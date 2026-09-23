@@ -164,6 +164,35 @@ func ParsePolicyDocument(doc string) (statements []PolicyStatement, skipped int,
 	return out, skipped, nil
 }
 
+// PolicyDocumentError is the collector's readability check for a permission
+// policy document (T3.3), written to cloud_policy.document_error: "" when the
+// graph may use the document, otherwise why not. It is the ONE definition of
+// "readable", over the same parser the projector runs, so a document recorded
+// readable at collection cannot fail to parse at projection (§4.7).
+//
+// Two ways to be unreadable:
+//
+//   - "parse: <reason>" -- the document did not parse at all.
+//   - "parse: N statement(s) unusable" -- it parsed, but N statements carry no
+//     Effect, or neither Action nor NotAction (P2-DECISIONS D-49). The
+//     projector would silently drop such a statement, so it would stop being
+//     confirmed and its grants would END: ending what could not be read
+//     (§2.7). Marking the whole document unreadable makes what it declared go
+//     STALE instead, and names the document under policy_documents.
+//
+// An empty document is not judged here: whether "nothing in hand" is a fetch
+// failure is the caller's to say.
+func PolicyDocumentError(doc string) string {
+	_, skipped, err := ParsePolicyDocument(doc)
+	switch {
+	case err != nil:
+		return "parse: " + err.Error()
+	case skipped > 0:
+		return fmt.Sprintf("parse: %d statement(s) unusable", skipped)
+	}
+	return ""
+}
+
 // ContentHash is the statement's content identity (SPEC §2.6): SHA-256 over
 // the canonical JSON of Effect, Action, NotAction, Resource, NotResource and
 // Condition. Canonical means lowercase effect, each list de-duplicated and

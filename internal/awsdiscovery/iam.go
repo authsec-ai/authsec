@@ -13,8 +13,9 @@ import (
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 )
 
-// The IAM read surface: roles, users, access keys and the policy documents
-// attached to each identity.
+// The IAM read surface: access keys, OIDC providers, AWS-managed policy
+// documents, and the helpers the authorization-details read (authdetails.go)
+// shares. Roles, users, groups and customer-managed policies are read there.
 //
 // This file knows AWS and nothing about AuthSec. It returns normalised structs;
 // deciding what to persist, how to reconcile and what a partial read means is
@@ -28,32 +29,25 @@ import (
 // interface cannot be called, so the CloudFormation template and this list can
 // be compared by eye.
 type IAMAPI interface {
-	ListRoles(ctx context.Context, in *iam.ListRolesInput, opts ...func(*iam.Options)) (*iam.ListRolesOutput, error)
-	GetRole(ctx context.Context, in *iam.GetRoleInput, opts ...func(*iam.Options)) (*iam.GetRoleOutput, error)
-	ListUsers(ctx context.Context, in *iam.ListUsersInput, opts ...func(*iam.Options)) (*iam.ListUsersOutput, error)
+	// GetAccountAuthorizationDetails is the whole IAM configuration read: roles,
+	// users, groups and customer-managed policies, one paginated call per filter
+	// (authdetails.go, SPEC T3.1). It replaced ListRoles, GetRole, ListUsers and
+	// the per-identity List*Policies / Get*Policy calls, which are deliberately
+	// no longer here: what is not in this interface cannot be called.
+	GetAccountAuthorizationDetails(ctx context.Context, in *iam.GetAccountAuthorizationDetailsInput, opts ...func(*iam.Options)) (*iam.GetAccountAuthorizationDetailsOutput, error)
 
 	ListAccessKeys(ctx context.Context, in *iam.ListAccessKeysInput, opts ...func(*iam.Options)) (*iam.ListAccessKeysOutput, error)
 	GetAccessKeyLastUsed(ctx context.Context, in *iam.GetAccessKeyLastUsedInput, opts ...func(*iam.Options)) (*iam.GetAccessKeyLastUsedOutput, error)
 
-	ListAttachedRolePolicies(ctx context.Context, in *iam.ListAttachedRolePoliciesInput, opts ...func(*iam.Options)) (*iam.ListAttachedRolePoliciesOutput, error)
-	ListRolePolicies(ctx context.Context, in *iam.ListRolePoliciesInput, opts ...func(*iam.Options)) (*iam.ListRolePoliciesOutput, error)
-	GetRolePolicy(ctx context.Context, in *iam.GetRolePolicyInput, opts ...func(*iam.Options)) (*iam.GetRolePolicyOutput, error)
-
-	ListAttachedUserPolicies(ctx context.Context, in *iam.ListAttachedUserPoliciesInput, opts ...func(*iam.Options)) (*iam.ListAttachedUserPoliciesOutput, error)
-	ListUserPolicies(ctx context.Context, in *iam.ListUserPoliciesInput, opts ...func(*iam.Options)) (*iam.ListUserPoliciesOutput, error)
-	GetUserPolicy(ctx context.Context, in *iam.GetUserPolicyInput, opts ...func(*iam.Options)) (*iam.GetUserPolicyOutput, error)
-
+	// GetPolicy and GetPolicyVersion read AWS-MANAGED policies only -- those
+	// attached to a principal or set as a boundary (§1.4, D-50). A
+	// customer-managed document comes from the LocalManagedPolicy listing.
 	GetPolicy(ctx context.Context, in *iam.GetPolicyInput, opts ...func(*iam.Options)) (*iam.GetPolicyOutput, error)
 	GetPolicyVersion(ctx context.Context, in *iam.GetPolicyVersionInput, opts ...func(*iam.Options)) (*iam.GetPolicyVersionOutput, error)
 
 	// ListOpenIDConnectProviders is ticket [2]'s addition: the account's OIDC
 	// providers, as join targets for IRSA and the EKS identity edge.
 	ListOpenIDConnectProviders(ctx context.Context, in *iam.ListOpenIDConnectProvidersInput, opts ...func(*iam.Options)) (*iam.ListOpenIDConnectProvidersOutput, error)
-
-	// GetAccountAuthorizationDetails reads groups and user group memberships
-	// (authdetails.go). Already granted by the role template; the SPEC's T3.1
-	// moves the whole IAM read onto it.
-	GetAccountAuthorizationDetails(ctx context.Context, in *iam.GetAccountAuthorizationDetailsInput, opts ...func(*iam.Options)) (*iam.GetAccountAuthorizationDetailsOutput, error)
 }
 
 // NewIAMClient builds a real IAM client from an assumed-role config.
@@ -80,47 +74,55 @@ var errTooManyPages = errors.New("pagination did not terminate")
 
 /* ------------------------------ normalised types --------------------------- */
 
-// IAMRole is one role, with the detail only GetRole returns.
+// IAMRole is one role as its authorization-details entry (RoleDetail)
+// returned it.
+//
+// There is no MaxSessionDuration and no Description here: RoleDetail does not
+// carry them, and there is no per-role call left to fetch them. The scanner
+// keeps what an earlier read stored for those two (D-48: merged, never
+// blanked) rather than writing their absence as a fact.
 type IAMRole struct {
-	ARN                string
-	Name               string
-	Path               string
-	UniqueID           string
-	Description        string
-	CreatedAt          *time.Time
-	LastUsedAt         *time.Time
-	MaxSessionDuration int32
-	Tags               map[string]string
+	ARN        string
+	Name       string
+	Path       string
+	UniqueID   string
+	CreatedAt  *time.Time
+	LastUsedAt *time.Time
+	Tags       map[string]string
 	// PermissionsBoundaryARN is the managed policy that caps this role's
 	// effective permissions, or "" when none is attached.
 	//
 	// A boundary does not grant anything; it is a ceiling. A role whose
 	// policies allow dynamodb:PutItem but whose boundary denies it cannot do
-	// it, so reporting the grant without the boundary over-states access. The
-	// field is already in the GetRole response -- it was simply discarded.
+	// it, so reporting the grant without the boundary over-states access.
 	PermissionsBoundaryARN string
-	// DetailComplete records whether GetRole succeeded for this role.
-	//
-	// False means only the ListRoles summary was available: last-used, tags and
-	// the permissions boundary are UNKNOWN, not absent. A writer must not treat
-	// a partial role as authoritative and overwrite metadata an earlier
-	// complete read established -- that turns a transient throttle into
-	// permanent data loss, and hides a missing boundary.
-	DetailComplete bool
-	// TrustPolicy is the decoded AssumeRolePolicyDocument. Retrieved here but
-	// NOT parsed and NOT persisted by ticket [1] — it is the input ticket [2]
-	// turns into cloud_assume_edge rows.
+	// TrustPolicy is the decoded AssumeRolePolicyDocument, verbatim. The
+	// scanner stores it on cloud_identity.trust_document (035) and the
+	// projector parses it; "" when the entry carried none.
 	TrustPolicy string
+	// InstanceProfileARNs are the instance profiles the role is in. Captured
+	// (§1.4) but not persisted: no column is specified for them (D-52).
+	InstanceProfileARNs []string
+	// Policies is everything attached to the role, from the same entry.
+	Policies IdentityPolicies
 }
 
-// IAMUser is one user.
+// IAMUser is one user as its authorization-details entry (UserDetail)
+// returned it.
 type IAMUser struct {
-	ARN              string
-	Name             string
-	Path             string
-	UniqueID         string
-	CreatedAt        *time.Time
-	PasswordLastUsed *time.Time
+	ARN       string
+	Name      string
+	Path      string
+	UniqueID  string
+	CreatedAt *time.Time
+	Tags      map[string]string
+	// PermissionsBoundaryARN: as IAMRole's. Users' boundaries had no read at
+	// all before authorization details (§1.3).
+	PermissionsBoundaryARN string
+	// GroupNames is the entry's GroupList, verbatim: group NAMES, resolved to
+	// ARNs by the reader against the same read's Group listing (Members).
+	GroupNames []string
+	Policies   IdentityPolicies
 }
 
 // IAMAccessKey is one long-lived programmatic key. The key id only — this
@@ -141,17 +143,17 @@ type AttachedPolicy struct {
 	Name      string
 	ARN       string
 	VersionID string
-	// PolicyID is AWS's PolicyId (ANPA...) from GetPolicy: the policy's
-	// CREATION BOUNDARY. A customer-managed policy deleted and recreated under
-	// the same ARN has a new one, and every graph key below the policy is
-	// built from it (SPEC §2.4). It was in the GetPolicy response all along,
-	// and was discarded.
+	// PolicyID is AWS's PolicyId (ANPA...), from the LocalManagedPolicy
+	// listing or GetPolicy: the policy's CREATION BOUNDARY. A customer-managed
+	// policy deleted and recreated under the same ARN has a new one, and every
+	// graph key below the policy is built from it (SPEC §2.4).
 	PolicyID string
 	Document string
-	// FetchError is non-empty when this policy could not be read this run:
-	// "fetch: <reason>". PER-DOCUMENT ISOLATION (§1.4): one unreadable policy
-	// is recorded on that policy and the scan continues -- it used to abort
-	// every policy of the identity, and then the whole permission scan.
+	// FetchError is non-empty when this policy's document could not be read
+	// this run: "fetch: <the call, the AWS error code, AWS's message>".
+	// PER-DOCUMENT ISOLATION (§1.4): one unreadable policy is recorded on that
+	// policy and the scan continues -- it used to abort every policy of the
+	// identity, and then the whole permission scan.
 	FetchError string
 	// AWSManaged distinguishes an AWS-owned policy from a customer-owned one.
 	// Ticket [2] weighs them differently: a customer-authored policy is a local
@@ -163,7 +165,9 @@ type AttachedPolicy struct {
 type InlinePolicy struct {
 	Name     string
 	Document string
-	// FetchError: as AttachedPolicy.FetchError.
+	// FetchError: as AttachedPolicy.FetchError. Authorization details carry
+	// inline documents in the listing itself, so today it is always empty;
+	// kept so a document that is not in hand can never read as readable.
 	FetchError string
 }
 
@@ -205,119 +209,6 @@ type IAMReader struct {
 // NewIAMReader constructs a reader over the given API.
 func NewIAMReader(api IAMAPI) *IAMReader {
 	return &IAMReader{api: api, policyCache: map[string]AttachedPolicy{}}
-}
-
-// ListRoles reads every role, then fetches the per-role detail.
-//
-// Two calls per role is what the ticket specifies, and it is not avoidable with
-// these operations: ListRoles returns neither RoleLastUsed nor tags, and both
-// matter — the first is liveness without CloudTrail, the second is the only
-// ownership hint available at this stage.
-//
-// iam:GetAccountAuthorizationDetails would return roles, users and every policy
-// document in one paginated call. The template already grants it. Comparing the
-// two on a real account is an open item in the AWS plan; this implementation is
-// the one the ticket asks for, and the shape of the rows is identical either
-// way, so switching later is a change to this function alone.
-func (r *IAMReader) ListRoles(ctx context.Context) ([]IAMRole, error) {
-	var out []IAMRole
-	var marker *string
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: roles", errTooManyPages)
-		}
-		resp, err := r.api.ListRoles(ctx, &iam.ListRolesInput{
-			MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, role := range resp.Roles {
-			out = append(out, r.roleDetail(ctx, role))
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			return out, nil
-		}
-		marker = resp.Marker
-	}
-}
-
-// roleDetail enriches a listed role with GetRole.
-//
-// A failure here degrades one role rather than failing the scan: the role
-// itself was listed, so we know it exists, and recording it without its
-// last-used date is strictly better than pretending it is not there. The
-// summary from ListRoles is kept as the fallback.
-func (r *IAMReader) roleDetail(ctx context.Context, role iamtypes.Role) IAMRole {
-	built := IAMRole{
-		ARN:         aws.ToString(role.Arn),
-		Name:        aws.ToString(role.RoleName),
-		Path:        aws.ToString(role.Path),
-		UniqueID:    aws.ToString(role.RoleId),
-		Description: aws.ToString(role.Description),
-		CreatedAt:   role.CreateDate,
-		TrustPolicy: decodePolicyDocument(role.AssumeRolePolicyDocument),
-	}
-	if role.MaxSessionDuration != nil {
-		built.MaxSessionDuration = *role.MaxSessionDuration
-	}
-
-	detail, err := r.api.GetRole(ctx, &iam.GetRoleInput{RoleName: role.RoleName})
-	if err != nil || detail.Role == nil {
-		// DetailComplete stays false: the caller must record this role as
-		// partially collected rather than writing its gaps as facts.
-		return built
-	}
-	d := detail.Role
-	if d.RoleLastUsed != nil {
-		built.LastUsedAt = d.RoleLastUsed.LastUsedDate
-	}
-	if doc := decodePolicyDocument(d.AssumeRolePolicyDocument); doc != "" {
-		built.TrustPolicy = doc
-	}
-	if d.Description != nil {
-		built.Description = *d.Description
-	}
-	if d.MaxSessionDuration != nil {
-		built.MaxSessionDuration = *d.MaxSessionDuration
-	}
-	built.Tags = tagMap(d.Tags)
-	if d.PermissionsBoundary != nil {
-		built.PermissionsBoundaryARN = aws.ToString(d.PermissionsBoundary.PermissionsBoundaryArn)
-	}
-	built.DetailComplete = true
-	return built
-}
-
-// ListUsers reads every user.
-func (r *IAMReader) ListUsers(ctx context.Context) ([]IAMUser, error) {
-	var out []IAMUser
-	var marker *string
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: users", errTooManyPages)
-		}
-		resp, err := r.api.ListUsers(ctx, &iam.ListUsersInput{
-			MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, u := range resp.Users {
-			out = append(out, IAMUser{
-				ARN:              aws.ToString(u.Arn),
-				Name:             aws.ToString(u.UserName),
-				Path:             aws.ToString(u.Path),
-				UniqueID:         aws.ToString(u.UserId),
-				CreatedAt:        u.CreateDate,
-				PasswordLastUsed: u.PasswordLastUsed,
-			})
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			return out, nil
-		}
-		marker = resp.Marker
-	}
 }
 
 // OIDCProviders reads the account's registered OIDC identity providers.
@@ -394,24 +285,8 @@ func (r *IAMReader) ListAccessKeys(ctx context.Context, userName string) ([]IAMA
 	}
 }
 
-// BoundaryPolicy reads the document of a permissions-boundary policy.
-//
-// A boundary is an ordinary managed policy used in a non-granting position, so
-// the read is the same two calls; what differs is how the caller must record
-// the result.
-func (r *IAMReader) BoundaryPolicy(ctx context.Context, boundaryARN string) (AttachedPolicy, error) {
-	p := r.managedPolicy(ctx, boundaryARN, boundaryPolicyName(boundaryARN))
-	if p.FetchError != "" {
-		// The caller still learns it failed: the identity keeps
-		// constraint_state 'bounded' from the ARN alone, and the policy row
-		// records the error.
-		return p, fmt.Errorf("boundary %s: %s", boundaryARN, p.FetchError)
-	}
-	return p, nil
-}
-
-// boundaryPolicyName recovers the policy name from its ARN. The boundary is
-// reported as an ARN only, and managedPolicy wants a name for its error text.
+// boundaryPolicyName recovers the policy name from its ARN. A boundary is
+// reported as an ARN only, and every policy row needs a name.
 func boundaryPolicyName(arn string) string {
 	if i := strings.LastIndex(arn, "/"); i >= 0 && i+1 < len(arn) {
 		return arn[i+1:]
@@ -419,125 +294,9 @@ func boundaryPolicyName(arn string) string {
 	return arn
 }
 
-// RolePolicies reads the managed and inline policies attached to a role.
-func (r *IAMReader) RolePolicies(ctx context.Context, roleARN, roleName string) (IdentityPolicies, error) {
-	out := IdentityPolicies{IdentityARN: roleARN, IdentityName: roleName}
-
-	var marker *string
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: attached policies for %s", errTooManyPages, roleName)
-		}
-		resp, err := r.api.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
-			RoleName: aws.String(roleName), MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, p := range resp.AttachedPolicies {
-			// Never fails the identity: an unreadable document is recorded on
-			// the policy (FetchError) and the attachment is still listed.
-			out.Attached = append(out.Attached,
-				r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName)))
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			break
-		}
-		marker = resp.Marker
-	}
-
-	marker = nil
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: inline policies for %s", errTooManyPages, roleName)
-		}
-		resp, err := r.api.ListRolePolicies(ctx, &iam.ListRolePoliciesInput{
-			RoleName: aws.String(roleName), MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, name := range resp.PolicyNames {
-			doc, err := r.api.GetRolePolicy(ctx, &iam.GetRolePolicyInput{
-				RoleName: aws.String(roleName), PolicyName: aws.String(name),
-			})
-			if err != nil {
-				out.Inline = append(out.Inline, InlinePolicy{
-					Name: name, FetchError: "fetch: " + classify(err).Error(),
-				})
-				continue
-			}
-			out.Inline = append(out.Inline, InlinePolicy{
-				Name: name, Document: decodePolicyDocument(doc.PolicyDocument),
-			})
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			return out, nil
-		}
-		marker = resp.Marker
-	}
-}
-
-// UserPolicies reads the managed and inline policies attached to a user.
-func (r *IAMReader) UserPolicies(ctx context.Context, userARN, userName string) (IdentityPolicies, error) {
-	out := IdentityPolicies{IdentityARN: userARN, IdentityName: userName}
-
-	var marker *string
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: attached policies for %s", errTooManyPages, userName)
-		}
-		resp, err := r.api.ListAttachedUserPolicies(ctx, &iam.ListAttachedUserPoliciesInput{
-			UserName: aws.String(userName), MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, p := range resp.AttachedPolicies {
-			// Never fails the identity: an unreadable document is recorded on
-			// the policy (FetchError) and the attachment is still listed.
-			out.Attached = append(out.Attached,
-				r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName)))
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			break
-		}
-		marker = resp.Marker
-	}
-
-	marker = nil
-	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: inline policies for %s", errTooManyPages, userName)
-		}
-		resp, err := r.api.ListUserPolicies(ctx, &iam.ListUserPoliciesInput{
-			UserName: aws.String(userName), MaxItems: aws.Int32(listPageLimit), Marker: marker,
-		})
-		if err != nil {
-			return out, classify(err)
-		}
-		for _, name := range resp.PolicyNames {
-			doc, err := r.api.GetUserPolicy(ctx, &iam.GetUserPolicyInput{
-				UserName: aws.String(userName), PolicyName: aws.String(name),
-			})
-			if err != nil {
-				out.Inline = append(out.Inline, InlinePolicy{
-					Name: name, FetchError: "fetch: " + classify(err).Error(),
-				})
-				continue
-			}
-			out.Inline = append(out.Inline, InlinePolicy{
-				Name: name, Document: decodePolicyDocument(doc.PolicyDocument),
-			})
-		}
-		if !resp.IsTruncated || resp.Marker == nil {
-			return out, nil
-		}
-		marker = resp.Marker
-	}
-}
-
-// managedPolicy fetches a managed policy's default version, through the cache.
+// managedPolicy fetches an AWS-managed policy's default version, through the
+// cache. Customer-managed policies never come here: their documents are in
+// the LocalManagedPolicy listing (authdetails.go).
 //
 // Two calls per policy: GetPolicy names the default version (and gives the
 // PolicyId), GetPolicyVersion returns the document. There is no single call
@@ -557,9 +316,11 @@ func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName str
 	}
 	defer func() { r.policyCache[policyARN] = built }()
 
+	// The reason names the call and AWS's error code (§2.14.13, E9: "coverage
+	// names the call"), never classify()'s "the role could not be assumed".
 	meta, err := r.api.GetPolicy(ctx, &iam.GetPolicyInput{PolicyArn: aws.String(policyARN)})
 	if err != nil {
-		built.FetchError = "fetch: " + classify(err).Error()
+		built.FetchError = "fetch: " + callError("iam:GetPolicy", err).Error()
 		return built
 	}
 	if meta.Policy != nil {
@@ -570,14 +331,14 @@ func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName str
 		}
 	}
 	if built.VersionID == "" {
-		built.FetchError = "fetch: GetPolicy returned no default version"
+		built.FetchError = "fetch: iam:GetPolicy returned no default version"
 		return built
 	}
 	ver, err := r.api.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
 		PolicyArn: aws.String(policyARN), VersionId: aws.String(built.VersionID),
 	})
 	if err != nil {
-		built.FetchError = "fetch: " + classify(err).Error()
+		built.FetchError = "fetch: " + callError("iam:GetPolicyVersion", err).Error()
 		return built
 	}
 	if ver.PolicyVersion != nil {

@@ -15,13 +15,16 @@ import (
 	"github.com/google/uuid"
 )
 
-// Scan resume, against a real database.
+// Scan attempts and checkpoints, against a real database.
 //
-// The phase that matters is the per-identity policy fetch: roughly seven AWS
-// calls per identity, so on hundreds of roles it dominates the scan and is
-// where an interruption is most likely to land. Resume has to make a second
-// attempt skip the identities the first one finished -- without making any AWS
-// call for them at all, which is the only saving that counts.
+// There used to be a per-identity policy phase -- roughly seven AWS calls per
+// identity -- and a checkpoint let a second attempt skip the identities the
+// first one had finished. SPEC T3.1 removed that phase: the whole IAM
+// configuration is now a handful of paginated GetAccountAuthorizationDetails
+// listings, re-read in full by every attempt. A checkpoint left at the run's
+// generation (by an interrupted attempt, or an older binary) must therefore
+// change NOTHING: skipping an identity would make this run depend on writes an
+// earlier attempt may or may not have made, and would save no AWS call.
 
 // manyRolesIAM builds an account with n roles, each carrying one inline policy
 // so the policy phase has real work to do per identity.
@@ -64,10 +67,10 @@ func resumeFixture(
 		c.ID
 }
 
-// A scan interrupted part-way through the policy phase must, on the next
-// attempt, skip the identities it already finished and make no AWS call for
-// them.
-func TestScanResumesPastIdentitiesAlreadyDone(t *testing.T) {
+// A checkpoint at the run's generation makes the next attempt skip nothing:
+// every identity is listed, handed over and written, and the checkpoint is
+// cleared once the attempt completes.
+func TestLeftoverCheckpointSkipsNoIdentity(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "ws-resume")
 	defer cleanWorkloadTables(t, db, ws)
@@ -76,114 +79,55 @@ func TestScanResumesPastIdentitiesAlreadyDone(t *testing.T) {
 	fake := manyRolesIAM(roleCount)
 	iamScanner, permScanner, connectorID := resumeFixture(t, ws, fake)
 
-	// ---- attempt one, interrupted -----------------------------------------
-	//
-	// A process that dies mid-scan leaves two things behind: rows for the
-	// identities it finished, and a checkpoint naming the last of them. It does
-	// NOT leave an advanced scan_generation, because commitScan never ran.
-	//
-	// That state is seeded directly here rather than by running and truncating a
-	// real scan, because a Scan() call that returns at all advances the
-	// generation -- see the note at the bottom of this file on why the live
-	// chain cannot yet produce this state on its own.
-	const finishedInAttemptOne = 8
+	// The state an interrupted attempt of the OLD per-identity phase left
+	// behind: a checkpoint naming the eighth role, and no advanced
+	// scan_generation (commitScan never ran).
 	checkpoints := repositories.NewCloudScanCheckpointRepository(db)
 	pendingGeneration := 1
-	cursor := fmt.Sprintf("arn:aws:iam::429418377036:role/role-%03d", finishedInAttemptOne-1)
+	cursor := fmt.Sprintf("arn:aws:iam::429418377036:role/role-%03d", 7)
 	if err := checkpoints.Advance(
 		ws, connectorID, pendingGeneration,
-		models.ScanPhaseIdentityPolicies, cursor, finishedInAttemptOne,
+		models.ScanPhaseIdentityPolicies, cursor, 8,
 	); err != nil {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
-	t.Logf("PASS: interrupted attempt left a checkpoint at %s", cursor)
 
-	// ---- attempt two, resuming --------------------------------------------
-	resumed, err := iamScanner.Scan(context.Background(), ws, connectorID)
+	snap, err := iamScanner.Scan(context.Background(), ws, connectorID)
 	if err != nil {
-		t.Fatalf("attempt two identity scan: %v", err)
+		t.Fatalf("identity scan: %v", err)
 	}
-	if resumed.Generation != pendingGeneration {
-		t.Fatalf("a resumed attempt must reuse generation %d, got %d",
-			pendingGeneration, resumed.Generation)
+	if snap.Generation != pendingGeneration {
+		t.Fatalf("the attempt must use generation %d, got %d", pendingGeneration, snap.Generation)
 	}
-	t.Logf("PASS: attempt two reused generation %d instead of starting a new one", resumed.Generation)
-
-	// The saving that matters: no policy call for the identities already done.
-	if got := len(resumed.Policies); got != roleCount-finishedInAttemptOne {
-		t.Fatalf("expected policies for %d remaining identities, got %d",
-			roleCount-finishedInAttemptOne, got)
+	if got := len(snap.Policies); got != roleCount {
+		t.Fatalf("policies handed over for %d identities, want all %d: a leftover checkpoint skipped some",
+			got, roleCount)
 	}
-	callsMade := fake.calls["GetRolePolicy"]
-	if callsMade != roleCount-finishedInAttemptOne {
-		t.Fatalf("expected %d GetRolePolicy calls on resume, saw %d -- resume is not skipping AWS calls",
-			roleCount-finishedInAttemptOne, callsMade)
+	if n := snap.Coverage.Counters["identities_resumed_past"]; n != 0 {
+		t.Fatalf("identities_resumed_past = %d, want 0", n)
 	}
-	if resumed.Coverage.Counters["identities_resumed_past"] != finishedInAttemptOne {
-		t.Fatalf("the scan report must say how many were skipped, got %v",
-			resumed.Coverage.Counters["identities_resumed_past"])
+	// One listing page per filter at this size; no per-identity policy call
+	// exists any more to count.
+	if got := fake.calls["GetAccountAuthorizationDetails:Role"]; got != 1 {
+		t.Fatalf("Role listing calls = %d, want 1", got)
 	}
-	t.Logf("PASS: %d AWS policy calls made instead of %d — %d identities skipped entirely",
-		callsMade, roleCount, finishedInAttemptOne)
-
-	// ---- a finished generation's checkpoint must not affect the next scan --
-	if _, err := permScanner.ScanFromSnapshot(context.Background(), ws, resumed); err != nil {
-		t.Fatalf("attempt two permission scan: %v", err)
+	if left, err := checkpoints.HasAny(ws, connectorID, pendingGeneration); err != nil || left {
+		t.Fatalf("checkpoint left behind after a complete attempt: %v (err %v)", left, err)
 	}
 
-	// The checkpoint for a finished generation is INERT rather than cleared: the
-	// identity scan clears it on completion, and then the permission scan writes
-	// its own cursor again on the way past. What has to hold is that the next
-	// scan -- which runs at generation+1 -- does not resume from it, or a
-	// completed account would never be re-read.
-	fake.calls["GetRolePolicy"] = 0
-	fresh, err := iamScanner.Scan(context.Background(), ws, connectorID)
-	if err != nil {
-		t.Fatalf("next scan: %v", err)
+	if _, err := permScanner.ScanFromSnapshot(context.Background(), ws, snap); err != nil {
+		t.Fatalf("permission scan: %v", err)
 	}
-	if fresh.Generation == resumed.Generation {
-		t.Fatalf("a scan after a completed one must advance the generation, still %d", fresh.Generation)
+	var policies, perms int64
+	db.Raw(`SELECT count(*) FROM cloud_policy WHERE workspace_id = ? AND last_seen_generation = ?`,
+		ws, pendingGeneration).Scan(&policies)
+	db.Raw(`SELECT count(*) FROM cloud_permission WHERE workspace_id = ?`, ws).Scan(&perms)
+	if policies != roleCount || perms != roleCount {
+		t.Fatalf("cloud_policy = %d, cloud_permission = %d at the run's generation, want %d each",
+			policies, perms, roleCount)
 	}
-	if fresh.Coverage.Counters["identities_resumed_past"] != 0 {
-		t.Fatalf("the next scan must not resume from a finished generation, skipped %v",
-			fresh.Coverage.Counters["identities_resumed_past"])
-	}
-	if got := fake.calls["GetRolePolicy"]; got != roleCount {
-		t.Fatalf("the next scan must re-read every identity, made %d of %d calls", got, roleCount)
-	}
-	t.Logf("PASS: next scan advanced to generation %d and re-read all %d identities",
-		fresh.Generation, roleCount)
-
-	// Every identity ends up with its permissions, across the two attempts --
-	// the point of the whole exercise.
-	perms, _, err := repositories.NewCloudPermissionRepository(db).ListPermissions(ws, repositories.CloudPermissionFilter{})
-	if err != nil {
-		t.Fatalf("list permissions: %v", err)
-	}
-	if len(perms) == 0 {
-		t.Fatal("the resumed identities must have their permissions written")
-	}
-	t.Logf("PASS: %d permission rows present after the resumed attempt", len(perms))
+	t.Logf("PASS: all %d identities read and written despite a checkpoint at role-007", roleCount)
 }
-
-// KNOWN LIMITATION, proven by the shape of the test above.
-//
-// The checkpoint mechanism works, but the live scan chain cannot yet produce the
-// state it resumes from. AWSIAMScanner.Scan calls commitScan on every path --
-// complete AND partial -- so any Scan() that returns advances
-// scan_generation. The next scan therefore computes a NEW generation, finds no
-// checkpoint at it, and re-fetches everything.
-//
-// Meanwhile the cursor is advanced by AWSPermissionScanner, which runs after the
-// identity scan has already committed. So the only interruption that would leave
-// a usable checkpoint -- the process dying inside the policy fetch -- happens
-// before any checkpoint has been written at all.
-//
-// Closing this needs the generation to stop advancing until the whole chain
-// finishes, which changes reconciliation timing for all three scanners and the
-// expectations in TestIAMRepeatScanUpdatesRatherThanDuplicating. That is a
-// deliberate design decision, not a local fix, so it is recorded here rather
-// than made quietly.
 
 // A fresh connector has no checkpoint, so a first scan must fetch everything
 // rather than mistaking an absent cursor for "already done".
