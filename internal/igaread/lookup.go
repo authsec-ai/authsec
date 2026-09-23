@@ -103,19 +103,26 @@ func parseCloudRef(raw string) (string, uuid.UUID, *Error) {
 
 // lookupConnector returns the account an AWS connector of this workspace
 // reads, or ok=false (another provider's rows are never projected).
-func lookupConnector(q *Query, connectorID uuid.UUID) (string, bool, error) {
+//
+// It also returns the connector's AWS partition (attrs.partition; "" is aws):
+// a workload's key is its ARN, CONSTRUCTED in that partition when the row holds
+// a bare id, so /lookup must build it exactly as the projector does
+// (igagraph.WorkloadKey, T3.6).
+func lookupConnector(q *Query, connectorID uuid.UUID) (account, partition string, ok bool, err error) {
 	var rows []struct {
-		Provider string
-		ScopeID  string
+		Provider  string
+		ScopeID   string
+		Partition string
 	}
-	if err := q.DB().Raw(`SELECT provider, scope_id FROM cloud_connector WHERE workspace_id = ? AND id = ?`,
+	if err := q.DB().Raw(`SELECT provider, scope_id, COALESCE(attrs->>'partition', '') AS partition
+	                        FROM cloud_connector WHERE workspace_id = ? AND id = ?`,
 		q.WS, connectorID).Scan(&rows).Error; err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	if len(rows) == 0 || rows[0].Provider != models.ProviderAWS {
-		return "", false, nil
+		return "", "", false, nil
 	}
-	return rows[0].ScopeID, true, nil
+	return rows[0].ScopeID, rows[0].Partition, true, nil
 }
 
 // lookupOrder prefers the active object, else the most recently seen retired
@@ -142,7 +149,7 @@ func lookupIdentity(q *Query, id uuid.UUID) (*LookupResult, error) {
 		return nil, nil
 	}
 	ci := rows[0]
-	if _, ok, err := lookupConnector(q, ci.ConnectorID); err != nil || !ok {
+	if _, _, ok, err := lookupConnector(q, ci.ConnectorID); err != nil || !ok {
 		return nil, err
 	}
 	imm := igagraph.ImmutableKey(ci)
@@ -178,7 +185,7 @@ func lookupWorkload(q *Query, id uuid.UUID) (*LookupResult, error) {
 		return nil, nil
 	}
 	cw := rows[0]
-	account, ok, err := lookupConnector(q, cw.ConnectorID)
+	account, partition, ok, err := lookupConnector(q, cw.ConnectorID)
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -190,7 +197,7 @@ func lookupWorkload(q *Query, id uuid.UUID) (*LookupResult, error) {
 	                                      WHERE s.workspace_id = n.workspace_id AND s.workload_id = n.id
 	                                        AND s.connector_id = ?)
 	                       `+lookupOrder,
-		q.WS, igagraph.WorkloadKey(cw, account), cw.ConnectorID).Scan(&nodes).Error; err != nil {
+		q.WS, igagraph.WorkloadKey(cw, partition, account), cw.ConnectorID).Scan(&nodes).Error; err != nil {
 		return nil, err
 	}
 	if len(nodes) == 0 {
