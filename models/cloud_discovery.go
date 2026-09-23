@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -579,6 +580,20 @@ type AWSConnectorAttrs struct {
 	// every region AWS happens to have enabled.
 	Regions []string `json:"regions,omitempty"`
 
+	// RegionsEverSelected is every region the selection has ever held -- the
+	// onboarding selection and each PATCH .../connectors/:id since (D-54),
+	// sorted -- maintained by the PATCH in the same UPDATE as Regions. Absent
+	// on a connector whose selection never changed, which is every connector
+	// onboarded before PATCH existed: its Regions are then the whole history.
+	//
+	// It is how a scan knows which regions it is NOT reading that an earlier
+	// scan did: their earlier results are kept and marked stale (§2.14.13
+	// l.1856-1859), never taken as gone. Nothing else records it -- a
+	// deselected region's rows are the evidence that vanishes, and a region
+	// that held nothing leaves no row at all. Read it through
+	// DeselectedRegions.
+	RegionsEverSelected []string `json:"regions_ever_selected,omitempty"`
+
 	// CallerARN is what sts:GetCallerIdentity returned the last time the
 	// connection was proven: the assumed-role ARN, not the role ARN. Evidence of
 	// what we actually became, kept because it is the only thing that
@@ -601,6 +616,27 @@ func (c *CloudConnector) AWSAttrs() AWSConnectorAttrs {
 	}
 	_ = json.Unmarshal(c.Attrs, &a)
 	return a
+}
+
+// DeselectedRegions lists, sorted, the regions the selection once held and no
+// longer does: regions an earlier scan may have read and this one will not.
+// Empty when the selection only ever grew.
+func (a AWSConnectorAttrs) DeselectedRegions() []string {
+	selected := make(map[string]bool, len(a.Regions))
+	for _, r := range a.Regions {
+		selected[r] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range a.RegionsEverSelected {
+		if r == "" || selected[r] || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SetAWSAttrs encodes the AWS shape into Attrs.

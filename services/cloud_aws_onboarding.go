@@ -516,9 +516,12 @@ func (e *RegionsUnavailableError) Unwrap() error { return e.Err }
 // (ec2:DescribeRegions through the discovery role; §5.3 GET .../regions), with
 // the connector as it was read.
 //
-// The client is signed for the connector's first selected region -- the same
-// one assumeRequestFor gives STS -- because DescribeRegions is answered from
-// any enabled region, and one the operator chose is known to be enabled.
+// The client is signed for the region assumeRequestFor gives STS
+// (awsdiscovery.SigningRegion): a selected region the account cannot disable
+// when there is one. DescribeRegions is answered from any enabled region, but
+// a selected OPT-IN region may since have been disabled -- the very case this
+// route must be able to show (enabled: false) and a PATCH must be able to
+// remove.
 func (s *AWSOnboardingService) EnabledRegions(
 	ctx context.Context, workspaceID, id uuid.UUID,
 ) ([]awsdiscovery.Region, *models.CloudConnector, error) {
@@ -617,6 +620,16 @@ func (s *AWSOnboardingService) UpdateRegions(
 // jsonb_set rather than a read-modify-write of the whole blob: two writers of
 // different attrs (a verify recording caller_arn, this) must not undo each
 // other. The status predicate refuses a connector revoked since it was read.
+//
+// attrs.regions_ever_selected grows IN THE SAME STATEMENT, from the row as it
+// is at the write -- its recorded history and the selection being replaced (a
+// connector onboarded before PATCH existed has no history recorded: it never
+// changed its selection, so its regions are its whole history) -- plus the new
+// selection, sorted. Computed from the
+// row, never from what the handler read before asking AWS: a second PATCH
+// committing meanwhile must not drop a region from the history, or a later
+// scan would treat that region's earlier results as gone rather than kept and
+// stale (§2.14.13).
 func (s *AWSOnboardingService) writeRegions(
 	workspaceID, id uuid.UUID, regions []string,
 ) (*models.CloudConnector, error) {
@@ -626,10 +639,25 @@ func (s *AWSOnboardingService) writeRegions(
 	}
 	var rows []models.CloudConnector
 	if err := s.db.Raw(`UPDATE cloud_connector
-		   SET attrs = jsonb_set(attrs, '{regions}', ?::jsonb, true), updated_at = now()
+		   SET attrs = jsonb_set(
+		           jsonb_set(attrs, '{regions}', ?::jsonb, true),
+		           '{regions_ever_selected}',
+		           (SELECT COALESCE(jsonb_agg(u.region ORDER BY u.region), '[]'::jsonb)
+		              FROM (SELECT jsonb_array_elements_text(CASE
+		                             WHEN jsonb_typeof(attrs->'regions_ever_selected') = 'array'
+		                             THEN attrs->'regions_ever_selected' ELSE '[]'::jsonb END) AS region
+		                    UNION
+		                    SELECT jsonb_array_elements_text(CASE
+		                             WHEN jsonb_typeof(attrs->'regions') = 'array'
+		                             THEN attrs->'regions' ELSE '[]'::jsonb END)
+		                    UNION
+		                    SELECT jsonb_array_elements_text(?::jsonb)) u
+		             WHERE u.region <> ''),
+		           true),
+		       updated_at = now()
 		 WHERE workspace_id = ? AND id = ? AND provider = ? AND status <> ?
 		RETURNING *`,
-		string(raw), workspaceID, id, models.CloudProviderAWS, models.CloudConnectorRevoked,
+		string(raw), string(raw), workspaceID, id, models.CloudProviderAWS, models.CloudConnectorRevoked,
 	).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -682,10 +710,11 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	if attrs.RoleARN == "" {
 		return nil, empty, errors.New("connector has no role arn recorded; re-run onboarding")
 	}
-	region := ""
-	if len(attrs.Regions) > 0 {
-		region = attrs.Regions[0]
-	} else {
+	// Signed for a selected region the account cannot disable, when there is
+	// one -- never merely the first of a SORTED selection (D-90), which an
+	// opt-in region the account later disabled would make unanswerable.
+	region := awsdiscovery.SigningRegion(attrs.Regions)
+	if region == "" {
 		return nil, empty, errors.New("connector has no regions in scope; re-run onboarding")
 	}
 

@@ -140,6 +140,12 @@ type WorkloadSnapshot struct {
 	// can fold it into the overall report instead of dropping it. Keyed
 	// "<surface>:<region>" per compute surface, plus "activity" globally.
 	Surfaces map[string]models.SurfaceCoverage
+
+	// activityErr is the error behind Errors["activity"] -- the same failure,
+	// as a value: the string alone has lost the SDK chain that names the
+	// failed call and AWS's code (awsdiscovery.FailedCall, §5.3 /coverage
+	// api, error_code; D-71).
+	activityErr error
 }
 
 // ScanFromSnapshot reads workloads and activity for the identities a
@@ -178,15 +184,21 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	// and nobody was meant to" is a different answer from both, and it is the
 	// honest one for an unselected region.
 	//
-	// That includes every region this connector holds workloads in: a region
-	// can be selected (PATCH .../connectors/:id accepts any ENABLED region,
-	// not only awsRegionsWithCompute) and later deselected, and without its
-	// stand-in its earlier results would stay "current" forever instead of
-	// kept and marked stale (§2.14.13).
+	// That includes every region this connector's selection ever held, and
+	// every region it holds workloads in: a region can be selected (PATCH
+	// .../connectors/:id accepts any ENABLED region, not only
+	// awsRegionsWithCompute) and later deselected, and without its stand-in
+	// its earlier results would stay "current" forever instead of kept and
+	// marked stale (§2.14.13). The selection's history, not the rows, is what
+	// makes the stand-in LAST: this scan's reconciliation deletes the
+	// deselected region's workloads below, and a region that held none never
+	// left a row -- yet an earlier run reached it, and without a stand-in the
+	// revision keeps showing that run's "reached" for a region nobody reads.
 	previously, err := s.workloads.RegionsForConnector(workspaceID, snapshot.ConnectorID)
 	if err != nil {
 		return nil, err
 	}
+	previously = append(previously, connector.AWSAttrs().DeselectedRegions()...)
 	for _, region := range unselectedRegions(regions, previously...) {
 		out.Surfaces[models.SurfaceCompute(region)] = models.SurfaceCoverage{
 			State: models.CloudCoverageNotSelected,
@@ -197,9 +209,9 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	// ---- activity, which is global because IAM is -------------------------
 	s.scanActivity(ctx, workspaceID, snapshot, out)
 	if activityErr, failed := out.Errors["activity"]; failed {
-		out.Surfaces["activity"] = models.SurfaceCoverage{
+		out.Surfaces["activity"] = withFailedCall(models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Count: out.UsageWritten, Error: activityErr,
-		}
+		}, out.activityErr)
 	} else {
 		out.Surfaces["activity"] = models.SurfaceCoverage{
 			State: models.CloudCoverageReached, Count: out.UsageWritten,
@@ -703,7 +715,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 		}
 		cfg, _, err := s.onboarding.ConfigForConnector(ctx, workspaceID, snapshot.ConnectorID, "")
 		if err != nil {
-			out.Errors["activity"] = err.Error()
+			out.Errors["activity"], out.activityErr = err.Error(), err
 			return
 		}
 		api = awsdiscovery.NewServiceLastAccessedClient(cfg)
@@ -719,7 +731,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 		Limit:       activityIdentityCap,
 	})
 	if err != nil {
-		out.Errors["activity"] = err.Error()
+		out.Errors["activity"], out.activityErr = err.Error(), err
 		return
 	}
 
@@ -729,7 +741,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 			// One identity's report failing does not mean the rest will. The
 			// surface is marked unread so nothing is reconciled away, and the
 			// remaining identities are still attempted.
-			out.Errors["activity"] = err.Error()
+			out.Errors["activity"], out.activityErr = err.Error(), err
 			continue
 		}
 		for _, svc := range activity {
@@ -744,7 +756,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 				LastSeenGeneration: snapshot.Generation,
 			}
 			if _, _, err := s.workloads.UpsertUsage(usage); err != nil {
-				out.Errors["activity"] = err.Error()
+				out.Errors["activity"], out.activityErr = err.Error(), err
 				break
 			}
 			out.UsageWritten++

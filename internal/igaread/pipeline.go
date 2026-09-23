@@ -80,14 +80,66 @@ type PipelineAccount struct {
 }
 
 // pipelineRun is a run with its projection job and publication (033: at most
-// one of each per run).
+// one of each per run), and whether the graph holds its connector at all.
 type pipelineRun struct {
 	models.CloudScanRun
-	JobStatus    *string
-	JobAttempts  *int
-	JobLastError *string
-	PubRev       *int64
+	JobStatus     *string
+	JobAttempts   *int
+	JobLastError  *string
+	PubRev        *int64
+	EverPublished bool
 }
+
+// PipelineLatestRunsSQL reads each AWS connector's latest run (D-92) with its
+// projection job, its publication, and whether the graph holds the connector
+// at all -- a FIXED amount of work per connector, however long its run history
+// (cloud_scan_run has no retention, and the console polls this route under the
+// §5.1 3 s budget). Exported so a test can EXPLAIN it; nothing else runs it.
+//
+// Per connector, two index probes of LIMIT 1, never a sort of its history:
+//   - its live run -- queued or running, at most one (uq_cloud_scan_run_live);
+//   - else its newest run by (requested_at DESC, id DESC)
+//     (idx_cloud_scan_run_history).
+//
+// Ranked explicitly rather than trusting requested_at alone: a refused claim
+// moves a live run's requested_at (T1.3), and the ranking must not depend on
+// which way it moved. Named columns, never r.*: the coverage jsonb is not read.
+//
+// ever_published: the connector has a partition watermark (iga_projection_state,
+// one index probe). A watermark is written in the SAME transaction as the
+// publication of the run it names (the projector's recordState), so "the graph
+// holds a publication of this connector's runs" and "it has a watermark" are
+// one fact -- and the watermark answers it without walking the history.
+const PipelineLatestRunsSQL = `
+	SELECT r.id, r.connector_id, r.status, r.requested_at, r.started_at, r.published_at,
+	       r.updated_at, r.last_error,
+	       j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,
+	       p.rev AS pub_rev,
+	       EXISTS (SELECT 1 FROM iga_projection_state ps
+	                WHERE ps.workspace_id = c.workspace_id AND ps.connector_id = c.id) AS ever_published
+	  FROM cloud_connector c
+	 CROSS JOIN LATERAL (
+	        SELECT x.id, x.connector_id, x.status, x.requested_at, x.started_at, x.published_at,
+	               x.updated_at, x.last_error
+	          FROM ((SELECT 0 AS pick, l.id, l.connector_id, l.status, l.requested_at, l.started_at,
+	                        l.published_at, l.updated_at, l.last_error
+	                   FROM cloud_scan_run l
+	                  WHERE l.connector_id = c.id AND l.workspace_id = c.workspace_id
+	                    AND l.status IN (?, ?)
+	                  ORDER BY l.requested_at DESC, l.id DESC
+	                  LIMIT 1)
+	                UNION ALL
+	                (SELECT 1 AS pick, n.id, n.connector_id, n.status, n.requested_at, n.started_at,
+	                        n.published_at, n.updated_at, n.last_error
+	                   FROM cloud_scan_run n
+	                  WHERE n.workspace_id = c.workspace_id AND n.connector_id = c.id
+	                  ORDER BY n.requested_at DESC, n.id DESC
+	                  LIMIT 1)) x
+	         ORDER BY x.pick
+	         LIMIT 1) r
+	  LEFT JOIN iga_projection_job j ON j.workspace_id = c.workspace_id AND j.scan_run_id = r.id
+	  LEFT JOIN iga_publication p ON p.workspace_id = c.workspace_id AND p.scan_run_id = r.id
+	 WHERE c.workspace_id = ? AND c.provider = ?`
 
 // Pipeline reads the workspace's pipeline state in the snapshot.
 func (q *Query) Pipeline() (*PipelineView, error) {
@@ -111,41 +163,20 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 
 	// Each connector's latest run (D-92): its newest NON-TERMINAL run when it
 	// has one -- uq_cloud_scan_run_live allows at most one -- else its newest
-	// terminal run. Ranked explicitly rather than trusting requested_at alone:
-	// a refused claim moves a live run's requested_at (T1.3), and the ranking
-	// must not depend on which way it moved.
+	// terminal run; and whether the graph holds the connector. One row per
+	// connector that has any run (PipelineLatestRunsSQL); a connector with
+	// none was never scanned, so never published either.
 	var latest []pipelineRun
-	if err := tx.Raw(`
-		SELECT DISTINCT ON (r.connector_id) r.*,
-		       j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,
-		       p.rev AS pub_rev
-		  FROM cloud_scan_run r
-		  LEFT JOIN iga_projection_job j ON j.workspace_id = r.workspace_id AND j.scan_run_id = r.id
-		  LEFT JOIN iga_publication p ON p.workspace_id = r.workspace_id AND p.scan_run_id = r.id
-		 WHERE r.workspace_id = ?
-		 ORDER BY r.connector_id, (r.status IN (?, ?)) DESC, r.requested_at DESC, r.id DESC`,
-		q.WS, models.CloudScanRunQueued, models.CloudScanRunRunning).Scan(&latest).Error; err != nil {
+	if err := tx.Raw(PipelineLatestRunsSQL,
+		models.CloudScanRunQueued, models.CloudScanRunRunning,
+		q.WS, models.CloudProviderAWS).Scan(&latest).Error; err != nil {
 		return nil, err
 	}
 	latestBy := make(map[uuid.UUID]*pipelineRun, len(latest))
+	everPublished := make(map[uuid.UUID]bool, len(latest))
 	for i := range latest {
 		latestBy[latest[i].ConnectorID] = &latest[i]
-	}
-
-	// Which connectors have ever been published into the graph: a
-	// publication of one of their runs exists (at most one row per
-	// connector here).
-	var published []struct{ ConnectorID uuid.UUID }
-	if err := tx.Raw(`
-		SELECT DISTINCT r.connector_id
-		  FROM iga_publication p
-		  JOIN cloud_scan_run r ON r.workspace_id = p.workspace_id AND r.id = p.scan_run_id
-		 WHERE p.workspace_id = ?`, q.WS).Scan(&published).Error; err != nil {
-		return nil, err
-	}
-	everPublished := make(map[uuid.UUID]bool, len(published))
-	for _, p := range published {
-		everPublished[p.ConnectorID] = true
+		everPublished[latest[i].ConnectorID] = latest[i].EverPublished
 	}
 
 	barrier, holderRun, err := q.pipelineBarrier()

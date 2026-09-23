@@ -313,3 +313,25 @@ func TestS2TemplateVersionDeclaredConsistently(t *testing.T) {
 		}
 	}
 }
+
+// SigningRegion never hands STS an opt-in region while the selection holds one
+// the account cannot disable -- whatever the sorted order puts first (D-90).
+func TestS2SigningRegionPrefersARegionThatCannotBeDisabled(t *testing.T) {
+	for _, c := range []struct {
+		selected []string
+		want     string
+	}{
+		{[]string{"af-south-1", "ap-east-1", "eu-central-2", "us-east-1"}, "us-east-1"},
+		{[]string{"ap-south-2", "eu-west-1", "us-east-1"}, "eu-west-1"}, // the first default one
+		{[]string{"me-central-1", "us-gov-west-1"}, "us-gov-west-1"},
+		{[]string{"cn-northwest-1"}, "cn-northwest-1"},
+		{[]string{"us-east-1"}, "us-east-1"},
+		// Only opt-in regions selected: nothing better to choose than the first.
+		{[]string{"af-south-1", "ap-south-2"}, "af-south-1"},
+		{nil, ""},
+	} {
+		if got := SigningRegion(c.selected); got != c.want {
+			t.Errorf("SigningRegion(%v) = %q, want %q", c.selected, got, c.want)
+		}
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -152,6 +153,58 @@ type coverageRun struct {
 	Coverage    []byte
 }
 
+// coverageWatermark is one partition's watermark (iga_projection_state): the
+// run the current revision holds that partition from.
+type coverageWatermark struct {
+	ConnectorID   uuid.UUID
+	EstateScopeID uuid.UUID
+	PartitionKey  string
+	LastRunID     uuid.UUID
+}
+
+// coverageScope is the set of surfaces an OLDER run still speaks for: the
+// RequiredSurfaces and RequiredScanners of the partitions whose watermark it
+// is -- the surfaces that decided what those partitions could end.
+//
+// The partitions are the projector's own (igagraph.Partitions over this run's
+// coverage, with the watermark's scope and connector), matched by key, so the
+// read side never re-derives which surface a partition needs. A watermark
+// whose key this build does not produce (a partition kind renamed since, D-60)
+// cannot be scoped: nil, and the run's every surface is shown -- an old gap
+// shown is a claim of less, a hidden one would be a claim of more.
+func coverageScope(run coverageRun, cov models.ScanCoverage, marks []coverageWatermark) map[string]bool {
+	if len(marks) == 0 {
+		return nil
+	}
+	byKey := map[string]igagraph.Partition{}
+	built := map[uuid.UUID]bool{}
+	scope := map[string]bool{}
+	for _, m := range marks {
+		if !built[m.EstateScopeID] {
+			built[m.EstateScopeID] = true
+			snap := &igagraph.Snapshot{
+				ScopeID:  m.EstateScopeID,
+				Run:      models.CloudScanRun{ID: run.ID, ConnectorID: run.ConnectorID},
+				Coverage: cov.Surfaces,
+			}
+			for _, p := range igagraph.Partitions(snap) {
+				byKey[p.Key()] = p
+			}
+		}
+		p, ok := byKey[m.PartitionKey]
+		if !ok {
+			return nil
+		}
+		for _, name := range p.RequiredSurfaces {
+			scope[name] = true
+		}
+		for _, name := range p.RequiredScanners {
+			scope[name] = true
+		}
+	}
+	return scope
+}
+
 // coverageDetail decodes the optional per-surface detail D-71 adds to a run's
 // coverage, beside the typed models.ScanCoverage.
 type coverageDetail struct {
@@ -224,15 +277,31 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 	// of these connectors. Usually one run per connector (its latest projected
 	// run); an older one where a partition the latest run did not carry still
 	// stands on it.
-	var runs []coverageRun
+	var watermarks []coverageWatermark
 	if err := tx.Raw(`
-		SELECT r.id, r.connector_id, r.published_at, r.coverage
-		  FROM cloud_scan_run r
-		 WHERE r.workspace_id = ?
-		   AND r.id IN (SELECT DISTINCT ps.last_run_id FROM iga_projection_state ps
-		                 WHERE ps.workspace_id = ? AND ps.connector_id IN ?)`,
-		q.WS, q.WS, order).Scan(&runs).Error; err != nil {
+		SELECT ps.connector_id, ps.estate_scope_id, ps.partition_key, ps.last_run_id
+		  FROM iga_projection_state ps
+		 WHERE ps.workspace_id = ? AND ps.connector_id IN ?`,
+		q.WS, order).Scan(&watermarks).Error; err != nil {
 		return nil, err
+	}
+	standing := map[uuid.UUID][]coverageWatermark{} // run -> the partitions standing on it
+	runIDs := []uuid.UUID{}
+	for _, w := range watermarks {
+		if _, ok := standing[w.LastRunID]; !ok {
+			runIDs = append(runIDs, w.LastRunID)
+		}
+		standing[w.LastRunID] = append(standing[w.LastRunID], w)
+	}
+	var runs []coverageRun
+	if len(runIDs) > 0 {
+		if err := tx.Raw(`
+			SELECT r.id, r.connector_id, r.published_at, r.coverage
+			  FROM cloud_scan_run r
+			 WHERE r.workspace_id = ? AND r.id IN ?`,
+			q.WS, runIDs).Scan(&runs).Error; err != nil {
+			return nil, err
+		}
 	}
 	// Newest first, so each surface is taken from the newest run that carries
 	// it: that run is the latest word on the surface in this revision.
@@ -248,15 +317,30 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		if acct == nil {
 			continue
 		}
+		// The connector's NEWEST run is the latest word on every surface it
+		// carries. An OLDER run speaks only for the partitions still standing
+		// on it: a surface is taken from it only when one of those partitions
+		// requires or vetoes on it (coverageScope). Its connector-wide
+		// failure -- a permission_scan stand-in, say -- stood for partitions a
+		// newer run has since re-read, and showing it would claim a gap the
+		// revision no longer has.
+		newest := seen[run.ConnectorID] == nil
 		acct.Runs = append(acct.Runs, R(RefScanRun, run.ID))
-		if seen[run.ConnectorID] == nil {
+		if newest {
 			seen[run.ConnectorID] = map[string]bool{}
 		}
 		cov := models.DecodeScanCoverage(run.Coverage)
+		var scope map[string]bool
+		if !newest {
+			scope = coverageScope(run, cov, standing[run.ID])
+		}
 		var detail coverageDetail
 		_ = json.Unmarshal(run.Coverage, &detail) // optional; absent is null
 		for name, s := range cov.Surfaces {
 			if seen[run.ConnectorID][name] {
+				continue
+			}
+			if scope != nil && !scope[name] {
 				continue
 			}
 			seen[run.ConnectorID][name] = true

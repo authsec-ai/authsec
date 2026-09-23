@@ -27,6 +27,12 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 	// Run 1: published and projected (rev 1).
 	published := l.scanAndProject(a)
 
+	// Account B's run, INTERLEAVED with A's: requested between A's first and
+	// second, in the same workspace -- so a history that leaked another
+	// connector's runs would show it among A's, in A's time order.
+	time.Sleep(5 * time.Millisecond)
+	bRun := l.scanAndProject(b)
+
 	// Run 2: failed -- claimed, then failed under its own fence.
 	time.Sleep(5 * time.Millisecond)
 	failed, err := l.runs.Enqueue(l.ws, a.conn, "manual")
@@ -187,6 +193,15 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 				t.Fatalf("run %s is on both pages", digs(r, "ref"))
 			}
 		}
+	}
+
+	// B's history is B's run alone, and names B: one connector's history
+	// never lists another's runs, however they interleave.
+	code, body = api.do(http.MethodGet, "/aws/connectors/"+b.conn.String()+"/scan-runs", nil)
+	mustStatus(t, "B's history", code, body, http.StatusOK)
+	if rows := digl(body, "data"); len(rows) != 1 || digs(rows[0], "ref") != refOf("cloud_scan_run", bRun.ID) ||
+		digs(rows[0], "integration") != refOf("cloud_connector", b.conn) {
+		t.Fatalf("B's history = %v, want exactly B's one run", body)
 	}
 
 	// A cursor is bound to its connector: presented on another's history it

@@ -903,18 +903,23 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	// (could not assume the role, connector vanished mid-scan, …) gets one
 	// surface entry standing in for the surfaces it never got to attempt --
 	// the same reasoning as workload_scan.go's own "compute:region" entry.
+	//
+	// Each carries the call and the AWS code the failure named, when it named
+	// them (§5.3 /coverage api, error_code; D-71): a role that could not be
+	// assumed for the permission scan says sts:AssumeRole and AWS's code, not
+	// only prose.
 	if permErr != nil && permSurfaces == nil {
-		merged.Surfaces[models.SurfacePermissionScan] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfacePermissionScan] = withFailedCall(models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: permErr.Error(),
-		}
+		}, permErr)
 	}
 	for k, v := range permSurfaces {
 		merged.Surfaces[k] = v
 	}
 	if workloadErr != nil && workloadSurfaces == nil {
-		merged.Surfaces[models.SurfaceWorkloadScan] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfaceWorkloadScan] = withFailedCall(models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: workloadErr.Error(),
-		}
+		}, workloadErr)
 	}
 	for k, v := range workloadSurfaces {
 		merged.Surfaces[k] = v

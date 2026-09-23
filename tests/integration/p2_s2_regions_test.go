@@ -399,33 +399,163 @@ func TestP2S2VerifyDoesNotUndoARegionChange(t *testing.T) {
 
 // A region outside the built-in list can now be selected (any ENABLED one);
 // deselecting it must still leave its earlier results kept and marked STALE
-// (§2.14.13), not "current" forever.
+// (§2.14.13), not "current" forever -- on EVERY later scan, not only the
+// first. The first scan after the deselection deletes the region's workloads
+// from inventory (reconciliation: they were not seen), and a region that held
+// none never left a row, so neither can be what remembers the region: the
+// selection's history does (attrs.regions_ever_selected).
 func TestP2S2DeselectedRegionIsKeptStale(t *testing.T) {
 	l := newP2Lab(t, "p2-s2-deselect", true)
-	a := l.account(accountA, "us-east-1", "ap-south-2") // not in the built-in 17
+	// Neither ap-south-2 nor eu-central-2 is in the built-in 17;
+	// eu-central-2 holds no compute at all.
+	a := l.account(accountA, "us-east-1", "ap-south-2", "eu-central-2")
 	role := a.role("fn-role", "AROAS2DESELECTXXXXXX")
 	a.lambda("ap-south-2", "hyderabad-fn", role)
-	a.svc.WithRegionsAPI(s2Regions("us-east-1", "ap-south-2"))
+	a.svc.WithRegionsAPI(s2Regions("us-east-1", "ap-south-2", "eu-central-2"))
 	api := s2DiscoveryAPI(t, l, a.svc)
-	l.scanAndProject(a)
+	read := l.api()
+	first := l.scanAndProject(a)
 	if st := s2EdgeState(l, "hyderabad-fn"); st != models.RelCurrent {
 		t.Fatalf("setup: hyderabad-fn executes_as = %q, want current", st)
 	}
+	if st := s2Coverage(first).Surfaces["lambda:eu-central-2"].State; st != models.CloudCoverageReached {
+		t.Fatalf("setup: lambda:eu-central-2 = %q, want reached (read, empty)", st)
+	}
 
 	code, body := api.patchRegions(a.conn, "us-east-1")
-	mustStatus(t, "deselect ap-south-2", code, body, http.StatusOK)
-	run := l.scanAndProject(a)
+	mustStatus(t, "deselect ap-south-2 and eu-central-2", code, body, http.StatusOK)
+	if got := s2Connector(t, l, a.conn).DeselectedRegions(); !reflect.DeepEqual(got, []string{"ap-south-2", "eu-central-2"}) {
+		t.Fatalf("deselected regions = %v, want [ap-south-2 eu-central-2]", got)
+	}
 
-	if st := s2Coverage(run).Surfaces["compute:ap-south-2"].State; st != models.CloudCoverageNotSelected {
-		t.Fatalf("compute:ap-south-2 after deselection = %q, want not_selected", st)
+	for i := 1; i <= 2; i++ {
+		run := l.scanAndProject(a)
+		for _, region := range []string{"ap-south-2", "eu-central-2"} {
+			if st := s2Coverage(run).Surfaces["compute:"+region].State; st != models.CloudCoverageNotSelected {
+				t.Fatalf("scan %d after deselection: compute:%s = %q, want not_selected", i, region, st)
+			}
+			if _, ok := s2Coverage(run).Surfaces["lambda:"+region]; ok {
+				t.Fatalf("scan %d after deselection read lambda:%s", i, region)
+			}
+		}
+		if st := s2EdgeState(l, "hyderabad-fn"); st != models.RelStale {
+			t.Fatalf("scan %d: hyderabad-fn executes_as after deselection = %q, want stale (kept, not confirmed)", i, st)
+		}
+		var life string
+		l.db.Raw(`SELECT lifecycle FROM iga_workload WHERE workspace_id = ? AND display_name = 'hyderabad-fn'`, l.ws).Scan(&life)
+		if life != models.IGALifecycleActive {
+			t.Fatalf("scan %d: hyderabad-fn = %q after deselection, want active (kept)", i, life)
+		}
+
+		// /coverage: the revision stands on THIS run alone -- every partition
+		// of both regions was attempted by it -- so it says not selected, with
+		// the fix, and never the earlier run's "reached" for a region nobody
+		// reads any more.
+		acc := s2CoverageAccount(t, read, "", a)
+		if runs := digl(acc, "runs"); len(runs) != 1 || digs(runs[0]) != refOf("cloud_scan_run", run.ID) {
+			t.Fatalf("scan %d: /coverage runs = %v, want only %s", i, runs, run.ID)
+		}
+		for _, region := range []string{"ap-south-2", "eu-central-2"} {
+			ns := s2Surface(t, acc, "compute:"+region)
+			if digs(ns, "state") != models.CloudCoverageNotSelected || digs(ns, "fix") != "change_regions" {
+				t.Fatalf("scan %d: /coverage compute:%s = %v, want not_selected with change_regions", i, region, ns)
+			}
+			for _, s := range digl(acc, "surfaces") {
+				if digs(s, "surface") == "lambda:"+region {
+					t.Fatalf("scan %d: /coverage still shows lambda:%s = %v for a region nobody reads", i, region, s)
+				}
+			}
+		}
 	}
-	if st := s2EdgeState(l, "hyderabad-fn"); st != models.RelStale {
-		t.Fatalf("hyderabad-fn executes_as after deselection = %q, want stale (kept, not confirmed)", st)
+}
+
+// The selection's history (attrs.regions_ever_selected) only grows: every
+// region any selection held, across PATCHes -- including a PATCH that commits
+// while another is waiting on AWS, whose regions the waiting one never read.
+// A region dropped from the history would have its earlier results treated
+// as gone by the next scan instead of kept and stale (§2.14.13).
+func TestP2S2RegionHistoryOnlyGrows(t *testing.T) {
+	l := newP2Lab(t, "p2-s2-region-history", true)
+	a := l.account(accountA, "us-east-1", "ap-south-2")
+	fake := s2Regions("us-east-1", "ap-south-2", "eu-central-1", "eu-west-1")
+	a.svc.WithRegionsAPI(fake)
+	api := s2DiscoveryAPI(t, l, a.svc)
+	if got := s2Connector(t, l, a.conn); got.RegionsEverSelected != nil || got.DeselectedRegions() != nil {
+		t.Fatalf("an onboarded connector records history %v before any change", got.RegionsEverSelected)
 	}
-	var life string
-	l.db.Raw(`SELECT lifecycle FROM iga_workload WHERE workspace_id = ? AND display_name = 'hyderabad-fn'`, l.ws).Scan(&life)
-	if life != models.IGALifecycleActive {
-		t.Fatalf("hyderabad-fn = %q after deselection, want active (kept)", life)
+
+	// The first change records what the connector was onboarded with.
+	code, body := api.patchRegions(a.conn, "us-east-1")
+	mustStatus(t, "PATCH us-east-1", code, body, http.StatusOK)
+	code, body = api.patchRegions(a.conn, "eu-central-1")
+	mustStatus(t, "PATCH eu-central-1", code, body, http.StatusOK)
+	got := s2Connector(t, l, a.conn)
+	if !reflect.DeepEqual(got.RegionsEverSelected, []string{"ap-south-2", "eu-central-1", "us-east-1"}) ||
+		!reflect.DeepEqual(got.DeselectedRegions(), []string{"ap-south-2", "us-east-1"}) {
+		t.Fatalf("history after two changes = %v (deselected %v)", got.RegionsEverSelected, got.DeselectedRegions())
+	}
+
+	// A change that commits while this PATCH waits on AWS: the history is
+	// grown from the row as it is at the write, never from what this PATCH
+	// read before asking.
+	fake.during = func() {
+		l.db.Exec(`UPDATE cloud_connector
+		              SET attrs = jsonb_set(jsonb_set(attrs, '{regions}', '["eu-west-1"]'),
+		                                    '{regions_ever_selected}', '["ap-south-2","eu-central-1","eu-west-1","us-east-1"]')
+		            WHERE id = ?`, a.conn)
+	}
+	code, body = api.patchRegions(a.conn, "us-east-1")
+	mustStatus(t, "PATCH racing another change", code, body, http.StatusOK)
+	fake.during = nil
+	got = s2Connector(t, l, a.conn)
+	if !reflect.DeepEqual(got.Regions, []string{"us-east-1"}) ||
+		!reflect.DeepEqual(got.RegionsEverSelected, []string{"ap-south-2", "eu-central-1", "eu-west-1", "us-east-1"}) {
+		t.Fatalf("after a racing change: regions %v, history %v; want [us-east-1] and eu-west-1 kept in the history",
+			got.Regions, got.RegionsEverSelected)
+	}
+}
+
+// A selection is stored SORTED (D-90), and opt-in regions (af-south-1,
+// ap-east-1, ap-south-2 ...) sort ahead of most default ones. The region STS
+// is signed for -- and with it ec2:DescribeRegions and every call made without
+// a region of its own -- must still be one the account cannot disable: signed
+// for an opt-in region the account later disabled, every scan's AssumeRole and
+// the DescribeRegions a PATCH needs to REMOVE that region would all go to an
+// endpoint that no longer answers.
+func TestP2S2SigningRegionIsNeverAnOptInSortedFirst(t *testing.T) {
+	l := newP2Lab(t, "p2-s2-signing-region", true)
+	v := okVerifier()
+	svc, _ := newOnboarding(l.db, v)
+	svc.WithRegionsAPI(s2Regions("us-east-1", "af-south-1", "ap-south-2"))
+	c, _, err := svc.Onboard(context.Background(), l.ws, services.AWSOnboardInput{
+		RoleARN: "arn:aws:iam::" + testAccount + ":role/AuthSecCloudDiscovery", ExternalID: mustMint(t, l.ws),
+		Regions: []string{"us-east-1"}, DisplayName: "signing",
+	}, "admin")
+	if err != nil {
+		t.Fatalf("onboard: %v", err)
+	}
+	api := s2DiscoveryAPI(t, l, svc)
+
+	code, body := api.patchRegions(c.ID, "us-east-1", "af-south-1")
+	mustStatus(t, "select af-south-1", code, body, http.StatusOK)
+	if got := s2ConnectorRegions(t, l, c.ID); !reflect.DeepEqual(got, []string{"af-south-1", "us-east-1"}) {
+		t.Fatalf("stored = %v, want sorted [af-south-1 us-east-1]", got)
+	}
+	if _, err := svc.VerifyConnector(context.Background(), l.ws, c.ID); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if v.lastReq.Region != "us-east-1" {
+		t.Fatalf("STS signed for %q with [af-south-1 us-east-1] selected, want us-east-1 (cannot be disabled)", v.lastReq.Region)
+	}
+
+	// Only opt-in regions selected: nothing better than the first to sign for.
+	code, body = api.patchRegions(c.ID, "ap-south-2", "af-south-1")
+	mustStatus(t, "select only opt-in regions", code, body, http.StatusOK)
+	if _, err := svc.VerifyConnector(context.Background(), l.ws, c.ID); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if v.lastReq.Region != "af-south-1" {
+		t.Fatalf("STS signed for %q with only opt-in regions selected, want the first, af-south-1", v.lastReq.Region)
 	}
 }
 

@@ -121,3 +121,42 @@ func classifyRegionsError(err error) error {
 		sentinel: ErrRegionsUnavailable, cause: err,
 	}
 }
+
+// regionsEnabledByDefault are the regions every account in their partition
+// has enabled and CANNOT disable: the commercial regions launched before
+// 20 March 2019, and the GovCloud and China partitions' regions. Every later
+// commercial region (af-south-1, ap-east-1, ap-south-2, eu-central-2,
+// me-central-1 ...) is opt-in, and an account can opt back out of one.
+var regionsEnabledByDefault = map[string]bool{
+	"us-east-1": true, "us-east-2": true, "us-west-1": true, "us-west-2": true,
+	"ca-central-1": true, "sa-east-1": true,
+	"eu-west-1": true, "eu-west-2": true, "eu-west-3": true, "eu-central-1": true, "eu-north-1": true,
+	"ap-south-1": true, "ap-southeast-1": true, "ap-southeast-2": true,
+	"ap-northeast-1": true, "ap-northeast-2": true, "ap-northeast-3": true,
+	"us-gov-west-1": true, "us-gov-east-1": true,
+	"cn-north-1": true, "cn-northwest-1": true,
+}
+
+// SigningRegion picks, from a connector's selection, the region STS -- and
+// every call made without a region of its own (IAM, ec2:DescribeRegions) --
+// is signed for: the first selected region the account cannot disable, else
+// the first selected region.
+//
+// NOT simply the first: a selection is stored sorted (D-90), and opt-in
+// regions (af-south-1, ap-east-1, ap-south-2 ...) sort ahead of most
+// default ones. Signed for an opt-in region the account later disabled, every
+// scan's AssumeRole would go to an endpoint that no longer answers, and
+// DescribeRegions could not run to show the region enabled: false -- so the
+// PATCH that removes it could not be validated (D-54, D-90). A region enabled
+// by default is always answered. Empty for an empty selection.
+func SigningRegion(selected []string) string {
+	for _, r := range selected {
+		if regionsEnabledByDefault[r] {
+			return r
+		}
+	}
+	if len(selected) == 0 {
+		return ""
+	}
+	return selected[0]
+}
