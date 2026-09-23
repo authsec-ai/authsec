@@ -101,6 +101,12 @@ func TestP2ListsLookupByKeyNeverByName(t *testing.T) {
 		t.Errorf("A's row re-pointed at B's connector -> %d %v, want 404: B does not support A's role", code, body)
 	}
 	l.db.Exec(`UPDATE cloud_identity SET connector_id = ? WHERE id = ?`, a.conn, ciA)
+	cwA := listsCloudRow(t, l, "cloud_workload", a.conn, "ticket-tools")
+	l.db.Exec(`UPDATE cloud_workload SET connector_id = ? WHERE id = ?`, b.conn, cwA)
+	if code, body := lookup("cloud_workload:" + cwA.String()); code != 404 {
+		t.Errorf("A's workload row re-pointed at B's connector -> %d %v, want 404: B does not support A's function", code, body)
+	}
+	l.db.Exec(`UPDATE cloud_workload SET connector_id = ? WHERE id = ?`, a.conn, cwA)
 
 	// RECREATED, NOT YET PROJECTED: the scan has collected the new principal
 	// (a new RoleId under the same ARN) but the graph still holds the old one.

@@ -73,6 +73,11 @@ func listsWalk(t *testing.T, api *readAPI, route string, limit int, kv ...string
 			seen[ref] = true
 			all = append(all, r)
 		}
+		// A cursor is issued only when another row exists (limit+1 read), so
+		// the page it opens is never empty.
+		if page > 0 && len(rows) == 0 {
+			t.Fatalf("%s page %d is empty although page %d issued a cursor", route, page, page-1)
+		}
 		next, _ := dig(body, "meta", "next_cursor").(string)
 		if next == "" {
 			return all
@@ -396,9 +401,15 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	a.attach("SharedToolRole", a.managed("NoDeletes", `{"Version":"2012-10-17","Statement":[{`+
 		`"Sid":"NoDeletes","Effect":"Deny","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::support-tickets/*"}]}`))
 	l.scanAndProject(a)
-	// A GitHub resource in the same workspace is never a graph row (D-6).
-	if err := l.db.Exec(`INSERT INTO iga_resources (workspace_id, resource_kind, display_name, provider, source_key)
-	                     VALUES (?, 'repository', 'acme/support-tickets', 'github', 'github␟repo␟1')`, l.ws).Error; err != nil {
+	// A GitHub resource in the same workspace is never a graph row (D-6) --
+	// even one a support row names, so provider = 'aws' is proven on its own
+	// and not only through the support condition.
+	if err := l.db.Exec(`WITH gh AS (
+	                         INSERT INTO iga_resources (workspace_id, resource_kind, display_name, provider, source_key)
+	                         VALUES (?, 'repository', 'acme/support-tickets', 'github', 'github␟repo␟1')
+	                         RETURNING workspace_id, id)
+	                     INSERT INTO iga_object_support (workspace_id, resource_id, connector_id, partition_key, state)
+	                     SELECT workspace_id, id, ?, 'lists-test|github', 'current' FROM gh`, l.ws, a.conn).Error; err != nil {
 		t.Fatalf("seed github resource: %v", err)
 	}
 	// Nor is an AWS reference no projection pass supports (D-6).
@@ -573,8 +584,13 @@ func TestP2ListsIdentities(t *testing.T) {
 	})
 	listsFunctions(a, "us-east-1", "refund", refund, "t1", shared, "t2", shared)
 	l.scanAndProject(a)
-	if err := l.db.Exec(`INSERT INTO iga_identity_accounts (workspace_id, display_name, account_kind, provider, source_key)
-	                     VALUES (?, 'SharedToolRole', 'github_user', 'github', 'github␟user␟1')`, l.ws).Error; err != nil {
+	// A GitHub identity, even with a support row, is never a graph row (D-6).
+	if err := l.db.Exec(`WITH gh AS (
+	                         INSERT INTO iga_identity_accounts (workspace_id, display_name, account_kind, provider, source_key)
+	                         VALUES (?, 'SharedToolRole', 'github_user', 'github', 'github␟user␟1')
+	                         RETURNING workspace_id, id)
+	                     INSERT INTO iga_object_support (workspace_id, identity_account_id, connector_id, partition_key, state)
+	                     SELECT workspace_id, id, ?, 'lists-test|github', 'current' FROM gh`, l.ws, a.conn).Error; err != nil {
 		t.Fatalf("seed github identity: %v", err)
 	}
 	// An AWS row no projection pass supports is not a graph row either (D-6).
@@ -645,6 +661,19 @@ func TestP2ListsIdentities(t *testing.T) {
 	if kinds := strings.Join(listsField(listsWalk(t, api, "/identities", 2, "sort", "-kind"), "kind"), ","); kinds !=
 		"iam_group,iam_user,iam_role,iam_role,iam_role" {
 		t.Errorf("sort=-kind = %s, want the rank reversed", kinds)
+	}
+
+	// t1 and t2 are deleted: their executes_as edges END, and an ended edge is
+	// no longer a use -- neither in the count nor in the used_by filter (D-17:
+	// current or stale only).
+	listsFunctions(a, "us-east-1", "refund", refund)
+	l.scanAndProject(a)
+	after := digl(listsGet(t, api, "/identities"), "data")
+	if r := listsRowBy(t, after, "name", "SharedToolRole"); num(r, "used_by_count", "value") != 0 {
+		t.Errorf("SharedToolRole used_by_count after its workloads ended = %v, want 0", r["used_by_count"])
+	}
+	if got := listsField(listsWalk(t, api, "/identities", 100, "used_by", "workloads"), "name"); !listsSameSet(got, []string{"refund-lambda-role"}) {
+		t.Errorf("used_by=workloads after t1 and t2 ended = %v, want only refund-lambda-role", got)
 	}
 }
 
