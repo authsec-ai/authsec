@@ -141,6 +141,14 @@ func TestTrustEdgeKeyNamesItsEndpoints(t *testing.T) {
 	if PodIdentitySubjectKey(arn, issuer, sa) == arn {
 		t.Error("the association observation's key collides with the role's own observation")
 	}
+	// The CONTRACT with T3.5's writer, pinned byte for byte: it records the
+	// association's observation under exactly this subject_native_id (m1/s3b
+	// builds it as igagraph.PodIdentityEvidenceKey -- the same five parts),
+	// and attachEvidence finds it by rebuilding it from the collected row.
+	// Change one side and the pod-identity edge silently loses its evidence.
+	if want := "aws" + Sep + "pod_identity" + Sep + arn + Sep + issuer + Sep + sa; PodIdentitySubjectKey(arn, issuer, sa) != want {
+		t.Errorf("PodIdentitySubjectKey = %q, want the agreed %q", PodIdentitySubjectKey(arn, issuer, sa), want)
+	}
 }
 
 // protected() answers for both can_assume partitions, and only with their own

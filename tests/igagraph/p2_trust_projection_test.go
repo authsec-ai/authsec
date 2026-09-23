@@ -244,3 +244,129 @@ func TestTrustReadableAtCollectionUnreadableNowFailsThePass(t *testing.T) {
 		t.Errorf("%d can_assume rows written by a failed pass", n)
 	}
 }
+
+// §4.7's OTHER hard error: a document the collector recorded readable that no
+// longer parses AS A WHOLE -- no Statement, or not an object at all. That is
+// the projector and the collector disagreeing (version skew, or a second
+// writer of trust_document), and the only honest answer is to fail the pass.
+// Read as "trusts nobody" instead, it would confirm nothing and END every
+// trust edge the role had on the strength of a document nobody could read.
+// The pass rolls back whole, so the last good read's edge stands, current.
+func TestTrustWholeDocumentUnreadableNowFailsThePass(t *testing.T) {
+	for name, bad := range map[string]string{
+		"no statement":   `{"Version":"2012-10-17"}`,
+		"not an object":  `[]`,
+		"statement text": `{"Version":"2012-10-17","Statement":"sts:AssumeRole"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			est := newEstate(f, "arn:aws:iam::111111111111:role/ledger-role", "AROALEDGERROLELEDGER")
+			est.seed(1)
+			trustSetDocument(f, est.roleID,
+				`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}`)
+			f.mustProject(est.load(f.publishedRun(f.connector, 1, cleanCoverage(region))))
+			var edge uuid.UUID
+			if err := f.db.QueryRow(`SELECT id FROM iga_relationship WHERE workspace_id = $1 AND relationship_type = 'can_assume'
+			                           AND state = 'current'`, f.workspace).Scan(&edge); err != nil {
+				t.Fatalf("setup: the role's can_assume: %v", err)
+			}
+
+			est.seed(2)
+			trustSetDocument(f, est.roleID, bad) // trust_parse_error '': "readable"
+			err := f.project(est.load(f.publishedRun(f.connector, 2, cleanCoverage(region))))
+			if err == nil || !strings.Contains(err.Error(), "parsed at collection, failed now") {
+				t.Fatalf("project = %v, want the pass to fail: collection said readable, the document does not parse", err)
+			}
+			var st string
+			if err := f.db.QueryRow(`SELECT state FROM iga_relationship WHERE id = $1`, edge).Scan(&st); err != nil {
+				t.Fatal(err)
+			}
+			if st != models.RelCurrent {
+				t.Errorf("the last good read's can_assume = %s after a failed pass, want current (nothing committed)", st)
+			}
+			if n := f.scalar(`SELECT count(*) FROM iga_relationship WHERE workspace_id = $1 AND relationship_type = 'can_assume'`,
+				f.workspace); n != 1 {
+				t.Errorf("%d can_assume rows, want the one from the last good read", n)
+			}
+		})
+	}
+}
+
+// trustOtherWorkspace is a second tenant in the same database: its own
+// workspace and its own AWS connector for accountID.
+func trustOtherWorkspace(f *fixture, accountID string) *fixture {
+	f.t.Helper()
+	g := *f
+	g.workspace, g.connector = uuid.New(), uuid.New()
+	g.exec(`INSERT INTO workspaces (id, name) VALUES ($1, 'ws-other')`, g.workspace)
+	g.exec(`INSERT INTO cloud_connector (id, workspace_id, provider, scope_kind, scope_id, auth_ref)
+	        VALUES ($1, $2, 'aws', 'account', $3, 'vault://other')`, g.connector, g.workspace, accountID)
+	return &g
+}
+
+// E14 / D-41 rule 1 across tenants. Tenant 1 trusts a role of an account it has
+// not connected -- a live aws_principal node for that ARN, IN TENANT 1. Tenant
+// 2 has that account connected and the role live, and the role trusts itself.
+// Tenant 1's node is none of tenant 2's business: tenant 2's edge must be
+// sourced from its OWN identity (rule 2), and tenant 2 must get no external
+// principal at all. Were rule 1's lookup not workspace-scoped, tenant 1's node
+// would decide tenant 2's edge source.
+func TestTrustLiveExternalPrincipalsAreThisWorkspaces(t *testing.T) {
+	f := newFixture(t)
+	const shared = "arn:aws:iam::222222222222:role/shared"
+	trustDocFor := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"` + shared + `"},"Action":"sts:AssumeRole"}]}`
+
+	one := newEstate(f, "arn:aws:iam::111111111111:role/ledger-role", "AROALEDGERROLELEDGER")
+	one.seed(1)
+	trustSetDocument(f, one.roleID, trustDocFor)
+	f.mustProject(one.load(f.publishedRun(f.connector, 1, cleanCoverage(region))))
+	if n := f.scalar(`SELECT count(*) FROM iga_relationship r JOIN iga_external_principal ep ON ep.id = r.source_external_principal_id
+	                   WHERE r.workspace_id = $1 AND r.state = 'current' AND ep.mechanism = 'aws_principal' AND ep.subject_claim = $2`,
+		f.workspace, shared); n != 1 {
+		t.Fatalf("setup: tenant 1 has %d live can_assume from an aws_principal %s, want 1", n, shared)
+	}
+
+	g := trustOtherWorkspace(f, "222222222222")
+	two := newEstate(g, shared, "AROASHAREDSHAREDSHAR")
+	two.seed(1)
+	trustSetDocument(g, two.roleID, trustDocFor)
+	g.mustProject(two.load(g.publishedRun(g.connector, 1, cleanCoverage(region))))
+
+	var source *uuid.UUID
+	var self uuid.UUID
+	if err := g.db.QueryRow(`SELECT r.source_identity_account_id, t.id FROM iga_relationship r
+	                           JOIN iga_identity_accounts t ON t.id = r.target_identity_account_id
+	                          WHERE r.workspace_id = $1 AND r.relationship_type = 'can_assume' AND r.state = 'current'`,
+		g.workspace).Scan(&source, &self); err != nil {
+		t.Fatalf("tenant 2's one can_assume: %v", err)
+	}
+	if source == nil || *source != self {
+		t.Errorf("tenant 2's can_assume source = %v, want its own live identity %s (rule 2)", source, self)
+	}
+	if n := g.scalar(`SELECT count(*) FROM iga_external_principal WHERE workspace_id = $1`, g.workspace); n != 0 {
+		t.Errorf("tenant 2 has %d external principals: another tenant's node decided its edge", n)
+	}
+}
+
+// D-88: "*" matches the caller of every assume action, so a role open to any
+// web-identity caller is projected as exactly that -- a can_assume from the
+// one "any AWS principal" node, mechanism oidc_federation -- never as a role
+// nobody may assume.
+func TestTrustAnyoneByWebIdentityIsAnEdge(t *testing.T) {
+	f := newFixture(t)
+	est := newEstate(f, "arn:aws:iam::111111111111:role/ledger-role", "AROALEDGERROLELEDGER")
+	est.seed(1)
+	trustSetDocument(f, est.roleID,
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithWebIdentity"}]}`)
+	f.mustProject(est.load(f.publishedRun(f.connector, 1, cleanCoverage(region))))
+	var kind, subject, mechanism string
+	if err := f.db.QueryRow(`SELECT ep.mechanism, ep.subject_claim, r.mechanism FROM iga_relationship r
+	                           JOIN iga_external_principal ep ON ep.id = r.source_external_principal_id
+	                          WHERE r.workspace_id = $1 AND r.relationship_type = 'can_assume' AND r.state = 'current'`,
+		f.workspace).Scan(&kind, &subject, &mechanism); err != nil {
+		t.Fatalf("the role's one can_assume: %v", err)
+	}
+	if kind != models.ExternalPrincipalAWSAccount || subject != "*" || mechanism != models.MechanismOIDCFederation {
+		t.Errorf("can_assume = %s %q by %s, want aws_account \"*\" by oidc_federation", kind, subject, mechanism)
+	}
+}

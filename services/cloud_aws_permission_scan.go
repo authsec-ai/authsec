@@ -252,7 +252,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 		len(out.UnreadableDocuments) == 0
 	out.Surfaces = map[string]models.SurfaceCoverage{
 		models.SurfaceOIDCProviders:  surfaceResult(len(providers), oidcErr),
-		models.SurfaceEKSPodIdentity: surfaceResult(out.PodIdentityEdges, eksErr),
+		models.SurfaceEKSPodIdentity: podIdentityCoverage(out.PodIdentityEdges, eksErr),
 	}
 	if len(out.UnreadableDocuments) > 0 || out.ParseFailures > 0 || out.StatementsSkipped > 0 {
 		// Written ONLY when something was dropped (canEnd relies on that), and
@@ -361,7 +361,8 @@ func (s *AWSPermissionScanner) writeAssumeEdges(
 // denied) has no row to hang an edge off, and inventing one would create an
 // identity that no scan discovered.
 //
-// Returns the first error encountered. Regions are independent, so one region
+// Returns the first listing error, else the first cluster's describe failures
+// (podIdentityCoverage: partial). Regions are independent, so one region
 // failing does not stop the others -- but any failure means this surface was
 // not fully read, which the caller turns into "not complete" so nothing gets
 // reconciled away.
@@ -381,7 +382,12 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		return nil
 	}
 
-	var firstErr error
+	// firstErr is the first failure to LIST (a reader, the clusters, a
+	// cluster's associations): denied or throttled. detailErr is the first
+	// cluster some of whose describes failed (*PodIdentityDetailFailures):
+	// partial. The listing failure wins -- it is the larger one, and either
+	// keeps every binding this run could not read stale.
+	var firstErr, detailErr error
 	for _, region := range regions {
 		reader, err := s.eksReaderFor(ctx, workspaceID, snapshot.ConnectorID, region)
 		if err != nil {
@@ -396,12 +402,21 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		}
 		for _, cluster := range clusters {
 			assocs, err := reader.PodIdentityAssociations(ctx, cluster.Name)
-			if err != nil {
+			var detail *awsdiscovery.PodIdentityDetailFailures
+			switch {
+			case err == nil:
+			case errors.As(err, &detail):
+				if detailErr == nil {
+					detailErr = err
+				}
+			default:
 				if firstErr == nil {
 					firstErr = err
 				}
-				continue
 			}
+			// What WAS read is real even when some describes (or a later
+			// page) failed: written, and so confirmed by this run, while the
+			// error keeps the surface from reading reached.
 			for _, assoc := range assocs {
 				if err := s.writePodIdentityEdge(workspaceID, snapshot, cluster, assoc, out); err != nil {
 					return err
@@ -409,7 +424,23 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 			}
 		}
 	}
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	return detailErr
+}
+
+// podIdentityCoverage is eks_pod_identity's coverage: a listing that succeeded
+// with some describes failing is partial (§1.4 "a failed detail call makes its
+// surface partial"); anything else is surfaceResult's -- reached, denied or
+// throttled. Every state but reached keeps the bindings this run did not
+// confirm (§2.7).
+func podIdentityCoverage(count int, err error) models.SurfaceCoverage {
+	var detail *awsdiscovery.PodIdentityDetailFailures
+	if errors.As(err, &detail) {
+		return models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: count, Error: err.Error()}
+	}
+	return surfaceResult(count, err)
 }
 
 // writePodIdentityEdge records one association.

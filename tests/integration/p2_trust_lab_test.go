@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/google/uuid"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -74,8 +75,9 @@ func trustRemoveRole(a *p2Account, name string) {
 }
 
 // trustScan is l.scan with an EKS fake of the test's choosing (the lab's own
-// hook answers EKS with an empty fake).
-func trustScan(l *p2Lab, a *p2Account, eks *fakeEKS, owner string) models.CloudScanRun {
+// hook answers EKS with an empty fake). eks is an interface so a wrapped fake
+// (trustFlakyEKS) fits; pass a literal nil for the lab's own.
+func trustScan(l *p2Lab, a *p2Account, eks awsdiscovery.EKSAPI, owner string) models.CloudScanRun {
 	l.t.Helper()
 	queued, err := l.runs.Enqueue(l.ws, a.conn, "manual")
 	if err != nil {
@@ -106,7 +108,7 @@ func trustScan(l *p2Lab, a *p2Account, eks *fakeEKS, owner string) models.CloudS
 var trustSeq int
 
 // trustCycle is one scan (with an optional EKS fake) and one projection.
-func trustCycle(l *p2Lab, a *p2Account, eks *fakeEKS) models.CloudScanRun {
+func trustCycle(l *p2Lab, a *p2Account, eks awsdiscovery.EKSAPI) models.CloudScanRun {
 	l.t.Helper()
 	trustSeq++
 	run := trustScan(l, a, eks, fmt.Sprintf("trust-scan-%d", trustSeq))
@@ -204,6 +206,46 @@ func trustIdentityID(l *p2Lab, role string) uuid.UUID {
 		l.t.Fatalf("identity %s: %v", role, err)
 	}
 	return id
+}
+
+// trustPodEvidenceWriterLanded says whether T3.5's writer of the pod-identity
+// association observation (§4.8, §1.4 "observation added") is on this branch.
+// It is NOT: m1/s3b carries it (recordPodIdentityEvidence, keyed
+// igagraph.PodIdentityEvidenceKey, byte-equal to PodIdentitySubjectKey --
+// pinned in internal/igagraph). Until it lands no collector writes that
+// observation, so every production pod-identity can_assume is an edge without
+// evidence and T4.9's zero cannot hold for an account with a pod association.
+// TestP2TrustPodIdentityEvidenceRatchet holds that gap at exactly its known
+// size and fails the moment it moves: flip this to true when the writer
+// merges, and the ratchet becomes T4.9's zero for pod-identity edges.
+const trustPodEvidenceWriterLanded = false
+
+// trustPodObservation stands in for T3.5's writer ONLY while it has not
+// landed: the association's observation as that writer records it -- the
+// role as the typed subject, PodIdentitySubjectKey as subject_native_id,
+// confirmed by this run. Once the collector writes its own, nothing is added,
+// so a test never sees two observations of one association.
+func trustPodObservation(l *p2Lab, a *p2Account, run models.CloudScanRun, roleARN, issuer, sa string) {
+	l.t.Helper()
+	key := igagraph.PodIdentitySubjectKey(roleARN, issuer, sa)
+	var written int64
+	l.db.Raw(`SELECT count(*) FROM cloud_observation WHERE workspace_id = ? AND subject_native_id = ?
+	            AND source_api = 'eks:DescribePodIdentityAssociation' AND last_confirmed_run_id = ?`,
+		l.ws, key, run.ID).Scan(&written)
+	if trustPodEvidenceWriterLanded || written > 0 {
+		return
+	}
+	var roleCloudID uuid.UUID
+	if err := l.db.Raw(`SELECT id FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`, l.ws, roleARN).
+		Row().Scan(&roleCloudID); err != nil {
+		l.t.Fatalf("role's cloud_identity: %v", err)
+	}
+	w := services.NewObservationWriter(l.db, l.ws, a.conn, run.ID, run.Generation)
+	if err := w.Record(services.IdentitySubject(roleCloudID), "eks:DescribePodIdentityAssociation",
+		models.SurfaceEKSPodIdentity, models.CloudCoverageReached, time.Now(), key,
+		map[string]any{"role_arn": roleARN, "oidc_issuer": issuer, "k8s_subject": sa}); err != nil {
+		l.t.Fatalf("record association observation: %v", err)
+	}
 }
 
 func trustBool(b *bool) string {
@@ -723,20 +765,7 @@ func TestP2TrustIRSAAndPodIdentity(t *testing.T) {
 	eks := podIdentityEKS(roleARN)
 
 	run := trustScan(l, a, eks, "trust-pod-scan-1")
-	// The association's observation, as T3.5's writer is to record it: the
-	// role as subject, PodIdentitySubjectKey as subject_native_id.
-	var roleCloudID uuid.UUID
-	if err := l.db.Raw(`SELECT id FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`, l.ws, roleARN).
-		Row().Scan(&roleCloudID); err != nil {
-		t.Fatalf("role's cloud_identity: %v", err)
-	}
-	w := services.NewObservationWriter(l.db, l.ws, a.conn, run.ID, run.Generation)
-	if err := w.Record(services.IdentitySubject(roleCloudID), "eks:DescribePodIdentityAssociation",
-		models.SurfaceEKSPodIdentity, models.CloudCoverageReached, time.Now(),
-		igagraph.PodIdentitySubjectKey(roleARN, eksIssuerNoSch, sa),
-		map[string]any{"cluster_name": "prod-cluster", "namespace": "payments", "service_account": "ledger-agent"}); err != nil {
-		t.Fatalf("record association observation: %v", err)
-	}
+	trustPodObservation(l, a, run, roleARN, eksIssuerNoSch, sa)
 	l.project("trust-pod-projector-1")
 
 	edges := trustEdgesTo(trustEdges(l), "ledger-role")
@@ -974,5 +1003,64 @@ func TestP2TrustUnlistedOwnPrincipalIsNotTheSource(t *testing.T) {
 	if len(ended) != 1 || ended[0].ID != before[0].ID || !ended[0].LastConfirmed.Equal(before[0].LastConfirmed) {
 		t.Errorf("consumer's ended edges = %+v, want the old identity edge, last confirmed %s and never again",
 			ended, before[0].LastConfirmed)
+	}
+}
+
+// trustAttrKeys lists the trust_* keys of one graph identity's provider_attrs.
+func trustAttrKeys(l *p2Lab, id uuid.UUID) []string {
+	l.t.Helper()
+	var keys []string
+	if err := l.db.Raw(`SELECT k FROM iga_identity_accounts a, jsonb_object_keys(a.provider_attrs) k
+	                     WHERE a.workspace_id = ? AND a.id = ? AND k LIKE 'trust%' ORDER BY k`, l.ws, id).
+		Scan(&keys).Error; err != nil {
+		l.t.Fatalf("provider_attrs keys of %s: %v", id, err)
+	}
+	return keys
+}
+
+// §2.4 / E8 for the trust flags (D-44, D-45, D-88): an unreadable document
+// keeps what the SAME incarnation's last read said, but a role deleted and
+// recreated under the same ARN is a different principal. Its first document
+// is unreadable, so nothing is known about it: its row carries NO trust flag
+// -- not its predecessor's Deny, NotPrincipal or NotAction, which are claims
+// about a document this incarnation never had, and which the read side would
+// turn into limitations on every path into the new role. The predecessor's
+// row keeps its own, as history.
+func TestP2TrustRecreatedRoleInheritsNoTrustFlags(t *testing.T) {
+	l := newP2Lab(t, "p2-trust-recreated-flags", true)
+	a := l.account(accountA)
+	partner := "arn:aws:iam::" + trustAccountC + ":root"
+	trustRole(a, "gatekeeper", "AROAGATEKEEPEROLD001", trustDoc(
+		trustAllow(`{"Service":"lambda.amazonaws.com"}`, "sts:AssumeRole"),
+		`{"Effect":"Deny","Principal":{"AWS":"`+partner+`"},"Action":"sts:AssumeRole"}`,
+		`{"Effect":"Deny","NotPrincipal":{"AWS":"`+partner+`"},"Action":"sts:AssumeRole"}`,
+		`{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"NotAction":"sts:TagSession"}`))
+	trustCycle(l, a, nil)
+	old := trustIdentityID(l, "gatekeeper")
+	all := []string{igagraph.TrustHasDenyAttr, igagraph.TrustHasNotPrincipalAttr, igagraph.TrustNegatedStatementsAttr}
+	if got := trustAttrKeys(l, old); strings.Join(got, ",") != strings.Join(all, ",") {
+		t.Fatalf("setup: first incarnation's trust keys = %v, want %v", got, all)
+	}
+	if deny, np := trustProviderAttrs(l, "gatekeeper"); deny == nil || !*deny || np == nil || !*np {
+		t.Fatalf("setup: flags = deny %s not_principal %s, want true/true", trustBool(deny), trustBool(np))
+	}
+
+	a.role("gatekeeper", "AROAGATEKEEPERNEW001") // same ARN, new RoleId
+	trustSetDoc(a, "gatekeeper", trustDoc(`{"Effect":"Allow","Principal":{"AWS":12},"Action":"sts:AssumeRole"}`))
+	trustCycle(l, a, nil)
+	fresh := trustIdentityID(l, "gatekeeper")
+	if fresh == old {
+		t.Fatal("setup: the recreated role kept its graph identity")
+	}
+	var parseErr string
+	l.db.Raw(`SELECT trust_parse_error FROM cloud_identity WHERE workspace_id = ? AND name = 'gatekeeper'`, l.ws).Scan(&parseErr)
+	if parseErr == "" {
+		t.Fatal("setup: the new incarnation's document should be unreadable")
+	}
+	if got := trustAttrKeys(l, fresh); len(got) != 0 {
+		t.Errorf("recreated role's trust keys = %v, want none: its only document was unreadable", got)
+	}
+	if got := trustAttrKeys(l, old); strings.Join(got, ",") != strings.Join(all, ",") {
+		t.Errorf("predecessor's trust keys = %v, want its own %v kept as history", got, all)
 	}
 }

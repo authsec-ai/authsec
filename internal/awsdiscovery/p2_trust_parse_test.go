@@ -268,9 +268,24 @@ func TestTrustActionDecidesMechanism(t *testing.T) {
 		"aws principal under web identity":  {`{"Effect":"Allow","Principal":{"AWS":"905418271234"},"Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
 		"mixed statement": {`{"Effect":"Allow","Principal":{"AWS":"905418271234",` + gh + `},` +
 			`"Action":["sts:AssumeRole","sts:AssumeRoleWithWebIdentity"]}`, []string{MechanismSTSAssumeRole, MechanismOIDCFederation}},
-		"anyone by assume role":  {`{"Effect":"Allow","Principal":"*","Action":"sts:Assume*"}`, []string{MechanismSTSAssumeRole}},
-		"anyone by web identity": {`{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
-		"everything":             {`{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"*"}`, []string{MechanismSTSAssumeRole}},
+		"anyone by assume role": {`{"Effect":"Allow","Principal":"*","Action":"sts:Assume*"}`, []string{MechanismSTSAssumeRole}},
+		// "*" matches the caller of every assume action (D-88): a role open
+		// to any web-identity or SAML caller is the widest trust there is,
+		// never "nobody may assume it". The mechanism names an action the
+		// statement allows.
+		"anyone by web identity": {`{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithWebIdentity"}`,
+			[]string{MechanismOIDCFederation}},
+		"anyone by saml": {`{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithSAML"}`,
+			[]string{MechanismSAMLFederation}},
+		"anyone by a not action sparing only federation": {`{"Effect":"Allow","Principal":"*","NotAction":"sts:AssumeRole"}`,
+			[]string{MechanismOIDCFederation}},
+		"anyone by a not action sparing only saml": {`{"Effect":"Allow","Principal":"*",` +
+			`"NotAction":["sts:AssumeRole","sts:AssumeRoleWithWebIdentity"]}`, []string{MechanismSAMLFederation}},
+		"anyone under tag session alone assumes nothing": {`{"Effect":"Allow","Principal":"*","Action":"sts:TagSession"}`, nil},
+		"anyone by every assume action is one edge": {`{"Effect":"Allow","Principal":"*",` +
+			`"Action":["sts:AssumeRoleWithSAML","sts:AssumeRoleWithWebIdentity","sts:AssumeRole"]}`, []string{MechanismSTSAssumeRole}},
+		"aws star keeps the aws rule": {`{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
+		"everything":                  {`{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"*"}`, []string{MechanismSTSAssumeRole}},
 		"saml under web identity": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::1:saml-provider/Okta"},` +
 			`"Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
 		"saml by not action": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::1:saml-provider/Okta"},` +

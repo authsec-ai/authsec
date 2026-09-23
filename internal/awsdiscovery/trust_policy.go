@@ -423,7 +423,9 @@ type TrustSubject struct {
 	IdentityARN string
 	// Mechanism is how it may assume the role, from the principal's TYPE
 	// (D-88): sts_assume_role for AWS, Service and "*"; oidc_federation for a
-	// web-identity provider; saml_federation for a SAML provider.
+	// web-identity provider; saml_federation for a SAML provider. A "*" whose
+	// statement does not allow sts:AssumeRole takes the federation it does
+	// allow (anyoneMechanism).
 	Mechanism string
 	// Wildcard reports that Subject is a pattern (or "*"): it names a set of
 	// principals, never one, and never resolves (§2.12).
@@ -434,13 +436,19 @@ type TrustSubject struct {
 // in a deterministic order. A federated principal yields one subject per
 // positive `sub` value, or one unscoped "*" subject when there is none.
 //
-// A principal yields a subject only when the statement allows the ONE assume
-// action its type can call (D-43, D-88): sts:AssumeRole for AWS, Service and
-// "*"; sts:AssumeRoleWithWebIdentity for a web-identity provider;
+// A named principal yields a subject only when the statement allows the ONE
+// assume action its type can call (D-43, D-88): sts:AssumeRole for AWS and
+// Service; sts:AssumeRoleWithWebIdentity for a web-identity provider;
 // sts:AssumeRoleWithSAML for a SAML provider. A Federated principal under
 // sts:AssumeRole alone, an AWS principal under web identity alone, anything
 // under sts:TagSession alone: the statement permits no assumption by it, and
 // claiming one would say more than the document does.
+//
+// `"Principal": "*"` names no type: it matches the caller of EVERY assume
+// action, so it yields its one subject when the statement allows ANY of the
+// three (anyoneMechanism). Requiring sts:AssumeRole of it would draw a role
+// open to every web-identity or SAML caller -- the widest trust there is -- as
+// a role nobody may assume.
 //
 // Callers decide what an effect means; a Deny statement's subjects are what it
 // denies, never who may assume the role.
@@ -461,9 +469,9 @@ func (s TrustStatement) Subjects() []TrustSubject {
 	for _, p := range s.Principals {
 		switch p.Type {
 		case PrincipalAnyone:
-			if s.allows(actionAssumeRole) {
+			if mech, ok := s.anyoneMechanism(); ok {
 				sub := classifyAWSEntry(AnyAWSPrincipal)
-				sub.Entry, sub.Mechanism = p, MechanismSTSAssumeRole
+				sub.Entry, sub.Mechanism = p, mech
 				add(sub)
 			}
 		case PrincipalAWS:
@@ -484,6 +492,26 @@ func (s TrustStatement) Subjects() []TrustSubject {
 		}
 	}
 	return out
+}
+
+// anyoneMechanism is how a `"Principal": "*"` statement lets its callers in,
+// and whether it lets anyone in at all (D-88: "An Allow yields edges when its
+// Action matches an assume action"). sts_assume_role whenever sts:AssumeRole
+// is allowed (D-88: "`*` → sts_assume_role"); otherwise the federation the
+// statement DOES allow (D-43), web identity before SAML -- one edge per
+// statement, principal and role (D-88), and never a mechanism naming an action
+// the statement does not allow. Neither decision says the principal "names" a
+// web identity or SAML caller: its node stays "any AWS principal" (D-42).
+func (s TrustStatement) anyoneMechanism() (string, bool) {
+	switch {
+	case s.allows(actionAssumeRole):
+		return MechanismSTSAssumeRole, true
+	case s.allows(actionAssumeRoleWebIdentity):
+		return MechanismOIDCFederation, true
+	case s.allows(actionAssumeRoleSAML):
+		return MechanismSAMLFederation, true
+	}
+	return "", false
 }
 
 // federatedSubjects classifies one Federated entry (D-42): an OIDC provider
