@@ -284,3 +284,27 @@ func federatedPrincipal(providerARN string, cond conditionBlock, webIdentity boo
 	}
 	return p
 }
+
+// ValidateTrustDocument is the collector's readability check for a role's
+// trust document (T3.3/T3.4, P2-DECISIONS D-45): "" when every statement
+// parses, otherwise the reason, written to cloud_identity.trust_parse_error so
+// the projector protects the role's trust edges instead of ending them.
+//
+// The collector (cloud_aws_iam_scan.go) calls this; the per-statement parser
+// (T3.4) owns its body. Until then it checks only that the document is a JSON
+// object with a Statement member.
+func ValidateTrustDocument(doc json.RawMessage) string {
+	if len(doc) == 0 {
+		return "parse: empty trust document"
+	}
+	var top struct {
+		Statement json.RawMessage `json:"Statement"`
+	}
+	if err := json.Unmarshal(doc, &top); err != nil {
+		return fmt.Sprintf("parse: %v", err)
+	}
+	if len(top.Statement) == 0 {
+		return "parse: no Statement"
+	}
+	return ""
+}
