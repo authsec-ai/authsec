@@ -196,6 +196,10 @@ All under `/authsec/discovery/aws`, authenticated, workspace-scoped.
 | `POST` | `/connectors/:id/verify` | `discovery:admin` | Re-prove; records the verdict on the row. |
 | `DELETE` | `/connectors/:id` | `discovery:admin` | Removes the row and purges the ExternalId. The customer's stack is theirs to delete. |
 | `POST` | `/connectors/:id/scan` | `discovery:admin` | Starts the IAM identity scan. 202; poll the connector. |
+| `GET` | `/connectors/:id/regions` | `discovery:read` | The regions ENABLED in the account (`ec2:DescribeRegions` through the discovery role, live): `[{name, opt_in_status, enabled, selected}]`. A selected region the account no longer enables is listed `enabled: false`. When AWS cannot be asked: 200 with the selection, `enabled: null`, and `meta.error {code, api, error_code, message, fault}` (IGA P2 T2.1, D-54, D-90). |
+| `PATCH` | `/connectors/:id` | `discovery:admin` | `{"regions": [...]}` only. Validated against the enabled list; stored de-duplicated and sorted; applies from the next scan to START (a running scan keeps the regions it was claimed with). |
+| `GET` | `/connectors/:id/scan-runs` | `discovery:read` | Run history, newest first: `limit` 1–100 (default 20), `cursor` (signed, bound to the connector). Each run: times, coverage summary, `projection {status, rev, attempts, retrying, last_error}` or null (T2.2, D-91). |
+| `GET` | `/scan-runs/:id` | `discovery:read` | One run, with `projection` as above. |
 | `GET` | `/identities` | `discovery:read` | Discovered identities. Candidates, not agents. |
 | `GET` | `/secrets` | `discovery:read` | Access keys, oldest first. Metadata only. |
 
@@ -218,6 +222,20 @@ sends every case to the same unhelpful place:
 - `fault: aws` (429) — throttled after the SDK's own retries.
 - `fault: authsec` (500) — the backend has no AWS identity of its own. Nothing
   the customer can fix, and it must not be shown to them as their mistake.
+
+The three IGA Phase 2 connector routes above (`…/regions`, `PATCH
+…/connectors/:id`, `…/scan-runs`) answer errors in the structured shape
+`{"error": {"code", "message", ...}}` instead, so the console can branch on a
+code; every older discovery route keeps `{"error": "<string>"}`. Codes:
+`invalid_parameter` (400, with `parameter`), `cursor_invalid` (400),
+`unauthenticated` (401), `not_found` (404, also for another workspace's
+connector), `connector_revoked` (409), `invalid_region` (422, with `regions`:
+every offender, `[]` for an empty selection, and `reason`),
+`regions_unavailable` (422: the enabled list could not be read, so nothing was
+written; with `failure`, `api`, `error_code`, `fault`), `internal` /
+`authsec_misconfigured` (500), `service_unavailable` (503). A refused
+`ec2:DescribeRegions` is `aws_access_denied` with the call and AWS's code —
+never the assume mapping's "check the trust policy": the role was assumed.
 
 ---
 
