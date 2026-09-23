@@ -125,8 +125,18 @@ func (r ClassifyRequest) normalized() (ClassifyRequest, *igaread.Error) {
 		return r, igaread.InvalidParameter("decision", "decision must be classified_agent or unclassified")
 	case r.Reason == "":
 		return r, igaread.InvalidParameter("reason", "reason is required: it is the audit record")
+	case strings.ContainsRune(r.Reason, 0):
+		// PostgreSQL text cannot hold U+0000 (22021), so the INSERT would fail
+		// and a client's malformed text would answer 500 internal, which §5.2
+		// keeps for the database's own failures. Only NUL: a newline or a tab is
+		// ordinary text in a reason, and PostgreSQL stores it. (encoding/json
+		// has already replaced invalid UTF-8 with U+FFFD, so NUL is the only
+		// character a decoded body can carry that text refuses.)
+		return r, igaread.InvalidParameter("reason", "reason must not contain a NUL (U+0000) character")
 	case utf8.RuneCountInString(r.Reason) > MaxClassificationReason:
 		return r, igaread.InvalidParameter("reason", fmt.Sprintf("reason must be at most %d characters", MaxClassificationReason))
+	case strings.ContainsRune(r.Purpose, 0):
+		return r, igaread.InvalidParameter("purpose", "purpose must not contain a NUL (U+0000) character")
 	case utf8.RuneCountInString(r.Purpose) > MaxClassificationPurpose:
 		return r, igaread.InvalidParameter("purpose", fmt.Sprintf("purpose must be at most %d characters", MaxClassificationPurpose))
 	case r.ExpectedVersion < 0:
@@ -203,6 +213,10 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// D-31: a bounded wait for every lock this transaction takes -- the
 		// workload row, the operation key's unique index entry, the clock row.
+		// LOCAL, so it ends with this transaction: the connection returns to
+		// the process's shared pool, which the projector and every other API
+		// also draw from, and a session-level bound would make any later wait
+		// longer than it fail with 55P03 there.
 		if err := tx.Exec(fmt.Sprintf("SET LOCAL lock_timeout = %d", s.lockTimeout.Milliseconds())).Error; err != nil {
 			return err
 		}

@@ -596,6 +596,10 @@ func TestP2ClassValidation(t *testing.T) {
 		{"blank reason", func(b map[string]any) { b["reason"] = "   " }, "reason"},
 		{"reason over 2000 characters", func(b map[string]any) { b["reason"] = strings.Repeat("é", 2001) }, "reason"},
 		{"purpose over 500 characters", func(b map[string]any) { b["purpose"] = strings.Repeat("é", 501) }, "purpose"},
+		// PostgreSQL text refuses U+0000: sent through, the INSERT fails and
+		// the client's malformed text is a 500. Trailing, it is not trimmed.
+		{"NUL in reason", func(b map[string]any) { b["reason"] = "handles\u0000tickets" }, "reason"},
+		{"NUL in purpose", func(b map[string]any) { b["purpose"] = "triage\u0000" }, "purpose"},
 		{"no expected_version", func(b map[string]any) { delete(b, "expected_version") }, "expected_version"},
 		{"negative expected_version", func(b map[string]any) { b["expected_version"] = -1 }, "expected_version"},
 		{"expected_version not a number", func(b map[string]any) { b["expected_version"] = "0" }, "expected_version"},
@@ -643,6 +647,15 @@ func TestP2ClassValidation(t *testing.T) {
 	out := f.classify(f.workload, b)
 	if got := digs(out, "data", "decision", "reason"); got != strings.Repeat("é", 2000) {
 		t.Fatalf("a 2000-character reason came back as %d characters", len([]rune(got)))
+	}
+	// Only NUL is refused: other control characters are ordinary text, and a
+	// multi-line reason is stored as sent (here as the deliberate replacement
+	// at version 1).
+	b = good()
+	b["expected_version"], b["reason"] = 1, "line one\n\tline two"
+	out = f.classify(f.workload, b)
+	if got := digs(out, "data", "decision", "reason"); got != "line one\n\tline two" {
+		t.Fatalf("a multi-line reason came back as %q", got)
 	}
 }
 
@@ -917,6 +930,82 @@ func TestP2ClassCrossWorkspaceIs404(t *testing.T) {
 	}
 }
 
+// classForeignWorkload gives workspace ws (not the lab's) one workload the
+// classification routes can read (D-6: an AWS row with a support row from a
+// connector of ws), and removes what a test decided about it when it ends.
+func classForeignWorkload(t *testing.T, db *gorm.DB, ws uuid.UUID, name string) uuid.UUID {
+	t.Helper()
+	conn := connectorFor(t, db, ws)
+	id := uuid.New()
+	if err := db.Exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, display_name, region, source_key)
+		VALUES (?, ?, 'lambda', ?, 'us-east-1', ?)`, id, ws, name, "aws\x1fclass-test\x1f"+id.String()).Error; err != nil {
+		t.Fatalf("insert workload: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO iga_object_support (workspace_id, workload_id, connector_id, partition_key)
+		VALUES (?, ?, ?, 'class-test')`, ws, id, conn).Error; err != nil {
+		t.Fatalf("insert support: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec(`DELETE FROM iga_workload_classification WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM iga_classification_clock WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM iga_object_support WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM iga_workload WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM cloud_connector WHERE workspace_id = ?`, ws)
+	})
+	return id
+}
+
+// E14 / §5.5 step 2: an operation id names one intent IN ONE WORKSPACE --
+// iga_wc_operation_key is UNIQUE (workspace_id, operation_id). The same id
+// arriving in another workspace, from that workspace's own member about that
+// workspace's own workload, is a fresh decision there: never a replay of, nor
+// 422 operation_id_reused against, a decision its caller cannot see.
+//
+// Safeguard: the step-2 operation lookup is scoped to the workspace. Unscoped,
+// workspace B's request finds workspace A's row, whose hash differs (another
+// workload, another actor), and is refused as operation_id_reused -- one
+// workspace's traffic failing another's, and an answer that tells B the id
+// exists somewhere.
+func TestP2ClassOperationIdIsPerWorkspace(t *testing.T) {
+	f := classSetup(t, "p2-class-op-per-ws")
+	op := uuid.New()
+	body := classBody(op, models.ClassificationClassified, "handles tier-1 tickets", 0, nil)
+	inA := f.classify(f.workload, body)
+
+	otherWS := newWorkspace(t, f.l.db, "p2-class-op-per-ws-other")
+	wB := classForeignWorkload(t, f.l.db, otherWS, "refund-processor")
+	ou, om := classMember(t, f.l.db, otherWS, nil, "other@test.local", "active")
+	f.api.asWorkspace(otherWS).withClaims(classClaims(ou, om))
+
+	// The SAME operation id and the same words, in workspace B.
+	st, inB := f.post(wB, body)
+	mustStatus(t, "the same operation id in another workspace", st, inB, http.StatusOK)
+	if dig(inB, "data", "replayed") != false || digs(inB, "data", "decision", "operation_id") != op.String() ||
+		digs(inB, "data", "classification") != models.ClassificationClassified || num(inB, "data", "classification_version") != 1 {
+		t.Fatalf("the same operation id in another workspace = %v, want a fresh decision (replayed false, version 1)", inB)
+	}
+	if digs(inB, "data", "decision", "id") == digs(inA, "data", "decision", "id") {
+		t.Fatal("workspace B's decision is workspace A's row")
+	}
+	// A retry in B replays B's own decision -- the lookup does find what B wrote.
+	if again := f.classify(wB, body); dig(again, "data", "replayed") != true ||
+		digs(again, "data", "decision", "id") != digs(inB, "data", "decision", "id") {
+		t.Fatalf("a retry in workspace B = %v, want the replay of B's decision", again)
+	}
+
+	// One decision row and one clock movement in EACH workspace.
+	for _, ws := range []uuid.UUID{f.l.ws, otherWS} {
+		if n := f.l.count(`SELECT count(*) FROM iga_workload_classification WHERE workspace_id = ? AND operation_id = ?`, ws, op); n != 1 {
+			t.Errorf("workspace %s holds %d decisions for the operation, want 1", ws, n)
+		}
+		if n := f.l.count(`SELECT COALESCE(max(seq), 0) FROM iga_classification_clock WHERE workspace_id = ?`, ws); n != 1 {
+			t.Errorf("workspace %s clock = %d, want 1", ws, n)
+		}
+	}
+	classWant(t, "workspace A after B's decision", f.state(f.workload),
+		classState{Classification: models.ClassificationClassified, Version: 1, Decisions: 1, Seq: 1})
+}
+
 /* ----------------------- the clock and list consistency ------------------- */
 
 // The classification clock (§5.5) moves exactly once per decision -- not on a
@@ -1053,6 +1142,63 @@ func TestP2ClassLockWaitIsBounded(t *testing.T) {
 		classState{Classification: models.ClassificationUnclassified, Version: 0, Decisions: 0, Seq: 0})
 }
 
+// D-31, the other half: the bound lives and dies with the decision's
+// transaction. The service runs on the process's shared pool (config.DB),
+// whose connections also serve the projector and every other API; a bound
+// left on a pooled connection after a decision committed would make any later
+// transaction there that legitimately waits longer on a lock fail with 55P03.
+//
+// Safeguard: SET LOCAL, not a session-level SET. The service runs here over a
+// pool of ONE connection, so the connection each decision used is the one
+// SHOW reads afterwards; the bound is a value no server default would have.
+func TestP2ClassLockTimeoutIsTransactionScoped(t *testing.T) {
+	f := classSetup(t, "p2-class-lock-scope")
+	one, err := gorm.Open(postgres.Open(os.Getenv("IGA_TEST_DSN")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	sqlDB, err := one.DB()
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	t.Cleanup(func() { sqlDB.Close() })
+	show := func(when string) string {
+		t.Helper()
+		var v string
+		if err := sqlDB.QueryRow(`SHOW lock_timeout`).Scan(&v); err != nil {
+			t.Fatalf("SHOW lock_timeout %s: %v", when, err)
+		}
+		return v
+	}
+	var pid, pidAfter int64
+	if err := sqlDB.QueryRow(`SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatalf("backend pid: %v", err)
+	}
+	before := show("before any decision")
+	if before == "1234ms" {
+		t.Fatalf("the server default lock_timeout is already the test's bound (%s)", before)
+	}
+	f.api.ctl.WithClassificationService(services.NewClassificationService(one).WithLockTimeout(1234 * time.Millisecond))
+
+	body := classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 0, nil)
+	f.classify(f.workload, body) // a committed decision
+	if got := show("after a decision"); got != before {
+		t.Fatalf("lock_timeout on the pooled connection after a decision = %s, want the session's %s", got, before)
+	}
+	f.classify(f.workload, body) // a replay commits too
+	if got := show("after a replay"); got != before {
+		t.Fatalf("lock_timeout on the pooled connection after a replay = %s, want the session's %s", got, before)
+	}
+	// The same backend throughout: SHOW read the connection the decisions ran on.
+	if err := sqlDB.QueryRow(`SELECT pg_backend_pid()`).Scan(&pidAfter); err != nil || pidAfter != pid {
+		t.Fatalf("backend pid %d -> %d (%v): the decisions ran on another connection", pid, pidAfter, err)
+	}
+	classWant(t, "after the decision and its replay", f.state(f.workload),
+		classState{Classification: models.ClassificationClassified, Version: 1, Decisions: 1, Seq: 1})
+}
+
 // With IGA_GRAPH_PROJECTION off there is no graph to decide about: 503
 // graph_unavailable, like every graph route (§2.8).
 func TestP2ClassGraphOffIs503(t *testing.T) {
@@ -1061,6 +1207,51 @@ func TestP2ClassGraphOffIs503(t *testing.T) {
 		classBody(uuid.New(), models.ClassificationClassified, "x", 0, nil))
 	if st != http.StatusServiceUnavailable || errCode(out) != "graph_unavailable" {
 		t.Fatalf("POST with the switch off = %d %v, want 503 graph_unavailable", st, out)
+	}
+}
+
+// D-11 / §2.14.14 "Unavailable features": /capabilities reports
+// features.classification true exactly when its routes are implemented -- in
+// this build, both /workloads/:id/classification routes are -- AND
+// graph_projection is on. Off or misconfigured, every graph route is 503, so
+// the console must not offer Classify.
+//
+// Safeguards: the flag is on (not the M0 constant false, which hides a live
+// feature), and only when the gate is on (not a constant true).
+func TestP2ClassCapabilitiesFeature(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		projection bool
+		verify     bool
+		mode       string
+		want       bool
+	}{
+		{"on", true, true, services.GraphProjectionOn, true},
+		{"off", false, false, services.GraphProjectionOff, false},
+		// Switched on, schema never verified: the fail-closed state (§2.8).
+		{"misconfigured", true, false, services.GraphProjectionMisconfigured, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newP2Lab(t, "p2-class-caps-"+tc.name, false)
+			l.gate = services.NewGraphProjectionGate(tc.projection, "")
+			if tc.verify {
+				if err := l.gate.Verify(l.db); err != nil {
+					t.Fatalf("verify: %v", err)
+				}
+			}
+			st, out := l.api().get("/capabilities")
+			mustStatus(t, "GET /capabilities", st, out, http.StatusOK)
+			if got := digs(out, "data", "graph_projection"); got != tc.mode {
+				t.Fatalf("graph_projection = %q, want %q (%v)", got, tc.mode, out)
+			}
+			feats, _ := dig(out, "data", "features").(map[string]any)
+			if len(feats) != 8 {
+				t.Fatalf("features = %v, want the eight §5.3 keys", feats)
+			}
+			if got, ok := feats["classification"].(bool); !ok || got != tc.want {
+				t.Fatalf("features.classification = %v, want %v", feats["classification"], tc.want)
+			}
+		})
 	}
 }
 

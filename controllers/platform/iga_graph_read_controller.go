@@ -87,15 +87,20 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 	return ctl.reader
 }
 
-// graphFeatures is what THIS build serves (§5.3 /capabilities). A feature is
-// true only when its routes exist: the console hides a feature it is told is
+// graphFeatures is what THIS build serves NOW (§5.3 /capabilities). A feature
+// is true only when its routes are implemented AND graph_projection is on
+// (D-11): with the switch off or misconfigured every graph route answers 503,
+// so nothing is usable. The console hides a feature it is told is
 // unavailable, and a feature reported available with no route behind it would
 // render as empty rather than as unavailable -- which §2.14.7 forbids.
-func graphFeatures() gin.H {
+func graphFeatures(mode string) gin.H {
+	on := mode == services.GraphProjectionOn
 	return gin.H{
 		"workloads": false, "identities": false, "resources": false,
 		"graph": false, "evidence": false, "changes": false,
-		"classification": false, "coverage": false,
+		// T6.6: POST and GET /workloads/:id/classification.
+		"classification": on,
+		"coverage":       false,
 	}
 }
 
@@ -118,7 +123,7 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"graph_projection": mode,
 		"reason":           nullIfEmpty(reason),
-		"features":         graphFeatures(),
+		"features":         graphFeatures(mode),
 		"schema_head":      nullIfEmpty(head),
 	}})
 }
