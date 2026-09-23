@@ -204,3 +204,58 @@ func TestExitsRefuseASupersededWorker(t *testing.T) {
 		})
 	}
 }
+
+// The barrier heartbeat. A projection that outruns the barrier lease would
+// otherwise appear in ExpiredCandidates while perfectly healthy, and the
+// recovery loop could abandon live work. RenewHeld extends the expiry WITHOUT
+// bumping the version, so the holder's fence stays valid.
+func TestBarrierHeartbeatRenewsWithoutBreakingTheFence(t *testing.T) {
+	f, job, version := claimedJob(t, "w1")
+	pipe := repositories.NewIGAPipelineLeaseRepository(f.gorm)
+	fence := repositories.PipelineFence{
+		WorkspaceID: f.workspace, Phase: models.PipelineProjecting,
+		RunID: job.ScanRunID, Version: version,
+	}
+
+	// Let it lapse: recovery would now consider this workspace stalled.
+	f.exec(`UPDATE iga_pipeline_lease SET expires_at = now() - interval '1 minute'
+	         WHERE workspace_id = $1`, f.workspace)
+	stalled, err := pipe.ExpiredCandidates(time.Now(), 50)
+	if err != nil {
+		t.Fatalf("expired candidates: %v", err)
+	}
+	if len(stalled) == 0 {
+		t.Fatal("precondition: an expired barrier must be a recovery candidate")
+	}
+
+	// A heartbeat tick.
+	if err := pipe.RenewHeld(fence, 15*time.Minute, time.Now()); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	// It is no longer a candidate, so recovery will not touch live work...
+	stalled, err = pipe.ExpiredCandidates(time.Now(), 50)
+	if err != nil {
+		t.Fatalf("expired candidates after renew: %v", err)
+	}
+	for _, l := range stalled {
+		if l.WorkspaceID == f.workspace {
+			t.Fatal("a renewed barrier is still listed as expired; recovery could abandon live work")
+		}
+	}
+
+	// ...and the holder's fence STILL WORKS. Bumping the version here would
+	// fence out the very worker doing the work.
+	l, err := pipe.Get(f.workspace)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if l.Version != version {
+		t.Errorf("renew moved the version %d -> %d; the holder's own fence would now fail",
+			version, l.Version)
+	}
+	if err := projectionServiceAs(f, "w1").
+		CompleteAndReleaseForTest(context.Background(), job, version); err != nil {
+		t.Fatalf("the holder could not settle its job after a renewal: %v", err)
+	}
+}

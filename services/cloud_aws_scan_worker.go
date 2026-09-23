@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -63,6 +64,34 @@ type AWSScanWorker struct {
 	// is demanded by every later transition, so a worker that slept past its
 	// expiry is refused because the version moved on.
 	pipelineVersion int64
+
+	// phase2Once caches whether the Phase 2 pipeline tables exist yet.
+	phase2Once  sync.Once
+	phase2Ready bool
+}
+
+// phase2Available reports whether the Phase 2 pipeline tables are present.
+//
+// STAGED ROLLOUT (§6.3, S0). This binary carries Phase 2, but it is deployed
+// while the database may still be at 026 -- the barrier arrives in 027 and the
+// projection job in 033. Referencing either before then fails at PLAN time,
+// which would stop the worker claiming or publishing ANY scan: Phase 1 would
+// break precisely during the window the staged rollout exists to make safe.
+//
+// So when they are absent the worker behaves exactly as it did before Phase 2:
+// no barrier, no projection job. The projector itself refuses to start below
+// 034 (ProjectionService.EnsureSchema), so nothing is left half-wired.
+func (w *AWSScanWorker) phase2Available() bool {
+	w.phase2Once.Do(func() {
+		lease, lerr := repositories.HasRelation(w.db, "iga_pipeline_lease")
+		jobs, jerr := repositories.HasRelation(w.db, "iga_projection_job")
+		w.phase2Ready = lerr == nil && jerr == nil && lease && jobs
+		if !w.phase2Ready {
+			log.Printf("aws scan worker %s: Phase 2 tables absent; "+
+				"scanning without the workspace barrier until migrations 027-034 are applied", w.owner)
+		}
+	})
+	return w.phase2Ready
 }
 
 func NewAWSScanWorker(db *gorm.DB, svc *AWSOnboardingService) *AWSScanWorker {
@@ -146,6 +175,18 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	// spec states plainly -- a customer with five AWS accounts scans them one
 	// at a time, and nothing narrower is sound because the shared-resource
 	// writer crosses connectors.
+	if !w.phase2Available() {
+		// Pre-Phase-2 schema: scan exactly as before, with no barrier.
+		if err := w.execute(ctx, run); err != nil {
+			if ferr := w.runs.Fail(run.ID, w.owner, run.LeaseVersion, err.Error()); ferr != nil {
+				log.Printf("aws scan worker %s: could not record failure for run %s: %v",
+					w.owner, run.ID, ferr)
+			}
+			return true, err
+		}
+		return true, nil
+	}
+
 	version, perr := w.pipeline.AcquireForCollection(
 		run.WorkspaceID, w.owner, run.ID, projectionPipelineLease, w.nowFunc())
 	if perr != nil {
@@ -264,6 +305,11 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 
 	if err := w.runs.PublishWithCoverage(run.ID, w.owner, run.LeaseVersion, merged,
 		func(tx *gorm.DB, published *models.CloudScanRun) error {
+			if !w.phase2Available() {
+				// Nothing to project into yet; publication and coverage still
+				// commit together, which is all Phase 1 needs.
+				return nil
+			}
 			// A published run ALWAYS has a job. A crash between the two is
 			// impossible rather than recovered.
 			if err := w.jobs.EnqueueTx(tx, &models.IGAProjectionJob{

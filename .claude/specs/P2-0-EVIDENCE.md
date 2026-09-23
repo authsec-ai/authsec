@@ -1,6 +1,6 @@
 # P2-0 evidence report
 
-**Commit:** `6b8efeb` on `graph` (parent `4504426`, rebased onto `0e75ad7`)
+**Commit:** `0eef56d` on `graph` (parent `4504426`, rebased onto `0e75ad7`)
 **Date run:** 2026-09-23
 **Database:** PostgreSQL 16, `postgres:16` container, migrations `001`–`034`
 applied in order unless a row says otherwise.
@@ -35,8 +35,9 @@ that never ran, so the skip column is mandatory.
 
 | Suite | Command | Pass | Skip | Fail |
 |---|---|---|---|---|
-| Graph | `go test -count=1 -p 1 -v ./internal/igagraph/... ./tests/igagraph/` | **53** | **0** | **0** |
-| Integration | `go test -count=1 -p 1 -v ./tests/integration/` | **155** | **0** | **0** |
+| Graph | `go test -count=1 -p 1 -v ./internal/igagraph/... ./tests/igagraph/` | **54** | **0** | **0** |
+| Integration (S1/S2, db at 034) | `go test -count=1 -p 1 -v ./tests/integration/` | **159** | **0** | **0** |
+| Phase 1 subset (S0, db at 026) | `go test ./tests/integration/ -run 'TestS0PhaseOne\|TestPermissionScan\|TestIAMScan\|TestWorkload\|TestCloudScanRun\|TestAFailedRun\|TestACrashedWorker\|TestScanRun'` | all pass | 0 | **0** |
 | Build / vet | `go build ./... && go vet ./...` | clean | — | — |
 | Isolation | `bash scripts/ci-iga-isolation-check.sh` | passed (3 rules) | — | — |
 | Migrations | `001`–`034` applied in order to a fresh database | applied | — | — |
@@ -53,7 +54,7 @@ that never ran, so the skip column is mandatory.
 | 6 | An obsolete worker | `TestExitsRefuseASupersededWorker` | Barrier recovered by `w2`; `w1` still holds the old version | `w1` changes **nothing** — not the job, not the barrier | PASS (both sub-cases) | — |
 | 7 | Two accounts naming the same bucket | `TestSharedResourceSurvivesOneAccountDroppingIt` | A and B both name one ARN; B stops | One object, two support rows; B's support ends, A's untouched, object survives | PASS | `retireUnsupported` retiring when **any** support ends → FAILS (verified earlier) |
 | 8 | A superseded scan worker that keeps running | `TestSupersededWorkerInventoryWriteIsRefused` (integration) | `w1` claims, `w2` reclaims the run, `w1` writes | `ErrScanFenceLost`; the row does **not** land | PASS | Neutralising `assertScanFence` → "the superseded write LANDED" |
-| 9 | Crash between publication and coverage | `PublishWithCoverage` | Coverage + publish + job enqueue in one transaction | Either fully published with coverage and a queued job, or not published | **Structural, not executed.** One transaction by construction; no test kills the process mid-commit |
+| 9 | Crash between publication and coverage | `TestPublishWithCoverageIsAtomicOnFailure` / `…CommitsAllThree` / `…RefusesASupersededWorker` | Claimed run; the enqueue hook returns an error mid-transaction | Nothing lands: run unpublished, `published_at` null, coverage unstamped, zero jobs. On success all three land. A superseded worker publishes nothing and the hook never runs | PASS, 3/3 | Committing the publish before the hook (the old 3-step shape) → `TestPublishWithCoverageIsAtomicOnFailure` FAILS |
 
 ## The five proofs
 
@@ -80,29 +81,35 @@ that never ran, so the skip column is mandatory.
 
 | Stage | Schema | Command | Expected | Observed |
 |---|---|---|---|---|
-| S0 | `001`–`026` (`s0`) | `go test ./tests/igagraph/ -run TestSchemaGateRefusesBelow034` | Projector **declines to start**; governance tables present | PASS — refused with *"projector requires migration 034 (relation iga_external_principal is missing…)"*; 153 tables; `agent_policies` present; `iga_external_principal` absent |
-| S1 | `001`–`034`, projector disabled (`s1`) | `go test ./tests/integration/` | Phase 1 scanning unaffected | PASS — 155 pass / 0 skip / 0 fail |
-| S2 | `001`–`034`, projector enabled (`s1`) | `go test ./tests/igagraph/ -run TestSchemaGateAcceptsAt034` + graph suite | Projector starts; the slice works end to end | PASS — accepted at head 034; graph suite 53/0/0 |
+| S0 | `001`–`026` (`s0`) | `TestSchemaGateRefusesBelow034` + `TestS0PhaseOneScanningSurvivesAPrePhase2Schema` + the Phase 1 subset | Projector **declines to start**; **Phase 1 scanning unchanged**; governance routes backed | PASS — refused with *"projector requires migration 034 (relation iga_external_principal is missing…)"*; a 026 database still enqueues, claims and publishes a scan; 153 tables; `agent_policies` and `enforcement_plans` present; `kind_chk` carries all six kinds; `iga_external_principal` absent |
+| S1 | `001`–`034`, projector disabled (`s1`/`iga_int`) | `go test -count=1 -p 1 -v ./tests/integration/` | Phase 1 scanning unaffected | PASS — 159 pass / 0 skip / 0 fail |
+| S2 | `001`–`034`, projector enabled | `TestSchemaGateAcceptsAt034` + graph suite | Projector starts; the slice works end to end | PASS — accepted at head 034; graph suite 54 / 0 / 0 |
+
+**S0 found a real bug, which is why it is run and not reasoned about.** This
+binary carries Phase 2 but is deployed while the database may still be at 026.
+`cloud_scan_run.Claim` named `iga_projection_job` (arrives in 033) and the
+worker acquired `iga_pipeline_lease` (arrives in 027) unconditionally — both
+fail at PLAN time on a 026 schema, so **no scan could be claimed or published
+at all** during the rollout window. Both now probe for the relation once and
+fall back to exactly the pre-Phase-2 behaviour.
+`TestS0PhaseOneScanningSurvivesAPrePhase2Schema` locks it in.
 
 ## What this report does NOT cover
 
 Stated plainly, because a gate that overclaims is worse than one with holes.
 
-1. **Scenario 9 is structural, not executed.** Publication, coverage and job
-   enqueue share one transaction by construction, but no test kills the process
-   mid-commit to observe it.
-2. **S0/S1/S2 are migration states, not deployments.** They prove the schema
-   gate and that each state's suites pass. They are not deploys into an
-   isolated environment, and say nothing about pod startup, config or rollout.
-3. **The §8 production rehearsal is still outstanding.** Everything here runs
+1. **S0/S1/S2 are migration states, not deployments.** They now prove the
+   schema gate, that Phase 1 scanning survives a pre-Phase-2 schema, and that
+   each state's suites pass. They are still not deploys into an isolated
+   environment, and say nothing about pod startup, config or K3s rollout
+   mechanics.
+2. **The §8 production rehearsal is still outstanding.** Everything here runs
    against a schema built from `001`–`034` on a fresh database. The spec is
    explicit that this proves nothing about production drift — `023` and `026`
    both exist because production had diverged from `001_bootstrap.sql`. This
    needs a `pg_dump --schema-only` of production restored into a scratch
    database, with `027`–`034` applied on top. That requires production access
    and has not been done.
-4. **The projection heartbeat's barrier renewal** is implemented and reasoned
-   about, but no test runs a projection long enough to observe a renewal.
-5. **`can_assume`, credentials, agent instances and the read path** are
+3. **`can_assume`, credentials, agent instances and the read path** are
    implemented and covered by the graph suite, but are out of P2-0's slice and
    have no dedicated scenario row here.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -101,7 +102,29 @@ type CloudScanRunRepository interface {
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
 }
 
-type cloudScanRunRepository struct{ db *gorm.DB }
+type cloudScanRunRepository struct {
+	db *gorm.DB
+
+	// projectionJobsOnce caches whether iga_projection_job exists. The answer
+	// only changes when a migration runs, which does not happen under a live
+	// worker, so probing once per process is enough -- and it keeps Claim from
+	// paying for a catalogue lookup on every poll.
+	projectionJobsOnce sync.Once
+	projectionJobs     bool
+}
+
+// hasProjectionJobs reports whether the projection job table exists yet.
+func (r *cloudScanRunRepository) hasProjectionJobs() bool {
+	r.projectionJobsOnce.Do(func() {
+		ok, err := HasRelation(r.db, "iga_projection_job")
+		// On error, assume ABSENT: the predicate is an extra guard, and the
+		// workspace barrier is what actually prevents the overwrite. Losing it
+		// degrades throughput protection; wrongly including it would break
+		// scanning outright.
+		r.projectionJobs = err == nil && ok
+	})
+	return r.projectionJobs
+}
 
 func NewCloudScanRunRepository(db *gorm.DB) CloudScanRunRepository {
 	return &cloudScanRunRepository{db: db}
@@ -152,7 +175,33 @@ func (r *cloudScanRunRepository) Claim(
 	// the previous holder: it recorded the old value, and every later operation
 	// of its own demands the row still carry it.
 	var out []models.CloudScanRun
-	err := r.db.Raw(`
+
+	// The projection predicate names iga_projection_job, which does not exist
+	// until migration 033. Referencing it unconditionally makes this statement
+	// fail at PLAN time on a database at 026 -- so a binary carrying Phase 2
+	// could not claim a scan at all during the window between the two
+	// releases, which is exactly the S0 state the staged rollout exists to
+	// keep working. Include the predicate only once the table is there.
+	projectionPredicate := ""
+	if r.hasProjectionJobs() {
+		// A connector whose previous run is still being projected is not
+		// claimable (SPEC §4.5). The projection reads that run's inventory,
+		// and a new scan would rewrite it underneath.
+		//
+		// TWO CONSEQUENCES, ACCEPTED DELIBERATELY:
+		//   * a WEDGED PROJECTION BLOCKS SCANNING for that connector. That is
+		//     why iga_projection_job has an attempts ceiling and terminal
+		//     states, and why RecoverStalled exists. ALERT ON queued/running
+		//     JOBS OLDER THAN ONE LEASE.
+		//   * scan throughput is bounded by projection. Acceptable at one
+		//     connector per customer and a projection measured in seconds.
+		projectionPredicate = `AND NOT EXISTS (
+			       SELECT 1 FROM iga_projection_job j
+			        WHERE j.connector_id = cloud_scan_run.connector_id
+			          AND j.status IN (?, ?))`
+	}
+
+	query := `
 		UPDATE cloud_scan_run SET
 			status           = ?,
 			lease_owner      = ?,
@@ -170,33 +219,23 @@ func (r *cloudScanRunRepository) Claim(
 			SELECT id FROM cloud_scan_run
 			 WHERE (status = ?
 			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
-			   -- A connector whose previous run is still being projected is not
-			   -- claimable (SPEC §4.5). The projection reads that run's
-			   -- inventory, and a new scan would rewrite it underneath.
-			   --
-			   -- TWO CONSEQUENCES, ACCEPTED DELIBERATELY:
-			   --   * a WEDGED PROJECTION BLOCKS SCANNING for that connector.
-			   --     That is why iga_projection_job has an attempts ceiling and
-			   --     terminal failed/abandoned states: a job must always reach a
-			   --     terminal state or it becomes an outage. ALERT ON
-			   --     queued/running JOBS OLDER THAN ONE LEASE.
-			   --   * scan throughput is bounded by projection. Acceptable at one
-			   --     connector per customer and a projection measured in seconds.
-			   AND NOT EXISTS (
-			       SELECT 1 FROM iga_projection_job j
-			        WHERE j.connector_id = cloud_scan_run.connector_id
-			          AND j.status IN (?, ?))
+			   ` + projectionPredicate + `
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED
 			 LIMIT 1
 		)
-		RETURNING *`,
+		RETURNING *`
+
+	args := []any{
 		models.CloudScanRunRunning, owner, expires, now,
 		now,
 		models.CloudScanRunQueued,
 		models.CloudScanRunRunning, now,
-		models.ProjectionQueued, models.ProjectionRunning,
-	).Scan(&out).Error
+	}
+	if projectionPredicate != "" {
+		args = append(args, models.ProjectionQueued, models.ProjectionRunning)
+	}
+	err := r.db.Raw(query, args...).Scan(&out).Error
 	if err != nil {
 		return nil, err
 	}
