@@ -1446,8 +1446,12 @@ type AWSWorkloadAttrs struct {
 
 // AWSGatewayTarget is one AgentCore gateway target: id, name, status and type
 // verbatim (§1.4). Its backing tool is not collected (§1.2).
+//
+// The JSON keys are exactly the workload detail's provider_attrs shape,
+// gateway_targets [{id, name, status, type}] (D-85), so the projector copies
+// the list as stored instead of renaming keys on the way through.
 type AWSGatewayTarget struct {
-	TargetID string `json:"target_id"`
+	TargetID string `json:"id"`
 	Name     string `json:"name,omitempty"`
 	Status   string `json:"status,omitempty"`
 	Type     string `json:"type,omitempty"`

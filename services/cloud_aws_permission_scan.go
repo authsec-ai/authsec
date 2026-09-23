@@ -396,12 +396,13 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		}
 		for _, cluster := range clusters {
 			assocs, err := reader.PodIdentityAssociations(ctx, cluster.Name)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
+			if err != nil && firstErr == nil {
+				firstErr = err
 			}
+			// T3.6 (S3b): what WAS read is real even when some of the
+			// cluster's describes failed (*awsdiscovery.ItemFailures) --
+			// written, and confirmed, while firstErr keeps the surface
+			// partial and reconciliation off for the rest.
 			for _, assoc := range assocs {
 				if err := s.writePodIdentityEdge(workspaceID, snapshot, cluster, assoc, out); err != nil {
 					return err

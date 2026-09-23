@@ -33,6 +33,9 @@ type s3bFakes struct {
 	s3        awsdiscovery.S3PolicyAPI
 	kms       awsdiscovery.KMSPolicyAPI
 	activity  awsdiscovery.ServiceLastAccessedAPI
+	// cloudTrail answers every region's LookupEvents / DescribeTrails (nil
+	// keeps an empty trail).
+	cloudTrail *fakeCloudTrail
 	// credentialCSV is the credential report's content ("" keeps the lab's
 	// empty report).
 	credentialCSV string
@@ -83,7 +86,11 @@ func (f *s3bFakes) hook(a *p2Account) services.ScannerHook {
 			if f.agentCore != nil {
 				core = f.agentCore
 			}
-			return lam, ecsAPI, ec2API, prof, bed, core, &fakeCloudTrail{}
+			trail := &fakeCloudTrail{}
+			if f.cloudTrail != nil {
+				trail = f.cloudTrail
+			}
+			return lam, ecsAPI, ec2API, prof, bed, core, trail
 		})
 	}
 }

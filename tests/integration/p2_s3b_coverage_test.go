@@ -22,6 +22,8 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
@@ -599,5 +601,108 @@ func TestP2S3bPodIdentityDescribeFailureIsPartialAndKeepsTheEdge(t *testing.T) {
 		ws, models.AssumeMechanismEKSPodIdentity).Row().Scan(&issuer)
 	if issuer == nil || *issuer != eksIssuerNoSch {
 		t.Fatalf("the edge's issuer = %v after a failed DescribeCluster, want %s kept", issuer, eksIssuerNoSch)
+	}
+}
+
+// s3bOneDescribeFails is an EKS API whose DescribePodIdentityAssociation fails
+// for ONE association while every other call answers as the fake does.
+type s3bOneDescribeFails struct {
+	*fakeEKS
+	failID string
+}
+
+func (f *s3bOneDescribeFails) DescribePodIdentityAssociation(ctx context.Context, in *eks.DescribePodIdentityAssociationInput, opts ...func(*eks.Options)) (*eks.DescribePodIdentityAssociationOutput, error) {
+	if aws.ToString(in.AssociationId) == f.failID {
+		return nil, denied("eks:DescribePodIdentityAssociation")
+	}
+	return f.fakeEKS.DescribePodIdentityAssociation(ctx, in, opts...)
+}
+
+// A cluster with two associations, one of whose describes fails: the surface
+// is partial and the failed binding's edge is kept, as above -- AND the one
+// that WAS read is written this run. The partial tally is returned beside the
+// associations it read, and the permission scan must still write those; it
+// used to skip the whole cluster on any error, so one unreadable association
+// left every other binding in the cluster unconfirmed.
+//
+// Safeguard (mutation-checked): writePodIdentityEdges writes what was read
+// before giving up on a cluster.
+func TestP2S3bPodIdentityPartialStillWritesWhatWasRead(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "p2-s3b-eks-partial")
+	defer cleanPermissionTables(t, db, ws)
+
+	eksFake := podIdentityEKS(plainRoleARN)
+	eksFake.associations["prod-cluster"] = append(eksFake.associations["prod-cluster"], ekstypes.PodIdentityAssociation{
+		AssociationId:  aws.String("a-2222222222"),
+		AssociationArn: aws.String("arn:aws:eks:us-east-1:429418377036:podidentityassociation/prod-cluster/a-2222222222"),
+		ClusterName:    aws.String("prod-cluster"), Namespace: aws.String("payments"),
+		ServiceAccount: aws.String("audit-agent"), RoleArn: aws.String(plainRoleARN),
+	})
+	scanner, snap := eksFixture(t, db, ws, populatedIAM(), eksFake)
+	if out, err := scanner.ScanFromSnapshot(context.Background(), ws, snap); err != nil || out.PodIdentityEdges != 2 {
+		t.Fatalf("setup: %v, %+v (want both associations written)", err, out)
+	}
+	first := snap.Generation
+
+	scanner.WithEKSAPI(&s3bOneDescribeFails{fakeEKS: eksFake, failID: "a-2222222222"})
+	snap.Generation++
+	out, err := scanner.ScanFromSnapshot(context.Background(), ws, snap)
+	if err != nil {
+		t.Fatalf("permission scan: %v", err)
+	}
+	if cov := out.Surfaces[models.SurfaceEKSPodIdentity]; cov.State != models.CloudCoveragePartial ||
+		!strings.Contains(cov.Error, "1 of 2 pod identity associations") || cov.API != "eks:DescribePodIdentityAssociation" {
+		t.Fatalf("eks_pod_identity with one describe denied = %+v, want partial, 1 of 2, naming the call", cov)
+	}
+	if out.Complete || out.PodIdentityEdges != 1 {
+		t.Fatalf("complete=%v edges=%d, want reconciliation blocked and the one readable binding written",
+			out.Complete, out.PodIdentityEdges)
+	}
+	generations := map[string]int{}
+	var rows []struct {
+		Subject            string
+		LastSeenGeneration int
+	}
+	db.Raw(`SELECT subject, last_seen_generation FROM cloud_assume_edge WHERE workspace_id = ? AND mechanism = ?`,
+		ws, models.AssumeMechanismEKSPodIdentity).Scan(&rows)
+	for _, r := range rows {
+		generations[r.Subject] = r.LastSeenGeneration
+	}
+	read, failed := awsdiscovery.K8sSubject("payments", "ledger-agent"), awsdiscovery.K8sSubject("payments", "audit-agent")
+	if len(generations) != 2 || generations[read] != snap.Generation || generations[failed] != first {
+		t.Fatalf("edge generations = %v, want %s confirmed by this run (%d) and %s kept from the last (%d)",
+			generations, read, snap.Generation, failed, first)
+	}
+}
+
+/* ------------------------- listing failures, named -------------------------- */
+
+// D-71: a listing that fails is reported with the call and AWS's own error
+// code as FIELDS (api, error_code), stamped at collection -- the state is the
+// one it always had (denied; throttled on a throttle), and a reader never has
+// to parse the Error prose for either.
+//
+// Safeguard (mutation-checked): listErr naming the call.
+func TestP2S3bListingFailureNamesTheCall(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "p2-s3b-listing-named")
+	defer cleanWorkloadTables(t, db, ws)
+	svc, snap := s3bActivityFixture(t, db, ws, 0)
+
+	out := s3bWorkloadScan(t, db, ws, svc, snap, &s3bActivity{}, &fakeLambda{fail: denied("lambda:ListFunctions")})
+	cov := out.Surfaces["lambda:us-east-1"]
+	if cov.State != models.CloudCoverageDenied || cov.API != "lambda:ListFunctions" || cov.ErrorCode != "AccessDenied" ||
+		!strings.Contains(cov.Error, "lambda:ListFunctions") {
+		t.Fatalf("lambda with ListFunctions denied = %+v, want denied, api lambda:ListFunctions, error_code AccessDenied", cov)
+	}
+	if out.WorkloadsComplete {
+		t.Fatal("a denied compute surface must block workload reconciliation")
+	}
+
+	out = s3bWorkloadScan(t, db, ws, svc, snap, &s3bActivity{}, &fakeLambda{fail: throttled("lambda:ListFunctions")})
+	if cov := out.Surfaces["lambda:us-east-1"]; cov.State != models.CloudCoverageThrottled ||
+		cov.API != "lambda:ListFunctions" || cov.ErrorCode != "Throttling" {
+		t.Fatalf("lambda with ListFunctions throttled = %+v, want throttled, naming the call and code", cov)
 	}
 }

@@ -42,9 +42,12 @@ import (
 var ErrServiceNotInRegion = errors.New("the service is not offered in this region")
 
 // listErr classifies the error of a LIST call against a regional endpoint: an
-// endpoint that does not resolve is ErrServiceNotInRegion, naming the call;
-// anything else is classify()'d exactly as before, so the coverage text of an
-// ordinary denial or throttle does not change.
+// endpoint that does not resolve is ErrServiceNotInRegion; anything else is
+// classify()'d exactly as before (ErrThrottled stays ErrThrottled, so the
+// state an ordinary denial or throttle maps to does not change). Either way
+// the call is NAMED, so coverage can stamp which call failed and AWS's own
+// code for it as fields (D-71: api, error_code) instead of anyone parsing
+// them back out of the Error text.
 //
 // The SDK does not retry a not-found DNS answer (aws/retry retryable_error.go),
 // so this surfaces on the first attempt rather than after the retry budget.
@@ -57,7 +60,7 @@ func listErr(call string, err error) error {
 		return &namedCallError{call: call, raw: err,
 			classified: fmt.Errorf("%w: %s does not resolve", ErrServiceNotInRegion, dns.Name)}
 	}
-	return classify(err)
+	return withCallName(call, err)
 }
 
 // namedCallError keeps BOTH halves of a failed call: the classified sentinel

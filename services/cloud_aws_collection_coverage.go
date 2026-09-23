@@ -16,6 +16,8 @@ import (
 //	*awsdiscovery.ItemFailures, per-item-> throttled    if any item was throttled
 //	                                       denied       if no item could be read
 //	                                       partial      otherwise
+//	a named listing failure             -> throttled / denied, as surfaceResult
+//	                                       always did, with api and error_code
 //
 // resource_policies is the one per-item surface with its own mapping (D-93,
 // resourcePolicyCoverage below).
@@ -27,7 +29,9 @@ import (
 // (D-71): the FIRST failing call, and AWS's own code for it or nothing.
 
 // collectionCoverage returns the coverage for the two collection-honesty
-// errors, and false for anything else (surfaceResult's own switch decides).
+// errors, and for any failure whose reader NAMED the call (awsdiscovery's
+// listErr / withCallName); false for anything else (surfaceResult's own switch
+// decides, exactly as before).
 func collectionCoverage(count int, err error) (models.SurfaceCoverage, bool) {
 	if err == nil {
 		return models.SurfaceCoverage{}, false
@@ -40,6 +44,16 @@ func collectionCoverage(count int, err error) (models.SurfaceCoverage, bool) {
 			Error: err.Error(), API: awsdiscovery.CallName(err)}, true
 	case errors.As(err, &items):
 		return itemFailureCoverage(count, items), true
+	case awsdiscovery.CallName(err) != "":
+		// An ordinary listing failure: the SAME state surfaceResult gives it
+		// (throttled on a throttle, else denied), plus the two facts D-71
+		// stamps at collection -- the call, and AWS's own code or nothing.
+		cov := models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error(),
+			API: awsdiscovery.CallName(err), ErrorCode: awsdiscovery.AWSErrorCode(err)}
+		if errors.Is(err, awsdiscovery.ErrThrottled) {
+			cov.State = models.CloudCoverageThrottled
+		}
+		return cov, true
 	}
 	return models.SurfaceCoverage{}, false
 }

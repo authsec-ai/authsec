@@ -348,14 +348,18 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 func (r *cloudWorkloadRepository) ActivitySample(
 	workspaceID, connectorID uuid.UUID, limit int,
 ) ([]models.CloudIdentity, int64, error) {
-	q := r.db.Model(&models.CloudIdentity{}).
-		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID)
+	// Two independent statements, never one builder reused across a Count and
+	// a Find: GORM mutates a chained statement in place.
+	scoped := func() *gorm.DB {
+		return r.db.Model(&models.CloudIdentity{}).
+			Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID)
+	}
 	var total int64
-	if err := q.Count(&total).Error; err != nil {
+	if err := scoped().Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var out []models.CloudIdentity
-	if err := q.Order(`native_id COLLATE "C", id`).Limit(clampLimit(limit)).Find(&out).Error; err != nil {
+	if err := scoped().Order(`native_id COLLATE "C", id`).Limit(clampLimit(limit)).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil

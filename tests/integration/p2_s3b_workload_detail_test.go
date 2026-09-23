@@ -8,6 +8,7 @@ package integration
 // Every test runs the REAL scan worker and projector.
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -285,6 +286,15 @@ func TestP2S3bFailedGetGatewayIsPartialAndKeepsTheKey(t *testing.T) {
 		ts[0].Name != "ticket-lambda" || ts[0].Status != "READY" {
 		t.Fatalf("gateway attrs targets = %+v, want id, name, status and type", ts)
 	}
+	// Stored under exactly the keys provider_attrs serves (D-85:
+	// gateway_targets [{id, name, status, type}]), so the projector copies it.
+	var raw struct {
+		GatewayTargets []map[string]any `json:"gateway_targets"`
+	}
+	if err := json.Unmarshal(cw1[0].Attrs, &raw); err != nil || len(raw.GatewayTargets) != 1 ||
+		raw.GatewayTargets[0]["id"] != "tgt-1" || raw.GatewayTargets[0]["type"] != "LAMBDA" {
+		t.Fatalf("stored gateway_targets = %s (%v), want [{id, name, status, type}]", cw1[0].Attrs, err)
+	}
 	g1 := s3bGraphWorkloads(t, l, models.WorkloadBedrockAgentCoreGW)
 	if len(g1) != 1 || g1[0].ExecutionRoleState != models.ExecRoleResolved {
 		t.Fatalf("setup: graph gateway = %+v", g1)
@@ -317,6 +327,24 @@ func TestP2S3bFailedGetGatewayIsPartialAndKeepsTheKey(t *testing.T) {
 	}
 	if obs := s3bObservations(t, l, "bedrock-agentcore:ListGateways"); len(obs) != 1 || obs[0].SubjectNativeID != gwARN {
 		t.Errorf("listing evidence = %+v, want one bedrock-agentcore:ListGateways observation", obs)
+	}
+
+	// ---- scan 3: GetGateway answers again; only ListGatewayTargets is denied --
+	// The role is known (so the edge is confirmed again), but the target list
+	// is not: the last list read is kept, never replaced by an empty one, and
+	// the surface is still partial.
+	core.getGatewayFail = nil
+	run3 := s3bScanAndProject(l, a, f)
+	if cov := s3bSurface(t, s3bRunCoverage(t, l, run3.ID), "agentcore-gateways:us-east-1"); cov.State != models.CloudCoveragePartial ||
+		!strings.Contains(cov.Error, "bedrock-agentcore:ListGatewayTargets AccessDenied") {
+		t.Fatalf("agentcore-gateways with only ListGatewayTargets denied = %+v, want partial", cov)
+	}
+	at = s3bCloudWorkloads(t, l, models.WorkloadBedrockAgentCoreGW)[0].attrs(t)
+	if at.DetailIncomplete || !at.TargetsIncomplete || len(at.GatewayTargets) != 1 || at.GatewayTargets[0].TargetID != "tgt-1" {
+		t.Errorf("gateway attrs with only the targets unread = %+v, want the detail complete and the previous targets kept", at)
+	}
+	if ex := s3bExecutesAs(t, l, g2[0].ID); len(ex) != 1 || ex[0].State != models.RelCurrent {
+		t.Errorf("gateway executes_as once GetGateway answers = %+v, want current again", ex)
 	}
 }
 

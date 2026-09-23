@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	bedrockagenttypes "github.com/aws/aws-sdk-go-v2/service/bedrockagent/types"
 	agentcoretypes "github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol/types"
+	cttypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
@@ -66,30 +67,10 @@ func TestP2S3bAccessKeyEvidenceAttachesToTheCredentialAndDedupes(t *testing.T) {
 		t.Fatalf("access key observations = %d, want 1 (iam_access_keys: observation added)", len(obs))
 	}
 	o := obs[0]
-	userID := s3bCloudIdentityID(t, l, userARN)
-	if o.IdentityID == nil || *o.IdentityID != userID || o.Surface != models.SurfaceIAMAccessKeys ||
-		o.SubjectNativeID != igagraph.AccessKeyEvidenceKey(keyID) || o.SubjectNativeID != keyID {
-		t.Fatalf("access key observation = %+v, want subject the user, surface iam_access_keys, keyed by the key id", o)
-	}
-	facts := o.facts(t)
-	if facts["key_id"] != keyID || facts["status"] != "Active" || facts["created_at"] == nil {
-		t.Errorf("access key facts = %v, want key id, status and creation time", facts)
-	}
-	if _, hashed := facts["last_used_at"]; hashed {
-		t.Errorf("last_used_at is in the hashed facts (%v): an active key would write a new observation every scan", facts)
-	}
 
-	// Attaches to the credential: the projected credential carries the same key.
-	var credentials int64
-	l.db.Raw(`SELECT count(*) FROM iga_credentials WHERE workspace_id = ? AND provider = 'aws'
-	          AND key_identifier = ?`, l.ws, o.SubjectNativeID).Scan(&credentials)
-	if credentials != 1 {
-		t.Fatalf("iga_credentials with key_identifier = the observation's key: %d, want 1", credentials)
-	}
-
-	// ... and to NO edge of the user. The user's grant exists and IS evidenced
-	// (by the user's own observation and the policy version's), just not by
-	// its key.
+	// The behaviour first: linked to NO edge of the user. The user's grant
+	// exists and IS evidenced (by the user's own observation and the policy
+	// version's), just not by its key.
 	var userGrants int64
 	l.db.Raw(`SELECT count(*) FROM iga_access_edges g JOIN iga_identity_accounts i
 	            ON i.workspace_id = g.workspace_id AND i.id = g.subject_identity_account_id
@@ -106,6 +87,23 @@ func TestP2S3bAccessKeyEvidenceAttachesToTheCredentialAndDedupes(t *testing.T) {
 			"must attach to the credential, never to every edge of the user", edge)
 	}
 
+	// Then the key that makes it so, and the credential it attaches to.
+	userID := s3bCloudIdentityID(t, l, userARN)
+	if o.IdentityID == nil || *o.IdentityID != userID || o.Surface != models.SurfaceIAMAccessKeys ||
+		o.SubjectNativeID != igagraph.AccessKeyEvidenceKey(keyID) || o.SubjectNativeID != keyID {
+		t.Fatalf("access key observation = %+v, want subject the user, surface iam_access_keys, keyed by the key id", o)
+	}
+	facts := o.facts(t)
+	if facts["key_id"] != keyID || facts["status"] != "Active" || facts["created_at"] == nil {
+		t.Errorf("access key facts = %v, want key id, status and creation time", facts)
+	}
+	var credentials int64
+	l.db.Raw(`SELECT count(*) FROM iga_credentials WHERE workspace_id = ? AND provider = 'aws'
+	          AND key_identifier = ?`, l.ws, o.SubjectNativeID).Scan(&credentials)
+	if credentials != 1 {
+		t.Fatalf("iga_credentials with key_identifier = the observation's key: %d, want 1", credentials)
+	}
+
 	// ---- rescan: same key, still active, used again since ---------------------
 	a.iam.keyLastUse[keyID] = ago(time.Minute)
 	run2 := l.scanAndProject(a)
@@ -118,6 +116,10 @@ func TestP2S3bAccessKeyEvidenceAttachesToTheCredentialAndDedupes(t *testing.T) {
 	if obs[0].ID != o.ID || obs[0].ConfirmationCount != 2 || obs[0].LastConfirmedRunID == nil ||
 		*obs[0].LastConfirmedRunID != run2.ID {
 		t.Fatalf("after rescan: %+v, want the same row confirmed by run %s (count 2)", obs[0], run2.ID)
+	}
+	// Why: the moving date is not a hashed fact.
+	if _, hashed := obs[0].facts(t)["last_used_at"]; hashed {
+		t.Errorf("last_used_at is in the hashed facts: an active key would write a new observation every scan")
 	}
 	// The date itself lives on the credential row, refreshed in place.
 	var lastUsed time.Time
@@ -135,6 +137,43 @@ func TestP2S3bAccessKeyEvidenceAttachesToTheCredentialAndDedupes(t *testing.T) {
 	l.scanAndProject(a)
 	if n := len(s3bObservations(t, l, "iam:ListAccessKeys")); n != 2 {
 		t.Errorf("access key observations after Active -> Inactive = %d, want 2 (a new fact is a new row)", n)
+	}
+}
+
+// The same rule for the one other observation the workload scanner files under
+// an IDENTITY: a CloudTrail event matched to a user is activity, "not
+// projected" (§1.4), so it is keyed by the event
+// (igagraph.CloudTrailEventEvidenceKey) and becomes evidence on none of the
+// user's edges -- keyed by the user's ARN, every event would "support" the
+// user's grant. Cloud Inventory still finds it by its typed subject.
+//
+// Safeguard (mutation-checked): the key in scanCloudTrail.
+func TestP2S3bCloudTrailEventIsNotEdgeEvidence(t *testing.T) {
+	l := newP2Lab(t, "p2-s3b-cloudtrail", true)
+	a := l.account(accountA)
+	userARN := s3bUserWithKey(a, "ci-bot", "AIDAS3BCIBOT000003", "AKIAS3BEXAMPLEKEY03")
+	trail := &fakeCloudTrail{events: []cttypes.Event{{
+		EventId: aws.String("evt-s3b-1"), EventName: aws.String("GetObject"),
+		EventSource: aws.String("s3.amazonaws.com"), Username: aws.String("ci-bot"),
+		EventTime: aws.Time(time.Now().Add(-time.Hour)),
+	}}}
+	s3bScanAndProject(l, a, &s3bFakes{cloudTrail: trail})
+
+	obs := s3bObservations(t, l, "cloudtrail:LookupEvents")
+	if len(obs) != 1 {
+		t.Fatalf("cloudtrail observations = %d, want 1 (one event matched to ci-bot)", len(obs))
+	}
+	linked := s3bEdgeEvidence(t, l)
+	if len(linked) == 0 {
+		t.Fatal("setup: no edge evidence at all (the user's grant must be evidenced by its own observations)")
+	}
+	if edge, ok := linked[obs[0].ID]; ok {
+		t.Fatalf("a CloudTrail event is linked as evidence on a %s edge of the user it matched", edge)
+	}
+	userID := s3bCloudIdentityID(t, l, userARN)
+	if obs[0].IdentityID == nil || *obs[0].IdentityID != userID ||
+		obs[0].SubjectNativeID != igagraph.CloudTrailEventEvidenceKey(userARN, "evt-s3b-1") {
+		t.Fatalf("cloudtrail observation = %+v, want subject the user, keyed by the event", obs[0])
 	}
 }
 
@@ -176,6 +215,14 @@ func TestP2S3bPodIdentityEvidenceIsTheAssociations(t *testing.T) {
 	if edge.Issuer != nil {
 		issuer = *edge.Issuer
 	}
+	// The behaviour first: evidence on none of the role's other edges.
+	linked := s3bEdgeEvidence(t, l)
+	if len(linked) == 0 {
+		t.Fatal("setup: no edge evidence at all")
+	}
+	if edge, ok := linked[o.ID]; ok {
+		t.Fatalf("the pod identity observation is linked as evidence on a %s edge of the role", edge)
+	}
 	wantKey := igagraph.PodIdentityEvidenceKey(role, issuer, edge.Subject)
 	if o.IdentityID == nil || *o.IdentityID != roleID || o.Surface != models.SurfaceEKSPodIdentity ||
 		o.SubjectNativeID != wantKey || !strings.Contains(o.SubjectNativeID, igagraph.Sep) {
@@ -190,14 +237,6 @@ func TestP2S3bPodIdentityEvidenceIsTheAssociations(t *testing.T) {
 		if facts[k] != want {
 			t.Errorf("pod identity fact %s = %v, want %v", k, facts[k], want)
 		}
-	}
-
-	linked := s3bEdgeEvidence(t, l)
-	if len(linked) == 0 {
-		t.Fatal("setup: no edge evidence at all")
-	}
-	if edge, ok := linked[o.ID]; ok {
-		t.Fatalf("the pod identity observation is linked as evidence on a %s edge of the role", edge)
 	}
 	_ = uuid.Nil
 }

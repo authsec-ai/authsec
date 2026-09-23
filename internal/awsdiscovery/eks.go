@@ -108,7 +108,13 @@ func (r *EKSReader) Clusters(ctx context.Context) ([]EKSCluster, error) {
 		}
 		resp, err := r.api.ListClusters(ctx, &eks.ListClustersInput{NextToken: next})
 		if err != nil {
-			return out, classify(err)
+			// Named (D-71: coverage stamps the call and AWS's code), but NOT
+			// mapped to ErrServiceNotInRegion the way the workload listings
+			// are: eks_pod_identity is ONE surface across every region, so a
+			// region where EKS is not offered cannot be told apart from the
+			// rest there, and an unsupported for the whole surface would
+			// license ending bindings the other regions hold.
+			return out, withCallName("eks:ListClusters", err)
 		}
 		for _, name := range resp.Clusters {
 			details.Attempt()
@@ -165,7 +171,7 @@ func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName str
 			ClusterName: aws.String(clusterName), NextToken: next,
 		})
 		if err != nil {
-			return out, classify(err)
+			return out, withCallName("eks:ListPodIdentityAssociations", err)
 		}
 		for _, summary := range resp.Associations {
 			id := aws.ToString(summary.AssociationId)

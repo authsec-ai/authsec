@@ -117,6 +117,29 @@ func TestS3bListErrMapsOnlyNXDOMAINToNotInRegion(t *testing.T) {
 	}
 }
 
+// Every other listing failure keeps the state it always mapped to -- the
+// classified sentinel is still what errors.Is sees -- and now NAMES its call
+// and keeps AWS's code, for coverage's api / error_code (D-71).
+func TestS3bListErrNamesTheCallAndKeepsTheSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		code     string
+		sentinel error
+	}{
+		{"AccessDeniedException", ErrNotAssumable},
+		{"ThrottlingException", ErrThrottled},
+	} {
+		err := listErr("bedrock:ListAgents", s3bAPIErr(tc.code))
+		if !errors.Is(err, tc.sentinel) || CallName(err) != "bedrock:ListAgents" || AWSErrorCode(err) != tc.code ||
+			!strings.HasPrefix(err.Error(), "bedrock:ListAgents: ") {
+			t.Fatalf("listErr(%s) = %v (call %q, code %q), want %v, named, AWS's code kept",
+				tc.code, err, CallName(err), AWSErrorCode(err), tc.sentinel)
+		}
+	}
+	if listErr("lambda:ListFunctions", nil) != nil {
+		t.Fatal("nil must stay nil")
+	}
+}
+
 func TestS3bWorkloadARNIsBuiltInThePartitionAndNeverGuesses(t *testing.T) {
 	for _, tc := range []struct {
 		partition, kind, region, account, id, want string

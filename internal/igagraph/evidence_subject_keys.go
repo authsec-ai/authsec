@@ -36,3 +36,15 @@ func AccessKeyEvidenceKey(keyID string) string { return keyID }
 func PodIdentityEvidenceKey(roleARN, issuer, k8sSubject string) string {
 	return Key("aws", "pod_identity", roleARN, issuer, k8sSubject)
 }
+
+// CloudTrailEventEvidenceKey is the subject_native_id of a CloudTrail event
+// matched to an identity (cloudtrail:LookupEvents): aws ␟ cloudtrail_event ␟
+// the identity's ARN ␟ the event id. §1.4 lists CloudTrail as "not projected"
+// -- an event is activity, never proof that an attachment, a membership or a
+// grant is configured -- yet keyed by the bare ARN every event would become
+// "supporting evidence" on every grant, assignment and member_of edge of the
+// user it matched. The ARN stays in the key so the row still reads "evidence
+// for X" after reconciliation SETs NULL its identity_id.
+func CloudTrailEventEvidenceKey(identityARN, eventID string) string {
+	return Key("aws", "cloudtrail_event", identityARN, eventID)
+}

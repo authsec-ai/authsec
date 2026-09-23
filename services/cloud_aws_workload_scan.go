@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -476,11 +477,11 @@ func (s *AWSWorkloadScanner) regionalCoverage(
 	prior, cerr := s.workloads.CountWorkloads(workspaceID, connectorID, runtimeKind, region)
 	switch {
 	case cerr != nil:
-		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count,
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, API: cov.API,
 			Error: fmt.Sprintf("%s (and whether earlier scans found %s here could not be checked: %v)",
 				cov.Error, runtimeKind, cerr)}
 	case prior > 0:
-		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count,
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, API: cov.API,
 			Error: fmt.Sprintf("%s, but an earlier scan collected %d %s here; not treated as unsupported",
 				cov.Error, prior, runtimeKind)}
 	}
@@ -607,9 +608,14 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 				// not as an orphaned observation -- see the function comment.
 				continue
 			}
+			// Keyed by the event, not by the identity's ARN: an event is
+			// activity, and must not become supporting evidence on every edge
+			// the identity holds (igagraph.CloudTrailEventEvidenceKey). The
+			// typed subject is still the identity, which is what Cloud
+			// Inventory reads it by.
 			if rerr := s.evidence.Record(
 				IdentitySubject(identity.ID), "cloudtrail:LookupEvents",
-				key, "", e.EventTime, identity.NativeID,
+				key, "", e.EventTime, igagraph.CloudTrailEventEvidenceKey(identity.NativeID, e.EventID),
 				map[string]any{
 					"event_id":     e.EventID,
 					"event_name":   e.EventName,
