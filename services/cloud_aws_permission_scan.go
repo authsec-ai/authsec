@@ -131,9 +131,10 @@ type PermissionSnapshot struct {
 	// UnreadableDocuments names each document -- policy or role trust policy
 	// -- that could not be fetched or parsed this run, with the reason,
 	// reported under policy_documents so coverage says WHICH document, not only
-	// that one failed (§1.4, T3.3). Deduplicated.
-	UnreadableDocuments []string
-	unreadableSeen      map[string]bool
+	// that one failed (§1.4, T3.3): as items (D-71) and in the prose.
+	// Deduplicated, in the order the scan met them.
+	UnreadableDocuments []models.CoverageItem
+	unreadableSeen      map[models.CoverageItem]bool
 	// policyHoldersMissing counts principals whose policies could not be
 	// written because their identity row was not found. Their attachments
 	// were not re-stamped this run, so cloud_policy reconciliation must not
@@ -213,8 +214,8 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// Roles whose trust documents are unreadable (the IAM scan judged them and
 	// stored the reason on each row) are named under policy_documents too:
 	// "names the documents" (T3.3) covers both kinds.
-	for _, label := range snapshot.UnreadableTrust {
-		out.noteUnreadableLabel(label)
+	for _, item := range snapshot.UnreadableTrust {
+		out.noteUnreadableItem(item)
 	}
 	if err := s.writeAssumeEdges(workspaceID, snapshot, out); err != nil {
 		return out, err
@@ -994,23 +995,30 @@ func documentHash(document string) string {
 
 // noteUnreadable records one unreadable document, once per name and version.
 func (o *PermissionSnapshot) noteUnreadable(name, version, reason string) {
-	label := name
-	if version != "" {
-		label += " " + version
-	}
-	o.noteUnreadableLabel(label + " (" + reason + ")")
+	o.noteUnreadableItem(models.CoverageItem{Policy: name, Version: version, Error: reason})
 }
 
-// noteUnreadableLabel records one unreadable document under a ready label.
-func (o *PermissionSnapshot) noteUnreadableLabel(label string) {
+// noteUnreadableItem records one unreadable document -- a policy, or a role's
+// trust policy the IAM scan judged -- once.
+func (o *PermissionSnapshot) noteUnreadableItem(item models.CoverageItem) {
 	if o.unreadableSeen == nil {
-		o.unreadableSeen = map[string]bool{}
+		o.unreadableSeen = map[models.CoverageItem]bool{}
 	}
-	if o.unreadableSeen[label] {
+	if o.unreadableSeen[item] {
 		return
 	}
-	o.unreadableSeen[label] = true
-	o.UnreadableDocuments = append(o.UnreadableDocuments, label)
+	o.unreadableSeen[item] = true
+	o.UnreadableDocuments = append(o.UnreadableDocuments, item)
+}
+
+// unreadableLabel is one unreadable document as the coverage prose names it:
+// "TicketRead v3 (fetch: AWS returned AccessDenied for iam:GetPolicyVersion: ...)".
+func unreadableLabel(item models.CoverageItem) string {
+	label := item.Policy
+	if item.Version != "" {
+		label += " " + item.Version
+	}
+	return label + " (" + item.Error + ")"
 }
 
 // policyDocumentsSurface is policy_documents when something could not be read
@@ -1018,21 +1026,39 @@ func (o *PermissionSnapshot) noteUnreadableLabel(label string) {
 // documents), and the error naming each unreadable one with its reason --
 // "1 policy could not be read: TicketRead v3 (parse: ...)". Written ONLY when
 // something was dropped; canEnd reads its absence as "nothing was".
+//
+// The same documents as Items (D-71), and both BOUNDED at
+// models.CoverageItemLimit: the count in the prose is always the full one,
+// Truncated says the list is not, and an account with thousands of broken
+// documents does not write a report that size into every run.
 func policyDocumentsSurface(out *PermissionSnapshot, trustDocuments int) models.SurfaceCoverage {
-	reason := "policy or trust documents could not be fully read"
-	if n := len(out.UnreadableDocuments); n > 0 {
-		noun := "policies"
-		if n == 1 {
-			noun = "policy"
-		}
-		reason = fmt.Sprintf("%d %s could not be read: %s", n, noun,
-			strings.Join(out.UnreadableDocuments, "; "))
-	}
-	return models.SurfaceCoverage{
+	cov := models.SurfaceCoverage{
 		State: models.CloudCoveragePartial,
 		Count: out.PoliciesWritten + trustDocuments,
-		Error: reason,
+		Error: "policy or trust documents could not be fully read",
 	}
+	n := len(out.UnreadableDocuments)
+	if n == 0 {
+		return cov
+	}
+	listed := out.UnreadableDocuments
+	if n > models.CoverageItemLimit {
+		listed, cov.Truncated = listed[:models.CoverageItemLimit], true
+	}
+	cov.Items = append([]models.CoverageItem(nil), listed...)
+	labels := make([]string, 0, len(listed))
+	for _, item := range listed {
+		labels = append(labels, unreadableLabel(item))
+	}
+	noun := "policies"
+	if n == 1 {
+		noun = "policy"
+	}
+	cov.Error = fmt.Sprintf("%d %s could not be read: %s", n, noun, strings.Join(labels, "; "))
+	if cov.Truncated {
+		cov.Error += fmt.Sprintf("; and %d more", n-len(listed))
+	}
+	return cov
 }
 
 func (s *AWSPermissionScanner) getOrCreateResource(

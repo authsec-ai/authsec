@@ -46,6 +46,8 @@ type fakeIAM struct {
 
 	attachedRolePolicies map[string][]iamtypes.AttachedPolicy
 	inlineRolePolicies   map[string]map[string]string // role -> policy -> document
+	// instanceProfiles is each role's InstanceProfileList, by role name.
+	instanceProfiles     map[string][]iamtypes.InstanceProfile
 	attachedUserPolicies map[string][]iamtypes.AttachedPolicy
 	inlineUserPolicies   map[string]map[string]string
 
@@ -86,6 +88,7 @@ func newFakeIAM() *fakeIAM {
 		keyLastUse:           map[string]*time.Time{},
 		attachedRolePolicies: map[string][]iamtypes.AttachedPolicy{},
 		inlineRolePolicies:   map[string]map[string]string{},
+		instanceProfiles:     map[string][]iamtypes.InstanceProfile{},
 		attachedUserPolicies: map[string][]iamtypes.AttachedPolicy{},
 		inlineUserPolicies:   map[string]map[string]string{},
 		managedPolicies:      map[string]string{},
@@ -230,6 +233,7 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 				RoleLastUsed: r.RoleLastUsed, Tags: r.Tags, PermissionsBoundary: r.PermissionsBoundary,
 				AttachedManagedPolicies: f.attachedRolePolicies[name],
 				RolePolicyList:          inlineDetails(f.inlineRolePolicies[name]),
+				InstanceProfileList:     f.instanceProfiles[name],
 			})
 		}
 	case iamtypes.EntityTypeUser:

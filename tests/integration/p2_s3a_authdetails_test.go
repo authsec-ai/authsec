@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 )
 
 /* ------------------------------ lab helpers -------------------------------- */
@@ -478,6 +479,14 @@ func TestP2S3aOneUnreadableDocumentIsolated(t *testing.T) {
 		!strings.Contains(b.DocumentError, "iam:GetPolicyVersion") || !strings.Contains(b.DocumentError, "AccessDenied") {
 		t.Errorf("unreadable row = %+v, want no document and a fetch error naming the call and code", b)
 	}
+	// D-71: the same document as a structured item, carrying exactly the
+	// reason its row carries -- ONE item although two holders attach it.
+	if pd := cov[models.SurfacePolicyDocuments]; len(pd.Items) != 1 || pd.Truncated ||
+		pd.Items[0] != (models.CoverageItem{Policy: "AAABlockedAccess", Version: "v3",
+			Error: pols["AAABlockedAccess"].DocumentError}) {
+		t.Errorf("policy_documents items = %+v (truncated %v), want exactly AAABlockedAccess v3 with its row's error",
+			pd.Items, pd.Truncated)
+	}
 	for _, name := range []string{"Alpha", "ZetaAccess", "Gamma"} {
 		if p, ok := pols[name]; !ok || !p.HasDocument || p.DocumentError != "" {
 			t.Errorf("%s at this run = %+v (present %v), want readable with its document", name, p, ok)
@@ -565,6 +574,10 @@ func TestP2S3aUnusableStatementMarksDocumentUnreadable(t *testing.T) {
 		!strings.Contains(pd.Error, "Mixed v3 (parse: 1 statement(s) unusable)") {
 		t.Errorf("policy_documents = %+v, want partial naming Mixed and the skipped statement", pd)
 	}
+	if pd := s3aCoverage(run)[models.SurfacePolicyDocuments]; len(pd.Items) != 1 ||
+		pd.Items[0] != (models.CoverageItem{Policy: "Mixed", Version: "v3", Error: "parse: 1 statement(s) unusable"}) {
+		t.Errorf("policy_documents items = %+v, want Mixed v3 with its D-49 error", pd.Items)
+	}
 	sup := s3aStatementSupport(l, a.conn)
 	for _, k := range []string{"Mixed/KeepA", "Mixed/LoseB"} {
 		if sup[k] != models.IGALifecycleActive+":"+models.RelStale {
@@ -610,9 +623,14 @@ func TestP2S3aPerFilterSurfaceStates(t *testing.T) {
 		!strings.Contains(g.Error, "iam:GetAccountAuthorizationDetails (Groups)") {
 		t.Errorf("iam_groups = %+v, want denied naming AccessDenied and iam:GetAccountAuthorizationDetails (Groups)", g)
 	}
+	// D-71: the call and AWS's code as FIELDS, stamped at collection, so no
+	// reader parses them back out of the prose.
+	if g := cov[models.SurfaceIAMGroups]; g.API != "iam:GetAccountAuthorizationDetails (Groups)" || g.ErrorCode != "AccessDenied" {
+		t.Errorf("iam_groups api/error_code = %q/%q, want the Groups listing and AccessDenied", g.API, g.ErrorCode)
+	}
 	for _, surf := range []string{models.SurfaceIAMRoles, models.SurfaceIAMUsers, models.SurfaceIAMPolicies} {
-		if s := cov[surf]; s.State != models.CloudCoverageReached {
-			t.Errorf("%s = %+v, want reached: another filter's failure is not this listing's", surf, s)
+		if s := cov[surf]; s.State != models.CloudCoverageReached || s.API != "" || s.ErrorCode != "" {
+			t.Errorf("%s = %+v, want reached, naming no failed call: another filter's failure is not this listing's", surf, s)
 		}
 	}
 	// The group's collected attachments are not reconciled away by a run that
@@ -645,6 +663,9 @@ func TestP2S3aPerFilterSurfaceStates(t *testing.T) {
 		!strings.Contains(p.Error, "iam:GetAccountAuthorizationDetails (LocalManagedPolicy)") {
 		t.Errorf("iam_policies = %+v, want throttled naming the LocalManagedPolicy listing", p)
 	}
+	if p := cov[models.SurfaceIAMPolicies]; p.API != "iam:GetAccountAuthorizationDetails (LocalManagedPolicy)" || p.ErrorCode != "Throttling" {
+		t.Errorf("iam_policies api/error_code = %q/%q, want the LocalManagedPolicy listing and Throttling", p.API, p.ErrorCode)
+	}
 	for _, surf := range []string{models.SurfaceIAMRoles, models.SurfaceIAMUsers, models.SurfaceIAMGroups} {
 		if s := cov[surf]; s.State != models.CloudCoverageReached {
 			t.Errorf("%s = %+v, want reached", surf, s)
@@ -659,6 +680,17 @@ func TestP2S3aPerFilterSurfaceStates(t *testing.T) {
 	}
 	if n := l.count(`SELECT count(*) FROM iga_policy_assignment WHERE workspace_id = ? AND state = 'ended'`, l.ws); n != 0 {
 		t.Errorf("%d assignments ended while a listing failed", n)
+	}
+
+	// The per-user access-key call names itself too: an IAM read refused
+	// after the role WAS assumed is not "the role could not be assumed".
+	delete(a.iam.fail, "GetAccountAuthorizationDetails:LocalManagedPolicy")
+	a.iam.fail["ListAccessKeys"] = denied("iam:ListAccessKeys")
+	run = l.scanAndProject(a)
+	k := s3aCoverage(run)[models.SurfaceIAMAccessKeys]
+	if k.State != models.CloudCoverageDenied || k.API != "iam:ListAccessKeys" || k.ErrorCode != "AccessDenied" ||
+		strings.Contains(k.Error, "could not be assumed") {
+		t.Errorf("iam_access_keys = %+v, want denied naming iam:ListAccessKeys and AccessDenied", k)
 	}
 }
 
@@ -876,6 +908,10 @@ func TestP2S3aTrustDocumentStoredAndJudged(t *testing.T) {
 		!strings.Contains(pd.Error, "trust policy of TrustRole (parse: ") {
 		t.Errorf("policy_documents = %+v, want partial naming TrustRole's trust policy", pd)
 	}
+	if pd := s3aCoverage(run)[models.SurfacePolicyDocuments]; len(pd.Items) != 1 ||
+		pd.Items[0] != (models.CoverageItem{Policy: "trust policy of TrustRole", Error: perr}) {
+		t.Errorf("policy_documents items = %+v, want the trust policy with the row's trust_parse_error %q", pd.Items, perr)
+	}
 	roleFacts := func() []map[string]any {
 		return s3aFacts(l, `SELECT o.sanitized_facts FROM cloud_observation o JOIN cloud_identity i ON i.id = o.identity_id
 		           WHERE o.workspace_id = ? AND i.native_id = ? AND o.surface = 'iam_roles'
@@ -978,5 +1014,117 @@ func TestP2S3aAttachedPolicyAbsentFromListing(t *testing.T) {
 		!strings.Contains(cov[models.SurfacePolicyDocuments].Error, "Ghost") {
 		t.Errorf("coverage = iam_policies %+v, policy_documents %+v; want reached, and Ghost named",
 			cov[models.SurfaceIAMPolicies], cov[models.SurfacePolicyDocuments])
+	}
+}
+
+// D-52: a role's InstanceProfileList (ARNs and names) is stored in its attrs,
+// replaced on every read -- a profile the role leaves is gone from the row,
+// not kept by the merge -- and is DESCRIPTIVE ONLY: never in the projected
+// identity's provider_attrs. The role's observation lists what the read
+// returned.
+func TestP2S3aInstanceProfilesInAttrs(t *testing.T) {
+	l := newP2Lab(t, "p2-s3a-profiles", true)
+	a := l.account(accountA)
+	roleARN := a.role("Ec2Role", "AROAEC2ROLEEC2ROLEEC")
+	profile := func(name string) iamtypes.InstanceProfile {
+		return iamtypes.InstanceProfile{
+			Arn:                 aws.String("arn:aws:iam::" + a.id + ":instance-profile/" + name),
+			InstanceProfileName: aws.String(name),
+		}
+	}
+	// Listed out of order: stored sorted, so an unchanged list is an unchanged row.
+	a.iam.instanceProfiles["Ec2Role"] = []iamtypes.InstanceProfile{profile("web"), profile("batch")}
+	run := l.scanAndProject(a)
+
+	stored := func() []models.AWSInstanceProfile {
+		var ci models.CloudIdentity
+		if err := l.db.Where("workspace_id = ? AND native_id = ?", l.ws, roleARN).First(&ci).Error; err != nil {
+			t.Fatalf("role row: %v", err)
+		}
+		return ci.AWSAttrs().InstanceProfiles
+	}
+	want := []models.AWSInstanceProfile{
+		{ARN: "arn:aws:iam::" + a.id + ":instance-profile/batch", Name: "batch"},
+		{ARN: "arn:aws:iam::" + a.id + ":instance-profile/web", Name: "web"},
+	}
+	if got := stored(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("instance profiles in attrs = %+v, want %+v", got, want)
+	}
+	var pattrs string
+	l.db.Raw(`SELECT provider_attrs::text FROM iga_identity_accounts WHERE workspace_id = ? AND display_name = 'Ec2Role'`,
+		l.ws).Scan(&pattrs)
+	if pattrs == "" || strings.Contains(pattrs, "instance") {
+		t.Errorf("projected provider_attrs = %q, want present and without instance profiles (descriptive only)", pattrs)
+	}
+	facts := s3aFacts(l, `SELECT o.sanitized_facts FROM cloud_observation o JOIN cloud_identity i ON i.id = o.identity_id
+	           WHERE o.workspace_id = ? AND i.native_id = ? AND o.last_confirmed_run_id = ?`, l.ws, roleARN, run.ID)
+	if len(facts) != 1 || !strings.Contains(fmt.Sprint(facts[0]["instance_profiles"]), "instance-profile/web") {
+		t.Errorf("role observation = %v, want it to list the instance profiles the read returned", facts)
+	}
+
+	// The role leaves "web": REPLACED, not merged.
+	a.iam.instanceProfiles["Ec2Role"] = []iamtypes.InstanceProfile{profile("batch")}
+	l.scanAndProject(a)
+	if got := stored(); len(got) != 1 || got[0].Name != "batch" {
+		t.Errorf("instance profiles after leaving web = %+v, want only batch", got)
+	}
+	// And leaves every profile: the key is gone.
+	delete(a.iam.instanceProfiles, "Ec2Role")
+	l.scanAndProject(a)
+	if got := stored(); len(got) != 0 {
+		t.Errorf("instance profiles after leaving all = %+v, want none", got)
+	}
+}
+
+// T3.5, the policy half, at the writer: a policy-version observation (subject
+// policy_id) recorded with the same content by two runs is ONE row, confirmed
+// twice, last by the second run -- the conflict target names policy_id (035's
+// widened dedupe index). A subject-less observation still dedupes after 035
+// widened the partial index's predicate with policy_id.
+func TestP2S3aObservationDedupeWithPolicySubject(t *testing.T) {
+	l := newP2Lab(t, "p2-s3a-obs-dedupe", true)
+	a := l.account(accountA)
+	a.role("DedupeRole", "AROADEDUPEROLEDEDUPE")
+	a.attach("DedupeRole", a.managed("DedupePolicy", s3aDoc("D", "s3:GetObject", "arn:aws:s3:::dedupe/*")))
+	first := l.scanAndProject(a)
+	second := l.scanAndProject(a)
+
+	var policyRow uuid.UUID
+	l.db.Raw(`SELECT id FROM cloud_policy WHERE workspace_id = ? AND connector_id = ? AND name = 'DedupePolicy'`,
+		l.ws, a.conn).Row().Scan(&policyRow)
+	if policyRow == uuid.Nil {
+		t.Fatal("no cloud_policy row for DedupePolicy")
+	}
+	facts := map[string]any{"probe": "s3a", "n": 1}
+	for _, run := range []models.CloudScanRun{first, second} {
+		w := services.NewObservationWriter(l.db, l.ws, a.conn, run.ID, run.Generation)
+		if err := w.Record(services.PolicySubject(policyRow), "test:s3a-dedupe", models.SurfaceIAMPolicies, "",
+			time.Now(), "arn:aws:iam::"+a.id+":policy/DedupePolicy", facts); err != nil {
+			t.Fatalf("record policy observation in run %s: %v", run.ID, err)
+		}
+		if err := w.Record(services.ObservationSubject{}, "test:s3a-dedupe", models.SurfaceIAMPolicies, "",
+			time.Now(), "", facts); err != nil {
+			t.Fatalf("record subject-less observation in run %s: %v", run.ID, err)
+		}
+	}
+	type row struct {
+		HasPolicy bool
+		Count     int
+		LastRun   uuid.UUID
+	}
+	var rows []row
+	l.db.Raw(`SELECT policy_id IS NOT NULL AS has_policy, confirmation_count AS count, last_confirmed_run_id AS last_run
+	            FROM cloud_observation WHERE workspace_id = ? AND source_api = 'test:s3a-dedupe'
+	           ORDER BY has_policy`, l.ws).Scan(&rows)
+	if len(rows) != 2 {
+		t.Fatalf("observations = %+v, want exactly one policy row and one subject-less row", rows)
+	}
+	for _, r := range rows {
+		if r.Count != 2 || r.LastRun != second.ID {
+			t.Errorf("observation %+v, want confirmed twice, last by run %s", r, second.ID)
+		}
+	}
+	if !rows[1].HasPolicy || rows[0].HasPolicy {
+		t.Errorf("observations = %+v, want one with the policy subject and one without", rows)
 	}
 }

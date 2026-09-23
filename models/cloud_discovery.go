@@ -287,7 +287,42 @@ type SurfaceCoverage struct {
 	Count int `json:"count"`
 	// Error is the provider's own words when State is not reached.
 	Error string `json:"error,omitempty"`
+
+	// The structured half of Error (P2-DECISIONS D-71), stamped at collection
+	// so a reader never parses the prose back into a code. All optional and
+	// additive: a run collected before they existed decodes with them empty,
+	// and the reader answers null.
+	//
+	// API is the call that failed, as an operator would search for it
+	// ("iam:GetAccountAuthorizationDetails (Groups)"); ErrorCode is the code
+	// AWS returned ("AccessDenied"). Both empty unless the collector KNOWS
+	// them -- never guessed from the message (§2.14.13: name the call, not a
+	// guess at the fix).
+	API       string `json:"api,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	// Items names each unreadable document under policy_documents, at most
+	// CoverageItemLimit of them; Truncated says more were unreadable than are
+	// listed (the count is in Error).
+	Items     []CoverageItem `json:"items,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
 }
+
+// CoverageItem is one document policy_documents could not read (D-71):
+// Policy names it as the operator knows it ("TicketRead", "ReadData (inline
+// on SharedToolRole)", "trust policy of SharedToolRole"), Version is the
+// managed policy's default version ("" for inline and trust documents), and
+// Error is the reason recorded on its row (cloud_policy.document_error or
+// cloud_identity.trust_parse_error) as collection wrote it.
+type CoverageItem struct {
+	Policy  string `json:"policy"`
+	Version string `json:"version"`
+	Error   string `json:"error"`
+}
+
+// CoverageItemLimit bounds SurfaceCoverage.Items (D-71): coverage lives in a
+// jsonb column on every run, and an account with thousands of unreadable
+// documents must not write a report that size each scan.
+const CoverageItemLimit = 100
 
 // ScanCoverage is the typed shape of CloudConnector.Coverage: the durable
 // report of what a scan could and could not read.
@@ -487,6 +522,18 @@ type AWSIdentityAttrs struct {
 	// The document itself is parsed in the next ticket into cloud_assume_edge;
 	// this is only the flag that says there is something to parse.
 	HasTrustPolicy bool `json:"has_trust_policy,omitempty"`
+	// InstanceProfiles are the instance profiles a role is in, from its
+	// authorization-details entry (§1.4 l.209, P2-DECISIONS D-52), replaced on
+	// every read. DESCRIPTIVE ONLY: not projected and not copied into
+	// provider_attrs -- an EC2 instance's executes_as still resolves through
+	// iam:GetInstanceProfile, which names the role the instance actually uses.
+	InstanceProfiles []AWSInstanceProfile `json:"instance_profiles,omitempty"`
+}
+
+// AWSInstanceProfile is one instance profile a role belongs to.
+type AWSInstanceProfile struct {
+	ARN  string `json:"arn"`
+	Name string `json:"name"`
 }
 
 // AWSAttrs decodes Attrs as the AWS shape.

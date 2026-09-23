@@ -156,7 +156,9 @@ func (r *IAMReader) AuthorizationDetails(ctx context.Context) AuthorizationDetai
 			role.LastUsedAt = d.RoleLastUsed.LastUsedDate
 		}
 		for _, ip := range d.InstanceProfileList {
-			role.InstanceProfileARNs = append(role.InstanceProfileARNs, aws.ToString(ip.Arn))
+			role.InstanceProfiles = append(role.InstanceProfiles, InstanceProfileRef{
+				ARN: aws.ToString(ip.Arn), Name: aws.ToString(ip.InstanceProfileName),
+			})
 		}
 		role.Policies = r.principalPolicies(ctx, &out, role.ARN, role.Name,
 			d.AttachedManagedPolicies, d.RolePolicyList, d.PermissionsBoundary)

@@ -129,6 +129,9 @@ func s3aAccount() *s3aFakeIAM {
 					AssumeRolePolicyDocument: aws.String(url.QueryEscape(`{"Statement":[]}`)),
 					AttachedManagedPolicies:  []iamtypes.AttachedPolicy{s3aAttached(s3aReadOnly)},
 					PermissionsBoundary:      &iamtypes.AttachedPermissionsBoundary{PermissionsBoundaryArn: aws.String(s3aPowerUser)},
+					InstanceProfileList: []iamtypes.InstanceProfile{{
+						Arn: aws.String(s3aAcct + "instance-profile/web"), InstanceProfileName: aws.String("web"),
+					}},
 					RolePolicyList: []iamtypes.PolicyDetail{{
 						PolicyName: aws.String("inl"), PolicyDocument: aws.String(url.QueryEscape(s3aDocA)),
 					}},
@@ -206,6 +209,11 @@ func TestS3aAuthorizationDetailsOneCallPerFilterAcrossPages(t *testing.T) {
 	}
 	if r1.TrustPolicy != `{"Statement":[]}` || len(r1.Policies.Inline) != 1 || r1.Policies.Inline[0].Document != s3aDocA {
 		t.Errorf("r1 = %+v, want its decoded trust document and inline policy", r1)
+	}
+	// D-52: the instance profiles, ARN and name.
+	if len(r1.InstanceProfiles) != 1 || r1.InstanceProfiles[0] != (InstanceProfileRef{
+		ARN: s3aAcct + "instance-profile/web", Name: "web"}) {
+		t.Errorf("r1 instance profiles = %+v, want web with its ARN", r1.InstanceProfiles)
 	}
 	if b := d.Users[0].Policies.Boundary; b == nil || b.ARN != s3aAcct+"policy/Local" || b.Document != s3aDocA {
 		t.Errorf("priya's customer-managed boundary = %+v, want it resolved from the listing", b)
@@ -331,3 +339,30 @@ func TestS3aLocalManagedPolicyReadsOnlyTheDefaultVersion(t *testing.T) {
 }
 
 var _ IAMAPI = (*s3aFakeIAM)(nil)
+
+// s3aDeniedKeys fails ListAccessKeys and ListOpenIDConnectProviders.
+type s3aDeniedKeys struct{ *s3aFakeIAM }
+
+func (s3aDeniedKeys) ListAccessKeys(context.Context, *iam.ListAccessKeysInput, ...func(*iam.Options)) (*iam.ListAccessKeysOutput, error) {
+	return nil, &smithy.GenericAPIError{Code: "AccessDenied", Message: "no keys"}
+}
+func (s3aDeniedKeys) ListOpenIDConnectProviders(context.Context, *iam.ListOpenIDConnectProvidersInput, ...func(*iam.Options)) (*iam.ListOpenIDConnectProvidersOutput, error) {
+	return nil, &smithy.GenericAPIError{Code: "Throttling", Message: "slow"}
+}
+
+// The IAM reads outside authorization details name their call too: a refused
+// IAM read after a successful assume-role is not "the role could not be
+// assumed" -- and the classification underneath is unchanged.
+func TestS3aOtherIAMReadsNameTheirCall(t *testing.T) {
+	r := NewIAMReader(s3aDeniedKeys{s3aAccount()})
+	_, err := r.ListAccessKeys(context.Background(), "priya")
+	var call *APICallError
+	if !errors.As(err, &call) || call.API != "iam:ListAccessKeys" || call.Code != "AccessDenied" ||
+		strings.Contains(err.Error(), "could not be assumed") {
+		t.Errorf("ListAccessKeys error = %v, want it naming iam:ListAccessKeys and AccessDenied", err)
+	}
+	_, err = r.OIDCProviders(context.Background())
+	if !errors.As(err, &call) || call.API != "iam:ListOpenIDConnectProviders" || !errors.Is(err, ErrThrottled) {
+		t.Errorf("OIDCProviders error = %v, want it naming its call and still classified throttled", err)
+	}
+}

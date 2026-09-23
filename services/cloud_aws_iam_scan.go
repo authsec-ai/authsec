@@ -34,9 +34,8 @@ import (
 // A large account is hundreds of authorization-details pages, one
 // GetPolicyVersion per attached AWS-managed policy and two calls per access
 // key, under a retrying client. Twenty minutes is generous for that and still
-// short enough
-// that a wedged scan releases its connector rather than blocking every later
-// one forever.
+// short enough that a wedged scan releases its connector rather than blocking
+// every later one forever.
 const iamScanTimeout = 20 * time.Minute
 
 // ErrScanNotPermitted is returned when the connector cannot currently be used.
@@ -164,8 +163,8 @@ type IAMSnapshot struct {
 
 	// UnreadableTrust names each role whose trust document is unreadable this
 	// run, with the reason stored on its row (trust_parse_error), so
-	// policy_documents names it beside the unreadable policies (T3.3).
-	UnreadableTrust []string
+	// policy_documents names it beside the unreadable policies (T3.3, D-71).
+	UnreadableTrust []models.CoverageItem
 
 	// CredentialReportSurface is bonus evidence about users this scan already
 	// wrote, kept OUT of Coverage on purpose -- see the comment where this is
@@ -264,8 +263,9 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 			snapshot.TrustPolicies[role.ARN] = role.TrustPolicy
 		}
 		if identity.TrustParseError != "" {
-			snapshot.UnreadableTrust = append(snapshot.UnreadableTrust,
-				fmt.Sprintf("trust policy of %s (%s)", role.Name, identity.TrustParseError))
+			snapshot.UnreadableTrust = append(snapshot.UnreadableTrust, models.CoverageItem{
+				Policy: "trust policy of " + role.Name, Error: identity.TrustParseError,
+			})
 		}
 		snapshot.addPolicies(role.ARN, role.Policies)
 	}
@@ -453,18 +453,28 @@ func (s *AWSIAMScanner) upsertRole(
 		Enabled:            true, // IAM has no disable switch for a role.
 		LastSeenGeneration: generation,
 	}
+	profiles := instanceProfiles(role.InstanceProfiles)
 	if err := identity.SetAWSAttrs(models.AWSIdentityAttrs{
 		UniqueID:               role.UniqueID,
 		Path:                   role.Path,
 		Tags:                   role.Tags,
 		HasTrustPolicy:         role.TrustPolicy != "",
 		PermissionsBoundaryARN: role.PermissionsBoundaryARN,
+		// D-52: in attrs, replaced on every read (it is not in
+		// roleAttrsNotRead), so a role taken out of a profile loses it.
+		InstanceProfiles: profiles,
 	}); err != nil {
 		return nil, err
 	}
 	setRoleTrustDocument(identity, role.TrustPolicy)
 
 	listed := listedPolicyFacts(role.Policies)
+	// As plain maps, so the redactor walks them like every other fact.
+	profileFacts := make([]any, 0, len(profiles))
+	for _, p := range profiles {
+		profileFacts = append(profileFacts, map[string]any{"arn": p.ARN, "name": p.Name})
+	}
+	listed["instance_profiles"] = profileFacts
 	// The role's observation CARRIES its trust document (§4.8): can_assume
 	// evidence is the role's own observation. Decoded, so the redactor walks it
 	// like any other fact; the text itself when it is not JSON.
@@ -498,6 +508,21 @@ func setRoleTrustDocument(identity *models.CloudIdentity, doc string) {
 		}
 	}
 	identity.TrustParseError = awsdiscovery.ValidateTrustDocument(raw)
+}
+
+// instanceProfiles is a role's InstanceProfileList as attrs store it, sorted by
+// ARN so an unchanged list is an unchanged row and an unchanged observation.
+// Nil for none, so the key is absent rather than an empty list.
+func instanceProfiles(in []awsdiscovery.InstanceProfileRef) []models.AWSInstanceProfile {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]models.AWSInstanceProfile, 0, len(in))
+	for _, p := range in {
+		out = append(out, models.AWSInstanceProfile{ARN: p.ARN, Name: p.Name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ARN < out[j].ARN })
+	return out
 }
 
 // trustDocumentFact is the trust document as an observation fact: decoded when
@@ -930,14 +955,11 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	return merged
 }
 
-// surfaceResult turns a read's outcome into a coverage entry.
-//
-// The count is reported even on failure, where it is a FLOOR rather than a
-// total — we read this many before we were stopped. The state is what tells a
-// reader which of the two it is.
 // surfacePartial reports a surface that was listed successfully but whose
-// contents are not fully known -- for example roles listed by ListRoles whose
-// GetRole detail failed.
+// contents are not fully known -- for example a listing whose per-item detail
+// call failed for some items. (The IAM read no longer has one: authorization
+// details carry every detail in the listing itself. Kept for the other
+// scanners' detail calls.)
 //
 // Kept distinct from an error: the list call worked, so the rows are real and
 // worth keeping. What must not happen is reconciliation treating this run as an
@@ -950,15 +972,31 @@ func surfacePartial(count int, incomplete int, reason string) models.SurfaceCove
 	}
 }
 
+// surfaceResult turns a read's outcome into a coverage entry.
+//
+// The count is reported even on failure, where it is a FLOOR rather than a
+// total — we read this many before we were stopped. The state is what tells a
+// reader which of the two it is.
+//
+// A failure that names its call (awsdiscovery.APICallError) also stamps the
+// call and AWS's error code as fields (D-71), so /coverage reports them
+// without parsing the prose. Any other error leaves both empty: unknown is
+// said as unknown, never inferred from the message.
 func surfaceResult(count int, err error) models.SurfaceCoverage {
+	var out models.SurfaceCoverage
 	switch {
 	case err == nil:
 		return models.SurfaceCoverage{State: models.CloudCoverageReached, Count: count}
 	case errors.Is(err, awsdiscovery.ErrThrottled):
-		return models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
+		out = models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
 	default:
-		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
+		out = models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
 	}
+	var call *awsdiscovery.APICallError
+	if errors.As(err, &call) {
+		out.API, out.ErrorCode = call.API, call.Code
+	}
+	return out
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }

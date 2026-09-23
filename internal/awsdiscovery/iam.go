@@ -100,11 +100,19 @@ type IAMRole struct {
 	// scanner stores it on cloud_identity.trust_document (035) and the
 	// projector parses it; "" when the entry carried none.
 	TrustPolicy string
-	// InstanceProfileARNs are the instance profiles the role is in. Captured
-	// (§1.4) but not persisted: no column is specified for them (D-52).
-	InstanceProfileARNs []string
+	// InstanceProfiles are the instance profiles the role is in (§1.4). The
+	// scanner stores them in the role's attrs, descriptive only (D-52).
+	InstanceProfiles []InstanceProfileRef
 	// Policies is everything attached to the role, from the same entry.
 	Policies IdentityPolicies
+}
+
+// InstanceProfileRef is one entry of a RoleDetail's InstanceProfileList: the
+// profile's ARN and name, and nothing else -- the profile's own role list is
+// what iam:GetInstanceProfile answers for EC2, not this.
+type InstanceProfileRef struct {
+	ARN  string
+	Name string
 }
 
 // IAMUser is one user as its authorization-details entry (UserDetail)
@@ -218,7 +226,9 @@ func NewIAMReader(api IAMAPI) *IAMReader {
 func (r *IAMReader) OIDCProviders(ctx context.Context) ([]OIDCProvider, error) {
 	resp, err := r.api.ListOpenIDConnectProviders(ctx, &iam.ListOpenIDConnectProvidersInput{})
 	if err != nil {
-		return nil, classify(err)
+		// Named with the call and AWS's code (§2.14.13), and still classified
+		// underneath, so throttled vs denied is decided as before.
+		return nil, callError("iam:ListOpenIDConnectProviders", err)
 	}
 	out := make([]OIDCProvider, 0, len(resp.OpenIDConnectProviderList))
 	for _, p := range resp.OpenIDConnectProviderList {
@@ -256,7 +266,10 @@ func (r *IAMReader) ListAccessKeys(ctx context.Context, userName string) ([]IAMA
 			UserName: aws.String(userName), MaxItems: aws.Int32(listPageLimit), Marker: marker,
 		})
 		if err != nil {
-			return out, classify(err)
+			// classify() alone rendered an IAM denial as "the role could not
+			// be assumed", which is false here: the role was assumed, and this
+			// one call was refused. Name the call instead (§2.14.13).
+			return out, callError("iam:ListAccessKeys", err)
 		}
 		for _, k := range resp.AccessKeyMetadata {
 			key := IAMAccessKey{
