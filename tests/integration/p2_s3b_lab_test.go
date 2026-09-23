@@ -39,6 +39,9 @@ type s3bFakes struct {
 	// credentialCSV is the credential report's content ("" keeps the lab's
 	// empty report).
 	credentialCSV string
+	// agentCoreAPI, when set, wins over agentCore: a wrapper that changes one
+	// call's behaviour (s3bPagedTargets) around a fakeAgentCore.
+	agentCoreAPI awsdiscovery.AgentCoreAPI
 }
 
 // hook is the lab account's hook with these overrides applied on top.
@@ -85,6 +88,9 @@ func (f *s3bFakes) hook(a *p2Account) services.ScannerHook {
 			var core awsdiscovery.AgentCoreAPI = &fakeAgentCore{}
 			if f.agentCore != nil {
 				core = f.agentCore
+			}
+			if f.agentCoreAPI != nil {
+				core = f.agentCoreAPI
 			}
 			trail := &fakeCloudTrail{}
 			if f.cloudTrail != nil {

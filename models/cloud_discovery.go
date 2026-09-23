@@ -1453,12 +1453,14 @@ type AWSWorkloadAttrs struct {
 //
 // The JSON keys are exactly the workload detail's provider_attrs shape,
 // gateway_targets [{id, name, status, type}] (D-85), so the projector copies
-// the list as stored instead of renaming keys on the way through.
+// the list as stored instead of renaming keys on the way through. All four
+// keys on every target, "" when AWS returned none: the shape is the contract,
+// and a key that comes and goes with the data is not a shape.
 type AWSGatewayTarget struct {
 	TargetID string `json:"id"`
-	Name     string `json:"name,omitempty"`
-	Status   string `json:"status,omitempty"`
-	Type     string `json:"type,omitempty"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Type     string `json:"type"`
 }
 
 // AWSAttrs decodes the AWS attrs, returning the zero value on anything

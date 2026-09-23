@@ -54,6 +54,10 @@ type AWSPermissionScanner struct {
 	// regional and the live path builds one client per selected region; a test
 	// double stands in for all of them.
 	eksAPI awsdiscovery.EKSAPI
+	// regionalEKS, when set, returns the EKS client for ONE region and wins
+	// over eksAPI: one double for every region cannot express "EKS is not
+	// offered in this region, and is read in that one" (T3.8).
+	regionalEKS func(region string) awsdiscovery.EKSAPI
 
 	// s3API/kmsAPI, when set, replace the real resource-policy clients.
 	s3API  awsdiscovery.S3PolicyAPI
@@ -100,6 +104,13 @@ func (s *AWSPermissionScanner) WithIAMAPI(api awsdiscovery.IAMAPI) *AWSPermissio
 // assume-role.
 func (s *AWSPermissionScanner) WithEKSAPI(api awsdiscovery.EKSAPI) *AWSPermissionScanner {
 	s.eksAPI = api
+	return s
+}
+
+// WithRegionalEKSAPI installs a per-region EKS client, bypassing assume-role;
+// it wins over WithEKSAPI. A test seam.
+func (s *AWSPermissionScanner) WithRegionalEKSAPI(f func(region string) awsdiscovery.EKSAPI) *AWSPermissionScanner {
+	s.regionalEKS = f
 	return s
 }
 
@@ -252,7 +263,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 		len(out.UnreadableDocuments) == 0
 	out.Surfaces = map[string]models.SurfaceCoverage{
 		models.SurfaceOIDCProviders:  surfaceResult(len(providers), oidcErr),
-		models.SurfaceEKSPodIdentity: surfaceResult(out.PodIdentityEdges, eksErr),
+		models.SurfaceEKSPodIdentity: podIdentityCoverage(out.PodIdentityEdges, eksErr),
 	}
 	if len(out.UnreadableDocuments) > 0 || out.ParseFailures > 0 || out.StatementsSkipped > 0 {
 		// Written ONLY when something was dropped (canEnd relies on that), and
@@ -361,10 +372,14 @@ func (s *AWSPermissionScanner) writeAssumeEdges(
 // denied) has no row to hang an edge off, and inventing one would create an
 // identity that no scan discovered.
 //
-// Returns the first error encountered. Regions are independent, so one region
-// failing does not stop the others -- but any failure means this surface was
-// not fully read, which the caller turns into "not complete" so nothing gets
-// reconciled away.
+// Returns every failure, across every region and cluster, as one
+// *podIdentityFailures (nil when nothing failed). Regions are independent, so
+// one region failing does not stop the others -- but any failure means this
+// surface was not fully read, which the caller turns into "not complete" so
+// nothing gets reconciled away, and the coverage names ALL of it: how many
+// clusters and associations could not be described, and every listing that
+// failed outright (§1.4 "the report names how many"). It used to report only
+// the first error, so a second region's denial read as the first one's partial.
 func (s *AWSPermissionScanner) writePodIdentityEdges(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot, out *PermissionSnapshot,
 ) error {
@@ -381,41 +396,72 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		return nil
 	}
 
-	var firstErr error
+	failures := newPodIdentityFailures()
 	for _, region := range regions {
 		reader, err := s.eksReaderFor(ctx, workspaceID, snapshot.ConnectorID, region)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			failures.addListing(err, "")
 			continue
 		}
 		clusters, err := reader.Clusters(ctx)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if errors.Is(err, awsdiscovery.ErrServiceNotInRegion) && len(clusters) == 0 {
+			// T3.8: EKS is not offered in this region -- nothing there to
+			// read, and nothing there claimed, so the region is skipped and
+			// costs the rest of the surface nothing (a region that listed
+			// clusters before failing is no such region, and falls through
+			// as the listing failure it is). Unless an earlier scan recorded
+			// a binding that may come from here: then a resolver failure is
+			// the likelier story, and it is reported as the failure it may be
+			// (the same guard regionalCoverage applies to compute). A
+			// connector whose every region is skipped this way holds no
+			// binding at all, so reached -- no binding in any selected
+			// region -- deletes nothing.
+			if why, blocks := s.podIdentityRegionUnread(workspaceID, snapshot.ConnectorID, region); blocks {
+				failures.addListing(err, why)
+			}
+			continue
 		}
+		failures.addClusters(err)
 		for _, cluster := range clusters {
 			assocs, err := reader.PodIdentityAssociations(ctx, cluster.Name)
-			if err != nil && firstErr == nil {
-				firstErr = err
-			}
+			failures.addAssociations(err)
 			// T3.6 (S3b): what WAS read is real even when some of the
 			// cluster's describes failed (*awsdiscovery.ItemFailures) --
-			// written, and confirmed, while firstErr keeps the surface
+			// written, and confirmed, while the failures keep the surface
 			// partial and reconciliation off for the rest.
 			for _, assoc := range assocs {
-				if err := s.writePodIdentityEdge(workspaceID, snapshot, cluster, assoc, out); err != nil {
+				if err := s.writePodIdentityEdge(workspaceID, snapshot, region, cluster, assoc, out); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	return firstErr
+	return failures.err()
+}
+
+// podIdentityRegionUnread decides whether a region whose EKS endpoint does not
+// resolve still blocks eks_pod_identity: yes when an earlier scan recorded a
+// binding that may come from it (or that cannot be checked), with the reason
+// to append to the failure; no when none ever did -- EKS is simply not
+// offered there. Never claim more than the data proves.
+func (s *AWSPermissionScanner) podIdentityRegionUnread(
+	workspaceID, connectorID uuid.UUID, region string,
+) (string, bool) {
+	prior, err := s.grants.CountPodIdentityEdges(workspaceID, connectorID, region)
+	switch {
+	case err != nil:
+		return fmt.Sprintf(" (and whether an earlier scan recorded pod identity bindings in %s could not be checked: %v)",
+			region, err), true
+	case prior > 0:
+		return fmt.Sprintf(", but %d pod identity binding(s) an earlier scan recorded may come from %s; not treated as not offered",
+			prior, region), true
+	}
+	return "", false
 }
 
 // writePodIdentityEdge records one association.
 func (s *AWSPermissionScanner) writePodIdentityEdge(
-	workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, region string,
 	cluster awsdiscovery.EKSCluster, assoc awsdiscovery.PodIdentityAssociation,
 	out *PermissionSnapshot,
 ) error {
@@ -445,6 +491,10 @@ func (s *AWSPermissionScanner) writePodIdentityEdge(
 		// Byte-for-byte what the Kubernetes connector records for the same pod.
 		K8sRef:             strPtrOrNil(subject),
 		LastSeenGeneration: snapshot.Generation,
+		// Where the binding was read (podIdentityEdgeAttrs): the region is
+		// what lets a later scan tell "EKS is not offered there" from "a
+		// binding we recorded there cannot be read" (T3.8).
+		Attrs: podIdentityEdgeAttrs(region, cluster, assoc),
 	}
 	// KNOWN LIMITATION. uq_cloud_assume_edge_subject is
 	// (identity_id, subject_kind, subject) and does not include the issuer, so
@@ -1065,6 +1115,9 @@ func (s *AWSPermissionScanner) eksReaderFor(
 	ctx context.Context, workspaceID, connectorID uuid.UUID, region string,
 ) (*awsdiscovery.EKSReader, error) {
 
+	if s.regionalEKS != nil {
+		return awsdiscovery.NewEKSReader(s.regionalEKS(region)), nil
+	}
 	if s.eksAPI != nil {
 		return awsdiscovery.NewEKSReader(s.eksAPI), nil
 	}

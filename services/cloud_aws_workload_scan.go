@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -137,11 +138,20 @@ type WorkloadSnapshot struct {
 
 	// Complete is true only when BOTH tables this scanner reconciles were read
 	// authoritatively: every compute surface (WorkloadsComplete) and activity
-	// (UsageComplete). Each gates its own table's reconciliation, for the
-	// reason the rest of this schema follows: unreached is not missing.
+	// (UsageComplete), for the reason the rest of this schema follows:
+	// unreached is not missing.
+	//
+	// UsageComplete gates ReconcileUsage. WorkloadsComplete does NOT gate
+	// workload deletion any more -- it reports whether the whole table was
+	// read. Deletion is per surface (ReconciledSurfaces): one partial surface
+	// blocks deletion "for that surface" (§1.4), never for the connector.
 	Complete          bool
 	WorkloadsComplete bool
 	UsageComplete     bool
+	// ReconciledSurfaces are the compute surfaces ("lambda:us-east-1") whose
+	// rows ReconcileWorkloads was licensed to age out this run: every one
+	// reached, with the IAM baseline complete. Sorted.
+	ReconciledSurfaces []string
 	// Errors carries what went wrong per surface, for the coverage report.
 	// Only surfaces whose state BLOCKS are listed: an unsupported surface
 	// (the service is not offered in that region) is not an error.
@@ -209,15 +219,25 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	// Each table is reconciled on the surfaces it depends on, and only those
 	// (T3.7). The IAM baseline gates both, as before: a workload or a usage
 	// row is attributed to an identity that scan must have read.
+	//
+	// Workloads are reconciled PER SURFACE: only the rows of a (runtime kind,
+	// region) whose surface was reached this run can be absent. A surface
+	// that is partial, denied or throttled keeps its own rows and costs no
+	// other surface anything -- one gateway whose GetGateway the stack does
+	// not grant must not stop a deleted Lambda from ever leaving Cloud
+	// Inventory: the connector-wide veto §1.3 removes for unoffered regions.
 	iamComplete := snapshot.Coverage.Complete()
 	out.WorkloadsComplete = iamComplete && out.computeAuthoritative()
 	out.UsageComplete = iamComplete && activity.State == models.CloudCoverageReached
 	out.Complete = out.WorkloadsComplete && out.UsageComplete
 
-	if out.WorkloadsComplete {
-		if _, err := s.workloads.ReconcileWorkloads(
-			workspaceID, snapshot.ConnectorID, snapshot.Generation); err != nil {
-			return out, err
+	if iamComplete {
+		if scopes, reached := out.reachedWorkloadScopes(); len(scopes) > 0 {
+			if _, err := s.workloads.ReconcileWorkloads(
+				workspaceID, snapshot.ConnectorID, snapshot.Generation, scopes); err != nil {
+				return out, err
+			}
+			out.ReconciledSurfaces = reached
 		}
 	}
 	if out.UsageComplete {
@@ -257,39 +277,74 @@ func nonBlocking(state string) bool {
 	return false
 }
 
-// computeSurfacePrefixes are the surfaces cloud_workload rows come from, plus
-// the per-region stand-in. They, and only they, license deleting workloads.
-// The bonus surfaces (AgentCore workload identities and credential providers,
+// computeSurfaceKinds maps each surface cloud_workload rows come from to the
+// runtime kind its rows are stored under. They, and only they, license
+// deleting workloads -- each its own kind in its own region. The bonus
+// surfaces (AgentCore workload identities and credential providers,
 // CloudTrail) have no reconciled table and never gate it.
-var computeSurfacePrefixes = map[string]bool{
-	models.SurfaceLambdaPrefix:            true,
-	models.SurfaceECSPrefix:               true,
-	models.SurfaceEC2Prefix:               true,
-	models.SurfaceBedrockAgentsPrefix:     true,
-	models.SurfaceBedrockAgentCorePrefix:  true,
-	models.SurfaceAgentCoreGatewaysPrefix: true,
-	// The per-region stand-in, models.SurfaceComputePrefix without its colon.
-	strings.TrimSuffix(models.SurfaceComputePrefix, ":"): true,
+var computeSurfaceKinds = map[string]string{
+	models.SurfaceLambdaPrefix:            models.WorkloadLambdaFunction,
+	models.SurfaceECSPrefix:               models.WorkloadECSTaskDefinition,
+	models.SurfaceEC2Prefix:               models.WorkloadEC2Instance,
+	models.SurfaceBedrockAgentsPrefix:     models.WorkloadBedrockAgent,
+	models.SurfaceBedrockAgentCorePrefix:  models.WorkloadBedrockAgentCoreRT,
+	models.SurfaceAgentCoreGatewaysPrefix: models.WorkloadBedrockAgentCoreGW,
+}
+
+// computeStandIn is the per-region stand-in's prefix, models.SurfaceCompute
+// without its colon. It speaks for no runtime kind -- it is written when the
+// region's services never ran -- so it licenses no deletion, but it does make
+// the table as a whole unauthoritative (computeAuthoritative).
+var computeStandIn = strings.TrimSuffix(models.SurfaceComputePrefix, ":")
+
+// splitSurface splits "lambda:us-east-1" into its prefix and region.
+func splitSurface(key string) (prefix, region string) {
+	if i := strings.Index(key, ":"); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return key, ""
+}
+
+// reachedWorkloadScopes is the one place workload absence is inferred: the
+// (runtime kind, region) of every compute surface REACHED this run, with the
+// surface keys they came from, sorted. Only reached -- "absence is only ever
+// inferred from reached" (§1.4). Partial, denied and throttled keep their
+// rows; not_selected keeps them too ("earlier results are kept and marked
+// stale", §2.14.13); unsupported has none to delete (regionalCoverage reports
+// a kind an earlier scan found in that region as denied, never unsupported).
+func (out *WorkloadSnapshot) reachedWorkloadScopes() ([]repositories.WorkloadScope, []string) {
+	var keys []string
+	for key, cov := range out.Surfaces {
+		prefix, region := splitSurface(key)
+		if _, ok := computeSurfaceKinds[prefix]; ok && region != "" && cov.State == models.CloudCoverageReached {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	scopes := make([]repositories.WorkloadScope, 0, len(keys))
+	for _, key := range keys {
+		prefix, region := splitSurface(key)
+		scopes = append(scopes, repositories.WorkloadScope{RuntimeKind: computeSurfaceKinds[prefix], Region: region})
+	}
+	return scopes, keys
 }
 
 // computeAuthoritative reports whether every compute surface this run reported
 // is in a non-blocking state -- derived from the coverage itself, so a
-// detail-call failure (partial) blocks workload deletion and a service not
-// offered in a region (unsupported) does not (§1.3).
+// detail-call failure (partial) counts against it and a service not offered in
+// a region (unsupported) does not (§1.3). It reports on the whole table
+// (WorkloadsComplete); the deletion gate is per surface, reachedWorkloadScopes.
 //
 // And at least one compute surface must have been READ: a run whose every
-// compute surface was not selected or unsupported established nothing, and
-// must not license deleting what an earlier run found -- the same rule
-// ScanCoverage.Complete applies ("attempted > 0"). It is what keeps a resolver
-// that answers NXDOMAIN for everything from reading as an empty estate.
+// compute surface was not selected or unsupported established nothing -- the
+// same rule ScanCoverage.Complete applies ("attempted > 0"). It is what keeps a
+// resolver that answers NXDOMAIN for everything from reading as an empty
+// estate.
 func (out *WorkloadSnapshot) computeAuthoritative() bool {
 	read := false
 	for key, cov := range out.Surfaces {
-		prefix := key
-		if i := strings.Index(key, ":"); i >= 0 {
-			prefix = key[:i]
-		}
-		if !computeSurfacePrefixes[prefix] {
+		prefix, _ := splitSurface(key)
+		if _, ok := computeSurfaceKinds[prefix]; !ok && prefix != computeStandIn {
 			continue
 		}
 		if !nonBlocking(cov.State) {
@@ -464,9 +519,11 @@ func (s *AWSWorkloadScanner) scanGateways(
 // (ErrServiceNotInRegion), and unsupported blocks nothing. But if an earlier
 // scan COLLECTED this runtime kind in this region, the service evidently is
 // offered there, and a resolver failure is the likelier story; unsupported
-// would then license deleting what that scan found. So it is reported denied
-// instead -- the call failed -- with the reason spelled out. Never claim more
-// than the data proves.
+// would then tell every reader that nothing there is claimed -- coverage
+// "complete", no conclusion prevented (D-58) -- over rows that scan found. So
+// it is reported denied instead -- the call failed -- with the reason spelled
+// out. Never claim more than the data proves. (It is also why unsupported
+// never has rows of its own for reachedWorkloadScopes to leave out.)
 func (s *AWSWorkloadScanner) regionalCoverage(
 	workspaceID, connectorID uuid.UUID, runtimeKind, region string, count int, err error,
 ) models.SurfaceCoverage {
@@ -497,9 +554,10 @@ func (s *AWSWorkloadScanner) scanWorkloadIdentities(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
 ) {
-	// Deliberately NOT a compute surface (computeSurfacePrefixes), so it never
-	// gates out.WorkloadsComplete and therefore ReconcileWorkloads: this
-	// surface is bonus evidence with no reconciled table of its own, and a
+	// Deliberately NOT a compute surface (computeSurfaceKinds), so it never
+	// counts against out.WorkloadsComplete nor licenses or blocks any
+	// ReconcileWorkloads scope: this surface is bonus evidence with no
+	// reconciled table of its own, and a
 	// customer whose deployed role predates this permission must not have
 	// their otherwise-complete Lambda/ECS/EC2 scan refuse to age out stale
 	// rows over a surface those rows have nothing to do with. Its coverage is

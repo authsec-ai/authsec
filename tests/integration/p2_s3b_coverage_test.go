@@ -479,9 +479,10 @@ func TestP2S3bOrganizationsIsReportedUnsupported(t *testing.T) {
 /* --------------------------- not offered in region -------------------------- */
 
 // T3.6 / T3.8 / E9: a service whose regional endpoint does not resolve is not
-// offered there -- unsupported, which blocks nothing (§1.4), so workload
-// reconciliation runs. It used to be denied, which vetoed workload
-// reconciliation for the whole connector on every run.
+// offered there -- unsupported, which blocks nothing (§1.4): the table still
+// reads as authoritative (WorkloadsComplete) and the region's other surfaces
+// still reconcile. It used to be denied, which vetoed workload reconciliation
+// for the whole connector on every run.
 //
 // But once an earlier scan COLLECTED that service in that region, a
 // non-resolving endpoint is not proof it is not offered: it is reported denied,
@@ -496,9 +497,12 @@ func TestP2S3bServiceNotOfferedInRegionIsUnsupported(t *testing.T) {
 
 	svc, snap := s3bActivityFixture(t, db, ws, 0)
 	s3bStaleRows(t, db, ws, snap)
-	// The planted stale Lambda is in us-east-1 too; drop it, so this region
-	// has never had a Lambda -- the genuinely-not-offered case.
-	db.Exec(`UPDATE cloud_workload SET region = 'eu-west-1' WHERE workspace_id = ? AND name = 's3b-gone'`, ws)
+	// The planted stale row becomes an ECS task definition, so us-east-1 has
+	// never had a Lambda -- the genuinely-not-offered case -- and the stale
+	// row belongs to a surface (ecs:us-east-1) that IS reached.
+	db.Exec(`UPDATE cloud_workload SET runtime_kind = 'ecs_task_definition',
+	                native_id = 'arn:aws:ecs:us-east-1:429418377036:task-definition/s3b-gone:1'
+	          WHERE workspace_id = ? AND name = 's3b-gone'`, ws)
 
 	out := s3bWorkloadScan(t, db, ws, svc, snap, &s3bActivity{}, &s3bDNSLambda{host: "lambda.us-east-1.amazonaws.com"})
 	cov := out.Surfaces["lambda:us-east-1"]
@@ -513,10 +517,10 @@ func TestP2S3bServiceNotOfferedInRegionIsUnsupported(t *testing.T) {
 		t.Error("an unsupported surface is not an error")
 	}
 	if !out.WorkloadsComplete {
-		t.Fatalf("unsupported must not block workload reconciliation: %+v", out.Errors)
+		t.Fatalf("unsupported must not make the workload table unauthoritative: %+v", out.Errors)
 	}
 	if workload, _ := s3bSurvived(t, db, ws); workload {
-		t.Error("the stale workload survived: an unsupported region vetoed reconciliation")
+		t.Error("the stale ECS row survived: its surface was reached beside an unsupported one")
 	}
 
 	// ---- an earlier scan found a Lambda here ---------------------------------

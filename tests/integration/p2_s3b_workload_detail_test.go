@@ -54,6 +54,19 @@ type s3bGraphWorkload struct {
 	ExecutionRoleState string
 }
 
+// s3bGraphByKey is the one node of rows with the given source key, as a
+// one-element slice, failing when it is not there.
+func s3bGraphByKey(t *testing.T, rows []s3bGraphWorkload, key string) []s3bGraphWorkload {
+	t.Helper()
+	for _, g := range rows {
+		if g.SourceKey == key {
+			return []s3bGraphWorkload{g}
+		}
+	}
+	t.Fatalf("no graph workload keyed %s in %+v", key, rows)
+	return nil
+}
+
 func s3bGraphWorkloads(t *testing.T, l *p2Lab, kind string) []s3bGraphWorkload {
 	t.Helper()
 	var rows []s3bGraphWorkload
@@ -103,24 +116,35 @@ func s3bCloudIdentityID(t *testing.T, l *p2Lab, nativeID string) uuid.UUID {
 //   - D-53 in the projector (project.go projectExecution): the edge would be
 //     re-asserted current, or the state written 'none';
 //   - the attrs/identity merge (cloud_workload_repository.go): the role and
-//     model the last good read recorded would be blanked.
+//     model the last good read recorded would be blanked;
+//   - per-surface reconciliation (ScanFromSnapshot, ReconcileWorkloads): the
+//     partial surface keeps its own removed row, and only its own -- the
+//     removed Lambda, whose surface was reached, is deleted.
 func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 	l := newP2Lab(t, "p2-s3b-getagent", true)
 	a := l.account(accountA)
 	role := a.role("support-agent-role", "AROAS3BAGENTROLE01")
 	a.attach("support-agent-role", a.managed("TicketRead", docTicketRead))
-	// A Lambda in the same region, removed before scan 2: the legacy
-	// cloud_workload reconcile is connector-wide, so the partial Bedrock
-	// surface must keep its row too.
+	// A Lambda in the same region, removed before scan 2: its surface is
+	// reached, so its row goes -- the partial Bedrock surface blocks deletion
+	// for that surface only (§1.4), never for the connector.
 	a.lambda("us-east-1", "nightly-export", role)
 
 	agentARN := "arn:aws:bedrock:us-east-1:" + a.id + ":agent/AGENTS3B01"
+	goneARN := "arn:aws:bedrock:us-east-1:" + a.id + ":agent/AGENTS3B02"
 	f := &s3bFakes{bedrock: &fakeBedrock{agents: map[string]bedrockagenttypes.Agent{
 		"AGENTS3B01": {
 			AgentId: aws.String("AGENTS3B01"), AgentArn: aws.String(agentARN),
 			AgentName: aws.String("support-bot"), AgentResourceRoleArn: aws.String(role),
 			FoundationModel: aws.String("amazon.titan-text-express-v1"),
 			AgentStatus:     bedrockagenttypes.AgentStatusPrepared,
+		},
+		// Deleted in AWS before scan 2 -- while GetAgent is denied, so the
+		// surface cannot prove that the set it listed is the whole truth.
+		"AGENTS3B02": {
+			AgentId: aws.String("AGENTS3B02"), AgentArn: aws.String(goneARN),
+			AgentName: aws.String("retired-bot"), AgentResourceRoleArn: aws.String(role),
+			AgentStatus: bedrockagenttypes.AgentStatusPrepared,
 		},
 	}}}
 
@@ -130,9 +154,11 @@ func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 	}
 	cw1 := s3bCloudWorkloads(t, l, models.WorkloadBedrockAgent)
 	g1 := s3bGraphWorkloads(t, l, models.WorkloadBedrockAgent)
-	if len(cw1) != 1 || len(g1) != 1 || cw1[0].NativeID != agentARN {
+	if len(cw1) != 2 || len(g1) != 2 || cw1[0].NativeID != agentARN || cw1[1].NativeID != goneARN {
 		t.Fatalf("setup: agent rows collected=%+v graph=%+v", cw1, g1)
 	}
+	g1 = s3bGraphByKey(t, g1, igagraph.Key("aws", agentARN))
+	cw1 = cw1[:1] // AGENTS3B01, the agent the rest of this test follows
 	if g1[0].ExecutionRoleState != models.ExecRoleResolved {
 		t.Fatalf("setup: execution role state %q, want resolved", g1[0].ExecutionRoleState)
 	}
@@ -142,8 +168,9 @@ func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 	}
 	roleID := s3bCloudIdentityID(t, l, role)
 
-	// ---- scan 2: GetAgent denied; the Lambda is gone --------------------------
+	// ---- scan 2: GetAgent denied; the Lambda and AGENTS3B02 are gone -----------
 	f.bedrock.getFail = denied("bedrock:GetAgent")
+	delete(f.bedrock.agents, "AGENTS3B02")
 	a.lambda("us-east-1", "", "")
 	run2 := s3bScanAndProject(l, a, f)
 
@@ -160,13 +187,21 @@ func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 		t.Errorf("partial api/error_code = %q/%q, want bedrock:GetAgent/AccessDenied (D-71)", cov.API, cov.ErrorCode)
 	}
 
-	// The SAME key: one collected row, the same ARN, the same graph node.
+	// The SAME key: one collected row, the same ARN, the same graph node --
+	// and the unlisted AGENTS3B02 kept beside it: a partial surface is never
+	// proof that what it did not list is gone.
 	cw2 := s3bCloudWorkloads(t, l, models.WorkloadBedrockAgent)
-	if len(cw2) != 1 || cw2[0].ID != cw1[0].ID || cw2[0].NativeID != agentARN {
-		t.Fatalf("collected agent rows after a failed GetAgent = %+v, want the one row keyed %s", cw2, agentARN)
+	if len(cw2) != 2 || cw2[0].ID != cw1[0].ID || cw2[0].NativeID != agentARN || cw2[1].NativeID != goneARN {
+		t.Fatalf("collected agent rows after a failed GetAgent = %+v, want the row keyed %s and the unlisted %s kept",
+			cw2, agentARN, goneARN)
 	}
+	cw2 = cw2[:1]
 	g2 := s3bGraphWorkloads(t, l, models.WorkloadBedrockAgent)
-	if len(g2) != 1 || g2[0].ID != g1[0].ID || g2[0].SourceKey != g1[0].SourceKey ||
+	if len(g2) != 2 {
+		t.Fatalf("graph agents after a failed GetAgent = %+v, want both nodes kept", g2)
+	}
+	g2 = s3bGraphByKey(t, g2, igagraph.Key("aws", agentARN))
+	if g2[0].ID != g1[0].ID || g2[0].SourceKey != g1[0].SourceKey ||
 		g2[0].SourceKey != igagraph.Key("aws", agentARN) || g2[0].Lifecycle != models.IGALifecycleActive {
 		t.Fatalf("graph agent after a failed GetAgent = %+v, want %+v unchanged and active", g2, g1)
 	}
@@ -194,10 +229,12 @@ func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 			"detail_incomplete with the call and code", at)
 	}
 
-	// Legacy deletion is blocked too: the removed Lambda's row survives
-	// because one compute surface was partial.
-	if n := len(s3bCloudWorkloads(t, l, models.WorkloadLambdaFunction)); n != 1 {
-		t.Errorf("cloud_workload lambda rows = %d, want 1: a partial surface must block ReconcileWorkloads", n)
+	// Cloud Inventory deletion is per surface: lambda:us-east-1 was reached,
+	// so the removed function's row is gone, while the partial bedrock-agents
+	// kept AGENTS3B02's (above).
+	if n := len(s3bCloudWorkloads(t, l, models.WorkloadLambdaFunction)); n != 0 {
+		t.Errorf("cloud_workload lambda rows = %d, want 0: a partial Bedrock surface must not veto "+
+			"deleting a Lambda its own reached surface no longer lists", n)
 	}
 
 	// Evidence names the call that actually returned the row.
@@ -352,7 +389,14 @@ func TestP2S3bFailedGetGatewayIsPartialAndKeepsTheKey(t *testing.T) {
 // (ListTaskDefinitions proves it exists) under its listed ARN, marked
 // incomplete, and ecs:<region> is partial -- it used to be dropped while the
 // surface read reached, which licensed deleting it. EC2's GetInstanceProfile
-// follows the same rule.
+// follows the same rule, for EVERY instance behind the unreadable profile: two
+// instances share web-tier here, and the second is answered from the reader's
+// profile cache -- the common case, one profile backing a fleet.
+//
+// Safeguard (mutation-checked, the reviewer's M-B): roleForInstanceProfile's
+// cached answer returns the cached FAILURE, not "no role"; handed on as "no
+// role" the second instance is written complete and unattributed, and the
+// graph records it as 'none', a false finding.
 func TestP2S3bECSDescribeAndInstanceProfileFailuresArePartial(t *testing.T) {
 	l := newP2Lab(t, "p2-s3b-ecs", true)
 	a := l.account(accountA)
@@ -364,11 +408,15 @@ func TestP2S3bECSDescribeAndInstanceProfileFailuresArePartial(t *testing.T) {
 		TaskRoleArn: aws.String(taskRole), Status: ecstypes.TaskDefinitionStatusActive,
 	}}}
 	profileARN := "arn:aws:iam::" + a.id + ":instance-profile/web-tier"
-	ec2Fake := &fakeEC2{instances: []ec2types.Instance{{
-		InstanceId:         aws.String("i-0s3b000000000001"),
-		State:              &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
-		IamInstanceProfile: &ec2types.IamInstanceProfile{Arn: aws.String(profileARN)},
-	}}}
+	var instances []ec2types.Instance
+	for _, id := range []string{"i-0s3b000000000001", "i-0s3b000000000002"} {
+		instances = append(instances, ec2types.Instance{
+			InstanceId:         aws.String(id),
+			State:              &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
+			IamInstanceProfile: &ec2types.IamInstanceProfile{Arn: aws.String(profileARN)},
+		})
+	}
+	ec2Fake := &fakeEC2{instances: instances}
 	profiles := &fakeInstanceProfile{roleByProfileName: map[string]string{"web-tier": instRole}}
 	f := &s3bFakes{ecs: ecsFake, ec2: ec2Fake, profiles: profiles}
 
@@ -376,6 +424,11 @@ func TestP2S3bECSDescribeAndInstanceProfileFailuresArePartial(t *testing.T) {
 	g1 := s3bGraphWorkloads(t, l, models.WorkloadECSTaskDefinition)
 	if len(g1) != 1 || g1[0].ExecutionRoleState != models.ExecRoleResolved {
 		t.Fatalf("setup: ECS node = %+v", g1)
+	}
+	instRoleID := s3bCloudIdentityID(t, l, instRole)
+	if inst := s3bGraphWorkloads(t, l, models.WorkloadEC2Instance); len(inst) != 2 ||
+		inst[0].ExecutionRoleState != models.ExecRoleResolved || inst[1].ExecutionRoleState != models.ExecRoleResolved {
+		t.Fatalf("setup: EC2 nodes = %+v, want two, both resolved", inst)
 	}
 
 	// ---- scan 2: the describe and the profile both fail -----------------------
@@ -390,8 +443,8 @@ func TestP2S3bECSDescribeAndInstanceProfileFailuresArePartial(t *testing.T) {
 		t.Fatalf("ecs after a denied describe = %+v, want partial, count 1, naming the call", s)
 	}
 	if s := s3bSurface(t, cov, "ec2:us-east-1"); s.State != models.CloudCoveragePartial ||
-		!strings.Contains(s.Error, "iam:GetInstanceProfile AccessDenied") {
-		t.Fatalf("ec2 after a denied GetInstanceProfile = %+v, want partial naming the call", s)
+		!strings.Contains(s.Error, "iam:GetInstanceProfile AccessDenied") || !strings.Contains(s.Error, "2 of 2 instances") {
+		t.Fatalf("ec2 after a denied GetInstanceProfile = %+v, want partial, 2 of 2 instances, naming the call", s)
 	}
 	cw := s3bCloudWorkloads(t, l, models.WorkloadECSTaskDefinition)
 	if len(cw) != 1 || cw[0].NativeID != tdARN || !cw[0].attrs(t).DetailIncomplete {
@@ -404,9 +457,26 @@ func TestP2S3bECSDescribeAndInstanceProfileFailuresArePartial(t *testing.T) {
 	if ex := s3bExecutesAs(t, l, g2[0].ID); len(ex) != 1 || ex[0].State != models.RelStale {
 		t.Errorf("ECS executes_as = %+v, want stale (never ended on a describe we could not read)", ex)
 	}
+	// Both instances: the one that asked AWS and the one answered from the
+	// cache. Each is incomplete, keeps its attribution, and keeps its graph
+	// state and edge -- stale, never 'none'.
+	for _, w := range s3bCloudWorkloads(t, l, models.WorkloadEC2Instance) {
+		if !w.attrs(t).DetailIncomplete || w.IdentityID == nil || *w.IdentityID != instRoleID {
+			t.Errorf("EC2 row %s = identity %v, attrs %+v: want detail incomplete and the previous attribution kept",
+				w.NativeID, w.IdentityID, w.attrs(t))
+		}
+	}
 	inst := s3bGraphWorkloads(t, l, models.WorkloadEC2Instance)
-	if len(inst) != 1 || inst[0].ExecutionRoleState != models.ExecRoleResolved {
-		t.Errorf("EC2 node = %+v, want its role state untouched by a failed GetInstanceProfile", inst)
+	if len(inst) != 2 {
+		t.Fatalf("EC2 nodes = %+v, want two", inst)
+	}
+	for _, n := range inst {
+		if n.ExecutionRoleState != models.ExecRoleResolved {
+			t.Errorf("EC2 node %s = %q, want its role state untouched by a failed GetInstanceProfile", n.SourceKey, n.ExecutionRoleState)
+		}
+		if ex := s3bExecutesAs(t, l, n.ID); len(ex) != 1 || ex[0].State != models.RelStale {
+			t.Errorf("EC2 node %s executes_as = %+v, want the edge kept, stale", n.SourceKey, ex)
+		}
 	}
 }
 

@@ -204,6 +204,31 @@ func (f *ItemFailures) Fail(item, call string, err error) {
 	f.Calls = append(f.Calls, CallFailure{Call: call, Failed: 1, Code: ErrorCode(err), AWSCode: AWSErrorCode(err)})
 }
 
+// Merge adds another reader's tally to this one, so a surface read by many
+// readers -- eks_pod_identity is one EKS reader per region, one association
+// listing per cluster -- reports EVERY failure it had, not only its first
+// reader's: "the report names how many" (§1.4). Items are counted as distinct
+// (a cluster name is unique only within its region), and a call's first code
+// is the first one seen across the merged tallies. A nil tally adds nothing.
+func (f *ItemFailures) Merge(o *ItemFailures) {
+	if o == nil {
+		return
+	}
+	f.Total += o.Total
+	f.Failed += o.Failed
+	f.Throttled += o.Throttled
+next:
+	for _, oc := range o.Calls {
+		for i := range f.Calls {
+			if f.Calls[i].Call == oc.Call {
+				f.Calls[i].Failed += oc.Failed
+				continue next
+			}
+		}
+		f.Calls = append(f.Calls, oc)
+	}
+}
+
 // Error names how many items failed, and which calls with which codes:
 // "2 of 7 agents could not be read in detail: bedrock:GetAgent AccessDeniedException".
 // §2.14.13: name the call and the code, never a guessed permission.

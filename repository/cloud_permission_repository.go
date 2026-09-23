@@ -51,6 +51,13 @@ type CloudPermissionRepository interface {
 	// table depends on was reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
 
+	// CountPodIdentityEdges counts the connector's EKS Pod Identity edges, any
+	// generation, that may come from the given region: those whose attrs name
+	// it, and every one whose attrs name no region (written before edges
+	// carried one), which may come from anywhere. Whether an earlier scan ever
+	// recorded a binding there (T3.8, writePodIdentityEdges).
+	CountPodIdentityEdges(workspaceID, connectorID uuid.UUID, region string) (int64, error)
+
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
 	Fenced(f ScanFence) CloudPermissionRepository
@@ -305,6 +312,17 @@ func (r *cloudPermissionRepository) CountsForConnector(workspaceID, connectorID 
 		return 0, 0, 0, err
 	}
 	return edges, permissions, resources, nil
+}
+
+func (r *cloudPermissionRepository) CountPodIdentityEdges(
+	workspaceID, connectorID uuid.UUID, region string,
+) (int64, error) {
+	var n int64
+	err := r.db.Model(&models.CloudAssumeEdge{}).
+		Where("workspace_id = ? AND connector_id = ? AND mechanism = ? AND COALESCE(attrs->>'region', '') IN (?, '')",
+			workspaceID, connectorID, models.AssumeMechanismEKSPodIdentity, region).
+		Count(&n).Error
+	return n, err
 }
 
 // ReconcileGeneration removes what this connector did not see, in the order

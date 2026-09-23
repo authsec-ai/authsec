@@ -2,6 +2,8 @@ package services
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
@@ -20,7 +22,8 @@ import (
 //	                                       always did, with api and error_code
 //
 // resource_policies is the one per-item surface with its own mapping (D-93,
-// resourcePolicyCoverage below).
+// resourcePolicyCoverage below), and eks_pod_identity the one surface read by
+// many readers at once (podIdentityCoverage, at the end of this file).
 //
 // §1.4: partial, denied and throttled all keep what the surface last
 // confirmed (stale); unsupported and reached do not. The Error always names
@@ -104,6 +107,122 @@ func resourcePolicyCoverage(reads int, err error) models.SurfaceCoverage {
 func withFirstFailure(cov models.SurfaceCoverage, f *awsdiscovery.ItemFailures) models.SurfaceCoverage {
 	if len(f.Calls) > 0 {
 		cov.API, cov.ErrorCode = f.Calls[0].Call, f.Calls[0].AWSCode
+	}
+	return cov
+}
+
+// podIdentityFailures is everything eks_pod_identity could not read in ONE
+// run, across every selected region and every cluster. The surface is read by
+// one EKS reader per region and one association listing per cluster, and each
+// returns its own error; keeping only the first of them undercounted the
+// report ("the report names how many", §1.4) and let a later region's denied
+// or throttled listing read as an earlier region's partial.
+type podIdentityFailures struct {
+	// listings are the reads that returned no list at all -- a session that
+	// could not be created, eks:ListClusters, eks:ListPodIdentityAssociations
+	// -- in the order they failed, each naming its call.
+	listings []podIdentityListing
+	// clusters and associations tally the DETAIL calls behind listings that
+	// succeeded (eks:DescribeCluster, eks:DescribePodIdentityAssociation),
+	// summed over every region and cluster.
+	clusters, associations *awsdiscovery.ItemFailures
+}
+
+// podIdentityListing is one listing that failed outright. why, when set, is
+// appended to the error's own text: the reason a non-resolving endpoint is
+// reported as a failure rather than skipped as "not offered here".
+type podIdentityListing struct {
+	err error
+	why string
+}
+
+func newPodIdentityFailures() *podIdentityFailures {
+	return &podIdentityFailures{
+		clusters:     awsdiscovery.NewItemFailures("clusters could not be read in detail", true),
+		associations: awsdiscovery.NewItemFailures("pod identity associations could not be read in detail", true),
+	}
+}
+
+func (f *podIdentityFailures) addListing(err error, why string) {
+	if err != nil {
+		f.listings = append(f.listings, podIdentityListing{err: err, why: why})
+	}
+}
+
+// addClusters and addAssociations take one reader call's error: its detail
+// tally (*awsdiscovery.ItemFailures) is merged into the surface's, and
+// anything else is a listing that returned nothing.
+func (f *podIdentityFailures) addClusters(err error)     { f.add(f.clusters, err) }
+func (f *podIdentityFailures) addAssociations(err error) { f.add(f.associations, err) }
+
+func (f *podIdentityFailures) add(tally *awsdiscovery.ItemFailures, err error) {
+	var items *awsdiscovery.ItemFailures
+	switch {
+	case err == nil:
+	case errors.As(err, &items):
+		tally.Merge(items)
+	default:
+		f.addListing(err, "")
+	}
+}
+
+// err is f when anything failed, else nil -- never a typed nil, which would
+// read as a failure.
+func (f *podIdentityFailures) err() error {
+	if len(f.listings) == 0 && f.clusters.Failed == 0 && f.associations.Failed == 0 {
+		return nil
+	}
+	return f
+}
+
+// Error names every failure: each failed listing with its call and code, then
+// "N of M clusters ..." and "N of M pod identity associations ..." for the
+// detail calls.
+func (f *podIdentityFailures) Error() string {
+	var parts []string
+	for _, l := range f.listings {
+		parts = append(parts, l.err.Error()+l.why)
+	}
+	if n := len(f.listings); n > 1 {
+		parts[0] = fmt.Sprintf("%d listings failed: %s", n, parts[0])
+	}
+	for _, t := range []*awsdiscovery.ItemFailures{f.clusters, f.associations} {
+		if t.Failed > 0 {
+			parts = append(parts, t.Error())
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// podIdentityCoverage is eks_pod_identity's coverage. A listing that failed
+// outright outranks every detail failure -- the region or cluster it covers
+// was not read at all -- and is denied, or throttled when every failed
+// listing was a throttle; with only detail calls failing, the surface is
+// partial (§1.4: "a failed detail call makes its surface partial"). All three
+// block. API and ErrorCode name the listing the state came from, else the
+// first failing detail call (D-71). Count is the edges written, a floor
+// whenever the state is not reached. Any other error is surfaceResult's.
+func podIdentityCoverage(count int, err error) models.SurfaceCoverage {
+	var f *podIdentityFailures
+	if !errors.As(err, &f) {
+		return surfaceResult(count, err)
+	}
+	if len(f.listings) > 0 {
+		lead, state := f.listings[0], models.CloudCoverageThrottled
+		for _, l := range f.listings {
+			if !errors.Is(l.err, awsdiscovery.ErrThrottled) {
+				lead, state = l, models.CloudCoverageDenied
+				break
+			}
+		}
+		return models.SurfaceCoverage{State: state, Count: count, Error: f.Error(),
+			API: awsdiscovery.CallName(lead.err), ErrorCode: awsdiscovery.AWSErrorCode(lead.err)}
+	}
+	cov := models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: count, Error: f.Error()}
+	for _, t := range []*awsdiscovery.ItemFailures{f.clusters, f.associations} {
+		if t.Failed > 0 {
+			return withFirstFailure(cov, t)
+		}
 	}
 	return cov
 }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"log"
 	"strings"
 	"time"
@@ -112,4 +113,26 @@ func arnField(arn string, i int) string {
 		return ""
 	}
 	return parts[i]
+}
+
+// podIdentityEdgeAttrs is a pod-identity cloud_assume_edge's attrs: where the
+// binding was read. The region is what a later scan needs to tell "EKS is not
+// offered there" from "a binding we recorded there cannot be read"
+// (CountPodIdentityEdges, T3.8); the cluster and association identifiers say
+// which EKS objects the edge stands for. Replaced on every read, like the
+// rest of the edge.
+func podIdentityEdgeAttrs(
+	region string, cluster awsdiscovery.EKSCluster, assoc awsdiscovery.PodIdentityAssociation,
+) json.RawMessage {
+	raw, err := json.Marshal(map[string]string{
+		"region":          region,
+		"cluster_name":    cluster.Name,
+		"cluster_arn":     cluster.ARN,
+		"association_arn": assoc.AssociationARN,
+		"association_id":  assoc.AssociationID,
+	})
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
 }

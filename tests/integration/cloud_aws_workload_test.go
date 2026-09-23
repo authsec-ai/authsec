@@ -129,9 +129,14 @@ type fakeBedrock struct {
 	// getFail makes GetAgent fail for every agent while ListAgents still lists
 	// them -- the detail-call failure T3.6 is about.
 	getFail error
+	// listFail fails ListAgents itself: the surface is not read at all.
+	listFail error
 }
 
 func (f *fakeBedrock) ListAgents(_ context.Context, _ *bedrockagent.ListAgentsInput, _ ...func(*bedrockagent.Options)) (*bedrockagent.ListAgentsOutput, error) {
+	if f.listFail != nil {
+		return nil, f.listFail
+	}
 	var summaries []bedrockagenttypes.AgentSummary
 	for id, a := range f.agents {
 		// The summary carries id, name and status -- never the ARN or the
@@ -172,12 +177,22 @@ type fakeAgentCore struct {
 	// account is the account GetGateway's ARN names; the connector's own
 	// (testAccount) when unset, as in a real account.
 	account string
+	// partition and region are the ones GetGateway's ARN names; aws and
+	// us-east-1 when unset.
+	partition, region string
+	// listRuntimesFail / listGatewaysFail fail the LISTING itself: the surface
+	// is not read at all, as opposed to one of its detail calls failing.
+	listRuntimesFail error
+	listGatewaysFail error
 
 	oauth2Providers []agentcoretypes.Oauth2CredentialProviderItem
 	apiKeyProviders []agentcoretypes.ApiKeyCredentialProviderItem
 }
 
 func (f *fakeAgentCore) ListAgentRuntimes(_ context.Context, _ *bedrockagentcorecontrol.ListAgentRuntimesInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListAgentRuntimesOutput, error) {
+	if f.listRuntimesFail != nil {
+		return nil, f.listRuntimesFail
+	}
 	return &bedrockagentcorecontrol.ListAgentRuntimesOutput{AgentRuntimes: f.runtimes}, nil
 }
 
@@ -194,6 +209,9 @@ func (f *fakeAgentCore) GetAgentRuntime(_ context.Context, in *bedrockagentcorec
 // that need one set fields on fakeAgentCore for it, per the pattern
 // runtimes/roleByID already establish.
 func (f *fakeAgentCore) ListGateways(_ context.Context, _ *bedrockagentcorecontrol.ListGatewaysInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewaysOutput, error) {
+	if f.listGatewaysFail != nil {
+		return nil, f.listGatewaysFail
+	}
 	return &bedrockagentcorecontrol.ListGatewaysOutput{Items: f.gateways}, nil
 }
 
@@ -205,12 +223,18 @@ func (f *fakeAgentCore) GetGateway(_ context.Context, in *bedrockagentcorecontro
 	if !ok {
 		return nil, denied("bedrock-agentcore:GetGateway")
 	}
-	account := f.account
+	account, partition, region := f.account, f.partition, f.region
 	if account == "" {
 		account = testAccount
 	}
+	if partition == "" {
+		partition = "aws"
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
 	return &bedrockagentcorecontrol.GetGatewayOutput{
-		GatewayArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:" + account + ":gateway/" + aws.ToString(in.GatewayIdentifier)),
+		GatewayArn: aws.String("arn:" + partition + ":bedrock-agentcore:" + region + ":" + account + ":gateway/" + aws.ToString(in.GatewayIdentifier)),
 		RoleArn:    aws.String(role),
 	}, nil
 }
