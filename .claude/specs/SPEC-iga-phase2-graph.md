@@ -5,7 +5,8 @@
 > [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md); the
 > invariants this phase must honour are [SPEC-iga-roadmap.md](SPEC-iga-roadmap.md) §3.
 >
-> **Verified 2026-09-21** against backend `efb67b2`, migrations `001`–`025`.
+> **Verified 2026-09-21** against backend `efb67b2`, migrations `001`–`025`; `026` (governance schema parity)
+> is written and precedes this phase — see §3.
 > Every table, column, file and line cited below was read. Claims that a
 > function or constraint *does* something were checked against its body, not
 > against its name.
@@ -133,7 +134,7 @@ duplicate a gate that already holds, and the second copy is the one that drifts.
 
 **§2.9 — cross-workspace provenance.** `024` added no `UNIQUE (workspace_id, id)`
 and, in closing D4, introduced a third single-column foreign key to
-`cloud_scan_run`. Migration `026` closes it. This is the only Phase 1-adjacent
+`cloud_scan_run`. Migration `027` closes it. This is the only Phase 1-adjacent
 item left, and it belongs before the projector: if the projector's foreign keys
 are written single-column they have to be redone.
 
@@ -421,12 +422,12 @@ the fix.
 **Rule for this phase: no single-column foreign key to a workspace-scoped
 table.** Every reference is `(workspace_id, id)` against a
 `UNIQUE (workspace_id, id)`. `cloud_scan_run` and `cloud_observation` lack that
-unique constraint today; `024` adds it. This applies to `last_confirmed_by`,
+unique constraint today; `027` adds it. This applies to `last_confirmed_by`,
 `iga_projection_state.last_run_id`, `iga_projection_job.scan_run_id` and every
 evidence junction.
 
 `cloud_observation.scan_run_id` (`022:42`) is itself a single-column FK to
-`cloud_scan_run(id)` — the same gap, in Phase 1 code. `024` qualifies it.
+`cloud_scan_run(id)` — the same gap, in Phase 1 code. `027` qualifies it.
 
 ### 2.10 Two mechanisms the rest of the design rests on
 
@@ -451,7 +452,7 @@ window between them is exactly where the overwrite happens.
 
 So the barrier is a **row**, not a lock:
 
-Its DDL is migration `026` (§3); it is not repeated here.
+Its DDL is migration `027` (§3); it is not repeated here.
 
 Every transition is one conditional `UPDATE`, atomic and recoverable:
 
@@ -539,7 +540,7 @@ Serialization does not help; this happens sequentially and is still wrong.
 
 **Object identity and source support are separate rows.**
 
-Its DDL is migration `031` (§3); it is not repeated here.
+Its DDL is migration `032` (§3); it is not repeated here.
 
 - **Projection** upserts one support row per `(object, connector, partition)`
   it observed, stamping `last_confirmed_run_id`.
@@ -586,7 +587,7 @@ shared, it moves to support rows rather than growing a second rule.
    ┌────┴─────────┬──────────────────┬──────────────┐    │
    ▼              ▼                  ▼              ▼    ▼
 iga_identity_  iga_workload      iga_resources   iga_credentials
-  accounts      NEW 026               ▲             │
+  accounts      NEW 029               ▲             │
    │  source_key ✦  source_key ✦      │   source_key ✦
    │                                  │
    │              iga_entitlements ───┘  source_key ✦ (§2.6)
@@ -594,7 +595,7 @@ iga_identity_  iga_workload      iga_resources   iga_credentials
    │                     │ NOT NULL
    └──────┬──────────────┘
           ▼
-   iga_access_edges          iga_relationship  NEW 028
+   iga_access_edges          iga_relationship  NEW 031
    identity → entitlement    typed source AND typed target
    basis/state/validity      legal (source,type,target) CHECK
    last_confirmed_by ────▶ cloud_scan_run (workspace-qualified)
@@ -611,12 +612,12 @@ Two tables carry the mechanisms of §2.10 and sit beside this graph rather than
 inside it:
 
     iga_pipeline_lease      one row per WORKSPACE. idle -> collecting ->
-      (026)                 projecting -> idle, fenced by `version`. A durable
+      (027)                 projecting -> idle, fenced by `version`. A durable
                             row, not a session lock, because publication and
                             projection are different transactions.
 
     iga_object_support      one row per (object, connector, partition).
-      (031)                 Reconciliation ends SUPPORT; a node retires only
+      (032)                 Reconciliation ends SUPPORT; a node retires only
                             when every support of it has ended. This is why
                             nodes carry no connector_id and edges do.
 ```
@@ -664,7 +665,7 @@ repo:authsec-ai/authsec  ──▶  role/gha-deploy    ──▶  s3:PutObject �
 
 The far end is a **node**, not a string on the edge:
 
-Its DDL is migration `033` (§3); it is not repeated here.
+Its DDL is migration `034` (§3); it is not repeated here.
 
 `iga_relationship` gains `source_external_principal_id` as a fourth typed
 source, with the legal-pair CHECK widened so `can_assume` accepts it.
@@ -917,7 +918,7 @@ Grouping is the one to hold the line on. Deciding that `cs-handler-a` and
 `cs-handler-b` are one agent is a correlation claim, and §2.12's rule applies:
 no merging on names, ever, without evidence.
 
-**Schema** is in migration `028` (§3), with `iga_workload`.
+**Schema** is in migration `029` (§3), with `iga_workload`.
 
 Two rules the projector must honour:
 
@@ -1479,7 +1480,7 @@ Every screen in §2.14 mapped to the contract behind it, and whether it exists.
 | Graph expansion | `GET /api/iga/v1/graph/expand?node=:id&rev=…` returning added nodes/edges plus `truncated` | **Missing** |
 | Evidence | `GET /api/iga/v1/edges/:id/evidence` | **Partial.** `GET /agents/:id/evidence` exists, agent-scoped, not per-edge |
 | Coverage for a scope | `GET /api/iga/v1/coverage?account=…` with per-surface cause **and prevented conclusion** | **Partial.** `GET /integrations/:id/coverage` exists; it reports state, not what the gap prevents |
-| Changes | `GET /api/iga/v1/estate/:id/changes?kind=configuration\|coverage` | **Missing.** Requires the lifecycle history 029/030 add |
+| Changes | `GET /api/iga/v1/estate/:id/changes?kind=configuration\|coverage` | **Missing.** Requires the lifecycle history 030/031 add |
 | Pagination + totals | Cursor + `total_known: bool` on every list | **Partial.** AWS lists clamp at 500 with no cursor (P1-8 unbuilt) |
 
 #### Revision pinning
@@ -1491,7 +1492,7 @@ pipeline barrier (§2.10A) serializes projection per workspace, so every
 projection commit is a totally ordered event — and that gives a well-defined
 revision for free.
 
-Its DDL is migration `032` (§3), with `iga_projection_state`.
+Its DDL is migration `033` (§3), with `iga_projection_state`.
 
 `rev` is assigned **inside the projection transaction**, as
 `max(rev) + 1` under the barrier row's lock — so two publications can never
@@ -1553,7 +1554,7 @@ suppresses every completeness claim (§2.14.11).
 | Estate list, Overview, Identities, Resources | The graph tables and projector | **2** |
 | Graph view with expansion | Traversal API with bounded depth and truncation | **4** |
 | Changes view | Relationship lifecycle history | **2** (schema) + **4** (read path) |
-| Manual classification as agent | `028` classification columns + decision record; the endpoint below | **2** (P2-G) |
+| Manual classification as agent | `029` classification columns + decision record; the endpoint below | **2** (P2-G) |
 | Inferred classification, grouping | Rules, evidence, review surface | **Not this phase** |
 | Ownership on Overview | Ownership attestation | **Post-graph** — shows "Not assigned" until then |
 | Activity on any screen | A CloudTrail collector for observed use | **Not this phase.** Access Advisor only, with §2.14.8 wording |
@@ -1674,19 +1675,32 @@ Phase 4/5 and is specified, not built.
 
 ## 3. Schema
 
-Nine migrations, `026`–`034`, in `authsec/migrations/master/`. **`024` and
+Nine migrations, `027`–`035`, in `authsec/migrations/master/`. **`024` and
 `025` have shipped** — `024_scan_evidence_durability.sql` closed D1–D4 and
 `025_observation_subjectless_dedupe.sql` followed it; §1.2 says what they did.
+
+**`026_governance_schema_parity.sql` ships first, on its own, and is not a
+Phase 2 migration.** The production schema rehearsal (restored production
+against a fresh `001`–`025`) found production missing six governance tables
+and two `CHECK`s that exist only in `001_bootstrap.sql` — the same defect as
+`023`, in a part of the schema `023` did not reach. It is live today: the
+deployed binary serves `/governance/agent-policies` and
+`/actuation/enforcement-plan` against tables production does not have, and
+production's `provisioning_instructions_kind_chk` rejects every eviction,
+delete and force-delete instruction. `026` copies the six tables verbatim from
+the bootstrap, widens `kind_chk`, and adds `force_chk`. Verified: after `026`,
+production is identical to a fresh install in tables, columns, indexes and
+constraint behaviour. Phase 2 therefore starts at `027`.
 
 > **Rehearse against a production schema dump before merging.** Migration `023`
 > exists only because that rehearsal caught seven columns added to
 > `001_bootstrap.sql` with no numbered migration: new installs had them,
 > production never would, and pods would have come up healthy and failed at
 > first customer use. Dump the schema (no rows), restore locally, apply
-> `026`–`033`, run the suite between each. **A green run on a fresh bootstrap
+> `027`–`034`, run the suite between each. **A green run on a fresh bootstrap
 > proves nothing about production.**
 
-### 026 — close the cross-workspace provenance gap
+### 027 — close the cross-workspace provenance gap
 
 **The pipeline barrier (§2.10A) lands here**, in the foundation migration:
 everything downstream assumes a workspace cannot collect and project at
@@ -1717,7 +1731,7 @@ CREATE TABLE IF NOT EXISTS public.iga_pipeline_lease (
 -- Every composite FK below needs this target, and it does not exist:
 -- 010 gives cloud_connector only a primary key on id and
 -- uq_cloud_connector_scope. Without it, every
--- REFERENCES cloud_connector (workspace_id, id) in 029-032 fails to apply.
+-- REFERENCES cloud_connector (workspace_id, id) in 030–033 fails to apply.
 ALTER TABLE public.cloud_connector
     ADD CONSTRAINT cloud_connector_workspace_id_key UNIQUE (workspace_id, id);
 ```
@@ -1776,10 +1790,10 @@ SELECT count(*) FROM cloud_observation o
 
 This is why §2.9 is a rule rather than a one-off fix: **no single-column foreign
 key to a workspace-scoped table.** Every migration from here adds its references
-in the composite form, and `026` exists because three were written before the
+in the composite form, and `027` exists because three were written before the
 rule was.
 
-### 027 — recognition keys and continuity
+### 028 — recognition keys and continuity
 
 Written out for **all five tables**. "Repeat the block for the others" is not
 something a migration can apply: it runs cleanly and leaves the other tables
@@ -1875,7 +1889,7 @@ Three notes, each a decision:
   recognition key and cannot be given one — they were minted by `uuid.New()`
   from GitHub scans and nothing records their origin. A total unique index would
   collapse them into one row. The partial index lets legacy rows coexist while
-  constraining every new one. `033` retires them.
+  constraining every new one. `035` retires them.
 - **`lifecycle <> 'retired'` in the predicate** is what makes
   delete-and-recreate expressible: the retired row keeps its `source_key`, the
   new row takes the same key, only one is live.
@@ -1885,7 +1899,7 @@ Three notes, each a decision:
 
 Put the Phase 3 warning from §2.6 in `iga_entitlements`' migration comment.
 
-### 028 — `iga_workload`
+### 029 — `iga_workload`
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.iga_workload (
@@ -1979,7 +1993,7 @@ CREATE TABLE IF NOT EXISTS public.iga_workload_classification (
 );
 ```
 
-### 029 — `iga_access_edges`: typed subject, required entitlement, lifecycle
+### 030 — `iga_access_edges`: typed subject, required entitlement, lifecycle
 
 ```sql
 ALTER TABLE public.iga_access_edges
@@ -1995,7 +2009,13 @@ ALTER TABLE public.iga_access_edges
     ADD COLUMN IF NOT EXISTS last_confirmed_at timestamptz NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS last_confirmed_by uuid,
     ADD COLUMN IF NOT EXISTS ended_reason      text NOT NULL DEFAULT '',
-    ADD COLUMN IF NOT EXISTS source_key        text NOT NULL DEFAULT '';
+    ADD COLUMN IF NOT EXISTS source_key        text NOT NULL DEFAULT '',
+    -- PARTITION MEMBERSHIP (§4.10). scope() selects the rows a partition owns
+    -- by these two columns and nothing else, and the projector stamps both on
+    -- every edge it writes. Without them every edge insert and every
+    -- reconciliation fails on a missing column.
+    ADD COLUMN IF NOT EXISTS partition_key     text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS connector_id      uuid;
 
 -- Backfill: the only writer ever set subject_kind = 'identity_account'
 -- (services/iga_service.go:918).
@@ -2031,7 +2051,11 @@ ALTER TABLE public.iga_access_edges
     ADD CONSTRAINT iga_access_edges_subject_instance_fkey
         FOREIGN KEY (workspace_id, subject_agent_instance_id)
         REFERENCES public.iga_agent_instances (workspace_id, id) ON DELETE CASCADE,
-    -- §2.9: workspace-qualified, against the UNIQUE added in 024.
+    -- §2.9: workspace-qualified, against the UNIQUE added in 027.
+    ADD CONSTRAINT iga_access_edges_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id)
+        ON DELETE SET NULL (connector_id),
     ADD CONSTRAINT iga_access_edges_run_fkey
         FOREIGN KEY (workspace_id, last_confirmed_by)
         REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE SET NULL (last_confirmed_by),
@@ -2077,10 +2101,10 @@ CREATE INDEX IF NOT EXISTS idx_iga_access_edges_subject_identity
   COLUMN` leaves it intact; assert its presence in the migration test.
 - `uq_iga_access_edges_live` is partial on `state <> 'ended'` so history
   accumulates while only one edge per grant is live.
-- `DROP COLUMN subject_kind` removes a column the Go model still has: `029` and
+- `DROP COLUMN subject_kind` removes a column the Go model still has: `030` and
   the `models/iga.go` change land in the same commit.
 
-### 030 — `iga_relationship`
+### 031 — `iga_relationship`
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.iga_relationship (
@@ -2091,8 +2115,8 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
     source_identity_account_id uuid,
     source_workload_id         uuid,
     source_agent_instance_id   uuid,
-    -- source_external_principal_id is added by 033, NOT here: its table does
-    -- not exist yet and a forward reference makes 030 fail to apply. 033 adds
+    -- source_external_principal_id is added by 034, NOT here: its table does
+    -- not exist yet and a forward reference makes 031 fail to apply. 034 adds
     -- the column, its composite FK, and widens both CHECKs below.
 
 
@@ -2109,10 +2133,17 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
     last_confirmed_by uuid,
     ended_reason      text NOT NULL DEFAULT '',
     source_key        text NOT NULL,
+    -- PARTITION MEMBERSHIP (§4.10), as on iga_access_edges.
+    partition_key     text NOT NULL DEFAULT '',
+    connector_id      uuid,
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT iga_relationship_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_relationship_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id)
+        ON DELETE SET NULL (connector_id),
     CONSTRAINT iga_relationship_workspace_fkey FOREIGN KEY (workspace_id)
         REFERENCES public.workspaces(id) ON DELETE CASCADE,
     CONSTRAINT iga_relationship_workspace_id_key UNIQUE (workspace_id, id),
@@ -2133,7 +2164,7 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
         REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE SET NULL (last_confirmed_by),
 
     -- Exactly one source and exactly one target, always.
-    -- Widened by 033 to admit source_external_principal_id.
+    -- Widened by 034 to admit source_external_principal_id.
     CONSTRAINT iga_relationship_source_chk CHECK (
         (source_identity_account_id   IS NOT NULL)::int
       + (source_workload_id           IS NOT NULL)::int
@@ -2151,7 +2182,7 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
             WHEN 'executes_as' THEN
                 source_workload_id IS NOT NULL AND target_identity_account_id IS NOT NULL
             WHEN 'can_assume' THEN
-                -- 033 widens this to also admit source_external_principal_id,
+                -- 034 widens this to also admit source_external_principal_id,
                 -- once that table exists.
                 source_identity_account_id IS NOT NULL
                 AND target_identity_account_id IS NOT NULL
@@ -2186,7 +2217,7 @@ other for the three current types. Keep both: the pair CHECK's `ELSE false` is
 the gate on new types, and the exactly-one CHECKs stay correct no matter how the
 pair CHECK is later widened.
 
-### 031 — evidence junctions and object support
+### 032 — evidence junctions and object support
 
 **Object support first**: the evidence junctions and every node
 reconciliation path depend on it, and §2.10B explains why a shared node
@@ -2328,7 +2359,7 @@ Both junctions have typed, workspace-qualified endpoints on both sides.
 `iga_observation_links` keeps its polymorphic `target_kind`/`target_id` for the
 GitHub path; P2-1's CI check forbids new writers to it.
 
-### 032 — projection job, projection state, agent origin
+### 033 — projection job, projection state, agent origin
 
 ```sql
 -- Mirrors cloud_scan_run's lease pattern. Enqueued in the SAME transaction as
@@ -2391,7 +2422,7 @@ CREATE TABLE IF NOT EXISTS public.iga_projection_state (
     CONSTRAINT iga_projection_state_generation_chk CHECK (last_generation >= 0),
     -- (workspace_id, connector_id), never connector_id alone: a bare FK
     -- lets a row in workspace A reference workspace B's integration, which
-    -- is the §2.9 defect this phase exists to close. 026 adds the
+    -- is the §2.9 defect this phase exists to close. 027 adds the
     -- UNIQUE (workspace_id, id) on cloud_connector that this needs.
     CONSTRAINT iga_projection_state_connector_fkey
         FOREIGN KEY (workspace_id, connector_id)
@@ -2451,7 +2482,7 @@ CREATE TABLE IF NOT EXISTS public.iga_publication (
 );
 ```
 
-### 033 — external principals
+### 034 — external principals
 
 The node for a far endpoint we may never resolve (§2.12).
 
@@ -2522,7 +2553,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_external_principal_key
     ON public.iga_external_principal (workspace_id, source_key);
 ```
 
-The table in §2.12, and then — because 030 could not forward-reference it —
+The table in §2.12, and then — because 031 could not forward-reference it —
 the three `ALTER`s that wire it in:
 
 ```sql
@@ -2554,11 +2585,11 @@ ALTER TABLE public.iga_relationship
         END);
 ```
 
-**`033` is part of the core rollout, not an optional extra.** Core
+**`034` is part of the core rollout, not an optional extra.** Core
 reconciliation writes this table — `retireUnsupported` suspends asserted
 resolutions and re-derives derived ones — and the projector's recreation and
 restoration branches call `SuspendAssertions` and
-`MarkAssertionsPendingReconfirm`. With `026`–`032` applied and `033` not, the
+`MarkAssertionsPendingReconfirm`. With `027`–`033` applied and `034` not, the
 reconciler fails with `relation "iga_external_principal" does not exist` on
 **every** run: the error is raised at plan time, so it fires even when no row
 could match. (Verified by applying exactly that intermediate state.)
@@ -2569,13 +2600,13 @@ What *is* staged is the feature, not the schema. The table ships empty; the
 P2-E and can be enabled later. An empty table makes every core write against
 it a no-op, which is the correct behaviour before that pass exists.
 
-### 034 — retire the legacy unkeyed rows (deferred)
+### 035 — retire the legacy unkeyed rows (deferred)
 
-`027`'s partial indexes let `source_key = ''` rows coexist. That is a transition
+`028`'s partial indexes let `source_key = ''` rows coexist. That is a transition
 allowance. Once P2-4 and P2-6 own the write path and **one clean production scan
 has run on the new path**, mark the remaining unkeyed rows
 `lifecycle = 'retired'`, `retired_reason = 'pre_graph'`, and tighten the CHECK
-to require a non-empty `source_key` on active rows. Ship as a separate PR, after 033. Never
+to require a non-empty `source_key` on active rows. Ship as a separate PR, after 034. Never
 tighten a constraint in the same release that introduces its column.
 
 ### Rules the DDL cannot express
@@ -2808,7 +2839,7 @@ func Continuity(kind string) string {
 // ImmutableKey reads the provider's creation-boundary id out of the collected
 // attrs. Returns "" when the provider exposes none.
 //
-// Continuity() and ImmutableKey() must agree: 027's CHECK rejects a row
+// Continuity() and ImmutableKey() must agree: 028's CHECK rejects a row
 // claiming 'immutable' with an empty immutable_key, which is deliberate -- a
 // silent disagreement here disables delete-and-recreate detection entirely.
 func ImmutableKey(ci models.CloudIdentity) string {
@@ -2819,7 +2850,7 @@ func ImmutableKey(ci models.CloudIdentity) string {
     //
     // Use the typed accessor, never a hand-rolled json.Unmarshal of a guessed
     // field name: a wrong key returns "" silently, Continuity() still says
-    // 'immutable', and 027's CHECK then rejects every IAM identity.
+    // 'immutable', and 028's CHECK then rejects every IAM identity.
     attrs, err := ci.AWSAttrs()
     if err != nil {
         return ""
@@ -2832,7 +2863,7 @@ func ImmutableKey(ci models.CloudIdentity) string {
 > it.** IAM roles and users are confirmed (`UniqueID`). EC2 instances,
 > Lambda, ECS task definitions and S3 buckets are **not** — each needs its own
 > check of what the collector actually writes, because `Continuity()` claiming
-> `immutable` while `ImmutableKey()` returns `""` makes 027's CHECK reject the
+> `immutable` while `ImmutableKey()` returns `""` makes 028's CHECK reject the
 > row. That loud failure is correct; do not relax the CHECK to get past it,
 > fix the mapping or downgrade the kind to `recognition_only`.
 
@@ -3662,7 +3693,7 @@ func (p *Projector) projectAccessEdges(tx *gorm.DB, snap *Snapshot, r *resolved)
             ConnectorID:              &snap.Run.ConnectorID,
             PartitionKey:             snap.EdgePartitionFor("access_edge", "", "").Key(),
             SubjectIdentityAccountID: &subj,
-            EntitlementID:            ent,          // NOT NULL since 029
+            EntitlementID:            ent,          // NOT NULL since 030
             ResourceID:               resID,        // denormalized for the reverse query
             Direction:                "outbound",
             PathKind:                 cp.NativeID,
@@ -3806,7 +3837,7 @@ func (p *Projector) recordState(tx *gorm.DB, snap *Snapshot, reconciled bool) er
 
 // Key is the partition's stable identity: scope, connector, class,
 // relationship type, target and its required surfaces, joined. It is the
-// unique key on iga_projection_state (032) and the value lastGenerationFor
+// unique key on iga_projection_state (033) and the value lastGenerationFor
 // looks up -- so two partitions that differ only by region or by service get
 // separate watermark rows instead of overwriting each other's progress.
 func (p Partition) Key() string
@@ -4304,7 +4335,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
         Updates(map[string]any{
             "state":        models.RelEnded,
             "valid_to":     snap.CompletedAt,
-            "ended_reason": reason, // never empty: 030's CHECK enforces it
+            "ended_reason": reason, // never empty: 031's CHECK enforces it
         }).Error
 }
 ```
@@ -4326,8 +4357,11 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 So membership is **written at projection time and queried directly**. Each
 relationship and access edge records the partition that produced it:
 
+The columns are created in migrations `030` (`iga_access_edges`) and `031`
+(`iga_relationship`); the fragment below shows their shape only.
+
 ```sql
--- EDGES ONLY: 029 (iga_access_edges) and 030 (iga_relationship).
+-- EDGES ONLY: 030 (iga_access_edges) and 031 (iga_relationship).
 --
 -- Nodes deliberately do NOT get these columns. A resource or managed-policy
 -- entitlement can be supported by several connectors at once, so a single
@@ -4436,7 +4470,7 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 // an object is retired only when no source anywhere still holds it.
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
     // One statement per node table, each joined on ITS OWN typed support
-    // column. There is no object_type/object_id to switch on -- 031 made
+    // column. There is no object_type/object_id to switch on -- 032 made
     // support typed precisely so a support row cannot point at a missing or
     // foreign-workspace object -- so the join column is fixed per table.
     for _, class := range models.NodeClasses { // identity, workload, resource, entitlement, agent
@@ -4447,7 +4481,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
         t := struct{ table, col string }{nodeTable(class), col}
         // The first EXISTS matters: an object with NO support rows at all is
         // pre-graph, not unsupported, and must not be retired by this pass --
-        // 034 handles those deliberately.
+        // 035 handles those deliberately.
         stmt := fmt.Sprintf(`
             UPDATE %[1]s n
                SET lifecycle = 'retired', retired_reason = 'unsupported', updated_at = now()
@@ -4536,7 +4570,7 @@ untouched because entitlements are reconciled on their own partition.
 ```go
 func (rc *Reconciler) lastGenerationFor(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error) {
     var st models.IGAProjectionState
-    // Keyed exactly as 032 keys the table, and exactly as scope() filters
+    // Keyed exactly as 033 keys the table, and exactly as scope() filters
     // rows -- one value, three call sites, no predicate to keep in agreement.
     err := tx.Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",
         ws, part.ConnectorID, part.Key()).First(&st).Error
@@ -4547,7 +4581,7 @@ func (rc *Reconciler) lastGenerationFor(tx *gorm.DB, part Partition, ws uuid.UUI
 }
 ```
 
-`iga_projection_state`'s unique key (032) must include the partition's surface
+`iga_projection_state`'s unique key (033) must include the partition's surface
 key, not just `(scope, class, relationship_type)` — otherwise roles and users
 share one watermark row, as do every region's workloads, and one partition's
 progress overwrites another's.
@@ -4827,9 +4861,9 @@ hardening pass:
 > 5. **Deployment states S0–S2, in an isolated environment**: deploy into
 >    each and confirm what the table says must hold — in particular that
 >    Phase 1 scanning still works in S1, and that the projector declines to
->    start below `033`.
+>    start below `034`.
 >
-> **S3 is not part of this gate.** It includes `034`, which depends on
+> **S3 is not part of this gate.** It includes `035`, which depends on
 > evidence from a real rollout (one clean S2 production scan) and is a
 > separate cleanup gate. It must not block starting the first slice.
 >
@@ -4868,8 +4902,8 @@ one — recorded in roadmap §2.1, and the same reasoning applies here.
 
 ### P2-2 · Close the cross-workspace provenance gap
 
-Migration `026` alone: the two `UNIQUE (workspace_id, id)` targets and the three
-single-column references converted to composite form (§3, `026`).
+Migration `027` alone: the two `UNIQUE (workspace_id, id)` targets and the three
+single-column references converted to composite form (§3, `027`).
 
 `024` already closed D1–D4. **Verify them, do not redo them** (§1.2), and in
 particular leave `models.ScanCoverage.Complete()` alone — the parse-failure gate
@@ -4879,11 +4913,11 @@ duplicates a gate that already holds, and the duplicate is the copy that drifts.
 
 Then wire the projection job enqueue: `repository/cloud_scan_run_repository.go`
 `Publish()` also enqueues `iga_projection_job` in the same transaction. That is a
-forward reference — land `026` now and wire the enqueue when `032` exists.
+forward reference — land `027` now and wire the enqueue when `033` exists.
 
 > **Gate:** a `cloud_observation` row whose `scan_run_id` belongs to another
 > workspace is rejected by the database, proven by a test that fails without
-> `026`. Then re-assert what `024` delivers, so a later change cannot quietly
+> `027`. Then re-assert what `024` delivers, so a later change cannot quietly
 > undo it: deleting a `cloud_permission` leaves its observations alive with
 > `subject_native_id` intact; a second unchanged read advances
 > `last_confirmed_run_id` without growing the table; a surface with one parse
@@ -4942,7 +4976,7 @@ func (r *igaRepository) UpsertIdentityAccount(a *models.IGAIdentityAccount) erro
 Then fix the caller: `services/iga_service.go:863,885,899,918` assigns
 `ID: uuid.New()` on every scan and must instead read back the resolved id for
 the edge it writes. All five methods — including `UpsertCredential`, whose
-`source_key` `027` adds.
+`source_key` `028` adds.
 
 Test against **real Postgres**. SQLite accepts the wrong thing silently.
 
@@ -4957,7 +4991,7 @@ Test against **real Postgres**. SQLite accepts the wrong thing silently.
 
 *The upsert trap that will bite: §4.9.*
 
-`027`–`031`, plus `models/iga.go`: `IGAAccessEdge` loses `SubjectKind`/
+`028`–`032`, plus `models/iga.go`: `IGAAccessEdge` loses `SubjectKind`/
 `SubjectID`, gains the three typed subject pointers and the lifecycle columns;
 new `models.IGAWorkload` and `models.IGARelationship`. `ListAccessEdges`
 (`repository/iga_repository.go:632`) filters on the dropped column and must take
@@ -5141,16 +5175,16 @@ and the evidence panel did not keep them apart.
 
 | Stage | Delivers | Gate |
 |---|---|---|
-| **P2-A** Foundation | `026` (workspace-qualified provenance) + P2-1 CI check + P2-3 `sourcekey.go` | `026` applies to a **production schema dump**, not a fresh bootstrap. Key table tests pass |
-| **P2-B** Objects | `027`–`028`, real upserts, support rows | Scenarios 1, 3, 7, 8, 9 |
-| **P2-C** Edges and evidence | `029`–`031`, projector, evidence | Scenarios 2, 11 |
+| **P2-A** Foundation | `027` (workspace-qualified provenance) + P2-1 CI check + P2-3 `sourcekey.go` | `027` applies to a **production schema dump**, not a fresh bootstrap. Key table tests pass |
+| **P2-B** Objects | `028`–`029`, real upserts, support rows | Scenarios 1, 3, 7, 8, 9 |
+| **P2-C** Edges and evidence | `030`–`032`, projector, evidence | Scenarios 2, 11 |
 | **P2-D** Lifecycle | Reconciliation, barrier, job | Scenarios 4, 5, 6 |
 | **P2-E** External | The **resolution pass** that populates `iga_external_principal`. The table itself ships with the core rollout (see below) | Scenario 10 |
 | **P2-F** One read path | P2-11: Identities + Resources for one workload, pinned `rev` via `iga_publication`, with evidence | Scenario 12, tasks U1–U5 |
-| **P2-G** Classification | `classification` + `iga_workload_classification` (028), the Classify-as-agent action on Overview | A classified Lambda appears as *Classified as agent* with its decision record; undo records its own decision; recreation starts `unclassified` |
+| **P2-G** Classification | `classification` + `iga_workload_classification` (029), the Classify-as-agent action on Overview | A classified Lambda appears as *Classified as agent* with its decision record; undo records its own decision; recreation starts `unclassified` |
 | **Graph canvas** | The one new UI component (§2.14.14) | Built **last**. The list views answer every §2.14.11 question except the visual one |
 | **Not scheduled** | Bedrock alias collection (`ListAgentAliases`) | Required before any instance count is shown. Until then the UI says *"instances not collected"* |
-| **Deferred** | `034` retirement of legacy unkeyed rows | After one clean production scan on the new path. **Not in the initial rollout** |
+| **Deferred** | `035` retirement of legacy unkeyed rows | After one clean production scan on the new path. **Not in the initial rollout** |
 
 #### Supported deployment states
 
@@ -5160,16 +5194,16 @@ state P2-0 must deploy into and check:
 
 | State | Schema | Projector | Must hold |
 |---|---|---|---|
-| **S0** | `001`–`025` (today) | not present | Phase 1 scanning unchanged |
-| **S1** | `001`–`033` | **disabled** | Phase 1 scanning still works against the migrated schema; nothing writes `iga_*` graph tables |
-| **S2** | `001`–`033` | enabled | The P2-0 slice end to end |
-| **S3** | `001`–`034` | enabled | After one clean S2 production scan |
+| **S0** | `001`–`026` (today, once `026` ships) | not present | Phase 1 scanning unchanged; governance routes work |
+| **S1** | `001`–`034` | **disabled** | Phase 1 scanning still works against the migrated schema; nothing writes `iga_*` graph tables |
+| **S2** | `001`–`034` | enabled | The P2-0 slice end to end |
+| **S3** | `001`–`035` | enabled | After one clean S2 production scan |
 
-**`026`–`033` ship in one release.** Any other split is unsupported, because
+**`027`–`034` ship in one release.** Any other split is unsupported, because
 core code references tables across that whole range.
 
 As a backstop against a partial rollout anyway, **the projector refuses to
-start below schema head `033`**: `ProjectionService.Run` reads the migration
+start below schema head `034`**: `ProjectionService.Run` reads the migration
 head and, if it is lower, logs and exits without claiming a job. A partial
 schema therefore degrades to *"graph not projecting"* — visible, and fixed by
 finishing the rollout — rather than to a reconciler that fails on every run.
@@ -5191,7 +5225,7 @@ was introduced, the named test observed to fail, and the fix restored:
 Command, for each: `TEST_DATABASE_URL=postgres://… go test ./tests/igagraph/... -run '<Test>'`.
 
 **Against this document's own SQL** (run 2026-09-23, PostgreSQL 16, on top of
-the shipped `001`–`025`): every `026`–`033` section's SQL was extracted and
+the shipped `001`–`025`): every `027`–`034` section's SQL was extracted and
 applied in order, **all eight apply**, and ten constraint probes were run with
 a seed that includes one insert that *must succeed* — so a rejection cannot
 pass merely because the seed was broken:
@@ -5211,7 +5245,7 @@ pass merely because the seed was broken:
 | Unknown classification value | rejected | `iga_workload_classification_chk` |
 
 `retireUnsupported`'s statement was also **executed** against all five node
-tables. This is what caught that `027` altered only one of its five tables —
+tables. This is what caught that `028` altered only one of its five tables —
 it applied cleanly and left four without `source_key`. A reading review and a
 static forward-reference check both missed it.
 
@@ -5273,7 +5307,7 @@ transaction** — `006` depends on it (`CREATE TEMP TABLE … ON COMMIT DROP`):
 for f in $(ls migrations/master/0*.sql | sort); do
   psql "$DB" -v ON_ERROR_STOP=1 --single-transaction -q -f "$f"
 done
-# then each spec section 026..033 the same way; 034 is deferred
+# then each spec section 027..034 the same way; 035 is deferred
 ```
 
 Then check the resulting schema has **every column the pseudocode uses**, not
@@ -5284,12 +5318,12 @@ failure mode this catches.
 # Migrations apply in order against a PRODUCTION schema dump, not a fresh bootstrap.
 pg_dump --schema-only "$PROD_URL" > /tmp/prod-schema.sql   # no rows
 createdb iga_rehearsal && psql iga_rehearsal < /tmp/prod-schema.sql
-# 034 is deferred (§6.3) and is NOT part of the initial rollout.
-for m in migrations/master/0{26,27,28,29,30,31,32,33}_*.sql; do
+# 035 is deferred (§6.3) and is NOT part of the initial rollout.
+for m in migrations/master/0{27,28,29,30,31,32,33,34}_*.sql; do
   psql iga_rehearsal -v ON_ERROR_STOP=1 -f "$m" || { echo "FAILED: $m"; break; }
 done
 
-# Confirm the FK constraint names 024 drops actually exist first.
+# Confirm the FK constraint names 027 drops actually exist first.
 psql iga_rehearsal -c "\d cloud_observation" | grep "Foreign-key"
 
 # A relationship with no target is rejected.
