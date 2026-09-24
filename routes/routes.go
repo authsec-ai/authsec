@@ -1662,6 +1662,10 @@ func SetupRoutes(
 			// AWS account decides what a scan may read and what it will cost.
 			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
 			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
+			// Quick Create: starting a session is admin, like POST /aws/connectors,
+			// because the link it returns connects an account. Reading one is not.
+			discovery.POST("/aws/onboarding/sessions", middlewares.Require("discovery", "admin"), cloudAWS.StartOnboardingSession)
+			discovery.GET("/aws/onboarding/sessions/:id", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingSession)
 			discovery.POST("/aws/connectors", middlewares.Require("discovery", "admin"), cloudAWS.CreateConnector)
 			discovery.GET("/aws/connectors", middlewares.Require("discovery", "read"), cloudAWS.ListConnectors)
 			discovery.GET("/aws/connectors/:id", middlewares.Require("discovery", "read"), cloudAWS.GetConnector)
