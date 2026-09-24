@@ -144,7 +144,12 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 	evidence := NewObservationWriter(
 		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation)
 
-	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence)
+	// The same run.Generation the evidence writer above was built with. One
+	// number, read once, so a row and the observation explaining it can never
+	// disagree about which pass produced them.
+	scanner := NewAWSIAMScanner(w.db, w.svc).
+		WithEvidence(evidence).
+		WithGeneration(run.Generation)
 	permissionScanner := NewAWSPermissionScanner(w.db, w.svc).WithEvidence(evidence)
 	workloadScanner := NewAWSWorkloadScanner(w.db, w.svc).WithEvidence(evidence)
 
