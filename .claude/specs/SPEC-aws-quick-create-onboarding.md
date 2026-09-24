@@ -11,7 +11,7 @@ What stays the same:
 
 Out of scope: Organizations, StackSets, onboarding several accounts at once, an endpoint for editing regions, GovCloud and China.
 
-This is Sumaya's AWS track. She should be briefed before coding starts and review the work before it merges.
+Review the work before it merges.
 
 The plan has three parts, kept apart on purpose:
 - **Part A** lists facts checked against AWS documentation, each with its source.
@@ -187,7 +187,7 @@ This plan only *adds* functions to the service and the controller, so the risk o
 - A manual-flow stack updated to a new template keeps `CallbackTopicArn` at `""`, so `HasCallback` is false and no custom resource is added.
 - `RoleName` keeps its previous value in both cases, so the role isn't replaced.
 
-**Open follow-up for Sumaya and Aditya (not in this plan).** The Update message could set the connector's recorded `TemplateVersion`, so the "Update the stack" hint clears after the customer updates. Update messages can be forged, so this would need the ExternalId to match the value in Vault and a successful `Verify` first. It stays out of scope until the owners decide.
+**Open follow-up (not in this plan).** The Update message could set the connector's recorded `TemplateVersion`, so the "Update the stack" hint clears after the customer updates. Update messages can be forged, so this would need the ExternalId to match the value in Vault and a successful `Verify` first. It stays out of scope until the owners decide.
 
 **Feedback for the Phase 2 spec.** T2.1 validates `PATCH` regions against `ec2:DescribeRegions`, which covers the **customer's** enabled regions. F12 shows that a scan of an opt-in region also needs the region enabled in **AuthSec's** account. T2.1 should check `AUTHSEC_AWS_OPTIN_SCAN_REGIONS` too; otherwise a region can be selected that will always fail.
 
@@ -445,7 +445,7 @@ The spike **must finish, with its findings written into this plan, before any im
 | S7 | A FAILED response rolls the stack back, deletes the role, and sends a Delete to the custom resource; that Delete completes once answered with SUCCESS | Send a callback with an unknown ExternalId | Adjust the Delete handling |
 | S8 | Once `ExternalId` loses `NoEcho`, every parameter is pre-filled on the Create stack review page | Visual check | — |
 | S9 | Regional probes behave as F12 predicts: an opt-in scan region enabled in both accounts shows Connected, and one disabled in the customer's account shows Not reachable | Enable one opt-in region (for example af-south-1) in AuthSec's sandbox account and test both cases | Adjust the probe's wording and classification |
-| S10 | *(Code, not AWS.)* `Onboard`'s upsert on a *revoked* connector brings it back to a usable state | An integration test | Raise it with Sumaya before changing anything |
+| S10 | *(Code, not AWS.)* `Onboard`'s upsert on a *revoked* connector brings it back to a usable state | An integration test | Raise it with the scan owners before changing anything |
 
 Open questions for people rather than the spike:
 - **Q2 (product):** whether AuthSec will have a principal in GovCloud or China.
@@ -569,7 +569,7 @@ Extend `tests/integration/cloud_aws_onboarding_test.go` with a fake verifier to 
 8. **Controller and routes.**
 9. **UI**, with tests.
 10. **End-to-end run** of all 10 scenarios.
-11. **Sumaya reviews, then merge.**
+11. **Review, then merge.**
 
 ---
 
