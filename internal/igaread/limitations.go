@@ -635,24 +635,30 @@ func loadRestrictions(q *Query, ins []*limInput, wantDeny, wantBoundary bool) (*
 // the SAME rule /resources/:id's resource_policy uses (ResourcePolicyOf,
 // D-19), so the Evidence panel and the resource Overview can never disagree
 // about one policy at one revision. The policy itself is never projected
-// (§1.4), so the grant's evaluation cannot account for it. One query per
-// distinct target text; a claim names few.
+// (§1.4), so the grant's evaluation cannot account for it. One query for
+// every distinct target text of every claim (ResourcePoliciesOf): a grouped
+// edge names tens of them (D-79, T6.10).
 func loadResourcePoliciesRead(q *Query, ins []*limInput) (map[string]bool, error) {
 	out := map[string]bool{}
 	if q.Rev == nil {
 		return out, nil
 	}
+	var texts []string
+	seen := map[string]bool{}
 	for _, in := range ins {
 		for _, t := range in.policyTargets {
-			if _, done := out[t.Text]; done {
-				continue
+			if !seen[t.Text] {
+				seen[t.Text] = true
+				texts = append(texts, t.Text)
 			}
-			st, err := ResourcePolicyOf(q, t.Text)
-			if err != nil {
-				return nil, err
-			}
-			out[t.Text] = st.Read
 		}
+	}
+	states, err := ResourcePoliciesOf(q, texts)
+	if err != nil {
+		return nil, err
+	}
+	for text, st := range states {
+		out[text] = st.Read
 	}
 	return out, nil
 }

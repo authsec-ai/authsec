@@ -298,12 +298,19 @@ type rdetailAccessAfter struct {
 // Statement lifecycle is not a condition: a live grant implies a live
 // statement, and an ended grant on a retired statement is history
 // include_ended asks for.
+//
+// Both CTEs carry ids and validity only. The page needs the statement's and
+// the policy's own columns for the rows of ONE page of holders, but the
+// holders and the total are computed over every row: on a reference as common
+// as "*" (named by a quarter of all statements, T6.10) that is tens of
+// thousands of rows, and carrying each statement's document through them made
+// the CTE spill to disk. The page statement joins those columns for its own
+// rows only (rdetailAccessPageSQL).
 func rdetailAccessRowsCTE(ws, resourceID uuid.UUID, states []string) (string, []any) {
 	return `WITH grants AS (
 	    SELECT g.workspace_id, g.id AS grant_id, g.state AS grant_state, g.valid_from AS grant_valid_from,
 	           g.valid_to AS grant_valid_to, g.subject_identity_account_id AS holder_id,
-	           e.id AS statement_id, e.sid, e.statement_index, e.native_rights, e.conditional,
-	           p.id AS policy_id, p.display_name AS policy_name, p.policy_kind
+	           e.id AS statement_id, e.policy_id
 	      FROM iga_entitlement_target t
 	      JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
 	      JOIN iga_policy p ON p.workspace_id = e.workspace_id AND p.id = e.policy_id
@@ -313,15 +320,13 @@ func rdetailAccessRowsCTE(ws, resourceID uuid.UUID, states []string) (string, []
 	       AND g.provider = 'aws' AND g.subject_identity_account_id IS NOT NULL AND g.state IN ?),
 	access_rows AS (
 	    SELECT gr.workspace_id, gr.holder_id, gr.grant_id, gr.grant_state, gr.grant_valid_from,
-	           gr.statement_id, gr.sid, gr.statement_index, gr.native_rights, gr.conditional,
-	           gr.policy_id, gr.policy_name, gr.policy_kind,
+	           gr.statement_id, gr.policy_id,
 	           NULL::uuid AS group_id, NULL::uuid AS membership_id, ''::text AS membership_state,
 	           NULL::timestamptz AS membership_valid_from
 	      FROM grants gr
 	    UNION ALL
 	    SELECT gr.workspace_id, m.source_identity_account_id, gr.grant_id, gr.grant_state, gr.grant_valid_from,
-	           gr.statement_id, gr.sid, gr.statement_index, gr.native_rights, gr.conditional,
-	           gr.policy_id, gr.policy_name, gr.policy_kind,
+	           gr.statement_id, gr.policy_id,
 	           gr.holder_id, m.id, m.state, m.valid_from
 	      FROM grants gr
 	      JOIN iga_relationship m
@@ -368,16 +373,18 @@ func rdetailAccessPageSQL(ws, resourceID uuid.UUID, states []string, after *rdet
 	       ia.id AS holder_id, ia.display_name AS holder_name, ia.account_kind AS holder_kind,
 	       ia.source_key AS holder_source_key, h.k2 AS holder_account,
 	       rw.grant_id, rw.grant_state, rw.grant_valid_from,
-	       rw.statement_id, rw.sid, rw.statement_index, rw.native_rights, rw.conditional,
-	       rw.policy_id, rw.policy_name, rw.policy_kind,
+	       rw.statement_id, e.sid, e.statement_index, e.native_rights, e.conditional,
+	       rw.policy_id, p.display_name AS policy_name, p.policy_kind,
 	       rw.group_id, gi.display_name AS group_name,
 	       rw.membership_id, rw.membership_state, rw.membership_valid_from
 	  FROM holders h
 	  JOIN iga_identity_accounts ia ON ia.workspace_id = ? AND ia.id = h.id
 	  JOIN access_rows rw ON rw.holder_id = h.id
+	  JOIN iga_entitlements e ON e.workspace_id = rw.workspace_id AND e.id = rw.statement_id
+	  JOIN iga_policy p ON p.workspace_id = rw.workspace_id AND p.id = rw.policy_id
 	  LEFT JOIN iga_identity_accounts gi ON gi.workspace_id = rw.workspace_id AND gi.id = rw.group_id
-	 ORDER BY h.k0, h.k1, h.k2, h.id, (rw.group_id IS NOT NULL), lower(rw.policy_name), rw.policy_id,
-	          rw.statement_index NULLS LAST, rw.statement_id, rw.group_id, rw.membership_valid_from, rw.grant_id`)
+	 ORDER BY h.k0, h.k1, h.k2, h.id, (rw.group_id IS NOT NULL), lower(p.display_name), rw.policy_id,
+	          e.statement_index NULLS LAST, rw.statement_id, rw.group_id, rw.membership_valid_from, rw.grant_id`)
 	args = append(args, limit+1, ws)
 	return b.String(), args
 }

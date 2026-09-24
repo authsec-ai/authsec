@@ -190,7 +190,7 @@ func newLoadGen(seed int64, name string, shape loadShape, accounts []loadAcct) *
 		externals:  map[string]*loadExternal{},
 
 		grantsByHolder: map[*loadIdent][]uuid.UUID{},
-		external:   []string{"444444444444", "555555555555"},
+		external:       []string{"444444444444", "555555555555"},
 	}
 	g.ws = g.uuid()
 	g.user = g.uuid()

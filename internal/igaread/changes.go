@@ -373,17 +373,21 @@ func (r *Reader) Changes(ctx context.Context, ws uuid.UUID, refType, rawID strin
 			return err
 		}
 
-		var inner string
-		var args []any
+		u := &changesUnion{}
 		if p.kind == ChangesConfiguration {
-			inner, args = changesConfigurationSQL(q.WS, obj, id)
+			u = changesConfigurationSQL(q.WS, obj, id)
 		} else {
 			lanes, err := changesLanes(q, obj, node, supports)
 			if err != nil {
 				return err
 			}
-			inner, args = changesCoverageSQL(q.WS, lanes)
+			// Coverage events are few (one per lane transition); their count
+			// keeps the plain DISTINCT.
+			if cov, cargs := changesCoverageSQL(q.WS, lanes); cov != "" {
+				u.addRepeatable(cov, cargs...)
+			}
 		}
+		inner, args := u.sql()
 
 		var data []ChangeEvent
 		var next *changesKey
@@ -404,9 +408,9 @@ func (r *Reader) Changes(ctx context.Context, ws uuid.UUID, refType, rawID strin
 		var n int64
 		known := true
 		if inner != "" {
+			countSQL, countArgs := u.countSQL(TotalCap + 1)
 			known, err = q.Optional(func(tx *gorm.DB) error {
-				return tx.Raw(`SELECT count(*) FROM (SELECT DISTINCT u.at, u.event, u.id FROM (`+inner+`) u LIMIT ?) t`,
-					append(append([]any{}, args...), TotalCap+1)...).Row().Scan(&n)
+				return tx.Raw(countSQL, countArgs...).Row().Scan(&n)
 			})
 			if err != nil {
 				return err
@@ -560,23 +564,109 @@ const changesGrantRevisionJoin = `LEFT JOIN iga_statement_revision gsr
 	               ON gsr.workspace_id = g.workspace_id AND gsr.entitlement_id = g.entitlement_id
 	              AND gsr.valid_from <= g.valid_from AND (gsr.valid_to IS NULL OR g.valid_from < gsr.valid_to)`
 
-const changesGrantWasAllow = `CASE WHEN gsr.id IS NULL THEN e.effect
-	           ELSE lower(COALESCE(gsr.statement->>'Effect', '')) END = '` + models.EffectAllow + `'`
+var changesGrantWasAllow = `CASE WHEN gsr.id IS NULL THEN e.effect
+	           ELSE ` + changesRevisionEffect("gsr") + ` END = '` + models.EffectAllow + `'`
+
+// changesRevisionEffect is a revision's Effect as the Allow rule reads it:
+// lowercased, '' when its verbatim statement names none.
+func changesRevisionEffect(alias string) string {
+	return `lower(COALESCE(` + alias + `.statement->>'Effect', ''))`
+}
+
+// changesGrantRevisionJoinOver is changesGrantRevisionJoin over the revisions
+// of the statements stmts selects only (a parenthesised subquery of
+// entitlement ids), each with its Effect already extracted as gsr.effect;
+// pair it with changesGrantWasAllowOver. Fenced with OFFSET 0 so the Effect is
+// read once per revision, not once per grant, and the join's hash holds ids
+// and times instead of every statement document of the workspace: T6.10
+// measured the grants of the "*" selector -- 21 000 of them, on 2 800
+// statements -- 40% faster this way. Binds: ws, then stmts' arguments.
+func changesGrantRevisionJoinOver(stmts string) string {
+	return `LEFT JOIN (SELECT r.id, r.entitlement_id, r.valid_from, r.valid_to, ` + changesRevisionEffect("r") + ` AS effect
+	                     FROM iga_statement_revision r
+	                    WHERE r.workspace_id = ? AND r.entitlement_id IN ` + stmts + `
+	                   OFFSET 0) gsr
+	               ON gsr.entitlement_id = g.entitlement_id
+	              AND gsr.valid_from <= g.valid_from AND (gsr.valid_to IS NULL OR g.valid_from < gsr.valid_to)`
+}
+
+// changesGrantWasAllowOver is changesGrantWasAllow over
+// changesGrantRevisionJoinOver's pre-extracted Effect.
+const changesGrantWasAllowOver = `CASE WHEN gsr.id IS NULL THEN e.effect ELSE gsr.effect END = '` + models.EffectAllow + `'`
 
 // changesUnion collects a query's UNION ALL branches with their arguments in
 // textual order.
+//
+// Each branch is added as UNIQUE (add) or REPEATABLE (addRepeatable). A
+// unique branch never yields one event twice, and never an event another
+// branch yields: its rows are keyed by one row of its own table (a lifecycle
+// event, a relationship, an assignment, a grant -- a grant's revision join
+// matches at most one revision, as revisions of one statement never overlap
+// -- or, for one identity or one resource, a statement revision), and every
+// event name comes from one branch only. A repeatable branch may repeat an
+// event: statement_replaced's id is derived from (policy, run), so several
+// retired statements of one policy -- or both replacement branches of a
+// resource -- name one event, and a workload reaches one statement revision
+// through each of its execution identities. The page dedupes with DISTINCT ON
+// either way; the distinction is for the count (countSQL).
 type changesUnion struct {
-	parts []string
-	args  []any
+	parts []changesPart
+}
+
+// changesPart is one branch of a changesUnion.
+type changesPart struct {
+	sql    string
+	args   []any
+	repeat bool
 }
 
 func (u *changesUnion) add(sql string, args ...any) {
-	u.parts = append(u.parts, sql)
-	u.args = append(u.args, args...)
+	u.parts = append(u.parts, changesPart{sql: sql, args: args})
 }
 
+func (u *changesUnion) addRepeatable(sql string, args ...any) {
+	u.parts = append(u.parts, changesPart{sql: sql, args: args, repeat: true})
+}
+
+// sql is every branch as one UNION ALL, in the order added ("" when none).
 func (u *changesUnion) sql() (string, []any) {
-	return strings.Join(u.parts, "\n UNION ALL \n"), u.args
+	parts := make([]string, 0, len(u.parts))
+	var args []any
+	for _, p := range u.parts {
+		parts = append(parts, p.sql)
+		args = append(args, p.args...)
+	}
+	return strings.Join(parts, "\n UNION ALL \n"), args
+}
+
+// countSQL is the optional total's statement (§5.2): the number of distinct
+// events, at most limit. Only the repeatable branches are deduplicated; the
+// unique ones stream straight into the LIMIT, so the count stops once it has
+// limit rows instead of producing and sorting every event first -- T6.10
+// measured the count of the "*" selector's 22 000 grant events at 415 ms
+// under one DISTINCT and 90 ms this way. The column alias lists rename the
+// first three columns (at, event, id), whatever the branches call them.
+func (u *changesUnion) countSQL(limit int) (string, []any) {
+	var unique, repeat []string
+	var uArgs, rArgs []any
+	for _, p := range u.parts {
+		if p.repeat {
+			repeat = append(repeat, p.sql)
+			rArgs = append(rArgs, p.args...)
+		} else {
+			unique = append(unique, p.sql)
+			uArgs = append(uArgs, p.args...)
+		}
+	}
+	var arms []string
+	if len(unique) > 0 {
+		arms = append(arms, `SELECT x.at, x.event, x.id FROM (`+strings.Join(unique, "\n UNION ALL \n")+`) x(at, event, id)`)
+	}
+	if len(repeat) > 0 {
+		arms = append(arms, `SELECT DISTINCT y.at, y.event, y.id FROM (`+strings.Join(repeat, "\n UNION ALL \n")+`) y(at, event, id)`)
+	}
+	args := append(append(append([]any{}, uArgs...), rArgs...), limit)
+	return `SELECT count(*) FROM (SELECT 1 FROM (` + strings.Join(arms, "\n UNION ALL \n") + `) c LIMIT ?) t`, args
 }
 
 // changesHolders is whose permission events an object's Changes shows, and
@@ -631,7 +721,7 @@ var changesAllRelTypes = []string{models.RelTypeExecutesAs, models.RelTypeTaskEx
 
 // changesConfigurationSQL is the union of every dated row of the object's
 // configuration history (§5.6 "Union of dated rows for the object").
-func changesConfigurationSQL(ws uuid.UUID, obj changesObject, id uuid.UUID) (string, []any) {
+func changesConfigurationSQL(ws uuid.UUID, obj changesObject, id uuid.UUID) *changesUnion {
 	u := &changesUnion{}
 
 	// Lifecycle: iga_lifecycle_event ONLY, never the node row -- lifecycle and
@@ -662,7 +752,7 @@ func changesConfigurationSQL(ws uuid.UUID, obj changesObject, id uuid.UUID) (str
 	case RefResource:
 		changesResourceBranches(u, ws, id)
 	}
-	return u.sql()
+	return u
 }
 
 // changesRelationshipSQL is one relationship branch: each row is a start at
@@ -735,26 +825,31 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 	gv, gvArgs := grantValid("sr.valid_from")
 	heldStmts := `(SELECT g.entitlement_id FROM iga_access_edges g
 	                WHERE g.workspace_id = ? AND g.provider = 'aws' AND ` + in + `)`
-	u.add(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, `+h.via("hs.holder")+`,
+	addRevisions := u.add
+	if h.workload != nil {
+		// One revision per execution identity holding a grant to it.
+		addRevisions = u.addRepeatable
+	}
+	addRevisions(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, `+h.via("hs.holder")+`,
 	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
 	         FROM `+held+`
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws'
 	         JOIN `+changesEditedRevisionsSQL(heldStmts)+` ON sr.entitlement_id = e.id
 	        WHERE `+gv,
-		append(append(append(append(append([]any{}, heldArgs...), ws, ws), heldArgs...)), gvArgs...)...)
+		append(append(append(append([]any{}, heldArgs...), ws, ws), heldArgs...), gvArgs...)...)
 
 	// statement_replaced: a Sid-less statement the holder held a grant to
 	// retired unsupported in a run in which a statement of the same policy
 	// began. One event per (policy, run), its id derived from both.
 	gv, gvArgs = grantValid("le.occurred_at")
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	u.addRepeatable(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
 	              `+h.via("hs.holder")+`, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+held+`
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws' AND e.sid = ''
 	         JOIN iga_lifecycle_event le ON le.workspace_id = e.workspace_id AND le.entitlement_id = e.id
 	                                    AND le.event = '`+models.LifecycleRetired+`' AND le.reason = '`+models.RetiredUnsupported+`'
 	        WHERE `+changesBegunInRunSQL+` AND `+gv,
-		append(append(append([]any{}, heldArgs...), ws), gvArgs...)...)
+		append(append(append([]any{}, heldArgs...), ws, ws), gvArgs...)...)
 }
 
 // changesEditedRevisionsSQL is the revisions (as sr) of the statements the
@@ -781,13 +876,21 @@ func changesEditedRevisionsSQL(stmts string) string {
 }
 
 // changesBegunInRunSQL: a statement of e's policy was first seen or restored
-// in le's run -- "another began in the same policy in the same run". No bind
-// variables.
-const changesBegunInRunSQL = `EXISTS (SELECT 1 FROM iga_entitlements ne
-	                 JOIN iga_lifecycle_event n ON n.workspace_id = ne.workspace_id AND n.entitlement_id = ne.id
-	                WHERE ne.workspace_id = e.workspace_id AND ne.policy_id = e.policy_id AND ne.provider = 'aws'
-	                  AND n.scan_run_id = le.scan_run_id
-	                  AND n.event IN ('` + models.LifecycleFirstSeen + `', '` + models.LifecycleRestored + `'))`
+// in le's run -- "another began in the same policy in the same run". Binds:
+// ws.
+//
+// Written as an uncorrelated IN over the (policy, run) pairs in which a
+// statement began, fenced with OFFSET 0 so the pairs are computed ONCE and
+// probed as a set. 036 gives iga_lifecycle_event no entitlement_id index, so
+// the correlated EXISTS this replaces scanned the whole event table once per
+// retired statement: T6.10 measured 240 ms for the 38 of the statements naming
+// "*" (a proposed index is raised as a spec question).
+const changesBegunInRunSQL = `(e.policy_id, le.scan_run_id) IN (
+	              SELECT ne.policy_id, n.scan_run_id FROM iga_entitlements ne
+	                JOIN iga_lifecycle_event n ON n.workspace_id = ne.workspace_id AND n.entitlement_id = ne.id
+	               WHERE ne.workspace_id = ? AND ne.provider = 'aws'
+	                 AND n.event IN ('` + models.LifecycleFirstSeen + `', '` + models.LifecycleRestored + `')
+	              OFFSET 0)`
 
 // changesResourceBranches: grant events of Allow statements naming the
 // resource positively, and revisions and replacements of any statement naming
@@ -797,17 +900,19 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 	naming := `(SELECT DISTINCT t.entitlement_id FROM iga_entitlement_target t
 	             WHERE t.workspace_id = ? AND t.resource_id = ? AND t.target_mode = '` + models.TargetResource + `')`
 
-	// Grants: Allow when they started (changesGrantWasAllow), as for holders.
+	// Grants: Allow when they started (changesGrantWasAllow), as for holders,
+	// over the naming statements' revisions only: a reference as common as
+	// "*" has tens of thousands of grants.
 	u.add(`SELECT x.at, x.event, g.id, 'grant'::text, NULL::uuid, x.reason, NULL::bigint, NULL::uuid, NULL::uuid
 	         FROM iga_access_edges g
 	         JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id AND e.provider = 'aws'
-	         `+changesGrantRevisionJoin+`
+	         `+changesGrantRevisionJoinOver(naming)+`
 	        CROSS JOIN LATERAL (VALUES (g.valid_from, '`+ChangeGrantStarted+`'::text, ''::text),
 	                                   (g.valid_to, '`+ChangeGrantEnded+`'::text, g.ended_reason)) x(at, event, reason)
 	        WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.assignment_id IS NOT NULL
-	          AND `+changesGrantWasAllow+`
+	          AND `+changesGrantWasAllowOver+`
 	          AND x.at IS NOT NULL AND g.entitlement_id IN `+naming,
-		ws, ws, id)
+		ws, ws, id, ws, ws, id)
 
 	u.add(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, NULL::uuid,
 	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
@@ -817,16 +922,16 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 		ws, id, ws, ws, ws, id)
 
 	// Replacements: the ended statement named it ...
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	u.addRepeatable(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
 	              NULL::uuid, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws' AND e.sid = ''
 	         JOIN iga_lifecycle_event le ON le.workspace_id = e.workspace_id AND le.entitlement_id = e.id
 	                                    AND le.event = '`+models.LifecycleRetired+`' AND le.reason = '`+models.RetiredUnsupported+`'
 	        WHERE `+changesBegunInRunSQL,
-		ws, id, ws)
+		ws, id, ws, ws)
 	// ... or a statement that began in its place names it.
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	u.addRepeatable(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
 	              NULL::uuid, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements ne ON ne.workspace_id = ? AND ne.id = hs.entitlement_id AND ne.provider = 'aws'

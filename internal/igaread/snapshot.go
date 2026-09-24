@@ -25,6 +25,22 @@ type Revision struct {
 	PublishedAt time.Time
 }
 
+// planCacheModeSQL makes every statement of the snapshot plan with its own
+// bind values (§5.6). The driver (pgx) prepares and caches each statement per
+// connection, and after five executions PostgreSQL may switch a prepared
+// statement to a GENERIC plan, costed without the values. Graph reads are
+// parameterised by one object in a skewed estate -- "*" is named by a quarter
+// of all statements, one execution role backs hundreds of workloads -- so a
+// generic plan is chosen for the typical object and is ruinous for the hot
+// one: T6.10 measured the Changes page of "*" at 0.5 s with a custom plan and
+// over 20 s with the generic one, so every sixth request on a connection
+// answered 504 (a timed-out request closes its connection, and the count
+// starts again). Planning a statement costs well under a millisecond to a few
+// milliseconds; the snapshot's reads are never hot loops of one statement.
+// SET LOCAL ends with the transaction, so the pool's connections are left as
+// they were for everything else.
+const planCacheModeSQL = "SET LOCAL plan_cache_mode = force_custom_plan"
+
 // Reader is the only way to read the graph (§5.1).
 type Reader struct {
 	db        *gorm.DB
@@ -87,6 +103,10 @@ func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Que
 		// work lowers it locally inside a savepoint and restores it after.
 		base := r.budget.Milliseconds()
 		if err := tx.Exec(fmt.Sprintf("SET LOCAL statement_timeout = %d", base)).Error; err != nil {
+			return err
+		}
+		// Custom plans only (planCacheModeSQL).
+		if err := tx.Exec(planCacheModeSQL).Error; err != nil {
 			return err
 		}
 		cur, err := currentRevision(tx, ws)

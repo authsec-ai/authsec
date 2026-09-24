@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +51,12 @@ const (
 	loadIterEnv = "IGA_LOAD_ITERATIONS"
 	// loadReportEnv names a file the measurement table is also written to.
 	loadReportEnv = "IGA_LOAD_REPORT"
+	// loadOnlyEnv narrows a run to the reads whose names match a regular
+	// expression: a diagnostic run (TestP2LoadTargets).
+	loadOnlyEnv = "IGA_LOAD_ONLY"
+	// loadSQLDirEnv names a directory each read's slowest traced statements
+	// are written to, bind values inlined, for EXPLAIN ANALYZE.
+	loadSQLDirEnv = "IGA_LOAD_SQL_DIR"
 )
 
 // loadSeed fixes the generator: the same seed builds the same fixture, byte
@@ -297,13 +302,13 @@ func (l *loadTrace) start() {
 	l.mu.Unlock()
 }
 
+// stop ends the trace and returns its statements in the order they ran.
 func (l *loadTrace) stop() []loadStatement {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.on = false
 	out := l.stmt
 	l.stmt = nil
-	sort.Slice(out, func(i, j int) bool { return out[i].elapsed > out[j].elapsed })
 	return out
 }
 
@@ -327,9 +332,9 @@ var loadLogger logger.Interface = loadGormLogger{}
 type loadGormLogger struct{}
 
 func (l loadGormLogger) LogMode(logger.LogLevel) logger.Interface { return l }
-func (loadGormLogger) Info(context.Context, string, ...any)        {}
-func (loadGormLogger) Warn(context.Context, string, ...any)        {}
-func (loadGormLogger) Error(context.Context, string, ...any)       {}
+func (loadGormLogger) Info(context.Context, string, ...any)       {}
+func (loadGormLogger) Warn(context.Context, string, ...any)       {}
+func (loadGormLogger) Error(context.Context, string, ...any)      {}
 func (loadGormLogger) Trace(_ context.Context, begin time.Time, fc func() (string, int64), _ error) {
 	loadTracer.mu.Lock()
 	on := loadTracer.on

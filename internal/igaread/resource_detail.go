@@ -379,11 +379,33 @@ func resourceCoverage(q *Query, accts *Accounts, resourceID uuid.UUID, identity 
 // cloud_resource row goes, and that happens during collection -- before any
 // publication -- so a resource_id key would change the answer at a revision.
 func ResourcePolicyOf(q *Query, text string) (ResourcePolicyState, error) {
-	if q.Rev == nil {
-		return ResourcePolicyState{}, nil
+	states, err := ResourcePoliciesOf(q, []string{text})
+	if err != nil {
+		return ResourcePolicyState{}, err
 	}
-	var rows []ResourcePolicyObservation
-	if err := q.DB().Raw(`SELECT o.id, o.ingested_at, o.last_confirmed_at, o.confirmation_count,
+	return states[text], nil
+}
+
+// ResourcePoliciesOf is ResourcePolicyOf for several reference texts in ONE
+// statement (§5.6: one query per section, never one per row): the candidates
+// of every text are read together and decided per text by the same rule.
+// T6.10: the Evidence panel of a grouped edge names tens of distinct targets,
+// and one scan of cloud_observation per target (subject_native_id has no
+// index) cost ~20 ms each. Every text has an entry; a text with no candidate
+// is the zero state (not read).
+func ResourcePoliciesOf(q *Query, texts []string) (map[string]ResourcePolicyState, error) {
+	out := make(map[string]ResourcePolicyState, len(texts))
+	if q.Rev == nil || len(texts) == 0 {
+		for _, t := range texts {
+			out[t] = ResourcePolicyState{}
+		}
+		return out, nil
+	}
+	var rows []struct {
+		ResourcePolicyObservation
+		Subject string
+	}
+	if err := q.DB().Raw(`SELECT o.subject_native_id AS subject, o.id, o.ingested_at, o.last_confirmed_at, o.confirmation_count,
 	                             (o.sanitized_facts->>'has_deny')::boolean AS has_deny,
 	                             (o.sanitized_facts->>'parse_failed')::boolean AS parse_failed,
 	                             EXISTS (SELECT 1 FROM iga_publication pb
@@ -393,13 +415,22 @@ func ResourcePolicyOf(q *Query, text string) (ResourcePolicyState, error) {
 	                                      WHERE pb.workspace_id = o.workspace_id AND pb.scan_run_id = o.last_confirmed_run_id
 	                                        AND pb.rev <= ?) AS last_in
 	                        FROM cloud_observation o
-	                       WHERE o.workspace_id = ? AND o.source_api IN ? AND o.subject_native_id = ?
+	                       WHERE o.workspace_id = ? AND o.source_api IN ? AND o.subject_native_id IN ?
 	                         AND o.ingested_at <= ?
-	                       ORDER BY o.ingested_at DESC, o.id DESC`,
-		q.Rev.Rev, q.Rev.Rev, q.WS, ResourcePolicySourceAPIs, text, q.Rev.PublishedAt).Scan(&rows).Error; err != nil {
-		return ResourcePolicyState{}, err
+	                       ORDER BY o.subject_native_id, o.ingested_at DESC, o.id DESC`,
+		q.Rev.Rev, q.Rev.Rev, q.WS, ResourcePolicySourceAPIs, texts, q.Rev.PublishedAt).Scan(&rows).Error; err != nil {
+		return nil, err
 	}
-	return resourcePolicyState(rows, q.Rev.PublishedAt), nil
+	// Each text's candidates, newest first -- the order resourcePolicyState
+	// was always given.
+	byText := make(map[string][]ResourcePolicyObservation, len(texts))
+	for _, r := range rows {
+		byText[r.Subject] = append(byText[r.Subject], r.ResourcePolicyObservation)
+	}
+	for _, t := range texts {
+		out[t] = resourcePolicyState(byText[t], q.Rev.PublishedAt)
+	}
+	return out, nil
 }
 
 // ResourcePolicyObservation is one candidate observation for resource_policy:

@@ -5,10 +5,10 @@ package load
 //
 // Methodology (RESULTS.md repeats it):
 //   - sequential: one request at a time, one process, the machine otherwise idle;
-//   - warm cache: every read makes one full unrecorded pass over its requests
-//     before the measured pass, so the pages it touches are in PostgreSQL's
-//     buffers or the OS page cache -- §5.6 states steady-state targets, and a
-//     cold first touch measures the disk, not the query;
+//   - warm cache: every read first makes each distinct request of its
+//     measured pass once, unrecorded, so the pages it touches are in
+//     PostgreSQL's buffers or the OS page cache -- §5.6 states steady-state
+//     targets, and a cold first touch measures the disk, not the query;
 //   - at least 50 measured iterations per read (IGA_LOAD_ITERATIONS may raise
 //     it), rotating over typical objects where the read takes an object, plus
 //     separate reads pinned to the heaviest object of each kind (the hub
@@ -18,7 +18,9 @@ package load
 //   - the time is the whole request as the server sees it: routing, handler,
 //     every query of the §5.1 snapshot, and JSON rendering (httptest, no
 //     network);
-//   - p50 / p95 / max by nearest rank over the measured iterations.
+//   - p50 / p95 / max by nearest rank over the measured iterations;
+//   - then a short traced pass (loadTraceIterations requests, never timed)
+//     names the slowest statements and the share spent in COUNT work.
 //
 // A fast answer counts only if it is an honest one: every measured response
 // must be 200 with the graph published, and nothing in it may be a timed-out
@@ -35,6 +37,8 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,29 +89,62 @@ type loadResult struct {
 	// (totals and facets); 0 when the read runs none.
 	counts  time.Duration
 	slowest []loadStatement
-	fails   []string
+	// statements is the first traced request's statements, in the order
+	// they ran: how many one request makes (§5.6: one per section or edge
+	// kind, never one per row).
+	statements []loadStatement
+	fails      []string
 }
 
 // TestP2LoadTargets measures every §5.6 read and fails on any target missed.
+//
+// IGA_LOAD_ONLY (a regular expression over the read names) and an
+// IGA_LOAD_ITERATIONS below loadMinIterations make a DIAGNOSTIC run, for
+// chasing one read: its misses still fail, but a clean diagnostic run ends
+// skipped, never passed -- it did not measure every §5.6 row at the stated
+// iteration count (§7.4: a run with skipped tests is not a pass).
 func TestP2LoadTargets(t *testing.T) {
 	env := loadEnvFor(t)
 	n := loadMinIterations
+	diagnostic := ""
 	if s := os.Getenv(loadIterEnv); s != "" {
 		v, err := strconv.Atoi(s)
-		if err != nil || v < loadMinIterations {
-			t.Fatalf("%s=%q: must be a number of at least %d", loadIterEnv, s, loadMinIterations)
+		if err != nil || v < 1 {
+			t.Fatalf("%s=%q: must be a positive number", loadIterEnv, s)
 		}
 		n = v
+		if n < loadMinIterations {
+			diagnostic = fmt.Sprintf("%s=%d is below the %d iterations a p95 is taken over", loadIterEnv, n, loadMinIterations)
+		}
 	}
 	cases := loadCases(t, env)
+	if only := os.Getenv(loadOnlyEnv); only != "" {
+		re, err := regexp.Compile(only)
+		if err != nil {
+			t.Fatalf("%s=%q: %v", loadOnlyEnv, only, err)
+		}
+		var keep []loadCase
+		for _, c := range cases {
+			if re.MatchString(c.name) {
+				keep = append(keep, c)
+			}
+		}
+		cases = keep
+		diagnostic = strings.TrimPrefix(diagnostic+"; "+loadOnlyEnv+"="+only+" measured only some reads", "; ")
+	}
 	var results []*loadResult
 	for _, c := range cases {
 		r := loadMeasure(env.api, c, n)
 		results = append(results, r)
-		t.Logf("%-18s %-55s p50 %7.1f  p95 %7.1f  max %7.1f ms", c.rows[0], c.name,
-			loadMS(r.p50), loadMS(r.p95), loadMS(r.max))
+		t.Logf("%-18s %-58s p50 %7.1f  p95 %7.1f  max %7.1f ms  (%d statements, COUNT %6.1f, slowest %6.1f)", c.rows[0], c.name,
+			loadMS(r.p50), loadMS(r.p95), loadMS(r.max), len(r.statements), loadMS(r.counts), loadMS(r.slowestMS()))
+		if dir := os.Getenv(loadSQLDirEnv); dir != "" {
+			if err := loadWriteStatements(dir, len(results), r); err != nil {
+				t.Errorf("write the statements of %s: %v", c.name, err)
+			}
+		}
 	}
-	report := loadReport(env, results, n)
+	report := loadReport(env, results, n, diagnostic)
 	t.Log("\n" + report)
 	if path := os.Getenv(loadReportEnv); path != "" {
 		if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
@@ -128,10 +165,20 @@ func TestP2LoadTargets(t *testing.T) {
 			}
 		}
 	}
+	if diagnostic != "" && !t.Failed() {
+		t.Skipf("diagnostic run (%s): not a §5.6 measurement", diagnostic)
+	}
 }
 
-// loadMeasure runs one read: a warm pass, the measured pass, then one traced
-// pass for the statement breakdown.
+// loadTraceIterations is how many requests of a read the traced pass makes:
+// enough to name the slow statements and the COUNT share, without tripling
+// the run.
+const loadTraceIterations = 10
+
+// loadMeasure runs one read: a warm pass over every distinct request the
+// measured pass will make, the measured pass, then a short traced pass for
+// the statement breakdown (tracing renders every statement's SQL, so it is
+// never timed).
 func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
 	r := &loadResult{c: c, n: n}
 	fail := func(i int, path, msg string) {
@@ -153,8 +200,16 @@ func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
 			fail(i, path, p)
 		}
 	}
-	for i := 0; i < n; i++ { // warm
+	// Warm: each distinct request once (at least three requests), so every
+	// page the measured pass touches is already cached.
+	warmed, made := map[string]bool{}, 0
+	for i := 0; i < n; i++ {
 		path := c.path(i)
+		if warmed[path] && made >= 3 {
+			continue
+		}
+		warmed[path] = true
+		made++
 		code, raw, _ := api.get(path)
 		check(i, path, code, raw)
 	}
@@ -172,10 +227,13 @@ func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
 	// is the optional COUNT work (totals and facets).
 	var counted []time.Duration
 	byText := map[string]time.Duration{}
-	for i := 0; i < n; i++ {
+	for i := 0; i < n && i < loadTraceIterations; i++ {
 		loadTracer.start()
 		api.get(c.path(i))
 		stmts := loadTracer.stop()
+		if i == 0 {
+			r.statements = stmts
+		}
 		var sum time.Duration
 		for _, s := range stmts {
 			if loadIsCount(s.sql) {
@@ -197,6 +255,36 @@ func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
 		r.slowest = r.slowest[:3]
 	}
 	return r
+}
+
+// slowestMS is the slowest traced statement's time (0 when none ran).
+func (r *loadResult) slowestMS() time.Duration {
+	if len(r.slowest) == 0 {
+		return 0
+	}
+	return r.slowest[0].elapsed
+}
+
+// loadWriteStatements writes a read's slowest traced statements, bind values
+// inlined, to <dir>/<seq>_<rank>.sql -- ready for EXPLAIN (ANALYZE, BUFFERS)
+// in psql when a read misses its target.
+func loadWriteStatements(dir string, seq int, r *loadResult) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for i, s := range r.slowest {
+		body := fmt.Sprintf("-- %s\n-- traced at %.1f ms\n%s;\n", r.c.name, loadMS(s.elapsed), s.sql)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%02d_%d.sql", seq, i)), []byte(body), 0o644); err != nil {
+			return err
+		}
+	}
+	// Every statement of the first traced request, in order.
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %d statements\n", r.c.name, len(r.statements))
+	for i, s := range r.statements {
+		fmt.Fprintf(&b, "%3d %8.1f ms  %s\n", i+1, loadMS(s.elapsed), loadClipSQL(s.sql))
+	}
+	return os.WriteFile(filepath.Join(dir, fmt.Sprintf("%02d_all.txt", seq)), []byte(b.String()), 0o644)
 }
 
 // loadRank is the nearest-rank percentile of sorted durations.
@@ -485,14 +573,17 @@ func loadClipSQL(s string) string {
 
 // loadReport renders the measurement as the Markdown table RESULTS.md
 // carries: one line per read, grouped by §5.6 row.
-func loadReport(env *loadEnv, results []*loadResult, n int) string {
+func loadReport(env *loadEnv, results []*loadResult, n int, diagnostic string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Fixture: %d rows (main workspace %d workloads), %d measured iterations per read, sequential, warm.\n\n",
+	if diagnostic != "" {
+		fmt.Fprintf(&b, "DIAGNOSTIC RUN (%s): not a §5.6 measurement.\n\n", diagnostic)
+	}
+	fmt.Fprintf(&b, "Fixture: %d rows (main workspace %d active workloads), %d measured iterations per read, sequential, warm.\n\n",
 		env.rows, env.main.h.activeWL, n)
 	for _, row := range []string{loadRowLists, loadRowTotals, loadRowDetail, loadRowGraph, loadRowEvid, loadRowChanges} {
 		target := loadTargets[row]
 		fmt.Fprintf(&b, "\n#### %s (p95 target %s)\n\n", row, target)
-		fmt.Fprintf(&b, "| Read | p50 ms | p95 ms | max ms | COUNT p95 ms | Slowest statement ms | Verdict |\n|---|---:|---:|---:|---:|---:|---|\n")
+		fmt.Fprintf(&b, "| Read | p50 ms | p95 ms | max ms | Statements | COUNT ms (traced) | Slowest statement ms (traced) | Verdict |\n|---|---:|---:|---:|---:|---:|---:|---|\n")
 		for _, r := range results {
 			if !loadHasRow(r.c.rows, row) {
 				continue
@@ -504,12 +595,8 @@ func loadReport(env *loadEnv, results []*loadResult, n int) string {
 			if len(r.fails) > 0 {
 				verdict = "**FAILED** (" + r.fails[0] + ")"
 			}
-			slow := 0.0
-			if len(r.slowest) > 0 {
-				slow = loadMS(r.slowest[0].elapsed)
-			}
-			fmt.Fprintf(&b, "| %s | %.1f | %.1f | %.1f | %.1f | %.1f | %s |\n", strings.ReplaceAll(r.c.name, "|", "\\|"),
-				loadMS(r.p50), loadMS(r.p95), loadMS(r.max), loadMS(r.counts), slow, verdict)
+			fmt.Fprintf(&b, "| %s | %.1f | %.1f | %.1f | %d | %.1f | %.1f | %s |\n", strings.ReplaceAll(r.c.name, "|", "\\|"),
+				loadMS(r.p50), loadMS(r.p95), loadMS(r.max), len(r.statements), loadMS(r.counts), loadMS(r.slowestMS()), verdict)
 		}
 	}
 	return b.String()
