@@ -148,6 +148,14 @@ type PermissionSnapshot struct {
 	// Deduplicated, in the order the scan met them.
 	UnreadableDocuments []models.CoverageItem
 	unreadableSeen      map[models.CoverageItem]bool
+	// UnreadableAPI and UnreadableCode are the call and AWS's code of the
+	// FIRST unreadable document, in the order the scan met them, whose fetch
+	// failed on a call -- as the fetch recorded them from the failed call
+	// itself (awsdiscovery.AttachedPolicy.FetchAPI / FetchCode), never parsed
+	// out of a reason's prose. They become policy_documents' api and
+	// error_code (P2-DECISIONS D-104). Empty when no document failed on a
+	// call: one that was read and did not parse names none.
+	UnreadableAPI, UnreadableCode string
 	// policyHoldersMissing counts principals whose policies could not be
 	// written because their identity row was not found. Their attachments
 	// were not re-stamped this run, so cloud_policy reconciliation must not
@@ -1068,7 +1076,7 @@ func (s *AWSPermissionScanner) recordManagedPolicy(
 		row.DocumentHash = documentHash(p.Document)
 	}
 	if docErr != "" {
-		out.noteUnreadable(p.Name, p.VersionID, docErr)
+		out.noteUnreadablePolicy(p, docErr)
 	}
 	stored, err := s.policies.UpsertPolicy(row)
 	if err != nil {
@@ -1171,6 +1179,18 @@ func (o *PermissionSnapshot) noteUnreadable(name, version, reason string) {
 	o.noteUnreadableItem(models.CoverageItem{Policy: name, Version: version, Error: reason})
 }
 
+// noteUnreadablePolicy records an unreadable managed policy under reason
+// (noteUnreadable) and, when its fetch failed on a call, that call and AWS's
+// code for it -- unless an earlier document already named one: the surface
+// names its FIRST failing call (D-104). A document that was fetched and did
+// not parse failed on no call and names none.
+func (o *PermissionSnapshot) noteUnreadablePolicy(p awsdiscovery.AttachedPolicy, reason string) {
+	o.noteUnreadable(p.Name, p.VersionID, reason)
+	if p.FetchError != "" && p.FetchAPI != "" && o.UnreadableAPI == "" {
+		o.UnreadableAPI, o.UnreadableCode = p.FetchAPI, p.FetchCode
+	}
+}
+
 // noteUnreadableItem records one unreadable document -- a policy, or a role's
 // trust policy the IAM scan judged -- once.
 func (o *PermissionSnapshot) noteUnreadableItem(item models.CoverageItem) {
@@ -1214,6 +1234,14 @@ func policyDocumentsSurface(out *PermissionSnapshot, trustDocuments int) models.
 	if n == 0 {
 		return cov
 	}
+	// The surface's api and error_code (D-71, D-104): its FIRST failing call
+	// and AWS's code for it, exactly as every other partial surface names its
+	// first (withFirstFailure) -- §5.3's "the call that failed", so coverage
+	// names the call a denial refused (§2.14.13, E9). Both empty when every
+	// unreadable document was read and did not parse: no call failed. Each
+	// document's own reason stays on its item and in the prose, so a second
+	// document refused by another call is still named, in its own words.
+	cov.API, cov.ErrorCode = out.UnreadableAPI, out.UnreadableCode
 	listed := out.UnreadableDocuments
 	if n > models.CoverageItemLimit {
 		listed, cov.Truncated = listed[:models.CoverageItemLimit], true

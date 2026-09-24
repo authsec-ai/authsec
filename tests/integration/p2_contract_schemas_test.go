@@ -943,10 +943,12 @@ const contractIncludeEnded = "&include_ended=true"
 
 var contractRelTypeOrGraph = contractEnum("executes_as", "task_execution_role", "member_of", "can_assume", "grant", "target")
 
-// truncated.bound_by: §5.4's four budgets, plus D-101's resolution_not_followed
-// (a resolution in force the walk shows but does not follow).
+// truncated.bound_by: §5.4's four budgets and nothing else -- a resolution in
+// force the walk shows but does not follow is not a budget, and /graph says it
+// in its additive resolution_not_followed (D-105, superseding D-101's /graph
+// half).
 var contractTruncated = contractNullable(contractObj(contractReq("bound_by",
-	contractEnum("nodes", "edges", "assume_hops", "time", "resolution_not_followed"))))
+	contractEnum("nodes", "edges", "assume_hops", "time"))))
 
 // The graph routes' meta (§5.3 l.5983; D-35 meta limitations).
 var contractGraphMeta = contractDetailMeta(
@@ -968,6 +970,8 @@ var contractGraph = contractDetail(contractObj(
 	contractReq("edges", contractArr(contractGraphEdge)),
 	contractReq("frontier", contractArr(contractFrontier)),
 	contractReq("truncated", contractTruncated),
+	// Additive (D-105): true, false, or null when the time budget bound first.
+	contractReq("resolution_not_followed", contractNullable(contractBool)),
 ), contractGraphMeta)
 
 // GET /graph/expand (D-35).

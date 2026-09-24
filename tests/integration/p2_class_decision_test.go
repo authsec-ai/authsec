@@ -192,21 +192,41 @@ func classPost(a *readAPI, path string, body any) classResp {
 	return classResp{status: w.Code, body: out, err: err}
 }
 
-// classWaitLockWaiter waits until some backend of this database is waiting on
-// a lock -- the second request, parked behind the first one's row lock.
-func classWaitLockWaiter(t *testing.T, db *gorm.DB) {
+// classStagingDeadline bounds how long a concurrency test waits for a state it
+// stages (request 1 at its commit, request 2 parked on a lock) and how long
+// request 2 may then wait on that lock. It is a generous bound, not a
+// measurement: nothing here is timed, and it is only ever reached when a step
+// never happens. It used to be 2 s for the lock wait, and a stall of the path
+// to the database for longer than that -- a loaded machine, a pool briefly
+// exhausted, the database VM paused -- failed the test with "never waited on
+// a lock" although both requests then behaved exactly as specified (seen once
+// in a full run; reproduced by holding the pool for 3 s). The production
+// lock_timeout (3 s, D-31) is proven by TestP2ClassLockWaitIsBounded; here it
+// would turn the same stall, landing between the release and request 1's
+// commit, into a 504 for request 2.
+const classStagingDeadline = time.Minute
+
+// classWaitLockWaiter waits until a backend of this database is waiting on a
+// lock while running a statement containing stmt -- the second request,
+// parked where the test says it must be (behind the first one's row lock, or
+// its operation-key index entry). Any other waiter does not count: it used to,
+// and a waiter the test did not stage would release request 1 before request
+// 2 reached the lock, so the retry ran after the commit and the concurrency
+// was never exercised.
+func classWaitLockWaiter(t *testing.T, db *gorm.DB, stmt string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(classStagingDeadline)
 	for time.Now().Before(deadline) {
 		var n int64
 		db.Raw(`SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n)
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND strpos(query, ?) > 0`, stmt).Scan(&n)
 		if n > 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("the second request never waited on a lock")
+	t.Fatalf("the second request never waited on a lock in %q", stmt)
 }
 
 type classState struct {
@@ -251,12 +271,15 @@ func TestP2ClassConcurrentRetriesReplay(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(releaseAll)
-	f.api.ctl.WithClassificationService(services.NewClassificationService(f.l.db).WithBeforeCommit(func() {
-		if atomic.AddInt32(&calls, 1) == 1 {
-			close(entered)
-			<-release
-		}
-	}))
+	// The lock wait is bounded by classStagingDeadline, not the production
+	// 3 s: see there. What this test proves does not depend on the bound.
+	f.api.ctl.WithClassificationService(services.NewClassificationService(f.l.db).WithLockTimeout(classStagingDeadline).
+		WithBeforeCommit(func() {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				close(entered)
+				<-release
+			}
+		}))
 	pubs := f.l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, f.l.ws)
 
 	body := classBody(uuid.New(), models.ClassificationClassified, "Owns tier-1 ticket routing", 0, nil)
@@ -266,11 +289,11 @@ func TestP2ClassConcurrentRetriesReplay(t *testing.T) {
 	case <-entered:
 	case r := <-first:
 		t.Fatalf("request 1 finished without reaching its commit: %d %v", r.status, r.body)
-	case <-time.After(5 * time.Second):
+	case <-time.After(classStagingDeadline):
 		t.Fatal("request 1 never reached its commit")
 	}
 	go func() { second <- classPost(f.api, f.path(f.workload), body) }()
-	classWaitLockWaiter(t, f.l.db)
+	classWaitLockWaiter(t, f.l.db, "FOR UPDATE OF w") // parked on the workload row, behind request 1
 	releaseAll()
 	a, b := <-first, <-second
 
@@ -356,12 +379,13 @@ func TestP2ClassSameOperationTwoWorkloadsConcurrently(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(releaseAll)
-	f.api.ctl.WithClassificationService(services.NewClassificationService(f.l.db).WithBeforeCommit(func() {
-		if atomic.AddInt32(&calls, 1) == 1 {
-			close(entered)
-			<-release
-		}
-	}))
+	f.api.ctl.WithClassificationService(services.NewClassificationService(f.l.db).WithLockTimeout(classStagingDeadline).
+		WithBeforeCommit(func() {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				close(entered)
+				<-release
+			}
+		}))
 
 	op := uuid.New()
 	first, second := make(chan classResp, 1), make(chan classResp, 1)
@@ -370,13 +394,14 @@ func TestP2ClassSameOperationTwoWorkloadsConcurrently(t *testing.T) {
 	}()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(classStagingDeadline):
 		t.Fatal("request 1 never reached its commit")
 	}
 	go func() {
 		second <- classPost(f.api, f.path(other), classBody(op, models.ClassificationClassified, "handles tier-1 tickets", 0, nil))
 	}()
-	classWaitLockWaiter(t, f.l.db) // parked on the operation key, not on a row
+	// Parked on the operation key's index entry, not on a row.
+	classWaitLockWaiter(t, f.l.db, "INSERT INTO iga_workload_classification")
 	releaseAll()
 	a, b := <-first, <-second
 

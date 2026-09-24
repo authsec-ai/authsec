@@ -34,6 +34,13 @@ type ProjectionService struct {
 	barrierLease time.Duration
 	maxAttempts  int
 	now          func() time.Time
+
+	// beforeGraphTx runs once a pass has read its inputs -- the run's
+	// snapshot and the existing graph -- and before its graph transaction
+	// opens. Tests only (WithBeforeGraphTx): it is how §7.1 E13 supersedes a
+	// LIVE pass of this service, so what stands between a superseded pass
+	// and the graph is exactly this service's own fencer.
+	beforeGraphTx func(job models.IGAProjectionJob)
 }
 
 func NewProjectionService(
@@ -66,6 +73,17 @@ func NewDefaultProjectionService(db *gorm.DB) *ProjectionService {
 		repositories.NewIGAGraphRepository(),
 		fmt.Sprintf("projector/%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8]),
 		5*time.Minute)
+}
+
+// WithBeforeGraphTx makes every pass call fn after it has read its inputs and
+// before its graph transaction opens, with the job as claimed. Tests only: fn
+// may expire and reclaim the job, and the pass then runs on the lease it
+// claimed, exactly as a paused worker wakes -- nothing but the fence inside
+// the transaction refuses it. Nothing is held while fn runs (the snapshot's
+// read-only transaction has closed), so fn may use the database freely.
+func (s *ProjectionService) WithBeforeGraphTx(fn func(job models.IGAProjectionJob)) *ProjectionService {
+	s.beforeGraphTx = fn
+	return s
 }
 
 // projectionFencer binds the two ownership proofs the graph transaction needs:
@@ -407,6 +425,9 @@ func (s *ProjectionService) projectAndReconcile(
 	)
 	reconciler := igagraph.NewReconciler(s.now)
 
+	if s.beforeGraphTx != nil {
+		s.beforeGraphTx(*job)
+	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := projector.Project(tx, snap); err != nil {
 			return err

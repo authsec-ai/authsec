@@ -113,7 +113,7 @@ func TestP2ChangesPaging(t *testing.T) {
 	for name, path := range map[string]string{
 		"another object": changesPath("identity", otherID, "cursor", cur),
 		"another kind":   changesPath("identity", roleID, "kind", "coverage", "cursor", cur),
-		"forged":         changesPath("identity", roleID, "cursor", cur[:len(cur)-2]+"xx"),
+		"forged":         changesPath("identity", roleID, "cursor", egatesForgeCursor(cur)),
 		"garbage":        changesPath("identity", roleID, "cursor", "not-a-cursor"),
 	} {
 		code, body := api.get(path)

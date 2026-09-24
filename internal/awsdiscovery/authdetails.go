@@ -282,7 +282,7 @@ func (r *IAMReader) resolveManaged(ctx context.Context, out *AuthorizationDetail
 		p = AttachedPolicy{Name: name, ARN: arn}
 		api := authDetailsCall(iamtypes.EntityTypeLocalManagedPolicy)
 		if out.PoliciesErr != nil {
-			p.FetchError = "fetch: " + out.PoliciesErr.Error()
+			p.fetchFailed(out.PoliciesErr)
 		} else {
 			p.FetchError = "fetch: attached but absent from the " + api + " listing"
 		}

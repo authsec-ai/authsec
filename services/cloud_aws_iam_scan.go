@@ -79,6 +79,14 @@ type AWSIAMScanner struct {
 
 	// policies writes group memberships (035), fenced like identities.
 	policies repositories.CloudPolicyRepository
+
+	// fence, when set (WithFence), is the run's scan fence. The coverage
+	// report and generation this scanner files on the CONNECTOR row
+	// (commitScan, persistCoverage) are written under it like every
+	// inventory row (§2.10A part 3): a superseded worker that wakes after
+	// its run was reclaimed must not replace the report of the worker that
+	// now owns it.
+	fence *repositories.ScanFence
 }
 
 // WithGeneration stamps every row with the RUN's generation instead of
@@ -102,6 +110,7 @@ func (s *AWSIAMScanner) WithEvidence(w *ObservationWriter) *AWSIAMScanner {
 func (s *AWSIAMScanner) WithFence(f repositories.ScanFence) *AWSIAMScanner {
 	s.identities = s.identities.Fenced(f)
 	s.policies = s.policies.Fenced(f)
+	s.fence = &f
 	return s
 }
 
@@ -852,13 +861,15 @@ func (s *AWSIAMScanner) commitScan(
 	if err != nil {
 		return err
 	}
-	return s.db.Model(&models.CloudConnector{}).
-		Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
-		Updates(map[string]interface{}{
-			"scan_generation": generation,
-			"coverage":        json.RawMessage(raw),
-			"updated_at":      time.Now(),
-		}).Error
+	return repositories.RunFenced(s.db, s.fence, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudConnector{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
+			Updates(map[string]interface{}{
+				"scan_generation": generation,
+				"coverage":        json.RawMessage(raw),
+				"updated_at":      time.Now(),
+			}).Error
+	})
 }
 
 // persistCoverage writes a coverage report without touching the generation.
@@ -869,13 +880,17 @@ func (s *AWSIAMScanner) persistCoverage(workspaceID, connectorID uuid.UUID, cove
 		return
 	}
 	// Best effort: losing a progress update must not fail the scan that was
-	// reporting it.
-	_ = s.db.Model(&models.CloudConnector{}).
-		Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
-		Updates(map[string]interface{}{
-			"coverage":   json.RawMessage(raw),
-			"updated_at": time.Now(),
-		}).Error
+	// reporting it. Fenced: a superseded worker's report -- FinalizeCoverage's
+	// after its scanners were refused -- is dropped, never filed over the
+	// current owner's.
+	_ = repositories.RunFenced(s.db, s.fence, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudConnector{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
+			Updates(map[string]interface{}{
+				"coverage":   json.RawMessage(raw),
+				"updated_at": time.Now(),
+			}).Error
+	})
 }
 
 // FinalizeCoverage folds the permission- and workload-scan results into the

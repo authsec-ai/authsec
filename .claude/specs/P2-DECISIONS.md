@@ -883,7 +883,10 @@ the implementation now follows it.
   so the answer must not read as complete (§5.4 "never states a completeness it
   did not establish"). Kept as the conservative reading; the contract test
   pins both as the only additions. *Raise:* §5.4's vocabulary should list them,
-  or say how the console renders an unknown `bound_by`.
+  or say how the console renders an unknown `bound_by`. *Superseded in part
+  by D-105:* `/graph` no longer puts `resolution_not_followed` in `truncated`
+  (it is the additive `data.resolution_not_followed`); `/graph/path`'s
+  `bound_by` value stands.
 - **D-102 Four shapes §5 leaves open (recorded by the conformance pass).**
   (a) `graph_state` is on every detail envelope's meta, as on the list
   envelope's (§5.2's detail example shows `rev`, `published_at` and
@@ -933,3 +936,60 @@ the implementation now follows it.
   "Errors, on every route" is meant to cover the discovery routes'
   middleware denials; if so, they need their own group wrapped by
   `GraphEnvelope`, as the graph catalogue has.
+
+## Added in the M1 E-gates review
+
+Numbered on merge after the Wave C entries (D-104, D-105).
+
+- **D-104 policy_documents names its first failing call.** When a
+  `policy_documents` surface is `partial` because a document's fetch was
+  refused, its `api` and `error_code` (D-71, §5.3 "the call that failed") are
+  the FIRST document's refused call and AWS's code for it, in the order the
+  scan met the documents — as every other partial surface names its first
+  failing call (`withFirstFailure`, `services/cloud_aws_collection_coverage.go`).
+  Both are taken from the failed call itself (`awsdiscovery.APICallError` →
+  `AttachedPolicy.FetchAPI` / `FetchCode` → `PermissionSnapshot.UnreadableAPI`
+  / `UnreadableCode`), never parsed from a reason's prose (D-71). Both stay
+  null when no document failed on a call (every unreadable one was read and
+  did not parse, D-49, or the listing omitted it). Items stay D-71's `{policy,
+  version, error}`: a second document refused by another call is named in its
+  own item's `error`. *Why:* E9 ("coverage names the call") and §2.14.13 ("so
+  coverage names the failed call and the error code") need the call in a
+  structured field, and the surface already has one; the S2 test had pinned
+  it null for this one surface, unlike every other partial surface. *Raise:*
+  whether §5.3's per-surface `api` should name every distinct failed call.
+- **D-105 A resolution the walk does not follow is not
+  a budget (§5.4, §2.12).** An external principal's resolution in force (034
+  `resolution_state = 'active'`) is shown on its node (D-87) and never walked:
+  the principal is terminal (§5.4). On `/graph`, `truncated` names only a
+  budget that bound — `nodes | edges | assume_hops | time` (§5.4
+  "Continuation" l.6129-6130; the §5.3 Graph example has `truncated: null`
+  beside a non-empty frontier) — so an unfollowed resolution never sets it.
+  The additive `data.resolution_not_followed` says it instead: `true` when the
+  walk passed one (a principal it holds whose resolved node it does not hold;
+  forward only, also a node it holds that a principal it does not hold
+  resolves to, when that principal has `can_assume` edges under the request's
+  lifecycle filter); `false` when it passed none; `null` when that was not
+  established (the time budget bound first; a check that itself runs out of
+  the request's time sets `truncated: time` when no other budget bound, as
+  D-40's levels do). It is set
+  whether or not a budget bound, and speaks of the nodes the response holds.
+  `/graph/path` is unchanged: `not_found_within_budget` with `bound_by:
+  "resolution_not_followed"` (or `more_paths` with it on a found list) when
+  the search passed such a resolution linking its two sides, since
+  `none_exists` would claim more than was searched and §5.4's outcome table
+  has no other value. *Merge note:* graph's D-101 (recorded by the
+  frozen-contract pass after this branch was cut) lists
+  `resolution_not_followed` on `/graph` `truncated`; this entry supersedes that
+  half of D-101 (its `/graph/path` `bound_by` half stands). On merge, graph's
+  `tests/integration/p2_contract_schemas_test.go` must follow: `contractTruncated`
+  loses `"resolution_not_followed"` from its enum, and `contractGraph` (a
+  closed shape) gains `contractReq("resolution_not_followed",
+  contractNullable(contractBool))`; `p2_graph_trust_test.go` takes this
+  branch's assertions. *Raise:* §5.4's outcome table has no value for "a path
+  may run through a resolution that was not followed", and its `bound_by`
+  names only budgets; and §2.12 ("no path is drawn through [suspended /
+  pending_reconfirmation] as current") implies a path MAY be drawn through an
+  active resolution, while §5.4 makes every external principal terminal.
+  Either add the value to §5.4's vocabulary or decide that the traversal
+  follows resolutions in force.
