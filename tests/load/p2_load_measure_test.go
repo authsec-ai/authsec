@@ -792,13 +792,8 @@ func loadReport(env *loadEnv, results []*loadResult, n int, diagnostic string) s
 // loadReportGraphShapes is the Graph reads' response sizes (loadGraphShape)
 // beside the display maxima (150 nodes, 300 edges; §5.4).
 func loadReportGraphShapes(b *strings.Builder, results []*loadResult) {
-	fmt.Fprintf(b, "
-Response sizes (every measured, warm and traced response; display maxima 150 nodes, 300 edges):
-
-")
-	fmt.Fprintf(b, "| Read | Server budgets (meta.budgets) | Largest response: nodes | edges | Within the display maxima | Truncated (bound_by: responses) |
-|---|---|---:|---:|---|---|
-")
+	fmt.Fprintf(b, "\nResponse sizes (every measured, warm and traced response; display maxima 150 nodes, 300 edges):\n\n")
+	fmt.Fprintf(b, "| Read | Server budgets (meta.budgets) | Largest response: nodes | edges | Within the display maxima | Truncated (bound_by: responses) |\n|---|---|---:|---:|---|---|\n")
 	for _, r := range results {
 		g := r.graph
 		if !loadHasRow(r.c.rows, loadRowGraph) || !g.seen {
@@ -817,8 +812,7 @@ Response sizes (every measured, warm and traced response; display maxima 150 nod
 		if len(bound) > 0 {
 			trunc = strings.Join(bound, ", ")
 		}
-		fmt.Fprintf(b, "| %s | %d nodes, %d edges | %d | %d | %s | %s |
-", strings.ReplaceAll(r.c.name, "|", `\|`),
+		fmt.Fprintf(b, "| %s | %d nodes, %d edges | %d | %d | %s | %s |\n", strings.ReplaceAll(r.c.name, "|", `\|`),
 			g.budgetNodes, g.budgetEdges, g.nodes, g.edges, within, trunc)
 	}
 }

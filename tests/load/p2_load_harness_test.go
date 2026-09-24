@@ -205,3 +205,43 @@ func TestP2LoadInterleaves(t *testing.T) {
 		t.Errorf("measured order %v, want round-robin %v", got, want)
 	}
 }
+
+// TestP2LoadGraphShape: the Graph reads' response sizes, which RESULTS.md
+// sets beside the 150-node / 300-edge display maxima (the server runs every
+// request under its hard budgets, so the size is what says whether a measured
+// request did more work than a display-default drawing needs): /graph's and
+// /graph/expand's nodes and edges, /graph/path's DISTINCT nodes and edges
+// across its paths, the largest response kept, every bound_by counted, the
+// budgets taken from meta.budgets, and a body that is no traversal ignored.
+func TestP2LoadGraphShape(t *testing.T) {
+	var g loadGraphShape
+	g.observe(loadJSONBody(t, `{"data":[],"meta":{}}`))
+	if g.seen {
+		t.Fatalf("a list body was taken for a traversal: %+v", g)
+	}
+	g.observe(loadJSONBody(t, `{"data":{"nodes":[{},{},{}],"edges":[{},{}],"truncated":null},
+		"meta":{"budgets":{"nodes":500,"edges":2000}}}`))
+	g.observe(loadJSONBody(t, `{"data":{"nodes":[{}],"edges":[{},{},{},{}],"truncated":{"bound_by":"nodes"}},"meta":{}}`))
+	// Two paths sharing their first node and edge: 3 distinct nodes, 2 edges.
+	g.observe(loadJSONBody(t, `{"data":{"outcome":"found","bound_by":"paths","paths":[
+		{"nodes":[{"ref":"workload:1"},{"ref":"identity:2"}],"edges":[{"claim":"relationship:1"}]},
+		{"nodes":[{"ref":"workload:1"},{"ref":"identity:3"}],"edges":[{"claim":"relationship:1"},{"claim":"grant:9"}]}]},
+		"meta":{"budgets":{"nodes":500,"edges":2000}}}`))
+	if !g.seen || g.nodes != 3 || g.edges != 4 {
+		t.Errorf("largest response %d nodes / %d edges, want 3 / 4 (the maxima of each, not of one body)", g.nodes, g.edges)
+	}
+	if g.budgetNodes != 500 || g.budgetEdges != 2000 {
+		t.Errorf("budgets %d / %d, want meta.budgets' 500 / 2000", g.budgetNodes, g.budgetEdges)
+	}
+	if len(g.boundBy) != 2 || g.boundBy["nodes"] != 1 || g.boundBy["paths"] != 1 {
+		t.Errorf("bound_by %v, want nodes: 1 (/graph's truncated) and paths: 1 (/graph/path's)", g.boundBy)
+	}
+	// a -x- b -y- c and a -x- b -z- d: the shared prefix counts once.
+	var p loadGraphShape
+	p.observe(loadJSONBody(t, `{"data":{"outcome":"found","bound_by":null,"paths":[
+		{"nodes":[{"ref":"a"},{"ref":"b"},{"ref":"c"}],"edges":[{"claim":"x"},{"claim":"y"}]},
+		{"nodes":[{"ref":"a"},{"ref":"b"},{"ref":"d"}],"edges":[{"claim":"x"},{"claim":"z"}]}]},"meta":{}}`))
+	if p.nodes != 4 || p.edges != 3 || len(p.boundBy) != 0 {
+		t.Errorf("path shape %d nodes / %d edges / bound_by %v, want 4 distinct nodes, 3 distinct edges, none", p.nodes, p.edges, p.boundBy)
+	}
+}
