@@ -76,6 +76,8 @@ func TestLiveQuickCreate(t *testing.T) {
 	// The bucket is private in the lab; CloudFormation reads it with the
 	// operator's own credentials. Existence is checked by the setup script.
 	svc.templateCheck = func(context.Context, string) error { return nil }
+	// No database: every account is new to this harness.
+	svc.existing = func(uuid.UUID, string) (*models.CloudConnector, error) { return nil, nil }
 	svc.onboard = func(ctx context.Context, ws uuid.UUID, in AWSOnboardInput, _ string) (*models.CloudConnector, bool, error) {
 		// Onboard's AWS half, verbatim in effect: assume, read back, cross-check.
 		_, arnAccount, err := awsdiscovery.ParseRoleARN(in.RoleARN)
@@ -169,7 +171,15 @@ func TestLiveQuickCreate(t *testing.T) {
 					}
 				}
 			}
-			outcome := svc.HandleCallbackMessage(ctx, body)
+			outcome := func() (o CallbackOutcome) {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("PANIC handling message: %v", r)
+						o = CallbackRetry
+					}
+				}()
+				return svc.HandleCallbackMessage(ctx, body)
+			}()
 			obs["outcome"] = outcome.String()
 			w.settle(ctx, aws.ToString(m.ReceiptHandle), outcome)
 			record["observed"] = append(record["observed"].([]map[string]string), obs)

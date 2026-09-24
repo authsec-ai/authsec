@@ -748,10 +748,15 @@ func (s *AWSQuickCreateService) handleCreate(
 		return fail(AWSOnbCodeLinkUsed, "session already "+sess.Status, false)
 	}
 
-	if prev, err := s.existing(sess.WorkspaceID, stack.AccountID); err == nil && prev != nil {
-		if old := prev.AWSAttrs().RoleARN; old != "" && old != props.RoleArn {
-			sess.PreviousRoleARN = old
+	if s.existing != nil {
+		if prev, err := s.existing(sess.WorkspaceID, stack.AccountID); err == nil && prev != nil {
+			if old := prev.AWSAttrs().RoleARN; old != "" && old != props.RoleArn {
+				sess.PreviousRoleARN = old
+			}
 		}
+	}
+	if s.onboard == nil {
+		return fail(AWSOnbCodeAuthSecUnavailable, "service built without an onboarding service", false)
 	}
 	sess.Status = AWSOnbVerifying
 	if err := s.saveSession(ctx, sess); err != nil {

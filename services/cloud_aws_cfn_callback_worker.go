@@ -105,6 +105,16 @@ func (w *AWSCallbackWorker) RunOnce(ctx context.Context) (int, error) {
 		wg.Add(1)
 		go func(body, receipt string) {
 			defer wg.Done()
+			// A panic in one message must not take the backend down with it, and
+			// must not strand the message for the full visibility timeout — that
+			// is longer than the stack's ServiceTimeout, so the customer's stack
+			// would fail. Recover, and hand it back for a prompt retry.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[aws-onb] ALERT stage=worker outcome=panic err=%v", r)
+					w.settle(ctx, receipt, CallbackRetry)
+				}
+			}()
 			w.settle(ctx, receipt, w.svc.HandleCallbackMessage(ctx, body))
 		}(aws.ToString(m.Body), aws.ToString(m.ReceiptHandle))
 	}
