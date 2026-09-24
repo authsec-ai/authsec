@@ -7,6 +7,7 @@ package integration
 // statement is a replacement -- the old one retires, a new one begins.
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,22 @@ func bdbOne(t *testing.T, m map[string][]bdbStatementRow, label string) bdbState
 		t.Fatalf("statement %q = %+v, want exactly one row (with its one grant)", label, m[label])
 	}
 	return m[label][0]
+}
+
+// bdbGrantOf renders a statement row's grant for a failure message: its id,
+// state and ended_reason, or "none".
+func bdbGrantOf(r bdbStatementRow) string {
+	if r.Grant == nil {
+		return "none"
+	}
+	state, reason := "", ""
+	if r.GrantState != nil {
+		state = *r.GrantState
+	}
+	if r.GrantReason != nil {
+		reason = *r.GrantReason
+	}
+	return r.Grant.String() + " (" + state + ", ended_reason " + strconv.Quote(reason) + ")"
 }
 
 type bdbRevision struct {
@@ -235,7 +252,7 @@ func TestP2BdbStatementIdentity(t *testing.T) {
 			t.Errorf("the edited Sid-less statement = %+v, want %s retired unsupported", old, ids["s3:GetObjectTagging"])
 		}
 		if old.Grant == nil || *old.GrantState != models.RelEnded || *old.GrantReason != models.EndedNotSeen {
-			t.Errorf("its grant = %v (%v, %v), want ended not_seen (D-67, statement case)", old.Grant, old.GrantState, old.GrantReason)
+			t.Errorf("its grant = %s, want ended not_seen (D-67, statement case)", bdbGrantOf(old))
 		}
 		// The retirement the Changes view reads, whatever ended_reason says.
 		if n := l.count(`SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ? AND scan_run_id = ?

@@ -3,10 +3,12 @@ package integration
 // B21's inline half (SPEC-iga-phase2-graph.md §7.3 B21; §2.4 "an inline policy
 // lives and dies with its holder"; §2.7 l.611; §7.1 E8(a)): a role recreated
 // under the same name with a same-named inline policy. Through the REAL scan
-// worker and projector. TestP2RecreatedRoleIsANewObject checks only the two
-// incarnations' lifecycle, and its mutation (M19) disables IDENTITY recreation,
-// so it fails at the identities first and never exercises the inline
-// incarnation key.
+// worker and projector. TestP2RecreatedRoleIsANewObject checks the two
+// incarnations' lifecycle and that no statement key is shared (it catches this
+// file's mutation too), and its own mutation (M19) disables IDENTITY
+// recreation, so it fails at the identities first; it asserts nothing of the
+// new statements (new ids, first_seen events), the old statements' retired
+// reason, or how the old inline assignment and grants end. This test does.
 
 import (
 	"testing"
