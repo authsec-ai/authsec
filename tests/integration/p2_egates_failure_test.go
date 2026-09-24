@@ -648,7 +648,7 @@ func TestP2EgatesE10SharedObjectSurvivesOneSource(t *testing.T) {
 		num(d, "data", "named_by_count", "value") != 2 {
 		t.Errorf("support-tickets/* detail = %s, want active, current, named by A's two statements", egatesJSON(dig(d, "data")))
 	}
-	egatesMeta(t, "resource detail", d, pubB.Rev, egatesMicro(pubB.PublishedAt))
+	egatesMeta(t, "resource detail", d, pubB.Rev, egatesPubTime(pubB.PublishedAt))
 	if rows := digl(egatesGet(t, api, "/resources"+qs("q", "support-tickets")), "data"); len(rows) != 1 || digs(rows[0], "ref") != tickets {
 		t.Errorf("/resources?q=support-tickets = %s, want the reference, still listed", egatesJSON(rows))
 	}

@@ -121,7 +121,7 @@ func TestP2EgatesE2RightWorkloadAmongDuplicates(t *testing.T) {
 		digs(detail, "data", "account", "id") != accountB || digs(detail, "data", "execution_role", "identity") != reader {
 		t.Errorf("B's detail = %s", egatesJSON(detail))
 	}
-	if srcs := digl(detail, "data", "sources"); len(srcs) != 1 || digs(srcs[0], "account_id") != accountB ||
+	if srcs := digl(detail, "data", "sources"); len(srcs) != 1 || digs(srcs[0], "account", "id") != accountB ||
 		digs(srcs[0], "integration") != refOf("cloud_connector", b.conn) {
 		t.Errorf("B's sources = %s, want B's connector only", egatesJSON(srcs))
 	}
@@ -198,7 +198,7 @@ func TestP2EgatesE3WorkloadIdentityStatementsResource(t *testing.T) {
 	// Detail: the execution role, resolved.
 	detail := egatesGet(t, api, egatesRoute(t, w))
 	bodies = append(bodies, detail)
-	egatesMeta(t, "workload detail", detail, pub.Rev, egatesMicro(pub.PublishedAt))
+	egatesMeta(t, "workload detail", detail, pub.Rev, egatesPubTime(pub.PublishedAt))
 	if digs(detail, "data", "execution_role", "state") != "resolved" || digs(detail, "data", "execution_role", "identity") != role ||
 		digs(detail, "data", "execution_role", "name") != egatesSharedRole {
 		t.Errorf("detail execution_role = %s", egatesJSON(dig(detail, "data", "execution_role")))

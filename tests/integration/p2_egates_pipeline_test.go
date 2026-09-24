@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -49,9 +50,10 @@ func egatesPublicationOf(t *testing.T, l *p2Lab, run uuid.UUID) egatesPublicatio
 	return p
 }
 
-// egatesMicro renders a publication time as the envelope does (§5.1 meta.
-// published_at, microseconds).
-func egatesMicro(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.999999Z07:00") }
+// egatesPubTime renders a publication time as the envelope does: meta.
+// published_at is RFC 3339 UTC to the second, the one rendering of a
+// publication's time on every route (D-96, igaread.PublicationTime).
+func egatesPubTime(at time.Time) string { return igaread.PublicationTime(at).Format(time.RFC3339) }
 
 // E1. Connect A with regions eu-central-1 and us-east-1; queue a scan through
 // the discovery route; the real worker collects and publishes; the real
@@ -170,7 +172,7 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 
 	// /workloads lists A's workloads at rev 1, as of the publication.
 	list := egatesGet(t, api, "/workloads")
-	egatesMeta(t, "/workloads", list, 1, egatesMicro(pub.PublishedAt))
+	egatesMeta(t, "/workloads", list, 1, egatesPubTime(pub.PublishedAt))
 	if digs(list, "meta", "graph_state") != "published" || dig(list, "meta", "total_known") != true ||
 		num(list, "meta", "total") != 7 || dig(list, "meta", "next_cursor") != nil {
 		t.Errorf("/workloads meta = %s", egatesJSON(dig(list, "meta")))
