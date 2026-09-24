@@ -62,6 +62,16 @@ func TestP2LoadFixtureIntegrity(t *testing.T) {
 	if got := loadNum(body, "data", "workloads", "total"); got != float64(g.h.hubRoleUsers) {
 		t.Errorf("hub role used-by workloads total = %v, generated %d", got, g.h.hubRoleUsers)
 	}
+	// ... and its workloads RUN AS it: the measured executes_as expand is a
+	// full first page (100 neighbours, §5.4) with a cursor for the rest. An
+	// empty page is fast for the wrong reason -- as it was while the hub was
+	// an ecsTaskExecutionRole, whose workloads reach it through
+	// task_execution_role only.
+	body = loadMustGet(t, api, "/graph/expand?"+loadQS("node", "identity:"+g.h.hubRole.String(), "edge", "executes_as", "direction", "reverse"))
+	if nodes, _ := loadDig(body, "data", "nodes").([]any); len(nodes) != 100 || loadDig(body, "data", "next_cursor") == nil {
+		t.Errorf("hub role's executes_as expand: %d nodes, next_cursor %v; want a full page of 100 and a cursor (%d workloads use it)",
+			len(nodes), loadDig(body, "data", "next_cursor"), g.h.hubRoleUsers)
+	}
 
 	// Changes attribute every event to a revision and a run (D-26, D-27a): a
 	// time that is not exactly one publication's published_at renders null.

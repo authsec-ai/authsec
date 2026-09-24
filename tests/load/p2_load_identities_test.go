@@ -50,7 +50,9 @@ type loadIdent struct {
 	trustDoc json.RawMessage
 	attrs    map[string]any // provider_attrs trust flags
 	obs      loadObs
-	users    int // workloads executing as it (hub selection)
+	// users is the live workloads using it (hub selection): through executes_as,
+	// or, for an ecsTaskExecutionRole, through task_execution_role.
+	users int
 }
 
 func (i *loadIdent) sourceKey() string { return igagraph.IdentityARNKey(i.arn) }

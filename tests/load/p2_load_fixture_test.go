@@ -165,7 +165,7 @@ type loadHandles struct {
 	executes       []uuid.UUID // executes_as relationships
 	canAssume      []uuid.UUID
 	assignments    []uuid.UUID
-	hubRole        uuid.UUID // the execution role the most workloads use
+	hubRole        uuid.UUID // the execution role the most workloads run as (executes_as)
 	hubRoleUsers   int
 	ecsExecRole    uuid.UUID // task_execution_role of every ECS workload in account A
 	ecsExecUsers   int

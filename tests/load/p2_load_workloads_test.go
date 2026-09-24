@@ -419,9 +419,17 @@ func (g *loadGen) handles() {
 		switch i.kind {
 		case models.CloudIdentityIAMRole:
 			roles = append(roles, i)
-			if i.name == "ecsTaskExecutionRole" && i.acct == g.accts[0] {
-				h.ecsExecRole, h.ecsExecUsers = i.id, i.users
-			} else if i.service != "" && i.users > h.hubRoleUsers {
+			switch {
+			case i.name == "ecsTaskExecutionRole":
+				// Its workloads reach it through task_execution_role, never
+				// executes_as: the heaviest Used-by (account A's is measured),
+				// never the execution-role hub. (Picked as the hub, account
+				// B's made "/graph/expand executes_as reverse (hub role)" an
+				// empty page -- the Graph response sizes showed 0 nodes.)
+				if i.acct == g.accts[0] {
+					h.ecsExecRole, h.ecsExecUsers = i.id, i.users
+				}
+			case i.service != "" && i.users > h.hubRoleUsers:
 				h.hubRole, h.hubRoleUsers = i.id, i.users
 			}
 		case models.CloudIdentityIAMUser:
