@@ -131,12 +131,16 @@ func TestP2EgatesE14CrossWorkspaceAccess(t *testing.T) {
 		egatesCycle(c.l, c.a)
 	}
 	mine, theirs := egatesIDsOf(t, home, ha), egatesIDsOf(t, other, oa)
+	// The two workspaces share no id: a probe's 404 is about the workspace,
+	// never an id the requester happens to hold too. A coverage claim is
+	// "coverage:<run>:<surface>", so its run is what must differ.
 	for typ, ref := range theirs.one {
-		if mine.all[refUUID(t, ref).String()] || strings.HasPrefix(ref, "coverage:") {
-			continue
+		probe := ref
+		if strings.HasPrefix(ref, "coverage:") {
+			probe = "cloud_scan_run:" + strings.Split(ref, ":")[1]
 		}
-		if mine.one[typ] == ref {
-			t.Fatalf("setup: both workspaces share %s %s", typ, ref)
+		if mine.all[refUUID(t, probe).String()] || mine.one[typ] == ref {
+			t.Fatalf("setup: both workspaces hold %s %s", typ, ref)
 		}
 	}
 
@@ -337,9 +341,14 @@ func egatesCall(t *testing.T, eng *gin.Engine, ws uuid.UUID, path string) (int, 
 
 var egatesTimestamp = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$`)
 
+// egatesInstallation matches the two GitHub installation ids E16 binds (one
+// per workspace: an installation binds once), the only fixture value the two
+// workspaces cannot share.
+var egatesInstallation = regexp.MustCompile(`inst-egates-(mixed|control)`)
+
 // egatesNormalize masks what legitimately differs between two workspaces
-// scanned from the same fixtures -- ids and times -- and sorts arrays, so
-// two responses compare by their fields and values alone.
+// scanned from the same fixtures -- ids, times and the installation id -- and
+// sorts arrays, so two responses compare by their fields and values alone.
 func egatesNormalize(v any) any {
 	switch x := v.(type) {
 	case map[string]any:
@@ -356,7 +365,7 @@ func egatesNormalize(v any) any {
 		sort.Slice(out, func(i, j int) bool { return egatesJSON(out[i]) < egatesJSON(out[j]) })
 		return out
 	case string:
-		s := egatesUUID.ReplaceAllString(x, "<id>")
+		s := egatesInstallation.ReplaceAllString(egatesUUID.ReplaceAllString(x, "<id>"), "<installation>")
 		if egatesTimestamp.MatchString(s) {
 			return "<time>"
 		}
@@ -378,7 +387,7 @@ func egatesGitHubRows(t *testing.T, l *p2Lab, ws uuid.UUID) string {
 		`SELECT to_jsonb(x)::text FROM iga_credentials x WHERE workspace_id = ?`,
 		`SELECT to_jsonb(x)::text FROM iga_agents x WHERE workspace_id = ?`,
 		`SELECT to_jsonb(x)::text FROM iga_agent_instances x WHERE workspace_id = ?`,
-		`SELECT to_jsonb(x)::text FROM iga_candidates x WHERE workspace_id = ?`,
+		`SELECT to_jsonb(x)::text FROM iga_classification_candidates x WHERE workspace_id = ?`,
 	} {
 		var got []string
 		if err := l.db.Raw(q, ws).Scan(&got).Error; err != nil {
@@ -586,13 +595,12 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	for _, acct := range []*egatesAcct{a, b} {
 		_, inv := egatesCall(t, eng, mixed.ws, "/authsec/discovery/aws/workloads?connector_id="+acct.conn.String())
 		var cloudID string
-		for _, w := range digl(inv, "workloads") {
+		for _, w := range digl(inv, "data") {
 			if digs(w, "name") == "ticket-tools" {
 				cloudID = digs(w, "id")
 			}
 		}
 		if cloudID == "" {
-			_, inv = egatesCall(t, eng, mixed.ws, "/authsec/discovery/aws/workloads?connector_id="+acct.conn.String())
 			t.Fatalf("Cloud Inventory for %s has no ticket-tools row: %s", acct.id, egatesJSON(inv))
 		}
 		look := egatesGet(t, api, "/lookup"+qs("cloud_ref", "cloud_workload:"+cloudID))

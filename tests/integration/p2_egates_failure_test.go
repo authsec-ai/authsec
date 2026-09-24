@@ -150,9 +150,15 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 		if digs(cov, "state") != models.CloudCoverageDenied || digs(cov, "api") != "iam:GetAccountAuthorizationDetails ("+filter+")" ||
 			digs(cov, "error_code") != "AccessDenied" || digs(cov, "prevents") != "surface_denied" ||
 			digs(cov, "run") != refOf("cloud_scan_run", run2.ID) || digs(cov, "since_run") != refOf("cloud_scan_run", run2.ID) ||
-			dig(cov, "count") != nil || strings.Contains(digs(cov, "error"), "could not be assumed") {
-			t.Errorf("/coverage %s = %s, want denied by iam:GetAccountAuthorizationDetails (%s), AccessDenied, in run %s",
-				s, egatesJSON(cov), filter, run2.ID)
+			dig(cov, "count") != nil || strings.Contains(digs(cov, "error"), "could not be assumed") ||
+			// D-72: since is the published_at of the first run of the
+			// unbroken streak -- this one.
+			digs(cov, "since") != s2TS(run2.PublishedAt) ||
+			// No invented remedy: the only fix the evidence supports is
+			// selecting a region (§2.14.13), never a permission to grant.
+			dig(cov, "fix") != nil {
+			t.Errorf("/coverage %s = %s, want denied by iam:GetAccountAuthorizationDetails (%s), AccessDenied, in run %s since %s, no fix",
+				s, egatesJSON(cov), filter, run2.ID, s2TS(run2.PublishedAt))
 		}
 		egatesNoGuessedPermission(t, "/coverage "+s, cov)
 	}
@@ -494,4 +500,3 @@ func TestP2EgatesE10SharedObjectSurvivesOneSource(t *testing.T) {
 		t.Errorf("the resource at the previous revision = %d %v, want 409 revision_stale", code, body)
 	}
 }
-

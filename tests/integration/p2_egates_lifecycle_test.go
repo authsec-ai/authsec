@@ -331,9 +331,29 @@ func TestP2EgatesE7PolicyEditsAndReattach(t *testing.T) {
 		t.Errorf("(c) policy_attached = %s, want the new assignment %s (run %s) newest, the first period's after it",
 			changesDump(att), asg[1].ID, runC.ID)
 	}
-	if det := changesPick(events, "policy_detached", "policy", refOf("policy", changesPolicy(t, l, egatesTicketRead))); len(det) != 1 ||
-		digs(det[0], "subject") != refOf("assignment", asg[0].ID) || digs(det[0], "at") != egatesMicro(e6End) {
-		t.Errorf("(c) the E6 detach = %s, want one, of the first period, at %s", changesDump(det), egatesMicro(e6End))
+	det := changesPick(events, "policy_detached", "policy", refOf("policy", changesPolicy(t, l, egatesTicketRead)))
+	if len(det) != 1 || digs(det[0], "subject") != refOf("assignment", asg[0].ID) || digs(det[0], "at") != egatesMicro(e6End) {
+		t.Fatalf("(c) the E6 detach = %s, want one, of the first period, at %s", changesDump(det), egatesMicro(e6End))
+	}
+	// What REMAINS is read at the current revision (D-28): the holder's
+	// NON-ENDED grants on the detached period's target -- the new ToolboxRead
+	// grant of (b) and the reattached TicketRead of (c) -- never the ToolboxRead
+	// grant (b) ended, and never a grant of the detached period itself.
+	if len(tb) != 2 || len(tr) != 2 {
+		t.Fatalf("setup: ToolboxRead grants %+v, TicketRead grants %+v, want two of each", tb, tr)
+	}
+	newToolbox := tb[1]
+	want := map[string]bool{refOf("grant", newToolbox.ID): true, refOf("grant", tr[1].ID): true}
+	got := map[string]string{}
+	for _, rm := range digl(det[0], "remaining") {
+		got[digs(rm, "grant")] = digs(rm, "state")
+	}
+	if len(got) != len(want) || got[refOf("grant", newToolbox.ID)] != models.RelCurrent || got[refOf("grant", tr[1].ID)] != models.RelCurrent {
+		t.Errorf("(c) the E6 detach's remaining = %s, want exactly the current grants %v (not ToolboxRead's ended %s)",
+			egatesJSON(dig(det[0], "remaining")), want, refOf("grant", tb[0].ID))
+	}
+	if _, paths := changesRemainingOf(det[0]); len(paths) != 1 || paths[egatesTickets] != "current" {
+		t.Errorf("(c) the E6 detach's paths = %v, want support-tickets/* remains current", paths)
 	}
 	lines = egatesTicketsLines(t, api, w, false)
 	if len(lines) != 2 || digs(lines[egatesTicketRead], "statement", "ref") != ticketStmt ||
