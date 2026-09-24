@@ -658,4 +658,51 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			}
 		}
 	})
+
+	// B20's own non-vacuity. A collection reference that is workspace-qualified
+	// but NOT integration-qualified is the review defect 035 was revised for
+	// (§7.6): it passes §2.9's rule and every foreign_workspace negative, and
+	// still lets one account's membership name another account's user. Plant
+	// it and require the guard to see it, and the probe to show that only the
+	// A2 side can tell the two keys apart.
+	t.Run("a_planted_workspace_only_collection_reference_is_caught", func(t *testing.T) {
+		tx, err := w.f.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		for _, ddl := range []string{
+			`ALTER TABLE cloud_identity ADD CONSTRAINT bfk_planted_ws_id_key UNIQUE (workspace_id, id)`,
+			`ALTER TABLE cloud_group_membership DROP CONSTRAINT cloud_gm_user_fkey,
+			   ADD CONSTRAINT cloud_gm_user_fkey FOREIGN KEY (workspace_id, user_identity_id)
+			   REFERENCES cloud_identity (workspace_id, id) ON DELETE CASCADE`,
+		} {
+			if _, err := tx.Exec(ddl); err != nil {
+				t.Fatalf("plant: %v", err)
+			}
+		}
+		planted := bfkForeignKeys(t, tx)
+		if !bfkMentions(bfkCoverageProblems(planted), "cloud_gm_user_fkey", "but its shape is workspace") {
+			t.Error("the coverage check did not see that cloud_gm_user_fkey lost connector_id")
+		}
+		if !bfkMentions(bfkQualificationProblems(planted), "cloud_gm_user_fkey", "(B20)") {
+			t.Error("the qualification check did not report the workspace-only cloud_gm_user_fkey")
+		}
+		probe := func(p *bfkSide) error {
+			if _, err := tx.Exec(`SAVEPOINT planted`); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if _, err := tx.Exec(`ROLLBACK TO SAVEPOINT planted`); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			return bfkInsert(tx, w.A.membership("user_identity_id", p.id("cuser")))
+		}
+		if err := probe(w.A2); err != nil {
+			t.Errorf("with the workspace-only key, the A2 user was still rejected (%v): "+
+				"foreign_integration cannot tell the two keys apart", err)
+		}
+		bfkWantFK(t, probe(w.B), "cloud_gm_user_fkey")
+	})
 }
