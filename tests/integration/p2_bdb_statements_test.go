@@ -122,13 +122,15 @@ func bdbRevisions(t *testing.T, l *p2Lab, stmt uuid.UUID) []bdbRevision {
 //	    the old grant not in it -- before retireUnsupported retires the
 //	    statement, so the cascade finds the grant already ended. D-67 (its
 //	    statement case) records this; the read side never classifies an end by
-//	    ended_reason: TestP2ChangesPolicyEdits (b) reads this same replacement
-//	    as statement_replaced with the old grant's grant_ended, from lifecycle
-//	    events and grant periods.
+//	    ended_reason: TestP2ChangesPolicyEdits (b) reads a Sid-less edit of
+//	    this kind as statement_replaced with the old grant's grant_ended, from
+//	    lifecycle events and grant periods.
 //
-// Safeguard (mutation-checked): statements are keyed by Sid or content, never
+// Safeguards (mutation-checked): statements are keyed by Sid or content, never
 // by position (StatementKey) -- index-keyed, the reorder moves ids between
-// statements.
+// statements; the replaced statement's retirement is logged as a lifecycle
+// event (retireUnsupported); and the grant partition ends the old grant
+// itself, not_seen, before the cascade (D-67).
 func TestP2BdbStatementIdentity(t *testing.T) {
 	l := newP2Lab(t, "p2-bdb-b11", true)
 	a := l.account(accountA)

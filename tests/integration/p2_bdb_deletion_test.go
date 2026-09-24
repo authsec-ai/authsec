@@ -22,18 +22,20 @@ package integration
 //     23503 on iga_le_publication_fkey: that key is declared DEFERRABLE
 //     INITIALLY DEFERRED, but RESTRICT is never deferred (PostgreSQL checks it
 //     the moment iga_publication's rows cascade away, while iga_lifecycle_event's
-//     rows -- cascaded later -- still reference them), so the declared deferral
-//     does nothing. The defect is raised as a spec question (P2-EVIDENCE.md
-//     §10.4, with the DDL below); migrations are not changed here. When 036 is
-//     corrected the skip stops firing and the assertion runs -- nothing to
-//     edit. Any OTHER refusal fails: a workspace delete must go through.
+//     rows -- cascaded later, with their subject node -- still reference
+//     them), so the declared deferral does nothing. The defect is raised as a
+//     spec question (P2-DECISIONS.md D-94, with the DDL below); migrations are
+//     not changed here. When 036 is corrected the skip stops firing and the
+//     assertion runs -- nothing to edit. Any OTHER refusal fails: a workspace
+//     delete must go through. (A skipped subtest is not a pass, §7.4: record
+//     it as a skip.)
 //   - A connector HARD delete after a projection never strips a surviving
 //     claim of its evidence (T4.9): edges survive a connector (their
 //     connector_id is SET NULL) while its observations cascade from it. Today
 //     the RESTRICT keys refuse the delete, which keeps the evidence; whatever
 //     033/036 become, a delete that goes through must not leave an edge that
 //     had evidence without any. The product's DELETE route only revokes (soft,
-//     D-89), so no product path reaches this.
+//     D-89), so no product path reaches this, and D-94 proposes no DDL for it.
 
 import (
 	"errors"
@@ -84,7 +86,7 @@ func TestP2BdbWorkspaceDeletionAfterProjection(t *testing.T) {
 			bdbInRolledBackTx(t, l, func(tx *gorm.DB) {
 				err := bdbDeleteWorkspace(tx, l.ws)
 				if c := bdbFKViolation(err); c == "iga_le_publication_fkey" {
-					t.Skipf("KNOWN SCHEMA DEFECT (spec question, P2-EVIDENCE.md §10.4): 036's iga_le_publication_fkey is "+
+					t.Skipf("KNOWN SCHEMA DEFECT (spec question, P2-DECISIONS.md D-94): 036's iga_le_publication_fkey is "+
 						"ON DELETE RESTRICT, which is never deferred, so a projected workspace cannot be deleted: %v", err)
 				}
 				if err != nil {
@@ -124,8 +126,8 @@ func TestP2BdbWorkspaceDeletionAfterProjection(t *testing.T) {
 	})
 }
 
-// bdbProposedLePublicationFK is the DDL this test proposes for 036: the same
-// key, deferred for real (NO ACTION honours DEFERRABLE; RESTRICT never does).
+// bdbProposedLePublicationFK is the DDL D-94 proposes for 036: the same key,
+// deferred for real (NO ACTION honours DEFERRABLE; RESTRICT never does).
 const bdbProposedLePublicationFK = `ALTER TABLE public.iga_lifecycle_event
     DROP CONSTRAINT iga_le_publication_fkey,
     ADD CONSTRAINT iga_le_publication_fkey FOREIGN KEY (workspace_id, rev)
