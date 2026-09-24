@@ -462,6 +462,22 @@ func loadCases(t *testing.T, env *loadEnv) []loadCase {
 	add(graph, "GET /graph resource reverse", gq(ref("resource", res), "reverse"))
 	add(graph, "GET /graph resource reverse (most-named bucket)", gq(ref("resource", loadFixed(h.hotBucket)), "reverse"))
 	add(graph, "GET /graph external principal forward (lambda.amazonaws.com)", gq(ref("external_principal", loadFixed(h.lambdaService)), "forward"))
+	// The canvas's other two traversal calls, under the same row: one node's
+	// next neighbours of one kind (the first page of 100), and the declared
+	// paths between two objects (§5.4).
+	ex := func(node, edge, dir string) func(int) string {
+		return func(int) string { return "/graph/expand?" + loadQS("node", node, "edge", edge, "direction", dir) }
+	}
+	add(graph, fmt.Sprintf("GET /graph/expand executes_as reverse (hub role, %d workloads)", h.hubRoleUsers),
+		ex("identity:"+h.hubRole.String(), "executes_as", "reverse"))
+	add(graph, `GET /graph/expand target reverse ("*")`, ex("resource:"+h.starResource.String(), "target", "reverse"))
+	add(graph, "GET /graph/path workload -> a resource its role reaches", func(i int) string {
+		p := h.paths[i%len(h.paths)]
+		return "/graph/path?" + loadQS("from", "workload:"+p[0].String(), "to", "resource:"+p[1].String())
+	})
+	add(graph, `GET /graph/path workload -> "*" (most-granted role)`, func(int) string {
+		return "/graph/path?" + loadQS("from", "workload:"+heavyWL.String(), "to", "resource:"+h.starResource.String())
+	})
 
 	// Evidence: one query per edge type; a grouped edge of 50 claims (D-79).
 	ev := func(typ string, ids []uuid.UUID) func(int) string {

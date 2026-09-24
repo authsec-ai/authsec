@@ -141,6 +141,10 @@ type loadGen struct {
 	workloads  []*loadWorkload
 
 	grantsByHolder map[*loadIdent][]uuid.UUID
+	// reach is, per holder, one exact resource a live Allow grant of it names
+	// positively: the far end of a declared path (/graph/path) from a
+	// workload executing as that holder.
+	reach map[*loadIdent]*loadResource
 
 	// obsHash keeps every observation content hash unique, as the collector's
 	// dedupe index requires.
@@ -171,6 +175,7 @@ type loadHandles struct {
 	lambdaService  uuid.UUID // lambda.amazonaws.com, trusted by every Lambda role
 	switchedWL     []uuid.UUID
 	groupedGrants  []uuid.UUID // 50 grants of one holder, one policy: a grouped edge (D-79)
+	paths          [][2]uuid.UUID // (workload, resource) pairs a declared path joins
 	coverageClaims []string    // coverage:<run>:<surface>
 	activeWL       int         // readable active workloads (the unfiltered list total)
 	activeIdent    int
@@ -190,6 +195,7 @@ func newLoadGen(seed int64, name string, shape loadShape, accounts []loadAcct) *
 		externals:  map[string]*loadExternal{},
 
 		grantsByHolder: map[*loadIdent][]uuid.UUID{},
+		reach:          map[*loadIdent]*loadResource{},
 		external:       []string{"444444444444", "555555555555"},
 	}
 	g.ws = g.uuid()

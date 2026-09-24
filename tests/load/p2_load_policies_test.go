@@ -932,6 +932,14 @@ func (g *loadGen) assignmentRows(assigns []*loadAssign) {
 			g.link("iga_access_edge_evidence", id, span, append([]loadObs{as.holder.obs}, polObs...)...)
 			if span.to == 0 {
 				g.grantsByHolder[as.holder] = append(g.grantsByHolder[as.holder], id)
+				if g.reach[as.holder] == nil {
+					for _, text := range s.cur.Resources {
+						if r := g.resources[text]; r != nil && r.exact {
+							g.reach[as.holder] = r
+							break
+						}
+					}
+				}
 				if len(g.h.grants) < 60 && g.chance(0.01) {
 					g.h.grants = append(g.h.grants, id)
 				}

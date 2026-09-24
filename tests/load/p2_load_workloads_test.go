@@ -403,6 +403,12 @@ func (g *loadGen) handles() {
 	h.activeWL = len(live)
 	for i := 0; i < len(live) && len(h.workloads) < 50; i += stride(len(live), 50) {
 		h.workloads = append(h.workloads, live[i].id)
+		// A workload running as a role with a live grant: the path
+		// workload -> executes_as -> role -> grant -> statement -> target ->
+		// resource is declared (§5.4).
+		if w := live[i]; w.role != nil && w.role.life.live() && !w.life.stale && g.reach[w.role] != nil {
+			h.paths = append(h.paths, [2]uuid.UUID{w.id, g.reach[w.role].id})
+		}
 	}
 	var roles, users []*loadIdent
 	for _, i := range g.idents {
