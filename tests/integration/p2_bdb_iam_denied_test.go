@@ -100,6 +100,9 @@ func bdbKeys(m map[string]int) string {
 // present but not reached (reconcile.go) -- trusting its presence alone, the
 // denied half ends everything.
 func TestP2BdbIAMDeniedEndsNothing(t *testing.T) {
+	// Skip the whole test without a database: "reached" needs "denied" to have
+	// run, and a skipped "denied" must not read as a failure of "reached".
+	igaDB(t)
 	var keptStale map[string]int
 
 	t.Run("denied", func(t *testing.T) {
