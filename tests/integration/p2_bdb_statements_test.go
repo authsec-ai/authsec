@@ -113,9 +113,18 @@ func bdbRevisions(t *testing.T, l *p2Lab, stmt uuid.UUID) []bdbRevision {
 //	    and policy_version_id v4 -- and its grant is the same row, current.
 //	(c) The Sid-less s3:GetObjectTagging becomes s3:PutObjectTagging. That is a
 //	    REPLACEMENT: the old statement retires unsupported with its support
-//	    ended and its grant ended (not_seen: its partition closes it before the
-//	    retirement cascade, D-67); a NEW statement with a new id and a new
-//	    current grant. The untouched Sid-less statement keeps its id.
+//	    ended, a 'retired' lifecycle event in this run, and its grant ended
+//	    not_seen; a NEW statement with a new id and a new current grant. The
+//	    untouched Sid-less statement keeps its id.
+//
+//	    not_seen, not §2.7's statement_retired (l.605; the cascade table,
+//	    l.5241): §4.10's Reconcile closes the grant partition -- read in full,
+//	    the old grant not in it -- before retireUnsupported retires the
+//	    statement, so the cascade finds the grant already ended. D-67 (its
+//	    statement case) records this; the read side never classifies an end by
+//	    ended_reason: TestP2ChangesPolicyEdits (b) reads this same replacement
+//	    as statement_replaced with the old grant's grant_ended, from lifecycle
+//	    events and grant periods.
 //
 // Safeguard (mutation-checked): statements are keyed by Sid or content, never
 // by position (StatementKey) -- index-keyed, the reorder moves ids between
@@ -224,7 +233,13 @@ func TestP2BdbStatementIdentity(t *testing.T) {
 			t.Errorf("the edited Sid-less statement = %+v, want %s retired unsupported", old, ids["s3:GetObjectTagging"])
 		}
 		if old.Grant == nil || *old.GrantState != models.RelEnded || *old.GrantReason != models.EndedNotSeen {
-			t.Errorf("its grant = %v (%v, %v), want ended not_seen", old.Grant, old.GrantState, old.GrantReason)
+			t.Errorf("its grant = %v (%v, %v), want ended not_seen (D-67, statement case)", old.Grant, old.GrantState, old.GrantReason)
+		}
+		// The retirement the Changes view reads, whatever ended_reason says.
+		if n := l.count(`SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ? AND scan_run_id = ?
+		                  AND entitlement_id = ? AND event = 'retired' AND reason = ?`,
+			l.ws, run.ID, old.ID, models.RetiredUnsupported); n != 1 {
+			t.Errorf("'retired' (unsupported) lifecycle events for the replaced statement in this run = %d, want 1", n)
 		}
 		if st := l.supportOf("entitlement_id", old.ID)[a.conn]; st != models.RelEnded {
 			t.Errorf("its support = %q, want ended", st)

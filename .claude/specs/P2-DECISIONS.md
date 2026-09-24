@@ -526,11 +526,19 @@ defect that should be fixed in the spec itself.
   `iga_entitlement_target` (032/036 define three). A target's facts come from its
   statement's policy-version observation. *Raise:* §4.8 and the T4.9 gate expect
   target evidence.
-- **D-67 Policy retired vs not_seen.** Reconciliation ends edge partitions
-  `not_seen` before `retireUnsupported` runs, so a retired policy's assignments
-  end `not_seen`, not `policy_retired`. The read side (Changes) never relies on
-  `ended_reason` to classify an end; it uses lifecycle events and assignment
-  periods. *Raise:* the T5.2 gate wording.
+- **D-67 Policy or statement retired vs not_seen.** Reconciliation ends edge
+  partitions `not_seen` before `retireUnsupported` runs (§4.10's own
+  `Reconcile`), so a retired policy's assignments end `not_seen`, not
+  `policy_retired`. *Statement case (added in the m1/bdb review):* the same
+  holds for the grants of a Sid-less statement that was edited (replaced) —
+  they end `not_seen`, not the `statement_retired` of §2.7 l.605 and the
+  cascade table (l.5241): the grant partition, read in full, closes them in
+  the pass before the statement retires. A cascade reason is written only
+  when the partition could not end the edge itself (P2-EVIDENCE §6.5). The
+  read side (Changes) never relies on `ended_reason` to classify an end; it
+  uses lifecycle events and assignment and grant periods (a replacement is
+  `statement_replaced`, D-27c). *Raise:* the T5.2 gate wording; §2.7's
+  Sid-less row and the cascade table.
 
 ## Added after the decisions audit (gaps no entry covered)
 
