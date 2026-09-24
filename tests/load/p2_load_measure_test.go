@@ -4,7 +4,7 @@ package load
 // the 10 000-workload fixture, through the real route table.
 //
 // Methodology (RESULTS.md repeats it):
-//   - sequential: one request at a time, one process, the machine otherwise idle;
+//   - sequential: one request at a time, one process;
 //   - warm cache: every read first makes each distinct request of its
 //     measured pass once, unrecorded, so the pages it touches are in
 //     PostgreSQL's buffers or the OS page cache -- §5.6 states steady-state
@@ -15,6 +15,13 @@ package load
 //     execution role, the "*" selector, the most-granted holder), because a
 //     p95 over typical objects says nothing about the one object every
 //     workload shares;
+//   - interleaved: iteration i of every read, then iteration i+1 of every
+//     read, round-robin. The machine this runs on is shared (other test
+//     suites use the same PostgreSQL server and CPUs), and a burst of outside
+//     load lasting a few seconds would otherwise land on the consecutive
+//     iterations of ONE read and decide its p95 alone; interleaved, it costs
+//     each read at most an iteration or two. A read's own slowness is on
+//     every one of its iterations either way;
 //   - the time is the whole request as the server sees it: routing, handler,
 //     every query of the §5.1 snapshot, and JSON rendering (httptest, no
 //     network);
@@ -132,14 +139,13 @@ func TestP2LoadTargets(t *testing.T) {
 		cases = keep
 		diagnostic = strings.TrimPrefix(diagnostic+"; "+loadOnlyEnv+"="+only+" measured only some reads", "; ")
 	}
-	var results []*loadResult
-	for _, c := range cases {
-		r := loadMeasure(env.api, c, n)
-		results = append(results, r)
+	results := loadMeasureAll(env.api, cases, n)
+	for i, r := range results {
+		c := r.c
 		t.Logf("%-18s %-58s p50 %7.1f  p95 %7.1f  max %7.1f ms  (%d statements, COUNT %6.1f, slowest %6.1f)", c.rows[0], c.name,
 			loadMS(r.p50), loadMS(r.p95), loadMS(r.max), len(r.statements), loadMS(r.counts), loadMS(r.slowestMS()))
 		if dir := os.Getenv(loadSQLDirEnv); dir != "" {
-			if err := loadWriteStatements(dir, len(results), r); err != nil {
+			if err := loadWriteStatements(dir, i+1, r); err != nil {
 				t.Errorf("write the statements of %s: %v", c.name, err)
 			}
 		}
@@ -192,61 +198,86 @@ func loadVerdict(r *loadResult) []string {
 // the run.
 const loadTraceIterations = 10
 
-// loadMeasure runs one read: a warm pass over every distinct request the
-// measured pass will make, the measured pass, then a short traced pass for
-// the statement breakdown (tracing renders every statement's SQL, so it is
-// never timed).
+// loadMeasure measures one read (loadMeasureAll of one case).
 func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
-	r := &loadResult{c: c, n: n}
-	fail := func(i int, path, msg string) {
+	return loadMeasureAll(api, []loadCase{c}, n)[0]
+}
+
+// loadMeasureAll runs the reads: a warm pass over every distinct request each
+// read's measured pass will make, the measured passes interleaved round-robin
+// (iteration i of every read before iteration i+1 of any), then a short traced
+// pass per read for the statement breakdown (tracing renders every
+// statement's SQL, so it is never timed).
+func loadMeasureAll(api *loadAPI, cases []loadCase, n int) []*loadResult {
+	rs := make([]*loadResult, len(cases))
+	times := make([][]time.Duration, len(cases))
+	for k, c := range cases {
+		rs[k] = &loadResult{c: c, n: n}
+		times[k] = make([]time.Duration, n)
+	}
+	// Warm: each distinct request once (at least three requests), so every
+	// page the measured pass touches is already cached.
+	for k, c := range cases {
+		warmed, made := map[string]bool{}, 0
+		for i := 0; i < n; i++ {
+			path := c.path(i)
+			if warmed[path] && made >= 3 {
+				continue
+			}
+			warmed[path] = true
+			made++
+			code, raw, _ := api.get(path)
+			rs[k].check(i, path, code, raw)
+		}
+	}
+	for i := 0; i < n; i++ {
+		for k, c := range cases {
+			path := c.path(i)
+			code, raw, d := api.get(path)
+			times[k][i] = d
+			rs[k].check(i, path, code, raw)
+		}
+	}
+	for k, r := range rs {
+		ts := times[k]
+		sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
+		r.p50, r.p95, r.max = loadRank(ts, 0.50), loadRank(ts, 0.95), ts[n-1]
+		r.trace(api)
+	}
+	return rs
+}
+
+// check records a response that is not an honest answer: a non-200, a body
+// that is not JSON, or a timed-out optional piece (loadHonest). At most five
+// are kept.
+func (r *loadResult) check(i int, path string, code int, raw []byte) {
+	fail := func(msg string) {
 		if len(r.fails) < 5 {
 			r.fails = append(r.fails, fmt.Sprintf("iteration %d, GET %s: %s", i, path, msg))
 		}
 	}
-	check := func(i int, path string, code int, raw []byte) {
-		if code != 200 {
-			fail(i, path, fmt.Sprintf("status %d: %s", code, loadClip(raw)))
-			return
-		}
-		var body map[string]any
-		if err := json.Unmarshal(raw, &body); err != nil {
-			fail(i, path, "body is not JSON")
-			return
-		}
-		for _, p := range loadHonest(body) {
-			fail(i, path, p)
-		}
+	if code != 200 {
+		fail(fmt.Sprintf("status %d: %s", code, loadClip(raw)))
+		return
 	}
-	// Warm: each distinct request once (at least three requests), so every
-	// page the measured pass touches is already cached.
-	warmed, made := map[string]bool{}, 0
-	for i := 0; i < n; i++ {
-		path := c.path(i)
-		if warmed[path] && made >= 3 {
-			continue
-		}
-		warmed[path] = true
-		made++
-		code, raw, _ := api.get(path)
-		check(i, path, code, raw)
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		fail("body is not JSON")
+		return
 	}
-	times := make([]time.Duration, n)
-	for i := 0; i < n; i++ {
-		path := c.path(i)
-		code, raw, d := api.get(path)
-		times[i] = d
-		check(i, path, code, raw)
+	for _, p := range loadHonest(body) {
+		fail(p)
 	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-	r.p50, r.p95, r.max = loadRank(times, 0.50), loadRank(times, 0.95), times[n-1]
+}
 
-	// The traced pass: which statements the time goes to, and how much of it
-	// is the optional COUNT work (totals and facets).
+// trace is the traced pass: which statements the read's time goes to, and
+// how much of it is the optional COUNT work (totals and facets).
+func (r *loadResult) trace(api *loadAPI) {
 	var counted []time.Duration
 	byText := map[string]time.Duration{}
-	for i := 0; i < n && i < loadTraceIterations; i++ {
+	for i := 0; i < r.n && i < loadTraceIterations; i++ {
 		loadTracer.start()
-		api.get(c.path(i))
+		api.get(r.c.path(i))
 		stmts := loadTracer.stop()
 		if i == 0 {
 			r.statements = stmts
@@ -271,7 +302,6 @@ func loadMeasure(api *loadAPI, c loadCase, n int) *loadResult {
 	if len(r.slowest) > 3 {
 		r.slowest = r.slowest[:3]
 	}
-	return r
 }
 
 // slowestMS is the slowest traced statement's time (0 when none ran).
@@ -654,7 +684,7 @@ func loadReport(env *loadEnv, results []*loadResult, n int, diagnostic string) s
 	if diagnostic != "" {
 		fmt.Fprintf(&b, "DIAGNOSTIC RUN (%s): not a §5.6 measurement.\n\n", diagnostic)
 	}
-	fmt.Fprintf(&b, "Fixture: %d rows (main workspace %d active workloads), %d measured iterations per read, sequential, warm.\n\n",
+	fmt.Fprintf(&b, "Fixture: %d rows (main workspace %d active workloads), %d measured iterations per read, sequential, warm, interleaved round-robin.\n\n",
 		env.rows, env.main.h.activeWL, n)
 	for _, row := range []string{loadRowLists, loadRowTotals, loadRowDetail, loadRowGraph, loadRowEvid, loadRowChanges} {
 		target := loadTargets[row]

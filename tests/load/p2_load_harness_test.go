@@ -177,3 +177,31 @@ func TestP2LoadVerdictJudgesEveryRow(t *testing.T) {
 		t.Errorf("a 5 ms read against a 1 ms target: %v, want one miss", v)
 	}
 }
+
+// TestP2LoadInterleaves: after each read's warm pass, the measured passes run
+// round-robin -- iteration i of every read before iteration i+1 of any -- so a
+// burst of outside load is shared by every read instead of deciding one
+// read's p95 (the methodology RESULTS.md states).
+func TestP2LoadInterleaves(t *testing.T) {
+	gin.SetMode(gin.ReleaseMode)
+	eng := gin.New()
+	var seen []string
+	eng.NoRoute(func(c *gin.Context) {
+		seen = append(seen, strings.TrimPrefix(c.Request.URL.RequestURI(), "/api/iga/v1"))
+		c.Data(http.StatusOK, "application/json", []byte(`{"data":{},"meta":{}}`))
+	})
+	api := &loadAPI{eng: eng}
+	mk := func(name string) loadCase {
+		return loadCase{rows: []string{loadRowDetail}, name: name,
+			path: func(i int) string { return "/" + name + "?i=" + string(rune('0'+i)) }}
+	}
+	loadMeasureAll(api, []loadCase{mk("a"), mk("b")}, 3)
+	// warm (a0 a1 a2, b0 b1 b2), measured, then traced (a0 a1 a2, b0 b1 b2).
+	if len(seen) != 18 {
+		t.Fatalf("%d requests, want 18: %v", len(seen), seen)
+	}
+	want := []string{"/a?i=0", "/b?i=0", "/a?i=1", "/b?i=1", "/a?i=2", "/b?i=2"}
+	if got := seen[6:12]; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("measured order %v, want round-robin %v", got, want)
+	}
+}
