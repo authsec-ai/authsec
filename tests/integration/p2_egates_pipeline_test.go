@@ -8,12 +8,16 @@ package integration
 // asserted at each step.
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -249,7 +253,10 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 //     the run without intervention, and the dead worker's fence refuses a
 //     write it attempts afterwards;
 //  2. a projector dies mid-projection (its graph transaction never
-//     committed, so it wrote nothing): the job is reclaimed and completes;
+//     committed, so it wrote nothing): the job is reclaimed, and when the
+//     first projector wakes and runs its pass on the lease it claimed, the
+//     real fencing repositories refuse it inside its graph transaction and it
+//     writes nothing; the job then completes;
 //  3. a projector dies after its commit and before completing the job: the
 //     replay completes, publishing nothing twice.
 //
@@ -327,13 +334,24 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 		t.Errorf("pipeline while the dead projector holds the job = %s", egatesJSON(acc))
 	}
 	egatesNotPublished(t, api, "/workloads")
+	// Its lease runs out and a second projector reclaims the job -- a new
+	// lease version on the same job, so the barrier (held by the JOB, §2.10A)
+	// still admits it. Before that one commits, the first wakes and runs its
+	// pass on the lease it claimed: only the job lease can refuse it.
 	l.db.Exec(`UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
-	l.project("egates-reclaiming-projector") // completes on its first pass
+	reclaimed, err := jobs.Claim("egates-reclaiming-projector", time.Minute, time.Now())
+	if err != nil || reclaimed == nil || reclaimed.ID != job.ID || reclaimed.LeaseVersion == job.LeaseVersion {
+		t.Fatalf("reclaim of job %s: %+v %v, want the same job under a new lease", job.ID, reclaimed, err)
+	}
+	egatesSupersededProjection(t, l, job, "egates-dead-projector")
+	// The reclaiming projector dies too; the next one completes, first pass.
+	l.db.Exec(`UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
+	l.project("egates-final-projector")
 	pub := egatesPublicationOf(t, l, queued.ID)
 	acc = s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
 	if pub.Rev != 1 || digs(acc, "state") != "published" || num(acc, "projection", "rev") != 1 ||
-		num(acc, "projection", "attempts") != 2 {
-		t.Errorf("after the reclaimed projection: rev %d, pipeline %s; want published at rev 1 on attempt 2",
+		num(acc, "projection", "attempts") != 3 {
+		t.Errorf("after the reclaimed projection: rev %d, pipeline %s; want published at rev 1 on attempt 3",
 			pub.Rev, egatesJSON(acc))
 	}
 	if body := egatesGet(t, api, "/workloads"); num(body, "meta", "rev") != 1 || len(digl(body, "data")) != 7 {
@@ -396,5 +414,68 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	}
 	if st := l.barrier(); st != models.PipelineIdle {
 		t.Errorf("barrier = %s, want idle", st)
+	}
+}
+
+// egatesFencer binds the two ownership proofs exactly as the projection
+// service's own fencer does (services.projectionFencer, unexported): the job
+// lease and the workspace barrier, each asserted by the REAL repositories
+// inside the graph transaction. The graph suite stubs this with okFencer; here
+// nothing is stubbed.
+type egatesFencer struct {
+	jobs     repositories.IGAProjectionJobRepository
+	pipeline repositories.IGAPipelineLeaseRepository
+	jobID    uuid.UUID
+}
+
+func (f egatesFencer) AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, v int64) error {
+	return f.jobs.AssertOwnedTx(tx, jobID, owner, v)
+}
+
+func (f egatesFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version int64) error {
+	return f.pipeline.AssertHeldTx(tx, repositories.PipelineFence{
+		WorkspaceID: ws, Phase: models.PipelineProjecting, RunID: runID, Version: version,
+		Holder: models.PipelineJobHolder(f.jobID),
+	})
+}
+
+// egatesSupersededProjection runs one projection pass of job as owner, on the
+// lease version owner claimed -- which another projector has since
+// superseded -- and asserts it is refused inside its graph transaction with
+// the projection lease lost, and that nothing it would have written landed:
+// no graph row, no publication, no lifecycle event.
+func egatesSupersededProjection(t *testing.T, l *p2Lab, job *models.IGAProjectionJob, owner string) {
+	t.Helper()
+	ctx := context.Background()
+	leases := repositories.NewIGAPipelineLeaseRepository(l.db)
+	lease, err := leases.Get(l.ws)
+	if err != nil {
+		t.Fatalf("read the barrier: %v", err)
+	}
+	snap, err := igagraph.Load(ctx, l.db, job.ScanRunID)
+	if err != nil {
+		t.Fatalf("load run %s: %v", job.ScanRunID, err)
+	}
+	ex, err := igagraph.LoadExisting(ctx, l.db, l.ws)
+	if err != nil {
+		t.Fatalf("load existing: %v", err)
+	}
+	fencer := egatesFencer{jobs: repositories.NewIGAProjectionJobRepository(l.db), pipeline: leases, jobID: job.ID}
+	p := igagraph.NewProjector(repositories.NewIGAGraphRepository(), fencer, ex,
+		job.ID, owner, job.LeaseVersion, lease.Version, time.Now, igagraph.LastGenerationFor)
+	shape := len(l.shape())
+	count := func() int64 {
+		return l.count(`SELECT (SELECT count(*) FROM iga_publication WHERE workspace_id = ?)
+		                     + (SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ?)
+		                     + (SELECT count(*) FROM iga_object_support WHERE workspace_id = ?)`, l.ws, l.ws, l.ws)
+	}
+	before := count()
+	err = l.db.Transaction(func(tx *gorm.DB) error { return p.Project(tx, snap) })
+	if !errors.Is(err, repositories.ErrProjectionLeaseLost) {
+		t.Errorf("a superseded projector's pass = %v, want %v", err, repositories.ErrProjectionLeaseLost)
+	}
+	if n := len(l.shape()); n != shape || count() != before {
+		t.Errorf("a superseded projector wrote: graph rows %d -> %d, publications+events+support %d -> %d",
+			shape, n, before, count())
 	}
 }

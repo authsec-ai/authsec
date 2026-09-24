@@ -378,7 +378,7 @@ func TestP2EgatesE8ReplaceRoleAndPolicy(t *testing.T) {
 	a := egatesProduction(t, l)
 	a.iam.inlineRolePolicies[egatesSharedRole] = map[string]string{"ToolsInline": evidenceDoc(
 		`{"Sid":"ReadArchive","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::ticket-archive/*"}`)}
-	egatesCycle(l, a)
+	pub0 := egatesPublicationOf(t, l, egatesCycle(l, a).ID)
 	api := l.api()
 	w := egatesWorkload(t, l, "ticket-tools", accountA)
 	oldRole := egatesIdentity(t, l, egatesSharedRole)
@@ -482,9 +482,13 @@ func TestP2EgatesE8ReplaceRoleAndPolicy(t *testing.T) {
 	// API: the old role readable, retired; the new one current; the workload
 	// runs as the new one; no old history on the new.
 	od := egatesGet(t, api, egatesRoute(t, oldRole))
+	// §5.2 "Retired objects": lifecycle, retired_reason and last_confirmed_at
+	// -- the last pass that saw the OLD role (the first), never the
+	// recreation's.
 	if digs(od, "data", "lifecycle") != models.IGALifecycleRetired || digs(od, "data", "retired_reason") != models.RetiredRecreated ||
-		digs(od, "data", "ref") != oldRole {
-		t.Errorf("(a) GET old role = %s, want it readable, retired recreated", egatesJSON(dig(od, "data")))
+		digs(od, "data", "ref") != oldRole || digs(od, "data", "last_confirmed_at") != s2TS(&pub0.PublishedAt) {
+		t.Errorf("(a) GET old role = %s, want it readable, retired recreated, last confirmed at %s",
+			egatesJSON(dig(od, "data")), s2TS(&pub0.PublishedAt))
 	}
 	nd := egatesGet(t, api, egatesRoute(t, newRole))
 	if digs(nd, "data", "lifecycle") != models.IGALifecycleActive || digs(nd, "data", "state") != models.RelCurrent ||
