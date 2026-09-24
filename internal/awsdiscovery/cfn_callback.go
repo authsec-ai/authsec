@@ -173,9 +173,16 @@ func ParseTopicARN(arn string) (partition, region string, err error) {
 // matches no form is not contacted: it lands in the DLQ with an alarm, and the
 // form is added here together with its fixture after review.
 //
-// Known so far: the form in AWS's own Lambda/CloudFormation documentation
-// (us-west-2). The spike adds the forms observed in us-east-1 and ap-south-1.
+// Known so far:
+//   - `.s3.{region}.` — captured live in ap-south-1 (2026-09-24). This is what
+//     CloudFormation sends today.
+//   - `.s3-{region}.` — the legacy form in AWS's own Lambda/CloudFormation
+//     documentation example (us-west-2). Kept because AWS documents it, not
+//     because it has been seen live.
 var responseHostForms = []func(region, compact string) string{
+	func(region, compact string) string {
+		return "cloudformation-custom-resource-response-" + compact + ".s3." + region + ".amazonaws.com"
+	},
 	func(region, compact string) string {
 		return "cloudformation-custom-resource-response-" + compact + ".s3-" + region + ".amazonaws.com"
 	},

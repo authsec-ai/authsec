@@ -176,7 +176,7 @@ func TestResponseURLRejections(t *testing.T) {
 		"port":              "https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com:8443/obj?X-Amz-Signature=abc",
 		"no signature":      "https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com/obj",
 		"no path":           "https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com/?X-Amz-Signature=abc",
-		"unobserved form":   "https://cloudformation-custom-resource-response-uswest2.s3.us-west-2.amazonaws.com/obj?X-Amz-Signature=abc",
+		"unobserved form":   "https://cloudformation-custom-resource-response-uswest2.s3.amazonaws.com/obj?X-Amz-Signature=abc",
 		"arbitrary host":    "https://example.com/obj?X-Amz-Signature=abc",
 		"internal metadata": "https://169.254.169.254/latest?X-Amz-Signature=abc",
 	}
