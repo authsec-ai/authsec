@@ -120,8 +120,9 @@ type CoverageSurface struct {
 	// read), shown as written -- never parsed.
 	Error any `json:"error"`
 	// Items is the per-document detail of a policy_documents surface, stamped
-	// at collection (D-71): [{policy, version, error}], bounded, with
-	// Truncated when the bound bit. null for a run collected without it.
+	// at collection (D-71, D-95): [{policy, version, error, api, error_code}],
+	// bounded, with Truncated when the bound bit. null for a run collected
+	// without it.
 	Items     []CoverageItem `json:"items"`
 	Truncated bool           `json:"truncated"`
 	Since     any            `json:"since"`
@@ -139,8 +140,8 @@ type CoverageSurface struct {
 
 // CoverageItem is one unreadable document of a policy_documents surface
 // (D-71). Only these fields are rendered, whatever else was stored. api and
-// error_code (additive to D-71's {policy, version, error}) are the call that
-// failed and AWS's code as collection stamped them on the item
+// error_code (D-95, additive to D-71's {policy, version, error}) are the call
+// that failed and AWS's code as collection stamped them on the item
 // (models.CoverageItem) -- null for a document that failed on no call (it was
 // read and did not parse) and for a run collected before they existed. Never
 // parsed out of error.

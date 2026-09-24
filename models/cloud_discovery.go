@@ -386,8 +386,8 @@ type SurfaceCoverage struct {
 // Error is the reason recorded on its row (cloud_policy.document_error or
 // cloud_identity.trust_parse_error) as collection wrote it.
 //
-// API and ErrorCode are Error's structured half, additive to D-71's {policy,
-// version, error}: the call whose failure left the document unread
+// API and ErrorCode are Error's structured half (D-95), additive to D-71's
+// {policy, version, error}: the call whose failure left the document unread
 // ("iam:GetPolicyVersion") and the code AWS returned ("AccessDenied"), stamped
 // from the failed call itself (awsdiscovery.AttachedPolicy.FetchAPI/FetchCode)
 // -- so each document names its own call even when several failed on

@@ -139,7 +139,9 @@ func egatesNoGuessedPermission(t *testing.T, what string, v any) {
 //
 // Safeguards (mutation-checked): an edge partition whose required surface was
 // not reached is never ended (canEnd); a stale row's last_confirmed_at is not
-// moved by a run that could not read it.
+// moved by a run that could not read it; every partition that requires an IAM
+// surface goes stale -- executes_as, can_assume and task_execution_role edges
+// and resource support included, not only the six kinds once listed.
 func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e9a", true)
 	a := egatesProduction(t, l)
@@ -402,7 +404,9 @@ const egatesAWSManaged = "arn:aws:iam::aws:policy/SupportTicketsReadOnly"
 //
 // Safeguards (mutation-checked): one unreadable document keeps its own
 // partition stale without vetoing the account (a detach in the same run still
-// ends).
+// ends); its /coverage item names the refused call and AWS's code from the
+// failed call itself, recorded at the fetch, stamped at collection and
+// rendered by /coverage (D-95).
 func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e9b", true)
 	a := egatesProduction(t, l)

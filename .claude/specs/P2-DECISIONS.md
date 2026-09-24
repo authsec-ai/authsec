@@ -678,3 +678,43 @@ defect that should be fixed in the spec itself.
   error code (AccessDenied, OptInRequired, SubscriptionRequired stay `denied`).
   `resource_policies`: all reads succeed → reached; some fail → partial (count =
   failures); all fail → denied; `NoSuchBucketPolicy` is a successful read.
+
+## Added in the M1 E-gates review
+
+- **D-94 A resolution the walk does not follow (§5.4, §2.12).** An external
+  principal's resolution in force (034 `resolution_state = 'active'`) is shown
+  on its node (D-87) and never walked: the principal is terminal (§5.4). On
+  `/graph`, `truncated` names only a budget that bound — `nodes | edges |
+  assume_hops | time` (§5.4 "Continuation"; the §5.3 example has `truncated:
+  null` beside a non-empty frontier) — so an unfollowed resolution never sets
+  it. The additive `data.resolution_not_followed` says it instead: `true` when
+  the walk passed one (a principal it holds whose resolved node it does not
+  hold; forward only, also a node it holds that a principal it does not hold
+  resolves to, when that principal has `can_assume` edges); `false` when it
+  passed none; `null` when that was not established (the time budget bound
+  first; a check that runs out of the request's time sets `truncated: time`,
+  as D-40's levels do). It speaks of the nodes the response holds.
+  `/graph/path` keeps `not_found_within_budget` with `bound_by:
+  "resolution_not_followed"` (or `more_paths` with it on a found list) when
+  the search passed such a resolution linking its two sides: `none_exists`
+  would claim more than was searched. *Raise:* §5.4's outcome table has no
+  value for "a path may run through a resolution that was not followed", and
+  its `bound_by` names only budgets; and §2.12 ("no path is drawn through
+  [suspended / pending_reconfirmation] as current") implies a path MAY be drawn
+  through an active resolution, while §5.4 makes every external principal
+  terminal. Either add the value to §5.4's vocabulary or decide that the
+  traversal follows resolutions in force.
+- **D-95 Coverage items name their failed call (D-71 extended).** A
+  `policy_documents` item is `{policy, version, error, api, error_code}`:
+  `api` and `error_code` are the call whose failure left the document unread
+  and the code AWS returned, stamped at collection from the failed call itself
+  (`awsdiscovery.APICallError` → `AttachedPolicy.FetchAPI` / `FetchCode` →
+  `models.CoverageItem`), never parsed from `error` (D-71). They are `null` for
+  a document that failed on no call (read and did not parse, D-49; listed
+  without its document) and for runs collected before the fields existed. The
+  surface's own `api` / `error_code` stay `null`: the surface is `partial`,
+  never refused as a whole, and its documents may fail on different calls, or
+  on none. *Why:* E9 ("coverage names the failed call") needs a structured
+  field, and one `api` per surface is ambiguous when two documents fail on
+  different calls. *Raise:* D-71 lists items as `{policy, version, error}`
+  only.

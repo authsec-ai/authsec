@@ -460,6 +460,10 @@ func egatesAWSRows(t *testing.T, l *p2Lab) string {
 	return strings.Join(rows, "\n")
 }
 
+// egatesAWSNamedSighting is E16's Kubernetes sighting named like an AWS
+// workload: A's refund-tools Lambda, the only AWS workload of that name.
+const egatesAWSNamedSighting = "refund-tools"
+
 // E16. A workspace with the existing GitHub integration AND the §7.1 AWS lab,
 // beside a control workspace with the same GitHub integration only. The
 // GitHub scan runs before and after the AWS scans and projections. Database:
@@ -476,7 +480,9 @@ func egatesAWSRows(t *testing.T, l *p2Lab) string {
 // with and without AWS in the workspace -- and the console pages.
 //
 // Safeguards (mutation-checked): the GitHub readers filter provider =
-// 'github'; the GitHub writer stamps it.
+// 'github'; the GitHub writer stamps it; the Kubernetes bridge proposes a
+// link only to a canonical iga_agents row, and does propose one (the
+// positive control).
 func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	mixed := newP2Lab(t, "p2-egates-e16-mixed", true)
 	control := newWorkspace(t, mixed.db, "p2-egates-e16-control")
@@ -512,6 +518,77 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	if got := egatesGitHubRows(t, mixed, mixed.ws); got != ghBefore {
 		t.Errorf("the AWS scans and projections changed GitHub rows:\nbefore %s\nafter  %s", ghBefore, got)
 	}
+	// The Kubernetes bridge, with the AWS lab in the workspace: a sighting
+	// named like an AWS workload is never proposed a link to it -- AWS
+	// workloads are not canonical agents. The lab has no cluster, so each
+	// sighting enters through the k8s webhook's own write path
+	// (DiscoveryManager.ReportSighting, source k8s_webhook), which runs the
+	// REAL bridge on a first sighting.
+	//
+	// Positive control, in BOTH workspaces: a sighting named like the
+	// workspace's GitHub agent IS proposed a link to that iga_agents row --
+	// weak, awaiting a person -- so "nothing proposed" is the bridge refusing
+	// an AWS name, not a bridge that proposes nothing at all. It runs before
+	// the GitHub rescan: Phase 1 confirms its agent again as a NEW iga_agents
+	// row on every scan, and the bridge proposes nothing on a name two active
+	// agents share, by design. Each workspace gets the same two sightings
+	// (same names and fingerprints), so the Discovered Agents routes compared
+	// below still compare like with like.
+	disc := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(mixed.db))
+	bridge := services.NewIGABridgeManager(mixed.db)
+	sight := func(ws uuid.UUID, name string) uuid.UUID {
+		t.Helper()
+		agent, created, err := disc.ReportSighting(ws, "egates-k8s-webhook", services.SightingInput{
+			Source: models.DiscoverySourceK8sWebhook, Fingerprint: "fp-egates-" + name, DisplayName: name,
+		})
+		if err != nil || agent == nil || !created {
+			t.Fatalf("the k8s webhook's sighting %q in %s: %+v created=%v (%v)", name, ws, agent, created, err)
+		}
+		t.Cleanup(func() {
+			mixed.db.Exec(`DELETE FROM discovered_agent_iga_links WHERE discovered_agent_id = ?`, agent.ID)
+			mixed.db.Exec(`DELETE FROM discovered_agents WHERE id = ?`, agent.ID)
+		})
+		return agent.ID
+	}
+	if n := mixed.count(`SELECT count(*) FROM iga_workload WHERE workspace_id = ? AND display_name = ?`,
+		mixed.ws, egatesAWSNamedSighting); n != 1 {
+		t.Fatalf("setup: %d AWS workloads named %s, want exactly one for the bridge to refuse", n, egatesAWSNamedSighting)
+	}
+	matched, sightings := map[uuid.UUID]uuid.UUID{}, map[uuid.UUID]uuid.UUID{}
+	for _, ws := range []uuid.UUID{mixed.ws, control} {
+		// The workspace's one GitHub agent (the only active iga_agents row,
+		// before the rescan confirms it again).
+		var agents []struct {
+			ID          uuid.UUID
+			DisplayName string
+		}
+		if err := mixed.db.Raw(`SELECT id, display_name FROM iga_agents WHERE workspace_id = ? AND lifecycle = 'active'`, ws).
+			Scan(&agents).Error; err != nil || len(agents) != 1 || agents[0].DisplayName == "" {
+			t.Fatalf("setup: workspace %s active GitHub agents = %+v (%v), want exactly one, named", ws, agents, err)
+		}
+		matched[ws] = sight(ws, agents[0].DisplayName)
+		link, err := bridge.GetLink(ws, matched[ws])
+		if err != nil || link == nil || link.IGAAgentID != agents[0].ID || link.State != models.IGALinkProposed ||
+			link.Strength != models.IGALinkWeak {
+			t.Errorf("positive control, workspace %s: a sighting named %q was proposed %+v (%v), want a weak proposal to iga_agents %s",
+				ws, agents[0].DisplayName, link, err, agents[0].ID)
+		}
+		// ... and a sighting named like A's refund-tools Lambda -- the ONE
+		// AWS workload of that name, so a bridge that matched AWS workloads
+		// would find it unambiguous and propose it: nothing, in the
+		// workspace that holds that workload and in the one that does not.
+		sightings[ws] = sight(ws, egatesAWSNamedSighting)
+		if link, err := bridge.GetLink(ws, sightings[ws]); err != nil || link != nil {
+			t.Errorf("workspace %s: the webhook's sighting named like an AWS workload was proposed %+v (%v), want nothing", ws, link, err)
+		}
+		if link, err := bridge.ProposeForAgent(ws, sightings[ws]); err != nil || link != nil {
+			t.Errorf("workspace %s: the bridge proposed %+v (%v) for a sighting named like an AWS workload, want nothing", ws, link, err)
+		}
+		if n := mixed.count(`SELECT count(*) FROM discovered_agent_iga_links WHERE workspace_id = ?`, ws); n != 1 {
+			t.Errorf("workspace %s: %d bridge links, want only the positive control's", ws, n)
+		}
+	}
+
 	awsBefore := egatesAWSRows(t, mixed)
 	githubScan(mixed.ws)
 	githubScan(control)
@@ -643,26 +720,20 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 		t.Errorf("GET …/access-paths = %s, want the GitHub agent's access summary", egatesJSON(body))
 	}
 
-	// The Kubernetes bridge: a sighting named like an AWS workload is never
-	// proposed a link to it -- AWS workloads are not canonical agents. The
-	// lab has no Kubernetes collector, so the sighting is inserted as the
-	// k8s webhook writes it (source k8s_webhook), and the REAL bridge runs
-	// over it.
-	sighting := uuid.New()
-	if err := mixed.db.Exec(`INSERT INTO discovered_agents (id, workspace_id, source, fingerprint, display_name)
-	                         VALUES (?, ?, 'k8s_webhook', ?, 'ticket-tools')`, sighting, mixed.ws, "fp-egates-"+sighting.String()[:8]).Error; err != nil {
-		t.Fatalf("seed a sighting: %v", err)
+	// Discovered Agents lists exactly the two sightings -- and no AWS
+	// workload -- and after the GitHub rescan the AWS-named one is still
+	// proposed nothing.
+	_, listing := egatesCall(t, eng, mixed.ws, "/authsec/discovery/agents")
+	listed := map[string]bool{}
+	for _, row := range digl(listing, "agents") {
+		listed[digs(row, "id")] = true
 	}
-	t.Cleanup(func() {
-		mixed.db.Exec(`DELETE FROM discovered_agent_iga_links WHERE discovered_agent_id = ?`, sighting)
-		mixed.db.Exec(`DELETE FROM discovered_agents WHERE id = ?`, sighting)
-	})
-	if link, err := services.NewIGABridgeManager(mixed.db).ProposeForAgent(mixed.ws, sighting); err != nil || link != nil {
-		t.Errorf("the bridge proposed %+v (%v) for a sighting named like an AWS workload, want nothing", link, err)
+	if strings.Contains(egatesJSON(listing), accountA) || strings.Contains(egatesJSON(listing), "arn:aws:") ||
+		num(listing, "total") != 2 || !listed[matched[mixed.ws].String()] || !listed[sightings[mixed.ws].String()] {
+		t.Errorf("/discovery/agents = %s, want the two sightings and no AWS workload", egatesJSON(listing))
 	}
-	if _, body := egatesCall(t, eng, mixed.ws, "/authsec/discovery/agents"); strings.Contains(egatesJSON(body), accountA) ||
-		num(body, "total") != 1 {
-		t.Errorf("/discovery/agents = %s, want the one sighting and no AWS workload", egatesJSON(body))
+	if link, err := bridge.ProposeForAgent(mixed.ws, sightings[mixed.ws]); err != nil || link != nil {
+		t.Errorf("after the GitHub rescan the bridge proposed %+v (%v) for the AWS-named sighting, want nothing", link, err)
 	}
 
 	// Cloud Inventory rows link to THEIR graph object: A's and B's

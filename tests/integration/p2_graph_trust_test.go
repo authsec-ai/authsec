@@ -233,8 +233,9 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	}
 	// Unresolved principals are the end of what can be read: nothing was
 	// left unfollowed, so the walk is complete.
-	if dig(body, "data", "truncated") != nil {
-		t.Errorf("reverse from partner-access: truncated = %v, want null (no resolution in force)", dig(body, "data", "truncated"))
+	if dig(body, "data", "truncated") != nil || dig(body, "data", "resolution_not_followed") != false {
+		t.Errorf("reverse from partner-access: truncated = %v, resolution_not_followed = %v, want null and false (no resolution in force)",
+			dig(body, "data", "truncated"), dig(body, "data", "resolution_not_followed"))
 	}
 	labels := []string{digs(nodes[edges[0].From], "label"), digs(nodes[edges[1].From], "label")}
 	if !(labels[0] == trustAccountC || labels[1] == trustAccountC) {
@@ -277,8 +278,11 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	}
 	// ...so what reaches data-reader was not walked, and the answer to "what
 	// reaches reader-access" is not complete: it must not read as complete.
-	if digs(rev, "data", "truncated", "bound_by") != "resolution_not_followed" {
-		t.Errorf("reverse from reader-access: truncated = %v, want bound_by resolution_not_followed", dig(rev, "data", "truncated"))
+	// No budget bound, so it is not truncated (§5.4): it says so in
+	// resolution_not_followed (D-94).
+	if dig(rev, "data", "truncated") != nil || dig(rev, "data", "resolution_not_followed") != true {
+		t.Errorf("reverse from reader-access: truncated = %v, resolution_not_followed = %v, want null and true",
+			dig(rev, "data", "truncated"), dig(rev, "data", "resolution_not_followed"))
 	}
 	fwd := graphGet(t, api, "/graph"+qs("root", reader, "direction", "forward"))
 	if graphNodes(t, digl(fwd, "data", "nodes"))[access] != nil {
@@ -287,8 +291,9 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	// Forward from data-reader nothing bound -- but the principal that IS
 	// data-reader may assume reader-access, and the walk (which can never
 	// reach a principal) did not look: not complete, as /graph/path says.
-	if digs(fwd, "data", "truncated", "bound_by") != "resolution_not_followed" {
-		t.Errorf("forward from data-reader: truncated = %v, want bound_by resolution_not_followed", dig(fwd, "data", "truncated"))
+	if dig(fwd, "data", "truncated") != nil || dig(fwd, "data", "resolution_not_followed") != true {
+		t.Errorf("forward from data-reader: truncated = %v, resolution_not_followed = %v, want null and true",
+			dig(fwd, "data", "truncated"), dig(fwd, "data", "resolution_not_followed"))
 	}
 	// The path search did not look through the resolution, so it must not
 	// say none_exists: the trust names data-reader's exact ARN.
@@ -302,8 +307,8 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	extRef := digs(ext, "ref")
 	fromExt := graphGet(t, api, "/graph"+qs("root", extRef, "direction", "forward"))
 	if graphNodes(t, digl(fromExt, "data", "nodes"))[access] == nil ||
-		digs(fromExt, "data", "truncated", "bound_by") != "resolution_not_followed" {
-		t.Errorf("forward from the principal = %v, want reader-access, truncated resolution_not_followed", fromExt["data"])
+		dig(fromExt, "data", "truncated") != nil || dig(fromExt, "data", "resolution_not_followed") != true {
+		t.Errorf("forward from the principal = %v, want reader-access, not truncated, resolution_not_followed", fromExt["data"])
 	}
 	tickets := graphResource(t, l, "arn:aws:s3:::support-tickets/*")
 	p = graphGet(t, api, "/graph/path"+qs("from", extRef, "to", tickets))

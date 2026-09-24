@@ -9,8 +9,9 @@ package integration
 //
 // §7.1's lab holds nothing deeper than the display default of can_assume hops
 // (assume_hops 2, §5.4), so this scenario adds what "expand past the display
-// default" needs, in A: chain-1 may assume chain-2, chain-2 chain-3, chain-3
-// chain-4 (each trusts the one before).
+// default" and a path past the hard hop budget need, in A: chain-1 may assume
+// chain-2, chain-2 chain-3, and so on to chain-6 (each trusts the one before)
+// -- five can_assume hops end to end, one more than §5.4's per-request 4.
 
 import (
 	"strings"
@@ -20,10 +21,15 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
-// egatesChain adds E11's chain of four roles to A.
+// egatesChainLength is how many roles egatesChain adds: chain-1 to chain-6,
+// five hops, so the whole chain is one hop past the hard budget.
+const egatesChainLength = 6
+
+// egatesChain adds E11's chain of six roles to A.
 func egatesChain(a *egatesAcct) {
 	a.role("chain-1", "AROAEGATESCHAIN00001")
-	for i, id := range []string{"AROAEGATESCHAIN00002", "AROAEGATESCHAIN00003", "AROAEGATESCHAIN00004"} {
+	for i, id := range []string{"AROAEGATESCHAIN00002", "AROAEGATESCHAIN00003", "AROAEGATESCHAIN00004",
+		"AROAEGATESCHAIN00005", "AROAEGATESCHAIN00006"} {
 		prev := a.roleARN("chain-" + string(rune('1'+i)))
 		trustRole(a.p2Account, "chain-"+string(rune('2'+i)), id, trustDoc(trustAllow(`{"AWS":"`+prev+`"}`, "sts:AssumeRole")))
 	}
@@ -55,12 +61,16 @@ func egatesUsedByPrincipal(t *testing.T, api *readAPI, identity, kind string) ma
 // closes_cycle. Expand past the display default: the frontier counts what was
 // not walked (exact), and /graph/expand walks it. Search a path to an
 // unreachable resource: none_exists when nothing bound, and
-// not_found_within_budget -- never none_exists -- when a budget did; neither
-// claims a distance.
+// not_found_within_budget -- never none_exists -- when a budget did, through
+// the route under its own hard budgets (chain-1 to chain-6 is one can_assume
+// hop past them); none claims a distance. A walk past a resolution in force
+// it does not follow says so in resolution_not_followed, and is not
+// truncated: no budget bound (§5.4, D-94).
 //
 // Safeguards (mutation-checked): a node already on the walk is not expanded
 // again (a cycle never duplicates nodes); none_exists only when both
-// frontiers were exhausted before any budget bound (D-38).
+// frontiers were exhausted before any budget bound (D-38); /graph's
+// truncated names only a budget that bound (D-94).
 func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e11", true)
 	a := egatesProduction(t, l)
@@ -115,6 +125,12 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	if graphFrontier(rev, cRef, "can_assume") != nil {
 		t.Errorf("an external principal is terminal; frontier %s", egatesJSON(dig(rev, "data", "frontier")))
 	}
+	// C's principal is unresolved: nothing was left unfollowed, and the walk
+	// is complete -- the control for reader-access's below.
+	if dig(rev, "data", "truncated") != nil || dig(rev, "data", "resolution_not_followed") != false {
+		t.Errorf("partner-access reverse graph: truncated %s, resolution_not_followed %v, want null and false",
+			egatesJSON(dig(rev, "data", "truncated")), dig(rev, "data", "resolution_not_followed"))
+	}
 	// The GitHub OIDC trust: an oidc principal with the wildcard subject,
 	// unresolved as a wildcard, federated.
 	gha := egatesUsedByPrincipal(t, api, egatesIdentity(t, l, "gha-deploy"), models.ExternalPrincipalOIDC)
@@ -131,7 +147,10 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	}
 	// A's role trusting B's data-reader: A was projected first, so the trust
 	// names a principal; B's pass then RESOLVED it (derived, D-41) -- shown,
-	// never walked, and the edge crosses from B into A.
+	// never walked, and the edge crosses from B into A. What reaches
+	// data-reader was therefore not read: resolution_not_followed says so,
+	// and truncated stays null -- no budget bound (§5.4 "Continuation", the
+	// §5.3 Graph example; D-94).
 	access := egatesIdentity(t, l, "reader-access")
 	reader := egatesIdentity(t, l, "data-reader")
 	rg := egatesGet(t, api, "/graph"+qs("root", access, "direction", "reverse"))
@@ -145,7 +164,7 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	rn := graphNodes(t, digl(rg, "data", "nodes"))
 	if crossing == nil || !crossing.CrossesAccount || digs(rn[crossing.From], "account", "id") != accountB ||
 		digs(rn[crossing.From], "resolution", "resolved_to") != reader || rn[reader] != nil ||
-		digs(rg, "data", "truncated", "bound_by") != "resolution_not_followed" {
+		dig(rg, "data", "truncated") != nil || dig(rg, "data", "resolution_not_followed") != true {
 		t.Errorf("reader-access reverse graph = %s, want B's resolved principal on a crossing edge, the resolution not walked",
 			egatesJSON(dig(rg, "data")))
 	}
@@ -172,7 +191,7 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 			}
 		}
 		if len(ln) != 2 || len(le) != 2 || len(closing) != 1 || (closing[0].To != loopA && closing[0].From != loopA) ||
-			dig(g, "data", "truncated") != nil {
+			dig(g, "data", "truncated") != nil || dig(g, "data", "resolution_not_followed") != false {
 			t.Errorf("loop-a %s graph = %s, want 2 nodes, 2 edges, one closes_cycle back at loop-a, complete",
 				dir, egatesJSON(dig(g, "data")))
 		}
@@ -181,7 +200,7 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	// --- Past the display default: chain-1 -> chain-2 -> chain-3 at two hops,
 	// then the frontier; /graph/expand takes the next step.
 	chain := map[int]string{}
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= egatesChainLength; i++ {
 		chain[i] = egatesIdentity(t, l, "chain-"+string(rune('0'+i)))
 	}
 	cg := egatesGet(t, api, "/graph"+qs("root", chain[1], "direction", "forward"))
@@ -209,7 +228,10 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 		dig(none, "data", "bound_by") != nil || dig(none, "data", "more_paths") != false || dig(none, "data", "direction") != nil {
 		t.Errorf("refund-tools -> ops-bucket/* = %s, want none_exists, no paths, nothing bound", egatesJSON(dig(none, "data")))
 	}
-	// The same search with a budget that binds is never "none".
+	// The same search with a budget that binds is never "none". A node budget
+	// small enough to bind on this fixture is below the route's own (500), so
+	// this one case is injected at the Reader; the hop budget below binds
+	// through the route.
 	r := igaread.NewReader(l.db, readTestCursorKey)
 	code, bound := graphDirect(t, r, graphBudgets(func(b *igaread.GraphBudgets) { b.Nodes = 3 }), l.ws, "/graph/path", "from", refund, "to", ops)
 	mustStatus(t, "bounded path", code, bound, 200)
@@ -218,16 +240,26 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 		t.Errorf("refund-tools -> ops-bucket/* under a 3-node budget = %s, want not_found_within_budget, bound_by nodes",
 			egatesJSON(dig(bound, "data")))
 	}
-	// A path that exists but needs more can_assume hops than the budget: not
-	// found within it, bound by the hops -- never none_exists.
+	// A path that exists but needs more can_assume hops than the route's hard
+	// budget (4, §5.4): not found within it, bound by the hops -- never
+	// none_exists, and no distance. Through the ROUTE, under its own budgets:
+	// chain-1 -> chain-4 (three hops) is found, chain-1 -> chain-6 (five) is
+	// not. The control first: the budget, not the chain, is what stops it.
 	if p := egatesGet(t, api, "/graph/path"+qs("from", chain[1], "to", chain[4])); digs(p, "data", "outcome") != "found" ||
 		len(digl(p, "data", "paths", 0, "edges")) != 3 {
 		t.Errorf("chain-1 -> chain-4 = %s, want found, three hops", egatesJSON(dig(p, "data")))
 	}
-	code, hops := graphDirect(t, r, graphBudgets(func(b *igaread.GraphBudgets) { b.AssumeHops = 2 }), l.ws, "/graph/path", "from", chain[1], "to", chain[4])
+	if n := l.count(`SELECT count(*) FROM iga_relationship WHERE workspace_id = ? AND relationship_type = 'can_assume'
+	                  AND state = 'current' AND source_identity_account_id = ANY(?::uuid[]) AND target_identity_account_id = ANY(?::uuid[])`,
+		l.ws, egatesRefArray(t, chain), egatesRefArray(t, chain)); n != egatesChainLength-1 {
+		t.Fatalf("setup: %d current can_assume edges along the chain, want %d: the path exists", n, egatesChainLength-1)
+	}
+	code, hops := api.get("/graph/path" + qs("from", chain[1], "to", chain[egatesChainLength]))
 	mustStatus(t, "hop-bound path", code, hops, 200)
-	if digs(hops, "data", "outcome") != "not_found_within_budget" || digs(hops, "data", "bound_by") != "assume_hops" {
-		t.Errorf("chain-1 -> chain-4 within 2 hops = %s, want not_found_within_budget, bound_by assume_hops", egatesJSON(dig(hops, "data")))
+	if digs(hops, "data", "outcome") != "not_found_within_budget" || digs(hops, "data", "bound_by") != "assume_hops" ||
+		len(digl(hops, "data", "paths")) != 0 || dig(hops, "data", "direction") != nil {
+		t.Errorf("chain-1 -> chain-%d (%d hops, the route's budget %d) = %s, want not_found_within_budget, bound_by assume_hops, no path",
+			egatesChainLength, egatesChainLength-1, igaread.DefaultGraphBudgets.AssumeHops, egatesJSON(dig(hops, "data")))
 	}
 	for what, body := range map[string]map[string]any{"none": none, "bounded": bound, "hops": hops} {
 		if strings.Contains(egatesJSON(body), `"distance`) || strings.Contains(egatesJSON(body), `"length`) {
@@ -347,4 +379,14 @@ func egatesMapKeys(m map[string]map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// egatesRefArray renders refs' UUIDs as a PostgreSQL uuid[] literal.
+func egatesRefArray(t *testing.T, refs map[int]string) string {
+	t.Helper()
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, refUUID(t, ref).String())
+	}
+	return "{" + strings.Join(ids, ",") + "}"
 }

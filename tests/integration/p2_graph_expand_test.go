@@ -62,7 +62,7 @@ func TestP2GraphExpandPagesAndCursor(t *testing.T) {
 		"another direction": {"node", role, "edge", "can_assume", "direction", "forward", "cursor", cursor},
 		"another kind":      {"node", role, "edge", "can_assume", "direction", "reverse", "cursor", cursor},
 		"another filter":    append(append([]string{}, args...), "include_ended", "true", "cursor", cursor),
-		"tampered":          append(append([]string{}, args...), "cursor", cursor[:len(cursor)-2]+"xx"),
+		"tampered":          append(append([]string{}, args...), "cursor", egatesForgeCursor(cursor)),
 	} {
 		code, body := graphDirect(t, r, one, l.ws, "/graph/expand", kv...)
 		if code != http.StatusBadRequest || errCode(body) != "cursor_invalid" {

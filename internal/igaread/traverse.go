@@ -96,9 +96,9 @@ const (
 	// look through an external principal's resolution IN FORCE that could
 	// connect the two ends (§2.12): the principal is terminal (§5.4), so the
 	// path is not drawn -- and "none exists" would claim more than was
-	// searched. /graph says the same in truncated when its walk passed one
-	// (graphResolutionUnfollowed). Additive to §5.4's vocabulary; see the
-	// path file.
+	// searched. /graph/path ONLY: §5.4's outcome table has no other way to
+	// say it (D-94, raised). /graph never puts it in truncated -- nothing
+	// bound -- and says it in resolution_not_followed instead.
 	GraphBoundResolution = "resolution_not_followed"
 )
 
@@ -304,9 +304,9 @@ type GraphFrontier struct {
 }
 
 // GraphTruncated names the budget that bound (§5.4): nodes | edges |
-// assume_hops | time -- or, additive to §5.4's vocabulary and exactly as
-// /graph/path says it, resolution_not_followed: nothing bound, but the walk
-// passed a resolution in force it does not follow. null when none did.
+// assume_hops | time, and nothing else -- null when none did. A resolution
+// the walk did not follow is not a budget: GraphData.ResolutionNotFollowed
+// says it (D-94).
 type GraphTruncated struct {
 	BoundBy string `json:"bound_by"`
 }
@@ -318,6 +318,13 @@ type GraphData struct {
 	Edges     []*GraphEdge    `json:"edges"`
 	Frontier  []GraphFrontier `json:"frontier"`
 	Truncated *GraphTruncated `json:"truncated"`
+	// ResolutionNotFollowed is additive to §5.3's shape (D-94): true when
+	// the walk passed an external principal's resolution IN FORCE (§2.12)
+	// that it shows and does not walk (graphResolutionUnfollowed), so what
+	// lies past it was not read; false when it passed none; null when that
+	// was not established (the time budget bound first). It speaks of the
+	// nodes this response holds, and never sets truncated: nothing bound.
+	ResolutionNotFollowed *bool `json:"resolution_not_followed"`
 }
 
 // GraphExpandData is /graph/expand's data (D-35).
@@ -1011,25 +1018,32 @@ func (t *graphTraversal) breadthFirst(start *GraphNode, dir string, maxHops int)
 			}
 		}
 	}
-	if truncated == nil {
-		// Nothing bound -- but an external principal's resolution IN FORCE
-		// is shown, never walked (§5.4, D-87), so a walk that passed one did
-		// not look past it and must not read as complete: /graph/path calls
-		// the same thing resolution_not_followed, and the two routes agree.
-		unfollowed, known, err := t.graphResolutionUnfollowed(dir)
+	// An external principal's resolution IN FORCE is shown, never walked
+	// (§5.4, D-87), so a walk that passed one did not look past it. That is
+	// not a budget binding, so it is never truncated (§5.4 sets truncated
+	// only when a budget binds, and its bound_by vocabulary is frozen): it is
+	// said in resolution_not_followed beside it (D-94). A walk the time
+	// budget stopped is not asked -- there is no time left to ask in -- and
+	// says null: not established.
+	var unfollowed *bool
+	if stop != GraphBoundTime {
+		u, known, err := t.graphResolutionUnfollowed(dir)
 		if err != nil {
 			return nil, err
 		}
 		switch {
-		case !known:
-			truncated = &GraphTruncated{BoundBy: GraphBoundTime} // not established in time
-		case unfollowed:
-			truncated = &GraphTruncated{BoundBy: GraphBoundResolution}
+		case known:
+			unfollowed = &u
+		case truncated == nil:
+			// The check ran out of the time the request had left (D-40):
+			// the time budget bound what this response could establish, so
+			// it must not read as complete -- and the field stays null.
+			truncated = &GraphTruncated{BoundBy: GraphBoundTime}
 		}
 	}
 	return &GraphData{
 		Root: start.Ref, Nodes: t.order, Edges: graphEdgesOrEmpty(t.edges),
-		Frontier: front, Truncated: truncated,
+		Frontier: front, Truncated: truncated, ResolutionNotFollowed: unfollowed,
 	}, nil
 }
 

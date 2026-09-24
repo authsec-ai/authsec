@@ -19,6 +19,24 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
+// egatesForgeCursor is cursor with one character of its signature replaced
+// by a different base64url character, so the MAC it carries no longer
+// verifies. Replacing the LAST two characters (with "xx", as two older tests
+// did) is not a forgery every time: a 32-byte MAC is 43 characters whose last
+// one carries only 4 bits, non-strict base64 ignores the other 2, and so the
+// "forged" cursor decodes to the very same MAC in about 1 run of 1024 -- and
+// is accepted. The third character from the end is signature, whole.
+func egatesForgeCursor(cursor string) string {
+	b := []byte(cursor)
+	i := len(b) - 3
+	if b[i] == 'A' {
+		b[i] = 'B'
+	} else {
+		b[i] = 'A'
+	}
+	return string(b)
+}
+
 // egatesFillersAs ADDS n Lambda functions named <prefix>-NNN to a region's
 // list, each running as roleARN.
 func egatesFillersAs(a *egatesAcct, region, prefix string, n int, roleARN string) {
