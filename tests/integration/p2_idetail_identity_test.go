@@ -139,10 +139,10 @@ func TestP2IdetailIdentityOverview(t *testing.T) {
 	}
 }
 
-// A key that turns Inactive: ONE entry, status Inactive. The projector
-// inserts a new 'revoked' row beside the frozen 'active' one on every pass
-// (the credential defect D-64 decides to fix); the read must report the
-// latest reading, never the key twice.
+// A key that turns Inactive: ONE entry, status Inactive. The projector once
+// inserted a new 'revoked' row beside the frozen 'active' one on every pass
+// (the credential defect D-64 fixed); the read must still report the latest
+// reading of such a pair, never the key twice.
 func TestP2IdetailCredentialTurnsInactive(t *testing.T) {
 	l := newP2Lab(t, "p2-idetail-creds", true)
 	a := l.account(accountA)
@@ -157,12 +157,25 @@ func TestP2IdetailCredentialTurnsInactive(t *testing.T) {
 	l.scanAndProject(a)
 
 	userID := idetailIdentityID(t, l, "ci-deployer")
-	// The fixture must really hold the key twice, or this proves nothing about
-	// the read. When D-64's projector fix lands this becomes 1: then drop this
-	// setup check, and the assertions below still hold.
+	// D-64's projector fix keeps ONE row per key (TestP2BdbInactiveKeyKeepsOneRow
+	// proves it). A build before the fix left the frozen 'active' original
+	// beside the 'revoked' reading, and the read still guards against it -- so
+	// that pre-fix state, which the fixed pipeline cannot produce, is inserted
+	// directly: the fixture must really hold the key twice, or this proves
+	// nothing about the read.
 	if n := l.count(`SELECT count(*) FROM iga_credentials WHERE workspace_id = ? AND identity_account_id = ?
-	                   AND key_identifier = 'AKIAIDETAILROTATE001'`, l.ws, userID); n < 2 {
-		t.Fatalf("setup: %d rows for the key, want the projector's duplicate (>= 2)", n)
+	                   AND key_identifier = 'AKIAIDETAILROTATE001'`, l.ws, userID); n != 1 {
+		t.Fatalf("setup: %d rows for the key after the fixed projector, want 1", n)
+	}
+	if err := l.db.Exec(`INSERT INTO iga_credentials (workspace_id, identity_account_id, credential_type, issuer,
+	                            key_identifier, rotation_posture, lifecycle, provider, source_key, continuity,
+	                            first_seen_at, last_seen_at, created_at, updated_at)
+	                     SELECT workspace_id, identity_account_id, credential_type, issuer, key_identifier,
+	                            rotation_posture, 'active', provider, source_key, continuity, first_seen_at,
+	                            first_seen_at, first_seen_at, first_seen_at
+	                       FROM iga_credentials WHERE workspace_id = ? AND identity_account_id = ?`,
+		l.ws, userID).Error; err != nil {
+		t.Fatalf("setup: insert the pre-D-64 duplicate: %v", err)
 	}
 	creds := digl(idetailGet(t, l.api(), "/identities/"+userID.String()), "data", "credentials")
 	if len(creds) != 1 || digs(creds[0], "status") != "Inactive" || digs(creds[0], "lifecycle") != "revoked" {

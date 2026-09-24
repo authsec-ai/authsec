@@ -526,11 +526,19 @@ defect that should be fixed in the spec itself.
   `iga_entitlement_target` (032/036 define three). A target's facts come from its
   statement's policy-version observation. *Raise:* §4.8 and the T4.9 gate expect
   target evidence.
-- **D-67 Policy retired vs not_seen.** Reconciliation ends edge partitions
-  `not_seen` before `retireUnsupported` runs, so a retired policy's assignments
-  end `not_seen`, not `policy_retired`. The read side (Changes) never relies on
-  `ended_reason` to classify an end; it uses lifecycle events and assignment
-  periods. *Raise:* the T5.2 gate wording.
+- **D-67 Policy or statement retired vs not_seen.** Reconciliation ends edge
+  partitions `not_seen` before `retireUnsupported` runs (§4.10's own
+  `Reconcile`), so a retired policy's assignments end `not_seen`, not
+  `policy_retired`. *Statement case (added in the m1/bdb review):* the same
+  holds for the grants of a Sid-less statement that was edited (replaced) —
+  they end `not_seen`, not the `statement_retired` of §2.7 l.605 and the
+  cascade table (l.5241): the grant partition, read in full, closes them in
+  the pass before the statement retires. A cascade reason is written only
+  when the partition could not end the edge itself (P2-EVIDENCE §6.5). The
+  read side (Changes) never relies on `ended_reason` to classify an end; it
+  uses lifecycle events and assignment and grant periods (a replacement is
+  `statement_replaced`, D-27c). *Raise:* the T5.2 gate wording; §2.7's
+  Sid-less row and the cascade table.
 
 ## Added after the decisions audit (gaps no entry covered)
 
@@ -678,3 +686,40 @@ defect that should be fixed in the spec itself.
   error code (AccessDenied, OptInRequired, SubscriptionRequired stay `denied`).
   `resource_policies`: all reads succeed → reached; some fail → partial (count =
   failures); all fail → denied; `NoSuchBucketPolicy` is a successful read.
+
+## Added in the M1 Wave C reviews
+
+- **D-94 Deleting a workspace after a projection (schema defect; migrations
+  unchanged).** `036` declares `iga_le_publication_fkey` `ON DELETE RESTRICT
+  DEFERRABLE INITIALLY DEFERRED` (§3 l.3354-3356). PostgreSQL never defers a
+  RESTRICT action — only `NO ACTION` honours `DEFERRABLE` — so when `DELETE
+  FROM workspaces` cascades to `iga_publication`, the check fires at once, while
+  the `iga_lifecycle_event` rows that cite those revisions (which cascade only
+  with their subject node) still exist: every workspace that has published
+  refuses deletion with 23503. With the switch off (nothing published) the
+  delete goes through. *Proposed DDL* (a corrected `036`, or `037`):
+
+  ```sql
+  ALTER TABLE public.iga_lifecycle_event
+      DROP CONSTRAINT iga_le_publication_fkey,
+      ADD CONSTRAINT iga_le_publication_fkey FOREIGN KEY (workspace_id, rev)
+          REFERENCES public.iga_publication (workspace_id, rev)
+          ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+  ```
+
+  It keeps the §3 probe (an event whose revision has no publication is still
+  rejected at commit, l.6645) and lets the workspace cascade finish before the
+  check. Applied in a rolled-back transaction, the delete then leaves no row of
+  the workspace in any `iga_*` table (`TestP2BdbWorkspaceDeletionAfterProjection`).
+  Until the DDL lands, that test's "under 036 as shipped" subtest is **skipped**
+  naming this entry — a skip, not a pass (§7.4) — and it runs unchanged once
+  the key is fixed; any other refusal fails it. The `cloud_*` rows are left
+  behind in both phases (`cloud_connector` has no foreign key to `workspaces`;
+  Phase 1, not changed). A connector **hard** delete after a projection is also
+  refused (23503 on an evidence junction's observation key: observations
+  cascade from the connector, edges survive it with `connector_id` set null);
+  that is the RESTRICT keys keeping every surviving edge's evidence (T4.9), and
+  the product only revokes a connector (D-89), so no DDL is proposed for it: the
+  test asserts only that no edge survives without its evidence. *Raise:* the
+  §3 DDL for `iga_le_publication_fkey`; and whether a workspace delete should
+  also reach its `cloud_*` rows.
