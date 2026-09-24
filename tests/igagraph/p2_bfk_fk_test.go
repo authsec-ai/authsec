@@ -39,8 +39,12 @@ package igagraph_test
 //
 // TestB9ForeignKeyCatalogGuard is what makes "every" true. It reads
 // pg_constraint and fails when a foreign key has no case, when a case's kind
-// does not match its key's shape, and when any single-column reference to a
-// workspace-scoped table is not an exemption listed with its reason.
+// does not match its key's shape, when any single-column reference to a
+// workspace-scoped table is not an exemption listed with its reason, when a
+// composite reference does not lead with workspace_id on both sides, when a
+// uuid column references nothing unlisted, and when a cloud_* table in §2.9's
+// form is missing from the scope. A planted instance of each, in a rolled-back
+// transaction, proves on every run that the checks can fail.
 //
 // Home: tests/igagraph, which rebuilds public from migrations/master on every
 // run (setupSchema). Nothing here edits a migration.
@@ -57,15 +61,18 @@ import (
 	"github.com/lib/pq"
 )
 
-// bfkPhase2CloudTables are the cloud_* tables whose references Phase 2 wrote
-// or rewrote. 027 converted cloud_scan_run's and cloud_observation's. 035
-// created the collection model and widened cloud_observation with policy_id.
-// It also made cloud_identity the target of every integration-qualified
-// reference (cloud_identity_scope_key), so its own reference to its
-// integration is in scope too. The other cloud_* tables are Phase 1's and are
-// not covered here.
+// bfkPhase2CloudTables are the cloud_* tables Phase 2 wrote references on or
+// made the target of one. 027 gave cloud_connector, cloud_scan_run and
+// cloud_observation their UNIQUE (workspace_id, id) and converted the run's
+// and the observation's references. 035 created the collection model, widened
+// cloud_observation with policy_id and made cloud_identity the target of every
+// integration-qualified reference (cloud_identity_scope_key), so the
+// references those rows make themselves are in scope too. The other cloud_*
+// tables are Phase 1's (single-column references throughout; spec question)
+// and are not covered here. bfkPhase2CloudTablesInCatalog re-derives this list
+// from the catalog on every run, so a later table cannot be left out.
 var bfkPhase2CloudTables = []string{
-	"cloud_scan_run", "cloud_observation", "cloud_identity",
+	"cloud_connector", "cloud_scan_run", "cloud_observation", "cloud_identity",
 	"cloud_group_membership", "cloud_policy", "cloud_policy_attachment",
 }
 
@@ -106,6 +113,9 @@ var bfkNoForeignKey = map[string]string{
 	"cloud_identity.workspace_id": "011: SPEC QUESTION: anchored by nothing. cloud_identity_connector_id_fkey " +
 		"is single-column, so an identity can name a workspace that does not exist, or one its connector " +
 		"is not in, and 035's cloud_identity_scope_key then pairs that workspace with that connector",
+	"cloud_connector.workspace_id": "001 and 010: SPEC QUESTION: no key to workspaces. Every (workspace_id, " +
+		"connector_id) reference 027-036 added is against cloud_connector (workspace_id, id), so it proves " +
+		"the pair agrees, not that the workspace exists",
 }
 
 /* -------------------------------- catalog --------------------------------- */
@@ -299,6 +309,12 @@ func TestB9B20ForeignKeysRejectForeignRows(t *testing.T) {
 			if c.deferred != fk.deferred {
 				t.Fatalf("%s: case says deferred=%v, catalog says %v", c.fk, c.deferred, fk.deferred)
 			}
+			// The kind picks the negatives, so a wrong one would silently skip
+			// B20's foreign_integration. Not fatal: the probes below still run
+			// and show what the key actually does.
+			if shape := bfkShape(fk); shape != c.kind {
+				t.Errorf("%s: case kind %s, but the catalog's key is %s-shaped", c.fk, c.kind, shape)
+			}
 			t.Run("control", func(t *testing.T) {
 				if err := w.attempt(t, c.build(w, w.A), nil); err != nil {
 					t.Fatalf("the same-workspace, same-integration control was rejected: %v", err)
@@ -454,6 +470,57 @@ func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 	return out
 }
 
+// bfkPhase2CloudTablesInCatalog derives bfkPhase2CloudTables from the catalog:
+// every cloud_* table that holds a composite foreign key (a reference in §2.9's
+// form) or a composite UNIQUE led by workspace_id (a target 027 or 035 added
+// for one). Phase 1's tables have neither.
+func bfkPhase2CloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
+	t.Helper()
+	rows, err := q.Query(`
+		SELECT DISTINCT r.relname::text
+		  FROM pg_constraint c
+		  JOIN pg_class r     ON r.oid = c.conrelid
+		  JOIN pg_namespace n ON n.oid = r.relnamespace
+		  JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = c.conkey[1]
+		 WHERE n.nspname = 'public' AND r.relname LIKE 'cloud\_%'
+		   AND cardinality(c.conkey) > 1
+		   AND (c.contype = 'f' OR (c.contype = 'u' AND a.attname = 'workspace_id'))
+		 ORDER BY 1`)
+	if err != nil {
+		t.Fatalf("read Phase 2 cloud tables: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan table: %v", err)
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read Phase 2 cloud tables: %v", err)
+	}
+	return out
+}
+
+func bfkCloudTableProblems(inCatalog []string) []string {
+	var out []string
+	for _, name := range inCatalog {
+		if !slices.Contains(bfkPhase2CloudTables, name) {
+			out = append(out, fmt.Sprintf("%s holds a composite key but is not in bfkPhase2CloudTables, "+
+				"so none of its foreign keys is tested", name))
+		}
+	}
+	for _, name := range bfkPhase2CloudTables {
+		if !slices.Contains(inCatalog, name) {
+			out = append(out, fmt.Sprintf("%s is in bfkPhase2CloudTables but holds no composite key: remove it", name))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func bfkBareUUIDProblems(bare []string) []string {
 	var out []string
 	for _, col := range bare {
@@ -469,6 +536,22 @@ func bfkBareUUIDProblems(bare []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// bfkMentions reports whether one problem names every part: the planted
+// object AND the check's own wording, so a problem raised for some other
+// reason about the same object does not count.
+func bfkMentions(problems []string, parts ...string) bool {
+	for _, p := range problems {
+		all := true
+		for _, part := range parts {
+			all = all && strings.Contains(p, part)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
 }
 
 // TestB9ForeignKeyCatalogGuard is what makes B9's "every composite FK" true:
@@ -499,12 +582,19 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			t.Error(p)
 		}
 	})
+	t.Run("every_phase2_cloud_table_is_in_scope", func(t *testing.T) {
+		for _, p := range bfkCloudTableProblems(bfkPhase2CloudTablesInCatalog(t, w.f.db)) {
+			t.Error(p)
+		}
+	})
 
 	// Non-vacuity, rerun on every run: plant the A3 pattern in a rolled-back
 	// transaction and require the guard AND the probe to see it. The planted
 	// key replaces cloud_pa_principal_fkey with the single-column form a
 	// careless migration would write. It keeps the name, so only the checks
-	// on shape can notice.
+	// on shape can notice. Beside it: a bare uuid column, a new composite key
+	// no case covers that pairs the child's workspace_id with the parent's id,
+	// and a new cloud_* table in §2.9's form that bfkPhase2CloudTables lacks.
 	t.Run("a_planted_single_column_reference_is_caught", func(t *testing.T) {
 		tx, err := w.f.db.Begin()
 		if err != nil {
@@ -516,31 +606,42 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			   ADD CONSTRAINT cloud_pa_principal_fkey FOREIGN KEY (principal_identity_id)
 			   REFERENCES cloud_identity (id) ON DELETE CASCADE`,
 			`ALTER TABLE iga_policy ADD COLUMN bfk_planted_run_id uuid`,
+			// Every existing row's new column is NULL, so MATCH SIMPLE lets the
+			// key be added. The column order is what is wrong with it.
+			`ALTER TABLE iga_policy ADD COLUMN bfk_planted_conn_id uuid,
+			   ADD CONSTRAINT bfk_planted_misqualified_fkey FOREIGN KEY (workspace_id, bfk_planted_conn_id)
+			   REFERENCES cloud_connector (id, workspace_id)`,
+			`CREATE TABLE cloud_bfk_planted (
+			   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, connector_id uuid NOT NULL,
+			   CONSTRAINT bfk_planted_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+			     REFERENCES cloud_connector (workspace_id, id))`,
 		} {
 			if _, err := tx.Exec(ddl); err != nil {
 				t.Fatalf("plant: %v", err)
 			}
 		}
 		planted := bfkForeignKeys(t, tx)
-		mentions := func(problems []string, what string) bool {
-			for _, p := range problems {
-				if strings.Contains(p, what) {
-					return true
-				}
-			}
-			return false
-		}
-		if !mentions(bfkSingleColumnProblems(planted), "cloud_pa_principal_fkey") {
+		if !bfkMentions(bfkSingleColumnProblems(planted), "cloud_pa_principal_fkey", "single-column reference") {
 			t.Error("the single-column rule did not report the planted cloud_pa_principal_fkey")
 		}
-		if !mentions(bfkCoverageProblems(planted), "cloud_pa_principal_fkey") {
+		if !bfkMentions(bfkCoverageProblems(planted), "cloud_pa_principal_fkey", "but its shape is legacy") {
 			t.Error("the coverage check did not see that cloud_pa_principal_fkey changed shape")
 		}
-		if !mentions(bfkQualificationProblems(planted), "cloud_pa_principal_fkey") {
+		if !bfkMentions(bfkQualificationProblems(planted), "cloud_pa_principal_fkey", "(B20)") {
 			t.Error("the qualification check did not report the planted cloud_pa_principal_fkey")
 		}
-		if !mentions(bfkBareUUIDProblems(bfkBareUUIDColumns(t, tx)), "iga_policy.bfk_planted_run_id") {
+		if !bfkMentions(bfkCoverageProblems(planted), "bfk_planted_misqualified_fkey", "has no subtest") {
+			t.Error("the coverage check did not report the planted, uncovered bfk_planted_misqualified_fkey")
+		}
+		if !bfkMentions(bfkQualificationProblems(planted), "bfk_planted_misqualified_fkey",
+			"does not pair workspace_id with workspace_id") {
+			t.Error("the qualification check did not report bfk_planted_misqualified_fkey pairing workspace_id with id")
+		}
+		if !bfkMentions(bfkBareUUIDProblems(bfkBareUUIDColumns(t, tx)), "iga_policy.bfk_planted_run_id", "references nothing") {
 			t.Error("the bare-uuid check did not report the planted iga_policy.bfk_planted_run_id")
+		}
+		if !bfkMentions(bfkCloudTableProblems(bfkPhase2CloudTablesInCatalog(t, tx)), "cloud_bfk_planted", "not in bfkPhase2CloudTables") {
+			t.Error("the table-scope check did not report the planted cloud_bfk_planted")
 		}
 		// And the rows cloud_pa_principal_fkey's subtests insert now go in: the
 		// probe those subtests run would fail, which is the point of them.
