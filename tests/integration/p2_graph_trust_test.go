@@ -221,7 +221,8 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 			dig(ext, "account", "connected") != false {
 			t.Errorf("principal %v, want an external principal naming unconnected account %s", ext, trustAccountC)
 		}
-		if l := graphLim(digl(ext, "limitations"), "account_not_connected"); l == nil || digs(l, "account_id") != trustAccountC {
+		// D-96: /evidence's field for the code -- the accounts it names.
+		if l := graphLim(digl(ext, "limitations"), "account_not_connected"); l == nil || digs(l, "accounts", 0) != trustAccountC {
 			t.Errorf("principal limitations = %v, want account_not_connected %s", digl(ext, "limitations"), trustAccountC)
 		}
 		if !e.CrossesAccount || graphLim(e.Limitations, "account_not_connected") == nil {

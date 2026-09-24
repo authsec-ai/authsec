@@ -678,3 +678,97 @@ defect that should be fixed in the spec itself.
   error code (AccessDenied, OptInRequired, SubscriptionRequired stay `denied`).
   `resource_policies`: all reads succeed → reached; some fail → partial (count =
   failures); all fail → denied; `NoSuchBucketPolicy` is a successful read.
+
+## Added by the frozen-contract conformance pass (T6.7, M1 Wave C)
+
+Every §5.3 route was called on one rich estate and compared field by field
+with §5.2/§5.3 (`tests/integration/p2_contract_*_test.go`). Where one concept
+had two shapes, or §5 was silent, the most conservative reading is below and
+the implementation now follows it.
+
+- **D-94 One rendering of a publication's time.** `meta.published_at` (every
+  response), `/pipeline`'s `current_published_at` and 409 `revision_stale`'s
+  `current_published_at` are the SAME instant and render as the same string:
+  RFC 3339 UTC to the second, as every §5.1/§5.2 example writes it
+  (`igaread.PublicationTime`). Before, `meta.published_at` carried
+  microseconds and the other two did not, so a console comparing the pinned
+  revision's time with /pipeline's or a 409's saw two values for one
+  publication. Changes keeps its event times (`at`, `meta.history_begins`) to
+  the microsecond (D-27a): every event carries its `rev`, so nothing joins on
+  the string.
+- **D-95 `meta.capabilities` on every detail envelope.** §5.2's detail
+  envelope shows `capabilities`, and §2.14.14 says the UI depends on
+  `meta.capabilities` on detail responses. Every response in the detail
+  envelope -- details, multi-section tabs, `/evidence`, `/lookup`,
+  `/pipeline`, `/coverage` and the three graph routes -- carries it: the
+  actions the response offers this caller, each stated, and `{}` where the
+  route offers none. Only workload detail offers one (`can_classify`, D-83).
+  The graph routes' meta is the detail envelope's plus `budgets` and
+  `limitations` (D-35). Never absent, so the console reads one meta type and
+  never infers an action from a missing field.
+- **D-96 One shape per concept.** A code, an object or a claim renders the
+  same everywhere it appears:
+  (a) *Graph limitations* (D-35 made literal): every node's and edge's
+  limitations come from `Query.ClaimLimitations` -- the computation `/evidence`
+  renders -- restricted to `FactFreeLimitations`, one call per traversal level
+  for all its new nodes and edges. An edge's list is exactly `/evidence`'s for
+  that claim (same codes, fields and order); a crossing edge adds the far
+  account's coverage (§5.4). A node's list is `/evidence`'s for its presence
+  plus the limitations of its restrictions (§5.4 "every path through a
+  restricted node carries the matching limitation"): an identity's Deny
+  statements (its own and its live groups', read by `loadRestrictions`, the
+  reader `/evidence` uses, so `restrictions.deny_statements` is the same count)
+  and its OWN boundary, a role's NotPrincipal trust (D-44), a statement's
+  Condition and negation -- each built by `/evidence`'s per-code constructor
+  (`contract_limitations.go`). Before, the graph built its own maps
+  (`account_not_connected` with `account_id` where `/evidence` has
+  `accounts`; `deny_statements_present` with `refs` where `/evidence` has
+  `statements`; `negated_statement` and `permissions_boundary_present` without
+  their fields), and edges lacked codes `/evidence` gave the same claim
+  (surface gaps of current claims, a target's Condition). A group's member
+  boundaries (D-22) are its grants' limitation, never the group node's.
+  (b) *sources*: one entry per support row, `{presence, integration, account,
+  state, first_seen_at, last_confirmed_at, ended_reason}`, on workload,
+  identity and resource detail alike (workload detail had aggregated per
+  connector with `account_id`/`label`).
+  (c) *A can_assume's trust statement*: `statement: {key, sid, negated}` on
+  Workload > Identities `may_assume`, Used by `principals` and `referenced-by`
+  alike (`may_assume` had a bare `statement_key`).
+  (d) *retired_reason* is always present on detail routes, null while active
+  (§5.2 "Every detail route returns retired objects with lifecycle,
+  retired_reason and last_confirmed_at"); list rows keep it only on retired
+  rows. Identity, resource and external-principal detail omitted it.
+  (e) *Graph nodes*: a statement node always states `sid` (`""` for a Sid-less
+  statement, as §5.3's grant line shows), and an external-principal node its
+  derived `lifecycle` (D-47, the detail's rule), so every node carries
+  `lifecycle`.
+- **D-97 Resource > Access pages by holder.** §5.3 "paged by holder": `limit`,
+  `next_cursor` and `total` count HOLDERS, never (holder, grant) rows, so a
+  holder's rows are never split across pages; `data.access` may hold more rows
+  than `total`. `excluded_by` and `deny_statements_naming` are capped lists
+  with their `_more` flags, never paged (D-77's list envelope with §5.3's named
+  fields as the `data` object).
+- **D-98 D-9 wired.** The production chain did not implement D-9: the graph
+  catalogue was mounted with the shared `AuthMiddleware` and
+  `middlewares.Require`, whose denials are `{"error": "<text>"}`,
+  `{"error": "insufficient_scope", ...}` or an empty 401. The catalogue is now
+  mounted by `MountIGAGraphReadRoutes` on its own `/api/iga/v1` group, behind
+  the same middlewares, each wrapped by `GraphEnvelope`: a 401 or 403 is
+  rendered `{"error": {"code": "unauthenticated" | "forbidden", "message",
+  "required_permissions"?}}` with the middleware's own description as the
+  message and its `WWW-Authenticate` header kept; a denial that is already the
+  §5.2 envelope (a handler's own 401 or 403) passes verbatim; the decisions are
+  untouched, and the Phase 1 routes keep the shared bodies. `/capabilities`
+  now also refuses a `rev` or any other parameter with 400, as D-82 says.
+- **D-99 bound_by beyond §5.4's four budgets (recorded, not introduced, by
+  the conformance pass).** Two values the traversal already returns are
+  outside §5.4's `nodes | edges | assume_hops | time`: `/graph/path`'s
+  `bound_by: "paths"` (the path budget bound: `found` with `more_paths: true`,
+  §5.4 "more_paths: true if the path budget bound" names no value for it), and
+  `resolution_not_followed` on `/graph` `truncated` and `/graph/path`
+  `bound_by`: the walk passed an external principal whose resolution is in
+  force (§2.12) and, the principal being terminal (§5.4), did not follow it --
+  so the answer must not read as complete (§5.4 "never states a completeness it
+  did not establish"). Kept as the conservative reading; the contract test
+  pins both as the only additions. *Raise:* §5.4's vocabulary should list them,
+  or say how the console renders an unknown `bound_by`.

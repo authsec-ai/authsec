@@ -670,6 +670,16 @@ var contractPermissions = contractDetail(
 
 /* ---------------------------- external principals -------------------------- */
 
+// A recorded resolution (§2.12, §5.3; D-87): the same object on the detail
+// and on a graph node; what was not recorded is null.
+var contractResolution = contractObj(
+	contractReq("state", contractEnum("active", "suspended", "pending_reconfirmation")),
+	contractReq("basis", contractEnum("derived", "asserted")),
+	contractReq("rule", contractNullable(contractNonEmpty)),
+	contractReq("resolved_to", contractNullable(contractRef("identity", "workload"))),
+	contractReq("resolved_by", contractNullable(contractNonEmpty)),
+)
+
 // GET /external-principals/:id (§5.3; D-87 resolution and labels).
 var contractExternalDetail = contractDetail(
 	contractObj(
@@ -680,11 +690,10 @@ var contractExternalDetail = contractDetail(
 		contractReq("subject", contractNonEmpty),
 		contractReq("account", contractNullable(contractAccount)),
 		contractReq("account_connected", contractNullable(contractBool)),
-		contractReq("resolution", contractNullable(contractObj(
-			contractReq("state", contractNonEmpty), contractReq("basis", contractNonEmpty),
-			contractReq("rule", contractStr), contractReq("resolved_to", contractNullable(contractNonEmpty)),
-			contractReq("resolved_by", contractNullable(contractStr))))),
-		contractOpt("unresolved_reason", contractNonEmpty),
+		contractReq("resolution", contractNullable(contractResolution)),
+		// null exactly when a resolution is in force (idetail_external.go).
+		contractReq("unresolved_reason", contractNullable(contractEnum("wildcard", "service_principal",
+			"account_not_connected", "account_principal", "not_in_inventory"))),
 		contractReq("lifecycle", contractLifecycle),
 		contractReq("retired_reason", contractNullable(contractNonEmpty)), // details: always stated
 		contractReq("state", contractNodeState),
@@ -826,7 +835,7 @@ var contractGraphNode = contractFunc(func(path string, v any, errs *[]string) {
 		more = []contractField{contractReq("kind", contractConst("external_principal")),
 			contractReq("account", contractNullable(contractAccount)), contractReq("mechanism", contractExternalKind),
 			contractReq("issuer", contractNonEmpty), contractReq("subject", contractNonEmpty),
-			contractOpt("resolution", contractAnyValue)}
+			contractOpt("resolution", contractResolution)}
 	default:
 		contractFail(errs, path, "node type %q is not a traversal node (§5.4)", typ)
 		return
@@ -883,7 +892,10 @@ var contractFrontier = contractObj(
 
 var contractRelTypeOrGraph = contractEnum("executes_as", "task_execution_role", "member_of", "can_assume", "grant", "target")
 
-var contractTruncated = contractNullable(contractObj(contractReq("bound_by", contractEnum("nodes", "edges", "assume_hops", "time"))))
+// truncated.bound_by: §5.4's four budgets, plus D-99's resolution_not_followed
+// (a resolution in force the walk shows but does not follow).
+var contractTruncated = contractNullable(contractObj(contractReq("bound_by",
+	contractEnum("nodes", "edges", "assume_hops", "time", "resolution_not_followed"))))
 
 // The graph routes' meta (§5.3 l.5983; D-35 meta limitations).
 var contractGraphMeta = contractDetailMeta(
@@ -920,7 +932,9 @@ var contractGraphExpand = contractDetail(contractObj(
 var contractGraphPath = contractDetail(contractObj(
 	contractReq("from", contractRef("workload", "identity", "external_principal", "statement", "resource")),
 	contractReq("to", contractRef("workload", "identity", "external_principal", "statement", "resource")),
-	contractReq("direction", contractEnum("forward", "reverse")),
+	// The orientation the paths run in; null when none was found (the
+	// route's additive field, graph_path.go).
+	contractReq("direction", contractNullable(contractEnum("forward", "reverse"))),
 	contractReq("outcome", contractEnum("found", "none_exists", "not_found_within_budget")),
 	contractReq("paths", contractArr(contractObj(
 		contractReq("nodes", contractArrMin(2, contractGraphNode)),
@@ -928,7 +942,8 @@ var contractGraphPath = contractDetail(contractObj(
 		contractReq("limitations", contractLimitations),
 	))),
 	contractReq("more_paths", contractBool),
-	contractReq("bound_by", contractNullable(contractEnum("nodes", "edges", "assume_hops", "time", "paths"))),
+	// §5.4's budgets, plus the path budget and D-99's resolution_not_followed.
+	contractReq("bound_by", contractNullable(contractEnum("nodes", "edges", "assume_hops", "time", "paths", "resolution_not_followed"))),
 ), contractGraphMeta)
 
 /* --------------------------------- evidence -------------------------------- */

@@ -22,8 +22,13 @@ import (
 )
 
 // IdentityDetail is the /identities/:id data object.
+//
+// retired_reason is always present here (null while active), as on every
+// detail route: the list row omits it on active rows, and a detail must say
+// why a retired object is retired (§5.2 "Retired objects"; D-96).
 type IdentityDetail struct {
 	IdentityRow
+	RetiredReason *string        `json:"retired_reason"`
 	FirstSeenAt   any            `json:"first_seen_at"`
 	Continuity    string         `json:"continuity"`
 	ImmutableKey  string         `json:"immutable_key"`
@@ -148,6 +153,7 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 		}
 		detail := IdentityDetail{
 			IdentityRow:   ident.Row(accts, used, stale),
+			RetiredReason: strPtr(ident.RetiredReason),
 			FirstSeenAt:   T(ident.FirstSeenAt),
 			Continuity:    ident.Continuity,
 			ImmutableKey:  ident.ImmutableKey,

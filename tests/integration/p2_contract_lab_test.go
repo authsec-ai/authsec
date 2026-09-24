@@ -12,8 +12,10 @@ package integration
 // POST route.
 //
 //	accounts   A 429418377036 (connected, us-east-1), B 905418271234
-//	           (connected; its Group listing is DENIED), C 300000000003 (never
-//	           connected: a KMS key and a trusting root)
+//	           (connected; its Group listing is DENIED in every scan, its Role
+//	           listing in its second: B's roles and their edges go STALE, with
+//	           stale_reason), C 300000000003 (never connected: a KMS key and a
+//	           trusting root)
 //	workloads  Lambda ticket-tools  -> SharedToolRole
 //	           Lambda orphan-fn     -> MissingRole (no such role: not_in_inventory)
 //	           ECS ticket-worker:1  -> SharedToolRole (task role), ImagePullRole
@@ -42,7 +44,8 @@ package integration
 //	               A PartnerRole trusts C's root (not connected)
 //
 // Revisions: rev 1 = A's first scan, rev 2 = B's, rev 3 = A's second (the
-// detach, TempRole gone, ListTickets' Condition edited: a statement revision).
+// detach, TempRole gone, ListTickets' Condition edited: a statement revision),
+// rev 4 = B's second (Role listing denied: stale, never ended).
 
 import (
 	"net/http"
@@ -78,9 +81,9 @@ type contractFixture struct {
 	l    *p2Lab
 	a, b *p2Account
 	api  *readAPI
-	// runs, in publication order: A's first scan, B's, A's second.
-	runA1, runB, runA2 models.CloudScanRun
-	fakesA             *s3bFakes
+	// runs, in publication order: A's first scan, B's, A's second, B's second.
+	runA1, runB, runA2, runB2 models.CloudScanRun
+	fakesA                    *s3bFakes
 
 	// Typed refs, "<type>:<uuid>".
 	lambda, ecs, agent, orphan              string
@@ -248,12 +251,13 @@ func contractLab(t *testing.T) *contractFixture {
 	/* ------------------------------ account B ------------------------------ */
 
 	// CrossRole trusts A's SharedToolRole (live in a connected account when B
-	// is projected, so the source is that identity: D-41) and B's LoopRole;
-	// LoopRole trusts CrossRole -- a cycle.
+	// is projected, so the source is that identity: D-41) by a Sid-keyed
+	// statement, and B's LoopRole by a Sid-less one; LoopRole trusts CrossRole
+	// -- a cycle.
 	crossARN := "arn:aws:iam::" + accountB + ":role/CrossRole"
 	loopARN := "arn:aws:iam::" + accountB + ":role/LoopRole"
 	trustRole(b, "CrossRole", "AROACROSSROLECROSSR1", trustDoc(
-		trustAllow(`{"AWS":"`+shared+`"}`, "sts:AssumeRole"),
+		`{"Sid":"FromTools","Effect":"Allow","Principal":{"AWS":"`+shared+`"},"Action":"sts:AssumeRole"}`,
 		trustAllow(`{"AWS":"`+loopARN+`"}`, "sts:AssumeRole")))
 	trustRole(b, "LoopRole", "AROALOOPROLELOOPROL1", trustDoc(
 		trustAllow(`{"AWS":"`+crossARN+`"}`, "sts:AssumeRole")))
@@ -275,6 +279,14 @@ func contractLab(t *testing.T) *contractFixture {
 			`"Condition":{"StringLike":{"s3:prefix":["tickets/*","archive/*"]}}}`))
 	f.fakesA.activity = &fakeActivity{services: f.fakesA.activity.(*fakeActivity).services}
 	f.runA2 = contractCycle(l, a, f.fakesA)
+
+	/* ------------------------- account B, second scan ------------------------ */
+
+	// The Role listing is refused too: nothing may END on a read that did not
+	// happen (§4.10 canEnd), so B's roles, their trust edges and their grants
+	// stay, STALE, each with the surface that explains it (D-74).
+	b.iam.fail["GetAccountAuthorizationDetails:Role"] = denied("iam:GetAccountAuthorizationDetails")
+	f.runB2 = contractCycle(l, b, &s3bFakes{})
 
 	f.api = l.api()
 	f.resolve(t)

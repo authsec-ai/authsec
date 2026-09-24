@@ -355,9 +355,10 @@ func TestP2GraphMembershipCarriesRestrictions(t *testing.T) {
 	// the count and refs of its bounded member users -- priya only: sam's
 	// boundary assignment ended, lee's membership ended. The Evidence panel
 	// states the same for the same claim (D-35: one function).
-	if l := graphLim(grants[0].Limitations, "permissions_boundary_present"); l == nil || num(l, "count") != 1 ||
-		len(digl(l, "refs")) != 1 || digs(l, "refs", 0) != priya {
-		t.Errorf("ops grant limitations = %v, want permissions_boundary_present {count 1, refs [priya]}", grants[0].Limitations)
+	// D-96: /evidence's fields for the code -- member_count and members.
+	if l := graphLim(grants[0].Limitations, "permissions_boundary_present"); l == nil || num(l, "member_count") != 1 ||
+		len(digl(l, "members")) != 1 || digs(l, "members", 0) != priya || dig(l, "holder") != false {
+		t.Errorf("ops grant limitations = %v, want permissions_boundary_present {member_count 1, members [priya]}", grants[0].Limitations)
 	}
 	if l := graphLim(grants[0].Limitations, "deny_statements_present"); l == nil || num(l, "count") != 1 {
 		t.Errorf("ops grant limitations = %v, want the group's own deny_statements_present", grants[0].Limitations)

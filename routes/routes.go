@@ -325,7 +325,14 @@ func SetupRoutes(
 			// both, with revisions, typed refs and operation ids.
 			// The whole §5.3 graph catalogue, with its permissions, is one table
 			// in iga_graph_read_routes.go so tests assert the same one.
-			platformCtrl.RegisterIGAGraphReadRoutes(iga, igaGraphRead, middlewares.Require)
+			//
+			// D-9: a graph route's 401 and 403 are the §5.2 envelope, like
+			// every other error on it. So the catalogue is mounted on its own
+			// group, behind the SAME AuthMiddleware and the SAME permission
+			// middleware, each wrapped by GraphEnvelope, which rewrites only
+			// the body of a denial -- never the decision. The Phase 1 routes
+			// on this group keep the shared middlewares' bodies.
+			platformCtrl.MountIGAGraphReadRoutes(r, igaGraphRead, middlewares.AuthMiddleware(), middlewares.Require)
 			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 			// Governance decisions. Both require an expected version, so a

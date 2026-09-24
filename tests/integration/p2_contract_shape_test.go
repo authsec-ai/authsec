@@ -101,6 +101,14 @@ func (s contractObjShape) check(path string, v any, errs *[]string) {
 		}
 		f.s.check(path+"."+f.name, x, errs)
 	}
+	// D-74, on every shape that names both fields: a stale row, node or edge
+	// carries stale_reason, and nothing else does.
+	if known["state"] && known["stale_reason"] {
+		_, has := m["stale_reason"]
+		if stale := m["state"] == "stale"; stale != has {
+			contractFail(errs, path, "state %v with stale_reason present=%v (D-74: exactly the stale ones carry it)", m["state"], has)
+		}
+	}
 	var extra []string
 	for k := range m {
 		if !known[k] {

@@ -37,6 +37,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -97,16 +98,18 @@ type WorkloadIdentityClaim struct {
 
 // WorkloadMayAssume is one may_assume item: a can_assume claim from an
 // execution identity (via_identity) to the role whose trust policy names it
-// (target), with the trust statement's key, its mechanism, and its
-// conditions verbatim -- null when the statement had none. Conditions are
-// recorded, never evaluated.
+// (target), with its trust statement, its mechanism, and its conditions
+// verbatim -- null when the statement had none. Conditions are recorded,
+// never evaluated. statement is the SAME object Used by's principals and
+// referenced-by name it with ({key, sid, negated}, TrustStatementOf), so the
+// three views of one can_assume never differ in shape (D-96).
 type WorkloadMayAssume struct {
 	Claim           string          `json:"claim"`
 	Type            string          `json:"type"`
 	ViaIdentity     string          `json:"via_identity"`
 	Target          IdentityBrief   `json:"target"`
 	Mechanism       string          `json:"mechanism"`
-	StatementKey    string          `json:"statement_key"`
+	Statement       TrustStatement  `json:"statement"`
 	Conditions      json.RawMessage `json:"conditions"`
 	Basis           string          `json:"basis"`
 	State           string          `json:"state"`
@@ -169,15 +172,18 @@ type workloadClaimRow struct {
 	Mechanism        string
 	StatementKey     string
 	Conditions       json.RawMessage
-	SourceID         uuid.UUID
-	IdentityID       uuid.UUID
-	DisplayName      string
-	AccountKind      string
-	SourceKey        string
-	K0               string `gorm:"column:k0"`
-	K1               string `gorm:"column:k1"`
-	K2               string `gorm:"column:k2"`
-	K3               string `gorm:"column:k3"`
+	// TrustNegated: the target role's trust_negated_statements lists this
+	// edge's statement key -- it was written with NotAction (D-88).
+	TrustNegated bool
+	SourceID     uuid.UUID
+	IdentityID   uuid.UUID
+	DisplayName  string
+	AccountKind  string
+	SourceKey    string
+	K0           string `gorm:"column:k0"`
+	K1           string `gorm:"column:k1"`
+	K2           string `gorm:"column:k2"`
+	K3           string `gorm:"column:k3"`
 }
 
 // workloadSectionKey is a section's cursor position: the last row's sort key
@@ -233,6 +239,7 @@ func (s workloadSection) page(q *Query, states []string, after *workloadSectionK
 	args = append([]any{q.WS}, append(args, states)...)
 	sqlText := `SELECT r.id, r.relationship_type, r.basis, r.state, r.valid_from, r.valid_to, r.ended_reason,
 	                   r.last_confirmed_at, r.connector_id, r.partition_key, r.mechanism, r.statement_key, r.conditions,
+	                   COALESCE((ia.provider_attrs -> '` + igagraph.TrustNegatedStatementsAttr + `') @> to_jsonb(r.statement_key), false) AS trust_negated,
 	                   COALESCE(r.source_identity_account_id, r.source_workload_id) AS source_id,
 	                   ia.id AS identity_id, ia.display_name, ia.account_kind, ia.source_key,
 	                   (` + keys[0] + `)::text AS k0, (` + keys[1] + `)::text AS k1,
@@ -439,8 +446,9 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 						Claim: R(RefRelationship, row.ID), Type: row.RelationshipType,
 						ViaIdentity: R(RefIdentity, row.SourceID),
 						Target:      workloadIdentityBriefOf(accts, row.IdentityID, row.DisplayName, row.AccountKind, row.SourceKey),
-						Mechanism:   row.Mechanism, StatementKey: row.StatementKey, Conditions: workloadJSONOrNull(row.Conditions),
-						Basis: row.Basis, State: row.State, StaleReason: StaleReasonOf(row.State, row.ID, reasons),
+						Mechanism:   row.Mechanism, Statement: workloadTrustStatement(row.StatementKey, row.TrustNegated),
+						Conditions: workloadJSONOrNull(row.Conditions),
+						Basis:      row.Basis, State: row.State, StaleReason: StaleReasonOf(row.State, row.ID, reasons),
 						ValidFrom: T(row.ValidFrom), ValidTo: workloadEndedAt(row.State, row.ValidTo), EndedReason: row.EndedReason,
 						LastConfirmedAt: T(row.LastConfirmedAt),
 					})
@@ -544,4 +552,12 @@ func workloadEndedAt(state string, validTo *time.Time) any {
 		return nil
 	}
 	return TS(validTo)
+}
+
+// workloadTrustStatement is a may_assume's trust statement, by Used by's own
+// rule (TrustStatementOf) with the role's NotAction flag for its key.
+func workloadTrustStatement(key string, negated bool) TrustStatement {
+	st := TrustStatementOf(key, nil)
+	st.Negated = negated
+	return st
 }

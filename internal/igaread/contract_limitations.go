@@ -12,7 +12,8 @@ package igaread
 // named one account_id where /evidence lists accounts, deny_statements_present
 // listed refs where /evidence lists statements, permissions_boundary_present
 // and negated_statement carried nothing or other fields. Same code, two
-// shapes -- the drift the frozen-contract test (p2_contract_*_test.go) pins.
+// shapes -- the drift the frozen-contract test (p2_contract_*_test.go) pins
+// (D-96).
 
 import (
 	"encoding/json"
@@ -100,4 +101,38 @@ func LimNotConnected(accounts []string) Limitation {
 // (null when not known).
 func LimSurface(code, accountID, surface, state string, since any) Limitation {
 	return Limitation{"code": code, "account_id": accountID, "surface": surface, "state": state, "since": since}
+}
+
+// HolderRestrictions reads, in this snapshot, the restrictions bearing on each
+// identity as a HOLDER: the ACTIVE Deny statements of the live attached and
+// inline assignments of it and of its live groups, and its OWN live boundary
+// policies -- by loadRestrictions, the SAME reader /evidence's
+// deny_statements_present and permissions_boundary_present come from, so a
+// graph node's restrictions and the Evidence panel of each of its grants can
+// never count different statements (D-35, D-78). Both maps are keyed by
+// identity, each list distinct and sorted; an identity with neither is
+// absent. A group's member boundaries (D-22) are not its own: they bear on
+// its grants, and /evidence computes them there.
+func (q *Query) HolderRestrictions(ids []uuid.UUID) (deny, boundary map[uuid.UUID][]uuid.UUID, err error) {
+	ins := make([]*limInput, 0, len(ids))
+	for _, id := range ids {
+		id := id
+		// A holder with no kind: loadRestrictions reads a group's members only
+		// for a group-held GRANT, which this is not.
+		ins = append(ins, &limInput{grant: true, holder: &id})
+	}
+	r, err := loadRestrictions(q, ins, true, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	deny, boundary = map[uuid.UUID][]uuid.UUID{}, map[uuid.UUID][]uuid.UUID{}
+	for _, id := range ids {
+		if d := r.denyOf(id); len(d) > 0 {
+			deny[id] = d
+		}
+		if b := uniqueIDs(r.boundary[id]); len(b) > 0 {
+			boundary[id] = b
+		}
+	}
+	return deny, boundary, nil
 }

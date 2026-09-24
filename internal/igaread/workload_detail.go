@@ -21,7 +21,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -67,20 +66,6 @@ func workloadProviderAttrsOf(raw json.RawMessage) WorkloadProviderAttrs {
 	}
 }
 
-// WorkloadSource is one entry of the detail's sources (§5.3 "the connectors
-// whose support rows hold it, with state"): one per connector, with D-1's
-// state over that connector's support rows (current if any is current, else
-// stale if any is stale, else ended) and their latest confirmation. Ended
-// supports are listed, not dropped: "A current, B ended" is the answer E10
-// asks for, and a retired workload's sources say who last held it.
-type WorkloadSource struct {
-	Integration     string `json:"integration"`
-	AccountID       string `json:"account_id"`
-	Label           string `json:"label"`
-	State           string `json:"state"`
-	LastConfirmedAt any    `json:"last_confirmed_at"`
-}
-
 // WorkloadDetail is data of GET /workloads/:id: every list row field (the
 // same builder, so a list row and the object it opens never disagree,
 // §2.14.11), plus the detail's own.
@@ -95,8 +80,14 @@ type WorkloadDetail struct {
 	RetiredReason *string               `json:"retired_reason"`
 	Continuity    string                `json:"continuity"`
 	ProviderAttrs WorkloadProviderAttrs `json:"provider_attrs"`
-	Sources       []WorkloadSource      `json:"sources"`
-	Decision      *LatestDecision       `json:"decision"`
+	// Sources is §5.3's "the connectors whose support rows hold it, with
+	// state" in the SAME shape identity and resource details give it
+	// (SupportSources): one entry per support row, as presence:<id>, with its
+	// connector, that connector's account, its state and dates (D-96). Ended
+	// supports are listed, not dropped: "A current, B ended" is E10's answer,
+	// and a retired workload's sources say who last held it.
+	Sources  []SupportSource `json:"sources"`
+	Decision *LatestDecision `json:"decision"`
 }
 
 // WorkloadDetailMeta is the detail envelope's meta (§5.2) with the detail's
@@ -166,7 +157,7 @@ func (r *Reader) WorkloadDetail(ctx context.Context, ws uuid.UUID, rawID string,
 			}
 			stale = StaleReasonOf(w.State, w.ID, reasons)
 		}
-		sources, err := q.workloadSources(accts, w.ID)
+		sources, err := SupportSources(q, accts, "workload_id", w.ID)
 		if err != nil {
 			return err
 		}
@@ -227,41 +218,6 @@ func (q *Query) LoadWorkload(id uuid.UUID) (*WorkloadDetailRecord, error) {
 		return nil, nil
 	}
 	return &rows[0], nil
-}
-
-// workloadSources is the detail's sources: one entry per connector holding a
-// support row for the workload, ordered by label, then connector id.
-func (q *Query) workloadSources(accts *Accounts, id uuid.UUID) ([]WorkloadSource, error) {
-	var rows []struct {
-		ConnectorID     uuid.UUID
-		State           string
-		LastConfirmedAt *time.Time
-	}
-	if err := q.DB().Raw(`SELECT s.connector_id,
-	                             CASE WHEN bool_or(s.state = 'current') THEN 'current'
-	                                  WHEN bool_or(s.state = 'stale')   THEN 'stale'
-	                                  ELSE 'ended' END AS state,
-	                             max(s.last_confirmed_at) AS last_confirmed_at
-	                        FROM iga_object_support s
-	                       WHERE s.workspace_id = ? AND s.workload_id = ?
-	                       GROUP BY s.connector_id`, q.WS, id).Scan(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make([]WorkloadSource, 0, len(rows))
-	for _, r := range rows {
-		src := WorkloadSource{Integration: R(RefConnector, r.ConnectorID), State: r.State, LastConfirmedAt: TS(r.LastConfirmedAt)}
-		if c := accts.Connector(r.ConnectorID); c != nil {
-			src.AccountID, src.Label = c.AccountID, c.Label
-		}
-		out = append(out, src)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Label != out[j].Label {
-			return out[i].Label < out[j].Label
-		}
-		return out[i].Integration < out[j].Integration
-	})
-	return out, nil
 }
 
 // RouteParams is D-75 for a per-object route: every query parameter must be

@@ -168,7 +168,7 @@ type ExternalPrincipalDetail struct {
 	Resolution       *ExternalResolution `json:"resolution"`
 	UnresolvedReason *string             `json:"unresolved_reason"`
 	Lifecycle        string              `json:"lifecycle"`
-	RetiredReason    string              `json:"retired_reason,omitempty"`
+	RetiredReason    *string             `json:"retired_reason"` // null while active (§5.2; D-96)
 	State            string              `json:"state"`
 	FirstSeenAt      any                 `json:"first_seen_at"`
 	LastSeenAt       any                 `json:"last_seen_at"`
@@ -292,7 +292,7 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 			LastConfirmedAt: TS(ep.LastConfirmedAt),
 		}
 		if detail.Lifecycle == models.IGALifecycleRetired {
-			detail.RetiredReason = ExternalRetiredNoLongerReferenced
+			detail.RetiredReason = strPtr(ExternalRetiredNoLongerReferenced)
 		}
 		if detail.Account != nil {
 			c := detail.Account.Connected

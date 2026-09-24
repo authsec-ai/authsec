@@ -47,8 +47,11 @@ var ResourcePolicySourceAPIs = []string{"s3:GetBucketPolicy", "kms:GetKeyPolicy"
 
 // ResourceDetailView is data of GET /resources/:id: the §5.3 list row (its
 // fields flattened in), plus existence, resource_policy and sources.
+// retired_reason is always present (null while active), as on every detail
+// route (§5.2 "Retired objects"; D-96); the list row omits it on active rows.
 type ResourceDetailView struct {
 	ResourceRow
+	RetiredReason  *string             `json:"retired_reason"`
 	Existence      string              `json:"existence"`
 	ResourcePolicy ResourcePolicyState `json:"resource_policy"`
 	Sources        []ResourceSource    `json:"sources"`
@@ -161,6 +164,7 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 		out = Envelope{
 			Data: ResourceDetailView{
 				ResourceRow:    rec.Row(accts, named, excluded, StaleReasonOf(rec.State, rec.ID, reasons)),
+				RetiredReason:  strPtr(rec.RetiredReason),
 				Existence:      ResourceExistenceNotVerified,
 				ResourcePolicy: policy,
 				Sources:        sources,

@@ -123,8 +123,10 @@ func TestP2GraphDenyAndBoundaryAreRestrictions(t *testing.T) {
 	if num(rn, "restrictions", "deny_statements") != 1 || dig(rn, "restrictions", "permissions_boundary") != true {
 		t.Errorf("role restrictions = %v, want {deny_statements: 1, permissions_boundary: true}", dig(rn, "restrictions"))
 	}
+	// D-96: the SAME fields /evidence gives the code -- count, statements,
+	// truncated.
 	d := graphLim(digl(rn, "limitations"), "deny_statements_present")
-	if d == nil || num(d, "count") != 1 || len(digl(d, "refs")) != 1 || digs(d, "refs", 0) != denyRef {
+	if d == nil || num(d, "count") != 1 || len(digl(d, "statements")) != 1 || digs(d, "statements", 0) != denyRef {
 		t.Errorf("role deny_statements_present = %v, want count 1 and the Deny statement's ref", d)
 	}
 	if !graphHasCode(digl(rn, "limitations"), "permissions_boundary_present") {
