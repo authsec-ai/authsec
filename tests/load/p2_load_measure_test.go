@@ -101,6 +101,78 @@ type loadResult struct {
 	// kind, never one per row).
 	statements []loadStatement
 	fails      []string
+	// graph is what the read's traversal responses held (Graph reads only).
+	graph loadGraphShape
+}
+
+// loadGraphShape is the size of the largest traversal response a read
+// returned -- nodes and edges (for /graph/path, the distinct ones across its
+// paths) -- every truncated.bound_by it saw, and the hard budgets the server
+// stated it ran under (meta.budgets). §5.6 judges Graph "for the display
+// defaults"; the console's only display-default parameter the server takes
+// is assume_hops (2, sent as the default), while its 150-node and 300-edge
+// display maxima are drawing limits (§5.4) the server never applies: every
+// request runs under the hard budgets. The shape says whether the measured
+// requests stayed inside the display maxima (then the two agree) or did more
+// work than a display-default drawing needs (then the time is an upper
+// bound).
+type loadGraphShape struct {
+	seen                     bool
+	nodes, edges             int
+	budgetNodes, budgetEdges int
+	boundBy                  map[string]int
+}
+
+// observe records one response body.
+func (g *loadGraphShape) observe(body map[string]any) {
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		return
+	}
+	nodes, edges := -1, -1
+	if ns, ok := data["nodes"].([]any); ok { // /graph, /graph/expand
+		es, _ := data["edges"].([]any)
+		nodes, edges = len(ns), len(es)
+	} else if ps, ok := data["paths"].([]any); ok { // /graph/path
+		nodeSet, edgeSet := map[string]bool{}, map[string]bool{}
+		for _, p := range ps {
+			pm, _ := p.(map[string]any)
+			for _, key := range []string{"nodes", "edges"} {
+				xs, _ := pm[key].([]any)
+				for _, x := range xs {
+					xm, _ := x.(map[string]any)
+					if key == "nodes" {
+						nodeSet[fmt.Sprint(xm["ref"])] = true
+					} else {
+						edgeSet[fmt.Sprint(xm["claim"])] = true
+					}
+				}
+			}
+		}
+		nodes, edges = len(nodeSet), len(edgeSet)
+	}
+	if nodes < 0 {
+		return
+	}
+	g.seen = true
+	g.nodes, g.edges = max(g.nodes, nodes), max(g.edges, edges)
+	bound := ""
+	if tr, ok := data["truncated"].(map[string]any); ok {
+		bound, _ = tr["bound_by"].(string)
+	} else if s, ok := data["bound_by"].(string); ok {
+		bound = s
+	}
+	if bound != "" {
+		if g.boundBy == nil {
+			g.boundBy = map[string]int{}
+		}
+		g.boundBy[bound]++
+	}
+	if b, ok := loadDig(body, "meta", "budgets").(map[string]any); ok {
+		n, _ := b["nodes"].(float64)
+		e, _ := b["edges"].(float64)
+		g.budgetNodes, g.budgetEdges = int(n), int(e)
+	}
 }
 
 // TestP2LoadTargets measures every §5.6 read and fails on any target missed.
@@ -268,6 +340,7 @@ func (r *loadResult) check(i int, path string, code int, raw []byte) {
 	for _, p := range loadHonest(body) {
 		fail(p)
 	}
+	r.graph.observe(body)
 }
 
 // trace is the traced pass: which statements the read's time goes to, and
@@ -514,7 +587,12 @@ func loadCases(t *testing.T, env *loadEnv) []loadCase {
 		return "/resources/" + h.starResource.String() + "/access?" + loadQS("cursor", access2)
 	})
 
-	// Graph at the display defaults (assume_hops 2, 150 nodes, 300 edges).
+	// Graph as the console asks for it at the display defaults: no
+	// assume_hops, so the server's default of 2 (§5.4, D-34). The server
+	// applies its hard budgets (500 nodes, 2 000 edges) to every request --
+	// the 150-node and 300-edge display maxima are the console's drawing
+	// limits, not a server parameter -- and the report says how large the
+	// responses were (loadGraphShape).
 	gq := func(root func(int) string, dir string) func(int) string {
 		return func(i int) string { return "/graph?" + loadQS("root", root(i), "direction", dir) }
 	}
@@ -704,9 +782,53 @@ func loadReport(env *loadEnv, results []*loadResult, n int, diagnostic string) s
 			fmt.Fprintf(&b, "| %s | %.1f | %.1f | %.1f | %d | %.1f | %.1f | %s |\n", strings.ReplaceAll(r.c.name, "|", "\\|"),
 				loadMS(r.p50), loadMS(r.p95), loadMS(r.max), len(r.statements), loadMS(r.counts), loadMS(r.slowestMS()), verdict)
 		}
+		if row == loadRowGraph {
+			loadReportGraphShapes(&b, results)
+		}
 	}
 	return b.String()
 }
+
+// loadReportGraphShapes is the Graph reads' response sizes (loadGraphShape)
+// beside the display maxima (150 nodes, 300 edges; §5.4).
+func loadReportGraphShapes(b *strings.Builder, results []*loadResult) {
+	fmt.Fprintf(b, "
+Response sizes (every measured, warm and traced response; display maxima 150 nodes, 300 edges):
+
+")
+	fmt.Fprintf(b, "| Read | Server budgets (meta.budgets) | Largest response: nodes | edges | Within the display maxima | Truncated (bound_by: responses) |
+|---|---|---:|---:|---|---|
+")
+	for _, r := range results {
+		g := r.graph
+		if !loadHasRow(r.c.rows, loadRowGraph) || !g.seen {
+			continue
+		}
+		within := "yes"
+		if g.nodes > loadDisplayNodes || g.edges > loadDisplayEdges {
+			within = "no"
+		}
+		var bound []string
+		for k, n := range g.boundBy {
+			bound = append(bound, fmt.Sprintf("%s: %d", k, n))
+		}
+		sort.Strings(bound)
+		trunc := "none"
+		if len(bound) > 0 {
+			trunc = strings.Join(bound, ", ")
+		}
+		fmt.Fprintf(b, "| %s | %d nodes, %d edges | %d | %d | %s | %s |
+", strings.ReplaceAll(r.c.name, "|", `\|`),
+			g.budgetNodes, g.budgetEdges, g.nodes, g.edges, within, trunc)
+	}
+}
+
+// The console's display maxima (§5.4 "Budgets"): drawing limits, never a
+// server parameter.
+const (
+	loadDisplayNodes = 150
+	loadDisplayEdges = 300
+)
 
 func loadHasRow(rows []string, row string) bool {
 	for _, r := range rows {

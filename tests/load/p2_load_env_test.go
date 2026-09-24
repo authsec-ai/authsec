@@ -9,20 +9,24 @@ package load
 //
 // Skipped unless IGA_LOAD_DSN names a database: the fixture is about a
 // million rows and must only ever land in a database someone chose for it.
-// It must be a Phase 2 database at 036 (the gate verifies the schema), and
-// NEVER one the integration package is using at the same time: that suite
-// empties cloud_observation and cloud_scan_run wholesale, which the fixture's
-// evidence junctions and publications forbid. For the same reason the fixture
-// is wiped when the run ends unless IGA_LOAD_KEEP=1.
+// It must be a Phase 2 database at 036 (the gate verifies the schema) that
+// is the load test's alone -- NEVER the integration package's IGA_TEST_DSN or
+// tests/igagraph's TEST_DATABASE_URL, at the same time or at any other:
+// every p2 lab empties cloud_observation and cloud_scan_run wholesale, which
+// the fixture's evidence junctions and publications forbid, so a fixture left
+// there breaks that suite. loadEnvFor refuses both (loadDSNRefusal). The
+// fixture is wiped when the run ends unless IGA_LOAD_KEEP=1.
 
 import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -43,8 +47,8 @@ const (
 	// loadDSNEnv names the database the fixture is built in.
 	loadDSNEnv = "IGA_LOAD_DSN"
 	// loadKeepEnv=1 keeps the fixture after the run, so the next run reuses it
-	// (a rebuild takes minutes); the integration suite cannot share the
-	// database while it is there.
+	// (a rebuild takes minutes). Only in a database dedicated to the load
+	// test: no other suite can use the database while the fixture is there.
 	loadKeepEnv = "IGA_LOAD_KEEP"
 	// loadIterEnv overrides the measured iterations per read (never below
 	// loadMinIterations: fewer cannot support a p95).
@@ -117,11 +121,112 @@ func loadEnvFor(t *testing.T) *loadEnv {
 	if dsn == "" {
 		t.Skipf("%s not set; skipping the T6.10 load test (point it at a Phase 2 database at 036 that nothing else is using)", loadDSNEnv)
 	}
+	// Before anything is written: never in a database another suite uses.
+	if why := loadDSNRefusal(dsn, os.Getenv); why != "" {
+		t.Fatalf("refusing to build the T6.10 fixture: %s", why)
+	}
 	loadEnvOnce.Do(func() { loadEnvVal, loadEnvErr = loadOpen(dsn) })
 	if loadEnvErr != nil {
 		t.Fatalf("load fixture: %v", loadEnvErr)
 	}
 	return loadEnvVal
+}
+
+// loadSharedDSNEnvs name the databases the other Phase 2 suites write to: the
+// integration package's (IGA_TEST_DSN; every p2 lab empties cloud_observation
+// and cloud_scan_run wholesale) and tests/igagraph's (TEST_DATABASE_URL; it
+// rebuilds its schema). The fixture's evidence junctions and publications
+// reference those tables, so a fixture in either database breaks that suite
+// (its first lab's DELETE fails on the foreign keys) and that suite would
+// break the fixture -- whether or not the two run at the same time, once
+// IGA_LOAD_KEEP=1 has left the fixture in place.
+var loadSharedDSNEnvs = []string{"IGA_TEST_DSN", "TEST_DATABASE_URL"}
+
+// loadDSNRefusal is why the fixture must not be built in dsn, or "" when
+// nothing forbids it: dsn names the same database as one of
+// loadSharedDSNEnvs, however either is spelled (URL or key=value, localhost
+// or 127.0.0.1, with or without parameters). A DSN that cannot be read is
+// refused too -- not being able to tell the databases apart is not proof that
+// they differ. getenv reads the environment (os.Getenv; tests pass their own).
+func loadDSNRefusal(dsn string, getenv func(string) string) string {
+	mine, err := loadDatabaseOf(dsn)
+	if err != nil {
+		return fmt.Sprintf("%s: %v", loadDSNEnv, err)
+	}
+	for _, env := range loadSharedDSNEnvs {
+		other := getenv(env)
+		if other == "" {
+			continue
+		}
+		theirs, err := loadDatabaseOf(other)
+		if err != nil {
+			return fmt.Sprintf("%s cannot be read (%v), so it cannot be shown to be a different database from %s; unset it or fix it",
+				env, err, loadDSNEnv)
+		}
+		if theirs == mine {
+			return fmt.Sprintf("%s and %s both name %s; the fixture needs a database of its own (for example one created from the 036 template)",
+				loadDSNEnv, env, mine)
+		}
+	}
+	return ""
+}
+
+// loadDatabaseOf is the database a PostgreSQL DSN names, as "host:port/dbname",
+// with libpq's defaults filled in (port 5432, host localhost, dbname = user)
+// and the loopback spellings folded into "localhost". It reads both the URL
+// form (postgres://user:pw@host:port/db?...) and the key=value form. Its
+// errors never repeat the DSN, which may carry a password.
+func loadDatabaseOf(dsn string) (string, error) {
+	host, port, db, user := "", "", "", ""
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", errors.New("not a valid postgres:// URL") // never echo the DSN: it may carry a password
+		}
+		host, port, db = u.Hostname(), u.Port(), strings.TrimPrefix(u.Path, "/")
+		if u.User != nil {
+			user = u.User.Username()
+		}
+		// libpq lets the query override the authority.
+		q := u.Query()
+		for key, dst := range map[string]*string{"host": &host, "port": &port, "dbname": &db, "user": &user} {
+			if v := q.Get(key); v != "" {
+				*dst = v
+			}
+		}
+	} else {
+		for _, f := range strings.Fields(dsn) {
+			key, v, ok := strings.Cut(f, "=")
+			if !ok {
+				return "", errors.New("neither a postgres:// URL nor key=value pairs")
+			}
+			v = strings.Trim(v, "'")
+			switch key {
+			case "host":
+				host = v
+			case "port":
+				port = v
+			case "dbname":
+				db = v
+			case "user":
+				user = v
+			}
+		}
+	}
+	if db == "" {
+		db = user
+	}
+	if db == "" {
+		return "", errors.New("names no database")
+	}
+	switch strings.ToLower(host) {
+	case "", "localhost", "127.0.0.1", "::1":
+		host = "localhost"
+	}
+	if port == "" {
+		port = "5432"
+	}
+	return strings.ToLower(host) + ":" + port + "/" + db, nil
 }
 
 // TestMain wipes the fixture once every test has run, unless IGA_LOAD_KEEP=1.

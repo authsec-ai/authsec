@@ -6,8 +6,10 @@ package integration
 // must give every reference the same pages -- through the lab's REAL scans
 // and projections, over each state D-18 distinguishes: a role's own grant, a
 // group's grant expanded to its members, a member who left (ended with
-// include_ended), a grant that began after the member left (never his), and a
-// detached policy's ended grant.
+// include_ended), a grant that began after the member left (never his), a
+// detached policy's ended grant, and that ended grant BESIDE a current one of
+// the same holder on the same reference (the default page lists the holder,
+// and must still leave the ended row out).
 
 import (
 	"context"
@@ -23,7 +25,8 @@ import (
 
 // Safeguards (mutation-checked): the identity-first page's direct probe, its
 // member probe, the membership overlap on its member rows, its states on the
-// membership, and its cursor predicate.
+// membership, its states on a listed holder's direct rows, and its cursor
+// predicate.
 func TestP2LoadAccessStrategiesAgreeOnTheLab(t *testing.T) {
 	l := newP2Lab(t, "p2-load-access-strategies", true)
 	a := l.account(accountA)
@@ -36,6 +39,12 @@ func TestP2LoadAccessStrategiesAgreeOnTheLab(t *testing.T) {
 	s3aGroupAttach(t, a, "ops", opsRead)
 	a.role("deployer", "AROADEPLOYERDEPLOYE1")
 	a.attach("deployer", opsRead)
+	// deployer also reaches "*" through a policy of its own, which it keeps
+	// when OpsRead is detached below: then it holds an ended and a current
+	// grant on "*" -- a holder the default page lists, beside a row it must
+	// not. (Only "*": ops-bucket/*'s five rows stay as they are.)
+	a.attach("deployer", changesManaged(a, "DeployWide", `{"Version":"2012-10-17","Statement":[{"Sid":"DeployWide",`+
+		`"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}`))
 	a.role("auditor", "AROAAUDITORAUDITORA1")
 	a.attach("auditor", opsRead)
 	a.iam.userGroups["priya"] = []string{"ops"}
@@ -84,6 +93,27 @@ func TestP2LoadAccessStrategiesAgreeOnTheLab(t *testing.T) {
 	a.iam.userGroups["bob"] = nil
 	a.detach("deployer", opsRead)
 	l.scanAndProject(a)
+	// The state that makes the direct rows' state filter matter must be there:
+	// on "*" deployer is listed by default with DeployWide's current row only,
+	// and include_ended adds OpsRead's ended one.
+	star := "/resources/" + rdetailResource(t, l, "*") + "/access"
+	for _, c := range []struct {
+		query string
+		want  map[string]string // policy name -> row state
+	}{
+		{"", map[string]string{"DeployWide": "current"}},
+		{"?include_ended=true", map[string]string{"DeployWide": "current", "OpsRead": "ended"}},
+	} {
+		got := map[string]string{}
+		for _, row := range digl(rdetailGet(t, l.api(), star+c.query), "data", "access") {
+			if digs(row, "holder", "name") == "deployer" {
+				got[digs(row, "policy", "name")] = digs(row, "state")
+			}
+		}
+		if len(got) != len(c.want) || got["DeployWide"] != c.want["DeployWide"] || got["OpsRead"] != c.want["OpsRead"] {
+			t.Fatalf("fixture: deployer's rows on \"*\"%s = %v, want %v", c.query, got, c.want)
+		}
+	}
 	compare("a member left, a policy detached")
 
 	// A grant that begins after bob left never reaches him -- on later-bucket/*,
