@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -69,18 +70,33 @@ const (
 	// index resolvable, so the console can show the result and a late duplicate
 	// callback is answered consistently.
 	awsOnbTerminalTTL = time.Hour
-	// awsOnbLockTTL outlives the longest a single message can take: the callback
-	// deadline plus the regional probes. See awsCallbackVisibility.
-	awsOnbLockTTL = 15 * time.Minute
+	// awsOnbLockTTL is short and refreshed every awsOnbLockRefresh while the
+	// holder works, so a worker that crashes releases the session within
+	// minutes instead of stranding it past the stack's ServiceTimeout.
+	awsOnbLockTTL     = 3 * time.Minute
+	awsOnbLockRefresh = time.Minute
+	// awsOnbActiveTTL is the floor for a session's lifetime while a callback is
+	// being handled, so its ExternalId index cannot expire mid-onboarding.
+	awsOnbActiveTTL = 15 * time.Minute
 	// awsCallbackDeadline is how long after CloudFormation published a request
 	// AuthSec keeps retrying before it answers anyway. 60s inside the template's
 	// ServiceTimeout of 600s, so the final answer always arrives before
 	// CloudFormation gives up on its own.
 	awsCallbackDeadline = 540 * time.Second
+	// awsAnswerReserve is kept free before the deadline for the answer itself:
+	// saving the session and up to three PUTs to CloudFormation. No Onboard
+	// attempt may still be running once the reserve starts.
+	awsAnswerReserve = 40 * time.Second
 	// awsIAMPropagationBudget bounds retrying AccessDenied right after the role
 	// was created. A new role's trust policy takes a few seconds to be honoured
 	// by STS; a trust policy that is simply wrong never will be.
 	awsIAMPropagationBudget = 90 * time.Second
+	// awsAuthSecErrorBudget bounds retrying an AuthSec-side failure that does
+	// not heal by itself — Vault unreachable or unmounted, the database, AuthSec's
+	// own AWS credentials. Retrying those to the deadline only made the customer
+	// watch "Verifying…" for nine minutes before the same failure. Throttling
+	// and timeouts, which do heal, are still retried to the deadline.
+	awsAuthSecErrorBudget = 60 * time.Second
 	// awsCallbackMaxAttempts caps callback attempts per session, so a flood of
 	// forged messages carrying a leaked ExternalId cannot drive AssumeRole calls.
 	awsCallbackMaxAttempts = 5
@@ -195,6 +211,10 @@ type AWSOnboardingSession struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// TerminalAt is when the session first became connected or failed. Its
+	// lifetime is fixed from that moment, so later messages (duplicates, or
+	// forgeries carrying a leaked ExternalId) can never keep it alive.
+	TerminalAt *time.Time `json:"terminal_at,omitempty"`
 }
 
 // AWSOnboardingSessionView is what the console is shown: the session without
@@ -411,6 +431,17 @@ func (s *AWSQuickCreateService) StartSession(
 			break
 		}
 	}
+	// When the stack's region is not scanned, never let an opt-in region be the
+	// one Onboard probes: if the customer has not enabled it, the whole
+	// connection would fail on a region that is only in scope, not required.
+	if awsdiscovery.IsOptInRegion(regs[0]) {
+		for i, r := range regs {
+			if !awsdiscovery.IsOptInRegion(r) {
+				regs = append([]string{r}, append(regs[:i:i], regs[i+1:]...)...)
+				break
+			}
+		}
+	}
 
 	templateURL := s.cfg.TemplateURLFor(dr)
 	if err := s.templateCheck(ctx, templateURL); err != nil {
@@ -496,18 +527,25 @@ func (s *AWSQuickCreateService) loadSession(ctx context.Context, id uuid.UUID) (
 	return &sess, nil
 }
 
-// saveSession writes a session back. A terminal session gets a fresh TTL so
-// its result stays readable; the ExternalId index moves with it, so a late
-// duplicate callback still finds the session and gets the same answer.
+// saveSession writes a session back, the ExternalId index with it.
+//
+// A session that has just become terminal is kept readable for
+// awsOnbTerminalTTL from that moment — once. Later saves never extend it. A
+// session still being worked on is kept at least awsOnbActiveTTL, so its index
+// cannot expire between the lookup and the answer.
 func (s *AWSQuickCreateService) saveSession(ctx context.Context, sess *AWSOnboardingSession) error {
 	now := s.now().UTC()
 	sess.UpdatedAt = now
-	ttl := sess.ExpiresAt.Sub(now)
-	if sess.terminal() {
+	if sess.terminal() && sess.TerminalAt == nil {
+		sess.TerminalAt = &now
 		sess.ExpiresAt = now.Add(awsOnbTerminalTTL)
-		ttl = awsOnbTerminalTTL
+	}
+	ttl := sess.ExpiresAt.Sub(now)
+	if !sess.terminal() && ttl < awsOnbActiveTTL {
+		ttl = awsOnbActiveTTL
 	}
 	if ttl <= 0 {
+		// A terminal session past its lifetime: keep it only briefly.
 		ttl = time.Minute
 	}
 	payload, err := json.Marshal(sess)
@@ -544,6 +582,15 @@ func (l callbackLog) emit(outcome, code, msg string) {
 // HandleCallbackMessage processes one SQS message body. See the file comment
 // for the trust model; every check runs before any AWS call.
 func (s *AWSQuickCreateService) HandleCallbackMessage(ctx context.Context, body string) CallbackOutcome {
+	return s.HandleCallbackDelivery(ctx, body, false)
+}
+
+// HandleCallbackDelivery is HandleCallbackMessage for a queue consumer that
+// knows how often the message has been delivered. lastChance means SQS will
+// move it to the DLQ instead of delivering it again: a transient failure is
+// then answered FAILED now, because an unanswered stack only fails after its
+// full ServiceTimeout, with no reason the customer can read.
+func (s *AWSQuickCreateService) HandleCallbackDelivery(ctx context.Context, body string, lastChance bool) CallbackOutcome {
 	lg := callbackLog{stage: "envelope"}
 
 	// 1. Envelope: ours, and a well-formed request for our resource.
@@ -593,12 +640,12 @@ func (s *AWSQuickCreateService) HandleCallbackMessage(ctx context.Context, body 
 		lg.emit(out.String(), "", "answered SUCCESS without changes")
 		return out
 	}
-	return s.handleCreate(ctx, env, req, stack, target, deadline, lg)
+	return s.handleCreate(ctx, env, req, stack, target, deadline, lastChance, lg)
 }
 
 func (s *AWSQuickCreateService) handleCreate(
 	ctx context.Context, env *awsdiscovery.SNSEnvelope, req *awsdiscovery.CFNRequest,
-	stack awsdiscovery.StackRef, target *url.URL, deadline time.Time, lg callbackLog,
+	stack awsdiscovery.StackRef, target *url.URL, deadline time.Time, lastChance bool, lg callbackLog,
 ) CallbackOutcome {
 	props := req.ResourceProperties
 	lg.stage = "session"
@@ -612,9 +659,12 @@ func (s *AWSQuickCreateService) handleCreate(
 		lg.emit(out.String(), code, msg)
 		return out
 	}
+	// transient hands a recoverable failure back to the queue — unless the
+	// deadline has passed or this is the queue's last delivery, when the stack
+	// is better served by an honest FAILED now than by a silent timeout later.
 	transient := func(msg string) CallbackOutcome {
-		if s.now().After(deadline) {
-			return failNoSession(AWSOnbCodeAuthSecUnavailable, "past deadline: "+msg)
+		if !s.now().Before(deadline) || lastChance {
+			return failNoSession(AWSOnbCodeAuthSecUnavailable, "final delivery or past deadline: "+msg)
 		}
 		lg.emit(CallbackRetry.String(), "", msg)
 		return CallbackRetry
@@ -637,16 +687,19 @@ func (s *AWSQuickCreateService) handleCreate(
 	}
 	lg.session = id.String()
 
-	locked, err := s.redis.SetNX(ctx, awsOnbLockKey(id), "1", awsOnbLockTTL).Result()
+	release, locked, err := s.acquireSessionLock(ctx, id)
 	if err != nil {
 		return transient("session lock: " + err.Error())
 	}
 	if !locked {
-		// Another worker holds this session. Its answer will be stored; this
-		// delivery comes back and replays it.
-		return transient("session is being processed by another worker")
+		// Another worker holds this session and will answer this same request
+		// itself. Never answer here — not even past the deadline — or a FAILED
+		// from this duplicate could overtake the holder's SUCCESS. Come back and
+		// replay whatever the holder stored.
+		lg.emit(CallbackRetry.String(), "", "session is being processed by another worker")
+		return CallbackRetry
 	}
-	defer s.redis.Del(context.WithoutCancel(ctx), awsOnbLockKey(id))
+	defer release()
 
 	sess, err := s.loadSession(ctx, id)
 	if err != nil {
@@ -686,15 +739,22 @@ func (s *AWSQuickCreateService) handleCreate(
 		return out
 	}
 
-	// fail records a FAILED answer against the session and delivers it.
+	// fail answers FAILED and, while the session is still live, records that
+	// answer for replay. Past the attempt cap nothing is written at all, and a
+	// finished session records only its attempt count: messages carrying a
+	// leaked ExternalId can neither grow the session nor keep it alive.
 	fail := func(code, msg string, markSession bool) CallbackOutcome {
 		reason := awsOnbReasons[code] + " AuthSec ref: " + sess.ref()
-		sess.Results[key] = awsStoredResult{Status: awsdiscovery.CFNStatusFailed, Reason: reason}
-		if markSession && !sess.terminal() {
-			sess.Status, sess.Code, sess.Message = AWSOnbFailed, code, awsOnbReasons[code]
-		}
-		if err := s.saveSession(ctx, sess); err != nil {
-			return transient("save session: " + err.Error())
+		if sess.Attempts <= awsCallbackMaxAttempts {
+			if !sess.terminal() {
+				sess.Results[key] = awsStoredResult{Status: awsdiscovery.CFNStatusFailed, Reason: reason}
+				if markSession {
+					sess.Status, sess.Code, sess.Message = AWSOnbFailed, code, awsOnbReasons[code]
+				}
+			}
+			if err := s.saveSession(ctx, sess); err != nil {
+				return transient("save session: " + err.Error())
+			}
 		}
 		out := answer(awsdiscovery.CFNStatusFailed, reason)
 		lg.emit(out.String(), code, msg)
@@ -737,10 +797,8 @@ func (s *AWSQuickCreateService) handleCreate(
 	// connection consistently and refuses anything else.
 	if sess.terminal() {
 		if sess.Status == AWSOnbConnected && sess.AccountID == stack.AccountID && sess.RoleARN == props.RoleArn {
-			sess.Results[key] = awsStoredResult{Status: awsdiscovery.CFNStatusSuccess}
-			if err := s.saveSession(ctx, sess); err != nil {
-				return transient("save session: " + err.Error())
-			}
+			// Nothing to record: the session is finished and the answer is
+			// derived from it, so a repeat gets the same answer without a write.
 			out := answer(awsdiscovery.CFNStatusSuccess, "")
 			lg.emit(out.String(), "", "session already connected to this role")
 			return out
@@ -780,10 +838,18 @@ func (s *AWSQuickCreateService) handleCreate(
 	cid := connector.ID
 	sess.ConnectorID = &cid
 	sess.Results[key] = awsStoredResult{Status: awsdiscovery.CFNStatusSuccess}
+	s.auditConnected(sess, connector, stack)
 	// Stored BEFORE answering, so a redelivery after a lost answer replays
 	// SUCCESS instead of connecting a second time.
+	//
+	// A failed save must NOT turn into a FAILED answer: the connection is
+	// already proven and written (Vault + connector row), and FAILED would roll
+	// the stack back and delete the very role the connector now points at.
+	// Answer SUCCESS regardless. The worst case of a lost save is a redelivery
+	// that runs Onboard again, which upserts the same row.
 	if err := s.saveSession(ctx, sess); err != nil {
-		return transient("save session: " + err.Error())
+		log.Printf("[aws-onb] ALERT stage=respond outcome=save_failed session=%s ref=%s err=%v (answering SUCCESS anyway)",
+			sess.ID, sess.ref(), err)
 	}
 
 	lg.stage = "respond"
@@ -799,22 +865,42 @@ func (s *AWSQuickCreateService) handleCreate(
 	return out
 }
 
-// onboardWithRetry runs the existing Onboard until it succeeds, a customer-side
-// failure is final, or the deadline arrives.
+// onboardWithRetry runs the existing Onboard until it succeeds, a failure is
+// final, or the time left runs out.
 //
-// AccessDenied right after the stack created the role is usually IAM
-// propagation, so it is retried for awsIAMPropagationBudget. AuthSec-side
-// failures (AuthSec's own credentials, Vault, the database, STS timeouts and
-// throttling) are retried until the deadline: a customer must not lose a
-// stack to a bad minute on AuthSec's side.
+// Three kinds of failure, three budgets:
+//   - AccessDenied from the customer's trust policy right after the stack
+//     created the role is usually IAM propagation: retried for
+//     awsIAMPropagationBudget, then reported as the customer's to fix.
+//   - Throttling and probe timeouts heal by themselves: retried until the last
+//     moment an attempt can still finish.
+//   - Everything else on AuthSec's side — Vault, the database, AuthSec's own
+//     AWS credentials — does not heal within one onboarding: retried for
+//     awsAuthSecErrorBudget, then answered FAILED instead of making the
+//     customer wait out the whole deadline for the same error.
+//
+// No attempt may still be running once awsAnswerReserve before the deadline
+// begins, so the answer to CloudFormation always goes out in time: an attempt
+// starts only if a full awsOnboardingTimeout fits before the reserve, and its
+// context ends at the reserve regardless.
 func (s *AWSQuickCreateService) onboardWithRetry(
 	ctx context.Context, sess *AWSOnboardingSession, roleARN string, deadline time.Time,
 ) (*models.CloudConnector, error) {
 	const baseDelay = 3 * time.Second
+	answerBy := deadline.Add(-awsAnswerReserve)
+	lastStart := answerBy.Add(-awsOnboardingTimeout)
 	start := s.now()
 	in := AWSOnboardInput{RoleARN: roleARN, ExternalID: sess.ExternalID, Regions: sess.Regions}
 	for attempt := 1; ; attempt++ {
-		connector, _, err := s.onboard(ctx, sess.WorkspaceID, in, sess.CreatedBy)
+		// !Before, not After: the wait below is capped at lastStart, so the loop
+		// lands exactly on it, where After is still false and the next wait
+		// would be zero — a spin.
+		if attempt > 1 && !s.now().Before(lastStart) {
+			return nil, onbErr(AWSOnbCodeAuthSecUnavailable, "no time left for another attempt before the deadline")
+		}
+		actx, cancel := context.WithDeadline(ctx, answerBy)
+		connector, _, err := s.onboard(actx, sess.WorkspaceID, in, sess.CreatedBy)
+		cancel()
 		if err == nil {
 			return connector, nil
 		}
@@ -827,28 +913,56 @@ func (s *AWSQuickCreateService) onboardWithRetry(
 			// session landed in another). Permanent. Matched on its message
 			// because Onboard's body is deliberately left unchanged.
 			return nil, onbErr(AWSOnbCodeAccountMismatch, "%v", err)
-		// !Before rather than After: the wait below is capped at the time left, so
-		// the loop lands exactly ON the deadline, where After is still false and
-		// the next wait would be zero — a spin.
+		case isAuthSecCredentialError(err):
+			// classify() files these under ErrNotAssumable, but they mean
+			// AuthSec's OWN credentials are bad or expired — nothing the
+			// customer's trust policy can fix.
+			if now.Sub(start) >= awsAuthSecErrorBudget {
+				return nil, onbErr(AWSOnbCodeAuthSecUnavailable, "%v", err)
+			}
 		case errors.Is(err, awsdiscovery.ErrNotAssumable):
-			if now.Sub(start) >= awsIAMPropagationBudget || !now.Before(deadline) {
+			if now.Sub(start) >= awsIAMPropagationBudget {
 				return nil, onbErr(AWSOnbCodeAssumeDenied, "%v", err)
 			}
+		case errors.Is(err, awsdiscovery.ErrThrottled), errors.Is(err, ErrAWSProbeTimeout),
+			errors.Is(err, context.DeadlineExceeded):
+			// Heals by itself; the lastStart check above ends it in time.
 		default:
-			if !now.Before(deadline) {
+			if now.Sub(start) >= awsAuthSecErrorBudget {
 				return nil, onbErr(AWSOnbCodeAuthSecUnavailable, "%v", err)
 			}
 		}
 		log.Printf("[aws-onb] stage=onboard outcome=retry session=%s ref=%s attempt=%d err=%v",
 			sess.ID, sess.ref(), attempt, err)
 		wait := retryBackoff(baseDelay, attempt)
-		if left := deadline.Sub(now); wait > left {
+		// Never sleep past the last moment an attempt may start; with nothing
+		// left, the check at the top of the loop ends it. A non-positive wait
+		// returns at once, and the loop cannot spin: the next iteration either
+		// starts a real attempt or returns.
+		if left := lastStart.Sub(now); wait > left {
 			wait = left
 		}
 		if err := s.sleep(ctx, wait); err != nil {
 			return nil, onbErr(AWSOnbCodeAuthSecUnavailable, "%v", err)
 		}
 	}
+}
+
+// isAuthSecCredentialError reports whether an assume-role failure is about
+// AuthSec's own base credentials (invalid, expired, mis-signed) rather than the
+// customer's trust policy. classify() keeps the AWS error code in the message
+// as "(Code)", which is what this matches on.
+func isAuthSecCredentialError(err error) bool {
+	if errors.Is(err, awsdiscovery.ErrNoBaseCredentials) {
+		return true
+	}
+	msg := err.Error()
+	for _, code := range []string{"(InvalidClientTokenId)", "(ExpiredToken)", "(SignatureDoesNotMatch)"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // deliver answers CloudFormation. A 5xx or transport error is retried a few
@@ -896,6 +1010,16 @@ func (s *AWSQuickCreateService) probeAndSave(ctx context.Context, sess *AWSOnboa
 		wg.Add(1)
 		go func(region string) {
 			defer wg.Done()
+			// A panic in one probe must not take the backend down with it; the
+			// region simply reads as not checked.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[aws-onb] ALERT stage=probe outcome=panic region=%s err=%v", region, r)
+					mu.Lock()
+					results[region] = AWSRegionProbe{Status: "not_reachable", Reason: "error"}
+					mu.Unlock()
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			pctx, cancel := context.WithTimeout(ctx, awsProbeTimeout)
@@ -993,6 +1117,87 @@ func newTemplateChecker(now func() time.Time) func(ctx context.Context, template
 		mu.Unlock()
 		return err
 	}
+}
+
+/* ---------------------------------- lock ----------------------------------- */
+
+// Compare-and-delete and compare-and-extend: a worker only ever releases or
+// extends the lock it holds. A plain DEL would let a worker that overran the
+// TTL delete the lock a second worker has since taken.
+var (
+	awsOnbUnlockScript = redis.NewScript(
+		`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) end return 0`)
+	awsOnbExtendScript = redis.NewScript(
+		`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) end return 0`)
+)
+
+// acquireSessionLock takes the per-session lock with a random owner token and
+// keeps it alive while the caller works. release stops the keep-alive and
+// deletes the lock only if it is still ours. A worker that dies simply stops
+// extending, so the lock frees itself within awsOnbLockTTL.
+func (s *AWSQuickCreateService) acquireSessionLock(ctx context.Context, id uuid.UUID) (release func(), ok bool, err error) {
+	token := uuid.NewString()
+	key := awsOnbLockKey(id)
+	ok, err = s.redis.SetNX(ctx, key, token, awsOnbLockTTL).Result()
+	if err != nil || !ok {
+		return func() {}, ok, err
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(awsOnbLockRefresh)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				_ = awsOnbExtendScript.Run(context.WithoutCancel(ctx), s.redis, []string{key},
+					token, awsOnbLockTTL.Milliseconds()).Err()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+		_ = awsOnbUnlockScript.Run(context.WithoutCancel(ctx), s.redis, []string{key}, token).Err()
+	}, true, nil
+}
+
+/* ---------------------------------- audit ---------------------------------- */
+
+// auditConnected records a Quick Create connection the way the manual flow's
+// POST /aws/connectors records its own: connecting an AWS account is a
+// security-relevant mutation, whichever path made it. There is no HTTP request
+// behind a callback, so the actor is the session's creator and the path names
+// the stack that reported back.
+func (s *AWSQuickCreateService) auditConnected(
+	sess *AWSOnboardingSession, connector *models.CloudConnector, stack awsdiscovery.StackRef,
+) {
+	if config.AuditLogger == nil {
+		return
+	}
+	config.AuditLogger.LogAdminAction(
+		sess.ID.String(),
+		sess.WorkspaceID.String(),
+		sess.CreatedBy,
+		"onboard",
+		"cloud_connector",
+		connector.ID.String(),
+		"CALLBACK",
+		"aws-quick-create/"+stack.Region+"/"+sess.StackName,
+		"",
+		"aws-cloudformation",
+		200,
+		0,
+		nil,
+		map[string]any{
+			"source": "quick_create", "account_id": connector.ScopeID, "role_arn": sess.RoleARN,
+			"regions": sess.Regions, "previous_role_arn": sess.PreviousRoleARN,
+		},
+		"",
+	)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

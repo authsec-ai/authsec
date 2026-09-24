@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -11,28 +13,40 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 // The Quick Create callback worker: drains the central SQS queue every
 // regional callback topic delivers to, and hands each message to
-// AWSQuickCreateService.HandleCallbackMessage.
+// AWSQuickCreateService.HandleCallbackDelivery.
 //
 // Safe on every replica. SQS hides a received message from other consumers
-// for the visibility timeout, and the service takes a per-session Redis lock,
+// while it is being handled, and the service takes a per-session Redis lock,
 // so two replicas never connect the same launch twice. A message is deleted
 // only once it is handled; anything else comes back.
 const (
-	// awsCallbackVisibility outlasts the longest a single message can take:
-	// the 540s callback deadline plus the regional probes. Shorter, and a slow
-	// message would reappear to a second worker while the first still holds it.
-	awsCallbackVisibility = 15 * time.Minute
+	// awsCallbackVisibility is how long a received message stays hidden. Short,
+	// and extended every awsCallbackHeartbeat while the message is still being
+	// handled: a worker that crashes or is redeployed releases its messages
+	// within minutes, well inside the stack's 600s ServiceTimeout, instead of
+	// stranding them for the whole handling budget.
+	awsCallbackVisibility = 2 * time.Minute
+	awsCallbackHeartbeat  = time.Minute
 	// awsCallbackRetryVisibility is how soon a transiently failed message
 	// becomes visible again. Well inside the callback deadline, so several
 	// retries fit before AuthSec must answer.
 	awsCallbackRetryVisibility = 30 * time.Second
 	awsCallbackWait            = 20 // seconds; SQS long-poll maximum
-	awsCallbackBatch           = 5
-	awsCallbackErrorBackoff    = 10 * time.Second
+	awsCallbackMaxBatch        = 10 // SQS maximum per receive
+	// awsCallbackConcurrency bounds how many callbacks one replica handles at
+	// once. Each can spend minutes retrying Onboard; the bound keeps a burst from
+	// exhausting STS and database connections, while a slow one never blocks the
+	// rest (there is no per-batch barrier).
+	awsCallbackConcurrency = 16
+	// awsCallbackDefaultMaxReceives is assumed when the queue's redrive policy
+	// cannot be read. It matches the runbook's recommended setting.
+	awsCallbackDefaultMaxReceives = 25
+	awsCallbackErrorBackoff       = 10 * time.Second
 )
 
 // sqsAPI is the slice of the SQS client the worker uses, so it can be
@@ -41,6 +55,7 @@ type sqsAPI interface {
 	ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, opts ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	DeleteMessage(ctx context.Context, in *sqs.DeleteMessageInput, opts ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
 	ChangeMessageVisibility(ctx context.Context, in *sqs.ChangeMessageVisibilityInput, opts ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	GetQueueAttributes(ctx context.Context, in *sqs.GetQueueAttributesInput, opts ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error)
 }
 
 // AWSCallbackWorker consumes the callback queue.
@@ -48,6 +63,11 @@ type AWSCallbackWorker struct {
 	svc      *AWSQuickCreateService
 	client   sqsAPI
 	queueURL string
+	// maxReceives is the queue's redrive maxReceiveCount: the delivery on which
+	// a message would next go to the DLQ is its last chance to be answered.
+	maxReceives int
+	slots       chan struct{}
+	heartbeat   time.Duration
 }
 
 // NewAWSCallbackWorker builds the worker against real SQS, using AuthSec's own
@@ -63,12 +83,58 @@ func NewAWSCallbackWorker(ctx context.Context, svc *AWSQuickCreateService) (*AWS
 	if err != nil {
 		return nil, fmt.Errorf("aws callback worker: %w", err)
 	}
-	return &AWSCallbackWorker{svc: svc, client: sqs.NewFromConfig(cfg), queueURL: queueURL}, nil
+	w := newAWSCallbackWorker(svc, sqs.NewFromConfig(cfg), queueURL)
+	w.maxReceives = w.readMaxReceives(ctx)
+	return w, nil
 }
 
-// Run consumes until the context ends.
+func newAWSCallbackWorker(svc *AWSQuickCreateService, client sqsAPI, queueURL string) *AWSCallbackWorker {
+	return &AWSCallbackWorker{
+		svc: svc, client: client, queueURL: queueURL,
+		maxReceives: awsCallbackDefaultMaxReceives,
+		slots:       make(chan struct{}, awsCallbackConcurrency),
+		heartbeat:   awsCallbackHeartbeat,
+	}
+}
+
+// readMaxReceives reads the queue's redrive policy. Without one there is no
+// DLQ and no last chance to detect; the default then only decides when the
+// worker stops waiting for a transient failure to clear.
+func (w *AWSCallbackWorker) readMaxReceives(ctx context.Context) int {
+	out, err := w.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(w.queueURL),
+		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameRedrivePolicy},
+	})
+	if err != nil {
+		log.Printf("[aws-onb] ALERT stage=worker outcome=no_redrive_policy err=%v (assuming maxReceiveCount=%d)",
+			err, awsCallbackDefaultMaxReceives)
+		return awsCallbackDefaultMaxReceives
+	}
+	raw := out.Attributes[string(sqstypes.QueueAttributeNameRedrivePolicy)]
+	var policy struct {
+		MaxReceiveCount json.Number `json:"maxReceiveCount"`
+	}
+	if raw == "" || json.Unmarshal([]byte(raw), &policy) != nil {
+		log.Printf("[aws-onb] ALERT stage=worker outcome=no_redrive_policy (assuming maxReceiveCount=%d)",
+			awsCallbackDefaultMaxReceives)
+		return awsCallbackDefaultMaxReceives
+	}
+	n, err := strconv.Atoi(policy.MaxReceiveCount.String())
+	if err != nil || n < 1 {
+		return awsCallbackDefaultMaxReceives
+	}
+	if n < 10 {
+		log.Printf("[aws-onb] ALERT stage=worker queue maxReceiveCount=%d is low: transient failures reach the "+
+			"DLQ within minutes. The runbook recommends %d.", n, awsCallbackDefaultMaxReceives)
+	}
+	return n
+}
+
+// Run consumes until the context ends. Each message is handled as soon as it
+// arrives, up to awsCallbackConcurrency at once; a slow one never holds up the
+// rest.
 func (w *AWSCallbackWorker) Run(ctx context.Context) {
-	log.Printf("aws callback worker started on %s", w.queueURL)
+	log.Printf("aws callback worker started on %s (maxReceiveCount=%d)", w.queueURL, w.maxReceives)
 	for {
 		select {
 		case <-ctx.Done():
@@ -76,7 +142,7 @@ func (w *AWSCallbackWorker) Run(ctx context.Context) {
 			return
 		default:
 		}
-		if _, err := w.RunOnce(ctx); err != nil {
+		if _, err := w.receiveAndDispatch(ctx, nil); err != nil {
 			log.Printf("[aws-onb] ALERT stage=worker outcome=receive_failed err=%v", err)
 			select {
 			case <-ctx.Done():
@@ -87,39 +153,101 @@ func (w *AWSCallbackWorker) Run(ctx context.Context) {
 	}
 }
 
-// RunOnce receives one batch and handles it. Messages in a batch are handled
-// concurrently: each can spend minutes retrying Onboard, and handling them one
-// after another would push later ones past their callback deadline.
+// RunOnce receives one batch, handles it, and waits for it to finish. For
+// tests and one-shot use; Run does not wait.
 func (w *AWSCallbackWorker) RunOnce(ctx context.Context) (int, error) {
+	var wg sync.WaitGroup
+	n, err := w.receiveAndDispatch(ctx, &wg)
+	wg.Wait()
+	return n, err
+}
+
+// receiveAndDispatch waits for a free slot, receives as many messages as there
+// are free slots (up to SQS's batch maximum), and starts each one.
+func (w *AWSCallbackWorker) receiveAndDispatch(ctx context.Context, wg *sync.WaitGroup) (int, error) {
+	// Block until at least one slot is free, so the worker never holds a
+	// message it cannot start.
+	select {
+	case w.slots <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	free := 1 + (cap(w.slots) - len(w.slots))
+	if free > awsCallbackMaxBatch {
+		free = awsCallbackMaxBatch
+	}
 	out, err := w.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(w.queueURL),
-		MaxNumberOfMessages: awsCallbackBatch,
+		MaxNumberOfMessages: int32(free),
 		WaitTimeSeconds:     awsCallbackWait,
 		VisibilityTimeout:   int32(awsCallbackVisibility / time.Second),
+		MessageSystemAttributeNames: []sqstypes.MessageSystemAttributeName{
+			sqstypes.MessageSystemAttributeNameApproximateReceiveCount,
+		},
 	})
-	if err != nil {
+	if err != nil || len(out.Messages) == 0 {
+		<-w.slots
 		return 0, err
 	}
-	var wg sync.WaitGroup
-	for _, m := range out.Messages {
-		wg.Add(1)
-		go func(body, receipt string) {
-			defer wg.Done()
-			// A panic in one message must not take the backend down with it, and
-			// must not strand the message for the full visibility timeout — that
-			// is longer than the stack's ServiceTimeout, so the customer's stack
-			// would fail. Recover, and hand it back for a prompt retry.
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[aws-onb] ALERT stage=worker outcome=panic err=%v", r)
-					w.settle(ctx, receipt, CallbackRetry)
-				}
-			}()
-			w.settle(ctx, receipt, w.svc.HandleCallbackMessage(ctx, body))
-		}(aws.ToString(m.Body), aws.ToString(m.ReceiptHandle))
+	for i, m := range out.Messages {
+		if i > 0 {
+			// The first message uses the slot taken above; each further one
+			// takes its own. There were at least `free` slots, so this does not
+			// block for long.
+			w.slots <- struct{}{}
+		}
+		if wg != nil {
+			wg.Add(1)
+		}
+		go w.handle(ctx, m, wg)
 	}
-	wg.Wait()
 	return len(out.Messages), nil
+}
+
+// handle processes one message: keeps it hidden while it is being worked on,
+// passes the last-chance flag, settles it, and frees its slot.
+func (w *AWSCallbackWorker) handle(ctx context.Context, m sqstypes.Message, wg *sync.WaitGroup) {
+	receipt := aws.ToString(m.ReceiptHandle)
+	stop := make(chan struct{})
+	beatDone := make(chan struct{})
+	go func() {
+		defer close(beatDone)
+		t := time.NewTicker(w.heartbeat)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if _, err := w.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+					QueueUrl: aws.String(w.queueURL), ReceiptHandle: aws.String(receipt),
+					VisibilityTimeout: int32(awsCallbackVisibility / time.Second),
+				}); err != nil {
+					log.Printf("[aws-onb] stage=worker outcome=heartbeat_failed err=%v", err)
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-beatDone
+		<-w.slots
+		if wg != nil {
+			wg.Done()
+		}
+	}()
+	// A panic in one message must not take the backend down with it. Hand the
+	// message back for a prompt retry.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[aws-onb] ALERT stage=worker outcome=panic err=%v", r)
+			w.settle(ctx, receipt, CallbackRetry)
+		}
+	}()
+
+	receives, _ := strconv.Atoi(m.Attributes[string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount)])
+	lastChance := receives >= w.maxReceives
+	w.settle(ctx, receipt, w.svc.HandleCallbackDelivery(ctx, aws.ToString(m.Body), lastChance))
 }
 
 // settle applies an outcome to a message.

@@ -460,3 +460,129 @@ func TestQuickCreateLogsNeverCarrySignature(t *testing.T) {
 		t.Fatal("the raw ExternalId reached the logs")
 	}
 }
+
+/* ------------------------------ hardening fixes ---------------------------- */
+
+// B4: a duplicate delivery that finds the session locked must never answer —
+// not even past the deadline — or its FAILED could overtake the holder's SUCCESS.
+func TestQuickCreateLockContentionNeverAnswers(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	h.mr.Set(awsOnbLockKey(sess.ID), "someone-else")
+	body := h.body(sess, cfnMsg{})
+	h.clock = h.clock.Add(awsCallbackDeadline + time.Minute) // past the deadline
+	if out := h.svc.HandleCallbackDelivery(context.Background(), body, true); out != CallbackRetry {
+		t.Fatalf("contention must retry, got %s", out)
+	}
+	if h.transport.count() != 0 || h.onboards != 0 {
+		t.Fatal("a contended delivery must neither answer nor onboard")
+	}
+	if v, _ := h.mr.Get(awsOnbLockKey(sess.ID)); v != "someone-else" {
+		t.Fatal("another worker's lock must never be released")
+	}
+}
+
+// B5: once Onboard succeeded, a failed session save still answers SUCCESS.
+func TestQuickCreateSaveFailureAfterConnectStillSucceeds(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	h.onboardErr = func(int) error {
+		h.mr.SetError("READONLY You can't write against a read only replica")
+		return nil
+	}
+	h.handle(t, h.body(sess, cfnMsg{}))
+	h.mr.SetError("")
+	if r := h.transport.last(t); r.Status != "SUCCESS" {
+		t.Fatalf("a proven connection must be answered SUCCESS, got %+v", r)
+	}
+}
+
+// B6: AuthSec's own bad credentials are AuthSec's fault, not the customer's.
+func TestQuickCreateAuthSecCredentialErrorIsNotCustomerFault(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	h.onboardErr = func(int) error {
+		return fmt.Errorf("%w: The security token included in the request is invalid. (InvalidClientTokenId)",
+			awsdiscovery.ErrNotAssumable)
+	}
+	h.handle(t, h.body(sess, cfnMsg{}))
+	if got := h.session(t, sess); got.Code != AWSOnbCodeAuthSecUnavailable {
+		t.Fatalf("expected %s, got %s", AWSOnbCodeAuthSecUnavailable, got.Code)
+	}
+}
+
+// B15: an AuthSec-side failure that does not heal fails fast, not at the deadline.
+func TestQuickCreatePersistentAuthSecErrorFailsFast(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	start := h.clock
+	h.onboardErr = func(int) error { return errors.New("failed to store the external id: 404 no handler for route kv/") }
+	h.handle(t, h.body(sess, cfnMsg{}))
+	if waited := h.clock.Sub(start); waited > 2*awsAuthSecErrorBudget {
+		t.Fatalf("waited %s; a persistent AuthSec error must fail within about %s", waited, awsAuthSecErrorBudget)
+	}
+	if got := h.session(t, sess); got.Code != AWSOnbCodeAuthSecUnavailable {
+		t.Fatalf("code %s", got.Code)
+	}
+}
+
+// B3: a failure that does heal is retried, but no attempt starts once the
+// answer reserve is near, so the answer always beats the deadline.
+func TestQuickCreateRetryStopsBeforeAnswerReserve(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	body := h.body(sess, cfnMsg{})
+	published := h.clock
+	h.onboardErr = func(int) error { return fmt.Errorf("%w: rate exceeded", awsdiscovery.ErrThrottled) }
+	h.handle(t, body)
+	lastStart := published.Add(awsCallbackDeadline - awsAnswerReserve - awsOnboardingTimeout)
+	if h.clock.After(lastStart) {
+		t.Fatalf("retrying ran to %s, past the last allowed start %s", h.clock, lastStart)
+	}
+	if r := h.transport.last(t); r.Status != "FAILED" {
+		t.Fatalf("expected FAILED, got %+v", r)
+	}
+}
+
+// B13: past the attempt cap nothing is written, so forged messages cannot grow
+// the session or keep it alive.
+func TestQuickCreateCappedSessionIsNotWritten(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	for i := 0; i < awsCallbackMaxAttempts+3; i++ {
+		h.handle(t, h.body(sess, cfnMsg{requestID: fmt.Sprintf("forged-%d", i), topic: qcTopicUSE}))
+	}
+	got := h.session(t, sess)
+	if got.Attempts != awsCallbackMaxAttempts {
+		t.Fatalf("attempts %d, want the cap %d", got.Attempts, awsCallbackMaxAttempts)
+	}
+	if len(got.Results) > awsCallbackMaxAttempts {
+		t.Fatalf("%d results stored past the cap", len(got.Results))
+	}
+}
+
+// B13: a finished session's lifetime is fixed when it finishes.
+func TestQuickCreateTerminalLifetimeIsFixed(t *testing.T) {
+	h := newQCHarness(t)
+	sess := h.start(t, "ap-south-1")
+	h.handle(t, h.body(sess, cfnMsg{}))
+	first := h.session(t, sess).ExpiresAt
+	h.clock = h.clock.Add(30 * time.Minute)
+	h.handle(t, h.body(sess, cfnMsg{requestID: "late", roleAccount: "333333333333"}))
+	if got := h.session(t, sess).ExpiresAt; !got.Equal(first) {
+		t.Fatalf("a later message extended the session from %s to %s", first, got)
+	}
+}
+
+// B10: an opt-in region is never the one Onboard probes when a default-enabled
+// region is selected.
+func TestQuickCreateOptInRegionIsNeverProbedFirst(t *testing.T) {
+	h := newQCHarness(t)
+	sess, err := h.svc.StartSession(context.Background(), uuid.New(), "a", []string{"af-south-1", "eu-west-1"}, "ap-south-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.Regions[0] != "eu-west-1" {
+		t.Fatalf("regions %v: an opt-in region must not come first", sess.Regions)
+	}
+}
