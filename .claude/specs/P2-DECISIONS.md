@@ -723,3 +723,63 @@ defect that should be fixed in the spec itself.
   test asserts only that no edge survives without its evidence. *Raise:* the
   §3 DDL for `iga_le_publication_fkey`; and whether a workspace delete should
   also reach its `cloud_*` rows.
+- **D-95 B9 and B20 pass WITH named exemptions.** §2.9
+  (l.656-661) forbids any single-column foreign key to a workspace-scoped
+  table, and B9 (l.6523) / B20 (l.6533) say every composite key rejects a
+  foreign row and that single-column references to `cloud_identity` are
+  caught. The schema at 036 still holds **19** single-column references to
+  workspace-scoped tables that no migration from 027 on converted. None of
+  these migrations is ours to change: the ones before 027 are Phase 1's,
+  and 027-036 are §3's DDL verbatim. So B9 and B20 are recorded as
+  passing ONLY for the keys outside this list, and §2.9 as NOT holding for
+  these 19, pending a spec ruling on the proposed DDL.
+  `tests/igagraph/p2_bfk_fk_test.go` pins the list exactly
+  (`bfkLegacySingleColumn`; a new single-column key, or an exemption whose
+  key has gone, fails the guard). For each key it proves what the key
+  enforces (a missing parent is refused) and that another workspace's parent
+  is ADMITTED. That subtest (`known_gap_foreign_workspace_admitted`) reports
+  SKIP, so it cannot read as a pass, and it FAILS once the gap closes. The
+  guard's `known_gap_open_section_2_9_exemptions` SKIPs with the whole list,
+  grouped. The guard's scope is every key on an `iga_*` or `cloud_*` table
+  and every key into one. It does not depend on a key's form, and every
+  `cloud_*` table must be classified Phase 1 or Phase 2 (review of bfk:
+  scoping by form missed the A3 pattern in a new table).
+  - *On the Phase 2 `cloud_*` tables B9/B20 cover (5):*
+    `cloud_identity_connector_id_fkey` (011) and
+    `cloud_observation_{identity,permission,resource,workload}_id_fkey`
+    (re-declared single-column by 024).
+  - *On the `iga_*` tables (1):* `iga_observations_delivery_fkey` (004).
+  - *On Phase 1's `cloud_*` tables (13):* `cloud_{secret,assume_edge,permission,
+    resource,workload,usage,scan_checkpoint}_connector_id_fkey`,
+    `cloud_{secret,assume_edge,permission,workload,usage}_identity_id_fkey`,
+    `cloud_permission_resource_id_fkey`.
+  - *B20's "Catches" class still open (6 of the above):*
+    `cloud_observation_identity_id_fkey` and the five Phase 1
+    `*_identity_id_fkey`.
+  - Also bare (no key at all): `cloud_identity.workspace_id`,
+    `cloud_connector.workspace_id` and the seven Phase 1 tables'
+    `workspace_id` (`bfkNoForeignKey`).
+
+  *Raise*, proposed DDL. Each keeps the key's current ON DELETE action; a SET
+  NULL key nulls only its own column:
+  - connector references (the 7 Phase 1 ones and cloud_identity's):
+    `FOREIGN KEY (workspace_id, connector_id) REFERENCES cloud_connector
+    (workspace_id, id) ON DELETE CASCADE` (027's
+    `cloud_connector_workspace_id_key`). This also puts every bare
+    `workspace_id` above except `cloud_connector`'s own under a key, which
+    then must agree with its connector's workspace;
+  - identity references: `FOREIGN KEY (workspace_id, connector_id,
+    identity_id) REFERENCES cloud_identity (workspace_id, connector_id, id)`
+    (035's `cloud_identity_scope_key`). CASCADE for secret, assume_edge,
+    permission and usage; `ON DELETE SET NULL (identity_id)` for workload
+    and observation;
+  - permission/resource/workload subjects: first `UNIQUE (workspace_id,
+    connector_id, id)` on `cloud_permission`, `cloud_resource` and
+    `cloud_workload`, then the matching integration-qualified key (`SET NULL
+    (<column>)` from `cloud_observation`, CASCADE for
+    `cloud_permission.resource_id`);
+  - `iga_observations.delivery_id`: needs a ruling first.
+    `iga_webhook_deliveries.workspace_id` is nullable (a delivery is stored
+    before it is bound), so no composite key can name an unbound delivery;
+  - `cloud_connector.workspace_id`: `REFERENCES workspaces (id)`, if the
+    connector rows of 001/010 permit it.
