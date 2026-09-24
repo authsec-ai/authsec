@@ -185,6 +185,14 @@ func TestResponseURLRejections(t *testing.T) {
 			t.Fatalf("%s: expected ErrResponseURLRejected, got %v", name, err)
 		}
 	}
+	// The global-endpoint form is us-east-1's alone.
+	if _, err := ValidateResponseURL("https://cloudformation-custom-resource-response-useast1.s3.amazonaws.com/obj?X-Amz-Signature=abc", "us-east-1"); err != nil {
+		t.Fatalf("us-east-1 global form must pass: %v", err)
+	}
+	if _, err := ValidateResponseURL("https://cloudformation-custom-resource-response-apsouth1.s3.amazonaws.com/obj?X-Amz-Signature=abc", "ap-south-1"); !errors.Is(err, ErrResponseURLRejected) {
+		t.Fatal("the global-endpoint form must not be accepted for a region other than us-east-1")
+	}
+
 	u, _ := url.Parse(good)
 	if strings.Contains(RedactedURL(u), "Signature") {
 		t.Fatal("RedactedURL must drop the presigned query")

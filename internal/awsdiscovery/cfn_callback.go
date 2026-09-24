@@ -175,13 +175,22 @@ func ParseTopicARN(arn string) (partition, region string, err error) {
 //
 // Known so far:
 //   - `.s3.{region}.` — captured live in ap-south-1 (2026-09-24). This is what
-//     CloudFormation sends today.
+//     CloudFormation sends outside us-east-1.
+//   - `.s3.amazonaws.com`, us-east-1 ONLY — captured live in us-east-1
+//     (2026-09-24). S3's legacy home region uses the global endpoint. For any
+//     other region the form yields "", which no host can equal.
 //   - `.s3-{region}.` — the legacy form in AWS's own Lambda/CloudFormation
 //     documentation example (us-west-2). Kept because AWS documents it, not
 //     because it has been seen live.
 var responseHostForms = []func(region, compact string) string{
 	func(region, compact string) string {
 		return "cloudformation-custom-resource-response-" + compact + ".s3." + region + ".amazonaws.com"
+	},
+	func(region, compact string) string {
+		if region != "us-east-1" {
+			return ""
+		}
+		return "cloudformation-custom-resource-response-" + compact + ".s3.amazonaws.com"
 	},
 	func(region, compact string) string {
 		return "cloudformation-custom-resource-response-" + compact + ".s3-" + region + ".amazonaws.com"
@@ -194,7 +203,9 @@ func CFNResponseHosts(region string) []string {
 	compact := strings.ReplaceAll(region, "-", "")
 	hosts := make([]string, 0, len(responseHostForms))
 	for _, form := range responseHostForms {
-		hosts = append(hosts, form(region, compact))
+		if h := form(region, compact); h != "" {
+			hosts = append(hosts, h)
+		}
 	}
 	return hosts
 }
