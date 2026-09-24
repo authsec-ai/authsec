@@ -317,32 +317,46 @@ var contractWorkloadSubject = contractObj(
 )
 
 // GET /workloads/:id/identities (§5.3; D-77 sections).
-var contractWorkloadIdentities = contractDetail(
-	contractObj(
-		contractReq("ref", contractRef("workload")),
-		contractReq("execution", contractSection(contractClaimRow(
-			contractReq("identity", contractIdentityBrief),
-			contractReq("used_by_count", contractExact)), 0)),
-		contractReq("execution_role_state", contractEnum("resolved", "not_in_scan", "not_in_inventory", "none")),
-		contractReq("execution_role_arn", contractNullable(contractNonEmpty)),
-		contractReq("other", contractSection(contractClaimRow(
-			contractReq("identity", contractIdentityBrief),
-			contractReq("used_by_count", contractExact)), 0)),
-		contractReq("groups", contractSection(contractClaimRow(
-			contractReq("identity", contractIdentityBrief),
-			contractReq("via_identity", contractRef("identity"))), 0)),
-		contractReq("may_assume", contractSection(contractClaimRow(
-			contractReq("via_identity", contractRef("identity")),
-			contractReq("target", contractIdentityBrief),
-			contractReq("mechanism", contractMechanism),
-			contractReq("statement", contractTrustStatement),
-			contractReq("conditions", contractAnyValue)), 0)),
-	),
-	contractDetailMeta(
-		contractReq("coverage", contractArr(contractCoverageNote)),
-		contractReq("limit", contractInt),
-		contractReq("workload", contractWorkloadSubject),
-	),
+var contractWorkloadIdentities = contractDetail(contractWorkloadIdentitiesData, contractWorkloadIdentitiesMeta)
+
+// GET /workloads/:id/identities?section=<name> (D-77): that section alone.
+func contractWorkloadIdentitiesSection(section string) contractShape {
+	var drop []string
+	for _, s := range []string{"execution", "other", "groups", "may_assume"} {
+		if s != section {
+			drop = append(drop, s)
+		}
+	}
+	// execution_role_state and _arn come with the full tab only.
+	drop = append(drop, "execution_role_state", "execution_role_arn")
+	return contractDetail(contractWithout(contractWorkloadIdentitiesData, drop...), contractWorkloadIdentitiesMeta)
+}
+
+var contractWorkloadIdentitiesMeta = contractDetailMeta(
+	contractReq("coverage", contractArr(contractCoverageNote)),
+	contractReq("limit", contractInt),
+	contractReq("workload", contractWorkloadSubject),
+)
+
+var contractWorkloadIdentitiesData = contractObj(
+	contractReq("ref", contractRef("workload")),
+	contractReq("execution", contractSection(contractClaimRow(
+		contractReq("identity", contractIdentityBrief),
+		contractReq("used_by_count", contractExact)), 0)),
+	contractReq("execution_role_state", contractEnum("resolved", "not_in_scan", "not_in_inventory", "none")),
+	contractReq("execution_role_arn", contractNullable(contractNonEmpty)),
+	contractReq("other", contractSection(contractClaimRow(
+		contractReq("identity", contractIdentityBrief),
+		contractReq("used_by_count", contractExact)), 0)),
+	contractReq("groups", contractSection(contractClaimRow(
+		contractReq("identity", contractIdentityBrief),
+		contractReq("via_identity", contractRef("identity"))), 0)),
+	contractReq("may_assume", contractSection(contractClaimRow(
+		contractReq("via_identity", contractRef("identity")),
+		contractReq("target", contractIdentityBrief),
+		contractReq("mechanism", contractMechanism),
+		contractReq("statement", contractTrustStatement),
+		contractReq("conditions", contractAnyValue)), 0)),
 )
 
 // A policy as a grant line or access row names it.
@@ -525,13 +539,15 @@ var contractIdentityRow = contractObj(
 // provider_attrs (D-85), credentials for users (D-86) and sources.
 func contractIdentityDetailData(kind string) contractShape {
 	attrs := []contractField{
-		contractReq("path", contractStr),
+		contractReq("path", contractNullable(contractStr)), // null when not recorded (D-100d)
 		contractReq("tags", contractMap(contractStr)),
 		contractReq("permissions_boundary_arn", contractNullable(contractNonEmpty)),
 	}
 	if kind == "iam_role" {
-		// Trust flags are a ROLE's: only a role has a trust policy (D-44).
-		attrs = append(attrs, contractReq("trust_has_deny", contractBool), contractReq("trust_has_not_principal", contractBool))
+		// Trust flags are a ROLE's: only a role has a trust policy (D-44); null
+		// when the projector wrote none, never a false it did not read (D-100d).
+		attrs = append(attrs, contractReq("trust_has_deny", contractNullable(contractBool)),
+			contractReq("trust_has_not_principal", contractNullable(contractBool)))
 	}
 	more := []contractField{
 		contractReq("retired_reason", contractNullable(contractNonEmpty)), // details: always stated
@@ -580,6 +596,23 @@ var contractPrincipalBrief = contractObj(
 // GET /identities/:id/used-by (§5.3; D-77): workloads and principals for a
 // role, members for a group.
 func contractUsedBy(kind string) contractShape {
+	return contractDetail(contractUsedByData(kind), contractUsedByMeta)
+}
+
+// GET /identities/:id/used-by?section=<name> (D-77): that section alone.
+func contractUsedBySection(kind, section string) contractShape {
+	var drop []string
+	for _, s := range []string{"workloads", "principals", "members"} {
+		if s != section {
+			drop = append(drop, s)
+		}
+	}
+	return contractDetail(contractWithout(contractUsedByData(kind), drop...), contractUsedByMeta)
+}
+
+var contractUsedByMeta = contractDetailMeta(contractReq("coverage", contractArr(contractCoverageNote)))
+
+func contractUsedByData(kind string) contractShape {
 	fields := []contractField{contractReq("identity", contractIdentitySubject)}
 	switch kind {
 	case "iam_role":
@@ -597,7 +630,7 @@ func contractUsedBy(kind string) contractShape {
 		fields = append(fields, contractReq("members", contractSection(contractClaimRow(
 			contractReq("member", contractIdentityBrief)), 0)))
 	}
-	return contractDetail(contractObj(fields...), contractDetailMeta(contractReq("coverage", contractArr(contractCoverageNote))))
+	return contractObj(fields...)
 }
 
 // One statement of the Permissions tab (§5.3 l.5910-5914).
@@ -878,17 +911,32 @@ var contractGraphEdge = contractFunc(func(path string, v any, errs *[]string) {
 	}, more...)...).check(path, v, errs)
 })
 
-var contractFrontier = contractObj(
+var contractFrontier = contractAll(contractObj(
 	contractReq("node", contractRef("workload", "identity", "external_principal", "statement", "resource")),
 	contractReq("edge", contractRelTypeOrGraph),
 	contractReq("direction", contractEnum("forward", "reverse")),
-	contractReq("more", contractObj(contractReq("count", contractNullable(contractInt)), contractReq("exact", contractBool))),
-	contractReq("expand", contractFunc(func(path string, v any, errs *[]string) {
-		if s, _ := v.(string); !strings.HasPrefix(s, "/api/iga/v1/graph/expand?node=") {
-			contractFail(errs, path, "want an /api/iga/v1/graph/expand call, got %s", contractJSON(v))
+	contractReq("more", contractFunc(func(path string, v any, errs *[]string) {
+		contractObj(contractReq("count", contractNullable(contractInt)), contractReq("exact", contractBool)).check(path, v, errs)
+		// §5.4: exact only when counted; an uncounted more is {null, false}.
+		if m, ok := v.(map[string]any); ok && (m["count"] == nil) != (m["exact"] == false) {
+			contractFail(errs, path, "want {count: n, exact: true} or {count: null, exact: false}, got %s", contractJSON(v))
 		}
 	})),
-)
+	contractReq("expand", contractStr),
+), contractFunc(func(path string, v any, errs *[]string) {
+	// §5.3's example, character for character: the call that expands THIS
+	// entry -- its node, edge and direction, the ref's colon unescaped --
+	// carrying the request's include_ended when it asked for ended claims
+	// (D-12), so the expansion shows what the canvas shows.
+	want := "/api/iga/v1/graph/expand?node=" + digs(v, "node") + "&edge=" + digs(v, "edge") + "&direction=" + digs(v, "direction")
+	if got := digs(v, "expand"); got != want && got != want+contractIncludeEnded {
+		contractFail(errs, path+".expand", "want %q, got %q", want, got)
+	}
+}))
+
+// contractIncludeEnded is the suffix a frontier's expand call carries when the
+// request asked for ended claims.
+const contractIncludeEnded = "&include_ended=true"
 
 var contractRelTypeOrGraph = contractEnum("executes_as", "task_execution_role", "member_of", "can_assume", "grant", "target")
 

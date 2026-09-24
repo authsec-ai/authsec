@@ -54,6 +54,8 @@ func contractCases(t *testing.T, f *contractFixture) []contractCase {
 	grantFinance := evidenceGrant(t, l, "SharedToolRole", "FinanceAll", "AllButFinance")
 	grantExternal := evidenceGrant(t, l, "SharedToolRole", "ExternalKey", "Decrypt")
 	grantSandbox := evidenceGrant(t, l, "CrossRole", "SandboxRead", "ReadSandbox")
+	grantLegacy := evidenceGrant(t, l, "SharedToolRole", "LegacyRead", "LegacyGet") // ended by the detach
+	opsBucket := evidenceNode(t, l, "resource", "iga_resources", "arn:aws:s3:::ops-bucket/*")
 	// D-80: a coverage claim names a run the revision was built from -- B's
 	// SECOND run, which superseded its first everywhere.
 	coverageB := igaread.CoverageRef(f.runB2.ID, "iam_roles")
@@ -596,6 +598,23 @@ func contractCases(t *testing.T, f *contractFixture) []contractCase {
 					t.Errorf("finance/* access = %s, want AllButFinance under excluded_by only (E4, B19)", contractJSON(b["data"]))
 				}
 			}},
+		{route: "GET /resources/:id/access", path: "/resources/" + u(opsBucket) + "/access", shape: contractResourceAccess,
+			check: func(t *testing.T, b map[string]any) {
+				// D-18: the group's own row, and one for its member through it,
+				// naming the group and the membership the grant reaches her by.
+				rows := contractByName(digl(b, "data", "access"), "holder", "name")
+				if len(rows) != 2 || dig(rows["ops"], "via_group") != nil || digs(rows["ops"], "grant", "claim") != grantOps {
+					t.Errorf("ops-bucket/* access = %s, want ops's own row and priya's through it", contractJSON(b["data"]))
+				}
+				vg := dig(rows["priya"], "via_group")
+				if digs(vg, "ref") != f.ops || digs(vg, "name") != "ops" || digs(vg, "membership", "state") != "current" ||
+					!strings.HasPrefix(digs(vg, "membership", "claim"), "relationship:") || digs(rows["priya"], "grant", "claim") != grantOps {
+					t.Errorf("priya via ops = %s", contractJSON(rows["priya"]))
+				}
+				if num(b, "meta", "total") != 2 {
+					t.Errorf("access meta = %s, want two holders", contractJSON(b["meta"]))
+				}
+			}},
 		{route: "GET /resources/:id/changes", path: "/resources/" + u(f.tickets) + "/changes", shape: contractChanges,
 			check: func(t *testing.T, b map[string]any) {
 				if ev := contractEvents(b); ev["grant_ended"] == nil || ev["first_seen"] == nil {
@@ -608,6 +627,38 @@ func contractCases(t *testing.T, f *contractFixture) []contractCase {
 		{route: "GET /graph", path: "/graph" + qs("root", f.lambda, "direction", "forward"), shape: contractGraph,
 			check: func(t *testing.T, b map[string]any) {
 				nodes := graphNodes(t, digl(b, "data", "nodes"))
+				// §5.3's example, node by node: a workload and a role labelled by
+				// name, a statement by its actions, a resource by the resource
+				// part of its ARN, each with its kind.
+				for ref, want := range map[string][2]string{
+					f.lambda: {"workload", "ticket-tools"}, f.shared: {"iam_role", "SharedToolRole"},
+					f.readTickets: {"statement", "s3:GetObject"}, f.toolboxStmt: {"statement", "s3:GetObject"},
+					f.tickets: {"selector", "support-tickets/*"},
+				} {
+					if n := nodes[ref]; digs(n, "kind") != want[0] || digs(n, "label") != want[1] {
+						t.Errorf("node %s = %s, want kind %q label %q", ref, contractJSON(n), want[0], want[1])
+					}
+				}
+				if !contractHasEdge(b, f.executesLambda, func(e any) bool {
+					return digs(e, "kind") == "executes_as" && digs(e, "from") == f.lambda && digs(e, "to") == f.shared && digs(e, "state") == "current"
+				}) {
+					t.Errorf("no current executes_as edge ticket-tools -> SharedToolRole")
+				}
+				if !contractHasEdge(b, "", func(e any) bool {
+					return digs(e, "kind") == "target" && digs(e, "mode") == "resource" && digs(e, "from") == f.readTickets && digs(e, "to") == f.tickets
+				}) {
+					t.Errorf("no target edge ReadTickets -> support-tickets/* (mode resource)")
+				}
+				// §5.4 lifecycle: current and stale by default; the ended LegacyGet
+				// grant only when include_ended asks (D-12).
+				if contractHasEdge(b, grantLegacy, func(any) bool { return true }) {
+					t.Errorf("the ended LegacyGet grant is on the default graph")
+				}
+				for _, e := range digl(b, "data", "frontier") {
+					if strings.HasSuffix(digs(e, "expand"), contractIncludeEnded) {
+						t.Errorf("frontier expand %q asks for ended claims the request did not", digs(e, "expand"))
+					}
+				}
 				rt, tb := nodes[f.readTickets], nodes[f.toolboxStmt]
 				// §5.4 independent grants: two statement nodes, one group_key.
 				if rt == nil || tb == nil || digs(rt, "group_key") == "" || digs(rt, "group_key") != digs(tb, "group_key") ||
@@ -744,6 +795,61 @@ func contractCases(t *testing.T, f *contractFixture) []contractCase {
 				}
 			}},
 
+		/* ----------------------- ended claims (D-12 include_ended) ------------- */
+
+		// LegacyRead's detach ended its assignment and its grant (rev 3). With
+		// include_ended each view shows them, ended, with valid_to and
+		// ended_reason -- the shapes' §5.1 rule holds every other row to
+		// neither -- and never as current.
+		{route: "GET /identities/:id/permissions", path: "/identities/" + u(f.shared) + "/permissions" + qs("include_ended", "true"),
+			shape: contractPermissions, check: func(t *testing.T, b map[string]any) {
+				lr := contractByName(digl(b, "data", "policies"), "name")["LegacyRead"]
+				if digs(lr, "assignment", "state") != "ended" || dig(lr, "assignment", "valid_to") == nil ||
+					digs(lr, "statements", 0, "grant") != grantLegacy || digs(lr, "statements", 0, "grant_state") != "ended" {
+					t.Errorf("LegacyRead = %s, want its ended assignment and grant", contractJSON(lr))
+				}
+			}},
+		{route: "GET /workloads/:id/resources", path: "/workloads/" + u(f.lambda) + "/resources" + qs("include_ended", "true"),
+			shape: contractWorkloadResources, check: func(t *testing.T, b map[string]any) {
+				gs := digl(contractByName(digl(b, "data"), "resource", "text")[contractTickets], "grants")
+				var ended any
+				for _, g := range gs {
+					if digs(g, "claim") == grantLegacy {
+						ended = g
+					}
+				}
+				if len(gs) != 3 || digs(ended, "state") != "ended" || dig(ended, "valid_to") == nil || dig(ended, "ended_reason") == nil {
+					t.Errorf("support-tickets/* grants = %s, want ReadTickets, ToolboxRead and the ended LegacyGet", contractJSON(gs))
+				}
+			}},
+		{route: "GET /resources/:id/access", path: "/resources/" + u(f.tickets) + "/access" + qs("include_ended", "true"),
+			shape: contractResourceAccess, check: func(t *testing.T, b map[string]any) {
+				var ended any
+				for _, r := range digl(b, "data", "access") {
+					if digs(r, "grant", "claim") == grantLegacy {
+						ended = r
+					}
+				}
+				if digs(ended, "state") != "ended" || digs(ended, "grant", "state") != "ended" {
+					t.Errorf("access = %s, want the ended LegacyGet grant, ended", contractJSON(b["data"]))
+				}
+			}},
+		{route: "GET /graph", path: "/graph" + qs("root", f.lambda, "direction", "forward", "include_ended", "true"), shape: contractGraph,
+			check: func(t *testing.T, b map[string]any) {
+				if !contractHasEdge(b, grantLegacy, func(e any) bool { return digs(e, "state") == "ended" && digs(e, "kind") == "grant" }) {
+					t.Errorf("no ended LegacyGet grant edge with include_ended")
+				}
+				fr := digl(b, "data", "frontier")
+				for _, e := range fr {
+					if !strings.HasSuffix(digs(e, "expand"), contractIncludeEnded) {
+						t.Errorf("frontier expand %q drops include_ended: the expansion would hide what the canvas shows", digs(e, "expand"))
+					}
+				}
+				if len(fr) == 0 {
+					t.Errorf("no frontier: the fixture's can_assume beyond assume_hops should leave one")
+				}
+			}},
+
 		/* ---------------------------------- lookup ------------------------------ */
 
 		{route: "GET /lookup", path: "/lookup" + qs("cloud_ref", "cloud_identity:"+cloudRoles[0].String()), shape: contractLookup,
@@ -836,6 +942,9 @@ func contractParameterCases(t *testing.T, f *contractFixture) []contractCase {
 		{qs("account", accountB), []string{"CrossRole", "LoopRole"}},
 		{qs("q", "AROASHAREDTOOLROLE01"), []string{"SharedToolRole"}},
 		{qs("lifecycle", "retired"), []string{"TempRole"}},
+		{qs("lifecycle", "all"), append(append([]string{}, roles...), "ops", "priya", "TempRole")},
+		{qs("account", accountA, "account", accountB), append(append([]string{}, roles...), "ops", "priya")}, // §5.2: repeatable
+		{qs("account", accountB, "kind", "iam_role"), []string{"CrossRole", "LoopRole"}},
 	} {
 		add("GET /identities", "/identities"+c.q, id, names("name", c.want...))
 	}
@@ -876,22 +985,43 @@ func contractParameterCases(t *testing.T, f *contractFixture) []contractCase {
 				}
 			})
 	}
-	add("GET /workloads/:id/identities", "/workloads/"+u(f.lambda)+"/identities"+qs("section", "may_assume"), contractAnyValue,
-		func(t *testing.T, b map[string]any) {
+	// D-77: ?section= returns that section ALONE (the closed shapes reject
+	// the others), and the section's cursor pages it.
+	add("GET /workloads/:id/identities", "/workloads/"+u(f.lambda)+"/identities"+qs("section", "may_assume"),
+		contractWorkloadIdentitiesSection("may_assume"), func(t *testing.T, b map[string]any) {
 			if len(digl(b, "data", "may_assume", "items")) != 1 {
 				t.Errorf("section=may_assume = %s", contractJSON(b["data"]))
 			}
 		})
-	add("GET /identities/:id/used-by", "/identities/"+u(f.cross)+"/used-by"+qs("section", "principals"), contractAnyValue,
-		func(t *testing.T, b map[string]any) {
-			if len(digl(b, "data", "principals", "items")) != 2 {
-				t.Errorf("section=principals = %s", contractJSON(b["data"]))
+	add("GET /identities/:id/used-by", "/identities/"+u(f.cross)+"/used-by"+qs("section", "principals", "limit", "1"),
+		contractUsedBySection("iam_role", "principals"), func(t *testing.T, b map[string]any) {
+			sec := dig(b, "data", "principals")
+			next := digs(sec, "next_cursor")
+			if len(digl(sec, "items")) != 1 || num(sec, "total") != 2 || next == "" {
+				t.Fatalf("section=principals limit=1 = %s, want 1 of 2 with a next page", contractJSON(sec))
+			}
+			p := "/identities/" + u(f.cross) + "/used-by" + qs("section", "principals", "limit", "1", "cursor", next)
+			code, page := f.api.get(p)
+			mustStatus(t, p, code, page, http.StatusOK)
+			contractCheck(t, p, page, contractUsedBySection("iam_role", "principals"))
+			second := dig(page, "data", "principals")
+			if len(digl(second, "items")) != 1 || dig(second, "next_cursor") != nil ||
+				digs(second, "items", 0, "claim") == digs(sec, "items", 0, "claim") {
+				t.Errorf("second page = %s, want the other principal and no further page", contractJSON(second))
 			}
 		})
 	add("GET /workloads/:id/changes", "/workloads/"+u(f.lambda)+"/changes"+qs("kind", "configuration", "limit", "1"), contractChanges,
 		func(t *testing.T, b map[string]any) {
-			if len(digl(b, "data")) != 1 || dig(b, "meta", "next_cursor") == nil {
-				t.Errorf("one event per page = %s", contractJSON(b["meta"]))
+			next := digs(b, "meta", "next_cursor")
+			if len(digl(b, "data")) != 1 || next == "" {
+				t.Fatalf("one event per page = %s", contractJSON(b["meta"]))
+			}
+			p := "/workloads/" + u(f.lambda) + "/changes" + qs("kind", "configuration", "limit", "1", "cursor", next)
+			code, page := f.api.get(p)
+			mustStatus(t, p, code, page, http.StatusOK)
+			contractCheck(t, p, page, contractChanges)
+			if len(digl(page, "data")) != 1 || digs(page, "data", 0, "id") == digs(b, "data", 0, "id") {
+				t.Errorf("second page = %s, want the next event", contractJSON(page["data"]))
 			}
 		})
 	return out

@@ -772,3 +772,31 @@ the implementation now follows it.
   did not establish"). Kept as the conservative reading; the contract test
   pins both as the only additions. *Raise:* §5.4's vocabulary should list them,
   or say how the console renders an unknown `bound_by`.
+- **D-100 Four shapes §5 leaves open (recorded by the conformance pass).**
+  (a) `graph_state` is on every detail envelope's meta, as on the list
+  envelope's (§5.2's detail example shows `rev`, `published_at` and
+  `capabilities` only): one meta type (D-95), `published` wherever an object
+  answers (D-4), and `not_published` on `/coverage` and `/pipeline` before the
+  first publication (D-72), where `rev` alone (null) would not say why.
+  (b) `meta.coverage`: §2.14.14 lists it among the fields "on every list and
+  detail response". It is on every list envelope and every object detail and
+  tab (D-73). `/graph`, `/graph/expand`, `/graph/path` and `/evidence` state
+  each gap instead as a `surface_*` limitation ON the node, edge or claim it
+  bears on (§2.14.11 "unread surfaces appear as a coverage note on the
+  affected edge"; D-35, D-96a) -- nothing is left unstated, and nothing is
+  summarised that the elements do not carry. `/coverage` is the coverage;
+  `/pipeline` and `/lookup` answer no question a gap bears on. *Raise:*
+  whether the canvas also wants the union in `meta.coverage` for its banner.
+  (c) A frontier entry's `expand` is §5.3's call verbatim
+  (`/api/iga/v1/graph/expand?node=<ref>&edge=<kind>&direction=<dir>`, the
+  ref's colon unescaped), plus `&include_ended=true` when the request asked
+  for ended claims (D-12), so an expansion shows what the canvas shows; `more`
+  is `{count: n, exact: true}` or `{count: null, exact: false}`, never a count
+  it did not establish (§5.4). The contract test pins all three.
+  (d) Identity detail `provider_attrs` (D-85 per kind): `path`, `tags` and
+  `permissions_boundary_arn` on every kind (`path` and the boundary null when
+  not recorded, `tags` `{}`); `trust_has_deny` and `trust_has_not_principal`
+  on roles only -- a user or group has no trust document, so it states no
+  trust flag rather than `false` -- and null on a role whose flag the
+  projector did not write, never `false` (a `false` would claim its trust has
+  no Deny).

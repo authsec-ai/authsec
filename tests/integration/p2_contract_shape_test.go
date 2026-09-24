@@ -109,6 +109,20 @@ func (s contractObjShape) check(path string, v any, errs *[]string) {
 			contractFail(errs, path, "state %v with stale_reason present=%v (D-74: exactly the stale ones carry it)", m["state"], has)
 		}
 	}
+	// §5.1 "Relationships, assignments and grants keep valid_from/valid_to/
+	// ended_reason", on every shape that names them: an ended claim states
+	// when and why it ended, and a claim still believed states neither.
+	if known["state"] && known["valid_to"] {
+		ended := m["state"] == "ended"
+		for _, f := range []string{"valid_to", "ended_reason"} {
+			if !known[f] {
+				continue
+			}
+			if _, has := m[f]; has != ended {
+				contractFail(errs, path, "state %v with %s present=%v (an ended claim, and only one, says when and why)", m["state"], f, has)
+			}
+		}
+	}
 	var extra []string
 	for k := range m {
 		if !known[k] {

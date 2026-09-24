@@ -77,6 +77,70 @@ func TestP2ContractErrorEnvelopes(t *testing.T) {
 		}
 	})
 
+	// 400 invalid_parameter for a malformed or disallowed VALUE of a parameter
+	// the route does define (§5.2 "a malformed or disallowed parameter"),
+	// naming it: the §5.2 common list parameters, each route's own filters and
+	// sections (§5.3, D-77), the graph routes' required and bounded ones (D-34,
+	// D-35, D-39), /evidence's claim cap (D-79) and /lookup's cloud_ref (D-81).
+	t.Run("400 malformed value", func(t *testing.T) {
+		u := func(ref string) string { return refUUID(t, ref).String() }
+		var tooMany []string
+		for i := 0; i <= igaread.EvidenceMaxClaims; i++ {
+			tooMany = append(tooMany, "claim", f.grantReadTickets)
+		}
+		for _, c := range []struct{ path, param string }{
+			{"/workloads" + qs("q", "t"), "q"}, // §5.2: at least 2 characters
+			{"/workloads" + qs("limit", "0"), "limit"},
+			{"/workloads" + qs("limit", "201"), "limit"},
+			{"/workloads" + qs("sort", "runtime_kind"), "sort"},
+			{"/workloads" + qs("facets", "kind"), "facets"},
+			{"/workloads" + qs("lifecycle", "ended"), "lifecycle"},
+			{"/workloads" + qs("account", "4294183770"), "account"},
+			{"/workloads" + qs("runtime_kind", "lambda"), "runtime_kind"},
+			{"/workloads" + qs("classification", "agents"), "classification"},
+			{"/workloads" + qs("execution_role_state", "unknown"), "execution_role_state"},
+			{"/workloads" + qs("integration", "cloud_connector:x"), "integration"},
+			{"/workloads" + qs("provider", "gcp"), "provider"}, // D-75
+			{"/identities" + qs("kind", "role"), "kind"},
+			{"/identities" + qs("used_by", "principals"), "used_by"},
+			{"/identities" + qs("sort", "service"), "sort"},
+			{"/resources" + qs("kind", "wildcard"), "kind"},
+			{"/resources" + qs("sort", "classification"), "sort"},
+			{"/resources" + qs("facets", "region"), "facets"},
+			{"/workloads/" + u(f.lambda) + "/resources" + qs("sort", "account"), "sort"},
+			{"/workloads/" + u(f.lambda) + "/resources" + qs("limit", "0"), "limit"},
+			{"/workloads/" + u(f.lambda) + "/identities" + qs("section", "principals"), "section"},
+			{"/identities/" + u(f.shared) + "/used-by" + qs("section", "members"), "section"}, // a role has no members
+			{"/workloads/" + u(f.lambda) + "/changes" + qs("kind", "all"), "kind"},
+			{"/workloads/" + u(f.lambda) + "/changes" + qs("limit", "201"), "limit"},
+			{"/workloads/" + u(f.lambda) + "/classification" + qs("limit", "0"), "limit"},
+			{"/resources/" + u(f.tickets) + "/access" + qs("limit", "201"), "limit"},
+			{"/graph" + qs("root", f.lambda), "direction"}, // D-35: required
+			{"/graph" + qs("root", f.lambda, "direction", "both"), "direction"},
+			{"/graph" + qs("root", f.lambda, "direction", "forward", "assume_hops", "5"), "assume_hops"}, // D-34
+			{"/graph" + qs("root", f.ticketRead, "direction", "forward"), "root"},                        // D-39: a policy is no root
+			{"/graph" + qs("root", f.grantReadTickets, "direction", "forward"), "root"},                  // nor a claim
+			{"/graph" + qs("direction", "forward"), "root"},
+			{"/graph/expand" + qs("node", f.shared, "edge", "trusts", "direction", "forward"), "edge"},
+			{"/graph/expand" + qs("node", f.shared, "edge", "can_assume"), "direction"},
+			{"/graph/path" + qs("from", f.lambda), "to"},
+			{"/graph/path" + qs("from", f.lambda, "to", f.lambda), "to"},
+			{"/evidence", "claim"},
+			{"/evidence" + qs(tooMany...), "claim"}, // D-79: at most 50
+			{"/evidence" + qs("claim", f.grantReadTickets, "include", "facts"), "include"},
+			{"/lookup", "cloud_ref"},
+			{"/lookup" + qs("cloud_ref", f.lambda), "cloud_ref"}, // a graph ref is no Cloud Inventory row
+			{"/coverage" + qs("account", "sandbox"), "account"},
+		} {
+			code, body := api.get(c.path)
+			if code != http.StatusBadRequest {
+				t.Errorf("%s = %d %s, want 400 naming %s", c.path, code, contractJSON(body), c.param)
+				continue
+			}
+			contractCheck(t, c.path, body, contractError("invalid_parameter", contractReq("parameter", contractConst(c.param))))
+		}
+	})
+
 	// 409 revision_stale: §5.1's one stale status and payload, exactly, on
 	// every revision-bound route; the live routes refuse a pin with 400 (D-82).
 	t.Run("409 revision_stale", func(t *testing.T) {
@@ -566,5 +630,40 @@ func TestP2ContractAuthEnvelopes(t *testing.T) {
 	w, body := call(http.MethodGet, "/workloads", token(jwt.MapClaims{"scope": "iga:read"}))
 	if w.Code != http.StatusOK || digs(body, "meta", "graph_state") != "not_published" {
 		t.Errorf("allowed list = %d %s, want 200 not_published", w.Code, w.Body.String())
+	}
+
+	// Each route's permission middleware is wrapped on its own (GraphRequire),
+	// not only through the authentication wrapper: AuthMiddleware happens to
+	// run the rest of the chain inside itself (c.Next), but an authenticator
+	// in gin's usual style returns first -- and the permission middleware's
+	// 403 (insufficient scope) and 401 (no claims at all) must still be the
+	// §5.2 envelope, with its required_permissions.
+	for _, c := range []struct {
+		name   string
+		claims jwt.MapClaims
+		status int
+		shape  contractShape
+	}{
+		{"scope missing", jwt.MapClaims{"workspace_id": l.ws.String(), "user_id": uuid.NewString()}, http.StatusForbidden,
+			contractError("forbidden", contractReq("required_permissions", contractConst([]any{"iga:read"})))},
+		{"no claims", nil, http.StatusUnauthorized, contractError("unauthenticated")},
+	} {
+		plain := gin.New()
+		claims := c.claims
+		platform.MountIGAGraphReadRoutes(plain, ctl, func(g *gin.Context) {
+			if claims != nil {
+				g.Set("claims", claims)
+			}
+		}, middlewares.Require)
+		req := httptest.NewRequest(http.MethodGet, "/api/iga/v1/workloads", nil)
+		rec := httptest.NewRecorder()
+		plain.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if rec.Code != c.status {
+			t.Errorf("%s behind a returning authenticator: %d %s, want %d", c.name, rec.Code, rec.Body.String(), c.status)
+			continue
+		}
+		contractCheck(t, c.name+" behind a returning authenticator", out, c.shape)
 	}
 }
