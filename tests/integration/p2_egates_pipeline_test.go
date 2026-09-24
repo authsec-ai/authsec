@@ -88,6 +88,19 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 	for _, p := range []string{"/workloads", "/identities", "/resources", "/coverage"} {
 		egatesNotPublished(t, api, p)
 	}
+	// What the console asks first (§5.3 /capabilities): the switch on at 036,
+	// every feature served -- before anything is published, so "nothing
+	// published yet" is never drawn as "unavailable" (§2.14.7).
+	caps := egatesGet(t, api, "/capabilities")
+	if digs(caps, "data", "graph_projection") != "on" || dig(caps, "data", "reason") != nil ||
+		digs(caps, "data", "schema_head") != "036" {
+		t.Errorf("/capabilities = %s, want on at 036 with no reason", egatesJSON(dig(caps, "data")))
+	}
+	for _, f := range []string{"workloads", "identities", "resources", "graph", "evidence", "changes", "classification", "coverage"} {
+		if dig(caps, "data", "features", f) != true {
+			t.Errorf("/capabilities features.%s = %v, want true", f, dig(caps, "data", "features", f))
+		}
+	}
 
 	// Queued at once (§2.15 step 1), waiting on nothing.
 	runID := disc.queueScan(a)
@@ -299,8 +312,8 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	}
 	// Both leases run out (the dead worker renews neither); the next worker
 	// reclaims the run and the barrier without intervention.
-	l.db.Exec(`UPDATE cloud_scan_run SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, queued.ID)
-	l.db.Exec(`UPDATE iga_pipeline_lease SET expires_at = now() - interval '1 minute' WHERE workspace_id = ?`, l.ws)
+	egatesExec(t, l, `UPDATE cloud_scan_run SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, queued.ID)
+	egatesExec(t, l, `UPDATE iga_pipeline_lease SET expires_at = now() - interval '1 minute' WHERE workspace_id = ?`, l.ws)
 	if !egatesWork(l, a, "egates-reclaiming-worker") {
 		t.Fatal("the expired run was not reclaimed")
 	}
@@ -338,14 +351,14 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	// lease version on the same job, so the barrier (held by the JOB, §2.10A)
 	// still admits it. Before that one commits, the first wakes and runs its
 	// pass on the lease it claimed: only the job lease can refuse it.
-	l.db.Exec(`UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
+	egatesExec(t, l, `UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
 	reclaimed, err := jobs.Claim("egates-reclaiming-projector", time.Minute, time.Now())
 	if err != nil || reclaimed == nil || reclaimed.ID != job.ID || reclaimed.LeaseVersion == job.LeaseVersion {
 		t.Fatalf("reclaim of job %s: %+v %v, want the same job under a new lease", job.ID, reclaimed, err)
 	}
 	egatesSupersededProjection(t, l, job, "egates-dead-projector")
 	// The reclaiming projector dies too; the next one completes, first pass.
-	l.db.Exec(`UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
+	egatesExec(t, l, `UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
 	l.project("egates-final-projector")
 	pub := egatesPublicationOf(t, l, queued.ID)
 	acc = s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
@@ -360,6 +373,12 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	}
 
 	// (3) The next scan's projector dies after its commit, before completing.
+	// The projection service completes its job in the same call right after
+	// the graph transaction commits, so that crash cannot be staged
+	// in-process: the pass runs whole, and its job and the barrier are then
+	// put back exactly as the crash leaves them -- graph and publication
+	// committed, the job running under a lease that has run out, the barrier
+	// still projecting for it.
 	run2 := egatesScan(l, a)
 	l.project("egates-projector-dies-after-commit")
 	before := len(l.shape())
@@ -368,12 +387,14 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 		l.ws, run2.ID).Row().Scan(&job2); err != nil {
 		t.Fatalf("read the second run's job: %v", err)
 	}
-	if res := l.db.Exec(`UPDATE iga_projection_job SET status = 'running', lease_owner = 'egates-projector-dies-after-commit',
-	          lease_expires_at = now() - interval '1 minute', completed_at = NULL WHERE id = ?`, job2); res.RowsAffected != 1 {
-		t.Fatalf("restore the dead projector's job: %v", res.Error)
+	if n := egatesExec(t, l, `UPDATE iga_projection_job SET status = 'running', lease_owner = 'egates-projector-dies-after-commit',
+	          lease_expires_at = now() - interval '1 minute', completed_at = NULL WHERE id = ?`, job2); n != 1 {
+		t.Fatalf("restore the dead projector's job: %d rows", n)
 	}
-	l.db.Exec(`UPDATE iga_pipeline_lease SET state = 'projecting', holder = ?, scan_run_id = ?,
-	          expires_at = now() + interval '15 minutes' WHERE workspace_id = ?`, models.PipelineJobHolder(job2), run2.ID, l.ws)
+	if n := egatesExec(t, l, `UPDATE iga_pipeline_lease SET state = 'projecting', holder = ?, scan_run_id = ?,
+	          expires_at = now() + interval '15 minutes' WHERE workspace_id = ?`, models.PipelineJobHolder(job2), run2.ID, l.ws); n != 1 {
+		t.Fatalf("restore the barrier the dead projector held: %d rows", n)
+	}
 	view = s2Pipeline(t, api)
 	if digs(view, "barrier", "state") != models.PipelineProjecting || num(view, "current_rev") != 2 {
 		t.Errorf("pipeline after a commit whose job never completed = %s, want projecting with the committed rev 2 current",
@@ -415,6 +436,18 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	if st := l.barrier(); st != models.PipelineIdle {
 		t.Errorf("barrier = %s, want idle", st)
 	}
+}
+
+// egatesExec runs one statement that stages a state the fakes cannot reach
+// (a lease run out, a crash between two writes), failing the test when it
+// errors, and returns the rows it touched.
+func egatesExec(t *testing.T, l *p2Lab, q string, args ...any) int64 {
+	t.Helper()
+	res := l.db.Exec(q, args...)
+	if res.Error != nil {
+		t.Fatalf("%s: %v", q, res.Error)
+	}
+	return res.RowsAffected
 }
 
 // egatesFencer binds the two ownership proofs exactly as the projection

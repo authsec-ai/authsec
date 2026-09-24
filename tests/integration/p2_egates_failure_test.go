@@ -174,6 +174,33 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 		t.Errorf("/identities meta.coverage = %s, want A's iam_roles denied with what it affects", egatesJSON(dig(ids, "meta", "coverage")))
 	}
 	egatesNoGuessedPermission(t, "/identities meta.coverage", dig(ids, "meta", "coverage"))
+	// D-73: each list names the gaps that bear on IT -- resources the managed
+	// policy listing; the role's own detail its own partition's surface; the
+	// workload list none of IAM's (its rows are not IAM claims), so it raises
+	// no banner the data does not support.
+	for what, c := range map[string]struct {
+		body    map[string]any
+		surface string
+		want    bool
+	}{
+		"/resources":            {egatesGet(t, api, "/resources"), models.SurfaceIAMPolicies, true},
+		"SharedToolRole detail": {egatesGet(t, api, egatesRoute(t, role)), models.SurfaceIAMRoles, true},
+		"/workloads":            {egatesGet(t, api, "/workloads"), "iam_", false},
+	} {
+		var hit map[string]any
+		for _, n := range digl(c.body, "meta", "coverage") {
+			if digs(n, "account_id") == accountA && strings.HasPrefix(digs(n, "surface"), c.surface) {
+				hit = n.(map[string]any)
+			}
+		}
+		if c.want && (hit == nil || digs(hit, "state") != models.CloudCoverageDenied || digs(hit, "affects") == "") {
+			t.Errorf("%s meta.coverage = %s, want A's %s denied with what it affects", what, egatesJSON(dig(c.body, "meta", "coverage")), c.surface)
+		}
+		if !c.want && hit != nil {
+			t.Errorf("%s meta.coverage = %s, want no IAM gap: it bears on no workload row (D-73)", what, egatesJSON(dig(c.body, "meta", "coverage")))
+		}
+		egatesNoGuessedPermission(t, what+" meta.coverage", dig(c.body, "meta", "coverage"))
+	}
 	rows := digl(ids, "data")
 	if len(rows) != 1 || digs(rows[0], "ref") != role || digs(rows[0], "state") != models.RelStale ||
 		digs(rows[0], "lifecycle") != models.IGALifecycleActive {

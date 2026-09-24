@@ -257,6 +257,40 @@ func TestP2EgatesE14CrossWorkspaceAccess(t *testing.T) {
 			}
 		}
 	}
+	// ... and so do their counts. The two labs are the same fixture, so a
+	// count or facet that read the other workspace's rows would say twice as
+	// much: every list, walked whole, is exactly its total, the owner's total
+	// is the same, and each facet whose buckets partition the rows (every row
+	// has exactly one account, one kind) sums to it -- facets apply every
+	// OTHER filter (§5.2), the workspace included.
+	for path, facets := range map[string][]string{
+		"/workloads":  {"account", "runtime_kind"},
+		"/identities": {"account", "kind"},
+		"/resources":  {"account", "kind"},
+	} {
+		walked := listsWalk(t, api, path, 200)
+		for _, row := range walked {
+			if !mine.all[refUUID(t, digs(row, "ref")).String()] {
+				t.Errorf("%s from home returned %s, which is not home's", path, digs(row, "ref"))
+			}
+		}
+		body := egatesGet(t, api, path+qs("limit", "1", "facets", strings.Join(facets, ",")))
+		ownerTotal := num(egatesGet(t, owner, path+qs("limit", "1")), "meta", "total")
+		if total := num(body, "meta", "total"); dig(body, "meta", "total_known") != true || total != int64(len(walked)) || total != ownerTotal {
+			t.Errorf("%s from home: total %d (known %v), %d rows walked, the owner's total %d; want one count of home's own rows",
+				path, total, dig(body, "meta", "total_known"), len(walked), ownerTotal)
+		}
+		for _, name := range facets {
+			chips, ok := listsFacet(body, name)
+			var sum int64
+			for _, n := range chips {
+				sum += n
+			}
+			if !ok || sum != int64(len(walked)) {
+				t.Errorf("%s facet %s from home = %v (sum %d), want it to count home's %d rows only", path, name, chips, sum, len(walked))
+			}
+		}
+	}
 	if rows := digl(egatesGet(t, api, "/workloads"+qs("integration", theirs.one["cloud_connector"])), "data"); len(rows) != 0 {
 		t.Errorf("/workloads filtered by the other workspace's connector = %d rows, want none (D-75)", len(rows))
 	}
@@ -571,7 +605,10 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	}
 
 	// The Kubernetes bridge: a sighting named like an AWS workload is never
-	// proposed a link to it -- AWS workloads are not canonical agents.
+	// proposed a link to it -- AWS workloads are not canonical agents. The
+	// lab has no Kubernetes collector, so the sighting is inserted as the
+	// k8s webhook writes it (source k8s_webhook), and the REAL bridge runs
+	// over it.
 	sighting := uuid.New()
 	if err := mixed.db.Exec(`INSERT INTO discovered_agents (id, workspace_id, source, fingerprint, display_name)
 	                         VALUES (?, ?, 'k8s_webhook', ?, 'ticket-tools')`, sighting, mixed.ws, "fp-egates-"+sighting.String()[:8]).Error; err != nil {

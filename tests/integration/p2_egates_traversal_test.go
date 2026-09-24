@@ -236,6 +236,110 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	}
 }
 
+// E11, the hard budgets as the ROUTES apply them (§5.4 "Budgets"): the
+// scenario's "expand past the display default" on a neighbourhood larger than
+// one request may return. 510 Lambdas in A run as fleet-role. Its reverse
+// /graph stops at the 500-node hard budget -- bound_by nodes, every node once,
+// meta.budgets the production ones -- and its frontier's more count is exact
+// (counted within the budget), never a guess; /graph/expand pages the
+// executes_as neighbours 100 at a time with a cursor for the rest, until all
+// 510 are walked once; assume_hops beyond the hard 4 is refused, not clamped.
+//
+// Nothing is injected here: the route runs Reader.Traversal's own budgets.
+// The cases that need a budget below the route's -- edges, paths, the time
+// budget and a more count that cannot be made exact ({count: null}) -- are
+// the Reader-level suites' (p2_graph_budgets_test.go, and the path cases of
+// TestP2EgatesE11ExternalAccountsCyclesAndLimits above).
+//
+// Safeguards (mutation-checked): the routes run under the §5.4 hard node and
+// neighbour budgets.
+func TestP2EgatesE11HardBudgetsThroughTheRoutes(t *testing.T) {
+	l := newP2Lab(t, "p2-egates-e11-budgets", true)
+	a := egatesProduction(t, l)
+	const fleetSize = 510
+	egatesFillersAs(a, egatesPrimary, "fleet-fn", fleetSize, a.role("fleet-role", "AROAEGATESFLEETROLE1"))
+	egatesCycle(l, a)
+	api := l.api()
+	fleet := egatesIdentity(t, l, "fleet-role")
+
+	g := egatesGet(t, api, "/graph"+qs("root", fleet, "direction", "reverse"))
+	b := igaread.DefaultGraphBudgets
+	if num(g, "meta", "budgets", "nodes") != int64(b.Nodes) || num(g, "meta", "budgets", "edges") != int64(b.Edges) ||
+		num(g, "meta", "budgets", "assume_hops") != int64(b.AssumeHops) || num(g, "meta", "budgets", "timeout_ms") != 3000 ||
+		b.Nodes != 500 || b.Edges != 2000 || b.AssumeHops != 4 || b.Neighbours != 100 {
+		t.Errorf("meta.budgets = %s, want §5.4's hard budgets (nodes 500, edges 2000, assume_hops 4, 3 s)",
+			egatesJSON(dig(g, "meta", "budgets")))
+	}
+	nodes := graphNodes(t, digl(g, "data", "nodes")) // fails on a node drawn twice
+	edges := graphEdges(t, digl(g, "data", "edges"))
+	if len(nodes) != b.Nodes || digs(g, "data", "truncated", "bound_by") != "nodes" {
+		t.Fatalf("fleet-role's reverse graph = %d nodes, truncated %s; want the %d-node hard budget to bind",
+			len(nodes), egatesJSON(dig(g, "data", "truncated")), b.Nodes)
+	}
+	var drawn int64
+	for _, e := range edges {
+		if e.Kind != "executes_as" {
+			continue
+		}
+		if e.To != fleet || nodes[e.From] == nil {
+			t.Errorf("executes_as %+v does not join a drawn workload to fleet-role", e)
+		}
+		drawn++
+	}
+	if len(graphRefsOfKind(digl(g, "data", "nodes"), "workload")) != int(drawn) {
+		t.Errorf("%d workloads drawn for %d executes_as edges: every drawn workload has its edge", len(graphRefsOfKind(digl(g, "data", "nodes"), "workload")), drawn)
+	}
+	// What was not returned, counted exactly within the budget -- and the
+	// call that returns it.
+	f := graphFrontier(g, fleet, "executes_as")
+	if f == nil || num(f, "more", "count") != fleetSize-drawn || dig(f, "more", "exact") != true ||
+		digs(f, "direction") != "reverse" ||
+		digs(f, "expand") != "/api/iga/v1/graph/expand?node="+fleet+"&edge=executes_as&direction=reverse" {
+		t.Errorf("fleet-role executes_as frontier = %s, want {count %d, exact} and its expand call", egatesJSON(f), fleetSize-drawn)
+	}
+
+	// /graph/expand: 100 per page, a cursor for the rest, every workload once.
+	seen := map[string]bool{}
+	cursor, pages := "", 0
+	for {
+		args := []string{"node", fleet, "edge", "executes_as", "direction", "reverse"}
+		if cursor != "" {
+			args = append(args, "cursor", cursor)
+		}
+		page := egatesGet(t, api, "/graph/expand"+qs(args...))
+		es := graphEdges(t, digl(page, "data", "edges"))
+		if len(es) > b.Neighbours || (digs(page, "data", "next_cursor") != "" && len(es) != b.Neighbours) {
+			t.Fatalf("expand page %d = %d edges (cursor %v), want pages of %d", pages, len(es), dig(page, "data", "next_cursor"), b.Neighbours)
+		}
+		for _, e := range es {
+			if e.To != fleet || seen[e.From] {
+				t.Fatalf("expand page %d: edge %+v repeats a workload or leaves fleet-role", pages, e)
+			}
+			seen[e.From] = true
+		}
+		pages++
+		if cursor = digs(page, "data", "next_cursor"); cursor == "" {
+			break
+		}
+		if pages > fleetSize/b.Neighbours+1 {
+			t.Fatalf("expand did not end after %d pages", pages)
+		}
+	}
+	if len(seen) != fleetSize || pages != fleetSize/b.Neighbours+1 {
+		t.Errorf("expand walked %d workloads in %d pages, want all %d in %d", len(seen), pages, fleetSize, fleetSize/b.Neighbours+1)
+	}
+
+	// assume_hops: 4 is the per-request ceiling; beyond it is a new expand
+	// from the frontier, so 5 is refused rather than quietly clamped.
+	if code, body := api.get("/graph" + qs("root", fleet, "direction", "forward", "assume_hops", "4")); code != 200 {
+		t.Errorf("assume_hops=4 = %d %s, want 200", code, egatesJSON(body))
+	}
+	if code, body := api.get("/graph" + qs("root", fleet, "direction", "forward", "assume_hops", "5")); code != 400 ||
+		errCode(body) != "invalid_parameter" {
+		t.Errorf("assume_hops=5 = %d %s, want 400 invalid_parameter", code, egatesJSON(body))
+	}
+}
+
 // egatesMapKeys lists a node map's refs.
 func egatesMapKeys(m map[string]map[string]any) []string {
 	out := make([]string, 0, len(m))
