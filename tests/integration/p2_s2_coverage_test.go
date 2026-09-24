@@ -123,10 +123,11 @@ func TestP2S2CoverageFromTheCurrentRevision(t *testing.T) {
 		!strings.Contains(digs(docs, "error"), "S2ReadOnlyTickets") || digs(docs, "run") != refOf("cloud_scan_run", runB.ID) {
 		t.Fatalf("B's unreadable document = %v, want partial naming S2ReadOnlyTickets", docs)
 	}
-	// The partial surface was not refused as a whole; no single call is named
-	// for it (the failed call is in the document's own words).
-	if dig(docs, "api") != nil || dig(docs, "error_code") != nil {
-		t.Fatalf("a partial surface names one call %v / %v it did not fail as a whole", dig(docs, "api"), dig(docs, "error_code"))
+	// The partial surface names its first failing call and AWS's code for it,
+	// as every partial surface does (D-71, D-104): the one call refused here.
+	if digs(docs, "api") != "iam:GetPolicyVersion" || digs(docs, "error_code") != "AccessDenied" {
+		t.Fatalf("B's partial policy_documents names %v / %v, want the refused iam:GetPolicyVersion / AccessDenied",
+			dig(docs, "api"), dig(docs, "error_code"))
 	}
 	if lam := s2Surface(t, accB, "lambda:us-east-1"); dig(lam, "prevents") != nil {
 		t.Fatalf("B's clean Lambda surface = %v", lam)

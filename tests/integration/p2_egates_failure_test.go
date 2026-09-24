@@ -404,9 +404,9 @@ const egatesAWSManaged = "arn:aws:iam::aws:policy/SupportTicketsReadOnly"
 //
 // Safeguards (mutation-checked): one unreadable document keeps its own
 // partition stale without vetoing the account (a detach in the same run still
-// ends); its /coverage item names the refused call and AWS's code from the
-// failed call itself, recorded at the fetch, stamped at collection and
-// rendered by /coverage (D-95).
+// ends); /coverage's policy_documents names the refused call and AWS's code in
+// its api and error_code, from the failed call itself -- recorded at the
+// fetch, stamped at collection, rendered by /coverage (D-71, D-104).
 func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e9b", true)
 	a := egatesProduction(t, l)
@@ -462,21 +462,21 @@ func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 		digs(docs, "run") != refOf("cloud_scan_run", run.ID) {
 		t.Errorf("/coverage policy_documents = %s, want partial in run %s", egatesJSON(docs), run.ID)
 	}
-	// The refused call and AWS's code, as fields on the unreadable document's
-	// own item (D-71, api and error_code additive to its {policy, version,
-	// error}) -- asserted on the fields, never on the error prose (D-71:
-	// "never parse Error prose into a code"). The surface itself names no
-	// single call: it was not refused as a whole, and its documents may fail
-	// on different calls (TestP2S2CoverageFromTheCurrentRevision).
-	if dig(docs, "api") != nil || dig(docs, "error_code") != nil {
-		t.Errorf("/coverage policy_documents api %v error_code %v, want null on the surface (per document on its items): %s",
+	// The refused call and AWS's code, in the surface's structured api and
+	// error_code (§5.3 "api (the call that failed)"; D-71, D-104) -- asserted
+	// on the fields, never on the error prose (D-71: "never parse Error prose
+	// into a code"), and the fake's message above names no call, so nothing
+	// here can be an echo of the fixture.
+	if digs(docs, "api") != "iam:GetPolicyVersion" || digs(docs, "error_code") != "AccessDenied" {
+		t.Errorf("/coverage policy_documents api %v error_code %v, want iam:GetPolicyVersion / AccessDenied: %s",
 			dig(docs, "api"), dig(docs, "error_code"), egatesJSON(docs))
 	}
+	// The unreadable document itself, as D-71's item {policy, version, error}
+	// -- exactly those fields -- with the reason its row carries.
 	items := digl(docs, "items")
-	if len(items) != 1 || digs(items[0], "policy") != "SupportTicketsReadOnly" ||
-		digs(items[0], "api") != "iam:GetPolicyVersion" || digs(items[0], "error_code") != "AccessDenied" ||
-		digs(items[0], "error") == "" {
-		t.Errorf("/coverage policy_documents items = %s, want exactly the AWS-managed document, with the refused call and AWS's code",
+	if len(items) != 1 || digs(items[0], "policy") != "SupportTicketsReadOnly" || digs(items[0], "error") == "" ||
+		len(items[0].(map[string]any)) != 3 {
+		t.Errorf("/coverage policy_documents items = %s, want exactly the AWS-managed document, as {policy, version, error}",
 			egatesJSON(items))
 	}
 	if strings.Contains(egatesJSON(docs), egatesTicketRead) {

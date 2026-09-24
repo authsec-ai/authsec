@@ -163,11 +163,12 @@ type AttachedPolicy struct {
 	// policy and the scan continues -- it used to abort every policy of the
 	// identity, and then the whole permission scan.
 	FetchError string
-	// FetchAPI and FetchCode are FetchError's structured half (P2-DECISIONS
-	// D-71, D-95): the call that failed and the code AWS returned, taken from the
-	// APICallError that failed it -- never parsed back out of the prose, and
-	// both empty when the fetch did not fail on a call (the listing returned
-	// no document, or omitted the policy).
+	// FetchAPI and FetchCode are FetchError's structured half: the call that
+	// failed and the code AWS returned, taken from the APICallError that
+	// failed it -- never parsed back out of the prose (D-71) -- and both empty
+	// when the fetch did not fail on a call (the listing returned no
+	// document, or omitted the policy). The permission scan names the first
+	// of them as policy_documents' api and error_code (P2-DECISIONS D-104).
 	FetchAPI  string
 	FetchCode string
 	// AWSManaged distinguishes an AWS-owned policy from a customer-owned one.
@@ -370,7 +371,7 @@ func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName str
 // fetchFailed records that the policy's document could not be fetched because
 // a call failed: FetchError in the words it has always had ("fetch: AWS
 // returned AccessDenied for iam:GetPolicyVersion: ..."), and beside it the
-// call and AWS's code as the APICallError names them (D-95), so coverage can
+// call and AWS's code as the APICallError names them (D-104), so coverage can
 // report both without reading the prose. An error that names no call leaves
 // them empty: unknown is said as unknown.
 func (p *AttachedPolicy) fetchFailed(err error) {

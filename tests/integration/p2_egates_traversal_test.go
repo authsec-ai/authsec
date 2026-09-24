@@ -64,13 +64,15 @@ func egatesUsedByPrincipal(t *testing.T, api *readAPI, identity, kind string) ma
 // not_found_within_budget -- never none_exists -- when a budget did, through
 // the route under its own hard budgets (chain-1 to chain-6 is one can_assume
 // hop past them); none claims a distance. A walk past a resolution in force
-// it does not follow says so in resolution_not_followed, and is not
-// truncated: no budget bound (§5.4, D-94).
+// it does not follow never reads as complete: truncated names it,
+// resolution_not_followed (§5.4 "never states a completeness it did not
+// establish"; recorded as D-101 by the frozen-contract pass), and a walk that
+// passed none is not truncated at all.
 //
 // Safeguards (mutation-checked): a node already on the walk is not expanded
 // again (a cycle never duplicates nodes); none_exists only when both
-// frontiers were exhausted before any budget bound (D-38); /graph's
-// truncated names only a budget that bound (D-94).
+// frontiers were exhausted before any budget bound (D-38); a /graph walk that
+// passed an unfollowed resolution is truncated, one that passed none is not.
 func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e11", true)
 	a := egatesProduction(t, l)
@@ -125,11 +127,11 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	if graphFrontier(rev, cRef, "can_assume") != nil {
 		t.Errorf("an external principal is terminal; frontier %s", egatesJSON(dig(rev, "data", "frontier")))
 	}
-	// C's principal is unresolved: nothing was left unfollowed, and the walk
-	// is complete -- the control for reader-access's below.
-	if dig(rev, "data", "truncated") != nil || dig(rev, "data", "resolution_not_followed") != false {
-		t.Errorf("partner-access reverse graph: truncated %s, resolution_not_followed %v, want null and false",
-			egatesJSON(dig(rev, "data", "truncated")), dig(rev, "data", "resolution_not_followed"))
+	// C's principal is unresolved: nothing was left unfollowed and no budget
+	// bound, so the walk is complete -- the control for reader-access's below.
+	if dig(rev, "data", "truncated") != nil {
+		t.Errorf("partner-access reverse graph: truncated %s, want null (no resolution in force, nothing bound)",
+			egatesJSON(dig(rev, "data", "truncated")))
 	}
 	// The GitHub OIDC trust: an oidc principal with the wildcard subject,
 	// unresolved as a wildcard, federated.
@@ -148,9 +150,8 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	// A's role trusting B's data-reader: A was projected first, so the trust
 	// names a principal; B's pass then RESOLVED it (derived, D-41) -- shown,
 	// never walked, and the edge crosses from B into A. What reaches
-	// data-reader was therefore not read: resolution_not_followed says so,
-	// and truncated stays null -- no budget bound (§5.4 "Continuation", the
-	// §5.3 Graph example; D-94).
+	// data-reader was therefore not read, and the answer must not read as
+	// complete: truncated resolution_not_followed (D-101).
 	access := egatesIdentity(t, l, "reader-access")
 	reader := egatesIdentity(t, l, "data-reader")
 	rg := egatesGet(t, api, "/graph"+qs("root", access, "direction", "reverse"))
@@ -164,7 +165,7 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 	rn := graphNodes(t, digl(rg, "data", "nodes"))
 	if crossing == nil || !crossing.CrossesAccount || digs(rn[crossing.From], "account", "id") != accountB ||
 		digs(rn[crossing.From], "resolution", "resolved_to") != reader || rn[reader] != nil ||
-		dig(rg, "data", "truncated") != nil || dig(rg, "data", "resolution_not_followed") != true {
+		digs(rg, "data", "truncated", "bound_by") != "resolution_not_followed" {
 		t.Errorf("reader-access reverse graph = %s, want B's resolved principal on a crossing edge, the resolution not walked",
 			egatesJSON(dig(rg, "data")))
 	}
@@ -191,7 +192,7 @@ func TestP2EgatesE11ExternalAccountsCyclesAndLimits(t *testing.T) {
 			}
 		}
 		if len(ln) != 2 || len(le) != 2 || len(closing) != 1 || (closing[0].To != loopA && closing[0].From != loopA) ||
-			dig(g, "data", "truncated") != nil || dig(g, "data", "resolution_not_followed") != false {
+			dig(g, "data", "truncated") != nil {
 			t.Errorf("loop-a %s graph = %s, want 2 nodes, 2 edges, one closes_cycle back at loop-a, complete",
 				dir, egatesJSON(dig(g, "data")))
 		}

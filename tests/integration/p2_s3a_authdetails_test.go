@@ -518,11 +518,10 @@ func TestP2S3aOneUnreadableDocumentIsolated(t *testing.T) {
 		t.Errorf("unreadable row = %+v, want no document and a fetch error naming the call and code", b)
 	}
 	// D-71: the same document as a structured item, carrying exactly the
-	// reason its row carries -- ONE item although two holders attach it --
-	// and the refused call and AWS's code as fields (additive to D-71).
+	// reason its row carries -- ONE item although two holders attach it.
 	if pd := cov[models.SurfacePolicyDocuments]; len(pd.Items) != 1 || pd.Truncated ||
 		pd.Items[0] != (models.CoverageItem{Policy: "AAABlockedAccess", Version: "v3",
-			Error: pols["AAABlockedAccess"].DocumentError, API: "iam:GetPolicyVersion", ErrorCode: "AccessDenied"}) {
+			Error: pols["AAABlockedAccess"].DocumentError}) {
 		t.Errorf("policy_documents items = %+v (truncated %v), want exactly AAABlockedAccess v3 with its row's error",
 			pd.Items, pd.Truncated)
 	}
