@@ -101,43 +101,47 @@ func (a *egatesAcct) hook() services.ScannerHook {
 	base := a.p2Account.hook()
 	return func(iamS *services.AWSIAMScanner, perm *services.AWSPermissionScanner, wl *services.AWSWorkloadScanner) {
 		base(iamS, perm, wl)
-		wl.WithRegionalAPIs(func(region string) (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI,
-			awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI,
-			awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI) {
-			var lam awsdiscovery.LambdaAPI = &fakeLambda{}
-			if f := a.lambdas[region]; f != nil {
-				lam = f
-			}
-			r := a.regions[region]
-			if r == nil {
-				r = &egatesRegion{}
-			}
-			var ecsAPI awsdiscovery.ECSAPI = &fakeECS{defs: map[string]ecstypes.TaskDefinition{}}
-			if r.ecs != nil {
-				ecsAPI = r.ecs
-			}
-			var ec2API awsdiscovery.EC2API = &fakeEC2{}
-			if r.ec2 != nil {
-				ec2API = r.ec2
-			}
-			var prof awsdiscovery.InstanceProfileAPI = &fakeInstanceProfile{roleByProfileName: map[string]string{}}
-			if r.profiles != nil {
-				prof = r.profiles
-			}
-			var bed awsdiscovery.BedrockAgentAPI = &fakeBedrock{agents: map[string]bedrockagenttypes.Agent{}}
-			if r.bedrock != nil {
-				bed = r.bedrock
-			}
-			var core awsdiscovery.AgentCoreAPI = &fakeAgentCore{}
-			if r.core != nil {
-				core = r.core
-			}
-			return lam, ecsAPI, ec2API, prof, bed, core, &fakeCloudTrail{}
-		})
+		wl.WithRegionalAPIs(a.regional)
 		if a.extra != nil {
 			a.extra(iamS, perm, wl)
 		}
 	}
+}
+
+// regional is one region's workload APIs: the account's own fakes for that
+// region, and an empty, successful listing for every one it has none of.
+func (a *egatesAcct) regional(region string) (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI,
+	awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI,
+	awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI) {
+	var lam awsdiscovery.LambdaAPI = &fakeLambda{}
+	if f := a.lambdas[region]; f != nil {
+		lam = f
+	}
+	r := a.regions[region]
+	if r == nil {
+		r = &egatesRegion{}
+	}
+	var ecsAPI awsdiscovery.ECSAPI = &fakeECS{defs: map[string]ecstypes.TaskDefinition{}}
+	if r.ecs != nil {
+		ecsAPI = r.ecs
+	}
+	var ec2API awsdiscovery.EC2API = &fakeEC2{}
+	if r.ec2 != nil {
+		ec2API = r.ec2
+	}
+	var prof awsdiscovery.InstanceProfileAPI = &fakeInstanceProfile{roleByProfileName: map[string]string{}}
+	if r.profiles != nil {
+		prof = r.profiles
+	}
+	var bed awsdiscovery.BedrockAgentAPI = &fakeBedrock{agents: map[string]bedrockagenttypes.Agent{}}
+	if r.bedrock != nil {
+		bed = r.bedrock
+	}
+	var core awsdiscovery.AgentCoreAPI = &fakeAgentCore{}
+	if r.core != nil {
+		core = r.core
+	}
+	return lam, ecsAPI, ec2API, prof, bed, core, &fakeCloudTrail{}
 }
 
 var egatesSeq int

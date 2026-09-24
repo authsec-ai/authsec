@@ -18,6 +18,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -34,6 +35,10 @@ type egatesEdgeRow struct {
 	State           string
 	ValidTo         *time.Time
 	LastConfirmedAt *time.Time
+	// ConnectorID and PartitionKey are the row's partition as the projector
+	// stamped it (D-60): which scan may confirm, stale or end it.
+	ConnectorID  uuid.UUID
+	PartitionKey string
 }
 
 // egatesEdgeRows reads every relationship, assignment, grant and support row
@@ -42,15 +47,19 @@ func egatesEdgeRows(t *testing.T, l *p2Lab) map[uuid.UUID]egatesEdgeRow {
 	t.Helper()
 	var rows []egatesEdgeRow
 	if err := l.db.Raw(`
-	    SELECT id, 'relationship:' || relationship_type AS kind, state, valid_to, last_confirmed_at FROM iga_relationship WHERE workspace_id = ?
-	    UNION ALL SELECT id, 'assignment', state, valid_to, last_confirmed_at FROM iga_policy_assignment WHERE workspace_id = ?
-	    UNION ALL SELECT id, 'grant', state, valid_to, last_confirmed_at FROM iga_access_edges WHERE workspace_id = ? AND provider = 'aws'
+	    SELECT id, 'relationship:' || relationship_type AS kind, state, valid_to, last_confirmed_at, connector_id, partition_key
+	      FROM iga_relationship WHERE workspace_id = ?
+	    UNION ALL SELECT id, 'assignment', state, valid_to, last_confirmed_at, connector_id, partition_key
+	      FROM iga_policy_assignment WHERE workspace_id = ?
+	    UNION ALL SELECT id, 'grant', state, valid_to, last_confirmed_at, connector_id, partition_key
+	      FROM iga_access_edges WHERE workspace_id = ? AND provider = 'aws'
 	    UNION ALL SELECT id, 'support:' || CASE WHEN identity_account_id IS NOT NULL THEN 'identity'
 	                                          WHEN workload_id IS NOT NULL THEN 'workload'
 	                                          WHEN resource_id IS NOT NULL THEN 'resource'
 	                                          WHEN entitlement_id IS NOT NULL THEN 'statement'
 	                                          ELSE 'policy' END,
-	                     state, NULL::timestamptz, last_confirmed_at FROM iga_object_support WHERE workspace_id = ?`,
+	                     state, NULL::timestamptz, last_confirmed_at, connector_id, partition_key
+	      FROM iga_object_support WHERE workspace_id = ?`,
 		l.ws, l.ws, l.ws, l.ws).Scan(&rows).Error; err != nil {
 		t.Fatalf("read edges: %v", err)
 	}
@@ -59,6 +68,43 @@ func egatesEdgeRows(t *testing.T, l *p2Lab) map[uuid.UUID]egatesEdgeRow {
 		out[r.ID] = r
 	}
 	return out
+}
+
+// egatesPartitionsOf rebuilds the partitions the projector reconciled a run
+// of connector conn under, by key -- igagraph.Partitions over the run's own
+// coverage and the connector's estate scope, the way the read side rebuilds
+// them (D-27e, workload_partitions.go). The scope is the one the projection
+// state records for the connector: a key covers scope and connector (D-57).
+func egatesPartitionsOf(t *testing.T, l *p2Lab, run models.CloudScanRun, conn uuid.UUID) map[string]igagraph.Partition {
+	t.Helper()
+	var scopes []uuid.UUID
+	if err := l.db.Raw(`SELECT DISTINCT estate_scope_id FROM iga_projection_state WHERE workspace_id = ? AND connector_id = ?`,
+		l.ws, conn).Scan(&scopes).Error; err != nil || len(scopes) != 1 {
+		t.Fatalf("estate scope of connector %s: %v (%v), want exactly one", conn, scopes, err)
+	}
+	var stored models.CloudScanRun
+	if err := l.db.First(&stored, "id = ?", run.ID).Error; err != nil {
+		t.Fatalf("read run %s: %v", run.ID, err)
+	}
+	snap := &igagraph.Snapshot{ScopeID: scopes[0], Run: models.CloudScanRun{ID: stored.ID, ConnectorID: stored.ConnectorID},
+		Coverage: models.DecodeScanCoverage(stored.Coverage).Surfaces}
+	out := map[string]igagraph.Partition{}
+	for _, p := range igagraph.Partitions(snap) {
+		out[p.Key()] = p
+	}
+	return out
+}
+
+// egatesRequiresIAM reports whether a partition needs one of the IAM
+// listings reached before it may confirm or close anything.
+func egatesRequiresIAM(p igagraph.Partition) bool {
+	for _, s := range p.RequiredSurfaces {
+		switch s {
+		case models.SurfaceIAMRoles, models.SurfaceIAMUsers, models.SurfaceIAMGroups, models.SurfaceIAMPolicies:
+			return true
+		}
+	}
+	return false
 }
 
 // egatesCoverageSurface is one surface of one account on /coverage.
@@ -117,30 +163,64 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 	if len(after) != len(before) {
 		t.Errorf("rows %d -> %d: a denied scan added or removed edges", len(before), len(after))
 	}
-	stale := map[string]int{}
 	for id, b := range before {
 		n := after[id]
 		if b.State != models.RelEnded && n.State == models.RelEnded {
 			t.Errorf("%s %s ENDED under a denied scan", b.Kind, id)
 		}
 		if n.State == models.RelStale {
-			stale[b.Kind]++
 			if (b.LastConfirmedAt == nil) != (n.LastConfirmedAt == nil) ||
 				(b.LastConfirmedAt != nil && !b.LastConfirmedAt.Equal(*n.LastConfirmedAt)) {
 				t.Errorf("%s %s is stale but its last_confirmed_at moved %v -> %v", b.Kind, id, b.LastConfirmedAt, n.LastConfirmedAt)
 			}
 		}
 	}
-	for _, kind := range []string{"assignment", "grant", "support:identity", "support:policy", "support:statement", "relationship:member_of"} {
-		var total int
-		for _, b := range before {
-			if b.Kind == kind && b.State != models.RelEnded {
-				total++
+	// "Everything under IAM stale" (§2.7 l.613), decided per row from the
+	// projector's own partition table rather than a list of kinds: a row is
+	// under IAM when its partition requires an IAM surface, all four of which
+	// run 2 was refused. A kind the projector later puts under IAM is covered
+	// without editing this test; a row whose partition this build cannot
+	// rebuild fails, rather than being skipped.
+	parts := egatesPartitionsOf(t, l, run2, a.conn)
+	underIAM, outside := map[string]int{}, map[string]int{}
+	for id, b := range before {
+		if b.State == models.RelEnded || b.ConnectorID != a.conn {
+			continue
+		}
+		p, ok := parts[b.PartitionKey]
+		if !ok {
+			t.Errorf("%s %s: partition %q is not in run 2's partition table", b.Kind, id, b.PartitionKey)
+			continue
+		}
+		if !egatesRequiresIAM(p) {
+			// Not an IAM claim (a workload's presence, on its service's
+			// regional surface): read in run 2, so confirmed by it -- the
+			// denial costs nothing outside IAM.
+			outside[b.Kind]++
+			if n := after[id]; n.State != models.RelCurrent || n.LastConfirmedAt == nil || !n.LastConfirmedAt.Equal(pub2.PublishedAt) {
+				t.Errorf("%s %s outside IAM (partition %s) = %s confirmed %v, want current, confirmed by run 2 at %s",
+					b.Kind, id, b.PartitionKey, n.State, n.LastConfirmedAt, pub2.PublishedAt)
 			}
+			continue
 		}
-		if total == 0 || stale[kind] != total {
-			t.Errorf("%s rows stale = %d of %d, want every one (the IAM partitions)", kind, stale[kind], total)
+		underIAM[b.Kind]++
+		if n := after[id]; n.State != models.RelStale {
+			t.Errorf("%s %s under IAM (requires %v) = %s after the denied scan, want stale", b.Kind, id, p.RequiredSurfaces, n.State)
 		}
+	}
+	// Non-vacuity: every kind of claim the lab builds under an IAM partition
+	// is there -- each relationship type, every support class but the
+	// workload's, assignments and grants -- and the workload presences are
+	// the control outside it.
+	for _, kind := range []string{"assignment", "grant", "support:identity", "support:policy", "support:statement",
+		"support:resource", "relationship:member_of", "relationship:executes_as", "relationship:can_assume",
+		"relationship:task_execution_role"} {
+		if underIAM[kind] == 0 {
+			t.Errorf("setup: no %s row under an IAM partition (%v): the check above proves nothing for it", kind, underIAM)
+		}
+	}
+	if outside["support:workload"] == 0 {
+		t.Errorf("setup: no workload presence outside IAM (%v)", outside)
 	}
 	if n := l.count(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND provider = 'aws' AND lifecycle <> 'active'`, l.ws); n != 0 {
 		t.Errorf("%d identities retired by a denied scan", n)
@@ -336,8 +416,11 @@ func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 	archive := egatesResource(t, l, "arn:aws:s3:::ticket-archive/*")
 	managedGrant := evidenceGrant(t, l, egatesSharedRole, "SupportTicketsReadOnly", "ReadSupport")
 
+	// AWS's refusal. Its message deliberately names no call: the call and the
+	// code /coverage reports must come from the collector's structured fields
+	// (D-71), never from prose that happens to contain them.
 	refused := &smithy.OperationError{ServiceID: "IAM", OperationName: "GetPolicyVersion",
-		Err: &smithy.GenericAPIError{Code: "AccessDenied", Message: "not authorized to perform iam:GetPolicyVersion"}}
+		Err: &smithy.GenericAPIError{Code: "AccessDenied", Message: "User is not authorized to perform this operation"}}
 	a.iam.failPolicyVersion[a.policyARN(egatesTicketRead)] = refused
 	a.iam.failPolicyVersion[egatesAWSManaged] = refused
 	a.detach(egatesSharedRole, a.policyARN(egatesToolbox))
@@ -375,10 +458,22 @@ func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 		digs(docs, "run") != refOf("cloud_scan_run", run.ID) {
 		t.Errorf("/coverage policy_documents = %s, want partial in run %s", egatesJSON(docs), run.ID)
 	}
+	// The refused call and AWS's code, as fields on the unreadable document's
+	// own item (D-71, api and error_code additive to its {policy, version,
+	// error}) -- asserted on the fields, never on the error prose (D-71:
+	// "never parse Error prose into a code"). The surface itself names no
+	// single call: it was not refused as a whole, and its documents may fail
+	// on different calls (TestP2S2CoverageFromTheCurrentRevision).
+	if dig(docs, "api") != nil || dig(docs, "error_code") != nil {
+		t.Errorf("/coverage policy_documents api %v error_code %v, want null on the surface (per document on its items): %s",
+			dig(docs, "api"), dig(docs, "error_code"), egatesJSON(docs))
+	}
 	items := digl(docs, "items")
-	if len(items) != 1 || !strings.Contains(egatesJSON(items[0]), "SupportTicketsReadOnly") ||
-		!strings.Contains(egatesJSON(items[0]), "GetPolicyVersion") {
-		t.Errorf("/coverage policy_documents items = %s, want exactly the AWS-managed document and the refused call", egatesJSON(items))
+	if len(items) != 1 || digs(items[0], "policy") != "SupportTicketsReadOnly" ||
+		digs(items[0], "api") != "iam:GetPolicyVersion" || digs(items[0], "error_code") != "AccessDenied" ||
+		digs(items[0], "error") == "" {
+		t.Errorf("/coverage policy_documents items = %s, want exactly the AWS-managed document, with the refused call and AWS's code",
+			egatesJSON(items))
 	}
 	if strings.Contains(egatesJSON(docs), egatesTicketRead) {
 		t.Errorf("/coverage names TicketRead as unreadable, but its document was read: %s", egatesJSON(docs))

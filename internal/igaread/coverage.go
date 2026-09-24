@@ -138,11 +138,18 @@ type CoverageSurface struct {
 }
 
 // CoverageItem is one unreadable document of a policy_documents surface
-// (D-71). Only these three fields are rendered, whatever else was stored.
+// (D-71). Only these fields are rendered, whatever else was stored. api and
+// error_code (additive to D-71's {policy, version, error}) are the call that
+// failed and AWS's code as collection stamped them on the item
+// (models.CoverageItem) -- null for a document that failed on no call (it was
+// read and did not parse) and for a run collected before they existed. Never
+// parsed out of error.
 type CoverageItem struct {
-	Policy  string `json:"policy"`
-	Version string `json:"version"`
-	Error   string `json:"error"`
+	Policy    string `json:"policy"`
+	Version   string `json:"version"`
+	Error     string `json:"error"`
+	API       any    `json:"api"`
+	ErrorCode any    `json:"error_code"`
 }
 
 // coverageRun is one run the current revision was built from.
@@ -358,6 +365,12 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 			}
 			if d, ok := detail.Surfaces[name]; ok && d.Items != nil {
 				entry.Items, entry.Truncated = d.Items, d.Truncated
+				for i := range entry.Items {
+					// A blank or non-string call or code is unknown: null.
+					api, _ := entry.Items[i].API.(string)
+					code, _ := entry.Items[i].ErrorCode.(string)
+					entry.Items[i].API, entry.Items[i].ErrorCode = nullIfBlank(api), nullIfBlank(code)
+				}
 			}
 			switch s.State {
 			case models.CloudCoverageReached:

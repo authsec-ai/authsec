@@ -1068,7 +1068,14 @@ func (s *AWSPermissionScanner) recordManagedPolicy(
 		row.DocumentHash = documentHash(p.Document)
 	}
 	if docErr != "" {
-		out.noteUnreadable(p.Name, p.VersionID, docErr)
+		item := models.CoverageItem{Policy: p.Name, Version: p.VersionID, Error: docErr}
+		if p.FetchError != "" {
+			// Unread because a call failed: the item names that call and
+			// AWS's code as the fetch recorded them (D-71), never parsed from
+			// docErr. A document that was read and did not parse names none.
+			item.API, item.ErrorCode = p.FetchAPI, p.FetchCode
+		}
+		out.noteUnreadableItem(item)
 	}
 	stored, err := s.policies.UpsertPolicy(row)
 	if err != nil {
@@ -1214,6 +1221,11 @@ func policyDocumentsSurface(out *PermissionSnapshot, trustDocuments int) models.
 	if n == 0 {
 		return cov
 	}
+	// No api or error_code on the SURFACE: it was not refused as a whole, and
+	// its documents may have failed on different calls, or on none (a parse
+	// error). Each item carries the call and AWS's code its own fetch failed
+	// on (D-71, stamped in recordManagedPolicy), so the failed call is named
+	// per document, where it is unambiguous.
 	listed := out.UnreadableDocuments
 	if n > models.CoverageItemLimit {
 		listed, cov.Truncated = listed[:models.CoverageItemLimit], true

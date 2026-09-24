@@ -163,6 +163,13 @@ type AttachedPolicy struct {
 	// policy and the scan continues -- it used to abort every policy of the
 	// identity, and then the whole permission scan.
 	FetchError string
+	// FetchAPI and FetchCode are FetchError's structured half (P2-DECISIONS
+	// D-71): the call that failed and the code AWS returned, taken from the
+	// APICallError that failed it -- never parsed back out of the prose, and
+	// both empty when the fetch did not fail on a call (the listing returned
+	// no document, or omitted the policy).
+	FetchAPI  string
+	FetchCode string
 	// AWSManaged distinguishes an AWS-owned policy from a customer-owned one.
 	// Ticket [2] weighs them differently: a customer-authored policy is a local
 	// decision, an AWS-managed one is a well-known grant.
@@ -333,7 +340,7 @@ func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName str
 	// names the call"), never classify()'s "the role could not be assumed".
 	meta, err := r.api.GetPolicy(ctx, &iam.GetPolicyInput{PolicyArn: aws.String(policyARN)})
 	if err != nil {
-		built.FetchError = "fetch: " + callError("iam:GetPolicy", err).Error()
+		built.fetchFailed(callError("iam:GetPolicy", err))
 		return built
 	}
 	if meta.Policy != nil {
@@ -351,13 +358,27 @@ func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName str
 		PolicyArn: aws.String(policyARN), VersionId: aws.String(built.VersionID),
 	})
 	if err != nil {
-		built.FetchError = "fetch: " + callError("iam:GetPolicyVersion", err).Error()
+		built.fetchFailed(callError("iam:GetPolicyVersion", err))
 		return built
 	}
 	if ver.PolicyVersion != nil {
 		built.Document = decodePolicyDocument(ver.PolicyVersion.Document)
 	}
 	return built
+}
+
+// fetchFailed records that the policy's document could not be fetched because
+// a call failed: FetchError in the words it has always had ("fetch: AWS
+// returned AccessDenied for iam:GetPolicyVersion: ..."), and beside it the
+// call and AWS's code as the APICallError names them (D-71), so coverage can
+// report both without reading the prose. An error that names no call leaves
+// them empty: unknown is said as unknown.
+func (p *AttachedPolicy) fetchFailed(err error) {
+	p.FetchError = "fetch: " + err.Error()
+	var call *APICallError
+	if errors.As(err, &call) {
+		p.FetchAPI, p.FetchCode = call.API, call.Code
+	}
 }
 
 /* -------------------------------- helpers --------------------------------- */

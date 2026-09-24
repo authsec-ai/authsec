@@ -79,6 +79,16 @@ func runFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error 
 	})
 }
 
+// RunFenced is runFenced for a write a scanner makes outside the inventory
+// repositories -- the coverage report and generation the IAM scanner files
+// on the connector row itself. With a fence, fn runs in one transaction that
+// first asserts it (FOR SHARE, as every inventory write does), so a
+// superseded worker gets ErrScanFenceLost and its report never replaces the
+// current owner's; without one, fn runs against db as before.
+func RunFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error {
+	return runFenced(db, fence, fn)
+}
+
 // runFencedTx is runFenced for a mutation that must be atomic on its own --
 // the multi-table deletes of ReconcileGeneration. It ALWAYS opens a
 // transaction, and asserts the fence inside it when one is set.

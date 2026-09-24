@@ -15,9 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 
-	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -258,79 +256,68 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 	}
 }
 
-// E13. Interruption, lease loss and replay, each followed through /pipeline:
+// E13. Interruption, lease loss and replay, each followed through /pipeline,
+// every scan by the REAL AWSScanWorker and every projection pass by the REAL
+// ProjectionService:
 //
-//  1. a scan worker dies mid-collection (it claimed the run and the barrier
-//     and then stopped); a second worker started while the first merely
-//     paused claims nothing; once the lease runs out the next worker reclaims
-//     the run without intervention, and the dead worker's fence refuses
-//     every write it attempts afterwards (an inventory upsert and each
-//     reconcile delete);
-//  2. a projector dies mid-projection (its graph transaction never
-//     committed, so it wrote nothing): a second projector started while it
-//     is merely paused claims nothing; the job is reclaimed, and when the
-//     first projector wakes and runs its pass on the lease it claimed, the
-//     real fencing repositories refuse it inside its graph transaction and it
+//  1. a scan worker dies mid-collection: it claimed the run and the barrier
+//     and stalls inside its first IAM listing (egatesSupersedeMidScan). A
+//     second worker started while it is merely paused claims nothing; once
+//     its leases run out the next worker reclaims the run without
+//     intervention and publishes it; the stalled worker then wakes, and its
+//     own fence refuses its first write -- nothing it does afterwards changes
+//     a row (TestP2EgatesE13SupersededScannersWriteNothing: the other two
+//     scanners);
+//  2. a projector dies mid-projection: the service pauses after reading its
+//     inputs, before its graph transaction (WithBeforeGraphTx). A second
+//     projector started while it is merely paused claims nothing; the job is
+//     reclaimed, and when the first pass wakes on the lease it claimed, the
+//     service's own fencer refuses it inside its graph transaction and it
 //     writes nothing; the job then completes;
 //  3. a projector dies after its commit and before completing the job: the
 //     replay completes, publishing nothing twice.
 //
 // Exactly one publication per run; job complete; barrier idle; the next scan
 // starts; nothing but the pipeline view ever shows the in-flight state.
+//
+// Safeguards (mutation-checked): the IAM scanner is built with the run's
+// fence; the projection service's fencer asserts the job lease.
 func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e13", true)
 	a := egatesProduction(t, l)
 	api := l.api()
 
-	// (1) A worker claims the run and the barrier, then dies.
-	queued, err := l.runs.Enqueue(l.ws, a.conn, "manual")
-	if err != nil {
-		t.Fatal(err)
+	// (1) A worker claims the run and the barrier and stalls mid-collection.
+	// While it is paused: the pipeline shows the collection in flight, nothing
+	// is listed, and a second worker claims nothing (the lease is live).
+	run, stale := egatesSupersedeMidScan(t, l, a, egatesPauseIAM, func(owner string) {
+		view := s2Pipeline(t, api)
+		if digs(view, "barrier", "state") != models.PipelineCollecting ||
+			digs(s2PipelineAccount(t, view, a.p2Account), "state") != "collecting" {
+			t.Errorf("pipeline while the first worker is paused mid-scan = %s", egatesJSON(view))
+		}
+		egatesNotPublished(t, api, "/workloads")
+		if egatesWork(l, a, "egates-second-worker") {
+			t.Fatal("a second worker claimed a run whose lease is live")
+		}
+		var holder string
+		l.db.Raw(`SELECT lease_owner FROM cloud_scan_run WHERE workspace_id = ? AND status = 'running'`, l.ws).Scan(&holder)
+		if holder != owner {
+			t.Fatalf("run owner after the second worker = %q, want the paused worker's %q", holder, owner)
+		}
+		if digs(view, "barrier", "scan_run") == "" {
+			t.Errorf("pipeline while collecting names no run: %s", egatesJSON(view))
+		}
+	})
+	queued := run
+	if st := digs(s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account), "state"); st != "projecting" {
+		t.Errorf("after the reclaimed run published: %q, want projecting", st)
 	}
-	dead, err := l.runs.ClaimForPipeline("egates-dead-scan-worker", time.Minute, time.Now())
-	if err != nil || dead == nil || dead.ID != queued.ID {
-		t.Fatalf("dead worker's claim: %v %v", dead, err)
-	}
-	// ... and the barrier, as RunOnce does before writing any inventory.
-	if _, err := repositories.NewIGAPipelineLeaseRepository(l.db).AcquireForCollection(
-		l.ws, "egates-dead-scan-worker", queued.ID, time.Minute, time.Now()); err != nil {
-		t.Fatalf("dead worker's barrier: %v", err)
-	}
-	view := s2Pipeline(t, api)
-	if digs(view, "barrier", "state") != models.PipelineCollecting ||
-		digs(view, "barrier", "scan_run") != refOf("cloud_scan_run", queued.ID) ||
-		digs(s2PipelineAccount(t, view, a.p2Account), "state") != "collecting" {
-		t.Fatalf("pipeline while the first worker holds the run = %s", egatesJSON(view))
-	}
-	egatesNotPublished(t, api, "/workloads")
-	// A second worker while the first is merely paused (its lease is live).
-	if egatesWork(l, a, "egates-second-worker") {
-		t.Fatal("a second worker claimed a run whose lease is live")
-	}
-	var owner string
-	l.db.Raw(`SELECT lease_owner FROM cloud_scan_run WHERE id = ?`, queued.ID).Scan(&owner)
-	if owner != "egates-dead-scan-worker" {
-		t.Fatalf("run owner after the second worker = %q, want the first worker's", owner)
-	}
-	// Both leases run out (the dead worker renews neither); the next worker
-	// reclaims the run and the barrier without intervention.
-	egatesExec(t, l, `UPDATE cloud_scan_run SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, queued.ID)
-	egatesExec(t, l, `UPDATE iga_pipeline_lease SET expires_at = now() - interval '1 minute' WHERE workspace_id = ?`, l.ws)
-	if !egatesWork(l, a, "egates-reclaiming-worker") {
-		t.Fatal("the expired run was not reclaimed")
-	}
-	var run models.CloudScanRun
-	l.db.First(&run, "id = ?", queued.ID)
-	if run.Status != models.CloudScanRunPublished || run.Attempts != 2 {
-		t.Fatalf("reclaimed run = %s after %d attempts, want published on the second", run.Status, run.Attempts)
-	}
-	// The superseded worker wakes and carries on: every write it attempts is
-	// refused by the fence in the same transaction as the write (§2.10A part
-	// 3) and lands nothing -- an inventory write (a role it would record) and
-	// each generation-reconcile delete a scan ends with. The deletes are
-	// aimed at a generation past the reclaimed run's (which keeps its own,
-	// T1.5), so each WOULD remove every row of its table were it accepted.
-	stale := repositories.ScanFence{RunID: dead.ID, Owner: "egates-dead-scan-worker", LeaseVersion: dead.LeaseVersion}
+	// A supplement at the repository level, under the stalled worker's OWN
+	// fence: the generation-reconcile deletes a scan ends with, which the
+	// real worker never reaches here (its first write is refused). Aimed at
+	// a generation past the reclaimed run's (which keeps its own, T1.5), each
+	// WOULD remove every row of its table were it accepted.
 	inventory := func() map[string]int64 {
 		out := map[string]int64{}
 		for _, table := range []string{"cloud_identity", "cloud_workload", "cloud_permission", "cloud_group_membership"} {
@@ -338,20 +325,14 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 		}
 		return out
 	}
-	held := inventory()
-	for table, n := range held {
+	kept := inventory()
+	for table, n := range kept {
 		if n == 0 {
 			t.Fatalf("setup: %s is empty after the reclaimed scan; a refused delete from it would prove nothing", table)
 		}
 	}
-	ghost := &models.CloudIdentity{WorkspaceID: l.ws, ConnectorID: a.conn, NativeID: a.roleARN("egates-ghost-role"),
-		Kind: models.CloudIdentityIAMRole, Name: "egates-ghost-role", LastSeenGeneration: dead.Generation}
-	next := dead.Generation + 1
-	for what, write := range map[string]func() error{
-		"identity upsert": func() error {
-			_, _, err := repositories.NewCloudIdentityRepository(l.db).Fenced(stale).UpsertIdentity(ghost)
-			return err
-		},
+	next := run.Generation + 1
+	for what, del := range map[string]func() error{
 		"identity reconcile": func() error {
 			_, _, err := repositories.NewCloudIdentityRepository(l.db).Fenced(stale).ReconcileGeneration(l.ws, a.conn, next)
 			return err
@@ -369,57 +350,91 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 			return err
 		},
 	} {
-		if err := write(); !errors.Is(err, repositories.ErrScanFenceLost) {
-			t.Errorf("a superseded scan worker's %s = %v, want %v", what, err, repositories.ErrScanFenceLost)
+		if err := del(); !errors.Is(err, repositories.ErrScanFenceLost) {
+			t.Errorf("the stalled scan worker's %s = %v, want %v", what, err, repositories.ErrScanFenceLost)
 		}
 	}
-	if now := inventory(); egatesJSON(now) != egatesJSON(held) {
-		t.Errorf("a superseded worker's writes landed: inventory %v -> %v", held, now)
-	}
-	if n := l.count(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`, l.ws, ghost.NativeID); n != 0 {
-		t.Errorf("a superseded worker's identity landed (%d rows)", n)
-	}
-	if st := digs(s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account), "state"); st != "projecting" {
-		t.Errorf("after the reclaimed run published: %q, want projecting", st)
+	if now := inventory(); egatesJSON(now) != egatesJSON(kept) {
+		t.Errorf("a superseded worker's deletes landed: inventory %v -> %v", kept, now)
 	}
 
-	// (2) A projector claims the job and dies before its transaction commits.
+	// (2) A projector dies mid-projection. The REAL ProjectionService claims
+	// the job, holds the barrier, reads the run's snapshot and the existing
+	// graph -- and pauses there, before its graph transaction opens
+	// (WithBeforeGraphTx), as a worker stalls. While it is paused: the
+	// pipeline shows the projection in flight and nothing is listed; a second
+	// projector finds nothing to claim (the lease is live). Then its lease
+	// runs out and a reclaiming projector takes the job -- a new lease
+	// version on the same job, so the barrier (held by the JOB, §2.10A) still
+	// admits it. The paused pass then wakes and carries on with the lease it
+	// claimed: only the service's own fencer, inside the graph transaction,
+	// stands between it and the graph.
 	jobs := repositories.NewIGAProjectionJobRepository(l.db)
-	job, err := jobs.Claim("egates-dead-projector", time.Minute, time.Now())
-	if err != nil || job == nil || job.ScanRunID != queued.ID {
-		t.Fatalf("dead projector's claim: %v %v", job, err)
+	leases := repositories.NewIGAPipelineLeaseRepository(l.db)
+	graphWrites := func() int64 {
+		return l.count(`SELECT (SELECT count(*) FROM iga_publication WHERE workspace_id = ?)
+		                     + (SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ?)
+		                     + (SELECT count(*) FROM iga_object_support WHERE workspace_id = ?)`, l.ws, l.ws, l.ws)
 	}
-	acc := s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
-	if digs(acc, "state") != "projecting" || digs(acc, "projection", "status") != models.ProjectionRunning {
-		t.Errorf("pipeline while the dead projector holds the job = %s", egatesJSON(acc))
+	var paused, reclaimed *models.IGAProjectionJob
+	var shapeAtWake int
+	var writesAtWake int64
+	dying := services.NewProjectionService(l.db, jobs, leases, repositories.NewIGAGraphRepository(),
+		"egates-dying-projector", time.Minute).
+		WithBeforeGraphTx(func(job models.IGAProjectionJob) {
+			paused = &job
+			if job.ScanRunID != queued.ID {
+				t.Fatalf("the dying projector claimed job %s of run %s, want the reclaimed run %s", job.ID, job.ScanRunID, queued.ID)
+			}
+			acc := s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
+			if digs(acc, "state") != "projecting" || digs(acc, "projection", "status") != models.ProjectionRunning {
+				t.Errorf("pipeline while the projector is paused mid-pass = %s", egatesJSON(acc))
+			}
+			egatesNotPublished(t, api, "/workloads")
+			pubs := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws)
+			second := services.NewProjectionService(l.db, jobs, leases, repositories.NewIGAGraphRepository(),
+				"egates-second-projector", time.Minute)
+			if worked, err := second.RunOnce(context.Background()); err != nil || worked {
+				t.Errorf("a second projector while the first holds a live lease: worked=%v err=%v, want nothing claimed", worked, err)
+			}
+			if n := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws); n != pubs {
+				t.Errorf("a second projector published while the first held the job: %d -> %d", pubs, n)
+			}
+			egatesExec(t, l, `UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
+			r, err := jobs.Claim("egates-reclaiming-projector", time.Minute, time.Now())
+			if err != nil || r == nil || r.ID != job.ID || r.LeaseVersion == job.LeaseVersion {
+				t.Fatalf("reclaim of job %s: %+v %v, want the same job under a new lease", job.ID, r, err)
+			}
+			reclaimed = r
+			shapeAtWake, writesAtWake = len(l.shape()), graphWrites()
+		})
+	worked, err := dying.RunOnce(context.Background())
+	if paused == nil {
+		t.Fatalf("the projection service never reached its graph transaction: worked=%v err=%v", worked, err)
 	}
-	egatesNotPublished(t, api, "/workloads")
-	// A second projector started while the first is merely paused (its job
-	// lease is live) finds nothing to claim and writes nothing.
-	pubs := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws)
-	second := services.NewProjectionService(l.db, jobs, repositories.NewIGAPipelineLeaseRepository(l.db),
-		repositories.NewIGAGraphRepository(), "egates-second-projector", time.Minute)
-	if worked, err := second.RunOnce(context.Background()); err != nil || worked {
-		t.Errorf("a second projector while the first holds a live lease: worked=%v err=%v, want nothing claimed", worked, err)
+	// Refused inside its graph transaction, with the projection lease lost,
+	// and nothing it would have written landed: no graph row, publication,
+	// lifecycle event or support row.
+	if !worked || !errors.Is(err, repositories.ErrProjectionLeaseLost) {
+		t.Errorf("the superseded projection pass: worked=%v err=%v, want %v", worked, err, repositories.ErrProjectionLeaseLost)
 	}
-	if n := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws); n != pubs {
-		t.Errorf("a second projector published while the first held the job: %d -> %d", pubs, n)
+	if n, w := len(l.shape()), graphWrites(); n != shapeAtWake || w != writesAtWake {
+		t.Errorf("a superseded projector wrote: graph rows %d -> %d, publications+events+support %d -> %d",
+			shapeAtWake, n, writesAtWake, w)
 	}
-	// Its lease runs out and a second projector reclaims the job -- a new
-	// lease version on the same job, so the barrier (held by the JOB, §2.10A)
-	// still admits it. Before that one commits, the first wakes and runs its
-	// pass on the lease it claimed: only the job lease can refuse it.
-	egatesExec(t, l, `UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
-	reclaimed, err := jobs.Claim("egates-reclaiming-projector", time.Minute, time.Now())
-	if err != nil || reclaimed == nil || reclaimed.ID != job.ID || reclaimed.LeaseVersion == job.LeaseVersion {
-		t.Fatalf("reclaim of job %s: %+v %v, want the same job under a new lease", job.ID, reclaimed, err)
+	// ... and changed nothing of the job it lost: still the reclaimer's.
+	var held models.IGAProjectionJob
+	if err := l.db.First(&held, "id = ?", paused.ID).Error; err != nil || held.Status != models.ProjectionRunning ||
+		held.LeaseOwner != "egates-reclaiming-projector" || held.LeaseVersion != reclaimed.LeaseVersion {
+		t.Errorf("job after the superseded pass = %s owned by %q at v%d (%v), want running, the reclaimer's at v%d",
+			held.Status, held.LeaseOwner, held.LeaseVersion, err, reclaimed.LeaseVersion)
 	}
-	egatesSupersededProjection(t, l, job, "egates-dead-projector")
+	job := paused
 	// The reclaiming projector dies too; the next one completes, first pass.
 	egatesExec(t, l, `UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = ?`, job.ID)
 	l.project("egates-final-projector")
 	pub := egatesPublicationOf(t, l, queued.ID)
-	acc = s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
+	acc := s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account)
 	if pub.Rev != 1 || digs(acc, "state") != "published" || num(acc, "projection", "rev") != 1 ||
 		num(acc, "projection", "attempts") != 3 {
 		t.Errorf("after the reclaimed projection: rev %d, pipeline %s; want published at rev 1 on attempt 3",
@@ -453,7 +468,7 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	          expires_at = now() + interval '15 minutes' WHERE workspace_id = ?`, models.PipelineJobHolder(job2), run2.ID, l.ws); n != 1 {
 		t.Fatalf("restore the barrier the dead projector held: %d rows", n)
 	}
-	view = s2Pipeline(t, api)
+	view := s2Pipeline(t, api)
 	if digs(view, "barrier", "state") != models.PipelineProjecting || num(view, "current_rev") != 2 {
 		t.Errorf("pipeline after a commit whose job never completed = %s, want projecting with the committed rev 2 current",
 			egatesJSON(view))
@@ -506,67 +521,4 @@ func egatesExec(t *testing.T, l *p2Lab, q string, args ...any) int64 {
 		t.Fatalf("%s: %v", q, res.Error)
 	}
 	return res.RowsAffected
-}
-
-// egatesFencer binds the two ownership proofs exactly as the projection
-// service's own fencer does (services.projectionFencer, unexported): the job
-// lease and the workspace barrier, each asserted by the REAL repositories
-// inside the graph transaction. The graph suite stubs this with okFencer; here
-// nothing is stubbed.
-type egatesFencer struct {
-	jobs     repositories.IGAProjectionJobRepository
-	pipeline repositories.IGAPipelineLeaseRepository
-	jobID    uuid.UUID
-}
-
-func (f egatesFencer) AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, v int64) error {
-	return f.jobs.AssertOwnedTx(tx, jobID, owner, v)
-}
-
-func (f egatesFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version int64) error {
-	return f.pipeline.AssertHeldTx(tx, repositories.PipelineFence{
-		WorkspaceID: ws, Phase: models.PipelineProjecting, RunID: runID, Version: version,
-		Holder: models.PipelineJobHolder(f.jobID),
-	})
-}
-
-// egatesSupersededProjection runs one projection pass of job as owner, on the
-// lease version owner claimed -- which another projector has since
-// superseded -- and asserts it is refused inside its graph transaction with
-// the projection lease lost, and that nothing it would have written landed:
-// no graph row, no publication, no lifecycle event.
-func egatesSupersededProjection(t *testing.T, l *p2Lab, job *models.IGAProjectionJob, owner string) {
-	t.Helper()
-	ctx := context.Background()
-	leases := repositories.NewIGAPipelineLeaseRepository(l.db)
-	lease, err := leases.Get(l.ws)
-	if err != nil {
-		t.Fatalf("read the barrier: %v", err)
-	}
-	snap, err := igagraph.Load(ctx, l.db, job.ScanRunID)
-	if err != nil {
-		t.Fatalf("load run %s: %v", job.ScanRunID, err)
-	}
-	ex, err := igagraph.LoadExisting(ctx, l.db, l.ws)
-	if err != nil {
-		t.Fatalf("load existing: %v", err)
-	}
-	fencer := egatesFencer{jobs: repositories.NewIGAProjectionJobRepository(l.db), pipeline: leases, jobID: job.ID}
-	p := igagraph.NewProjector(repositories.NewIGAGraphRepository(), fencer, ex,
-		job.ID, owner, job.LeaseVersion, lease.Version, time.Now, igagraph.LastGenerationFor)
-	shape := len(l.shape())
-	count := func() int64 {
-		return l.count(`SELECT (SELECT count(*) FROM iga_publication WHERE workspace_id = ?)
-		                     + (SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ?)
-		                     + (SELECT count(*) FROM iga_object_support WHERE workspace_id = ?)`, l.ws, l.ws, l.ws)
-	}
-	before := count()
-	err = l.db.Transaction(func(tx *gorm.DB) error { return p.Project(tx, snap) })
-	if !errors.Is(err, repositories.ErrProjectionLeaseLost) {
-		t.Errorf("a superseded projector's pass = %v, want %v", err, repositories.ErrProjectionLeaseLost)
-	}
-	if n := len(l.shape()); n != shape || count() != before {
-		t.Errorf("a superseded projector wrote: graph rows %d -> %d, publications+events+support %d -> %d",
-			shape, n, before, count())
-	}
 }

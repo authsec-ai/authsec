@@ -385,10 +385,20 @@ type SurfaceCoverage struct {
 // managed policy's default version ("" for inline and trust documents), and
 // Error is the reason recorded on its row (cloud_policy.document_error or
 // cloud_identity.trust_parse_error) as collection wrote it.
+//
+// API and ErrorCode are Error's structured half, additive to D-71's {policy,
+// version, error}: the call whose failure left the document unread
+// ("iam:GetPolicyVersion") and the code AWS returned ("AccessDenied"), stamped
+// from the failed call itself (awsdiscovery.AttachedPolicy.FetchAPI/FetchCode)
+// -- so each document names its own call even when several failed on
+// different ones. Empty for a document that was read and did not parse, which
+// failed on no call.
 type CoverageItem struct {
-	Policy  string `json:"policy"`
-	Version string `json:"version"`
-	Error   string `json:"error"`
+	Policy    string `json:"policy"`
+	Version   string `json:"version"`
+	Error     string `json:"error"`
+	API       string `json:"api,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 // CoverageItemLimit bounds SurfaceCoverage.Items (D-71): coverage lives in a
