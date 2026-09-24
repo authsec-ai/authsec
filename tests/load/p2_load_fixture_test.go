@@ -174,10 +174,10 @@ type loadHandles struct {
 	hotBucket      uuid.UUID // the most-named exact resource
 	lambdaService  uuid.UUID // lambda.amazonaws.com, trusted by every Lambda role
 	switchedWL     []uuid.UUID
-	groupedGrants  []uuid.UUID // 50 grants of one holder, one policy: a grouped edge (D-79)
+	groupedGrants  []uuid.UUID    // 50 grants of one holder, one policy: a grouped edge (D-79)
 	paths          [][2]uuid.UUID // (workload, resource) pairs a declared path joins
-	coverageClaims []string    // coverage:<run>:<surface>
-	activeWL       int         // readable active workloads (the unfiltered list total)
+	coverageClaims []string       // coverage:<run>:<surface>
+	activeWL       int            // readable active workloads (the unfiltered list total)
 	activeIdent    int
 	activeRes      int
 	firstAcct      string

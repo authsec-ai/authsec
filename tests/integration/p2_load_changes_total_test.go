@@ -16,15 +16,17 @@ package integration
 //   - statement_replaced: its id is derived from (policy, run) (D-27c), so
 //     every Sid-less statement of the policy retired in the run names the one
 //     event. The pass edits BOTH Sid-less statements of the policy.
-//   - statement_replaced on a RESOURCE: both branches (the ended statement
-//     named it; one that began in its place names it) reach the same event.
+//   - statement_replaced on a RESOURCE: the ended statements and the ones that
+//     began in their place all name it, and each reaches the one event.
 //
 // The page dedupes with DISTINCT ON either way, so a wrongly marked branch
-// shows only in the total: it would count one event several times while the
-// list shows it once, and a client paging to the stated total would wait for
-// events that do not exist.
+// shows in the total: it would count one event several times while the list
+// shows it once, and a client paging to the stated total would wait for
+// events that do not exist. It shows in small pages too (see below).
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -49,8 +51,9 @@ const (
 // pages list, where several union branches reach one event.
 //
 // Safeguards (mutation-checked): the workload's statement_revised branch, the
-// holders' statement_replaced branch and both of the resource's
-// statement_replaced branches are counted with DISTINCT (addRepeatable).
+// holders' statement_replaced branch and the resource's statement_replaced
+// branch are counted with DISTINCT (addRepeatable), and deduplicated before
+// the page cuts them (pageSQL).
 func TestP2LoadChangesTotalCountsEachEventOnce(t *testing.T) {
 	l := newP2Lab(t, "p2-load-changes-total", true)
 	a := l.account(accountA)
@@ -120,6 +123,46 @@ func TestP2LoadChangesTotalCountsEachEventOnce(t *testing.T) {
 				t.Errorf("meta total = %v (known %v), but the pages list %d distinct events: a branch that repeats an event is counted without DISTINCT",
 					dig(page, "meta", "total"), dig(page, "meta", "total_known"), len(ids))
 			}
+
+			// Small pages list the same events in the same order. The page
+			// statement cuts every branch to limit+1 rows BEFORE merging them
+			// (changesUnion.pageSQL): exact only while a repeatable branch is
+			// deduplicated before its cut and every branch honours the
+			// cursor. A branch that returned the same event twice would fill
+			// its limit+1 rows with fewer events, and a page would end early
+			// (no next_cursor) or skip one.
+			want := make([]string, 0, len(all))
+			for _, e := range all {
+				want = append(want, digs(e, "id"))
+			}
+			for _, limit := range []int{1, 2, 3} {
+				if got := loadChangesPaged(t, api, c.refType, c.id, limit); strings.Join(got, ",") != strings.Join(want, ",") {
+					t.Errorf("limit %d pages list %d events %v, the limit-200 list %d %v", limit, len(got), got, len(want), want)
+				}
+			}
 		})
 	}
+}
+
+// loadChangesPaged reads every configuration page of an object's Changes at
+// one limit and returns the event ids in order.
+func loadChangesPaged(t *testing.T, api *readAPI, refType string, id uuid.UUID, limit int) []string {
+	t.Helper()
+	var out []string
+	cursor := ""
+	for page := 0; page < 500; page++ {
+		kv := []string{"limit", strconv.Itoa(limit)}
+		if cursor != "" {
+			kv = append(kv, "cursor", cursor)
+		}
+		body := changesGet(t, api, changesPath(refType, id, kv...))
+		for _, e := range digl(body, "data") {
+			out = append(out, digs(e, "id"))
+		}
+		if cursor = digs(body, "meta", "next_cursor"); cursor == "" {
+			return out
+		}
+	}
+	t.Fatalf("Changes of %s %s at limit %d did not end within 500 pages", refType, id, limit)
+	return nil
 }

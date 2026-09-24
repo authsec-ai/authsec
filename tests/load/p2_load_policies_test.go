@@ -35,6 +35,10 @@ var loadAWSManagedNames = []string{"AWSLambdaBasicExecutionRole", "AmazonS3ReadO
 	"PowerUserAccess", "AWSXRayDaemonWriteAccess", "AmazonSSMManagedInstanceCore", "SecretsManagerReadWrite",
 	"AmazonBedrockFullAccess", "AWSLambdaVPCAccessExecutionRole", "AmazonEC2ReadOnlyAccess", "AmazonSNSFullAccess"}
 
+// loadReachMaxNamed is the most statements a /graph/path pair's resource may
+// be named by (loadGen.reach): a typical reference, not a hub.
+const loadReachMaxNamed = 10
+
 // loadResource is one resource reference (a distinct Resource text).
 type loadResource struct {
 	id      uuid.UUID
@@ -932,9 +936,15 @@ func (g *loadGen) assignmentRows(assigns []*loadAssign) {
 			g.link("iga_access_edge_evidence", id, span, append([]loadObs{as.holder.obs}, polObs...)...)
 			if span.to == 0 {
 				g.grantsByHolder[as.holder] = append(g.grantsByHolder[as.holder], id)
+				// The far end of a measured /graph/path: an exact resource
+				// few statements name. A hub reference (the most-named bucket,
+				// named by hundreds) has a reverse frontier past the node
+				// budget, so its honest answer is not_found_within_budget
+				// (§5.4), which measures the budget, not a found path; the
+				// hub is measured by its own read ("*").
 				if g.reach[as.holder] == nil {
 					for _, text := range s.cur.Resources {
-						if r := g.resources[text]; r != nil && r.exact {
+						if r := g.resources[text]; r != nil && r.exact && r.named <= loadReachMaxNamed {
 							g.reach[as.holder] = r
 							break
 						}

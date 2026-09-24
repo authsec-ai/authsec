@@ -87,12 +87,12 @@ func TestP2LoadFixtureIntegrity(t *testing.T) {
 		}
 	}
 
-	// The measured /graph/path pairs are joined by a declared path: a search
+	// Every measured /graph/path pair is joined by a declared path: a search
 	// that finds nothing ends quickly for the wrong reason.
 	if len(g.h.paths) < 20 {
 		t.Errorf("%d measured path pairs, want at least 20", len(g.h.paths))
 	}
-	for _, p := range g.h.paths[:5] {
+	for _, p := range g.h.paths {
 		body = loadMustGet(t, api, "/graph/path?from=workload:"+p[0].String()+"&to=resource:"+p[1].String())
 		if got := loadDig(body, "data", "outcome"); got != "found" {
 			t.Errorf("path workload %s -> resource %s: outcome %v, the fixture declares one", p[0], p[1], got)

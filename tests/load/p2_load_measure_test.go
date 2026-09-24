@@ -152,22 +152,39 @@ func TestP2LoadTargets(t *testing.T) {
 		}
 	}
 	for _, r := range results {
-		for _, f := range r.fails {
-			t.Errorf("%s: %s", r.c.name, f)
-		}
-		for _, row := range r.c.rows {
-			if target := loadTargets[row]; r.p95 > target {
-				slow := ""
-				if len(r.slowest) > 0 {
-					slow = fmt.Sprintf("; slowest statement %.1f ms: %s", loadMS(r.slowest[0].elapsed), loadClipSQL(r.slowest[0].sql))
-				}
-				t.Errorf("§5.6 %s target missed: %s p95 %.1f ms > %s%s", row, r.c.name, loadMS(r.p95), target, slow)
-			}
+		for _, f := range loadVerdict(r) {
+			t.Error(f)
 		}
 	}
 	if diagnostic != "" && !t.Failed() {
 		t.Skipf("diagnostic run (%s): not a §5.6 measurement", diagnostic)
 	}
+}
+
+// loadVerdict is what fails one read: every dishonest or failed response
+// (loadMeasure's fails), and every §5.6 row whose p95 target it missed, named
+// with its slowest traced statement -- the one to EXPLAIN ANALYZE. Empty when
+// the read met every target honestly.
+func loadVerdict(r *loadResult) []string {
+	var out []string
+	for _, f := range r.fails {
+		out = append(out, fmt.Sprintf("%s: %s", r.c.name, f))
+	}
+	for _, row := range r.c.rows {
+		target, ok := loadTargets[row]
+		if !ok {
+			out = append(out, fmt.Sprintf("%s: no §5.6 target for row %q", r.c.name, row))
+			continue
+		}
+		if r.p95 > target {
+			slow := ""
+			if len(r.slowest) > 0 {
+				slow = fmt.Sprintf("; slowest statement %.1f ms: %s", loadMS(r.slowest[0].elapsed), loadClipSQL(r.slowest[0].sql))
+			}
+			out = append(out, fmt.Sprintf("§5.6 %s target missed: %s p95 %.1f ms > %s%s", row, r.c.name, loadMS(r.p95), target, slow))
+		}
+	}
+	return out
 }
 
 // loadTraceIterations is how many requests of a read the traced pass makes:
@@ -385,6 +402,9 @@ func loadCases(t *testing.T, env *loadEnv) []loadCase {
 	}
 
 	heavyWL, heavyHolder := loadHeaviest(g)
+	if len(h.grants) < loadMaxClaims {
+		t.Fatalf("the fixture sampled %d grants, the %d-claim evidence read needs %d", len(h.grants), loadMaxClaims, loadMaxClaims)
+	}
 
 	var cs []loadCase
 	add := func(rows []string, name string, path func(int) string) {
@@ -447,6 +467,17 @@ func loadCases(t *testing.T, env *loadEnv) []loadCase {
 	add(detail, `GET /resources/:id/access ("*")`, loadPath("/resources/", loadFixed(h.starResource), "/access"))
 	add(detail, "GET /resources/:id (most-named bucket)", loadPath("/resources/", loadFixed(h.hotBucket), ""))
 	add(detail, "GET /resources/:id/access (most-named bucket)", loadPath("/resources/", loadFixed(h.hotBucket), "/access"))
+	// A tab's second page (D-77): a section cursor, and a list-tab cursor, on
+	// the heaviest objects -- the page after the first 100 holders.
+	usedBy2 := loadSectionCursor(t, api, "/identities/"+h.ecsExecRole.String()+"/used-by", "workloads")
+	add(detail, fmt.Sprintf("GET /identities/:id/used-by section=workloads page 2 (ecsTaskExecutionRole, %d)", h.ecsExecUsers),
+		func(int) string {
+			return "/identities/" + h.ecsExecRole.String() + "/used-by?" + loadQS("section", "workloads", "cursor", usedBy2)
+		})
+	access2 := loadNextCursor(t, api, "/resources/"+h.starResource.String()+"/access")
+	add(detail, `GET /resources/:id/access page 2 ("*")`, func(int) string {
+		return "/resources/" + h.starResource.String() + "/access?" + loadQS("cursor", access2)
+	})
 
 	// Graph at the display defaults (assume_hops 2, 150 nodes, 300 edges).
 	gq := func(root func(int) string, dir string) func(int) string {
@@ -494,6 +525,15 @@ func loadCases(t *testing.T, env *loadEnv) []loadCase {
 	add(evid, fmt.Sprintf("GET /evidence grouped edge (%d grants)", len(h.groupedGrants)), func(int) string {
 		v := url.Values{}
 		for _, id := range h.groupedGrants {
+			v.Add("claim", "grant:"+id.String())
+		}
+		return "/evidence?" + v.Encode()
+	})
+	// The request's maximum (D-79: claim repeated 1-50), over many holders:
+	// the grouped edge above is the largest one holder has in the fixture.
+	add(evid, fmt.Sprintf("GET /evidence %d claims (the D-79 maximum, many holders)", loadMaxClaims), func(int) string {
+		v := url.Values{}
+		for _, id := range h.grants[:loadMaxClaims] {
 			v.Add("claim", "grant:"+id.String())
 		}
 		return "/evidence?" + v.Encode()
@@ -554,6 +594,21 @@ func loadDeepCursor(t *testing.T, api *loadAPI, route string, n int) string {
 		cursor = next
 	}
 	return cursor
+}
+
+// loadMaxClaims is the most claims one /evidence request takes (D-79).
+const loadMaxClaims = 50
+
+// loadSectionCursor is the cursor of a multi-section tab's section's second
+// page (D-77: data.<section>.next_cursor).
+func loadSectionCursor(t *testing.T, api *loadAPI, path, section string) string {
+	t.Helper()
+	body := loadMustGet(t, api, path)
+	next, _ := loadDig(body, "data", section, "next_cursor").(string)
+	if next == "" {
+		t.Fatalf("%s: section %s has no second page", path, section)
+	}
+	return next
 }
 
 // loadNextCursor is the cursor of a list's second page.
