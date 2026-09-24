@@ -993,3 +993,44 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   active resolution, while §5.4 makes every external principal terminal.
   Either add the value to §5.4's vocabulary or decide that the traversal
   follows resolutions in force.
+
+## Added by T6.10 (the 10 000-workload load test)
+
+- **D-106 Indexes for a resource's Changes (not applied).**
+  *Raise, for Aditya* (§3 DDL vs §5.6). §5.6 gives Changes the index
+  "lifecycle and validity columns", and a resource's Changes selects three of
+  its branches by statement: the grants of the statements naming it
+  (`iga_access_edges.entitlement_id`), their revisions
+  (`iga_statement_revision.entitlement_id`) and their lifecycle events
+  (`iga_lifecycle_event.entitlement_id`, which the holders' replacement branch
+  also probes). 036 serves none of them: `idx_iga_access_edges_entitlement` is
+  partial on `state <> 'ended'` and Changes must read ended grants;
+  `iga_statement_revision` is indexed only on its live revision
+  (`uq_iga_statement_revision_live`); `iga_lifecycle_event` has no
+  `entitlement_id` index. So every page and every total of every resource's
+  Changes scans all three tables. The §5.6 target (500 ms) is met without them
+  on the T6.10 fixture (`tests/load/RESULTS.md` §5: `*` p95 305.7 ms, a typical
+  reference 133.7 ms), and the §3 DDL stays verbatim this milestone, so no
+  migration is changed. Proposed:
+
+  ```sql
+  CREATE INDEX idx_iga_access_edges_entitlement_all ON public.iga_access_edges (workspace_id, entitlement_id);
+  CREATE INDEX idx_iga_le_entitlement ON public.iga_lifecycle_event (workspace_id, entitlement_id) WHERE entitlement_id IS NOT NULL;
+  CREATE INDEX idx_iga_statement_revision_entitlement ON public.iga_statement_revision (workspace_id, entitlement_id, valid_from, id);
+  ```
+
+  Measured on the fixture (`RESULTS.md` §7: created, ANALYZEd, measured,
+  dropped; psql `EXPLAIN (ANALYZE, TIMING OFF)` of the statements the load
+  test traced, `jit = off`, custom plans, median of 9):
+
+  | Statement | Without (036) | With |
+  |---|---:|---:|
+  | typical resource's Changes page / total | 49.0 / 48.2 ms | 0.9 / 0.8 ms |
+  | most-named resource's page / total | 92.9 / 91.8 ms | 93.4 / 89.1 ms |
+  | `*` page / total | 154.9 / 96.1 ms | 161.5 / 98.0 ms |
+
+  A typical reference's statements become fifty times faster and scan
+  nothing; the hub references are bound by their volume, and at
+  `random_page_cost` 4 the planner keeps the sequential scans of edges and
+  revisions for them. *Why raise it:* headroom on the reads a user opens most,
+  and the partial entitlement index is a trap for any history read.

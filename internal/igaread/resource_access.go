@@ -218,8 +218,17 @@ func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string,
 		}
 		meta := NewListMeta(q, limit)
 
-		// THE PAGE: one mandatory statement, limit+1 holders.
+		// THE PAGE: one mandatory statement, limit+1 holders -- found
+		// grant-first, or identity-first for a reference as common as "*"
+		// (rdetailAccessDenseAt). Either finds the same rows.
+		dense, err := rdetailAccessIsDense(q, rec.ID, r.accessDenseAt)
+		if err != nil {
+			return err
+		}
 		sqlText, args := rdetailAccessPageSQL(q.WS, rec.ID, states, after, limit)
+		if dense {
+			sqlText, args = rdetailAccessDensePageSQL(q.WS, rec.ID, states, after, limit)
+		}
 		var scans []rdetailAccessScan
 		if err := q.DB().Raw(sqlText, args...).Scan(&scans).Error; err != nil {
 			return err
@@ -298,12 +307,19 @@ type rdetailAccessAfter struct {
 // Statement lifecycle is not a condition: a live grant implies a live
 // statement, and an ended grant on a retired statement is history
 // include_ended asks for.
+//
+// Both CTEs carry ids and validity only. The page needs the statement's and
+// the policy's own columns for the rows of ONE page of holders, but the
+// holders and the total are computed over every row: on a reference as common
+// as "*" (named by a quarter of all statements, T6.10) that is tens of
+// thousands of rows, and carrying each statement's document through them made
+// the CTE spill to disk. The page statement joins those columns for its own
+// rows only (rdetailAccessPageSQL).
 func rdetailAccessRowsCTE(ws, resourceID uuid.UUID, states []string) (string, []any) {
 	return `WITH grants AS (
 	    SELECT g.workspace_id, g.id AS grant_id, g.state AS grant_state, g.valid_from AS grant_valid_from,
 	           g.valid_to AS grant_valid_to, g.subject_identity_account_id AS holder_id,
-	           e.id AS statement_id, e.sid, e.statement_index, e.native_rights, e.conditional,
-	           p.id AS policy_id, p.display_name AS policy_name, p.policy_kind
+	           e.id AS statement_id, e.policy_id
 	      FROM iga_entitlement_target t
 	      JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
 	      JOIN iga_policy p ON p.workspace_id = e.workspace_id AND p.id = e.policy_id
@@ -313,15 +329,13 @@ func rdetailAccessRowsCTE(ws, resourceID uuid.UUID, states []string) (string, []
 	       AND g.provider = 'aws' AND g.subject_identity_account_id IS NOT NULL AND g.state IN ?),
 	access_rows AS (
 	    SELECT gr.workspace_id, gr.holder_id, gr.grant_id, gr.grant_state, gr.grant_valid_from,
-	           gr.statement_id, gr.sid, gr.statement_index, gr.native_rights, gr.conditional,
-	           gr.policy_id, gr.policy_name, gr.policy_kind,
+	           gr.statement_id, gr.policy_id,
 	           NULL::uuid AS group_id, NULL::uuid AS membership_id, ''::text AS membership_state,
 	           NULL::timestamptz AS membership_valid_from
 	      FROM grants gr
 	    UNION ALL
 	    SELECT gr.workspace_id, m.source_identity_account_id, gr.grant_id, gr.grant_state, gr.grant_valid_from,
-	           gr.statement_id, gr.sid, gr.statement_index, gr.native_rights, gr.conditional,
-	           gr.policy_id, gr.policy_name, gr.policy_kind,
+	           gr.statement_id, gr.policy_id,
 	           gr.holder_id, m.id, m.state, m.valid_from
 	      FROM grants gr
 	      JOIN iga_relationship m
@@ -342,10 +356,9 @@ var rdetailHolderKeySQL = [3]string{
 	IdentityAccountSQL,
 }
 
-// rdetailAccessPageSQL is the one page statement: limit+1 holders after the
-// cursor's (holders CTE), then every row of each (the whole of a holder's rows
-// is always on one page). Within a holder: direct rows before via-group rows,
-// then policy name, statement index, and ids -- deterministic.
+// rdetailAccessPageSQL is the one page statement, grant-first: every access
+// row (rdetailAccessRowsCTE), the limit+1 holders after the cursor's among
+// them (holders CTE), then every row of each (rdetailAccessSelectSQL).
 func rdetailAccessPageSQL(ws, resourceID uuid.UUID, states []string, after *rdetailAccessAfter, limit int) (string, []any) {
 	cte, args := rdetailAccessRowsCTE(ws, resourceID, states)
 	k := rdetailHolderKeySQL
@@ -363,24 +376,160 @@ func rdetailAccessPageSQL(ws, resourceID uuid.UUID, states []string, after *rdet
 	}
 	b.WriteString(`
 	     ORDER BY k0, k1, k2, ia.id
-	     LIMIT ?)
+	     LIMIT ?)`)
+	args = append(args, limit+1)
+	b.WriteString(rdetailAccessSelectSQL)
+	return b.String(), append(args, ws)
+}
+
+// rdetailAccessDenseAt is the number of positive targets naming a reference
+// from which its Access page finds its holders IDENTITY-first
+// (rdetailAccessDensePageSQL) instead of grant-first (rdetailAccessPageSQL).
+//
+// Grant-first reads every grant on every statement naming the reference to
+// know which identities hold one, then keeps the first page of them. For a
+// reference as common as "*" -- named by a quarter of all statements, held by
+// nine identities in ten (T6.10: 2 553 statements, 20 049 grants, 3 279 of
+// 3 550 identities) -- that is tens of thousands of rows for a page of a
+// hundred holders. Identity-first walks the identities in the page's order
+// and asks of each whether it holds such a grant, stopping at the page: about
+// a hundred probes when holders are dense, and every identity probed when they
+// are sparse -- which is why it is kept for dense references. T6.10 on the
+// fixture: "*" 150 ms grant-first, 38 ms identity-first; the most-named exact
+// resource (599 targets) 44 ms against 37 ms; references named 50 to 300 times
+// 10-30 ms against 55-90 ms. The choice changes the plan, never the answer:
+// both statements return the same rows in the same order (tested).
+const rdetailAccessDenseAt = 1000
+
+// rdetailAccessIsDense reports whether at least denseAt positive targets name
+// the reference. It counts target rows, whatever their statements' effect or
+// lifecycle: a measure of how common the reference is, not of its access.
+func rdetailAccessIsDense(q *Query, resourceID uuid.UUID, denseAt int) (bool, error) {
+	if denseAt < 1 {
+		return true, nil
+	}
+	var n int64
+	if err := q.DB().Raw(`SELECT count(*) FROM (
+	                          SELECT 1 FROM iga_entitlement_target t
+	                           WHERE t.workspace_id = ? AND t.resource_id = ? AND t.target_mode = ?
+	                           LIMIT ?) x`, q.WS, resourceID, models.TargetResource, denseAt).Row().Scan(&n); err != nil {
+		return false, err
+	}
+	return n >= int64(denseAt), nil
+}
+
+// rdetailAccessDensePageSQL is the page statement identity-first: the same
+// holders in the same order as rdetailAccessPageSQL, and the same rows for
+// each (rdetailAccessSelectSQL).
+//
+//	named        the ALLOW statements naming the reference with mode =
+//	             resource (with their policies), exactly as grants selects
+//	             them
+//	cands        this workspace's AWS identities after the cursor, in the page
+//	             order, fenced (OFFSET 0) so they are walked in that order
+//	holders      the first limit+1 of them that hold a grant in states on a
+//	             named statement, or are a member (member_of in states) of a
+//	             group holding one over an overlapping period (D-18): one
+//	             LIMIT 1 probe each, the member probe only when the direct one
+//	             found nothing, so the walk stops at the page
+//	access_rows  those holders' rows, as rdetailAccessRowsCTE's access_rows
+//	             would give them: their own grants, and a row per grant of a
+//	             group they are a member of while the membership overlapped it
+func rdetailAccessDensePageSQL(ws, resourceID uuid.UUID, states []string, after *rdetailAccessAfter, limit int) (string, []any) {
+	k := rdetailHolderKeySQL
+	var b strings.Builder
+	args := []any{ws, resourceID}
+	b.WriteString(`WITH named AS MATERIALIZED (
+	    SELECT e.id, e.policy_id
+	      FROM iga_entitlement_target t
+	      JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
+	      JOIN iga_policy p ON p.workspace_id = e.workspace_id AND p.id = e.policy_id
+	     WHERE t.workspace_id = ? AND t.resource_id = ? AND t.target_mode = 'resource'
+	       AND e.provider = 'aws' AND e.effect = 'allow' AND p.provider = 'aws'),
+	cands AS (
+	    SELECT ia.id, ` + k[0] + ` AS k0, ` + k[1] + ` AS k1, ` + k[2] + ` AS k2
+	      FROM iga_identity_accounts ia
+	     WHERE ia.workspace_id = ? AND ia.provider = 'aws'`)
+	args = append(args, ws)
+	if after != nil {
+		b.WriteString(`
+	       AND (` + k[0] + `, ` + k[1] + `, ` + k[2] + `, ia.id) > (?::text, ?::int, ?::text, ?::uuid)`)
+		args = append(args, after.key.Name, after.key.NoAcct, after.key.Account, after.id)
+	}
+	b.WriteString(`
+	     ORDER BY 2, 3, 4, 1
+	    OFFSET 0),
+	holders AS MATERIALIZED (
+	    SELECT c.id, c.k0, c.k1, c.k2
+	      FROM cands c
+	      LEFT JOIN LATERAL (
+	           SELECT 1 AS hit FROM iga_access_edges g
+	            WHERE g.workspace_id = ? AND g.subject_identity_account_id = c.id
+	              AND g.provider = 'aws' AND g.state IN ? AND g.entitlement_id IN (SELECT n.id FROM named n)
+	            LIMIT 1) d ON true
+	      LEFT JOIN LATERAL (
+	           SELECT 1 AS hit FROM iga_relationship m
+	             JOIN iga_access_edges g
+	               ON g.workspace_id = m.workspace_id AND g.subject_identity_account_id = m.target_identity_account_id
+	              AND g.provider = 'aws' AND g.state IN ? AND g.entitlement_id IN (SELECT n.id FROM named n)
+	              AND m.valid_from < COALESCE(g.valid_to, 'infinity') AND g.valid_from < COALESCE(m.valid_to, 'infinity')
+	            WHERE m.workspace_id = ? AND m.relationship_type = '` + models.RelTypeMemberOf + `'
+	              AND COALESCE(m.source_identity_account_id, m.source_workload_id) = c.id
+	              AND m.source_identity_account_id IS NOT NULL AND m.state IN ?
+	            LIMIT 1) mm ON d.hit IS NULL
+	     WHERE d.hit IS NOT NULL OR mm.hit IS NOT NULL
+	     ORDER BY c.k0, c.k1, c.k2, c.id
+	     LIMIT ?),
+	access_rows AS (
+	    SELECT g.workspace_id, g.subject_identity_account_id AS holder_id, g.id AS grant_id, g.state AS grant_state,
+	           g.valid_from AS grant_valid_from, n.id AS statement_id, n.policy_id,
+	           NULL::uuid AS group_id, NULL::uuid AS membership_id, ''::text AS membership_state,
+	           NULL::timestamptz AS membership_valid_from
+	      FROM holders h
+	      JOIN iga_access_edges g ON g.workspace_id = ? AND g.subject_identity_account_id = h.id
+	      JOIN named n ON n.id = g.entitlement_id
+	     WHERE g.provider = 'aws' AND g.state IN ?
+	    UNION ALL
+	    SELECT g.workspace_id, m.source_identity_account_id, g.id, g.state, g.valid_from, n.id, n.policy_id,
+	           g.subject_identity_account_id, m.id, m.state, m.valid_from
+	      FROM holders h
+	      JOIN iga_relationship m
+	        ON m.workspace_id = ? AND m.relationship_type = '` + models.RelTypeMemberOf + `'
+	       AND COALESCE(m.source_identity_account_id, m.source_workload_id) = h.id
+	       AND m.source_identity_account_id IS NOT NULL AND m.state IN ?
+	      JOIN iga_access_edges g
+	        ON g.workspace_id = m.workspace_id AND g.subject_identity_account_id = m.target_identity_account_id
+	       AND g.provider = 'aws' AND g.state IN ?
+	       AND m.valid_from < COALESCE(g.valid_to, 'infinity') AND g.valid_from < COALESCE(m.valid_to, 'infinity')
+	      JOIN named n ON n.id = g.entitlement_id)`)
+	args = append(args, ws, states, states, ws, states, limit+1, ws, states, ws, states, states)
+	b.WriteString(rdetailAccessSelectSQL)
+	return b.String(), append(args, ws)
+}
+
+// rdetailAccessSelectSQL is the page statement's final SELECT, over a holders
+// CTE (id, k0, k1, k2: the page's limit+1 holders) and an access_rows CTE
+// holding at least their rows: every row of each holder (the whole of a
+// holder's rows is always on one page). Within a holder: direct rows before
+// via-group rows, then policy name, statement index, and ids --
+// deterministic. Binds: ws.
+const rdetailAccessSelectSQL = `
 	SELECT h.k0, h.k1, h.k2,
 	       ia.id AS holder_id, ia.display_name AS holder_name, ia.account_kind AS holder_kind,
 	       ia.source_key AS holder_source_key, h.k2 AS holder_account,
 	       rw.grant_id, rw.grant_state, rw.grant_valid_from,
-	       rw.statement_id, rw.sid, rw.statement_index, rw.native_rights, rw.conditional,
-	       rw.policy_id, rw.policy_name, rw.policy_kind,
+	       rw.statement_id, e.sid, e.statement_index, e.native_rights, e.conditional,
+	       rw.policy_id, p.display_name AS policy_name, p.policy_kind,
 	       rw.group_id, gi.display_name AS group_name,
 	       rw.membership_id, rw.membership_state, rw.membership_valid_from
 	  FROM holders h
 	  JOIN iga_identity_accounts ia ON ia.workspace_id = ? AND ia.id = h.id
 	  JOIN access_rows rw ON rw.holder_id = h.id
+	  JOIN iga_entitlements e ON e.workspace_id = rw.workspace_id AND e.id = rw.statement_id
+	  JOIN iga_policy p ON p.workspace_id = rw.workspace_id AND p.id = rw.policy_id
 	  LEFT JOIN iga_identity_accounts gi ON gi.workspace_id = rw.workspace_id AND gi.id = rw.group_id
-	 ORDER BY h.k0, h.k1, h.k2, h.id, (rw.group_id IS NOT NULL), lower(rw.policy_name), rw.policy_id,
-	          rw.statement_index NULLS LAST, rw.statement_id, rw.group_id, rw.membership_valid_from, rw.grant_id`)
-	args = append(args, limit+1, ws)
-	return b.String(), args
-}
+	 ORDER BY h.k0, h.k1, h.k2, h.id, (rw.group_id IS NOT NULL), lower(p.display_name), rw.policy_id,
+	          e.statement_index NULLS LAST, rw.statement_id, rw.group_id, rw.membership_valid_from, rw.grant_id`
 
 // rdetailAccessScan is one row of the page statement.
 type rdetailAccessScan struct {

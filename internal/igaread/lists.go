@@ -530,6 +530,14 @@ func listsOne(k listsKey) []listsKey { return []listsKey{k} }
 type listsExact struct {
 	expr  string
 	value string
+	// suffixOf, when set, is a cheap expression that expr is always a suffix
+	// of. The arm then tests that first -- (right(suffixOf, len) = value AND
+	// expr = value) -- which is exact (expr = value implies the suffix test)
+	// and spares the per-row cost of an expensive expr on every row whose
+	// suffix already differs. T6.10: the workload provider id is two regular
+	// expressions per row, and q + account + facets evaluates the q filter in
+	// six statements (page, total, four facets) over the whole estate.
+	suffixOf string
 }
 
 // listsQ is §5.2's q (D-76): a case-insensitive substring of the display name
@@ -545,9 +553,16 @@ func listsQ(p *ListParams, nameCol, accountExpr string, exact ...listsExact) []l
 	parts := []string{"lower(" + nameCol + `) LIKE lower(?) ESCAPE '\'`}
 	args := []any{"%" + EscapeLike(p.Q) + "%"}
 	if isAccountID(p.Q) {
-		exact = append(exact, listsExact{accountExpr, p.Q})
+		exact = append(exact, listsExact{expr: accountExpr, value: p.Q})
 	}
 	for _, e := range exact {
+		if e.suffixOf != "" {
+			// A boolean AND is evaluated left to right and stops at the first
+			// false argument, so expr runs only where the suffix matches.
+			parts = append(parts, "(right("+e.suffixOf+", char_length(?::text)) = ? AND "+e.expr+" = ?)")
+			args = append(args, e.value, e.value, e.value)
+			continue
+		}
 		parts = append(parts, e.expr+" = ?")
 		args = append(args, e.value)
 	}
@@ -1000,8 +1015,13 @@ func (s listsWorkloadScan) sortKeys() []*string { return []*string{s.K0, s.K1, s
 // listsWorkloadProviderID is the provider's own id for a workload (D-76): the
 // ARN's resource id (after resource-type/ or resource-type:) -- an EC2
 // instance id, a Bedrock agent id, a function name. No stored column holds it.
-const listsWorkloadProviderID = `regexp_replace(substring(split_part(w.source_key, chr(31), 2)
+const listsWorkloadProviderID = `regexp_replace(substring(` + listsWorkloadARN + `
              from '^arn:[^:]*:[^:]*:[^:]*:[^:]*:(.*)$'), '^[^/:]*[/:]', '')`
+
+// listsWorkloadARN is the ARN a workload is keyed by (its source key's second
+// segment). listsWorkloadProviderID is always a suffix of it: the resource
+// part is the ARN's tail, and only a prefix of that is stripped.
+const listsWorkloadARN = `split_part(w.source_key, chr(31), 2)`
 
 var listsWorkloadRuntimeKinds = []string{
 	models.WorkloadLambdaFunction, models.WorkloadECSTaskDefinition, models.WorkloadEC2Instance,
@@ -1067,7 +1087,7 @@ func listsWorkloadFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	fs := []listsFilter{listsReadable("w", "workload_id", ws)}
 	fs = append(fs, listsLifecycle(p, "w.lifecycle")...)
 	fs = append(fs, listsQ(p, "w.display_name", WorkloadAccountSQL,
-		listsQARN(p, "w.source_key"), listsExact{listsWorkloadProviderID, p.Q})...)
+		listsQARN(p, "w.source_key"), listsExact{expr: listsWorkloadProviderID, value: p.Q, suffixOf: listsWorkloadARN})...)
 	fs = append(fs, listsAccount(p, WorkloadAccountSQL)...)
 
 	names, notStated, perr := listsRegions(p)
@@ -1215,7 +1235,7 @@ func listsIdentityFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	fs = append(fs, listsLifecycle(p, "ia.lifecycle")...)
 	// Provider id: the immutable key (RoleId AROA..., UserId AIDA..., GroupId AGPA...).
 	fs = append(fs, listsQ(p, "ia.display_name", IdentityAccountSQL,
-		listsQARN(p, "ia.source_key"), listsExact{"ia.immutable_key", p.Q})...)
+		listsQARN(p, "ia.source_key"), listsExact{expr: "ia.immutable_key", value: p.Q})...)
 	fs = append(fs, listsAccount(p, IdentityAccountSQL)...)
 
 	// region: validated, never a filter -- IAM is global, and a region choice
@@ -1350,7 +1370,7 @@ func listsResourceFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	// A resource's "full ARN or pattern" IS its display name; there is no
 	// provider id for a reference.
 	fs = append(fs, listsQ(p, "r.display_name", ResourceAccountSQL,
-		listsExact{"r.display_name", p.Q})...)
+		listsExact{expr: "r.display_name", value: p.Q})...)
 	fs = append(fs, listsAccount(p, ResourceAccountSQL)...)
 
 	names, notStated, perr := listsRegions(p)
