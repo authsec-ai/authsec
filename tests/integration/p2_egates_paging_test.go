@@ -102,6 +102,13 @@ func TestP2EgatesE12ChangesDuringPagingAndExploration(t *testing.T) {
 	egatesStale(t, "graph expand continuation after a publication", code, body, 1, 2)
 	code, body = api.get(egatesRoute(t, role, "/used-by") + qs("section", "workloads", "cursor", digs(used, "data", "workloads", "next_cursor")))
 	egatesStale(t, "used-by continuation after a publication", code, body, 1, 2)
+	// Any other read the investigation pins to rev 1 -- a different evidence
+	// claim, a graph re-rooted -- is paused the same way (§2.14.5 "When the
+	// revision moves", step 2), never an answer from the newer revision.
+	code, body = api.get("/evidence" + qs("claim", evidenceGrant(t, l, egatesSharedRole, egatesTicketRead, "ReadTickets"), "rev", "1"))
+	egatesStale(t, "another evidence claim at the pinned revision", code, body, 1, 2)
+	code, body = api.get("/graph" + qs("root", role, "direction", "reverse", "rev", "1"))
+	egatesStale(t, "the graph at the pinned revision", code, body, 1, 2)
 	// Refresh: a fresh walk at rev 2 is whole -- no repeat, no gap.
 	walked := listsWalk(t, api, "/workloads", 100)
 	refs := map[string]bool{}
@@ -174,7 +181,9 @@ func TestP2EgatesE12ChangesDuringPagingAndExploration(t *testing.T) {
 	// cursor minted after the original still pages.
 	state := func() (int64, int64, int64) {
 		var v int64
-		l.db.Raw(`SELECT classification_version FROM iga_workload WHERE id = ?`, fourth.workload).Scan(&v)
+		if err := l.db.Raw(`SELECT classification_version FROM iga_workload WHERE id = ?`, fourth.workload).Row().Scan(&v); err != nil {
+			t.Fatalf("read the workload's classification version: %v", err)
+		}
 		return v, l.count(`SELECT count(*) FROM iga_workload_classification WHERE workspace_id = ?`, l.ws),
 			l.count(`SELECT COALESCE(max(seq), 0) FROM iga_classification_clock WHERE workspace_id = ?`, l.ws)
 	}

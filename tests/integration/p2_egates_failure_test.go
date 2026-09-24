@@ -224,7 +224,11 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 	if b, a := egatesGraphShape(t, graphBefore), egatesGraphShape(t, graphAfter); b != a {
 		t.Errorf("the graph changed under a denied scan:\n before %s\n after  %s", b, a)
 	}
-	for _, e := range graphEdgesOfKind(graphEdges(t, digl(graphAfter, "data", "edges")), "grant") {
+	staleGrants := graphEdgesOfKind(graphEdges(t, digl(graphAfter, "data", "edges")), "grant")
+	if len(staleGrants) != 2 {
+		t.Errorf("graph grants under a denied scan = %+v, want TicketRead's and ToolboxRead's, kept", staleGrants)
+	}
+	for _, e := range staleGrants {
 		if e.State != models.RelStale || graphLim(e.Limitations, "surface_denied") == nil {
 			t.Errorf("graph grant %s = state %s limitations %v, want stale with surface_denied", e.Claim, e.State, e.Limitations)
 		}
@@ -413,7 +417,8 @@ func TestP2EgatesE9bUnreadableDocumentAndDetachInOneRun(t *testing.T) {
 // support-tickets/*, never "*".
 //
 // Safeguards (mutation-checked): a pass ends only its OWN connector's support
-// rows; a node retires only when no support row is left.
+// rows (its partition's connector and key scope the end); a node retires only
+// when no support row is left.
 func TestP2EgatesE10SharedObjectSurvivesOneSource(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e10", true)
 	a := egatesProduction(t, l)

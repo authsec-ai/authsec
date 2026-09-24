@@ -66,7 +66,9 @@ func egatesIDsOf(t *testing.T, l *p2Lab, a *egatesAcct) egatesWorkspaceIDs {
 		"iga_external_principal", "iga_statement_revision", "iga_lifecycle_event", "cloud_connector", "cloud_scan_run",
 		"cloud_identity", "cloud_workload", "cloud_policy", "cloud_observation"} {
 		var ids []uuid.UUID
-		l.db.Raw(`SELECT id FROM `+table+` WHERE workspace_id = ?`, l.ws).Scan(&ids)
+		if err := l.db.Raw(`SELECT id FROM `+table+` WHERE workspace_id = ?`, l.ws).Scan(&ids).Error; err != nil {
+			t.Fatalf("read %s ids: %v", table, err)
+		}
 		for _, id := range ids {
 			w.all[id.String()] = true
 		}
@@ -440,12 +442,18 @@ func egatesAWSRows(t *testing.T, l *p2Lab) string {
 	var rows []string
 	for _, table := range []string{"iga_identity_accounts", "iga_entitlements", "iga_access_edges", "iga_resources"} {
 		var got []string
-		l.db.Raw(`SELECT to_jsonb(x)::text FROM `+table+` x WHERE workspace_id = ? AND provider = 'aws'`, l.ws).Scan(&got)
+		if err := l.db.Raw(`SELECT to_jsonb(x)::text FROM `+table+` x WHERE workspace_id = ? AND provider = 'aws'`, l.ws).
+			Scan(&got).Error; err != nil || len(got) == 0 {
+			t.Fatalf("read AWS rows of %s: %d rows (%v)", table, len(got), err)
+		}
 		rows = append(rows, got...)
 	}
 	for _, table := range []string{"iga_workload", "iga_relationship", "iga_policy", "iga_policy_assignment", "iga_object_support"} {
 		var got []string
-		l.db.Raw(`SELECT to_jsonb(x)::text FROM `+table+` x WHERE workspace_id = ?`, l.ws).Scan(&got)
+		if err := l.db.Raw(`SELECT to_jsonb(x)::text FROM `+table+` x WHERE workspace_id = ?`, l.ws).
+			Scan(&got).Error; err != nil || len(got) == 0 {
+			t.Fatalf("read rows of %s: %d rows (%v)", table, len(got), err)
+		}
 		rows = append(rows, got...)
 	}
 	sort.Strings(rows)
@@ -528,12 +536,22 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 		}
 	}
 	var awsNames []string
-	mixed.db.Raw(`SELECT display_name FROM iga_workload WHERE workspace_id = ?
-	              UNION SELECT display_name FROM iga_identity_accounts WHERE workspace_id = ? AND provider = 'aws'`, mixed.ws, mixed.ws).Scan(&awsNames)
-	for _, table := range []string{"iga_agents", "iga_agent_instances"} {
+	if err := mixed.db.Raw(`SELECT display_name FROM iga_workload WHERE workspace_id = ?
+	              UNION SELECT display_name FROM iga_identity_accounts WHERE workspace_id = ? AND provider = 'aws'`,
+		mixed.ws, mixed.ws).Scan(&awsNames).Error; err != nil || len(awsNames) == 0 {
+		t.Fatalf("setup: AWS names %v (%v)", awsNames, err)
+	}
+	// iga_agents is named by display_name; an instance by the native workload
+	// it was sighted as (iga_agent_instances has no name of its own).
+	for table, col := range map[string]string{"iga_agents": "display_name", "iga_agent_instances": "native_workload_id"} {
 		var names []string
-		mixed.db.Raw(`SELECT display_name FROM `+table+` WHERE workspace_id = ?`, mixed.ws).Scan(&names)
+		if err := mixed.db.Raw(`SELECT `+col+` FROM `+table+` WHERE workspace_id = ?`, mixed.ws).Scan(&names).Error; err != nil {
+			t.Fatalf("read %s: %v", table, err)
+		}
 		for _, n := range names {
+			if strings.Contains(n, "arn:aws:") {
+				t.Errorf("%s holds %q, an AWS object", table, n)
+			}
 			for _, aws := range awsNames {
 				if n == aws {
 					t.Errorf("%s holds %q, an AWS object", table, n)
@@ -556,26 +574,35 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 			q += ` AND provider = 'aws'`
 		}
 		var ids []uuid.UUID
-		mixed.db.Raw(q, mixed.ws).Scan(&ids)
+		if err := mixed.db.Raw(q, mixed.ws).Scan(&ids).Error; err != nil || len(ids) == 0 {
+			t.Fatalf("setup: AWS ids of %s: %d (%v)", table, len(ids), err)
+		}
 		for _, id := range ids {
 			awsIDs[id.String()] = true
 		}
 	}
+	// The workspace's GitHub agent (the fixture's provider-declared one, which
+	// the scan confirms), read through database/sql: an error or no row fails
+	// the setup rather than quietly dropping the agent routes from E16. Phase 1
+	// confirms that agent again on every rescan, as a new iga_agents row (the
+	// same in both workspaces; not a Phase 2 behaviour), so the FIRST scan's
+	// is the one compared: picked by name alone, the two workspaces could
+	// open different scans' agents.
 	agentOf := func(ws uuid.UUID) string {
 		var id uuid.UUID
-		mixed.db.Raw(`SELECT id FROM iga_agents WHERE workspace_id = ? ORDER BY display_name LIMIT 1`, ws).Scan(&id)
+		if err := mixed.db.Raw(`SELECT id FROM iga_agents WHERE workspace_id = ? ORDER BY created_at, id LIMIT 1`, ws).
+			Row().Scan(&id); err != nil {
+			t.Fatalf("setup: workspace %s has no GitHub agent to open: %v", ws, err)
+		}
 		return id.String()
 	}
 	paths := func(ws uuid.UUID) []string {
 		ag, in := agentOf(ws), integ[ws].ID.String()
-		out := []string{"/api/iga/v1/integrations", "/api/iga/v1/integrations/" + in, "/api/iga/v1/integrations/" + in + "/coverage",
+		return []string{"/api/iga/v1/integrations", "/api/iga/v1/integrations/" + in, "/api/iga/v1/integrations/" + in + "/coverage",
 			"/api/iga/v1/integrations/" + in + "/source-health", "/api/iga/v1/scan-runs/" + scans[ws].String(),
 			"/api/iga/v1/agents", "/api/iga/v1/identity-accounts", "/api/iga/v1/classification-candidates",
-			"/authsec/discovery/agents", "/authsec/discovery/coverage"}
-		if ag != uuid.Nil.String() {
-			out = append(out, "/api/iga/v1/agents/"+ag, "/api/iga/v1/agents/"+ag+"/evidence", "/api/iga/v1/agents/"+ag+"/access-paths")
-		}
-		return out
+			"/authsec/discovery/agents", "/authsec/discovery/coverage",
+			"/api/iga/v1/agents/" + ag, "/api/iga/v1/agents/" + ag + "/evidence", "/api/iga/v1/agents/" + ag + "/access-paths"}
 	}
 	mp, cp := paths(mixed.ws), paths(control)
 	if len(mp) != len(cp) {
@@ -602,6 +629,18 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 		if m, c := egatesJSON(egatesNormalize(mb)), egatesJSON(egatesNormalize(cb)); m != c {
 			t.Errorf("GET %s differs with AWS in the workspace:\n mixed   %s\n control %s", mp[i], m, c)
 		}
+	}
+	// Non-vacuity: the lists §7.1 names carry the GitHub rows, so "the same
+	// as the control, and no AWS object" is a statement about rows, not about
+	// two empty lists.
+	for path, min := range map[string]int{"/api/iga/v1/identity-accounts": 1, "/api/iga/v1/agents": 1} {
+		_, body := egatesCall(t, eng, mixed.ws, path)
+		if rows := digl(body, "data"); len(rows) < min {
+			t.Errorf("GET %s in the mixed workspace = %s, want the GitHub rows", path, egatesJSON(body))
+		}
+	}
+	if _, body := egatesCall(t, eng, mixed.ws, "/api/iga/v1/agents/"+agentOf(mixed.ws)+"/access-paths"); digs(body, "meta", "access_summary", "state") == "" {
+		t.Errorf("GET …/access-paths = %s, want the GitHub agent's access summary", egatesJSON(body))
 	}
 
 	// The Kubernetes bridge: a sighting named like an AWS workload is never
