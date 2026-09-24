@@ -5,8 +5,14 @@ package integration
 // .../connectors/:id/regions, PATCH .../connectors/:id, GET
 // .../connectors/:id/scan-runs, and the projection GET .../scan-runs/:id
 // gained. They answer in the discovery routes' own envelope ({success, data,
-// meta}), are not revision-bound (D-91), and their ERRORS are the §5.2
-// envelope. Built over the REAL worker and projector.
+// meta}) and are not revision-bound (D-91). The errors their HANDLERS raise
+// on the three new routes (400, 401 for a token with no workspace, 404, 422)
+// are the §5.2 envelope. The 401 and 403 of the discovery group's shared
+// authentication and permission middleware are NOT: they keep the shared
+// bodies, as every other /authsec/discovery route does (D-9 scopes the §5.2
+// denial envelope to the graph routes; D-101) -- so this test drives the
+// handlers and claims nothing about the middleware's bodies. Built over the
+// REAL worker and projector.
 
 import (
 	"net/http"
@@ -208,7 +214,8 @@ func TestP2ContractDiscoveryRoutes(t *testing.T) {
 		t.Errorf("scan run = %s, want its projection at rev 1", contractJSON(body["data"]))
 	}
 
-	// The §5.2 envelope for these routes' errors: 404 with no hint, 401.
+	// The §5.2 envelope for these handlers' errors: 404 with no hint, and the
+	// handler's own 401 for a token that names no workspace.
 	code, body = d.do(http.MethodGet, "/aws/connectors/workload:"+a.conn.String()+"/regions", nil)
 	if code != http.StatusNotFound {
 		t.Fatalf("another type's ref = %d", code)

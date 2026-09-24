@@ -126,16 +126,26 @@ func TestP2IdetailIdentityOverview(t *testing.T) {
 			t.Errorf("credential %v: want created_at (null until the projector records issued_at) and last_seen_at", c)
 		}
 	}
+	// A user has no trust document: its trust flags are stated, as null --
+	// never false, never absent (D-85's one shape, D-100d).
 	upa := dig(u, "provider_attrs").(map[string]any)
-	if _, has := upa["trust_has_deny"]; has {
-		t.Errorf("user provider_attrs = %v: a user has no trust document, so no trust flags", upa)
+	for _, k := range []string{"trust_has_deny", "trust_has_not_principal"} {
+		if v, has := upa[k]; !has || v != nil {
+			t.Errorf("user provider_attrs = %v: %s must be present and null", upa, k)
+		}
 	}
 
-	// The group: no credentials, no trust keys.
+	// The group: no credentials; trust flags null, like the user's.
 	groupID := idetailIdentityID(t, l, "ops")
 	g := dig(idetailGet(t, api, "/identities/identity:"+groupID.String()), "data").(map[string]any)
 	if _, has := g["credentials"]; has || digs(g, "kind") != models.CloudIdentityIAMGroup || digs(g, "immutable_key") != "AGPAOPSOPSOPSOPSOPS1" {
 		t.Errorf("group detail = %s, want kind iam_group, its GroupId, no credentials", idetailJSON(g))
+	}
+	gpa := dig(g, "provider_attrs").(map[string]any)
+	for _, k := range []string{"trust_has_deny", "trust_has_not_principal"} {
+		if v, has := gpa[k]; !has || v != nil {
+			t.Errorf("group provider_attrs = %v: %s must be present and null", gpa, k)
+		}
 	}
 }
 

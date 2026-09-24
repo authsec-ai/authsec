@@ -760,6 +760,13 @@ the implementation now follows it.
   §5.2 envelope (a handler's own 401 or 403) passes verbatim; the decisions are
   untouched, and the Phase 1 routes keep the shared bodies. `/capabilities`
   now also refuses a `rev` or any other parameter with 400, as D-82 says.
+  The whole `/api/iga/v1` surface is mounted by `routes.SetupIGARoutes`, which
+  `SetupRoutes` calls and which the contract test mounts itself with the
+  production `AuthMiddleware()` (configured from the environment) and
+  `middlewares.Require`: `SetupRoutes` cannot be built in a test without the
+  whole platform, so the test also checks, from the routes package's source,
+  that `SetupRoutes` calls `SetupIGARoutes` and that nothing else mounts the
+  graph catalogue. Reverting to the shared-group mount now fails a test.
 - **D-99 bound_by beyond §5.4's four budgets (recorded, not introduced, by
   the conformance pass).** Two values the traversal already returns are
   outside §5.4's `nodes | edges | assume_hops | time`: `/graph/path`'s
@@ -793,10 +800,31 @@ the implementation now follows it.
   for ended claims (D-12), so an expansion shows what the canvas shows; `more`
   is `{count: n, exact: true}` or `{count: null, exact: false}`, never a count
   it did not establish (§5.4). The contract test pins all three.
-  (d) Identity detail `provider_attrs` (D-85 per kind): `path`, `tags` and
-  `permissions_boundary_arn` on every kind (`path` and the boundary null when
-  not recorded, `tags` `{}`); `trust_has_deny` and `trust_has_not_principal`
-  on roles only -- a user or group has no trust document, so it states no
-  trust flag rather than `false` -- and null on a role whose flag the
-  projector did not write, never `false` (a `false` would claim its trust has
-  no Deny).
+  (d) Identity detail `provider_attrs` (D-85 per kind): all five keys on
+  every kind -- §5.3 and D-85 list them for identity detail without
+  qualifying by kind, and one shape per concept (D-95, D-96) means a key is
+  never absent. `path` and `permissions_boundary_arn` are null when not
+  recorded, `tags` `{}`. `trust_has_deny` and `trust_has_not_principal` are a
+  bool only on a role whose flag the projector wrote; null on a role whose
+  flag it did not write, never `false` (a `false` would claim its trust has
+  no Deny), and null on a user or group, which has no trust document -- as a
+  group's `permissions_boundary_arn` is null. (Revised in review: the flags
+  had been left off users and groups, so the object's keys depended on the
+  kind.)
+- **D-101 The discovery routes' 401 and 403 keep the shared bodies.** §5.3
+  keeps connector and scan operations "on the existing
+  `/authsec/discovery/aws/*` routes with `discovery:read` /
+  `discovery:admin`", §5.2's 403 row names only `iga:read` / `iga:review`,
+  and D-9 scopes the §5.2 denial envelope to the graph routes, leaving the
+  shared middlewares' bodies unchanged for "any other product". The
+  discovery group's `AuthMiddleware` also guards every Phase 1 discovery
+  route (sources, Kubernetes sightings, claim/quarantine), so its 401 and
+  the `discovery:*` 403 keep `{"error": "<text>"}` /
+  `{"error": "insufficient_scope", ...}` on the Phase 2 discovery routes too.
+  The errors the three NEW discovery routes' handlers raise (400, 401 for a
+  token naming no workspace, 404, 422) are the §5.2 envelope; the extended
+  `GET .../scan-runs/:id` keeps its handler's existing bodies. The discovery
+  contract test claims only the handlers' envelope. *Raise:* whether §5.2's
+  "Errors, on every route" is meant to cover the discovery routes'
+  middleware denials; if so, they need their own group wrapped by
+  `GraphEnvelope`, as the graph catalogue has.

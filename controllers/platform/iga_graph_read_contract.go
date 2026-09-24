@@ -24,12 +24,13 @@ import (
 
 // MountIGAGraphReadRoutes mounts the §5.3 graph catalogue on its OWN
 // /api/iga/v1 group of r: behind auth, with each route's permission
-// middleware built by require, both wrapped by GraphEnvelope. routes.go calls
-// it with middlewares.AuthMiddleware() and middlewares.Require; the contract
-// test (p2_contract_errors_test.go) with the same middlewares over a test
-// configuration, so the wiring production runs is the wiring that is tested.
-// A separate group because AuthMiddleware on the shared /api/iga/v1 group
-// also guards the Phase 1 routes, whose bodies must not change.
+// middleware built by require, both wrapped by GraphEnvelope. Production
+// calls it from routes.SetupIGARoutes, with middlewares.AuthMiddleware() and
+// middlewares.Require; the contract test (p2_contract_errors_test.go) mounts
+// that same SetupIGARoutes -- not this function -- so the wiring production
+// runs is the wiring that is tested, and checks that SetupRoutes calls it
+// (D-98). A separate group because AuthMiddleware on the shared /api/iga/v1
+// group also guards the Phase 1 routes, whose bodies must not change.
 func MountIGAGraphReadRoutes(r gin.IRouter, ctl *IGAGraphReadController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1")
 	g.Use(GraphEnvelope(auth))

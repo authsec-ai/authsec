@@ -200,18 +200,23 @@ func idetailDetailSurfaces(kind string) idetailSurfaces {
 
 // IdentityProviderAttrs renders an identity's provider_attrs through D-85's
 // allowlist -- never the raw jsonb: path, tags, permissions_boundary_arn,
-// and for a role trust_has_deny and trust_has_not_principal (D-44).
+// trust_has_deny and trust_has_not_principal (D-44), on EVERY kind, so the
+// object has one shape whatever the identity is (§5.3 lists the five for
+// identity detail without qualification; D-96, D-100d).
 //
-// A trust flag the projector did not write is null ("not known"), never
-// false: a recreated role whose document could not be read carries none
-// (trustFlags), and false would claim its trust has no Deny. Users and groups
-// have no trust document, so they carry no trust keys at all.
-// permissions_boundary_arn is null when none is recorded; tags are {} when
-// none are.
+// A trust flag is stated only for a role, and only as the projector wrote it:
+// null means "not stated", never false. A recreated role whose document could
+// not be read carries none (trustFlags), and false would claim its trust has
+// no Deny. A user or group has no trust document at all, so its flags are
+// null too -- present, like a group's permissions_boundary_arn, never a false
+// no trust document was read to support, and never absent (a missing key
+// would make the console infer from the kind). permissions_boundary_arn is
+// null when none is recorded; tags are {} when none are.
 func IdentityProviderAttrs(kind string, raw json.RawMessage) map[string]any {
 	var in map[string]any
 	_ = json.Unmarshal(raw, &in)
-	out := map[string]any{"path": nil, "tags": map[string]any{}, "permissions_boundary_arn": nil}
+	out := map[string]any{"path": nil, "tags": map[string]any{}, "permissions_boundary_arn": nil,
+		igagraph.TrustHasDenyAttr: nil, igagraph.TrustHasNotPrincipalAttr: nil}
 	if p, ok := in["path"].(string); ok {
 		out["path"] = p
 	}
@@ -225,8 +230,6 @@ func IdentityProviderAttrs(kind string, raw json.RawMessage) map[string]any {
 		for _, k := range []string{igagraph.TrustHasDenyAttr, igagraph.TrustHasNotPrincipalAttr} {
 			if v, ok := in[k].(bool); ok {
 				out[k] = v
-			} else {
-				out[k] = nil
 			}
 		}
 	}

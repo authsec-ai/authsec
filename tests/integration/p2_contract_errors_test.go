@@ -14,8 +14,13 @@ package integration
 import (
 	"encoding/base64"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -28,6 +33,7 @@ import (
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -553,19 +559,32 @@ func TestP2ContractClassificationPost(t *testing.T) {
 	}
 }
 
-// D-9: the PRODUCTION chain -- MountIGAGraphReadRoutes with the real
-// AuthMiddleware and the real permission middleware -- answers 401 and 403 in
-// the §5.2 envelope, keeps the middlewares' headers and decisions, and passes
-// an allowed request and a handler's own envelope through untouched.
+// D-9, D-98: the PRODUCTION chain answers 401 and 403 in the §5.2 envelope,
+// keeps the middlewares' headers and decisions, and passes an allowed request
+// and a handler's own envelope through untouched -- while the Phase 1 routes
+// beside it keep the shared middlewares' bodies.
+//
+// "Production" is meant literally: the engine is built by
+// routes.SetupIGARoutes, the function SetupRoutes calls for the whole
+// /api/iga/v1 surface, with the production AuthMiddleware() configured from
+// the environment as cmd/main.go configures it -- never a copy of the wiring.
+// Only the graph controller is the lab's (its database and switch). And
+// contractSetupRoutesMountsIGA proves SetupRoutes reaches that function and
+// that nothing else in the routes package mounts the graph catalogue, because
+// SetupRoutes itself cannot be built without the whole platform.
 func TestP2ContractAuthEnvelopes(t *testing.T) {
+	contractSetupRoutesMountsIGA(t)
 	l := newP2Lab(t, "p2-contract-auth", true)
 	gin.SetMode(gin.TestMode)
 	const secret = "p2-contract-jwt-secret"
-	cfg := &middlewares.AuthConfig{JWTSecret: secret, JWTDefaultSecret: secret + "-default",
-		ExpectedIssuer: "authsec-ai/auth-manager", RequireServerAuth: true}
+	// middlewares.DefaultAuthConfig's inputs, as a deployment sets them.
+	t.Setenv("JWT_SDK_SECRET", secret)
+	t.Setenv("JWT_DEF_SECRET", secret+"-default")
+	t.Setenv("AUTH_EXPECT_ISS", "authsec-ai/auth-manager")
+	t.Setenv("REQUIRE_SERVER_AUTH", "true")
 	eng := gin.New()
 	ctl := platform.NewIGAGraphReadControllerWith(l.db, l.gate, readTestCursorKey)
-	platform.MountIGAGraphReadRoutes(eng, ctl, middlewares.AuthMiddlewareWithConfig(cfg), middlewares.Require)
+	routes.SetupIGARoutes(eng, platform.NewIGAController(l.db), ctl)
 
 	token := func(claims jwt.MapClaims) string {
 		claims["iss"] = "authsec-ai/auth-manager"
@@ -632,6 +651,26 @@ func TestP2ContractAuthEnvelopes(t *testing.T) {
 		t.Errorf("allowed list = %d %s, want 200 not_published", w.Code, w.Body.String())
 	}
 
+	// The Phase 1 routes on the same prefix keep the shared middlewares'
+	// bodies (D-9 "The shared middleware's bodies do not change for Phase 1
+	// /api/iga/v1 routes"): the envelope is the graph catalogue's own group's,
+	// never the prefix's. Same decisions, their own shapes.
+	for _, c := range []struct {
+		name, bearer string
+		status       int
+		errText      string // the shared body's "error" string; "" for any
+	}{
+		{"Phase 1, no token", "", http.StatusUnauthorized, ""},
+		{"Phase 1, no iga:read", token(jwt.MapClaims{}), http.StatusForbidden, "insufficient_scope"},
+	} {
+		w, body := call(http.MethodGet, "/agents", c.bearer)
+		msg, isText := body["error"].(string)
+		if w.Code != c.status || !isText || msg == "" || (c.errText != "" && msg != c.errText) {
+			t.Errorf("%s: %d %s, want %d with the shared {\"error\": %q} body, not the graph envelope",
+				c.name, w.Code, w.Body.String(), c.status, c.errText)
+		}
+	}
+
 	// Each route's permission middleware is wrapped on its own (GraphRequire),
 	// not only through the authentication wrapper: AuthMiddleware happens to
 	// run the rest of the chain inside itself (c.Next), but an authenticator
@@ -665,5 +704,60 @@ func TestP2ContractAuthEnvelopes(t *testing.T) {
 			continue
 		}
 		contractCheck(t, c.name+" behind a returning authenticator", out, c.shape)
+	}
+}
+
+// contractSetupRoutesMountsIGA proves, from the routes package's own source,
+// the one step TestP2ContractAuthEnvelopes cannot run: that SetupRoutes -- the
+// router cmd/main.go serves, which cannot be built here without the whole
+// platform -- mounts /api/iga/v1 by calling SetupIGARoutes, and that nothing
+// else in the package mounts the graph catalogue. A second mount (the
+// pre-D-98 RegisterIGAGraphReadRoutes on the shared group, say) would be
+// production wiring the behavioural test never exercises -- exactly the
+// regression D-98 fixed, compiling and passing unnoticed.
+func contractSetupRoutesMountsIGA(t *testing.T) {
+	t.Helper()
+	dir := filepath.Join("..", "..", "routes")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the routes package: %v", err)
+	}
+	fset := gotoken.NewFileSet()
+	callers := map[string][]string{} // callee -> the functions calling it, in source order
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", e.Name(), err)
+		}
+		for _, d := range file.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					switch f := call.Fun.(type) {
+					case *ast.Ident:
+						callers[f.Name] = append(callers[f.Name], fn.Name.Name)
+					case *ast.SelectorExpr:
+						callers[f.Sel.Name] = append(callers[f.Sel.Name], fn.Name.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	for callee, want := range map[string][]string{
+		"SetupIGARoutes":             {"SetupRoutes"},
+		"MountIGAGraphReadRoutes":    {"SetupIGARoutes"},
+		"RegisterIGAGraphReadRoutes": nil,
+	} {
+		if got := callers[callee]; !reflect.DeepEqual(got, want) {
+			t.Errorf("routes package: %s is called from %v, want %v -- the graph catalogue must be mounted once, "+
+				"by SetupIGARoutes, which SetupRoutes calls (D-98)", callee, got, want)
+		}
 	}
 }

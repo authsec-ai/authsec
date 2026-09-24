@@ -1223,6 +1223,18 @@ func TestP2ContractGraphLimitationsAreEvidences(t *testing.T) {
 		evidence[claim] = out
 		return out
 	}
+	// An identity's trust_has_not_principal as its detail states it (D-85),
+	// read once per identity.
+	notPrincipal := map[string]bool{}
+	trustNotPrincipal := func(ref string) bool {
+		if v, ok := notPrincipal[ref]; ok {
+			return v
+		}
+		code, body := api.get("/identities/" + refUUID(t, ref).String())
+		mustStatus(t, "identity detail "+ref, code, body, http.StatusOK)
+		notPrincipal[ref] = dig(body, "data", "provider_attrs", "trust_has_not_principal") == true
+		return notPrincipal[ref]
+	}
 	// The far account's coverage a crossing edge must carry (§5.4): every
 	// surface of A that /coverage says prevents something, as a limitation.
 	code, cov := api.get("/coverage" + qs("account", accountA))
@@ -1315,6 +1327,14 @@ func TestP2ContractGraphLimitationsAreEvidences(t *testing.T) {
 				bound := graphLim(digl(n, "limitations"), "permissions_boundary_present")
 				if (bound != nil) != (dig(n, "restrictions", "permissions_boundary") == true) || (bound != nil && dig(bound, "holder") != true) {
 					t.Errorf("%s node %s: restrictions %v, limitation %v", p, ref, dig(n, "restrictions"), bound)
+				}
+				// D-44: not_principal_unresolved exactly when the role's trust
+				// uses NotPrincipal, as its detail states it -- required, not
+				// merely allowed (TestP2ContractGraphNotPrincipalUnresolved
+				// holds a role that does).
+				np := graphLim(digl(n, "limitations"), "not_principal_unresolved")
+				if want := trustNotPrincipal(ref); (np != nil) != want {
+					t.Errorf("%s node %s: not_principal_unresolved %v, but its trust_has_not_principal is %v", p, ref, np, want)
 				}
 				if deny != nil || bound != nil {
 					restricted++

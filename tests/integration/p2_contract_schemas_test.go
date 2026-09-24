@@ -543,12 +543,15 @@ func contractIdentityDetailData(kind string) contractShape {
 		contractReq("tags", contractMap(contractStr)),
 		contractReq("permissions_boundary_arn", contractNullable(contractNonEmpty)),
 	}
+	// The trust flags are on EVERY kind (D-85, one shape: D-100d). Only a role
+	// has a trust policy (D-44), so only a role's may be a bool -- null when
+	// the projector wrote none, never a false it did not read; a user's or
+	// group's is null, stated, never absent.
+	trustFlag := contractNull
 	if kind == "iam_role" {
-		// Trust flags are a ROLE's: only a role has a trust policy (D-44); null
-		// when the projector wrote none, never a false it did not read (D-100d).
-		attrs = append(attrs, contractReq("trust_has_deny", contractNullable(contractBool)),
-			contractReq("trust_has_not_principal", contractNullable(contractBool)))
+		trustFlag = contractNullable(contractBool)
 	}
+	attrs = append(attrs, contractReq("trust_has_deny", trustFlag), contractReq("trust_has_not_principal", trustFlag))
 	more := []contractField{
 		contractReq("retired_reason", contractNullable(contractNonEmpty)), // details: always stated
 		contractReq("first_seen_at", contractTime),
