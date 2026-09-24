@@ -596,3 +596,28 @@ Extend `tests/integration/cloud_aws_onboarding_test.go` with a fake verifier to 
 - **Acknowledgement wording:** it's the "IAM resources with custom names" checkbox, because `RoleName` is set.
 - **New edge cases:** the user switches console region, the session expires before Create, Redis restarts, the SUCCESS PUT fails, and "Launch again" needs a new session.
 - **Parts A, B and C** now keep verified facts, design decisions and spike items apart, with a source for every fact.
+
+---
+
+## IMPLEMENTATION NOTES (backend, branch `aws-quick-create-onboarding`)
+
+Built: template + adapter (`9ec0549`), service (`5d02404`), SQS worker (`2e06436`),
+endpoints (`8424864`). Frontend not started. Deviations from the plan above, each
+deliberate:
+
+- **SQS visibility and session lock are 15 minutes, not 5.** One message can take
+  the 540s callback deadline plus the regional probes; 5 minutes would let it
+  reappear to a second replica while the first still holds it.
+- **`aws_onb_values_changed` and `aws_onb_expired` are one code, `aws_onb_unknown_link`.**
+  An ExternalId that matches no session cannot be told apart from one whose session
+  expired, so the stack-event reason says both.
+- **`aws_onb_invalid_request`** added, for a RoleArn in the callback that does not parse.
+- **Region-probe `region_disabled`** is inferred from `InvalidClientTokenId` on an
+  opt-in region, pending spike S9; otherwise such a failure reads `blocked`.
+- **ResponseURL allow-list starts with one host form**, `…-{region no dashes}.s3-{region}.amazonaws.com`,
+  whose only fixture is AWS's documented us-west-2 example (marked `"captured": false`).
+  Spike S3 must replace it with captured URLs before merge.
+- **Onboard's own account cross-check** is recognised by its error text
+  ("refusing to onboard"), because Onboard's body is deliberately unchanged.
+- The SNS topic policy, the infrastructure, the daily canary and the metrics are not
+  code in this repo; see the runbook in `docs/flows/aws-cloud-discovery-onboarding.md`.

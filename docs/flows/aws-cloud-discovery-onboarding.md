@@ -67,12 +67,14 @@ IAM role and nothing else. The template is embedded in the binary rather than
 hosted, so the template a customer runs is exactly the one their AuthSec build
 expects, and an air-gapped deployment needs no outbound fetch to onboard.
 
-Two parameters, both copied from the console:
+Two required parameters, filled in by the console (by the Launch link, or
+copied by hand in the manual flow):
 
 | Parameter | What it is |
 |---|---|
 | `AuthSecPrincipalArn` | The AuthSec IAM principal permitted to assume the role. Deployment configuration (`AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN`), the same for every customer. |
-| `ExternalId` | Per-connection, AuthSec-generated. Secret. `NoEcho` in the template. |
+| `ExternalId` | Per-connection, AuthSec-generated. **Not `NoEcho`** since template `2026-09-24`: Quick Create ignores NoEcho parameters, and the value is readable in the role's trust policy anyway. AWS treats it as a confused-deputy guard, not a secret. AuthSec still stores it in Vault. |
+| `CallbackTopicArn` | Optional. Set only by the Launch link; empty means the manual flow and no callback resource. See [Quick Create](#quick-create-automatic-onboarding). |
 
 ### Why the ExternalId matters
 
@@ -187,7 +189,9 @@ All under `/authsec/discovery/aws`, authenticated, workspace-scoped.
 
 | Method | Path | Permission | |
 |---|---|---|---|
-| `GET` | `/onboarding` | `discovery:read` | Mints an ExternalId; returns the template, the principal, and the permission list. |
+| `GET` | `/onboarding` | `discovery:read` | Mints an ExternalId; returns the template, the principal, and the permission list, plus `automatic` (whether Launch in AWS is offered). |
+| `POST` | `/onboarding/sessions` | `discovery:admin` | Quick Create. `{regions[], deployment_region?}` → session with `quick_create_url`. 422 `aws_onb_invalid_regions`. |
+| `GET` | `/onboarding/sessions/:id` | `discovery:read` | Session status, account, per-region results. 404 when expired or another workspace's. |
 | `POST` | `/connectors` | `discovery:admin` | `{role_arn, external_id, regions[], display_name}`. 201 new, 200 reconnected. |
 | `GET` | `/connectors` | `discovery:read` | List. |
 | `GET` | `/connectors/:id` | `discovery:read` | One. |
@@ -216,6 +220,83 @@ sends every case to the same unhelpful place:
 - `fault: aws` (429) — throttled after the SDK's own retries.
 - `fault: authsec` (500) — the backend has no AWS identity of its own. Nothing
   the customer can fix, and it must not be shown to them as their mistake.
+
+---
+
+## Quick Create (automatic onboarding)
+
+Design: [`.claude/specs/SPEC-aws-quick-create-onboarding.md`](../../.claude/specs/SPEC-aws-quick-create-onboarding.md).
+Code: `internal/awsdiscovery/{quickcreate,cfn_callback,callback_config}.go`,
+`services/cloud_aws_quickcreate.go`, `services/cloud_aws_cfn_callback_worker.go`.
+
+The customer picks **AWS Region(s)** to scan, clicks **Launch in AWS**, ticks
+the IAM acknowledgement and clicks **Create stack**. Nothing is pasted back:
+
+1. `POST /onboarding/sessions` mints an ExternalId and names the stack
+   `AuthSec-Discovery-<suffix>` and the role `AuthSecCloudDiscovery-<suffix>`
+   (per launch, so a re-onboard never collides with an existing role).
+2. The stack's `Custom::AuthSecRegistration` makes CloudFormation publish a
+   Create request to AuthSec's SNS topic **in the stack's region** (a
+   custom resource's ServiceToken must be in the stack's region).
+3. Every regional topic delivers to one central SQS queue. The worker finds
+   the session by `sha256(ExternalId)`, checks the request (our topic, allowed
+   ResponseURL host, one region end to end, one account), and connects through
+   the existing `Onboard()` — AssumeRole with the ExternalId, GetCallerIdentity.
+   Only then does it answer SUCCESS; a FAILED answer rolls the stack back.
+4. The scan regions are then probed one by one through the same path a scan
+   uses.
+
+The IAM role is global, so **one stack covers every scan region**; only the
+stack's own region needs callback infrastructure.
+
+### Configuration
+
+| Variable | Meaning |
+|---|---|
+| `AUTHSEC_AWS_CFN_CALLBACK_TOPICS` | JSON `{"<region>":"<topic ARN in that region>"}`. The keys are the supported deployment regions. Commercial, default-enabled regions only. |
+| `AUTHSEC_AWS_CFN_CALLBACK_QUEUE_URL` | The central queue, `https://sqs.<region>.amazonaws.com/<account>/<name>`. |
+| `AUTHSEC_AWS_TEMPLATE_BASE_URL` | S3 base; the template is published at `<base>/aws/<TemplateVersion>/authsec-aws-discovery-role.yaml`. |
+| `AUTHSEC_AWS_TEMPLATE_URL_OVERRIDES` | Optional JSON `{"<region>":"<template URL>"}`, if Quick Create needs a bucket in the stack's region (spike item S1). |
+| `AUTHSEC_AWS_OPTIN_SCAN_REGIONS` | Comma list of opt-in regions **AuthSec's own account** has enabled. Scans assume the role through each region's STS endpoint with AuthSec's credentials, so an opt-in region disabled on AuthSec's side can never be scanned. |
+| `AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER` | `true` stops the worker on this replica. |
+
+Unset topics, queue or template base = automatic onboarding off; the console
+shows the manual flow.
+
+### Infrastructure, per AuthSec environment
+
+- One SNS topic per supported deployment region, policy allowing only
+  `sns:Publish` (principal: see spike item S2 in the spec; fall back to
+  `{"AWS":"*"}`). Trust never depends on this policy.
+- One central SQS queue, subscribed to every topic (create each subscription
+  in the topic's region), raw message delivery **off**, queue policy
+  `Principal {"Service":"sns.amazonaws.com"}` with `aws:SourceArn` = the topics.
+  Redrive to a DLQ after 5 receives.
+- The template published byte-for-byte, publicly readable, at a versioned,
+  immutable key. Publish before the release that bumps `TemplateVersion`;
+  `POST /onboarding/sessions` refuses to hand out a link whose template does
+  not answer a HEAD request.
+- AuthSec's base identity needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+  `sqs:ChangeMessageVisibility` on the queue.
+
+### Operating rules
+
+- **Topics and the worker are permanent.** Once any customer stack points at a
+  topic, that topic and a running worker must exist for as long as the stack
+  does: they answer the Delete sent when the customer removes the stack. An
+  unanswered Delete fails their deletion after 10 minutes (`DELETE_FAILED`;
+  they retry once the worker is back). Never rename or recreate a topic: a
+  ServiceToken cannot change in place.
+- **Alerts.** Every log line is prefixed `[aws-onb]`; lines that need a person
+  carry `ALERT`. Alarm on: DLQ depth > 0, queue oldest-message age > 120s,
+  `aws_onb_authsec_unavailable`, `aws_onb_template_missing`, SNS
+  `NumberOfNotificationsFailed`.
+- **Support.** Every FAILED reason a customer sees in their stack events ends in
+  `AuthSec ref: <suffix>`; grep the logs for `ref=<suffix>`.
+- **ResponseURL hosts** are an allow-list backed by captured fixtures in
+  `internal/awsdiscovery/testdata/cfn_response_urls/`. A real callback whose
+  host is not on it lands in the DLQ; add the host form and its fixture
+  together, after review.
 
 ---
 
