@@ -9,23 +9,29 @@ package igaread
 // organizations_not_collected hold for EVERY claim, so they are stated once,
 // in meta.
 //
+// An EDGE is a claim, and its limitations are /evidence's for that claim,
+// from the SAME function (Query.ClaimLimitations with FactFreeLimitations):
+// same codes, same fields, same order, so an edge on the canvas and the
+// Evidence panel it opens never disagree (D-35). A NODE's are built here from
+// the rows the traversal holds -- its own account, its staleness, a
+// statement's Condition and negation, an identity's restrictions (§5.4 "every
+// path through a restricted node carries the matching limitation") -- by the
+// SAME per-code constructors /evidence uses (contract_limitations.go), so a
+// code has one set of fields wherever it appears.
+//
 // Every crosses_account edge also carries the FAR account's coverage (§5.4
 // "the far account's coverage appears as limitations on the edge";
 // §2.14.10 "Coverage for the far segment stays visible"): the far account is
 // the endpoint account that is not the claim's own connector's -- an
-// unconnected one is account_not_connected, a connected one names each of its
-// surfaces the current revision's runs did not reach.
+// unconnected one is account_not_connected (from /evidence's endpoints), a
+// connected one names each of its surfaces the current revision's runs did
+// not reach. That is the graph's one addition to a claim's limitations.
 //
 // Each code applies only when its condition holds (§2.14.7 "never generic").
-//
-// D-35 asks for the SAME function as /evidence. /evidence (T6.5) is built in
-// parallel with this file, so the codes are computed here from the rows the
-// traversal already holds, with graph-prefixed names; folding the two into
-// one function is the integration step, and until then any difference
-// between them is a defect of one of them.
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	"github.com/google/uuid"
@@ -35,20 +41,14 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
-// GraphLimitation is one limitation: {code, ...its fields}.
-type GraphLimitation map[string]any
+// GraphLimitation is one limitation on a graph element -- the SAME type as
+// /evidence's (D-35): {code, ...its code's fields}.
+type GraphLimitation = Limitation
 
-// The §5.3 limitation codes the traversal uses.
+// The limitation codes the graph meta states once for every element.
 const (
-	graphLimEffectiveAccess     = "effective_access_not_evaluated"
-	graphLimOrganizations       = "organizations_not_collected"
-	graphLimAccountNotConnected = "account_not_connected"
-	graphLimConditions          = "conditions_not_evaluated"
-	graphLimNegated             = "negated_statement"
-	graphLimNotPrincipal        = "not_principal_unresolved"
-	graphLimCallerPermission    = "caller_permission_not_evaluated"
-	graphLimDeny                = "deny_statements_present"
-	graphLimBoundary            = "permissions_boundary_present"
+	graphLimEffectiveAccess = LimEffectiveAccessNotEvaluated
+	graphLimOrganizations   = LimOrganizationsNotCollected
 )
 
 // graphSurfaceLimitations maps stale_reason entries to surface_* limitations
@@ -60,22 +60,19 @@ func graphSurfaceLimitations(reasons []StaleReason) []GraphLimitation {
 		code, _ := Prevents(r.Surface, r.State).(string)
 		switch code {
 		case PreventsSurfaceDenied, PreventsSurfacePartial, PreventsSurfaceStale:
-			out = append(out, GraphLimitation{"code": code, "account_id": r.AccountID,
-				"surface": r.Surface, "state": r.State, "since": r.Since})
+			out = append(out, LimSurface(code, r.AccountID, r.Surface, r.State, r.Since))
 		}
 	}
 	return out
 }
 
-func graphNotConnected(accountID string) GraphLimitation {
-	return GraphLimitation{"code": graphLimAccountNotConnected, "account_id": accountID}
-}
-
 // nodeLimitations is a node's own limitations.
 func (t *graphTraversal) nodeLimitations(n *GraphNode) []GraphLimitation {
 	var ls []GraphLimitation
-	if n.acct != "" && !n.connected {
-		ls = append(ls, graphNotConnected(n.acct))
+	if !n.connected {
+		if l := LimNotConnected([]string{n.acct}); l != nil {
+			ls = append(ls, l)
+		}
 	}
 	ls = append(ls, n.surfaceLims...)
 	switch n.typ {
@@ -84,72 +81,50 @@ func (t *graphTraversal) nodeLimitations(n *GraphNode) []GraphLimitation {
 	case RefIdentity:
 		ls = append(ls, graphHolderLimitations(n)...)
 		if n.notPrincipal {
-			ls = append(ls, GraphLimitation{"code": graphLimNotPrincipal})
+			ls = append(ls, GraphLimitation{"code": LimNotPrincipalUnresolved})
 		}
 	}
 	return graphSortLimits(ls)
 }
 
 // graphStatementLimitations: the statement's Condition (its keys listed) and
-// its negation (NotAction or NotResource).
+// its negation (NotAction or NotResource), by /evidence's own rule and
+// constructors, over the statement's text as /evidence parses it.
 func graphStatementLimitations(stmt *GraphNode) []GraphLimitation {
 	var ls []GraphLimitation
-	if stmt.conditional {
-		keys := stmt.condKeys
-		if keys == nil {
-			keys = []string{}
-		}
-		ls = append(ls, GraphLimitation{"code": graphLimConditions, "keys": keys})
+	if stmt.conditional || hasCondition(stmt.text.Condition) {
+		ls = append(ls, LimConditions(stmt.text.Condition))
 	}
 	if stmt.negated {
-		ls = append(ls, GraphLimitation{"code": graphLimNegated})
+		ls = append(ls, LimNegated(stmt.text))
 	}
 	return ls
 }
 
-// graphHolderLimitations: the holder's Deny statements (count and refs) and
-// its boundary -- restrictions on everything it is granted.
+// graphHolderLimitations: the identity's Deny statements (its own and its
+// groups') and its OWN boundary -- restrictions on everything it is granted.
+// A group's member boundaries (D-22) are a limitation of the group's GRANTS,
+// which /evidence computes for those edges; the group node itself has no
+// boundary (its restrictions say so).
 func graphHolderLimitations(holder *GraphNode) []GraphLimitation {
 	var ls []GraphLimitation
-	if holder.denyCount > 0 {
-		refs := holder.denyRefs
-		l := GraphLimitation{"code": graphLimDeny, "count": holder.denyCount, "refs": refs}
-		if int64(len(refs)) < holder.denyCount {
-			l["refs_truncated"] = true
-		}
+	if l := LimDeny(holder.denyIDs); l != nil {
 		ls = append(ls, l)
 	}
-	if holder.boundary {
-		ls = append(ls, GraphLimitation{"code": graphLimBoundary})
+	if l := LimBoundary(holder.boundaryPolicies, nil); l != nil {
+		ls = append(ls, l)
 	}
 	return ls
 }
 
-// graphMemberBoundaryLimitations is D-22's second boundary rule: a grant held
-// by a GROUP also carries permissions_boundary_present, with the count and the
-// member refs, when a member user of the group has a boundary assignment --
-// the grant reaches that member only on a path through a restricted node (§2.6
-// l.549, §5.4). Nothing is evaluated: the boundary may or may not narrow the
-// grant. It is the grant edge's limitation, not the group node's: the group
-// itself has no boundary (its restrictions say so).
-func graphMemberBoundaryLimitations(holder *GraphNode) []GraphLimitation {
-	if holder.memberBoundaryCount == 0 {
-		return nil
-	}
-	refs := holder.memberBoundaryRefs
-	l := GraphLimitation{"code": graphLimBoundary, "count": holder.memberBoundaryCount, "refs": refs}
-	if int64(len(refs)) < holder.memberBoundaryCount {
-		l["refs_truncated"] = true
-	}
-	return []GraphLimitation{l}
-}
-
-// graphSortLimits dedupes limitations and orders them by code, then by their
-// canonical JSON, so the same claim renders the same list every time.
+// graphSortLimits dedupes limitations and orders them as /evidence does --
+// by the §5.3 table's order, then account, then surface -- and, among equals,
+// by canonical JSON, so the same union (a path's) renders the same list every
+// time.
 func graphSortLimits(ls []GraphLimitation) []GraphLimitation {
 	type keyed struct {
-		code, key string
-		l         GraphLimitation
+		key string
+		l   GraphLimitation
 	}
 	seen := map[string]bool{}
 	var ks []keyed
@@ -160,19 +135,14 @@ func graphSortLimits(ls []GraphLimitation) []GraphLimitation {
 			continue
 		}
 		seen[k] = true
-		code, _ := l["code"].(string)
-		ks = append(ks, keyed{code, k, l})
+		ks = append(ks, keyed{k, l})
 	}
-	sort.Slice(ks, func(i, j int) bool {
-		if ks[i].code != ks[j].code {
-			return ks[i].code < ks[j].code
-		}
-		return ks[i].key < ks[j].key
-	})
+	sort.SliceStable(ks, func(i, j int) bool { return ks[i].key < ks[j].key })
 	out := make([]GraphLimitation, 0, len(ks))
 	for _, k := range ks {
 		out = append(out, k.l)
 	}
+	sortLimitations(out)
 	return out
 }
 
