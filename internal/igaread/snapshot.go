@@ -25,7 +25,7 @@ type Revision struct {
 	PublishedAt time.Time
 }
 
-// planCacheModeSQL makes every statement of the snapshot plan with its own
+// snapshotSettingsSQL makes every statement of the snapshot plan with its own
 // bind values (§5.6). The driver (pgx) prepares and caches each statement per
 // connection, and after five executions PostgreSQL may switch a prepared
 // statement to a GENERIC plan, costed without the values. Graph reads are
@@ -39,19 +39,32 @@ type Revision struct {
 // milliseconds; the snapshot's reads are never hot loops of one statement.
 // SET LOCAL ends with the transaction, so the pool's connections are left as
 // they were for everything else.
-const planCacheModeSQL = "SET LOCAL plan_cache_mode = force_custom_plan"
+//
+// The same statement turns JIT compilation off for the snapshot. PostgreSQL
+// JIT-compiles any statement whose estimated cost passes jit_above_cost
+// (100 000 by default), and compiling costs hundreds of milliseconds before the
+// first row: T6.10 measured a holder count over "*" at 106 ms without JIT and
+// 875 ms with it. A read's estimate crosses the threshold on size alone -- the
+// resource list's page is costed at 75 000 on the 10 000-object fixture -- so
+// a slightly larger estate would pay it on every request, inside a 3 s budget,
+// for statements that run for tens of milliseconds. set_config(..., true) is
+// SET LOCAL; one round trip sets both.
+const snapshotSettingsSQL = "SELECT set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)"
 
 // Reader is the only way to read the graph (§5.1).
 type Reader struct {
 	db        *gorm.DB
 	budget    time.Duration
 	cursorKey []byte
+	// accessDenseAt is where Resource › Access switches to finding its page
+	// of holders identity-first (rdetailAccessDenseAt).
+	accessDenseAt int
 }
 
 // NewReader builds a reader over db. cursorKey signs list cursors
 // (IGA_CURSOR_SECRET); it must be the same on every replica.
 func NewReader(db *gorm.DB, cursorKey []byte) *Reader {
-	return &Reader{db: db, budget: RequestBudget, cursorKey: cursorKey}
+	return &Reader{db: db, budget: RequestBudget, cursorKey: cursorKey, accessDenseAt: rdetailAccessDenseAt}
 }
 
 // WithBudget returns a copy with a different request budget. Tests use it to
@@ -64,6 +77,16 @@ func (r *Reader) WithBudget(d time.Duration) *Reader {
 
 // Budget is the request deadline this reader applies.
 func (r *Reader) Budget() time.Duration { return r.budget }
+
+// WithAccessDenseAt returns a copy whose Resource › Access pages holders
+// identity-first from n positive targets on (rdetailAccessDenseAt). The two
+// strategies return the same rows in the same order; tests use this to run
+// both over one estate. Production uses the default.
+func (r *Reader) WithAccessDenseAt(n int) *Reader {
+	cp := *r
+	cp.accessDenseAt = n
+	return &cp
+}
 
 // Pin is what the request asked to be pinned to: the rev parameter, and the
 // revision the presented cursor was issued at. Either may be nil.
@@ -105,8 +128,8 @@ func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Que
 		if err := tx.Exec(fmt.Sprintf("SET LOCAL statement_timeout = %d", base)).Error; err != nil {
 			return err
 		}
-		// Custom plans only (planCacheModeSQL).
-		if err := tx.Exec(planCacheModeSQL).Error; err != nil {
+		// Custom plans only, no JIT (snapshotSettingsSQL).
+		if err := tx.Exec(snapshotSettingsSQL).Error; err != nil {
 			return err
 		}
 		cur, err := currentRevision(tx, ws)

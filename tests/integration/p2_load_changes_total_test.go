@@ -52,8 +52,10 @@ const (
 //
 // Safeguards (mutation-checked): the workload's statement_revised branch, the
 // holders' statement_replaced branch and the resource's statement_replaced
-// branch are counted with DISTINCT (addRepeatable), and deduplicated before
-// the page cuts them (pageSQL).
+// branch are counted with DISTINCT (addRepeatable); every branch honours the
+// cursor before the page cuts it (pageSQL). The dedupe below each repeatable
+// branch's cut needs an event repeated more often than a page is long:
+// TestP2LoadChangesPagesKeepEveryRepeatedEvent.
 func TestP2LoadChangesTotalCountsEachEventOnce(t *testing.T) {
 	l := newP2Lab(t, "p2-load-changes-total", true)
 	a := l.account(accountA)
@@ -165,4 +167,80 @@ func loadChangesPaged(t *testing.T, api *readAPI, refType string, id uuid.UUID, 
 	}
 	t.Fatalf("Changes of %s %s at limit %d did not end within 500 pages", refType, id, limit)
 	return nil
+}
+
+// loadDocArchive is a policy of three Sid-less Allow statements naming one
+// bucket; version selects the actions, so every statement's content -- and so
+// its key -- changes between versions.
+func loadDocArchive(version int) string {
+	actions := [][]string{
+		{"s3:GetObject", "s3:ListBucket", "s3:GetObjectTagging"},
+		{"s3:GetObjectVersion", "s3:GetBucketLocation", "s3:GetObjectAcl"},
+	}[version]
+	doc := `{"Version":"2012-10-17","Statement":[`
+	for i, a := range actions {
+		if i > 0 {
+			doc += ","
+		}
+		doc += `{"Effect":"Allow","Action":"` + a + `","Resource":"arn:aws:s3:::replaced-bucket/*"}`
+	}
+	return doc + `]}`
+}
+
+// Two policies replaced in ONE pass, each through three Sid-less statements
+// naming one bucket: each statement_replaced event is reached three times by
+// its branch (one row per retired statement), and the two events share their
+// time and event name, so they sort next to each other. The page statement
+// cuts every branch to limit+1 rows before merging: a repeatable branch that
+// were cut BEFORE it is deduplicated would spend all three rows of a limit-2
+// page on the first event, and the second -- sorting before the grant events
+// of the same instant -- would be skipped for good, the cursor having moved
+// past it. Every page size lists every event once, in order.
+//
+// Safeguard (mutation-checked): pageSQL's DISTINCT ON inside each repeatable
+// arm, below its LIMIT.
+func TestP2LoadChangesPagesKeepEveryRepeatedEvent(t *testing.T) {
+	l := newP2Lab(t, "p2-load-changes-repeated", true)
+	a := l.account(accountA)
+	role := a.role("ArchiveRole", "AROAARCHIVEROLE00001")
+	archiveA := changesManaged(a, "ArchiveA", loadDocArchive(0))
+	archiveB := changesManaged(a, "ArchiveB", loadDocArchive(0))
+	a.attach("ArchiveRole", archiveA)
+	a.attach("ArchiveRole", archiveB)
+	a.lambda("us-east-1", "archiver", role)
+	l.scanAndProject(a)
+
+	a.iam.managedPolicies[archiveA] = loadDocArchive(1)
+	a.iam.managedPolicies[archiveB] = loadDocArchive(1)
+	a.iam.policyVersions[archiveA] = "v2"
+	a.iam.policyVersions[archiveB] = "v2"
+	l.scanAndProject(a)
+
+	api := l.api()
+	for _, c := range []struct {
+		name    string
+		refType string
+		id      uuid.UUID
+	}{
+		{"identity ArchiveRole", "identity", changesIdentity(t, l, "ArchiveRole")},
+		{"resource replaced-bucket/*", "resource", changesIDOf(t, l,
+			`SELECT id FROM iga_resources WHERE workspace_id = ? AND display_name = ?`, l.ws, "arn:aws:s3:::replaced-bucket/*")},
+		{"workload archiver", "workload", changesIDOf(t, l, `SELECT id FROM iga_workload WHERE workspace_id = ?`, l.ws)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			all := changesAll(t, api, c.refType, c.id, "configuration")
+			if n := len(changesPick(all, "statement_replaced", "", "")); n != 2 {
+				t.Fatalf("%d statement_replaced events, want one per policy (the setup must replace both in one pass):%s", n, changesDump(all))
+			}
+			want := make([]string, 0, len(all))
+			for _, e := range all {
+				want = append(want, digs(e, "id"))
+			}
+			for _, limit := range []int{1, 2, 3, 4} {
+				if got := loadChangesPaged(t, api, c.refType, c.id, limit); strings.Join(got, ",") != strings.Join(want, ",") {
+					t.Errorf("limit %d pages list %d events, the limit-200 list %d:%s", limit, len(got), len(want), changesDump(all))
+				}
+			}
+		})
+	}
 }

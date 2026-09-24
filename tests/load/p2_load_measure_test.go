@@ -314,10 +314,15 @@ func loadRank(sorted []time.Duration, p float64) time.Duration {
 }
 
 // loadIsCount reports whether a statement is optional COUNT work: a total or
-// a facet (§5.2), which the lists run as separate COUNT queries.
+// a facet (§5.2), which the routes run as separate COUNT queries -- a list's
+// SELECT count(...), a facet's SELECT (expr) AS v, count(*) AS n ... GROUP BY,
+// and a tab's total over its own CTEs (WITH ... SELECT count(*) FROM (...)),
+// whatever the spacing (statements are traced on one line, but "( SELECT"
+// keeps its space).
 func loadIsCount(sql string) bool {
-	s := strings.ToLower(sql)
-	return strings.HasPrefix(s, "select count(") || strings.Contains(s, "count(*) from (select")
+	s := strings.ReplaceAll(strings.ToLower(sql), "( ", "(")
+	return strings.HasPrefix(s, "select count(") || strings.Contains(s, "count(*) from (select") ||
+		strings.Contains(s, "count(*) as n from")
 }
 
 // loadHonest lists what in a response is a timed-out optional piece, or

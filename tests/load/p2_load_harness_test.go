@@ -86,6 +86,24 @@ func TestP2LoadRank(t *testing.T) {
 	}
 }
 
+// TestP2LoadIsCount: the report's COUNT column finds every kind of optional
+// count the routes run -- a list total, a facet, a tab total over its CTEs --
+// and no page statement.
+func TestP2LoadIsCount(t *testing.T) {
+	for sql, want := range map[string]bool{
+		`SELECT count(*) FROM (SELECT 1 FROM "iga_workload" w WHERE x LIMIT 10001) t`:                             true,
+		`SELECT (w.region)::text AS v, count(*) AS n FROM iga_workload w WHERE x GROUP BY 1`:                      true,
+		`WITH grants AS (SELECT 1) SELECT count(*) FROM ( SELECT ia.id FROM iga_identity_accounts ia) x`:          true,
+		`WITH changes_naming AS MATERIALIZED (SELECT 1) SELECT count(*) FROM (SELECT 1 FROM (x) c LIMIT 10001) t`: true,
+		`SELECT w.id, w.display_name FROM iga_workload w ORDER BY 1 LIMIT 101`:                                    false,
+		`WITH holders AS (SELECT 1) SELECT h.k0 FROM holders h`:                                                   false,
+	} {
+		if got := loadIsCount(sql); got != want {
+			t.Errorf("loadIsCount(%q) = %v, want %v", sql, got, want)
+		}
+	}
+}
+
 // loadFakeAPI serves one canned response on every path, after a delay.
 func loadFakeAPI(code int, body string, delay time.Duration) *loadAPI {
 	gin.SetMode(gin.ReleaseMode)
