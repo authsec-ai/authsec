@@ -229,14 +229,15 @@ func IdentityProviderAttrs(kind string, raw json.RawMessage) map[string]any {
 
 // idetailCredentials reads a user's access keys, newest first.
 //
-// ONE entry per key. The projector's upsert conflicts only with a live
+// ONE entry per key. The projector's upsert once conflicted only with a live
 // (non-revoked) row (028's partial uq_iga_credentials_source_key), so a key
-// that turned Inactive is INSERTED again as 'revoked' on every pass while its
-// original row stays 'active' with a frozen last_seen_at -- the defect D-64
-// decides to fix in the projector. Until then the latest reading wins: per
-// source key, the row a scan wrote most recently (last_seen_at, then
-// updated_at, then id). Showing every row would list one key twice, once as
-// active -- a claim no current scan makes.
+// that turned Inactive was INSERTED again as 'revoked' on every pass while its
+// original row stayed 'active' with a frozen last_seen_at. D-64 fixed the
+// projector (UpsertCredential now updates the key's one row in place); rows a
+// build before that fix wrote may still hold duplicates, so the latest reading
+// still wins here: per source key, the row a scan wrote most recently
+// (last_seen_at, then updated_at, then id). Showing every row would list one
+// key twice, once as active -- a claim no current scan makes.
 func idetailCredentials(q *Query, id uuid.UUID) ([]IdentityCredential, error) {
 	var rows []struct {
 		KeyIdentifier string

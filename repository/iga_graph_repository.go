@@ -438,10 +438,49 @@ func (r *igaGraphRepository) ReplaceTargets(tx *gorm.DB, ws, entitlementID uuid.
 	return nil
 }
 
+// UpsertCredential writes one access key's metadata ON ITS EXISTING ROW,
+// found by source key REGARDLESS OF LIFECYCLE (D-64), and inserts only a key
+// that has no row at all.
+//
+// An upsert alone cannot do this. Its conflict target is 028's partial index
+// uq_iga_credentials_source_key, which EXCLUDES revoked and expired rows, so a
+// key the provider reports Inactive (written lifecycle 'revoked') never
+// conflicts: every pass inserted another 'revoked' row beside the original,
+// and the original stayed 'active', frozen at its last reading -- one key
+// shown twice, once as a claim no current scan makes.
+//
+// Which row: the live one when there is one (the index allows at most one),
+// else the most recently seen -- so a key that turned Inactive keeps its one
+// row, and one that turns Active again reopens that same row (no live row can
+// exist for it to collide with). first_seen_at is never rewritten.
 func (r *igaGraphRepository) UpsertCredential(tx *gorm.DB, c *models.IGACredential) (uuid.UUID, error) {
 	if err := requirePassTime("credential "+c.SourceKey, c.FirstSeenAt, c.LastSeenAt); err != nil {
 		return uuid.Nil, err
 	}
+	if c.SourceKey != "" {
+		var ids []uuid.UUID
+		if err := tx.Raw(`
+			UPDATE iga_credentials
+			   SET credential_type = ?, issuer = ?, key_identifier = ?, expires_at = ?, last_used_at = ?,
+			       rotation_posture = ?, lifecycle = ?, last_seen_at = ?, updated_at = ?
+			 WHERE id = (SELECT id FROM iga_credentials
+			              WHERE workspace_id = ? AND provider = ? AND source_key = ?
+			              ORDER BY (lifecycle NOT IN ('revoked', 'expired')) DESC,
+			                       last_seen_at DESC, created_at DESC, id
+			              LIMIT 1)
+			RETURNING id`,
+			c.CredentialType, c.Issuer, c.KeyIdentifier, c.ExpiresAt, c.LastUsedAt,
+			c.RotationPosture, c.Lifecycle, c.LastSeenAt, c.LastSeenAt,
+			c.WorkspaceID, c.Provider, c.SourceKey).Scan(&ids).Error; err != nil {
+			return uuid.Nil, err
+		}
+		if len(ids) == 1 {
+			c.ID = ids[0]
+			return c.ID, nil
+		}
+	}
+	// No row for this key yet: insert. The conflict clause stays as a guard
+	// against a second live row, which the workspace barrier already excludes.
 	err := tx.Clauses(returningID, onKey("source_key <> '' AND lifecycle NOT IN ('revoked', 'expired')", []string{
 		"credential_type", "issuer", "key_identifier", "expires_at", "last_used_at",
 		"rotation_posture", "lifecycle", "last_seen_at", "updated_at",
