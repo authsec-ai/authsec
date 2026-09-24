@@ -66,7 +66,7 @@ func TestP2GraphParseStatementBothShapes(t *testing.T) {
 	if len(st.Actions) != 1 || st.Actions[0] != "s3:GetObject" || len(st.Condition) == 0 {
 		t.Fatalf("verbatim = %+v", st)
 	}
-	if keys := graphConditionKeys(st.Condition); len(keys) != 2 || keys[0] != "aws:PrincipalTag/team" || keys[1] != "aws:SecureTransport" {
+	if keys := ConditionKeys(st.Condition); len(keys) != 2 || keys[0] != "aws:PrincipalTag/team" || keys[1] != "aws:SecureTransport" {
 		t.Errorf("condition keys = %v, want both keys, sorted", keys)
 	}
 	// The projector's fallback shape (models.NativeRights, lowercase keys).

@@ -66,7 +66,7 @@ type graphEdgeSpec struct {
 	cols string
 }
 
-func (s *graphEdgeSpec) claimRef(id uuid.UUID) string { return R(s.claim, id) }
+func (s *graphEdgeSpec) claimRef(id uuid.UUID) Ref { return Ref{Type: s.claim, ID: id} }
 
 // graphEdgeRow is one edge row as every spec's cols read it.
 type graphEdgeRow struct {
@@ -79,33 +79,28 @@ type graphEdgeRow struct {
 	State           *string
 	Basis           string
 	Mechanism       string
-	StatementKey    string
-	Conditions      *string
 	LastConfirmedAt *time.Time
 	ConnectorID     *uuid.UUID
 	PartitionKey    string
 	PolicyName      *string
 }
 
-// edge renders the row as a GraphEdge; decorateEdges completes it once both
-// endpoints are read.
-func (r graphEdgeRow) edge(kind, claim, from, to string) *GraphEdge {
+// edge renders the row as a GraphEdge; decorateEdges and decorateLimitations
+// complete it once both endpoints are read.
+func (r graphEdgeRow) edge(kind string, claim Ref, from, to string) *GraphEdge {
 	e := &GraphEdge{
-		Claim: claim, Kind: kind, From: from, To: to,
+		Claim: claim.String(), Kind: kind, From: from, To: to,
 		Basis: r.Basis, Mechanism: r.Mechanism, LastConfirmedAt: TS(r.LastConfirmedAt),
 		Limitations:  []GraphLimitation{},
+		claimRef:     claim,
 		connectorID:  r.ConnectorID,
 		partitionKey: r.PartitionKey,
-		statementKey: r.StatementKey,
 	}
 	if r.State != nil {
 		e.State = *r.State
 	}
 	if r.PolicyName != nil {
 		e.Policy = *r.PolicyName
-	}
-	if r.Conditions != nil && *r.Conditions != "" && *r.Conditions != "null" {
-		e.conditions = []byte(*r.Conditions)
 	}
 	if kind == GraphEdgeTarget {
 		e.Mode = "resource"
@@ -121,17 +116,17 @@ const (
 	             WHEN e0.source_identity_account_id IS NOT NULL THEN 'identity'
 	             ELSE 'external_principal' END) AS from_type,
 	       e0.target_identity_account_id AS to_id, 'identity' AS to_type,
-	       e0.state, e0.basis, e0.mechanism, e0.statement_key, e0.conditions::text AS conditions,
+	       e0.state, e0.basis, e0.mechanism,
 	       e0.last_confirmed_at, e0.connector_id, e0.partition_key, NULL::text AS policy_name`
 	graphGrantCols = `e0.id AS claim_id,
 	       e0.subject_identity_account_id AS from_id, 'identity' AS from_type,
 	       e0.entitlement_id AS to_id, 'statement' AS to_type,
-	       e0.state, e0.basis, '' AS mechanism, '' AS statement_key, NULL::text AS conditions,
+	       e0.state, e0.basis, '' AS mechanism,
 	       e0.last_confirmed_at, e0.connector_id, e0.partition_key, p.display_name AS policy_name`
 	graphTargetCols = `e0.id AS claim_id,
 	       e0.entitlement_id AS from_id, 'statement' AS from_type,
 	       e0.resource_id AS to_id, 'resource' AS to_type,
-	       NULL::text AS state, 'declared' AS basis, '' AS mechanism, '' AS statement_key, NULL::text AS conditions,
+	       NULL::text AS state, 'declared' AS basis, '' AS mechanism,
 	       NULL::timestamptz AS last_confirmed_at, NULL::uuid AS connector_id, '' AS partition_key, NULL::text AS policy_name`
 )
 

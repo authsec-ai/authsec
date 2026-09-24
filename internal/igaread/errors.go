@@ -85,7 +85,7 @@ func RevisionStale(requested int64, cur *Revision) *Error {
 	e := newErr(http.StatusConflict, "revision_stale", "A newer scan was published.").
 		With("requested_rev", requested)
 	if cur != nil {
-		e.With("current_rev", cur.Rev).With("current_published_at", cur.PublishedAt.UTC().Format(time.RFC3339))
+		e.With("current_rev", cur.Rev).With("current_published_at", PublicationTime(cur.PublishedAt).Format(time.RFC3339)) // D-96
 	} else {
 		e.With("current_rev", nil).With("current_published_at", nil)
 	}

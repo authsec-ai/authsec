@@ -118,6 +118,12 @@ func graphFeatures(on bool) gin.H {
 // schema verification failed or errored, so the scan worker claims nothing and
 // the projector is not running.
 func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
+	// D-82: live state, never pinned -- a rev (or any parameter: the route
+	// takes none) is 400, as on /pipeline, rather than silently ignored.
+	if perr := onlyParams(c.Request.URL.Query()); perr != nil {
+		writeGraphError(c, perr)
+		return
+	}
 	mode, reason, head := ctl.gate().Status()
 	if db := ctl.db(); head == "" && db != nil {
 		// Off, or never verified: report the migration head we can see, so an

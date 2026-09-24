@@ -203,11 +203,13 @@ type GraphNode struct {
 	Resolution map[string]any `json:"resolution,omitempty"`
 
 	// Statements: the policy that declares it, its group_key (D-37) and its
-	// NotResource exclusions -- never edges (§5.4).
+	// NotResource exclusions -- never edges (§5.4). sid is always stated on a
+	// statement, "" when it has none (§5.3's grant line: "sid": ""), never
+	// absent (D-98); other node types have no sid.
 	Policy     string            `json:"policy,omitempty"`
 	PolicyRef  string            `json:"policy_ref,omitempty"`
 	Effect     string            `json:"effect,omitempty"`
-	Sid        string            `json:"sid,omitempty"`
+	Sid        *string           `json:"sid,omitempty"`
 	Index      *int              `json:"index,omitempty"`
 	GroupKey   string            `json:"group_key,omitempty"`
 	Exclusions *[]GraphExclusion `json:"exclusions,omitempty"`
@@ -226,23 +228,19 @@ type GraphNode struct {
 	connected bool   // its account is a connected account (D-3)
 
 	stale          StaleSubject
-	surfaceLims    []GraphLimitation // surface_* from its stale_reason
 	conditional    bool
-	condKeys       []string
 	negated        bool
-	groupActions   []string // statements: D-37's action half
-	groupCondition string   // statements: the canonical Condition, "" for none
-	notPrincipal   bool
-	negatedTrust   map[string]bool // trust statement keys written with NotAction (D-88)
-	resolvedTo     string          // external principals: the target of a resolution IN FORCE (§2.12)
-	denyRefs       []string
-	denyCount      int64
-	boundary       bool
-	// Groups: member users with a boundary assignment (D-22), for the
-	// group's grant edges.
-	memberBoundaryCount int64
-	memberBoundaryRefs  []string
-	fetched             bool
+	text           statementText // statements: the verbatim statement, as /evidence parses it
+	groupActions   []string      // statements: D-37's action half
+	groupCondition string        // statements: the canonical Condition, "" for none
+	notPrincipal   bool          // roles: the trust policy uses NotPrincipal (D-44)
+	resolvedTo     string        // external principals: the target of a resolution IN FORCE (§2.12)
+	// Identities: the Deny statements bearing on it as a holder (its own and
+	// its live groups') and its OWN boundary policies, from loadRestrictions
+	// -- the reader /evidence's grant limitations use (D-35).
+	denyIDs          []uuid.UUID
+	boundaryPolicies []uuid.UUID
+	fetched          bool
 }
 
 // GraphRestrictions is an identity's restrictions (§5.4, D-78): how many Deny
@@ -279,10 +277,12 @@ type GraphEdge struct {
 	StaleReason     *[]StaleReason    `json:"stale_reason,omitempty"`
 	Limitations     []GraphLimitation `json:"limitations"`
 
+	claimRef     Ref // the claim, for Query.ClaimLimitations
 	connectorID  *uuid.UUID
 	partitionKey string
-	statementKey string
-	conditions   json.RawMessage
+	// farCoverage: a crosses_account edge's far-account gaps (§5.4), the
+	// graph's one addition to the claim's own limitations.
+	farCoverage []GraphLimitation
 }
 
 // GraphMore is a frontier entry's count of neighbours the response does not
@@ -341,22 +341,20 @@ type GraphBudgetsMeta struct {
 	TimeoutMS  int64 `json:"timeout_ms"`
 }
 
-// GraphMeta is the meta of every traversal response: the revision, the
-// budgets, and the limitations that hold for EVERY claim, stated once (D-35):
-// effective access is never evaluated, and AWS Organizations is not
-// collected.
+// GraphMeta is the meta of every traversal response: the detail envelope's
+// (a traversal answers about one object, never a one-row list; D-97
+// capabilities, {} here), the budgets, and the limitations that hold for
+// EVERY claim, stated once (D-35): effective access is never evaluated, and
+// AWS Organizations is not collected.
 type GraphMeta struct {
-	Rev         *int64            `json:"rev"`
-	PublishedAt *time.Time        `json:"published_at"`
-	GraphState  string            `json:"graph_state"`
+	DetailMeta
 	Budgets     GraphBudgetsMeta  `json:"budgets"`
 	Limitations []GraphLimitation `json:"limitations"`
 }
 
 func (g *GraphTraversal) meta(q *Query) GraphMeta {
-	d := NewDetailMeta(q)
 	return GraphMeta{
-		Rev: d.Rev, PublishedAt: d.PublishedAt, GraphState: d.GraphState,
+		DetailMeta: NewDetailMeta(q),
 		Budgets: GraphBudgetsMeta{
 			Nodes: g.b.Nodes, Edges: g.b.Edges, AssumeHops: g.b.AssumeHops,
 			Paths: g.b.Paths, Neighbours: g.b.Neighbours, TimeoutMS: g.r.budget.Milliseconds(),
@@ -487,6 +485,9 @@ func (t *graphTraversal) readRoot(ref Ref) (*GraphNode, error) {
 		return nil, nil
 	}
 	if err := t.decorateNodes(lv, []*GraphNode{n}); err != nil {
+		return nil, err
+	}
+	if err := t.decorateLimitations(lv, []*GraphNode{n}, nil); err != nil {
 		return nil, err
 	}
 	t.nodes[n.Ref] = n
@@ -620,7 +621,8 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 				res.more = true
 				break
 			}
-			claim := spec.claimRef(row.ClaimID)
+			claimRef := spec.claimRef(row.ClaimID)
+			claim := claimRef.String()
 			fromRef, toRef := R(row.FromType, row.FromID), R(row.ToType, row.ToID)
 			nearRef, farRef, farType, farID := fromRef, toRef, row.ToType, row.ToID
 			if dir == GraphReverse {
@@ -655,7 +657,7 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 				res.newNodes = append(res.newNodes, far)
 				nodeCount++
 			}
-			e := row.edge(kind, claim, fromRef, toRef)
+			e := row.edge(kind, claimRef, fromRef, toRef)
 			stagedEdges[claim] = e
 			res.newEdges = append(res.newEdges, e)
 			edgeCount++
@@ -669,7 +671,8 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 	}
 
 	// One query per node type for what the level reached, then their
-	// decorations, then the edges' own fields -- which need both endpoints.
+	// decorations, then the edges' own fields -- which need both endpoints --
+	// then, in one call for both, their limitations (D-35).
 	if err := t.fetchNodes(lv, res.newNodes); err != nil {
 		return nil, err
 	}
@@ -684,6 +687,9 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 		return nil, err
 	}
 	if err := t.decorateEdges(lv, res.newEdges, lookup); err != nil {
+		return nil, err
+	}
+	if err := t.decorateLimitations(lv, res.newNodes, res.newEdges); err != nil {
 		return nil, err
 	}
 	return res, nil

@@ -70,8 +70,9 @@ func TestP2IdetailExternalPrincipals(t *testing.T) {
 		!strings.HasPrefix(digs(root, "ref"), "external_principal:") {
 		t.Errorf("account C = %s, want aws_account %s, account not connected, resolution null, active/current", idetailJSON(root), trustAccountC)
 	}
-	if _, has := root["retired_reason"]; has {
-		t.Errorf("active principal carries retired_reason %v: only a retired one does", root["retired_reason"])
+	// D-98d: every detail route states retired_reason, null while active.
+	if v, has := root["retired_reason"]; !has || v != nil {
+		t.Errorf("active principal retired_reason = %v (present %v), want null: only a retired one names a reason", v, has)
 	}
 	role := detail("aws", "arn:aws:iam::"+trustAccountC+":role/partner-role")
 	if role["mechanism"] != models.ExternalPrincipalAWSPrincipal || digs(role, "account", "id") != trustAccountC ||

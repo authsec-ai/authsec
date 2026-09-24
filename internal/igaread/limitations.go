@@ -344,34 +344,28 @@ func computeLimitationsAndCoverage(q *Query, accts *Accounts, ins []*limInput, c
 		}
 
 		// The statement or trust statement has a Condition; the keys listed.
+		// Every code below is built by its one constructor
+		// (contract_limitations.go), which the graph routes share (D-35).
 		if in.stmt != nil && (in.stmt.Conditional || hasCondition(in.stmt.text.Condition)) {
-			add(Limitation{"code": LimConditionsNotEvaluated, "keys": ConditionKeys(in.stmt.text.Condition)})
+			add(LimConditions(in.stmt.text.Condition))
 		}
 		if in.relType == models.RelTypeCanAssume && hasCondition(in.trustConditions) {
-			add(Limitation{"code": LimConditionsNotEvaluated, "keys": ConditionKeys(in.trustConditions)})
+			add(LimConditions(in.trustConditions))
 		}
 
 		// NotAction or NotResource: the statement's own flag, or -- for a
 		// trust edge, whose row has no column for it (031) -- the target
 		// role's list of NotAction trust statements (D-88).
 		if in.stmt != nil && in.stmt.Negated {
-			negs := []string{}
-			if len(in.stmt.text.NotActions) > 0 {
-				negs = append(negs, "NotAction")
-			}
-			if len(in.stmt.text.NotResources) > 0 {
-				negs = append(negs, "NotResource")
-			}
-			add(Limitation{"code": LimNegatedStatement, "negations": negs})
+			add(LimNegated(in.stmt.text))
 		}
 		if in.relType == models.RelTypeCanAssume && in.trustStatementKey != "" && contains(in.trustNegated, in.trustStatementKey) {
-			add(Limitation{"code": LimNegatedStatement, "negations": []string{"NotAction"}})
+			add(LimNegatedTrust())
 		}
 
 		if in.grant && in.holder != nil {
-			if d := restr.denyOf(*in.holder); len(d) > 0 {
-				refs, trunc := capRefs(RefStatement, d)
-				add(Limitation{"code": LimDenyStatementsPresent, "count": len(d), "statements": refs, "truncated": trunc})
+			if l := LimDeny(restr.denyOf(*in.holder)); l != nil {
+				add(l)
 			}
 			if l := restr.boundaryOf(*in.holder, in.holderKind); l != nil {
 				add(l)
@@ -417,13 +411,12 @@ func computeLimitationsAndCoverage(q *Query, accts *Accounts, ins []*limInput, c
 
 		var unconnected []string
 		for _, e := range in.endpoints {
-			if e.account != "" && !e.connected && !contains(unconnected, e.account) {
+			if !e.connected {
 				unconnected = append(unconnected, e.account)
 			}
 		}
-		if len(unconnected) > 0 {
-			sort.Strings(unconnected)
-			add(Limitation{"code": LimAccountNotConnected, "accounts": unconnected})
+		if l := LimNotConnected(unconnected); l != nil {
+			add(l)
 		}
 
 		if in.relType == models.RelTypeCanAssume {
@@ -434,7 +427,7 @@ func computeLimitationsAndCoverage(q *Query, accts *Accounts, ins []*limInput, c
 		}
 
 		for _, g := range gaps[i] {
-			add(Limitation{"code": g.code, "account_id": g.accountID, "surface": g.surface, "state": g.state, "since": g.since})
+			add(LimSurface(g.code, g.accountID, g.surface, g.state, g.since))
 		}
 
 		if in.activity {
@@ -528,16 +521,7 @@ func (r *restrictions) boundaryOf(holder uuid.UUID, holderKind string) Limitatio
 			}
 		}
 	}
-	members = uniqueIDs(members)
-	if len(own) == 0 && len(members) == 0 {
-		return nil
-	}
-	pol, _ := capRefs(RefPolicy, own)
-	mem, trunc := capRefs(RefIdentity, members)
-	return Limitation{
-		"code": LimPermissionsBoundaryPresent, "holder": len(own) > 0,
-		"policies": pol, "members": mem, "member_count": len(members), "truncated": trunc,
-	}
+	return LimBoundary(own, members)
 }
 
 func loadRestrictions(q *Query, ins []*limInput, wantDeny, wantBoundary bool) (*restrictions, error) {

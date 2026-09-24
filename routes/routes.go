@@ -274,66 +274,12 @@ func SetupRoutes(
 	// ════════════════════════════════════════════════════════
 	// ADDITIVE. This sits alongside the existing /authsec/discovery/* surface
 	// (Kubernetes sightings, claim/quarantine, coverage) and changes none of
-	// it. Different prefix, different tables (iga_*), different permissions
-	// (iga:*), so nothing in the working discovery path can be affected.
-	//
-	// The authenticated workspace is established by AuthMiddleware and is never
-	// read from a body, query parameter or provider identifier.
-	{
-		igaController := platformCtrl.NewIGAController(config.DB)
-		igaGraphRead := platformCtrl.NewIGAGraphReadController()
-
-		// Provider ingress. Unauthenticated at the TOKEN layer only — GitHub
-		// holds no AuthSec token — but authenticated by HMAC signature over the
-		// raw body, with the workspace resolved server-side from the verified
-		// binding. Registered outside the authenticated group so it cannot
-		// inherit AuthMiddleware.
-		r.POST("/api/iga/v1/webhooks/github/:app_registration_id", igaController.ReceiveWebhook)
-
-		iga := r.Group("/api/iga/v1")
-		iga.Use(middlewares.AuthMiddleware())
-		{
-			// Connect and authorize.
-			iga.POST("/integrations", middlewares.Require("iga", "admin"), igaController.CreateIntegration)
-			iga.GET("/integrations", middlewares.Require("iga", "read"), igaController.ListIntegrations)
-			iga.GET("/integrations/:integration_id", middlewares.Require("iga", "read"), igaController.GetIntegration)
-			// Verification turns an untrusted installation id into a trusted
-			// binding; it is an admin action and it is audited.
-			iga.POST("/integrations/:integration_id/verify", middlewares.Require("iga", "admin"), igaController.VerifyIntegration)
-			iga.POST("/integrations/:integration_id/disconnect", middlewares.Require("iga", "admin"), igaController.DisconnectIntegration)
-
-			// Enumerate.
-			iga.POST("/integrations/:integration_id/scans", middlewares.Require("iga", "admin"), igaController.CreateScan)
-			iga.GET("/scan-runs/:scan_id", middlewares.Require("iga", "read"), igaController.GetScanRun)
-
-			// Coverage and source health are separate surfaces on purpose: a
-			// scan failure is an operational issue, not an agent-risk finding.
-			iga.GET("/integrations/:integration_id/coverage", middlewares.Require("iga", "read"), igaController.GetCoverage)
-			iga.GET("/integrations/:integration_id/source-health", middlewares.Require("iga", "read"), igaController.GetSourceHealth)
-
-			// Inventory. Confirmed agents, candidates and identities are
-			// DIFFERENT routes with different counts.
-			iga.GET("/agents", middlewares.Require("iga", "read"), igaController.ListAgents)
-			iga.GET("/agents/:agent_id", middlewares.Require("iga", "read"), igaController.GetAgent)
-			iga.GET("/agents/:agent_id/evidence", middlewares.Require("iga", "read"), igaController.GetAgentEvidence)
-			iga.GET("/agents/:agent_id/access-paths", middlewares.Require("iga", "read"), igaController.GetAgentAccessPaths)
-			iga.GET("/identity-accounts", middlewares.Require("iga", "read"), igaController.ListIdentityAccounts)
-
-			// Phase 2 graph reads (SPEC §5.3) live in iga_graph_read_controller.go.
-			// The graph branch's GET /workloads/:id/access-path and
-			// POST /estate/:id/classification were removed (§6.1): §5.3 replaces
-			// both, with revisions, typed refs and operation ids.
-			// The whole §5.3 graph catalogue, with its permissions, is one table
-			// in iga_graph_read_routes.go so tests assert the same one.
-			platformCtrl.RegisterIGAGraphReadRoutes(iga, igaGraphRead, middlewares.Require)
-			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
-
-			// Governance decisions. Both require an expected version, so a
-			// stale decision is rejected rather than last-write-wins.
-			iga.POST("/classification-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideCandidate)
-			iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
-		}
-	}
+	// it. The whole surface -- provider ingress, the Phase 1 routes and the
+	// Phase 2 graph catalogue -- is mounted by SetupIGARoutes (iga_routes.go),
+	// the one function the frozen-contract test also mounts, so the 401/403
+	// envelope a graph route answers in production is the tested one (D-9,
+	// D-100).
+	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec

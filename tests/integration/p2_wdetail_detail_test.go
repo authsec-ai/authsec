@@ -90,8 +90,10 @@ func TestP2WdetailDetailShape(t *testing.T) {
 	}
 
 	srcs := digl(d, "sources")
-	if len(srcs) != 1 || digs(srcs[0], "integration") != refOf("cloud_connector", a.conn) || digs(srcs[0], "account_id") != a.id ||
-		digs(srcs[0], "label") != "acct-"+a.id || digs(srcs[0], "state") != "current" || dig(srcs[0], "last_confirmed_at") == nil {
+	// D-98: one entry per support row, in the shape every detail gives it.
+	if len(srcs) != 1 || digs(srcs[0], "integration") != refOf("cloud_connector", a.conn) || digs(srcs[0], "account", "id") != a.id ||
+		digs(srcs[0], "account", "label") != "acct-"+a.id || digs(srcs[0], "state") != "current" || dig(srcs[0], "last_confirmed_at") == nil ||
+		!strings.HasPrefix(digs(srcs[0], "presence"), "presence:") {
 		t.Errorf("sources = %s, want the one connector, current", wdetailJSON(srcs))
 	}
 	if m := d.(map[string]any); m["decision"] != nil {

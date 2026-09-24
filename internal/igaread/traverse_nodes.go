@@ -9,13 +9,15 @@ package igaread
 // Then each node type's decorations, one statement per type per level:
 //
 //	identity   restrictions (Deny statements held directly or through a live
-//	           group membership; a live boundary assignment, D-78),
-//	           a group's member users with a boundary (D-22, for its grants),
-//	           used_by_count (UsedByCounts, the list's count), trust flags
+//	           group membership; a live boundary assignment, D-78) -- by
+//	           loadRestrictions, /evidence's reader (D-35) -- used_by_count
+//	           (UsedByCounts, the list's count), the NotPrincipal trust flag
 //	statement  its policy, its label, group_key (D-37) and exclusions (the
 //	           NotResource entries -- never edges, §5.4)
 //	every type stale_reason for stale nodes (NodeStaleReasons, D-74; an
 //	           external principal's from its stale can_assume edges)
+//
+// Their limitations are decorateLimitations' (traverse_limits.go).
 
 import (
 	"crypto/sha256"
@@ -28,6 +30,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -96,12 +99,11 @@ func (t *graphTraversal) fetchWorkloads(lv *graphLevel, ids []uuid.UUID, set map
 	return nil
 }
 
-// graphIdentityRow is an identity with the trust flags its provider_attrs
-// carry (D-44, D-88).
+// graphIdentityRow is an identity with the NotPrincipal trust flag its
+// provider_attrs carry (D-44).
 type graphIdentityRow struct {
 	IdentityRecord
 	TrustNotPrincipal bool
-	TrustNegated      string
 }
 
 func (t *graphTraversal) fetchIdentities(lv *graphLevel, ids []uuid.UUID, set map[uuid.UUID]*GraphNode) error {
@@ -111,8 +113,7 @@ func (t *graphTraversal) fetchIdentities(lv *graphLevel, ids []uuid.UUID, set ma
 	}
 	var rows []graphIdentityRow
 	if err := tx.Raw(`SELECT `+IdentityColumns+`,
-	                         COALESCE(ia.provider_attrs->>'trust_has_not_principal', '') = 'true' AS trust_not_principal,
-	                         COALESCE(ia.provider_attrs->'trust_negated_statements', '[]'::jsonb)::text AS trust_negated
+	                         COALESCE(ia.provider_attrs->>'`+igagraph.TrustHasNotPrincipalAttr+`', '') = 'true' AS trust_not_principal
 	                    FROM `+IdentityFrom+`
 	                   WHERE ia.workspace_id = ? AND ia.provider = 'aws' AND `+SupportedSQL("ia", "identity_account_id")+`
 	                     AND ia.id IN ?`, t.q.WS, ids).Scan(&rows).Error; err != nil {
@@ -126,14 +127,6 @@ func (t *graphTraversal) fetchIdentities(lv *graphLevel, ids []uuid.UUID, set ma
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
 		n.stale = r.StaleSubject()
 		n.notPrincipal = r.TrustNotPrincipal
-		var negated []string
-		_ = json.Unmarshal([]byte(r.TrustNegated), &negated) // absent or malformed: none
-		if len(negated) > 0 {
-			n.negatedTrust = map[string]bool{}
-			for _, k := range negated {
-				n.negatedTrust[k] = true
-			}
-		}
 		n.Restrictions = &GraphRestrictions{}
 		n.fetched = true
 	}
@@ -187,7 +180,9 @@ func (t *graphTraversal) fetchExternal(lv *graphLevel, ids []uuid.UUID, set map[
 		n.Label = GraphExternalLabel(r.Mechanism, r.Issuer, r.SubjectClaim)
 		n.Mechanism, n.Issuer, n.Subject = r.Mechanism, r.Issuer, r.SubjectClaim
 		t.ownAccount(n, graphExternalAccount(r.Mechanism, r.SubjectClaim))
-		n.State, n.LastConfirmedAt = r.State, TS(r.LastConfirmedAt)
+		// lifecycle is derived, by the detail route's own rule (D-47,
+		// ExternalLifecycleOf): every node on the canvas states one (D-98).
+		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, ExternalLifecycleOf(r.State), TS(r.LastConfirmedAt)
 		if r.ResolutionBasis != "" {
 			// D-87. A resolution is DISPLAYED, never followed: an external
 			// principal is a terminal node (§5.4), and its edges keep their
@@ -292,7 +287,8 @@ func (t *graphTraversal) fetchStatements(lv *graphLevel, ids []uuid.UUID, set ma
 		st := graphParseStatement(r.NativeRights)
 		n.Kind, n.key = RefStatement, r.SourceKey
 		n.Label = GraphStatementLabel(st.Actions, st.NotActions)
-		n.Policy, n.Effect, n.Sid = r.PolicyName, r.Effect, r.Sid
+		sid := r.Sid
+		n.Policy, n.Effect, n.Sid = r.PolicyName, r.Effect, &sid
 		if r.PolicyID != nil {
 			n.PolicyRef = R(RefPolicy, *r.PolicyID)
 		}
@@ -303,7 +299,7 @@ func (t *graphTraversal) fetchStatements(lv *graphLevel, ids []uuid.UUID, set ma
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
 		n.stale = StaleSubject{ID: r.ID}
 		n.conditional, n.negated = r.Conditional, r.Negated
-		n.condKeys = graphConditionKeys(st.Condition)
+		n.text = parseStatementText(json.RawMessage(r.NativeRights))
 		n.groupActions = graphGroupActions(st.Actions, st.NotActions)
 		n.groupCondition = graphCanonicalJSON(st.Condition)
 		empty := []GraphExclusion{}
@@ -456,28 +452,6 @@ func graphCanonicalJSON(raw json.RawMessage) string {
 	return string(out)
 }
 
-// graphConditionKeys lists a Condition block's keys, sorted and distinct:
-// {"StringEquals": {"aws:PrincipalTag/team": ...}} -> [aws:PrincipalTag/team].
-// The limitation lists them; nothing is evaluated (§5.3).
-func graphConditionKeys(raw json.RawMessage) []string {
-	if len(raw) == 0 {
-		return nil
-	}
-	var cond map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &cond); err != nil {
-		return nil
-	}
-	var keys []string
-	for _, byKey := range cond {
-		for k := range byKey {
-			keys = append(keys, k)
-		}
-	}
-	keys = graphDedupe(keys)
-	sort.Strings(keys)
-	return keys
-}
-
 // graphDedupe keeps the first of each value, in order.
 func graphDedupe(xs []string) []string {
 	seen := map[string]bool{}
@@ -495,7 +469,8 @@ func graphDedupe(xs []string) []string {
 
 // decorateNodes completes the nodes a level (or the root read) found:
 // identity restrictions and used-by counts, statement targets, group keys and
-// exclusions, stale reasons, and every node's limitations.
+// exclusions, and stale reasons. Their limitations follow
+// (decorateLimitations), in one call with the level's edges.
 func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error {
 	byType := map[string][]*GraphNode{}
 	for _, n := range nodes {
@@ -516,13 +491,7 @@ func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error
 		}
 	}
 	// External principals have no support rows: theirs come from their edges.
-	if err := t.principalStaleReasons(lv, byType[RefExternalPrincipal]); err != nil {
-		return err
-	}
-	for _, n := range nodes {
-		n.Limitations = t.nodeLimitations(n)
-	}
-	return nil
+	return t.principalStaleReasons(lv, byType[RefExternalPrincipal])
 }
 
 func graphIDs(nodes []*GraphNode) []uuid.UUID {
@@ -533,121 +502,33 @@ func graphIDs(nodes []*GraphNode) []uuid.UUID {
 	return ids
 }
 
-// decorateIdentities reads the identities' restrictions, the member
-// boundaries of the groups among them, and their used-by counts.
+// decorateIdentities reads the identities' restrictions and their used-by
+// counts.
 //
-// Deny statements are counted for the identity AND its groups (a live --
-// current or stale -- member_of): a group's Deny applies to its members
-// (§5.3 deny_statements_present "the holder (or its groups)"). Only active
-// Deny statements of live attached or inline assignments count; a boundary is
-// a live boundary assignment.
+// The restrictions are read by HolderRestrictions -- loadRestrictions, the
+// SAME reader /evidence's deny_statements_present and
+// permissions_boundary_present come from (D-35) -- so the node's restrictions,
+// its limitations and the Evidence panel of each of its grants count the same
+// statements: the ACTIVE Deny statements of live attached or inline
+// assignments of the identity AND of its live (not ended) groups -- a group's
+// Deny applies to its members (§5.3 deny_statements_present "the holder (or
+// its groups)") -- and the identity's own live boundary assignments. A
+// group's member boundaries (D-22) are its grants' limitation, not the
+// group's.
 func (t *graphTraversal) decorateIdentities(lv *graphLevel, nodes []*GraphNode) error {
 	if len(nodes) == 0 {
 		return nil
 	}
 	ids := graphIDs(nodes)
-	byID := map[uuid.UUID]*GraphNode{}
-	for _, n := range nodes {
-		byID[n.id] = n
+	if _, err := lv.db(); err != nil { // the level's allowance is spent
+		return err
 	}
-	tx, err := lv.db()
+	deny, boundary, err := lv.query().HolderRestrictions(ids)
 	if err != nil {
 		return err
 	}
-	var denies []struct {
-		NodeID uuid.UUID
-		DenyID uuid.UUID
-	}
-	if err := tx.Raw(`SELECT h.node AS node_id, e.id AS deny_id
-	                    FROM (SELECT ia.id AS node, ia.id AS holder
-	                            FROM iga_identity_accounts ia
-	                           WHERE ia.workspace_id = ? AND ia.id IN ?
-	                          UNION
-	                          SELECT r.source_identity_account_id, r.target_identity_account_id
-	                            FROM iga_relationship r
-	                           WHERE r.workspace_id = ? AND r.relationship_type = 'member_of'
-	                             AND `+strings.ReplaceAll(graphRelSource, "e0.", "r.")+` IN ?
-	                             AND r.state IN ('current', 'stale')) h
-	                    JOIN iga_policy_assignment pa
-	                      ON pa.workspace_id = ? AND pa.holder_identity_account_id = h.holder
-	                     AND pa.state <> 'ended' AND pa.assignment_kind IN ('attached', 'inline')
-	                    JOIN iga_entitlements e
-	                      ON e.workspace_id = pa.workspace_id AND e.policy_id = pa.policy_id
-	                     AND e.provider = 'aws' AND e.effect = 'deny' AND e.lifecycle = 'active'
-	                   GROUP BY h.node, e.id, e.source_key
-	                   ORDER BY h.node, e.source_key, e.id`,
-		t.q.WS, ids, t.q.WS, ids, t.q.WS).Scan(&denies).Error; err != nil {
-		return err
-	}
-	for _, d := range denies {
-		n := byID[d.NodeID]
-		n.denyCount++
-		if len(n.denyRefs) < graphRefCap {
-			n.denyRefs = append(n.denyRefs, R(RefStatement, d.DenyID))
-		}
-	}
-
-	if tx, err = lv.db(); err != nil {
-		return err
-	}
-	var bounded []uuid.UUID
-	if err := tx.Raw(`SELECT DISTINCT pa.holder_identity_account_id
-	                    FROM iga_policy_assignment pa
-	                   WHERE pa.workspace_id = ? AND pa.holder_identity_account_id IN ?
-	                     AND pa.assignment_kind = 'boundary' AND pa.state <> 'ended'`,
-		t.q.WS, ids).Scan(&bounded).Error; err != nil {
-		return err
-	}
-	for _, id := range bounded {
-		byID[id].boundary = true
-	}
-
-	// D-22: a group's member users with a live boundary assignment, for the
-	// group's grant edges. A member is a live -- current or stale -- member_of,
-	// the same membership the group's Deny statements count through above
-	// (§5.4: a stale edge is still believed); an ended membership is not.
-	// The member must be a readable identity (D-6): a ref is something the
-	// client can open.
-	var groups []uuid.UUID
-	for _, n := range nodes {
-		if n.Kind == models.CloudIdentityIAMGroup {
-			groups = append(groups, n.id)
-		}
-	}
-	if len(groups) > 0 {
-		if tx, err = lv.db(); err != nil {
-			return err
-		}
-		var members []struct {
-			GroupID  uuid.UUID
-			MemberID uuid.UUID
-		}
-		if err := tx.Raw(`SELECT r.target_identity_account_id AS group_id, m.id AS member_id
-		                    FROM iga_relationship r
-		                    JOIN iga_identity_accounts m
-		                      ON m.workspace_id = r.workspace_id AND m.id = r.source_identity_account_id
-		                   WHERE r.workspace_id = ? AND r.relationship_type = 'member_of'
-		                     AND r.target_identity_account_id IN ?
-		                     AND r.state IN ('current', 'stale')
-		                     AND m.provider = 'aws' AND `+SupportedSQL("m", "identity_account_id")+`
-		                     AND EXISTS (SELECT 1 FROM iga_policy_assignment pa
-		                                  WHERE pa.workspace_id = m.workspace_id AND pa.holder_identity_account_id = m.id
-		                                    AND pa.assignment_kind = 'boundary' AND pa.state <> 'ended')
-		                   GROUP BY r.target_identity_account_id, m.id, m.source_key
-		                   ORDER BY r.target_identity_account_id, m.source_key, m.id`,
-			t.q.WS, groups).Scan(&members).Error; err != nil {
-			return err
-		}
-		for _, m := range members {
-			g := byID[m.GroupID]
-			g.memberBoundaryCount++
-			if len(g.memberBoundaryRefs) < graphRefCap {
-				g.memberBoundaryRefs = append(g.memberBoundaryRefs, R(RefIdentity, m.MemberID))
-			}
-		}
-	}
-
-	if tx, err = lv.db(); err != nil {
+	tx, err := lv.db()
+	if err != nil {
 		return err
 	}
 	used, err := UsedByCounts(tx, t.q.WS, ids)
@@ -655,7 +536,8 @@ func (t *graphTraversal) decorateIdentities(lv *graphLevel, nodes []*GraphNode) 
 		return err
 	}
 	for _, n := range nodes {
-		n.Restrictions = &GraphRestrictions{DenyStatements: n.denyCount, PermissionsBoundary: n.boundary}
+		n.denyIDs, n.boundaryPolicies = deny[n.id], boundary[n.id]
+		n.Restrictions = &GraphRestrictions{DenyStatements: int64(len(n.denyIDs)), PermissionsBoundary: len(n.boundaryPolicies) > 0}
 		c, ok := used[n.id]
 		if !ok {
 			c = Unknown()
@@ -664,10 +546,6 @@ func (t *graphTraversal) decorateIdentities(lv *graphLevel, nodes []*GraphNode) 
 	}
 	return nil
 }
-
-// graphRefCap bounds the refs a limitation lists (deny statements); the count
-// beside them is always the whole number.
-const graphRefCap = 100
 
 // decorateStatements reads the statements' targets, both modes, in one
 // statement: the positive ones make the group_key, the NotResource ones are
@@ -719,8 +597,7 @@ func (t *graphTraversal) decorateStatements(lv *graphLevel, nodes []*GraphNode) 
 }
 
 // nodeStaleReasons fills stale_reason (D-74) on the stale nodes of one class
-// through NodeStaleReasons -- the lists' function -- and the surface_*
-// limitations it implies.
+// through NodeStaleReasons -- the lists' function.
 func (t *graphTraversal) nodeStaleReasons(lv *graphLevel, nodes []*GraphNode, column string) error {
 	var subjects []StaleSubject
 	for _, n := range nodes {
@@ -742,9 +619,6 @@ func (t *graphTraversal) nodeStaleReasons(lv *graphLevel, nodes []*GraphNode, co
 	}
 	for _, n := range nodes {
 		n.StaleReason = StaleReasonOf(n.State, n.id, reasons)
-		if n.StaleReason != nil {
-			n.surfaceLims = graphSurfaceLimitations(*n.StaleReason)
-		}
 	}
 	return nil
 }

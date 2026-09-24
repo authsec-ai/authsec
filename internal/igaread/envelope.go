@@ -78,9 +78,19 @@ func (m *ListMeta) Stamp(q *Query) {
 		m.Rev, m.PublishedAt, m.GraphState = nil, nil, GraphNotPublished
 		return
 	}
-	rev, at := q.Rev.Rev, q.Rev.PublishedAt.UTC()
+	rev, at := q.Rev.Rev, PublicationTime(q.Rev.PublishedAt)
 	m.Rev, m.PublishedAt, m.GraphState = &rev, &at, GraphPublished
 }
+
+// PublicationTime is how a publication's published_at is rendered in EVERY
+// place it appears -- meta.published_at of every response, /pipeline's
+// current_published_at, 409 revision_stale's current_published_at: RFC 3339
+// UTC to the second, as every §5.1/§5.2 example writes it and as TS renders
+// every other time (D-96). One instant, one string, so the console can compare
+// the pinned revision's time with /pipeline's and with a 409's. (Changes
+// renders its event times to the microsecond, D-27a; each event carries its
+// rev, so nothing joins on the string.)
+func PublicationTime(at time.Time) time.Time { return at.UTC().Truncate(time.Second) }
 
 // SetTotal records a counted total (at most TotalCap+1 rows counted).
 func (m *ListMeta) SetTotal(n int64, known bool) {
@@ -98,18 +108,25 @@ func (m *ListMeta) SetTotal(n int64, known bool) {
 
 // DetailMeta is the detail envelope's meta -- distinct from a list's, never a
 // one-row list (§5.2).
+//
+// capabilities is on EVERY detail envelope (§5.2's example; §2.14.14 "the UI
+// depends on ... meta.capabilities on detail responses"): the actions the
+// response offers this caller, each stated true or false, and {} where the
+// route offers none -- never absent, so the console reads one meta type and
+// never infers an action from a missing field (D-97). Only workload detail
+// offers one today, can_classify (D-83).
 type DetailMeta struct {
 	Rev          *int64         `json:"rev"`
 	PublishedAt  *time.Time     `json:"published_at"`
 	GraphState   string         `json:"graph_state"`
-	Capabilities map[string]any `json:"capabilities,omitempty"`
+	Capabilities map[string]any `json:"capabilities"`
 }
 
 // NewDetailMeta stamps a detail meta from the snapshot.
 func NewDetailMeta(q *Query) DetailMeta {
-	d := DetailMeta{GraphState: GraphNotPublished}
+	d := DetailMeta{GraphState: GraphNotPublished, Capabilities: map[string]any{}}
 	if q.Rev != nil {
-		rev, at := q.Rev.Rev, q.Rev.PublishedAt.UTC()
+		rev, at := q.Rev.Rev, PublicationTime(q.Rev.PublishedAt)
 		d.Rev, d.PublishedAt, d.GraphState = &rev, &at, GraphPublished
 	}
 	return d

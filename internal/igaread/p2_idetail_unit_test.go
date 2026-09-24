@@ -64,8 +64,9 @@ func TestIdetailCredentialStatusOf(t *testing.T) {
 	}
 }
 
-// D-85: the allowlist, exactly; trust flags only on roles, null when the
-// projector did not write them, never false.
+// D-85: the allowlist, exactly, on every kind (D-102d); trust flags stated
+// only for a role, null when the projector did not write them, never false --
+// and null, never absent, on a user or group, which has no trust document.
 func TestIdetailIdentityProviderAttrs(t *testing.T) {
 	raw := json.RawMessage(`{"path":"/svc/","tags":{"team":"a"},"permissions_boundary_arn":"arn:b",` +
 		`"trust_has_deny":true,"trust_negated_statements":["k"],"secret_thing":"x"}`)
@@ -77,9 +78,15 @@ func TestIdetailIdentityProviderAttrs(t *testing.T) {
 	if _, has := role["trust_negated_statements"]; has {
 		t.Error("trust_negated_statements leaked: it feeds limitations, not the detail (D-85)")
 	}
-	user := IdentityProviderAttrs(models.CloudIdentityIAMUser, json.RawMessage(`{"path":"/"}`))
-	if len(user) != 3 || user["permissions_boundary_arn"] != nil || len(user["tags"].(map[string]any)) != 0 {
-		t.Errorf("user attrs = %v, want path, tags {} and boundary null only", user)
+	for _, kind := range []string{models.CloudIdentityIAMUser, models.CloudIdentityIAMGroup} {
+		// Even a flag in the jsonb is no trust document's: only a role has one.
+		attrs := IdentityProviderAttrs(kind, json.RawMessage(`{"path":"/","trust_has_deny":false}`))
+		deny, hasDeny := attrs["trust_has_deny"]
+		np, hasNP := attrs["trust_has_not_principal"]
+		if len(attrs) != 5 || attrs["permissions_boundary_arn"] != nil || len(attrs["tags"].(map[string]any)) != 0 ||
+			!hasDeny || deny != nil || !hasNP || np != nil {
+			t.Errorf("%s attrs = %v, want path, tags {}, boundary null and both trust flags null (D-102d)", kind, attrs)
+		}
 	}
 }
 
