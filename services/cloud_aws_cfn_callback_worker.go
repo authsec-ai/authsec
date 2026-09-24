@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,7 +44,9 @@ const (
 	// once. Each can spend minutes retrying Onboard; the bound keeps a burst from
 	// exhausting STS and database connections, while a slow one never blocks the
 	// rest (there is no per-batch barrier).
-	awsCallbackConcurrency = 16
+	awsCallbackConcurrency    = 16
+	awsCallbackMaxConcurrency = 128
+	envAWSCallbackConcurrency = "AUTHSEC_AWS_CFN_CALLBACK_CONCURRENCY"
 	// awsCallbackDefaultMaxReceives is assumed when the queue's redrive policy
 	// cannot be read. It matches the runbook's recommended setting.
 	awsCallbackDefaultMaxReceives = 25
@@ -84,7 +88,11 @@ func NewAWSCallbackWorker(ctx context.Context, svc *AWSQuickCreateService) (*AWS
 		return nil, fmt.Errorf("aws callback worker: %w", err)
 	}
 	w := newAWSCallbackWorker(svc, sqs.NewFromConfig(cfg), queueURL)
-	w.maxReceives = w.readMaxReceives(ctx)
+	// Bounded: an unreachable SQS endpoint must not hold up the caller for the
+	// SDK's full retry budget. The default is used if the read times out.
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	w.maxReceives = w.readMaxReceives(rctx)
 	return w, nil
 }
 
@@ -92,9 +100,24 @@ func newAWSCallbackWorker(svc *AWSQuickCreateService, client sqsAPI, queueURL st
 	return &AWSCallbackWorker{
 		svc: svc, client: client, queueURL: queueURL,
 		maxReceives: awsCallbackDefaultMaxReceives,
-		slots:       make(chan struct{}, awsCallbackConcurrency),
+		slots:       make(chan struct{}, awsCallbackConcurrencyFromEnv()),
 		heartbeat:   awsCallbackHeartbeat,
 	}
+}
+
+// awsCallbackConcurrencyFromEnv reads AUTHSEC_AWS_CFN_CALLBACK_CONCURRENCY,
+// the callbacks one replica handles at once. Raise it (with replicas) for a
+// large onboarding burst: slots needed ≈ arrivals per second × seconds each
+// callback holds a slot. Bounded so a typo cannot open thousands of STS calls.
+func awsCallbackConcurrencyFromEnv() int {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(envAWSCallbackConcurrency)))
+	if err != nil || n < 1 {
+		return awsCallbackConcurrency
+	}
+	if n > awsCallbackMaxConcurrency {
+		return awsCallbackMaxConcurrency
+	}
+	return n
 }
 
 // readMaxReceives reads the queue's redrive policy. Without one there is no
@@ -228,9 +251,18 @@ func (w *AWSCallbackWorker) handle(ctx context.Context, m sqstypes.Message, wg *
 			}
 		}
 	}()
+	// The heartbeat is stopped and joined BEFORE the message is settled: a
+	// tick landing after settle would reset the visibility settle just chose
+	// (30s for a retry, 0 for a reject) back to two minutes.
+	var stopOnce sync.Once
+	stopBeat := func() {
+		stopOnce.Do(func() {
+			close(stop)
+			<-beatDone
+		})
+	}
 	defer func() {
-		close(stop)
-		<-beatDone
+		stopBeat()
 		<-w.slots
 		if wg != nil {
 			wg.Done()
@@ -241,13 +273,16 @@ func (w *AWSCallbackWorker) handle(ctx context.Context, m sqstypes.Message, wg *
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[aws-onb] ALERT stage=worker outcome=panic err=%v", r)
+			stopBeat()
 			w.settle(ctx, receipt, CallbackRetry)
 		}
 	}()
 
 	receives, _ := strconv.Atoi(m.Attributes[string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount)])
 	lastChance := receives >= w.maxReceives
-	w.settle(ctx, receipt, w.svc.HandleCallbackDelivery(ctx, aws.ToString(m.Body), lastChance))
+	outcome := w.svc.HandleCallbackDelivery(ctx, aws.ToString(m.Body), lastChance)
+	stopBeat()
+	w.settle(ctx, receipt, outcome)
 }
 
 // settle applies an outcome to a message.

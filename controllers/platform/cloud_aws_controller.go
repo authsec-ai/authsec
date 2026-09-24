@@ -13,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -147,6 +148,8 @@ func (ctl *CloudAWSController) quickCreate() (*services.AWSQuickCreateService, e
 	ctl.qcOnce.Do(func() {
 		cfg, err := services.LoadAWSCallbackConfig()
 		if err != nil {
+			// Logged once here, not on every GET /aws/onboarding.
+			log.Printf("[aws-onb] ALERT automatic AWS onboarding misconfigured: %v", err)
 			ctl.qcErr = err
 			return
 		}
@@ -162,7 +165,6 @@ func (ctl *CloudAWSController) quickCreate() (*services.AWSQuickCreateService, e
 func (ctl *CloudAWSController) automaticBlock() gin.H {
 	qc, err := ctl.quickCreate()
 	if err != nil {
-		log.Printf("[aws-onb] ALERT automatic AWS onboarding misconfigured: %v", err)
 		return gin.H{"enabled": false}
 	}
 	if !qc.Available() {
@@ -209,7 +211,8 @@ func (ctl *CloudAWSController) StartOnboardingSession(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": services.AWSOnbCodeNotConfigured})
 		return
 	}
-	sess, err := qc.StartSession(c.Request.Context(), workspaceID, actor, in.Regions, in.DeploymentRegion)
+	userID, _ := middlewares.ResolveUserID(c)
+	sess, err := qc.StartSessionFor(c.Request.Context(), workspaceID, actor, userID, in.Regions, in.DeploymentRegion)
 	if err != nil {
 		status, body := mapAWSQuickCreateError(err)
 		c.JSON(status, body)
@@ -257,9 +260,11 @@ func (ctl *CloudAWSController) GetOnboardingSession(c *gin.Context) {
 	view := sess.View()
 	// The launch link and its ExternalId let whoever opens them connect an AWS
 	// account to this workspace — an admin action. This route is readable with
-	// discovery:read, so only the admin who started the session gets them back;
-	// anyone else sees the status and the result.
-	if actor != sess.CreatedBy {
+	// discovery:read, so only the user who started the session gets them back;
+	// anyone else sees the status and the result. Compared on the user id, not
+	// the actor, which can be a workspace-level client id shared by every user.
+	userID, _ := middlewares.ResolveUserID(c)
+	if !sess.StartedBy(userID, actor) {
 		view.QuickCreateURL, view.ExternalID = "", ""
 	}
 	c.JSON(http.StatusOK, gin.H{

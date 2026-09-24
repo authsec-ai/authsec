@@ -96,6 +96,7 @@ type qcHarness struct {
 	clock      time.Time
 	existing   *models.CloudConnector
 	verifier   fakeRegionVerifier
+	clockMu    sync.Mutex
 }
 
 func newQCHarness(t *testing.T) *qcHarness {
@@ -119,10 +120,15 @@ func newQCHarness(t *testing.T) *qcHarness {
 		cfg:       cfg,
 		principal: qcPrincipal,
 		http:      &http.Client{Transport: h.transport},
-		now:       func() time.Time { return h.clock },
+		now:       func() time.Time { h.clockMu.Lock(); defer h.clockMu.Unlock(); return h.clock },
 		// Sleeping advances the fake clock, so retry budgets are exercised
 		// without waiting for them.
-		sleep: func(_ context.Context, d time.Duration) error { h.clock = h.clock.Add(d); return nil },
+		sleep: func(_ context.Context, d time.Duration) error {
+			h.clockMu.Lock()
+			defer h.clockMu.Unlock()
+			h.clock = h.clock.Add(d)
+			return nil
+		},
 		onboard: func(_ context.Context, ws uuid.UUID, in AWSOnboardInput, _ string) (*models.CloudConnector, bool, error) {
 			h.onboards++
 			h.lastInput = in
@@ -584,5 +590,34 @@ func TestQuickCreateOptInRegionIsNeverProbedFirst(t *testing.T) {
 	}
 	if sess.Regions[0] != "eu-west-1" {
 		t.Fatalf("regions %v: an opt-in region must not come first", sess.Regions)
+	}
+}
+
+// The launch link goes back only to the user who started the session — decided
+// on the per-user id, because the actor can be a client id every user shares.
+func TestQuickCreateStartedBy(t *testing.T) {
+	s := &AWSOnboardingSession{CreatedBy: "shared-client", CreatorUserID: "user-a"}
+	if !s.StartedBy("user-a", "shared-client") {
+		t.Fatal("the creator must be recognised")
+	}
+	if s.StartedBy("user-b", "shared-client") {
+		t.Fatal("another user with the same shared client id must not be treated as the creator")
+	}
+	if s.StartedBy("", "shared-client") {
+		t.Fatal("an unknown user must not be treated as the creator")
+	}
+	legacy := &AWSOnboardingSession{CreatedBy: "user-a"}
+	if !legacy.StartedBy("", "user-a") || legacy.StartedBy("", "user-b") {
+		t.Fatal("a session without a recorded user id falls back to the actor")
+	}
+}
+
+func TestAWSCallbackConcurrencyFromEnv(t *testing.T) {
+	for in, want := range map[string]int{"": awsCallbackConcurrency, "abc": awsCallbackConcurrency,
+		"0": awsCallbackConcurrency, "40": 40, "100000": awsCallbackMaxConcurrency} {
+		t.Setenv(envAWSCallbackConcurrency, in)
+		if got := awsCallbackConcurrencyFromEnv(); got != want {
+			t.Fatalf("%q: got %d want %d", in, got, want)
+		}
 	}
 }

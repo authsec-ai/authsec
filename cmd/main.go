@@ -191,11 +191,16 @@ func main() {
 				qc := services.NewAWSQuickCreateService(
 					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
 					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
-				if w, werr := services.NewAWSCallbackWorker(context.Background(), qc); werr != nil {
-					log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", werr)
-				} else {
-					go w.Run(context.Background())
-				}
+				// Built inside the goroutine: it reads the queue's settings from
+				// SQS, and a slow or unreachable SQS must never delay boot.
+				go func() {
+					w, werr := services.NewAWSCallbackWorker(context.Background(), qc)
+					if werr != nil {
+						log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", werr)
+						return
+					}
+					w.Run(context.Background())
+				}()
 			}
 		}
 	}

@@ -183,16 +183,20 @@ type awsStoredResult struct {
 
 // AWSOnboardingSession is one Quick Create launch.
 type AWSOnboardingSession struct {
-	ID               uuid.UUID `json:"id"`
-	WorkspaceID      uuid.UUID `json:"workspace_id"`
-	CreatedBy        string    `json:"created_by"`
-	ExternalID       string    `json:"external_id"`
-	Regions          []string  `json:"regions"`
-	DeploymentRegion string    `json:"deployment_region"`
-	Suffix           string    `json:"suffix"`
-	StackName        string    `json:"stack_name"`
-	RoleName         string    `json:"role_name"`
-	QuickCreateURL   string    `json:"quick_create_url"`
+	ID          uuid.UUID `json:"id"`
+	WorkspaceID uuid.UUID `json:"workspace_id"`
+	CreatedBy   string    `json:"created_by"`
+	// CreatorUserID is the signed-in user who started the launch (CreatedBy
+	// may be a workspace-level client id). Empty for sessions started before
+	// it was recorded.
+	CreatorUserID    string   `json:"creator_user_id,omitempty"`
+	ExternalID       string   `json:"external_id"`
+	Regions          []string `json:"regions"`
+	DeploymentRegion string   `json:"deployment_region"`
+	Suffix           string   `json:"suffix"`
+	StackName        string   `json:"stack_name"`
+	RoleName         string   `json:"role_name"`
+	QuickCreateURL   string   `json:"quick_create_url"`
 
 	Status  string `json:"status"`
 	Code    string `json:"code,omitempty"`
@@ -241,6 +245,16 @@ type AWSOnboardingSessionView struct {
 }
 
 // View strips the bookkeeping.
+// StartedBy reports whether the caller is the user who started the session.
+// The per-user id decides when it was recorded; only an older session without
+// one falls back to comparing the actor.
+func (s *AWSOnboardingSession) StartedBy(userID, actor string) bool {
+	if s.CreatorUserID != "" {
+		return userID != "" && userID == s.CreatorUserID
+	}
+	return actor != "" && actor == s.CreatedBy
+}
+
 func (s *AWSOnboardingSession) View() AWSOnboardingSessionView {
 	return AWSOnboardingSessionView{
 		ID: s.ID, Status: s.Status, Code: s.Code, Message: s.Message,
@@ -383,6 +397,15 @@ func newSuffix() (string, error) {
 func (s *AWSQuickCreateService) StartSession(
 	ctx context.Context, workspaceID uuid.UUID, actor string, regions []string, deploymentRegion string,
 ) (*AWSOnboardingSession, error) {
+	return s.StartSessionFor(ctx, workspaceID, actor, "", regions, deploymentRegion)
+}
+
+// StartSessionFor is StartSession that also records the signed-in user who
+// started it. actor can be a workspace-level client id shared by every user,
+// so the per-user id is what decides who may see the launch link again.
+func (s *AWSQuickCreateService) StartSessionFor(
+	ctx context.Context, workspaceID uuid.UUID, actor, creatorUserID string, regions []string, deploymentRegion string,
+) (*AWSOnboardingSession, error) {
 	if !s.cfg.Enabled() || s.principal == "" {
 		return nil, onbErr(AWSOnbCodeNotConfigured, "automatic AWS onboarding is not configured on this deployment")
 	}
@@ -461,7 +484,7 @@ func (s *AWSQuickCreateService) StartSession(
 	}
 	topic, _ := s.cfg.TopicFor(dr)
 	sess := &AWSOnboardingSession{
-		ID: uuid.New(), WorkspaceID: workspaceID, CreatedBy: actor, ExternalID: externalID,
+		ID: uuid.New(), WorkspaceID: workspaceID, CreatedBy: actor, CreatorUserID: creatorUserID, ExternalID: externalID,
 		Regions: regs, DeploymentRegion: dr, Suffix: suffix,
 		StackName: awsOnbStackName(suffix), RoleName: awsOnbRoleName(suffix),
 		Status: AWSOnbPending,
@@ -720,7 +743,9 @@ func (s *AWSQuickCreateService) handleCreate(
 	// stack is about to roll back.
 	answer := func(status, reason string) CallbackOutcome {
 		out, rejected := s.deliver(ctx, target, awsdiscovery.NewCFNResponse(req, status, reason, physical))
-		if rejected {
+		// Past the attempt cap nothing is written, not even this flag: those
+		// messages are not the customer's stack.
+		if rejected && sess.Attempts <= awsCallbackMaxAttempts {
 			sess.ResponsePutFailed = true
 			if err := s.saveSession(ctx, sess); err != nil {
 				log.Printf("[aws-onb] stage=respond outcome=save_failed session=%s err=%v", sess.ID, err)
@@ -1178,10 +1203,14 @@ func (s *AWSQuickCreateService) auditConnected(
 	if config.AuditLogger == nil {
 		return
 	}
+	userID := sess.CreatorUserID
+	if userID == "" {
+		userID = sess.CreatedBy
+	}
 	config.AuditLogger.LogAdminAction(
 		sess.ID.String(),
 		sess.WorkspaceID.String(),
-		sess.CreatedBy,
+		userID,
 		"onboard",
 		"cloud_connector",
 		connector.ID.String(),
