@@ -107,6 +107,28 @@ func egatesRequiresIAM(p igagraph.Partition) bool {
 	return false
 }
 
+// egatesRowKindOf is the kind of row a partition reconciles, in
+// egatesEdgeRows' vocabulary: a node partition's support rows
+// ("support:<class>", an entitlement's being a statement's), a relationship
+// partition's relationships of its type, and the assignment and grant
+// partitions' rows. Kind and region are not part of it: they split one kind
+// of row into several partitions.
+func egatesRowKindOf(p igagraph.Partition) string {
+	switch p.Target {
+	case "":
+		if p.Class == models.ObjectEntitlement {
+			return "support:statement"
+		}
+		return "support:" + p.Class
+	case "relationship":
+		return "relationship:" + p.RelationshipType
+	case "access_edge":
+		return "grant"
+	default:
+		return p.Target
+	}
+}
+
 // egatesCoverageSurface is one surface of one account on /coverage.
 func egatesCoverageSurface(t *testing.T, api *readAPI, a *egatesAcct, surface string) map[string]any {
 	t.Helper()
@@ -141,7 +163,9 @@ func egatesNoGuessedPermission(t *testing.T, what string, v any) {
 // not reached is never ended (canEnd); a stale row's last_confirmed_at is not
 // moved by a run that could not read it; every partition that requires an IAM
 // surface goes stale -- executes_as, can_assume and task_execution_role edges
-// and resource support included, not only the six kinds once listed.
+// and resource support included, not only the six kinds once listed -- with
+// the kinds to prove derived from the projector's partition table, each shown
+// non-vacuous.
 func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 	l := newP2Lab(t, "p2-egates-e9a", true)
 	a := egatesProduction(t, l)
@@ -177,12 +201,15 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 			}
 		}
 	}
-	// "Everything under IAM stale" (§2.7 l.613), decided per row from the
-	// projector's own partition table rather than a list of kinds: a row is
-	// under IAM when its partition requires an IAM surface, all four of which
-	// run 2 was refused. A kind the projector later puts under IAM is covered
-	// without editing this test; a row whose partition this build cannot
-	// rebuild fails, rather than being skipped.
+	// "Everything under IAM stale" (§2.7 l.613), decided from the projector's
+	// own partition table (igagraph.Partitions over run 2's coverage) rather
+	// than from a list written here: a row is under IAM when its partition
+	// requires an IAM surface, all four of which run 2 was refused -- and the
+	// kinds that must be proven are the kinds of those partitions. A
+	// partition the projector later puts under IAM is covered without
+	// editing this test; a row whose partition this build cannot rebuild, or
+	// that sits in a partition of another kind than its own, fails rather
+	// than being skipped.
 	parts := egatesPartitionsOf(t, l, run2, a.conn)
 	underIAM, outside := map[string]int{}, map[string]int{}
 	for id, b := range before {
@@ -192,6 +219,10 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 		p, ok := parts[b.PartitionKey]
 		if !ok {
 			t.Errorf("%s %s: partition %q is not in run 2's partition table", b.Kind, id, b.PartitionKey)
+			continue
+		}
+		if kind := egatesRowKindOf(p); kind != b.Kind {
+			t.Errorf("%s %s is stamped with partition %q, a %s partition", b.Kind, id, b.PartitionKey, kind)
 			continue
 		}
 		if !egatesRequiresIAM(p) {
@@ -210,19 +241,42 @@ func TestP2EgatesE9aIAMDeniedRetainsEverything(t *testing.T) {
 			t.Errorf("%s %s under IAM (requires %v) = %s after the denied scan, want stale", b.Kind, id, p.RequiredSurfaces, n.State)
 		}
 	}
-	// Non-vacuity: every kind of claim the lab builds under an IAM partition
-	// is there -- each relationship type, every support class but the
-	// workload's, assignments and grants -- and the workload presences are
-	// the control outside it.
+	// Non-vacuity, per kind, the kinds DERIVED from the partition table:
+	// every kind of claim run 2's IAM-requiring partitions reconcile has rows
+	// here (support for identities, policies, statements and resources;
+	// assignments; grants; member_of, can_assume, executes_as and
+	// task_execution_role relationships, at the time of writing), so the check
+	// above proved each of them stale. The workload presences are the control
+	// outside IAM. No kind is exempt: a partition kind the lab builds no row
+	// for fails here, so a kind added under IAM must come with its fixture.
+	iamKinds, outsideKinds := map[string]bool{}, map[string]bool{}
+	for _, p := range parts {
+		if egatesRequiresIAM(p) {
+			iamKinds[egatesRowKindOf(p)] = true
+		} else {
+			outsideKinds[egatesRowKindOf(p)] = true
+		}
+	}
+	// A floor under the derivation: the kinds of claim that rest on IAM at the
+	// time of writing. A partition that stopped requiring an IAM surface would
+	// otherwise move its rows out of the check above without a word -- and
+	// "everything under IAM stale" would then prove less than it says.
 	for _, kind := range []string{"assignment", "grant", "support:identity", "support:policy", "support:statement",
 		"support:resource", "relationship:member_of", "relationship:executes_as", "relationship:can_assume",
 		"relationship:task_execution_role"} {
+		if !iamKinds[kind] {
+			t.Errorf("run 2's partition table no longer puts %s under IAM (%v): its rows would escape E9(a)", kind, iamKinds)
+		}
+	}
+	for kind := range iamKinds {
 		if underIAM[kind] == 0 {
 			t.Errorf("setup: no %s row under an IAM partition (%v): the check above proves nothing for it", kind, underIAM)
 		}
 	}
-	if outside["support:workload"] == 0 {
-		t.Errorf("setup: no workload presence outside IAM (%v)", outside)
+	for kind := range outsideKinds {
+		if outside[kind] == 0 {
+			t.Errorf("setup: no %s row outside IAM (%v): the control proves nothing for it", kind, outside)
+		}
 	}
 	if n := l.count(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND provider = 'aws' AND lifecycle <> 'active'`, l.ws); n != 0 {
 		t.Errorf("%d identities retired by a denied scan", n)

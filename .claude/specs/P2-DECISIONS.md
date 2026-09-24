@@ -701,3 +701,38 @@ merge if that number is taken.
   structured field, and the surface already has one; the S2 test had pinned
   it null for this one surface, unlike every other partial surface. *Raise:*
   whether §5.3's per-surface `api` should name every distinct failed call.
+- **D-egates (number on merge) A resolution the walk does not follow is not
+  a budget (§5.4, §2.12).** An external principal's resolution in force (034
+  `resolution_state = 'active'`) is shown on its node (D-87) and never walked:
+  the principal is terminal (§5.4). On `/graph`, `truncated` names only a
+  budget that bound — `nodes | edges | assume_hops | time` (§5.4
+  "Continuation" l.6129-6130; the §5.3 Graph example has `truncated: null`
+  beside a non-empty frontier) — so an unfollowed resolution never sets it.
+  The additive `data.resolution_not_followed` says it instead: `true` when the
+  walk passed one (a principal it holds whose resolved node it does not hold;
+  forward only, also a node it holds that a principal it does not hold
+  resolves to, when that principal has `can_assume` edges under the request's
+  lifecycle filter); `false` when it passed none; `null` when that was not
+  established (the time budget bound first; a check that itself runs out of
+  the request's time sets `truncated: time` when no other budget bound, as
+  D-40's levels do). It is set
+  whether or not a budget bound, and speaks of the nodes the response holds.
+  `/graph/path` is unchanged: `not_found_within_budget` with `bound_by:
+  "resolution_not_followed"` (or `more_paths` with it on a found list) when
+  the search passed such a resolution linking its two sides, since
+  `none_exists` would claim more than was searched and §5.4's outcome table
+  has no other value. *Merge note:* graph's D-101 (recorded by the
+  frozen-contract pass after this branch was cut) lists
+  `resolution_not_followed` on `/graph` `truncated`; this entry supersedes that
+  half of D-101 (its `/graph/path` `bound_by` half stands). On merge, graph's
+  `tests/integration/p2_contract_schemas_test.go` must follow: `contractTruncated`
+  loses `"resolution_not_followed"` from its enum, and `contractGraph` (a
+  closed shape) gains `contractReq("resolution_not_followed",
+  contractNullable(contractBool))`; `p2_graph_trust_test.go` takes this
+  branch's assertions. *Raise:* §5.4's outcome table has no value for "a path
+  may run through a resolution that was not followed", and its `bound_by`
+  names only budgets; and §2.12 ("no path is drawn through [suspended /
+  pending_reconfirmation] as current") implies a path MAY be drawn through an
+  active resolution, while §5.4 makes every external principal terminal.
+  Either add the value to §5.4's vocabulary or decide that the traversal
+  follows resolutions in force.

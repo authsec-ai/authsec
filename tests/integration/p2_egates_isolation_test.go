@@ -573,6 +573,13 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 			t.Errorf("positive control, workspace %s: a sighting named %q was proposed %+v (%v), want a weak proposal to iga_agents %s",
 				ws, agents[0].DisplayName, link, err, agents[0].ID)
 		}
+		// ... and the bridge asked directly -- the call the AWS-named sighting
+		// gets below -- proposes the same link, not a second one.
+		if link, err := bridge.ProposeForAgent(ws, matched[ws]); err != nil || link == nil || link.IGAAgentID != agents[0].ID ||
+			link.State != models.IGALinkProposed || link.Strength != models.IGALinkWeak {
+			t.Errorf("positive control, workspace %s: ProposeForAgent for the sighting named %q = %+v (%v), want a weak proposal to iga_agents %s",
+				ws, agents[0].DisplayName, link, err, agents[0].ID)
+		}
 		// ... and a sighting named like A's refund-tools Lambda -- the ONE
 		// AWS workload of that name, so a bridge that matched AWS workloads
 		// would find it unambiguous and propose it: nothing, in the

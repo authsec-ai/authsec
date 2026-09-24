@@ -35,7 +35,9 @@ package igaread
 // principal is terminal (§5.4) -- its resolution is shown, never walked -- so
 // a path through it is neither drawn nor ruled out: not_found_within_budget
 // (or more_paths) with bound_by "resolution_not_followed", additive to §5.4's
-// vocabulary.
+// vocabulary and raised (D-egates): none_exists would claim more than was
+// searched, and the outcome table has no other value. /graph says the same
+// fact in its own resolution_not_followed field, never in truncated.
 //
 // Both orientations. The route has no direction, and a path runs along its
 // edges' own directions -- but §5.4's reverse question ("what reaches this":
