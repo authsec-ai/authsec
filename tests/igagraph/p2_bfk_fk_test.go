@@ -817,7 +817,11 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 	//   - a new cloud_* table written the Phase 1 way, with single-column
 	//     references only, to cloud_connector, cloud_identity and cloud_policy
 	//     (review of bfk: the guard once derived its cloud scope from composite
-	//     keys, so this table was invisible to every check);
+	//     keys, so this table was invisible to every check), and one to a
+	//     workspace-scoped table outside the graph (discovered_agents). No
+	//     cloud_* key at 036 points outside the graph, so only that last one
+	//     shows the child-side scope (r.relname LIKE 'cloud\_%') is needed: the
+	//     others are read through their parent either way;
 	//   - a new single-column reference to cloud_policy from a Phase 1 table,
 	//     and one to cloud_identity from a table outside the graph.
 	t.Run("a_planted_single_column_reference_is_caught", func(t *testing.T) {
@@ -842,7 +846,8 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			   id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
 			   connector_id uuid NOT NULL REFERENCES cloud_connector (id),
 			   identity_id uuid NOT NULL REFERENCES cloud_identity (id),
-			   policy_row_id uuid REFERENCES cloud_policy (id))`,
+			   policy_row_id uuid REFERENCES cloud_policy (id),
+			   agent_ref_id uuid REFERENCES discovered_agents (id))`,
 			`ALTER TABLE cloud_workload ADD COLUMN bfk_planted_policy_id uuid REFERENCES cloud_policy (id)`,
 			`ALTER TABLE discovered_agents ADD COLUMN bfk_planted_identity_id uuid REFERENCES cloud_identity (id)`,
 		} {
@@ -886,6 +891,7 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			{"cloud_bfk_planted_connector_id_fkey", false},
 			{"cloud_bfk_planted_identity_id_fkey", true},
 			{"cloud_bfk_planted_policy_row_id_fkey", true},
+			{"cloud_bfk_planted_agent_ref_id_fkey", false},
 			{"cloud_workload_bfk_planted_policy_id_fkey", true},
 			{"discovered_agents_bfk_planted_identity_id_fkey", true},
 		} {
