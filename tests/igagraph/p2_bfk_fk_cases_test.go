@@ -1,10 +1,11 @@
 package igagraph_test
 
-// One entry per foreign key on the iga_* tables and on the Phase 2 cloud_*
-// tables (bfkPhase2CloudTables). TestB9ForeignKeyCatalogGuard fails if the
-// catalog holds a foreign key with no entry here, if an entry names none, or if
-// an entry's kind does not match the key's shape. So this list cannot drift
-// from the schema without a test going red.
+// One entry per foreign key in scope (bfkForeignKeys): every key on an iga_*
+// or cloud_* table, Phase 1's included, and every key from any other table
+// that points into one. TestB9ForeignKeyCatalogGuard fails if the catalog holds
+// such a key with no entry here, if an entry names none, or if an entry's kind
+// does not match the key's shape. So this list cannot drift from the schema
+// without a test going red.
 //
 // build(w, p) returns the child row in workspace A. The reference under test
 // names p's row and every other reference names A's rows. p is A for the
@@ -89,6 +90,59 @@ var bfkCases = []bfkCase{
 	}},
 	{fk: "iga_observations_delivery_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
 		return w.A.igaObservation("delivery_id", p.id("delivery"))
+	}},
+
+	// ---------------- Phase 1's cloud_* tables (011-017), bfkLegacy ----------
+	// Written before §2.9 and converted by none of 027-036. Five of them are
+	// single-column references to cloud_identity: B20's "Catches" class, on
+	// the tables Phase 1 still writes.
+	{fk: "cloud_secret_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudSecret("connector_id", p.conn)
+	}},
+	{fk: "cloud_secret_identity_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudSecret("identity_id", p.id("cuser"))
+	}},
+	{fk: "cloud_assume_edge_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudAssumeEdge("connector_id", p.conn)
+	}},
+	{fk: "cloud_assume_edge_identity_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudAssumeEdge("identity_id", p.id("cuser"))
+	}},
+	{fk: "cloud_permission_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudPermission("connector_id", p.conn)
+	}},
+	{fk: "cloud_permission_identity_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudPermission("identity_id", p.id("cuser"))
+	}},
+	// cloud_permission_scope_resource_chk: a resource exactly when scoped to one.
+	{fk: "cloud_permission_resource_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudPermission("scope_kind", "resource", "resource_id", p.id("cres"))
+	}},
+	{fk: "cloud_resource_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudResource("connector_id", p.conn)
+	}},
+	{fk: "cloud_workload_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudWorkload("connector_id", p.conn)
+	}},
+	{fk: "cloud_workload_identity_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudWorkload("identity_id", p.id("cuser"))
+	}},
+	{fk: "cloud_usage_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudUsage("connector_id", p.conn)
+	}},
+	{fk: "cloud_usage_identity_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudUsage("identity_id", p.id("cuser"))
+	}},
+	{fk: "cloud_scan_checkpoint_connector_id_fkey", kind: bfkLegacy, build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.cloudScanCheckpoint("connector_id", p.conn)
+	}},
+
+	// ---------------- references INTO the graph from outside it -------------
+	// discovered_agent_iga_links is Discovery's table (001), not the graph's,
+	// but its key names an iga_agents row, so it is held to §2.9 too. Its
+	// other keys point at Discovery's own tables and are out of scope.
+	{fk: "discovered_agent_iga_links_iga_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.discoveredLink("iga_agent_id", p.id("agent"))
 	}},
 
 	// ---------------- 004: the estate and the GitHub path --------------------

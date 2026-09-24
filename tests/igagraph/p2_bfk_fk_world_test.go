@@ -189,7 +189,7 @@ func bfkSeedCollection(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID
 }
 
 // bfkSeedSide seeds one row of every table a foreign key in scope references,
-// in dependency order.
+// in dependency order, plus the discovered agent a link's default names.
 func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct string, rev int64) *bfkSide {
 	t.Helper()
 	s := bfkSeedCollection(t, db, name, ws, conn, acct)
@@ -214,6 +214,8 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 		{"srcobj", func() bfkRow { return s.sourceObject() }},
 		{"iobs", func() bfkRow { return s.igaObservation() }},
 		{"agent", func() bfkRow { return s.agent() }},
+		// 001's discovered agent, for the link that references iga_agents
+		{"dagent", func() bfkRow { return s.discoveredAgent() }},
 		// the graph's nodes and edges
 		{"ident", func() bfkRow { return s.identity() }},
 		{"res", func() bfkRow { return s.resource() }},
@@ -293,6 +295,56 @@ func (s *bfkSide) cloudWorkload(set ...any) bfkRow {
 	return bfkRowOf("cloud_workload", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
 		"runtime_kind", "lambda_function",
 		"native_id", fmt.Sprintf("arn:aws:lambda:eu-central-1:%s:function:%s", s.acct, bfkFresh("bfk"))}, set)
+}
+
+// The remaining Phase 1 tables (011-017) are only ever children: no key in
+// scope points at them, so no side seeds one. Their builders exist for the
+// bfkLegacy cases on their own single-column references.
+
+func (s *bfkSide) cloudSecret(set ...any) bfkRow {
+	return bfkRowOf("cloud_secret", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
+		"identity_id", s.id("cuser"), "kind", "access_key", "native_id", bfkFresh("AKIA")}, set)
+}
+
+// cloudAssumeEdge uses the legacy vocabulary (awsdiscovery's SubjectKind* and
+// Mechanism*). uq_cloud_assume_edge_subject is (identity_id, subject_kind,
+// subject), so the subject is fresh.
+func (s *bfkSide) cloudAssumeEdge(set ...any) bfkRow {
+	return bfkRowOf("cloud_assume_edge", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
+		"identity_id", s.id("cuser"), "subject_kind", "cloud_service", "subject", bfkFresh("svc"),
+		"mechanism", "sts_assume_role"}, set)
+}
+
+// cloudUsage: uq_cloud_usage_identity_service is (identity_id, service,
+// source), so the service is fresh.
+func (s *bfkSide) cloudUsage(set ...any) bfkRow {
+	return bfkRowOf("cloud_usage", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
+		"identity_id", s.id("cuser"), "service", bfkFresh("svc")}, set)
+}
+
+// cloudScanCheckpoint has no id column: its key is (workspace, connector,
+// generation, phase).
+func (s *bfkSide) cloudScanCheckpoint(set ...any) bfkRow {
+	return bfkRowOf("cloud_scan_checkpoint", []any{"workspace_id", s.ws, "connector_id", s.conn,
+		"generation", 1, "phase", bfkFresh("phase")}, set)
+}
+
+/* ------------------ builders: 001's references into the graph -------------- */
+
+// discoveredAgent is a Discovery row (001), not a graph table: it is seeded
+// only because discovered_agent_iga_links needs one to name.
+func (s *bfkSide) discoveredAgent(set ...any) bfkRow {
+	return bfkRowOf("discovered_agents", []any{"id", uuid.New(), "workspace_id", s.ws, "source", "aws",
+		"fingerprint", bfkFresh("fp")}, set)
+}
+
+// discoveredLink names this side's discovered agent and iga_agents row.
+// discovered_agent_iga_links_agent_key admits one link per discovered agent
+// and workspace; every child row is inserted in a transaction of its own that
+// rolls back (attempt), so the shared default never collides.
+func (s *bfkSide) discoveredLink(set ...any) bfkRow {
+	return bfkRowOf("discovered_agent_iga_links", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"discovered_agent_id", s.id("dagent"), "iga_agent_id", s.id("agent")}, set)
 }
 
 /* ------------------- builders: 004's estate and GitHub path ---------------- */

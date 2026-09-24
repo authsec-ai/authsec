@@ -22,8 +22,9 @@ package igagraph_test
 //	                     workspace A under integration A2: 23503 from it
 //	absent_workspace     (the workspaces anchor) a workspace that does not exist
 //	absent_parent,       (bfkLegacy) what a pre-§2.9 single-column key does
-//	foreign_workspace_   enforce, and the cross-workspace row it admits. The
-//	admitted             second pins a known gap (spec question).
+//	foreign_workspace_   enforce (PASS), and the cross-workspace row it admits:
+//	admitted             a known gap (spec question), reported as SKIP so it
+//	                     cannot read as a pass. It FAILS once the gap closes.
 //
 // WHY THE NAME, NOT JUST THE CODE. Some rows fail two constraints at once by
 // construction. One case is a connector reference on a table whose other
@@ -37,14 +38,30 @@ package igagraph_test
 // only thing that can refuse the row. The lifted names are logged. The
 // constraint under test is never lifted, and a control never lifts anything.
 //
-// TestB9ForeignKeyCatalogGuard is what makes "every" true. It reads
-// pg_constraint and fails when a foreign key has no case, when a case's kind
-// does not match its key's shape, when any single-column reference to a
-// workspace-scoped table is not an exemption listed with its reason, when a
-// composite reference does not lead with workspace_id on both sides, when a
-// uuid column references nothing unlisted, and when a cloud_* table in §2.9's
-// form is missing from the scope. A planted instance of each, in a rolled-back
-// transaction, proves on every run that the checks can fail.
+// TestB9ForeignKeyCatalogGuard is what makes "every" true. Its scope is by
+// table name, not by form: every foreign key on an iga_* or cloud_* table
+// (Phase 1's included) and every key from any other table that points into
+// one (bfkForeignKeys). It reads pg_constraint and fails when such a key has no
+// case, when a case's kind does not match its key's shape, when a
+// single-column reference to a workspace-scoped table is not an exemption
+// listed with its reason, when a composite reference does not lead with
+// workspace_id on both sides, when a reference to a collection fact is not
+// integration-qualified, when a uuid column references nothing unlisted, and
+// when a cloud_* table is not classified in bfkCloudTables. A planted instance
+// of each, in a rolled-back transaction, proves on every run that the checks
+// can fail: among them the A3 pattern in a new cloud_* table, in a Phase 1
+// table and in a table outside the graph.
+//
+// WHAT A GREEN RUN DOES NOT SHOW. At 036, bfkLegacySingleColumn lists the
+// single-column references §2.9 forbids that no migration converted. They are
+// spec questions; the migrations are verbatim from the spec and not this
+// test's to change. B9 does NOT hold for them: each one's
+// foreign_workspace_admitted subtest shows another workspace's parent going in
+// and reports SKIP, and the guard's no_open_section_2_9_exemption subtest SKIPs
+// with the whole list, grouped. So "B9 and B20 pass" means that every key NOT
+// in that list rejects a foreign row, and that the list is exact. It does not
+// mean §2.9 holds, and it does not mean every single-column reference to
+// cloud_identity (B20's "Catches") is caught: several are in the list.
 //
 // Home: tests/igagraph, which rebuilds public from migrations/master on every
 // run (setupSchema). Nothing here edits a migration.
@@ -61,35 +78,87 @@ import (
 	"github.com/lib/pq"
 )
 
-// bfkPhase2CloudTables are the cloud_* tables Phase 2 wrote references on or
-// made the target of one. 027 gave cloud_connector, cloud_scan_run and
-// cloud_observation their UNIQUE (workspace_id, id) and converted the run's
-// and the observation's references. 035 created the collection model, widened
-// cloud_observation with policy_id and made cloud_identity the target of every
-// integration-qualified reference (cloud_identity_scope_key), so the
-// references those rows make themselves are in scope too. The other cloud_*
-// tables are Phase 1's (single-column references throughout; spec question)
-// and are not covered here. bfkPhase2CloudTablesInCatalog re-derives this list
-// from the catalog on every run, so a later table cannot be left out.
-var bfkPhase2CloudTables = []string{
-	"cloud_connector", "cloud_scan_run", "cloud_observation", "cloud_identity",
-	"cloud_group_membership", "cloud_policy", "cloud_policy_attachment",
+// bfkCloudTable says where a cloud_* table's references come from.
+type bfkCloudTable struct {
+	// phase2: created by 027-036, or given §2.9's target or references by them.
+	// A Phase 1 table was written before the rule, and none of 027-036
+	// converted it.
+	phase2 bool
+	origin string
 }
+
+// bfkCloudTables classifies every cloud_* table in the schema. The guard
+// requires the catalog's cloud_* tables to be exactly these, so a new one fails
+// until someone classifies it (and the coverage check until its keys have
+// cases). The classification does NOT decide scope: every foreign key on every
+// cloud_* table is in scope whatever its form (bfkForeignKeys). An earlier
+// version took its cloud scope from the tables already holding a composite
+// key, and so could not see a new table written with single-column references
+// only, which is the A3 pattern itself. It only groups the open exemptions
+// (bfkOpenGaps).
+var bfkCloudTables = map[string]bfkCloudTable{
+	"cloud_connector":         {true, "010; 027 added UNIQUE (workspace_id, id), the target of every connector reference"},
+	"cloud_scan_run":          {true, "020; 027 converted its connector reference and added UNIQUE (workspace_id, id)"},
+	"cloud_observation":       {true, "022; 027 converted run and connector, 035 added the integration-qualified policy_id"},
+	"cloud_identity":          {true, "011; 035 made it the target of every collection reference (cloud_identity_scope_key)"},
+	"cloud_group_membership":  {true, "035"},
+	"cloud_policy":            {true, "035"},
+	"cloud_policy_attachment": {true, "035"},
+	"cloud_secret":            {false, "011"},
+	"cloud_assume_edge":       {false, "012"},
+	"cloud_permission":        {false, "013"},
+	"cloud_resource":          {false, "013"},
+	"cloud_workload":          {false, "015"},
+	"cloud_usage":             {false, "016"},
+	"cloud_scan_checkpoint":   {false, "017"},
+}
+
+// Reasons shared by the Phase 1 exemptions below.
+const (
+	bfkPhase1Connector = ": Phase 1, never converted. Proposed: (workspace_id, connector_id) " +
+		"REFERENCES cloud_connector (workspace_id, id), against 027's cloud_connector_workspace_id_key"
+	bfkPhase1Identity = ": Phase 1, never converted; a single-column reference to cloud_identity (B20's " +
+		"Catches). Proposed: (workspace_id, connector_id, identity_id) REFERENCES cloud_identity " +
+		"(workspace_id, connector_id, id), against 035's cloud_identity_scope_key"
+)
 
 // bfkLegacySingleColumn: the single-column references to workspace-scoped
 // tables that §2.9 forbids and 027-036 did not convert. They are spec questions
-// (reported with this test). They are not accepted design. Each is covered by a
-// bfkLegacy case that demonstrates the gap rather than asserting it.
+// (reported with this test), not accepted design. Each is covered by a
+// bfkLegacy case that demonstrates the gap (SKIP) rather than asserting it.
 var bfkLegacySingleColumn = map[string]string{
 	"iga_observations_delivery_fkey": "004: iga_webhook_deliveries has no UNIQUE (workspace_id, id) and a " +
 		"nullable workspace_id (a delivery is stored before it is bound)",
 	"cloud_identity_connector_id_fkey": "011: never converted. 035 added cloud_identity_scope_key " +
 		"(workspace_id, connector_id, id) as a target, but the row's own (workspace_id, connector_id) pair " +
-		"is anchored only by this single-column key",
-	"cloud_observation_identity_id_fkey":   "024: subject key re-declared single-column (ON DELETE SET NULL); 027 converted only run and connector",
-	"cloud_observation_permission_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); 027 converted only run and connector",
-	"cloud_observation_resource_id_fkey":   "024: subject key re-declared single-column (ON DELETE SET NULL); 027 converted only run and connector",
-	"cloud_observation_workload_id_fkey":   "024: subject key re-declared single-column (ON DELETE SET NULL); 027 converted only run and connector",
+		"is anchored only by this single-column key. Proposed: (workspace_id, connector_id) REFERENCES " +
+		"cloud_connector (workspace_id, id), against 027's cloud_connector_workspace_id_key",
+	"cloud_observation_identity_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); 027 " +
+		"converted only run and connector. A single-column reference to cloud_identity on a table B20 covers. " +
+		"Proposed: (workspace_id, connector_id, identity_id) REFERENCES cloud_identity (workspace_id, " +
+		"connector_id, id) ON DELETE SET NULL (identity_id)",
+	"cloud_observation_permission_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
+		"027 converted only run and connector. cloud_permission has no UNIQUE (workspace_id, id) to reference",
+	"cloud_observation_resource_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
+		"027 converted only run and connector. cloud_resource has no UNIQUE (workspace_id, id) to reference",
+	"cloud_observation_workload_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
+		"027 converted only run and connector. cloud_workload has no UNIQUE (workspace_id, id) to reference",
+
+	// Phase 1's cloud_* tables (bfkCloudTables): 027-036 converted none of them.
+	"cloud_secret_connector_id_fkey":          "011" + bfkPhase1Connector,
+	"cloud_secret_identity_id_fkey":           "011" + bfkPhase1Identity,
+	"cloud_assume_edge_connector_id_fkey":     "012" + bfkPhase1Connector,
+	"cloud_assume_edge_identity_id_fkey":      "012" + bfkPhase1Identity,
+	"cloud_permission_connector_id_fkey":      "013" + bfkPhase1Connector,
+	"cloud_permission_identity_id_fkey":       "013" + bfkPhase1Identity,
+	"cloud_resource_connector_id_fkey":        "013" + bfkPhase1Connector,
+	"cloud_workload_connector_id_fkey":        "015" + bfkPhase1Connector,
+	"cloud_workload_identity_id_fkey":         "015" + bfkPhase1Identity,
+	"cloud_usage_connector_id_fkey":           "016" + bfkPhase1Connector,
+	"cloud_usage_identity_id_fkey":            "016" + bfkPhase1Identity,
+	"cloud_scan_checkpoint_connector_id_fkey": "017" + bfkPhase1Connector,
+	"cloud_permission_resource_id_fkey": "013: Phase 1, never converted. cloud_resource has no UNIQUE " +
+		"(workspace_id, id) to reference",
 }
 
 // bfkNoForeignKey: the uuid columns in scope that reference nothing at all.
@@ -116,7 +185,22 @@ var bfkNoForeignKey = map[string]string{
 	"cloud_connector.workspace_id": "001 and 010: SPEC QUESTION: no key to workspaces. Every (workspace_id, " +
 		"connector_id) reference 027-036 added is against cloud_connector (workspace_id, id), so it proves " +
 		"the pair agrees, not that the workspace exists",
+
+	// Phase 1's tables: the workspace_id no key covers, because each table's
+	// connector reference is single-column (bfkLegacySingleColumn).
+	"cloud_secret.workspace_id":          "011" + bfkPhase1Workspace,
+	"cloud_assume_edge.workspace_id":     "012" + bfkPhase1Workspace,
+	"cloud_permission.workspace_id":      "013" + bfkPhase1Workspace,
+	"cloud_resource.workspace_id":        "013" + bfkPhase1Workspace,
+	"cloud_workload.workspace_id":        "015" + bfkPhase1Workspace,
+	"cloud_usage.workspace_id":           "016" + bfkPhase1Workspace,
+	"cloud_scan_checkpoint.workspace_id": "017" + bfkPhase1Workspace,
 }
+
+// bfkPhase1Workspace: why a Phase 1 table's workspace_id is bare.
+const bfkPhase1Workspace = ": Phase 1, SPEC QUESTION: anchored by nothing. The connector key is single-column, " +
+	"so nothing ties the row's workspace to its connector's; the composite connector reference proposed in " +
+	"bfkLegacySingleColumn would"
 
 /* -------------------------------- catalog --------------------------------- */
 
@@ -132,8 +216,12 @@ type bfkQuerier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
 
-// bfkForeignKeys reads every foreign key on the iga_* tables and on
-// bfkPhase2CloudTables, keyed by constraint name.
+// bfkForeignKeys reads every foreign key in scope, keyed by constraint name:
+// every key whose child is an iga_* or cloud_* table, and every key from any
+// other table whose parent is one. The scope is by name, not by form, so a
+// table written entirely in the pre-§2.9 form is in it (the A3 pattern), and
+// so is a reference into the graph from a table outside it. A reference from
+// outside the graph to outside it (Discovery's own keys, say) is not.
 func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 	t.Helper()
 	rows, err := q.Query(`
@@ -150,7 +238,8 @@ func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 		  JOIN pg_namespace n  ON n.oid = r.relnamespace
 		  JOIN pg_class fr     ON fr.oid = c.confrelid
 		 WHERE c.contype = 'f' AND n.nspname = 'public'
-		   AND (r.relname LIKE 'iga\_%' OR r.relname = ANY ($1))`, pq.Array(bfkPhase2CloudTables))
+		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%'
+		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')`)
 	if err != nil {
 		t.Fatalf("read foreign keys: %v", err)
 	}
@@ -343,7 +432,10 @@ func TestB9B20ForeignKeysRejectForeignRows(t *testing.T) {
 						t.Fatalf("%s now rejects another workspace's parent (%v): the §2.9 gap is closed, so "+
 							"move it from bfkLegacySingleColumn to a composite case", fk.name, err)
 					}
-					t.Logf("KNOWN GAP (§2.9, spec question): %s admits workspace B's parent for a row in A. %s",
+					// Admitted, as pinned. SKIP, not PASS: what this subtest
+					// shows is that B9 does NOT hold for this key, and a green
+					// run must not read as if it did.
+					t.Skipf("KNOWN GAP (§2.9, spec question): %s ADMITTED workspace B's parent for a row in A. %s",
 						fk.name, bfkLegacySingleColumn[fk.name])
 				})
 			}
@@ -437,8 +529,8 @@ func bfkQualificationProblems(fks map[string]bfkFK) []string {
 	return out
 }
 
-// bfkBareUUIDColumns lists table.column for every uuid column in scope, other
-// than a table's own id, that no foreign key covers.
+// bfkBareUUIDColumns lists table.column for every uuid column of an iga_* or
+// cloud_* table, other than a table's own id, that no foreign key covers.
 func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 	t.Helper()
 	rows, err := q.Query(`
@@ -448,10 +540,10 @@ func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 		  JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
 		 WHERE n.nspname = 'public' AND r.relkind = 'r'
 		   AND a.atttypid = 'uuid'::regtype AND a.attname <> 'id'
-		   AND (r.relname LIKE 'iga\_%' OR r.relname = ANY ($1))
+		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%')
 		   AND NOT EXISTS (SELECT 1 FROM pg_constraint c
 		                    WHERE c.contype = 'f' AND c.conrelid = r.oid AND a.attnum = ANY (c.conkey))
-		 ORDER BY 1`, pq.Array(bfkPhase2CloudTables))
+		 ORDER BY 1`)
 	if err != nil {
 		t.Fatalf("read uuid columns: %v", err)
 	}
@@ -470,24 +562,18 @@ func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 	return out
 }
 
-// bfkPhase2CloudTablesInCatalog derives bfkPhase2CloudTables from the catalog:
-// every cloud_* table that holds a composite foreign key (a reference in §2.9's
-// form) or a composite UNIQUE led by workspace_id (a target 027 or 035 added
-// for one). Phase 1's tables have neither.
-func bfkPhase2CloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
+// bfkCloudTablesInCatalog lists every cloud_* table, whatever its keys: a
+// table with none at all, or with single-column ones only, is listed too.
+func bfkCloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
 	t.Helper()
 	rows, err := q.Query(`
-		SELECT DISTINCT r.relname::text
-		  FROM pg_constraint c
-		  JOIN pg_class r     ON r.oid = c.conrelid
+		SELECT r.relname::text
+		  FROM pg_class r
 		  JOIN pg_namespace n ON n.oid = r.relnamespace
-		  JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = c.conkey[1]
-		 WHERE n.nspname = 'public' AND r.relname LIKE 'cloud\_%'
-		   AND cardinality(c.conkey) > 1
-		   AND (c.contype = 'f' OR (c.contype = 'u' AND a.attname = 'workspace_id'))
+		 WHERE n.nspname = 'public' AND r.relkind IN ('r', 'p') AND r.relname LIKE 'cloud\_%'
 		 ORDER BY 1`)
 	if err != nil {
-		t.Fatalf("read Phase 2 cloud tables: %v", err)
+		t.Fatalf("read cloud tables: %v", err)
 	}
 	defer rows.Close()
 	var out []string
@@ -499,26 +585,59 @@ func bfkPhase2CloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
 		out = append(out, name)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("read Phase 2 cloud tables: %v", err)
+		t.Fatalf("read cloud tables: %v", err)
 	}
 	return out
 }
 
+// bfkCloudTableProblems: bfkCloudTables is exactly the catalog's cloud_* tables.
 func bfkCloudTableProblems(inCatalog []string) []string {
 	var out []string
 	for _, name := range inCatalog {
-		if !slices.Contains(bfkPhase2CloudTables, name) {
-			out = append(out, fmt.Sprintf("%s holds a composite key but is not in bfkPhase2CloudTables, "+
-				"so none of its foreign keys is tested", name))
+		if _, known := bfkCloudTables[name]; !known {
+			out = append(out, fmt.Sprintf("%s is a cloud_* table bfkCloudTables does not classify: say whether "+
+				"its references are Phase 1's or Phase 2's, and give each of its foreign keys a case", name))
 		}
 	}
-	for _, name := range bfkPhase2CloudTables {
+	for name := range bfkCloudTables {
 		if !slices.Contains(inCatalog, name) {
-			out = append(out, fmt.Sprintf("%s is in bfkPhase2CloudTables but holds no composite key: remove it", name))
+			out = append(out, fmt.Sprintf("%s is in bfkCloudTables but not in the schema: remove it", name))
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// bfkOpenGaps states the exemptions the way evidence has to: grouped by where
+// they sit (the Phase 2 cloud_* tables B9 and B20 cover, Phase 1's cloud_*
+// tables, the iga_* tables) and, across all of them, the single-column
+// references to cloud_identity that B20's "Catches" names. Whether the list is
+// exact is bfkSingleColumnProblems' job.
+func bfkOpenGaps(fks map[string]bfkFK) string {
+	var phase2, phase1, iga, identity []string
+	for name := range bfkLegacySingleColumn {
+		fk := fks[name]
+		switch t, cloud := bfkCloudTables[fk.table]; {
+		case !cloud:
+			iga = append(iga, name)
+		case t.phase2:
+			phase2 = append(phase2, name)
+		default:
+			phase1 = append(phase1, name)
+		}
+		if fk.refTable == "cloud_identity" {
+			identity = append(identity, name)
+		}
+	}
+	list := func(names []string) string {
+		sort.Strings(names)
+		return fmt.Sprintf("(%d) %s", len(names), strings.Join(names, ", "))
+	}
+	return fmt.Sprintf("%d single-column references to workspace-scoped tables ADMIT another workspace's parent "+
+		"(§2.9; spec questions, proposed DDL in bfkLegacySingleColumn). On Phase 2 cloud_* tables %s. "+
+		"On Phase 1 cloud_* tables %s. On iga_* tables %s. Among them, the single-column references to "+
+		"cloud_identity that B20 says it catches %s",
+		len(bfkLegacySingleColumn), list(phase2), list(phase1), list(iga), list(identity))
 }
 
 func bfkBareUUIDProblems(bare []string) []string {
@@ -582,9 +701,17 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			t.Error(p)
 		}
 	})
-	t.Run("every_phase2_cloud_table_is_in_scope", func(t *testing.T) {
-		for _, p := range bfkCloudTableProblems(bfkPhase2CloudTablesInCatalog(t, w.f.db)) {
+	t.Run("every_cloud_table_is_classified", func(t *testing.T) {
+		for _, p := range bfkCloudTableProblems(bfkCloudTablesInCatalog(t, w.f.db)) {
 			t.Error(p)
+		}
+	})
+	// What a green run does NOT show (header: WHAT A GREEN RUN DOES NOT SHOW).
+	// SKIP, not PASS, while any exemption stands, naming every one grouped, so
+	// evidence written from this run cannot claim that §2.9 holds.
+	t.Run("no_open_section_2_9_exemption", func(t *testing.T) {
+		if len(bfkLegacySingleColumn) > 0 {
+			t.Skipf("NOT DEMONSTRATED: %s", bfkOpenGaps(fks))
 		}
 	})
 
@@ -592,9 +719,15 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 	// transaction and require the guard AND the probe to see it. The planted
 	// key replaces cloud_pa_principal_fkey with the single-column form a
 	// careless migration would write. It keeps the name, so only the checks
-	// on shape can notice. Beside it: a bare uuid column, a new composite key
-	// no case covers that pairs the child's workspace_id with the parent's id,
-	// and a new cloud_* table in §2.9's form that bfkPhase2CloudTables lacks.
+	// on shape can notice. Beside it:
+	//   - a bare uuid column, and a new composite key no case covers that pairs
+	//     the child's workspace_id with the parent's id;
+	//   - a new cloud_* table written the Phase 1 way, with single-column
+	//     references only, to cloud_connector, cloud_identity and cloud_policy
+	//     (review of bfk: the guard once derived its cloud scope from composite
+	//     keys, so this table was invisible to every check);
+	//   - a new single-column reference to cloud_policy from a Phase 1 table,
+	//     and one to cloud_identity from a table outside the graph.
 	t.Run("a_planted_single_column_reference_is_caught", func(t *testing.T) {
 		tx, err := w.f.db.Begin()
 		if err != nil {
@@ -611,10 +744,15 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			`ALTER TABLE iga_policy ADD COLUMN bfk_planted_conn_id uuid,
 			   ADD CONSTRAINT bfk_planted_misqualified_fkey FOREIGN KEY (workspace_id, bfk_planted_conn_id)
 			   REFERENCES cloud_connector (id, workspace_id)`,
+			// Column-level REFERENCES, as a careless migration writes them:
+			// PostgreSQL names each key <table>_<column>_fkey.
 			`CREATE TABLE cloud_bfk_planted (
-			   id uuid PRIMARY KEY, workspace_id uuid NOT NULL, connector_id uuid NOT NULL,
-			   CONSTRAINT bfk_planted_connector_fkey FOREIGN KEY (workspace_id, connector_id)
-			     REFERENCES cloud_connector (workspace_id, id))`,
+			   id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+			   connector_id uuid NOT NULL REFERENCES cloud_connector (id),
+			   identity_id uuid NOT NULL REFERENCES cloud_identity (id),
+			   policy_row_id uuid REFERENCES cloud_policy (id))`,
+			`ALTER TABLE cloud_workload ADD COLUMN bfk_planted_policy_id uuid REFERENCES cloud_policy (id)`,
+			`ALTER TABLE discovered_agents ADD COLUMN bfk_planted_identity_id uuid REFERENCES cloud_identity (id)`,
 		} {
 			if _, err := tx.Exec(ddl); err != nil {
 				t.Fatalf("plant: %v", err)
@@ -637,11 +775,41 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 			"does not pair workspace_id with workspace_id") {
 			t.Error("the qualification check did not report bfk_planted_misqualified_fkey pairing workspace_id with id")
 		}
-		if !bfkMentions(bfkBareUUIDProblems(bfkBareUUIDColumns(t, tx)), "iga_policy.bfk_planted_run_id", "references nothing") {
-			t.Error("the bare-uuid check did not report the planted iga_policy.bfk_planted_run_id")
+		bare := bfkBareUUIDProblems(bfkBareUUIDColumns(t, tx))
+		for _, col := range []string{"iga_policy.bfk_planted_run_id", "cloud_bfk_planted.workspace_id"} {
+			if !bfkMentions(bare, col, "references nothing") {
+				t.Errorf("the bare-uuid check did not report the planted %s", col)
+			}
 		}
-		if !bfkMentions(bfkCloudTableProblems(bfkPhase2CloudTablesInCatalog(t, tx)), "cloud_bfk_planted", "not in bfkPhase2CloudTables") {
-			t.Error("the table-scope check did not report the planted cloud_bfk_planted")
+		if !bfkMentions(bfkCloudTableProblems(bfkCloudTablesInCatalog(t, tx)), "cloud_bfk_planted", "does not classify") {
+			t.Error("the table check did not report the planted, unclassified cloud_bfk_planted")
+		}
+		// The A3 pattern outside the tables that were already in §2.9's form.
+		// Every one is a single-column reference no exemption lists and no case
+		// covers; the ones to a collection fact also break B20.
+		for _, p := range []struct {
+			fk  string
+			b20 bool
+		}{
+			{"cloud_bfk_planted_connector_id_fkey", false},
+			{"cloud_bfk_planted_identity_id_fkey", true},
+			{"cloud_bfk_planted_policy_row_id_fkey", true},
+			{"cloud_workload_bfk_planted_policy_id_fkey", true},
+			{"discovered_agents_bfk_planted_identity_id_fkey", true},
+		} {
+			if _, ok := planted[p.fk]; !ok {
+				t.Errorf("bfkForeignKeys does not read the planted %s: it is outside the guard's scope", p.fk)
+				continue
+			}
+			if !bfkMentions(bfkSingleColumnProblems(planted), p.fk, "single-column reference") {
+				t.Errorf("the single-column rule did not report the planted %s", p.fk)
+			}
+			if !bfkMentions(bfkCoverageProblems(planted), p.fk, "has no subtest") {
+				t.Errorf("the coverage check did not report the planted, uncovered %s", p.fk)
+			}
+			if p.b20 && !bfkMentions(bfkQualificationProblems(planted), p.fk, "(B20)") {
+				t.Errorf("the B20 check did not report the planted single-column collection reference %s", p.fk)
+			}
 		}
 		// And the rows cloud_pa_principal_fkey's subtests insert now go in: the
 		// probe those subtests run would fail, which is the point of them.
