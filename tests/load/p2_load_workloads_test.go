@@ -48,13 +48,13 @@ var loadKindSurface = map[string][2]string{
 	models.WorkloadBedrockAgentCoreGW: {"agentcore-gateways", "bedrock-agentcore:GetGateway"},
 }
 
-// workloads generates every account's runtimes: Lambda 58%, ECS 20%, EC2
+// genWorkloads generates every account's runtimes: Lambda 58%, ECS 20%, EC2
 // 15%, Bedrock agents 4%, AgentCore runtimes 2%, gateways 1%. Execution roles
 // are drawn with a Zipf skew, so one default role carries hundreds of
 // workloads. Forty names in the second account repeat the first account's
 // (staging mirrors production), and some workloads change role, arrive late,
 // retire and come back.
-func (g *loadGen) workloads() {
+func (g *loadGen) genWorkloads() {
 	per := g.share(g.shape.Workloads)
 	byService := map[*loadAcct]map[string][]*loadIdent{}
 	for _, a := range g.accts {
@@ -363,9 +363,9 @@ func loadBuild(seed int64, name string, shape loadShape, accounts []loadAcct) *l
 	g.identities()
 	g.trust()
 	pool := g.pool()
-	g.policies(pool)
+	g.genPolicies(pool)
 	assigns := g.assignments()
-	g.workloads()
+	g.genWorkloads()
 	g.identityRows()
 	g.trustAll()
 	g.policyRows()

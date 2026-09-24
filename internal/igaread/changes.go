@@ -733,14 +733,15 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 	// statement_revised: a Sid-keyed statement's revision with a predecessor
 	// whose content differs, while the holder's grant to it was valid.
 	gv, gvArgs := grantValid("sr.valid_from")
+	heldStmts := `(SELECT g.entitlement_id FROM iga_access_edges g
+	                WHERE g.workspace_id = ? AND g.provider = 'aws' AND ` + in + `)`
 	u.add(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, `+h.via("hs.holder")+`,
 	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
 	         FROM `+held+`
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws'
-	         JOIN iga_statement_revision sr ON sr.workspace_id = e.workspace_id AND sr.entitlement_id = e.id
-	         `+changesPrevRevisionSQL+`
+	         JOIN `+changesEditedRevisionsSQL(heldStmts)+` ON sr.entitlement_id = e.id
 	        WHERE `+gv,
-		append(append(append([]any{}, heldArgs...), ws), gvArgs...)...)
+		append(append(append(append(append([]any{}, heldArgs...), ws, ws), heldArgs...)), gvArgs...)...)
 
 	// statement_replaced: a Sid-less statement the holder held a grant to
 	// retired unsupported in a run in which a statement of the same policy
@@ -756,16 +757,28 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 		append(append(append([]any{}, heldArgs...), ws), gvArgs...)...)
 }
 
-// changesPrevRevisionSQL joins a revision (sr) to its immediate predecessor
-// on the same statement and keeps it only when the content differs: the
-// first revision is not a revision event, and a restored statement's reopened
-// revision with unchanged content is a restoration (its lifecycle event says
-// so), not an edit.
-const changesPrevRevisionSQL = `JOIN LATERAL (SELECT p.content_hash FROM iga_statement_revision p
-	                              WHERE p.workspace_id = sr.workspace_id AND p.entitlement_id = sr.entitlement_id
-	                                AND (p.valid_from, p.id) < (sr.valid_from, sr.id)
-	                              ORDER BY p.valid_from DESC, p.id DESC LIMIT 1) prev
-	           ON prev.content_hash <> sr.content_hash`
+// changesEditedRevisionsSQL is the revisions (as sr) of the statements the
+// subquery stmts selects whose immediate predecessor on the same statement,
+// in (valid_from, id) order, has DIFFERENT content (D-27b): the first revision
+// is not a revision event, and a restored statement's reopened revision with
+// unchanged content is a restoration (its lifecycle event says so), not an
+// edit.
+//
+// The predecessor comes from ONE window over those statements' revisions,
+// never a lookup per revision: 036 indexes iga_statement_revision only on its
+// live revision (uq_iga_statement_revision_live, valid_to IS NULL), so a
+// per-row predecessor lookup is a scan of the table per revision -- T6.10
+// measured 2.5 s for the 1 913 revisions of the statements naming "*", and a
+// 504 for its Changes (§5.6: 500 ms). stmts is a parenthesised subquery
+// returning entitlement ids. Binds: ws, then stmts' arguments.
+func changesEditedRevisionsSQL(stmts string) string {
+	return `(SELECT r.id, r.entitlement_id, r.valid_from, r.first_seen_run_id
+	           FROM (SELECT r0.id, r0.entitlement_id, r0.valid_from, r0.first_seen_run_id, r0.content_hash,
+	                        lag(r0.content_hash) OVER (PARTITION BY r0.entitlement_id ORDER BY r0.valid_from, r0.id) AS prev_hash
+	                   FROM iga_statement_revision r0
+	                  WHERE r0.workspace_id = ? AND r0.entitlement_id IN ` + stmts + `) r
+	          WHERE r.prev_hash <> r.content_hash) sr`
+}
 
 // changesBegunInRunSQL: a statement of e's policy was first seen or restored
 // in le's run -- "another began in the same policy in the same run". No bind
@@ -800,9 +813,8 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws'
-	         JOIN iga_statement_revision sr ON sr.workspace_id = e.workspace_id AND sr.entitlement_id = e.id
-	         `+changesPrevRevisionSQL,
-		ws, id, ws)
+	         JOIN `+changesEditedRevisionsSQL(naming)+` ON sr.entitlement_id = e.id`,
+		ws, id, ws, ws, ws, id)
 
 	// Replacements: the ended statement named it ...
 	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,

@@ -251,9 +251,9 @@ func (g *loadGen) actionsFor(text string) []string {
 
 /* --------------------------------- policies -------------------------------- */
 
-// policies generates every policy's first version and history. Holders of
+// genPolicies generates every policy's first version and history. Holders of
 // inline policies are drawn from the identities.
-func (g *loadGen) policies(pool map[*loadAcct][]string) {
+func (g *loadGen) genPolicies(pool map[*loadAcct][]string) {
 	C := g.shape.Cycles
 	global := []string{"*", "arn:aws:s3:::*", "arn:aws:logs:*:*:*", "arn:aws:dynamodb:*:*:table/*"}
 	// AWS-managed: one object across accounts; owner is the first account

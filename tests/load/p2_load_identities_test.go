@@ -317,20 +317,20 @@ func (g *loadGen) trustEdges(role *loadIdent) {
 					write(span, src.endpoint(), src, nil)
 				}
 				if srcEnd > 0 && (end == 0 || srcEnd < end) {
-					ext := g.external(sub.Issuer, sub.Subject, models.ExternalPrincipalAWSPrincipal, a.run(srcEnd))
+					ext := g.externalPrincipal(sub.Issuer, sub.Subject, models.ExternalPrincipalAWSPrincipal, a.run(srcEnd))
 					write(loadSpan{from: srcEnd, to: end, reason: models.EndedNotSeen}, ext.key, nil, ext)
 				}
 				continue
 			}
-			ext := g.external(sub.Issuer, sub.Subject, sub.Kind, a.run(from))
+			ext := g.externalPrincipal(sub.Issuer, sub.Subject, sub.Kind, a.run(from))
 			write(loadSpan{from: from, to: end, reason: models.EndedNotSeen}, ext.key, nil, ext)
 		}
 	}
 }
 
-// external returns (creating once) the external principal for an issuer and
+// externalPrincipal returns (creating once) the external principal for an issuer and
 // subject; one node per workspace however many roles trust it.
-func (g *loadGen) external(issuer, subject, kind string, first *loadRun) *loadExternal {
+func (g *loadGen) externalPrincipal(issuer, subject, kind string, first *loadRun) *loadExternal {
 	key := igagraph.ExternalPrincipalKey(issuer, subject)
 	if e := g.externals[key]; e != nil {
 		if first.at.Before(e.first.at) {
