@@ -633,3 +633,22 @@ The note above about a 15-minute visibility and lock is superseded:
 - **Fail fast:** AuthSec-side errors that do not heal fail after 60s; throttling and timeouts still retry to the last safe moment.
 - **Lock contention never answers**, and **a failed save after a successful Onboard still answers SUCCESS**.
 - **Quick Create connections are audited.** `GET /sessions/:id` returns the launch link and ExternalId only to the session's creator.
+
+### Deferred: region checks off the worker slot
+
+Proposed after the final review: run the per-Region probes in a background pool
+instead of on the callback worker's slot. They already run AFTER SUCCESS is sent
+to CloudFormation, so the stack never waits for them; they only hold a worker
+slot for a few more seconds (about 5–10s per callback in total instead of 1–3s).
+
+Not built for now. Capacity is already sufficient: about 100–150 callbacks per
+minute per replica at the default 16 slots, so 2–3 replicas clear even a
+simultaneous 1000-customer burst in minutes, inside the 540s callback deadline.
+`AUTHSEC_AWS_CFN_CALLBACK_CONCURRENCY` and replicas scale it further without
+code. The async version would add a second session writer, a second pool and
+background work a deploy can lose.
+
+Build it when the queue's ApproximateAgeOfOldestMessage alarm (over 60s) fires in
+production. Keep `Onboard()` before SUCCESS in any version: it both proves the
+role and persists the connector, and answering SUCCESS before persisting would
+leave a completed stack with no connector and nothing to roll back.
