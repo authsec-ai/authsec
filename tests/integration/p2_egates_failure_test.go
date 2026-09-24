@@ -10,6 +10,7 @@ package integration
 
 import (
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -67,15 +68,18 @@ func egatesCoverageSurface(t *testing.T, api *readAPI, a *egatesAcct, surface st
 	return s
 }
 
+// egatesGuessedPermission matches a JSON KEY that would carry a permission to
+// grant -- "permission", "required_permissions", "missing_actions" and the
+// like. Keys, not values: permission_scan is a surface's name and
+// permissions_boundary_present a limitation's code, and neither is a remedy.
+var egatesGuessedPermission = regexp.MustCompile(`"[a-z_]*(permission|missing)[a-z_]*"\s*:`)
+
 // egatesNoGuessedPermission fails when a coverage entry names a permission
 // to grant (§2.14.13, E9 "coverage invents a permission name").
 func egatesNoGuessedPermission(t *testing.T, what string, v any) {
 	t.Helper()
-	raw := strings.ToLower(egatesJSON(v))
-	for _, w := range []string{`"permission`, `"missing`, `"required_permission`, `"grant_permission`} {
-		if strings.Contains(raw, w) {
-			t.Errorf("%s names a guessed permission (%s): %s", what, w, egatesJSON(v))
-		}
+	if k := egatesGuessedPermission.FindString(strings.ToLower(egatesJSON(v))); k != "" {
+		t.Errorf("%s names a guessed permission (%s): %s", what, k, egatesJSON(v))
 	}
 }
 

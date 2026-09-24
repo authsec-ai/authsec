@@ -263,10 +263,12 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 //  1. a scan worker dies mid-collection (it claimed the run and the barrier
 //     and then stopped); a second worker started while the first merely
 //     paused claims nothing; once the lease runs out the next worker reclaims
-//     the run without intervention, and the dead worker's fence refuses a
-//     write it attempts afterwards;
+//     the run without intervention, and the dead worker's fence refuses
+//     every write it attempts afterwards (an inventory upsert and each
+//     reconcile delete);
 //  2. a projector dies mid-projection (its graph transaction never
-//     committed, so it wrote nothing): the job is reclaimed, and when the
+//     committed, so it wrote nothing): a second projector started while it
+//     is merely paused claims nothing; the job is reclaimed, and when the
 //     first projector wakes and runs its pass on the lease it claimed, the
 //     real fencing repositories refuse it inside its graph transaction and it
 //     writes nothing; the job then completes;
@@ -322,15 +324,60 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 	if run.Status != models.CloudScanRunPublished || run.Attempts != 2 {
 		t.Fatalf("reclaimed run = %s after %d attempts, want published on the second", run.Status, run.Attempts)
 	}
-	// The superseded worker's write is refused and lands nothing.
-	identities := l.count(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ?`, l.ws)
+	// The superseded worker wakes and carries on: every write it attempts is
+	// refused by the fence in the same transaction as the write (§2.10A part
+	// 3) and lands nothing -- an inventory write (a role it would record) and
+	// each generation-reconcile delete a scan ends with. The deletes are
+	// aimed at a generation past the reclaimed run's (which keeps its own,
+	// T1.5), so each WOULD remove every row of its table were it accepted.
 	stale := repositories.ScanFence{RunID: dead.ID, Owner: "egates-dead-scan-worker", LeaseVersion: dead.LeaseVersion}
-	if _, _, err := repositories.NewCloudIdentityRepository(l.db).Fenced(stale).
-		ReconcileGeneration(l.ws, a.conn, dead.Generation+1); err == nil {
-		t.Error("a superseded scan worker's reconcile was accepted, want ErrScanFenceLost")
+	inventory := func() map[string]int64 {
+		out := map[string]int64{}
+		for _, table := range []string{"cloud_identity", "cloud_workload", "cloud_permission", "cloud_group_membership"} {
+			out[table] = l.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`, l.ws)
+		}
+		return out
 	}
-	if n := l.count(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ?`, l.ws); n != identities {
-		t.Errorf("a superseded worker's delete landed: identities %d -> %d", identities, n)
+	held := inventory()
+	for table, n := range held {
+		if n == 0 {
+			t.Fatalf("setup: %s is empty after the reclaimed scan; a refused delete from it would prove nothing", table)
+		}
+	}
+	ghost := &models.CloudIdentity{WorkspaceID: l.ws, ConnectorID: a.conn, NativeID: a.roleARN("egates-ghost-role"),
+		Kind: models.CloudIdentityIAMRole, Name: "egates-ghost-role", LastSeenGeneration: dead.Generation}
+	next := dead.Generation + 1
+	for what, write := range map[string]func() error{
+		"identity upsert": func() error {
+			_, _, err := repositories.NewCloudIdentityRepository(l.db).Fenced(stale).UpsertIdentity(ghost)
+			return err
+		},
+		"identity reconcile": func() error {
+			_, _, err := repositories.NewCloudIdentityRepository(l.db).Fenced(stale).ReconcileGeneration(l.ws, a.conn, next)
+			return err
+		},
+		"workload reconcile": func() error {
+			_, _, err := repositories.NewCloudWorkloadRepository(l.db).Fenced(stale).ReconcileGeneration(l.ws, a.conn, next)
+			return err
+		},
+		"permission reconcile": func() error {
+			_, _, _, err := repositories.NewCloudPermissionRepository(l.db).Fenced(stale).ReconcileGeneration(l.ws, a.conn, next)
+			return err
+		},
+		"membership reconcile": func() error {
+			_, err := repositories.NewCloudPolicyRepository(l.db).Fenced(stale).ReconcileMemberships(l.ws, a.conn, next)
+			return err
+		},
+	} {
+		if err := write(); !errors.Is(err, repositories.ErrScanFenceLost) {
+			t.Errorf("a superseded scan worker's %s = %v, want %v", what, err, repositories.ErrScanFenceLost)
+		}
+	}
+	if now := inventory(); egatesJSON(now) != egatesJSON(held) {
+		t.Errorf("a superseded worker's writes landed: inventory %v -> %v", held, now)
+	}
+	if n := l.count(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`, l.ws, ghost.NativeID); n != 0 {
+		t.Errorf("a superseded worker's identity landed (%d rows)", n)
 	}
 	if st := digs(s2PipelineAccount(t, s2Pipeline(t, api), a.p2Account), "state"); st != "projecting" {
 		t.Errorf("after the reclaimed run published: %q, want projecting", st)
@@ -347,6 +394,17 @@ func TestP2EgatesE13InterruptionLeaseLossReplay(t *testing.T) {
 		t.Errorf("pipeline while the dead projector holds the job = %s", egatesJSON(acc))
 	}
 	egatesNotPublished(t, api, "/workloads")
+	// A second projector started while the first is merely paused (its job
+	// lease is live) finds nothing to claim and writes nothing.
+	pubs := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws)
+	second := services.NewProjectionService(l.db, jobs, repositories.NewIGAPipelineLeaseRepository(l.db),
+		repositories.NewIGAGraphRepository(), "egates-second-projector", time.Minute)
+	if worked, err := second.RunOnce(context.Background()); err != nil || worked {
+		t.Errorf("a second projector while the first holds a live lease: worked=%v err=%v, want nothing claimed", worked, err)
+	}
+	if n := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws); n != pubs {
+		t.Errorf("a second projector published while the first held the job: %d -> %d", pubs, n)
+	}
 	// Its lease runs out and a second projector reclaims the job -- a new
 	// lease version on the same job, so the barrier (held by the JOB, §2.10A)
 	// still admits it. Before that one commits, the first wakes and runs its

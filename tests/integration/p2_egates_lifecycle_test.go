@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -316,7 +317,8 @@ func TestP2EgatesE7PolicyEditsAndReattach(t *testing.T) {
 	asg := l.assignments(egatesTicketRead)
 	if len(asg) != 2 || asg[0].ID != e6Assignment[0].ID || asg[0].State != models.RelEnded || asg[0].ValidTo == nil ||
 		!asg[0].ValidTo.Equal(e6End) || asg[1].ID == asg[0].ID || asg[1].State != models.RelCurrent || asg[1].ValidTo != nil {
-		t.Errorf("(c) TicketRead assignments = %+v, want the E6 period ended at %s unchanged and a new current row", asg, e6End)
+		// Fatal: every (c) check below reads the two periods by index.
+		t.Fatalf("(c) TicketRead assignments = %+v, want the E6 period ended at %s unchanged and a new current row", asg, e6End)
 	}
 	tr := grantsOf(l.grants(), egatesTicketRead)
 	if len(tr) != 2 || tr[0].State != models.RelEnded || tr[1].State != models.RelCurrent || tr[1].Assignment != asg[1].ID ||
@@ -331,9 +333,13 @@ func TestP2EgatesE7PolicyEditsAndReattach(t *testing.T) {
 		t.Errorf("(c) policy_attached = %s, want the new assignment %s (run %s) newest, the first period's after it",
 			changesDump(att), asg[1].ID, runC.ID)
 	}
+	// An event's at is rendered with all six fractional digits (D-27a,
+	// igaread.ChangeTime), unlike the envelope's published_at, which drops
+	// trailing zeros: compared as the route renders it, or one pass in ten
+	// (a microsecond ending in 0) would fail on formatting alone.
 	det := changesPick(events, "policy_detached", "policy", refOf("policy", changesPolicy(t, l, egatesTicketRead)))
-	if len(det) != 1 || digs(det[0], "subject") != refOf("assignment", asg[0].ID) || digs(det[0], "at") != egatesMicro(e6End) {
-		t.Fatalf("(c) the E6 detach = %s, want one, of the first period, at %s", changesDump(det), egatesMicro(e6End))
+	if len(det) != 1 || digs(det[0], "subject") != refOf("assignment", asg[0].ID) || digs(det[0], "at") != igaread.ChangeTime(e6End) {
+		t.Fatalf("(c) the E6 detach = %s, want one, of the first period, at %s", changesDump(det), igaread.ChangeTime(e6End))
 	}
 	// What REMAINS is read at the current revision (D-28): the holder's
 	// NON-ENDED grants on the detached period's target -- the new ToolboxRead
