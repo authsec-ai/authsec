@@ -22,8 +22,8 @@ package igagraph_test
 //	                     workspace A under integration A2: 23503 from it
 //	absent_workspace     (the workspaces anchor) a workspace that does not exist
 //	absent_parent,       (bfkLegacy) what a pre-§2.9 single-column key does
-//	foreign_workspace_   enforce (PASS), and the cross-workspace row it admits:
-//	admitted             a known gap (spec question), reported as SKIP so it
+//	known_gap_foreign_   enforce (PASS), and the cross-workspace row it admits:
+//	workspace_admitted   a known gap (spec question), reported as SKIP so it
 //	                     cannot read as a pass. It FAILS once the gap closes.
 //
 // WHY THE NAME, NOT JUST THE CODE. Some rows fail two constraints at once by
@@ -54,14 +54,16 @@ package igagraph_test
 //
 // WHAT A GREEN RUN DOES NOT SHOW. At 036, bfkLegacySingleColumn lists the
 // single-column references §2.9 forbids that no migration converted. They are
-// spec questions; the migrations are verbatim from the spec and not this
-// test's to change. B9 does NOT hold for them: each one's
-// foreign_workspace_admitted subtest shows another workspace's parent going in
-// and reports SKIP, and the guard's no_open_section_2_9_exemption subtest SKIPs
-// with the whole list, grouped. So "B9 and B20 pass" means that every key NOT
-// in that list rejects a foreign row, and that the list is exact. It does not
-// mean §2.9 holds, and it does not mean every single-column reference to
-// cloud_identity (B20's "Catches") is caught: several are in the list.
+// spec questions (P2-DECISIONS D-bfk, with the composite DDL proposed for
+// each); the migrations are verbatim from the spec and not this test's to
+// change. B9 does NOT hold for them: each one's
+// known_gap_foreign_workspace_admitted subtest shows another workspace's
+// parent going in and reports SKIP, and the guard's
+// known_gap_open_section_2_9_exemptions subtest SKIPs with the whole list,
+// grouped. So "B9 and B20 pass" means that every key NOT in that list rejects
+// a foreign row, and that the list is exact. It does not mean §2.9 holds, and
+// it does not mean every single-column reference to cloud_identity (B20's
+// "Catches") is caught: six are in the list.
 //
 // Home: tests/igagraph, which rebuilds public from migrations/master on every
 // run (setupSchema). Nothing here edits a migration.
@@ -113,36 +115,49 @@ var bfkCloudTables = map[string]bfkCloudTable{
 	"cloud_scan_checkpoint":   {false, "017"},
 }
 
-// Reasons shared by the Phase 1 exemptions below.
+// Reasons shared by the exemptions below. Each proposal keeps the key's
+// current ON DELETE action; a SET NULL key nulls only its own column
+// (PostgreSQL 15's SET NULL (column)), never workspace_id or connector_id.
+// The same proposals are recorded in P2-DECISIONS D-bfk.
 const (
-	bfkPhase1Connector = ": Phase 1, never converted. Proposed: (workspace_id, connector_id) " +
-		"REFERENCES cloud_connector (workspace_id, id), against 027's cloud_connector_workspace_id_key"
-	bfkPhase1Identity = ": Phase 1, never converted; a single-column reference to cloud_identity (B20's " +
+	bfkConnectorProposal = ". Proposed: (workspace_id, connector_id) REFERENCES cloud_connector " +
+		"(workspace_id, id) ON DELETE CASCADE, against 027's cloud_connector_workspace_id_key"
+	bfkPhase1Connector = ": Phase 1, never converted" + bfkConnectorProposal
+	bfkPhase1Identity  = ": Phase 1, never converted; a single-column reference to cloud_identity (B20's " +
 		"Catches). Proposed: (workspace_id, connector_id, identity_id) REFERENCES cloud_identity " +
-		"(workspace_id, connector_id, id), against 035's cloud_identity_scope_key"
+		"(workspace_id, connector_id, id) ON DELETE CASCADE, against 035's cloud_identity_scope_key"
+	// cloud_permission, cloud_resource and cloud_workload have no workspace-led
+	// UNIQUE for a composite key to name.
+	bfkNoScopeKey = ". Proposed: first UNIQUE (workspace_id, connector_id, id) on the parent " +
+		"(cloud_<parent>_scope_key, as 035 gave cloud_identity and cloud_policy), then "
+	bfkObservationSubject = "024: subject key re-declared single-column (ON DELETE SET NULL); 027 converted " +
+		"only run and connector"
 )
 
 // bfkLegacySingleColumn: the single-column references to workspace-scoped
 // tables that §2.9 forbids and 027-036 did not convert. They are spec questions
-// (reported with this test), not accepted design. Each is covered by a
-// bfkLegacy case that demonstrates the gap (SKIP) rather than asserting it.
+// (P2-DECISIONS D-bfk), not accepted design. Each is covered by a bfkLegacy
+// case that demonstrates the gap (SKIP) rather than asserting it, and the
+// guard states the whole list (known_gap_open_section_2_9_exemptions).
 var bfkLegacySingleColumn = map[string]string{
 	"iga_observations_delivery_fkey": "004: iga_webhook_deliveries has no UNIQUE (workspace_id, id) and a " +
-		"nullable workspace_id (a delivery is stored before it is bound)",
+		"nullable workspace_id (a delivery is stored before it is bound), so no composite key can name an " +
+		"unbound one. Needs a ruling on whether an observation may cite an unbound delivery",
 	"cloud_identity_connector_id_fkey": "011: never converted. 035 added cloud_identity_scope_key " +
 		"(workspace_id, connector_id, id) as a target, but the row's own (workspace_id, connector_id) pair " +
-		"is anchored only by this single-column key. Proposed: (workspace_id, connector_id) REFERENCES " +
-		"cloud_connector (workspace_id, id), against 027's cloud_connector_workspace_id_key",
-	"cloud_observation_identity_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); 027 " +
-		"converted only run and connector. A single-column reference to cloud_identity on a table B20 covers. " +
-		"Proposed: (workspace_id, connector_id, identity_id) REFERENCES cloud_identity (workspace_id, " +
-		"connector_id, id) ON DELETE SET NULL (identity_id)",
-	"cloud_observation_permission_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
-		"027 converted only run and connector. cloud_permission has no UNIQUE (workspace_id, id) to reference",
-	"cloud_observation_resource_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
-		"027 converted only run and connector. cloud_resource has no UNIQUE (workspace_id, id) to reference",
-	"cloud_observation_workload_id_fkey": "024: subject key re-declared single-column (ON DELETE SET NULL); " +
-		"027 converted only run and connector. cloud_workload has no UNIQUE (workspace_id, id) to reference",
+		"is anchored only by this single-column key" + bfkConnectorProposal,
+	"cloud_observation_identity_id_fkey": bfkObservationSubject + ". A single-column reference to " +
+		"cloud_identity on a table B20 covers. Proposed: (workspace_id, connector_id, identity_id) REFERENCES " +
+		"cloud_identity (workspace_id, connector_id, id) ON DELETE SET NULL (identity_id)",
+	"cloud_observation_permission_id_fkey": bfkObservationSubject + bfkNoScopeKey + "(workspace_id, " +
+		"connector_id, permission_id) REFERENCES cloud_permission (workspace_id, connector_id, id) " +
+		"ON DELETE SET NULL (permission_id)",
+	"cloud_observation_resource_id_fkey": bfkObservationSubject + bfkNoScopeKey + "(workspace_id, " +
+		"connector_id, resource_id) REFERENCES cloud_resource (workspace_id, connector_id, id) " +
+		"ON DELETE SET NULL (resource_id)",
+	"cloud_observation_workload_id_fkey": bfkObservationSubject + bfkNoScopeKey + "(workspace_id, " +
+		"connector_id, workload_id) REFERENCES cloud_workload (workspace_id, connector_id, id) " +
+		"ON DELETE SET NULL (workload_id)",
 
 	// Phase 1's cloud_* tables (bfkCloudTables): 027-036 converted none of them.
 	"cloud_secret_connector_id_fkey":          "011" + bfkPhase1Connector,
@@ -153,12 +168,16 @@ var bfkLegacySingleColumn = map[string]string{
 	"cloud_permission_identity_id_fkey":       "013" + bfkPhase1Identity,
 	"cloud_resource_connector_id_fkey":        "013" + bfkPhase1Connector,
 	"cloud_workload_connector_id_fkey":        "015" + bfkPhase1Connector,
-	"cloud_workload_identity_id_fkey":         "015" + bfkPhase1Identity,
 	"cloud_usage_connector_id_fkey":           "016" + bfkPhase1Connector,
 	"cloud_usage_identity_id_fkey":            "016" + bfkPhase1Identity,
 	"cloud_scan_checkpoint_connector_id_fkey": "017" + bfkPhase1Connector,
-	"cloud_permission_resource_id_fkey": "013: Phase 1, never converted. cloud_resource has no UNIQUE " +
-		"(workspace_id, id) to reference",
+	// 015 declared it ON DELETE SET NULL: a workload outlives its role.
+	"cloud_workload_identity_id_fkey": "015: Phase 1, never converted; a single-column reference to " +
+		"cloud_identity (B20's Catches). Proposed: (workspace_id, connector_id, identity_id) REFERENCES " +
+		"cloud_identity (workspace_id, connector_id, id) ON DELETE SET NULL (identity_id), against 035's " +
+		"cloud_identity_scope_key",
+	"cloud_permission_resource_id_fkey": "013: Phase 1, never converted" + bfkNoScopeKey + "(workspace_id, " +
+		"connector_id, resource_id) REFERENCES cloud_resource (workspace_id, connector_id, id) ON DELETE CASCADE",
 }
 
 // bfkNoForeignKey: the uuid columns in scope that reference nothing at all.
@@ -427,10 +446,24 @@ func TestB9B20ForeignKeysRejectForeignRows(t *testing.T) {
 				t.Run("absent_parent", func(t *testing.T) {
 					w.mustReject(t, fks, c, fk, c.build(w, w.absent))
 				})
-				t.Run("foreign_workspace_admitted", func(t *testing.T) {
-					if err := w.attempt(t, c.build(w, w.B), nil); err != nil {
-						t.Fatalf("%s now rejects another workspace's parent (%v): the §2.9 gap is closed, so "+
-							"move it from bfkLegacySingleColumn to a composite case", fk.name, err)
+				t.Run("known_gap_foreign_workspace_admitted", func(t *testing.T) {
+					// The same lifting as mustReject, so the answer is this key's
+					// alone. Without it, converting ANOTHER key on the same
+					// column (cloud_usage's identity key, which carries
+					// connector_id once composite) would refuse the row and read
+					// as this key's gap closing.
+					row := c.build(w, w.B)
+					lift := bfkCoViolated(fks, fk, row)
+					if len(lift) > 0 {
+						t.Logf("lifted, co-violated by construction: %s", strings.Join(lift, ", "))
+					}
+					if err := w.attempt(t, row, lift); err != nil {
+						var pe *pq.Error
+						if errors.As(err, &pe) && pe.Constraint == fk.name {
+							t.Fatalf("%s now rejects another workspace's parent (%v): the §2.9 gap is closed, so "+
+								"move it from bfkLegacySingleColumn to a composite case", fk.name, err)
+						}
+						t.Fatalf("harness: workspace B's parent for %s was refused by something else: %v", fk.name, err)
 					}
 					// Admitted, as pinned. SKIP, not PASS: what this subtest
 					// shows is that B9 does NOT hold for this key, and a green
@@ -608,36 +641,89 @@ func bfkCloudTableProblems(inCatalog []string) []string {
 	return out
 }
 
-// bfkOpenGaps states the exemptions the way evidence has to: grouped by where
-// they sit (the Phase 2 cloud_* tables B9 and B20 cover, Phase 1's cloud_*
-// tables, the iga_* tables) and, across all of them, the single-column
-// references to cloud_identity that B20's "Catches" names. Whether the list is
-// exact is bfkSingleColumnProblems' job.
-func bfkOpenGaps(fks map[string]bfkFK) string {
-	var phase2, phase1, iga, identity []string
+// bfkGapGroups are the open exemptions grouped the way evidence has to state
+// them: by where they sit (the Phase 2 cloud_* tables B9 and B20 cover,
+// Phase 1's cloud_* tables, the iga_* tables, any other table) and, across all
+// of them, the single-column references to cloud_identity that B20's
+// "Catches" names. Each list is sorted.
+type bfkGapGroups struct {
+	phase2, phase1, iga, other, identity []string
+}
+
+// bfkOpenGaps groups bfkLegacySingleColumn. Whether that list is exact is
+// bfkSingleColumnProblems' job.
+func bfkOpenGaps(fks map[string]bfkFK) bfkGapGroups {
+	var g bfkGapGroups
 	for name := range bfkLegacySingleColumn {
 		fk := fks[name]
-		switch t, cloud := bfkCloudTables[fk.table]; {
-		case !cloud:
-			iga = append(iga, name)
-		case t.phase2:
-			phase2 = append(phase2, name)
+		class, cloud := bfkCloudTables[fk.table]
+		switch {
+		case cloud && class.phase2:
+			g.phase2 = append(g.phase2, name)
+		case cloud:
+			g.phase1 = append(g.phase1, name)
+		case strings.HasPrefix(fk.table, "iga_"):
+			g.iga = append(g.iga, name)
 		default:
-			phase1 = append(phase1, name)
+			g.other = append(g.other, name)
 		}
 		if fk.refTable == "cloud_identity" {
-			identity = append(identity, name)
+			g.identity = append(g.identity, name)
 		}
 	}
-	list := func(names []string) string {
+	for _, names := range [][]string{g.phase2, g.phase1, g.iga, g.other, g.identity} {
 		sort.Strings(names)
-		return fmt.Sprintf("(%d) %s", len(names), strings.Join(names, ", "))
 	}
+	return g
+}
+
+// located is every exemption, each in the one group for where it sits.
+func (g bfkGapGroups) located() [][]string { return [][]string{g.phase2, g.phase1, g.iga, g.other} }
+
+func bfkGapList(names []string) string {
+	if len(names) == 0 {
+		return "(0) none"
+	}
+	return fmt.Sprintf("(%d) %s", len(names), strings.Join(names, ", "))
+}
+
+func (g bfkGapGroups) String() string {
 	return fmt.Sprintf("%d single-column references to workspace-scoped tables ADMIT another workspace's parent "+
-		"(§2.9; spec questions, proposed DDL in bfkLegacySingleColumn). On Phase 2 cloud_* tables %s. "+
-		"On Phase 1 cloud_* tables %s. On iga_* tables %s. Among them, the single-column references to "+
-		"cloud_identity that B20 says it catches %s",
-		len(bfkLegacySingleColumn), list(phase2), list(phase1), list(iga), list(identity))
+		"(§2.9; spec questions, P2-DECISIONS D-bfk, proposed DDL in bfkLegacySingleColumn). "+
+		"On Phase 2 cloud_* tables %s. On Phase 1 cloud_* tables %s. On iga_* tables %s. On other tables %s. "+
+		"Among them, the single-column references to cloud_identity that B20 says it catches %s",
+		len(bfkLegacySingleColumn), bfkGapList(g.phase2), bfkGapList(g.phase1), bfkGapList(g.iga),
+		bfkGapList(g.other), bfkGapList(g.identity))
+}
+
+// bfkGapStatementProblems: the statement names every exemption exactly once
+// by location, and every exempt reference to cloud_identity in B20's group, so
+// evidence quoted from a run cannot silently drop one.
+func bfkGapStatementProblems(fks map[string]bfkFK, g bfkGapGroups) []string {
+	var out []string
+	stated := g.String()
+	placed := map[string]int{}
+	for _, names := range g.located() {
+		if !strings.Contains(stated, bfkGapList(names)) {
+			out = append(out, fmt.Sprintf("the known-gap statement omits the group %s", bfkGapList(names)))
+		}
+		for _, name := range names {
+			placed[name]++
+		}
+	}
+	if !strings.Contains(stated, bfkGapList(g.identity)) {
+		out = append(out, fmt.Sprintf("the known-gap statement omits B20's group %s", bfkGapList(g.identity)))
+	}
+	for name := range bfkLegacySingleColumn {
+		if placed[name] != 1 {
+			out = append(out, fmt.Sprintf("the known-gap statement places %s %d times, not once", name, placed[name]))
+		}
+		if fks[name].refTable == "cloud_identity" && !slices.Contains(g.identity, name) {
+			out = append(out, fmt.Sprintf("%s references cloud_identity but is missing from B20's group", name))
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func bfkBareUUIDProblems(bare []string) []string {
@@ -708,11 +794,17 @@ func TestB9ForeignKeyCatalogGuard(t *testing.T) {
 	})
 	// What a green run does NOT show (header: WHAT A GREEN RUN DOES NOT SHOW).
 	// SKIP, not PASS, while any exemption stands, naming every one grouped, so
-	// evidence written from this run cannot claim that §2.9 holds.
-	t.Run("no_open_section_2_9_exemption", func(t *testing.T) {
-		if len(bfkLegacySingleColumn) > 0 {
-			t.Skipf("NOT DEMONSTRATED: %s", bfkOpenGaps(fks))
+	// evidence written from this run cannot claim that §2.9 holds. A statement
+	// that dropped one would FAIL here instead.
+	t.Run("known_gap_open_section_2_9_exemptions", func(t *testing.T) {
+		if len(bfkLegacySingleColumn) == 0 {
+			return // §2.9 holds for every key in scope: nothing to state
 		}
+		gaps := bfkOpenGaps(fks)
+		for _, p := range bfkGapStatementProblems(fks, gaps) {
+			t.Error(p)
+		}
+		t.Skipf("NOT DEMONSTRATED: %s", gaps)
 	})
 
 	// Non-vacuity, rerun on every run: plant the A3 pattern in a rolled-back
