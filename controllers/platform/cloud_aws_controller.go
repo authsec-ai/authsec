@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -33,6 +34,13 @@ import (
 // Bedrock, activity and classification all resolve against.
 type CloudAWSController struct {
 	db *gorm.DB
+
+	// The Quick Create service is built once: its settings come from the
+	// environment and do not change at runtime, and building it per request
+	// would throw away the template check's cache on every launch.
+	qcOnce sync.Once
+	qc     *services.AWSQuickCreateService
+	qcErr  error
 }
 
 // NewCloudAWSController constructs the controller.
@@ -136,12 +144,16 @@ func (ctl *CloudAWSController) GetOnboardingPackage(c *gin.Context) {
 // or reading a session never assumes a role, so no Vault client is needed
 // here; the callback worker, which does connect accounts, builds its own.
 func (ctl *CloudAWSController) quickCreate() (*services.AWSQuickCreateService, error) {
-	cfg, err := services.LoadAWSCallbackConfig()
-	if err != nil {
-		return nil, err
-	}
-	return services.NewAWSQuickCreateService(nil, config.GetRedisClient(), cfg,
-		os.Getenv(authsecPrincipalEnv)), nil
+	ctl.qcOnce.Do(func() {
+		cfg, err := services.LoadAWSCallbackConfig()
+		if err != nil {
+			ctl.qcErr = err
+			return
+		}
+		ctl.qc = services.NewAWSQuickCreateService(nil, config.GetRedisClient(), cfg,
+			os.Getenv(authsecPrincipalEnv))
+	})
+	return ctl.qc, ctl.qcErr
 }
 
 // automaticBlock tells the console whether to offer "Launch in AWS", and with
@@ -221,7 +233,7 @@ func (ctl *CloudAWSController) StartOnboardingSession(c *gin.Context) {
 
 // GetOnboardingSession handles GET /authsec/discovery/aws/onboarding/sessions/:id.
 func (ctl *CloudAWSController) GetOnboardingSession(c *gin.Context) {
-	workspaceID, _, err := ctl.workspaceAndActor(c)
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -242,8 +254,16 @@ func (ctl *CloudAWSController) GetOnboardingSession(c *gin.Context) {
 		c.JSON(status, body)
 		return
 	}
+	view := sess.View()
+	// The launch link and its ExternalId let whoever opens them connect an AWS
+	// account to this workspace — an admin action. This route is readable with
+	// discovery:read, so only the admin who started the session gets them back;
+	// anyone else sees the status and the result.
+	if actor != sess.CreatedBy {
+		view.QuickCreateURL, view.ExternalID = "", ""
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"data": sess.View(),
+		"data": view,
 		"meta": gin.H{"as_of": time.Now().UTC(), "terminal": sess.Status == services.AWSOnbConnected ||
 			sess.Status == services.AWSOnbFailed},
 	})

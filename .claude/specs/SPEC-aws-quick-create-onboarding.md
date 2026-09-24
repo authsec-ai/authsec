@@ -621,3 +621,15 @@ deliberate:
   ("refusing to onboard"), because Onboard's body is deliberately unchanged.
 - The SNS topic policy, the infrastructure, the daily canary and the metrics are not
   code in this repo; see the runbook in `docs/flows/aws-cloud-discovery-onboarding.md`.
+
+### Review fixes (commit `9a125f5` and the controller commit after it)
+
+The note above about a 15-minute visibility and lock is superseded:
+
+- **Visibility is 2 minutes, extended every minute while a message is handled; the lock is 3 minutes with a keep-alive and an owner token.** A crashed worker frees its message and lock within minutes, inside the stack's ServiceTimeout.
+- **DLQ after maxReceiveCount 25 (recommended).** The worker reads the real value and answers FAILED on the last delivery.
+- **No batch barrier:** up to 16 callbacks per replica run independently.
+- **Answer reserve:** no Onboard attempt runs within 40s of the deadline.
+- **Fail fast:** AuthSec-side errors that do not heal fail after 60s; throttling and timeouts still retry to the last safe moment.
+- **Lock contention never answers**, and **a failed save after a successful Onboard still answers SUCCESS**.
+- **Quick Create connections are audited.** `GET /sessions/:id` returns the launch link and ExternalId only to the session's creator.

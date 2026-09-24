@@ -271,7 +271,12 @@ shows the manual flow.
 - One central SQS queue, subscribed to every topic (create each subscription
   in the topic's region), raw message delivery **off**, queue policy
   `Principal {"Service":"sns.amazonaws.com"}` with `aws:SourceArn` = the topics.
-  Redrive to a DLQ after 5 receives.
+  Redrive to a DLQ with **maxReceiveCount 25**. The worker reads this at
+  startup and answers FAILED on the last delivery, so a stack never times out
+  in silence; a low value (under 10) sends transient failures to the DLQ within
+  minutes, and the worker logs an ALERT about it. The queue's default visibility
+  does not matter: the worker receives with 2 minutes and extends it every
+  minute while a message is being handled.
 - The template published byte-for-byte, publicly readable, at a versioned,
   immutable key. Publish before the release that bumps `TemplateVersion`;
   `POST /onboarding/sessions` refuses to hand out a link whose template does
