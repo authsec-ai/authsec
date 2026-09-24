@@ -71,7 +71,13 @@ const listPageLimit int32 = 1000
 // rather than spin.
 const maxPages = 200
 
-var errTooManyPages = errors.New("pagination did not terminate")
+// ErrTooManyPages means a paginated read stopped at its page cap. The rows
+// read so far are real; the set is not known to be whole. That is a partial
+// read, not a refusal — callers record it as such (see services.surfaceResult),
+// never as "denied".
+var ErrTooManyPages = errors.New("pagination did not terminate")
+
+var errTooManyPages = ErrTooManyPages
 
 /* ------------------------------ normalised types --------------------------- */
 
