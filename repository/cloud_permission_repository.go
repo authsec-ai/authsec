@@ -175,10 +175,33 @@ func (r *cloudPermissionRepository) UpsertResource(res *models.CloudResource) (*
 					// bucket's ARN never changes, but the plan may later type a
 					// service where it can) should not keep showing a stale label.
 					"name": res.Name,
+					// The three ARN-derived columns ARE refreshed. 021 added them with
+					// NOT NULL defaults and a comment saying the next scan would fill
+					// them in; it did not, because only the Create path wrote them and
+					// every pre-021 row takes this branch forever. `is_external=false`
+					// is not "unknown" -- it is a positive claim of locality about what
+					// may be a cross-account ARN, and idx_cloud_resource_external is
+					// built to query exactly that column.
+					//
+					// Safe to refresh: all three are functions of the ARN, which is
+					// native_id, i.e. the conflict key -- so a repeat scan derives the
+					// same values. They move together because 021's CHECKs couple them
+					// to each other and to `kind` (already refreshed above):
+					// (NOT is_external OR resource_account <> '') and
+					// (object_key = '' OR kind = 's3_object'). Updating a subset can
+					// violate one of those and fail the upsert.
+					"resource_account": res.ResourceAccount,
+					"is_external":      res.IsExternal,
+					"object_key":       res.ObjectKey,
 					// sensitivity is NOT refreshed here deliberately -- see
 					// UpsertPermission's identical note. A later ticket may raise it
 					// from tags or activity, and this scan must not stamp it back
 					// down to the rule-based default on every repeat run.
+					//
+					// sensitivity_source and sensitivity_reason stay out for the same
+					// reason: they explain `sensitivity`, so refreshing them while the
+					// verdict stays pinned would leave a row whose stated reason
+					// contradicts its own value.
 					"last_seen_generation": res.LastSeenGeneration,
 					"last_seen_at":         now,
 					"row_updated_at":       now,

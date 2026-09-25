@@ -178,7 +178,6 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAt
 			        OR excluded.last_used_at > cloud_identity.last_used_at
 			      THEN excluded.last_used_at ELSE cloud_identity.last_used_at END`)
 	}
-
 	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
 		return tx.Clauses(
 			clause.OnConflict{
@@ -209,12 +208,20 @@ func (r *cloudIdentityRepository) UpsertSecret(s *models.CloudSecret) (*models.C
 	now := time.Now()
 
 	assignments := map[string]interface{}{
-		"connector_id":         s.ConnectorID,
-		"identity_id":          s.IdentityID,
-		"kind":                 s.Kind,
-		"created_at":           s.ProviderCreatedAt,
-		"expires_at":           s.ExpiresAt,
-		"status":               s.Status,
+		"connector_id": s.ConnectorID,
+		"identity_id":  s.IdentityID,
+		"kind":         s.Kind,
+		"created_at":   s.ProviderCreatedAt,
+		"expires_at":   s.ExpiresAt,
+		"status":       s.Status,
+		// Unconditional, unlike UpsertIdentity's attrs, and safe only because no
+		// caller writes a secret's attrs today: upsertAccessKey builds the row
+		// from ListAccessKeys alone and never calls SetAWSAttrs, so this blob is
+		// always "{}" and there is nothing an overwrite could destroy.
+		//
+		// If a collector ever populates it -- a key's rotation date from the
+		// credential report is the obvious candidate -- it needs the same
+		// keep-what-this-read-did-not-return merge UpsertIdentity applies (D-48).
 		"attrs":                s.Attrs,
 		"last_seen_generation": s.LastSeenGeneration,
 		"last_seen_at":         now,

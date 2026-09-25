@@ -75,7 +75,22 @@ func (r *cloudObservationRepository) ListObservations(
 		return nil, 0, err
 	}
 	var out []models.CloudObservation
-	if err := q.Order("observed_at DESC").Limit(clampLimit(f.Limit)).Offset(f.Offset).
+	// Ends in `id`, per the rule stated on ListIdentities: offset paging is only
+	// coherent over a TOTAL order, and observed_at alone is not one.
+	//
+	// The ties are real, not theoretical. Most Record calls pass their own
+	// time.Now(), which rarely collides -- but CloudTrail events are stamped
+	// with e.EventTime, the event's own timestamp, which AWS reports to the
+	// second. A busy account produces many events per second, and CloudTrail is
+	// both the highest-volume source here and the one the Events tab pages
+	// through. Without a tiebreaker, page two can repeat a row page one already
+	// showed and omit one it never did, and the console's "newest observation
+	// per key" dedupe relies on this order being stable.
+	//
+	// `id DESC` rather than ASC to match the DESC direction of the four
+	// (workspace_id, <subject>, observed_at DESC) indexes, so the requested
+	// order stays on the same physical direction those indexes already provide.
+	if err := q.Order("observed_at DESC, id DESC").Limit(clampLimit(f.Limit)).Offset(f.Offset).
 		Find(&out).Error; err != nil {
 		return nil, 0, err
 	}

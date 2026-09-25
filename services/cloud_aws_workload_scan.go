@@ -960,7 +960,6 @@ func (s *AWSWorkloadScanner) scanActivity(
 	if err != nil {
 		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Error: err.Error()}
 	}
-
 	reads := awsdiscovery.NewItemFailures("identities' activity reports could not be read", false)
 	var writeErr error
 	for _, identity := range identities {
