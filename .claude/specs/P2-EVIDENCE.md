@@ -276,3 +276,23 @@ projection. Correct, but relevant to T6.10's load target.
    acceptable, or should the checkpoint be cut differently?
 3. §2.5: should credential revocation get a partition (`iam_access_keys`), or
    is provider-reported status enough for this milestone?
+
+---
+
+# P2 evidence — checkpoint M1 (S2–S6)
+
+The full M1 report is [`P2-EVIDENCE-M1.md`](P2-EVIDENCE-M1.md): what each work item built and which tests prove it, the B1–B24 and E1–E16 traceability, every mutation check recorded, the deviations from the spec, what the spec gets wrong, the open questions, and the decisions index. In brief:
+
+| | |
+|---|---|
+| **Code** | `graph` @ **`e63dfa7`**: the merged code is `9248549`, and `e63dfa7` is one test-only commit after it. 17 work items on `m1/<key>` branches, each implemented, adversarially reviewed and fixed before its merge |
+| **Scope** | The S2–S6 backend and the §7 proofs: B1–B24, and the backend halves of E1–E16. Not in M1: the S7 console (`Authsec-ui`), the S8 real-AWS lab, Playwright, the §9 production rehearsal, deploys |
+| **Suites** | At `9248549`: `TestP2` integration **332 of 332 passed**, 0 skipped at top level; the graph and read packages pass; the isolation check passes. At `e63dfa7`: its one changed test passes with a DSN and skips without; a full re-run was in progress at this commit (M1 report §2). |
+| **Load (T6.10)** | At `9248549`, 10 000 workloads: all 12 load tests pass; **83 timed rows, every one within its §5.6 target**. Least headroom: `/resources/:id/access ("*")`, p95 268.5 ms of 300 |
+| **Regression** | Whole repository at `e63dfa7` against `0e75ad7`: **no new failure**; the 21 pre-existing failures (sqlite without cgo, PostgreSQL expected at `:5432`) are identical on both sides |
+| **B1–B24** | 23 proven (4 of them as a decision restates them: B9 and B20 under D-95, B11 under D-67, B12 under D-51). **B16 is not proven**: its test exists, but no removal of its safeguard is recorded |
+| **E1–E16** | 15 backend halves proven. E15 is console-only. Every console half is S7, and every gate still needs S8's real-AWS run |
+| **Mutations** | 968 recorded: 908 caught, 53 missed then fixed, 5 missed and left (3 accepted, 2 open), 2 not confirmed from a log. Not re-run for the report |
+| **Migrations** | Unchanged since M0: `027`–`036` are the §3 DDL as M0 left them. Every schema change is a proposal (D-94, D-95, D-106; M0's `035`/`028` rollback defects) |
+| **For review** | **105 open spec questions** (M1 report §9.1, most consequential first), **39 decisions marked Raise** (§10.1), and 19 departures from the spec's text (§7.1). Every D-n is provisional |
+| **Status** | `origin/graph` is at `3ea0244` (end of Wave A). **Stopping here for review** |
