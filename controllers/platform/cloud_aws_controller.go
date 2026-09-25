@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -44,6 +46,13 @@ type CloudAWSController struct {
 	// lists do), built on first use.
 	cursorsOnce sync.Once
 	cursors     *igaread.Reader
+
+	// The Quick Create service is built once: its settings come from the
+	// environment and do not change at runtime, and building it per request
+	// would throw away the template check's cache on every launch.
+	qcOnce sync.Once
+	qc     *services.AWSQuickCreateService
+	qcErr  error
 }
 
 // NewCloudAWSController constructs the controller.
@@ -140,14 +149,167 @@ func (ctl *CloudAWSController) GetOnboardingPackage(c *gin.Context) {
 			"additional_permissions":  awsdiscovery.AdditionalPermissions(),
 			"hard_denies":             awsdiscovery.HardDenies(),
 		},
+		"automatic": ctl.automaticBlock(),
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
 			"next":  "POST /authsec/discovery/aws/connectors with the stack's RoleArn output and this external_id",
-			"note": "the external id is a secret and is minted per request; display the one returned here " +
+			"note": "the external id is minted per request; display the one returned here " +
 				"and post that same value back, do not re-fetch between the two steps",
 			"read_only": "the stack creates one IAM role and nothing else; no software is installed in the account",
 		},
 	})
+}
+
+/* ------------------------------ quick create ------------------------------ */
+
+// quickCreate builds the Quick Create service for session requests. Starting
+// or reading a session never assumes a role, so no Vault client is needed
+// here; the callback worker, which does connect accounts, builds its own.
+func (ctl *CloudAWSController) quickCreate() (*services.AWSQuickCreateService, error) {
+	ctl.qcOnce.Do(func() {
+		cfg, err := services.LoadAWSCallbackConfig()
+		if err != nil {
+			// Logged once here, not on every GET /aws/onboarding.
+			log.Printf("[aws-onb] ALERT automatic AWS onboarding misconfigured: %v", err)
+			ctl.qcErr = err
+			return
+		}
+		ctl.qc = services.NewAWSQuickCreateService(nil, config.GetRedisClient(), cfg,
+			os.Getenv(authsecPrincipalEnv))
+	})
+	return ctl.qc, ctl.qcErr
+}
+
+// automaticBlock tells the console whether to offer "Launch in AWS", and with
+// which regions. enabled:false is not an error: the console shows the manual
+// flow.
+func (ctl *CloudAWSController) automaticBlock() gin.H {
+	qc, err := ctl.quickCreate()
+	if err != nil {
+		return gin.H{"enabled": false}
+	}
+	if !qc.Available() {
+		return gin.H{"enabled": false}
+	}
+	cfg := qc.Config()
+	regions := cfg.SupportedDeploymentRegions()
+	def := regions[0]
+	for _, r := range regions {
+		if r == "us-east-1" {
+			def = r
+		}
+	}
+	return gin.H{
+		"enabled":                      true,
+		"supported_deployment_regions": regions,
+		"default_deployment_region":    def,
+		"optin_scan_regions":           cfg.OptInScanRegionList(),
+	}
+}
+
+// StartOnboardingSession handles POST /authsec/discovery/aws/onboarding/sessions.
+//
+// Body: {"regions": [...], "deployment_region": "..."}. regions are the AWS
+// Regions to scan; deployment_region (optional) is where the one stack is
+// created. Returns the session with its Quick Create link. The link carries a
+// fresh ExternalId and is usable once, for one hour.
+func (ctl *CloudAWSController) StartOnboardingSession(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var in struct {
+		Regions          []string `json:"regions"`
+		DeploymentRegion string   `json:"deployment_region"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	qc, err := ctl.quickCreate()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": services.AWSOnbCodeNotConfigured})
+		return
+	}
+	userID, _ := middlewares.ResolveUserID(c)
+	sess, err := qc.StartSessionFor(c.Request.Context(), workspaceID, actor, userID, in.Regions, in.DeploymentRegion)
+	if err != nil {
+		status, body := mapAWSQuickCreateError(err)
+		c.JSON(status, body)
+		return
+	}
+	auditAdminMutation(c, workspaceID.String(), "start_onboarding", "aws_onboarding_session",
+		sess.ID.String(), http.StatusCreated, nil, gin.H{
+			"regions": sess.Regions, "deployment_region": sess.DeploymentRegion, "stack_name": sess.StackName,
+		})
+	c.JSON(http.StatusCreated, gin.H{
+		"success": true,
+		"data":    sess.View(),
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"next":  "open quick_create_url, then poll GET /authsec/discovery/aws/onboarding/sessions/" + sess.ID.String(),
+			"note": "the link is single-use and expires at expires_at. If the stack does not report back, " +
+				"POST /authsec/discovery/aws/connectors with the stack's RoleArn and this external_id still works",
+		},
+	})
+}
+
+// GetOnboardingSession handles GET /authsec/discovery/aws/onboarding/sessions/:id.
+func (ctl *CloudAWSController) GetOnboardingSession(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+	qc, err := ctl.quickCreate()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "code": services.AWSOnbCodeNotConfigured})
+		return
+	}
+	sess, err := qc.GetSession(c.Request.Context(), workspaceID, id)
+	if err != nil {
+		status, body := mapAWSQuickCreateError(err)
+		c.JSON(status, body)
+		return
+	}
+	view := sess.View()
+	// The launch link and its ExternalId let whoever opens them connect an AWS
+	// account to this workspace — an admin action. This route is readable with
+	// discovery:read, so only the user who started the session gets them back;
+	// anyone else sees the status and the result. Compared on the user id, not
+	// the actor, which can be a workspace-level client id shared by every user.
+	userID, _ := middlewares.ResolveUserID(c)
+	if !sess.StartedBy(userID, actor) {
+		view.QuickCreateURL, view.ExternalID = "", ""
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": view,
+		"meta": gin.H{"as_of": time.Now().UTC(), "terminal": sess.Status == services.AWSOnbConnected ||
+			sess.Status == services.AWSOnbFailed},
+	})
+}
+
+// mapAWSQuickCreateError maps a session error to a status. The code travels
+// with every response so the console can show the matching copy.
+func mapAWSQuickCreateError(err error) (int, gin.H) {
+	if errors.Is(err, services.ErrAWSOnbSessionNotFound) {
+		return http.StatusNotFound, gin.H{"error": "onboarding session not found or expired"}
+	}
+	var oe *services.AWSOnbError
+	if errors.As(err, &oe) {
+		status := http.StatusServiceUnavailable
+		if oe.Code == services.AWSOnbCodeInvalidRegions {
+			status = http.StatusUnprocessableEntity
+		}
+		return status, gin.H{"error": oe.Message, "code": oe.Code}
+	}
+	return http.StatusInternalServerError, gin.H{"error": err.Error()}
 }
 
 /* -------------------------------- connectors ------------------------------ */

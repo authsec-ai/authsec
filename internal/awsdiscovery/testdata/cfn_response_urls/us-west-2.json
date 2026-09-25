@@ -1,0 +1,6 @@
+{
+  "region": "us-west-2",
+  "source": "Host taken verbatim from AWS's own example request in the Lambda developer guide (Using AWS Lambda with AWS CloudFormation), which prints ResponseURL as https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com/pre-signed-URL. The path and query below are sanitised placeholders in the presigned-URL shape; the spike replaces this with a captured URL and adds us-east-1 and ap-south-1.",
+  "captured": false,
+  "url": "https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com/arn%3Aaws%3Acloudformation%3Aus-west-2%3A123456789012%3Astack/AuthSec-Discovery-abcd2345/2d213470-3bbd-11ea-a35f-06b8fd1f0384%7CAuthSecRegistration%7Cba9e9fc5-4c6a-4b38-8459-3f9a3d838a4c?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260924T000000Z&X-Amz-SignedHeaders=host&X-Amz-Expires=7200&X-Amz-Credential=REDACTED&X-Amz-Signature=REDACTED"
+}

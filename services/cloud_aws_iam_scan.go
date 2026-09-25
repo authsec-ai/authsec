@@ -1021,6 +1021,11 @@ func surfaceResult(count int, err error) models.SurfaceCoverage {
 		return models.SurfaceCoverage{State: models.CloudCoverageReached, Count: count}
 	case errors.Is(err, awsdiscovery.ErrThrottled):
 		out = models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
+	case errors.Is(err, awsdiscovery.ErrTooManyPages):
+		// The read stopped at its page cap. Nothing was refused; the rows are
+		// real but the set is not known to be whole. Partial, not denied --
+		// and, like denied, not authoritative, so it still blocks deletion.
+		out = models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: count, Error: err.Error()}
 	default:
 		out = models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
 	}
