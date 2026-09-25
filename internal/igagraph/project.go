@@ -122,9 +122,10 @@ type Projector struct {
 	events     *EventLog
 	exclusions Exclusions
 
-	// EvidenceMissing counts projected edges whose supporting observation
-	// could not be found, PER EDGE TYPE (§4.8, T4.9). An edge is still written
-	// -- the configuration was read -- and counted; the gate asserts zero.
+	// EvidenceMissing counts projected edges lacking a required supporting
+	// observation, keyed "<edge kind>.<role>" (§4.8, T4.9): a grant needs its
+	// policy version AND its holder. An edge is still written -- the
+	// configuration was read -- and counted; the gate asserts zero.
 	EvidenceMissing map[string]int
 }
 

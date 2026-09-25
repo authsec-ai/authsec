@@ -271,7 +271,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 
 	// Evidence is anchored on THIS run.
 	evidence := NewObservationWriter(
-		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation)
+		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation).WithFence(fence)
 
 	// THE RUN'S SCOPE, READ ONCE (§5.3 PATCH .../connectors/:id, D-54): a
 	// region change applies from the NEXT scan. Every scanner below reads the

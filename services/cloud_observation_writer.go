@@ -10,6 +10,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -221,6 +222,11 @@ type ObservationWriter struct {
 	connectorID uuid.UUID
 	runID       uuid.UUID
 	generation  int
+	// fence is the run's ownership, asserted in the same transaction as every
+	// write (§2.10A, part 3), exactly as the inventory repositories do. Without
+	// it an obsolete worker -- reclaimed, or its run abandoned -- could still
+	// confirm a fact and move last_confirmed_run_id back onto its own run.
+	fence *repositories.ScanFence
 
 	written int
 	skipped int
@@ -243,6 +249,16 @@ func NewObservationWriter(
 		db: db, workspaceID: workspaceID, connectorID: connectorID,
 		runID: runID, generation: generation,
 	}
+}
+
+// WithFence makes every write assert the run's ownership first; a worker that
+// no longer owns its run gets repositories.ErrScanFenceLost and writes nothing.
+func (w *ObservationWriter) WithFence(f repositories.ScanFence) *ObservationWriter {
+	if w == nil {
+		return nil
+	}
+	w.fence = &f
+	return w
 }
 
 // Record writes one observation, deduplicating on unchanged content.
@@ -383,9 +399,11 @@ func (w *ObservationWriter) Record(
 	proposed := uuid.New()
 	obs.ID = proposed
 
-	res := w.db.Clauses(conflict, clause.Returning{}).Create(obs)
-	if res.Error != nil {
-		return fmt.Errorf("record observation (%s): %w", sourceAPI, res.Error)
+	err = repositories.RunFenced(w.db, w.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(conflict, clause.Returning{}).Create(obs).Error
+	})
+	if err != nil {
+		return fmt.Errorf("record observation (%s): %w", sourceAPI, err)
 	}
 	if obs.ID == proposed {
 		w.written++

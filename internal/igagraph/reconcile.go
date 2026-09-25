@@ -56,6 +56,9 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions, even
 			return fmt.Errorf("reconcile %s: %w", part.Key(), err)
 		}
 	}
+	if err := rc.reconcileCredentials(tx, snap, at); err != nil {
+		return err
+	}
 	// Only now, with every partition's support settled, is it safe to ask
 	// which objects have no support left (§2.10B).
 	if err := rc.retireUnsupported(tx, snap, events, at); err != nil {
@@ -186,6 +189,36 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot
 		return rc.endOlderThan(tx, part, snap, at, models.EndedNotSeen, "NOT ("+p+")", args...)
 	}
 	return rc.endOlderThan(tx, part, snap, at, models.EndedNotSeen, "")
+}
+
+// credentialPartition is the read that lists a user's access keys: the users
+// surface (which holder we looked at) and the access-keys surface (their keys).
+var credentialPartition = Partition{
+	RequiredSurfaces: []string{models.SurfaceIAMUsers, models.SurfaceIAMAccessKeys},
+}
+
+// reconcileCredentials revokes an access key that disappeared from an
+// authoritative read (§2.5): lifecycle 'revoked', never 'rotated' -- a new key
+// beside it is not evidence of replacement. Under the same gate as every other
+// end (§2.7), and only for keys of users THIS run confirmed through THIS
+// connector: a user nobody looked at, or another account's user, keeps its keys.
+// A key the pass reported has last_seen_at = at (projectCredentials, D-26).
+func (rc *Reconciler) reconcileCredentials(tx *gorm.DB, snap *Snapshot, at time.Time) error {
+	if !rc.canEnd(snap, credentialPartition) {
+		return nil
+	}
+	col := models.SupportColumn(models.ObjectIdentity)
+	return tx.Exec(`
+		UPDATE iga_credentials c
+		   SET lifecycle = 'revoked', retired_reason = ?, updated_at = ?
+		 WHERE c.workspace_id = ? AND c.provider = ? AND c.lifecycle = ?
+		   AND c.last_seen_at < ?
+		   AND EXISTS (SELECT 1 FROM iga_object_support s
+		                WHERE s.workspace_id = c.workspace_id AND s.connector_id = ?
+		                  AND s.`+col+` = c.identity_account_id
+		                  AND s.last_confirmed_run_id = ?)`,
+		models.EndedNotSeen, at, snap.Run.WorkspaceID, models.ProviderAWS, models.LifecycleActive,
+		at, snap.Run.ConnectorID, snap.Run.ID).Error
 }
 
 // markStale: we could not look at THIS partition. Rows this run DID confirm

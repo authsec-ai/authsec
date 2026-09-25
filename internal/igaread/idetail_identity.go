@@ -54,9 +54,10 @@ type IdentityDetail struct {
 //
 // lifecycle is returned beside it, unmapped (D-86). created_at is the stored
 // issued_at, null while the projector does not record it. last_seen_at is when
-// a scan last reported the key: a key deleted in AWS is never revoked by
-// absence this phase (§2.5 -- no credential partition exists), so an old
-// last_seen_at is the only honest signal that it may be gone.
+// a scan last reported the key. A key deleted in AWS is revoked once an
+// authoritative read of its user no longer lists it (§2.5,
+// Reconciler.reconcileCredentials); until such a read, an old last_seen_at is
+// the honest signal that it may be gone.
 type IdentityCredential struct {
 	KeyID      string  `json:"key_id"`
 	Status     *string `json:"status"`

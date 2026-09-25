@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
@@ -176,25 +177,31 @@ func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) e
 			Version:     lease.Version,
 			Holder:      lease.Holder,
 		}
-		reason, action := s.recoveryFor(lease, now)
-		switch action {
-		case recoveryLeave:
-			continue
-		case recoveryRelease:
-			if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Decide AND act in one transaction, with the run or job row locked
+		// (FOR UPDATE), so a worker that claims or heartbeats the job while
+		// recovery is deciding cannot be abandoned on a stale read (R2).
+		var reason string
+		var action recoveryAction
+		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var derr error
+			reason, action, derr = s.recoveryFor(tx, lease, now)
+			if derr != nil {
+				return derr
+			}
+			switch action {
+			case recoveryRelease:
 				return s.pipeline.ReleaseTx(tx, fence)
-			}); err != nil {
-				log.Printf("[projection] recovery release %s: %v", lease.WorkspaceID, err)
-			}
-		case recoveryAbandon:
-			if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			case recoveryAbandon:
 				return s.pipeline.AbandonTx(tx, fence, reason)
-			}); err != nil {
-				log.Printf("[projection] recovery abandon %s: %v", lease.WorkspaceID, err)
-			} else {
-				log.Printf("[projection] recovered wedged workspace %s (%s): %s",
-					lease.WorkspaceID, lease.State, reason)
 			}
+			return nil
+		})
+		switch {
+		case err != nil:
+			log.Printf("[projection] recovery %s (%s): %v", lease.WorkspaceID, lease.State, err)
+		case action == recoveryAbandon:
+			log.Printf("[projection] recovered wedged workspace %s (%s): %s",
+				lease.WorkspaceID, lease.State, reason)
 		}
 	}
 	return nil
@@ -209,29 +216,41 @@ const (
 )
 
 // recoveryFor decides what an expired barrier needs, by asking whether the
-// work behind it can still be picked up by anyone.
+// work behind it can still be picked up by anyone -- or is being worked on
+// right now.
+//
+// A row that does not exist is unreachable work; a row that could not be READ
+// is not evidence of anything, so a read error is returned and the barrier is
+// left for the next pass rather than abandoned.
 func (s *ProjectionService) recoveryFor(
-	lease models.IGAPipelineLease, now time.Time,
-) (string, recoveryAction) {
+	tx *gorm.DB, lease models.IGAPipelineLease, now time.Time,
+) (string, recoveryAction, error) {
+	locked := tx.Clauses(clause.Locking{Strength: "UPDATE"})
 	switch lease.State {
 	case models.PipelineCollecting:
 		var run models.CloudScanRun
-		if err := s.db.First(&run, "id = ?", *lease.ScanRunID).Error; err != nil {
-			return "collecting barrier for a run that no longer exists", recoveryAbandon
+		if err := locked.First(&run, "id = ?", *lease.ScanRunID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "collecting barrier for a run that no longer exists", recoveryAbandon, nil
+			}
+			return "", recoveryLeave, fmt.Errorf("read scan run: %w", err)
 		}
 		if run.Terminal() {
 			// The scan gave up (or was abandoned) without releasing the
 			// barrier a previous attempt took. Nobody will finish it.
-			return fmt.Sprintf("scan run is %s and will not resume", run.Status), recoveryAbandon
+			return fmt.Sprintf("scan run is %s and will not resume", run.Status), recoveryAbandon, nil
 		}
 		// queued or running-but-expired: the scan worker's own Claim reclaims
 		// it and AcquireForCollection takes the barrier back in-phase.
-		return "", recoveryLeave
+		return "", recoveryLeave, nil
 
 	case models.PipelineProjecting:
 		var job models.IGAProjectionJob
-		if err := s.db.First(&job, "scan_run_id = ?", *lease.ScanRunID).Error; err != nil {
-			return "projecting barrier with no projection job", recoveryAbandon
+		if err := locked.First(&job, "scan_run_id = ?", *lease.ScanRunID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "projecting barrier with no projection job", recoveryAbandon, nil
+			}
+			return "", recoveryLeave, fmt.Errorf("read projection job: %w", err)
 		}
 		switch job.Status {
 		case models.ProjectionComplete:
@@ -239,19 +258,25 @@ func (s *ProjectionService) recoveryFor(
 			// unreachable -- but if the barrier is somehow still held for a
 			// completed job, releasing is right and abandoning would wrongly
 			// mark a successful job abandoned.
-			return "", recoveryRelease
+			return "", recoveryRelease, nil
 		case models.ProjectionAbandoned:
-			return "projection job already abandoned", recoveryAbandon
+			return "projection job already abandoned", recoveryAbandon, nil
+		}
+		// An attempt running under a live lease is being worked on NOW, even
+		// if it is the last one allowed: the ceiling decides whether another
+		// attempt may START, never whether the current one may finish.
+		if job.Status == models.ProjectionRunning && job.LeaseExpiresAt != nil && job.LeaseExpiresAt.After(now) {
+			return "", recoveryLeave, nil
 		}
 		if job.Attempts >= s.maxAttempts {
 			// Past the ceiling, Claim will never pick it up again.
-			return fmt.Sprintf("projection gave up after %d attempts", job.Attempts), recoveryAbandon
+			return fmt.Sprintf("projection gave up after %d attempts", job.Attempts), recoveryAbandon, nil
 		}
 		// queued, running-but-expired, or failed past its backoff: all
 		// claimable, so the job's own reclaim gets another go.
-		return "", recoveryLeave
+		return "", recoveryLeave, nil
 	}
-	return "", recoveryLeave
+	return "", recoveryLeave, nil
 }
 
 // RunOnce claims at most one job and projects it. Returns whether it worked.
@@ -327,6 +352,12 @@ func (s *ProjectionService) holdBarrier(job *models.IGAProjectionJob) (int64, er
 		return 0, fmt.Errorf("%w: barrier is %s/%s for run %v, not %s for run %s",
 			repositories.ErrPipelineLost, lease.State, lease.Holder, lease.ScanRunID,
 			want, job.ScanRunID)
+	}
+	// A reclaim can find the barrier already past its expiry. Renew it now,
+	// not at the first heartbeat: until then recovery would see an expired
+	// barrier over a job that is in fact being worked (R2).
+	if err := s.pipeline.RenewHeld(s.fence(job, lease.Version), s.barrierLease, s.now()); err != nil {
+		return 0, err
 	}
 	return lease.Version, nil
 }
@@ -438,6 +469,13 @@ func (s *ProjectionService) projectAndReconcile(
 		// DEFERRED, so the events commit only together with it (036).
 		if err := reconciler.Reconcile(tx, snap, projector.Exclusions(), projector.Events()); err != nil {
 			return err
+		}
+		// Edges written without their required evidence are still published --
+		// the configuration was read -- but never silently (§4.8): the count
+		// per edge kind and role is reported with the run it came from.
+		if len(projector.EvidenceMissing) > 0 {
+			log.Printf("[projection] run %s published edges missing evidence: %v",
+				job.ScanRunID, projector.EvidenceMissing)
 		}
 		return projector.Events().Flush(tx, s.graph)
 	})

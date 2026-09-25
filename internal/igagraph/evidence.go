@@ -22,32 +22,34 @@ import (
 //	                         trust document); pod identity: the association's
 //	                         observation (PodIdentitySubjectKey)
 //
-// EVERY PROJECTED EDGE NEEDS EVIDENCE, COUNTED PER EDGE, NOT PER CLASS. A
-// per-class count passes with one evidenced edge and ten thousand bare ones.
-// An edge whose observation cannot be found is still written -- the
-// configuration was read -- and counted in EvidenceMissing; the gate asserts
-// zero.
+// EVERY PROJECTED EDGE NEEDS EVIDENCE, COUNTED PER EDGE AND PER REQUIRED ROLE,
+// NOT PER CLASS. A per-class count passes with one evidenced edge and ten
+// thousand bare ones; a per-edge count passes a grant whose holder was
+// observed but whose policy version was not. Each ref an edge names is a role
+// it needs evidence for: a role with no observation is counted in
+// EvidenceMissing under "<edge kind>.<role>". The edge is still written --
+// the configuration was read -- and the gate asserts zero.
 func (p *Projector) attachEvidence(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	ws := snap.Run.WorkspaceID
-	link := func(kind string, n int, fn func(obsID uuid.UUID) error, refs ...SubjectRef) error {
-		found := 0
+	link := func(kind string, fn func(obsID uuid.UUID) error, refs ...SubjectRef) error {
 		for _, ref := range refs {
+			found := 0
 			for _, obsID := range snap.ConfirmedBy[ref] {
 				if err := fn(obsID); err != nil {
 					return err
 				}
 				found++
 			}
-		}
-		if found == 0 {
-			p.EvidenceMissing[kind] += n
+			if found == 0 {
+				p.EvidenceMissing[kind+"."+ref.Kind]++
+			}
 		}
 		return nil
 	}
 
 	for _, g := range r.grants {
 		g := g
-		if err := link("grant", 1, func(obs uuid.UUID) error {
+		if err := link("grant", func(obs uuid.UUID) error {
 			return p.repo.LinkAccessEdgeEvidence(tx, ws, g.ID, obs, "supports")
 		}, SubjectRef{Kind: "policy", NativeID: g.PolicyNative},
 			SubjectRef{Kind: "identity", NativeID: g.HolderNative}); err != nil {
@@ -56,7 +58,7 @@ func (p *Projector) attachEvidence(tx *gorm.DB, snap *Snapshot, r *resolved) err
 	}
 	for _, a := range r.assignRefs {
 		a := a
-		if err := link("assignment", 1, func(obs uuid.UUID) error {
+		if err := link("assignment", func(obs uuid.UUID) error {
 			return p.repo.LinkAssignmentEvidence(tx, ws, a.ID, obs, "supports")
 		}, SubjectRef{Kind: "identity", NativeID: a.HolderNative},
 			SubjectRef{Kind: "policy", NativeID: a.PolicyNative}); err != nil {
@@ -68,7 +70,7 @@ func (p *Projector) attachEvidence(tx *gorm.DB, snap *Snapshot, r *resolved) err
 	} {
 		for _, rel := range rels {
 			rel := rel
-			if err := link(kind, 1, func(obs uuid.UUID) error {
+			if err := link(kind, func(obs uuid.UUID) error {
 				return p.repo.LinkRelationshipEvidence(tx, ws, rel.ID, obs, "supports")
 			}, SubjectRef{Kind: rel.SubjectKind, NativeID: rel.SubjectNativ}); err != nil {
 				return fmt.Errorf("link %s evidence: %w", kind, err)
