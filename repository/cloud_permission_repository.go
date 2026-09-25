@@ -50,6 +50,28 @@ type CloudPermissionRepository interface {
 	// the caller must only invoke this after a scan in which every surface this
 	// table depends on was reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
+
+	// CountPodIdentityEdges counts the connector's EKS Pod Identity edges, any
+	// generation, that may come from the given region: those whose attrs name
+	// it, and every one whose attrs name no region (written before edges
+	// carried one), which may come from anywhere. Whether an earlier scan ever
+	// recorded a binding there (T3.8, writePodIdentityEdges).
+	CountPodIdentityEdges(workspaceID, connectorID uuid.UUID, region string) (int64, error)
+
+	// ReconcileGenerationKeeping is ReconcileGeneration with named assume
+	// edges exempt: rows the scan did not see because it did not LOOK where
+	// they live (an EKS Pod Identity binding in a region deselected since),
+	// which must be kept and marked stale, never deleted as gone (§2.14.13).
+	ReconcileGenerationKeeping(workspaceID, connectorID uuid.UUID, generation int, keepEdges []uuid.UUID) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
+
+	// HeldOverAssumeEdges lists this connector's assume edges of one
+	// mechanism that the given generation has NOT seen (yet): the rows
+	// reconciliation would delete.
+	HeldOverAssumeEdges(workspaceID, connectorID uuid.UUID, generation int, mechanism string) ([]models.CloudAssumeEdge, error)
+
+	// Fenced returns a view whose mutations refuse to commit unless the
+	// given run is still owned by the caller (§2.10A). Reads are unaffected.
+	Fenced(f ScanFence) CloudPermissionRepository
 }
 
 // CloudPermissionFilter narrows an assume-edge, permission, or resource
@@ -64,11 +86,20 @@ type CloudPermissionFilter struct {
 	Offset      int
 }
 
-type cloudPermissionRepository struct{ db *gorm.DB }
+type cloudPermissionRepository struct {
+	db    *gorm.DB
+	fence *ScanFence
+}
 
 // NewCloudPermissionRepository constructs the repository.
 func NewCloudPermissionRepository(db *gorm.DB) CloudPermissionRepository {
 	return &cloudPermissionRepository{db: db}
+}
+
+func (r *cloudPermissionRepository) Fenced(f ScanFence) CloudPermissionRepository {
+	copy := *r
+	copy.fence = &f
+	return &copy
 }
 
 func (r *cloudPermissionRepository) UpsertAssumeEdge(e *models.CloudAssumeEdge) (*models.CloudAssumeEdge, bool, error) {
@@ -85,27 +116,39 @@ func (r *cloudPermissionRepository) UpsertAssumeEdge(e *models.CloudAssumeEdge) 
 	proposed := e.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id":         e.ConnectorID,
-				"issuer":               e.Issuer,
-				"mechanism":            e.Mechanism,
-				"k8s_ref":              e.K8sRef,
-				"attrs":                e.Attrs,
-				"last_seen_generation": e.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-			DoNothing: false,
-		},
-		clause.Returning{},
-	).Create(e).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id":         e.ConnectorID,
+					"issuer":               e.Issuer,
+					"mechanism":            e.Mechanism,
+					"k8s_ref":              e.K8sRef,
+					"attrs":                e.Attrs,
+					"last_seen_generation": e.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+				DoNothing: false,
+			},
+			clause.Returning{},
+		).Create(e).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
 	return e, e.ID == proposed, nil
+}
+
+func (r *cloudPermissionRepository) HeldOverAssumeEdges(
+	workspaceID, connectorID uuid.UUID, generation int, mechanism string,
+) ([]models.CloudAssumeEdge, error) {
+	var rows []models.CloudAssumeEdge
+	err := r.db.Where(`workspace_id = ? AND connector_id = ? AND mechanism = ? AND last_seen_generation < ?`,
+		workspaceID, connectorID, mechanism, generation).
+		Order("id").Find(&rows).Error
+	return rows, err
 }
 
 func (r *cloudPermissionRepository) UpsertResource(res *models.CloudResource) (*models.CloudResource, bool, error) {
@@ -121,50 +164,52 @@ func (r *cloudPermissionRepository) UpsertResource(res *models.CloudResource) (*
 	proposed := res.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": res.ConnectorID,
-				"kind":         res.Kind,
-				// name IS refreshed: a resource renamed in place (e.g. an S3
-				// bucket's ARN never changes, but the plan may later type a
-				// service where it can) should not keep showing a stale label.
-				"name": res.Name,
-				// The three ARN-derived columns ARE refreshed. 021 added them with
-				// NOT NULL defaults and a comment saying the next scan would fill
-				// them in; it did not, because only the Create path wrote them and
-				// every pre-021 row takes this branch forever. `is_external=false`
-				// is not "unknown" -- it is a positive claim of locality about what
-				// may be a cross-account ARN, and idx_cloud_resource_external is
-				// built to query exactly that column.
-				//
-				// Safe to refresh: all three are functions of the ARN, which is
-				// native_id, i.e. the conflict key -- so a repeat scan derives the
-				// same values. They move together because 021's CHECKs couple them
-				// to each other and to `kind` (already refreshed above):
-				// (NOT is_external OR resource_account <> '') and
-				// (object_key = '' OR kind = 's3_object'). Updating a subset can
-				// violate one of those and fail the upsert.
-				"resource_account": res.ResourceAccount,
-				"is_external":      res.IsExternal,
-				"object_key":       res.ObjectKey,
-				// sensitivity is NOT refreshed here deliberately -- see
-				// UpsertPermission's identical note. A later ticket may raise it
-				// from tags or activity, and this scan must not stamp it back
-				// down to the rule-based default on every repeat run.
-				//
-				// sensitivity_source and sensitivity_reason stay out for the same
-				// reason: they explain `sensitivity`, so refreshing them while the
-				// verdict stays pinned would leave a row whose stated reason
-				// contradicts its own value.
-				"last_seen_generation": res.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(res).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": res.ConnectorID,
+					"kind":         res.Kind,
+					// name IS refreshed: a resource renamed in place (e.g. an S3
+					// bucket's ARN never changes, but the plan may later type a
+					// service where it can) should not keep showing a stale label.
+					"name": res.Name,
+					// The three ARN-derived columns ARE refreshed. 021 added them with
+					// NOT NULL defaults and a comment saying the next scan would fill
+					// them in; it did not, because only the Create path wrote them and
+					// every pre-021 row takes this branch forever. `is_external=false`
+					// is not "unknown" -- it is a positive claim of locality about what
+					// may be a cross-account ARN, and idx_cloud_resource_external is
+					// built to query exactly that column.
+					//
+					// Safe to refresh: all three are functions of the ARN, which is
+					// native_id, i.e. the conflict key -- so a repeat scan derives the
+					// same values. They move together because 021's CHECKs couple them
+					// to each other and to `kind` (already refreshed above):
+					// (NOT is_external OR resource_account <> '') and
+					// (object_key = '' OR kind = 's3_object'). Updating a subset can
+					// violate one of those and fail the upsert.
+					"resource_account": res.ResourceAccount,
+					"is_external":      res.IsExternal,
+					"object_key":       res.ObjectKey,
+					// sensitivity is NOT refreshed here deliberately -- see
+					// UpsertPermission's identical note. A later ticket may raise it
+					// from tags or activity, and this scan must not stamp it back
+					// down to the rule-based default on every repeat run.
+					//
+					// sensitivity_source and sensitivity_reason stay out for the same
+					// reason: they explain `sensitivity`, so refreshing them while the
+					// verdict stays pinned would leave a row whose stated reason
+					// contradicts its own value.
+					"last_seen_generation": res.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+			},
+			clause.Returning{},
+		).Create(res).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -197,40 +242,42 @@ func (r *cloudPermissionRepository) UpsertPermission(p *models.CloudPermission) 
 	proposed := p.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			// Matches uq_cloud_permission_grant, whose NULLS NOT DISTINCT is
-			// what lets two account_wide/prefix grants from the same statement
-			// (both resource_id NULL) collide as one conflict target instead of
-			// duplicating on every scan.
-			Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": p.ConnectorID,
-				"plane":        p.Plane,
-				"effect":       p.Effect,
-				"role_name":    p.RoleName,
-				"actions":      p.Actions,
-				"scope_kind":   p.ScopeKind,
-				"derivation":   p.Derivation,
-				// The constraint columns MUST refresh on conflict. A statement
-				// that gains a Condition in AWS between two scans would
-				// otherwise keep its old unconditional row, and the console
-				// would keep showing access that is now gated.
-				"not_actions":      p.NotActions,
-				"not_resources":    p.NotResources,
-				"condition":        p.Condition,
-				"constraint_state": p.ConstraintState,
-				// sensitivity is NOT refreshed on conflict. It starts as the
-				// rule-based default this scan computed, but a reviewer may have
-				// since raised it by hand (once that exists), and a re-scan of
-				// an unchanged statement must not silently revert that call.
-				"last_seen_generation": p.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(p).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				// Matches uq_cloud_permission_grant, whose NULLS NOT DISTINCT is
+				// what lets two account_wide/prefix grants from the same statement
+				// (both resource_id NULL) collide as one conflict target instead of
+				// duplicating on every scan.
+				Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": p.ConnectorID,
+					"plane":        p.Plane,
+					"effect":       p.Effect,
+					"role_name":    p.RoleName,
+					"actions":      p.Actions,
+					"scope_kind":   p.ScopeKind,
+					"derivation":   p.Derivation,
+					// The constraint columns MUST refresh on conflict. A statement
+					// that gains a Condition in AWS between two scans would
+					// otherwise keep its old unconditional row, and the console
+					// would keep showing access that is now gated.
+					"not_actions":      p.NotActions,
+					"not_resources":    p.NotResources,
+					"condition":        p.Condition,
+					"constraint_state": p.ConstraintState,
+					// sensitivity is NOT refreshed on conflict. It starts as the
+					// rule-based default this scan computed, but a reviewer may have
+					// since raised it by hand (once that exists), and a re-scan of
+					// an unchanged statement must not silently revert that call.
+					"last_seen_generation": p.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+			},
+			clause.Returning{},
+		).Create(p).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -311,6 +358,17 @@ func (r *cloudPermissionRepository) CountsForConnector(workspaceID, connectorID 
 	return edges, permissions, resources, nil
 }
 
+func (r *cloudPermissionRepository) CountPodIdentityEdges(
+	workspaceID, connectorID uuid.UUID, region string,
+) (int64, error) {
+	var n int64
+	err := r.db.Model(&models.CloudAssumeEdge{}).
+		Where("workspace_id = ? AND connector_id = ? AND mechanism = ? AND COALESCE(attrs->>'region', '') IN (?, '')",
+			workspaceID, connectorID, models.AssumeMechanismEKSPodIdentity, region).
+		Count(&n).Error
+	return n, err
+}
+
 // ReconcileGeneration removes what this connector did not see, in the order
 // that respects the foreign keys: permissions before the resources they may
 // point at, then edges. Resources are deleted explicitly rather than left to
@@ -320,11 +378,21 @@ func (r *cloudPermissionRepository) CountsForConnector(workspaceID, connectorID 
 func (r *cloudPermissionRepository) ReconcileGeneration(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, int64, int64, error) {
+	return r.ReconcileGenerationKeeping(workspaceID, connectorID, generation, nil)
+}
+
+func (r *cloudPermissionRepository) ReconcileGenerationKeeping(
+	workspaceID, connectorID uuid.UUID, generation int, keepEdges []uuid.UUID,
+) (int64, int64, int64, error) {
 
 	var edgesRemoved, permissionsRemoved, resourcesRemoved int64
-	err := r.db.Transaction(func(tx *gorm.DB) error {
-		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudAssumeEdge{})
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+		edges := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation)
+		if len(keepEdges) > 0 {
+			edges = edges.Where("id NOT IN ?", keepEdges)
+		}
+		res := edges.Delete(&models.CloudAssumeEdge{})
 		if res.Error != nil {
 			return res.Error
 		}

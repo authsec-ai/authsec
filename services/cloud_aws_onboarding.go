@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -76,6 +77,15 @@ type AWSOnboardingService struct {
 	repo     repositories.CloudConnectorRepository
 	vault    vault.VaultClient
 	verifier awsdiscovery.Verifier
+
+	// regionsAPI, when set, answers ec2:DescribeRegions without assuming the
+	// role. The test seam for EnabledRegions, like the scanners' With*API.
+	regionsAPI awsdiscovery.RegionsAPI
+
+	// pinned is the connector row a scan run was claimed with (ForRun). Every
+	// scanner of that run reads the connector through Connector, so they all
+	// see ONE region list, however the connector changes mid-run.
+	pinned *models.CloudConnector
 }
 
 // NewAWSOnboardingService constructs the service against real AWS.
@@ -97,6 +107,13 @@ func NewAWSOnboardingService(db *gorm.DB, vc vault.VaultClient) *AWSOnboardingSe
 // exercised without an AWS account.
 func (s *AWSOnboardingService) WithVerifier(v awsdiscovery.Verifier) *AWSOnboardingService {
 	s.verifier = v
+	return s
+}
+
+// WithRegionsAPI installs an EC2 client for DescribeRegions, bypassing
+// assume-role. Tests use it; production builds one from the connector's role.
+func (s *AWSOnboardingService) WithRegionsAPI(api awsdiscovery.RegionsAPI) *AWSOnboardingService {
+	s.regionsAPI = api
 	return s
 }
 
@@ -321,7 +338,7 @@ func (s *AWSOnboardingService) VerifyConnector(
 	ctx context.Context, workspaceID, id uuid.UUID,
 ) (*models.CloudConnector, error) {
 
-	c, req, err := s.assumeRequestFor(workspaceID, id)
+	_, req, err := s.assumeRequestFor(workspaceID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -344,12 +361,18 @@ func (s *AWSOnboardingService) VerifyConnector(
 		return updated, verr
 	}
 
-	attrs := c.AWSAttrs()
-	attrs.CallerARN = identity.ARN
-	if err := c.SetAWSAttrs(attrs); err != nil {
+	// ONE FIELD, WRITTEN IN PLACE. caller_arn is the only attr a verification
+	// learns. Writing back the whole attrs blob read before the probe -- which
+	// takes seconds, under retries -- silently undid a region change (PATCH
+	// .../connectors/:id) that committed while AWS was answering. jsonb_set
+	// touches caller_arn alone; MarkVerified with no attrs leaves the rest.
+	if err := s.db.Exec(`UPDATE cloud_connector
+		   SET attrs = jsonb_set(attrs, '{caller_arn}', to_jsonb(?::text), true)
+		 WHERE workspace_id = ? AND id = ? AND provider = ?`,
+		identity.ARN, workspaceID, id, models.CloudProviderAWS).Error; err != nil {
 		return nil, err
 	}
-	return s.repo.MarkVerified(workspaceID, id, c.Attrs)
+	return s.repo.MarkVerified(workspaceID, id, nil)
 }
 
 // ConfigForConnector returns an AWS config authenticated as a connector's
@@ -414,9 +437,252 @@ func (s *AWSOnboardingService) Connectors(workspaceID uuid.UUID) ([]models.Cloud
 	return s.repo.List(workspaceID, models.CloudProviderAWS)
 }
 
-// Connector reads one.
+// Connector reads one. On a service pinned to a run (ForRun) it answers that
+// run's connector from the pinned row, so every scanner of the run sees the
+// scope the run was claimed with.
 func (s *AWSOnboardingService) Connector(workspaceID, id uuid.UUID) (*models.CloudConnector, error) {
+	if p := s.pinned; p != nil && p.WorkspaceID == workspaceID && p.ID == id {
+		cp := *p
+		return &cp, nil
+	}
 	return s.repo.Get(workspaceID, id)
+}
+
+// ForRun returns a copy of the service pinned to the connector row as it is
+// NOW, for one scan run.
+//
+// A REGION CHANGE APPLIES FROM THE NEXT SCAN (§5.3 PATCH, D-54: a run keeps
+// the regions it was claimed with). The permission scanner's EKS pass and the
+// workload scanner each read the connector's regions, minutes apart; without
+// the pin, a PATCH landing between them changed the run already in flight --
+// EKS read the old regions, compute the new ones, and the run's coverage
+// described neither selection. The worker pins right after the claim.
+func (s *AWSOnboardingService) ForRun(workspaceID, connectorID uuid.UUID) (*AWSOnboardingService, error) {
+	c, err := s.repo.Get(workspaceID, connectorID)
+	if err != nil {
+		return nil, err
+	}
+	cp := *s
+	cp.pinned = c
+	return &cp, nil
+}
+
+/* ----------------------------- region selection --------------------------- */
+
+// ErrAWSConnectorRevoked refuses an operation on a revoked connection: its
+// ExternalId is purged, so AWS cannot be asked anything through it, and a
+// configuration change would apply to scans that can never run.
+var ErrAWSConnectorRevoked = errors.New("this connection was revoked; re-onboard the account first")
+
+// InvalidRegionsError names the regions a selection cannot contain (§5.3:
+// "422 invalid_region names the offender"): malformed codes, or regions not
+// enabled in the account. An EMPTY selection is one too, with no region to
+// name (D-90): it is not a region list the account could be scanned under.
+type InvalidRegionsError struct {
+	Regions []string
+	Reason  string
+}
+
+func (e *InvalidRegionsError) Error() string {
+	if len(e.Regions) == 0 {
+		return e.Reason
+	}
+	return fmt.Sprintf("%s: %s", e.Reason, strings.Join(e.Regions, ", "))
+}
+
+// RegionSelectionError is a selection longer than the cap: 400 on the
+// parameter, not 422 -- no region in it is at fault.
+type RegionSelectionError struct{ Msg string }
+
+func (e *RegionSelectionError) Error() string { return e.Msg }
+
+// RegionsUnavailableError means the account's ENABLED regions could not be
+// read from AWS: ec2:DescribeRegions was refused or throttled, the role could
+// not be assumed underneath it, or AWS did not answer in time. Err keeps the
+// SDK error chain, so awsdiscovery.FailedCall still names the call and the
+// code AWS returned.
+//
+// It is distinct from every AuthSec-side failure (no secrets store, no base
+// credentials, a connector with no role recorded), which never reach AWS and
+// are 500s: GET .../regions answers THIS one with the selection it holds and
+// the failure stated (200), and PATCH refuses with 422 regions_unavailable,
+// because a selection is never accepted unvalidated (D-90).
+type RegionsUnavailableError struct{ Err error }
+
+func (e *RegionsUnavailableError) Error() string { return e.Err.Error() }
+func (e *RegionsUnavailableError) Unwrap() error { return e.Err }
+
+// EnabledRegions lists the regions enabled in the connector's account
+// (ec2:DescribeRegions through the discovery role; §5.3 GET .../regions), with
+// the connector as it was read.
+//
+// The client is signed for the region assumeRequestFor gives STS
+// (awsdiscovery.SigningRegion): a selected region the account cannot disable
+// when there is one. DescribeRegions is answered from any enabled region, but
+// a selected OPT-IN region may since have been disabled -- the very case this
+// route must be able to show (enabled: false) and a PATCH must be able to
+// remove.
+func (s *AWSOnboardingService) EnabledRegions(
+	ctx context.Context, workspaceID, id uuid.UUID,
+) ([]awsdiscovery.Region, *models.CloudConnector, error) {
+	c, err := s.awsConnector(workspaceID, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.Status == models.CloudConnectorRevoked {
+		return nil, c, ErrAWSConnectorRevoked
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, awsOnboardingTimeout)
+	defer cancel()
+
+	api := s.regionsAPI
+	if api == nil {
+		cfg, _, cerr := s.ConfigForConnector(probeCtx, workspaceID, id, "")
+		if cerr != nil {
+			return nil, c, cerr
+		}
+		api = awsdiscovery.NewRegionsClient(cfg)
+	}
+	regions, err := awsdiscovery.EnabledRegions(probeCtx, api)
+	if err != nil {
+		if ctx.Err() != nil {
+			// The CLIENT went away: nothing to report to AWS's account of it.
+			return nil, c, err
+		}
+		// Our own probe budget firing is a timeout to report as one, never as
+		// a denial or bad input.
+		if probeCtx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("%w: %w", ErrAWSProbeTimeout, err)
+		}
+		return nil, c, &RegionsUnavailableError{Err: err}
+	}
+	return regions, c, nil
+}
+
+// UpdateRegions replaces the connector's region selection (§5.3 PATCH
+// .../connectors/:id). Returns the updated connector and the selection it
+// replaced.
+//
+// Validated in two steps, cheapest first: the codes' shape (no AWS call), then
+// membership of the account's ENABLED regions, read live. Every offender is
+// named. Nothing is written unless the whole selection is valid, and an
+// enabled list that cannot be read refuses the change (RegionsUnavailableError)
+// -- a selection is never accepted unvalidated (D-90). Stored de-duplicated
+// and sorted.
+//
+// Applies from the NEXT scan: a run in flight reads its pinned row (ForRun).
+func (s *AWSOnboardingService) UpdateRegions(
+	ctx context.Context, workspaceID, id uuid.UUID, requested []string,
+) (*models.CloudConnector, []string, error) {
+	c, err := s.awsConnector(workspaceID, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.Status == models.CloudConnectorRevoked {
+		return nil, nil, ErrAWSConnectorRevoked
+	}
+	before := c.AWSAttrs().Regions
+
+	selection, err := normalizeRegionSelection(requested)
+	if err != nil {
+		return nil, before, err
+	}
+
+	enabled, _, err := s.EnabledRegions(ctx, workspaceID, id)
+	if err != nil {
+		return nil, before, err
+	}
+	on := make(map[string]bool, len(enabled))
+	for _, r := range enabled {
+		on[r.Name] = true
+	}
+	var offenders []string
+	for _, r := range selection {
+		if !on[r] {
+			offenders = append(offenders, r)
+		}
+	}
+	if len(offenders) > 0 {
+		return nil, before, &InvalidRegionsError{Regions: offenders,
+			Reason: "not enabled in this AWS account"}
+	}
+
+	updated, err := s.writeRegions(workspaceID, id, selection)
+	if err != nil {
+		return nil, before, err
+	}
+	return updated, before, nil
+}
+
+// writeRegions sets attrs.regions IN PLACE, atomically, on a live connector.
+//
+// jsonb_set rather than a read-modify-write of the whole blob: two writers of
+// different attrs (a verify recording caller_arn, this) must not undo each
+// other. The status predicate refuses a connector revoked since it was read.
+//
+// attrs.regions_ever_selected grows IN THE SAME STATEMENT, from the row as it
+// is at the write -- its recorded history and the selection being replaced (a
+// connector onboarded before PATCH existed has no history recorded: it never
+// changed its selection, so its regions are its whole history) -- plus the new
+// selection, sorted. Computed from the
+// row, never from what the handler read before asking AWS: a second PATCH
+// committing meanwhile must not drop a region from the history, or a later
+// scan would treat that region's earlier results as gone rather than kept and
+// stale (§2.14.13).
+func (s *AWSOnboardingService) writeRegions(
+	workspaceID, id uuid.UUID, regions []string,
+) (*models.CloudConnector, error) {
+	raw, err := json.Marshal(regions)
+	if err != nil {
+		return nil, err
+	}
+	var rows []models.CloudConnector
+	if err := s.db.Raw(`UPDATE cloud_connector
+		   SET attrs = jsonb_set(
+		           jsonb_set(attrs, '{regions}', ?::jsonb, true),
+		           '{regions_ever_selected}',
+		           (SELECT COALESCE(jsonb_agg(u.region ORDER BY u.region), '[]'::jsonb)
+		              FROM (SELECT jsonb_array_elements_text(CASE
+		                             WHEN jsonb_typeof(attrs->'regions_ever_selected') = 'array'
+		                             THEN attrs->'regions_ever_selected' ELSE '[]'::jsonb END) AS region
+		                    UNION
+		                    SELECT jsonb_array_elements_text(CASE
+		                             WHEN jsonb_typeof(attrs->'regions') = 'array'
+		                             THEN attrs->'regions' ELSE '[]'::jsonb END)
+		                    UNION
+		                    SELECT jsonb_array_elements_text(?::jsonb)) u
+		             WHERE u.region <> ''),
+		           true),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ? AND provider = ? AND status <> ?
+		RETURNING *`,
+		string(raw), string(raw), workspaceID, id, models.CloudProviderAWS, models.CloudConnectorRevoked,
+	).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		// Revoked (or removed) between the read and the write.
+		if _, gerr := s.awsConnector(workspaceID, id); gerr != nil {
+			return nil, gerr
+		}
+		return nil, ErrAWSConnectorRevoked
+	}
+	return &rows[0], nil
+}
+
+// awsConnector reads a connector of this workspace that is an AWS connector;
+// anything else is not found (a GCP connector id on an AWS route is absent,
+// not a type error that confirms the id exists).
+func (s *AWSOnboardingService) awsConnector(workspaceID, id uuid.UUID) (*models.CloudConnector, error) {
+	c, err := s.repo.Get(workspaceID, id)
+	if err != nil {
+		return nil, err
+	}
+	if c.Provider != models.CloudProviderAWS {
+		return nil, repositories.ErrCloudConnectorNotFound
+	}
+	return c, nil
 }
 
 /* --------------------------------- helpers -------------------------------- */
@@ -444,10 +710,11 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	if attrs.RoleARN == "" {
 		return nil, empty, errors.New("connector has no role arn recorded; re-run onboarding")
 	}
-	region := ""
-	if len(attrs.Regions) > 0 {
-		region = attrs.Regions[0]
-	} else {
+	// Signed for a selected region the account cannot disable, when there is
+	// one -- never merely the first of a SORTED selection (D-90), which an
+	// opt-in region the account later disabled would make unanswerable.
+	region := awsdiscovery.SigningRegion(attrs.Regions)
+	if region == "" {
 		return nil, empty, errors.New("connector has no regions in scope; re-run onboarding")
 	}
 
@@ -521,5 +788,45 @@ func normalizeRegions(in []string) ([]string, error) {
 	if len(out) > maxRegionsPerConnector {
 		return nil, fmt.Errorf("at most %d regions may be selected", maxRegionsPerConnector)
 	}
+	return out, nil
+}
+
+// normalizeRegionSelection is normalizeRegions for a region CHANGE (PATCH
+// .../connectors/:id, D-90), where the caller must be told every malformed
+// code at once (422 invalid_region names the offenders), not just the first.
+// Duplicates are removed and the result is SORTED: a selection is a set, and
+// storing it in one canonical order keeps the audit's before/after comparable.
+// An empty selection is 422 invalid_region too -- no scan scope at all -- and
+// only a selection over the cap is a 400.
+func normalizeRegionSelection(in []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	var malformed []string
+	for _, r := range in {
+		r = strings.ToLower(strings.TrimSpace(r))
+		if r == "" {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		if err := awsdiscovery.ValidateRegion(r); err != nil {
+			malformed = append(malformed, r)
+			continue
+		}
+		out = append(out, r)
+	}
+	if len(malformed) > 0 {
+		sort.Strings(malformed)
+		return nil, &InvalidRegionsError{Regions: malformed, Reason: "not AWS region codes"}
+	}
+	if len(out) == 0 {
+		return nil, &InvalidRegionsError{Regions: []string{}, Reason: "select at least one AWS region to scan"}
+	}
+	if len(out) > maxRegionsPerConnector {
+		return nil, &RegionSelectionError{Msg: fmt.Sprintf("at most %d regions may be selected", maxRegionsPerConnector)}
+	}
+	sort.Strings(out)
 	return out, nil
 }

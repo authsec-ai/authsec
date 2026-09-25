@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -149,14 +150,18 @@ const (
 	// keep prior findings visible without claiming it re-confirmed them.
 	CloudCoverageStale = "stale"
 
-	// CloudCoverageUnsupported is a surface AuthSec has built no collector for.
+	// CloudCoverageUnsupported: nothing there is claimed, for one of two
+	// reasons (§1.4) -- the service is not offered in that region (its regional
+	// endpoint does not resolve; awsdiscovery.ErrServiceNotInRegion), or AuthSec
+	// does not collect the surface at all (organizations: SCPs are not read).
 	//
 	// Distinct from denied and from not_configured, and the distinction is the
 	// whole point: denied is the customer's to fix by granting a permission,
-	// not_configured is their deliberate choice, and unsupported is OURS to
-	// build. Collapsing them lets a gap in our product read as a gap in their
-	// estate. CloudTrail is the live example -- the role template grants it and
-	// no collector calls it.
+	// not_configured is their deliberate choice, and unsupported is neither --
+	// nobody can fix it, because there is nothing to read. Collapsing them lets
+	// a gap in our product, or in AWS's regional footprint, read as a gap in
+	// their estate. NEVER inferred from AccessDenied: an SCP or a region opt-out
+	// produces that too (§2.14.13), and a false unsupported licenses deletion.
 	CloudCoverageUnsupported = "unsupported"
 
 	// CloudCoverageNotSelected is a surface excluded from the scan's selected
@@ -229,6 +234,11 @@ const (
 	SurfaceIAMUsers      = "iam_users"
 	SurfaceIAMAccessKeys = "iam_access_keys"
 	SurfaceIAMPolicies   = "iam_policies"
+	// SurfaceIAMGroups is the groups-and-memberships read (035). Required by
+	// the member_of partition and by every policy, statement, assignment and
+	// grant partition (§4.10): a policy attached only to a group is seen only
+	// when groups are read.
+	SurfaceIAMGroups = "iam_groups"
 	// SurfacePolicyDocuments covers parsing what those APIs returned, as
 	// opposed to fetching it. A document can be fetched successfully and still
 	// be unreadable.
@@ -248,15 +258,143 @@ const (
 	SurfaceEKSPodIdentity = "eks_pod_identity"
 )
 
+// SCANNER-LEVEL FAILURE MARKERS. These are not surfaces a scan reads; they are
+// written by FinalizeCoverage ONLY when a scanner returned an error before
+// producing a snapshot at all, standing in for every surface it never got to
+// attempt.
+//
+// Their PRESENCE is therefore proof of failure, and their ABSENCE proves
+// nothing -- which is the opposite of an ordinary surface, where absence means
+// "did not look". Reconciliation keeps them in a separate veto list
+// (Partition.RequiredScanners) for exactly that reason.
+//
+// Promoted from string literals in FinalizeCoverage and in the workload
+// scanner so the partition table and the writer cannot drift by a typo.
+const (
+	SurfacePermissionScan = "permission_scan"
+	SurfaceWorkloadScan   = "workload_scan"
+	// SurfaceComputePrefix + region is the stand-in written when a region's
+	// client config fails or the region was never selected. It is NOT a
+	// success key: a clean regional read reports lambda:<region> and friends,
+	// never this. Treating it as a required surface would mean no partition
+	// could ever close.
+	SurfaceComputePrefix = "compute:"
+)
+
+// SurfaceCompute names the per-region compute stand-in surface.
+func SurfaceCompute(region string) string { return SurfaceComputePrefix + region }
+
+// The rest of the coverage vocabulary (§1.4, §4.10: "the surface names are
+// models.Surface* constants, not invented strings"). Promoted from literals in
+// the scanners so a writer and a reader cannot drift by a typo.
+const (
+	// SurfaceActivity is Access Advisor (GenerateServiceLastAccessedDetails):
+	// partial above the per-scan identity cap, throttled on throttle (T3.7).
+	SurfaceActivity = "activity"
+	// SurfaceIAMCredentialReport is the account credential report. Bonus
+	// evidence, merged only at FinalizeCoverage.
+	SurfaceIAMCredentialReport = "iam_credential_report"
+	// SurfaceResourcePolicies is the per-resource GetBucketPolicy/GetKeyPolicy
+	// read; per-resource failures are counted (T3.7), never silently reached.
+	SurfaceResourcePolicies = "resource_policies"
+	// SurfaceOrganizations is AWS Organizations and SCPs, which AuthSec does
+	// not collect. Always reported unsupported (§1.2, §1.4, T3.8), so coverage
+	// can say what that prevents instead of staying silent about it.
+	SurfaceOrganizations = "organizations"
+)
+
+// Regional surface prefixes: each is reported as "<prefix>:<region>"
+// (SurfaceRegional), one key per service per selected region (§1.4).
+const (
+	SurfaceLambdaPrefix                = "lambda"
+	SurfaceECSPrefix                   = "ecs"
+	SurfaceEC2Prefix                   = "ec2"
+	SurfaceBedrockAgentsPrefix         = "bedrock-agents"
+	SurfaceBedrockAgentCorePrefix      = "bedrock-agentcore"
+	SurfaceAgentCoreGatewaysPrefix     = "agentcore-gateways"
+	SurfaceAgentCoreIdentitiesPrefix   = "agentcore-workload-identities"
+	SurfaceAgentCoreCredProviderPrefix = "agentcore-credential-providers"
+	SurfaceCloudTrailEventsPrefix      = "cloudtrail-events"
+	SurfaceCloudTrailStatusPrefix      = "cloudtrail-status"
+)
+
+// SurfaceRegional names one service's surface in one region: "ecs:eu-west-1".
+func SurfaceRegional(prefix, region string) string { return prefix + ":" + region }
+
+// OrganizationsCoverage is the fixed entry every AWS scan reports for
+// SurfaceOrganizations. unsupported, so ScanCoverage.Complete skips it and no
+// reconciliation gate ever waits on it; the Error is AuthSec's own words
+// because there are no provider words for a call never made.
+func OrganizationsCoverage() SurfaceCoverage {
+	return SurfaceCoverage{
+		State: CloudCoverageUnsupported,
+		Error: "AWS Organizations and service control policies (SCPs) are not collected by AuthSec",
+	}
+}
+
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`
-	// Count is how many objects were read. Only meaningful when State is
-	// reached — a count from a denied surface is a floor, not a total.
+	// CappedAfter is set when a per-scan cap, not a failure, stopped the read
+	// (activity above its identity cap, T3.7): the native id of the LAST item
+	// read, in the surface's deterministic order -- byte order of the ARN
+	// (D-86). An item that sorts after it was not read this run, so its
+	// activity is "not collected", never "no attempt reported". Stamped by the
+	// collector so no reader has to re-derive the sample from a later
+	// inventory.
+	CappedAfter string `json:"capped_after,omitempty"`
+	// Count is how many objects were read. A total when State is reached; a
+	// FLOOR otherwise -- for partial, the rows that were read, with Error
+	// naming how many were not (§1.4: "the report names how many"). One
+	// exception, recorded in D-93: resource_policies counts its FAILED reads
+	// whenever it is not reached.
 	Count int `json:"count"`
-	// Error is the provider's own words when State is not reached.
+	// Error says why State is not reached: the failed call and the provider's
+	// error code, or for partial "N of M <items> could not be read: <call>
+	// <code>". Never a guessed missing permission (§2.14.13).
 	Error string `json:"error,omitempty"`
+
+	// The structured half of Error (P2-DECISIONS D-71), stamped at collection
+	// so a reader never parses the prose back into a code. All optional and
+	// additive: a run collected before they existed decodes with them empty,
+	// and the reader answers null.
+	//
+	// Stamped by whichever layer named the call: IAM through
+	// awsdiscovery.APICallError, the workload and permission scanners through
+	// awsdiscovery.CallName and AWSErrorCode (a named call), anything else
+	// through awsdiscovery.FailedCall (the SDK's own operation error). For
+	// partial, the FIRST failing call.
+	//
+	// API is the call that failed, as an operator would search for it
+	// ("iam:GetAccountAuthorizationDetails (Groups)"); ErrorCode is the code
+	// AWS returned ("AccessDenied"). Both empty unless the collector KNOWS
+	// them -- never guessed from the message (§2.14.13: name the call, not a
+	// guess at the fix).
+	API       string `json:"api,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	// Items names each unreadable document under policy_documents, at most
+	// CoverageItemLimit of them; Truncated says more were unreadable than are
+	// listed (the count is in Error).
+	Items     []CoverageItem `json:"items,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
 }
+
+// CoverageItem is one document policy_documents could not read (D-71):
+// Policy names it as the operator knows it ("TicketRead", "ReadData (inline
+// on SharedToolRole)", "trust policy of SharedToolRole"), Version is the
+// managed policy's default version ("" for inline and trust documents), and
+// Error is the reason recorded on its row (cloud_policy.document_error or
+// cloud_identity.trust_parse_error) as collection wrote it.
+type CoverageItem struct {
+	Policy  string `json:"policy"`
+	Version string `json:"version"`
+	Error   string `json:"error"`
+}
+
+// CoverageItemLimit bounds SurfaceCoverage.Items (D-71): coverage lives in a
+// jsonb column on every run, and an account with thousands of unreadable
+// documents must not write a report that size each scan.
+const CoverageItemLimit = 100
 
 // ScanCoverage is the typed shape of CloudConnector.Coverage: the durable
 // report of what a scan could and could not read.
@@ -348,6 +486,9 @@ func DecodeScanCoverage(raw json.RawMessage) ScanCoverage {
 const (
 	CloudIdentityIAMRole = "iam_role"
 	CloudIdentityIAMUser = "iam_user"
+	// CloudIdentityIAMGroup is kind 'iam_group' (035). cloud_identity_kind_chk
+	// only requires kind <> '', so no constraint change was needed.
+	CloudIdentityIAMGroup = "iam_group"
 
 	// GCP. A service account is the only identity kind GCP discovery writes
 	// today; workload-identity and federated principals arrive with the
@@ -405,6 +546,14 @@ type CloudIdentity struct {
 	Enabled    bool            `json:"enabled" gorm:"not null;default:true"`
 	Attrs      json.RawMessage `json:"attrs" gorm:"type:jsonb;not null;default:'{}'"`
 
+	// The role's trust document, verbatim (035), so the projector parses Allow
+	// AND Deny statements with their conditions. TrustParseError is non-empty
+	// when the document could not be parsed: that role's trust edges go stale,
+	// never ended (§4.10).
+	TrustDocument     json.RawMessage `json:"trust_document,omitempty" gorm:"type:jsonb"`
+	TrustDocumentHash string          `json:"trust_document_hash" gorm:"not null;default:''"`
+	TrustParseError   string          `json:"trust_parse_error" gorm:"not null;default:''"`
+
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt         time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
@@ -445,6 +594,18 @@ type AWSIdentityAttrs struct {
 	// The document itself is parsed in the next ticket into cloud_assume_edge;
 	// this is only the flag that says there is something to parse.
 	HasTrustPolicy bool `json:"has_trust_policy,omitempty"`
+	// InstanceProfiles are the instance profiles a role is in, from its
+	// authorization-details entry (§1.4 l.209, P2-DECISIONS D-52), replaced on
+	// every read. DESCRIPTIVE ONLY: not projected and not copied into
+	// provider_attrs -- an EC2 instance's executes_as still resolves through
+	// iam:GetInstanceProfile, which names the role the instance actually uses.
+	InstanceProfiles []AWSInstanceProfile `json:"instance_profiles,omitempty"`
+}
+
+// AWSInstanceProfile is one instance profile a role belongs to.
+type AWSInstanceProfile struct {
+	ARN  string `json:"arn"`
+	Name string `json:"name"`
 }
 
 // AWSAttrs decodes Attrs as the AWS shape.
@@ -530,6 +691,20 @@ type AWSConnectorAttrs struct {
 	// every region AWS happens to have enabled.
 	Regions []string `json:"regions,omitempty"`
 
+	// RegionsEverSelected is every region the selection has ever held -- the
+	// onboarding selection and each PATCH .../connectors/:id since (D-54),
+	// sorted -- maintained by the PATCH in the same UPDATE as Regions. Absent
+	// on a connector whose selection never changed, which is every connector
+	// onboarded before PATCH existed: its Regions are then the whole history.
+	//
+	// It is how a scan knows which regions it is NOT reading that an earlier
+	// scan did: their earlier results are kept and marked stale (§2.14.13
+	// l.1856-1859), never taken as gone. Nothing else records it -- a
+	// deselected region's rows are the evidence that vanishes, and a region
+	// that held nothing leaves no row at all. Read it through
+	// DeselectedRegions.
+	RegionsEverSelected []string `json:"regions_ever_selected,omitempty"`
+
 	// CallerARN is what sts:GetCallerIdentity returned the last time the
 	// connection was proven: the assumed-role ARN, not the role ARN. Evidence of
 	// what we actually became, kept because it is the only thing that
@@ -552,6 +727,27 @@ func (c *CloudConnector) AWSAttrs() AWSConnectorAttrs {
 	}
 	_ = json.Unmarshal(c.Attrs, &a)
 	return a
+}
+
+// DeselectedRegions lists, sorted, the regions the selection once held and no
+// longer does: regions an earlier scan may have read and this one will not.
+// Empty when the selection only ever grew.
+func (a AWSConnectorAttrs) DeselectedRegions() []string {
+	selected := make(map[string]bool, len(a.Regions))
+	for _, r := range a.Regions {
+		selected[r] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range a.RegionsEverSelected {
+		if r == "" || selected[r] || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SetAWSAttrs encodes the AWS shape into Attrs.
@@ -1303,6 +1499,11 @@ type AWSWorkloadAttrs struct {
 	InstanceProfileARN string `json:"instance_profile_arn,omitempty"`
 	// EnvVarNames are Lambda environment variable names. NEVER values.
 	EnvVarNames []string `json:"env_var_names,omitempty"`
+	// EnvVarsUnread: AWS returned the function's environment as an error
+	// (EnvironmentResponse.Error, e.g. Lambda could not decrypt the variables
+	// with the function's KMS key) instead of its variables, so no names were
+	// read -- EnvVarNames empty then means unknown, never "has none".
+	EnvVarsUnread bool `json:"env_vars_unread,omitempty"`
 	// FoundationModel is the Bedrock agent's model id.
 	FoundationModel string `json:"foundation_model,omitempty"`
 	// Status is the provider's own lifecycle string, verbatim.
@@ -1311,6 +1512,38 @@ type AWSWorkloadAttrs struct {
 	// not find in inventory, so an unattributed row still says which role it
 	// was looking for.
 	UnresolvedRoleARN string `json:"unresolved_role_arn,omitempty"`
+
+	// DetailIncomplete: the workload was LISTED but its detail call failed
+	// (GetAgent, DescribeTaskDefinition, GetAgentRuntime, GetGateway,
+	// GetInstanceProfile). Its execution role is UNKNOWN this run -- not
+	// absent -- so the repository keeps the previous row's attribution and
+	// attrs instead of blanking them, and the projector leaves the execution
+	// role state and edges as they were rather than writing "none" (D-53).
+	// DetailError names the call and the AWS error code.
+	DetailIncomplete bool   `json:"detail_incomplete,omitempty"`
+	DetailError      string `json:"detail_error,omitempty"`
+
+	// GatewayTargets are an AgentCore gateway's targets, which §1.4 makes
+	// ATTRIBUTES of the gateway, not objects. TargetsIncomplete is set when
+	// ListGatewayTargets failed; the previous list is then kept, never
+	// replaced by an empty one.
+	GatewayTargets    []AWSGatewayTarget `json:"gateway_targets,omitempty"`
+	TargetsIncomplete bool               `json:"targets_incomplete,omitempty"`
+}
+
+// AWSGatewayTarget is one AgentCore gateway target: id, name, status and type
+// verbatim (§1.4). Its backing tool is not collected (§1.2).
+//
+// The JSON keys are exactly the workload detail's provider_attrs shape,
+// gateway_targets [{id, name, status, type}] (D-85), so the projector copies
+// the list as stored instead of renaming keys on the way through. All four
+// keys on every target, "" when AWS returned none: the shape is the contract,
+// and a key that comes and goes with the data is not a shape.
+type AWSGatewayTarget struct {
+	TargetID string `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Type     string `json:"type"`
 }
 
 // AWSAttrs decodes the AWS attrs, returning the zero value on anything

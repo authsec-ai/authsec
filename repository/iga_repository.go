@@ -613,25 +613,61 @@ func (r *igaRepository) ListAgents(workspaceID uuid.UUID, rollup string, limit, 
 	return out, total, err
 }
 
+// THE GITHUB WRITER. It changes ONLY where the shared schema forces it
+// (SPEC-iga-phase2-graph.md §1.5, T4.8): every row it writes is stamped
+// provider = 'github', and an access edge carries the typed subject alongside
+// the legacy pair. It is NOT keyed: GitHub recognition keys would duplicate
+// every existing GitHub row once on upgrade, with nothing to retire the old
+// ones, so GitHub rows keep source_key = '' and stay outside every unique
+// index the AWS projector conflicts on.
+
 func (r *igaRepository) UpsertIdentityAccount(a *models.IGAIdentityAccount) error {
+	if a.Provider == "" {
+		a.Provider = models.ProviderGitHub
+	}
 	return r.db.Create(a).Error
 }
 func (r *igaRepository) UpsertCredential(c *models.IGACredential) error {
+	if c.Provider == "" {
+		c.Provider = models.ProviderGitHub
+	}
 	return r.db.Create(c).Error
 }
 func (r *igaRepository) UpsertResource(res *models.IGAResource) error {
+	if res.Provider == "" {
+		res.Provider = models.ProviderGitHub
+	}
 	return r.db.Create(res).Error
 }
 func (r *igaRepository) UpsertEntitlement(e *models.IGAEntitlement) error {
-	return r.db.Create(e).Error
-}
-func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
+	if e.Provider == "" {
+		e.Provider = models.ProviderGitHub
+	}
 	return r.db.Create(e).Error
 }
 
+// UpsertAccessEdge writes BOTH subject forms until 037 (030 is expand only):
+// the legacy subject_kind / subject_id that the 0e75ad7 binary and
+// GET .../agents/:id/access-paths read, and the typed column derived from them
+// -- so iga_access_edges_subject_agree_chk holds by construction.
+func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
+	if e.Provider == "" {
+		e.Provider = models.ProviderGitHub
+	}
+	if e.SubjectKind == "identity_account" && e.SubjectIdentityAccountID == nil {
+		id := e.SubjectID
+		e.SubjectIdentityAccountID = &id
+	}
+	return r.db.Create(e).Error
+}
+
+// ListAccessEdges keeps its BASE semantics -- any subject, by subject_id --
+// and reads GitHub's rows only. The graph branch hard-coded the agent subject
+// column here; that changed what GitHub's access paths returned.
 func (r *igaRepository) ListAccessEdges(workspaceID uuid.UUID, subjectID uuid.UUID) ([]models.IGAAccessEdge, error) {
 	var out []models.IGAAccessEdge
-	err := r.db.Where("workspace_id = ? AND subject_id = ?", workspaceID, subjectID).
+	err := r.db.Where("workspace_id = ? AND subject_id = ? AND provider = ?",
+		workspaceID, subjectID, models.ProviderGitHub).
 		Order("direction, created_at").Find(&out).Error
 	return out, err
 }
@@ -899,7 +935,9 @@ func (r *igaRepository) ListCandidatesCursor(workspaceID uuid.UUID, state string
 }
 
 func (r *igaRepository) ListIdentityAccounts(workspaceID uuid.UUID, after *CursorKeyT, limit int) ([]models.IGAIdentityAccount, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
+	// GitHub's rows only: AWS identities share this table (028) and must not
+	// appear in GET /api/iga/v1/identity-accounts (§1.5, E16).
+	q := r.db.Where("workspace_id = ? AND provider = ?", workspaceID, models.ProviderGitHub)
 	var out []models.IGAIdentityAccount
 	err := afterCursor(q, after).Order("created_at DESC, id DESC").Limit(limit).Find(&out).Error
 	return out, err
@@ -935,15 +973,15 @@ func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UU
 		p := AccessPath{Edge: edges[i]}
 		if edges[i].EntitlementID != nil {
 			var e models.IGAEntitlement
-			if err := r.db.First(&e, "id = ? AND workspace_id = ?",
-				*edges[i].EntitlementID, workspaceID).Error; err == nil {
+			if err := r.db.First(&e, "id = ? AND workspace_id = ? AND provider = ?",
+				*edges[i].EntitlementID, workspaceID, models.ProviderGitHub).Error; err == nil {
 				p.Entitlement = &e
 			}
 		}
 		if edges[i].ResourceID != nil {
 			var res models.IGAResource
-			if err := r.db.First(&res, "id = ? AND workspace_id = ?",
-				*edges[i].ResourceID, workspaceID).Error; err == nil {
+			if err := r.db.First(&res, "id = ? AND workspace_id = ? AND provider = ?",
+				*edges[i].ResourceID, workspaceID, models.ProviderGitHub).Error; err == nil {
 				p.Resource = &res
 			}
 		}
@@ -954,7 +992,8 @@ func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UU
 
 func (r *igaRepository) ListCredentialsFor(workspaceID, identityAccountID uuid.UUID) ([]models.IGACredential, error) {
 	var out []models.IGACredential
-	err := r.db.Where("workspace_id = ? AND identity_account_id = ?", workspaceID, identityAccountID).
+	err := r.db.Where("workspace_id = ? AND identity_account_id = ? AND provider = ?",
+		workspaceID, identityAccountID, models.ProviderGitHub).
 		Order("created_at DESC").Find(&out).Error
 	return out, err
 }

@@ -95,6 +95,10 @@ jobs:
       DB_NAME: authsec
       DB_SSLMODE: disable
       RUN_INTEGRATION: "1"
+      # Without this the whole tests/integration suite SKIPS (igaDB checks it)
+      # and `go test` prints ok while running nothing -- the exact trap the
+      # Phase 2 review flagged. Point it at the migrated service DB below.
+      IGA_TEST_DSN: postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable
 
     steps:
       - uses: actions/checkout@v6
@@ -113,5 +117,21 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      # The integration harness (igaDB) expects the schema to already exist --
+      # it inserts into workspaces/cloud_* rather than building them. Apply
+      # every migration in order, each file in its own transaction because 006
+      # uses CREATE TEMP TABLE ... ON COMMIT DROP.
+      - name: Apply migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in migrations/master/0*.sql; do
+            psql -h localhost -U postgres -d authsec -v ON_ERROR_STOP=1 -1 -f "$f" >/dev/null
+          done
+
       - name: Integration tests
+        # NOTE: TestIGACheckpointsAndSurvivorship is a known pre-existing
+        # failure in the scan-checkpoint path, unrelated to the graph work.
+        # This job is opt-in (run-integration label) and NOT part of the merge
+        # gate, so that failure surfaces here without blocking merges.
         run: go test ./tests/unit/ ./tests/integration/... -v -timeout 120s

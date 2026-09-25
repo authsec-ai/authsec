@@ -174,6 +174,11 @@ Resources:
               # exactly one role, and resolving it needs this second call. EC2
               # is the only workload with that hop.
               #
+              # ec2:DescribeRegions lists the regions ENABLED in this account,
+              # so the console can offer them and AuthSec can refuse a region
+              # selection the account has not opted in to. It returns region
+              # names and opt-in status only.
+              #
               # These may already be covered by SecurityAudit - they are
               # Describe/List reads of exactly the kind it exists to grant -
               # but that has never been confirmed against a live policy
@@ -188,6 +193,7 @@ Resources:
                   - ecs:ListTaskDefinitions
                   - ecs:DescribeTaskDefinition
                   - ec2:DescribeInstances
+                  - ec2:DescribeRegions
                   - iam:GetInstanceProfile
                 Resource: '*'
 
@@ -201,9 +207,15 @@ Resources:
                   - bedrock:GetAgent
                 Resource: '*'
 
-              # Bedrock AgentCore. List-only on the credential providers: the
+              # Bedrock AgentCore. List-only on the CREDENTIAL PROVIDERS: the
               # List calls return provider names and ARNs, and there is
-              # deliberately no Get here, because that is where a value would be.
+              # deliberately no credential-provider Get here, because that is
+              # where a value would be.
+              #
+              # GetGateway is a different kind of Get: a gateway holds no
+              # credential value. ListGateways returns neither the gateway's
+              # ARN nor the role it runs as, and without GetGateway a gateway
+              # is recorded under its bare id with no execution identity.
               - Sid: BedrockAgentCore
                 Effect: Allow
                 Action:
@@ -213,6 +225,7 @@ Resources:
                   - bedrock-agentcore:ListOauth2CredentialProviders
                   - bedrock-agentcore:ListApiKeyCredentialProviders
                   - bedrock-agentcore:ListGateways
+                  - bedrock-agentcore:GetGateway
                   - bedrock-agentcore:ListGatewayTargets
                 Resource: '*'
 

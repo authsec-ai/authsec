@@ -332,12 +332,7 @@ func (s *GCPScanner) upsertServiceAccount(
 		return gcpWrittenIdentity{}, err
 	}
 
-	// Not a partial read: GCP lists service accounts with their full shape in one
-	// call, and a project it could not read fails the scan outright rather than
-	// yielding a half-populated account. So this always carries a complete blob,
-	// and attrs is refreshed as before -- Disabled in particular is a state
-	// transition that must land.
-	stored, _, err := s.identities.UpsertIdentity(identity, false)
+	stored, _, err := s.identities.UpsertIdentity(identity)
 	if err != nil {
 		return gcpWrittenIdentity{}, err
 	}

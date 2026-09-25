@@ -36,8 +36,15 @@ type CloudScanRunRepository interface {
 	Enqueue(workspaceID, connectorID uuid.UUID, trigger string) (*models.CloudScanRun, error)
 
 	// Claim takes ownership of one claimable run for `owner`, for `lease`.
-	// Returns nil when there is nothing to claim.
+	// Returns nil when there is nothing to claim. This is the Phase 1 claim:
+	// it names no Phase 2 table, so it runs against any schema.
 	Claim(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
+
+	// ClaimForPipeline is Claim with the projection predicate: a connector
+	// whose previous run is still being projected is not claimable (§4.5).
+	// Used ONLY when IGA_GRAPH_PROJECTION is on and verified -- the switch
+	// decides, never a probe of the schema (§2.8).
+	ClaimForPipeline(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
 
 	// Renew extends a lease the caller still holds. ErrLeaseLost otherwise.
 	Renew(runID uuid.UUID, owner string, version int64, lease time.Duration) error
@@ -46,8 +53,48 @@ type CloudScanRunRepository interface {
 	// still holds the fence token it claimed.
 	Publish(runID uuid.UUID, owner string, version int64) error
 
+	// PublishWithCoverage persists this run's coverage, publishes it, and runs
+	// `after` -- ALL IN ONE TRANSACTION, under the caller's fence.
+	//
+	// This reverses the previous ordering deliberately. The old sequence was
+	// Publish -> FinalizeCoverage -> SetCoverage (best effort), and the comment
+	// there argued publication must come first so a superseded worker could not
+	// overwrite the winner's coverage. THE FENCE ALREADY GUARANTEES THAT, and
+	// inside one transaction the ordering of the two writes is not observable.
+	//
+	// What the old sequence could not guarantee is that a published run always
+	// has its coverage. A crash in the gap made the loss permanent -- and the
+	// projection job would then read absent coverage, canEnd would refuse every
+	// partition, and the graph would silently never close anything.
+	//
+	// `after` is where the projection job is enqueued and the pipeline flips to
+	// projecting. Both must be atomic with publication: a published run that
+	// never got a job is work that silently never happens.
+	//
+	// COVERAGE STOPS BEING BEST-EFFORT: a scan whose coverage cannot be stored
+	// has not published.
+	PublishWithCoverage(
+		runID uuid.UUID, owner string, version int64,
+		coverage models.ScanCoverage,
+		after func(tx *gorm.DB, run *models.CloudScanRun) error,
+	) error
+
 	// Fail marks a run finished without publishing, under the same fence.
 	Fail(runID uuid.UUID, owner string, version int64, reason string) error
+
+	// FailTx is Fail in the caller's transaction, so a run's failure and the
+	// pipeline barrier's release commit together (§2.10A: nothing returns the
+	// barrier to idle without the run already being terminal).
+	FailTx(tx *gorm.DB, runID uuid.UUID, owner string, version int64, reason string) error
+
+	// Requeue returns a claimed run to the queue WITHOUT counting it as a
+	// failure.
+	//
+	// Used when the workspace pipeline barrier (§2.10A) is held by another
+	// connector: nothing went wrong with this run, it simply cannot start yet.
+	// Marking it failed would burn an attempt and eventually give up on a scan
+	// that was only ever waiting its turn.
+	Requeue(runID uuid.UUID, owner string, version int64) error
 
 	// SetCoverage stamps this run's own final coverage report. Not fenced by
 	// lease version: Publish already cleared lease_owner on success, so the
@@ -59,6 +106,50 @@ type CloudScanRunRepository interface {
 
 	Get(runID uuid.UUID) (*models.CloudScanRun, error)
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
+
+	// History lists one connector's runs, newest first, keyset-paged on
+	// (requested_at DESC, id DESC) -- every run however it ended, each with
+	// what became of its projection (GET .../connectors/:id/scan-runs, §5.3,
+	// D-91). limit is the page size the caller wants; it asks for one more to
+	// learn whether another page exists.
+	//
+	// requested_at is the run's last (re)queue time (D-55): a refused claim
+	// moves a LIVE run's forward. Only the connector's one live run can move,
+	// and it moves toward the head of the list, so a client paging older runs
+	// never skips a terminal one.
+	History(workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int) ([]ScanRunRecord, error)
+
+	// GetWithProjection reads one run of the workspace together with what
+	// became of its projection, in ONE statement -- so a run and its job are
+	// never read either side of the projection's commit (GET .../scan-runs/:id
+	// gains projection: {status, rev}, §5.3). A run of another workspace is
+	// ErrCloudScanRunNotFound, exactly like an absent one.
+	GetWithProjection(workspaceID, runID uuid.UUID) (*ScanRunRecord, error)
+}
+
+// ScanRunPosition is where a history page ended: the last row's sort key.
+type ScanRunPosition struct {
+	RequestedAt time.Time
+	ID          uuid.UUID
+}
+
+// RunProjection is a run's projection job and the publication it produced.
+// 033 makes both at most one per run: iga_projection_job_run_key UNIQUE
+// (scan_run_id), iga_publication_run_key UNIQUE (workspace_id, scan_run_id).
+type RunProjection struct {
+	JobStatus string
+	Attempts  int
+	LastError string
+	// Rev is the revision this run's projection published, nil until then --
+	// and nil for good when the job was abandoned or superseded.
+	Rev         *int64
+	PublishedAt *time.Time
+}
+
+// ScanRunRecord is one row of a connector's run history.
+type ScanRunRecord struct {
+	Run        models.CloudScanRun
+	Projection *RunProjection
 }
 
 type cloudScanRunRepository struct{ db *gorm.DB }
@@ -96,6 +187,18 @@ func (r *cloudScanRunRepository) Enqueue(
 func (r *cloudScanRunRepository) Claim(
 	owner string, lease time.Duration, now time.Time,
 ) (*models.CloudScanRun, error) {
+	return r.claim(owner, lease, now, false)
+}
+
+func (r *cloudScanRunRepository) ClaimForPipeline(
+	owner string, lease time.Duration, now time.Time,
+) (*models.CloudScanRun, error) {
+	return r.claim(owner, lease, now, true)
+}
+
+func (r *cloudScanRunRepository) claim(
+	owner string, lease time.Duration, now time.Time, pipeline bool,
+) (*models.CloudScanRun, error) {
 	if owner == "" {
 		return nil, errors.New("a claim needs an owner")
 	}
@@ -112,7 +215,31 @@ func (r *cloudScanRunRepository) Claim(
 	// the previous holder: it recorded the old value, and every later operation
 	// of its own demands the row still carry it.
 	var out []models.CloudScanRun
-	err := r.db.Raw(`
+
+	// The projection predicate names iga_projection_job. It is included only
+	// in pipeline mode, which the IGA_GRAPH_PROJECTION switch decides after
+	// verifying the schema -- so the Phase 1 claim never names a Phase 2 table
+	// and runs unchanged against any schema (S1, §7.5).
+	projectionPredicate := ""
+	if pipeline {
+		// A connector whose previous run is still being projected is not
+		// claimable (SPEC §4.5). The projection reads that run's inventory,
+		// and a new scan would rewrite it underneath.
+		//
+		// TWO CONSEQUENCES, ACCEPTED DELIBERATELY:
+		//   * a WEDGED PROJECTION BLOCKS SCANNING for that connector. That is
+		//     why iga_projection_job has an attempts ceiling and terminal
+		//     states, and why RecoverStalled exists. ALERT ON queued/running
+		//     JOBS OLDER THAN ONE LEASE.
+		//   * scan throughput is bounded by projection. Acceptable at one
+		//     connector per customer and a projection measured in seconds.
+		projectionPredicate = `AND NOT EXISTS (
+			       SELECT 1 FROM iga_projection_job j
+			        WHERE j.connector_id = cloud_scan_run.connector_id
+			          AND j.status IN (?, ?))`
+	}
+
+	query := `
 		UPDATE cloud_scan_run SET
 			status           = ?,
 			lease_owner      = ?,
@@ -128,18 +255,25 @@ func (r *cloudScanRunRepository) Claim(
 			updated_at       = ?
 		WHERE id = (
 			SELECT id FROM cloud_scan_run
-			 WHERE status = ?
-			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			 WHERE (status = ?
+			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			   ` + projectionPredicate + `
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED
 			 LIMIT 1
 		)
-		RETURNING *`,
+		RETURNING *`
+
+	args := []any{
 		models.CloudScanRunRunning, owner, expires, now,
 		now,
 		models.CloudScanRunQueued,
 		models.CloudScanRunRunning, now,
-	).Scan(&out).Error
+	}
+	if projectionPredicate != "" {
+		args = append(args, models.ProjectionQueued, models.ProjectionRunning)
+	}
+	err := r.db.Raw(query, args...).Scan(&out).Error
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +303,49 @@ func (r *cloudScanRunRepository) Publish(runID uuid.UUID, owner string, version 
 	})
 }
 
+func (r *cloudScanRunRepository) PublishWithCoverage(
+	runID uuid.UUID, owner string, version int64,
+	coverage models.ScanCoverage,
+	after func(tx *gorm.DB, run *models.CloudScanRun) error,
+) error {
+	raw, err := json.Marshal(coverage)
+	if err != nil {
+		return fmt.Errorf("encode coverage: %w", err)
+	}
+	now := time.Now()
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// One fenced UPDATE doing both writes. RowsAffected == 0 means the
+		// lease moved on, and the whole transaction rolls back -- so a
+		// superseded worker writes neither coverage nor publication.
+		res := tx.Model(&models.CloudScanRun{}).
+			Where("id = ? AND lease_owner = ? AND lease_version = ?", runID, owner, version).
+			Updates(map[string]any{
+				"coverage":         raw,
+				"status":           models.CloudScanRunPublished,
+				"published_at":     now,
+				"lease_owner":      "",
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("%w: run=%s owner=%s version=%d", ErrLeaseLost, runID, owner, version)
+		}
+
+		if after == nil {
+			return nil
+		}
+		var run models.CloudScanRun
+		if err := tx.First(&run, "id = ?", runID).Error; err != nil {
+			return err
+		}
+		return after(tx, &run)
+	})
+}
+
 func (r *cloudScanRunRepository) Fail(
 	runID uuid.UUID, owner string, version int64, reason string,
 ) error {
@@ -189,6 +366,59 @@ func (r *cloudScanRunRepository) Fail(
 // that slept past its expiry is refused because the version moved on, not
 // because we compared timestamps and decided it was late. Clock skew between
 // two hosts therefore cannot let a superseded worker publish.
+func (r *cloudScanRunRepository) FailTx(
+	tx *gorm.DB, runID uuid.UUID, owner string, version int64, reason string,
+) error {
+	now := time.Now()
+	res := tx.Model(&models.CloudScanRun{}).
+		Where("id = ? AND lease_owner = ? AND lease_version = ?", runID, owner, version).
+		Updates(map[string]any{
+			"status":           models.CloudScanRunFailed,
+			"last_error":       truncateError(reason),
+			"lease_owner":      "",
+			"lease_expires_at": nil,
+			"updated_at":       now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("%w: run=%s owner=%s version=%d", ErrLeaseLost, runID, owner, version)
+	}
+	return nil
+}
+
+func (r *cloudScanRunRepository) Requeue(runID uuid.UUID, owner string, version int64) error {
+	now := time.Now()
+	// attempts is decremented back: Claim incremented it, and a run that never
+	// got to start must not be charged an attempt against scanMaxAttempts.
+	//
+	// requested_at = now() SENDS IT TO THE BACK OF THE QUEUE (§2.10A). Claim
+	// takes the oldest claimable row, so a refused run that kept its original
+	// requested_at stayed the oldest row and was re-claimed in a tight loop --
+	// starving every other workspace's scans, and with the attempt refund
+	// above, never tripping the retry ceiling either.
+	//
+	// started_at IS CLEARED when the refused claim is what set it (D-55).
+	// Claim stamps started_at = COALESCE(started_at, now) before the barrier
+	// is asked, so a refused run otherwise carried a start time for a scan
+	// that never began -- /pipeline and the run history then showed a queued
+	// run as started, and "started 4 min ago" was when it was first refused.
+	// attempts is read BEFORE this statement's refund (every SET expression
+	// sees the old row): attempts <= 1 means no earlier claim ever collected,
+	// so the start is this refusal's. A run reclaimed after a crash
+	// (attempts > 1) really did start, and keeps that time.
+	return r.fenced(runID, owner, version, map[string]any{
+		"status":           models.CloudScanRunQueued,
+		"lease_owner":      "",
+		"lease_expires_at": nil,
+		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"started_at":       gorm.Expr("CASE WHEN attempts <= 1 THEN NULL ELSE started_at END"),
+		"requested_at":     now,
+		"updated_at":       now,
+	})
+}
+
 func (r *cloudScanRunRepository) fenced(
 	runID uuid.UUID, owner string, version int64, updates map[string]any,
 ) error {
@@ -249,6 +479,89 @@ func (r *cloudScanRunRepository) Latest(
 		return nil, err
 	}
 	return &run, nil
+}
+
+// scanRunHistoryRow is one history row as the join returns it.
+type scanRunHistoryRow struct {
+	models.CloudScanRun
+	JobStatus    *string
+	JobAttempts  *int
+	JobLastError *string
+	PubRev       *int64
+	PubAt        *time.Time
+}
+
+func (row scanRunHistoryRow) projection() *RunProjection {
+	if row.JobStatus == nil {
+		// No job: a publication cannot exist either (one is only ever written
+		// by a job's projection).
+		return nil
+	}
+	p := &RunProjection{JobStatus: *row.JobStatus, Rev: row.PubRev, PublishedAt: row.PubAt}
+	if row.JobAttempts != nil {
+		p.Attempts = *row.JobAttempts
+	}
+	if row.JobLastError != nil {
+		p.LastError = *row.JobLastError
+	}
+	return p
+}
+
+// historySelect joins a run to its projection job and its publication. Both
+// joins are workspace-qualified (§2.9), and at most one row each (033).
+//
+// It names iga_projection_job and iga_publication, so it is NOT part of the
+// Phase 1 scan path (whose claim names no Phase 2 table): it serves read
+// routes of a binary that migrates to 036 before it serves anything, where
+// both tables exist whatever IGA_GRAPH_PROJECTION says -- and runs projected
+// before a switch-off stay visible with their revision.
+const historySelect = `
+	SELECT r.*, j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,
+	       p.rev AS pub_rev, p.published_at AS pub_at
+	  FROM cloud_scan_run r
+	  LEFT JOIN iga_projection_job j ON j.workspace_id = r.workspace_id AND j.scan_run_id = r.id
+	  LEFT JOIN iga_publication p ON p.workspace_id = r.workspace_id AND p.scan_run_id = r.id`
+
+func (r *cloudScanRunRepository) History(
+	workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int,
+) ([]ScanRunRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	// ORDER BY (requested_at DESC, id DESC) walks idx_cloud_scan_run_history
+	// (workspace_id, connector_id, requested_at DESC); the id tiebreak makes
+	// the keyset total, so no row is skipped or repeated across pages (§5.2).
+	q := historySelect + `
+	 WHERE r.workspace_id = ? AND r.connector_id = ?`
+	args := []any{workspaceID, connectorID}
+	if after != nil {
+		q += ` AND (r.requested_at, r.id) < (?, ?)`
+		args = append(args, after.RequestedAt, after.ID)
+	}
+	q += ` ORDER BY r.requested_at DESC, r.id DESC LIMIT ?`
+	args = append(args, limit)
+
+	var rows []scanRunHistoryRow
+	if err := r.db.Raw(q, args...).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]ScanRunRecord, len(rows))
+	for i, row := range rows {
+		out[i] = ScanRunRecord{Run: row.CloudScanRun, Projection: row.projection()}
+	}
+	return out, nil
+}
+
+func (r *cloudScanRunRepository) GetWithProjection(workspaceID, runID uuid.UUID) (*ScanRunRecord, error) {
+	var rows []scanRunHistoryRow
+	if err := r.db.Raw(historySelect+`
+	 WHERE r.workspace_id = ? AND r.id = ?`, workspaceID, runID).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, ErrCloudScanRunNotFound
+	}
+	return &ScanRunRecord{Run: rows[0].CloudScanRun, Projection: rows[0].projection()}, nil
 }
 
 // truncateError keeps a provider's message without letting a pathological one

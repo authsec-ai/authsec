@@ -12,6 +12,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -36,6 +37,16 @@ import (
 type CloudAWSController struct {
 	db *gorm.DB
 
+	// svc, when set, is the onboarding service every handler uses instead of
+	// one built from VAULT_ADDR/VAULT_TOKEN -- the seam that lets the routes be
+	// driven through gin with fake AWS and a memory vault.
+	svc *services.AWSOnboardingService
+
+	// cursors signs the run-history cursor (IGA_CURSOR_SECRET, as the graph
+	// lists do), built on first use.
+	cursorsOnce sync.Once
+	cursors     *igaread.Reader
+
 	// The Quick Create service is built once: its settings come from the
 	// environment and do not change at runtime, and building it per request
 	// would throw away the template check's cache on every launch.
@@ -49,6 +60,13 @@ func NewCloudAWSController(db *gorm.DB) *CloudAWSController {
 	return &CloudAWSController{db: db}
 }
 
+// WithOnboardingService makes every handler use svc. Tests use it; production
+// builds the service per request from the environment.
+func (ctl *CloudAWSController) WithOnboardingService(svc *services.AWSOnboardingService) *CloudAWSController {
+	ctl.svc = svc
+	return ctl
+}
+
 // authsecPrincipalEnv names the AuthSec AWS principal a customer's trust policy
 // must allow. Deployment configuration, not per-workspace: one AuthSec identity
 // assumes every customer role, and the ExternalId is what separates them.
@@ -56,6 +74,9 @@ const authsecPrincipalEnv = "AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"
 
 // service builds the onboarding service, or explains why it cannot.
 func (ctl *CloudAWSController) service() (*services.AWSOnboardingService, error) {
+	if ctl.svc != nil {
+		return ctl.svc, nil
+	}
 	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 	if addr == "" || token == "" {
 		// The ExternalId is a shared secret with the customer's trust policy.
@@ -1105,22 +1126,33 @@ func (ctl *CloudAWSController) GetScanRun(c *gin.Context) {
 		return
 	}
 
-	run, err := repositories.NewCloudScanRunRepository(ctl.db).Get(runID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
-		return
-	}
 	// The workspace comes from the authenticated context, never the URL: a run
 	// id from another workspace must read as absent, not as forbidden, so the
-	// endpoint cannot be used to test whether an id exists.
-	if run.WorkspaceID != workspaceID {
-		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+	// endpoint cannot be used to test whether an id exists. The read is
+	// workspace-qualified, so such a run is simply not found.
+	//
+	// The run gains projection: {status, rev} (§5.3): what became of its
+	// projection job, and the revision it published -- null when the run has
+	// no job (the switch was off, or it never published). Read in the SAME
+	// statement as the run, so the two cannot straddle the projection's commit.
+	rec, err := repositories.NewCloudScanRunRepository(ctl.db).GetWithProjection(workspaceID, runID)
+	if err != nil {
+		if errors.Is(err, repositories.ErrCloudScanRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+			return
+		}
+		log.Printf("[discovery] scan run %s: %v", runID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read the scan run"})
 		return
 	}
+	run := &rec.Run
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    run,
+		"data": scanRunWithProjection{
+			CloudScanRun: *run,
+			Projection:   projectionView(rec.Projection),
+		},
 		"meta": gin.H{
 			"as_of":    time.Now().UTC(),
 			"terminal": run.Terminal(),

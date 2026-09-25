@@ -274,57 +274,12 @@ func SetupRoutes(
 	// ════════════════════════════════════════════════════════
 	// ADDITIVE. This sits alongside the existing /authsec/discovery/* surface
 	// (Kubernetes sightings, claim/quarantine, coverage) and changes none of
-	// it. Different prefix, different tables (iga_*), different permissions
-	// (iga:*), so nothing in the working discovery path can be affected.
-	//
-	// The authenticated workspace is established by AuthMiddleware and is never
-	// read from a body, query parameter or provider identifier.
-	{
-		igaController := platformCtrl.NewIGAController(config.DB)
-
-		// Provider ingress. Unauthenticated at the TOKEN layer only — GitHub
-		// holds no AuthSec token — but authenticated by HMAC signature over the
-		// raw body, with the workspace resolved server-side from the verified
-		// binding. Registered outside the authenticated group so it cannot
-		// inherit AuthMiddleware.
-		r.POST("/api/iga/v1/webhooks/github/:app_registration_id", igaController.ReceiveWebhook)
-
-		iga := r.Group("/api/iga/v1")
-		iga.Use(middlewares.AuthMiddleware())
-		{
-			// Connect and authorize.
-			iga.POST("/integrations", middlewares.Require("iga", "admin"), igaController.CreateIntegration)
-			iga.GET("/integrations", middlewares.Require("iga", "read"), igaController.ListIntegrations)
-			iga.GET("/integrations/:integration_id", middlewares.Require("iga", "read"), igaController.GetIntegration)
-			// Verification turns an untrusted installation id into a trusted
-			// binding; it is an admin action and it is audited.
-			iga.POST("/integrations/:integration_id/verify", middlewares.Require("iga", "admin"), igaController.VerifyIntegration)
-			iga.POST("/integrations/:integration_id/disconnect", middlewares.Require("iga", "admin"), igaController.DisconnectIntegration)
-
-			// Enumerate.
-			iga.POST("/integrations/:integration_id/scans", middlewares.Require("iga", "admin"), igaController.CreateScan)
-			iga.GET("/scan-runs/:scan_id", middlewares.Require("iga", "read"), igaController.GetScanRun)
-
-			// Coverage and source health are separate surfaces on purpose: a
-			// scan failure is an operational issue, not an agent-risk finding.
-			iga.GET("/integrations/:integration_id/coverage", middlewares.Require("iga", "read"), igaController.GetCoverage)
-			iga.GET("/integrations/:integration_id/source-health", middlewares.Require("iga", "read"), igaController.GetSourceHealth)
-
-			// Inventory. Confirmed agents, candidates and identities are
-			// DIFFERENT routes with different counts.
-			iga.GET("/agents", middlewares.Require("iga", "read"), igaController.ListAgents)
-			iga.GET("/agents/:agent_id", middlewares.Require("iga", "read"), igaController.GetAgent)
-			iga.GET("/agents/:agent_id/evidence", middlewares.Require("iga", "read"), igaController.GetAgentEvidence)
-			iga.GET("/agents/:agent_id/access-paths", middlewares.Require("iga", "read"), igaController.GetAgentAccessPaths)
-			iga.GET("/identity-accounts", middlewares.Require("iga", "read"), igaController.ListIdentityAccounts)
-			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
-
-			// Governance decisions. Both require an expected version, so a
-			// stale decision is rejected rather than last-write-wins.
-			iga.POST("/classification-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideCandidate)
-			iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
-		}
-	}
+	// it. The whole surface -- provider ingress, the Phase 1 routes and the
+	// Phase 2 graph catalogue -- is mounted by SetupIGARoutes (iga_routes.go),
+	// the one function the frozen-contract test also mounts, so the 401/403
+	// envelope a graph route answers in production is the tested one (D-9,
+	// D-100).
+	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
@@ -1670,6 +1625,11 @@ func SetupRoutes(
 			discovery.GET("/aws/connectors", middlewares.Require("discovery", "read"), cloudAWS.ListConnectors)
 			discovery.GET("/aws/connectors/:id", middlewares.Require("discovery", "read"), cloudAWS.GetConnector)
 			discovery.POST("/aws/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAWS.VerifyConnector)
+			// Phase 2 (§5.3, T2.1-T2.2): enabled regions, the region selection
+			// (applies from the next scan), and the run history.
+			discovery.GET("/aws/connectors/:id/regions", middlewares.Require("discovery", "read"), cloudAWS.GetConnectorRegions)
+			discovery.PATCH("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.UpdateConnector)
+			discovery.GET("/aws/connectors/:id/scan-runs", middlewares.Require("discovery", "read"), cloudAWS.ListConnectorScanRuns)
 			// DELETE verb, revoke semantics: the connector row and everything it
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.

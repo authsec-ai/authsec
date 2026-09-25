@@ -40,13 +40,38 @@ var CloudFormationTemplate string
 //
 // Bumped by ticket [2], which adds iam:ListOpenIDConnectProviders. Bumped
 // again to add s3:GetBucketPolicy/kms:GetKeyPolicy for resource-policy reads.
-// Bumped again for Quick Create: ExternalId lost NoEcho, and the optional
-// CallbackTopicArn / Custom::AuthSecRegistration callback was added. The
-// role's permissions did not change in that bump.
+// Bumped for IGA Phase 2 (T2.4, D-54) to add bedrock-agentcore:GetGateway --
+// the gateway's ARN and execution role, which ListGateways does not return --
+// and ec2:DescribeRegions, which GET .../connectors/:id/regions calls to list
+// the regions enabled in the account. Both granted explicitly, in one bump,
+// rather than assumed covered by SecurityAudit (see the template's header).
 //
-// Must match the TemplateVersion output in the YAML, and the TemplateVersion
-// property of the AuthSecRegistration resource.
+// Must match BOTH the Metadata.AuthSec.TemplateVersion and the TemplateVersion
+// output in the YAML; TestS2TemplateVersionDeclaredConsistently checks all
+// three.
+//
+// Bumped again for Quick Create (2026-09-24): ExternalId lost NoEcho, and the
+// optional CallbackTopicArn / Custom::AuthSecRegistration callback was added.
+// Role permissions are unchanged by that bump. The AuthSecRegistration
+// resource also carries the version, as a property.
 const TemplateVersion = "2026-09-24"
+
+// TemplateOutdated reports whether a connector's recorded template version is
+// older than the one this build ships -- a FACT about the two versions, never
+// a diagnosis of a denial (§2.14.13: an SCP or a boundary refuses the same
+// call). Versions are dates (YYYY-MM-DD), so string order is date order.
+//
+// nil when nothing was recorded: a connector onboarded before versions were
+// stamped is of unknown vintage, and "not outdated" would claim more than the
+// row proves. The recorded value is the one stamped at onboarding; nothing
+// refreshes it after the customer updates the stack.
+func TemplateOutdated(recorded string) *bool {
+	if recorded == "" {
+		return nil
+	}
+	outdated := recorded < TemplateVersion
+	return &outdated
+}
 
 // maxRetryAttempts bounds the SDK's built-in backoff. Above the SDK default of
 // 3 because IAM and CloudTrail throttle readily on a large account and a scan
@@ -90,6 +115,14 @@ var (
 	// customer-side mismatch — wrong ExternalId, or a trust policy naming a
 	// different principal — so it is a 400, not a 500.
 	ErrNotAssumable = errors.New("the role could not be assumed")
+	// ErrCallDenied means AWS refused one call made WITH the assumed role --
+	// lambda:ListFunctions, iam:GetPolicyVersion -- to the role. The role was
+	// assumed: the connection is fine, and the trust-policy remedy of
+	// ErrNotAssumable would send the customer to the wrong place. Why it was
+	// refused (the role's grant, an SCP, a permissions boundary, a region
+	// opt-out) the response does not say, so neither does the message: it
+	// names the call and AWS's code, never a guessed cause (§2.14.13).
+	ErrCallDenied = errors.New("AWS refused the call")
 	// ErrThrottled means AWS throttled us even after the SDK's own backoff.
 	ErrThrottled = errors.New("AWS throttled the request")
 	// ErrNoBaseCredentials means AuthSec's OWN AWS identity is missing or
@@ -291,6 +324,20 @@ func ValidateRegion(region string) error {
 // the customer must correct in their own account; a throttle means try later;
 // anything else is ours to investigate. Collapsing all three into "AWS error"
 // sends every case to the same unhelpful place.
+//
+// The SDK error stays in the chain (classifiedError), so FailedCall can still
+// read the operation and the error code AWS returned, which coverage reports
+// as api and error_code.
+//
+// AN AUTHORIZATION REFUSAL OF A CALL MADE AS THE ROLE IS NOT AN ASSUME
+// FAILURE. When the SDK names the operation and it is not STS's (and no STS
+// operation failed underneath it -- the credential provider assumes lazily),
+// AccessDenied means the role was assumed and then refused that one call. It
+// used to read "the role could not be assumed: ..." -- and that sentence was
+// written into every denied surface's coverage, stating a cause the response
+// never gave. It is ErrCallDenied, naming the call. An error with no operation
+// in its chain (a bare API error) keeps the old classification: which call
+// failed is then unknown.
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -298,13 +345,32 @@ func classify(err error) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "AccessDenied", "AccessDeniedException", "InvalidClientTokenId",
-			"SignatureDoesNotMatch", "ExpiredToken", "MalformedPolicyDocument":
-			return fmt.Errorf("%w: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode())
+		case "AccessDenied", "AccessDeniedException":
+			if api, _ := FailedCall(err); api != "" && !assumeFailed(err) {
+				return &classifiedError{
+					msg:      fmt.Sprintf("%v %s: %s (%s)", ErrCallDenied, api, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+					sentinel: ErrCallDenied, cause: err,
+				}
+			}
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+				sentinel: ErrNotAssumable, cause: err,
+			}
+		case "InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken", "MalformedPolicyDocument":
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+				sentinel: ErrNotAssumable, cause: err,
+			}
 		case "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException":
-			return fmt.Errorf("%w: %s", ErrThrottled, apiErr.ErrorMessage())
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s", ErrThrottled, apiErr.ErrorMessage()),
+				sentinel: ErrThrottled, cause: err,
+			}
 		}
-		return fmt.Errorf("aws %s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage())
+		return &classifiedError{
+			msg:   fmt.Sprintf("aws %s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage()),
+			cause: err,
+		}
 	}
 	return err
 }

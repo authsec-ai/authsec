@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -121,6 +123,9 @@ type ObservationSubject struct {
 	PermissionID *uuid.UUID
 	ResourceID   *uuid.UUID
 	WorkloadID   *uuid.UUID
+	// PolicyID is a policy VERSION as an evidence subject (035): the grant,
+	// the assignment and the target all cite it.
+	PolicyID *uuid.UUID
 }
 
 // IdentitySubject and friends keep call sites from constructing the struct by
@@ -130,6 +135,82 @@ func IdentitySubject(id uuid.UUID) ObservationSubject   { return ObservationSubj
 func PermissionSubject(id uuid.UUID) ObservationSubject { return ObservationSubject{PermissionID: &id} }
 func ResourceSubject(id uuid.UUID) ObservationSubject   { return ObservationSubject{ResourceID: &id} }
 func WorkloadSubject(id uuid.UUID) ObservationSubject   { return ObservationSubject{WorkloadID: &id} }
+func PolicySubject(id uuid.UUID) ObservationSubject     { return ObservationSubject{PolicyID: &id} }
+
+// ObservedSubjectFact is the key under which Record names, inside a subject's
+// facts, the subject row they were observed on: "<kind>:<row id>".
+//
+// WHY THE FACTS NAME THEIR SUBJECT. content_hash is of the facts alone, and an
+// observation outlives the row it describes (024): reconciliation's delete SETs
+// NULL the subject column, and the row falls under
+// uq_cloud_observation_dedupe_no_subject (025/035), keyed only by
+// (workspace_id, source_api, content_hash). Equal facts about two different
+// rows are ORDINARY -- one statement fanned out to two resources, two holders
+// of one managed policy, the same AWS-managed policy read in two accounts, a
+// policy detached, reattached unchanged and detached again -- so the second
+// orphan collided with the first, the DELETE failed with a unique violation,
+// and it failed again on every later run, because the stale row kept its
+// colliding observation. Naming the row makes two observations' facts equal
+// only when they are about the same row, which the subject dedupe index
+// already keeps unique while the row lives; so no orphan can ever equal
+// another row. An unchanged re-read still dedupes: every upsert returns the
+// SURVIVING row's id, so a live subject's name never changes. Evidence with no
+// subject at all (AgentCore Workload Identities) is not stamped and dedupes on
+// content, as 025 intends.
+//
+// It is the row's identity, not a join key: evidence is joined on the typed
+// subject and subject_native_id, never on a cloud_* row id (§4.8). A caller's
+// own fact under this key is overwritten.
+const ObservedSubjectFact = "observed_subject"
+
+// ref names the subject column that is set, as "<kind>:<row id>", or "" for
+// evidence with no subject. At most one is set (the database checks it).
+func (s ObservationSubject) ref() string {
+	switch {
+	case s.IdentityID != nil:
+		return "identity:" + s.IdentityID.String()
+	case s.PermissionID != nil:
+		return "permission:" + s.PermissionID.String()
+	case s.ResourceID != nil:
+		return "resource:" + s.ResourceID.String()
+	case s.WorkloadID != nil:
+		return "workload:" + s.WorkloadID.String()
+	case s.PolicyID != nil:
+		return "policy:" + s.PolicyID.String()
+	}
+	return ""
+}
+
+// stampSubject returns the facts naming the subject they were observed on
+// (ObservedSubjectFact), or the facts unchanged for evidence with no subject.
+// A copy: the caller's map is not modified. Facts that are not a JSON object
+// cannot carry the name and are refused, rather than stored unstamped where
+// they would collide once orphaned.
+func stampSubject(facts any, ref string) (any, error) {
+	if ref == "" {
+		return facts, nil
+	}
+	var stamped map[string]any
+	switch t := facts.(type) {
+	case nil:
+		stamped = map[string]any{}
+	case map[string]any:
+		stamped = make(map[string]any, len(t)+1)
+		for k, v := range t {
+			stamped[k] = v
+		}
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalise observation: %w", err)
+		}
+		if err := json.Unmarshal(b, &stamped); err != nil || stamped == nil {
+			return nil, fmt.Errorf("observation facts must be a JSON object to name their subject, got %T", facts)
+		}
+	}
+	stamped[ObservedSubjectFact] = ref
+	return stamped, nil
+}
 
 // ObservationWriter records evidence for one scan run.
 //
@@ -141,6 +222,11 @@ type ObservationWriter struct {
 	connectorID uuid.UUID
 	runID       uuid.UUID
 	generation  int
+	// fence is the run's ownership, asserted in the same transaction as every
+	// write (§2.10A, part 3), exactly as the inventory repositories do. Without
+	// it an obsolete worker -- reclaimed, or its run abandoned -- could still
+	// confirm a fact and move last_confirmed_run_id back onto its own run.
+	fence *repositories.ScanFence
 
 	written int
 	skipped int
@@ -165,6 +251,16 @@ func NewObservationWriter(
 	}
 }
 
+// WithFence makes every write assert the run's ownership first; a worker that
+// no longer owns its run gets repositories.ErrScanFenceLost and writes nothing.
+func (w *ObservationWriter) WithFence(f repositories.ScanFence) *ObservationWriter {
+	if w == nil {
+		return nil
+	}
+	w.fence = &f
+	return w
+}
+
 // Record writes one observation, deduplicating on unchanged content.
 //
 // An unchanged re-read writes no NEW row -- the unique index on (workspace,
@@ -184,7 +280,16 @@ func (w *ObservationWriter) Record(
 	if w == nil {
 		return nil
 	}
-	payload, hash, err := HashObservation(facts)
+	// The facts name their subject row BEFORE hashing (ObservedSubjectFact), so
+	// the observation cannot collide with another once its subject is deleted.
+	// Rows written before the stamp existed are not rewritten: the first
+	// stamped write for their subject is a new row, confirmed from then on.
+	ref := subject.ref()
+	stamped, err := stampSubject(facts, ref)
+	if err != nil {
+		return err
+	}
+	payload, hash, err := HashObservation(stamped)
 	if err != nil {
 		return err
 	}
@@ -205,6 +310,7 @@ func (w *ObservationWriter) Record(
 		PermissionID:       subject.PermissionID,
 		ResourceID:         subject.ResourceID,
 		WorkloadID:         subject.WorkloadID,
+		PolicyID:           subject.PolicyID,
 		SourceAPI:          sourceAPI,
 		Surface:            surface,
 		SurfaceState:       surfaceState,
@@ -235,20 +341,41 @@ func (w *ObservationWriter) Record(
 	// emits it verbatim; without that it quotes every Column.Name as a plain
 	// identifier, turning the expression into a single invalid, literally-quoted
 	// column name instead of the function call Postgres needs to match the index.
-	hasSubject := subject.IdentityID != nil || subject.PermissionID != nil ||
-		subject.ResourceID != nil || subject.WorkloadID != nil
+	hasSubject := ref != ""
 
 	conflict := clause.OnConflict{
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"last_confirmed_run_id": w.runID,
 			"last_confirmed_at":     now,
 			"confirmation_count":    gorm.Expr("cloud_observation.confirmation_count + 1"),
+			// P2-2, the dedupe-path half of the qualified-subject change
+			// (SPEC §4.8). Changing what the permission scanner SUPPLIES is not
+			// enough on its own: an unchanged rescan of stable IAM writes no new
+			// row and takes this DO UPDATE branch, so without upgrading the key
+			// here the pre-change unqualified subject_native_id would survive
+			// indefinitely -- and igagraph.indexObservations skips every
+			// unqualified permission key, so those edges would never get
+			// evidence.
+			//
+			// Guarded so it can ONLY EVER ADD qualification: it upgrades a
+			// stored key that lacks the unit separator to the new one, never
+			// the reverse, and never writes a placeholder over a real value.
+			// For identity/resource/workload subjects the new key is the bare
+			// ARN the row already holds, so this is a self-assignment and a
+			// no-op for them.
+			"subject_native_id": gorm.Expr(
+				`CASE WHEN cloud_observation.subject_native_id NOT LIKE '%' || ? || '%'
+				           AND ? <> '(unknown)'
+				      THEN ? ELSE cloud_observation.subject_native_id END`,
+				igagraph.Sep, subjectNativeID, subjectNativeID),
 		}),
 	}
 	if hasSubject {
 		conflict.Columns = []clause.Column{
 			{Name: "workspace_id"},
-			{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id)", Raw: true},
+			// Must match uq_cloud_observation_dedupe EXACTLY, which 035 widened
+			// with policy_id. A mismatch fails every write at runtime.
+			{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id, policy_id)", Raw: true},
 			{Name: "source_api"},
 			{Name: "content_hash"},
 		}
@@ -260,7 +387,7 @@ func (w *ObservationWriter) Record(
 		// predicate -- Postgres will not infer a partial index from the column
 		// list alone.
 		conflict.TargetWhere = clause.Where{Exprs: []clause.Expression{clause.Expr{
-			SQL: "identity_id IS NULL AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL",
+			SQL: "identity_id IS NULL AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL AND policy_id IS NULL",
 		}}}
 	}
 
@@ -272,9 +399,11 @@ func (w *ObservationWriter) Record(
 	proposed := uuid.New()
 	obs.ID = proposed
 
-	res := w.db.Clauses(conflict, clause.Returning{}).Create(obs)
-	if res.Error != nil {
-		return fmt.Errorf("record observation (%s): %w", sourceAPI, res.Error)
+	err = repositories.RunFenced(w.db, w.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(conflict, clause.Returning{}).Create(obs).Error
+	})
+	if err != nil {
+		return fmt.Errorf("record observation (%s): %w", sourceAPI, err)
 	}
 	if obs.ID == proposed {
 		w.written++

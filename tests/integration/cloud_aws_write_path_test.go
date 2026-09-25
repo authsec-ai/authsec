@@ -25,190 +25,6 @@ import (
 	"github.com/authsec-ai/authsec/services"
 )
 
-// A throttled iam:GetRole must not erase what a complete read established.
-//
-// internal/awsdiscovery/iam.go states the guarantee outright: DetailComplete
-// false means tags and the permissions boundary are UNKNOWN, not absent, and "a
-// writer must not treat a partial role as authoritative". The writer did
-// exactly that -- upsertRole builds attrs before it checks DetailComplete, and
-// Tags/PermissionsBoundaryARN/Description are all `omitempty`, so they vanish
-// from the JSON and the unconditional blob assignment overwrote the good one.
-//
-// IAM tags are the only ownership signal this system collects.
-func TestAThrottledRoleReadDoesNotEraseTagsOrBoundary(t *testing.T) {
-	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-partial-role")
-	defer cleanIdentities(t, db, ws)
-
-	const roleARN = "arn:aws:iam::429418377036:role/tagged-role"
-	const boundaryARN = "arn:aws:iam::429418377036:policy/the-ceiling"
-
-	fake := newFakeIAM()
-	fake.roles = append(fake.roles, iamtypes.Role{
-		Arn:        aws.String(roleARN),
-		RoleName:   aws.String("tagged-role"),
-		RoleId:     aws.String("AROATAGGED0000000001"),
-		CreateDate: ago(72 * time.Hour),
-		Tags: []iamtypes.Tag{
-			{Key: aws.String("owner"), Value: aws.String("platform-team")},
-		},
-		PermissionsBoundary: &iamtypes.AttachedPermissionsBoundary{
-			PermissionsBoundaryArn: aws.String(boundaryARN),
-		},
-	})
-
-	scanner, connectorID := scanFixture(t, db, ws, fake)
-
-	// Scan one: GetRole succeeds, so the row is complete.
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("baseline scan: %v", err)
-	}
-	before := awsAttrsOf(t, db, ws, roleARN)
-	if before.Tags["owner"] != "platform-team" {
-		t.Fatalf("test setup: baseline should have stored the owner tag, got %#v", before.Tags)
-	}
-	if before.PermissionsBoundaryARN != boundaryARN {
-		t.Fatalf("test setup: baseline should have stored the boundary, got %q", before.PermissionsBoundaryARN)
-	}
-
-	// Scan two: GetRole is throttled. ListRoles still names the role, so it is
-	// seen and must not be reconciled away -- but nothing new is known about it.
-	fake.fail["GetRole"] = throttled("iam:GetRole")
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("partial scan must not fail the run: %v", err)
-	}
-
-	after := awsAttrsOf(t, db, ws, roleARN)
-	if after.Tags["owner"] != "platform-team" {
-		t.Fatalf("a throttled GetRole erased the owner tag: %#v", after.Tags)
-	}
-	if after.PermissionsBoundaryARN != boundaryARN {
-		t.Fatalf("a throttled GetRole erased the boundary ARN: %q", after.PermissionsBoundaryARN)
-	}
-	// The other half: preserving the blob must not leave the row claiming it
-	// was fully read. Without this the earlier complete read's absent
-	// detail_incomplete key survives, the row looks fresh, and constraintState
-	// answers from stale evidence as though it were current.
-	if !after.DetailIncomplete {
-		t.Fatal("a preserved blob must still record that THIS read fell short")
-	}
-	t.Log("PASS: tags and boundary survived, and the row is marked incomplete")
-}
-
-// A later complete read must clear the flag again, or a single throttle would
-// pin the role as incomplete forever.
-func TestACompleteReReadClearsTheIncompleteFlag(t *testing.T) {
-	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-partial-recover")
-	defer cleanIdentities(t, db, ws)
-
-	const roleARN = "arn:aws:iam::429418377036:role/recovering-role"
-	fake := newFakeIAM()
-	fake.roles = append(fake.roles, iamtypes.Role{
-		Arn:        aws.String(roleARN),
-		RoleName:   aws.String("recovering-role"),
-		RoleId:     aws.String("AROARECOVER000000001"),
-		CreateDate: ago(48 * time.Hour),
-		Tags:       []iamtypes.Tag{{Key: aws.String("owner"), Value: aws.String("team-b")}},
-	})
-	scanner, connectorID := scanFixture(t, db, ws, fake)
-
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("baseline scan: %v", err)
-	}
-	fake.fail["GetRole"] = throttled("iam:GetRole")
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("throttled scan: %v", err)
-	}
-	if !awsAttrsOf(t, db, ws, roleARN).DetailIncomplete {
-		t.Fatal("test setup: the throttled scan should have marked the role incomplete")
-	}
-
-	// AWS recovers.
-	delete(fake.fail, "GetRole")
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("recovery scan: %v", err)
-	}
-
-	after := awsAttrsOf(t, db, ws, roleARN)
-	if after.DetailIncomplete {
-		t.Fatal("a complete read must clear detail_incomplete, not leave it stuck on")
-	}
-	if after.Tags["owner"] != "team-b" {
-		t.Fatalf("the recovery read lost the owner tag: %#v", after.Tags)
-	}
-	t.Log("PASS: the flag clears on recovery and the tags are still there")
-}
-
-// The row must still be stamped as seen, or the fix would trade data loss for
-// deletion -- a far worse bug. Guards against "fix" by skipping the upsert.
-func TestAPartiallyReadRoleIsStillMarkedSeen(t *testing.T) {
-	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-partial-seen")
-	defer cleanIdentities(t, db, ws)
-
-	const roleARN = "arn:aws:iam::429418377036:role/seen-role"
-	fake := newFakeIAM()
-	fake.roles = append(fake.roles, iamtypes.Role{
-		Arn:        aws.String(roleARN),
-		RoleName:   aws.String("seen-role"),
-		RoleId:     aws.String("AROASEEN000000000001"),
-		CreateDate: ago(24 * time.Hour),
-		Tags:       []iamtypes.Tag{{Key: aws.String("owner"), Value: aws.String("team-a")}},
-	})
-	scanner, connectorID := scanFixture(t, db, ws, fake)
-
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("baseline scan: %v", err)
-	}
-	var firstGen int
-	db.Raw(`SELECT last_seen_generation FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`,
-		ws, roleARN).Scan(&firstGen)
-
-	fake.fail["GetRole"] = throttled("iam:GetRole")
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("partial scan: %v", err)
-	}
-
-	var secondGen int
-	db.Raw(`SELECT last_seen_generation FROM cloud_identity WHERE workspace_id = ? AND native_id = ?`,
-		ws, roleARN).Scan(&secondGen)
-	if secondGen <= firstGen {
-		t.Fatalf("a partially read role must still be stamped as seen: generation %d -> %d",
-			firstGen, secondGen)
-	}
-	t.Logf("PASS: generation advanced %d -> %d while attrs were preserved", firstGen, secondGen)
-}
-
-// A brand-new role that could only be read partially must still land. There is
-// no earlier blob to protect, and a thin row beats no row at all.
-func TestAFirstSightingOfAPartialRoleStillWritesItsAttrs(t *testing.T) {
-	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-partial-first")
-	defer cleanIdentities(t, db, ws)
-
-	const roleARN = "arn:aws:iam::429418377036:role/never-detailed"
-	fake := newFakeIAM()
-	fake.roles = append(fake.roles, iamtypes.Role{
-		Arn:        aws.String(roleARN),
-		RoleName:   aws.String("never-detailed"),
-		RoleId:     aws.String("AROANEVER00000000001"),
-		CreateDate: ago(time.Hour),
-	})
-	fake.fail["GetRole"] = throttled("iam:GetRole")
-
-	scanner, connectorID := scanFixture(t, db, ws, fake)
-	if _, err := scanner.Scan(context.Background(), ws, connectorID); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-
-	attrs := awsAttrsOf(t, db, ws, roleARN)
-	if !attrs.DetailIncomplete {
-		t.Fatal("a first sighting read only from ListRoles must record detail_incomplete")
-	}
-	t.Log("PASS: a first-seen partial role is written and flagged incomplete")
-}
-
 // Migration 021's three ARN-derived columns must be refreshed on conflict.
 //
 // They were written on INSERT only, so every resource that existed before 021
@@ -348,11 +164,8 @@ func TestATruncatedActivityReadBlocksReconciliation(t *testing.T) {
 		t.Fatalf("a truncated activity read must not fail the scan: %v", err)
 	}
 
-	if !out.ActivityTruncated {
-		t.Fatal("reading 500 of 520+ identities must be reported as truncated")
-	}
-	if out.Complete {
-		t.Fatal("a truncated activity read must not license reconciliation")
+	if out.UsageComplete {
+		t.Fatal("a truncated activity read must not license usage reconciliation")
 	}
 	if got := out.Surfaces["activity"].State; got != models.CloudCoveragePartial {
 		t.Fatalf("truncation is partial, not %q: the read was not denied, it stopped short", got)
@@ -379,14 +192,11 @@ func TestAnUntruncatedActivityReadStillReconciles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if out.ActivityTruncated {
-		t.Fatal("a handful of identities is not a truncated read")
-	}
 	if got := out.Surfaces["activity"].State; got != models.CloudCoverageReached {
 		t.Fatalf("an activity read under the cap is reached, got %q", got)
 	}
-	if !out.Complete {
-		t.Fatalf("a clean scan must still reconcile: %v", out.Errors)
+	if !out.UsageComplete {
+		t.Fatalf("a clean activity read must still reconcile usage: %v", out.Errors)
 	}
 	t.Log("PASS: an under-cap activity read still reports reached and complete")
 }

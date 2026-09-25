@@ -154,6 +154,28 @@ func main() {
 	// ExternalId stored there. Without it the worker would claim runs it cannot
 	// execute and fail them, which is worse than not starting: say so once and
 	// leave the runs queued for a replica that is configured.
+	// IGA_GRAPH_PROJECTION (SPEC-iga-phase2-graph.md §2.8): ONE switch, read
+	// ONCE, default off. Off is Phase 1 exactly -- no barrier, no projection
+	// job, no Phase 2 SQL -- and supported at any schema, which is what makes
+	// rolling back to 0e75ad7 and turning the graph on later safe.
+	//
+	// On: the schema is verified (the relations and columns 027-036 add),
+	// retried on error and never cached as an answer. Until it passes, the scan
+	// worker claims nothing (fail closed) and /capabilities says
+	// "misconfigured" with the reason. Only a SUCCESSFUL check starts the
+	// projector, which also runs RecoverStalled on its ticker -- without it the
+	// first scan in every workspace queued a job nobody would claim, and no
+	// scan could run there again.
+	graphGate := services.GraphProjectionGateFromEnv()
+	services.SetGraphProjection(graphGate)
+	if graphGate.Enabled() {
+		go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
+		})
+	} else {
+		log.Printf("[graph] %s is off: Phase 1 scanning, no projection", services.GraphProjectionEnv)
+	}
+
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -162,7 +184,8 @@ func main() {
 			log.Printf("AWS scan worker not started: %v", verr)
 		} else {
 			awsSvc := services.NewAWSOnboardingService(config.DB, vc)
-			go services.NewAWSScanWorker(config.DB, awsSvc).Run(context.Background())
+			go services.NewAWSScanWorker(config.DB, awsSvc).WithGraphProjection(graphGate).
+				Run(context.Background())
 		}
 	}
 

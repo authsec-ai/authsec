@@ -3,6 +3,7 @@ package repositories
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -22,12 +23,11 @@ type CloudIdentityRepository interface {
 	// A repeat scan updates the same row and stamps the generation; it never
 	// creates a duplicate. Reports whether the row was newly created.
 	//
-	// partialRead says the caller could not read this principal in full — some
-	// of what it is passing in Attrs is UNKNOWN rather than absent. The row is
-	// still stamped (it was seen, so it must not be reconciled away), but the
-	// attrs blob is left as an earlier complete read established it. See the
-	// implementation for why that distinction cannot be made inside the repo.
-	UpsertIdentity(i *models.CloudIdentity, partialRead bool) (stored *models.CloudIdentity, created bool, err error)
+	// keepAttrs names attrs keys the caller's read DOES NOT RETURN (D-48): on a
+	// rescan the stored value of each is kept unless the new attrs carry the
+	// key, so a field no call supplies is never blanked. Every other key is
+	// replaced wholesale, so a tag or boundary removed in AWS disappears.
+	UpsertIdentity(i *models.CloudIdentity, keepAttrs ...string) (stored *models.CloudIdentity, created bool, err error)
 
 	// UpsertSecret records one secret, keyed on (workspace_id, native_id).
 	UpsertSecret(s *models.CloudSecret) (stored *models.CloudSecret, created bool, err error)
@@ -49,6 +49,11 @@ type CloudIdentityRepository interface {
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (identitiesRemoved, secretsRemoved int64, err error)
 
 	ListSecrets(workspaceID uuid.UUID, f CloudSecretFilter) ([]models.CloudSecret, int64, error)
+
+	// Fenced returns a view of this repository whose mutations refuse to
+	// commit unless the given run is still owned by the caller (§2.10A). Reads
+	// are unaffected.
+	Fenced(f ScanFence) CloudIdentityRepository
 }
 
 // CloudSecretFilter narrows a secret listing. ConnectorID scopes to one
@@ -69,14 +74,23 @@ type CloudIdentityFilter struct {
 	Offset      int
 }
 
-type cloudIdentityRepository struct{ db *gorm.DB }
+type cloudIdentityRepository struct {
+	db    *gorm.DB
+	fence *ScanFence
+}
 
 // NewCloudIdentityRepository constructs the repository.
 func NewCloudIdentityRepository(db *gorm.DB) CloudIdentityRepository {
 	return &cloudIdentityRepository{db: db}
 }
 
-func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, partialRead bool) (*models.CloudIdentity, bool, error) {
+func (r *cloudIdentityRepository) Fenced(f ScanFence) CloudIdentityRepository {
+	copy := *r
+	copy.fence = &f
+	return &copy
+}
+
+func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAttrs ...string) (*models.CloudIdentity, bool, error) {
 	if i.WorkspaceID == uuid.Nil || i.ConnectorID == uuid.Nil {
 		return nil, false, errors.New("workspace_id and connector_id are required")
 	}
@@ -106,6 +120,52 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, partia
 		"last_seen_generation": i.LastSeenGeneration,
 		"last_seen_at":         now,
 		"row_updated_at":       now,
+		// The role's trust document and its readability (035). Named here or a
+		// rescan never updates them -- a role whose trust became unreadable
+		// would keep reading as parsed, and one fixed in AWS would keep its
+		// error. From the INSERT tuple, so NULL stays NULL for a document that
+		// is not JSON (and for every identity that is not a role).
+		"trust_document":      gorm.Expr("excluded.trust_document"),
+		"trust_document_hash": gorm.Expr("excluded.trust_document_hash"),
+		"trust_parse_error":   gorm.Expr("excluded.trust_parse_error"),
+	}
+	// Attrs merge, never blank (§1.3, D-48), for exactly the keys the caller's
+	// read does not return: the stored value is laid UNDER the new attrs, so
+	// the new read wins wherever it has the key and the old value survives only
+	// where the read is silent. jsonb_strip_nulls drops a key the stored row
+	// never had, rather than writing it as null. A plain `stored || new` merge
+	// would be wrong: omitempty leaves a removed tag or boundary ABSENT from the
+	// new attrs, and it would survive forever.
+	//
+	// ONLY FOR THE SAME PRINCIPAL. The row is keyed by ARN, and a role deleted
+	// and recreated under its name keeps the row but is a different role with a
+	// new unique id (§2.4's creation boundary): the stored values describe its
+	// predecessor, and the read that would correct them never comes (D-48: new
+	// roles get none). So they are kept only when the stored unique_id equals
+	// the new one -- a row with none on either side cannot prove it is the same
+	// principal, and keeps nothing.
+	if len(keepAttrs) > 0 {
+		pairs := make([]string, 0, len(keepAttrs))
+		args := make([]interface{}, 0, 2*len(keepAttrs))
+		for _, k := range keepAttrs {
+			pairs = append(pairs, "?::text, cloud_identity.attrs -> ?::text")
+			args = append(args, k, k)
+		}
+		assignments["attrs"] = gorm.Expr(
+			"CASE WHEN cloud_identity.attrs ->> 'unique_id' = excluded.attrs ->> 'unique_id'"+
+				" THEN jsonb_strip_nulls(jsonb_build_object("+strings.Join(pairs, ", ")+")) || excluded.attrs"+
+				" ELSE excluded.attrs END",
+			args...)
+	}
+	// A role's trust document and its readability (035, T3.4), refreshed on
+	// every scan through this FENCED write like the rest of the row -- a
+	// superseded worker must not replace them. Roles only: no other identity
+	// has a trust document, and a user, group or GCP upsert must never clear a
+	// role's.
+	if i.Kind == models.CloudIdentityIAMRole {
+		for _, col := range []string{"trust_document", "trust_document_hash", "trust_parse_error"} {
+			assignments[col] = gorm.Expr("excluded." + col)
+		}
 	}
 	// last_used_at is only advanced, never cleared. AWS reports it from
 	// different places with different freshness — GetRole's RoleLastUsed, the
@@ -118,47 +178,15 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, partia
 			        OR excluded.last_used_at > cloud_identity.last_used_at
 			      THEN excluded.last_used_at ELSE cloud_identity.last_used_at END`)
 	}
-	// attrs gets the same treatment as last_used_at, for the same reason, and it
-	// is the caller who must say so. A partial read carries a THIN blob, not a
-	// corrective one: a throttled iam:GetRole yields Tags=nil, boundary="" and
-	// Description="", all `omitempty`, so they vanish from the serialised JSON
-	// and a blind overwrite erases what a complete read established. IAM tags are
-	// the only ownership signal we collect, so that loss is permanent and silent.
-	//
-	// This cannot be decided here. `detail_incomplete` lives inside the attrs
-	// JSON, not in a column, and it is `omitempty` -- so false is ABSENT from the
-	// blob and "key missing" would have to be read as complete. Parsing provider
-	// JSON in a provider-neutral repository to find out is the wrong place for
-	// that knowledge; the scanner already knows, so it tells us.
-	//
-	// Keeping the old blob is only half of it. The blob an earlier COMPLETE read
-	// stored carries no detail_incomplete key (it is `omitempty`, and it was
-	// false), so preserving it verbatim would leave the row asserting it is
-	// fully read when this scan could not confirm that. For a role whose last
-	// complete read found no boundary, constraintState would then still answer
-	// `unconstrained` -- a firmer claim than the evidence now supports.
-	//
-	// So: merge, do not replace. `||` keeps every key the good read established
-	// and overlays the one fact this read actually learned -- that it fell
-	// short. Old tags and boundary survive AND the row stays honest about its
-	// freshness, which is what makes constraintState degrade to unknown.
-	//
-	// This one key is the only provider-specific knowledge in this method, and
-	// it buys the whole guarantee. Only an UPDATE is affected; a first insert
-	// still writes whatever the partial read had, because a thin row beats no
-	// row and there is nothing yet to preserve.
-	if partialRead {
-		assignments["attrs"] = gorm.Expr(
-			`cloud_identity.attrs || jsonb_build_object('detail_incomplete', true)`)
-	}
-
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(assignments),
-		},
-		clause.Returning{},
-	).Create(i).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(assignments),
+			},
+			clause.Returning{},
+		).Create(i).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -192,10 +220,8 @@ func (r *cloudIdentityRepository) UpsertSecret(s *models.CloudSecret) (*models.C
 		// always "{}" and there is nothing an overwrite could destroy.
 		//
 		// If a collector ever populates it -- a key's rotation date from the
-		// credential report is the obvious candidate -- this acquires the exact
-		// bug UpsertIdentity's partialRead parameter exists to prevent, and it
-		// needs the same treatment. It is written here rather than fixed because
-		// a flag no caller can set is speculative API surface.
+		// credential report is the obvious candidate -- it needs the same
+		// keep-what-this-read-did-not-return merge UpsertIdentity applies (D-48).
 		"attrs":                s.Attrs,
 		"last_seen_generation": s.LastSeenGeneration,
 		"last_seen_at":         now,
@@ -208,13 +234,15 @@ func (r *cloudIdentityRepository) UpsertSecret(s *models.CloudSecret) (*models.C
 			      THEN excluded.last_used_at ELSE cloud_secret.last_used_at END`)
 	}
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(assignments),
-		},
-		clause.Returning{},
-	).Create(s).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(assignments),
+			},
+			clause.Returning{},
+		).Create(s).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -337,7 +365,7 @@ func (r *cloudIdentityRepository) ReconcileGeneration(
 ) (int64, int64, error) {
 
 	var identitiesRemoved, secretsRemoved int64
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudSecret{})
 		if res.Error != nil {

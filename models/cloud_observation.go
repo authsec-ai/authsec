@@ -37,6 +37,10 @@ type CloudObservation struct {
 	PermissionID *uuid.UUID `json:"permission_id,omitempty" gorm:"type:uuid"`
 	ResourceID   *uuid.UUID `json:"resource_id,omitempty" gorm:"type:uuid"`
 	WorkloadID   *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
+	// PolicyID (035) makes a policy VERSION an evidence subject, qualified by
+	// (workspace, connector) like every other. It is the fifth subject, and the
+	// at-most-one check and both dedupe indexes were widened with it.
+	PolicyID *uuid.UUID `json:"policy_id,omitempty" gorm:"type:uuid"`
 
 	// SubjectNativeID is the AWS-native id (ARN, role name, ...) captured at
 	// write time. It is what keeps this row legible as "evidence for X" after
@@ -94,6 +98,8 @@ func (o CloudObservation) Subject() (kind string, id uuid.UUID) {
 		return "resource", *o.ResourceID
 	case o.WorkloadID != nil:
 		return "workload", *o.WorkloadID
+	case o.PolicyID != nil:
+		return "policy", *o.PolicyID
 	}
 	return "", uuid.Nil
 }
