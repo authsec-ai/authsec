@@ -121,10 +121,10 @@ COMMENT ON COLUMN public.sync_configurations.ad_ca_bundle IS
 -- Evidence basis "observed" is an authoritative directory read. It is not
 -- platform_declared, so it cannot auto-confirm an agent.
 --
--- 038 (collector registry) DROP+ADDs this same constraint with runtime_batch
--- and configuration_snapshot, and without observed. Rebuild from the union of
--- both lists plus any value the live constraint already allows, so 038-then-039
--- and a re-apply of 039 after 038 both keep every mode.
+-- 038 rebuilds this same constraint. Both files union the historical modes,
+-- the collector modes (runtime_batch, configuration_snapshot), observed, and
+-- any value the live constraint already allows, so 038-then-039 and
+-- 039-then-038 both keep every mode.
 DO $$
 DECLARE
     wanted text[] := ARRAY[

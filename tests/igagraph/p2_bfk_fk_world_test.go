@@ -210,6 +210,10 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 		{"integ", func() bfkRow { return s.integration() }},
 		{"iscope", func() bfkRow { return s.integrationScope() }},
 		{"iscan", func() bfkRow { return s.igaScanRun() }},
+		// 039's ad_inventory_runs references sync_configurations by id. That
+		// key is outside the iga_*/cloud_* scope; the seed exists so the
+		// in-scope integration and scan-run keys can be inserted at all.
+		{"adcfg", func() bfkRow { return s.syncConfiguration() }},
 		// 038's collector parents. discovery_sources is not iga_*/cloud_*, but
 		// iga_observations now references it, and the collector rows below
 		// reference iga_estate_scopes, iga_integrations and iga_scan_runs.
@@ -375,6 +379,22 @@ func (s *bfkSide) integrationScope(set ...any) bfkRow {
 func (s *bfkSide) igaScanRun(set ...any) bfkRow {
 	return bfkRowOf("iga_scan_runs", []any{"id", uuid.New(), "workspace_id", s.ws, "integration_id", s.id("integ"),
 		"mode", "full", "generation", 1}, set)
+}
+
+// syncConfiguration is the AD connection an inventory run hangs off. client_id
+// is a bare uuid: sync_configurations has no foreign key to clients.
+func (s *bfkSide) syncConfiguration(set ...any) bfkRow {
+	return bfkRowOf("sync_configurations", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"client_id", uuid.New(), "sync_type", "active_directory", "config_name", bfkFresh("ad")}, set)
+}
+
+// adInventoryRun points at A's sync configuration. Callers override
+// integration_id or scan_run_id with the parent under test; the other stays
+// A's so only that key is the one being judged.
+func (s *bfkSide) adInventoryRun(set ...any) bfkRow {
+	return bfkRowOf("ad_inventory_runs", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"sync_config_id", s.id("adcfg"), "status", "succeeded", "mode", "full",
+		"integration_id", s.id("integ"), "scan_run_id", s.id("iscan")}, set)
 }
 
 // scanCheckpoint has no id column: its key is (workspace, run, class, partition).

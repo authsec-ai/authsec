@@ -476,4 +476,15 @@ var bfkCases = []bfkCase{
 	{fk: "iga_observations_discovery_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
 		return w.A.igaObservation("discovery_source_id", p.id("dsrc"))
 	}},
+
+	// ---------------- 039: AD inventory runs point into the evidence tables --
+	// In scope because the parent is iga_integrations or iga_scan_runs. The
+	// child lives in A; the column under test names p, so a parent that exists
+	// only in another workspace is refused.
+	{fk: "ad_inventory_runs_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.adInventoryRun("integration_id", p.id("integ"))
+	}},
+	{fk: "ad_inventory_runs_scan_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.adInventoryRun("scan_run_id", p.id("iscan"))
+	}},
 }
