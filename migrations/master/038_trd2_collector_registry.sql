@@ -88,9 +88,15 @@ ALTER TABLE public.iga_observations
     REFERENCES public.discovery_sources (workspace_id, id)
     ON DELETE SET NULL (discovery_source_id);
 
-ALTER TABLE public.iga_observations DROP CONSTRAINT IF EXISTS iga_observations_mode_chk;
-ALTER TABLE public.iga_observations
-    ADD CONSTRAINT iga_observations_mode_chk CHECK (mode IN (
+-- 039 (AD inventory) rebuilds this same constraint and needs mode 'observed'.
+-- Rebuild from the union of the historical list, the collector modes, and
+-- 'observed', then keep any value the live constraint already allows. 038
+-- then 039 and 039 then 038 both leave every mode in place. A static
+-- DROP/ADD here would strip 'observed' when it runs second, and would fail
+-- outright if an observed row already existed.
+DO $$
+DECLARE
+    wanted text[] := ARRAY[
         'platform_declared',
         'deployment_declared',
         'invocation_declared',
@@ -99,8 +105,37 @@ ALTER TABLE public.iga_observations
         'secret_reference',
         'identity_grant',
         'audit_event',
+        'observed',
         'runtime_batch',
-        'configuration_snapshot'));
+        'configuration_snapshot'
+    ];
+    def text;
+    extra text;
+    modes text[] := wanted;
+BEGIN
+    SELECT pg_get_constraintdef(c.oid) INTO def
+    FROM pg_constraint c
+    WHERE c.conname = 'iga_observations_mode_chk'
+      AND c.conrelid = 'public.iga_observations'::regclass;
+
+    IF def IS NOT NULL THEN
+        FOR extra IN
+            SELECT x[1]
+            FROM regexp_matches(def, '''([^'']+)''', 'g') AS x
+        LOOP
+            IF NOT (extra = ANY (modes)) THEN
+                modes := array_append(modes, extra);
+            END IF;
+        END LOOP;
+    END IF;
+
+    ALTER TABLE public.iga_observations DROP CONSTRAINT IF EXISTS iga_observations_mode_chk;
+    EXECUTE format(
+        'ALTER TABLE public.iga_observations ADD CONSTRAINT iga_observations_mode_chk CHECK (mode IN (%s))',
+        (SELECT string_agg(quote_literal(m), ', ' ORDER BY m) FROM unnest(modes) AS m)
+    );
+END
+$$;
 
 ALTER TABLE public.iga_scan_runs DROP CONSTRAINT IF EXISTS iga_scan_runs_mode_chk;
 ALTER TABLE public.iga_scan_runs
