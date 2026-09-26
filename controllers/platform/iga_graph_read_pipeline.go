@@ -33,7 +33,11 @@ import (
 func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
 		vals := c.Request.URL.Query()
-		if perr := onlyParams(vals, "include"); perr != nil {
+		if perr := onlyParams(vals, "include", "graph", "provider"); perr != nil {
+			return nil, perr
+		}
+		ctx, perr := igaread.BindOptIn(c.Request.Context(), vals)
+		if perr != nil {
 			return nil, perr
 		}
 		includeStuck, perr := pipelineInclude(vals)
@@ -41,7 +45,7 @@ func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{}, func(q *igaread.Query) error {
+		err := g.Reader.Read(ctx, g.WS, igaread.Pin{}, func(q *igaread.Query) error {
 			view, err := q.Pipeline()
 			if err != nil {
 				return err
@@ -87,7 +91,11 @@ func pipelineInclude(vals url.Values) (bool, *igaread.Error) {
 func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
 		vals := c.Request.URL.Query()
-		if perr := onlyParams(vals, "account", "rev"); perr != nil {
+		if perr := onlyParams(vals, "account", "rev", "graph", "provider"); perr != nil {
+			return nil, perr
+		}
+		ctx, perr := igaread.BindOptIn(c.Request.Context(), vals)
+		if perr != nil {
 			return nil, perr
 		}
 		rev, perr := igaread.ParseRev(vals)
@@ -99,7 +107,7 @@ func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
+		err := g.Reader.Read(ctx, g.WS, igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
 			data, err := q.Coverage(accounts)
 			if err != nil {
 				return err

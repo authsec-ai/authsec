@@ -1024,6 +1024,28 @@ func contractParameterCases(t *testing.T, f *contractFixture) []contractCase {
 				t.Errorf("second page = %s, want the next event", contractJSON(page["data"]))
 			}
 		})
+	// S12b runtime reads. The AWS estate has no runtime rows; the envelope is
+	// the contract, and the rows themselves are TestTRD2ITA5P2Readers.
+	add("GET /workloads/:id/runtime-instances", "/workloads/"+u(f.lambda)+"/runtime-instances", contractRuntimeInstances, func(t *testing.T, b map[string]any) {
+		if len(digl(b, "data")) != 0 {
+			t.Errorf("runtime instances = %s, want none on the AWS estate", contractJSON(b["data"]))
+		}
+	})
+	add("GET /workloads/:id/observed-access", "/workloads/"+u(f.lambda)+"/observed-access", contractObservedAccess, func(t *testing.T, b map[string]any) {
+		if len(digl(b, "data")) != 0 {
+			t.Errorf("observed access = %s, want none on the AWS estate", contractJSON(b["data"]))
+		}
+	})
+	add("GET /workloads/:id/runtime-policy-status", "/workloads/"+u(f.lambda)+"/runtime-policy-status", contractRuntimePolicy, func(t *testing.T, b map[string]any) {
+		if digs(b, "data", "status") != "not_configured" || digs(b, "data", "workload_id") != u(f.lambda) {
+			t.Errorf("runtime policy = %s, want not_configured", contractJSON(b["data"]))
+		}
+	})
+	add("GET /identities/:id/observed-use", "/identities/"+u(f.shared)+"/observed-use", contractObservedUse, func(t *testing.T, b map[string]any) {
+		if len(digl(b, "data", "bindings")) != 0 || len(digl(b, "data", "observed_access")) != 0 {
+			t.Errorf("observed use = %s, want none on the AWS estate", contractJSON(b["data"]))
+		}
+	})
 	return out
 }
 
@@ -1057,12 +1079,15 @@ func TestP2ContractEveryRouteFieldByField(t *testing.T) {
 		})
 	}
 
-	// Every GET the route table mounts has a case above; the one POST has its
-	// own test (TestP2ContractClassificationPost).
+	// Every GET the route table mounts has a case above. Classification has
+	// TestP2ContractClassificationPost. Agent registration has
+	// TestTRD2ITA5RegistrationIdempotency (idempotency, evidence, classification).
 	for _, r := range api.eng.Routes() {
 		route := r.Method + " " + strings.TrimPrefix(r.Path, "/api/iga/v1")
 		if r.Method == http.MethodPost {
-			if route != "POST /workloads/:id/classification" {
+			switch route {
+			case "POST /workloads/:id/classification", "POST /workloads/:id/agent-registration":
+			default:
 				t.Errorf("POST route %s has no contract test", route)
 			}
 			continue

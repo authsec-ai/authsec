@@ -244,6 +244,10 @@ func (r *Reader) WorkloadResources(ctx context.Context, ws uuid.UUID, rawID stri
 	if perr != nil {
 		return nil, perr
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	id, nerr := RouteID(RefWorkload, rawID)
 	if nerr != nil {
 		return nil, nerr

@@ -338,7 +338,15 @@ func (t *graphTraversal) fetchResources(lv *graphLevel, ids []uuid.UUID, set map
 		n.stale = r.StaleSubject()
 		n.fetched = true
 	}
-	return nil
+	return t.fillResourceFacts(lv, nodesOf(set))
+}
+
+func nodesOf(set map[uuid.UUID]*GraphNode) []*GraphNode {
+	out := make([]*GraphNode, 0, len(set))
+	for _, n := range set {
+		out = append(out, n)
+	}
+	return out
 }
 
 // ownAccount sets a workload's, identity's or external principal's account

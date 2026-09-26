@@ -194,7 +194,7 @@ func TestTRD2ITA5RegistrationIdempotency(t *testing.T) {
 	}
 
 	bare := uuid.New()
-	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key) VALUES ($1, $2, 'lambda_function', $3)`,
+	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, classification) VALUES ($1, $2, 'lambda_function', $3, 'classified_agent')`,
 		bare, f.ws, "bare-"+bare.String())
 	noEv := a5RegBody(t, 0, "invoice processing", owner, "", "no-evidence", staleObs, uuid.Nil)
 	code, noEvBody, ebody := api.post("/workloads/"+bare.String()+"/agent-registration", "a5-reg-5", noEv)
@@ -465,8 +465,8 @@ func a5IGAEvidence(f *a3) (workload, observation uuid.UUID) {
 	integ, _, _ := f.seedCollector("linux")
 	run := f.seedRun(integ, "full", true)
 	workload = uuid.New()
-	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, display_name)
-		VALUES ($1, $2, 'lambda_function', $3, 'invoice')`, workload, f.ws, "wl-"+workload.String())
+	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, display_name, classification)
+		VALUES ($1, $2, 'lambda_function', $3, 'invoice', 'classified_agent')`, workload, f.ws, "wl-"+workload.String())
 	obj := uuid.New()
 	f.exec(`INSERT INTO iga_source_objects (id, workspace_id, integration_id, object_type, recognition_key)
 		VALUES ($1, $2, $3, 'workload', $4)`, obj, f.ws, integ, "obj-"+obj.String())
@@ -485,8 +485,8 @@ func a5IGAEvidence(f *a3) (workload, observation uuid.UUID) {
 func a5CloudEvidence(f *a3) (workload, observation uuid.UUID) {
 	f.t.Helper()
 	workload = uuid.New()
-	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, display_name)
-		VALUES ($1, $2, 'lambda_function', $3, 'cloud-fn')`, workload, f.ws, "cwl-"+workload.String())
+	f.exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, display_name, classification)
+		VALUES ($1, $2, 'lambda_function', $3, 'cloud-fn', 'classified_agent')`, workload, f.ws, "cwl-"+workload.String())
 	run := f.publishedRun(f.connector, 1)
 	cloudWL := uuid.New()
 	f.exec(`INSERT INTO cloud_workload (id, workspace_id, connector_id, runtime_kind, native_id, name)

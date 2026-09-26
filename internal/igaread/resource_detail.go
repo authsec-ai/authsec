@@ -51,10 +51,12 @@ var ResourcePolicySourceAPIs = []string{"s3:GetBucketPolicy", "kms:GetKeyPolicy"
 // route (§5.2 "Retired objects"; D-98); the list row omits it on active rows.
 type ResourceDetailView struct {
 	ResourceRow
-	RetiredReason  *string             `json:"retired_reason"`
-	Existence      string              `json:"existence"`
-	ResourcePolicy ResourcePolicyState `json:"resource_policy"`
-	Sources        []ResourceSource    `json:"sources"`
+	RetiredReason   *string             `json:"retired_reason"`
+	Existence       string              `json:"existence"`
+	ResourcePolicy  ResourcePolicyState `json:"resource_policy"`
+	Sources         []ResourceSource    `json:"sources"`
+	ReferenceStatus *string             `json:"reference_status,omitempty"`
+	NativeKind      *string             `json:"native_kind,omitempty"`
 }
 
 // ResourcePolicyState is resource_policy (§5.3, D-19): whether a bucket or key
@@ -95,7 +97,7 @@ type ResourceDetailMeta struct {
 // the first publication (D-4) are 404 not_found with no hint.
 func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
 	for name := range vals {
-		if name != "rev" {
+		if name != "rev" && !isOptInParam(name) {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
 		}
 	}
@@ -104,6 +106,10 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 		return nil, perr
 	}
 	id, perr := RouteID(RefResource, rawID)
+	if perr != nil {
+		return nil, perr
+	}
+	ctx, perr = bindOptIn(ctx, vals)
 	if perr != nil {
 		return nil, perr
 	}
@@ -161,14 +167,22 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 			return err
 		}
 
+		view := ResourceDetailView{
+			ResourceRow:    rec.Row(accts, named, excluded, StaleReasonOf(rec.State, rec.ID, reasons)),
+			RetiredReason:  strPtr(rec.RetiredReason),
+			Existence:      ResourceExistenceNotVerified,
+			ResourcePolicy: policy,
+			Sources:        sources,
+		}
+		if q.V2 {
+			status, kind, err := q.resourceFacts(rec.ID)
+			if err != nil {
+				return err
+			}
+			view.ReferenceStatus, view.NativeKind = status, kind
+		}
 		out = Envelope{
-			Data: ResourceDetailView{
-				ResourceRow:    rec.Row(accts, named, excluded, StaleReasonOf(rec.State, rec.ID, reasons)),
-				RetiredReason:  strPtr(rec.RetiredReason),
-				Existence:      ResourceExistenceNotVerified,
-				ResourcePolicy: policy,
-				Sources:        sources,
-			},
+			Data: view,
 			Meta: ResourceDetailMeta{DetailMeta: NewDetailMeta(q), Coverage: cov},
 		}
 		return nil

@@ -103,6 +103,7 @@ func contractListMeta(extra ...contractField) contractShape {
 		contractReq("rev", contractNullable(contractInt)),
 		contractReq("published_at", contractNullable(contractTime)),
 		contractReq("graph_state", contractGraphState),
+		contractOpt("graph_revision", contractInt),
 		contractReq("next_cursor", contractNullable(contractNonEmpty)),
 		contractReq("limit", contractInt),
 		contractReq("total_known", contractBool),
@@ -122,6 +123,7 @@ func contractDetailMeta(extra ...contractField) contractShape {
 		contractReq("rev", contractNullable(contractInt)),
 		contractReq("published_at", contractNullable(contractTime)),
 		contractReq("graph_state", contractGraphState),
+		contractOpt("graph_revision", contractInt),
 		contractReq("capabilities", contractMap(contractBool)),
 	), extra...)
 }
@@ -1077,6 +1079,11 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 		contractReq("evidence", contractBool), contractReq("changes", contractBool),
 		contractReq("classification", contractBool), contractReq("coverage", contractBool),
 	)),
+	contractReq("graph_v2", contractObj(
+		contractReq("opt_in", contractConst("graph=v2")),
+		contractReq("available", contractBool),
+		contractReq("providers", contractArr(contractEnum("ad", "aws", "kubernetes", "linux"))),
+	)),
 	contractReq("schema_head", contractNullable(contractNonEmpty)),
 )))
 
@@ -1168,6 +1175,53 @@ var contractCoverage = contractDetail(contractArr(contractObj(
 		contractReq("outdated", contractNullable(contractBool)),
 	)),
 )), contractDetailMeta())
+
+/* --------------------------- runtime reads (S12b) --------------------------- */
+
+var contractRuntimeInstance = contractObj(
+	contractReq("ref", contractRef("runtime_instance")),
+	contractReq("runtime_key", contractNonEmpty),
+	contractReq("runtime_kind", contractNonEmpty),
+	contractReq("started_at", contractNullable(contractTime)),
+	contractReq("ended_at", contractNullable(contractTime)),
+	contractReq("last_observed_at", contractTime),
+	contractReq("ttl_basis", contractNullable(contractEnum("runtime_unobserved"))),
+)
+
+var contractRuntimeInstances = contractList(contractRuntimeInstance, contractListMeta())
+
+var contractObservedAccessGroup = contractObj(
+	contractReq("resource", contractRef("resource")),
+	contractReq("action", contractNonEmpty),
+	contractReq("outcome", contractNonEmpty),
+	contractReq("attribution", contractStr),
+	contractReq("count", contractInt),
+	contractReq("first_observed_at", contractTime),
+	contractReq("last_observed_at", contractTime),
+	contractReq("access_class", contractConst("observed")),
+)
+
+var contractObservedAccess = contractList(contractObservedAccessGroup, contractListMeta())
+
+var contractRuntimePolicy = contractDetail(contractObj(
+	contractReq("workload_id", contractNonEmpty),
+	contractReq("status", contractConst("not_configured")),
+), contractDetailMeta())
+
+var contractObservedBinding = contractObj(
+	contractReq("ref", contractRef("runtime_binding")),
+	contractReq("runtime_instance", contractRef("runtime_instance")),
+	contractReq("workload", contractRef("workload")),
+	contractReq("binding_kind", contractNonEmpty),
+	contractReq("basis", contractNonEmpty),
+	contractReq("valid_from", contractTime),
+	contractReq("valid_to", contractNullable(contractTime)),
+)
+
+var contractObservedUse = contractDetail(contractObj(
+	contractReq("bindings", contractArr(contractObservedBinding)),
+	contractReq("observed_access", contractArr(contractObservedAccessGroup)),
+), contractDetailMeta())
 
 /* ---------------------------------- errors --------------------------------- */
 

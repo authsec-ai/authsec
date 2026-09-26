@@ -107,6 +107,10 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 	if nerr != nil {
 		return nil, nerr
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	var out Envelope
 	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {

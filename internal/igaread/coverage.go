@@ -230,9 +230,11 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		return nil, err
 	}
 	var connectors []models.CloudConnector
-	if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
-		Find(&connectors).Error; err != nil {
-		return nil, err
+	if q.includeProvider(models.ProviderAWS) {
+		if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
+			Find(&connectors).Error; err != nil {
+			return nil, err
+		}
 	}
 	want := map[string]bool{}
 	for _, a := range accounts {
@@ -263,7 +265,7 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		order = append(order, c.ID)
 	}
 	if len(order) == 0 {
-		return out, nil
+		return q.appendIntegrationCoverage(out)
 	}
 	// Ordered by label then id, like /pipeline (D-92).
 	sort.SliceStable(order, func(i, j int) bool {
@@ -387,6 +389,55 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 	}
 	for _, id := range order {
 		out = append(out, *byConnector[id])
+	}
+	return q.appendIntegrationCoverage(out)
+}
+
+// appendIntegrationCoverage adds one row per opted-in iga integration after
+// the AWS account rows. A default read leaves the AWS slice as it was.
+func (q *Query) appendIntegrationCoverage(out []CoverageAccount) ([]CoverageAccount, error) {
+	if !q.V2 {
+		return out, nil
+	}
+	var rows []struct {
+		ID            uuid.UUID
+		Provider      string
+		Status        string
+		CoverageState *string
+		RunID         *uuid.UUID
+	}
+	if err := q.DB().Raw(`SELECT i.id, i.provider, i.status, ps.coverage_state, ps.last_iga_scan_run_id AS run_id
+		FROM iga_integrations i
+		LEFT JOIN iga_projection_state ps
+		  ON ps.workspace_id = i.workspace_id AND ps.integration_id = i.id
+		WHERE i.workspace_id = ?
+		ORDER BY i.provider, i.id`, q.WS).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	seen := map[uuid.UUID]bool{}
+	for _, r := range rows {
+		if !q.includeProvider(r.Provider) || r.Provider == models.ProviderAWS || seen[r.ID] {
+			continue
+		}
+		seen[r.ID] = true
+		acct := CoverageAccount{
+			Integration:     "integration:" + r.ID.String(),
+			ConnectorStatus: r.Status,
+			Template:        map[string]any{},
+			Runs:            []string{},
+			Surfaces:        []CoverageSurface{},
+		}
+		run := ""
+		if r.RunID != nil {
+			run = "iga_scan_run:" + r.RunID.String()
+			acct.Runs = append(acct.Runs, run)
+		}
+		if r.CoverageState != nil && *r.CoverageState != "" {
+			acct.Surfaces = append(acct.Surfaces, CoverageSurface{
+				Surface: "projection", State: *r.CoverageState, Run: run,
+			})
+		}
+		out = append(out, acct)
 	}
 	return out, nil
 }

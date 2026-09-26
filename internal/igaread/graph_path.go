@@ -111,6 +111,10 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 	if perr := graphCheckParams(vals, "from", "to"); perr != nil {
 		return nil, perr
 	}
+	ctx, perr := bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	from, perr := graphNodeParam(vals, "from")
 	if perr != nil {
 		return nil, perr
