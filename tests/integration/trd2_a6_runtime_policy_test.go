@@ -274,6 +274,13 @@ func TestTRD2ITA6CapabilityOnSync(t *testing.T) {
 	g := openGorm(t, db)
 	ws := uuid.New()
 	execDB(t, db, `INSERT INTO workspaces (id, name) VALUES ($1, $2)`, ws, "a6cap-"+ws.String()[:8])
+	// Accept queues collector_outbox rows. The evidence job's projector claims
+	// the oldest ready batch in the database, so these must not outlive the test.
+	t.Cleanup(func() {
+		if _, err := db.Exec(`DELETE FROM workspaces WHERE id = $1`, ws); err != nil {
+			t.Errorf("capability workspace cleanup: %v", err)
+		}
+	})
 	scope, integ, src, collector := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	execDB(t, db, `INSERT INTO iga_estate_scopes (id, workspace_id, scope_kind) VALUES ($1, $2, 'aws_account')`, scope, ws)
 	execDB(t, db, `INSERT INTO iga_integrations (id, workspace_id, provider, provider_host, app_registration_id)
