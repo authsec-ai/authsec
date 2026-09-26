@@ -271,8 +271,9 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
-	// Gin's default engine trusts every X-Forwarded-For. Trust nobody unless
-	// IGA_TRUSTED_PROXIES lists the load-balancer CIDRs.
+	// Rollout: set IGA_TRUSTED_PROXIES to the load-balancer CIDRs. Unset
+	// leaves gin's ClientIP() default in place for tenant rate limits,
+	// audit, and request logs.
 	if err := middlewares.ApplyTrustedProxies(r); err != nil {
 		log.Fatalf("IGA_TRUSTED_PROXIES: %v", err)
 	}
