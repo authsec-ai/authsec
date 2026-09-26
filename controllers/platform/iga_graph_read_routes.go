@@ -26,12 +26,16 @@ func RegisterIGAGraphReadRoutes(g gin.IRoutes, ctl *IGAGraphReadController, requ
 	g.POST("/workloads/:id/classification", require("iga", "review"), ctl.ClassifyWorkload)
 	g.POST("/workloads/:id/agent-registration", require("discovery", "claim"), ctl.RegisterWorkloadAgent)
 	g.GET("/workloads/:id/classification", read, ctl.GetWorkloadClassification)
+	g.GET("/workloads/:id/runtime-instances", read, ctl.GetRuntimeInstances)
+	g.GET("/workloads/:id/observed-access", read, ctl.GetObservedAccess)
+	g.GET("/workloads/:id/runtime-policy-status", read, ctl.GetRuntimePolicyStatus)
 
 	g.GET("/identities", read, ctl.ListIdentities)
 	g.GET("/identities/:id", read, ctl.GetIdentity)
 	g.GET("/identities/:id/used-by", read, ctl.GetIdentityUsedBy)
 	g.GET("/identities/:id/permissions", read, ctl.GetIdentityPermissions)
 	g.GET("/identities/:id/changes", read, ctl.GetIdentityChanges)
+	g.GET("/identities/:id/observed-use", read, ctl.GetObservedUse)
 
 	g.GET("/external-principals/:id", read, ctl.GetExternalPrincipal)
 	g.GET("/external-principals/:id/referenced-by", read, ctl.GetExternalPrincipalReferencedBy)

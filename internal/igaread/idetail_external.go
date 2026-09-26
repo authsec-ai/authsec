@@ -253,6 +253,10 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 	if perr != nil {
 		return nil, perr
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	id, nerr := RouteID(RefExternalPrincipal, rawID)
 	if nerr != nil {
 		return nil, nerr
@@ -413,6 +417,10 @@ func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, ws uuid.UUID
 		return nil, perr
 	}
 	includeEnded, perr := idetailIncludeEnded(vals)
+	if perr != nil {
+		return nil, perr
+	}
+	ctx, perr = bindOptIn(ctx, vals)
 	if perr != nil {
 		return nil, perr
 	}

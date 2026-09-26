@@ -175,6 +175,17 @@ type EvidenceRaw struct {
 type EvidenceMeta struct {
 	DetailMeta
 	Summary *EvidenceSummary `json:"summary,omitempty"`
+	// Provenance is the publication's typed source. Set only for graph=v2.
+	// Manifest is the pre-v2 column, kept beside source_manifest_v2.
+	Provenance *EvidenceProvenance `json:"provenance,omitempty"`
+}
+
+// EvidenceProvenance is A3's integration arm as a reader sees it.
+type EvidenceProvenance struct {
+	GraphRevision    int64           `json:"graph_revision"`
+	Manifest         json.RawMessage `json:"manifest"`
+	SourceManifestV2 json.RawMessage `json:"source_manifest_v2,omitempty"`
+	IntegrationID    *string         `json:"integration_id,omitempty"`
 }
 
 // EvidenceSummary is one sentence over every claim of the request -- only
@@ -198,7 +209,7 @@ const RefObservation = "cloud_observation"
 func (r *Reader) Evidence(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
 	for name := range vals {
 		switch name {
-		case "claim", "include", "rev":
+		case "claim", "include", "rev", "graph", "provider":
 		default:
 			return nil, InvalidParameter(name, name+" is not a parameter of /evidence")
 		}
@@ -231,6 +242,10 @@ func (r *Reader) Evidence(ctx context.Context, ws uuid.UUID, vals url.Values) (a
 		}
 	}
 	rev, perr := ParseRev(vals)
+	if perr != nil {
+		return nil, perr
+	}
+	ctx, perr = bindOptIn(ctx, vals)
 	if perr != nil {
 		return nil, perr
 	}
@@ -267,6 +282,13 @@ func (r *Reader) Evidence(ctx context.Context, ws uuid.UUID, vals url.Values) (a
 			data[i] = c.render(lims[i], cov.collection(i), includeRaw)
 		}
 		meta := EvidenceMeta{DetailMeta: NewDetailMeta(q)}
+		if q.V2 {
+			prov, err := q.evidenceProvenance()
+			if err != nil {
+				return err
+			}
+			meta.Provenance = prov
+		}
 		if len(claims) == 1 {
 			out = Envelope{Data: data[0], Meta: meta}
 			return nil
@@ -458,6 +480,7 @@ func loadClaims(q *Query, accts *Accounts, refs []Ref, opts loadOpts) ([]*evClai
 		{RefGrant, l.grants},
 		{RefAssignment, l.assignments},
 		{RefRelationship, l.relationships},
+		{RefObservedAccess, l.observedAccess},
 		{RefTarget, l.targets},
 		{RefPresence, l.presenceRows},
 		{RefWorkload, l.objects(RefWorkload)},

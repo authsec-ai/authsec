@@ -64,6 +64,7 @@ type Reader struct {
 // NewReader builds a reader over db. cursorKey signs list cursors
 // (IGA_CURSOR_SECRET); it must be the same on every replica.
 func NewReader(db *gorm.DB, cursorKey []byte) *Reader {
+	installGraphWiden(db)
 	return &Reader{db: db, budget: RequestBudget, cursorKey: cursorKey, accessDenseAt: rdetailAccessDenseAt}
 }
 
@@ -105,6 +106,10 @@ type Query struct {
 	WS uuid.UUID
 	// Rev is the revision the request reads; nil when nothing is published.
 	Rev *Revision
+	// V2 is graph=v2. Providers is the closed set the snapshot may read.
+	// Both stay zero on a default request, and SQL() is then an identity.
+	V2        bool
+	Providers []string
 
 	savepoints int
 	baseMS     int64
@@ -141,7 +146,11 @@ func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Que
 				return RevisionStale(*want, cur)
 			}
 		}
-		q := &Query{tx: tx, ctx: ctx, deadline: deadline, WS: ws, Rev: cur, baseMS: base}
+		sc := graphScopeFrom(ctx)
+		q := &Query{
+			tx: tx, ctx: ctx, deadline: deadline, WS: ws, Rev: cur, baseMS: base,
+			V2: sc.V2, Providers: sc.Providers,
+		}
 		return fn(q)
 	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err == nil {

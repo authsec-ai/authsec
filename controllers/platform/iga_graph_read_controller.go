@@ -132,11 +132,20 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 			head = fmt.Sprintf("%03d", h)
 		}
 	}
+	on := mode == services.GraphProjectionOn
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"graph_projection": mode,
 		"reason":           nullIfEmpty(reason),
-		"features":         graphFeatures(mode == services.GraphProjectionOn),
-		"schema_head":      nullIfEmpty(head),
+		"features":         graphFeatures(on),
+		// graph_v2 is a sibling of features, not a ninth feature key. The
+		// eight feature flags stay the contract; this object tells the
+		// console the opt-in query and the providers it unlocks.
+		"graph_v2": gin.H{
+			"opt_in":    "graph=v2",
+			"available": on,
+			"providers": []string{"ad", "aws", "kubernetes", "linux"},
+		},
+		"schema_head": nullIfEmpty(head),
 	}})
 }
 

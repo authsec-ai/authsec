@@ -31,7 +31,7 @@ import (
 // checked before the snapshot opens (D-10).
 func idetailParams(vals url.Values, allowed ...string) (*int64, *Error) {
 	for name := range vals {
-		if !contains(allowed, name) {
+		if !contains(allowed, name) && !isOptInParam(name) {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
 		}
 	}

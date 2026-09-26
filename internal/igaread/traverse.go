@@ -77,6 +77,22 @@ var graphEdgeKinds = []string{
 	GraphEdgeMemberOf, GraphEdgeTarget, GraphEdgeTaskExecutionRole,
 }
 
+// GraphEdgeBackedByDirectory and GraphEdgeObservedAccess are v2-only. They
+// are not in graphEdgeKinds: an expand that does not opt in still says
+// "edge must be one of" the AWS kinds.
+const (
+	GraphEdgeBackedByDirectory = models.RelTypeBackedByDirectory
+	GraphEdgeObservedAccess    = "observed_access"
+)
+
+// graphV2EdgeKinds keeps the AWS order and appends the v2 kinds, so a v2
+// level's AWS edges stay in the order a default level emits them.
+var graphV2EdgeKinds = []string{
+	GraphEdgeCanAssume, GraphEdgeExecutesAs, GraphEdgeGrant,
+	GraphEdgeMemberOf, GraphEdgeTarget, GraphEdgeTaskExecutionRole,
+	GraphEdgeBackedByDirectory, GraphEdgeObservedAccess,
+}
+
 // Directions (§5.4): forward answers "what can this reach, declared"; reverse
 // "what reaches this".
 const (
@@ -218,6 +234,10 @@ type GraphNode struct {
 	// typed kind (D-16).
 	Text string `json:"text,omitempty"`
 	Type string `json:"type,omitempty"`
+	// ReferenceStatus and NativeKind are iga_resources columns (041). They
+	// are set only for graph=v2. A default resource node does not carry them.
+	ReferenceStatus *string `json:"reference_status,omitempty"`
+	NativeKind      *string `json:"native_kind,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
@@ -262,20 +282,28 @@ type GraphExclusion struct {
 // targets, and closes_cycle / crosses_account on every edge. from and to are
 // the claim's own endpoints, whichever direction it was traversed in.
 type GraphEdge struct {
-	Claim           string            `json:"claim"`
-	Kind            string            `json:"kind"`
-	From            string            `json:"from"`
-	To              string            `json:"to"`
-	State           string            `json:"state"`
-	Mode            string            `json:"mode,omitempty"`
-	Basis           string            `json:"basis"`
-	Mechanism       string            `json:"mechanism,omitempty"`
-	Policy          string            `json:"policy,omitempty"`
-	ClosesCycle     bool              `json:"closes_cycle"`
-	CrossesAccount  bool              `json:"crosses_account"`
-	LastConfirmedAt any               `json:"last_confirmed_at"`
-	StaleReason     *[]StaleReason    `json:"stale_reason,omitempty"`
-	Limitations     []GraphLimitation `json:"limitations"`
+	Claim     string `json:"claim"`
+	Kind      string `json:"kind"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	State     string `json:"state"`
+	Mode      string `json:"mode,omitempty"`
+	Basis     string `json:"basis"`
+	Mechanism string `json:"mechanism,omitempty"`
+	// AccessClass, Outcome, Meaning, CalculationState and EffectiveConclusion
+	// are v2 labels. EffectiveConclusion is the stored grant column, not a
+	// traversal result: the response still carries effective_access_not_evaluated.
+	AccessClass         string            `json:"access_class,omitempty"`
+	Outcome             string            `json:"outcome,omitempty"`
+	Meaning             string            `json:"meaning,omitempty"`
+	CalculationState    string            `json:"calculation_state,omitempty"`
+	EffectiveConclusion string            `json:"effective_conclusion,omitempty"`
+	Policy              string            `json:"policy,omitempty"`
+	ClosesCycle         bool              `json:"closes_cycle"`
+	CrossesAccount      bool              `json:"crosses_account"`
+	LastConfirmedAt     any               `json:"last_confirmed_at"`
+	StaleReason         *[]StaleReason    `json:"stale_reason,omitempty"`
+	Limitations         []GraphLimitation `json:"limitations"`
 
 	claimRef     Ref // the claim, for Query.ClaimLimitations
 	connectorID  *uuid.UUID
@@ -382,7 +410,7 @@ func (g *GraphTraversal) meta(q *Query) GraphMeta {
 // routes name their starting objects explicitly, so it narrows nothing. It is
 // validated so a malformed value is still 400.
 func graphCheckParams(vals url.Values, allowed ...string) *Error {
-	ok := map[string]bool{"account": true, "rev": true}
+	ok := map[string]bool{"account": true, "rev": true, "graph": true, "provider": true}
 	for _, a := range allowed {
 		ok[a] = true
 	}
@@ -390,7 +418,7 @@ func graphCheckParams(vals url.Values, allowed ...string) *Error {
 		if !ok[name] {
 			return InvalidParameter(name, name+" is not a parameter of this route")
 		}
-		if name != "account" && len(vs) > 1 {
+		if name != "account" && name != "provider" && len(vs) > 1 {
 			return InvalidParameter(name, name+" may be given once")
 		}
 	}
@@ -574,7 +602,7 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 
 	kinds := opts.kinds
 	if kinds == nil {
-		kinds = graphEdgeKinds
+		kinds = t.q.edgeKinds()
 	}
 	for _, kind := range kinds {
 		spec := graphSpecFor(dir, kind)
@@ -665,6 +693,9 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 				nodeCount++
 			}
 			e := row.edge(kind, claimRef, fromRef, toRef)
+			if t.q.V2 {
+				labelV2Edge(e, kind, row)
+			}
 			stagedEdges[claim] = e
 			res.newEdges = append(res.newEdges, e)
 			edgeCount++
@@ -694,6 +725,9 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 		return nil, err
 	}
 	if err := t.decorateEdges(lv, res.newEdges, lookup); err != nil {
+		return nil, err
+	}
+	if err := t.fillGrantHonesty(lv, res.newEdges); err != nil {
 		return nil, err
 	}
 	if err := t.decorateLimitations(lv, res.newNodes, res.newEdges); err != nil {
@@ -749,8 +783,12 @@ func nearOf(e *GraphEdge, dir string) string {
 // in this direction (§5.4's table). An external principal is terminal in
 // reverse (nothing targets one), and a resource in forward.
 func graphKindsFor(typ, dir string) []string {
+	return graphKindsForList(typ, dir, graphEdgeKinds)
+}
+
+func graphKindsForList(typ, dir string, kinds []string) []string {
 	var out []string
-	for _, k := range graphEdgeKinds {
+	for _, k := range kinds {
 		if s := graphSpecFor(dir, k); s != nil {
 			if _, ok := s.near[typ]; ok {
 				out = append(out, k)
@@ -777,7 +815,7 @@ func (t *graphTraversal) frontier(pairs []graphPair, dir string, known bool) ([]
 		pos[n.Ref] = i
 	}
 	kindPos := map[string]int{}
-	for i, k := range graphEdgeKinds {
+	for i, k := range t.q.edgeKinds() {
 		kindPos[k] = i
 	}
 	seen := map[graphPair]bool{}
@@ -880,6 +918,10 @@ type graphVisit struct {
 // again: a node reached twice is returned once, and the edges say how.
 func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "root", "direction", "assume_hops", "include_ended"); perr != nil {
+		return nil, perr
+	}
+	ctx, perr := bindOptIn(ctx, vals)
+	if perr != nil {
 		return nil, perr
 	}
 	root, perr := graphNodeParam(vals, "root")
@@ -1164,6 +1206,14 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 	if perr := graphCheckParams(vals, "node", "edge", "direction", "cursor", "include_ended"); perr != nil {
 		return nil, perr
 	}
+	ctx, perr := bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
+	edgeKinds := graphEdgeKinds
+	if graphScopeFrom(ctx).V2 {
+		edgeKinds = graphV2EdgeKinds
+	}
 	node, perr := graphNodeParam(vals, "node")
 	if perr != nil {
 		return nil, perr
@@ -1176,10 +1226,10 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 	if kind == "" {
 		return nil, InvalidParameter("edge", "edge is required")
 	}
-	if !contains(graphEdgeKinds, kind) {
-		return nil, InvalidParameter("edge", "edge must be one of "+strings.Join(graphEdgeKinds, ", "))
+	if !contains(edgeKinds, kind) {
+		return nil, InvalidParameter("edge", "edge must be one of "+strings.Join(edgeKinds, ", "))
 	}
-	if !contains(graphKindsFor(node.Type, dir), kind) {
+	if !contains(graphKindsForList(node.Type, dir, edgeKinds), kind) {
 		return nil, InvalidParameter("edge", fmt.Sprintf("a %s has no %s edges in direction %s", node.Type, kind, dir))
 	}
 	ended, perr := graphIncludeEnded(vals)

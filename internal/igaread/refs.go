@@ -19,12 +19,13 @@ const (
 	RefStatement         = "statement"          // iga_entitlements (provider = 'aws')
 
 	// Claims.
-	RefRelationship = "relationship" // iga_relationship
-	RefAssignment   = "assignment"   // iga_policy_assignment
-	RefGrant        = "grant"        // iga_access_edges
-	RefTarget       = "target"       // iga_entitlement_target
-	RefPresence     = "presence"     // an object's support rows (iga_object_support)
-	RefCoverage     = "coverage"     // coverage:<run id>:<surface>
+	RefRelationship   = "relationship"    // iga_relationship
+	RefObservedAccess = "observed_access" // iga_observed_access (graph=v2; not an /evidence type)
+	RefAssignment     = "assignment"      // iga_policy_assignment
+	RefGrant          = "grant"           // iga_access_edges
+	RefTarget         = "target"          // iga_entitlement_target
+	RefPresence       = "presence"        // an object's support rows (iga_object_support)
+	RefCoverage       = "coverage"        // coverage:<run id>:<surface>
 
 	// Collection-side references the pipeline and scan views use.
 	RefScanRun   = "cloud_scan_run"

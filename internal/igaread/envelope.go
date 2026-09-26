@@ -63,6 +63,10 @@ type ListMeta struct {
 	TotalAtLeast *int64                  `json:"total_at_least,omitempty"`
 	Facets       map[string][]FacetValue `json:"facets,omitempty"`
 	Coverage     []CoverageNote          `json:"coverage"`
+	// GraphRevision is the publication rev, repeated under the name TRD 2
+	// readers asked for. Set only for graph=v2, so a default envelope does
+	// not grow a field.
+	GraphRevision *int64 `json:"graph_revision,omitempty"`
 }
 
 // NewListMeta starts a list meta from the snapshot's revision.
@@ -80,6 +84,9 @@ func (m *ListMeta) Stamp(q *Query) {
 	}
 	rev, at := q.Rev.Rev, PublicationTime(q.Rev.PublishedAt)
 	m.Rev, m.PublishedAt, m.GraphState = &rev, &at, GraphPublished
+	if q.V2 {
+		m.GraphRevision = &rev
+	}
 }
 
 // PublicationTime is how a publication's published_at is rendered in EVERY
@@ -120,6 +127,9 @@ type DetailMeta struct {
 	PublishedAt  *time.Time     `json:"published_at"`
 	GraphState   string         `json:"graph_state"`
 	Capabilities map[string]any `json:"capabilities"`
+	// GraphRevision mirrors ListMeta.GraphRevision. Omitempty keeps a default
+	// detail envelope byte-identical.
+	GraphRevision *int64 `json:"graph_revision,omitempty"`
 }
 
 // NewDetailMeta stamps a detail meta from the snapshot.
@@ -128,6 +138,9 @@ func NewDetailMeta(q *Query) DetailMeta {
 	if q.Rev != nil {
 		rev, at := q.Rev.Rev, PublicationTime(q.Rev.PublishedAt)
 		d.Rev, d.PublishedAt, d.GraphState = &rev, &at, GraphPublished
+		if q.V2 {
+			d.GraphRevision = &rev
+		}
 	}
 	return d
 }

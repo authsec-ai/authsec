@@ -149,7 +149,7 @@ type rdetailAccessKey struct {
 // ResourceAccess serves GET /resources/:id/access.
 func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
 	for name := range vals {
-		if !rdetailAccessParams[name] {
+		if !rdetailAccessParams[name] && !isOptInParam(name) {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
 		}
 	}
@@ -174,6 +174,10 @@ func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string,
 		return nil, perr
 	}
 	id, perr := RouteID(RefResource, rawID)
+	if perr != nil {
+		return nil, perr
+	}
+	ctx, perr = bindOptIn(ctx, vals)
 	if perr != nil {
 		return nil, perr
 	}

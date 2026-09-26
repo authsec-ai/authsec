@@ -73,6 +73,7 @@ func NewAgentRegistrationService(db *gorm.DB) *AgentRegistrationService {
 type lockedRegWorkload struct {
 	ID                    uuid.UUID
 	ClassificationVersion int64
+	Classification        string
 	SourceKey             string
 	RuntimeKind           string
 }
@@ -104,7 +105,7 @@ func (s *AgentRegistrationService) Register(ctx context.Context, ws uuid.UUID, i
 			return err
 		}
 		var locked []lockedRegWorkload
-		if err := tx.Raw(`SELECT id, classification_version, source_key, runtime_kind
+		if err := tx.Raw(`SELECT id, classification_version, classification, source_key, runtime_kind
 			FROM iga_workload
 			WHERE workspace_id = ? AND id = ?
 			FOR UPDATE`, ws, in.WorkloadID).Scan(&locked).Error; err != nil {
@@ -144,6 +145,15 @@ func (s *AgentRegistrationService) Register(ctx context.Context, ws uuid.UUID, i
 				return err
 			}
 			return conflict
+		}
+		// The vocabulary has no classified_not_agent. unclassified is the
+		// not-agent state. provider_native_agent is already an agent class
+		// and may be registered. The check is after expected_version so a
+		// stale version is still classification_conflict. 409 is not stored
+		// in the idempotency row.
+		if w.Classification != models.ClassificationClassified && w.Classification != models.ClassificationProviderAgent {
+			return igaread.Conflict("classification_not_agent",
+				"Registration requires classified_agent or provider_native_agent. unclassified is not an agent.")
 		}
 
 		var owners int64

@@ -133,6 +133,10 @@ func (r *Reader) WorkloadDetail(ctx context.Context, ws uuid.UUID, rawID string,
 	if nerr != nil {
 		return nil, nerr
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	var out *WorkloadDetailResponse
 	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
@@ -230,7 +234,7 @@ func RouteParams(vals url.Values, allowed ...string) *Error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if !contains(allowed, name) {
+		if !contains(allowed, name) && !isOptInParam(name) {
 			return InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this route", name))
 		}
 	}

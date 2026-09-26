@@ -141,6 +141,10 @@ func (r *Reader) IdentityUsedBy(ctx context.Context, ws uuid.UUID, rawID string,
 	default:
 		return nil, InvalidParameter("section", "section must be workloads, principals or members")
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	cursor := vals.Get("cursor")
 	if cursor != "" && section == "" {
 		return nil, InvalidParameter("cursor", "a cursor pages one section: pass section with it")

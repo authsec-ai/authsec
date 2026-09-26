@@ -161,9 +161,11 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 	// still in the graph. "No integration" (§2.14.7) is no connector that is
 	// not revoked, which the console reads from these lines.
 	var connectors []models.CloudConnector
-	if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
-		Find(&connectors).Error; err != nil {
-		return nil, err
+	if q.includeProvider(models.ProviderAWS) {
+		if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
+			Find(&connectors).Error; err != nil {
+			return nil, err
+		}
 	}
 
 	// Each connector's latest run (D-92): its newest NON-TERMINAL run when it
@@ -172,10 +174,12 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 	// connector that has any run (PipelineLatestRunsSQL); a connector with
 	// none was never scanned, so never published either.
 	var latest []pipelineRun
-	if err := tx.Raw(PipelineLatestRunsSQL,
-		models.CloudScanRunQueued, models.CloudScanRunRunning,
-		q.WS, models.CloudProviderAWS).Scan(&latest).Error; err != nil {
-		return nil, err
+	if q.includeProvider(models.ProviderAWS) {
+		if err := tx.Raw(PipelineLatestRunsSQL,
+			models.CloudScanRunQueued, models.CloudScanRunRunning,
+			q.WS, models.CloudProviderAWS).Scan(&latest).Error; err != nil {
+			return nil, err
+		}
 	}
 	latestBy := make(map[uuid.UUID]*pipelineRun, len(latest))
 	everPublished := make(map[uuid.UUID]bool, len(latest))
@@ -216,6 +220,13 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 	}
 	// Ordered by label then id (D-92): stable across requests, and the order
 	// the operator named the accounts in.
+	if q.V2 {
+		extra, err := q.pipelineIntegrations()
+		if err != nil {
+			return nil, err
+		}
+		view.Accounts = append(view.Accounts, extra...)
+	}
 	sort.SliceStable(view.Accounts, func(i, j int) bool {
 		a, b := view.Accounts[i], view.Accounts[j]
 		if la, lb := strings.ToLower(a.Label), strings.ToLower(b.Label); la != lb {
@@ -224,6 +235,53 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 		return a.Integration < b.Integration
 	})
 	return view, nil
+}
+
+// pipelineIntegrations adds one line per opted-in iga integration. AWS
+// connectors stay on the cloud path above. Default reads never call this.
+func (q *Query) pipelineIntegrations() ([]PipelineAccount, error) {
+	var rows []struct {
+		ID              uuid.UUID
+		Provider        string
+		ProviderHost    string
+		AccountNativeID string
+		Status          string
+		CoverageState   *string
+		RunID           *uuid.UUID
+	}
+	if err := q.DB().Raw(`SELECT i.id, i.provider, i.provider_host, COALESCE(i.account_native_id, '') AS account_native_id,
+		i.status, ps.coverage_state, ps.last_iga_scan_run_id AS run_id
+		FROM iga_integrations i
+		LEFT JOIN iga_projection_state ps
+		  ON ps.workspace_id = i.workspace_id AND ps.integration_id = i.id
+		WHERE i.workspace_id = ?
+		ORDER BY i.provider, i.id`, q.WS).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	var out []PipelineAccount
+	seen := map[uuid.UUID]bool{}
+	for _, r := range rows {
+		if !q.includeProvider(r.Provider) || r.Provider == models.ProviderAWS || seen[r.ID] {
+			continue
+		}
+		seen[r.ID] = true
+		acct := PipelineAccount{
+			Integration:     "integration:" + r.ID.String(),
+			AccountID:       r.AccountNativeID,
+			Label:           r.Provider + "/" + r.ProviderHost,
+			ConnectorStatus: r.Status,
+			State:           "collector",
+			Projection:      map[string]any{},
+		}
+		if r.CoverageState != nil {
+			acct.Projection["coverage_state"] = *r.CoverageState
+		}
+		if r.RunID != nil {
+			acct.LatestRun = map[string]any{"ref": "iga_scan_run:" + r.RunID.String()}
+		}
+		out = append(out, acct)
+	}
+	return out, nil
 }
 
 // connectorLabel is the operator's display name, falling back to the account

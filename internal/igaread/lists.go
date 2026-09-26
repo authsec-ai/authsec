@@ -163,7 +163,7 @@ func (s *listsSpec[S]) facetNames() []string {
 // every list accepts.
 var listsCommonParams = map[string]bool{
 	"q": true, "sort": true, "limit": true, "cursor": true, "facets": true,
-	"lifecycle": true, "account": true, "rev": true, "provider": true,
+	"lifecycle": true, "account": true, "rev": true, "provider": true, "graph": true,
 }
 
 // listsAfter is a decoded cursor position.
@@ -192,9 +192,20 @@ func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals ur
 			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this list", name))
 		}
 	}
-	if perr := listsProvider(p); perr != nil {
+	sc, perr := parseGraphOnly(vals)
+	if perr != nil {
 		return nil, perr
 	}
+	if sc.V2 {
+		provs, perr := parseV2Providers(vals)
+		if perr != nil {
+			return nil, perr
+		}
+		sc.Providers = provs
+	} else if perr := listsProvider(p); perr != nil {
+		return nil, perr
+	}
+	ctx = withGraphScope(ctx, sc)
 	filters, scope, classBound, perr := spec.filters(p, ws)
 	if perr != nil {
 		return nil, perr

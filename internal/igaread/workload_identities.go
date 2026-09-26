@@ -278,6 +278,10 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 	if perr != nil {
 		return nil, perr
 	}
+	ctx, perr = bindOptIn(ctx, vals)
+	if perr != nil {
+		return nil, perr
+	}
 	section := vals.Get("section")
 	if section != "" && !contains(workloadIdentitySections, section) {
 		return nil, InvalidParameter("section", fmt.Sprintf("section must be one of %v", workloadIdentitySections))
