@@ -7,6 +7,7 @@ import (
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/pkg/collectorcontract"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -34,17 +35,22 @@ func NewCollectorController(db *gorm.DB) *platformCtrl.CollectorController {
 // MountCollectorV2 registers /api/iga/v2 collector routes.
 // humanAuth is the existing user middleware (AuthMiddleware in production).
 // Every route 404s when IGA_V2_INGEST is off, before the body is read.
-func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorController, humanAuth gin.HandlerFunc) {
+// The returned sync service is the one mounted; tests use it for quota and
+// crash hooks. Production callers may ignore it.
+func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorController, humanAuth gin.HandlerFunc) *services.CollectorSyncService {
 	if r == nil || db == nil || ctl == nil || humanAuth == nil {
-		return
+		return nil
 	}
 	now := ctl.Now
+	syncSvc := services.NewCollectorSyncService(db, now)
+	syncCtl := platformCtrl.NewCollectorSyncController(syncSvc)
 	v2 := r.Group("/api/iga/v2", middlewares.RequireV2Ingest())
 
 	admin := v2.Group("")
 	admin.Use(humanAuth, middlewares.CollectorRateLimit(collectorRatePerMin, time.Minute), middlewares.LimitBody(collectorBodyLimit))
 	admin.POST("/collector-enrollments", middlewares.Require("discovery", "admin"), ctl.CreateEnrollment)
 	admin.POST("/collectors/:id/revoke", middlewares.Require("discovery", "admin"), ctl.Revoke)
+	admin.POST("/collectors/:id/epoch", middlewares.Require("discovery", "admin"), syncCtl.AuthorizeEpoch)
 	admin.GET("/collectors/:id", middlewares.Require("discovery", "read"), ctl.Get)
 
 	// Static machine paths are registered beside :id. Gin prefers the static
@@ -65,4 +71,16 @@ func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorCon
 	)
 	machine.POST("/collectors/self/credentials/rotate", ctl.Rotate)
 	machine.GET("/collectors/self", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), ctl.GetSelf)
+	machine.GET("/receipts/:id", middlewares.RequireCollectorScope(models.CollectorScopeReceiptWrite), syncCtl.GetReceipt)
+
+	// Sync is on its own group so the body cap is the 2 MiB decompressed limit,
+	// not the 64 KiB enrollment cap. Auth still runs before the handler reads.
+	sync := v2.Group("")
+	sync.Use(
+		middlewares.CollectorRateLimit(collectorRatePerMin, time.Minute),
+		middlewares.AuthenticateCollector(db, now),
+		middlewares.LimitBody(collectorcontract.DecompressedMaxBytes),
+	)
+	sync.POST("/agent-sync", middlewares.RequireCollectorScope(models.CollectorScopeIngest), syncCtl.AgentSync)
+	return syncSvc
 }

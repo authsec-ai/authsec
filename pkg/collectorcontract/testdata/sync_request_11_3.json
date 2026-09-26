@@ -1,0 +1,50 @@
+{
+  "schema_version": "2.0",
+  "batch_id": "10000000-0000-4000-8000-000000000007",
+  "collector_epoch": "20000000-0000-4000-8000-000000000001",
+  "sequence": 7,
+  "sent_at": "2026-09-25T08:00:00Z",
+  "objects": [
+    {
+      "ref": "o_workload",
+      "kind": "linux.systemd_workload",
+      "native": {"unit": "invoice-worker.service"}
+    },
+    {
+      "ref": "o_identity",
+      "kind": "linux.local_account",
+      "native": {"uid": 995, "user_namespace": "host"},
+      "attributes": {"name": "svc-invoice"}
+    },
+    {
+      "ref": "o_db",
+      "kind": "network.endpoint",
+      "native": {
+        "address": "10.20.0.15",
+        "port": 5432,
+        "protocol": "tcp",
+        "address_family": "ipv4"
+      }
+    }
+  ],
+  "observations": [
+    {
+      "event_id": "e-connect-42",
+      "kind": "runtime.network_connect",
+      "subject_ref": "o_workload",
+      "identity_ref": "o_identity",
+      "resource_ref": "o_db",
+      "runtime": {
+        "boot_id": "boot-a",
+        "pid_namespace": "host",
+        "pid": 824,
+        "start_ticks": 93401
+      },
+      "observed_at": "2026-09-25T07:59:58Z",
+      "outcome": "success",
+      "attribution": "kernel_process_credentials"
+    }
+  ],
+  "applied": [],
+  "health": {"events_lost": 0, "queue_depth": 1}
+}

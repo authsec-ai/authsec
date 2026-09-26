@@ -1,0 +1,24 @@
+{
+  "receipt_id": "30000000-0000-4000-8000-000000000007",
+  "accepted_sequence": 7,
+  "projection_state": "queued",
+  "published_graph_revision": 184,
+  "mapping_url": "/api/iga/v2/receipts/30000000-0000-4000-8000-000000000007",
+  "desired": {
+    "revision": 12,
+    "graph_revision": 184,
+    "manifest_id": "40000000-0000-4000-8000-000000000012",
+    "policy_format": "authsec.runtime.v1",
+    "opa_bundle": {
+      "url": "/api/iga/v2/policy-artifacts/opa-12",
+      "sha256": "<64 lowercase hex characters>",
+      "rego_version": "v1"
+    },
+    "controls": {
+      "url": "/api/iga/v2/policy-artifacts/controls-12",
+      "sha256": "<64 lowercase hex characters>"
+    },
+    "signed_manifest": "<detached signed manifest>"
+  },
+  "next_sync_seconds": 15
+}

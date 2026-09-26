@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthSec collector agent-sync response 2.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["receipt_id", "accepted_sequence", "projection_state", "published_graph_revision", "mapping_url", "desired", "next_sync_seconds"],
+  "properties": {
+    "receipt_id": { "type": "string", "format": "uuid" },
+    "accepted_sequence": { "type": "integer", "minimum": 1 },
+    "receipt_state": { "enum": ["accepted", "projecting", "published", "failed"] },
+    "projection_state": { "enum": ["queued", "published"] },
+    "published_graph_revision": { "type": "integer", "minimum": 0 },
+    "mapping_url": { "type": "string", "minLength": 1 },
+    "desired": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/desired" }
+      ]
+    },
+    "next_sync_seconds": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "desired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "graph_revision", "manifest_id", "policy_format", "opa_bundle", "controls", "signed_manifest"],
+      "properties": {
+        "revision": { "type": "integer" },
+        "graph_revision": { "type": "integer" },
+        "manifest_id": { "type": "string", "format": "uuid" },
+        "policy_format": { "const": "authsec.runtime.v1" },
+        "opa_bundle": { "$ref": "#/$defs/artifact" },
+        "controls": { "$ref": "#/$defs/artifact" },
+        "signed_manifest": { "type": "string" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "sha256"],
+      "properties": {
+        "url": { "type": "string" },
+        "sha256": { "type": "string" },
+        "rego_version": { "type": "string" }
+      }
+    }
+  }
+}
