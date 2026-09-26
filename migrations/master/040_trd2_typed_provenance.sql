@@ -8,6 +8,32 @@
 -- credential_id is the reserved third support arm for credential projection.
 -- It is not added here; that projection is not enabled.
 --
+-- Relationship, access-edge and policy-assignment rows may name neither arm.
+-- That grandfathers GitHub edges whose connector_id is null. The database does
+-- not force a new collector row to carry integration_id. Go does: a confirming
+-- collector run without integration_id is rejected in the repository, and the
+-- collector writer always sets the integration arm. Both arms are refused.
+--
+-- Lock and runtime. The runner wraps this file in one transaction, so nothing
+-- here uses CREATE INDEX CONCURRENTLY (that cannot run inside a transaction).
+-- The new unique indexes are on columns this file adds; existing rows have
+-- them NULL, so each build is a catalog write plus an empty partial index.
+--
+--   Statement                         Lock                         Notes
+--   ADD COLUMN (nullable)             ACCESS EXCLUSIVE, brief      no table rewrite (PG 11+)
+--   ADD COLUMN ordering_sequence      ACCESS EXCLUSIVE, brief      constant default, no rewrite
+--   DROP NOT NULL                     ACCESS EXCLUSIVE, catalog    no rewrite
+--   ADD CHECK / FK NOT VALID          ACCESS EXCLUSIVE /           no full-table scan
+--                                     SHARE ROW EXCLUSIVE
+--   CREATE UNIQUE INDEX               SHARE                        empty new columns; not CONCURRENTLY
+--   VALIDATE CONSTRAINT               not in this file             scripts/validate-040-typed-provenance.sql
+--
+-- VALIDATE runs outside the deploy transaction and takes only
+-- SHARE UPDATE EXCLUSIVE. Existing rows already satisfy the new checks:
+-- the cloud columns were NOT NULL and the new columns start NULL.
+-- Adding a check as VALID and validating a NOT VALID constraint in the same
+-- transaction would still scan under ACCESS EXCLUSIVE, so this file does neither.
+--
 -- Re-runnable. No transaction wrapper (the runner applies each file with psql -1).
 -- Down: forward-only. Rollback is the feature flag off; the new columns stay null.
 
@@ -72,6 +98,30 @@ ALTER TABLE public.iga_publication
 ALTER TABLE public.iga_pipeline_lease
     ADD COLUMN IF NOT EXISTS iga_scan_run_id uuid;
 
+-- Which snapshot a batch belongs to. Null means a runtime batch. Set by
+-- ingest when 040 is present. superseded_at records a batch the generation
+-- fence rejected; projection_state stays 'queued' because 038's check does
+-- not allow 'superseded'.
+ALTER TABLE public.collector_batches
+    ADD COLUMN IF NOT EXISTS snapshot_id uuid,
+    ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
+
+-- Watermark for (integration, scope, class). last_generation is the highest
+-- snapshot generation projected. ordering_sequence breaks ties inside that
+-- generation. Runtime batches do not move either value.
+ALTER TABLE public.iga_projection_state
+    ADD COLUMN IF NOT EXISTS ordering_sequence bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS ordering_epoch uuid;
+
+COMMENT ON COLUMN public.collector_batches.snapshot_id IS
+    'Logical collector_snapshots.snapshot_id this batch belongs to. NULL is a runtime batch.';
+COMMENT ON COLUMN public.collector_batches.superseded_at IS
+    'Set when a newer snapshot generation for the same integration, scope and class already projected. The batch is not published.';
+COMMENT ON COLUMN public.iga_projection_state.ordering_sequence IS
+    'Highest collector batch sequence projected at last_generation for this integration, scope and class.';
+COMMENT ON COLUMN public.iga_projection_state.ordering_epoch IS
+    'Epoch of the snapshot that set last_generation. A copied watermark, not a foreign key: collector_snapshots.epoch is not unique.';
+
 COMMENT ON COLUMN public.iga_object_support.integration_id IS
     'Collector owning source. credential_id is reserved for credential projection and is not created until that projection is enabled.';
 
@@ -102,7 +152,7 @@ BEGIN
                 AND (last_confirmed_run_id IS NOT NULL)::int
                     + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
                 AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL)
-                AND (last_confirmed_run_id IS NULL OR connector_id IS NOT NULL));
+                AND (last_confirmed_run_id IS NULL OR connector_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_relationship_arm_xor') THEN
         ALTER TABLE public.iga_relationship
@@ -110,7 +160,7 @@ BEGIN
                 (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
                 AND (last_confirmed_by IS NOT NULL)::int
                     + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
-                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_access_edges_arm_xor') THEN
         ALTER TABLE public.iga_access_edges
@@ -118,7 +168,7 @@ BEGIN
                 (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
                 AND (last_confirmed_by IS NOT NULL)::int
                     + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
-                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_policy_assignment_arm_xor') THEN
         ALTER TABLE public.iga_policy_assignment
@@ -126,61 +176,71 @@ BEGIN
                 (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
                 AND (last_confirmed_by IS NOT NULL)::int
                     + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
-                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_access_edge_evidence_arm_xor') THEN
         ALTER TABLE public.iga_access_edge_evidence
             ADD CONSTRAINT iga_access_edge_evidence_arm_xor CHECK (
-                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_relationship_evidence_arm_xor') THEN
         ALTER TABLE public.iga_relationship_evidence
             ADD CONSTRAINT iga_relationship_evidence_arm_xor CHECK (
-                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_assignment_evidence_arm_xor') THEN
         ALTER TABLE public.iga_assignment_evidence
             ADD CONSTRAINT iga_assignment_evidence_arm_xor CHECK (
-                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_projection_job_arm_xor') THEN
         ALTER TABLE public.iga_projection_job
             ADD CONSTRAINT iga_projection_job_arm_xor CHECK (
                 (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int = 1
-                AND (scan_run_id IS NOT NULL) = (connector_id IS NOT NULL));
+                AND (scan_run_id IS NOT NULL) = (connector_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_projection_state_arm_xor') THEN
         ALTER TABLE public.iga_projection_state
             ADD CONSTRAINT iga_projection_state_arm_xor CHECK (
                 (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int = 1
                 AND (last_run_id IS NOT NULL)::int + (last_iga_scan_run_id IS NOT NULL)::int = 1
-                AND (connector_id IS NOT NULL) = (last_run_id IS NOT NULL));
+                AND (connector_id IS NOT NULL) = (last_run_id IS NOT NULL)) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_publication_arm_xor') THEN
         ALTER TABLE public.iga_publication
             ADD CONSTRAINT iga_publication_arm_xor CHECK (
-                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int = 1);
+                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int = 1) NOT VALID;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_pipeline_lease_arm_xor') THEN
         ALTER TABLE public.iga_pipeline_lease
             ADD CONSTRAINT iga_pipeline_lease_arm_xor CHECK (
-                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int <= 1);
+                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int <= 1) NOT VALID;
     END IF;
 END $$;
 
 -- Idle means no run of either type. 027's check did not know the collector arm.
+-- Replace it once. A later apply leaves the row alone so a validated check is
+-- not dropped back to NOT VALID. VALIDATE is the separate script.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_pipeline_lease_busy_chk') THEN
-        ALTER TABLE public.iga_pipeline_lease DROP CONSTRAINT iga_pipeline_lease_busy_chk;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'iga_pipeline_lease_busy_chk'
+           AND pg_get_constraintdef(oid) LIKE '%iga_scan_run_id%'
+    ) THEN
+        NULL;
+    ELSE
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_pipeline_lease_busy_chk') THEN
+            ALTER TABLE public.iga_pipeline_lease DROP CONSTRAINT iga_pipeline_lease_busy_chk;
+        END IF;
+        ALTER TABLE public.iga_pipeline_lease
+            ADD CONSTRAINT iga_pipeline_lease_busy_chk CHECK (
+                (state = 'idle') = (holder = '' AND scan_run_id IS NULL AND iga_scan_run_id IS NULL)) NOT VALID;
     END IF;
-    ALTER TABLE public.iga_pipeline_lease
-        ADD CONSTRAINT iga_pipeline_lease_busy_chk CHECK (
-            (state = 'idle') = (holder = '' AND scan_run_id IS NULL AND iga_scan_run_id IS NULL));
 END $$;
 
--- Composite foreign keys. NOT VALID, then VALIDATE. A second apply skips the
--- add and validates again.
+-- Composite foreign keys, NOT VALID. VALIDATE is scripts/validate-040-typed-provenance.sql,
+-- outside this transaction. A second apply skips the add.
 DO $$
 DECLARE
     fk record;
@@ -210,11 +270,14 @@ BEGIN
                 'ALTER TABLE public.%I ADD CONSTRAINT %I FOREIGN KEY (workspace_id, %I) REFERENCES public.%I (workspace_id, id) NOT VALID',
                 fk.tbl, fk.conname, fk.col, fk.parent);
         END IF;
-        EXECUTE format('ALTER TABLE public.%I VALIDATE CONSTRAINT %I', fk.tbl, fk.conname);
     END LOOP;
 END $$;
 
--- Collector conflict targets. The cloud unique indexes are not widened.
+-- Collector conflict targets. Built in this transaction, not CONCURRENTLY:
+-- the runner's transaction forbids CONCURRENTLY, and every indexed column is
+-- new, so the partial indexes contain no existing rows.
+
+-- The cloud unique indexes are not widened.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_identity_integration
     ON public.iga_object_support (workspace_id, identity_account_id, integration_id, partition_key)
     WHERE identity_account_id IS NOT NULL AND integration_id IS NOT NULL;

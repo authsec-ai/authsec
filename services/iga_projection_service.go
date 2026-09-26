@@ -52,6 +52,9 @@ type ProjectionService struct {
 	// beforeCollectorTx runs after the collector barrier is acquired and
 	// before the publication transaction. Tests only.
 	beforeCollectorTx func()
+	// stopAfterBarrier returns after the barrier is acquired, without
+	// publishing. Tests use it to simulate a dead worker.
+	stopAfterBarrier bool
 }
 
 func NewProjectionService(
@@ -314,7 +317,8 @@ func (s *ProjectionService) WithCloudHold(d time.Duration) *ProjectionService {
 }
 
 // WithCollectorWriter installs the normalizer the collector arm runs. The
-// default is SupportWriter. Tests install FixtureWriter.
+// default is SupportWriter, which writes support against canonical rows that
+// already exist. Tests install FixtureWriter, which also creates nodes.
 func (s *ProjectionService) WithCollectorWriter(w CollectorGraphWriter) *ProjectionService {
 	s.collector = w
 	return s
@@ -324,6 +328,13 @@ func (s *ProjectionService) WithCollectorWriter(w CollectorGraphWriter) *Project
 // before its publication transaction. Tests only.
 func (s *ProjectionService) WithBeforeCollectorTx(fn func()) *ProjectionService {
 	s.beforeCollectorTx = fn
+	return s
+}
+
+// WithStopAfterBarrier makes the next collector pass return after the barrier
+// is acquired. Tests only: it is a dead worker that still holds the job.
+func (s *ProjectionService) WithStopAfterBarrier() *ProjectionService {
+	s.stopAfterBarrier = true
 	return s
 }
 

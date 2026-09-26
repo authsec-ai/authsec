@@ -735,6 +735,13 @@ type IGAProjectionState struct {
 	LastRunID        uuid.UUID  `json:"last_run_id" gorm:"type:uuid"`
 	LastIGAScanRunID *uuid.UUID `json:"last_iga_scan_run_id,omitempty" gorm:"type:uuid"`
 	LastGeneration   int64      `json:"last_generation" gorm:"not null"`
+	// OrderingSequence and OrderingEpoch are the collector watermark.
+	// LastGeneration is the highest snapshot generation projected for this
+	// integration, scope and class. OrderingSequence breaks ties inside that
+	// generation. Runtime batches do not move them. Cloud rows leave both at
+	// the column default.
+	OrderingSequence int64      `json:"ordering_sequence" gorm:"not null;default:0"`
+	OrderingEpoch    *uuid.UUID `json:"ordering_epoch,omitempty" gorm:"type:uuid"`
 	CoverageState    string     `json:"coverage_state" gorm:"not null"`
 	Reconciled       bool       `json:"reconciled" gorm:"not null;default:false"`
 	UpdatedAt        time.Time  `json:"updated_at"`

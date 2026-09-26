@@ -142,6 +142,9 @@ var v2ProjectionColumns = []string{
 	"iga_publication.iga_scan_run_id",
 	"iga_publication.source_manifest_v2",
 	"iga_pipeline_lease.iga_scan_run_id",
+	"iga_projection_state.ordering_sequence",
+	"collector_batches.snapshot_id",
+	"collector_batches.superseded_at",
 }
 
 // VerifyV2ProjectionSchema fails closed when collector projection is switched

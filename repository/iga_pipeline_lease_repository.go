@@ -208,8 +208,11 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 	return out[0].Version, nil
 }
 
-// AcquireForCollectorProjection moves idle -> projecting for one iga_scan_run.
-// scan_run_id stays NULL. A cloud run on the barrier is not stolen.
+// AcquireForCollectorProjection moves idle -> projecting for one iga_scan_run,
+// or reclaims an expired projecting barrier for that same run. The barrier
+// stays projecting, the run does not change, and version increments so the
+// dead worker's fence fails. scan_run_id stays NULL. A live barrier, or one
+// that names a different run, is not stolen.
 func (r *igaPipelineLeaseRepository) AcquireForCollectorProjection(
 	ws, igaRunID, jobID uuid.UUID, lease time.Duration, now time.Time,
 ) (int64, error) {
@@ -227,9 +230,15 @@ func (r *igaPipelineLeaseRepository) AcquireForCollectorProjection(
 			version = iga_pipeline_lease.version + 1,
 			updated_at = EXCLUDED.updated_at
 		 WHERE iga_pipeline_lease.state = ?
+		    OR (iga_pipeline_lease.state = ?
+		        AND iga_pipeline_lease.iga_scan_run_id = EXCLUDED.iga_scan_run_id
+		        AND iga_pipeline_lease.scan_run_id IS NULL
+		        AND iga_pipeline_lease.expires_at IS NOT NULL
+		        AND iga_pipeline_lease.expires_at <= ?)
 		RETURNING *`,
 		ws, models.PipelineProjecting, models.PipelineJobHolder(jobID), igaRunID, now.Add(lease), now,
 		models.PipelineIdle,
+		models.PipelineProjecting, now,
 	).Scan(&out).Error
 	if err != nil {
 		return 0, err

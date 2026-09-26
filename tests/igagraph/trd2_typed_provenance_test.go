@@ -100,8 +100,8 @@ func TestTRD2CollectorProjectionFence(t *testing.T) {
 	run := seedRun(t, f, ws, integ, "configuration_snapshot", true)
 	pod := seedObject(t, f, ws, integ, run, "Pod", "pod-a")
 	user := seedObject(t, f, ws, integ, run, "ServiceAccount", "sa-a")
-	seedSnapshot(t, f, ws, collector, epoch, "cluster-a", "Pod", true)
-	seedBatch(t, f, ws, integ, collector, epoch, run)
+	snap := seedSnapshotGen(t, f, ws, collector, epoch, "cluster-a", "Pod", true, 1)
+	seedBatchSnap(t, f, ws, integ, collector, epoch, run, 1, snap)
 
 	t.Setenv("IGA_V2_PROJECTION", "on")
 	svc := services.NewProjectionService(f.gorm,
@@ -126,6 +126,24 @@ func TestTRD2CollectorProjectionFence(t *testing.T) {
 	var refs []models.SourceManifestRef
 	if err := json.Unmarshal(manifest, &refs); err != nil || len(refs) != 1 || refs[0].Kind != models.ManifestKindIGAScanRun || refs[0].ID != run {
 		t.Fatalf("source_manifest_v2 = %s (%v)", manifest, err)
+	}
+	var cloudManifest []byte
+	if err := f.db.QueryRow(`SELECT manifest FROM iga_publication WHERE workspace_id = $1 AND iga_scan_run_id = $2`, ws, run).Scan(&cloudManifest); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	asMap := map[string]string{}
+	if err := json.Unmarshal(cloudManifest, &asMap); err != nil {
+		t.Fatalf("cloud readers decode manifest as map[string]string: %v (%s)", err, cloudManifest)
+	}
+	if asMap["cluster-a/Pod"] != run.String() {
+		t.Fatalf("manifest = %s", cloudManifest)
+	}
+	latest, err := f.graph.LatestManifest(f.gorm, ws)
+	if err != nil {
+		t.Fatalf("LatestManifest: %v", err)
+	}
+	if err := json.Unmarshal(latest, &asMap); err != nil || asMap["cluster-a/Pod"] != run.String() {
+		t.Fatalf("LatestManifest = %s (%v)", latest, err)
 	}
 	assertArm := func(q string, args ...any) {
 		t.Helper()
@@ -152,8 +170,8 @@ func TestTRD2CollectorProjectionFence(t *testing.T) {
 	epoch2 := uuid.New()
 	run2 := seedRun(t, f, ws, integ, "configuration_snapshot", false)
 	seedObject(t, f, ws, integ, run2, "Pod", "pod-b")
-	seedSnapshot(t, f, ws, collector, epoch2, "cluster-a", "Pod", false)
-	seedBatch(t, f, ws, integ, collector, epoch2, run2)
+	snap2 := seedSnapshotGen(t, f, ws, collector, epoch2, "cluster-a", "Pod", false, 1)
+	seedBatchSnap(t, f, ws, integ, collector, epoch2, run2, 1, snap2)
 	if _, err := svc.RunOnce(context.Background()); err != nil {
 		t.Fatalf("incomplete: %v", err)
 	}
@@ -167,8 +185,8 @@ func TestTRD2CollectorProjectionFence(t *testing.T) {
 	epoch3 := uuid.New()
 	run3 := seedRun(t, f, ws, integ, "configuration_snapshot", true)
 	seedObject(t, f, ws, integ, run3, "Pod", "pod-b")
-	seedSnapshot(t, f, ws, collector, epoch3, "cluster-a", "Pod", true)
-	seedBatch(t, f, ws, integ, collector, epoch3, run3)
+	snap3 := seedSnapshotGen(t, f, ws, collector, epoch3, "cluster-a", "Pod", true, 2)
+	seedBatchSnap(t, f, ws, integ, collector, epoch3, run3, 1, snap3)
 	if _, err := svc.RunOnce(context.Background()); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -323,7 +341,7 @@ func seedCollector(t *testing.T, f *fixture, ws uuid.UUID, provider string) (int
 	f.exec(`INSERT INTO iga_estate_scopes (id, workspace_id, scope_kind, source_key, display_name)
 		VALUES ($1, $2, 'host', $3, 'scope')`, scope, ws, "scope-"+scope.String())
 	f.exec(`INSERT INTO discovery_sources (id, workspace_id, kind, display_name)
-		VALUES ($1, $2, 'k8s_webhook', 'src')`, src, ws)
+		VALUES ($1, $2, 'k8s_webhook', $3)`, src, ws, "src-"+src.String())
 	f.exec(`INSERT INTO collector_instances
 		(id, workspace_id, discovery_source_id, estate_scope_id, integration_id, kind,
 		 installation_key_id, installation_public_key)
@@ -361,22 +379,33 @@ func seedObject(t *testing.T, f *fixture, ws, integ, run uuid.UUID, objectType, 
 	return obj
 }
 
-func seedSnapshot(t *testing.T, f *fixture, ws, collector, epoch uuid.UUID, scope, class string, complete bool) {
+func seedSnapshotGen(t *testing.T, f *fixture, ws, collector, epoch uuid.UUID, scope, class string, complete bool, generation int64) uuid.UUID {
 	t.Helper()
+	snapID := uuid.New()
 	f.exec(`INSERT INTO collector_snapshots
 		(id, workspace_id, collector_id, snapshot_id, epoch, scope_key, object_class, generation, expected_chunks, complete, gap_blocked)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 1, 1, $8, false)`,
-		uuid.New(), ws, collector, uuid.New(), epoch, scope, class, complete)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, false)`,
+		uuid.New(), ws, collector, snapID, epoch, scope, class, generation, complete)
+	return snapID
 }
 
 func seedBatch(t *testing.T, f *fixture, ws, integ, collector, epoch, run uuid.UUID) {
 	t.Helper()
+	seedBatchSnap(t, f, ws, integ, collector, epoch, run, 1, uuid.Nil)
+}
+
+func seedBatchSnap(t *testing.T, f *fixture, ws, integ, collector, epoch, run uuid.UUID, sequence int64, snap uuid.UUID) {
+	t.Helper()
 	batch := uuid.New()
+	var snapArg any
+	if snap != uuid.Nil {
+		snapArg = snap
+	}
 	f.exec(`INSERT INTO collector_batches
 		(id, workspace_id, collector_id, epoch, sequence, batch_id, payload_hash, receipt_id,
-		 receipt_state, projection_state, iga_scan_run_id)
-		VALUES ($1, $2, $3, $4, 1, $5, 'h', $6, 'accepted', 'queued', $7)`,
-		batch, ws, collector, epoch, uuid.New(), uuid.New(), run)
+		 receipt_state, projection_state, iga_scan_run_id, snapshot_id)
+		VALUES ($1, $2, $3, $4, $5, $6, 'h', $7, 'accepted', 'queued', $8, $9)`,
+		batch, ws, collector, epoch, sequence, uuid.New(), uuid.New(), run, snapArg)
 	f.exec(`INSERT INTO collector_outbox
 		(id, workspace_id, integration_id, collector_id, batch_row_id, job_kind, dedupe_key, state)
 		VALUES ($1, $2, $3, $4, $5, 'collector_project', $6, 'ready')`,

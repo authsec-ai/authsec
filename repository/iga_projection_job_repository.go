@@ -56,6 +56,9 @@ type IGAProjectionJobRepository interface {
 	// ClaimCollector takes one job on the iga_scan_run_id arm. The cloud Claim
 	// never returns those rows, so a flag-off worker leaves them queued.
 	ClaimCollector(owner string, lease time.Duration, now time.Time) (*models.IGAProjectionJob, error)
+	// ClaimCollectorRun claims the job for one iga_scan_run, including a queued
+	// job and a running or failed job whose lease has expired.
+	ClaimCollectorRun(owner string, igaRunID uuid.UUID, lease time.Duration, now time.Time) (*models.IGAProjectionJob, error)
 	Renew(jobID uuid.UUID, owner string, version int64, lease time.Duration) error
 	Complete(jobID uuid.UUID, owner string, version int64) error
 	Fail(jobID uuid.UUID, owner string, version int64, reason string) error
@@ -198,6 +201,50 @@ func (r *igaProjectionJobRepository) ClaimCollector(
 		)
 		RETURNING *`,
 		models.ProjectionRunning, owner, now.Add(lease),
+		MaxProjectionAttempts,
+		models.ProjectionQueued,
+		models.ProjectionRunning, now,
+		models.ProjectionFailed, now,
+	).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// ClaimCollectorRun is ClaimCollector for one iga_scan_run. The coordinator
+// enqueues that run's job and then claims it, so a replica cannot take a
+// different workspace's collector job while it holds this run's outbox.
+func (r *igaProjectionJobRepository) ClaimCollectorRun(
+	owner string, igaRunID uuid.UUID, lease time.Duration, now time.Time,
+) (*models.IGAProjectionJob, error) {
+	if owner == "" {
+		return nil, errors.New("a claim needs an owner")
+	}
+	var out []models.IGAProjectionJob
+	err := r.db.Raw(`
+		UPDATE iga_projection_job SET
+			status           = ?,
+			lease_owner      = ?,
+			lease_expires_at = ?,
+			lease_version    = lease_version + 1,
+			attempts         = attempts + 1
+		WHERE id = (
+			SELECT id FROM iga_projection_job
+			 WHERE iga_scan_run_id = ?
+			   AND attempts < ?
+			   AND (status = ?
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT 1
+		)
+		RETURNING *`,
+		models.ProjectionRunning, owner, now.Add(lease),
+		igaRunID,
 		MaxProjectionAttempts,
 		models.ProjectionQueued,
 		models.ProjectionRunning, now,

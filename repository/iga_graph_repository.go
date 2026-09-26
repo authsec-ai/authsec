@@ -500,9 +500,14 @@ func (r *igaGraphRepository) UpsertAssignment(tx *gorm.DB, a *models.IGAPolicyAs
 	if err := requirePassTime("assignment "+a.SourceKey, a.ValidFrom, a.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
+	if err := rejectBareCollectorRun(a.IntegrationID, a.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
 	q := tx
 	if a.IntegrationID == nil {
 		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
+	} else if a.ConnectorID != nil {
+		return uuid.Nil, fmt.Errorf("assignment names both provenance arms")
 	}
 	err := q.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
@@ -518,9 +523,14 @@ func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, s
 	if err := requirePassTime("grant "+e.SourceKey, e.ValidFrom, e.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
+	if err := rejectBareCollectorRun(e.IntegrationID, e.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
 	q := tx
 	if e.IntegrationID == nil {
 		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
+	} else if e.ConnectorID != nil {
+		return uuid.Nil, fmt.Errorf("grant names both provenance arms")
 	}
 	err := q.Clauses(returningID, onKey("source_key <> '' AND "+liveEdge, []string{
 		"entitlement_id", "assignment_id", "calculation_state", "effective_conclusion",
@@ -538,6 +548,12 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 	if err := requirePassTime("relationship "+rel.SourceKey, rel.ValidFrom, rel.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
+	// The database still allows neither arm, so GitHub rows with a null
+	// connector_id stay valid. A confirming collector run without
+	// integration_id is refused here; the collector writer always sets it.
+	if err := rejectBareCollectorRun(rel.IntegrationID, rel.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
 	q := tx
 	if rel.IntegrationID == nil {
 		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
@@ -549,6 +565,16 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 		"statement_key", "conditions", "mechanism", "updated_at",
 	})).Create(rel).Error
 	return rel.ID, err
+}
+
+// rejectBareCollectorRun is the Go side of the neither-arm grandfather. The
+// database allows a row with no connector_id and no integration_id. A
+// confirming collector run is not that row: it has to name its integration.
+func rejectBareCollectorRun(integration, confirming *uuid.UUID) error {
+	if confirming != nil && integration == nil {
+		return fmt.Errorf("a confirming collector run requires integration_id")
+	}
+	return nil
 }
 
 // UpsertExternalPrincipal writes the node for a principal a trust policy or
@@ -657,11 +683,12 @@ func (r *igaGraphRepository) UpsertProjectionState(tx *gorm.DB, s *models.IGAPro
 			}},
 			DoUpdates: clause.AssignmentColumns([]string{
 				"estate_scope_id", "object_class", "relationship_type", "last_iga_scan_run_id",
-				"last_generation", "coverage_state", "reconciled", "updated_at",
+				"last_generation", "ordering_sequence", "ordering_epoch",
+				"coverage_state", "reconciled", "updated_at",
 			}),
 		}).Create(s).Error
 	}
-	return tx.Omit("IntegrationID", "LastIGAScanRunID").Clauses(clause.OnConflict{
+	return tx.Omit("IntegrationID", "LastIGAScanRunID", "OrderingSequence", "OrderingEpoch").Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "connector_id"}, {Name: "partition_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"estate_scope_id", "object_class", "relationship_type", "last_run_id",

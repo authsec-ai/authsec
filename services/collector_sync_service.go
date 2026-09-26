@@ -248,12 +248,32 @@ func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal
 		}
 	}
 	batchRow := uuid.New()
-	if err := tx.Exec(`INSERT INTO collector_batches
+	hasSnap, snapErr := repositories.HasColumn(tx, "collector_batches", "snapshot_id")
+	if snapErr != nil {
+		s.note(snapErr)
+		return nil, ErrSyncUnavailable
+	}
+	var snapID *uuid.UUID
+	if hasSnap && req.Snapshot != nil {
+		id, err := uuid.Parse(req.Snapshot.SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+		snapID = &id
+	}
+	insertBatch := `INSERT INTO collector_batches
 		(id, workspace_id, collector_id, epoch, sequence, batch_id, payload_hash, receipt_id,
 		 receipt_state, projection_state, iga_scan_run_id, graph_revision, received_at, receipt_body)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb))`,
-		batchRow, p.WorkspaceID, p.CollectorID, epoch, req.Sequence, batchID, hash, receiptID,
-		runID, rev, now, string(respBody)).Error; err != nil {
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb))`
+	args := []any{batchRow, p.WorkspaceID, p.CollectorID, epoch, req.Sequence, batchID, hash, receiptID, runID, rev, now, string(respBody)}
+	if hasSnap {
+		insertBatch = `INSERT INTO collector_batches
+		(id, workspace_id, collector_id, epoch, sequence, batch_id, payload_hash, receipt_id,
+		 receipt_state, projection_state, iga_scan_run_id, graph_revision, received_at, receipt_body, snapshot_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb), ?)`
+		args = append(args, snapID)
+	}
+	if err := tx.Exec(insertBatch, args...).Error; err != nil {
 		s.note(err)
 		return nil, classifyPersist(err)
 	}
@@ -707,14 +727,16 @@ func (s *CollectorSyncService) RunWorkerOnce(owner string) error {
 			state = 'leased', lease_owner = ?, leased_until = ?, attempt_count = attempt_count + 1, updated_at = ?
 			WHERE id = (
 				SELECT id FROM collector_outbox
-				WHERE (state = 'ready' AND available_at <= ?)
-				   OR (state = 'leased' AND leased_until IS NOT NULL AND leased_until < ?)
-				ORDER BY available_at
-				FOR UPDATE SKIP LOCKED
-				LIMIT 1
-			)
-			RETURNING id::text, batch_row_id::text`,
-			owner, now.Add(time.Minute), now, now, now).Row().Scan(&jobText, &batchText)
+			WHERE job_kind <> 'candidate_eval'
+			  AND NOT (job_kind = 'collector_project' AND ?::bool)
+			  AND ((state = 'ready' AND available_at <= ?)
+			    OR (state = 'leased' AND leased_until IS NOT NULL AND leased_until < ?))
+			ORDER BY available_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id::text, batch_row_id::text`,
+			owner, now.Add(time.Minute), now, V2ProjectionEnabled(), now, now).Row().Scan(&jobText, &batchText)
 		if err != nil {
 			return err
 		}
