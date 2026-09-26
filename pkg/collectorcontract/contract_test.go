@@ -136,8 +136,54 @@ func TestPrivilegedKindForbidden(t *testing.T) {
 			t.Fatalf("%s: %+v", kind, cerr)
 		}
 	}
-	if IsPrivilegedKind("linux.systemd_workload") || !KnownObjectKind("k8s.pod") || !KnownObservationKind("runtime.dns") {
+	if IsPrivilegedKind("linux.systemd_workload") || !KnownObjectKind("k8s.pod") || !KnownObservationKind("runtime.dns") || !KnownObservationKind("admission.actor") {
 		t.Fatal("kind registry mismatch")
+	}
+	if IsPrivilegedKind("admission.actor") {
+		t.Fatal("admission.actor is telemetry, not a privileged kind")
+	}
+}
+
+func TestAdmissionPreviewAndHealthCounters(t *testing.T) {
+	reqSchema := compileSchema(t, "schema/agent_sync_request.schema.json")
+	raw := readFixture(t, "testdata/sync_request_admission.json")
+	mustValidate(t, reqSchema, raw)
+	parsed, cerr := Validate(raw)
+	if cerr != nil {
+		t.Fatalf("validate admission fixture: %+v", cerr)
+	}
+	if parsed.Observations[0].Kind != "admission.actor" || !parsed.Observations[0].Preview {
+		t.Fatalf("observation = %+v", parsed.Observations[0])
+	}
+	h := parsed.Health
+	if h.PartitionsPartial != 1 || h.PartitionsForbidden != 0 || h.PoisonIsolated != 2 || h.IdempotencyConflicts != 3 {
+		t.Fatalf("health = %+v", h)
+	}
+	for _, kind := range []string{"k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node"} {
+		if !ClusterScopedKind(kind) || !OpenClusterKind(kind) {
+			t.Fatalf("%s should be open cluster inventory", kind)
+		}
+	}
+	if !ClusterScopedKind("k8s.pv") || OpenClusterKind("k8s.pv") {
+		t.Fatal("persistent volume still requires a star allowlist")
+	}
+
+	negative := []byte(`{
+		"schema_version":"2.0",
+		"batch_id":"10000000-0000-4000-8000-000000000352",
+		"collector_epoch":"20000000-0000-4000-8000-000000000001",
+		"sequence":1,
+		"sent_at":"2026-09-25T08:00:00Z",
+		"objects":[],
+		"observations":[],
+		"applied":[],
+		"health":{"events_lost":0,"queue_depth":0,"partitions_partial":-1}
+	}`)
+	if err := validateSchema(reqSchema, negative); err == nil {
+		t.Fatal("schema accepted a negative health counter")
+	}
+	if _, cerr := Validate(negative); cerr == nil || cerr.Kind != "invalid" || !hasMessage(cerr, "must be >= 0") {
+		t.Fatalf("negative health = %+v", cerr)
 	}
 }
 

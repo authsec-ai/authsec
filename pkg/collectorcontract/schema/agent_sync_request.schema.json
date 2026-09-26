@@ -59,7 +59,8 @@
         "runtime": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } },
         "observed_at": { "type": "string", "format": "date-time" },
         "outcome": { "enum": ["attempted", "success", "denied", "unknown"] },
-        "attribution": { "type": "string" }
+        "attribution": { "type": "string" },
+        "preview": { "type": "boolean" }
       }
     },
     "notSecret": {
@@ -75,7 +76,11 @@
         "events_lost": { "type": "integer", "minimum": 0 },
         "queue_depth": { "type": "integer", "minimum": 0 },
         "watch_gaps": { "type": "integer", "minimum": 0 },
-        "source_failures": { "type": "integer", "minimum": 0 }
+        "source_failures": { "type": "integer", "minimum": 0 },
+        "partitions_partial": { "type": "integer", "minimum": 0 },
+        "partitions_forbidden": { "type": "integer", "minimum": 0 },
+        "poison_isolated": { "type": "integer", "minimum": 0 },
+        "idempotency_conflicts": { "type": "integer", "minimum": 0 }
       }
     }
   }

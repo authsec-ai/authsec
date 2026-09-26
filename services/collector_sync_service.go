@@ -374,6 +374,9 @@ func (s *CollectorSyncService) storeObservations(tx *gorm.DB, p *models.Collecto
 				return err
 			}
 		}
+		// The payload is the observation itself, including preview=true
+		// telemetry. Preview is not an existence fact: a dry-run admission
+		// does not become a canonical graph node. This path never writes one.
 		body, err := json.Marshal(ob)
 		if err != nil {
 			return err
@@ -568,7 +571,7 @@ func (s *CollectorSyncService) enforceScope(p *models.CollectorPrincipal, req *c
 					return ErrSyncForbidden
 				}
 			}
-			if collectorcontract.ClusterScopedKind(obj.Kind) && !allow["*"] {
+			if collectorcontract.ClusterScopedKind(obj.Kind) && !allow["*"] && !collectorcontract.OpenClusterKind(obj.Kind) {
 				return ErrSyncForbidden
 			}
 		}

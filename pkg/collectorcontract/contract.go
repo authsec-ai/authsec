@@ -72,6 +72,12 @@ type Observation struct {
 	ObservedAt  string         `json:"observed_at"`
 	Outcome     string         `json:"outcome"`
 	Attribution string         `json:"attribution,omitempty"`
+	// Preview marks explicitly enabled preview telemetry (§6.2). An admission
+	// request with dryRun=true produces no durable existence fact. When preview
+	// is true this observation is telemetry only: it is stored, and it is not
+	// a configuration existence claim. Ingest does not write a canonical graph
+	// node for it.
+	Preview bool `json:"preview,omitempty"`
 }
 
 // AppliedReceipt is the §22.3 control receipt carried in applied[].
@@ -93,11 +99,18 @@ type ControlReceipt struct {
 }
 
 // Health is collector liveness. It is not authorization.
+// The four partition and poison counters are optional (§11.2 / §11.5).
+// Zero is omitted so a body that only sends events_lost and queue_depth
+// still round-trips.
 type Health struct {
-	EventsLost     int64 `json:"events_lost"`
-	QueueDepth     int64 `json:"queue_depth"`
-	WatchGaps      int64 `json:"watch_gaps,omitempty"`
-	SourceFailures int64 `json:"source_failures,omitempty"`
+	EventsLost           int64 `json:"events_lost"`
+	QueueDepth           int64 `json:"queue_depth"`
+	WatchGaps            int64 `json:"watch_gaps,omitempty"`
+	SourceFailures       int64 `json:"source_failures,omitempty"`
+	PartitionsPartial    int64 `json:"partitions_partial,omitempty"`
+	PartitionsForbidden  int64 `json:"partitions_forbidden,omitempty"`
+	PoisonIsolated       int64 `json:"poison_isolated,omitempty"`
+	IdempotencyConflicts int64 `json:"idempotency_conflicts,omitempty"`
 }
 
 // SyncResponse is the durable receipt (§11.4). desired is null until policy
@@ -129,7 +142,14 @@ type Mapping struct {
 	CanonicalID string `json:"canonical_id"`
 }
 
-// FieldError is one bounded 422 entry.
+// FieldError is one entry of an invalid agent-sync response.
+// HTTP 422 Unprocessable Entity has this body and no other fields:
+//
+//	{"error":"invalid","fields":[{"path":"<json path>","message":"<reason>"}]}
+//
+// path is a location such as "objects[0].kind" or "snapshot.digest".
+// message describes the problem. Field values are never echoed.
+// At most 20 entries are returned.
 type FieldError struct {
 	Path    string `json:"path"`
 	Message string `json:"message"`

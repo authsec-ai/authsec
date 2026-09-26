@@ -41,6 +41,10 @@ func ObservationKinds() []string {
 		"runtime.privilege_change",
 		"runtime.credential_reference",
 		"collector.health",
+		// admission.actor is the API-server-authenticated actor (§6.2).
+		// A node sensor may not submit it; only runtime.* and collector.health
+		// are in that collector's observation scope.
+		"admission.actor",
 	}
 }
 
@@ -75,11 +79,23 @@ func NamespacedKind(kind string) bool {
 	}
 }
 
-// ClusterScopedKind is a Kubernetes kind allowed only when the namespace
-// allowlist contains "*".
+// ClusterScopedKind is a Kubernetes object that is not namespaced.
 func ClusterScopedKind(kind string) bool {
 	switch kind {
 	case "k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node", "k8s.pv":
+		return true
+	default:
+		return false
+	}
+}
+
+// OpenClusterKind is cluster inventory a k8s collector may report without a
+// "*" namespace allowlist: read-only cluster RBAC (ClusterRole and
+// ClusterRoleBinding) plus Namespace and Node. PersistentVolume stays
+// cluster-scoped and still requires "*".
+func OpenClusterKind(kind string) bool {
+	switch kind {
+	case "k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node":
 		return true
 	default:
 		return false

@@ -92,6 +92,23 @@ func Validate(raw []byte) (*SyncRequest, *ContractError) {
 	if out.CapabilityDigest != "" && !hexDigest.MatchString(out.CapabilityDigest) {
 		fields = append(fields, FieldError{Path: "capability_digest", Message: "must be 64 lowercase hex characters"})
 	}
+	for _, counter := range []struct {
+		path string
+		n    int64
+	}{
+		{"health.events_lost", out.Health.EventsLost},
+		{"health.queue_depth", out.Health.QueueDepth},
+		{"health.watch_gaps", out.Health.WatchGaps},
+		{"health.source_failures", out.Health.SourceFailures},
+		{"health.partitions_partial", out.Health.PartitionsPartial},
+		{"health.partitions_forbidden", out.Health.PartitionsForbidden},
+		{"health.poison_isolated", out.Health.PoisonIsolated},
+		{"health.idempotency_conflicts", out.Health.IdempotencyConflicts},
+	} {
+		if counter.n < 0 {
+			fields = append(fields, FieldError{Path: counter.path, Message: "must be >= 0"})
+		}
+	}
 	seenRef := map[string]bool{}
 	if out.Objects == nil {
 		fields = append(fields, FieldError{Path: "objects", Message: "required"})

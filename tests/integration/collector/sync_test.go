@@ -455,14 +455,37 @@ func TestSync_ScopeEnforcement(t *testing.T) {
 	if got.code != http.StatusForbidden {
 		t.Fatalf("namespace: %d %s", got.code, got.body)
 	}
-	cluster := syncBody(t, 3, epoch, uuid.NewString(), []collectorcontract.Object{{
-		Ref: "o_cr", Kind: "k8s.cluster_role", Native: map[string]any{"name": "admin"},
-	}}, nil, nil, nil, nil)
-	got = postSync(k8s.Credential, cluster, nil)
-	if got.code != http.StatusForbidden {
-		t.Fatalf("cluster scope: %d %s", got.code, got.body)
+	cluster := syncBody(t, 3, epoch, uuid.NewString(), []collectorcontract.Object{
+		{Ref: "o_cr", Kind: "k8s.cluster_role", Native: map[string]any{"name": "view"}},
+		{Ref: "o_crb", Kind: "k8s.cluster_role_binding", Native: map[string]any{"name": "view-bind"}},
+		{Ref: "o_ns", Kind: "k8s.namespace", Native: map[string]any{"name": "payments"}},
+		{Ref: "o_node", Kind: "k8s.node", Native: map[string]any{"name": "node-a"}},
+	}, []collectorcontract.Observation{{
+		EventID: "e-admit", Kind: "admission.actor", SubjectRef: "o_ns",
+		ObservedAt: "2026-09-25T08:00:00Z", Outcome: "success", Preview: true,
+	}}, nil, nil, map[string]any{
+		"health": map[string]any{
+			"events_lost": 0, "queue_depth": 1,
+			"partitions_partial": 1, "partitions_forbidden": 2,
+			"poison_isolated": 3, "idempotency_conflicts": 4,
+		},
+	})
+	mustSyncOK(t, postSync(k8s.Credential, cluster, nil))
+	var payload string
+	if err := db.Raw(`SELECT fact_payload::text FROM iga_observations WHERE workspace_id = ? AND evidence_ref = 'e-admit'`, ws).Scan(&payload).Error; err != nil {
+		t.Fatal(err)
 	}
-	linuxObj := syncBody(t, 4, epoch, uuid.NewString(), []collectorcontract.Object{{
+	if !strings.Contains(payload, "admission.actor") || !strings.Contains(payload, `"preview": true`) {
+		t.Fatalf("admission preview was not stored as telemetry: %s", payload)
+	}
+	pv := syncBody(t, 4, epoch, uuid.NewString(), []collectorcontract.Object{{
+		Ref: "o_pv", Kind: "k8s.pv", Native: map[string]any{"name": "data"},
+	}}, nil, nil, nil, nil)
+	got = postSync(k8s.Credential, pv, nil)
+	if got.code != http.StatusForbidden {
+		t.Fatalf("pv without star: %d %s", got.code, got.body)
+	}
+	linuxObj := syncBody(t, 5, epoch, uuid.NewString(), []collectorcontract.Object{{
 		Ref: "o_unit", Kind: "linux.systemd_workload", Native: map[string]any{"unit": "x.service"},
 	}}, nil, nil, nil, nil)
 	got = postSync(k8s.Credential, linuxObj, nil)
@@ -474,6 +497,9 @@ func TestSync_ScopeEnforcement(t *testing.T) {
 	starEpoch := uuid.NewString()
 	mustSyncOK(t, postSync(star.Credential, syncBody(t, 1, starEpoch, uuid.NewString(), []collectorcontract.Object{{
 		Ref: "o_cr", Kind: "k8s.cluster_role", Native: map[string]any{"name": "view"},
+	}}, nil, nil, nil, nil), nil))
+	mustSyncOK(t, postSync(star.Credential, syncBody(t, 2, starEpoch, uuid.NewString(), []collectorcontract.Object{{
+		Ref: "o_pv", Kind: "k8s.pv", Native: map[string]any{"name": "data"},
 	}}, nil, nil, nil, nil), nil))
 
 	linux := enrollCollector(t, ws, "linux_collector", "", nil)
@@ -510,6 +536,12 @@ func TestSync_ScopeEnforcement(t *testing.T) {
 	got = postSync(node.Credential, priv, nil)
 	if got.code != http.StatusForbidden {
 		t.Fatalf("privileged kind: %d %s", got.code, got.body)
+	}
+	got = postSync(node.Credential, syncBody(t, 5, nodeEpoch, uuid.NewString(), nil, []collectorcontract.Observation{{
+		EventID: "e-admit-node", Kind: "admission.actor", ObservedAt: "2026-09-25T08:00:00Z", Outcome: "success", Preview: true,
+	}}, nil, nil, nil), nil)
+	if got.code != http.StatusForbidden {
+		t.Fatalf("node sensor admission: %d %s", got.code, got.body)
 	}
 }
 

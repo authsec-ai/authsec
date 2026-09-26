@@ -182,6 +182,8 @@ func writeSyncErr(c *gin.Context, err error) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 			return
 		}
+		// 422 shape is {"error":"invalid","fields":[{"path":"...","message":"..."}]}.
+		// See collectorcontract.FieldError. Field values are not echoed.
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid", "fields": contract.Fields})
 		return
 	}
