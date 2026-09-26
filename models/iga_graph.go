@@ -69,8 +69,8 @@ const (
 	// never that assumption succeeds.
 	RelTypeCanAssume = "can_assume"
 	// RelTypeBackedByDirectory is a local identity backed by a directory
-	// object. Derivation is a later package. The basis is derived or asserted,
-	// never observed and never declared.
+	// object. The NSS resolver writes it with basis derived. Asserted remains
+	// legal. Observed and declared are not.
 	RelTypeBackedByDirectory = "backed_by_directory"
 )
 
