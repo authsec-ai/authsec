@@ -311,6 +311,17 @@ func openInventoryDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE ad_directory_instances (
 			id text primary key, workspace_id text, sync_config_id text, forest_id text, domain_sid text,
 			domain_dn text, dns_host_name text, invocation_id text, updated_at datetime)`,
+		`CREATE TABLE ad_directory_posture (
+			id text primary key, workspace_id text not null, run_id text not null, object_guid text not null,
+			object_sid text not null default '', account_kind text not null, distinguished_name text not null default '',
+			sam_account_name text not null default '', coverage text not null, partial_reasons text not null default '[]',
+			unconstrained_delegation numeric not null default 0, constrained_delegation numeric not null default 0,
+			protocol_transition numeric not null default 0, delegation_targets text not null default '[]',
+			rbcd_principals text not null default '[]', rbcd_asserted numeric not null default 0,
+			privileged numeric, privileged_direct numeric not null default 0, privileged_nested numeric not null default 0,
+			privileged_path text not null default '[]', admin_count numeric not null default 0, admin_count_orphan numeric,
+			sensitive_not_delegated numeric not null default 0, gmsa numeric not null default 0, smsa numeric not null default 0,
+			depth_exceeded numeric not null default 0, account_disabled numeric not null default 0, created_at datetime)`,
 		`CREATE TABLE iga_integrations (
 			id text primary key, workspace_id text, provider text, provider_host text, app_registration_id text,
 			installation_id text, account_native_id text, capability_profile text, requested_permissions text,

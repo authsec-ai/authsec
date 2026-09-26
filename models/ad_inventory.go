@@ -73,3 +73,39 @@ type ADDirectoryInstance struct {
 }
 
 func (ADDirectoryInstance) TableName() string { return "ad_directory_instances" }
+
+// ADDirectoryPosture is D03 evidence for one account in one inventory run.
+// Privileged and AdminCountOrphan are nil when the read cannot support a
+// negative. Nothing in this row is a secret.
+type ADDirectoryPosture struct {
+	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey"`
+	WorkspaceID             uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	RunID                   uuid.UUID      `json:"run_id" gorm:"type:uuid;not null;index"`
+	ObjectGUID              string         `json:"object_guid" gorm:"not null"`
+	ObjectSID               string         `json:"object_sid" gorm:"column:object_sid;not null;default:''"`
+	AccountKind             string         `json:"account_kind" gorm:"not null"`
+	DistinguishedName       string         `json:"distinguished_name" gorm:"not null;default:''"`
+	SAMAccountName          string         `json:"sam_account_name" gorm:"not null;default:''"`
+	Coverage                string         `json:"coverage" gorm:"not null"`
+	PartialReasons          datatypes.JSON `json:"partial_reasons" gorm:"type:jsonb;not null"`
+	UnconstrainedDelegation bool           `json:"unconstrained_delegation" gorm:"not null;default:false"`
+	ConstrainedDelegation   bool           `json:"constrained_delegation" gorm:"not null;default:false"`
+	ProtocolTransition      bool           `json:"protocol_transition" gorm:"not null;default:false"`
+	DelegationTargets       datatypes.JSON `json:"delegation_targets" gorm:"type:jsonb;not null"`
+	RBCDPrincipals          datatypes.JSON `json:"rbcd_principals" gorm:"type:jsonb;not null"`
+	RBCDAsserted            bool           `json:"rbcd_asserted" gorm:"not null;default:false"`
+	Privileged              *bool          `json:"privileged"`
+	PrivilegedDirect        bool           `json:"privileged_direct" gorm:"not null;default:false"`
+	PrivilegedNested        bool           `json:"privileged_nested" gorm:"not null;default:false"`
+	PrivilegedPath          datatypes.JSON `json:"privileged_path" gorm:"type:jsonb;not null"`
+	AdminCount              bool           `json:"admin_count" gorm:"not null;default:false"`
+	AdminCountOrphan        *bool          `json:"admin_count_orphan"`
+	SensitiveNotDelegated   bool           `json:"sensitive_not_delegated" gorm:"not null;default:false"`
+	GMSA                    bool           `json:"gmsa" gorm:"not null;default:false"`
+	SMSA                    bool           `json:"smsa" gorm:"not null;default:false"`
+	DepthExceeded           bool           `json:"depth_exceeded" gorm:"not null;default:false"`
+	AccountDisabled         bool           `json:"account_disabled" gorm:"not null;default:false"`
+	CreatedAt               time.Time      `json:"created_at"`
+}
+
+func (ADDirectoryPosture) TableName() string { return "ad_directory_posture" }

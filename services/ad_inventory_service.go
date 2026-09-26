@@ -323,6 +323,7 @@ func (s *ADInventoryService) execute(ctx context.Context, workspaceID uuid.UUID,
 		}).Error
 
 	var coverage []directory.ScopeCoverage
+	var readObjects []adldap.Object
 	var snapshot directory.ADInventorySnapshot
 	snapshot.WorkspaceID = workspaceID
 	snapshot.ForestID = ident.ForestID
@@ -368,6 +369,7 @@ func (s *ADInventoryService) execute(ctx context.Context, workspaceID uuid.UUID,
 			st.completed[p.class] = []string{}
 		}
 		for _, obj := range read.Objects {
+			readObjects = append(readObjects, obj)
 			key, err := igagraph.ADIdentityKey(ident.ForestID, obj.ObjectGUID)
 			if err != nil {
 				continue
@@ -422,6 +424,9 @@ func (s *ADInventoryService) execute(ctx context.Context, workspaceID uuid.UUID,
 	if len(coverage) == 0 {
 		status = "failed"
 		authoritative = false
+	}
+	if err := s.savePosture(db, workspaceID, runID, ident.DomainSID, readObjects, status == "succeeded", now); err != nil {
+		return fail(err.Error())
 	}
 	done := s.now()
 	covJSON, _ := json.Marshal(coverage)

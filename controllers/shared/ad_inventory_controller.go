@@ -197,6 +197,29 @@ func (h *ADInventoryController) ListObjects(c *gin.Context) {
 	c.JSON(http.StatusOK, page)
 }
 
+// ListPosture returns a page of directory-posture evidence for one run.
+// The response is the allowlisted view: privileged is null when the read
+// cannot support a negative, and no secret attribute is present.
+func (h *ADInventoryController) ListPosture(c *gin.Context) {
+	ws, ok := workspaceFromToken(c)
+	if !ok {
+		return
+	}
+	runID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "run id is required"})
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	page, err := h.Svc.ListPosture(c.Request.Context(), ws, runID, strings.TrimSpace(c.Query("object_guid")), limit, offset)
+	if err != nil {
+		writeInventoryErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, page)
+}
+
 func workspaceFromToken(c *gin.Context) (uuid.UUID, bool) {
 	raw := strings.TrimSpace(c.GetString("workspace_id"))
 	id, err := uuid.Parse(raw)
