@@ -22,12 +22,20 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 		t.Skip("IGA_TEST_DSN not set")
 	}
 
-	t.Run("fresh_without_041_042", func(t *testing.T) {
+	// These subtests apply migration files themselves. They do not call
+	// applyMaster, which stops at 040 and never applies 042 or 045.
+	t.Run("fresh_without_041", func(t *testing.T) {
 		db := openFreshDB(t, dsn, "a9_fresh_045")
 		applyMasterWhere(t, db, func(base string) bool { return true })
 		applyFile(t, db, masterPath(t, "045_ad_hardening_posture.sql"))
+		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'discovered_agent_workloads'`); n != 1 {
+			t.Fatal("real 042 did not apply")
+		}
 		if n := scalarDB(t, db, `SELECT count(*) FROM pg_constraint WHERE conname = 'ad_directory_posture_run_fkey'`); n != 1 {
 			t.Fatalf("posture fk count = %d", n)
+		}
+		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'ad_directory_posture' AND column_name = 'protected_users'`); n != 1 {
+			t.Fatal("protected_users column missing")
 		}
 		if n := scalarDB(t, db, `SELECT count(*) FROM pg_constraint WHERE conname = 'ad_inventory_scopes_config_fkey'`); n != 1 {
 			t.Fatalf("039 scope fk should still exist before the validate script, count = %d", n)
@@ -37,27 +45,26 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("with_placeholder_041_042", func(t *testing.T) {
+	t.Run("with_placeholder_041", func(t *testing.T) {
 		dir := t.TempDir()
 		p041 := filepath.Join(dir, "041_placeholder.sql")
-		p042 := filepath.Join(dir, "042_placeholder.sql")
 		if err := os.WriteFile(p041, []byte("SELECT 1;\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p042, []byte("CREATE TABLE IF NOT EXISTS public.a9_placeholder_042 (id int);\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		// 041 and 042 sit between 040 and 045. They are temp files, never committed.
+		// 041 is still absent from master. 042 is the real A5 migration.
+		// The placeholder is a temp file, never committed.
 		db := openFreshDB(t, dsn, "a9_mid_041")
 		applyMasterWhere(t, db, func(base string) bool { return base < "041" })
 		applyFile(t, db, p041)
-		applyFile(t, db, p042)
-		applyFile(t, db, masterPath(t, "045_ad_hardening_posture.sql"))
-		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'a9_placeholder_042'`); n != 1 {
-			t.Fatal("placeholder 042 did not apply")
+		applyMasterWhere(t, db, func(base string) bool { return base >= "042" })
+		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'discovered_agent_workloads'`); n != 1 {
+			t.Fatal("real 042 did not apply after placeholder 041")
 		}
 		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'ad_directory_posture'`); n != 1 {
-			t.Fatal("045 did not apply after placeholder 041 and 042")
+			t.Fatal("045 did not apply after placeholder 041 and real 042")
+		}
+		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'ad_directory_posture' AND column_name = 'protected_users'`); n != 1 {
+			t.Fatal("protected_users column missing after 041 then 042 and 045")
 		}
 	})
 

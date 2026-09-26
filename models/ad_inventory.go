@@ -101,6 +101,7 @@ type ADDirectoryPosture struct {
 	AdminCount              bool           `json:"admin_count" gorm:"not null;default:false"`
 	AdminCountOrphan        *bool          `json:"admin_count_orphan"`
 	SensitiveNotDelegated   bool           `json:"sensitive_not_delegated" gorm:"not null;default:false"`
+	ProtectedUsers          bool           `json:"protected_users" gorm:"not null;default:false"`
 	GMSA                    bool           `json:"gmsa" gorm:"not null;default:false"`
 	SMSA                    bool           `json:"smsa" gorm:"not null;default:false"`
 	DepthExceeded           bool           `json:"depth_exceeded" gorm:"not null;default:false"`

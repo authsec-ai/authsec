@@ -13,10 +13,13 @@ func TestPrivilegedSIDIgnoresName(t *testing.T) {
 	if !PrivilegedSID(domain, domain+"-512") {
 		t.Fatal("domain RID 512 is privileged whatever its name is")
 	}
-	for _, rid := range []string{"518", "519", "520", "525"} {
+	for _, rid := range []string{"518", "519", "520"} {
 		if !PrivilegedSID(domain, domain+"-"+rid) {
 			t.Fatalf("RID %s is privileged", rid)
 		}
+	}
+	if PrivilegedSID(domain, domain+"-525") {
+		t.Fatal("Protected Users (RID 525) is a hardening group, not a privilege")
 	}
 	for _, sid := range []string{
 		SIDBuiltinAdministrators, SIDBuiltinAccountOperators, SIDBuiltinServerOperators,
@@ -40,6 +43,47 @@ func TestPrivilegedSIDIgnoresName(t *testing.T) {
 	}
 	if !PrivilegedSID("", SIDBuiltinAdministrators) {
 		t.Fatal("builtin SIDs do not need a domain SID")
+	}
+}
+
+func TestProtectedUsersIsNotPrivileged(t *testing.T) {
+	renamed := group("CN=Restricted Accounts,DC=authsec,DC=test", domain+"-525")
+	look := group("CN=Protected Users,DC=authsec,DC=test", domain+"-1998")
+	member := user("CN=pat,DC=authsec,DC=test", domain+"-1201", "pat")
+	member.MemberOf = []string{renamed.DistinguishedName}
+	decoy := user("CN=decoy,DC=authsec,DC=test", domain+"-1202", "decoy")
+	decoy.MemberOf = []string{look.DistinguishedName}
+	counted := user("CN=counted,DC=authsec,DC=test", domain+"-1203", "counted")
+	counted.MemberOf = []string{renamed.DistinguishedName}
+	counted.AdminCount = true
+	primaryOnly := user("CN=primary,DC=authsec,DC=test", domain+"-1204", "primary")
+	primaryOnly.PrimaryGroupID = 525
+
+	got := index(Evaluate(domain, []adldap.Object{renamed, look, member, decoy, counted}, true))
+	pat := got["pat"]
+	if pat.Privileged == nil || *pat.Privileged || pat.Coverage != "complete" || !pat.ProtectedUsers {
+		t.Fatalf("Protected Users member: %+v", pat)
+	}
+	if len(pat.PrivilegedPath) != 0 || pat.PrivilegedDirect || pat.PrivilegedNested {
+		t.Fatalf("Protected Users must not produce a privileged path: %+v", pat)
+	}
+	if pat.AdminCountOrphan == nil || *pat.AdminCountOrphan {
+		t.Fatalf("member without adminCount is not an orphan: %+v", pat)
+	}
+	if got["decoy"].ProtectedUsers || truth(got["decoy"].Privileged) || got["decoy"].Privileged == nil {
+		t.Fatalf("look-alike Protected Users name: %+v", got["decoy"])
+	}
+	orphan := got["counted"]
+	if orphan.Privileged == nil || *orphan.Privileged || !orphan.ProtectedUsers || !truth(orphan.AdminCountOrphan) {
+		t.Fatalf("adminCount plus Protected Users is an orphan, not a privilege: %+v", orphan)
+	}
+
+	// The primary group is RID 525, and that group object was not read.
+	// Membership is still evidence. The missing object keeps coverage partial,
+	// so privileged stays unset.
+	missing := index(Evaluate(domain, []adldap.Object{primaryOnly}, true))["primary"]
+	if !missing.ProtectedUsers || missing.Coverage != "partial" || missing.Privileged != nil {
+		t.Fatalf("primary Protected Users without the group object: %+v", missing)
 	}
 }
 

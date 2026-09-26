@@ -41,6 +41,7 @@ type PostureView struct {
 	AdminCount              bool      `json:"admin_count"`
 	AdminCountOrphan        *bool     `json:"admin_count_orphan"`
 	SensitiveNotDelegated   bool      `json:"sensitive_not_delegated"`
+	ProtectedUsers          bool      `json:"protected_users"`
 	GMSA                    bool      `json:"gmsa"`
 	SMSA                    bool      `json:"smsa"`
 	DepthExceeded           bool      `json:"depth_exceeded"`
@@ -92,6 +93,7 @@ func (s *ADInventoryService) savePosture(db *gorm.DB, workspaceID, runID uuid.UU
 				AdminCount:              r.AdminCount,
 				AdminCountOrphan:        r.AdminCountOrphan,
 				SensitiveNotDelegated:   r.SensitiveNotDelegated,
+				ProtectedUsers:          r.ProtectedUsers,
 				GMSA:                    r.GMSA,
 				SMSA:                    r.SMSA,
 				DepthExceeded:           r.DepthExceeded,
@@ -173,6 +175,7 @@ func postureView(row models.ADDirectoryPosture) PostureView {
 		AdminCount:              row.AdminCount,
 		AdminCountOrphan:        row.AdminCountOrphan,
 		SensitiveNotDelegated:   row.SensitiveNotDelegated,
+		ProtectedUsers:          row.ProtectedUsers,
 		GMSA:                    row.GMSA,
 		SMSA:                    row.SMSA,
 		DepthExceeded:           row.DepthExceeded,

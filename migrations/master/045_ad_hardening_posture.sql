@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS public.ad_directory_posture (
     admin_count              boolean NOT NULL DEFAULT false,
     admin_count_orphan       boolean,
     sensitive_not_delegated  boolean NOT NULL DEFAULT false,
+    protected_users          boolean NOT NULL DEFAULT false,
     gmsa                     boolean NOT NULL DEFAULT false,
     smsa                     boolean NOT NULL DEFAULT false,
     depth_exceeded           boolean NOT NULL DEFAULT false,
@@ -155,6 +156,11 @@ CREATE TABLE IF NOT EXISTS public.ad_directory_posture (
     CONSTRAINT ad_directory_posture_depth_chk CHECK (
         depth_exceeded = false OR coverage = 'partial')
 );
+
+-- A database that applied an earlier draft of this unshipped file already
+-- has the table. CREATE TABLE IF NOT EXISTS does not add the new column.
+ALTER TABLE public.ad_directory_posture
+    ADD COLUMN IF NOT EXISTS protected_users boolean NOT NULL DEFAULT false;
 
 DO $$
 BEGIN
@@ -178,3 +184,5 @@ COMMENT ON COLUMN public.ad_directory_posture.rbcd_principals IS
     'SIDs parsed from msDS-AllowedToActOnBehalfOfOtherIdentity. The security descriptor itself is not stored.';
 COMMENT ON COLUMN public.ad_directory_posture.account_disabled IS
     'userAccountControl ACCOUNTDISABLE. Recorded as an ITDR input; this table does not raise a finding.';
+COMMENT ON COLUMN public.ad_directory_posture.protected_users IS
+    'TRUE when a Protected Users (domain RID 525) path was observed. Membership restricts NTLM, delegation, and caching; it is not a privilege. FALSE means that path was not observed. A partial read is not proof of absence.';

@@ -11,6 +11,10 @@
 // unparsed delegation descriptor cannot support that assertion. A privileged
 // path that was actually observed is still recorded as privileged=true.
 //
+// Protected Users (domain RID 525) is a hardening group. Membership restricts
+// NTLM, delegation, and caching. It is recorded on ProtectedUsers and is not
+// a privilege, so it never sets Privileged or clears an adminCount orphan.
+//
 // gMSA and sMSA are recorded from object class. msDS-GroupMSAMembership is
 // not read: the posture allowlist does not include that descriptor, and the
 // managed-password attribute is on the secret denylist.
@@ -71,6 +75,7 @@ type Result struct {
 	AdminCount              bool
 	AdminCountOrphan        *bool
 	SensitiveNotDelegated   bool
+	ProtectedUsers          bool
 	GMSA                    bool
 	SMSA                    bool
 	DepthExceeded           bool
@@ -81,6 +86,17 @@ type Result struct {
 // groups. name is ignored: a look-alike CN is not privileged, and a renamed
 // well-known group still is. An empty domain SID disables the domain RIDs
 // and leaves the builtin SIDs in force.
+//
+// Domain RIDs are 512, 518, 519, and 520. Group Policy Creator Owners (520)
+// is included because it can create and own GPOs; it is not an
+// AdminSDHolder-protected group. Protected Users (525) is not privileged.
+// Domain Controllers (516), read-only domain controllers (521), Key Admins
+// (526), Enterprise Key Admins (527), and builtin Replicator (S-1-5-32-552)
+// are not in this set: they identify a DC, a key-credential admin, or a
+// legacy replication principal, not an admin of the domain.
+// Schema Admins (518) and Enterprise Admins (519) match only when domainSID
+// is the forest-root domain. A child-domain inventory does not see those
+// forest-root groups.
 func PrivilegedSID(domainSID, sid string) bool {
 	sid = strings.TrimSpace(sid)
 	if sid == "" {
@@ -94,23 +110,36 @@ func PrivilegedSID(domainSID, sid string) bool {
 			return true
 		}
 	}
-	domainSID = strings.TrimSpace(domainSID)
-	if domainSID == "" || !strings.HasPrefix(strings.ToUpper(sid), strings.ToUpper(domainSID)+"-") {
+	rid, ok := domainRID(domainSID, sid)
+	if !ok {
 		return false
 	}
-	rid := sid[strings.LastIndex(sid, "-")+1:]
 	switch rid {
-	case "512", "518", "519", "520", "525":
-		// The prefix check above uses the full domain SID, so the last
-		// component is the RID only when the remainder is exactly one label.
-		rest := sid[len(domainSID):]
-		if strings.Count(rest, "-") != 1 {
-			return false
-		}
+	case "512", "518", "519", "520":
 		return true
 	default:
 		return false
 	}
+}
+
+// protectedUsersSID reports domain RID 525. The match is the SID, not the CN.
+func protectedUsersSID(domainSID, sid string) bool {
+	rid, ok := domainRID(domainSID, sid)
+	return ok && rid == "525"
+}
+
+// domainRID returns the RID when sid is exactly domainSID plus one label.
+func domainRID(domainSID, sid string) (string, bool) {
+	sid = strings.TrimSpace(sid)
+	domainSID = strings.TrimSpace(domainSID)
+	if sid == "" || domainSID == "" || !strings.HasPrefix(strings.ToUpper(sid), strings.ToUpper(domainSID)+"-") {
+		return "", false
+	}
+	rest := sid[len(domainSID):]
+	if strings.Count(rest, "-") != 1 {
+		return "", false
+	}
+	return sid[strings.LastIndex(sid, "-")+1:], true
 }
 
 // Evaluate walks every account in objects. scopeComplete is false when any
@@ -164,11 +193,12 @@ func one(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, byS
 		r.RBCDPrincipals = append([]string(nil), obj.RBCDPrincipals...)
 	}
 
-	found, direct, nested, path, unresolved, depthExceeded := walk(domainSID, obj, byDN, bySID, parents)
+	found, direct, nested, path, unresolved, depthExceeded, protected := walk(domainSID, obj, byDN, bySID, parents)
 	r.PrivilegedDirect = direct
 	r.PrivilegedNested = nested
 	r.PrivilegedPath = path
 	r.DepthExceeded = depthExceeded
+	r.ProtectedUsers = protected
 
 	var reasons []string
 	if !scopeComplete {
@@ -212,7 +242,7 @@ type step struct {
 	path []string
 }
 
-func walk(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, bySID map[string]adldap.Object, parents map[string][]string) (found, direct, nested bool, path []string, unresolved, depthExceeded bool) {
+func walk(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, bySID map[string]adldap.Object, parents map[string][]string) (found, direct, nested bool, path []string, unresolved, depthExceeded, protected bool) {
 	var queue []step
 	seenSeed := map[string]bool{}
 	push := func(dn string) {
@@ -239,6 +269,15 @@ func walk(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, by
 			if g, ok := bySID[strings.ToUpper(sid)]; ok {
 				push(g.DistinguishedName)
 			}
+		case protectedUsersSID(domainSID, sid):
+			// The primary group is Protected Users even when its object was
+			// not read. A missing object still cannot be walked further.
+			protected = true
+			if g, ok := bySID[strings.ToUpper(sid)]; ok {
+				push(g.DistinguishedName)
+			} else {
+				unresolved = true
+			}
 		default:
 			if g, ok := bySID[strings.ToUpper(sid)]; ok {
 				push(g.DistinguishedName)
@@ -262,6 +301,9 @@ func walk(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, by
 			continue
 		}
 		next := append(append([]string{}, cur.path...), strings.TrimSpace(g.ObjectSID))
+		if protectedUsersSID(domainSID, g.ObjectSID) {
+			protected = true
+		}
 		if PrivilegedSID(domainSID, g.ObjectSID) {
 			found = true
 			if len(next) <= 1 {
@@ -286,7 +328,7 @@ func walk(domainSID string, obj adldap.Object, byDN map[string]adldap.Object, by
 			}
 		}
 	}
-	return found, direct, nested, path, unresolved, depthExceeded
+	return found, direct, nested, path, unresolved, depthExceeded, protected
 }
 
 func parentEdges(objects []adldap.Object) map[string][]string {

@@ -320,7 +320,7 @@ func openInventoryDB(t *testing.T) *gorm.DB {
 			rbcd_principals text not null default '[]', rbcd_asserted numeric not null default 0,
 			privileged numeric, privileged_direct numeric not null default 0, privileged_nested numeric not null default 0,
 			privileged_path text not null default '[]', admin_count numeric not null default 0, admin_count_orphan numeric,
-			sensitive_not_delegated numeric not null default 0, gmsa numeric not null default 0, smsa numeric not null default 0,
+			sensitive_not_delegated numeric not null default 0, protected_users numeric not null default 0, gmsa numeric not null default 0, smsa numeric not null default 0,
 			depth_exceeded numeric not null default 0, account_disabled numeric not null default 0, created_at datetime)`,
 		`CREATE TABLE iga_integrations (
 			id text primary key, workspace_id text, provider text, provider_host text, app_registration_id text,
