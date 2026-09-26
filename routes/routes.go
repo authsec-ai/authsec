@@ -1438,7 +1438,13 @@ func SetupRoutes(
 		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
 		//     any caller who knows a workspace_id can add rows to that workspace's
 		//     inventory
-		//   - there is no rate limit, so inventory growth from this path is unbounded
+		//   - the default is the historical ingress: no rate limit, so inventory
+		//     growth from this path is unbounded unless IGA_LEGACY_INGRESS_RATE_PER_MIN
+		//     is a positive integer. That limit is per workspace, not per client IP,
+		//     so a cluster behind one egress address is not one bucket. Bodies are
+		//     capped at 32 MiB (IGA_LEGACY_INGRESS_MAX_BODY). X-Forwarded-For is
+		//     ignored unless IGA_TRUSTED_PROXIES names the proxy. A settings lookup
+		//     error fails open instead of returning 503.
 		//
 		// What keeps the blast radius to noise rather than privilege: a sighting
 		// grants nothing. Rows land `unregistered`, and only an authenticated,
@@ -1449,7 +1455,7 @@ func SetupRoutes(
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
 		discoveryIngress := authsec.Group("/discovery")
-		discoveryIngress.Use(middlewares.LegacyDiscoveryIngressGuard(config.DB, 120, time.Minute, 1<<20))
+		discoveryIngress.Use(middlewares.LegacyDiscoveryIngressGuard(config.DB))
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
 

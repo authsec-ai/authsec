@@ -78,12 +78,15 @@ func TestMain(m *testing.M) {
 
 func newRouter(ctl *platform.CollectorController) *gin.Engine {
 	r := gin.New()
+	if err := middlewares.ApplyTrustedProxies(r); err != nil {
+		panic(err)
+	}
 	r.Use(gin.Recovery())
 	routes.MountCollectorV2(r, db, ctl, humanAuth)
 
 	disc := platform.NewDiscoveryController(db)
 	ingress := r.Group("/authsec/discovery")
-	ingress.Use(middlewares.LegacyDiscoveryIngressGuard(db, 120, time.Minute, 1<<20))
+	ingress.Use(middlewares.LegacyDiscoveryIngressGuard(db))
 	ingress.POST("/sightings", disc.ReportSighting)
 	ingress.POST("/agent-registration", disc.RegisterAgent)
 

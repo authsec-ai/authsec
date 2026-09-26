@@ -101,10 +101,26 @@ func TestLegacyIngress_GlobalFlag(t *testing.T) {
 }
 
 func TestLegacyIngress_BodyCap(t *testing.T) {
+	t.Setenv("IGA_LEGACY_INGRESS_MAX_BODY", "1048576")
 	ws := newWorkspace(t)
 	payload := bytes.Repeat([]byte("a"), (1<<20)+8)
 	got := do(http.MethodPost, "/authsec/discovery/sightings", "", "", ws.String(), payload)
 	if got.code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize legacy body: %d %s", got.code, got.body)
+	}
+}
+
+func TestLegacyIngress_DefaultAllowsBurst(t *testing.T) {
+	t.Setenv("IGA_LEGACY_INGRESS_RATE_PER_MIN", "")
+	ws := newWorkspace(t)
+	for i := 0; i < 500; i++ {
+		body := []byte(`{"workspace_id":"` + ws.String() + `","source":"vm_sensor","fingerprint":"burst-` + uuid.NewString() + `","display_name":"burst"}`)
+		got := do(http.MethodPost, "/authsec/discovery/sightings", "", "", "", body)
+		if got.code == http.StatusTooManyRequests {
+			t.Fatalf("request %d rate limited under default settings: %s", i, got.body)
+		}
+		if got.code != http.StatusCreated && got.code != http.StatusOK {
+			t.Fatalf("request %d: %d %s", i, got.code, got.body)
+		}
 	}
 }
