@@ -153,6 +153,24 @@ func TestMigration_AppliesOnDatabaseAt036WithData(t *testing.T) {
 		ws, objID, runID, "pre-038-obs").Error; err != nil {
 		t.Fatal(err)
 	}
+	// 039 may have already widened the check with 'observed' (and any other
+	// value). 038 has to apply on top of that without dropping those modes
+	// or rejecting the rows.
+	if err := gdb.Exec(`ALTER TABLE public.iga_observations DROP CONSTRAINT iga_observations_mode_chk`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Exec(`ALTER TABLE public.iga_observations ADD CONSTRAINT iga_observations_mode_chk CHECK (mode IN (
+		'platform_declared', 'deployment_declared', 'invocation_declared', 'framework_dependency',
+		'tool_configuration', 'secret_reference', 'identity_grant', 'audit_event',
+		'observed', 'zz_from_039'))`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Exec(`INSERT INTO iga_observations
+		(workspace_id, source_object_id, scan_run_id, mode, fact_payload, observed_at, dedupe_key)
+		VALUES (?, ?, ?, 'observed', '{}', NOW(), 'pre-038-observed')`,
+		ws, objID, runID).Error; err != nil {
+		t.Fatal(err)
+	}
 	var linuxRejected bool
 	if err := gdb.Exec(`INSERT INTO discovery_sources
 		(id, workspace_id, kind, display_name, config, runtime)
@@ -196,5 +214,23 @@ func TestMigration_AppliesOnDatabaseAt036WithData(t *testing.T) {
 		VALUES (?, ?, ?, 'runtime_batch', '{}', NOW(), 'post-038-obs', 'authenticated_collector')`,
 		ws, objID, runID).Error; err != nil {
 		t.Fatalf("runtime_batch observation: %v", err)
+	}
+	if err := gdb.Exec(`INSERT INTO iga_observations
+		(workspace_id, source_object_id, scan_run_id, mode, fact_payload, observed_at, dedupe_key)
+		VALUES (?, ?, ?, 'observed', '{}', NOW(), 'post-038-observed')`,
+		ws, objID, runID).Error; err != nil {
+		t.Fatalf("observed mode was stripped by 038: %v", err)
+	}
+	if err := gdb.Exec(`INSERT INTO iga_observations
+		(workspace_id, source_object_id, scan_run_id, mode, fact_payload, observed_at, dedupe_key)
+		VALUES (?, ?, ?, 'configuration_snapshot', '{}', NOW(), 'post-038-snapshot')`,
+		ws, objID, runID).Error; err != nil {
+		t.Fatalf("configuration_snapshot observation: %v", err)
+	}
+	if err := gdb.Exec(`INSERT INTO iga_observations
+		(workspace_id, source_object_id, scan_run_id, mode, fact_payload, observed_at, dedupe_key)
+		VALUES (?, ?, ?, 'zz_from_039', '{}', NOW(), 'post-038-kept')`,
+		ws, objID, runID).Error; err != nil {
+		t.Fatalf("038 dropped a mode 039 had already allowed: %v", err)
 	}
 }
