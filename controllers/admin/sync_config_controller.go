@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -71,7 +72,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	// Create sync configuration
 	syncConfig := models.SyncConfiguration{
 		ID:          uuid.New(),
-		WorkspaceID:    workspaceID,
+		WorkspaceID: workspaceID,
 		ClientID:    clientID,
 		ProjectID:   projectID,
 		SyncType:    req.SyncType,
@@ -89,7 +90,23 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 		syncConfig.ADBaseDN = req.ADConfig.BaseDN
 		syncConfig.ADFilter = req.ADConfig.Filter
 		syncConfig.ADUseSSL = req.ADConfig.UseSSL
-		syncConfig.ADSkipVerify = req.ADConfig.SkipVerify
+		if refuseADSkipVerify(req.ADConfig.SkipTLSVerify()) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "insecure_skip_verify is refused when ENVIRONMENT is production"})
+			return
+		}
+		syncConfig.ADSkipVerify = req.ADConfig.SkipTLSVerify()
+		syncConfig.ADStartTLS = req.ADConfig.StartTLS
+		syncConfig.ADChangeTracking = req.ADConfig.ChangeTracking
+		syncConfig.ADCABundle = req.ADConfig.CABundle
+		syncConfig.ADPageSize = req.ADConfig.PageSize
+		if syncConfig.ADPageSize == 0 {
+			syncConfig.ADPageSize = 500
+		}
+		if req.ADConfig.TrackingMode != "" {
+			syncConfig.ADTrackingMode = req.ADConfig.TrackingMode
+		} else {
+			syncConfig.ADTrackingMode = "usn"
+		}
 
 		// Encrypt password
 		encryptedPassword, err := utils.Encrypt(req.ADConfig.Password)
@@ -133,11 +150,11 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	// Audit log: Sync configuration created
 	middlewares.Audit(c, "sync_config", syncConfig.ID.String(), "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"config_name": syncConfig.ConfigName,
-			"sync_type":   syncConfig.SyncType,
-			"workspace_id":   syncConfig.WorkspaceID.String(),
-			"client_id":   syncConfig.ClientID.String(),
-			"is_active":   syncConfig.IsActive,
+			"config_name":  syncConfig.ConfigName,
+			"sync_type":    syncConfig.SyncType,
+			"workspace_id": syncConfig.WorkspaceID.String(),
+			"client_id":    syncConfig.ClientID.String(),
+			"is_active":    syncConfig.IsActive,
 		},
 	})
 
@@ -287,7 +304,22 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 			syncConfig.ADFilter = req.ADConfig.Filter
 		}
 		syncConfig.ADUseSSL = req.ADConfig.UseSSL
-		syncConfig.ADSkipVerify = req.ADConfig.SkipVerify
+		if refuseADSkipVerify(req.ADConfig.SkipTLSVerify()) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "insecure_skip_verify is refused when ENVIRONMENT is production"})
+			return
+		}
+		syncConfig.ADSkipVerify = req.ADConfig.SkipTLSVerify()
+		syncConfig.ADStartTLS = req.ADConfig.StartTLS
+		syncConfig.ADChangeTracking = req.ADConfig.ChangeTracking
+		if req.ADConfig.PageSize > 0 {
+			syncConfig.ADPageSize = req.ADConfig.PageSize
+		}
+		if req.ADConfig.TrackingMode != "" {
+			syncConfig.ADTrackingMode = req.ADConfig.TrackingMode
+		}
+		if req.ADConfig.CABundle != "" {
+			syncConfig.ADCABundle = req.ADConfig.CABundle
+		}
 	}
 
 	// Update Entra ID config if provided
@@ -326,11 +358,11 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	// Audit log: Sync configuration updated
 	middlewares.Audit(c, "sync_config", syncConfig.ID.String(), "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"config_name": syncConfig.ConfigName,
-			"sync_type":   syncConfig.SyncType,
-			"workspace_id":   syncConfig.WorkspaceID.String(),
-			"client_id":   syncConfig.ClientID.String(),
-			"is_active":   syncConfig.IsActive,
+			"config_name":  syncConfig.ConfigName,
+			"sync_type":    syncConfig.SyncType,
+			"workspace_id": syncConfig.WorkspaceID.String(),
+			"client_id":    syncConfig.ClientID.String(),
+			"is_active":    syncConfig.IsActive,
 		},
 	})
 
@@ -396,9 +428,9 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	// Audit log: Sync configuration deleted
 	middlewares.Audit(c, "sync_config", configID.String(), "delete", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"id":        configID.String(),
+			"id":           configID.String(),
 			"workspace_id": workspaceID.String(),
-			"client_id": clientID.String(),
+			"client_id":    clientID.String(),
 		},
 	})
 
@@ -457,4 +489,8 @@ func (scc *SyncConfigController) maskSensitiveFields(config models.SyncConfigura
 		config.EntraClientSecret = "********"
 	}
 	return config
+}
+
+func refuseADSkipVerify(skip bool) bool {
+	return skip && config.AppConfig != nil && strings.EqualFold(config.AppConfig.Environment, "production")
 }

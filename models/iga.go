@@ -43,6 +43,9 @@ const (
 	EvidenceSecretReference    = "secret_reference"
 	EvidenceIdentityGrant      = "identity_grant"
 	EvidenceAuditEvent         = "audit_event"
+	// Directory reads use models.EvidenceObserved ("observed"), declared with
+	// the discovery evidence kinds. It is not platform_declared, so it cannot
+	// auto-confirm an agent.
 )
 
 // EvidenceRank orders evidence by strength. Only platform_declared may

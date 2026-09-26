@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/directory/adguid"
 	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -21,6 +22,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -618,19 +620,19 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 			if tt.seedExisting {
 				existing := models.ExtendedUser{
 					User: sharedmodels.User{
-						ID:           uuid.New(),
-						ClientID:     clientID,
-						WorkspaceID:  workspaceID,
-						ProjectID:    projectID,
-						Name:         "Existing User",
-						Username:     strPtr(tt.adUser.Username),
-						Email:        tt.adUser.Email,
-						Provider:     "ad_sync",
-						ProviderID:   tt.adUser.UserPrincipalName,
+						ID:              uuid.New(),
+						ClientID:        clientID,
+						WorkspaceID:     workspaceID,
+						ProjectID:       projectID,
+						Name:            "Existing User",
+						Username:        strPtr(tt.adUser.Username),
+						Email:           tt.adUser.Email,
+						Provider:        "ad_sync",
+						ProviderID:      tt.adUser.UserPrincipalName,
 						WorkspaceDomain: "app.authsec.ai",
-						Active:       true,
-						CreatedAt:    time.Now(),
-						UpdatedAt:    time.Now(),
+						Active:          true,
+						CreatedAt:       time.Now(),
+						UpdatedAt:       time.Now(),
 					},
 					ExternalID:   strPtr(tt.adUser.ObjectGUID),
 					SyncSource:   strPtr("active_directory"),
@@ -706,19 +708,19 @@ func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
 			if tt.seedExisting {
 				existing := models.ExtendedUser{
 					User: sharedmodels.User{
-						ID:           uuid.New(),
-						ClientID:     clientID,
-						WorkspaceID:  workspaceID,
-						ProjectID:    projectID,
-						Name:         "Existing Agent",
-						Username:     strPtr(tt.agentUser.Username),
-						Email:        tt.agentUser.Email,
-						Provider:     tt.agentUser.Provider,
-						ProviderID:   tt.agentUser.ProviderID,
+						ID:              uuid.New(),
+						ClientID:        clientID,
+						WorkspaceID:     workspaceID,
+						ProjectID:       projectID,
+						Name:            "Existing Agent",
+						Username:        strPtr(tt.agentUser.Username),
+						Email:           tt.agentUser.Email,
+						Provider:        tt.agentUser.Provider,
+						ProviderID:      tt.agentUser.ProviderID,
 						WorkspaceDomain: "app.authsec.ai",
-						Active:       true,
-						CreatedAt:    time.Now(),
-						UpdatedAt:    time.Now(),
+						Active:          true,
+						CreatedAt:       time.Now(),
+						UpdatedAt:       time.Now(),
 					},
 					ExternalID:   strPtr(tt.agentUser.ExternalID),
 					SyncSource:   strPtr(tt.agentUser.SyncSource),
@@ -786,14 +788,113 @@ func TestADSyncController_mapLDAPEntryToUser(t *testing.T) {
 
 	user := controller.mapLDAPEntryToUser(entry)
 
-	assert.NotEmpty(t, user.ObjectGUID)
+	raw := []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
+	wantGUID, err := adguid.Format(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "67452301-ab89-efcd-0123-456789abcdef", wantGUID)
+	assert.Equal(t, wantGUID, user.ObjectGUID)
 	assert.Equal(t, "test@example.com", user.UserPrincipalName)
 	assert.Equal(t, "Test User", user.DisplayName)
 	assert.Equal(t, "test@example.com", user.Email)
 	assert.Equal(t, "testuser", user.Username)
 	assert.Equal(t, "IT", user.Department)
 	assert.Equal(t, "Developer", user.Title)
-	assert.Contains(t, user.Groups, "Developers")
-	assert.Contains(t, user.Groups, "Users")
+	assert.Contains(t, user.Groups, "CN=Developers,OU=Groups,DC=test,DC=com")
+	assert.Contains(t, user.Groups, "CN=Users,OU=Groups,DC=test,DC=com")
+	assert.Contains(t, user.GroupDisplayNames, "Developers")
+	assert.Contains(t, user.GroupDisplayNames, "Users")
 	assert.True(t, user.IsActive)
+}
+
+func TestMapLDAPEntryUACDoesNotUseSubstring(t *testing.T) {
+	controller := &ADSyncController{}
+	raw := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f}
+	cases := []struct {
+		uac    string
+		active bool
+	}{
+		{"512", true},
+		{"514", false},
+		{"66048", true},
+		{"12", true},
+		{"32", true},
+	}
+	for _, tc := range cases {
+		entry := &ldap.Entry{Attributes: []*ldap.EntryAttribute{
+			{Name: "objectGUID", ByteValues: [][]byte{raw}},
+			{Name: "userAccountControl", Values: []string{tc.uac}},
+			{Name: "memberOf", Values: []string{`CN=Doe\, Jane,OU=Groups,DC=test,DC=com`}},
+			{Name: "userPrincipalName", Values: []string{"u@example.com"}},
+		}}
+		user := controller.mapLDAPEntryToUser(entry)
+		assert.Equal(t, tc.active, user.IsActive, "uac %s", tc.uac)
+		assert.Equal(t, "03020100-0504-0706-0809-0a0b0c0d0e0f", user.ObjectGUID)
+		assert.Equal(t, []string{`CN=Doe\, Jane,OU=Groups,DC=test,DC=com`}, user.Groups)
+		assert.Equal(t, []string{"Doe, Jane"}, user.GroupDisplayNames)
+	}
+}
+
+func TestSyncRewritesLegacyGUID(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE users (
+		id text primary key, client_id text, workspace_id text, project_id text,
+		name text, username text, email text, password_hash text, workspace_domain text,
+		provider text, provider_id text, provider_data text, avatar_url text,
+		active numeric, mfa_enabled numeric, mfa_method text, mfa_default_method text,
+		mfa_enrolled_at datetime, mfa_verified numeric, created_at datetime, updated_at datetime,
+		last_login datetime, external_id text, sync_source text, last_sync_at datetime,
+		is_synced_user numeric, failed_login_attempts integer, account_locked_at datetime,
+		password_reset_required numeric
+	)`).Error)
+
+	raw := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f}
+	canonical, err := adguid.Format(raw)
+	require.NoError(t, err)
+	legacy, err := adguid.LegacyString(raw)
+	require.NoError(t, err)
+	require.NotEqual(t, canonical, legacy)
+
+	ws, clientID, projectID := uuid.New(), uuid.New(), uuid.New()
+	existing := models.ExtendedUser{
+		User: sharedmodels.User{
+			ID: uuid.New(), ClientID: clientID, WorkspaceID: ws, ProjectID: projectID,
+			Name: "Legacy", Username: strPtr("legacy"), Email: "legacy@example.com",
+			Provider: "ad_sync", ProviderID: "legacy@example.com", WorkspaceDomain: "app.authsec.ai",
+			Active: true, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+		ExternalID: strPtr(legacy), SyncSource: strPtr("active_directory"), IsSyncedUser: true,
+	}
+	require.NoError(t, db.Create(&existing).Error)
+
+	err = (&ADSyncController{}).syncUserToDatabase(db, models.ADUser{
+		ObjectGUID: canonical, UserPrincipalName: "legacy@example.com", DisplayName: "Canonical",
+		Email: "other@example.com", Username: "legacy", IsActive: true,
+	}, ws.String(), clientID.String(), projectID.String())
+	require.NoError(t, err)
+
+	var rows []models.ExtendedUser
+	require.NoError(t, db.Find(&rows).Error)
+	require.Len(t, rows, 1)
+	require.NotNil(t, rows[0].ExternalID)
+	assert.Equal(t, canonical, *rows[0].ExternalID)
+
+	err = (&ADSyncController{}).syncUserToDatabase(db, models.ADUser{
+		ObjectGUID: canonical, DisplayName: "Again", Email: "other@example.com",
+		Username: "legacy", IsActive: true,
+	}, ws.String(), clientID.String(), projectID.String())
+	require.NoError(t, err)
+	require.NoError(t, db.Find(&rows).Error)
+	require.Len(t, rows, 1)
+}
+
+func TestConnectToADRefusesSkipVerifyInProduction(t *testing.T) {
+	prev := config.AppConfig
+	config.AppConfig = &config.Config{Environment: "production"}
+	t.Cleanup(func() { config.AppConfig = prev })
+	_, err := (&ADSyncController{}).connectToAD(models.ADSyncConfig{
+		Server: "127.0.0.1:1", Username: "u", Password: "p", UseSSL: true, SkipVerify: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "production")
 }

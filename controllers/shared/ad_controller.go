@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/directory/adguid"
+	"github.com/authsec-ai/authsec/internal/directory/adldap"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -148,7 +149,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 	// Audit log: AD sync completed
 	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"workspace_id":     input.WorkspaceID,
+			"workspace_id":  input.WorkspaceID,
 			"client_id":     input.ClientID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
@@ -283,32 +284,19 @@ func (asc *ADSyncController) TestADConnection(c *gin.Context) {
 
 // Private helper methods
 
-func (asc *ADSyncController) connectToAD(config models.ADSyncConfig) (*ldap.Conn, error) {
-	var conn *ldap.Conn
-	var err error
-
-	if config.UseSSL {
-		// Connect with SSL/TLS
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: config.SkipVerify,
-		}
-		conn, err = ldap.DialTLS("tcp", config.Server, tlsConfig)
-	} else {
-		// Connect without SSL (not recommended for production)
-		conn, err = ldap.Dial("tcp", config.Server)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to AD server: %w", err)
-	}
-
-	// Bind with service account
-	if err := conn.Bind(config.Username, config.Password); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to bind to AD: %w", err)
-	}
-
-	return conn, nil
+func (asc *ADSyncController) connectToAD(cfg models.ADSyncConfig) (*ldap.Conn, error) {
+	// TLS is verified by default. skip_verify is logged and refused in production.
+	// A custom CA bundle is trusted when one is stored on the connection.
+	return adldap.Dial(adldap.Conn{
+		Server:     cfg.Server,
+		Username:   cfg.Username,
+		Password:   cfg.Password,
+		UseSSL:     cfg.UseSSL,
+		StartTLS:   cfg.StartTLS,
+		SkipVerify: cfg.SkipTLSVerify(),
+		CABundle:   cfg.CABundle,
+		Production: adProduction(),
+	})
 }
 
 func (asc *ADSyncController) FetchADUsers(config models.ADSyncConfig) ([]models.ADUser, error) {
@@ -396,11 +384,11 @@ func (asc *ADSyncController) mapLDAPEntryToUser(entry *ldap.Entry) models.ADUser
 	var objectGUID string
 	rawGUID := entry.GetRawAttributeValue("objectGUID")
 	if len(rawGUID) == 16 {
-		// Parse the 16-byte slice into a UUID object
-		parsedGUID, err := uuid.FromBytes(rawGUID)
+		// AD objectGUID is mixed-endian. uuid.FromBytes without the swap
+		// stores a different text form than AD itself displays.
+		parsedGUID, err := adguid.Format(rawGUID)
 		if err == nil {
-			// Convert the UUID object to its standard string format
-			objectGUID = parsedGUID.String()
+			objectGUID = parsedGUID
 		}
 	}
 
@@ -410,27 +398,22 @@ func (asc *ADSyncController) mapLDAPEntryToUser(entry *ldap.Entry) models.ADUser
 		email = getAttr("userPrincipalName")
 	}
 
-	// Parse user account control to determine if account is active
+	// ACCOUNTDISABLE is bit 0x2 of the integer. A decimal string that merely
+	// contains the digit 2 (for example "12" or "32") is not a disabled account.
+	// An unparsable value is left active rather than guessed with a substring.
 	uacStr := getAttr("userAccountControl")
 	isActive := true
-	if uacStr != "" {
-		// Bit 2 (0x2) indicates disabled account
-		// This is a simplified check - you might want more robust parsing
-		isActive = !strings.Contains(uacStr, "2")
+	if flags, err := adguid.ParseUAC(uacStr); err == nil {
+		isActive = flags.Active
 	}
 
-	// Get group memberships
+	// Groups keep the full DN. The CN is display-only: two groups can share a
+	// CN, and a comma inside a CN is escaped.
 	groups := entry.GetAttributeValues("memberOf")
-
-	// Clean up group names (extract CN from DN)
-	var cleanGroups []string
+	var displayNames []string
 	for _, group := range groups {
-		if strings.HasPrefix(group, "CN=") {
-			parts := strings.Split(group, ",")
-			if len(parts) > 0 {
-				cn := strings.TrimPrefix(parts[0], "CN=")
-				cleanGroups = append(cleanGroups, cn)
-			}
+		if cn := adguid.CommonName(group); cn != "" {
+			displayNames = append(displayNames, cn)
 		}
 	}
 
@@ -442,7 +425,8 @@ func (asc *ADSyncController) mapLDAPEntryToUser(entry *ldap.Entry) models.ADUser
 		Username:          getAttr("sAMAccountName"),
 		Department:        getAttr("department"),
 		Title:             getAttr("title"),
-		Groups:            cleanGroups,
+		Groups:            groups,
+		GroupDisplayNames: displayNames,
 		IsActive:          isActive,
 		Attributes: map[string]string{
 			"cn":                 getAttr("cn"),
@@ -473,23 +457,24 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", adUser.Email, adUser.ObjectGUID, workspaceUUID).First(&existingUser).Error
+	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR LOWER(external_id) IN ?)",
+		workspaceUUID, adUser.Email, adMatchIDs(adUser.ObjectGUID)).First(&existingUser).Error
 
 	now := time.Now()
 
 	if err == gorm.ErrRecordNotFound {
 		newUser := models.ExtendedUser{
 			User: sharedmodels.User{
-				ID:         uuid.New(),
-				ClientID:   clientUUID,
-				WorkspaceID:   workspaceUUID,
-				ProjectID:  projectUUID,
-				Name:       adUser.DisplayName,
-				Username:   stringPtr(adUser.Username),
-				Email:      adUser.Email,
-				Provider:   "ad_sync",
-				ProviderID: adUser.UserPrincipalName,
-				Active:     adUser.IsActive,
+				ID:          uuid.New(),
+				ClientID:    clientUUID,
+				WorkspaceID: workspaceUUID,
+				ProjectID:   projectUUID,
+				Name:        adUser.DisplayName,
+				Username:    stringPtr(adUser.Username),
+				Email:       adUser.Email,
+				Provider:    "ad_sync",
+				ProviderID:  adUser.UserPrincipalName,
+				Active:      adUser.IsActive,
 				ProviderData: func() datatypes.JSON {
 					data, _ := json.Marshal(map[string]interface{}{
 						"objectGUID":        adUser.ObjectGUID,
@@ -503,9 +488,9 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 					return datatypes.JSON(data)
 				}(),
 				WorkspaceDomain: domainSuffix,
-				MFAEnabled:   false,
-				CreatedAt:    now,
-				UpdatedAt:    now,
+				MFAEnabled:      false,
+				CreatedAt:       now,
+				UpdatedAt:       now,
 			},
 			ExternalID:   stringPtr(adUser.ObjectGUID),
 			SyncSource:   stringPtr("active_directory"),
@@ -523,21 +508,23 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 		return fmt.Errorf("failed to check existing user: %w", err)
 	}
 
+	providerData, _ := json.Marshal(map[string]interface{}{
+		"objectGUID":        adUser.ObjectGUID,
+		"userPrincipalName": adUser.UserPrincipalName,
+		"sAMAccountName":    adUser.Username,
+		"department":        adUser.Department,
+		"title":             adUser.Title,
+		"groups":            adUser.Groups,
+		"attributes":        adUser.Attributes,
+	})
 	updates := map[string]interface{}{
-		"name":         adUser.DisplayName,
-		"username":     adUser.Username,
-		"active":       adUser.IsActive,
-		"last_sync_at": &now,
-		"updated_at":   now,
-		"provider_data": map[string]interface{}{
-			"objectGUID":        adUser.ObjectGUID,
-			"userPrincipalName": adUser.UserPrincipalName,
-			"sAMAccountName":    adUser.Username,
-			"department":        adUser.Department,
-			"title":             adUser.Title,
-			"groups":            adUser.Groups,
-			"attributes":        adUser.Attributes,
-		},
+		"name":          adUser.DisplayName,
+		"username":      adUser.Username,
+		"active":        adUser.IsActive,
+		"external_id":   adUser.ObjectGUID,
+		"last_sync_at":  &now,
+		"updated_at":    now,
+		"provider_data": datatypes.JSON(providerData),
 	}
 
 	if err := tenantDB.Model(&existingUser).Updates(updates).Error; err != nil {
@@ -593,7 +580,7 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 	// Audit log: Agent sync completed
 	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "agent_sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"workspace_id":       input.WorkspaceID,
+			"workspace_id":    input.WorkspaceID,
 			"client_id":       input.ClientID,
 			"users_processed": result.UsersProcessed,
 			"users_created":   result.UsersCreated,
@@ -624,7 +611,11 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", agentUser.Email, agentUser.ExternalID, workspaceUUID).First(&existingUser).Error
+	// Match either GUID spelling so a legacy row is not duplicated. The agent
+	// payload has no raw objectGUID bytes, so this path does not rewrite
+	// external_id — the next LDAP sync is what canonicalises it.
+	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR LOWER(external_id) IN ?)",
+		workspaceUUID, agentUser.Email, adMatchIDs(agentUser.ExternalID)).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -633,21 +624,21 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 
 		newUser := models.ExtendedUser{
 			User: sharedmodels.User{
-				ID:           uuid.New(),
-				ClientID:     clientUUID,
+				ID:              uuid.New(),
+				ClientID:        clientUUID,
 				WorkspaceID:     workspaceUUID,
-				ProjectID:    projectUUID,
-				Name:         agentUser.Name,
-				Username:     stringPtr(agentUser.Username),
-				Email:        agentUser.Email,
-				Provider:     agentUser.Provider,
-				ProviderID:   agentUser.ProviderID,
-				Active:       agentUser.IsActive,
-				ProviderData: datatypes.JSON(providerData),
+				ProjectID:       projectUUID,
+				Name:            agentUser.Name,
+				Username:        stringPtr(agentUser.Username),
+				Email:           agentUser.Email,
+				Provider:        agentUser.Provider,
+				ProviderID:      agentUser.ProviderID,
+				Active:          agentUser.IsActive,
+				ProviderData:    datatypes.JSON(providerData),
 				WorkspaceDomain: domainSuffix,
-				MFAEnabled:   false,
-				CreatedAt:    now,
-				UpdatedAt:    now,
+				MFAEnabled:      false,
+				CreatedAt:       now,
+				UpdatedAt:       now,
 			},
 			ExternalID:   stringPtr(agentUser.ExternalID),
 			SyncSource:   stringPtr(agentUser.SyncSource),
@@ -732,16 +723,18 @@ func (asc *ADSyncController) loadStoredADConfig(configID, workspaceID, clientID 
 		return models.ADSyncConfig{}, fmt.Errorf("failed to decrypt credentials")
 	}
 
-	// Build ADSyncConfig
-	adConfig := models.ADSyncConfig{
-		Server:     syncConfig.ADServer,
-		Username:   syncConfig.ADUsername,
-		Password:   decryptedPassword,
-		BaseDN:     syncConfig.ADBaseDN,
-		Filter:     syncConfig.ADFilter,
-		UseSSL:     syncConfig.ADUseSSL,
-		SkipVerify: syncConfig.ADSkipVerify,
-	}
+	return syncConfig.ADConnection(decryptedPassword), nil
+}
 
-	return adConfig, nil
+// adMatchIDs is the canonical GUID plus the legacy unswapped spelling, when
+// they differ. A non-GUID external id is matched as itself.
+func adMatchIDs(externalID string) []string {
+	ids, err := adguid.LookupIDs(externalID)
+	if err != nil || len(ids) == 0 {
+		if strings.TrimSpace(externalID) == "" {
+			return []string{""}
+		}
+		return []string{externalID}
+	}
+	return ids
 }
