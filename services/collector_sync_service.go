@@ -304,6 +304,11 @@ func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal
 		s.note(err)
 		return nil, ErrSyncUnavailable
 	}
+	report := []byte(req.Capabilities)
+	if err := RecordCollectorCapability(tx, inst.WorkspaceID, inst.ID, digest, report); err != nil {
+		s.note(err)
+		return nil, ErrSyncUnavailable
+	}
 	return respBody, nil
 }
 

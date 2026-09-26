@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://authsec.ai/schema/authsec.controls.v1.json",
+  "title": "AuthSec controls artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "profile", "filesystem", "egress", "exec", "admission", "broker"],
+  "properties": {
+    "schema": {"const": "authsec.controls.v1"},
+    "profile": {"type": "string", "minLength": 1},
+    "filesystem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "paths"],
+      "properties": {
+        "baseline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["loaders", "libraries", "certificates", "readonly_config"],
+          "properties": {
+            "loaders": {"type": "object", "additionalProperties": {"type": "string"}},
+            "libraries": {"type": "array", "items": {"type": "string"}},
+            "certificates": {"type": "array", "items": {"type": "string"}},
+            "readonly_config": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rule_id", "path", "effect"],
+            "properties": {
+              "rule_id": {"type": "string"},
+              "path": {"type": "string"},
+              "effect": {"enum": ["allow", "deny", "require_approval"]}
+            }
+          }
+        }
+      }
+    },
+    "egress": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "resource_id", "address", "port", "protocol", "effect"],
+        "properties": {
+          "rule_id": {"type": "string"},
+          "resource_id": {"type": "string"},
+          "address": {"type": "string"},
+          "port": {"type": "integer"},
+          "protocol": {"type": "string"},
+          "effect": {"enum": ["allow", "deny", "require_approval"]}
+        }
+      }
+    },
+    "exec": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "effect"],
+        "properties": {
+          "rule_id": {"type": "string"},
+          "effect": {"enum": ["allow", "deny", "require_approval"]}
+        }
+      }
+    },
+    "admission": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "effect"],
+        "properties": {
+          "rule_id": {"type": "string"},
+          "effect": {"enum": ["allow", "deny", "require_approval"]}
+        }
+      }
+    },
+    "broker": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "resource_id", "adapter", "effect"],
+        "properties": {
+          "rule_id": {"type": "string"},
+          "resource_id": {"type": "string"},
+          "adapter": {"type": "string"},
+          "effect": {"enum": ["allow", "deny", "require_approval"]}
+        }
+      }
+    }
+  }
+}

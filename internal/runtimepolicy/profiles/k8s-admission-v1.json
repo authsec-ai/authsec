@@ -1,0 +1,12 @@
+{
+  "profile": "k8s-admission-v1",
+  "filesystem_baseline": {
+    "loaders": {},
+    "libraries": [],
+    "certificates": [],
+    "readonly_config": []
+  },
+  "certified_digests": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": ["admission", "egress"]
+  }
+}

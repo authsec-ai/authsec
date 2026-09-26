@@ -11,6 +11,7 @@ import (
 // are off. Only 1, true, on and yes enable a flag.
 const (
 	EnvV2Ingest                = "IGA_V2_INGEST"
+	EnvV2Policy                = "IGA_V2_POLICY"
 	EnvLegacyIngressDisabled   = "IGA_LEGACY_INGRESS_DISABLED"
 	EnvNextSyncSeconds         = "IGA_V2_NEXT_SYNC_SECONDS"
 	EnvCollectorResponseKey    = "IGA_COLLECTOR_RESPONSE_KEY"
@@ -37,6 +38,11 @@ func FlagOn(name string) bool {
 // V2IngestEnabled is the gate in front of /api/iga/v2 collector routes.
 // When it is off those routes respond 404 and write nothing.
 func V2IngestEnabled() bool { return FlagOn(EnvV2Ingest) }
+
+// V2PolicyEnabled is the gate in front of /api/iga/v2/runtime-policies.
+// When it is off those routes are not registered and nothing is evaluated.
+// Existing agent_policies and enforcement_plans behaviour does not change.
+func V2PolicyEnabled() bool { return FlagOn(EnvV2Policy) }
 
 // LegacyIngressGloballyDisabled is the process-wide kill switch. A workspace
 // can also disable its own ingress without this flag.
