@@ -28,6 +28,11 @@ type Object struct {
 	ServicePrincipalName []string     `json:"service_principal_name,omitempty"`
 	UserAccountControl   uint32       `json:"user_account_control"`
 	AccountFlags         adguid.Flags `json:"account_flags"`
+	AdminCount           bool         `json:"admin_count,omitempty"`
+	PrimaryGroupID       uint32       `json:"primary_group_id,omitempty"`
+	AllowedToDelegateTo  []string     `json:"allowed_to_delegate_to,omitempty"`
+	RBCDPrincipals       []string     `json:"rbcd_principals,omitempty"`
+	RBCDUnparsed         bool         `json:"rbcd_unparsed,omitempty"`
 	AccountExpires       string       `json:"account_expires,omitempty"`
 	PwdLastSet           string       `json:"pwd_last_set,omitempty"`
 	WhenChanged          string       `json:"when_changed,omitempty"`
@@ -65,6 +70,7 @@ func ParseEntry(e *ldap.Entry, ldapClass string) (Object, bool) {
 	}
 	uac, computed := e.GetAttributeValue("userAccountControl"), e.GetAttributeValue("msDS-User-Account-Control-Computed")
 	flags, _ := mergeUAC(uac, computed)
+	rbcd, rbcdUnparsed := rbcdSIDs(e.GetRawAttributeValue("msDS-AllowedToActOnBehalfOfOtherIdentity"))
 	memberOf := nonEmpty(e.GetAttributeValues("memberOf"))
 	member := nonEmpty(e.GetAttributeValues("member"))
 	obj := Object{
@@ -84,6 +90,11 @@ func ParseEntry(e *ldap.Entry, ldapClass string) (Object, bool) {
 		ServicePrincipalName: nonEmpty(e.GetAttributeValues("servicePrincipalName")),
 		UserAccountControl:   flags.Raw,
 		AccountFlags:         flags,
+		AdminCount:           adminCountSet(e.GetAttributeValue("adminCount")),
+		PrimaryGroupID:       parseUint32(e.GetAttributeValue("primaryGroupID")),
+		AllowedToDelegateTo:  nonEmpty(e.GetAttributeValues("msDS-AllowedToDelegateTo")),
+		RBCDPrincipals:       rbcd,
+		RBCDUnparsed:         rbcdUnparsed,
 		AccountExpires:       fileTime(e.GetAttributeValue("accountExpires")),
 		PwdLastSet:           fileTime(e.GetAttributeValue("pwdLastSet")),
 		WhenChanged:          e.GetAttributeValue("whenChanged"),
@@ -173,6 +184,32 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func adminCountSet(s string) bool {
+	return strings.TrimSpace(s) == "1"
+}
+
+func parseUint32(s string) uint32 {
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(n)
+}
+
+// rbcdSIDs parses the resource-based constrained delegation descriptor down
+// to trustee SIDs. An empty attribute is "no RBCD", not a parse failure.
+// The raw descriptor is never returned.
+func rbcdSIDs(raw []byte) (sids []string, unparsed bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	sids, err := adguid.DACLSIDs(raw)
+	if err != nil {
+		return nil, true
+	}
+	return sids, false
 }
 
 func parseInt(s string) int64 {

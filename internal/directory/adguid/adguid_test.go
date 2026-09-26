@@ -169,6 +169,28 @@ func TestUACBitsNotDigitContains(t *testing.T) {
 	}
 }
 
+func TestUACDelegationBits(t *testing.T) {
+	unconstrained := FromUint(512 | UACTrustedForDelegation)
+	if !unconstrained.TrustedForDelegation || unconstrained.NotDelegated || unconstrained.TrustedToAuthForDelegation {
+		t.Fatalf("unconstrained: %+v", unconstrained)
+	}
+	if !unconstrained.Active {
+		t.Fatal("delegation must not mark the account disabled")
+	}
+	sensitive := FromUint(512 | UACNotDelegated)
+	if !sensitive.NotDelegated || sensitive.TrustedForDelegation {
+		t.Fatalf("not delegated: %+v", sensitive)
+	}
+	transition := FromUint(512 | UACTrustedToAuthForDelegation)
+	if !transition.TrustedToAuthForDelegation || transition.TrustedForDelegation {
+		t.Fatalf("protocol transition: %+v", transition)
+	}
+	// 0x80000 contains the digit 2. The bit test must not treat that as disable.
+	if unconstrained.AccountDisabled {
+		t.Fatal("0x80000 must not be read as ACCOUNTDISABLE")
+	}
+}
+
 func TestCommonNameKeepsFullDNIdentity(t *testing.T) {
 	dn := `CN=Doe\, Jane,OU=People,DC=authsec,DC=test`
 	if got := CommonName(dn); got != "Doe, Jane" {

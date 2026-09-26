@@ -81,6 +81,19 @@ samba-tool group add parentgrp || true
 samba-tool group add childgrp || true
 samba-tool group addmembers parentgrp childgrp || true
 samba-tool group addmembers childgrp alice || true
+
+# Posture seeds. Privileged membership is nested under Domain Admins by RID,
+# not by renaming the group. Delegation bits and adminCount are set over LDAP
+# by the Go test after Samba is up, so this script does not invent a binary ACL.
+create_user unconstrained "CANARY-SECRET-DO-NOT-LEAK-10" --given-name=Unconstrained --surname=User || true
+create_user constrained "CANARY-SECRET-DO-NOT-LEAK-11" --given-name=Constrained --surname=User || true
+create_user rbcdtarget "CANARY-SECRET-DO-NOT-LEAK-12" --given-name=RBCD --surname=Target || true
+create_user nestedda "CANARY-SECRET-DO-NOT-LEAK-13" --given-name=Nested --surname=DA || true
+create_user orphan "CANARY-SECRET-DO-NOT-LEAK-14" --given-name=Orphan --surname=Admin || true
+create_user sensitive "CANARY-SECRET-DO-NOT-LEAK-15" --given-name=Sensitive --surname=User || true
+samba-tool group add nestgrp || true
+samba-tool group addmembers "Domain Admins" nestgrp || true
+samba-tool group addmembers nestgrp nestedda || true
 samba-tool computer create ws01 || true
 samba-tool spn add HTTP/invoice.authsec.test alice || true
 
