@@ -1,0 +1,21 @@
+{
+  "workload_id": "50000000-0000-4000-8000-000000000024",
+  "delivery_revision": 12,
+  "runtime_generation": "managed-run-900",
+  "state": "verified",
+  "controls": [
+    {
+      "kind": "tetragon.file_open_deny",
+      "state": "verified",
+      "artifact_sha256": "<64 lowercase hex characters>",
+      "test": "forbidden_open_returned_eacces"
+    },
+    {
+      "kind": "linux.netns_egress",
+      "state": "verified",
+      "artifact_sha256": "<64 lowercase hex characters>",
+      "test": "allow_and_deny_endpoints_verified"
+    }
+  ],
+  "observed_at": "2026-09-25T08:12:00Z"
+}

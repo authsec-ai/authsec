@@ -30,6 +30,7 @@ var (
 	db      *gorm.DB
 	pg      *testsupport.PGContainer
 	router  *gin.Engine
+	syncSvc *services.CollectorSyncService
 	current time.Time
 )
 
@@ -79,7 +80,7 @@ func TestMain(m *testing.M) {
 func newRouter(ctl *platform.CollectorController) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
-	routes.MountCollectorV2(r, db, ctl, humanAuth)
+	syncSvc = routes.MountCollectorV2(r, db, ctl, humanAuth)
 
 	disc := platform.NewDiscoveryController(db)
 	ingress := r.Group("/authsec/discovery")

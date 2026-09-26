@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthSec collector agent-sync request 2.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "batch_id", "collector_epoch", "sequence", "sent_at", "objects", "observations", "applied", "health"],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "batch_id": { "type": "string", "format": "uuid" },
+    "collector_epoch": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "sent_at": { "type": "string", "format": "date-time" },
+    "capabilities": { "type": "object" },
+    "capability_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "objects": { "type": "array", "items": { "$ref": "#/$defs/object" } },
+    "observations": { "type": "array", "items": { "$ref": "#/$defs/observation" } },
+    "applied": { "type": "array", "items": { "$ref": "applied_receipt.schema.json" } },
+    "health": { "$ref": "#/$defs/health" }
+  },
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "collector_epoch", "scope_key", "object_class", "generation", "chunk_no", "terminal_chunk_count", "digest", "complete"],
+      "properties": {
+        "snapshot_id": { "type": "string", "format": "uuid" },
+        "collector_epoch": { "type": "string", "format": "uuid" },
+        "scope_key": { "type": "string", "minLength": 1 },
+        "object_class": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer" },
+        "chunk_no": { "type": "integer", "minimum": 1 },
+        "terminal_chunk_count": { "type": "integer", "minimum": 1 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "kind", "native"],
+      "properties": {
+        "ref": { "type": "string", "pattern": "^o_[A-Za-z0-9_]+$" },
+        "kind": { "type": "string", "minLength": 1 },
+        "native": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } },
+        "attributes": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "kind", "observed_at", "outcome"],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "subject_ref": { "type": "string" },
+        "identity_ref": { "type": "string" },
+        "resource_ref": { "type": "string" },
+        "runtime": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "outcome": { "enum": ["attempted", "success", "denied", "unknown"] },
+        "attribution": { "type": "string" }
+      }
+    },
+    "notSecret": {
+      "not": {
+        "enum": ["password", "passwd", "secret", "secret_value", "token", "api_key", "apikey", "private_key", "access_key", "client_secret", "connection_string", "shadow", "credential", "credentials", "kubeconfig", "authorization", "bearer", "canonical_id", "iga_id", "graph_id"]
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["events_lost", "queue_depth"],
+      "properties": {
+        "events_lost": { "type": "integer", "minimum": 0 },
+        "queue_depth": { "type": "integer", "minimum": 0 },
+        "watch_gaps": { "type": "integer", "minimum": 0 },
+        "source_failures": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

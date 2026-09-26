@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "batch_id": "10000000-0000-4000-8000-000000000010",
+  "collector_epoch": "20000000-0000-4000-8000-000000000001",
+  "sequence": 1,
+  "sent_at": "2026-09-25T08:00:00Z",
+  "objects": [],
+  "observations": [],
+  "applied": [],
+  "health": {"events_lost": 0, "queue_depth": 0}
+}

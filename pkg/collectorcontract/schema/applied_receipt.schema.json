@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthSec collector applied control receipt 2.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workload_id", "delivery_revision", "runtime_generation", "state", "controls", "observed_at"],
+  "properties": {
+    "workload_id": { "type": "string", "format": "uuid" },
+    "delivery_revision": { "type": "integer" },
+    "runtime_generation": { "type": "string", "minLength": 1 },
+    "state": { "type": "string", "minLength": 1 },
+    "controls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "state", "artifact_sha256", "test"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "state": { "type": "string", "minLength": 1 },
+          "artifact_sha256": { "type": "string", "minLength": 1 },
+          "test": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "observed_at": { "type": "string", "format": "date-time" }
+  }
+}
