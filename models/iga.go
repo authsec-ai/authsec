@@ -430,8 +430,18 @@ type IGAAgent struct {
 
 func (IGAAgent) TableName() string { return "iga_agents" }
 
+// WorkloadLinkBasisHuman is the only basis that may set
+// iga_agent_instances.workload_id. A weak name match or a candidate join
+// is not authority.
+const WorkloadLinkBasisHuman = "human_registration"
+
 // IGAAgentInstance is a realization proven by a source that can prove
 // deployment. A repository declaration alone never produces one of these.
+//
+// WorkloadID is set only by a human registration (042). ObservationID and
+// CloudObservationID are the two evidence arms; at most one is set. LinkedBy
+// and OwnerUserID are recorded user ids with no foreign key, matching
+// iga_workload_classification.decided_by_user_id.
 type IGAAgentInstance struct {
 	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
@@ -443,9 +453,36 @@ type IGAAgentInstance struct {
 	Lifecycle        string     `json:"lifecycle" gorm:"not null;default:'active'"`
 	FirstSeenAt      time.Time  `json:"first_seen_at"`
 	LastSeenAt       time.Time  `json:"last_seen_at"`
+
+	WorkloadID            *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
+	ObservationID         *uuid.UUID `json:"observation_id,omitempty" gorm:"type:uuid"`
+	CloudObservationID    *uuid.UUID `json:"cloud_observation_id,omitempty" gorm:"type:uuid"`
+	WorkloadLinkBasis     *string    `json:"workload_link_basis,omitempty"`
+	LinkedBy              *uuid.UUID `json:"linked_by,omitempty" gorm:"type:uuid"`
+	OwnerUserID           *uuid.UUID `json:"owner_user_id,omitempty" gorm:"type:uuid"`
+	LinkPurpose           string     `json:"link_purpose" gorm:"not null;default:''"`
+	ClassificationVersion *int64     `json:"classification_version,omitempty"`
 }
 
 func (IGAAgentInstance) TableName() string { return "iga_agent_instances" }
+
+// DiscoveredAgentWorkload is a candidate or weak join from a legacy
+// discovered_agents row to a canonical workload (042). LinkStrength is only
+// weak or candidate: this row never sets an authoritative workload_id.
+type DiscoveredAgentWorkload struct {
+	ID                 uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID        uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null"`
+	DiscoveredAgentID  uuid.UUID  `json:"discovered_agent_id" gorm:"type:uuid;not null"`
+	WorkloadID         uuid.UUID  `json:"workload_id" gorm:"type:uuid;not null"`
+	ObservationID      *uuid.UUID `json:"observation_id,omitempty" gorm:"type:uuid"`
+	CloudObservationID *uuid.UUID `json:"cloud_observation_id,omitempty" gorm:"type:uuid"`
+	LinkStrength       string     `json:"link_strength" gorm:"not null;default:'candidate'"`
+	LinkState          string     `json:"link_state" gorm:"not null;default:'proposed'"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+func (DiscoveredAgentWorkload) TableName() string { return "discovered_agent_workloads" }
 
 // Providers of the shared canonical tables (028). Existing rows are GitHub's;
 // the AWS projector writes ProviderAWS. Every GitHub reader filters on

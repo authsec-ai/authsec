@@ -193,6 +193,10 @@ var bfkNoForeignKey = map[string]string{
 	"iga_workload_classification.operation_id": "029: a client-generated idempotency key (§5.5), not a reference",
 	"iga_workload_classification.decided_by_user_id": "029 (spec verbatim): the deciding user's id; users is " +
 		"not an iga_* table and §3 declares no key",
+	"iga_agent_instances.linked_by": "042: the human who registered the instance. users is not an iga_* table; " +
+		"recorded like iga_workload_classification.decided_by_user_id, not a foreign key",
+	"iga_agent_instances.owner_user_id": "042: the accountable owner named by the registration. Same bare-uuid " +
+		"treatment as linked_by",
 	"iga_webhook_deliveries.integration_id": "004: filled when a delivery binds; SPEC QUESTION: no key",
 	"iga_source_objects.integration_scope_id": "004: SPEC QUESTION: no key to iga_integration_scopes " +
 		"(workspace_id, id)",

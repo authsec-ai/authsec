@@ -103,6 +103,10 @@ func TestP2ListsRoutesPermissionsAndCrossWorkspace(t *testing.T) {
 		"POST /workloads/:id/classification": {path: "/workloads/" + w + "/classification", perm: review, want: 404,
 			body: map[string]any{"operation_id": uuid.NewString(), "decision": "classified_agent",
 				"purpose": "", "reason": "cross-workspace probe", "expected_version": 0, "undoes_decision_id": nil}},
+		"POST /workloads/:id/agent-registration": {path: "/workloads/" + w + "/agent-registration", perm: "discovery:claim", want: 404,
+			body: map[string]any{"expected_version": 0, "purpose": "cross-workspace probe",
+				"owner_user_id": user.String(), "create_agent": map[string]any{"display_name": "probe"},
+				"observation_id": uuid.NewString()}},
 
 		"GET /identities":                 {path: "/identities", perm: read, want: 200},
 		"GET /identities/:id":             {path: "/identities/" + id, perm: read, want: 404},
