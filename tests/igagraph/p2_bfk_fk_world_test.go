@@ -210,6 +210,15 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 		{"integ", func() bfkRow { return s.integration() }},
 		{"iscope", func() bfkRow { return s.integrationScope() }},
 		{"iscan", func() bfkRow { return s.igaScanRun() }},
+		// 038's collector parents. discovery_sources is not iga_*/cloud_*, but
+		// iga_observations now references it, and the collector rows below
+		// reference iga_estate_scopes, iga_integrations and iga_scan_runs.
+		// collector_integrations is not seeded: its unique keys are the
+		// (workspace, integration) and (workspace, collector) pairs the child
+		// case inserts, and a seed row would make the control fail first.
+		{"dsrc", func() bfkRow { return s.discoverySource() }},
+		{"cinst", func() bfkRow { return s.collectorInstance() }},
+		{"cbatch", func() bfkRow { return s.collectorBatch() }},
 		{"delivery", func() bfkRow { return s.delivery() }},
 		{"srcobj", func() bfkRow { return s.sourceObject() }},
 		{"iobs", func() bfkRow { return s.igaObservation() }},
@@ -400,6 +409,56 @@ func (s *bfkSide) igaObservation(set ...any) bfkRow {
 	return bfkRowOf("iga_observations", []any{"id", uuid.New(), "workspace_id", s.ws,
 		"source_object_id", s.id("srcobj"), "scan_run_id", s.id("iscan"), "mode", "platform_declared",
 		"observed_at", time.Now(), "dedupe_key", bfkFresh("obs")}, set)
+}
+
+// discoverySource is a Discovery connector (002, kind extended by 038). The
+// observation's discovery-source key is the only in-scope reference to it.
+func (s *bfkSide) discoverySource(set ...any) bfkRow {
+	return bfkRowOf("discovery_sources", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"kind", "k8s_webhook", "display_name", bfkFresh("src")}, set)
+}
+
+// collectorInstance is one enrolled collector. installation_key_id is fresh on
+// every call: the partial unique index admits only one active key per workspace,
+// and the world's own instance must not collide with the child under test.
+func (s *bfkSide) collectorInstance(set ...any) bfkRow {
+	return bfkRowOf("collector_instances", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"discovery_source_id", s.id("dsrc"), "estate_scope_id", s.id("scope"),
+		"integration_id", s.id("integ"), "kind", "k8s_collector",
+		"installation_key_id", bfkFresh("inst"), "installation_public_key", []byte("bfk")}, set)
+}
+
+// collectorEnrollment names an estate scope. token_hash is fresh so the
+// world's rows and the child cannot collide on collector_enrollments_token_hash_key.
+func (s *bfkSide) collectorEnrollment(set ...any) bfkRow {
+	return bfkRowOf("collector_enrollments", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"token_hash", bfkFresh("tok"), "kind", "k8s_collector", "estate_scope_kind", "cluster",
+		"estate_scope_id", s.id("scope")}, set)
+}
+
+// collectorIntegration binds A's source and collector to p's integration. It
+// has no id column, so it is never seeded through put.
+func (s *bfkSide) collectorIntegration(set ...any) bfkRow {
+	return bfkRowOf("collector_integrations", []any{"workspace_id", s.ws,
+		"discovery_source_id", s.id("dsrc"), "integration_id", s.id("integ"),
+		"collector_id", s.id("cinst")}, set)
+}
+
+// collectorBatch is one accepted batch. epoch, batch_id and receipt_id are
+// fresh per call, so the seeded batch and the child do not share a unique key.
+func (s *bfkSide) collectorBatch(set ...any) bfkRow {
+	return bfkRowOf("collector_batches", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"collector_id", s.id("cinst"), "epoch", uuid.New(), "sequence", int64(1),
+		"batch_id", uuid.New(), "payload_hash", bfkFresh("ph"), "receipt_id", uuid.New(),
+		"receipt_state", "accepted", "projection_state", "queued",
+		"iga_scan_run_id", s.id("iscan")}, set)
+}
+
+// collectorOutbox is one projection job for A's batch and collector.
+func (s *bfkSide) collectorOutbox(set ...any) bfkRow {
+	return bfkRowOf("collector_outbox", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"integration_id", s.id("integ"), "collector_id", s.id("cinst"),
+		"batch_row_id", s.id("cbatch"), "job_kind", "bfk", "dedupe_key", bfkFresh("ob")}, set)
 }
 
 func (s *bfkSide) candidate(set ...any) bfkRow {
