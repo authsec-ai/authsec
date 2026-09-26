@@ -79,8 +79,9 @@ jobs:
             PGPASSWORD=postgres psql -h localhost -U postgres -d authsec \
               -v ON_ERROR_STOP=1 -1 -f "$f" >/dev/null
           done
-          # Just the two tests that prove the qualified-subject evidence path.
-          # The full integration suite runs in the opt-in job in pr-checks.yml,
+          # The two qualified-subject evidence tests, plus the TRD2 integration
+          # proofs (mixed sources, fencing, flag-off golden, migration-on-data).
+          # The rest of the suite stays in the opt-in job in pr-checks.yml,
           # which carries one known-failing, unrelated checkpoint test.
-          go test ./tests/integration/ -count=1 \
-            -run 'TestPermissionEvidenceSubjectKeyIsQualified|TestObservationDedupeUpgradesUnqualifiedKey'
+          go test ./tests/integration/ -count=1 -timeout 30m \
+            -run 'TestPermissionEvidenceSubjectKeyIsQualified|TestObservationDedupeUpgradesUnqualifiedKey|TestTRD2IT'

@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -355,6 +356,10 @@ type IGARelationship struct {
 	// never ends -- see §4.10.
 	PartitionKey string     `json:"partition_key" gorm:"not null;default:''"`
 	ConnectorID  *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+	// IntegrationID is the collector owning source. Exactly one of it and
+	// ConnectorID is set on a collector or cloud row; a legacy row may name neither.
+	IntegrationID          *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
+	ConfirmingIGAScanRunID *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`
 
 	// can_assume only: the trust statement that declared it, verbatim facts.
 	// Conditions are RECORDED, NEVER EVALUATED; nil means no Condition.
@@ -465,18 +470,21 @@ type IGAPolicyAssignment struct {
 	SourceKey               string     `json:"source_key" gorm:"not null"`
 	PartitionKey            string     `json:"partition_key" gorm:"not null"`
 	ConnectorID             *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+	IntegrationID           *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
+	ConfirmingIGAScanRunID  *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`
 }
 
 func (IGAPolicyAssignment) TableName() string { return "iga_policy_assignment" }
 
 // IGAAssignmentEvidence links an assignment to the observations supporting it.
 type IGAAssignmentEvidence struct {
-	ID            uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID   uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	AssignmentID  uuid.UUID `json:"assignment_id" gorm:"type:uuid;not null"`
-	ObservationID uuid.UUID `json:"observation_id" gorm:"type:uuid;not null"`
-	Relation      string    `json:"relation" gorm:"not null;default:'supports'"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	AssignmentID     uuid.UUID  `json:"assignment_id" gorm:"type:uuid;not null"`
+	ObservationID    *uuid.UUID `json:"observation_id,omitempty" gorm:"type:uuid"`
+	IGAObservationID *uuid.UUID `json:"iga_observation_id,omitempty" gorm:"type:uuid"`
+	Relation         string     `json:"relation" gorm:"not null;default:'supports'"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 func (IGAAssignmentEvidence) TableName() string { return "iga_assignment_evidence" }
@@ -564,24 +572,26 @@ func (IGAExternalPrincipal) TableName() string { return "iga_external_principal"
 // IGAAccessEdgeEvidence links an access edge to the observation supporting it.
 // Both endpoints typed and FK'd, unlike iga_observation_links.
 type IGAAccessEdgeEvidence struct {
-	ID            uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID   uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	AccessEdgeID  uuid.UUID `json:"access_edge_id" gorm:"type:uuid;not null"`
-	ObservationID uuid.UUID `json:"observation_id" gorm:"type:uuid;not null"`
-	Relation      string    `json:"relation" gorm:"not null;default:'supports'"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	AccessEdgeID     uuid.UUID  `json:"access_edge_id" gorm:"type:uuid;not null"`
+	ObservationID    *uuid.UUID `json:"observation_id,omitempty" gorm:"type:uuid"`
+	IGAObservationID *uuid.UUID `json:"iga_observation_id,omitempty" gorm:"type:uuid"`
+	Relation         string     `json:"relation" gorm:"not null;default:'supports'"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 func (IGAAccessEdgeEvidence) TableName() string { return "iga_access_edge_evidence" }
 
 // IGARelationshipEvidence is the same junction against iga_relationship.
 type IGARelationshipEvidence struct {
-	ID             uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID    uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	RelationshipID uuid.UUID `json:"relationship_id" gorm:"type:uuid;not null"`
-	ObservationID  uuid.UUID `json:"observation_id" gorm:"type:uuid;not null"`
-	Relation       string    `json:"relation" gorm:"not null;default:'supports'"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	RelationshipID   uuid.UUID  `json:"relationship_id" gorm:"type:uuid;not null"`
+	ObservationID    *uuid.UUID `json:"observation_id,omitempty" gorm:"type:uuid"`
+	IGAObservationID *uuid.UUID `json:"iga_observation_id,omitempty" gorm:"type:uuid"`
+	Relation         string     `json:"relation" gorm:"not null;default:'supports'"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 func (IGARelationshipEvidence) TableName() string { return "iga_relationship_evidence" }
@@ -607,14 +617,16 @@ type IGAObjectSupport struct {
 	EntitlementID     *uuid.UUID `json:"entitlement_id,omitempty" gorm:"type:uuid"`
 	PolicyID          *uuid.UUID `json:"policy_id,omitempty" gorm:"type:uuid"`
 
-	ConnectorID  uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
-	PartitionKey string    `json:"partition_key" gorm:"not null"`
+	ConnectorID   uuid.UUID  `json:"connector_id" gorm:"type:uuid"`
+	IntegrationID *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
+	PartitionKey  string     `json:"partition_key" gorm:"not null"`
 
-	State              string     `json:"state" gorm:"not null;default:'current'"`
-	FirstSeenAt        time.Time  `json:"first_seen_at" gorm:"not null;default:now()"`
-	LastConfirmedRunID *uuid.UUID `json:"last_confirmed_run_id,omitempty" gorm:"type:uuid"`
-	LastConfirmedAt    *time.Time `json:"last_confirmed_at,omitempty"`
-	EndedReason        string     `json:"ended_reason" gorm:"not null;default:''"`
+	State                  string     `json:"state" gorm:"not null;default:'current'"`
+	FirstSeenAt            time.Time  `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastConfirmedRunID     *uuid.UUID `json:"last_confirmed_run_id,omitempty" gorm:"type:uuid"`
+	ConfirmingIGAScanRunID *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`
+	LastConfirmedAt        *time.Time `json:"last_confirmed_at,omitempty"`
+	EndedReason            string     `json:"ended_reason" gorm:"not null;default:''"`
 }
 
 func (IGAObjectSupport) TableName() string { return "iga_object_support" }
@@ -686,12 +698,13 @@ func NodeTable(class string) string {
 // This mirrors cloud_scan_run's pattern exactly rather than inventing a second
 // ownership notion.
 type IGAProjectionJob struct {
-	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	ScanRunID   uuid.UUID `json:"scan_run_id" gorm:"type:uuid;not null"`
-	ConnectorID uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
-	Generation  int       `json:"generation" gorm:"not null"`
-	Status      string    `json:"status" gorm:"not null;default:'queued'"`
+	ID           uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID  uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ScanRunID    uuid.UUID  `json:"scan_run_id" gorm:"type:uuid"`
+	IGAScanRunID *uuid.UUID `json:"iga_scan_run_id,omitempty" gorm:"type:uuid"`
+	ConnectorID  uuid.UUID  `json:"connector_id" gorm:"type:uuid"`
+	Generation   int        `json:"generation" gorm:"not null"`
+	Status       string     `json:"status" gorm:"not null;default:'queued'"`
 
 	LeaseOwner     string     `json:"lease_owner" gorm:"not null;default:''"`
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
@@ -711,18 +724,29 @@ func (IGAProjectionJob) TableName() string { return "iga_projection_job" }
 // Reconciled stays false until the Reconciler commits, so a pass interrupted
 // between projection and reconciliation is visible as exactly that.
 type IGAProjectionState struct {
-	ID               uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID      uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	EstateScopeID    uuid.UUID `json:"estate_scope_id" gorm:"type:uuid;not null"`
-	ConnectorID      uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
-	ObjectClass      string    `json:"object_class" gorm:"not null;default:''"`
-	RelationshipType string    `json:"relationship_type" gorm:"not null;default:''"`
-	PartitionKey     string    `json:"partition_key" gorm:"not null"`
-	LastRunID        uuid.UUID `json:"last_run_id" gorm:"type:uuid;not null"`
-	LastGeneration   int64     `json:"last_generation" gorm:"not null"`
-	CoverageState    string    `json:"coverage_state" gorm:"not null"`
-	Reconciled       bool      `json:"reconciled" gorm:"not null;default:false"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	EstateScopeID    uuid.UUID  `json:"estate_scope_id" gorm:"type:uuid;not null"`
+	ConnectorID      uuid.UUID  `json:"connector_id" gorm:"type:uuid"`
+	IntegrationID    *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
+	ObjectClass      string     `json:"object_class" gorm:"not null;default:''"`
+	RelationshipType string     `json:"relationship_type" gorm:"not null;default:''"`
+	PartitionKey     string     `json:"partition_key" gorm:"not null"`
+	LastRunID        uuid.UUID  `json:"last_run_id" gorm:"type:uuid"`
+	LastIGAScanRunID *uuid.UUID `json:"last_iga_scan_run_id,omitempty" gorm:"type:uuid"`
+	LastGeneration   int64      `json:"last_generation" gorm:"not null"`
+	// OrderingSequence, OrderingEpoch and OrderingSnapshot record the collector
+	// watermark. LastGeneration is the highest snapshot generation projected
+	// for this integration, scope and class. OrderingSnapshot is the
+	// snapshot_id that set it. Sequence is recorded and is not a tie-break:
+	// another snapshot of the same generation is not superseded. Runtime
+	// batches do not move these values. Cloud rows leave them at the default.
+	OrderingSequence int64      `json:"ordering_sequence" gorm:"not null;default:0"`
+	OrderingEpoch    *uuid.UUID `json:"ordering_epoch,omitempty" gorm:"type:uuid"`
+	OrderingSnapshot *uuid.UUID `json:"ordering_snapshot,omitempty" gorm:"type:uuid"`
+	CoverageState    string     `json:"coverage_state" gorm:"not null"`
+	Reconciled       bool       `json:"reconciled" gorm:"not null;default:false"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 func (IGAProjectionState) TableName() string { return "iga_projection_state" }
@@ -741,10 +765,13 @@ type IGAPublication struct {
 	// Rev is per-workspace, monotonic and gap-free. Readers pin to it.
 	Rev         int64     `json:"rev" gorm:"primaryKey"`
 	PublishedAt time.Time `json:"published_at" gorm:"not null"`
-	ScanRunID   uuid.UUID `json:"scan_run_id" gorm:"type:uuid;not null"`
-	// Manifest maps partition_key -> run_id as of this revision, so a reader
-	// can see exactly which run each part of the graph came from.
-	Manifest json.RawMessage `json:"manifest" gorm:"type:jsonb;not null;default:'{}'"`
+	ScanRunID   uuid.UUID `json:"scan_run_id" gorm:"type:uuid"`
+	// IGAScanRunID is the collector run this revision committed. Exactly one
+	// of it and ScanRunID is set. Manifest is the cloud reader's column and
+	// is left in its existing shape.
+	IGAScanRunID     *uuid.UUID      `json:"iga_scan_run_id,omitempty" gorm:"type:uuid"`
+	Manifest         json.RawMessage `json:"manifest" gorm:"type:jsonb;not null;default:'{}'"`
+	SourceManifestV2 json.RawMessage `json:"source_manifest_v2,omitempty" gorm:"type:jsonb"`
 }
 
 func (IGAPublication) TableName() string { return "iga_publication" }
@@ -762,16 +789,77 @@ func (IGAPublication) TableName() string { return "iga_publication" }
 // The cost is stated plainly: scanning serializes per WORKSPACE, not per
 // connector.
 type IGAPipelineLease struct {
-	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;primaryKey"`
-	State       string     `json:"state" gorm:"not null;default:'idle'"`
-	Holder      string     `json:"holder" gorm:"not null;default:''"`
-	ScanRunID   *uuid.UUID `json:"scan_run_id,omitempty" gorm:"type:uuid"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	Version     int64      `json:"version" gorm:"not null;default:0"`
-	UpdatedAt   time.Time  `json:"updated_at" gorm:"not null;default:now()"`
+	WorkspaceID  uuid.UUID  `json:"workspace_id" gorm:"type:uuid;primaryKey"`
+	State        string     `json:"state" gorm:"not null;default:'idle'"`
+	Holder       string     `json:"holder" gorm:"not null;default:''"`
+	ScanRunID    *uuid.UUID `json:"scan_run_id,omitempty" gorm:"type:uuid"`
+	IGAScanRunID *uuid.UUID `json:"iga_scan_run_id,omitempty" gorm:"type:uuid"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	Version      int64      `json:"version" gorm:"not null;default:0"`
+	UpdatedAt    time.Time  `json:"updated_at" gorm:"not null;default:now()"`
 }
 
 func (IGAPipelineLease) TableName() string { return "iga_pipeline_lease" }
+
+// RunKindCollector is the pipeline fence's run type for an iga_scan_runs id.
+// The empty kind is a cloud_scan_run, which is what every existing caller passes.
+const RunKindCollector = "collector"
+
+// Source manifest kinds stored in iga_publication.source_manifest_v2.
+const (
+	ManifestKindCloudScanRun = "cloud_scan_run"
+	ManifestKindIGAScanRun   = "iga_scan_run"
+)
+
+// SourceManifestRef is one typed run in source_manifest_v2. The cloud
+// manifest column is a different document and is not this struct.
+type SourceManifestRef struct {
+	Kind          string     `json:"kind"`
+	ID            uuid.UUID  `json:"id"`
+	IntegrationID *uuid.UUID `json:"integration_id,omitempty"`
+	ConnectorID   *uuid.UUID `json:"connector_id,omitempty"`
+}
+
+// SupportFromCloud is the only constructor for a cloud support row.
+func SupportFromCloud(ws, connector, run uuid.UUID, partition string, at time.Time) *IGAObjectSupport {
+	return &IGAObjectSupport{
+		WorkspaceID: ws, ConnectorID: connector, PartitionKey: partition,
+		State: RelCurrent, FirstSeenAt: at,
+		LastConfirmedRunID: &run, LastConfirmedAt: &at,
+	}
+}
+
+// SupportFromIntegration is the only constructor for a collector support row.
+func SupportFromIntegration(ws, integration, run uuid.UUID, partition string, at time.Time) *IGAObjectSupport {
+	return &IGAObjectSupport{
+		WorkspaceID: ws, IntegrationID: &integration, PartitionKey: partition,
+		State: RelCurrent, FirstSeenAt: at,
+		ConfirmingIGAScanRunID: &run, LastConfirmedAt: &at,
+	}
+}
+
+// ValidateArm refuses a support row that names both sources, neither source,
+// or a confirming run from the other arm.
+func (s *IGAObjectSupport) ValidateArm() error {
+	if s == nil {
+		return errors.New("object support is nil")
+	}
+	cloud := s.ConnectorID != uuid.Nil
+	collector := s.IntegrationID != nil
+	if cloud == collector {
+		return errors.New("object support must name exactly one source arm")
+	}
+	if s.LastConfirmedRunID != nil && s.ConfirmingIGAScanRunID != nil {
+		return errors.New("object support must name at most one confirming run")
+	}
+	if s.ConfirmingIGAScanRunID != nil && !collector {
+		return errors.New("collector confirming run requires integration_id")
+	}
+	if s.LastConfirmedRunID != nil && !cloud {
+		return errors.New("cloud confirming run requires connector_id")
+	}
+	return nil
+}
 
 /* --------------------------------- helpers -------------------------------- */
 

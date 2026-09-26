@@ -680,8 +680,10 @@ type IGAAccessEdge struct {
 
 	// Partition membership. An edge written without these is invisible to
 	// reconciliation and never ends.
-	PartitionKey string     `json:"partition_key" gorm:"not null;default:''"`
-	ConnectorID  *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+	PartitionKey           string     `json:"partition_key" gorm:"not null;default:''"`
+	ConnectorID            *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+	IntegrationID          *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
+	ConfirmingIGAScanRunID *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`
 
 	ObservedAt *time.Time `json:"observed_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`

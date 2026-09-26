@@ -53,6 +53,12 @@ type IGAProjectionJobRepository interface {
 	EnqueueTx(tx *gorm.DB, job *models.IGAProjectionJob) error
 
 	Claim(owner string, lease time.Duration, now time.Time) (*models.IGAProjectionJob, error)
+	// ClaimCollector takes one job on the iga_scan_run_id arm. The cloud Claim
+	// never returns those rows, so a flag-off worker leaves them queued.
+	ClaimCollector(owner string, lease time.Duration, now time.Time) (*models.IGAProjectionJob, error)
+	// ClaimCollectorRun claims the job for one iga_scan_run, including a queued
+	// job and a running or failed job whose lease has expired.
+	ClaimCollectorRun(owner string, igaRunID uuid.UUID, lease time.Duration, now time.Time) (*models.IGAProjectionJob, error)
 	Renew(jobID uuid.UUID, owner string, version int64, lease time.Duration) error
 	Complete(jobID uuid.UUID, owner string, version int64) error
 	Fail(jobID uuid.UUID, owner string, version int64, reason string) error
@@ -82,9 +88,28 @@ func NewIGAProjectionJobRepository(db *gorm.DB) IGAProjectionJobRepository {
 }
 
 func (r *igaProjectionJobRepository) EnqueueTx(tx *gorm.DB, job *models.IGAProjectionJob) error {
+	// One job per run. A cloud job conflicts on scan_run_id (033's UNIQUE).
+	// A collector job conflicts on the partial unique index and leaves
+	// scan_run_id and connector_id NULL.
+	if job.IGAScanRunID != nil {
+		if job.ScanRunID != uuid.Nil || job.ConnectorID != uuid.Nil {
+			return fmt.Errorf("collector projection job must not name a cloud run or connector")
+		}
+		if err := tx.Omit("ScanRunID", "ConnectorID").Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "iga_scan_run_id"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "iga_scan_run_id IS NOT NULL"},
+			}},
+			DoNothing: true,
+		}).Create(job).Error; err != nil {
+			return err
+		}
+		return tx.Raw(`SELECT id FROM iga_projection_job WHERE workspace_id = ? AND iga_scan_run_id = ?`,
+			job.WorkspaceID, *job.IGAScanRunID).Row().Scan(&job.ID)
+	}
 	// One job per scan run (033's UNIQUE). A retried publish must not enqueue
 	// a second.
-	if err := tx.Clauses(clause.OnConflict{
+	if err := tx.Omit("IGAScanRunID").Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "scan_run_id"}},
 		DoNothing: true,
 	}).Create(job).Error; err != nil {
@@ -120,6 +145,7 @@ func (r *igaProjectionJobRepository) Claim(
 		WHERE id = (
 			SELECT id FROM iga_projection_job
 			 WHERE attempts < ?
+			   AND scan_run_id IS NOT NULL
 			   AND (status = ?
 			     -- A running job whose worker died.
 			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
@@ -133,6 +159,92 @@ func (r *igaProjectionJobRepository) Claim(
 		)
 		RETURNING *`,
 		models.ProjectionRunning, owner, now.Add(lease),
+		MaxProjectionAttempts,
+		models.ProjectionQueued,
+		models.ProjectionRunning, now,
+		models.ProjectionFailed, now,
+	).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// ClaimCollector is Claim restricted to the collector arm.
+func (r *igaProjectionJobRepository) ClaimCollector(
+	owner string, lease time.Duration, now time.Time,
+) (*models.IGAProjectionJob, error) {
+	if owner == "" {
+		return nil, errors.New("a claim needs an owner")
+	}
+	var out []models.IGAProjectionJob
+	err := r.db.Raw(`
+		UPDATE iga_projection_job SET
+			status           = ?,
+			lease_owner      = ?,
+			lease_expires_at = ?,
+			lease_version    = lease_version + 1,
+			attempts         = attempts + 1
+		WHERE id = (
+			SELECT id FROM iga_projection_job
+			 WHERE attempts < ?
+			   AND iga_scan_run_id IS NOT NULL
+			   AND (status = ?
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			 ORDER BY requested_at
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT 1
+		)
+		RETURNING *`,
+		models.ProjectionRunning, owner, now.Add(lease),
+		MaxProjectionAttempts,
+		models.ProjectionQueued,
+		models.ProjectionRunning, now,
+		models.ProjectionFailed, now,
+	).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// ClaimCollectorRun is ClaimCollector for one iga_scan_run. The coordinator
+// enqueues that run's job and then claims it, so a replica cannot take a
+// different workspace's collector job while it holds this run's outbox.
+func (r *igaProjectionJobRepository) ClaimCollectorRun(
+	owner string, igaRunID uuid.UUID, lease time.Duration, now time.Time,
+) (*models.IGAProjectionJob, error) {
+	if owner == "" {
+		return nil, errors.New("a claim needs an owner")
+	}
+	var out []models.IGAProjectionJob
+	err := r.db.Raw(`
+		UPDATE iga_projection_job SET
+			status           = ?,
+			lease_owner      = ?,
+			lease_expires_at = ?,
+			lease_version    = lease_version + 1,
+			attempts         = attempts + 1
+		WHERE id = (
+			SELECT id FROM iga_projection_job
+			 WHERE iga_scan_run_id = ?
+			   AND attempts < ?
+			   AND (status = ?
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT 1
+		)
+		RETURNING *`,
+		models.ProjectionRunning, owner, now.Add(lease),
+		igaRunID,
 		MaxProjectionAttempts,
 		models.ProjectionQueued,
 		models.ProjectionRunning, now,

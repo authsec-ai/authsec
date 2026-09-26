@@ -62,8 +62,10 @@ type IGAGraphRepository interface {
 	LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error
 	LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
 	LinkAssignmentEvidence(tx *gorm.DB, ws, assignmentID, obsID uuid.UUID, relation string) error
+	LinkRelationshipCollectorEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
 
 	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
+	PublicationForIGARun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
 	NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, error)
 	LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.RawMessage, error)
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) error
@@ -498,7 +500,16 @@ func (r *igaGraphRepository) UpsertAssignment(tx *gorm.DB, a *models.IGAPolicyAs
 	if err := requirePassTime("assignment "+a.SourceKey, a.ValidFrom, a.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
-	err := tx.Clauses(returningID, onKey(liveEdge, []string{
+	if err := rejectBareCollectorRun(a.IntegrationID, a.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
+	q := tx
+	if a.IntegrationID == nil {
+		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
+	} else if a.ConnectorID != nil {
+		return uuid.Nil, fmt.Errorf("assignment names both provenance arms")
+	}
+	err := q.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 	})).Create(a).Error
 	return a.ID, err
@@ -512,7 +523,16 @@ func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, s
 	if err := requirePassTime("grant "+e.SourceKey, e.ValidFrom, e.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
-	err := tx.Clauses(returningID, onKey("source_key <> '' AND "+liveEdge, []string{
+	if err := rejectBareCollectorRun(e.IntegrationID, e.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
+	q := tx
+	if e.IntegrationID == nil {
+		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
+	} else if e.ConnectorID != nil {
+		return uuid.Nil, fmt.Errorf("grant names both provenance arms")
+	}
+	err := q.Clauses(returningID, onKey("source_key <> '' AND "+liveEdge, []string{
 		"entitlement_id", "assignment_id", "calculation_state", "effective_conclusion",
 		"state", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id", "updated_at",
 	})).Create(e).Error
@@ -528,11 +548,33 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 	if err := requirePassTime("relationship "+rel.SourceKey, rel.ValidFrom, rel.LastConfirmedAt); err != nil {
 		return uuid.Nil, err
 	}
-	err := tx.Clauses(returningID, onKey(liveEdge, []string{
+	// The database still allows neither arm, so GitHub rows with a null
+	// connector_id stay valid. A confirming collector run without
+	// integration_id is refused here; the collector writer always sets it.
+	if err := rejectBareCollectorRun(rel.IntegrationID, rel.ConfirmingIGAScanRunID); err != nil {
+		return uuid.Nil, err
+	}
+	q := tx
+	if rel.IntegrationID == nil {
+		q = q.Omit("IntegrationID", "ConfirmingIGAScanRunID")
+	} else if rel.ConnectorID != nil {
+		return uuid.Nil, fmt.Errorf("relationship names both provenance arms")
+	}
+	err := q.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 		"statement_key", "conditions", "mechanism", "updated_at",
 	})).Create(rel).Error
 	return rel.ID, err
+}
+
+// rejectBareCollectorRun is the Go side of the neither-arm grandfather. The
+// database allows a row with no connector_id and no integration_id. A
+// confirming collector run is not that row: it has to name its integration.
+func rejectBareCollectorRun(integration, confirming *uuid.UUID) error {
+	if confirming != nil && integration == nil {
+		return fmt.Errorf("a confirming collector run requires integration_id")
+	}
+	return nil
 }
 
 // UpsertExternalPrincipal writes the node for a principal a trust policy or
@@ -595,7 +637,27 @@ func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjec
 	default:
 		return fmt.Errorf("object support row names no object")
 	}
-	return tx.Clauses(clause.OnConflict{
+	if err := s.ValidateArm(); err != nil {
+		return err
+	}
+	if s.IntegrationID != nil {
+		// uq_iga_os_<class>_integration. connector_id stays NULL.
+		return tx.Omit("ConnectorID").Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "workspace_id"}, {Name: col}, {Name: "integration_id"}, {Name: "partition_key"},
+			},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: col + " IS NOT NULL AND integration_id IS NOT NULL"},
+			}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"state":                      models.RelCurrent,
+				"ended_reason":               "",
+				"confirming_iga_scan_run_id": s.ConfirmingIGAScanRunID,
+				"last_confirmed_at":          s.LastConfirmedAt,
+			}),
+		}).Create(s).Error
+	}
+	return tx.Omit("IntegrationID", "ConfirmingIGAScanRunID").Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"}, {Name: col}, {Name: "connector_id"}, {Name: "partition_key"},
 		},
@@ -610,7 +672,23 @@ func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjec
 }
 
 func (r *igaGraphRepository) UpsertProjectionState(tx *gorm.DB, s *models.IGAProjectionState) error {
-	return tx.Clauses(clause.OnConflict{
+	if s.IntegrationID != nil {
+		if s.ConnectorID != uuid.Nil || s.LastRunID != uuid.Nil || s.LastIGAScanRunID == nil {
+			return fmt.Errorf("projection state integration arm is incomplete")
+		}
+		return tx.Omit("ConnectorID", "LastRunID").Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "integration_id"}, {Name: "partition_key"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "integration_id IS NOT NULL"},
+			}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"estate_scope_id", "object_class", "relationship_type", "last_iga_scan_run_id",
+				"last_generation", "ordering_sequence", "ordering_epoch", "ordering_snapshot",
+				"coverage_state", "reconciled", "updated_at",
+			}),
+		}).Create(s).Error
+	}
+	return tx.Omit("IntegrationID", "LastIGAScanRunID", "OrderingSequence", "OrderingEpoch", "OrderingSnapshot").Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "connector_id"}, {Name: "partition_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"estate_scope_id", "object_class", "relationship_type", "last_run_id",
@@ -620,20 +698,34 @@ func (r *igaGraphRepository) UpsertProjectionState(tx *gorm.DB, s *models.IGAPro
 }
 
 func (r *igaGraphRepository) LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error {
-	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGAAccessEdgeEvidence{
-		WorkspaceID: ws, AccessEdgeID: edgeID, ObservationID: obsID, Relation: relation,
+	return tx.Omit("IGAObservationID").Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGAAccessEdgeEvidence{
+		WorkspaceID: ws, AccessEdgeID: edgeID, ObservationID: &obsID, Relation: relation,
 	}).Error
 }
 
 func (r *igaGraphRepository) LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error {
-	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGARelationshipEvidence{
-		WorkspaceID: ws, RelationshipID: relID, ObservationID: obsID, Relation: relation,
+	return tx.Omit("IGAObservationID").Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGARelationshipEvidence{
+		WorkspaceID: ws, RelationshipID: relID, ObservationID: &obsID, Relation: relation,
 	}).Error
 }
 
 func (r *igaGraphRepository) LinkAssignmentEvidence(tx *gorm.DB, ws, assignmentID, obsID uuid.UUID, relation string) error {
-	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGAAssignmentEvidence{
-		WorkspaceID: ws, AssignmentID: assignmentID, ObservationID: obsID, Relation: relation,
+	return tx.Omit("IGAObservationID").Clauses(clause.OnConflict{DoNothing: true}).Create(&models.IGAAssignmentEvidence{
+		WorkspaceID: ws, AssignmentID: assignmentID, ObservationID: &obsID, Relation: relation,
+	}).Error
+}
+
+// LinkRelationshipCollectorEvidence records an iga_observations row as the
+// evidence for a relationship. observation_id stays NULL.
+func (r *igaGraphRepository) LinkRelationshipCollectorEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error {
+	return tx.Omit("ObservationID").Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "workspace_id"}, {Name: "relationship_id"}, {Name: "iga_observation_id"}, {Name: "relation"},
+		},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "iga_observation_id IS NOT NULL"}}},
+		DoNothing:   true,
+	}).Create(&models.IGARelationshipEvidence{
+		WorkspaceID: ws, RelationshipID: relID, IGAObservationID: &obsID, Relation: relation,
 	}).Error
 }
 
@@ -684,7 +776,28 @@ func (r *igaGraphRepository) InsertPublication(tx *gorm.DB, p *models.IGAPublica
 	if len(p.Manifest) == 0 {
 		p.Manifest = json.RawMessage(`{}`)
 	}
-	return tx.Create(p).Error
+	cloud := p.ScanRunID != uuid.Nil
+	collector := p.IGAScanRunID != nil
+	if cloud == collector {
+		return fmt.Errorf("publication must name exactly one run arm")
+	}
+	if collector {
+		return tx.Omit("ScanRunID").Create(p).Error
+	}
+	return tx.Omit("IGAScanRunID", "SourceManifestV2").Create(p).Error
+}
+
+// PublicationForIGARun is PublicationForRun for the collector arm.
+func (r *igaGraphRepository) PublicationForIGARun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error) {
+	var out models.IGAPublication
+	err := tx.Where("workspace_id = ? AND iga_scan_run_id = ?", ws, runID).First(&out).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // InsertLifecycleEvents appends the pass's events. Their FK to the

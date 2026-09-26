@@ -487,4 +487,58 @@ var bfkCases = []bfkCase{
 	{fk: "ad_inventory_runs_scan_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
 		return w.A.adInventoryRun("scan_run_id", p.id("iscan"))
 	}},
+
+	// ---------------- 040: typed collector provenance ------------------------
+	{fk: "iga_object_support_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "integration_id", p.id("integ"),
+			"confirming_iga_scan_run_id", w.A.id("iscan"))
+	}},
+	{fk: "iga_object_support_confirming_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "integration_id", w.A.id("integ"),
+			"confirming_iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_relationship_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.relationship("integration_id", p.id("integ"))
+	}},
+	{fk: "iga_relationship_confirming_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.relationship("integration_id", w.A.id("integ"), "confirming_iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_access_edges_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("integration_id", p.id("integ"))
+	}},
+	{fk: "iga_access_edges_confirming_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("integration_id", w.A.id("integ"), "confirming_iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_policy_assignment_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.assignment("integration_id", p.id("integ"))
+	}},
+	{fk: "iga_policy_assignment_confirming_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.assignment("integration_id", w.A.id("integ"), "confirming_iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_access_edge_evidence_iga_observation_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.edgeEvidence("observation_id", nil, "iga_observation_id", p.id("iobs"))
+	}},
+	{fk: "iga_relationship_evidence_iga_observation_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.relationshipEvidence("observation_id", nil, "iga_observation_id", p.id("iobs"))
+	}},
+	{fk: "iga_assignment_evidence_iga_observation_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.assignmentEvidence("observation_id", nil, "iga_observation_id", p.id("iobs"))
+	}},
+	{fk: "iga_projection_job_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.projectionJob("scan_run_id", nil, "connector_id", nil, "iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_projection_state_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.projectionState("connector_id", nil, "last_run_id", nil,
+			"integration_id", p.id("integ"), "last_iga_scan_run_id", w.A.id("iscan"))
+	}},
+	{fk: "iga_projection_state_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.projectionState("connector_id", nil, "last_run_id", nil,
+			"integration_id", w.A.id("integ"), "last_iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_publication_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.publication("scan_run_id", nil, "iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "iga_pipeline_lease_iga_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.pipelineLease("state", "projecting", "holder", "job:bfk", "iga_scan_run_id", p.id("iscan"))
+	}},
 }

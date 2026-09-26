@@ -248,12 +248,32 @@ func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal
 		}
 	}
 	batchRow := uuid.New()
-	if err := tx.Exec(`INSERT INTO collector_batches
+	hasSnap, snapErr := repositories.HasColumn(tx, "collector_batches", "snapshot_id")
+	if snapErr != nil {
+		s.note(snapErr)
+		return nil, ErrSyncUnavailable
+	}
+	var snapID *uuid.UUID
+	if hasSnap && req.Snapshot != nil {
+		id, err := uuid.Parse(req.Snapshot.SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+		snapID = &id
+	}
+	insertBatch := `INSERT INTO collector_batches
 		(id, workspace_id, collector_id, epoch, sequence, batch_id, payload_hash, receipt_id,
 		 receipt_state, projection_state, iga_scan_run_id, graph_revision, received_at, receipt_body)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb))`,
-		batchRow, p.WorkspaceID, p.CollectorID, epoch, req.Sequence, batchID, hash, receiptID,
-		runID, rev, now, string(respBody)).Error; err != nil {
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb))`
+	args := []any{batchRow, p.WorkspaceID, p.CollectorID, epoch, req.Sequence, batchID, hash, receiptID, runID, rev, now, string(respBody)}
+	if hasSnap {
+		insertBatch = `INSERT INTO collector_batches
+		(id, workspace_id, collector_id, epoch, sequence, batch_id, payload_hash, receipt_id,
+		 receipt_state, projection_state, iga_scan_run_id, graph_revision, received_at, receipt_body, snapshot_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'queued', ?, ?, ?, CAST(? AS jsonb), ?)`
+		args = append(args, snapID)
+	}
+	if err := tx.Exec(insertBatch, args...).Error; err != nil {
 		s.note(err)
 		return nil, classifyPersist(err)
 	}
@@ -623,6 +643,13 @@ func (s *CollectorSyncService) note(err error) { s.LastPersistErr = err }
 
 // Receipt returns the current receipt for this collector. Another collector's
 // receipt is not found.
+//
+// A batch the generation fence rejected keeps receipt_state=accepted and
+// projection_state=queued. Migration 038's collector_batches_projection_state_chk
+// allows only queued and published, so the row cannot store 'superseded'.
+// superseded_at is set and the outbox is done with last_error superseded.
+// GET /receipts reports state and projection_state "superseded" so the
+// collector stops waiting. That value is not written back to those columns.
 func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUID) ([]byte, error) {
 	if p == nil || !containsString(p.Scopes, models.CollectorScopeReceiptWrite) {
 		return nil, ErrSyncForbidden
@@ -632,12 +659,22 @@ func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUI
 		ProjectionState string
 		GraphRevision   int64
 		JobState        string
+		Superseded      bool
 	}
-	err := s.db.Raw(`SELECT b.receipt_state, b.projection_state, b.graph_revision, COALESCE(o.state, '')
+	supersededSQL := "false"
+	if has, err := repositories.HasColumn(s.db, "collector_batches", "superseded_at"); err != nil {
+		return nil, err
+	} else if has {
+		supersededSQL = "b.superseded_at IS NOT NULL"
+	}
+	err := s.db.Raw(`SELECT b.receipt_state, b.projection_state, b.graph_revision, COALESCE(o.state, ''),
+		`+supersededSQL+`
 		FROM collector_batches b
-		LEFT JOIN collector_outbox o ON o.workspace_id = b.workspace_id AND o.batch_row_id = b.id
+		LEFT JOIN collector_outbox o
+		  ON o.workspace_id = b.workspace_id AND o.batch_row_id = b.id AND o.job_kind = 'collector_project'
 		WHERE b.workspace_id = ? AND b.collector_id = ? AND b.receipt_id = ?`,
-		p.WorkspaceID, p.CollectorID, id).Row().Scan(&row.ReceiptState, &row.ProjectionState, &row.GraphRevision, &row.JobState)
+		p.WorkspaceID, p.CollectorID, id).Row().Scan(
+		&row.ReceiptState, &row.ProjectionState, &row.GraphRevision, &row.JobState, &row.Superseded)
 	if err != nil {
 		return nil, ErrSyncNotFound
 	}
@@ -650,8 +687,13 @@ func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUI
 	case "failed", "dead":
 		state = "failed"
 	}
+	projection := row.ProjectionState
+	if row.Superseded {
+		state = "superseded"
+		projection = "superseded"
+	}
 	view := collectorcontract.ReceiptView{
-		ReceiptID: id.String(), State: state, ProjectionState: row.ProjectionState,
+		ReceiptID: id.String(), State: state, ProjectionState: projection,
 		PublishedGraphRevision: row.GraphRevision, Mappings: []collectorcontract.Mapping{},
 	}
 	return json.Marshal(view)
@@ -707,14 +749,16 @@ func (s *CollectorSyncService) RunWorkerOnce(owner string) error {
 			state = 'leased', lease_owner = ?, leased_until = ?, attempt_count = attempt_count + 1, updated_at = ?
 			WHERE id = (
 				SELECT id FROM collector_outbox
-				WHERE (state = 'ready' AND available_at <= ?)
-				   OR (state = 'leased' AND leased_until IS NOT NULL AND leased_until < ?)
-				ORDER BY available_at
-				FOR UPDATE SKIP LOCKED
-				LIMIT 1
-			)
-			RETURNING id::text, batch_row_id::text`,
-			owner, now.Add(time.Minute), now, now, now).Row().Scan(&jobText, &batchText)
+			WHERE job_kind <> 'candidate_eval'
+			  AND NOT (job_kind = 'collector_project' AND ?::bool)
+			  AND ((state = 'ready' AND available_at <= ?)
+			    OR (state = 'leased' AND leased_until IS NOT NULL AND leased_until < ?))
+			ORDER BY available_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id::text, batch_row_id::text`,
+			owner, now.Add(time.Minute), now, V2ProjectionEnabled(), now, now).Row().Scan(&jobText, &batchText)
 		if err != nil {
 			return err
 		}

@@ -42,6 +42,19 @@ type ProjectionService struct {
 	// LIVE pass of this service, so what stands between a superseded pass
 	// and the graph is exactly this service's own fencer.
 	beforeGraphTx func(job models.IGAProjectionJob)
+
+	// v2 scheduling. Zero values keep the cloud worker on its existing path.
+	v2Turn    int
+	v2Checked bool
+	v2OK      bool
+	cloudHold time.Duration
+	collector CollectorGraphWriter
+	// beforeCollectorTx runs after the collector barrier is acquired and
+	// before the publication transaction. Tests only.
+	beforeCollectorTx func()
+	// stopAfterBarrier returns after the barrier is acquired, without
+	// publishing. Tests use it to simulate a dead worker.
+	stopAfterBarrier bool
 }
 
 func NewProjectionService(
@@ -167,15 +180,22 @@ func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) e
 	}
 	for i := range stalled {
 		lease := stalled[i]
-		if lease.ScanRunID == nil {
+		if lease.ScanRunID == nil && lease.IGAScanRunID == nil {
 			continue // idle rows carry no run; ExpiredCandidates excludes them
 		}
 		fence := repositories.PipelineFence{
 			WorkspaceID: lease.WorkspaceID,
 			Phase:       lease.State,
-			RunID:       *lease.ScanRunID,
 			Version:     lease.Version,
 			Holder:      lease.Holder,
+		}
+		if lease.IGAScanRunID != nil && lease.ScanRunID == nil {
+			fence.RunKind = models.RunKindCollector
+			fence.RunID = *lease.IGAScanRunID
+		} else if lease.ScanRunID != nil {
+			fence.RunID = *lease.ScanRunID
+		} else {
+			continue
 		}
 		// Decide AND act in one transaction, with the run or job row locked
 		// (FOR UPDATE), so a worker that claims or heartbeats the job while
@@ -192,7 +212,13 @@ func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) e
 			case recoveryRelease:
 				return s.pipeline.ReleaseTx(tx, fence)
 			case recoveryAbandon:
-				return s.pipeline.AbandonTx(tx, fence, reason)
+				if err := s.pipeline.AbandonTx(tx, fence, reason); err != nil {
+					return err
+				}
+				if fence.RunKind == models.RunKindCollector {
+					return failCollectorProjectOutbox(tx, fence.WorkspaceID, fence.RunID, reason)
+				}
+				return nil
 			}
 			return nil
 		})
@@ -246,7 +272,16 @@ func (s *ProjectionService) recoveryFor(
 
 	case models.PipelineProjecting:
 		var job models.IGAProjectionJob
-		if err := locked.First(&job, "scan_run_id = ?", *lease.ScanRunID).Error; err != nil {
+		q := locked
+		switch {
+		case lease.IGAScanRunID != nil && lease.ScanRunID == nil:
+			q = q.Where("iga_scan_run_id = ?", *lease.IGAScanRunID)
+		case lease.ScanRunID != nil:
+			q = q.Where("scan_run_id = ?", *lease.ScanRunID)
+		default:
+			return "projecting barrier with no run", recoveryAbandon, nil
+		}
+		if err := q.First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return "projecting barrier with no projection job", recoveryAbandon, nil
 			}
@@ -279,11 +314,80 @@ func (s *ProjectionService) recoveryFor(
 	return "", recoveryLeave, nil
 }
 
+// WithCloudHold sleeps after a cloud claim when IGA_V2_PROJECTION is on.
+// Tests use it to prove the scheduler gives the collector arm a turn before a
+// queue of slow cloud jobs drains. Production leaves it zero.
+func (s *ProjectionService) WithCloudHold(d time.Duration) *ProjectionService {
+	s.cloudHold = d
+	return s
+}
+
+// WithCollectorWriter installs the normalizer the collector arm runs. The
+// default is SupportWriter, which writes support against canonical rows that
+// already exist. Tests install FixtureWriter, which also creates nodes.
+func (s *ProjectionService) WithCollectorWriter(w CollectorGraphWriter) *ProjectionService {
+	s.collector = w
+	return s
+}
+
+// WithBeforeCollectorTx runs fn after the collector barrier is acquired and
+// before its publication transaction. Tests only.
+func (s *ProjectionService) WithBeforeCollectorTx(fn func()) *ProjectionService {
+	s.beforeCollectorTx = fn
+	return s
+}
+
+// WithStopAfterBarrier makes the next collector pass return after the barrier
+// is acquired. Tests only: it is a dead worker that still holds the job.
+func (s *ProjectionService) WithStopAfterBarrier() *ProjectionService {
+	s.stopAfterBarrier = true
+	return s
+}
+
 // RunOnce claims at most one job and projects it. Returns whether it worked.
+//
+// With IGA_V2_PROJECTION on, turns alternate between the collector arm and the
+// cloud arm. A turn whose arm has nothing falls through to the other, so an
+// idle arm never skips a job that is waiting. Flag off claims cloud jobs only.
 func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
+	if V2ProjectionEnabled() && s.v2SchemaReady() {
+		s.v2Turn++
+		if s.v2Turn%2 == 0 {
+			worked, err := s.projectCollectorOnce(ctx)
+			if worked || err != nil {
+				return worked, err
+			}
+		}
+	}
+	worked, err := s.runCloudOnce(ctx)
+	if V2ProjectionEnabled() && s.v2SchemaReady() && !worked && err == nil {
+		return s.projectCollectorOnce(ctx)
+	}
+	return worked, err
+}
+
+func (s *ProjectionService) v2SchemaReady() bool {
+	if s.v2Checked {
+		return s.v2OK
+	}
+	s.v2Checked = true
+	if err := VerifyV2ProjectionSchema(s.db); err != nil {
+		log.Printf("[projection] %s", err.Error())
+		s.v2OK = false
+		return false
+	}
+	s.v2OK = true
+	return true
+}
+
+// runCloudOnce is the cloud claim path. Collector jobs are not visible to it.
+func (s *ProjectionService) runCloudOnce(ctx context.Context) (bool, error) {
 	job, err := s.jobs.Claim(s.owner, s.lease, s.now())
 	if err != nil || job == nil {
 		return false, err
+	}
+	if s.cloudHold > 0 && V2ProjectionEnabled() {
+		time.Sleep(s.cloudHold)
 	}
 	// The barrier must be PROJECTING this run and held by THIS JOB (§2.10A).
 	// The job lease is the fence between workers; the barrier names the job,
