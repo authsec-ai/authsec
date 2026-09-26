@@ -55,11 +55,15 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 		// A placeholder stands in for 041 so this order does not run the real
-		// runtime migration. 042 is the real A5 migration.
+		// runtime migration. 042 is the real A5 migration. 043 references
+		// iga_runtime_instances, which only the real 041 creates, so this
+		// pre-041 shape does not apply 043.
 		db := openFreshDB(t, dsn, "a9_mid_041")
 		applyMasterWhere(t, db, func(base string) bool { return base < "041" })
 		applyFile(t, db, p041)
-		applyMasterWhere(t, db, func(base string) bool { return base >= "042" })
+		applyMasterWhere(t, db, func(base string) bool {
+			return base >= "042" && !strings.HasPrefix(base, "043_")
+		})
 		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'discovered_agent_workloads'`); n != 1 {
 			t.Fatal("real 042 did not apply after placeholder 041")
 		}

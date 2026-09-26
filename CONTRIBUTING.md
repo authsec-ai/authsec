@@ -4,7 +4,7 @@ Thank you for your interest in contributing to AuthSec! This guide explains how 
 
 ## Development Setup
 
-1. **Prerequisites**: Go 1.25+, PostgreSQL 15+
+1. **Prerequisites**: Go 1.26+, PostgreSQL 15+
 2. Clone the repository:
    ```bash
    git clone https://github.com/authsec-ai/authsec.git

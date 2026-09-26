@@ -44,6 +44,11 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The golang image sets GOTOOLCHAIN=local. A go.mod bump that leaves
+      # the Dockerfile behind fails this step instead of shipping a broken image.
+      - name: Docker builder toolchain
+        run: docker buildx build --platform linux/amd64 --target builder -t authsec-builder:ci .
+
       - name: Test
         run: go test ./...
 
