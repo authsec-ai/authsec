@@ -495,6 +495,25 @@ const (
 	ProviderAD         = "ad"
 )
 
+// Account kinds the provider/kind check accepts. AWS and GitHub kinds are
+// not closed by that check.
+const (
+	AccountKindLocalUser       = "local_user"
+	AccountKindLocalGroup      = "local_group"
+	AccountKindK8sSA           = "k8s_service_account"
+	AccountKindK8sGroup        = "k8s_group"
+	AccountKindADUser          = "ad_user"
+	AccountKindADGroup         = "ad_group"
+	AccountKindADComputer      = "ad_computer"
+	AccountKindADManagedSA     = "ad_managed_service_account"
+	AccountStateEnabled        = "enabled"
+	AccountStateDisabled       = "disabled"
+	AccountStateUnknown        = "unknown"
+	ReferenceStatusReferenced  = "referenced"
+	ReferenceStatusObserved    = "observed"
+	ReferenceStatusInventoried = "inventoried"
+)
+
 // ValidIntegrationProviders is the iga_integrations.provider vocabulary.
 // github is the original value. linux, kubernetes and ad are additive (TRD 2).
 // ProviderAWS is a canonical-graph provider, not an integration provider, and
@@ -526,6 +545,8 @@ type IGAIdentityAccount struct {
 	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
 	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
 	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+	// AccountState is enabled, disabled or unknown. It is not lifecycle.
+	AccountState string `json:"account_state" gorm:"not null;default:'enabled'"`
 
 	// ProviderAttrs is display-only provider fact -- tags, path, boundary ARN
 	// -- so the read APIs never read cloud_*. Never identity, never a filter.
@@ -597,8 +618,11 @@ type IGAResource struct {
 
 	// ProviderAttrs: account and region ONLY when the ARN carries them, and
 	// account_connected. An S3 reference states neither and is never assigned
-	// the scanning account (§1.4).
-	ProviderAttrs json.RawMessage `json:"provider_attrs" gorm:"type:jsonb;not null;default:'{}'"`
+	// the scanning account (§1.4). Display only. Not an authorization filter.
+	ProviderAttrs   json.RawMessage `json:"provider_attrs" gorm:"type:jsonb;not null;default:'{}'"`
+	ReferenceStatus string          `json:"reference_status" gorm:"not null;default:'referenced'"`
+	NativeKind      string          `json:"native_kind" gorm:"not null;default:''"`
+	KindMetadata    json.RawMessage `json:"kind_metadata" gorm:"type:jsonb;not null;default:'{}'"`
 
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`

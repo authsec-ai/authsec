@@ -661,12 +661,14 @@ func TestTRD2ITT06MixedSources(t *testing.T) {
 	}
 }
 
-// TestTRD2ITFlagOffGoldenAndMigration applies 001–039 and 001–040, projects the
-// same AWS estate with the flag off, and requires the publication, edge,
-// support and evidence business columns to match. It then loads AD and GitHub
-// rows (GitHub connector_id null), applies 040 and the validate script, and
-// requires those rows and the mode check to be unchanged. Re-applying 040 is
-// a no-op. A collector batch on the 040 database stays queued.
+// TestTRD2ITFlagOffGoldenAndMigration seeds the same AWS estate on a database
+// that stops at 039 and on one that has every master migration. The 039
+// database receives 040 and later before the projector runs, because the
+// models write 041's columns. Publication, edge, support and evidence
+// business columns match, and the new columns hold their defaults. AD and
+// GitHub rows seeded before 040 are unchanged. Re-applying 040 is a no-op.
+// A collector batch on the fully migrated database stays queued while the
+// flag is off.
 func TestTRD2ITFlagOffGoldenAndMigration(t *testing.T) {
 	dsn := os.Getenv("IGA_TEST_DSN")
 	if dsn == "" {
@@ -678,6 +680,25 @@ func TestTRD2ITFlagOffGoldenAndMigration(t *testing.T) {
 	applyMaster(t, db039, true)
 	g039 := openGorm(t, db039)
 	ws, conn, runID := seedGoldenEstate(t, db039)
+	modeBefore := constraintDef(t, db039, "iga_observations_mode_chk")
+	scanModeBefore := constraintDef(t, db039, "iga_scan_runs_mode_chk")
+	grandfather := grandfatherDigest(t, db039, ws)
+	applyMasterWhere(t, db039, func(base string) bool {
+		ver := base
+		if i := strings.IndexByte(base, '_'); i > 0 {
+			ver = base[:i]
+		}
+		return ver >= "040"
+	})
+	if grandfatherDigest(t, db039, ws) != grandfather {
+		t.Fatal("applying 040 and later changed AD or GitHub grandfather rows")
+	}
+	if constraintDef(t, db039, "iga_observations_mode_chk") != modeBefore {
+		t.Fatal("040 changed iga_observations_mode_chk")
+	}
+	if constraintDef(t, db039, "iga_scan_runs_mode_chk") != scanModeBefore {
+		t.Fatal("040 changed iga_scan_runs_mode_chk")
+	}
 	projectEstate(t, g039, runID)
 	golden := businessDigest(t, db039, ws)
 	if !strings.Contains(golden, "pub|") || !strings.Contains(golden, "sup|") {
@@ -686,9 +707,7 @@ func TestTRD2ITFlagOffGoldenAndMigration(t *testing.T) {
 	if !strings.Contains(golden, "aee|") && !strings.Contains(golden, "ree|") {
 		t.Fatalf("039 projection wrote no evidence rows:\n%s", golden)
 	}
-	modeBefore := constraintDef(t, db039, "iga_observations_mode_chk")
-	scanModeBefore := constraintDef(t, db039, "iga_scan_runs_mode_chk")
-	grandfather := grandfatherDigest(t, db039, ws)
+	assertAWS041Defaults(t, db039, ws)
 
 	db040 := openFreshDB(t, dsn, "authsec_it_golden040")
 	applyMaster(t, db040, false)
@@ -700,8 +719,9 @@ func TestTRD2ITFlagOffGoldenAndMigration(t *testing.T) {
 	projectEstate(t, g040, runID)
 	got := businessDigest(t, db040, ws)
 	if got != golden {
-		t.Fatalf("flag-off 040 business columns differ from 039\n--- 039\n%s\n--- 040\n%s", golden, got)
+		t.Fatalf("flag-off full schema business columns differ from the 039-then-later projection\n--- early\n%s\n--- full\n%s", golden, got)
 	}
+	assertAWS041Defaults(t, db040, ws)
 	if n := scalarDB(t, db040, `SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND integration_id IS NOT NULL`, ws); n != 0 {
 		t.Fatalf("cloud support rows set integration_id: %d", n)
 	}
@@ -1086,6 +1106,23 @@ func projectEstate(t *testing.T, g *gorm.DB, run uuid.UUID) {
 	}
 }
 
+func assertAWS041Defaults(t *testing.T, db *sql.DB, ws uuid.UUID) {
+	t.Helper()
+	if n := scalarDB(t, db, `SELECT count(*) FROM iga_identity_accounts
+		WHERE workspace_id = $1 AND provider = 'aws' AND account_state IS DISTINCT FROM 'enabled'`, ws); n != 0 {
+		t.Fatalf("aws account_state is not the default: %d", n)
+	}
+	if n := scalarDB(t, db, `SELECT count(*) FROM iga_resources
+		WHERE workspace_id = $1 AND provider = 'aws'
+		  AND (reference_status IS DISTINCT FROM 'referenced' OR native_kind IS DISTINCT FROM '')`, ws); n != 0 {
+		t.Fatalf("aws resource 041 columns are not the defaults: %d", n)
+	}
+	if n := scalarDB(t, db, `SELECT count(*) FROM iga_policy
+		WHERE workspace_id = $1 AND provider = 'aws' AND rights_schema IS DISTINCT FROM ''`, ws); n != 0 {
+		t.Fatalf("aws rights_schema is not the default: %d", n)
+	}
+}
+
 func businessDigest(t *testing.T, db *sql.DB, ws uuid.UUID) string {
 	t.Helper()
 	const q = `
@@ -1201,9 +1238,8 @@ func swapDB(dsn, name string) string {
 }
 
 // applyMaster applies migrations/master. through039 stops before 040, which is
-// the pre-M2 half of the golden pair. Otherwise it stops at 040: later files
-// (042 and anything after it) are applied by the test that owns them, so this
-// golden stays a 039-versus-040 comparison.
+// the pre-M2 half of the golden pair. Otherwise every master file is applied,
+// including 041 and later, so the projector runs on the current schema.
 func applyMaster(t *testing.T, db *sql.DB, through039 bool) {
 	t.Helper()
 	dir, err := filepath.Abs(filepath.Join("..", "..", "migrations", "master"))
@@ -1222,9 +1258,6 @@ func applyMaster(t *testing.T, db *sql.DB, through039 bool) {
 			ver = base[:i]
 		}
 		if through039 && ver >= "040" {
-			continue
-		}
-		if !through039 && ver > "040" {
 			continue
 		}
 		applyFile(t, db, f)

@@ -383,3 +383,231 @@ func ADIdentityKey(forestID, canonicalGUID string) (string, error) {
 	}
 	return Key("ad", EscapeSegment(forestID), EscapeSegment(canonicalGUID)), nil
 }
+
+// UnescapeSegment reverses EscapeSegment. A truncated or non-hex escape is an error.
+func UnescapeSegment(s string) (string, error) {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' {
+			b.WriteByte(s[i])
+			continue
+		}
+		if i+2 >= len(s) {
+			return "", fmt.Errorf("truncated escape in %q", s)
+		}
+		hi, ok1 := unhex(s[i+1])
+		lo, ok2 := unhex(s[i+2])
+		if !ok1 || !ok2 {
+			return "", fmt.Errorf("bad escape in %q", s)
+		}
+		b.WriteByte(hi<<4 | lo)
+		i += 2
+	}
+	return b.String(), nil
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func segment(name, value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s is required", name)
+	}
+	return EscapeSegment(value), nil
+}
+
+func parts(pairs ...[2]string) ([]string, error) {
+	out := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		s, err := segment(p[0], p[1])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// HostKey is the local host. The server estate bound at enrollment is the
+// key. machine-id is not a component: a clone keeps its machine-id and must
+// not become the same host.
+func HostKey(estateID string) (string, error) {
+	p, err := parts([2]string{"estate", estateID})
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"host"}, p...)...), nil
+}
+
+// SystemdWorkloadKey is the durable unit. An invocation id is a run, not this key.
+func SystemdWorkloadKey(estateID, unit string) (string, error) {
+	p, err := parts([2]string{"estate", estateID}, [2]string{"unit", unit})
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"systemd"}, p...)...), nil
+}
+
+// UnmanagedProcessGroupKey is one boot's process lineage. The executable path
+// is not a component.
+func UnmanagedProcessGroupKey(estateID, bootID, rootPID, startTicks string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"boot", bootID},
+		[2]string{"root pid", rootPID},
+		[2]string{"start ticks", startTicks},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"process-group"}, p...)...), nil
+}
+
+// ProcessRuntimeKey includes start ticks so a reused PID is a different runtime.
+func ProcessRuntimeKey(estateID, bootID, pidNS, pid, startTicks string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"boot", bootID},
+		[2]string{"pid namespace", pidNS},
+		[2]string{"pid", pid},
+		[2]string{"start ticks", startTicks},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"process"}, p...)...), nil
+}
+
+// LocalIdentityKey is estate + user namespace + UID. The account name is not
+// a component, so a rename keeps the identity. UID 1000 on two estates is
+// two identities.
+func LocalIdentityKey(estateID, userNS, uid string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"user namespace", userNS},
+		[2]string{"uid", uid},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"uid"}, p...)...), nil
+}
+
+// KubernetesWorkloadKey does not include the object UID. The UID is the
+// incarnation, recorded separately. slot distinguishes containers of one object.
+func KubernetesWorkloadKey(estateID, group, kind, namespace, name, slot string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"group", group},
+		[2]string{"kind", kind},
+		[2]string{"namespace", namespace},
+		[2]string{"name", name},
+		[2]string{"slot", slot},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("kubernetes", append([]string{"workload"}, p...)...), nil
+}
+
+// KubernetesRuntimeKey is one container execution. A new restart or runtime
+// id is a new row.
+func KubernetesRuntimeKey(estateID, podUID, container, restart, runtimeID string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"pod uid", podUID},
+		[2]string{"container", container},
+		[2]string{"restart", restart},
+		[2]string{"runtime id", runtimeID},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("kubernetes", append([]string{"runtime"}, p...)...), nil
+}
+
+// KubernetesServiceAccountKey is namespace + name. The ServiceAccount UID is
+// the incarnation, not the recognition key.
+func KubernetesServiceAccountKey(estateID, namespace, name string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"namespace", namespace},
+		[2]string{"name", name},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("kubernetes", append([]string{"sa"}, p...)...), nil
+}
+
+// FileResourceKey escapes the path so a slash or a unit separator cannot
+// change how many segments the key has.
+func FileResourceKey(estateID, mntNS, path string) (string, error) {
+	p, err := parts(
+		[2]string{"estate", estateID},
+		[2]string{"mount namespace", mntNS},
+		[2]string{"path", path},
+	)
+	if err != nil {
+		return "", err
+	}
+	return Key("linux", append([]string{"file"}, p...)...), nil
+}
+
+// NetworkEndpointKey is the network endpoint. It is not EndpointKey, which
+// names an AWS identity inside an edge. A private address includes the estate
+// so two hosts do not share it. A public address does not.
+func NetworkEndpointKey(family, address, port, protocol, estate string, private bool) (string, error) {
+	if private && strings.TrimSpace(estate) == "" {
+		return "", fmt.Errorf("a private endpoint requires an estate")
+	}
+	p, err := parts(
+		[2]string{"family", family},
+		[2]string{"address", address},
+		[2]string{"port", port},
+		[2]string{"protocol", protocol},
+	)
+	if err != nil {
+		return "", err
+	}
+	if private {
+		est, err := segment("estate", estate)
+		if err != nil {
+			return "", err
+		}
+		p = append(p, est)
+	}
+	return Key("network", p...), nil
+}
+
+// SecretRefKey names a secret reference. There is no value parameter: a
+// secret value must not enter a key.
+func SecretRefKey(provider, estateOrIssuer, namespace, name, key string) (string, error) {
+	p, err := parts(
+		[2]string{"provider", provider},
+		[2]string{"estate or issuer", estateOrIssuer},
+		[2]string{"namespace", namespace},
+		[2]string{"name", name},
+	)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(key) != "" {
+		k, err := segment("key", key)
+		if err != nil {
+			return "", err
+		}
+		p = append(p, k)
+	}
+	return Key("secret", p...), nil
+}
