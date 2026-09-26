@@ -256,7 +256,9 @@ const IdentityARNSQL = `split_part(ia.source_key, chr(31), 2)`
 const IdentityAccountSQL = `(CASE WHEN ` + IdentityARNSQL + ` LIKE 'arn:%' THEN split_part(` + IdentityARNSQL + `, ':', 5) ELSE '' END)`
 
 // IdentityKindRankSQL orders identity kinds by rank (D-13): iam_role <
-// iam_user < iam_group.
+// iam_user < iam_group. It is the default (non-v2) order. v2 uses
+// identityKindRankV2SQL so the newer account kinds rank after these three
+// instead of tying with iam_group.
 const IdentityKindRankSQL = `(CASE ia.account_kind WHEN 'iam_role' THEN 0 WHEN 'iam_user' THEN 1 ELSE 2 END)`
 
 // IdentityColumns / IdentityFrom read an identity row into IdentityRecord. The
@@ -307,6 +309,10 @@ type IdentityRow struct {
 	State           string         `json:"state"`
 	StaleReason     *[]StaleReason `json:"stale_reason,omitempty"`
 	LastConfirmedAt any            `json:"last_confirmed_at"`
+	// AccountState is enabled, disabled or unknown. It is set only when the
+	// request opted into graph=v2; the default row omits it. It is not
+	// lifecycle, state or stale_reason.
+	AccountState *string `json:"account_state,omitempty"`
 }
 
 // Row renders the record; usedBy is its used_by_count (Unknown() when the
@@ -366,6 +372,39 @@ func UsedByCounts(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]Exa
 		out[r.ID] = CappedCount(r.N)
 	}
 	return out, nil
+}
+
+// identityAccountStates reads iga_identity_accounts.account_state for the
+// page just loaded. It is a second statement, used only when graph=v2, so
+// the default identity SELECT (IdentityColumns) stays unchanged.
+func identityAccountStates(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ID    uuid.UUID
+		State string `gorm:"column:account_state"`
+	}
+	if err := tx.Raw(`SELECT id, account_state FROM iga_identity_accounts
+	                   WHERE workspace_id = ? AND id IN ?`, ws, ids).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.ID] = r.State
+	}
+	return out, nil
+}
+
+// iamIdentityKind is an AWS IAM account kind. Other kinds have no IAM-shaped
+// detail sections.
+func iamIdentityKind(kind string) bool {
+	switch kind {
+	case models.CloudIdentityIAMRole, models.CloudIdentityIAMUser, models.CloudIdentityIAMGroup:
+		return true
+	default:
+		return false
+	}
 }
 
 /* -------------------------------- resources -------------------------------- */

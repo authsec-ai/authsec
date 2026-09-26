@@ -50,6 +50,9 @@ type IdentityPermissionsView struct {
 	Inherited []InheritedPolicies `json:"inherited"`
 	Activity  IdentityActivity    `json:"activity"`
 	Truncated bool                `json:"truncated"`
+	// Limitations is set for a non-IAM identity under graph=v2. IAM responses
+	// leave it unset.
+	Limitations []string `json:"limitations,omitempty"`
 }
 
 // PermissionPolicy is one policy as it applies through one assignment.
@@ -166,6 +169,24 @@ func (r *Reader) IdentityPermissions(ctx context.Context, ws uuid.UUID, rawID st
 		}
 		if ident == nil {
 			return NotFound()
+		}
+		if q.V2 && !iamIdentityKind(ident.AccountKind) {
+			// IAM permissions, boundaries and Access Advisor do not apply.
+			// An empty section plus not_applicable, with no AWS wording.
+			out = Envelope{
+				Data: &IdentityPermissionsView{
+					Identity:  ident.header(),
+					Policies:  []PermissionPolicy{},
+					Inherited: []InheritedPolicies{},
+					Activity: IdentityActivity{
+						State:  "not_applicable",
+						Reason: strPtr(LimitationNotApplicable),
+					},
+					Limitations: []string{LimitationNotApplicable},
+				},
+				Meta: IdentityTabMeta{DetailMeta: NewDetailMeta(q), Coverage: []CoverageNote{}},
+			}
+			return nil
 		}
 		accts, err := q.LoadAccounts()
 		if err != nil {

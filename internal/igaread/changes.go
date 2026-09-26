@@ -241,7 +241,7 @@ var changesAllowedParams = map[string]bool{"kind": true, "limit": true, "cursor"
 
 func parseChangesParams(vals url.Values) (*changesParams, *Error) {
 	for k := range vals {
-		if !changesAllowedParams[k] {
+		if !changesAllowedParams[k] && !isOptInParam(k) {
 			return nil, InvalidParameter(k, "unknown parameter "+k+": Changes accepts only kind, limit, cursor and rev")
 		}
 	}
@@ -329,6 +329,10 @@ func (r *Reader) Changes(ctx context.Context, ws uuid.UUID, refType, rawID strin
 		return nil, e
 	}
 	p, e := parseChangesParams(vals)
+	if e != nil {
+		return nil, e
+	}
+	ctx, e = bindOptIn(ctx, vals)
 	if e != nil {
 		return nil, e
 	}

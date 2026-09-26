@@ -146,7 +146,7 @@ type listsSpec[S listsScan] struct {
 
 	keys    map[string][]listsKey // by sort key; id is always appended
 	facets  map[string]listsFacet
-	filters func(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScope, bool, *Error)
+	filters func(p *ListParams, ws uuid.UUID, sc GraphScope) ([]listsFilter, listsScope, bool, *Error)
 	render  func(q *Query, accts *Accounts, rows []S) (any, error)
 }
 
@@ -206,7 +206,13 @@ func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals ur
 		return nil, perr
 	}
 	ctx = withGraphScope(ctx, sc)
-	filters, scope, classBound, perr := spec.filters(p, ws)
+	if sc.V2 && spec.route == listsRouteIdentities {
+		// Kind rank and facet labels widen only for this request. The package
+		// spec stays the AWS vocabulary, so a default read still sorts and
+		// labels with IdentityKindRankSQL.
+		spec = withIdentityV2Spec(spec)
+	}
+	filters, scope, classBound, perr := spec.filters(p, ws, sc)
 	if perr != nil {
 		return nil, perr
 	}
@@ -1092,7 +1098,7 @@ var listsWorkloads = listsSpec[listsWorkloadScan]{
 	},
 }
 
-func listsWorkloadFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScope, bool, *Error) {
+func listsWorkloadFilters(p *ListParams, ws uuid.UUID, _ GraphScope) ([]listsFilter, listsScope, bool, *Error) {
 	sc := listsScope{accounts: p.Accounts}
 	classBound := false
 	fs := []listsFilter{listsReadable("w", "workload_id", ws)}
@@ -1227,19 +1233,32 @@ var listsIdentities = listsSpec[listsIdentityScan]{
 		if err != nil {
 			return nil, err
 		}
+		var statesByID map[uuid.UUID]string
+		if q.V2 {
+			statesByID, err = identityAccountStates(q.DB(), q.WS, ids)
+			if err != nil {
+				return nil, err
+			}
+		}
 		out := make([]IdentityRow, 0, len(rows))
 		for _, r := range rows {
 			used := Unknown()
 			if c, has := counts[r.ID]; ok && has {
 				used = c
 			}
-			out = append(out, r.Row(accts, used, StaleReasonOf(r.State, r.ID, reasons)))
+			row := r.Row(accts, used, StaleReasonOf(r.State, r.ID, reasons))
+			if q.V2 {
+				if s, ok := statesByID[r.ID]; ok {
+					row.AccountState = &s
+				}
+			}
+			out = append(out, row)
 		}
 		return out, nil
 	},
 }
 
-func listsIdentityFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScope, bool, *Error) {
+func listsIdentityFilters(p *ListParams, ws uuid.UUID, graph GraphScope) ([]listsFilter, listsScope, bool, *Error) {
 	sc := listsScope{accounts: p.Accounts}
 	// provider = 'aws' and supported: GitHub identities share the table (D-6).
 	fs := []listsFilter{listsReadable("ia", "identity_account_id", ws)}
@@ -1261,7 +1280,12 @@ func listsIdentityFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	}
 	fs = append(fs, integ...)
 
-	kinds, perr := listsEnum(p, "kind", listsIdentityKinds...)
+	var kinds []string
+	if graph.V2 {
+		kinds, perr = listsIdentityKindsV2(p, graph)
+	} else {
+		kinds, perr = listsEnum(p, "kind", listsIdentityKinds...)
+	}
 	if perr != nil {
 		return nil, sc, false, perr
 	}
@@ -1281,6 +1305,153 @@ func listsIdentityFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 		        AND ur.target_identity_account_id = ia.id AND ur.state IN ('current', 'stale'))`, args: []any{UsedByTypes}})
 	}
 	return fs, sc, false, nil
+}
+
+// v2IdentityKindOrder is the identity kind vocabulary under graph=v2, IAM
+// kinds first and then each provider's kinds. Ranks follow this order.
+func v2IdentityKindOrder() []string {
+	return []string{
+		models.CloudIdentityIAMRole,
+		models.CloudIdentityIAMUser,
+		models.CloudIdentityIAMGroup,
+		models.AccountKindLocalUser,
+		models.AccountKindLocalGroup,
+		models.AccountKindK8sSA,
+		models.AccountKindK8sGroup,
+		models.AccountKindADUser,
+		models.AccountKindADGroup,
+		models.AccountKindADComputer,
+		models.AccountKindADManagedSA,
+	}
+}
+
+// identityKindRankV2SQL ranks every v2 kind on its own, after the IAM kinds.
+// IdentityKindRankSQL stays the default: there every non-IAM kind ties at 2.
+var identityKindRankV2SQL = func() string {
+	order := v2IdentityKindOrder()
+	var b strings.Builder
+	b.WriteString("(CASE ia.account_kind")
+	for i, kind := range order {
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", kind, i)
+	}
+	fmt.Fprintf(&b, " ELSE %d END)", len(order))
+	return b.String()
+}()
+
+// identityKindLabelsV2 labels the kind facet under graph=v2. The default
+// facet map on listsIdentities is unchanged.
+var identityKindLabelsV2 = map[string]string{
+	models.CloudIdentityIAMRole:   "IAM role",
+	models.CloudIdentityIAMUser:   "IAM user",
+	models.CloudIdentityIAMGroup:  "IAM group",
+	models.AccountKindLocalUser:   "Local user",
+	models.AccountKindLocalGroup:  "Local group",
+	models.AccountKindK8sSA:       "Kubernetes service account",
+	models.AccountKindK8sGroup:    "Kubernetes group",
+	models.AccountKindADUser:      "AD user",
+	models.AccountKindADGroup:     "AD group",
+	models.AccountKindADComputer:  "AD computer",
+	models.AccountKindADManagedSA: "AD managed service account",
+}
+
+// providerAdmitsKind reports whether provider can own kind. Linux, Kubernetes
+// and AD go through models.CheckProviderKind. AWS is not closed there, so
+// its kinds stay the IAM three.
+func providerAdmitsKind(provider, kind string) bool {
+	switch provider {
+	case models.ProviderAWS:
+		return iamIdentityKind(kind)
+	case models.ProviderLinux, models.ProviderKubernetes, models.ProviderAD:
+		return models.CheckProviderKind(provider, kind) == nil
+	default:
+		return false
+	}
+}
+
+func identityKindsForProviders(providers []string) []string {
+	var out []string
+	for _, kind := range v2IdentityKindOrder() {
+		for _, provider := range providers {
+			if providerAdmitsKind(provider, kind) {
+				out = append(out, kind)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func identityKindKnown(kind string) bool {
+	for _, provider := range graphV2ProviderOrder {
+		if providerAdmitsKind(provider, kind) {
+			return true
+		}
+	}
+	return false
+}
+
+// listsIdentityKindsV2 accepts a kind only when a provider in scope can have
+// it. A kind those providers cannot have is 400, not an empty page.
+func listsIdentityKindsV2(p *ListParams, graph GraphScope) ([]string, *Error) {
+	allowed := identityKindsForProviders(graph.Providers)
+	var out []string
+	for _, v := range p.Raw["kind"] {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if !contains(allowed, v) {
+			return nil, rejectIdentityKind(v, graph.Providers)
+		}
+		if !contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+func rejectIdentityKind(kind string, providers []string) *Error {
+	if len(providers) == 1 {
+		if err := models.CheckProviderKind(providers[0], kind); err != nil {
+			return InvalidParameter("kind", err.Error())
+		}
+	} else {
+		var msgs []string
+		for _, provider := range providers {
+			if err := models.CheckProviderKind(provider, kind); err != nil {
+				msgs = append(msgs, err.Error())
+			}
+		}
+		if len(msgs) == len(providers) && len(msgs) > 0 {
+			return InvalidParameter("kind", strings.Join(msgs, "; "))
+		}
+	}
+	if identityKindKnown(kind) {
+		return InvalidParameter("kind", fmt.Sprintf("kind %s is not valid for provider %s", kind, strings.Join(providers, ", ")))
+	}
+	return InvalidParameter("kind", fmt.Sprintf("kind must be one of %s", strings.Join(identityKindsForProviders(providers), ", ")))
+}
+
+// withIdentityV2Spec copies a list spec and, for the identity list, replaces
+// the kind sort and the kind facet labels. The caller's spec is not mutated.
+func withIdentityV2Spec[S listsScan](spec *listsSpec[S]) *listsSpec[S] {
+	cp := *spec
+	keys := make(map[string][]listsKey, len(spec.keys))
+	for name, key := range spec.keys {
+		keys[name] = key
+	}
+	keys["kind"] = listsJoin(listsOne(listsRank(identityKindRankV2SQL)), listsIdentityName, listsIdentityAccount)
+	cp.keys = keys
+	facets := make(map[string]listsFacet, len(spec.facets))
+	for name, facet := range spec.facets {
+		facets[name] = facet
+	}
+	if kind, ok := facets["kind"]; ok {
+		kind.finalize = listsLabelled(identityKindLabelsV2)
+		facets["kind"] = kind
+	}
+	cp.facets = facets
+	return &cp
 }
 
 /* -------------------------------- resources -------------------------------- */
@@ -1363,7 +1534,7 @@ var listsResources = listsSpec[listsResourceScan]{
 
 var listsServiceRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
-func listsResourceFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScope, bool, *Error) {
+func listsResourceFilters(p *ListParams, ws uuid.UUID, _ GraphScope) ([]listsFilter, listsScope, bool, *Error) {
 	// meta.coverage is NOT narrowed by the account filter here. A coverage
 	// note's account is the SCANNING connector's, but a resource's account is
 	// the one its ARN states (D-3), and any connector's policies may name
