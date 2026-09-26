@@ -469,9 +469,12 @@ Therefore: **observing a new key never implies the old one was replaced.**
 - A new key appears ⇒ insert an `iga_credentials` row, `lifecycle = 'active'`.
   The other key stays `active`. Two active keys is a correct, common state, not
   a conflict to resolve.
-- A key disappears from an authoritative read ⇒ `lifecycle = 'revoked'`, under
-  the same four conditions that let a relationship end (§2.7). Never `rotated`,
-  because we did not observe a replacement.
+- A key disappears from an authoritative read ⇒ `lifecycle = 'revoked'`,
+  `retired_reason = 'not_seen'`, under the same four conditions that let a
+  relationship end (§2.7), where the read is `iam_users` and `iam_access_keys`
+  both `reached` and the key's user confirmed by this run through this
+  connector. A user nobody looked at, or another account's user, keeps its
+  keys. Never `rotated`, because we did not observe a replacement.
 - `rotated` is only written when a human records it, `basis = 'asserted'`.
 
 In every case the identity account keeps its `id`, its `first_seen_at` and every
@@ -602,7 +605,7 @@ cleanup.**
 | Managed policy detached from one of two roles | That role's assignment and its grants `ended`; the policy, its statements and the other role's assignment untouched |
 | Policy re-attached a week later | A **new** assignment and new grants; the ended period stays as it was |
 | Statement with a Sid edited | Same statement id; a new revision; grants unchanged |
-| Statement without a Sid edited | Old statement's support ends and it retires; its grants `ended` (`statement_retired`); a new statement with new grants |
+| Statement without a Sid edited | Old statement's support ends and it retires; its grants `ended` `not_seen` (the grant partition, read in full, closes them before the statement retires); a new statement with new grants |
 | Two policies grant the same action; one detached | One grant `ended`, the other `current`; the path stays |
 | User added to a group | New `member_of`; the group's grants now reach the user by traversal; nothing copied |
 | Second access key added | New credential `active`; the user and every relationship unchanged |
@@ -961,8 +964,9 @@ draws one declared path, and expands only when asked (§2.14.11). A
 force-directed view of 107 identities against 461 permissions is a hairball
 that answers no question; governance work is reading one path, deciding on it,
 and explaining the decision later. The canvas is visually distinct from
-attack-path tools — edges read *configured to run as*, *granted by*, *names*,
-never *can access* — and the path list says the same thing as text.
+attack-path tools — edges read *runs as*, *ECS agent uses*, *may assume*,
+*declares*, never *can access* — and the path list says the same thing as
+text.
 
 #### Sequencing, and the temptations at each step
 
@@ -1028,28 +1032,76 @@ There are also three distinct "agent" concepts in the tree: `discovered_agents`
 (legacy), `iga_agents` (`models/iga.go:421`, canonical), and Bedrock/AgentCore
 rows in `cloud_workload`. The IA exposes all three without distinguishing them.
 
-#### 2.14.2 Where it lives: the IGA sidebar
+#### 2.14.2 Where it lives: navigation, screens and what each one shows
 
-The IGA sidebar today (`IgaSidebar.tsx:48-75`) is **Integrations, Discovered
-Agents, Identities, Cloud Inventory, Detection Rules**, then the governance
-group. GitHub and Kubernetes have no pages of their own; they are rows in
-Integrations and open at `/iga/integrations/:id`. **Every one of these
-destinations is kept.**
+**Navigation is grouped by the customer's task**, and every existing route
+keeps working (bookmarks, redirects and `?connector=` links included):
 
-| Item | Route | Change |
-|---|---|---|
-| Integrations | `/iga/integrations` | Kept. The AWS connector drawer gains scan history and outcome (§2.14.7) |
-| **Agents & workloads** | `/iga/estate` | **New**, second in the list. The entry point of the journey |
-| Discovered Agents | `/iga/agents` | **Kept as it is.** It is the Kubernetes/runtime discovery pipeline (`discovered_agents`). Its rows never appear in the graph, and graph rows never appear in it |
-| **Identities** | `/iga/identities` | The existing route, today a static "not available yet" card (`IdentitiesPage.tsx:16-41`), becomes the graph's identity list |
-| **Resources** | `/iga/resources` | **New**. Resource references and selectors |
-| Cloud Inventory | `/iga/cloud/*` | **Kept** as the raw collection view: every `cloud_*` row, including surfaces the graph does not project (CloudTrail events, workload identities, credential providers). Linked from each account's drawer as *"Raw inventory"* |
-| Detection Rules, governance group | unchanged | Unchanged |
+| Group | Item | Route | What it is for, in its own subtitle |
+|---|---|---|---|
+| **Explore** | Agents & workloads | `/iga/estate` | Find a workload and start an investigation — the projected identity graph |
+| | Identities | `/iga/identities` | Roles, users and groups; what runs as them and what they declare |
+| | Resources | `/iga/resources` | Exact references and selectors that declared access names |
+| **Governance** | Provenance, Access Certification, Separation of Duties, Birthrights & Lifecycle, Enforcement queue | unchanged | Unchanged capabilities. They govern workspace users, service accounts and OAuth clients; nothing in them implies an action on AWS objects from the graph |
+| **Data sources** | Integrations | `/iga/integrations` | Connect, verify, scan and troubleshoot collection |
+| | Agent sightings | `/iga/agents` | Agents found in repositories and clusters that need a decision — claim, provision or quarantine. The existing Discovered Agents workflow, renamed for its purpose; it is not a second copy of Agents & workloads |
+| | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists |
+| | Detection Rules | `/iga/detection-rules` | What a repository scan looks for |
 
-"Estate" is the route segment only; the customer sees *Agents & workloads*,
-and breadcrumbs use it. Identities and Resources are estate-wide lists because
-an investigation often starts from a shared role or a sensitive bucket rather
-than from a workload.
+- **One breadcrumb**, the global one, using the sidebar's own labels, ending
+  in the current object's name on every object and detail page (graph
+  objects, an integration, a campaign). No in-page trail, no Copy link
+  button; the URL is the link.
+- **The collapsed sidebar** keeps a tooltip per icon and the active item's
+  highlight.
+- **Returning from a detail page** restores the list's filters (URL),
+  paging (history state) and scroll position — on every list that opens a
+  detail page, not only the graph inventories.
+- **Account context travels** between related destinations by account id
+  (`?account=`), never by an internal connector id in one place and an
+  account number in another.
+- A filter a screen cannot apply is not offered; a filter it can apply only
+  to a loaded page is labelled as such.
+
+**Screens, their task, and what shows by default.** Each field is placed in
+one of five tiers: **default** (the row or card), **optional column**
+(Columns), **selection summary** (the compact graph card or row details),
+**evidence/details** (drawer, evidence panel, object page), **raw**
+(a collapsed disclosure). Nothing is shown just because the API returns it,
+and nothing useful is removed — it moves tier.
+
+| Surface | Main task | Default | Moved out of the default |
+|---|---|---|---|
+| Integrations | Connect, verify, scan, troubleshoot | Name/provider, scope, health, last scan | Raw `last_error` → details; connector ids → details |
+| Integration detail / AWS drawer | Verify and scan one source | Scope, health, regions, last scan and its outcome | Role and caller ARNs, template version → details |
+| Agents & workloads | Find a workload | Name with runtime and region, account, classification; freshness when room | ARN, region column, instances → Columns / details |
+| Workload Overview | What is it, what does it run as | Runtime and location; classification and who decided; **application identity** and, for ECS, the **task execution role** as supporting infrastructure; next action | ARN, sources, continuity → details |
+| Identities | Find an identity | Name with subtype, account, direct workload bindings | ARN → Columns / details |
+| Identity detail | Who uses it, what it declares | Subtype and account, direct workload bindings, trust, policy summary, freshness | Statement documents → evidence |
+| Resources | Find what policies name | Reference name, exact vs selector, service/type, account when the reference names one | Full reference → Columns / details |
+| Resource detail | What names it | What the reference identifies; observed resource vs exact reference vs selector; who names it | Statements → evidence |
+| Graph canvas / Paths | Follow relationships | Workload → identity → declared resource relationship | Statement nodes (Detailed view), claims (evidence) |
+| Evidence and coverage | Explain one fact or gap | Explanation, then policy/statement, constraints, source and freshness | Raw record (collapsed) |
+| Agent sightings | Decide on a sighting | Sighting, source, decision status, evidence summary | Fingerprint, matched client id, source metadata JSON → details |
+| Cloud Inventory | Inspect collected rows | Name, kind, account, last seen | Native ARN → details |
+| Detection Rules | Tune what a scan looks for | Rules, globs, word lists | Versions → details |
+| Provenance | Why an entitlement exists | Entitlement, subject, origin, flags, expiry | Request id, snapshot JSON → drawer, collapsed |
+| Certification / campaign | Review access, record decisions | Name, status, progress, due / subject, entitlement, decision, reviewer | Item evidence JSON → drawer, collapsed |
+| Separation of Duties | Rules, findings, simulations | Rule, subject, detected; simulation outcome | Explanations → expandable |
+| Birthrights & Lifecycle | Policies and their grants | Policy, applies to, duration; stale grants; orphaned agents | Raw ids → details |
+| Enforcement queue | Did a decision take effect | Target, operation, status, failure summary | Fingerprints → details |
+
+**Every action says what actually happened.** An action shows its
+progress; success only when the effect happened (a copy after the
+clipboard accepted it; a scan as *queued* until the run reports, then its
+outcome); a failure that says why and how to recover, keeping what was
+already loaded on screen. Loading, empty, filtered-empty, forbidden,
+missing object, failed request, incomplete data and a newer publication are
+eight different states — a failed request is never *"Not found"* and never
+an empty table. A governance decision (*Revoke*, *Remediated*) is recorded
+as a decision; whether it was applied is the enforcement queue's to say.
+Destructive actions confirm their scope first; viewing, filtering,
+expanding and moving diagram nodes stay one step.
 
 #### 2.14.3 Classification: what we may call an agent
 
@@ -1214,7 +1266,9 @@ not a workload, so it does not borrow the workload's tabs.
 | External principal | `/iga/external-principals/:id/{overview,referenced-by}` | **Overview · Referenced by** | Which account it belongs to and why it is unresolved · what names it. No Graph tab: there is nothing on the far side we could read |
 
 `/iga/estate/:id` with no tab segment is Overview. The **Evidence panel** is
-not a tab. It is `?evidence=<claim id>` on whichever view opened it.
+not a tab. It is `?evidence=<claim ref>` on whichever view opened it; a grouped
+graph line (§2.14.11) opens `?evidence=<ref>,<ref>` and the panel shows each
+claim separately, one `/evidence` read per claim.
 
 ##### What a URL carries, and what it promises
 
@@ -1233,7 +1287,7 @@ What a link recipient sees when the graph has changed:
 
 | Case | Shown |
 |---|---|
-| The object still exists | The current state, and, **only if** the link carries `from=<published_at>` (the "Copy link" action adds it), a one-line notice: *"Shared 22 Sep 14:02. The graph has been rescanned since, so this shows it as it is now."* |
+| The object still exists | The current state. The shareable link is the browser address — there is no separate Copy link control — and it never promises a revision. A link that carries `from=<published_at>` also gets a one-line notice when the graph has been rescanned since: *"Shared 22 Sep 14:02. The graph has been rescanned since, so this shows it as it is now."* |
 | The object has retired | *"`ticket-tools` is no longer in the latest scan. It was last confirmed 18 Sep."* Overview still renders from the retired row. Other tabs say they have no current data rather than rendering empty |
 | The object never existed in this workspace, or belongs to another | *"Not found in this workspace."* The page must not reveal whether it exists elsewhere |
 | The `evidence` claim has ended | The panel opens on the ended claim with its `valid_to` and `ended_reason` |
@@ -1291,13 +1345,19 @@ the investigation to it:
   (from history state). If the revision moved in between, the list reloads at
   the current revision from page one and says why: *"The list was refreshed
   because a newer scan published."*
-- **Breadcrumbs name the investigation**, not the schema:
-  `Agents & workloads › customer-support-agent › Identities`. Never
-  `iga_agents › iga_relationship`.
+- **One breadcrumb, naming the investigation**, not the schema: the global
+  header's, `IGA › Agents & workloads › ticket-tools`. The object page names
+  itself there; the active tab is not repeated (the tabs say it), and the
+  page body carries no second trail. Never `iga_agents › iga_relationship`.
+- **The object header is compact**: the name, one line of type · account ·
+  region, and a status badge only when one applies (a classification, or
+  *not in the latest scan*). An account reads *"Payments (429418377036)"*
+  only when it has a name of its own; otherwise the id alone.
 - **The originating object persists** across detours. Following
   `SharedToolRole` from `ticket-tools`' Identities tab shows *"← Back to
-  ticket-tools"* on the role's page. It is carried as `via=<id>`, and is
-  dropped when the customer navigates from the sidebar or dismisses it.
+  ticket-tools"* on the role's page. It is carried as `via=<id>`, shown only
+  on such a detour, and dropped when the customer navigates from the sidebar
+  or dismisses it.
 
 ##### Existing routes
 
@@ -1307,7 +1367,8 @@ No existing IGA route is removed or redirected in this milestone.
 |---|---|
 | `/iga/cloud`, `/iga/cloud/{identities,compute,resources}` | **Kept** as Cloud Inventory, the raw collection view. The existing `/iga/cloud/aws/*` redirects stay |
 | `/iga/identities` | The same route; the placeholder card is replaced by the graph identity list |
-| `/iga/agents`, `/iga/integrations`, `/iga/integrations/:id`, `/iga/detection-rules`, governance routes, `/discovery/*` redirects, the Google OAuth callback | Unchanged |
+| `/iga/integrations` | Gains `?connector=<id>`, which opens that AWS account's drawer: the pipeline notice's *View details* and coverage's *Change regions* link there. Closing the drawer drops it |
+| `/iga/agents`, `/iga/integrations/:id`, `/iga/detection-rules`, governance routes, `/discovery/*` redirects, the Google OAuth callback | Unchanged |
 
 **Links between the two views, not redirects.** Cloud Inventory rows gain an
 *"Open in graph"* action where the row has a projected counterpart; graph
@@ -1318,32 +1379,59 @@ id-bearing bookmark exists to break.
 
 #### 2.14.6 Wireframes
 
-**Agents & workloads list.** The entry point. Filters at the top apply everywhere.
-Two rows named `ticket-tools` are two workloads in two accounts, so the
-account is always a column, never a tooltip.
+**Agents & workloads list.** The entry point, answering *what has been
+discovered?* before anything else. A row names the object and gives one line
+of compact context — runtime, region, and the account when the Account
+column has no room — so two rows named `ticket-tools` stay two workloads in
+two accounts at every width. Identifiers are not printed under every name.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────┐
 │ Agents & workloads                                    as of 22 Sep, 14:02      │
-│ 3 integrations · 2 complete · 1 partial                                        │
-│ [Search name, ARN or account id] [AWS ▾] [All accounts ▾] [All regions ▾]      │
+│ 3 AWS accounts · 1 incomplete                                                  │
+│ [Search name, ARN or account id        ] [All 412│Agents 9│Unclassified 403]   │
+│                                            [Filters 2] [Sort ▾] [Columns]      │
+│ (Account: production ×) (Runtime: Lambda ×)  Clear all                         │
 ├────────────────────────────────────────────────────────────────────────────────┤
-│ ⚠ sandbox (905418271234): iam_users denied. Identity lists for that account    │
-│   are incomplete.                                                  [Coverage]  │
+│ ⚠ Discovery is incomplete in sandbox. Some workloads may be missing.           │
+│                                                  [Review collection gaps]     │
 ├────────────────────────────────────────────────────────────────────────────────┤
-│ NAME                    CLASSIFICATION ▾       RUNTIME    ACCOUNT    CONFIRMED │
-│ customer-support-agent  Provider-native agent  Bedrock    production 22 min ago│
-│   instances not collected                                                      │
-│ cs-runtime-prod         Provider-native agent  AgentCore  production 22 min ago│
-│ refund-tools            Classified as agent    Lambda     production 22 min ago│
-│ ticket-tools            Unclassified workload  Lambda     production 22 min ago│
-│ ticket-tools            Unclassified workload  Lambda     sandbox    22 min ago│
-│ nightly-etl             Unclassified workload  ECS        production 6 days ago│
-│   stale: eu-west-1 compute not read since 15 Sep                               │
+│ NAME                          ACCOUNT        CLASSIFICATION   LAST CONFIRMED  ›│
+│ customer-support-agent        production     Agent            22 min ago      ›│
+│   AgentCore · eu-central-1                                                     │
+│ ticket-tools                  production     Unclassified     22 min ago      ›│
+│   Lambda · eu-central-1                                                        │
+│ ticket-tools                  220171243705   Unclassified     22 min ago      ›│
+│   Lambda · eu-west-1                                                           │
+│ nightly-etl                   production     Unclassified     Stale           ›│
+│   ECS · eu-west-1                            Lambda functions eu-west-1 denied │
 ├────────────────────────────────────────────────────────────────────────────────┤
 │ 1–100 of 412 found · sandbox incomplete                      [‹ Prev] [Next ›] │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+- **Columns by priority, from the table's own width** (re-measured when the
+  sidebar or an inspector changes it): the name is always shown with a way
+  to open it; then account, classification and freshness while they fit.
+  Region, runtime, ARN and instances are in each row's details (›) unless
+  the customer chooses them in **Columns**; a chosen field that does not fit
+  moves to details and Columns says so. The table is exactly its
+  container's width — nothing scrolls sideways, and a long ARN is clipped in
+  a column, whole (and copyable) in details. Below 640 px of table width,
+  rows become cards: name, context and the classification chip, with
+  **Details** for the rest. Column choices are remembered per table, user
+  and workspace; nothing about the rows is stored.
+- **One account identifier:** a name with its id beneath only when the two
+  differ.
+- **Classification is one word** (*Agent*, *Unclassified*); its meaning is
+  on hover and in details. *Unclassified* is never a negative.
+- **Instances not collected** is a detail of the workload that has it
+  (a Bedrock agent's aliases are not read yet), not a line under every row.
+- **Filters:** search first and widest; the view controls beside it; one
+  **Filters** button with the applied count (account, region and runtime
+  inside); Sort and Columns after it; applied filters as removable chips
+  with **Clear all**. Every filter is the server's, over the whole result —
+  the page on screen is never filtered on its own. All of it is in the URL.
 
 **Overview.** Answers "what is this and how much do we know?" Plain words
 first; the ARN and the raw evidence are one click away, not the headline.
@@ -1554,22 +1642,36 @@ coverage, and a coverage gap is never described as "more available".
 ##### The Evidence panel
 
 The panel answers one question: **why does the product claim this?** It
-opens for a relationship, a grant, a node's existence, or a coverage claim,
-and always has the same five parts, in this order:
+opens for a relationship, a grant, a node's existence, or a coverage claim.
+On the graph it is the deeper layer behind the selection card's **View
+evidence** — it replaces the card, one layer at a time, beside the canvas or
+as a drawer over it; on every other view it is the page's side panel. Either
+way its header stays in view, and it reads in sections:
 
-| Part | Contents | Example |
-|---|---|---|
-| **Claim** | One sentence in the §2.14.8 wording | *"SharedToolRole is granted s3:GetObject on support-tickets/\* by 2 statements."* |
-| **Status** | The four dimensions (§2.14.9) as four separate facts | *declared · current · collection complete · effective access unknown* |
-| **Supporting facts** | Each fact on its own line: the source API call, account, region, the scan and time it was collected, and for a grant the **policy, Sid, statement index and the statement excerpt**. Two declaring statements are two entries, each with its own status | *TicketRead (managed) · statement 2 "ReadTickets" · current* / *ToolboxRead (managed) · statement 1 · current* |
-| **Freshness** | First seen, last confirmed, and if stale, why and since when | *"Last confirmed 22 min ago by the scan of production."* |
-| **Limitations** | What this claim does **not** establish, and any coverage gap that bears on it | *"Conditions, SCPs, permission boundaries and resource policies were not evaluated. We have not confirmed any object exists under this prefix."* |
+1. **Explanation.** The claim in one sentence in the §2.14.8 wording
+   (*"A statement in legacy-reads lists s3:GetObject for this object
+   pattern."*), with its basis, and a lifecycle or collection state only when
+   it is not current/complete. One short line per panel says *"Declared
+   access — whether a request would succeed has not been evaluated."*
+2. **Policy and statement.** The policy (and Sid or position), the Effect as
+   written — never as a decision — the actions, and the exact resource
+   reference or selector.
+3. **Conditions and constraints.** Conditions (*recorded, not evaluated*) and
+   the limitations that qualify THIS claim as short expandable chips:
+   *Permissions boundary recorded; not evaluated*, *Resource existence not
+   confirmed*, *Evidence stale*, *Relevant coverage missing*. Distinct
+   limitations are all kept; repeats are not.
+4. **Collection source and freshness.** Source API, last confirmed, first
+   seen, stale since or ended; then **Supporting records** behind a
+   disclosure — each collection of the fact, which is not a separate grant.
+5. **Raw record**, collapsed, fetched only when opened, scrolling in its own
+   box.
 
-The **Limitations** part is never empty and never generic boilerplate. It
-lists the specific gaps that apply to this claim: an unread surface, an
-unevaluated condition key present in the statement, an unresolved external
-account. A **Show raw record** control at the bottom reveals the stored
-observation JSON, for the engineer who needs it.
+Every row is full width, so an ARN or an API name wraps rather than breaking
+inside a narrow column. Times are short and relative with the exact time and
+timezone on hover and to screen readers. Several independent grants behind
+one line are each shown in full, headed *"Grant 1 of 2"*. Missing evidence is
+never "none", stale never ended, and a declared grant never access that works.
 
 #### 2.14.8 Terminology
 
@@ -1690,7 +1792,7 @@ The questions it exists to answer, and where each is read:
 
 | Question | Where |
 |---|---|
-| Which identity is this workload configured to use? | The `executes_as` edge, labelled *configured to run as* |
+| Which identity is this workload configured to use? | The `executes_as` edge, labelled *runs as*; for ECS, the task role — and, separately, the task execution role labelled *ECS agent uses*, whose declared permissions are folded as supporting infrastructure — only when it was reached from the workload through that edge and no workload runs as it; a role that is both is the application's identity and folds like any other |
 | Which other workloads share that identity? | A count on the identity node; expanding lists them |
 | Which policies declare its permissions? | Each grant edge names its policy; two policies declaring the same grant are **two edges** |
 | Which resources or selectors do those statements name? | Terminal nodes, typed by §2.14.12 |
@@ -1736,9 +1838,16 @@ Five things this single picture has to get right:
 5. **Stale is dashed, not missing.** A failed refresh makes an edge stale. It
    stays on the canvas with its last-confirmed time.
 
-**Wording.** Edge labels are `configured to run as`, `may assume`, `granted
-by`, `names`. Never `can access`, never `uses`. Configuration is not observed
-activity, and a declared grant is not proof an AWS request succeeds.
+**Wording.** Relationship words describe configuration or a declaration:
+`runs as` (a workload's identity — for ECS, the **task role**, what the
+application runs as), `ECS agent uses` (the ECS **task execution role**, used
+to pull images and write logs; its credentials are not available to the
+containers, so it is never described as the application's identity),
+`may assume`, `member of`, and — in the Detailed view — `has statement` and
+`applies to`; in the Overview a statement's contribution is one
+`declares <actions>` (or `denies <actions>`) line. Never `can access`.
+Configuration is not observed activity, and a declared grant is not proof an
+AWS request succeeds.
 
 ##### Budgets
 
@@ -1787,34 +1896,46 @@ and testable:
 
 | Concern | Behaviour |
 |---|---|
-| **Select vs open** | One click (or Enter on a focused element) **selects**: a node shows its summary, an edge shows its evidence, in the side panel. Selection is `node=` / `evidence=` in the URL and **replaces** history. **Open** (double-click, or the panel's **Open** button) **navigates** to that object's own page and pushes history. **Focus here** re-roots the graph on the selected node, as a new history entry |
-| **Expand** | A node with unshown neighbours carries a count: *"+3 roles"* (or *"+3 or more"* when the count is not known). Expanding adds exactly those neighbours, one step. `max_assume_hops` is a starting depth, never a ceiling on expansion |
+| **The workspace** | The Graph tab fills the page below a one-row object header (name and its metadata line together; the way back to the previous object is a small link at the right of that row). Top: one toolbar — **Overview / Detailed / Paths** (and, for an identity, the direction) at the left; three icon buttons at the right: **Fit** (frame what is drawn), **Layout** (go to the starting object, Reset layout, Restore previous layout; a dot when cards were moved) and **Expand**, which fills the browser window — not the monitor — and leaves on its button or Escape once nothing is selected. A notice line only when something needs saying; then the canvas; then the **status bar**. There is no search: a graph on screen is read, not queried — finding an object is the lists' job |
+| **Views** | **Overview** (the default): workload → identity → what it declares. Each statement's contribution is a `declares` line identity → resource, one per (holder, resource, effect): an Allow and a Deny are never one line; every statement behind a line stays listed, with its own grant and target claims, so independent grants stay independently inspectable; role assumption, membership and execution-role hops stay drawn; a statement with targets not loaded yet stays drawn with its Load control. **Detailed**: every statement drawn. **Paths**: the list below. A selection survives switching (a statement selected in Detailed is its line in Overview) |
+| **Select vs open** | A click (or Enter/Space on a focused card or line) **selects** and opens the **selection card** in the canvas's top-right corner — its name and type, one plain sentence, up to three facts, the uncertainty that matters, **View evidence** and **Open details**; the canvas pans so the card never covers the selection. A card is `node=`, a line `edge=<its claims>` — one claim for a drawn relationship, and for an Overview line a statement's grant and target claims, which only that line holds (a grant is shared by every line of its statement, a target by every holder); both **replace** history. A statement opened in Overview selects its line; an Overview line opened in Detailed selects its statement. **View evidence** replaces the card with the evidence panel (`evidence=`, replace while a selection is open); Back or Escape goes evidence → card → nothing, and focus returns to the card or line. **Open details** (or double-click) navigates to the object's page; **Graph from here** re-roots, as a new history entry |
+| **Moving cards** | Dragging a card moves that card, its lines follow; dragging the background pans; a drag never selects; the card's own buttons do not start a drag. A moved card is the customer's: kept through Load, collapse, folding, view changes and a refresh's re-layout, remembered in this browser per workspace, user and graph root (ids and coordinates only). **Reset layout** discards them and lays out again; **Restore previous layout** undoes that once. Moving a card never changes a fact, and nothing can be drawn between cards |
+| **Categories** | A card's tinted header says what it IS — workload/agent (blue), identity with its subtype Role/User/Group (purple), resource: exact reference or selector (teal), policy statement (slate, Detailed view), external or unresolved (amber, dashed outline) — always with an icon and the type in words, from the `--color-object-*` tokens. Category colour never means status: status keeps its own tokens, and the selected state is the accent ring. These five families are the one sanctioned exception to the console's "no new colour tokens" review rule: no existing token names an object category, and reusing status tokens would make a category read as a state |
+| **Expand** | A card with relationships the server has not sent carries a **Load** control: *"Load 3 roles it may assume"*, *"Load workloads that run as it"* (a count only when exact). Loading adds exactly those neighbours, one step. `max_assume_hops` is a starting depth, never a ceiling. More than two such controls on one card are offered in its inspector |
+| **Progressive disclosure** | The first view is the starting object, its execution identity and a readable set of branches. A card with more than six **loaded** relationships of one kind shows the first six in server order and one *"+N more statements"* card for the rest, plus what is reachable only through them. It is labelled *hidden in this view · loaded*, is selectable (its inspector lists every member with **Show**), and **Show all** puts each back as its own card. Folding is presentation only: every identifier and claim stays, Paths lists everything, and a selected object, a requested path and a traced path are never folded. It is distinct from **Load** (not fetched yet) |
 | **Collapse** | Collapsing removes what that expansion added **unless** the same node is also reached by another expanded path. Nodes are reference-counted by expansion, so collapsing one path never breaks another |
-| **Shared paths** | A node reached by several paths is drawn **once**. Many workloads sharing one identity collapse into one group node, *"Used by 14 workloads"*, which expands into its members |
-| **Grouped edges** | Several grants between the same two nodes may be drawn as **one line with a count badge** (*"2 statements"*) for legibility. The grouping is visual only. The evidence panel lists every grant separately, each with its own status. Line style follows the most-current member: solid if **any** grant is current, dashed only if **all** are stale, and the badge carries the mix (*"1 current · 1 ended"*). Ending one grant never restyles the line while another is current |
+| **Shared paths** | A node reached by several paths is drawn **once**; a shared role is one card with several relationships, never duplicated to simplify the drawing. Leaf workloads sharing one execution identity and lifecycle fold into one card, *"14 workloads"*, which the inspector lists and **Draw each workload** expands |
+| **Grouped edges** | Statements with the same `group_key` (actions, targets, effect, conditions and exclusions, D-37), the same holder **and the same lifecycle** are drawn as one card and one line marked *×2*. Matching action names alone never group. The grouping is visual only: the inspector lists every grant separately, each with its own evidence |
+| **Edge labels** | Every line carries its words (§2.14.11 *Wording*) at its midpoint, always — a relationship is never an unlabelled arrow. Hover, keyboard focus, selection and a highlighted path only emphasise the label; hovering it says what the relationship means. Beside the words, compact markers: *×N* independent grants (or statements behind an Overview line), *!* a condition or constraint recorded and not evaluated, *↻* closes a cycle, *⇄* crosses into another account. Labels are drawn above every line, so a selected line never strikes through them. Lines between the same two cards are drawn apart, and a moved card keeps its lines attached while it moves. Stale and ended are the line's own dash. Each line is selectable by pointer (a wide invisible stroke) and by keyboard (its label button). A selected line is the accent colour and a highlighted path a neutral dark — never success green, which would suggest AWS confirmed access |
 | **Exclusions** | A `NotResource` statement is drawn with an *"except finance/\*"* chip on its statement node and a positive edge only to the `*` selector. An excluded resource is **never** drawn as the end of a path, and the Paths list reads *"all resources except finance/\*"* |
 | **Cycles** | Role A may assume B, and B may assume A. Each node is drawn once; the edge back to an already-drawn node is drawn to it and marked *cycle*. Expansion never re-adds a visited node. The server de-duplicates too (§5.4) |
 | **Loading and failure** | The first load is all-or-nothing: an error with Retry, never a partial canvas presented as the answer (§2.14.7). An **expansion** failure is local: that node shows *"Could not load. Retry"*, and everything already drawn stays. A truncated response is not a failure and is never shown as one |
-| **Layout stability** | A deterministic left-to-right layered layout: workload → identity → statement → resource or selector, with external principals in the identity column's upper band. Expanding and collapsing **never moves nodes already on screen**; new nodes take free positions by the placement rule in §2.14.15. Only a refresh to a new revision may re-lay out, and it says so (*"Layout updated for the newer scan"*). Transitions are 200 ms at most and are removed under `prefers-reduced-motion` |
-| **Legend** | Always visible: node kinds, edge labels (§2.14.11 *Wording*), dashed = stale, the cycle marker, the out-of-scope marker, the truncation chip |
+| **Layout stability** | A deterministic left-to-right layered layout: workloads start the line and resources end it; a chain of role assumptions takes one layer per hop rather than being stacked in one identity column. Loading, collapsing, folding and showing **never move cards already on screen**; new cards take free space by the placement rule in §2.14.15. Only **Arrange** or a refresh to a new revision lays out again, and a refresh says so (*"Layout updated for the newer scan"*). Transitions are 200 ms at most and are removed under `prefers-reduced-motion` |
+| **Viewport** | A graph opens on its starting object at a readable scale: the whole graph when it fits legibly, otherwise the start object near the left edge. Returning to it (Back, a view change) restores where the customer left it; nothing refits it afterwards, and opening the card or evidence only pans. **Fit** frames what is drawn; **Reset layout** re-lays out and then shows the starting object: separate actions. When no loaded card is in view, the canvas says so and offers both. Loading, a failed load, no relationships and off-screen content are four different states |
+| **Accounts on a card** | *Other account* (connected, not the starting object's), *not connected* (AuthSec cannot read it) and an account simply not recorded are three different facts. A statement has no account line (its policy is the context); a resource or selector shows one only when its reference names it. Nothing says "Unknown account" where an account does not apply |
+| **Status bar** | One strip under the canvas that is the legend, the count and the zoom at once, listing only what is drawn: each category with its number of cards (hovering or focusing one dims every other card), *Folded* with its count, a line style (stale, ended, Deny) or marker (constraint, cross-account, cycle) only when a drawn line uses it; at the right *"Declared access · not evaluated"* and the zoom (− 100% +). Relationship words need no legend: every line is labelled, and hovering a label says what the relationship means (both ECS roles included) |
 
 ##### The path list, the accessible equivalent
 
-The Graph tab has two presentations of **the same response**: **Canvas** and
-**Paths**. Paths is a nested list: each declared path is an ordered list of
-steps, each step naming the node, its kind and account, and the edge label
-into it (*"ticket-tools — configured to run as → SharedToolRole — granted by
-TicketRead, ToolboxRead → s3:GetObject — names → support-tickets/\*
-(prefix selector)"*).
+**Paths** is a list of declared paths over **everything loaded** — not only
+what the canvas has room to draw — each a numbered list of steps: the object
+with its kind and context, then the relationship's own verb into the next
+(*"1. ticket-tools · Workload ↓ runs as 2. SharedToolRole · IAM role ↓ has
+statement 3. s3:GetObject · Statement ↓ applies to 4. support-tickets/\* ·
+Selector"*). Every verb and object selects it (the same selection card), and
+**Show on canvas** traces the path there. A path is never called "can
+access"; one whose last object has relationships not loaded says it
+*continues beyond what is loaded*.
 
-- It is **complete for what was loaded**. Anything drawn on the canvas is in
-  the list, and expansion and truncation work the same way in both.
+- It says exactly where it stopped: its own 200-path limit, a path cut at 12
+  steps, or the server's truncation (more exists than is loaded). Only when
+  none applies does it say every path over what is loaded is listed.
 - Grouped edges are **never** grouped in the list. Each statement is its own
   item.
 - It is the **default below 768 px**, with the canvas available but not
   imposed.
-- Selecting a step opens the same Evidence panel as selecting the edge on the
-  canvas. The toggle's state is in the URL (`as=paths`).
+- Selecting a step opens the same selection card as selecting the line on
+  the canvas. The view is in the URL (`as=overview|detailed|paths`).
 
 The canvas itself supports the keyboard (§2.14.15), but the path list is how
 a screen-reader user, or anyone who prefers text, gets the whole answer.
@@ -1845,6 +1966,24 @@ Counts follow the same rule: *"names 3 selectors and 1 exact reference"*, never
 
 Coverage explains **what is missing and which conclusion it prevents** — that
 second half is what makes it actionable rather than a complaint.
+
+**Above an inventory, one line.** Gaps never stack as rows above the rows
+they qualify. The list shows one sentence about what they mean for it —
+*"Discovery is incomplete in 2 accounts. Some workloads may be missing."* —
+and **Review collection gaps**, which opens a side sheet over the list (the
+list stays where it was): gaps by account, then service and region, in
+readable names (*"Lambda functions · eu-west-1"*), each with its
+consequence; the surface key and state one disclosure deeper; and **Full
+coverage** for the account (below). When nothing is incomplete but a region
+or service is outside the scan scope, the line says that instead, in a
+neutral tone.
+
+**"Denied" is the collector's.** A gap's words are about collection —
+*"Collection denied — AWS refused the discovery role's request"* — never
+about what a workload may access. Denied, failed or unchecked, blocked by an
+account policy, outside the scan scope (region not selected), and not
+offered by AWS in that region are five different states, and are never
+merged.
 
 ```
 ┌─ Coverage · sandbox (905418271234) ──────────────────────────────────────────┐
@@ -1882,13 +2021,13 @@ named below.
 
 | Screen | Composition |
 |---|---|
-| Agents & workloads, Identities, Resources lists | `ConsolePage` (title, description, actions) → `ConsoleFilterBar` (`console/iam-console.tsx`) → `TableCard` (`theme/components/cards.tsx`) → `AdaptiveTable` (`ui/adaptive-table.tsx`), with `ui/table-skeleton` for the loading state. **Pagination needs a cursor variant**: `ui/table-pagination` takes `currentPage`, `totalPages` and `totalItems`, none of which a cursor list has. Add a Prev/Next control that renders *"1–100 of 412 found"* or *"1–100 · more available"* from `total_known` |
-| Object detail header + tabs | `ConsolePage` with `ui/breadcrumb` in the title slot and `ui/tabs` for each object type's tabs (§2.14.5). **Tabs are routes**, not local state, so Back and deep links work |
-| Overview body | `console/detail.tsx`: `DetailGrid` + `DetailRow`, `CopyField` for ARNs |
-| Relationship and evidence rows | `AdaptiveTable` rows; lifecycle via `console/status.tsx` `StatusBadge` — **one badge per dimension**, never a combined tone (§2.14.9) |
+| Agents & workloads, Identities, Resources lists | `ConsolePage` (title, description, actions) → `ConsoleFilterBar` (`console/iam-console.tsx`) with `ConsoleFiltersButton` and `AppliedFilters` → `TableCard` (`theme/components/cards.tsx`) → `AdaptiveTable` (`ui/adaptive-table.tsx`) with `sizing="fit"`, `ColumnsMenu` and `useColumnPreferences` (`ui/table-columns.tsx`, `ui/use-column-preferences.ts`), with `ui/table-skeleton` for the loading state. `sizing="fit"` is a shared extension: fixed table layout at the container's width, column widths that are the ones used to decide visibility, row details for what does not fit, and cards below a width; other consumers keep the default `"auto"`. **Pagination needs a cursor variant**: `ui/table-pagination` takes `currentPage`, `totalPages` and `totalItems`, none of which a cursor list has. Add a Prev/Next control that renders *"1–100 of 412 found"* or *"1–100 · more available"* from `total_known` |
+| Object detail header + tabs | `ConsolePage` `variant="object"` (a compact header over the tabs) and the object's tabs (§2.14.5). The object is named in the global breadcrumb, not in the page body. **Tabs are routes**, not local state, so Back and deep links work |
+| Overview body | `iga/shared/components/Panel.tsx`: the page is a set of `Panel`s (title 13 px semibold in sentence case, count and actions in the panel's own header) flowing into two columns on a wide screen; facts are `Facts` / `Fact` — a 12 px muted label **beside** its 13 px value, one line per fact — and identifiers are `CopyValue`. Drawers keep `console/detail.tsx` (`DrawerSection` titles are sentence case there too) |
+| Relationship and evidence rows | `SectionList` panels of `ClaimRow`s: what the claim names on the left, `ClaimFacts` on the right — basis, lifecycle and confirmation as separate words (lifecycle a badge only when stale or ended, §2.14.9), never the API's enum — and the explanation under it. A statement's actions are an `ActionList`: up to eight shown as they are, a longer list summarised by service with its count, every action one click away |
 | Coverage and partial banners | `console/status.tsx` `DecisionBanner`, per affected account |
-| Evidence panel | `ui/sheet` — a single side panel with its own URL. **Not** `ui/drawer` stacked on a drawer (§2.14.5 forbids nesting) |
-| Graph canvas | The one genuinely new component. Sits in the Graph tab's `TableCard` slot; its legend and truncation chip reuse `StatusBadge` |
+| Evidence panel | A single side panel with its own URL, beside the tab content (never beside the tab strip), or `ui/sheet` over it on a narrower window. On the Graph tab it is the workspace's inspector. **Not** `ui/drawer` stacked on a drawer (§2.14.5 forbids nesting) |
+| Graph canvas | The one genuinely new component: a workspace filling the height below the tabs, with its own toolbar and inspector |
 
 The graph canvas is the only surface with no existing primitive, and it
 is built after the lists (§6) — the list views answer every question in §2.14.11
@@ -1985,8 +2124,8 @@ claims a capability that is not live.
 
 | Width | Lists | Detail | Evidence panel | Graph |
 |---|---|---|---|---|
-| ≥ 1280 px | Full table | Tabs across the top | Side panel **beside** the view; the view stays usable | Canvas + side panel |
-| 768–1279 px | Table; off-by-default columns stay off | Same | Sheet **over** the view | Canvas; panel as a sheet |
+| ≥ 1280 px | Full table | Tabs across the top | Side panel **beside** the view; the view stays usable | Canvas + inspector beside it, 360–420 px, while the canvas keeps at least 560 px of the workspace's own width (the sidebar already taken out) |
+| 768–1279 px | Table; off-by-default columns stay off | Same | Sheet **over** the view | Canvas; the inspector beside it when that width allows, else a drawer over it that leaves the canvas usable |
 | < 768 px | `AdaptiveTable` card layout: name, account and classification on every card | Tabs become a select | Full-screen sheet with a back arrow | **Paths** by default (§2.14.11); canvas on request |
 
 ##### Keyboard
@@ -1997,7 +2136,7 @@ claims a capability that is not live.
 | Lists | `↑` / `↓` move between rows; `Enter` opens; `Cmd/Ctrl+Enter` opens in a new tab; `.` opens the row's action menu |
 | Tabs | `←` / `→` between tabs (the `ui/tabs` default); `Enter` activates |
 | Evidence panel | Focus moves into the panel on open and returns to the opener on close; `Tab` is trapped only on the full-screen sheet |
-| Graph canvas | `Tab` moves through nodes in path order; arrow keys follow edges from the focused node; `Enter` selects; `Shift+Enter` opens; `+` / `-` expand and collapse |
+| Graph canvas | `Tab` moves through cards; `←` / `→` follow lines from the focused card; `↑` / `↓` move to the nearest card above or below; `Enter` selects and opens the inspector; `Shift+Enter` opens the object's page; `+` / `-` load and collapse; `Esc` closes the inspector and returns focus to the card or line |
 | Paths | A standard nested list: arrow keys, `Enter` selects a step |
 
 Every interactive element has a visible focus state, and every state in
@@ -2025,30 +2164,41 @@ repos, against representative graphs):
 | Layout stability | **Neither re-layout nor ELK's interactive mode preserves positions.** A full re-layout after expanding four nodes moved 3 of 9 existing nodes; interactive mode with position hints moved 7 of 9, and with fixed columns it exhausted memory |
 
 **Layout stability, therefore, is ours.** ELK computes the layout **once**, on
-first load, and again only on an explicit **Tidy layout** action or when a
-refresh moves to a new revision (announced, §2.14.11). Expansion does not call
-ELK. New nodes are placed by our own deterministic rule, with every existing
-node pinned:
+first view, and again only on an explicit **Arrange** or when a refresh moves
+to a new revision (announced, §2.14.11). A result for a layout since
+superseded — a newer Arrange, another root, workspace or publication — is
+dropped. Loading does not call ELK. New cards are placed by our own
+deterministic rule, with every card already drawn pinned:
 
-1. Columns are fixed by node kind: workload · identity · statement · resource,
-   with external principals in the identity column's upper band.
-2. A new node goes in its kind's column, in the first free slot below the
-   lowest existing node connected to the node that was expanded, at the
-   standard vertical spacing.
-3. Slots are claimed in the order the server returned the nodes, which is
-   stable (§5.4), so the same expansion always lands the same way.
-4. Collapsing frees slots but does not move the remaining nodes.
+1. **One sizing contract.** A card's content is fixed rows, each clamped to
+   one line (a category header with the type, the name, one line of context,
+   at most two indicators, one Load row), and its height follows from which
+   rows it has. ELK is
+   given exactly that size and its own coordinates are used, so a card with
+   extra rows can never overlap its neighbour. Full identifiers are in the
+   inspector and in each card's accessible name.
+2. A new card goes one layer beyond the drawn card that revealed it — right
+   of it for a relationship pointing away, left for one pointing at it — in
+   the first free space nearest that card's height, with room between layers
+   for the arrowhead and a selected line's label.
+3. Cards are placed in the order the server returned them, which is stable
+   (§5.4), so the same expansion always lands the same way.
+4. Collapsing leaves the remaining cards where they are. A card drawn again
+   later returns to its old place if nothing has taken it since.
+5. **A card the customer moved is theirs.** Its position is kept through
+   every re-layout except Reset layout, and new cards are placed around it.
 
 **Components.**
 
 | Element | Built as |
 |---|---|
-| Node | A custom node per kind, composed from existing console primitives (`StatusBadge` per dimension, `EntityCell`). Shows name, kind, account, and the lifecycle badge. External principals and selectors have their own visual treatment |
-| Grouped-grants edge | A custom edge whose label is a button: *"granted by · 2 statements"*, `aria-label` included. Selecting it opens the evidence panel listing every grant separately |
-| Expand / collapse | A control on the node: *"+3 roles"*, or *"+ more"* when the count is not exact |
-| Re-root | **Focus here**, in the node's panel; a new history entry |
-| Cycle marker, out-of-scope marker, truncation chip, legend | React Flow overlays using `StatusBadge` |
-| Zoom | React Flow's controls; zoom level is not in the URL |
+| Node | One card component for every kind: a category header (icon, colour, type in words), the name, one line of context, at most two indicators (lifecycle, other account / not connected, unresolved, exclusions, Deny) and one Load row; every other indicator — boundary, direct workload bindings, coverage gaps — is in the selection card. External and folded cards are dashed. Draggable; its buttons are not drag handles |
+| Edge | One custom edge: a directed connector whose midpoint button carries the markers and, on hover, keyboard focus or selection, the words; a Deny line has its own dash; its `aria-label` is the whole description |
+| Load / collapse | One row on the card (*"Load 3 roles it may assume"*), all of them in the selection card |
+| Selection card, evidence panel | `SelectionCard` floating in the canvas; `GraphInspector` for evidence only, beside the canvas or a drawer; never both, never stacked |
+| Re-root | **Graph from here**, in the selection card; a new history entry |
+| Toolbar, status line, legend | Above the canvas, never overlaying it (§2.14.11 *The workspace*) |
+| Zoom | React Flow's controls, compact at the canvas's lower left; zoom level is not in the URL |
 | Keyboard | Our `onKeyDown` on the node component: Enter selects, Shift+Enter opens, arrow keys move to the connected node in that direction, `+`/`-` expand and collapse. A polite live region announces selection, expansion, truncation and errors |
 | Paths | The accessible equivalent (§2.14.11), from the same response; no React Flow involved |
 | Attribution | React Flow's attribution stays visible unless the company subscribes to React Flow Pro; the MIT licence permits hiding it, the project asks that commercial users who hide it subscribe. A product decision, not a technical one |
@@ -2097,7 +2247,7 @@ path to support-tickets/\* remains through ToolboxRead."* (E6)
 #### Change: `ToolboxRead`'s statement is edited
 
 It has no Sid, so its content hash changes: statement `h:3f9c…` loses support
-and retires; its grant ends `statement_retired`; statement `h:a41e…` appears
+and retires; its grant ends `not_seen`; statement `h:a41e…` appears
 with a new grant. The Changes view says a statement without a Sid changed and
 is shown as one ending and another beginning. Had it carried a Sid, the same
 statement would have gained a revision instead. (E7)
@@ -2105,7 +2255,8 @@ statement would have gained a revision instead. (E7)
 #### Failure: the role disappears, then returns
 
 A clean scan does not see `SharedToolRole`; its support ends, it retires
-`unsupported`, and every edge on it ends `subject_retired`. If it returns with
+`unsupported`, and every edge on it ends — `not_seen`, because the clean scan
+read the edges' partitions in full and closed them first. If it returns with
 the **same** `RoleId`, it is restored: same id, same `first_seen_at`; its
 relationships are new rows, because we did not observe them in the gap; an
 asserted association comes back `pending_reconfirmation`. If it returns with a
@@ -4574,6 +4725,11 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions) erro
             return err
         }
     }
+    // Access keys of users this run confirmed, when iam_users and
+    // iam_access_keys were both reached: a key not reported is revoked (§2.5).
+    if err := rc.reconcileCredentials(tx, snap); err != nil {
+        return err
+    }
     // Only now, with every partition's support settled, is it safe to ask
     // which objects have no support left (§2.10B).
     if err := rc.retireUnsupported(tx, snap); err != nil {
@@ -5231,7 +5387,13 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 }
 ```
 
-Retiring a node ends what depends on it, in the same transaction:
+Retiring a node ends what depends on it, in the same transaction. Edge
+partitions have already been reconciled by then, so an edge whose own
+partition was read in full has already ended `not_seen` — a retired policy's
+assignments, a replaced Sid-less statement's grants — and keeps that reason.
+The cascade reason is written only on an edge its partition could not end
+itself (stale or protected), and the Changes view classifies ends by
+lifecycle events and assignment and grant periods, never by `ended_reason`:
 
 | Retired | Ends | `ended_reason` |
 |---|---|---|
@@ -5747,35 +5909,133 @@ Authorization: every read needs **`iga:read`**; classification needs
 stay on the existing `/authsec/discovery/aws/*` routes with `discovery:read` /
 `discovery:admin`. No new permission is introduced.
 
+The shapes below are the implemented wire contract (`internal/igaread`,
+`controllers/platform/iga_graph_read*.go`, `cloud_aws_controller_p2.go`).
+Conventions that hold on every `/api/iga/v1` route:
+
+- **Unknown query parameters are `400 invalid_parameter`**, naming the
+  parameter; each single-valued parameter may appear once. Routes that are
+  live state rather than a revision (`/capabilities`, `/pipeline`) reject
+  `rev` the same way.
+- Timestamps are RFC 3339 UTC to the second, and **nullable** wherever the
+  column is (`first_seen_at`, `last_confirmed_at`, `valid_from`, `decided_at`,
+  …); Changes times are microsecond (below). A key documented as present is
+  always present, with `null` rather than omission, unless marked optional
+  (`key?`).
+- Counts are `{ "value": n | null, "exact": bool }`; `value: null` means an
+  optional count timed out. Per-row counts cap at 1 000 (`exact: false`).
+- `account` is `{ id, label, connected }` or `null` ("Unknown account").
+- A row whose `state` is `stale` carries `stale_reason?: [{account_id,
+  surface, state, since}]`; an ended claim carries `valid_to?` and
+  `ended_reason?`.
+- `sources` (object details) is `[{ presence, integration, account, state,
+  first_seen_at, last_confirmed_at, ended_reason }]`; `presence` is a claim
+  ref `/evidence` accepts.
+- Detail `meta` is `{ rev, published_at, graph_state, capabilities }`
+  (`capabilities` is `{}` except on workload detail) and, on object details and
+  their tabs, `coverage` (§5.2's notes). Route `:id` accepts a bare UUID or
+  that route's own typed ref.
+- A **paged section** inside a detail tab is `{ items, next_cursor,
+  total_known, total?, total_at_least? }`; continuing one is
+  `?section=<name>&cursor=<its next_cursor>`, which returns only that section.
+
 #### Integration, scan and pipeline
 
 | Method, path | Auth | Purpose | Status |
 |---|---|---|---|
 | `POST /authsec/discovery/aws/connectors` | `discovery:admin` | Connect | Exists |
 | `POST /authsec/discovery/aws/connectors/:id/verify` | `discovery:admin` | Verify | Exists |
-| `GET /authsec/discovery/aws/connectors/:id/regions` | `discovery:read` | Regions enabled in the account (`ec2:DescribeRegions` through the discovery role), with which are selected | **New** |
-| `PATCH /authsec/discovery/aws/connectors/:id` | `discovery:admin` | `{ "regions": ["eu-central-1","us-east-1"] }`. Validated against the enabled list; applies from the next scan; `422 invalid_region` names the offender | **New** |
+| `GET /authsec/discovery/aws/connectors/:id/regions` | `discovery:read` | Regions enabled in the account (`ec2:DescribeRegions` through the discovery role, live), with which are selected (below) | **New** |
+| `PATCH /authsec/discovery/aws/connectors/:id` | `discovery:admin` | Body exactly `{ "regions": ["eu-central-1","us-east-1"] }` (another key or a missing `regions` is `400`, `parameter: "body"` / `"regions"`; at most 32). Stored de-duplicated and sorted, validated live against the enabled list, applies from the next scan to start. `200 { success, message, data: <connector>, meta: { as_of, regions, previous_regions, applies } }`. `422 invalid_region` carries `regions` (the offenders) and `reason`; `422 regions_unavailable` carries `failure`, `api`, `error_code`, `fault` when AWS could not be asked | **New** |
 | `POST /authsec/discovery/aws/connectors/:id/scan` | `discovery:admin` | Queue a scan | Exists |
-| `GET /authsec/discovery/aws/connectors/:id/scan-runs` | `discovery:read` | Run history, newest first, cursor-paged: status, times, coverage summary, projection job status, publication `rev` | **New** |
-| `GET /authsec/discovery/aws/scan-runs/:id` | `discovery:read` | One run; gains `projection: { status, rev }` | Exists, extended |
+| `GET /authsec/discovery/aws/connectors/:id/scan-runs` | `discovery:read` | Run history (below), newest first by `(requested_at, id)`, `limit` 1–100 (default 20), cursor-paged, not revision-bound | **New** |
+| `GET /authsec/discovery/aws/scan-runs/:id` | `discovery:read` | One run: the existing `cloud_scan_run` model (`id`, `connector_id`, `status`, `requested_at`, `started_at?`, `published_at?`, `updated_at`, `last_error` — `""` when none —, raw `coverage`, lease fields) plus `projection` (the history shape, or `null`); `meta: { as_of, terminal, note }`. Bare UUID only; legacy `{ "error": "<text>" }` bodies | Exists, extended |
 | `GET /api/iga/v1/pipeline` | `iga:read` | The workspace's state (below) | **New** |
-| `GET /api/iga/v1/capabilities` | authenticated | What this deployment supports | **New** |
+| `GET /api/iga/v1/capabilities` | authenticated | What this deployment supports; not behind the `503` gate | **New** |
 | `GET /api/iga/v1/coverage` | `iga:read` | Per account and surface, from the runs the current revision was built from | **New** |
+
+The AWS routes answer `{ success: true, data, meta }` and are neither gated on
+graph projection nor revision-bound; their own errors are `{ error: { code,
+message, … } }` (`not_found`, `connector_revoked`, `aborted`,
+`authsec_misconfigured`, `service_unavailable`, with `fault`), while an
+authentication or permission denial arrives in the middleware's legacy body.
+
+```json
+GET /authsec/discovery/aws/connectors/:id/regions
+{ "success": true,
+  "data": [ { "name": "eu-central-1", "opt_in_status": "opt-in-not-required", "enabled": true,  "selected": true },
+            { "name": "me-south-1",   "opt_in_status": null,                  "enabled": false, "selected": true } ],
+  "meta": { "as_of": "…", "integration": "cloud_connector:51c…", "source": "ec2:DescribeRegions",
+            "error": null,
+            "template": { "deployed": "2026-09-23", "current": "2026-09-23", "outdated": false },
+            "template_outdated": false, "note": "…" } }
+```
+
+`data` is the enabled regions plus any selected region the account no longer
+enables (`enabled: false`), sorted by name. **When AWS cannot be asked** the
+answer is still `200`: only the selected regions, each `enabled: null` and
+`opt_in_status: null`, with `meta.error: { code, api, error_code, message,
+fault }` (`code` one of `aws_error`, `aws_access_denied`,
+`role_not_assumable`, `aws_throttled`, `aws_timeout`; `fault` `aws` or
+`customer_account`) — the failed call and AWS's code, never a guessed missing
+permission (§2.14.13).
+
+```json
+GET /authsec/discovery/aws/connectors/:id/scan-runs
+{ "success": true,
+  "data": [
+    { "ref": "cloud_scan_run:9a3…", "id": "9a3…", "integration": "cloud_connector:51c…",
+      "status": "published", "trigger": "manual", "attempts": 1, "generation": 7,
+      "queued_at": "…", "started_at": "…", "published_at": "…", "finished_at": "…",
+      "updated_at": "…", "last_error": null,
+      "coverage": { "status": "partial", "counts": { "reached": 14, "denied": 1 },
+                    "not_reached": [ { "surface": "iam_users", "state": "denied",
+                                       "api": "iam:ListUsers", "error_code": "AccessDenied" } ] },
+      "projection": { "status": "complete", "rev": 42, "attempts": 1, "retrying": false, "last_error": null } } ],
+  "meta": { "as_of": "…", "integration": "cloud_connector:51c…", "sort": "-requested_at",
+            "limit": 20, "next_cursor": null, "note": "…" } }
+```
+
+`queued_at` is `requested_at` (when the run last entered the queue);
+`finished_at` is `published_at` for a published run, `updated_at` for a
+failed or abandoned one, else `null`. `coverage` is `null` until the run's
+coverage is stamped; `projection` is `null` when the run has no projection job.
 
 ```json
 GET /api/iga/v1/pipeline
 { "data": {
-    "barrier": { "state": "collecting", "scan_run": "cloud_scan_run:9a3…", "since": "2026-09-23T14:28:02Z" },
+    "barrier": { "state": "collecting", "scan_run": "cloud_scan_run:9a3…", "since": "2026-09-23T14:28:02Z",
+                 "integration": "cloud_connector:51c…", "account_id": "220171243705",
+                 "label": "production", "started_at": "2026-09-23T14:28:02Z" },
     "accounts": [
       { "integration": "cloud_connector:51c…", "account_id": "220171243705", "label": "production",
+        "connector_status": "active", "state": "collecting",
         "latest_run": { "ref": "cloud_scan_run:9a3…", "status": "running", "started_at": "…" },
         "projection": null, "last_published_rev": 41 },
       { "integration": "cloud_connector:7e2…", "account_id": "905418271234", "label": "sandbox",
+        "connector_status": "active", "state": "queued",
         "latest_run": { "ref": "cloud_scan_run:b10…", "status": "queued", "queued_at": "…",
                         "waiting_on": "cloud_scan_run:9a3…" },
         "projection": null, "last_published_rev": 41 } ],
-    "current_rev": 41, "current_published_at": "…" } }
+    "current_rev": 41, "current_published_at": "…" },
+  "meta": { "rev": 41, "published_at": "…", "graph_state": "published", "capabilities": {} } }
 ```
+
+`barrier.state` is `idle`, `collecting` or `projecting`; every other barrier
+key is `null` when idle. `accounts` lists every AWS connector, revoked ones
+included, by label. **`state` is derived by the server** and the console
+renders it rather than deriving its own: `revoked` (connector revoked),
+`never_scanned`, `queued`, `collecting` (run running), `failed` (run failed or
+abandoned, or its projection job failed past the retry ceiling or was
+abandoned), `projecting` (job queued, running, or failed and `retrying`),
+`published` (job complete, or a run published without a job while the graph
+holds an earlier publication of the account) and `first_publication_pending`
+(published without a job, nothing of the account in the graph yet).
+`latest_run` keys follow its status: `queued` → `queued_at`, `waiting_on`
+(the run the barrier holds, or `null`); `running` → `started_at`;
+`published` → `started_at`, `published_at`; `failed`/`abandoned` →
+`started_at`, `finished_at`, `error`. `projection` is `{ status, rev,
+attempts, retrying, last_error }` or `null`.
 
 ```json
 GET /api/iga/v1/capabilities
@@ -5784,14 +6044,33 @@ GET /api/iga/v1/capabilities
             "features": { "workloads": true, "identities": true, "resources": true,
                           "graph": true, "evidence": true, "changes": true,
                           "classification": true, "coverage": true },
-            "schema_head": "036" } }
+            "schema_head": "036" } }            // null when unknown; no meta
 ```
 
-`GET /coverage?account=<id>` returns, for each surface: `state`, `count`,
-`error_code` (the AWS error code when one was returned), `api` (the call that
-failed), `since` (first run in the current state), `prevents` (a code from
-§5.4's limitations vocabulary) and `run`. It **never** returns a guessed
-missing permission (§2.14.13).
+`GET /coverage?account=<id>&rev=` (`account` repeatable, 12 digits) returns
+detail meta and `data: CoverageAccount[]`, one per AWS connector by label:
+
+```json
+{ "integration": "cloud_connector:51c…", "account": { "id": "220171243705", "label": "production", "connected": true },
+  "connector_status": "active",
+  "template": { "deployed": "2026-09-23", "current": "2026-09-23", "outdated": false },
+  "runs": [ "cloud_scan_run:9a3…" ],
+  "surfaces": [
+    { "surface": "iam_users", "state": "denied", "count": null,
+      "error_code": "AccessDenied", "api": "iam:ListUsers", "error": "…",
+      "items": null, "truncated": false,
+      "since": "…", "since_run": "cloud_scan_run:8f0…",
+      "prevents": "surface_denied", "fix": null,
+      "run": "cloud_scan_run:9a3…", "ref": "coverage:9a3…:iam_users" } ] }
+```
+
+`runs` are the runs the current revision was built from, newest first; `[]`
+(and `surfaces: []`) means the revision holds nothing of that account yet.
+`count` is set only when `reached`; `error_code`, `api` and `error` (AWS's
+words) only when not; `items` details unreadable policy documents; `fix` is
+`change_regions` only for `not_selected`; `ref` opens the surface in
+`/evidence`. It **never** returns a guessed missing permission (§2.14.13). Not
+published: `data: []` with `graph_state: "not_published"`.
 
 #### Agents & workloads
 
@@ -5805,7 +6084,8 @@ missing permission (§2.14.13).
 | `runtime_kind` | `lambda_function`, `ecs_task_definition`, `ec2_instance`, `bedrock_agent`, `bedrock_agentcore_runtime`, `bedrock_agentcore_gateway` |
 | `classification` | `agent` (provider-native or classified), `provider_native_agent`, `classified_agent`, `unclassified` |
 | `execution_role_state` | `resolved`, `not_in_scan`, `not_in_inventory`, `none` |
-| `sort` | `name` (default), `-name`, `account`, `last_confirmed`, `classification` |
+| `provider` | `aws` |
+| `sort` | `name` (default), `account`, `last_confirmed`, `classification`; each also `-`-prefixed |
 | `facets` | `account`, `runtime_kind`, `classification`, `region` |
 
 ```json
@@ -5820,39 +6100,64 @@ missing permission (§2.14.13).
   "instances": { "state": "not_collected" } }
 ```
 
+`execution_role` is `{state: "resolved", identity, name}` (both nullable),
+`{state: "not_in_scan" | "not_in_inventory", execution_role_arn}` or
+`{state: "none"}`. `retired_reason?` appears on a retired row, `stale_reason?`
+on a stale one. The `account` facet always ends with `unknown`, `region` with
+`not_stated`, and `classification` begins with `agent`.
+
 Query: one statement over `iga_workload` joined to its estate scope for the
 account, keyset-paged on `(lower(display_name), id)`
 (`idx_iga_workload_list`); `execution_role` from the live `executes_as` row,
 or `execution_role_state`/`_arn` when unresolved.
 
-`GET /api/iga/v1/workloads/:id` — the list fields plus `continuity`,
-`provider_attrs` (status, foundation model, env var names, gateway targets
-`[{id, name, status, type}]`), `sources` (the connectors whose support rows
-hold it, with state), and the latest classification decision
-`{ decision, purpose, reason, decided_by: { user_id, display }, decided_at }`.
+`GET /api/iga/v1/workloads/:id` — the row fields with `retired_reason`
+always present (`null` while active), plus `continuity`, `provider_attrs`
+(`status`, `foundation_model`, `env_var_names`, `gateway_targets
+[{id, name, status, type}]` — every key present; `null` means not collected
+or not applicable, `[]` collected and empty), `sources`, and `decision`, the
+latest classification decision or `null`: `{ id, operation_id, decision,
+purpose, reason, decided_by: { user_id, display }, decided_at }` (`id` is what
+an undo sends as `undoes_decision_id`). `meta.capabilities` is always
+`{ can_classify }`, plus `meta.coverage`.
 
-`GET /api/iga/v1/workloads/:id/identities`
+`GET /api/iga/v1/workloads/:id/identities?section=&cursor=&limit=&include_ended=`
+— without `section`, the first page of all four sections, each a paged
+section with its own cursor (`limit` applies per section); with `section`,
+only that one:
 
 ```json
 { "data": {
-    "execution": [
+    "ref": "workload:6f1e…",
+    "execution": { "items": [
       { "claim": "relationship:88a…", "type": "executes_as",
         "identity": { "ref": "identity:c41…", "name": "SharedToolRole", "kind": "iam_role",
                       "arn": "arn:aws:iam::220171243705:role/SharedToolRole", "account": { … } },
         "basis": "declared", "state": "current", "valid_from": "…", "last_confirmed_at": "…",
         "used_by_count": { "value": 2, "exact": true } } ],
-    "execution_role_state": "resolved",
-    "other": [ { "claim": "relationship:9c0…", "type": "task_execution_role", … } ],
-    "groups": [ ],
-    "may_assume": [ { "claim": "relationship:1d7…", "type": "can_assume",
-                      "target": { "ref": "identity:e02…", "name": "data-reader", … },
-                      "conditions": null, "state": "current" } ] },
-  "meta": { "rev": 42, … } }
+      "next_cursor": null, "total_known": true, "total": 1 },
+    "execution_role_state": "resolved", "execution_role_arn": null,
+    "other": { "items": [ { "claim": "relationship:9c0…", "type": "task_execution_role", … } ], … },
+    "groups": { "items": [ { "claim": "relationship:4e1…", "type": "member_of",
+                             "identity": { … }, "via_identity": "identity:c41…", … } ], … },
+    "may_assume": { "items": [
+      { "claim": "relationship:1d7…", "type": "can_assume", "via_identity": "identity:c41…",
+        "target": { "ref": "identity:e02…", "name": "data-reader", … },
+        "mechanism": "sts_assume_role",
+        "statement": { "key": "…", "sid": "", "negated": false },
+        "conditions": null, "basis": "declared", "state": "current",
+        "valid_from": "…", "last_confirmed_at": "…" } ], … } },
+  "meta": { "rev": 42, "published_at": "…", "graph_state": "published", "capabilities": {},
+            "workload": { "ref": "workload:6f1e…", "lifecycle": "active", "retired_reason": null },
+            "limit": 100, "coverage": [ ] } }
 ```
 
-`execution_role_state` other than `resolved` carries `execution_role_arn`, so
-the tab says *"Runs as `<arn>` — not read in the latest scan"* rather than
-showing nothing.
+`used_by_count` is on `execution` and `other` only. `execution_role_state` and
+`execution_role_arn` are on the full tab only (not on a `section=` page);
+`execution_role_arn` is set for `not_in_scan`/`not_in_inventory`, so the tab
+says *"Runs as `<arn>` — not read in the latest scan"* rather than showing
+nothing. A section with nothing to page is `{items: [], next_cursor: null,
+total_known: true, total: 0}`.
 
 `GET /api/iga/v1/workloads/:id/resources` — for every resource the workload's
 execution identities (and their groups) have a **grant** to — positive
@@ -5862,20 +6167,29 @@ line per grant**:
 
 ```json
 { "resource": { "ref": "resource:0b9…", "text": "arn:aws:s3:::support-tickets/*",
-                "kind": "selector", "service": "s3", "account": null, "region": null },
+                "kind": "selector", "type": "s3_object", "service": "s3", "account": null, "region": null },
   "grants": [
     { "claim": "grant:a11…", "via_identity": "identity:c41…",
       "policy": { "ref": "policy:3f0…", "name": "TicketRead", "kind": "customer_managed" },
       "statement": { "ref": "statement:77e…", "sid": "ReadTickets", "index": 2,
                      "actions": ["s3:GetObject"], "not_actions": [], "conditional": false },
-      "target_mode": "resource", "state": "current", "valid_from": "…" },
+      "target_mode": "resource", "exclusions": [],
+      "state": "current", "valid_from": "…", "last_confirmed_at": "…" },
     { "claim": "grant:a12…", "policy": { "name": "ToolboxRead", … }, "statement": { "sid": "", "index": 1, … }, … } ],
   "restrictions": { "deny_statements": 0, "permissions_boundary": false } }
 ```
 
-Paged by resource (`sort`: `kind`, `name`), 100 per page; grants per resource
-are not paged (the Resources tab shows at most the statements naming it, which
-is bounded by the policies attached).
+`via_group?` (the group's `identity:` ref) is present on a group-held line,
+whose `state` is also stale when the membership is. `exclusions` are the
+statement's `NotResource` entries as `[{ref, text}]`. The line carries no
+name for `via_identity`. Statement
+`index` is 1-based and nullable. `meta` is the list meta plus
+`workload: { ref, lifecycle, retired_reason }`.
+
+Paged by resource (`sort`: `kind` (default), `name`, each also `-`-prefixed),
+100 per page, `include_ended` for ended lines; grants per resource are not
+paged (the Resources tab shows at most the statements naming it, which is
+bounded by the policies attached).
 
 `GET /api/iga/v1/workloads/:id/changes?kind=configuration|coverage&cursor=` —
 §5.3 *Changes*.
@@ -5884,104 +6198,257 @@ is bounded by the policies attached).
 
 `GET /api/iga/v1/identities` — filters `q`, `account`, `kind`
 (`iam_role`, `iam_user`, `iam_group`), `used_by` (`workloads` = identities
-some workload runs as), `lifecycle`; sort `name`, `kind`, `account`,
-`last_confirmed`; facets `account`, `kind`. Rows: name, kind, ARN, account,
-`used_by_count` (`{value, exact}`), `last_confirmed_at`.
+some workload runs as), `integration`, `provider`, `lifecycle`; `region` is
+accepted and never filters (IAM is global); sort `name`, `kind`, `account`,
+`last_confirmed` (each also `-`-prefixed); facets `account`, `kind`. Rows:
+`ref`, `name`, `kind`, `arn`, `account`, `region: "global"`, `used_by_count`
+(`{value, exact}`, `value` null when the count timed out), `lifecycle`,
+`retired_reason?`, `state`, `stale_reason?`, `last_confirmed_at`. The row
+has no `first_seen_at`; detail does.
 
-`GET /api/iga/v1/identities/:id` — list fields plus `continuity`,
-`immutable_key`, `provider_attrs` (path, tags, permissions-boundary ARN,
-`trust_has_deny`, `trust_has_not_principal`), credentials
-(`[{ key_id, status, created_at, last_used_at }]` for users), sources.
+`GET /api/iga/v1/identities/:id` — row fields with `retired_reason` always
+present, plus `first_seen_at`, `continuity`, `immutable_key` (`""` when none),
+`provider_attrs` (`path`, `tags` — `{}` when none —,
+`permissions_boundary_arn`, `trust_has_deny`, `trust_has_not_principal`;
+every key present, the trust flags `null` for users and groups), `sources`
+and, for users only, `credentials`: `[{ key_id, status, lifecycle,
+created_at, last_used_at, last_seen_at }]`. `status` is AWS's `Active` /
+`Inactive` (or `null`); `lifecycle` is the stored credential lifecycle, so a
+key the reconciler revoked (§2.5) reads `revoked`.
 
-`GET /api/iga/v1/identities/:id/used-by` — two sections, each paged:
-`workloads` (via `executes_as` and `task_execution_role`, with the relationship
-type) and `principals` (sources of `can_assume` into this role: identities and
-external principals, with mechanism and conditions); for a group, `members`
-(`member_of`).
-
-`GET /api/iga/v1/identities/:id/permissions` — grouped by policy:
+`GET /api/iga/v1/identities/:id/used-by?section=&cursor=&limit=&include_ended=`
+— sections by the identity's kind: a role has `workloads` and `principals`, a
+group `members`, a user none. Without `section`, one request returns the
+first page of every section that applies, each a paged section with its own
+cursor; `section=` returns one, and a section that does not apply is `400
+invalid_parameter` (`parameter: "section"`). `meta` is detail meta with
+`coverage`; paging lives in the sections, not in `meta`.
 
 ```json
-{ "policies": [
+{ "data": {
+    "identity": { "ref": "identity:c41…", "name": "SharedToolRole", "kind": "iam_role",
+                  "lifecycle": "active", "state": "current" },
+    "workloads": { "items": [
+      { "claim": "relationship:88a…", "type": "executes_as",
+        "workload": { "ref": "workload:6f1e…", "name": "ticket-tools", "runtime_kind": "lambda_function",
+                      "arn": "…", "account": { … }, "region": "eu-central-1" },
+        "basis": "declared", "state": "current", "valid_from": "…", "last_confirmed_at": "…" } ],
+      "next_cursor": null, "total_known": true, "total": 1 },
+    "principals": { "items": [
+      { "claim": "relationship:1d7…", "type": "can_assume",
+        "principal": { "ref": "external_principal:5b2…", "name": "token.actions.githubusercontent.com · repo:acme/tools:*",
+                       "kind": "oidc", "arn": null, "account": null },
+        "mechanism": "oidc_federation", "conditions": { … },
+        "statement": { "key": "…", "sid": "GitHubDeploy", "negated": false },
+        "basis": "declared", "state": "current", "valid_from": "…", "last_confirmed_at": "…" } ],
+      "next_cursor": null, "total_known": true, "total": 1 } },
+  "meta": { "rev": 42, … , "coverage": [ ] } }
+```
+
+`principal.kind` is the identity kind for an identity, and the external
+principal's mechanism (`aws_account`, `aws_principal`, `aws_service`, `oidc`,
+`saml`, `k8s_service_account`) for an external one, whose `arn` is `null`.
+`principals` may carry `limitations: ["not_principal_unresolved"]` when the
+trust policy uses NotPrincipal. A group's `members` items are `{claim, type:
+"member_of", member: {ref, name, kind, arn, account}, basis, state,
+valid_from, last_confirmed_at}`.
+
+`GET /api/iga/v1/identities/:id/permissions?include_ended=` — grouped by
+policy, unpaged (at most 1 000 statements; `truncated` says the cap bound):
+
+```json
+{ "identity": { "ref": "identity:c41…", "name": "SharedToolRole", "kind": "iam_role",
+                "lifecycle": "active", "state": "current" },
+  "policies": [
     { "ref": "policy:3f0…", "name": "TicketRead", "kind": "customer_managed",
       "assignment": { "claim": "assignment:5aa…", "kind": "attached", "via_group": null,
                       "state": "current", "valid_from": "…" },
       "statements": [
         { "ref": "statement:77e…", "sid": "ReadTickets", "index": 2, "effect": "allow",
           "actions": ["s3:GetObject"], "not_actions": [],
-          "targets": [ { "ref": "resource:0b9…", "text": "arn:aws:s3:::support-tickets/*",
+          "targets": [ { "ref": "resource:0b9…", "claim": "target:c20…",
+                         "text": "arn:aws:s3:::support-tickets/*",
                          "kind": "selector", "mode": "resource" } ],
-          "condition": null, "grant": "grant:a11…", "revision_count": 1 } ] } ],
+          "condition": null, "grant": "grant:a11…", "grant_state": "current",
+          "revision_count": 1, "state": "current" } ] } ],
   "boundary": { "policy": null },
-  "inherited": [ { "group": "identity:g77…", "policies": [ … ] } ],
-  "activity": { "source": "access_advisor", "tracking_note": "…",
-                "services": [ { "namespace": "s3", "last_authenticated_attempt": "2026-09-20T…" } ] } }
+  "inherited": [ { "group": "identity:g77…", "name": "support-engineers",
+                   "membership": { "claim": "relationship:4e1…", "type": "member_of", … },
+                   "policies": [ … ] } ],
+  "activity": { "source": "access_advisor", "state": "collected", "reason": null,
+                "tracking_note": "…",
+                "services": [ { "namespace": "s3", "last_authenticated_attempt": "2026-09-20T…" } ] },
+  "truncated": false }
 ```
 
-Deny statements appear under their policy with `"effect": "deny"` and no
-`grant`. Boundary policies appear under `boundary`, never as grants. Access
-Advisor data is labelled per §2.14.8.
+Deny statements appear under their policy with `"effect": "deny"`, `grant:
+null` and `grant_state: null`. Boundary policies appear under `boundary`
+(`{ policy, others? }`, each a full policy block with assignment `kind:
+"boundary"`), never as grants. `inherited` is filled for users only.
+`revision_count` is `null` when its optional count timed out. `activity` is
+always an object: `state: "not_collected"` carries a `reason` (`retired`,
+`not_read`, `not_in_scan`, `outside_sample`, `report_not_read`,
+`surface_not_reached`, `newer_scan_not_published`) and `services: null`;
+Access Advisor data is labelled per §2.14.8. `meta` is detail meta with
+`coverage`.
 
 #### External principals
 
-`GET /api/iga/v1/external-principals/:id` — mechanism, issuer, subject,
-account (when parseable), `account_connected`, resolution
-`{ state, basis, rule, resolved_to, resolved_by }`.
+`GET /api/iga/v1/external-principals/:id` — `ref`, `name` (the principal's
+label: *"any AWS principal"*, *"issuer · subject"*, `ns/sa`), `mechanism`,
+`issuer` and `subject` (`""` when none), `account` (when parseable, `connected`
+as of the revision), `account_connected` (`null` without an account),
+`resolution` (`{ state, basis, rule, resolved_to, resolved_by }`, or `null`
+when never recorded), `unresolved_reason` (`wildcard`, `service_principal`,
+`account_not_connected`, `account_principal`, `not_in_inventory`, or `null`),
+`lifecycle` (derived: active while any `can_assume` from it is current or
+stale), `retired_reason` (`no_longer_referenced` or `null`), `state`,
+`first_seen_at`, `last_seen_at`, `last_confirmed_at`.
 
-`GET /api/iga/v1/external-principals/:id/referenced-by` — the `can_assume`
-edges from it, with target roles, statements and conditions.
+`GET /api/iga/v1/external-principals/:id/referenced-by?cursor=&limit=&include_ended=`
+— a list envelope (with `meta.coverage`) of the `can_assume` edges from it,
+ordered by target name: `{claim, type: "can_assume", target: {ref, name, kind,
+arn, account}, mechanism, statement: {key, sid, negated}, conditions, basis,
+state, stale_reason?, valid_from, valid_to?, ended_reason?,
+last_confirmed_at}`.
 
 #### Resources
 
 `GET /api/iga/v1/resources` — filters `q`, `account` (incl. `unknown`),
 `region` (incl. `not_stated`), `kind` (`exact`, `selector`, `external`),
-`service`, `lifecycle`; sort `kind` (default), `name`, `service`, `account`;
-facets `kind`, `service`, `account`. Rows: text (the ARN or pattern), kind,
-service, account, region, `named_by_count` (`{value, exact}` — statements naming it as a positive target; exclusions are counted separately as `excluded_by_count`),
-`last_confirmed_at`.
+`service`, `integration`, `provider`, `lifecycle`; sort `kind` (default:
+exact, selector, external), `name`, `service`, `account` (each also
+`-`-prefixed); facets `kind`, `service`, `account`. Rows: `ref`, `text` (the
+ARN or pattern), `kind`, `type` (`TypeResourceARN`'s `s3_object`,
+`s3_bucket`, …, `unknown` when not an ARN, so an object selector is never
+shown as its bucket, §2.14.12), `service`, `account`, `region`,
+`named_by_count` (`{value, exact}` — statements naming it as a positive
+target), `excluded_by_count` (statements excluding it through `NotResource`,
+always present), `lifecycle`, `retired_reason?`, `state`, `stale_reason?`,
+`last_confirmed_at`. Resources carry no `first_seen_at`. `meta.coverage` is
+not narrowed by `account` on this route.
 
-`GET /api/iga/v1/resources/:id` — list fields plus
-`existence: "not_verified"`, `resource_policy`
+`GET /api/iga/v1/resources/:id` — row fields with `retired_reason` always
+present, plus `existence: "not_verified"`, `resource_policy`
 (`{ read: true|false, has_deny: true|false|null }` from the existing
-resource-policy observations), sources.
+resource-policy observations), `sources`; detail meta with `coverage`.
 
-`GET /api/iga/v1/resources/:id/access` — `access`: one row per (holder,
-grant) whose statement names this resource as a **positive** target
-(`mode = resource`): holder identity, via group (if any), policy, statement,
-state; paged by holder. Separately, never mixed into `access` or its counts:
+`GET /api/iga/v1/resources/:id/access?cursor=&limit=&include_ended=` —
+`access`: one row per (holder, grant) whose statement names this resource as a
+**positive** target (`mode = resource`); paged by holder (`limit` counts
+holders, and a holder's rows never split across pages; `meta.total` is the
+number of holders). Separately, never mixed into `access` or its counts:
 `excluded_by` (Allow statements that name it in `NotResource` — they exclude
 it, they do not grant it) and `deny_statements_naming` (Deny statements
-targeting it). Both are restrictions, shown as such.
+targeting it). Both are restrictions, shown as such, returned unpaged with
+every page, each capped at 100 statements (`excluded_by_more`,
+`deny_statements_naming_more`) and 100 holders per statement
+(`holders_more`). `meta` is the list meta (§5.2).
+
+```json
+{ "data": {
+    "access": [
+      { "holder": { "ref": "identity:c41…", "name": "SharedToolRole", "kind": "iam_role", "arn": "…", "account": { … } },
+        "via_group": null,
+        "grant": { "claim": "grant:a11…", "state": "current", "valid_from": "…" },
+        "policy": { "ref": "policy:3f0…", "name": "TicketRead", "kind": "customer_managed" },
+        "statement": { "ref": "statement:77e…", "sid": "ReadTickets", "index": 2,
+                       "actions": ["s3:GetObject"], "not_actions": [], "conditional": false },
+        "state": "current" } ],
+    "excluded_by": [ ], "excluded_by_more": false,
+    "deny_statements_naming": [
+      { "statement": { … }, "policy": { … }, "holders": [ "identity:e02…" ], "holders_more": false } ],
+    "deny_statements_naming_more": false },
+  "meta": { "rev": 42, … } }
+```
+
+A group-held row's `via_group` is `{ ref, name, membership: { claim, state,
+valid_from } }`; the row's `state` is the worse of the grant's and the
+membership's.
 
 #### Graph
 
 | Route | Purpose |
 |---|---|
-| `GET /api/iga/v1/graph?root=<ref>&direction=forward\|reverse&assume_hops=2` | The initial neighbourhood of an object (§5.4) |
-| `GET /api/iga/v1/graph/expand?node=<ref>&edge=<kind>&direction=…&cursor=` | One node's next neighbours of one kind |
-| `GET /api/iga/v1/graph/path?from=<ref>&to=<ref>` | Declared paths between two objects, bounded (§5.4) |
+| `GET /api/iga/v1/graph?root=<ref>&direction=forward\|reverse&assume_hops=2&include_ended=` | The initial neighbourhood of an object (§5.4). **`direction` is required**; `root` is a typed workload, identity, external principal, statement or resource ref; `assume_hops` 0–4 |
+| `GET /api/iga/v1/graph/expand?node=<ref>&edge=<kind>&direction=…&cursor=&include_ended=` | One node's next neighbours of one kind, 100 per page; an edge kind not valid for the node's type and direction is `400` |
+| `GET /api/iga/v1/graph/path?from=<ref>&to=<ref>` | Declared paths between two objects over current and stale edges, bounded (§5.4) |
+
+All three accept `rev` and a repeatable `account` (validated; it does not
+narrow traversal, §5.4). Query-parameter refs must be typed.
 
 ```json
 { "data": {
     "root": "workload:6f1e…",
-    "nodes": [ { "ref": "workload:6f1e…", "kind": "workload", "label": "ticket-tools", "account": { … }, "state": "current" },
-               { "ref": "identity:c41…", "kind": "iam_role", "label": "SharedToolRole", "restrictions": { "deny_statements": 0 } },
-               { "ref": "statement:77e…", "kind": "statement", "label": "s3:GetObject", "policy": "TicketRead",
+    "nodes": [ { "ref": "workload:6f1e…", "kind": "workload", "label": "ticket-tools", "account": { … },
+                 "arn": "…", "runtime_kind": "lambda_function",
+                 "state": "current", "lifecycle": "active", "last_confirmed_at": "…", "limitations": [ ] },
+               { "ref": "identity:c41…", "kind": "iam_role", "label": "SharedToolRole", "account": { … }, "arn": "…",
+                 "restrictions": { "deny_statements": 0, "permissions_boundary": false },
+                 "used_by_count": { "value": 2, "exact": true },
+                 "state": "current", "lifecycle": "active", "last_confirmed_at": "…", "limitations": [ ] },
+               { "ref": "statement:77e…", "kind": "statement", "label": "s3:GetObject",
+                 "policy": "TicketRead", "policy_ref": "policy:3f0…", "effect": "allow",
+                 "sid": "ReadTickets", "index": 2, "exclusions": [ ],
+                 "group_key": "s3:GetObject→resource:0b9…",
+                 "state": "current", "lifecycle": "active", "last_confirmed_at": "…", "limitations": [ ] },
+               { "ref": "statement:91b…", "kind": "statement", "label": "s3:GetObject", "policy": "ToolboxRead", …,
                  "group_key": "s3:GetObject→resource:0b9…" },
-               { "ref": "statement:91b…", "kind": "statement", "label": "s3:GetObject", "policy": "ToolboxRead",
-                 "group_key": "s3:GetObject→resource:0b9…" },
-               { "ref": "resource:0b9…", "kind": "selector", "label": "support-tickets/*" } ],
-    "edges": [ { "claim": "relationship:88a…", "kind": "executes_as", "from": "workload:6f1e…", "to": "identity:c41…", "state": "current" },
-               { "claim": "grant:a11…", "kind": "grant", "from": "identity:c41…", "to": "statement:77e…", "state": "current" },
-               { "claim": "grant:a12…", "kind": "grant", "from": "identity:c41…", "to": "statement:91b…", "state": "current" },
-               { "claim": "target:c20…", "kind": "target", "mode": "resource", "from": "statement:77e…", "to": "resource:0b9…" },
-               { "claim": "target:c21…", "kind": "target", "mode": "resource", "from": "statement:91b…", "to": "resource:0b9…" } ],
+               { "ref": "resource:0b9…", "kind": "selector", "label": "support-tickets/*",
+                 "text": "arn:aws:s3:::support-tickets/*", "type": "s3_object", "account": null, … } ],
+    "edges": [ { "claim": "relationship:88a…", "kind": "executes_as", "from": "workload:6f1e…", "to": "identity:c41…",
+                 "state": "current", "basis": "declared", "closes_cycle": false, "crosses_account": false,
+                 "last_confirmed_at": "…", "limitations": [ ] },
+               { "claim": "grant:a11…", "kind": "grant", "from": "identity:c41…", "to": "statement:77e…",
+                 "policy": "TicketRead", "state": "current", … },
+               { "claim": "grant:a12…", "kind": "grant", "from": "identity:c41…", "to": "statement:91b…", "state": "current", … },
+               { "claim": "target:c20…", "kind": "target", "mode": "resource", "from": "statement:77e…", "to": "resource:0b9…",
+                 "state": "current", "basis": "declared", … },
+               { "claim": "target:c21…", "kind": "target", "mode": "resource", "from": "statement:91b…", "to": "resource:0b9…", … } ],
     "frontier": [ { "node": "identity:c41…", "edge": "can_assume", "direction": "forward",
                     "more": { "count": 3, "exact": true },
                     "expand": "/api/iga/v1/graph/expand?node=identity:c41…&edge=can_assume&direction=forward" } ],
-    "truncated": null },
-  "meta": { "rev": 42, "budgets": { "nodes": 500, "edges": 2000, "assume_hops": 4, "timeout_ms": 3000 } } }
+    "truncated": null,
+    "resolution_not_followed": false },
+  "meta": { "rev": 42, "published_at": "…", "graph_state": "published", "capabilities": {},
+            "budgets": { "nodes": 500, "edges": 2000, "assume_hops": 4, "paths": 200,
+                         "neighbours_per_page": 100, "timeout_ms": 3000 },
+            "limitations": [ { "code": "effective_access_not_evaluated" },
+                             { "code": "organizations_not_collected" } ] } }
 ```
+
+Nodes carry `account` (absent on statements), `state`, `lifecycle`,
+`last_confirmed_at`, `stale_reason?` and `limitations` always, and by type:
+workload `arn`, `runtime_kind`; identity `arn`, `restrictions`,
+`used_by_count`; external principal `mechanism`, `issuer`, `subject`,
+`resolution`; statement `policy` (the policy's **name**), `policy_ref`,
+`effect`, `sid`, `index?`, `group_key`, `exclusions` (`[{ref, text}]`, the
+`NotResource` entries); resource `text`, `type`. A resource node's `kind` is
+its reference kind (`exact`, `selector`, `external`). Edges carry `claim`,
+`kind`, `from`/`to` (the claim's own endpoints whatever the traversal
+direction), `state`, `basis`, `closes_cycle`, `crosses_account`,
+`last_confirmed_at`, `stale_reason?`, `limitations`, and `mode?` (target),
+`mechanism?` (relationships), `policy?` (grant, the name). Limitations
+stated once for every element sit in `meta.limitations`; an element carries
+only its own. `resolution_not_followed` is `null` when not established.
+
+`/graph/expand` returns `{ nodes, edges, frontier, truncated, next_cursor }` —
+the neighbours only, not the expanded node. `/graph/path` returns:
+
+```json
+{ "data": { "from": "workload:6f1e…", "to": "resource:0b9…",
+            "outcome": "found", "direction": "forward",
+            "paths": [ { "nodes": [ { …full node… } ], "edges": [ { …full edge… } ],
+                         "limitations": [ … ] } ],
+            "more_paths": false, "bound_by": null },
+  "meta": { … as /graph … } }
+```
+
+Each path holds its own full node and edge objects, `from` to `to`, and the
+union of its limitations; there is no top-level node or edge list.
+`direction` is the orientation of the returned paths (`null` unless
+`found`); `bound_by` is `nodes`, `edges`, `assume_hops`, `time`, `paths`,
+`resolution_not_followed` or `null`.
 
 `group_key` lets the canvas draw statements with the same actions and target
 as one line (§2.14.11); the response always lists each statement and grant
@@ -5989,7 +6456,12 @@ separately.
 
 #### Evidence
 
-`GET /api/iga/v1/evidence?claim=<claim ref>` — any claim or object ref:
+`GET /api/iga/v1/evidence?claim=<ref>&include=raw&rev=` — any claim ref
+(`grant`, `assignment`, `relationship`, `target`, `presence`, `coverage`) or
+object ref (which means its presence). `claim` is repeatable up to 50: one
+claim returns `data` as an object, several as an array, with
+`meta.summary?: { sentence }` when they share a holder and `group_key`. `meta`
+is detail meta.
 
 ```json
 { "data": {
@@ -5999,21 +6471,36 @@ separately.
       { "source_api": "iam:GetAccountAuthorizationDetails", "account_id": "220171243705", "region": null,
         "observed_in_run": "cloud_scan_run:9a3…", "last_confirmed_at": "…",
         "fact": "SharedToolRole has TicketRead attached" },
-      { "source_api": "iam:GetPolicyVersion", "policy_version": "v3",
+      { "source_api": "iam:GetPolicyVersion", "account_id": "220171243705", "region": null,
+        "observed_in_run": "cloud_scan_run:9a3…", "last_confirmed_at": "…", "policy_version": "v3",
         "fact": "Statement ReadTickets allows s3:GetObject on arn:aws:s3:::support-tickets/*",
+        "policy": { "ref": "policy:3f0…", "name": "TicketRead", "kind": "customer_managed" },
+        "statement": { "ref": "statement:77e…", "sid": "ReadTickets", "index": 2 },
         "statement_excerpt": { "Sid": "ReadTickets", "Effect": "Allow", "Action": "s3:GetObject",
                                "Resource": "arn:aws:s3:::support-tickets/*" } } ],
-    "freshness": { "first_seen_at": "…", "last_confirmed_at": "…", "stale_since": null },
+    "freshness": { "first_seen_at": "…", "last_confirmed_at": "…", "stale_since": null,
+                   "valid_to": null, "ended_reason": null },
     "limitations": [
       { "code": "effective_access_not_evaluated" },
-      { "code": "selector_may_match_nothing" },
-      { "code": "resource_existence_not_verified" },
+      { "code": "selector_may_match_nothing", "resources": [ "resource:0b9…" ] },
       { "code": "organizations_not_collected" } ],
     "raw": null },
-  "meta": { "rev": 42 } }
+  "meta": { "rev": 42, "published_at": "…", "graph_state": "published", "capabilities": {} } }
 ```
 
-`include=raw` adds the stored observation `sanitized_facts`. Those are
+`status.basis` is `null` for coverage claims; `collection` is `complete`,
+`partial` or `stale`. Every fact states `source_api`, `account_id`, `region`,
+`observed_in_run` and `last_confirmed_at` (each nullable); `policy_version`,
+`statement_excerpt`, `policy` and `statement` appear when the fact is about
+a statement. `freshness.stale_since` is set only when stale, `valid_to` and
+`ended_reason` only when ended. Each limitation is `{ code, … }` with the
+fields its code needs (`keys`, `negations`, `count`/`statements`/`truncated`,
+`holder`/`policies`/`members`/`member_count`, `resources`, `accounts`,
+`account_id`/`surface`/`state`/`since`); ref lists cap at 50.
+
+`include=raw` sets `raw` to an array aligned one to one with `facts`, each
+`{ observation, source_api, sanitized_facts }` from the stored observation
+(`observation` is a `cloud_observation:` ref). `sanitized_facts` are
 redacted **at write time** by the observation writer (`cloud_observation_writer.go:34-49`)
 and are returned only through this authorized route; nothing else exposes
 them. The **limitations vocabulary**, with the exact condition for each, is:
@@ -6037,34 +6524,76 @@ them. The **limitations vocabulary**, with the exact condition for each, is:
 
 #### Changes
 
-`GET /api/iga/v1/{workloads|identities|resources}/:id/changes?kind=configuration|coverage&cursor=`
-— events, newest first, 50 per page:
+`GET /api/iga/v1/{workloads|identities|resources}/:id/changes?kind=configuration|coverage&limit=&cursor=&rev=`
+— events, newest first by `(at, event, id)`, `limit` 1–200, default 50:
 
-| Event | Source |
-|---|---|
-| `first_seen`, `retired` (with reason: `unsupported`, `recreated`, `policy_recreated`), `restored` | `iga_lifecycle_event` (`036`) |
-| `relationship_started` / `relationship_ended` | `iga_relationship` `valid_from` / `valid_to`, `ended_reason` |
-| `policy_attached` / `policy_detached` | Assignment periods |
-| `grant_started` / `grant_ended` | Grants |
-| `statement_revised` | `iga_statement_revision` (before and after) |
-| `statement_replaced` | A Sid-less statement ended and another began in the same policy in the same run |
-| `coverage_changed` | Consecutive runs' coverage for the object's account and surfaces |
+| Event | Source | `detail` (`subject`) |
+|---|---|---|
+| `first_seen`, `retired` (with reason: `unsupported`, `recreated`, `policy_recreated`), `restored` | `iga_lifecycle_event` (`036`) | `{object}` (the object) |
+| `relationship_started` / `relationship_ended` | `iga_relationship` `valid_from` / `valid_to` | `{type, source, target, mechanism?, state}` (`relationship:`) |
+| `policy_attached` / `policy_detached` | Assignment periods | `{policy, holder, assignment_kind, state}` (`assignment:`) |
+| `grant_started` / `grant_ended` | Grant periods | `{policy, statement, holder, assignment, state, actions, not_actions?, targets}` (`grant:`) |
+| `statement_revised` | `iga_statement_revision` | `{statement, policy}` (`statement:`) |
+| `statement_replaced` | A Sid-less statement retired and a statement of the same policy began, in one run | `{policy}` (`policy:`) |
+| `coverage_changed` | Consecutive published runs' coverage for the object's account and surfaces (`kind=coverage` only) | `{integration, account_id, surface}` (`coverage:`) |
 
-Each event carries its time, run, the claim refs involved, and for
-grant/assignment ends the grants that **remain** on the same path, so the view
-can say *"the path remains through ToolboxRead"*.
+```json
+{ "id": "policy_detached:5aa…", "event": "policy_detached",
+  "at": "2026-09-21T14:02:00.123456Z", "rev": 43, "run": "cloud_scan_run:9a3…",
+  "subject": "assignment:5aa…",
+  "claims": [ "assignment:5aa…", "policy:3f0…", "identity:c41…" ],
+  "reason": "not_seen", "via": "identity:c41…",
+  "detail": { "policy": "policy:3f0…", "holder": "identity:c41…",
+              "assignment_kind": "attached", "state": "ended" },
+  "remaining": [ { "grant": "grant:a12…", "state": "current", "last_confirmed_at": "…",
+                   "policy": "policy:7c4…", "statement": "statement:91b…",
+                   "targets": [ "resource:0b9…" ] } ],
+  "paths": [ { "target": "resource:0b9…", "remains": "current" } ],
+  "labels": { "policy:3f0…": "TicketRead", "identity:c41…": "SharedToolRole",
+              "policy:7c4…": "ToolboxRead", "resource:0b9…": "support-tickets/*" } }
+```
+
+`id` is `<event>:<uuid>`, stable, not a typed ref. `at` is microsecond
+precision (it is the publication's `published_at`); `rev` and `run` are
+`null` when no single publication matches. Every value in `subject`,
+`claims`, `detail`, `remaining` and `paths` is a ref, and `labels` names each
+one, so the console composes *"TicketRead detached from SharedToolRole"*
+without a second read. `via?` appears on workload Changes only (the execution
+identity the event reached it through). `reason` is the retirement reason of
+a lifecycle event or the stored `ended_reason` of an end, as recorded; the
+view never classifies an end by it (§4.10: an end the reconciler observed is
+`not_seen` even when the object behind it retires in the same pass — a detached policy
+reads `policy_detached`, a replaced statement `statement_replaced`, a
+retirement `retired`). `remaining?` and `paths?` appear on `grant_ended` and
+non-boundary `policy_detached`: the grants still declaring a path to the
+ended claim's targets, and per target whether a path `remains` (`current`,
+`stale`, `none`), so the view can say *"the path remains through
+ToolboxRead"*. `before?`/`after?` appear on `statement_revised` (`{statement,
+policy_version_id, content_hash}`), `statement_replaced` (`{policy_version_id,
+statements: [{statement, content, content_hash}]}`) and `coverage_changed`
+(before `{state, recorded, run, coverage}`, after `{state, recorded,
+error_code, api, error, prevents}`). `meta` is the list meta plus `kind` and
+`history_begins` (microsecond time of the object's first `first_seen`, or
+`null`): nothing earlier is claimed. The feed is chosen by
+`kind=configuration|coverage`; in the console it is the view-owned query
+parameter `feed`.
 
 #### Classification
 
 `POST /api/iga/v1/workloads/:id/classification` — §5.5.
-`GET /api/iga/v1/workloads/:id/classification` — the decision history, newest
-first.
+`GET /api/iga/v1/workloads/:id/classification?limit=&cursor=&rev=` — the
+decision history, newest first by `result_version`, in a list envelope
+(`coverage: []`): `[{ id, operation_id, decision, previous, purpose, reason,
+decided_by: { user_id, display }, decided_at, against_version,
+result_version, undoes_decision_id }]`, ids bare UUIDs, `purpose` nullable.
 
 #### Lookup
 
 `GET /api/iga/v1/lookup?cloud_ref=cloud_identity:<id>|cloud_workload:<id>` —
 the graph object projected from a Cloud Inventory row, by source key through
-the row's own connector; `404` when none. Never by name.
+the row's own connector: `{ "data": { "ref": "identity:c41…", "lifecycle":
+"active" }, "meta": { … detail meta … } }`; `404 not_found` when none
+(including nothing published, or a non-AWS connector). Never by name.
 
 ### 5.4 Traversal
 
@@ -6230,6 +6759,31 @@ Agents & workloads order is by name for this reason (§2.14.6).
 T6.10 load-tests these on a generated 10 000-workload fixture; a target missed
 is a defect, not a note.
 
+### 5.7 Read additions the experience asks for (proposed, not implemented)
+
+The §2.14 experience runs on the reads above. Where it needs data they do not
+return, it shows a truthful fallback today; each row below is the contract that
+would replace that fallback. **None of these is built.** Already met, and so
+not listed: server-side search, filter, sort and full-scope facets and totals
+at the revision (§5.2), and revision-consistent counts (every count on a page
+is taken in that page's snapshot, §5.1).
+
+Every addition shares these rules: the workspace is the authenticated one,
+never a parameter (§5.2); the read runs in the revision snapshot and returns
+`meta.revision`; a cursor follows §5.1's rule for a revision that changed; a
+count is `Exact` — capped, `{value: null, exact: false}` when its optional
+query did not finish, never a number that looks exact.
+
+| Addition | Consumer | Request → response | Completeness and failure | Fallback shown today |
+|---|---|---|---|---|
+| **Typed direct bindings** | Identities list *Bindings* column and filter; identity Overview; graph selection card | Identity rows, `/identities/:id` and graph identity nodes add `bindings: { runs_as: Exact, execution_role: Exact }` beside `used_by_count`, which keeps D-17's meaning. The list adds `bound_as=runs_as\|execution_role` beside `used_by=workloads` | Same optional-work rule as `used_by_count`; each half fails independently to `exact: false` | One count, labelled *Direct bindings* and explained as "run as it, or whose ECS agent uses it as the task execution role". The two roles are told apart where the relationship itself is shown (the workload's Identities, the graph's *runs as* / *ECS agent uses*) |
+| **Paged paths** | Paths view once the canvas reaches its limit (§2.14.11) | `/graph/path` adds `cursor=` and returns `next_cursor` when `bound_by: "paths"`; each page is the next shortest paths, full nodes and edges as now | `more_paths` and `bound_by` unchanged; a page past the deadline returns what it has with `bound_by: "time"` | Paths lists the paths in the **loaded** graph and says so, including when a path was cut by the depth limit; a server path with `more_paths` says "More paths exist beyond the search limit" |
+| **Server-side Overview summary** | Overview (§2.14.11 *Views*) on a root whose statements are not all loaded | `GET /graph/summary?root=&direction=&cursor=` → `lines: [{ holder, target, effect, statements: [ref], grants: [claim], targets: [claim] }]`, 100 lines a page | A line keeps every claim behind it (evidence-preserving); Allow and Deny are never one line; `truncated` as `/graph` | The client summarises only statements whose grant and targets are loaded; a statement with more targets to load stays drawn, with its own Load control |
+| **Per-object collection summary** | Selection card's uncertainty line; evidence *Collection source and freshness* | Graph nodes and detail reads add `collection: { surfaces: [{ surface, state, as_of }] }` for the surfaces that could have produced or ended the object | `state` uses the coverage vocabulary (§1.4); an unknown surface is `unknown`, never omitted | The node's own `limitations` and `stale_reason`, and the account's coverage on the list pages |
+
+A security judgement is never derived from these: a shared role is not a
+finding, and a declared path is not effective access (§1.2).
+
 ## 6. Implementation handoff
 
 ### 6.1 Starting from the graph branch
@@ -6317,7 +6871,7 @@ check. `Proof` is the §7 scenario that fails without it.
 | Task | Files | Change | Gate |
 |---|---|---|---|
 | T5.1 | `internal/igagraph/snapshot.go`, `reconcile.go` | Partitions per §4.10; `Exclusions` and `protected()` applied in every edge and support update; exhaustive `scope()` | B12 and B18. E9 |
-| T5.2 | `reconcile.go` | Retirement cascade table (§4.10); policy recreation | Policy retired → assignments end `policy_retired`. E7 |
+| T5.2 | `reconcile.go` | Retirement cascade table (§4.10); policy recreation | Policy retired on a clean scan → its assignments end `not_seen` (closed by their partition first); an edge its partition left stale ends with the cascade reason. E7 |
 | T5.3 | `repository/iga_graph_repository.go` | Revisions and target replacement (§4.10 contracts) | Sid edit → one new revision, same grant id. E7 |
 | T5.4 | `internal/igagraph` (event log), `internal/igaread` | `iga_lifecycle_event` written in the projection transaction; Changes events (§5.3) | Detach → `policy_detached` with remaining grants; retire → restore → both events present after later updates (B24). E6, E8 |
 
