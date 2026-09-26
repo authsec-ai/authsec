@@ -312,8 +312,8 @@ func claimWholeSnapshot(tx *gorm.DB, head collectorBatch, owner string, until, n
 	if err := tx.Raw(`SELECT count(*) FROM collector_outbox o
 		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
 		WHERE o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
-		  AND o.workspace_id = ? AND b.snapshot_id = ?`,
-		owner, models.OutboxKindCollectorProject, head.WorkspaceID, *head.SnapshotID).
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.epoch = ? AND b.snapshot_id = ?`,
+		owner, models.OutboxKindCollectorProject, head.WorkspaceID, head.CollectorID, head.Epoch, *head.SnapshotID).
 		Scan(&owned).Error; err != nil {
 		return snapshotClaim{}, err
 	}
@@ -332,10 +332,10 @@ func snapshotClaimLeader(tx *gorm.DB, head collectorBatch, owner string) (bool, 
 	err := tx.Raw(`SELECT MIN(b.sequence) FROM collector_outbox o
 		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
 		WHERE o.job_kind = ?
-		  AND o.workspace_id = ? AND o.collector_id = ? AND b.snapshot_id = ?
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.epoch = ? AND b.snapshot_id = ?
 		  AND b.projection_state = 'queued' AND b.superseded_at IS NULL
 		  AND o.state IN ('ready', 'leased')`,
-		models.OutboxKindCollectorProject, head.WorkspaceID, head.CollectorID, *head.SnapshotID).
+		models.OutboxKindCollectorProject, head.WorkspaceID, head.CollectorID, head.Epoch, *head.SnapshotID).
 		Row().Scan(&pending)
 	if err != nil {
 		return false, err
@@ -343,8 +343,8 @@ func snapshotClaimLeader(tx *gorm.DB, head collectorBatch, owner string) (bool, 
 	err = tx.Raw(`SELECT MIN(b.sequence) FROM collector_outbox o
 		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
 		WHERE o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
-		  AND o.workspace_id = ? AND b.snapshot_id = ?`,
-		owner, models.OutboxKindCollectorProject, head.WorkspaceID, *head.SnapshotID).
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.epoch = ? AND b.snapshot_id = ?`,
+		owner, models.OutboxKindCollectorProject, head.WorkspaceID, head.CollectorID, head.Epoch, *head.SnapshotID).
 		Row().Scan(&owned)
 	if err != nil {
 		return false, err
@@ -358,9 +358,9 @@ func releaseSnapshotClaim(tx *gorm.DB, head collectorBatch, owner string, until 
 		FROM collector_batches b
 		WHERE b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
 		  AND o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
-		  AND o.workspace_id = ? AND o.collector_id = ? AND b.snapshot_id = ?`,
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.epoch = ? AND b.snapshot_id = ?`,
 		until, owner, models.OutboxKindCollectorProject,
-		head.WorkspaceID, head.CollectorID, *head.SnapshotID).Error
+		head.WorkspaceID, head.CollectorID, head.Epoch, *head.SnapshotID).Error
 }
 
 func claimCollectorSiblings(tx *gorm.DB, head collectorBatch, owner string, until, now time.Time) error {
@@ -565,7 +565,7 @@ func (s *ProjectionService) publishCollector(ctx context.Context, batches []coll
 		}
 		writer := s.collector
 		if writer == nil {
-			writer = SupportWriter{}
+			writer = ProviderWriter{}
 		}
 		if err := writer.Project(tx, pass); err != nil {
 			return err
@@ -779,8 +779,8 @@ func expandSnapshotRuns(tx *gorm.DB, pass *CollectorPass, refs *[]models.SourceM
 		return nil
 	}
 	rows, err := tx.Raw(`SELECT iga_scan_run_id FROM collector_batches
-		WHERE workspace_id = ? AND snapshot_id = ? AND iga_scan_run_id IS NOT NULL`,
-		pass.WorkspaceID, *pass.SnapshotID).Rows()
+		WHERE workspace_id = ? AND collector_id = ? AND epoch = ? AND snapshot_id = ? AND iga_scan_run_id IS NOT NULL`,
+		pass.WorkspaceID, pass.CollectorID, pass.Epoch, *pass.SnapshotID).Rows()
 	if err != nil {
 		return err
 	}
@@ -815,8 +815,8 @@ func snapshotPublicationRev(tx *gorm.DB, pass CollectorPass) (int64, error) {
 	var rev int64
 	if pass.SnapshotID != nil {
 		err := tx.Raw(`SELECT COALESCE(MAX(graph_revision), 0) FROM collector_batches
-			WHERE workspace_id = ? AND snapshot_id = ?`,
-			pass.WorkspaceID, *pass.SnapshotID).Scan(&rev).Error
+			WHERE workspace_id = ? AND collector_id = ? AND epoch = ? AND snapshot_id = ?`,
+			pass.WorkspaceID, pass.CollectorID, pass.Epoch, *pass.SnapshotID).Scan(&rev).Error
 		if err != nil {
 			return 0, err
 		}
@@ -1191,7 +1191,7 @@ func (FixtureWriter) materialize(tx *gorm.DB, in CollectorPass) error {
 		case models.ObjectIdentity:
 			_, err = in.Repo.UpsertIdentity(tx, &models.IGAIdentityAccount{
 				WorkspaceID: in.WorkspaceID, EstateScopeID: &scopeID, DisplayName: row.RecognitionKey,
-				AccountKind: "user", Provider: "kubernetes", SourceKey: key,
+				AccountKind: "k8s_service_account", Provider: "kubernetes", SourceKey: key,
 				ProviderAttrs: json.RawMessage(`{}`),
 				FirstSeenAt:   in.At, LastSeenAt: in.At,
 			})

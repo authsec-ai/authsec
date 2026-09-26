@@ -68,6 +68,10 @@ const (
 	// Allow statement of the role's trust policy. Trust PERMITS assumption --
 	// never that assumption succeeds.
 	RelTypeCanAssume = "can_assume"
+	// RelTypeBackedByDirectory is a local identity backed by a directory
+	// object. Derivation is a later package. The basis is derived or asserted,
+	// never observed and never declared.
+	RelTypeBackedByDirectory = "backed_by_directory"
 )
 
 // Trust mechanisms (iga_relationship.mechanism, required exactly for
@@ -138,6 +142,9 @@ const (
 	EndedPolicyRecreated  = "policy_recreated"
 	EndedPolicyRetired    = "policy_retired"
 	EndedStatementRetired = "statement_retired"
+	// EndedRuntimeUnobserved -- a runtime partition was not re-observed within
+	// its TTL. Snapshot absence never uses this reason.
+	EndedRuntimeUnobserved = "runtime_unobserved"
 )
 
 // Workload classification (§2.14.3).
@@ -198,14 +205,23 @@ const (
 	PolicyKindAWSManaged      = "aws_managed"
 	PolicyKindCustomerManaged = "customer_managed"
 	PolicyKindInline          = "inline"
+	PolicyKindK8sRole         = "k8s_role"
+	PolicyKindK8sClusterRole  = "k8s_cluster_role"
+	PolicyKindK8sNetwork      = "k8s_network_policy"
+	PolicyKindPOSIXACL        = "linux_posix_acl"
+	PolicyKindSystemd         = "linux_systemd"
+	PolicyKindLSM             = "linux_lsm"
+	PolicyKindNftables        = "linux_nftables"
 )
 
 // Assignment kinds: how a policy applies to a holder. A boundary LIMITS and
 // never grants (§2.6).
 const (
-	AssignmentAttached = "attached"
-	AssignmentInline   = "inline"
-	AssignmentBoundary = "boundary"
+	AssignmentAttached              = "attached"
+	AssignmentInline                = "inline"
+	AssignmentBoundary              = "boundary"
+	AssignmentK8sRoleBinding        = "k8s_role_binding"
+	AssignmentK8sClusterRoleBinding = "k8s_cluster_role_binding"
 )
 
 // Target modes: a statement's Resource list, or its NotResource list. A
@@ -408,8 +424,11 @@ type IGAPolicy struct {
 	// its holder.
 	ImmutableKey string `json:"immutable_key" gorm:"not null;default:''"`
 
-	VersionID     string `json:"version_id" gorm:"not null;default:''"`
-	DocumentHash  string `json:"document_hash" gorm:"not null;default:''"`
+	VersionID    string `json:"version_id" gorm:"not null;default:''"`
+	DocumentHash string `json:"document_hash" gorm:"not null;default:''"`
+	// RightsSchema says which native document native_rights holds. Empty on
+	// rows this package did not project. It is not an authorization verdict.
+	RightsSchema  string `json:"rights_schema" gorm:"not null;default:''"`
 	Lifecycle     string `json:"lifecycle" gorm:"not null;default:'active'"`
 	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
 
@@ -469,6 +488,10 @@ type IGAPolicyAssignment struct {
 	EndedReason             string     `json:"ended_reason" gorm:"not null;default:''"`
 	SourceKey               string     `json:"source_key" gorm:"not null"`
 	PartitionKey            string     `json:"partition_key" gorm:"not null"`
+	BindingNativeUID        string     `json:"binding_native_uid" gorm:"not null;default:''"`
+	AssignmentScopeKind     string     `json:"assignment_scope_kind" gorm:"not null;default:''"`
+	AssignmentEstateScopeID *uuid.UUID `json:"assignment_estate_scope_id,omitempty" gorm:"type:uuid"`
+	NamespaceUID            string     `json:"namespace_uid" gorm:"not null;default:''"`
 	ConnectorID             *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
 	IntegrationID           *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
 	ConfirmingIGAScanRunID  *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`

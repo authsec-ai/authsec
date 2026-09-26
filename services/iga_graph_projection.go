@@ -126,6 +126,18 @@ func CollectorMicrobatch() time.Duration {
 	return 5 * time.Second
 }
 
+// RuntimeSupportTTL is how long runtime support stays current without a new
+// observation. Snapshot absence does not use it. IGA_V2_RUNTIME_SUPPORT_TTL
+// overrides it. The default is 24h.
+func RuntimeSupportTTL() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("IGA_V2_RUNTIME_SUPPORT_TTL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 24 * time.Hour
+}
+
 // v2ProjectionColumns are the 040 columns collector projection writes.
 var v2ProjectionColumns = []string{
 	"iga_object_support.integration_id",

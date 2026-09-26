@@ -249,6 +249,10 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 	for _, seed := range bfkAfterSideSeed {
 		seed(t, db, s)
 	}
+	for _, extra := range bfkExtraParents {
+		key, row := extra(s)
+		s.put(t, db, key, row)
+	}
 	return s
 }
 
@@ -256,6 +260,10 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 // scope and run its composite keys reference. The hook stays here so the
 // shared case list does not grow an AD seed.
 var bfkAfterSideSeed []func(t *testing.T, db *sql.DB, s *bfkSide)
+
+// bfkExtraParents adds rows that later migrations need as parents. A4 registers
+// the runtime instance. The hook stays here so the shared case file does not.
+var bfkExtraParents []func(*bfkSide) (string, bfkRow)
 
 func (s *bfkSide) arn(kind string) string {
 	return fmt.Sprintf("arn:aws:iam::%s:%s/bfk-%s", s.acct, kind, uuid.NewString())
