@@ -198,11 +198,14 @@ var bfkNoForeignKey = map[string]string{
 		"(workspace_id, id)",
 	"iga_pipeline_lease.scan_run_id": "027: SPEC QUESTION: no key at all, so a barrier can name another " +
 		"workspace's run or none (§2.9)",
-	// 040: copied watermark, not a parent. collector_snapshots.epoch is not
-	// unique (many snapshots share one epoch), so there is no key to reference.
-	// The fence compares generation then sequence; the epoch is recorded beside them.
+	// 040: copied watermarks, not parents. collector_snapshots.epoch is not
+	// unique (many snapshots share one epoch). snapshot_id is unique only
+	// together with workspace_id and collector_id. The fence compares
+	// generation, then snapshot_id. Neither column is a foreign key.
 	"iga_projection_state.ordering_epoch": "040: ordering watermark copied from the collector snapshot's epoch. " +
 		"Not a foreign key: epoch is not unique on collector_snapshots",
+	"iga_projection_state.ordering_snapshot": "040: snapshot_id that set the generation watermark. " +
+		"Not a foreign key: collector_snapshots uniqueness is (workspace_id, collector_id, snapshot_id)",
 	"cloud_identity.workspace_id": "011: SPEC QUESTION: anchored by nothing. cloud_identity_connector_id_fkey " +
 		"is single-column, so an identity can name a workspace that does not exist, or one its connector " +
 		"is not in, and 035's cloud_identity_scope_key then pairs that workspace with that connector",

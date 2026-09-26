@@ -159,6 +159,24 @@ func TestTRD2ITStaleGenerationDoesNotEndSupport(t *testing.T) {
 	if n := f.scalar(`SELECT count(*) FROM collector_batches WHERE iga_scan_run_id = $1 AND superseded_at IS NOT NULL AND projection_state = 'queued'`, run1); n != 1 {
 		t.Fatalf("superseded batches = %d", n)
 	}
+	var receiptID uuid.UUID
+	f.scan(`SELECT receipt_id FROM collector_batches WHERE iga_scan_run_id = $1`, []any{run1}, &receiptID)
+	raw, err := services.NewCollectorSyncService(f.g, nil).Receipt(&models.CollectorPrincipal{
+		WorkspaceID: f.ws, CollectorID: collector, Scopes: []string{models.CollectorScopeReceiptWrite},
+	}, receiptID)
+	if err != nil {
+		t.Fatalf("receipt: %v", err)
+	}
+	var view struct {
+		State           string `json:"state"`
+		ProjectionState string `json:"projection_state"`
+	}
+	if err := json.Unmarshal(raw, &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.State != "superseded" || view.ProjectionState != "superseded" {
+		t.Fatalf("receipt = %s", raw)
+	}
 	after := f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND state = 'current'`, f.ws)
 	if after != before {
 		t.Fatalf("support current %d -> %d", before, after)
@@ -249,8 +267,9 @@ func TestTRD2ITCrashReclaimThenAWS(t *testing.T) {
 
 func TestTRD2ITAttemptsCeilingReleasesBarrier(t *testing.T) {
 	f := newA3(t)
-	integ, _, _ := f.seedCollector("linux")
+	integ, collector, _ := f.seedCollector("linux")
 	run := f.seedRun(integ, "runtime_batch", false)
+	f.seedBatch(integ, collector, uuid.New(), run, 1, uuid.Nil)
 	jobID := uuid.New()
 	f.exec(`INSERT INTO iga_projection_job
 		(id, workspace_id, iga_scan_run_id, generation, status, attempts, lease_owner, lease_expires_at)
@@ -263,15 +282,155 @@ func TestTRD2ITAttemptsCeilingReleasesBarrier(t *testing.T) {
 	if err := f.svc().RecoverStalled(context.Background(), time.Now()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	var barrier string
+	var barrier, outbox string
 	f.scan(`SELECT state FROM iga_pipeline_lease WHERE workspace_id = $1`, []any{f.ws}, &barrier)
 	if barrier != models.PipelineIdle {
 		t.Fatalf("ceiling left barrier %s", barrier)
+	}
+	f.scan(`SELECT state FROM collector_outbox WHERE workspace_id = $1 AND job_kind = 'collector_project'`, []any{f.ws}, &outbox)
+	if outbox != "failed" {
+		t.Fatalf("abandoned run left outbox %s", outbox)
+	}
+	if _, err := f.svc().RunOnce(context.Background()); err != nil {
+		t.Fatalf("run after ceiling: %v", err)
+	}
+	f.scan(`SELECT state FROM collector_outbox WHERE workspace_id = $1 AND job_kind = 'collector_project'`, []any{f.ws}, &outbox)
+	if outbox != "failed" {
+		t.Fatalf("outbox requeued after abandon: %s", outbox)
 	}
 	cloud := f.publishedRun(f.connector, 1)
 	pipe := repositories.NewIGAPipelineLeaseRepository(f.g)
 	if _, err := pipe.AcquireForCollection(f.ws, "aws-scan", cloud, time.Minute, time.Now()); err != nil {
 		t.Fatalf("AWS acquire after ceiling: %v", err)
+	}
+}
+
+func TestTRD2ITSnapshotProjectsWhole(t *testing.T) {
+	f := newA3(t)
+	integ, collector, _ := f.seedCollector("kubernetes")
+	epochA := uuid.New()
+	runA := f.seedRun(integ, "configuration_snapshot", true)
+	for _, name := range []string{"ghost", "p1", "p2", "p3"} {
+		f.seedObject(integ, runA, "Pod", name)
+	}
+	snapA := f.seedSnapshot(collector, epochA, "cluster-a", "Pod", true, 1)
+	f.seedBatch(integ, collector, epochA, runA, 9, snapA)
+
+	t.Setenv("IGA_V2_PROJECTION", "on")
+	t.Setenv("IGA_V2_MICROBATCH", "1ms")
+	svc := f.svc()
+	if _, err := svc.RunOnce(context.Background()); err != nil {
+		t.Fatalf("prior snapshot: %v", err)
+	}
+	f.wantPubs(runA, 1)
+
+	epochB := uuid.New()
+	snapB := f.seedSnapshot(collector, epochB, "cluster-a", "Pod", true, 1)
+	f.exec(`UPDATE collector_snapshots SET expected_chunks = 3 WHERE snapshot_id = $1`, snapB)
+	var runs [3]uuid.UUID
+	for i := 1; i <= 3; i++ {
+		runs[i-1] = f.seedRun(integ, "configuration_snapshot", true)
+		f.seedObject(integ, runs[i-1], "Pod", fmt.Sprintf("p%d", i))
+		f.seedBatch(integ, collector, epochB, runs[i-1], int64(i), snapB)
+	}
+	f.exec(`UPDATE collector_outbox SET available_at = now() + interval '1 hour'
+		WHERE batch_row_id IN (SELECT id FROM collector_batches WHERE iga_scan_run_id = $1)`, runs[2])
+
+	if _, err := svc.RunOnce(context.Background()); err != nil {
+		t.Fatalf("three-chunk snapshot: %v", err)
+	}
+	for i, run := range runs {
+		if state := f.batchState(run); state != "published" {
+			t.Fatalf("chunk %d state = %s", i+1, state)
+		}
+		if n := f.scalar(`SELECT count(*) FROM collector_batches WHERE iga_scan_run_id = $1 AND superseded_at IS NOT NULL`, run); n != 0 {
+			t.Fatalf("chunk %d superseded", i+1)
+		}
+	}
+	if n := f.scalar(`SELECT count(*) FROM iga_publication WHERE workspace_id = $1`, f.ws); n != 2 {
+		t.Fatalf("publications = %d, want the prior snapshot plus one pass", n)
+	}
+	var manifest []byte
+	f.scan(`SELECT source_manifest_v2 FROM iga_publication WHERE iga_scan_run_id = $1`, []any{runs[0]}, &manifest)
+	var refs []models.SourceManifestRef
+	if err := json.Unmarshal(manifest, &refs); err != nil || len(refs) != 3 {
+		t.Fatalf("source_manifest_v2 = %s (%v)", manifest, err)
+	}
+	if got := f.supportState(integ, "Pod", "p3"); got != "current" {
+		t.Fatalf("chunk-3 object support = %s", got)
+	}
+	if got := f.supportState(integ, "Pod", "ghost"); got != "ended" {
+		t.Fatalf("absent object support = %s", got)
+	}
+}
+
+func TestTRD2ITSnapshotReplicasOnePass(t *testing.T) {
+	f := newA3(t)
+	integ, collector, _ := f.seedCollector("kubernetes")
+	epochA := uuid.New()
+	runA := f.seedRun(integ, "configuration_snapshot", true)
+	for _, name := range []string{"ghost", "p1", "p2", "p3"} {
+		f.seedObject(integ, runA, "Pod", name)
+	}
+	snapA := f.seedSnapshot(collector, epochA, "cluster-a", "Pod", true, 1)
+	f.seedBatch(integ, collector, epochA, runA, 1, snapA)
+	t.Setenv("IGA_V2_PROJECTION", "on")
+	t.Setenv("IGA_V2_MICROBATCH", "200ms")
+	if _, err := f.svc().RunOnce(context.Background()); err != nil {
+		t.Fatalf("prior snapshot: %v", err)
+	}
+
+	epochB := uuid.New()
+	snapB := f.seedSnapshot(collector, epochB, "cluster-a", "Pod", true, 1)
+	f.exec(`UPDATE collector_snapshots SET expected_chunks = 3 WHERE snapshot_id = $1`, snapB)
+	var runs [3]uuid.UUID
+	for i := 1; i <= 3; i++ {
+		runs[i-1] = f.seedRun(integ, "configuration_snapshot", true)
+		f.seedObject(integ, runs[i-1], "Pod", fmt.Sprintf("p%d", i))
+		f.seedBatch(integ, collector, epochB, runs[i-1], int64(i), snapB)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			svc := services.NewProjectionService(f.g,
+				repositories.NewIGAProjectionJobRepository(f.g),
+				repositories.NewIGAPipelineLeaseRepository(f.g),
+				f.graph, fmt.Sprintf("replica-%d", n), time.Minute).
+				WithCollectorWriter(services.FixtureWriter{})
+			for k := 0; k < 40; k++ {
+				if _, err := svc.RunOnce(context.Background()); err != nil && !errors.Is(err, repositories.ErrPipelineLost) {
+					errCh <- err
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	if n := f.scalar(`SELECT count(*) FROM collector_batches WHERE snapshot_id = $1 AND projection_state = 'published'`, snapB); n != 3 {
+		t.Fatalf("published chunks = %d", n)
+	}
+	if n := f.scalar(`SELECT count(*) FROM collector_batches WHERE snapshot_id = $1 AND superseded_at IS NOT NULL`, snapB); n != 0 {
+		t.Fatalf("superseded chunks = %d", n)
+	}
+	if n := f.scalar(`SELECT count(*) FROM iga_publication WHERE workspace_id = $1`, f.ws); n != 2 {
+		t.Fatalf("publications = %d, want one authoritative pass plus the prior snapshot", n)
+	}
+	for _, name := range []string{"p1", "p2", "p3"} {
+		if got := f.supportState(integ, "Pod", name); got != "current" {
+			t.Fatalf("%s support = %s", name, got)
+		}
+	}
+	if got := f.supportState(integ, "Pod", "ghost"); got != "ended" {
+		t.Fatalf("ghost support = %s", got)
 	}
 }
 
@@ -684,6 +843,18 @@ func (f *a3) wantPubs(run uuid.UUID, n int) {
 	if got := f.scalar(`SELECT count(*) FROM iga_publication WHERE iga_scan_run_id = $1`, run); got != n {
 		f.t.Fatalf("publications for %s = %d, want %d", run, got, n)
 	}
+}
+
+func (f *a3) supportState(integ uuid.UUID, objectType, name string) string {
+	f.t.Helper()
+	key := fmt.Sprintf("collector:%s:%s:%s", integ, objectType, name)
+	var state string
+	f.scan(`SELECT s.state FROM iga_object_support s
+		LEFT JOIN iga_workload w ON w.id = s.workload_id
+		LEFT JOIN iga_identity_accounts i ON i.id = s.identity_account_id
+		WHERE s.workspace_id = $1 AND (w.source_key = $2 OR i.source_key = $2)`,
+		[]any{f.ws, key}, &state)
+	return state
 }
 
 func (f *a3) batchState(run uuid.UUID) string {

@@ -212,7 +212,13 @@ func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) e
 			case recoveryRelease:
 				return s.pipeline.ReleaseTx(tx, fence)
 			case recoveryAbandon:
-				return s.pipeline.AbandonTx(tx, fence, reason)
+				if err := s.pipeline.AbandonTx(tx, fence, reason); err != nil {
+					return err
+				}
+				if fence.RunKind == models.RunKindCollector {
+					return failCollectorProjectOutbox(tx, fence.WorkspaceID, fence.RunID, reason)
+				}
+				return nil
 			}
 			return nil
 		})

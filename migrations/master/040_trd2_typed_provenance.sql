@@ -107,20 +107,25 @@ ALTER TABLE public.collector_batches
     ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
 
 -- Watermark for (integration, scope, class). last_generation is the highest
--- snapshot generation projected. ordering_sequence breaks ties inside that
--- generation. Runtime batches do not move either value.
+-- snapshot generation projected. ordering_snapshot is the snapshot_id that
+-- set it. ordering_sequence is recorded and is not a tie-break: a different
+-- snapshot of the same generation is projected, not superseded. Runtime
+-- batches do not move any of these values.
 ALTER TABLE public.iga_projection_state
     ADD COLUMN IF NOT EXISTS ordering_sequence bigint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS ordering_epoch uuid;
+    ADD COLUMN IF NOT EXISTS ordering_epoch uuid,
+    ADD COLUMN IF NOT EXISTS ordering_snapshot uuid;
 
 COMMENT ON COLUMN public.collector_batches.snapshot_id IS
     'Logical collector_snapshots.snapshot_id this batch belongs to. NULL is a runtime batch.';
 COMMENT ON COLUMN public.collector_batches.superseded_at IS
-    'Set when a newer snapshot generation for the same integration, scope and class already projected. The batch is not published.';
+    'Set when a newer snapshot generation for the same integration, scope and class already projected. The batch is not published. GET /receipts reports state superseded; these columns stay accepted and queued because 038 forbids projection_state superseded.';
 COMMENT ON COLUMN public.iga_projection_state.ordering_sequence IS
-    'Highest collector batch sequence projected at last_generation for this integration, scope and class.';
+    'Highest collector batch sequence recorded for the snapshot that set last_generation. Not a fence: another snapshot of the same generation is not superseded.';
 COMMENT ON COLUMN public.iga_projection_state.ordering_epoch IS
     'Epoch of the snapshot that set last_generation. A copied watermark, not a foreign key: collector_snapshots.epoch is not unique.';
+COMMENT ON COLUMN public.iga_projection_state.ordering_snapshot IS
+    'collector_snapshots.snapshot_id that set last_generation. A copied watermark, not a foreign key: snapshot_id is unique only with workspace_id and collector_id. The same value on a later pass is a replay, not a newer snapshot.';
 
 COMMENT ON COLUMN public.iga_object_support.integration_id IS
     'Collector owning source. credential_id is reserved for credential projection and is not created until that projection is enabled.';

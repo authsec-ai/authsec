@@ -135,14 +135,15 @@ func TestTRD2CollectorProjectionFence(t *testing.T) {
 	if err := json.Unmarshal(cloudManifest, &asMap); err != nil {
 		t.Fatalf("cloud readers decode manifest as map[string]string: %v (%s)", err, cloudManifest)
 	}
-	if asMap["cluster-a/Pod"] != run.String() {
+	manifestKey := "collector:" + integ.String() + "/cluster-a/Pod"
+	if asMap[manifestKey] != run.String() || asMap["cluster-a/Pod"] != "" {
 		t.Fatalf("manifest = %s", cloudManifest)
 	}
 	latest, err := f.graph.LatestManifest(f.gorm, ws)
 	if err != nil {
 		t.Fatalf("LatestManifest: %v", err)
 	}
-	if err := json.Unmarshal(latest, &asMap); err != nil || asMap["cluster-a/Pod"] != run.String() {
+	if err := json.Unmarshal(latest, &asMap); err != nil || asMap[manifestKey] != run.String() {
 		t.Fatalf("LatestManifest = %s (%v)", latest, err)
 	}
 	assertArm := func(q string, args ...any) {

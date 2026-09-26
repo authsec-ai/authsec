@@ -42,8 +42,11 @@ type CollectorPass struct {
 	Generation    int64
 	Sequence      int64
 	Epoch         uuid.UUID
-	At            time.Time
-	Repo          repositories.IGAGraphRepository
+	// SnapshotID is the logical collector snapshot. Nil for a runtime batch.
+	// Absence and the fence use this id, not the batch sequence.
+	SnapshotID *uuid.UUID
+	At         time.Time
+	Repo       repositories.IGAGraphRepository
 }
 
 // OutboxKindCandidateEval is the enqueue-only handoff to policy evaluation.
@@ -70,13 +73,22 @@ type collectorBatch struct {
 }
 
 type collectorWatermark struct {
-	found      bool
-	generation int64
-	sequence   int64
-	reconciled bool
-	epoch      uuid.UUID
-	epochSet   bool
+	found       bool
+	generation  int64
+	sequence    int64
+	reconciled  bool
+	epoch       uuid.UUID
+	epochSet    bool
+	snapshot    uuid.UUID
+	snapshotSet bool
 }
+
+// A watermark read says whether this pass may write the graph.
+const (
+	watermarkProject = iota
+	watermarkStale
+	watermarkReplay
+)
 
 // projectCollectorOnce claims one microbatch, projects the union of its runs,
 // and publishes them under the workspace fence.
@@ -121,9 +133,19 @@ func (s *ProjectionService) projectCollectorOnce(ctx context.Context) (bool, err
 		return true, err
 	}
 	claimed, err := s.jobs.ClaimCollectorRun(s.owner, head.ScanRunID, s.lease, s.now())
-	if err != nil || claimed == nil {
+	if err != nil {
 		_ = s.requeueOutbox(ctx, batches, s.now())
 		return false, err
+	}
+	if claimed == nil {
+		// An abandoned job still conflicts with EnqueueTx, so Claim returns
+		// nothing and a requeue would reset available_at every tick.
+		if fail, reason := s.collectorOutboxShouldFail(ctx, head); fail {
+			_ = s.releaseOutbox(ctx, batches, "failed", reason)
+			return false, nil
+		}
+		_ = s.requeueOutbox(ctx, batches, s.now())
+		return false, nil
 	}
 	version, err := s.pipeline.AcquireForCollectorProjection(
 		head.WorkspaceID, head.ScanRunID, claimed.ID, s.barrierLease, s.now())
@@ -162,6 +184,7 @@ func (s *ProjectionService) claimCollectorGroup(ctx context.Context) ([]collecto
 	now := s.now()
 	until := now.Add(s.lease)
 	var head collectorBatch
+	var released bool
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var outboxID, ws, integ, collector, batchID uuid.UUID
 		err := tx.Raw(`UPDATE collector_outbox SET
@@ -191,6 +214,26 @@ func (s *ProjectionService) claimCollectorGroup(ctx context.Context) ([]collecto
 			return err
 		}
 		head = loaded
+		if head.Authoritative && head.SnapshotID != nil {
+			got, err := claimWholeSnapshot(tx, head, s.owner, until, now)
+			if err != nil {
+				return err
+			}
+			if !got.ok {
+				// Give the rows back in this transaction. A missing chunk waits
+				// out the microbatch. The replica that holds the lowest sequence
+				// retries at once so the others do not split the snapshot.
+				retry := now.Add(CollectorMicrobatch())
+				if got.leader {
+					retry = now
+				}
+				if err := releaseSnapshotClaim(tx, head, s.owner, retry); err != nil {
+					return err
+				}
+				released = true
+			}
+			return nil
+		}
 		return claimCollectorSiblings(tx, head, s.owner, until, now)
 	})
 	if err != nil {
@@ -199,7 +242,125 @@ func (s *ProjectionService) claimCollectorGroup(ctx context.Context) ([]collecto
 		}
 		return nil, err
 	}
+	if released {
+		return nil, nil
+	}
 	return listOwnedCollectorGroup(s.db.WithContext(ctx), head, s.owner)
+}
+
+// snapshotClaim is the result of trying to lease every chunk of one snapshot.
+type snapshotClaim struct {
+	ok     bool
+	leader bool
+}
+
+// claimWholeSnapshot leases every outbox row of an authoritative snapshot.
+// There is no available_at window: a chunk that is merely not due yet is
+// still part of the snapshot. ok is false when a chunk is missing or another
+// owner holds one. The caller gives back whatever this transaction took.
+func claimWholeSnapshot(tx *gorm.DB, head collectorBatch, owner string, until, now time.Time) (snapshotClaim, error) {
+	var expected int
+	err := tx.Raw(`SELECT expected_chunks FROM collector_snapshots
+		WHERE workspace_id = ? AND collector_id = ? AND snapshot_id = ?`,
+		head.WorkspaceID, head.CollectorID, *head.SnapshotID).Row().Scan(&expected)
+	if err != nil {
+		return snapshotClaim{}, err
+	}
+	var pending int
+	if err := tx.Raw(`SELECT count(*) FROM collector_outbox o
+		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		WHERE o.job_kind = ?
+		  AND o.workspace_id = ? AND o.collector_id = ? AND o.integration_id = ?
+		  AND b.epoch = ? AND b.snapshot_id = ?
+		  AND b.receipt_state = 'accepted' AND b.projection_state = 'queued'
+		  AND b.superseded_at IS NULL
+		  AND o.state IN ('ready', 'leased')`,
+		models.OutboxKindCollectorProject,
+		head.WorkspaceID, head.CollectorID, head.IntegrationID, head.Epoch, *head.SnapshotID).
+		Scan(&pending).Error; err != nil {
+		return snapshotClaim{}, err
+	}
+	if pending < expected {
+		return snapshotClaim{}, nil
+	}
+	// The head row is already leased by owner. Do not increment its attempt
+	// again. SKIP LOCKED skips a chunk another replica holds instead of waiting.
+	if err := tx.Exec(`UPDATE collector_outbox SET
+		state = 'leased', lease_owner = ?, leased_until = ?,
+		attempt_count = CASE WHEN lease_owner = ? AND state = 'leased' THEN attempt_count ELSE attempt_count + 1 END,
+		updated_at = ?
+		WHERE id IN (
+			SELECT o.id FROM collector_outbox o
+			JOIN collector_batches b
+			  ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+			WHERE o.job_kind = ?
+			  AND o.workspace_id = ? AND o.collector_id = ? AND o.integration_id = ?
+			  AND b.epoch = ? AND b.snapshot_id = ?
+			  AND b.receipt_state = 'accepted' AND b.projection_state = 'queued'
+			  AND b.superseded_at IS NULL
+			  AND o.state IN ('ready', 'leased')
+			  AND (o.lease_owner IS NULL OR o.lease_owner = ?
+			    OR o.leased_until IS NULL OR o.leased_until < ?)
+			FOR UPDATE OF o SKIP LOCKED)`,
+		owner, until, owner, now,
+		models.OutboxKindCollectorProject,
+		head.WorkspaceID, head.CollectorID, head.IntegrationID, head.Epoch, *head.SnapshotID,
+		owner, now).Error; err != nil {
+		return snapshotClaim{}, err
+	}
+	var owned int
+	if err := tx.Raw(`SELECT count(*) FROM collector_outbox o
+		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		WHERE o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
+		  AND o.workspace_id = ? AND b.snapshot_id = ?`,
+		owner, models.OutboxKindCollectorProject, head.WorkspaceID, *head.SnapshotID).
+		Scan(&owned).Error; err != nil {
+		return snapshotClaim{}, err
+	}
+	if owned >= expected && owned >= pending {
+		return snapshotClaim{ok: true}, nil
+	}
+	leader, err := snapshotClaimLeader(tx, head, owner)
+	if err != nil {
+		return snapshotClaim{}, err
+	}
+	return snapshotClaim{leader: leader}, nil
+}
+
+func snapshotClaimLeader(tx *gorm.DB, head collectorBatch, owner string) (bool, error) {
+	var pending, owned sql.NullInt64
+	err := tx.Raw(`SELECT MIN(b.sequence) FROM collector_outbox o
+		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		WHERE o.job_kind = ?
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.snapshot_id = ?
+		  AND b.projection_state = 'queued' AND b.superseded_at IS NULL
+		  AND o.state IN ('ready', 'leased')`,
+		models.OutboxKindCollectorProject, head.WorkspaceID, head.CollectorID, *head.SnapshotID).
+		Row().Scan(&pending)
+	if err != nil {
+		return false, err
+	}
+	err = tx.Raw(`SELECT MIN(b.sequence) FROM collector_outbox o
+		JOIN collector_batches b ON b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		WHERE o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
+		  AND o.workspace_id = ? AND b.snapshot_id = ?`,
+		owner, models.OutboxKindCollectorProject, head.WorkspaceID, *head.SnapshotID).
+		Row().Scan(&owned)
+	if err != nil {
+		return false, err
+	}
+	return pending.Valid && owned.Valid && owned.Int64 == pending.Int64, nil
+}
+
+func releaseSnapshotClaim(tx *gorm.DB, head collectorBatch, owner string, until time.Time) error {
+	return tx.Exec(`UPDATE collector_outbox o SET
+		state = 'ready', lease_owner = NULL, leased_until = NULL, available_at = ?, updated_at = now()
+		FROM collector_batches b
+		WHERE b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		  AND o.lease_owner = ? AND o.state = 'leased' AND o.job_kind = ?
+		  AND o.workspace_id = ? AND o.collector_id = ? AND b.snapshot_id = ?`,
+		until, owner, models.OutboxKindCollectorProject,
+		head.WorkspaceID, head.CollectorID, *head.SnapshotID).Error
 }
 
 func claimCollectorSiblings(tx *gorm.DB, head collectorBatch, owner string, until, now time.Time) error {
@@ -352,7 +513,7 @@ func (s *ProjectionService) publishCollector(ctx context.Context, batches []coll
 		ScanRunID: head.ScanRunID, ScanRunIDs: runIDs,
 		Mode: head.Mode, ScopeKey: head.ScopeKey, ObjectClass: head.ObjectClass,
 		Authoritative: head.Authoritative, Generation: head.Generation, Sequence: maxSeq,
-		Epoch: head.Epoch, At: s.now(), Repo: s.graph,
+		Epoch: head.Epoch, SnapshotID: head.SnapshotID, At: s.now(), Repo: s.graph,
 	}
 	fence := s.collectorFence(job, version)
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -379,15 +540,28 @@ func (s *ProjectionService) publishCollector(ctx context.Context, batches []coll
 			}
 			return s.finishPublished(tx, batches, job, fence, pass, 0)
 		}
-		stale, wm, err := readCollectorWatermark(tx, pass)
+		decision, wm, err := readCollectorWatermark(tx, pass)
 		if err != nil {
 			return err
 		}
-		if stale {
+		if decision == watermarkStale {
 			if err := tx.RollbackTo("collector_pub").Error; err != nil {
 				return err
 			}
 			return s.finishSuperseded(tx, batches, job, fence, pass.At)
+		}
+		if decision == watermarkReplay {
+			if err := tx.RollbackTo("collector_pub").Error; err != nil {
+				return err
+			}
+			rev, err := snapshotPublicationRev(tx, pass)
+			if err != nil {
+				return err
+			}
+			return s.finishPublished(tx, batches, job, fence, pass, rev)
+		}
+		if err := expandSnapshotRuns(tx, &pass, &refs); err != nil {
+			return err
 		}
 		writer := s.collector
 		if writer == nil {
@@ -556,32 +730,106 @@ func assertOutboxLease(tx *gorm.DB, batches []collectorBatch, owner string, at t
 	return nil
 }
 
-func readCollectorWatermark(tx *gorm.DB, pass CollectorPass) (bool, collectorWatermark, error) {
+func readCollectorWatermark(tx *gorm.DB, pass CollectorPass) (int, collectorWatermark, error) {
 	var gen, seq int64
 	var reconciled bool
-	var epoch nullUUID
-	err := tx.Raw(`SELECT last_generation, ordering_sequence, reconciled, ordering_epoch
+	var epoch, snap nullUUID
+	err := tx.Raw(`SELECT last_generation, ordering_sequence, reconciled, ordering_epoch, ordering_snapshot
 		FROM iga_projection_state
 		WHERE workspace_id = ? AND integration_id = ? AND partition_key = ?
 		FOR UPDATE`,
-		pass.WorkspaceID, pass.IntegrationID, collectorPartition(pass)).Row().Scan(&gen, &seq, &reconciled, &epoch)
+		pass.WorkspaceID, pass.IntegrationID, collectorPartition(pass)).Row().Scan(&gen, &seq, &reconciled, &epoch, &snap)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, collectorWatermark{}, nil
+		return watermarkProject, collectorWatermark{}, nil
 	}
 	if err != nil {
-		return false, collectorWatermark{}, err
+		return 0, collectorWatermark{}, err
 	}
-	wm := collectorWatermark{found: true, generation: gen, sequence: seq, reconciled: reconciled, epochSet: epoch.Valid}
+	wm := collectorWatermark{
+		found: true, generation: gen, sequence: seq, reconciled: reconciled,
+		epochSet: epoch.Valid, snapshotSet: snap.Valid,
+	}
 	if epoch.Valid {
 		wm.epoch = epoch.UUID
 	}
-	// Runtime batches never end support and never lose to a snapshot here.
-	// An older snapshot generation, or the same generation at an earlier
-	// sequence, is superseded. last_generation only moves forward.
-	if pass.Authoritative && (pass.Generation < gen || (pass.Generation == gen && pass.Sequence <= seq && gen > 0)) {
-		return true, wm, nil
+	if snap.Valid {
+		wm.snapshot = snap.UUID
 	}
-	return false, wm, nil
+	// Runtime batches never end support and never lose to a snapshot.
+	// The fence compares snapshot generations. The same snapshot_id is a
+	// replay. A different snapshot of the same generation is not stale:
+	// batch sequence is not a tie-break and must not drop chunks.
+	if !pass.Authoritative {
+		return watermarkProject, wm, nil
+	}
+	if pass.SnapshotID != nil && wm.snapshotSet && wm.snapshot == *pass.SnapshotID && wm.reconciled {
+		return watermarkReplay, wm, nil
+	}
+	if pass.Generation < gen {
+		return watermarkStale, wm, nil
+	}
+	return watermarkProject, wm, nil
+}
+
+// expandSnapshotRuns replaces the pass's runs with every batch of the snapshot
+// so absence is computed from the whole snapshot, including a chunk this
+// statement did not originate.
+func expandSnapshotRuns(tx *gorm.DB, pass *CollectorPass, refs *[]models.SourceManifestRef) error {
+	if !pass.Authoritative || pass.SnapshotID == nil {
+		return nil
+	}
+	rows, err := tx.Raw(`SELECT iga_scan_run_id FROM collector_batches
+		WHERE workspace_id = ? AND snapshot_id = ? AND iga_scan_run_id IS NOT NULL`,
+		pass.WorkspaceID, *pass.SnapshotID).Rows()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	pass.ScanRunIDs = ids
+	out := make([]models.SourceManifestRef, 0, len(ids))
+	for _, id := range ids {
+		id := id
+		out = append(out, models.SourceManifestRef{
+			Kind: models.ManifestKindIGAScanRun, ID: id, IntegrationID: &pass.IntegrationID,
+		})
+	}
+	*refs = out
+	return nil
+}
+
+func snapshotPublicationRev(tx *gorm.DB, pass CollectorPass) (int64, error) {
+	var rev int64
+	if pass.SnapshotID != nil {
+		err := tx.Raw(`SELECT COALESCE(MAX(graph_revision), 0) FROM collector_batches
+			WHERE workspace_id = ? AND snapshot_id = ?`,
+			pass.WorkspaceID, *pass.SnapshotID).Scan(&rev).Error
+		if err != nil {
+			return 0, err
+		}
+		if rev > 0 {
+			return rev, nil
+		}
+	}
+	err := tx.Raw(`SELECT COALESCE(MAX(p.rev), 0) FROM iga_publication p
+		JOIN iga_projection_state s
+		  ON s.workspace_id = p.workspace_id AND s.last_iga_scan_run_id = p.iga_scan_run_id
+		WHERE s.workspace_id = ? AND s.integration_id = ? AND s.partition_key = ?`,
+		pass.WorkspaceID, pass.IntegrationID, collectorPartition(pass)).Scan(&rev).Error
+	return rev, err
 }
 
 func writeCollectorWatermark(tx *gorm.DB, repo repositories.IGAGraphRepository, pass CollectorPass, wm collectorWatermark) error {
@@ -595,15 +843,23 @@ func writeCollectorWatermark(tx *gorm.DB, repo repositories.IGAGraphRepository, 
 	}
 	gen, seq := pass.Generation, pass.Sequence
 	reconciled := pass.Authoritative
-	var epoch *uuid.UUID
+	var epoch, snap *uuid.UUID
 	if pass.Authoritative {
 		e := pass.Epoch
 		epoch = &e
+		if pass.SnapshotID != nil {
+			id := *pass.SnapshotID
+			snap = &id
+		}
 	} else if wm.found {
 		gen, seq, reconciled = wm.generation, wm.sequence, wm.reconciled
 		if wm.epochSet {
 			e := wm.epoch
 			epoch = &e
+		}
+		if wm.snapshotSet {
+			id := wm.snapshot
+			snap = &id
 		}
 	} else {
 		gen, seq = 0, 0
@@ -612,7 +868,7 @@ func writeCollectorWatermark(tx *gorm.DB, repo repositories.IGAGraphRepository, 
 		WorkspaceID: pass.WorkspaceID, EstateScopeID: scopeID,
 		IntegrationID: &pass.IntegrationID, PartitionKey: collectorPartition(pass),
 		ObjectClass: pass.ObjectClass, LastIGAScanRunID: &pass.ScanRunID,
-		LastGeneration: gen, OrderingSequence: seq, OrderingEpoch: epoch,
+		LastGeneration: gen, OrderingSequence: seq, OrderingEpoch: epoch, OrderingSnapshot: snap,
 		CoverageState: "reached", Reconciled: reconciled, UpdatedAt: pass.At,
 	})
 }
@@ -626,7 +882,7 @@ func collectorCloudManifest(tx *gorm.DB, repo repositories.IGAGraphRepository, p
 	if len(prev) > 0 && string(prev) != "null" {
 		_ = json.Unmarshal(prev, &m)
 	}
-	m[collectorPartition(pass)] = pass.ScanRunID.String()
+	m[collectorManifestKey(pass)] = pass.ScanRunID.String()
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
@@ -701,6 +957,47 @@ func collectorPartition(p CollectorPass) string {
 		class = "object"
 	}
 	return scope + "/" + class
+}
+
+// collectorManifestKey is the cloud-shaped manifest entry. projection_state
+// stays on collectorPartition, which is already keyed by integration_id.
+// Two integrations that share a scope and class must not overwrite each other.
+func collectorManifestKey(p CollectorPass) string {
+	return "collector:" + p.IntegrationID.String() + "/" + collectorPartition(p)
+}
+
+// collectorOutboxShouldFail reports that this run's projection job will never
+// be claimed again, so its outbox rows must stop returning to ready.
+func (s *ProjectionService) collectorOutboxShouldFail(ctx context.Context, head collectorBatch) (bool, string) {
+	var status string
+	var attempts int
+	var expires sql.NullTime
+	err := s.db.WithContext(ctx).Raw(`SELECT status, attempts, lease_expires_at FROM iga_projection_job
+		WHERE workspace_id = ? AND iga_scan_run_id = ?`,
+		head.WorkspaceID, head.ScanRunID).Row().Scan(&status, &attempts, &expires)
+	if err != nil {
+		return false, ""
+	}
+	if status == models.ProjectionAbandoned {
+		return true, "projection job abandoned"
+	}
+	live := status == models.ProjectionRunning && expires.Valid && expires.Time.After(s.now())
+	if attempts >= s.maxAttempts && !live {
+		return true, "projection job abandoned"
+	}
+	return false, ""
+}
+
+// failCollectorProjectOutbox marks a collector run's project rows failed so
+// recovery cannot leave them ready after the job is abandoned.
+func failCollectorProjectOutbox(tx *gorm.DB, ws, run uuid.UUID, reason string) error {
+	return tx.Exec(`UPDATE collector_outbox o
+		SET state = 'failed', last_error = ?, lease_owner = NULL, leased_until = NULL, updated_at = now()
+		FROM collector_batches b
+		WHERE b.workspace_id = o.workspace_id AND b.id = o.batch_row_id
+		  AND o.workspace_id = ? AND b.iga_scan_run_id = ?
+		  AND o.job_kind = ? AND o.state IN ('ready', 'leased')`,
+		reason, ws, run, models.OutboxKindCollectorProject).Error
 }
 
 type nullUUID struct {

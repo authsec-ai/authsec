@@ -143,6 +143,7 @@ var v2ProjectionColumns = []string{
 	"iga_publication.source_manifest_v2",
 	"iga_pipeline_lease.iga_scan_run_id",
 	"iga_projection_state.ordering_sequence",
+	"iga_projection_state.ordering_snapshot",
 	"collector_batches.snapshot_id",
 	"collector_batches.superseded_at",
 }

@@ -683,12 +683,12 @@ func (r *igaGraphRepository) UpsertProjectionState(tx *gorm.DB, s *models.IGAPro
 			}},
 			DoUpdates: clause.AssignmentColumns([]string{
 				"estate_scope_id", "object_class", "relationship_type", "last_iga_scan_run_id",
-				"last_generation", "ordering_sequence", "ordering_epoch",
+				"last_generation", "ordering_sequence", "ordering_epoch", "ordering_snapshot",
 				"coverage_state", "reconciled", "updated_at",
 			}),
 		}).Create(s).Error
 	}
-	return tx.Omit("IntegrationID", "LastIGAScanRunID", "OrderingSequence", "OrderingEpoch").Clauses(clause.OnConflict{
+	return tx.Omit("IntegrationID", "LastIGAScanRunID", "OrderingSequence", "OrderingEpoch", "OrderingSnapshot").Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "connector_id"}, {Name: "partition_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"estate_scope_id", "object_class", "relationship_type", "last_run_id",

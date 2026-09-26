@@ -643,6 +643,13 @@ func (s *CollectorSyncService) note(err error) { s.LastPersistErr = err }
 
 // Receipt returns the current receipt for this collector. Another collector's
 // receipt is not found.
+//
+// A batch the generation fence rejected keeps receipt_state=accepted and
+// projection_state=queued. Migration 038's collector_batches_projection_state_chk
+// allows only queued and published, so the row cannot store 'superseded'.
+// superseded_at is set and the outbox is done with last_error superseded.
+// GET /receipts reports state and projection_state "superseded" so the
+// collector stops waiting. That value is not written back to those columns.
 func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUID) ([]byte, error) {
 	if p == nil || !containsString(p.Scopes, models.CollectorScopeReceiptWrite) {
 		return nil, ErrSyncForbidden
@@ -652,12 +659,22 @@ func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUI
 		ProjectionState string
 		GraphRevision   int64
 		JobState        string
+		Superseded      bool
 	}
-	err := s.db.Raw(`SELECT b.receipt_state, b.projection_state, b.graph_revision, COALESCE(o.state, '')
+	supersededSQL := "false"
+	if has, err := repositories.HasColumn(s.db, "collector_batches", "superseded_at"); err != nil {
+		return nil, err
+	} else if has {
+		supersededSQL = "b.superseded_at IS NOT NULL"
+	}
+	err := s.db.Raw(`SELECT b.receipt_state, b.projection_state, b.graph_revision, COALESCE(o.state, ''),
+		`+supersededSQL+`
 		FROM collector_batches b
-		LEFT JOIN collector_outbox o ON o.workspace_id = b.workspace_id AND o.batch_row_id = b.id
+		LEFT JOIN collector_outbox o
+		  ON o.workspace_id = b.workspace_id AND o.batch_row_id = b.id AND o.job_kind = 'collector_project'
 		WHERE b.workspace_id = ? AND b.collector_id = ? AND b.receipt_id = ?`,
-		p.WorkspaceID, p.CollectorID, id).Row().Scan(&row.ReceiptState, &row.ProjectionState, &row.GraphRevision, &row.JobState)
+		p.WorkspaceID, p.CollectorID, id).Row().Scan(
+		&row.ReceiptState, &row.ProjectionState, &row.GraphRevision, &row.JobState, &row.Superseded)
 	if err != nil {
 		return nil, ErrSyncNotFound
 	}
@@ -670,8 +687,13 @@ func (s *CollectorSyncService) Receipt(p *models.CollectorPrincipal, id uuid.UUI
 	case "failed", "dead":
 		state = "failed"
 	}
+	projection := row.ProjectionState
+	if row.Superseded {
+		state = "superseded"
+		projection = "superseded"
+	}
 	view := collectorcontract.ReceiptView{
-		ReceiptID: id.String(), State: state, ProjectionState: row.ProjectionState,
+		ReceiptID: id.String(), State: state, ProjectionState: projection,
 		PublishedGraphRevision: row.GraphRevision, Mappings: []collectorcontract.Mapping{},
 	}
 	return json.Marshal(view)
