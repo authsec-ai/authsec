@@ -428,7 +428,8 @@ type IGAPolicy struct {
 	DocumentHash string `json:"document_hash" gorm:"not null;default:''"`
 	// RightsSchema says which native document native_rights holds. Empty on
 	// rows this package did not project. It is not an authorization verdict.
-	RightsSchema  string `json:"rights_schema" gorm:"not null;default:''"`
+	// Parentheses: a zero value must be omitted so pre-041 schemas still insert.
+	RightsSchema  string `json:"rights_schema" gorm:"not null;default:('')"`
 	Lifecycle     string `json:"lifecycle" gorm:"not null;default:'active'"`
 	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
 
@@ -488,10 +489,10 @@ type IGAPolicyAssignment struct {
 	EndedReason             string     `json:"ended_reason" gorm:"not null;default:''"`
 	SourceKey               string     `json:"source_key" gorm:"not null"`
 	PartitionKey            string     `json:"partition_key" gorm:"not null"`
-	BindingNativeUID        string     `json:"binding_native_uid" gorm:"not null;default:''"`
-	AssignmentScopeKind     string     `json:"assignment_scope_kind" gorm:"not null;default:''"`
-	AssignmentEstateScopeID *uuid.UUID `json:"assignment_estate_scope_id,omitempty" gorm:"type:uuid"`
-	NamespaceUID            string     `json:"namespace_uid" gorm:"not null;default:''"`
+	BindingNativeUID        string     `json:"binding_native_uid" gorm:"not null;default:('')"`
+	AssignmentScopeKind     string     `json:"assignment_scope_kind" gorm:"not null;default:('')"`
+	AssignmentEstateScopeID *uuid.UUID `json:"assignment_estate_scope_id,omitempty" gorm:"type:uuid;default:null"`
+	NamespaceUID            string     `json:"namespace_uid" gorm:"not null;default:('')"`
 	ConnectorID             *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
 	IntegrationID           *uuid.UUID `json:"integration_id,omitempty" gorm:"type:uuid"`
 	ConfirmingIGAScanRunID  *uuid.UUID `json:"confirming_iga_scan_run_id,omitempty" gorm:"type:uuid"`
