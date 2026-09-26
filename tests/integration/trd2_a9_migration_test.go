@@ -23,10 +23,14 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 	}
 
 	// These subtests apply migration files themselves so each order is explicit.
-	t.Run("fresh_without_041", func(t *testing.T) {
+	// fresh_master applies every shipped file, including the real 041.
+	t.Run("fresh_master", func(t *testing.T) {
 		db := openFreshDB(t, dsn, "a9_fresh_045")
 		applyMasterWhere(t, db, func(base string) bool { return true })
 		applyFile(t, db, masterPath(t, "045_ad_hardening_posture.sql"))
+		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'iga_runtime_instances'`); n != 1 {
+			t.Fatal("real 041 did not apply")
+		}
 		if n := scalarDB(t, db, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'discovered_agent_workloads'`); n != 1 {
 			t.Fatal("real 042 did not apply")
 		}

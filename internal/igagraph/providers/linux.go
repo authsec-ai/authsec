@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/directory/adresolve"
 	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 )
@@ -79,12 +80,14 @@ func linuxObject(p *Plan, estate string, o Object) error {
 			return err
 		}
 		name := str(o.Attrs, "name")
-		p.Identities = append(p.Identities, Identity{
+		idn := Identity{
 			SourceKey: key, Continuity: models.ContinuityRecognitionOnly,
 			Provider: models.ProviderLinux, Kind: models.AccountKindLocalUser,
 			Name: name, State: models.AccountStateEnabled, Backing: "host",
 			Attrs: displayAttrs(o.Native, o.Attrs), Ref: o.Ref,
-		})
+		}
+		applyDirectory(p, &idn, o)
+		p.Identities = append(p.Identities, idn)
 	case "linux.local_group":
 		ns := str(o.Native, "user_namespace")
 		if ns == "" {
@@ -94,12 +97,14 @@ func linuxObject(p *Plan, estate string, o Object) error {
 		if err != nil {
 			return err
 		}
-		p.Identities = append(p.Identities, Identity{
+		idn := Identity{
 			SourceKey: key, Continuity: models.ContinuityRecognitionOnly,
 			Provider: models.ProviderLinux, Kind: models.AccountKindLocalGroup,
 			Name: str(o.Attrs, "name"), State: models.AccountStateEnabled, Backing: "host",
 			Attrs: displayAttrs(o.Native, o.Attrs), Ref: o.Ref,
-		})
+		}
+		applyDirectory(p, &idn, o)
+		p.Identities = append(p.Identities, idn)
 	case "linux.file":
 		ns := str(o.Native, "mount_namespace")
 		if ns == "" {
@@ -154,6 +159,24 @@ func linuxObject(p *Plan, estate string, o Object) error {
 		})
 	}
 	return nil
+}
+
+// DirectoryRelationKey is the source key of a backed_by_directory edge.
+// Both endpoints are escaped, so a rename of either display name does not
+// change the key. The AD key already is the objectGUID.
+func DirectoryRelationKey(localKey, adKey string) (string, error) {
+	return relationKey("linux", models.RelTypeBackedByDirectory, localKey, adKey)
+}
+
+func applyDirectory(p *Plan, idn *Identity, o Object) {
+	hint, ok := adresolve.Parse(o.Native, o.ObservationIDs)
+	if !ok {
+		return
+	}
+	idn.Directory = &hint
+	if hint.Unreadable {
+		p.Unresolved = append(p.Unresolved, "directory:"+idn.SourceKey+":"+hint.Reason)
+	}
 }
 
 func linuxConstraint(p *Plan, estate, workloadKey, kind, schema, bind, name string, doc map[string]any) error {

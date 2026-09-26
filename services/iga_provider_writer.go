@@ -62,6 +62,12 @@ func (ProviderWriter) Project(tx *gorm.DB, in CollectorPass) error {
 	if err := writePlan(tx, in, estate, plan, ids); err != nil {
 		return err
 	}
+	if err := resolveDirectoryBacking(tx, in, plan, ids); err != nil {
+		return err
+	}
+	for _, unresolved := range plan.Unresolved {
+		log.Printf("[projection] unresolved %s", unresolved)
+	}
 	if err := joinAWSRole(tx, in, plan, ids); err != nil {
 		return err
 	}
@@ -139,15 +145,23 @@ func loadFacts(tx *gorm.DB, in CollectorPass) (factSet, error) {
 		return out, err
 	}
 	defer rows.Close()
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for rows.Next() {
 		var row loadedFact
 		if err := rows.Scan(&row.ObjectType, &row.Recognition, &row.Payload, &row.Locator, &row.ObsID, &row.Fact, &row.ObservedAt); err != nil {
 			return out, err
 		}
 		obj := objectFrom(row)
-		if !seen[obj.Kind+"\x00"+obj.Recognition] {
-			seen[obj.Kind+"\x00"+obj.Recognition] = true
+		objKey := obj.Kind + "\x00" + obj.Recognition
+		if i, ok := seen[objKey]; ok {
+			if row.ObsID != uuid.Nil {
+				out.objects[i].ObservationIDs = append(out.objects[i].ObservationIDs, row.ObsID)
+			}
+		} else {
+			if row.ObsID != uuid.Nil {
+				obj.ObservationIDs = []uuid.UUID{row.ObsID}
+			}
+			seen[objKey] = len(out.objects)
 			out.objects = append(out.objects, obj)
 		}
 		if ob, ok := observationFrom(row); ok {

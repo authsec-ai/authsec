@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/directory/adresolve"
 	"github.com/google/uuid"
 )
 
@@ -21,6 +22,9 @@ type Object struct {
 	Native      map[string]any
 	Attrs       map[string]any
 	Raw         json.RawMessage
+	// ObservationIDs are the facts this object was read from. The directory
+	// resolver records them as the inputs of a derived relationship.
+	ObservationIDs []uuid.UUID
 }
 
 // Observation is one stored fact. Preview observations are not existence.
@@ -58,6 +62,9 @@ type Identity struct {
 	Attrs        json.RawMessage
 	DN           string
 	Ref          string
+	// Directory is an authoritative NSS mapping. Nil means the collector
+	// reported none. A display name is not a mapping. The writer resolves it.
+	Directory *adresolve.Hint
 }
 
 // Workload is a canonical runtime.
