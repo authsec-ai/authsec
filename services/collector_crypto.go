@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,12 +106,25 @@ func RotateSignedMessage(collectorID, nonce, requestedAt, newPublicKey, scopes s
 	}, "\n"))
 }
 
-// ResponseSealer encrypts the one-time enroll response. The key comes from
-// IGA_COLLECTOR_RESPONSE_KEY or from a runtime-generated file under .secrets/,
-// which is git-ignored. Nothing here is a committed secret.
+// ResponseSealer encrypts the one-time enroll response.
+//
+// IGA_COLLECTOR_RESPONSE_KEY is required when IGA_V2_INGEST is on. The key
+// is hashed with SHA-256 and must be the same on every replica: enrollment
+// recovery decrypts a response that a different process may have sealed.
+// A missing key is a hard error (logged at ERROR) and leaves the v2 routes
+// unmounted. There is no per-process random fallback in that mode, and the
+// git-ignored .secrets file is not consulted either, because a file written
+// on one replica is not the key the others hold.
+//
+// When ingest is off, a git-ignored .secrets/collector-response.key is used
+// if it already exists; otherwise a random key is generated for local
+// development and a WARNING is logged. Nothing here is a committed secret.
 type ResponseSealer struct {
 	key []byte
 }
+
+// responseKeyLogf is the logger for key-loading failures. Tests replace it.
+var responseKeyLogf = log.Printf
 
 // NewResponseSealer loads or creates the response-encryption key.
 func NewResponseSealer() (*ResponseSealer, error) {
@@ -122,12 +136,17 @@ func NewResponseSealer() (*ResponseSealer, error) {
 }
 
 func loadResponseKey() ([]byte, error) {
-	if v := strings.TrimSpace(os.Getenv("IGA_COLLECTOR_RESPONSE_KEY")); v != "" {
+	if v := strings.TrimSpace(os.Getenv(EnvCollectorResponseKey)); v != "" {
 		sum := sha256.Sum256([]byte(v))
 		return sum[:], nil
 	}
+	if V2IngestEnabled() {
+		responseKeyLogf("[collector] ERROR: %s is enabled but %s is unset. Refusing a per-process random key; replicas would disagree and enrollment recovery would fail.", EnvV2Ingest, EnvCollectorResponseKey)
+		return nil, fmt.Errorf("%s is required when %s is enabled", EnvCollectorResponseKey, EnvV2Ingest)
+	}
 	path := filepath.Join(".secrets", "collector-response.key")
 	if b, err := os.ReadFile(path); err == nil && len(bytesTrim(b)) >= 16 {
+		responseKeyLogf("[collector] WARNING: %s is unset; using %s. Set %s before enabling %s so every replica shares one key.", EnvCollectorResponseKey, path, EnvCollectorResponseKey, EnvV2Ingest)
 		sum := sha256.Sum256(b)
 		return sum[:], nil
 	}
@@ -138,6 +157,7 @@ func loadResponseKey() ([]byte, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
 		_ = os.WriteFile(path, raw, 0o600)
 	}
+	responseKeyLogf("[collector] WARNING: %s is unset and %s is missing; generated a per-process key. Do not enable %s on more than one replica without %s.", EnvCollectorResponseKey, path, EnvV2Ingest, EnvCollectorResponseKey)
 	sum := sha256.Sum256(raw)
 	return sum[:], nil
 }
