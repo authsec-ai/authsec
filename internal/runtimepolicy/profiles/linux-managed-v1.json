@@ -1,0 +1,17 @@
+{
+  "profile": "linux-managed-v1",
+  "filesystem_baseline": {
+    "loaders": {
+      "amd64": "/lib64/ld-linux-x86-64.so.2",
+      "arm64": "/lib/ld-linux-aarch64.so.1"
+    },
+    "libraries": ["/lib/libc.so.6"],
+    "certificates": ["/etc/ssl/certs/ca-certificates.crt"],
+    "readonly_config": ["/etc/nsswitch.conf"]
+  },
+  "certified_digests": {},
+  "test_only_digests": {
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": ["filesystem", "egress", "exec", "privilege", "secret"],
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff": ["filesystem"]
+  }
+}

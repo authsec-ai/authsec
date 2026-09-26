@@ -1,4 +1,6 @@
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+# Multi-arch index for golang:1.26-alpine. The image sets GOTOOLCHAIN=local,
+# so the builder must match go.mod (OPA v1.21.0 requires go 1.26.0).
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS builder
 
 RUN apk add --no-cache ca-certificates && update-ca-certificates
 
