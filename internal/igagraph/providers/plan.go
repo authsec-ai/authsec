@@ -194,6 +194,14 @@ type ResourceBinding struct {
 	Observation uuid.UUID
 }
 
+// Skipped is one object that could not be keyed. The rest of the pass still
+// projects. A skipped object must not be treated as absent.
+type Skipped struct {
+	Kind   string
+	Ref    string
+	Reason string
+}
+
 // Plan is the projection input. Keys are source keys, not row ids.
 type Plan struct {
 	Identities       []Identity
@@ -210,6 +218,7 @@ type Plan struct {
 	PolicyBindings   []PolicyBinding
 	ResourceBindings []ResourceBinding
 	Unresolved       []string
+	Skipped          []Skipped
 }
 
 // Normalize builds a plan for linux, kubernetes or ad. Unknown native
@@ -225,6 +234,17 @@ func Normalize(in Input) (*Plan, error) {
 	default:
 		return &Plan{}, nil
 	}
+}
+
+func skipObject(p *Plan, o Object, err error) {
+	if err == nil {
+		return
+	}
+	ref := o.Ref
+	if ref == "" {
+		ref = o.Recognition
+	}
+	p.Skipped = append(p.Skipped, Skipped{Kind: o.Kind, Ref: ref, Reason: err.Error()})
 }
 
 func str(m map[string]any, k string) string {

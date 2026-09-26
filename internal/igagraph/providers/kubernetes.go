@@ -21,25 +21,25 @@ func normalizeKubernetes(in Input) (*Plan, error) {
 			bindings = append(bindings, o)
 		default:
 			if err := k8sObject(p, in.EstateID, o); err != nil {
-				return nil, err
+				skipObject(p, o, err)
 			}
 		}
 	}
 	for _, o := range sas {
 		if err := k8sServiceAccount(p, in.EstateID, o); err != nil {
-			return nil, err
+			skipObject(p, o, err)
 		}
 	}
 	for _, o := range in.Objects {
 		if o.Kind == "k8s.workload" || o.Kind == "k8s.pod" {
 			if err := k8sExecutesAs(p, in.EstateID, o); err != nil {
-				return nil, err
+				skipObject(p, o, err)
 			}
 		}
 	}
 	for _, o := range bindings {
 		if err := k8sBinding(p, in.EstateID, o); err != nil {
-			return nil, err
+			skipObject(p, o, err)
 		}
 	}
 	return p, nil
@@ -67,7 +67,11 @@ func k8sObject(p *Plan, estate string, o Object) error {
 		})
 	case "k8s.service", "k8s.pvc", "k8s.pv":
 		kind := strings.TrimPrefix(o.Kind, "k8s.")
-		key, err := igraph.KubernetesWorkloadKey(estate, str(o.Native, "apiGroup"), kind, str(o.Native, "namespace"), str(o.Native, "name"), kind)
+		ns := str(o.Native, "namespace")
+		if o.Kind == "k8s.pv" && ns == "" {
+			ns = clusterNS
+		}
+		key, err := igraph.KubernetesWorkloadKey(estate, coreGroup(str(o.Native, "apiGroup")), kind, ns, str(o.Native, "name"), kind)
 		if err != nil {
 			return err
 		}
@@ -91,13 +95,18 @@ func k8sObject(p *Plan, estate string, o Object) error {
 }
 
 func k8sWorkload(p *Plan, estate string, o Object) error {
-	group := str(o.Native, "apiGroup")
-	if group == "" {
-		group = "apps"
-	}
 	kind := str(o.Native, "kind")
 	if kind == "" {
 		kind = "Pod"
+	}
+	group := str(o.Native, "apiGroup")
+	if group == "" {
+		// A bare Pod is a core object. Other kinds keep the historical apps default.
+		if kind == "Pod" {
+			group = "core"
+		} else {
+			group = "apps"
+		}
 	}
 	slot := str(o.Native, "slot")
 	if slot == "" {
@@ -146,11 +155,6 @@ func k8sExecutesAs(p *Plan, estate string, o Object) error {
 		p.Unresolved = append(p.Unresolved, "k8s-sa:"+ns+"/"+name)
 		return nil
 	}
-	rel, err := igraph.SecretRefKey("kubernetes", "executes_as", ns, str(o.Native, "name"), name)
-	if err != nil {
-		return err
-	}
-	_ = rel
 	rkey, err := relationKey("kubernetes", "executes_as", wkey, saKey)
 	if err != nil {
 		return err
@@ -329,6 +333,13 @@ func k8sBinding(p *Plan, estate string, o Object) error {
 }
 
 const clusterNS = "_"
+
+func coreGroup(group string) string {
+	if strings.TrimSpace(group) == "" {
+		return "core"
+	}
+	return group
+}
 
 func ensureGroup(p *Plan, estate, name string) error {
 	switch name {

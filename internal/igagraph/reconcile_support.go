@@ -34,10 +34,13 @@ func SnapshotNodeClass(objectClass string) string {
 	}
 }
 
-// RuntimePartition is the support partition runtime evidence uses.
-// Snapshot absence never selects it, and runtime aging never selects a
-// snapshot partition.
-const RuntimePartition = "collector/object"
+// RuntimePartition is the support partition for observed runtimes.
+// collectorPartition joins scope and class with "/", so it always contains
+// a slash. The unit separator here cannot be produced that way, including
+// the default "collector/object" used by a pass with no scope or class.
+// Snapshot absence never selects this partition, and runtime aging never
+// selects a snapshot partition or a delta inventory partition.
+const RuntimePartition = "runtime\x1fobserved"
 
 // RuntimeUnobserved is true when a runtime support row has not been confirmed
 // inside the TTL. A zero TTL disables aging.

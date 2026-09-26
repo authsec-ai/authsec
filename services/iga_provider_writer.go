@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	igraph "github.com/authsec-ai/authsec/internal/igagraph"
@@ -54,6 +55,9 @@ func (ProviderWriter) Project(tx *gorm.DB, in CollectorPass) error {
 	if err != nil {
 		return err
 	}
+	for _, skipped := range plan.Skipped {
+		log.Printf("[projection] skipped %s %s: %s", skipped.Kind, skipped.Ref, skipped.Reason)
+	}
 	ids := &idMap{byKey: map[string]uuid.UUID{}}
 	if err := writePlan(tx, in, estate, plan, ids); err != nil {
 		return err
@@ -68,7 +72,7 @@ func (ProviderWriter) Project(tx *gorm.DB, in CollectorPass) error {
 		return err
 	}
 	class, end := igraph.MayEndSnapshotSupport(in.Authoritative, in.ObjectClass)
-	if end {
+	if end && !skippedPassClass(plan, in.ObjectClass) {
 		seen := ids.seen[class]
 		if err := endAbsentSupport(tx, in, collectorPartition(in), class, seen); err != nil {
 			return err
@@ -610,6 +614,8 @@ func ageRuntimeSupport(tx *gorm.DB, in CollectorPass) error {
 		return nil
 	}
 	cutoff := in.At.Add(-ttl)
+	// Only this integration's runtime partition. Delta inventory
+	// (collector/object) and snapshot partitions are not selected.
 	if err := tx.Exec(`UPDATE iga_object_support
 		SET state = 'ended', ended_reason = ?, last_confirmed_at = ?
 		WHERE workspace_id = ? AND integration_id = ? AND partition_key = ?
@@ -617,9 +623,27 @@ func ageRuntimeSupport(tx *gorm.DB, in CollectorPass) error {
 		models.EndedRuntimeUnobserved, in.At, in.WorkspaceID, in.IntegrationID, igraph.RuntimePartition, cutoff).Error; err != nil {
 		return err
 	}
-	return tx.Exec(`UPDATE iga_runtime_instances SET ended_at = ?
-		WHERE workspace_id = ? AND ended_at IS NULL AND last_observed_at < ?`,
-		in.At, in.WorkspaceID, cutoff).Error
+	estate, err := collectorEstate(tx, in)
+	if err != nil {
+		return err
+	}
+	// Another collector's live runtime support keeps the shared instance.
+	// A pass only ages instances on its own estate.
+	return tx.Exec(`UPDATE iga_runtime_instances ri SET ended_at = ?
+		WHERE ri.workspace_id = ? AND ri.estate_scope_id = ? AND ri.ended_at IS NULL
+		  AND ri.last_observed_at < ?
+		  AND EXISTS (
+		      SELECT 1 FROM iga_object_support s
+		       WHERE s.workspace_id = ri.workspace_id AND s.workload_id = ri.workload_id
+		         AND s.integration_id = ? AND s.partition_key = ?)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM iga_object_support s
+		       WHERE s.workspace_id = ri.workspace_id AND s.workload_id = ri.workload_id
+		         AND s.partition_key = ? AND s.integration_id <> ?
+		         AND s.state <> 'ended' AND s.last_confirmed_at >= ?)`,
+		in.At, in.WorkspaceID, estate, cutoff,
+		in.IntegrationID, igraph.RuntimePartition,
+		igraph.RuntimePartition, in.IntegrationID, cutoff).Error
 }
 
 func retireCollectorNodes(tx *gorm.DB, in CollectorPass) error {
@@ -631,14 +655,15 @@ func retireCollectorNodes(tx *gorm.DB, in CollectorPass) error {
 		{"iga_entitlements", "entitlement_id"},
 	} {
 		err := tx.Exec(`UPDATE `+table.table+` n
-			SET lifecycle = 'retired', retired_reason = 'unsupported'
+			SET lifecycle = 'retired', retired_reason = 'unsupported', updated_at = ?
 			WHERE n.workspace_id = ? AND n.provider IN ('linux','kubernetes','ad')
 			  AND n.lifecycle <> 'retired'
 			  AND EXISTS (SELECT 1 FROM iga_object_support s
-			      WHERE s.workspace_id = n.workspace_id AND s.`+table.col+` = n.id)
+			      WHERE s.workspace_id = n.workspace_id AND s.`+table.col+` = n.id
+			        AND s.integration_id = ?)
 			  AND NOT EXISTS (SELECT 1 FROM iga_object_support s
 			      WHERE s.workspace_id = n.workspace_id AND s.`+table.col+` = n.id AND s.state <> 'ended')`,
-			in.WorkspaceID).Error
+			in.At, in.WorkspaceID, in.IntegrationID).Error
 		if err != nil {
 			return err
 		}
@@ -672,6 +697,21 @@ func retireRecreated(tx *gorm.DB, table string, ws uuid.UUID, key, immutable str
 		SET state = 'ended', ended_reason = 'subject_recreated', valid_to = ?
 		WHERE workspace_id = ? AND holder_identity_account_id = ? AND state <> 'ended'`,
 		at, ws, id).Error
+}
+
+// skippedPassClass is true when this pass dropped an object of the class it
+// would otherwise treat as absent. Ending support would retire that object.
+func skippedPassClass(plan *providers.Plan, objectClass string) bool {
+	want := igraph.SnapshotNodeClass(objectClass)
+	if plan == nil || want == "" {
+		return false
+	}
+	for _, skipped := range plan.Skipped {
+		if skipped.Kind == objectClass || igraph.SnapshotNodeClass(skipped.Kind) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func providerOf(plan *providers.Plan, policyKey string) string {

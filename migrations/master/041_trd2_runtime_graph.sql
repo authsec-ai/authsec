@@ -92,6 +92,8 @@ ALTER TABLE public.iga_resources
     ADD COLUMN IF NOT EXISTS kind_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE public.iga_policy
     ADD COLUMN IF NOT EXISTS rights_schema text NOT NULL DEFAULT '';
+ALTER TABLE public.iga_policy
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 ALTER TABLE public.iga_policy_assignment
     ADD COLUMN IF NOT EXISTS binding_native_uid text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS assignment_scope_kind text NOT NULL DEFAULT '',

@@ -546,9 +546,7 @@ type IGAIdentityAccount struct {
 	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
 	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
 	// AccountState is enabled, disabled or unknown. It is not lifecycle.
-	// The parentheses keep GORM from substituting the default on a zero value,
-	// so a projection against a schema from before 041 does not name the column.
-	AccountState string `json:"account_state" gorm:"not null;default:('enabled')"`
+	AccountState string `json:"account_state" gorm:"not null;default:'enabled'"`
 
 	// ProviderAttrs is display-only provider fact -- tags, path, boundary ARN
 	// -- so the read APIs never read cloud_*. Never identity, never a filter.
@@ -622,8 +620,8 @@ type IGAResource struct {
 	// account_connected. An S3 reference states neither and is never assigned
 	// the scanning account (§1.4). Display only. Not an authorization filter.
 	ProviderAttrs   json.RawMessage `json:"provider_attrs" gorm:"type:jsonb;not null;default:'{}'"`
-	ReferenceStatus string          `json:"reference_status" gorm:"not null;default:('referenced')"`
-	NativeKind      string          `json:"native_kind" gorm:"not null;default:('')"`
+	ReferenceStatus string          `json:"reference_status" gorm:"not null;default:'referenced'"`
+	NativeKind      string          `json:"native_kind" gorm:"not null;default:''"`
 	KindMetadata    json.RawMessage `json:"kind_metadata" gorm:"type:jsonb;not null;default:'{}'"`
 
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`

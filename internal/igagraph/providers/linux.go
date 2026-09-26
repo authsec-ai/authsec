@@ -14,7 +14,7 @@ func normalizeLinux(in Input) (*Plan, error) {
 	for _, o := range in.Objects {
 		byRef[o.Ref] = o
 		if err := linuxObject(p, in.EstateID, o); err != nil {
-			return nil, err
+			skipObject(p, o, err)
 		}
 	}
 	for _, ob := range in.Observations {
@@ -22,7 +22,7 @@ func normalizeLinux(in Input) (*Plan, error) {
 			continue
 		}
 		if err := linuxObservation(p, in.EstateID, ob, byRef); err != nil {
-			return nil, err
+			p.Skipped = append(p.Skipped, Skipped{Kind: ob.Kind, Ref: ob.SubjectRef, Reason: err.Error()})
 		}
 	}
 	return p, nil
@@ -139,7 +139,11 @@ func linuxObject(p *Plan, estate string, o Object) error {
 			Attrs: displayAttrs(o.Native, o.Attrs), Ref: o.Ref,
 		})
 	case "secret.reference":
-		key, err := igraph.SecretRefKey(first(str(o.Native, "provider"), "linux"), estate, str(o.Native, "namespace"), str(o.Native, "name"), str(o.Native, "key"))
+		ns := str(o.Native, "namespace")
+		if ns == "" {
+			ns = "host"
+		}
+		key, err := igraph.SecretRefKey(first(str(o.Native, "provider"), "linux"), estate, ns, str(o.Native, "name"), str(o.Native, "key"))
 		if err != nil {
 			return err
 		}

@@ -22,8 +22,7 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 		t.Skip("IGA_TEST_DSN not set")
 	}
 
-	// These subtests apply migration files themselves. They do not call
-	// applyMaster, which stops at 040 and never applies 042 or 045.
+	// These subtests apply migration files themselves so each order is explicit.
 	t.Run("fresh_without_041", func(t *testing.T) {
 		db := openFreshDB(t, dsn, "a9_fresh_045")
 		applyMasterWhere(t, db, func(base string) bool { return true })
@@ -51,8 +50,8 @@ func TestTRD2ITA9DirectoryPostureMigration(t *testing.T) {
 		if err := os.WriteFile(p041, []byte("SELECT 1;\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// 041 is still absent from master. 042 is the real A5 migration.
-		// The placeholder is a temp file, never committed.
+		// A placeholder stands in for 041 so this order does not run the real
+		// runtime migration. 042 is the real A5 migration.
 		db := openFreshDB(t, dsn, "a9_mid_041")
 		applyMasterWhere(t, db, func(base string) bool { return base < "041" })
 		applyFile(t, db, p041)

@@ -114,6 +114,36 @@ func TestRuntimeKeysCollideOnlyOnTheirComponents(t *testing.T) {
 	}
 }
 
+func TestCoreAndClusterSentinels(t *testing.T) {
+	svc, err := KubernetesWorkloadKey("c", "core", "service", "pay", "api", "service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(svc, "core") {
+		t.Fatalf("core service key: %s", svc)
+	}
+	pv, err := KubernetesWorkloadKey("c", "core", "pv", "_", "data", "pv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc == pv {
+		t.Fatal("service and persistent volume collided")
+	}
+	if _, err := KubernetesWorkloadKey("c", "", "service", "pay", "api", "service"); err == nil {
+		t.Fatal("an empty group must not key")
+	}
+	if _, err := KubernetesWorkloadKey("c", "core", "pv", "", "data", "pv"); err == nil {
+		t.Fatal("an empty namespace must not key")
+	}
+	host, err := SecretRefKey("linux", "estate-a", "host", "db", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(host, "host") {
+		t.Fatalf("linux secret ref sentinel: %s", host)
+	}
+}
+
 func TestADIdentityKeyStillThreeSegments(t *testing.T) {
 	key, err := ADIdentityKey("DC=authsec,DC=test", "aabbccdd-eeff-0011-2233-445566778899")
 	if err != nil {

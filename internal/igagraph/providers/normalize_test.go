@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 )
 
 func TestLinuxInvoiceProjectsDeclaredAndObserved(t *testing.T) {
@@ -285,6 +287,85 @@ func TestADProjectsWithoutMailAndKeepsRename(t *testing.T) {
 	}
 	_ = guid
 	_ = raw
+}
+
+func TestCoreServicePVCAndClusterPVAndBarePod(t *testing.T) {
+	estate := "cluster-1"
+	plan, err := Normalize(Input{Provider: "kubernetes", EstateID: estate, Objects: []Object{
+		{Ref: "svc", Kind: "k8s.service", Native: map[string]any{"namespace": "pay", "name": "api"}},
+		{Ref: "pvc", Kind: "k8s.pvc", Native: map[string]any{"namespace": "pay", "name": "data"}},
+		{Ref: "pv", Kind: "k8s.pv", Native: map[string]any{"name": "vol"}},
+		{Ref: "pod", Kind: "k8s.pod", Native: map[string]any{"namespace": "pay", "name": "worker"}},
+		{Ref: "bad", Kind: "k8s.service", Native: map[string]any{"name": "nameless"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for _, pair := range []struct{ kind, ns, name string }{
+		{"service", "pay", "api"},
+		{"pvc", "pay", "data"},
+		{"pv", "_", "vol"},
+	} {
+		key, err := igraph.KubernetesWorkloadKey(estate, "core", pair.kind, pair.ns, pair.name, pair.kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want[key] = pair.kind
+	}
+	got := map[string]bool{}
+	for _, r := range plan.Resources {
+		got[r.SourceKey] = true
+	}
+	for key, kind := range want {
+		if !got[key] {
+			t.Fatalf("missing %s key %s in %+v", kind, key, plan.Resources)
+		}
+	}
+	pod, err := igraph.KubernetesWorkloadKey(estate, "core", "Pod", "pay", "worker", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, w := range plan.Workloads {
+		if w.SourceKey == pod {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("bare pod key %s not in %+v", pod, plan.Workloads)
+	}
+	if len(plan.Skipped) != 1 || plan.Skipped[0].Ref != "bad" {
+		t.Fatalf("skipped %+v", plan.Skipped)
+	}
+}
+
+func TestLinuxSecretRefWithoutNamespace(t *testing.T) {
+	estate := "estate-1"
+	plan, err := Normalize(Input{Provider: "linux", EstateID: estate, Objects: []Object{
+		{Ref: "sec", Kind: "secret.reference", Native: map[string]any{"name": "db", "key": "password"}},
+		{Ref: "bad", Kind: "linux.systemd_workload", Native: map[string]any{}},
+		{Ref: "unit", Kind: "linux.systemd_workload", Native: map[string]any{"unit": "invoice.service"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := igraph.SecretRefKey("linux", estate, "host", "db", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, r := range plan.Resources {
+		if r.SourceKey == key {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("secret ref %s not in %+v", key, plan.Resources)
+	}
+	if len(plan.Workloads) != 1 || len(plan.Skipped) != 1 {
+		t.Fatalf("workloads %+v skipped %+v", plan.Workloads, plan.Skipped)
+	}
 }
 
 func adRaw(forest, guid, kind, dn, name string, disabled bool, member []string) json.RawMessage {

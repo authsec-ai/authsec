@@ -2,7 +2,9 @@ package integration
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -321,22 +323,49 @@ func TestTRD2ITRuntimeTTLDoesNotCrossPartitions(t *testing.T) {
 	f.t.Setenv("IGA_V2_RUNTIME_SUPPORT_TTL", "1h")
 	integ, collector, _ := f.seedCollector("linux")
 	run := f.seedRun(integ, "runtime_batch", false)
-	f.seedFact(integ, run, "linux.process_group", "g1", "g",
-		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "10", "start_ticks": "1"}}, nil)
+	f.seedFact(integ, run, "linux.local_account", "svc", "svc",
+		map[string]any{"native": map[string]any{"uid": 995, "user_namespace": "host"}, "attributes": map[string]any{"name": "svc"}}, nil)
 	f.seedBatch(integ, collector, uuid.New(), run, 1, uuid.Nil)
 	f.projectDefault()
 	f.exec(`UPDATE iga_object_support SET last_confirmed_at = now() - interval '2 hours' WHERE workspace_id = $1`, f.ws)
-	f.exec(`UPDATE iga_runtime_instances SET last_observed_at = now() - interval '2 hours' WHERE workspace_id = $1`, f.ws)
 	run2 := f.seedRun(integ, "runtime_batch", false)
-	f.seedFact(integ, run2, "linux.process_group", "g2", "g2",
-		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "11", "start_ticks": "2"}}, nil)
+	f.seedFact(integ, run2, "linux.local_account", "other", "other",
+		map[string]any{"native": map[string]any{"uid": 996, "user_namespace": "host"}, "attributes": map[string]any{"name": "other"}}, nil)
 	f.seedBatch(integ, collector, uuid.New(), run2, 2, uuid.Nil)
 	f.projectDefault()
-	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND ended_reason = 'runtime_unobserved'`, f.ws) != 1 {
+	if f.scalar(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = $1 AND display_name = 'svc' AND lifecycle = 'active'`, f.ws) != 1 {
+		t.Fatal("delta identity aged out")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_object_support s JOIN iga_identity_accounts i ON i.id = s.identity_account_id
+		WHERE s.workspace_id = $1 AND i.display_name = 'svc' AND s.state = 'current'`, f.ws) != 1 {
+		t.Fatal("delta support aged out")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND partition_key = $2`, f.ws, igraph.RuntimePartition) != 0 {
+		t.Fatal("a delta pass wrote the runtime partition")
+	}
+
+	rrun := f.seedRun(integ, "runtime_batch", false)
+	f.seedFact(integ, rrun, "linux.process_group", "g", "g",
+		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "10", "start_ticks": "1"}},
+		map[string]any{"kind": "runtime.process", "subject_ref": "g", "outcome": "success",
+			"runtime": map[string]any{"boot_id": "boot", "pid_namespace": "host", "pid": "10", "start_ticks": "1"}})
+	f.seedBatch(integ, collector, uuid.New(), rrun, 3, uuid.Nil)
+	f.projectDefault()
+	f.exec(`UPDATE iga_object_support SET last_confirmed_at = now() - interval '2 hours'
+		WHERE workspace_id = $1 AND partition_key = $2`, f.ws, igraph.RuntimePartition)
+	f.exec(`UPDATE iga_runtime_instances SET last_observed_at = now() - interval '2 hours' WHERE workspace_id = $1`, f.ws)
+	rrun2 := f.seedRun(integ, "runtime_batch", false)
+	f.seedFact(integ, rrun2, "linux.process_group", "g2", "g2",
+		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "11", "start_ticks": "2"}},
+		map[string]any{"kind": "runtime.process", "subject_ref": "g2", "outcome": "success",
+			"runtime": map[string]any{"boot_id": "boot", "pid_namespace": "host", "pid": "11", "start_ticks": "2"}})
+	f.seedBatch(integ, collector, uuid.New(), rrun2, 4, uuid.Nil)
+	f.projectDefault()
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND partition_key = $2 AND ended_reason = 'runtime_unobserved'`, f.ws, igraph.RuntimePartition) != 1 {
 		t.Fatal("stale runtime support did not age out")
 	}
-	if f.scalar(`SELECT count(*) FROM iga_workload WHERE workspace_id = $1 AND display_name = '10' AND lifecycle = 'retired'`, f.ws) != 1 {
-		t.Fatal("runtime-only workload was not retired")
+	if f.scalar(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = $1 AND display_name = 'svc' AND lifecycle = 'active'`, f.ws) != 1 {
+		t.Fatal("runtime aging retired a delta identity")
 	}
 
 	snapInteg, snapCol, scope := f.seedCollector("linux")
@@ -347,23 +376,20 @@ func TestTRD2ITRuntimeTTLDoesNotCrossPartitions(t *testing.T) {
 	f.seedFact(snapInteg, srun, "linux.systemd_workload", "unit", "o",
 		map[string]any{"native": map[string]any{"unit": "both.service"}}, nil)
 	f.seedBatch(snapInteg, snapCol, epoch, srun, 1, snap)
-	rrun := f.seedRun(integ, "runtime_batch", false)
-	f.seedFact(integ, rrun, "linux.process_group", "child", "c",
-		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "12", "start_ticks": "3"}}, nil)
-	f.seedBatch(integ, collector, uuid.New(), rrun, 3, uuid.Nil)
 	f.projectDefault()
-	// Snapshot absence of the unit must not end the process-group runtime support,
-	// and a runtime pass must not end the snapshot support.
 	epoch2 := uuid.New()
 	snap2 := f.seedSnapshot(snapCol, epoch2, "host", "linux.systemd_workload", true, 2)
 	srun2 := f.seedRun(snapInteg, "configuration_snapshot", true)
 	f.seedBatch(snapInteg, snapCol, epoch2, srun2, 1, snap2)
 	f.projectDefault()
-	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND partition_key = 'collector/object' AND state = 'current'`, f.ws) == 0 {
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND partition_key = $2 AND state = 'current'`, f.ws, igraph.RuntimePartition) == 0 {
 		t.Fatal("snapshot absence ended runtime support")
 	}
-	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND ended_reason = 'absent' AND partition_key = 'collector/object'`, f.ws) != 0 {
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND ended_reason = 'absent' AND partition_key = $2`, f.ws, igraph.RuntimePartition) != 0 {
 		t.Fatal("runtime partition ended with snapshot absence")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND partition_key = 'host/linux.systemd_workload' AND state <> 'ended'`, f.ws) != 0 {
+		t.Fatal("empty snapshot left systemd support current")
 	}
 }
 
@@ -460,26 +486,193 @@ func TestTRD2ITT07RecreateCloneAndPID(t *testing.T) {
 	}
 }
 
-func TestTRD2ITMigration041Rehearsal(t *testing.T) {
-	dsn := "postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable"
-	if v := getenvIGA(); v != "" {
-		dsn = v
+func TestTRD2ITCoreObjectsAndLinuxSecretRef(t *testing.T) {
+	f := newA3(t)
+	k8s, col, _ := f.seedCollector("kubernetes")
+	epoch := uuid.New()
+	snap := f.seedSnapshot(col, epoch, "cluster", "k8s.service", true, 1)
+	run := f.seedRun(k8s, "configuration_snapshot", true)
+	f.seedFact(k8s, run, "k8s.service", "svc", "svc", map[string]any{"native": map[string]any{"namespace": "pay", "name": "api"}}, nil)
+	f.seedFact(k8s, run, "k8s.pvc", "pvc", "pvc", map[string]any{"native": map[string]any{"namespace": "pay", "name": "data"}}, nil)
+	f.seedFact(k8s, run, "k8s.pv", "pv", "pv", map[string]any{"native": map[string]any{"name": "vol"}}, nil)
+	f.seedBatch(k8s, col, epoch, run, 1, snap)
+	f.projectDefault()
+	if f.scalar(`SELECT count(*) FROM iga_resources WHERE workspace_id = $1 AND provider = 'kubernetes'`, f.ws) != 3 {
+		t.Fatal("core service, pvc or cluster pv did not project")
 	}
-	db := openFreshDB(t, dsn, "authsec_it_a4mig")
-	applyMaster(t, db, false)
-	applyFile(t, db, "../../migrations/master/041_trd2_runtime_graph.sql")
-	execDB(t, db, `CREATE TABLE IF NOT EXISTS runtime_policies (id uuid primary key)`)
-	execDB(t, db, `CREATE TABLE IF NOT EXISTS discovered_agent_workloads (id uuid primary key)`)
-	applyFile(t, db, "../../migrations/master/041_trd2_runtime_graph.sql")
-	applyFile(t, db, "../../scripts/validate-041-runtime-graph.sql")
-	if !constraintValidated(t, db, "iga_identity_accounts_provider_kind_chk") {
-		t.Fatal("041 check was not validated")
-	}
-	if !constraintValidated(t, db, "iga_pa_estate_scope_fkey") {
-		t.Fatal("041 foreign key was not validated")
+
+	linux, lcol, _ := f.seedCollector("linux")
+	lrun := f.seedRun(linux, "runtime_batch", false)
+	f.seedFact(linux, lrun, "secret.reference", "db", "db",
+		map[string]any{"native": map[string]any{"name": "db", "key": "password"}}, nil)
+	f.seedBatch(linux, lcol, uuid.New(), lrun, 1, uuid.Nil)
+	f.projectDefault()
+	if f.scalar(`SELECT count(*) FROM iga_resources WHERE workspace_id = $1 AND provider = 'linux' AND native_kind = 'secret_reference'`, f.ws) != 1 {
+		t.Fatal("linux secret ref without a namespace did not project")
 	}
 }
 
-func getenvIGA() string {
-	return ""
+func TestTRD2ITSkippedObjectDoesNotEndSupport(t *testing.T) {
+	f := newA3(t)
+	integ, col, _ := f.seedCollector("linux")
+	epoch := uuid.New()
+	snap := f.seedSnapshot(col, epoch, "host", "linux.systemd_workload", true, 1)
+	run := f.seedRun(integ, "configuration_snapshot", true)
+	f.seedFact(integ, run, "linux.systemd_workload", "keep", "keep",
+		map[string]any{"native": map[string]any{"unit": "keep.service"}}, nil)
+	f.seedBatch(integ, col, epoch, run, 1, snap)
+	f.projectDefault()
+
+	epoch2 := uuid.New()
+	snap2 := f.seedSnapshot(col, epoch2, "host", "linux.systemd_workload", true, 2)
+	run2 := f.seedRun(integ, "configuration_snapshot", true)
+	f.seedFact(integ, run2, "linux.systemd_workload", "other", "other",
+		map[string]any{"native": map[string]any{"unit": "other.service"}}, nil)
+	f.seedFact(integ, run2, "linux.systemd_workload", "bad", "bad",
+		map[string]any{"native": map[string]any{}}, nil)
+	f.seedBatch(integ, col, epoch2, run2, 1, snap2)
+	f.projectDefault()
+	if f.scalar(`SELECT count(*) FROM iga_workload WHERE workspace_id = $1 AND display_name = 'other.service' AND lifecycle = 'active'`, f.ws) != 1 {
+		t.Fatal("the good object did not project")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_workload WHERE workspace_id = $1 AND display_name = 'keep.service' AND lifecycle = 'active'`, f.ws) != 1 {
+		t.Fatal("a skipped object was treated as absence")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_object_support s JOIN iga_workload w ON w.id = s.workload_id
+		WHERE s.workspace_id = $1 AND w.display_name = 'keep.service' AND s.state = 'current'`, f.ws) != 1 {
+		t.Fatal("skipped class ended support")
+	}
+}
+
+func TestTRD2ITRuntimeAgingStaysOnTheOwningCollector(t *testing.T) {
+	f := newA3(t)
+	f.t.Setenv("IGA_V2_RUNTIME_SUPPORT_TTL", "1h")
+	bInteg, bCol, _ := f.seedCollector("linux")
+	run := f.seedRun(bInteg, "runtime_batch", false)
+	f.seedFact(bInteg, run, "linux.process_group", "b", "b",
+		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "20", "start_ticks": "1"}},
+		map[string]any{"kind": "runtime.process", "subject_ref": "b", "outcome": "success",
+			"runtime": map[string]any{"boot_id": "boot", "pid_namespace": "host", "pid": "20", "start_ticks": "1"}})
+	f.seedBatch(bInteg, bCol, uuid.New(), run, 1, uuid.Nil)
+	f.projectDefault()
+	f.exec(`UPDATE iga_object_support SET last_confirmed_at = now() - interval '2 hours' WHERE workspace_id = $1 AND integration_id = $2`, f.ws, bInteg)
+	f.exec(`UPDATE iga_runtime_instances SET last_observed_at = now() - interval '2 hours' WHERE workspace_id = $1`, f.ws)
+
+	aInteg, aCol, _ := f.seedCollector("linux")
+	arun := f.seedRun(aInteg, "runtime_batch", false)
+	f.seedFact(aInteg, arun, "linux.process_group", "a", "a",
+		map[string]any{"native": map[string]any{"boot_id": "boot", "root_pid": "21", "start_ticks": "1"}},
+		map[string]any{"kind": "runtime.process", "subject_ref": "a", "outcome": "success",
+			"runtime": map[string]any{"boot_id": "boot", "pid_namespace": "host", "pid": "21", "start_ticks": "1"}})
+	f.seedBatch(aInteg, aCol, uuid.New(), arun, 1, uuid.Nil)
+	f.projectDefault()
+	if f.scalar(`SELECT count(*) FROM iga_object_support WHERE workspace_id = $1 AND integration_id = $2 AND state = 'current'`, f.ws, bInteg) == 0 {
+		t.Fatal("collector A ended collector B's support")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_runtime_instances ri
+		JOIN iga_workload w ON w.id = ri.workload_id
+		WHERE ri.workspace_id = $1 AND w.display_name = '20' AND ri.ended_at IS NULL`, f.ws) != 1 {
+		t.Fatal("collector A ended collector B's runtime instance")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_workload WHERE workspace_id = $1 AND display_name = '20' AND lifecycle = 'retired'`, f.ws) != 0 {
+		t.Fatal("collector B's node was retired while B was silent")
+	}
+}
+
+func TestTRD2ITRetiredNodeObservedAgainIsNewIncarnation(t *testing.T) {
+	// A systemd unit is recognition-only: it has no immutable key. The AWS
+	// projector restores the same row only when that key is non-empty
+	// (project.go case c). An empty key takes case (d), a new row. The
+	// retired row stays retired.
+	f := newA3(t)
+	integ, col, _ := f.seedCollector("linux")
+	epoch := uuid.New()
+	snap := f.seedSnapshot(col, epoch, "host", "linux.systemd_workload", true, 1)
+	run := f.seedRun(integ, "configuration_snapshot", true)
+	f.seedFact(integ, run, "linux.systemd_workload", "unit", "unit",
+		map[string]any{"native": map[string]any{"unit": "invoice.service"}}, nil)
+	f.seedBatch(integ, col, epoch, run, 1, snap)
+	f.projectDefault()
+	var oldID uuid.UUID
+	f.scan(`SELECT id FROM iga_workload WHERE workspace_id = $1 AND display_name = 'invoice.service' AND lifecycle = 'active'`, []any{f.ws}, &oldID)
+	epoch2 := uuid.New()
+	snap2 := f.seedSnapshot(col, epoch2, "host", "linux.systemd_workload", true, 2)
+	run2 := f.seedRun(integ, "configuration_snapshot", true)
+	f.seedBatch(integ, col, epoch2, run2, 1, snap2)
+	f.projectDefault()
+	var reason string
+	f.scan(`SELECT retired_reason FROM iga_workload WHERE id = $1`, []any{oldID}, &reason)
+	if reason != "unsupported" {
+		t.Fatalf("retired reason %s", reason)
+	}
+	epoch3 := uuid.New()
+	snap3 := f.seedSnapshot(col, epoch3, "host", "linux.systemd_workload", true, 3)
+	run3 := f.seedRun(integ, "configuration_snapshot", true)
+	f.seedFact(integ, run3, "linux.systemd_workload", "unit", "unit",
+		map[string]any{"native": map[string]any{"unit": "invoice.service"}}, nil)
+	f.seedBatch(integ, col, epoch3, run3, 1, snap3)
+	f.projectDefault()
+	var newID uuid.UUID
+	f.scan(`SELECT id FROM iga_workload WHERE workspace_id = $1 AND display_name = 'invoice.service' AND lifecycle = 'active'`, []any{f.ws}, &newID)
+	if newID == uuid.Nil || newID == oldID {
+		t.Fatalf("re-observation did not open a new incarnation: old %s new %s", oldID, newID)
+	}
+	f.scan(`SELECT retired_reason FROM iga_workload WHERE id = $1`, []any{oldID}, &reason)
+	if reason != "unsupported" {
+		t.Fatal("the retired incarnation was reactivated")
+	}
+}
+
+func TestTRD2ITMigration041Rehearsal(t *testing.T) {
+	dsn := "postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable"
+	if v := os.Getenv("IGA_TEST_DSN"); v != "" {
+		dsn = v
+	}
+	validates := []string{
+		"../../scripts/validate-040-typed-provenance.sql",
+		"../../scripts/validate-042-agent-instance-link.sql",
+		"../../scripts/validate-045-ad-hardening.sql",
+		"../../scripts/validate-041-runtime-graph.sql",
+	}
+	check := func(db *sql.DB) {
+		t.Helper()
+		if !constraintValidated(t, db, "iga_identity_accounts_provider_kind_chk") {
+			t.Fatal("041 check was not validated")
+		}
+		if !constraintValidated(t, db, "iga_pa_estate_scope_fkey") {
+			t.Fatal("041 foreign key was not validated")
+		}
+		if !constraintValidated(t, db, "iga_agent_instances_workload_fkey") &&
+			!constraintValidated(t, db, "discovered_agent_workloads_workload_fkey") {
+			t.Fatal("042 validate script did not validate a link foreign key")
+		}
+		if !constraintValidated(t, db, "ad_directory_posture_run_fkey") {
+			t.Fatal("045 posture foreign key was not validated")
+		}
+	}
+
+	t.Run("late_041", func(t *testing.T) {
+		db := openFreshDB(t, dsn, "authsec_it_a4late")
+		applyMasterWhere(t, db, func(base string) bool {
+			ver := base
+			if i := strings.IndexByte(base, '_'); i > 0 {
+				ver = base[:i]
+			}
+			return ver <= "040" || ver == "042" || ver == "045"
+		})
+		applyFile(t, db, "../../migrations/master/041_trd2_runtime_graph.sql")
+		applyFile(t, db, "../../migrations/master/041_trd2_runtime_graph.sql")
+		for _, script := range validates {
+			applyFile(t, db, script)
+		}
+		check(db)
+	})
+	t.Run("fresh_order", func(t *testing.T) {
+		db := openFreshDB(t, dsn, "authsec_it_a4fresh")
+		applyMasterWhere(t, db, func(string) bool { return true })
+		for _, script := range validates {
+			applyFile(t, db, script)
+		}
+		check(db)
+	})
 }

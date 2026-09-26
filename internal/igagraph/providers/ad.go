@@ -33,7 +33,8 @@ func normalizeAD(in Input) (*Plan, error) {
 	for _, o := range in.Objects {
 		obj, err := decodeAD(o)
 		if err != nil {
-			return nil, err
+			skipObject(p, o, err)
+			continue
 		}
 		if obj.ObjectGUID == "" {
 			continue
@@ -43,12 +44,14 @@ func normalizeAD(in Input) (*Plan, error) {
 			var ferr error
 			forest, ferr = forestFromRecognition(o.Recognition, obj.ObjectGUID)
 			if ferr != nil {
-				return nil, ferr
+				skipObject(p, o, ferr)
+				continue
 			}
 		}
 		key, err := igraph.ADIdentityKey(forest, obj.ObjectGUID)
 		if err != nil {
-			return nil, err
+			skipObject(p, o, err)
+			continue
 		}
 		kind := obj.AccountKind
 		if kind == "" {
@@ -92,7 +95,8 @@ func normalizeAD(in Input) (*Plan, error) {
 			}
 			rkey, err := relationKey("ad", "member_of", src, row.key)
 			if err != nil {
-				return nil, err
+				p.Skipped = append(p.Skipped, Skipped{Kind: "member", Ref: member, Reason: err.Error()})
+				continue
 			}
 			p.Relationships = append(p.Relationships, Relationship{
 				SourceKey: rkey, Type: models.RelTypeMemberOf, Basis: models.BasisDeclared,
