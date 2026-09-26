@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,7 +105,7 @@ func TestPagedSearchCompleteAndSizeLimitPartial(t *testing.T) {
 	}
 	for _, c := range s.calls {
 		for _, a := range c.Attributes {
-			if Denied(a) {
+			if Denied(a) || strings.EqualFold(a, "msDS-ManagedPassword") {
 				t.Fatalf("search requested denied attribute %s", a)
 			}
 		}
@@ -206,6 +207,9 @@ func TestParseEntryDropsSecretAndKeepsNoMailDisabled(t *testing.T) {
 			{Name: "uSNChanged", Values: []string{"77"}},
 			{Name: "msDS-ManagedPassword", ByteValues: [][]byte{[]byte("CANARY-SECRET-DO-NOT-LEAK-9")}},
 			{Name: "unicodePwd", Values: []string{"nope"}},
+			{Name: "adminCount", Values: []string{"1"}},
+			{Name: "primaryGroupID", Values: []string{"513"}},
+			{Name: "msDS-AllowedToDelegateTo", Values: []string{"HOST/db.authsec.test"}},
 		},
 	}
 	obj, ok := ParseEntry(e, ClassUser)
@@ -226,6 +230,9 @@ func TestParseEntryDropsSecretAndKeepsNoMailDisabled(t *testing.T) {
 	}
 	if obj.ObjectSID != "S-1-5-32-544" {
 		t.Fatalf("sid %s", obj.ObjectSID)
+	}
+	if !obj.AdminCount || obj.PrimaryGroupID != 513 || len(obj.AllowedToDelegateTo) != 1 {
+		t.Fatalf("posture attributes: admin=%v primary=%d targets=%v", obj.AdminCount, obj.PrimaryGroupID, obj.AllowedToDelegateTo)
 	}
 	if obj.Basis != BasisObserved {
 		t.Fatalf("basis %s", obj.Basis)

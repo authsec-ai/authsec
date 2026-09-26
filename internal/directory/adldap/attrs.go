@@ -46,6 +46,13 @@ func InventoryAttributes() []string {
 		"cn",
 		"displayName",
 		"mail",
+		// Posture (D03). The security descriptor is parsed down to SIDs and
+		// is not stored. msDS-GroupMSAMembership is not requested: gMSA and
+		// sMSA are recorded from object class, not from the password ACL.
+		"adminCount",
+		"primaryGroupID",
+		"msDS-AllowedToDelegateTo",
+		"msDS-AllowedToActOnBehalfOfOtherIdentity",
 	}
 }
 
