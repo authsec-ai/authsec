@@ -55,6 +55,14 @@ func TestADInventoryConfigOmitsSecrets(t *testing.T) {
 		t.Fatalf("get leaked material: %s", rec.Body.String())
 	}
 
+	dirsync := `{"config_id":"` + cfgID.String() + `","tracking_mode":"dirsync","scopes":[{"base_dn":"DC=authsec,DC=test"}]}`
+	req = httptest.NewRequest(http.MethodPut, "/config", bytes.NewBufferString(dirsync))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "dirsync not supported yet; use usn")
+
 	bare := gin.New()
 	bare.PUT("/config", h.PutConfig)
 	req = httptest.NewRequest(http.MethodPut, "/config", bytes.NewBufferString(body))

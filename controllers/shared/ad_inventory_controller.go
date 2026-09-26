@@ -216,6 +216,7 @@ func writeInventoryErr(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"error": msg})
 	case strings.Contains(msg, "no administrator-approved"),
 		strings.Contains(msg, "tracking_mode"),
+		strings.Contains(msg, "dirsync not supported"),
 		strings.Contains(msg, "disabled"),
 		strings.Contains(msg, "base DN"):
 		c.JSON(http.StatusBadRequest, gin.H{"error": msg})

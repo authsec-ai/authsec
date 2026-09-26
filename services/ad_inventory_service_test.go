@@ -183,19 +183,32 @@ func TestInventoryRunCursorRenamePartialAndSecrets(t *testing.T) {
 	}
 }
 
-func TestDirSyncAndDCChangeRecoverWithFullRead(t *testing.T) {
+func TestDirSyncRejectedAndDCChangeRecoversWithFullRead(t *testing.T) {
 	db := openInventoryDB(t)
 	ws, cfgID := uuid.New(), uuid.New()
 	password, err := utils.Encrypt("CANARY-SECRET-DO-NOT-LEAK-2")
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(`INSERT INTO sync_configurations
 		(id, workspace_id, sync_type, is_active, ad_server, ad_username, ad_password, ad_use_ssl, ad_change_tracking, ad_tracking_mode, ad_page_size)
-		VALUES (?, ?, 'active_directory', 1, 'dc.authsec.test:389', 'svc', ?, 0, 1, 'dirsync', 50)`,
+		VALUES (?, ?, 'active_directory', 1, 'dc.authsec.test:389', 'svc', ?, 0, 1, 'usn', 50)`,
 		cfgID.String(), ws.String(), password).Error)
 	svc := &ADInventoryService{DB: db}
 	ctx := context.Background()
 	_, err = svc.PutConfig(ctx, ws, InventoryConfig{
 		ConfigID: cfgID, ChangeTracking: true, TrackingMode: "dirsync",
+		Scopes: []InventoryScope{{BaseDN: "DC=authsec,DC=test"}},
+	})
+	if err == nil || err.Error() != models.DirSyncUnsupportedMessage {
+		t.Fatalf("dirsync err = %v", err)
+	}
+	var cursors int64
+	require.NoError(t, db.Model(&models.ADInventoryCursor{}).Count(&cursors).Error)
+	if cursors != 0 {
+		t.Fatalf("dirsync wrote %d cursor rows", cursors)
+	}
+
+	_, err = svc.PutConfig(ctx, ws, InventoryConfig{
+		ConfigID: cfgID, ChangeTracking: true, TrackingMode: "usn",
 		Scopes: []InventoryScope{{BaseDN: "DC=authsec,DC=test"}},
 	})
 	require.NoError(t, err)
@@ -223,9 +236,12 @@ func TestDirSyncAndDCChangeRecoverWithFullRead(t *testing.T) {
 	if _, err := svc.Run(ctx, ws, cfgID, "tester"); err != nil {
 		t.Fatal(err)
 	}
+	if len(floors) == 0 {
+		t.Fatal("DC change produced no reads")
+	}
 	for _, f := range floors {
 		if f != 0 {
-			t.Fatalf("dirsync/DC recovery used incremental floor %d (%v)", f, floors)
+			t.Fatalf("DC recovery used incremental floor %d (%v)", f, floors)
 		}
 	}
 }
@@ -287,7 +303,7 @@ func openInventoryDB(t *testing.T) *gorm.DB {
 			base_dn text, object_classes text, enabled numeric, created_at datetime, updated_at datetime)`,
 		`CREATE TABLE ad_inventory_cursors (
 			workspace_id text, scope_id text, invocation_id text, highest_usn integer,
-			tracking_mode text, dirsync_valid numeric, updated_at datetime, primary key (workspace_id, scope_id))`,
+			tracking_mode text, updated_at datetime, primary key (workspace_id, scope_id))`,
 		`CREATE TABLE ad_inventory_runs (
 			id text primary key, workspace_id text, sync_config_id text, integration_id text, scan_run_id text,
 			status text, mode text, started_at datetime, completed_at datetime, requested_by text,

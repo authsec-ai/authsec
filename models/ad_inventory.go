@@ -34,7 +34,6 @@ type ADInventoryCursor struct {
 	InvocationID string    `json:"invocation_id" gorm:"not null;default:''"`
 	HighestUSN   int64     `json:"highest_usn" gorm:"not null;default:0"`
 	TrackingMode string    `json:"tracking_mode" gorm:"not null;default:'usn'"`
-	DirSyncValid bool      `json:"dirsync_valid" gorm:"column:dirsync_valid;not null;default:false"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 

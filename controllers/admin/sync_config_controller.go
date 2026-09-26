@@ -47,6 +47,10 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ad_config is required for active_directory sync type"})
 		return
 	}
+	if req.ADConfig != nil && models.IsDirSyncMode(req.ADConfig.TrackingMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": models.DirSyncUnsupportedMessage})
+		return
+	}
 	if req.SyncType == "entra_id" && req.EntraConfig == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "entra_config is required for entra_id sync type"})
 		return
@@ -242,6 +246,10 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	var req models.UpdateSyncConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format", "details": err.Error()})
+		return
+	}
+	if req.ADConfig != nil && models.IsDirSyncMode(req.ADConfig.TrackingMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": models.DirSyncUnsupportedMessage})
 		return
 	}
 

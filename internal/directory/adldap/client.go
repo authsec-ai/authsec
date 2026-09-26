@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 
 	"github.com/authsec-ai/authsec/internal/directory/adguid"
 	"github.com/go-ldap/ldap/v3"
@@ -25,7 +24,7 @@ type Conn struct {
 	PageSize       int
 	Production     bool
 	ChangeTracking bool
-	TrackingMode   string // "usn" (default) or "dirsync"
+	TrackingMode   string // "usn". "dirsync" is rejected by the API.
 }
 
 // LDAPReader talks to one domain controller.
@@ -111,14 +110,9 @@ func (r *LDAPReader) DirectoryIdentity(ctx context.Context) (Identity, error) {
 	return id, nil
 }
 
-// ReadClass runs one paged search. DirSync mode does not send a DirSync
-// control: a Windows DirSync cookie is not portable to Samba, so the caller
-// recovers with a full scoped read (usnFloor 0) instead.
+// ReadClass runs one paged search. usnFloor 0 is a full read of the class.
 func (r *LDAPReader) ReadClass(ctx context.Context, baseDN, class string, usnFloor int64, pageSize int) (ClassRead, error) {
 	_ = ctx
-	if strings.EqualFold(r.Conn.TrackingMode, "dirsync") {
-		usnFloor = 0
-	}
 	filter, err := ClassFilter(class, usnFloor)
 	if err != nil {
 		return ClassRead{}, err

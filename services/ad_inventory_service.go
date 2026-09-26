@@ -142,12 +142,15 @@ func (s *ADInventoryService) PutConfig(ctx context.Context, workspaceID uuid.UUI
 		return InventoryConfig{}, adldap.ErrSkipVerifyRefused
 	}
 	page := clampADPage(cfg.PageSize)
-	mode := cfg.TrackingMode
+	mode := strings.ToLower(strings.TrimSpace(cfg.TrackingMode))
 	if mode == "" {
 		mode = "usn"
 	}
-	if mode != "usn" && mode != "dirsync" {
-		return InventoryConfig{}, fmt.Errorf("tracking_mode must be usn or dirsync")
+	if models.IsDirSyncMode(mode) {
+		return InventoryConfig{}, fmt.Errorf("%s", models.DirSyncUnsupportedMessage)
+	}
+	if mode != "usn" {
+		return InventoryConfig{}, fmt.Errorf("tracking_mode must be usn")
 	}
 	scopes, err := normalizeScopes(cfg.Scopes)
 	if err != nil {
@@ -221,6 +224,9 @@ func (s *ADInventoryService) Run(ctx context.Context, workspaceID, configID uuid
 	if !row.IsActive {
 		return InventoryRunView{}, fmt.Errorf("sync configuration is disabled")
 	}
+	if models.IsDirSyncMode(row.ADTrackingMode) {
+		return InventoryRunView{}, fmt.Errorf("%s", models.DirSyncUnsupportedMessage)
+	}
 	password, err := utils.Decrypt(row.ADPassword)
 	if err != nil {
 		return InventoryRunView{}, fmt.Errorf("failed to decrypt credentials")
@@ -287,9 +293,6 @@ func (s *ADInventoryService) execute(ctx context.Context, workspaceID uuid.UUID,
 		}
 		cur, _ := s.loadCursor(db, workspaceID, sc.ID)
 		mode, floor := adldap.PlanRead(conn.ChangeTracking, cur, ident.InvocationID)
-		if strings.EqualFold(conn.TrackingMode, "dirsync") {
-			mode, floor = "full", 0
-		}
 		if mode != "incremental" {
 			anyIncremental = false
 		}
@@ -403,13 +406,6 @@ func (s *ADInventoryService) execute(ctx context.Context, workspaceID uuid.UUID,
 			InvocationID: ident.InvocationID,
 			HighestUSN:   st.maxUSN,
 			Mode:         "usn",
-		}
-		if strings.EqualFold(conn.TrackingMode, "dirsync") {
-			// No DirSync cookie was obtained. Leave the cursor invalid so the
-			// next run takes the full-scoped-read recovery path again.
-			cur.Mode = "dirsync"
-			cur.DirSyncValid = false
-			cur.HighestUSN = 0
 		}
 		_ = s.saveCursor(db, workspaceID, id, cur, now)
 	}
@@ -663,7 +659,7 @@ func (s *ADInventoryService) loadCursor(db *gorm.DB, workspaceID, scopeID uuid.U
 	}
 	return adldap.Cursor{
 		InvocationID: row.InvocationID, HighestUSN: row.HighestUSN,
-		Mode: row.TrackingMode, DirSyncValid: row.DirSyncValid,
+		Mode: row.TrackingMode,
 	}, nil
 }
 
@@ -673,7 +669,7 @@ func (s *ADInventoryService) saveCursor(db *gorm.DB, workspaceID, scopeID uuid.U
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return db.Create(&models.ADInventoryCursor{
 			WorkspaceID: workspaceID, ScopeID: scopeID, InvocationID: cur.InvocationID,
-			HighestUSN: cur.HighestUSN, TrackingMode: cur.Mode, DirSyncValid: cur.DirSyncValid,
+			HighestUSN: cur.HighestUSN, TrackingMode: cur.Mode,
 			UpdatedAt: now,
 		}).Error
 	}
@@ -682,7 +678,7 @@ func (s *ADInventoryService) saveCursor(db *gorm.DB, workspaceID, scopeID uuid.U
 	}
 	return db.Model(&existing).Updates(map[string]interface{}{
 		"invocation_id": cur.InvocationID, "highest_usn": cur.HighestUSN,
-		"tracking_mode": cur.Mode, "dirsync_valid": cur.DirSyncValid, "updated_at": now,
+		"tracking_mode": cur.Mode, "updated_at": now,
 	}).Error
 }
 

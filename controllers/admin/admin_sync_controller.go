@@ -17,6 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 type AdminSyncController struct {
@@ -321,7 +322,13 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
 
-	// Check if user already exists (by email or external ID scoped to tenant)
+	// Check if user already exists (by email or either GUID spelling, scoped to tenant).
+	// external_id is matched exactly, in lowercase, so idx_users_external_id is usable.
+	matchIDs := shared.ADMatchIDs(adUser.ObjectGUID)
+	canonicalID := adUser.ObjectGUID
+	if len(matchIDs) > 0 && matchIDs[0] != "" {
+		canonicalID = matchIDs[0]
+	}
 	var existingUser models.AdminUser
 	query := `SELECT id, email, COALESCE(username, ''), COALESCE(password_hash, ''), COALESCE(name, ''),
 	          client_id, workspace_id, project_id, COALESCE(workspace_domain, ''), COALESCE(provider, ''),
@@ -330,14 +337,14 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
+	          WHERE (LOWER(email) = LOWER($1) OR external_id = ANY($2)) AND workspace_id = $3`
 
 	var username, passwordHash, name, workspaceDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, workspaceIDVal, projectIDStr sql.NullString
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, adUser.Email, adUser.ObjectGUID, workspaceID).Scan(
+	err = db.DB.QueryRow(query, adUser.Email, pq.Array(matchIDs), workspaceID).Scan(
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &workspaceIDVal, &projectIDStr,
 		&workspaceDomain, &provider, &providerID, &providerData,
@@ -440,7 +447,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 			ProviderID:   adUser.UserPrincipalName,
 			ProviderData: providerDataBytes,
 			Active:       true, // Always set to true for synced admin users
-			ExternalID:   adUser.ObjectGUID,
+			ExternalID:   canonicalID,
 			SyncSource:   "active_directory",
 			LastSyncAt:   &now,
 			IsSyncedUser: true,
@@ -487,9 +494,11 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 	updates := map[string]interface{}{
 		"name":          adUser.DisplayName,
 		"username":      adUser.Username,
+		"email":         adUser.Email,
+		"external_id":   canonicalID,
 		"active":        true, // Always set to true for synced admin users
 		"last_sync_at":  &now,
-		"provider_data": providerDataBytes,
+		"provider_data": string(providerDataBytes),
 	}
 
 	if err := asc.adminUserRepo.UpdateAdminUser(existingUser.ID, updates); err != nil {

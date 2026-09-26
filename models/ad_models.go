@@ -1,5 +1,16 @@
 package models
 
+import "strings"
+
+// DirSyncUnsupportedMessage is the 400 body for tracking_mode=dirsync.
+// DirSync is not implemented; callers must use usn.
+const DirSyncUnsupportedMessage = "dirsync not supported yet; use usn"
+
+// IsDirSyncMode reports whether tracking_mode asks for DirSync.
+func IsDirSyncMode(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "dirsync")
+}
+
 // ADSyncController struct
 type ADSyncController struct{}
 
@@ -21,8 +32,8 @@ type ADSyncConfig struct {
 	CABundle string `json:"ca_bundle,omitempty"`
 	// PageSize is the LDAP page size for the inventory adapter (1..1000).
 	PageSize int `json:"page_size,omitempty"`
-	// ChangeTracking enables a persisted uSNChanged cursor. DirSync is accepted
-	// only as TrackingMode "dirsync", which recovers with a full scoped read.
+	// ChangeTracking enables a persisted uSNChanged cursor. TrackingMode must
+	// be "usn"; "dirsync" is rejected until a DirSync cookie can be proven.
 	ChangeTracking bool   `json:"change_tracking,omitempty"`
 	TrackingMode   string `json:"tracking_mode,omitempty"`
 }

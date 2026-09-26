@@ -457,8 +457,8 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR LOWER(external_id) IN ?)",
-		workspaceUUID, adUser.Email, adMatchIDs(adUser.ObjectGUID)).First(&existingUser).Error
+	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR external_id IN ?)",
+		workspaceUUID, adUser.Email, ADMatchIDs(adUser.ObjectGUID)).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -614,8 +614,8 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 	// Match either GUID spelling so a legacy row is not duplicated. The agent
 	// payload has no raw objectGUID bytes, so this path does not rewrite
 	// external_id — the next LDAP sync is what canonicalises it.
-	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR LOWER(external_id) IN ?)",
-		workspaceUUID, agentUser.Email, adMatchIDs(agentUser.ExternalID)).First(&existingUser).Error
+	err = tenantDB.Where("workspace_id = ? AND (LOWER(email) = LOWER(?) OR external_id IN ?)",
+		workspaceUUID, agentUser.Email, ADMatchIDs(agentUser.ExternalID)).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -726,9 +726,10 @@ func (asc *ADSyncController) loadStoredADConfig(configID, workspaceID, clientID 
 	return syncConfig.ADConnection(decryptedPassword), nil
 }
 
-// adMatchIDs is the canonical GUID plus the legacy unswapped spelling, when
-// they differ. A non-GUID external id is matched as itself.
-func adMatchIDs(externalID string) []string {
+// ADMatchIDs is the lowercase canonical GUID plus the lowercase legacy
+// unswapped spelling, when they differ. Match external_id exactly so
+// idx_users_external_id stays usable. A non-GUID external id is matched as itself.
+func ADMatchIDs(externalID string) []string {
 	ids, err := adguid.LookupIDs(externalID)
 	if err != nil || len(ids) == 0 {
 		if strings.TrimSpace(externalID) == "" {

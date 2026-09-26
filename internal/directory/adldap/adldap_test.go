@@ -184,9 +184,9 @@ func TestPlanReadRecovery(t *testing.T) {
 	if mode, floor := PlanRead(true, Cursor{}, "dc-a"); mode != "full" || floor != 0 {
 		t.Fatalf("empty cursor = %s %d", mode, floor)
 	}
-	bad := Cursor{Mode: "dirsync", DirSyncValid: false, InvocationID: "dc-a", HighestUSN: 9}
+	bad := Cursor{Mode: "dirsync", InvocationID: "dc-a", HighestUSN: 9}
 	if mode, floor := PlanRead(true, bad, "dc-a"); mode != "full" || floor != 0 {
-		t.Fatalf("invalid dirsync = %s %d", mode, floor)
+		t.Fatalf("stored dirsync cursor = %s %d", mode, floor)
 	}
 }
 

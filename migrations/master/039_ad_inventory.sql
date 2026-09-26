@@ -7,9 +7,9 @@
 -- not project iga_identity_accounts: canonical projection for provider ad
 -- waits for the TRD2 M3 vocabulary.
 --
--- A uSNChanged cursor is per scope. It is not advanced after a partial read,
--- and a DirSync configuration does not store a cookie — the next run is a
--- full scoped read. Deletions are not inferred from an incremental cursor.
+-- A uSNChanged cursor is per scope. It is not advanced after a partial read.
+-- tracking_mode dirsync is not stored: the API rejects it until a DirSync
+-- cookie can be proven. Deletions are not inferred from an incremental cursor.
 -- ============================================================================
 
 ALTER TABLE public.sync_configurations
@@ -48,7 +48,6 @@ CREATE TABLE IF NOT EXISTS public.ad_inventory_cursors (
     invocation_id text NOT NULL DEFAULT '',
     highest_usn   bigint NOT NULL DEFAULT 0,
     tracking_mode text NOT NULL DEFAULT 'usn',
-    dirsync_valid boolean NOT NULL DEFAULT false,
     updated_at    timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT ad_inventory_cursors_pkey PRIMARY KEY (workspace_id, scope_id),
     CONSTRAINT ad_inventory_cursors_scope_fkey
@@ -110,17 +109,25 @@ CREATE TABLE IF NOT EXISTS public.ad_directory_instances (
 
 COMMENT ON TABLE public.ad_inventory_scopes IS
     'Administrator-approved AD base DNs. Objects are evidence, not iga_identity_accounts.';
+-- Drop the column if a previous draft of this unmerged migration created it.
+ALTER TABLE public.ad_inventory_cursors
+    DROP COLUMN IF EXISTS dirsync_valid;
+
 COMMENT ON TABLE public.ad_inventory_cursors IS
-    'Per-scope uSNChanged cursor. dirsync_valid stays false: DirSync cookies are not stored.';
+    'Per-scope uSNChanged cursor. DirSync cookies are not stored.';
 COMMENT ON COLUMN public.sync_configurations.ad_ca_bundle IS
     'PEM trust anchor for LDAPS or StartTLS. Empty uses the system pool.';
 
 -- Evidence basis "observed" is an authoritative directory read. It is not
 -- platform_declared, so it cannot auto-confirm an agent.
+--
+-- 038 (collector registry) DROP+ADDs this same constraint with runtime_batch
+-- and configuration_snapshot, and without observed. Rebuild from the union of
+-- both lists plus any value the live constraint already allows, so 038-then-039
+-- and a re-apply of 039 after 038 both keep every mode.
 DO $$
-BEGIN
-    ALTER TABLE public.iga_observations DROP CONSTRAINT IF EXISTS iga_observations_mode_chk;
-    ALTER TABLE public.iga_observations ADD CONSTRAINT iga_observations_mode_chk CHECK (mode IN (
+DECLARE
+    wanted text[] := ARRAY[
         'platform_declared',
         'deployment_declared',
         'invocation_declared',
@@ -129,6 +136,34 @@ BEGIN
         'secret_reference',
         'identity_grant',
         'audit_event',
-        'observed'));
+        'observed',
+        'runtime_batch',
+        'configuration_snapshot'
+    ];
+    def text;
+    extra text;
+    modes text[] := wanted;
+BEGIN
+    SELECT pg_get_constraintdef(c.oid) INTO def
+    FROM pg_constraint c
+    WHERE c.conname = 'iga_observations_mode_chk'
+      AND c.conrelid = 'public.iga_observations'::regclass;
+
+    IF def IS NOT NULL THEN
+        FOR extra IN
+            SELECT x[1]
+            FROM regexp_matches(def, '''([^'']+)''', 'g') AS x
+        LOOP
+            IF NOT (extra = ANY (modes)) THEN
+                modes := array_append(modes, extra);
+            END IF;
+        END LOOP;
+    END IF;
+
+    ALTER TABLE public.iga_observations DROP CONSTRAINT IF EXISTS iga_observations_mode_chk;
+    EXECUTE format(
+        'ALTER TABLE public.iga_observations ADD CONSTRAINT iga_observations_mode_chk CHECK (mode IN (%s))',
+        (SELECT string_agg(quote_literal(m), ', ' ORDER BY m) FROM unnest(modes) AS m)
+    );
 END
 $$;

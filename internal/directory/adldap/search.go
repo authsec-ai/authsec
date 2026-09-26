@@ -140,19 +140,18 @@ func classify(err error) string {
 type Cursor struct {
 	InvocationID string
 	HighestUSN   int64
-	// Mode is "usn" or "dirsync". DirSync cookies are not sent by this
-	// package; an invalid or unproven DirSync cursor recovers with a full read.
-	Mode         string
-	DirSyncValid bool
+	// Mode is "usn". A stored "dirsync" cursor is not a uSNChanged position
+	// and recovers with a full read. DirSync itself is rejected by the API.
+	Mode string
 }
 
 // PlanRead decides a full scoped read or a uSNChanged incremental read.
-// A DC change (invocationID) or an invalid DirSync cursor forces a full read.
+// A DC change (invocationID) or a stored DirSync cursor forces a full read.
 func PlanRead(tracking bool, stored Cursor, liveInvocation string) (mode string, usnFloor int64) {
 	if !tracking {
 		return "full", 0
 	}
-	if stored.Mode == "dirsync" && !stored.DirSyncValid {
+	if strings.EqualFold(stored.Mode, "dirsync") {
 		return "full", 0
 	}
 	if stored.HighestUSN <= 0 || stored.InvocationID == "" || liveInvocation == "" {

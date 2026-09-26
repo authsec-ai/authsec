@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +14,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/directory/adguid"
 	"github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/testdb"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/go-ldap/ldap/v3"
@@ -21,7 +22,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -64,22 +64,13 @@ func (m *MockLDAPDialer) DialTLS(network, addr string, config *tls.Config) (*lda
 }
 
 func setupADTestDB(t *testing.T) *gorm.DB {
-	if config.DB != nil {
-		return config.DB
+	t.Helper()
+	// Dedicated database, not the empty CI authsec DB. Migrate when users is missing.
+	db, err := testdb.Prepare("authsec_ad_shared_test", false)
+	if errors.Is(err, testdb.ErrUnreachable) {
+		t.Skipf("Postgres is not reachable (%v). CI sets DB_HOST, DB_PORT, DB_USER, and DB_PASSWORD; this test migrates authsec_ad_shared_test and must run there.", err)
 	}
-
-	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		getenvDefault("DB_HOST", "localhost"),
-		getenvDefault("DB_USER", "postgres"),
-		getenvDefault("DB_PASSWORD", "postgres"),
-		getenvDefault("DB_NAME", "authsec"),
-		getenvDefault("DB_PORT", "5432"),
-	)
-
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	require.NoError(t, err, "fallback DB should connect")
-	config.DB = db
+	require.NoError(t, err)
 	return db
 }
 
