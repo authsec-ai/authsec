@@ -246,8 +246,16 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 	if err := bfkInsert(db, s.publication("rev", rev, "scan_run_id", s.id("run"))); err != nil {
 		t.Fatalf("seed %s publication: %v", name, err)
 	}
+	for _, seed := range bfkAfterSideSeed {
+		seed(t, db, s)
+	}
 	return s
 }
+
+// bfkAfterSideSeed runs once a side's graph parents exist. A9 seeds the AD
+// scope and run its composite keys reference. The hook stays here so the
+// shared case list does not grow an AD seed.
+var bfkAfterSideSeed []func(t *testing.T, db *sql.DB, s *bfkSide)
 
 func (s *bfkSide) arn(kind string) string {
 	return fmt.Sprintf("arn:aws:iam::%s:%s/bfk-%s", s.acct, kind, uuid.NewString())

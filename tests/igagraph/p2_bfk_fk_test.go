@@ -247,6 +247,12 @@ type bfkQuerier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
 
+// bfkExtraNames are foreign keys outside the iga_*/cloud_* name scope that
+// still need a B9 case. Widening the LIKE to ad_% would also pull 039's
+// single-column keys into scope, and those names are dropped once the
+// composite keys are validated. A9 registers only the composite names.
+var bfkExtraNames []string
+
 // bfkForeignKeys reads every foreign key in scope, keyed by constraint name:
 // every key whose child is an iga_* or cloud_* table, and every key from any
 // other table whose parent is one. The scope is by name, not by form, so a
@@ -255,6 +261,10 @@ type bfkQuerier interface {
 // outside the graph to outside it (Discovery's own keys, say) is not.
 func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 	t.Helper()
+	names := bfkExtraNames
+	if names == nil {
+		names = []string{}
+	}
 	rows, err := q.Query(`
 		SELECT r.relname::text, c.conname::text, fr.relname::text,
 		       ARRAY(SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY AS k(num, ord)
@@ -270,7 +280,8 @@ func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 		  JOIN pg_class fr     ON fr.oid = c.confrelid
 		 WHERE c.contype = 'f' AND n.nspname = 'public'
 		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%'
-		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')`)
+		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%'
+		        OR c.conname::text = ANY($1))`, pq.StringArray(names))
 	if err != nil {
 		t.Fatalf("read foreign keys: %v", err)
 	}
