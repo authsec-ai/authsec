@@ -1424,6 +1424,8 @@ func SetupRoutes(
 		//
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
+		collectorCtl := NewCollectorController(config.DB)
+		MountCollectorV2(r, config.DB, collectorCtl, middlewares.AuthMiddleware())
 
 		// Connector ingress is UNAUTHENTICATED by deliberate choice.
 		//
@@ -1436,7 +1438,18 @@ func SetupRoutes(
 		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
 		//     any caller who knows a workspace_id can add rows to that workspace's
 		//     inventory
-		//   - there is no rate limit, so inventory growth from this path is unbounded
+		//   - the default is the historical ingress: no rate limit, so inventory
+		//     growth from this path is unbounded unless IGA_LEGACY_INGRESS_RATE_PER_MIN
+		//     is a positive integer. That limit is per workspace, not per client IP,
+		//     so a cluster behind one egress address is not one bucket. The
+		//     workspace id in the key is caller-asserted: anyone who knows it can
+		//     drain that bucket. Bodies are capped at 32 MiB
+		//     (IGA_LEGACY_INGRESS_MAX_BODY). When the body has no workspace id the
+		//     fallback is RemoteIP unless IGA_TRUSTED_PROXIES is set, in which
+		//     case it is ClientIP. A settings lookup error fails open instead of
+		//     returning 503. A rollout behind a load balancer should set
+		//     IGA_TRUSTED_PROXIES to the proxy CIDRs; leaving it unset keeps
+		//     gin's ClientIP() default for the rest of the process.
 		//
 		// What keeps the blast radius to noise rather than privilege: a sighting
 		// grants nothing. Rows land `unregistered`, and only an authenticated,
@@ -1447,6 +1460,7 @@ func SetupRoutes(
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
 		discoveryIngress := authsec.Group("/discovery")
+		discoveryIngress.Use(middlewares.LegacyDiscoveryIngressGuard(config.DB))
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
 
@@ -1483,6 +1497,9 @@ func SetupRoutes(
 		discovery.Use(middlewares.AuthMiddleware())
 		{
 			// Connector registry.
+			if collectorCtl != nil {
+				discovery.PUT("/settings/legacy-ingress", middlewares.Require("discovery", "admin"), collectorCtl.SetLegacyIngress)
+			}
 			discovery.POST("/sources", middlewares.Require("discovery", "admin"), discoveryController.CreateDiscoverySource)
 			discovery.GET("/sources", middlewares.Require("discovery", "read"), discoveryController.ListDiscoverySources)
 			discovery.GET("/sources/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoverySource)

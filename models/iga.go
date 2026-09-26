@@ -448,9 +448,20 @@ func (IGAAgentInstance) TableName() string { return "iga_agent_instances" }
 // the AWS projector writes ProviderAWS. Every GitHub reader filters on
 // ProviderGitHub, or AWS identities appear in the GitHub lists (§1.5).
 const (
-	ProviderGitHub = "github"
-	ProviderAWS    = "aws"
+	ProviderGitHub     = "github"
+	ProviderAWS        = "aws"
+	ProviderLinux      = "linux"
+	ProviderKubernetes = "kubernetes"
+	ProviderAD         = "ad"
 )
+
+// ValidIntegrationProviders is the iga_integrations.provider vocabulary.
+// github is the original value. linux, kubernetes and ad are additive (TRD 2).
+// ProviderAWS is a canonical-graph provider, not an integration provider, and
+// is intentionally absent here.
+func ValidIntegrationProviders() []string {
+	return []string{ProviderGitHub, ProviderLinux, ProviderKubernetes, ProviderAD}
+}
 
 // IGAIdentityAccount is a programmatic principal. Never a credential, and never
 // automatically an agent.

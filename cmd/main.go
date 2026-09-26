@@ -271,6 +271,12 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
+	// Rollout: set IGA_TRUSTED_PROXIES to the load-balancer CIDRs. Unset
+	// leaves gin's ClientIP() default in place for tenant rate limits,
+	// audit, and request logs.
+	if err := middlewares.ApplyTrustedProxies(r); err != nil {
+		log.Fatalf("IGA_TRUSTED_PROXIES: %v", err)
+	}
 	// CIMD-registered OAuth clients carry their metadata URL as the public
 	// client_id (services/oauth_as_service.go:850). URL-encoded slashes in
 	// path params must survive routing, otherwise DELETE
