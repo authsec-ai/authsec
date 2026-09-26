@@ -142,6 +142,11 @@ func (m *actuationManager) AuthenticateAgent(token string) (*models.DiscoverySou
 	if token == "" {
 		return nil, errors.New("actuation token required")
 	}
+	// v2 collector credentials and enrollment tokens are a different authority.
+	// They must not authenticate the v1 actuation surface, even by accident.
+	if strings.HasPrefix(token, "authsec_col_") || strings.HasPrefix(token, "authsec_enr_") {
+		return nil, errors.New("invalid actuation token")
+	}
 	var src models.DiscoverySource
 	err := m.db.First(&src, "actuation_token_hash = ? AND actuation_token_hash <> ''",
 		hashActuationToken(token)).Error

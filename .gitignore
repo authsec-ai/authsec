@@ -16,3 +16,6 @@ main.exe
 # redirect is run under Git Bash, which creates a real file instead of
 # discarding output.
 NUL
+
+# Dev keys generated at runtime (TRD2 collector response sealing)
+.secrets/

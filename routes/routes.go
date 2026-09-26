@@ -1424,6 +1424,8 @@ func SetupRoutes(
 		//
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
+		collectorCtl := NewCollectorController(config.DB)
+		MountCollectorV2(r, config.DB, collectorCtl, middlewares.AuthMiddleware())
 
 		// Connector ingress is UNAUTHENTICATED by deliberate choice.
 		//
@@ -1447,6 +1449,7 @@ func SetupRoutes(
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
 		discoveryIngress := authsec.Group("/discovery")
+		discoveryIngress.Use(middlewares.LegacyDiscoveryIngressGuard(config.DB, 120, time.Minute, 1<<20))
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
 
@@ -1483,6 +1486,9 @@ func SetupRoutes(
 		discovery.Use(middlewares.AuthMiddleware())
 		{
 			// Connector registry.
+			if collectorCtl != nil {
+				discovery.PUT("/settings/legacy-ingress", middlewares.Require("discovery", "admin"), collectorCtl.SetLegacyIngress)
+			}
 			discovery.POST("/sources", middlewares.Require("discovery", "admin"), discoveryController.CreateDiscoverySource)
 			discovery.GET("/sources", middlewares.Require("discovery", "read"), discoveryController.ListDiscoverySources)
 			discovery.GET("/sources/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoverySource)
