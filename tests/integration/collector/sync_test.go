@@ -481,10 +481,7 @@ func TestSync_ScopeEnforcement(t *testing.T) {
 	pv := syncBody(t, 4, epoch, uuid.NewString(), []collectorcontract.Object{{
 		Ref: "o_pv", Kind: "k8s.pv", Native: map[string]any{"name": "data"},
 	}}, nil, nil, nil, nil)
-	got = postSync(k8s.Credential, pv, nil)
-	if got.code != http.StatusForbidden {
-		t.Fatalf("pv without star: %d %s", got.code, got.body)
-	}
+	mustSyncOK(t, postSync(k8s.Credential, pv, nil))
 	linuxObj := syncBody(t, 5, epoch, uuid.NewString(), []collectorcontract.Object{{
 		Ref: "o_unit", Kind: "linux.systemd_workload", Native: map[string]any{"unit": "x.service"},
 	}}, nil, nil, nil, nil)

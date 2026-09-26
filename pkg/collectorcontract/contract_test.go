@@ -159,13 +159,10 @@ func TestAdmissionPreviewAndHealthCounters(t *testing.T) {
 	if h.PartitionsPartial != 1 || h.PartitionsForbidden != 0 || h.PoisonIsolated != 2 || h.IdempotencyConflicts != 3 {
 		t.Fatalf("health = %+v", h)
 	}
-	for _, kind := range []string{"k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node"} {
+	for _, kind := range []string{"k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node", "k8s.pv"} {
 		if !ClusterScopedKind(kind) || !OpenClusterKind(kind) {
 			t.Fatalf("%s should be open cluster inventory", kind)
 		}
-	}
-	if !ClusterScopedKind("k8s.pv") || OpenClusterKind("k8s.pv") {
-		t.Fatal("persistent volume still requires a star allowlist")
 	}
 
 	negative := []byte(`{

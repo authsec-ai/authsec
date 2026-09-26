@@ -90,12 +90,12 @@ func ClusterScopedKind(kind string) bool {
 }
 
 // OpenClusterKind is cluster inventory a k8s collector may report without a
-// "*" namespace allowlist: read-only cluster RBAC (ClusterRole and
-// ClusterRoleBinding) plus Namespace and Node. PersistentVolume stays
-// cluster-scoped and still requires "*".
+// "*" namespace allowlist. Spec §6.1 / matrix S6.1 (P0) and K02 include
+// read-only cluster RBAC (ClusterRole, ClusterRoleBinding), Namespace, Node,
+// and PersistentVolume. The agent watches v1/persistentvolumes by default.
 func OpenClusterKind(kind string) bool {
 	switch kind {
-	case "k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node":
+	case "k8s.cluster_role", "k8s.cluster_role_binding", "k8s.namespace", "k8s.node", "k8s.pv":
 		return true
 	default:
 		return false

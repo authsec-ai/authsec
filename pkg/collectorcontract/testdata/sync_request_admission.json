@@ -9,6 +9,11 @@
       "ref": "o_ns",
       "kind": "k8s.namespace",
       "native": {"name": "payments"}
+    },
+    {
+      "ref": "o_pv",
+      "kind": "k8s.pv",
+      "native": {"name": "data"}
     }
   ],
   "observations": [
