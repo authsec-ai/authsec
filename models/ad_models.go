@@ -1,5 +1,16 @@
 package models
 
+import "strings"
+
+// DirSyncUnsupportedMessage is the 400 body for tracking_mode=dirsync.
+// DirSync is not implemented; callers must use usn.
+const DirSyncUnsupportedMessage = "dirsync not supported yet; use usn"
+
+// IsDirSyncMode reports whether tracking_mode asks for DirSync.
+func IsDirSyncMode(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "dirsync")
+}
+
 // ADSyncController struct
 type ADSyncController struct{}
 
@@ -10,18 +21,36 @@ type ADSyncConfig struct {
 	Password   string `json:"password"`    // Service account password
 	BaseDN     string `json:"base_dn"`     // Base DN for user search (e.g., "OU=Users,DC=company,DC=com")
 	Filter     string `json:"filter"`      // LDAP filter (e.g., "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))")
-	UseSSL     bool   `json:"use_ssl"`     // Whether to use SSL/TLS
+	UseSSL     bool   `json:"use_ssl"`     // Whether to use SSL/TLS (LDAPS)
 	SkipVerify bool   `json:"skip_verify"` // Skip SSL certificate verification (for testing)
+	// InsecureSkipVerify is the spec name for SkipVerify. Either flag skips
+	// verification outside production; production refuses both.
+	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
+	// StartTLS upgrades a plain LDAP connection. Ignored when UseSSL is set.
+	StartTLS bool `json:"start_tls,omitempty"`
+	// CABundle is a PEM trust anchor for LDAPS or StartTLS. Empty uses the system pool.
+	CABundle string `json:"ca_bundle,omitempty"`
+	// PageSize is the LDAP page size for the inventory adapter (1..1000).
+	PageSize int `json:"page_size,omitempty"`
+	// ChangeTracking enables a persisted uSNChanged cursor. TrackingMode must
+	// be "usn"; "dirsync" is rejected until a DirSync cookie can be proven.
+	ChangeTracking bool   `json:"change_tracking,omitempty"`
+	TrackingMode   string `json:"tracking_mode,omitempty"`
+}
+
+// SkipTLSVerify reports whether the caller asked to skip certificate checks.
+func (c ADSyncConfig) SkipTLSVerify() bool {
+	return c.SkipVerify || c.InsecureSkipVerify
 }
 
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
-	WorkspaceID  string        `json:"workspace_id" binding:"required"`
-	ClientID  string        `json:"client_id"`
-	ProjectID string        `json:"project_id"`
-	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
-	Config    *ADSyncConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
-	DryRun    bool          `json:"dry_run,omitempty"`   // Preview changes without applying
+	WorkspaceID string        `json:"workspace_id" binding:"required"`
+	ClientID    string        `json:"client_id"`
+	ProjectID   string        `json:"project_id"`
+	ConfigID    *string       `json:"config_id,omitempty"` // ID of stored config to use
+	Config      *ADSyncConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
+	DryRun      bool          `json:"dry_run,omitempty"`   // Preview changes without applying
 }
 
 // SyncResult represents the result of a sync operation using shared ErrorResponse
@@ -36,25 +65,27 @@ type SyncResult struct {
 
 // ADUser represents a user from Active Directory
 type ADUser struct {
-	ObjectGUID        string            `json:"object_guid"`
-	UserPrincipalName string            `json:"user_principal_name"`
-	DisplayName       string            `json:"display_name"`
-	Email             string            `json:"email"`
-	Username          string            `json:"username"`
-	Department        string            `json:"department"`
-	Title             string            `json:"title"`
+	ObjectGUID        string `json:"object_guid"`
+	UserPrincipalName string `json:"user_principal_name"`
+	DisplayName       string `json:"display_name"`
+	Email             string `json:"email"`
+	Username          string `json:"username"`
+	Department        string `json:"department"`
+	Title             string `json:"title"`
+	// Groups are full DNs. GroupDisplayNames is the CN, for display only.
 	Groups            []string          `json:"groups"`
+	GroupDisplayNames []string          `json:"group_display_names,omitempty"`
 	Attributes        map[string]string `json:"attributes"`
 	IsActive          bool              `json:"is_active"`
 }
 
 // AgentSyncRequest represents the request from AD Agent
 type AgentSyncRequest struct {
-	WorkspaceID  string          `json:"workspace_id" binding:"required"`
-	ProjectID string          `json:"project_id"`
-	ClientID  string          `json:"client_id"`
-	Users     []AgentUserData `json:"users" binding:"required"`
-	DryRun    bool            `json:"dry_run,omitempty"`
+	WorkspaceID string          `json:"workspace_id" binding:"required"`
+	ProjectID   string          `json:"project_id"`
+	ClientID    string          `json:"client_id"`
+	Users       []AgentUserData `json:"users" binding:"required"`
+	DryRun      bool            `json:"dry_run,omitempty"`
 }
 
 // AgentUserData represents user data from AD Agent

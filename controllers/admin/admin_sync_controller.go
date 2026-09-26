@@ -17,11 +17,12 @@ import (
 	"github.com/authsec-ai/authsec/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 type AdminSyncController struct {
 	adminUserRepo *database.AdminUserRepository
-	workspaceRepo    *database.WorkspaceRepository
+	workspaceRepo *database.WorkspaceRepository
 }
 
 // NewAdminSyncController creates a new admin sync controller
@@ -33,13 +34,13 @@ func NewAdminSyncController() (*AdminSyncController, error) {
 
 	return &AdminSyncController{
 		adminUserRepo: database.NewAdminUserRepository(db),
-		workspaceRepo:    database.NewWorkspaceRepository(db),
+		workspaceRepo: database.NewWorkspaceRepository(db),
 	}, nil
 }
 
 // AdminSyncInput represents the input for syncing admin users
 type AdminSyncInput struct {
-	WorkspaceID    string                `json:"workspace_id" binding:"required"`
+	WorkspaceID string                `json:"workspace_id" binding:"required"`
 	ClientID    string                `json:"client_id,omitempty"`          // Optional client_id
 	ProjectID   string                `json:"project_id,omitempty"`         // Optional project_id
 	ConfigID    *string               `json:"config_id,omitempty"`          // ID of stored config to use
@@ -171,7 +172,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "ad_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "active_directory",
-			"workspace_id":     input.WorkspaceID,
+			"workspace_id":  input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -296,7 +297,7 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "entra_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "entra_id",
-			"workspace_id":     input.WorkspaceID,
+			"workspace_id":  input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -321,7 +322,13 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
 
-	// Check if user already exists (by email or external ID scoped to tenant)
+	// Check if user already exists (by email or either GUID spelling, scoped to tenant).
+	// external_id is matched exactly, in lowercase, so idx_users_external_id is usable.
+	matchIDs := shared.ADMatchIDs(adUser.ObjectGUID)
+	canonicalID := adUser.ObjectGUID
+	if len(matchIDs) > 0 && matchIDs[0] != "" {
+		canonicalID = matchIDs[0]
+	}
 	var existingUser models.AdminUser
 	query := `SELECT id, email, COALESCE(username, ''), COALESCE(password_hash, ''), COALESCE(name, ''),
 	          client_id, workspace_id, project_id, COALESCE(workspace_domain, ''), COALESCE(provider, ''),
@@ -330,14 +337,14 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
+	          WHERE (LOWER(email) = LOWER($1) OR external_id = ANY($2)) AND workspace_id = $3`
 
 	var username, passwordHash, name, workspaceDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, workspaceIDVal, projectIDStr sql.NullString
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, adUser.Email, adUser.ObjectGUID, workspaceID).Scan(
+	err = db.DB.QueryRow(query, adUser.Email, pq.Array(matchIDs), workspaceID).Scan(
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &workspaceIDVal, &projectIDStr,
 		&workspaceDomain, &provider, &providerID, &providerData,
@@ -434,13 +441,13 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 			Username:     adUser.Username,
 			Name:         adUser.DisplayName,
 			ClientID:     clientID,
-			WorkspaceID:     &workspaceID,
+			WorkspaceID:  &workspaceID,
 			ProjectID:    projectID,
 			Provider:     "ad_sync",
 			ProviderID:   adUser.UserPrincipalName,
 			ProviderData: providerDataBytes,
 			Active:       true, // Always set to true for synced admin users
-			ExternalID:   adUser.ObjectGUID,
+			ExternalID:   canonicalID,
 			SyncSource:   "active_directory",
 			LastSyncAt:   &now,
 			IsSyncedUser: true,
@@ -487,9 +494,11 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 	updates := map[string]interface{}{
 		"name":          adUser.DisplayName,
 		"username":      adUser.Username,
+		"email":         adUser.Email,
+		"external_id":   canonicalID,
 		"active":        true, // Always set to true for synced admin users
 		"last_sync_at":  &now,
-		"provider_data": providerDataBytes,
+		"provider_data": string(providerDataBytes),
 	}
 
 	if err := asc.adminUserRepo.UpdateAdminUser(existingUser.ID, updates); err != nil {
@@ -639,7 +648,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 			Username:     entraUser.MailNickname,
 			Name:         entraUser.DisplayName,
 			ClientID:     clientID,
-			WorkspaceID:     &workspaceID,
+			WorkspaceID:  &workspaceID,
 			ProjectID:    projectID,
 			Provider:     "entra_id",
 			ProviderID:   entraUser.UserPrincipalName,
@@ -764,18 +773,18 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 	// Tenant entry doesn't exist for this email - create a new entry with same workspace_id
 	// This creates a new row in tenants table with the new email but same tenant configuration
 	tenant := &sharedmodels.Tenant{
-		ID:           uuid.New(),
+		ID:              uuid.New(),
 		WorkspaceID:     *adminUser.WorkspaceID, // Same workspace_id as existing tenant
-		Email:        adminUser.Email,     // New email from synced user
-		Username:     &adminUser.Username,
-		Name:         adminUser.Name,
+		Email:           adminUser.Email,        // New email from synced user
+		Username:        &adminUser.Username,
+		Name:            adminUser.Name,
 		WorkspaceDomain: existingTenant.WorkspaceDomain, // Copy from existing tenant
 		WorkspaceDB:     existingTenant.WorkspaceDB,     // Copy from existing tenant (same DB)
-		Source:       existingTenant.Source,       // Copy from existing tenant
-		Status:       existingTenant.Status,       // Copy from existing tenant
-		PasswordHash: adminUser.PasswordHash,      // Empty for synced users
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
+		Source:          existingTenant.Source,          // Copy from existing tenant
+		Status:          existingTenant.Status,          // Copy from existing tenant
+		PasswordHash:    adminUser.PasswordHash,         // Empty for synced users
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
 	}
 
 	if err := asc.workspaceRepo.CreateTenant(tenant); err != nil {
@@ -828,18 +837,7 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, workspaceID string)
 		return models.ADSyncConfig{}, fmt.Errorf("failed to decrypt credentials")
 	}
 
-	// Build ADSyncConfig
-	adConfig := models.ADSyncConfig{
-		Server:     syncConfig.ADServer,
-		Username:   syncConfig.ADUsername,
-		Password:   decryptedPassword,
-		BaseDN:     syncConfig.ADBaseDN,
-		Filter:     syncConfig.ADFilter,
-		UseSSL:     syncConfig.ADUseSSL,
-		SkipVerify: syncConfig.ADSkipVerify,
-	}
-
-	return adConfig, nil
+	return syncConfig.ADConnection(decryptedPassword), nil
 }
 
 // loadStoredEntraConfig loads Entra ID configuration from database and decrypts credentials
@@ -884,7 +882,7 @@ func (asc *AdminSyncController) loadStoredEntraConfig(configID, workspaceID stri
 
 	// Build shared.EntraIDConfig
 	entraConfig := shared.EntraIDConfig{
-		WorkspaceID:     syncConfig.EntraWorkspaceID,
+		WorkspaceID:  syncConfig.EntraWorkspaceID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

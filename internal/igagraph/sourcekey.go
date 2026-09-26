@@ -339,3 +339,47 @@ func PermissionSubjectKey(p models.CloudPermission, holderNativeID, resourceNati
 func Qualified(subjectNativeID string) bool {
 	return strings.Contains(subjectNativeID, Sep)
 }
+
+// EscapeSegment percent-encodes bytes that would make a joined source key
+// ambiguous. Existing AWS keys do not use this — an ARN cannot contain the
+// unit separator — but AD forest names are untrusted directory text.
+//
+// Encoding: each of 0x00–0x1F (including the unit separator), 0x7F, '%', '/'
+// and '\\' becomes '%' plus two uppercase hex digits. The escape character
+// itself is encoded, so a literal "%1F" cannot collide with an encoded
+// separator. Commas and '=' are not separators in this scheme and are left
+// as-is, which keeps a DN readable. Apply it to every AD segment before Key.
+func EscapeSegment(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x1F || c == 0x7F || c == '%' || c == '/' || c == '\\' {
+			const hex = "0123456789ABCDEF"
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0F])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// ADIdentityKey is the recognition key of an AD object (§4.2):
+//
+//	ad ␟ escaped(forest ID) ␟ canonical objectGUID
+//
+// Forest ID is rootDSE rootDomainNamingContext. The GUID is the canonical
+// text after the AD mixed-endian conversion, not the raw RFC 4122 reading of
+// the bytes. The SID is not part of the key — it is a secondary identifier —
+// and neither is the DN, so a rename (modrdn) keeps the identity. A different
+// objectGUID is a different object even when the names match.
+func ADIdentityKey(forestID, canonicalGUID string) (string, error) {
+	forestID = strings.TrimSpace(forestID)
+	canonicalGUID = strings.ToLower(strings.TrimSpace(canonicalGUID))
+	if forestID == "" || canonicalGUID == "" {
+		return "", fmt.Errorf("ad identity key requires a forest id and a canonical objectGUID")
+	}
+	return Key("ad", EscapeSegment(forestID), EscapeSegment(canonicalGUID)), nil
+}

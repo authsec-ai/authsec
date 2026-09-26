@@ -1753,6 +1753,19 @@ func SetupRoutes(
 			// callback") is what previously 404'd here. Live-confirmed via a
 			// real Google consent round trip.
 			r.GET("/discovery/gcp/google-oauth/callback", cloudGCPOAuth.GoogleOAuthCallback)
+
+			// AD service-account inventory. These sit on the discovery group,
+			// not under /uflow/admin/ad, because that group is role-gated and
+			// would hide reads from discovery:read. The legacy human-user
+			// import routes are unchanged. discovery:admin configures and
+			// runs; discovery:read views runs, coverage and objects. The bind
+			// password is never accepted or returned here.
+			adInventory := sharedCtrl.NewADInventoryController(config.DB)
+			discovery.PUT("/ad/inventory/config", middlewares.Require("discovery", "admin"), adInventory.PutConfig)
+			discovery.GET("/ad/inventory/config", middlewares.Require("discovery", "read"), adInventory.GetConfig)
+			discovery.POST("/ad/inventory/runs", middlewares.Require("discovery", "admin"), adInventory.StartRun)
+			discovery.GET("/ad/inventory/runs/:id", middlewares.Require("discovery", "read"), adInventory.GetRun)
+			discovery.GET("/ad/inventory/objects", middlewares.Require("discovery", "read"), adInventory.ListObjects)
 		}
 
 		// ────────────────────────────────────────────────────

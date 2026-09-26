@@ -24,7 +24,9 @@ const (
 // three different KINDS of knowledge, and staleness means the opposite thing in
 // two of them.
 const (
-	// EvidenceObserved -- we saw it exist at runtime.
+	// EvidenceObserved -- we saw it exist. Runtime sightings and an authoritative
+	// directory read (AD inventory) both use this basis. It is not a rank and
+	// it does not auto-confirm an agent.
 	EvidenceObserved = "observed"
 	// EvidenceDeclared -- someone wrote down that it should exist. A repository
 	// declaration. May never have run.
