@@ -24,6 +24,7 @@ func RegisterIGAGraphReadRoutes(g gin.IRoutes, ctl *IGAGraphReadController, requ
 	g.GET("/workloads/:id/resources", read, ctl.GetWorkloadResources)
 	g.GET("/workloads/:id/changes", read, ctl.GetWorkloadChanges)
 	g.POST("/workloads/:id/classification", require("iga", "review"), ctl.ClassifyWorkload)
+	g.POST("/workloads/:id/agent-registration", require("discovery", "claim"), ctl.RegisterWorkloadAgent)
 	g.GET("/workloads/:id/classification", read, ctl.GetWorkloadClassification)
 
 	g.GET("/identities", read, ctl.ListIdentities)

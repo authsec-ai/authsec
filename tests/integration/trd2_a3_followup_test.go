@@ -1200,6 +1200,10 @@ func swapDB(dsn, name string) string {
 	return u.String()
 }
 
+// applyMaster applies migrations/master. through039 stops before 040, which is
+// the pre-M2 half of the golden pair. Otherwise it stops at 040: later files
+// (042 and anything after it) are applied by the test that owns them, so this
+// golden stays a 039-versus-040 comparison.
 func applyMaster(t *testing.T, db *sql.DB, through039 bool) {
 	t.Helper()
 	dir, err := filepath.Abs(filepath.Join("..", "..", "migrations", "master"))
@@ -1213,7 +1217,14 @@ func applyMaster(t *testing.T, db *sql.DB, through039 bool) {
 	sort.Strings(files)
 	for _, f := range files {
 		base := filepath.Base(f)
-		if through039 && strings.HasPrefix(base, "040") {
+		ver := base
+		if i := strings.IndexByte(base, '_'); i > 0 {
+			ver = base[:i]
+		}
+		if through039 && ver >= "040" {
+			continue
+		}
+		if !through039 && ver > "040" {
 			continue
 		}
 		applyFile(t, db, f)

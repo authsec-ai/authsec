@@ -84,4 +84,4 @@ jobs:
           # The rest of the suite stays in the opt-in job in pr-checks.yml,
           # which carries one known-failing, unrelated checkpoint test.
           go test ./tests/integration/ -count=1 -timeout 30m \
-            -run 'TestPermissionEvidenceSubjectKeyIsQualified|TestObservationDedupeUpgradesUnqualifiedKey|TestTRD2IT'
+            -run 'TestPermissionEvidenceSubjectKeyIsQualified|TestObservationDedupeUpgradesUnqualifiedKey|TestTRD2IT|TestTRD2ITA5'

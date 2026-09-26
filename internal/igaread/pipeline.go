@@ -41,11 +41,16 @@ const (
 )
 
 // PipelineView is the /pipeline data object.
+//
+// CollectorDeferrals is set only when the caller opts in with
+// include=stuck_snapshots. Absent, the field is omitted and the rest of the
+// object stays the AWS pipeline shape.
 type PipelineView struct {
-	Barrier            PipelineBarrier   `json:"barrier"`
-	Accounts           []PipelineAccount `json:"accounts"`
-	CurrentRev         *int64            `json:"current_rev"`
-	CurrentPublishedAt any               `json:"current_published_at"`
+	Barrier            PipelineBarrier         `json:"barrier"`
+	Accounts           []PipelineAccount       `json:"accounts"`
+	CurrentRev         *int64                  `json:"current_rev"`
+	CurrentPublishedAt any                     `json:"current_published_at"`
+	CollectorDeferrals *CollectorDeferralBlock `json:"collector_deferrals,omitempty"`
 }
 
 // PipelineBarrier is the workspace barrier (§2.10A). integration, account_id,

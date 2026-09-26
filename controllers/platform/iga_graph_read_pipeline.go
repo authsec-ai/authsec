@@ -27,11 +27,17 @@ import (
 // Not revision-pinned (D-82): the pipeline is the live state around the graph,
 // not a read of it, and a queued scan must be visible the moment it is queued
 // (§2.15 step 1) whatever revision the client holds. So a rev parameter is 400
-// -- honouring it would claim a pin the route does not give -- and so is any
-// other parameter: the route takes none.
+// -- honouring it would claim a pin the route does not give. The only
+// parameter is include=stuck_snapshots, which adds collector_deferrals.
+// Without it that block is omitted and the body stays the AWS pipeline shape.
 func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		if perr := onlyParams(c.Request.URL.Query()); perr != nil {
+		vals := c.Request.URL.Query()
+		if perr := onlyParams(vals, "include"); perr != nil {
+			return nil, perr
+		}
+		includeStuck, perr := pipelineInclude(vals)
+		if perr != nil {
 			return nil, perr
 		}
 		var body igaread.Envelope
@@ -40,11 +46,36 @@ func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 			if err != nil {
 				return err
 			}
+			if includeStuck {
+				block, err := q.CollectorDeferrals()
+				if err != nil {
+					return err
+				}
+				view.CollectorDeferrals = block
+			}
 			body = igaread.Envelope{Data: view, Meta: igaread.NewDetailMeta(q)}
 			return nil
 		})
 		return body, err
 	})
+}
+
+// pipelineInclude is the opt-in for the stuck-snapshot block. The parameter
+// is absent on the default read. Any other value is 400, naming include.
+func pipelineInclude(vals url.Values) (bool, *igaread.Error) {
+	raw, ok := vals["include"]
+	if !ok {
+		return false, nil
+	}
+	if len(raw) == 0 {
+		return false, igaread.InvalidParameter("include", "include must be stuck_snapshots")
+	}
+	for _, v := range raw {
+		if strings.TrimSpace(v) != "stuck_snapshots" {
+			return false, igaread.InvalidParameter("include", "include must be stuck_snapshots")
+		}
+	}
+	return true, nil
 }
 
 // GetCoverage handles GET /api/iga/v1/coverage[?account=<id>][&rev=N]: per
