@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -182,15 +183,25 @@ func TestTRD2ITLinuxAndK8sNormalizers(t *testing.T) {
 			"serviceAccountName": "invoice",
 			"annotations":        map[string]any{"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/invoice"},
 		}}, nil)
+	roleARN := "arn:aws:iam::123456789012:role/invoice"
+	f.exec(`INSERT INTO iga_identity_accounts
+		(id, workspace_id, display_name, account_kind, provider, source_key, first_seen_at, last_seen_at)
+		VALUES ($1,$2,'invoice','iam_role','aws',$3, now(), now())`,
+		uuid.New(), f.ws, igraph.IdentityARNKey(roleARN))
 	f.seedBatch(k8s, kcol, uuid.New(), krun, 1, uuid.Nil)
 	f.projectDefault()
-	if f.scalar(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = $1 AND provider = 'aws'`, f.ws) != 0 {
+	if f.scalar(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = $1 AND provider = 'aws'`, f.ws) != 1 {
 		t.Fatal("role annotation fabricated an AWS identity")
 	}
 	if f.scalar(`SELECT count(*) FROM iga_relationship WHERE workspace_id = $1 AND relationship_type = 'can_assume'`, f.ws) != 0 {
 		t.Fatal("annotation became can_assume")
 	}
-	if f.scalar(`SELECT count(*) FROM iga_relationship WHERE workspace_id = $1 AND relationship_type = 'executes_as' AND basis = 'declared'`, f.ws) != 1 {
+	if f.scalar(`SELECT count(*) FROM iga_relationship r
+		JOIN iga_identity_accounts i ON i.workspace_id = r.workspace_id AND i.id = r.target_identity_account_id
+		WHERE r.workspace_id = $1 AND r.relationship_type = 'executes_as' AND r.basis = 'declared' AND i.provider = 'aws'`, f.ws) != 1 {
+		t.Fatal("existing AWS role was not joined by a declared executes_as")
+	}
+	if f.scalar(`SELECT count(*) FROM iga_relationship WHERE workspace_id = $1 AND relationship_type = 'executes_as' AND basis = 'declared'`, f.ws) != 2 {
 		t.Fatal("declared executes_as missing")
 	}
 	var scope, ns string
