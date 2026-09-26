@@ -156,8 +156,18 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 		if err != nil {
 			return err
 		}
+		row := ident.Row(accts, used, stale)
+		if q.V2 {
+			states, err := identityAccountStates(q.DB(), q.WS, []uuid.UUID{id})
+			if err != nil {
+				return err
+			}
+			if s, ok := states[id]; ok {
+				row.AccountState = &s
+			}
+		}
 		detail := IdentityDetail{
-			IdentityRow:   ident.Row(accts, used, stale),
+			IdentityRow:   row,
 			RetiredReason: strPtr(ident.RetiredReason),
 			FirstSeenAt:   T(ident.FirstSeenAt),
 			Continuity:    ident.Continuity,

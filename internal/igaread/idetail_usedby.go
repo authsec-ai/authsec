@@ -198,6 +198,9 @@ func (r *Reader) IdentityUsedBy(ctx context.Context, ws uuid.UUID, rawID string,
 			return err
 		}
 		data := map[string]any{"identity": ident.header()}
+		if q.V2 && !iamIdentityKind(ident.AccountKind) && len(applies) == 0 {
+			data["limitations"] = []string{LimitationNotApplicable}
+		}
 		states := idetailEdgeStates(includeEnded)
 		for _, s := range sections {
 			var a *idetailAfter

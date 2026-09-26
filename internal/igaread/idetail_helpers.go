@@ -23,6 +23,10 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
+// LimitationNotApplicable is the limitation a non-IAM identity's IAM-shaped
+// tab carries under graph=v2. The section is empty; the code says why.
+const LimitationNotApplicable = "not_applicable"
+
 /* ------------------------------ parameters -------------------------------- */
 
 // idetailParams validates a detail or tab route's query string: every name
