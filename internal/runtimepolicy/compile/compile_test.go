@@ -171,7 +171,11 @@ func TestCheckEnforceable(t *testing.T) {
 		t.Fatal(err)
 	}
 	doc.Mode = "enforce"
-	reg, _ := profiles.Load()
+	loaded, _ := profiles.Load()
+	if loaded.Supports("linux-managed-v1", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "filesystem") {
+		t.Fatal("fixture digest is certified on the production registry")
+	}
+	reg := loaded.WithTestDigests()
 	wid := uuid.MustParse("50000000-0000-4000-8000-000000000024")
 	_, err = CheckEnforceable(reg, doc, []TargetRef{{
 		WorkloadID: wid, Profile: "linux-managed-v1",

@@ -30,6 +30,20 @@
 -- immediately. Nothing is NOT VALID. scripts/validate-043-runtime-policy.sql
 -- only asserts that, and is re-runnable outside the deploy transaction.
 --
+-- Workspace deletion. A direct UPDATE or DELETE of a receipt or audit row,
+-- and a direct DELETE of a non-draft revision, raises 55000 while the
+-- workspace row is still visible. DELETE FROM workspaces removes that row
+-- first; the BEFORE DELETE triggers then see it is gone and allow the
+-- cascade. Receipt and audit foreign keys along that path are ON DELETE
+-- CASCADE (policy, publication, target). They are not RESTRICT: RESTRICT
+-- fired before the cascade could delete the child, so one created policy
+-- made the workspace undeletable. Target foreign keys to workload, runtime
+-- instance and collector are CASCADE for the same reason: those parents are
+-- removed on their own cascade from the workspace while a target still
+-- points at them. The publication self-reference is ON DELETE SET NULL.
+-- A direct delete of a receipt, an audit row, or a non-draft revision, with
+-- the workspace still present, is still rejected.
+--
 -- Lock and runtime. No existing table is altered, so there is no ACCESS
 -- EXCLUSIVE on a populated relation and no VALIDATE step inside this file.
 --
@@ -138,7 +152,7 @@ CREATE TABLE IF NOT EXISTS public.runtime_policy_approvals (
     CONSTRAINT runtime_policy_approvals_policy_fkey FOREIGN KEY (workspace_id, policy_id)
         REFERENCES public.runtime_policies (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_approvals_simulation_fkey FOREIGN KEY (workspace_id, simulation_id)
-        REFERENCES public.runtime_policy_simulations (workspace_id, id),
+        REFERENCES public.runtime_policy_simulations (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_approvals_hash_chk CHECK (revision_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT runtime_policy_approvals_digest_chk CHECK (target_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT runtime_policy_approvals_reason_chk CHECK (reason <> '')
@@ -165,7 +179,7 @@ CREATE TABLE IF NOT EXISTS public.runtime_policy_publications (
     CONSTRAINT runtime_policy_publications_policy_fkey FOREIGN KEY (workspace_id, policy_id)
         REFERENCES public.runtime_policies (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_publications_superseded_fkey FOREIGN KEY (workspace_id, superseded_publication_id)
-        REFERENCES public.runtime_policy_publications (workspace_id, id),
+        REFERENCES public.runtime_policy_publications (workspace_id, id) ON DELETE SET NULL,
     CONSTRAINT runtime_policy_publications_hash_chk CHECK (revision_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT runtime_policy_publications_mode_chk CHECK (mode IN ('observe', 'enforce'))
 );
@@ -185,11 +199,11 @@ CREATE TABLE IF NOT EXISTS public.runtime_policy_targets (
     CONSTRAINT runtime_policy_targets_publication_fkey FOREIGN KEY (workspace_id, publication_id)
         REFERENCES public.runtime_policy_publications (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_targets_workload_fkey FOREIGN KEY (workspace_id, workload_id)
-        REFERENCES public.iga_workload (workspace_id, id),
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_targets_runtime_fkey FOREIGN KEY (workspace_id, workload_id, runtime_instance_id)
-        REFERENCES public.iga_runtime_instances (workspace_id, workload_id, id),
+        REFERENCES public.iga_runtime_instances (workspace_id, workload_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_targets_collector_fkey FOREIGN KEY (workspace_id, collector_id)
-        REFERENCES public.collector_instances (workspace_id, id),
+        REFERENCES public.collector_instances (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_targets_delivery_chk CHECK (desired_delivery_revision >= 1),
     CONSTRAINT runtime_policy_targets_digest_chk CHECK (
         capability_digest = '' OR capability_digest ~ '^[0-9a-f]{64}$')
@@ -211,11 +225,11 @@ CREATE TABLE IF NOT EXISTS public.runtime_policy_receipts (
     CONSTRAINT runtime_policy_receipts_pkey PRIMARY KEY (id),
     CONSTRAINT runtime_policy_receipts_workspace_id_key UNIQUE (workspace_id, id),
     CONSTRAINT runtime_policy_receipts_target_fkey FOREIGN KEY (workspace_id, target_id)
-        REFERENCES public.runtime_policy_targets (workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.runtime_policy_targets (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_receipts_publication_fkey FOREIGN KEY (workspace_id, publication_id)
-        REFERENCES public.runtime_policy_publications (workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.runtime_policy_publications (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_receipts_policy_fkey FOREIGN KEY (workspace_id, policy_id)
-        REFERENCES public.runtime_policies (workspace_id, id) ON DELETE RESTRICT
+        REFERENCES public.runtime_policies (workspace_id, id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS public.runtime_policy_audit (
@@ -235,7 +249,7 @@ CREATE TABLE IF NOT EXISTS public.runtime_policy_audit (
     CONSTRAINT runtime_policy_audit_workspace_fkey FOREIGN KEY (workspace_id)
         REFERENCES public.workspaces (id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_audit_policy_fkey FOREIGN KEY (workspace_id, policy_id)
-        REFERENCES public.runtime_policies (workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.runtime_policies (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT runtime_policy_audit_action_chk CHECK (action <> '')
 );
 
@@ -261,7 +275,7 @@ CREATE TABLE IF NOT EXISTS public.collector_capability_reports (
 );
 
 COMMENT ON TABLE public.runtime_policy_revisions IS
-    'Immutable once state leaves draft. document and content_hash cannot change, and the row cannot be deleted.';
+    'Identity columns never change. document and content_hash change only while state stays draft. state moves only along draft, validated, simulated, approved, published, then superseded or revoked. A direct delete is rejected; a workspace cascade is allowed once the workspace row is gone.';
 COMMENT ON TABLE public.runtime_policy_approvals IS
     'Invalidated in place when the revision content changes. Never deleted to hide an approval.';
 COMMENT ON TABLE public.runtime_policy_receipts IS
@@ -269,18 +283,54 @@ COMMENT ON TABLE public.runtime_policy_receipts IS
 COMMENT ON TABLE public.collector_capability_reports IS
     'One row per collector capability digest observed on agent sync. Evidence, not a policy decision.';
 
+-- True once DELETE FROM workspaces has removed the owning row. The cascade
+-- then reaches these tables. A direct delete still sees the workspace.
+CREATE OR REPLACE FUNCTION public.runtime_policy_workspace_gone(ws uuid)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    RETURN NOT EXISTS (SELECT 1 FROM public.workspaces WHERE id = ws);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.runtime_policy_revisions_immutable()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
+        IF public.runtime_policy_workspace_gone(OLD.workspace_id) THEN
+            RETURN OLD;
+        END IF;
         RAISE EXCEPTION 'runtime policy revisions cannot be deleted'
             USING ERRCODE = '55000';
     END IF;
+    IF NEW.workspace_id IS DISTINCT FROM OLD.workspace_id
+       OR NEW.policy_id IS DISTINCT FROM OLD.policy_id
+       OR NEW.revision IS DISTINCT FROM OLD.revision
+       OR NEW.author_user_id IS DISTINCT FROM OLD.author_user_id
+       OR NEW.compiler_format IS DISTINCT FROM OLD.compiler_format THEN
+        RAISE EXCEPTION 'runtime policy revision identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.state IS DISTINCT FROM OLD.state THEN
+        IF NOT (
+            (OLD.state = 'draft' AND NEW.state = 'validated')
+            OR (OLD.state = 'validated' AND NEW.state = 'simulated')
+            OR (OLD.state = 'simulated' AND NEW.state = 'approved')
+            OR (OLD.state = 'approved' AND NEW.state = 'published')
+            OR (OLD.state = 'published' AND NEW.state = 'superseded')
+            OR (OLD.state = 'published' AND NEW.state = 'revoked')
+        ) THEN
+            RAISE EXCEPTION 'runtime policy revision cannot move from % to %', OLD.state, NEW.state
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
     IF NEW.document IS DISTINCT FROM OLD.document
        OR NEW.content_hash IS DISTINCT FROM OLD.content_hash THEN
-        IF OLD.state <> 'draft' THEN
+        IF OLD.state <> 'draft' OR NEW.state <> 'draft' THEN
             RAISE EXCEPTION 'runtime policy revision document is immutable once state is %', OLD.state
                 USING ERRCODE = '55000';
         END IF;
@@ -306,6 +356,9 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    IF TG_OP = 'DELETE' AND public.runtime_policy_workspace_gone(OLD.workspace_id) THEN
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION 'runtime policy receipts are append-only'
         USING ERRCODE = '55000';
 END;
@@ -321,6 +374,9 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    IF TG_OP = 'DELETE' AND public.runtime_policy_workspace_gone(OLD.workspace_id) THEN
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION 'runtime policy audit is append-only'
         USING ERRCODE = '55000';
 END;

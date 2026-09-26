@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+func TestPreparedCacheIsBounded(t *testing.T) {
+	e := NewEngine()
+	for i := 0; i < preparedCacheLimit+3; i++ {
+		e.Eval(context.Background(), "ws", strings.Repeat("a", 8)+string(rune('a'+(i%26)))+strings.Repeat("b", i), map[string]any{
+			"policy_revision": i,
+			"targets":         map[string]any{},
+			"rules":           []any{},
+		}, map[string]any{"action": "exec"})
+	}
+	if len(e.cache) != preparedCacheLimit {
+		t.Fatalf("cache size = %d, want %d", len(e.cache), preparedCacheLimit)
+	}
+}
+
 func TestVersionPin(t *testing.T) {
 	if Version != "1.21.0" {
 		t.Fatalf("version %s", Version)

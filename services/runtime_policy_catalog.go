@@ -8,19 +8,11 @@ import (
 )
 
 // RecordCollectorCapability inserts one capability digest for a collector.
-// A repeated digest refreshes last_seen_at and the report. A database that
-// has not applied migration 043 is left unchanged: the digest is already
-// stored on collector_instances, and sync must keep accepting batches.
+// A repeated digest refreshes last_seen_at and the report. The caller decides
+// whether the flag is on and treats an error as best-effort: a failed insert
+// must not change the sync result.
 func RecordCollectorCapability(tx *gorm.DB, workspaceID, collectorID uuid.UUID, digest string, report []byte) error {
 	if tx == nil || digest == "" || len(digest) != 64 {
-		return nil
-	}
-	var present int64
-	if err := tx.Raw(`SELECT count(*) FROM information_schema.tables
-		WHERE table_schema = 'public' AND table_name = 'collector_capability_reports'`).Scan(&present).Error; err != nil {
-		return err
-	}
-	if present == 0 {
 		return nil
 	}
 	if len(report) == 0 || !json.Valid(report) {

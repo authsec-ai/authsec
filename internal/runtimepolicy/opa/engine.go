@@ -38,6 +38,10 @@ const (
 
 	// DefaultTimeout is the evaluation deadline when the caller does not set one.
 	DefaultTimeout = 50 * time.Millisecond
+
+	// preparedCacheLimit bounds one engine's prepared queries. Each entry is
+	// one workspace and revision. The oldest entry is dropped past the limit.
+	preparedCacheLimit = 64
 )
 
 //go:embed decision.rego
@@ -85,6 +89,7 @@ type Engine struct {
 
 	mu    sync.Mutex
 	cache map[string]*rego.PreparedEvalQuery
+	order []string
 }
 
 // NewEngine evaluates the pinned template.
@@ -196,7 +201,13 @@ func (e *Engine) prepare(ctx context.Context, workspaceID, revision string, data
 	if err != nil {
 		return nil, err
 	}
+	if len(e.cache) >= preparedCacheLimit {
+		drop := e.order[0]
+		e.order = e.order[1:]
+		delete(e.cache, drop)
+	}
 	e.cache[key] = &q
+	e.order = append(e.order, key)
 	return &q, nil
 }
 

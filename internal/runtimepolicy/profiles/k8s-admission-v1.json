@@ -6,7 +6,8 @@
     "certificates": [],
     "readonly_config": []
   },
-  "certified_digests": {
+  "certified_digests": {},
+  "test_only_digests": {
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": ["admission", "egress"]
   }
 }

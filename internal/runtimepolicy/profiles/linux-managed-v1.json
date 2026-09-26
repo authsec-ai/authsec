@@ -9,7 +9,8 @@
     "certificates": ["/etc/ssl/certs/ca-certificates.crt"],
     "readonly_config": ["/etc/nsswitch.conf"]
   },
-  "certified_digests": {
+  "certified_digests": {},
+  "test_only_digests": {
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": ["filesystem", "egress", "exec", "privilege", "secret"],
     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff": ["filesystem"]
   }

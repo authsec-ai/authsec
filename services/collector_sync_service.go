@@ -304,12 +304,26 @@ func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal
 		s.note(err)
 		return nil, ErrSyncUnavailable
 	}
-	report := []byte(req.Capabilities)
-	if err := RecordCollectorCapability(tx, inst.WorkspaceID, inst.ID, digest, report); err != nil {
-		s.note(err)
-		return nil, ErrSyncUnavailable
+	// Evidence for A7. Off unless IGA_V2_POLICY is on, and a failed insert
+	// (including a missing table) is rolled back to the savepoint so the
+	// batch still commits. Sync must not become 503 because of this write.
+	if V2PolicyEnabled() {
+		if err := recordCapabilityBestEffort(tx, inst.WorkspaceID, inst.ID, digest, []byte(req.Capabilities)); err != nil {
+			s.note(err)
+		}
 	}
 	return respBody, nil
+}
+
+func recordCapabilityBestEffort(tx *gorm.DB, workspaceID, collectorID uuid.UUID, digest string, report []byte) error {
+	if err := tx.Exec("SAVEPOINT collector_capability").Error; err != nil {
+		return err
+	}
+	if err := RecordCollectorCapability(tx, workspaceID, collectorID, digest, report); err != nil {
+		_ = tx.Exec("ROLLBACK TO SAVEPOINT collector_capability").Error
+		return err
+	}
+	return tx.Exec("RELEASE SAVEPOINT collector_capability").Error
 }
 
 func authorizeEpoch(inst *models.CollectorInstance, presented uuid.UUID) (uuid.UUID, int64, error) {

@@ -1,6 +1,6 @@
 # AuthSec – Identity & Access Management Platform
 
-![Go Version](https://img.shields.io/badge/Go-1.25-blue)
+![Go Version](https://img.shields.io/badge/Go-1.26-blue)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 
 AuthSec is a unified Go service for the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, external-service credentials, and SPIFFE/SPIRE workload identity — all served from a single binary.
@@ -104,7 +104,7 @@ remain intentionally named with `tenant`.
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - PostgreSQL 15+ (master DB)
 - HashiCorp Vault (optional — recommended for OIDC secrets)
 - Redis (optional — caching)
@@ -952,7 +952,7 @@ go build -o authsec ./cmd/
 ### Docker
 
 ```dockerfile
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
