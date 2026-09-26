@@ -450,4 +450,30 @@ var bfkCases = []bfkCase{
 	{fk: "iga_le_policy_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
 		return w.A.lifecycleEvent("identity_account_id", nil, "policy_id", p.id("pol"))
 	}},
+
+	// ---------------- 038: collector registry --------------------------------
+	// These keys are in scope because the parent is iga_* (or, for the
+	// observation, the child is). A same-workspace parent is the control; a
+	// parent that exists only in another workspace is refused.
+	{fk: "collector_enrollments_estate_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorEnrollment("estate_scope_id", p.id("scope"))
+	}},
+	{fk: "collector_instances_estate_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorInstance("estate_scope_id", p.id("scope"))
+	}},
+	{fk: "collector_instances_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorInstance("integration_id", p.id("integ"))
+	}},
+	{fk: "collector_integrations_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorIntegration("integration_id", p.id("integ"))
+	}},
+	{fk: "collector_batches_scan_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorBatch("iga_scan_run_id", p.id("iscan"))
+	}},
+	{fk: "collector_outbox_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.collectorOutbox("integration_id", p.id("integ"))
+	}},
+	{fk: "iga_observations_discovery_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.igaObservation("discovery_source_id", p.id("dsrc"))
+	}},
 }

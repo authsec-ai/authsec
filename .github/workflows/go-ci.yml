@@ -53,6 +53,10 @@ jobs:
       # would have caught it never ran. These steps point the suites at the
       # postgres service so they actually execute on every PR.
       - name: Graph projection tests (self-migrating, isolated DB)
+        # `go test ./...` above fails on known, unrelated tests. Those failures
+        # must not hide this suite: it is the only place the graph catalog
+        # guard and the projection tests run.
+        if: success() || failure()
         env:
           # A DEDICATED database: the igagraph suite DROPs and rebuilds its
           # public schema from migrations, so it must never share the DB the
@@ -65,6 +69,7 @@ jobs:
           go test ./tests/igagraph/... -count=1
 
       - name: Evidence path tests (real scanner -> real projector)
+        if: success() || failure()
         env:
           IGA_TEST_DSN: postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable
         run: |
