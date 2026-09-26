@@ -46,8 +46,9 @@ func LegacyIngressGloballyDisabled() bool { return FlagOn(EnvLegacyIngressDisabl
 // discovery ingress. Unset, empty, zero, or any non-integer means unlimited:
 // the behaviour of that ingress before the collector registry. A positive
 // value limits each workspace independently so many agents behind one egress
-// address do not share a bucket. The limit is never applied as zero to the
-// sliding window; zero would deny every request.
+// address do not share a bucket. The workspace id in that key is
+// caller-asserted: anyone who knows it can drain the bucket. The limit is
+// never applied as zero to the sliding window; zero would deny every request.
 func LegacyIngressRatePerMin() int {
 	v := strings.TrimSpace(os.Getenv(EnvLegacyIngressRatePerMin))
 	if v == "" {
@@ -75,11 +76,9 @@ func LegacyIngressMaxBody() int64 {
 }
 
 // TrustedProxyList is IGA_TRUSTED_PROXIES: comma-separated IPs or CIDRs.
-// An empty result means trust nobody, so ClientIP is the TCP peer and a
-// client-supplied X-Forwarded-For is ignored. Operators behind a load
-// balancer set this to that proxy's addresses; otherwise every client
-// looks like the balancer, and a spoofed forwarding header is ignored
-// rather than honoured.
+// An empty result means leave gin's trusted-proxy default alone, so
+// ClientIP() is unchanged for tenant rate limits, audit, and request logs.
+// A rollout behind a load balancer should set this to that proxy's CIDRs.
 func TrustedProxyList() []string {
 	raw := strings.TrimSpace(os.Getenv(EnvTrustedProxies))
 	if raw == "" {

@@ -90,23 +90,63 @@ func TestLegacyIngress_SettingsLookupFailsOpen(t *testing.T) {
 	}
 }
 
-func TestApplyTrustedProxies_DefaultIgnoresForwardedFor(t *testing.T) {
+func TestApplyTrustedProxies_DefaultLeavesClientIPUnchanged(t *testing.T) {
+	t.Setenv("IGA_TRUSTED_PROXIES", "")
+	gin.SetMode(gin.TestMode)
+	readIP := func(r *gin.Engine) string {
+		r.GET("/ip", func(c *gin.Context) {
+			c.String(http.StatusOK, c.ClientIP())
+		})
+		req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+		req.RemoteAddr = "10.1.1.1:1234"
+		req.Header.Set("X-Forwarded-For", "1.2.3.4")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Body.String()
+	}
+	baseline := readIP(gin.New())
+	configured := gin.New()
+	if err := ApplyTrustedProxies(configured); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIP(configured); got != baseline {
+		t.Fatalf("ClientIP %q, gin default is %q", got, baseline)
+	}
+	if baseline != "1.2.3.4" {
+		t.Fatalf("gin default ClientIP %q, want the forwarded address", baseline)
+	}
+}
+
+func TestLegacyIngress_IPFallbackUsesRemoteIP(t *testing.T) {
+	t.Setenv("IGA_LEGACY_INGRESS_RATE_PER_MIN", "1")
 	t.Setenv("IGA_TRUSTED_PROXIES", "")
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	if err := ApplyTrustedProxies(r); err != nil {
 		t.Fatal(err)
 	}
-	r.GET("/ip", func(c *gin.Context) {
-		c.String(http.StatusOK, c.ClientIP())
+	r.POST("/authsec/discovery/sightings", LegacyDiscoveryIngressGuard(nil), func(c *gin.Context) {
+		c.Status(http.StatusCreated)
 	})
-	req := httptest.NewRequest(http.MethodGet, "/ip", nil)
-	req.RemoteAddr = "10.1.1.1:1234"
-	req.Header.Set("X-Forwarded-For", "1.2.3.4")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Body.String() != "10.1.1.1" {
-		t.Fatalf("ClientIP %q, want the TCP peer", w.Body.String())
+	post := func(remote, forwarded string) int {
+		body := []byte(`{"source":"vm_sensor"}`)
+		req := httptest.NewRequest(http.MethodPost, "/authsec/discovery/sightings", bytes.NewReader(body))
+		req.RemoteAddr = remote
+		if forwarded != "" {
+			req.Header.Set("X-Forwarded-For", forwarded)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	if post("10.4.4.1:4000", "1.2.3.4") != http.StatusCreated {
+		t.Fatal("first request from the TCP peer should pass")
+	}
+	if post("10.4.4.1:4000", "9.9.9.9") != http.StatusTooManyRequests {
+		t.Fatal("a spoofed X-Forwarded-For must not open a new bucket")
+	}
+	if post("10.4.4.2:4000", "1.2.3.4") != http.StatusCreated {
+		t.Fatal("a different TCP peer must not share the bucket")
 	}
 }
 

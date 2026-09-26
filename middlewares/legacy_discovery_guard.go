@@ -21,8 +21,11 @@ import (
 // Defaults match the historical ingress: no rate limit, and a 32 MiB body
 // cap (IGA_LEGACY_INGRESS_MAX_BODY). IGA_LEGACY_INGRESS_RATE_PER_MIN, when
 // set to a positive integer, limits each workspace rather than each client
-// IP. A missing or unparseable workspace id falls back to the TCP peer.
-// X-Forwarded-For is only consulted when IGA_TRUSTED_PROXIES names the proxy.
+// IP. That workspace id is caller-asserted, so anyone who knows it can
+// drain the bucket. A missing or unparseable workspace id falls back to
+// RemoteIP when IGA_TRUSTED_PROXIES is unset, so a spoofed X-Forwarded-For
+// cannot choose the bucket. When the variable is set, the fallback is
+// ClientIP.
 //
 // Order: the process-wide kill switch (no body read), then the size cap,
 // then the optional per-workspace rate limit, then the workspace switch.
@@ -107,18 +110,29 @@ func legacyRateKey(c *gin.Context, ws uuid.UUID) string {
 		path = c.Request.URL.Path
 	}
 	if ws == uuid.Nil {
-		return "legacy-discovery:ip:" + c.ClientIP() + ":" + path
+		// No trusted proxies configured: do not use ClientIP. Gin trusts
+		// every X-Forwarded-For by default, and this process does not change
+		// that. RemoteIP is the TCP peer and cannot be chosen by the header.
+		ip := c.RemoteIP()
+		if len(services.TrustedProxyList()) > 0 {
+			ip = c.ClientIP()
+		}
+		return "legacy-discovery:ip:" + ip + ":" + path
 	}
 	return "legacy-discovery:" + ws.String() + ":" + path
 }
 
 // ApplyTrustedProxies configures which reverse proxies may set
-// X-Forwarded-For. See services.TrustedProxyList. Unset trusts nobody:
-// Engine.SetTrustedProxies(nil), so ClientIP is the remote address.
+// X-Forwarded-For, and only when IGA_TRUSTED_PROXIES is set.
+// Unset does not call SetTrustedProxies, so ClientIP() stays on gin's
+// default. TenantRateLimitMiddleware, monitoring, admin auth audit, and
+// the request log all key off ClientIP(); rewriting the default would
+// change those keys app-wide. A rollout behind a load balancer should set
+// IGA_TRUSTED_PROXIES to that proxy's CIDRs.
 func ApplyTrustedProxies(r *gin.Engine) error {
 	list := services.TrustedProxyList()
 	if len(list) == 0 {
-		return r.SetTrustedProxies(nil)
+		return nil
 	}
 	return r.SetTrustedProxies(list)
 }
