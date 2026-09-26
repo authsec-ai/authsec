@@ -99,6 +99,72 @@ func VerifyGraphSchema(db *gorm.DB) error {
 	return nil
 }
 
+// V2ProjectionEnv is the collector projection switch. Unset is off. It does
+// not change GraphProjectionGate, which stays the 036 pipeline switch.
+const V2ProjectionEnv = "IGA_V2_PROJECTION"
+
+// V2ProjectionEnabled is true only for an explicit on. Anything else, including
+// unset, is off, so a typo does not start collector projection.
+func V2ProjectionEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(V2ProjectionEnv))) {
+	case "on", "true", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+// CollectorMicrobatch bounds how long collector outbox rows are grouped before
+// one publication, and how long one arm may run before the scheduler offers
+// the other arm a turn. IGA_V2_MICROBATCH overrides it for tests.
+func CollectorMicrobatch() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("IGA_V2_MICROBATCH")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Second
+}
+
+// v2ProjectionColumns are the 040 columns collector projection writes.
+var v2ProjectionColumns = []string{
+	"iga_object_support.integration_id",
+	"iga_object_support.confirming_iga_scan_run_id",
+	"iga_relationship.integration_id",
+	"iga_access_edges.integration_id",
+	"iga_policy_assignment.integration_id",
+	"iga_access_edge_evidence.iga_observation_id",
+	"iga_relationship_evidence.iga_observation_id",
+	"iga_assignment_evidence.iga_observation_id",
+	"iga_projection_job.iga_scan_run_id",
+	"iga_projection_state.integration_id",
+	"iga_projection_state.last_iga_scan_run_id",
+	"iga_publication.iga_scan_run_id",
+	"iga_publication.source_manifest_v2",
+	"iga_pipeline_lease.iga_scan_run_id",
+}
+
+// VerifyV2ProjectionSchema fails closed when collector projection is switched
+// on against a database that does not have migration 040.
+func VerifyV2ProjectionSchema(db *gorm.DB) error {
+	var missing []string
+	for _, qc := range v2ProjectionColumns {
+		table, col, _ := strings.Cut(qc, ".")
+		ok, err := repositories.HasColumn(db, table, col)
+		if err != nil {
+			return fmt.Errorf("v2 schema verification could not run: %w", err)
+		}
+		if !ok {
+			missing = append(missing, qc)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s=on needs migration 040; missing: %s",
+			V2ProjectionEnv, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // GraphProjectionGate carries the switch and whether it has been verified.
 //
 //	IGA_GRAPH_PROJECTION  verified   scan worker            projector

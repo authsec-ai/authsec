@@ -1,0 +1,252 @@
+-- 040_trd2_typed_provenance.sql — TRD 2 typed alternative provenance (M2).
+--
+-- The canonical graph stays provider-neutral. Cloud rows keep connector_id,
+-- cloud_scan_run and cloud_observation. Collector rows use integration_id,
+-- iga_scan_runs and iga_observations. Composite foreign keys are
+-- (workspace_id, id). 038 and 039 CHECK constraints are not dropped.
+--
+-- credential_id is the reserved third support arm for credential projection.
+-- It is not added here; that projection is not enabled.
+--
+-- Re-runnable. No transaction wrapper (the runner applies each file with psql -1).
+-- Down: forward-only. Rollback is the feature flag off; the new columns stay null.
+
+-- Parents the new keys reference. 001 and 038 already UNIQUE (workspace_id, id).
+-- 039 may add the same uniqueness under another name. Skip when any unique or
+-- primary key already covers exactly those two columns.
+DO $$
+DECLARE
+    parent text;
+BEGIN
+    FOREACH parent IN ARRAY ARRAY['iga_integrations', 'iga_scan_runs', 'iga_observations']
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1
+              FROM pg_constraint c
+              JOIN pg_class t ON t.oid = c.conrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE n.nspname = 'public'
+               AND t.relname = parent
+               AND c.contype IN ('u', 'p')
+               AND (
+                    SELECT array_agg(a.attname::text ORDER BY k.ord)
+                      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+               ) = ARRAY['workspace_id', 'id']
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I ADD CONSTRAINT %I UNIQUE (workspace_id, id)',
+                parent, parent || '_workspace_id_key');
+        END IF;
+    END LOOP;
+END $$;
+
+-- Alternative arm columns. Nullable: the checks below are the rule.
+ALTER TABLE public.iga_object_support
+    ADD COLUMN IF NOT EXISTS integration_id uuid,
+    ADD COLUMN IF NOT EXISTS confirming_iga_scan_run_id uuid;
+ALTER TABLE public.iga_relationship
+    ADD COLUMN IF NOT EXISTS integration_id uuid,
+    ADD COLUMN IF NOT EXISTS confirming_iga_scan_run_id uuid;
+ALTER TABLE public.iga_access_edges
+    ADD COLUMN IF NOT EXISTS integration_id uuid,
+    ADD COLUMN IF NOT EXISTS confirming_iga_scan_run_id uuid;
+ALTER TABLE public.iga_policy_assignment
+    ADD COLUMN IF NOT EXISTS integration_id uuid,
+    ADD COLUMN IF NOT EXISTS confirming_iga_scan_run_id uuid;
+ALTER TABLE public.iga_access_edge_evidence
+    ADD COLUMN IF NOT EXISTS iga_observation_id uuid;
+ALTER TABLE public.iga_relationship_evidence
+    ADD COLUMN IF NOT EXISTS iga_observation_id uuid;
+ALTER TABLE public.iga_assignment_evidence
+    ADD COLUMN IF NOT EXISTS iga_observation_id uuid;
+ALTER TABLE public.iga_projection_job
+    ADD COLUMN IF NOT EXISTS iga_scan_run_id uuid;
+ALTER TABLE public.iga_projection_state
+    ADD COLUMN IF NOT EXISTS integration_id uuid,
+    ADD COLUMN IF NOT EXISTS last_iga_scan_run_id uuid;
+ALTER TABLE public.iga_publication
+    ADD COLUMN IF NOT EXISTS iga_scan_run_id uuid,
+    ADD COLUMN IF NOT EXISTS source_manifest_v2 jsonb;
+ALTER TABLE public.iga_pipeline_lease
+    ADD COLUMN IF NOT EXISTS iga_scan_run_id uuid;
+
+COMMENT ON COLUMN public.iga_object_support.integration_id IS
+    'Collector owning source. credential_id is reserved for credential projection and is not created until that projection is enabled.';
+
+-- The cloud arm keeps its meaning. It is nullable only so the collector arm
+-- can be the one that is set. Existing rows keep the values they have.
+ALTER TABLE public.iga_object_support ALTER COLUMN connector_id DROP NOT NULL;
+ALTER TABLE public.iga_access_edge_evidence ALTER COLUMN observation_id DROP NOT NULL;
+ALTER TABLE public.iga_relationship_evidence ALTER COLUMN observation_id DROP NOT NULL;
+ALTER TABLE public.iga_assignment_evidence ALTER COLUMN observation_id DROP NOT NULL;
+ALTER TABLE public.iga_projection_job
+    ALTER COLUMN scan_run_id DROP NOT NULL,
+    ALTER COLUMN connector_id DROP NOT NULL;
+ALTER TABLE public.iga_projection_state
+    ALTER COLUMN connector_id DROP NOT NULL,
+    ALTER COLUMN last_run_id DROP NOT NULL;
+ALTER TABLE public.iga_publication ALTER COLUMN scan_run_id DROP NOT NULL;
+
+-- Exactly one arm where every existing row already has the cloud arm.
+-- Relationship, access edge and policy assignment grandfather a row that
+-- names neither arm (GitHub edges have a null connector_id). Both arms are
+-- refused everywhere.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_object_support_arm_xor') THEN
+        ALTER TABLE public.iga_object_support
+            ADD CONSTRAINT iga_object_support_arm_xor CHECK (
+                (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int = 1
+                AND (last_confirmed_run_id IS NOT NULL)::int
+                    + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL)
+                AND (last_confirmed_run_id IS NULL OR connector_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_relationship_arm_xor') THEN
+        ALTER TABLE public.iga_relationship
+            ADD CONSTRAINT iga_relationship_arm_xor CHECK (
+                (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
+                AND (last_confirmed_by IS NOT NULL)::int
+                    + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_access_edges_arm_xor') THEN
+        ALTER TABLE public.iga_access_edges
+            ADD CONSTRAINT iga_access_edges_arm_xor CHECK (
+                (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
+                AND (last_confirmed_by IS NOT NULL)::int
+                    + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_policy_assignment_arm_xor') THEN
+        ALTER TABLE public.iga_policy_assignment
+            ADD CONSTRAINT iga_policy_assignment_arm_xor CHECK (
+                (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int <= 1
+                AND (last_confirmed_by IS NOT NULL)::int
+                    + (confirming_iga_scan_run_id IS NOT NULL)::int <= 1
+                AND (confirming_iga_scan_run_id IS NULL OR integration_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_access_edge_evidence_arm_xor') THEN
+        ALTER TABLE public.iga_access_edge_evidence
+            ADD CONSTRAINT iga_access_edge_evidence_arm_xor CHECK (
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_relationship_evidence_arm_xor') THEN
+        ALTER TABLE public.iga_relationship_evidence
+            ADD CONSTRAINT iga_relationship_evidence_arm_xor CHECK (
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_assignment_evidence_arm_xor') THEN
+        ALTER TABLE public.iga_assignment_evidence
+            ADD CONSTRAINT iga_assignment_evidence_arm_xor CHECK (
+                (observation_id IS NOT NULL)::int + (iga_observation_id IS NOT NULL)::int = 1);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_projection_job_arm_xor') THEN
+        ALTER TABLE public.iga_projection_job
+            ADD CONSTRAINT iga_projection_job_arm_xor CHECK (
+                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int = 1
+                AND (scan_run_id IS NOT NULL) = (connector_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_projection_state_arm_xor') THEN
+        ALTER TABLE public.iga_projection_state
+            ADD CONSTRAINT iga_projection_state_arm_xor CHECK (
+                (connector_id IS NOT NULL)::int + (integration_id IS NOT NULL)::int = 1
+                AND (last_run_id IS NOT NULL)::int + (last_iga_scan_run_id IS NOT NULL)::int = 1
+                AND (connector_id IS NOT NULL) = (last_run_id IS NOT NULL));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_publication_arm_xor') THEN
+        ALTER TABLE public.iga_publication
+            ADD CONSTRAINT iga_publication_arm_xor CHECK (
+                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int = 1);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_pipeline_lease_arm_xor') THEN
+        ALTER TABLE public.iga_pipeline_lease
+            ADD CONSTRAINT iga_pipeline_lease_arm_xor CHECK (
+                (scan_run_id IS NOT NULL)::int + (iga_scan_run_id IS NOT NULL)::int <= 1);
+    END IF;
+END $$;
+
+-- Idle means no run of either type. 027's check did not know the collector arm.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_pipeline_lease_busy_chk') THEN
+        ALTER TABLE public.iga_pipeline_lease DROP CONSTRAINT iga_pipeline_lease_busy_chk;
+    END IF;
+    ALTER TABLE public.iga_pipeline_lease
+        ADD CONSTRAINT iga_pipeline_lease_busy_chk CHECK (
+            (state = 'idle') = (holder = '' AND scan_run_id IS NULL AND iga_scan_run_id IS NULL));
+END $$;
+
+-- Composite foreign keys. NOT VALID, then VALIDATE. A second apply skips the
+-- add and validates again.
+DO $$
+DECLARE
+    fk record;
+BEGIN
+    FOR fk IN
+        SELECT * FROM (VALUES
+            ('iga_object_support_integration_fkey', 'iga_object_support', 'integration_id', 'iga_integrations'),
+            ('iga_object_support_confirming_iga_run_fkey', 'iga_object_support', 'confirming_iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_relationship_integration_fkey', 'iga_relationship', 'integration_id', 'iga_integrations'),
+            ('iga_relationship_confirming_iga_run_fkey', 'iga_relationship', 'confirming_iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_access_edges_integration_fkey', 'iga_access_edges', 'integration_id', 'iga_integrations'),
+            ('iga_access_edges_confirming_iga_run_fkey', 'iga_access_edges', 'confirming_iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_policy_assignment_integration_fkey', 'iga_policy_assignment', 'integration_id', 'iga_integrations'),
+            ('iga_policy_assignment_confirming_iga_run_fkey', 'iga_policy_assignment', 'confirming_iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_access_edge_evidence_iga_observation_fkey', 'iga_access_edge_evidence', 'iga_observation_id', 'iga_observations'),
+            ('iga_relationship_evidence_iga_observation_fkey', 'iga_relationship_evidence', 'iga_observation_id', 'iga_observations'),
+            ('iga_assignment_evidence_iga_observation_fkey', 'iga_assignment_evidence', 'iga_observation_id', 'iga_observations'),
+            ('iga_projection_job_iga_run_fkey', 'iga_projection_job', 'iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_projection_state_integration_fkey', 'iga_projection_state', 'integration_id', 'iga_integrations'),
+            ('iga_projection_state_iga_run_fkey', 'iga_projection_state', 'last_iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_publication_iga_run_fkey', 'iga_publication', 'iga_scan_run_id', 'iga_scan_runs'),
+            ('iga_pipeline_lease_iga_run_fkey', 'iga_pipeline_lease', 'iga_scan_run_id', 'iga_scan_runs')
+        ) AS t(conname, tbl, col, parent)
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = fk.conname) THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I ADD CONSTRAINT %I FOREIGN KEY (workspace_id, %I) REFERENCES public.%I (workspace_id, id) NOT VALID',
+                fk.tbl, fk.conname, fk.col, fk.parent);
+        END IF;
+        EXECUTE format('ALTER TABLE public.%I VALIDATE CONSTRAINT %I', fk.tbl, fk.conname);
+    END LOOP;
+END $$;
+
+-- Collector conflict targets. The cloud unique indexes are not widened.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_identity_integration
+    ON public.iga_object_support (workspace_id, identity_account_id, integration_id, partition_key)
+    WHERE identity_account_id IS NOT NULL AND integration_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_workload_integration
+    ON public.iga_object_support (workspace_id, workload_id, integration_id, partition_key)
+    WHERE workload_id IS NOT NULL AND integration_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_resource_integration
+    ON public.iga_object_support (workspace_id, resource_id, integration_id, partition_key)
+    WHERE resource_id IS NOT NULL AND integration_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_entitlement_integration
+    ON public.iga_object_support (workspace_id, entitlement_id, integration_id, partition_key)
+    WHERE entitlement_id IS NOT NULL AND integration_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_policy_integration
+    ON public.iga_object_support (workspace_id, policy_id, integration_id, partition_key)
+    WHERE policy_id IS NOT NULL AND integration_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_aee_iga_observation
+    ON public.iga_access_edge_evidence (workspace_id, access_edge_id, iga_observation_id, relation)
+    WHERE iga_observation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_re_iga_observation
+    ON public.iga_relationship_evidence (workspace_id, relationship_id, iga_observation_id, relation)
+    WHERE iga_observation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_ae_iga_observation
+    ON public.iga_assignment_evidence (workspace_id, assignment_id, iga_observation_id, relation)
+    WHERE iga_observation_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_projection_job_iga_run
+    ON public.iga_projection_job (workspace_id, iga_scan_run_id)
+    WHERE iga_scan_run_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_projection_state_integration
+    ON public.iga_projection_state (workspace_id, integration_id, partition_key)
+    WHERE integration_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_publication_iga_run
+    ON public.iga_publication (workspace_id, iga_scan_run_id)
+    WHERE iga_scan_run_id IS NOT NULL;
