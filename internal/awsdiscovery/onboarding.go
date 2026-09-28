@@ -56,8 +56,15 @@ var CloudFormationTemplate string
 // resource also carries the version, as a property.
 const TemplateVersion = "2026-09-24"
 
+// PermissionsVersion is the oldest template version that grants every
+// permission this build reads with: the last bump that changed the role's
+// permissions. A bump that changes only the template's plumbing (2026-09-24,
+// the Quick Create callback) leaves it where it is, so existing stacks are not
+// reported outdated for permissions they already hold.
+const PermissionsVersion = "2026-09-23"
+
 // TemplateOutdated reports whether a connector's recorded template version is
-// older than the one this build ships -- a FACT about the two versions, never
+// older than the permissions this build needs -- a FACT about the two versions, never
 // a diagnosis of a denial (§2.14.13: an SCP or a boundary refuses the same
 // call). Versions are dates (YYYY-MM-DD), so string order is date order.
 //
@@ -69,7 +76,7 @@ func TemplateOutdated(recorded string) *bool {
 	if recorded == "" {
 		return nil
 	}
-	outdated := recorded < TemplateVersion
+	outdated := recorded < PermissionsVersion
 	return &outdated
 }
 

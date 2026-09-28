@@ -96,6 +96,12 @@ func IsOptInRegion(region string) bool {
 	return ok
 }
 
+// IsKnownRegion reports whether AWS has this region: one every account has
+// enabled, or a known opt-in one. Anything else is a name nobody can deploy to.
+func IsKnownRegion(region string) bool {
+	return regionsEnabledByDefault[region] || IsOptInRegion(region)
+}
+
 // QuickCreateURL builds a Quick Create link for the embedded template.
 //
 // params are template parameter names without the param_ prefix. Every name

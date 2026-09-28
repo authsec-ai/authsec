@@ -639,6 +639,16 @@ func (s *AWSQuickCreateService) HandleCallbackDelivery(ctx context.Context, body
 	}
 	lg.account, lg.region = stack.AccountID, stack.Region
 
+	// The stack's region comes from a StackId anyone can write, and it builds
+	// the host a ResponseURL may name. An invented one ("external-1") would
+	// make a legacy S3 host outside AWS's CloudFormation response buckets look
+	// allowed, so it must be a region AWS has. A real region that is not the
+	// topic's is still answered FAILED below, with a reason the customer reads.
+	if !awsdiscovery.IsKnownRegion(stack.Region) {
+		lg.emit(CallbackReject.String(), "", "stack region is not a known AWS region")
+		return CallbackReject
+	}
+
 	// 2. ResponseURL, before anything could make AuthSec contact it.
 	lg.stage = "response_url"
 	target, err := awsdiscovery.ValidateResponseURL(req.ResponseURL, stack.Region)
