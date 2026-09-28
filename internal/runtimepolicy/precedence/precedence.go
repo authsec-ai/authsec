@@ -5,6 +5,13 @@
 // then an unexpired approved exception. A deny from any source is never
 // replaced by an allow from another. The function is pure: callers load the
 // facts and this package does not read agent_policies or enforcement_plans.
+//
+// The signed manifest's targets[].effect is not this full decision. Publish
+// fills it only from quarantine, emergency, and guardrail facts, as a
+// workload-level override hint. An empty fact list is not default deny for
+// that hint: the target is omitted. The per-action decision stays in the
+// bundle. A quarantine that starts after publish is an unsigned marker on
+// desired, not a rewrite of the signed hint.
 package precedence
 
 import "time"

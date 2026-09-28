@@ -32,6 +32,12 @@ func (s *RuntimePolicyService) Simulate(ctx context.Context, actor Actor, id uui
 			return 0, nil, statusErr(http.StatusBadRequest, "invalid_document", "The simulation body is not JSON.")
 		}
 	}
+	if !req.EventWindow.Start.IsZero() && !req.EventWindow.End.IsZero() {
+		start, end := req.EventWindow.Start.UTC(), req.EventWindow.End.UTC()
+		if end.Before(start) || end.Sub(start) > maxSimulationWindow {
+			return 0, nil, statusErr(http.StatusBadRequest, "window_too_long", "The event window must be at most 30 days.")
+		}
+	}
 	route := "POST /api/iga/v2/runtime-policies/:id/simulations"
 	return s.onceLocked(ctx, actor, id, key, route, ifMatch, body, func(tx *gorm.DB, head policyHead, cur revisionHead) (int, []byte, error) {
 		if etag(cur.Revision, cur.ContentHash) != ifMatch {
@@ -152,6 +158,11 @@ type simSample struct {
 	WorkloadID  string   `json:"workload_id"`
 }
 
+const (
+	maxSimulationWindow = 30 * 24 * time.Hour
+	maxSimulationRows   = 50000
+)
+
 func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, ws uuid.UUID, doc compile.Document, result *compile.Result, cur revisionHead, start, end time.Time, graph int64) (simSummary, map[string]any, error) {
 	summary := simSummary{Samples: []simSample{}}
 	if len(doc.Targets.WorkloadIDs) == 0 {
@@ -168,23 +179,35 @@ func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, 
 		o.action, o.resource_id::text AS resource_id, COALESCE(res.kind_metadata::text, '{}') AS meta
 		FROM iga_observed_access o
 		JOIN iga_resources res ON res.workspace_id = o.workspace_id AND res.id = o.resource_id
-		WHERE o.workspace_id = ? AND o.workload_id::text IN ? AND o.observed_at >= ? AND o.observed_at <= ?`,
-		ws, doc.Targets.WorkloadIDs, start, end).Scan(&rows).Error
+		WHERE o.workspace_id = ? AND o.workload_id = ANY(?::uuid[]) AND o.observed_at >= ? AND o.observed_at <= ?
+		ORDER BY o.observed_at
+		LIMIT ?`,
+		ws, pgUUIDArray(doc.Targets.WorkloadIDs), start, end, maxSimulationRows+1).Scan(&rows).Error
 	if err != nil {
 		return summary, nil, err
+	}
+	truncated := false
+	if len(rows) > maxSimulationRows {
+		truncated = true
+		rows = rows[:maxSimulationRows]
 	}
 	mode := doc.Mode
 	if mode == "" {
 		mode = "observe"
 	}
 	data := result.Data
+	factsByWorkload := map[string][]precedence.Fact{}
 	for _, row := range rows {
 		meta := map[string]any{}
 		_ = json.Unmarshal([]byte(row.Meta), &meta)
 		path, _ := meta["path"].(string)
-		facts, err := loadPrecedence(tx, ws, row.WorkloadID, doc, s.clock())
-		if err != nil {
-			return summary, nil, err
+		facts, ok := factsByWorkload[row.WorkloadID]
+		if !ok {
+			facts, err = loadPrecedence(tx, ws, row.WorkloadID, doc, s.clock())
+			if err != nil {
+				return summary, nil, err
+			}
+			factsByWorkload[row.WorkloadID] = facts
 		}
 		outcome := precedence.Resolve(s.clock(), facts)
 		input := map[string]any{
@@ -219,5 +242,21 @@ func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, 
 			})
 		}
 	}
-	return summary, map[string]any{"observations": len(rows)}, nil
+	return summary, map[string]any{"observations": len(rows), "truncated": truncated}, nil
+}
+
+func pgUUIDArray(ids []string) string {
+	if len(ids) == 0 {
+		return "{}"
+	}
+	out := make([]byte, 0, 2+len(ids)*37)
+	out = append(out, '{')
+	for i, id := range ids {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, id...)
+	}
+	out = append(out, '}')
+	return string(out)
 }

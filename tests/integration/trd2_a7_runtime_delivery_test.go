@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/profiles"
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/sign"
@@ -73,8 +74,8 @@ func TestTRD2ITA7ObserveDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.PolicyRevisionHash != hash || manifest.TargetDigest != digest {
-		t.Fatalf("manifest hash %s digest %s want %s %s", manifest.PolicyRevisionHash, manifest.TargetDigest, hash, digest)
+	if manifest.PolicyRevisionHash != hash || manifest.TargetDigest != digest || manifest.Mode != "observe" || manifest.Revoked {
+		t.Fatalf("manifest hash %s digest %s mode %s revoked %v", manifest.PolicyRevisionHash, manifest.TargetDigest, manifest.Mode, manifest.Revoked)
 	}
 	bundle := a7Download(t, env, desired.OPABundle.URL, env.principal())
 	if err := sign.VerifyBundle(bundle, map[string]*ecdsa.PublicKey{"current": env.pub}); err != nil {
@@ -90,6 +91,24 @@ func TestTRD2ITA7ObserveDelivery(t *testing.T) {
 	if rec := a7DownloadStatus(t, env, desired.OPABundle.URL, foreign); rec.Code != http.StatusNotFound {
 		t.Fatalf("other workspace download %d %s", rec.Code, rec.Body.String())
 	}
+	applied := collectorcontract.AppliedReceipt{
+		WorkloadID: env.wl.String(), DeliveryRevision: desired.Revision,
+		RuntimeGeneration: "gen-1", State: "delivered",
+		Controls: []collectorcontract.ControlReceipt{{
+			Kind: "tetragon.file_open_deny", State: "staged", ArtifactSHA256: strings.Repeat("ab", 32), Test: "open",
+		}},
+		ObservedAt: "2026-09-28T08:00:00Z",
+	}
+	a7Sync(t, env, 2, []collectorcontract.AppliedReceipt{applied})
+	a7Sync(t, env, 3, []collectorcontract.AppliedReceipt{applied})
+	if n := a7ReceiptCount(t, env); n != 1 {
+		t.Fatalf("identical syncs stored %d receipts", n)
+	}
+	applied.State = "verified"
+	a7Sync(t, env, 4, []collectorcontract.AppliedReceipt{applied})
+	if n := a7ReceiptCount(t, env); n != 2 {
+		t.Fatalf("changed state stored %d receipts", n)
+	}
 	rev := callPolicy(t, env.r, http.MethodPost, path+"/revoke", env.author, "runtime_policy:enforce", "revoke-1", etag, []byte(`{"reason":"stop"}`))
 	if rev.Code != http.StatusCreated {
 		t.Fatalf("revoke %d %s", rev.Code, rev.Body.String())
@@ -103,9 +122,26 @@ func TestTRD2ITA7ObserveDelivery(t *testing.T) {
 	if epoch != 1 || phase != "revoked" {
 		t.Fatalf("epoch %d phase %s", epoch, phase)
 	}
-	again := a7Desired(t, a7Sync(t, env, 2, nil))
-	if again.Revision <= desired.Revision {
-		t.Fatalf("revoked delivery %d did not advance past %d", again.Revision, desired.Revision)
+	var dbMode string
+	if err := env.db.QueryRow(`SELECT mode FROM runtime_policy_publications WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 1`, env.ws).Scan(&dbMode); err != nil {
+		t.Fatal(err)
+	}
+	if dbMode != "observe" {
+		t.Fatalf("revoked row stored mode %s", dbMode)
+	}
+	again := a7Desired(t, a7Sync(t, env, 5, nil))
+	if again.Revision <= desired.Revision || !again.Revoked || again.Mode != "revoked" {
+		t.Fatalf("revoked desired %+v", again)
+	}
+	if again.OPABundle.SHA256 == desired.OPABundle.SHA256 {
+		t.Fatal("revoke reused the previous bundle")
+	}
+	revokedManifest, err := sign.VerifyManifest(again.SignedManifest, map[string]*ecdsa.PublicKey{"current": env.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revokedManifest.Mode != "revoked" || !revokedManifest.Revoked {
+		t.Fatalf("revoked manifest %+v", revokedManifest)
 	}
 }
 
@@ -225,6 +261,14 @@ func TestTRD2ITA7EnforceAndQuarantine(t *testing.T) {
 	if ok.Code != http.StatusCreated {
 		t.Fatalf("enforce publish %d %s", ok.Code, ok.Body.String())
 	}
+	enforced := a7Desired(t, a7Sync(t, env, 1, nil))
+	enfManifest, err := sign.VerifyManifest(enforced.SignedManifest, map[string]*ecdsa.PublicKey{"current": env.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enfManifest.Mode != "enforce" || enforced.Mode != "enforce" {
+		t.Fatalf("enforce mode manifest %s desired %s", enfManifest.Mode, enforced.Mode)
+	}
 	var published struct {
 		Data struct {
 			DeliveryRevision int64 `json:"delivery_revision"`
@@ -235,7 +279,7 @@ func TestTRD2ITA7EnforceAndQuarantine(t *testing.T) {
 	}
 	one := collectorcontract.ControlReceipt{Kind: "tetragon.file_open_deny", State: "verified", ArtifactSHA256: strings.Repeat("ab", 32), Test: "open"}
 	two := collectorcontract.ControlReceipt{Kind: "linux.netns_egress", State: "verified", ArtifactSHA256: strings.Repeat("cd", 32), Test: "egress"}
-	a7Sync(t, env, 1, []collectorcontract.AppliedReceipt{{
+	a7Sync(t, env, 2, []collectorcontract.AppliedReceipt{{
 		WorkloadID: env.wl.String(), DeliveryRevision: published.Data.DeliveryRevision,
 		RuntimeGeneration: "run-1", State: "verified", Controls: []collectorcontract.ControlReceipt{one},
 		ObservedAt: "2026-09-28T08:00:00Z",
@@ -243,13 +287,18 @@ func TestTRD2ITA7EnforceAndQuarantine(t *testing.T) {
 	if a7Protected(t, env, path) {
 		t.Fatal("one verified control marked the target protected")
 	}
-	a7Sync(t, env, 2, []collectorcontract.AppliedReceipt{{
+	secondApplied := []collectorcontract.AppliedReceipt{{
 		WorkloadID: env.wl.String(), DeliveryRevision: published.Data.DeliveryRevision,
 		RuntimeGeneration: "run-2", State: "verified", Controls: []collectorcontract.ControlReceipt{one, two},
 		ObservedAt: "2026-09-28T09:00:00Z",
-	}})
+	}}
+	a7Sync(t, env, 3, secondApplied)
 	if !a7Protected(t, env, path) {
 		t.Fatal("both required controls verified but the target is not protected")
+	}
+	a7Sync(t, env, 4, secondApplied)
+	if n := a7ReceiptCount(t, env); n != 2 {
+		t.Fatalf("repeated verified sync stored %d receipts", n)
 	}
 
 	q := newA7(t, a7GoodDigest, false)
@@ -270,6 +319,35 @@ func TestTRD2ITA7EnforceAndQuarantine(t *testing.T) {
 	}
 	if len(manifest.Targets) != 1 || manifest.Targets[0].Effect != "deny" || manifest.Targets[0].Source != "quarantine" {
 		t.Fatalf("precedence %+v", manifest.Targets)
+	}
+
+	late := newA7(t, a7GoodDigest, false)
+	latePath, lateEtag, _, _ := a7Approve(t, late, a7Doc(late.wl, "late-"+late.wl.String()[:8], "/var/app/data", []string{"filesystem"}))
+	latePub := callPolicy(t, late.r, http.MethodPost, latePath+"/publications", late.author, "runtime_policy:enforce", "late-pub", lateEtag, []byte(`{"mode":"observe"}`))
+	if latePub.Code != http.StatusCreated {
+		t.Fatalf("late publish %d %s", latePub.Code, latePub.Body.String())
+	}
+	before := a7Desired(t, a7Sync(t, late, 1, nil))
+	beforeManifest, err := sign.VerifyManifest(before.SignedManifest, map[string]*ecdsa.PublicKey{"current": late.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Quarantine || len(beforeManifest.Targets) != 0 {
+		t.Fatalf("clean publish quarantine %v targets %+v", before.Quarantine, beforeManifest.Targets)
+	}
+	agent2 := uuid.New()
+	execDB(t, late.db, `INSERT INTO discovered_agents (id, workspace_id, source, fingerprint, status)
+		VALUES ($1, $2, 'k8s_webhook', $3, 'quarantined')`, agent2, late.ws, "fp-"+agent2.String()[:8])
+	execDB(t, late.db, `INSERT INTO discovered_agent_workloads
+		(workspace_id, discovered_agent_id, workload_id, link_strength, link_state)
+		VALUES ($1, $2, $3, 'weak', 'accepted')`, late.ws, agent2, late.wl)
+	after := a7Desired(t, a7Sync(t, late, 2, nil))
+	afterManifest, err := sign.VerifyManifest(after.SignedManifest, map[string]*ecdsa.PublicKey{"current": late.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Quarantine || len(afterManifest.Targets) != 0 || after.SignedManifest != before.SignedManifest {
+		t.Fatalf("sync quarantine %v targets %+v", after.Quarantine, afterManifest.Targets)
 	}
 }
 
@@ -353,6 +431,10 @@ func TestTRD2ITA7CandidateAndPreconditions(t *testing.T) {
 	read := callPolicy(t, env.r, http.MethodGet, "/api/iga/v2/runtime-policies/simulations/"+simBody.Data.SimulationID.String(), env.author, "runtime_policy:read", "", "", nil)
 	if read.Code != http.StatusOK || !strings.Contains(read.Body.String(), simBody.Data.SimulationID.String()) {
 		t.Fatalf("get simulation %d %s", read.Code, read.Body.String())
+	}
+	long := callPolicy(t, env.r, http.MethodPost, ppath+"/simulations", env.author, "runtime_policy:write", "sim-long", petag, []byte(`{"event_window":{"start":"2026-01-01T00:00:00Z","end":"2026-03-01T00:00:00Z"}}`))
+	if long.Code != http.StatusBadRequest || !strings.Contains(long.Body.String(), "window_too_long") {
+		t.Fatalf("long window %d %s", long.Code, long.Body.String())
 	}
 }
 
@@ -480,6 +562,27 @@ func TestTRD2ITA7CollectorList(t *testing.T) {
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("non-collector %d %s", missing.Code, missing.Body.String())
 	}
+	badFilter := callPolicy(t, r, http.MethodGet, "/api/iga/v2/collectors?estate_id=not-a-uuid", user, "discovery:read", "", "", nil)
+	if badFilter.Code != http.StatusBadRequest || !strings.Contains(badFilter.Body.String(), "invalid_filter") {
+		t.Fatalf("bad estate %d %s", badFilter.Code, badFilter.Body.String())
+	}
+	badCursor := callPolicy(t, r, http.MethodGet, "/api/iga/v2/collectors?cursor=nope", user, "discovery:read", "", "", nil)
+	if badCursor.Code != http.StatusBadRequest || !strings.Contains(badCursor.Body.String(), "invalid_cursor") {
+		t.Fatalf("bad cursor %d %s", badCursor.Code, badCursor.Body.String())
+	}
+	ws2 := uuid.New()
+	execDB(t, db, `INSERT INTO workspaces (id, name) VALUES ($1, $2)`, ws2, "a7other-"+ws2.String()[:8])
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM workspaces WHERE id = $1`, ws2) })
+	foreign := uuid.New()
+	a7Collector(t, db, ws2, uuid.New(), uuid.New(), uuid.New(), foreign, a7GoodDigest)
+	listedAll := callPolicy(t, r, http.MethodGet, "/api/iga/v2/collectors?limit=100", user, "discovery:read", "", "", nil)
+	if listedAll.Code != http.StatusOK || strings.Contains(listedAll.Body.String(), foreign.String()) {
+		t.Fatalf("cross-workspace list %d %s", listedAll.Code, listedAll.Body.String())
+	}
+	foreignGet := callPolicy(t, r, http.MethodGet, "/api/iga/v2/collectors/"+foreign.String(), user, "discovery:read", "", "", nil)
+	if foreignGet.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace get %d %s", foreignGet.Code, foreignGet.Body.String())
+	}
 }
 
 func TestTRD2ITA7WorkspaceCascade(t *testing.T) {
@@ -527,6 +630,231 @@ func TestTRD2ITA7WorkspaceCascade(t *testing.T) {
 			t.Fatalf("%s left %d rows", table, n)
 		}
 	}
+}
+
+func TestTRD2ITA7CanaryAudience(t *testing.T) {
+	env := newA7(t, a7GoodDigest, false)
+	execDB(t, env.db, `UPDATE iga_workload SET estate_scope_id = $2 WHERE id = $1`, env.wl, env.scope)
+	wlB := uuid.New()
+	scopeB, integB, srcB, colB := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	a7Collector(t, env.db, env.ws, scopeB, integB, srcB, colB, a7GoodDigest)
+	execDB(t, env.db, `INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key, estate_scope_id)
+		VALUES ($1, $2, 'process', $3, $4)`, wlB, env.ws, "wl-"+wlB.String()[:8], scopeB)
+	doc := a7DocWorkloads([]uuid.UUID{env.wl, wlB}, "aud-"+env.wl.String()[:8], "/var/app/one", []string{"filesystem"})
+	path, etag, _, _ := a7Approve(t, env, doc)
+	first := callPolicy(t, env.r, http.MethodPost, path+"/publications", env.author, "runtime_policy:enforce", "aud-pub-1", etag, []byte(`{"mode":"observe"}`))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first publish %d %s", first.Code, first.Body.String())
+	}
+	var firstPub struct {
+		Data struct {
+			DeliveryRevision int64 `json:"delivery_revision"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPub); err != nil {
+		t.Fatal(err)
+	}
+	b := &models.CollectorPrincipal{
+		WorkspaceID: env.ws, CollectorID: colB, EstateScopeID: scopeB,
+		DiscoverySourceID: srcB, IntegrationID: integB,
+		Kind: models.CollectorKindLinux, Scopes: []string{models.CollectorScopeIngest, models.CollectorScopePolicyRead},
+	}
+	if got := a7Desired(t, a7Accept(t, env.g, b, 1, nil)); got.Revision != firstPub.Data.DeliveryRevision {
+		t.Fatalf("collector B baseline %d want %d", got.Revision, firstPub.Data.DeliveryRevision)
+	}
+	edited := a7DocWorkloads([]uuid.UUID{env.wl, wlB}, "aud-"+env.wl.String()[:8], "/var/app/two", []string{"filesystem"})
+	put := callPolicy(t, env.r, http.MethodPut, path+"/draft", env.author, "runtime_policy:write", "aud-draft", etag, edited)
+	if put.Code != http.StatusOK {
+		t.Fatalf("draft %d %s", put.Code, put.Body.String())
+	}
+	var putBody struct {
+		ETag string `json:"etag"`
+	}
+	if err := json.Unmarshal(put.Body.Bytes(), &putBody); err != nil {
+		t.Fatal(err)
+	}
+	validated := callPolicy(t, env.r, http.MethodPost, path+"/validate", env.author, "runtime_policy:write", "aud-val", putBody.ETag, []byte(`{}`))
+	if validated.Code != http.StatusOK {
+		t.Fatalf("validate %d %s", validated.Code, validated.Body.String())
+	}
+	var valBody struct {
+		ETag string `json:"etag"`
+	}
+	if err := json.Unmarshal(validated.Body.Bytes(), &valBody); err != nil {
+		t.Fatal(err)
+	}
+	etag = a7FinishApproval(t, env, path, valBody.ETag, "aud-2")
+	canaryBody := []byte(`{"mode":"observe","canary_workload_ids":["` + env.wl.String() + `"],"window_seconds":60,"failure_threshold":1}`)
+	second := callPolicy(t, env.r, http.MethodPost, path+"/publications", env.author, "runtime_policy:enforce", "aud-pub-2", etag, canaryBody)
+	if second.Code != http.StatusCreated {
+		t.Fatalf("canary publish %d %s", second.Code, second.Body.String())
+	}
+	var canary struct {
+		Data struct {
+			DeliveryRevision int64 `json:"delivery_revision"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &canary); err != nil {
+		t.Fatal(err)
+	}
+	if got := a7Desired(t, a7Sync(t, env, 1, nil)); got.Revision != canary.Data.DeliveryRevision {
+		t.Fatalf("canary collector %d want %d", got.Revision, canary.Data.DeliveryRevision)
+	}
+	if got := a7Desired(t, a7Accept(t, env.g, b, 2, nil)); got.Revision != firstPub.Data.DeliveryRevision {
+		t.Fatalf("non-canary collector %d want previous %d", got.Revision, firstPub.Data.DeliveryRevision)
+	}
+	worker := services.NewRolloutWorker(env.g)
+	worker.SetClock(time.Now)
+	if err := worker.Tick(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	phase, reason := a7Phase(t, env)
+	if phase != "canary" || reason != "" {
+		t.Fatalf("early tick phase %s reason %s", phase, reason)
+	}
+	past := time.Now().Add(2 * time.Minute)
+	worker.SetClock(func() time.Time { return past })
+	if err := worker.Tick(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	phase, reason = a7Phase(t, env)
+	if phase != "canary" || reason != "no_canary_receipts" {
+		t.Fatalf("empty window phase %s reason %s", phase, reason)
+	}
+	if got := a7Desired(t, a7Accept(t, env.g, b, 3, nil)); got.Revision != firstPub.Data.DeliveryRevision {
+		t.Fatalf("non-canary after empty window %d", got.Revision)
+	}
+	a7Sync(t, env, 2, []collectorcontract.AppliedReceipt{{
+		WorkloadID: env.wl.String(), DeliveryRevision: canary.Data.DeliveryRevision,
+		RuntimeGeneration: "canary-ok", State: "verified",
+		Controls: []collectorcontract.ControlReceipt{{
+			Kind: "tetragon.file_open_deny", State: "verified", ArtifactSHA256: strings.Repeat("ab", 32), Test: "open",
+		}},
+		ObservedAt: "2026-09-28T08:00:00Z",
+	}})
+	worker.SetClock(func() time.Time { return past.Add(time.Minute) })
+	if err := worker.Tick(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	phase, reason = a7Phase(t, env)
+	if phase != "rest" || reason != "" {
+		t.Fatalf("promote phase %s reason %s", phase, reason)
+	}
+	promoted := a7Desired(t, a7Accept(t, env.g, b, 4, nil))
+	if promoted.Revision != canary.Data.DeliveryRevision {
+		t.Fatalf("rest collector B %d want %d", promoted.Revision, canary.Data.DeliveryRevision)
+	}
+	restManifest, err := sign.VerifyManifest(promoted.SignedManifest, map[string]*ecdsa.PublicKey{"current": env.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	edited = a7DocWorkloads([]uuid.UUID{env.wl, wlB}, "aud-"+env.wl.String()[:8], "/var/app/three", []string{"filesystem"})
+	put = callPolicy(t, env.r, http.MethodPut, path+"/draft", env.author, "runtime_policy:write", "aud-draft-3", etag, edited)
+	if put.Code != http.StatusOK {
+		t.Fatalf("third draft %d %s", put.Code, put.Body.String())
+	}
+	if err := json.Unmarshal(put.Body.Bytes(), &putBody); err != nil {
+		t.Fatal(err)
+	}
+	validated = callPolicy(t, env.r, http.MethodPost, path+"/validate", env.author, "runtime_policy:write", "aud-val-3", putBody.ETag, []byte(`{}`))
+	if validated.Code != http.StatusOK {
+		t.Fatalf("third validate %d %s", validated.Code, validated.Body.String())
+	}
+	if err := json.Unmarshal(validated.Body.Bytes(), &valBody); err != nil {
+		t.Fatal(err)
+	}
+	etag = a7FinishApproval(t, env, path, valBody.ETag, "aud-3")
+	failBody := []byte(`{"mode":"observe","canary_workload_ids":["` + env.wl.String() + `"],"window_seconds":86400,"failure_threshold":1}`)
+	third := callPolicy(t, env.r, http.MethodPost, path+"/publications", env.author, "runtime_policy:enforce", "aud-pub-3", etag, failBody)
+	if third.Code != http.StatusCreated {
+		t.Fatalf("failing canary %d %s", third.Code, third.Body.String())
+	}
+	var failing struct {
+		Data struct {
+			DeliveryRevision int64 `json:"delivery_revision"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(third.Body.Bytes(), &failing); err != nil {
+		t.Fatal(err)
+	}
+	a7Sync(t, env, 3, []collectorcontract.AppliedReceipt{{
+		WorkloadID: env.wl.String(), DeliveryRevision: failing.Data.DeliveryRevision,
+		RuntimeGeneration: "canary-bad", State: "failed",
+		Controls: []collectorcontract.ControlReceipt{{
+			Kind: "tetragon.file_open_deny", State: "failed", ArtifactSHA256: strings.Repeat("cd", 32), Test: "open",
+		}},
+		ObservedAt: "2026-09-28T09:00:00Z",
+	}})
+	if err := worker.Tick(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	phase, _ = a7Phase(t, env)
+	if phase != "paused" {
+		t.Fatalf("pause phase %s", phase)
+	}
+	if got := a7Desired(t, a7Accept(t, env.g, b, 5, nil)); got.Revision != promoted.Revision {
+		t.Fatalf("paused non-canary %d want %d", got.Revision, promoted.Revision)
+	}
+	rolled := callPolicy(t, env.r, http.MethodPost, path+"/rollback", env.author, "runtime_policy:enforce", "aud-rb", etag, []byte(`{"reason":"pause"}`))
+	if rolled.Code != http.StatusCreated {
+		t.Fatalf("rollback %d %s", rolled.Code, rolled.Body.String())
+	}
+	backA := a7Desired(t, a7Sync(t, env, 4, nil))
+	backB := a7Desired(t, a7Accept(t, env.g, b, 6, nil))
+	if backA.Revision != backB.Revision || backA.Revision <= failing.Data.DeliveryRevision {
+		t.Fatalf("rollback A %d B %d failing %d", backA.Revision, backB.Revision, failing.Data.DeliveryRevision)
+	}
+	backManifest, err := sign.VerifyManifest(backB.SignedManifest, map[string]*ecdsa.PublicKey{"current": env.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backManifest.PolicyRevisionHash != restManifest.PolicyRevisionHash {
+		t.Fatalf("rollback hash %s want %s", backManifest.PolicyRevisionHash, restManifest.PolicyRevisionHash)
+	}
+}
+
+func TestTRD2ITA7OneDesired(t *testing.T) {
+	env := newA7(t, a7GoodDigest, false)
+	path1, etag1, hash1, _ := a7Approve(t, env, a7Doc(env.wl, "one-"+env.wl.String()[:8], "/var/app/old", []string{"filesystem"}))
+	first := callPolicy(t, env.r, http.MethodPost, path1+"/publications", env.author, "runtime_policy:enforce", "one-pub-1", etag1, []byte(`{"mode":"observe"}`))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first policy %d %s", first.Code, first.Body.String())
+	}
+	path2, etag2, hash2, _ := a7Approve(t, env, a7Doc(env.wl, "two-"+env.wl.String()[:8], "/var/app/new", []string{"filesystem"}))
+	second := callPolicy(t, env.r, http.MethodPost, path2+"/publications", env.author, "runtime_policy:enforce", "one-pub-2", etag2, []byte(`{"mode":"observe"}`))
+	if second.Code != http.StatusCreated {
+		t.Fatalf("second policy %d %s", second.Code, second.Body.String())
+	}
+	var published struct {
+		Data struct {
+			DeliveryRevision int64 `json:"delivery_revision"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &published); err != nil {
+		t.Fatal(err)
+	}
+	desired := a7Desired(t, a7Sync(t, env, 1, nil))
+	manifest, err := sign.VerifyManifest(desired.SignedManifest, map[string]*ecdsa.PublicKey{"current": env.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desired.Revision != published.Data.DeliveryRevision || manifest.PolicyRevisionHash != hash2 || manifest.PolicyRevisionHash == hash1 {
+		t.Fatalf("desired rev %d hash %s older %s newer %s", desired.Revision, manifest.PolicyRevisionHash, hash1, hash2)
+	}
+}
+
+func a7Phase(t *testing.T, env *a7Env) (string, string) {
+	t.Helper()
+	var phase, reason string
+	err := env.db.QueryRow(`SELECT COALESCE(rollout_plan->>'phase', ''), COALESCE(rollout_plan->>'pause_reason', '')
+		FROM runtime_policy_publications
+		WHERE workspace_id = $1 AND rollout_plan->>'phase' IN ('canary', 'paused', 'rest')
+		ORDER BY created_at DESC LIMIT 1`, env.ws).Scan(&phase, &reason)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return phase, reason
 }
 
 type a7Env struct {
@@ -626,6 +954,10 @@ func a7SigningKey(t *testing.T) *ecdsa.PublicKey {
 }
 
 func a7Doc(wl uuid.UUID, name, path string, controls []string) []byte {
+	return a7DocWorkloads([]uuid.UUID{wl}, name, path, controls)
+}
+
+func a7DocWorkloads(ids []uuid.UUID, name, path string, controls []string) []byte {
 	if controls == nil {
 		controls = []string{}
 	}
@@ -633,9 +965,13 @@ func a7Doc(wl uuid.UUID, name, path string, controls []string) []byte {
 	if path != "" {
 		rules = append(rules, map[string]any{"id": "files", "action": "file.read", "path": path, "effect": "allow"})
 	}
+	rawIDs := make([]string, len(ids))
+	for i, id := range ids {
+		rawIDs[i] = id.String()
+	}
 	raw, err := json.Marshal(map[string]any{
 		"name": name, "format": models.RuntimePolicyFormatV1,
-		"targets":                 map[string]any{"workload_ids": []string{wl.String()}, "include_future_incarnations": false},
+		"targets":                 map[string]any{"workload_ids": rawIDs, "include_future_incarnations": false},
 		"profile":                 "linux-managed-v1",
 		"default_effect":          "deny",
 		"mode":                    "observe",
@@ -652,7 +988,7 @@ func a7Doc(wl uuid.UUID, name, path string, controls []string) []byte {
 func a7Approve(t *testing.T, env *a7Env, doc []byte) (string, string, string, string) {
 	t.Helper()
 	path, etag := a7CreateValidated(t, env, doc)
-	etag = a7FinishApproval(t, env, path, etag, "appr")
+	etag = a7FinishApproval(t, env, path, etag, "appr-"+uuid.NewString())
 	var hash, digest string
 	if err := env.db.QueryRow(`SELECT r.content_hash, s.target_digest
 		FROM runtime_policy_revisions r
@@ -728,6 +1064,9 @@ type a7DesiredDoc struct {
 	Revision       int64  `json:"revision"`
 	PolicyFormat   string `json:"policy_format"`
 	SignedManifest string `json:"signed_manifest"`
+	Mode           string `json:"mode"`
+	Revoked        bool   `json:"revoked"`
+	Quarantine     bool   `json:"quarantine"`
 	OPABundle      struct {
 		URL         string `json:"url"`
 		SHA256      string `json:"sha256"`
@@ -819,6 +1158,15 @@ func a7DownloadStatus(t *testing.T, env *a7Env, artifactURL string, p *models.Co
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func a7ReceiptCount(t *testing.T, env *a7Env) int {
+	t.Helper()
+	var n int
+	if err := env.db.QueryRow(`SELECT count(*) FROM runtime_policy_receipts WHERE workspace_id = $1`, env.ws).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func a7Protected(t *testing.T, env *a7Env, path string) bool {

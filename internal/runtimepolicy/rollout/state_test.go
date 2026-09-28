@@ -32,6 +32,12 @@ func TestMapAndProtect(t *testing.T) {
 	if TargetState("rolled_back", "verified", required, verified) != RolledBack {
 		t.Fatal("rollback phase should win")
 	}
+	if TargetState("complete", "delivered", nil, []Control{{Kind: "filesystem", State: "staged"}}) != Delivered {
+		t.Fatal("a delivered receipt should stay delivered")
+	}
+	if TargetState("complete", "delivered", nil, []Control{{Kind: "filesystem", State: "failed"}}) != Failed {
+		t.Fatal("a failed control should beat a delivered receipt")
+	}
 	if len(ControlStates()) != 8 {
 		t.Fatal(ControlStates())
 	}

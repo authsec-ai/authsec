@@ -1,10 +1,16 @@
 // Package sign builds an ES256-signed OPA bundle and a detached manifest.
 //
 // The bundle is a gzip-compressed tar of policy.rego, data.json and
-// .signatures.json. .signatures.json follows OPA's bundle signing shape:
-// key id, scope "write", the signed file hashes, and a compact JWS whose
-// payload is the canonical file list. The signature is raw R||S, not ASN.1.
-// Controls are hashed separately and covered by the detached manifest.
+// .signatures.json. .signatures.json is OPA's format: {"signatures":["<compact
+// JWS>"]}. The JWS payload is {"files":[{"name","hash","algorithm":"SHA-256"}],
+// "keyid","scope":"write"}. JSON members are hashed the way OPA hashes them
+// (canonical object key order, not the raw bytes). Rego is hashed as raw
+// bytes. Stock OPA's verifier accepts exactly one JWT, so the bundle is signed
+// by the current key only. Rotation overlap is the detached manifest, which
+// carries one JWS per key. The signature is raw R||S, not ASN.1.
+//
+// Targets on the manifest are a workload-level override hint from quarantine,
+// emergency, and guardrail facts. They are not the per-action decision.
 //
 // Only the standard library is used. Private keys are never logged.
 package sign
@@ -26,7 +32,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"path"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -54,24 +62,32 @@ type Bundle struct {
 
 // Manifest is the detached claim over both artifact hashes.
 type Manifest struct {
-	WorkspaceID        string         `json:"workspace_id"`
-	PublicationID      string         `json:"publication_id"`
-	TargetScope        string         `json:"target_scope,omitempty"`
-	DeliveryRevision   int64          `json:"delivery_revision"`
-	PolicyRevisionHash string         `json:"policy_revision_hash"`
-	GraphRevision      int64          `json:"graph_revision"`
-	TargetDigest       string         `json:"target_digest"`
-	CapabilityDigest   string         `json:"capability_digest,omitempty"`
-	CompilerBuild      string         `json:"compiler_build"`
-	OPABundleSHA256    string         `json:"opa_bundle_sha256"`
-	ControlsSHA256     string         `json:"controls_sha256"`
-	RevocationEpoch    int64          `json:"revocation_epoch"`
-	KeyID              string         `json:"key_id"`
-	CreatedAt          string         `json:"created_at"`
-	Targets            []TargetEffect `json:"targets,omitempty"`
+	WorkspaceID        string `json:"workspace_id"`
+	PublicationID      string `json:"publication_id"`
+	TargetScope        string `json:"target_scope,omitempty"`
+	DeliveryRevision   int64  `json:"delivery_revision"`
+	PolicyRevisionHash string `json:"policy_revision_hash"`
+	GraphRevision      int64  `json:"graph_revision"`
+	TargetDigest       string `json:"target_digest"`
+	CapabilityDigest   string `json:"capability_digest,omitempty"`
+	CompilerBuild      string `json:"compiler_build"`
+	OPABundleSHA256    string `json:"opa_bundle_sha256"`
+	ControlsSHA256     string `json:"controls_sha256"`
+	RevocationEpoch    int64  `json:"revocation_epoch"`
+	KeyID              string `json:"key_id"`
+	CreatedAt          string `json:"created_at"`
+	// Mode is observe, enforce, or revoked. Revoked tells the agent to drop
+	// the policy. The bundle beside a revoked manifest is a deny-all tombstone,
+	// not the previous allow set.
+	Mode    string         `json:"mode"`
+	Revoked bool           `json:"revoked,omitempty"`
+	Targets []TargetEffect `json:"targets,omitempty"`
 }
 
-// TargetEffect is the §13.4 result baked into the manifest at publish time.
+// TargetEffect is a workload-level override hint baked in at publish time.
+// It is computed only from quarantine, emergency, and guardrail facts. It is
+// not the per-action decision and it is not rewritten on a later sync. A
+// quarantine that starts after publish is a separate unsigned marker on desired.
 type TargetEffect struct {
 	WorkloadID string `json:"workload_id"`
 	Effect     string `json:"effect"`
@@ -136,40 +152,47 @@ func (k Key) ToPublic() (PublicKey, error) {
 	return PublicKey{KeyID: k.ID, Alg: algo, PEM: pemText}, nil
 }
 
-// SignBundle writes a deterministic gzip tar. keys[0] is the current key.
-// Additional keys are the rotation overlap and each gets its own signature.
+// SignBundle writes a deterministic gzip tar. keys[0] is the only key in
+// .signatures.json. OPA's default verifier rejects more than one JWT, so
+// overlap keys are not added here. Callers that still hold a previous key
+// verify bundles that were signed when that key was current.
 func SignBundle(files []File, keys []Key) (Bundle, error) {
-	if len(keys) == 0 || keys[0].Private == nil {
+	if len(keys) == 0 || keys[0].Private == nil || keys[0].ID == "" {
 		return Bundle{}, errors.New("policy signing key is not configured")
 	}
 	sorted := append([]File(nil), files...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	seen := map[string]bool{}
 	entries := make([]fileHash, 0, len(sorted))
 	for _, f := range sorted {
-		if f.Name == ".signatures.json" {
+		name := strings.TrimPrefix(f.Name, "/")
+		if name == "" || name == ".signatures.json" || strings.Contains(name, "..") {
 			return Bundle{}, errors.New("bundle file name is reserved")
 		}
-		sum := sha256.Sum256(f.Body)
-		entries = append(entries, fileHash{Name: f.Name, Hash: hex.EncodeToString(sum[:]), Algorithm: "SHA-256"})
-	}
-	payload, err := json.Marshal(signedFiles{Files: entries})
-	if err != nil {
-		return Bundle{}, err
-	}
-	doc := signaturesDoc{Signatures: make([]signatureEntry, 0, len(keys))}
-	for _, key := range keys {
-		if key.Private == nil || key.ID == "" {
-			return Bundle{}, errors.New("policy signing key is not configured")
+		if seen[name] {
+			return Bundle{}, errors.New("bundle file name is duplicated")
 		}
-		jws, err := signJWS(key.Private, key.ID, payload)
+		seen[name] = true
+		sum, err := fileDigest(name, f.Body)
 		if err != nil {
 			return Bundle{}, err
 		}
-		doc.Signatures = append(doc.Signatures, signatureEntry{
-			KeyID: key.ID, Scope: "write", Signed: payload, Signature: jws,
-		})
+		f.Name = name
+		entries = append(entries, fileHash{Name: name, Hash: sum, Algorithm: "SHA-256"})
 	}
-	sigBody, err := json.Marshal(doc)
+	// The slice above mutated copies. Rebuild members with the trimmed names.
+	for i := range sorted {
+		sorted[i].Name = strings.TrimPrefix(sorted[i].Name, "/")
+	}
+	payload, err := json.Marshal(signedFiles{Files: entries, KeyID: keys[0].ID, Scope: "write"})
+	if err != nil {
+		return Bundle{}, err
+	}
+	jws, err := signJWS(keys[0].Private, keys[0].ID, payload)
+	if err != nil {
+		return Bundle{}, err
+	}
+	sigBody, err := json.Marshal(signaturesDoc{Signatures: []string{jws}})
 	if err != nil {
 		return Bundle{}, err
 	}
@@ -205,7 +228,9 @@ func SignBundle(files []File, keys []Key) (Bundle, error) {
 }
 
 // VerifyBundle accepts the gzip tar when one signature verifies under pubs
-// and every signed file hash matches the tar member. pubs is keyed by key id.
+// and every tar member is in that signature. An extra or duplicate member is
+// rejected. pubs is keyed by key id. JSON files are hashed in OPA's canonical
+// form. A bundle signed by a key that is not in pubs fails.
 func VerifyBundle(tarGz []byte, pubs map[string]*ecdsa.PublicKey) error {
 	files, sigBody, err := readTar(tarGz)
 	if err != nil {
@@ -217,27 +242,33 @@ func VerifyBundle(tarGz []byte, pubs map[string]*ecdsa.PublicKey) error {
 	}
 	var verified bool
 	var first error
-	for _, sig := range doc.Signatures {
-		pub := pubs[sig.KeyID]
-		if pub == nil {
-			if first == nil {
-				first = errors.New("unknown signing key")
-			}
-			continue
-		}
-		payload, err := verifyJWS(pub, sig.KeyID, sig.Signature)
+	for _, compact := range doc.Signatures {
+		kid, payload, err := openJWS(compact)
 		if err != nil {
 			if first == nil {
 				first = err
 			}
 			continue
 		}
-		if !bytes.Equal(payload, sig.Signed) {
-			return errors.New("bundle signature payload does not match the file list")
+		pub := pubs[kid]
+		if pub == nil {
+			if first == nil {
+				first = errors.New("unknown signing key")
+			}
+			continue
+		}
+		if _, err := verifyJWS(pub, kid, compact); err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
 		}
 		var signed signedFiles
 		if err := json.Unmarshal(payload, &signed); err != nil {
 			return err
+		}
+		if signed.Scope != "" && signed.Scope != "write" {
+			return errors.New("bundle signature scope is not write")
 		}
 		if err := matchFiles(files, signed.Files); err != nil {
 			return err
@@ -346,6 +377,8 @@ func SHA256Hex(body []byte) string {
 
 type signedFiles struct {
 	Files []fileHash `json:"files"`
+	KeyID string     `json:"keyid"`
+	Scope string     `json:"scope"`
 }
 
 type fileHash struct {
@@ -355,14 +388,7 @@ type fileHash struct {
 }
 
 type signaturesDoc struct {
-	Signatures []signatureEntry `json:"signatures"`
-}
-
-type signatureEntry struct {
-	KeyID     string          `json:"keyid"`
-	Scope     string          `json:"scope"`
-	Signed    json.RawMessage `json:"signed"`
-	Signature string          `json:"signature"`
+	Signatures []string `json:"signatures"`
 }
 
 func signJWS(key *ecdsa.PrivateKey, kid string, payload []byte) (string, error) {
@@ -433,17 +459,133 @@ func matchFiles(files map[string][]byte, hashes []fileHash) error {
 	if len(hashes) == 0 {
 		return errors.New("signed file list is empty")
 	}
+	signed := map[string]fileHash{}
 	for _, h := range hashes {
-		body, ok := files[h.Name]
-		if !ok {
-			return errors.New("signed file is missing from the bundle")
+		if _, dup := signed[h.Name]; dup {
+			return errors.New("signed file name is duplicated")
 		}
-		sum := sha256.Sum256(body)
-		if hex.EncodeToString(sum[:]) != h.Hash || h.Algorithm != "SHA-256" {
+		signed[h.Name] = h
+	}
+	if len(files) != len(signed) {
+		return errors.New("bundle contains a file that is not signed")
+	}
+	for name, body := range files {
+		h, ok := signed[name]
+		if !ok {
+			return errors.New("bundle contains a file that is not signed")
+		}
+		sum, err := fileDigest(name, body)
+		if err != nil || sum != h.Hash || h.Algorithm != "SHA-256" {
 			return errors.New("bundle file hash does not match the signature")
 		}
 	}
 	return nil
+}
+
+func fileDigest(name string, body []byte) (string, error) {
+	if structuredJSON(name) {
+		raw, err := hashCanonicalJSON(body)
+		if err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(raw), nil
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func structuredJSON(name string) bool {
+	base := path.Base(name)
+	return base == "data.json" || strings.HasSuffix(base, ".json")
+}
+
+// hashCanonicalJSON matches OPA's bundle file hash for structured documents:
+// objects are walked with keys in alphabetical order, arrays in order, and
+// scalars are JSON-encoded with HTML escaping off.
+func hashCanonicalJSON(body []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("bundle json has trailing data")
+	}
+	h := sha256.New()
+	if err := walkJSON(h, value); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+func walkJSON(h io.Writer, v any) error {
+	switch x := v.(type) {
+	case map[string]any:
+		if _, err := h.Write([]byte("{")); err != nil {
+			return err
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i, key := range keys {
+			if i > 0 {
+				if _, err := h.Write([]byte(",")); err != nil {
+					return err
+				}
+			}
+			enc, err := encodePrimitive(key)
+			if err != nil {
+				return err
+			}
+			if _, err := h.Write(enc); err != nil {
+				return err
+			}
+			if _, err := h.Write([]byte(":")); err != nil {
+				return err
+			}
+			if err := walkJSON(h, x[key]); err != nil {
+				return err
+			}
+		}
+		_, err := h.Write([]byte("}"))
+		return err
+	case []any:
+		if _, err := h.Write([]byte("[")); err != nil {
+			return err
+		}
+		for i, e := range x {
+			if i > 0 {
+				if _, err := h.Write([]byte(",")); err != nil {
+					return err
+				}
+			}
+			if err := walkJSON(h, e); err != nil {
+				return err
+			}
+		}
+		_, err := h.Write([]byte("]"))
+		return err
+	default:
+		enc, err := encodePrimitive(x)
+		if err != nil {
+			return err
+		}
+		_, err = h.Write(enc)
+		return err
+	}
+}
+
+func encodePrimitive(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 func readTar(tarGz []byte) (map[string][]byte, []byte, error) {
@@ -467,11 +609,15 @@ func readTar(tarGz []byte) (map[string][]byte, []byte, error) {
 		if _, err := buf.ReadFrom(tr); err != nil {
 			return nil, nil, err
 		}
-		if hdr.Name == ".signatures.json" {
+		name := strings.TrimPrefix(hdr.Name, "/")
+		if name == ".signatures.json" {
 			sig = buf.Bytes()
 			continue
 		}
-		files[hdr.Name] = buf.Bytes()
+		if _, dup := files[name]; dup {
+			return nil, nil, errors.New("bundle file name is duplicated")
+		}
+		files[name] = buf.Bytes()
 	}
 	if sig == nil {
 		return nil, nil, errors.New("bundle has no .signatures.json")

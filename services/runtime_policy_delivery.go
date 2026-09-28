@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/rollout"
 	"github.com/authsec-ai/authsec/models"
@@ -20,14 +21,20 @@ const inlineArtifactLimit = 64 << 10
 // a new table. A missing phase means complete: that publication is desired
 // immediately, which is what a 043 row inserted before A7 already means.
 type rolloutPlan struct {
-	Phase       string                  `json:"phase,omitempty"`
-	LeasedUntil string                  `json:"leased_until,omitempty"`
-	LeaseOwner  string                  `json:"lease_owner,omitempty"`
-	Canary      []string                `json:"canary_workload_ids,omitempty"`
-	Window      int                     `json:"window_seconds,omitempty"`
-	Threshold   int                     `json:"failure_threshold,omitempty"`
-	Started     string                  `json:"started_at,omitempty"`
-	Artifacts   map[string]planArtifact `json:"artifacts,omitempty"`
+	Phase       string   `json:"phase,omitempty"`
+	LeasedUntil string   `json:"leased_until,omitempty"`
+	LeaseOwner  string   `json:"lease_owner,omitempty"`
+	Canary      []string `json:"canary_workload_ids,omitempty"`
+	Window      int      `json:"window_seconds,omitempty"`
+	Threshold   int      `json:"failure_threshold,omitempty"`
+	Started     string   `json:"started_at,omitempty"`
+	// Mode is the wire mode (observe, enforce, or revoked). publications.mode
+	// stays observe|enforce; a revoke is mode "revoked" here and on the manifest.
+	Mode    string `json:"mode,omitempty"`
+	Revoked bool   `json:"revoked,omitempty"`
+	// Reason is set when a canary window ends with no receipts.
+	Reason    string                  `json:"pause_reason,omitempty"`
+	Artifacts map[string]planArtifact `json:"artifacts,omitempty"`
 }
 
 type planArtifact struct {
@@ -58,6 +65,12 @@ type desiredState struct {
 	OPABundle      desiredArtifact `json:"opa_bundle"`
 	Controls       desiredArtifact `json:"controls"`
 	SignedManifest string          `json:"signed_manifest"`
+	// Mode, Revoked, and Quarantine are additive. Quarantine is unsigned: it
+	// reflects an accepted quarantine link at sync time and does not rewrite
+	// the signed manifest.
+	Mode       string `json:"mode,omitempty"`
+	Revoked    bool   `json:"revoked,omitempty"`
+	Quarantine bool   `json:"quarantine,omitempty"`
 }
 
 // GetRollout reports per-target §15.2 state for the latest publication.
@@ -104,18 +117,7 @@ func (s *RuntimePolicyService) GetRollout(ctx context.Context, ws, policyID uuid
 	for _, row := range rows {
 		var required []string
 		_ = json.Unmarshal([]byte(row.Required), &required)
-		var reported []struct {
-			Kind  string `json:"kind"`
-			State string `json:"state"`
-		}
-		if row.Controls != "" {
-			_ = json.Unmarshal([]byte(row.Controls), &reported)
-		}
-		controls := make([]rollout.Control, 0, len(reported))
-		for _, c := range reported {
-			controls = append(controls, rollout.Control{Kind: c.Kind, State: c.State})
-		}
-		receiptState := ""
+		receiptState, controls := parseReceiptStatus(row.Controls)
 		if row.Error != "" {
 			receiptState = rollout.Failed
 		}
@@ -138,9 +140,14 @@ func (s *RuntimePolicyService) GetRollout(ctx context.Context, ws, policyID uuid
 	return http.StatusOK, out, nil
 }
 
-// ReadPolicyArtifact returns the bytes of one artifact when the collector is
-// a current target of that publication in its own workspace. Anything else
-// is not found.
+// ReadPolicyArtifact returns the bytes of one artifact when this collector's
+// current desired publication, or the publication named by its latest
+// receipt, contains that artifact. A historical target that is neither still
+// desired nor the latest receipt is not found, so a rolled-back collector can
+// still fetch the bundle it is running.
+//
+// The lookup matches the artifact id inside rollout_plan. That is an
+// unindexed jsonb scan; 048 does not add an expression index for it.
 func ReadPolicyArtifact(db *gorm.DB, ws, collector, id uuid.UUID) (body []byte, kind, sum string, err error) {
 	var rows []struct{ Plan string }
 	qerr := db.Raw(`SELECT p.rollout_plan::text AS plan
@@ -153,7 +160,35 @@ func ReadPolicyArtifact(db *gorm.DB, ws, collector, id uuid.UUID) (body []byte, 
 		    OR p.rollout_plan->'artifacts'->'controls'->>'id' = ?
 		    OR p.rollout_plan->'artifacts'->'manifest'->>'id' = ?
 		  )
-		LIMIT 1`, collector, ws, id.String(), id.String(), id.String()).Scan(&rows).Error
+		  AND (
+		    p.id = (
+		      SELECT p2.id
+		      FROM runtime_policy_targets t2
+		      JOIN runtime_policy_publications p2
+		        ON p2.workspace_id = t2.workspace_id AND p2.id = t2.publication_id
+		      WHERE t2.workspace_id = p.workspace_id AND t2.collector_id = ?
+		        AND (
+		          COALESCE(p2.rollout_plan->>'phase', 'complete') NOT IN ('canary', 'paused')
+		          OR EXISTS (
+		            SELECT 1
+		            FROM jsonb_array_elements_text(COALESCE(p2.rollout_plan->'canary_workload_ids', '[]'::jsonb)) c(wid)
+		            WHERE c.wid = t2.workload_id::text
+		          )
+		        )
+		      ORDER BY t2.desired_delivery_revision DESC
+		      LIMIT 1
+		    )
+		    OR p.id = (
+		      SELECT r.publication_id
+		      FROM runtime_policy_receipts r
+		      JOIN runtime_policy_targets t3
+		        ON t3.workspace_id = r.workspace_id AND t3.id = r.target_id
+		      WHERE r.workspace_id = p.workspace_id AND t3.collector_id = ?
+		      ORDER BY r.observed_at DESC
+		      LIMIT 1
+		    )
+		  )
+		LIMIT 1`, collector, ws, id.String(), id.String(), id.String(), collector, collector).Scan(&rows).Error
 	if qerr != nil {
 		return nil, "", "", qerr
 	}
@@ -263,7 +298,31 @@ func loadDesired(tx *gorm.DB, ws, collector uuid.UUID, inline bool) (json.RawMes
 			URL: "/api/iga/v2/policy-artifacts/" + controls.ID, SHA256: controls.SHA256,
 		},
 		SignedManifest: string(manifestRaw),
+		Mode:           plan.Mode,
+		Revoked:        plan.Revoked,
 	}
+	var quarantined []struct{ N int }
+	if err := tx.Raw(`SELECT 1 AS n FROM runtime_policy_targets t
+		WHERE t.workspace_id = ? AND t.publication_id = ? AND t.collector_id = ?
+		  AND (
+		    EXISTS (
+		      SELECT 1 FROM discovered_agent_workloads w
+		      JOIN discovered_agents a ON a.workspace_id = w.workspace_id AND a.id = w.discovered_agent_id
+		      WHERE w.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
+		        AND w.link_state = 'accepted' AND a.status = 'quarantined'
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM agent_policies p
+		      JOIN discovered_agent_workloads w
+		        ON w.workspace_id = p.workspace_id AND w.discovered_agent_id = p.discovered_agent_id
+		      WHERE p.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
+		        AND p.enabled AND p.desired_state = 'quarantined' AND w.link_state = 'accepted'
+		    )
+		  )
+		LIMIT 1`, ws, chosen.PubID, collector).Scan(&quarantined).Error; err != nil {
+		return nil, err
+	}
+	doc.Quarantine = len(quarantined) == 1
 	if putBody {
 		doc.OPABundle.Body = bundle.Body
 		doc.Controls.Body = controls.Body
@@ -330,13 +389,20 @@ func recordReceipts(tx *gorm.DB, p *models.CollectorPrincipal, req *collectorcon
 		if err != nil {
 			return err
 		}
-		controls, _ := json.Marshal(ap.Controls)
-		hashes := make([]string, 0, len(ap.Controls))
+		reported := ap.Controls
+		if reported == nil {
+			reported = []collectorcontract.ControlReceipt{}
+		}
+		statusRaw, _ := json.Marshal(struct {
+			ReceiptState string                             `json:"receipt_state"`
+			Controls     []collectorcontract.ControlReceipt `json:"controls"`
+		}{ReceiptState: ap.State, Controls: reported})
+		hashes := make([]string, 0, len(reported))
 		errText := ""
 		if rollout.MapControlState(ap.State) == rollout.Failed {
 			errText = ap.State
 		}
-		for _, c := range ap.Controls {
+		for _, c := range reported {
 			if c.ArtifactSHA256 != "" {
 				hashes = append(hashes, c.ArtifactSHA256)
 			}
@@ -347,14 +413,67 @@ func recordReceipts(tx *gorm.DB, p *models.CollectorPrincipal, req *collectorcon
 		hashJSON, _ := json.Marshal(hashes)
 		observed := ap.ObservedAt
 		for _, t := range targets {
+			// Skip when the latest receipt for this target and revision already
+			// has the same generation, state, and controls. Receipts are
+			// append-only, so an unchanged sync must not insert another row.
 			if err := tx.Exec(`INSERT INTO runtime_policy_receipts
 				(id, workspace_id, target_id, publication_id, policy_id, delivery_revision, runtime_generation, control_status, artifact_hashes, error, observed_at, graph_revision)
-				VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), CAST(? AS jsonb), ?, COALESCE(NULLIF(?, '')::timestamptz, now()), ?)`,
+				SELECT ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), CAST(? AS jsonb), ?, COALESCE(NULLIF(?, '')::timestamptz, now()), ?
+				WHERE NOT EXISTS (
+					SELECT 1 FROM (
+						SELECT runtime_generation, control_status
+						FROM runtime_policy_receipts
+						WHERE workspace_id = ? AND target_id = ? AND delivery_revision = ?
+						ORDER BY observed_at DESC
+						LIMIT 1
+					) latest
+					WHERE latest.runtime_generation = ?
+					  AND latest.control_status = CAST(? AS jsonb)
+				)`,
 				uuid.New(), p.WorkspaceID, t.ID, t.PubID, t.PolicyID, ap.DeliveryRevision, ap.RuntimeGeneration,
-				string(controls), string(hashJSON), errText, observed, t.Graph).Error; err != nil {
+				string(statusRaw), string(hashJSON), errText, observed, t.Graph,
+				p.WorkspaceID, t.ID, ap.DeliveryRevision, ap.RuntimeGeneration, string(statusRaw),
+			).Error; err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// parseReceiptStatus reads the wrapper written by recordReceipts, or a legacy
+// control array from a receipt stored before that wrapper.
+func parseReceiptStatus(raw string) (string, []rollout.Control) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return "", nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		var wrap struct {
+			ReceiptState string `json:"receipt_state"`
+			Controls     []struct {
+				Kind  string `json:"kind"`
+				State string `json:"state"`
+			} `json:"controls"`
+		}
+		if json.Unmarshal([]byte(raw), &wrap) == nil {
+			controls := make([]rollout.Control, 0, len(wrap.Controls))
+			for _, c := range wrap.Controls {
+				controls = append(controls, rollout.Control{Kind: c.Kind, State: c.State})
+			}
+			return wrap.ReceiptState, controls
+		}
+	}
+	var reported []struct {
+		Kind  string `json:"kind"`
+		State string `json:"state"`
+	}
+	if json.Unmarshal([]byte(raw), &reported) != nil {
+		return "", nil
+	}
+	controls := make([]rollout.Control, 0, len(reported))
+	for _, c := range reported {
+		controls = append(controls, rollout.Control{Kind: c.Kind, State: c.State})
+	}
+	return "", controls
 }

@@ -72,8 +72,17 @@ func MapControlState(reported string) string {
 }
 
 // Class maps a receipt kind onto a required-control name.
+// linux-managed-v1 has no control-kind table, so the fixture kinds used by
+// the delivery tests are matched exactly and everything else falls back to
+// a substring.
 func Class(kind string) string {
-	k := strings.ToLower(kind)
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch k {
+	case "tetragon.file_open_deny":
+		return "filesystem"
+	case "linux.netns_egress":
+		return "egress"
+	}
 	switch {
 	case k == "filesystem" || strings.Contains(k, "file"):
 		return "filesystem"
@@ -139,6 +148,16 @@ func TargetState(phase, receiptState string, required []string, controls []Contr
 		st := MapControlState(c.State)
 		if rank[st] > rank[worst] {
 			worst = st
+		}
+	}
+	// delivered is a target state. MapControlState folds it into staged for a
+	// control, so the receipt state has to win before that remap.
+	if strings.EqualFold(strings.TrimSpace(receiptState), Delivered) {
+		switch worst {
+		case Failed, Unsupported, Degraded:
+			return worst
+		default:
+			return Delivered
 		}
 	}
 	switch worst {

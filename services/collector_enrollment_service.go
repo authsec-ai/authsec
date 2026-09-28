@@ -624,19 +624,22 @@ func (s *CollectorEnrollmentService) Revoke(workspaceID, id uuid.UUID, expectedV
 
 // CollectorView is the human (and collector) read model. It has no credential material.
 type CollectorView struct {
-	ID                uuid.UUID       `json:"id"`
-	Kind              string          `json:"kind"`
-	Status            string          `json:"status"`
-	RowVersion        int64           `json:"row_version"`
-	AgentVersion      string          `json:"agent_version"`
-	Health            CollectorHealth `json:"health"`
-	Capabilities      json.RawMessage `json:"capabilities"`
-	Coverage          []CoverageFact  `json:"coverage"`
-	DesiredRevision   *int64          `json:"desired_revision"`
-	AppliedRevision   *int64          `json:"applied_revision"`
-	DiscoverySourceID uuid.UUID       `json:"discovery_source_id"`
-	IntegrationID     uuid.UUID       `json:"integration_id"`
-	EstateID          uuid.UUID       `json:"estate_id"`
+	ID              uuid.UUID       `json:"id"`
+	Kind            string          `json:"kind"`
+	Status          string          `json:"status"`
+	RowVersion      int64           `json:"row_version"`
+	AgentVersion    string          `json:"agent_version"`
+	Health          CollectorHealth `json:"health"`
+	Capabilities    json.RawMessage `json:"capabilities"`
+	Coverage        []CoverageFact  `json:"coverage"`
+	DesiredRevision *int64          `json:"desired_revision"`
+	// AppliedRevision is the highest delivery revision whose latest receipt
+	// for that target is not failed. A failed latest receipt does not count.
+	// U1b should treat a missing value as nothing applied.
+	AppliedRevision   *int64    `json:"applied_revision"`
+	DiscoverySourceID uuid.UUID `json:"discovery_source_id"`
+	IntegrationID     uuid.UUID `json:"integration_id"`
+	EstateID          uuid.UUID `json:"estate_id"`
 }
 
 // CollectorHealth is liveness, not a credential.
@@ -679,16 +682,22 @@ func (s *CollectorEnrollmentService) view(inst *models.CollectorInstance) (*Coll
 	if len(caps) == 0 {
 		caps = json.RawMessage(`{}`)
 	}
+	view := s.viewBody(inst, caps, coverage)
 	desired, applied := s.deliveryRevisions(inst.WorkspaceID, inst.ID)
+	view.DesiredRevision = desired
+	view.AppliedRevision = applied
+	return view, nil
+}
+
+func (s *CollectorEnrollmentService) viewBody(inst *models.CollectorInstance, caps json.RawMessage, coverage []CoverageFact) *CollectorView {
 	return &CollectorView{
 		ID: inst.ID, Kind: inst.Kind, Status: inst.Status, RowVersion: inst.RowVersion,
 		AgentVersion: inst.Version,
 		Health:       CollectorHealth{Status: inst.Status, LastSeenAt: inst.LastSeenAt},
 		Capabilities: caps, Coverage: coverage,
-		DesiredRevision: desired, AppliedRevision: applied,
 		DiscoverySourceID: inst.DiscoverySourceID, IntegrationID: inst.IntegrationID,
 		EstateID: inst.EstateScopeID,
-	}, nil
+	}
 }
 
 // CollectorListFilter is the workspace-scoped collector list.
@@ -721,15 +730,15 @@ func (s *CollectorEnrollmentService) List(ws uuid.UUID, f CollectorListFilter) (
 		args = append(args, f.Status)
 	}
 	if f.EstateID != "" {
-		q += ` AND estate_scope_id = ?`
+		q += ` AND estate_scope_id = ?::uuid`
 		args = append(args, f.EstateID)
 	}
 	if f.IntegrationID != "" {
-		q += ` AND integration_id = ?`
+		q += ` AND integration_id = ?::uuid`
 		args = append(args, f.IntegrationID)
 	}
 	if f.Cursor != "" {
-		q += ` AND id > ?`
+		q += ` AND id > ?::uuid`
 		args = append(args, f.Cursor)
 	}
 	q += ` ORDER BY id LIMIT ?`
@@ -743,14 +752,34 @@ func (s *CollectorEnrollmentService) List(ws uuid.UUID, f CollectorListFilter) (
 		next = ids[limit-1].String()
 		ids = ids[:limit]
 	}
+	// The view body is still one read per row. Desired and applied revisions
+	// are filled by one batch below.
 	out := make([]CollectorView, 0, len(ids))
 	for _, id := range ids {
-		view, err := s.Get(ws, id)
+		inst, err := s.repo.GetInstance(ws, id)
+		if err != nil {
+			if errors.Is(err, repositories.ErrCollectorNotFound) {
+				return nil, "", ErrCollectorNotFound
+			}
+			return nil, "", err
+		}
+		var coverage []CoverageFact
+		err = s.db.Raw(`SELECT object_class, state, reason_code FROM iga_coverage_states
+			WHERE workspace_id = ? AND integration_id = ? ORDER BY object_class`,
+			inst.WorkspaceID, inst.IntegrationID).Scan(&coverage).Error
 		if err != nil {
 			return nil, "", err
 		}
-		out = append(out, *view)
+		if coverage == nil {
+			coverage = []CoverageFact{}
+		}
+		caps := inst.ApprovedScope
+		if len(caps) == 0 {
+			caps = json.RawMessage(`{}`)
+		}
+		out = append(out, *s.viewBody(inst, caps, coverage))
 	}
+	s.attachDeliveryRevisions(ws, out)
 	return out, next, nil
 }
 
@@ -761,13 +790,70 @@ func (s *CollectorEnrollmentService) deliveryRevisions(ws, id uuid.UUID) (desire
 		desired = d[0].V
 	}
 	var a []struct{ V *int64 }
-	if err := s.db.Raw(`SELECT MAX(r.delivery_revision) AS v
-		FROM runtime_policy_receipts r
-		JOIN runtime_policy_targets t ON t.workspace_id = r.workspace_id AND t.id = r.target_id
-		WHERE r.workspace_id = ? AND t.collector_id = ?`, ws, id).Scan(&a).Error; err == nil && len(a) == 1 {
+	if err := s.db.Raw(`SELECT MAX(latest.delivery_revision) AS v
+		FROM (
+			SELECT DISTINCT ON (r.target_id) r.delivery_revision, r.error, r.control_status::text AS status
+			FROM runtime_policy_receipts r
+			JOIN runtime_policy_targets t ON t.workspace_id = r.workspace_id AND t.id = r.target_id
+			WHERE r.workspace_id = ? AND t.collector_id = ?
+			ORDER BY r.target_id, r.observed_at DESC
+		) latest
+		WHERE latest.error = '' AND latest.status NOT LIKE '%"failed"%'`, ws, id).Scan(&a).Error; err == nil && len(a) == 1 {
 		applied = a[0].V
 	}
 	return desired, applied
+}
+
+func (s *CollectorEnrollmentService) attachDeliveryRevisions(ws uuid.UUID, views []CollectorView) {
+	if len(views) == 0 {
+		return
+	}
+	ids := make([]string, len(views))
+	for i, view := range views {
+		ids[i] = view.ID.String()
+	}
+	lit := pgUUIDArray(ids)
+	var desired []struct {
+		ID uuid.UUID
+		V  *int64
+	}
+	if err := s.db.Raw(`SELECT collector_id AS id, MAX(desired_delivery_revision) AS v
+		FROM runtime_policy_targets
+		WHERE workspace_id = ? AND collector_id = ANY(?::uuid[])
+		GROUP BY collector_id`, ws, lit).Scan(&desired).Error; err != nil {
+		return
+	}
+	var applied []struct {
+		ID uuid.UUID
+		V  *int64
+	}
+	if err := s.db.Raw(`SELECT collector_id AS id, MAX(delivery_revision) AS v
+		FROM (
+			SELECT DISTINCT ON (t.collector_id, r.target_id)
+				t.collector_id, r.delivery_revision, r.error, r.control_status::text AS status
+			FROM runtime_policy_receipts r
+			JOIN runtime_policy_targets t ON t.workspace_id = r.workspace_id AND t.id = r.target_id
+			WHERE r.workspace_id = ? AND t.collector_id = ANY(?::uuid[])
+			ORDER BY t.collector_id, r.target_id, r.observed_at DESC
+		) latest
+		WHERE error = '' AND status NOT LIKE '%"failed"%'
+		GROUP BY collector_id`, ws, lit).Scan(&applied).Error; err != nil {
+		return
+	}
+	byID := map[uuid.UUID]int{}
+	for i := range views {
+		byID[views[i].ID] = i
+	}
+	for _, row := range desired {
+		if i, ok := byID[row.ID]; ok {
+			views[i].DesiredRevision = row.V
+		}
+	}
+	for _, row := range applied {
+		if i, ok := byID[row.ID]; ok {
+			views[i].AppliedRevision = row.V
+		}
+	}
 }
 
 // ReadArtifact returns a signed artifact for a collector that is a current target.

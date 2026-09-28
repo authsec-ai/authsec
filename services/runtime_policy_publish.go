@@ -260,6 +260,13 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 	if req.epochOverride != nil {
 		epoch = *req.epochOverride
 	}
+	wireMode := req.Mode
+	revoked := req.phaseOverride == "revoked"
+	if revoked {
+		// publications.mode is constrained to observe|enforce. The wire mode
+		// is revoked; the column stays observe.
+		wireMode = "revoked"
+	}
 	effects := make([]sign.TargetEffect, 0, len(targets))
 	seenWorkload := map[string]bool{}
 	for _, t := range targets {
@@ -267,9 +274,12 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 			continue
 		}
 		seenWorkload[t.WorkloadID.String()] = true
-		facts, err := loadPrecedence(tx, actor.WorkspaceID, t.WorkloadID.String(), doc, s.clock())
+		facts, err := loadOverrideFacts(tx, actor.WorkspaceID, t.WorkloadID.String())
 		if err != nil {
 			return 0, nil, err
+		}
+		if len(facts) == 0 {
+			continue
 		}
 		outcome := precedence.Resolve(s.clock(), facts)
 		effects = append(effects, sign.TargetEffect{WorkloadID: t.WorkloadID.String(), Effect: outcome.Effect, Source: outcome.Source})
@@ -279,28 +289,28 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 	if err != nil {
 		return 0, nil, err
 	}
+	regoBody := []byte(result.Rego)
+	if revoked {
+		// Tombstone. Agents that ignore the revoked flag still fail closed.
+		regoBody = []byte("package authsec.runtime\n\ndefault allow := false\n")
+		dataRaw = []byte(`{"revoked":true}`)
+	}
 	bundle, err := sign.SignBundle([]sign.File{
-		{Name: "policy.rego", Body: []byte(result.Rego)},
+		{Name: "policy.rego", Body: regoBody},
 		{Name: "data.json", Body: dataRaw},
 	}, keys.SigningKeys())
 	if err != nil {
 		return 0, nil, statusErr(http.StatusServiceUnavailable, "signing_unavailable", "policy signing key could not be parsed")
 	}
 	controlsHash := sign.SHA256Hex(result.Controls)
-	digest := ""
-	for _, t := range targets {
-		if digest == "" || t.Digest < digest {
-			digest = t.Digest
-		}
-	}
 	manifest := sign.Manifest{
 		WorkspaceID: actor.WorkspaceID.String(), PublicationID: pubID.String(),
 		DeliveryRevision: delivery, PolicyRevisionHash: cur.ContentHash,
 		GraphRevision: cur.GraphRevision, TargetDigest: result.TargetDigest,
-		CapabilityDigest: digest, CompilerBuild: opa.Version,
+		CompilerBuild:   opa.Version,
 		OPABundleSHA256: bundle.SHA256, ControlsSHA256: controlsHash,
 		KeyID: keys.Current.ID, CreatedAt: s.clock().Format(time.RFC3339),
-		Targets: effects,
+		Mode: wireMode, Revoked: revoked, Targets: effects,
 	}
 	signed, manifestHash, err := sign.SignManifest(manifest, keys.SigningKeys())
 	if err != nil {
@@ -316,7 +326,8 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 		superseded = &previous[0]
 	}
 	planDoc := rolloutPlan{
-		Phase: phase, Canary: req.CanaryWorkloadIDs, Window: req.WindowSeconds,
+		Phase: phase, Mode: wireMode, Revoked: revoked,
+		Canary: req.CanaryWorkloadIDs, Window: req.WindowSeconds,
 		Threshold: req.FailureThreshold, Started: s.clock().Format(time.RFC3339),
 		Artifacts: map[string]planArtifact{
 			"opa_bundle": {ID: uuid.NewString(), SHA256: bundle.SHA256, Body: base64.StdEncoding.EncodeToString(bundle.Bytes)},
@@ -371,7 +382,7 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 		"etag": etag(cur.Revision, cur.ContentHash),
 		"data": map[string]any{
 			"policy_id": policyID, "publication_id": pubID, "revision": cur.Revision,
-			"delivery_revision": delivery, "mode": req.Mode, "rollout_phase": phase,
+			"delivery_revision": delivery, "mode": wireMode, "rollout_phase": phase,
 			"content_hash": cur.ContentHash, "target_digest": result.TargetDigest,
 			"semantic_report": report,
 		},
@@ -476,7 +487,10 @@ func resolvePublicationTargets(tx *gorm.DB, ws uuid.UUID, result *compile.Result
 	return out, nil
 }
 
-func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Document, now time.Time) ([]precedence.Fact, error) {
+// loadOverrideFacts is the publish-time workload hint: quarantine, an
+// emergency deny, and enabled guardrails. Policy rules are not included.
+// An empty result means "no override", not default deny.
+func loadOverrideFacts(tx *gorm.DB, ws uuid.UUID, workloadID string) ([]precedence.Fact, error) {
 	var facts []precedence.Fact
 	var quarantined []struct{ N int }
 	if err := tx.Raw(`SELECT 1 AS n FROM discovered_agent_workloads w
@@ -499,6 +513,14 @@ func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Do
 	}
 	if len(guard) == 1 {
 		facts = append(facts, precedence.Fact{Source: precedence.SourceGuardrail, Effect: "deny"})
+	}
+	return facts, nil
+}
+
+func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Document, now time.Time) ([]precedence.Fact, error) {
+	facts, err := loadOverrideFacts(tx, ws, workloadID)
+	if err != nil {
+		return nil, err
 	}
 	var agents []string
 	if err := tx.Raw(`SELECT discovered_agent_id::text FROM discovered_agent_workloads

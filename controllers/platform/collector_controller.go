@@ -303,9 +303,30 @@ func (ctl *CollectorController) List(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_parameter"})
 		return
 	}
+	estateID := c.Query("estate_id")
+	if estateID != "" {
+		if _, err := uuid.Parse(estateID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_filter"})
+			return
+		}
+	}
+	integrationID := c.Query("integration_id")
+	if integrationID != "" {
+		if _, err := uuid.Parse(integrationID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_filter"})
+			return
+		}
+	}
+	cursor := c.Query("cursor")
+	if cursor != "" {
+		if _, err := uuid.Parse(cursor); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_cursor"})
+			return
+		}
+	}
 	views, next, err := ctl.svc.List(ws, services.CollectorListFilter{
-		Kind: kind, Status: status, EstateID: c.Query("estate_id"),
-		IntegrationID: c.Query("integration_id"), Cursor: c.Query("cursor"), Limit: limit,
+		Kind: kind, Status: status, EstateID: estateID,
+		IntegrationID: integrationID, Cursor: cursor, Limit: limit,
 	})
 	if err != nil {
 		writeCollectorErr(c, err)

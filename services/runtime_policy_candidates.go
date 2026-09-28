@@ -241,8 +241,8 @@ func loadCandidateInput(tx *gorm.DB, ws uuid.UUID, workloads []string, graph int
 		FROM iga_observed_access o
 		JOIN iga_resources res ON res.workspace_id = o.workspace_id AND res.id = o.resource_id
 		LEFT JOIN iga_runtime_instances ri ON ri.workspace_id = o.workspace_id AND ri.id = o.runtime_instance_id
-		WHERE o.workspace_id = ? AND o.workload_id::text IN ? AND o.observed_at >= ? AND o.observed_at <= ?`,
-		ws, workloads, start, end).Scan(&obs).Error
+		WHERE o.workspace_id = ? AND o.workload_id = ANY(?::uuid[]) AND o.observed_at >= ? AND o.observed_at <= ?`,
+		ws, pgUUIDArray(workloads), start, end).Scan(&obs).Error
 	if err != nil {
 		return in, err
 	}
@@ -284,8 +284,8 @@ func loadCandidateInput(tx *gorm.DB, ws uuid.UUID, workloads []string, graph int
 		COALESCE(res.native_kind, '') AS native_kind, COALESCE(res.kind_metadata::text, '{}') AS meta
 		FROM iga_workload_resource_bindings b
 		JOIN iga_resources res ON res.workspace_id = b.workspace_id AND res.id = b.resource_id
-		WHERE b.workspace_id = ? AND b.workload_id::text IN ? AND b.state = 'current'`,
-		ws, workloads).Scan(&deps).Error; err != nil {
+		WHERE b.workspace_id = ? AND b.workload_id = ANY(?::uuid[]) AND b.state = 'current'`,
+		ws, pgUUIDArray(workloads)).Scan(&deps).Error; err != nil {
 		return in, err
 	}
 	for _, row := range deps {

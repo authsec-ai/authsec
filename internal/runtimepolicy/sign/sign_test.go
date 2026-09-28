@@ -33,15 +33,20 @@ func TestSignVerifyRotationAndTamper(t *testing.T) {
 		t.Fatal("tampered bundle verified")
 	}
 
-	both, err := SignBundle(files, []Key{newKey, oldKey})
+	// The bundle carries one JWT (OPA rejects more). A bundle signed while the
+	// previous key was current still verifies under that key.
+	previous, err := SignBundle(files, []Key{oldKey})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyBundle(both.Bytes, pubs(oldKey)); err != nil {
-		t.Fatalf("overlap rejected the previous key: %v", err)
+	if err := VerifyBundle(previous.Bytes, pubs(oldKey)); err != nil {
+		t.Fatalf("previous key rejected its own bundle: %v", err)
 	}
-	if err := VerifyBundle(both.Bytes, pubs(newKey)); err != nil {
-		t.Fatalf("overlap rejected the current key: %v", err)
+	if err := VerifyBundle(previous.Bytes, pubs(newKey)); err == nil {
+		t.Fatal("current key verified a bundle signed only by the previous key")
+	}
+	if err := VerifyBundle(single.Bytes, pubs(newKey)); err != nil {
+		t.Fatalf("current key rejected its own bundle: %v", err)
 	}
 
 	m := Manifest{

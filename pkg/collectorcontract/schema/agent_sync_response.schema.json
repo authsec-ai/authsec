@@ -31,7 +31,10 @@
         "policy_format": { "const": "authsec.runtime.v1" },
         "opa_bundle": { "$ref": "#/$defs/artifact" },
         "controls": { "$ref": "#/$defs/artifact" },
-        "signed_manifest": { "type": "string" }
+        "signed_manifest": { "type": "string" },
+        "mode": { "type": "string" },
+        "revoked": { "type": "boolean" },
+        "quarantine": { "type": "boolean" }
       }
     },
     "artifact": {

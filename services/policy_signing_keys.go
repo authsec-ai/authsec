@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/sign"
@@ -44,11 +45,65 @@ func (s PolicyKeySet) SigningKeys() []sign.Key {
 	return out
 }
 
+// policyKeyCacheTTL bounds how often a Vault path is read. The cache key is
+// the env paths and ids, never the PEM bytes. Tests that point
+// IGA_POLICY_SIGNING_KEY_PEM at a fresh directory do not share a stale miss.
+const policyKeyCacheTTL = 60 * time.Second
+
+type policyKeyCacheEntry struct {
+	mu  sync.Mutex
+	key string
+	at  time.Time
+	set PolicyKeySet
+	err error
+}
+
+var loadedPolicyKeys policyKeyCacheEntry
+
 // LoadPolicyKeys reads the current signing key. A missing key is
 // "policy signing key is not configured". A present key that does not parse
 // is "policy signing key could not be parsed". Neither error includes key
 // bytes or the path.
+//
+// The previous key is file-only and must be a private PEM. During overlap the
+// detached manifest is dual-signed, so a public PEM is not enough. The bundle
+// itself carries one JWT, the current key, because stock OPA rejects a
+// signatures file with more than one. Vault (IGA_POLICY_SIGNING_VAULT_PATH)
+// supplies only the current key. Parsed keys are cached in process for
+// policyKeyCacheTTL and are never logged.
 func LoadPolicyKeys(now time.Time) (PolicyKeySet, error) {
+	key := policyKeyCacheKey(now)
+	loadedPolicyKeys.mu.Lock()
+	defer loadedPolicyKeys.mu.Unlock()
+	if loadedPolicyKeys.key == key && !loadedPolicyKeys.at.IsZero() && time.Since(loadedPolicyKeys.at) < policyKeyCacheTTL {
+		return loadedPolicyKeys.set, loadedPolicyKeys.err
+	}
+	set, err := loadPolicyKeys(now)
+	loadedPolicyKeys.key = key
+	loadedPolicyKeys.at = time.Now()
+	loadedPolicyKeys.set = set
+	loadedPolicyKeys.err = err
+	return set, err
+}
+
+func policyKeyCacheKey(now time.Time) string {
+	open := "0"
+	if overlapOpen(now) {
+		open = "1"
+	}
+	return strings.Join([]string{
+		os.Getenv(EnvPolicySigningKeyPEM),
+		os.Getenv(EnvPolicySigningKeyID),
+		os.Getenv(EnvPolicySigningPreviousKeyPEM),
+		os.Getenv(EnvPolicySigningPreviousKeyID),
+		os.Getenv(EnvPolicySigningOverlapUntil),
+		os.Getenv(EnvPolicySigningVaultPath),
+		os.Getenv("VAULT_ADDR"),
+		open,
+	}, "\x00")
+}
+
+func loadPolicyKeys(now time.Time) (PolicyKeySet, error) {
 	current, err := loadOneKey(EnvPolicySigningKeyPEM, EnvPolicySigningKeyID, "current", true)
 	if err != nil {
 		return PolicyKeySet{}, err
