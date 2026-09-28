@@ -19,6 +19,7 @@ const (
 	EnvLegacyIngressRatePerMin = "IGA_LEGACY_INGRESS_RATE_PER_MIN"
 	EnvLegacyIngressMaxBody    = "IGA_LEGACY_INGRESS_MAX_BODY"
 	EnvTrustedProxies          = "IGA_TRUSTED_PROXIES"
+	EnvV2ITDR                  = "IGA_V2_ITDR"
 )
 
 // DefaultLegacyIngressMaxBody is the legacy discovery body cap when
@@ -50,6 +51,10 @@ func V2PolicyEnabled() bool { return FlagOn(EnvV2Policy) }
 // V2EnforceEnabled gates publication mode=enforce. Observe delivery works
 // with only IGA_V2_POLICY. Enforce stays off until this flag is set.
 func V2EnforceEnabled() bool { return FlagOn(EnvV2Enforce) }
+
+// V2ITDREnabled is the gate in front of /api/iga/v2/itdr routes.
+// When it is off those routes are not registered, and no ITDR processing runs.
+func V2ITDREnabled() bool { return FlagOn(EnvV2ITDR) }
 
 // LegacyIngressGloballyDisabled is the process-wide kill switch. A workspace
 // can also disable its own ingress without this flag.

@@ -1427,6 +1427,7 @@ func SetupRoutes(
 		collectorCtl := NewCollectorController(config.DB)
 		MountCollectorV2(r, config.DB, collectorCtl, middlewares.AuthMiddleware())
 		MountRuntimePolicy(r, config.DB, middlewares.AuthMiddleware())
+		MountITDR(r, config.DB, middlewares.AuthMiddleware())
 
 		// Connector ingress is UNAUTHENTICATED by deliberate choice.
 		//
