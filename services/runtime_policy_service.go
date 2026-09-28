@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/compile"
+	"github.com/authsec-ai/authsec/internal/runtimepolicy/opa"
 	"github.com/authsec-ai/authsec/internal/runtimepolicy/profiles"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
@@ -41,22 +42,50 @@ func statusErr(status int, code, msg string) *StatusError {
 	return &StatusError{Status: status, Code: code, Message: msg}
 }
 
-// RuntimePolicyService is the M5 admin API. Publications, simulation and
-// rollout stay unimplemented for the later delivery package.
+// RuntimePolicyService is the M5 admin API: drafts, simulation, signed
+// publication and rollout. Production uses the certified profile registry.
+// Tests that must accept a test-only digest use NewRuntimePolicyServiceWithRegistry
+// with Registry.WithTestDigests. Production must not.
 type RuntimePolicyService struct {
 	db   *gorm.DB
 	reg  *profiles.Registry
 	lock time.Duration
+	eval opa.Evaluator
+	now  func() time.Time
 }
 
-// NewRuntimePolicyService builds the service. A nil registry falls back to the
-// embedded certified profiles.
+// NewRuntimePolicyService builds the service from the certified profiles.
+// Test-only digests are not loaded.
 func NewRuntimePolicyService(db *gorm.DB) *RuntimePolicyService {
 	reg, err := profiles.Load()
 	if err != nil {
 		reg = &profiles.Registry{}
 	}
-	return &RuntimePolicyService{db: db, reg: reg, lock: ClassificationLockTimeout}
+	return NewRuntimePolicyServiceWithRegistry(db, reg)
+}
+
+// NewRuntimePolicyServiceWithRegistry builds the service with an explicit
+// profile registry. Production passes the result of profiles.Load, which
+// ignores test-only digests.
+func NewRuntimePolicyServiceWithRegistry(db *gorm.DB, reg *profiles.Registry) *RuntimePolicyService {
+	if reg == nil {
+		reg = &profiles.Registry{}
+	}
+	return &RuntimePolicyService{db: db, reg: reg, lock: ClassificationLockTimeout, eval: opa.NewEngine(), now: time.Now}
+}
+
+func (s *RuntimePolicyService) clock() time.Time {
+	if s == nil || s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
+
+func (s *RuntimePolicyService) engine() opa.Evaluator {
+	if s == nil || s.eval == nil {
+		return opa.NewEngine()
+	}
+	return s.eval
 }
 
 type policyHead struct {

@@ -12,6 +12,7 @@ import (
 const (
 	EnvV2Ingest                = "IGA_V2_INGEST"
 	EnvV2Policy                = "IGA_V2_POLICY"
+	EnvV2Enforce               = "IGA_V2_ENFORCE"
 	EnvLegacyIngressDisabled   = "IGA_LEGACY_INGRESS_DISABLED"
 	EnvNextSyncSeconds         = "IGA_V2_NEXT_SYNC_SECONDS"
 	EnvCollectorResponseKey    = "IGA_COLLECTOR_RESPONSE_KEY"
@@ -42,7 +43,13 @@ func V2IngestEnabled() bool { return FlagOn(EnvV2Ingest) }
 // V2PolicyEnabled is the gate in front of /api/iga/v2/runtime-policies.
 // When it is off those routes are not registered and nothing is evaluated.
 // Existing agent_policies and enforcement_plans behaviour does not change.
+// Collector sync also skips desired state and receipt writes, so the response
+// stays byte-identical to the pre-delivery receipt.
 func V2PolicyEnabled() bool { return FlagOn(EnvV2Policy) }
+
+// V2EnforceEnabled gates publication mode=enforce. Observe delivery works
+// with only IGA_V2_POLICY. Enforce stays off until this flag is set.
+func V2EnforceEnabled() bool { return FlagOn(EnvV2Enforce) }
 
 // LegacyIngressGloballyDisabled is the process-wide kill switch. A workspace
 // can also disable its own ingress without this flag.

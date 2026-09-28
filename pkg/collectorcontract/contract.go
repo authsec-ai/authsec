@@ -9,7 +9,9 @@ const (
 	// SchemaVersion is the only schema this server accepts.
 	SchemaVersion = "2.0"
 	// PackageVersion is the pin agents record. It is not the wire schema string.
-	PackageVersion = "2.0.0"
+	// 2.1.0 adds an optional artifact body for include_policy=inline.
+	// SchemaVersion stays 2.0.
+	PackageVersion = "2.1.0"
 	// DecompressedMaxBytes is the 2 MiB uncompressed cap from §11.1.
 	DecompressedMaxBytes = 2 << 20
 	// CompressedMaxBytes is the cap on a gzip body before it is inflated.

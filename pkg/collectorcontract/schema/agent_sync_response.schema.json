@@ -41,7 +41,8 @@
       "properties": {
         "url": { "type": "string" },
         "sha256": { "type": "string" },
-        "rego_version": { "type": "string" }
+        "rego_version": { "type": "string" },
+        "body": { "type": "string" }
       }
     }
   }

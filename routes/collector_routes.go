@@ -49,6 +49,7 @@ func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorCon
 	admin := v2.Group("")
 	admin.Use(humanAuth, middlewares.CollectorRateLimit(collectorRatePerMin, time.Minute), middlewares.LimitBody(collectorBodyLimit))
 	admin.POST("/collector-enrollments", middlewares.Require("discovery", "admin"), ctl.CreateEnrollment)
+	admin.GET("/collectors", middlewares.Require("discovery", "read"), ctl.List)
 	admin.POST("/collectors/:id/revoke", middlewares.Require("discovery", "admin"), ctl.Revoke)
 	admin.POST("/collectors/:id/epoch", middlewares.Require("discovery", "admin"), syncCtl.AuthorizeEpoch)
 	admin.GET("/collectors/:id", middlewares.Require("discovery", "read"), ctl.Get)
@@ -71,6 +72,8 @@ func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorCon
 	)
 	machine.POST("/collectors/self/credentials/rotate", ctl.Rotate)
 	machine.GET("/collectors/self", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), ctl.GetSelf)
+	machine.GET("/policy-keys", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), ctl.PolicyKeys)
+	machine.GET("/policy-artifacts/:id", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), ctl.PolicyArtifact)
 	machine.GET("/receipts/:id", middlewares.RequireCollectorScope(models.CollectorScopeReceiptWrite), syncCtl.GetReceipt)
 
 	// Sync is on its own group so the body cap is the 2 MiB decompressed limit,

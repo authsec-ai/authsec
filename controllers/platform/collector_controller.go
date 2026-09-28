@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/authsec-ai/authsec/middlewares"
@@ -275,6 +276,84 @@ func (ctl *CollectorController) GetSelf(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, view)
+}
+
+// List handles GET /api/iga/v2/collectors. discovery:read. No credential material.
+func (ctl *CollectorController) List(c *gin.Context) {
+	ws, ok := ctl.workspace(c)
+	if !ok {
+		return
+	}
+	limit := 0
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_parameter"})
+			return
+		}
+		limit = n
+	}
+	kind := c.Query("kind")
+	if kind != "" && kind != "linux_collector" && kind != "k8s_collector" && kind != "node_sensor" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_parameter"})
+		return
+	}
+	status := c.Query("status")
+	if status != "" && status != "active" && status != "revoked" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_parameter"})
+		return
+	}
+	views, next, err := ctl.svc.List(ws, services.CollectorListFilter{
+		Kind: kind, Status: status, EstateID: c.Query("estate_id"),
+		IntegrationID: c.Query("integration_id"), Cursor: c.Query("cursor"), Limit: limit,
+	})
+	if err != nil {
+		writeCollectorErr(c, err)
+		return
+	}
+	if views == nil {
+		views = []services.CollectorView{}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": views, "next_cursor": next})
+}
+
+// PolicyKeys handles GET /api/iga/v2/policy-keys. Collector policy_read.
+func (ctl *CollectorController) PolicyKeys(c *gin.Context) {
+	if middlewares.CollectorFrom(c) == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	keys := services.PolicyPublicKeys(ctl.Now())
+	if keys == nil {
+		keys = []services.PolicyPublicKey{}
+	}
+	c.JSON(http.StatusOK, gin.H{"keys": keys})
+}
+
+// PolicyArtifact handles GET /api/iga/v2/policy-artifacts/:id.
+// The collector must be a current target in its own workspace.
+func (ctl *CollectorController) PolicyArtifact(c *gin.Context) {
+	p := middlewares.CollectorFrom(c)
+	if p == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		return
+	}
+	body, kind, sum, err := ctl.svc.ReadArtifact(p.WorkspaceID, p.CollectorID, id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		return
+	}
+	ctype := "application/json"
+	if kind == "opa_bundle" {
+		ctype = "application/gzip"
+	}
+	c.Header("ETag", `"`+sum+`"`)
+	c.Data(http.StatusOK, ctype, body)
 }
 
 // SetLegacyIngress handles PUT /authsec/discovery/settings/legacy-ingress.

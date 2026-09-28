@@ -100,13 +100,14 @@ type EnrollInput struct {
 
 // EnrollResult is returned once and, on a same-key retry, returned again.
 type EnrollResult struct {
-	CollectorID         uuid.UUID `json:"collector_id"`
-	DiscoverySourceID   uuid.UUID `json:"discovery_source_id"`
-	IntegrationID       uuid.UUID `json:"integration_id"`
-	EstateID            uuid.UUID `json:"estate_id"`
-	Credential          string    `json:"credential"`
-	CredentialExpiresAt time.Time `json:"credential_expires_at"`
-	Scopes              []string  `json:"scopes"`
+	CollectorID         uuid.UUID         `json:"collector_id"`
+	DiscoverySourceID   uuid.UUID         `json:"discovery_source_id"`
+	IntegrationID       uuid.UUID         `json:"integration_id"`
+	EstateID            uuid.UUID         `json:"estate_id"`
+	Credential          string            `json:"credential"`
+	CredentialExpiresAt time.Time         `json:"credential_expires_at"`
+	Scopes              []string          `json:"scopes"`
+	PolicyKeys          []PolicyPublicKey `json:"policy_keys,omitempty"`
 }
 
 // IssueEnrollment mints a single-use token bound to kind and estate scope.
@@ -388,12 +389,14 @@ func (s *CollectorEnrollmentService) createCollector(tx *gorm.DB, en *models.Col
 	if err := tx.Create(&cred).Error; err != nil {
 		return nil, err
 	}
-	return &EnrollResult{
+	out := &EnrollResult{
 		CollectorID: collectorID, DiscoverySourceID: sourceID,
 		IntegrationID: integrationID, EstateID: estateID,
 		Credential: plain, CredentialExpiresAt: cred.ExpiresAt,
 		Scopes: []string(scopes),
-	}, nil
+	}
+	out.PolicyKeys = PolicyPublicKeys(s.Now())
+	return out, nil
 }
 
 func (s *CollectorEnrollmentService) bindEstate(tx *gorm.DB, en *models.CollectorEnrollment, keyID string, now time.Time) (uuid.UUID, error) {
@@ -452,10 +455,11 @@ type RotateInput struct {
 // RotateResult is the replacement credential. The previous one stays valid
 // until OverlapUntil, then fails authentication.
 type RotateResult struct {
-	Credential   string    `json:"credential"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	OverlapUntil time.Time `json:"overlap_until"`
-	Scopes       []string  `json:"scopes"`
+	Credential   string            `json:"credential"`
+	ExpiresAt    time.Time         `json:"expires_at"`
+	OverlapUntil time.Time         `json:"overlap_until"`
+	Scopes       []string          `json:"scopes"`
+	PolicyKeys   []PolicyPublicKey `json:"policy_keys,omitempty"`
 }
 
 // Rotate replaces the current credential after the installation key signs the request.
@@ -573,6 +577,7 @@ func (s *CollectorEnrollmentService) Rotate(in RotateInput) (*RotateResult, erro
 		}
 		result = &RotateResult{
 			Credential: plain, ExpiresAt: next.ExpiresAt, OverlapUntil: overlapUntil, Scopes: storedScopes,
+			PolicyKeys: PolicyPublicKeys(now),
 		}
 		return nil
 	})
@@ -674,14 +679,100 @@ func (s *CollectorEnrollmentService) view(inst *models.CollectorInstance) (*Coll
 	if len(caps) == 0 {
 		caps = json.RawMessage(`{}`)
 	}
+	desired, applied := s.deliveryRevisions(inst.WorkspaceID, inst.ID)
 	return &CollectorView{
 		ID: inst.ID, Kind: inst.Kind, Status: inst.Status, RowVersion: inst.RowVersion,
 		AgentVersion: inst.Version,
 		Health:       CollectorHealth{Status: inst.Status, LastSeenAt: inst.LastSeenAt},
 		Capabilities: caps, Coverage: coverage,
+		DesiredRevision: desired, AppliedRevision: applied,
 		DiscoverySourceID: inst.DiscoverySourceID, IntegrationID: inst.IntegrationID,
 		EstateID: inst.EstateScopeID,
 	}, nil
+}
+
+// CollectorListFilter is the workspace-scoped collector list.
+type CollectorListFilter struct {
+	Kind          string
+	Status        string
+	EstateID      string
+	IntegrationID string
+	Cursor        string
+	Limit         int
+}
+
+// List returns collectors in one workspace. The cursor is the last id.
+func (s *CollectorEnrollmentService) List(ws uuid.UUID, f CollectorListFilter) ([]CollectorView, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	q := `SELECT id FROM collector_instances WHERE workspace_id = ?`
+	args := []any{ws}
+	if f.Kind != "" {
+		q += ` AND kind = ?`
+		args = append(args, f.Kind)
+	}
+	if f.Status != "" {
+		q += ` AND status = ?`
+		args = append(args, f.Status)
+	}
+	if f.EstateID != "" {
+		q += ` AND estate_scope_id = ?`
+		args = append(args, f.EstateID)
+	}
+	if f.IntegrationID != "" {
+		q += ` AND integration_id = ?`
+		args = append(args, f.IntegrationID)
+	}
+	if f.Cursor != "" {
+		q += ` AND id > ?`
+		args = append(args, f.Cursor)
+	}
+	q += ` ORDER BY id LIMIT ?`
+	args = append(args, limit+1)
+	var ids []uuid.UUID
+	if err := s.db.Raw(q, args...).Scan(&ids).Error; err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(ids) > limit {
+		next = ids[limit-1].String()
+		ids = ids[:limit]
+	}
+	out := make([]CollectorView, 0, len(ids))
+	for _, id := range ids {
+		view, err := s.Get(ws, id)
+		if err != nil {
+			return nil, "", err
+		}
+		out = append(out, *view)
+	}
+	return out, next, nil
+}
+
+func (s *CollectorEnrollmentService) deliveryRevisions(ws, id uuid.UUID) (desired, applied *int64) {
+	var d []struct{ V *int64 }
+	if err := s.db.Raw(`SELECT MAX(desired_delivery_revision) AS v FROM runtime_policy_targets WHERE workspace_id = ? AND collector_id = ?`,
+		ws, id).Scan(&d).Error; err == nil && len(d) == 1 {
+		desired = d[0].V
+	}
+	var a []struct{ V *int64 }
+	if err := s.db.Raw(`SELECT MAX(r.delivery_revision) AS v
+		FROM runtime_policy_receipts r
+		JOIN runtime_policy_targets t ON t.workspace_id = r.workspace_id AND t.id = r.target_id
+		WHERE r.workspace_id = ? AND t.collector_id = ?`, ws, id).Scan(&a).Error; err == nil && len(a) == 1 {
+		applied = a[0].V
+	}
+	return desired, applied
+}
+
+// ReadArtifact returns a signed artifact for a collector that is a current target.
+func (s *CollectorEnrollmentService) ReadArtifact(ws, collector, id uuid.UUID) ([]byte, string, string, error) {
+	return ReadPolicyArtifact(s.db, ws, collector, id)
 }
 
 // PolicyInputs returns discovered-agent facts that are allowed to feed v2 policy.

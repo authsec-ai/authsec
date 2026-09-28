@@ -71,6 +71,88 @@ func (ctl *RuntimePolicyController) Validate(c *gin.Context) {
 	})
 }
 
+func (ctl *RuntimePolicyController) CreateCandidate(c *gin.Context) {
+	ctl.mutate(c, false, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		return ctl.svc.CreateCandidate(c.Request.Context(), actor, key, body)
+	})
+}
+
+func (ctl *RuntimePolicyController) GetSimulation(c *gin.Context) {
+	actor, ok := policyActor(c)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(c.Param("simulation_id"))
+	if err != nil {
+		writePolicy(c, 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."})
+		return
+	}
+	status, body, err := ctl.svc.GetSimulation(c.Request.Context(), actor.WorkspaceID, id)
+	writePolicy(c, status, body, err)
+}
+
+func (ctl *RuntimePolicyController) Simulate(c *gin.Context) {
+	ctl.mutate(c, true, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			return 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."}
+		}
+		return ctl.svc.Simulate(c.Request.Context(), actor, id, key, match, body)
+	})
+}
+
+func (ctl *RuntimePolicyController) GetRollout(c *gin.Context) {
+	actor, ok := policyActor(c)
+	if !ok {
+		return
+	}
+	id, ok := policyID(c)
+	if !ok {
+		return
+	}
+	status, body, err := ctl.svc.GetRollout(c.Request.Context(), actor.WorkspaceID, id)
+	writePolicy(c, status, body, err)
+}
+
+func (ctl *RuntimePolicyController) Publish(c *gin.Context) {
+	ctl.enforce(c, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			return 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."}
+		}
+		return ctl.svc.Publish(c.Request.Context(), actor, id, key, match, body)
+	})
+}
+
+func (ctl *RuntimePolicyController) Rollback(c *gin.Context) {
+	ctl.enforce(c, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			return 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."}
+		}
+		return ctl.svc.Rollback(c.Request.Context(), actor, id, key, match, body)
+	})
+}
+
+func (ctl *RuntimePolicyController) Revoke(c *gin.Context) {
+	ctl.enforce(c, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			return 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."}
+		}
+		return ctl.svc.Revoke(c.Request.Context(), actor, id, key, match, body)
+	})
+}
+
+func (ctl *RuntimePolicyController) enforce(c *gin.Context, fn func(services.Actor, string, string, []byte) (int, []byte, error)) {
+	ctl.mutate(c, true, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
+		if models.IsRuntimePolicyCandidateSystem(actor.UserID, actor.Kind) {
+			return 0, nil, &services.StatusError{Status: http.StatusForbidden, Code: "candidate_system_forbidden", Message: "The candidate generator cannot approve or enforce."}
+		}
+		return fn(actor, key, match, body)
+	})
+}
+
 func (ctl *RuntimePolicyController) Approve(c *gin.Context) {
 	ctl.mutate(c, true, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
 		if models.IsRuntimePolicyCandidateSystem(actor.UserID, actor.Kind) {
