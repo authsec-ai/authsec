@@ -130,9 +130,10 @@ type stringOrSlice []string
 func (s *stringOrSlice) UnmarshalJSON(b []byte) error {
 	var single string
 	if err := json.Unmarshal(b, &single); err == nil {
-		if single != "" {
-			*s = []string{single}
+		if single == "" {
+			return fmt.Errorf("principal value is an empty string")
 		}
+		*s = []string{single}
 		return nil
 	}
 	var multi []string
@@ -372,15 +373,20 @@ func actionMatches(pattern, action string) bool {
 }
 
 // wildcardMatch is IAM's glob: * matches any run, ? any one character.
+// Operates on runes so that ? matches a full Unicode codepoint, not a single
+// byte — a byte-indexed loop would split a multi-byte character across two
+// iterations and misfire on any non-ASCII condition value.
 func wildcardMatch(pattern, s string) bool {
+	pr := []rune(pattern)
+	sr := []rune(s)
 	p, i := 0, 0
 	star, mark := -1, 0
-	for i < len(s) {
+	for i < len(sr) {
 		switch {
-		case p < len(pattern) && pattern[p] == '*':
+		case p < len(pr) && pr[p] == '*':
 			star, mark = p, i
 			p++
-		case p < len(pattern) && (pattern[p] == '?' || pattern[p] == s[i]):
+		case p < len(pr) && (pr[p] == '?' || pr[p] == sr[i]):
 			p++
 			i++
 		case star >= 0:
@@ -391,10 +397,10 @@ func wildcardMatch(pattern, s string) bool {
 			return false
 		}
 	}
-	for p < len(pattern) && pattern[p] == '*' {
+	for p < len(pr) && pr[p] == '*' {
 		p++
 	}
-	return p == len(pattern)
+	return p == len(pr)
 }
 
 // TrustSubject is one principal a statement names, normalised to the far

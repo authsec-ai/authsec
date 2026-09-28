@@ -1,0 +1,6 @@
+{
+  "region": "ap-south-1",
+  "source": "Captured 2026-09-24 from a live Create request for Custom::AuthSecRegistration (stack AuthSec-Discovery-dfwvploj, lab account), delivered through the ap-south-1 callback topic. Host and path are verbatim; the query parameter NAMES are verbatim and their values are redacted, because they are a presigned write credential.",
+  "captured": true,
+  "url": "https://cloudformation-custom-resource-response-apsouth1.s3.ap-south-1.amazonaws.com/arn%3Aaws%3Acloudformation%3Aap-south-1%3A429418377036%3Astack/AuthSec-Discovery-dfwvploj/d40df0f0-b7f5-11f1-b0cb-0a41e8f2c531%7CAuthSecRegistration%7C9168bb9c-4739-457d-83df-60f014f4b9b5?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=REDACTED&X-Amz-SignedHeaders=host&X-Amz-Expires=REDACTED&X-Amz-Credential=REDACTED&X-Amz-Security-Token=REDACTED&X-Amz-Signature=REDACTED"
+}

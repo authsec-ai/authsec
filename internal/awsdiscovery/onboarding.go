@@ -49,7 +49,12 @@ var CloudFormationTemplate string
 // Must match BOTH the Metadata.AuthSec.TemplateVersion and the TemplateVersion
 // output in the YAML; TestS2TemplateVersionDeclaredConsistently checks all
 // three.
-const TemplateVersion = "2026-09-23"
+//
+// Bumped again for Quick Create (2026-09-24): ExternalId lost NoEcho, and the
+// optional CallbackTopicArn / Custom::AuthSecRegistration callback was added.
+// Role permissions are unchanged by that bump. The AuthSecRegistration
+// resource also carries the version, as a property.
+const TemplateVersion = "2026-09-24"
 
 // TemplateOutdated reports whether a connector's recorded template version is
 // older than the one this build ships -- a FACT about the two versions, never

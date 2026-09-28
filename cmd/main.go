@@ -189,6 +189,45 @@ func main() {
 		}
 	}
 
+	// AWS Quick Create callback worker: drains the SQS queue that every
+	// regional callback topic delivers to, and connects the account a stack
+	// launched from AuthSec reports back.
+	//
+	// Starts only when automatic onboarding is configured. Once any customer
+	// stack points at AuthSec's topics this worker must keep running: it is
+	// also what answers the Delete a stack sends when the customer removes it,
+	// and an unanswered Delete fails their stack deletion after 10 minutes.
+	if os.Getenv("AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER") != "true" {
+		cbCfg, cbErr := services.LoadAWSCallbackConfig()
+		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+		switch {
+		case cbErr != nil:
+			log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", cbErr)
+		case !cbCfg.Enabled():
+			log.Printf("AWS callback worker not started: automatic AWS onboarding is not configured")
+		case vaultAddr == "" || vaultToken == "":
+			log.Printf("[aws-onb] ALERT AWS callback worker not started: VAULT_ADDR/VAULT_TOKEN not configured")
+		default:
+			if vc, verr := vault.NewClient(vaultAddr, vaultToken); verr != nil {
+				log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", verr)
+			} else {
+				qc := services.NewAWSQuickCreateService(
+					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
+				// Built inside the goroutine: it reads the queue's settings from
+				// SQS, and a slow or unreachable SQS must never delay boot.
+				go func() {
+					w, werr := services.NewAWSCallbackWorker(context.Background(), qc)
+					if werr != nil {
+						log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", werr)
+						return
+					}
+					w.Run(context.Background())
+				}()
+			}
+		}
+	}
+
 	// Initialise Vault (optional; logs warning if not configured)
 	config.InitVault(cfg)
 

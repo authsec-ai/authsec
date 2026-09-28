@@ -1,0 +1,6 @@
+{
+  "region": "us-east-1",
+  "source": "Captured 2026-09-24 from a live Create request for Custom::AuthSecRegistration (stack AuthSec-Discovery-r3lewcg4, lab account), delivered through the us-east-1 callback topic. us-east-1 uses S3's global endpoint: no region in the host. Host and path are verbatim; the query parameter NAMES are verbatim and their values are redacted, because they are a presigned write credential.",
+  "captured": true,
+  "url": "https://cloudformation-custom-resource-response-useast1.s3.amazonaws.com/arn%3Aaws%3Acloudformation%3Aus-east-1%3A429418377036%3Astack/AuthSec-Discovery-r3lewcg4/fdd02dc0-b7f7-11f1-b308-0e2ce0dd7a2d%7CAuthSecRegistration%7Cd3977b73-34e8-4fb2-81d5-64fb99bc90a3?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=REDACTED&X-Amz-SignedHeaders=host&X-Amz-Expires=REDACTED&X-Amz-Credential=REDACTED&X-Amz-Security-Token=REDACTED&X-Amz-Signature=REDACTED"
+}

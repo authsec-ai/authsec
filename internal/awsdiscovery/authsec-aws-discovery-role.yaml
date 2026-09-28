@@ -8,14 +8,15 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-09-23'
+    TemplateVersion: '2026-09-24'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: Copy these two values from the AuthSec console
+          default: Filled in by AuthSec - do not change
         Parameters:
           - AuthSecPrincipalArn
           - ExternalId
+          - CallbackTopicArn
       - Label:
           default: Optional
         Parameters:
@@ -33,18 +34,34 @@ Parameters:
     AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(root|user\/.+|role\/.+)$'
     ConstraintDescription: must be an IAM principal ARN.
 
+  # Deliberately NOT NoEcho. CloudFormation Quick Create links ignore NoEcho
+  # parameters, so a NoEcho ExternalId could never be pre-filled by AuthSec's
+  # "Launch in AWS" link. Hiding it bought nothing anyway: the same value is
+  # readable in this role's trust policy by anyone with iam:GetRole, and AWS
+  # treats an external ID as a confused-deputy guard, not a secret.
   ExternalId:
     Type: String
     Description: >-
-      The AuthSec-generated ExternalId for this connection. Copy it from the
-      AuthSec console; do not invent one. It is what proves the connection was
-      started by you, and it is the reason a third party who learns this role's
-      ARN still cannot assume it.
+      The AuthSec-generated ExternalId for this connection. Filled in by AuthSec;
+      do not change it. It is the reason a third party who learns this role's
+      ARN still cannot have AuthSec assume it.
     MinLength: 32
     MaxLength: 1224
     AllowedPattern: '^[\w+=,.@:\/-]+$'
-    NoEcho: true
     ConstraintDescription: must be the ExternalId shown in the AuthSec console.
+
+  # Set only by AuthSec's "Launch in AWS" link. When present, the stack reports
+  # the new role back to AuthSec through this SNS topic so the customer never
+  # has to copy the RoleArn output. Empty (the default) means the manual flow:
+  # no callback resource is created and nothing else about the stack changes.
+  CallbackTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Filled in by AuthSec's Launch link. Leave empty when deploying this
+      template by hand.
+    AllowedPattern: '^$|^arn:aws:sns:[a-z0-9-]+:\d{12}:[A-Za-z0-9_-]{1,256}$'
+    ConstraintDescription: must be empty or the SNS topic ARN AuthSec provided.
 
   RoleName:
     Type: String
@@ -65,6 +82,10 @@ Parameters:
       How long one assumed session may last, in seconds. A scan of a large
       account can run for a while; the default of one hour is enough for the
       current scan surfaces. Minimum 3600, maximum 43200.
+
+Conditions:
+
+  HasCallback: !Not [!Equals [!Ref CallbackTopicArn, '']]
 
 Resources:
 
@@ -307,12 +328,37 @@ Resources:
         - Key: Purpose
           Value: cloud-discovery-read-only
 
+  # Reports the role to AuthSec so the customer does not paste anything. It
+  # creates nothing in this account: CloudFormation publishes one message to
+  # AuthSec's SNS topic and waits for AuthSec's SUCCESS or FAILED answer.
+  #
+  # AuthSec answers only after it has assumed the role with the ExternalId and
+  # read the account back with sts:GetCallerIdentity, so a SUCCESS here means
+  # the connection is proven, not merely announced. A FAILED answer rolls the
+  # stack back, which deletes the role again.
+  #
+  # ServiceTimeout is 10 minutes rather than CloudFormation's default hour, so
+  # a callback that never arrives fails the stack while the customer is still
+  # looking at it.
+  AuthSecRegistration:
+    Type: Custom::AuthSecRegistration
+    Condition: HasCallback
+    DependsOn: AuthSecDiscoveryRole
+    Properties:
+      ServiceToken: !Ref CallbackTopicArn
+      ServiceTimeout: 600
+      RoleArn: !GetAtt AuthSecDiscoveryRole.Arn
+      ExternalId: !Ref ExternalId
+      AccountId: !Ref 'AWS::AccountId'
+      TemplateVersion: '2026-09-24'
+
 Outputs:
 
   RoleArn:
     Description: >-
-      Paste this back into the AuthSec console to finish onboarding. This value
-      is not secret; the ExternalId is.
+      When deploying by hand, paste this back into the AuthSec console to finish
+      onboarding. Not needed when the stack was launched from AuthSec. This
+      value is not secret.
     Value: !GetAtt AuthSecDiscoveryRole.Arn
 
   AccountId:
@@ -323,4 +369,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-09-23'
+    Value: '2026-09-24'

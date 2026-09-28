@@ -59,6 +59,16 @@ func NewCloudTrailClient(cfg aws.Config) CloudTrailAPI { return cloudtrail.NewFr
 // history the account's trail retains.
 const lookupWindow = 48 * time.Hour
 
+// maxTrailPages bounds one RecentEvents read: at LookupEvents' 50 events per
+// page, 200 pages is the first 10,000 events of the window. Its own constant,
+// not IAM's maxPages: that one is sized for 1,000-item pages and a runaway
+// marker, while this one is a deliberate cost bound that a busy account
+// reaches in normal operation. Reaching it is reported as a partial read.
+const (
+	maxTrailPages       = 200
+	lookupEventsPerPage = 50
+)
+
 // TrailEvent is one CloudTrail management event, reduced to what a reader
 // needs to decide whether it is evidence of one of THIS scan's identities
 // acting -- including a call AWS denied, which
@@ -105,8 +115,9 @@ func (r *CloudTrailReader) RecentEvents(ctx context.Context) ([]TrailEvent, erro
 	var out []TrailEvent
 	var next *string
 	for page := 0; ; page++ {
-		if page >= maxPages {
-			return out, fmt.Errorf("%w: cloudtrail events", errTooManyPages)
+		if page >= maxTrailPages {
+			return out, fmt.Errorf("%w: read the first %d CloudTrail events of the last %s; more exist",
+				ErrTooManyPages, maxTrailPages*lookupEventsPerPage, lookupWindow)
 		}
 		resp, err := r.api.LookupEvents(ctx, &cloudtrail.LookupEventsInput{
 			StartTime: aws.Time(start), EndTime: aws.Time(now), NextToken: next,
