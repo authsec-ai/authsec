@@ -481,7 +481,7 @@ func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Do
 	var quarantined []struct{ N int }
 	if err := tx.Raw(`SELECT 1 AS n FROM discovered_agent_workloads w
 		JOIN discovered_agents a ON a.workspace_id = w.workspace_id AND a.id = w.discovered_agent_id
-		WHERE w.workspace_id = ? AND w.workload_id = ? AND w.link_state = 'accepted' AND a.status = 'quarantined'
+		WHERE w.workspace_id = ? AND w.workload_id::text = ? AND w.link_state = 'accepted' AND a.status = 'quarantined'
 		LIMIT 1`, ws, workloadID).Scan(&quarantined).Error; err != nil {
 		return nil, err
 	}
@@ -492,7 +492,7 @@ func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Do
 	if err := tx.Raw(`SELECT 1 AS n FROM agent_policies p
 		JOIN discovered_agent_workloads w
 		  ON w.workspace_id = p.workspace_id AND w.discovered_agent_id = p.discovered_agent_id
-		WHERE p.workspace_id = ? AND w.workload_id = ? AND p.enabled AND p.desired_state = 'quarantined'
+		WHERE p.workspace_id = ? AND w.workload_id::text = ? AND p.enabled AND p.desired_state = 'quarantined'
 		  AND w.link_state = 'accepted'
 		LIMIT 1`, ws, workloadID).Scan(&guard).Error; err != nil {
 		return nil, err
@@ -502,7 +502,7 @@ func loadPrecedence(tx *gorm.DB, ws uuid.UUID, workloadID string, doc compile.Do
 	}
 	var agents []string
 	if err := tx.Raw(`SELECT discovered_agent_id::text FROM discovered_agent_workloads
-		WHERE workspace_id = ? AND workload_id = ? AND link_state = 'accepted'`, ws, workloadID).Scan(&agents).Error; err != nil {
+		WHERE workspace_id = ? AND workload_id::text = ? AND link_state = 'accepted'`, ws, workloadID).Scan(&agents).Error; err != nil {
 		return nil, err
 	}
 	if len(agents) > 0 {

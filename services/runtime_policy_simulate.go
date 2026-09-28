@@ -168,7 +168,7 @@ func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, 
 		o.action, o.resource_id::text AS resource_id, COALESCE(res.kind_metadata::text, '{}') AS meta
 		FROM iga_observed_access o
 		JOIN iga_resources res ON res.workspace_id = o.workspace_id AND res.id = o.resource_id
-		WHERE o.workspace_id = ? AND o.workload_id IN ? AND o.observed_at >= ? AND o.observed_at <= ?`,
+		WHERE o.workspace_id = ? AND o.workload_id::text IN ? AND o.observed_at >= ? AND o.observed_at <= ?`,
 		ws, doc.Targets.WorkloadIDs, start, end).Scan(&rows).Error
 	if err != nil {
 		return summary, nil, err
