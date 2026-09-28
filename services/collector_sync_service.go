@@ -62,10 +62,22 @@ func NewCollectorSyncService(db *gorm.DB, now func() time.Time) *CollectorSyncSe
 
 func (s *CollectorSyncService) clock() time.Time { return s.now().UTC() }
 
+// SyncOptions carries collector-sync choices that are not part of the
+// request body. include_policy is a query parameter because the request
+// schema rejects unknown fields.
+type SyncOptions struct {
+	Inline bool
+}
+
 // Accept validates and durably stores one decompressed batch. On success the
 // returned bytes are the receipt JSON. A storage failure returns
 // ErrSyncUnavailable and leaves no receipt row.
 func (s *CollectorSyncService) Accept(p *models.CollectorPrincipal, raw []byte) ([]byte, error) {
+	return s.AcceptOptions(p, raw, SyncOptions{})
+}
+
+// AcceptOptions is Accept with an explicit inline-policy choice.
+func (s *CollectorSyncService) AcceptOptions(p *models.CollectorPrincipal, raw []byte, opt SyncOptions) ([]byte, error) {
 	if p == nil || !containsString(p.Scopes, models.CollectorScopeIngest) {
 		return nil, ErrSyncForbidden
 	}
@@ -105,7 +117,7 @@ func (s *CollectorSyncService) Accept(p *models.CollectorPrincipal, raw []byte) 
 	var body []byte
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var err error
-		body, err = s.persist(tx, p, req, raw, hash)
+		body, err = s.persist(tx, p, req, raw, hash, opt.Inline)
 		return err
 	})
 	if err != nil {
@@ -114,7 +126,7 @@ func (s *CollectorSyncService) Accept(p *models.CollectorPrincipal, raw []byte) 
 	return body, nil
 }
 
-func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal, req *collectorcontract.SyncRequest, raw []byte, hash string) ([]byte, error) {
+func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal, req *collectorcontract.SyncRequest, raw []byte, hash string, inline bool) ([]byte, error) {
 	repo := repositories.NewCollectorRepository(tx)
 	inst, err := repo.LockInstance(p.WorkspaceID, p.CollectorID)
 	if err != nil {
@@ -190,6 +202,20 @@ func (s *CollectorSyncService) persist(tx *gorm.DB, p *models.CollectorPrincipal
 		MappingURL:             "/api/iga/v2/receipts/" + receiptID.String(),
 		Desired:                json.RawMessage("null"),
 		NextSyncSeconds:        NextSyncSeconds(),
+	}
+	// Desired state and receipt rows exist only while IGA_V2_POLICY is on.
+	// Both writes sit in a savepoint: a missing table or a bad receipt must
+	// not turn an accepted batch into a 503, and flag-off skips them entirely
+	// so the receipt bytes stay identical to the pre-delivery response.
+	if V2PolicyEnabled() {
+		if desired, err := loadDesiredBestEffort(tx, p.WorkspaceID, p.CollectorID, inline); err != nil {
+			s.note(err)
+		} else if len(desired) > 0 {
+			resp.Desired = desired
+		}
+		if err := recordReceiptsBestEffort(tx, p, req); err != nil {
+			s.note(err)
+		}
 	}
 	respBody, err := json.Marshal(resp)
 	if err != nil {

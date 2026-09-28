@@ -473,6 +473,15 @@ func main() {
 		warningWorker := services.NewPolicyWarningWorker(config.DB, 5*time.Minute, 50)
 		warningWorker.Start()
 		log.Printf("policy pre-deadline warning worker started (interval=5m)")
+
+		// Runtime-policy canary. The handler only records the plan. This loop
+		// claims one publication at a time and never sleeps inside a request.
+		// It starts only when IGA_V2_POLICY is on, so a flag-off process does
+		// not touch the delivery tables.
+		if services.V2PolicyEnabled() {
+			go services.NewRolloutWorker(config.DB).Run(context.Background())
+			log.Printf("runtime policy rollout worker started (interval=5s)")
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────

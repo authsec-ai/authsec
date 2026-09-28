@@ -83,6 +83,25 @@ func TestGoldenRoundTrip(t *testing.T) {
 		"next_sync_seconds": 15
 	}`)
 	mustValidate(t, respSchema, live)
+	withBody := []byte(`{
+		"receipt_id": "30000000-0000-4000-8000-000000000007",
+		"accepted_sequence": 1,
+		"receipt_state": "accepted",
+		"projection_state": "queued",
+		"published_graph_revision": 0,
+		"mapping_url": "/api/iga/v2/receipts/30000000-0000-4000-8000-000000000007",
+		"desired": {
+			"revision": 12,
+			"graph_revision": 184,
+			"manifest_id": "40000000-0000-4000-8000-000000000012",
+			"policy_format": "authsec.runtime.v1",
+			"opa_bundle": {"url": "/api/iga/v2/policy-artifacts/40000000-0000-4000-8000-000000000013", "sha256": "abc", "rego_version": "v1", "body": "aGVsbG8="},
+			"controls": {"url": "/api/iga/v2/policy-artifacts/40000000-0000-4000-8000-000000000014", "sha256": "def"},
+			"signed_manifest": "[\"sig\"]"
+		},
+		"next_sync_seconds": 15
+	}`)
+	mustValidate(t, respSchema, withBody)
 }
 
 func TestNegativeFixtures(t *testing.T) {

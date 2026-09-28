@@ -41,7 +41,7 @@ func (ctl *CollectorSyncController) AgentSync(c *gin.Context) {
 		writeSyncErr(c, err)
 		return
 	}
-	body, err := ctl.svc.Accept(p, raw)
+	body, err := ctl.svc.AcceptOptions(p, raw, services.SyncOptions{Inline: c.Query("include_policy") == "inline"})
 	if err != nil {
 		writeSyncErr(c, err)
 		return
