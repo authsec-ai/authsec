@@ -39,6 +39,8 @@ type OAuthASService struct {
 	authzCtx  *AuthorizationContextService
 	rsService *ResourceServerService
 	jwksCache *jwksCache
+	// hydraIssuer is the issuer Hydra stamps on the id_tokens it issues.
+	hydraIssuer *hydraIssuerCache
 }
 
 var (
@@ -52,10 +54,11 @@ var (
 
 func NewOAuthASService(db *gorm.DB) *OAuthASService {
 	return &OAuthASService{
-		db:        db,
-		authzCtx:  NewAuthorizationContextService(db),
-		rsService: NewResourceServerService(db),
-		jwksCache: &jwksCache{},
+		db:          db,
+		authzCtx:    NewAuthorizationContextService(db),
+		rsService:   NewResourceServerService(db),
+		jwksCache:   &jwksCache{},
+		hydraIssuer: &hydraIssuerCache{},
 	}
 }
 
@@ -2185,6 +2188,78 @@ func (c *jwksCache) get() (json.RawMessage, error) {
 	return c.data, nil
 }
 
+// --- Hydra issuer ---
+
+// HydraJWKS returns Hydra's own signing keys, without the native keys
+// FetchJWKS adds. An id_token that claims Hydra's issuer must verify against
+// these.
+func (s *OAuthASService) HydraJWKS() (json.RawMessage, error) {
+	return s.jwksCache.get()
+}
+
+// HydraIssuer returns the issuer Hydra's discovery document states, without a
+// trailing slash. Hydra issues the id_tokens that browser login returns and
+// stamps this issuer in `iss`. It differs from the AS's own issuer
+// (config.OAuthBaseURL) whenever Hydra is served from its own host, e.g.
+// https://oauth.prod.authsec.ai beside https://prod.api.authsec.ai.
+func (s *OAuthASService) HydraIssuer() (string, error) {
+	if s.hydraIssuer == nil {
+		s.hydraIssuer = &hydraIssuerCache{}
+	}
+	return s.hydraIssuer.get()
+}
+
+// NormalizeIssuer compares issuers without surrounding space or a trailing
+// slash, which OIDC treats as the same issuer only by configuration accident.
+func NormalizeIssuer(iss string) string {
+	return strings.TrimRight(strings.TrimSpace(iss), "/")
+}
+
+type hydraIssuerCache struct {
+	mu        sync.Mutex
+	issuer    string
+	fetchedAt time.Time
+}
+
+func (c *hydraIssuerCache) get() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.issuer != "" && time.Since(c.fetchedAt) < 5*time.Minute {
+		return c.issuer, nil
+	}
+
+	discoveryURL := strings.TrimRight(config.AppConfig.HydraPublicURL, "/") + "/.well-known/openid-configuration"
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	iss, err := func() (string, error) {
+		resp, err := httpClient.Get(discoveryURL)
+		if err != nil {
+			return "", fmt.Errorf("fetch Hydra discovery: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("fetch Hydra discovery: HTTP %d", resp.StatusCode)
+		}
+		var doc struct {
+			Issuer string `json:"issuer"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&doc); err != nil {
+			return "", fmt.Errorf("parse Hydra discovery: %w", err)
+		}
+		if iss := NormalizeIssuer(doc.Issuer); iss != "" {
+			return iss, nil
+		}
+		return "", fmt.Errorf("Hydra discovery states no issuer")
+	}()
+	if err != nil {
+		if c.issuer != "" {
+			return c.issuer, nil // stale is better than failing every exchange
+		}
+		return "", err
+	}
+	c.issuer, c.fetchedAt = iss, time.Now()
+	return c.issuer, nil
+}
+
 // EnrichUserinfoClaims enriches session-based claims with data from the local user table and
 // OIDC identity repository. Falls back to session claims if DB lookups fail (graceful degradation).
 // The sub may be a UUID (AdminUser.ID) or a composite like "google-<providerUserID>".
@@ -2343,9 +2418,15 @@ func (s *OAuthASService) VerifyIDTokenHint(idToken, expectedIssuer, expectedAudi
 	}
 
 	if expectedIssuer != "" {
-		iss, _ := claims["iss"].(string)
-		if iss != expectedIssuer {
-			return "", fmt.Errorf("id_token issuer mismatch")
+		// The keys above are Hydra's, so a token they verify is Hydra's and
+		// carries Hydra's issuer, which is not the AS's when Hydra has its own
+		// host. Accept either.
+		iss := NormalizeIssuer(fmt.Sprint(claims["iss"]))
+		if iss != NormalizeIssuer(expectedIssuer) {
+			hydraIss, herr := s.HydraIssuer()
+			if herr != nil || iss != hydraIss {
+				return "", fmt.Errorf("id_token issuer mismatch")
+			}
 		}
 	}
 
