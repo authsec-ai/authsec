@@ -1398,15 +1398,42 @@ type oauthJWK struct {
 }
 
 // verifySelfIssuedIDToken validates an OIDC id_token issued by this AuthSec AS
-// and intended for the authenticated OAuth client. This is the standards path
+// or by its Hydra, and intended for the authenticated OAuth client. This is the standards path
 // for token-exchange subject_token_type=id_token; ID tokens are JWT assertions,
 // not Hydra-introspectable access tokens.
 func (ctrl *OAuthASController) verifySelfIssuedIDToken(raw string, expectedClientID string) (jwt.MapClaims, error) {
 	if config.AppConfig == nil {
 		return nil, fmt.Errorf("server configuration unavailable")
 	}
-	selfIssuer := config.AppConfig.OAuthBaseURL()
-	jwks, err := ctrl.service.FetchJWKS()
+	selfIssuer := services.NormalizeIssuer(config.AppConfig.OAuthBaseURL())
+
+	// Two issuers sign id_tokens here: this AS, and Hydra, which issues the
+	// id_token browser login returns under its own issuer (for example
+	// https://oauth.prod.authsec.ai beside https://prod.api.authsec.ai). Each
+	// is accepted only with its own keys: a token claiming Hydra's issuer must
+	// verify against Hydra's JWKS. Any other issuer is refused before any key
+	// is tried.
+	unverified := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(raw, unverified); err != nil {
+		return nil, fmt.Errorf("id_token signature/claims invalid: %w", err)
+	}
+	claimedIss, _ := unverified["iss"].(string)
+	claimedIss = services.NormalizeIssuer(claimedIss)
+
+	var (
+		jwks json.RawMessage
+		err  error
+	)
+	switch {
+	case claimedIss != "" && claimedIss == selfIssuer:
+		jwks, err = ctrl.service.FetchJWKS()
+	default:
+		hydraIssuer, herr := ctrl.service.HydraIssuer()
+		if herr != nil || claimedIss == "" || claimedIss != hydraIssuer {
+			return nil, fmt.Errorf("id_token issuer mismatch")
+		}
+		jwks, err = ctrl.service.HydraJWKS()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("id_token JWKS unavailable")
 	}
@@ -1436,7 +1463,7 @@ func (ctrl *OAuthASController) verifySelfIssuedIDToken(raw string, expectedClien
 		}
 		return nil, fmt.Errorf("id_token signature/claims invalid: %w", err)
 	}
-	if iss, _ := claims["iss"].(string); iss != selfIssuer {
+	if iss, _ := claims["iss"].(string); services.NormalizeIssuer(iss) != claimedIss {
 		return nil, fmt.Errorf("id_token issuer mismatch")
 	}
 	if !claimHasAudience(claims["aud"], expectedClientID) {
