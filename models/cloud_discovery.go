@@ -99,6 +99,11 @@ type CloudConnector struct {
 	VerifiedAt *time.Time `json:"verified_at,omitempty"`
 	LastError  string     `json:"last_error" gorm:"not null;default:''"`
 
+	// LastErrorCode is the stable class of LastError, stamped where the error
+	// was understood so a reader never parses the prose back into a code. Empty
+	// when the failure did not match a known sentinel. See ClassifyConnectorError.
+	LastErrorCode string `json:"last_error_code" gorm:"not null;default:''"`
+
 	CreatedBy string    `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
