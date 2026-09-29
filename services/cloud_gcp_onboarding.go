@@ -551,7 +551,7 @@ func (s *GCPOnboardingService) VerifyConnector(
 		err = fmt.Errorf("%w: connector has no recognised auth method recorded", ErrInvalidScopeID)
 	}
 	if err != nil {
-		updated, uerr := s.repo.MarkError(workspaceID, id, sanitizedReason(err))
+		updated, uerr := s.repo.MarkError(workspaceID, id, sanitizedReason(err), ClassifyConnectorError(err))
 		if uerr != nil {
 			return nil, uerr
 		}
@@ -571,7 +571,7 @@ func (s *GCPOnboardingService) VerifyConnector(
 		}
 	}
 	if err != nil {
-		updated, uerr := s.repo.MarkError(workspaceID, id, sanitizedReason(err))
+		updated, uerr := s.repo.MarkError(workspaceID, id, sanitizedReason(err), ClassifyConnectorError(err))
 		if uerr != nil {
 			return nil, uerr
 		}

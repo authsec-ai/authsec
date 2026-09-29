@@ -44,10 +44,15 @@ type CloudConnectorRepository interface {
 
 	// MarkError records that the connection could not be used, and why.
 	//
+	// `reason` is the provider's own prose; `code` is its stable class from
+	// ClassifyConnectorError, or "" when the failure matched no known sentinel.
+	// Both are stored: the prose is what an operator debugs with, the code is
+	// what a list column can render without parsing the prose.
+	//
 	// It deliberately does NOT touch verified_at: the last time the connection
 	// genuinely worked is evidence, and overwriting it would erase the only
 	// thing that distinguishes "broken since this morning" from "never worked".
-	MarkError(workspaceID, id uuid.UUID, reason string) (*models.CloudConnector, error)
+	MarkError(workspaceID, id uuid.UUID, reason, code string) (*models.CloudConnector, error)
 
 	// Revoke marks a connector revoked and clears its auth_ref, returning the
 	// PREVIOUS auth_ref so the caller can purge it from the secrets store, or ""
@@ -94,6 +99,10 @@ func (r *cloudConnectorRepository) Upsert(c *models.CloudConnector) (*models.Clo
 	//
 	// created_by and created_at are absent for the same class of reason: the row
 	// records who first connected the account, not who last touched it.
+	// last_error_code travels with last_error, always. Assigning one without the
+	// other leaves a re-onboarded connector with an empty error and the previous
+	// failure's classification still attached — which the console renders as a
+	// failure phrase on a connector that is working.
 	assignments := map[string]interface{}{
 		"scope_kind":      c.ScopeKind,
 		"parent_scope_id": c.ParentScopeID,
@@ -102,6 +111,7 @@ func (r *cloudConnectorRepository) Upsert(c *models.CloudConnector) (*models.Clo
 		"attrs":           c.Attrs,
 		"verified_at":     c.VerifiedAt,
 		"last_error":      c.LastError,
+		"last_error_code": c.LastErrorCode,
 		"updated_at":      time.Now(),
 	}
 
@@ -165,10 +175,11 @@ func (r *cloudConnectorRepository) List(workspaceID uuid.UUID, provider string) 
 func (r *cloudConnectorRepository) MarkVerified(workspaceID, id uuid.UUID, attrs json.RawMessage) (*models.CloudConnector, error) {
 	now := time.Now()
 	updates := map[string]interface{}{
-		"status":      models.CloudConnectorActive,
-		"verified_at": now,
-		"last_error":  "",
-		"updated_at":  now,
+		"status":          models.CloudConnectorActive,
+		"verified_at":     now,
+		"last_error":      "",
+		"last_error_code": "",
+		"updated_at":      now,
 	}
 	// An empty blob leaves attrs alone rather than erasing it. A verification is
 	// evidence that the connection works; it is not a licence to forget which
@@ -185,7 +196,7 @@ func (r *cloudConnectorRepository) MarkVerified(workspaceID, id uuid.UUID, attrs
 	return r.Get(workspaceID, id)
 }
 
-func (r *cloudConnectorRepository) MarkError(workspaceID, id uuid.UUID, reason string) (*models.CloudConnector, error) {
+func (r *cloudConnectorRepository) MarkError(workspaceID, id uuid.UUID, reason, code string) (*models.CloudConnector, error) {
 	if reason == "" {
 		// The CHECK constraint refuses status='error' with an empty reason, and a
 		// constraint violation here would be a confusing 500. Say what happened.
@@ -194,9 +205,10 @@ func (r *cloudConnectorRepository) MarkError(workspaceID, id uuid.UUID, reason s
 	err := r.db.Model(&models.CloudConnector{}).
 		Where("workspace_id = ? AND id = ?", workspaceID, id).
 		Updates(map[string]interface{}{
-			"status":     models.CloudConnectorError,
-			"last_error": reason,
-			"updated_at": time.Now(),
+			"status":          models.CloudConnectorError,
+			"last_error":      reason,
+			"last_error_code": code,
+			"updated_at":      time.Now(),
 		}).Error
 	if err != nil {
 		return nil, err

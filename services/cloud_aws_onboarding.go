@@ -354,7 +354,7 @@ func (s *AWSOnboardingService) VerifyConnector(
 		if probeCtx.Err() == context.DeadlineExceeded {
 			verr = fmt.Errorf("%w: %v", ErrAWSProbeTimeout, verr)
 		}
-		updated, uerr := s.repo.MarkError(workspaceID, id, verr.Error())
+		updated, uerr := s.repo.MarkError(workspaceID, id, verr.Error(), ClassifyConnectorError(verr))
 		if uerr != nil {
 			return nil, uerr
 		}
