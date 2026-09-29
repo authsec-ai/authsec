@@ -450,6 +450,12 @@ func (IGAAgentInstance) TableName() string { return "iga_agent_instances" }
 const (
 	ProviderGitHub = "github"
 	ProviderAWS    = "aws"
+	// ProviderK8s is the Kubernetes authorization model: ServiceAccounts, Roles,
+	// ClusterRoles and the bindings between them, collected by the in-cluster
+	// agent. It shares the iga_* tables with the others — the model is
+	// provider-neutral by design (SPEC §1.5) — and is partitioned only by this
+	// column.
+	ProviderK8s = "k8s"
 )
 
 // IGAIdentityAccount is a programmatic principal. Never a credential, and never

@@ -1465,6 +1465,13 @@ func SetupRoutes(
 			// registered while its runtime state becomes gone.
 			discoveryIngress.POST("/lifecycle", discoveryController.ReportLifecycleEvent)
 
+			// The cluster's AUTHORIZATION MODEL — which ServiceAccount may do what,
+			// through which binding and role. Unauthenticated for the same reason as
+			// the rest of this group: the caller is a workload in a customer's
+			// cluster, and the payload grants nothing. It describes authorization
+			// that already exists over there; it creates none here.
+			discoveryIngress.POST("/rbac-snapshot", discoveryController.ReportRBACSnapshot)
+
 			// Per-sweep manifest of everything a connector observed. The only signal
 			// that catches an agent destroyed while nobody was watching — before
 			// install, or during an outage — since admission sees deletions live or

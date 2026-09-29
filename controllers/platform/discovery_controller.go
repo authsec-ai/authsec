@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -962,4 +963,52 @@ func (ctl *DiscoveryController) GetCoverage(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+/* ------------------------- Kubernetes RBAC snapshot ----------------------- */
+
+// ReportRBACSnapshot handles POST /authsec/discovery/rbac-snapshot.
+//
+// The in-cluster agent's periodic reading of the cluster's authorization model:
+// ServiceAccounts, Roles, ClusterRoles and the bindings between them. It is
+// projected into the shared iga_* graph under provider 'k8s', which is what lets
+// the console answer "what can this agent actually do in there?".
+//
+// Unauthenticated, on the same ingress and for the same reason as sightings: the
+// caller is a workload in a customer's cluster with no console credential, and
+// the payload GRANTS NOTHING — it describes authorization that already exists
+// somewhere else. The workspace is asserted in the body, as it is for every
+// route in this group.
+//
+// The body carries no secret material by construction. RBAC objects hold
+// authorization structure; the agent never reads a Secret, and the only secret
+// reference here is a token secret's NAME.
+func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
+	var snap models.K8sRBACSnapshot
+	if err := c.ShouldBindJSON(&snap); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	wsID, ok := ctl.assertedWorkspace(c, snap.WorkspaceID)
+	if !ok {
+		return
+	}
+
+	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).
+		Ingest(wsID, snap)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 202 when the projection gate is off: the snapshot was well-formed and
+	// received, and nothing was written. A 200 would imply it landed in the
+	// graph; a 4xx would make a correctly-configured agent log errors against a
+	// control plane that is simply not projecting yet.
+	status := http.StatusOK
+	if !out.Accepted {
+		status = http.StatusAccepted
+	}
+	c.JSON(status, out)
 }
