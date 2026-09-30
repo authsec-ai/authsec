@@ -1045,10 +1045,14 @@ keeps working (bookmarks, redirects and `?connector=` links included):
 | | Agent sightings | `/iga/agents` | Agents found in repositories and clusters that need a decision — claim, provision or quarantine. The existing Discovered Agents workflow, renamed for its purpose; it is not a second copy of Agents & workloads |
 | | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists. Its tiles are the tab's kind / attribution / sensitivity filters; one flat row carries search, type chips and the account scope |
 
-Identities (`/iga/identities`) and Resources (`/iga/resources`) have no sidebar
-entry: an estate-wide list of either duplicated Cloud Inventory's tabs. Their
-pages and routes are unchanged and are reached from a workload's graph, an
-object's links, the breadcrumb and Cloud Inventory's *Open in graph*.
+Cloud Inventory's Identities and Resources tabs are **the** list of each: the
+graph's own estate-wide lists (`/iga/identities`, `/iga/resources`) redirect
+to them. An identity's, resource's or external principal's graph page is the
+detail view behind that list — its breadcrumb reads *Cloud Inventory ·
+Identities* (or *· Resources*) and Cloud Inventory stays active in the
+sidebar. From a row, *Open in graph* reaches it: identities and compute by the
+source-key lookup (§5.3 *Lookup*), resources by an exact full-ARN match against
+the graph's exact references (none when no statement names it exactly).
 | | Detection Rules | `/iga/detection-rules` | What a repository scan looks for |
 
 - **One breadcrumb**, the global one, using the sidebar's own labels, ending
