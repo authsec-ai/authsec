@@ -1040,12 +1040,15 @@ keeps working (bookmarks, redirects and `?connector=` links included):
 | Group | Item | Route | What it is for, in its own subtitle |
 |---|---|---|---|
 | **Explore** | Agents & workloads | `/iga/estate` | Find a workload and start an investigation — the projected identity graph |
-| | Identities | `/iga/identities` | Roles, users and groups; what runs as them and what they declare |
-| | Resources | `/iga/resources` | Exact references and selectors that declared access names |
 | **Governance** | Provenance, Access Certification, Separation of Duties, Birthrights & Lifecycle, Enforcement queue | unchanged | Unchanged capabilities. They govern workspace users, service accounts and OAuth clients; nothing in them implies an action on AWS objects from the graph |
 | **Data sources** | Integrations | `/iga/integrations` | Connect, verify, scan and troubleshoot collection |
 | | Agent sightings | `/iga/agents` | Agents found in repositories and clusters that need a decision — claim, provision or quarantine. The existing Discovered Agents workflow, renamed for its purpose; it is not a second copy of Agents & workloads |
-| | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists |
+| | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists. Its tiles are the tab's kind / attribution / sensitivity filters; one flat row carries search, type chips and the account scope |
+
+Identities (`/iga/identities`) and Resources (`/iga/resources`) have no sidebar
+entry: an estate-wide list of either duplicated Cloud Inventory's tabs. Their
+pages and routes are unchanged and are reached from a workload's graph, an
+object's links, the breadcrumb and Cloud Inventory's *Open in graph*.
 | | Detection Rules | `/iga/detection-rules` | What a repository scan looks for |
 
 - **One breadcrumb**, the global one, using the sidebar's own labels, ending
