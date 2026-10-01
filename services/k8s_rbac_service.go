@@ -64,6 +64,27 @@ type K8sRBACResult struct {
 	// Retired is how many previously-seen rows were marked gone. Always 0 for an
 	// incomplete snapshot.
 	Retired int `json:"retired"`
+
+	// Reconciled says whether absence was acted on at all, and Reason says why
+	// not. Mirrors ManifestResult: a sweep that retired nothing because it was
+	// incomplete and a sweep that retired nothing because nothing was gone are
+	// the same number and opposite facts, and an operator needs to tell them
+	// apart without reading the code.
+	Reconciled bool   `json:"reconciled"`
+	Reason     string `json:"reason,omitempty"`
+
+	// Generation is the sweep's fencing token, echoed so the agent's logs and
+	// the sweep row agree.
+	Generation int64 `json:"generation,omitempty"`
+
+	Stale int `json:"stale"`
+}
+
+// sweepRef is one accepted sweep's authority to write and to close rows.
+type sweepRef struct {
+	SourceID uuid.UUID
+	SweepID  uuid.UUID
+	Scope    k8sgraph.Scope
 }
 
 type k8sRBACManager struct {
@@ -117,7 +138,28 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 	// than an unprojected one: an assignment whose policy landed but whose edges
 	// did not would read as a grant of nothing, which is a confident wrong
 	// answer rather than a visible gap.
+	// The sweep is what gives this snapshot the authority to CLOSE rows. Without
+	// a resolvable discovery source there is no evidence stream to attribute the
+	// reading to, so the snapshot is still projected -- new access is still worth
+	// recording -- but nothing may be retired from it, and the result says so
+	// rather than reporting a quiet zero.
+	sourceID := m.resolveSource(workspaceID, snap, cluster)
+	if sourceID == uuid.Nil {
+		res.Reason = "snapshot could not be attributed to a discovery source, so absence " +
+			"is not evidence of deletion; rows were projected but none retired"
+	}
+
 	err := m.db.Transaction(func(tx *gorm.DB) error {
+		var ref *sweepRef
+		if sourceID != uuid.Nil {
+			r, err := m.openSweep(tx, workspaceID, sourceID, cluster, snap, observed)
+			if err != nil {
+				return fmt.Errorf("open sweep: %w", err)
+			}
+			ref = r
+			res.Generation = r.Scope.Generation
+		}
+
 		if err := m.upsertIdentities(tx, workspaceID, out.Identities, observed); err != nil {
 			return fmt.Errorf("identities: %w", err)
 		}
@@ -146,20 +188,134 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		}
 
 		assignmentIDs, err := m.upsertAssignments(tx, workspaceID, out.Assignments,
-			policyIDs, identityIDs, observed)
+			policyIDs, identityIDs, observed, ref)
 		if err != nil {
 			return fmt.Errorf("assignments: %w", err)
 		}
-		if err := m.upsertEdges(tx, workspaceID, snap.Cluster, out.Edges,
-			identityIDs, statementIDs, assignmentIDs, observed); err != nil {
+		if err := m.upsertEdges(tx, workspaceID, snap.Cluster, out.Edges, out.Assignments,
+			identityIDs, statementIDs, assignmentIDs, observed, ref); err != nil {
 			return fmt.Errorf("edges: %w", err)
 		}
-		return nil
+
+		if ref == nil {
+			return nil
+		}
+
+		// Support rows are what make a node visible to reconciliation. A node
+		// written without one is never reconciled -- it simply lives forever,
+		// which is the defect this whole path exists to close.
+		if err := m.upsertSupport(tx, workspaceID, ref, out,
+			identityIDs, policyIDs, statementIDs, observed); err != nil {
+			return fmt.Errorf("support: %w", err)
+		}
+
+		rr, err := k8sgraph.NewReconciler(func() time.Time { return observed }).
+			Reconcile(tx, k8sgraph.ReconcileInput{
+				WorkspaceID: workspaceID, SweepID: ref.SweepID, Scope: ref.Scope,
+			})
+		if err != nil {
+			return fmt.Errorf("reconcile: %w", err)
+		}
+		res.Reconciled = true
+		res.Retired = rr.ObjectsRetired
+		res.Stale = rr.SupportStale + rr.EdgesStale
+		if !snap.Complete {
+			res.Reason = "sweep was incomplete, so absence is not evidence of deletion; " +
+				"what could not be confirmed was marked stale, not ended"
+		} else if !snap.ClusterScoped {
+			res.Reason = "sweep could not read cluster-scoped objects, so ClusterRoles and " +
+				"ClusterRoleBindings were marked stale rather than retired"
+		}
+
+		// The sweep is only 'projected' once its rows and its retirements are
+		// both in. A failed transaction leaves it 'received', which is the
+		// honest record that a reading arrived and was never applied.
+		return tx.Model(&models.IGAK8sSweep{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, ref.SweepID).
+			Updates(map[string]any{
+				"status":       models.K8sSweepProjected,
+				"projected_at": observed,
+			}).Error
 	})
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// resolveSource finds the evidence stream this snapshot belongs to.
+//
+// Returns uuid.Nil rather than an error: a snapshot that cannot be attributed
+// is still worth projecting, it simply may not retire anything. Failing the
+// whole ingest would throw away the new access it reports as well.
+func (m *k8sRBACManager) resolveSource(workspaceID uuid.UUID,
+	snap models.K8sRBACSnapshot, cluster string) uuid.UUID {
+
+	if id, err := uuid.Parse(strings.TrimSpace(snap.DiscoverySourceID)); err == nil {
+		var n int64
+		if m.db.Table("discovery_sources").
+			Where("workspace_id = ? AND id = ?", workspaceID, id).
+			Count(&n).Error == nil && n == 1 {
+			return id
+		}
+	}
+	// Fall back to the cluster name. The agent registers its source before it
+	// ever sweeps, so this resolves for every normally-deployed agent whose
+	// payload simply predates the discovery_source_id field.
+	var row struct{ ID uuid.UUID }
+	if err := m.db.Table("discovery_sources").Select("id").
+		Where("workspace_id = ? AND cluster_name = ?", workspaceID, cluster).
+		Order("created_at ASC").Limit(1).Scan(&row).Error; err != nil {
+		return uuid.Nil
+	}
+	return row.ID
+}
+
+// openSweep records this reading and takes the next generation for the cluster.
+//
+// The generation is read and written inside the caller's transaction, so two
+// snapshots arriving together cannot take the same one -- the unique index on
+// (workspace, source, cluster, generation) makes the loser fail rather than
+// silently share a fencing token with the winner.
+func (m *k8sRBACManager) openSweep(tx *gorm.DB, workspaceID, sourceID uuid.UUID,
+	cluster string, snap models.K8sRBACSnapshot, observed time.Time) (*sweepRef, error) {
+
+	var last int64
+	if err := tx.Table("iga_k8s_sweep").
+		Select("COALESCE(MAX(generation), 0)").
+		Where("workspace_id = ? AND discovery_source_id = ? AND cluster = ?",
+			workspaceID, sourceID, cluster).
+		Scan(&last).Error; err != nil {
+		return nil, err
+	}
+
+	started := observed
+	if t := parseSnapshotTime(snap.SweepStartedAt); !t.IsZero() {
+		started = t
+	}
+
+	row := &models.IGAK8sSweep{
+		ID:                uuid.New(),
+		WorkspaceID:       workspaceID,
+		DiscoverySourceID: sourceID,
+		Cluster:           cluster,
+		Generation:        last + 1,
+		ScanKind:          defaultString(snap.ScanKind, "rbac"),
+		Complete:          snap.Complete,
+		ClusterScoped:     snap.ClusterScoped,
+		Namespaces:        snap.Namespaces,
+		SweepStartedAt:    started,
+		ObservedAt:        observed,
+		Status:            models.K8sSweepReceived,
+	}
+	if err := tx.Create(row).Error; err != nil {
+		return nil, err
+	}
+	return &sweepRef{
+		SourceID: sourceID,
+		SweepID:  row.ID,
+		Scope:    k8sgraph.ScopeOf(snap, sourceID, row.Generation),
+	}, nil
 }
 
 // idsBySourceKey maps every live source_key in a graph table to its row id.
@@ -197,7 +353,7 @@ func (m *k8sRBACManager) idsBySourceKey(tx *gorm.DB, workspaceID uuid.UUID,
 // that something was bound to something we could not see.
 func (m *k8sRBACManager) upsertAssignments(tx *gorm.DB, workspaceID uuid.UUID,
 	as []k8sgraph.Assignment, policyIDs, identityIDs map[string]uuid.UUID,
-	observed time.Time) (map[string]uuid.UUID, error) {
+	observed time.Time, ref *sweepRef) (map[string]uuid.UUID, error) {
 
 	out := make(map[string]uuid.UUID, len(as))
 	for i := range as {
@@ -221,16 +377,27 @@ func (m *k8sRBACManager) upsertAssignments(tx *gorm.DB, workspaceID uuid.UUID,
 			"valid_from":        observed,
 			"last_confirmed_at": observed,
 			"source_key":        a.SourceKey,
-			"partition_key":     a.Namespace,
+			// The partition this binding belongs to, spelled by the same code
+			// the reconciler uses. A bare namespace here -- which is what this
+			// was -- means no retirement query ever matches the row, so the
+			// binding lives forever however carefully the sweep looked.
+			"partition_key": partitionKeyFor(ref, a.Namespace, k8sgraph.TargetAssignment),
+		}
+		update := map[string]any{
+			"policy_id":                  policyID,
+			"holder_identity_account_id": holderID,
+			"assignment_kind":            a.Kind,
+			"last_confirmed_at":          observed,
+			"state":                      "current",
+		}
+		if ref != nil {
+			row["discovery_source_id"] = ref.SourceID
+			row["last_confirmed_sweep_id"] = ref.SweepID
+			update["discovery_source_id"] = ref.SourceID
+			update["last_confirmed_sweep_id"] = ref.SweepID
 		}
 		if err := tx.Table("iga_policy_assignment").
-			Clauses(conflictOn(liveAssignment, map[string]any{
-				"policy_id":                  policyID,
-				"holder_identity_account_id": holderID,
-				"assignment_kind":            a.Kind,
-				"last_confirmed_at":          observed,
-				"state":                      "current",
-			})).Create(row).Error; err != nil {
+			Clauses(conflictOn(liveAssignment, update)).Create(row).Error; err != nil {
 			return nil, err
 		}
 		out[a.SourceKey] = row["id"].(uuid.UUID)
@@ -280,8 +447,18 @@ func (m *k8sRBACManager) assignmentIDs(tx *gorm.DB,
 // calculation. The projector already decided both; this writes them unchanged
 // rather than upgrading a partial edge to look resolved.
 func (m *k8sRBACManager) upsertEdges(tx *gorm.DB, workspaceID uuid.UUID, cluster string,
-	edges []k8sgraph.Edge, identityIDs, statementIDs, assignmentIDs map[string]uuid.UUID,
-	observed time.Time) error {
+	edges []k8sgraph.Edge, assignments []k8sgraph.Assignment,
+	identityIDs, statementIDs, assignmentIDs map[string]uuid.UUID,
+	observed time.Time, ref *sweepRef) error {
+
+	// A grant is owned by the partition of the BINDING that produced it, not of
+	// the role it points at: a RoleBinding in one namespace may reference a
+	// cluster-wide ClusterRole, and it is the binding that disappears when that
+	// namespace is swept.
+	ns := make(map[string]string, len(assignments))
+	for _, a := range assignments {
+		ns[a.SourceKey] = a.Namespace
+	}
 
 	for i := range edges {
 		e := edges[i]
@@ -316,7 +493,7 @@ func (m *k8sRBACManager) upsertEdges(tx *gorm.DB, workspaceID uuid.UUID, cluster
 			"last_confirmed_at":    observed,
 			"observed_at":          observed,
 			"source_key":           e.SourceKey,
-			"partition_key":        cluster,
+			"partition_key":        partitionKeyFor(ref, ns[e.AssignmentKey], k8sgraph.TargetAccessEdge),
 			"created_at":           observed,
 			"updated_at":           observed,
 		}
@@ -327,15 +504,22 @@ func (m *k8sRBACManager) upsertEdges(tx *gorm.DB, workspaceID uuid.UUID, cluster
 			row["assignment_id"] = id
 		}
 
+		update := map[string]any{
+			"calculation_state":    e.CalculationState,
+			"effective_conclusion": e.EffectiveConclusion,
+			"last_confirmed_at":    observed,
+			"observed_at":          observed,
+			"state":                "current",
+			"updated_at":           observed,
+		}
+		if ref != nil {
+			row["discovery_source_id"] = ref.SourceID
+			row["last_confirmed_sweep_id"] = ref.SweepID
+			update["discovery_source_id"] = ref.SourceID
+			update["last_confirmed_sweep_id"] = ref.SweepID
+		}
 		if err := tx.Table("iga_access_edges").
-			Clauses(conflictOn(liveEdge, map[string]any{
-				"calculation_state":    e.CalculationState,
-				"effective_conclusion": e.EffectiveConclusion,
-				"last_confirmed_at":    observed,
-				"observed_at":          observed,
-				"state":                "current",
-				"updated_at":           observed,
-			})).Create(row).Error; err != nil {
+			Clauses(conflictOn(liveEdge, update)).Create(row).Error; err != nil {
 			return err
 		}
 	}
@@ -545,4 +729,111 @@ func parseSnapshotTime(s string) time.Time {
 		return time.Now().UTC()
 	}
 	return t.UTC()
+}
+
+/* ------------------------------- support ---------------------------------- */
+
+// partitionKeyFor spells the partition a row belongs to.
+//
+// ONE SPELLING, used by the writer and the reconciler alike. Two spellings is
+// the duplication bug in its most expensive form here: a support row written
+// under a key no retirement query matches reads as "nothing supports this
+// object", and the object is retired on the next complete sweep -- a revocation
+// the cluster never made.
+//
+// With no sweep (an unattributable snapshot) the key falls back to the bare
+// namespace, which no reconciler scope will ever match. That is deliberate: the
+// rows are projected, and nothing can retire them.
+func partitionKeyFor(ref *sweepRef, namespace, target string) string {
+	if ref == nil {
+		return namespace
+	}
+	return k8sgraph.PartitionForEdge(ref.Scope, namespace, target).Key()
+}
+
+// upsertSupport records, per object, that THIS sweep saw it.
+//
+// Support is what reconciliation reads: an object survives exactly as long as
+// some source still supports it (§2.10B). The upsert is idempotent on
+// (workspace, object, source_ref, partition) -- the partial unique indexes 041
+// rebuilt on source_ref -- so a re-delivered snapshot refreshes the row rather
+// than adding a second one.
+func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *sweepRef,
+	out k8sgraph.Result, identityIDs, policyIDs, statementIDs map[string]uuid.UUID,
+	observed time.Time) error {
+
+	// A statement belongs to the partition of the role that declares it: a
+	// ClusterRole's rules are cluster-scoped, a Role's are namespaced. Resolving
+	// it from the policy rather than guessing is what keeps a namespaced sweep
+	// from retiring a ClusterRole's rules.
+	policyNS := make(map[string]string, len(out.Policies))
+	for _, p := range out.Policies {
+		policyNS[p.SourceKey] = p.Namespace
+	}
+
+	type item struct {
+		col       string
+		id        uuid.UUID
+		partition k8sgraph.Partition
+	}
+	var items []item
+
+	for _, n := range out.Identities {
+		if id, ok := identityIDs[n.SourceKey]; ok {
+			items = append(items, item{"identity_account_id", id,
+				k8sgraph.PartitionForIdentity(ref.Scope, n.Namespace)})
+		}
+	}
+	for _, n := range out.Policies {
+		if id, ok := policyIDs[n.SourceKey]; ok {
+			items = append(items, item{"policy_id", id,
+				k8sgraph.PartitionForRole(ref.Scope, n.Namespace)})
+		}
+	}
+	for _, st := range out.Statements {
+		id, ok := statementIDs[st.StatementKey]
+		if !ok {
+			continue
+		}
+		items = append(items, item{"entitlement_id", id, k8sgraph.Partition{
+			SourceID: ref.Scope.SourceID, Cluster: ref.Scope.Cluster,
+			Namespace: policyNS[st.PolicyKey], Class: k8sgraph.ClassEntitlement,
+		}})
+	}
+
+	for _, it := range items {
+		row := map[string]any{
+			"id":                      uuid.New(),
+			"workspace_id":            workspaceID,
+			it.col:                    it.id,
+			"discovery_source_id":     ref.SourceID,
+			"partition_key":           it.partition.Key(),
+			"state":                   models.RelCurrent,
+			"first_seen_at":           observed,
+			"last_confirmed_sweep_id": ref.SweepID,
+			"last_confirmed_at":       observed,
+		}
+		if err := tx.Table("iga_object_support").
+			Clauses(clause.OnConflict{
+				Columns: []clause.Column{
+					{Name: "workspace_id"}, {Name: it.col},
+					{Name: "source_ref"}, {Name: "partition_key"},
+				},
+				TargetWhere: clause.Where{Exprs: []clause.Expression{
+					gorm.Expr(it.col + " IS NOT NULL"),
+				}},
+				DoUpdates: clause.Assignments(map[string]any{
+					// Re-confirming revives a row that a previous sweep ended or
+					// marked stale: the object is plainly here again, and
+					// leaving it ended would retire a live object forever.
+					"state":                   models.RelCurrent,
+					"ended_reason":            "",
+					"last_confirmed_sweep_id": ref.SweepID,
+					"last_confirmed_at":       observed,
+				}),
+			}).Create(row).Error; err != nil {
+			return fmt.Errorf("%s support: %w", it.col, err)
+		}
+	}
+	return nil
 }
