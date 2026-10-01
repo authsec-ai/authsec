@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/k8sread"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/google/uuid"
@@ -217,5 +218,109 @@ func TestIngestIsIdempotent(t *testing.T) {
 	if n := count(t, db, `SELECT count(*) FROM iga_access_edges
 	    WHERE workspace_id = ? AND provider = 'k8s' AND state = 'current'`, ws); n == 0 {
 		t.Error("an identical re-delivery ended the grant it re-confirmed")
+	}
+}
+
+// Write and read must agree. This is where a provider filter or a column that
+// exists only on the write side fails silently: the ingest reports success, the
+// rows are in the table, and every screen shows an empty cluster.
+func TestIngestIsReadableBack(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+
+	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	q := k8sread.New(db, ws)
+
+	clusters, err := q.Clusters()
+	if err != nil {
+		t.Fatalf("clusters: %v", err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1", len(clusters))
+	}
+	cl := clusters[0]
+	if cl.LastSweep == nil {
+		t.Fatal("cluster has no last sweep; the reading behind the answer is missing")
+	}
+	if cl.LastSweep.Coverage != k8sread.CoverageComplete {
+		t.Errorf("coverage = %q, want %q", cl.LastSweep.Coverage, k8sread.CoverageComplete)
+	}
+	if cl.ServiceAccounts == 0 || cl.Roles == 0 || cl.Grants == 0 {
+		t.Errorf("cluster reads back empty: %+v", cl)
+	}
+
+	ids, err := q.Identities(50)
+	if err != nil {
+		t.Fatalf("identities: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Fatal("no identities read back although ingest wrote them")
+	}
+	var sa k8sread.Identity
+	for _, i := range ids {
+		if i.Grants > 0 {
+			sa = i
+			break
+		}
+	}
+	if sa.ID == (uuid.UUID{}) {
+		t.Fatal("no identity has a grant; the subject join is wrong")
+	}
+
+	grants, sum, err := q.AccessFor(sa.ID)
+	if err != nil {
+		t.Fatalf("access: %v", err)
+	}
+	if len(grants) == 0 {
+		t.Fatal("identity has grants in the list but none in its detail")
+	}
+	g := grants[0]
+	if g.RoleName != "secret-reader" {
+		t.Errorf("role_name = %q, want secret-reader: the chain did not resolve", g.RoleName)
+	}
+	if len(g.Verbs) == 0 || len(g.Resources) == 0 {
+		t.Errorf("rule read back without verbs or resources: %+v", g)
+	}
+	if g.CalculationState != "complete" {
+		t.Errorf("calculation_state = %q, want complete for a fully resolved chain", g.CalculationState)
+	}
+	if sum.Note == "" {
+		t.Error("summary carries no note; an empty or short list would be unexplained")
+	}
+	if sum.Complete == 0 {
+		t.Errorf("summary says nothing was fully calculated: %+v", sum)
+	}
+}
+
+// A sweep that could not read cluster-wide must SAY so on the way out, not just
+// behave differently inside the reconciler.
+func TestReadReportsAPartialSweepHonestly(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+
+	// Complete, but namespaced only.
+	snap := snapshot(ws, src, true, true, false)
+	if _, err := mgr.Ingest(ws, snap); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	clusters, err := k8sread.New(db, ws).Clusters()
+	if err != nil {
+		t.Fatalf("clusters: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].LastSweep == nil {
+		t.Fatal("no cluster or no sweep")
+	}
+	sw := clusters[0].LastSweep
+	if sw.Coverage != k8sread.CoverageNamespaced {
+		t.Errorf("coverage = %q, want %q", sw.Coverage, k8sread.CoverageNamespaced)
+	}
+	if sw.Limitation == "" {
+		t.Error("a namespaced-only sweep reported no limitation; the gap would be invisible")
 	}
 }

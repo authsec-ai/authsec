@@ -1623,6 +1623,7 @@ func SetupRoutes(
 			// Everything that CHANGES a connection is discovery:admin: connecting an
 			// AWS account decides what a scan may read and what it will cost.
 			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
+			k8sGraph := platformCtrl.NewK8sGraphController(config.DB)
 			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
 			// Quick Create: starting a session is admin, like POST /aws/connectors,
 			// because the link it returns connects an account. Reading one is not.
@@ -1657,6 +1658,19 @@ func SetupRoutes(
 			// connector is written after publication and so lags the run.
 			discovery.GET("/aws/scan-runs/:id", middlewares.Require("discovery", "read"), cloudAWS.GetScanRun)
 			discovery.GET("/aws/identities", middlewares.Require("discovery", "read"), cloudAWS.ListIdentities)
+
+			// ────────────────────────────────────────────────────────
+			// The Kubernetes identity graph.
+			//
+			// A separate surface from /aws/* because the questions differ. AWS
+			// asks which account and which region; Kubernetes asks which
+			// cluster, which namespace, and -- the one that decides how much
+			// the answer is worth -- whether the agent could read cluster-scoped
+			// objects at all. Every response carries the sweep behind it, so an
+			// empty list is never mistaken for "no access".
+			discovery.GET("/k8s/clusters", middlewares.Require("discovery", "read"), k8sGraph.ListClusters)
+			discovery.GET("/k8s/identities", middlewares.Require("discovery", "read"), k8sGraph.ListIdentities)
+			discovery.GET("/k8s/identities/:id/access", middlewares.Require("discovery", "read"), k8sGraph.GetAccess)
 			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
 
 			// Trust relationships and permission/resource extraction: who may
