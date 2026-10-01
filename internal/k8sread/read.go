@@ -251,6 +251,59 @@ func (q *Query) Identities(limit int) ([]Identity, error) {
 	return out, err
 }
 
+// Workload is a runtime object and what it runs as.
+type Workload struct {
+	ID          uuid.UUID `json:"id"`
+	DisplayName string    `json:"display_name"`
+	Namespace   string    `json:"namespace"`
+	Lifecycle   string    `json:"lifecycle"`
+
+	// RunsAs is the ServiceAccount this workload executes as, when one was
+	// resolvable. Empty is a real answer: a workload whose identity we could
+	// not determine is a gap, not an absence of access.
+	RunsAs   string     `json:"runs_as,omitempty"`
+	RunsAsID *uuid.UUID `json:"runs_as_id,omitempty"`
+	// Basis is 'observed' when the agent saw the Pod's serviceAccountName and
+	// 'declared' when only the configured anchor is known.
+	Basis string `json:"basis,omitempty"`
+	// Grants is how much that identity can do. This is the number the product
+	// exists to produce: what this agent can actually reach.
+	Grants int `json:"grants"`
+}
+
+// Workloads lists the runtime objects and their execution identities.
+func (q *Query) Workloads(limit int) ([]Workload, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	var out []Workload
+	err := q.tx.Raw(`
+		SELECT w.id,
+		       w.display_name,
+		       COALESCE(w.provider_attrs->>'namespace', '') AS namespace,
+		       w.lifecycle,
+		       COALESCE(i.display_name, '') AS runs_as,
+		       i.id   AS runs_as_id,
+		       COALESCE(r.basis, '') AS basis,
+		       (SELECT count(*) FROM iga_access_edges e
+		         WHERE e.workspace_id = w.workspace_id
+		           AND e.provider = ?
+		           AND e.subject_identity_account_id = i.id
+		           AND e.state = 'current') AS grants
+		  FROM iga_workload w
+		  LEFT JOIN iga_relationship r
+		         ON r.workspace_id = w.workspace_id
+		        AND r.source_workload_id = w.id
+		        AND r.relationship_type = 'executes_as'
+		        AND r.state <> 'ended'
+		  LEFT JOIN iga_identity_accounts i
+		         ON i.workspace_id = w.workspace_id AND i.id = r.target_identity_account_id
+		 WHERE w.workspace_id = ? AND w.provider = ?
+		 ORDER BY grants DESC, w.display_name
+		 LIMIT ?`, models.ProviderK8s, q.WS, models.ProviderK8s, limit).Scan(&out).Error
+	return out, err
+}
+
 // Grant is one resolved step of what an identity can do.
 //
 // It is deliberately the WHOLE chain in one row -- binding, role, rule -- rather

@@ -324,3 +324,142 @@ func TestReadReportsAPartialSweepHonestly(t *testing.T) {
 		t.Error("a namespaced-only sweep reported no limitation; the gap would be invisible")
 	}
 }
+
+// seedAgent inserts a discovered agent running as the ServiceAccount the RBAC
+// snapshot grants secrets to -- the join that makes "this agent can read
+// secrets" answerable.
+func seedAgent(t *testing.T, db *gorm.DB, ws uuid.UUID, anchor, runtime string) string {
+	t.Helper()
+	fp := "fp-" + uuid.New().String()[:8]
+	md := `{"cluster":{"name":"` + cluster + `"},"kubernetes":{"namespace":"iga-demo"},` +
+		`"provisioning_hints":{"identity_anchor":"` + anchor + `"}}`
+	if err := db.Exec(`INSERT INTO discovered_agents
+	    (workspace_id,source,fingerprint,display_name,metadata,status,runtime_status,
+	     observed_service_account)
+	    VALUES (?,?,?,?,?::jsonb,'unregistered',?,?)`,
+		ws, "k8s_webhook", fp, "research-agent", md, runtime, anchor).Error; err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	return fp
+}
+
+// The product question, end to end: a Pod runs as a ServiceAccount, and that
+// ServiceAccount can read secrets.
+func TestWorkloadsLinkToTheirIdentities(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
+
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	res, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true))
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if res.Workloads == 0 {
+		t.Fatal("no workloads projected although a discovered agent exists")
+	}
+	if res.ExecutesAs == 0 {
+		t.Fatalf("no executes_as edge: the workload was not linked to its identity (%+v)", res)
+	}
+
+	// The edge must point at the ServiceAccount the RBAC sweep knows about.
+	var n int
+	if err := db.Raw(`
+		SELECT count(*) FROM iga_relationship r
+		  JOIN iga_workload w          ON w.id = r.source_workload_id
+		  JOIN iga_identity_accounts i ON i.id = r.target_identity_account_id
+		 WHERE r.workspace_id = ? AND r.relationship_type = 'executes_as'
+		   AND r.state = 'current'
+		   AND i.display_name = 'system:serviceaccount:iga-demo:research'`, ws).
+		Scan(&n).Error; err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if n == 0 {
+		t.Error("executes_as does not reach the ServiceAccount the sweep projected")
+	}
+}
+
+// A bare ServiceAccount name cannot be resolved to a namespace. Guessing one
+// would attach the workload to another namespace's identically-named account.
+func TestWorkloadWithABareNameIsNotGuessed(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	seedAgent(t, db, ws, "research", "running") // bare, not an anchor
+
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	res, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true))
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if res.Unanchored == 0 {
+		t.Error("a bare ServiceAccount name was resolved anyway; it has no namespace to resolve with")
+	}
+	if res.ExecutesAs != 0 {
+		t.Error("an executes_as edge was invented from a bare name")
+	}
+}
+
+// An agent observed gone retires its workload and ends the edge -- but the RBAC
+// sweep, which never lists a Pod, must not be what decides that.
+func TestGoneWorkloadIsRetired(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	fp := seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
+
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	live := `SELECT count(*) FROM iga_relationship
+	          WHERE workspace_id = ? AND relationship_type = 'executes_as' AND state = 'current'`
+	if count(t, db, live, ws) == 0 {
+		t.Fatal("no current executes_as after the first ingest")
+	}
+
+	// The resync manifest -- not this sweep -- observes the Pod gone.
+	if err := db.Exec(`UPDATE discovered_agents SET runtime_status = 'gone'
+	    WHERE workspace_id = ? AND fingerprint = ?`, ws, fp).Error; err != nil {
+		t.Fatalf("mark gone: %v", err)
+	}
+	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if n := count(t, db, live, ws); n != 0 {
+		t.Errorf("%d executes_as still current after the workload was observed gone", n)
+	}
+	if n := count(t, db, `SELECT count(*) FROM iga_workload
+	    WHERE workspace_id = ? AND provider = 'k8s' AND lifecycle = 'retired'`, ws); n == 0 {
+		t.Error("the gone workload was not retired")
+	}
+}
+
+// The whole chain, read back the way a screen will read it: agent -> identity
+// -> grants. If this passes, the product can answer its own question.
+func TestWorkloadReadsBackWithItsAccess(t *testing.T) {
+	db := ingestDB(t)
+	ws, src := seedWorkspace(t, db)
+	seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
+
+	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	wls, err := k8sread.New(db, ws).Workloads(50)
+	if err != nil {
+		t.Fatalf("workloads: %v", err)
+	}
+	if len(wls) == 0 {
+		t.Fatal("no workloads read back")
+	}
+	w := wls[0]
+	if w.RunsAs != "system:serviceaccount:iga-demo:research" {
+		t.Errorf("runs_as = %q; the execution identity did not resolve", w.RunsAs)
+	}
+	if w.Grants == 0 {
+		t.Error("workload reports 0 grants although its identity can read secrets")
+	}
+	if w.Basis == "" {
+		t.Error("no basis on the execution edge; the claim is unqualified")
+	}
+}

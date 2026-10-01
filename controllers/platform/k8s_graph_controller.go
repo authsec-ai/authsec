@@ -94,6 +94,30 @@ func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"grants": grants, "summary": sum})
 }
 
+// ListWorkloads handles GET /authsec/discovery/k8s/workloads.
+//
+// The screen this serves answers the product's actual question -- "what can
+// this agent reach" -- by naming the identity each workload runs as and how
+// much that identity can do.
+func (ctl *K8sGraphController) ListWorkloads(c *gin.Context) {
+	ws, ok := ctl.ws(c)
+	if !ok {
+		return
+	}
+	out, err := k8sread.New(ctl.db, ws).Workloads(igaLimit(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workloads": out,
+		"meta": gin.H{
+			"note": "runs_as is the configured or observed execution identity; it " +
+				"does not assert the workload made any request",
+		},
+	})
+}
+
 func (ctl *K8sGraphController) ws(c *gin.Context) (uuid.UUID, bool) {
 	raw := c.GetString("workspace_id")
 	id, err := uuid.Parse(raw)
