@@ -1,23 +1,29 @@
-# SPEC: IGA roadmap — from today to the identity graph
+# SPEC: IGA roadmap — discovery, identity graph, policy enforcement
 
-> **The single delivery plan.** Where the product is, the foundations every phase
-> rests on, the invariants every phase honours, and the six phases that end with a
-> customer walking a real AWS workload to the permissions it holds.
+> **Phase numbering updated 1 October 2026.** Phase 1 is connect and collect;
+> Phase 2 is the complete scanning-to-declared-access-graph journey, including
+> entitlement relationships, traversal APIs and console; Phase 3 is policy
+> creation and enforcement. Phase 3 R1a/R1b/R2/R3 are release increments, not separate
+> numbered phases. Renumbering does not certify implementation or deployment.
 >
-> The phase being implemented has its own document with its schema, tasks and
-> acceptance tests. Today that is
-> [SPEC-iga-phase1-collect.md](SPEC-iga-phase1-collect.md); the phase after it
-> is [SPEC-iga-phase2-graph.md](SPEC-iga-phase2-graph.md).
+> Phase 1 contracts: [SPEC-iga-phase1-collect.md](SPEC-iga-phase1-collect.md).
+> Phase 2 target: [SPEC-iga-phase2-graph.md](SPEC-iga-phase2-graph.md).
+> Phase 3 proposed customer requirements:
+> [Phase 3 policy requirements](SPEC-iga-phase3-policy-requirements.md).
+> The Phase 3 implementation spec is still to be authored and approved; existing
+> Kubernetes policy code is review input, not its design authority.
 >
 > Product context: [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md).
-> **Verified 2026-09-15** against the live cluster and the tree at `aac6f5a`
-> (`origin/authsec-staging` through `d3504b1`, PR #54).
+> Sections 1–3 retain the earlier graph planning/reference material; dated source
+> claims there are not a current implementation audit. Where contracts conflict,
+> the active Phase 2 spec governs graph delivery, and the approved forthcoming
+> Phase 3 spec will govern policy enforcement.
 
 ---
 
-## 1. Where we are
+## 1. Historical implementation snapshot (15 September 2026)
 
-### 1.1 Built and serving
+### 1.1 Reported built and serving in that snapshot
 
 AWS discovery is wired end to end at a basic level. `routes/routes.go:1647–1683`
 serves onboarding, connector create/list/get/verify/revoke, `POST
@@ -41,7 +47,7 @@ Two other sources exist and are **not** part of this roadmap's scope:
 the GitHub IGA provider (`services/iga_github_provider.go`) and the
 `authsec-iga-agent` Kubernetes collector running in `authsec-system`.
 
-### 1.2 Broken or missing
+### 1.2 Reported gaps in that snapshot; recheck before implementation
 
 | Defect | Where | Consequence |
 |---|---|---|
@@ -136,7 +142,7 @@ created by migrations `015`–`017` but missing from `001_bootstrap.sql`, so a
 fresh install and a migrated database disagreed — a new install failed scans with
 `relation "cloud_scan_checkpoint" does not exist`. Bootstrap now mirrors them.
 
-### 1.3 Open security defects, independent of phases
+### 1.3 Security findings recorded in that snapshot, independent of phases
 
 | ID | Defect | Gate |
 |---|---|---|
@@ -226,8 +232,12 @@ Enumerated from the SDK clients imported in non-test code: `iam`, `sts`,
 | AgentCore | `ListAgentRuntimes`, `GetAgentRuntime` | per region |
 | EKS | `ListClusters`, `DescribeCluster`, `ListPodIdentityAssociations`, `DescribePodIdentityAssociation` | per region |
 
-**Granted but not collected.** The CloudFormation role asks for these and no
-collector calls them: `cloudtrail:LookupEvents`/`DescribeTrails`/`GetTrailStatus`;
+**Historical collection-gap list; not current coverage authority.** The earlier
+review listed the following calls as granted but uncollected. Current source now
+contains `internal/awsdiscovery/cloudtrail_events.go`, with a bounded management-
+event reader; Phase 3 requires deeper history and attribution. Recheck every
+remaining entry against the active collectors and coverage manifest:
+`cloudtrail:LookupEvents`/`DescribeTrails`/`GetTrailStatus`;
 `bedrock-agentcore:ListGateways`/`ListGatewayTargets`/`ListWorkloadIdentities`/
 `ListOauth2CredentialProviders`/`ListApiKeyCredentialProviders`;
 `iam:GenerateCredentialReport`/`GetCredentialReport`/`GetAccountAuthorizationDetails`.
@@ -444,16 +454,18 @@ One current grant per assignment, enforced by a partial unique index
 `WHERE state <> 'ended'`, so re-attachment opens a new period instead of
 colliding with the closed one.
 
-### 3.5a Constraints are recorded, never evaluated
+### 3.5a Declared-graph constraints and policy evaluation are separate
 
 A permission row says what a document grants. Four things narrow that, and each
 is stored rather than applied: a `Condition`, a `NotAction`, a `NotResource`, and
 the identity's permissions boundary.
 
 `constraint_state` carries the result — `unconstrained | conditional | negated |
-bounded`. **Only `unconstrained` may be rendered as plain access**, and database
-checks refuse a row that carries a condition or a negation while claiming
-otherwise. A boundary's own statements are stored with `derivation = 'boundary'`:
+bounded`. These describe collected constraints, not effective authorization.
+Even an unconstrained declared statement is not proof of successful access.
+Database checks must preserve constraint information. Phase 3 adds separately
+scoped evaluation and verification; it does not relabel declared graph edges as
+effective access. A boundary's own statements are stored with `derivation = 'boundary'`:
 they never grant, they cap.
 
 This is the line between this milestone and effective access. We can say "this
@@ -491,24 +503,31 @@ available for reparsing.
 
 ## 4. The phases
 
-Each phase ends with something a person can see, so progress is never a claim
-about internal state.
+Each phase ends with a customer-visible outcome and executed acceptance evidence.
+The former entitlement, traversal and console phases are consolidated into Phase 2;
+there is no separate Phase 3 “Entitlement graph” or deferred Phase 4/5 graph UI.
 
 | Phase | Delivers | Depends on | Exit gate |
 |---|---|---|---|
-| **0 · Foundations** | §2 of this document | — | **Closed.** Topology, membership contract, constraints, coverage manifest and budgets decided |
-| **1 · Connect and collect** | Durable scan execution, evidence written by cloud collectors, idempotent upserts, the CI boundary check, the membership interface, verified bindings on the new path | Phase 0 | A real account is verified; selected APIs paginate; a failed detail call cannot masquerade as complete collection; worker death or retry cannot publish partial or older state as current |
-| **2 · Objects and identity graph** | Durable per-run coverage and evidence, recognition keys, workloads and identities, typed relationships on both ends, a separately-fenced projector, real agent/instance read path | 1 | Repeat scan keeps IDs and `first_seen_at`; role replacement closes the old edge; key rotation preserves the account; recreation is recorded; a registered agent is distinguished from native discovery |
-| **3 · Entitlement graph** | Lossless policy documents, operative-version history, statement revisions, assignment periods, scoped resource resolution | 2 | Parser acceptance (§5) passes; policy edits and detach/reattach preserve history; every relationship has valid evidence and typed workspace-scoped endpoints |
-| **4 · Traversal API** | Workspace-authorized inventories, scan status and coverage, bounded graph and evidence reads under §2.4 | 3 | Foreign-workspace IDs rejected; current and history reads pin a publication; limits and missing coverage explicit |
-| **5 · Console** | AWS connection and status, identity inventory, runtime/agent detail, relationship view, evidence drawer | 4 | A customer walks a real workload-to-permission path, changes the source, rescans, and sees the change without duplication or invented certainty |
+| **0 · Foundations** | Topology, tenant/membership authority, scope/coverage and lifecycle contracts | — | Approved contracts and reproducible baseline checks; no assumed isolation |
+| **1 · Connect and collect** | AWS onboarding, durable scanning, evidence, pagination, coverage and stable inventory | 0 | Real-account scan and recovery; failed reads cannot masquerade as complete; superseded work cannot publish |
+| **2 · End-to-end identity and declared-access graph** | Objects, entitlement/statement/assignment history, typed evidenced relationships, publication/reconciliation, bounded traversal APIs, inventories and usable console | 1 | Customer follows a real workload through identity and declared permissions to resources, examines evidence, changes the source and sees a safe rescan; parser (§5), workspace, lifecycle and UI gates pass |
+| **3 · Policy creation and enforcement** | Findings-driven right-sizing, policy lifecycle and AWS arm, preview, approval, rollout, verification, drift/reversal; later time-bound and runtime increments | 2 plus each capability's evidence prerequisites | Actual supported policy outcome traced from finding/UI to provider artifact and scoped operational evidence, including failure/recovery; relevant MUST gates in the approved Phase 3 spec pass |
 
-Phase 2 must re-prove A2's per-scope invariant on the new ingestion path — it is
-new code writing new tables and inherits nothing.
+**Phase 3 increments:** R1a delivers service-level right-sizing using existing
+Access Advisor evidence, generated proposals, owner review before observation or
+canary, static impact preview, Slack/UI approval, direct or Terraform/CloudFormation
+PR delivery and scoped verification. It does not depend on upgraded CloudTrail.
+R1b adds action-level right-sizing with attributable history, relevant data events
+and historical what-if, reusing the same workflow. R2 adds broader time-bound
+access, native expiry, session revocation and expanded identity-split support;
+R1a already includes shared-role impact and a supported split path. R3 adds
+mandatory gateway/tool controls, human approval and session budgets. These labels
+reserve no automatic completion status.
 
-Native-agent acceptance in Phase 5 additionally requires a real supported
-provider agent. A scripted fixture is labelled registered/simulated and does not
-pass it.
+Phase 2 re-proves per-scope reconciliation and publication invariants on its own
+code path. Native-agent claims require a real supported provider agent; a fixture
+labelled registered/simulated does not establish provider-native discovery.
 
 ### API and console contract
 
@@ -544,7 +563,8 @@ end.
 
 ## 5. Parser acceptance
 
-Required before Phase 3 closes. These encode known parser failures as tests.
+Required before Phase 2 closes and before Phase 3 relies on parsed policy
+semantics. These are acceptance requirements, not reported test results.
 
 | Case | Expected |
 |---|---|
@@ -558,28 +578,32 @@ Required before Phase 3 closes. These encode known parser failures as tests.
 
 ---
 
-## 6. Non-goals
+## 6. Boundaries between graph delivery and policy enforcement
 
-Stated so a demo cannot imply otherwise.
+- **Phase 2 is a declared-access graph.** A configured path is evidence of a
+  grant or relationship, never universal proof that a request succeeds. Phase 3
+  adds capability-scoped evaluation, native changes and verification separately.
+- **Activity has a source and coverage.** Access Advisor reports attempts at its
+  supported grain. Current source also contains bounded CloudTrail management-
+  event collection; that is not complete data-plane history or reliable role-
+  session attribution. Phase 3 R1a qualifies service-level evidence; R1b supplies
+  the upgraded history required for action-level recommendations and replay.
+- **Resource selectors are not resource enumeration.** Phase 3 must collect or
+  explicitly qualify the resource and policy context required by each supported
+  operation; graph presence alone cannot authorize mutation.
+- **Runtime enforcement is a distinct capability.** Gateway discovery does not
+  prove that requests traverse a mandatory enforcement boundary. Phase 3 R3 must
+  prove routing, identity, approval, budget and bypass behavior.
+- **Discovery credentials never write.** Phase 3 adds separate opt-in enforcement
+  authority and respects customer-owned Terraform/CloudFormation workflows.
+- **Preserve existing integrations.** Kubernetes, GitHub and legacy runtime
+  functionality remain intact. AWS is the first end-to-end enforcement focus,
+  not the entire product or permission to remove other providers.
+- **No name-based identity merging or speculative graph database requirement.**
+  Preserve immutable incarnation, evidence, ownership and measured scale.
 
-- **No effective access.** Conditions are stored, never evaluated. Service
-  control policies, permission boundaries and session policies are out of scope.
-  A path is evidence of a grant, never proof a request succeeds.
-- **No observed usage.** No CloudTrail client exists. Activity is Access-Advisor
-  attempts, which include denied ones.
-- **No resource inventory.** Selectors are preserved; buckets and tables are
-  never enumerated, so a concrete resource node waits for a later surface.
-- **No gateway path.** AgentCore gateway and target reads are granted but
-  uncollected, so the tool-chain segment is absent rather than guessed.
-- **No merging on names.**
-- **No graph database.** Revisit on measured traversal and scale.
-- **No second source.** The `authsec-iga-agent` Kubernetes collector and GitHub
-  discovery are out of scope until AWS delivers one source end to end. Not
-  precluded: their output arrives as observations against source objects, so
-  adding one later is a new source type and a coverage row, not a schema change.
-- **No remediation.** Discovery credentials can never write. Remediation needs a
-  separate role and separate consent.
-
-Governance policies, certification and source remediation sit on top of this
-graph and are later features. Nothing here may preclude them, which is why
-`basis`, evidence links and grant handles exist now rather than being retrofitted.
+The graph remains useful independently of enforcement. Policy deployment does
+not erase the collected grants; the UI overlays desired controls, observed
+artifacts and scoped verification with distinct states. Certification and other
+broader governance work retain their own explicit scope and future acceptance
+gates rather than being implied by completion of Phase 3 R1a or R1b.
