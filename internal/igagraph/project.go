@@ -331,7 +331,7 @@ func (p *Projector) support(tx *gorm.DB, snap *Snapshot, class string, id uuid.U
 	now := p.at // D-26: the pass's one timestamp
 	row := &models.IGAObjectSupport{
 		WorkspaceID:        snap.Run.WorkspaceID,
-		ConnectorID:        snap.Run.ConnectorID,
+		ConnectorID:        &snap.Run.ConnectorID,
 		PartitionKey:       part.Key(),
 		State:              models.RelCurrent,
 		LastConfirmedRunID: &snap.Run.ID,
