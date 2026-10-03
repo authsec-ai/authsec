@@ -2,7 +2,7 @@
 
 Updated: 1 October 2026.
 
-**Outcome:** remove unnecessary standing access while preserving application behavior. AuthSec owns policy lifecycle; AWS enforces native controls. This brief defines requirements for the forthcoming canonical implementation spec. All acceptance gates remain to be executed; numeric targets are planning estimates unless explicitly sourced. Existing Kubernetes code is review input, not design authority. Preserve existing integrations and runtime behavior.
+**Outcome:** remove unnecessary standing access while preserving application behavior. AuthSec owns policy lifecycle; AWS enforces native controls. This brief defines requirements for Phase 3. R1a is specified in [SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md) (draft for review); R1b, R2 and R3 each need their own implementation spec. All acceptance gates remain to be executed; numeric targets are planning estimates unless explicitly sourced. Existing Kubernetes code is review input, not design authority. Preserve existing integrations and runtime behavior.
 
 ## 1. Customers and day one
 

@@ -10,14 +10,16 @@
 > Phase 2 target: [SPEC-iga-phase2-graph.md](SPEC-iga-phase2-graph.md).
 > Phase 3 proposed customer requirements:
 > [Phase 3 policy requirements](SPEC-iga-phase3-policy-requirements.md).
-> The Phase 3 implementation spec is still to be authored and approved; existing
-> Kubernetes policy code is review input, not its design authority.
+> Phase 3 R1a implementation spec (draft for review):
+> [SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md); R1b, R2 and R3 need
+> their own specs. Existing Kubernetes policy code is review input, not its
+> design authority.
 >
 > Product context: [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md).
 > Sections 1–3 retain the earlier graph planning/reference material; dated source
 > claims there are not a current implementation audit. Where contracts conflict,
-> the active Phase 2 spec governs graph delivery, and the approved forthcoming
-> Phase 3 spec will govern policy enforcement.
+> the active Phase 2 spec governs graph delivery, and each approved Phase 3
+> increment spec governs its policy enforcement.
 
 ---
 
