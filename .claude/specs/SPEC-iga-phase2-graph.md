@@ -1037,23 +1037,18 @@ rows in `cloud_workload`. The IA exposes all three without distinguishing them.
 **Navigation is grouped by the customer's task**, and every existing route
 keeps working (bookmarks, redirects and `?connector=` links included):
 
-| Group | Item | Route | What it is for, in its own subtitle |
-|---|---|---|---|
-| **Explore** | Agents & workloads | `/iga/estate` | Find a workload and start an investigation — the projected identity graph |
-| **Governance** | Provenance, Access Certification, Separation of Duties, Birthrights & Lifecycle, Enforcement queue | unchanged | Unchanged capabilities. They govern workspace users, service accounts and OAuth clients; nothing in them implies an action on AWS objects from the graph |
-| **Data sources** | Integrations | `/iga/integrations` | Connect, verify, scan and troubleshoot collection |
-| | Agent sightings | `/iga/agents` | Agents found in repositories and clusters that need a decision — claim, provision or quarantine. The existing Discovered Agents workflow, renamed for its purpose; it is not a second copy of Agents & workloads |
-| | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists. Its tiles are the tab's kind / attribution / sensitivity filters; one flat row carries search, type chips and the account scope |
+| Sidebar | Route | What it is for |
+|---|---|---|
+| **Accounts & clusters** | `/iga/sources` | What is connected and whether it is reporting (replaces Integrations; scan rules live inside a GitHub organisation) |
+| **Discovery** | `/iga/discovery` | Everything found — workloads, identities, resources, agent sightings — from every source, one search, one set of filters, a *Graph* / *As collected* view (replaces Agents & workloads, Cloud Inventory, Agent sightings, Kubernetes access and the Identities / Resources lists) |
+| **Policy** | `/iga/policy` | Decisions over discovered objects — a preview on sample data until its backend is dependable |
+| **Logs** | `/iga/logs` | What happened, when, by whom — a preview on sample data |
 
-Cloud Inventory's Identities and Resources tabs are **the** list of each: the
-graph's own estate-wide lists (`/iga/identities`, `/iga/resources`) redirect
-to them. An identity's, resource's or external principal's graph page is the
-detail view behind that list — its breadcrumb reads *Cloud Inventory ·
-Identities* (or *· Resources*) and Cloud Inventory stays active in the
-sidebar. From a row, *Open in graph* reaches it: identities and compute by the
-source-key lookup (§5.3 *Lookup*), resources by an exact full-ARN match against
-the graph's exact references (none when no statement names it exactly).
-| | Detection Rules | `/iga/detection-rules` | What a repository scan looks for |
+The design of these four screens, the object card that heads every object
+page and the redirects from every earlier route are in
+[`SPEC-console-revamp.md`](SPEC-console-revamp.md). Governance pages leave
+the sidebar but keep their routes. Object pages keep theirs and are reached
+from Discovery.
 
 - **One breadcrumb**, the global one, using the sidebar's own labels, ending
   in the current object's name on every object and detail page (graph
