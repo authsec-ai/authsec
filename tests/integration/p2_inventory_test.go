@@ -47,8 +47,14 @@ func TestP2InventoryEveryProvider(t *testing.T) {
 
 	rows, body := l.list(invWorkloads)
 	invWant(t, "workload names", invNames(rows), []string{"billing-fn", "checkout", "Deploy_100%", "repo-agent", "stale-mixed"})
+	// No AWS publication in the fixture, and the Kubernetes source has never
+	// swept: the rows are AWS and others, so the result is mixed, with the
+	// cluster's not_swept note.
 	invWant(t, "meta", body["meta"], map[string]any{
-		"limit": float64(50), "next_cursor": nil, "total_known": true, "total": float64(5)})
+		"limit": float64(50), "next_cursor": nil, "total_known": true, "total": float64(5),
+		"rev": nil, "published_at": nil, "graph_state": "mixed",
+		"coverage": []any{map[string]any{"account_id": invCluster, "surface": "k8s_sweep", "state": "not_swept",
+			"affects": "no sweep has been received, so this cluster has no inventory yet"}}})
 
 	aws := invRow(t, rows, "billing-fn")
 	invWant(t, "aws workload", aws, map[string]any{
@@ -58,6 +64,8 @@ func TestP2InventoryEveryProvider(t *testing.T) {
 		"sub_scope": "us-east-1", "lifecycle": "active", "retired_reason": nil, "state": "current",
 		"first_seen_at": invBase.Format(time.RFC3339), "last_seen_at": invBase.Add(time.Hour).Format(time.RFC3339),
 		"attrs": map[string]any{"package_type": "Zip"},
+		// Nothing is published in this fixture, so no AWS row can claim it.
+		"as_of": nil,
 	})
 	k8s := invRow(t, rows, "checkout")
 	invWant(t, "k8s workload", k8s, map[string]any{
@@ -66,7 +74,8 @@ func TestP2InventoryEveryProvider(t *testing.T) {
 		"scope":     map[string]any{"kind": "k8s_cluster", "id": invCluster, "label": invCluster},
 		"sub_scope": "shop", "lifecycle": "active", "retired_reason": nil, "state": "current",
 		"first_seen_at": invBase.Format(time.RFC3339), "last_seen_at": invBase.Add(4 * time.Hour).Format(time.RFC3339),
-		"attrs": map[string]any{"fingerprint": "fp-checkout"},
+		"attrs":       map[string]any{"fingerprint": "fp-checkout"},
+		"graph_state": "unrevisioned", "as_of": nil,
 	})
 	gh := invRow(t, rows, "Deploy_100%")
 	invWant(t, "github workload", gh, map[string]any{
@@ -75,7 +84,8 @@ func TestP2InventoryEveryProvider(t *testing.T) {
 		"scope":     map[string]any{"kind": "github_org", "id": invOrg, "label": invOrg},
 		"sub_scope": "acme/web", "lifecycle": "active", "retired_reason": nil, "state": "stale",
 		"first_seen_at": invBase.Format(time.RFC3339), "last_seen_at": invBase.Add(2 * time.Hour).Format(time.RFC3339),
-		"attrs": map[string]any{"path": ".github/workflows/deploy.yml"},
+		"attrs":       map[string]any{"path": ".github/workflows/deploy.yml"},
+		"graph_state": "unrevisioned", "as_of": nil,
 	})
 	// A projection may state the native id; it is then the row's.
 	invWant(t, "stated native id", digs(invRow(t, rows, "repo-agent"), "native_id"), "acme/web/AGENTS.md")

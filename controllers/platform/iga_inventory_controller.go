@@ -7,6 +7,7 @@ import "github.com/gin-gonic/gin"
 //	GET /api/iga/v1/inventory/workloads
 //	GET /api/iga/v1/inventory/identities
 //	GET /api/iga/v1/inventory/resources
+//	GET /api/iga/v1/inventory/summary
 //
 // Every workload, identity and resource AWS, Kubernetes and GitHub put in the
 // shared iga_* tables, in one provider-neutral row. internal/igaread owns the
@@ -37,6 +38,7 @@ func RegisterIGAInventoryRoutes(g gin.IRoutes, ctl *IGAGraphReadController, requ
 	g.GET("/inventory/workloads", read, ctl.ListInventoryWorkloads)
 	g.GET("/inventory/identities", read, ctl.ListInventoryIdentities)
 	g.GET("/inventory/resources", read, ctl.ListInventoryResources)
+	g.GET("/inventory/summary", read, ctl.GetInventorySummary)
 }
 
 // ListInventoryWorkloads handles GET /api/iga/v1/inventory/workloads.
@@ -57,5 +59,13 @@ func (ctl *IGAGraphReadController) ListInventoryIdentities(c *gin.Context) {
 func (ctl *IGAGraphReadController) ListInventoryResources(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
 		return g.Reader.ListInventoryResources(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
+	})
+}
+
+// GetInventorySummary handles GET /api/iga/v1/inventory/summary: one count per
+// object type for the same filters as the three lists.
+func (ctl *IGAGraphReadController) GetInventorySummary(c *gin.Context) {
+	ctl.serve(c, func(g graphCall) (any, error) {
+		return g.Reader.InventorySummary(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
 	})
 }

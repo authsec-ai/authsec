@@ -29,6 +29,14 @@ package igaread
 //
 // state is current when any of its support rows is current, else stale.
 //
+// PUBLICATION STATE (B1). The inventory is not pinned to a revision, but it
+// reports what a reader needs to tell a numbered AWS publication from a live
+// Kubernetes write: meta.rev / meta.published_at (the AWS publication current
+// in the request's snapshot, null when none; reported, never enforced),
+// meta.graph_state over the FILTERED result, meta.coverage (the graph lists'
+// AWS notes for the accounts in scope plus one note per Kubernetes cluster
+// from its latest sweep), and per row graph_state and as_of.
+//
 // Scope: an AWS row's scope is derived from existing columns, through the SAME
 // expressions the graph lists use (WorkloadAccountSQL, IdentityAccountSQL,
 // ResourceAccountSQL), labelled from the workspace's connectors (LoadAccounts);
@@ -41,12 +49,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/k8sread"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -78,6 +88,13 @@ const inventoryScopeAWSAccount = "aws_account"
 var inventoryParams = map[string]bool{
 	"provider": true, "kind": true, "scope": true, "q": true, "lifecycle": true,
 	"limit": true, "cursor": true, "facets": true, "sort": true,
+}
+
+// inventorySummaryParams are every parameter GET /inventory/summary accepts:
+// the filters that apply to all three classes. kind is class-specific, and
+// paging, sort and facets have no meaning for counts.
+var inventorySummaryParams = map[string]bool{
+	"provider": true, "scope": true, "q": true, "lifecycle": true,
 }
 
 // inventorySorts are the sort values: by name (then id), or most recently
@@ -127,11 +144,42 @@ type InventoryRow struct {
 	FirstSeenAt   any             `json:"first_seen_at"`
 	LastSeenAt    any             `json:"last_seen_at"`
 	Attrs         map[string]any  `json:"attrs"`
+	// GraphState is "published" for an AWS row (it is in the current
+	// publication) and "unrevisioned" for a Kubernetes or GitHub row (written
+	// straight from a sweep or a scan, no publication number). Omitted for an
+	// AWS row when the workspace has no publication: nothing can be claimed.
+	GraphState string `json:"graph_state,omitempty"`
+	// AsOf is the reading behind the row: an AWS row's publication time, the
+	// observed_at of the Kubernetes sweep that last confirmed a row, the time of
+	// the GitHub scan run that did. null when no confirming reading is recorded.
+	AsOf any `json:"as_of"`
+}
+
+// InventoryPublication is the publication state an inventory response carries
+// in its meta, shared by the lists and the summary.
+type InventoryPublication struct {
+	// Rev and PublishedAt are the AWS publication current in the snapshot, null
+	// when none. Reported, not enforced: the inventory is not pinned.
+	Rev         *int64     `json:"rev"`
+	PublishedAt *time.Time `json:"published_at"`
+	// GraphState is published | unrevisioned | mixed | not_published, over the
+	// filtered result (inventoryGraphState). Omitted only when its probe timed
+	// out: unknown is never guessed.
+	GraphState *string `json:"graph_state,omitempty"`
+	// Coverage: the graph lists' AWS notes for the accounts in scope, then one
+	// k8s_sweep note per Kubernetes cluster in scope. [] when there is none.
+	Coverage []InventoryCoverageNote `json:"coverage"`
+}
+
+// InventoryCoverageNote is a CoverageNote, plus the sweep time a Kubernetes
+// cluster's note is read from. An AWS note carries no observed_at.
+type InventoryCoverageNote struct {
+	CoverageNote
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
 }
 
 // InventoryMeta is an inventory list's meta: the graph lists' paging, total
-// and facets, without their revision and coverage (nothing here is pinned to
-// a publication).
+// and facets, and the publication state (nothing here is pinned to one).
 type InventoryMeta struct {
 	Limit        int                     `json:"limit"`
 	NextCursor   *string                 `json:"next_cursor"`
@@ -139,6 +187,7 @@ type InventoryMeta struct {
 	Total        *int64                  `json:"total,omitempty"`
 	TotalAtLeast *int64                  `json:"total_at_least,omitempty"`
 	Facets       map[string][]FacetValue `json:"facets,omitempty"`
+	InventoryPublication
 }
 
 // inventoryRecord is one row as inventoryColumns reads it, plus the page
@@ -159,6 +208,7 @@ type inventoryRecord struct {
 	FirstSeenAt   time.Time
 	LastSeenAt    time.Time
 	ProviderAttrs json.RawMessage
+	AsOf          *time.Time
 	K0            *string `gorm:"column:k0"`
 	K1            *string `gorm:"column:k1"`
 	K2            *string `gorm:"column:k2"`
@@ -173,7 +223,7 @@ func (s inventoryRecord) sortKeys() []*string { return []*string{s.K0, s.K1, s.K
 // row renders the record. An AWS account is labelled as everywhere else
 // (Accounts.Of: the connector's display name, else the id); a k8s or github
 // scope by its scope_label, else its id.
-func (s inventoryRecord) row(refType string, accts *Accounts) (InventoryRow, error) {
+func (s inventoryRecord) row(refType string, accts *Accounts, rev *Revision) (InventoryRow, error) {
 	attrs := map[string]any{}
 	if len(s.ProviderAttrs) > 0 {
 		if err := json.Unmarshal(s.ProviderAttrs, &attrs); err != nil {
@@ -195,7 +245,16 @@ func (s inventoryRecord) row(refType string, accts *Accounts) (InventoryRow, err
 			scope.Label = s.ScopeID
 		}
 	}
+	graphState, asOf := "unrevisioned", TS(s.AsOf)
+	if s.Provider == models.ProviderAWS {
+		graphState, asOf = "", nil
+		if rev != nil {
+			graphState, asOf = GraphPublished, T(PublicationTime(rev.PublishedAt))
+		}
+	}
 	return InventoryRow{
+		GraphState:    graphState,
+		AsOf:          asOf,
 		Ref:           R(refType, s.ID),
 		Provider:      s.Provider,
 		Kind:          s.Kind,
@@ -221,7 +280,10 @@ func (s inventoryRecord) row(refType string, accts *Accounts) (InventoryRow, err
 type inventoryClass struct {
 	route   string
 	refType string
-	alias   string
+	// list is the graph list of the same class (listsRoute*): its name selects
+	// the coverage notes (listsCoverage) that bear on this class.
+	list  string
+	alias string
 	// from is the node table, aliased, with the joins the AWS expressions need;
 	// every filter and facet names only its aliases.
 	from       string
@@ -237,21 +299,21 @@ type inventoryClass struct {
 
 var (
 	inventoryWorkloads = newInventoryClass(inventoryClass{
-		route: inventoryRouteWorkloads, refType: RefWorkload, alias: "w",
+		route: inventoryRouteWorkloads, list: listsRouteWorkloads, refType: RefWorkload, alias: "w",
 		from: `iga_workload w
   LEFT JOIN iga_estate_scopes es ON es.workspace_id = w.workspace_id AND es.id = w.estate_scope_id`,
 		kindCol: "w.runtime_kind", supportCol: "workload_id",
 		awsScope: WorkloadAccountSQL, awsSubScope: "w.region",
 	})
 	inventoryIdentities = newInventoryClass(inventoryClass{
-		route: inventoryRouteIdentities, refType: RefIdentity, alias: "ia",
+		route: inventoryRouteIdentities, list: listsRouteIdentities, refType: RefIdentity, alias: "ia",
 		from:    `iga_identity_accounts ia`,
 		kindCol: "ia.account_kind", supportCol: "identity_account_id",
 		// IAM is global: an AWS identity has an account and no region.
 		awsScope: IdentityAccountSQL, awsSubScope: "''",
 	})
 	inventoryResources = newInventoryClass(inventoryClass{
-		route: inventoryRouteResources, refType: RefResource, alias: "r",
+		route: inventoryRouteResources, list: listsRouteResources, refType: RefResource, alias: "r",
 		from:    `iga_resources r`,
 		kindCol: "r.resource_kind", supportCol: "resource_id",
 		// What the reference's ARN states (never the scanning connector's).
@@ -270,14 +332,14 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
        ` + c.scopeLabelSQL() + ` AS scope_label,
        ` + c.subScopeSQL() + ` AS sub_scope,
        ` + a + `.lifecycle, ` + a + `.retired_reason, sup.state,
-       ` + a + `.first_seen_at, ` + a + `.last_seen_at, ` + a + `.provider_attrs`
+       ` + a + `.first_seen_at, ` + a + `.last_seen_at, ` + a + `.provider_attrs, asof.as_of`
 	c.spec = &listsSpec[inventoryRecord]{
 		route:   c.route,
 		columns: columns,
 		// SupportLateral is the graph lists' D-1 state: current if any support
 		// row is current, else stale if any is stale. Every listed row has a
 		// non-ended support row, so it is never ended here.
-		from:      c.from + "\n  " + SupportLateral(a, c.supportCol),
+		from:      c.from + "\n  " + SupportLateral(a, c.supportCol) + "\n  " + c.asOfLateral(),
 		countFrom: c.from,
 		idCol:     a + ".id",
 		keys: map[string][]listsKey{
@@ -293,6 +355,24 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
 		},
 	}
 	return &c
+}
+
+// asOfLateral derives a Kubernetes or GitHub row's as_of (B1): the newest
+// reading that confirmed it, over its non-ended support rows -- the
+// observed_at of the Kubernetes sweep (last_confirmed_sweep_id) or the
+// completion time of the GitHub scan run (last_confirmed_scan_run_id), else
+// the run's start. An AWS row's as_of is the publication, so it is skipped
+// here. NULL when no support row names a confirming reading. One probe on the
+// (workspace_id, <support column>) prefix of the uq_iga_os_* indexes per page
+// row; the count and facet statements do not join it.
+func (c *inventoryClass) asOfLateral() string {
+	return `LEFT JOIN LATERAL (
+	        SELECT max(COALESCE(sw.observed_at, gr.completed_at, gr.started_at)) AS as_of
+	          FROM iga_object_support s2
+	          LEFT JOIN iga_k8s_sweep sw ON sw.workspace_id = s2.workspace_id AND sw.id = s2.last_confirmed_sweep_id
+	          LEFT JOIN iga_scan_runs gr ON gr.workspace_id = s2.workspace_id AND gr.id = s2.last_confirmed_scan_run_id
+	         WHERE ` + c.alias + `.provider <> 'aws' AND s2.workspace_id = ` + c.alias + `.workspace_id
+	           AND s2.` + c.supportCol + ` = ` + c.alias + `.id AND s2.state <> 'ended') asof ON true`
 }
 
 // attr is a provider_attrs text value, ” when absent or null.
@@ -376,7 +456,7 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 	if vals.Get("limit") == "" {
 		p.Limit = InventoryDefaultLimit
 	}
-	filters, perr := c.filters(p, ws)
+	filters, req, perr := c.filters(p, ws)
 	if perr != nil {
 		return nil, perr
 	}
@@ -431,7 +511,7 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 		}
 		data := make([]InventoryRow, 0, len(recs))
 		for _, rec := range recs {
-			row, err := rec.row(c.refType, accts)
+			row, err := rec.row(c.refType, accts, q.Rev)
 			if err != nil {
 				return err
 			}
@@ -439,10 +519,7 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 		}
 
 		// Total and facets: optional, over every filter (facets: every OTHER).
-		n, known, err := q.CountUpTo(func(tx *gorm.DB) *gorm.DB {
-			w, wargs := listsWhere(filters, "")
-			return tx.Table(spec.countFrom).Where(w, wargs...)
-		})
+		n, known, err := q.CountUpTo(c.countQuery(filters))
 		if err != nil {
 			return err
 		}
@@ -459,6 +536,11 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 				meta.Facets[name] = vals // nil (JSON null) when it timed out
 			}
 		}
+		pub, err := inventoryPublication(q, accts, req, []*inventoryClass{c}, [][]listsFilter{filters})
+		if err != nil {
+			return err
+		}
+		meta.InventoryPublication = pub
 		out = Envelope{Data: data, Meta: meta}
 		return nil
 	})
@@ -468,11 +550,29 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 	return out, nil
 }
 
+// countQuery is the unpaged query the list's total, and the summary's count of
+// this class, are taken over: the count FROM under every filter.
+func (c *inventoryClass) countQuery(filters []listsFilter) func(tx *gorm.DB) *gorm.DB {
+	return func(tx *gorm.DB) *gorm.DB {
+		w, wargs := listsWhere(filters, "")
+		return tx.Table(c.spec.countFrom).Where(w, wargs...)
+	}
+}
+
+// inventoryRequest is what the validated parameters selected, for the
+// publication state: the providers, scope ids and kinds asked for (empty =
+// all).
+type inventoryRequest struct {
+	providers, scopes, kinds []string
+}
+
 // filters turns the validated parameters into SQL filters. provider must be
 // one of InventoryProviders; kind and scope take any value (an unknown one is
 // an empty list, not an error: kinds and scopes are data, not an enum). Each
-// is tagged with its facet, so that facet's counts leave it out.
-func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *Error) {
+// is tagged with its facet, so that facet's counts leave it out. The
+// summary builds its three counts from these same filters, so a count and the
+// total of its list cannot disagree.
+func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *inventoryRequest, *Error) {
 	fs := []listsFilter{c.readable(ws)}
 	fs = append(fs, listsLifecycle(p, c.alias+".lifecycle")...)
 	if p.Q != "" {
@@ -484,12 +584,13 @@ func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *E
 	}
 	providers, perr := listsEnum(p, "provider", InventoryProviders...)
 	if perr != nil {
-		return nil, perr
+		return nil, nil, perr
 	}
+	req := &inventoryRequest{providers: providers, scopes: inventoryValues(p, "scope"), kinds: inventoryValues(p, "kind")}
 	fs = append(fs, listsIn("provider", c.alias+".provider", providers)...)
-	fs = append(fs, listsIn("kind", c.kindCol, inventoryValues(p, "kind"))...)
-	fs = append(fs, listsIn("scope", c.scopeIDSQL(), inventoryValues(p, "scope"))...)
-	return fs, nil
+	fs = append(fs, listsIn("kind", c.kindCol, req.kinds)...)
+	fs = append(fs, listsIn("scope", c.scopeIDSQL(), req.scopes)...)
+	return fs, req, nil
 }
 
 // inventoryValues reads a repeatable free-text filter: trimmed, empty values
@@ -574,4 +675,305 @@ func inventoryScopeFacet(counts map[string]int64, accts *Accounts) []FacetValue 
 		out = append(out, *fv)
 	}
 	return listsFacetOrder(out, "")
+}
+
+/* --------------------------------- summary --------------------------------- */
+
+// InventorySummary is GET /api/iga/v1/inventory/summary (B2): one count per
+// object type for the same filters as the three lists, in one snapshot.
+type InventorySummary struct {
+	Workloads  Exact `json:"workloads"`
+	Identities Exact `json:"identities"`
+	Resources  Exact `json:"resources"`
+}
+
+// InventorySummary serves GET /api/iga/v1/inventory/summary.
+//
+// The parameters are provider, scope, q and lifecycle (anything else is 400
+// invalid_parameter), validated and turned into SQL by the lists' own filter
+// builder, and each count is the list's total over the same FROM
+// (countQuery) -- so a count and the total of its list cannot disagree. Each
+// is counted with CountUpTo, the graph lists' capped, savepointed count: an
+// exact value up to TotalCap, {value: TotalCap, exact: false} above it, and
+// {value: null, exact: false} when that one count timed out -- the other two
+// are unaffected. One REPEATABLE READ snapshot, one request deadline.
+func (r *Reader) InventorySummary(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+	for name := range vals {
+		if !inventorySummaryParams[name] {
+			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this route", name))
+		}
+	}
+	p, perr := ParseListParams(vals, []string{"name"}, "name", nil)
+	if perr != nil {
+		return nil, perr
+	}
+	classes := []*inventoryClass{inventoryWorkloads, inventoryIdentities, inventoryResources}
+	filters := make([][]listsFilter, len(classes))
+	var req *inventoryRequest
+	for i, c := range classes {
+		if filters[i], req, perr = c.filters(p, ws); perr != nil {
+			return nil, perr
+		}
+	}
+
+	var out Envelope
+	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+		accts, err := q.LoadAccounts()
+		if err != nil {
+			return err
+		}
+		var counts [3]Exact
+		for i, c := range classes {
+			n, known, err := q.CountUpTo(c.countQuery(filters[i]))
+			if err != nil {
+				return err
+			}
+			counts[i] = inventoryExact(n, known)
+		}
+		pub, err := inventoryPublication(q, accts, req, classes, filters)
+		if err != nil {
+			return err
+		}
+		out = Envelope{
+			Data: InventorySummary{Workloads: counts[0], Identities: counts[1], Resources: counts[2]},
+			Meta: pub,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// inventoryExact is a CountUpTo result as an ExactCount, by the rule
+// ListMeta.SetTotal applies to a list's total: known and within TotalCap is
+// exact; beyond it the cap is a lower bound; a timeout is unknown (null).
+func inventoryExact(n int64, known bool) Exact {
+	switch {
+	case !known:
+		return Unknown()
+	case n > TotalCap:
+		return Exact{Value: ptrInt64(TotalCap), Exact: false}
+	default:
+		return ExactOf(n)
+	}
+}
+
+/* ----------------------------- publication state ---------------------------- */
+
+// The graph states an inventory result can be in (meta.graph_state). published
+// and not_published are the graph lists' own (GraphPublished,
+// GraphNotPublished).
+const (
+	inventoryUnrevisioned = "unrevisioned"
+	inventoryMixed        = "mixed"
+)
+
+// inventoryPublication is the meta every inventory response carries: the AWS
+// publication current in the snapshot, the graph state of the filtered result
+// and the coverage notes. classes and filters are parallel: one entry for a
+// list, the three classes for the summary.
+func inventoryPublication(q *Query, accts *Accounts, req *inventoryRequest, classes []*inventoryClass, filters [][]listsFilter) (InventoryPublication, error) {
+	pub := InventoryPublication{Coverage: []InventoryCoverageNote{}}
+	if q.Rev != nil {
+		rev, at := q.Rev.Rev, PublicationTime(q.Rev.PublishedAt)
+		pub.Rev, pub.PublishedAt = &rev, &at
+	}
+	var err error
+	if pub.GraphState, err = inventoryGraphState(q, req, classes, filters); err != nil {
+		return pub, err
+	}
+	aws, err := inventoryAWSNotes(q, accts, req, classes)
+	if err != nil {
+		return pub, err
+	}
+	k8s, err := inventoryK8sNotes(q, req)
+	if err != nil {
+		return pub, err
+	}
+	pub.Coverage = append(append(pub.Coverage, aws...), k8s...)
+	return pub, nil
+}
+
+// inventoryGraphState is meta.graph_state, computed over the FILTERED result --
+// the rows every filter leaves, not the page in hand:
+//
+//	published      every row is an AWS row and a publication exists
+//	unrevisioned   no row is an AWS row (Kubernetes and GitHub only)
+//	mixed          both kinds
+//	not_published  AWS rows are selected and no publication exists
+//
+// How: at most one EXISTS statement per class, each probing "any AWS row" and
+// "any other row" over the class's count FROM and filters -- so a result
+// proves its kinds on the first matching row instead of counting, and the
+// provider filter rules out a probe that cannot match without running it.
+// The cost is bounded by the same index (workspace, provider, lifecycle) the
+// total uses; an empty result scans no more than the count would. Probes are
+// optional work (a savepoint, like the total): if one times out the state is
+// unknown and omitted (nil), never guessed.
+//
+// An empty result has no rows to ask, so the filter's intent decides: AWS
+// only -> published / not_published by the publication; Kubernetes / GitHub
+// only -> unrevisioned; both selected -> the publication's state.
+func inventoryGraphState(q *Query, req *inventoryRequest, classes []*inventoryClass, filters [][]listsFilter) (*string, error) {
+	awsPossible := len(req.providers) == 0 || contains(req.providers, models.ProviderAWS)
+	otherPossible := len(req.providers) == 0
+	for _, v := range req.providers {
+		otherPossible = otherPossible || v != models.ProviderAWS
+	}
+
+	var hasAWS, hasOther bool
+	for i, c := range classes {
+		needAWS, needOther := awsPossible && !hasAWS, otherPossible && !hasOther
+		if !needAWS && !needOther {
+			break
+		}
+		w, wargs := listsWhere(filters[i], "")
+		probe := func(need bool, cond string, args *[]any) string {
+			if !need {
+				return "false"
+			}
+			*args = append(*args, wargs...)
+			return "EXISTS (SELECT 1 FROM " + c.spec.countFrom + " WHERE " + w + " AND " + c.alias + ".provider " + cond + ")"
+		}
+		var args []any
+		sqlText := "SELECT " + probe(needAWS, "= 'aws'", &args) + ", " + probe(needOther, "<> 'aws'", &args)
+		var a, o bool
+		ok, err := q.Optional(func(tx *gorm.DB) error {
+			return tx.Raw(sqlText, args...).Row().Scan(&a, &o)
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		hasAWS, hasOther = hasAWS || a, hasOther || o
+	}
+
+	awsState := GraphNotPublished
+	if q.Rev != nil {
+		awsState = GraphPublished
+	}
+	state := awsState
+	switch {
+	case hasAWS && hasOther:
+		state = inventoryMixed
+	case hasAWS:
+	case hasOther, !awsPossible:
+		state = inventoryUnrevisioned
+	}
+	return &state, nil
+}
+
+// inventoryAWSNotes are the graph lists' coverage notes (listsCoverage) for
+// the AWS accounts the request selects: every account of the workspace when
+// no scope is chosen, only the chosen account ids when one is; none when the
+// provider filter or the scope leaves AWS out. The summary spans three
+// classes, so a surface that bears on several is one note whose affects names
+// each, in class order.
+func inventoryAWSNotes(q *Query, accts *Accounts, req *inventoryRequest, classes []*inventoryClass) ([]InventoryCoverageNote, error) {
+	if len(req.providers) > 0 && !contains(req.providers, models.ProviderAWS) {
+		return nil, nil
+	}
+	var accounts []string
+	for _, v := range req.scopes {
+		if isAccountID(v) {
+			accounts = append(accounts, v)
+		}
+	}
+	if len(req.scopes) > 0 && len(accounts) == 0 {
+		return nil, nil // the scope names only non-AWS scopes
+	}
+
+	type key struct{ account, surface string }
+	merged := map[key]*InventoryCoverageNote{}
+	var order []key
+	for _, c := range classes {
+		notes, err := listsCoverage(q, accts, c.list, listsScope{accounts: accounts, kinds: req.kinds})
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range notes {
+			k := key{n.AccountID, n.Surface}
+			if prev := merged[k]; prev != nil {
+				if !strings.Contains(prev.Affects, n.Affects) {
+					prev.Affects += "; " + n.Affects
+				}
+				continue
+			}
+			n := n
+			merged[k] = &InventoryCoverageNote{CoverageNote: n}
+			order = append(order, k)
+		}
+	}
+	out := make([]InventoryCoverageNote, 0, len(order))
+	for _, k := range order {
+		out = append(out, *merged[k])
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].AccountID != out[j].AccountID {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Surface < out[j].Surface
+	})
+	return out, nil
+}
+
+// inventoryK8sSurface is a Kubernetes note's surface: the cluster's sweep.
+const inventoryK8sSurface = "k8s_sweep"
+
+// inventoryK8sNotes is one note per Kubernetes cluster in scope, from its
+// latest sweep (k8sread.LatestSweeps, the vocabulary and logic k8sread owns):
+// state complete | namespaced_only | incomplete, or not_swept for a cluster
+// whose agent registered and never delivered one. account_id is the cluster
+// name -- the scope.id its rows carry. The scope filter narrows to the chosen
+// clusters; the provider filter can leave Kubernetes out. Two agents reporting
+// one cluster name are one scope: the newest sweep speaks for it.
+func inventoryK8sNotes(q *Query, req *inventoryRequest) ([]InventoryCoverageNote, error) {
+	if len(req.providers) > 0 && !contains(req.providers, models.ProviderK8s) {
+		return nil, nil
+	}
+	sweeps, err := k8sread.New(q.DB(), q.WS).LatestSweeps()
+	if err != nil {
+		return nil, err
+	}
+	byCluster := map[string]InventoryCoverageNote{}
+	for _, cs := range sweeps {
+		if len(req.scopes) > 0 && !contains(req.scopes, cs.Cluster) {
+			continue
+		}
+		state, observed := k8sread.CoverageNone, (*time.Time)(nil)
+		if cs.Sweep != nil {
+			at := cs.Sweep.ObservedAt.UTC().Truncate(time.Second)
+			state, observed = cs.Sweep.Coverage, &at
+		}
+		note := InventoryCoverageNote{
+			CoverageNote: CoverageNote{AccountID: cs.Cluster, Surface: inventoryK8sSurface, State: state, Affects: k8sread.Affects(state)},
+			ObservedAt:   observed,
+		}
+		if prev, ok := byCluster[cs.Cluster]; ok && !inventoryNewer(note.ObservedAt, prev.ObservedAt) {
+			continue
+		}
+		byCluster[cs.Cluster] = note
+	}
+	out := make([]InventoryCoverageNote, 0, len(byCluster))
+	for _, n := range byCluster {
+		out = append(out, n)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
+	return out, nil
+}
+
+// inventoryNewer reports whether a is a later sweep than b; a sweep beats none.
+func inventoryNewer(a, b *time.Time) bool {
+	switch {
+	case a == nil:
+		return false
+	case b == nil:
+		return true
+	default:
+		return a.After(*b)
+	}
 }
