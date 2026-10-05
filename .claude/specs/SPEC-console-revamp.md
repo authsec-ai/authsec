@@ -55,14 +55,17 @@ of Duties (`/iga/sod`), Birthrights & Lifecycle (`/iga/birthrights`),
 Enforcement queue (`/iga/enforcement`).
 
 - Their page components under `features/governance/` and their data hooks
-  are removed **after checking shared consumers**. Today those consumers
-  are: `App.tsx` (routes), `app/api/governanceApi.ts` (mutations also used
-  by `features/discovery/ClaimAgentDialog.tsx` — claim and quarantine — and
-  `features/discovery/EnforcementStatusCard.tsx`), and
-  `features/governance/ActuationTokenDialog.tsx` (used by the Kubernetes
-  integration page to mint an agent token — that is connection setup, not a
-  governance screen, and moves to `features/discovery/`). The API slice
-  keeps only the endpoints a retained consumer calls.
+  are removed **after checking shared consumers**. The shared consumers
+  were: `App.tsx` (routes); `features/discovery/DiscoveredAgentsPage.tsx`
+  (claim, provision, quarantine, deprovision, release and delete actions);
+  `features/discovery/ClaimAgentDialog.tsx`; `EnforcementStatusCard.tsx` and
+  the Kubernetes integration page's **actuation** panel and
+  `ActuationTokenDialog.tsx` — the token that switches enforcement on in a
+  cluster (quarantine → NetworkPolicies). That is enforcement setup, not
+  connection setup, so it is removed with the rest, not moved. After those
+  consumers went, nothing used `app/api/governanceApi.ts`, so the whole
+  slice and its tag types are removed. Provider-mutating and enforcement
+  actions are outside this revamp; the backend capability is untouched.
 - Old bookmarks land on a **retired-page state**: the page title, one
   sentence (*This screen was retired and has no replacement yet.*), and
   links to **Discovery** and **Connections**. Links to Policy or Logs, if
@@ -179,12 +182,11 @@ Removed: Cadence, Agents, Detail. Filters: Type, Status, search.
 | Verify | yes | yes | no | yes |
 | Edit scope | regions | projects | namespaces are the agent's config; link to the install values | repositories |
 | Scan rules | — | — | — | yes |
-| Mint agent token | — | — | yes | — |
 | Revoke | yes | yes | yes (disconnect) | yes |
 
 Actions are governed by authorisation as well as capability:
 - Visibility follows the server's permission (`discovery:admin` for Scan,
-  Verify, Edit scope, Revoke, Mint token; `discovery:read` sees the row and
+  Verify, Edit scope, Revoke; `discovery:read` sees the row and
   the detail). A read-only user sees no administrative control; the server
   enforces it regardless (403 is shown as *Your role cannot do this*, never
   as a failure).
@@ -262,8 +264,8 @@ says so.
 
 | Provider | Workloads | Identities | Resources | Sightings | Read model |
 |---|---|---|---|---|---|
-| AWS | yes | yes | yes | — | unified inventory (B1) for lists; detail from the §5.3 graph reads (revisioned); latest-collected rows via `/authsec/discovery/aws/*` |
-| Kubernetes | yes | yes (ServiceAccounts) | — | yes (cluster sightings) | unified inventory (B1) once its fields land; until then `/authsec/discovery/k8s/*` via `k8sGraphApi` — **no revision, no cursor, `limit` only, no facets, no `q`**; writes into `iga_*` are unrevisioned |
+| AWS | yes | yes | yes | — | **Published** reads the §5.3 graph lists — they carry the classification, runtime and sensitivity facets and revision pinning the inventory does not — and the detail reads; the unified inventory lists AWS rows too (labelled `published`) and is the contract Kubernetes and GitHub use; **Latest collected** reads `/authsec/discovery/aws/*` |
+| Kubernetes | yes | yes (ServiceAccounts) | — | yes (cluster sightings) | **unified inventory** (B1: rows `unrevisioned`, labelled by their sweep); detail from `/authsec/discovery/k8s/*` via `k8sGraphApi` (`getK8sAccess`: the SA → binding → role → rule chain), opened at `/iga/k8s/:kind/:id`. Absent B1's fields the UI still lists, without a publication label. Earlier notes: `k8sGraphApi` has **no revision, no cursor, `limit` only, no facets, no `q`**; writes into `iga_*` are unrevisioned |
 | GitHub (graph rows) | schema only | schema only | — | — | 042 added GitHub provenance to the shared tables; no writer yet, so the inventory lists no GitHub object until one exists |
 | GCP | — | yes (latest collected only) | — | — | `/authsec/discovery/gcp/*` |
 | GitHub | — | — | — | yes (repository sightings) | `/authsec/discovery/agents` |
@@ -376,8 +378,7 @@ counts come from B2 (one call) or, until then, from each list's own
 |---|---|---|
 | View, filter, open detail, open evidence | read-only discovery | yes |
 | Claim (existing dialog and `claim` mutation) | **provisioning** — with the identity left blank, which its own copy calls the normal path, the backend mints a governed identity *and an OAuth client* (`services/discovery_claim_identity.go`) | **no** — the existing Claim flow is not offered in Discovery; the backend capability is untouched |
-| Associate a sighting with an existing identity | ownership / classification | **only** as a new, narrower action with its own contract: pick an existing identity (required), no creation of any identity or client, server-enforced `iga:review`; specified and reviewed separately before it is built. Until then, sightings are read-only apart from Ignore |
-| Ignore | classification | yes |
+| Associate a sighting with an existing identity | ownership / classification | **only** as a new, narrower action with its own contract: pick an existing identity (required), no creation of any identity or client, server-enforced `iga:review`; specified and reviewed separately before it is built. Until then sightings are read-only; no Ignore action exists end to end (the `ignored` status has no endpoint that sets it) |
 | Classify a workload as agent / undo | classification | yes (already on workload pages) |
 | Provision | provider-mutating | **no** — not offered in Discovery |
 | Quarantine | enforcement | **no** — not offered; `EnforcementStatusCard` is not rendered in Discovery |
@@ -636,7 +637,7 @@ rollout per phase.
 | Follow an old governance bookmark | The retirement state; no legacy screen or dialog appears; no governance API call is made |
 | Refresh during an investigation | A newer publication is announced; loaded content stays labelled with its publication; an uncached request shows the refresh-required state, not an error; Refresh re-pins everything together and handles a retired selection |
 | Connect a GCP project or a cluster | *Open in Discovery* becomes available on that provider's own readiness rule, including a successful empty result |
-| Act on a sighting | Only Ignore (and, once specified, Associate) is offered; nothing creates an identity or client |
+| Act on a sighting | Sightings are read-only; nothing creates an identity, a client or an enforcement effect |
 | Keyboard only | Objects, filters, tabs, preview and evidence are all reachable without double-click or hover |
 
 State matrix, required distinct on every list and detail: loading, empty,
