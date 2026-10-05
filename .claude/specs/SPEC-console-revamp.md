@@ -318,7 +318,7 @@ Filters:  Source ▾   Region ▾   Lifecycle ▾   Runtime ▾   Attribution �
   one-line note: *Normalised rows from the latest scan, including rows not
   yet in a publication. Published is what AuthSec concluded from them.* It
   never claims to be the provider's raw response.
-- **Freshness**: the pinned publication and a *Refresh* when a newer one
+- **Publication state**: the pinned publication and a *Refresh* when a newer one
   exists. Refresh re-pins the lists; it never requests a scan (that is on
   Connections).
 
@@ -395,7 +395,7 @@ Kubernetes writes are unrevisioned, so the header is built from the
 | Condition | Source | Shown |
 |---|---|---|
 | Connection health | last heartbeat | on Connections: *Agent online, heartbeat 2 min ago* |
-| Inventory freshness | `last_sweep.observed_at` | Discovery header: *Inventory from sweep at <time>* |
+| Inventory date | `last_sweep.observed_at` | Discovery header: *Inventory from sweep at <time>* |
 | Coverage | `last_sweep.coverage` (`cluster_scoped`, `namespaces`) | the coverage state word and sentence |
 | No sweep | `coverage: not_swept` | *No inventory received yet* — not an empty list |
 | Heartbeat recent, sweep old | both | *Agent online; its last inventory is from <time>* — the discrepancy is stated |
@@ -410,7 +410,7 @@ they show are defined with their calculation and completeness.
 - Name, kind, provider glyph.
 - Account / cluster and region / namespace.
 - One or two facts relevant to the type (below).
-- One freshness or coverage exception, if any (*Stale since 3 Oct*;
+- One lifecycle or coverage exception, if any (*Stale since 3 Oct*;
   *Account coverage partial*).
 - *Open details* · *Open graph*.
 - No portrait, no identifiers beyond what disambiguates.

@@ -1076,14 +1076,14 @@ and nothing useful is removed — it moves tier.
 |---|---|---|---|
 | Integrations | Connect, verify, scan, troubleshoot | Name/provider, scope, health, last scan | Raw `last_error` → details; connector ids → details |
 | Integration detail / AWS drawer | Verify and scan one source | Scope, health, regions, last scan and its outcome | Role and caller ARNs, template version → details |
-| Agents & workloads | Find a workload | Name with runtime and region, account, classification; freshness when room | ARN, region column, instances → Columns / details |
+| Agents & workloads | Find a workload | Name with runtime and region, account, classification; last confirmed when room | ARN, region column, instances → Columns / details |
 | Workload Overview | What is it, what does it run as | Runtime and location; classification and who decided; **application identity** and, for ECS, the **task execution role** as supporting infrastructure; next action | ARN, sources, continuity → details |
 | Identities | Find an identity | Name with subtype, account, direct workload bindings | ARN → Columns / details |
-| Identity detail | Who uses it, what it declares | Subtype and account, direct workload bindings, trust, policy summary, freshness | Statement documents → evidence |
+| Identity detail | Who uses it, what it declares | Subtype and account, direct workload bindings, trust, policy summary, last confirmed | Statement documents → evidence |
 | Resources | Find what policies name | Reference name, exact vs selector, service/type, account when the reference names one | Full reference → Columns / details |
 | Resource detail | What names it | What the reference identifies; observed resource vs exact reference vs selector; who names it | Statements → evidence |
 | Graph canvas / Paths | Follow relationships | Workload → identity → declared resource relationship | Statement nodes (Detailed view), claims (evidence) |
-| Evidence and coverage | Explain one fact or gap | Explanation, then policy/statement, constraints, source and freshness | Raw record (collapsed) |
+| Evidence and coverage | Explain one fact or gap | Explanation, then policy/statement, constraints, source and confirmation | Raw record (collapsed) |
 | Agent sightings | Decide on a sighting | Sighting, source, decision status, evidence summary | Fingerprint, matched client id, source metadata JSON → details |
 | Cloud Inventory | Inspect collected rows | Name, kind, account, last seen | Native ARN → details |
 | Detection Rules | Tune what a scan looks for | Rules, globs, word lists | Versions → details |
@@ -1414,7 +1414,7 @@ two accounts at every width. Identifiers are not printed under every name.
 
 - **Columns by priority, from the table's own width** (re-measured when the
   sidebar or an inspector changes it): the name is always shown with a way
-  to open it; then account, classification and freshness while they fit.
+  to open it; then account, classification and last confirmed while they fit.
   Region, runtime, ARN and instances are in each row's details (›) unless
   the customer chooses them in **Columns**; a chosen field that does not fit
   moves to details and Columns says so. The table is exactly its
@@ -1618,7 +1618,7 @@ and conflating them is the failure the whole coverage model exists to prevent.
 | **Unavailable** | the backend for this view is not deployed: *"Changes will show configuration and coverage history. Not available yet."* Neither an error nor empty | same | same | same | same | same |
 | **Not authorized** | `403`: *"You need the IGA read permission to view the identity graph."* Never an empty list, never "not found" | same | same | same | same | same |
 | **Refresh failed** | A reload after data was shown failed: the **previous data stays**, dimmed, with *"Could not refresh — showing results from 14:02. [Retry]"* | same | same | same | same | same |
-| **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | freshness shows the queue, not just the age | same | same | same | same |
+| **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | the status line shows the queue, not just the age | same | same | same | same |
 
 **Queued is a real state, because the barrier serializes per workspace.** A
 customer with five accounts will see scans wait. That is the price of §2.10A's
@@ -1663,7 +1663,7 @@ way its header stays in view, and it reads in sections:
    *Permissions boundary recorded; not evaluated*, *Resource existence not
    confirmed*, *Evidence stale*, *Relevant coverage missing*. Distinct
    limitations are all kept; repeats are not.
-4. **Collection source and freshness.** Source API, last confirmed, first
+4. **Collection source and confirmation.** Source API, last confirmed, first
    seen, stale since or ended; then **Supporting records** behind a
    disclosure — each collection of the fact, which is not a separate grant.
 5. **Raw record**, collapsed, fetched only when opened, scrolling in its own
@@ -6781,7 +6781,7 @@ query did not finish, never a number that looks exact.
 | **Typed direct bindings** | Identities list *Bindings* column and filter; identity Overview; graph selection card | Identity rows, `/identities/:id` and graph identity nodes add `bindings: { runs_as: Exact, execution_role: Exact }` beside `used_by_count`, which keeps D-17's meaning. The list adds `bound_as=runs_as\|execution_role` beside `used_by=workloads` | Same optional-work rule as `used_by_count`; each half fails independently to `exact: false` | One count, labelled *Direct bindings* and explained as "run as it, or whose ECS agent uses it as the task execution role". The two roles are told apart where the relationship itself is shown (the workload's Identities, the graph's *runs as* / *ECS agent uses*) |
 | **Paged paths** | Paths view once the canvas reaches its limit (§2.14.11) | `/graph/path` adds `cursor=` and returns `next_cursor` when `bound_by: "paths"`; each page is the next shortest paths, full nodes and edges as now | `more_paths` and `bound_by` unchanged; a page past the deadline returns what it has with `bound_by: "time"` | Paths lists the paths in the **loaded** graph and says so, including when a path was cut by the depth limit; a server path with `more_paths` says "More paths exist beyond the search limit" |
 | **Server-side Overview summary** | Overview (§2.14.11 *Views*) on a root whose statements are not all loaded | `GET /graph/summary?root=&direction=&cursor=` → `lines: [{ holder, target, effect, statements: [ref], grants: [claim], targets: [claim] }]`, 100 lines a page | A line keeps every claim behind it (evidence-preserving); Allow and Deny are never one line; `truncated` as `/graph` | The client summarises only statements whose grant and targets are loaded; a statement with more targets to load stays drawn, with its own Load control |
-| **Per-object collection summary** | Selection card's uncertainty line; evidence *Collection source and freshness* | Graph nodes and detail reads add `collection: { surfaces: [{ surface, state, as_of }] }` for the surfaces that could have produced or ended the object | `state` uses the coverage vocabulary (§1.4); an unknown surface is `unknown`, never omitted | The node's own `limitations` and `stale_reason`, and the account's coverage on the list pages |
+| **Per-object collection summary** | Selection card's uncertainty line; evidence *Collection source and confirmation* | Graph nodes and detail reads add `collection: { surfaces: [{ surface, state, as_of }] }` for the surfaces that could have produced or ended the object | `state` uses the coverage vocabulary (§1.4); an unknown surface is `unknown`, never omitted | The node's own `limitations` and `stale_reason`, and the account's coverage on the list pages |
 
 A security judgement is never derived from these: a shared role is not a
 finding, and a declared path is not effective access (§1.2).
