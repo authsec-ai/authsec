@@ -216,6 +216,10 @@ func bfkSeedSide(t *testing.T, db *sql.DB, name string, ws, conn uuid.UUID, acct
 		{"agent", func() bfkRow { return s.agent() }},
 		// 001's discovered agent, for the link that references iga_agents
 		{"dagent", func() bfkRow { return s.discoveredAgent() }},
+		// 041's Kubernetes provenance: the source a sweep, a support row or an
+		// edge names, and the sweep that last confirmed one
+		{"dsrc", func() bfkRow { return s.discoverySource() }},
+		{"sweep", func() bfkRow { return s.k8sSweep() }},
 		// the graph's nodes and edges
 		{"ident", func() bfkRow { return s.identity() }},
 		{"res", func() bfkRow { return s.resource() }},
@@ -345,6 +349,27 @@ func (s *bfkSide) discoveredAgent(set ...any) bfkRow {
 func (s *bfkSide) discoveredLink(set ...any) bfkRow {
 	return bfkRowOf("discovered_agent_iga_links", []any{"id", uuid.New(), "workspace_id", s.ws,
 		"discovered_agent_id", s.id("dagent"), "iga_agent_id", s.id("agent")}, set)
+}
+
+/* ------------------ builders: 041's Kubernetes provenance ------------------ */
+
+// discoverySource is a Discovery row (001), not a graph table: 041 gave it
+// UNIQUE (workspace_id, id) so Kubernetes provenance can name it. The display
+// name is fresh: discovery_sources_workspace_kind_name_key is (workspace_id,
+// kind, display_name).
+func (s *bfkSide) discoverySource(set ...any) bfkRow {
+	return bfkRowOf("discovery_sources", []any{"id", uuid.New(), "workspace_id", s.ws, "kind", "k8s_webhook",
+		"display_name", bfkFresh("bfk")}, set)
+}
+
+// k8sSweep is a received sweep (iga_k8s_sweep_projected_chk and _error_chk:
+// no projected_at, no error). The cluster is fresh:
+// iga_k8s_sweep_generation_key is (workspace_id, discovery_source_id, cluster,
+// generation).
+func (s *bfkSide) k8sSweep(set ...any) bfkRow {
+	return bfkRowOf("iga_k8s_sweep", []any{"id", uuid.New(), "workspace_id", s.ws,
+		"discovery_source_id", s.id("dsrc"), "cluster", bfkFresh("cluster"), "generation", 1,
+		"sweep_started_at", time.Now(), "observed_at", time.Now()}, set)
 }
 
 /* ------------------- builders: 004's estate and GitHub path ---------------- */
@@ -548,6 +573,9 @@ func (s *bfkSide) assignmentEvidence(set ...any) bfkRow {
 
 // support supports an identity; iga_object_support_one_chk admits exactly one
 // object column, so a case testing another object clears identity_account_id.
+// Its source is the connector; iga_object_support_source_chk (041, 042) admits
+// exactly one of connector_id, discovery_source_id and integration_id, so a
+// case testing another source clears connector_id.
 func (s *bfkSide) support(set ...any) bfkRow {
 	return bfkRowOf("iga_object_support", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
 		"partition_key", bfkFresh("p"), "identity_account_id", s.id("ident")}, set)

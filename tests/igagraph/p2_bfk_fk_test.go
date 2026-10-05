@@ -193,6 +193,10 @@ var bfkNoForeignKey = map[string]string{
 	"iga_workload_classification.operation_id": "029: a client-generated idempotency key (§5.5), not a reference",
 	"iga_workload_classification.decided_by_user_id": "029 (spec verbatim): the deciding user's id; users is " +
 		"not an iga_* table and §3 declares no key",
+	"iga_object_support.source_ref": "041 and 042: a STORED generated column, COALESCE(connector_id, " +
+		"discovery_source_id, integration_id), not a reference. Each of the three carries its own " +
+		"workspace-qualified key (iga_object_support_connector_fkey, iga_os_discovery_source_fkey, " +
+		"iga_os_integration_fkey); source_ref exists so the support upserts' unique indexes have one non-null column",
 	"iga_webhook_deliveries.integration_id": "004: filled when a delivery binds; SPEC QUESTION: no key",
 	"iga_source_objects.integration_scope_id": "004: SPEC QUESTION: no key to iga_integration_scopes " +
 		"(workspace_id, id)",
