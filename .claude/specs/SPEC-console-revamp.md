@@ -1,8 +1,15 @@
 # SPEC — Console revamp: four destinations, one Discovery, honest summaries
 
-Status: **proposed, revision 4** — design to lock before implementation.
-Nothing below is implemented. Where today's code matters, the text says
-what exists and where.
+Status: **revision 5.** The design is locked. The console changes and the
+three read contracts (B1, B2, B3) are **implemented in the local
+`authsec-staging` working trees of `authsec` and `Authsec-ui`; nothing is
+pushed or deployed.** Executed so far: the backend build and tests against a
+scratch PostgreSQL 16 (migrations 001-042 applied in order), and for the
+console the type check and lint against the pre-change baseline, a production
+build, and a render pass against a fixture backend. **Not yet done:** any
+signed-in check against a real workspace, so no screen here is claimed usable
+in production. Where this text says what a provider does, it says what the
+code does, and anything still a proposal is labelled so.
 
 Fixed by decision: the four primary destinations — **Connections**,
 **Discovery**, **Policy**, **Logs**. Secondary and detail screens are
@@ -179,10 +186,10 @@ Removed: Cadence, Agents, Detail. Filters: Type, Status, search.
 | Action | AWS | GCP | Kubernetes | GitHub |
 |---|---|---|---|---|
 | Scan now | yes (queues a run; 409 while one is live, said as *A scan is already running*) | yes | no — the agent scans on its own schedule; the row says *Reports every N min* | yes (repository scan) |
-| Verify | yes | yes | no | yes |
+| Verify | yes | yes | no | no — no verify route exists for GitHub; its state comes from the integration record |
 | Edit scope | regions | projects | namespaces are the agent's config; link to the install values | repositories |
 | Scan rules | — | — | — | yes |
-| Revoke | yes | yes | yes (disconnect) | yes |
+| Revoke (AWS, GCP) / Remove connection (Kubernetes, GitHub) | revoke | revoke | remove the source | remove the source |
 
 Actions are governed by authorisation as well as capability:
 - Visibility follows the server's permission (`discovery:admin` for Scan,
@@ -197,22 +204,37 @@ Actions are governed by authorisation as well as capability:
 - Failure keeps the control available with the cause and Retry; success
   refetches the row and the detail so the readiness model updates.
 
-**Revoke** confirms with its consequences first, per provider. AWS / GCP:
-*AuthSec stops reading this account. Everything already discovered is
-kept. Rows this connection supported are no longer reconfirmed and show
-as stale from the next publication; nothing is deleted. The role in your
-account is not removed — do that in AWS.* Kubernetes: *The agent's token
-is revoked; it stops reporting. Its last inventory is kept and marked
-unreconfirmed.* GitHub: *Repository scans stop; sightings are kept.*
-**Edit scope** (AWS regions, GitHub repositories): *Applies from the next
-scan. Rows from a removed region are kept and show as stale from the next
-publication.*
+**Revoke / Remove connection** confirms with its consequences first, per
+provider, and each sentence is what the backend does (checked against the
+handlers and `DeleteSource`):
 
-The stale transitions above are what the reconciliation rule gives (a
-partition whose surfaces were not reached goes stale, never ended — graph
-spec §4.10); they are **verified in the Connections dry run** before the
-copy ships, and if a provider does not behave that way the copy says what
-that provider actually does rather than asserting the rule.
+- **AWS.** Revoke flips the connector to `revoked`, purges the stored
+  ExternalId and touches no discovered row. No scan can run on it again.
+  Discovered results are kept, unchanged, no longer reconfirmed, and
+  Discovery says the account is revoked. Rows are **not** marked stale by
+  revoke. The IAM role stays until the customer deletes the CloudFormation
+  stack. Connecting the same account again reactivates the connector.
+- **GCP.** Same as AWS; a JSON key's Vault entry is purged, federation has
+  nothing to purge. AuthSec deletes nothing in the customer's project.
+- **Kubernetes.** There is no revoke. *Remove connection* deletes the
+  discovery source and the sightings it reported. It does not stop the
+  agent, which registers again at its next heartbeat unless uninstalled.
+  Workloads and identities earlier sweeps wrote to the shared tables are
+  not deleted.
+- **GitHub.** *Remove connection* deletes the organisation's integration and
+  the sightings it found. Removing the workspace's last organisation also
+  removes the GitHub App registration and its private key. The App is not
+  deleted from GitHub.
+
+A revoked or disabled Kubernetes or GitHub source stays removable: that
+action is the only clean-up it has.
+
+**Edit scope** (AWS regions, GitHub repositories): *Applies from the next
+scan.* Whether rows from a removed region go stale at the next publication
+follows the reconciliation rule (a partition whose surfaces were not reached
+goes stale, never ended — graph spec §4.10). That is **proposed behaviour,
+not yet observed**: it is verified in the Connections dry run, and until
+then the dialog states only that the change applies from the next scan.
 
 ### First successful journey
 
@@ -388,8 +410,10 @@ in Discovery authors policy or enforces anything.
 
 ### Kubernetes in Discovery
 
-Listed by the unified inventory under Provider = Kubernetes (B1); until B1's
-fields land, from `k8sGraphApi` with the contract in the table above. The
+Listed by the unified inventory under Provider = Kubernetes (B1). The
+*Runs as* and *Cluster access* columns join `k8sGraphApi`'s workload list,
+which is read up to 500 rows; a count taken from that join says *at least* at
+the cap. The
 workload → ServiceAccount → binding → role → rule chain is the Kubernetes
 workload's Identities tab and its Graph tab. Kubernetes writes are
 **unrevisioned**: the agent's sweep is written straight into the shared
@@ -552,15 +576,15 @@ or Enforcement screens is reused.
 
 | UI fact | Current source | Available today | Completeness semantics | Required change | Fallback until then |
 |---|---|---|---|---|---|
-| Connection status + reason (all providers) | `CloudConnector.status/last_error`+ error code (AWS, GCP); `DiscoverySource.last_status/last_error` (K8s, GitHub) | yes, three shapes | — | B3: one `/authsec/discovery/connections` read with `status`, `status_reason_code`, `last_scan`, `coverage_state`, `graph`, `scope_summary` | UI adapter over the three lists |
+| Connection status + reason (all providers) | `CloudConnector.status/last_error`+ error code (AWS, GCP); `DiscoverySource.last_status/last_error` (K8s, GitHub) | yes, three shapes | — | B3: one `GET /authsec/discovery/connections` read (shape below) | UI adapter over the three lists |
 | Latest scan state | `cloud_scan_run` list (AWS/GCP); `last_sync_at` (GitHub); heartbeat (K8s) | yes | exact | B3 | adapter |
 | Coverage state per connection | `CloudConnector.coverage.surfaces` (AWS/GCP); K8s coverage; GitHub none | AWS/GCP yes; K8s partial; GitHub no | per-surface states | B3 (`coverage_state`, `surfaces_short`); GitHub reports repositories scanned vs in scope | *Unknown* for GitHub |
 | Graph publication per connection | `/api/iga/v1/pipeline`, `/coverage` (AWS); none for K8s (unrevisioned) | AWS yes | exact | B3 includes `graph` for AWS; K8s shows *Reported <heartbeat>* | — |
-| Type counts | each list's `total` / `total_known` | yes (AWS) | `ExactCount` | B2: `GET /api/iga/v1/summary` at the pinned rev honouring the same filters | four list reads with `limit=1` |
+| Type counts | each list's `total` / `total_known` | yes (AWS) | `ExactCount` | B2: `GET /api/iga/v1/inventory/summary` honouring the same filters (provider, scope, q, lifecycle) | four list reads with `limit=1` |
 | Facet counts | `facets=` on the graph lists and on the unified inventory (`provider`, `kind`, `scope`) | yes | server-side, other filters applied | B1 adds no facet; type-specific facets beyond those three stay on the graph lists for AWS | Kubernetes type-specific facets *Unavailable* |
 | One paged, searchable, faceted list per object type over every provider | unified inventory `/api/iga/v1/inventory/*` (PR #75) | yes — cursors, capped totals, `provider` / `kind` / `scope` facets, `q` | §5.2; **no** `rev`, `published_at`, `graph_state` or `coverage` today | B1 (below) | AWS from the graph lists; Kubernetes from `k8sGraphApi`, counts *At least N* |
 | GitHub objects in the inventory | shared tables + 042 columns | schema only | — | a GitHub writer for workloads, identities and support rows (outside this spec; owner: backend) | GitHub is sightings only |
-| Stable provider-qualified source reference | connector id (AWS/GCP), source id (K8s/GitHub) | yes, two id spaces | — | B3 returns one `source_ref` per connection; graph rows reference it | adapter |
+| Stable provider-qualified source reference | connector id (AWS/GCP), source id (K8s/GitHub) | yes, two id spaces | — | B3 returns one `id` per connection, equal to the `source_ref` the graph tables record | adapter |
 | Declared permissions examples | workload Resources tab first page; identity Permissions | yes | labelled examples | none | — |
 | Workloads bound / resources named / may assume | `used_by_count`, `named_by_count`, used-by first page | yes | `ExactCount` / paged | none | — |
 | Sighting ↔ identity link | `matched_client_id` | yes | — | none | — |
@@ -588,10 +612,26 @@ The three backend changes, named in the table:
   reading them.
 - **B2 — type counts.** `GET /api/iga/v1/inventory/summary` → one
   `ExactCount` per object type for the same filters, in one snapshot.
-- **B3 — one connections read.** `GET /authsec/discovery/connections`
-  across providers with `status`, `status_reason_code`, `last_scan`,
-  `coverage_state`, `graph` and `scope_summary`, and one `source_ref` per
-  connection.
+- **B3 — one connections read.** `GET /authsec/discovery/connections` returns
+  one `Connection` per connected source: `id` (the connector id, or the
+  discovery source id — the value graph rows record as `source_ref`),
+  `provider`, `scope_kind`, `name`, `native_id`, `scope_id` (what the
+  inventory calls `scope.id` for its rows), `connection{state, reason_code,
+  verified_at}`, `scan{state, at, run_id, heartbeat_at, reports_every_seconds}`,
+  `coverage{state, gaps[]}`, `graph{state, rev, published_at}`,
+  `scope_summary`, `discovery{ready, as_of}` and `capabilities{scan, verify,
+  edit_scope, revoke, rules}`. The four conditions are independent fields,
+  never one status. `connection.state` is `connected`, `authentication_failed`,
+  `revoked` or `not_verified`; `reason_code` carries the cause (for example a
+  Kubernetes `heartbeat_lost`, an AWS `throttled`), so `not_verified` is never
+  read as "never verified" without it. A GitHub connection's `id` is its
+  discovery source id. Kubernetes coverage gaps use the surface `k8s_sweep`
+  with the sweep's own coverage word.
+  **Caller permission.** `GET /authsec/discovery/connections/can-administer`
+  runs behind the server's own `discovery:admin` middleware: 200 means the
+  caller may administer, 403 means not. The console asks it and never infers
+  a permission from a role name or token claim; an error other than 403 is
+  not read as permission.
 
 The table is the measure of the work, not the count.
 
