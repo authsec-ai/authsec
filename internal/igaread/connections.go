@@ -205,12 +205,13 @@ type ConnectionCapabilities struct {
 // connCapabilities are fixed per provider (SPEC-console-revamp "Actions by
 // provider"). GCP's scope is not editable: there is no route that changes a
 // GCP connector after onboarding. Kubernetes scans on the agent's own
-// schedule and its scope is the agent's config, so it can only be revoked.
+// schedule and its scope is the agent's config, so it can only be removed
+// (Revoke here is "remove the connection": there is no token to revoke).
 var connCapabilities = map[string]ConnectionCapabilities{
 	ConnProviderAWS:    {Scan: true, Verify: true, EditScope: true, Revoke: true},
 	ConnProviderGCP:    {Scan: true, Verify: true, Revoke: true},
 	ConnProviderK8s:    {Revoke: true},
-	ConnProviderGitHub: {Scan: true, Verify: true, EditScope: true, Revoke: true, Rules: true},
+	ConnProviderGitHub: {Scan: true, EditScope: true, Revoke: true, Rules: true}, // no verify route exists for GitHub
 }
 
 // ConnectionList is the response body.
@@ -450,6 +451,15 @@ func connCloudCoverage(cov models.ScanCoverage) ConnectionCoverage {
 		out.Gaps = append(out.Gaps, ConnectionGap{Surface: surface, State: s.State})
 	}
 	sort.Slice(out.Gaps, func(i, j int) bool { return out.Gaps[i].Surface < out.Gaps[j].Surface })
+	// "denied" is a refusal and only a refusal: a scan that reached nothing
+	// because every surface was throttled or timed out was not refused, and
+	// saying so would send the operator to fix permissions that are fine.
+	denied := false
+	for _, g := range out.Gaps {
+		if g.State == models.CloudCoverageDenied {
+			denied = true
+		}
+	}
 	switch {
 	case attempted == 0:
 		out.State = connCovUnknown
@@ -457,8 +467,10 @@ func connCloudCoverage(cov models.ScanCoverage) ConnectionCoverage {
 		out.State = connCovComplete
 	case reached > 0:
 		out.State = connCovPartial
-	default:
+	case denied:
 		out.State = connCovDenied
+	default:
+		out.State = connCovUnknown
 	}
 	return out
 }
@@ -608,23 +620,19 @@ func connKubernetes(q *Query, now time.Time) ([]Connection, error) {
 			newest[cs.SourceID] = cs
 		}
 	}
-	// The newest usable sweep -- one whose rows are in the inventory
-	// (projected) -- which is what makes Discovery ready, even when a later
-	// sweep failed.
-	var usable []struct {
-		SourceID   uuid.UUID
-		ObservedAt time.Time
-	}
-	if err := q.DB().Raw(`
-		SELECT DISTINCT ON (discovery_source_id) discovery_source_id AS source_id, observed_at
-		  FROM iga_k8s_sweep
-		 WHERE workspace_id = ? AND status = ?
-		 ORDER BY discovery_source_id, observed_at DESC`, q.WS, models.K8sSweepProjected).Scan(&usable).Error; err != nil {
+	// The newest APPLIED sweep of each source -- the one whose rows are in the
+	// inventory. It is what makes Discovery ready, even when a later sweep
+	// failed, and what coverage and scope describe: a sweep that has arrived
+	// and not been applied says nothing about rows that do not exist yet.
+	projected, err := k8sread.New(q.DB(), q.WS).LatestProjectedSweeps()
+	if err != nil {
 		return nil, err
 	}
-	usableAt := make(map[uuid.UUID]time.Time, len(usable))
-	for _, u := range usable {
-		usableAt[u.SourceID] = u.ObservedAt
+	usable := map[uuid.UUID]*k8sread.Sweep{}
+	for key, sw := range projected {
+		if prev, ok := usable[key.SourceID]; !ok || sw.ObservedAt.After(prev.ObservedAt) {
+			usable[key.SourceID] = sw
+		}
 	}
 
 	out := make([]Connection, 0, len(sources))
@@ -643,13 +651,13 @@ func connKubernetes(q *Query, now time.Time) ([]Connection, error) {
 			CreatedAt:    T(s.CreatedAt),
 			Connection:   connK8sCondition(s),
 			Scan:         connK8sScan(s, sweep.Sweep, now),
-			Coverage:     connK8sCoverage(sweep.Sweep),
+			Coverage:     connK8sCoverage(usable[s.ID]),
 			Graph:        ConnectionGraph{State: connGraphLive},
-			ScopeSummary: connK8sScope(s, sweep.Sweep),
+			ScopeSummary: connK8sScope(s, firstSweep(usable[s.ID], sweep.Sweep)),
 			Capabilities: connCapabilities[ConnProviderK8s],
 		}
-		if at, ok := usableAt[s.ID]; ok {
-			conn.Discovery = ConnectionDiscovery{Ready: true, AsOf: T(at)}
+		if sw, ok := usable[s.ID]; ok {
+			conn.Discovery = ConnectionDiscovery{Ready: true, AsOf: T(sw.ObservedAt)}
 		}
 		out = append(out, conn)
 	}
@@ -864,7 +872,7 @@ func connGitHub(q *Query) ([]Connection, error) {
 		native := nameOr(cfg.Account, g.DisplayName)
 		conn := Connection{
 			ID: g.ID.String(), Provider: ConnProviderGitHub, ScopeKind: connScopeOrganisation,
-			Name: nameOr(g.DisplayName, native), NativeID: native, ScopeID: "",
+			Name: nameOr(g.DisplayName, native), NativeID: native, ScopeID: cfg.Account,
 			CreatedAt:    T(g.CreatedAt),
 			Connection:   connGitHubCondition(g),
 			Scan:         connGitHubScan(g),
@@ -959,4 +967,14 @@ func connGitHubScope(mode string, selected int) string {
 		return "all repositories"
 	}
 	return countWord(selected, "repository", "repositories", "no repositories selected")
+}
+
+// firstSweep is the first sweep that exists.
+func firstSweep(sweeps ...*k8sread.Sweep) *k8sread.Sweep {
+	for _, sw := range sweeps {
+		if sw != nil {
+			return sw
+		}
+	}
+	return nil
 }

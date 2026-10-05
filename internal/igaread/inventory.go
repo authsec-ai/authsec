@@ -925,7 +925,7 @@ func inventoryAWSNotes(q *Query, accts *Accounts, req *inventoryRequest, classes
 const inventoryK8sSurface = "k8s_sweep"
 
 // inventoryK8sNotes is one note per Kubernetes cluster in scope, from its
-// latest sweep (k8sread.LatestSweeps, the vocabulary and logic k8sread owns):
+// latest APPLIED sweep (k8sread.LatestProjectedSweeps, the vocabulary and logic k8sread owns):
 // state complete | namespaced_only | incomplete, or not_swept for a cluster
 // whose agent registered and never delivered one. account_id is the cluster
 // name -- the scope.id its rows carry. The scope filter narrows to the chosen
@@ -935,7 +935,16 @@ func inventoryK8sNotes(q *Query, req *inventoryRequest) ([]InventoryCoverageNote
 	if len(req.providers) > 0 && !contains(req.providers, models.ProviderK8s) {
 		return nil, nil
 	}
-	sweeps, err := k8sread.New(q.DB(), q.WS).LatestSweeps()
+	kq := k8sread.New(q.DB(), q.WS)
+	sweeps, err := kq.LatestSweeps()
+	if err != nil {
+		return nil, err
+	}
+	// The note describes the rows, and the rows come from the newest sweep that
+	// was APPLIED. A newer sweep that arrived and was not applied (or failed to
+	// apply) says nothing about them, so it does not speak here; a cluster with
+	// no applied sweep has no rows and reads not_swept.
+	projected, err := kq.LatestProjectedSweeps()
 	if err != nil {
 		return nil, err
 	}
@@ -945,9 +954,9 @@ func inventoryK8sNotes(q *Query, req *inventoryRequest) ([]InventoryCoverageNote
 			continue
 		}
 		state, observed := k8sread.CoverageNone, (*time.Time)(nil)
-		if cs.Sweep != nil {
-			at := cs.Sweep.ObservedAt.UTC().Truncate(time.Second)
-			state, observed = cs.Sweep.Coverage, &at
+		if sw, ok := projected[k8sread.SweepKey{SourceID: cs.SourceID, Cluster: cs.Cluster}]; ok {
+			at := sw.ObservedAt.UTC().Truncate(time.Second)
+			state, observed = sw.Coverage, &at
 		}
 		note := InventoryCoverageNote{
 			CoverageNote: CoverageNote{AccountID: cs.Cluster, Surface: inventoryK8sSurface, State: state, Affects: k8sread.Affects(state)},

@@ -206,6 +206,33 @@ func (q *Query) LatestSweeps() ([]ClusterSweep, error) {
 	return out, nil
 }
 
+// SweepKey is one (source, cluster) pair.
+type SweepKey struct {
+	SourceID uuid.UUID
+	Cluster  string
+}
+
+// LatestProjectedSweeps is the newest sweep of each (source, cluster) whose
+// rows were applied to the shared tables (status projected): the reading the
+// inventory's Kubernetes rows actually come from. It differs from
+// LatestSweeps when the newest sweep has arrived and not been applied, or has
+// failed to apply: that sweep's coverage describes rows that do not exist yet,
+// so a caller reporting what the inventory covers must use this one.
+func (q *Query) LatestProjectedSweeps() (map[SweepKey]*Sweep, error) {
+	var sweeps []models.IGAK8sSweep
+	if err := q.tx.Raw(`
+		SELECT DISTINCT ON (discovery_source_id, cluster) *
+		  FROM iga_k8s_sweep WHERE workspace_id = ? AND status = ?
+		 ORDER BY discovery_source_id, cluster, generation DESC`, q.WS, models.K8sSweepProjected).Scan(&sweeps).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[SweepKey]*Sweep, len(sweeps))
+	for _, s := range sweeps {
+		out[SweepKey{SourceID: s.DiscoverySourceID, Cluster: s.Cluster}] = sweepOf(s)
+	}
+	return out, nil
+}
+
 // Affects is the short sentence saying what a coverage state means for the
 // inventory of its cluster, for a coverage note. Limitation is the long form
 // for a sweep's own header; this is the one-line form a list's coverage

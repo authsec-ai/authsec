@@ -1630,6 +1630,11 @@ func SetupRoutes(
 			// summarises; it changes nothing.
 			discovery.GET("/connections", middlewares.Require("discovery", "read"),
 				platformCtrl.NewDiscoveryConnectionsController(config.DB).ListConnections)
+			// Behind the same discovery:admin middleware as the administrative
+			// connection routes: reaching the handler IS the server's answer, so the
+			// console can show a read-only reader no administrative control.
+			discovery.GET("/connections/can-administer", middlewares.Require("discovery", "admin"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).CanAdminister)
 			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
 			// Quick Create: starting a session is admin, like POST /aws/connectors,
 			// because the link it returns connects an account. Reading one is not.

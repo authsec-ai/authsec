@@ -46,3 +46,13 @@ func (ctl *DiscoveryConnectionsController) ListConnections(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, body)
 }
+
+// CanAdminister handles GET /authsec/discovery/connections/can-administer. It
+// is mounted behind the same discovery:admin middleware as the administrative
+// connection routes, so reaching this handler IS the answer: the server's own
+// decision about this caller, never a copy of it. The console asks once so it
+// can show a read-only reader no Scan, Verify, Edit scope or Revoke control at
+// all; a 403 here is the other answer. The routes themselves enforce either way.
+func (ctl *DiscoveryConnectionsController) CanAdminister(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"can_administer": true})
+}
