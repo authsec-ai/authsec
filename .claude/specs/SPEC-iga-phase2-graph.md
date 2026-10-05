@@ -1039,16 +1039,16 @@ keeps working (bookmarks, redirects and `?connector=` links included):
 
 | Sidebar | Route | What it is for |
 |---|---|---|
-| **Accounts & clusters** | `/iga/sources` | What is connected and whether it is reporting (replaces Integrations; scan rules live inside a GitHub organisation) |
-| **Discovery** | `/iga/discovery` | Everything found — workloads, identities, resources, agent sightings — from every source, one search, one set of filters, a *Graph* / *As collected* view (replaces Agents & workloads, Cloud Inventory, Agent sightings, Kubernetes access and the Identities / Resources lists) |
-| **Policy** | `/iga/policy` | Decisions over discovered objects — a preview on sample data until its backend is dependable |
-| **Logs** | `/iga/logs` | What happened, when, by whom — a preview on sample data |
+| **Connections** | `/iga/connections` | What is connected, is it reporting, is its data usable — a four-way readiness model per connection (replaces Integrations; scan rules live inside a GitHub organisation) |
+| **Discovery** | `/iga/discovery` | Everything found, provider-scoped — workloads, identities, resources, sightings — one search, explicit filter and count semantics, a *Published* / *Latest collected* view (replaces Agents & workloads, Cloud Inventory, Agent sightings, Kubernetes access and the Identities / Resources lists) |
+| **Policy** | `/iga/policy` | Reserved; a preview boundary only — its functionality is a separate spec |
+| **Logs** | `/iga/logs` | What happened, when, by whom — a labelled preview on sample events |
 
-The design of these four screens, the object card that heads every object
-page and the redirects from every earlier route are in
-[`SPEC-console-revamp.md`](SPEC-console-revamp.md). Governance pages leave
-the sidebar but keep their routes. Object pages keep theirs and are reached
-from Discovery.
+The design — secondary screens, the interaction rule, redirects that carry
+their parameters, the removal contract for the legacy governance screens,
+the three summary compositions and the field-level backend dependencies —
+is [`SPEC-console-revamp.md`](SPEC-console-revamp.md). Object pages keep
+their routes and are reached from Discovery.
 
 - **One breadcrumb**, the global one, using the sidebar's own labels, ending
   in the current object's name on every object and detail page (graph
