@@ -1,6 +1,6 @@
 # SPEC — Console revamp: four destinations, one Discovery, honest summaries
 
-Status: **proposed, revision 2** — design to lock before implementation.
+Status: **proposed, revision 3** — design to lock before implementation.
 Nothing below is implemented. Where today's code matters, the text says
 what exists and where.
 
@@ -64,10 +64,10 @@ Enforcement queue (`/iga/enforcement`).
   governance screen, and moves to `features/discovery/`). The API slice
   keeps only the endpoints a retained consumer calls.
 - Old bookmarks land on a **retired-page state**: the page title, one
-  sentence (*This screen was retired. Decisions over discovered objects
-  live under Policy; activity under Logs.*), and links to Discovery,
-  Policy and Logs. It renders nothing of the old functionality and makes
-  no governance API call.
+  sentence (*This screen was retired and has no replacement yet.*), and
+  links to **Discovery** and **Connections**. Links to Policy or Logs, if
+  shown, are labelled *(preview)*. It renders nothing of the old
+  functionality and makes no governance API call.
 - No search result, breadcrumb, row menu or detail-page link may reach a
   retired screen. The global search index and `Breadcrumb.tsx` labels for
   those segments are removed.
@@ -163,7 +163,7 @@ One row per connection, fitted to the available width (priorities under
 |---|---|
 | Name | Display name; the id in mono beneath only when no friendly name exists (never both when they are the same); provider glyph + provider word |
 | Type | AWS account · GCP project · Kubernetes cluster · GitHub organisation |
-| Status | The **primary condition** (the worst of the four, in words) and **one supporting line** that says what is missing and what to do: *Partial — IAM users not read. Grant iam:ListUsers and scan again.* The full four-way breakdown is on the connection's Overview tab, never only on hover |
+| Status | The **primary condition** and **one supporting line**. Precedence, deterministic: Revoked › Authentication failed › Latest scan failed › Publication failed › Coverage partial / denied › Scan running / queued › Connected. The supporting line always says what still holds: *Latest scan failed · Inventory from 29 Sep remains available* — never implying data disappeared — then what to do: *Grant iam:ListUsers and scan again.* The full four-way breakdown is on the connection's Overview tab, never only on hover |
 | Last scan | Relative time + outcome (*Finished 6 days ago* · *Failed 2 h ago* · *Running*) |
 | Graph | *Published 12 min ago* · *Not published* · *Publication failed* — distinct from the scan outcome |
 | Scope | *3 regions* · *all namespaces* · *12 repositories* |
@@ -182,21 +182,56 @@ Removed: Cadence, Agents, Detail. Filters: Type, Status, search.
 | Mint agent token | — | — | yes | — |
 | Revoke | yes | yes | yes (disconnect) | yes |
 
-**Revoke** confirms with its consequences first: *AuthSec stops reading
-this account. Everything already discovered is kept and marked as no
-longer reconfirmed; nothing is deleted. The role in the customer's account
-is not removed — do that in AWS.* **Edit scope** says what changes apply
-from: *Regions apply from the next scan; rows from regions you remove are
-kept and marked stale at the next publication.*
+Actions are governed by authorisation as well as capability:
+- Visibility follows the server's permission (`discovery:admin` for Scan,
+  Verify, Edit scope, Revoke, Mint token; `discovery:read` sees the row and
+  the detail). A read-only user sees no administrative control; the server
+  enforces it regardless (403 is shown as *Your role cannot do this*, never
+  as a failure).
+- A submitted action disables its control and shows its pending state
+  (*Queuing…*, *Verifying…*); a duplicate submission is refused client-side
+  and a 409 from the server is shown as its meaning (*A scan is already
+  running*).
+- Failure keeps the control available with the cause and Retry; success
+  refetches the row and the detail so the readiness model updates.
+
+**Revoke** confirms with its consequences first, per provider. AWS / GCP:
+*AuthSec stops reading this account. Everything already discovered is
+kept. Rows this connection supported are no longer reconfirmed and show
+as stale from the next publication; nothing is deleted. The role in your
+account is not removed — do that in AWS.* Kubernetes: *The agent's token
+is revoked; it stops reporting. Its last inventory is kept and marked
+unreconfirmed.* GitHub: *Repository scans stop; sightings are kept.*
+**Edit scope** (AWS regions, GitHub repositories): *Applies from the next
+scan. Rows from a removed region are kept and show as stale from the next
+publication.*
+
+The stale transitions above are what the reconciliation rule gives (a
+partition whose surfaces were not reached goes stale, never ended — graph
+spec §4.10); they are **verified in the Connections dry run** before the
+copy ships, and if a provider does not behave that way the copy says what
+that provider actually does rather than asserting the rule.
 
 ### First successful journey
 
-connect → verify → choose scope → scan → publication → open Discovery.
-The connection's Overview tab is a five-step tracker with each step's state
-and its next action, so the operator never has to infer "is it ready?" from
-timestamps. *Scan finished* and *Graph published* are two steps; the last
-step's button is *Open in Discovery* and is enabled only when a publication
-includes this connection.
+connect → verify → choose scope → scan → result available → open
+Discovery. The connection's Overview tab is a tracker with each step's
+state and its next action, so the operator never infers "is it ready?" from
+timestamps. *Scan finished* and *Result available* are two steps, and what
+"available" means is per provider:
+
+| Provider | Discovery is ready when | *Open in Discovery* lands on |
+|---|---|---|
+| AWS, Published view | a publication includes this connection | `type=workloads&view=published&account=` |
+| AWS, Latest collected view | the latest scan finished (any outcome short of failed), collection status shown | `view=latest&account=` |
+| Kubernetes | a usable sweep exists for the cluster (`last_sweep.status` complete or partial) | `provider=k8s&source=` |
+| GCP | collected identity inventory exists for the project | `provider=gcp&type=identities&source=` |
+| GitHub | a completed discovery result exists for the organisation | `type=sightings&source=` |
+
+A successful collection with **zero results** is ready: *ready* means the
+result is available, not that objects were found; Discovery then shows the
+successful-empty state for that source. The AWS tracker shows *Graph
+published* as a sixth step for the Published view only.
 
 ### Coverage screen
 
@@ -213,8 +248,12 @@ behind an expansion on each row; the row leads with the consequence.
 
 Discovery is **provider-scoped** until the read contracts are equal. The
 header carries a Provider control (AWS · Kubernetes · GCP · GitHub, only
-providers with a connection); the default is the provider with the most
-recent publication. A combination the provider does not collect shows an
+providers with a connection). Default provider: the one the reader last
+used (URL, then local preference); else the provider whose result is most
+recently available by its own readiness rule (AWS publication, Kubernetes
+sweep `observed_at`, GCP latest scan, GitHub latest result); else the only
+connected provider; a workspace with no connection shows the connect-first
+state with a link to Connections. A combination the provider does not collect shows an
 explicit *Not collected for Kubernetes* state with the reason — **never an
 empty list**. There is no "all providers" view until B1 lands; the control
 says so.
@@ -230,6 +269,26 @@ says so.
 
 Each cell is the contract the UI may rely on. A cell with "—" renders the
 explicit not-collected state.
+
+### Control contract per provider and view
+
+The controls offered are exactly what the read model supports; a control is
+never shown that quietly acts on a capped local subset.
+
+| Provider / view | Search | Filters | Sort | Pagination | Counts | Detail · graph |
+|---|---|---|---|---|---|---|
+| AWS Published | server `q` over name, full ARN, account id | Source, Region, Lifecycle, Classification, Runtime / Kind / Representation / External / Sensitivity / Named by Deny | route sort keys (`name`, `last_confirmed_at`, …) | keyset cursor, signed | `total` / `total_known` (`ExactCount`) | object pages; Graph tab |
+| AWS Latest collected | **client-side over the loaded page only**, labelled *Search the N loaded rows* | Source and Kind server-side; Attribution, Unused access client-side over loaded rows, labelled | client-side over loaded rows | offset `limit`/`offset` (500 cap), *Load more* | `total` from the discovery route when returned, else *At least N loaded* | connector drawers; *Open in graph* via `/lookup` |
+| Kubernetes | **none server-side**; client-side over the loaded `limit` rows, labelled *Search the N loaded workloads* | Source (cluster), Namespace — client-side over loaded rows, labelled | client-side | `limit` only; *Load more* raises the limit; no cursor | *At least N* until the response is shorter than the limit, then exact | Kubernetes workload / identity detail (`/iga/estate/:id`, `/iga/identities/:id` once B1; until then the K8s access detail); Graph tab |
+| GCP identities | client-side over loaded rows, labelled | Source | client-side | offset | as AWS latest | connector drawer |
+| GitHub sightings | server `q` (name, fingerprint) | Status, Live only | server | offset | exact | sighting detail |
+
+Switching type keeps only the filters the new type supports (Source always;
+Region only where the table above lists it); every removed filter is named
+in a one-interaction chip. B1 extends the AWS Published contract to
+Kubernetes rows; it does **not** by itself enable an all-provider view —
+GCP and GitHub keep their own contracts until each is brought to the same
+one, and the Provider control stays until then.
 
 ### Layout
 
@@ -280,9 +339,9 @@ Filters:  Source ▾   Region ▾   Lifecycle ▾   Runtime ▾   Attribution �
 | Decision needed · Registered · Ignored; Live only | sightings | |
 
 Rules
-- Switching type keeps Source and Region; type-specific filters are
-  **removed visibly** (an "x Removed: Runtime — not a resource filter" chip
-  for one interaction) — never silently ignored.
+- Switching type keeps Source, and Region only where the new type supports
+  it; every other filter is **removed visibly** (an "x Removed: Runtime —
+  not a resource filter" chip for one interaction) — never silently ignored.
 - Facet counts reflect **every other active filter** (the server's
   `facets` do this, §5.2 of the graph spec); a facet whose count is not
   known shows *Unavailable*, not 0.
@@ -302,16 +361,20 @@ unknown, never zero):
 | `Unavailable` | the count timed out or the provider does not report it |
 | `0` | a successful query established no matches |
 
-A total is never derived from the page in hand. Type-switcher counts come
-from B2 (one call) or, until then, from each list's own `total` /
-`total_known` — never from `rows.length`.
+A total is never derived from the page in hand, and a cursor is never
+turned into a number: *12 more* only when an exact total is known;
+*More available* / *Load more* when only a cursor is; an incomplete
+collection is stated beside the count, not folded into it. Type-switcher
+counts come from B2 (one call) or, until then, from each list's own
+`total` / `total_known` — never from `rows.length`.
 
 ### Sightings actions — inventory
 
 | Action | Class | In this revamp |
 |---|---|---|
 | View, filter, open detail, open evidence | read-only discovery | yes |
-| Claim (tie a sighting to an identity) | ownership / classification | yes — the existing `ClaimAgentDialog` claim path |
+| Claim (existing dialog and `claim` mutation) | **provisioning** — with the identity left blank, which its own copy calls the normal path, the backend mints a governed identity *and an OAuth client* (`services/discovery_claim_identity.go`) | **no** — the existing Claim flow is not offered in Discovery; the backend capability is untouched |
+| Associate a sighting with an existing identity | ownership / classification | **only** as a new, narrower action with its own contract: pick an existing identity (required), no creation of any identity or client, server-enforced `iga:review`; specified and reviewed separately before it is built. Until then, sightings are read-only apart from Ignore |
 | Ignore | classification | yes |
 | Classify a workload as agent / undo | classification | yes (already on workload pages) |
 | Provision | provider-mutating | **no** — not offered in Discovery |
@@ -324,10 +387,18 @@ in Discovery authors policy or enforces anything.
 
 Served from `k8sGraphApi` under Provider = Kubernetes with the contract in
 the table above. The workload → ServiceAccount → binding → role → rule
-chain is the Kubernetes workload's Identities tab and its Graph tab. Because
-Kubernetes writes are unrevisioned, the header shows *Reported <time>* from
-the cluster heartbeat rather than a publication, and a cluster that has not
-reported shows *No report from this cluster since <time>*.
+chain is the Kubernetes workload's Identities tab and its Graph tab.
+Kubernetes writes are unrevisioned, so the header is built from the
+**sweep behind the displayed data** (`last_sweep`: `observed_at`, `status`,
+`complete`, `coverage`, `cluster_scoped`), never from the agent heartbeat:
+
+| Condition | Source | Shown |
+|---|---|---|
+| Connection health | last heartbeat | on Connections: *Agent online, heartbeat 2 min ago* |
+| Inventory freshness | `last_sweep.observed_at` | Discovery header: *Inventory from sweep at <time>* |
+| Coverage | `last_sweep.coverage` (`cluster_scoped`, `namespaces`) | the coverage state word and sentence |
+| No sweep | `coverage: not_swept` | *No inventory received yet* — not an empty list |
+| Heartbeat recent, sweep old | both | *Agent online; its last inventory is from <time>* — the discrepancy is stated |
 
 ## Summaries — three compositions
 
@@ -369,13 +440,15 @@ they show are defined with their calculation and completeness.
 
 | Fact | Shown on | Calculation | Completeness |
 |---|---|---|---|
-| Runs as / ECS agent uses | workload preview, header | `execution_role` (task role) and `other` of type `task_execution_role` — **two labels, never merged into "Runs as"** | exact for the first page; *+N more* when `next_cursor` |
+| Runs as / ECS agent uses | workload preview, header | `execution_role` (task role) and `other` of type `task_execution_role` — **two labels, never merged into "Runs as"** | the rows shown are exact; the summary is complete only when there is no `next_cursor`; otherwise *More available* |
 | Declared permissions — examples | workload / identity preview | The first grant lines of the Resources tab at the pinned revision, labelled *Examples of declared permissions*; Allow / Deny, conditions and `NotResource` exclusions are preserved on drill-down; **`NotResource` targets are never counted as destinations** | labelled as examples; no ranking is claimed |
-| Resources named (count) | identity header | `named_by_count` / list `total` | `ExactCount` semantics |
-| Workloads bound | identity preview, header | `used_by_count` — direct bindings via `executes_as` and `task_execution_role`, said as such | exact or capped (*3+*) |
-| May assume (count) | identity header | trust-policy principals — **configured trust, never a proven assumption**; wording *may assume (declared)* | first page + `next_cursor` |
+| Resources named (count) | resource header only | `named_by_count` is a **resource-detail** field — statements naming that resource | `ExactCount` semantics |
+| Resources an identity can reach (count) | — | no identity-scoped resource total exists; the identity's Permissions tab lists statements, not a resource total | **unavailable** — not summarised; the header links to Permissions |
+| Workloads bound | identity preview, header | `used_by_count` — direct bindings via `executes_as` and `task_execution_role`, said as such | exact, or *At least 3* when capped |
+| Trusted principals (incoming) | identity header | the Used-by tab's *principals* section: who the role's trust policy names — **incoming**: *Trusted to assume this role (declared)* — configured trust, never a proven assumption | first page; *More available* on `next_cursor` |
+| May assume (outgoing) | — | which roles trust **this** identity — a different query (the graph's `can_assume` edges from this identity, `/graph` forward); shown only when a verified outgoing read supplies it; until then **not shown** | — |
 | Accounts crossed | not shown | no complete source; would require a traversal | — |
-| Identities that reach a resource | resource preview, header | the Access tab's first page | *+N more* when paged |
+| Identities that reach a resource | resource preview, header | the Access tab's first page | *12 more* only when an exact total is returned; *More available* when only a cursor is; incomplete collection stated separately from paging |
 | Qualifications | all | shown only when they answer the question at hand: *Permissions boundary present* on a declared permission, not on every object; *Stale since* on the object; *Coverage partial* on the account | — |
 
 *Declared access — not evaluated* appears once per screen, in the header,
@@ -420,9 +493,22 @@ Rules
   came from (`evidence=` beside the content; Back closes it).
 - *Refresh* re-pins displayed data; *Scan now* requests a new scan; the two
   are never one control.
-- A newer publication never replaces data mid-investigation: the banner
-  offers Refresh; until then every read stays pinned (`409 revision_stale`
-  handling as today).
+- A newer publication never silently replaces data mid-investigation —
+  but the backend does **not** serve old revisions: once a newer publication
+  is current, any read pinned to the old one is refused with `409
+  revision_stale` (`internal/igaread/snapshot.go`). The contract is
+  therefore:
+  - content already loaded stays visible, labelled with its publication
+    (*as of 29 Sep 16:30*); newer responses are never mixed in;
+  - an uncached tab, page or evidence request that returns `409` shows a
+    specific *A newer publication is current — refresh to continue* state
+    in place of that panel, with the Refresh control; nothing else on the
+    screen changes;
+  - Refresh re-pins the whole investigation together, resets incompatible
+    cursors and re-reads the selected object; if that object is retired or
+    absent at the new publication, the page shows its retired state (its
+    Overview and Changes, the other tabs saying they have no current data)
+    and the list returns to the same filters without the selection.
 - Redirected old URLs keep their account, source, tab and filter
   parameters.
 
@@ -515,7 +601,9 @@ rollout per phase.
 | Switch providers | Supported data or the explicit not-collected state; never an empty inventory that looks like "none" |
 | Use a narrow viewport (≤ 900 px content width) | The main tasks complete with no horizontal table scroll; hidden columns are reachable in details; sorting remains available |
 | Follow an old governance bookmark | The retirement state; no legacy screen or dialog appears; no governance API call is made |
-| Refresh during an investigation | A newer publication is announced; data changes only on Refresh; Scan now is a different control |
+| Refresh during an investigation | A newer publication is announced; loaded content stays labelled with its publication; an uncached request shows the refresh-required state, not an error; Refresh re-pins everything together and handles a retired selection |
+| Connect a GCP project or a cluster | *Open in Discovery* becomes available on that provider's own readiness rule, including a successful empty result |
+| Act on a sighting | Only Ignore (and, once specified, Associate) is offered; nothing creates an identity or client |
 | Keyboard only | Objects, filters, tabs, preview and evidence are all reachable without double-click or hover |
 
 State matrix, required distinct on every list and detail: loading, empty,
