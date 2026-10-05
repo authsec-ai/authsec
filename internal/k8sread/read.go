@@ -26,6 +26,7 @@
 package k8sread
 
 import (
+	"sort"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -136,6 +137,12 @@ func (q *Query) latestSweep(sourceID uuid.UUID, cluster string) (*Sweep, error) 
 		}
 		return nil, err
 	}
+	return sweepOf(s), nil
+}
+
+// sweepOf is the one place a stored sweep becomes the reading behind an
+// answer, so latestSweep and LatestSweeps cannot disagree about it.
+func sweepOf(s models.IGAK8sSweep) *Sweep {
 	out := &Sweep{
 		ID: s.ID, Generation: s.Generation, Status: s.Status,
 		Complete: s.Complete, ClusterScoped: s.ClusterScoped,
@@ -143,7 +150,77 @@ func (q *Query) latestSweep(sourceID uuid.UUID, cluster string) (*Sweep, error) 
 		AgeSeconds: int64(time.Since(s.ObservedAt).Seconds()),
 	}
 	out.Coverage, out.Limitation = coverageOf(s.Complete, s.ClusterScoped)
+	return out
+}
+
+// ClusterSweep is one (source, cluster) pair and its newest sweep.
+type ClusterSweep struct {
+	SourceID uuid.UUID
+	Cluster  string
+	// Sweep is nil for a Kubernetes source that names its cluster and has
+	// never delivered a sweep: coverage not_swept.
+	Sweep *Sweep
+}
+
+// LatestSweeps is latestSweep for every (source, cluster) of the workspace in
+// two statements, plus the Kubernetes sources that have never swept (their
+// cluster_name, with a nil Sweep). Ordered by cluster, then source, so a
+// caller's output is deterministic.
+func (q *Query) LatestSweeps() ([]ClusterSweep, error) {
+	var sweeps []models.IGAK8sSweep
+	// DISTINCT ON with generation DESC is latestSweep's ORDER BY ... First,
+	// once per (source, cluster).
+	if err := q.tx.Raw(`
+		SELECT DISTINCT ON (discovery_source_id, cluster) *
+		  FROM iga_k8s_sweep WHERE workspace_id = ?
+		 ORDER BY discovery_source_id, cluster, generation DESC`, q.WS).Scan(&sweeps).Error; err != nil {
+		return nil, err
+	}
+	out := make([]ClusterSweep, 0, len(sweeps))
+	for _, s := range sweeps {
+		out = append(out, ClusterSweep{SourceID: s.DiscoverySourceID, Cluster: s.Cluster, Sweep: sweepOf(s)})
+	}
+
+	var idle []struct {
+		ID          uuid.UUID
+		ClusterName string
+	}
+	if err := q.tx.Raw(`
+		SELECT s.id, s.cluster_name
+		  FROM discovery_sources s
+		 WHERE s.workspace_id = ? AND s.kind = ? AND s.cluster_name <> ''
+		   AND NOT EXISTS (SELECT 1 FROM iga_k8s_sweep w
+		                    WHERE w.workspace_id = s.workspace_id AND w.discovery_source_id = s.id)`,
+		q.WS, models.DiscoverySourceK8sWebhook).Scan(&idle).Error; err != nil {
+		return nil, err
+	}
+	for _, s := range idle {
+		out = append(out, ClusterSweep{SourceID: s.ID, Cluster: s.ClusterName})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Cluster != out[j].Cluster {
+			return out[i].Cluster < out[j].Cluster
+		}
+		return out[i].SourceID.String() < out[j].SourceID.String()
+	})
 	return out, nil
+}
+
+// Affects is the short sentence saying what a coverage state means for the
+// inventory of its cluster, for a coverage note. Limitation is the long form
+// for a sweep's own header; this is the one-line form a list's coverage
+// carries, written here beside the states so the two cannot drift.
+func Affects(coverage string) string {
+	switch coverage {
+	case CoverageComplete:
+		return "nothing: the latest sweep read the whole cluster"
+	case CoverageNamespaced:
+		return "cluster-scoped roles and bindings were not read, so cluster-wide access is not covered"
+	case CoverageIncomplete:
+		return "a list failed in the latest sweep, so absence from this cluster's inventory proves nothing"
+	default:
+		return "no sweep has been received, so this cluster has no inventory yet"
+	}
 }
 
 // coverageOf turns the two sweep flags into a state and the sentence that
