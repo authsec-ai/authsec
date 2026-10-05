@@ -1,6 +1,6 @@
 # SPEC — Console revamp: four destinations, one Discovery, honest summaries
 
-Status: **proposed, revision 3** — design to lock before implementation.
+Status: **proposed, revision 4** — design to lock before implementation.
 Nothing below is implemented. Where today's code matters, the text says
 what exists and where.
 
@@ -226,7 +226,7 @@ timestamps. *Scan finished* and *Result available* are two steps, and what
 | AWS, Latest collected view | the latest scan finished (any outcome short of failed), collection status shown | `view=latest&account=` |
 | Kubernetes | a usable sweep exists for the cluster (`last_sweep.status` complete or partial) | `provider=k8s&source=` |
 | GCP | collected identity inventory exists for the project | `provider=gcp&type=identities&source=` |
-| GitHub | a completed discovery result exists for the organisation | `type=sightings&source=` |
+| GitHub | a completed discovery result exists for the organisation | `type=sightings&source=` — GitHub *workloads* appear in the inventory only once a GitHub writer records support rows (042 added the columns; nothing writes them yet); until then GitHub is sightings only |
 
 A successful collection with **zero results** is ready: *ready* means the
 result is available, not that objects were found; Discovery then shows the
@@ -262,8 +262,9 @@ says so.
 
 | Provider | Workloads | Identities | Resources | Sightings | Read model |
 |---|---|---|---|---|---|
-| AWS | yes | yes | yes | — | graph lists `/api/iga/v1/*` (revisioned, keyset-paged, facets, `q`); latest-collected rows via `/authsec/discovery/aws/*` |
-| Kubernetes | yes | yes (ServiceAccounts) | — | yes (cluster sightings) | `/authsec/discovery/k8s/*` via `k8sGraphApi` — **no revision, no cursor, `limit` only, no facets, no `q`**; unrevisioned writes into `iga_*` |
+| AWS | yes | yes | yes | — | unified inventory (B1) for lists; detail from the §5.3 graph reads (revisioned); latest-collected rows via `/authsec/discovery/aws/*` |
+| Kubernetes | yes | yes (ServiceAccounts) | — | yes (cluster sightings) | unified inventory (B1) once its fields land; until then `/authsec/discovery/k8s/*` via `k8sGraphApi` — **no revision, no cursor, `limit` only, no facets, no `q`**; writes into `iga_*` are unrevisioned |
+| GitHub (graph rows) | schema only | schema only | — | — | 042 added GitHub provenance to the shared tables; no writer yet, so the inventory lists no GitHub object until one exists |
 | GCP | — | yes (latest collected only) | — | — | `/authsec/discovery/gcp/*` |
 | GitHub | — | — | — | yes (repository sightings) | `/authsec/discovery/agents` |
 
@@ -285,10 +286,11 @@ never shown that quietly acts on a capped local subset.
 
 Switching type keeps only the filters the new type supports (Source always;
 Region only where the table above lists it); every removed filter is named
-in a one-interaction chip. B1 extends the AWS Published contract to
-Kubernetes rows; it does **not** by itself enable an all-provider view —
-GCP and GitHub keep their own contracts until each is brought to the same
-one, and the Provider control stays until then.
+in a one-interaction chip. B1 brings Kubernetes rows under the inventory
+contract with their publication state labelled; it does **not** by itself
+enable an all-provider view — GCP keeps its own contract and GitHub has no
+graph rows until its writer exists — and the Provider control stays until
+then.
 
 ### Layout
 
@@ -385,12 +387,16 @@ in Discovery authors policy or enforces anything.
 
 ### Kubernetes in Discovery
 
-Served from `k8sGraphApi` under Provider = Kubernetes with the contract in
-the table above. The workload → ServiceAccount → binding → role → rule
-chain is the Kubernetes workload's Identities tab and its Graph tab.
-Kubernetes writes are unrevisioned, so the header is built from the
-**sweep behind the displayed data** (`last_sweep`: `observed_at`, `status`,
-`complete`, `coverage`, `cluster_scoped`), never from the agent heartbeat:
+Listed by the unified inventory under Provider = Kubernetes (B1); until B1's
+fields land, from `k8sGraphApi` with the contract in the table above. The
+workload → ServiceAccount → binding → role → rule chain is the Kubernetes
+workload's Identities tab and its Graph tab. Kubernetes writes are
+**unrevisioned**: the agent's sweep is written straight into the shared
+tables, with no publication number and no "newer publication" prompt, so
+every Kubernetes row carries `graph_state: unrevisioned` and an `as_of`
+from the **sweep behind it**, and the header is built from that sweep
+(`last_sweep`: `observed_at`, `status`, `complete`, `coverage`,
+`cluster_scoped`), never from the agent heartbeat:
 
 | Condition | Source | Shown |
 |---|---|---|
@@ -550,16 +556,43 @@ or Enforcement screens is reused.
 | Coverage state per connection | `CloudConnector.coverage.surfaces` (AWS/GCP); K8s coverage; GitHub none | AWS/GCP yes; K8s partial; GitHub no | per-surface states | B3 (`coverage_state`, `surfaces_short`); GitHub reports repositories scanned vs in scope | *Unknown* for GitHub |
 | Graph publication per connection | `/api/iga/v1/pipeline`, `/coverage` (AWS); none for K8s (unrevisioned) | AWS yes | exact | B3 includes `graph` for AWS; K8s shows *Reported <heartbeat>* | — |
 | Type counts | each list's `total` / `total_known` | yes (AWS) | `ExactCount` | B2: `GET /api/iga/v1/summary` at the pinned rev honouring the same filters | four list reads with `limit=1` |
-| Facet counts | `facets=` on graph lists | AWS yes; K8s no | server-side, other filters applied | B1 for K8s | K8s facets *Unavailable* |
-| Kubernetes workloads / identities in a revisioned, paged, searchable list | `k8sGraphApi` (`limit` only) | partial | none | B1: K8s rows served by the graph lists with `provider=k8s`, revisioned or explicitly `graph_state: unrevisioned`, keyset-paged, `q`, facets | provider-scoped K8s view on `k8sGraphApi`, counts *At least N* |
+| Facet counts | `facets=` on the graph lists and on the unified inventory (`provider`, `kind`, `scope`) | yes | server-side, other filters applied | B1 adds no facet; type-specific facets beyond those three stay on the graph lists for AWS | Kubernetes type-specific facets *Unavailable* |
+| One paged, searchable, faceted list per object type over every provider | unified inventory `/api/iga/v1/inventory/*` (PR #75) | yes — cursors, capped totals, `provider` / `kind` / `scope` facets, `q` | §5.2; **no** `rev`, `published_at`, `graph_state` or `coverage` today | B1 (below) | AWS from the graph lists; Kubernetes from `k8sGraphApi`, counts *At least N* |
+| GitHub objects in the inventory | shared tables + 042 columns | schema only | — | a GitHub writer for workloads, identities and support rows (outside this spec; owner: backend) | GitHub is sightings only |
 | Stable provider-qualified source reference | connector id (AWS/GCP), source id (K8s/GitHub) | yes, two id spaces | — | B3 returns one `source_ref` per connection; graph rows reference it | adapter |
 | Declared permissions examples | workload Resources tab first page; identity Permissions | yes | labelled examples | none | — |
 | Workloads bound / resources named / may assume | `used_by_count`, `named_by_count`, used-by first page | yes | `ExactCount` / paged | none | — |
 | Sighting ↔ identity link | `matched_client_id` | yes | — | none | — |
 | Logs events | none | no | — | out of scope (preview) | fixtures |
 
-B1–B3 are the three backend changes; the table is the measure of the work,
-not the count.
+The three backend changes, named in the table:
+
+- **B1 — publication state on the unified inventory.** PR #75's
+  `/api/iga/v1/inventory/{workloads,identities,resources}` are Discovery's
+  list contract: one provider-neutral row per object AWS, Kubernetes and
+  GitHub write into the shared `iga_*` tables, with `provider` / `kind` /
+  `scope` facets, §5.2 cursors, capped totals and `q`. They gain what a
+  reader needs to tell a numbered AWS publication from a live Kubernetes
+  write. **Envelope:** `meta.rev` and `meta.published_at` — the AWS
+  publication current at the snapshot, `null` when none (reported, not
+  enforced: the inventory is not pinned); `meta.graph_state` —
+  `published` (every row at that publication) · `unrevisioned` (no row is)
+  · `mixed` · `not_published` (AWS rows requested, no publication);
+  `meta.coverage[]` — the §5.2 notes for the AWS accounts in scope, plus
+  one note per Kubernetes cluster from its latest sweep's coverage.
+  **Per row:** `graph_state` (`published` for AWS rows, `unrevisioned` for
+  Kubernetes and GitHub rows) and `as_of` (AWS: `published_at`;
+  Kubernetes: the confirming sweep's `observed_at`; GitHub: `null` until a
+  writer exists). The §5.3 graph lists stay AWS-only; detail pages keep
+  reading them.
+- **B2 — type counts.** `GET /api/iga/v1/inventory/summary` → one
+  `ExactCount` per object type for the same filters, in one snapshot.
+- **B3 — one connections read.** `GET /authsec/discovery/connections`
+  across providers with `status`, `status_reason_code`, `last_scan`,
+  `coverage_state`, `graph` and `scope_summary`, and one `source_ref` per
+  connection.
+
+The table is the measure of the work, not the count.
 
 ## Delivery sequence
 
