@@ -92,6 +92,10 @@ type DiscoveryScanWorker struct {
 	name       string
 	poll       time.Duration
 	lease      time.Duration
+	// graph projects each finished run's declared agents into the shared
+	// graph. It honours IGA_GRAPH_PROJECTION, so with the switch off it
+	// writes nothing.
+	graph *GitHubGraphProjector
 }
 
 // NewDiscoveryScanWorker builds the worker against the live GitHub provider.
@@ -116,7 +120,16 @@ func NewDiscoveryScanWorker(db *gorm.DB) *DiscoveryScanWorker {
 		name:  fmt.Sprintf("%s/%s", host, uuid.NewString()[:8]),
 		poll:  scanWorkerPollInterval,
 		lease: scanWorkerLease,
+		// nil gate: the process-wide one, read when a run finishes.
+		graph: NewGitHubGraphProjector(db, nil),
 	}
+}
+
+// WithGraphProjection binds the worker's graph projection to a gate. Without
+// one it reads the process-wide gate, which defaults to off.
+func (w *DiscoveryScanWorker) WithGraphProjection(g *GraphProjectionGate) *DiscoveryScanWorker {
+	w.graph.gate = g
+	return w
 }
 
 // NewDiscoveryScanWorkerWithScanner injects a scanner directly, so the queue can
@@ -168,6 +181,7 @@ func (w *DiscoveryScanWorker) RunOnce(ctx context.Context) (bool, error) {
 		// an absent Vault produce the same answer three times, and a failed run
 		// naming the missing configuration is more useful than a queued one.
 		_ = w.runs.Finish(run, models.ScanRunFailed, err.Error())
+		w.projectGraph(run)
 		return true, err
 	}
 
@@ -184,7 +198,11 @@ func (w *DiscoveryScanWorker) RunOnce(ctx context.Context) (bool, error) {
 
 	switch {
 	case scanErr == nil:
-		return true, w.runs.Finish(run, models.ScanRunSucceeded, "")
+		if err := w.runs.Finish(run, models.ScanRunSucceeded, ""); err != nil {
+			return true, err
+		}
+		w.projectGraph(run)
+		return true, nil
 
 	case errors.Is(scanErr, repositories.ErrScanRunNotClaimable):
 		// Our lease was taken over mid-scan. The run belongs to another worker
@@ -199,7 +217,22 @@ func (w *DiscoveryScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	default:
 		// A genuine failure. Requeue gives it its remaining attempts and then
 		// marks it failed, keeping the cursor so retries make progress.
-		return true, w.runs.Requeue(run, scanErr.Error())
+		err := w.runs.Requeue(run, scanErr.Error())
+		w.projectGraph(run) // a no-op unless that was the last attempt
+		return true, err
+	}
+}
+
+// projectGraph projects a FINISHED run's declared agents into the shared graph.
+// A requeued run is not finished and is left for the attempt that finishes it.
+// A failure is logged, never turned into a failed scan: the run's own record is
+// already written and is the product's answer.
+func (w *DiscoveryScanWorker) projectGraph(run *models.DiscoveryScanRun) {
+	if w.graph == nil {
+		return
+	}
+	if _, err := w.graph.ProjectRepoScanRun(run.WorkspaceID, run.ID); err != nil {
+		log.Printf("[discovery-scan-worker] graph projection of run %s: %v", run.ID, err)
 	}
 }
 

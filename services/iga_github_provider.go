@@ -344,7 +344,7 @@ func (g *GitHubProvider) ListScopes(ctx context.Context, in ProviderContext) ([]
 				id = strconv.FormatInt(r.ID, 10)
 			}
 			out = append(out, ProviderScope{
-				Kind: "repository", NativeID: id,
+				Kind: "repository", NativeID: id, NodeID: r.NodeID,
 				DisplayName: r.FullName, DefaultBranch: branch,
 				Archived: r.Archived,
 			})
