@@ -111,6 +111,15 @@ func WorkloadKey(cluster, fingerprint string) string {
 	return Key(cluster, "workload", fingerprint)
 }
 
+// NativeWorkloadID is a workload's readable id: namespace/name, or name when
+// the workload is cluster-scoped.
+func NativeWorkloadID(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	return namespace + "/" + name
+}
+
 // LegacyWorkloadKey is the name-based key earlier releases wrote. Kept only so
 // those rows can be found and re-keyed; nothing new is written under it.
 func LegacyWorkloadKey(cluster, namespace, name string) string {
@@ -211,6 +220,10 @@ func ProjectWorkloads(cluster string, in []WorkloadSighting) WorkloadResult {
 				"runtime_status": s.RuntimeStatus,
 				"archetype":      s.Archetype,
 				"workload_kind":  s.WorkloadKind,
+				// The id a person recognises (namespace/name). The key carries the
+				// fingerprint, which is unique but opaque, so the inventory reads
+				// this instead of deriving its native_id from the key.
+				"native_id": NativeWorkloadID(s.Namespace, name),
 			}, cluster, s.Namespace),
 		})
 

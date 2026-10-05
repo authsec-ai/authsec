@@ -315,8 +315,8 @@ func (l *invLab) seedHome() {
 		attrs: map[string]any{"package_type": "Zip"}, seen: 1 * time.Hour},
 		invByConnector, "current")
 	e.add(invNode{table: wl, name: "checkout", provider: "k8s", kind: "k8s_deployment",
-		key:   k8sgraph.WorkloadKey(invCluster, "shop", "checkout"),
-		attrs: invK8sAttrs("shop", map[string]any{"fingerprint": "fp-checkout"}), seen: 4 * time.Hour},
+		key:   k8sgraph.WorkloadKey(invCluster, "fp-checkout"),
+		attrs: invK8sAttrs("shop", map[string]any{"fingerprint": "fp-checkout", "native_id": k8sgraph.NativeWorkloadID("shop", "checkout")}), seen: 4 * time.Hour},
 		invByK8s, "stale", invByK8s, "current")
 	e.add(invNode{table: wl, name: "Deploy_100%", provider: "github", kind: "github_actions_workflow",
 		key:   invGitHubKey("workflow", "acme/web", "deploy.yml"),
@@ -327,15 +327,15 @@ func (l *invLab) seedHome() {
 		attrs: invGitHubAttrs("acme/web", map[string]any{"native_id": "acme/web/AGENTS.md"}), seen: 3 * time.Hour},
 		invByRepoScan, "current")
 	e.add(invNode{table: wl, name: "stale-mixed", provider: "k8s", kind: "k8s_cronjob",
-		key: k8sgraph.WorkloadKey(invCluster, "batch", "stale-mixed"), attrs: invK8sAttrs("batch", nil), seen: 5 * time.Hour},
+		key: k8sgraph.WorkloadKey(invCluster, "fp-stale-mixed"), attrs: invK8sAttrs("batch", map[string]any{"fingerprint": "fp-stale-mixed", "native_id": k8sgraph.NativeWorkloadID("batch", "stale-mixed")}), seen: 5 * time.Hour},
 		invByK8s, "stale", invByK8s, "ended")
 	e.add(invNode{table: wl, name: "ended-only", provider: "k8s", kind: "k8s_job",
-		key: k8sgraph.WorkloadKey(invCluster, "batch", "ended-only"), attrs: invK8sAttrs("batch", nil), seen: 6 * time.Hour},
+		key: k8sgraph.WorkloadKey(invCluster, "fp-ended-only"), attrs: invK8sAttrs("batch", nil), seen: 6 * time.Hour},
 		invByK8s, "ended")
 	e.add(invNode{table: wl, name: "unsupported", provider: "aws", kind: "lambda_function", region: "us-east-1", awsScope: true,
 		key: invAWSKey("arn:aws:lambda:us-east-1:" + invAccountHome + ":function:unsupported"), seen: 7 * time.Hour})
 	e.add(invNode{table: wl, name: "retired-wl", provider: "k8s", kind: "k8s_job", retired: "deleted",
-		key: k8sgraph.WorkloadKey(invCluster, "batch", "retired-wl"), attrs: invK8sAttrs("batch", nil), seen: 8 * time.Hour},
+		key: k8sgraph.WorkloadKey(invCluster, "fp-retired-wl"), attrs: invK8sAttrs("batch", nil), seen: 8 * time.Hour},
 		invByK8s, "current")
 
 	id := "iga_identity_accounts"
@@ -378,7 +378,7 @@ func (l *invLab) seedOther() {
 		key: invAWSKey("arn:aws:lambda:eu-west-1:" + invAccountOther + ":function:billing-other"), seen: time.Hour},
 		invByConnector, "current")
 	e.add(invNode{table: "iga_workload", name: "checkout", provider: "k8s", kind: "k8s_deployment",
-		key: k8sgraph.WorkloadKey(invCluster, "shop", "checkout"), attrs: invK8sAttrs("shop", nil), seen: time.Hour},
+		key: k8sgraph.WorkloadKey(invCluster, "fp-checkout"), attrs: invK8sAttrs("shop", nil), seen: time.Hour},
 		invByK8s, "current")
 	e.add(invNode{table: "iga_identity_accounts", name: "billing-other-role", provider: "aws", kind: "iam_role",
 		key: invAWSKey("arn:aws:iam::" + invAccountOther + ":role/billing-other-role"), seen: time.Hour},

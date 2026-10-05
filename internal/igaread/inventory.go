@@ -66,9 +66,9 @@ const InventoryDefaultLimit = 50
 // InventoryProviders are the providers the inventory lists.
 var InventoryProviders = []string{models.ProviderAWS, models.ProviderK8s, models.ProviderGitHub}
 
-// The provider_attrs keys a k8s or github row states its scope in. They are
-// the row's scope and sub_scope, never its attrs.
-var inventoryScopeKeys = []string{"scope_kind", "scope_id", "scope_label", "sub_scope"}
+// The provider_attrs keys a k8s or github row states its scope and native id
+// in. They are the row's scope, sub_scope and native_id, never its attrs.
+var inventoryScopeKeys = []string{"scope_kind", "scope_id", "scope_label", "sub_scope", "native_id"}
 
 // inventoryScopeAWSAccount is an AWS row's scope kind.
 const inventoryScopeAWSAccount = "aws_account"
