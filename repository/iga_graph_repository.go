@@ -597,7 +597,11 @@ func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjec
 	}
 	return tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
-			{Name: "workspace_id"}, {Name: col}, {Name: "connector_id"}, {Name: "partition_key"},
+			// source_ref, not connector_id: 041 rebuilt the uq_iga_os_* indexes on
+			// source_ref = COALESCE(connector_id, discovery_source_id[, integration_id]),
+			// and ON CONFLICT must name the index columns exactly or Postgres
+			// rejects it (42P10). For an AWS row source_ref equals connector_id.
+			{Name: "workspace_id"}, {Name: col}, {Name: "source_ref"}, {Name: "partition_key"},
 		},
 		TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: col + " IS NOT NULL"}}},
 		DoUpdates: clause.Assignments(map[string]any{
