@@ -94,7 +94,8 @@ type pipelineRun struct {
 // projection job, its publication, and whether the graph holds the connector
 // at all -- a FIXED amount of work per connector, however long its run history
 // (cloud_scan_run has no retention, and the console polls this route under the
-// §5.1 3 s budget). Exported so a test can EXPLAIN it; nothing else runs it.
+// §5.1 3 s budget). Exported so a test can EXPLAIN it, and because the
+// connections read (connections.go) takes the same latest run per connector.
 //
 // Per connector, two index probes of LIMIT 1, never a sort of its history:
 //   - its live run -- queued or running, at most one (uq_cloud_scan_run_live);

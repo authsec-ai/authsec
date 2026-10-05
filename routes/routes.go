@@ -1624,6 +1624,12 @@ func SetupRoutes(
 			// AWS account decides what a scan may read and what it will cost.
 			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
 			k8sGraph := platformCtrl.NewK8sGraphController(config.DB)
+			// One read of every connection of every provider: connection, latest
+			// scan, coverage and graph state, scope and capabilities
+			// (SPEC-console-revamp B3). discovery:read, like the lists it
+			// summarises; it changes nothing.
+			discovery.GET("/connections", middlewares.Require("discovery", "read"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).ListConnections)
 			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
 			// Quick Create: starting a session is admin, like POST /aws/connectors,
 			// because the link it returns connects an account. Reading one is not.
