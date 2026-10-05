@@ -39,9 +39,10 @@ type Partition struct {
 	Namespace string
 
 	// Class is the node class this partition owns: identity | policy |
-	// entitlement. Empty for edge partitions.
+	// entitlement | workload. Empty for edge partitions.
 	Class string
-	// Target is "" for nodes, else "assignment" or "access_edge".
+	// Target is "" for nodes, else "assignment", "access_edge" or
+	// "executes_as".
 	Target string
 }
 
@@ -74,9 +75,15 @@ const (
 	ClassIdentity    = "identity"
 	ClassPolicy      = "policy"
 	ClassEntitlement = "entitlement"
+	// ClassWorkload is spelled as models.ObjectWorkload so SupportColumn
+	// resolves it to iga_object_support.workload_id.
+	ClassWorkload = "workload"
 
 	TargetAssignment = "assignment"
 	TargetAccessEdge = "access_edge"
+	// TargetExecutesAs owns the workload -> ServiceAccount edges in
+	// iga_relationship, partitioned by the WORKLOAD's namespace.
+	TargetExecutesAs = "executes_as"
 )
 
 // Scope is the sweep's coverage: what it looked at, and whether it finished.
@@ -159,12 +166,12 @@ func Partitions(s Scope) []Partition {
 	var out []Partition
 
 	add := func(ns string) {
-		for _, class := range []string{ClassIdentity, ClassPolicy, ClassEntitlement} {
+		for _, class := range []string{ClassIdentity, ClassPolicy, ClassEntitlement, ClassWorkload} {
 			out = append(out, Partition{
 				SourceID: s.SourceID, Cluster: s.Cluster, Namespace: ns, Class: class,
 			})
 		}
-		for _, target := range []string{TargetAssignment, TargetAccessEdge} {
+		for _, target := range []string{TargetAssignment, TargetAccessEdge, TargetExecutesAs} {
 			out = append(out, Partition{
 				SourceID: s.SourceID, Cluster: s.Cluster, Namespace: ns, Target: target,
 			})
@@ -195,6 +202,17 @@ func PartitionForRole(s Scope, namespace string) Partition {
 // could read cluster-wide.
 func PartitionForIdentity(s Scope, namespace string) Partition {
 	return Partition{SourceID: s.SourceID, Cluster: s.Cluster, Namespace: namespace, Class: ClassIdentity}
+}
+
+// PartitionForWorkload returns the partition owning a discovered workload.
+//
+// The evidence for a workload is the discovered-agent inventory, not the RBAC
+// lists, but it is reconciled on the same sweep and under the same rule: its
+// support ends only when a complete sweep that covered its namespace no longer
+// finds it live in that inventory. A workload with no namespace belongs to the
+// cluster partition.
+func PartitionForWorkload(s Scope, namespace string) Partition {
+	return Partition{SourceID: s.SourceID, Cluster: s.Cluster, Namespace: namespace, Class: ClassWorkload}
 }
 
 // PartitionForEdge returns the partition owning an assignment or grant.

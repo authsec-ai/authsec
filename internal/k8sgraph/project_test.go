@@ -320,3 +320,105 @@ func TestKeysAreClusterScoped(t *testing.T) {
 		t.Error("identically-named ServiceAccounts in two clusters produced one key")
 	}
 }
+
+/* ------------------------------ unified inventory ------------------------- */
+
+// Two workloads reporting the same display name in one namespace are two
+// workloads. The name key merged them, and one's access read as the other's.
+func TestWorkloadsWithTheSameNameKeepDistinctKeys(t *testing.T) {
+	res := ProjectWorkloads(cluster, []WorkloadSighting{
+		{Fingerprint: "fp-a", DisplayName: "agent", Namespace: "prod", RuntimeStatus: "running"},
+		{Fingerprint: "fp-b", DisplayName: "agent", Namespace: "prod", RuntimeStatus: "running"},
+	})
+	if len(res.Workloads) != 2 {
+		t.Fatalf("got %d workloads, want 2", len(res.Workloads))
+	}
+	a, b := res.Workloads[0], res.Workloads[1]
+	if a.SourceKey == b.SourceKey {
+		t.Errorf("same-name workloads share key %q", a.SourceKey)
+	}
+	if a.SourceKey != WorkloadKey(cluster, "fp-a") {
+		t.Errorf("key = %q, want the fingerprint key", a.SourceKey)
+	}
+	if a.LegacyKey != LegacyWorkloadKey(cluster, "prod", "agent") {
+		t.Errorf("legacy key = %q, want the old name key so the row can be re-keyed", a.LegacyKey)
+	}
+}
+
+func TestRuntimeKindFollowsTheWorkloadKind(t *testing.T) {
+	for in, want := range map[string]string{
+		"Deployment":  "k8s_deployment",
+		"StatefulSet": "k8s_statefulset",
+		"DaemonSet":   "k8s_daemonset",
+		"CronJob":     "k8s_cronjob",
+		"Job":         "k8s_job",
+		"Pod":         "k8s_pod",
+		" Pod ":       "k8s_pod",
+		"":            "k8s_workload",
+		"weird kind":  "k8s_workload",
+	} {
+		if got := RuntimeKind(in); got != want {
+			t.Errorf("RuntimeKind(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestInventoryScopeKeys(t *testing.T) {
+	snap := snapshot(
+		[]models.K8sRole{{Kind: models.K8sKindClusterRole, Name: "view",
+			Rules: []models.K8sPolicyRule{{Verbs: []string{"get"}, Resources: []string{"pods"}}}}},
+		[]models.K8sBinding{{Kind: models.K8sKindClusterRoleBinding, Name: "b",
+			RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+			Subjects: []models.K8sSubject{{Kind: models.K8sSubjectUser, Name: "alice"}}}},
+		[]models.K8sServiceAccount{sa("prod", "agent")},
+	)
+	res := Project(snap)
+	byKey := map[string]Node{}
+	for _, n := range res.Identities {
+		byKey[n.SourceKey] = n
+	}
+	check := func(what string, attrs map[string]any, sub any) {
+		t.Helper()
+		if attrs["scope_kind"] != ScopeKindCluster || attrs["scope_id"] != cluster ||
+			attrs["scope_label"] != cluster {
+			t.Errorf("%s scope keys wrong: %v", what, attrs)
+		}
+		if v, ok := attrs["sub_scope"]; !ok || v != sub {
+			t.Errorf("%s sub_scope = %v (present %v), want %v", what, v, ok, sub)
+		}
+	}
+	saNode := byKey[ServiceAccountKey(cluster, "prod", "agent")]
+	check("service account", saNode.Attrs, "prod")
+	if saNode.Attrs["name"] != "agent" || saNode.Attrs["cluster"] != cluster {
+		t.Errorf("existing service account attrs lost: %v", saNode.Attrs)
+	}
+	check("user", byKey[Key(cluster, "user", "alice")].Attrs, nil)
+
+	w := ProjectWorkloads(cluster, []WorkloadSighting{{Fingerprint: "fp", Namespace: "prod"}})
+	check("workload", w.Workloads[0].Attrs, "prod")
+	if w.Workloads[0].Attrs["fingerprint"] != "fp" {
+		t.Errorf("existing workload attrs lost: %v", w.Workloads[0].Attrs)
+	}
+}
+
+// Every namespace a sweep covers owns a workload partition and an executes_as
+// partition. Without them the reconciler never looks at either.
+func TestPartitionsIncludeWorkloadsAndExecutesAs(t *testing.T) {
+	sc := Scope{Cluster: cluster, Complete: true, ClusterScoped: true, Namespaces: []string{"a", "b"}}
+	var classes, targets int
+	for _, p := range Partitions(sc) {
+		if p.Class == ClassWorkload {
+			classes++
+		}
+		if p.Target == TargetExecutesAs {
+			targets++
+		}
+	}
+	// cluster + a + b
+	if classes != 3 || targets != 3 {
+		t.Errorf("workload partitions = %d, executes_as partitions = %d, want 3 and 3", classes, targets)
+	}
+	if !sc.CanEnd(PartitionForWorkload(sc, "a")) {
+		t.Error("a complete sweep covering namespace a cannot end its workloads")
+	}
+}

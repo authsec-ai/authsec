@@ -147,6 +147,10 @@ func (rc *Reconciler) reconcileSupport(tx *gorm.DB, in ReconcileInput, part Part
 // Edges are NOT support-backed: a binding is one cluster's fact, so absence
 // from the partition that owns it is conclusive on its own.
 func (rc *Reconciler) reconcileEdges(tx *gorm.DB, in ReconcileInput, part Partition, closing bool, at time.Time) (int, error) {
+	if part.Target == TargetExecutesAs {
+		return rc.reconcileExecutesAs(tx, in, part, closing, at)
+	}
+
 	var model any
 	switch part.Target {
 	case TargetAssignment:
@@ -175,6 +179,34 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, in ReconcileInput, part Partit
 	return int(r.RowsAffected), r.Error
 }
 
+// reconcileExecutesAs closes workload -> identity edges the sweep did not
+// reconfirm.
+//
+// iga_relationship has no discovery_source_id or last_confirmed_sweep_id (its
+// provenance columns are AWS's connector_id and last_confirmed_by), so "this
+// sweep confirmed it" is read from last_confirmed_at, which the writer stamps
+// with the very instant this pass runs at. The source is still fenced: it is
+// part of the partition key. IS DISTINCT FROM rather than <, so an agent clock
+// that ran backwards cannot keep an unconfirmed edge alive.
+func (rc *Reconciler) reconcileExecutesAs(tx *gorm.DB, in ReconcileInput, part Partition, closing bool, at time.Time) (int, error) {
+	q := tx.Model(&models.IGARelationship{}).
+		Where("workspace_id = ? AND partition_key = ? AND relationship_type = ?",
+			in.WorkspaceID, part.Key(), models.RelTypeExecutesAs).
+		Where("state <> ?", models.RelEnded).
+		Where("last_confirmed_at IS DISTINCT FROM ?", at)
+
+	if !closing {
+		r := q.Where("state = ?", models.RelCurrent).Update("state", models.RelStale)
+		return int(r.RowsAffected), r.Error
+	}
+	r := q.Updates(map[string]any{
+		"state":        models.RelEnded,
+		"valid_to":     at,
+		"ended_reason": models.EndedNotSeen,
+	})
+	return int(r.RowsAffected), r.Error
+}
+
 // retireUnsupported -- STEP 2: derive each object's lifecycle from what support
 // REMAINS, then cascade what depends on it, in the same transaction.
 //
@@ -182,6 +214,7 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, in ReconcileInput, part Partit
 //	identity    its assignments and its grants    subject_retired
 //	policy      its assignments, and their grants policy_retired
 //	statement   its grants                        statement_retired
+//	workload    its executes_as edges             subject_retired
 //
 // "What remains" is the whole point: an object retires only when NO source
 // still supports it. One agent going blind marks its own support stale and
@@ -190,17 +223,32 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 	ws := in.WorkspaceID
 	total := 0
 
-	// The three node tables a Kubernetes sweep owns, with the column that
+	// The four node tables a Kubernetes sweep owns, with the column that
 	// points at them and the reason an edge carries when they go.
 	for _, t := range []struct {
 		table      string
 		supportCol string
 		endReason  string
+		// everSupported narrows retirement to rows that have had support at
+		// all. Workloads were written for releases before they carried any,
+		// so for them "no live support" can mean "never had evidence" -- a
+		// row of another cluster that its own sweep has not adopted yet --
+		// and retiring that would re-create it under a new id next sweep.
+		everSupported bool
 	}{
-		{"iga_identity_accounts", "identity_account_id", models.EndedSubjectRetired},
-		{"iga_policy", "policy_id", models.EndedPolicyRetired},
-		{"iga_entitlements", "entitlement_id", models.EndedStatementRetired},
+		{"iga_identity_accounts", "identity_account_id", models.EndedSubjectRetired, false},
+		{"iga_policy", "policy_id", models.EndedPolicyRetired, false},
+		{"iga_entitlements", "entitlement_id", models.EndedStatementRetired, false},
+		{"iga_workload", "workload_id", models.EndedSubjectRetired, true},
 	} {
+		ever := ""
+		if t.everSupported {
+			ever = `
+			   AND EXISTS (
+			         SELECT 1 FROM iga_object_support s
+			          WHERE s.workspace_id = o.workspace_id
+			            AND s.` + t.supportCol + ` = o.id)`
+		}
 		// Retire every live k8s node of this class with no surviving support.
 		// NOT EXISTS over non-ended support is the multi-source rule (§2.10B)
 		// stated once, in SQL, rather than counted in Go where a miscount
@@ -215,7 +263,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 			         SELECT 1 FROM iga_object_support s
 			          WHERE s.workspace_id = o.workspace_id
 			            AND s.`+t.supportCol+` = o.id
-			            AND s.state <> ?)`,
+			            AND s.state <> ?)`+ever,
 			models.IGALifecycleRetired, models.RetiredUnsupported,
 			ws, models.ProviderK8s, models.IGALifecycleActive, models.RelEnded)
 		if r.Error != nil {
@@ -239,6 +287,21 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, table, supportCol, reason string, at time.Time) error {
 	retired := `SELECT id FROM ` + table + `
 	             WHERE workspace_id = ? AND provider = ? AND lifecycle = ?`
+
+	// A retired workload no longer runs as anything. Its executes_as edges are
+	// the only edges hanging off it, and they live in iga_relationship.
+	if supportCol == "workload_id" {
+		if err := tx.Exec(`
+			UPDATE iga_relationship
+			   SET state = ?, valid_to = ?, ended_reason = ?
+			 WHERE workspace_id = ? AND relationship_type = ? AND state <> ?
+			   AND source_workload_id IN (`+retired+`)`,
+			models.RelEnded, at, reason, ws, models.RelTypeExecutesAs, models.RelEnded,
+			ws, models.ProviderK8s, models.IGALifecycleRetired).Error; err != nil {
+			return fmt.Errorf("cascade executes_as from %s: %w", table, err)
+		}
+		return nil
+	}
 
 	// Which edge column points at this node class.
 	var assignCol, edgeCol string
