@@ -175,21 +175,24 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		if err := m.upsertPolicies(tx, workspaceID, out.Policies, observed); err != nil {
 			return fmt.Errorf("policies: %w", err)
 		}
-		if err := m.upsertStatements(tx, workspaceID, out.Statements, observed); err != nil {
-			return fmt.Errorf("statements: %w", err)
-		}
 
 		// The nodes are in; resolve their ids so the edges can reference them.
 		// Read back rather than remember what we just wrote: an upsert that
 		// collided with an existing row returns that row's id, and assuming our
 		// generated one would attach every edge to a node that does not exist.
-		identityIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_identity_accounts")
-		if err != nil {
-			return fmt.Errorf("resolve identity ids: %w", err)
-		}
+		//
+		// Policies first: a statement names the role that declares it
+		// (policy_id), so the role's id must be known before the rule is written.
 		policyIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_policy")
 		if err != nil {
 			return fmt.Errorf("resolve policy ids: %w", err)
+		}
+		if err := m.upsertStatements(tx, workspaceID, out.Statements, policyIDs, observed); err != nil {
+			return fmt.Errorf("statements: %w", err)
+		}
+		identityIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_identity_accounts")
+		if err != nil {
+			return fmt.Errorf("resolve identity ids: %w", err)
 		}
 		statementIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_entitlements")
 		if err != nil {
@@ -214,7 +217,7 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 			return fmt.Errorf("load sightings: %w", err)
 		}
 		wres := k8sgraph.ProjectWorkloads(cluster, sight)
-		n, err := m.upsertWorkloads(tx, workspaceID, wres, identityIDs, observed, ref)
+		workloadIDs, n, err := m.upsertWorkloads(tx, workspaceID, wres, identityIDs, observed, ref)
 		if err != nil {
 			return fmt.Errorf("workloads: %w", err)
 		}
@@ -229,9 +232,12 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		// Support rows are what make a node visible to reconciliation. A node
 		// written without one is never reconciled -- it simply lives forever,
 		// which is the defect this whole path exists to close.
-		if err := m.upsertSupport(tx, workspaceID, ref, out,
-			identityIDs, policyIDs, statementIDs, observed); err != nil {
+		if err := m.upsertSupport(tx, workspaceID, ref, out, wres,
+			identityIDs, policyIDs, statementIDs, workloadIDs, observed); err != nil {
 			return fmt.Errorf("support: %w", err)
+		}
+		if err := m.adoptUnreconciled(tx, workspaceID, cluster, ref, observed); err != nil {
+			return fmt.Errorf("adopt unreconciled rows: %w", err)
 		}
 
 		rr, err := k8sgraph.NewReconciler(func() time.Time { return observed }).
@@ -348,6 +354,10 @@ func (m *k8sRBACManager) openSweep(tx *gorm.DB, workspaceID, sourceID uuid.UUID,
 // Scoped to this provider: another provider's keys cannot collide with ours
 // (every k8s key starts "k8s␟"), but reading the whole workspace would load
 // every AWS row on every Kubernetes sweep for nothing.
+//
+// LIVE means not retired. A key deleted and recreated has a retired row and a
+// live one; reading both into one map let whichever came back last win, and a
+// retired id attaches this sweep's edges and support to an object that is gone.
 func (m *k8sRBACManager) idsBySourceKey(tx *gorm.DB, workspaceID uuid.UUID,
 	table string) (map[string]uuid.UUID, error) {
 
@@ -357,7 +367,8 @@ func (m *k8sRBACManager) idsBySourceKey(tx *gorm.DB, workspaceID uuid.UUID,
 	}
 	if err := tx.Table(table).
 		Select("id, source_key").
-		Where("workspace_id = ? AND provider = ?", workspaceID, models.ProviderK8s).
+		Where("workspace_id = ? AND provider = ? AND lifecycle <> ?",
+			workspaceID, models.ProviderK8s, models.IGALifecycleRetired).
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -670,8 +681,13 @@ func (m *k8sRBACManager) upsertPolicies(tx *gorm.DB, workspaceID uuid.UUID,
 // carries — and the Kubernetes-shaped detail (apiGroups, resources,
 // resourceNames) into native_rights, so nothing is lost and nothing is
 // flattened into a vocabulary it does not fit.
+//
+// policy_id links the rule to the Role or ClusterRole that declares it, as the
+// AWS statements are linked to theirs. A rule always arrives with its role, so
+// the id resolves; were it ever missing, the column is left as it was rather
+// than written null (no CHECK requires it for provider 'k8s').
 func (m *k8sRBACManager) upsertStatements(tx *gorm.DB, workspaceID uuid.UUID,
-	sts []k8sgraph.Statement, observed time.Time) error {
+	sts []k8sgraph.Statement, policyIDs map[string]uuid.UUID, observed time.Time) error {
 
 	for i := range sts {
 		s := sts[i]
@@ -721,14 +737,19 @@ func (m *k8sRBACManager) upsertStatements(tx *gorm.DB, workspaceID uuid.UUID,
 			"created_at":    observed,
 			"updated_at":    observed,
 		}
+		update := map[string]any{
+			"native_rights":     native,
+			"normalized_rights": normalized,
+			"last_seen_at":      observed,
+			"lifecycle":         "active",
+			"updated_at":        observed,
+		}
+		if id, ok := policyIDs[s.PolicyKey]; ok {
+			row["policy_id"] = id
+			update["policy_id"] = id
+		}
 		if err := tx.Table("iga_entitlements").
-			Clauses(conflictOn(liveByLifecycle, map[string]any{
-				"native_rights":     native,
-				"normalized_rights": normalized,
-				"last_seen_at":      observed,
-				"lifecycle":         "active",
-				"updated_at":        observed,
-			})).Create(row).Error; err != nil {
+			Clauses(conflictOn(liveByLifecycle, update)).Create(row).Error; err != nil {
 			return err
 		}
 	}
@@ -745,15 +766,21 @@ func jsonAttrs(v map[string]any) ([]byte, error) {
 //
 // The agent's clock bounds what the snapshot proves, so it is preferred — but a
 // skewed or missing one must not make the row unwritable.
+//
+// Truncated to the microsecond Postgres stores. The executes_as reconciler
+// recognises "confirmed by this sweep" by last_confirmed_at EQUAL to this
+// instant. The value written and the value compared pass through the same
+// driver encoding today, so they agree anyway; truncating here makes that
+// equality hold by construction rather than by the driver's rounding.
 func parseSnapshotTime(s string) time.Time {
 	if s == "" {
-		return time.Now().UTC()
+		return time.Now().UTC().Truncate(time.Microsecond)
 	}
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
-		return time.Now().UTC()
+		return time.Now().UTC().Truncate(time.Microsecond)
 	}
-	return t.UTC()
+	return t.UTC().Truncate(time.Microsecond)
 }
 
 /* ------------------------------- support ---------------------------------- */
@@ -783,8 +810,13 @@ func partitionKeyFor(ref *sweepRef, namespace, target string) string {
 // (workspace, object, source_ref, partition) -- the partial unique indexes 041
 // rebuilt on source_ref -- so a re-delivered snapshot refreshes the row rather
 // than adding a second one.
+//
+// A workload is supported while its sighting is live in discovered_agents. A
+// gone or vanished sighting is simply not confirmed here, and the reconciler
+// ends its support exactly as it ends an identity's.
 func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *sweepRef,
-	out k8sgraph.Result, identityIDs, policyIDs, statementIDs map[string]uuid.UUID,
+	out k8sgraph.Result, wres k8sgraph.WorkloadResult,
+	identityIDs, policyIDs, statementIDs, workloadIDs map[string]uuid.UUID,
 	observed time.Time) error {
 
 	// A statement belongs to the partition of the role that declares it: a
@@ -824,6 +856,15 @@ func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *
 			SourceID: ref.Scope.SourceID, Cluster: ref.Scope.Cluster,
 			Namespace: policyNS[st.PolicyKey], Class: k8sgraph.ClassEntitlement,
 		}})
+	}
+	for _, w := range wres.Workloads {
+		if !w.Live {
+			continue
+		}
+		if id, ok := workloadIDs[w.SourceKey]; ok {
+			items = append(items, item{"workload_id", id,
+				k8sgraph.PartitionForWorkload(ref.Scope, w.Namespace)})
+		}
 	}
 
 	for _, it := range items {
@@ -871,6 +912,10 @@ func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *
 // policy selector reads them (agent_policy_service.go) -- the same two paths,
 // because two spellings of "which cluster is this in" would silently split the
 // inventory in half.
+//
+// Only the Kubernetes webhook's sightings: the fingerprint that keys a workload
+// is unique per (workspace, source), so another source's row could otherwise
+// claim the same key.
 func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
 	cluster string) ([]k8sgraph.WorkloadSighting, error) {
 
@@ -879,24 +924,34 @@ func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
 		Select(`fingerprint,
 		        display_name,
 		        COALESCE(metadata->'kubernetes'->>'namespace', '') AS namespace,
+		        COALESCE(metadata->'kubernetes'->>'workload_kind', '') AS workload_kind,
 		        COALESCE(metadata->'provisioning_hints'->>'identity_anchor', '') AS identity_anchor,
 		        observed_service_account,
 		        runtime_status,
 		        archetype`).
-		Where("workspace_id = ? AND metadata->'cluster'->>'name' = ?", workspaceID, cluster).
+		Where("workspace_id = ? AND source = ? AND metadata->'cluster'->>'name' = ?",
+			workspaceID, models.DiscoverySourceK8sWebhook, cluster).
 		Scan(&rows).Error
 	return rows, err
 }
 
-// upsertWorkloads writes the runtime objects and their execution identities.
+// upsertWorkloads writes the runtime objects and their execution identities,
+// and returns the live workloads' ids by source key.
 //
-// Lifecycle here is NOT the sweep's to decide. An RBAC sweep never lists a Pod,
-// so its silence about one is not an observation -- it is the absence of a
-// question. runtime_status, maintained by the resync manifest, is the authority,
-// and this mirrors it rather than adding a second mechanism that could disagree.
+// A gone sighting is retired here, at once: it is a positive observation by the
+// resync manifest, not an absence, so it needs no complete sweep to prove it.
+// A sighting that has VANISHED is a different fact -- an absence -- and is left
+// to the reconciler, which ends its support only on a complete sweep that
+// covered its namespace.
 func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 	res k8sgraph.WorkloadResult, identityIDs map[string]uuid.UUID,
-	observed time.Time, ref *sweepRef) (int, error) {
+	observed time.Time, ref *sweepRef) (map[string]uuid.UUID, int, error) {
+
+	// Rows written under the old name key move to the fingerprint key first,
+	// so the upserts below find them rather than inserting beside them.
+	if err := m.rekeyWorkloads(tx, workspaceID, res.Workloads, observed); err != nil {
+		return nil, 0, err
+	}
 
 	// LIVE ROWS ARE UPSERTED; DEAD ONES ARE UPDATED. Never the other way round.
 	//
@@ -922,7 +977,7 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 		w := live[i]
 		attrs, err := jsonAttrs(w.Attrs)
 		if err != nil {
-			return 0, err
+			return nil, 0, err
 		}
 		row := map[string]any{
 			"id":             uuid.New(),
@@ -942,12 +997,15 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 		}
 		if err := tx.Table("iga_workload").
 			Clauses(conflictOn(liveByLifecycle, map[string]any{
+				// The kind may arrive only on a later sighting; a row first
+				// written as k8s_workload is corrected, not left generic.
+				"runtime_kind":   w.RuntimeKind,
 				"display_name":   w.DisplayName,
 				"provider_attrs": attrs,
 				"last_seen_at":   observed,
 				"updated_at":     observed,
 			})).Create(row).Error; err != nil {
-			return 0, fmt.Errorf("workload %s: %w", w.SourceKey, err)
+			return nil, 0, fmt.Errorf("workload %s: %w", w.SourceKey, err)
 		}
 	}
 
@@ -960,13 +1018,28 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 				"retired_reason": models.EndedNotSeen,
 				"updated_at":     observed,
 			}).Error; err != nil {
-			return 0, fmt.Errorf("retire workloads: %w", err)
+			return nil, 0, fmt.Errorf("retire workloads: %w", err)
+		}
+		// Their support ends with them, from every source: "gone" is the
+		// workspace's inventory speaking, not one agent's view. Support left
+		// current on a retired row would list a dead workload as confirmed.
+		if err := tx.Exec(`
+			UPDATE iga_object_support
+			   SET state = ?, ended_reason = ?
+			 WHERE workspace_id = ? AND state <> ?
+			   AND workload_id IN (
+			         SELECT id FROM iga_workload
+			          WHERE workspace_id = ? AND provider = ?
+			            AND source_key IN ? AND lifecycle = ?)`,
+			models.RelEnded, models.EndedNotSeen, workspaceID, models.RelEnded,
+			workspaceID, models.ProviderK8s, dead, models.IGALifecycleRetired).Error; err != nil {
+			return nil, 0, fmt.Errorf("end gone workload support: %w", err)
 		}
 	}
 
 	workloadIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_workload")
 	if err != nil {
-		return 0, fmt.Errorf("resolve workload ids: %w", err)
+		return nil, 0, fmt.Errorf("resolve workload ids: %w", err)
 	}
 
 	written := 0
@@ -997,20 +1070,27 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 			"last_confirmed_at":          observed,
 			"source_key":                 e.SourceKey,
 		}
+		update := map[string]any{
+			"basis":             e.Basis,
+			"state":             models.RelCurrent,
+			"last_confirmed_at": observed,
+		}
 		if ref != nil {
-			row["partition_key"] = k8sgraph.PartitionForEdge(ref.Scope, "", "workload").Key()
+			// Owned by the WORKLOAD's namespace partition, which Partitions()
+			// emits -- so the reconciler closes an edge no sighting confirms.
+			// Updated on conflict too, so an edge written under an earlier
+			// spelling moves into a partition that is actually reconciled.
+			pk := k8sgraph.PartitionForEdge(ref.Scope, e.Namespace, k8sgraph.TargetExecutesAs).Key()
+			row["partition_key"] = pk
+			update["partition_key"] = pk
 		}
 		if err := tx.Table("iga_relationship").
 			Clauses(clause.OnConflict{
 				Columns:     []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
 				TargetWhere: clause.Where{Exprs: []clause.Expression{gorm.Expr("state <> 'ended'")}},
-				DoUpdates: clause.Assignments(map[string]any{
-					"basis":             e.Basis,
-					"state":             models.RelCurrent,
-					"last_confirmed_at": observed,
-				}),
+				DoUpdates:   clause.Assignments(update),
 			}).Create(row).Error; err != nil {
-			return written, fmt.Errorf("executes_as %s: %w", e.SourceKey, err)
+			return nil, written, fmt.Errorf("executes_as %s: %w", e.SourceKey, err)
 		}
 		written++
 	}
@@ -1027,8 +1107,163 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 				"valid_to":     observed,
 				"ended_reason": models.EndedNotSeen,
 			}).Error; err != nil {
-			return written, fmt.Errorf("end executes_as: %w", err)
+			return nil, written, fmt.Errorf("end executes_as: %w", err)
 		}
 	}
-	return written, nil
+	return workloadIDs, written, nil
+}
+
+// rekeyWorkloads moves rows written under the name key to the fingerprint key,
+// IN PLACE.
+//
+// Same row, same id: classifications, lifecycle events and every other
+// reference to the workload survive. Inserting a fresh row instead would orphan
+// all of them and leave the old row live under a key nothing writes any more.
+//
+// A row is moved only when its recorded fingerprint is this sighting's. Two
+// workloads that shared a name were merged into ONE old row, carrying whichever
+// fingerprint wrote last; that sighting reclaims the row and the other gets a
+// row of its own. Moving on the name alone would hand the first sighting to
+// arrive the other workload's history.
+func (m *k8sRBACManager) rekeyWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
+	ws []k8sgraph.Workload, observed time.Time) error {
+
+	for _, w := range ws {
+		if w.LegacyKey == "" || w.LegacyKey == w.SourceKey {
+			continue
+		}
+		var moved []struct{ ID uuid.UUID }
+		if err := tx.Raw(`
+			UPDATE iga_workload o
+			   SET source_key = ?, updated_at = ?
+			 WHERE o.workspace_id = ? AND o.provider = ?
+			   AND o.source_key = ? AND o.lifecycle <> ?
+			   AND o.provider_attrs->>'fingerprint' = ?
+			   AND NOT EXISTS (
+			         SELECT 1 FROM iga_workload n
+			          WHERE n.workspace_id = o.workspace_id
+			            AND n.source_key = ? AND n.lifecycle <> ?)
+			RETURNING o.id`,
+			w.SourceKey, observed, workspaceID, models.ProviderK8s,
+			w.LegacyKey, models.IGALifecycleRetired, w.Fingerprint,
+			w.SourceKey, models.IGALifecycleRetired).Scan(&moved).Error; err != nil {
+			return fmt.Errorf("re-key workload %s: %w", w.SourceKey, err)
+		}
+
+		// Its execution edges follow it: their keys embed the workload's, and
+		// an edge left under the old key would never be re-confirmed while a
+		// duplicate was written beside it.
+		oldPrefix, newPrefix := k8sgraph.RelKeyPrefix(w.LegacyKey), k8sgraph.RelKeyPrefix(w.SourceKey)
+		for _, mv := range moved {
+			var rels []struct {
+				ID        uuid.UUID
+				SourceKey string
+			}
+			if err := tx.Table("iga_relationship").Select("id, source_key").
+				Where("workspace_id = ? AND source_workload_id = ? AND relationship_type = ? AND state <> ?",
+					workspaceID, mv.ID, models.RelTypeExecutesAs, models.RelEnded).
+				Scan(&rels).Error; err != nil {
+				return fmt.Errorf("re-key executes_as of %s: %w", w.SourceKey, err)
+			}
+			for _, r := range rels {
+				if !strings.HasPrefix(r.SourceKey, oldPrefix) {
+					continue
+				}
+				if err := tx.Table("iga_relationship").Where("id = ?", r.ID).
+					Updates(map[string]any{
+						"source_key": newPrefix + strings.TrimPrefix(r.SourceKey, oldPrefix),
+						"updated_at": observed,
+					}).Error; err != nil {
+					return fmt.Errorf("re-key executes_as %s: %w", r.SourceKey, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// legacyExecutesAsTarget is the partition target executes_as edges were once
+// written under. Partitions() never emitted it, so no sweep reconciled them.
+const legacyExecutesAsTarget = "workload"
+
+// adoptUnreconciled brings this cluster's rows that no sweep could reconcile
+// into this sweep's partitions.
+//
+// Two kinds, both written before workloads were reconciled at all:
+//
+//   - an active workload with no support from this source. Given support that
+//     NO sweep has confirmed (last_confirmed_sweep_id NULL), it is exactly as
+//     reconcilable as everything else: a complete sweep covering its namespace
+//     ends it, anything less marks it stale. A workload whose sighting is live
+//     was confirmed above and is never adopted.
+//   - an executes_as edge in the legacy partition, or in none (written by an
+//     unattributed snapshot). Moved to its workload's namespace partition and
+//     left otherwise untouched; the reconciler then decides it like any other.
+//
+// Scoped to this cluster by provider_attrs.cluster, so one cluster's sweep
+// never claims another cluster's rows.
+func (m *k8sRBACManager) adoptUnreconciled(tx *gorm.DB, workspaceID uuid.UUID,
+	cluster string, ref *sweepRef, observed time.Time) error {
+
+	var wls []struct {
+		ID        uuid.UUID
+		Namespace string
+	}
+	if err := tx.Raw(`
+		SELECT w.id, COALESCE(w.provider_attrs->>'namespace', '') AS namespace
+		  FROM iga_workload w
+		 WHERE w.workspace_id = ? AND w.provider = ? AND w.lifecycle = ?
+		   AND w.provider_attrs->>'cluster' = ?
+		   AND NOT EXISTS (
+		         SELECT 1 FROM iga_object_support s
+		          WHERE s.workspace_id = w.workspace_id
+		            AND s.workload_id = w.id
+		            AND s.discovery_source_id = ?)`,
+		workspaceID, models.ProviderK8s, models.IGALifecycleActive, cluster, ref.SourceID).
+		Scan(&wls).Error; err != nil {
+		return fmt.Errorf("find unsupported workloads: %w", err)
+	}
+	for _, w := range wls {
+		if err := tx.Table("iga_object_support").
+			Clauses(clause.OnConflict{DoNothing: true}).
+			Create(map[string]any{
+				"id":                  uuid.New(),
+				"workspace_id":        workspaceID,
+				"workload_id":         w.ID,
+				"discovery_source_id": ref.SourceID,
+				"partition_key":       k8sgraph.PartitionForWorkload(ref.Scope, w.Namespace).Key(),
+				"state":               models.RelCurrent,
+				"first_seen_at":       observed,
+			}).Error; err != nil {
+			return fmt.Errorf("adopt workload %s: %w", w.ID, err)
+		}
+	}
+
+	legacy := k8sgraph.Partition{SourceID: ref.SourceID, Cluster: cluster,
+		Target: legacyExecutesAsTarget}.Key()
+	var rels []struct {
+		ID        uuid.UUID
+		Namespace string
+	}
+	if err := tx.Raw(`
+		SELECT r.id, COALESCE(w.provider_attrs->>'namespace', '') AS namespace
+		  FROM iga_relationship r
+		  JOIN iga_workload w
+		    ON w.workspace_id = r.workspace_id AND w.id = r.source_workload_id
+		 WHERE r.workspace_id = ? AND r.relationship_type = ? AND r.state <> ?
+		   AND r.partition_key IN ('', ?)
+		   AND w.provider = ? AND w.provider_attrs->>'cluster' = ?`,
+		workspaceID, models.RelTypeExecutesAs, models.RelEnded, legacy,
+		models.ProviderK8s, cluster).Scan(&rels).Error; err != nil {
+		return fmt.Errorf("find unpartitioned executes_as: %w", err)
+	}
+	for _, r := range rels {
+		if err := tx.Table("iga_relationship").Where("id = ?", r.ID).
+			Update("partition_key",
+				k8sgraph.PartitionForEdge(ref.Scope, r.Namespace, k8sgraph.TargetExecutesAs).Key()).
+			Error; err != nil {
+			return fmt.Errorf("adopt executes_as %s: %w", r.ID, err)
+		}
+	}
+	return nil
 }

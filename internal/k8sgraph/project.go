@@ -226,9 +226,12 @@ func Project(snap models.K8sRBACSnapshot) Result {
 			return
 		}
 		seenIdentity[key] = true
+		// Every identity carries the unified-inventory scope: the cluster, and
+		// its namespace -- null for a User or Group, which Kubernetes does not
+		// scope.
 		res.Identities = append(res.Identities, Node{
 			SourceKey: key, Kind: kind, DisplayName: display,
-			Namespace: namespace, Attrs: attrs,
+			Namespace: namespace, Attrs: WithScope(attrs, cluster, namespace),
 		})
 	}
 

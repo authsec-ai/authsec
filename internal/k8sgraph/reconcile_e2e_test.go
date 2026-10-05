@@ -293,3 +293,188 @@ func TestASecondSourceKeepsTheObjectAlive(t *testing.T) {
 		t.Errorf("identity lifecycle = %q, want active: a second source still supports it", got)
 	}
 }
+
+/* -------------------------------- workloads ------------------------------- */
+
+// seedWorkload adds one workload in iga-demo running as the fixture's
+// ServiceAccount: the workload, its support row confirmed by sweepID, and its
+// executes_as edge confirmed at confirmedAt -- all under the partitions the
+// reconciler spells for them.
+func (f *fixture) seedWorkload(t *testing.T, sweepID uuid.UUID, confirmedAt time.Time) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	sc := f.scope(1, true, true, "iga-demo")
+	wl, rel := uuid.New(), uuid.New()
+	if err := f.db.Exec(`INSERT INTO iga_workload (id,workspace_id,provider,runtime_kind,display_name,
+	        lifecycle,source_key,continuity,provider_attrs)
+	      VALUES (?,?,'k8s','k8s_deployment','research-agent','active',?,'recognition_only',
+	              '{"cluster":"k3s","namespace":"iga-demo"}')`,
+		wl, f.ws, k8sgraph.WorkloadKey(f.cluster, "fp-"+wl.String()[:8])).Error; err != nil {
+		t.Fatalf("seed workload: %v", err)
+	}
+	if err := f.db.Exec(`INSERT INTO iga_object_support (workspace_id,workload_id,discovery_source_id,
+	        partition_key,state,last_confirmed_sweep_id,last_confirmed_at)
+	      VALUES (?,?,?,?,'current',?,now())`,
+		f.ws, wl, f.source, k8sgraph.PartitionForWorkload(sc, "iga-demo").Key(), sweepID).Error; err != nil {
+		t.Fatalf("seed workload support: %v", err)
+	}
+	if err := f.db.Exec(`INSERT INTO iga_relationship (id,workspace_id,relationship_type,source_workload_id,
+	        target_identity_account_id,basis,state,valid_from,last_confirmed_at,source_key,partition_key)
+	      VALUES (?,?,'executes_as',?,?,'observed','current',?,?,?,?)`,
+		rel, f.ws, wl, f.identity, confirmedAt, confirmedAt, "k8s|rel|"+rel.String(),
+		k8sgraph.PartitionForEdge(sc, "iga-demo", k8sgraph.TargetExecutesAs).Key()).Error; err != nil {
+		t.Fatalf("seed executes_as: %v", err)
+	}
+	return wl, rel
+}
+
+func (f *fixture) sweep(t *testing.T, gen int64, complete, clusterScoped bool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if err := f.db.Exec(`INSERT INTO iga_k8s_sweep (id,workspace_id,discovery_source_id,cluster,
+	    generation,complete,cluster_scoped,namespaces,sweep_started_at,observed_at)
+	    VALUES (?,?,?,?,?,?,?,'{iga-demo}',now(),now())`,
+		id, f.ws, f.source, f.cluster, gen, complete, clusterScoped).Error; err != nil {
+		t.Fatalf("sweep %d: %v", gen, err)
+	}
+	return id
+}
+
+func (f *fixture) lifecycle(t *testing.T, table string, id uuid.UUID) string {
+	t.Helper()
+	var s string
+	if err := f.db.Raw(`SELECT lifecycle FROM `+table+` WHERE id = ?`, id).Scan(&s).Error; err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+	return s
+}
+
+// A workload no sighting confirmed is retired by a complete sweep exactly as
+// an identity is: its support ends, it retires, and the edge it ran under goes
+// with it -- by cascade, so the edge here is one this sweep DID confirm, and
+// only its workload's retirement can end it.
+func TestCompleteSweepRetiresAnUnconfirmedWorkload(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	wl, rel := f.seedWorkload(t, first, at)
+
+	second := f.sweep(t, 2, true, true)
+	res, err := k8sgraph.NewReconciler(func() time.Time { return at }).Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, true, true, "iga-demo")})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.supportState(t, "workload_id", wl); got != "ended" {
+		t.Errorf("workload support = %q, want ended: a complete sweep did not confirm it", got)
+	}
+	if got := f.lifecycle(t, "iga_workload", wl); got != "retired" {
+		t.Errorf("workload lifecycle = %q, want retired: its only support ended", got)
+	}
+	if got := f.state(t, "iga_relationship", "id", rel); got != "ended" {
+		t.Errorf("executes_as state = %q, want ended: its workload is gone", got)
+	}
+	var reason string
+	if err := f.db.Raw(`SELECT ended_reason FROM iga_relationship WHERE id = ?`, rel).
+		Scan(&reason).Error; err != nil {
+		t.Fatalf("read reason: %v", err)
+	}
+	if reason != "subject_retired" {
+		t.Errorf("executes_as ended_reason = %q, want subject_retired", reason)
+	}
+	if res.ObjectsRetired == 0 || res.SupportEnded == 0 {
+		t.Errorf("retirement not counted: %+v", res)
+	}
+}
+
+// A complete sweep ends an executes_as edge it did not reconfirm, through the
+// workload's namespace partition, even while the workload itself stays.
+func TestCompleteSweepEndsAnUnconfirmedExecutesAs(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	second := f.sweep(t, 2, true, true)
+	// The workload is confirmed by this sweep; its edge is an hour old.
+	wl, rel := f.seedWorkload(t, second, time.Now().Add(-time.Hour))
+
+	res, err := k8sgraph.NewReconciler(nil).Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, true, true, "iga-demo")})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.state(t, "iga_relationship", "id", rel); got != "ended" {
+		t.Errorf("executes_as state = %q, want ended: no sighting reconfirmed it", got)
+	}
+	if got := f.lifecycle(t, "iga_workload", wl); got != "active" {
+		t.Errorf("workload lifecycle = %q, want active: this sweep confirmed it", got)
+	}
+	if res.EdgesEnded == 0 {
+		t.Errorf("no edge counted as ended: %+v", res)
+	}
+}
+
+// An incomplete sweep only marks the workload's support and edge stale.
+func TestIncompleteSweepOnlyStalesAWorkload(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	wl, rel := f.seedWorkload(t, first, time.Now().Add(-time.Hour))
+
+	second := f.sweep(t, 2, false, true)
+	if _, err := k8sgraph.NewReconciler(nil).Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, false, true, "iga-demo")}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.supportState(t, "workload_id", wl); got != "stale" {
+		t.Errorf("workload support = %q, want stale after an incomplete sweep", got)
+	}
+	if got := f.lifecycle(t, "iga_workload", wl); got != "active" {
+		t.Errorf("workload lifecycle = %q, want active after an incomplete sweep", got)
+	}
+	if got := f.state(t, "iga_relationship", "id", rel); got != "stale" {
+		t.Errorf("executes_as state = %q, want stale after an incomplete sweep", got)
+	}
+}
+
+// An edge confirmed at the sweep's own instant was seen by this sweep, and a
+// complete sweep must leave it current. iga_relationship has no sweep id, so
+// this is the whole of what "confirmed" means for it.
+func TestExecutesAsConfirmedByThisSweepSurvives(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	at := time.Now().UTC().Truncate(time.Microsecond)
+
+	second := f.sweep(t, 2, true, true)
+	wl, rel := f.seedWorkload(t, second, at)
+	if _, err := k8sgraph.NewReconciler(func() time.Time { return at }).Reconcile(f.db,
+		k8sgraph.ReconcileInput{WorkspaceID: f.ws, SweepID: second,
+			Scope: f.scope(2, true, true, "iga-demo")}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.state(t, "iga_relationship", "id", rel); got != "current" {
+		t.Errorf("executes_as state = %q, want current: this sweep confirmed it", got)
+	}
+	if got := f.lifecycle(t, "iga_workload", wl); got != "active" {
+		t.Errorf("workload lifecycle = %q, want active: this sweep confirmed it", got)
+	}
+}
+
+// A workload that has never had support -- written before workloads carried
+// any, or by another cluster's projection not yet adopted -- is not evidence
+// of anything, and no sweep may retire it for lacking support it never had.
+func TestNeverSupportedWorkloadIsNotRetired(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	wl := uuid.New()
+	if err := f.db.Exec(`INSERT INTO iga_workload (id,workspace_id,provider,runtime_kind,display_name,
+	        lifecycle,source_key,continuity,provider_attrs)
+	      VALUES (?,?,'k8s','k8s_workload','other-cluster-agent','active',?,'recognition_only','{}')`,
+		wl, f.ws, k8sgraph.WorkloadKey("other", "fp-x")).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	second := f.sweep(t, 2, true, true)
+	if _, err := k8sgraph.NewReconciler(nil).Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, true, true, "iga-demo")}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.lifecycle(t, "iga_workload", wl); got != "active" {
+		t.Errorf("never-supported workload lifecycle = %q, want active", got)
+	}
+}
