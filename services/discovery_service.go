@@ -453,7 +453,32 @@ func (m *discoveryManager) RecordLifecycleEvent(workspaceID uuid.UUID, in Lifecy
 	if err != nil {
 		return nil, nil, err
 	}
+	// A deleted or absent agent leaves the shared graph now, not at the next
+	// RBAC snapshot. Resync absences arrive here too (ReconcileManifest).
+	m.projectK8sSighting(workspaceID, in.Source, in.Fingerprint)
 	return agent, event, nil
+}
+
+// projectK8sSighting copies a Kubernetes sighting into the shared graph at
+// once (K8sRBACManager.ProjectSighting) rather than waiting for the cluster's
+// next RBAC snapshot. A no-op for other sources and while IGA_GRAPH_PROJECTION
+// is off.
+//
+// Best-effort for the same reason as the correlation proposal: the graph is
+// laid over the inventory, and losing a sighting to protect it would invert
+// the priority. The next snapshot projects it anyway.
+func (m *discoveryManager) projectK8sSighting(workspaceID uuid.UUID, source, fingerprint string) {
+	if source != models.DiscoverySourceK8sWebhook {
+		return
+	}
+	db := m.repo.DB()
+	if db == nil {
+		return
+	}
+	if err := NewK8sRBACManager(db, GraphProjectionGateFromEnv()).
+		ProjectSighting(workspaceID, fingerprint); err != nil {
+		log.Printf("[discovery] could not project sighting %s into the graph: %v", fingerprint, err)
+	}
 }
 
 // runtimeStatusFor maps an event to the runtime state it asserts.
@@ -750,6 +775,7 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 			}
 		}
 	}
+	m.projectK8sSighting(workspaceID, stored.Source, stored.Fingerprint)
 	return stored, created, nil
 }
 
