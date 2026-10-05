@@ -450,4 +450,62 @@ var bfkCases = []bfkCase{
 	{fk: "iga_le_policy_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
 		return w.A.lifecycleEvent("identity_account_id", nil, "policy_id", p.id("pol"))
 	}},
+
+	// ---------------- 041: Kubernetes provenance -----------------------------
+	// The source is a discovery_sources row, the reading an iga_k8s_sweep.
+	bfkAnchorCase("iga_k8s_sweep_workspace_fkey", (*bfkSide).k8sSweep),
+	{fk: "iga_k8s_sweep_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.k8sSweep("discovery_source_id", p.id("dsrc"))
+	}},
+	// iga_object_support_source_chk: exactly one source, so the connector goes;
+	// iga_object_support_confirm_chk: a sweep only with its own source.
+	{fk: "iga_os_discovery_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "discovery_source_id", p.id("dsrc"))
+	}},
+	{fk: "iga_os_sweep_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "discovery_source_id", w.A.id("dsrc"),
+			"last_confirmed_sweep_id", p.id("sweep"))
+	}},
+	// A binding assignment: iga_pa_confirm_provider_chk keeps last_confirmed_by
+	// NULL on it, as the builder leaves it.
+	{fk: "iga_pa_discovery_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.assignment("assignment_kind", "k8s_role_binding", "discovery_source_id", p.id("dsrc"))
+	}},
+	{fk: "iga_pa_sweep_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.assignment("assignment_kind", "k8s_role_binding", "discovery_source_id", w.A.id("dsrc"),
+			"last_confirmed_sweep_id", p.id("sweep"))
+	}},
+	// A Kubernetes grant: iga_access_edges_k8s_grant_chk demands the typed
+	// subject and no resource, iga_access_edges_confirm_provider_chk no AWS run.
+	{fk: "iga_access_edges_discovery_source_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("provider", "k8s", "discovery_source_id", p.id("dsrc"))
+	}},
+	{fk: "iga_access_edges_sweep_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("provider", "k8s", "discovery_source_id", w.A.id("dsrc"),
+			"last_confirmed_sweep_id", p.id("sweep"))
+	}},
+
+	// ---------------- 042: GitHub provenance ---------------------------------
+	// The source is an iga_integrations row, the reading an iga_scan_runs row.
+	{fk: "iga_os_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "integration_id", p.id("integ"))
+	}},
+	{fk: "iga_os_scan_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.support("connector_id", nil, "integration_id", w.A.id("integ"),
+			"last_confirmed_scan_run_id", p.id("iscan"))
+	}},
+	// The GitHub grant shape (as iga_access_edges_resource_fkey's), with no AWS
+	// run (iga_access_edges_github_confirm_chk); a scan run only with its
+	// integration (iga_access_edges_scan_run_source_chk).
+	{fk: "iga_access_edges_integration_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("provider", "github", "subject_kind", "agent", "subject_id", w.A.id("agent"),
+			"subject_identity_account_id", nil, "entitlement_id", nil, "assignment_id", nil,
+			"resource_id", w.A.id("res"), "integration_id", p.id("integ"))
+	}},
+	{fk: "iga_access_edges_scan_run_fkey", build: func(w *bfkWorld, p *bfkSide) bfkRow {
+		return w.A.grant("provider", "github", "subject_kind", "agent", "subject_id", w.A.id("agent"),
+			"subject_identity_account_id", nil, "entitlement_id", nil, "assignment_id", nil,
+			"resource_id", w.A.id("res"), "integration_id", w.A.id("integ"),
+			"last_confirmed_scan_run_id", p.id("iscan"))
+	}},
 }

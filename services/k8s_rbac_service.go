@@ -36,6 +36,10 @@ that never happened.
 type K8sRBACManager interface {
 	// Ingest projects one snapshot. Returns what it wrote.
 	Ingest(workspaceID uuid.UUID, snap models.K8sRBACSnapshot) (*K8sRBACResult, error)
+	// ProjectSighting copies one Kubernetes sighting into the shared graph as
+	// soon as it is reported or changes state, instead of waiting for the
+	// cluster's next RBAC snapshot.
+	ProjectSighting(workspaceID uuid.UUID, fingerprint string) error
 }
 
 // K8sRBACResult reports one ingest.
@@ -918,9 +922,16 @@ func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *
 // claim the same key.
 func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
 	cluster string) ([]k8sgraph.WorkloadSighting, error) {
+	return m.loadSightingsWhere(tx, workspaceID, cluster, "")
+}
+
+// loadSightingsWhere is loadSightings, narrowed to one fingerprint when
+// fingerprint is not empty.
+func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
+	cluster, fingerprint string) ([]k8sgraph.WorkloadSighting, error) {
 
 	var rows []k8sgraph.WorkloadSighting
-	err := tx.Table("discovered_agents").
+	q := tx.Table("discovered_agents").
 		Select(`fingerprint,
 		        display_name,
 		        COALESCE(metadata->'kubernetes'->>'namespace', '') AS namespace,
@@ -930,9 +941,121 @@ func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
 		        runtime_status,
 		        archetype`).
 		Where("workspace_id = ? AND source = ? AND metadata->'cluster'->>'name' = ?",
-			workspaceID, models.DiscoverySourceK8sWebhook, cluster).
-		Scan(&rows).Error
+			workspaceID, models.DiscoverySourceK8sWebhook, cluster)
+	if fingerprint != "" {
+		q = q.Where("fingerprint = ?", fingerprint)
+	}
+	err := q.Scan(&rows).Error
 	return rows, err
+}
+
+// ProjectSighting copies one sighting into the shared graph at once.
+//
+// Before this, a workload reached iga_workload only when the cluster's next
+// RBAC snapshot arrived, so a newly sighted agent was missing from the
+// inventory -- and a deleted one still listed -- until then. It reuses the
+// snapshot path's projection and upserts, so the row is exactly what the next
+// sweep would write: same fingerprint key, kind, scope and execution identity.
+//
+// It confirms; it never closes. No sweep stands behind a single sighting, so
+// the support row it writes carries no sweep id: the next complete sweep
+// either confirms it or ends it like any unconfirmed support (§2.7). A sighting
+// that is GONE is retired here, as the snapshot path does, because that is a
+// positive observation rather than an absence.
+//
+// A sighting that names no cluster cannot be attributed and is left alone.
+func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint string) error {
+	if m.gate == nil || !m.gate.Enabled() || strings.TrimSpace(fingerprint) == "" {
+		return nil
+	}
+
+	var meta struct {
+		Cluster  string
+		SourceID *uuid.UUID
+	}
+	err := m.db.Table("discovered_agents").
+		Select(`COALESCE(metadata->'cluster'->>'name', '') AS cluster,
+		        discovery_source_id AS source_id`).
+		Where("workspace_id = ? AND source = ? AND fingerprint = ?",
+			workspaceID, models.DiscoverySourceK8sWebhook, fingerprint).
+		Take(&meta).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load sighting: %w", err)
+	}
+	cluster := strings.TrimSpace(meta.Cluster)
+	if cluster == "" {
+		return nil
+	}
+
+	// The same evidence stream the cluster's sweeps resolve to, so the support
+	// row written here is the one the next sweep confirms, not a second one.
+	probe := models.K8sRBACSnapshot{}
+	if meta.SourceID != nil {
+		probe.DiscoverySourceID = meta.SourceID.String()
+	}
+	sourceID := m.resolveSource(workspaceID, probe, cluster)
+	observed := time.Now().UTC().Truncate(time.Microsecond)
+
+	return m.db.Transaction(func(tx *gorm.DB) error {
+		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, fingerprint)
+		if err != nil {
+			return fmt.Errorf("load sighting: %w", err)
+		}
+		wres := k8sgraph.ProjectWorkloads(cluster, sight)
+		identityIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_identity_accounts")
+		if err != nil {
+			return fmt.Errorf("resolve identity ids: %w", err)
+		}
+		// No sweep: executes_as keeps the partition a sweep last gave it, and
+		// nothing is reconciled here.
+		workloadIDs, _, err := m.upsertWorkloads(tx, workspaceID, wres, identityIDs, observed, nil)
+		if err != nil {
+			return fmt.Errorf("workload: %w", err)
+		}
+		if sourceID == uuid.Nil {
+			return nil
+		}
+		scope := k8sgraph.Scope{SourceID: sourceID, Cluster: cluster}
+		for _, w := range wres.Workloads {
+			id, ok := workloadIDs[w.SourceKey]
+			if !w.Live || !ok {
+				continue
+			}
+			row := map[string]any{
+				"id":                  uuid.New(),
+				"workspace_id":        workspaceID,
+				"workload_id":         id,
+				"discovery_source_id": sourceID,
+				"partition_key":       k8sgraph.PartitionForWorkload(scope, w.Namespace).Key(),
+				"state":               models.RelCurrent,
+				"first_seen_at":       observed,
+				"last_confirmed_at":   observed,
+			}
+			if err := tx.Table("iga_object_support").
+				Clauses(clause.OnConflict{
+					Columns: []clause.Column{
+						{Name: "workspace_id"}, {Name: "workload_id"},
+						{Name: "source_ref"}, {Name: "partition_key"},
+					},
+					TargetWhere: clause.Where{Exprs: []clause.Expression{
+						gorm.Expr("workload_id IS NOT NULL"),
+					}},
+					// A sighting revives the row but leaves last_confirmed_sweep_id
+					// alone: only a sweep may claim to have confirmed it.
+					DoUpdates: clause.Assignments(map[string]any{
+						"state":             models.RelCurrent,
+						"ended_reason":      "",
+						"last_confirmed_at": observed,
+					}),
+				}).Create(row).Error; err != nil {
+				return fmt.Errorf("workload support: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // upsertWorkloads writes the runtime objects and their execution identities,

@@ -105,8 +105,12 @@ type ProviderContext struct {
 
 // ProviderScope is one enumerable container: an organization or a repository.
 type ProviderScope struct {
-	Kind          string // "organization" | "repository"
-	NativeID      string // immutable provider id — the recognition key input
+	Kind     string // "organization" | "repository"
+	NativeID string // immutable provider id — the recognition key input
+	// NodeID is GitHub's global node id when the listing returned one. Usually
+	// equal to NativeID; kept separately because NativeID falls back to the
+	// numeric id, and a reader shown "node_id" must get a node id or nothing.
+	NodeID        string
 	DisplayName   string // owner/name — a LOCATOR, never identity
 	DefaultBranch string
 	// Archived reports the provider's own read-only flag. It qualifies a
