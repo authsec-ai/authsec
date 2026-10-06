@@ -594,7 +594,7 @@ func TestIGAWebhookIngress(t *testing.T) {
 	integ := verifiedIntegration(t, mgr, ws, "inst-hook")
 
 	secret := "test-webhook-secret"
-	body := []byte(`{"action":"created"}`)
+	body := []byte(`{"action":"created","installation":{"id":"inst-hook"}}`)
 	sign := func(b []byte) string {
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write(b)
@@ -622,14 +622,39 @@ func TestIGAWebhookIngress(t *testing.T) {
 	t.Log("PASS: invalid signature rejected without touching the queue")
 
 	// 2. A valid signature for an UNKNOWN installation is a binding failure.
+	unknownBody := []byte(`{"action":"created","installation":{"id":"inst-does-not-exist"}}`)
 	unknown := base
 	unknown.DeliveryID = "d-unknown"
-	unknown.InstallationID = "inst-does-not-exist"
-	unknown.Signature = sign(body)
+	unknown.InstallationID = ""
+	unknown.Body = unknownBody
+	unknown.Signature = sign(unknownBody)
 	if _, err := mgr.AcceptWebhook(unknown); !errors.Is(err, repositories.ErrIGABindingFailed) {
 		t.Fatalf("expected binding failure, got %v", err)
 	}
 	t.Log("PASS: payload installation id alone does not authorize")
+
+	// 2b. AS-072: the installation comes from the signed body. A signed
+	//     delivery for another installation, replayed with this
+	//     installation's id in the unsigned header, is refused; so is a
+	//     signed body that names no installation.
+	replay := unknown
+	replay.DeliveryID = "d-replay"
+	replay.InstallationID = "inst-hook"
+	if _, err := mgr.AcceptWebhook(replay); !errors.Is(err, repositories.ErrIGABindingFailed) {
+		t.Fatalf("header/body installation mismatch: expected binding failure, got %v", err)
+	}
+	bare := []byte(`{"action":"created"}`)
+	noInst := base
+	noInst.DeliveryID = "d-noinst"
+	noInst.Body = bare
+	noInst.Signature = sign(bare)
+	if _, err := mgr.AcceptWebhook(noInst); !errors.Is(err, repositories.ErrIGABindingFailed) {
+		t.Fatalf("installation only in the header: expected binding failure, got %v", err)
+	}
+	if n := countRows(db, `SELECT count(*) FROM iga_durable_jobs WHERE workspace_id = ?`, ws); n != 0 {
+		t.Fatalf("unbound deliveries enqueued %d jobs", n)
+	}
+	t.Log("PASS: the unsigned installation header never selects the binding")
 
 	// 3. A valid, bound delivery is accepted and enqueues exactly one job.
 	good := base
