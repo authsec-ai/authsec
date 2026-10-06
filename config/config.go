@@ -433,6 +433,13 @@ func LoadConfig() *Config {
 		OIDCStateHMACKey:              oidcStateHMACKey,
 	}
 
+	// XAA issuance flags mint NativeSealer tokens; without the sealer those
+	// tokens are inactive at introspection and their keys are not on JWKS
+	// (AS-067). Refuse to start rather than issue unusable tokens.
+	if err := AppConfig.ValidateXAAFlags(); err != nil {
+		log.Fatalf("CRITICAL: invalid XAA feature flags: %v. Cannot start.", err)
+	}
+
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)
 	requiredSecrets := map[string]string{
 		"DB_USER":        dbUser,
@@ -451,6 +458,40 @@ func LoadConfig() *Config {
 	}
 
 	return AppConfig
+}
+
+// ValidateXAAFlags checks the dependencies between the XAA feature flags:
+// every issuance flag (XAA_M2M, XAA_REDEMPTION, XAA_CIBA, XAA_ISSUANCE)
+// mints NativeSealer tokens and so needs XAA_NATIVE_SEALER, and XAA_DPOP
+// binds redeemed tokens and so needs XAA_REDEMPTION.
+func (c *Config) ValidateXAAFlags() error {
+	if c == nil {
+		return nil
+	}
+	var missing []string
+	if !c.XAANativeSealer {
+		for _, f := range []struct {
+			name string
+			on   bool
+		}{
+			{"XAA_M2M", c.XAAm2m},
+			{"XAA_REDEMPTION", c.XAARedemption},
+			{"XAA_CIBA", c.XAACiba},
+			{"XAA_ISSUANCE", c.XAAIssuance},
+			{"XAA_DPOP", c.XAADPOP},
+		} {
+			if f.on {
+				missing = append(missing, f.name)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s require XAA_NATIVE_SEALER=true (tokens they mint would be inactive at introspection and absent from JWKS)", strings.Join(missing, ", "))
+	}
+	if c.XAADPOP && !c.XAARedemption {
+		return fmt.Errorf("XAA_DPOP requires XAA_REDEMPTION=true")
+	}
+	return nil
 }
 
 func (c *Config) OAuthBaseURL() string {
