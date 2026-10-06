@@ -13,6 +13,7 @@ package middlewares
 
 import (
 	"crypto/rsa"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/delegation"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -83,7 +86,7 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 			}
 			return pubKey, nil
-		})
+		}, jwt.WithExpirationRequired())
 		if err != nil {
 			log.Printf("[SpiffeAuth] Token verification failed: %v", err)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token verification failed"})
@@ -97,6 +100,13 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 		}
 		if !spiffeAudienceAllowed(verifiedClaims["aud"]) {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token audience mismatch"})
+			return
+		}
+		// A delegated JWT-SVID must still be its agent's active delegation
+		// token, issued for at most delegation.MaxTTL (AS-069). Fails closed.
+		if err := delegation.Verify(c.Request.Context(), spiffeDelegationDB(), verifiedClaims, token); err != nil {
+			log.Printf("[SpiffeAuth] Delegated token refused: %v", err)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token has been revoked or is no longer valid"})
 			return
 		}
 
@@ -119,6 +129,13 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func spiffeDelegationDB() *sql.DB {
+	if db := config.GetDatabase(); db != nil {
+		return db.DB
+	}
+	return nil
 }
 
 func spiffeAudienceAllowed(raw interface{}) bool {

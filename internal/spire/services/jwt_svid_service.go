@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -17,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/authsec-ai/authsec/internal/delegation"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 )
 
@@ -30,6 +32,10 @@ type JWTSVIDService struct {
 	logger      *logrus.Entry
 	keyCache    map[string]*rsa.PrivateKey
 	keyCacheMu  sync.RWMutex
+
+	// delegationDB holds delegation_tokens; a delegated JWT-SVID only
+	// validates while it is its agent's active token (AS-069).
+	delegationDB *sql.DB
 }
 
 // NewJWTSVIDService creates a new JWT-SVID service
@@ -40,6 +46,10 @@ func NewJWTSVIDService(vaultClient *vault.Client, logger *logrus.Entry) *JWTSVID
 		keyCache:    make(map[string]*rsa.PrivateKey),
 	}
 }
+
+// SetDelegationStore sets the database whose delegation_tokens decide
+// whether a delegated JWT-SVID is still valid.
+func (s *JWTSVIDService) SetDelegationStore(db *sql.DB) { s.delegationDB = db }
 
 // IssueJWTSVIDRequest is the request to issue a JWT-SVID
 type IssueJWTSVIDRequest struct {
@@ -87,11 +97,12 @@ func (s *JWTSVIDService) IssueJWTSVID(
 		return nil, fmt.Errorf("audience is required")
 	}
 
-	// Default TTL: 1 hour
+	// Default TTL: 1 hour; never more than delegation.MaxTTL.
 	ttl := req.TTL
 	if ttl == 0 {
 		ttl = 3600
 	}
+	ttl = int(delegation.CapTTL(time.Duration(ttl) * time.Second).Seconds())
 
 	// Calculate expiration
 	now := time.Now()
@@ -159,6 +170,7 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 			}
 			return publicKey, nil
 		},
+		jwt.WithExpirationRequired(),
 	)
 
 	if err != nil {
@@ -169,6 +181,14 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
+		return &ValidateJWTSVIDResponse{
+			Valid: false,
+		}, nil
+	}
+
+	// A delegated token must still be its agent's active delegation token.
+	if err := delegation.Verify(ctx, s.delegationDB, claims, req.Token); err != nil {
+		s.logger.WithError(err).Info("delegated JWT-SVID refused")
 		return &ValidateJWTSVIDResponse{
 			Valid: false,
 		}, nil

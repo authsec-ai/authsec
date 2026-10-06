@@ -100,6 +100,7 @@ func Bootstrap(cfg *BootstrapConfig) (*Dependencies, error) {
 
 	bundleSvc := services.NewBundleService(workspaceRepo, vaultPKI, logger.WithField("service", "bundle"))
 	jwtSvidSvc := services.NewJWTSVIDService(vaultPKI, logger.WithField("service", "jwt_svid"))
+	jwtSvidSvc.SetDelegationStore(cfg.MasterDB)
 	pkiProvSvc := services.NewPKIProvisioningService(workspaceRepo, vaultPKI, logger.WithField("service", "pki_prov"))
 
 	// ── Controllers ──

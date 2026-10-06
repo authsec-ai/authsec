@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/delegation"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -66,6 +67,11 @@ func delegationAgentRef(c *gin.Context, raw string) (*uuid.UUID, bool) {
 	return &cid, true
 }
 
+// capPolicyTTL keeps a policy's max TTL within the delegated-token maximum.
+func capPolicyTTL(seconds int) int {
+	return int(delegation.CapTTL(time.Duration(seconds) * time.Second).Seconds())
+}
+
 func respondDelegationLookupError(c *gin.Context, err error) {
 	if status := tenancy.HTTPStatus(err); status != http.StatusNotFound {
 		c.JSON(status, gin.H{"error": "Failed to load delegation policy"})
@@ -91,6 +97,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 	if req.MaxTTLSeconds <= 0 {
 		req.MaxTTLSeconds = 3600
 	}
+	req.MaxTTLSeconds = capPolicyTTL(req.MaxTTLSeconds)
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -236,7 +243,7 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 		policy.AllowedPermissions = permsJSON
 	}
 	if req.MaxTTLSeconds != nil {
-		policy.MaxTTLSeconds = *req.MaxTTLSeconds
+		policy.MaxTTLSeconds = capPolicyTTL(*req.MaxTTLSeconds)
 	}
 	if req.Enabled != nil {
 		policy.Enabled = *req.Enabled

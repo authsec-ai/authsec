@@ -11,6 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/delegation"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -359,6 +360,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	if req.TTLSeconds <= 0 {
 		req.TTLSeconds = 3600
 	}
+	req.TTLSeconds = int(delegation.CapTTL(time.Duration(req.TTLSeconds) * time.Second).Seconds())
 
 	tenantDB := config.DB.WithContext(c.Request.Context()).Scopes(tenancy.Scope(*workspaceID))
 
