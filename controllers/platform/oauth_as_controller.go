@@ -85,7 +85,12 @@ func (ctrl *OAuthASController) evalPDP(ctx context.Context, req policy.PolicyReq
 		mode = config.AppConfig.PolicyEngineMode
 	}
 
-	decision, _ := ctrl.pdp.Decide(ctx, req)
+	decision, err := ctrl.pdp.Decide(ctx, req)
+	if err != nil && mode == "enforce" {
+		// Fail closed: policies that could not be read cannot be honoured.
+		log.Printf("[PDP] policy evaluation failed, denying: %v", err)
+		return true
+	}
 
 	// thin gates passed → gateEffect is always permit at this point
 	pdpAgrees := decision.Effect != policy.EffectDeny
@@ -1056,9 +1061,10 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		return
 	}
 
-	// ── 6. PDP gate (shadow/enforce).
+	// ── 6. PDP gate (shadow/enforce). Policies of the resource server's
+	// workspace govern access to it (ADR-0001 §5.2).
 	if ctrl.evalPDP(ctx, policy.PolicyRequest{
-		WorkspaceID:      sa.WorkspaceID,
+		WorkspaceID:      rs.WorkspaceID,
 		ClientID:         client.ClientID,
 		SubjectType:      "service_account",
 		SubjectID:        sa.ID,

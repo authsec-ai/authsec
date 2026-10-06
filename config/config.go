@@ -394,7 +394,7 @@ func LoadConfig() *Config {
 		XAACiba:                 getEnvBool("XAA_CIBA", false),
 		XAAIssuance:             getEnvBool("XAA_ISSUANCE", false),
 		EnableEmbeddedSpire:     getEnvBool("ENABLE_EMBEDDED_SPIRE", false),
-		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "off"),
+		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "enforce"), // deny policies block (AS-035); "shadow"/"off" only for diagnosis
 		OktaDomain:              oktaDomain,
 		OktaClientID:            oktaClientID,
 		OktaClientSecret:        oktaClientSecret,
