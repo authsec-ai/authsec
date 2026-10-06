@@ -37,9 +37,9 @@ func ValidateWorkspaceFromToken() gin.HandlerFunc {
 		if tokenWorkspaceIDStr != urlWorkspaceID {
 			log.Printf("SECURITY: Workspace mismatch - Token: %s, URL: %s, User: %v, Admin: %v",
 				tokenWorkspaceIDStr, urlWorkspaceID, c.GetString("user_id"), isAdminUser(c))
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Access denied: workspace mismatch",
-			})
+			// Another workspace's resources do not exist for this caller: 404,
+			// so the response does not confirm the workspace exists (AS-063).
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			c.Abort()
 			return
 		}
