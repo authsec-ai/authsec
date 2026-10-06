@@ -10,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	authz "github.com/authsec-ai/authsec/internal/authz"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -70,7 +71,7 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			return
 		}
 
-		claims, err := validateJWTToken(tokenString, cfg)
+		claims, err := validateJWTTokenFor(tokenString, cfg, surfaceClasses(c.Request.URL.Path))
 		if err != nil {
 			fmt.Printf("WARN: JWT validation failed: %v\n", err)
 			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="token is expired or invalid"`)
@@ -332,46 +333,30 @@ func extractBearerToken(c *gin.Context) (string, error) {
 	return parts[1], nil
 }
 
-// validateJWTToken validates the JWT token and returns claims
+// validateJWTToken validates a user session token (admin, end-user or
+// legacy class) and returns its claims.
 func validateJWTToken(tokenString string, cfg *AuthConfig) (jwt.MapClaims, error) {
-	// Try parsing with different secrets - prioritize environment variables
-	// Use configured JWT secrets with minimal fallback
-	secrets := []string{
-		cfg.JWTSecret,        // Primary JWT secret (JWT_SDK_SECRET from env)
-		cfg.JWTDefaultSecret, // Secondary JWT secret (JWT_DEF_SECRET from env)
+	return validateJWTTokenFor(tokenString, cfg, userSessionClasses)
+}
+
+// validateJWTTokenFor validates a session token whose class is in allowed.
+// Each class verifies only under its own key, with typ and aud required; a
+// typ-less legacy token verifies under the legacy secrets until the legacy
+// deadline. The rule is documented in internal/sessiontoken (AS-033).
+func validateJWTTokenFor(tokenString string, cfg *AuthConfig, allowed []sessiontoken.Class) (jwt.MapClaims, error) {
+	secrets := sessiontoken.Secrets{
+		Default: cfg.JWTDefaultSecret, // JWT_DEF_SECRET
+		SDK:     cfg.JWTSecret,        // JWT_SDK_SECRET
+		Other:   os.Getenv("JWT_SECRET"),
 	}
-
-	// Add only essential fallback for cross-service compatibility
-	if jwtSecret := os.Getenv("JWT_SECRET"); jwtSecret != "" && jwtSecret != cfg.JWTSecret && jwtSecret != cfg.JWTDefaultSecret {
-		secrets = append(secrets, jwtSecret)
+	claims, _, err := sessiontoken.VerifyWith(secrets, tokenString, allowed...)
+	if err != nil {
+		return nil, err
 	}
-
-	var lastErr error
-	for _, secret := range secrets {
-		if secret == "" {
-			continue // Skip empty secrets
-		}
-
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
-
-		if err == nil && token.Valid {
-			if claims, ok := token.Claims.(jwt.MapClaims); ok {
-				// Validate issuer and audience
-				if err := validateClaims(claims, cfg); err != nil {
-					return nil, err
-				}
-				return claims, nil
-			}
-		}
-		lastErr = err
+	if err := validateClaims(claims, cfg); err != nil {
+		return nil, err
 	}
-
-	return nil, lastErr
+	return claims, nil
 }
 
 // validateClaims validates issuer, audience, and timing claims
@@ -401,8 +386,10 @@ func validateClaims(claims jwt.MapClaims, cfg *AuthConfig) error {
 		return fmt.Errorf("token missing required issuer (iss) claim")
 	}
 
-	// Validate audience (always enforced; skip only if no audience is configured)
-	if audClaim, exists := claims["aud"]; exists {
+	// Validate audience. A classed token's aud was checked against its class
+	// by sessiontoken; a legacy token keeps the configured audience check.
+	_, classed := claims["typ"]
+	if audClaim, exists := claims["aud"]; exists && !classed {
 		if cfg.ExpectedAudience != "" && !validateAudience(audClaim, cfg.ExpectedAudience) {
 			return fmt.Errorf("token audience mismatch")
 		}
@@ -971,6 +958,9 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 
 		// Validate the token
 		claims, err := validateJWTToken(tokenString, cfg)
+		if err == nil && sessionRevoked(claims) {
+			err = fmt.Errorf("session has been revoked")
+		}
 		if err != nil {
 			fmt.Printf("Token validation error: %v\n", err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})

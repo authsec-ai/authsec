@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/logintickets"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -109,9 +110,18 @@ func resolveLoginSubject(c *gin.Context, realm string) (*LoginSubject, error) {
 		if err != nil {
 			return nil, err
 		}
-		claims, err := validateJWTToken(token, DefaultAuthConfig())
+		// The console realm accepts console tokens only; the end-user realm
+		// (and the realm-less legacy routes) accept either user class (AS-033).
+		allowed := userSessionClasses
+		if realm == logintickets.RealmAdmin {
+			allowed = []sessiontoken.Class{sessiontoken.Admin, sessiontoken.Legacy}
+		}
+		claims, err := validateJWTTokenFor(token, DefaultAuthConfig(), allowed)
 		if err != nil {
 			return nil, err
+		}
+		if sessionRevoked(claims) {
+			return nil, errors.New("session has been revoked")
 		}
 		return subjectFromClaims(claims)
 	}

@@ -20,7 +20,10 @@ func Test_UserManagement_RequiresWorkspaceAdmin(t *testing.T) {
 	env := testsupport.Get(t)
 	ws, u := seedEndUser(t)
 	_ = ws
-	tok := env.MustAsUser(u.UserID, u.WorkspaceID, u.Email)
+	// A console-class token of a member without the admin role: the role
+	// gate, not the token class, must refuse it (AS-033 refuses an end-user
+	// token on console routes before any role check).
+	tok := consoleTokenFor(t, u.UserID, u.WorkspaceID, u.Email)
 	wsid := u.WorkspaceID.String()
 
 	for _, r := range []struct{ method, path string }{
@@ -102,7 +105,7 @@ func Test_PlatformOperations_Closed(t *testing.T) {
 	env := testsupport.Get(t)
 	ws, u := seedEndUser(t)
 	tokAdmin := env.MustAsAdmin(ws.AdminUserID, ws.WorkspaceID, ws.AdminEmail)
-	tokUser := env.MustAsUser(u.UserID, u.WorkspaceID, u.Email)
+	tokUser := consoleTokenFor(t, u.UserID, u.WorkspaceID, u.Email)
 
 	if w := env.Do("POST", "/authsec/migration/migrations/master/run", nil, tokAdmin); w.Code != http.StatusNotFound {
 		t.Errorf("master migration run must be gone, got %d", w.Code)

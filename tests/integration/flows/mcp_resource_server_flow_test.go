@@ -111,7 +111,7 @@ func Test_MCP_NonAdminCreate(t *testing.T) {
 	}
 
 	// Mint a token for the non-admin user (no "admin" role).
-	userTok := env.MustAsUser(endUser.UserID, ws.WorkspaceID, endUser.Email)
+	userTok := consoleTokenFor(t, endUser.UserID, ws.WorkspaceID, endUser.Email)
 
 	createBody := map[string]interface{}{
 		"name":                "forbidden-rs-" + nonce(t),

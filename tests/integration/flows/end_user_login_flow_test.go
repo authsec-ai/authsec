@@ -51,10 +51,13 @@ func Test_EndUserLogin_PasswordToProtectedAPI(t *testing.T) {
 		t.Fatalf("expected non-empty token in login response, body: %s", loginResp.Body.String())
 	}
 
-	protectedResp := env.Do("GET", "/authsec/applications", nil, loginPayload.Token)
+	// An end-user session reaches end-user self-service routes, and is
+	// refused on the console (AS-033).
+	protectedResp := env.Do("GET", "/authsec/uflow/auth/workspace/totp/devices", nil, loginPayload.Token)
 	if protectedResp.Code == http.StatusUnauthorized {
-		t.Errorf("expected authenticated access to /authsec/applications, got 401 (body: %s)", protectedResp.Body.String())
+		t.Errorf("expected authenticated access to end-user self-service, got 401 (body: %s)", protectedResp.Body.String())
 	}
+	assertStatus(t, env.Do("GET", "/authsec/applications", nil, loginPayload.Token), http.StatusUnauthorized)
 }
 
 // Test_EndUserLogin_WrongPassword confirms that a login attempt with the wrong

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -440,7 +441,6 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 		"client_id":      user.ClientID.String(),
 		"email":          user.Email,
 		"sub":            user.ID.String(),
-		"aud":            "authsec-api",
 		"iss":            "authsec-ai/auth-manager",
 		"iat":            now.Unix(),
 		"exp":            now.Add(24 * time.Hour).Unix(),
@@ -451,10 +451,8 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 	}
 
 	claims["jti"] = uuid.NewString() // revocable by id (AS-031)
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	token.Header["kid"] = "default"
-
-	tokenString, err := token.SignedString([]byte(jwtSecret))
+	// End-user class (AS-033): typ/aud and the class key come from sessiontoken.
+	tokenString, err := sessiontoken.SignWith(sessiontoken.Secrets{Default: jwtSecret, SDK: os.Getenv("JWT_SDK_SECRET")}, sessiontoken.EndUser, claims)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign token: %w", err)
 	}
