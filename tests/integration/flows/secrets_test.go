@@ -48,9 +48,14 @@ func Test_RotateLegacyMFACiphertexts(t *testing.T) {
 	methodData, _ := json.Marshal(map[string]string{"secret_encrypted": seedCT, "label": "phone"})
 	backup, _ := json.Marshal([]string{codeCT})
 
+	// mfa_methods rows must belong to a user's workspace (migration 047).
+	ws, err := SeedWorkspaceWithAdmin(config.DB, emailSafeNonce())
+	if err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
 	id := uuid.New()
 	if _, err := db.Exec(`INSERT INTO mfa_methods (id, client_id, method_type, method_data, backup_codes, enabled, verified)
-		VALUES ($1, $2, 'totp', $3::jsonb, $4, true, true)`, id, uuid.New(), string(methodData), string(backup)); err != nil {
+		VALUES ($1, $2, 'totp', $3::jsonb, $4, true, true)`, id, ws.AdminUserID, string(methodData), string(backup)); err != nil {
 		t.Fatalf("seed mfa_methods: %v", err)
 	}
 
