@@ -27,7 +27,6 @@ import (
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
-	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -380,14 +379,36 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		return
 	}
 
-	var signingSecret []byte
-	var tokenType string
+	// secret_id used to switch the result to an sdk-agent token without ever
+	// checking the secret. Nothing calls it that way; refuse rather than
+	// upgrade the token type on an unverified claim.
 	if req.SecretID != nil {
-		signingSecret = []byte(config.AppConfig.JWTSdkSecret)
-		tokenType = "sdk-agent"
-	} else {
-		signingSecret = []byte(config.AppConfig.JWTDefSecret)
-		tokenType = "default"
+		c.JSON(http.StatusBadRequest, gin.H{"error": "secret_id is not supported"})
+		return
+	}
+	signingSecret := []byte(config.AppConfig.JWTDefSecret)
+	tokenType := "default"
+
+	// The new token never outlives the one presented, so a session cannot be
+	// extended indefinitely by re-minting.
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour)
+	var presentedExp *jwt.NumericDate
+	if claims, ok := c.Get("claims"); ok {
+		if mc, ok := claims.(jwt.MapClaims); ok {
+			presentedExp, _ = mc.GetExpirationTime()
+		}
+	}
+	if presentedExp == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "presented token has no expiry"})
+		return
+	}
+	if presentedExp.Time.Before(expiresAt) {
+		expiresAt = presentedExp.Time
+	}
+	if !expiresAt.After(now) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "presented token has expired"})
+		return
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -396,9 +417,9 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		"email_id":     emailID,
 		"token_type":   tokenType,
 		"aud":          "authsec-api",
-		"iat":          time.Now().Unix(),
-		"nbf":          time.Now().Unix(),
-		"exp":          time.Now().Add(24 * time.Hour).Unix(),
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          expiresAt.Unix(),
 		"iss":          "authsec-ai/auth-manager",
 	})
 	token.Header["kid"] = tokenType
@@ -412,34 +433,8 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 	c.JSON(http.StatusOK, sharedmodels.TokenResponse{
 		AccessToken: tokenString,
 		TokenType:   "Bearer",
-		ExpiresIn:   24 * 60 * 60,
+		ExpiresIn:   expiresAt.Unix() - now.Unix(),
 	})
-}
-
-// OIDCToken exchanges an OIDC token from Hydra for a JWT.
-func (ac *AuthmgrController) OIDCToken(c *gin.Context) {
-	var req sharedmodels.OIDCTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	tokenResp, err := services.IssueOIDCJWT(ctx, req.OidcToken)
-	if err != nil {
-		status := http.StatusUnauthorized
-		if strings.Contains(err.Error(), "missing required field") {
-			status = http.StatusBadRequest
-		} else if strings.Contains(err.Error(), "failed to generate token") {
-			status = http.StatusInternalServerError
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, tokenResp)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

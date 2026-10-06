@@ -1570,6 +1570,32 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	// ── 1b. Authenticate the client. A body client_id alone proves nothing;
+	// without this, anyone holding a user's token could name its client and
+	// mint an ID-JAG for that user.
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	authClient, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil || authClient == nil {
+		log.Printf("[ISSUANCE] tokenExchangeGrant: client auth failed: %v", err)
+		desc := "client authentication failed"
+		if err != nil {
+			desc = err.Error()
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": desc,
+		})
+		return
+	}
+	if oauthClient != nil && oauthClient.ClientID != authClient.ClientID {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "client_id does not match the authenticated client",
+		})
+		return
+	}
+	oauthClient = authClient
+
 	// ── 2. requested_token_type check.
 	requestedType := c.PostForm("requested_token_type")
 	if requestedType != tokens.IDJAGTokenType {

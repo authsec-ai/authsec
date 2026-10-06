@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -192,14 +193,36 @@ func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
 
 		// Create a done channel for the request
 		doneChan := make(chan struct{})
+		// panicChan carries a handler panic back to this goroutine. The chain
+		// runs on its own goroutine, where gin's Recovery cannot see a panic;
+		// left unrecovered it would take down the whole process.
+		panicChan := make(chan interface{}, 1)
 
 		go func() {
 			defer close(doneChan)
+			defer func() {
+				if p := recover(); p != nil {
+					// Log here: the stack is lost once the panic is re-raised,
+					// and nobody re-raises it if the request already timed out.
+					logrus.WithFields(logrus.Fields{
+						"panic": fmt.Sprint(p),
+						"stack": string(debug.Stack()),
+					}).Error("Handler panic")
+					panicChan <- p
+				}
+			}()
 			c.Next()
 		}()
 
 		select {
 		case <-doneChan:
+			// Re-raise a handler panic on the request goroutine so the
+			// Recovery middleware turns it into a 500.
+			select {
+			case p := <-panicChan:
+				panic(p)
+			default:
+			}
 			// Request completed normally
 			return
 		case <-timeoutChan:

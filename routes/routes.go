@@ -2233,16 +2233,18 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
 	authzCtrl := platformCtrl.NewAuthorizationController()
 
-	// Token endpoints. /verify and /oidc are intentionally public and
-	// workspace-agnostic: they validate a presented token and return only claims
-	// that token already proves — they must never expand the caller's authority
-	// or expose another workspace's data beyond the token itself. /generate mints
-	// a token and therefore requires authentication.
+	// Token endpoints. /verify is intentionally public and workspace-agnostic:
+	// it validates a presented token and returns only claims that token already
+	// proves — it must never expand the caller's authority or expose another
+	// workspace's data beyond the token itself. /generate mints a token and
+	// therefore requires authentication.
+	//
+	// /oidc was removed (AS-028): it turned any active Hydra access token, for
+	// any client, into a 24h platform session, and nothing calls it.
 	tokenGroup := r.Group("/auth/token")
 	{
 		tokenGroup.POST("/verify", ac.VerifyToken)
 		tokenGroup.POST("/generate", middlewares.AuthMiddleware(), ac.GenerateToken)
-		tokenGroup.POST("/oidc", ac.OIDCToken)
 	}
 
 	// ── /authz/* — single canonical authorization surface ──
