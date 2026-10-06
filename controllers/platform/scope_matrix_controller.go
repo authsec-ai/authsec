@@ -270,6 +270,13 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 		return
 	}
 
+	// Another workspace's resource server is not found, before anything
+	// (including the permission backfill below, which writes) runs.
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsUUID.String(), workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
 	scopes, err := ctrl.scopeRegistry.ListByResourceServer(workspaceID, rsUUID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1071,6 +1078,11 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 	userID := extractUserIDRequired(c)
 	if userID == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id required"})
+		return
+	}
+
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID.String(), workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
