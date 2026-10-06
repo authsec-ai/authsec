@@ -8044,9 +8044,7 @@ END $$;
 
 -- <<< tenancy hardening (045-048)
 
--- <<< tenancy hardening (045-047)
 
--- <<< tenancy hardening (045-046)
 
 -- ---------------------------------------------------------------------------
 -- revoked_session_tokens (050). Kept identical to migrations/master/050_session_token_revocations.sql.

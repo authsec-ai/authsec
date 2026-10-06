@@ -223,8 +223,8 @@ func Test_ExtSvcCredentials_SVIDCannotReadOtherWorkspace(t *testing.T) {
 		t.Fatalf("register B: %v", err)
 	}
 	svcB := uuid.New()
-	mustExec(t, `INSERT INTO services (id, name, type, created_by, agent_accessible, vault_path)
-		VALUES (?, ?, 'api', ?, true, ?)`, svcB, "svc-"+n, wsB.AdminUserID.String(), "secret/svc-"+n)
+	mustExec(t, `INSERT INTO services (id, name, type, created_by, agent_accessible, vault_path, workspace_id)
+		VALUES (?, ?, 'api', ?, true, ?, ?)`, svcB, "svc-"+n, wsB.AdminUserID.String(), "secret/svc-"+n, wsB.WorkspaceID)
 
 	svid := func(ws *WorkspaceScenario, key *rsa.PrivateKey) string {
 		tok, err := testsupport.MintSVID(testsupport.SVIDParams{

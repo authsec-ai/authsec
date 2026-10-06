@@ -298,3 +298,12 @@ func PerUserRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc
 		c.Next()
 	}
 }
+
+// ResetRateLimitsForTest clears the in-memory rate-limit counters. Tests share
+// one process and one client address, so without this a suite's later tests
+// inherit earlier tests' request counts. Never call it outside tests.
+func ResetRateLimitsForTest() {
+	memStore.mu.Lock()
+	memStore.items = make(map[string]*rateLimitEntry)
+	memStore.mu.Unlock()
+}
