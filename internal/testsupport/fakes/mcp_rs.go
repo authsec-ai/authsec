@@ -91,7 +91,7 @@ func (rs *MCPResourceServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"jsonrpc": "2.0",
 				"id":      req["id"],
 				"result": map[string]interface{}{
-					"protocolVersion": "2024-11-05",
+					"protocolVersion": "2025-03-26", // the version internal/mcp requests and accepts
 					"serverInfo":      map[string]string{"name": "fake-mcp", "version": "0.1"},
 					"capabilities":    map[string]interface{}{"tools": map[string]bool{"listChanged": false}},
 				},

@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"time"
+	"net"
 	"bytes"
 	"encoding/json"
 	"net/http"
@@ -73,6 +75,7 @@ func ensureControllerDB(t *testing.T) {
 	if config.GetDatabase() != nil && config.DB != nil {
 		return
 	}
+	skipWithoutPostgres(t, "localhost", "5432")
 	// Force sane local defaults so InitDatabaseWithoutGORM connects
 	os.Setenv("DB_HOST", "localhost")
 	os.Setenv("DB_PORT", "5432")
@@ -763,4 +766,15 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 			}
 		})
 	}
+}
+
+// skipWithoutPostgres skips a DB-backed test when no Postgres is listening,
+// instead of failing the package (CI provides one on :5432).
+func skipWithoutPostgres(t *testing.T, host, port string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("no Postgres at %s:%s: %v", host, port, err)
+	}
+	conn.Close()
 }
