@@ -1,8 +1,11 @@
 package middlewares
 
 import (
+	"net/http"
+
 	"encoding/json"
 	"fmt"
+	"github.com/authsec-ai/authsec/config"
 	"os"
 	"strings"
 	"time"
@@ -280,6 +283,21 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	}
 
 	printJSON(entry)
+
+	// Persist to audit_events so the action appears in the workspace's audit
+	// log; stdout alone never reached it (AS-049).
+	if config.AuditLogger != nil {
+		persistedWS := workspaceID
+		if persistedWS == "unknown_workspace" {
+			persistedWS = ""
+		}
+		var before, after interface{}
+		if changes != nil {
+			before, after = changes.Before, changes.After
+		}
+		config.AuditLogger.LogAdminAction(reqID, persistedWS, userID, actionType, objectType, objectID,
+			c.Request.Method, c.FullPath(), c.ClientIP(), c.Request.UserAgent(), http.StatusOK, 0, before, after, "")
+	}
 }
 
 // --- Helper ---

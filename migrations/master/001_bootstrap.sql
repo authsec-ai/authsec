@@ -7006,3 +7006,18 @@ CREATE TABLE IF NOT EXISTS public.revoked_session_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_expires ON public.revoked_session_tokens (expires_at);
 CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_workspace ON public.revoked_session_tokens (workspace_id);
+
+-- ---------------------------------------------------------------------------
+-- audit_events append-only (051). Kept identical to migrations/master/051_audit_events_append_only.sql.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.audit_events_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_events rows are append-only';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_immutable ON public.audit_events;
+CREATE TRIGGER trg_audit_events_immutable
+    BEFORE UPDATE ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_immutable();
