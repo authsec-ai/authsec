@@ -25,6 +25,7 @@ package integration
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -693,11 +694,26 @@ func TestP2K8sGraphImplicitGroups(t *testing.T) {
 		t.Errorf("path kinds = %v", kinds)
 	}
 
-	// Expansion: the group's members.
+	// Expansion: the group's members -- EVERY ServiceAccount of the namespace,
+	// since each is implicitly in system:serviceaccounts:<ns> (the projection
+	// writes the membership for all of them once a binding names the group),
+	// and nothing from another namespace.
 	ex := graphGet(t, api, "/graph/expand"+k8sQS("node", w.group, "edge", "member_of", "direction", "reverse"))
 	contractCheck(t, "GET /graph/expand (group members)", ex, contractK8sGraphExpand)
-	if n := digl(ex, "data", "nodes"); len(n) != 1 || digs(n[0], "ref") != w.sa {
-		t.Errorf("group members = %v", ex["data"])
+	var wantMembers []string
+	if err := w.db.Raw(`SELECT 'identity:' || id FROM iga_identity_accounts
+	    WHERE workspace_id = ? AND provider = 'k8s' AND account_kind = 'k8s_service_account'
+	      AND lifecycle = 'active' AND provider_attrs->>'namespace' = ? ORDER BY 1`,
+		w.ws, crossNS).Scan(&wantMembers).Error; err != nil {
+		t.Fatalf("namespace service accounts: %v", err)
+	}
+	var gotMembers []string
+	for _, n := range digl(ex, "data", "nodes") {
+		gotMembers = append(gotMembers, digs(n, "ref"))
+	}
+	sort.Strings(gotMembers)
+	if len(wantMembers) < 2 || strings.Join(gotMembers, ",") != strings.Join(wantMembers, ",") {
+		t.Errorf("group members = %v, want every ServiceAccount of %s %v", gotMembers, crossNS, wantMembers)
 	}
 }
 
