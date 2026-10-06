@@ -1,16 +1,20 @@
 package services
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -216,16 +220,40 @@ func (s *TOTPService) VerifyTOTP(userID uuid.UUID, workspaceID uuid.UUID, totpCo
 		return false, err
 	}
 
-	// Try validating against each device
-	for _, device := range devices {
-		if s.ValidateTOTPCode(device.Secret, totpCode) {
-			// Update last used timestamp
-			s.totpRepo.UpdateLastUsed(device.ID)
-			return true, nil
+	// Lockout and once-per-step replay protection (AS-004).
+	return s.guardedMatch(userID, workspaceID, devices, totpCode)
+}
+
+// guardedMatch checks a code against the user's devices under the lockout
+// and replay rules of internal/lockout: a locked account gets
+// lockout.ErrLocked, and a time step already accepted for the user is
+// refused.
+func (s *TOTPService) guardedMatch(userID, workspaceID uuid.UUID, devices []models.TOTPSecret, totpCode string) (bool, error) {
+	var db *sql.DB
+	if conn := config.GetDatabase(); conn != nil {
+		db = conn.DB
+	}
+	return lockout.GuardCode(context.Background(), db, workspaceID, userID, lockout.TOTP, func() (int64, bool) {
+		for _, device := range devices {
+			if step, ok := s.matchStep(device.Secret, totpCode); ok {
+				s.totpRepo.UpdateLastUsed(device.ID)
+				return step, true
+			}
+		}
+		return 0, false
+	})
+}
+
+// matchStep is ValidateTOTPCode that also returns the matched time step.
+func (s *TOTPService) matchStep(secret string, code string) (int64, bool) {
+	now := time.Now()
+	for _, offset := range []int64{0, -1, 1} {
+		t := now.Add(time.Duration(offset)*30*time.Second).Unix() / 30
+		if subtle.ConstantTimeCompare([]byte(code), []byte(s.generateTOTP(secret, t))) == 1 {
+			return t, true
 		}
 	}
-
-	return false, nil
+	return 0, false
 }
 
 // VerifyBackupCode validates a backup code for authentication
@@ -324,16 +352,8 @@ func (s *TOTPService) LoginWithTOTPWithUser(user *models.ExtendedUser, totpCode 
 		return false, fmt.Errorf("no TOTP devices registered")
 	}
 
-	// Try validating against each device
-	for _, device := range devices {
-		if s.ValidateTOTPCode(device.Secret, totpCode) {
-			// Update last used timestamp
-			s.totpRepo.UpdateLastUsed(device.ID)
-			return true, nil
-		}
-	}
-
-	return false, nil
+	// Lockout and once-per-step replay protection (AS-004, AS-034).
+	return s.guardedMatch(user.ID, user.WorkspaceID, devices, totpCode)
 }
 
 // HasTOTPEnabled checks if user has TOTP enabled

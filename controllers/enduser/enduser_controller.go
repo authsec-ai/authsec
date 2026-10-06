@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
@@ -1007,19 +1008,32 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 	// Single-DB collapse: tenant isolation must come from explicit predicates.
 	tenantDB := config.DB
 
+	// Account lockout on repeated failures, keyed by (workspace, email) so an
+	// unknown email behaves like a known one (AS-034).
+	if lockout.Refuse(c, workspaceID, lockout.EndUserPassword, input.Email) {
+		return
+	}
+
 	// Find user by (workspace_id, email) — the canonical identity tuple.
 	// Soft-deleted users (deleted_at set) must never authenticate.
 	var user models.User
 	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND deleted_at IS NULL", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
+		if lockout.RecordFailure(c, workspaceID, lockout.EndUserPassword, input.Email) {
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
 	// Verify password
 	if !user.CheckPassword(input.Password) {
+		if lockout.RecordFailure(c, workspaceID, lockout.EndUserPassword, input.Email) {
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
+	lockout.RecordSuccess(c, workspaceID, lockout.EndUserPassword, input.Email)
 
 	// Check if MFA is enabled
 	var user2 models.User

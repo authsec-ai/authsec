@@ -1,6 +1,7 @@
 package enduser
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/middlewares"
 
 	"github.com/authsec-ai/authsec/models"
@@ -234,6 +236,10 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 
 	// Verify TOTP code
 	valid, err := ctrl.totpService.VerifyTOTP(userID, workspaceID, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify TOTP", "details": err.Error()})
 		return
@@ -563,6 +569,10 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 
 	// Validate TOTP code
 	valid, err := ctrl.totpService.LoginWithTOTPWithUser(user, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -629,6 +639,10 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 
 	// Validate TOTP code
 	valid, err := ctrl.totpService.LoginWithTOTPWithUser(user, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

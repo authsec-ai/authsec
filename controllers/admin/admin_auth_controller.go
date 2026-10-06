@@ -12,6 +12,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/models"
@@ -217,31 +218,19 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		return
 	}
 
-	// Check if account is locked (lockout period: 30 minutes)
-	if adminUser.AccountLockedAt != nil {
-		lockoutDuration := 30 * time.Minute
-		if time.Since(*adminUser.AccountLockedAt) < lockoutDuration {
-			remainingTime := lockoutDuration - time.Since(*adminUser.AccountLockedAt)
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
-			}
-			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":   "Account is temporarily locked due to multiple failed login attempts",
-				"message": fmt.Sprintf("Please try again in %d minutes or reset your password", int(remainingTime.Minutes())+1),
-			})
-			return
+	// Account lockout (AS-034): counted in auth_lockouts with an atomic
+	// upsert, keyed by (workspace, email). The users.failed_login_attempts
+	// counter this replaces was never loaded by the lookup, so it never fired.
+	lockWS := uuid.Nil
+	if adminUser.WorkspaceID != nil {
+		lockWS = *adminUser.WorkspaceID
+	}
+	if lockout.Refuse(c, lockWS, lockout.AdminPassword, adminUser.Email) {
+		if config.AuditLogger != nil {
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
 		}
-		// Lockout period expired, reset fields
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, map[string]interface{}{
-			"failed_login_attempts": 0,
-			"account_locked_at":     nil,
-		}); err != nil {
-			fmt.Printf("Failed to reset lockout fields: %v\n", err)
-		}
-		adminUser.FailedLoginAttempts = 0
-		adminUser.AccountLockedAt = nil
+		monitoring.RecordAuthFailure("admin", "account_locked", "admin")
+		return
 	}
 
 	// Check if password reset is required
@@ -260,61 +249,17 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	// Verify password
 	if !adminUser.CheckPassword(input.Password) {
-		// Increment failed login attempts
-		adminUser.FailedLoginAttempts++
-
-		updates := map[string]interface{}{
-			"failed_login_attempts": adminUser.FailedLoginAttempts,
-		}
-
-		// Lock account after 3 failed attempts and require password reset
-		if adminUser.FailedLoginAttempts >= 3 {
-			now := time.Now()
-			updates["account_locked_at"] = now
-			updates["password_reset_required"] = true
-			if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, updates); err != nil {
-				fmt.Printf("Failed to lock account: %v\n", err)
-			}
-
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked after 3 failed attempts")
-			}
-			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":   "Account locked due to multiple failed login attempts",
-				"message": "Your account has been locked for security. Please reset your password to unlock.",
-			})
-			return
-		}
-
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, updates); err != nil {
-			fmt.Printf("Failed to update failed attempts: %v\n", err)
-		}
-
-		// Audit: Failed login - invalid password
 		if config.AuditLogger != nil {
 			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "invalid password")
 		}
 		monitoring.RecordAuthFailure("admin", "invalid_password", "admin")
-
-		remainingAttempts := 3 - adminUser.FailedLoginAttempts
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error":   "Invalid credentials",
-			"message": fmt.Sprintf("Invalid password. %d attempt(s) remaining before account lockout.", remainingAttempts),
-		})
+		if lockout.RecordFailure(c, lockWS, lockout.AdminPassword, adminUser.Email) {
+			return
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
-
-	// Successful login - reset failed attempts
-	if adminUser.FailedLoginAttempts > 0 {
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, map[string]interface{}{
-			"failed_login_attempts": 0,
-			"account_locked_at":     nil,
-		}); err != nil {
-			fmt.Printf("Failed to reset failed attempts: %v\n", err)
-		}
-	}
+	lockout.RecordSuccess(c, lockWS, lockout.AdminPassword, adminUser.Email)
 
 	// Update last login
 	if err := aac.adminUserRepo.UpdateLastLogin(adminUser.ID); err != nil {

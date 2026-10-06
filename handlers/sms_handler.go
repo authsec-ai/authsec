@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	appmodels "github.com/authsec-ai/authsec/models"
@@ -639,10 +641,30 @@ func (h *SMSHandler) VerifySMS(c *gin.Context) {
 		return
 	}
 
-	storedCode, err := util.DecryptString(smsData.VerificationCode)
-	if err != nil || req.Code != storedCode {
+	// Under the account lockout (AS-004); a code is single use: it is
+	// cleared as soon as it is accepted, so it cannot be replayed.
+	storedCode, decErr := util.DecryptString(smsData.VerificationCode)
+	valid, handled := guardSecondFactor(c, req.WorkspaceID, client.ID, lockout.SMS, func() (int64, bool) {
+		return -1, decErr == nil && subtle.ConstantTimeCompare([]byte(req.Code), []byte(storedCode)) == 1
+	})
+	if handled {
+		return
+	}
+	if !valid {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid SMS code"})
 		return
+	}
+	var methodData map[string]interface{}
+	if json.Unmarshal(method.MethodData, &methodData) == nil {
+		delete(methodData, "verification_code")
+		delete(methodData, "code_expires_at")
+		if cleared, err := json.Marshal(methodData); err == nil {
+			if err := mfaRepo.UpdateMethodData(client.ID.String(), "sms", cleared); err != nil {
+				log.Printf("Failed to clear used SMS code: %v", err)
+				c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to verify SMS code"})
+				return
+			}
+		}
 	}
 
 	// Update last used timestamp

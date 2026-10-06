@@ -1,18 +1,22 @@
 package services
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/models"
 
 	"github.com/google/uuid"
@@ -101,6 +105,18 @@ func (s *TenantTOTPService) ValidateTOTPCode(secret string, code string) bool {
 	return false
 }
 
+// matchStep is ValidateTOTPCode that also returns the matched time step.
+func (s *TenantTOTPService) matchStep(secret string, code string) (int64, bool) {
+	now := time.Now()
+	for _, offset := range []int64{0, -1, 1} {
+		t := now.Add(time.Duration(offset)*30*time.Second).Unix() / 30
+		if subtle.ConstantTimeCompare([]byte(code), []byte(s.generateTOTP(secret, t))) == 1 {
+			return t, true
+		}
+	}
+	return 0, false
+}
+
 // generateTOTP generates a TOTP code for a given time step
 func (s *TenantTOTPService) generateTOTP(secret string, t int64) string {
 	// Decode base32 secret
@@ -176,15 +192,30 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 		}, nil
 	}
 
-	// Step 7: Validate TOTP code against all devices
-	validCode := false
+	// Step 7: Validate TOTP code against all devices, under the account
+	// lockout and once-per-step replay rules (AS-004, AS-034).
 	var usedSecret *models.TenantTOTPSecret
-	for _, secret := range secrets {
-		if s.ValidateTOTPCode(secret.Secret, req.TOTPCode) {
-			validCode = true
-			usedSecret = &secret
-			break
+	var db *sql.DB
+	if conn := config.GetDatabase(); conn != nil {
+		db = conn.DB
+	}
+	validCode, guardErr := lockout.GuardCode(context.Background(), db, workspaceUUID, user.ID, lockout.TOTP, func() (int64, bool) {
+		for i := range secrets {
+			if step, ok := s.matchStep(secrets[i].Secret, req.TOTPCode); ok {
+				usedSecret = &secrets[i]
+				return step, true
+			}
 		}
+		return 0, false
+	})
+	if errors.Is(guardErr, lockout.ErrLocked) {
+		return &models.TenantTOTPLoginResponse{
+			Success: false,
+			Message: lockout.Message,
+		}, nil
+	}
+	if guardErr != nil {
+		return nil, fmt.Errorf("failed to verify TOTP: %w", guardErr)
 	}
 
 	if !validCode {
