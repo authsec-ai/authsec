@@ -13,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -22,7 +23,6 @@ import (
 // SCIMAdminController handles SCIM 2.0 provisioning endpoints for admin users (master DB)
 type SCIMAdminController struct {
 	adminUserRepo *database.AdminUserRepository
-	workspaceRepo    *database.WorkspaceRepository
 }
 
 // NewSCIMAdminController creates a new SCIM admin controller
@@ -34,7 +34,6 @@ func NewSCIMAdminController() (*SCIMAdminController, error) {
 
 	return &SCIMAdminController{
 		adminUserRepo: database.NewAdminUserRepository(db),
-		workspaceRepo:    database.NewWorkspaceRepository(db),
 	}, nil
 }
 
@@ -55,7 +54,7 @@ func scimAdminBaseURL(c *gin.Context) string {
 func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	workspaceID, err := shared.RequireWorkspaceID(c)
+	_, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -79,23 +78,19 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 		return
 	}
 
-	workspaceUUID, err := uuid.Parse(workspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", "Invalid tenant ID", "invalidValue"))
-		return
-	}
-
-	// Build query with filter
-	query := "SELECT COUNT(*) FROM users WHERE workspace_id = $1"
+	// Build query with filter. $1 is the workspace (bound by the scoped
+	// layer); the filter's own arguments start at $2.
+	query := `SELECT COUNT(*) FROM users
+		WHERE workspace_id = $1`
 	filterClause, filterArgs := buildAdminUserFilterClause(filter)
-	args := []interface{}{workspaceUUID}
+	args := []interface{}{}
 	if filterClause != "" {
 		query += " AND " + filterClause
 		args = append(args, filterArgs...)
 	}
 
 	var totalResults int
-	if err := db.DB.QueryRow(query, args...).Scan(&totalResults); err != nil {
+	if err := tenancy.QueryRow(c, db.DB, query, args, &totalResults); err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to count users", ""))
 		return
 	}
@@ -108,10 +103,10 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 	if filterClause != "" {
 		selectQuery += " AND " + filterClause
 	}
-	selectQuery += " ORDER BY created_at ASC LIMIT $" + strconv.Itoa(len(args)+1) + " OFFSET $" + strconv.Itoa(len(args)+2)
+	selectQuery += " ORDER BY created_at ASC LIMIT $" + strconv.Itoa(len(args)+2) + " OFFSET $" + strconv.Itoa(len(args)+3)
 	args = append(args, count, startIndex-1)
 
-	rows, err := db.DB.Query(selectQuery, args...)
+	rows, err := tenancy.Query(c, db.DB, selectQuery, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to fetch users", ""))
 		return
@@ -149,7 +144,7 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 func (sac *SCIMAdminController) GetAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	workspaceID, err := shared.RequireWorkspaceID(c)
+	_, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -162,15 +157,13 @@ func (sac *SCIMAdminController) GetAdminUser(c *gin.Context) {
 		return
 	}
 
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Database not initialized", ""))
 		return
 	}
 
-	user, err := sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	user, err := sac.fetchAdminUser(c, db, userUUID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 		return
@@ -201,17 +194,19 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 	}
 
 	email := input.GetPrimaryEmail()
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Database not initialized", ""))
 		return
 	}
 
-	// Check if user already exists
+	workspaceUUID, _ := uuid.Parse(workspaceID)
+
+	// Check if user already exists in this workspace
 	var existingCount int
-	db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER($1) AND workspace_id = $2", email, workspaceUUID).Scan(&existingCount)
+	_ = tenancy.QueryRow(c, db.DB, `
+		SELECT COUNT(*) FROM users
+		WHERE workspace_id = $1 AND LOWER(email) = LOWER($2)`, []interface{}{email}, &existingCount)
 	if existingCount > 0 {
 		c.JSON(http.StatusConflict, models.NewSCIMError("409", "User with this email already exists", "uniqueness"))
 		return
@@ -251,18 +246,6 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 		return
 	}
 
-	// Create tenant record for this admin user (same pattern as AdminSyncController)
-	existingTenant, err := sac.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID)
-	if err == nil && existingTenant != nil {
-		adminSyncCtrl := &AdminSyncController{
-			adminUserRepo: sac.adminUserRepo,
-			workspaceRepo:    sac.workspaceRepo,
-		}
-		if err := adminSyncCtrl.createTenantForAdminUser(newUser, existingTenant); err != nil {
-			log.Printf("SCIM Admin: Warning - failed to create tenant record for %s: %v", email, err)
-		}
-	}
-
 	log.Printf("SCIM Admin: Created user %s (tenant: %s)", email, workspaceID)
 
 	middlewares.Audit(c, "scim_admin", workspaceID, "create_user", &middlewares.AuditChanges{
@@ -293,8 +276,6 @@ func (sac *SCIMAdminController) ReplaceAdminUser(c *gin.Context) {
 		return
 	}
 
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Database not initialized", ""))
@@ -302,7 +283,7 @@ func (sac *SCIMAdminController) ReplaceAdminUser(c *gin.Context) {
 	}
 
 	// Verify user exists
-	user, err := sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	user, err := sac.fetchAdminUser(c, db, userUUID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 		return
@@ -335,13 +316,13 @@ func (sac *SCIMAdminController) ReplaceAdminUser(c *gin.Context) {
 		"last_sync_at":  &now,
 	}
 
-	if err := sac.adminUserRepo.UpdateAdminUser(user.ID, updates); err != nil {
+	if err := sac.adminUserRepo.UpdateAdminUserInWorkspace(c.Request.Context(), user.ID, updates); err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to update user", ""))
 		return
 	}
 
 	// Re-fetch
-	updatedUser, _ := sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	updatedUser, _ := sac.fetchAdminUser(c, db, userUUID)
 
 	middlewares.Audit(c, "scim_admin", workspaceID, "replace_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
@@ -370,15 +351,13 @@ func (sac *SCIMAdminController) PatchAdminUser(c *gin.Context) {
 		return
 	}
 
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Database not initialized", ""))
 		return
 	}
 
-	user, err := sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	user, err := sac.fetchAdminUser(c, db, userUUID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 		return
@@ -405,13 +384,13 @@ func (sac *SCIMAdminController) PatchAdminUser(c *gin.Context) {
 		}
 	}
 
-	if err := sac.adminUserRepo.UpdateAdminUser(user.ID, updates); err != nil {
+	if err := sac.adminUserRepo.UpdateAdminUserInWorkspace(c.Request.Context(), user.ID, updates); err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to patch user", ""))
 		return
 	}
 
 	// Re-fetch
-	updatedUser, _ := sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	updatedUser, _ := sac.fetchAdminUser(c, db, userUUID)
 
 	middlewares.Audit(c, "scim_admin", workspaceID, "patch_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
@@ -440,8 +419,6 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 		return
 	}
 
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Database not initialized", ""))
@@ -449,14 +426,16 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	// Verify user exists and belongs to tenant
-	_, err = sac.fetchAdminUser(db, userUUID, workspaceUUID)
+	_, err = sac.fetchAdminUser(c, db, userUUID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 		return
 	}
 
 	// Delete the user
-	_, err = db.DB.Exec("DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, workspaceUUID)
+	_, err = tenancy.Exec(c, db.DB, `
+		DELETE FROM users
+		WHERE workspace_id = $1 AND id = $2`, userUUID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
@@ -475,22 +454,24 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 // Helper functions
 // ──────────────────────────────────────────────
 
-// fetchAdminUser retrieves an admin user by ID and tenant
-func (sac *SCIMAdminController) fetchAdminUser(db *database.DBConnection, userID, workspaceID uuid.UUID) (*models.AdminUser, error) {
+// fetchAdminUser retrieves a user of the request's workspace by ID. Another
+// workspace's user is tenancy.ErrNotFound.
+func (sac *SCIMAdminController) fetchAdminUser(c *gin.Context, db *database.DBConnection, userID uuid.UUID) (*models.AdminUser, error) {
 	query := `SELECT id, email, COALESCE(username, ''), COALESCE(name, ''),
 		active, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 		COALESCE(provider, ''), COALESCE(provider_id, ''),
-		created_at, updated_at
-		FROM users WHERE id = $1 AND workspace_id = $2`
+		created_at, updated_at, workspace_id
+		FROM users WHERE workspace_id = $1 AND id = $2`
 
 	var user models.AdminUser
 	var username, name, externalID, syncSource, provider, providerID sql.NullString
+	var workspaceID uuid.UUID
 
-	err := db.DB.QueryRow(query, userID, workspaceID).Scan(
+	err := tenancy.QueryRow(c, db.DB, query, []interface{}{userID},
 		&user.ID, &user.Email, &username, &name,
 		&user.Active, &externalID, &syncSource,
 		&provider, &providerID,
-		&user.CreatedAt, &user.UpdatedAt,
+		&user.CreatedAt, &user.UpdatedAt, &workspaceID,
 	)
 	if err != nil {
 		return nil, err

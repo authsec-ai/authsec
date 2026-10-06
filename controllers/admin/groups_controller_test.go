@@ -12,12 +12,14 @@ import (
 	"testing"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // Mock database for testing
@@ -90,6 +92,24 @@ func ensureControllerDB(t *testing.T) {
 	require.NotNil(t, config.DB, "GORM DB should be initialized")
 }
 
+// withTenant sets the tenant context AuthMiddleware sets for a verified token.
+func withTenant(c *gin.Context, workspaceID string) {
+	if ws, err := uuid.Parse(workspaceID); err == nil {
+		tenancy.Set(c, tenancy.Context{WorkspaceID: ws})
+	}
+}
+
+// scopedTestDB returns config.DB restricted to the workspace.
+func scopedTestDB(t *testing.T, workspaceID string) *gorm.DB {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/", nil)
+	withTenant(c, workspaceID)
+	db, err := tenancy.DB(c, config.DB)
+	require.NoError(t, err)
+	return db
+}
+
 func skipIfNoSeed(t *testing.T) {
 	t.Helper()
 	if seededWorkspaceID == uuid.Nil {
@@ -126,12 +146,12 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 		{
 			name:  "invalid request payload",
 			input: models.UserDefinedGroupsRequest{
-				// Missing required fields — controller binds to GroupRequest;
-				// json.RawMessage with null passes required, so only WorkspaceID fails
+				// No groups: workspace_id is no longer read from the body
+				// (the token's workspace is used), so the groups check fails.
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "Invalid request payload: Key: 'GroupRequest.WorkspaceID' Error:Field validation for 'WorkspaceID' failed on the 'required' tag",
+				"error": "At least one group is required",
 			},
 			setupMocks: func() {},
 		},
@@ -155,7 +175,7 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody: map[string]interface{}{
-				"error": "Failed to add groups: database connection not available",
+				"error": "database connection not available",
 			},
 			setupMocks: func() {},
 		},
@@ -179,6 +199,7 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			c.Request = req
+			withTenant(c, workspaceID)
 			controller.AddUserDefinedGroups(c)
 
 			assert.Equal(t, tt.expectedStatus, w.Code)
@@ -235,7 +256,7 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   map[string]interface{}{"error": "Failed to map groups to client: database connection not available"},
+			expectedBody:   map[string]interface{}{"error": "database connection not available"},
 			setupMocks:     func() {},
 		},
 	}
@@ -258,6 +279,7 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			c.Request = req
+			withTenant(c, workspaceID)
 			controller.MapGroupsToClient(c)
 
 			assert.Equal(t, tt.expectedStatus, w.Code)
@@ -320,7 +342,7 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   map[string]interface{}{"error": "Failed to remove groups from client: database connection not available"},
+			expectedBody:   map[string]interface{}{"error": "database connection not available"},
 			setupMocks: func() {
 			},
 		},
@@ -343,6 +365,7 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			c.Request = req
+			withTenant(c, workspaceID)
 
 			controller.RemoveGroupsFromClient(c)
 
@@ -390,14 +413,14 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 			name:           "missing tenant ID",
 			workspaceID:       "",
 			expectedStatus: http.StatusUnauthorized,
-			expectedBody:   map[string]interface{}{"error": "Tenant ID not found in authentication token"},
+			expectedBody:   map[string]interface{}{"error": "workspace context required"},
 			setTenant:      false,
 		},
 		{
 			name:           "database error",
 			workspaceID:       workspaceID,
 			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   map[string]interface{}{"error": "Failed to fetch groups: database connection not available"},
+			expectedBody:   map[string]interface{}{"error": "database connection not available"},
 			setTenant:      true,
 			tamperDB:       true,
 		},
@@ -408,10 +431,6 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 
-			if tt.setTenant && tt.workspaceID != "" {
-				c.Set("workspace_id", tt.workspaceID)
-			}
-
 			origDB := config.DB
 			if tt.tamperDB {
 				config.DB = nil
@@ -420,6 +439,9 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 
 			req := httptest.NewRequest("GET", "/uflow/groups/"+tt.workspaceID, nil)
 			c.Request = req
+			if tt.setTenant && tt.workspaceID != "" {
+				withTenant(c, tt.workspaceID)
+			}
 
 			controller.GetUserDefinedGroups(c)
 
@@ -452,23 +474,23 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		tamperDB       bool
 	}{
 		{
-			name: "successful group deletion",
+			name: "unknown group is not found",
 			input: models.DeleteGroupsRequest{
 				WorkspaceID: workspaceID,
 				Groups:      []string{uuid.New().String()},
 			},
-			expectedStatus: http.StatusOK,
-			expectedBody:   map[string]interface{}{"message": "Groups deleted successfully"},
+			expectedStatus: http.StatusNotFound,
+			expectedBody:   map[string]interface{}{"error": "Group not found"},
 			setTenant:      true,
 		},
 		{
-			name: "successful group deletion - single group",
+			name: "group names are rejected",
 			input: models.DeleteGroupsRequest{
 				WorkspaceID: workspaceID,
-				Groups:      []string{uuid.New().String()},
+				Groups:      []string{"GroupToDelete"},
 			},
-			expectedStatus: http.StatusOK,
-			expectedBody:   map[string]interface{}{"message": "Groups deleted successfully"},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   map[string]interface{}{"error": "group ids must be UUIDs"},
 			setTenant:      true,
 		},
 		{
@@ -477,7 +499,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 				Groups: []string{"GroupToDelete"},
 			},
 			expectedStatus: http.StatusUnauthorized,
-			expectedBody:   map[string]interface{}{"error": "workspace_id not found in authentication token"},
+			expectedBody:   map[string]interface{}{"error": "workspace context required"},
 			setTenant:      false,
 		},
 		{
@@ -497,7 +519,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 				Groups:      []string{"GroupToDelete"},
 			},
 			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   map[string]interface{}{"error": "Failed to delete groups: database connection not available"},
+			expectedBody:   map[string]interface{}{"error": "database connection not available"},
 			setTenant:      true,
 			tamperDB:       true,
 		},
@@ -507,10 +529,6 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-
-			if tt.setTenant && workspaceID != "" {
-				c.Set("workspace_id", workspaceID)
-			}
 
 			if tt.input.WorkspaceID == "" && tt.setTenant && workspaceID != "" {
 				tt.input.WorkspaceID = workspaceID
@@ -525,6 +543,9 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 			jsonData, _ := json.Marshal(tt.input)
 			c.Request = httptest.NewRequest("DELETE", "/uflow/groups", bytes.NewBuffer(jsonData))
 			c.Request.Header.Set("Content-Type", "application/json")
+			if tt.setTenant {
+				withTenant(c, workspaceID)
+			}
 
 			controller.DeleteUserDefinedGroups(c)
 
@@ -568,27 +589,13 @@ func TestAddUserDefinedGroups(t *testing.T) {
 			wantErr:    false,
 			setupMocks: func() {},
 		},
-		{
-			name:     "database error",
-			workspaceID: workspaceID,
-			groups:   []string{"TestGroup"},
-			wantErr:  true,
-			setupMocks: func() {
-			},
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			origDB := config.DB
-			if tt.name == "database error" {
-				config.DB = nil
-			}
-			defer func() { config.DB = origDB }()
-
-			_, err := AddUserDefinedGroups(tt.workspaceID, tt.groups)
+			_, err := AddUserDefinedGroups(scopedTestDB(t, tt.workspaceID), uuid.MustParse(tt.workspaceID), tt.groups)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -644,7 +651,7 @@ func TestMapGroupsToClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			err := MapGroupsToClient(tt.workspaceID, tt.clientID, tt.groups)
+			err := MapGroupsToClient(scopedTestDB(t, tt.workspaceID), uuid.MustParse(tt.workspaceID), tt.clientID, tt.groups)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -672,26 +679,13 @@ func TestGetUserDefinedGroups(t *testing.T) {
 			wantErr:    false,
 			setupMocks: func() {},
 		},
-		{
-			name:       "database error",
-			workspaceID:   workspaceID,
-			wantErr:    true,
-			tamperDB:   true,
-			setupMocks: func() {},
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			origDB := config.DB
-			if tt.tamperDB {
-				config.DB = nil
-			}
-			defer func() { config.DB = origDB }()
-
-			groups, err := GetUserDefinedGroups(tt.workspaceID)
+			groups, err := GetUserDefinedGroups(scopedTestDB(t, tt.workspaceID))
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -738,27 +732,17 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 			wantErr:    false,
 			setupMocks: func() {},
 		},
-		{
-			name:       "database error",
-			workspaceID:   workspaceID,
-			groups:     []string{"GroupToDelete"},
-			wantErr:    true,
-			tamperDB:   true,
-			setupMocks: func() {},
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			origDB := config.DB
-			if tt.tamperDB {
-				config.DB = nil
+			ids := make([]uuid.UUID, 0, len(tt.groups))
+			for _, g := range tt.groups {
+				ids = append(ids, uuid.MustParse(g))
 			}
-			defer func() { config.DB = origDB }()
-
-			err := DeleteUserDefinedGroups(tt.workspaceID, tt.groups)
+			_, err := DeleteUserDefinedGroups(scopedTestDB(t, tt.workspaceID), ids)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

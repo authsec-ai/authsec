@@ -8075,3 +8075,22 @@ DROP TRIGGER IF EXISTS trg_audit_events_immutable ON public.audit_events;
 CREATE TRIGGER trg_audit_events_immutable
     BEFORE UPDATE ON public.audit_events
     FOR EACH ROW EXECUTE FUNCTION public.audit_events_immutable();
+
+-- ---------------------------------------------------------------------------
+-- users:delete in the global permission catalog (052). Kept identical to
+-- migrations/master/052_users_delete_permission.sql.
+-- ---------------------------------------------------------------------------
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES (gen_random_uuid(), NULL, 'users', 'delete', 'Delete a user of the workspace', 'users:delete', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+INSERT INTO public.role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM public.roles r
+CROSS JOIN public.permissions p
+WHERE r.name = 'admin'
+  AND r.workspace_id IS NOT NULL
+  AND p.workspace_id IS NULL
+  AND p.resource = 'users'
+  AND p.action = 'delete'
+ON CONFLICT (role_id, permission_id) DO NOTHING;

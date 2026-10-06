@@ -13,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -39,6 +40,23 @@ var (
 
 type EndUserController struct{}
 
+// endUserScope returns the request's tenant context and the tenant database
+// restricted to its workspace (ADR-0001 §4.3), answering 401 itself when the
+// request carries no tenant.
+func endUserScope(c *gin.Context) (tenancy.Context, *gorm.DB, bool) {
+	tc, err := tenancy.From(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return tenancy.Context{}, nil, false
+	}
+	db, err := tenancy.DB(c, tenantConnectionProvider())
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return tenancy.Context{}, nil, false
+	}
+	return tc, db, true
+}
+
 // RegisterEndUser godoc
 // RegisterClient — deleted in Phase G (final workspace_id sweep, 2026-05-31).
 // Was an unrouted legacy handler that queried the dropped `clients` and
@@ -61,7 +79,7 @@ type EndUserController struct{}
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id} [get]
 type GetEndUsersFilter struct {
-	WorkspaceID string `json:"workspace_id" binding:"required" validate:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	Page        int    `json:"page,omitempty"`
 	Limit       int    `json:"limit,omitempty"`
 	Active      *bool  `json:"active,omitempty"`
@@ -72,11 +90,6 @@ type GetEndUsersFilter struct {
 }
 
 func (euc *EndUserController) GetEndUser(c *gin.Context) {
-	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
 	userIdentifier := c.Param("user_id")
 
 	lookupByID, userUUID, _, emailIdentifier, parseErr := resolveEndUserLookup(userIdentifier, c.Query("client_id"))
@@ -85,46 +98,30 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		return
 	}
 
-	// Connect to tenant database
 	if config.DB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	workspaceUUID, err := uuid.Parse(workspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
+	// The workspace comes from the token; another workspace's user does not
+	// exist here (404).
+	_, tenantDB, ok := endUserScope(c)
+	if !ok {
 		return
 	}
 
-	tenantDB := config.DB
-
-	// Fetch user with all associations. Single-DB collapse means tenant
-	// isolation must come from explicit row-level predicates.
 	var user models.User
+	q := tenantDB.Preload("Groups").Where("deleted_at IS NULL")
 	if lookupByID {
-		if err := tenantDB.Preload("Groups").
-			Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceUUID).First(&user).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
-			return
-		}
+		q = q.Where("id = ?", userUUID)
 	} else {
-		if err := tenantDB.Preload("Groups").
-			Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL", workspaceUUID, emailIdentifier).First(&user).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		q = q.Where("LOWER(email) = LOWER(?)", emailIdentifier)
+	}
+	if err := q.First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 			return
 		}
-	}
-
-	if user.WorkspaceID != uuid.Nil && !strings.EqualFold(user.WorkspaceID.String(), workspaceID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "user does not belong to tenant"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
 		return
 	}
 
@@ -221,31 +218,18 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 
 	offset := (filter.Page - 1) * filter.Limit
 
-	// Determine tenant identifier: prefer request filter, fall back to authenticated context
-	tenantIdentifier := filter.WorkspaceID
-	if tenantIdentifier == "" {
-		if tenantVal, exists := c.Get("workspace_id"); exists {
-			if tenantStr, ok := tenantVal.(string); ok && tenantStr != "" {
-				tenantIdentifier = tenantStr
-			}
-		}
-	}
-	if tenantIdentifier == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
-		return
-	}
-	filter.WorkspaceID = tenantIdentifier
-
-	// Connect to tenant database
 	if config.DB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database connection not available"})
 		return
 	}
-	tenantDB := config.DB
+	// The workspace comes from the token; a body workspace_id is ignored.
+	_, tenantDB, ok := endUserScope(c)
+	if !ok {
+		return
+	}
 
-	// Build query - no base tenant filter needed since we're in tenant-specific DB.
 	// Exclude soft-deleted users from all listings.
-	query := tenantDB.Model(&models.User{}).Where("workspace_id = ? AND deleted_at IS NULL", filter.WorkspaceID)
+	query := tenantDB.Model(&models.User{}).Where("deleted_at IS NULL")
 
 	// Apply filters
 	if filter.Active != nil {
@@ -314,11 +298,6 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id}/status [put]
 func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
-	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
 	userID := c.Param("user_id")
 
 	var input models.UpdateEndUserStatusInput
@@ -333,15 +312,18 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 		return
 	}
 
-	// Connect to tenant database
 	if config.DB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB := config.DB
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
+		return
+	}
+	workspaceID := tc.WorkspaceID.String()
 
-	// Update user status
-	result := tenantDB.Model(&models.User{}).Where("id = ? AND workspace_id = ?", userUUID, workspaceID).
+	// Update user status; another workspace's user is not found (404).
+	result := tenantDB.Model(&models.User{}).Where("id = ?", userUUID).
 		Updates(map[string]interface{}{
 			"active":     input.Active,
 			"updated_at": time.Now(),
@@ -390,11 +372,6 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id} [put]
 func (euc *EndUserController) UpdateUser(c *gin.Context) {
-	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
 	userID := c.Param("user_id")
 
 	var input models.UpdateUserRequest
@@ -409,12 +386,15 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// Connect to tenant database
 	if config.DB == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB := config.DB
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
+		return
+	}
+	workspaceID := tc.WorkspaceID.String()
 
 	// Prepare update data
 	updateData := make(map[string]interface{})
@@ -436,8 +416,8 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 		updateData["workspace_domain"] = *input.WorkspaceDomain
 	}
 
-	// Update user
-	result := tenantDB.Model(&models.User{}).Where("id = ? AND workspace_id = ?", userUUID, workspaceID).
+	// Update user; another workspace's user is not found (404).
+	result := tenantDB.Model(&models.User{}).Where("id = ?", userUUID).
 		Updates(updateData)
 
 	if result.Error != nil {
@@ -452,7 +432,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 	// Fetch updated user
 	var updatedUser models.User
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&updatedUser).Error; err != nil {
+	if err := tenantDB.Where("id = ?", userUUID).First(&updatedUser).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch updated user"})
 		return
 	}
@@ -503,158 +483,79 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 // @Router /authsec/uflow/user/enduser/delete [post]
 
 func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
-
-	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
-
-	if !ok {
-
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-
-		return
-
-	}
-
 	userID := c.Param("user_id")
-
 	jsonData := make(map[string]string)
-
 	if userID == "" {
-
 		if err := c.ShouldBindJSON(&jsonData); err != nil {
-
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON format: " + err.Error()})
-
 			return
-
 		}
-
-		if userID == "" {
-
-			userID = jsonData["user_id"]
-
-		}
-
+		userID = jsonData["user_id"]
 	}
-
 	if userID == "" {
-
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
-
 		return
-
-	}
-
-	userInfo := middlewares.GetUserInfo(c)
-
-	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
-
-		c.JSON(http.StatusForbidden, gin.H{"error": "tenant scope is required"})
-
-		return
-
-	}
-
-	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), workspaceID) {
-
-		c.JSON(http.StatusForbidden, gin.H{"error": "cross-tenant deletion is not allowed"})
-
-		return
-
 	}
 
 	if config.DB == nil {
-
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-
 		return
-
 	}
-
-	workspaceUUID, err := uuid.Parse(workspaceID)
-
-	if err != nil {
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
-
+	// The workspace comes from the tenant context set by AuthMiddleware. This
+	// read user_info, which nothing sets, so it always answered 403 (AS-048).
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
 		return
-
 	}
-
-	tenantDB := tenantConnectionProvider()
+	workspaceID := tc.WorkspaceID.String()
 
 	userUUID, err := uuid.Parse(userID)
-
 	if err != nil {
-
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id format"})
-
 		return
-
 	}
 
-	if others, err := countOtherActiveEndUsers(tenantDB, workspaceUUID, userUUID); err != nil {
-
+	if others, err := countOtherActiveEndUsers(tenantDB, userUUID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify active users"})
-
 		return
-
 	} else if others == 0 {
-
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot deactivate the last active user in this tenant"})
-
 		return
-
 	}
 
-	rowsAffected, err := updateUserActiveStatus(tenantDB, workspaceUUID, userUUID, false)
-
+	rowsAffected, err := updateUserActiveStatus(tenantDB, userUUID, false)
 	if err != nil {
-
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to disable user"})
-
 		return
-
 	}
-
-	// Check if a user was actually found and disabled.
-
+	// Another workspace's user is not found (404).
 	if rowsAffected == 0 {
-
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-
 		return
-
 	}
 
 	// Audit log: End user deleted (soft delete)
-
 	middlewares.Audit(c, "enduser", userID, "delete", &middlewares.AuditChanges{
-
 		Before: map[string]interface{}{
-
-			"user_id": userID,
-
+			"user_id":      userID,
 			"workspace_id": workspaceID,
-
-			"active": true,
+			"active":       true,
 		},
-
 		After: map[string]interface{}{
-
 			"active": false,
 		},
 	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
-
 }
 
 // DeleteUserAllRequest is the request body for hard delete
 
+// The user comes from the :user_id path parameter when present; workspace_id
+// is ignored (the token's workspace is used).
 type DeleteUserAllRequest struct {
-	WorkspaceID string `json:"workspace_id" binding:"required"`
-
-	UserID string `json:"user_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"`
+	UserID      string `json:"user_id"`
 }
 
 // DeleteUserAll godoc
@@ -686,324 +587,151 @@ type DeleteUserAllRequest struct {
 // @Router /authsec/uflow/user/enduser/delete_all [post]
 
 func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
-
 	var req DeleteUserAllRequest
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
-
-		return
-
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+			return
+		}
 	}
 
-	workspaceID := strings.TrimSpace(req.WorkspaceID)
-
-	userID := strings.TrimSpace(req.UserID)
-
-	if workspaceID == "" || userID == "" {
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and user_id are required"})
-
-		return
-
+	userID := strings.TrimSpace(c.Param("user_id"))
+	if userID == "" {
+		userID = strings.TrimSpace(req.UserID)
 	}
-
-	// Verify caller's tenant matches target tenant
-
-	userInfo := middlewares.GetUserInfo(c)
-
-	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
-
-		c.JSON(http.StatusForbidden, gin.H{"error": "tenant scope is required"})
-
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
 		return
-
-	}
-
-	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), workspaceID) {
-
-		c.JSON(http.StatusForbidden, gin.H{"error": "cross-tenant deletion is not allowed"})
-
-		return
-
-	}
-
-	workspaceUUID, err := uuid.Parse(workspaceID)
-
-	if err != nil {
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
-
-		return
-
 	}
 
 	userUUID, err := uuid.Parse(userID)
-
 	if err != nil {
-
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id format"})
-
 		return
-
 	}
 
 	if config.DB == nil {
-
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-
 		return
-
 	}
 
-	tenantDB := tenantConnectionProvider()
-
-	// Use fresh session to avoid stale transaction states
-
-	freshDB := tenantDB.Session(&gorm.Session{NewDB: true})
-
-	// Verify user exists
-
-	var user models.User
-
-	if err := freshDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
-
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-
-			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-
-			return
-
-		}
-
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch user: " + err.Error()})
-
+	// The workspace comes from the tenant context (AS-048: this read
+	// user_info, which nothing sets, so it always answered 403).
+	tc, scopedDB, ok := endUserScope(c)
+	if !ok {
 		return
+	}
+	workspaceUUID := tc.WorkspaceID
+	workspaceID := workspaceUUID.String()
 
+	// Verify the user exists in this workspace; another workspace's is 404.
+	var user models.User
+	if err := scopedDB.Where("id = ?", userUUID).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch user: " + err.Error()})
+		return
 	}
 
 	// Check if this is the last active user
-
-	others, err := countOtherActiveEndUsers(freshDB, workspaceUUID, userUUID)
-
+	others, err := countOtherActiveEndUsers(scopedDB, userUUID)
 	if err != nil {
-
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify active users"})
-
 		return
-
 	}
-
 	if others == 0 {
-
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete the last active user in this tenant"})
-
 		return
-
 	}
 
 	log.Printf("INFO: Hard deleting user %s and all related data for tenant %s", userUUID, workspaceUUID)
 
-	// Delete all related data in a transaction
-
+	// Every delete is restricted to the caller's workspace.
 	deletedCounts := make(map[string]int64)
-
-	err = freshDB.Transaction(func(tx *gorm.DB) error {
-
-		// 1. Delete role_bindings
-
-		result := tx.Where("user_id = ? AND workspace_id = ?", userUUID, workspaceUUID).Delete(&models.RoleBinding{})
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete role_bindings: %w", result.Error)
-
+	err = scopedDB.Transaction(func(tx *gorm.DB) error {
+		for _, table := range []string{"role_bindings", "totp_secrets", "totp_backup_codes", "ciba_auth_requests", "voice_identity_links", "user_groups"} {
+			result := tx.Table(table).Where("workspace_id = ? AND user_id = ?", workspaceUUID, userUUID).Delete(map[string]interface{}{})
+			if result.Error != nil {
+				return fmt.Errorf("failed to delete %s: %w", table, result.Error)
+			}
+			deletedCounts[table] = result.RowsAffected
 		}
-
-		deletedCounts["role_bindings"] = result.RowsAffected
-
-		// 2. Delete totp_secrets (MFA devices)
-
-		result = tx.Exec("DELETE FROM totp_secrets WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
+		result := tx.Where("workspace_id = ? AND id = ?", workspaceUUID, userUUID).Delete(&models.User{})
 		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete totp_secrets: %w", result.Error)
-
-		}
-
-		deletedCounts["totp_secrets"] = result.RowsAffected
-
-		// 3. Delete totp_backup_codes
-
-		result = tx.Exec("DELETE FROM totp_backup_codes WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete totp_backup_codes: %w", result.Error)
-
-		}
-
-		deletedCounts["totp_backup_codes"] = result.RowsAffected
-
-		// 4. Delete ciba_auth_requests
-
-		result = tx.Exec("DELETE FROM ciba_auth_requests WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete ciba_auth_requests: %w", result.Error)
-
-		}
-
-		deletedCounts["ciba_auth_requests"] = result.RowsAffected
-
-		// 5. Delete voice_identity_links
-
-		result = tx.Exec("DELETE FROM voice_identity_links WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete voice_identity_links: %w", result.Error)
-
-		}
-
-		deletedCounts["voice_identity_links"] = result.RowsAffected
-
-		// 6. Delete user_groups
-
-		result = tx.Exec("DELETE FROM user_groups WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete user_groups: %w", result.Error)
-
-		}
-
-		deletedCounts["user_groups"] = result.RowsAffected
-
-		// 7. Finally, delete the user
-
-		result = tx.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).Delete(&models.User{})
-
-		if result.Error != nil {
-
 			return fmt.Errorf("failed to delete user: %w", result.Error)
-
 		}
-
 		deletedCounts["users"] = result.RowsAffected
-
 		return nil
-
 	})
-
 	if err != nil {
-
 		log.Printf("ERROR: Failed to hard delete user %s: %v", userUUID, err)
-
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user: " + err.Error()})
-
 		return
-
 	}
 
 	log.Printf("INFO: Successfully hard deleted user %s with counts: %+v", userUUID, deletedCounts)
 
 	// Audit log: End user hard deleted
-
 	middlewares.Audit(c, "enduser", userID, "delete_all", &middlewares.AuditChanges{
-
 		Before: map[string]interface{}{
-
-			"user_id": userID,
-
+			"user_id":      userID,
 			"workspace_id": workspaceID,
-
-			"email": user.Email,
-
-			"username": user.Username,
+			"email":        user.Email,
+			"username":     user.Username,
 		},
-
 		After: map[string]interface{}{
-
-			"deleted": true,
-
+			"deleted":        true,
 			"deleted_counts": deletedCounts,
 		},
 	})
 
 	c.JSON(http.StatusOK, gin.H{
-
-		"message": "User and all related data deleted successfully",
-
-		"user_id": userID,
-
+		"message":        "User and all related data deleted successfully",
+		"user_id":        userID,
 		"deleted_counts": deletedCounts,
 	})
-
 }
 
 type toggleEndUserActiveRequest struct {
-	WorkspaceID string               `json:"workspace_id" binding:"required"`
+	WorkspaceID string               `json:"workspace_id"` // ignored: the token's workspace is used
 	UserID      string               `json:"user_id" binding:"required"`
 	Active      *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
-func countOtherActiveEndUsers(db *gorm.DB, workspaceID uuid.UUID, excludeUser uuid.UUID) (int64, error) {
+func countOtherActiveEndUsers(db *gorm.DB, excludeUser uuid.UUID) (int64, error) {
 	if db == nil {
 		return 0, fmt.Errorf("tenant database connection not available")
 	}
 
 	var count int64
 	if err := db.Model(&models.User{}).
-		Where("workspace_id = ? AND id <> ? AND active = ?", workspaceID, excludeUser, true).
+		Where("id <> ? AND active = ?", excludeUser, true).
 		Count(&count).Error; err != nil {
 		return 0, err
 	}
+
 	return count, nil
 }
 
 func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 	var req toggleEndUserActiveRequest
-
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
 		return
 	}
 
-	workspaceID := strings.TrimSpace(req.WorkspaceID)
 	userID := strings.TrimSpace(req.UserID)
-	if workspaceID == "" || userID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and user_id are required"})
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
 		return
 	}
-
-	// Verify the caller's workspace (from the JWT) matches the target workspace.
-	// Without this, a workspace-A admin could toggle a user in workspace B.
-	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "workspace scope is required"})
-		return
-	}
-	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), workspaceID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "cross-workspace operation is not allowed"})
-		return
-	}
-
 	if req.Active == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "active field is required"})
 		return
 	}
-
 	active := req.Active.Bool()
-
-	workspaceUUID, err := uuid.Parse(workspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
-		return
-	}
 
 	userUUID, err := uuid.Parse(userID)
 	if err != nil {
@@ -1016,10 +744,17 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB := tenantConnectionProvider()
+	// The caller's workspace comes from the tenant context (AS-048: this
+	// read user_info, which nothing sets, so it always answered 403). A user
+	// of another workspace is not found here (404).
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
+		return
+	}
+	workspaceID := tc.WorkspaceID.String()
 
 	if !active {
-		others, err := countOtherActiveEndUsers(tenantDB, workspaceUUID, userUUID)
+		others, err := countOtherActiveEndUsers(tenantDB, userUUID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify active users"})
 			return
@@ -1030,13 +765,11 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 		}
 	}
 
-	rowsAffected, err := updateUserActiveStatus(tenantDB, workspaceUUID, userUUID, active)
+	rowsAffected, err := updateUserActiveStatus(tenantDB, userUUID, active)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user status"})
 		return
 	}
-
-	// Check if a user was actually found and deleted.
 	if rowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
@@ -1060,18 +793,17 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 
 // Private helper methods
 
-func updateUserActiveStatus(db *gorm.DB, workspaceID uuid.UUID, userID uuid.UUID, active bool) (int64, error) {
+func updateUserActiveStatus(db *gorm.DB, userID uuid.UUID, active bool) (int64, error) {
 	if db == nil {
 		return 0, fmt.Errorf("tenant database connection not available")
 	}
 
 	result := db.Table("users").
-		Where("id = ? AND workspace_id = ?", userID, workspaceID).
+		Where("id = ?", userID).
 		Updates(map[string]interface{}{
 			"active":     active,
 			"updated_at": timeNow(),
 		})
-
 	return result.RowsAffected, result.Error
 }
 
@@ -2062,20 +1794,16 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 		return
 	}
 
-	// Parse tenant ID
-	workspaceUUID, err := uuid.Parse(input.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
+	// The workspace comes from the token; the body's workspace_id is ignored.
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
 		return
 	}
-	workspaceID := workspaceUUID.String()
+	workspaceID := tc.WorkspaceID.String()
 
-	// Get tenant database connection
-	tenantDB := config.DB
-
-	// Find the user in tenant database
+	// Find the user in this workspace; another workspace's user is 404.
 	var user models.User
-	query := tenantDB.Where("workspace_id = ? AND active = ?", workspaceID, true)
+	query := tenantDB.Where("active = ?", true)
 
 	// Search by email or user ID based on what's provided
 	if input.Email != "" {
@@ -2114,7 +1842,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 	}
 
 	// Update user password in tenant database
-	if err := tenantDB.Model(&user).Updates(map[string]interface{}{
+	if err := tenantDB.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]interface{}{
 		"password_hash": tempUser.PasswordHash,
 		"updated_at":    time.Now(),
 	}).Error; err != nil {
@@ -2169,20 +1897,16 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 		return
 	}
 
-	// Parse tenant ID
-	workspaceUUID, err := uuid.Parse(input.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
+	// The workspace comes from the token; the body's workspace_id is ignored.
+	tc, tenantDB, ok := endUserScope(c)
+	if !ok {
 		return
 	}
-	workspaceID := workspaceUUID.String()
+	workspaceID := tc.WorkspaceID.String()
 
-	// Get tenant database connection
-	tenantDB := config.DB
-
-	// Find the user in tenant database
+	// Find the user in this workspace; another workspace's user is 404.
 	var user models.User
-	query := tenantDB.Where("workspace_id = ? AND active = ?", workspaceID, true)
+	query := tenantDB.Where("active = ?", true)
 
 	if input.Email != "" {
 		query = query.Where("email = ? AND provider IN (?)", input.Email, []string{"custom", "ad_sync"})
@@ -2228,7 +1952,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 	}
 
 	// Update user password in tenant database
-	if err := tenantDB.Model(&user).Updates(map[string]interface{}{
+	if err := tenantDB.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]interface{}{
 		"password_hash": tempUser.PasswordHash,
 		"updated_at":    time.Now(),
 	}).Error; err != nil {

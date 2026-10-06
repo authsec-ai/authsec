@@ -10,6 +10,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -964,10 +965,18 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 	freshRBAC := services.NewRBACService(freshDB)
+	// Every referent of the binding is looked up through the scoped layer:
+	// another workspace's role, user, group, service account or resource
+	// server does not exist here (AS-062).
+	scoped, err := tenancy.DB(c, freshDB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
+	}
 
 	// Validate role exists for this workspace.
 	var role models.RBACRole
-	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
+	if err := scoped.Where("id = ?", roleID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found for tenant"})
 		return
 	}
@@ -985,6 +994,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			sid, err := uuid.Parse(req.Scope.ID)
 			if err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Scope ID format (must be UUID or '*' for tenant-wide)"})
+				return
+			}
+			if err := requireBindingScopeInWorkspace(scoped, sid); err != nil {
+				writeBindingLookupError(c, err, "Scope not found")
 				return
 			}
 			scopeID = &sid
@@ -1025,7 +1038,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		// Scope to the binding's workspace and exclude soft-deleted users so a
 		// role binding can't be created for a user outside this workspace.
 		var user models.User
-		if err := freshDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userID, workspaceID).First(&user).Error; err != nil {
+		if err := scoped.Where("id = ? AND deleted_at IS NULL", userID).First(&user).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
 		}
@@ -1040,6 +1053,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Group ID format"})
 			return
 		}
+		if err := requireInWorkspace(scoped, "groups", groupID); err != nil {
+			writeBindingLookupError(c, err, "Group not found")
+			return
+		}
 		binding.GroupID = &groupID
 		auditExtra["group_id"] = req.GroupID
 
@@ -1051,7 +1068,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		}
 		// Verify SA exists in this workspace.
 		var sa models.ServiceAccount
-		if err := freshDB.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
+		if err := scoped.Where("id = ?", saID).First(&sa).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Service account not found"})
 			return
 		}

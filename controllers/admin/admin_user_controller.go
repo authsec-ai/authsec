@@ -1,7 +1,7 @@
 package admin
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -29,14 +30,9 @@ type AdminUserController struct {
 	adminUserRepo *database.AdminUserRepository
 }
 
-var (
-	errTenantNotFound    = fmt.Errorf("tenant not found")
-	errWorkspaceDBNotSet = fmt.Errorf("tenant database not configured")
-)
-
 // TenantUserListRequest represents payload for listing tenant users
 type TenantUserListRequest struct {
-	WorkspaceID string `json:"workspace_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	Page        int    `json:"page"`
 	Limit       int    `json:"limit"`
 	ClientID    string `json:"client_id"`
@@ -78,12 +74,12 @@ func NewAdminUserController() (*AdminUserController, error) {
 func (auc *AdminUserController) ListTenants(c *gin.Context) {
 	// A workspace admin sees their own workspace only. This listed every
 	// workspace on the platform, with owner emails and password hashes (AS-009).
-	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
+	tc, err := tenancy.From(c)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
-	tenant, err := auc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID)
+	tenant, err := auc.workspaceRepo.GetWorkspaceByWorkspaceID(tc.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve tenants"})
 		return
@@ -118,22 +114,13 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		return
 	}
 
-	// Get workspace_id from validated JWT token
-	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		log.Printf("%s: workspace_id not found in authentication token", logPrefix)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
-		return
-	}
-	log.Printf("%s: resolved workspace_id from token: %s", logPrefix, workspaceIDStr)
-
-	workspaceUUID, err := uuid.Parse(workspaceIDStr)
+	tc, err := tenancy.From(c)
 	if err != nil {
-		log.Printf("%s: invalid workspace_id %q: %v", logPrefix, workspaceIDStr, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
-	log.Printf("%s: using workspace_id=%s", logPrefix, workspaceUUID)
+	workspaceUUID := tc.WorkspaceID
+	ctx := c.Request.Context()
 
 	if err := auc.adminUserRepo.EnsureTenantAdminRoleAssignment(workspaceUUID); err != nil {
 		log.Printf("%s: failed ensure tenant admin roles: %v", logPrefix, err)
@@ -161,7 +148,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		log.Printf("%s: filtering by status: %s", logPrefix, statusFilter)
 	}
 
-	users, err := auc.adminUserRepo.ListAdminUsersByTenantWithFilter(workspaceUUID, provider)
+	users, err := auc.adminUserRepo.ListAdminUsersInWorkspace(ctx, provider)
 	if err != nil {
 		log.Printf("%s: failed to retrieve admin users: %v", logPrefix, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve admin users"})
@@ -183,20 +170,16 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		}
 
 		// Fetch and add roles for this user
-		if user.WorkspaceID != nil {
-			roles, err := auc.adminUserRepo.GetUserRoles(user.ID, *user.WorkspaceID)
-			if err != nil {
-				log.Printf("%s: failed to get roles for user %s: %v", logPrefix, user.ID, err)
-				payload["roles"] = []interface{}{} // Return empty array on error
-			} else {
-				payload["roles"] = roles
-			}
+		roles, err := auc.adminUserRepo.GetUserRoles(user.ID, workspaceUUID)
+		if err != nil {
+			log.Printf("%s: failed to get roles for user %s: %v", logPrefix, user.ID, err)
+			payload["roles"] = []interface{}{} // Return empty array on error
 		} else {
-			payload["roles"] = []interface{}{}
+			payload["roles"] = roles
 		}
 
 		// Check for pending registration
-		hasPending, err := auc.adminUserRepo.HasPendingRegistration(user.Email)
+		hasPending, err := auc.adminUserRepo.HasPendingRegistrationInWorkspace(ctx, user.Email)
 		if err != nil {
 			log.Printf("%s: failed to check pending registration for user %s: %v", logPrefix, user.ID, err)
 			payload["pending_registration"] = false
@@ -272,37 +255,19 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 		return
 	}
 
-	// Pull workspace_id from the authenticated JWT — never trust the body.
-	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok || workspaceIDStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in token"})
-		return
-	}
-	workspaceUUID, err := uuid.Parse(workspaceIDStr)
+	// The workspace comes from the verified token, never the body.
+	tc, err := tenancy.From(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	ctx := c.Request.Context()
 
-	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", workspaceUUID).WithField("active", active)
+	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", tc.WorkspaceID).WithField("active", active)
 
-	// Fetch admin user
-	adminUser, err := auc.adminUserRepo.GetAdminUserByID(userUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrAdminUserNotFound) {
-			logger.Warn("Admin user not found")
-			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
-			return
-		}
-		logger.WithError(err).Error("Failed to fetch admin user")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load admin user"})
-		return
-	}
-
-	// Validate tenant ownership
-	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), workspaceUUID.String()) {
-		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
+	// Another workspace's user does not exist here: 404.
+	adminUser, ok := auc.loadAdminUser(c, userUUID)
+	if !ok {
 		return
 	}
 
@@ -318,18 +283,11 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 
 	// Check if trying to deactivate the last active admin
 	if !active {
-		activeAdmins, err := auc.adminUserRepo.ListAdminUsersByTenant(workspaceUUID)
+		activeCount, err := auc.countOtherActiveAdmins(ctx, userUUID)
 		if err != nil {
 			logger.WithError(err).Error("Failed to verify admin count")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify admin count"})
 			return
-		}
-
-		activeCount := 0
-		for _, admin := range activeAdmins {
-			if admin.Active && admin.ID != userUUID {
-				activeCount++
-			}
 		}
 
 		if activeCount == 0 {
@@ -343,16 +301,13 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	}
 
 	// Update admin user active status
-	updated, err := auc.adminUserRepo.UpdateAdminUserActive(userUUID, active)
-	if err != nil {
+	if err := auc.adminUserRepo.SetAdminUserActiveInWorkspace(ctx, userUUID, active); err != nil {
+		if shared.IsNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
+			return
+		}
 		logger.WithError(err).Error("Failed to update admin user active flag")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update admin user"})
-		return
-	}
-
-	if !updated {
-		logger.Warn("Admin user not found during update")
-		c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
 		return
 	}
 
@@ -433,34 +388,20 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 
 	logger = logger.WithField("user_id", userUUID)
 
-	// Get authenticated user info
-	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
-		logger.Warn("Missing tenant scope in request")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Tenant scope is required"})
-		return
-	}
-
-	userTenant := strings.TrimSpace(userInfo.WorkspaceID)
-	logger = logger.WithField("workspace_id", userTenant)
-
-	// Fetch admin user to delete
-	adminUser, err := auc.adminUserRepo.GetAdminUserByID(userUUID)
+	// The workspace comes from the tenant context set by AuthMiddleware; the
+	// handler used to read user_info, which nothing sets, and always
+	// answered 403 (AS-048).
+	tc, err := tenancy.From(c)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			logger.Warn("Admin user not found")
-			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
-			return
-		}
-		logger.WithError(err).Error("Failed to fetch admin user")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load admin user"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	ctx := c.Request.Context()
+	logger = logger.WithField("workspace_id", tc.WorkspaceID)
 
-	// Validate tenant ownership
-	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), userTenant) {
-		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
+	// Another workspace's user does not exist here: 404.
+	adminUser, ok := auc.loadAdminUser(c, userUUID)
+	if !ok {
 		return
 	}
 
@@ -475,20 +416,11 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	// Check if this is the last active admin for the tenant
-	workspaceUUID, _ := uuid.Parse(userTenant)
-	activeAdmins, err := auc.adminUserRepo.ListAdminUsersByTenant(workspaceUUID)
+	activeCount, err := auc.countOtherActiveAdmins(ctx, userUUID)
 	if err != nil {
 		logger.WithError(err).Error("Failed to verify admin count")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify admin count"})
 		return
-	}
-
-	// Count active admins excluding the current user
-	activeCount := 0
-	for _, admin := range activeAdmins {
-		if admin.Active && admin.ID != userUUID {
-			activeCount++
-		}
 	}
 
 	if activeCount == 0 {
@@ -501,9 +433,8 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	// Perform soft delete
-	if err := auc.adminUserRepo.DeleteAdminUser(userUUID); err != nil {
-		if errors.Is(err, database.ErrAdminUserNotFound) {
-			logger.Warn("Admin user not found during delete")
+	if err := auc.adminUserRepo.SetAdminUserActiveInWorkspace(ctx, userUUID, false); err != nil {
+		if shared.IsNotFound(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
 			return
 		}
@@ -533,10 +464,12 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Admin user soft deleted"})
 }
 
-// DeleteAdminUserAllRequest is the request body for hard delete
+// DeleteAdminUserAllRequest is the optional request body for hard delete. The
+// user comes from the :user_id path parameter when present; workspace_id is
+// ignored (the token's workspace is used).
 type DeleteAdminUserAllRequest struct {
-	WorkspaceID string `json:"workspace_id" binding:"required"`
-	UserID      string `json:"user_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"`
+	UserID      string `json:"user_id"`
 }
 
 // DeleteAdminUserAll godoc
@@ -559,27 +492,34 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	logger.Info("Processing admin user hard delete request")
 
 	var req DeleteAdminUserAllRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.WithError(err).Warn("Failed to bind JSON request body")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
-		return
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			logger.WithError(err).Warn("Failed to bind JSON request body")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
+			return
+		}
+	}
+	rawUserID := strings.TrimSpace(c.Param("user_id"))
+	if rawUserID == "" {
+		rawUserID = strings.TrimSpace(req.UserID)
 	}
 
 	// Validate and parse user ID
-	userUUID, err := uuid.Parse(strings.TrimSpace(req.UserID))
+	userUUID, err := uuid.Parse(rawUserID)
 	if err != nil {
-		logger.WithError(err).WithField("user_id", req.UserID).Warn("Invalid user ID format")
+		logger.WithError(err).WithField("user_id", rawUserID).Warn("Invalid user ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user_id format"})
 		return
 	}
 
-	// Validate and parse tenant ID
-	workspaceUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
+	// The workspace comes from the tenant context (AS-048).
+	tc, err := tenancy.From(c)
 	if err != nil {
-		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	workspaceUUID := tc.WorkspaceID
+	ctx := c.Request.Context()
 
 	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", workspaceUUID)
 
@@ -590,37 +530,9 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		return
 	}
 
-	// Get authenticated user info to validate tenant ownership
-	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
-		logger.Warn("Missing tenant scope in request")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Tenant scope is required"})
-		return
-	}
-
-	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), workspaceUUID.String()) {
-		logger.Warn("Cross-tenant deletion attempted")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cross-tenant deletion is not allowed"})
-		return
-	}
-
-	// Fetch admin user to delete
-	adminUser, err := auc.adminUserRepo.GetAdminUserByID(userUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrAdminUserNotFound) {
-			logger.Warn("Admin user not found")
-			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
-			return
-		}
-		logger.WithError(err).Error("Failed to fetch admin user")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load admin user"})
-		return
-	}
-
-	// Validate tenant ownership
-	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), workspaceUUID.String()) {
-		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
+	// Another workspace's user does not exist here: 404.
+	adminUser, ok := auc.loadAdminUser(c, userUUID)
+	if !ok {
 		return
 	}
 
@@ -635,19 +547,11 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	}
 
 	// Check if this is the last active admin for the tenant
-	activeAdmins, err := auc.adminUserRepo.ListAdminUsersByTenant(workspaceUUID)
+	activeCount, err := auc.countOtherActiveAdmins(ctx, userUUID)
 	if err != nil {
 		logger.WithError(err).Error("Failed to verify admin count")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify admin count"})
 		return
-	}
-
-	// Count active admins excluding the current user
-	activeCount := 0
-	for _, admin := range activeAdmins {
-		if admin.Active && admin.ID != userUUID {
-			activeCount++
-		}
 	}
 
 	if activeCount == 0 {
@@ -681,7 +585,7 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 
 	// Helper function to execute delete and count rows
 	execDelete := func(table, query string, args ...interface{}) error {
-		result, err := tx.Exec(query, args...)
+		result, err := tenancy.ExecContext(ctx, tx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to delete from %s: %w", table, err)
 		}
@@ -691,40 +595,39 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		return nil
 	}
 
-	// All child-table deletes are workspace-scoped: defense-in-depth on top of
-	// the cross-workspace ownership check above. Every table below has both
-	// user_id and workspace_id columns in the master bootstrap.
+	// Every delete goes through the scoped layer (workspace_id = $1). Every
+	// table below has both user_id and workspace_id columns.
 
 	// 1. Delete role_bindings
-	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE user_id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete role_bindings")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 2. Delete totp_secrets
-	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE user_id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete totp_secrets")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 3. Delete totp_backup_codes
-	if err := execDelete("totp_backup_codes", "DELETE FROM totp_backup_codes WHERE user_id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+	if err := execDelete("totp_backup_codes", "DELETE FROM totp_backup_codes WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete totp_backup_codes")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 4. Delete user_groups
-	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE user_id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete user_groups")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 5. Finally, delete the user
-	if err := execDelete("users", "DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+	if err := execDelete("users", "DELETE FROM users WHERE workspace_id = $1 AND id = $2", userUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -745,10 +648,8 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	// closes the seconds-wide window between "user deleted from DB" and
 	// "introspection sees the user is gone". Fire-and-forget; the response
 	// returns to the operator immediately.
-	if adminUser.WorkspaceID != nil {
-		oauthAS := services.NewOAuthASService(config.DB)
-		go oauthAS.RevokeUserTokensForWorkspace(adminUser.ID, *adminUser.WorkspaceID)
-	}
+	oauthAS := services.NewOAuthASService(config.DB)
+	go oauthAS.RevokeUserTokensForWorkspace(adminUser.ID, workspaceUUID)
 
 	// Audit log the successful deletion
 	if config.AuditLogger != nil {
@@ -773,6 +674,39 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		"user_id":        userUUID.String(),
 		"deleted_counts": deletedCounts,
 	})
+}
+
+// loadAdminUser loads an admin user of the request's workspace. It answers
+// 404 itself for a user that does not exist there, including another
+// workspace's user, and 500 on a database error.
+func (auc *AdminUserController) loadAdminUser(c *gin.Context, userID uuid.UUID) (*models.AdminUser, bool) {
+	adminUser, err := auc.adminUserRepo.GetAdminUserInWorkspace(c.Request.Context(), userID)
+	if err != nil {
+		if shared.IsNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
+			return nil, false
+		}
+		monitoring.GetLogger().WithError(err).Error("Failed to fetch admin user")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load admin user"})
+		return nil, false
+	}
+	return adminUser, true
+}
+
+// countOtherActiveAdmins counts the workspace's active admins other than
+// the given user.
+func (auc *AdminUserController) countOtherActiveAdmins(ctx context.Context, except uuid.UUID) (int, error) {
+	admins, err := auc.adminUserRepo.ListAdminUsersInWorkspace(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, admin := range admins {
+		if admin.Active && admin.ID != except {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func buildAdminUserResponse(user models.AdminUser) (map[string]interface{}, error) {
@@ -825,21 +759,21 @@ func isPendingAdminInvite(user models.AdminUser) bool {
 // @Router /authsec/uflow/admin/enduser/list [post]
 func (auc *AdminUserController) ListEndUsersByTenant(c *gin.Context) {
 	var req TenantUserListRequest
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
-	workspaceUUID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
+	_, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
 
 	// Validate client_id if provided
 	var clientUUID *uuid.UUID
-	if req.ClientID != "" {
+	if strings.TrimSpace(req.ClientID) != "" {
 		parsed, err := uuid.Parse(req.ClientID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
@@ -848,16 +782,9 @@ func (auc *AdminUserController) ListEndUsersByTenant(c *gin.Context) {
 		clientUUID = &parsed
 	}
 
-	users, err := auc.fetchTenantUsers(workspaceUUID, clientUUID, req.Provider)
+	users, err := listWorkspaceEndUsers(db, clientUUID, req.Provider)
 	if err != nil {
-		switch err {
-		case errTenantNotFound:
-			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
-		case errWorkspaceDBNotSet:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant database not configured"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list users"})
 		return
 	}
 
@@ -956,18 +883,13 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 
 // UpdateTenant updates an existing tenant
 func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
-	// Get workspace_id from validated JWT token (not URL parameter to prevent spoofing)
-	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
-
-	workspaceID, err := uuid.Parse(workspaceIDStr)
+	// The workspace comes from the verified token, not the URL.
+	tc, err := tenancy.From(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	workspaceID := tc.WorkspaceID
 
 	var input struct {
 		Email           string `json:"email,omitempty"`
@@ -1021,142 +943,112 @@ func (auc *AdminUserController) GetTenantUsers(c *gin.Context) {
 	})
 }
 
-func (auc *AdminUserController) fetchTenantUsers(workspaceID uuid.UUID, clientID *uuid.UUID, provider string) ([]map[string]interface{}, error) {
-	tenant, err := auc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID.String())
-	if err != nil {
-		return nil, errTenantNotFound
+// listWorkspaceEndUsers lists the users of the workspace db is scoped to,
+// with their role bindings. It replaces a lookup that opened a per-tenant
+// database which no longer exists, so the endpoint always answered 400.
+func listWorkspaceEndUsers(db *gorm.DB, clientID *uuid.UUID, provider string) ([]map[string]interface{}, error) {
+	type userRow struct {
+		ID        uuid.UUID
+		Email     string
+		Name      *string
+		ClientID  *uuid.UUID
+		Provider  *string
+		Active    bool
+		CreatedAt time.Time
+		UpdatedAt *time.Time
 	}
-
-	if tenant.WorkspaceDB == "" {
-		return nil, errWorkspaceDBNotSet
-	}
-
-	cfg := config.GetConfig()
-	// Safety: ensure we do not accidentally query the primary DB when workspace_db is unset/misconfigured.
-	if tenant.WorkspaceDB == cfg.DBName || strings.TrimSpace(tenant.WorkspaceDB) == "" {
-		return nil, errWorkspaceDBNotSet
-	}
-
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		tenant.WorkspaceDB,
-		cfg.DBPort,
-	)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-	defer tenantDB.Close()
-
-	if err := tenantDB.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping tenant database: %w", err)
-	}
-
-	// Build query with optional client_id and provider filters
-	query := `SELECT id, email, COALESCE(name, '') AS name, COALESCE(client_id::text, '') AS client_id,
-	          COALESCE(provider, '') AS provider, active,
-	          COALESCE(created_at, NOW()) AS created_at,
-	          updated_at
-	          FROM users`
-
-	var rows *sql.Rows
-	var filters []string
-	var args []interface{}
-	argNum := 1
-
+	q := db.Table("users").
+		Select("id, email, name, client_id, provider, active, created_at, updated_at").
+		Where("deleted_at IS NULL")
 	if clientID != nil {
-		filters = append(filters, fmt.Sprintf("client_id = $%d", argNum))
-		args = append(args, clientID)
-		argNum++
+		q = q.Where("client_id = ?", *clientID)
 	}
-
 	if provider != "" {
-		filters = append(filters, fmt.Sprintf("provider = $%d", argNum))
-		args = append(args, provider)
-		argNum++
+		q = q.Where("provider = ?", provider)
 	}
-
-	if len(filters) > 0 {
-		query += " WHERE " + strings.Join(filters, " AND ")
-	}
-
-	rows, err = tenantDB.Query(query, args...)
-
-	if err != nil {
+	var rows []userRow
+	if err := q.Order("created_at DESC").Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("failed to query users: %w", err)
 	}
-	defer rows.Close()
 
-	var users []map[string]interface{}
-	userRoles := make(map[string][]database.UserRole)
-	// Fetch roles for users in bulk
-	roleRows, roleErr := tenantDB.Query(`
-		SELECT rb.user_id::text, COALESCE(rb.role_id::text, roles.id::text) AS role_id, COALESCE(rb.role_name, roles.name, '') AS role_name
-		FROM role_bindings rb
-		LEFT JOIN roles ON rb.role_id = roles.id
-		WHERE rb.user_id IS NOT NULL
-	`)
-	if roleErr == nil {
-		defer roleRows.Close()
-		for roleRows.Next() {
-			var uid, rid, rname string
-			if scanErr := roleRows.Scan(&uid, &rid, &rname); scanErr == nil && strings.TrimSpace(uid) != "" {
-				userRoles[uid] = append(userRoles[uid], database.UserRole{
-					ID:   uuid.MustParse(rid),
-					Name: rname,
-				})
-			}
+	type bindingRow struct {
+		UserID   uuid.UUID
+		RoleID   uuid.UUID
+		RoleName *string
+	}
+	var bindings []bindingRow
+	if err := db.Table("role_bindings").
+		Select("user_id, role_id, role_name").
+		Where("user_id IS NOT NULL").
+		Scan(&bindings).Error; err != nil {
+		return nil, fmt.Errorf("failed to query role bindings: %w", err)
+	}
+	type roleRow struct {
+		ID   uuid.UUID
+		Name string
+	}
+	var roles []roleRow
+	if err := db.Table("roles").Select("id, name").Scan(&roles).Error; err != nil {
+		return nil, fmt.Errorf("failed to query roles: %w", err)
+	}
+	roleNames := make(map[uuid.UUID]string, len(roles))
+	for _, r := range roles {
+		roleNames[r.ID] = r.Name
+	}
+	userRoles := make(map[uuid.UUID][]database.UserRole)
+	for _, b := range bindings {
+		name := roleNames[b.RoleID]
+		if b.RoleName != nil && *b.RoleName != "" {
+			name = *b.RoleName
 		}
+		userRoles[b.UserID] = append(userRoles[b.UserID], database.UserRole{ID: b.RoleID, Name: name})
 	}
 
-	for rows.Next() {
-		var id, email, name, clientIDStr, provider string
-		var active bool
-		var createdAt time.Time
-		var updatedAt sql.NullTime
-		if err := rows.Scan(&id, &email, &name, &clientIDStr, &provider, &active, &createdAt, &updatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan user: %w", err)
+	users := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		name := ""
+		if r.Name != nil {
+			name = *r.Name
 		}
-
 		parts := strings.Fields(name)
-		firstName := ""
-		lastName := ""
+		firstName, lastName := "", ""
 		if len(parts) > 0 {
 			firstName = parts[0]
 		}
 		if len(parts) > 1 {
 			lastName = strings.Join(parts[1:], " ")
 		}
-
 		status := "inactive"
-		if active {
+		if r.Active {
 			status = "active"
 		}
-
+		clientIDStr, providerStr := "", ""
+		if r.ClientID != nil {
+			clientIDStr = r.ClientID.String()
+		}
+		if r.Provider != nil {
+			providerStr = *r.Provider
+		}
 		user := map[string]interface{}{
-			"id":         id,
-			"email":      email,
+			"id":         r.ID.String(),
+			"email":      r.Email,
 			"first_name": firstName,
 			"last_name":  lastName,
 			"client_id":  clientIDStr,
-			"provider":   provider,
+			"provider":   providerStr,
 			"status":     status,
-			"created_at": createdAt,
+			"created_at": r.CreatedAt,
 		}
-		if updatedAt.Valid {
-			user["updated_at"] = updatedAt.Time
+		if r.UpdatedAt != nil {
+			user["updated_at"] = *r.UpdatedAt
 		}
-		if roles, ok := userRoles[id]; ok {
-			user["roles"] = roles
+		if ur, ok := userRoles[r.ID]; ok {
+			user["roles"] = ur
 		} else {
 			user["roles"] = []database.UserRole{}
 		}
 		users = append(users, user)
 	}
-
 	return users, nil
 }
 
@@ -1204,25 +1096,17 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 		return
 	}
 
-	// Pull workspace_id from the authenticated JWT — never trust the body.
-	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok || workspaceIDStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in token"})
-		return
-	}
-	workspaceUUID, err := uuid.Parse(workspaceIDStr)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id in token"})
+	// The workspace comes from the verified token, never the body.
+	tc, tenantDB, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
 
-	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", workspaceUUID).WithField("active", active)
+	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", tc.WorkspaceID).WithField("active", active)
 
-	tenantDB := config.DB
-
-	// Check if user exists — scope to workspace and exclude soft-deleted.
+	// Another workspace's user does not exist here: 404.
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND deleted_at IS NULL", userUUID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			logger.Warn("End user not found in tenant database")
 			c.JSON(http.StatusNotFound, gin.H{"error": "End user not found"})
@@ -1234,7 +1118,7 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 	}
 
 	// Update the active status
-	if err := tenantDB.Model(&user).Update("active", active).Error; err != nil {
+	if err := tenantDB.Model(&models.ExtendedUser{}).Where("id = ?", user.ID).Update("active", active).Error; err != nil {
 		logger.WithError(err).Error("Failed to update end user active flag")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update end user"})
 		return
@@ -1330,29 +1214,32 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	logger = logger.WithField("workspace_id", workspaceUUID.String())
 	logger.Info("Processing delete_tenant request")
 
-	// Get authenticated user info
-	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil {
-		logger.Warn("Unauthorized: no user info")
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	// The caller acts in the workspace of their token (AS-048: this read
+	// user_info, which nothing sets). Another workspace does not exist here.
+	tc, err := tenancy.From(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
+	}
+	if tc.WorkspaceID != workspaceUUID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 		return
 	}
 
-	// Verify the requesting user has permission to delete this tenant
-	// Must be either:
-	// 1. A super admin (workspace_id is "admin" or empty)
-	// 2. The primary admin of the tenant being deleted
-	isSuperAdmin := userInfo.WorkspaceID == "" || userInfo.WorkspaceID == "admin"
-	isPrimaryAdminOfTenant := strings.EqualFold(userInfo.WorkspaceID, workspaceUUID.String())
-
-	if !isSuperAdmin && !isPrimaryAdminOfTenant {
-		logger.WithFields(map[string]interface{}{
-			"requester_tenant": userInfo.WorkspaceID,
-			"target_tenant":    workspaceUUID.String(),
-		}).Warn("Permission denied: not authorized to delete this tenant")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only super admins or the tenant's primary admin can delete a tenant"})
+	// Only the workspace's owner (its primary admin) may delete it. There is
+	// no platform super admin on a workspace token (ADR-0001 §7).
+	var ownerID *uuid.UUID
+	if err := config.DB.Table("workspaces").Select("owner_user_id").Where("id = ?", tc.WorkspaceID).Scan(&ownerID).Error; err != nil {
+		logger.WithError(err).Error("Failed to load workspace owner")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch tenant"})
 		return
 	}
+	if ownerID == nil || *ownerID != tc.PrincipalID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only the workspace owner can delete the workspace"})
+		return
+	}
+	requesterID := tc.PrincipalID.String()
+	requesterEmail := c.GetString("email")
 
 	// Fetch the tenant to verify it exists
 	tenant, err := auc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceUUID.String())
@@ -1396,7 +1283,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	// Audit log the deletion
 	if config.AuditLogger != nil {
-		config.AuditLogger.LogAuthentication(requestID, workspaceUUID.String(), "admin", userInfo.UserID, "tenant_deleted", c.ClientIP(), c.GetHeader("User-Agent"), true, fmt.Sprintf("Tenant %s deleted by %s", workspaceUUID.String(), userInfo.Email))
+		config.AuditLogger.LogAuthentication(requestID, workspaceUUID.String(), "admin", requesterID, "tenant_deleted", c.ClientIP(), c.GetHeader("User-Agent"), true, fmt.Sprintf("Tenant %s deleted by %s", workspaceUUID.String(), requesterEmail))
 	}
 
 	// Audit log: Tenant deleted (stdout)

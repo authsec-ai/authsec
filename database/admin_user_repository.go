@@ -1,13 +1,16 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -15,6 +18,10 @@ import (
 )
 
 var ErrAdminUserNotFound = errors.New("admin user not found")
+
+// ErrAmbiguousAdminEmail means an email is a console admin in more than one
+// workspace and the caller did not say which (AS-038).
+var ErrAmbiguousAdminEmail = errors.New("email is an admin in more than one workspace")
 
 // AdminUserRepository handles admin user database operations on global DB
 type AdminUserRepository struct {
@@ -32,18 +39,9 @@ func (aur *AdminUserRepository) EnsureAdminRole(workspaceID uuid.UUID) (uuid.UUI
 	return NewAdminSeedRepository(aur.db).EnsureAdminRoleAndPermissions(workspaceID)
 }
 
-// ListAdminUsersByTenant returns active admin users scoped to a tenant
-// Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) ListAdminUsersByTenant(workspaceID uuid.UUID) ([]models.AdminUser, error) {
-	return aur.ListAdminUsersByTenantWithFilter(workspaceID, "")
-}
-
-// ListAdminUsersByTenantWithFilter returns active admin users scoped to a tenant with optional provider filter
-// Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uuid.UUID, provider string) ([]models.AdminUser, error) {
-	// Build query with optional provider filter
-	queryBase := `
-		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
+// adminUserColumns is the column list scanAdminUserRow expects.
+const adminUserColumns = `
+		       u.id, u.email, u.username, u.password_hash, u.name,
 		       u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
 		       COALESCE(u.provider_id, '') AS provider_id,
 		       COALESCE(u.provider_data, '{}'::jsonb) AS provider_data,
@@ -54,26 +52,69 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uui
 		       COALESCE(u.sync_source, '') AS sync_source,
 		       u.last_sync_at, u.is_synced_user,
 		       u.last_login, u.created_at, u.updated_at,
-		       u.temporary_password, u.temporary_password_expires_at,
-		       COALESCE(u.is_primary_admin, false) AS is_primary_admin
+		       COALESCE(u.temporary_password, false) AS temporary_password,
+		       u.temporary_password_expires_at,
+		       COALESCE(u.is_primary_admin, false) AS is_primary_admin`
+
+func scanAdminUserRow(row interface{ Scan(...interface{}) error }) (models.AdminUser, error) {
+	var user models.AdminUser
+	err := row.Scan(
+		&user.ID,
+		&user.Email,
+		&user.Username,
+		&user.PasswordHash,
+		&user.Name,
+		&user.ClientID,
+		&user.WorkspaceID,
+		&user.ProjectID,
+		&user.WorkspaceDomain,
+		&user.Provider,
+		&user.ProviderID,
+		&user.ProviderData,
+		&user.AvatarURL,
+		&user.Active,
+		&user.MFAEnabled,
+		pq.Array(&user.MFAMethod),
+		&user.MFADefaultMethod,
+		&user.MFAEnrolledAt,
+		&user.MFAVerified,
+		&user.ExternalID,
+		&user.SyncSource,
+		&user.LastSyncAt,
+		&user.IsSyncedUser,
+		&user.LastLogin,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.TemporaryPassword,
+		&user.TemporaryPasswordExpiresAt,
+		&user.IsPrimaryAdmin,
+	)
+	return user, err
+}
+
+// adminInWorkspace restricts u to users holding the admin role in the
+// workspace bound to $1.
+const adminInWorkspace = `
+		  AND EXISTS (
+		        SELECT 1 FROM role_bindings rb
+		        JOIN roles r ON r.id = rb.role_id AND r.workspace_id = rb.workspace_id
+		        WHERE rb.workspace_id = $1 AND rb.user_id = u.id
+		          AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin'))`
+
+// ListAdminUsersInWorkspace returns the active admin users of the workspace
+// carried by ctx, optionally filtered by provider.
+func (aur *AdminUserRepository) ListAdminUsersInWorkspace(ctx context.Context, provider string) ([]models.AdminUser, error) {
+	query := `SELECT ` + adminUserColumns + `
 		FROM users u
-		JOIN role_bindings rb ON u.id = rb.user_id AND rb.workspace_id = $1
-		JOIN roles r ON rb.role_id = r.id AND r.workspace_id = $1
-		WHERE u.active = true
-		  AND u.workspace_id = $1
-		  AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin')`
-
-	// Add provider filter if specified
-	var rows *sql.Rows
-	var err error
-
+		WHERE u.workspace_id = $1 AND u.active = true` + adminInWorkspace
+	args := []interface{}{}
 	if provider != "" {
-		query := queryBase + ` AND u.provider = $2 ORDER BY u.created_at DESC`
-		rows, err = aur.db.Query(query, workspaceID, provider)
-	} else {
-		query := queryBase + ` ORDER BY u.created_at DESC`
-		rows, err = aur.db.Query(query, workspaceID)
+		query += ` AND u.provider = $2`
+		args = append(args, provider)
 	}
+	query += ` ORDER BY u.created_at DESC`
+
+	rows, err := tenancy.QueryContext(ctx, aur.db.DB, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query admin users: %w", err)
 	}
@@ -81,48 +122,85 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uui
 
 	var users []models.AdminUser
 	for rows.Next() {
-		var user models.AdminUser
-		if err := rows.Scan(
-			&user.ID,
-			&user.Email,
-			&user.Username,
-			&user.PasswordHash,
-			&user.Name,
-			&user.ClientID,
-			&user.WorkspaceID,
-			&user.ProjectID,
-			&user.WorkspaceDomain,
-			&user.Provider,
-			&user.ProviderID,
-			&user.ProviderData,
-			&user.AvatarURL,
-			&user.Active,
-			&user.MFAEnabled,
-			pq.Array(&user.MFAMethod),
-			&user.MFADefaultMethod,
-			&user.MFAEnrolledAt,
-			&user.MFAVerified,
-			&user.ExternalID,
-			&user.SyncSource,
-			&user.LastSyncAt,
-			&user.IsSyncedUser,
-			&user.LastLogin,
-			&user.CreatedAt,
-			&user.UpdatedAt,
-			&user.TemporaryPassword,
-			&user.TemporaryPasswordExpiresAt,
-			&user.IsPrimaryAdmin,
-		); err != nil {
+		user, err := scanAdminUserRow(rows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan admin user: %w", err)
 		}
 		users = append(users, user)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("admin user query error: %w", err)
 	}
-
 	return users, nil
+}
+
+// GetAdminUserInWorkspace returns the admin user with this id in the
+// workspace carried by ctx, active or not. A user of another workspace, or
+// one without the admin role here, is tenancy.ErrNotFound.
+func (aur *AdminUserRepository) GetAdminUserInWorkspace(ctx context.Context, id uuid.UUID) (*models.AdminUser, error) {
+	query := `SELECT ` + adminUserColumns + `
+		FROM users u
+		WHERE u.workspace_id = $1 AND u.id = $2 AND u.deleted_at IS NULL` + adminInWorkspace
+	rows, err := tenancy.QueryContext(ctx, aur.db.DB, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get admin user: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to get admin user: %w", err)
+		}
+		return nil, tenancy.ErrNotFound
+	}
+	user, err := scanAdminUserRow(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan admin user: %w", err)
+	}
+	return &user, nil
+}
+
+// SetAdminUserActiveInWorkspace sets the active flag of a user of the
+// workspace carried by ctx. Another workspace's user is tenancy.ErrNotFound.
+func (aur *AdminUserRepository) SetAdminUserActiveInWorkspace(ctx context.Context, id uuid.UUID, active bool) error {
+	res, err := tenancy.ExecContext(ctx, aur.db.DB, `
+		UPDATE users SET active = $3, updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`, id, active)
+	if err != nil {
+		return fmt.Errorf("failed to update admin user active flag: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return tenancy.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateAdminUserInWorkspace updates columns of a user of the workspace
+// carried by ctx. Column names come from the caller's code, never the request.
+func (aur *AdminUserRepository) UpdateAdminUserInWorkspace(ctx context.Context, id uuid.UUID, updates map[string]interface{}) error {
+	if len(updates) == 0 {
+		return fmt.Errorf("no updates provided")
+	}
+	cols := make([]string, 0, len(updates))
+	for col := range updates {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	args := []interface{}{id}
+	set := make([]string, 0, len(cols)+1)
+	for _, col := range cols {
+		args = append(args, updates[col])
+		set = append(set, fmt.Sprintf("%s = $%d", col, len(args)+1))
+	}
+	set = append(set, "updated_at = NOW()")
+	query := "UPDATE users SET " + strings.Join(set, ", ") + " WHERE workspace_id = $1 AND id = $2"
+	res, err := tenancy.ExecContext(ctx, aur.db.DB, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update admin user: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return tenancy.ErrNotFound
+	}
+	return nil
 }
 
 // UserRole represents a role assigned to a user
@@ -163,42 +241,19 @@ func (aur *AdminUserRepository) GetUserRoles(userID, workspaceID uuid.UUID) ([]U
 	return roles, rows.Err()
 }
 
-// HasPendingRegistration checks if a user has a pending registration entry
-func (aur *AdminUserRepository) HasPendingRegistration(email string) (bool, error) {
-	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM pending_registrations 
-			WHERE LOWER(email) = LOWER($1) AND expires_at > NOW()
-		)
-	`
+// HasPendingRegistrationInWorkspace reports whether the workspace carried by
+// ctx has an unexpired pending registration for this email.
+func (aur *AdminUserRepository) HasPendingRegistrationInWorkspace(ctx context.Context, email string) (bool, error) {
 	var exists bool
-	err := aur.db.QueryRow(query, email).Scan(&exists)
+	err := tenancy.QueryRowContext(ctx, aur.db.DB, `
+		SELECT EXISTS(
+			SELECT 1 FROM pending_registrations
+			WHERE workspace_id = $1 AND LOWER(email) = LOWER($2) AND expires_at > NOW()
+		)`, []interface{}{email}, &exists)
 	if err != nil {
 		return false, fmt.Errorf("failed to check pending registration: %w", err)
 	}
 	return exists, nil
-}
-
-// UpdateAdminUserActive updates the active flag for a global admin user.
-func (aur *AdminUserRepository) UpdateAdminUserActive(userID uuid.UUID, active bool) (bool, error) {
-	query := `
-		UPDATE users
-		SET active = $1,
-		    updated_at = $2
-		WHERE id = $3
-	`
-
-	result, err := aur.db.Exec(query, active, time.Now(), userID)
-	if err != nil {
-		return false, fmt.Errorf("failed to update admin user active flag: %w", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("failed to determine rows affected: %w", err)
-	}
-
-	return rows > 0, nil
 }
 
 // EnsureTenantAdminRoleAssignment makes sure the tenant's primary admin user is mapped to the admin role.
@@ -288,84 +343,6 @@ func (aur *AdminUserRepository) ensureAdminRoleBinding(userID, workspaceID, role
 	return nil
 }
 
-func (aur *AdminUserRepository) GetAdminUserAccessContext(userID uuid.UUID) ([]string, []string, []string, []string, error) {
-	// Uses role_bindings for role assignments (user_roles is deprecated)
-	roleQuery := `
-		SELECT r.name
-		FROM role_bindings rb
-		JOIN roles r ON rb.role_id = r.id
-		WHERE rb.user_id = $1
-	`
-
-	resourceQuery := `
-		SELECT DISTINCT p.resource
-		FROM role_bindings rb
-		JOIN role_permissions rp ON rb.role_id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE rb.user_id = $1
-	`
-
-	permissionQuery := `
-		SELECT DISTINCT p.resource || ':' || p.action
-		FROM role_bindings rb
-		JOIN role_permissions rp ON rb.role_id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE rb.user_id = $1
-	`
-
-	roles, err := aur.collectStringValues(roleQuery, userID)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to fetch admin roles: %w", err)
-	}
-
-	// Scopes are no longer used - return empty slice
-	scopes := []string{}
-
-	resources, err := aur.collectStringValues(resourceQuery, userID)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to fetch admin resources: %w", err)
-	}
-
-	permissions, err := aur.collectStringValues(permissionQuery, userID)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to fetch admin permissions: %w", err)
-	}
-
-	return roles, scopes, resources, permissions, nil
-}
-
-func (aur *AdminUserRepository) collectStringValues(query string, args ...interface{}) ([]string, error) {
-	rows, err := aur.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	seen := make(map[string]struct{})
-	var values []string
-
-	for rows.Next() {
-		var value string
-		if err := rows.Scan(&value); err != nil {
-			return nil, err
-		}
-		normalized := strings.TrimSpace(strings.ToLower(value))
-		if normalized == "" {
-			continue
-		}
-		if _, exists := seen[normalized]; !exists {
-			seen[normalized] = struct{}{}
-			values = append(values, normalized)
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
 // CreateAdminUser creates a new admin user in global database
 func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	// Validate that password hash is set for non-synced users
@@ -450,7 +427,48 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	return nil
 }
 
-// GetAdminUserByEmail retrieves an admin user by email (case-insensitive)
+// ResolveAdminForPasswordReset finds the one admin account a pre-auth
+// password reset applies to. Emails are unique per workspace, not globally,
+// so the first match by email could be another workspace's admin (AS-038):
+// with a workspace domain the lookup is (domain, email); without one it
+// succeeds only when the email is an admin in exactly one workspace and
+// returns ErrAmbiguousAdminEmail otherwise.
+func (aur *AdminUserRepository) ResolveAdminForPasswordReset(email, workspaceDomain string) (*models.AdminUser, error) {
+	if strings.TrimSpace(workspaceDomain) != "" {
+		return aur.GetAdminUserByEmailAndWorkspaceDomain(email, workspaceDomain)
+	}
+	// TENANT-EXEMPT: pre-auth flow with no workspace yet; it only counts
+	// the accounts this email has, to refuse an ambiguous reset.
+	var n int
+	if err := aur.db.QueryRow(`
+		SELECT COUNT(DISTINCT u.id)
+		  FROM users u
+		  JOIN role_bindings rb ON rb.user_id = u.id AND rb.workspace_id = u.workspace_id
+		  JOIN roles r ON r.id = rb.role_id
+		  JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
+		  JOIN roles workspace_role ON workspace_role.id = wm.role_id
+		 WHERE LOWER(u.email) = LOWER($1)
+		   AND u.active = true
+		   AND u.deleted_at IS NULL
+		   AND LOWER(r.name) = 'admin'
+		   AND wm.status = 'active'
+		   AND LOWER(workspace_role.name) = 'admin'`, email).Scan(&n); err != nil {
+		return nil, fmt.Errorf("failed to count admin accounts: %w", err)
+	}
+	switch n {
+	case 0:
+		return nil, sql.ErrNoRows
+	case 1:
+		return aur.GetAdminUserByEmail(email)
+	default:
+		return nil, ErrAmbiguousAdminEmail
+	}
+}
+
+// GetAdminUserByEmail retrieves an admin user by email (case-insensitive).
+// TENANT-EXEMPT: the first match across workspaces. Kept for the pre-auth
+// admin login without a workspace domain; anything that changes an account
+// must use a (workspace, email) lookup (AS-038).
 // Uses role_bindings for role assignments (user_roles is deprecated)
 func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.AdminUser, error) {
 	query := `
@@ -821,67 +839,9 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	return &user, nil
 }
 
-// GetAdminUserByID retrieves an admin user by ID
-// Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) GetAdminUserByID(id uuid.UUID) (*models.AdminUser, error) {
-	query := `
-		SELECT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
-			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
-			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
-			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
-			u.mfa_enrolled_at, u.mfa_verified,
-			COALESCE(u.external_id, '') AS external_id,
-			COALESCE(u.sync_source, '') AS sync_source,
-			u.last_sync_at, u.is_synced_user,
-			u.last_login, u.created_at, u.updated_at
-		FROM users u
-		JOIN role_bindings rb ON u.id = rb.user_id
-		JOIN roles r ON rb.role_id = r.id
-		WHERE u.id = $1 AND u.active = true AND r.name = 'admin'
-	`
-
-	var user models.AdminUser
-	err := aur.db.QueryRow(query, id).Scan(
-		&user.ID,
-		&user.Email,
-		&user.Username,
-		&user.PasswordHash,
-		&user.Name,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&user.ProviderID,
-		&user.ProviderData,
-		&user.AvatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		pq.Array(&user.MFAMethod),
-		&user.MFADefaultMethod,
-		&user.MFAEnrolledAt,
-		&user.MFAVerified,
-		&user.ExternalID,
-		&user.SyncSource,
-		&user.LastSyncAt,
-		&user.IsSyncedUser,
-		&user.LastLogin,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, sql.ErrNoRows
-		}
-		return nil, fmt.Errorf("failed to get admin user: %w", err)
-	}
-
-	return &user, nil
-}
-
-// UpdateAdminUser updates an admin user
+// UpdateAdminUser updates an admin user by id.
+// TENANT-EXEMPT: pre-auth flows (login bookkeeping, password reset) that
+// already resolved the account; request handlers use UpdateAdminUserInWorkspace.
 func (aur *AdminUserRepository) UpdateAdminUser(id uuid.UUID, updates map[string]interface{}) error {
 	if len(updates) == 0 {
 		return fmt.Errorf("no updates provided")
@@ -910,105 +870,6 @@ func (aur *AdminUserRepository) UpdateAdminUser(id uuid.UUID, updates map[string
 	}
 
 	return nil
-}
-
-// DeleteAdminUser soft deletes an admin user
-func (aur *AdminUserRepository) DeleteAdminUser(id uuid.UUID) error {
-	query := "UPDATE users SET active = false, updated_at = $1 WHERE id = $2"
-
-	res, err := aur.db.Exec(query, time.Now(), id)
-	if err != nil {
-		return fmt.Errorf("failed to delete admin user: %w", err)
-	}
-
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
-		return ErrAdminUserNotFound
-	}
-
-	return nil
-}
-
-// UpdateAdminUserActiveStatus toggles the active flag for an admin user.
-func (aur *AdminUserRepository) UpdateAdminUserActiveStatus(id uuid.UUID, active bool) error {
-	query := "UPDATE users SET active = $1, updated_at = $2 WHERE id = $3"
-
-	res, err := aur.db.Exec(query, active, time.Now(), id)
-	if err != nil {
-		return fmt.Errorf("failed to update admin user status: %w", err)
-	}
-
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
-		return ErrAdminUserNotFound
-	}
-
-	return nil
-}
-
-// GetAllAdminUsers retrieves all admin users
-// Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) GetAllAdminUsers() ([]models.AdminUser, error) {
-	query := `
-		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
-			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
-			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
-			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
-			u.mfa_enrolled_at, u.mfa_verified,
-			COALESCE(u.external_id, '') AS external_id,
-			COALESCE(u.sync_source, '') AS sync_source,
-			u.last_sync_at, u.is_synced_user,
-			u.last_login, u.created_at, u.updated_at
-		FROM users u
-		JOIN role_bindings rb ON u.id = rb.user_id
-		JOIN roles r ON rb.role_id = r.id
-		WHERE u.active = true AND r.name = 'admin'
-		ORDER BY u.created_at DESC
-	`
-
-	rows, err := aur.db.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query admin users: %w", err)
-	}
-	defer rows.Close()
-
-	var users []models.AdminUser
-	for rows.Next() {
-		var user models.AdminUser
-		err := rows.Scan(
-			&user.ID,
-			&user.Email,
-			&user.Username,
-			&user.PasswordHash,
-			&user.Name,
-			&user.ClientID,
-			&user.WorkspaceID,
-			&user.ProjectID,
-			&user.WorkspaceDomain,
-			&user.Provider,
-			&user.ProviderID,
-			&user.ProviderData,
-			&user.AvatarURL,
-			&user.Active,
-			&user.MFAEnabled,
-			pq.Array(&user.MFAMethod),
-			&user.MFADefaultMethod,
-			&user.MFAEnrolledAt,
-			&user.MFAVerified,
-			&user.ExternalID,
-			&user.SyncSource,
-			&user.LastSyncAt,
-			&user.IsSyncedUser,
-			&user.LastLogin,
-			&user.CreatedAt,
-			&user.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan admin user: %w", err)
-		}
-		users = append(users, user)
-	}
-
-	return users, nil
 }
 
 // UpdateLastLogin updates the last login time for an admin user

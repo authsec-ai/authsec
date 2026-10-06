@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -105,53 +107,43 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		return
 	}
 
-	// Get workspace_id from token (set by auth middleware)
-	var workspaceIDFromToken string
-	var workspaceUUID uuid.UUID
-	if tenantVal, exists := c.Get("workspace_id"); exists {
-		if tenantStr, ok := tenantVal.(string); ok {
-			workspaceIDFromToken = tenantStr
-			if parsedUUID, parseErr := uuid.Parse(workspaceIDFromToken); parseErr == nil {
-				workspaceUUID = parsedUUID
-			}
-		}
+	// The invitee always joins the inviter's workspace, taken from the
+	// verified token; a body workspace_id is ignored. An omitted one used to
+	// create a user with no workspace at all.
+	tc, err := tenancy.From(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
 	}
+	workspaceUUID := tc.WorkspaceID
+	workspaceIDFromToken := workspaceUUID.String()
+	ctx := c.Request.Context()
 
 	// Check if user with this email already exists IN THIS TENANT (tenant-scoped check)
 	// This respects the new composite UNIQUE constraint (email, workspace_id)
-	if workspaceUUID != uuid.Nil {
-		u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, workspaceUUID)
-		if err == nil && u != nil {
-			// User already exists in THIS tenant
-			c.JSON(http.StatusConflict, gin.H{"error": "User with this email already exists in this tenant"})
-			return
-		} else if err != nil && err != sql.ErrNoRows {
-			// Database error
-			log.Printf("User-flow:ERROR: Failed to check user existence: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check user existence"})
-			return
-		}
-		// If err == sql.ErrNoRows, user doesn't exist in this tenant - proceed with invite
+	u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, workspaceUUID)
+	if err == nil && u != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "User with this email already exists in this tenant"})
+		return
+	} else if err != nil && err != sql.ErrNoRows {
+		log.Printf("User-flow:ERROR: Failed to check user existence: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check user existence"})
+		return
 	}
 
-	// Check if username already exists using direct database query
+	// Check if username already exists in this workspace
 	db := config.GetDatabase()
 	var existingUsername string
-
-	// Parse workspace_id from token for database query
-	var workspaceUUIDForQuery interface{}
-	if workspaceIDFromToken != "" {
-		if parsedUUID, parseErr := uuid.Parse(workspaceIDFromToken); parseErr == nil {
-			workspaceUUIDForQuery = parsedUUID
-		}
-	}
-
-	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND workspace_id = $2 LIMIT 1", req.Username, workspaceUUIDForQuery).Scan(&existingUsername)
+	err = tenancy.QueryRowContext(ctx, db.DB, `
+		SELECT username FROM users
+		WHERE workspace_id = $1 AND username = $2 LIMIT 1`, []interface{}{req.Username}, &existingUsername)
 	if err == nil {
 		// Reactivate the user as a side-effect — log on failure but still surface
 		// the 409 conflict so the inviter knows the username is taken.
-		if _, reactivateErr := db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, workspaceUUIDForQuery); reactivateErr != nil {
-			log.Printf("WARN: AdminInvite reactivate failed for username=%s workspace=%s: %v", req.Username, workspaceUUIDForQuery, reactivateErr)
+		if _, reactivateErr := tenancy.ExecContext(ctx, db.DB, `
+			UPDATE users SET active = true
+			WHERE workspace_id = $1 AND username = $2`, req.Username); reactivateErr != nil {
+			log.Printf("WARN: AdminInvite reactivate failed for username=%s workspace=%s: %v", req.Username, workspaceUUID, reactivateErr)
 		}
 		c.JSON(http.StatusConflict, gin.H{"error": "User with this username already exists in this workspace"})
 		return
@@ -188,20 +180,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		clientIDPtr = &clientUUID
 	}
 
-	var workspaceIDPtr *uuid.UUID
-	if strings.TrimSpace(req.WorkspaceID) != "" {
-		workspaceUUID, parseErr := uuid.Parse(req.WorkspaceID)
-		if parseErr != nil {
-			log.Printf("User-flow: invalid workspace_id format: %v", parseErr)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
-			return
-		}
-		workspaceIDPtr = &workspaceUUID
-	} else if workspaceUUID != uuid.Nil {
-		// The body may omit workspace_id; the invited admin belongs to the
-		// inviter's workspace (users.workspace_id is required since 047).
-		workspaceIDPtr = &workspaceUUID
-	}
+	workspaceIDPtr := &workspaceUUID
 
 	var projectIDPtr *uuid.UUID
 	if strings.TrimSpace(req.ProjectID) != "" {
@@ -249,27 +228,27 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	// Assign admin role and binding for this tenant/user (tenant-wide)
-	if workspaceUUID != uuid.Nil {
+	{
 		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(workspaceUUID)
 		if err != nil {
 			log.Printf("User-flow:ERROR: Failed to ensure admin role/perms for invited admin: %v", err)
 		} else {
 			// Insert into role_bindings (user_roles is deprecated)
 			// scope_type and scope_id are NULL for tenant-wide role assignments
-			if _, err := config.GetDatabase().Exec(`
+			if _, err := tenancy.ExecContext(ctx, db.DB, `
 				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-				SELECT $1, $2, $3, $4, NULL, NULL, NOW(), NOW()
+				SELECT $2, $1, $3, $4, NULL, NULL, NOW(), NOW()
 				WHERE NOT EXISTS (
 					SELECT 1 FROM role_bindings
-					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4
+					WHERE workspace_id = $1 AND user_id = $3 AND role_id = $4
 					AND scope_type IS NULL AND scope_id IS NULL
 				)
-			`, uuid.New(), workspaceUUID, adminUser.ID, roleID); err != nil {
+			`, uuid.New(), adminUser.ID, roleID); err != nil {
 				log.Printf("User-flow:ERROR: Failed to bind admin role to invited user: %v", err)
 			}
 
 			// Bind to workspace_memberships (RequireWorkspaceRole checks this)
-			if _, err := config.GetDatabase().Exec(`
+			if _, err := db.DB.ExecContext(ctx, `
 				INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, 'active', 'invite', NOW(), NOW())
 				ON CONFLICT (workspace_id, user_id) DO NOTHING
@@ -376,34 +355,13 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		return
 	}
 
-	// Get workspace_id from token
-	var workspaceUUID uuid.UUID
-	if tenantVal, exists := c.Get("workspace_id"); exists {
-		if tenantStr, ok := tenantVal.(string); ok {
-			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				workspaceUUID = parsedUUID
-			}
-		}
-	}
-
-	// Get the user to verify they are a pending invite
-	// Try to get from main users table first
-	user, err := aic.adminUserRepo.GetAdminUserByID(userUUID)
-	if err != nil {
-		// User not found in users table, may not exist or invite already deleted
-		log.Printf("User-flow: failed to get admin user by ID %s: %v", userUUID, err)
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "User not found",
-			"hint":  "User may have already been deleted or invite was not created successfully",
-		})
+	// The invite must belong to the caller's workspace; another workspace's
+	// user does not exist here (404).
+	user, ok := aic.loadInvitee(c, userUUID)
+	if !ok {
 		return
 	}
-
-	// Verify the user belongs to the same tenant
-	if user.WorkspaceID != nil && workspaceUUID != uuid.Nil && *user.WorkspaceID != workspaceUUID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot cancel invite for user in different tenant"})
-		return
-	}
+	ctx := c.Request.Context()
 
 	// Verify this is a pending invite (temporary_password=true and never logged in)
 	if !user.TemporaryPassword {
@@ -422,15 +380,24 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
 		return
 	}
-
-	// Delete role bindings first
-	if _, err := db.Exec("DELETE FROM role_bindings WHERE user_id = $1", userUUID); err != nil {
-		log.Printf("User-flow: failed to delete role bindings: %v", err)
+	tx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
+		return
 	}
-
-	// Delete the user
-	if _, err := db.Exec("DELETE FROM users WHERE id = $1", userUUID); err != nil {
-		log.Printf("User-flow: failed to delete user: %v", err)
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`,
+		`DELETE FROM workspace_memberships WHERE workspace_id = $1 AND user_id = $2`,
+		`DELETE FROM users WHERE workspace_id = $1 AND id = $2`,
+	} {
+		if _, err := tenancy.ExecContext(ctx, tx, q, userUUID); err != nil {
+			log.Printf("User-flow: failed to cancel invite for %s: %v", userUUID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
 		return
 	}
@@ -451,6 +418,22 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		UserID:  userUUID.String(),
 		Email:   user.Email,
 	})
+}
+
+// loadInvitee loads an invited admin of the request's workspace. It answers
+// 404 itself when there is none, including another workspace's user.
+func (aic *AdminInviteController) loadInvitee(c *gin.Context, userID uuid.UUID) (*models.AdminUser, bool) {
+	user, err := aic.adminUserRepo.GetAdminUserInWorkspace(c.Request.Context(), userID)
+	if err != nil {
+		if shared.IsNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return nil, false
+		}
+		log.Printf("User-flow: failed to get admin user %s: %v", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load user"})
+		return nil, false
+	}
+	return user, true
 }
 
 // ResendInviteRequest represents the request body for resending an invite
@@ -495,32 +478,13 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 		return
 	}
 
-	// Get workspace_id from token
-	var workspaceUUID uuid.UUID
-	if tenantVal, exists := c.Get("workspace_id"); exists {
-		if tenantStr, ok := tenantVal.(string); ok {
-			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				workspaceUUID = parsedUUID
-			}
-		}
-	}
-
-	// Get the user
-	user, err := aic.adminUserRepo.GetAdminUserByID(userUUID)
-	if err != nil {
-		log.Printf("User-flow: failed to get admin user by ID %s: %v", userUUID, err)
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "User not found",
-			"hint":  "User may have already been deleted or invite was not created successfully",
-		})
+	// The invite must belong to the caller's workspace; another workspace's
+	// user does not exist here (404).
+	user, ok := aic.loadInvitee(c, userUUID)
+	if !ok {
 		return
 	}
-
-	// Verify the user belongs to the same tenant
-	if user.WorkspaceID != nil && workspaceUUID != uuid.Nil && *user.WorkspaceID != workspaceUUID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot resend invite for user in different tenant"})
-		return
-	}
+	ctx := c.Request.Context()
 
 	// Verify this is a pending invite
 	if !user.TemporaryPassword {
@@ -553,17 +517,10 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 	}
 
 	// Update the user in database
-	db := config.GetDatabase()
-	if db == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
-		return
-	}
-
-	_, err = db.Exec(`
-		UPDATE users 
-		SET password_hash = $1, temporary_password_expires_at = $2, updated_at = NOW()
-		WHERE id = $3
-	`, user.PasswordHash, newExpiresAt, userUUID)
+	err = aic.adminUserRepo.UpdateAdminUserInWorkspace(ctx, userUUID, map[string]interface{}{
+		"password_hash":                 user.PasswordHash,
+		"temporary_password_expires_at": newExpiresAt,
+	})
 	if err != nil {
 		log.Printf("User-flow: failed to update user password: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update invitation"})
@@ -631,38 +588,24 @@ type ListPendingInvitesResponse struct {
 // @Failure 500 {object} map[string]interface{}
 // @Router /authsec/uflow/admin/invite/pending [get]
 func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
-	// Get workspace_id from token
-	var workspaceUUID uuid.UUID
-	if tenantVal, exists := c.Get("workspace_id"); exists {
-		if tenantStr, ok := tenantVal.(string); ok {
-			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				workspaceUUID = parsedUUID
-			}
-		}
-	}
-
 	db := config.GetDatabase()
 	if db == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
 		return
 	}
 
-	// Query for pending invites
+	// Pending invites of the caller's workspace only. With no workspace in
+	// the request this used to list every workspace's invites.
 	query := `
 		SELECT id, email, username, name, workspace_domain, temporary_password_expires_at, created_at
 		FROM users
-		WHERE temporary_password = true 
+		WHERE workspace_id = $1
+		  AND temporary_password = true
 		  AND last_login IS NULL
-		  AND ($1::uuid IS NULL OR workspace_id = $1)
 		ORDER BY created_at DESC
 	`
 
-	var workspaceIDParam interface{}
-	if workspaceUUID != uuid.Nil {
-		workspaceIDParam = workspaceUUID
-	}
-
-	rows, err := db.Query(query, workspaceIDParam)
+	rows, err := tenancy.Query(c, db.DB, query)
 	if err != nil {
 		log.Printf("User-flow: failed to query pending invites: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve pending invitations"})

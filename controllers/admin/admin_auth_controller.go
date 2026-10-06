@@ -41,12 +41,18 @@ type RegisterInput struct {
 // ForgotPasswordInput represents the input for forgot password
 type ForgotPasswordInput struct {
 	Email string `json:"email" binding:"required,email"`
+	// WorkspaceDomain names the workspace when the email is an admin in more
+	// than one (AS-038). Optional otherwise.
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
 // ResetPasswordInput represents the input for password reset
 type ResetPasswordInput struct {
 	Email       string `json:"email" binding:"required,email"`
 	NewPassword string `json:"new_password" binding:"required,min=6"`
+	// WorkspaceDomain names the workspace when the email is an admin in more
+	// than one (AS-038). Optional otherwise.
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 } // NewAdminAuthController creates a new admin auth controller
 func NewAdminAuthController() (*AdminAuthController, error) {
 	db := config.GetDatabase()
@@ -687,11 +693,13 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 		time.Sleep(time.Until(start.Add(1 * time.Second)))
 	}()
 
-	// ✅ Check if admin user exists
-	adminUser, err := aac.adminUserRepo.GetAdminUserByEmail(input.Email)
+	// Check if admin user exists. An email that is an admin in several
+	// workspaces resolves only with a workspace domain (AS-038); the generic
+	// answer below does not reveal which case applied.
+	adminUser, err := aac.adminUserRepo.ResolveAdminForPasswordReset(input.Email, input.WorkspaceDomain)
 	if err != nil {
 		// Differentiate between "not found" vs real DB error
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrAmbiguousAdminEmail) {
 			// Don't reveal user existence
 			c.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset code has been sent"})
 			return
@@ -814,9 +822,14 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 		return
 	}
 
-	// Get admin user
-	adminUser, err := aac.adminUserRepo.GetAdminUserByEmail(input.Email)
+	// Get the one admin account this reset applies to. The first admin with
+	// this email in any workspace used to be rewritten (AS-038).
+	adminUser, err := aac.adminUserRepo.ResolveAdminForPasswordReset(input.Email, input.WorkspaceDomain)
 	if err != nil {
+		if errors.Is(err, database.ErrAmbiguousAdminEmail) {
+			c.JSON(http.StatusConflict, gin.H{"error": "This email is an admin in more than one workspace; include workspace_domain"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Admin user not found"})
 		return
 	}

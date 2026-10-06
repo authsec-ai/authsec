@@ -115,7 +115,7 @@ func (Group) TableName() string {
 }
 
 type RemoveGroupsRequest struct {
-	WorkspaceID string   `json:"workspace_id" binding:"required"`
+	WorkspaceID string   `json:"workspace_id"` // ignored: the token's workspace is used
 	ClientID string   `json:"client_id"`
 	Groups   []string `json:"groups" binding:"required"`
 }

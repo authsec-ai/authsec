@@ -131,6 +131,12 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// The workspace comes from the token; users are written only there.
+	tc, tenantDB, ok := TenantScope(c)
+	if !ok {
+		return
+	}
+	input.WorkspaceID = tc.WorkspaceID.String()
 
 	// Determine which config to use
 	var entraConfig EntraIDConfig
@@ -179,9 +185,6 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 		c.JSON(http.StatusOK, result)
 		return
 	}
-
-	// Connect to tenant database
-	tenantDB := config.DB
 
 	// Sync users to database
 	for _, entraUser := range entraUsers {

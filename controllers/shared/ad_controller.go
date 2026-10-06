@@ -82,6 +82,12 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 		})
 		return
 	}
+	// The workspace comes from the token; users are written only there.
+	tc, tenantDB, ok := TenantScope(c)
+	if !ok {
+		return
+	}
+	input.WorkspaceID = tc.WorkspaceID.String()
 
 	// Determine which config to use
 	var adConfig models.ADSyncConfig
@@ -130,8 +136,6 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 		c.JSON(http.StatusOK, result)
 		return
 	}
-
-	tenantDB := config.DB
 
 	// Sync users to database
 	for _, adUser := range adUsers {
@@ -570,7 +574,12 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 		return
 	}
 
-	tenantDB := config.DB
+	// The workspace comes from the token; users are written only there.
+	tc, tenantDB, ok := TenantScope(c)
+	if !ok {
+		return
+	}
+	input.WorkspaceID = tc.WorkspaceID.String()
 
 	// Process each user
 	for _, user := range input.Users {

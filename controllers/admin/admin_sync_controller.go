@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -21,7 +22,6 @@ import (
 
 type AdminSyncController struct {
 	adminUserRepo *database.AdminUserRepository
-	workspaceRepo    *database.WorkspaceRepository
 }
 
 // NewAdminSyncController creates a new admin sync controller
@@ -33,13 +33,12 @@ func NewAdminSyncController() (*AdminSyncController, error) {
 
 	return &AdminSyncController{
 		adminUserRepo: database.NewAdminUserRepository(db),
-		workspaceRepo:    database.NewWorkspaceRepository(db),
 	}, nil
 }
 
 // AdminSyncInput represents the input for syncing admin users
 type AdminSyncInput struct {
-	WorkspaceID    string                `json:"workspace_id" binding:"required"`
+	WorkspaceID string                `json:"workspace_id"`                 // ignored: the token's workspace is used
 	ClientID    string                `json:"client_id,omitempty"`          // Optional client_id
 	ProjectID   string                `json:"project_id,omitempty"`         // Optional project_id
 	ConfigID    *string               `json:"config_id,omitempty"`          // ID of stored config to use
@@ -77,12 +76,15 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 		return
 	}
 
-	// Validate tenant ID
-	workspaceUUID, err := uuid.Parse(input.WorkspaceID)
+	// The workspace comes from the token; a body workspace_id is ignored.
+	tc, err := tenancy.From(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	workspaceUUID := tc.WorkspaceID
+	input.WorkspaceID = workspaceUUID.String()
+	ctx := c.Request.Context()
 
 	// Parse client_id and project_id if provided
 	var clientUUID, projectUUID *uuid.UUID
@@ -152,7 +154,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 
 	// Sync users to main database
 	for _, adUser := range adUsers {
-		created, err := asc.syncADUserToMainDB(adUser, workspaceUUID, clientUUID, projectUUID)
+		created, err := asc.syncADUserToMainDB(ctx, adUser, workspaceUUID, clientUUID, projectUUID)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Failed to sync user %s: %v", adUser.Email, err))
 			continue
@@ -201,12 +203,15 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 		return
 	}
 
-	// Validate tenant ID
-	workspaceUUID, err := uuid.Parse(input.WorkspaceID)
+	// The workspace comes from the token; a body workspace_id is ignored.
+	tc, err := tenancy.From(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
+	workspaceUUID := tc.WorkspaceID
+	input.WorkspaceID = workspaceUUID.String()
+	ctx := c.Request.Context()
 
 	// Parse client_id and project_id if provided
 	var clientUUID, projectUUID *uuid.UUID
@@ -277,7 +282,7 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 
 	// Sync users to main database
 	for _, entraUser := range entraUsers {
-		created, err := asc.syncEntraUserToMainDB(entraUser, workspaceUUID, clientUUID, projectUUID)
+		created, err := asc.syncEntraUserToMainDB(ctx, entraUser, workspaceUUID, clientUUID, projectUUID)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Failed to sync user %s: %v", entraUser.Mail, err))
 			continue
@@ -309,16 +314,10 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 
 // syncADUserToMainDB syncs an AD user to the main database as an admin user and creates/updates tenant record
 // Returns (created bool, error) where created=true means new user, created=false means updated existing user
-func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
+func (asc *AdminSyncController) syncADUserToMainDB(ctx context.Context, adUser models.ADUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return false, fmt.Errorf("database not initialized")
-	}
-
-	// Get the existing tenant to copy its configuration
-	existingTenant, err := asc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID.String())
-	if err != nil {
-		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
 
 	// Check if user already exists (by email or external ID scoped to tenant)
@@ -330,14 +329,14 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
+	          WHERE workspace_id = $1 AND (LOWER(email) = LOWER($2) OR external_id = $3)`
 
 	var username, passwordHash, name, workspaceDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, workspaceIDVal, projectIDStr sql.NullString
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, adUser.Email, adUser.ObjectGUID, workspaceID).Scan(
+	err := tenancy.QueryRowContext(ctx, db.DB, query, []interface{}{adUser.Email, adUser.ObjectGUID},
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &workspaceIDVal, &projectIDStr,
 		&workspaceDomain, &provider, &providerID, &providerData,
@@ -453,11 +452,6 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
-		// Create tenant record for this admin user with same tenant configuration
-		if err := asc.createTenantForAdminUser(newUser, existingTenant); err != nil {
-			log.Printf("Warning: Failed to create tenant record for admin user %s: %v", adUser.Email, err)
-		}
-
 		// Write workspace_memberships for the synced user.
 		var memberRoleID uuid.UUID
 		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
@@ -492,16 +486,8 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 		"provider_data": providerDataBytes,
 	}
 
-	if err := asc.adminUserRepo.UpdateAdminUser(existingUser.ID, updates); err != nil {
+	if err := asc.adminUserRepo.UpdateAdminUserInWorkspace(ctx, existingUser.ID, updates); err != nil {
 		return false, fmt.Errorf("failed to update admin user: %w", err)
-	}
-
-	// Update tenant record for this admin user (allows multiple admin emails for same tenant)
-	log.Printf("Attempting to create/update tenant entry for admin user: %s", adUser.Email)
-	if err := asc.createTenantForAdminUser(&existingUser, existingTenant); err != nil {
-		log.Printf("ERROR: Failed to update tenant record for admin user %s: %v", adUser.Email, err)
-	} else {
-		log.Printf("SUCCESS: Tenant record created/updated for admin user: %s", adUser.Email)
 	}
 
 	log.Printf("Updated existing AD admin user: %s (%s)", adUser.Email, adUser.ObjectGUID)
@@ -510,16 +496,10 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 
 // syncEntraUserToMainDB syncs an Entra ID user to the main database as an admin user and creates/updates tenant record
 // Returns (created bool, error) where created=true means new user, created=false means updated existing user
-func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
+func (asc *AdminSyncController) syncEntraUserToMainDB(ctx context.Context, entraUser shared.EntraIDUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return false, fmt.Errorf("database not initialized")
-	}
-
-	// Get the existing tenant to copy its configuration
-	existingTenant, err := asc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID.String())
-	if err != nil {
-		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
 
 	// Check if user already exists (by email or external ID scoped to tenant)
@@ -531,14 +511,14 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
+	          WHERE workspace_id = $1 AND (LOWER(email) = LOWER($2) OR external_id = $3)`
 
 	var username, passwordHash, name, workspaceDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, workspaceIDVal, projectIDStr sql.NullString
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, entraUser.Mail, entraUser.ID, workspaceID).Scan(
+	err := tenancy.QueryRowContext(ctx, db.DB, query, []interface{}{entraUser.Mail, entraUser.ID},
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &workspaceIDVal, &projectIDStr,
 		&workspaceDomain, &provider, &providerID, &providerData,
@@ -658,11 +638,6 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
-		// Create tenant record for this admin user with same tenant configuration
-		if err := asc.createTenantForAdminUser(newUser, existingTenant); err != nil {
-			log.Printf("Warning: Failed to create tenant record for admin user %s: %v", entraUser.Mail, err)
-		}
-
 		// Write workspace_memberships for the synced user.
 		var memberRoleID uuid.UUID
 		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
@@ -701,90 +676,12 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 		"provider_data": providerDataBytes,
 	}
 
-	if err := asc.adminUserRepo.UpdateAdminUser(existingUser.ID, updates); err != nil {
+	if err := asc.adminUserRepo.UpdateAdminUserInWorkspace(ctx, existingUser.ID, updates); err != nil {
 		return false, fmt.Errorf("failed to update admin user: %w", err)
-	}
-
-	// Update tenant record for this admin user (allows multiple admin emails for same tenant)
-	log.Printf("Attempting to create/update tenant entry for admin user: %s", entraUser.Mail)
-	if err := asc.createTenantForAdminUser(&existingUser, existingTenant); err != nil {
-		log.Printf("ERROR: Failed to update tenant record for admin user %s: %v", entraUser.Mail, err)
-	} else {
-		log.Printf("SUCCESS: Tenant record created/updated for admin user: %s", entraUser.Mail)
 	}
 
 	log.Printf("Updated existing Entra ID admin user: %s (%s)", entraUser.Mail, entraUser.ID)
 	return false, nil
-}
-
-// createTenantForAdminUser creates a new tenant entry with the same workspace_id as existing tenant
-// This allows multiple admin emails to share the same tenant configuration
-func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.AdminUser, existingTenant *sharedmodels.Tenant) error {
-	// Check if tenant entry already exists for this email
-	existingTenantRecord, err := asc.workspaceRepo.GetWorkspaceByEmail(adminUser.Email)
-	if err == nil && existingTenantRecord != nil {
-		// Tenant entry exists for this email - update it
-		log.Printf("Tenant entry already exists for email %s, updating it", adminUser.Email)
-
-		// Update tenant record with latest sync data
-		now := time.Now()
-		// Phase 6: workspaces is the new tenants. workspace_domain replaces workspace_domain.
-		// workspace_db column gone with the dynamic-DB feature. username column is on users
-		// table, not workspaces — dropped here. id is the PK.
-		updateQuery := `UPDATE workspaces
-			SET name = $1, workspace_domain = $2,
-			    source = $3, status = $4, updated_at = $5
-			WHERE email = $6 AND id = $7`
-
-		db := config.GetDatabase()
-		if db == nil {
-			return fmt.Errorf("database not initialized")
-		}
-
-		// Phase 6: dropped Username (lives on users table, not workspaces) and WorkspaceDB
-		// (legacy dynamic-DB column, removed) — query now has 7 placeholders matching 7 args.
-		_, err := db.DB.Exec(updateQuery,
-			adminUser.Name,
-			existingTenant.WorkspaceDomain,
-			existingTenant.Source,
-			existingTenant.Status,
-			now,
-			adminUser.Email,
-			*adminUser.WorkspaceID,
-		)
-
-		if err != nil {
-			return fmt.Errorf("failed to update tenant entry: %w", err)
-		}
-
-		log.Printf("Updated tenant entry for admin user %s with workspace_id %s", adminUser.Email, adminUser.WorkspaceID)
-		return nil
-	}
-
-	// Tenant entry doesn't exist for this email - create a new entry with same workspace_id
-	// This creates a new row in tenants table with the new email but same tenant configuration
-	tenant := &sharedmodels.Tenant{
-		ID:           uuid.New(),
-		WorkspaceID:     *adminUser.WorkspaceID, // Same workspace_id as existing tenant
-		Email:        adminUser.Email,     // New email from synced user
-		Username:     &adminUser.Username,
-		Name:         adminUser.Name,
-		WorkspaceDomain: existingTenant.WorkspaceDomain, // Copy from existing tenant
-		WorkspaceDB:     existingTenant.WorkspaceDB,     // Copy from existing tenant (same DB)
-		Source:       existingTenant.Source,       // Copy from existing tenant
-		Status:       existingTenant.Status,       // Copy from existing tenant
-		PasswordHash: adminUser.PasswordHash,      // Empty for synced users
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
-	}
-
-	if err := asc.workspaceRepo.CreateTenant(tenant); err != nil {
-		return fmt.Errorf("failed to create tenant entry: %w", err)
-	}
-
-	log.Printf("Created new tenant entry for admin user %s with workspace_id %s (shares same workspace_db: %s)",
-		adminUser.Email, adminUser.WorkspaceID, existingTenant.WorkspaceDB)
-	return nil
 }
 
 // loadStoredADConfig loads AD configuration from database and decrypts credentials

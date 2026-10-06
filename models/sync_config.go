@@ -58,7 +58,7 @@ func (SyncConfiguration) TableName() string {
 
 // CreateSyncConfigRequest represents the request to create a new sync configuration
 type CreateSyncConfigRequest struct {
-	WorkspaceID    string `json:"workspace_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	ClientID    string `json:"client_id"`
 	ProjectID   string `json:"project_id"`
 	SyncType    string `json:"sync_type" binding:"required"` // 'active_directory' or 'entra_id'
@@ -83,7 +83,7 @@ type EntraIDSyncConfig struct {
 
 // ListSyncConfigsRequest represents the request to list sync configurations
 type ListSyncConfigsRequest struct {
-	WorkspaceID string  `json:"workspace_id" binding:"required"`
+	WorkspaceID string  `json:"workspace_id"` // ignored: the token's workspace is used
 	ClientID string  `json:"client_id"`
 	SyncType *string `json:"sync_type,omitempty"` // Optional filter: 'active_directory' or 'entra_id'
 }
@@ -91,7 +91,7 @@ type ListSyncConfigsRequest struct {
 // UpdateSyncConfigRequest represents the request to update a sync configuration
 type UpdateSyncConfigRequest struct {
 	ID          string  `json:"id" binding:"required"`
-	WorkspaceID    string  `json:"workspace_id" binding:"required"`
+	WorkspaceID string  `json:"workspace_id"` // ignored: the token's workspace is used
 	ClientID    string  `json:"client_id"`
 	ConfigName  *string `json:"config_name,omitempty"`
 	Description *string `json:"description,omitempty"`
@@ -107,7 +107,7 @@ type UpdateSyncConfigRequest struct {
 // DeleteSyncConfigRequest represents the request to delete a sync configuration
 type DeleteSyncConfigRequest struct {
 	ID       string `json:"id" binding:"required"`
-	WorkspaceID string `json:"workspace_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	ClientID string `json:"client_id"`
 }
 

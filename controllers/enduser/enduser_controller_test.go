@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -178,11 +179,11 @@ func TestEndUserController_GetEndUsers(t *testing.T) {
 			},
 		},
 		{
-			name:  "invalid input",
-			input: GetEndUsersFilter{
-				// Missing workspace_id
-			},
-			expectedStatus: http.StatusBadRequest,
+			// workspace_id is no longer required in the body: the token's
+			// workspace is used, so this reaches the (absent) database.
+			name:           "workspace_id not required",
+			input:          GetEndUsersFilter{},
+			expectedStatus: http.StatusInternalServerError,
 			setupMocks:     func() {},
 		},
 		{
@@ -381,7 +382,9 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 			if workspaceID, ok := tt.input["workspace_id"]; ok {
 				// Set token claims for auth middleware simulation
 				setTokenClaimsInContext(c, workspaceID, tt.input["user_id"])
-				c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
+				if ws, err := uuid.Parse(workspaceID); err == nil {
+					tenancy.Set(c, tenancy.Context{WorkspaceID: ws})
+				}
 			}
 
 			controller.DeleteEndUser(c)
@@ -419,7 +422,7 @@ func TestEndUserController_ActiveOrDeactiveEndUser(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Authenticated caller in the same workspace so the request passes the
 	// workspace check and exercises the no-database path under test.
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
+	tenancy.Set(c, tenancy.Context{WorkspaceID: uuid.MustParse(workspaceID)})
 
 	controller.ActiveOrDeactiveEndUser(c)
 

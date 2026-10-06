@@ -121,7 +121,7 @@ type CustomResetPasswordResponse struct {
 
 // Admin password management models
 type AdminChangePasswordInput struct {
-	WorkspaceID    string `json:"workspace_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	UserID      string `json:"user_id,omitempty"`
 	Email       string `json:"email,omitempty"`
 	NewPassword string `json:"new_password" binding:"required"`
@@ -135,7 +135,7 @@ type AdminChangePasswordResponse struct {
 }
 
 type AdminResetPasswordInput struct {
-	WorkspaceID  string `json:"workspace_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id"` // ignored: the token's workspace is used
 	UserID    string `json:"user_id,omitempty"`
 	Email     string `json:"email,omitempty"`
 	SendEmail bool   `json:"send_email,omitempty"`

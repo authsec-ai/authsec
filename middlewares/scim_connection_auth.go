@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 )
@@ -73,6 +74,14 @@ func SCIMConnectionAuth() gin.HandlerFunc {
 		workspaceID := conn.WorkspaceID.String()
 		c.Set("workspace_id", workspaceID)
 		c.Set("scim_connection_id", conn.ID.String())
+		// A machine credential's workspace comes from its own row (ADR-0001
+		// §4.1); handlers read it through the tenant context.
+		tenancy.Set(c, tenancy.Context{
+			WorkspaceID:   conn.WorkspaceID,
+			PrincipalID:   conn.ID,
+			PrincipalKind: "scim_connection",
+			Realm:         "scim",
+		})
 
 		if conn.DefaultClientID != nil {
 			c.Set("scim_default_client_id", conn.DefaultClientID.String())

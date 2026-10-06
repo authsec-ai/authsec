@@ -12,6 +12,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -85,15 +86,21 @@ func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 	return clientUUID, projectUUID, nil
 }
 
-// getWorkspaceDB resolves the active workspace ID from the JWT context and returns
-// the shared config.DB. The name is kept for backward compatibility with
-// callers; the tenant-DB-routing behavior was removed in Step 0.
+// getWorkspaceDB resolves the request's workspace and returns config.DB
+// restricted to it. The name is kept for backward compatibility with callers.
 func getWorkspaceDB(c *gin.Context) (*gorm.DB, string, error) {
-	workspaceID, err := shared.RequireWorkspaceID(c)
+	// The workspace is the SCIM connection's own (set by SCIMConnectionAuth
+	// from the scim_connections row), and every query goes through a handle
+	// scoped to it (ADR-0001 §4.3).
+	tc, err := tenancy.From(c)
 	if err != nil {
 		return nil, "", fmt.Errorf("tenant not found in token")
 	}
-	return config.DB, workspaceID, nil
+	db, err := tenancy.DB(c, config.DB)
+	if err != nil {
+		return nil, "", fmt.Errorf("tenant not found in token")
+	}
+	return db, tc.WorkspaceID.String(), nil
 }
 
 // ──────────────────────────────────────────────
