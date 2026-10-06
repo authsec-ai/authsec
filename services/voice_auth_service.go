@@ -37,31 +37,11 @@ func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthSer
 	}
 }
 
-// tenantMapping is retired (Phase B). It used to resolve workspace from the
-// legacy `clients` table via client_id, which is wrong under OAuth 2.1 (no
-// general client_id → workspace mapping) and the table no longer exists.
-// Voice auth must be reworked to carry workspace_id explicitly (host header /
-// JWT / resource indicator). Until then this returns a clean error instead of
-// a 500 on a missing relation. Tracked in RESIDUAL_AGENTS_WORK.md.
-func (s *VoiceAuthService) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	_ = clientID
-	return uuid.Nil, fmt.Errorf("legacy client_id→workspace lookup removed (Phase B); voice auth must pass workspace_id explicitly")
-}
-
 // InitiateVoiceAuth creates a new voice authentication session
-func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (*models.VoiceInitiateResponse, error) {
-	// Parse and validate client_id
-	clientID, err := uuid.Parse(req.ClientID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid client_id format")
-	}
-
-	// Look up workspace_id from tenant_mappings table using client_id
-	workspaceID, err := s.tenantMapping(clientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve tenant from client_id: %w", err)
-	}
-
+// The caller is the voice assistant's backend, authenticated as an OAuth
+// client of workspaceID (see the controller); only that client can verify or
+// redeem the session it starts.
+func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest, workspaceID, clientID uuid.UUID) (*models.VoiceInitiateResponse, error) {
 	// Voice platform is optional and accepts any string (alexa, google, siri, web, custom, etc.)
 	// No validation needed - store as-is for flexibility
 
@@ -116,9 +96,12 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 }
 
 // VerifyVoiceOTP verifies the voice OTP and returns device code or token
-func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*models.VoiceVerifyResponse, error) {
-	// Find voice session
+func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, clientID uuid.UUID) (*models.VoiceVerifyResponse, error) {
+	// Find voice session; another client's session is as good as unknown.
 	session, err := s.voiceRepo.FindVoiceSessionByToken(req.SessionToken)
+	if err == nil && (session.ClientID == nil || *session.ClientID != clientID) {
+		err = fmt.Errorf("session belongs to another client")
+	}
 	if err != nil {
 		return &models.VoiceVerifyResponse{
 			Success: false,
@@ -277,9 +260,12 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 
 // AuthenticateWithCredentials authenticates user with email/password via voice
 // WARNING: Less secure - credentials spoken aloud
-func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenRequest) (*models.VoiceTokenResponse, error) {
-	// Find voice session
+func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenRequest, clientID uuid.UUID) (*models.VoiceTokenResponse, error) {
+	// Find voice session; another client's session is as good as unknown.
 	session, err := s.voiceRepo.FindVoiceSessionByToken(req.SessionToken)
+	if err == nil && (session.ClientID == nil || *session.ClientID != clientID) {
+		err = fmt.Errorf("session belongs to another client")
+	}
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_request",
@@ -295,17 +281,9 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 		}, nil
 	}
 
-	// Validate tenant
-	tenant, err := s.workspaceRepo.GetWorkspaceByDomain(req.WorkspaceDomain)
-	if err != nil {
-		return &models.VoiceTokenResponse{
-			Error:            "invalid_request",
-			ErrorDescription: "Tenant not found",
-		}, nil
-	}
-
-	// Find user by email and tenant
-	user, err := s.userRepo.GetUserByEmailAndTenant(req.Email, tenant.ID)
+	// The user must belong to the session's workspace, which came from the
+	// authenticated voice client, not from the request.
+	user, err := s.userRepo.GetUserByEmailAndTenant(req.Email, session.WorkspaceID)
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",
@@ -318,6 +296,14 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",
 			ErrorDescription: "Invalid credentials",
+		}, nil
+	}
+
+	tenant, err := s.workspaceRepo.GetWorkspaceByID(session.WorkspaceID.String())
+	if err != nil {
+		return &models.VoiceTokenResponse{
+			Error:            "invalid_request",
+			ErrorDescription: "Workspace not found",
 		}, nil
 	}
 

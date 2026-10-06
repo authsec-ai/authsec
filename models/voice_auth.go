@@ -147,7 +147,7 @@ type VoiceTokenRequest struct {
 	SessionToken string `json:"session_token" binding:"required"`
 	Email        string `json:"email" binding:"required"`
 	Password     string `json:"password" binding:"required"`
-	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"` // ignored: the session's workspace decides
 }
 
 // VoiceTokenResponse represents the response for voice token request

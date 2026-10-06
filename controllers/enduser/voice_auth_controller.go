@@ -57,7 +57,11 @@ func (ctrl *VoiceAuthController) InitiateVoiceAuth(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.InitiateVoiceAuth(&req)
+	client, workspaceID, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.InitiateVoiceAuth(&req, workspaceID, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate voice authentication", "details": err.Error()})
 		return
@@ -93,7 +97,11 @@ func (ctrl *VoiceAuthController) VerifyVoiceOTP(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.VerifyVoiceOTP(&req)
+	client, _, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.VerifyVoiceOTP(&req, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify voice OTP", "details": err.Error()})
 		return
@@ -128,7 +136,11 @@ func (ctrl *VoiceAuthController) GetTokenWithCredentials(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.AuthenticateWithCredentials(&req)
+	client, _, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.AuthenticateWithCredentials(&req, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to authenticate", "details": err.Error()})
 		return
@@ -487,4 +499,23 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 		"message": message,
 		"status":  status,
 	})
+}
+
+// authenticateVoiceClient authenticates the voice assistant's backend as an
+// OAuth client (client_secret_basic or private_key_jwt, as at /oauth/token)
+// and returns it with its workspace. The voice endpoints were anonymous and
+// took the workspace from a client_id in the body; anyone could then assert a
+// linked voice identity and receive that user's token (AS-047).
+func authenticateVoiceClient(c *gin.Context) (*models.MCPOAuthClient, uuid.UUID, bool) {
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	client, err := services.AuthenticateClient(c.Request.Context(), config.DB, c.Request, tokenEndpoint)
+	if err != nil || client == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client", "error_description": "voice requests must authenticate as an OAuth client"})
+		return nil, uuid.Nil, false
+	}
+	if client.HomeWorkspaceID == nil || *client.HomeWorkspaceID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client", "error_description": "client is not registered to a workspace"})
+		return nil, uuid.Nil, false
+	}
+	return client, *client.HomeWorkspaceID, true
 }
