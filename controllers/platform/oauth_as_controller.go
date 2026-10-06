@@ -1804,7 +1804,7 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		WHERE workspace_id = ? AND side = 'issuance'
 		  AND (client_id IS NULL OR client_id = ?)
 		  AND (resource_server_id IS NULL OR resource_server_id IN (
-		        SELECT id FROM resource_servers WHERE resource_uri = ? AND ? <> ''))`,
+		        SELECT id FROM resource_servers WHERE resource_uri = ? AND ? <> '')) -- TENANT-EXEMPT: outer query scoped by workspace_id`,
 		subject.WorkspaceID, oauthClient.ClientID, resource, resource,
 	).Scan(&brokeringRows).Error; err != nil {
 		log.Printf("[MCP_AUTH] tokenExchange: brokering gate lookup failed: %v", err)

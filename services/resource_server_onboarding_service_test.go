@@ -120,6 +120,7 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
 			application_type TEXT NOT NULL DEFAULT 'mcp_server',
+			agent_type TEXT,
 			legacy_client_id TEXT,
 			name TEXT NOT NULL,
 			public_base_url TEXT NOT NULL,

@@ -669,7 +669,7 @@ func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 	if err := config.DB.WithContext(c.Request.Context()).
 		Where("client_id = ?", req.ClientID).
 		Where(`home_workspace_id = ? OR id IN (
-			SELECT oauth_client_id FROM resource_server_client_registrations
+			SELECT oauth_client_id FROM resource_server_client_registrations -- TENANT-EXEMPT: scoped by workspace_id on the next line
 			WHERE workspace_id = ? AND resource_server_id = ?)`, workspaceID, workspaceID, rs.ID).
 		First(&client).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "client not found"})

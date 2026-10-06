@@ -95,7 +95,7 @@ func CheckActive(ctx context.Context, db *sql.DB, workspaceID, clientID, token s
 	}
 	var stored string
 	err := db.QueryRowContext(ctx, `
-		SELECT token FROM delegation_tokens
+		SELECT token FROM delegation_tokens -- TENANT-EXEMPT: scoped by workspace_id on the next line
 		WHERE workspace_id::text = $1 AND client_id::text = $2
 		  AND status = 'active' AND expires_at > now()`,
 		workspaceID, clientID).Scan(&stored)
