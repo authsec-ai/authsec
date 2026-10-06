@@ -4,6 +4,74 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-06 (cont.) — Phases 1–6 run back to back (owner: "complete each phase and commit, do not push")
+
+**Branches (local only, nothing pushed):**
+- Backend: `fix/p0-containment`, about 50 commits on top of `authsec-staging`.
+- UI: `fix/p0-admin-login-ticket` → `chore/ui-stabilize` → `feat/ui-tenancy` → `fix/ui-integrations`. Each branch is stacked on the previous one; the tip is `fix/ui-integrations`.
+
+### By phase
+- **P0 containment (before Phase 1).**
+  - Sign-in chain: login tickets.
+  - The token's workspace is enforced on path, query and body.
+  - User management and SCIM need owner/admin.
+  - Global listings are scoped, and password hashes are never serialized.
+  - OTPs no longer echoed; the TOTP key and its rotation are fixed; secrets are out of logs.
+  - Token exchange requires client authentication.
+  - Issuers and SPIFFE providers are scoped to a workspace.
+  - SAML signatures are verified; legacy CIBA, registration and OIDC paths are scoped.
+  - Discovery, provisioning, redirect approval, extsvc and delegation-token lookups stay in their workspace.
+  - OIDC sign-in is a first factor only.
+  - Policies enforced by default; session revocation and logout; audit persistence; one reconciler leader across replicas.
+- **Phase 1:** `docs/adr/0001-tenancy-model.md`.
+- **Phase 2:**
+  - Default tests green without local services.
+  - `go mod tidy`.
+  - `deploy/dev` stack (Postgres, Hydra, Vault) and a `Makefile`.
+  - `/authsec/healthz` and `/authsec/readyz`.
+  - `internal/tenancy` scoped layer.
+  - `TwoTenants` isolation harness.
+  - TENANT-EXEMPT ratchet wired into CI.
+  - UI type-check and lint at 0 errors.
+- **Phase 3:**
+  - Migrations 045–048: missing `workspace_id` columns, backfill with orphan report, FKs and NOT NULL added NOT VALID, per-workspace uniques. Plus 050 (session revocation), 051 (audit append-only) and 052 (`users:delete` for admins).
+  - Per-request membership re-check.
+  - Users and identity domain moved onto the scoped layer.
+  - Agent/resource-plane fixes.
+  - Isolation tests per endpoint for users, groups, RBAC, password reset, sync/SCIM and the agent plane.
+  - Ratchet 487 → 482.
+- **Phase 4 (UI):**
+  - Workspace from token claims.
+  - Full cache reset on identity change, cross-tab and logout, plus server-side logout.
+  - Workspace switcher (backed by `GET /authsec/workspaces`).
+  - OIDC `state_token`.
+  - About 12 broken integrations fixed.
+  - Global 401 handler, not-found states, HubSpot token leak closed.
+- **Phase 6 (in part):**
+  - `tests/integration/flows/e2e_agent_books_flight_test.go`: the two-tenant flight-booking story.
+  - Unscoped-SQL sweep: 482 statements remain outside the layer. By area: database 107, igaread 84, controllers/admin 62, services 51, controllers/platform 47, repository 46, other 85. 9 TENANT-EXEMPT markers.
+
+### Verification at the end
+- **Backend:** `go build`, `go vet` and `go test ./...` green. Integration flows, onboarding and flags-off green. Ratchet at its baseline.
+- **Upgrade rehearsals on the scratch DB:** 043 → 052 applied, 0 failed.
+- **UI:** type-check 0 errors, lint 0 errors (572 warnings), 26 files / 165 tests pass, build OK.
+
+### Not done / needs a decision
+- **RLS** is not enabled on tables yet. It needs the application/owner DB role split (ADR §4.4) and a deploy change.
+- **Caller migration** is finished for users and identity only. The other domains are still scoped by hand, and the ratchet tracks them.
+- **Interrupted agents.** Two delegated agents stopped on the account spend limit. Their committed work was merged and verified; the users-domain work-in-progress was finished by hand and verified.
+- **Phase 5 leftovers:** open P2/P3 rows in `docs/ISSUES.md`, e.g. AS-047 voice tables, AS-060 global `resource_uri`/issuer squatting, AS-079 platform-row convention, AS-080 bootstrap drift, AS-014 per-workspace collector credentials, AS-015 legacy CIBA client authentication.
+- **Release notes required:**
+  - TOTP key must be valid hex in production (startup fails otherwise).
+  - Collectors with actuation must set `controlPlane.sourceToken`.
+  - The Python SDK's legacy CIBA call must send `client_id`.
+  - SAML IdPs must sign responses.
+  - Run `scripts/tenancy-validate.sql` after the 047 deploy.
+  - Test passkey registration on Windows Hello.
+- **Housekeeping:**
+  - Agent worktrees remain under `.claude/worktrees/`, which git ignores; remove them with `git worktree remove`.
+  - Containers still running: `authsec-audit-pg` and the `authsec-dev` compose stack.
+
 ## 2026-10-06 (cont.) — P0 containment track, item 1: interactive sign-in chain (AS-001/002/003/029, UI-001)
 
 **Status:** done, pending your review. **Uncommitted** on backend branch `fix/p0-containment` and UI branch `fix/p0-admin-login-ticket`. Nothing is pushed. You approved the two edits the permission classifier had blocked.

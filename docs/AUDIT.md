@@ -1,5 +1,7 @@
 # AuthSec — Phase 0 Audit
 
+> **Status after Phases 1–6 (2026-10-06):** every P0 in this audit is fixed or contained; partials are listed in [`ISSUES.md`](ISSUES.md) with commit ids. The tenancy model is in [`adr/0001-tenancy-model.md`](adr/0001-tenancy-model.md); progress and remaining work are in [`PROGRESS.md`](PROGRESS.md). The findings below describe the code as it was at `e25d76f`.
+
 **Date:** 2026-10-06 · **Scope:** backend `authsec` @ `e25d76f` (branch `authsec-staging`), frontend `Authsec-ui` @ `2f4a852` (branch `multitenacyV2`) · **Mode:** read-only, no code changes.
 
 This document is the curated summary. Every issue has a row in [`ISSUES.md`](ISSUES.md) with evidence and a proposed fix. The detailed inventories (table by table, route by route, statement by statement) are under [`docs/audit/`](audit/). Those are verbatim agent working notes and are leads, not ground truth.

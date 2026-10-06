@@ -62,7 +62,11 @@ Sibling repos: `../mt-plugin` (the extracted DB-per-tenant service, no longer us
 ### How to run
 Verified on 2026-10-06. Details and error output are in `docs/AUDIT.md` §3.
 - **Backend:**
-  - `go build ./...` · `go vet ./...` · `go test ./...`
+  - `make build` · `make vet` · `make test` (DB-backed unit tests skip without Postgres)
+  - `make test-integration`: flows, onboarding and flags-off via testcontainers. Docker required; `-p 1`.
+  - `make tenant-exempt`: the scoping ratchet. Raw SQL outside `internal/tenancy` needs `// TENANT-EXEMPT: <reason>`, and the count may only go down.
+  - `make dev-up` then `make run`: local Postgres, Hydra and Vault (`deploy/dev`).
+  - Older form: `go build ./...` · `go vet ./...` · `go test ./...`
   - Three packages fail without Postgres on `127.0.0.1:5432`. DB-gated suites need `TEST_DATABASE_URL` / `IGA_TEST_DSN`.
   - Run with `go run ./cmd`, giving env vars as below. It listens on `PORT` (default 7468).
   - If `~/go/pkg/mod` has root-owned dirs, use `GOMODCACHE=<scratch> GOFLAGS=-modcacherw GOPROXY=file://$HOME/go/pkg/mod/cache/download,https://proxy.golang.org,direct`.
@@ -155,3 +159,6 @@ Decided in [`docs/adr/0001-tenancy-model.md`](docs/adr/0001-tenancy-model.md) (a
 - 2026-10-06: Phase 0 audit complete. See `docs/AUDIT.md`, `docs/ISSUES.md`, `docs/PROGRESS.md`.
 - 2026-10-06: ADR-0001 accepted: shared DB + `workspace_id`; users belong to one workspace, operators may hold memberships; same-workspace check on every token issuance; separate platform realm; RLS rolled out per domain in Phase 3.
 - 2026-10-06: The owner asked to run all phases back to back, committing locally (never pushing). Work happens on local branches only; `authsec-staging` auto-deploys.
+- 2026-10-06: Tenant isolation is enforced in four layers: (1) `AuthMiddleware` rejects any path/query/body workspace other than the token's (404) and re-checks membership per request; (2) `internal/tenancy` is the scoped data layer; (3) per-endpoint isolation tests use `TwoTenants` in `tests/integration/flows`; (4) the TENANT-EXEMPT ratchet runs in CI. RLS is designed (ADR §4.4) but not yet enabled.
+- 2026-10-06: Interactive sign-in uses single-use login tickets (`internal/logintickets`, migration 043). The MFA endpoints and webauthn callbacks never trust client-asserted identity.
+- 2026-10-06: Migration numbers in use: 043–048, 050–052 (049 unused).
