@@ -140,6 +140,7 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 	}
 
 	// Sign token using auth-manager's signing method
+	jwtClaims["jti"] = uuid.NewString() // revocable by id (AS-031)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwtClaims)
 	token.Header["kid"] = tokenType // KID header for key selection
 
@@ -169,6 +170,7 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	now := time.Now()
 	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"jti":          uuid.NewString(), // revocable by id (AS-031)
 		"workspace_id": req.WorkspaceID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,

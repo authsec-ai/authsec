@@ -6991,3 +6991,18 @@ COMMENT ON TABLE public.login_tickets IS
     'Short-lived, single-use proof that an interactive sign-in passed its first '
     'factor; gates the anonymous MFA endpoints and the session-token callbacks. '
     'Stores only a SHA-256 hash of the ticket.';
+
+-- ---------------------------------------------------------------------------
+-- revoked_session_tokens (050). Kept identical to migrations/master/050_session_token_revocations.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.revoked_session_tokens (
+    jti          text PRIMARY KEY,
+    workspace_id uuid,
+    user_id      uuid,
+    expires_at   timestamptz NOT NULL,
+    revoked_at   timestamptz NOT NULL DEFAULT now(),
+    reason       text NOT NULL DEFAULT 'logout'
+);
+
+CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_expires ON public.revoked_session_tokens (expires_at);
+CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_workspace ON public.revoked_session_tokens (workspace_id);

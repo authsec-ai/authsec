@@ -288,6 +288,9 @@ func SetupRoutes(
 	authsec := r.Group("/authsec")
 
 	// Liveness and readiness for probes and smoke tests (AS-093).
+	// Ends the presented session (AS-031).
+	authsec.POST("/auth/logout", middlewares.AuthMiddleware(), middlewares.Logout)
+
 	authsec.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	authsec.GET("/readyz", func(c *gin.Context) {
 		db := config.GetDatabase()

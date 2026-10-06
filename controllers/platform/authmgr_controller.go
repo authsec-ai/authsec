@@ -412,6 +412,7 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"jti": uuid.NewString(), // revocable by id (AS-031)
 		"workspace_id": workspaceID,
 		"user_id":      userID,
 		"email_id":     emailID,

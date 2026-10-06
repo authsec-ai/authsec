@@ -463,6 +463,7 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 		"device_info":    deviceInfo,
 	}
 
+	claims["jti"] = uuid.NewString() // revocable by id (AS-031)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	token.Header["kid"] = "default"
 

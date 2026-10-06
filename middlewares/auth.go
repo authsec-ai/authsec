@@ -79,6 +79,12 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			return
 		}
 
+		if sessionRevoked(claims) {
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="session has been revoked"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session has been revoked"})
+			return
+		}
+
 		// Extract user info and set context
 		// Map claims to UserInfo manually or via helper
 		// Note: helper extractUserInfo pulls from context "claims", so we must set that first
@@ -402,9 +408,13 @@ func validateClaims(claims jwt.MapClaims, cfg *AuthConfig) error {
 		}
 	}
 
-	// Validate timing - strict on expiration
+	// Validate timing - strict on expiration; a token must expire (AS-033).
 	now := time.Now().Unix()
-	if exp, ok := claims["exp"].(float64); ok && now > int64(exp) {
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return fmt.Errorf("token missing required expiry (exp) claim")
+	}
+	if now > int64(exp) {
 		return fmt.Errorf("token expired")
 	}
 	if nbf, ok := claims["nbf"].(float64); ok && now < int64(nbf) {
