@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
@@ -21,6 +22,7 @@ func TestConnectorErrorCodeWireValues(t *testing.T) {
 		{ConnErrPolicyBlocked, "policy_blocked"},
 		{ConnErrDeployment, "deployment_misconfigured"},
 		{ConnErrExternalIDNotIssued, "external_id_not_issued"},
+		{ConnErrExternalIDUnreadable, "external_id_unreadable"},
 		{ConnErrCredentialInvalid, "credential_invalid"},
 		{ConnErrScopeInvalid, "scope_invalid"},
 	} {
@@ -49,6 +51,7 @@ func TestClassifyConnectorError(t *testing.T) {
 		{"gcp throttled", gcp.ErrThrottled, ConnErrThrottled},
 		{"probe timeout", ErrAWSProbeTimeout, ConnErrTimeout},
 		{"external id", ErrExternalIDNotIssued, ConnErrExternalIDNotIssued},
+		{"external id unreadable", ErrExternalIDUnreadable, ConnErrExternalIDUnreadable},
 
 		// Deployment-side faults must never read as the customer's mistake.
 		{"aws has no creds", awsdiscovery.ErrNoBaseCredentials, ConnErrDeployment},
@@ -115,5 +118,16 @@ func TestClassifyConnectorErrorTimeoutBeatsThrottle(t *testing.T) {
 func TestClassifyConnectorErrorConstraintFallback(t *testing.T) {
 	if got := ClassifyConnectorError(errors.New("denied by constraints/iam.disableServiceAccountKeyCreation")); got != ConnErrPolicyBlocked {
 		t.Errorf("raw org-policy text = %q, want %q", got, ConnErrPolicyBlocked)
+	}
+}
+
+// The unreadable-external-id error reaches scan runs and API responses, which
+// the console shows. It must never name where the secret lives.
+func TestErrExternalIDUnreadableLeaksNoSecretPath(t *testing.T) {
+	msg := ErrExternalIDUnreadable.Error()
+	for _, leak := range []string{"kv/", "secret/", "workspaces/", "path"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("error text %q contains %q", msg, leak)
+		}
 	}
 }

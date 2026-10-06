@@ -26,6 +26,10 @@ type ConnectorInfo struct {
 	Label     string
 	Status    string
 	Regions   []string
+	// Deselected: regions the selection once held and no longer does
+	// (AWSConnectorAttrs.DeselectedRegions). Their earlier results are kept and
+	// stale, so a not_selected surface there is still a gap (D-58).
+	Deselected []string
 }
 
 // Accounts is the per-request directory of the workspace's AWS accounts,
@@ -48,7 +52,7 @@ func (q *Query) LoadAccounts() (*Accounts, error) {
 	for i := range rows {
 		c := &rows[i]
 		attrs := c.AWSAttrs()
-		info := &ConnectorInfo{ID: c.ID, AccountID: c.ScopeID, Label: attrs.DisplayName, Status: c.Status, Regions: attrs.Regions}
+		info := &ConnectorInfo{ID: c.ID, AccountID: c.ScopeID, Label: attrs.DisplayName, Status: c.Status, Regions: attrs.Regions, Deselected: attrs.DeselectedRegions()}
 		if info.Label == "" {
 			info.Label = c.ScopeID
 		}
@@ -169,3 +173,20 @@ func ExactOf(n int64) Exact { return Exact{Value: &n, Exact: true} }
 // Unknown is a count that could not be established (an optional query that
 // timed out): {value: null, exact: false}.
 func Unknown() Exact { return Exact{Value: nil, Exact: false} }
+
+// notSelectedIsGap decides a not_selected surface. A region the customer once
+// selected and later took out of scope keeps its earlier results, marked stale
+// (D-58, §2.14.13): that is still a gap, reported as stale. A region never
+// selected has no earlier results to be stale: it is scope, not a gap.
+func notSelectedIsGap(surface string, deselected []string) bool {
+	_, region, ok := strings.Cut(surface, ":")
+	if !ok {
+		return false
+	}
+	for _, r := range deselected {
+		if r == region {
+			return true
+		}
+	}
+	return false
+}
