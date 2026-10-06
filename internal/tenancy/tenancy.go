@@ -23,7 +23,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -108,19 +110,39 @@ func DBContext(ctx context.Context, db *gorm.DB) (*gorm.DB, error) {
 }
 
 // Get loads the row with primary key id into dst, only if it belongs to the
-// request's workspace. Another workspace's row is ErrNotFound.
+// request's workspace. Another workspace's row is ErrNotFound. It runs under
+// row-level security (see Transaction).
 func Get(c *gin.Context, db *gorm.DB, dst interface{}, id interface{}) error {
-	scoped, err := DB(c, db)
+	err := Transaction(c.Request.Context(), db, func(tx *gorm.DB) error {
+		return tx.Where("id = ?", id).First(dst).Error
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrNotFound
+	}
+	return err
+}
+
+// Transaction runs fn in a GORM transaction for the workspace carried by ctx,
+// with the workspace predicate applied and Postgres row-level security in
+// force (app.workspace_id set, and the restricted role when available), so a
+// query that forgets its own scoping still cannot reach another workspace.
+func Transaction(ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB) error) error {
+	tc, err := FromContext(ctx)
 	if err != nil {
 		return err
 	}
-	if err := scoped.Where("id = ?", id).First(dst).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrNotFound
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sqlDB, _ := db.DB()
+		if err := tx.Exec(`SELECT set_config('app.workspace_id', ?, true)`, tc.WorkspaceID.String()).Error; err != nil {
+			return fmt.Errorf("tenancy: set app.workspace_id: %w", err)
 		}
-		return err
-	}
-	return nil
+		if role := rlsRole(ctx, sqlDB); role != "" {
+			if err := tx.Exec(`SET LOCAL ROLE ` + role).Error; err != nil {
+				return fmt.Errorf("tenancy: set role: %w", err)
+			}
+		}
+		return fn(tx.Scopes(Scope(tc.WorkspaceID)).Session(&gorm.Session{}))
+	})
 }
 
 // workspacePredicate matches "workspace_id = $1", optionally table-qualified.
@@ -178,11 +200,21 @@ func QueryContext(ctx context.Context, q Querier, query string, args ...interfac
 	return q.QueryContext(ctx, query, all...)
 }
 
-// ExecContext is Exec for code below the HTTP layer.
+// ExecContext is Exec for code below the HTTP layer. Given a *sql.DB it runs
+// under row-level security (see WithTx).
 func ExecContext(ctx context.Context, q Querier, query string, args ...interface{}) (sql.Result, error) {
 	all, err := scopedArgs(ctx, query, args)
 	if err != nil {
 		return nil, err
+	}
+	if db, ok := q.(*sql.DB); ok {
+		var res sql.Result
+		err := WithTx(ctx, db, all[0].(uuid.UUID), func(tx *sql.Tx) error {
+			var e error
+			res, e = tx.ExecContext(ctx, query, all...)
+			return e
+		})
+		return res, err
 	}
 	return q.ExecContext(ctx, query, all...)
 }
@@ -193,7 +225,14 @@ func QueryRowContext(ctx context.Context, q Querier, query string, args []interf
 	if err != nil {
 		return err
 	}
-	if err := q.QueryRowContext(ctx, query, all...).Scan(dest...); err != nil {
+	if db, ok := q.(*sql.DB); ok {
+		err = WithTx(ctx, db, all[0].(uuid.UUID), func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, query, all...).Scan(dest...)
+		})
+	} else {
+		err = q.QueryRowContext(ctx, query, all...).Scan(dest...)
+	}
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -217,6 +256,12 @@ func WithTx(ctx context.Context, db *sql.DB, workspaceID uuid.UUID, fn func(*sql
 	if _, err := tx.ExecContext(ctx, `SELECT set_config('app.workspace_id', $1, true)`, workspaceID.String()); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("tenancy: set app.workspace_id: %w", err)
+	}
+	if role := rlsRole(ctx, db); role != "" {
+		if _, err := tx.ExecContext(ctx, `SET LOCAL ROLE `+role); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("tenancy: set role: %w", err)
+		}
 	}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
@@ -249,3 +294,49 @@ func Workspace(c *gin.Context) (uuid.UUID, error) {
 	}
 	return tc.WorkspaceID, nil
 }
+
+// rlsRole returns the restricted role scoped transactions switch to, or "" when
+// it does not exist or this connection cannot assume it (migration 054 creates
+// it; scripts/create-tenant-role.sql does when the migration could not).
+// Switching matters because Postgres exempts superusers from row-level
+// security. AUTHSEC_RLS_ROLE=off disables the switch.
+func rlsRole(ctx context.Context, db *sql.DB) string {
+	name := os.Getenv("AUTHSEC_RLS_ROLE")
+	if name == "off" || db == nil {
+		return ""
+	}
+	if name == "" {
+		name = "authsec_tenant"
+	}
+	if !roleNamePattern.MatchString(name) {
+		return ""
+	}
+	key := roleCacheKey{db: db, role: name}
+	if v, ok := roleCache.Load(key); ok {
+		if v.(bool) {
+			return name
+		}
+		return ""
+	}
+	var ok bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)
+		AND pg_has_role(current_user, (SELECT oid FROM pg_roles WHERE rolname = $1), 'MEMBER')`, name).Scan(&ok)
+	if err != nil {
+		return "" // not cached: retried on the next transaction
+	}
+	roleCache.Store(key, ok)
+	if ok {
+		return name
+	}
+	return ""
+}
+
+type roleCacheKey struct {
+	db   *sql.DB
+	role string
+}
+
+var (
+	roleCache       sync.Map
+	roleNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+)
