@@ -694,9 +694,6 @@ Manages registered external service integrations with Vault-backed credentials.
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/authsec/exsvc/health` | Public | Health check |
-| `GET` | `/authsec/exsvc/debug/auth` | JWT | Debug JWT claims |
-| `GET` | `/authsec/exsvc/debug/test` | JWT | Connectivity test |
-| `GET` | `/authsec/exsvc/debug/token` | JWT | Inspect token context |
 | `POST` | `/authsec/exsvc/services` | JWT + `external-service:create` | Register external service |
 | `GET` | `/authsec/exsvc/services` | JWT + `external-service:read` | List external services |
 | `GET` | `/authsec/exsvc/services/:id` | JWT + `external-service:read` | Get external service |

@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -340,8 +341,11 @@ func main() {
 	// exclude /authsec/metrics from compression so Prometheus can scrape it
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/authsec/metrics"})))
 
-	// Prometheus metrics endpoint
-	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))
+	// Prometheus metrics (AS-075): never public. METRICS_ADDR serves them on a
+	// separate listener (e.g. 127.0.0.1:9100, or a cluster-internal port);
+	// METRICS_TOKEN mounts /authsec/metrics on the main port behind a bearer
+	// token. With neither, the metrics are not exposed.
+	metricsSrv := mountMetrics(r)
 
 	// favicon.ico — browsers automatically request this for every HTML page,
 	// including backend-served pages like /authsec/hmgr/consent. Return 204
@@ -550,10 +554,45 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(ctx)
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced shutdown: %v", err)
 	}
 	log.Println("Server exited cleanly")
+}
+
+// mountMetrics exposes the Prometheus handler without making it public: on
+// its own listener when METRICS_ADDR is set (returned for shutdown), and/or
+// on the main router behind "Authorization: Bearer $METRICS_TOKEN".
+func mountMetrics(r *gin.Engine) *http.Server {
+	if token := os.Getenv("METRICS_TOKEN"); token != "" {
+		want := []byte("Bearer " + token)
+		h := promhttp.Handler()
+		r.GET("/authsec/metrics", func(c *gin.Context) {
+			if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), want) != 1 {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+			h.ServeHTTP(c.Writer, c.Request)
+		})
+	}
+	addr := os.Getenv("METRICS_ADDR")
+	if addr == "" {
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/authsec/metrics", promhttp.Handler())
+	ms := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := ms.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics listener on %s stopped: %v", addr, err)
+		}
+	}()
+	log.Printf("Prometheus metrics served on %s/metrics", addr)
+	return ms
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

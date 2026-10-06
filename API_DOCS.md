@@ -1790,7 +1790,7 @@ Manages service-to-service authentication credentials.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/authsec/metrics` | Public | Prometheus metrics scrape endpoint |
+| GET | `/authsec/metrics` | Bearer `METRICS_TOKEN` (or `METRICS_ADDR` listener) | Prometheus metrics; not exposed unless configured |
 
 ---
 

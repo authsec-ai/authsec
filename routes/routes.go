@@ -9,7 +9,6 @@
 //	/authsec/oidc/*          – OIDC federation
 //	/authsec/scim/v2/*       – SCIM 2.0 provisioning
 //	/authsec/health          – health checks
-//	/authsec/debug/*         – debug helpers (dev only)
 //
 // The well-known OAuth/OIDC discovery endpoints remain at the root as required by RFC 8414
 // and OpenID Connect Discovery. They are advertised from the canonical OAuth issuer host.
@@ -1349,27 +1348,8 @@ func SetupRoutes(
 		exsvc.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"status": "ok", "service": "external-service"})
 		})
-		exsvc.GET("/debug/auth", middlewares.AuthMiddleware(), platformCtrl.DebugExternalServiceAuth)
-		exsvc.GET("/debug/test", middlewares.AuthMiddleware(), func(c *gin.Context) {
-			c.JSON(200, gin.H{"status": "authenticated", "path": "/debug/test"})
-		})
-		exsvc.GET("/debug/token", middlewares.AuthMiddleware(), func(c *gin.Context) {
-			contextData := make(map[string]interface{})
-			if claims, exists := c.Get("claims"); exists {
-				contextData["claims"] = claims
-			}
-			if perms, exists := c.Get("perms"); exists {
-				contextData["perms"] = perms
-			}
-			if scope, exists := c.Get("scope"); exists {
-				contextData["scope"] = scope
-			}
-			if user, exists := c.Get("user"); exists {
-				contextData["user"] = user
-			}
-			contextData["all_context_keys"] = c.Keys
-			c.JSON(200, gin.H{"status": "authenticated", "context_data": contextData})
-		})
+		// /debug/{auth,test,token} echoed the caller's claims and context;
+		// removed (AS-075).
 
 		// Dual-auth: accepts standard auth-manager JWT or SPIFFE JWT-SVID (for agent access).
 		extSvcs := exsvc.Group("/services")

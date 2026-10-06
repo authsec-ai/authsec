@@ -415,67 +415,6 @@ func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Conte
 	})
 }
 
-// DebugExternalServiceAuth dumps JWT claims — useful for troubleshooting.
-func DebugExternalServiceAuth(c *gin.Context) {
-	claimsInterface, exists := c.Get("claims")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "No claims found"})
-		return
-	}
-
-	var claims map[string]interface{}
-	switch v := claimsInterface.(type) {
-	case map[string]interface{}:
-		claims = v
-	case jwt.MapClaims:
-		claims = map[string]interface{}(v)
-	default:
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid claims format", "type": fmt.Sprintf("%T", claimsInterface)})
-		return
-	}
-
-	roles, scopes, resources := []string{}, []string{}, []string{}
-	if rv, ok := claims["roles"].([]interface{}); ok {
-		for _, r := range rv {
-			if s, ok := r.(string); ok {
-				roles = append(roles, s)
-			}
-		}
-	}
-	if sv, ok := claims["scopes"].([]interface{}); ok {
-		for _, s := range sv {
-			if str, ok := s.(string); ok {
-				scopes = append(scopes, str)
-			}
-		}
-	}
-	if perms, ok := claims["perms"].(map[string]interface{}); ok {
-		if allow, ok := perms["allow"].([]interface{}); ok {
-			for _, p := range allow {
-				if s, ok := p.(string); ok {
-					scopes = append(scopes, s)
-				}
-			}
-		}
-	}
-	if rv, ok := claims["resources"].([]interface{}); ok {
-		for _, r := range rv {
-			if s, ok := r.(string); ok {
-				resources = append(resources, s)
-			}
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"claims":              claims,
-		"extracted_roles":     roles,
-		"extracted_scopes":    scopes,
-		"extracted_resources": resources,
-		"client_id":           claims["client_id"],
-		"workspace_id":        claims["workspace_id"],
-	})
-}
-
 /* -------------------------------------------------------------------------- */
 /*                              Local helpers                                 */
 /* -------------------------------------------------------------------------- */
