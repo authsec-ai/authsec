@@ -47,6 +47,16 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # Tenant isolation ratchet: raw SQL outside internal/tenancy needs a
+      # TENANT-EXEMPT reason, and the count may only go down (ADR-0001).
+      - name: Tenant-scoping ratchet
+        run: scripts/check-tenant-exempt.sh
+
+      # Auth, onboarding and cross-tenant isolation flows. Testcontainers
+      # starts its own Postgres; -p 1 avoids reaper name races.
+      - name: Integration flows (incl. cross-tenant isolation)
+        run: go test -tags integration -p 1 ./tests/integration/flows/ ./tests/integration/onboarding/ ./tests/integration/flagsoff/ -count=1
+
       # The DB-gated suites SKIP unless their DSN env var is set -- so plain
       # `go test ./...` above prints ok while running none of them. That is
       # exactly how the Phase 2 evidence defect shipped once: the tests that

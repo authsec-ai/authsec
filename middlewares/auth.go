@@ -10,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	authz "github.com/authsec-ai/authsec/internal/authz"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -97,6 +98,12 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		// A request may only name the workspace its token was issued for.
 		if !enforceTokenWorkspace(c, info.WorkspaceID) {
 			return
+		}
+
+		// The one request-scoped tenant context (ADR-0001 §4.2).
+		if ws, err := uuid.Parse(info.WorkspaceID); err == nil {
+			uid, _ := uuid.Parse(info.UserID)
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: uid, PrincipalKind: "user"})
 		}
 
 		// Check admin access for admin paths (server auth)
