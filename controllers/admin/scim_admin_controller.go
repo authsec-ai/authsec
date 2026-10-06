@@ -240,7 +240,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 		PasswordHash: "",
 	}
 
-	if err := sac.adminUserRepo.CreateAdminUser(newUser); err != nil {
+	if err := sac.adminUserRepo.CreateAdminUser(c.Request.Context(), newUser); err != nil {
 		log.Printf("SCIM Admin: Failed to create user: %v", err)
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to create user", ""))
 		return

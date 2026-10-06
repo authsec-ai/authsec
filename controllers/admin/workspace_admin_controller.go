@@ -394,7 +394,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	adminRoleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, workspace.WorkspaceID)
+	adminRoleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), workspace.WorkspaceID), tx)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to ensure admin role/permissions in main database: %v", err)

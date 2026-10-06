@@ -779,7 +779,7 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	}
 
 	repo := database.NewAdminUserRepository(dbConn)
-	userRoles, err := repo.GetUserRoles(userID, workspaceID)
+	userRoles, err := repo.GetUserRoles(database.WithWorkspace(c.Request.Context(), workspaceID), userID)
 	if err != nil || len(userRoles) == 0 {
 		return
 	}

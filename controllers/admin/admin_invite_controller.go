@@ -121,7 +121,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 
 	// Check if user with this email already exists IN THIS TENANT (tenant-scoped check)
 	// This respects the new composite UNIQUE constraint (email, workspace_id)
-	u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, workspaceUUID)
+	u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(ctx, req.Email)
 	if err == nil && u != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "User with this email already exists in this tenant"})
 		return
@@ -220,7 +220,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	// Save to database using repository
-	if err := aic.adminUserRepo.CreateAdminUser(&adminUser); err != nil {
+	if err := aic.adminUserRepo.CreateAdminUser(ctx, &adminUser); err != nil {
 		log.Printf("User-flow: failed to create admin user: %v", err)
 
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin user: " + err.Error()})
@@ -229,7 +229,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 
 	// Assign admin role and binding for this tenant/user (tenant-wide)
 	{
-		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(workspaceUUID)
+		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(ctx)
 		if err != nil {
 			log.Printf("User-flow:ERROR: Failed to ensure admin role/perms for invited admin: %v", err)
 		} else {

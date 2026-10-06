@@ -54,7 +54,7 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 	// Fetch admin roles from database
 	var roles []string
 	if adminUser.WorkspaceID != nil && *adminUser.WorkspaceID != uuid.Nil {
-		rolesFromDB, err := oc.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.WorkspaceID)
+		rolesFromDB, err := oc.adminUserRepo.GetAdminRoles(database.WithWorkspace(context.Background(), *adminUser.WorkspaceID), adminUser.ID)
 		if err == nil {
 			roles = rolesFromDB
 		} else {
@@ -911,7 +911,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 
 	// Look up the AdminUser to generate a properly-scoped JWT — in the
 	// resolved user's own workspace only, never by email alone.
-	adminUser, err := oc.adminUserRepo.GetAdminUserByEmailAndTenant(user.Email, user.WorkspaceID)
+	adminUser, err := oc.adminUserRepo.GetAdminUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), user.WorkspaceID), user.Email)
 	if err != nil {
 		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to look up admin user by email %s: %v", user.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load user account"})
@@ -1041,7 +1041,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Use EnsureAdminRoleAndPermissionsTx to seed both role AND permissions (fix for OIDC registration bug)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, workspaceID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), workspaceID), tx)
 	if err != nil {
 		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", workspaceID, err)
 	} else {
@@ -1347,7 +1347,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Use EnsureAdminRoleAndPermissionsTx to seed both role AND permissions (fix for OIDC registration bug)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, workspaceID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), workspaceID), tx)
 	if err != nil {
 		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", workspaceID, err)
 	} else {

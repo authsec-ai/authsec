@@ -114,15 +114,13 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		return
 	}
 
-	tc, err := tenancy.From(c)
-	if err != nil {
+	if _, err := tenancy.From(c); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
 		return
 	}
-	workspaceUUID := tc.WorkspaceID
 	ctx := c.Request.Context()
 
-	if err := auc.adminUserRepo.EnsureTenantAdminRoleAssignment(workspaceUUID); err != nil {
+	if err := auc.adminUserRepo.EnsureTenantAdminRoleAssignment(ctx); err != nil {
 		log.Printf("%s: failed ensure tenant admin roles: %v", logPrefix, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile admin roles"})
 		return
@@ -170,7 +168,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		}
 
 		// Fetch and add roles for this user
-		roles, err := auc.adminUserRepo.GetUserRoles(user.ID, workspaceUUID)
+		roles, err := auc.adminUserRepo.GetUserRoles(ctx, user.ID)
 		if err != nil {
 			log.Printf("%s: failed to get roles for user %s: %v", logPrefix, user.ID, err)
 			payload["roles"] = []interface{}{} // Return empty array on error
@@ -1267,7 +1265,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	// Step 1: Delete all data from the master database
 	logger.Info("Step 1: Deleting tenant data from master database")
-	deletedCounts, err := auc.workspaceRepo.DeleteTenant(workspaceUUID)
+	deletedCounts, err := auc.workspaceRepo.DeleteTenant(c.Request.Context())
 	if err != nil {
 		logger.WithError(err).Error("Failed to delete tenant data from master database")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete tenant data: " + err.Error()})

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -989,7 +990,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// is now resolved directly via clients.workspace_id.
 
 	// Assign admin role BEFORE committing transaction (workspace-scoped)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, pendingReg.WorkspaceID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID), tx)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to ensure admin role/permissions: %v", err)
@@ -1084,7 +1085,7 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	var roles []string
 	if adminUser.WorkspaceID != nil && *adminUser.WorkspaceID != uuid.Nil {
 		// Get roles for this admin user in their tenant
-		rolesFromDB, err := aac.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.WorkspaceID)
+		rolesFromDB, err := aac.adminUserRepo.GetAdminRoles(database.WithWorkspace(context.Background(), *adminUser.WorkspaceID), adminUser.ID)
 		if err == nil {
 			roles = rolesFromDB
 		} else {

@@ -448,7 +448,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(ctx context.Context, adUser m
 			PasswordHash: "", // No password for synced users
 		}
 
-		if err := asc.adminUserRepo.CreateAdminUser(newUser); err != nil {
+		if err := asc.adminUserRepo.CreateAdminUser(ctx, newUser); err != nil {
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
@@ -634,7 +634,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(ctx context.Context, entra
 			PasswordHash: "", // No password for synced users
 		}
 
-		if err := asc.adminUserRepo.CreateAdminUser(newUser); err != nil {
+		if err := asc.adminUserRepo.CreateAdminUser(ctx, newUser); err != nil {
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
