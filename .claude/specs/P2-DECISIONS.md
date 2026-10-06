@@ -1034,3 +1034,52 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   `random_page_cost` 4 the planner keeps the sequential scans of edges and
   revisions for them. *Why raise it:* headroom on the reads a user opens most,
   and the partial entitlement index is a trap for any history read.
+
+## Added by the Kubernetes traversal (feat/k8s-access-graph)
+
+- **D-107 Kubernetes on `/graph`, `/graph/expand`, `/graph/path`
+  (`internal/igaread/traverse_k8s.go`).** *Provisional, for review.* The
+  traversal routes read the Kubernetes projection's rows (provider `k8s`, the
+  same tables) as well as AWS's. Additive only: every AWS response is
+  unchanged byte for byte (`p2_k8s_graph_lifecycle_test.go` compares them
+  before and after a cluster's rows arrive).
+  - *One provider per traversal.* The root's provider (an external principal
+    is AWS's) is the provider of every node and edge the request reads: each
+    spec names it through a slot rendered `'aws'` or `'k8s'`, never
+    `IN ('aws','k8s')`, so no edge across the providers is ever walked. A
+    `/graph/path` `to` of the other provider is 404, as before.
+  - *Kinds.* `executes_as` (workload -> ServiceAccount, basis `observed` |
+    `declared`) and `grant` (identity -> rule); no `target` (a rule names
+    resource types, 040 forbids a resource row), `member_of`, `can_assume` or
+    `task_execution_role`, and no frontier for them.
+  - *Nodes* keep the AWS shape without `account` or `arn` (both absent) and add
+    `provider: "k8s"`, `scope {kind: k8s_cluster, id, label}`, `sub_scope`
+    (namespace, null when cluster-scoped) and `native_id` (workloads and
+    identities, the inventory's own expressions). Identity kinds are
+    `k8s_service_account | k8s_user | k8s_group`; `restrictions` is always
+    `{0, false}` (RBAC has no Deny or boundary). A rule node has `sid: ""`, no
+    `index`, `exclusions: []`, `label` "<verbs> on <targets>", `group_key`
+    `k8s:<verbs>→<targets>@<cluster>/<role namespace or *>`, and `k8s_rule
+    {verbs, api_groups, resources, resource_names, non_resource_urls}`.
+  - *Grants* add `provider`, `policy_ref`, `policy_kind` and `assignment {ref,
+    kind, name, namespace}` -- the binding, whose namespace (null for a
+    ClusterRoleBinding) is where the rule applies.
+  - *Limitations* are Kubernetes coverage, never AWS surfaces:
+    `k8s_coverage_gap {cluster, namespace, state, observed_at}` when the newest
+    applied sweep of the element's partition's source and cluster could not
+    end a row there (states `not_swept | incomplete | namespaced_only |
+    namespace_not_swept | unattributed`), and `k8s_unresolved_bindings {count,
+    bindings, truncated}` on an identity bound to a role the sweep did not see
+    (a partial grant with no rule: unresolved is not none). A stale element's
+    `stale_reason` is the same gap, `{account_id: <cluster>, surface:
+    k8s_sweep, state, since: null}`.
+  - *Meta.* `graph_state: "unrevisioned"`; `rev`/`published_at` report the AWS
+    publication current in the snapshot (null when none), as the inventory
+    does; `limitations: [effective_access_not_evaluated,
+    k8s_observations_not_recorded]` -- no cloud_observation backs a Kubernetes
+    claim and `/evidence` stays AWS-only. A workspace with Kubernetes rows and
+    no publication graphs them; an AWS root there is still 404 (D-4). An
+    expansion cursor of a Kubernetes node carries rev 0 and is never stale.
+  - *Not done.* Following an IRSA / EKS Pod Identity resolution across the
+    providers; `/evidence` for Kubernetes claims; the console's rendering
+    (new kinds, icons, `rev: null` expansion, node routes).

@@ -70,6 +70,10 @@ func (t *graphTraversal) decorateLimitations(lv *graphLevel, nodes []*GraphNode,
 	if len(nodes)+len(edges) == 0 {
 		return nil
 	}
+	if t.provider == models.ProviderK8s {
+		// Kubernetes coverage, never /evidence's AWS claims (traverse_k8s.go).
+		return t.decorateK8sLimitations(lv, nodes, edges)
+	}
 	refs := make([]Ref, 0, len(nodes)+len(edges))
 	for _, n := range nodes {
 		refs = append(refs, Ref{Type: n.typ, ID: n.id})
@@ -207,6 +211,9 @@ func graphSortPairs(ps []graphPair, pos, kindPos map[string]int) {
 func (t *graphTraversal) decorateEdges(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
 	if len(edges) == 0 {
 		return nil
+	}
+	if t.provider == models.ProviderK8s {
+		return t.decorateK8sEdges(lv, edges, node)
 	}
 	crossing := false
 	for _, e := range edges {

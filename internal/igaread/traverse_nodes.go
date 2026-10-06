@@ -38,7 +38,32 @@ import (
 // marks the ones it found (fetched). Each read carries D-6's readability
 // predicate, so the root of a request and every node a level reaches are held
 // to the same rule.
+//
+// Of the traversal's provider only (traverse_k8s.go): before the root is read
+// the provider is not known, and the root is looked for among AWS's nodes,
+// then Kubernetes'.
 func (t *graphTraversal) fetchNodes(lv *graphLevel, nodes []*GraphNode) error {
+	if t.provider != models.ProviderK8s {
+		if err := t.fetchAWSNodes(lv, nodes); err != nil {
+			return err
+		}
+	}
+	if t.provider != models.ProviderAWS {
+		var rest []*GraphNode
+		for _, n := range nodes {
+			if !n.fetched {
+				rest = append(rest, n)
+			}
+		}
+		if len(rest) > 0 {
+			return t.fetchK8sNodes(lv, rest)
+		}
+	}
+	return nil
+}
+
+// fetchAWSNodes is fetchNodes for AWS nodes (and external principals).
+func (t *graphTraversal) fetchAWSNodes(lv *graphLevel, nodes []*GraphNode) error {
 	byType := map[string]map[uuid.UUID]*GraphNode{}
 	for _, n := range nodes {
 		if byType[n.typ] == nil {
@@ -89,7 +114,7 @@ func (t *graphTraversal) fetchWorkloads(lv *graphLevel, ids []uuid.UUID, set map
 	}
 	for _, r := range rows {
 		n := set[r.ID]
-		n.Kind, n.Label, n.key = RefWorkload, r.DisplayName, r.SourceKey
+		n.provider, n.Kind, n.Label, n.key = models.ProviderAWS, RefWorkload, r.DisplayName, r.SourceKey
 		n.ARN, n.RuntimeKind = NativeOfKey(r.SourceKey), r.RuntimeKind
 		t.ownAccount(n, r.AccountID)
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
@@ -121,7 +146,7 @@ func (t *graphTraversal) fetchIdentities(lv *graphLevel, ids []uuid.UUID, set ma
 	}
 	for _, r := range rows {
 		n := set[r.ID]
-		n.Kind, n.Label, n.key = r.AccountKind, r.DisplayName, r.SourceKey
+		n.provider, n.Kind, n.Label, n.key = models.ProviderAWS, r.AccountKind, r.DisplayName, r.SourceKey
 		n.ARN = NativeOfKey(r.SourceKey)
 		t.ownAccount(n, r.AccountID)
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
@@ -285,7 +310,7 @@ func (t *graphTraversal) fetchStatements(lv *graphLevel, ids []uuid.UUID, set ma
 	for _, r := range rows {
 		n := set[r.ID]
 		st := graphParseStatement(r.NativeRights)
-		n.Kind, n.key = RefStatement, r.SourceKey
+		n.provider, n.Kind, n.key = models.ProviderAWS, RefStatement, r.SourceKey
 		n.Label = GraphStatementLabel(st.Actions, st.NotActions)
 		sid := r.Sid
 		n.Policy, n.Effect, n.Sid = r.PolicyName, r.Effect, &sid
@@ -328,7 +353,7 @@ func (t *graphTraversal) fetchResources(lv *graphLevel, ids []uuid.UUID, set map
 	}
 	for _, r := range rows {
 		n := set[r.ID]
-		n.Kind, n.key = r.Kind, r.SourceKey
+		n.provider, n.Kind, n.key = models.ProviderAWS, r.Kind, r.SourceKey
 		n.Label, n.Text, n.Type = GraphResourceLabel(r.DisplayName), r.DisplayName, ResourceType(r.DisplayName)
 		// D-3: a resource's connectedness is the PROJECTED value, never the
 		// live connector list, so the canvas and the list agree at one rev.
@@ -472,6 +497,9 @@ func graphDedupe(xs []string) []string {
 // exclusions, and stale reasons. Their limitations follow
 // (decorateLimitations), in one call with the level's edges.
 func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error {
+	if t.provider == models.ProviderK8s {
+		return t.decorateK8sNodes(lv, nodes)
+	}
 	byType := map[string][]*GraphNode{}
 	for _, n := range nodes {
 		byType[n.typ] = append(byType[n.typ], n)

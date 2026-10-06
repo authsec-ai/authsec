@@ -35,13 +35,47 @@ package igaread
 // A target has no state of its own: its lifecycle is its statement's
 // (§5.4 "Filtered by: statement lifecycle"), so the default reads only active
 // statements' targets, and the edge's state is the statement's (D-1).
+//
+// ONE PROVIDER PER TRAVERSAL. Every node and edge predicate names the
+// provider through graphProviderSlot, which the traversal renders as its
+// root's provider -- 'aws' for an AWS root, so the SQL an AWS request runs is
+// the SQL it always ran, and 'k8s' for a Kubernetes root (traverse_k8s.go).
+// Never `provider IN ('aws', 'k8s')`: no projector writes an edge from one
+// provider's node to the other's, and a predicate that admitted one would let
+// a defect in either projector draw a path across the boundary. The one
+// crossing that exists -- an AWS trust naming a Kubernetes service account
+// (IRSA, EKS Pod Identity) -- runs through an external principal, which is
+// shown and never followed (§5.4, graphResolutionUnfollowed).
 
 import (
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/authsec-ai/authsec/models"
 )
+
+// graphProviderSlot stands for the traversal's provider in every spec below;
+// graphRender replaces it with the quoted literal. A slot rather than a bind
+// variable because the specs are spliced into statements whose bind order the
+// callers own, and the provider is one of two constants, never input.
+const graphProviderSlot = "{{provider}}"
+
+// graphRender renders a spec fragment for one provider (models.ProviderAWS or
+// models.ProviderK8s; anything else is a defect and panics rather than
+// reading another provider's rows).
+func graphRender(sql, provider string) string {
+	switch provider {
+	case models.ProviderAWS, models.ProviderK8s:
+	default:
+		panic("igaread: traversal provider " + provider + " is not aws or k8s")
+	}
+	return strings.ReplaceAll(sql, graphProviderSlot, "'"+provider+"'")
+}
+
+// render is graphRender for this traversal's provider.
+func (t *graphTraversal) render(sql string) string { return graphRender(sql, t.provider) }
 
 // graphEdgeSpec is how to read one edge kind in one direction. Every SQL
 // fragment is free of bind variables except where a caller appends them. The
@@ -150,7 +184,7 @@ func graphRelForward(kind string, nearTypes ...string) *graphEdgeSpec {
 		kind: kind, claim: RefRelationship,
 		from: `iga_relationship e0
 		  JOIN iga_identity_accounts far ON far.workspace_id = e0.workspace_id AND far.id = e0.target_identity_account_id`,
-		where:  `e0.relationship_type = '` + kind + `' AND far.provider = 'aws' AND ` + SupportedSQL("far", "identity_account_id"),
+		where:  `e0.relationship_type = '` + kind + `' AND far.provider = ` + graphProviderSlot + ` AND ` + SupportedSQL("far", "identity_account_id"),
 		live:   graphRelLive,
 		near:   near,
 		farKey: `far.source_key`,
@@ -165,7 +199,7 @@ func graphRelReverse(kind, farTable, farColumn, farSupport string) *graphEdgeSpe
 		kind: kind, claim: RefRelationship,
 		from: `iga_relationship e0
 		  JOIN ` + farTable + ` far ON far.workspace_id = e0.workspace_id AND far.id = e0.` + farColumn,
-		where:  `e0.relationship_type = '` + kind + `' AND far.provider = 'aws' AND ` + SupportedSQL("far", farSupport),
+		where:  `e0.relationship_type = '` + kind + `' AND far.provider = ` + graphProviderSlot + ` AND ` + SupportedSQL("far", farSupport),
 		live:   graphRelLive,
 		near:   map[string]string{RefIdentity: `e0.target_identity_account_id`},
 		farKey: `far.source_key`,
@@ -185,7 +219,7 @@ var graphSpecs = map[string]map[string]*graphEdgeSpec{
 			from: `iga_access_edges e0
 			  JOIN iga_entitlements far ON far.workspace_id = e0.workspace_id AND far.id = e0.entitlement_id
 			  LEFT JOIN iga_policy p ON p.workspace_id = far.workspace_id AND p.id = far.policy_id`,
-			where: `e0.provider = 'aws' AND far.provider = 'aws' AND far.effect = 'allow' AND ` +
+			where: `e0.provider = ` + graphProviderSlot + ` AND far.provider = ` + graphProviderSlot + ` AND far.effect = 'allow' AND ` +
 				SupportedSQL("far", "entitlement_id"),
 			live:   `e0.state IN ('current', 'stale')`,
 			near:   map[string]string{RefIdentity: `e0.subject_identity_account_id`},
@@ -197,8 +231,8 @@ var graphSpecs = map[string]map[string]*graphEdgeSpec{
 			from: `iga_entitlement_target e0
 			  JOIN iga_entitlements st ON st.workspace_id = e0.workspace_id AND st.id = e0.entitlement_id
 			  JOIN iga_resources far ON far.workspace_id = e0.workspace_id AND far.id = e0.resource_id`,
-			where: `e0.target_mode = 'resource' AND st.provider = 'aws' AND st.effect = 'allow'
-			        AND far.provider = 'aws' AND ` + SupportedSQL("far", "resource_id"),
+			where: `e0.target_mode = 'resource' AND st.provider = ` + graphProviderSlot + ` AND st.effect = 'allow'
+			        AND far.provider = ` + graphProviderSlot + ` AND ` + SupportedSQL("far", "resource_id"),
 			live:   `st.lifecycle = 'active'`,
 			near:   map[string]string{RefStatement: `e0.entitlement_id`},
 			farKey: `far.source_key`,
@@ -218,7 +252,7 @@ var graphSpecs = map[string]map[string]*graphEdgeSpec{
 			  LEFT JOIN iga_identity_accounts fi ON fi.workspace_id = e0.workspace_id AND fi.id = e0.source_identity_account_id
 			  LEFT JOIN iga_external_principal fe ON fe.workspace_id = e0.workspace_id AND fe.id = e0.source_external_principal_id`,
 			where: `e0.relationship_type = 'can_assume'
-			        AND ((fi.id IS NOT NULL AND fi.provider = 'aws' AND ` + SupportedSQL("fi", "identity_account_id") + `)
+			        AND ((fi.id IS NOT NULL AND fi.provider = ` + graphProviderSlot + ` AND ` + SupportedSQL("fi", "identity_account_id") + `)
 			             OR fe.id IS NOT NULL)`,
 			live:   graphRelLive,
 			near:   map[string]string{RefIdentity: `e0.target_identity_account_id`},
@@ -231,8 +265,8 @@ var graphSpecs = map[string]map[string]*graphEdgeSpec{
 			  JOIN iga_entitlements st ON st.workspace_id = e0.workspace_id AND st.id = e0.entitlement_id
 			  JOIN iga_identity_accounts far ON far.workspace_id = e0.workspace_id AND far.id = e0.subject_identity_account_id
 			  LEFT JOIN iga_policy p ON p.workspace_id = st.workspace_id AND p.id = st.policy_id`,
-			where: `e0.provider = 'aws' AND st.provider = 'aws' AND st.effect = 'allow'
-			        AND far.provider = 'aws' AND ` + SupportedSQL("far", "identity_account_id"),
+			where: `e0.provider = ` + graphProviderSlot + ` AND st.provider = ` + graphProviderSlot + ` AND st.effect = 'allow'
+			        AND far.provider = ` + graphProviderSlot + ` AND ` + SupportedSQL("far", "identity_account_id"),
 			// Literally <> 'ended': idx_iga_access_edges_entitlement is partial
 			// on exactly this predicate.
 			live:   `e0.state <> 'ended'`,
@@ -244,7 +278,7 @@ var graphSpecs = map[string]map[string]*graphEdgeSpec{
 			kind: GraphEdgeTarget, claim: RefTarget,
 			from: `iga_entitlement_target e0
 			  JOIN iga_entitlements far ON far.workspace_id = e0.workspace_id AND far.id = e0.entitlement_id`,
-			where: `e0.target_mode = 'resource' AND far.provider = 'aws' AND far.effect = 'allow' AND ` +
+			where: `e0.target_mode = 'resource' AND far.provider = ` + graphProviderSlot + ` AND far.effect = 'allow' AND ` +
 				SupportedSQL("far", "entitlement_id"),
 			live:   `far.lifecycle = 'active'`,
 			near:   map[string]string{RefResource: `e0.resource_id`},
@@ -269,8 +303,13 @@ var graphNodeTables = map[string]string{
 // predicates is the spec's WHERE after the workspace: its own predicates and,
 // unless the request asked for ended edges, its lifecycle filter.
 func (t *graphTraversal) predicates(s *graphEdgeSpec) string {
+	return t.render(graphPredicates(s, t.ended))
+}
+
+// graphPredicates is predicates before the provider is rendered.
+func graphPredicates(s *graphEdgeSpec, ended bool) string {
 	p := s.where
-	if !t.ended {
+	if !ended {
 		p += " AND " + s.live
 	}
 	return p
@@ -296,7 +335,7 @@ func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, groups map
 		return nil, nil
 	}
 	sql := `SELECT ` + s.cols + `, ` + s.farKey + ` AS far_key
-	          FROM ` + s.from + `
+	          FROM ` + t.render(s.from) + `
 	         WHERE e0.workspace_id = ? AND (` + strings.Join(ors, " OR ") + `)
 	           AND ` + t.predicates(s)
 	if after != nil {
@@ -351,7 +390,7 @@ func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes
 			N  int64
 		}
 		if err := tx.Raw(`SELECT n.id, (SELECT count(*) FROM (
-		                          SELECT 1 FROM `+s.from+`
+		                          SELECT 1 FROM `+t.render(s.from)+`
 		                           WHERE e0.workspace_id = n.workspace_id AND `+expr+` = n.id
 		                             AND `+t.predicates(s)+`
 		                           LIMIT ?) d) AS n

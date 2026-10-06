@@ -219,8 +219,23 @@ type GraphNode struct {
 	Text string `json:"text,omitempty"`
 	Type string `json:"type,omitempty"`
 
+	// Kubernetes nodes only (traverse_k8s.go), all additive and absent on
+	// every AWS node, so an AWS response is what it always was. provider is
+	// "k8s"; scope is the cluster ({kind: k8s_cluster, id, label}), sub_scope
+	// the namespace (null for a cluster-scoped object), native_id the id a
+	// person recognises (namespace/name) on workloads and identities -- the
+	// unified inventory's own fields, read by its own expressions -- and
+	// k8s_rule a statement's PolicyRule, verbatim. A Kubernetes node has no
+	// account and no ARN: both are absent, as a statement's account is.
+	Provider string         `json:"provider,omitempty"`
+	Scope    *GraphScope    `json:"scope,omitempty"`
+	SubScope *graphOptional `json:"sub_scope,omitempty"`
+	NativeID string         `json:"native_id,omitempty"`
+	K8sRule  *GraphK8sRule  `json:"k8s_rule,omitempty"`
+
 	Limitations []GraphLimitation `json:"limitations"`
 
+	provider  string // the node's provider (aws | k8s); "" for an external principal
 	typ       string
 	id        uuid.UUID
 	key       string // source_key
@@ -235,6 +250,7 @@ type GraphNode struct {
 	groupCondition string        // statements: the canonical Condition, "" for none
 	notPrincipal   bool          // roles: the trust policy uses NotPrincipal (D-44)
 	resolvedTo     string        // external principals: the target of a resolution IN FORCE (§2.12)
+	policyKind     string        // Kubernetes statements: the role's policy_kind, for its grants
 	// Identities: the Deny statements bearing on it as a holder (its own and
 	// its live groups') and its OWN boundary policies, from loadRestrictions
 	// -- the reader /evidence's grant limitations use (D-35).
@@ -262,20 +278,31 @@ type GraphExclusion struct {
 // targets, and closes_cycle / crosses_account on every edge. from and to are
 // the claim's own endpoints, whichever direction it was traversed in.
 type GraphEdge struct {
-	Claim           string            `json:"claim"`
-	Kind            string            `json:"kind"`
-	From            string            `json:"from"`
-	To              string            `json:"to"`
-	State           string            `json:"state"`
-	Mode            string            `json:"mode,omitempty"`
-	Basis           string            `json:"basis"`
-	Mechanism       string            `json:"mechanism,omitempty"`
-	Policy          string            `json:"policy,omitempty"`
-	ClosesCycle     bool              `json:"closes_cycle"`
-	CrossesAccount  bool              `json:"crosses_account"`
-	LastConfirmedAt any               `json:"last_confirmed_at"`
-	StaleReason     *[]StaleReason    `json:"stale_reason,omitempty"`
-	Limitations     []GraphLimitation `json:"limitations"`
+	Claim           string         `json:"claim"`
+	Kind            string         `json:"kind"`
+	From            string         `json:"from"`
+	To              string         `json:"to"`
+	State           string         `json:"state"`
+	Mode            string         `json:"mode,omitempty"`
+	Basis           string         `json:"basis"`
+	Mechanism       string         `json:"mechanism,omitempty"`
+	Policy          string         `json:"policy,omitempty"`
+	ClosesCycle     bool           `json:"closes_cycle"`
+	CrossesAccount  bool           `json:"crosses_account"`
+	LastConfirmedAt any            `json:"last_confirmed_at"`
+	StaleReason     *[]StaleReason `json:"stale_reason,omitempty"`
+
+	// Kubernetes edges only, additive and absent on every AWS edge. provider
+	// is "k8s". A Kubernetes grant names the binding it comes through and the
+	// role whose rule it reaches -- "via RoleBinding X to Role Y" -- because
+	// the binding, not the role, decides where the rule applies: a RoleBinding
+	// of a ClusterRole grants its rules in the binding's namespace only.
+	Provider   string           `json:"provider,omitempty"`
+	PolicyRef  string           `json:"policy_ref,omitempty"`
+	PolicyKind string           `json:"policy_kind,omitempty"`
+	Assignment *GraphAssignment `json:"assignment,omitempty"`
+
+	Limitations []GraphLimitation `json:"limitations"`
 
 	claimRef     Ref // the claim, for Query.ClaimLimitations
 	connectorID  *uuid.UUID
@@ -359,8 +386,8 @@ type GraphMeta struct {
 	Limitations []GraphLimitation `json:"limitations"`
 }
 
-func (g *GraphTraversal) meta(q *Query) GraphMeta {
-	return GraphMeta{
+func (g *GraphTraversal) meta(q *Query, provider string) GraphMeta {
+	m := GraphMeta{
 		DetailMeta: NewDetailMeta(q),
 		Budgets: GraphBudgetsMeta{
 			Nodes: g.b.Nodes, Edges: g.b.Edges, AssumeHops: g.b.AssumeHops,
@@ -371,6 +398,10 @@ func (g *GraphTraversal) meta(q *Query) GraphMeta {
 			{"code": graphLimOrganizations},
 		},
 	}
+	if provider == models.ProviderK8s {
+		graphK8sMeta(&m)
+	}
+	return m
 }
 
 /* -------------------------------- parameters ------------------------------- */
@@ -451,6 +482,14 @@ type graphTraversal struct {
 	accts  *Accounts
 	budget time.Duration
 
+	// provider is the ROOT's provider, and every node and edge the traversal
+	// reads is of it (graphProviderSlot): "" until the root is read, then
+	// models.ProviderAWS or models.ProviderK8s. An external principal root is
+	// AWS's: principals are the AWS trust graph's.
+	provider string
+	// k8s is the Kubernetes coverage, read once (traverse_k8s.go).
+	k8s *graphK8sCoverage
+
 	nodes   map[string]*GraphNode
 	order   []*GraphNode
 	edges   []*GraphEdge
@@ -482,6 +521,15 @@ func (t *graphTraversal) node(ref string) *GraphNode { return t.nodes[ref] }
 // readRoot reads the starting node, MANDATORY (§5.1: a graph request fails
 // only when even its root cannot be read): nil when it is not a readable node
 // of this workspace (404, no hint).
+//
+// The first root a traversal reads decides its provider: an AWS node (or an
+// external principal) makes it an AWS traversal, a Kubernetes node a
+// Kubernetes one, and every later read -- /graph/path's second root included
+// -- is of that provider only. An AWS root exists only in a published graph
+// (D-4: nothing exists before the first publication), so without a
+// publication it is 404 exactly as before. Kubernetes rows are not tied to a
+// publication (they are written straight from a sweep), so a Kubernetes root
+// is readable whether or not one exists.
 func (t *graphTraversal) readRoot(ref Ref) (*GraphNode, error) {
 	n := &GraphNode{typ: ref.Type, id: ref.ID, Ref: ref.String()}
 	lv := t.mandatory()
@@ -489,6 +537,15 @@ func (t *graphTraversal) readRoot(ref Ref) (*GraphNode, error) {
 		return nil, err
 	}
 	if !n.fetched {
+		return nil, nil
+	}
+	if t.provider == "" {
+		t.provider = n.provider
+		if t.provider == "" {
+			t.provider = models.ProviderAWS // an external principal
+		}
+	}
+	if t.provider == models.ProviderAWS && !t.q.Published() {
 		return nil, nil
 	}
 	if err := t.decorateNodes(lv, []*GraphNode{n}); err != nil {
@@ -578,7 +635,7 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 	}
 	for _, kind := range kinds {
 		spec := graphSpecFor(dir, kind)
-		if spec == nil {
+		if spec == nil || !t.hasKind(kind) {
 			continue
 		}
 		groups := map[string][]uuid.UUID{}
@@ -760,6 +817,25 @@ func graphKindsFor(typ, dir string) []string {
 	return out
 }
 
+// kindsFor is graphKindsFor for this traversal's provider: a Kubernetes
+// traversal has only the kinds the Kubernetes projection writes
+// (graphK8sEdgeKinds), so it never names a frontier no row could fill -- a
+// "Load more resources" under a rule that has no resource rows.
+func (t *graphTraversal) kindsFor(typ, dir string) []string {
+	var out []string
+	for _, k := range graphKindsFor(typ, dir) {
+		if t.hasKind(k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// hasKind reports whether the traversal's provider has edges of a kind.
+func (t *graphTraversal) hasKind(kind string) bool {
+	return t.provider != models.ProviderK8s || contains(graphK8sEdgeKinds, kind)
+}
+
 // frontier describes every (node, kind) the response may not contain in full
 // (§5.4 "Continuation"): more = the kind's neighbours in this direction, under
 // the same lifecycle filter, minus those the response carries. The counts are
@@ -909,9 +985,8 @@ func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Value
 
 	var out Envelope
 	err := g.r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
-		if !q.Published() {
-			return NotFound() // D-4: no object exists before the first publication
-		}
+		// D-4 (no AWS object exists before the first publication) is
+		// readRoot's: a Kubernetes root needs none.
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
 		if err != nil {
 			return err
@@ -927,7 +1002,7 @@ func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Value
 		if err != nil {
 			return err
 		}
-		out = Envelope{Data: data, Meta: g.meta(q)}
+		out = Envelope{Data: data, Meta: g.meta(q, t.provider)}
 		return nil
 	})
 	if err != nil {
@@ -957,7 +1032,7 @@ func (t *graphTraversal) breadthFirst(start *GraphNode, dir string, maxHops int)
 		for _, n := range frontier {
 			if visit[n.Ref].hops >= maxHops {
 				noAssume[n.Ref] = true // the hop limit: named in the frontier below
-				for _, k := range graphKindsFor(n.typ, dir) {
+				for _, k := range t.kindsFor(n.typ, dir) {
 					if k == GraphEdgeCanAssume {
 						pending = append(pending, graphPair{n.Ref, k})
 					}
@@ -1000,7 +1075,7 @@ func (t *graphTraversal) breadthFirst(start *GraphNode, dir string, maxHops int)
 	}
 	// Whatever is left in the frontier was never expanded.
 	for _, n := range frontier {
-		for _, k := range graphKindsFor(n.typ, dir) {
+		for _, k := range t.kindsFor(n.typ, dir) {
 			pending = append(pending, graphPair{n.Ref, k})
 		}
 	}
@@ -1109,13 +1184,17 @@ func (t *graphTraversal) graphResolutionUnfollowed(dir string) (unfollowed, know
 		if err != nil {
 			return err
 		}
+		// The principal's can_assume edges are AWS trust edges whatever the
+		// traversal's provider: a principal resolved to a Kubernetes service
+		// account (IRSA, EKS Pod Identity) is still a trust into AWS roles,
+		// shown and never followed -- so its edges are read as AWS's.
 		return tx.Raw(`SELECT ep.id FROM iga_external_principal ep
 		                WHERE ep.workspace_id = ? AND ep.resolution_state = ?
 		                  AND (`+strings.Join(ors, " OR ")+`) `+held+`
-		                  AND EXISTS (SELECT 1 FROM `+spec.from+`
+		                  AND EXISTS (SELECT 1 FROM `+graphRender(spec.from, models.ProviderAWS)+`
 		                               WHERE e0.workspace_id = ep.workspace_id
 		                                 AND e0.source_external_principal_id = ep.id
-		                                 AND `+t.predicates(spec)+`)
+		                                 AND `+graphRender(graphPredicates(spec, t.ended), models.ProviderAWS)+`)
 		                LIMIT 1`, args...).Scan(&found).Error
 	})
 	if lv != nil {
@@ -1203,15 +1282,17 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 			return nil, CursorInvalid("Malformed cursor.")
 		}
 		after = &graphKeyset{Key: k.K, ID: c.ID}
-		cursorRev := c.Rev
-		pin.CursorRev = &cursorRev
+		// A Kubernetes node's cursor is unrevisioned (graphK8sCursorRev):
+		// its rows are not a publication's, so a publication between two
+		// pages does not make the cursor stale. An AWS cursor is pinned.
+		if c.Rev != graphK8sCursorRev {
+			cursorRev := c.Rev
+			pin.CursorRev = &cursorRev
+		}
 	}
 
 	var out Envelope
 	err := g.r.Read(ctx, ws, pin, func(q *Query) error {
-		if !q.Published() {
-			return NotFound()
-		}
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
 		if err != nil {
 			return err
@@ -1245,7 +1326,7 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 			}
 			data.Frontier = []GraphFrontier{{Node: start.Ref, Edge: kind, Direction: dir, Expand: expand}}
 			data.Truncated = &GraphTruncated{BoundBy: GraphBoundTime}
-			out = Envelope{Data: data, Meta: g.meta(q)}
+			out = Envelope{Data: data, Meta: g.meta(q, t.provider)}
 			return nil
 		}
 		t.commit(s)
@@ -1258,7 +1339,7 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 				seen[r.far.Ref] = true
 				data.Nodes = append(data.Nodes, r.far)
 				if r.far.Ref != start.Ref {
-					for _, k := range graphKindsFor(r.far.typ, dir) {
+					for _, k := range t.kindsFor(r.far.typ, dir) {
 						pending = append(pending, graphPair{r.far.Ref, k})
 					}
 				}
@@ -1273,7 +1354,11 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 		}
 		if (s.more || s.bound != "") && s.last != nil {
 			key, _ := json.Marshal(graphExpandKey{K: s.last.Key})
-			tok := g.r.SignCursor(Cursor{WS: ws, Rev: q.Rev.Rev, Route: cctx.Route, Filter: cctx.Filter,
+			crev := graphK8sCursorRev
+			if t.provider == models.ProviderAWS {
+				crev = q.Rev.Rev // readRoot: an AWS root exists only when published
+			}
+			tok := g.r.SignCursor(Cursor{WS: ws, Rev: crev, Route: cctx.Route, Filter: cctx.Filter,
 				Sort: cctx.Sort, Key: key, ID: s.last.ID})
 			data.NextCursor = &tok
 		}
@@ -1282,7 +1367,7 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 			return err
 		}
 		data.Frontier = front
-		out = Envelope{Data: data, Meta: g.meta(q)}
+		out = Envelope{Data: data, Meta: g.meta(q, t.provider)}
 		return nil
 	})
 	if err != nil {
