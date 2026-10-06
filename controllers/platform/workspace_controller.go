@@ -87,3 +87,50 @@ func workspaceUserID(c *gin.Context, claims jwt.MapClaims) (uuid.UUID, error) {
 	}
 	return uuid.Nil, http.ErrNoCookie
 }
+
+// ListMyWorkspaces lists the workspaces the signed-in user may switch to:
+// their home workspace and every workspace with an active membership. It
+// returns nothing about workspaces the user does not belong to.
+func (wc *WorkspaceController) ListMyWorkspaces(c *gin.Context) {
+	claims, _ := c.Get("claims")
+	mapClaims, _ := claims.(jwt.MapClaims)
+	userID, err := workspaceUserID(c, mapClaims)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id missing from token"})
+		return
+	}
+	current := c.GetString("workspace_id")
+
+	type row struct {
+		WorkspaceID     uuid.UUID `json:"workspace_id"`
+		Name            string    `json:"name"`
+		WorkspaceDomain string    `json:"workspace_domain"`
+		Role            string    `json:"role"`
+		Current         bool      `json:"current"`
+	}
+	var rows []row
+	// TENANT-EXEMPT: lists the caller's own memberships across workspaces, keyed by the verified user id.
+	if err := config.DB.Raw(`
+		SELECT w.id AS workspace_id, COALESCE(w.name, '') AS name,
+		       COALESCE(w.workspace_domain, '') AS workspace_domain,
+		       COALESCE(r.name, '') AS role
+		  FROM workspace_memberships m
+		  JOIN workspaces w ON w.id = m.workspace_id
+		  LEFT JOIN roles r ON r.id = m.role_id
+		 WHERE m.user_id = ? AND m.status = 'active' AND w.status = 'active'
+		UNION
+		SELECT w.id, COALESCE(w.name, ''), COALESCE(w.workspace_domain, ''), ''
+		  FROM users u
+		  JOIN workspaces w ON w.id = u.workspace_id
+		 WHERE u.id = ? AND u.deleted_at IS NULL AND COALESCE(u.active, true) AND w.status = 'active'
+		   AND NOT EXISTS (SELECT 1 FROM workspace_memberships m2 -- TENANT-EXEMPT: same caller-own listing
+		                    WHERE m2.workspace_id = u.workspace_id AND m2.user_id = u.id)
+		 ORDER BY 2`, userID, userID).Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
+		return
+	}
+	for i := range rows {
+		rows[i].Current = rows[i].WorkspaceID.String() == current
+	}
+	c.JSON(http.StatusOK, gin.H{"workspaces": rows})
+}

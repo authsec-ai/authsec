@@ -304,6 +304,7 @@ func SetupRoutes(
 		workspaces := authsec.Group("/workspaces")
 		workspaces.Use(middlewares.AuthMiddleware())
 		{
+			workspaces.GET("", workspaceController.ListMyWorkspaces)
 			workspaces.POST("/:workspace_id/switch", workspaceController.SwitchWorkspace)
 		}
 
