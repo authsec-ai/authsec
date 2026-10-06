@@ -918,15 +918,9 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 		return
 	}
 
-	tokenStr, err := oc.generateAdminJWTToken(adminUser)
-	if err != nil {
-		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to generate JWT for user %s: %v", user.Email, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session token"})
-		return
-	}
-
-	// The OIDC identity is verified: the MFA step and the session callback
-	// that follow require this ticket.
+	// The OIDC identity is the first factor only. No session token is handed
+	// out here: one returned at this point let an admin with MFA skip it.
+	// The MFA step and the session callback that follow require this ticket.
 	if adminUser.WorkspaceID == nil || *adminUser.WorkspaceID != user.WorkspaceID || adminUser.ID != user.ID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to load user account"})
 		return
@@ -943,7 +937,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 		WorkspaceDomain: workspaceDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
-		Token:        tokenStr,
+		MFARequired:  true,
 		LoginTicket:  ticket,
 	})
 }

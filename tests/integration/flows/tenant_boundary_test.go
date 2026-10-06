@@ -514,6 +514,10 @@ func Test_OIDCAdminLogin_ScopedToStateWorkspace(t *testing.T) {
 		if resp["workspace_id"] != ws.WorkspaceID.String() || resp["login_ticket"] == "" || resp["login_ticket"] == nil {
 			t.Fatalf("OIDC login must sign in workspace %s's admin: %s", ws.WorkspaceID, w.Body.String())
 		}
+		// The OIDC identity is a first factor only: no session token before MFA.
+		if tok, ok := resp["token"]; ok && tok != "" {
+			t.Fatalf("OIDC first factor must not return a session token: %s", w.Body.String())
+		}
 	}
 }
 
