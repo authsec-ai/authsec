@@ -129,9 +129,12 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 
 	var out Envelope
 	err := g.r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
-		if !q.Published() {
-			return NotFound()
-		}
+		// D-4 is readRoot's (an AWS root needs a publication, a Kubernetes
+		// one does not). `from` decides the provider and `to` is read in it:
+		// a `to` of the other provider is not a node of this search, and is
+		// 404 as it always was. (No edge joins the two providers' nodes; the
+		// IRSA trust that links them runs through an external principal,
+		// which is terminal.)
 		t, err := newGraphTraversal(q, g.b, g.r.budget, false)
 		if err != nil {
 			return err
@@ -140,18 +143,21 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 		if err != nil {
 			return err
 		}
+		if src == nil {
+			return NotFound()
+		}
 		dst, err := t.readRoot(to)
 		if err != nil {
 			return err
 		}
-		if src == nil || dst == nil {
+		if dst == nil {
 			return NotFound()
 		}
 		data, err := t.pathVerdict(src, dst, g.b)
 		if err != nil {
 			return err
 		}
-		out = Envelope{Data: data, Meta: g.meta(q)}
+		out = Envelope{Data: data, Meta: g.meta(q, t.provider)}
 		return nil
 	})
 	if err != nil {
