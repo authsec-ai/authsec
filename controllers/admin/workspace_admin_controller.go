@@ -184,19 +184,6 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		}
 	}
 
-	// Single-tenant guard: only one admin/tenant is permitted.
-	// Exclude the system workspace (00000000-...) which is seeded at bootstrap.
-	{
-		db := config.GetDatabase()
-		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active' AND id != '00000000-0000-0000-0000-000000000000'").Scan(&tenantCount); err == nil && tenantCount > 0 {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "Single-tenant deployment: only one admin is allowed.",
-			})
-			return
-		}
-	}
-
 	// Create temporary user to use existing HashPassword method
 	tempUser := models.ExtendedUser{
 		User: sharedmodels.User{

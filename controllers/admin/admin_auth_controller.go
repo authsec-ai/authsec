@@ -541,20 +541,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Single-tenant guard: authsec runs as a single-workspace deployment.
-	// Only one admin/tenant is permitted; reject any subsequent registration.
-	// Exclude the system workspace (00000000-...) which is seeded at bootstrap.
-	{
-		db := config.GetDatabase()
-		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active' AND id != '00000000-0000-0000-0000-000000000000'").Scan(&tenantCount); err == nil && tenantCount > 0 {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "Single-tenant deployment: only one admin is allowed.",
-			})
-			return
-		}
-	}
-
 	// Check if pending registration already exists
 	existingPending, err := aac.pendingRepo.GetPendingRegistration(input.Email)
 	if err == nil && existingPending != nil {

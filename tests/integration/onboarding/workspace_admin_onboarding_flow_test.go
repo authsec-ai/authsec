@@ -112,31 +112,56 @@ func Test_AdminOnboarding_SignupOTPRegisterLogin(t *testing.T) {
 	assert.NotEmpty(t, token, "login response should contain a token; got: %v", body4)
 }
 
-// Test_AdminOnboarding_SingleWorkspaceGuard verifies that the single-workspace
-// deployment guard rejects a second admin registration when one workspace
-// already exists.
+// Test_AdminOnboarding_SecondWorkspaceSignsUp verifies that AuthSec is
+// multi-tenant: once a workspace exists, another organisation can still sign
+// up its own workspace (the old single-workspace guard returned 409, AS-030),
+// complete registration with its emailed OTP, sign in, and see only its own
+// users. A workspace domain already taken is still refused.
 //
 // NOTE: This test depends on Test_AdminOnboarding_SignupOTPRegisterLogin having
-// run first in the same binary invocation (they share the same DB). The Go test
-// runner executes functions in source-file order within a package, and our
-// TestMain is serial, so this ordering is deterministic.
-func Test_AdminOnboarding_SingleWorkspaceGuard(t *testing.T) {
+// run first in the same binary invocation (they share the same DB).
+func Test_AdminOnboarding_SecondWorkspaceSignsUp(t *testing.T) {
 	env := testsupport.Get(t)
 
-	// Use a different nonce so the email and domain are genuinely new.
 	n := testsupport.TestNonce(t)
 	slug := dnSafe(n)
 	email := "admin2@" + slug + ".test.local"
+	password := "SecurePass123!"
 
 	w := env.Do("POST", "/authsec/uflow/auth/admin/register", map[string]interface{}{
 		"email":            email,
-		"password":         "SecurePass123!",
+		"password":         password,
 		"name":             "Admin2 " + n,
 		"workspace_domain": slug,
 	}, "")
 	t.Logf("second-registration status=%d body=%s", w.Code, w.Body.String())
-	assert.Equal(t, 409, w.Code,
-		"second workspace registration must be rejected with 409 (single-workspace guard)")
+	require.Equal(t, 201, w.Code, "a second workspace must be able to sign up")
+
+	var otp string
+	require.NoError(t, config.GetDatabase().DB.QueryRow(
+		`SELECT otp FROM otp_entries WHERE email = $1 ORDER BY created_at DESC LIMIT 1`, email).Scan(&otp))
+	w = env.Do("POST", "/authsec/uflow/auth/admin/complete-registration", map[string]interface{}{"email": email, "otp": otp}, "")
+	require.Equal(t, 201, w.Code, "second workspace registration must complete: %s", w.Body.String())
+
+	w = env.Do("POST", "/authsec/uflow/auth/admin/login", map[string]interface{}{"email": email, "password": password}, "")
+	require.Equal(t, 200, w.Code, "second workspace admin must sign in: %s", w.Body.String())
+	token := stringField(parseBody(w), "token")
+	require.NotEmpty(t, token)
+
+	w = env.Do("GET", "/authsec/uflow/admin/users/list", nil, token)
+	require.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), email)
+	firstEmail := "admin@" + dnSafe(nonceFromName("Test_AdminOnboarding_SignupOTPRegisterLogin")) + ".test.local"
+	assert.NotContains(t, w.Body.String(), firstEmail, "the second workspace must not see the first workspace's users")
+
+	// A taken workspace domain is still refused.
+	w = env.Do("POST", "/authsec/uflow/auth/admin/register", map[string]interface{}{
+		"email":            "someone-else@" + slug + ".test.local",
+		"password":         password,
+		"name":             "Squatter",
+		"workspace_domain": slug,
+	}, "")
+	assert.Equal(t, 409, w.Code, "registering an existing workspace domain must be refused")
 }
 
 // Test_AdminOnboarding_DuplicateEmail verifies that registering the same email
