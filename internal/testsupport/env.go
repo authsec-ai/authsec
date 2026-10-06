@@ -140,6 +140,10 @@ func Boot(opts ...BootOption) (*Env, error) {
 		gin.SetMode(gin.TestMode)
 		waH, adminWAH, euWAH := buildWebAuthn()
 		router := gin.New()
+		if err := middlewares.ConfigureTrustedProxies(router); err != nil {
+			bootErr = fmt.Errorf("trusted proxies: %w", err)
+			return
+		}
 		router.Use(gin.Recovery())
 		routes.SetupRoutes(router, waH, adminWAH, euWAH, nil)
 

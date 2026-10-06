@@ -318,6 +318,11 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
+	// Client addresses come from forwarding headers only via TRUSTED_PROXIES
+	// (AS-034); by default the TCP peer is the client.
+	if err := middlewares.ConfigureTrustedProxies(r); err != nil {
+		log.Fatalf("invalid TRUSTED_PROXIES: %v", err)
+	}
 	// CIMD-registered OAuth clients carry their metadata URL as the public
 	// client_id (services/oauth_as_service.go:850). URL-encoded slashes in
 	// path params must survive routing, otherwise DELETE
