@@ -869,7 +869,15 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 	// User DOES NOT EXIST by email
 	// Check if this is from app.authsec.dev (empty workspace_domain) or custom domain
 	if state.WorkspaceDomain == "" {
-		// From app.authsec.dev or custom domain - allow registration with needs_domain
+		// From app.authsec.dev or custom domain - allow registration with needs_domain.
+		// state_token is the only proof /oidc/complete-registration accepts
+		// that this provider verified this email and subject.
+		regState, err := oc.oidcService.IssueRegistrationState(state.ProviderName, userInfo, state.OriginDomain)
+		if err != nil {
+			log.Printf("ERROR handleDiscoverAndGenerateToken: failed to issue registration state: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start registration"})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":         "User not found",
 			"needs_domain":  true,
@@ -881,6 +889,7 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 				"name":             userInfo.Name,
 				"picture":          userInfo.Picture,
 				"provider_user_id": userInfo.Sub,
+				"state_token":      regState,
 			},
 		})
 	} else {
@@ -900,8 +909,9 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 	log.Printf("DEBUG generateAndRespondWithTokenAndOrigin: workspaceDomain='%s' (from DB), originDomain='%s'",
 		workspaceDomain, originDomain)
 
-	// Look up the AdminUser to generate a properly-scoped JWT
-	adminUser, err := oc.adminUserRepo.GetAdminUserByEmail(user.Email)
+	// Look up the AdminUser to generate a properly-scoped JWT — in the
+	// resolved user's own workspace only, never by email alone.
+	adminUser, err := oc.adminUserRepo.GetAdminUserByEmailAndTenant(user.Email, user.WorkspaceID)
 	if err != nil {
 		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to look up admin user by email %s: %v", user.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load user account"})
@@ -917,7 +927,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 
 	// The OIDC identity is verified: the MFA step and the session callback
 	// that follow require this ticket.
-	if adminUser.WorkspaceID == nil || *adminUser.WorkspaceID != user.WorkspaceID {
+	if adminUser.WorkspaceID == nil || *adminUser.WorkspaceID != user.WorkspaceID || adminUser.ID != user.ID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to load user account"})
 		return
 	}
@@ -1227,31 +1237,12 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		Name            string `json:"name"`
 		Picture         string `json:"picture"`
 		ProviderUserID  string `json:"provider_user_id" binding:"required"`
-		StateToken      string `json:"state_token"` // signed OIDC state for verification
+		StateToken      string `json:"state_token" binding:"required"` // single-use token from the discover flow (provider_data.state_token)
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
-	}
-
-	// Verify the OIDC state if provided — prevents arbitrary identity registration.
-	// The state_token was returned by the discover flow and proves the caller
-	// completed OIDC authentication with this provider+email+sub.
-	if input.StateToken != "" {
-		var stateRow struct {
-			ProviderName string `gorm:"column:provider_name"`
-			Action       string `gorm:"column:action"`
-		}
-		if err := config.DB.Table("oidc_states").
-			Select("provider_name, action").
-			Where("state_token = ?", input.StateToken).
-			First(&stateRow).Error; err == nil {
-			if stateRow.ProviderName != input.Provider {
-				c.JSON(http.StatusForbidden, gin.H{"error": "provider mismatch: OIDC state does not match request"})
-				return
-			}
-		}
 	}
 
 	// Normalize and validate tenant domain
@@ -1267,6 +1258,20 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Tenant domain already exists. Please choose a different name."})
 		return
 	}
+
+	// The state token is the proof that the discover flow just verified this
+	// provider, email and subject. It is redeemed once, and the account is
+	// created only for the identity it was issued for.
+	stateProvider, stateEmail, stateSub, err := oc.oidcService.ConsumeRegistrationState(input.StateToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired registration state. Please sign in with your provider again."})
+		return
+	}
+	if stateProvider != input.Provider || !strings.EqualFold(stateEmail, strings.TrimSpace(input.Email)) || stateSub != input.ProviderUserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Registration state does not match this identity"})
+		return
+	}
+	input.Email = stateEmail
 
 	// Duplicate OIDC identity check removed — the unique constraint on
 	// oidc_user_identities(workspace_id, provider_name, provider_user_id) catches
@@ -1610,9 +1615,16 @@ func (oc *OIDCController) UnlinkIdentity(c *gin.Context) {
 // Admin endpoints for managing OIDC providers
 // ========================================
 
-// GetAllProviders returns all OIDC providers (admin)
+// GetAllProviders returns the OIDC providers owned by the caller's workspace
+// (admin). Platform providers are not listed: they are not the workspace's to
+// manage, and there is no platform-admin role to manage them with.
 func (oc *OIDCController) GetAllProviders(c *gin.Context) {
-	providers, err := oc.oidcService.GetAllProviders()
+	wsID, ok := tokenWorkspace(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id missing from token"})
+		return
+	}
+	providers, err := oc.oidcService.GetWorkspaceProviders(wsID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get providers"})
 		return
@@ -1621,8 +1633,14 @@ func (oc *OIDCController) GetAllProviders(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"providers": providers})
 }
 
-// UpdateProvider updates an OIDC provider configuration (admin)
+// UpdateProvider updates one of the caller's workspace's OIDC providers
+// (admin). Platform providers are read-only here.
 func (oc *OIDCController) UpdateProvider(c *gin.Context) {
+	wsID, ok := tokenWorkspace(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id missing from token"})
+		return
+	}
 	providerName := c.Param("provider")
 	if providerName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Provider name required"})
@@ -1635,8 +1653,17 @@ func (oc *OIDCController) UpdateProvider(c *gin.Context) {
 		return
 	}
 
-	if err := oc.oidcService.UpdateProvider(providerName, &input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// getClientSecret reads the secret at this path and sends it to the
+	// provider's token_url, so a workspace may only point it at its own
+	// canonical path, never at another workspace's or the platform's secret.
+	if input.ClientSecretVaultPath != "" &&
+		input.ClientSecretVaultPath != config.WorkspaceIDPSecretPath(wsID.String(), models.IdentityProviderOIDC, providerName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "client_secret_vault_path must be this workspace's own secret path"})
+		return
+	}
+
+	if err := oc.oidcService.UpdateProvider(wsID, providerName, &input); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "OIDC provider not found"})
 		return
 	}
 

@@ -120,7 +120,8 @@ type DeviceTokenRegistrationResponse struct {
 type CIBAInitiateRequest struct {
 	LoginHint      string   `json:"login_hint" binding:"required"` // User email
 	BindingMessage string   `json:"binding_message,omitempty"`     // Message shown to user
-	ClientID       string   `json:"client_id,omitempty"`           // Optional client ID
+	ClientID       string   `json:"client_id,omitempty"`           // OAuth client_id; selects the workspace (this or workspace_id is required)
+	WorkspaceID    string   `json:"workspace_id,omitempty"`        // Workspace to look the user up in (this or client_id is required)
 	Scopes         []string `json:"scopes,omitempty"`              // OAuth scopes
 }
 
@@ -171,6 +172,8 @@ const (
 	CIBAErrorExpiredToken         = "expired_token"         // Request expired
 	CIBAErrorUserNotFound         = "user_not_found"        // Email not found
 	CIBAErrorNoDevice             = "no_device_registered"  // User has no push device
+	CIBAErrorInvalidRequest       = "invalid_request"       // No usable workspace/client in the request
+	CIBAErrorInvalidClient        = "invalid_client"        // Poll client does not match the request
 )
 
 // ========================================

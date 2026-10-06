@@ -387,6 +387,57 @@ func (s *OIDCService) GetStateByToken(token string) (*models.OIDCState, error) {
 	return s.stateRepo.GetStateByToken(token)
 }
 
+// registrationStateAction marks the oidc_states row that lets an identity the
+// discover flow just verified finish sign-up at /oidc/complete-registration.
+const registrationStateAction = "complete_reg"
+
+// registrationIdentity is the verified identity a registration state is bound
+// to (stored in the row's signed_state column).
+type registrationIdentity struct {
+	Email string `json:"email"`
+	Sub   string `json:"sub"`
+}
+
+// IssueRegistrationState records that provider has just verified userInfo and
+// returns a single-use token, valid for 15 minutes, that
+// ConsumeRegistrationState redeems for exactly that identity.
+func (s *OIDCService) IssueRegistrationState(providerName string, userInfo *models.OIDCUserInfo, originDomain string) (string, error) {
+	token, err := generateSecureToken(32)
+	if err != nil {
+		return "", err
+	}
+	binding, err := json.Marshal(registrationIdentity{Email: strings.ToLower(userInfo.Email), Sub: userInfo.Sub})
+	if err != nil {
+		return "", err
+	}
+	state := &models.OIDCState{
+		StateToken:   token,
+		OriginDomain: originDomain,
+		ProviderName: providerName,
+		Action:       registrationStateAction,
+		SignedState:  string(binding),
+		ExpiresAt:    time.Now().Add(15 * time.Minute),
+	}
+	if err := s.stateRepo.CreateState(state); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// ConsumeRegistrationState redeems a registration state token once and
+// returns the provider and identity it was issued for.
+func (s *OIDCService) ConsumeRegistrationState(token string) (providerName, email, sub string, err error) {
+	state, err := s.stateRepo.ConsumeState(token, registrationStateAction)
+	if err != nil {
+		return "", "", "", err
+	}
+	var id registrationIdentity
+	if err := json.Unmarshal([]byte(state.SignedState), &id); err != nil || id.Email == "" || id.Sub == "" {
+		return "", "", "", fmt.Errorf("invalid registration state")
+	}
+	return state.ProviderName, id.Email, id.Sub, nil
+}
+
 // CleanupExpiredStates removes expired OIDC states (should be called periodically)
 func (s *OIDCService) CleanupExpiredStates() error {
 	return s.stateRepo.DeleteExpiredStates()
@@ -396,9 +447,9 @@ func (s *OIDCService) CleanupExpiredStates() error {
 // Admin methods for managing providers
 // ========================================
 
-// GetAllProviders returns all OIDC providers (for admin)
-func (s *OIDCService) GetAllProviders() ([]models.OIDCProvider, error) {
-	return s.providerRepo.GetAllProviders()
+// GetWorkspaceProviders returns the OIDC providers owned by a workspace (for its admins)
+func (s *OIDCService) GetWorkspaceProviders(workspaceID uuid.UUID) ([]models.OIDCProvider, error) {
+	return s.providerRepo.GetWorkspaceProviders(workspaceID)
 }
 
 // GetProviderByName returns a specific OIDC provider
@@ -406,9 +457,9 @@ func (s *OIDCService) GetProviderByName(name string) (*models.OIDCProvider, erro
 	return s.providerRepo.GetProviderByName(name)
 }
 
-// UpdateProvider updates an OIDC provider configuration
-func (s *OIDCService) UpdateProvider(providerName string, input *models.OIDCProviderUpdateInput) error {
-	return s.providerRepo.UpdateProvider(providerName, input)
+// UpdateProvider updates a workspace-owned OIDC provider configuration
+func (s *OIDCService) UpdateProvider(workspaceID uuid.UUID, providerName string, input *models.OIDCProviderUpdateInput) error {
+	return s.providerRepo.UpdateProvider(workspaceID, providerName, input)
 }
 
 // ========================================

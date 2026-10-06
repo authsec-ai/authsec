@@ -373,15 +373,26 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		},
 	}
 
-	// Create workspace record FIRST (project / user FKs depend on it)
-	if _, err := tx.Exec(`
+	// Create workspace record FIRST (project / user FKs depend on it).
+	// This flow only ever creates a NEW workspace. A pending registration
+	// that names an existing one (e.g. an end-user sign-up row from
+	// /user/register/initiate) must never make its email that workspace's
+	// owner/admin, so a conflict fails the whole registration.
+	res, err := tx.Exec(`
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'manual', 'active', NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash)
+	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		tx.Rollback()
+		log.Printf("Registration refused: workspace %s already exists", pendingReg.WorkspaceID)
+		c.JSON(http.StatusConflict, gin.H{"error": "Registration session is not valid for a new workspace. Please initiate registration again"})
 		return
 	}
 
@@ -585,10 +596,26 @@ func (uc *UserController) Login(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
-	user, err := uc.userRepo.GetUserByEmail(input.Email)
+	// The workspace comes from the workspace_domain the request names (its
+	// own domain or a verified custom domain), never from the email: the
+	// same email can exist in several workspaces. As before, this login is
+	// for the workspace's owner account.
+	tenant, err := uc.resolveLoginWorkspace(input.WorkspaceDomain)
 	if err != nil {
-		log.Printf("Login failed for %s: user not found in main database, error: %v", input.Email, err)
+		log.Printf("Login failed for %s: workspace domain %q did not resolve: %v", input.Email, input.WorkspaceDomain, err)
+		c.Set("error", fmt.Sprintf("Invalid tenant domain: '%s'", input.WorkspaceDomain))
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant domain"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(tenant.Email), input.Email) {
+		log.Printf("Login failed for %s: not the owner of workspace %s", input.Email, tenant.WorkspaceID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	user, err := uc.userRepo.GetUserByEmailAndTenant(input.Email, tenant.WorkspaceID)
+	if err != nil {
+		log.Printf("Login failed for %s: user not found in workspace %s, error: %v", input.Email, tenant.WorkspaceID, err)
 		c.Set("error", fmt.Sprintf("User not found: %s", input.Email))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
@@ -599,15 +626,6 @@ func (uc *UserController) Login(c *gin.Context) {
 		log.Printf("Login failed for %s: account is disabled", input.Email)
 		c.Set("error", fmt.Sprintf("Account disabled for user: %s", input.Email))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account is disabled"})
-		return
-	}
-
-	// Find tenant in main database
-	tenant, err := uc.workspaceRepo.GetWorkspaceByEmail(input.Email)
-	if err != nil {
-		log.Printf("Login failed for %s: tenant not found, error: %v", input.Email, err)
-		c.Set("error", fmt.Sprintf("Tenant not found for user: %s", input.Email))
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
@@ -744,6 +762,39 @@ func (uc *UserController) Login(c *gin.Context) {
 		response.OTPRequired = true
 		c.JSON(http.StatusOK, response)
 	}
+}
+
+// resolveLoginWorkspace returns the one workspace whose own domain, or one of
+// whose verified custom domains, is domain.
+func (uc *UserController) resolveLoginWorkspace(domain string) (*models.Tenant, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return nil, fmt.Errorf("workspace_domain is required")
+	}
+	rows, err := config.GetDatabase().Query(`
+		SELECT id FROM workspaces WHERE LOWER(workspace_domain) = $1
+		UNION
+		SELECT workspace_id FROM workspace_domains WHERE LOWER(domain) = $1 AND is_verified = true
+		LIMIT 2`, domain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) != 1 {
+		return nil, fmt.Errorf("domain matches %d workspaces", len(ids))
+	}
+	return uc.workspaceRepo.GetWorkspaceByWorkspaceID(ids[0].String())
 }
 
 // WebAuthnCallback godoc

@@ -912,14 +912,24 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	if workspaceName == "" {
 		workspaceName = pendingReg.Email
 	}
-	if _, err := tx.Exec(`
+	// Admin registration only ever creates a NEW workspace; a pending row
+	// naming an existing one (e.g. from end-user /user/register/initiate)
+	// must not make its email that workspace's owner.
+	wsRes, err := tx.Exec(`
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, vault_mount, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'admin_registration', 'active', NULL, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash)
+	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
+		return
+	}
+	if n, err := wsRes.RowsAffected(); err != nil || n != 1 {
+		tx.Rollback()
+		log.Printf("Admin registration refused: workspace %s already exists", pendingReg.WorkspaceID)
+		c.JSON(http.StatusConflict, gin.H{"error": "Registration session is not valid for a new workspace. Please initiate registration again"})
 		return
 	}
 

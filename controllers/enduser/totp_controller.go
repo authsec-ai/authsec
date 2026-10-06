@@ -3,9 +3,11 @@ package enduser
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
 
@@ -553,8 +555,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
-	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
+	user, err := ctrl.lookupTOTPUser(c, req.Email, req.WorkspaceID, req.WorkspaceDomain)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -620,8 +621,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
-	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
+	user, err := ctrl.lookupTOTPUser(c, req.Email, req.WorkspaceID, req.WorkspaceDomain)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -699,6 +699,25 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 		Message: "Device approved successfully",
 		Token:   token,
 	})
+}
+
+// lookupTOTPUser finds the user a TOTP request is for. When the request names
+// a workspace (workspace_id, or workspace_domain), the lookup is scoped to it.
+// Without one it falls back to the legacy email-only lookup, which may pick
+// the same email in another workspace (AS-038; the SDK sends no workspace).
+func (ctrl *TOTPController) lookupTOTPUser(c *gin.Context, email, workspaceID, workspaceDomain string) (*models.ExtendedUser, error) {
+	ref := strings.TrimSpace(workspaceID)
+	if ref == "" {
+		ref = strings.TrimSpace(workspaceDomain)
+	}
+	if ref == "" {
+		return ctrl.userRepo.GetUserByEmail(email)
+	}
+	wsID, err := shared.ResolveWorkspace(c, ref)
+	if err != nil {
+		return nil, err
+	}
+	return ctrl.userRepo.GetUserByEmailAndTenant(email, wsID)
 }
 
 // generateJWTToken generates a JWT token

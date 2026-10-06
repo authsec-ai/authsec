@@ -98,17 +98,20 @@ func (r *OIDCProviderRepository) GetActiveProviders() ([]models.OIDCProvider, er
 	return providers, rows.Err()
 }
 
-// GetAllProviders retrieves all OIDC providers (for admin)
-func (r *OIDCProviderRepository) GetAllProviders() ([]models.OIDCProvider, error) {
+// GetWorkspaceProviders retrieves the OIDC providers owned by one workspace
+// (for that workspace's admins). Platform rows (workspace_id IS NULL) are not
+// included: they are not the workspace's to manage.
+func (r *OIDCProviderRepository) GetWorkspaceProviders(workspaceID uuid.UUID) ([]models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
 		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
+		WHERE workspace_id = $1
 		ORDER BY display_name
 	`
 
-	rows, err := r.db.Query(query)
+	rows, err := r.db.Query(query, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -120,14 +123,17 @@ func (r *OIDCProviderRepository) GetAllProviders() ([]models.OIDCProvider, error
 		if err != nil {
 			return nil, err
 		}
+		wsID := workspaceID
+		provider.WorkspaceID = &wsID
 		providers = append(providers, *provider)
 	}
 
 	return providers, rows.Err()
 }
 
-// UpdateProvider updates an OIDC provider configuration
-func (r *OIDCProviderRepository) UpdateProvider(providerName string, input *models.OIDCProviderUpdateInput) error {
+// UpdateProvider updates one workspace's OIDC provider configuration. Platform
+// rows (workspace_id IS NULL) and other workspaces' rows are never touched.
+func (r *OIDCProviderRepository) UpdateProvider(workspaceID uuid.UUID, providerName string, input *models.OIDCProviderUpdateInput) error {
 	query := `
 		UPDATE oidc_providers
 			SET client_id = COALESCE(NULLIF($1, ''), client_id),
@@ -136,7 +142,7 @@ func (r *OIDCProviderRepository) UpdateProvider(providerName string, input *mode
 			    icon_url = COALESCE(NULLIF($4, ''), icon_url),
 			    redirect_uri = COALESCE(NULLIF($5, ''), redirect_uri),
 			    updated_at = $6
-			WHERE provider_name = $7
+			WHERE workspace_id = $7 AND provider_name = $8
 		`
 
 	result, err := r.db.Exec(query,
@@ -146,6 +152,7 @@ func (r *OIDCProviderRepository) UpdateProvider(providerName string, input *mode
 		input.IconURL,
 		input.RedirectURI,
 		time.Now(),
+		workspaceID,
 		providerName,
 	)
 	if err != nil {
@@ -348,6 +355,26 @@ func (r *OIDCStateRepository) DeleteState(stateToken string) error {
 	query := `DELETE FROM oidc_states WHERE state_token = $1`
 	_, err := r.db.Exec(query, stateToken)
 	return err
+}
+
+// ConsumeState atomically deletes an unexpired state of the given action and
+// returns it, so a state token can be redeemed at most once.
+func (r *OIDCStateRepository) ConsumeState(stateToken, action string) (*models.OIDCState, error) {
+	query := `
+		DELETE FROM oidc_states
+		WHERE state_token = $1 AND action = $2 AND expires_at > $3
+		RETURNING provider_name, COALESCE(signed_state, ''), COALESCE(request_host, '')
+	`
+	state := &models.OIDCState{StateToken: stateToken, Action: action}
+	if err := r.db.QueryRow(query, stateToken, action, time.Now()).Scan(
+		&state.ProviderName, &state.SignedState, &state.OriginDomain,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("state not found or expired")
+		}
+		return nil, err
+	}
+	return state, nil
 }
 
 // DeleteExpiredStates deletes all expired state entries (cleanup job)

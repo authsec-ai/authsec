@@ -65,7 +65,7 @@ func (ctrl *CIBAAuthController) InitiateCIBAAuth(c *gin.Context) {
 	// Check if there was an error in response (user not found, no device, etc.)
 	if resp.Error != "" {
 		statusCode := http.StatusOK // RFC 8628 style - return 200 with error field
-		if resp.Error == models.CIBAErrorUserNotFound {
+		if resp.Error == models.CIBAErrorUserNotFound || resp.Error == models.CIBAErrorInvalidRequest {
 			statusCode = http.StatusBadRequest
 		}
 		c.JSON(statusCode, resp)
@@ -156,7 +156,7 @@ func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 	}
 
 	// Poll for token
-	resp, err := ctrl.cibaService.PollForToken(req.AuthReqID)
+	resp, err := ctrl.cibaService.PollForToken(req.AuthReqID, req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to poll token", "details": err.Error()})
 		return
@@ -169,6 +169,8 @@ func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 			statusCode = http.StatusForbidden
 		} else if resp.Error == models.CIBAErrorExpiredToken {
 			statusCode = http.StatusBadRequest
+		} else if resp.Error == models.CIBAErrorInvalidClient {
+			statusCode = http.StatusUnauthorized
 		}
 		c.JSON(statusCode, resp)
 		return

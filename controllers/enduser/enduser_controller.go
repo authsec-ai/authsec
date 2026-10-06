@@ -1697,17 +1697,13 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 	var existingUser models.User
 	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
 		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
-			// Synced user without password — update their password_hash instead.
-			tempUser := models.ExtendedUser{User: sharedmodels.User{PasswordHash: input.Password}}
-			if err := tempUser.HashPassword(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
-				return
-			}
-			if err := tenantDB.Model(&existingUser).Update("password_hash", tempUser.PasswordHash).Error; err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user"})
-				return
-			}
-			c.JSON(http.StatusOK, gin.H{"message": "Registration completed successfully", "email": input.Email})
+			// Setting the first password on a directory-synced account claims
+			// it, so it needs proof of the mailbox: only the OTP flow
+			// (/user/register/initiate + /complete) may do that.
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "email_verification_required",
+				"message": "This account exists. Verify your email with /user/register/initiate and /user/register/complete to set a password.",
+			})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
