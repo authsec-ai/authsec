@@ -132,16 +132,12 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 			return nil, fmt.Errorf("unsupported signing algorithm: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
+		if key, ok := selectJWK(keyMap, kid); ok {
 			return key, nil
-		}
-		// No kid or kid not in JWKS — try any available key (single-key case).
-		for _, k := range keyMap {
-			return k, nil
 		}
 		return nil, fmt.Errorf("kid not found in client JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return nil, fmt.Errorf("invalid_client: client_assertion validation failed: %w", err)
 	}
@@ -301,15 +297,12 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 			return nil, fmt.Errorf("unsupported token alg: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
+		if key, ok := selectJWK(keyMap, kid); ok {
 			return key, nil
-		}
-		for _, k := range keyMap {
-			return k, nil
 		}
 		return nil, fmt.Errorf("kid not found in workload issuer JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return nil, fmt.Errorf("invalid_client: token verification failed: %w", err)
 	}
@@ -453,6 +446,27 @@ func authenticateClientSecretBasic(ctx context.Context, db *gorm.DB, clientID, s
 
 // ── JWKS helpers ─────────────────────────────────────────────────────────────
 
+// selectJWK picks the key that verifies a token whose header names kid. When
+// the JWKS names its keys, the kid must match one exactly; a token without a
+// kid, or a JWKS whose only key is unnamed, uses that single key. Falling back
+// to "any key" let a token signed for one kid verify under another (AS-066).
+func selectJWK(keyMap map[string]interface{}, kid string) (interface{}, bool) {
+	if key, ok := keyMap[kid]; ok && kid != "" {
+		return key, true
+	}
+	if len(keyMap) != 1 {
+		return nil, false
+	}
+	for name, k := range keyMap {
+		// A named kid may only fall back to a key the JWKS left unnamed
+		// (parseJWKSKeys calls those "key-N").
+		if kid == "" || strings.HasPrefix(name, "key-") {
+			return k, true
+		}
+	}
+	return nil, false
+}
+
 // resolveJWKS returns a map of kid → public key from the stored JWKS row.
 // It handles both inline JWKS JSON and a jwks_uri fetch.
 func resolveJWKS(row models.OAuthClientJWKS) (map[string]interface{}, error) {
@@ -542,15 +556,12 @@ func VerifySVID(svid, tokenEndpoint string) (string, error) {
 			return nil, fmt.Errorf("unsupported SVID alg: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
+		if key, ok := selectJWK(keyMap, kid); ok {
 			return key, nil
-		}
-		for _, k := range keyMap {
-			return k, nil
 		}
 		return nil, fmt.Errorf("kid not found in SPIFFE JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return sub, fmt.Errorf("SVID signature/expiry verification failed: %w", err)
 	}

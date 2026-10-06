@@ -163,11 +163,8 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 				return nil, fmt.Errorf("unsupported signing algorithm: %v", t.Header["alg"])
 			}
 			kid, _ := t.Header["kid"].(string)
-			if key, ok := keyMap[kid]; ok {
+			if key, ok := selectJWK(keyMap, kid); ok {
 				return key, nil
-			}
-			for _, k := range keyMap {
-				return k, nil
 			}
 			return nil, fmt.Errorf("kid not found in issuer JWKS")
 		}
@@ -175,7 +172,10 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 
 	// Step 4: full parse + verify.
 	leeway := time.Duration(issuer.ClockSkewSecs) * time.Second
-	parsed, err := jwt.Parse(assertion, keyFunc, jwt.WithValidMethods(allowedAlgs), jwt.WithLeeway(leeway))
+	// exp is required: the jti replay cache only holds an ID-JAG until it
+	// expires, so a token without one could be replayed forever (AS-066).
+	parsed, err := jwt.Parse(assertion, keyFunc, jwt.WithValidMethods(allowedAlgs), jwt.WithLeeway(leeway),
+		jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return nil, nil, fmt.Errorf("invalid_grant: ID-JAG signature/expiry invalid: %w", err)
 	}
