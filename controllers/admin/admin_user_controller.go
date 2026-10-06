@@ -76,13 +76,20 @@ func NewAdminUserController() (*AdminUserController, error) {
 
 // ListTenants retrieves all tenants
 func (auc *AdminUserController) ListTenants(c *gin.Context) {
-	tenants, err := auc.workspaceRepo.GetAllTenants()
+	// A workspace admin sees their own workspace only. This listed every
+	// workspace on the platform, with owner emails and password hashes (AS-009).
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
+	}
+	tenant, err := auc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve tenants"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"tenants": tenants})
+	c.JSON(http.StatusOK, gin.H{"tenants": []interface{}{tenant}})
 }
 
 // ListAdminUsers godoc

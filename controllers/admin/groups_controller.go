@@ -1122,6 +1122,7 @@ func fetchTenantGroupUsers(workspaceID string) ([]groupUserSummary, error) {
 	users := make([]groupUserSummary, 0)
 	if err := tenantDB.Table("users").
 		Select("id, email, name, provider, client_id, active").
+		Where("workspace_id = ? AND deleted_at IS NULL", workspaceID).
 		Order("LOWER(email) ASC").
 		Find(&users).Error; err != nil {
 		return nil, fmt.Errorf("failed to query tenant users: %w", err)

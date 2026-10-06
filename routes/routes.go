@@ -934,7 +934,9 @@ func SetupRoutes(
 		)
 		{
 			admin.GET("/tenants", adminUserController.ListTenants)
-			admin.POST("/tenants", adminUserController.CreateTenant)
+			// POST /tenants (create a bare workspace) removed: any workspace admin
+			// could create workspaces and the response echoed a password hash
+			// (AS-041). Workspaces are created by sign-up.
 			admin.PUT("/tenants/:workspace_id", adminUserController.UpdateTenant)
 			admin.DELETE("/tenants/:workspace_id", middlewares.Require("tenants", "delete"), adminUserController.DeleteTenant)
 			admin.GET("/tenants/:workspace_id/users", adminUserController.GetTenantUsers)
@@ -999,7 +1001,7 @@ func SetupRoutes(
 
 		// SCIM token
 		scimToken := uflow.Group("/admin/scim")
-		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
+		scimToken.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"), middlewares.ValidateWorkspaceFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
 		}
@@ -1093,16 +1095,19 @@ func SetupRoutes(
 		}
 
 		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
+		// Managing other users' accounts is for the workspace's owners and
+		// admins; any signed-in end user could do it before (AS-023, AS-007).
+		userAdmin := middlewares.RequireWorkspaceRole("owner", "admin")
 		{
-			user.GET("/enduser/:workspace_id/:user_id", endUserController.GetEndUser)
-			user.POST("/enduser/list", endUserController.GetEndUsers)
-			user.GET("/enduser/list", endUserController.GetEndUsers)
-			user.PUT("/enduser/:workspace_id/:user_id", endUserController.UpdateUser)
-			user.PUT("/enduser/:workspace_id/:user_id/status", endUserController.UpdateEndUserStatus)
-			user.POST("/enduser/active", endUserController.ActiveOrDeactiveEndUser)
-			user.POST("/enduser/delete", endUserController.DeleteEndUser)
-			user.DELETE("/enduser/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
-			user.DELETE("/enduser/delete_all/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
+			user.GET("/enduser/:workspace_id/:user_id", userAdmin, endUserController.GetEndUser)
+			user.POST("/enduser/list", userAdmin, endUserController.GetEndUsers)
+			user.GET("/enduser/list", userAdmin, endUserController.GetEndUsers)
+			user.PUT("/enduser/:workspace_id/:user_id", userAdmin, endUserController.UpdateUser)
+			user.PUT("/enduser/:workspace_id/:user_id/status", userAdmin, endUserController.UpdateEndUserStatus)
+			user.POST("/enduser/active", userAdmin, endUserController.ActiveOrDeactiveEndUser)
+			user.POST("/enduser/delete", userAdmin, endUserController.DeleteEndUser)
+			user.DELETE("/enduser/:workspace_id/:user_id", userAdmin, middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
+			user.DELETE("/enduser/delete_all/:workspace_id/:user_id", userAdmin, middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
 			user.POST("/rbac/roles", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/roles", rolesScopedBindingsController.ListRolesEndUser)
 			user.PUT("/rbac/roles/:role_id", forbiddenLegacyRBACMutation)
@@ -1118,12 +1123,12 @@ func SetupRoutes(
 			user.GET("/permissions", permissionController.GetMyPermissions)
 			user.GET("/permissions/effective", permissionController.GetMyEffectivePermissions)
 			user.GET("/permissions/check", permissionController.CheckPermission)
-			user.POST("/groups/users/add", groupController.AddUserToGroups)
-			user.POST("/groups/users/remove", groupController.RemoveUserFromGroups)
+			user.POST("/groups/users/add", userAdmin, groupController.AddUserToGroups)
+			user.POST("/groups/users/remove", userAdmin, groupController.RemoveUserFromGroups)
 			user.GET("/groups/users", groupController.GetMyGroups)
-			user.GET("/groups/:workspace_id/:group_id/users", groupController.GetGroupUsers)
-			user.POST("/admin/change-password", endUserController.AdminChangeUserPassword)
-			user.POST("/admin/reset-password", endUserController.AdminResetUserPassword)
+			user.GET("/groups/:workspace_id/:group_id/users", userAdmin, groupController.GetGroupUsers)
+			user.POST("/admin/change-password", userAdmin, endUserController.AdminChangeUserPassword)
+			user.POST("/admin/reset-password", userAdmin, endUserController.AdminResetUserPassword)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1290,9 +1295,10 @@ func SetupRoutes(
 		mig := authsec.Group("/migration")
 		{
 			master := mig.Group("/migrations/master")
-			master.Use(middlewares.AuthMiddleware())
+			master.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"))
 			{
-				master.POST("/run", migCtrl.RunMasterMigrations)
+				// POST /run removed: migrations run at startup, and any signed-in
+				// user could run the platform's master migrations (AS-039).
 				master.GET("/status", migCtrl.GetMasterMigrationStatus)
 			}
 		}
@@ -2197,14 +2203,13 @@ func registerOocmgrRoutes(r gin.IRouter) {
 	// Workspace lifecycle moved to /authsec/uflow/admin and /authsec/applications.
 	//
 	// The only surviving operator-facing surfaces under /oocmgr are:
-	//   * /oocmgr/oidc/raw-hydra-dump   — raw Hydra-client dump for debugging
 	//   * /oocmgr/hydra-clients/sync    — reconcile MCP client rows with Hydra
-	oidc := secured.Group("/oidc")
-	{
-		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
-	}
+	// /oidc/raw-hydra-dump removed: it dumped other workspaces' Hydra clients
+	// by a prefix of a client-supplied workspace_id (AS-022).
 
+	// Was anonymous (AS-075).
 	hydraClients := secured.Group("/hydra-clients")
+	hydraClients.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"))
 	{
 		hydraClients.POST("/sync", ac.SyncHydraClients)
 	}

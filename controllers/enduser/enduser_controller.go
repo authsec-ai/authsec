@@ -245,7 +245,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 
 	// Build query - no base tenant filter needed since we're in tenant-specific DB.
 	// Exclude soft-deleted users from all listings.
-	query := tenantDB.Model(&models.User{}).Where("deleted_at IS NULL")
+	query := tenantDB.Model(&models.User{}).Where("workspace_id = ? AND deleted_at IS NULL", filter.WorkspaceID)
 
 	// Apply filters
 	if filter.Active != nil {
