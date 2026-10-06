@@ -357,9 +357,14 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 			return nil, fmt.Errorf("invalid_client: %w", err)
 		}
 	} else {
-		if err := db.WithContext(ctx).
-			Where("spiffe_id = ? AND status = 'active'", sub).
-			First(&sa).Error; err != nil {
+		// A registered provider belongs to one workspace; its SVIDs may only map
+		// to that workspace's workloads. Only the legacy global SPIFFE_OIDC_ISSUER
+		// (no provider row, operator-controlled) resolves instance-wide.
+		q := db.WithContext(ctx).Where("spiffe_id = ? AND status = 'active'", sub)
+		if providerWS != nil {
+			q = q.Where("workspace_id = ?", *providerWS)
+		}
+		if err := q.First(&sa).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				log.Printf("auth.unknown_caller: verified SVID for unregistered SPIFFE ID sub=%q", sub)
 				return nil, fmt.Errorf("invalid_client: no active service account for SPIFFE ID")
@@ -386,7 +391,7 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		var revokedCount int64
 		if err := db.WithContext(ctx).
 			Table("application_spiffe_identities").
-			Where("spiffe_id = ? AND (revoked_at IS NOT NULL OR status IN ('revoked','disabled'))", sub).
+			Where("workspace_id = ? AND spiffe_id = ? AND (revoked_at IS NOT NULL OR status IN ('revoked','disabled'))", sa.WorkspaceID, sub).
 			Count(&revokedCount).Error; err != nil {
 			return nil, fmt.Errorf("invalid_client: %w", err)
 		}
@@ -401,8 +406,8 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		db.WithContext(ctx).Exec(
 			`UPDATE application_spiffe_identities
 			    SET status = 'attested', last_attested_at = ?, last_error = NULL, last_error_at = NULL
-			  WHERE spiffe_id = ? AND status = 'attestation_pending'`,
-			now, sub,
+			  WHERE workspace_id = ? AND spiffe_id = ? AND status = 'attestation_pending'`,
+			now, sa.WorkspaceID, sub,
 		)
 	}
 	// Best-effort: stamp last_seen_at so the inventory can age out stale workloads.

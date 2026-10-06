@@ -2755,11 +2755,14 @@ CREATE TABLE public.trusted_issuers (
     revoked_at      timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- Owning workspace; NULL = platform-owned (see 044).
+    workspace_id    uuid    REFERENCES public.workspaces(id) ON DELETE CASCADE,
     CONSTRAINT trusted_issuers_pkey PRIMARY KEY (id),
     CONSTRAINT trusted_issuers_status_chk CHECK (status IN ('active', 'revoked'))
 );
 CREATE UNIQUE INDEX uq_trusted_issuers_iss ON public.trusted_issuers (iss);
 CREATE INDEX idx_trusted_issuers_provider_name ON public.trusted_issuers (provider_name);
+CREATE INDEX idx_trusted_issuers_workspace ON public.trusted_issuers (workspace_id);
 
 -- a2a_brokering_policies: permit/deny rules for XAA requester→RS pairings.
 -- side='redemption' gates incoming ID-JAG redemption; side='issuance' gates

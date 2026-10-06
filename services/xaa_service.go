@@ -239,6 +239,13 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 //   - CreateIdentity (one tx); freshly materialized user has zero role bindings.
 //   - If not found and JITProvisioning=false → returns ("", ErrNoLocalUser).
 func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer *models.TrustedIssuer, targetWorkspaceID uuid.UUID) (uuid.UUID, error) {
+	// A workspace-owned issuer vouches only for subjects of its own workspace;
+	// it must never resolve or provision users in another one. Platform issuers
+	// (WorkspaceID nil, including the self-issued provider) are unrestricted.
+	if issuer.WorkspaceID != nil && *issuer.WorkspaceID != targetWorkspaceID {
+		return uuid.Nil, fmt.Errorf("access_denied: issuer is not trusted for this resource's workspace")
+	}
+
 	// Apply subject_mapping transformation if configured (simple prefix-strip for now).
 	mappedSub := externalSub
 	if issuer.SubjectMapping != nil && *issuer.SubjectMapping != "" {
