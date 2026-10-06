@@ -127,6 +127,9 @@ const (
 	// RetiredPolicyRecreated -- a statement of a policy incarnation that was
 	// itself recreated (§4.7).
 	RetiredPolicyRecreated = "policy_recreated"
+	// RetiredConnectionRemoved -- the discovery source (connection) that
+	// supported this object was deleted, and no other source supports it.
+	RetiredConnectionRemoved = "connection_removed"
 )
 
 // Why an edge, assignment or support row ended.
@@ -137,6 +140,9 @@ const (
 	EndedPolicyRecreated  = "policy_recreated"
 	EndedPolicyRetired    = "policy_retired"
 	EndedStatementRetired = "statement_retired"
+	// EndedConnectionRemoved -- the discovery source that made this claim was
+	// deleted. The row is kept, ended, so its history survives the source.
+	EndedConnectionRemoved = "connection_removed"
 )
 
 // Workload classification (§2.14.3).

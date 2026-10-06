@@ -67,9 +67,13 @@ func TestRoleBindingCanReferenceAClusterRole(t *testing.T) {
 		t.Fatalf("want one grant edge, got %d", len(res.Edges))
 	}
 	e := res.Edges[0]
-	if e.CalculationState != "complete" || e.EffectiveConclusion != "effective" {
-		t.Errorf("a fully resolved chain is effective, got %s/%s",
+	// Resolved, but declared rather than evaluated: never complete/effective.
+	if e.CalculationState != "partial" || e.EffectiveConclusion != "unknown" {
+		t.Errorf("a resolved chain is declared, not evaluated: want partial/unknown, got %s/%s",
 			e.CalculationState, e.EffectiveConclusion)
+	}
+	if e.StatementKey == "" {
+		t.Error("a resolved chain must still name its rule")
 	}
 	// The role key must be the CLUSTER-scoped one. Resolving it as
 	// "prod/secret-reader" would invent a namespaced role that does not exist.
@@ -420,5 +424,226 @@ func TestPartitionsIncludeWorkloadsAndExecutesAs(t *testing.T) {
 	}
 	if !sc.CanEnd(PartitionForWorkload(sc, "a")) {
 		t.Error("a complete sweep covering namespace a cannot end its workloads")
+	}
+}
+
+/* --------------------- kubernetes hardening: items 2, 3, 5a, 7 ------------- */
+
+func viewRole() models.K8sRole {
+	return models.K8sRole{
+		Kind: models.K8sKindClusterRole, Name: "view",
+		Rules: []models.K8sPolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}}},
+	}
+}
+
+func identityKeys(res Result) map[string]Node {
+	out := map[string]Node{}
+	for _, n := range res.Identities {
+		out[n.SourceKey] = n
+	}
+	return out
+}
+
+// Every grant, resolved or not, is declared-not-evaluated.
+func TestEveryGrantIsDeclaredNotEvaluated(t *testing.T) {
+	res := Project(snapshot(
+		[]models.K8sRole{viewRole()},
+		[]models.K8sBinding{
+			{Kind: models.K8sKindClusterRoleBinding, Name: "resolved",
+				RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+				Subjects: []models.K8sSubject{{Kind: models.K8sSubjectServiceAccount, Name: "a", Namespace: "prod"}}},
+			{Kind: models.K8sKindClusterRoleBinding, Name: "dangling",
+				RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "missing"},
+				Subjects: []models.K8sSubject{{Kind: models.K8sSubjectServiceAccount, Name: "a", Namespace: "prod"}}},
+		},
+		[]models.K8sServiceAccount{sa("prod", "a")},
+	))
+	if len(res.Edges) != 2 {
+		t.Fatalf("want 2 edges (one resolved, one dangling), got %d", len(res.Edges))
+	}
+	for _, e := range res.Edges {
+		if e.CalculationState != GrantCalculation || e.EffectiveConclusion != GrantConclusion {
+			t.Errorf("edge %q = %s/%s, want %s/%s", e.SourceKey, e.CalculationState,
+				e.EffectiveConclusion, GrantCalculation, GrantConclusion)
+		}
+	}
+	if GrantBasis != "declared" || GrantCalculation != "partial" || GrantConclusion != "unknown" {
+		t.Errorf("grant honesty = %s/%s/%s, want declared/partial/unknown",
+			GrantBasis, GrantCalculation, GrantConclusion)
+	}
+}
+
+// A RoleBinding ServiceAccount subject with no namespace takes the
+// RoleBinding namespace -- as the API server resolves it.
+func TestRoleBindingSubjectWithNoNamespaceTakesTheBindings(t *testing.T) {
+	res := Project(snapshot(
+		[]models.K8sRole{viewRole()},
+		[]models.K8sBinding{{
+			Kind: models.K8sKindRoleBinding, Name: "rb", Namespace: "prod",
+			RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+			Subjects: []models.K8sSubject{{Kind: models.K8sSubjectServiceAccount, Name: "agent"}},
+		}},
+		nil,
+	))
+	want := ServiceAccountKey(cluster, "prod", "agent")
+	ids := identityKeys(res)
+	n, ok := ids[want]
+	if !ok {
+		t.Fatalf("no identity %q; got %v", want, ids)
+	}
+	if n.DisplayName != "system:serviceaccount:prod:agent" || n.Namespace != "prod" {
+		t.Errorf("identity = %q in %q, want system:serviceaccount:prod:agent in prod", n.DisplayName, n.Namespace)
+	}
+	for k, n := range ids {
+		if strings.Contains(n.DisplayName, "::") || k == ServiceAccountKey(cluster, "", "agent") {
+			t.Errorf("phantom ServiceAccount %q (%s) created", n.DisplayName, k)
+		}
+	}
+	if len(res.Edges) != 1 || res.Edges[0].SubjectKey != want {
+		t.Errorf("grant not attributed to %q: %+v", want, res.Edges)
+	}
+	if len(res.Unresolved) != 0 {
+		t.Errorf("a RoleBinding subject resolves in the binding namespace; got unresolved %v", res.Unresolved)
+	}
+}
+
+// Under a ClusterRoleBinding there is no namespace to take: unresolved and
+// counted, never a "system:serviceaccount::name" identity.
+func TestClusterRoleBindingSubjectWithNoNamespaceIsUnresolved(t *testing.T) {
+	res := Project(snapshot(
+		[]models.K8sRole{viewRole()},
+		[]models.K8sBinding{{
+			Kind: models.K8sKindClusterRoleBinding, Name: "crb",
+			RoleRef: models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+			Subjects: []models.K8sSubject{
+				{Kind: models.K8sSubjectServiceAccount, Name: "agent"},
+				{Kind: models.K8sSubjectServiceAccount, Name: "ok", Namespace: "prod"},
+			},
+		}},
+		nil,
+	))
+	for _, n := range res.Identities {
+		if strings.Contains(n.DisplayName, "::") || n.SourceKey == ServiceAccountKey(cluster, "", "agent") {
+			t.Errorf("phantom ServiceAccount %q created", n.DisplayName)
+		}
+	}
+	if len(res.Unresolved) != 1 || !strings.Contains(res.Unresolved[0], "agent") {
+		t.Errorf("unresolved = %v, want the namespace-less subject counted once", res.Unresolved)
+	}
+	if len(res.Assignments) != 1 || res.Assignments[0].HolderKey != ServiceAccountKey(cluster, "prod", "ok") {
+		t.Errorf("assignments = %+v, want only the namespaced subject", res.Assignments)
+	}
+	if len(res.Edges) != 1 {
+		t.Errorf("want only the namespaced subject grant, got %d edges", len(res.Edges))
+	}
+}
+
+// The IRSA annotation lands in provider_attrs as aws_role_arn, and only when
+// present.
+func TestServiceAccountCarriesItsIRSARole(t *testing.T) {
+	withRole := sa("prod", "irsa")
+	withRole.AWSRoleARN = "arn:aws:iam::123456789012:role/reader"
+	res := Project(snapshot(nil, nil, []models.K8sServiceAccount{withRole, sa("prod", "plain")}))
+	ids := identityKeys(res)
+	if got := ids[ServiceAccountKey(cluster, "prod", "irsa")].Attrs["aws_role_arn"]; got != withRole.AWSRoleARN {
+		t.Errorf("aws_role_arn = %v, want %s", got, withRole.AWSRoleARN)
+	}
+	if _, ok := ids[ServiceAccountKey(cluster, "prod", "plain")].Attrs["aws_role_arn"]; ok {
+		t.Error("an account with no IRSA annotation carries an aws_role_arn key")
+	}
+}
+
+// ServiceAccounts are members of the implicit groups a binding names -- and of
+// no group nobody names.
+func TestImplicitGroupMembershipOnlyForNamedGroups(t *testing.T) {
+	bind := func(name, group string) models.K8sBinding {
+		return models.K8sBinding{Kind: models.K8sKindClusterRoleBinding, Name: name,
+			RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+			Subjects: []models.K8sSubject{{Kind: models.K8sSubjectGroup, Name: group}}}
+	}
+	res := Project(snapshot(
+		[]models.K8sRole{viewRole()},
+		[]models.K8sBinding{
+			bind("all", "system:serviceaccounts"),
+			bind("prod-only", "system:serviceaccounts:prod"),
+		},
+		[]models.K8sServiceAccount{sa("prod", "a"), sa("dev", "b")},
+	))
+	got := map[string]bool{}
+	for _, m := range res.Memberships {
+		got[m.MemberKey+" -> "+m.GroupKey] = true
+		if m.SourceKey != MemberOfKey(m.MemberKey, m.GroupKey) {
+			t.Errorf("membership key %q not spelled by MemberOfKey", m.SourceKey)
+		}
+	}
+	a, b := ServiceAccountKey(cluster, "prod", "a"), ServiceAccountKey(cluster, "dev", "b")
+	want := []string{
+		a + " -> " + GroupKey(cluster, "system:serviceaccounts"),
+		a + " -> " + GroupKey(cluster, "system:serviceaccounts:prod"),
+		b + " -> " + GroupKey(cluster, "system:serviceaccounts"),
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing membership %q", w)
+		}
+	}
+	if len(res.Memberships) != len(want) {
+		t.Errorf("%d memberships, want %d: %v", len(res.Memberships), len(want), got)
+	}
+	for k := range got {
+		if strings.Contains(k, "system:authenticated") || strings.Contains(k, "system:serviceaccounts:dev") {
+			t.Errorf("membership of a group no binding names: %q", k)
+		}
+	}
+	// The groups a membership points at are identities this snapshot projects.
+	ids := identityKeys(res)
+	for _, m := range res.Memberships {
+		if _, ok := ids[m.GroupKey]; !ok {
+			t.Errorf("membership points at group %q, which is not projected", m.GroupKey)
+		}
+	}
+}
+
+// system:authenticated covers every ServiceAccount too.
+func TestAuthenticatedGroupMembership(t *testing.T) {
+	res := Project(snapshot(
+		[]models.K8sRole{viewRole()},
+		[]models.K8sBinding{{Kind: models.K8sKindClusterRoleBinding, Name: "authn",
+			RoleRef:  models.K8sRoleRef{Kind: models.K8sKindClusterRole, Name: "view"},
+			Subjects: []models.K8sSubject{{Kind: models.K8sSubjectGroup, Name: "system:authenticated"}}}},
+		[]models.K8sServiceAccount{sa("prod", "a")},
+	))
+	if len(res.Memberships) != 1 ||
+		res.Memberships[0].GroupKey != GroupKey(cluster, "system:authenticated") ||
+		res.Memberships[0].Namespace != "prod" {
+		t.Errorf("memberships = %+v, want prod/a in system:authenticated", res.Memberships)
+	}
+}
+
+// member_of partitions exist per namespace, and only a cluster-wide sweep may
+// end one: the binding that names the group may be a ClusterRoleBinding.
+func TestMemberOfPartitionsNeedClusterScopeToEnd(t *testing.T) {
+	full := Scope{Cluster: cluster, Complete: true, ClusterScoped: true, Namespaces: []string{"a"}}
+	ns := Scope{Cluster: cluster, Complete: true, ClusterScoped: false, Namespaces: []string{"a"}}
+	n := 0
+	for _, p := range Partitions(full) {
+		if p.Target == TargetMemberOf {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("member_of partitions = %d, want 2 (cluster + a)", n)
+	}
+	if !full.CanEnd(PartitionForEdge(full, "a", TargetMemberOf)) {
+		t.Error("a complete cluster-wide sweep covering a cannot end its memberships")
+	}
+	if ns.CanEnd(PartitionForEdge(ns, "a", TargetMemberOf)) {
+		t.Error("a namespaced sweep ended memberships it cannot know are unnamed")
+	}
+	if !ns.CanEnd(PartitionForEdge(ns, "a", TargetAccessEdge)) {
+		t.Error("the member_of rule leaked onto ordinary edge partitions")
+	}
+	if p, ok := ParsePartitionKey(PartitionForEdge(full, "a", TargetMemberOf).Key()); !ok || p.Target != TargetMemberOf {
+		t.Errorf("a member_of partition key does not parse back: %+v %v", p, ok)
 	}
 }

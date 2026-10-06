@@ -113,6 +113,13 @@ type SightingInput struct {
 	// ObservedRunningAt is set ONLY by a collector that genuinely saw the agent
 	// run. A declaration must leave it nil, and the database enforces that.
 	ObservedRunningAt *time.Time
+	// RuntimeStatus is what the connector observed: "running" (the default
+	// when empty) or "stopped" -- a workload that exists with zero replicas.
+	// "stopped" is honoured only from the Kubernetes connector, the one source
+	// that can tell scaled-to-zero from running; from any other it reads as
+	// running. A sighting can never assert "gone": absence is a lifecycle event
+	// or a manifest's business.
+	RuntimeStatus string
 }
 
 // AgentRegistrationInput is a heartbeat from a deployed discovery agent.
@@ -164,11 +171,16 @@ type ManifestInput struct {
 	ScanKind          string
 	// Complete is false when any LIST in the sweep failed. A partial sweep retires
 	// nothing — see ReconcileManifest.
-	Complete       bool
-	Namespaces     []string
-	Fingerprints   []string
-	SweepStartedAt *time.Time
-	ObservedAt     *time.Time
+	Complete     bool
+	Namespaces   []string
+	Fingerprints []string
+	// StoppedFingerprints is the subset of Fingerprints observed scaled to
+	// zero. Present, so never marked gone; marked stopped instead. A present
+	// fingerprint NOT in it is running, which revives one that was stopped.
+	// Optional: an older connector sends none, and nothing changes for it.
+	StoppedFingerprints []string
+	SweepStartedAt      *time.Time
+	ObservedAt          *time.Time
 }
 
 // ManifestResult reports what a manifest changed, so the connector's logs and the
@@ -181,6 +193,11 @@ type ManifestResult struct {
 	Namespaces   int      `json:"namespaces"`
 	MarkedGone   int      `json:"marked_gone"`
 	Fingerprints []string `json:"fingerprints,omitempty"`
+	// MarkedStopped and MarkedRunning count the positive runtime transitions
+	// the manifest carried (scaled to zero, and back). Omitted when zero, so
+	// an older connector sees the response it always did.
+	MarkedStopped int `json:"marked_stopped,omitempty"`
+	MarkedRunning int `json:"marked_running,omitempty"`
 }
 
 // AgentUpdateInput captures the operator-editable fields on an inventory row.
@@ -550,6 +567,43 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 		Namespaces: len(in.Namespaces),
 	}
 
+	// A stopped fingerprint is PRESENT -- a workload scaled to zero still
+	// exists -- whether or not the connector also listed it in fingerprints.
+	present := unionStrings(in.Fingerprints, in.StoppedFingerprints)
+
+	// Positive observations first, and on a partial sweep too: what the
+	// connector SAW is evidence even when the sweep cannot vouch for absence.
+	// Kubernetes only, the one connector that reports scale-to-zero.
+	if in.Source == models.DiscoverySourceK8sWebhook {
+		stoppedSet := map[string]bool{}
+		for _, fp := range in.StoppedFingerprints {
+			stoppedSet[fp] = true
+		}
+		var running []string
+		for _, fp := range present {
+			if !stoppedSet[fp] {
+				running = append(running, fp)
+			}
+		}
+		stopped, resumed, err := m.repo.ApplyPresentRuntime(repositories.PresentRuntimeInput{
+			WorkspaceID: workspaceID,
+			Source:      in.Source,
+			ClusterName: in.ClusterName,
+			Stopped:     in.StoppedFingerprints,
+			Running:     running,
+			ObservedAt:  observedAt,
+		})
+		if err != nil {
+			return nil, err
+		}
+		result.MarkedStopped, result.MarkedRunning = len(stopped), len(resumed)
+		// Into the graph now, as a sighting would: the workload stays (a stopped
+		// workload is still present) and its runtime_status follows.
+		for _, fp := range append(stopped, resumed...) {
+			m.projectK8sSighting(workspaceID, in.Source, fp)
+		}
+	}
+
 	if !in.Complete {
 		result.Reason = "sweep was incomplete, so absence is not evidence of deletion; " +
 			"nothing was retired"
@@ -565,7 +619,7 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 		Source:         in.Source,
 		SourceID:       in.DiscoverySourceID,
 		ClusterName:    in.ClusterName,
-		Present:        in.Fingerprints,
+		Present:        present,
 		Namespaces:     in.Namespaces,
 		SweepStartedAt: sweepStart,
 		ObservedAt:     observedAt,
@@ -604,6 +658,21 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 	}
 
 	return result, nil
+}
+
+// unionStrings is a ∪ b, in first-seen order, without duplicates.
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, v := range list {
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 func defaultString(v, def string) string {
@@ -703,6 +772,23 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	// its runtime timestamp when the caller supplied none. A declared sighting
 	// proves only that a file exists: runtime is unknown, and it carries no
 	// runtime timestamp at all — the database refuses one.
+	//
+	// The Kubernetes connector may say what it saw is STOPPED -- the workload
+	// exists with zero replicas. That is still direct proof the workload
+	// exists (so never gone, and not retired from the graph), but not that it
+	// ran: last_observed_running_at does not advance.
+	stopped := false
+	switch strings.TrimSpace(in.RuntimeStatus) {
+	case "", models.RuntimeStatusRunning:
+	case models.RuntimeStatusStopped:
+		// Only the Kubernetes connector can tell scaled-to-zero from running;
+		// from anything else the sighting is what it always was.
+		stopped = in.Source == models.DiscoverySourceK8sWebhook
+	default:
+		return nil, false, fmt.Errorf("unknown sighting runtime_status %q (want running or stopped)",
+			in.RuntimeStatus)
+	}
+
 	runtimeStatus := models.RuntimeStatusRunning
 	runtimeReason := "observed by the " + in.Source + " connector"
 	runtimeObservedAt := &observedAt
@@ -710,6 +796,9 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 		runtimeStatus = models.RuntimeStatusUnknown
 		runtimeReason = "declared in a repository; no runtime observation"
 		runtimeObservedAt = nil
+	} else if stopped {
+		runtimeStatus = models.RuntimeStatusStopped
+		runtimeReason = "scaled to zero: observed by the " + in.Source + " connector with no running replicas"
 	} else if runningAt == nil {
 		runningAt = &observedAt
 	}

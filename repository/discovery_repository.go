@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -63,6 +64,10 @@ type DiscoveryRepository interface {
 	// last seen in the manifest's scope but missing from it is marked gone.
 	// Returns the fingerprints it marked.
 	MarkAbsent(in MarkAbsentInput) ([]string, error)
+	// ApplyPresentRuntime folds a manifest's POSITIVE observations into the
+	// runtime state: fingerprints present but scaled to zero become stopped,
+	// and stopped ones present again with replicas become running. Never gone.
+	ApplyPresentRuntime(in PresentRuntimeInput) (stopped, resumed []string, err error)
 
 	// ClaimAgent links a sighting to a governed identity and an accountable
 	// owner in one conditional update. Refuses a quarantined or already-claimed
@@ -124,6 +129,18 @@ type MarkAbsentInput struct {
 	SweepStartedAt time.Time
 	ObservedAt     time.Time
 	Reason         string
+}
+
+// PresentRuntimeInput is what a manifest observed PRESENT, split by whether it
+// was running: Stopped are workloads that exist with zero replicas, Running the
+// rest. Scoped like MarkAbsent: one workspace, source kind and cluster.
+type PresentRuntimeInput struct {
+	WorkspaceID uuid.UUID
+	Source      string
+	ClusterName string
+	Stopped     []string
+	Running     []string
+	ObservedAt  time.Time
 }
 
 // ClaimAgentInput carries everything a claim needs. OwnerUserID is mandatory —
@@ -263,6 +280,15 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, e
 			}
 			_ = json.Unmarshal(src.Config, &cfg)
 			integrationID = cfg.IntegrationID
+		}
+
+		// The graph objects only this source vouched for are retired, and its
+		// own claims ended and kept as history -- BEFORE the source row goes,
+		// because the FK cascade deletes the support rows that say which
+		// objects those are. Left to the cascade, they stayed active with no
+		// support, hidden from every view and retired by none.
+		if _, rerr := k8sgraph.RetireSource(tx, workspaceID, id, time.Now().UTC()); rerr != nil {
+			return fmt.Errorf("retire the source's graph objects: %w", rerr)
 		}
 
 		// BEFORE the source: once the source row goes, the FK nulls
@@ -786,6 +812,71 @@ func (r *discoveryRepository) MarkAbsent(in MarkAbsentInput) ([]string, error) {
 		return nil, err
 	}
 	return fingerprints, nil
+}
+
+// ApplyPresentRuntime marks present-but-scaled-to-zero agents stopped and
+// stopped agents that are running again running.
+//
+// Both are POSITIVE observations -- the sweep saw the workload -- so neither
+// needs a complete sweep, and neither can ever produce gone: a workload scaled
+// to zero still exists, and retiring it would delete an agent that is one
+// `kubectl scale` from running. Only a row that is currently running/unknown
+// becomes stopped, and only a stopped one becomes running: a gone row is not
+// resurrected here (a sighting does that, with its reappeared event), and the
+// monotonic guard keeps a late manifest from overriding newer evidence.
+func (r *discoveryRepository) ApplyPresentRuntime(in PresentRuntimeInput) ([]string, []string, error) {
+	if in.WorkspaceID == uuid.Nil || in.Source == "" || strings.TrimSpace(in.ClusterName) == "" {
+		return nil, nil, errors.New("workspace, source and cluster are required to apply runtime state")
+	}
+	if in.ObservedAt.IsZero() {
+		in.ObservedAt = time.Now()
+	}
+	// set is a fixed SQL fragment; every value goes through a placeholder.
+	apply := func(fps, from []string, set string, setArgs ...interface{}) ([]string, error) {
+		if len(fps) == 0 {
+			return nil, nil
+		}
+		var rows []struct{ Fingerprint string }
+		args := append(append([]interface{}{}, setArgs...),
+			in.WorkspaceID, in.Source, in.ClusterName, fps, from, models.EvidenceDeclared, in.ObservedAt)
+		if err := r.db.Raw(`
+			UPDATE discovered_agents
+			   SET `+set+`, updated_at = now()
+			 WHERE workspace_id = ? AND source = ?
+			   AND metadata #>> '{cluster,name}' = ?
+			   AND fingerprint IN ?
+			   AND runtime_status IN ?
+			   AND evidence_mode <> ?
+			   AND (runtime_observed_at IS NULL OR runtime_observed_at <= ?)
+			RETURNING fingerprint`, args...).Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.Fingerprint)
+		}
+		return out, nil
+	}
+
+	stopped, err := apply(in.Stopped,
+		[]string{models.RuntimeStatusRunning, models.RuntimeStatusUnknown},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?`,
+		models.RuntimeStatusStopped,
+		"scaled to zero: present in a resync sweep with no running replicas", in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark stopped: %w", err)
+	}
+	resumed, err := apply(in.Running,
+		[]string{models.RuntimeStatusStopped},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?,
+		 last_observed_running_at = GREATEST(COALESCE(last_observed_running_at, ?::timestamptz), ?::timestamptz)`,
+		models.RuntimeStatusRunning,
+		"running again: present in a resync sweep with replicas", in.ObservedAt,
+		in.ObservedAt, in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark running: %w", err)
+	}
+	return stopped, resumed, nil
 }
 
 /* --------------------------- claim / quarantine ------------------------- */
