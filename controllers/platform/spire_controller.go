@@ -31,6 +31,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -38,9 +39,10 @@ import (
 
 // SpireWorkload is the GORM model for registered SPIFFE workloads.
 type SpireWorkload struct {
-	ID       uint   `json:"-" gorm:"primaryKey"`
-	SpiffeID string `json:"spiffe_id" gorm:"uniqueIndex"`
-	Owner    string `json:"owner"`
+	ID          uint       `json:"-" gorm:"primaryKey"`
+	SpiffeID    string     `json:"spiffe_id" gorm:"uniqueIndex"`
+	Owner       string     `json:"owner"`
+	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"` // owner; from the caller's token, never the body (047)
 }
 
 func (SpireWorkload) TableName() string { return "spire_workloads" }
@@ -397,6 +399,9 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 		SpiffeID: spiffeID,
 		Owner:    clientID,
 	}
+	if ws, err := uuid.Parse(workspaceUUIDStr); err == nil {
+		w.WorkspaceID = &ws
+	}
 	if err := sc.db.Create(&w).Error; err != nil {
 		return "", fmt.Errorf("failed to save workload record: %w", err)
 	}
@@ -629,6 +634,10 @@ func (sc *SpireController) RegisterWorkload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	w.WorkspaceID = nil
+	if tc, err := tenancy.From(c); err == nil {
+		w.WorkspaceID = &tc.WorkspaceID
+	}
 	if err := sc.db.Create(&w).Error; err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -662,6 +671,7 @@ func (sc *SpireController) UpdateWorkload(c *gin.Context) {
 		return
 	}
 	w.SpiffeID = spiffeID
+	w.WorkspaceID = nil // ownership is not editable
 	if err := sc.db.Model(&existing).Updates(w).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

@@ -3,6 +3,7 @@ package repositories
 import (
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
@@ -20,6 +21,7 @@ type ExternalService struct {
 	AuthConfig      string         `json:"auth_config"` // JSON blob
 	VaultPath       string         `json:"vault_path"`
 	CreatedBy       string         `json:"created_by" gorm:"not null"`
+	WorkspaceID     *uuid.UUID     `json:"workspace_id,omitempty" gorm:"type:uuid"` // owner; set from the caller's token (047)
 	AgentAccessible bool           `json:"agent_accessible" gorm:"default:true"`
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`

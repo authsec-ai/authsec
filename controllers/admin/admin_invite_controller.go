@@ -197,6 +197,10 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			return
 		}
 		workspaceIDPtr = &workspaceUUID
+	} else if workspaceUUID != uuid.Nil {
+		// The body may omit workspace_id; the invited admin belongs to the
+		// inviter's workspace (users.workspace_id is required since 047).
+		workspaceIDPtr = &workspaceUUID
 	}
 
 	var projectIDPtr *uuid.UUID
