@@ -655,28 +655,10 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: WebAuthn FinishRegistration failed: %v", reqID, err)
 
-		// More comprehensive error handling - handle attestation, validation, and format errors
-		if strings.Contains(err.Error(), "attestation") ||
-			strings.Contains(err.Error(), "Invalid attestation") ||
-			strings.Contains(err.Error(), "format") ||
-			strings.Contains(err.Error(), "validation") {
-
-			log.Printf("[%s] FinishRegistration: Attempting fallback credential creation", reqID)
-
-			fallbackCred, fbErr := buildFallbackCredentialFromContainer(&reqBody.Credential)
-			if fbErr != nil {
-				log.Printf("[%s] FinishRegistration: Fallback credential creation failed: %v", reqID, fbErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid attestation/public key"})
-				return
-			}
-
-			log.Printf("[%s] FinishRegistration: Fallback credential created successfully", reqID)
-			credential = fallbackCred
-		} else {
-			log.Printf("[%s] FinishRegistration: Non-attestation WebAuthn error: %v", reqID, err)
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "WebAuthn registration failed"})
-			return
-		}
+		// A credential whose attestation, challenge or origin did not verify is
+		// rejected; the old fallback accepted forged registrations (AS-003).
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "WebAuthn registration failed"})
+		return
 	}
 
 	// Validate credential is not nil before proceeding

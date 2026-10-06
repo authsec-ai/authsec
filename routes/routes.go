@@ -41,6 +41,7 @@ import (
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/buildinfo"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
@@ -2029,16 +2030,26 @@ func registerWebAuthnRoutes(
 		c.JSON(200, gin.H{"status": "healthy", "service": "webauthn-service"})
 	})
 
+	// Every enrolment and verification step needs a login ticket (issued only
+	// after a server-verified first factor) or a session, and may act only for
+	// that subject. Status lookups stay open: the SDK's CIBA client calls them.
+	adminStep := middlewares.RequireLoginSubject(logintickets.RealmAdmin, false)
+	adminVerify := middlewares.RequireLoginSubject(logintickets.RealmAdmin, true)
+	endUserStep := middlewares.RequireLoginSubject(logintickets.RealmEndUser, false)
+	endUserVerify := middlewares.RequireLoginSubject(logintickets.RealmEndUser, true)
+	anyStep := middlewares.RequireLoginSubject("", false)
+	anyVerify := middlewares.RequireLoginSubject("", true)
+
 	// Admin WebAuthn (uses global DB)  →  /authsec/webauthn/admin/*
 	admin := router.Group("/admin")
 	{
 		admin.POST("/mfa/status", adminHandler.GetMFAStatus)
 		admin.POST("/mfa/loginStatus", adminHandler.GetMFAStatusForLogin)
 		admin.GET("/mfa/loginStatus", adminHandler.GetMFAStatusForLoginGET)
-		admin.POST("/beginRegistration", adminHandler.BeginRegistration)
-		admin.POST("/finishRegistration", adminHandler.FinishRegistration)
-		admin.POST("/beginAuthentication", adminHandler.BeginAuthentication)
-		admin.POST("/finishAuthentication", adminHandler.FinishAuthentication)
+		admin.POST("/beginRegistration", adminStep, adminHandler.BeginRegistration)
+		admin.POST("/finishRegistration", adminStep, adminHandler.FinishRegistration)
+		admin.POST("/beginAuthentication", adminStep, adminHandler.BeginAuthentication)
+		admin.POST("/finishAuthentication", adminVerify, adminHandler.FinishAuthentication)
 	}
 
 	// End-user WebAuthn (uses tenant-specific DBs)  →  /authsec/webauthn/enduser/*
@@ -2047,47 +2058,47 @@ func registerWebAuthnRoutes(
 		enduser.POST("/mfa/status", endUserHandler.GetMFAStatus)
 		enduser.POST("/mfa/loginStatus", endUserHandler.GetMFAStatusForLogin)
 		enduser.GET("/mfa/loginStatus", endUserHandler.GetMFAStatusForLoginGET)
-		enduser.POST("/beginRegistration", endUserHandler.BeginRegistration)
-		enduser.POST("/finishRegistration", endUserHandler.FinishRegistration)
-		enduser.POST("/beginAuthentication", endUserHandler.BeginAuthentication)
-		enduser.POST("/finishAuthentication", endUserHandler.FinishAuthentication)
+		enduser.POST("/beginRegistration", endUserStep, endUserHandler.BeginRegistration)
+		enduser.POST("/finishRegistration", endUserStep, endUserHandler.FinishRegistration)
+		enduser.POST("/beginAuthentication", endUserStep, endUserHandler.BeginAuthentication)
+		enduser.POST("/finishAuthentication", endUserVerify, endUserHandler.FinishAuthentication)
 	}
 
 	// Legacy flat routes  →  /authsec/webauthn/*
 	router.POST("/mfa/status", webAuthnHandler.GetMFAStatus)
 	router.POST("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLogin)
 	router.GET("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLoginGET)
-	router.POST("/beginRegistration", webAuthnHandler.BeginRegistration)
-	router.POST("/beginAuthRegistration", webAuthnHandler.BeginWebAuthnRegistration)
-	router.POST("/finishRegistration", webAuthnHandler.FinishRegistration)
-	router.POST("/beginAuthentication", webAuthnHandler.BeginAuthentication)
-	router.POST("/finishAuthentication", webAuthnHandler.FinishAuthentication)
+	router.POST("/beginRegistration", anyStep, webAuthnHandler.BeginRegistration)
+	router.POST("/beginAuthRegistration", anyStep, webAuthnHandler.BeginWebAuthnRegistration)
+	router.POST("/finishRegistration", anyStep, webAuthnHandler.FinishRegistration)
+	router.POST("/beginAuthentication", anyStep, webAuthnHandler.BeginAuthentication)
+	router.POST("/finishAuthentication", anyVerify, webAuthnHandler.FinishAuthentication)
 
 	// Biometric (alias flows)
-	router.POST("/biometric/verifyBegin", webAuthnHandler.BeginBiometricVerify)
-	router.POST("/biometric/verifyFinish", webAuthnHandler.FinishBiometricVerify)
-	router.POST("/biometric/beginSetup", webAuthnHandler.BeginBiometricSetup)
-	router.POST("/biometric/confirmSetup", webAuthnHandler.ConfirmBiometricSetup)
-	router.POST("/biometric/beginLoginSetup", webAuthnHandler.BeginBiometricLoginSetup)
-	router.POST("/biometric/confirmLoginSetup", webAuthnHandler.ConfirmBiometricLoginSetup)
-	router.POST("/biometric/verifyLoginBegin", webAuthnHandler.BeginBiometricLoginVerify)
-	router.POST("/biometric/verifyLoginFinish", webAuthnHandler.FinishBiometricLoginVerify)
+	router.POST("/biometric/verifyBegin", anyStep, webAuthnHandler.BeginBiometricVerify)
+	router.POST("/biometric/verifyFinish", anyVerify, webAuthnHandler.FinishBiometricVerify)
+	router.POST("/biometric/beginSetup", anyStep, webAuthnHandler.BeginBiometricSetup)
+	router.POST("/biometric/confirmSetup", anyStep, webAuthnHandler.ConfirmBiometricSetup)
+	router.POST("/biometric/beginLoginSetup", anyStep, webAuthnHandler.BeginBiometricLoginSetup)
+	router.POST("/biometric/confirmLoginSetup", anyStep, webAuthnHandler.ConfirmBiometricLoginSetup)
+	router.POST("/biometric/verifyLoginBegin", anyStep, webAuthnHandler.BeginBiometricLoginVerify)
+	router.POST("/biometric/verifyLoginFinish", anyVerify, webAuthnHandler.FinishBiometricLoginVerify)
 
 	// TOTP (legacy)
 	totpHandler := handlers.NewTOTPHandler()
-	router.POST("/totp/beginLoginSetup", totpHandler.BeginSetup)
-	router.POST("/totp/beginSetup", totpHandler.BeginTOTPSetup)
-	router.POST("/totp/confirmLoginSetup", totpHandler.ConfirmSetup)
-	router.POST("/totp/confirmSetup", totpHandler.ConfirmTOTPSetup)
-	router.POST("/totp/verifyLogin", totpHandler.VerifyLoginTOTP)
-	router.POST("/totp/verify", totpHandler.VerifyTOTP)
+	router.POST("/totp/beginLoginSetup", anyStep, totpHandler.BeginSetup)
+	router.POST("/totp/beginSetup", anyStep, totpHandler.BeginTOTPSetup)
+	router.POST("/totp/confirmLoginSetup", anyStep, totpHandler.ConfirmSetup)
+	router.POST("/totp/confirmSetup", anyStep, totpHandler.ConfirmTOTPSetup)
+	router.POST("/totp/verifyLogin", anyVerify, totpHandler.VerifyLoginTOTP)
+	router.POST("/totp/verify", anyVerify, totpHandler.VerifyTOTP)
 
 	// SMS (legacy)
 	smsHandler := handlers.NewSMSHandler()
-	router.POST("/sms/beginSetup", smsHandler.BeginSMSSetup)
-	router.POST("/sms/confirmSetup", smsHandler.ConfirmSMSSetup)
-	router.POST("/sms/requestCode", smsHandler.RequestSMSCode)
-	router.POST("/sms/verify", smsHandler.VerifySMS)
+	router.POST("/sms/beginSetup", anyStep, smsHandler.BeginSMSSetup)
+	router.POST("/sms/confirmSetup", anyStep, smsHandler.ConfirmSMSSetup)
+	router.POST("/sms/requestCode", anyStep, smsHandler.RequestSMSCode)
+	router.POST("/sms/verify", anyVerify, smsHandler.VerifySMS)
 }
 
 // registerHmgrRoutes registers all Hydra Manager routes under /hmgr.

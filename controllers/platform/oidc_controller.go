@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/database"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -914,12 +915,26 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 		return
 	}
 
+	// The OIDC identity is verified: the MFA step and the session callback
+	// that follow require this ticket.
+	if adminUser.WorkspaceID == nil || *adminUser.WorkspaceID != user.WorkspaceID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to load user account"})
+		return
+	}
+	ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmAdmin, user.WorkspaceID, adminUser.ID, adminUser.Email, "oidc")
+	if err != nil {
+		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to issue login ticket: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start sign-in"})
+		return
+	}
+
 	c.JSON(http.StatusOK, models.LoginResponse{
 		WorkspaceID:  user.WorkspaceID.String(),
 		WorkspaceDomain: workspaceDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
 		Token:        tokenStr,
+		LoginTicket:  ticket,
 	})
 }
 

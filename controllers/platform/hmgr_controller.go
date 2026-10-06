@@ -16,6 +16,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	hydrautils "github.com/authsec-ai/authsec/internal/hydra/utils"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -1531,6 +1532,14 @@ func buildSAMLRedirectURL(redirectTo, loginChallenge string, user *hydramodels.U
 	query.Set("workspace_id", user.WorkspaceID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
+	// The assertion has been processed: hand the UI the ticket its MFA step
+	// and session callback require. /uflow/user/saml/login is anonymous and
+	// must never be treated as proof of a SAML sign-in (AS-029).
+	if ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmEndUser, user.WorkspaceID, user.ID, user.Email, "saml"); err != nil {
+		log.Printf("[SAML] buildSAMLRedirectURL: failed to issue login ticket: %v", err)
+	} else {
+		query.Set(logintickets.ResponseField, ticket)
+	}
 
 	builtURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
 	if err != nil {

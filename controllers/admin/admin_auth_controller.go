@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -441,6 +442,20 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 			return
 		}
 		response["token"] = token
+	} else {
+		// The MFA step and the session callback require proof that this
+		// password check happened.
+		if adminUser.WorkspaceID == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+		ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmAdmin, *adminUser.WorkspaceID, adminUser.ID, adminUser.Email, "password")
+		if err != nil {
+			log.Printf("AdminLogin: failed to issue login ticket: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start sign-in"})
+			return
+		}
+		response[logintickets.ResponseField] = ticket
 	}
 
 	// Include temporary password status if applicable

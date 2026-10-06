@@ -14,8 +14,10 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
@@ -687,6 +689,22 @@ func (uc *UserController) Login(c *gin.Context) {
 		OTPRequired:     false,
 	}
 
+	// The password is verified: hand the client a ticket that the MFA step and
+	// the session callback require. The password was checked on a user found
+	// by email alone, so the ticket is issued only if that is this
+	// workspace's user (the same email may exist in another workspace).
+	if wsUser, wsErr := uc.userRepo.GetUserByEmailAndTenant(user.Email, tenant.WorkspaceID); wsErr != nil || wsUser.ID != user.ID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+	ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmAdmin, tenant.WorkspaceID, user.ID, user.Email, "password")
+	if err != nil {
+		log.Printf("Login: failed to issue login ticket for %s: %v", input.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start sign-in"})
+		return
+	}
+	response.LoginTicket = ticket
+
 	// Determine next step based on user status and MFA methods
 	if isFirstLogin {
 		// First-time login - NO TOKEN, just return basic info
@@ -741,34 +759,24 @@ func (uc *UserController) Login(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/login/webauthn-callback [post]
 func (uc *UserController) WebAuthnCallback(c *gin.Context) {
-	var input models.WebAuthnCallbackInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// The session token is minted only for the subject of a login ticket whose
+	// first factor and second factor were both verified on the server. The
+	// email, workspace_id and mfa_verified a client sends are not trusted:
+	// trusting them let anyone mint any workspace owner's token (AS-001).
+	ticket, err := logintickets.ConsumeVerified(config.GetDatabase().DB, middlewares.LoginTicketFromRequest(c), logintickets.RealmAdmin)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "sign-in has not completed multi-factor verification"})
 		return
 	}
 
-	// Find the tenant user in main database
-	tenant, err := uc.workspaceRepo.GetWorkspaceByWorkspaceID(input.WorkspaceID.String())
+	tenant, err := uc.workspaceRepo.GetWorkspaceByWorkspaceID(ticket.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 
-	// Ensure MFA verification flag is present
-	if input.MFAVerified == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "MFA verification status is required"})
-		return
-	}
-
-	// Verify MFA was successful
-	if !*input.MFAVerified {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA verification failed"})
-		return
-	}
-
-	// Find user in main database (not tenant database), scoped to the workspace
-	user, err := uc.userRepo.GetUserByEmailAndTenant(tenant.Email, tenant.WorkspaceID)
-	if err != nil {
+	user, err := uc.userRepo.GetUserByEmailAndTenant(ticket.Email, tenant.WorkspaceID)
+	if err != nil || user.ID != ticket.UserID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}

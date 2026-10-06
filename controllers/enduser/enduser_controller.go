@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -1166,6 +1167,9 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
 	}
+	if !attachLoginTicket(c, &response, &user, "oidc") {
+		return
+	}
 
 	// Handle logic based on MFA and login type
 	if !user.MFAEnabled {
@@ -1302,6 +1306,9 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 			FirstLogin:  isFirstLogin,
 			OTPRequired: false,
 		}
+		if !attachLoginTicket(c, &response, &user, "password") {
+			return
+		}
 
 		authController, authErr := NewEndUserAuthController()
 		if authErr != nil {
@@ -1340,6 +1347,9 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
 		MFARequired: true,
+	}
+	if !attachLoginTicket(c, &response, &user, "password") {
+		return
 	}
 
 	log.Printf("Returning user login for: %s - requires MFA verification", user.Email)
@@ -2330,4 +2340,18 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 		"owner_email": ownerEmail,
 		"user_email":  userEmail,
 	})
+}
+
+// attachLoginTicket hands the client the ticket that the MFA step and the
+// session callback require, once a first factor has been verified for user.
+// On failure it writes the error response and returns false.
+func attachLoginTicket(c *gin.Context, response *models.LoginResponse, user *models.User, firstFactor string) bool {
+	ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmEndUser, user.WorkspaceID, user.ID, user.Email, firstFactor)
+	if err != nil {
+		log.Printf("failed to issue login ticket for %s: %v", user.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start sign-in"})
+		return false
+	}
+	response.LoginTicket = ticket
+	return true
 }

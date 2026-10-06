@@ -6962,3 +6962,29 @@ COMMENT ON COLUMN public.cloud_observation.content_hash IS
 COMMENT ON COLUMN public.cloud_observation.surface_state IS
     'The surface coverage state when this was collected, so a fact read during '
     'a partial scan stays readable as such later.';
+
+-- ---------------------------------------------------------------------------
+-- login_tickets (043): first-factor proof for the MFA step and the session
+-- callbacks. Kept identical to migrations/master/043_login_tickets.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.login_tickets (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_hash     text NOT NULL UNIQUE,
+    realm           text NOT NULL CHECK (realm IN ('admin', 'enduser')),
+    workspace_id    uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id         uuid NOT NULL,
+    email           text NOT NULL,
+    first_factor    text NOT NULL,
+    mfa_verified_at timestamptz,
+    consumed_at     timestamptz,
+    expires_at      timestamptz NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_tickets_workspace ON public.login_tickets (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_login_tickets_expires ON public.login_tickets (expires_at);
+
+COMMENT ON TABLE public.login_tickets IS
+    'Short-lived, single-use proof that an interactive sign-in passed its first '
+    'factor; gates the anonymous MFA endpoints and the session-token callbacks. '
+    'Stores only a SHA-256 hash of the ticket.';
