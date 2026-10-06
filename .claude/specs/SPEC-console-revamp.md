@@ -437,6 +437,75 @@ from the **sweep behind it**, and the header is built from that sweep
 | No sweep | `coverage: not_swept` | *No inventory received yet* — not an empty list |
 | Heartbeat recent, sweep old | both | *Agent online; its last inventory is from <time>* — the discrepancy is stated |
 
+### Kubernetes object pages — requirement (revision 5, 6 Oct 2026)
+
+The Kubernetes workload and ServiceAccount pages at `/iga/k8s/:kind/:id`
+move onto the same shell as the AWS object pages (`ObjectShell`), reading the
+routes that exist at the backend tip and nothing else. Every sentence below is
+a requirement; what the backend cannot answer is said on the page, never
+filled in.
+
+**Reads.** Header, Overview and Access come from `k8sread`
+(`/authsec/discovery/k8s/clusters`, `/workloads`, `/identities`,
+`/identities/:id/access`). The Graph tab comes from `/api/iga/v1/graph`,
+`/graph/expand` and `/graph/path` with a Kubernetes root (`workload:<id>` or
+`identity:<id>`), **without** `rev`: a Kubernetes answer is unrevisioned, the
+page never pins a revision, never shows "newer publication", and treats
+`meta.rev` as absent. The AWS detail routes 404 for Kubernetes ids and are not
+called.
+
+**Header.** Name, kind in words (*Kubernetes workload · Deployment*,
+*ServiceAccount*), cluster and namespace. The publication stamp is replaced by
+the sweep: *Inventory from the sweep at <time> · Fully swept | Namespaces only
+| Sweep incomplete | Never swept*. *Namespaces only* carries a persistent
+warning that cluster-wide bindings were not read. No "Published", no revision
+number, no heartbeat time in the header.
+
+**Overview** answers three things, in this order:
+1. *Runs as* — the ServiceAccount, with basis *Observed running* or
+   *Configured only*, and a mismatch flag when the two differ.
+2. *What the cluster lets it do* — grouped by role, worst first (wildcard,
+   then escalation verbs `escalate` `bind` `impersonate` and `secrets get`,
+   then the rest); each group names the binding and its scope badge
+   *cluster-wide* or *namespace <ns>*.
+3. *Not evaluated* — a panel, not a footnote: admission policies and webhooks,
+   token mounting (`automountServiceAccountToken`), grants through groups
+   (`system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+   `system:authenticated`) unless the API lists them for this identity, and
+   cloud identity links (IRSA, Pod Identity, GKE Workload Identity).
+
+**Access tab** (the name; never *Resources*): one row per rule — verbs on
+resource types, API group, scope badge, the binding as the reason, and pills
+*Wildcard*, *Named instances only* (with the note that `resourceNames` do not
+constrain list, watch or create), *Privilege escalation* for the verbs above.
+Partial chains (binding to a role the sweep did not see) show *Role not in
+the sweep — unresolved, not none*. A ServiceAccount page adds *Workloads that
+run as it* with honest counts (*At least N* at the read cap).
+
+**Graph tab.** Workload → ServiceAccount → rule cards; the binding is the edge
+label, the role is the card title, rules of one role collapse into one card by
+default, the scope badge sits on the card. New node kinds
+`k8s_service_account`, `k8s_user`, `k8s_group` and a rule statement carrying
+`k8s_rule` get icons, categories and sentences; the inspector reads *Rule in
+ClusterRole X, bound to this ServiceAccount by RoleBinding Y in namespace Z*.
+The status bar reads *Declared by RBAC · admission policies and token mounting
+not evaluated*. The word *effective* does not appear anywhere on these pages.
+Paths-to-resource is not offered for Kubernetes; the Paths view is hidden.
+
+**Wording.** *stale* is "unconfirmed, still believed"; *ended* is "the sweep
+no longer sees it". Empty lists say what was not read, never "no access".
+
+**Removal.** The flat `K8sAccessChain` page body is replaced, not kept beside
+the new page; one read path per fact.
+
+**Acceptance.** Type check and lint at the pre-change baseline, the production
+build, and a render pass of both pages against a fixture backend covering:
+full sweep, namespaces-only sweep, never swept, partial chain, wildcard rule,
+escalation rule, stale and ended rows, a workload with no ServiceAccount
+resolved, and a Kubernetes-only workspace with no AWS publication. A passing
+test is not acceptance; the render pass is, and it is still not a signed-in
+check.
+
 ## Summaries — three compositions
 
 Not one universal card. Three compositions with distinct jobs; the facts
