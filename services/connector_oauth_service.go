@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,12 +16,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/connectoradapters"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ConnectorOAuthService drives the connect-once OAuth flow: it builds the
@@ -176,16 +179,26 @@ type CallbackResult struct {
 // HandleCallback validates the state, exchanges the code for tokens, and stores
 // the resulting workspace-scope Connection (secret → Vault). One-shot: the state
 // row is deleted regardless of outcome.
-func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackResult, error) {
+//
+// binding is the value of the browser cookie set when the flow started
+// (ConnectStateBinding). It must match, so a provider redirect carrying a
+// state that another user started cannot complete their connect in this
+// browser (AS-071: the victim's provider token would land under the
+// initiator's workspace and subject).
+func (s *ConnectorOAuthService) HandleCallback(code, state, binding string) (*CallbackResult, error) {
 	if code == "" || state == "" {
 		return nil, errors.New("missing code or state")
 	}
+	if !ConnectStateBindingValid(state, binding) {
+		return nil, ErrConnectStateNotBound
+	}
 	var st models.ConnectorOAuthState
-	if err := s.db.First(&st, "state = ?", state).Error; err != nil {
+	// The state is an unguessable one-shot handle; the workspace comes from the
+	// row it names. Consume it atomically so two callbacks cannot both use it.
+	res := s.db.Clauses(clause.Returning{}).Where("state = ?", state).Delete(&st)
+	if res.Error != nil || res.RowsAffected != 1 {
 		return nil, errors.New("invalid or expired state")
 	}
-	// One-shot: consume the state now.
-	s.db.Delete(&models.ConnectorOAuthState{}, "state = ?", state)
 	if time.Now().After(st.ExpiresAt) {
 		return nil, errors.New("state expired")
 	}
@@ -511,6 +524,65 @@ func (s *ConnectorOAuthService) resolveProviderApp(workspaceID uuid.UUID, provid
 func providerSupports(methods []string, want string) bool {
 	for _, m := range methods {
 		if m == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrConnectStateNotBound means the callback arrived in a browser that did
+// not start the connect flow.
+var ErrConnectStateNotBound = errors.New("connect must be completed in the browser session that started it")
+
+// ConnectStateCookie is the name of the cookie that binds one connect flow
+// to the browser that started it (one cookie per flow, so parallel connects
+// in several tabs do not overwrite each other).
+func ConnectStateCookie(state string) string {
+	if len(state) > 16 {
+		state = state[:16]
+	}
+	return "authsec_cx_" + state
+}
+
+// ConnectStateBinding is the cookie value for a connect flow: an HMAC of the
+// state under the server's state key, so it cannot be computed by a third
+// party who only learns the state from a provider URL.
+func ConnectStateBinding(state string) string {
+	m := hmac.New(sha256.New, oidcStateHMACKey())
+	m.Write([]byte("connector-oauth-state:" + state))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// ConnectStateBindingValid checks a cookie value against the state.
+func ConnectStateBindingValid(state, binding string) bool {
+	if binding == "" {
+		return false
+	}
+	return hmac.Equal([]byte(binding), []byte(ConnectStateBinding(state)))
+}
+
+// SafeConnectRedirect reports whether redirect_after may be used after the
+// callback: a same-origin path, or a URL on the configured UI origin or on
+// the origin of the browser that started the flow (requestOrigin, the
+// Origin header of the start request).
+func SafeConnectRedirect(raw, requestOrigin string) bool {
+	if raw == "" {
+		return true
+	}
+	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") && !strings.HasPrefix(raw, "/\\") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return false
+	}
+	allowed := []string{requestOrigin}
+	if config.AppConfig != nil {
+		allowed = append(allowed, config.AppConfig.UIOrigin)
+	}
+	for _, a := range allowed {
+		o, oErr := url.Parse(strings.TrimSpace(a))
+		if oErr == nil && o.Host != "" && strings.EqualFold(o.Scheme, u.Scheme) && strings.EqualFold(o.Host, u.Host) {
 			return true
 		}
 	}

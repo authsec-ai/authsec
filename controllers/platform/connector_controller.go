@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -350,12 +352,17 @@ func (ctl *ConnectorController) StartOAuthConnect(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if !services.SafeConnectRedirect(req.RedirectAfter, c.GetHeader("Origin")) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_after must be a path or a URL on the console origin"})
+		return
+	}
 	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
 	out, err := svc.Start(wsID, id, principal, req.RedirectAfter, req.Scopes)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	setConnectBindingCookie(c, out.State)
 	auditAdminMutation(c, wsID.String(), "connect_start", "connector", id.String(), http.StatusOK, nil, gin.H{"provider": true})
 	c.JSON(http.StatusOK, out)
 }
@@ -366,15 +373,21 @@ func (ctl *ConnectorController) OAuthCallback(c *gin.Context) {
 	code := c.Query("code")
 	state := c.Query("state")
 
+	binding, _ := c.Cookie(services.ConnectStateCookie(state))
+	if !services.ConnectStateBindingValid(state, binding) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": services.ErrConnectStateNotBound.Error()})
+		return
+	}
 	vaultClient, err := ctl.getVaultClient()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
-	res, err := svc.HandleCallback(code, state)
+	res, err := svc.HandleCallback(code, state, binding)
+	clearConnectBindingCookie(c, state)
 	if err != nil {
-		// Bad/expired state or provider error.
+		// Bad/expired/unbound state or provider error.
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -383,6 +396,44 @@ func (ctl *ConnectorController) OAuthCallback(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "connected", "connector_id": res.ConnectorID})
+}
+
+// connectCallbackPath is where providers redirect (routes.go); the binding
+// cookie is scoped to it.
+const connectCallbackPath = "/authsec/connector-oauth/callback"
+
+// setConnectBindingCookie binds a connect flow to this browser (AS-071): the
+// callback completes only when it carries the cookie. Lax is enough because
+// the provider's redirect back is a top-level GET navigation.
+func setConnectBindingCookie(c *gin.Context, state string) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     services.ConnectStateCookie(state),
+		Value:    services.ConnectStateBinding(state),
+		Path:     connectCallbackPath,
+		MaxAge:   int((10 * time.Minute).Seconds()),
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(c),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func clearConnectBindingCookie(c *gin.Context, state string) {
+	if state == "" {
+		return
+	}
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     services.ConnectStateCookie(state),
+		Value:    "",
+		Path:     connectCallbackPath,
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(c),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func requestIsHTTPS(c *gin.Context) bool {
+	return c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
 }
 
 // GrantAssignment handles POST /authsec/connectors/:id/assignments — grant an
@@ -668,12 +719,17 @@ func (ctl *ConnectorController) StartUserConnect(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if !services.SafeConnectRedirect(req.RedirectAfter, c.GetHeader("Origin")) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_after must be a path or a URL on the console origin"})
+		return
+	}
 	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
 	out, err := svc.StartUser(wsID, id, userID, req.RedirectAfter, req.Scopes)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	setConnectBindingCookie(c, out.State)
 	c.JSON(http.StatusOK, out)
 }
 
