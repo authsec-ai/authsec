@@ -100,6 +100,13 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			return
 		}
 
+		// The user must still belong to the workspace the token names.
+		if ok, _ := principalActiveInWorkspace(info.WorkspaceID, info.UserID); !ok {
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="session is no longer valid for this workspace"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session is no longer valid for this workspace"})
+			return
+		}
+
 		// The one request-scoped tenant context (ADR-0001 §4.2).
 		if ws, err := uuid.Parse(info.WorkspaceID); err == nil {
 			uid, _ := uuid.Parse(info.UserID)
