@@ -1262,6 +1262,64 @@ func (s *OAuthASService) revokeHydraConsentForSubject(subject string) error {
 	return nil
 }
 
+// revokeHydraConsentForClient revokes a subject's Hydra consent sessions for
+// one client, which invalidates the access and refresh tokens issued under
+// them.
+func (s *OAuthASService) revokeHydraConsentForClient(subject, hydraClientID string) error {
+	target := config.AppConfig.HydraAdminURL + "/admin/oauth2/auth/sessions/consent?subject=" +
+		url.QueryEscape(subject) + "&client=" + url.QueryEscape(hydraClientID)
+	req, err := http.NewRequest("DELETE", target, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke-consent request: %w", err)
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra admin unavailable: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("hydra returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// RevokeTokensForConsentGrant revokes the tokens a revoked consent grant
+// backs (AS-068): the user's Hydra consent sessions (and with them the
+// access and refresh tokens) for the grant's client, and the user's live
+// native tokens issued to that client for the grant's resource server.
+// Errors are returned after every step has been tried.
+func (s *OAuthASService) RevokeTokensForConsentGrant(ctx context.Context, grant *models.OAuthConsentGrant) error {
+	if grant == nil {
+		return nil
+	}
+	var client models.MCPOAuthClient
+	if err := s.db.WithContext(ctx).Select("id, client_id, hydra_client_id").
+		Where("id = ?", grant.OAuthClientID).First(&client).Error; err != nil {
+		return fmt.Errorf("load consent client: %w", err)
+	}
+	var errs []error
+	if client.HydraClientID != "" {
+		if err := s.revokeHydraConsentForClient(grant.UserID.String(), client.HydraClientID); err != nil {
+			errs = append(errs, fmt.Errorf("hydra consent revoke: %w", err))
+		}
+	}
+
+	var live []models.NativeToken
+	if err := s.db.WithContext(ctx).
+		Where(`workspace_id = ? AND subject_type = 'user' AND subject_id = ? AND client_id = ?
+		       AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?`,
+			grant.WorkspaceID, grant.UserID, client.ClientID, grant.ResourceServerID, time.Now()).
+		Find(&live).Error; err != nil {
+		errs = append(errs, fmt.Errorf("list native tokens: %w", err))
+	}
+	for _, nt := range live {
+		if err := tokens.RevokeAccessToken(ctx, s.db, nt.Iss, nt.JTI.String(), "consent_revoked", nt.ExpiresAt); err != nil {
+			errs = append(errs, fmt.Errorf("revoke native token %s: %w", nt.JTI, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // RevokeUserTokensForWorkspace invalidates a user's active OAuth tokens + consent
 // in a specific workspace, immediately after an RBAC mutation removes or narrows
 // their permissions. Phase H-5 is the security keystone: without it, removing

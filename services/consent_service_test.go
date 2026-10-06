@@ -38,8 +38,10 @@ func TestConsentService_MethodsExist(t *testing.T) {
 	var _ func() = func() {
 		_ = svc.CheckExistingConsent
 		_ = svc.UpsertConsent
-		_ = svc.RevokeConsent
+		_ = svc.RevokeConsentByTenant
 		_ = svc.RevokeConsentByUser
+		_ = svc.ConsentWithdrawn
+		_ = svc.MarkReconsented
 		_ = svc.ListByUser
 		_ = svc.ListByTenant
 	}

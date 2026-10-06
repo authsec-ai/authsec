@@ -1150,6 +1150,13 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 					arcCtx.ContextID, consentErr)
 			}
 		}
+	} else if mcpClient != nil && workspaceUUID != uuid.Nil && subjectUUID != uuid.Nil {
+		// Consent given again (not remembered) clears an earlier revocation,
+		// which would otherwise refuse the refreshes of these new tokens.
+		if err := ctrl.consentService.MarkReconsented(workspaceUUID, subjectUUID, mcpClient.ID, rs.ID); err != nil {
+			log.Printf("[MCP_AUTH] ConsentHandler: failed to clear revoked consent context_id=%s: %v",
+				arcCtx.ContextID, err)
+		}
 	}
 
 	log.Printf("[MCP_AUTH] ConsentHandler: consent completed context_id=%s client=%s rs=%s remember=%v scopes=%d",

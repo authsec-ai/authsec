@@ -924,6 +924,21 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
+	// Consent the user withdrew (or an admin revoked) ends the refresh chain
+	// even if Hydra still honours it (AS-068). A failed lookup refuses.
+	if subUUID, perr := uuid.Parse(sub); perr == nil {
+		withdrawn, cErr := ctrl.consentService.ConsentWithdrawn(rs.WorkspaceID, subUUID, oauthClient.ID, rs.ID)
+		if cErr != nil || withdrawn {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: consent withdrawn sub=%s rs=%s err=%v", sub, resourceParam, cErr)
+			revokeRefreshed("consent withdrawn")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "consent for this client has been revoked",
+			})
+			return
+		}
+	}
+
 	issuedScopes := strings.Fields(issuedScopeStr)
 	currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 		c.Request.Context(),
@@ -3321,9 +3336,14 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 	}
 
 	// RevokeConsentByTenant enforces tenant ownership — cross-tenant revocations are rejected.
-	if err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	// Tokens issued under the grant stop working too (AS-068).
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "consent_grant_revoked", "oauth_consent_grant",
@@ -3359,15 +3379,19 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 		return
 	}
 
-	_, userID, err := ctrl.requireAuthenticatedUserContext(c)
+	workspaceID, userID, err := ctrl.requireAuthenticatedUserContext(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := ctrl.consentService.RevokeConsentByUser(grantID, userID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByUser(grantID, userID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeUserConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
