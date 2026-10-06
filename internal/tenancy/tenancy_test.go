@@ -96,3 +96,33 @@ func TestScopeAddsPredicate(t *testing.T) {
 		t.Fatalf("the workspace is not bound: %v", stmt.Vars)
 	}
 }
+
+func TestHTTPStatus(t *testing.T) {
+	cases := []struct {
+		err  error
+		want int
+	}{
+		{nil, 200},
+		{ErrNoTenant, 401},
+		{ErrNotFound, 404},
+		{gorm.ErrRecordNotFound, 404},
+		{errors.New("boom"), 500},
+	}
+	for _, tc := range cases {
+		if got := HTTPStatus(tc.err); got != tc.want {
+			t.Errorf("HTTPStatus(%v) = %d, want %d", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestWorkspace(t *testing.T) {
+	c := testContext()
+	if _, err := Workspace(c); !errors.Is(err, ErrNoTenant) {
+		t.Fatalf("no tenant: got %v", err)
+	}
+	ws := uuid.New()
+	Set(c, Context{WorkspaceID: ws})
+	if got, err := Workspace(c); err != nil || got != ws {
+		t.Fatalf("Workspace = %v, %v; want %v", got, err, ws)
+	}
+}

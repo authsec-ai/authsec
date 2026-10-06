@@ -54,12 +54,19 @@ type CreateResourceServerRequest struct {
 	// ApplicationType is one of models.ApplicationType* — mcp_server (default),
 	// ai_agent, clawbot, api_service. Optional; left empty defaults to mcp_server.
 	ApplicationType string `json:"application_type,omitempty"`
+	// AgentType labels an ai_agent application. Ignored for other types;
+	// defaults to DefaultAgentType for ai_agent.
+	AgentType string `json:"agent_type,omitempty"`
 	// ScopePresetID, if set and not "blank", seeds preset scopes for this RS.
 	ScopePresetID *string `json:"scope_preset_id,omitempty"`
 	// DefaultAccessEnabled controls the initial enabled flag on the auto-created
 	// access policy. Defaults to false (closed) per the wireframe redesign.
 	DefaultAccessEnabled *bool `json:"default_access_enabled,omitempty"`
 }
+
+// DefaultAgentType is the agent_type given to an ai_agent application created
+// without one; it matches the console's only delegation target type.
+const DefaultAgentType = "mcp-agent"
 
 // ValidApplicationType reports whether the supplied type is one of the
 // supported Application type constants. Empty string is treated as valid and
@@ -154,9 +161,21 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	appSlug := SlugForApp(req.Name)
 	canonicalRequestedScopes := CanonicalAuthSecScopes(req.ScopesSupported, appSlug)
 
+	// An ai_agent always carries an agent_type: delegation policies match on
+	// it and provision-identity refuses an agent without one (AS-046).
+	var agentType *string
+	if appType == models.ApplicationTypeAIAgent {
+		at := strings.TrimSpace(req.AgentType)
+		if at == "" {
+			at = DefaultAgentType
+		}
+		agentType = &at
+	}
+
 	rs := &models.ResourceServer{
 		WorkspaceID:             req.WorkspaceID,
 		ApplicationType:         appType,
+		AgentType:               agentType,
 		Name:                    req.Name,
 		PublicBaseURL:           publicURL,
 		ProtectedBasePath:       basePath,

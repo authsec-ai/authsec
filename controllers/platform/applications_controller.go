@@ -94,6 +94,7 @@ type applicationCreateRequest struct {
 	PublicBaseURL        string   `json:"public_base_url" binding:"required"`
 	ProtectedBasePath    string   `json:"protected_base_path,omitempty"`
 	ApplicationType      string   `json:"application_type,omitempty"`
+	AgentType            string   `json:"agent_type,omitempty"`
 	ScopesSupported      []string `json:"scopes_supported,omitempty"`
 	RegistrationModes    []string `json:"registration_modes,omitempty"`
 	ScopePresetID        *string  `json:"scope_preset_id,omitempty"`
@@ -125,6 +126,7 @@ func (ctrl *ApplicationsController) Create(c *gin.Context) {
 		PublicBaseURL:        req.PublicBaseURL,
 		ProtectedBasePath:    req.ProtectedBasePath,
 		ApplicationType:      req.ApplicationType,
+		AgentType:            req.AgentType,
 		ScopesSupported:      req.ScopesSupported,
 		RegistrationModes:    req.RegistrationModes,
 		ScopePresetID:        req.ScopePresetID,

@@ -313,6 +313,10 @@ var sharedSpireController *SpireController
 // SetSharedSpireController stores the singleton so other controllers can create entries in-process.
 func SetSharedSpireController(sc *SpireController) { sharedSpireController = sc }
 
+// EmbeddedSpireAvailable reports whether the embedded SPIRE control plane
+// (ENABLE_EMBEDDED_SPIRE) is running, which RegisterAgentWorkload needs.
+func EmbeddedSpireAvailable() bool { return sharedSpireController != nil }
+
 // RegisterAgentWorkload creates a SPIRE workload entry for an AI agent.
 // It writes to both the master DB (spire_workloads) and the tenant DB (workload_entries),
 // and optionally creates a SPIRE entry via gRPC if the server is connected.

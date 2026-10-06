@@ -2,14 +2,11 @@ package platform
 
 import (
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	spiremodels "github.com/authsec-ai/authsec/internal/spire/domain/models"
-	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -17,27 +14,13 @@ import (
 )
 
 // DelegationPolicyController manages delegation policies that govern
-// which roles can delegate trust to AI agent types.
-// All operations run against the tenant's database.
-type DelegationPolicyController struct {
-	workloadEntrySvc *spireservices.WorkloadEntryService
-	jwtSvidSvc       *spireservices.JWTSVIDService
-	agentSvc         *spireservices.AgentService
-}
+// which roles can delegate trust to AI agent types, within one workspace.
+// Every statement goes through internal/tenancy, so another workspace's
+// policy or agent is answered as not found.
+type DelegationPolicyController struct{}
 
 func NewDelegationPolicyController() *DelegationPolicyController {
 	return &DelegationPolicyController{}
-}
-
-// SetServices injects the SPIRE services after bootstrap.
-func (dc *DelegationPolicyController) SetServices(
-	workloadEntrySvc *spireservices.WorkloadEntryService,
-	jwtSvidSvc *spireservices.JWTSVIDService,
-	agentSvc *spireservices.AgentService,
-) {
-	dc.workloadEntrySvc = workloadEntrySvc
-	dc.jwtSvidSvc = jwtSvidSvc
-	dc.agentSvc = agentSvc
 }
 
 // --- Request/Response types ---
@@ -49,7 +32,9 @@ type CreateDelegationPolicyRequest struct {
 	MaxTTLSeconds      int      `json:"max_ttl_seconds"`
 	Enabled            *bool    `json:"enabled"`
 	ClientID           string   `json:"client_id"`
-	Audience           []string `json:"audience"`
+	// Audience is accepted for compatibility and ignored: creating a
+	// policy no longer issues a token.
+	Audience []string `json:"audience"`
 }
 
 type UpdateDelegationPolicyRequest struct {
@@ -61,15 +46,41 @@ type UpdateDelegationPolicyRequest struct {
 	ClientID           *string  `json:"client_id"`
 }
 
-// CreateDelegationPolicy creates a new delegation policy for a tenant.
-func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationWorkspaceID(c)
+// delegationAgentRef parses a policy's client_id and checks that it names an
+// active ai_agent in the request's workspace. It writes the error response
+// and returns false when it doesn't.
+func delegationAgentRef(c *gin.Context, raw string) (*uuid.UUID, bool) {
+	cid, err := uuid.Parse(raw)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
+		return nil, false
+	}
+	if err := validateClientActive(c, cid); err != nil {
+		if status := tenancy.HTTPStatus(err); status != http.StatusNotFound {
+			c.JSON(status, gin.H{"error": "Failed to validate agent"})
+			return nil, false
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found or not active"})
+		return nil, false
+	}
+	return &cid, true
+}
+
+func respondDelegationLookupError(c *gin.Context, err error) {
+	if status := tenancy.HTTPStatus(err); status != http.StatusNotFound {
+		c.JSON(status, gin.H{"error": "Failed to load delegation policy"})
 		return
 	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
+}
 
-	tenantDB := config.DB
+// CreateDelegationPolicy creates a new delegation policy in the caller's workspace.
+func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
+	workspaceID, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
+		return
+	}
 
 	var req CreateDelegationPolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -77,7 +88,6 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	// Default values
 	if req.MaxTTLSeconds <= 0 {
 		req.MaxTTLSeconds = 3600
 	}
@@ -86,38 +96,31 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		enabled = *req.Enabled
 	}
 
-	// Marshal allowed permissions to JSON
 	allowedPerms := req.AllowedPermissions
 	if allowedPerms == nil {
 		allowedPerms = []string{}
 	}
 	permsJSON, _ := json.Marshal(allowedPerms)
 
-	// Extract created_by from token
 	userIDStr := delegationContextString(c, "user_id")
 	var createdBy *uuid.UUID
 	if uid, err := uuid.Parse(userIDStr); err == nil {
 		createdBy = &uid
 	}
 
-	// Validate and parse client_id if provided. client_id references the
-	// ai_agent resource_servers.id this policy is scoped to (Phase B).
+	// client_id references the ai_agent resource_servers.id this policy is
+	// scoped to; it must be an agent of this workspace.
 	var clientID *uuid.UUID
 	if req.ClientID != "" {
-		cid, err := uuid.Parse(req.ClientID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
+		var ok bool
+		if clientID, ok = delegationAgentRef(c, req.ClientID); !ok {
 			return
 		}
-		if err := validateClientActive(req.ClientID, workspaceID.String()); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Agent not found or not active", "details": err.Error()})
-			return
-		}
-		clientID = &cid
 	}
 
 	policy := models.DelegationPolicy{
-		WorkspaceID:        *workspaceID,
+		ID:                 uuid.New(),
+		WorkspaceID:        workspaceID,
 		RoleName:           req.RoleName,
 		AgentType:          req.AgentType,
 		AllowedPermissions: permsJSON,
@@ -127,9 +130,8 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		CreatedBy:          createdBy,
 	}
 
-	result := tenantDB.Create(&policy)
-	if result.Error != nil {
-		if isDuplicateKeyError(result.Error) {
+	if err := config.DB.WithContext(c.Request.Context()).Create(&policy).Error; err != nil {
+		if isDuplicateKeyError(err) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "A delegation policy for this role and agent type already exists",
 			})
@@ -139,197 +141,6 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	// If policy is linked to an AI agent client, auto-provision SPIRE identity if needed
-	response := gin.H{"policy": policy}
-	if clientID != nil {
-		var spiffeID *string
-		var clientType string
-		var agentType *string
-		tenantDB.Table("resource_servers").
-			Select("spiffe_id, application_type, agent_type").
-			Where("id = ? AND workspace_id = ?", clientID, workspaceID).
-			Row().Scan(&spiffeID, &clientType, &agentType)
-
-		if clientType == "ai_agent" {
-			resolvedSpiffeID := ""
-
-			if spiffeID == nil || *spiffeID == "" {
-				// Auto-provision via merged service
-				if dc.workloadEntrySvc != nil && dc.agentSvc != nil {
-					agents, err := dc.agentSvc.ListAgentsByTenant(c.Request.Context(), workspaceID.String())
-					if err != nil {
-						log.Printf("[DelegationPolicy] Failed to list SPIRE agents for auto-provision: %v", err)
-						response["identity_provision"] = gin.H{
-							"status": "skipped",
-							"reason": "Could not list SPIRE agents: " + err.Error(),
-						}
-					} else if len(agents) == 0 {
-						response["identity_provision"] = gin.H{
-							"status": "skipped",
-							"reason": "No SPIRE agents available to use as parent",
-						}
-					} else {
-						parentID := agents[0].SpiffeID
-						agentTypeStr := req.AgentType
-						if agentType != nil && *agentType != "" {
-							agentTypeStr = *agentType
-						}
-
-						trustDomain := config.AppConfig.SpiffeTrustDomain
-						if trustDomain == "" {
-							trustDomain = "example.org"
-						}
-						newSpiffeID := fmt.Sprintf("spiffe://%s/tenants/%s/agents/%s/%s",
-							trustDomain, workspaceID.String(), agentTypeStr, clientID.String())
-
-						entry := &spiremodels.WorkloadEntry{
-							WorkspaceID: workspaceID.String(),
-							SpiffeID:    newSpiffeID,
-							ParentID:    parentID,
-							Selectors:   map[string]string{"authsec:client_id": clientID.String(), "authsec:agent_type": agentTypeStr},
-						}
-
-						created, err := dc.workloadEntrySvc.CreateEntry(c.Request.Context(), entry)
-						if err != nil {
-							log.Printf("[DelegationPolicy] Auto-provision failed for agent %s: %v", clientID.String(), err)
-							response["identity_provision"] = gin.H{
-								"status": "failed",
-								"reason": err.Error(),
-							}
-						} else {
-							tenantDB.Table("resource_servers").
-								Where("id = ? AND workspace_id = ?", clientID, workspaceID).
-								Update("spiffe_id", created.SpiffeID)
-
-							log.Printf("[DelegationPolicy] Auto-provisioned identity for agent %s: spiffe_id=%s", clientID.String(), created.SpiffeID)
-							response["identity_provision"] = gin.H{
-								"status":    "provisioned",
-								"spiffe_id": created.SpiffeID,
-								"entry_id":  created.ID,
-								"parent_id": created.ParentID,
-							}
-							resolvedSpiffeID = created.SpiffeID
-						}
-					}
-				} else {
-					response["identity_provision"] = gin.H{
-						"status": "skipped",
-						"reason": "SPIRE services not initialized",
-					}
-				}
-			} else {
-				resolvedSpiffeID = *spiffeID
-				response["identity_provision"] = gin.H{
-					"status":    "already_provisioned",
-					"spiffe_id": *spiffeID,
-				}
-			}
-
-			// Auto-delegate token if we have a SPIFFE ID
-			if resolvedSpiffeID != "" {
-				audience := req.Audience
-				if len(audience) == 0 {
-					audience = []string{"authsec-api"}
-				}
-				ttlDuration := time.Duration(req.MaxTTLSeconds) * time.Second
-
-				delegatedPerms := policy.GetAllowedPermissions()
-				if len(delegatedPerms) == 0 {
-					response["delegate_token"] = gin.H{
-						"status": "skipped",
-						"reason": "No permissions in policy",
-					}
-				} else if dc.jwtSvidSvc == nil {
-					response["delegate_token"] = gin.H{
-						"status": "skipped",
-						"reason": "JWT-SVID service not initialized",
-					}
-				} else {
-					emailID := delegationContextString(c, "email_id")
-					customClaims := map[string]interface{}{
-						"user_id":      userIDStr,
-						"workspace_id": workspaceID.String(),
-						"email":        emailID,
-						"agent_type":   req.AgentType,
-						"permissions":  delegatedPerms,
-						"client_id":    clientID.String(),
-					}
-
-					finalTTL := int(ttlDuration.Seconds())
-					jwtResp, jwtErr := dc.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
-						WorkspaceID:  workspaceID.String(),
-						SpiffeID:     resolvedSpiffeID,
-						Audience:     audience,
-						TTL:          finalTTL,
-						CustomClaims: customClaims,
-					})
-					if jwtErr != nil {
-						log.Printf("[DelegationPolicy] Auto-delegate-token failed for agent %s: %v", clientID.String(), jwtErr)
-						response["delegate_token"] = gin.H{
-							"status": "failed",
-							"reason": jwtErr.Error(),
-						}
-					} else {
-						// Store token in delegation_tokens
-						dPermsJSON, _ := json.Marshal(delegatedPerms)
-						audJSON, _ := json.Marshal(audience)
-						userUUID, _ := uuid.Parse(userIDStr)
-						expiresAt := time.Now().Add(time.Duration(finalTTL) * time.Second)
-
-						upsertToken := models.DelegationToken{
-							WorkspaceID: *workspaceID,
-							ClientID:    *clientID,
-							PolicyID:    &policy.ID,
-							Token:       jwtResp.Token,
-							SpiffeID:    jwtResp.SpiffeID,
-							Permissions: dPermsJSON,
-							Audience:    audJSON,
-							ExpiresAt:   expiresAt,
-							DelegatedBy: userUUID,
-							TTLSeconds:  finalTTL,
-							Status:      "active",
-						}
-
-						var existing models.DelegationToken
-						upsertResult := tenantDB.
-							Where("workspace_id = ? AND client_id = ?", workspaceID, clientID).
-							First(&existing)
-						if upsertResult.Error == nil {
-							tenantDB.Model(&existing).Updates(map[string]interface{}{
-								"policy_id":    &policy.ID,
-								"token":        jwtResp.Token,
-								"spiffe_id":    jwtResp.SpiffeID,
-								"permissions":  dPermsJSON,
-								"audience":     audJSON,
-								"expires_at":   expiresAt,
-								"delegated_by": userUUID,
-								"ttl_seconds":  finalTTL,
-								"status":       "active",
-								"updated_at":   time.Now(),
-							})
-						} else {
-							if err := tenantDB.Create(&upsertToken).Error; err != nil {
-								log.Printf("[DelegationPolicy] Failed to store delegation token: %v", err)
-							}
-						}
-
-						log.Printf("[DelegationPolicy] Auto-delegated token for agent %s: perms=%d ttl=%ds", clientID.String(), len(delegatedPerms), finalTTL)
-						response["delegate_token"] = gin.H{
-							"status":      "issued",
-							"token":       jwtResp.Token,
-							"spiffe_id":   jwtResp.SpiffeID,
-							"expires_at":  jwtResp.ExpiresAt,
-							"permissions": delegatedPerms,
-							"audience":    audience,
-							"ttl_seconds": finalTTL,
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Audit log: delegation policy created
 	middlewares.Audit(c, "delegation_policy", policy.ID.String(), "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"role_name":           req.RoleName,
@@ -341,20 +152,20 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		},
 	})
 
-	c.JSON(http.StatusCreated, response)
+	// Creating a policy grants nothing by itself. Identity provisioning and
+	// delegated JWT-SVIDs are explicit admin actions
+	// (/uflow/admin/agents/:id/provision-identity and /delegate-token), which
+	// intersect the policy with the caller's own permissions.
+	c.JSON(http.StatusCreated, gin.H{"policy": policy})
 }
 
-// ListDelegationPolicies lists all delegation policies for a tenant.
+// ListDelegationPolicies lists the caller's workspace's delegation policies.
 func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
-	workspaceID, err := resolveDelegationWorkspaceID(c)
+	query, err := tenancy.DB(c, config.DB)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
 		return
 	}
-
-	tenantDB := config.DB
-
-	query := tenantDB.Where("workspace_id = ?", workspaceID)
 
 	if roleName := c.Query("role_name"); roleName != "" {
 		query = query.Where("role_name = ?", roleName)
@@ -368,7 +179,7 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 		query = query.Where("enabled = false")
 	}
 
-	var policies []models.DelegationPolicy
+	policies := []models.DelegationPolicy{}
 	if err := query.Order("created_at DESC").Find(&policies).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list delegation policies"})
 		return
@@ -379,14 +190,6 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 
 // GetDelegationPolicy retrieves a single delegation policy by ID.
 func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationWorkspaceID(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-
-	tenantDB := config.DB
-
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid policy ID"})
@@ -394,9 +197,8 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 	}
 
 	var policy models.DelegationPolicy
-	result := tenantDB.Where("id = ? AND workspace_id = ?", policyID, workspaceID).First(&policy)
-	if result.Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
+	if err := tenancy.Get(c, config.DB, &policy, policyID); err != nil {
+		respondDelegationLookupError(c, err)
 		return
 	}
 
@@ -405,14 +207,6 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 
 // UpdateDelegationPolicy updates an existing delegation policy.
 func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationWorkspaceID(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-
-	tenantDB := config.DB
-
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid policy ID"})
@@ -420,8 +214,8 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 	}
 
 	var policy models.DelegationPolicy
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", policyID, workspaceID).First(&policy).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
+	if err := tenancy.Get(c, config.DB, &policy, policyID); err != nil {
+		respondDelegationLookupError(c, err)
 		return
 	}
 
@@ -449,23 +243,23 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 	}
 	if req.ClientID != nil {
 		if *req.ClientID == "" {
-			policy.ClientID = nil // clear client_id
+			policy.ClientID = nil
 		} else {
-			cid, err := uuid.Parse(*req.ClientID)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
+			cid, ok := delegationAgentRef(c, *req.ClientID)
+			if !ok {
 				return
 			}
-			if err := validateClientActive(*req.ClientID, workspaceID.String()); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Client not found or not active", "details": err.Error()})
-				return
-			}
-			policy.ClientID = &cid
+			policy.ClientID = cid
 		}
 	}
 	policy.UpdatedAt = time.Now()
 
-	if err := tenantDB.Save(&policy).Error; err != nil {
+	scoped, err := tenancy.DB(c, config.DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
+		return
+	}
+	if err := scoped.Save(&policy).Error; err != nil {
 		if isDuplicateKeyError(err) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "A delegation policy for this role and agent type already exists",
@@ -476,7 +270,6 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	// Audit log: delegation policy updated
 	middlewares.Audit(c, "delegation_policy", policyID.String(), "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"role_name":       policy.RoleName,
@@ -491,27 +284,27 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 
 // DeleteDelegationPolicy deletes a delegation policy.
 func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationWorkspaceID(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-
-	tenantDB := config.DB
-
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid policy ID"})
 		return
 	}
 
-	result := tenantDB.Where("id = ? AND workspace_id = ?", policyID, workspaceID).Delete(&models.DelegationPolicy{})
+	scoped, err := tenancy.DB(c, config.DB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
+		return
+	}
+	result := scoped.Where("id = ?", policyID).Delete(&models.DelegationPolicy{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete delegation policy"})
+		return
+	}
 	if result.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
 		return
 	}
 
-	// Audit log: delegation policy deleted
 	middlewares.Audit(c, "delegation_policy", policyID.String(), "delete", nil)
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "id": policyID.String()})

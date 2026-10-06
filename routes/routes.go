@@ -179,10 +179,6 @@ func SetupRoutes(
 		// dead code (RESIDUAL #40) and has been removed.
 		agentController.SetJWTSVIDService(spireDeps.JWTSVIDSvc)
 
-		// Delegation policy controllers (admin + platform)
-		delegationPolicyController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
-		delegationPolicyCtrl.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
-
 		// PKI provisioning — inject into tenant + OIDC controllers
 		if spireDeps.PKIProvisioningSvc != nil {
 			userController.SetPKIService(spireDeps.PKIProvisioningSvc)

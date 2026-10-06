@@ -196,3 +196,28 @@ func WithTx(ctx context.Context, db *sql.DB, workspaceID uuid.UUID, fn func(*sql
 	}
 	return tx.Commit()
 }
+
+// HTTPStatus maps an error from this package to the status a handler should
+// answer: 401 when no workspace was resolved, 404 for another workspace's (or
+// a missing) row, 500 otherwise.
+func HTTPStatus(err error) int {
+	switch {
+	case err == nil:
+		return 200
+	case errors.Is(err, ErrNoTenant):
+		return 401
+	case errors.Is(err, ErrNotFound), errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, sql.ErrNoRows):
+		return 404
+	default:
+		return 500
+	}
+}
+
+// Workspace returns the request's workspace id, or ErrNoTenant.
+func Workspace(c *gin.Context) (uuid.UUID, error) {
+	tc, err := From(c)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return tc.WorkspaceID, nil
+}

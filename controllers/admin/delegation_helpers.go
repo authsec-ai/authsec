@@ -105,17 +105,18 @@ func validateClientActive(clientID, workspaceID string) error {
 		return fmt.Errorf("master database not initialized")
 	}
 
+	// resource_servers has no deleted_at: rows are hard-deleted and `active`
+	// marks a disabled agent (AS-045).
 	query := `
 		SELECT id FROM resource_servers
-		WHERE id::text = $1
-		AND workspace_id::text = $2
+		WHERE workspace_id::text = $1
+		AND id::text = $2
 		AND application_type = 'ai_agent'
 		AND active = true
-		AND deleted_at IS NULL
 		LIMIT 1
 	`
 	var id string
-	if err := masterDB.DB.QueryRow(query, clientID, workspaceID).Scan(&id); err != nil {
+	if err := masterDB.DB.QueryRow(query, workspaceID, clientID).Scan(&id); err != nil {
 		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
 	}
 	return nil

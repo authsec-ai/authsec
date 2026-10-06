@@ -12,6 +12,7 @@ import (
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -62,21 +63,44 @@ type agentClient struct {
 	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
+// loadAgent returns the active ai_agent with the given id in the request's
+// workspace. Another workspace's agent is answered 404; the response is
+// written and ok is false on any error.
+func loadAgent(c *gin.Context, id string) (agentClient, bool) {
+	var agent agentClient
+	scoped, err := tenancy.DB(c, config.DB)
+	if err == nil {
+		err = scoped.Table("resource_servers").
+			Where("id = ? AND application_type = 'ai_agent' AND active = true", id).
+			First(&agent).Error
+	}
+	if err != nil {
+		if status := tenancy.HTTPStatus(err); status != http.StatusNotFound {
+			c.JSON(status, gin.H{"error": "Failed to load agent"})
+			return agent, false
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+		return agent, false
+	}
+	return agent, true
+}
+
 // ListAgents lists all AI agent clients for the tenant.
 // GET /uflow/admin/agents
 func (ac *AgentController) ListAgents(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	ws, err := tenancy.Workspace(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	workspaceID := &ws
 
-	tenantDB := config.DB
+	query := config.DB.WithContext(c.Request.Context()).
+		Scopes(tenancy.Scope(*workspaceID)).
+		Table("resource_servers").
+		Where("application_type = 'ai_agent' AND active = true")
 
-	var agents []agentClient
-	query := tenantDB.Table("resource_servers").
-		Where("workspace_id = ? AND application_type = 'ai_agent'", workspaceID).
-		Where("active = true")
+	agents := []agentClient{}
 
 	if agentType := c.Query("agent_type"); agentType != "" {
 		query = query.Where("agent_type = ?", agentType)
@@ -96,27 +120,14 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 // GetAgent gets a single AI agent client by client_id.
 // GET /uflow/admin/agents/:id
 func (ac *AgentController) GetAgent(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-
 	clientID := c.Param("id")
 	if _, err := uuid.Parse(clientID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid agent ID"})
 		return
 	}
 
-	tenantDB := config.DB
-
-	var agent agentClient
-	result := tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("active = true").
-		First(&agent)
-	if result.Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+	agent, ok := loadAgent(c, clientID)
+	if !ok {
 		return
 	}
 
@@ -133,11 +144,12 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 // subject_id). We match on any identifier associated with the agent: its own id
 // (as subject or client), and its spiffe_id (as actor).
 func (ac *AgentController) GetAgentActivity(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	ws, err := tenancy.Workspace(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	workspaceID := &ws
 	agentID := c.Param("id")
 	if _, err := uuid.Parse(agentID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid agent ID"})
@@ -145,15 +157,8 @@ func (ac *AgentController) GetAgentActivity(c *gin.Context) {
 	}
 
 	// Confirm the agent exists in this workspace + grab its spiffe_id.
-	var agent struct {
-		ID       string
-		SpiffeID *string
-	}
-	if err := config.DB.Table("resource_servers").
-		Select("id, spiffe_id").
-		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", agentID, workspaceID).
-		First(&agent).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+	agent, ok := loadAgent(c, agentID)
+	if !ok {
 		return
 	}
 
@@ -169,8 +174,8 @@ func (ac *AgentController) GetAgentActivity(c *gin.Context) {
 		spiffe = *agent.SpiffeID
 	}
 	var rows []models.ConnectorActionAudit
-	if err := config.DB.
-		Where("workspace_id = ?", *workspaceID).
+	if err := config.DB.WithContext(c.Request.Context()).
+		Scopes(tenancy.Scope(*workspaceID)).
 		Where(`actor_client_id = ? OR subject_id::text = ? OR (actor_spiffe_id <> '' AND actor_spiffe_id = ?)`,
 			agentID, agentID, spiffe).
 		Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
@@ -186,11 +191,12 @@ func (ac *AgentController) GetAgentActivity(c *gin.Context) {
 // The SPIFFE ID is then written back to the client record.
 // POST /uflow/admin/agents/:id/provision-identity
 func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	ws, err := tenancy.Workspace(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	workspaceID := &ws
 
 	clientID := c.Param("id")
 	if _, err := uuid.Parse(clientID); err != nil {
@@ -204,16 +210,11 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantDB := config.DB
+	tenantDB := config.DB.WithContext(c.Request.Context()).Scopes(tenancy.Scope(*workspaceID))
 
 	// Look up the agent client
-	var agent agentClient
-	result := tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("active = true").
-		First(&agent)
-	if result.Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+	agent, ok := loadAgent(c, clientID)
+	if !ok {
 		return
 	}
 
@@ -235,6 +236,13 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
+	// Provisioning registers a SPIRE entry through the embedded control plane,
+	// which is only mounted with ENABLE_EMBEDDED_SPIRE.
+	if !platformCtrl.EmbeddedSpireAvailable() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "SPIRE identity provisioning is not enabled on this deployment"})
+		return
+	}
+
 	// Register workload entry via the monolith's platform controller.
 	// Writes to both spire_workloads (master) and workload_entries (tenant),
 	// and registers with SPIRE server via gRPC if connected.
@@ -253,7 +261,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 
 	// Write the SPIFFE ID back to the agent's resource_servers row
 	updateResult := tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ?", clientID, workspaceID).
+		Where("id = ?", clientID).
 		Update("spiffe_id", spiffeID)
 	if updateResult.Error != nil {
 		log.Printf("[AgentController] Failed to update agent spiffe_id: %v", updateResult.Error)
@@ -279,11 +287,12 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 // RevokeIdentity deletes the SPIRE workload entry for an AI agent and clears its SPIFFE ID.
 // DELETE /uflow/admin/agents/:id/revoke-identity
 func (ac *AgentController) RevokeIdentity(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	ws, err := tenancy.Workspace(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	workspaceID := &ws
 
 	clientID := c.Param("id")
 	if _, err := uuid.Parse(clientID); err != nil {
@@ -291,16 +300,11 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantDB := config.DB
+	tenantDB := config.DB.WithContext(c.Request.Context()).Scopes(tenancy.Scope(*workspaceID))
 
 	// Look up the agent
-	var agent agentClient
-	result := tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("active = true").
-		First(&agent)
-	if result.Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+	agent, ok := loadAgent(c, clientID)
+	if !ok {
 		return
 	}
 
@@ -311,7 +315,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 
 	// Clear the SPIFFE ID from the agent's resource_servers row
 	tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ?", clientID, workspaceID).
+		Where("id = ?", clientID).
 		Update("spiffe_id", nil)
 
 	log.Printf("[AgentController] Agent %s identity revoked (spiffe_id was %s)", clientID, *agent.SpiffeID)
@@ -333,11 +337,12 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 // DelegateToken resolves delegation permissions and issues a JWT-SVID for the agent.
 // POST /uflow/admin/agents/:id/delegate-token
 func (ac *AgentController) DelegateToken(c *gin.Context) {
-	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	ws, err := tenancy.Workspace(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	workspaceID := &ws
 
 	clientID := c.Param("id")
 	if _, err := uuid.Parse(clientID); err != nil {
@@ -355,16 +360,11 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		req.TTLSeconds = 3600
 	}
 
-	tenantDB := config.DB
+	tenantDB := config.DB.WithContext(c.Request.Context()).Scopes(tenancy.Scope(*workspaceID))
 
 	// Look up the agent client
-	var agent agentClient
-	result := tenantDB.Table("resource_servers").
-		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("active = true").
-		First(&agent)
-	if result.Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+	agent, ok := loadAgent(c, clientID)
+	if !ok {
 		return
 	}
 
@@ -470,7 +470,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	// Upsert: update if (workspace_id, client_id) exists, else insert
 	var existing models.DelegationToken
 	upsertResult := tenantDB.
-		Where("workspace_id = ? AND client_id = ?", workspaceID, clientUUID).
+		Where("client_id = ?", clientUUID).
 		First(&existing)
 	if upsertResult.Error == nil {
 		// Update existing row
