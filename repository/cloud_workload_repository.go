@@ -30,6 +30,26 @@ type CloudWorkloadRepository interface {
 	ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error)
 	ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error)
 
+	// UsageSummary counts, per identity, how many services it is reported
+	// against and how many of those it has never used.
+	//
+	// Exists because the inventory's question -- "which identities have unused
+	// access" -- is an aggregate, and answering it by shipping every usage row
+	// to the browser does not scale: the lab account alone holds ~9,500 rows
+	// across 102 identities, so the client's paged walk stopped at its cap and
+	// could only report floors. One GROUP BY answers it exactly, in one row per
+	// identity.
+	//
+	// Deliberately unpaged: the result is bounded by the identity count, not
+	// the usage count, which is the whole point. connectorID nil means every
+	// connector in the workspace.
+	//
+	// An identity with no usage rows is ABSENT from the result rather than
+	// present with zeroes. "AWS reported nothing for this identity" and "AWS
+	// reported it uses everything it has" are different findings, and the
+	// inventory renders them differently ("Not reported" vs "All N used").
+	UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error)
+
 	// CountsForConnector reports how many rows of each kind a connector holds,
 	// for the scan report.
 	CountsForConnector(workspaceID, connectorID uuid.UUID) (workloads, usage int64, err error)
@@ -342,6 +362,40 @@ func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorklo
 		return nil, 0, err
 	}
 	return out, total, nil
+}
+
+// CloudUsageSummaryRow is one identity's activity totals. See
+// CloudWorkloadRepository.UsageSummary.
+type CloudUsageSummaryRow struct {
+	IdentityID uuid.UUID `json:"identity_id"`
+	// Services is how many (identity, service) rows exist for this identity.
+	Services int64 `json:"services"`
+	// NeverUsed is how many of those carry a null last_used_at -- the service
+	// AWS reports was never accessed in its tracking window.
+	NeverUsed int64 `json:"never_used"`
+}
+
+// UsageSummary aggregates cloud_usage per identity. See the interface.
+//
+// Counted in Postgres with a FILTER clause rather than two queries or a scan in
+// Go: the never-used count is the actionable number on the page, and computing
+// it beside the total in one pass is both cheaper and immune to the two numbers
+// disagreeing because rows changed between reads.
+func (r *cloudWorkloadRepository) UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
+	q := r.db.Model(&models.CloudUsage{}).
+		Select("identity_id, count(*) AS services, count(*) FILTER (WHERE last_used_at IS NULL) AS never_used").
+		Where("workspace_id = ?", workspaceID)
+	if connectorID != nil {
+		q = q.Where("connector_id = ?", *connectorID)
+	}
+	out := []CloudUsageSummaryRow{}
+	// Ordered for a stable response, not because any caller depends on it: an
+	// unordered GROUP BY may come back differently on each call, which turns a
+	// diff of two captured responses into noise.
+	if err := q.Group("identity_id").Order("identity_id").Scan(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, error) {

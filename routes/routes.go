@@ -1699,6 +1699,9 @@ func SetupRoutes(
 			// permission as every other discovery read.
 			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
 			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
+			// The aggregate behind the identities inventory's unused-access column.
+			// A literal path beside /aws/usage, not a wildcard under it.
+			discovery.GET("/aws/usage/summary", middlewares.Require("discovery", "read"), cloudAWS.ListUsageSummary)
 
 			// Evidence: why a cloud_* row exists, or -- for a subject-less fact
 			// like an AgentCore Workload Identity -- what was observed even
