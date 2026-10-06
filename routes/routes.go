@@ -240,7 +240,6 @@ func SetupRoutes(
 		oauth.POST("/userinfo", oauthASController.Userinfo)
 		oauth.GET("/logout", oauthASController.EndSession)
 		// RFC 9126 — Pushed Authorization Request (public)
-		oauth.POST("/par", oauthASController.PAR)
 		// XAA access-request status poll (Journey B — no auth, capability by ID)
 		oauth.GET("/access-requests/:id", oauthASController.AccessRequestStatus)
 		// Requester SDK bootstrap (client-authenticated; XAA_ISSUANCE flag gates it).
@@ -586,7 +585,6 @@ func SetupRoutes(
 				v1Applications.GET("/:id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccessQuery)
 				v1Applications.POST("/:id/access-simulations", scopeMatrixController.AccessSimulation)
 				v1Applications.POST("/:id/access-change-previews", scopeMatrixController.AccessChangePreview)
-				v1Applications.POST("/:id/evidence-exports", scopeMatrixController.EvidenceExport)
 			}
 		}
 

@@ -368,6 +368,127 @@ func (s *IdentityProviderService) UpdateSAML(req UpdateSAMLIDPRequest) (*models.
 	return &idp, nil
 }
 
+// UpdateOIDCIDPRequest is the input for UpdateOIDC. Empty fields keep their
+// current value. ClientSecret, when set, replaces the Vault secret. The
+// provider_name is fixed at creation: it keys the Vault path and the login
+// URLs, so renaming is delete + create.
+type UpdateOIDCIDPRequest struct {
+	WorkspaceID      uuid.UUID
+	IDPID            uuid.UUID
+	ProviderName     string // optional; must equal the current name
+	DisplayName      string
+	AuthorizationURL string
+	TokenURL         string
+	UserinfoURL      string
+	ClientID         string
+	ClientSecret     string
+	Scopes           string
+	IconURL          *string
+	RedirectURI      *string
+}
+
+// UpdateOIDC rewrites the oidc_providers row of an existing OIDC IDP (and the
+// identity_providers display name / redirect URI) in one transaction. The
+// merged configuration is re-validated like a create.
+func (s *IdentityProviderService) UpdateOIDC(req UpdateOIDCIDPRequest) (*models.IdentityProvider, error) {
+	if req.WorkspaceID == uuid.Nil || req.IDPID == uuid.Nil {
+		return nil, fmt.Errorf("workspace_id and idp id are required")
+	}
+	var idp models.IdentityProvider
+	if err := s.db.Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+		First(&idp).Error; err != nil {
+		return nil, err
+	}
+	if idp.ProviderType != models.IdentityProviderOIDC {
+		return nil, fmt.Errorf("identity provider %s is not an OIDC provider", idp.ID)
+	}
+	if idp.OIDCProviderID == nil {
+		return nil, fmt.Errorf("identity provider %s has no oidc_provider_id", idp.ID)
+	}
+	var cur models.OIDCProvider
+	if err := s.db.Where("id = ? AND workspace_id = ?", *idp.OIDCProviderID, req.WorkspaceID).
+		First(&cur).Error; err != nil {
+		return nil, err
+	}
+
+	if n := strings.ToLower(strings.TrimSpace(req.ProviderName)); n != "" && n != cur.ProviderName {
+		return nil, fmt.Errorf("provider_name cannot be changed; delete and recreate the provider")
+	}
+
+	pick := func(v, old string) string {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+		return old
+	}
+	merged := CreateOIDCIDPRequest{
+		WorkspaceID:      req.WorkspaceID,
+		ProviderName:     cur.ProviderName,
+		DisplayName:      pick(req.DisplayName, cur.DisplayName),
+		AuthorizationURL: pick(req.AuthorizationURL, cur.AuthorizationURL),
+		TokenURL:         pick(req.TokenURL, cur.TokenURL),
+		UserinfoURL:      pick(req.UserinfoURL, cur.UserinfoURL),
+		ClientID:         pick(req.ClientID, cur.ClientID),
+		Scopes:           pick(req.Scopes, cur.Scopes),
+		IconURL:          cur.IconURL,
+		RedirectURI:      cur.RedirectURI,
+	}
+	if req.IconURL != nil {
+		merged.IconURL = strings.TrimSpace(*req.IconURL)
+	}
+	if req.RedirectURI != nil {
+		merged.RedirectURI = strings.TrimSpace(*req.RedirectURI)
+	}
+	if err := validateKnownOIDCProviderConfig(cur.ProviderName, merged); err != nil {
+		return nil, err
+	}
+
+	if req.ClientSecret != "" {
+		if err := config.SaveWorkspaceIDPSecret(req.WorkspaceID.String(), models.IdentityProviderOIDC, cur.ProviderName,
+			map[string]interface{}{"client_secret": req.ClientSecret}); err != nil {
+			return nil, fmt.Errorf("failed to store client secret in Vault: %w", err)
+		}
+	}
+
+	now := time.Now()
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&models.OIDCProvider{}).
+			Where("id = ? AND workspace_id = ?", cur.ID, req.WorkspaceID).
+			Updates(map[string]interface{}{
+				"display_name":      merged.DisplayName,
+				"authorization_url": merged.AuthorizationURL,
+				"token_url":         merged.TokenURL,
+				"userinfo_url":      merged.UserinfoURL,
+				"client_id":         merged.ClientID,
+				"scopes":            merged.Scopes,
+				"icon_url":          merged.IconURL,
+				"redirect_uri":      merged.RedirectURI,
+				"updated_at":        now,
+			})
+		if res.Error != nil {
+			return fmt.Errorf("update oidc_providers: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return tx.Model(&models.IdentityProvider{}).
+			Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+			Updates(map[string]interface{}{
+				"display_name": merged.DisplayName,
+				"redirect_uri": merged.RedirectURI,
+				"updated_at":   now,
+			}).Error
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	if err := s.db.Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+		First(&idp).Error; err != nil {
+		return nil, err
+	}
+	return &idp, nil
+}
+
 // UpdateStatus flips an IDP between 'configured' and 'disabled'. The
 // identity_providers row is the product-level record, while protocol-specific
 // rows are still read by runtime flows. Keep both layers in lockstep so the

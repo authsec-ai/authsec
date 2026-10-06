@@ -462,8 +462,9 @@ func LoadConfig() *Config {
 
 // ValidateXAAFlags checks the dependencies between the XAA feature flags:
 // every issuance flag (XAA_M2M, XAA_REDEMPTION, XAA_CIBA, XAA_ISSUANCE)
-// mints NativeSealer tokens and so needs XAA_NATIVE_SEALER, and XAA_DPOP
-// binds redeemed tokens and so needs XAA_REDEMPTION.
+// mints NativeSealer tokens and so needs XAA_NATIVE_SEALER. XAA_DPOP is
+// refused: DPoP proofs are not validated, so the flag would accept them
+// unchecked.
 func (c *Config) ValidateXAAFlags() error {
 	if c == nil {
 		return nil
@@ -488,8 +489,10 @@ func (c *Config) ValidateXAAFlags() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%s require XAA_NATIVE_SEALER=true (tokens they mint would be inactive at introspection and absent from JWKS)", strings.Join(missing, ", "))
 	}
-	if c.XAADPOP && !c.XAARedemption {
-		return fmt.Errorf("XAA_DPOP requires XAA_REDEMPTION=true")
+	if c.XAADPOP {
+		// The token endpoint does not validate DPoP proofs; with the flag on
+		// it would accept them unchecked (AS-073). Keep it off until it does.
+		return fmt.Errorf("XAA_DPOP is not supported: DPoP proof validation is not implemented")
 	}
 	return nil
 }

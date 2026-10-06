@@ -2859,16 +2859,6 @@ func (ctrl *OAuthASController) EndSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "logged_out"})
 }
 
-// PAR is temporarily disabled while AuthSec is still backed by stock Hydra, which
-// does not expose /oauth2/par in self-hosted mode. A later AuthSec-owned PAR
-// implementation will re-enable this endpoint without depending on Hydra PAR.
-func (ctrl *OAuthASController) PAR(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error":             "unsupported_request",
-		"error_description": "PAR is temporarily disabled; use /oauth/authorize directly",
-	})
-}
-
 // OAuthPolicyResult holds the validated policy state from validateOAuthPolicy.
 type OAuthPolicyResult struct {
 	Client      *models.MCPOAuthClient

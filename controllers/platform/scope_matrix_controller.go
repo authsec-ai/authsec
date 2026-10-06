@@ -3402,39 +3402,6 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 	})
 }
 
-func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
-	workspaceID, err := extractWorkspaceID(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
-		return
-	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
-		return
-	}
-	var toolsCount, scopesCount, rolesCount, bindingsCount int64
-	config.DB.Table("mcp_tools").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&toolsCount)
-	config.DB.Table("oauth_scopes").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&scopesCount)
-	config.DB.Table("roles").Where("workspace_id = ? AND name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
-	config.DB.Table("role_bindings rb").
-		Joins("JOIN roles r ON r.id = rb.role_id").
-		Where("rb.workspace_id = ? AND r.name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").
-		Count(&bindingsCount)
-	c.JSON(http.StatusAccepted, gin.H{
-		"export_id":    uuid.NewString(),
-		"status":       "ready",
-		"generated_at": time.Now().UTC().Format(time.RFC3339),
-		"application":  accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
-		"evidence": gin.H{
-			"tools":              toolsCount,
-			"access_labels":      scopesCount,
-			"application_roles":  rolesCount,
-			"access_assignments": bindingsCount,
-		},
-	})
-}
-
 func boolState(ok bool) string {
 	if ok {
 		return "ok"
