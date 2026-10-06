@@ -59,8 +59,9 @@ type DiscoverySourceUpdateRequest struct {
 // connector reports. Idempotent on (source, fingerprint) within the workspace.
 type SightingRequest struct {
 	// WorkspaceID is supplied by the connector, which is configured with it at
-	// deploy time. The sightings route is unauthenticated (see routes.go), so there
-	// is no token to derive the workspace from — the caller asserts it.
+	// deploy time. The sightings route has no user token to derive the workspace
+	// from, so the caller asserts it and its ingest token vouches for it (see
+	// discovery_ingest_auth.go).
 	//
 	// Typed as a string rather than uuid.UUID on purpose: `binding:"required"` on a
 	// uuid.UUID treats the all-zero UUID as absent, and the all-zero UUID is the
@@ -78,14 +79,17 @@ type SightingRequest struct {
 	// transitions. Optional for backward compatibility with connectors that predate
 	// lifecycle tracking; absent means "now".
 	ObservedAt *time.Time `json:"observed_at,omitempty"`
+	// RuntimeStatus is "running" (the default when absent) or "stopped": a
+	// workload the Kubernetes connector saw scaled to zero. Optional.
+	RuntimeStatus string `json:"runtime_status,omitempty"`
 }
 
 // AgentRegistrationRequest is the body for POST
 // /authsec/discovery/agent-registration — a deployed connector announcing itself
 // and then heartbeating.
 //
-// Unauthenticated, exactly like /sightings, and for the same reason: the agent is
-// configured with its workspace at deploy time and asserts it. WorkspaceID is a
+// Ingest-token authenticated, exactly like /sightings, and for the same reason: the
+// agent is configured with its workspace at deploy time and asserts it. WorkspaceID is a
 // string for the same reason too — `binding:"required"` on a uuid.UUID rejects the
 // all-zero UUID, which is the real System workspace.
 type AgentRegistrationRequest struct {
@@ -134,11 +138,14 @@ type ResyncManifestRequest struct {
 	ScanKind          string     `json:"scan_kind,omitempty"`
 	// Complete is false when any LIST in the sweep failed. A partial manifest is
 	// accepted but retires nothing — see services.ReconcileManifest.
-	Complete       bool       `json:"complete"`
-	Namespaces     []string   `json:"namespaces"`
-	Fingerprints   []string   `json:"fingerprints"`
-	SweepStartedAt *time.Time `json:"sweep_started_at,omitempty"`
-	ObservedAt     *time.Time `json:"observed_at,omitempty"`
+	Complete     bool     `json:"complete"`
+	Namespaces   []string `json:"namespaces"`
+	Fingerprints []string `json:"fingerprints"`
+	// StoppedFingerprints is the subset of fingerprints seen scaled to zero:
+	// present, so never marked gone. Optional.
+	StoppedFingerprints []string   `json:"stopped_fingerprints,omitempty"`
+	SweepStartedAt      *time.Time `json:"sweep_started_at,omitempty"`
+	ObservedAt          *time.Time `json:"observed_at,omitempty"`
 }
 
 // AgentUpdateRequest is the body for PUT /authsec/discovery/agents/:id.
@@ -206,12 +213,13 @@ func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, er
 	return wsID, principal, nil
 }
 
-// assertedWorkspace resolves the workspace an UNAUTHENTICATED connector claims in
-// its request body, and confirms it exists.
+// assertedWorkspace resolves the workspace a connector claims in its request
+// body, and confirms it exists.
 //
-// Used by the three ingress routes (sightings, agent-registration, lifecycle,
-// resync-manifest) where there is no token to derive the workspace from — the
-// caller asserts it and the agent is configured with it at deploy time.
+// Used by the ingress routes (agent-registration, sightings, lifecycle,
+// resync-manifest, rbac-snapshot) through ingressWorkspace, which first checks
+// the call's ingest token against that workspace (discovery_ingest_auth.go) —
+// the agent is configured with its workspace at deploy time and asserts it.
 //
 // The existence check is not redundant with the foreign key. Without it a typo'd
 // workspace id surfaces as a raw Postgres FK violation, which is a miserable thing
@@ -465,17 +473,17 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		return
 	}
 
-	// This route is unauthenticated, so the workspace comes from the body rather
-	// than a token claim. See the ingress comment in routes.go for what that trades.
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	// The workspace comes from the body; the ingest token (when the mode asks for
+	// one) is what vouches for it. See discovery_ingest_auth.go.
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
 
-	// No authenticated principal on this path. Record an explicitly-marked
-	// attribution rather than something that reads like a verified identity, so a
-	// row's provenance is never overstated when someone reads it later.
-	principal := "unauthenticated:" + req.Source
+	// Attributed to the ingest token that authenticated the call, or explicitly
+	// marked unauthenticated, so a row's provenance is never overstated when
+	// someone reads it later.
+	principal := ingestPrincipal(c, req.Source)
 
 	agent, created, err := ctl.manager().ReportSighting(wsID, principal, services.SightingInput{
 		Source:            req.Source,
@@ -486,6 +494,7 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		DeploymentOrigin:  req.DeploymentOrigin,
 		Archetype:         req.Archetype,
 		ObservedAt:        req.ObservedAt,
+		RuntimeStatus:     req.RuntimeStatus,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -521,7 +530,7 @@ func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, ctl.registrationIngestSource(req.Kind, req.InstanceID))
 	if !ok {
 		return
 	}
@@ -579,7 +588,7 @@ func (ctl *DiscoveryController) ReportLifecycleEvent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
@@ -632,21 +641,22 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
 
 	result, err := ctl.manager().ReconcileManifest(wsID, services.ManifestInput{
-		Source:            req.Source,
-		DiscoverySourceID: req.DiscoverySourceID,
-		ClusterName:       req.ClusterName,
-		ScanKind:          req.ScanKind,
-		Complete:          req.Complete,
-		Namespaces:        req.Namespaces,
-		Fingerprints:      req.Fingerprints,
-		SweepStartedAt:    req.SweepStartedAt,
-		ObservedAt:        req.ObservedAt,
+		Source:              req.Source,
+		DiscoverySourceID:   req.DiscoverySourceID,
+		ClusterName:         req.ClusterName,
+		ScanKind:            req.ScanKind,
+		Complete:            req.Complete,
+		Namespaces:          req.Namespaces,
+		Fingerprints:        req.Fingerprints,
+		StoppedFingerprints: req.StoppedFingerprints,
+		SweepStartedAt:      req.SweepStartedAt,
+		ObservedAt:          req.ObservedAt,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -990,13 +1000,19 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, snap.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, snap.WorkspaceID, parsedIngestSource(snap.DiscoverySourceID))
 	if !ok {
 		return
 	}
 
 	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).
 		Ingest(wsID, snap)
+	if errors.Is(err, services.ErrClusterUIDMismatch) {
+		// A different cluster installed under this one's name. Refused, not
+		// merged; nothing was written.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

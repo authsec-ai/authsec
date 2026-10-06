@@ -448,10 +448,10 @@ type AccessSummary struct {
 	Partial  int `json:"partial"`
 	Stale    int `json:"stale"`
 
-	// Note is always set. Kubernetes RBAC is purely additive -- no deny rules,
-	// no conditions -- which is the only reason a resolved chain here may be
-	// called effective rather than merely configured. Saying so on every
-	// response keeps that claim attached to its justification.
+	// Note is always set. Every Kubernetes grant is declared, not evaluated
+	// (calculation_state partial, effective_conclusion unknown): RBAC says what
+	// is allowed, and the layers that can still refuse a request are not read.
+	// Saying so on every response keeps the claim attached to its limits.
 	Note string `json:"note"`
 }
 
@@ -500,10 +500,11 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 	}
 
 	out := make([]Grant, 0, len(rows))
-	sum := AccessSummary{Total: len(rows), Note: "Kubernetes RBAC is allow-only: it has no " +
-		"deny rules and no conditions, so a resolved chain is access the API server will " +
-		"honour. Admission control may still refuse the action -- that is a different layer " +
-		"and is not an authorization decision."}
+	sum := AccessSummary{Total: len(rows), Note: "Kubernetes grants are declared, not " +
+		"evaluated: RBAC is allow-only, so a resolved chain is what RBAC allows, but admission " +
+		"control, token automount and audiences, and resourceNames semantics are not evaluated, " +
+		"so no grant is concluded effective. A grant with no rule is a binding whose role was " +
+		"not in the sweep."}
 
 	for i := range rows {
 		g := rows[i].Grant

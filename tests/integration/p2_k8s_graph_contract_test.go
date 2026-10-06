@@ -12,12 +12,18 @@ package integration
 //	node   the AWS node's common fields, no account and no arn, plus provider
 //	       "k8s", scope {kind k8s_cluster, id, label}, sub_scope (namespace or
 //	       null); native_id on workloads and identities; k8s_rule on rules
-//	edge   executes_as or grant, basis observed | declared, provider "k8s",
-//	       never crosses an account; a grant carries policy, policy_ref,
-//	       policy_kind and its binding (assignment)
-//	meta   graph_state "unrevisioned", rev / published_at the AWS publication
-//	       in the snapshot (null when none), limitations
+//	edge   executes_as, member_of or grant, basis observed | declared,
+//	       provider "k8s", never crosses an account; a grant carries policy,
+//	       policy_ref, policy_kind, its binding (assignment) and -- additive,
+//	       optional in the schema, always present (D-109) -- effective_scope;
+//	       a member_of may carry implicit_membership (D-110)
+//	meta   graph_state "unrevisioned", rev / published_at null (D-111: a
+//	       Kubernetes response neither pins nor reports an AWS publication;
+//	       the schema keeps them nullable, the tests assert null), limitations
 //	       [effective_access_not_evaluated, k8s_observations_not_recorded]
+//
+// A response that crossed into AWS (D-108) is checked by the mixed shapes of
+// p2_k8s_graph_cross_test.go instead.
 
 import (
 	"strings"
@@ -56,6 +62,16 @@ var (
 		default:
 			contractFail(errs, path, "limitation %q is not a Kubernetes element's", code)
 		}
+	})
+
+	// D-109: {kind: namespace, namespace} or {kind: cluster, namespace: null}.
+	contractK8sEffectiveScope = contractFunc(func(path string, v any, errs *[]string) {
+		m, _ := v.(map[string]any)
+		if m["kind"] == "cluster" {
+			contractObj(contractReq("kind", contractConst("cluster")), contractReq("namespace", contractNull)).check(path, v, errs)
+			return
+		}
+		contractObj(contractReq("kind", contractConst("namespace")), contractReq("namespace", contractNonEmpty)).check(path, v, errs)
 	})
 
 	contractK8sRule = contractObj(
@@ -117,6 +133,10 @@ var contractK8sGraphEdge = contractFunc(func(path string, v any, errs *[]string)
 	var more []contractField
 	switch kind {
 	case "executes_as":
+	case "member_of":
+		// D-110: a ServiceAccount's membership of an implicit group.
+		from = contractRef("identity")
+		more = []contractField{contractOpt("implicit_membership", contractConst(true))}
 	case "grant":
 		claimType, from, to = "grant", contractRef("identity"), contractRef("statement")
 		more = []contractField{
@@ -128,6 +148,8 @@ var contractK8sGraphEdge = contractFunc(func(path string, v any, errs *[]string)
 				contractReq("name", contractNonEmpty),
 				contractReq("namespace", contractNullable(contractNonEmpty)),
 			)),
+			// D-109: where the rule applies.
+			contractOpt("effective_scope", contractK8sEffectiveScope),
 		}
 	default:
 		contractFail(errs, path, "edge kind %q has no Kubernetes rows", kind)
@@ -166,11 +188,13 @@ var contractK8sGraphMeta = contractObj(
 	})),
 )
 
-// The frontier of a Kubernetes traversal names only the two Kubernetes kinds.
+// The frontier of a Kubernetes traversal names only the Kubernetes kinds --
+// and can_assume, for a ServiceAccount an AWS trust's principal resolves to
+// (D-108).
 var contractK8sFrontier = contractAll(contractFrontier, contractFunc(func(path string, v any, errs *[]string) {
 	contractObj(
 		contractReq("node", contractRef("workload", "identity", "statement")),
-		contractReq("edge", contractEnum("executes_as", "grant")),
+		contractReq("edge", contractEnum("executes_as", "grant", "member_of", "can_assume")),
 		contractReq("direction", contractEnum("forward", "reverse")),
 		contractReq("more", contractAnyValue),
 		contractReq("expand", contractStr),

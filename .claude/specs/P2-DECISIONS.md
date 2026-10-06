@@ -1083,3 +1083,122 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   - *Not done.* Following an IRSA / EKS Pod Identity resolution across the
     providers; `/evidence` for Kubernetes claims; the console's rendering
     (new kinds, icons, `rev: null` expansion, node routes).
+
+## Added by the Kubernetes hardening (kh/graph)
+
+- **D-108 IRSA / EKS Pod Identity: resolved at read time, walked across the
+  providers (`internal/igaread/traverse_cross.go`,
+  `internal/igagraph/trust.go`).** *Provisional, for review.* Supersedes
+  D-107's "one provider per traversal" and its *Not done* "following an IRSA /
+  EKS Pod Identity resolution", and narrows D-87 / §5.4's "an external
+  principal is terminal" for these two mechanisms.
+  - *Read time, not stored.* Whether an `oidc` or `k8s_service_account`
+    principal IS a ServiceAccount of the workspace is computed in the
+    request's snapshot (`readCross`), never written to
+    `iga_external_principal.resolved_identity_account_id`. Why: the
+    Kubernetes rows arrive from a sweep outside any AWS publication. A stored
+    resolution would either be written by the AWS projector -- and go stale
+    for a whole AWS cycle every time a cluster appears, changes issuer or
+    loses the ServiceAccount -- or by the Kubernetes ingest into rows a
+    publication owns (changing an AWS-published row with no new rev). Read
+    time keeps the AWS projector's contract, its tests and `deriveResolutions`
+    (still `exact_arn_match` only) untouched, is always as fresh as the
+    snapshot, and needs no DDL. The rules live in `igagraph` beside the
+    principals' writer (`NormalizeOIDCIssuer`, `K8sServiceAccountSubject`,
+    `ResolutionRuleIRSAIssuerMatch`, `ResolutionRulePodIdentityCluster`).
+  - *Rules.* `irsa_issuer_match`: an `oidc` principal whose issuer equals --
+    scheme-, trailing-slash- and host-case-insensitively -- the `oidc_issuer`
+    of the newest **projected** sweep of exactly one cluster name of the SAME
+    workspace, and whose subject `system:serviceaccount:<ns>:<sa>` (no
+    wildcard) names a live (`lifecycle active`, supported) ServiceAccount of
+    it. `pod_identity_cluster_match`: a pod-identity principal whose
+    association (`cloud_assume_edge`, mechanism `eks_pod_identity`, same
+    issuer and `k8s_ref`) names exactly one `cluster_name`, that name is swept
+    by exactly one Kubernetes (source, cluster), that sweep's issuer -- when
+    the agent reported one -- is the principal's, and the subject names a live
+    ServiceAccount of it. Anything else (no or another issuer, two clusters
+    with the issuer, two sources sweeping the name, a wildcard, a missing
+    ServiceAccount, another workspace's sweep) stays unresolved. A stored
+    resolution (any basis) wins. No AWS publication: nothing crosses (D-4).
+  - *The crossing edge* is the principal's own `can_assume` claim, drawn from
+    the ServiceAccount (the principal and the ServiceAccount are one
+    principal, §2.12) to the role: `from` = the SA, `to` = the role, plus
+    additive `crosses_provider: true`, `via_principal:
+    external_principal:<id>` (the claim's declared source) and `resolution
+    {basis: derived, rule}`; no `provider` field (it is the AWS claim; the
+    SA node says `provider: "k8s"`, the role says nothing, as every AWS
+    node). It is read forward from a ServiceAccount (a crossing unit of the
+    level: the resolved principals' `can_assume` rows, rendered AWS) and in
+    reverse from the role (the AWS `can_assume` row of a resolved principal
+    is re-pointed at the SA, whose walk continues on the Kubernetes side). The
+    principal node is then not in the response; where the request names it
+    (a root, a `/graph/path` end) it stays a node, keeps its own edges and
+    displays the read-time resolution in its `resolution` (D-87's shape), not
+    walked, so `resolution_not_followed` is `true` there as for any
+    resolution. `GET /external-principals/:id` renders the same read-time
+    resolution (and then no `unresolved_reason`).
+  - *Every other edge stays one provider*: each statement is rendered for the
+    provider of the frontier nodes it reads FROM, so a projector defect that
+    wrote an `executes_as` across the providers is still never walked
+    (`TestP2K8sGraphLeavesAWSUnchanged`). The crossing counts as an assume hop;
+    every budget applies across it; frontier counts for a ServiceAccount's
+    `can_assume` sum its resolved principals' edges.
+  - *Meta.* A response holding nodes of both providers -- a walk that crossed,
+    or a `/graph/path` between the two -- is `graph_state: "mixed"` with the
+    AWS `rev`/`published_at` it read and `limitations
+    [effective_access_not_evaluated, organizations_not_collected,
+    k8s_observations_not_recorded]`. `/graph/path` ends may now be of
+    different providers (was 404): found through a crossing, else
+    `none_exists` when both frontiers are exhausted.
+  - *Byte-identical AWS.* An AWS-rooted response that touches no resolved
+    principal is unchanged byte for byte (`TestP2K8sGraphCrossIRSA` compares
+    eight AWS calls before a cluster exists, with no issuer, with another
+    issuer, and -- for the roles the crossing does not touch -- with the
+    crossing in force). The one extra statement such a walk may issue (the
+    sweep read, when a level meets an external principal) changes nothing it
+    returns.
+
+- **D-109 `effective_scope` on every Kubernetes grant
+  (`traverse_k8s.go`).** *Provisional, for review.* A rule node is ONE node
+  whichever binding reaches it, and its `scope`/`sub_scope` are its ROLE's (a
+  ClusterRole's rule is the cluster's). Where the rule applies is the
+  binding's, so it is said on the grant edge, explicitly, beside
+  `assignment`: `effective_scope {kind: "namespace", namespace: <binding
+  ns>}` for a RoleBinding -- of a Role or of a ClusterRole -- and `{kind:
+  "cluster", namespace: null}` for a ClusterRoleBinding. Not on the rule
+  node: two grants of different scope can reach the same rule in one
+  response (the fixture's `research-reads-secrets` and `research-secrets-ns`),
+  and a node field would have to pick one. The console must read a rule's
+  reach from the edge that brought it there, never from the rule's
+  `sub_scope`.
+
+- **D-110 Implicit group membership on the Kubernetes walk
+  (`traverse_k8s.go`).** *Provisional, for review.* `member_of` is now a
+  Kubernetes edge kind (`graphK8sEdgeKinds`): ServiceAccount -> group
+  forward, group -> its member ServiceAccounts in reverse, with the group's
+  grants walked as any identity's. The projection writes the rows (another
+  work item: only for `system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+  `system:authenticated` when some binding names the group, basis
+  `declared`). The edge carries additive `implicit_membership: true` when the
+  source is a ServiceAccount and the group is one of those three (no object
+  declares the membership: the API server does), so a chain reads "via
+  implicit group membership". The row's `partition_key` must be one
+  `k8sgraph.ParsePartitionKey` reads, or the edge carries
+  `k8s_coverage_gap unattributed` (tests write the ServiceAccount's own node
+  partition).
+
+- **D-111 A Kubernetes root never pins or reports the AWS revision
+  (`traverse.go`, `graph_path.go`).** *Provisional, for review.* Supersedes
+  D-107's "rev/published_at report the AWS publication current in the
+  snapshot". A response of Kubernetes nodes only has `rev: null`,
+  `published_at: null`, `graph_state: "unrevisioned"`; `rev=` on a Kubernetes
+  root (`/graph` root, `/graph/expand` node, both `/graph/path` ends) is
+  ignored -- never 409. The rev check moved from before the snapshot's
+  reads into it, after the root is read: an AWS root (or a `/graph/path` with
+  an AWS end) is checked exactly as before, and a root that does not exist is
+  checked first, as before (409 before 404). A walk that crosses into AWS is
+  `mixed` with the AWS rev it read (D-108). A Kubernetes node's expansion
+  cursor stays unrevisioned (rev 0) even when its page crossed into AWS rows:
+  keyset paging by (far key, claim) neither repeats nor skips an unchanged
+  row, and the item is that a publication never makes a Kubernetes
+  continuation stale.

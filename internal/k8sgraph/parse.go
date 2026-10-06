@@ -126,7 +126,7 @@ func ParsePartitionKey(key string) (Partition, bool) {
 		default:
 			return Partition{}, false
 		}
-	case TargetAssignment, TargetAccessEdge, TargetExecutesAs:
+	case TargetAssignment, TargetAccessEdge, TargetExecutesAs, TargetMemberOf:
 		if p.Class != "" {
 			return Partition{}, false
 		}

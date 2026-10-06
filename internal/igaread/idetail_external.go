@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
@@ -152,7 +153,9 @@ func ExternalPrincipalAccount(accts *Accounts, inRevision map[uuid.UUID]bool, ac
 // ExternalPrincipalAccount) or null when the principal states none;
 // account_connected repeats account.connected, and is null with it -- a
 // service principal is not "in an unconnected account". resolution is null
-// when no resolution was ever recorded (D-87), else the stored one;
+// when no resolution was ever recorded (D-87) and none is derived at read
+// time (D-108: an IRSA / Pod Identity principal naming a ServiceAccount of
+// the workspace's own clusters), else the stored -- or read-time -- one;
 // unresolved_reason is null exactly when a resolution is in force (state
 // active, with a target). lifecycle is derived (D-47): active while any
 // can_assume from it is current or stale, retired once every one has ended,
@@ -290,6 +293,17 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 			FirstSeenAt:     T(ep.FirstSeenAt),
 			LastSeenAt:      T(ep.LastSeenAt),
 			LastConfirmedAt: TS(ep.LastConfirmedAt),
+		}
+		if detail.Resolution == nil {
+			// D-108: a principal naming a Kubernetes ServiceAccount of this
+			// workspace resolves at read time, as the graph draws it.
+			cross, err := readCross(func() (*gorm.DB, error) { return q.DB(), nil }, q.WS, true)
+			if err != nil {
+				return err
+			}
+			if m, ok := cross.match(ep.ID); ok {
+				detail.Resolution = crossDetailResolution(m)
+			}
 		}
 		if detail.Lifecycle == models.IGALifecycleRetired {
 			detail.RetiredReason = strPtr(ExternalRetiredNoLongerReferenced)
