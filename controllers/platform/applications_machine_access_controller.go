@@ -663,8 +663,15 @@ func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 		return
 	}
 
+	// Only a client of this workspace, or one with a registration on this
+	// application, is visible here: no existence oracle for other clients.
 	var client models.MCPOAuthClient
-	if err := config.DB.Where("client_id = ?", req.ClientID).First(&client).Error; err != nil {
+	if err := config.DB.WithContext(c.Request.Context()).
+		Where("client_id = ?", req.ClientID).
+		Where(`home_workspace_id = ? OR id IN (
+			SELECT oauth_client_id FROM resource_server_client_registrations
+			WHERE workspace_id = ? AND resource_server_id = ?)`, workspaceID, workspaceID, rs.ID).
+		First(&client).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "client not found"})
 		return
 	}
@@ -692,15 +699,18 @@ func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 		fail("connection_approved", "this client is not an approved connection on this MCP server — approve its request in the Requests tab")
 	}
 
-	// 3. brokering gate (redemption): an explicit deny blocks the ID-JAG redemption.
+	// 3. brokering gate (redemption): an explicit deny for this client, on
+	// this application or on every application, blocks the ID-JAG redemption.
+	// A failed lookup is reported as failing, never as permitted (AS-074).
 	type brokeringRow struct{ Effect string }
 	var rows []brokeringRow
-	config.DB.Raw(`
+	gateErr := config.DB.WithContext(c.Request.Context()).Raw(`
 		SELECT effect FROM a2a_brokering_policies
 		WHERE workspace_id = ? AND side = 'redemption'
-		  AND (client_id IS NULL OR client_id = ?)`,
-		workspaceID, client.ClientID,
-	).Scan(&rows)
+		  AND (client_id IS NULL OR client_id = ?)
+		  AND (resource_server_id IS NULL OR resource_server_id = ?)`,
+		workspaceID, client.ClientID, rs.ID,
+	).Scan(&rows).Error
 	denied := false
 	for _, r := range rows {
 		if r.Effect == "deny" {
@@ -708,9 +718,12 @@ func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 			break
 		}
 	}
-	if denied {
+	switch {
+	case gateErr != nil:
+		fail("brokering_permitted", "couldn't evaluate the brokering rules; try again")
+	case denied:
 		fail("brokering_permitted", "a brokering deny rule blocks cross-app redemption for this client — remove it under Trusted Issuers → Cross-app brokering")
-	} else {
+	default:
 		pass("brokering_permitted")
 	}
 

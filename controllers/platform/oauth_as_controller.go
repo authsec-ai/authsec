@@ -1775,17 +1775,30 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	resource := c.PostForm("resource")
+
 	// ── 5. Issuance brokering gate (a2a_brokering_policies side='issuance').
-	// Explicit-deny-wins: any deny row for (workspace, client) blocks issuance.
-	// No matching row = permit (ownership of a valid subject_token is sufficient consent).
+	// Explicit-deny-wins: a deny row for (workspace, client) blocks issuance,
+	// whether it names no resource server or the one this ID-JAG targets.
+	// No matching row = permit (ownership of a valid subject_token is
+	// sufficient consent). A failed lookup refuses issuance (AS-074).
 	type brokeringRow struct{ Effect string }
 	var brokeringRows []brokeringRow
-	config.DB.WithContext(ctx).Raw(`
+	if err := config.DB.WithContext(ctx).Raw(`
 		SELECT effect FROM a2a_brokering_policies
 		WHERE workspace_id = ? AND side = 'issuance'
-		  AND (client_id IS NULL OR client_id = ?)`,
-		subject.WorkspaceID, oauthClient.ClientID,
-	).Scan(&brokeringRows)
+		  AND (client_id IS NULL OR client_id = ?)
+		  AND (resource_server_id IS NULL OR resource_server_id IN (
+		        SELECT id FROM resource_servers WHERE resource_uri = ? AND ? <> ''))`,
+		subject.WorkspaceID, oauthClient.ClientID, resource, resource,
+	).Scan(&brokeringRows).Error; err != nil {
+		log.Printf("[MCP_AUTH] tokenExchange: brokering gate lookup failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":             "temporarily_unavailable",
+			"error_description": "could not evaluate brokering policy",
+		})
+		return
+	}
 	for _, br := range brokeringRows {
 		if br.Effect == "deny" {
 			c.JSON(http.StatusForbidden, gin.H{
@@ -1803,7 +1816,6 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	if targetIssuer == "" {
 		targetIssuer = selfIssuer
 	}
-	resource := c.PostForm("resource")
 	scope := strings.Join(strings.Fields(c.PostForm("scope")), " ")
 
 	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
@@ -2884,22 +2896,11 @@ func (ctrl *OAuthASController) inferAuthorizeResource(clientID string) (string, 
 		return resourceURI, nil
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceAmbiguous) {
-		// List available resource URIs to help the client developer.
-		var uris []string
-		var servers []models.ResourceServer
-		if dbErr := config.DB.Where("active = true").Select("resource_uri").Find(&servers).Error; dbErr == nil {
-			for _, s := range servers {
-				uris = append(uris, s.ResourceURI)
-			}
-		}
-		desc := "resource parameter required because client maps to multiple resource servers"
-		if len(uris) > 0 {
-			desc += ". Available: " + strings.Join(uris, ", ")
-		}
+		// The caller is unauthenticated: name no resource servers (AS-070).
 		return "", &policyError{
 			Status:      http.StatusBadRequest,
 			Code:        "invalid_request",
-			Description: desc,
+			Description: "resource parameter required because client maps to multiple resource servers",
 		}
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceUnavailable) {
