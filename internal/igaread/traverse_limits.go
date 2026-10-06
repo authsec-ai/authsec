@@ -66,13 +66,20 @@ const (
 // node's restriction limitations and each crossing edge's far coverage.
 // Everything else about them -- an edge's state, crosses_account, a node's
 // restrictions -- is decided before (decorateNodes, decorateEdges).
+//
+// Kubernetes nodes and edges carry Kubernetes coverage, never /evidence's AWS
+// claims (traverse_k8s.go); a crossing edge is an AWS claim, and carries its
+// own (traverse_cross.go).
 func (t *graphTraversal) decorateLimitations(lv *graphLevel, nodes []*GraphNode, edges []*GraphEdge) error {
+	nodes, k8sNodes := graphSplitNodes(nodes)
+	edges, k8sEdges := graphSplitEdges(edges)
+	if len(k8sNodes)+len(k8sEdges) > 0 {
+		if err := t.decorateK8sLimitations(lv, k8sNodes, k8sEdges); err != nil {
+			return err
+		}
+	}
 	if len(nodes)+len(edges) == 0 {
 		return nil
-	}
-	if t.provider == models.ProviderK8s {
-		// Kubernetes coverage, never /evidence's AWS claims (traverse_k8s.go).
-		return t.decorateK8sLimitations(lv, nodes, edges)
 	}
 	refs := make([]Ref, 0, len(nodes)+len(edges))
 	for _, n := range nodes {
@@ -208,12 +215,19 @@ func graphSortPairs(ps []graphPair, pos, kindPos map[string]int) {
 // a target's state (its statement's, §5.4), crosses_account (D-36), the
 // stale_reason of every stale edge (D-74), and a crossing edge's far
 // coverage. Their limitations follow (decorateLimitations).
+//
+// Kubernetes edges by decorateK8sEdges; a crossing edge is an AWS claim and
+// decorated as one (its ServiceAccount end has no account, so it never
+// crosses an account).
 func (t *graphTraversal) decorateEdges(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
+	edges, k8s := graphSplitEdges(edges)
+	if len(k8s) > 0 {
+		if err := t.decorateK8sEdges(lv, k8s, node); err != nil {
+			return err
+		}
+	}
 	if len(edges) == 0 {
 		return nil
-	}
-	if t.provider == models.ProviderK8s {
-		return t.decorateK8sEdges(lv, edges, node)
 	}
 	crossing := false
 	for _, e := range edges {

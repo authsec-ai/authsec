@@ -13,15 +13,21 @@ package igaread
 //	executes_as iga_relationship, workload -> ServiceAccount, basis observed
 //	            (the Pod's serviceAccountName was seen) or declared (only the
 //	            configured anchor is known)
+//	member_of   iga_relationship, ServiceAccount -> the implicit groups the
+//	            API server puts it in (system:serviceaccounts,
+//	            system:serviceaccounts:<ns>, system:authenticated), written
+//	            only for a group some binding names; basis declared (D-110)
 //	grant       iga_access_edges, identity -> rule, through a RoleBinding or
 //	            ClusterRoleBinding (iga_policy_assignment, assignment_id)
 //
-// so a Kubernetes traversal is the AWS traversal with the provider slot
-// rendered 'k8s' (traverse_edges.go) and two of its six edge kinds: there is
-// no member_of, can_assume or task_execution_role row, and no target -- a
-// Kubernetes rule names resource TYPES ("secrets in namespace prod"), never a
-// resource instance, so 040 forbids a resource_id and a rule's node states
-// what it allows itself (k8s_rule).
+// so a Kubernetes walk is the AWS walk with the provider slot rendered 'k8s'
+// (traverse_edges.go) and three of its six edge kinds: there is no
+// can_assume or task_execution_role row, and no target -- a Kubernetes rule
+// names resource TYPES ("secrets in namespace prod"), never a resource
+// instance, so 040 forbids a resource_id and a rule's node states what it
+// allows itself (k8s_rule). A ServiceAccount an AWS trust names (IRSA, EKS
+// Pod Identity) has one more way out: the crossing into the AWS role
+// (traverse_cross.go, D-108).
 //
 // What differs, and why:
 //
@@ -49,21 +55,23 @@ package igaread
 //     pushes a snapshot; nothing per claim is stored), and /evidence is AWS's.
 //     The meta says so once (k8s_observations_not_recorded), instead of
 //     AWS's organizations_not_collected, which says nothing about a cluster.
-//   - Revisions: Kubernetes rows are written straight from a sweep and belong
-//     to no publication. They are read in the request's one REPEATABLE READ
-//     snapshot, which is the consistency unit. meta.graph_state is
-//     "unrevisioned" (the inventory's word); meta.rev and published_at report
-//     the AWS publication current in the snapshot (null when there is none),
-//     as the inventory does -- reported, not what the rows are pinned to. A
-//     workspace with Kubernetes rows and no publication graphs them all the
-//     same; an AWS root there is still 404 (D-4). An expansion cursor of a
-//     Kubernetes node is unrevisioned (graphK8sCursorRev), so a publication
-//     between two pages does not make it stale.
-//
-// Cross-provider IRSA / EKS Pod Identity (an AWS trust naming a Kubernetes
-// service account) is an external principal: terminal, never followed, so it
-// never draws an edge between the providers. Following its resolution is not
-// done here.
+//   - Revisions (D-111): Kubernetes rows are written straight from a sweep
+//     and belong to no publication. They are read in the request's one
+//     REPEATABLE READ snapshot, which is the consistency unit. A response of
+//     Kubernetes nodes only has meta.graph_state "unrevisioned" (the
+//     inventory's word) and meta.rev and published_at null: it neither pins
+//     nor reports an AWS publication, and a rev= on a Kubernetes root is
+//     ignored (never 409). A response that crossed into AWS (traverse_cross.go)
+//     is "mixed", with the AWS rev it read. A workspace with Kubernetes rows
+//     and no publication graphs them all the same; an AWS root there is still
+//     404 (D-4). An expansion cursor of a Kubernetes node is unrevisioned
+//     (graphK8sCursorRev), so a publication between two pages does not make
+//     it stale.
+//   - Where a rule applies (D-109): a grant names its binding, and its
+//     effective_scope says where the rule applies -- the binding's namespace
+//     for a RoleBinding (of a Role or of a ClusterRole), the cluster for a
+//     ClusterRoleBinding -- so a ClusterRole's rule reached through a
+//     RoleBinding never reads as cluster-wide.
 
 import (
 	"encoding/json"
@@ -80,7 +88,7 @@ import (
 
 // graphK8sEdgeKinds are the edge kinds the Kubernetes projection writes, in
 // graphEdgeKinds order.
-var graphK8sEdgeKinds = []string{GraphEdgeExecutesAs, GraphEdgeGrant}
+var graphK8sEdgeKinds = []string{GraphEdgeExecutesAs, GraphEdgeGrant, GraphEdgeMemberOf}
 
 // graphK8sCursorRev is the revision an expansion cursor of a Kubernetes node
 // carries: none. A publication is numbered from 1, so 0 is never a real one.
@@ -116,12 +124,26 @@ const (
 // sweep, as the inventory's coverage notes name it (inventoryK8sSurface).
 const graphK8sStaleSurface = inventoryK8sSurface
 
-// graphK8sMeta makes a Kubernetes traversal's meta: graph_state unrevisioned,
-// and the limitations that hold for every Kubernetes element.
+// graphK8sMeta makes a Kubernetes traversal's meta: graph_state
+// unrevisioned, no AWS revision (D-111), and the limitations that hold for
+// every Kubernetes element.
 func graphK8sMeta(m *GraphMeta) {
+	m.Rev, m.PublishedAt = nil, nil
 	m.GraphState = inventoryUnrevisioned
 	m.Limitations = []GraphLimitation{
 		{"code": graphLimEffectiveAccess},
+		{"code": LimK8sObservationsNotRecorded},
+	}
+}
+
+// graphMixedMeta makes the meta of a response holding nodes of both
+// providers (traverse_cross.go): graph_state mixed, the AWS revision it read,
+// and the limitations of both.
+func graphMixedMeta(m *GraphMeta) {
+	m.GraphState = GraphMixed
+	m.Limitations = []GraphLimitation{
+		{"code": graphLimEffectiveAccess},
+		{"code": graphLimOrganizations},
 		{"code": LimK8sObservationsNotRecorded},
 	}
 }
@@ -165,6 +187,20 @@ type GraphAssignment struct {
 	Ref       string  `json:"ref"`
 	Kind      string  `json:"kind"`
 	Name      string  `json:"name"`
+	Namespace *string `json:"namespace"`
+}
+
+// Effective scope kinds (D-109).
+const (
+	GraphScopeNamespace = "namespace"
+	GraphScopeCluster   = "cluster"
+)
+
+// GraphEffectiveScope is where a Kubernetes grant's rule applies (D-109):
+// {kind: namespace, namespace: <the binding's>} or {kind: cluster,
+// namespace: null}.
+type GraphEffectiveScope struct {
+	Kind      string  `json:"kind"`
 	Namespace *string `json:"namespace"`
 }
 
@@ -449,14 +485,22 @@ func (t *graphTraversal) decorateK8sNodes(lv *graphLevel, nodes []*GraphNode) er
 /* ---------------------------------- edges ---------------------------------- */
 
 // decorateK8sEdges completes Kubernetes edges once both endpoints are read:
-// the provider, and on a grant its binding (assignment) and its role
-// (policy_ref, policy_kind -- the rule's own role, as policy already names).
-// Nothing crosses an account: Kubernetes nodes have none.
+// the provider; on a member_of whether the membership is implicit (D-110);
+// and on a grant its binding (assignment), where its rule applies
+// (effective_scope, D-109) and its role (policy_ref, policy_kind -- the
+// rule's own role, as policy already names). Nothing crosses an account:
+// Kubernetes nodes have none.
 func (t *graphTraversal) decorateK8sEdges(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
 	var grants []uuid.UUID
 	byID := map[uuid.UUID]*GraphEdge{}
 	for _, e := range edges {
 		e.Provider = models.ProviderK8s
+		if e.Kind == GraphEdgeMemberOf {
+			from, to := node(e.From), node(e.To)
+			e.ImplicitMembership = from != nil && to != nil && from.Kind == models.K8sAccountKindServiceAccount &&
+				graphK8sImplicitGroup(to.key)
+			continue
+		}
 		if e.Kind != GraphEdgeGrant {
 			continue
 		}
@@ -488,16 +532,32 @@ func (t *graphTraversal) decorateK8sEdges(lv *graphLevel, edges []*GraphEdge, no
 	}
 	for _, r := range rows {
 		a := &GraphAssignment{Ref: R(RefAssignment, r.AssignmentID), Kind: r.AssignmentKind}
+		scope := &GraphEffectiveScope{Kind: GraphScopeCluster}
 		if k, ok := k8sgraph.ParseKey(r.SourceKey); ok {
 			a.Name = k.Name
 			if k.Namespace != "" {
 				ns := k.Namespace
 				a.Namespace = &ns
+				scope = &GraphEffectiveScope{Kind: GraphScopeNamespace, Namespace: &ns}
 			}
 		}
-		byID[r.EdgeID].Assignment = a
+		e := byID[r.EdgeID]
+		e.Assignment, e.EffectiveScope = a, scope
 	}
 	return nil
+}
+
+// graphK8sImplicitGroup reports whether a Kubernetes group identity's source
+// key names a group the API server places subjects in implicitly:
+// system:serviceaccounts, system:serviceaccounts:<ns> or
+// system:authenticated (D-110).
+func graphK8sImplicitGroup(sourceKey string) bool {
+	k, ok := k8sgraph.ParseKey(sourceKey)
+	if !ok || k.Type != "group" {
+		return false
+	}
+	return k.Name == "system:authenticated" || k.Name == "system:serviceaccounts" ||
+		strings.HasPrefix(k.Name, "system:serviceaccounts:")
 }
 
 /* ------------------------------- limitations -------------------------------- */
