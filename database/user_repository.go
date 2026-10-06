@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,10 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"gorm.io/datatypes"
 )
 
 // UserRepository handles user database operations without GORM
@@ -33,74 +34,84 @@ func NewUserRepository(db *DBConnection) *UserRepository {
 	return &UserRepository{db: db}
 }
 
-// CreateUser creates a new user record
-func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
-	// Validate user data before creation
-	if err := ur.validateUserForCreation(user); err != nil {
-		return fmt.Errorf("user validation failed: %w", err)
-	}
-
-	query := `
-		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, workspace_domain, provider, provider_id, provider_data,
+// extendedUserColumns is the column list scanExtendedUser expects.
+const extendedUserColumns = `id, client_id, workspace_id, project_id, name, username, email,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
-	`
+			created_at, updated_at`
 
-	now := time.Now()
-	if user.ID == uuid.Nil {
-		user.ID = uuid.New()
-	}
-	if user.CreatedAt.IsZero() {
-		user.CreatedAt = now
-	}
-	if user.UpdatedAt.IsZero() {
-		user.UpdatedAt = now
-	}
+// scanExtendedUser scans one extendedUserColumns row through scan.
+func scanExtendedUser(scan func(dest ...interface{}) error) (*models.ExtendedUser, error) {
+	user := &models.ExtendedUser{}
+	var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
+	var mfaEnrolledAt, lastLoginAt sql.NullTime
+	var mfaMethod pq.StringArray
 
-	// Convert datatypes.JSON to interface{} for SQL operations
-	var mfaMethodArray interface{}
-	if user.MFAMethod != nil {
-		mfaMethodArray = user.MFAMethod
-	}
-
-	_, err := ur.db.Exec(query,
-		user.ID,
-		user.ClientID,
-		user.WorkspaceID,
-		user.ProjectID,
-		user.Name,
-		user.Username,
-		user.Email,
-		user.PasswordHash,
-		user.WorkspaceDomain,
-		user.Provider,
-		user.ProviderID,
-		user.ProviderData,
-		user.AvatarURL,
-		user.Active,
-		user.MFAEnabled,
-		mfaMethodArray,
-		user.MFADefaultMethod,
-		user.MFAEnrolledAt,
-		user.MFAVerified,
-		user.LastLogin,
-		user.CreatedAt,
-		user.UpdatedAt,
+	err := scan(
+		&user.ID,
+		&user.ClientID,
+		&user.WorkspaceID,
+		&user.ProjectID,
+		&user.Name,
+		&username,
+		&user.Email,
+		&user.PasswordHash,
+		&user.WorkspaceDomain,
+		&user.Provider,
+		&providerID,
+		&user.ProviderData,
+		&avatarURL,
+		&user.Active,
+		&user.MFAEnabled,
+		&mfaMethod,
+		&mfaDefaultMethod,
+		&mfaEnrolledAt,
+		&user.MFAVerified,
+		&lastLoginAt,
+		&user.CreatedAt,
+		&user.UpdatedAt,
 	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, tenancy.ErrNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
 
-	return err
+	if username.Valid {
+		user.Username = &username.String
+	}
+	if providerID.Valid {
+		user.ProviderID = providerID.String
+	}
+	if avatarURL.Valid {
+		user.AvatarURL = &avatarURL.String
+	}
+	if mfaDefaultMethod.Valid {
+		user.MFADefaultMethod = &mfaDefaultMethod.String
+	}
+	if mfaEnrolledAt.Valid {
+		user.MFAEnrolledAt = &mfaEnrolledAt.Time
+	}
+	if lastLoginAt.Valid {
+		user.LastLogin = &lastLoginAt.Time
+	}
+	user.MFAMethod = mfaMethod
+	return user, nil
 }
 
-// CreateOIDCEndUser creates a workspace-scoped consumer identity for a first
-// federated application login. It deliberately does not create a
-// workspace_memberships row or an admin role binding.
-func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName string, userInfo *models.OIDCUserInfo) (*models.ExtendedUser, error) {
+// CreateOIDCEndUser creates a consumer identity in the workspace carried by
+// ctx for a first federated application login. It deliberately does not
+// create a workspace_memberships row or an admin role binding.
+func (ur *UserRepository) CreateOIDCEndUser(ctx context.Context, providerName string, userInfo *models.OIDCUserInfo) (*models.ExtendedUser, error) {
+	workspaceID, err := ctxWorkspace(ctx)
+	if err != nil {
+		return nil, err
+	}
 	email := strings.ToLower(strings.TrimSpace(userInfo.Email))
-	if workspaceID == uuid.Nil || email == "" || userInfo.Sub == "" {
-		return nil, fmt.Errorf("workspace_id, email, and provider subject are required")
+	if email == "" || userInfo.Sub == "" {
+		return nil, fmt.Errorf("email and provider subject are required")
 	}
 
 	name := strings.TrimSpace(userInfo.Name)
@@ -121,9 +132,15 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 
 	userID := uuid.New()
 	now := time.Now().UTC()
-	query := `
+	domainSuffix := os.Getenv("TENANT_DOMAIN_SUFFIX")
+	if domainSuffix == "" {
+		domainSuffix = "authsec.dev"
+	}
+	// $1 is the context's workspace; row-level security checks the row.
+	err = tenancy.WithTx(ctx, ur.db.DB, workspaceID, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `
 		INSERT INTO users (
-			id, workspace_id, name, username, email, password_hash, workspace_domain,
+			workspace_id, id, name, username, email, password_hash, workspace_domain,
 			provider, provider_id, provider_data, avatar_url, active,
 			last_login, created_at, updated_at
 		)
@@ -132,33 +149,30 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 		ON CONFLICT (workspace_id, LOWER(email)) WHERE deleted_at IS NULL
 		DO UPDATE SET updated_at = users.updated_at
 		RETURNING id
-	`
-	domainSuffix := os.Getenv("TENANT_DOMAIN_SUFFIX")
-	if domainSuffix == "" {
-		domainSuffix = "authsec.dev"
-	}
-	if err := ur.db.QueryRow(
-		query,
-		userID,
-		workspaceID,
-		name,
-		username,
-		email,
-		providerName,
-		userInfo.Sub,
-		profileData,
-		userInfo.Picture,
-		now,
-		domainSuffix,
-	).Scan(&userID); err != nil {
+	`,
+			workspaceID,
+			userID,
+			name,
+			username,
+			email,
+			providerName,
+			userInfo.Sub,
+			profileData,
+			userInfo.Picture,
+			now,
+			domainSuffix,
+		).Scan(&userID)
+	})
+	if err != nil {
 		return nil, fmt.Errorf("create workspace OIDC end user: %w", err)
 	}
 
-	return ur.GetUserByID(userID)
+	return ur.GetUserByID(ctx, userID)
 }
 
 // UpdateLastLogin records successful consumer authentication.
 func (ur *UserRepository) UpdateLastLogin(userID uuid.UUID) error {
+	// TENANT-EXEMPT: sign-in bookkeeping on the account that just signed in.
 	_, err := ur.db.Exec(
 		"UPDATE users SET last_login = $1, updated_at = $1 WHERE id = $2 AND deleted_at IS NULL",
 		time.Now().UTC(),
@@ -167,597 +181,118 @@ func (ur *UserRepository) UpdateLastLogin(userID uuid.UUID) error {
 	return err
 }
 
-// GetUserByEmail retrieves a user by email (case-insensitive)
+// GetUserByEmail retrieves a user by email (case-insensitive): the first
+// match across workspaces, for the pre-auth flows that have no workspace yet.
 func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
+	// TENANT-EXEMPT: pre-auth lookup by email before a workspace is known.
+	query := `SELECT ` + extendedUserColumns + `
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL
-	`
-
-	user := &models.ExtendedUser{}
-	var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
-	var mfaEnrolledAt, lastLoginAt sql.NullTime
-	var mfaMethod pq.StringArray
-
-	err := ur.db.QueryRow(query, email).Scan(
-		&user.ID,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.Name,
-		&username,
-		&user.Email,
-		&user.PasswordHash,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&providerID,
-		&user.ProviderData,
-		&avatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		&mfaMethod,
-		&mfaDefaultMethod,
-		&mfaEnrolledAt,
-		&user.MFAVerified,
-		&lastLoginAt,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
-	// Handle nullable fields
-	if username.Valid {
-		user.Username = &username.String
-	}
-	if providerID.Valid {
-		user.ProviderID = providerID.String
-	}
-	if avatarURL.Valid {
-		user.AvatarURL = &avatarURL.String
-	}
-	if mfaDefaultMethod.Valid {
-		user.MFADefaultMethod = &mfaDefaultMethod.String
-	}
-	if mfaEnrolledAt.Valid {
-		user.MFAEnrolledAt = &mfaEnrolledAt.Time
-	}
-	if lastLoginAt.Valid {
-		user.LastLogin = &lastLoginAt.Time
-	}
-
-	// Assign MFA method directly from TEXT[] array
-	user.MFAMethod = mfaMethod
-
-	return user, nil
+		WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL`
+	return scanExtendedUser(func(dest ...interface{}) error {
+		return ur.db.QueryRow(query, email).Scan(dest...)
+	})
 }
 
-// GetUserByEmailAndClient retrieves a user by email scoped to a client
-func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UUID) (*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
+// GetUserByEmailAndTenant retrieves a user by email (case-insensitive) in the
+// workspace carried by ctx.
+func (ur *UserRepository) GetUserByEmailAndTenant(ctx context.Context, email string) (*models.ExtendedUser, error) {
+	query := `SELECT ` + extendedUserColumns + `
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND deleted_at IS NULL
-	`
-
-	user := &models.ExtendedUser{}
-	var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
-	var mfaEnrolledAt, lastLoginAt sql.NullTime
-	var mfaMethod pq.StringArray
-
-	err := ur.db.QueryRow(query, email, clientID).Scan(
-		&user.ID,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.Name,
-		&username,
-		&user.Email,
-		&user.PasswordHash,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&providerID,
-		&user.ProviderData,
-		&avatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		&mfaMethod,
-		&mfaDefaultMethod,
-		&mfaEnrolledAt,
-		&user.MFAVerified,
-		&lastLoginAt,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
-	if username.Valid {
-		user.Username = &username.String
-	}
-	if providerID.Valid {
-		user.ProviderID = providerID.String
-	}
-	if avatarURL.Valid {
-		user.AvatarURL = &avatarURL.String
-	}
-	if mfaDefaultMethod.Valid {
-		user.MFADefaultMethod = &mfaDefaultMethod.String
-	}
-	if mfaEnrolledAt.Valid {
-		user.MFAEnrolledAt = &mfaEnrolledAt.Time
-	}
-	if lastLoginAt.Valid {
-		user.LastLogin = &lastLoginAt.Time
-	}
-
-	user.MFAMethod = mfaMethod
-
-	return user, nil
+		WHERE workspace_id = $1 AND LOWER(email) = LOWER($2) AND deleted_at IS NULL`
+	return scanExtendedUser(func(dest ...interface{}) error {
+		return tenancy.QueryRowContext(ctx, ur.db.DB, query, []interface{}{email}, dest...)
+	})
 }
 
-// GetUserByEmailAndTenant retrieves a user by email scoped to a tenant
-func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
+// GetUserByID retrieves a user by id in the workspace carried by ctx. A user
+// of another workspace is ErrUserNotFound.
+func (ur *UserRepository) GetUserByID(ctx context.Context, userID uuid.UUID) (*models.ExtendedUser, error) {
+	query := `SELECT ` + extendedUserColumns + `
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND workspace_id = $2 AND deleted_at IS NULL
-	`
-
-	user := &models.ExtendedUser{}
-	var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
-	var mfaEnrolledAt, lastLoginAt sql.NullTime
-	var mfaMethod pq.StringArray
-
-	err := ur.db.QueryRow(query, email, workspaceID).Scan(
-		&user.ID,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.Name,
-		&username,
-		&user.Email,
-		&user.PasswordHash,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&providerID,
-		&user.ProviderData,
-		&avatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		&mfaMethod,
-		&mfaDefaultMethod,
-		&mfaEnrolledAt,
-		&user.MFAVerified,
-		&lastLoginAt,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
-	if username.Valid {
-		user.Username = &username.String
-	}
-	if providerID.Valid {
-		user.ProviderID = providerID.String
-	}
-	if avatarURL.Valid {
-		user.AvatarURL = &avatarURL.String
-	}
-	if mfaDefaultMethod.Valid {
-		user.MFADefaultMethod = &mfaDefaultMethod.String
-	}
-	if mfaEnrolledAt.Valid {
-		user.MFAEnrolledAt = &mfaEnrolledAt.Time
-	}
-	if lastLoginAt.Valid {
-		user.LastLogin = &lastLoginAt.Time
-	}
-
-	user.MFAMethod = mfaMethod
-
-	return user, nil
+		WHERE workspace_id = $1 AND id = $2 AND deleted_at IS NULL`
+	return scanExtendedUser(func(dest ...interface{}) error {
+		return tenancy.QueryRowContext(ctx, ur.db.DB, query, []interface{}{userID}, dest...)
+	})
 }
 
-// GetUserByID retrieves a user by ID
-func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
-		FROM users
-		WHERE id = $1 AND deleted_at IS NULL
-	`
-
-	user := &models.ExtendedUser{}
-	var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
-	var mfaEnrolledAt, lastLoginAt sql.NullTime
-	var mfaMethod pq.StringArray
-
-	err := ur.db.QueryRow(query, userID).Scan(
-		&user.ID,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.Name,
-		&username,
-		&user.Email,
-		&user.PasswordHash,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&providerID,
-		&user.ProviderData,
-		&avatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		&mfaMethod,
-		&mfaDefaultMethod,
-		&mfaEnrolledAt,
-		&user.MFAVerified,
-		&lastLoginAt,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
-	// Handle nullable fields
-	if username.Valid {
-		user.Username = &username.String
-	}
-	if providerID.Valid {
-		user.ProviderID = providerID.String
-	}
-	if avatarURL.Valid {
-		user.AvatarURL = &avatarURL.String
-	}
-	if mfaDefaultMethod.Valid {
-		user.MFADefaultMethod = &mfaDefaultMethod.String
-	}
-	if mfaEnrolledAt.Valid {
-		user.MFAEnrolledAt = &mfaEnrolledAt.Time
-	}
-	if lastLoginAt.Valid {
-		user.LastLogin = &lastLoginAt.Time
-	}
-
-	// Assign MFA method directly from TEXT[] array
-	user.MFAMethod = mfaMethod
-
-	return user, nil
-}
-
-// GetUserByProvider retrieves a workspace user by OAuth provider and provider ID.
-func (ur *UserRepository) GetUserByProvider(workspaceID uuid.UUID, provider, providerID string) (*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
-		FROM users
-		WHERE workspace_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL
-	`
-
-	user := &models.ExtendedUser{}
-	var username, providerIDNull, avatarURL, mfaDefaultMethod sql.NullString
-	var mfaEnrolledAt, lastLoginAt sql.NullTime
-	var mfaMethod pq.StringArray
-
-	err := ur.db.QueryRow(query, workspaceID, provider, providerID).Scan(
-		&user.ID,
-		&user.ClientID,
-		&user.WorkspaceID,
-		&user.ProjectID,
-		&user.Name,
-		&username,
-		&user.Email,
-		&user.PasswordHash,
-		&user.WorkspaceDomain,
-		&user.Provider,
-		&providerIDNull,
-		&user.ProviderData,
-		&avatarURL,
-		&user.Active,
-		&user.MFAEnabled,
-		&mfaMethod,
-		&mfaDefaultMethod,
-		&mfaEnrolledAt,
-		&user.MFAVerified,
-		&lastLoginAt,
-		&user.CreatedAt,
-		&user.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
-	// Handle nullable fields
-	if username.Valid {
-		user.Username = &username.String
-	}
-	if providerIDNull.Valid {
-		user.ProviderID = providerIDNull.String
-	}
-	if avatarURL.Valid {
-		user.AvatarURL = &avatarURL.String
-	}
-	if mfaDefaultMethod.Valid {
-		user.MFADefaultMethod = &mfaDefaultMethod.String
-	}
-	if mfaEnrolledAt.Valid {
-		user.MFAEnrolledAt = &mfaEnrolledAt.Time
-	}
-	if lastLoginAt.Valid {
-		user.LastLogin = &lastLoginAt.Time
-	}
-
-	// Assign MFA method directly from TEXT[] array
-	user.MFAMethod = mfaMethod
-
-	return user, nil
-}
-
-// UpdateUserLogin updates login-related fields for a user
+// UpdateUserLogin records a sign-in for a user.
 func (ur *UserRepository) UpdateUserLogin(userID uuid.UUID) error {
-	query := `
-		UPDATE users
-		SET last_login = $1, updated_at = $2
-		WHERE id = $3
-	`
-
 	now := time.Now()
-	result, err := ur.db.Exec(query, now, now, userID)
+	// TENANT-EXEMPT: sign-in bookkeeping on the account that just signed in.
+	result, err := ur.db.Exec(`UPDATE users SET last_login = $1, updated_at = $2 WHERE id = $3`, now, now, userID)
 	if err != nil {
 		return err
 	}
-
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
-
 	if rowsAffected == 0 {
 		return fmt.Errorf("user not found")
 	}
-
 	return nil
 }
 
-// UpdateUserMFA updates MFA-related fields for a user
-func (ur *UserRepository) UpdateUserMFA(userID uuid.UUID, mfaEnabled bool, mfaMethods []byte) error {
-	query := `
+// UpdateUserMFA updates the MFA fields of a user of the workspace carried by
+// ctx. Another workspace's user is "user not found".
+func (ur *UserRepository) UpdateUserMFA(ctx context.Context, userID uuid.UUID, mfaEnabled bool, mfaMethods []byte) error {
+	result, err := tenancy.ExecContext(ctx, ur.db.DB, `
 		UPDATE users
-		SET mfa_enabled = $1, mfa_method = $2, updated_at = $3
-		WHERE id = $4
-	`
-
-	now := time.Now()
-	result, err := ur.db.Exec(query, mfaEnabled, mfaMethods, now, userID)
+		SET mfa_enabled = $3, mfa_method = $4, updated_at = $5
+		WHERE workspace_id = $1 AND id = $2
+	`, userID, mfaEnabled, mfaMethods, time.Now())
 	if err != nil {
 		return err
 	}
-
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
-
 	if rowsAffected == 0 {
 		return fmt.Errorf("user not found")
 	}
-
 	return nil
 }
 
-// UpdateUserPassword updates a user's password hash
-func (ur *UserRepository) UpdateUserPassword(userID uuid.UUID, passwordHash string) error {
-	query := `
-		UPDATE users
-		SET password_hash = $1, updated_at = $2
-		WHERE id = $3
-	`
-
-	result, err := ur.db.Exec(query, passwordHash, time.Now(), userID)
-	if err != nil {
-		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("user not found")
-	}
-
-	return nil
-}
-
-// GetUsersByWorkspaceID retrieves users by tenant ID with pagination
-func (ur *UserRepository) GetUsersByWorkspaceID(workspaceID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
-	query := `
-		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at
+// GetUsersByWorkspaceID lists the users of the workspace carried by ctx,
+// newest first.
+func (ur *UserRepository) GetUsersByWorkspaceID(ctx context.Context, limit, offset int) ([]*models.ExtendedUser, error) {
+	rows, err := tenancy.QueryContext(ctx, ur.db.DB, `SELECT `+extendedUserColumns+`
 		FROM users
 		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3
-	`
-
-	rows, err := ur.db.Query(query, workspaceID, limit, offset)
+	`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	var users []*models.ExtendedUser
-
 	for rows.Next() {
-		user := &models.ExtendedUser{}
-		var username, providerID, avatarURL, mfaDefaultMethod sql.NullString
-		var mfaEnrolledAt, lastLoginAt sql.NullTime
-		var mfaMethod pq.StringArray
-
-		err := rows.Scan(
-			&user.ID,
-			&user.ClientID,
-			&user.WorkspaceID,
-			&user.ProjectID,
-			&user.Name,
-			&username,
-			&user.Email,
-			&user.PasswordHash,
-			&user.WorkspaceDomain,
-			&user.Provider,
-			&providerID,
-			&user.ProviderData,
-			&avatarURL,
-			&user.Active,
-			&user.MFAEnabled,
-			&mfaMethod,
-			&mfaDefaultMethod,
-			&mfaEnrolledAt,
-			&user.MFAVerified,
-			&lastLoginAt,
-			&user.CreatedAt,
-			&user.UpdatedAt,
-		)
-
+		user, err := scanExtendedUser(rows.Scan)
 		if err != nil {
 			return nil, err
 		}
-
-		// Handle nullable fields
-		if username.Valid {
-			user.Username = &username.String
-		}
-		if providerID.Valid {
-			user.ProviderID = providerID.String
-		}
-		if avatarURL.Valid {
-			user.AvatarURL = &avatarURL.String
-		}
-		if mfaDefaultMethod.Valid {
-			user.MFADefaultMethod = &mfaDefaultMethod.String
-		}
-		if mfaEnrolledAt.Valid {
-			user.MFAEnrolledAt = &mfaEnrolledAt.Time
-		}
-		if lastLoginAt.Valid {
-			user.LastLogin = &lastLoginAt.Time
-		}
-
-		// Assign MFA method directly from TEXT[] array
-		user.MFAMethod = mfaMethod
-
 		users = append(users, user)
 	}
-
 	return users, rows.Err()
 }
 
-// CountUsersByWorkspaceID counts users for a tenant
-func (ur *UserRepository) CountUsersByWorkspaceID(workspaceID uuid.UUID) (int, error) {
-	query := `SELECT COUNT(*) FROM users WHERE workspace_id = $1`
-
-	var count int
-	err := ur.db.QueryRow(query, workspaceID).Scan(&count)
-	return count, err
-}
-
-// UserExists checks if a user exists by email (case-insensitive)
-func (ur *UserRepository) UserExists(email string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email) = LOWER($1))`
-
-	var exists bool
-	err := ur.db.QueryRow(query, email).Scan(&exists)
-	return exists, err
-}
-
-// DeleteUser soft deletes a user (marks as inactive) or hard deletes
-func (ur *UserRepository) DeleteUser(userID uuid.UUID) error {
-	// For now, we'll do a soft delete by marking as inactive
-	query := `UPDATE users SET active = false, updated_at = $1 WHERE id = $2`
-
-	result, err := ur.db.Exec(query, time.Now(), userID)
+// CreateUserTx creates a user of the workspace carried by ctx inside the
+// caller's transaction (sign-up creates the workspace and its first user
+// atomically). The user's workspace must be the context's.
+func (ur *UserRepository) CreateUserTx(ctx context.Context, tx *sql.Tx, user *models.ExtendedUser) error {
+	ws, err := ctxWorkspace(ctx)
 	if err != nil {
 		return err
 	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
+	if user.WorkspaceID != ws {
+		return fmt.Errorf("user validation failed: user must belong to the caller's workspace")
 	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("user not found")
-	}
-
-	return nil
-}
-
-// Transaction support
-
-// CreateUserTx creates a user within a transaction
-func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) error {
-	// Validate user data before creation
-	if err := ur.validateUserForCreation(user); err != nil {
+	if err := ur.validateUserForCreation(ctx, tx, user); err != nil {
 		return fmt.Errorf("user validation failed: %w", err)
 	}
-
-	query := `
-		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, workspace_domain, provider, provider_id, provider_data,
-			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
-			mfa_enrolled_at, mfa_verified, last_login,
-			created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
-	`
 
 	now := time.Now()
 	if user.ID == uuid.Nil {
@@ -770,16 +305,23 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 		user.UpdatedAt = now
 	}
 
-	// Convert datatypes.JSON to interface{} for SQL operations
 	var mfaMethodArray interface{}
 	if user.MFAMethod != nil {
 		mfaMethodArray = user.MFAMethod
 	}
 
-	_, err := tx.Exec(query,
+	// $1 is the context's workspace.
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO users (workspace_id, id, client_id, project_id, name, username, email,
+			password_hash, workspace_domain, provider, provider_id, provider_data,
+			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
+			mfa_enrolled_at, mfa_verified, last_login,
+			created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	`,
+		ws,
 		user.ID,
 		user.ClientID,
-		user.WorkspaceID,
 		user.ProjectID,
 		user.Name,
 		user.Username,
@@ -800,60 +342,16 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 		user.CreatedAt,
 		user.UpdatedAt,
 	)
-
 	return err
 }
 
-// initializeUserFields sets default values for optional fields
-func (ur *UserRepository) initializeUserFields(user *models.ExtendedUser) {
-	now := time.Now()
+var emailPattern = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 
-	if user.ID == uuid.Nil {
-		user.ID = uuid.New()
-	}
-	if user.CreatedAt.IsZero() {
-		user.CreatedAt = now
-	}
-	if user.UpdatedAt.IsZero() {
-		user.UpdatedAt = now
-	}
-
-	// Initialize ProviderData if nil
-	if user.ProviderData == nil {
-		user.ProviderData = datatypes.JSON("{}")
-	}
-
-	// Ensure required boolean fields have proper defaults
-	// MFAEnabled and MFAVerified already have defaults in sharedmodels.User
-}
-
-// CreateUserWithValidation creates a user with comprehensive validation and initialization
-func (ur *UserRepository) CreateUserWithValidation(user *models.ExtendedUser) error {
-	// Initialize default fields
-	ur.initializeUserFields(user)
-
-	// Validate user data
-	if err := ur.validateUserForCreation(user); err != nil {
-		return fmt.Errorf("user validation failed: %w", err)
-	}
-
-	// Validate relationships
-	if err := ur.validateUserRelationships(user); err != nil {
-		return fmt.Errorf("relationship validation failed: %w", err)
-	}
-
-	// Create the user
-	return ur.CreateUser(user)
-}
-
-// validateUserForCreation performs comprehensive validation before user creation
-func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) error {
-	// 1. Required field validation
+// validateUserForCreation validates a new user of the workspace carried by
+// ctx, checking uniqueness inside the caller's transaction.
+func (ur *UserRepository) validateUserForCreation(ctx context.Context, tx *sql.Tx, user *models.ExtendedUser) error {
 	if user.ClientID == uuid.Nil {
 		return fmt.Errorf("client_id is required")
-	}
-	if user.WorkspaceID == uuid.Nil {
-		return fmt.Errorf("workspace_id is required")
 	}
 	// Note: project_id is optional and can be nil for admin users
 	if strings.TrimSpace(user.Email) == "" {
@@ -868,118 +366,37 @@ func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) err
 	if strings.TrimSpace(user.ProviderID) == "" {
 		return fmt.Errorf("provider_id is required")
 	}
-
-	// 2. Email format validation
-	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
-	if !emailRegex.MatchString(user.Email) {
+	if !emailPattern.MatchString(user.Email) {
 		return fmt.Errorf("invalid email format: %s", user.Email)
 	}
-
-	// 3. ProviderData JSON validation (if provided)
-	if user.ProviderData != nil && len(user.ProviderData) > 0 {
+	if len(user.ProviderData) > 0 {
 		var jsonTest interface{}
 		if err := json.Unmarshal(user.ProviderData, &jsonTest); err != nil {
 			return fmt.Errorf("invalid JSON in provider_data: %w", err)
 		}
 	}
 
-	// 4. Check for existing user with same email scoped to client
-	if existingUser, err := ur.GetUserByEmailAndClient(user.Email, user.ClientID); err == nil && existingUser != nil {
+	// The same email for the same client in this workspace.
+	var existingID uuid.UUID
+	err := tenancy.QueryRowContext(ctx, tx, `
+		SELECT id FROM users
+		 WHERE workspace_id = $1 AND LOWER(email) = LOWER($2) AND client_id = $3 AND deleted_at IS NULL`,
+		[]interface{}{user.Email, user.ClientID}, &existingID)
+	if err == nil {
 		return fmt.Errorf("user with email %s already exists for this client", user.Email)
-	} else if err != nil && err.Error() != "user not found" {
+	} else if !errors.Is(err, tenancy.ErrNotFound) {
 		return fmt.Errorf("failed to check existing user email: %w", err)
 	}
 
-	// 5. Check for existing user with same provider/provider_id combination
-	if err := ur.checkProviderUniqueness(user.WorkspaceID, user.Provider, user.ProviderID, user.ID); err != nil {
-		return err
-	}
-
-	// 6. Validate user relationships (scopes, roles, groups, resources)
-	if err := ur.validateUserRelationships(user); err != nil {
-		return fmt.Errorf("user relationship validation failed: %w", err)
-	}
-
-	return nil
-}
-
-// checkProviderUniqueness validates that a provider identity is unique inside a workspace.
-func (ur *UserRepository) checkProviderUniqueness(workspaceID uuid.UUID, provider, providerID string, excludeUserID uuid.UUID) error {
-	query := `SELECT id FROM users WHERE workspace_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL`
-	args := []interface{}{workspaceID, provider, providerID}
-
-	if excludeUserID != uuid.Nil {
-		query += ` AND id != $4`
-		args = append(args, excludeUserID)
-	}
-
-	var existingID uuid.UUID
-	err := ur.db.QueryRow(query, args...).Scan(&existingID)
+	// The same provider identity in this workspace.
+	err = tenancy.QueryRowContext(ctx, tx, `
+		SELECT id FROM users
+		 WHERE workspace_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL AND id <> $4`,
+		[]interface{}{user.Provider, user.ProviderID, user.ID}, &existingID)
 	if err == nil {
-		return fmt.Errorf("user with provider '%s' and provider_id '%s' already exists", provider, providerID)
-	}
-	if err != sql.ErrNoRows {
+		return fmt.Errorf("user with provider '%s' and provider_id '%s' already exists", user.Provider, user.ProviderID)
+	} else if !errors.Is(err, tenancy.ErrNotFound) {
 		return fmt.Errorf("error checking provider uniqueness: %w", err)
 	}
-
-	return nil
-}
-
-// GetUserMFAMethods retrieves enabled MFA methods for a user
-func (ur *UserRepository) GetUserMFAMethods(userID uuid.UUID, clientID uuid.UUID) ([]map[string]interface{}, error) {
-	query := `
-		SELECT method_type, display_name, description, method_data, is_primary, verified
-		FROM mfa_methods
-		WHERE user_id = $1 AND client_id = $2 AND enabled = true
-		ORDER BY is_primary DESC, enrolled_at ASC
-	`
-
-	rows, err := ur.db.Query(query, userID, clientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query MFA methods: %w", err)
-	}
-	defer rows.Close()
-
-	var methods []map[string]interface{}
-	for rows.Next() {
-		var methodType, displayName, description string
-		var methodData []byte
-		var isPrimary, verified bool
-
-		err := rows.Scan(&methodType, &displayName, &description, &methodData, &isPrimary, &verified)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan MFA method: %w", err)
-		}
-
-		method := map[string]interface{}{
-			"method_type":  methodType,
-			"display_name": displayName,
-			"description":  description,
-			"is_primary":   isPrimary,
-			"verified":     verified,
-		}
-
-		// Parse method_data JSON if present
-		if len(methodData) > 0 {
-			var data map[string]interface{}
-			if err := json.Unmarshal(methodData, &data); err == nil {
-				method["method_data"] = data
-			}
-		}
-
-		methods = append(methods, method)
-	}
-
-	return methods, nil
-}
-
-// validateUserRelationships checks if referenced scopes, roles, groups, and resources exist
-func (ur *UserRepository) validateUserRelationships(user *models.ExtendedUser) error {
-	// Note: In sharedmodels.User v0.5.0, relationships are loaded via GORM associations
-	// For now, we'll validate that if relationships are populated, they have valid IDs
-
-	// This validation would be more comprehensive if we had access to the relationship tables
-	// For now, we trust that the relationships are properly managed through the mapping functions
-
 	return nil
 }

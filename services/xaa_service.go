@@ -274,7 +274,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 	// user rooted elsewhere (cross-workspace stays the federated-guest path below).
 	if issuer.ProviderName == selfIssuedProviderName {
 		if subUUID, perr := uuid.Parse(mappedSub); perr == nil {
-			if existing, uerr := s.userRepo.GetUserByID(subUUID); uerr == nil && existing != nil && existing.WorkspaceID == targetWorkspaceID {
+			if existing, uerr := s.userRepo.GetUserByID(database.WithWorkspace(ctx, targetWorkspaceID), subUUID); uerr == nil && existing != nil && existing.WorkspaceID == targetWorkspaceID {
 				// Best-effort link row for audit/traceability (the real email, not a
 				// placeholder). A failure here is non-fatal — the user is already real.
 				now := time.Now().UTC()
@@ -304,7 +304,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 		Email: mappedSub + "@jit.local", // placeholder — real email not in ID-JAG
 		Name:  mappedSub,
 	}
-	user, err := s.userRepo.CreateOIDCEndUser(targetWorkspaceID, issuer.ProviderName, userInfo)
+	user, err := s.userRepo.CreateOIDCEndUser(database.WithWorkspace(ctx, targetWorkspaceID), issuer.ProviderName, userInfo)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("jit_provision: create user: %w", err)
 	}

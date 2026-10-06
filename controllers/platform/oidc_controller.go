@@ -614,7 +614,7 @@ func (oc *OIDCController) finishHydraLogin(c *gin.Context, state *models.OIDCSta
 
 	var user *models.ExtendedUser
 	if identity != nil {
-		user, err = oc.userRepo.GetUserByID(identity.UserID)
+		user, err = oc.userRepo.GetUserByID(database.WithWorkspace(c.Request.Context(), identity.WorkspaceID), identity.UserID)
 		if err != nil {
 			log.Printf("hydra_login callback: GetUserByID(%s) failed: %v", identity.UserID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "user lookup failed"})
@@ -622,9 +622,9 @@ func (oc *OIDCController) finishHydraLogin(c *gin.Context, state *models.OIDCSta
 		}
 		_ = oc.oidcService.UpdateLastLogin(identity.ID)
 	} else {
-		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
+		user, err = oc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), workspaceID), userInfo.Email)
 		if database.IsUserNotFound(err) {
-			user, err = oc.userRepo.CreateOIDCEndUser(workspaceID, state.ProviderName, userInfo)
+			user, err = oc.userRepo.CreateOIDCEndUser(database.WithWorkspace(c.Request.Context(), workspaceID), state.ProviderName, userInfo)
 			if err != nil {
 				log.Printf("hydra_login callback: JIT end-user creation failed email=%s workspace=%s: %v", userInfo.Email, workspaceID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "failed to create workspace end user"})
@@ -798,7 +798,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 
 	if identity != nil {
 		// User has OIDC identity - get user by ID
-		user, err = oc.userRepo.GetUserByID(identity.UserID)
+		user, err = oc.userRepo.GetUserByID(database.WithWorkspace(c.Request.Context(), identity.WorkspaceID), identity.UserID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user info"})
 			return
@@ -807,7 +807,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 		oc.oidcService.UpdateLastLogin(identity.ID)
 	} else {
 		// No OIDC identity - check if user exists by email in this tenant
-		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, *state.WorkspaceID)
+		user, err = oc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), *state.WorkspaceID), userInfo.Email)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace"})
 			return
@@ -1034,7 +1034,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		adminUser.AvatarURL = &userInfo.Picture
 	}
 
-	if err := oc.userRepo.CreateUserTx(tx, adminUser); err != nil {
+	if err := oc.userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), workspaceID), tx, adminUser); err != nil {
 		log.Printf("Failed to create admin user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 		return
@@ -1340,7 +1340,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		adminUser.AvatarURL = &input.Picture
 	}
 
-	if err := oc.userRepo.CreateUserTx(tx, adminUser); err != nil {
+	if err := oc.userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), workspaceID), tx, adminUser); err != nil {
 		log.Printf("Failed to create user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 		return

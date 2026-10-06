@@ -252,7 +252,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get user details
-	user, err := ctrl.userRepo.GetUserByID(userID)
+	user, err := ctrl.userRepo.GetUserByID(database.WithWorkspace(c.Request.Context(), workspaceID), userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
 		return
@@ -717,7 +717,7 @@ func (ctrl *TOTPController) lookupTOTPUser(c *gin.Context, email, workspaceID, w
 	if err != nil {
 		return nil, err
 	}
-	return ctrl.userRepo.GetUserByEmailAndTenant(email, wsID)
+	return ctrl.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsID), email)
 }
 
 // generateJWTToken generates a JWT token

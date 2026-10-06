@@ -679,7 +679,7 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 	var lookupErr error
 	if wsID := getContextString(c, "workspace_id"); wsID != "" {
 		if wsUUID, parseErr := uuid.Parse(wsID); parseErr == nil {
-			user, lookupErr = userRepo.GetUserByEmailAndTenant(email, wsUUID)
+			user, lookupErr = userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsUUID), email)
 		}
 	}
 	if user == nil {

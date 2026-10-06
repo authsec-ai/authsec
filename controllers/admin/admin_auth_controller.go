@@ -979,7 +979,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		},
 	}
 
-	if err := userRepo.CreateUserTx(tx, &adminUser); err != nil {
+	if err := userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID), tx, &adminUser); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create admin user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin user"})

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -158,7 +159,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(link.ID)
 
 			// Get user from repository
-			user, err := s.userRepo.GetUserByID(link.UserID)
+			user, err := s.userRepo.GetUserByID(database.WithWorkspace(context.Background(), session.WorkspaceID), link.UserID)
 			if err != nil {
 				return &models.VoiceVerifyResponse{
 					Success: false,
@@ -283,7 +284,7 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 
 	// The user must belong to the session's workspace, which came from the
 	// authenticated voice client, not from the request.
-	user, err := s.userRepo.GetUserByEmailAndTenant(req.Email, session.WorkspaceID)
+	user, err := s.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(context.Background(), session.WorkspaceID), req.Email)
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",

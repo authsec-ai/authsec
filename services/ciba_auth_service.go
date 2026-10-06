@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -63,7 +64,7 @@ func (s *CIBAAuthService) InitiateCIBAAuth(req *models.CIBAInitiateRequest) (*mo
 			ErrorDescription: err.Error(),
 		}, nil
 	}
-	user, err := s.userRepo.GetUserByEmailAndTenant(req.LoginHint, workspaceID)
+	user, err := s.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(context.Background(), workspaceID), req.LoginHint)
 	if err != nil || user == nil || !user.Active {
 		return &models.CIBAInitiateResponse{
 			Error:            models.CIBAErrorUserNotFound,
@@ -269,7 +270,7 @@ func (s *CIBAAuthService) PollForToken(authReqID string, clientIDStr string) (*m
 
 		// User approved - generate token
 		// Get user from tenant database
-		user, err := s.userRepo.GetUserByID(authReq.UserID)
+		user, err := s.userRepo.GetUserByID(database.WithWorkspace(context.Background(), authReq.WorkspaceID), authReq.UserID)
 		if err != nil {
 			// Revert so a retry can mint (best-effort); we own the consume.
 			s.cibaRepo.UpdateCIBAAuthRequestStatusIf(authReqID, "consumed", "approved", authReq.BiometricVerified)

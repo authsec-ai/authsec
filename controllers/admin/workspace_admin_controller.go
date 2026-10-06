@@ -387,7 +387,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// user identity is (workspace_id, email).
 
 	// Create user AFTER workspace is created
-	if err := uc.userRepo.CreateUserTx(tx, &user); err != nil {
+	if err := uc.userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), workspace.WorkspaceID), tx, &user); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create default client user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default client	user"})
@@ -600,7 +600,7 @@ func (uc *UserController) Login(c *gin.Context) {
 		return
 	}
 
-	user, err := uc.userRepo.GetUserByEmailAndTenant(input.Email, tenant.WorkspaceID)
+	user, err := uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID), input.Email)
 	if err != nil {
 		log.Printf("Login failed for %s: user not found in workspace %s, error: %v", input.Email, tenant.WorkspaceID, err)
 		c.Set("error", fmt.Sprintf("User not found: %s", input.Email))
@@ -698,7 +698,7 @@ func (uc *UserController) Login(c *gin.Context) {
 	// the session callback require. The password was checked on a user found
 	// by email alone, so the ticket is issued only if that is this
 	// workspace's user (the same email may exist in another workspace).
-	if wsUser, wsErr := uc.userRepo.GetUserByEmailAndTenant(user.Email, tenant.WorkspaceID); wsErr != nil || wsUser.ID != user.ID {
+	if wsUser, wsErr := uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID), user.Email); wsErr != nil || wsUser.ID != user.ID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -813,7 +813,7 @@ func (uc *UserController) WebAuthnCallback(c *gin.Context) {
 		return
 	}
 
-	user, err := uc.userRepo.GetUserByEmailAndTenant(ticket.Email, tenant.WorkspaceID)
+	user, err := uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID), ticket.Email)
 	if err != nil || user.ID != ticket.UserID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
@@ -902,7 +902,7 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 	// Find user in main database, scoped to workspace when workspace_id is provided
 	var user *models.ExtendedUser
 	if wsUUID, parseErr := uuid.Parse(input.WorkspaceID); parseErr == nil {
-		user, err = uc.userRepo.GetUserByEmailAndTenant(input.Email, wsUUID)
+		user, err = uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsUUID), input.Email)
 	} else {
 		user, err = uc.userRepo.GetUserByEmail(input.Email)
 	}
@@ -1395,7 +1395,7 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	}
 
 	// Find user in main database, scoped to the workspace
-	user, err := uc.userRepo.GetUserByEmailAndTenant(tenant.Email, tenant.WorkspaceID)
+	user, err := uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID), tenant.Email)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
@@ -1485,7 +1485,7 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	// Format as PostgreSQL text array: {webauthn}
 	mfaMethodsArray := "{" + strings.Join(mfaMethods, ",") + "}"
 
-	err = uc.userRepo.UpdateUserMFA(user.ID, true, []byte(mfaMethodsArray))
+	err = uc.userRepo.UpdateUserMFA(database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID), user.ID, true, []byte(mfaMethodsArray))
 	if err != nil {
 		log.Printf("Failed to update user MFA settings: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update MFA settings"})

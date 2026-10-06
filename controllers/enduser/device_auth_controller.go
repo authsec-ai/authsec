@@ -391,7 +391,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		return
 	}
 
-	user, err := ctrl.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
+	user, err := ctrl.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), workspaceID), userInfo.Email)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace", "details": err.Error()})
 		return
