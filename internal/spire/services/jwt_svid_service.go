@@ -299,14 +299,16 @@ func (s *JWTSVIDService) getOrCreateSigningKey(
 	vaultPath := fmt.Sprintf("secret/spire/jwt-signing-keys/%s", workspaceID)
 	data, err := s.vaultClient.ReadKVSecret(ctx, jwtKVMount, vaultPath)
 	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Warn("Failed to read JWT signing key from Vault, will generate new key")
+		// A read error is not "no key": generating here would overwrite the
+		// stored key and invalidate every SVID it signed (AS-036).
+		return nil, fmt.Errorf("read JWT signing key from Vault: %w", err)
 	}
 
 	if data != nil {
 		if pemStr, ok := data["private_key_pem"].(string); ok && pemStr != "" {
 			key, parseErr := parseRSAPrivateKeyPEM(pemStr)
 			if parseErr != nil {
-				s.logger.WithField("workspace_id", workspaceID).WithError(parseErr).Warn("Failed to parse stored JWT signing key, will regenerate")
+				return nil, fmt.Errorf("stored JWT signing key is unparseable; refusing to overwrite it: %w", parseErr)
 			} else {
 				s.logger.WithField("workspace_id", workspaceID).Info("Loaded JWT signing key from Vault")
 				s.keyCache[workspaceID] = key

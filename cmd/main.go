@@ -392,6 +392,10 @@ func main() {
 		tokens.InitNativeKeys(nil)
 		log.Printf("[NATIVE_KEYS] Vault not configured — using ephemeral native signing keyset")
 	}
+	// Production never runs on keys that die with the process (AS-036).
+	if err := tokens.NativeKeys().CheckDurable(os.Getenv("ENVIRONMENT")); err != nil {
+		log.Fatalf("[NATIVE_KEYS] refusing to start: %v", err)
+	}
 
 	// All routes (user-flow + webauthn + spire identity)
 	routes.SetupRoutes(r, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler, spireDeps)
