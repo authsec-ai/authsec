@@ -956,6 +956,11 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 
 	// All checks passed — return the refreshed token set.
 	log.Printf("[MCP_AUTH] tokenRefreshGrant: success client=%s resource=%s", oauthClient.ClientID, resourceParam)
+	// A client used only through refresh is in use (AS-037).
+	if dbErr := config.DB.Model(&models.MCPOAuthClient{}).Where("id = ?", oauthClient.ID).
+		Update("last_token_issued_at", time.Now()).Error; dbErr != nil {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: failed to stamp last_token_issued_at for client=%s: %v", oauthClient.ClientID, dbErr)
+	}
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
 

@@ -63,7 +63,7 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 
 	// First pass immediately so a restart picks up any in-flight failures
 	// without waiting for the first interval.
-	r.tick(ctx)
+	RunAsLeader(ctx, r.db, "hydra-reconcile", func() { r.tick(ctx) })
 
 	for {
 		select {
@@ -71,7 +71,7 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 			log.Printf("[HydraReconciler] stopping: %v", ctx.Err())
 			return
 		case <-ticker.C:
-			r.tick(ctx)
+			RunAsLeader(ctx, r.db, "hydra-reconcile", func() { r.tick(ctx) })
 		}
 	}
 }
@@ -90,39 +90,13 @@ func (r *HydraReconciler) runStaleDCRCleanup(ctx context.Context) {
 	log.Printf("[HydraReconciler] stale DCR cleanup: staleDays=%d", staleDays)
 
 	cleanup := func() {
-		cutoff := time.Now().AddDate(0, 0, -staleDays)
-		var staleClients []models.MCPOAuthClient
-		// A client is stale only if it was CREATED before the cutoff AND it has
-		// either never issued a token or not issued one since the cutoff. The
-		// created_at gate is essential: without it a freshly-registered DCR
-		// client (last_token_issued_at IS NULL) is reaped the instant the next
-		// cleanup runs — including at every backend boot — even though it's
-		// seconds old. Young clients are never stale, regardless of token history.
-		if err := r.db.WithContext(ctx).Where(
-			"registration_type = 'dcr' AND sync_status = ? AND created_at < ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)",
-			models.MCPClientSyncActive,
-			cutoff,
-			cutoff,
-		).Find(&staleClients).Error; err != nil {
-			log.Printf("[HydraReconciler] stale DCR query failed: %v", err)
-			return
-		}
-		if len(staleClients) == 0 {
-			return
-		}
-		log.Printf("[HydraReconciler] stale DCR cleanup: marking %d client(s) pending_delete (cutoff=%s)", len(staleClients), cutoff.Format(time.RFC3339))
-		for i := range staleClients {
-			c := &staleClients[i]
-			if err := r.db.WithContext(ctx).Model(c).Update("sync_status", models.MCPClientSyncPendingDelete).Error; err != nil {
-				log.Printf("[HydraReconciler] stale DCR: failed to mark pending_delete client_id=%s: %v", c.ClientID, err)
-			} else {
-				log.Printf("[HydraReconciler] stale DCR: marked pending_delete client_id=%s", c.ClientID)
-			}
+		if _, err := r.MarkStaleDCRClients(ctx, staleDays); err != nil {
+			log.Printf("[HydraReconciler] stale DCR cleanup failed: %v", err)
 		}
 	}
 
 	// Run once immediately, then every 24 hours.
-	cleanup()
+	RunAsLeader(ctx, r.db, "stale-dcr", cleanup)
 	dailyTicker := time.NewTicker(24 * time.Hour)
 	defer dailyTicker.Stop()
 	for {
@@ -130,9 +104,50 @@ func (r *HydraReconciler) runStaleDCRCleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-dailyTicker.C:
-			cleanup()
+			RunAsLeader(ctx, r.db, "stale-dcr", cleanup)
 		}
 	}
+}
+
+// MarkStaleDCRClients marks DCR clients with no token issued in staleDays
+// days (neither last_token_issued_at nor a native_tokens row) as
+// pending_delete, and returns how many it marked.
+func (r *HydraReconciler) MarkStaleDCRClients(ctx context.Context, staleDays int) (int, error) {
+	cutoff := time.Now().AddDate(0, 0, -staleDays)
+	var staleClients []models.MCPOAuthClient
+	// A client is stale only if it was CREATED before the cutoff AND it has
+	// either never issued a token or not issued one since the cutoff. The
+	// created_at gate is essential: without it a freshly-registered DCR
+	// client (last_token_issued_at IS NULL) is reaped the instant the next
+	// cleanup runs — including at every backend boot — even though it's
+	// seconds old. Young clients are never stale, regardless of token history.
+	// Native grants (client_credentials, jwt-bearer, token exchange, CIBA)
+	// record a native_tokens row but do not stamp last_token_issued_at, so
+	// a client used only through them looked stale and was deleted while
+	// in use (AS-037). Recent issuance in either place keeps it.
+	if err := r.db.WithContext(ctx).Where(
+		"registration_type = 'dcr' AND sync_status = ? AND created_at < ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)"+
+			" AND NOT EXISTS (SELECT 1 FROM native_tokens nt WHERE nt.client_id = mcp_oauth_clients.client_id AND nt.issued_at >= ?)",
+		models.MCPClientSyncActive,
+		cutoff,
+		cutoff,
+		cutoff,
+	).Find(&staleClients).Error; err != nil {
+		return 0, err
+	}
+	if len(staleClients) == 0 {
+		return 0, nil
+	}
+	log.Printf("[HydraReconciler] stale DCR cleanup: marking %d client(s) pending_delete (cutoff=%s)", len(staleClients), cutoff.Format(time.RFC3339))
+	for i := range staleClients {
+		c := &staleClients[i]
+		if err := r.db.WithContext(ctx).Model(c).Update("sync_status", models.MCPClientSyncPendingDelete).Error; err != nil {
+			log.Printf("[HydraReconciler] stale DCR: failed to mark pending_delete client_id=%s: %v", c.ClientID, err)
+		} else {
+			log.Printf("[HydraReconciler] stale DCR: marked pending_delete client_id=%s", c.ClientID)
+		}
+	}
+	return len(staleClients), nil
 }
 
 // runPendingApprovalExpiry auto-expires pending_approval registrations that
@@ -165,7 +180,7 @@ func (r *HydraReconciler) runPendingApprovalExpiry(ctx context.Context) {
 		}
 	}
 
-	expire()
+	RunAsLeader(ctx, r.db, "pending-approval-expiry", expire)
 	dailyTicker := time.NewTicker(24 * time.Hour)
 	defer dailyTicker.Stop()
 	for {
@@ -173,7 +188,7 @@ func (r *HydraReconciler) runPendingApprovalExpiry(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-dailyTicker.C:
-			expire()
+			RunAsLeader(ctx, r.db, "pending-approval-expiry", expire)
 		}
 	}
 }
@@ -283,7 +298,7 @@ func (r *HydraReconciler) runAccessRequestExpiryAndReminder(ctx context.Context)
 		}
 	}
 
-	run()
+	RunAsLeader(ctx, r.db, "access-request-expiry", run)
 	hourlyTicker := time.NewTicker(time.Hour)
 	defer hourlyTicker.Stop()
 	for {
@@ -291,7 +306,7 @@ func (r *HydraReconciler) runAccessRequestExpiryAndReminder(ctx context.Context)
 		case <-ctx.Done():
 			return
 		case <-hourlyTicker.C:
-			run()
+			RunAsLeader(ctx, r.db, "access-request-expiry", run)
 		}
 	}
 }
@@ -307,7 +322,7 @@ func (r *HydraReconciler) runPRMOverrideReverify(ctx context.Context) {
 			log.Printf("[HydraReconciler] PRM reverify: replaced=%d staled=%d", replaced, staled)
 		}
 	}
-	run()
+	RunAsLeader(ctx, r.db, "prm-reverify", run)
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
@@ -315,7 +330,7 @@ func (r *HydraReconciler) runPRMOverrideReverify(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			run()
+			RunAsLeader(ctx, r.db, "prm-reverify", run)
 		}
 	}
 }
