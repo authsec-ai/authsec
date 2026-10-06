@@ -84,9 +84,9 @@ Verified on 2026-10-06. Details and error output are in `docs/AUDIT.md` §3.
 
 ## 4. Multi-tenancy architecture (target state)
 
-Until `docs/adr/0001-tenancy-model.md` is approved, treat this section as the proposal.
+Decided in [`docs/adr/0001-tenancy-model.md`](docs/adr/0001-tenancy-model.md) (accepted 2026-10-06). In code the tenant is the **workspace** and the column is `workspace_id`; read "tenant_id" below as `workspace_id`.
 
-**Isolation model:** shared database, `tenant_id` column on every tenant-owned table. *Current state (Phase 0):* the codebase already uses one shared Postgres DB, with the tenant column named **`workspace_id`** (143 of 175 tables). The original DB-per-tenant design was removed in `764a654` and `05e289d`. The proposal is to keep shared-DB and keep the `workspace_id` name, pending ADR-0001.
+**Isolation model:** shared database, `tenant_id` column on every tenant-owned table. *Decided (ADR-0001):* shared Postgres DB, tenant column **`workspace_id`**, enforced by edge resolution in `AuthMiddleware`, a scoped data layer (`internal/tenancy`), and Postgres RLS (`app.workspace_id`, `FORCE`) as defense in depth.
 
 **Non-negotiable rules:**
 1. Every tenant-owned table has a non-null `tenant_id` with a foreign key and an index (usually composite, e.g. `(tenant_id, id)`).
@@ -153,3 +153,5 @@ Until `docs/adr/0001-tenancy-model.md` is approved, treat this section as the pr
 - 2026-10-06: The admin UI login relies on the unauthenticated `/uflow/login/webauthn-callback` (AS-001), so the backend and UI must be fixed together.
 - 2026-10-06: `../AGENTS.md` and `../.claude/DEFINITION-OF-DONE.md` (referenced by AGENTS.md) do not exist in `merger/`. Use §5 of this file as the definition of done.
 - 2026-10-06: Phase 0 audit complete. See `docs/AUDIT.md`, `docs/ISSUES.md`, `docs/PROGRESS.md`.
+- 2026-10-06: ADR-0001 accepted: shared DB + `workspace_id`; users belong to one workspace, operators may hold memberships; same-workspace check on every token issuance; separate platform realm; RLS rolled out per domain in Phase 3.
+- 2026-10-06: The owner asked to run all phases back to back, committing locally (never pushing). Work happens on local branches only; `authsec-staging` auto-deploys.
