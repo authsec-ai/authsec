@@ -1744,10 +1744,31 @@ func (s *OAuthASService) RevokeClientRegistration(rsID, clientID string) error {
 }
 
 // ApprovePendingRedirects copies pending redirect URIs to approved, updates Hydra, clears flag.
-func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
+//
+// The client is looked up by its public client_id, which is global. It must be
+// registered on rsID in workspaceID and must not be homed in another workspace;
+// otherwise it is not found (AS-027).
+func (s *OAuthASService) ApprovePendingRedirects(workspaceID uuid.UUID, rsID, clientID string) error {
+	rsUUID, err := uuid.Parse(rsID)
+	if err != nil {
+		return fmt.Errorf("invalid RS ID: %w", err)
+	}
 	client, err := s.authzCtx.GetMCPOAuthClientByClientID(clientID)
 	if err != nil {
 		return fmt.Errorf("client not found: %w", err)
+	}
+	if client.HomeWorkspaceID != nil && *client.HomeWorkspaceID != workspaceID {
+		return fmt.Errorf("client not found: %w", gorm.ErrRecordNotFound)
+	}
+	var registered int64
+	if err := s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND oauth_client_id = ? AND workspace_id = ? AND status <> ?",
+			rsUUID, client.ID, workspaceID, models.ClientRegStatusRevoked).
+		Count(&registered).Error; err != nil {
+		return err
+	}
+	if registered == 0 {
+		return fmt.Errorf("client not found: %w", gorm.ErrRecordNotFound)
 	}
 
 	if !client.RedirectReviewPending {

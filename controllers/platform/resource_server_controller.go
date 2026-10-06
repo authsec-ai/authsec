@@ -480,7 +480,7 @@ func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 	}
 
 	clientID := c.Param("client_id")
-	if err := ctrl.oauthSvc.ApprovePendingRedirects(clientID); err != nil {
+	if err := ctrl.oauthSvc.ApprovePendingRedirects(workspaceID, rsID, clientID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

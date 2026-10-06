@@ -31,6 +31,7 @@ func (ExternalService) TableName() string { return "services" }
 type ExternalServiceRepository interface {
 	Create(svc *ExternalService) error
 	GetByID(id string) (*ExternalService, error)
+	GetByIDForWorkspace(id, workspaceID string) (*ExternalService, error)
 	ListByClient(clientID string) ([]ExternalService, error)
 	Update(svc *ExternalService) error
 	Delete(id string) error
@@ -49,6 +50,25 @@ func (r *externalServiceRepository) Create(svc *ExternalService) error {
 func (r *externalServiceRepository) GetByID(id string) (*ExternalService, error) {
 	var svc ExternalService
 	err := r.db.First(&svc, "id = ?", id).Error
+	return &svc, err
+}
+
+// GetByIDForWorkspace loads a service only when its creator belongs to
+// workspaceID. The services table has no workspace column; created_by holds the
+// creator's token client_id, which is the workspace id itself (admin tokens), a
+// user's id or legacy client_id, or an OAuth client's client_id.
+func (r *externalServiceRepository) GetByIDForWorkspace(id, workspaceID string) (*ExternalService, error) {
+	var svc ExternalService
+	err := r.db.Where("id = ?", id).
+		Where(`(created_by = ?
+			OR EXISTS (SELECT 1 FROM users u WHERE u.workspace_id::text = ?
+				AND (u.id::text = services.created_by OR u.client_id::text = services.created_by))
+			OR EXISTS (SELECT 1 FROM workspace_memberships m WHERE m.workspace_id::text = ?
+				AND m.status = 'active' AND m.user_id::text = services.created_by)
+			OR EXISTS (SELECT 1 FROM mcp_oauth_clients c WHERE c.home_workspace_id::text = ?
+				AND c.client_id = services.created_by))`,
+			workspaceID, workspaceID, workspaceID, workspaceID).
+		First(&svc).Error
 	return &svc, err
 }
 

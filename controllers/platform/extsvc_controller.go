@@ -358,7 +358,7 @@ func (ctl *ExternalServiceController) DeleteExternalService(c *gin.Context) {
 
 // GetExternalServiceCredentials handles GET /authsec/services/:id/credentials.
 func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Context) {
-	tenantDB, clientID, _, err := ctl.resolveTenant(c)
+	tenantDB, clientID, workspaceID, err := ctl.resolveTenant(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -369,10 +369,15 @@ func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Conte
 	var svc *repositories.ExternalService
 
 	// SPIFFE JWT-SVID agents may access agent-accessible services directly,
-	// bypassing client ownership checks.
+	// bypassing client ownership checks, but only services created in the
+	// workspace whose trust bundle verified the SVID (AS-013).
 	authMethod, _ := c.Get("auth_method")
 	if authMethod == "spiffe-jwt-svid" {
-		svc, err = repo.GetByID(serviceID)
+		if svidWS := c.GetString("spiffe_workspace_id"); svidWS == "" || svidWS != workspaceID {
+			c.JSON(http.StatusNotFound, gin.H{"error": "service not found"})
+			return
+		}
+		svc, err = repo.GetByIDForWorkspace(serviceID, workspaceID)
 		if err != nil || !svc.AgentAccessible {
 			c.JSON(http.StatusNotFound, gin.H{"error": "service not found"})
 			return

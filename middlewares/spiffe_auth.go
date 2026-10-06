@@ -7,6 +7,7 @@ package middlewares
 //   - "claims"      – jwt.MapClaims of the verified token
 //   - "auth_method" – "spiffe-jwt-svid"
 //   - "spiffe_id"   – the sub claim (e.g. "spiffe://tenant-id/agent/...")
+//   - "spiffe_workspace_id" – the workspace whose JWKS verified the token
 //
 // Ported from external-service/middleware/spiffe_auth.go.
 
@@ -113,6 +114,8 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 		c.Set("claims", verifiedClaims)
 		c.Set("auth_method", "spiffe-jwt-svid")
 		c.Set("spiffe_id", sub)
+		// The workspace whose trust bundle verified the signature.
+		c.Set("spiffe_workspace_id", workspaceID)
 
 		c.Next()
 	}

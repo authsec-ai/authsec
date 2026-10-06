@@ -1464,6 +1464,12 @@ func SetupRoutes(
 		// permission-checked human can claim one into a governed identity. The worst
 		// case is a polluted Unregistered Agents report, not access.
 		//
+		// Partial containment (AS-014, DiscoveryController.ingressConnector): a
+		// connector may authenticate with its per-connector credential as the
+		// bearer token, which then decides the workspace and the connector; and
+		// a connector that holds a credential can no longer be spoken for
+		// without it. Uncredentialed connectors keep the trade-off above.
+		//
 		// Registered on its own group so it cannot accidentally inherit
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.

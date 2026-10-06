@@ -186,8 +186,11 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		}
 
 		// --- 2. the identity ------------------------------------------------
-		var client models.MCPOAuthClient
-		if err := tx.First(&client, "id = ?", *agent.MatchedClientID).Error; err != nil {
+		// matched_client_id was supplied by whoever claimed the agent, so the client
+		// must be this workspace's own; otherwise provisioning would take over another
+		// workspace's client (AS-026).
+		client, err := loadWorkspaceClient(tx, workspaceID, *agent.MatchedClientID)
+		if err != nil {
 			return fmt.Errorf("matched oauth client not found: %w", err)
 		}
 		result.OAuthClientID = client.ID
@@ -198,7 +201,7 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		// service_account — an oauth client is NOT a bindable principal. So every
 		// provisioned agent gets a paired service account, using the oauth_client_id
 		// column that already exists, and entitlements attach to that.
-		sa, created, err := m.ensureAnchor(tx, workspaceID, &agent, &client)
+		sa, created, err := m.ensureAnchor(tx, workspaceID, &agent, client)
 		if err != nil {
 			return err
 		}
@@ -471,6 +474,17 @@ func anchorName(agent *models.DiscoveredAgent, client *models.MCPOAuthClient) st
 	return fmt.Sprintf("agent-%s-%s", base, fp)
 }
 
+// loadWorkspaceClient loads an OAuth client only when workspaceID is its home
+// workspace. mcp_oauth_clients is shared by every workspace, so a client homed
+// elsewhere, or not yet bound anywhere, is reported as not found.
+func loadWorkspaceClient(tx *gorm.DB, workspaceID, clientID uuid.UUID) (*models.MCPOAuthClient, error) {
+	var client models.MCPOAuthClient
+	if err := tx.First(&client, "id = ? AND home_workspace_id = ?", clientID, workspaceID).Error; err != nil {
+		return nil, err
+	}
+	return &client, nil
+}
+
 /* ------------------------------ deprovision ----------------------------- */
 
 func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionInput) (*DeprovisionResult, error) {
@@ -508,6 +522,15 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 		var client models.MCPOAuthClient
 		if err := tx.First(&client, "id = ?", clientID).Error; err != nil {
 			return fmt.Errorf("oauth client not found: %w", err)
+		}
+		// mcp_oauth_clients is shared by every workspace. A client this workspace
+		// does not own can only reach here through a claimed agent whose
+		// matched_client_id named it, and is not found (AS-026). An internal caller
+		// holding a foreign client (a cross-workspace connection failing
+		// certification) may only take away what this workspace granted.
+		owned := client.HomeWorkspaceID != nil && *client.HomeWorkspaceID == workspaceID
+		if !owned && in.OAuthClientID == nil {
+			return fmt.Errorf("oauth client not found: %w", gorm.ErrRecordNotFound)
 		}
 
 		// The paired anchors. Plural deliberately: nothing stops an older path having
@@ -576,8 +599,11 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 		// 4. Registrations: revoke rather than delete, so the history of the agent
 		// having been connected survives.
 		var regs []models.ResourceServerClientRegistration
-		if err := tx.Where("oauth_client_id = ? AND status <> ?", clientID, models.ClientRegStatusRevoked).
-			Find(&regs).Error; err != nil {
+		regQuery := tx.Where("oauth_client_id = ? AND status <> ?", clientID, models.ClientRegStatusRevoked)
+		if !owned {
+			regQuery = regQuery.Where("workspace_id = ?", workspaceID)
+		}
+		if err := regQuery.Find(&regs).Error; err != nil {
 			return fmt.Errorf("find registrations: %w", err)
 		}
 		for _, reg := range regs {
@@ -603,20 +629,25 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 			res.RegistrationsRevoked++
 		}
 
-		// 5. The identity itself.
-		if uerr := tx.Model(&models.MCPOAuthClient{}).Where("id = ?", clientID).
-			Update("governance_status", models.GovernanceStatusDeprovisioned).Error; uerr != nil {
-			return fmt.Errorf("set governance status: %w", uerr)
+		// 5. The identity itself, when it is this workspace's to retire.
+		if owned {
+			if uerr := tx.Model(&models.MCPOAuthClient{}).Where("id = ?", clientID).
+				Update("governance_status", models.GovernanceStatusDeprovisioned).Error; uerr != nil {
+				return fmt.Errorf("set governance status: %w", uerr)
+			}
 		}
 
 		// 6. Zero-residual check. Asserting the outcome rather than assuming it is the
 		// difference between "we revoked" and "we ran some statements".
 		var residual int64
-		if err := tx.Model(&models.RoleBinding{}).
+		residualQuery := tx.Model(&models.RoleBinding{}).
 			Joins("JOIN service_accounts sa ON sa.id = role_bindings.service_account_id").
 			Where("sa.oauth_client_id = ? AND (role_bindings.expires_at IS NULL OR role_bindings.expires_at > NOW())",
-				clientID).
-			Count(&residual).Error; err != nil {
+				clientID)
+		if !owned {
+			residualQuery = residualQuery.Where("role_bindings.workspace_id = ?", workspaceID)
+		}
+		if err := residualQuery.Count(&residual).Error; err != nil {
 			return fmt.Errorf("residual check: %w", err)
 		}
 		res.ResidualBindings = int(residual)

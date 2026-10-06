@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -58,6 +59,16 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		return
 	}
 
+	// Only the user who delegated the token, or a workspace owner/admin, may
+	// read it; any other member sees the same 404 as no token at all (AS-025).
+	if !sc.mayReadDelegationToken(c, *workspaceID, &dt) {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "No active delegation token found",
+			"details": "An admin must delegate a token first via POST /uflow/admin/agents/:id/delegate-token",
+		})
+		return
+	}
+
 	// Check expiry
 	if dt.IsExpired() {
 		// Mark as expired
@@ -83,6 +94,24 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		"issued_at":    dt.CreatedAt,
 		"updated_at":   dt.UpdatedAt,
 	})
+}
+
+// mayReadDelegationToken reports whether the authenticated caller delegated dt
+// or holds the owner or admin role in workspaceID.
+func (sc *SDKTokenController) mayReadDelegationToken(c *gin.Context, workspaceID uuid.UUID, dt *models.DelegationToken) bool {
+	raw, err := middlewares.ResolveUserID(c)
+	if err != nil {
+		return false
+	}
+	userID, err := uuid.Parse(raw)
+	if err != nil || userID == uuid.Nil {
+		return false
+	}
+	if userID == dt.DelegatedBy {
+		return true
+	}
+	isAdmin, err := middlewares.HasWorkspaceRole(workspaceID, userID, "owner", "admin")
+	return err == nil && isAdmin
 }
 
 // RevokeDelegationToken revokes the active delegation token for an AI agent.
@@ -119,4 +148,3 @@ func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
 		"message":   "Delegation token revoked successfully",
 	})
 }
-

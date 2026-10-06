@@ -933,6 +933,17 @@ func (m *discoveryManager) ClaimAgent(workspaceID, agentID uuid.UUID, in ClaimIn
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		// A caller-supplied identity must be one of this workspace's own clients;
+		// binding another workspace's client here lets provision/deprovision take
+		// it over or revoke it (AS-026).
+		db := m.repo.DB()
+		if db == nil {
+			return nil, errors.New("cannot verify matched_client_id without a database handle")
+		}
+		if _, err := loadWorkspaceClient(db, workspaceID, clientID); err != nil {
+			return nil, fmt.Errorf("matched_client_id is not a client of this workspace: %w", err)
+		}
 	}
 
 	return m.repo.ClaimAgent(repositories.ClaimAgentInput{
