@@ -94,6 +94,11 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		// Set all context values expected by downstream consumers
 		setContextValues(c, claims, info)
 
+		// A request may only name the workspace its token was issued for.
+		if !enforceTokenWorkspace(c, info.WorkspaceID) {
+			return
+		}
+
 		// Check admin access for admin paths (server auth)
 		if cfg.RequireServerAuth {
 			path := c.FullPath()
