@@ -1,6 +1,7 @@
 package tenancy
 
 import (
+	"context"
 	"errors"
 	"net/http/httptest"
 	"strings"
@@ -115,6 +116,36 @@ func TestHTTPStatus(t *testing.T) {
 	}
 }
 
+func dryRunDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(postgres.New(postgres.Config{DSN: "host=invalid"}), &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// A scoped handle is reused for several queries in one handler; conditions of
+// one query must not carry into the next.
+func TestDBIsReusable(t *testing.T) {
+	c := testContext()
+	Set(c, Context{WorkspaceID: uuid.New()})
+	scoped, err := DB(c, dryRunDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := scoped.Where("id = ?", 1).Find(&[]row{}).Statement.SQL.String()
+	second := scoped.Where("name = ?", "x").Find(&[]row{}).Statement.SQL.String()
+	if strings.Contains(second, "WHERE id = $") || !strings.Contains(second, "name = $") {
+		t.Fatalf("second query inherited the first one's conditions:\n%s\n%s", first, second)
+	}
+	for _, q := range []string{first, second} {
+		if !strings.Contains(q, "workspace_id = $") {
+			t.Fatalf("workspace predicate missing: %s", q)
+		}
+	}
+}
+
 func TestWorkspace(t *testing.T) {
 	c := testContext()
 	if _, err := Workspace(c); !errors.Is(err, ErrNoTenant) {
@@ -124,5 +155,31 @@ func TestWorkspace(t *testing.T) {
 	Set(c, Context{WorkspaceID: ws})
 	if got, err := Workspace(c); err != nil || got != ws {
 		t.Fatalf("Workspace = %v, %v; want %v", got, err, ws)
+	}
+}
+
+func TestContextFormsUseTheContextTenant(t *testing.T) {
+	ctx := context.Background()
+	if _, err := DBContext(ctx, dryRunDB(t)); !errors.Is(err, ErrNoTenant) {
+		t.Fatalf("DBContext without tenant: want ErrNoTenant, got %v", err)
+	}
+	if _, err := QueryContext(ctx, nil, "SELECT 1 FROM users WHERE workspace_id = $1"); !errors.Is(err, ErrNoTenant) {
+		t.Fatalf("QueryContext without tenant: want ErrNoTenant, got %v", err)
+	}
+	if _, err := ExecContext(ctx, nil, "DELETE FROM users WHERE workspace_id = $1"); !errors.Is(err, ErrNoTenant) {
+		t.Fatalf("ExecContext without tenant: want ErrNoTenant, got %v", err)
+	}
+	ws := uuid.New()
+	ctx = WithContext(ctx, Context{WorkspaceID: ws})
+	if err := QueryRowContext(ctx, nil, "SELECT 1 FROM users WHERE id = $1", nil); !errors.Is(err, ErrUnscopedQuery) {
+		t.Fatalf("unscoped statement: want ErrUnscopedQuery, got %v", err)
+	}
+	scoped, err := DBContext(ctx, dryRunDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := scoped.Find(&[]row{}).Statement
+	if len(stmt.Vars) != 1 || stmt.Vars[0] != ws {
+		t.Fatalf("workspace from ctx not bound: %v", stmt.Vars)
 	}
 }

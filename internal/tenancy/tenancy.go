@@ -10,6 +10,10 @@
 //   - lookups by id: tenancy.Get(c, config.DB, &model, id)  -> ErrNotFound for other workspaces
 //   - RLS:           tenancy.WithTx(ctx, db, ws, func(tx *sql.Tx) error { ... })
 //
+// Repositories and services below the HTTP layer use the context.Context
+// forms (DBContext, QueryContext, ExecContext, QueryRowContext) with the
+// request's context, which carries the same tenant context.
+//
 // A raw query that deliberately bypasses this package must carry a
 // "// TENANT-EXEMPT: <reason>" comment (see scripts/check-tenant-exempt.sh).
 package tenancy
@@ -86,13 +90,21 @@ func Scope(workspaceID uuid.UUID) func(*gorm.DB) *gorm.DB {
 	}
 }
 
-// DB returns db restricted to the request's workspace.
+// DB returns db restricted to the request's workspace. The result is a new
+// session, so it can be reused for several queries without one query's
+// conditions leaking into the next.
 func DB(c *gin.Context, db *gorm.DB) (*gorm.DB, error) {
-	tc, err := From(c)
+	return DBContext(c.Request.Context(), db)
+}
+
+// DBContext is DB for code below the HTTP layer: the workspace comes from the
+// tenant context carried by ctx (see WithContext).
+func DBContext(ctx context.Context, db *gorm.DB) (*gorm.DB, error) {
+	tc, err := FromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return db.WithContext(c.Request.Context()).Scopes(Scope(tc.WorkspaceID)), nil
+	return db.WithContext(ctx).Scopes(Scope(tc.WorkspaceID)).Session(&gorm.Session{}), nil
 }
 
 // Get loads the row with primary key id into dst, only if it belongs to the
@@ -129,39 +141,55 @@ type Querier interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
-func scopedArgs(c *gin.Context, query string, args []interface{}) (context.Context, []interface{}, error) {
+func scopedArgs(ctx context.Context, query string, args []interface{}) ([]interface{}, error) {
 	if err := CheckScoped(query); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	tc, err := From(c)
+	tc, err := FromContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return c.Request.Context(), append([]interface{}{tc.WorkspaceID}, args...), nil
+	return append([]interface{}{tc.WorkspaceID}, args...), nil
 }
 
 // Query runs a statement whose $1 is the request's workspace; args start at $2.
 func Query(c *gin.Context, q Querier, query string, args ...interface{}) (*sql.Rows, error) {
-	ctx, all, err := scopedArgs(c, query, args)
+	return QueryContext(c.Request.Context(), q, query, args...)
+}
+
+// Exec runs a statement whose $1 is the request's workspace; args start at $2.
+func Exec(c *gin.Context, q Querier, query string, args ...interface{}) (sql.Result, error) {
+	return ExecContext(c.Request.Context(), q, query, args...)
+}
+
+// QueryRow scans one row of a statement whose $1 is the request's workspace.
+// No row (including another workspace's) is ErrNotFound.
+func QueryRow(c *gin.Context, q Querier, query string, args []interface{}, dest ...interface{}) error {
+	return QueryRowContext(c.Request.Context(), q, query, args, dest...)
+}
+
+// QueryContext is Query for code below the HTTP layer (repositories,
+// services): the workspace comes from the tenant context carried by ctx.
+func QueryContext(ctx context.Context, q Querier, query string, args ...interface{}) (*sql.Rows, error) {
+	all, err := scopedArgs(ctx, query, args)
 	if err != nil {
 		return nil, err
 	}
 	return q.QueryContext(ctx, query, all...)
 }
 
-// Exec runs a statement whose $1 is the request's workspace; args start at $2.
-func Exec(c *gin.Context, q Querier, query string, args ...interface{}) (sql.Result, error) {
-	ctx, all, err := scopedArgs(c, query, args)
+// ExecContext is Exec for code below the HTTP layer.
+func ExecContext(ctx context.Context, q Querier, query string, args ...interface{}) (sql.Result, error) {
+	all, err := scopedArgs(ctx, query, args)
 	if err != nil {
 		return nil, err
 	}
 	return q.ExecContext(ctx, query, all...)
 }
 
-// QueryRow scans one row of a statement whose $1 is the request's workspace.
-// No row (including another workspace's) is ErrNotFound.
-func QueryRow(c *gin.Context, q Querier, query string, args []interface{}, dest ...interface{}) error {
-	ctx, all, err := scopedArgs(c, query, args)
+// QueryRowContext is QueryRow for code below the HTTP layer.
+func QueryRowContext(ctx context.Context, q Querier, query string, args []interface{}, dest ...interface{}) error {
+	all, err := scopedArgs(ctx, query, args)
 	if err != nil {
 		return err
 	}
