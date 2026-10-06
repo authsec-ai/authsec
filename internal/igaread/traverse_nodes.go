@@ -39,25 +39,30 @@ import (
 // predicate, so the root of a request and every node a level reaches are held
 // to the same rule.
 //
-// Of the traversal's provider only (traverse_k8s.go): before the root is read
-// the provider is not known, and the root is looked for among AWS's nodes,
-// then Kubernetes'.
+// Each node is read as the provider the edge that reached it is of (want,
+// traverse_k8s.go, traverse_cross.go); a root's provider is not known, and it
+// is looked for among AWS's nodes, then Kubernetes'.
 func (t *graphTraversal) fetchNodes(lv *graphLevel, nodes []*GraphNode) error {
-	if t.provider != models.ProviderK8s {
-		if err := t.fetchAWSNodes(lv, nodes); err != nil {
+	var aws, k8s []*GraphNode
+	for _, n := range nodes {
+		if n.want == models.ProviderK8s {
+			k8s = append(k8s, n)
+		} else {
+			aws = append(aws, n)
+		}
+	}
+	if len(aws) > 0 {
+		if err := t.fetchAWSNodes(lv, aws); err != nil {
 			return err
 		}
 	}
-	if t.provider != models.ProviderAWS {
-		var rest []*GraphNode
-		for _, n := range nodes {
-			if !n.fetched {
-				rest = append(rest, n)
-			}
+	for _, n := range aws {
+		if !n.fetched && n.want == "" {
+			k8s = append(k8s, n)
 		}
-		if len(rest) > 0 {
-			return t.fetchK8sNodes(lv, rest)
-		}
+	}
+	if len(k8s) > 0 {
+		return t.fetchK8sNodes(lv, k8s)
 	}
 	return nil
 }
@@ -199,6 +204,19 @@ func (t *graphTraversal) fetchExternal(lv *graphLevel, ids []uuid.UUID, set map[
 	                   WHERE ep.workspace_id = ? AND ep.id IN ?`, t.q.WS, ids).Scan(&rows).Error; err != nil {
 		return err
 	}
+	// A principal that may name a Kubernetes ServiceAccount needs the
+	// request's read-time resolutions (traverse_cross.go).
+	var cross *graphCross
+	for _, r := range rows {
+		if r.ResolutionBasis == "" &&
+			(r.Mechanism == models.ExternalPrincipalOIDC || r.Mechanism == models.ExternalPrincipalK8sServiceAccount) {
+			if err := t.loadCross(lv); err != nil {
+				return err
+			}
+			cross = t.cross
+			break
+		}
+	}
 	for _, r := range rows {
 		n := set[r.ID]
 		n.Kind, n.key = RefExternalPrincipal, r.SourceKey
@@ -208,6 +226,15 @@ func (t *graphTraversal) fetchExternal(lv *graphLevel, ids []uuid.UUID, set map[
 		// lifecycle is derived, by the detail route's own rule (D-47,
 		// ExternalLifecycleOf): every node on the canvas states one (D-98).
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, ExternalLifecycleOf(r.State), TS(r.LastConfirmedAt)
+		if r.ResolutionBasis == "" && cross != nil {
+			// D-108: the read-time resolution of a principal that names a
+			// Kubernetes ServiceAccount. Where the principal is a node (the
+			// request named it), it is displayed and not walked, as D-87's.
+			if m, ok := cross.match(r.ID); ok {
+				n.Resolution = crossResolution(m)
+				n.resolvedTo = R(RefIdentity, m.identity)
+			}
+		}
 		if r.ResolutionBasis != "" {
 			// D-87. A resolution is DISPLAYED, never followed: an external
 			// principal is a terminal node (§5.4), and its edges keep their
@@ -496,9 +523,15 @@ func graphDedupe(xs []string) []string {
 // identity restrictions and used-by counts, statement targets, group keys and
 // exclusions, and stale reasons. Their limitations follow
 // (decorateLimitations), in one call with the level's edges.
+//
+// Each provider's nodes by its own decorations: Kubernetes nodes by
+// decorateK8sNodes, the rest as below.
 func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error {
-	if t.provider == models.ProviderK8s {
-		return t.decorateK8sNodes(lv, nodes)
+	nodes, k8s := graphSplitNodes(nodes)
+	if len(k8s) > 0 {
+		if err := t.decorateK8sNodes(lv, k8s); err != nil {
+			return err
+		}
 	}
 	byType := map[string][]*GraphNode{}
 	for _, n := range nodes {

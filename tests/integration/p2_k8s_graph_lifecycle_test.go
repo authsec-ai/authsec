@@ -197,27 +197,33 @@ func TestP2K8sGraphLeavesAWSUnchanged(t *testing.T) {
 		}
 	}
 
-	// The Kubernetes root reads the same snapshot: rev is the AWS
-	// publication's (reported), graph_state says its rows have none.
+	// The Kubernetes root reads the same snapshot, but neither pins nor
+	// reports the AWS publication (D-111): rev and published_at null,
+	// graph_state says its rows have none -- and a rev= on it, current or
+	// not, is ignored rather than 409.
 	kb := graphGet(t, api, "/graph"+k8sQS("root", f.workload, "direction", "forward"))
 	contractCheck(t, "GET /graph (k8s beside AWS)", kb, contractK8sGraph)
 	awsBody := graphGet(t, api, awsCalls[0])
-	if dig(kb, "meta", "rev") == nil || dig(kb, "meta", "rev") != dig(awsBody, "meta", "rev") ||
+	if dig(kb, "meta", "rev") != nil || dig(kb, "meta", "published_at") != nil || dig(awsBody, "meta", "rev") == nil ||
 		digs(kb, "meta", "graph_state") != "unrevisioned" {
-		t.Errorf("k8s meta = %v, want the AWS rev reported and graph_state unrevisioned", kb["meta"])
+		t.Errorf("k8s meta = %v, want rev and published_at null and graph_state unrevisioned", kb["meta"])
 	}
 	if graphMentions(t, kb, ticket) || graphMentions(t, kb, role) {
 		t.Error("the Kubernetes walk reaches an AWS node")
 	}
 
-	// A path is searched within its `from`'s provider; the other provider's
-	// `to` is not a node of it.
+	// A path between the two providers' nodes runs only through a crossing
+	// (D-108), and there is none here: both ends are read, both frontiers
+	// are exhausted, none_exists -- a mixed response with the AWS rev.
 	for _, p := range []string{
 		"/graph/path" + k8sQS("from", ticket, "to", f.secretRule),
 		"/graph/path" + k8sQS("from", f.workload, "to", role),
 	} {
-		if code, body := api.get(p); code != http.StatusNotFound {
-			t.Errorf("GET %s = %d %v, want 404", p, code, body)
+		code, body := api.get(p)
+		mustStatus(t, p, code, body, http.StatusOK)
+		if digs(body, "data", "outcome") != "none_exists" || digs(body, "meta", "graph_state") != "mixed" ||
+			dig(body, "meta", "rev") != dig(awsBody, "meta", "rev") {
+			t.Errorf("GET %s = %v, want none_exists in a mixed response at the AWS rev", p, body)
 		}
 	}
 
