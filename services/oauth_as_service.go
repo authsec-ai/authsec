@@ -144,7 +144,9 @@ func (s *OAuthASService) m2mGrantTypes() []string {
 // m2mTokenAuthMethods returns the token_endpoint_auth_methods_supported list.
 // private_key_jwt and client_secret_basic are only advertised when XAA_M2M is on.
 func (s *OAuthASService) m2mTokenAuthMethods() []string {
-	base := []string{"none", "client_secret_basic", "client_secret_post"}
+	// client_secret_post is not implemented by the token endpoint's client
+	// authentication (services/client_auth.go), so it is not advertised (AS-096).
+	base := []string{"none", "client_secret_basic"}
 	if config.AppConfig != nil && config.AppConfig.XAAm2m {
 		base = append(base, "private_key_jwt")
 	}
@@ -2200,7 +2202,11 @@ func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
 // Redirect URIs are callback identifiers — the AS never fetches them server-side during
 // the OAuth flow, so SSRF IP-blocklists do NOT apply here. Validation is structural only:
 // absolute URL, no fragment, https scheme (or http for localhost in dev).
-func validateRedirectURIs(uris []string) error {
+func validateRedirectURIs(uris []string) error { return ValidateRedirectURIs(uris) }
+
+// ValidateRedirectURIs is the redirect URI rule shared by every registration
+// path (DCR, PUT, CIMD, review approval).
+func ValidateRedirectURIs(uris []string) error {
 	for _, raw := range uris {
 		u, err := url.Parse(raw)
 		if err != nil || !u.IsAbs() {

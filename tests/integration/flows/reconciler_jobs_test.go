@@ -83,3 +83,42 @@ func Test_RunAsLeader_IsExclusive(t *testing.T) {
 		t.Fatalf("lock was not released: runs=%d", got)
 	}
 }
+
+// AS-096: expired replay-guard and revocation rows are pruned; live ones stay.
+func Test_ReplayCachePrune_RemovesOnlyExpiredRows(t *testing.T) {
+	n := nonce(t)
+	rows := []struct {
+		jti string
+		exp time.Time
+	}{{n + "-old", time.Now().Add(-3 * time.Hour)}, {n + "-live", time.Now().Add(time.Hour)}}
+	for _, row := range rows {
+		for _, q := range []string{
+			`INSERT INTO client_assertion_replay_cache (client_id, jti, expires_at) VALUES (?, ?, ?)`,
+			`INSERT INTO id_jag_replay_cache (iss, jti, expires_at) VALUES (?, ?, ?)`,
+			`INSERT INTO revoked_tokens (iss, kind, jti, expires_at) VALUES (?, 'access_token', ?, ?)`,
+		} {
+			if err := config.DB.Exec(q, "prune-"+n, row.jti, row.exp).Error; err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		if err := config.DB.Exec(`INSERT INTO revoked_session_tokens (jti, expires_at) VALUES (?, ?)`, row.jti, row.exp).Error; err != nil {
+			t.Fatalf("seed revoked_session_tokens: %v", err)
+		}
+	}
+
+	r := services.NewHydraReconciler(config.DB, time.Minute)
+	if _, err := r.PruneReplayCaches(context.Background()); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	for _, table := range []string{"client_assertion_replay_cache", "id_jag_replay_cache", "revoked_tokens", "revoked_session_tokens"} {
+		var old, live int64
+		config.DB.Table(table).Where("jti = ?", n+"-old").Count(&old)
+		config.DB.Table(table).Where("jti = ?", n+"-live").Count(&live)
+		if old != 0 {
+			t.Errorf("%s: expired row not pruned", table)
+		}
+		if live != 1 {
+			t.Errorf("%s: live row removed (count %d)", table, live)
+		}
+	}
+}

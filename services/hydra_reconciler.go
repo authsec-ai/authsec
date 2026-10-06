@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -60,6 +61,7 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 	go r.runPendingApprovalExpiry(ctx)
 	go r.runAccessRequestExpiryAndReminder(ctx)
 	go r.runPRMOverrideReverify(ctx)
+	go r.runReplayCachePrune(ctx)
 
 	// First pass immediately so a restart picks up any in-flight failures
 	// without waiting for the first interval.
@@ -148,6 +150,61 @@ func (r *HydraReconciler) MarkStaleDCRClients(ctx context.Context, staleDays int
 		}
 	}
 	return len(staleClients), nil
+}
+
+// replayPruneTables are replay-guard and revocation tables whose rows are
+// only meaningful until the underlying token expires (AS-096).
+var replayPruneTables = []string{
+	"client_assertion_replay_cache",
+	"id_jag_replay_cache",
+	"revoked_tokens",
+	"revoked_session_tokens",
+}
+
+// replayPruneGrace keeps rows past expires_at for clock skew between this
+// server and token issuers; verifier leeway is well under this.
+const replayPruneGrace = time.Hour
+
+// PruneReplayCaches deletes expired rows from the replay and revocation
+// tables and returns how many it removed.
+func (r *HydraReconciler) PruneReplayCaches(ctx context.Context) (int64, error) {
+	cutoff := time.Now().Add(-replayPruneGrace)
+	var total int64
+	for _, table := range replayPruneTables {
+		// TENANT-EXEMPT: platform retention job across all workspaces; table names are constants.
+		res := r.db.WithContext(ctx).Exec(`DELETE FROM `+table+` WHERE expires_at < ?`, cutoff)
+		if res.Error != nil {
+			return total, fmt.Errorf("prune %s: %w", table, res.Error)
+		}
+		total += res.RowsAffected
+	}
+	return total, nil
+}
+
+// runReplayCachePrune prunes the replay/revocation tables hourly, on one
+// replica only.
+func (r *HydraReconciler) runReplayCachePrune(ctx context.Context) {
+	run := func() {
+		n, err := r.PruneReplayCaches(ctx)
+		if err != nil {
+			log.Printf("[HydraReconciler] replay cache prune failed: %v", err)
+			return
+		}
+		if n > 0 {
+			log.Printf("[HydraReconciler] replay cache prune: removed %d expired row(s)", n)
+		}
+	}
+	RunAsLeader(ctx, r.db, "replay-cache-prune", run)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			RunAsLeader(ctx, r.db, "replay-cache-prune", run)
+		}
+	}
 }
 
 // runPendingApprovalExpiry auto-expires pending_approval registrations that

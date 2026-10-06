@@ -3167,14 +3167,12 @@ func isExpiryOnlyError(err error) bool {
 
 // --- Helpers ---
 
+// isValidRedirectURI applies the same structural rule as the PUT/CIMD paths
+// (services.ValidateRedirectURIs): an absolute URL without a fragment, https,
+// or http only when the host is exactly a loopback name. A prefix match let
+// http://localhost.evil.com through (AS-096).
 func isValidRedirectURI(uri string) bool {
-	if strings.HasPrefix(uri, "https://") {
-		return true
-	}
-	if strings.HasPrefix(uri, "http://localhost") || strings.HasPrefix(uri, "http://127.0.0.1") {
-		return true
-	}
-	return false
+	return services.ValidateRedirectURIs([]string{uri}) == nil
 }
 
 func containsString(slice []string, s string) bool {
