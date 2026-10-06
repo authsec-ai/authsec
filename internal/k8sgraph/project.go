@@ -17,9 +17,13 @@
 //   - It does not expand wildcards. A rule granting `*` on `*` is stored as
 //     `*`, not as every verb on every resource that happens to exist today. The
 //     rule is the fact; an expansion is an interpretation with an expiry date.
-//   - It does not evaluate conditions, because Kubernetes RBAC has none — which
-//     is worth saying, since the absence is what makes an observed binding
-//     genuinely effective rather than merely configured.
+//   - It does not EVALUATE access. A grant records what RBAC declares -- this
+//     subject is bound to this rule -- and nothing more. Whether a request
+//     would actually succeed also depends on admission control, token
+//     automount and audiences, and resourceNames semantics, none of which is
+//     read here. So every grant is basis 'declared', calculation_state
+//     'partial', effective_conclusion 'unknown': honest about being a
+//     configuration fact rather than an evaluated decision.
 //   - It writes NO iga_agents or iga_agent_instances rows. See the note on
 //     Project.
 package k8sgraph
@@ -169,26 +173,77 @@ type Assignment struct {
 }
 
 // Edge is one subject→statement grant.
+//
+// Every Kubernetes grant is DECLARED, NOT EVALUATED: RBAC says what is
+// allowed, but admission control, token automount and audiences, and
+// resourceNames semantics are not evaluated, so no grant may claim to be
+// effective. A resolved chain (binding → role → rule) carries a StatementKey;
+// an unresolved one (the role was not in the snapshot) carries none. Both are
+// calculation_state 'partial' and effective_conclusion 'unknown' -- the
+// difference between them is the missing statement, not a stronger claim.
 type Edge struct {
 	SourceKey     string
 	SubjectKey    string
 	PolicyKey     string
 	StatementKey  string
 	AssignmentKey string
-	// CalculationState is "complete" only when the whole chain resolved:
-	// binding → roleRef → role → rule. A binding whose role is missing from the
-	// snapshot is "partial", and its conclusion is "unknown".
+	// CalculationState is always GrantCalculation (see above).
 	CalculationState string
-	// EffectiveConclusion is "effective" for a resolved chain.
-	//
-	// That is a stronger claim than the AWS projector can make, and it is
-	// defensible for exactly one reason: Kubernetes RBAC is PURELY ADDITIVE.
-	// There are no deny rules and no conditions, so a rule reachable from a
-	// subject is a rule the API server will honour. Nothing else in the snapshot
-	// could take it away — missing data could only add MORE access, never remove
-	// this. (Admission control can still refuse the action, but that is a
-	// different layer and is not an authorization decision.)
+	// EffectiveConclusion is always GrantConclusion (see above).
 	EffectiveConclusion string
+}
+
+// Grant honesty for every Kubernetes access edge. The service writes these
+// together; the access-edge honesty CHECK allows an 'unknown' conclusion from
+// any calculation state.
+const (
+	GrantBasis       = models.BasisDeclared
+	GrantCalculation = "partial"
+	GrantConclusion  = "unknown"
+)
+
+// Membership is a ServiceAccount's membership of one of the groups Kubernetes
+// puts every ServiceAccount in implicitly:
+//
+//	system:serviceaccounts          every ServiceAccount
+//	system:serviceaccounts:<ns>     every ServiceAccount in <ns>
+//	system:authenticated            every authenticated principal
+//
+// A binding to one of these groups grants to the ServiceAccount, and the
+// snapshot never says so: Kubernetes has no membership objects to list. It is
+// written as an iga_relationship member_of row (ServiceAccount → group) ONLY
+// for groups some binding in the snapshot names -- a group nobody grants to
+// adds nothing to anyone's access, and creating it would fill the graph with
+// nodes that mean nothing.
+type Membership struct {
+	SourceKey string
+	MemberKey string // the ServiceAccount identity
+	GroupKey  string // the Group identity
+	// Namespace is the ServiceAccount's namespace, which owns the row's
+	// partition (see TargetMemberOf).
+	Namespace string
+}
+
+// Implicit group names.
+const (
+	GroupAllServiceAccounts = "system:serviceaccounts"
+	GroupAuthenticated      = "system:authenticated"
+)
+
+// NamespaceServiceAccountsGroup is the implicit group of every ServiceAccount
+// in one namespace.
+func NamespaceServiceAccountsGroup(ns string) string {
+	return GroupAllServiceAccounts + ":" + ns
+}
+
+// GroupKey identifies a Group subject.
+func GroupKey(cluster, name string) string {
+	return SubjectKey(cluster, models.K8sSubject{Kind: models.K8sSubjectGroup, Name: name})
+}
+
+// MemberOfKey names a member_of relationship by its endpoints.
+func MemberOfKey(memberKey, groupKey string) string {
+	return models.RelTypeMemberOf + Sep + memberKey + Sep + groupKey
 }
 
 // Result is everything one snapshot projects to.
@@ -198,7 +253,10 @@ type Result struct {
 	Statements  []Statement
 	Assignments []Assignment
 	Edges       []Edge
-	// Unresolved names bindings whose roleRef was not in the snapshot. Reported
+	Memberships []Membership
+	// Unresolved names bindings whose roleRef was not in the snapshot, and
+	// ServiceAccount subjects that cannot be placed in a namespace (one with no
+	// namespace under a ClusterRoleBinding). Reported
 	// rather than dropped: on a complete sweep it means a binding references a
 	// role that does not exist (harmless but worth seeing), and on a partial one
 	// it is the visible edge of what was missed.
@@ -236,19 +294,26 @@ func Project(snap models.K8sRBACSnapshot) Result {
 	}
 
 	for _, sa := range snap.ServiceAccounts {
+		attrs := map[string]any{
+			"cluster":   cluster,
+			"namespace": sa.Namespace,
+			"name":      sa.Name,
+			"uid":       sa.UID,
+			// Names only. The agent never reads the Secret.
+			"token_secret_names": sa.Secrets,
+		}
+		// The IRSA role annotation, when present: the AWS role a Pod running
+		// as this account can assume. Absent rather than "" when there is
+		// none, so a removed annotation leaves no stale value behind.
+		if arn := strings.TrimSpace(sa.AWSRoleARN); arn != "" {
+			attrs["aws_role_arn"] = arn
+		}
 		addIdentity(
 			ServiceAccountKey(cluster, sa.Namespace, sa.Name),
 			models.K8sAccountKindServiceAccount,
 			sa.Anchor,
 			sa.Namespace,
-			map[string]any{
-				"cluster":   cluster,
-				"namespace": sa.Namespace,
-				"name":      sa.Name,
-				"uid":       sa.UID,
-				// Names only. The agent never reads the Secret.
-				"token_secret_names": sa.Secrets,
-			},
+			attrs,
 		)
 	}
 
@@ -295,6 +360,7 @@ func Project(snap models.K8sRBACSnapshot) Result {
 	}
 
 	// --- bindings, and the edges they imply ---------------------------------
+	namedGroups := map[string]bool{}
 	for _, b := range snap.Bindings {
 		bindingKey := BindingKey(cluster, b)
 		roleKey := RoleRefKey(cluster, b)
@@ -310,6 +376,22 @@ func Project(snap models.K8sRBACSnapshot) Result {
 		}
 
 		for _, s := range b.Subjects {
+			if s.Kind == models.K8sSubjectServiceAccount && s.Namespace == "" {
+				// Kubernetes resolves a RoleBinding's ServiceAccount subject
+				// with no namespace in the RoleBinding's own namespace. Under a
+				// ClusterRoleBinding there is no namespace to take and the API
+				// server grants to nobody -- so it is unresolved, never the
+				// phantom "system:serviceaccount::name".
+				if b.Namespace == "" {
+					res.Unresolved = append(res.Unresolved,
+						bindingKey+" -> serviceaccount with no namespace: "+s.Name)
+					continue
+				}
+				s.Namespace = b.Namespace
+			}
+			if s.Kind == models.K8sSubjectGroup {
+				namedGroups[s.Name] = true
+			}
 			subjectKey := SubjectKey(cluster, s)
 
 			// A User or Group subject is a principal we did not collect as an
@@ -359,8 +441,8 @@ func Project(snap models.K8sRBACSnapshot) Result {
 					SubjectKey:          subjectKey,
 					PolicyKey:           roleKey,
 					AssignmentKey:       bindingKey + Sep + subjectKey,
-					CalculationState:    "partial",
-					EffectiveConclusion: "unknown",
+					CalculationState:    GrantCalculation,
+					EffectiveConclusion: GrantConclusion,
 				})
 				continue
 			}
@@ -373,12 +455,38 @@ func Project(snap models.K8sRBACSnapshot) Result {
 					PolicyKey:     roleKey,
 					StatementKey:  stKey,
 					AssignmentKey: bindingKey + Sep + subjectKey,
-					// The whole chain resolved, and Kubernetes RBAC is additive
-					// with no deny — so this is effective, not merely configured.
-					CalculationState:    "complete",
-					EffectiveConclusion: "effective",
+					// Resolved, but declared rather than evaluated: see Edge.
+					CalculationState:    GrantCalculation,
+					EffectiveConclusion: GrantConclusion,
 				})
 			}
+		}
+	}
+
+	// --- implicit group membership -----------------------------------------
+	// Every ServiceAccount identity this snapshot projects -- listed, or named
+	// only by a binding -- belongs to the implicit groups. Written only for the
+	// groups a binding names: those are the only ones that carry access, and
+	// the only ones with a group node to point at.
+	for _, id := range res.Identities {
+		if id.Kind != models.K8sAccountKindServiceAccount || id.Namespace == "" {
+			continue
+		}
+		for _, g := range []string{
+			GroupAllServiceAccounts,
+			NamespaceServiceAccountsGroup(id.Namespace),
+			GroupAuthenticated,
+		} {
+			if !namedGroups[g] {
+				continue
+			}
+			groupKey := GroupKey(cluster, g)
+			res.Memberships = append(res.Memberships, Membership{
+				SourceKey: MemberOfKey(id.SourceKey, groupKey),
+				MemberKey: id.SourceKey,
+				GroupKey:  groupKey,
+				Namespace: id.Namespace,
+			})
 		}
 	}
 

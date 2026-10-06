@@ -78,6 +78,9 @@ type SightingRequest struct {
 	// transitions. Optional for backward compatibility with connectors that predate
 	// lifecycle tracking; absent means "now".
 	ObservedAt *time.Time `json:"observed_at,omitempty"`
+	// RuntimeStatus is "running" (the default when absent) or "stopped": a
+	// workload the Kubernetes connector saw scaled to zero. Optional.
+	RuntimeStatus string `json:"runtime_status,omitempty"`
 }
 
 // AgentRegistrationRequest is the body for POST
@@ -134,11 +137,14 @@ type ResyncManifestRequest struct {
 	ScanKind          string     `json:"scan_kind,omitempty"`
 	// Complete is false when any LIST in the sweep failed. A partial manifest is
 	// accepted but retires nothing — see services.ReconcileManifest.
-	Complete       bool       `json:"complete"`
-	Namespaces     []string   `json:"namespaces"`
-	Fingerprints   []string   `json:"fingerprints"`
-	SweepStartedAt *time.Time `json:"sweep_started_at,omitempty"`
-	ObservedAt     *time.Time `json:"observed_at,omitempty"`
+	Complete     bool     `json:"complete"`
+	Namespaces   []string `json:"namespaces"`
+	Fingerprints []string `json:"fingerprints"`
+	// StoppedFingerprints is the subset of fingerprints seen scaled to zero:
+	// present, so never marked gone. Optional.
+	StoppedFingerprints []string   `json:"stopped_fingerprints,omitempty"`
+	SweepStartedAt      *time.Time `json:"sweep_started_at,omitempty"`
+	ObservedAt          *time.Time `json:"observed_at,omitempty"`
 }
 
 // AgentUpdateRequest is the body for PUT /authsec/discovery/agents/:id.
@@ -486,6 +492,7 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		DeploymentOrigin:  req.DeploymentOrigin,
 		Archetype:         req.Archetype,
 		ObservedAt:        req.ObservedAt,
+		RuntimeStatus:     req.RuntimeStatus,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -638,15 +645,16 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 	}
 
 	result, err := ctl.manager().ReconcileManifest(wsID, services.ManifestInput{
-		Source:            req.Source,
-		DiscoverySourceID: req.DiscoverySourceID,
-		ClusterName:       req.ClusterName,
-		ScanKind:          req.ScanKind,
-		Complete:          req.Complete,
-		Namespaces:        req.Namespaces,
-		Fingerprints:      req.Fingerprints,
-		SweepStartedAt:    req.SweepStartedAt,
-		ObservedAt:        req.ObservedAt,
+		Source:              req.Source,
+		DiscoverySourceID:   req.DiscoverySourceID,
+		ClusterName:         req.ClusterName,
+		ScanKind:            req.ScanKind,
+		Complete:            req.Complete,
+		Namespaces:          req.Namespaces,
+		Fingerprints:        req.Fingerprints,
+		StoppedFingerprints: req.StoppedFingerprints,
+		SweepStartedAt:      req.SweepStartedAt,
+		ObservedAt:          req.ObservedAt,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -997,6 +1005,12 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 
 	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).
 		Ingest(wsID, snap)
+	if errors.Is(err, services.ErrClusterUIDMismatch) {
+		// A different cluster installed under this one's name. Refused, not
+		// merged; nothing was written.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

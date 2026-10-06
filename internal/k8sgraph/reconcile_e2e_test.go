@@ -478,3 +478,138 @@ func TestNeverSupportedWorkloadIsNotRetired(t *testing.T) {
 		t.Errorf("never-supported workload lifecycle = %q, want active", got)
 	}
 }
+
+/* --------------------------- kubernetes hardening -------------------------- */
+
+// sweepStartedAt inserts a complete, cluster-wide sweep that started at a given
+// instant.
+func (f *fixture) sweepStartedAt(t *testing.T, gen int64, started time.Time) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if err := f.db.Exec(`INSERT INTO iga_k8s_sweep (id,workspace_id,discovery_source_id,cluster,
+	    generation,complete,cluster_scoped,namespaces,sweep_started_at,observed_at)
+	    VALUES (?,?,?,?,?,true,true,'{iga-demo}',?,now())`,
+		id, f.ws, f.source, f.cluster, gen, started).Error; err != nil {
+		t.Fatalf("sweep %d: %v", gen, err)
+	}
+	return id
+}
+
+// Support confirmed AFTER the sweep started (a sighting projected while it
+// ran) is newer evidence than the sweep holds: the sweep may not end it, and
+// the object it supports stays.
+func TestFenceKeepsSupportConfirmedAfterTheSweepStarted(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	// The seed confirmed everything at now(); this sweep started an hour ago.
+	second := f.sweepStartedAt(t, 2, time.Now().Add(-time.Hour))
+	res, err := NewReconcilerForTest().Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, true, true, "iga-demo")})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.supportState(t, "identity_account_id", f.identity); got != "current" {
+		t.Errorf("identity support = %q, want current: it was confirmed after the sweep started", got)
+	}
+	if got := f.state(t, "iga_identity_accounts", "id", f.identity); got != "active" {
+		t.Errorf("identity lifecycle = %q, want active", got)
+	}
+	if res.SupportEnded != 0 || res.ObjectsRetired != 0 {
+		t.Errorf("the fence let the sweep end newer evidence: %+v", res)
+	}
+
+	// The same rows, swept by a sweep that started after they were confirmed,
+	// are ended as before -- the fence holds back only newer evidence.
+	third := f.sweepStartedAt(t, 3, time.Now().Add(time.Hour))
+	if _, err := NewReconcilerForTest().Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: third, Scope: f.scope(3, true, true, "iga-demo")}); err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
+	if got := f.state(t, "iga_identity_accounts", "id", f.identity); got != "retired" {
+		t.Errorf("identity lifecycle = %q, want retired by a sweep that started after its confirmation", got)
+	}
+}
+
+// NewReconcilerForTest is a reconciler on the wall clock.
+func NewReconcilerForTest() *k8sgraph.Reconciler { return k8sgraph.NewReconciler(nil) }
+
+// Another cluster's identity that no source supports -- an unattributed
+// snapshot's -- is not this sweep's to retire.
+func TestSweepNeverRetiresAnotherClustersUnsupportedRows(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	theirs := uuid.New()
+	if err := f.db.Exec(`INSERT INTO iga_identity_accounts (id,workspace_id,display_name,account_kind,
+	        identity_backing,lifecycle,provider,source_key,continuity,provider_attrs)
+	      VALUES (?,?,?,'k8s_service_account','provider','active','k8s',?,'recognition_only','{}')`,
+		theirs, f.ws, "system:serviceaccount:iga-demo:research",
+		k8sgraph.ServiceAccountKey("other-cluster", "iga-demo", "research")).Error; err != nil {
+		t.Fatalf("seed other cluster: %v", err)
+	}
+	second := f.sweep(t, 2, true, true)
+	if _, err := NewReconcilerForTest().Reconcile(f.db, k8sgraph.ReconcileInput{
+		WorkspaceID: f.ws, SweepID: second, Scope: f.scope(2, true, true, "iga-demo")}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.state(t, "iga_identity_accounts", "id", f.identity); got != "retired" {
+		t.Errorf("own identity = %q, want retired (the sweep did not see it)", got)
+	}
+	if got := f.state(t, "iga_identity_accounts", "id", theirs); got != "active" {
+		t.Errorf("other cluster's unsupported identity = %q, want active: this sweep has no evidence about it", got)
+	}
+}
+
+// RetireSource retires what only the removed source supported, keeps what
+// another source still supports, and ends the source's own claims in place.
+func TestRetireSourceRetiresOnlyWhatItAloneSupported(t *testing.T) {
+	first := uuid.New()
+	f := seed(t, first, 1)
+	// A second source supports the policy, so it must survive the removal.
+	other := uuid.New()
+	if err := f.db.Exec(`INSERT INTO discovery_sources (id,workspace_id,kind,display_name) VALUES (?,?,?,?)`,
+		other, f.ws, "k8s_webhook", "agent-b-"+other.String()[:8]).Error; err != nil {
+		t.Fatalf("second source: %v", err)
+	}
+	sc := k8sgraph.Scope{SourceID: other, Cluster: f.cluster}
+	if err := f.db.Exec(`INSERT INTO iga_object_support (workspace_id,policy_id,discovery_source_id,partition_key,state)
+	    VALUES (?,?,?,?,'current')`, f.ws, f.policy, other, k8sgraph.PartitionForRole(sc, "").Key()).Error; err != nil {
+		t.Fatalf("other support: %v", err)
+	}
+
+	n, err := k8sgraph.RetireSource(f.db, f.ws, f.source, time.Now())
+	if err != nil {
+		t.Fatalf("retire source: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("retired %d objects, want 2 (identity and statement)", n)
+	}
+	var reason string
+	if err := f.db.Raw(`SELECT retired_reason FROM iga_identity_accounts WHERE id = ?`, f.identity).
+		Scan(&reason).Error; err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := f.state(t, "iga_identity_accounts", "id", f.identity); got != "retired" || reason != "connection_removed" {
+		t.Errorf("identity = %s/%s, want retired/connection_removed", got, reason)
+	}
+	if got := f.state(t, "iga_policy", "id", f.policy); got != "active" {
+		t.Errorf("policy = %q, want active: another source still supports it", got)
+	}
+	if got := f.state(t, "iga_policy_assignment", "id", f.assign); got != "ended" {
+		t.Errorf("assignment = %q, want ended", got)
+	}
+	var detached int
+	if err := f.db.Raw(`SELECT count(*) FROM iga_access_edges WHERE workspace_id = ? AND discovery_source_id IS NULL
+	    AND state = 'ended' AND ended_reason = 'connection_removed'`, f.ws).Scan(&detached).Error; err != nil {
+		t.Fatalf("read edges: %v", err)
+	}
+	if detached != 1 {
+		t.Errorf("%d grants ended and detached, want 1 kept as history", detached)
+	}
+	// The delete the caller then runs must not take the history with it.
+	if err := f.db.Exec(`DELETE FROM discovery_sources WHERE id = ?`, f.source).Error; err != nil {
+		t.Fatalf("delete source: %v", err)
+	}
+	if got := f.state(t, "iga_policy_assignment", "id", f.assign); got != "ended" {
+		t.Errorf("assignment after the delete = %q, want the ended row kept", got)
+	}
+}
