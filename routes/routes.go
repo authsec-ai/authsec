@@ -286,6 +286,17 @@ func SetupRoutes(
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
+
+	// Liveness and readiness for probes and smoke tests (AS-093).
+	authsec.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	authsec.GET("/readyz", func(c *gin.Context) {
+		db := config.GetDatabase()
+		if db == nil || db.DB == nil || db.DB.PingContext(c.Request.Context()) != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "database": "down"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "database": "up"})
+	})
 	{
 		workspaces := authsec.Group("/workspaces")
 		workspaces.Use(middlewares.AuthMiddleware())
