@@ -1,5 +1,155 @@
-# See [AGENTS.md](./AGENTS.md)
+# CLAUDE.md — AuthSec Platform
 
-This repo's canonical agent/engineer orientation lives in [`AGENTS.md`](./AGENTS.md)
-(the cross-tool standard). Workspace-wide context is in the root
-[`../AGENTS.md`](../AGENTS.md).
+This file is the persistent context for Claude Code. Read it at the start of every session. Keep it current: when a decision is made or a fact about the codebase is learned, update the relevant section in the same change.
+
+---
+
+## 1. What AuthSec is
+
+AuthSec (https://authsec.ai) is a **security and authorization layer for AI agents**.
+
+Example: a user tells an AI assistant (a ChatGPT/Gemini-style chatbot) to "book me a flight." To do that, the agent needs scoped, time-bound access to check availability, fill in passenger details, and complete payment. AuthSec decides and enforces:
+
+- **Which** agent gets access
+- **To what** (resources, tools, APIs, scopes)
+- **When** (time windows, expiry, one-time vs. standing grants)
+- **Where / in what context** (environment, origin, conditions)
+- **On whose behalf** (the human principal who delegated authority)
+
+All of this is managed from the AuthSec Platform (admin dashboard and APIs), and every decision is auditable.
+
+### Core domain concepts
+Names confirmed against the code on 2026-10-06. **In the code the tenant is called a "workspace"** (`workspace_id`); "tenant" survives only in legacy route and function names.
+
+| Concept | Meaning | Name in code (main tables) |
+|---|---|---|
+| Tenant / Organization | A customer of AuthSec. The top-level isolation boundary. | **Workspace** (`workspaces`, `workspace_domains`, `workspace_memberships`) |
+| User / Principal | A human in a tenant who owns agents and delegates authority. | Admin user / end user, both in `users`, plus memberships |
+| Agent | An AI agent identity registered within a tenant. | Agent client (`mcp_oauth_clients`, `/authsec/agents`), **service account** (`service_accounts`), workload / SPIFFE identity, discovered agent (IGA) |
+| Resource / Integration | An external system or tool an agent may act on (e.g. airline API). | **Resource server** (shown as "Application" in the UI; MCP servers) (`resource_servers`), **connector** (`connectors`), external service (`services`) |
+| Scope / Permission | A specific capability on a resource. | OAuth scope (`oauth_scopes`), `resource:action` permission (`permissions`), role (`roles`) |
+| Policy | Rules that decide whether an agent may perform an action (who / what / when / where). | `agent_policies*`, `delegation_policies`, `a2a_brokering_policies`, `resource_server_access_policies`; PDP behind `POLICY_ENGINE_MODE` |
+| Grant / Delegation | A concrete, possibly time-bound authorization from a principal to an agent. | `role_bindings`, `oauth_consent_grants`, `resource_server_client_registrations`, `delegation_tokens`, `connector_assignments`, `access_requests` |
+| Token / Credential | What the agent presents at runtime; must carry tenant + agent + scope claims. | Platform session JWT (HS256, `workspace_id` claim); native token (RS256 via `NativeIssuer`, workspace in the `native_tokens` row); Hydra token; ID-JAG; JWT-SVID |
+| Audit Event | An immutable record of every authorization decision and admin change. | `audit_events`, `authorization_decision_logs`, `auth_issuance_audit`, `agent_action_audit_log`, `connector_action_audit` |
+
+---
+
+## 2. Current mission
+
+AuthSec was originally designed as a **multi-tenant SaaS platform**. Over time that design was not followed and the platform **lost its multi-tenancy**. Many features are also broken.
+
+The mission, in priority order:
+1. **Make the platform stable**: it builds, starts, and the core flows work end to end.
+2. **Restore true multi-tenancy** across backend and frontend with strict tenant isolation.
+3. **Fix all existing bugs and broken features**, tracked in `docs/ISSUES.md`.
+
+Tenant isolation is a **security property**, not a feature. A cross-tenant data leak is the worst possible bug in this product.
+
+---
+
+## 3. Repositories
+
+| Repo | Path | Stack |
+|---|---|---|
+| Backend | `/home/sauron/k1/authsec/merger/authsec` (branch `authsec-staging`) | Go 1.25, Gin; raw `database/sql` + `lib/pq` and GORM (no AutoMigrate); PostgreSQL 15+ (CI uses 16); Ory Hydra; Vault; optional SPIRE/Redis |
+| Frontend | `/home/sauron/k1/authsec/Authsec-ui` (branch `multitenacyV2` == `authsec-staging`) | React 19 + Vite + TypeScript; Redux Toolkit + RTK Query; react-router 6; Radix/shadcn + Tailwind; Vitest |
+
+Sibling repos: `../mt-plugin` (the extracted DB-per-tenant service, no longer used) and `../sharedmodels` (legacy structs).
+
+⚠️ `deploy.yml` in both repos deploys to production **on push to `authsec-staging`**. Work on feature branches and never push without explicit approval.
+
+### How to run
+Verified on 2026-10-06. Details and error output are in `docs/AUDIT.md` §3.
+- **Backend:**
+  - `go build ./...` · `go vet ./...` · `go test ./...`
+  - Three packages fail without Postgres on `127.0.0.1:5432`. DB-gated suites need `TEST_DATABASE_URL` / `IGA_TEST_DSN`.
+  - Run with `go run ./cmd`, giving env vars as below. It listens on `PORT` (default 7468).
+  - If `~/go/pkg/mod` has root-owned dirs, use `GOMODCACHE=<scratch> GOFLAGS=-modcacherw GOPROXY=file://$HOME/go/pkg/mod/cache/download,https://proxy.golang.org,direct`.
+- **Frontend:**
+  - `npm ci` · `npm run dev` (Vite) · `npm run build` ✅ · `npx vitest run` ✅
+  - `npm run type-check` ❌ (197 errors) · `npm run lint` ❌ (282 errors)
+- **Database (local) and migrations:**
+  - Start Postgres: `docker run -d --name authsec-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=authsec -p 127.0.0.1:55432:5432 postgres:16`
+  - Migrations in `migrations/master/NNN_*.sql` apply automatically at boot (`SKIP_MIGRATIONS=true` skips them) and are recorded in `migration_logs`. `migrations/deltas/` and `migrations/contract/` are not applied by the runner.
+  - Hydra (`HYDRA_ADMIN_URL`, `HYDRA_PUBLIC_URL`) is needed for login and OAuth flows. Without Vault, signing keys are ephemeral (tokens die on restart).
+  - Admin-auth endpoints are rate-limited to 5/min per IP.
+- **Required env vars (names only, never values):**
+  - Backend, fatal if missing: `DB_USER DB_PASSWORD JWT_SDK_SECRET JWT_DEF_SECRET WEBAUTHN_RP_NAME WEBAUTHN_RP_ID WEBAUTHN_ORIGIN`
+  - Backend, usual: `PORT ENVIRONMENT DB_HOST DB_PORT DB_NAME DB_SSL_MODE JWT_SECRET TOTP_ENCRYPTION_KEY SYNC_CONFIG_ENCRYPTION_KEY HYDRA_ADMIN_URL HYDRA_PUBLIC_URL VAULT_ADDR VAULT_TOKEN REDIS_URL TENANT_DOMAIN_SUFFIX CORS_ALLOWED_ORIGINS`
+  - Backend, flags (default off): `XAA_NATIVE_SEALER XAA_M2M XAA_REDEMPTION XAA_DPOP XAA_CIBA XAA_ISSUANCE ENABLE_EMBEDDED_SPIRE IGA_GRAPH_PROJECTION POLICY_ENGINE_MODE`
+  - Frontend: `VITE_API_URL VITE_OAUTH_BASE_URL VITE_APP_NAME`
+
+---
+
+## 4. Multi-tenancy architecture (target state)
+
+Until `docs/adr/0001-tenancy-model.md` is approved, treat this section as the proposal.
+
+**Isolation model:** shared database, `tenant_id` column on every tenant-owned table. *Current state (Phase 0):* the codebase already uses one shared Postgres DB, with the tenant column named **`workspace_id`** (143 of 175 tables). The original DB-per-tenant design was removed in `764a654` and `05e289d`. The proposal is to keep shared-DB and keep the `workspace_id` name, pending ADR-0001.
+
+**Non-negotiable rules:**
+1. Every tenant-owned table has a non-null `tenant_id` with a foreign key and an index (usually composite, e.g. `(tenant_id, id)`).
+2. Tenant context is resolved **once**, at the edge (auth middleware), from a verified token or session. It is **never** taken from a request body, query param, or client-controlled header.
+3. Tenant context flows through a single request-scoped mechanism (context object / async-local storage / DI scope). No function looks up the tenant by itself.
+4. All data access goes through a tenant-scoped repository or query layer that applies the tenant filter automatically. Raw unscoped queries need a `// TENANT-EXEMPT: <reason>` comment and a review.
+5. Use database-level enforcement (e.g. Postgres Row-Level Security) as defense in depth where the DB supports it. *Confirmed:* PostgreSQL 15+ (CI uses 16), which supports RLS. No RLS is used today.
+6. Lookups by ID must also match the tenant. A record from another tenant returns **404**, not 403, so callers can't confirm it exists.
+7. Agent tokens and credentials carry a `tenant_id` claim. The runtime authorization check verifies that the agent, the grant, the policy, and the resource all belong to the **same tenant**.
+8. Unique constraints are scoped per tenant (e.g. `UNIQUE(tenant_id, slug)`), not global, unless the value is truly global.
+9. Secrets, signing keys, webhook secrets, and integration credentials are per tenant and never shared.
+10. Cache keys, queue messages, background jobs, scheduled tasks, webhooks, file storage paths, logs, and metrics all carry the tenant ID.
+11. Audit events are written per tenant and are append-only.
+12. Platform-level super-admin access, if it exists, is explicit, separately authorized, and audited. It is never the default code path.
+
+**Frontend rules:**
+- The active tenant comes from the authenticated session, not from local state the user can edit.
+- Switching tenants clears all cached data (query cache, stores) before loading the new tenant's data.
+- The UI is never the security boundary. Hiding a button is UX; the backend must enforce.
+- Routes and API calls must handle tenant-scoped 404s gracefully.
+
+---
+
+## 5. Working rules for Claude Code
+
+- **Plan before editing.** For any non-trivial change, state the plan and the files affected first.
+- **Small, reviewable changes.** One concern per commit or PR. Don't mix refactors with bug fixes.
+- **Never** run destructive operations (drop tables, delete data, force-push, rewrite migrations that already ran) without explicit approval.
+- **Migrations** must be forward-only and reversible where possible. Adding `tenant_id` follows this order: add a nullable column, backfill it, add NOT NULL and the FK, then add indexes and constraints. Each step is its own migration.
+- **Tests come with every fix.** For every bug fixed, add a test that would have caught it. For every tenant-scoped endpoint, add a cross-tenant isolation test (tenant A cannot read, list, update, or delete tenant B's data).
+- **Don't guess.** If behavior is ambiguous, check the code, the tests, and git history, then ask.
+- **Never commit secrets.** Never print secret values in output.
+- **Keep docs in sync:** this file, `docs/ISSUES.md`, `docs/PROGRESS.md`, and the ADRs.
+
+### Definition of done (per change)
+- [ ] Builds and lints cleanly (backend and frontend)
+- [ ] Existing tests pass, and new tests cover the change
+- [ ] Cross-tenant isolation tests added or updated if data access changed
+- [ ] No unscoped queries introduced
+- [ ] Docs updated (`ISSUES.md` status, `PROGRESS.md`, this file if context changed)
+
+---
+
+## 6. Project docs
+
+| File | Purpose |
+|---|---|
+| `docs/AUDIT.md` | Phase 0 findings: architecture map, tenancy gaps, broken features |
+| `docs/ISSUES.md` | Every known bug or gap, with an ID, severity, status, and owner repo |
+| `docs/PROGRESS.md` | Running log: what was done each session and what's next |
+| `docs/adr/` | Architecture Decision Records (tenancy model, auth, etc.) |
+
+**Severity scale:** `P0` security or tenant leak · `P1` core flow broken · `P2` feature broken · `P3` minor or cosmetic
+
+---
+
+## 7. Known facts and decisions log
+<!-- Append dated entries. Example:
+- 2026-10-06: Confirmed backend uses Postgres 15; RLS will be used as defense in depth (ADR-0001).
+-->
+- 2026-10-06: The tenant is the **workspace** (`workspace_id`), in one shared Postgres DB. History: DB-per-tenant → `mt-plugin` extraction (`764a654`, 2026-04-29) → single-tenant substrate (`69c82a3`) → tenant model deleted (`05e289d`, 2026-06-23).
+- 2026-10-06: Platform JWTs carry a `workspace_id` claim and are set into gin context by `middlewares/auth.go`. `ValidateWorkspaceFromToken` checks only the `:workspace_id` path param, so body and query values are not validated. That is the root cause of most cross-tenant findings.
+- 2026-10-06: `AdminRegister` has an unconditional single-tenant guard (409 on the second workspace).
+- 2026-10-06: The admin UI login relies on the unauthenticated `/uflow/login/webauthn-callback` (AS-001), so the backend and UI must be fixed together.
+- 2026-10-06: `../AGENTS.md` and `../.claude/DEFINITION-OF-DONE.md` (referenced by AGENTS.md) do not exist in `merger/`. Use §5 of this file as the definition of done.
+- 2026-10-06: Phase 0 audit complete. See `docs/AUDIT.md`, `docs/ISSUES.md`, `docs/PROGRESS.md`.
