@@ -11,6 +11,12 @@ signed-in check against a real workspace, so no screen here is claimed usable
 in production. Where this text says what a provider does, it says what the
 code does, and anything still a proposal is labelled so.
 
+**Evidence rule.** Nothing here, in a commit message, PR text, decision record
+or test suite is proof that a behaviour exists. Trace each dependency to the
+registered route, the handler, the writer, the migration and the collector
+before building on it, and treat a passing test as the author's assumption
+until the real producer and consumer have been exercised end to end.
+
 Fixed by decision: the four primary destinations — **Connections**,
 **Discovery**, **Policy**, **Logs**. Secondary and detail screens are
 unrestricted. The legacy governance screens are **removed**, not hidden.

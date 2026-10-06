@@ -5,6 +5,12 @@
 > [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md); the
 > invariants this work must honour are [SPEC-iga-roadmap.md](SPEC-iga-roadmap.md) §3.
 >
+> **Evidence rule.** Nothing in this document, a commit message, PR text, a
+> decision record or a test suite proves a behaviour exists. Trace each part
+> (route, handler, writer, migration, collector, deployed image) before
+> relying on it; a passing test is the author's assumption until the real
+> producer and consumer have been exercised end to end.
+>
 > **Inspected, 2026-09-23.** Every claim about current behaviour below was
 > traced in code at these commits, not taken from names, comments or earlier
 > reports:
