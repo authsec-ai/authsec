@@ -589,7 +589,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "OTP regenerated and sent to your email",
 			"email":   input.Email,
-			"otp":     otp, // Include OTP in response for testing (remove in production)
 		})
 		return
 	}
@@ -660,7 +659,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Admin registration initiated. Please check your email for OTP to complete registration.",
 		"email":   input.Email,
-		"otp":     otp, // Include OTP in response for testing purposes (remove in production)
 	})
 }
 
@@ -1377,7 +1375,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		}
 	}(input.Email, otp)
 
-	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, workspaceDomain, otp)
+	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s", input.Email, workspaceDomain)
 
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
 		Message:         "Bootstrap initiated. Please check your email for OTP to complete registration.",

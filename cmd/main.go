@@ -101,6 +101,13 @@ func main() {
 
 	}
 
+	// MFA secrets were encrypted with a hardcoded key until the key's env var
+	// name was fixed (AS-020); move them to the configured key. Decryption
+	// still falls back to the legacy key, so a failure here locks no one out.
+	if _, err := services.RotateLegacyMFACiphertexts(config.Database.DB); err != nil {
+		log.Printf("WARN: MFA key rotation incomplete: %v", err)
+	}
+
 	// Phase 6: tenants table dropped — workspace is the only identity table.
 	{
 		var workspaces int64

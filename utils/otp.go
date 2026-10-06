@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"net/smtp"
+	"os"
 	"strings"
 	"time"
 
@@ -78,7 +79,7 @@ var SendOTPEmailFunc = func(email, otp string) error {
 		// No SMTP configured — log the OTP so the operator can read it from
 		// the backend logs. This keeps registration usable in dev/single-node
 		// deploys without a real mail provider.
-		log.Printf("SendOTPEmail: SMTP not configured — OTP for %s: %s", email, otp)
+		logUndeliveredOTP("SendOTPEmail", email, otp)
 		return nil
 	}
 
@@ -138,7 +139,7 @@ var SendPasswordResetOTPEmailFunc = func(email, otp string) error {
 	smtpPass := config.AppConfig.SMTPPassword
 
 	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendPasswordResetOTPEmail: SMTP not configured — OTP for %s: %s", email, otp)
+		logUndeliveredOTP("SendPasswordResetOTPEmail", email, otp)
 		return nil
 	}
 
@@ -627,4 +628,16 @@ func SendPolicyExpiryWarningEmail(w PolicyExpiryWarning) error {
 		return err
 	}
 	return nil
+}
+
+// logUndeliveredOTP reports an OTP that could not be emailed because SMTP is
+// not configured. The code itself is logged only in development: logs are
+// shipped and retained, and an OTP in them lets anyone with log access
+// complete someone else's sign-up or password reset (AS-019/AS-043).
+func logUndeliveredOTP(caller, email, otp string) {
+	if strings.EqualFold(os.Getenv("ENVIRONMENT"), "development") {
+		log.Printf("%s: SMTP not configured — development OTP for %s: %s", caller, email, otp)
+		return
+	}
+	log.Printf("WARN %s: SMTP not configured — OTP for %s was not delivered", caller, email)
 }

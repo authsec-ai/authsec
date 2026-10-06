@@ -752,8 +752,8 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		log.Printf("[%s] FinishRegistration: userflow service call failed: %v", reqID, err)
 		// Proceed anyway, but log the error
 	} else {
-		log.Printf("[%s] FinishRegistration: userflow service returned accessToken=%s, refreshToken=%s",
-			reqID, accessToken, refreshToken)
+		log.Printf("[%s] FinishRegistration: userflow service returned tokens (access=%t, refresh=%t)",
+			reqID, accessToken != "", refreshToken != "")
 	}
 
 	// Step 14: Clean up session
@@ -1036,8 +1036,8 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 		log.Printf("[%s] FinishAuthentication: userflow service call failed: %v", reqID, err)
 		// Proceed anyway, but log the error
 	} else {
-		log.Printf("[%s] FinishAuthentication: userflow service returned accessToken=%s, refreshToken=%s",
-			reqID, accessToken, refreshToken)
+		log.Printf("[%s] FinishAuthentication: userflow service returned tokens (access=%t, refresh=%t)",
+			reqID, accessToken != "", refreshToken != "")
 	}
 
 	// Cleanup session

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/testsupport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,16 +76,12 @@ func Test_AdminOnboarding_SignupOTPRegisterLogin(t *testing.T) {
 	t.Logf("register status=%d body=%s", w2.Code, w2.Body.String())
 	require.Equal(t, 201, w2.Code, "register should return 201")
 
-	body2 := parseBody(w2)
-	otp := stringField(body2, "otp")
-	// OTP may also surface under alternate keys depending on implementation.
-	if otp == "" {
-		otp = stringField(body2, "verification_code")
-	}
-	if otp == "" {
-		otp = stringField(body2, "code")
-	}
-	t.Logf("otp from register response: %q", otp)
+	// The OTP is delivered by email, never in the response (AS-019); read it
+	// where the mailer would, from otp_entries.
+	require.NotContains(t, w2.Body.String(), `"otp"`, "register must not return the OTP")
+	var otp string
+	require.NoError(t, config.GetDatabase().DB.QueryRow(
+		`SELECT otp FROM otp_entries WHERE email = $1 ORDER BY created_at DESC LIMIT 1`, email).Scan(&otp))
 
 	// ── Step 3: complete-registration ────────────────────────────────────────
 	completePayload := map[string]interface{}{

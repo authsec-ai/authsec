@@ -97,10 +97,9 @@ func RequestIDMiddleware() gin.HandlerFunc {
 			}
 
 			logFields := logrus.Fields{
-				"url":         c.Request.URL.String(),
+				// Query strings carry codes, states and tokens; log the path only.
 				"method":      c.Request.Method,
 				"path":        path,
-				"query":       c.Request.URL.RawQuery,
 				"status_code": statusCode,
 				"workspace_id": c.GetHeader("X-Workspace-ID"),
 			}

@@ -173,7 +173,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 		log.Printf("ERROR: Failed to store OIDC state: %v", err)
 		return nil, fmt.Errorf("failed to store OIDC state: %w", err)
 	}
-	log.Printf("DEBUG InitiateOIDCFlow: Successfully created state with token='%s', workspace_domain='%s', origin_domain='%s', action='%s'", stateToken, input.WorkspaceDomain, s.requestOrigin, action)
+	log.Printf("DEBUG InitiateOIDCFlow: created state, workspace_domain='%s', origin_domain='%s', action='%s'", input.WorkspaceDomain, s.requestOrigin, action)
 
 	// Build authorization URL
 	callbackURL := s.resolveCallbackURL(provider)
