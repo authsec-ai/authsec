@@ -59,8 +59,9 @@ type DiscoverySourceUpdateRequest struct {
 // connector reports. Idempotent on (source, fingerprint) within the workspace.
 type SightingRequest struct {
 	// WorkspaceID is supplied by the connector, which is configured with it at
-	// deploy time. The sightings route is unauthenticated (see routes.go), so there
-	// is no token to derive the workspace from — the caller asserts it.
+	// deploy time. The sightings route has no user token to derive the workspace
+	// from, so the caller asserts it and its ingest token vouches for it (see
+	// discovery_ingest_auth.go).
 	//
 	// Typed as a string rather than uuid.UUID on purpose: `binding:"required"` on a
 	// uuid.UUID treats the all-zero UUID as absent, and the all-zero UUID is the
@@ -84,8 +85,8 @@ type SightingRequest struct {
 // /authsec/discovery/agent-registration — a deployed connector announcing itself
 // and then heartbeating.
 //
-// Unauthenticated, exactly like /sightings, and for the same reason: the agent is
-// configured with its workspace at deploy time and asserts it. WorkspaceID is a
+// Ingest-token authenticated, exactly like /sightings, and for the same reason: the
+// agent is configured with its workspace at deploy time and asserts it. WorkspaceID is a
 // string for the same reason too — `binding:"required"` on a uuid.UUID rejects the
 // all-zero UUID, which is the real System workspace.
 type AgentRegistrationRequest struct {
@@ -206,12 +207,13 @@ func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, er
 	return wsID, principal, nil
 }
 
-// assertedWorkspace resolves the workspace an UNAUTHENTICATED connector claims in
-// its request body, and confirms it exists.
+// assertedWorkspace resolves the workspace a connector claims in its request
+// body, and confirms it exists.
 //
-// Used by the three ingress routes (sightings, agent-registration, lifecycle,
-// resync-manifest) where there is no token to derive the workspace from — the
-// caller asserts it and the agent is configured with it at deploy time.
+// Used by the ingress routes (agent-registration, sightings, lifecycle,
+// resync-manifest, rbac-snapshot) through ingressWorkspace, which first checks
+// the call's ingest token against that workspace (discovery_ingest_auth.go) —
+// the agent is configured with its workspace at deploy time and asserts it.
 //
 // The existence check is not redundant with the foreign key. Without it a typo'd
 // workspace id surfaces as a raw Postgres FK violation, which is a miserable thing
@@ -465,17 +467,17 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		return
 	}
 
-	// This route is unauthenticated, so the workspace comes from the body rather
-	// than a token claim. See the ingress comment in routes.go for what that trades.
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	// The workspace comes from the body; the ingest token (when the mode asks for
+	// one) is what vouches for it. See discovery_ingest_auth.go.
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
 
-	// No authenticated principal on this path. Record an explicitly-marked
-	// attribution rather than something that reads like a verified identity, so a
-	// row's provenance is never overstated when someone reads it later.
-	principal := "unauthenticated:" + req.Source
+	// Attributed to the ingest token that authenticated the call, or explicitly
+	// marked unauthenticated, so a row's provenance is never overstated when
+	// someone reads it later.
+	principal := ingestPrincipal(c, req.Source)
 
 	agent, created, err := ctl.manager().ReportSighting(wsID, principal, services.SightingInput{
 		Source:            req.Source,
@@ -521,7 +523,7 @@ func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, ctl.registrationIngestSource(req.Kind, req.InstanceID))
 	if !ok {
 		return
 	}
@@ -579,7 +581,7 @@ func (ctl *DiscoveryController) ReportLifecycleEvent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
@@ -632,7 +634,7 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, req.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
 	if !ok {
 		return
 	}
@@ -990,7 +992,7 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, snap.WorkspaceID)
+	wsID, ok := ctl.ingressWorkspace(c, snap.WorkspaceID, parsedIngestSource(snap.DiscoverySourceID))
 	if !ok {
 		return
 	}
