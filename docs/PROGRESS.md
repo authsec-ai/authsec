@@ -4,6 +4,57 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-07 — Voice tables, row-level security, remaining areas and P2/P3
+
+**Owner asked for:** build the voice-auth tables; switch on RLS; move the remaining areas onto the scoped layer and work through P2/P3. Committed locally on `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI, stacked on `fix/ui-integrations`); nothing pushed.
+
+### Done
+- **Voice auth (AS-047), `208d8e7`:**
+  - Migration 053 adds `voice_active_sessions`.
+  - The voice flow was unsafe as well as broken, so voice backends must now authenticate as an OAuth client of the workspace, and a session belongs to its client.
+  - UI watcher re-mounted (`d773999`).
+- **Row-level security (AS-050), `978e8d7`:**
+  - Migration 054 enables and forces the `tenancy_isolation` policy on all 163 workspace tables.
+  - `internal/tenancy` transactions set `app.workspace_id` and `SET LOCAL ROLE authsec_tenant`, because superusers bypass RLS.
+  - A test fails if any workspace table lacks the policy.
+- **Multi-tenant sign-up (AS-030), `c9b6b11`:** single-tenant guard removed; a second workspace signs up end to end.
+- **Scoped-layer migration:**
+  - Admin users, seeding, the workspace registry, end-user lookups and sign-up writes (`f397c7a`, `fd643db`).
+  - Ratchet 482 → 464.
+- **P1/P2 fixes:** AS-033, 034, 004, 036, 042, 061, 067, 071, 072, 073, 075, 082, 096. See `ISSUES.md`.
+- **UI:** route-level code splitting (UI-034).
+
+### Interrupted
+- All three parallel agents hit the account spend limit.
+- Their committed work was merged and verified after each set (build, vet, unit, all integration suites, upgrade rehearsals 053, 054 and 065, each 0 failed).
+- Small uncommitted remainders were finished and verified here: the AS-061 connection-grant check, and the SSRF client.
+- One large uncommitted remainder was **discarded**: the database/ device, CIBA, TOTP and OTP repositories moved onto the scoped layer. It conflicted with the newly merged TOTP lockout code and was untested. That migration is still to do.
+
+### Release notes (deploy)
+- **Row-level security:** run `scripts/create-tenant-role.sql` if migration 054 logged that it could not create `authsec_tenant`.
+- **New settings:**
+  - `TRUSTED_PROXIES` (unset means forwarding headers are ignored)
+  - `AUTH_LOCKOUT_MAX_FAILURES`, `AUTH_LOCKOUT_WINDOW`, `AUTH_LOCKOUT_DURATION`
+  - `METRICS_TOKEN` or `METRICS_ADDR` (otherwise metrics are not exposed)
+  - `OUTBOUND_ALLOWED_HOSTS`, `OUTBOUND_ALLOWED_CIDRS`
+- **Startup now refuses to run when:**
+  - `ENVIRONMENT=production` and the native signing key is ephemeral, unless Vault works or `NATIVE_RSA_PRIVATE_KEY_B64` is set;
+  - XAA issuance flags are on without `XAA_NATIVE_SEALER`.
+- **Behaviour changes for clients:**
+  - Voice assistant backends must use OAuth client credentials.
+  - Session tokens are now class-bound: admin tokens work on the console, end-user tokens on self-service, SDK tokens on the SDK surface. Tokens issued before this change keep working until they expire.
+
+### Still open
+- AS-014: per-workspace collector credentials.
+- AS-015/044: CIBA client authentication.
+- AS-018, AS-025, AS-038: remaining parts.
+- AS-060: global `resource_uri` and issuer uniques.
+- AS-064, 065, 076, 078, 079, 080, 081, 083, 094, 095, 097.
+- The ratchet's remaining 464 raw statements.
+- UI-033: `Tenant*` naming.
+- OPS-001: deploy-on-push process.
+- ENV-001: local Go module cache owned by root (needs your `sudo`).
+
 ## 2026-10-06 (cont.) — Phases 1–6 run back to back (owner: "complete each phase and commit, do not push")
 
 **Branches (local only, nothing pushed):**
