@@ -236,6 +236,16 @@ func NamespaceServiceAccountsGroup(ns string) string {
 	return GroupAllServiceAccounts + ":" + ns
 }
 
+// ImplicitGroup reports whether a group name is one the API server places
+// subjects in implicitly -- system:serviceaccounts,
+// system:serviceaccounts:<ns> or system:authenticated -- so no object declares
+// the membership (D-110). The one statement of that rule for every reader:
+// the graph walk (igaread) and the flat access route (k8sread) both ask here.
+func ImplicitGroup(name string) bool {
+	return name == GroupAuthenticated || name == GroupAllServiceAccounts ||
+		strings.HasPrefix(name, GroupAllServiceAccounts+":")
+}
+
 // GroupKey identifies a Group subject.
 func GroupKey(cluster, name string) string {
 	return SubjectKey(cluster, models.K8sSubject{Kind: models.K8sSubjectGroup, Name: name})
