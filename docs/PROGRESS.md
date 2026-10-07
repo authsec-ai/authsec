@@ -4,6 +4,54 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-07 (cont. 2) — P2/P3 burn-down, schema parity, ratchet
+
+Branch `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
+
+### Done
+- **AS-065:** SPIFFE SVIDs are verified by kid against the workspace bundle, and the tenancy context is set (`0b0ec03`).
+- **AS-076:** PSAT verification is never switched off by `ENVIRONMENT`; skipping it needs an explicit flag (`e65fff6`).
+- **AS-078:** admin WebAuthn and MFA status act in the signed-in workspace (`4fb6ccd`, `9291044`; UI `b1faa55`). Before this fix, an admin could get passkey-registration options for another workspace's account with the same email.
+- **AS-079:** platform rows are `workspace_id IS NULL`, with a CHECK against new system-workspace rows (055, `456ffd4`).
+- **AS-080:** `scripts/schema-parity.sh` shows that a fresh bootstrap and an upgraded DB end with the same schema. 069 adds the two indexes the upgrade path had missed (`456ffd4`).
+- **AS-081:** embedded SPIRE is refused at startup in production and staging (`deb5645`).
+- **AS-094:** dead config and code deleted, about 930 lines (`04eeb37`).
+- **AS-097:** expand step for `entra_tenant_id` (070, `a44fa5a`).
+- **AS-060:** the ADR records why four uniques stay global for now, and the steps to finish (`87aec78`).
+- **Ratchet:**
+  - It now skips RLS-only packages and statements handed to the scoped layer (`538b92d`, `ef6c39a`).
+  - SCIM writes moved onto the scoped layer (`24ef0e7`).
+  - 445 → 303.
+- **IGA FK catalog test** updated for 047 (`2bd9077`).
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding, flagsoff and igagraph suites pass.
+- Migrations 055, 066–070 were rehearsed on clones of the scratch DB; all are idempotent.
+- Schema parity: fresh == upgraded.
+
+### Release notes (deploy)
+- **Migrations:**
+  - 055: platform rows. The `migrations:*` permissions are removed, and every workspace admin role gains `users:read` and `users:write`.
+  - 069: indexes.
+  - 070: `entra_tenant_id`, kept in sync with the old column by a trigger.
+- **New or changed settings:**
+  - `SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY` and `SPIRE_DEV_MTLS_BYPASS`: development only.
+  - `ICP_SERVICE_URL` is required in production when SPIFFE SVIDs are used.
+  - `ENABLE_EMBEDDED_SPIRE` is refused in production and staging.
+  - `ADMIN_CROSS_TENANT_ACCESS` is removed; nothing read it.
+- **Admin MFA status:** send `workspace_id`. Without it, an email that exists in more than one workspace now gets a 400.
+
+### Needs the owner
+- AS-098: `.env` is tracked with dev secrets. Confirm that no environment uses these values, then untrack the file.
+- AS-081: fix or remove the embedded SPIRE control plane.
+- AS-015: retire legacy `/uflow/auth/ciba` (needs a Python SDK change).
+- AS-097: run the contract migration after the next deploy.
+- OPS-001: the deploy-on-push process.
+- ENV-001: the root-owned Go module cache (needs `sudo`).
+
+---
+
 ## 2026-10-07 (cont.) — Data layer, auth P0/P1 remainders, IGA reads
 
 Same branch (`fix/p0-containment`), nothing pushed.

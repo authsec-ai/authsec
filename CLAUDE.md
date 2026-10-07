@@ -161,6 +161,7 @@ Decided in [`docs/adr/0001-tenancy-model.md`](docs/adr/0001-tenancy-model.md) (a
 - 2026-10-06: The owner asked to run all phases back to back, committing locally (never pushing). Work happens on local branches only; `authsec-staging` auto-deploys.
 - 2026-10-06: Tenant isolation is enforced in four layers: (1) `AuthMiddleware` rejects any path/query/body workspace other than the token's (404) and re-checks membership per request; (2) `internal/tenancy` is the scoped data layer; (3) per-endpoint isolation tests use `TwoTenants` in `tests/integration/flows`; (4) the TENANT-EXEMPT ratchet runs in CI. RLS is designed (ADR §4.4) but not yet enabled.
 - 2026-10-06: Interactive sign-in uses single-use login tickets (`internal/logintickets`, migration 043). The MFA endpoints and webauthn callbacks never trust client-asserted identity.
-- 2026-10-06: Migration numbers in use: 043–048, 050–054, 065–068 (049 and 055–064 unused).
+- 2026-10-06: Migration numbers in use: 043–048, 050–055, 065–070 (049 and 056–064 unused).
 - 2026-10-07: Postgres RLS is on (054). Every new workspace table's migration must `SELECT public.tenancy_enable_rls('public.<table>')`; `tests/integration/flows/rls_test.go` fails otherwise. RLS restricts only transactions opened through `internal/tenancy` (they set `app.workspace_id` and run as `authsec_tenant`).
 - 2026-10-07: Outbound requests to tenant-chosen URLs must use `internal/safehttp`.
+- 2026-10-07: `scripts/schema-parity.sh <binary>` checks that a fresh bootstrap and an upgraded copy of the scratch DB end with the same schema. Run it after any migration. The tenant ratchet skips statements handed to the scoped layer and the RLS-only packages (`internal/igaread`, `internal/k8sread`).
