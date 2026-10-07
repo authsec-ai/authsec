@@ -16,10 +16,14 @@
 #   b   the working tree's 001 alone
 #   c   the working tree's 001..N in one runner pass (what a fresh install does)
 #   c2  c, then 002..N applied a SECOND time (every later file is re-runnable)
-#   a0  only when ORIG_REF is set: 001 as of BASE_REF, then 002..N as of
-#       ORIG_REF. Proves that guards added to existing migrations do not change
-#       what they do on the numbered path: raw pg_dump of a and a0 must be
-#       byte-identical (only pg_dump's random \restrict key is removed).
+#   a0  only when ORIG_REF is set: 001 as of BASE_REF, then every later file
+#       that existed at ORIG_REF as of ORIG_REF, and the files added since
+#       from the working tree. Proves that guards added to existing migrations
+#       do not change what they do on the numbered path: raw pg_dump of a and
+#       a0 must be byte-identical (only pg_dump's random \restrict key is
+#       removed). With ORIG_REF at the commit before a change that only ADDS
+#       migrations (T3.01: 047-056 over 05fb773), a0 == a also proves the
+#       change left every existing file alone.
 #
 # a, b, c and c2 must have identical normalised schema dumps and identical
 # seeded rows. Exit status is non-zero on any difference; the diff is printed.
@@ -125,6 +129,15 @@ if [ -n "$ORIG_REF" ]; then
   ORIG_LATER=( $(git ls-tree --name-only "$ORIG_REF" migrations/master/ | sed 's#.*/##' | grep -E '^[0-9]+_.*\.sql$' | grep -v '^001_' | sort) )
   stage_ref "$BASE_REF" "$S/a0/master" 001_bootstrap.sql
   stage_ref "$ORIG_REF" "$S/a0/master" "${ORIG_LATER[@]}"
+  # Files ADDED since ORIG_REF have no original version: a0 takes them from
+  # the working tree, exactly as a does, so a0 == a still isolates edits to the
+  # files that already existed at ORIG_REF.
+  NEW_LATER=()
+  for f in "${LATER[@]}"; do
+    case " ${ORIG_LATER[*]} " in *" $f "*) ;; *) NEW_LATER+=("$f") ;; esac
+  done
+  [ "${#NEW_LATER[@]}" -gt 0 ] && stage_worktree "$S/a0/master" "${NEW_LATER[@]}"
+  echo "a0: ${#ORIG_LATER[@]} files as of ORIG_REF, ${#NEW_LATER[@]} added since (${NEW_LATER[*]:-none})"
 fi
 
 echo "== building the runner wrapper"

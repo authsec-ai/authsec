@@ -58,7 +58,7 @@ present, not exercised end to end; **missing**; **proposed**; **conflict**.
 
 | Dependency | Evidence | Status |
 |---|---|---|
-| Highest migration | Local `042_unified_inventory.sql`; origin adds `043_discovery_ingest_auth.sql`; `037` is reserved by `migrations/contract/037_iga_access_edges_contract.sql` | traced. **Phase 3 starts at `044`** |
+| Highest migration | Local `042_unified_inventory.sql`; origin adds `043_discovery_ingest_auth.sql`; `037` is reserved by `migrations/contract/037_iga_access_edges_contract.sql` | traced; re-checked at T3.01: `044`–`046` landed first, so **Phase 3 starts at `047`** |
 | AWS publication | Projector writes the graph and `iga_publication` in one fenced transaction under `iga_pipeline_lease` (`internal/igagraph/project.go:177-284`); manifest `{partition_key: run_id}` (`:286-308`) | traced; not exercised in a deployed environment |
 | Publication is AWS-only | `iga_publication.scan_run_id` FK to `cloud_scan_run` (`033:150`) | traced |
 | Graph history | `Reader.Read` returns `RevisionStale` for any revision but the latest (`internal/igaread/snapshot.go:139-142`); there is no historic read | traced — a plan cannot re-read the graph it was compiled from (§2.11) |
@@ -664,7 +664,7 @@ legacy agent-lifecycle feature; Phase 3 neither reads nor migrates it.
 | `governance:emergency` (new) | Break-glass Undo or control removal without an approval reference; mandatory reason; always notified |
 | `iga:admin` (existing) | Owners and owner rules |
 
-`052` seeds the four new permissions as global rows and binds them to every
+`055` seeds the four new permissions as global rows and binds them to every
 workspace `admin` role, using the same statements as `004`/`005`.
 `governance:read` is an existing row that the legacy routes also use; sharing a
 read permission couples nothing else. Self-approval is refused in code for
@@ -1115,7 +1115,7 @@ behaviour; they are out of scope.
   on. Connectors on the older template record every collected form as
   `not_collected` ("discovery template update needed"), so no first
   attachment is offered for them.
-- **Immutable evidence (`053`).** Each scan writes, per form and region, one
+- **Immutable evidence (`056`).** Each scan writes, per form and region, one
   `cloud_resource_policy_coverage` row, and per resource read one
   `cloud_resource_policy_observation` row — including `policy_present = false`
   for "no policy" — with the document stored once by hash in
@@ -1197,7 +1197,7 @@ flowchart TB
   subgraph DATA["PostgreSQL"]
     G[("Graph iga_* (Phase 2)")]
     RAW[("cloud_* (Phase 1)")]
-    P3[("iga_gov_* + cloud_resource_policy_* (044–053)")]
+    P3[("iga_gov_* + cloud_resource_policy_* (047–056)")]
     AP[("agent_policies … (legacy)")]
   end
 
@@ -1277,7 +1277,7 @@ names only `iga_*` tables and the allowlisted shared tables.
 
 | Gate | Values | Effect |
 |---|---|---|
-| `IGA_POLICY` env | `off` (default), `on` | `on` requires `IGA_GRAPH_PROJECTION=on` and a verified Phase 3 schema: every relation and added column of `044`–`053` checked by existence, as `VerifyGraphSchema` does for the graph (`services/iga_graph_projection.go:74-101`). Fail closed: on with verification failing, every Phase 3 route returns `503 policy_unavailable` and the evaluation step is skipped. Off: the same, and the Policy destination keeps its preview. Legacy routes and workers are unaffected either way |
+| `IGA_POLICY` env | `off` (default), `on` | `on` requires `IGA_GRAPH_PROJECTION=on` and a verified Phase 3 schema: every relation and added column of `047`–`056` checked by existence, as `VerifyGraphSchema` does for the graph (`services/iga_graph_projection.go:74-101`). Fail closed: on with verification failing, every Phase 3 route returns `503 policy_unavailable` and the evaluation step is skipped. Off: the same, and the Policy destination keeps its preview. Legacy routes and workers are unaffected either way |
 | `iga_gov_settings.enforcement_mode` | `findings_only` (default), `enforce` | `findings_only`: findings, proposals, reviews, approvals and J1 export; `direct` and `iac_pr` deployments refused with `enforcement_not_enabled` |
 | `cloud_enforcement_binding.state = verified` | per account | Required for `direct` (J3) |
 | `iga_gov_iac_source` covering the role | per account/repository | Required for `iac_pr` (J2) |
@@ -1363,21 +1363,21 @@ sequenceDiagram
 
 ### 6.1 Rules and the bootstrap decision
 
-- **Numbering.** The local chain ends at `042_unified_inventory.sql`; the
-  cached `origin/authsec-staging` adds `043_discovery_ingest_auth.sql`;
+- **Numbering.** The chain ends at `046_ingest_token_triggers.sql`
+  (`043`–`046` landed after this spec was first drafted against `042`);
   `037` is reserved by `migrations/contract/037_iga_access_edges_contract.sql`.
-  Phase 3 therefore uses `044`–`053` in `migrations/master/`, applied by the
-  existing runner. The numbers are re-checked against the actual files when
-  T3.01 starts (workspace rule); if another migration lands first, the
-  block moves up as a unit and this section is edited, never patched with a
-  second list.
+  Phase 3 therefore uses `047`–`056` in `migrations/master/`, applied by the
+  existing runner. The numbers were re-checked against the actual files when
+  T3.01 started (workspace rule) and the block moved up as a unit; if another
+  migration lands first, it moves up again and this section is edited, never
+  patched with a second list.
 - **Independent tables.** Every Phase 3 table is new: `iga_gov_*`, plus
   `cloud_enforcement_binding`, `cloud_resource_policy_*`,
   `cloud_policy_document`, the Slack tables and `iga_gov_settings`. **No
   existing table is altered.** `agent_policies`, `agent_policy_*`,
   `provisioning_instructions`, `iga_policy` and `iga_policy_assignment` keep
   their columns, constraints and rows (probe DB1; the constraint fingerprint of
-  `agent_policies` is identical before and after `044`–`053`). Existing tables
+  `agent_policies` is identical before and after `047`–`056`). Existing tables
   are referenced only by FK: `workspaces`, `users`,
   `iga_identity_accounts`, `iga_workload`, `iga_publication`,
   `cloud_connector`, `cloud_scan_run`, `discovery_sources`.
@@ -1390,11 +1390,11 @@ sequenceDiagram
   `CASE`-shaped check is wrapped in `(…) IS TRUE`. A catalog query listing every
   Phase 3 CHECK that names a nullable column was reviewed against this rule
   (§6.3), and the NULL cases are probes (DB138–DB140).
-- The only data change to an existing table is `052`'s insert of four global
+- The only data change to an existing table is `055`'s insert of four global
   `governance:*` permissions and their binding to each workspace `admin` role,
   idempotent (`ON CONFLICT DO NOTHING`), as `003` / `004` / `005` do.
 - Re-runnable: `IF NOT EXISTS`, guarded `DO` blocks, `DROP TRIGGER IF EXISTS`.
-  Applying `044`–`053` twice succeeds (§6.3).
+  Applying `047`–`056` twice succeeds (§6.3).
 - **Bootstrap.** The repository rule is that every schema change also brings
   `001_bootstrap.sql` to the same end state (`authsec/AGENTS.md`, schema
   contract). On a fresh database the master runner executes `001` and then
@@ -1404,16 +1404,17 @@ sequenceDiagram
   that Phase 3 references), so Phase 3 cannot add its own tables to `001`
   without first closing that gap. The resolution is a prerequisite, not a
   deferral:
-  - **T3.00 (before T3.01):** bring `001` to the end state of `001`–`043` in a
+  - **T3.00 (before T3.01):** bring `001` to the end state of `001`–`046` in a
     separate change, proven by three scratch databases compared with
     `pg_dump --schema-only` after normalisation: (a) the numbered chain on a
     fresh database, (b) the new `001` alone, (c) the new `001` followed by
-    `002`–`043`; (a), (b) and (c) must be identical. Any later file that is not
+    `002`–`046`; (a), (b) and (c) must be identical. Any later file that is not
     re-runnable over the new `001` is fixed in that change.
-  - **T3.01:** adds `044`–`053` and the same objects to `001`, with the same
-    three-way comparison extended to `053`.
-  Neither step has been done; §6.3 rehearses only the numbered chain.
-- Before deployment, `044`–`053` are rehearsed on a copy of the production
+  - **T3.01:** adds `047`–`056` and the same objects to `001`, with the same
+    three-way comparison extended to `056`.
+  T3.00 is done (`05fb773`); T3.01 extends `scripts/bootstrap-parity-check.sh`
+  to `056` and adds the executable §6.3 proofs (`tests/igagovschema`).
+- Before deployment, `047`–`056` are rehearsed on a copy of the production
   schema (schema only, no customer data) and on a fresh database, separately.
   The fresh-database and synthetic-upgrade rehearsals are recorded in §6.3; the
   production-schema rehearsal is a Stage A exit (§13.1).
@@ -1423,7 +1424,7 @@ sequenceDiagram
 The SQL below is exactly what §6.3 executed. Each heading is one migration
 file.
 
-#### `044_iga_gov_ownership.sql`
+#### `047_iga_gov_ownership.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS iga_gov_owner_rule (
@@ -1466,7 +1467,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_owner
   ON iga_gov_owner (workspace_id, object_kind, coalesce(workload_id, identity_account_id), user_id, role);
 ```
 
-#### `045_iga_gov_findings.sql`
+#### `048_iga_gov_findings.sql`
 
 ```sql
 -- One row per revision the evaluator processed. Evaluation runs inside the
@@ -1628,7 +1629,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_finding_rule (
 );
 ```
 
-#### `046_iga_gov_policy.sql`
+#### `049_iga_gov_policy.sql`
 
 ```sql
 -- The AuthSec governance policy: customer intent and its lifecycle. It is
@@ -1805,7 +1806,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_target_one_canary
   ON iga_gov_target (version_id) WHERE is_canary;
 ```
 
-#### `047_iga_gov_plans_reviews.sql`
+#### `050_iga_gov_plans_reviews.sql`
 
 ```sql
 -- The immutable evidence a proposal was compiled from: per-source references
@@ -2028,7 +2029,7 @@ CREATE TRIGGER iga_gov_revalidation_immutable BEFORE UPDATE ON iga_gov_revalidat
   FOR EACH ROW EXECUTE FUNCTION authsec_row_immutable();
 ```
 
-#### `048_iga_gov_rollout.sql`
+#### `051_iga_gov_rollout.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS iga_gov_rollout (
@@ -2496,7 +2497,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_validation_item (
 );
 ```
 
-#### `049_iga_gov_jobs_events.sql`
+#### `052_iga_gov_jobs_events.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS iga_gov_job (
@@ -2572,7 +2573,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_metrics_hourly (
 );
 ```
 
-#### `050_cloud_enforcement_binding.sql`
+#### `053_cloud_enforcement_binding.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS cloud_enforcement_binding (
@@ -2640,7 +2641,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_iac_change (
 );
 ```
 
-#### `051_slack_and_notifications.sql`
+#### `054_slack_and_notifications.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspace_slack_integration (
@@ -2686,7 +2687,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_notification (
 );
 ```
 
-#### `052_iga_gov_settings_permissions.sql`
+#### `055_iga_gov_settings_permissions.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS iga_gov_settings (
@@ -2718,7 +2719,7 @@ WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
 ON CONFLICT (role_id, permission_id) DO NOTHING;
 ```
 
-#### `053_cloud_resource_policy.sql`
+#### `056_cloud_resource_policy.sql`
 
 ```sql
 -- Resource policies collected by enumeration, as IMMUTABLE observations per
@@ -2801,12 +2802,12 @@ schema accepts the prescribed states and rejects the forbidden ones. It does
 not prove any Go service, worker, AWS call or UI behaviour; those are proved
 only by §14.
 
-Run on 7 October 2026 on a newly created UTF-8 database: the 41 local files
-`001`–`042` in order, **each in one transaction** as the runner applies them
-(all succeeded), then the cached origin's `043_discovery_ingest_auth.sql`
-(read with `git show`), then `044`–`053` above in one transaction, then
-`044`–`053` a second time (idempotence; succeeded). The constraint fingerprint
-of `agent_policies` was identical before and after.
+Re-run at T3.01 (7 October 2026) on a newly created UTF-8 database by the
+real runner (`internal/migration`, as `cmd/main.go` applies it): `001`–`046`
+in order, **each in one transaction**, then `047`–`056` above, each in one
+transaction, then `047`–`056` a second time (idempotence; succeeded). Every
+table that existed at `046`, `agent_policies` included, kept an identical
+definition (columns, defaults, constraints, indexes, triggers).
 
 **One complete path across two accounts, executed.** A script on a copy of
 that database performs the R1a journey in the order this spec prescribes, every
@@ -2865,7 +2866,7 @@ probe, so their result is observed.
 
 | # | Probe | Expected | Result |
 |---|---|---|---|
-| DB1 | Legacy agent_policies row still insertable unchanged by 044-053 | accepted | pass |
+| DB1 | Legacy agent_policies row still insertable unchanged by 047-056 | accepted | pass |
 | DB2 | A governance policy cannot reference a legacy agent policy | FK violation | pass |
 | DB3 | Governance policy with an unsupported provider (R1k adds k8s) | CHECK violation | pass |
 | DB4 | Governance policy with an unknown family | CHECK violation | pass |
@@ -3029,16 +3030,17 @@ acceptance subject, attempt status) and the migration `moved` check are
 wrapped in `IS TRUE`, and the NULL cases are probes DB138–DB140.
 
 **Upgrade over existing rows (synthetic).** A second scratch database was built
-to `043` the same way, given a workspace, its `admin` role and two legacy
-selector policies in `agent_policies`, and then `044`–`053` were applied. The
+to `046` the same way, given a workspace, its `admin` role and two legacy
+selector policies in `agent_policies`, and then `047`–`056` were applied. The
 two legacy rows were byte-identical afterwards (row-text hash compared), and
 the `admin` role received `governance:author`, `approve`, `enforce` and
 `emergency`. This is not the production-schema rehearsal, which remains a
 Stage A exit.
 
-The path and probe scripts (generated by two small Python files) are
-reproduced in the T3.01 pull request; they are not committed tests (the
-workspace rule is no new tests unless asked), so T3.01's reviewer re-runs them.
+The probes, the path and the synthetic upgrade are committed as
+`tests/igagovschema` (T3.01; requested for this task), run against real
+PostgreSQL with `TEST_DATABASE_URL`, so a reviewer re-runs them with
+`go test ./tests/igagovschema/...`.
 
 ### 6.4 ERD (Phase 3 tables)
 
@@ -4873,7 +4875,7 @@ containment and admission policies are not R1k mechanisms (requirements §5.1).
 
 **Schema.** R1k adds `k8s` to `iga_gov_policy.provider` and a Kubernetes
 control key `(workspace_id, cluster_uid, namespace, service_account_uid)` in
-its own migration; nothing in `044`–`053` is pre-built for it.
+its own migration; nothing in `047`–`056` is pre-built for it.
 
 ### 12.3 R2 — time-bound access and session response
 
@@ -4924,7 +4926,7 @@ stack touches.
 | Stage | Exit |
 |---|---|
 | **0. Legacy containment** (disposition plan §5 steps 1–2) — stale-report repair, legacy audit gaps, `IGA_LEGACY_AGENT_POLICY` (default `on`), compatibility read | Gate and compatibility read merged; G1 counts requested from the operator |
-| **A. Lock** — this spec approved; migration numbers re-checked against the files; bootstrap parity to `043` (T3.00); `044`–`053` rehearsed on a production-schema copy (the fresh-database rehearsal is §6.3); enforcement template written; its §3.6 self-test run by hand in the lab account, including the `DeleteRolePermissionsBoundary` condition-key check | Rehearsal log; template review; self-test transcript |
+| **A. Lock** — this spec approved; migration numbers re-checked against the files; bootstrap parity to `046` (T3.00); `047`–`056` rehearsed on a production-schema copy (the fresh-database rehearsal is §6.3); enforcement template written; its §3.6 self-test run by hand in the lab account, including the `DeleteRolePermissionsBoundary` condition-key check | Rehearsal log; template review; self-test transcript |
 | **B. UI/UX** — every §9 view against the §7 contracts with typed fixtures, reviewed in the running console | `ui-reviewer` pass; walkthrough recorded |
 | **C. Backend** — services, workers, adapters, routes | `authsec-reviewer` pass; existing checks and `ci-iga-isolation-check.sh` green; §6.3 probes re-run |
 | **D. Integrate** — UI on real APIs; lab account end to end | §14.1 passed and recorded |
@@ -4936,8 +4938,8 @@ work items owned by the discovery and agent repositories (§12.2).
 
 | Task | What | Depends on |
 |---|---|---|
-| T3.00 | Bring `001_bootstrap.sql` to the end state of `001`–`043`, proven by the three-way schema comparison of §6.1; fix any later file that is not re-runnable over it | A |
-| T3.01 | Migrations `044`–`053` as in §6.2, and the same objects in `001` (three-way comparison to `053`); Go models; repositories | T3.00 |
+| T3.00 | Bring `001_bootstrap.sql` to the end state of `001`–`046`, proven by the three-way schema comparison of §6.1; fix any later file that is not re-runnable over it | A |
+| T3.01 | Migrations `047`–`056` as in §6.2, and the same objects in `001` (three-way comparison to `056`); Go models; repositories | T3.00 |
 | T3.02 | `IGA_POLICY` gate; Phase 3 schema verification by relation and column; capabilities `policy` block with provider support | T3.01 |
 | T3.03 | Activity sample prioritises workload-bound and controlled roles (§2.6) | — |
 | T3.03b | Discovery template version: resource-policy collection (§3.9) — the collected forms; immutable observations, documents and coverage; region completeness; retention — and the read-only migration-evidence actions of §11 (ECS services and tasks, Lambda aliases, versions and event-source mappings, Auto Scaling groups, launch template versions, instance-profile associations) | T3.01 |
@@ -5229,7 +5231,7 @@ by a recorded run, never by code review.
     outcomes; an `unused_service` finding speaks only for identity-policy
     access (§3.4, §8.7).
 17. Drift is never auto-reconciled in R1a.
-18. Phase 3 tables live in numbered migrations `044`–`053`, alter no existing
+18. Phase 3 tables live in numbered migrations `047`–`056`, alter no existing
     table, and are verified by their own gate (§4.3, §6.1).
 19. The console keeps four destinations; Policy holds the workflow in
     secondary views; Logs carries policy events; Connections keeps collection
@@ -5251,7 +5253,7 @@ by a recorded run, never by code review.
     workloads without merging them, and is verified by complete live
     migration evidence; reduction of either role is a later, separately
     approved change (§11).
-25. Bootstrap parity to `043` is a prerequisite of the Phase 3 migrations, not
+25. Bootstrap parity to `046` is a prerequisite of the Phase 3 migrations, not
     a deferred question (§6.1).
 26. Logs shows recorded events only; sample events exist only in the preview
     shown while `IGA_POLICY` is off (§9.6).
@@ -5266,7 +5268,7 @@ by a recorded run, never by code review.
 | Question | Default if not decided by Stage A | Owner |
 |---|---|---|
 | Origin divergence: cached `origin/authsec-staging` is 19 commits ahead (including `043`); the local branch was not updated for this review | T3.01 re-checks numbering and §6.3 is re-run on the merged chain | Backend |
-| Production-schema rehearsal of `044`–`053` | Stage A exit; not done | Backend + operator |
+| Production-schema rehearsal of `047`–`056` | Stage A exit; not done | Backend + operator |
 | Legacy usage in production (disposition G1) | Gate stays `on`; compatibility view ships | Operator |
 | Slack app distribution | One AuthSec app; signing secret in env `AUTHSEC_SLACK_SIGNING_SECRET`, client id/secret in Vault | Product + platform |
 | GitHub App permission upgrade (contents + pull requests write) | Requested only when a customer maps an IaC source | Product |
