@@ -1,6 +1,8 @@
 package repositories
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -87,6 +90,37 @@ var ErrNotRestorable = errors.New("object is not restorable")
 var ErrNotAGrant = errors.New("only Allow statements are grants")
 
 var returningID = clause.Returning{Columns: []clause.Column{{Name: "id"}}}
+
+// txTenant returns ws as the tenant context, on tx's own context, and tx's
+// connection, so a raw statement of the caller's transaction (or, given the
+// root handle, a statement of its own) runs through the tenancy layer:
+// workspace_id = $1 is bound to ws, and on a bare *sql.DB the write runs
+// under row-level security. A context already carrying another workspace is
+// refused rather than overridden.
+func txTenant(tx *gorm.DB, ws uuid.UUID) (context.Context, tenancy.Querier, error) {
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, nil, fmt.Errorf("tenancy: a transaction of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), tx.Statement.ConnPool, nil
+}
+
+// scanIDs reads a one-column result of ids (a RETURNING id) and closes rows.
+func scanIDs(rows *sql.Rows) ([]uuid.UUID, error) {
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 
 // ErrNoPassTime means a node, edge, support, revision, lifecycle-event or
 // publication row reached the write without the projection pass's timestamp. Refused, never defaulted: the column default
@@ -289,18 +323,26 @@ func (r *igaGraphRepository) RetirePolicyIncarnation(tx *gorm.DB, ws, policyID u
 		Error; err != nil {
 		return nil, err
 	}
-	var stmts []uuid.UUID
-	if err := tx.Raw(`UPDATE iga_entitlements SET lifecycle = 'retired', retired_reason = ?, updated_at = ?
-	                   WHERE workspace_id = ? AND policy_id = ? AND lifecycle <> 'retired'
-	                   RETURNING id`, models.RetiredPolicyRecreated, now, ws, policyID).
-		Scan(&stmts).Error; err != nil {
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `UPDATE iga_entitlements SET lifecycle = 'retired', retired_reason = $2, updated_at = $3
+	                   WHERE workspace_id = $1 AND policy_id = $4 AND lifecycle <> 'retired'
+	                   RETURNING id`, models.RetiredPolicyRecreated, now, policyID)
+	if err != nil {
+		return nil, err
+	}
+	stmts, err := scanIDs(rows)
+	if err != nil {
 		return nil, err
 	}
 	end := map[string]any{"state": models.RelEnded, "valid_to": now, "ended_reason": models.EndedPolicyRecreated}
-	if err := tx.Model(&models.IGAAccessEdge{}).
-		Where(`workspace_id = ? AND state <> ? AND assignment_id IN
-		       (SELECT id FROM iga_policy_assignment WHERE workspace_id = ? AND policy_id = ?)`,
-			ws, models.RelEnded, ws, policyID).Updates(end).Error; err != nil {
+	if _, err := tenancy.ExecContext(ctx, q, `UPDATE iga_access_edges
+		   SET state = $2, valid_to = $3, ended_reason = $4, updated_at = $5
+		 WHERE workspace_id = $1 AND state <> $2 AND assignment_id IN
+		       (SELECT id FROM iga_policy_assignment WHERE workspace_id = $1 AND policy_id = $6)`,
+		models.RelEnded, now, models.EndedPolicyRecreated, time.Now(), policyID); err != nil {
 		return nil, err
 	}
 	if err := tx.Model(&models.IGAPolicyAssignment{}).
@@ -458,20 +500,29 @@ func (r *igaGraphRepository) UpsertCredential(tx *gorm.DB, c *models.IGACredenti
 		return uuid.Nil, err
 	}
 	if c.SourceKey != "" {
-		var ids []uuid.UUID
-		if err := tx.Raw(`
+		ctx, q, err := txTenant(tx, c.WorkspaceID)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		rows, err := tenancy.QueryContext(ctx, q, `
 			UPDATE iga_credentials
-			   SET credential_type = ?, issuer = ?, key_identifier = ?, expires_at = ?, last_used_at = ?,
-			       rotation_posture = ?, lifecycle = ?, last_seen_at = ?, updated_at = ?
-			 WHERE id = (SELECT id FROM iga_credentials
-			              WHERE workspace_id = ? AND provider = ? AND source_key = ?
+			   SET credential_type = $2, issuer = $3, key_identifier = $4, expires_at = $5, last_used_at = $6,
+			       rotation_posture = $7, lifecycle = $8, last_seen_at = $9, updated_at = $9
+			 WHERE workspace_id = $1
+			   AND id = (SELECT id FROM iga_credentials
+			              WHERE workspace_id = $1 AND provider = $10 AND source_key = $11
 			              ORDER BY (lifecycle NOT IN ('revoked', 'expired')) DESC,
 			                       last_seen_at DESC, created_at DESC, id
 			              LIMIT 1)
 			RETURNING id`,
 			c.CredentialType, c.Issuer, c.KeyIdentifier, c.ExpiresAt, c.LastUsedAt,
-			c.RotationPosture, c.Lifecycle, c.LastSeenAt, c.LastSeenAt,
-			c.WorkspaceID, c.Provider, c.SourceKey).Scan(&ids).Error; err != nil {
+			c.RotationPosture, c.Lifecycle, c.LastSeenAt,
+			c.Provider, c.SourceKey)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		ids, err := scanIDs(rows)
+		if err != nil {
 			return uuid.Nil, err
 		}
 		if len(ids) == 1 {
@@ -660,9 +711,12 @@ func (r *igaGraphRepository) PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID)
 // the barrier row FOR UPDATE (AssertHeldTx), which serializes projection per
 // workspace. UNIQUE (workspace_id, scan_run_id) backstops a double publish.
 func (r *igaGraphRepository) NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, error) {
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return 0, err
+	}
 	var next int64
-	err := tx.Raw(`SELECT COALESCE(max(rev), 0) + 1 FROM iga_publication WHERE workspace_id = ?`, ws).
-		Scan(&next).Error
+	err = tenancy.QueryRowContext(ctx, q, `SELECT COALESCE(max(rev), 0) + 1 FROM iga_publication WHERE workspace_id = $1`, nil, &next)
 	return next, err
 }
 
@@ -670,15 +724,19 @@ func (r *igaGraphRepository) NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, err
 // published: the base the next publication's cumulative manifest is built on
 // (D-57). Read under the same barrier as NextRevision.
 func (r *igaGraphRepository) LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.RawMessage, error) {
-	var rows []struct{ Manifest json.RawMessage }
-	if err := tx.Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? ORDER BY rev DESC LIMIT 1`, ws).
-		Scan(&rows).Error; err != nil {
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
+	var manifest []byte
+	err = tenancy.QueryRowContext(ctx, q, `SELECT manifest FROM iga_publication WHERE workspace_id = $1 ORDER BY rev DESC LIMIT 1`, nil, &manifest)
+	if errors.Is(err, tenancy.ErrNotFound) {
 		return nil, nil
 	}
-	return rows[0].Manifest, nil
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(manifest), nil
 }
 
 func (r *igaGraphRepository) InsertPublication(tx *gorm.DB, p *models.IGAPublication) error {
