@@ -159,16 +159,16 @@ func TestTrustProtectedPartitions(t *testing.T) {
 	pod := snap.EdgePartitionFor(models.RelTypeCanAssume, models.MechanismEKSPodIdentity, "")
 	role := uuid.New()
 
-	if _, _, ok := protected(pod, Exclusions{UnattributedPodIdentity: []uuid.UUID{role}}); !ok {
+	if _, _, ok := protected(pod, Exclusions{UnattributedPodIdentity: []uuid.UUID{role}}, unreadableTargets{}); !ok {
 		t.Error("pod-identity partition does not protect a role with an unattributed association")
 	}
-	if _, _, ok := protected(pod, Exclusions{UnreadableTrust: []uuid.UUID{role}}); ok {
+	if _, _, ok := protected(pod, Exclusions{UnreadableTrust: []uuid.UUID{role}}, unreadableTargets{}); ok {
 		t.Error("an unreadable trust DOCUMENT protected pod-identity edges, which it does not declare")
 	}
-	if _, _, ok := protected(trust, Exclusions{UnattributedPodIdentity: []uuid.UUID{role}}); ok {
+	if _, _, ok := protected(trust, Exclusions{UnattributedPodIdentity: []uuid.UUID{role}}, unreadableTargets{}); ok {
 		t.Error("an unattributed association protected trust-document edges")
 	}
-	if _, _, ok := protected(trust, Exclusions{UnreadableTrust: []uuid.UUID{role}}); !ok {
+	if _, _, ok := protected(trust, Exclusions{UnreadableTrust: []uuid.UUID{role}}, unreadableTargets{}); !ok {
 		t.Error("trust partition does not protect a role whose document was unreadable")
 	}
 }
