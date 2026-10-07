@@ -1,6 +1,7 @@
 package enduser
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -31,6 +32,39 @@ func NewTenantCIBAController() (*TenantCIBAController, error) {
 	}, nil
 }
 
+// authenticateCIBAClient authenticates the calling OAuth client
+// (client_secret_basic; services.AuthenticateClient) and returns its
+// client_id. A client_id in the body must name the same client. Without a
+// credential the request is refused unless the operator set
+// CIBA_ALLOW_UNAUTHENTICATED_CLIENTS=true for SDKs that cannot send one yet
+// (AS-044); a credential that is sent is always verified.
+func authenticateCIBAClient(c *gin.Context, bodyClientID string) (string, bool) {
+	tokenEndpoint := ""
+	if config.AppConfig != nil {
+		tokenEndpoint = config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	}
+	client, err := services.AuthenticateClient(c.Request.Context(), config.DB, c.Request, tokenEndpoint)
+	if err == nil {
+		if bodyClientID != "" && bodyClientID != client.ClientID {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":             models.TenantCIBAErrorInvalidClient,
+				"error_description": "client_id does not match the authenticated client",
+			})
+			return "", false
+		}
+		return client.ClientID, true
+	}
+	if !services.HasClientCredentials(c.Request) && config.CIBAAllowUnauthenticatedClients() && bodyClientID != "" {
+		log.Printf("[CIBA] DEPRECATED: unauthenticated workspace CIBA call for client_id=%s (CIBA_ALLOW_UNAUTHENTICATED_CLIENTS=true)", bodyClientID)
+		return bodyClientID, true
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{
+		"error":             models.TenantCIBAErrorInvalidClient,
+		"error_description": "client authentication required (HTTP Basic client_id:client_secret)",
+	})
+	return "", false
+}
+
 // InitiateTenantCIBA initiates CIBA authentication for tenant users
 // @Summary Initiate CIBA authentication for tenant users
 // @Description Initiates CIBA (push notification) authentication flow for tenant users
@@ -49,11 +83,15 @@ func (tcc *TenantCIBAController) InitiateTenantCIBA(c *gin.Context) {
 		return
 	}
 
-	// Validate required fields
-	if req.ClientID == "" || req.Email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "client_id and email are required"})
+	if req.Email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
 		return
 	}
+	clientID, ok := authenticateCIBAClient(c, req.ClientID)
+	if !ok {
+		return
+	}
+	req.ClientID = clientID
 
 	// Normalize email
 	req.Email = strings.ToLower(req.Email)
@@ -147,10 +185,15 @@ func (tcc *TenantCIBAController) PollTenantCIBAToken(c *gin.Context) {
 	}
 
 	// Validate required fields
-	if req.AuthReqID == "" || req.ClientID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_req_id and client_id are required"})
+	if req.AuthReqID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_req_id is required"})
 		return
 	}
+	clientID, ok := authenticateCIBAClient(c, req.ClientID)
+	if !ok {
+		return
+	}
+	req.ClientID = clientID
 
 	// Call CIBA service
 	response, err := tcc.cibaService.PollTenantCIBAToken(&req)

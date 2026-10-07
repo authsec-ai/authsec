@@ -785,6 +785,17 @@ func ExtractClientIDFromBasicAuth(r *http.Request) string {
 	return clientID
 }
 
+// HasClientCredentials reports whether the request presents a client
+// credential (Basic auth or a client assertion), valid or not. Callers that
+// tolerate unauthenticated clients use it so a wrong credential is still
+// refused rather than treated as "none sent".
+func HasClientCredentials(r *http.Request) bool {
+	if _, _, ok := r.BasicAuth(); ok {
+		return true
+	}
+	return r.FormValue("client_assertion") != ""
+}
+
 // LookupClientByID loads an MCPOAuthClient by its client_id string.
 func LookupClientByID(ctx context.Context, db *gorm.DB, clientID string) (*models.MCPOAuthClient, error) {
 	var client models.MCPOAuthClient

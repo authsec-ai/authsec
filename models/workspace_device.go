@@ -54,6 +54,9 @@ type TenantCIBAAuthRequest struct {
 
 	// Client information
 	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
+	// ResourceServerID is the resource server the user approves access to;
+	// the poll must name the same one (066, AS-044).
+	ResourceServerID *uuid.UUID `json:"resource_server_id,omitempty" gorm:"type:uuid"`
 
 	// Push notification
 	DeviceTokenID  uuid.UUID `json:"device_token_id" gorm:"type:uuid;not null"`
@@ -339,4 +342,6 @@ const (
 	TenantCIBAErrorNoDevice             = "no_device_registered"  // User has no push device
 	TenantCIBAErrorTenantNotFound       = "tenant_not_found"      // Tenant not found
 	TenantCIBAErrorInvalidClient        = "invalid_client"        // Client ID invalid
+	TenantCIBAErrorInvalidScope         = "invalid_scope"         // No requested scope is granted by RBAC
+	TenantCIBAErrorInvalidGrant         = "invalid_grant"         // auth_req_id issued to another client or resource
 )

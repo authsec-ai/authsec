@@ -37,7 +37,18 @@ func NewCIBAAuthController() (*CIBAAuthController, error) {
 	}, nil
 }
 
-// InitiateCIBAAuth initiates CIBA authentication flow
+// InitiateCIBAAuth initiates CIBA authentication flow.
+//
+// Legacy surface (deprecated; successor /oauth/bc-authorize). It does not
+// authenticate the client: the Python SDK (authsec_sdk.ciba.CIBAClient, admin
+// flow) posts only {login_hint, binding_message} and has no client secret to
+// send, so requiring client authentication here would break every SDK
+// release in the field (AS-015). Containment instead: the request must name
+// workspace_id or an approved client_id, the user is looked up only inside
+// that workspace, a request started for a client can be polled only with that
+// client_id, and the minted session lasts 24h. New integrations use
+// /oauth/bc-authorize, which authenticates the client and binds the poll.
+//
 // @Summary Initiate CIBA authentication
 // @Description Initiates CIBA flow by looking up user by email and sending push notification to their registered device
 // @Tags CIBA Authentication

@@ -23,6 +23,8 @@ type clientContext struct {
 	RSID        uuid.UUID
 	RSAudience  string
 	ClientUUID  uuid.UUID // mcp_oauth_clients.id (UUID PK)
+	Client      *models.MCPOAuthClient
+	RS          *models.ResourceServer
 }
 
 // TenantCIBAAuthService handles CIBA authentication for tenant users
@@ -88,26 +90,26 @@ func (s *TenantCIBAAuthService) lookupClientContext(clientIDStr, resourceURI str
 		return clientContext{}, fmt.Errorf("client not found: %w", err)
 	}
 
-	var reg models.ResourceServerClientRegistration
-
 	if resourceURI != "" {
-		// Caller specified the target resource — resolve that RS, then require an
-		// approved registration binding this client to exactly that RS.
+		// Caller specified the target resource. Resolve it only among the
+		// resource servers this client has an approved registration on, so a
+		// resource URI reused in another workspace can never be picked.
 		var rs models.ResourceServer
-		if err := config.DB.Where("resource_uri = ?", resourceURI).First(&rs).Error; err != nil {
-			return clientContext{}, fmt.Errorf("unknown resource %q: %w", resourceURI, err)
-		}
-		if err := config.DB.
-			Where("oauth_client_id = ? AND resource_server_id = ? AND status = ?",
-				oauthClient.ID, rs.ID, models.ClientRegStatusApproved).
-			First(&reg).Error; err != nil {
+		err := config.DB.
+			Joins("JOIN resource_server_client_registrations r ON r.resource_server_id = resource_servers.id AND r.workspace_id = resource_servers.workspace_id").
+			Where("resource_servers.resource_uri = ? AND r.oauth_client_id = ? AND r.status = ?",
+				resourceURI, oauthClient.ID, models.ClientRegStatusApproved).
+			First(&rs).Error
+		if err != nil {
 			return clientContext{}, fmt.Errorf("client %s is not approved for resource %q: %w", clientIDStr, resourceURI, err)
 		}
 		return clientContext{
-			WorkspaceID: reg.WorkspaceID,
+			WorkspaceID: rs.WorkspaceID,
 			RSID:        rs.ID,
 			RSAudience:  rs.ResourceURI,
 			ClientUUID:  oauthClient.ID,
+			Client:      &oauthClient,
+			RS:          &rs,
 		}, nil
 	}
 
@@ -125,7 +127,7 @@ func (s *TenantCIBAAuthService) lookupClientContext(clientIDStr, resourceURI str
 	if len(regs) > 1 {
 		return clientContext{}, ErrCIBAResourceRequired
 	}
-	reg = regs[0]
+	reg := regs[0]
 
 	var rs models.ResourceServer
 	if err := config.DB.
@@ -139,7 +141,38 @@ func (s *TenantCIBAAuthService) lookupClientContext(clientIDStr, resourceURI str
 		RSID:        rs.ID,
 		RSAudience:  rs.ResourceURI,
 		ClientUUID:  oauthClient.ID,
+		Client:      &oauthClient,
+		RS:          &rs,
 	}, nil
+}
+
+// lookupWorkspaceUser finds the active user with this email in the one
+// workspace the client resolved to. users.client_id is not a workspace and is
+// never used to select the user (AS-044).
+func lookupWorkspaceUser(ctx context.Context, workspaceID uuid.UUID, email string) (*models.User, error) {
+	var user models.User
+	err := config.DB.WithContext(ctx).
+		Where("workspace_id = ? AND LOWER(email) = ? AND active = ?", workspaceID, strings.ToLower(strings.TrimSpace(email)), true).
+		First(&user).Error
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// ErrCIBANoGrantableScopes is returned when none of the requested scopes is
+// granted to the user on the resource server by RBAC.
+var ErrCIBANoGrantableScopes = fmt.Errorf("none of the requested scopes is granted to this user for the resource")
+
+// grantableScopes intersects requested scopes with the resource server's
+// scopes_supported and the user's RBAC-derived scopes (the resolver
+// authorization_code uses). OIDC core scopes pass only for OIDC clients.
+func grantableScopes(ctx context.Context, cc clientContext, userID uuid.UUID, requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		return nil, nil
+	}
+	return NewScopeResolver(config.DB).ResolveGrantableScopes(
+		ctx, cc.WorkspaceID.String(), userID.String(), cc.RSID.String(), requested, cc.RS, cc.Client)
 }
 
 // InitiateTenantCIBAAuth initiates CIBA authentication for tenant users
@@ -162,10 +195,10 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	clientUUID := ctx.ClientUUID
 
 	tenantDB := config.DB
-
-	// Step 2: Look up user in workspace database
 	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
-	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID, workspaceUUID)
+
+	// Step 2: Look up the user in the client's workspace only.
+	user, err := lookupWorkspaceUser(context.Background(), workspaceUUID, req.Email)
 	if err != nil {
 		return &models.TenantCIBAInitiateResponse{
 			Error:            models.TenantCIBAErrorUserNotFound,
@@ -189,23 +222,31 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 		return nil, fmt.Errorf("failed to generate auth_req_id: %w", err)
 	}
 
-	// Default scopes if not provided
-	scopes := req.Scopes
-	if len(scopes) == 0 {
-		scopes = []string{"openid", "email", "profile"}
+	// The token can carry only scopes the user holds on this resource server
+	// (RBAC), never simply what the client asked for.
+	scopes, err := grantableScopes(context.Background(), ctx, user.ID, req.Scopes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve scopes: %w", err)
+	}
+	if len(req.Scopes) > 0 && len(scopes) == 0 {
+		return &models.TenantCIBAInitiateResponse{
+			Error:            models.TenantCIBAErrorInvalidScope,
+			ErrorDescription: ErrCIBANoGrantableScopes.Error(),
+		}, nil
 	}
 
 	// Step 5: Create CIBA authentication request
 	cibaRequest := &models.TenantCIBAAuthRequest{
-		AuthReqID:      authReqID,
-		UserID:         user.ID,
-		WorkspaceID:    workspaceUUID,
-		UserEmail:      strings.ToLower(req.Email),
-		ClientID:       &clientUUID,
-		DeviceTokenID:  devices[0].ID,
-		BindingMessage: req.BindingMessage,
-		Scopes:         models.JSONStringArray(scopes),
-		Status:         "pending",
+		AuthReqID:        authReqID,
+		UserID:           user.ID,
+		WorkspaceID:      workspaceUUID,
+		UserEmail:        strings.ToLower(req.Email),
+		ClientID:         &clientUUID,
+		ResourceServerID: &ctx.RSID,
+		DeviceTokenID:    devices[0].ID,
+		BindingMessage:   req.BindingMessage,
+		Scopes:           models.JSONStringArray(scopes),
+		Status:           "pending",
 	}
 
 	if err := workspaceRepo.CreateTenantCIBAAuthRequest(cibaRequest); err != nil {
@@ -346,6 +387,16 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 		}, nil
 	}
 
+	// The request may be polled only by the client that started it, for the
+	// resource server the user was asked about (AS-044).
+	if request.ClientID == nil || *request.ClientID != clientCtx.ClientUUID ||
+		request.ResourceServerID == nil || *request.ResourceServerID != clientCtx.RSID {
+		return &models.TenantCIBATokenResponse{
+			Error:            models.TenantCIBAErrorInvalidGrant,
+			ErrorDescription: "auth_req_id was not issued to this client for this resource",
+		}, nil
+	}
+
 	if request.IsExpired() {
 		return &models.TenantCIBATokenResponse{
 			Error:            models.TenantCIBAErrorExpiredToken,
@@ -368,6 +419,25 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 	}
 
 	if request.Status == "approved" {
+		// Re-check RBAC at issuance: a role removed after initiation must not
+		// still be minted into the token.
+		scopes, serr := grantableScopes(context.Background(), clientCtx, request.UserID, request.Scopes)
+		if serr != nil {
+			return nil, fmt.Errorf("failed to resolve scopes: %w", serr)
+		}
+		if len(request.Scopes) > 0 && len(scopes) == 0 {
+			return &models.TenantCIBATokenResponse{
+				Error:            models.TenantCIBAErrorInvalidScope,
+				ErrorDescription: ErrCIBANoGrantableScopes.Error(),
+			}, nil
+		}
+		if _, uerr := lookupWorkspaceUser(context.Background(), workspaceUUID, request.UserEmail); uerr != nil {
+			return &models.TenantCIBATokenResponse{
+				Error:            models.TenantCIBAErrorAccessDenied,
+				ErrorDescription: "User is no longer active in this workspace",
+			}, nil
+		}
+
 		// Atomically claim the approved→consumed transition BEFORE minting, so
 		// two concurrent polls cannot both issue a token (§6 single-mint). Only
 		// the poll that wins the conditional UPDATE proceeds to generate a token.
@@ -388,7 +458,7 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 		token, err := s.generateJWTToken(
 			request.UserID, workspaceUUID,
 			clientCtx.ClientUUID, clientCtx.RSID, clientCtx.RSAudience,
-			req.ClientID, request.UserEmail, request.Scopes,
+			req.ClientID, request.UserEmail, scopes,
 		)
 		if err != nil {
 			// Minting failed AFTER we claimed approved→consumed. Revert to
@@ -414,7 +484,7 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 			AccessToken: token,
 			TokenType:   "Bearer",
 			ExpiresIn:   ttl,
-			Scope:       strings.Join(request.Scopes, " "),
+			Scope:       strings.Join(scopes, " "),
 		}, nil
 	}
 
