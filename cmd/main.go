@@ -176,6 +176,25 @@ func main() {
 		log.Printf("[graph] %s is off: Phase 1 scanning, no projection", services.GraphProjectionEnv)
 	}
 
+	// IGA_POLICY (SPEC-iga-phase3-policy.md §4.3, T3.02): the Phase 3 policy
+	// product. ONE switch, read ONCE, default off. On requires
+	// IGA_GRAPH_PROJECTION=on (read live from the graph gate) and the Phase 3
+	// schema (047-056) verified by relation, retried on error and never cached
+	// as an answer. FAIL CLOSED: until all of that holds, every
+	// /api/iga/v1/policy route answers 503 policy_unavailable and
+	// /capabilities says why. Legacy agent-policy routes and workers are not
+	// gated by it.
+	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
+	services.SetPolicyGate(policyGate)
+	if policyGate.Enabled() {
+		if state, reason, _ := policyGate.Status(); state != services.PolicyOn {
+			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
+		}
+		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	} else {
+		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+	}
+
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {

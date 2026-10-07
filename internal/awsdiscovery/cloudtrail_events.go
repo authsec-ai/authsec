@@ -2,7 +2,9 @@ package awsdiscovery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,16 +22,31 @@ import (
 // is built around: LookupEvents is account-wide, not identity-scoped, and
 // there is no server-side filter for "calls made while assuming role R".
 //
-// WHAT THIS FILE DOES NOT CLAIM. Matching an event back to a scanned identity
-// is done by comparing Event.Username against the identity's own name -- the
-// same heuristic CloudTrail's own console search box uses, not a guaranteed
-// join. For an assumed role, Username is the SESSION's display form (for
-// example "AssumedRole/MyRole/session-name" or just "session-name",
-// inconsistently across event sources), not the role's ARN, so a match here
-// is evidence worth recording, never proof of identity the way an IAM-issued
-// ARN is. Every event this reader returns is kept exactly because it could
-// not be silently and confidently attributed, and the caller decides what
-// counts as a match.
+// ATTRIBUTION (SPEC-iga-phase3-policy.md §8.6, T3.04). An event is tied to an
+// identity by the record's own userIdentity, never by a name:
+//
+//   - an assumed-role session (and a federated-user session) by
+//     userIdentity.sessionContext.sessionIssuer: its arn is the role's ARN and
+//     its principalId the role's RoleId, the incarnation. Username is the
+//     SESSION's display form ("session-name", or "AssumedRole/R/session-name",
+//     inconsistently across event sources), so matching it against role names
+//     attributed a session named like some other role to that role, and never
+//     attributed the role's own sessions. It is not used for a session.
+//   - an IAM user's own call by userIdentity.arn and principalId (AIDA...).
+//   - a record that carries no userIdentity at all -- not one CloudTrail
+//     writes, but the shape of a LookupEvents result whose CloudTrailEvent
+//     could not be read -- falls back to the legacy hint, Username against an
+//     IAM USER's name only, and says so (AttributionUsername).
+//
+// Any other principal (root, an AWS service, another account, an Identity
+// Center user, a session whose issuer the record omits) is attributed to
+// nothing. The caller decides whether an attribution key names one of its
+// identities and checks the incarnation (TrailEvent.Attribution).
+//
+// The record's errorCode and errorMessage are read too: an authorization
+// error code marks the event AuthorizationDenied, and the message's documented
+// phrase names which policy type denied it (ClassifyDenial). The message text
+// itself is never kept.
 //
 // WHY BOUNDED. LookupEvents has no documented hard rate limit as generous as
 // most list calls, and an account's default trail can hold ninety days of
@@ -85,7 +102,147 @@ type TrailEvent struct {
 	// entirely for a normal successful event, not merely empty, so a caller
 	// can tell "no error recorded" from "recorded and empty".
 	ErrorCode string
-	Denied    bool
+	// Denied is the legacy flag: true for ANY error code (a throttle or a
+	// NoSuchBucket included). AuthorizationDenied is the narrow one.
+	Denied bool
+
+	// The record's userIdentity (T3.04). PrincipalType is userIdentity.type
+	// ("AssumedRole", "IAMUser", "FederatedUser", "Root", "AWSService", ...);
+	// "" when the record carried no userIdentity.
+	PrincipalType string
+	// PrincipalARN and PrincipalID are userIdentity.arn and principalId: for
+	// an assumed role "arn:aws:sts::<acct>:assumed-role/<role>/<session>" and
+	// "AROA...:<session>"; for an IAM user its ARN and AIDA... id.
+	PrincipalARN string
+	PrincipalID  string
+	// SessionIssuer* are userIdentity.sessionContext.sessionIssuer: for an
+	// assumed role, the ROLE -- its ARN (with its path) and its RoleId. Empty
+	// for a call that was not made from a session.
+	SessionIssuerType        string
+	SessionIssuerARN         string
+	SessionIssuerPrincipalID string
+	// SessionName is the RoleSessionName: the last segment of an assumed-role
+	// userIdentity.arn. Empty for anything but an assumed-role session.
+	SessionName string
+
+	// AuthorizationDenied is true only for the authorization error codes
+	// (AuthorizationErrorCodes): AWS refused the call on a policy decision.
+	AuthorizationDenied bool
+	// DenialPolicyType is set exactly when AuthorizationDenied: the policy type
+	// errorMessage names (ClassifyDenial), DenialUnknown when it names none.
+	DenialPolicyType string
+}
+
+// AuthorizationErrorCodes are the error codes that mean AWS denied a call on
+// an authorization decision (SPEC-iga-phase3-policy.md §8.6). Any other
+// error code -- a throttle, a missing resource, a validation error -- is not
+// a denial and must never be read as one.
+var AuthorizationErrorCodes = map[string]bool{
+	"AccessDenied":                 true,
+	"AccessDeniedException":        true,
+	"UnauthorizedOperation":        true,
+	"Client.UnauthorizedOperation": true,
+}
+
+// Denial policy types (sanitized_facts.denial_policy_type, §8.6): which policy
+// type AWS's access-denied message names as the reason.
+const (
+	DenialPermissionsBoundary = "permissions_boundary"
+	DenialIdentityPolicy      = "identity_policy"
+	DenialSCP                 = "scp"
+	DenialRCP                 = "rcp"
+	DenialResourcePolicy      = "resource_policy"
+	DenialSessionPolicy       = "session_policy"
+	DenialUnknown             = "unknown"
+)
+
+// denialReason matches the reason clause of AWS's access-denied messages
+// ("Access denied error messages", IAM User Guide): an implicit deny reads
+// "... because no <policy type> allows the <action> action", an explicit one
+// "... with an explicit deny in a(n) <policy type>". Anchored on those two
+// clauses so a policy-type phrase anywhere else in the message (a resource
+// name, a session name) is not taken for the reason.
+var denialReason = regexp.MustCompile(`(?i)(?:because no|with an explicit deny in an?)\s+` +
+	`(permissions boundary|identity-based policy|service control policy|resource control policy|` +
+	`resource-based policy|session policy|vpc endpoint policy)`)
+
+// ClassifyDenial names the policy type an access-denied message attributes the
+// denial to, from AWS's documented phrases. A message with no recognised
+// reason clause -- an older or service-specific format, an encoded EC2
+// authorization message, a VPC endpoint policy (not a type this enum names) --
+// is DenialUnknown: never guessed.
+func ClassifyDenial(message string) string {
+	m := denialReason.FindStringSubmatch(message)
+	if m == nil {
+		return DenialUnknown
+	}
+	switch strings.ToLower(m[1]) {
+	case "permissions boundary":
+		return DenialPermissionsBoundary
+	case "identity-based policy":
+		return DenialIdentityPolicy
+	case "service control policy":
+		return DenialSCP
+	case "resource control policy":
+		return DenialRCP
+	case "resource-based policy":
+		return DenialResourcePolicy
+	case "session policy":
+		return DenialSessionPolicy
+	}
+	return DenialUnknown
+}
+
+// How an event was tied to an identity (sanitized_facts.attribution).
+const (
+	// AttributionSessionIssuer: a session, by sessionContext.sessionIssuer's
+	// ARN and principalId (the role's RoleId).
+	AttributionSessionIssuer = "session_issuer"
+	// AttributionPrincipalARN: an IAM user's own call, by userIdentity.arn and
+	// principalId.
+	AttributionPrincipalARN = "principal_arn"
+	// AttributionUsername: a record with no userIdentity; Username matched
+	// against an IAM user's name. A hint, and only ever an IAM user.
+	AttributionUsername = "username"
+)
+
+// Attribution is what the caller looks an event's identity up by.
+type Attribution struct {
+	// How is one of the Attribution* constants; "" means the event names no
+	// identity this reader can attribute, and it must not be matched at all.
+	How string
+	// ARN is the identity's ARN (the session issuer's, or the user's); empty
+	// for AttributionUsername.
+	ARN string
+	// UniqueID is the identity's immutable id as the record states it (RoleId
+	// or AIDA...). When both it and the identity's recorded unique id are
+	// known they must be equal: a role recreated under the same ARN is a
+	// different principal, and its predecessor's events are not its own.
+	UniqueID string
+	// UserName is the IAM user name for AttributionUsername.
+	UserName string
+}
+
+// Attribution says how this event may be tied to an identity (see the file
+// header). Pure: the caller resolves the key against its own inventory.
+func (e TrailEvent) Attribution() Attribution {
+	switch {
+	case e.PrincipalType == "" && e.PrincipalARN == "" && e.SessionIssuerARN == "":
+		// No userIdentity in the record at all: the legacy hint, users only.
+		if e.Username == "" {
+			return Attribution{}
+		}
+		return Attribution{How: AttributionUsername, UserName: e.Username}
+	case e.SessionIssuerARN != "":
+		// Any session -- an assumed role, a federated user -- belongs to its
+		// issuer, whatever its own display name is.
+		return Attribution{How: AttributionSessionIssuer, ARN: e.SessionIssuerARN, UniqueID: e.SessionIssuerPrincipalID}
+	case e.PrincipalType == "IAMUser" && e.PrincipalARN != "":
+		return Attribution{How: AttributionPrincipalARN, ARN: e.PrincipalARN, UniqueID: e.PrincipalID}
+	}
+	// An assumed role whose record omits its issuer, root, an AWS service,
+	// another account, an Identity Center user: nothing to attribute to.
+	return Attribution{}
 }
 
 // CloudTrailReader reads recent management events for one region.
@@ -135,9 +292,10 @@ func (r *CloudTrailReader) RecentEvents(ctx context.Context) ([]TrailEvent, erro
 	}
 }
 
-// trailEventFrom normalises one SDK event. The error code is read out of the
-// embedded CloudTrailEvent JSON: LookupEvents' own typed fields do not surface
-// it, only the raw event record does.
+// trailEventFrom normalises one SDK event. The error code, the error message
+// and the principal are read out of the embedded CloudTrailEvent JSON:
+// LookupEvents' own typed fields surface none of them, only the raw event
+// record does.
 func trailEventFrom(e cttypes.Event) TrailEvent {
 	out := TrailEvent{
 		EventID:     aws.ToString(e.EventId),
@@ -148,18 +306,74 @@ func trailEventFrom(e cttypes.Event) TrailEvent {
 	if e.EventTime != nil {
 		out.EventTime = *e.EventTime
 	}
-	if code := errorCodeFromRawEvent(aws.ToString(e.CloudTrailEvent)); code != "" {
-		out.ErrorCode = code
+	raw := aws.ToString(e.CloudTrailEvent)
+	var rec trailRecord
+	message := ""
+	if raw != "" && json.Unmarshal([]byte(raw), &rec) == nil {
+		out.ErrorCode, message = rec.ErrorCode, rec.ErrorMessage
+		if u := rec.UserIdentity; u != nil {
+			out.PrincipalType, out.PrincipalARN, out.PrincipalID = u.Type, u.ARN, u.PrincipalID
+			if u.SessionContext != nil && u.SessionContext.SessionIssuer != nil {
+				si := u.SessionContext.SessionIssuer
+				out.SessionIssuerType, out.SessionIssuerARN, out.SessionIssuerPrincipalID = si.Type, si.ARN, si.PrincipalID
+			}
+			out.SessionName = assumedRoleSessionName(u.Type, u.ARN)
+		}
+	} else {
+		// Not a record this reader can decode: the error code is still worth
+		// keeping, from the one narrow scan the reader always made.
+		out.ErrorCode = errorCodeFromRawEvent(raw)
+	}
+	if out.ErrorCode != "" {
 		out.Denied = true
+		if AuthorizationErrorCodes[out.ErrorCode] {
+			out.AuthorizationDenied = true
+			out.DenialPolicyType = ClassifyDenial(message)
+		}
 	}
 	return out
 }
 
-// errorCodeFromRawEvent extracts errorCode from the raw event JSON without a
-// full unmarshal into a struct this package would otherwise need to keep in
-// step with CloudTrail's own record schema. A cheap, deliberately narrow
-// scan for one field; anything more is scope the wider CloudTrail upgrade
-// owns, not this reader.
+// trailRecord is the slice of a CloudTrail record this reader reads. Fields it
+// does not name are ignored, so the record schema can grow without breaking it.
+type trailRecord struct {
+	ErrorCode    string `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
+	UserIdentity *struct {
+		Type           string `json:"type"`
+		ARN            string `json:"arn"`
+		PrincipalID    string `json:"principalId"`
+		SessionContext *struct {
+			SessionIssuer *struct {
+				Type        string `json:"type"`
+				ARN         string `json:"arn"`
+				PrincipalID string `json:"principalId"`
+			} `json:"sessionIssuer"`
+		} `json:"sessionContext"`
+	} `json:"userIdentity"`
+}
+
+// assumedRoleSessionName is the RoleSessionName of an assumed-role session:
+// the last segment of "arn:<partition>:sts::<acct>:assumed-role/<role>/<session>".
+// Empty for any other principal -- a federated user's name is not a role
+// session name.
+func assumedRoleSessionName(principalType, arn string) string {
+	if principalType != "AssumedRole" {
+		return ""
+	}
+	_, resource, ok := strings.Cut(arn, ":assumed-role/")
+	if !ok {
+		return ""
+	}
+	parts := strings.Split(resource, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+// errorCodeFromRawEvent extracts errorCode from a raw event that did not
+// decode as JSON: a cheap, deliberately narrow scan for one field.
 func errorCodeFromRawEvent(raw string) string {
 	const key = `"errorCode":"`
 	i := strings.Index(raw, key)

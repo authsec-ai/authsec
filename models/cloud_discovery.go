@@ -348,6 +348,15 @@ type SurfaceCoverage struct {
 	// collector so no reader has to re-derive the sample from a later
 	// inventory.
 	CappedAfter string `json:"capped_after,omitempty"`
+	// Prioritized is set, with CappedAfter, when the capped activity sample
+	// read identities AHEAD of byte order (T3.03, SPEC-iga-phase3-policy.md
+	// §2.6): the ARNs of every sampled identity that is bound to a workload or
+	// under a live AuthSec control, sorted. They are read first, so the sample
+	// is exactly these plus every ARN at or before CappedAfter -- which is the
+	// last ARN of the REST, and empty when the prioritised ones alone filled
+	// the cap. Absent when nothing was prioritised: the D-86 sample, unchanged.
+	// ActivitySampled is the one reading of the pair.
+	Prioritized []string `json:"prioritized,omitempty"`
 	// Count is how many objects were read. A total when State is reached; a
 	// FLOOR otherwise -- for partial, the rows that were read, with Error
 	// naming how many were not (§1.4: "the report names how many"). One
@@ -382,6 +391,23 @@ type SurfaceCoverage struct {
 	// listed (the count is in Error).
 	Items     []CoverageItem `json:"items,omitempty"`
 	Truncated bool           `json:"truncated,omitempty"`
+}
+
+// ActivitySampled reports whether the activity read this coverage records
+// attempted the identity with this ARN (D-86, T3.03). A read that was not
+// capped -- no CappedAfter and nothing Prioritized -- attempted every
+// identity it had; a capped one attempted the prioritised ARNs and every ARN
+// at or before CappedAfter in byte order (Go's string order). Whether the
+// attempt succeeded is a separate question: the run's usage rows answer it.
+func (c SurfaceCoverage) ActivitySampled(arn string) bool {
+	if c.CappedAfter == "" && len(c.Prioritized) == 0 {
+		return true
+	}
+	if c.CappedAfter != "" && arn <= c.CappedAfter {
+		return true
+	}
+	i := sort.SearchStrings(c.Prioritized, arn)
+	return i < len(c.Prioritized) && c.Prioritized[i] == arn
 }
 
 // CoverageItem is one document policy_documents could not read (D-71):

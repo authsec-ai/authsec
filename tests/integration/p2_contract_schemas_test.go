@@ -1078,7 +1078,24 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 		contractReq("classification", contractBool), contractReq("coverage", contractBool),
 	)),
 	contractReq("schema_head", contractNullable(contractNonEmpty)),
+	// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02).
+	contractReq("policy", contractPolicyCapabilities),
 )))
+
+// The /capabilities policy block (§4.3): the IGA_POLICY gate, one boolean per
+// feature with a reason for each false one, and provider support.
+var contractPolicyCapabilities = contractObj(
+	contractReq("state", contractEnum("on", "off", "misconfigured")),
+	contractReq("reason", contractNullable(contractNonEmpty)),
+	contractReq("schema_head", contractNullable(contractNonEmpty)),
+	contractReq("findings", contractBool), contractReq("proposals", contractBool),
+	contractReq("export", contractBool), contractReq("iac", contractBool),
+	contractReq("enforcement", contractBool), contractReq("slack", contractBool),
+	contractReq("reasons", contractMap(contractNonEmpty)),
+	contractReq("providers", contractObj(
+		contractReq("aws", contractConst("supported")), contractReq("k8s", contractConst("not_supported")))),
+	contractReq("provider_reasons", contractObj(contractReq("k8s", contractNonEmpty))),
+)
 
 var contractRunRef = contractRef("cloud_scan_run")
 
