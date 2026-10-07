@@ -10,10 +10,29 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 baseline_file=scripts/tenant-exempt-baseline.txt
 
+# Packages whose every query runs on the transaction tenancy.RLSTransaction
+# opens (app.workspace_id set, role authsec_tenant), so row-level security
+# scopes them whatever the SQL text says. Their raw SQL is not counted, but
+# the package may reach the database through RLSTransaction only: any other
+# use of a DB handle fails the check.
+rls_only=(internal/igaread internal/k8sread)
+for pkg in "${rls_only[@]}"; do
+  other=$(git ls-files "$pkg/*.go" | grep -v '_test\.go$' \
+    | xargs grep -nE '(\br\.db\b|\bconfig\.(DB|GetDatabase)\b|\b(gorm|sql)\.Open\(|tenancy\.(Transaction|DB|DBContext|Exec|Query|QueryRow)(Context)?\()' \
+    | grep -v 'tenancy\.RLSTransaction(' || true)
+  if [[ -n "$other" ]]; then
+    echo "$pkg is RLS-only but reaches the database another way:" >&2
+    echo "$other" >&2
+    exit 1
+  fi
+done
+rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
+
 count=$(git ls-files '*.go' \
   | grep -v '_test\.go$' \
   | grep -v '^internal/tenancy/' \
   | grep -v '^tests/' \
+  | grep -vE "$rls_only_re" \
   | xargs awk '
       FNR == 1 { h1 = h2 = h3 = "" }
       {
