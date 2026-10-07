@@ -80,6 +80,7 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 
 	// Build query with filter. $1 is the workspace (bound by the scoped
 	// layer); the filter's own arguments start at $2.
+	// TENANT-EXEMPT: built here with workspace_id = $1 and run by tenancy.QueryRow below
 	query := `SELECT COUNT(*) FROM users
 		WHERE workspace_id = $1`
 	filterClause, filterArgs := buildAdminUserFilterClause(filter)

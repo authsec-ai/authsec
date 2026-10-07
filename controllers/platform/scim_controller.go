@@ -40,6 +40,7 @@ func scimSQL() *sql.DB { return config.GetDatabase().DB }
 
 // scimAddMember adds a user of the workspace to one of its groups; the
 // composite keys refuse a user or group of another workspace.
+// TENANT-EXEMPT: only ever passed to tenancy.ExecContext (workspace_id = $1)
 const scimAddMember = `
 	INSERT INTO user_groups (workspace_id, user_id, group_id)
 	SELECT g.workspace_id, $2, g.id FROM groups g WHERE g.workspace_id = $1 AND g.id = $3

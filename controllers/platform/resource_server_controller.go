@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -521,14 +522,14 @@ func (ctrl *ResourceServerController) TestLogin(c *gin.Context) {
 	sdkPolicyState := "unknown"
 	var toolCount int64
 	var unmappedCount int64
-	config.DB.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
-	config.DB.Raw(`
+	config.DB.Model(&models.MCPTool{}).Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&toolCount)
+	tenancy.GormRaw(c.Request.Context(), config.DB, `
 		SELECT COUNT(*) FROM mcp_tools mt
-		 WHERE mt.resource_server_id = ?
+		 WHERE mt.workspace_id = $1 AND mt.resource_server_id = $2
 		   AND mt.is_public = false
 		   AND NOT EXISTS (
 			   SELECT 1 FROM mcp_tool_scope_map m
-			    WHERE m.tool_id = mt.id AND m.source = 'admin_override'
+			    WHERE m.workspace_id = mt.workspace_id AND m.tool_id = mt.id AND m.source = 'admin_override'
 		   )
 	`, rs.ID).Scan(&unmappedCount)
 

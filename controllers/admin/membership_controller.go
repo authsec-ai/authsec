@@ -150,12 +150,17 @@ const membershipColumns = `
 			uu.user_last_login
 		`
 
+// membershipQuery runs on the handle mc.scoped returns (tenancy.DB: the
+// request's workspace on wm), and its LATERAL joins are bound to wm.workspace_id.
+// TENANT-EXEMPT: GORM builder over the scoped handle; see above
 func membershipQuery(db *gorm.DB) *gorm.DB {
 	return db.Table("workspace_memberships AS wm").
 		Select(membershipColumns).
+		// TENANT-EXEMPT: bound to wm.workspace_id
 		Joins(`LEFT JOIN LATERAL (
 			SELECT r.name AS membership_type FROM roles r
 			WHERE r.id = wm.role_id AND r.workspace_id = wm.workspace_id) rr ON true`).
+		// TENANT-EXEMPT: bound to wm.workspace_id
 		Joins(`LEFT JOIN LATERAL (
 			SELECT u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login
 			FROM users u WHERE u.workspace_id = wm.workspace_id AND u.id = wm.user_id) uu ON true`)
@@ -165,6 +170,7 @@ func membershipQuery(db *gorm.DB) *gorm.DB {
 func endUserStateQuery(db *gorm.DB) *gorm.DB {
 	return db.Table("workspace_end_user_states AS s").
 		Select("s.*, uu.user_email, uu.user_name, uu.user_username, uu.user_last_login").
+		// TENANT-EXEMPT: bound to wm.workspace_id
 		Joins(`LEFT JOIN LATERAL (
 			SELECT u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login
 			FROM users u WHERE u.workspace_id = s.workspace_id AND u.id = s.user_id) uu ON true`)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -244,9 +245,10 @@ func (ctrl *ApplicationsController) PostureSummary(c *gin.Context) {
 			Count(&appTools)
 		config.DB.Table("mcp_tools t").
 			Where("t.workspace_id = ? AND t.resource_server_id = ? AND t.is_public = false", workspaceID, app.ID).
+			// TENANT-EXEMPT: GORM builder; t is bound to workspaceID above and the map row to t's workspace
 			Where(`NOT EXISTS (
 				SELECT 1 FROM mcp_tool_scope_map mtsm
-				WHERE mtsm.tool_id = t.id AND mtsm.source = 'admin_override'
+				WHERE mtsm.workspace_id = t.workspace_id AND mtsm.tool_id = t.id AND mtsm.source = 'admin_override'
 			)`).
 			Count(&appUnmapped)
 		config.DB.Table("mcp_tools").
@@ -463,7 +465,7 @@ func (ctrl *ApplicationsController) ListConnections(c *gin.Context) {
 	}
 
 	var rows []rawConn
-	err = config.DB.Raw(`
+	err = tenancy.GormRaw(inWorkspace(workspaceID), config.DB, `
 		SELECT
 			r.id::text                                               AS reg_id,
 			r.status                                                 AS reg_status,
@@ -483,7 +485,7 @@ func (ctrl *ApplicationsController) ListConnections(c *gin.Context) {
 			r.created_at                                             AS created_at
 		FROM resource_server_client_registrations r
 		JOIN mcp_oauth_clients c ON c.id = r.oauth_client_id
-		LEFT JOIN service_accounts sa ON sa.oauth_client_id = c.id
+		LEFT JOIN service_accounts sa ON sa.workspace_id = r.workspace_id AND sa.oauth_client_id = c.id
 		LEFT JOIN role_bindings rb_sa
 			ON  rb_sa.service_account_id = sa.id
 			AND rb_sa.workspace_id = r.workspace_id
@@ -491,21 +493,22 @@ func (ctrl *ApplicationsController) ListConnections(c *gin.Context) {
 			AND rb_sa.scope_id = r.resource_server_id
 		LEFT JOIN LATERAL (
 			SELECT subject_id FROM access_requests
-			WHERE requested_by_client = c.client_id
+			WHERE workspace_id = r.workspace_id
+			  AND requested_by_client = c.client_id
 			  AND resource_server_id = r.resource_server_id
 			  AND status = 'approved'
 			ORDER BY updated_at DESC LIMIT 1
 		) ar ON true
-		LEFT JOIN users u ON u.id = ar.subject_id
+		LEFT JOIN users u ON u.workspace_id = r.workspace_id AND u.id = ar.subject_id
 		LEFT JOIN role_bindings rb_u
 			ON  rb_u.user_id = u.id
 			AND rb_u.workspace_id = r.workspace_id
 			AND rb_u.scope_type = 'resource_server'
 			AND rb_u.scope_id = r.resource_server_id
-		WHERE r.resource_server_id = ?
-		  AND r.workspace_id = ?
+		WHERE r.workspace_id = $1
+		  AND r.resource_server_id = $2
 		ORDER BY r.created_at DESC
-	`, rs.ID, workspaceID).Scan(&rows).Error
+	`, rs.ID).Scan(&rows).Error
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

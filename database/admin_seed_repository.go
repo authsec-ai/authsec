@@ -52,20 +52,20 @@ func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissionsTx(ctx context.Cont
 }
 
 func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(ctx context.Context, q tenancy.Querier) (uuid.UUID, error) {
-	ws, err := ctxWorkspace(ctx)
-	if err != nil {
+	if _, err := ctxWorkspace(ctx); err != nil {
 		return uuid.Nil, err
 	}
 	now := time.Now()
 
 	// The workspace's admin role; the row's workspace is the context's.
 	roleID := uuid.New()
-	if err := q.QueryRowContext(ctx, `
+	if err := tenancy.QueryRowContext(ctx, q, `
 		INSERT INTO roles (id, workspace_id, name, description, created_at, updated_at)
 		VALUES ($2, $1, 'admin', 'Administrator with full access', $3, $3)
 		ON CONFLICT (workspace_id, name) DO UPDATE SET updated_at = EXCLUDED.updated_at
+		 WHERE roles.workspace_id = $1
 		RETURNING id
-	`, ws, roleID, now).Scan(&roleID); err != nil {
+	`, []interface{}{roleID, now}, &roleID); err != nil {
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)
 	}
 

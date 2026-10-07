@@ -13,6 +13,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -704,12 +705,12 @@ func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 	// A failed lookup is reported as failing, never as permitted (AS-074).
 	type brokeringRow struct{ Effect string }
 	var rows []brokeringRow
-	gateErr := config.DB.WithContext(c.Request.Context()).Raw(`
+	gateErr := tenancy.GormRaw(inWorkspace(workspaceID), config.DB, `
 		SELECT effect FROM a2a_brokering_policies
-		WHERE workspace_id = ? AND side = 'redemption'
-		  AND (client_id IS NULL OR client_id = ?)
-		  AND (resource_server_id IS NULL OR resource_server_id = ?)`,
-		workspaceID, client.ClientID, rs.ID,
+		WHERE workspace_id = $1 AND side = 'redemption'
+		  AND (client_id IS NULL OR client_id = $2)
+		  AND (resource_server_id IS NULL OR resource_server_id = $3)`,
+		client.ClientID, rs.ID,
 	).Scan(&rows).Error
 	denied := false
 	for _, r := range rows {

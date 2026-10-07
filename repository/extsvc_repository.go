@@ -61,6 +61,7 @@ func (r *externalServiceRepository) GetByID(id string) (*ExternalService, error)
 // user's id or legacy client_id, or an OAuth client's client_id.
 func (r *externalServiceRepository) GetByIDForWorkspace(id, workspaceID string) (*ExternalService, error) {
 	var svc ExternalService
+	// TENANT-EXEMPT: services has no workspace_id; the workspace is matched through created_by below
 	err := r.db.Where("id = ?", id).
 		Where(`(created_by = ?
 			OR EXISTS (SELECT 1 FROM users u WHERE u.workspace_id::text = ?

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -173,13 +174,15 @@ func RecordAudit(ctx context.Context, db *gorm.DB, a IssuanceAuditRow) {
 	} else {
 		subjectID = sql.NullString{}
 	}
-	_, err = sqlDB.ExecContext(ctx, `
+	// The row is written in its own workspace, under RLS.
+	actx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: a.WorkspaceID})
+	_, err = tenancy.InsertContext(actx, sqlDB, `
 		INSERT INTO auth_issuance_audit
 			(workspace_id, token_family, client_id, subject_type, subject_id,
 			 resource_server_id, pdp_effect, gate_effect, pdp_agrees,
 			 scopes_requested, scopes_granted, pdp_reason)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		a.WorkspaceID, a.TokenFamily, a.ClientID, a.SubjectType, subjectID,
+		a.TokenFamily, a.ClientID, a.SubjectType, subjectID,
 		a.ResourceServerID, a.PDPEffect, a.GateEffect, a.PDPAgrees,
 		a.ScopesRequested, a.ScopesGranted, a.PDPReason,
 	)

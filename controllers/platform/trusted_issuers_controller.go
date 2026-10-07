@@ -8,6 +8,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -270,8 +271,9 @@ func (ctrl *TrustedIssuersController) Revoke(c *gin.Context) {
 	now := time.Now().UTC()
 	txErr := db.Transaction(func(tx *gorm.DB) error {
 		// Mark issuer revoked.
-		if err := tx.Exec(
-			`UPDATE trusted_issuers SET status = 'revoked', revoked_at = ? WHERE id = ?`,
+		ctx := c.Request.Context()
+		if err := tenancy.GormExec(ctx, tx,
+			`UPDATE trusted_issuers SET status = 'revoked', revoked_at = $2 WHERE workspace_id = $1 AND id = $3`,
 			now, issuerID,
 		).Error; err != nil {
 			return err
@@ -280,17 +282,17 @@ func (ctrl *TrustedIssuersController) Revoke(c *gin.Context) {
 		// Bulk-insert live XAA tokens from this issuer into revoked_tokens. The
 		// issuer only ever minted into its own workspace, so only that
 		// workspace's tokens are touched.
-		return tx.Exec(`
+		return tenancy.GormExec(ctx, tx, `
 			INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
-			SELECT iss, 'access_token', jti::text, ?, 'issuer_revoked', expires_at
+			SELECT iss, 'access_token', jti::text, $2, 'issuer_revoked', expires_at
 			FROM native_tokens
-			WHERE token_family = 'xaa'
-			  AND source_grant_iss = ?
-			  AND workspace_id = ?
+			WHERE workspace_id = $1
+			  AND token_family = 'xaa'
+			  AND source_grant_iss = $3
 			  AND revoked_at IS NULL
 			  AND expires_at > NOW()
 			ON CONFLICT (iss, kind, jti) DO NOTHING`,
-			now, issuer.Iss, workspaceID,
+			now, issuer.Iss,
 		).Error
 	})
 	if txErr != nil {
