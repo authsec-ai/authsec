@@ -131,12 +131,16 @@ func Transaction(ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB) error) e
 	if err != nil {
 		return err
 	}
+	// The role is resolved before the transaction opens: the first lookup
+	// needs a connection of its own, and asking the pool for one while this
+	// transaction holds another deadlocks a small, busy pool.
+	sqlDB, _ := db.DB()
+	role := rlsRole(ctx, sqlDB)
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		sqlDB, _ := db.DB()
 		if err := tx.Exec(`SELECT set_config('app.workspace_id', ?, true)`, tc.WorkspaceID.String()).Error; err != nil {
 			return fmt.Errorf("tenancy: set app.workspace_id: %w", err)
 		}
-		if role := rlsRole(ctx, sqlDB); role != "" {
+		if role != "" {
 			if err := tx.Exec(`SET LOCAL ROLE ` + role).Error; err != nil {
 				return fmt.Errorf("tenancy: set role: %w", err)
 			}
@@ -249,6 +253,7 @@ func WithTx(ctx context.Context, db *sql.DB, workspaceID uuid.UUID, fn func(*sql
 	if workspaceID == uuid.Nil {
 		return ErrNoTenant
 	}
+	role := rlsRole(ctx, db) // before the transaction: see Transaction
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -257,7 +262,7 @@ func WithTx(ctx context.Context, db *sql.DB, workspaceID uuid.UUID, fn func(*sql
 		_ = tx.Rollback()
 		return fmt.Errorf("tenancy: set app.workspace_id: %w", err)
 	}
-	if role := rlsRole(ctx, db); role != "" {
+	if role != "" {
 		if _, err := tx.ExecContext(ctx, `SET LOCAL ROLE `+role); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("tenancy: set role: %w", err)
@@ -340,3 +345,29 @@ var (
 	roleCache       sync.Map
 	roleNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 )
+
+// RLSTransaction is Transaction for statements that already filter on
+// workspace_id themselves (raw SQL read models and their writes): it runs fn
+// in one GORM transaction with the given options (isolation level, read-only;
+// nil for the defaults) under row-level security for the workspace carried by
+// ctx, without adding the GORM workspace scope, which would make an
+// unqualified workspace_id ambiguous in joins. fn receives that workspace.
+func RLSTransaction(ctx context.Context, db *gorm.DB, opts *sql.TxOptions, fn func(tx *gorm.DB, workspaceID uuid.UUID) error) error {
+	tc, err := FromContext(ctx)
+	if err != nil {
+		return err
+	}
+	sqlDB, _ := db.DB()
+	role := rlsRole(ctx, sqlDB) // before the transaction: see Transaction
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT set_config('app.workspace_id', ?, true)`, tc.WorkspaceID.String()).Error; err != nil {
+			return fmt.Errorf("tenancy: set app.workspace_id: %w", err)
+		}
+		if role != "" {
+			if err := tx.Exec(`SET LOCAL ROLE ` + role).Error; err != nil {
+				return fmt.Errorf("tenancy: set role: %w", err)
+			}
+		}
+		return fn(tx, tc.WorkspaceID)
+	}, opts)
+}

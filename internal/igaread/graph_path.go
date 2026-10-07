@@ -59,8 +59,6 @@ package igaread
 import (
 	"context"
 	"net/url"
-
-	"github.com/google/uuid"
 )
 
 // Path outcomes (§5.4).
@@ -107,7 +105,7 @@ func (s *graphSide) exhausted() bool { return len(s.frontier) == 0 }
 
 // Path serves GET /graph/path. include_ended is not a parameter here: a path
 // is declared among current and stale edges (§5.4, D-12).
-func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "from", "to"); perr != nil {
 		return nil, perr
 	}
@@ -128,7 +126,7 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := g.r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		// D-4 is readRoot's (an AWS root needs a publication, a Kubernetes
 		// one does not). `from` decides the provider and `to` is read in it:
 		// a `to` of the other provider is not a node of this search, and is

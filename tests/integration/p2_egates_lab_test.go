@@ -54,6 +54,7 @@ import (
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -419,7 +420,11 @@ func egatesDiscoveryAPI(t *testing.T, l *p2Lab, a *egatesAcct) *egatesDiscovery 
 	ctl := platform.NewCloudAWSController(l.db).WithOnboardingService(a.svc)
 	eng := gin.New()
 	g := eng.Group("/authsec/discovery")
-	g.Use(func(c *gin.Context) { c.Set("workspace_id", l.ws.String()); c.Next() })
+	g.Use(func(c *gin.Context) {
+		c.Set("workspace_id", l.ws.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: l.ws, PrincipalKind: "user"})
+		c.Next()
+	})
 	g.POST("/aws/connectors/:id/scan", ctl.ScanIAM)
 	g.GET("/aws/scan-runs/:id", ctl.GetScanRun)
 	g.GET("/aws/connectors/:id/scan-runs", ctl.ListConnectorScanRuns)

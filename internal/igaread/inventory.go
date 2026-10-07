@@ -104,18 +104,18 @@ var inventorySorts = []string{"name", "-last_seen"}
 var inventoryFacetNames = []string{"provider", "kind", "scope"}
 
 // ListInventoryWorkloads serves GET /api/iga/v1/inventory/workloads.
-func (r *Reader) ListInventoryWorkloads(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryWorkloads)
+func (r *Reader) ListInventoryWorkloads(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryWorkloads)
 }
 
 // ListInventoryIdentities serves GET /api/iga/v1/inventory/identities.
-func (r *Reader) ListInventoryIdentities(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryIdentities)
+func (r *Reader) ListInventoryIdentities(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryIdentities)
 }
 
 // ListInventoryResources serves GET /api/iga/v1/inventory/resources.
-func (r *Reader) ListInventoryResources(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryResources)
+func (r *Reader) ListInventoryResources(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryResources)
 }
 
 /* --------------------------------- the rows -------------------------------- */
@@ -440,7 +440,8 @@ func (c *inventoryClass) readable(ws uuid.UUID) listsFilter {
 
 // inventoryRun is one inventory list request. Parameters (400) are checked,
 // and the cursor opened, before the snapshot is.
-func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values, c *inventoryClass) (any, error) {
+func inventoryRun(ctx context.Context, r *Reader, vals url.Values, c *inventoryClass) (any, error) {
+	ws := workspaceIn(ctx)
 	for name := range vals {
 		if !inventoryParams[name] {
 			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this list", name))
@@ -478,7 +479,7 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 	var out Envelope
 	// No publication pin: Kubernetes and GitHub publish no revisions, so the
 	// snapshot is the consistency unit.
-	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := r.Read(ctx, Pin{}, func(q *Query) error {
 		meta := InventoryMeta{Limit: p.Limit}
 		accts, err := q.LoadAccounts()
 		if err != nil {
@@ -697,7 +698,8 @@ type InventorySummary struct {
 // exact value up to TotalCap, {value: TotalCap, exact: false} above it, and
 // {value: null, exact: false} when that one count timed out -- the other two
 // are unaffected. One REPEATABLE READ snapshot, one request deadline.
-func (r *Reader) InventorySummary(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (r *Reader) InventorySummary(ctx context.Context, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	for name := range vals {
 		if !inventorySummaryParams[name] {
 			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this route", name))
@@ -717,7 +719,7 @@ func (r *Reader) InventorySummary(ctx context.Context, ws uuid.UUID, vals url.Va
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := r.Read(ctx, Pin{}, func(q *Query) error {
 		accts, err := q.LoadAccounts()
 		if err != nil {
 			return err

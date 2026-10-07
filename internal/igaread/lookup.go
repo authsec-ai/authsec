@@ -40,7 +40,7 @@ type LookupResult struct {
 // the row is not this workspace's, is not AWS, or has no projected counterpart
 // supported by its connector -- and when nothing is published yet (D-4: no
 // object exists before the first publication).
-func (r *Reader) Lookup(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (r *Reader) Lookup(ctx context.Context, vals url.Values) (any, error) {
 	for name := range vals {
 		if name != "cloud_ref" && name != "rev" {
 			return nil, InvalidParameter(name, name+" is not a parameter of /lookup")
@@ -56,7 +56,7 @@ func (r *Reader) Lookup(ctx context.Context, ws uuid.UUID, vals url.Values) (any
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

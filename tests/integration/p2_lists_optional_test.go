@@ -96,7 +96,7 @@ func TestP2ListsNoTimeForOptionalWork(t *testing.T) {
 	var res any
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
-		res, err = r.ListWorkloads(context.Background(), l.ws, url.Values{"facets": {"account,region"}})
+		res, err = r.ListWorkloads(wsCtx(context.Background(), l.ws), url.Values{"facets": {"account,region"}})
 		if e := igaread.AsError(err); e == nil || e.Code != "query_timeout" {
 			break
 		}
@@ -125,7 +125,7 @@ func TestP2ListsCountUpToTimesOut(t *testing.T) {
 	l := newP2Lab(t, "p2-lists-countupto", true)
 	l.scanAndProject(oneLambda(l))
 	r := igaread.NewReader(l.db, readTestCursorKey).WithBudget(800 * time.Millisecond)
-	err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		n, known, err := q.CountUpTo(func(tx *gorm.DB) *gorm.DB { return tx.Table("(SELECT pg_sleep(2)) AS s") })
 		if err != nil || known || n != 0 {
 			t.Fatalf("CountUpTo past its allowance = %d known=%v err=%v, want unknown with no error", n, known, err)

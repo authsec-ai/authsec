@@ -23,6 +23,8 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 func graphLevelReader(t *testing.T) *Reader {
@@ -50,7 +52,7 @@ func graphLevelRead(t *testing.T, r *Reader, allowance time.Duration, fn func(q 
 	t.Helper()
 	var ok bool
 	var held *Query
-	err := r.Read(context.Background(), uuid.New(), Pin{}, func(q *Query) error {
+	err := r.Read(tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: uuid.New()}), Pin{}, func(q *Query) error {
 		held = q
 		var lv *graphLevel
 		var err error

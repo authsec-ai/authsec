@@ -98,7 +98,7 @@ func CredentialStatusOf(lifecycle string) *string {
 // when nothing is published yet (D-4), when the id is malformed or another
 // type's reference (D-5), and when it is not a readable identity of this
 // workspace (D-6: a GitHub row, or an AWS row no pass supported).
-func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) GetIdentity(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	rev, perr := idetailParams(vals, "rev")
 	if perr != nil {
 		return nil, perr
@@ -108,7 +108,7 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 		return nil, nerr
 	}
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

@@ -130,7 +130,8 @@ type IdentityRef struct {
 // | members), cursor (only with section), limit (1-200, default 100),
 // include_ended (D-12), rev. A section that does not apply to the identity's
 // kind is 400 invalid_parameter naming section, read in the snapshot.
-func (r *Reader) IdentityUsedBy(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) IdentityUsedBy(ctx context.Context, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	rev, perr := idetailParams(vals, "rev", "section", "cursor", "limit", "include_ended")
 	if perr != nil {
 		return nil, perr
@@ -170,7 +171,7 @@ func (r *Reader) IdentityUsedBy(ctx context.Context, ws uuid.UUID, rawID string,
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

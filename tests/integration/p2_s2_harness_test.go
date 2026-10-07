@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -88,6 +89,7 @@ func s2DiscoveryAPI(t *testing.T, l *p2Lab, svc *services.AWSOnboardingService) 
 		d.mu.Unlock()
 		if ws != uuid.Nil {
 			c.Set("workspace_id", ws.String())
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalKind: "user"})
 		}
 		c.Next()
 	})

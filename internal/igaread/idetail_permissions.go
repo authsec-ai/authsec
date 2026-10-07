@@ -138,7 +138,7 @@ type InheritedPolicies struct {
 // IdentityPermissions serves GET /identities/:id/permissions. Parameters:
 // rev, and include_ended (D-12), which adds ended assignments and memberships
 // with their ended grants. 404 exactly as GetIdentity.
-func (r *Reader) IdentityPermissions(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) IdentityPermissions(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	rev, perr := idetailParams(vals, "rev", "include_ended")
 	if perr != nil {
 		return nil, perr
@@ -152,7 +152,7 @@ func (r *Reader) IdentityPermissions(ctx context.Context, ws uuid.UUID, rawID st
 		return nil, nerr
 	}
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

@@ -69,6 +69,6 @@ func (ctl *IGAGraphReadController) GetResourceChanges(c *gin.Context) {
 
 func (ctl *IGAGraphReadController) changes(c *gin.Context, refType string) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.Changes(g.C.Request.Context(), g.WS, refType, g.C.Param("id"), g.C.Request.URL.Query())
+		return g.Reader.Changes(g.C.Request.Context(), refType, g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }

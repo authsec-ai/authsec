@@ -14,6 +14,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -173,11 +174,12 @@ func (ctl *IGAGraphReadController) serve(c *gin.Context, fn func(g graphCall) (a
 	c.JSON(http.StatusOK, body)
 }
 
-// tokenWorkspace is the workspace AuthMiddleware established. Never a
-// parameter, never a fallback to another claim.
+// tokenWorkspace is the workspace AuthMiddleware established in the tenant
+// context (internal/tenancy). Never a parameter, never a fallback to another
+// claim.
 func tokenWorkspace(c *gin.Context) (uuid.UUID, bool) {
-	id, err := uuid.Parse(c.GetString("workspace_id"))
-	if err != nil || id == uuid.Nil {
+	id, err := tenancy.Workspace(c)
+	if err != nil {
 		return uuid.Nil, false
 	}
 	return id, true

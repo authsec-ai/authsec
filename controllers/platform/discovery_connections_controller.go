@@ -30,12 +30,12 @@ func NewDiscoveryConnectionsController(db *gorm.DB) *DiscoveryConnectionsControl
 // Read-only; the workspace is the token's and nothing in the request can
 // change it. It takes no parameters.
 func (ctl *DiscoveryConnectionsController) ListConnections(c *gin.Context) {
-	ws, ok := tokenWorkspace(c)
+	_, ok := tokenWorkspace(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
 	}
-	body, err := ctl.reader.ListConnections(c.Request.Context(), ws)
+	body, err := ctl.reader.ListConnections(c.Request.Context())
 	if err != nil {
 		e := igaread.AsError(err)
 		if e.Status >= 500 && e.Status != http.StatusServiceUnavailable {

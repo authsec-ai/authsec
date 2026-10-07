@@ -147,7 +147,8 @@ type rdetailAccessKey struct {
 }
 
 // ResourceAccess serves GET /resources/:id/access.
-func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) ResourceAccess(ctx context.Context, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	for name := range vals {
 		if !rdetailAccessParams[name] {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
@@ -201,7 +202,7 @@ func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string,
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound() // no object exists before the first publication (D-4)
 		}

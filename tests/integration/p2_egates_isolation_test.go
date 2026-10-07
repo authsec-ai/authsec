@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -339,6 +340,7 @@ func egatesGitHubAPI(t *testing.T, l *p2Lab) *gin.Engine {
 			ws = uuid.MustParse(h)
 		}
 		c.Set("workspace_id", ws.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalKind: "user"})
 		c.Next()
 	})
 	g := eng.Group("/api/iga/v1")

@@ -248,7 +248,7 @@ var idetailExternalSurfaces = idetailSurfaces{
 // GetExternalPrincipal serves GET /external-principals/:id. 404 not_found
 // when nothing is published (D-4), for a malformed id or another type's
 // reference (D-5), and when the principal is not this workspace's.
-func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) GetExternalPrincipal(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	rev, perr := idetailParams(vals, "rev")
 	if perr != nil {
 		return nil, perr
@@ -258,7 +258,7 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 		return nil, nerr
 	}
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}
@@ -403,7 +403,8 @@ type idetailReferencedScan struct {
 // referenced-by: a single-collection tab in the §5.2 list envelope (D-77),
 // 100 per page (limit 1-200), ordered by the target role's name, then
 // account, then the claim id (D-13); include_ended adds ended edges (D-12).
-func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	rev, perr := idetailParams(vals, "rev", "cursor", "limit", "include_ended")
 	if perr != nil {
 		return nil, perr
@@ -433,7 +434,7 @@ func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, ws uuid.UUID
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

@@ -155,18 +155,18 @@ func (r *Reader) Traversal() *GraphTraversal { return &GraphTraversal{r: r, b: D
 func (r *Reader) TraversalWith(b GraphBudgets) *GraphTraversal { return &GraphTraversal{r: r, b: b} }
 
 // Graph serves GET /graph with the production budgets.
-func (r *Reader) Graph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Graph(ctx, ws, vals)
+func (r *Reader) Graph(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Graph(ctx, vals)
 }
 
 // ExpandGraph serves GET /graph/expand with the production budgets.
-func (r *Reader) ExpandGraph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Expand(ctx, ws, vals)
+func (r *Reader) ExpandGraph(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Expand(ctx, vals)
 }
 
 // GraphPath serves GET /graph/path with the production budgets.
-func (r *Reader) GraphPath(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Path(ctx, ws, vals)
+func (r *Reader) GraphPath(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Path(ctx, vals)
 }
 
 /* ------------------------------ response shapes ---------------------------- */
@@ -954,7 +954,7 @@ type graphVisit struct {
 // edge to a node already reached is returned, marked closes_cycle when that
 // node is on the path that reached its source, and the node is never expanded
 // again: a node reached twice is returned once, and the edges say how.
-func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Graph(ctx context.Context, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "root", "direction", "assume_hops", "include_ended"); perr != nil {
 		return nil, perr
 	}
@@ -984,7 +984,7 @@ func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Value
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := g.r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		// D-4 (no AWS object exists before the first publication) is
 		// readRoot's: a Kubernetes root needs none.
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
@@ -1239,7 +1239,8 @@ func GraphExpandRoute(node, kind, dir string) string {
 // An expansion has no path of its own beyond the node, so closes_cycle marks
 // only an edge back to the node itself. Its frontier names the new
 // neighbours' own unexpanded neighbours, so the canvas can show "+N".
-func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Expand(ctx context.Context, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	if perr := graphCheckParams(vals, "node", "edge", "direction", "cursor", "include_ended"); perr != nil {
 		return nil, perr
 	}
@@ -1292,7 +1293,7 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, pin, func(q *Query) error {
+	err := g.r.Read(ctx, pin, func(q *Query) error {
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
 		if err != nil {
 			return err

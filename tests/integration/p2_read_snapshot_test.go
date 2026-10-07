@@ -26,7 +26,7 @@ func TestP2ReadOptionalTimeoutKeepsTheSnapshot(t *testing.T) {
 	l.scanAndProject(oneLambda(l))
 	r := igaread.NewReader(l.db, []byte("k")).WithBudget(800 * time.Millisecond)
 
-	err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		ok, err := q.Optional(func(tx *gorm.DB) error { return tx.Exec(`SELECT pg_sleep(2)`).Error })
 		if err != nil {
 			t.Fatalf("a timed-out optional query must not be an error: %v", err)
@@ -54,7 +54,7 @@ func TestP2ReadMandatoryTimeoutIs504(t *testing.T) {
 	l := newP2Lab(t, "p2-read-mandatory", true)
 	l.scanAndProject(oneLambda(l))
 	r := igaread.NewReader(l.db, []byte("k")).WithBudget(300 * time.Millisecond)
-	err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		return q.DB().Exec(`SELECT pg_sleep(2)`).Error
 	})
 	e := igaread.AsError(err)
@@ -73,7 +73,7 @@ func TestP2ReadRevisionStale(t *testing.T) {
 	r := igaread.NewReader(l.db, []byte("k"))
 
 	var first int64
-	if err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	if err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		if q.Rev == nil {
 			t.Fatal("no revision after a projection")
 		}
@@ -84,7 +84,7 @@ func TestP2ReadRevisionStale(t *testing.T) {
 	}
 	l.scanAndProject(a)
 
-	err := r.Read(context.Background(), l.ws, igaread.Pin{Rev: &first}, func(*igaread.Query) error { return nil })
+	err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{Rev: &first}, func(*igaread.Query) error { return nil })
 	e := igaread.AsError(err)
 	if e == nil || e.Status != 409 || e.Code != "revision_stale" {
 		t.Fatalf("rev=%d after a newer publication = %v, want 409 revision_stale", first, err)
@@ -92,7 +92,7 @@ func TestP2ReadRevisionStale(t *testing.T) {
 	if e.Extra["requested_rev"] != first || e.Extra["current_rev"] != first+1 {
 		t.Fatalf("409 body = %v, want requested %d current %d", e.Extra, first, first+1)
 	}
-	err = r.Read(context.Background(), l.ws, igaread.Pin{CursorRev: &first}, func(*igaread.Query) error { return nil })
+	err = r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{CursorRev: &first}, func(*igaread.Query) error { return nil })
 	if e := igaread.AsError(err); e == nil || e.Code != "revision_stale" {
 		t.Fatalf("a cursor from rev %d = %v, want 409 revision_stale", first, err)
 	}
@@ -106,7 +106,7 @@ func TestP2ReadDoesNotStraddleAPublication(t *testing.T) {
 	l.scanAndProject(a)
 	r := igaread.NewReader(l.db, []byte("k"))
 
-	err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		var before int64
 		q.DB().Raw(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, q.WS).Row().Scan(&before)
 		// A second role and a rescan publish while this snapshot is open.

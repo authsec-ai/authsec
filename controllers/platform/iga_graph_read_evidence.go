@@ -16,6 +16,6 @@ import "github.com/gin-gonic/gin"
 // include=raw.
 func (ctl *IGAGraphReadController) GetEvidence(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.Evidence(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
+		return g.Reader.Evidence(g.C.Request.Context(), g.C.Request.URL.Query())
 	})
 }

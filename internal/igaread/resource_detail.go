@@ -93,7 +93,7 @@ type ResourceDetailMeta struct {
 // bare UUID or resource:<uuid> (D-5); anything else, another workspace's id, a
 // GitHub row, an AWS row no projection pass supports (D-6), and every id before
 // the first publication (D-4) are 404 not_found with no hint.
-func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) ResourceDetail(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	for name := range vals {
 		if name != "rev" {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
@@ -109,7 +109,7 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

@@ -76,7 +76,7 @@ func TestP2LoadReadPlansWithBindValuesOnlyInsideTheRead(t *testing.T) {
 	}
 	r := igaread.NewReader(db, []byte("k"))
 	var inside, optional map[string]string
-	if err := r.Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	if err := r.Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		inside = show(q.DB())
 		// Optional work runs in a savepoint: the settings hold there too.
 		_, err := q.Optional(func(tx *gorm.DB) error { optional = show(tx); return nil })

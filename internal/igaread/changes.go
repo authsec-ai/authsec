@@ -319,7 +319,8 @@ func decodeChangesKey(c *Cursor) (*changesKey, *Error) {
 // this workspace's, not a graph row, or nothing published -- D-4, no object
 // can exist before the first publication). A retired object still has its
 // Changes (§5.2 "Retired objects").
-func (r *Reader) Changes(ctx context.Context, ws uuid.UUID, refType, rawID string, vals url.Values) (any, error) {
+func (r *Reader) Changes(ctx context.Context, refType, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	obj, ok := changesObjects[refType]
 	if !ok {
 		return nil, fmt.Errorf("igaread: no Changes route for %q", refType)
@@ -346,7 +347,7 @@ func (r *Reader) Changes(ctx context.Context, ws uuid.UUID, refType, rawID strin
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}
