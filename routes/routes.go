@@ -1425,27 +1425,40 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
 
-		// Connector ingress is UNAUTHENTICATED by deliberate choice.
+		// Connector ingress: no AuthMiddleware, an INGEST TOKEN instead.
 		//
 		// A connector runs inside a customer's cluster and is configured with its
-		// workspace_id at deploy time (a Helm --set on the discovery agent), which it
-		// then asserts in the request body. That removes the token-minting step from
-		// the install flow entirely.
+		// workspace_id at deploy time (a Helm value on the discovery agent), which it
+		// asserts in the request body. That alone authenticated nothing: anyone
+		// holding a workspace UUID could add rows to that workspace's inventory and,
+		// since the shared graph projects these payloads synchronously, inject a
+		// cluster-admin grant or post a "complete" sweep that ends a real cluster's
+		// model.
 		//
-		// What this trades away, stated plainly so it is not rediscovered later:
-		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
-		//     any caller who knows a workspace_id can add rows to that workspace's
-		//     inventory
-		//   - there is no rate limit, so inventory growth from this path is unbounded
+		// So each handler now checks the call's `Authorization: Bearer <ingest
+		// token>` against the body's workspace before trusting it
+		// (controllers/platform/discovery_ingest_auth.go). A token is minted by a
+		// discovery:admin for the caller's own workspace (POST
+		// /discovery/ingest-tokens below), optionally bound to one source; only its
+		// sha256 is stored. IGA_DISCOVERY_INGEST_AUTH picks the mode:
+		//   - off      nothing is checked (the old behaviour)
+		//   - warn     DEFAULT. A valid token is attributed; a call without one is
+		//              ACCEPTED but logged and counted, so agents installed before
+		//              tokens existed keep working during rollout. NOT a protected
+		//              ingress: startup logs a banner, discovery_ingest_auth_enforced
+		//              is 0 and the uflow health check says so until enforce
+		//   - enforce  no valid (unrevoked, unexpired) token for the body's
+		//              workspace (and, if bound, for the call's source) -> 401
+		// In warn and enforce a valid token of ANOTHER workspace is always 403: a
+		// token never authorises another workspace. Rollout steps:
+		// controllers/platform/DISCOVERY_INGEST_AUTH.md.
 		//
-		// What keeps the blast radius to noise rather than privilege: a sighting
-		// grants nothing. Rows land `unregistered`, and only an authenticated,
-		// permission-checked human can claim one into a governed identity. The worst
-		// case is a polluted Unregistered Agents report, not access.
+		// There is still no rate limit on this path.
 		//
 		// Registered on its own group so it cannot accidentally inherit
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
+		platformCtrl.LogDiscoveryIngestAuthMode()
 		discoveryIngress := authsec.Group("/discovery")
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
@@ -1466,10 +1479,10 @@ func SetupRoutes(
 			discoveryIngress.POST("/lifecycle", discoveryController.ReportLifecycleEvent)
 
 			// The cluster's AUTHORIZATION MODEL — which ServiceAccount may do what,
-			// through which binding and role. Unauthenticated for the same reason as
-			// the rest of this group: the caller is a workload in a customer's
-			// cluster, and the payload grants nothing. It describes authorization
-			// that already exists over there; it creates none here.
+			// through which binding and role. Ingest-token authenticated like the
+			// rest of this group: the caller is a workload in a customer's cluster.
+			// The payload grants nothing here, but it becomes the graph's model of
+			// that cluster, which is why the token check matters most on this route.
 			discoveryIngress.POST("/rbac-snapshot", discoveryController.ReportRBACSnapshot)
 
 			// Per-sweep manifest of everything a connector observed. The only signal
@@ -1496,9 +1509,16 @@ func SetupRoutes(
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
 
+			// Ingest tokens: the credentials agents present on the ingress above.
+			// discovery:admin; the workspace is the caller's, never the body's.
+			//   POST   /ingest-tokens      mint (the plaintext is returned once)
+			//   GET    /ingest-tokens      list (prefixes, never hashes)
+			//   DELETE /ingest-tokens/:id  revoke
+			platformCtrl.MountDiscoveryIngestTokenRoutes(discovery, discoveryController, middlewares.Require)
+
 			// NOTE: POST /sightings, /agent-registration, /lifecycle and
 			// /resync-manifest are deliberately NOT here — they are registered
-			// unauthenticated on discoveryIngress above. Re-adding any of them here
+			// on discoveryIngress above (ingest-token auth). Re-adding any of them here
 			// would make Gin panic at startup on the duplicate method+path.
 
 			// Inventory. ?status=unregistered is the Unregistered Agents report;
@@ -1682,6 +1702,7 @@ func SetupRoutes(
 			discovery.GET("/k8s/clusters", middlewares.Require("discovery", "read"), k8sGraph.ListClusters)
 			discovery.GET("/k8s/identities", middlewares.Require("discovery", "read"), k8sGraph.ListIdentities)
 			discovery.GET("/k8s/workloads", middlewares.Require("discovery", "read"), k8sGraph.ListWorkloads)
+			discovery.GET("/k8s/identities/:id", middlewares.Require("discovery", "read"), k8sGraph.GetIdentity)
 			discovery.GET("/k8s/identities/:id/access", middlewares.Require("discovery", "read"), k8sGraph.GetAccess)
 			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
 
@@ -1699,6 +1720,9 @@ func SetupRoutes(
 			// permission as every other discovery read.
 			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
 			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
+			// The aggregate behind the identities inventory's unused-access column.
+			// A literal path beside /aws/usage, not a wildcard under it.
+			discovery.GET("/aws/usage/summary", middlewares.Require("discovery", "read"), cloudAWS.ListUsageSummary)
 
 			// Evidence: why a cloud_* row exists, or -- for a subject-less fact
 			// like an AgentCore Workload Identity -- what was observed even

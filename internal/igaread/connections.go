@@ -335,7 +335,7 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 			Connection: ConnectionCondition{
 				State: connCloudState(c), ReasonCode: connCloudReason(c), VerifiedAt: TS(c.VerifiedAt),
 			},
-			Coverage: connCloudCoverage(cov),
+			Coverage: connCloudCoverage(cov, cloudDeselected(c)),
 			Graph:    ConnectionGraph{State: connGraphNA},
 		}
 		switch c.Provider {
@@ -420,9 +420,10 @@ func connGCPScope(kind string) (scopeKind, summary string) {
 
 // connCloudCoverage is the connector's per-surface coverage as one state and
 // the surfaces not fully read, with the graph lists' own reading of a
-// surface (listsCoverage): reached and unsupported are not gaps; a surface
-// the scope did not select is a gap stated as stale (its earlier results are
-// kept and marked stale); everything else is a gap in its own state.
+// surface (listsCoverage): reached, unsupported and not_selected are not
+// gaps; everything else is a gap in its own state. A region the operator left
+// out of scope is scope, not a collection gap: counting it made every
+// connection that scans a subset of regions read "Coverage partial".
 //
 //	no surfaces, or none ever attempted  -> unknown
 //	no gap                               -> complete
@@ -430,7 +431,7 @@ func connGCPScope(kind string) (scopeKind, summary string) {
 //	gaps and nothing reached             -> denied
 //
 // Sorted by surface, so the answer is stable.
-func connCloudCoverage(cov models.ScanCoverage) ConnectionCoverage {
+func connCloudCoverage(cov models.ScanCoverage, deselected []string) ConnectionCoverage {
 	out := ConnectionCoverage{Gaps: []ConnectionGap{}}
 	reached, attempted := 0, 0
 	for surface, s := range cov.Surfaces {
@@ -442,7 +443,11 @@ func connCloudCoverage(cov models.ScanCoverage) ConnectionCoverage {
 		case models.CloudCoverageUnsupported:
 			continue
 		case models.CloudCoverageNotSelected:
-			out.Gaps = append(out.Gaps, ConnectionGap{Surface: surface, State: models.CloudCoverageStale})
+			// A region selected before and since deselected keeps stale results
+			// (D-58): still a gap. A region never selected is scope.
+			if notSelectedIsGap(surface, deselected) {
+				out.Gaps = append(out.Gaps, ConnectionGap{Surface: surface, State: models.CloudCoverageStale})
+			}
 			continue
 		case models.CloudCoverageUnknown, models.CloudCoverageNotConfigured:
 		default:
@@ -977,4 +982,12 @@ func firstSweep(sweeps ...*k8sread.Sweep) *k8sread.Sweep {
 		}
 	}
 	return nil
+}
+
+// cloudDeselected is an AWS connector's deselected regions; other providers have none.
+func cloudDeselected(c *models.CloudConnector) []string {
+	if c.Provider != models.CloudProviderAWS {
+		return nil
+	}
+	return c.AWSAttrs().DeselectedRegions()
 }

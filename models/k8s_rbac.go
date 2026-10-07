@@ -83,6 +83,11 @@ type K8sServiceAccount struct {
 	// collector writes as cloud_assume_edge.k8s_ref, so all three join without a
 	// translation table.
 	Anchor string `json:"anchor"`
+	// AWSRoleARN is the value of the eks.amazonaws.com/role-arn annotation
+	// (IRSA), empty when absent. The only annotation the agent sends: it names
+	// the AWS role a Pod running as this account can assume, which is what lets
+	// a Kubernetes walk cross into AWS.
+	AWSRoleARN string `json:"aws_role_arn,omitempty"`
 }
 
 // K8sRBACSnapshot is one complete reading of a cluster's authorization model.
@@ -92,6 +97,17 @@ type K8sRBACSnapshot struct {
 	DiscoverySourceID string `json:"discovery_source_id,omitempty"`
 	Cluster           string `json:"cluster"`
 	ScanKind          string `json:"scan_kind"`
+
+	// ClusterUID is the UID of the kube-system namespace: the de-facto cluster
+	// UID, immutable for the cluster's life. Empty when the agent cannot read
+	// it. Two clusters installed under one name share a cluster name but never
+	// this, so it is what lets the server refuse to merge them.
+	ClusterUID string `json:"cluster_uid,omitempty"`
+	// OIDCIssuer is the cluster's ServiceAccount token issuer, from the API
+	// server's /.well-known/openid-configuration. An AWS IRSA trust names this
+	// issuer, so it is the join from an AWS role to the cluster. Empty when
+	// unreadable.
+	OIDCIssuer string `json:"oidc_issuer,omitempty"`
 
 	SweepStartedAt string `json:"sweep_started_at"`
 	ObservedAt     string `json:"observed_at"`

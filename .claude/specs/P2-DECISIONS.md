@@ -1034,3 +1034,306 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   `random_page_cost` 4 the planner keeps the sequential scans of edges and
   revisions for them. *Why raise it:* headroom on the reads a user opens most,
   and the partial entitlement index is a trap for any history read.
+
+## Added by the Kubernetes traversal (feat/k8s-access-graph)
+
+- **D-107 Kubernetes on `/graph`, `/graph/expand`, `/graph/path`
+  (`internal/igaread/traverse_k8s.go`).** *Provisional, for review.* The
+  traversal routes read the Kubernetes projection's rows (provider `k8s`, the
+  same tables) as well as AWS's. Additive only: every AWS response is
+  unchanged byte for byte (`p2_k8s_graph_lifecycle_test.go` compares them
+  before and after a cluster's rows arrive).
+  - *One provider per traversal.* The root's provider (an external principal
+    is AWS's) is the provider of every node and edge the request reads: each
+    spec names it through a slot rendered `'aws'` or `'k8s'`, never
+    `IN ('aws','k8s')`, so no edge across the providers is ever walked. A
+    `/graph/path` `to` of the other provider is 404, as before.
+  - *Kinds.* `executes_as` (workload -> ServiceAccount, basis `observed` |
+    `declared`) and `grant` (identity -> rule); no `target` (a rule names
+    resource types, 040 forbids a resource row), `member_of`, `can_assume` or
+    `task_execution_role`, and no frontier for them.
+  - *Nodes* keep the AWS shape without `account` or `arn` (both absent) and add
+    `provider: "k8s"`, `scope {kind: k8s_cluster, id, label}`, `sub_scope`
+    (namespace, null when cluster-scoped) and `native_id` (workloads and
+    identities, the inventory's own expressions). Identity kinds are
+    `k8s_service_account | k8s_user | k8s_group`; `restrictions` is always
+    `{0, false}` (RBAC has no Deny or boundary). A rule node has `sid: ""`, no
+    `index`, `exclusions: []`, `label` "<verbs> on <targets>", `group_key`
+    `k8s:<verbs>→<targets>@<cluster>/<role namespace or *>`, and `k8s_rule
+    {verbs, api_groups, resources, resource_names, non_resource_urls}`.
+  - *Grants* add `provider`, `policy_ref`, `policy_kind` and `assignment {ref,
+    kind, name, namespace}` -- the binding, whose namespace (null for a
+    ClusterRoleBinding) is where the rule applies.
+  - *Limitations* are Kubernetes coverage, never AWS surfaces:
+    `k8s_coverage_gap {cluster, namespace, state, observed_at}` when the newest
+    applied sweep of the element's partition's source and cluster could not
+    end a row there (states `not_swept | incomplete | namespaced_only |
+    namespace_not_swept | unattributed`), and `k8s_unresolved_bindings {count,
+    bindings, truncated}` on an identity bound to a role the sweep did not see
+    (a partial grant with no rule: unresolved is not none). A stale element's
+    `stale_reason` is the same gap, `{account_id: <cluster>, surface:
+    k8s_sweep, state, since: null}`.
+  - *Meta.* `graph_state: "unrevisioned"`; `rev`/`published_at` report the AWS
+    publication current in the snapshot (null when none), as the inventory
+    does; `limitations: [effective_access_not_evaluated,
+    k8s_observations_not_recorded]` -- no cloud_observation backs a Kubernetes
+    claim and `/evidence` stays AWS-only. A workspace with Kubernetes rows and
+    no publication graphs them; an AWS root there is still 404 (D-4). An
+    expansion cursor of a Kubernetes node carries rev 0 and is never stale.
+  - *Not done.* Following an IRSA / EKS Pod Identity resolution across the
+    providers; `/evidence` for Kubernetes claims; the console's rendering
+    (new kinds, icons, `rev: null` expansion, node routes).
+
+## Added by the Kubernetes hardening (kh/graph)
+
+- **D-108 IRSA / EKS Pod Identity: resolved at read time, walked across the
+  providers (`internal/igaread/traverse_cross.go`,
+  `internal/igagraph/trust.go`).** *Provisional, for review.* Supersedes
+  D-107's "one provider per traversal" and its *Not done* "following an IRSA /
+  EKS Pod Identity resolution", and narrows D-87 / §5.4's "an external
+  principal is terminal" for these two mechanisms.
+  - *Read time, not stored.* Whether an `oidc` or `k8s_service_account`
+    principal IS a ServiceAccount of the workspace is computed in the
+    request's snapshot (`readCross`), never written to
+    `iga_external_principal.resolved_identity_account_id`. Why: the
+    Kubernetes rows arrive from a sweep outside any AWS publication. A stored
+    resolution would either be written by the AWS projector -- and go stale
+    for a whole AWS cycle every time a cluster appears, changes issuer or
+    loses the ServiceAccount -- or by the Kubernetes ingest into rows a
+    publication owns (changing an AWS-published row with no new rev). Read
+    time keeps the AWS projector's contract, its tests and `deriveResolutions`
+    (still `exact_arn_match` only) untouched, is always as fresh as the
+    snapshot, and needs no DDL. The rules live in `igagraph` beside the
+    principals' writer (`NormalizeOIDCIssuer`, `K8sServiceAccountSubject`,
+    `ResolutionRuleIRSAIssuerMatch`, `ResolutionRulePodIdentityCluster`).
+  - *Rules.* `irsa_issuer_match`: an `oidc` principal whose issuer equals --
+    scheme-, trailing-slash- and host-case-insensitively -- the `oidc_issuer`
+    of the newest **projected** sweep of exactly one cluster name of the SAME
+    workspace, and whose subject `system:serviceaccount:<ns>:<sa>` (no
+    wildcard) names a live (`lifecycle active`, supported) ServiceAccount of
+    it. `pod_identity_cluster_match`: a pod-identity principal whose
+    association (`cloud_assume_edge`, mechanism `eks_pod_identity`, same
+    issuer and `k8s_ref`) names exactly one `cluster_name`, that name is swept
+    by exactly one Kubernetes (source, cluster), that sweep's issuer -- when
+    the agent reported one -- is the principal's, and the subject names a live
+    ServiceAccount of it. Anything else (no or another issuer, two clusters
+    with the issuer, two sources sweeping the name, a wildcard, a missing
+    ServiceAccount, another workspace's sweep) stays unresolved. A stored
+    resolution (any basis) wins. No AWS publication: nothing crosses (D-4).
+  - *The crossing edge* is the principal's own `can_assume` claim, drawn from
+    the ServiceAccount (the principal and the ServiceAccount are one
+    principal, §2.12) to the role: `from` = the SA, `to` = the role, plus
+    additive `crosses_provider: true`, `via_principal:
+    external_principal:<id>` (the claim's declared source) and `resolution
+    {basis: derived, rule}`; no `provider` field (it is the AWS claim; the
+    SA node says `provider: "k8s"`, the role says nothing, as every AWS
+    node). It is read forward from a ServiceAccount (a crossing unit of the
+    level: the resolved principals' `can_assume` rows, rendered AWS) and in
+    reverse from the role (the AWS `can_assume` row of a resolved principal
+    is re-pointed at the SA, whose walk continues on the Kubernetes side). The
+    principal node is then not in the response; where the request names it
+    (a root, a `/graph/path` end) it stays a node, keeps its own edges and
+    displays the read-time resolution in its `resolution` (D-87's shape), not
+    walked, so `resolution_not_followed` is `true` there as for any
+    resolution. `GET /external-principals/:id` renders the same read-time
+    resolution (and then no `unresolved_reason`).
+  - *Every other edge stays one provider*: each statement is rendered for the
+    provider of the frontier nodes it reads FROM, so a projector defect that
+    wrote an `executes_as` across the providers is still never walked
+    (`TestP2K8sGraphLeavesAWSUnchanged`). The crossing counts as an assume hop;
+    every budget applies across it; frontier counts for a ServiceAccount's
+    `can_assume` sum its resolved principals' edges.
+  - *Meta.* A response holding nodes of both providers -- a walk that crossed,
+    or a `/graph/path` between the two -- is `graph_state: "mixed"` with the
+    AWS `rev`/`published_at` it read and `limitations
+    [effective_access_not_evaluated, organizations_not_collected,
+    k8s_observations_not_recorded]`. `/graph/path` ends may now be of
+    different providers (was 404): found through a crossing, else
+    `none_exists` when both frontiers are exhausted.
+  - *Byte-identical AWS.* An AWS-rooted response that touches no resolved
+    principal is unchanged byte for byte (`TestP2K8sGraphCrossIRSA` compares
+    eight AWS calls before a cluster exists, with no issuer, with another
+    issuer, and -- for the roles the crossing does not touch -- with the
+    crossing in force). The one extra statement such a walk may issue (the
+    sweep read, when a level meets an external principal) changes nothing it
+    returns.
+
+- **D-109 `effective_scope` on every Kubernetes grant
+  (`traverse_k8s.go`).** *Provisional, for review.* A rule node is ONE node
+  whichever binding reaches it, and its `scope`/`sub_scope` are its ROLE's (a
+  ClusterRole's rule is the cluster's). Where the rule applies is the
+  binding's, so it is said on the grant edge, explicitly, beside
+  `assignment`: `effective_scope {kind: "namespace", namespace: <binding
+  ns>}` for a RoleBinding -- of a Role or of a ClusterRole -- and `{kind:
+  "cluster", namespace: null}` for a ClusterRoleBinding. Not on the rule
+  node: two grants of different scope can reach the same rule in one
+  response (the fixture's `research-reads-secrets` and `research-secrets-ns`),
+  and a node field would have to pick one. The console must read a rule's
+  reach from the edge that brought it there, never from the rule's
+  `sub_scope`.
+
+- **D-110 Implicit group membership on the Kubernetes walk
+  (`traverse_k8s.go`).** *Provisional, for review.* `member_of` is now a
+  Kubernetes edge kind (`graphK8sEdgeKinds`): ServiceAccount -> group
+  forward, group -> its member ServiceAccounts in reverse, with the group's
+  grants walked as any identity's. The projection writes the rows (another
+  work item: only for `system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+  `system:authenticated` when some binding names the group, basis
+  `declared`). The edge carries additive `implicit_membership: true` when the
+  source is a ServiceAccount and the group is one of those three (no object
+  declares the membership: the API server does), so a chain reads "via
+  implicit group membership". The row's `partition_key` must be one
+  `k8sgraph.ParsePartitionKey` reads, or the edge carries
+  `k8s_coverage_gap unattributed` (tests write the ServiceAccount's own node
+  partition).
+
+- **D-111 A Kubernetes root never pins or reports the AWS revision
+  (`traverse.go`, `graph_path.go`).** *Provisional, for review.* Supersedes
+  D-107's "rev/published_at report the AWS publication current in the
+  snapshot". A response of Kubernetes nodes only has `rev: null`,
+  `published_at: null`, `graph_state: "unrevisioned"`; `rev=` on a Kubernetes
+  root (`/graph` root, `/graph/expand` node, both `/graph/path` ends) is
+  ignored -- never 409. The rev check moved from before the snapshot's
+  reads into it, after the root is read: an AWS root (or a `/graph/path` with
+  an AWS end) is checked exactly as before, and a root that does not exist is
+  checked first, as before (409 before 404). A walk that crosses into AWS is
+  `mixed` with the AWS rev it read (D-108). A Kubernetes node's expansion
+  cursor stays unrevisioned (rev 0) even when its page crossed into AWS rows:
+  keyset paging by (far key, claim) neither repeats nor skips an unchanged
+  row, and the item is that a publication never makes a Kubernetes
+  continuation stale.
+
+## Added by the Kubernetes follow-ups (kf/access)
+
+- **D-112 The flat Kubernetes access route reads what the graph walk reads
+  (`internal/k8sread/read.go`, `scope.go`; `GET
+  /authsec/discovery/k8s/identities/:id/access`, `/k8s/identities`,
+  `/k8s/workloads`).** *Provisional, for review.* The console's Kubernetes
+  Overview and Access tabs read this route; it had fallen behind D-109 and
+  D-110. Shape change, for the console:
+  - *Group grants (D-110).* An identity's access is its own grants plus the
+    grants of every group it is `member_of` -- the projection's
+    ServiceAccount -> `system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+    `system:authenticated` rows -- with the walk's predicates: membership and
+    grant live when `current | stale` (ended hidden, as before), the group a
+    Kubernetes identity with a support row (D-6), every join bound to the
+    workspace. One SQL (`accessRowsSQL`) feeds the access route and both
+    lists' counts. A group-derived row's `state` is the weaker of its two
+    links (stale when the membership or the grant is stale); one grant of one
+    group reached through two live memberships is one row. A grant with no
+    rule (role never seen) is a row on either path, as before.
+  - *New per-grant fields (additive):* `via` -- `null` for a direct grant,
+    else `{relationship: "member_of", group, group_id, implicit_membership,
+    state, basis}` (the membership's own state and basis; `implicit_membership`
+    exactly as the graph's member_of edge computes it); `effective_scope
+    {kind: namespace|cluster, namespace}` -- D-109's rule, from the same
+    function the graph now calls (`k8sread.BindingScope`), so a ClusterRole's
+    rule bound by a RoleBinding is the binding's namespace, never
+    cluster-wide; read from the assignment's key, or for a grant with no
+    assignment row (role never seen) from the grant's own key, which starts
+    with the binding key; `binding_name`; `basis` (always `declared`);
+    `resolved` (binding -> role -> rule resolved; false = the role was not in
+    the sweep, the graph's `k8s_unresolved_bindings`). `namespace` keeps its
+    meaning: the ROLE's namespace, never where the rule applies.
+  - *Removed:* per-grant `effective_conclusion` (it was always `unknown`;
+    grants are declared, not evaluated -- the vocabulary is `basis declared`,
+    `calculation_state partial`, as on the graph) and `summary.complete`,
+    which could never be non-zero once every grant is `partial`. The note no
+    longer uses the word "effective"; the only key containing it is
+    `effective_scope` (D-109's name).
+  - *Summary:* `{total, partial, stale, resolved, unresolved, direct,
+    via_group, note}`; `partial + stale`, `resolved + unresolved` and `direct
+    + via_group` each equal `total`. `partial` keeps its meaning (rows not
+    stale).
+  - *Lists:* `/k8s/identities` `grants`/`stale`/`wildcard` and
+    `/k8s/workloads` `grants` count the same rows (group grants included):
+    an identity's `grants` equals its access summary's `partial`, `stale`
+    its `stale`, and a workload's `grants` its execution identity's
+    `partial`. `/k8s/clusters` is unchanged (it counts grant rows, a group's
+    included, not per-identity paths).
+  - *One statement of each rule.* `k8sgraph.ImplicitGroup` (which group
+    names are implicit), `k8sread.ImplicitGroupKey` and `k8sread.BindingScope`
+    are now what `traverse_k8s.go` calls too, so the walk and the route
+    cannot drift. The readability predicate is written out in
+    `accessRowsSQL` (igaread imports k8sread, not the reverse).
+  - *Tests:* `tests/integration/p2_k8s_access_route_test.go` (real projection,
+    real controller; agreement with `/graph` row for row), the e2e
+    `TestIngestIsReadableBack` and `TestHardeningImplicitGroupMembership`.
+
+## Added by the Kubernetes identity kinds (feat/k8s-identity-kinds)
+
+- **D-113 Every Kubernetes identity kind is readable on the flat routes, and
+  the lists count their page only (`internal/k8sread/identities.go`,
+  `read.go`; `controllers/platform/k8s_graph_controller.go`; `GET
+  /authsec/discovery/k8s/identities/:id` (new), `/k8s/identities`,
+  `/k8s/identities/:id/access`, `/k8s/workloads`).** *Provisional, for
+  review.* The console's Kubernetes object page looked an identity up in
+  `/k8s/identities`, which listed ServiceAccounts only and stopped at 500, so a
+  User (`system:kube-controller-manager`) or a Group could not be opened and
+  their rules read "Not available". Additive except where marked:
+  - *New route* `GET /k8s/identities/:id` -- same middleware as its siblings
+    (`discovery:read`, workspace from the token). Body `{identity, meta.note}`;
+    `identity` is the list row of ANY kind. 404 `{error, code: not_found}` when
+    the token's workspace has no Kubernetes identity with that id (another
+    workspace's, an AWS identity's and an unknown id read the same); 400 on a
+    malformed id.
+  - *Identity row, new fields:* `kind` (`k8s_service_account | k8s_user |
+    k8s_group`), `name` (a ServiceAccount's without its namespace), `cluster`
+    (the key's cluster field), `last_seen_at`, and for a group only `members`
+    (its live -- current or stale -- `member_of` rows: the ServiceAccounts the
+    projection places in it; Users who authenticate into a group are not
+    readable from RBAC, so a lower bound). `anchor` is the RBAC subject name:
+    unchanged for a ServiceAccount, the User's or Group's name otherwise;
+    `namespace` is `""` for a User or Group. Every row of every kind carries
+    `grants`, `stale`, `wildcard` from the access route's own rows (D-112): a
+    ServiceAccount's include its groups' grants as before; a User's or Group's
+    are its own (the projection records no membership of either).
+  - *List parameters,* all optional: `kind` (`service_account | user | group`,
+    or the account kind; repeatable or comma-separated; unknown -> 400
+    `invalid_parameter`). **Default `service_account` only**, the contract
+    before this decision. `cluster`, `namespace` (one value each; a repeat is
+    400): `cluster` matches the key's cluster exactly (`k8sgraph.ClusterPrefix`,
+    as the cluster counts), `namespace` keeps ServiceAccounts only. `limit`
+    1-1000, default 500 (the console's only call before this); absent,
+    unreadable or <= 0 is the default and > 1000 is 1000 -- never a 400, as
+    before. `cursor`: `meta.next_cursor` of the previous page, HMAC-signed
+    (`IGA_CURSOR_SECRET`, `igaread.SignCursor`) and bound to the workspace, the
+    route, the NORMALISED filter set (kinds sorted and de-duplicated, cluster,
+    namespace) and the sort; any mismatch or a bad signature is 400
+    `cursor_invalid`. `meta` keeps `note` and adds `kinds`, `cluster`,
+    `namespace`, `limit`, `total` (the filter's count across all pages) and
+    `next_cursor` (null on the last page). The list is `[]`, never `null`.
+  - *Order -- CHANGED.* `/k8s/identities` is ordered by `anchor`, then `id`
+    (keyset `(display_name, id) > cursor`); `/k8s/workloads` by `display_name`,
+    then `id`. Before, both were `grants DESC, name`. Ordering by a count needs
+    every identity's count before the first row can be chosen, which is the
+    whole-workspace computation the next point removes; the console uses both
+    lists as id lookups, not in their order.
+  - *Counts are the page's (review item).* `accessRowsSQL` is now bound to a
+    set of holders in BOTH branches -- the direct grant's subject and the
+    membership's source (the latter also spelled as
+    `idx_iga_relationship_source`'s COALESCE expression so the index applies)
+    -- and carries `entitlement_id`, so counting needs no re-join to
+    `iga_access_edges`. Each list chooses its page from its own table first
+    (filters, order, cursor, limit), then counts `grants/stale/wildcard` with
+    one statement for that page's ids only (`countsFor`; the workloads list
+    for its page's `runs_as` ids), and a group's `members` with one statement
+    for the page's groups. Semantics and de-duplication are unchanged: one
+    grant of one group reached through two live memberships is one row; a
+    group-derived row is stale when either link is. `AccessFor` binds its one
+    identity to the same SQL. `Query.Identities(limit)` stays, as the first
+    page of the default filter with its old clamp.
+  - *Access route:* unchanged shape; a User's or Group's rows are its own
+    grants, every one `via: null`, `summary.direct = total`.
+  - *Tests:* `tests/integration/p2_k8s_identity_kinds_test.go` (real
+    projection, real controller; two clusters, Users and Groups): detail for
+    a ServiceAccount, a User in each of two clusters and three Groups (equal to
+    the list row and to the access summary); 404 across workspaces; the kind,
+    cluster and namespace filters with totals; paging at 1, 2 and 4 against
+    the unpaged order; the cursor's filter, workspace and signature binding;
+    the access route for Users and Groups; and
+    `TestP2K8sIdentityKindsCountsArePageScoped` -- 205 ServiceAccounts, a page
+    of 5: the one statement reading access rows binds exactly the page's ids,
+    and under `EXPLAIN ANALYZE` (statistics as autovacuum keeps them) every
+    scan of a per-identity table produces <= 40 rows, against >= 400 membership
+    rows for the whole list.

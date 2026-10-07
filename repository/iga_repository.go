@@ -664,9 +664,13 @@ func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
 // ListAccessEdges keeps its BASE semantics -- any subject, by subject_id --
 // and reads GitHub's rows only. The graph branch hard-coded the agent subject
 // column here; that changed what GitHub's access paths returned.
+//
+// LEGACY ROWS ONLY, the unkeyed ones. The unified projection (ghgraph) writes
+// keyed GitHub rows into the same tables; every legacy GitHub reader excludes
+// them, so the old GitHub screens answer exactly what they did before it.
 func (r *igaRepository) ListAccessEdges(workspaceID uuid.UUID, subjectID uuid.UUID) ([]models.IGAAccessEdge, error) {
 	var out []models.IGAAccessEdge
-	err := r.db.Where("workspace_id = ? AND subject_id = ? AND provider = ?",
+	err := r.db.Where("workspace_id = ? AND subject_id = ? AND provider = ? AND source_key = ''",
 		workspaceID, subjectID, models.ProviderGitHub).
 		Order("direction, created_at").Find(&out).Error
 	return out, err
@@ -936,8 +940,11 @@ func (r *igaRepository) ListCandidatesCursor(workspaceID uuid.UUID, state string
 
 func (r *igaRepository) ListIdentityAccounts(workspaceID uuid.UUID, after *CursorKeyT, limit int) ([]models.IGAIdentityAccount, error) {
 	// GitHub's rows only: AWS identities share this table (028) and must not
-	// appear in GET /api/iga/v1/identity-accounts (§1.5, E16).
-	q := r.db.Where("workspace_id = ? AND provider = ?", workspaceID, models.ProviderGitHub)
+	// appear in GET /api/iga/v1/identity-accounts (§1.5, E16). And the LEGACY
+	// GitHub rows only: the keyed rows the unified projection writes belong to
+	// the inventory API, not to this list.
+	q := r.db.Where("workspace_id = ? AND provider = ? AND source_key = ''",
+		workspaceID, models.ProviderGitHub)
 	var out []models.IGAIdentityAccount
 	err := afterCursor(q, after).Order("created_at DESC, id DESC").Limit(limit).Find(&out).Error
 	return out, err
@@ -973,14 +980,14 @@ func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UU
 		p := AccessPath{Edge: edges[i]}
 		if edges[i].EntitlementID != nil {
 			var e models.IGAEntitlement
-			if err := r.db.First(&e, "id = ? AND workspace_id = ? AND provider = ?",
+			if err := r.db.First(&e, "id = ? AND workspace_id = ? AND provider = ? AND source_key = ''",
 				*edges[i].EntitlementID, workspaceID, models.ProviderGitHub).Error; err == nil {
 				p.Entitlement = &e
 			}
 		}
 		if edges[i].ResourceID != nil {
 			var res models.IGAResource
-			if err := r.db.First(&res, "id = ? AND workspace_id = ? AND provider = ?",
+			if err := r.db.First(&res, "id = ? AND workspace_id = ? AND provider = ? AND source_key = ''",
 				*edges[i].ResourceID, workspaceID, models.ProviderGitHub).Error; err == nil {
 				p.Resource = &res
 			}
@@ -992,7 +999,7 @@ func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UU
 
 func (r *igaRepository) ListCredentialsFor(workspaceID, identityAccountID uuid.UUID) ([]models.IGACredential, error) {
 	var out []models.IGACredential
-	err := r.db.Where("workspace_id = ? AND identity_account_id = ? AND provider = ?",
+	err := r.db.Where("workspace_id = ? AND identity_account_id = ? AND provider = ? AND source_key = ''",
 		workspaceID, identityAccountID, models.ProviderGitHub).
 		Order("created_at DESC").Find(&out).Error
 	return out, err

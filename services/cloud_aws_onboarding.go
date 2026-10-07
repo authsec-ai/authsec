@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -62,6 +63,13 @@ const maxRegionsPerConnector = 32
 // ErrExternalIDNotIssued means the submitted ExternalId does not carry this
 // workspace's signature. See mintExternalID for why that check exists.
 var ErrExternalIDNotIssued = errors.New("this external id was not issued to this workspace")
+
+// ErrExternalIDUnreadable means the connector's stored ExternalId could not be
+// read back from the secrets store. Deliberately carries no detail: the store's
+// own error names the secret's path, which includes the workspace id and the
+// account, and this error travels into scan runs and API responses that the
+// console shows to users. The underlying error is logged where it happens.
+var ErrExternalIDUnreadable = errors.New("AuthSec could not read the external ID for this role; try again shortly, and reconnect the account if it persists")
 
 // ErrAWSProbeTimeout means the assume-role probe did not finish inside
 // awsOnboardingTimeout. Distinct from the request context dying (the client
@@ -720,7 +728,9 @@ func (s *AWSOnboardingService) assumeRequestFor(
 
 	secret, err := s.vault.ReadSecret(c.AuthRef)
 	if err != nil {
-		return nil, empty, fmt.Errorf("failed to read the external id: %w", err)
+		// Logged, not returned: the store's error names where the secret lives.
+		log.Printf("aws connector %s (workspace %s): reading the external id failed: %v", id, workspaceID, err)
+		return nil, empty, ErrExternalIDUnreadable
 	}
 	externalID, _ := secret["external_id"].(string)
 	if externalID == "" {

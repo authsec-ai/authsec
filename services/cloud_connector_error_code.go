@@ -43,6 +43,11 @@ const (
 	// workspace, so onboarding has to restart from this one.
 	ConnErrExternalIDNotIssued = "external_id_not_issued"
 
+	// ConnErrExternalIDUnreadable: the stored ExternalId could not be read
+	// back from AuthSec's secrets store, so no session can be assumed until
+	// the connection is verified again or reconnected.
+	ConnErrExternalIDUnreadable = "external_id_unreadable"
+
 	// ConnErrCredentialInvalid: the supplied credential is structurally
 	// unusable — a malformed service-account key — as opposed to refused.
 	ConnErrCredentialInvalid = "credential_invalid"
@@ -82,6 +87,9 @@ func ClassifyConnectorError(err error) string {
 
 	case errors.Is(err, ErrExternalIDNotIssued):
 		return ConnErrExternalIDNotIssued
+
+	case errors.Is(err, ErrExternalIDUnreadable):
+		return ConnErrExternalIDUnreadable
 
 	case errors.Is(err, awsdiscovery.ErrNoBaseCredentials),
 		errors.Is(err, gcp.ErrWIFIssuerNotHTTPS),

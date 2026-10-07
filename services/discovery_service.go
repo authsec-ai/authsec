@@ -26,8 +26,9 @@ type DiscoveryManager interface {
 	GetSource(workspaceID, id uuid.UUID) (*models.DiscoverySource, error)
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	UpdateSource(workspaceID, id uuid.UUID, in DiscoverySourceUpdateInput) (*models.DiscoverySource, error)
-	// DeleteSource removes the source, its integration and its findings, and
-	// returns a secrets-store path the caller must purge (empty when none).
+	// DeleteSource removes the source, its integration and its findings,
+	// revokes (never deletes) its bound ingest tokens, and returns a
+	// secrets-store path the caller must purge (empty when none).
 	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
 	// RegisterAgent records a heartbeat from a deployed discovery agent, creating
@@ -113,6 +114,13 @@ type SightingInput struct {
 	// ObservedRunningAt is set ONLY by a collector that genuinely saw the agent
 	// run. A declaration must leave it nil, and the database enforces that.
 	ObservedRunningAt *time.Time
+	// RuntimeStatus is what the connector observed: "running" (the default
+	// when empty) or "stopped" -- a workload that exists with zero replicas.
+	// "stopped" is honoured only from the Kubernetes connector, the one source
+	// that can tell scaled-to-zero from running; from any other it reads as
+	// running. A sighting can never assert "gone": absence is a lifecycle event
+	// or a manifest's business.
+	RuntimeStatus string
 }
 
 // AgentRegistrationInput is a heartbeat from a deployed discovery agent.
@@ -161,14 +169,24 @@ type ManifestInput struct {
 	Source            string
 	DiscoverySourceID *uuid.UUID
 	ClusterName       string
-	ScanKind          string
+	// ClusterUID is the swept cluster's kube-system UID, when the agent could
+	// read it. Empty means "not stated", never "a different cluster" -- but a
+	// connection that has recorded a UID refuses a manifest that states none
+	// while RequireClusterUIDEnv is on (ErrClusterUIDRequired).
+	ClusterUID string
+	ScanKind   string
 	// Complete is false when any LIST in the sweep failed. A partial sweep retires
 	// nothing — see ReconcileManifest.
-	Complete       bool
-	Namespaces     []string
-	Fingerprints   []string
-	SweepStartedAt *time.Time
-	ObservedAt     *time.Time
+	Complete     bool
+	Namespaces   []string
+	Fingerprints []string
+	// StoppedFingerprints is the subset of Fingerprints observed scaled to
+	// zero. Present, so never marked gone; marked stopped instead. A present
+	// fingerprint NOT in it is running, which revives one that was stopped.
+	// Optional: an older connector sends none, and nothing changes for it.
+	StoppedFingerprints []string
+	SweepStartedAt      *time.Time
+	ObservedAt          *time.Time
 }
 
 // ManifestResult reports what a manifest changed, so the connector's logs and the
@@ -181,6 +199,11 @@ type ManifestResult struct {
 	Namespaces   int      `json:"namespaces"`
 	MarkedGone   int      `json:"marked_gone"`
 	Fingerprints []string `json:"fingerprints,omitempty"`
+	// MarkedStopped and MarkedRunning count the positive runtime transitions
+	// the manifest carried (scaled to zero, and back). Omitted when zero, so
+	// an older connector sees the response it always did.
+	MarkedStopped int `json:"marked_stopped,omitempty"`
+	MarkedRunning int `json:"marked_running,omitempty"`
 }
 
 // AgentUpdateInput captures the operator-editable fields on an inventory row.
@@ -373,9 +396,22 @@ func (m *discoveryManager) RegisterAgent(workspaceID uuid.UUID, in AgentRegistra
 		src.LastSyncAt = &now
 	}
 
+	reportedUID := strings.TrimSpace(in.ClusterUID)
 	stored, created, err := m.repo.UpsertSelfRegistration(src)
 	if err != nil {
 		return nil, false, err
+	}
+	// The connector keeps the FIRST cluster UID it recorded; a heartbeat
+	// reporting another is accepted (liveness still counts) but never re-binds
+	// the row, and the repository marks it cluster_uid_conflict for the console.
+	// Logged here too, because a conflict is two clusters' inventories about to
+	// be confused and an operator reading logs should not have to find it in a
+	// status column. Only deleting and re-adding the connection resets the UID.
+	if reportedUID != "" && stored.ClusterUID != "" && reportedUID != stored.ClusterUID {
+		log.Printf("[discovery] cluster_uid_conflict: connector %s (workspace %s, instance %q, cluster %q) "+
+			"belongs to cluster uid %s but a heartbeat reported %s; heartbeat accepted, uid kept, "+
+			"RBAC snapshots from %s will be refused",
+			stored.ID, workspaceID, in.InstanceID, in.ClusterName, stored.ClusterUID, reportedUID, reportedUID)
 	}
 	// Explicit here because AfterFind does not fire for a Create with RETURNING.
 	stored.DeriveConnected(now)
@@ -453,7 +489,86 @@ func (m *discoveryManager) RecordLifecycleEvent(workspaceID uuid.UUID, in Lifecy
 	if err != nil {
 		return nil, nil, err
 	}
+	// A deleted or absent agent leaves the shared graph now, not at the next
+	// RBAC snapshot. Resync absences arrive here too (ReconcileManifest).
+	m.projectK8sSighting(workspaceID, in.Source, in.Fingerprint)
 	return agent, event, nil
+}
+
+// checkManifestClusterUID refuses a manifest whose cluster UID differs from the
+// one its connection recorded first (ErrClusterUIDMismatch), exactly as an
+// RBAC snapshot is refused. The connection is the manifest's
+// discovery_source_id, or else -- as for a snapshot -- the oldest connection
+// of its kind registered under the cluster name. A connection with no
+// recorded UID makes no claim, and the manifest is handled as before. A
+// manifest that states NO UID for a connection that recorded one is refused
+// too (ErrClusterUIDRequired) while RequireClusterUIDEnv is on -- otherwise
+// leaving the UID out would let another cluster's manifest mark this one's
+// agents gone -- and is handled as before when it is off. A manifest never
+// records a UID itself: registration and the RBAC sweep do.
+func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in ManifestInput) error {
+	uid := strings.TrimSpace(in.ClusterUID)
+	requireUID := RequireClusterUID()
+	db := m.repo.DB()
+	if (uid == "" && !requireUID) || db == nil {
+		return nil
+	}
+	var src struct {
+		ID         uuid.UUID
+		ClusterUID string
+	}
+	q := db.Table("discovery_sources").Select("id, cluster_uid").Where("workspace_id = ?", workspaceID)
+	if in.DiscoverySourceID != nil {
+		q = q.Where("id = ?", *in.DiscoverySourceID)
+	} else {
+		q = q.Where("kind = ? AND cluster_name = ?", in.Source, in.ClusterName).Order("created_at ASC")
+	}
+	if err := q.Limit(1).Scan(&src).Error; err != nil {
+		return fmt.Errorf("read connection cluster uid: %w", err)
+	}
+	if missingClusterUID(uid, src.ClusterUID, requireUID) {
+		log.Printf("[discovery] cluster_uid_required: resync manifest for cluster %q states no uid, "+
+			"connection %s belongs to %s; refused", in.ClusterName, src.ID, src.ClusterUID)
+		if err := repositories.RecordClusterUIDConflict(db, workspaceID, src.ID, "", "resync manifest"); err != nil {
+			log.Printf("[discovery] could not record the missing cluster uid on %s: %v", src.ID, err)
+		}
+		return fmt.Errorf("%w: manifest for cluster %q states no cluster_uid but connection %s belongs "+
+			"to cluster %q; the agent must send its cluster's kube-system namespace UID as cluster_uid "+
+			"(or the control plane must set %s=false)",
+			ErrClusterUIDRequired, in.ClusterName, src.ID, src.ClusterUID, RequireClusterUIDEnv)
+	}
+	if uid == "" || src.ClusterUID == "" || src.ClusterUID == uid {
+		return nil
+	}
+	log.Printf("[discovery] cluster_uid_mismatch: resync manifest for cluster %q reports uid %s, "+
+		"connection %s belongs to %s; refused", in.ClusterName, uid, src.ID, src.ClusterUID)
+	if err := repositories.RecordClusterUIDConflict(db, workspaceID, src.ID, uid, "resync manifest"); err != nil {
+		log.Printf("[discovery] could not record the cluster uid conflict on %s: %v", src.ID, err)
+	}
+	return fmt.Errorf("%w: manifest is from cluster %q but connection %s belongs to cluster %q; "+
+		"two clusters are installed under one cluster name", ErrClusterUIDMismatch, uid, src.ID, src.ClusterUID)
+}
+
+// projectK8sSighting copies a Kubernetes sighting into the shared graph at
+// once (K8sRBACManager.ProjectSighting) rather than waiting for the cluster's
+// next RBAC snapshot. A no-op for other sources and while IGA_GRAPH_PROJECTION
+// is off.
+//
+// Best-effort for the same reason as the correlation proposal: the graph is
+// laid over the inventory, and losing a sighting to protect it would invert
+// the priority. The next snapshot projects it anyway.
+func (m *discoveryManager) projectK8sSighting(workspaceID uuid.UUID, source, fingerprint string) {
+	if source != models.DiscoverySourceK8sWebhook {
+		return
+	}
+	db := m.repo.DB()
+	if db == nil {
+		return
+	}
+	if err := NewK8sRBACManager(db, GraphProjectionGateFromEnv()).
+		ProjectSighting(workspaceID, fingerprint); err != nil {
+		log.Printf("[discovery] could not project sighting %s into the graph: %v", fingerprint, err)
+	}
 }
 
 // runtimeStatusFor maps an event to the runtime state it asserts.
@@ -509,6 +624,12 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 			return nil, fmt.Errorf("unknown discovery_source_id for this workspace: %w", err)
 		}
 	}
+	// Before anything is folded in: a manifest from a DIFFERENT cluster that
+	// shares this one's name would mark this cluster's agents gone by their
+	// absence from a cluster they were never in.
+	if err := m.checkManifestClusterUID(workspaceID, in); err != nil {
+		return nil, err
+	}
 
 	observedAt := time.Now()
 	if in.ObservedAt != nil && !in.ObservedAt.IsZero() {
@@ -523,6 +644,43 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 		Accepted:   true,
 		Observed:   len(in.Fingerprints),
 		Namespaces: len(in.Namespaces),
+	}
+
+	// A stopped fingerprint is PRESENT -- a workload scaled to zero still
+	// exists -- whether or not the connector also listed it in fingerprints.
+	present := unionStrings(in.Fingerprints, in.StoppedFingerprints)
+
+	// Positive observations first, and on a partial sweep too: what the
+	// connector SAW is evidence even when the sweep cannot vouch for absence.
+	// Kubernetes only, the one connector that reports scale-to-zero.
+	if in.Source == models.DiscoverySourceK8sWebhook {
+		stoppedSet := map[string]bool{}
+		for _, fp := range in.StoppedFingerprints {
+			stoppedSet[fp] = true
+		}
+		var running []string
+		for _, fp := range present {
+			if !stoppedSet[fp] {
+				running = append(running, fp)
+			}
+		}
+		stopped, resumed, err := m.repo.ApplyPresentRuntime(repositories.PresentRuntimeInput{
+			WorkspaceID: workspaceID,
+			Source:      in.Source,
+			ClusterName: in.ClusterName,
+			Stopped:     in.StoppedFingerprints,
+			Running:     running,
+			ObservedAt:  observedAt,
+		})
+		if err != nil {
+			return nil, err
+		}
+		result.MarkedStopped, result.MarkedRunning = len(stopped), len(resumed)
+		// Into the graph now, as a sighting would: the workload stays (a stopped
+		// workload is still present) and its runtime_status follows.
+		for _, fp := range append(stopped, resumed...) {
+			m.projectK8sSighting(workspaceID, in.Source, fp)
+		}
 	}
 
 	if !in.Complete {
@@ -540,7 +698,7 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 		Source:         in.Source,
 		SourceID:       in.DiscoverySourceID,
 		ClusterName:    in.ClusterName,
-		Present:        in.Fingerprints,
+		Present:        present,
 		Namespaces:     in.Namespaces,
 		SweepStartedAt: sweepStart,
 		ObservedAt:     observedAt,
@@ -579,6 +737,21 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 	}
 
 	return result, nil
+}
+
+// unionStrings is a ∪ b, in first-seen order, without duplicates.
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, v := range list {
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 func defaultString(v, def string) string {
@@ -678,6 +851,23 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	// its runtime timestamp when the caller supplied none. A declared sighting
 	// proves only that a file exists: runtime is unknown, and it carries no
 	// runtime timestamp at all — the database refuses one.
+	//
+	// The Kubernetes connector may say what it saw is STOPPED -- the workload
+	// exists with zero replicas. That is still direct proof the workload
+	// exists (so never gone, and not retired from the graph), but not that it
+	// ran: last_observed_running_at does not advance.
+	stopped := false
+	switch strings.TrimSpace(in.RuntimeStatus) {
+	case "", models.RuntimeStatusRunning:
+	case models.RuntimeStatusStopped:
+		// Only the Kubernetes connector can tell scaled-to-zero from running;
+		// from anything else the sighting is what it always was.
+		stopped = in.Source == models.DiscoverySourceK8sWebhook
+	default:
+		return nil, false, fmt.Errorf("unknown sighting runtime_status %q (want running or stopped)",
+			in.RuntimeStatus)
+	}
+
 	runtimeStatus := models.RuntimeStatusRunning
 	runtimeReason := "observed by the " + in.Source + " connector"
 	runtimeObservedAt := &observedAt
@@ -685,6 +875,9 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 		runtimeStatus = models.RuntimeStatusUnknown
 		runtimeReason = "declared in a repository; no runtime observation"
 		runtimeObservedAt = nil
+	} else if stopped {
+		runtimeStatus = models.RuntimeStatusStopped
+		runtimeReason = "scaled to zero: observed by the " + in.Source + " connector with no running replicas"
 	} else if runningAt == nil {
 		runningAt = &observedAt
 	}
@@ -750,6 +943,7 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 			}
 		}
 	}
+	m.projectK8sSighting(workspaceID, stored.Source, stored.Fingerprint)
 	return stored, created, nil
 }
 

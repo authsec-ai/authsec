@@ -355,6 +355,11 @@ func (ctl *CloudAWSController) regionsError(c *gin.Context, err error) {
 				"changed: "+unavailable.Error(),
 			gin.H{"failure": f["code"], "api": f["api"], "error_code": f["error_code"], "fault": f["fault"]})
 
+	case errors.Is(err, services.ErrExternalIDUnreadable):
+		// The sentinel's text is safe to send: it names no secret path.
+		awsP2Error(c, http.StatusInternalServerError, "external_id_unreadable", err.Error(),
+			gin.H{"fault": "authsec"})
+
 	case errors.Is(err, awsdiscovery.ErrNoBaseCredentials):
 		log.Printf("[discovery] regions for %s: %v", c.Param("id"), err)
 		awsP2Error(c, http.StatusInternalServerError, "authsec_misconfigured",

@@ -84,7 +84,21 @@ const (
 	// TargetExecutesAs owns the workload -> ServiceAccount edges in
 	// iga_relationship, partitioned by the WORKLOAD's namespace.
 	TargetExecutesAs = "executes_as"
+	// TargetMemberOf owns the ServiceAccount -> implicit group edges in
+	// iga_relationship, partitioned by the SERVICEACCOUNT's namespace. A
+	// membership is written only while some binding names the group, and the
+	// binding that names it may be cluster-scoped, so ending one also needs a
+	// sweep that could read cluster-wide (see CanEnd).
+	TargetMemberOf = "member_of"
 )
+
+// ClusterPrefix is the source-key prefix every row of one cluster carries:
+// "k8s␟<cluster>␟". It scopes the queries that act on a cluster's rows as a
+// whole -- adoption and the retirement cascade -- so one cluster's sweep can
+// never touch another's.
+func ClusterPrefix(cluster string) string {
+	return Key(cluster)
+}
 
 // Scope is the sweep's coverage: what it looked at, and whether it finished.
 //
@@ -155,6 +169,12 @@ func (s Scope) CanEnd(p Partition) bool {
 	if !s.ClusterScoped && len(s.Namespaces) == 0 {
 		return false
 	}
+	// A membership exists because some binding names the group, and that
+	// binding may be a ClusterRoleBinding. A sweep that could not read
+	// cluster-wide cannot know the group is no longer named.
+	if p.Target == TargetMemberOf && !s.ClusterScoped {
+		return false
+	}
 	return s.Covers(p)
 }
 
@@ -171,7 +191,7 @@ func Partitions(s Scope) []Partition {
 				SourceID: s.SourceID, Cluster: s.Cluster, Namespace: ns, Class: class,
 			})
 		}
-		for _, target := range []string{TargetAssignment, TargetAccessEdge, TargetExecutesAs} {
+		for _, target := range []string{TargetAssignment, TargetAccessEdge, TargetExecutesAs, TargetMemberOf} {
 			out = append(out, Partition{
 				SourceID: s.SourceID, Cluster: s.Cluster, Namespace: ns, Target: target,
 			})
