@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/authsec-ai/authsec/internal/k8sread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -30,13 +31,13 @@ func NewK8sGraphController(db *gorm.DB) *K8sGraphController {
 // the counts without reading last_sweep.coverage can draw exactly the wrong
 // conclusion from a cluster whose agent lost cluster-wide read this morning.
 func (ctl *K8sGraphController) ListClusters(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
-		return
-	}
-	out, err := k8sread.New(ctl.db, ws).Clusters()
+	var out []k8sread.Cluster
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Clusters()
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -51,13 +52,13 @@ func (ctl *K8sGraphController) ListClusters(c *gin.Context) {
 
 // ListIdentities handles GET /authsec/discovery/k8s/identities.
 func (ctl *K8sGraphController) ListIdentities(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
-		return
-	}
-	out, err := k8sread.New(ctl.db, ws).Identities(igaLimit(c))
+	var out []k8sread.Identity
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Identities(igaLimit(c))
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -75,8 +76,8 @@ func (ctl *K8sGraphController) ListIdentities(c *gin.Context) {
 // question behind this screen is "why can this account do that", and three
 // separately-paged objects do not answer it.
 func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
+	if _, err := tenancy.Workspace(c); err != nil {
+		respondK8sReadError(c, err)
 		return
 	}
 	id, err := uuid.Parse(c.Param("id"))
@@ -84,9 +85,25 @@ func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity id"})
 		return
 	}
-	grants, sum, err := k8sread.New(ctl.db, ws).AccessFor(id)
+	var (
+		grants []k8sread.Grant
+		sum    k8sread.AccessSummary
+	)
+	err = k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) error {
+		// Another workspace's identity, or an unknown one, is 404 -- never
+		// an empty list that would read as "no access".
+		ok, err := q.HasIdentity(id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return tenancy.ErrNotFound
+		}
+		grants, sum, err = q.AccessFor(id)
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	// The summary ships even when the list is empty, because an empty list has
@@ -100,13 +117,13 @@ func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 // this agent reach" -- by naming the identity each workload runs as and how
 // much that identity can do.
 func (ctl *K8sGraphController) ListWorkloads(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
-		return
-	}
-	out, err := k8sread.New(ctl.db, ws).Workloads(igaLimit(c))
+	var out []k8sread.Workload
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Workloads(igaLimit(c))
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -118,14 +135,17 @@ func (ctl *K8sGraphController) ListWorkloads(c *gin.Context) {
 	})
 }
 
-func (ctl *K8sGraphController) ws(c *gin.Context) (uuid.UUID, bool) {
-	raw := c.GetString("workspace_id")
-	id, err := uuid.Parse(raw)
-	if err != nil {
+// respondK8sReadError maps a read failure: no workspace in the token is 401,
+// an identity outside the caller's workspace 404, anything else 500.
+func respondK8sReadError(c *gin.Context, err error) {
+	switch tenancy.HTTPStatus(err) {
+	case http.StatusUnauthorized:
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
-		return uuid.Nil, false
+	case http.StatusNotFound:
+		c.JSON(http.StatusNotFound, gin.H{"error": "identity not found"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
-	return id, true
 }
 
 func igaLimit(c *gin.Context) int {
