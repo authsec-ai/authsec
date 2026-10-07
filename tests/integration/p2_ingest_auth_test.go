@@ -119,7 +119,7 @@ func (l *ingestLab) post(route, bearer string, body any) (int, map[string]any) {
 // mint is a token through the service, as the admin endpoint mints it.
 func (l *ingestLab) mint(ws uuid.UUID, src *uuid.UUID) (string, uuid.UUID) {
 	l.t.Helper()
-	row, plain, err := l.tokens.Mint(ws, src, "test", "kh-test")
+	row, plain, err := l.tokens.Mint(ws, src, "test", "kh-test", nil)
 	if err != nil {
 		l.t.Fatalf("mint: %v", err)
 	}
@@ -368,7 +368,7 @@ func sha256Hex(s string) string {
 // only its sha256 is stored; a list never reads a hash.
 func TestP2IngestTokenStore(t *testing.T) {
 	l := newIngestLab(t)
-	row, plain, err := l.tokens.Mint(l.wsA, &l.srcA1, "  lab  ", "kh-test")
+	row, plain, err := l.tokens.Mint(l.wsA, &l.srcA1, "  lab  ", "kh-test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,13 +394,13 @@ func TestP2IngestTokenStore(t *testing.T) {
 	}
 
 	// Another mint never repeats a token.
-	_, plain2, _ := l.tokens.Mint(l.wsA, nil, "", "kh-test")
+	_, plain2, _ := l.tokens.Mint(l.wsA, nil, "", "kh-test", nil)
 	if plain2 == plain {
 		t.Error("two mints returned the same token")
 	}
 
 	// List: the workspace's tokens, no hash, never another workspace's.
-	_, _, _ = l.tokens.Mint(l.wsB, nil, "", "kh-test")
+	_, _, _ = l.tokens.Mint(l.wsB, nil, "", "kh-test", nil)
 	list, err := l.tokens.List(l.wsA)
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +415,7 @@ func TestP2IngestTokenStore(t *testing.T) {
 	}
 
 	// Binding to another workspace's source is refused.
-	if _, _, err := l.tokens.Mint(l.wsA, &l.srcB1, "", "kh-test"); err != repositories.ErrIngestTokenSourceNotFound {
+	if _, _, err := l.tokens.Mint(l.wsA, &l.srcB1, "", "kh-test", nil); err != repositories.ErrIngestTokenSourceNotFound {
 		t.Errorf("mint A bound to B's source: %v, want ErrIngestTokenSourceNotFound", err)
 	}
 

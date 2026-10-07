@@ -30,8 +30,8 @@ type DiscoveryRepository interface {
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	TouchSource(workspaceID, id uuid.UUID, status string) error
 	UpdateSource(s *models.DiscoverySource) error
-	// DeleteSource removes a source, its integration, and its findings.
-	// Returns a secrets-store path to purge when this was the workspace's last
+	// DeleteSource removes a source, its integration, and its findings, and
+	// revokes (never deletes) the ingest tokens bound to it. Returns a secrets-store path to purge when this was the workspace's last
 	// GitHub organisation, or "" when there is nothing to purge.
 	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
@@ -265,6 +265,13 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 // Everything that points at discovered_agents (events, access requests,
 // provenance, provisioning instructions, IGA links) is itself ON DELETE SET
 // NULL, so this cannot cascade into an audit trail or fail on a dependent row.
+//
+// The source's ingest tokens are REVOKED, not deleted, in the same transaction
+// and before the source row goes (RevokeSourceIngestTokens). Their foreign key
+// is ON DELETE SET NULL (044), so they stay as revoked history with
+// source_bound true and no source; a NULL source on an unrevoked bound token
+// would read as a workspace-wide token, which the table's CHECK refuses -- so a
+// delete that did not revoke first fails instead of widening a credential.
 func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
 	purgePath := ""
 	err := r.db.Transaction(func(tx *gorm.DB) error {
@@ -297,6 +304,12 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, e
 		if derr := tx.Delete(&models.DiscoveredAgent{},
 			"workspace_id = ? AND discovery_source_id = ?", workspaceID, id).Error; derr != nil {
 			return derr
+		}
+
+		// BEFORE the source, like the findings: an agent holding a token bound
+		// to this source must stop authenticating the moment it is gone.
+		if _, terr := RevokeSourceIngestTokens(tx, workspaceID, id); terr != nil {
+			return fmt.Errorf("revoke the source's ingest tokens: %w", terr)
 		}
 
 		res := tx.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)

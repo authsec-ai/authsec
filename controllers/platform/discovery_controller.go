@@ -418,6 +418,10 @@ func (ctl *DiscoveryController) vaultClient() (vault.VaultClient, error) {
 // the secrets store, so nothing GitHub-related is left behind with nothing using
 // it. The App itself remains on github.com -- only its owner can remove it
 // there.
+//
+// The one exception is the source's ingest tokens: they are revoked, not
+// deleted, and kept as history (source_bound, no source) -- see
+// DISCOVERY_INGEST_AUTH.md.
 func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 	wsID, _, err := ctl.workspace(c)
 	if err != nil {

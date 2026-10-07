@@ -26,8 +26,9 @@ type DiscoveryManager interface {
 	GetSource(workspaceID, id uuid.UUID) (*models.DiscoverySource, error)
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	UpdateSource(workspaceID, id uuid.UUID, in DiscoverySourceUpdateInput) (*models.DiscoverySource, error)
-	// DeleteSource removes the source, its integration and its findings, and
-	// returns a secrets-store path the caller must purge (empty when none).
+	// DeleteSource removes the source, its integration and its findings,
+	// revokes (never deletes) its bound ingest tokens, and returns a
+	// secrets-store path the caller must purge (empty when none).
 	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
 	// RegisterAgent records a heartbeat from a deployed discovery agent, creating

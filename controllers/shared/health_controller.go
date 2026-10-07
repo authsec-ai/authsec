@@ -7,6 +7,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/monitoring"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 )
 
@@ -66,6 +67,11 @@ func (hc *HealthController) ComprehensiveHealthCheck(c *gin.Context) {
 	if !systemHealthy["healthy"].(bool) {
 		isHealthy = false
 	}
+
+	// Discovery ingress auth: reported, never what makes the service
+	// unhealthy -- warn is the default during rollout, and a 503 would take the
+	// control plane out of its load balancer for a configuration choice.
+	checks["discovery_ingest_auth"] = hc.checkDiscoveryIngestAuth()
 
 	// 5. Metrics Health Check
 	metricsHealthy := hc.checkMetricsHealth()
@@ -225,6 +231,25 @@ func (hc *HealthController) checkSystemHealth() map[string]interface{} {
 	// Check if memory usage is too high (> 80% of system memory would be concerning)
 	// For now, just log the values - in production you'd set thresholds
 
+	return result
+}
+
+// checkDiscoveryIngestAuth reports IGA_DISCOVERY_INGEST_AUTH. "enforced" is
+// false in off and warn, with a warning saying what that leaves open and how
+// to enforce (controllers/platform/DISCOVERY_INGEST_AUTH.md).
+func (hc *HealthController) checkDiscoveryIngestAuth() map[string]interface{} {
+	st := services.CurrentDiscoveryIngestAuthStatus()
+	result := map[string]interface{}{
+		"healthy":  true,
+		"mode":     string(st.Mode),
+		"enforced": st.Enforced,
+		"env":      st.Env,
+		"message":  "discovery ingress requires a valid ingest token",
+	}
+	if !st.Enforced {
+		result["message"] = st.Warning
+		result["warning"] = st.Warning
+	}
 	return result
 }
 
