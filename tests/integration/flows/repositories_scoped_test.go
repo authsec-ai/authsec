@@ -4,11 +4,14 @@ package flows
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/google/uuid"
 )
 
 // Repository-level checks for the data-access repositories moved onto the
@@ -59,6 +62,60 @@ func Test_ScopedRepo_CreateOIDCEndUser(t *testing.T) {
 
 	if _, err := repo.CreateOIDCEndUser(context.Background(), "google", info); err == nil {
 		t.Error("create without a workspace in ctx succeeded")
+	}
+}
+
+// Admin users: listing, lookup by id, updates and creation stay in ctx's
+// workspace and among holders of its admin role.
+func Test_ScopedRepo_AdminUsers(t *testing.T) {
+	a, b := TwoTenants(t)
+	repo := database.NewAdminUserRepository(config.GetDatabase())
+	ctxA := database.WithWorkspace(context.Background(), a.WS.WorkspaceID)
+
+	list, err := repo.ListAdminUsersInWorkspace(ctxA, "")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	ids := map[uuid.UUID]bool{}
+	for _, u := range list {
+		ids[u.ID] = true
+	}
+	if !ids[a.WS.AdminUserID] || ids[b.WS.AdminUserID] || ids[a.EndUser.UserID] {
+		t.Errorf("A's admin list: %v (want A's admin only, not B's admin or A's end user)", ids)
+	}
+	if l, err := repo.ListAdminUsersInWorkspace(ctxA, "no-such-provider"); err != nil || len(l) != 0 {
+		t.Errorf("provider filter: %d users, %v", len(l), err)
+	}
+
+	if u, err := repo.GetAdminUserInWorkspace(ctxA, a.WS.AdminUserID); err != nil || u.ID != a.WS.AdminUserID {
+		t.Errorf("get own admin: %v", err)
+	}
+	for _, id := range []uuid.UUID{b.WS.AdminUserID, a.EndUser.UserID} {
+		if _, err := repo.GetAdminUserInWorkspace(ctxA, id); !errors.Is(err, tenancy.ErrNotFound) {
+			t.Errorf("get %s in A: %v, want ErrNotFound", id, err)
+		}
+	}
+	nameB := columnValue(t, "users", "name", "id = ?", b.WS.AdminUserID)
+	if err := repo.UpdateAdminUserInWorkspace(ctxA, b.WS.AdminUserID, map[string]interface{}{"name": "taken"}); !errors.Is(err, tenancy.ErrNotFound) {
+		t.Errorf("update B's admin from A: %v, want ErrNotFound", err)
+	}
+	if got := columnValue(t, "users", "name", "id = ?", b.WS.AdminUserID); got != nameB {
+		t.Errorf("B's admin renamed to %q", got)
+	}
+
+	n := emailSafeNonce()
+	ws := a.WS.WorkspaceID
+	nu := &models.AdminUser{Email: "adm-" + n + "@example.com", Name: "Adm " + n, PasswordHash: "x", Provider: "local",
+		Active: true, WorkspaceID: &ws, ClientID: &a.WS.ClientID, WorkspaceDomain: a.WS.WorkspaceDomain}
+	other := b.WS.WorkspaceID
+	if err := repo.CreateAdminUser(ctxA, &models.AdminUser{Email: "x-" + n + "@example.com", PasswordHash: "x", WorkspaceID: &other}); err == nil {
+		t.Error("created a user of workspace B under A's context")
+	}
+	if err := repo.CreateAdminUser(ctxA, nu); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if _, err := repo.GetAdminUserInWorkspace(ctxA, nu.ID); err != nil {
+		t.Errorf("new admin is not an admin of A: %v", err)
 	}
 }
 

@@ -85,44 +85,32 @@ func scanAdminUserRow(row interface{ Scan(...interface{}) error }) (models.Admin
 	return user, err
 }
 
-// adminInWorkspace restricts u to users holding the admin role in the
-// workspace bound to $1.
-const adminInWorkspace = `
-		  AND EXISTS (
-		        SELECT 1 FROM role_bindings rb
-		        JOIN roles r ON r.id = rb.role_id AND r.workspace_id = rb.workspace_id
-		        WHERE rb.workspace_id = $1 AND rb.user_id = u.id
-		          AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin'))`
-
-// ListAdminUsersInWorkspace returns the active admin users of the workspace
-// carried by ctx, optionally filtered by provider.
+// ListAdminUsersInWorkspace returns the active admin users (holders of the
+// workspace's admin role) of the workspace carried by ctx, optionally
+// filtered by provider.
 func (aur *AdminUserRepository) ListAdminUsersInWorkspace(ctx context.Context, provider string) ([]models.AdminUser, error) {
-	query := `SELECT ` + adminUserColumns + `
-		FROM users u
-		WHERE u.workspace_id = $1 AND u.active = true` + adminInWorkspace
 	args := []interface{}{}
+	providerFilter := ""
 	if provider != "" {
-		query += ` AND u.provider = $2`
+		providerFilter = ` AND u.provider = $2`
 		args = append(args, provider)
 	}
-	query += ` ORDER BY u.created_at DESC`
-
-	rows, err := tenancy.QueryContext(ctx, aur.db.DB, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query admin users: %w", err)
-	}
-	defer rows.Close()
-
 	var users []models.AdminUser
-	for rows.Next() {
+	err := queryScoped(ctx, aur.db.DB, `SELECT `+adminUserColumns+` FROM users u
+		WHERE u.workspace_id = $1 AND u.active = true AND EXISTS (SELECT 1 FROM role_bindings rb
+		        JOIN roles r ON r.id = rb.role_id AND r.workspace_id = rb.workspace_id
+		        WHERE rb.workspace_id = $1 AND rb.user_id = u.id
+		          AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin'))`+providerFilter+`
+		ORDER BY u.created_at DESC`, args, func(rows *sql.Rows) error {
 		user, err := scanAdminUserRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan admin user: %w", err)
+			return fmt.Errorf("failed to scan admin user: %w", err)
 		}
 		users = append(users, user)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("admin user query error: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query admin users: %w", err)
 	}
 	return users, nil
 }
@@ -131,26 +119,27 @@ func (aur *AdminUserRepository) ListAdminUsersInWorkspace(ctx context.Context, p
 // workspace carried by ctx, active or not. A user of another workspace, or
 // one without the admin role here, is tenancy.ErrNotFound.
 func (aur *AdminUserRepository) GetAdminUserInWorkspace(ctx context.Context, id uuid.UUID) (*models.AdminUser, error) {
-	query := `SELECT ` + adminUserColumns + `
-		FROM users u
-		WHERE u.workspace_id = $1 AND u.id = $2 AND u.deleted_at IS NULL` + adminInWorkspace
-	rows, err := tenancy.QueryContext(ctx, aur.db.DB, query, id)
+	user, err := scanAdminUserRow(scanFunc(func(dest ...interface{}) error {
+		return tenancy.QueryRowContext(ctx, aur.db.DB, `SELECT `+adminUserColumns+` FROM users u
+		WHERE u.workspace_id = $1 AND u.id = $2 AND u.deleted_at IS NULL AND EXISTS (SELECT 1 FROM role_bindings rb
+		        JOIN roles r ON r.id = rb.role_id AND r.workspace_id = rb.workspace_id
+		        WHERE rb.workspace_id = $1 AND rb.user_id = u.id
+		          AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin'))`,
+			[]interface{}{id}, dest...)
+	}))
+	if errors.Is(err, tenancy.ErrNotFound) {
+		return nil, tenancy.ErrNotFound
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get admin user: %w", err)
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("failed to get admin user: %w", err)
-		}
-		return nil, tenancy.ErrNotFound
-	}
-	user, err := scanAdminUserRow(rows)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan admin user: %w", err)
-	}
 	return &user, nil
 }
+
+// scanFunc adapts a scan function to scanAdminUserRow's row parameter.
+type scanFunc func(dest ...interface{}) error
+
+func (f scanFunc) Scan(dest ...interface{}) error { return f(dest...) }
 
 // SetAdminUserActiveInWorkspace sets the active flag of a user of the
 // workspace carried by ctx. Another workspace's user is tenancy.ErrNotFound.
@@ -185,8 +174,7 @@ func (aur *AdminUserRepository) UpdateAdminUserInWorkspace(ctx context.Context, 
 		set = append(set, fmt.Sprintf("%s = $%d", col, len(args)+1))
 	}
 	set = append(set, "updated_at = NOW()")
-	query := "UPDATE users SET " + strings.Join(set, ", ") + " WHERE workspace_id = $1 AND id = $2"
-	res, err := tenancy.ExecContext(ctx, aur.db.DB, query, args...)
+	res, err := tenancy.ExecContext(ctx, aur.db.DB, "UPDATE users SET "+strings.Join(set, ", ")+" WHERE workspace_id = $1 AND id = $2", args...)
 	if err != nil {
 		return fmt.Errorf("failed to update admin user: %w", err)
 	}
@@ -258,14 +246,9 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(ctx context.Cont
 	}
 	// workspaces is the tenant registry (no workspace_id column); the owner
 	// must also be a user of the same workspace.
-	if _, err := tenancy.ExecContext(ctx, aur.db.DB, `
-		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at)
-		SELECT $2, $1, u.id, $3, NULL, NULL, NOW()
-		  FROM workspaces w
-		  JOIN users u ON u.id = w.owner_user_id AND u.workspace_id = w.id
-		 WHERE w.id = $1 AND u.workspace_id = $1 AND u.active = true
-		   AND NOT EXISTS (
-			SELECT 1 FROM role_bindings
+	if _, err := tenancy.ExecContext(ctx, aur.db.DB, `INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at)
+		SELECT $2, $1, u.id, $3, NULL, NULL, NOW() FROM workspaces w JOIN users u ON u.id = w.owner_user_id AND u.workspace_id = w.id
+		 WHERE w.id = $1 AND u.workspace_id = $1 AND u.active = true AND NOT EXISTS (SELECT 1 FROM role_bindings
 			 WHERE workspace_id = $1 AND user_id = u.id AND role_id = $3
 			   AND scope_type IS NULL AND scope_id IS NULL)
 	`, uuid.New(), adminRoleID); err != nil {
@@ -303,31 +286,26 @@ func (aur *AdminUserRepository) CreateAdminUser(ctx context.Context, user *model
 	}
 
 	// $1 is the context's workspace; row-level security checks the row.
-	err = tenancy.WithTx(ctx, aur.db.DB, ws, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+	err = insertScoped(ctx, aur.db.DB, `
 		INSERT INTO users (workspace_id, id, email, username, password_hash, name,
 			provider, active, temporary_password, temporary_password_expires_at,
 			created_at, updated_at, client_id, project_id, workspace_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-	`,
-			ws,
-			user.ID,
-			user.Email,
-			user.Username,
-			user.PasswordHash,
-			user.Name,
-			user.Provider,
-			user.Active,
-			user.TemporaryPassword,
-			user.TemporaryPasswordExpiresAt,
-			user.CreatedAt,
-			user.UpdatedAt,
-			user.ClientID,
-			user.ProjectID,
-			user.WorkspaceDomain,
-		)
-		return err
-	})
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		user.ID,
+		user.Email,
+		user.Username,
+		user.PasswordHash,
+		user.Name,
+		user.Provider,
+		user.Active,
+		user.TemporaryPassword,
+		user.TemporaryPasswordExpiresAt,
+		user.CreatedAt,
+		user.UpdatedAt,
+		user.ClientID,
+		user.ProjectID,
+		user.WorkspaceDomain,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create admin user: %w", err)
 	}
@@ -340,10 +318,8 @@ func (aur *AdminUserRepository) CreateAdminUser(ctx context.Context, user *model
 	}
 
 	// Use role_bindings (user_roles is deprecated)
-	result, err := tenancy.ExecContext(ctx, aur.db.DB, `
-		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-		SELECT $2, $1, $3, $4, NULL, NULL, NOW(), NOW()
-		WHERE NOT EXISTS (
+	result, err := tenancy.ExecContext(ctx, aur.db.DB, `INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+		SELECT $2, $1, $3, $4, NULL, NULL, NOW(), NOW() WHERE NOT EXISTS (
 			SELECT 1 FROM role_bindings WHERE workspace_id = $1 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL
 		)
 	`, uuid.New(), user.ID, roleID)
