@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/authsec-ai/authsec/utils"
 )
 
 // MaxTTL caps the lifetime of a delegated JWT-SVID.
@@ -93,22 +95,51 @@ func CheckActive(ctx context.Context, db *sql.DB, workspaceID, clientID, token s
 	if workspaceID == "" || clientID == "" || token == "" {
 		return ErrInactive
 	}
-	var stored string
+	var sealed string
 	err := db.QueryRowContext(ctx, `
 		SELECT token FROM delegation_tokens -- TENANT-EXEMPT: scoped by workspace_id on the next line
 		WHERE workspace_id::text = $1 AND client_id::text = $2
 		  AND status = 'active' AND expires_at > now()`,
-		workspaceID, clientID).Scan(&stored)
+		workspaceID, clientID).Scan(&sealed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInactive
 	}
 	if err != nil {
 		return fmt.Errorf("delegation: check revocation: %w", err)
 	}
+	stored, _, err := OpenToken(sealed)
+	if err != nil {
+		return ErrInactive
+	}
 	if subtle.ConstantTimeCompare([]byte(stored), []byte(token)) != 1 {
 		return ErrInactive
 	}
 	return nil
+}
+
+// SealToken encrypts a delegated JWT-SVID for storage in
+// delegation_tokens.token (AES-GCM, utils.EncryptString). The plaintext is a
+// bearer credential and is never stored (AS-025).
+func SealToken(token string) (string, error) {
+	if token == "" {
+		return "", errors.New("delegation: empty token")
+	}
+	return utils.EncryptString(token)
+}
+
+// OpenToken returns the plaintext of a stored delegation token. Rows written
+// before tokens were encrypted hold the JWT itself; those are returned with
+// legacy=true so the caller can re-seal them. A JWT always contains '.',
+// which standard base64 ciphertext never does, so the two cannot be confused.
+func OpenToken(stored string) (token string, legacy bool, err error) {
+	if strings.Count(stored, ".") == 2 {
+		return stored, true, nil
+	}
+	plain, err := utils.DecryptString(stored)
+	if err != nil {
+		return "", false, fmt.Errorf("delegation: open stored token: %w", err)
+	}
+	return plain, false, nil
 }
 
 // Verify applies both checks to a verified delegated token.

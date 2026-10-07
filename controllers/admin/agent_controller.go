@@ -441,7 +441,14 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	log.Printf("[AgentController] Delegated JWT-SVID issued: agent=%s spiffe_id=%s perms=%d ttl=%ds",
 		clientID, *agent.SpiffeID, len(delegatedPerms), finalTTL)
 
-	// Upsert into delegation_tokens so SDK/agent can pull it later
+	// Upsert into delegation_tokens so SDK/agent can pull it later. The token
+	// is stored encrypted, never in plaintext (AS-025).
+	sealedToken, err := delegation.SealToken(jwtResp.Token)
+	if err != nil {
+		log.Printf("[AgentController] Failed to seal delegation token for agent %s: %v", clientID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store delegation token"})
+		return
+	}
 	permsJSON, _ := json.Marshal(delegatedPerms)
 	audJSON, _ := json.Marshal(req.Audience)
 	userUUID, _ := uuid.Parse(userID)
@@ -459,7 +466,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		WorkspaceID: *workspaceID,
 		ClientID:    clientUUID,
 		PolicyID:    policyID,
-		Token:       jwtResp.Token,
+		Token:       sealedToken,
 		SpiffeID:    jwtResp.SpiffeID,
 		Permissions: permsJSON,
 		Audience:    audJSON,
@@ -472,13 +479,13 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	// Upsert: update if (workspace_id, client_id) exists, else insert
 	var existing models.DelegationToken
 	upsertResult := tenantDB.
-		Where("client_id = ?", clientUUID).
+		Where("workspace_id = ? AND client_id = ?", *workspaceID, clientUUID).
 		First(&existing)
 	if upsertResult.Error == nil {
 		// Update existing row
 		tenantDB.Model(&existing).Updates(map[string]interface{}{
 			"policy_id":    policyID,
-			"token":        jwtResp.Token,
+			"token":        sealedToken,
 			"spiffe_id":    jwtResp.SpiffeID,
 			"permissions":  permsJSON,
 			"audience":     audJSON,

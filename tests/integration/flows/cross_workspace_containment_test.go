@@ -260,7 +260,7 @@ func Test_DelegationToken_OnlyOwnerOrAdmin(t *testing.T) {
 		t.Fatalf("seed other user: %v", err)
 	}
 	agent := uuid.New()
-	secret := "delegated-svid-" + emailSafeNonce()
+	secret := "eyJhbGciOiJSUzI1NiJ9.delegated-svid-" + emailSafeNonce() + ".sig" // a JWT-shaped legacy plaintext row
 	mustExec(t, `INSERT INTO delegation_tokens (id, client_id, workspace_id, token, spiffe_id,
 			expires_at, delegated_by, ttl_seconds)
 		VALUES (?, ?, ?, ?, 'spiffe://test/agent', ?, ?, 3600)`,
