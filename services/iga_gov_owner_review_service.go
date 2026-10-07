@@ -1548,8 +1548,9 @@ func init() {
 			}
 			return tx.Exec(`UPDATE iga_gov_owner_response
 				SET delivery = 'delivered',
-				    delivery_channels = ARRAY(SELECT DISTINCT c FROM unnest(array_append(delivery_channels, ?::text)) AS c ORDER BY c)
-				WHERE workspace_id = ? AND review_id = ? AND user_id = ?`, n.Channel, n.WorkspaceID, n.SubjectID, *user).Error
+				    delivery_channels = CASE WHEN ?::text = ANY(delivery_channels) THEN delivery_channels
+				                             ELSE array_append(delivery_channels, ?::text) END
+				WHERE workspace_id = ? AND review_id = ? AND user_id = ?`, n.Channel, n.Channel, n.WorkspaceID, n.SubjectID, *user).Error
 		},
 		OnDead: func(tx *gorm.DB, n *models.IGAGovNotification, user *uuid.UUID) error {
 			if user == nil {
