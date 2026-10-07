@@ -143,6 +143,16 @@ func Test_AdminOnboarding_SecondWorkspaceSignsUp(t *testing.T) {
 	w = env.Do("POST", "/authsec/uflow/auth/admin/complete-registration", map[string]interface{}{"email": email, "otp": otp}, "")
 	require.Equal(t, 201, w.Code, "second workspace registration must complete: %s", w.Body.String())
 
+	// AS-083: the first admin's id is independent of the workspace id, and
+	// the workspace names the admin as its owner.
+	var userID, workspaceID, ownerID string
+	require.NoError(t, config.GetDatabase().DB.QueryRow(`
+		SELECT u.id::text, u.workspace_id::text, COALESCE(w.owner_user_id::text, '')
+		FROM users u JOIN workspaces w ON w.id = u.workspace_id
+		WHERE LOWER(u.email) = LOWER($1)`, email).Scan(&userID, &workspaceID, &ownerID))
+	assert.NotEqual(t, workspaceID, userID, "the first admin must not share the workspace's id")
+	assert.Equal(t, userID, ownerID, "the workspace owner must be the first admin")
+
 	w = env.Do("POST", "/authsec/uflow/auth/admin/login", map[string]interface{}{"email": email, "password": password}, "")
 	require.Equal(t, 200, w.Code, "second workspace admin must sign in: %s", w.Body.String())
 	token := stringField(parseBody(w), "token")

@@ -539,8 +539,9 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Generate UUIDs for admin user
-	adminUUID := uuid.New()
+	// The new workspace's id. The first admin gets an id of their own when
+	// the registration completes (AS-083).
+	newWorkspaceID := uuid.New()
 
 	// Create pending registration.
 	// ProjectID is generated up-front and persisted on pending_registrations so
@@ -552,9 +553,9 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	pendingReg := &models.PendingRegistration{
 		Email:           input.Email,
 		PasswordHash:    hashedPassword,
-		WorkspaceID:     adminUUID,
+		WorkspaceID:     newWorkspaceID,
 		ProjectID:       uuid.New(),
-		ClientID:        adminUUID, // Same as tenant for admin
+		ClientID:        newWorkspaceID, // Same as tenant for admin
 		WorkspaceDomain: workspaceDomain,
 		ExpiresAt:       time.Now().Add(24 * time.Hour), // 24 hours for admin registration
 	}
@@ -909,7 +910,8 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	username := pendingReg.Email
 	adminUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:              pendingReg.WorkspaceID, // Use tenant ID as user ID for admin
+			// No ID: CreateUserTx gives the admin a fresh id, independent of
+			// the workspace's (AS-083).
 			Email:           pendingReg.Email,
 			Name:            fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 			PasswordHash:    pendingReg.PasswordHash,
