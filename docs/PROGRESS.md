@@ -29,7 +29,8 @@ Branch `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pus
   - AS-100: AD/Entra sync never created memberships (`64ccc89`).
   - AS-101: end-user sign-up deleted other workspaces' pending registrations (`30d546a`).
   Eight unrouted legacy `UserController` handlers were also deleted (`3dabc45`).
-- **Interrupted:** two of the three agents hit the spend limit. Their committed work is merged and verified (build, vet, unit, flows, onboarding and flagsoff all pass). Left to do: `services/oauth_as_service.go`, `scope_resolver.go` and `governance_certify_service.go`, and `database/voice_auth_repository.go`, `agent_action_repository.go`, `ciba_auth_repository.go` and `user_repository.go`. A half-finished voice repository change was not taken.
+- **After the agents:** the agent action guard is scoped (AS-102, `70ad2fe`). The voice repository rewrite an agent left uncommitted was verified and merged (`c992db2`). Platform and pre-session statements got specific exemptions (`ecfcb02`). Ratchet now 151.
+- **Interrupted:** two of the three agents hit the spend limit. Their committed work is merged and verified (build, vet, unit, flows, onboarding and flagsoff all pass). Left to do: `services/oauth_as_service.go`, `scope_resolver.go` and `governance_certify_service.go`, and `database/ciba_auth_repository.go` and `user_repository.go`.
 
 ### Verification
 - Build, vet and unit tests pass.
