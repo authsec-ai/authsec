@@ -18,8 +18,9 @@ import (
 //
 // with the same reason GET /api/iga/v1/capabilities reports in policy.reason,
 // before any permission or handler runs. GET /policy/status is mounted
-// in this build with the §7.1 owners routes (T3.07) and the §7.1 / §7.2
-// reads of T3.06b (iga_gov_findings_controller.go); the other §7 routes are
+// in this build with the §7.1 owners routes (T3.07), the §7.1 / §7.2
+// reads of T3.06b (iga_gov_findings_controller.go), the §7.4 owner review
+// (T3.12) and the §7.8 settings and events (T3.20); the other §7 routes are
 // added to RegisterIGAPolicyRoutes by the tasks that implement them, and
 // inherit the gate by being in the group.
 
@@ -89,6 +90,22 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
 	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
+
+	// §7.4 owner review (T3.12, iga_gov_reviews_controller.go). The member
+	// routes check ownership in the handler, with governance:read as the
+	// fallback for a caller who is not an owner.
+	g.GET("/reviews", ctl.ListReviews(require("governance", "read")))
+	g.GET("/reviews/:id", ctl.GetReview(require("governance", "read")))
+	g.POST("/reviews/:id/respond", ctl.RespondReview)
+	g.POST("/reviews/:id/exception", require("governance", "approve"), ctl.ExceptReview)
+	g.POST("/reviews/:id/remind", require("governance", "author"), ctl.RemindReview)
+
+	// §7.8 settings and events (T3.20, iga_gov_events_controller.go).
+	g.GET("/settings", require("governance", "read"), ctl.GetSettings)
+	g.PUT("/settings", require("governance", "enforce"), ctl.PutSettings)
+	g.GET("/events", require("governance", "read"), ctl.ListEvents)
+	g.GET("/events/export", require("governance", "read"), ctl.ExportEvents)
+	g.GET("/events/kinds", require("governance", "read"), ctl.EventKinds)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's

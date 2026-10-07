@@ -1,0 +1,436 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
+)
+
+// Phase 3 workspace settings (SPEC-iga-phase3-policy.md §7.8, §4.3, §9.3
+// S9; T3.20): GET /settings and PUT /settings over iga_gov_settings (055),
+// plus the notification channels (email and webhook targets).
+//
+// DECISION (T3.20, notification channels -- DDL needed): 055's
+// iga_gov_settings has no column for notification channels, §9.3 S9 lists
+// "email and webhook targets" under Setup, and the disposition plan wants
+// the legacy addresses COPIED into "Phase 3 notification settings". No
+// migration may be added in this task, so the channels are behind
+// GovNotificationChannelStore, whose production implementation reports
+// itself unavailable until the DDL lands (reported with the exact DDL).
+// Everything else -- the API, the copy-on-first-read of the legacy row, the
+// webhook target the notifier resolves -- is built and tested against that
+// interface. While it is unavailable: owners are notified by email (and by
+// any registered channel), no workspace webhook is sent, GET /settings says
+// why, and PUT /settings with notifications is 409
+// notification_settings_unavailable.
+
+// GovNotificationChannels are a workspace's notification targets.
+type GovNotificationChannels struct {
+	// EmailEnabled: owners are emailed (default true).
+	EmailEnabled bool `json:"email_enabled"`
+	// WebhookURL is the workspace webhook ("" = none); https only.
+	WebhookURL string `json:"webhook_url"`
+	// WebhookSecret signs the webhook (X-AuthSec-Signature); never returned.
+	WebhookSecret string `json:"-"`
+	// Source is "phase3" (set through PUT /settings) or "legacy_copy".
+	Source             string     `json:"source"`
+	CopiedFromLegacyAt *time.Time `json:"copied_from_legacy_at"`
+}
+
+// GovNotificationChannelStore persists GovNotificationChannels.
+type GovNotificationChannelStore interface {
+	// Available reports whether the store can hold channels, and why not.
+	Available() (bool, string)
+	// GetTx returns the workspace's channels and whether a row exists.
+	GetTx(tx *gorm.DB, ws uuid.UUID) (*GovNotificationChannels, bool, error)
+	// SaveTx writes the workspace's channels.
+	SaveTx(tx *gorm.DB, ws uuid.UUID, ch GovNotificationChannels) error
+}
+
+// GovChannelsUnavailableReason is why channels cannot be stored in this
+// build (the DDL is pending).
+const GovChannelsUnavailableReason = "Notification channel settings are not stored in this build: the Phase 3 settings table has no channel columns yet. Owners are notified by email."
+
+type unavailableChannelStore struct{}
+
+func (unavailableChannelStore) Available() (bool, string) { return false, GovChannelsUnavailableReason }
+func (unavailableChannelStore) GetTx(*gorm.DB, uuid.UUID) (*GovNotificationChannels, bool, error) {
+	return nil, false, errGovChannelsUnavailable
+}
+func (unavailableChannelStore) SaveTx(*gorm.DB, uuid.UUID, GovNotificationChannels) error {
+	return errGovChannelsUnavailable
+}
+
+var errGovChannelsUnavailable = errors.New(GovChannelsUnavailableReason)
+
+var (
+	govChannelStoreMu sync.RWMutex
+	govChannelStore   GovNotificationChannelStore = unavailableChannelStore{}
+)
+
+// SetGovNotificationChannelStore installs the channel store (the DDL's
+// implementation once it lands; tests install a fake). It returns a
+// function restoring the previous store.
+func SetGovNotificationChannelStore(s GovNotificationChannelStore) (restore func()) {
+	govChannelStoreMu.Lock()
+	prev := govChannelStore
+	if s == nil {
+		s = unavailableChannelStore{}
+	}
+	govChannelStore = s
+	govChannelStoreMu.Unlock()
+	return func() {
+		govChannelStoreMu.Lock()
+		govChannelStore = prev
+		govChannelStoreMu.Unlock()
+	}
+}
+
+func currentGovChannelStore() GovNotificationChannelStore {
+	govChannelStoreMu.RLock()
+	defer govChannelStoreMu.RUnlock()
+	return govChannelStore
+}
+
+// DefaultGovNotificationChannels is a workspace without a channel row:
+// email on, no webhook.
+func DefaultGovNotificationChannels() GovNotificationChannels {
+	return GovNotificationChannels{EmailEnabled: true, Source: "default"}
+}
+
+// govChannels returns the workspace's effective channels (defaults when the
+// store is unavailable or has no row). It never copies: the copy happens on
+// the settings read (GovSettingsService.Get).
+func govChannels(db *gorm.DB, ws uuid.UUID) GovNotificationChannels {
+	st := currentGovChannelStore()
+	if ok, _ := st.Available(); !ok {
+		return DefaultGovNotificationChannels()
+	}
+	ch, exists, err := st.GetTx(db, ws)
+	if err != nil || !exists || ch == nil {
+		return DefaultGovNotificationChannels()
+	}
+	return *ch
+}
+
+// GovWorkspaceWebhookTarget is the notifier's webhook resolver: the
+// workspace webhook from the channel store, or nil.
+func GovWorkspaceWebhookTarget(db *gorm.DB, ws uuid.UUID) (*GovWebhookTarget, error) {
+	ch := govChannels(db, ws)
+	if ch.WebhookURL == "" {
+		return nil, nil
+	}
+	return &GovWebhookTarget{URL: ch.WebhookURL, Secret: ch.WebhookSecret}, nil
+}
+
+// GovNotificationSettingsView is the notifications block of GET /settings.
+type GovNotificationSettingsView struct {
+	Available          bool       `json:"available"`
+	Reason             string     `json:"reason,omitempty"`
+	EmailEnabled       bool       `json:"email_enabled"`
+	WebhookURL         string     `json:"webhook_url"`
+	WebhookSecretSet   bool       `json:"webhook_secret_set"`
+	Source             string     `json:"source"`
+	CopiedFromLegacyAt *time.Time `json:"copied_from_legacy_at"`
+	// Slack is T3.14's (workspace_slack_integration); reported here so the
+	// Setup page has one place to read.
+	Slack GovChannelAvailability `json:"slack"`
+}
+
+// GovChannelAvailability is whether an extra channel is installed.
+type GovChannelAvailability struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// GovSettingsView is GET /settings.
+type GovSettingsView struct {
+	models.IGAGovSettings
+	// Saved is false when the workspace has no row (every value a default).
+	Saved         bool                        `json:"saved"`
+	Notifications GovNotificationSettingsView `json:"notifications"`
+}
+
+// GovSettingsService serves §7.8 settings.
+type GovSettingsService struct {
+	db *gorm.DB
+}
+
+// NewGovSettingsService builds the service over db and the installed
+// channel store.
+func NewGovSettingsService(db *gorm.DB) *GovSettingsService { return &GovSettingsService{db: db} }
+
+// Get is GET /settings. On the first read of a workspace whose channel store
+// has no row and whose LEGACY governance_notification_settings row exists,
+// the legacy channel addresses are copied into the store in one transaction
+// with a settings.notification_channels_copied event (disposition plan §2:
+// copy, never move -- the legacy row is only read).
+func (s *GovSettingsService) Get(ctx context.Context, ws uuid.UUID) (*GovSettingsView, error) {
+	db := s.db.WithContext(ctx)
+	if err := s.copyLegacyChannels(db, ws); err != nil {
+		return nil, err
+	}
+	return s.view(db, ws)
+}
+
+func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, error) {
+	var rows []models.IGAGovSettings
+	if err := db.Where("workspace_id = ?", ws).Limit(1).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := &GovSettingsView{}
+	if len(rows) == 1 {
+		out.IGAGovSettings, out.Saved = rows[0], true
+	} else {
+		out.IGAGovSettings = models.DefaultIGAGovSettings(ws)
+		out.IGAGovSettings.UpdatedAt = time.Time{}
+	}
+	st := currentGovChannelStore()
+	ok, reason := st.Available()
+	n := GovNotificationSettingsView{Available: ok, Reason: reason}
+	ch := govChannels(db, ws)
+	n.EmailEnabled, n.WebhookURL, n.WebhookSecretSet = ch.EmailEnabled, ch.WebhookURL, ch.WebhookSecret != ""
+	n.Source, n.CopiedFromLegacyAt = ch.Source, ch.CopiedFromLegacyAt
+	if _, has := govNoticeChannel(GovChannelSlack); has {
+		n.Slack = GovChannelAvailability{Available: true}
+	} else {
+		n.Slack = GovChannelAvailability{Reason: "Slack is not available in this build: the Slack app has not been released."}
+	}
+	out.Notifications = n
+	return out, nil
+}
+
+func (s *GovSettingsService) copyLegacyChannels(db *gorm.DB, ws uuid.UUID) error {
+	st := currentGovChannelStore()
+	if ok, _ := st.Available(); !ok {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Serialise first reads of one workspace on its settings row lock
+		// (the row may not exist: lock the workspace's settings key instead).
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext('iga_gov_settings_channels:' || ?::text))`, ws.String()).Error; err != nil {
+			return err
+		}
+		_, exists, err := st.GetTx(tx, ws)
+		if err != nil || exists {
+			return err
+		}
+		legacy, err := ReadLegacyNotificationChannels(tx, ws)
+		if err != nil || legacy == nil {
+			return err
+		}
+		now := time.Now().UTC()
+		ch := GovNotificationChannels{EmailEnabled: legacy.EmailEnabled, WebhookURL: legacy.WebhookURL,
+			WebhookSecret: legacy.WebhookSecret, Source: "legacy_copy", CopiedFromLegacyAt: &now}
+		if err := st.SaveTx(tx, ws, ch); err != nil {
+			return err
+		}
+		return appendGovEvent(tx, ws, GovEventSettingsChannelsCopied, models.GovActorSystem, "settings", govEventRefs{},
+			map[string]any{"from": "governance_notification_settings", "email_enabled": legacy.EmailEnabled,
+				"webhook_configured": legacy.WebhookURL != "", "webhook_signed": legacy.WebhookSecret != ""})
+	})
+}
+
+// GovSettingsPatch is PUT /settings: every field optional (omitted keeps
+// the current value).
+type GovSettingsPatch struct {
+	EnforcementMode        *string `json:"enforcement_mode"`
+	DefaultWindowDays      *int    `json:"default_window_days"`
+	DefaultObservationDays *int    `json:"default_observation_days"`
+	OwnerReviewDays        *int    `json:"owner_review_days"`
+	ApprovalValidDays      *int    `json:"approval_valid_days"`
+	CanaryHours            *int    `json:"canary_hours"`
+	IaCApplyHours          *int    `json:"iac_apply_hours"`
+	EvidenceRetentionRevs  *int    `json:"evidence_retention_revs"`
+	// Reason is required when switching to enforce (§7.8).
+	Reason string `json:"reason"`
+	// ExpectedUpdatedAt, when given, must equal the row's updated_at
+	// (§7 "Concurrency"): a stale write is 409 version_conflict.
+	ExpectedUpdatedAt *time.Time             `json:"expected_updated_at"`
+	Notifications     *GovNotificationsPatch `json:"notifications"`
+}
+
+// GovNotificationsPatch changes the notification channels.
+type GovNotificationsPatch struct {
+	EmailEnabled  *bool   `json:"email_enabled"`
+	WebhookURL    *string `json:"webhook_url"`
+	WebhookSecret *string `json:"webhook_secret"`
+}
+
+// 055's CHECK ranges, checked here so a bad value is a 400 naming the field.
+var govSettingsRanges = []struct {
+	name     string
+	get      func(*GovSettingsPatch) *int
+	set      func(*models.IGAGovSettings, int)
+	val      func(*models.IGAGovSettings) int
+	min, max int
+}{
+	{"default_window_days", func(p *GovSettingsPatch) *int { return p.DefaultWindowDays }, func(s *models.IGAGovSettings, v int) { s.DefaultWindowDays = v }, func(s *models.IGAGovSettings) int { return s.DefaultWindowDays }, 30, 400},
+	{"default_observation_days", func(p *GovSettingsPatch) *int { return p.DefaultObservationDays }, func(s *models.IGAGovSettings, v int) { s.DefaultObservationDays = v }, func(s *models.IGAGovSettings) int { return s.DefaultObservationDays }, 1, 90},
+	{"owner_review_days", func(p *GovSettingsPatch) *int { return p.OwnerReviewDays }, func(s *models.IGAGovSettings, v int) { s.OwnerReviewDays = v }, func(s *models.IGAGovSettings) int { return s.OwnerReviewDays }, 1, 30},
+	{"approval_valid_days", func(p *GovSettingsPatch) *int { return p.ApprovalValidDays }, func(s *models.IGAGovSettings, v int) { s.ApprovalValidDays = v }, func(s *models.IGAGovSettings) int { return s.ApprovalValidDays }, 1, 30},
+	{"canary_hours", func(p *GovSettingsPatch) *int { return p.CanaryHours }, func(s *models.IGAGovSettings, v int) { s.CanaryHours = v }, func(s *models.IGAGovSettings) int { return s.CanaryHours }, 1, 336},
+	{"iac_apply_hours", func(p *GovSettingsPatch) *int { return p.IaCApplyHours }, func(s *models.IGAGovSettings, v int) { s.IaCApplyHours = v }, func(s *models.IGAGovSettings) int { return s.IaCApplyHours }, 1, 336},
+	{"evidence_retention_revs", func(p *GovSettingsPatch) *int { return p.EvidenceRetentionRevs }, func(s *models.IGAGovSettings, v int) { s.EvidenceRetentionRevs = v }, func(s *models.IGAGovSettings) int { return s.EvidenceRetentionRevs }, 5, 365},
+}
+
+// Update is PUT /settings: validated, written with a settings.updated event
+// in one transaction. It returns the views before and after.
+func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p GovSettingsPatch) (before, after *GovSettingsView, err error) {
+	db := s.db.WithContext(ctx)
+	if err := s.copyLegacyChannels(db, ws); err != nil {
+		return nil, nil, err
+	}
+	st := currentGovChannelStore()
+	if p.Notifications != nil {
+		if ok, reason := st.Available(); !ok {
+			return nil, nil, govErr(http.StatusConflict, "notification_settings_unavailable", reason, nil)
+		}
+		if u := p.Notifications.WebhookURL; u != nil {
+			v := strings.TrimSpace(*u)
+			if v != "" && !strings.HasPrefix(v, "https://") {
+				return nil, nil, GovBadParam("notifications.webhook_url", "webhook_url must be an https:// URL or empty.")
+			}
+		}
+	}
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var rows []models.IGAGovSettings
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("workspace_id = ?", ws).Limit(1).Find(&rows).Error; err != nil {
+			return err
+		}
+		cur := models.DefaultIGAGovSettings(ws)
+		saved := len(rows) == 1
+		if saved {
+			cur = rows[0]
+		}
+		if p.ExpectedUpdatedAt != nil {
+			if !saved || !cur.UpdatedAt.Equal(*p.ExpectedUpdatedAt) {
+				return govErr(http.StatusConflict, "version_conflict", "The settings changed since they were read; re-read and retry.",
+					map[string]any{"updated_at": nullTime(saved, cur.UpdatedAt)})
+			}
+		}
+		b, err := s.view(tx, ws)
+		if err != nil {
+			return err
+		}
+		before = b
+		next := cur
+		var changed []string
+		if p.EnforcementMode != nil {
+			m := *p.EnforcementMode
+			if m != models.GovModeFindingsOnly && m != models.GovModeEnforce {
+				return GovBadParam("enforcement_mode", "enforcement_mode must be findings_only or enforce.")
+			}
+			if m != cur.EnforcementMode {
+				if m == models.GovModeEnforce && strings.TrimSpace(p.Reason) == "" {
+					return GovBadParam("reason", "Switching to enforce requires a reason.")
+				}
+				next.EnforcementMode = m
+				changed = append(changed, "enforcement_mode")
+			}
+		}
+		for _, r := range govSettingsRanges {
+			v := r.get(&p)
+			if v == nil {
+				continue
+			}
+			if *v < r.min || *v > r.max {
+				return GovBadParam(r.name, r.name+" must be between "+strconv.Itoa(r.min)+" and "+strconv.Itoa(r.max)+".")
+			}
+			if *v != r.val(&cur) {
+				r.set(&next, *v)
+				changed = append(changed, r.name)
+			}
+		}
+		var chBefore, chAfter GovNotificationChannels
+		if p.Notifications != nil {
+			got, exists, err := st.GetTx(tx, ws)
+			if err != nil {
+				return err
+			}
+			chBefore = DefaultGovNotificationChannels()
+			if exists && got != nil {
+				chBefore = *got
+			}
+			chAfter = chBefore
+			if v := p.Notifications.EmailEnabled; v != nil && *v != chAfter.EmailEnabled {
+				chAfter.EmailEnabled = *v
+				changed = append(changed, "notifications.email_enabled")
+			}
+			if v := p.Notifications.WebhookURL; v != nil && strings.TrimSpace(*v) != chAfter.WebhookURL {
+				chAfter.WebhookURL = strings.TrimSpace(*v)
+				changed = append(changed, "notifications.webhook_url")
+				if chAfter.WebhookURL == "" {
+					chAfter.WebhookSecret = ""
+				}
+			}
+			if v := p.Notifications.WebhookSecret; v != nil && *v != chAfter.WebhookSecret {
+				chAfter.WebhookSecret = *v
+				changed = append(changed, "notifications.webhook_secret")
+			}
+			if chAfter != chBefore {
+				chAfter.Source = "phase3"
+				if err := st.SaveTx(tx, ws, chAfter); err != nil {
+					return err
+				}
+			}
+		}
+		sort.Strings(changed)
+		if len(changed) > 0 {
+			next.UpdatedBy = &actor
+			if err := repositories.NewIGAGovSettingsRepository(tx).SaveTx(tx, &next); err != nil {
+				return err
+			}
+		}
+		payload := map[string]any{"changed": changed, "reason": strings.TrimSpace(p.Reason),
+			"before": govSettingsDigest(&cur), "after": govSettingsDigest(&next)}
+		if p.Notifications != nil {
+			payload["notifications_before"] = govChannelsDigest(chBefore)
+			payload["notifications_after"] = govChannelsDigest(chAfter)
+		}
+		if cur.EnforcementMode != next.EnforcementMode {
+			payload["enforcement_mode_changed"] = map[string]string{"from": cur.EnforcementMode, "to": next.EnforcementMode}
+		}
+		if err := appendGovEvent(tx, ws, GovEventSettingsUpdated, models.GovActorUser, actor.String(), govEventRefs{}, payload); err != nil {
+			return err
+		}
+		a, err := s.view(tx, ws)
+		after = a
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return before, after, nil
+}
+
+func govSettingsDigest(s *models.IGAGovSettings) map[string]any {
+	return map[string]any{"enforcement_mode": s.EnforcementMode, "default_window_days": s.DefaultWindowDays,
+		"default_observation_days": s.DefaultObservationDays, "owner_review_days": s.OwnerReviewDays,
+		"approval_valid_days": s.ApprovalValidDays, "canary_hours": s.CanaryHours, "iac_apply_hours": s.IaCApplyHours,
+		"evidence_retention_revs": s.EvidenceRetentionRevs}
+}
+
+// govChannelsDigest never carries the secret, only whether one is set.
+func govChannelsDigest(c GovNotificationChannels) map[string]any {
+	return map[string]any{"email_enabled": c.EmailEnabled, "webhook_url": c.WebhookURL, "webhook_signed": c.WebhookSecret != ""}
+}
+
+func nullTime(ok bool, t time.Time) any {
+	if !ok {
+		return nil
+	}
+	return t
+}

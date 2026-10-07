@@ -539,13 +539,17 @@ func RegisterPolicyJobNoops(w *PolicyJobWorker) {
 }
 
 // NewDefaultPolicyJobWorker is the production worker: the handlers that exist
-// in this build (evaluate_owner_rules, T3.07) plus the no-op periodic kinds,
+// in this build (evaluate_owner_rules, T3.07; notify, T3.12) plus the no-op periodic kinds,
 // and the default schedules. Later tasks Register their kinds here.
 func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w := NewPolicyJobWorker(db, "")
 	RegisterPolicyJobNoops(w)
 	w.Register(PolicyJobKind{Kind: repositories.GovJobEvaluateOwnerRules,
 		Handler: NewIGAGovOwnershipService(db).EvaluateOwnerRulesHandler})
+	// T3.12: notify delivers iga_gov_notification rows (email, webhook, and
+	// the channels registered with RegisterGovNotificationChannel); retry
+	// attempt x 10 min, dead after 5 (§8.1).
+	w.Register(NewGovNotifier(db).JobKind())
 	return w
 }
 
