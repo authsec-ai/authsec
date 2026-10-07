@@ -1,6 +1,8 @@
 package platform
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,11 +27,23 @@ import (
 // SCIMController handles SCIM 2.0 provisioning endpoints for end-users (tenant DB)
 type SCIMController struct{}
 
-func countSCIMTenantUsers(workspaceID uuid.UUID) (int64, error) {
+func countSCIMTenantUsers(ctx context.Context) (int64, error) {
 	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ?", workspaceID).Scan(&count).Error
+	err := tenancy.QueryRowContext(ctx, scimSQL(), `SELECT COUNT(*) FROM users WHERE workspace_id = $1`, nil, &count)
 	return count, err
 }
+
+// scimSQL is the database handle for the controller's raw statements, which
+// run through the scoped layer: the workspace is the SCIM connection's (the
+// tenant context SCIMConnectionAuth set), bound to $1, under RLS.
+func scimSQL() *sql.DB { return config.GetDatabase().DB }
+
+// scimAddMember adds a user of the workspace to one of its groups; the
+// composite keys refuse a user or group of another workspace.
+const scimAddMember = `
+	INSERT INTO user_groups (workspace_id, user_id, group_id)
+	SELECT g.workspace_id, $2, g.id FROM groups g WHERE g.workspace_id = $1 AND g.id = $3
+	ON CONFLICT DO NOTHING`
 
 // scimBaseURL returns the base URL for SCIM resource locations
 func scimBaseURL(c *gin.Context) string {
@@ -327,7 +341,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 	workspaceUUID, _ := uuid.Parse(workspaceID)
 
 	// Gate: check total-user limit before provisioning.
-	if currentCount, countErr := countSCIMTenantUsers(workspaceUUID); countErr == nil {
+	if currentCount, countErr := countSCIMTenantUsers(c.Request.Context()); countErr == nil {
 		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), workspaceID, int(currentCount)); billErr != nil {
 			log.Printf("[SCIM] billing check failed (fail-open) tenant=%s: %v", workspaceID, billErr)
 		} else if !resp.Allowed {
@@ -410,17 +424,19 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 
 	// Write workspace_memberships row with default "member" role.
 	// Look up (or create) the "member" role for this workspace.
-	var memberRoleID uuid.UUID
-	if err := config.DB.Raw(`
-		SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1
-	`, workspaceUUID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
-		config.DB.Exec(`
-			INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
-			VALUES (?, ?, ?, ?, 'active', 'scim', NOW(), NOW())
-			ON CONFLICT (workspace_id, user_id) DO NOTHING
-		`, uuid.New(), workspaceUUID, newUser.ID, memberRoleID)
-	} else {
-		log.Printf("SCIM: no 'member' role found for workspace %s — workspace_memberships not created", workspaceID)
+	res, err := tenancy.ExecContext(c.Request.Context(), scimSQL(), `
+		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+		SELECT $2, r.workspace_id, $3, r.id, 'active', 'scim', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND LOWER(r.name) = 'member'
+		 ORDER BY r.created_at
+		 LIMIT 1
+		ON CONFLICT (workspace_id, user_id) DO NOTHING
+	`, uuid.New(), newUser.ID)
+	if err != nil {
+		log.Printf("SCIM: workspace_memberships row for %s not created: %v", newUser.ID, err)
+	} else if n, _ := res.RowsAffected(); n == 0 {
+		log.Printf("SCIM: no 'member' role found for workspace %s (or membership exists) — workspace_memberships not created", workspaceID)
 	}
 
 	// Send temporary password email to the user (async — don't block SCIM response)
@@ -585,13 +601,16 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	tenantDB.Where("id = ?", userUUID).First(&user)
 
 	// Sync membership status when active flag changes.
-	workspaceUUID, _ := uuid.Parse(workspaceID)
 	if active, ok := updates["active"]; ok {
 		if activeBool, isBool := active.(bool); isBool {
+			status := "suspended"
 			if activeBool {
-				config.DB.Exec(`UPDATE workspace_memberships SET status = 'active', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
-			} else {
-				config.DB.Exec(`UPDATE workspace_memberships SET status = 'suspended', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
+				status = "active"
+			}
+			if _, err := tenancy.ExecContext(c.Request.Context(), scimSQL(),
+				`UPDATE workspace_memberships SET status = $3, updated_at = NOW() WHERE workspace_id = $1 AND user_id = $2`,
+				userUUID, status); err != nil {
+				log.Printf("SCIM: membership status for %s not updated: %v", userUUID, err)
 			}
 		}
 	}
@@ -640,8 +659,10 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 	log.Printf("SCIM: Deleted user %s (tenant: %s)", userID, workspaceID)
 
 	// Mark membership as 'left' (soft delete — matches the user soft-delete above).
-	workspaceUUID, _ := uuid.Parse(workspaceID)
-	config.DB.Exec(`UPDATE workspace_memberships SET status = 'left', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
+	if _, err := tenancy.ExecContext(c.Request.Context(), scimSQL(),
+		`UPDATE workspace_memberships SET status = 'left', updated_at = NOW() WHERE workspace_id = $1 AND user_id = $2`, userUUID); err != nil {
+		log.Printf("SCIM: membership of %s not marked left: %v", userUUID, err)
+	}
 
 	middlewares.Audit(c, "scim", workspaceID, "delete_user", &middlewares.AuditChanges{
 		Before: map[string]interface{}{"user_id": userID},
@@ -775,10 +796,9 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			memberUUID, newGroup.ID, workspaceUUID,
-		)
+		if _, err := tenancy.ExecContext(c.Request.Context(), scimSQL(), scimAddMember, memberUUID, newGroup.ID); err != nil {
+			log.Printf("SCIM: member %s not added to group %s: %v", memberUUID, newGroup.ID, err)
+		}
 	}
 
 	log.Printf("SCIM: Created group %s (tenant: %s)", input.DisplayName, workspaceID)
@@ -836,17 +856,7 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	})
 
 	// Replace members: remove all, then add new
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupUUID, workspaceUUID)
-	for _, member := range input.Members {
-		memberUUID, err := uuid.Parse(member.Value)
-		if err != nil {
-			continue
-		}
-		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			memberUUID, groupUUID, workspaceUUID,
-		)
-	}
+	sc.replaceGroupMembers(c.Request.Context(), groupUUID, input.Members)
 
 	middlewares.Audit(c, "scim", workspaceID, "replace_group", &middlewares.AuditChanges{
 		After: map[string]interface{}{
@@ -905,22 +915,19 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 			}
 			if op.Path == "" || strings.EqualFold(op.Path, "members") {
 				// Full member replacement
-				sc.replaceGroupMembers(tenantDB, groupUUID, workspaceUUID, op.Value)
+				sc.replaceGroupMembers(c.Request.Context(), groupUUID, parseMemberRefs(op.Value))
 			}
 		case "add":
 			if strings.EqualFold(op.Path, "members") {
-				sc.addGroupMembers(tenantDB, groupUUID, workspaceUUID, op.Value)
+				sc.addGroupMembers(c.Request.Context(), groupUUID, parseMemberRefs(op.Value))
 			}
 		case "remove":
 			if strings.EqualFold(op.Path, "members") {
-				sc.removeGroupMembers(tenantDB, groupUUID, workspaceUUID, op.Value)
+				sc.removeGroupMembers(c.Request.Context(), groupUUID, parseMemberRefs(op.Value))
 			} else if strings.HasPrefix(strings.ToLower(op.Path), "members[value eq") {
 				// Handle format: members[value eq "user-id"]
 				memberID := extractFilterValue(op.Path)
-				if memberUUID, err := uuid.Parse(memberID); err == nil {
-					tenantDB.Exec("DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
-						memberUUID, groupUUID, workspaceUUID)
-				}
+				sc.removeGroupMembers(c.Request.Context(), groupUUID, []models.SCIMMemberRef{{Value: memberID}})
 			}
 		}
 	}
@@ -959,7 +966,10 @@ func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 	workspaceUUID, _ := uuid.Parse(workspaceID)
 
 	// Remove member associations first
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupUUID, workspaceUUID)
+	if _, err := tenancy.ExecContext(c.Request.Context(), scimSQL(),
+		`DELETE FROM user_groups WHERE workspace_id = $1 AND group_id = $2`, groupUUID); err != nil {
+		log.Printf("SCIM: members of group %s not removed: %v", groupUUID, err)
+	}
 
 	result := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, workspaceUUID).Delete(&models.TenantGroup{})
 	if result.Error != nil {
@@ -1133,38 +1143,40 @@ func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, workspaceI
 }
 
 // replaceGroupMembers replaces all members of a group
-func (sc *SCIMController) replaceGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupID, workspaceID)
-	sc.addGroupMembers(tenantDB, groupID, workspaceID, value)
+func (sc *SCIMController) replaceGroupMembers(ctx context.Context, groupID uuid.UUID, members []models.SCIMMemberRef) {
+	if _, err := tenancy.ExecContext(ctx, scimSQL(),
+		`DELETE FROM user_groups WHERE workspace_id = $1 AND group_id = $2`, groupID); err != nil {
+		log.Printf("SCIM: members of group %s not cleared: %v", groupID, err)
+		return
+	}
+	sc.addGroupMembers(ctx, groupID, members)
 }
 
-// addGroupMembers adds members to a group from a SCIM PATCH value
-func (sc *SCIMController) addGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
-	members := parseMemberRefs(value)
+// addGroupMembers adds members to a group
+func (sc *SCIMController) addGroupMembers(ctx context.Context, groupID uuid.UUID, members []models.SCIMMemberRef) {
 	for _, member := range members {
 		memberUUID, err := uuid.Parse(member.Value)
 		if err != nil {
 			continue
 		}
-		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			memberUUID, groupID, workspaceID,
-		)
+		if _, err := tenancy.ExecContext(ctx, scimSQL(), scimAddMember, memberUUID, groupID); err != nil {
+			log.Printf("SCIM: member %s not added to group %s: %v", memberUUID, groupID, err)
+		}
 	}
 }
 
 // removeGroupMembers removes members from a group
-func (sc *SCIMController) removeGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
-	members := parseMemberRefs(value)
+func (sc *SCIMController) removeGroupMembers(ctx context.Context, groupID uuid.UUID, members []models.SCIMMemberRef) {
 	for _, member := range members {
 		memberUUID, err := uuid.Parse(member.Value)
 		if err != nil {
 			continue
 		}
-		tenantDB.Exec(
-			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
-			memberUUID, groupID, workspaceID,
-		)
+		if _, err := tenancy.ExecContext(ctx, scimSQL(),
+			`DELETE FROM user_groups WHERE workspace_id = $1 AND user_id = $2 AND group_id = $3`,
+			memberUUID, groupID); err != nil {
+			log.Printf("SCIM: member %s not removed from group %s: %v", memberUUID, groupID, err)
+		}
 	}
 }
 
