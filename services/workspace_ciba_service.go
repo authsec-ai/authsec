@@ -165,7 +165,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 
 	// Step 2: Look up user in workspace database
 	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
-	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
+	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID, workspaceUUID)
 	if err != nil {
 		return &models.TenantCIBAInitiateResponse{
 			Error:            models.TenantCIBAErrorUserNotFound,
@@ -403,7 +403,7 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 			return nil, fmt.Errorf("failed to generate JWT token: %w", err)
 		}
 
-		workspaceRepo.UpdateTenantUserLastLogin(request.UserID)
+		workspaceRepo.UpdateTenantUserLastLogin(request.UserID, request.WorkspaceID)
 
 		ttl := 24 * 60 * 60
 		if s.nativeIssuer != nil {

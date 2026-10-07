@@ -175,7 +175,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 
 	// Step 5: Look up user in tenant database
 	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
-	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
+	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID, workspaceUUID)
 	if err != nil {
 		return &models.TenantTOTPLoginResponse{
 			Success: false,
@@ -227,7 +227,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 
 	// Step 8: Update last_used timestamp
 	if usedSecret != nil {
-		workspaceRepo.UpdateTenantTOTPSecretLastUsed(usedSecret.ID)
+		workspaceRepo.UpdateTenantTOTPSecretLastUsed(usedSecret.ID, workspaceUUID)
 	}
 
 	// Step 9: Generate JWT token
@@ -237,7 +237,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 	}
 
 	// Step 10: Update user's last login timestamp
-	workspaceRepo.UpdateTenantUserLastLogin(user.ID)
+	workspaceRepo.UpdateTenantUserLastLogin(user.ID, workspaceUUID)
 
 	return &models.TenantTOTPLoginResponse{
 		Success: true,
