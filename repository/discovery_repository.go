@@ -227,12 +227,21 @@ func (r *discoveryRepository) ListSources(workspaceID uuid.UUID, kind string, en
 // ignores the error. Without this, last_sync_at is never written by anything and
 // the console shows every integration as "Never run" forever.
 func (r *discoveryRepository) TouchSource(workspaceID, id uuid.UUID, status string) error {
+	// A sighting NEVER clears a recorded cluster UID conflict. The sighting
+	// that touches the source may be the matching cluster's -- or the very
+	// sighting just refused for its UID -- and it proves nothing about the
+	// conflicting one, so letting it reset last_status/last_error hid the
+	// conflict seconds after it was recorded (and made which one the console
+	// showed depend on the order sightings arrived in). The conflict stays
+	// until a heartbeat from the recorded cluster UID clears it after the hold
+	// (UpsertSelfRegistration), or an operator updates the connection.
+	conflicted := `last_status = '` + ClusterUIDConflictStatus + `'`
 	return r.db.Model(&models.DiscoverySource{}).
 		Where("workspace_id = ? AND id = ?", workspaceID, id).
 		Updates(map[string]interface{}{
 			"last_sync_at": time.Now(),
-			"last_status":  status,
-			"last_error":   "",
+			"last_status":  gorm.Expr(`CASE WHEN `+conflicted+` THEN last_status ELSE ? END`, status),
+			"last_error":   gorm.Expr(`CASE WHEN ` + conflicted + ` THEN last_error ELSE '' END`),
 			"updated_at":   time.Now(),
 		}).Error
 }
@@ -398,8 +407,30 @@ const clusterUIDConflictHold = 15 * time.Minute
 // the heartbeat path's hold keeps it visible. The recorded UID itself is never
 // touched. Never fails the caller's request: the error is returned for the
 // caller to log.
+//
+// reportedUID "" records data that stated NO cluster UID for a connector that
+// has one (refused under IGA_K8S_REQUIRE_CLUSTER_UID): the same status and
+// runtime key, with reported_uid "" and reason "missing", and a last_error
+// that says the UID was missing rather than naming an empty cluster.
 func RecordClusterUIDConflict(db *gorm.DB, workspaceID, sourceID uuid.UUID,
 	reportedUID, via string) error {
+
+	if reportedUID == "" {
+		return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_required: this connection belongs to cluster %s, but an incoming %s '
+		        || 'states no cluster UID, so it cannot be shown to come from this cluster and is '
+		        || 'refused. Upgrade the agent so it reports its cluster UID, or set '
+		        || 'IGA_K8S_REQUIRE_CLUSTER_UID=false on the control plane.', cluster_uid, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', '',
+		                              'reason', 'missing', 'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ? AND cluster_uid <> ''`,
+			ClusterUIDConflictStatus, via, via, workspaceID, sourceID).Error
+	}
 
 	return db.Exec(`
 		UPDATE discovery_sources
@@ -474,9 +505,14 @@ func (r *discoveryRepository) UpsertSelfRegistration(s *models.DiscoverySource) 
 	// recorded UID regardless of the order Postgres applies them in.
 	conflict := `(excluded.cluster_uid <> '' AND discovery_sources.cluster_uid <> ''
 	              AND excluded.cluster_uid <> discovery_sources.cluster_uid)`
-	held := `(discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	// A heartbeat stating NO UID never clears a recorded conflict either: it
+	// is not the recorded cluster vouching for itself. Only a heartbeat from
+	// the recorded UID (after the hold) or an operator clears it.
+	held := `((discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
 	          AND (discovery_sources.runtime->'cluster_uid_conflict'->>'last_seen_at')::timestamptz
-	              > now() - make_interval(secs => ?))`
+	              > now() - make_interval(secs => ?))
+	         OR (discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	             AND excluded.cluster_uid = ''))`
 	hold := clusterUIDConflictHold.Seconds()
 	assignments["cluster_uid"] = gorm.Expr(
 		"CASE WHEN discovery_sources.cluster_uid = '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")

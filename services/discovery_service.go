@@ -170,7 +170,9 @@ type ManifestInput struct {
 	DiscoverySourceID *uuid.UUID
 	ClusterName       string
 	// ClusterUID is the swept cluster's kube-system UID, when the agent could
-	// read it. Optional: empty means "not stated", never "a different cluster".
+	// read it. Empty means "not stated", never "a different cluster" -- but a
+	// connection that has recorded a UID refuses a manifest that states none
+	// while RequireClusterUIDEnv is on (ErrClusterUIDRequired).
 	ClusterUID string
 	ScanKind   string
 	// Complete is false when any LIST in the sweep failed. A partial sweep retires
@@ -497,13 +499,18 @@ func (m *discoveryManager) RecordLifecycleEvent(workspaceID uuid.UUID, in Lifecy
 // one its connection recorded first (ErrClusterUIDMismatch), exactly as an
 // RBAC snapshot is refused. The connection is the manifest's
 // discovery_source_id, or else -- as for a snapshot -- the oldest connection
-// of its kind registered under the cluster name. Either UID empty means no
-// claim either way, and the manifest is handled as before. A manifest never
+// of its kind registered under the cluster name. A connection with no
+// recorded UID makes no claim, and the manifest is handled as before. A
+// manifest that states NO UID for a connection that recorded one is refused
+// too (ErrClusterUIDRequired) while RequireClusterUIDEnv is on -- otherwise
+// leaving the UID out would let another cluster's manifest mark this one's
+// agents gone -- and is handled as before when it is off. A manifest never
 // records a UID itself: registration and the RBAC sweep do.
 func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in ManifestInput) error {
 	uid := strings.TrimSpace(in.ClusterUID)
+	requireUID := RequireClusterUID()
 	db := m.repo.DB()
-	if uid == "" || db == nil {
+	if (uid == "" && !requireUID) || db == nil {
 		return nil
 	}
 	var src struct {
@@ -519,7 +526,18 @@ func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in Man
 	if err := q.Limit(1).Scan(&src).Error; err != nil {
 		return fmt.Errorf("read connection cluster uid: %w", err)
 	}
-	if src.ClusterUID == "" || src.ClusterUID == uid {
+	if missingClusterUID(uid, src.ClusterUID, requireUID) {
+		log.Printf("[discovery] cluster_uid_required: resync manifest for cluster %q states no uid, "+
+			"connection %s belongs to %s; refused", in.ClusterName, src.ID, src.ClusterUID)
+		if err := repositories.RecordClusterUIDConflict(db, workspaceID, src.ID, "", "resync manifest"); err != nil {
+			log.Printf("[discovery] could not record the missing cluster uid on %s: %v", src.ID, err)
+		}
+		return fmt.Errorf("%w: manifest for cluster %q states no cluster_uid but connection %s belongs "+
+			"to cluster %q; the agent must send its cluster's kube-system namespace UID as cluster_uid "+
+			"(or the control plane must set %s=false)",
+			ErrClusterUIDRequired, in.ClusterName, src.ID, src.ClusterUID, RequireClusterUIDEnv)
+	}
+	if uid == "" || src.ClusterUID == "" || src.ClusterUID == uid {
 		return nil
 	}
 	log.Printf("[discovery] cluster_uid_mismatch: resync manifest for cluster %q reports uid %s, "+

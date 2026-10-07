@@ -1259,3 +1259,81 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   - *Tests:* `tests/integration/p2_k8s_access_route_test.go` (real projection,
     real controller; agreement with `/graph` row for row), the e2e
     `TestIngestIsReadableBack` and `TestHardeningImplicitGroupMembership`.
+
+## Added by the Kubernetes identity kinds (feat/k8s-identity-kinds)
+
+- **D-113 Every Kubernetes identity kind is readable on the flat routes, and
+  the lists count their page only (`internal/k8sread/identities.go`,
+  `read.go`; `controllers/platform/k8s_graph_controller.go`; `GET
+  /authsec/discovery/k8s/identities/:id` (new), `/k8s/identities`,
+  `/k8s/identities/:id/access`, `/k8s/workloads`).** *Provisional, for
+  review.* The console's Kubernetes object page looked an identity up in
+  `/k8s/identities`, which listed ServiceAccounts only and stopped at 500, so a
+  User (`system:kube-controller-manager`) or a Group could not be opened and
+  their rules read "Not available". Additive except where marked:
+  - *New route* `GET /k8s/identities/:id` -- same middleware as its siblings
+    (`discovery:read`, workspace from the token). Body `{identity, meta.note}`;
+    `identity` is the list row of ANY kind. 404 `{error, code: not_found}` when
+    the token's workspace has no Kubernetes identity with that id (another
+    workspace's, an AWS identity's and an unknown id read the same); 400 on a
+    malformed id.
+  - *Identity row, new fields:* `kind` (`k8s_service_account | k8s_user |
+    k8s_group`), `name` (a ServiceAccount's without its namespace), `cluster`
+    (the key's cluster field), `last_seen_at`, and for a group only `members`
+    (its live -- current or stale -- `member_of` rows: the ServiceAccounts the
+    projection places in it; Users who authenticate into a group are not
+    readable from RBAC, so a lower bound). `anchor` is the RBAC subject name:
+    unchanged for a ServiceAccount, the User's or Group's name otherwise;
+    `namespace` is `""` for a User or Group. Every row of every kind carries
+    `grants`, `stale`, `wildcard` from the access route's own rows (D-112): a
+    ServiceAccount's include its groups' grants as before; a User's or Group's
+    are its own (the projection records no membership of either).
+  - *List parameters,* all optional: `kind` (`service_account | user | group`,
+    or the account kind; repeatable or comma-separated; unknown -> 400
+    `invalid_parameter`). **Default `service_account` only**, the contract
+    before this decision. `cluster`, `namespace` (one value each; a repeat is
+    400): `cluster` matches the key's cluster exactly (`k8sgraph.ClusterPrefix`,
+    as the cluster counts), `namespace` keeps ServiceAccounts only. `limit`
+    1-1000, default 500 (the console's only call before this); absent,
+    unreadable or <= 0 is the default and > 1000 is 1000 -- never a 400, as
+    before. `cursor`: `meta.next_cursor` of the previous page, HMAC-signed
+    (`IGA_CURSOR_SECRET`, `igaread.SignCursor`) and bound to the workspace, the
+    route, the NORMALISED filter set (kinds sorted and de-duplicated, cluster,
+    namespace) and the sort; any mismatch or a bad signature is 400
+    `cursor_invalid`. `meta` keeps `note` and adds `kinds`, `cluster`,
+    `namespace`, `limit`, `total` (the filter's count across all pages) and
+    `next_cursor` (null on the last page). The list is `[]`, never `null`.
+  - *Order -- CHANGED.* `/k8s/identities` is ordered by `anchor`, then `id`
+    (keyset `(display_name, id) > cursor`); `/k8s/workloads` by `display_name`,
+    then `id`. Before, both were `grants DESC, name`. Ordering by a count needs
+    every identity's count before the first row can be chosen, which is the
+    whole-workspace computation the next point removes; the console uses both
+    lists as id lookups, not in their order.
+  - *Counts are the page's (review item).* `accessRowsSQL` is now bound to a
+    set of holders in BOTH branches -- the direct grant's subject and the
+    membership's source (the latter also spelled as
+    `idx_iga_relationship_source`'s COALESCE expression so the index applies)
+    -- and carries `entitlement_id`, so counting needs no re-join to
+    `iga_access_edges`. Each list chooses its page from its own table first
+    (filters, order, cursor, limit), then counts `grants/stale/wildcard` with
+    one statement for that page's ids only (`countsFor`; the workloads list
+    for its page's `runs_as` ids), and a group's `members` with one statement
+    for the page's groups. Semantics and de-duplication are unchanged: one
+    grant of one group reached through two live memberships is one row; a
+    group-derived row is stale when either link is. `AccessFor` binds its one
+    identity to the same SQL. `Query.Identities(limit)` stays, as the first
+    page of the default filter with its old clamp.
+  - *Access route:* unchanged shape; a User's or Group's rows are its own
+    grants, every one `via: null`, `summary.direct = total`.
+  - *Tests:* `tests/integration/p2_k8s_identity_kinds_test.go` (real
+    projection, real controller; two clusters, Users and Groups): detail for
+    a ServiceAccount, a User in each of two clusters and three Groups (equal to
+    the list row and to the access summary); 404 across workspaces; the kind,
+    cluster and namespace filters with totals; paging at 1, 2 and 4 against
+    the unpaged order; the cursor's filter, workspace and signature binding;
+    the access route for Users and Groups; and
+    `TestP2K8sIdentityKindsCountsArePageScoped` -- 205 ServiceAccounts, a page
+    of 5: the one statement reading access rows binds exactly the page's ids,
+    and under `EXPLAIN ANALYZE` (statistics as autovacuum keeps them) every
+    scan of a per-identity table produces <= 40 rows, against >= 400 membership
+    rows for the whole list.

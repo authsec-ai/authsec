@@ -110,6 +110,43 @@ type K8sRBACResult struct {
 // controller maps it to 409 cluster_uid_mismatch; nothing is written.
 var ErrClusterUIDMismatch = errors.New("cluster_uid_mismatch")
 
+// ErrClusterUIDRequired rejects data that states NO cluster UID for a
+// discovery source that has recorded one (RequireClusterUIDEnv). Without it,
+// omitting the UID skipped the check altogether: an old or forged agent could
+// write to a cluster whose connection had pinned its UID simply by not saying
+// which cluster it was. The controller maps it to 409 cluster_uid_required;
+// nothing is written, and the connection is flagged cluster_uid_conflict.
+var ErrClusterUIDRequired = errors.New("cluster_uid_required")
+
+// RequireClusterUIDEnv switches ErrClusterUIDRequired. Default (unset, or any
+// value strconv.ParseBool does not read as false): on. A discovery source
+// that has recorded a cluster UID then refuses an RBAC snapshot or resync
+// manifest that carries none, and keeps a sighting that carries none in the
+// inventory without projecting it into the graph. "false" restores the
+// earlier lenient behaviour, where a missing UID is never checked. A source
+// with no recorded UID is unaffected either way, and a heartbeat with no UID
+// is always accepted (and never clears the recorded one).
+const RequireClusterUIDEnv = "IGA_K8S_REQUIRE_CLUSTER_UID"
+
+// RequireClusterUID reads RequireClusterUIDEnv on every call, so a restart is
+// not what the tests or an operator flipping it depend on. Fails closed: only
+// an explicit false turns the requirement off.
+func RequireClusterUID() bool {
+	v := strings.TrimSpace(os.Getenv(RequireClusterUIDEnv))
+	if v == "" {
+		return true
+	}
+	b, err := strconv.ParseBool(v)
+	return err != nil || b
+}
+
+// missingClusterUID reports whether data stating uid must be refused for a
+// source that recorded `recorded`: the requirement is on, the data states no
+// UID, and the source has one.
+func missingClusterUID(uid, recorded string, require bool) bool {
+	return require && strings.TrimSpace(uid) == "" && recorded != ""
+}
+
 // ErrSweepConflict reports that another sweep of the same (workspace, source,
 // cluster) took this sweep's generation first: two snapshots of one cluster
 // were projected at once, and this one lost. Its transaction is rolled back
@@ -217,6 +254,9 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 			"is not evidence of deletion; rows were projected but none retired"
 	}
 
+	// Read once, so the refusal and the sightings this snapshot projects agree.
+	requireUID := RequireClusterUID()
+
 	err := m.db.Transaction(func(tx *gorm.DB) error {
 		var ref *sweepRef
 		// The cluster UID the source recorded first, "" when it has none: what
@@ -224,8 +264,10 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		var recordedUID string
 		if sourceID != uuid.Nil {
 			// Before anything is written: a snapshot from a different cluster
-			// that shares this one's name is refused, not merged.
-			have, err := m.claimClusterUID(tx, workspaceID, sourceID, snap.ClusterUID)
+			// that shares this one's name is refused, not merged -- and, with
+			// RequireClusterUIDEnv on, so is one that does not say which
+			// cluster it is from.
+			have, err := m.claimClusterUID(tx, workspaceID, sourceID, snap.ClusterUID, requireUID)
 			if err != nil {
 				return err
 			}
@@ -286,7 +328,7 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		// Workloads: who RUNS as these identities. The RBAC sweep never lists a
 		// Pod, so this comes from the discovered-agent inventory and joins on
 		// the anchor both sides already spell identically.
-		sight, err := m.loadSightings(tx, workspaceID, cluster, sourceID, recordedUID)
+		sight, err := m.loadSightings(tx, workspaceID, cluster, sourceID, recordedUID, requireUID)
 		if err != nil {
 			return fmt.Errorf("load sightings: %w", err)
 		}
@@ -342,9 +384,10 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 				"projected_at": observed,
 			}).Error
 	})
-	if errors.Is(err, ErrClusterUIDMismatch) {
+	if errors.Is(err, ErrClusterUIDMismatch) || errors.Is(err, ErrClusterUIDRequired) {
 		// Refused and rolled back; the conflict is recorded on the connection
 		// afterwards, outside the failed transaction, so the console sees it.
+		// A missing UID is recorded as reported "".
 		if rerr := repositories.RecordClusterUIDConflict(m.db, workspaceID, sourceID,
 			strings.TrimSpace(snap.ClusterUID), "RBAC snapshot"); rerr != nil {
 			log.Printf("[k8s-rbac] could not record the cluster uid conflict on source %s: %v", sourceID, rerr)
@@ -441,16 +484,20 @@ func (m *k8sRBACManager) keep() int {
 // from a heartbeat (UpsertSelfRegistration), which keeps the first UID too and
 // never overwrites it -- and any later snapshot carrying a different one is
 // refused with ErrClusterUIDMismatch. The only way to change a source's UID is
-// to delete the connection and let the agent register again. A snapshot with
-// no UID -- an agent that cannot read kube-system, or one that predates the
-// field -- is accepted as before: absence is not evidence of a different
-// cluster.
+// to delete the connection and let the agent register again.
+//
+// A snapshot with NO UID -- an agent that cannot read kube-system, one that
+// predates the field, or one that leaves it out on purpose -- is accepted
+// while the source has recorded none (absence is not evidence of a different
+// cluster). Once the source HAS recorded one, a snapshot with none is refused
+// with ErrClusterUIDRequired when require is set (RequireClusterUIDEnv):
+// otherwise leaving the UID out would be a way round the check above.
 //
 // The conditional UPDATE takes the source row's lock, so two clusters racing
 // to record their UID cannot both win: the second waits, finds the first's,
 // and is refused.
 func (m *k8sRBACManager) claimClusterUID(tx *gorm.DB, workspaceID, sourceID uuid.UUID,
-	uid string) (string, error) {
+	uid string, require bool) (string, error) {
 
 	uid = strings.TrimSpace(uid)
 	if uid != "" {
@@ -470,6 +517,12 @@ func (m *k8sRBACManager) claimClusterUID(tx *gorm.DB, workspaceID, sourceID uuid
 		return have, fmt.Errorf("%w: snapshot is from cluster %q but discovery source %s belongs to "+
 			"cluster %q; two clusters are installed under one cluster name",
 			ErrClusterUIDMismatch, uid, sourceID, have)
+	}
+	if missingClusterUID(uid, have, require) {
+		return have, fmt.Errorf("%w: snapshot states no cluster_uid but discovery source %s belongs to "+
+			"cluster %q; the agent must send its cluster's kube-system namespace UID as "+
+			"cluster_uid (or the control plane must set %s=false)",
+			ErrClusterUIDRequired, sourceID, have, RequireClusterUIDEnv)
 	}
 	return have, nil
 }
@@ -1246,21 +1299,28 @@ func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *
 // cluster's kube-system UID in metadata.cluster.uid (agents from chart 0.4.1);
 // when it and the source's recorded UID are both known, the UID decides: a
 // sighting from another UID is never this source's, whatever name or source
-// id it carries. Either side empty falls back to the rules above.
+// id it carries. The source with no recorded UID falls back to the rules
+// above. A sighting stating no UID, for a source that recorded one, is not
+// this source's while RequireClusterUIDEnv is on (requireUID), and falls back
+// to the rules above when it is off.
 //
 // Only the Kubernetes webhook's sightings: the fingerprint that keys a workload
 // is unique per (workspace, source), so another source's row could otherwise
 // claim the same key.
 func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
-	cluster string, sourceID uuid.UUID, recordedUID string) ([]k8sgraph.WorkloadSighting, error) {
-	return m.loadSightingsWhere(tx, workspaceID, cluster, sourceID, recordedUID, "")
+	cluster string, sourceID uuid.UUID, recordedUID string, requireUID bool) ([]k8sgraph.WorkloadSighting, error) {
+	return m.loadSightingsWhere(tx, workspaceID, cluster, sourceID, recordedUID, requireUID, "")
 }
 
 // loadSightingsWhere is loadSightings, narrowed to one fingerprint when
 // fingerprint is not empty. sourceID Nil does not narrow by source, and
-// recordedUID "" does not narrow by cluster UID.
+// recordedUID "" does not narrow by cluster UID. With a recorded UID, a
+// sighting stating no UID is loaded only when requireUID is off
+// (RequireClusterUIDEnv): with it on, such a sighting stays in the inventory
+// but is not projected, by this sweep or by ProjectSighting.
 func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
-	cluster string, sourceID uuid.UUID, recordedUID, fingerprint string) ([]k8sgraph.WorkloadSighting, error) {
+	cluster string, sourceID uuid.UUID, recordedUID string, requireUID bool,
+	fingerprint string) ([]k8sgraph.WorkloadSighting, error) {
 
 	var rows []k8sgraph.WorkloadSighting
 	q := tx.Table("discovered_agents").
@@ -1277,7 +1337,9 @@ func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
 	if sourceID != uuid.Nil {
 		q = q.Where("(discovery_source_id = ? OR discovery_source_id IS NULL)", sourceID)
 	}
-	if recordedUID != "" {
+	if recordedUID != "" && requireUID {
+		q = q.Where("metadata->'cluster'->>'uid' = ?", recordedUID)
+	} else if recordedUID != "" {
 		q = q.Where("COALESCE(metadata->'cluster'->>'uid', '') IN ('', ?)", recordedUID)
 	}
 	if fingerprint != "" {
@@ -1306,7 +1368,9 @@ func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
 // A sighting that names no cluster cannot be attributed and is left alone. A
 // sighting whose metadata.cluster.uid differs from the UID its source recorded
 // first is not projected at all (ErrClusterUIDMismatch, conflict recorded on
-// the source); the caller has already stored it in the inventory.
+// the source); the caller has already stored it in the inventory. Nor, with
+// RequireClusterUIDEnv on, is one that states no UID for a source that has
+// recorded one (ErrClusterUIDRequired, recorded the same way).
 //
 // It reads only the rows the sighting can reference -- its own workload and
 // the ServiceAccount it runs as (idsForKeys) -- never every Kubernetes
@@ -1351,16 +1415,31 @@ func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint stri
 	// is kept in the inventory (the caller already stored it) but is not
 	// projected: attributing it to this source would put one cluster's
 	// workload in the other's graph. The conflict is recorded on the
-	// connection for the console. Either UID empty: no claim, projected as
-	// before.
-	if uid := strings.TrimSpace(meta.ClusterUID); uid != "" && sourceID != uuid.Nil {
+	// connection for the console. A sighting stating NO UID for a source that
+	// recorded one is treated the same way when RequireClusterUIDEnv is on
+	// (ErrClusterUIDRequired): leaving the UID out must not be a way round
+	// the check. The source has no recorded UID, or the requirement is off and
+	// the sighting states none: no claim, projected as before.
+	requireUID := RequireClusterUID()
+	uid := strings.TrimSpace(meta.ClusterUID)
+	if sourceID != uuid.Nil && (uid != "" || requireUID) {
 		var recorded string
 		if err := m.db.Table("discovery_sources").Select("cluster_uid").
 			Where("workspace_id = ? AND id = ?", workspaceID, sourceID).
 			Scan(&recorded).Error; err != nil {
 			return fmt.Errorf("read source cluster uid: %w", err)
 		}
-		if recorded != "" && recorded != uid {
+		if missingClusterUID(uid, recorded, requireUID) {
+			if rerr := repositories.RecordClusterUIDConflict(m.db, workspaceID, sourceID,
+				"", "sighting"); rerr != nil {
+				log.Printf("[k8s-rbac] could not record the missing cluster uid on source %s: %v",
+					sourceID, rerr)
+			}
+			return fmt.Errorf("%w: sighting %s states no metadata.cluster.uid but discovery source %s "+
+				"belongs to cluster %q; kept in the inventory, not projected into the graph",
+				ErrClusterUIDRequired, fingerprint, sourceID, recorded)
+		}
+		if uid != "" && recorded != "" && recorded != uid {
 			if rerr := repositories.RecordClusterUIDConflict(m.db, workspaceID, sourceID,
 				uid, "sighting"); rerr != nil {
 				log.Printf("[k8s-rbac] could not record the cluster uid conflict on source %s: %v",
@@ -1376,7 +1455,7 @@ func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint stri
 	return m.db.Transaction(func(tx *gorm.DB) error {
 		// By fingerprint, which names one row; the source this sighting
 		// belongs to is the one resolved above.
-		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, uuid.Nil, "", fingerprint)
+		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, uuid.Nil, "", false, fingerprint)
 		if err != nil {
 			return fmt.Errorf("load sighting: %w", err)
 		}

@@ -676,18 +676,24 @@ func setRecordedUID(t *testing.T, db *gorm.DB, src uuid.UUID, uid string) {
 
 // A sighting from another cluster UID is kept in the inventory but never
 // projected into its source's graph -- not when it is reported, not by the
-// source's sweep -- and the conflict is recorded on the connection.
+// source's sweep -- and the conflict is recorded on the connection. Run with
+// IGA_K8S_REQUIRE_CLUSTER_UID=false, where a sighting stating no UID is still
+// projected; with it on (the default) see TestUIDRequiredSightingWithoutUID.
 func TestIdentSightingFromAnotherClusterUIDIsNotProjected(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	setRecordedUID(t, db, src, "uid-a")
 	t.Setenv(services.GraphProjectionEnv, "on")
+	t.Setenv(services.RequireClusterUIDEnv, "false")
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
 
-	for fp, uid := range map[string]string{"fp-same": "uid-a", "fp-none": "", "fp-other": "uid-b"} {
-		if _, _, err := disco.ReportSighting(ws, "test", uidSighting(src, fp, uid, now)); err != nil {
-			t.Fatalf("sighting %s: %v", fp, err)
+	// An ordered slice, conflicting sighting FIRST: the matching cluster's
+	// sightings after it must not clear the conflict it recorded. (A map here
+	// made the order -- and the test -- random.)
+	for _, c := range []struct{ fp, uid string }{{"fp-other", "uid-b"}, {"fp-same", "uid-a"}, {"fp-none", ""}} {
+		if _, _, err := disco.ReportSighting(ws, "test", uidSighting(src, c.fp, c.uid, now)); err != nil {
+			t.Fatalf("sighting %s: %v", c.fp, err)
 		}
 	}
 	// All three are in the inventory.
@@ -807,11 +813,14 @@ func TestIdentManifestFromAnotherClusterUIDIsRefused(t *testing.T) {
 	}
 }
 
-// A manifest with no UID behaves exactly as before.
+// With IGA_K8S_REQUIRE_CLUSTER_UID=false, a manifest with no UID behaves
+// exactly as before. With it on (the default) see
+// TestUIDRequiredManifestWithoutUID.
 func TestIdentManifestWithoutUIDIsUnchanged(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	setRecordedUID(t, db, src, "uid-a")
+	t.Setenv(services.RequireClusterUIDEnv, "false")
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
 	if _, _, err := disco.ReportSighting(ws, "test", uidSighting(src, "fp-1", "", now)); err != nil {
