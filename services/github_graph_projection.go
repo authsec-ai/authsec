@@ -1,12 +1,14 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/ghgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -93,7 +95,9 @@ func (p *GitHubGraphProjector) ProjectScan(workspaceID, scanRunID uuid.UUID,
 	observed := p.now().UTC()
 	res := &GitHubGraphResult{}
 
-	err := p.db.Transaction(func(tx *gorm.DB) error {
+	// The whole projection runs under row-level security for the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(ctx, p.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		// One projection per integration at a time. Two concurrent scans of
 		// the same integration would each end what the other just confirmed.
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended(?, 0))`,
@@ -266,29 +270,66 @@ func (p *GitHubGraphProjector) writeScan(tx *gorm.DB, ws, scanRunID uuid.UUID,
 // content. Its source object is still this generation's, and its observation
 // still names the rule that recognised it, which is exactly "a workflow the
 // scan recorded".
+// txTenant returns ws as the tenant context, on tx's own context, and tx's
+// connection, so a raw statement of the caller's transaction runs through the
+// tenancy layer: workspace_id = $1 is bound to ws (and, on a transaction
+// opened by tenancy.RLSTransaction, row-level security holds as well). A
+// context already carrying another workspace is refused rather than
+// overridden.
+func txTenant(tx *gorm.DB, ws uuid.UUID) (context.Context, tenancy.Querier, error) {
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, nil, fmt.Errorf("tenancy: a transaction of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), tx.Statement.ConnPool, nil
+}
+
 func (p *GitHubGraphProjector) attachWorkflows(tx *gorm.DB, ws, integrationID uuid.UUID,
 	generation int64, snap *ghgraph.Snapshot) error {
 
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return err
+	}
 	var rows []struct {
 		Repo string
 		Path string
 		Name string
 	}
-	if err := tx.Raw(`
+	res, err := tenancy.QueryContext(ctx, q, `
 		SELECT so.source_subject_key                     AS repo,
 		       COALESCE(so.locator->>'name', '')         AS path,
 		       COALESCE(so.normalized_payload->>'name', '') AS name
 		  FROM iga_source_objects so
-		 WHERE so.workspace_id = ? AND so.integration_id = ?
-		   AND so.object_type = ? AND so.lifecycle = ?
-		   AND so.scan_generation = ?
+		 WHERE so.workspace_id = $1 AND so.integration_id = $2
+		   AND so.object_type = $3 AND so.lifecycle = $4
+		   AND so.scan_generation = $5
 		   AND EXISTS (SELECT 1 FROM iga_observations o
 		                WHERE o.workspace_id = so.workspace_id
 		                  AND o.source_object_id = so.id
-		                  AND o.rule_id = ?)
+		                  AND o.rule_id = $6)
 		 ORDER BY so.source_subject_key, so.recognition_key`,
-		ws, integrationID, models.ClassRepoDeclaration, models.LifecycleActive,
-		generation, ghgraph.WorkflowRuleID).Scan(&rows).Error; err != nil {
+		integrationID, models.ClassRepoDeclaration, models.LifecycleActive,
+		generation, ghgraph.WorkflowRuleID)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+	for res.Next() {
+		var r struct {
+			Repo string
+			Path string
+			Name string
+		}
+		if err := res.Scan(&r.Repo, &r.Path, &r.Name); err != nil {
+			return err
+		}
+		rows = append(rows, r)
+	}
+	if err := res.Err(); err != nil {
 		return err
 	}
 	byRepo := map[string]int{}
@@ -335,7 +376,9 @@ func (p *GitHubGraphProjector) ProjectRepoScanRun(workspaceID, runID uuid.UUID) 
 	observed := p.now().UTC()
 	res := &GitHubDeclaredResult{}
 
-	err := p.db.Transaction(func(tx *gorm.DB) error {
+	// The whole projection runs under row-level security for the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(ctx, p.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var run models.DiscoveryScanRun
 		if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, runID).
 			Take(&run).Error; err != nil {
@@ -451,7 +494,7 @@ func (p *GitHubGraphProjector) ProjectRepoScanRun(workspaceID, runID uuid.UUID) 
 		res.SupportEnded, res.SupportStale = ended, stale
 
 		retired, err := ghgraph.RetireUnsupported(tx, workspaceID,
-			"s2.discovery_source_id = ?", run.SourceID, observed)
+			ghgraph.SourceDiscovery, run.SourceID, observed)
 		if err != nil {
 			return fmt.Errorf("retire unsupported: %w", err)
 		}
