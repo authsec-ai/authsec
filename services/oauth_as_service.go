@@ -2854,6 +2854,7 @@ func (s *OAuthASService) RevokeNativeTokenByJTI(workspaceID uuid.UUID, jtiStr st
 	// admin token-revocation path never actually revoked anything. Introspection
 	// treats revoked_tokens as authoritative, so a token an admin believed they had
 	// killed stayed valid for its full remaining lifetime.
+	// TENANT-EXEMPT: revoked_tokens is the issuer-wide denylist keyed by (iss, kind, jti)
 	return s.db.Exec(`
 		INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
 		VALUES (?, 'access_token', ?, ?, ?, ?)

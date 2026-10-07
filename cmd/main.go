@@ -112,7 +112,8 @@ func main() {
 	// Phase 6: tenants table dropped — workspace is the only identity table.
 	{
 		var workspaces int64
-		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
+		// TENANT-EXEMPT: startup log line counting the tenant registry
+	_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
 		log.Printf("[migration:phase6] workspaces=%d", workspaces)
 	}
 

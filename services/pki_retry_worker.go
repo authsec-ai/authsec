@@ -37,8 +37,12 @@ func (w *PKIRetryWorker) Start() {
 	}()
 }
 
+// RunOnce runs one retry pass now (tests and manual runs).
+func (w *PKIRetryWorker) RunOnce() { w.retryFailedTenants() }
+
 // retryFailedTenants queries tenants with pki_provisioning_failed status and retries each
 func (w *PKIRetryWorker) retryFailedTenants() {
+	// TENANT-EXEMPT: platform worker over the tenant registry (workspaces has no workspace_id)
 	rows, err := w.db.Query("SELECT id, name, workspace_domain FROM workspaces WHERE status = 'pki_provisioning_failed'")
 	if err != nil {
 		log.Printf("PKI retry worker: failed to query failed tenants: %v", err)
@@ -79,8 +83,11 @@ func (w *PKIRetryWorker) retryTenantPKI(workspaceID, name, domain string) {
 		return
 	}
 
+	// The registry row is keyed by id: workspaces has no workspace_id column,
+	// so the old "WHERE workspace_id = $3" failed after every successful retry.
+	// TENANT-EXEMPT: the tenant registry row of the workspace just provisioned
 	_, err = w.db.Exec(
-		"UPDATE workspaces SET vault_mount = $1, ca_cert = $2, status = 'active', updated_at = NOW() WHERE workspace_id = $3",
+		"UPDATE workspaces SET vault_mount = $1, ca_cert = $2, status = 'active', updated_at = NOW() WHERE id = $3",
 		resp.PKIMount, resp.CACert, workspaceID,
 	)
 	if err != nil {
