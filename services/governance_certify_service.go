@@ -1,12 +1,15 @@
 package services
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -321,51 +324,57 @@ func (m *certifyManager) Generate(workspaceID, campaignID uuid.UUID) (*GenerateR
 
 // selectCandidates finds the open provenance rows a campaign's scope covers.
 func (m *certifyManager) selectCandidates(workspaceID uuid.UUID, scope CampaignScope) ([]models.EntitlementProvenance, error) {
-	q := m.db.Model(&models.EntitlementProvenance{}).
-		Where("workspace_id = ? AND revoked_at IS NULL", workspaceID)
-
-	if scope.standing() {
-		q = q.Where("is_standing")
-	}
-	if len(scope.EntitlementTypes) > 0 {
-		q = q.Where("entitlement_type IN ?", scope.EntitlementTypes)
-	}
-	if len(scope.SubjectTypes) > 0 {
-		q = q.Where("subject_type IN ?", scope.SubjectTypes)
-	}
-	if len(scope.Origins) > 0 {
-		q = q.Where("origin IN ?", scope.Origins)
-	}
-	if len(scope.ResourceServerIDs) > 0 {
-		ids := make([]string, 0, len(scope.ResourceServerIDs))
-		for _, id := range scope.ResourceServerIDs {
-			ids = append(ids, id.String())
-		}
-		// The RS lives in the snapshot, which is where it stays readable after the grant
-		// row is gone.
-		q = q.Where("entitlement_snapshot #>> '{resource_server_id}' IN ?", ids)
-	}
-	if scope.AgentsOnly {
-		// An agent anchor is a service account paired to an oauth client.
-		q = q.Where(`subject_type = ? AND EXISTS (
-		               SELECT 1 FROM service_accounts sa
-		                WHERE sa.workspace_id = ? AND sa.id = entitlement_provenance.subject_id
-		                  AND sa.oauth_client_id IS NOT NULL)`,
-			models.ProvenanceSubjectServiceAccount, workspaceID)
-	}
-	if scope.DormantDays > 0 {
-		// No token issued for the subject within the window. The highest-signal filter
-		// available: standing access nobody uses.
-		cutoff := time.Now().AddDate(0, 0, -scope.DormantDays)
-		q = q.Where(`NOT EXISTS (
-		               SELECT 1 FROM native_tokens nt
-		                WHERE nt.workspace_id = ? AND nt.subject_id = entitlement_provenance.subject_id
-		                  AND nt.issued_at >= ?)`, workspaceID, cutoff)
-	}
-
 	var out []models.EntitlementProvenance
-	// Standing first, then oldest — the grants most likely to be stale lead the queue.
-	err := q.Order("is_standing DESC").Order("granted_at ASC").Find(&out).Error
+	// Read under row-level security for the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(ctx, m.db, &sql.TxOptions{ReadOnly: true}, func(tx *gorm.DB, _ uuid.UUID) error {
+		q := tx.Model(&models.EntitlementProvenance{}).
+			Where("workspace_id = ? AND revoked_at IS NULL", workspaceID)
+
+		if scope.standing() {
+			q = q.Where("is_standing")
+		}
+		if len(scope.EntitlementTypes) > 0 {
+			q = q.Where("entitlement_type IN ?", scope.EntitlementTypes)
+		}
+		if len(scope.SubjectTypes) > 0 {
+			q = q.Where("subject_type IN ?", scope.SubjectTypes)
+		}
+		if len(scope.Origins) > 0 {
+			q = q.Where("origin IN ?", scope.Origins)
+		}
+		if len(scope.ResourceServerIDs) > 0 {
+			ids := make([]string, 0, len(scope.ResourceServerIDs))
+			for _, id := range scope.ResourceServerIDs {
+				ids = append(ids, id.String())
+			}
+			// The RS lives in the snapshot, which is where it stays readable after the grant
+			// row is gone.
+			q = q.Where("entitlement_snapshot #>> '{resource_server_id}' IN ?", ids)
+		}
+		if scope.AgentsOnly {
+			// An agent anchor is a service account paired to an oauth client.
+			// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of selectCandidates
+			q = q.Where(`subject_type = ? AND EXISTS (
+			               SELECT 1 FROM service_accounts sa
+			                WHERE sa.workspace_id = ? AND sa.id = entitlement_provenance.subject_id
+			                  AND sa.oauth_client_id IS NOT NULL)`,
+				models.ProvenanceSubjectServiceAccount, workspaceID)
+		}
+		if scope.DormantDays > 0 {
+			// No token issued for the subject within the window. The highest-signal filter
+			// available: standing access nobody uses.
+			cutoff := time.Now().AddDate(0, 0, -scope.DormantDays)
+			// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of selectCandidates
+			q = q.Where(`NOT EXISTS (
+			               SELECT 1 FROM native_tokens nt
+			                WHERE nt.workspace_id = ? AND nt.subject_id = entitlement_provenance.subject_id
+			                  AND nt.issued_at >= ?)`, workspaceID, cutoff)
+		}
+
+		// Standing first, then oldest — the grants most likely to be stale lead the queue.
+		return q.Order("is_standing DESC").Order("granted_at ASC").Find(&out).Error
+	})
 	return out, err
 }
 
@@ -410,13 +419,18 @@ func (m *certifyManager) assembleEvidence(workspaceID uuid.UUID,
 
 	// Runtime state, straight from discovery. This is evidence no traditional IGA has:
 	// whether the workload behind the entitlement is even running.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	sqlDB, err := m.db.DB()
+	if err != nil {
+		return nil, err
+	}
 	if p.DiscoveredAgentID != nil {
 		var agent struct {
 			RuntimeStatus string
 			LastSeenAt    *time.Time
 		}
-		if err := m.db.Raw(`SELECT runtime_status, last_seen_at FROM discovered_agents WHERE workspace_id = ? AND id = ?`,
-			workspaceID, *p.DiscoveredAgentID).Scan(&agent).Error; err == nil {
+		if err := tenancy.QueryRowContext(ctx, sqlDB, `SELECT COALESCE(runtime_status, ''), last_seen_at FROM discovered_agents WHERE workspace_id = $1 AND id = $2`,
+			[]any{*p.DiscoveredAgentID}, &agent.RuntimeStatus, &agent.LastSeenAt); err == nil {
 			ev.RuntimeStatus = agent.RuntimeStatus
 			ev.LastSeenAt = agent.LastSeenAt
 		}
@@ -424,10 +438,23 @@ func (m *certifyManager) assembleEvidence(workspaceID uuid.UUID,
 
 	// Open conflicts, so risk sits next to the grant rather than in another report.
 	var violations []string
-	if err := m.db.Raw(`
-		SELECT rule_name FROM sod_violations
-		 WHERE workspace_id = ? AND subject_type = ? AND subject_id = ? AND status = 'open'`,
-		workspaceID, p.SubjectType, p.SubjectID).Scan(&violations).Error; err == nil {
+	if err := tenancy.WithTx(ctx, sqlDB, workspaceID, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(ctx, tx, `SELECT rule_name FROM sod_violations
+		 WHERE workspace_id = $1 AND subject_type = $2 AND subject_id = $3 AND status = 'open'`,
+			p.SubjectType, p.SubjectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			violations = append(violations, name)
+		}
+		return rows.Err()
+	}); err == nil {
 		ev.OpenSoDViolations = violations
 	}
 
@@ -458,6 +485,18 @@ func recommend(ev *itemEvidence) (string, string) {
 	default:
 		return "keep", "in active use"
 	}
+}
+
+// userEmail reads the email of a user of workspace ws ("" when it has none),
+// under row-level security. A user of another workspace is tenancy.ErrNotFound.
+func (m *certifyManager) userEmail(ws, userID uuid.UUID, email *string) error {
+	sqlDB, err := m.db.DB()
+	if err != nil {
+		return err
+	}
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
+	return tenancy.QueryRowContext(ctx, sqlDB, `SELECT COALESCE(email,'') FROM users WHERE workspace_id = $1 AND id = $2`,
+		[]any{userID}, email)
 }
 
 // resolveReviewer picks who has to decide: resource-server owner -> the human who
@@ -495,8 +534,7 @@ func (m *certifyManager) resolveReviewer(workspaceID uuid.UUID,
 	// 2. Whoever granted it. They made the call, so they can defend or withdraw it.
 	if p.GrantedBy != nil {
 		var email string
-		if err := m.db.Raw(`SELECT COALESCE(email,'') FROM users WHERE id = ? AND workspace_id = ?`,
-			*p.GrantedBy, workspaceID).Scan(&email).Error; err == nil && email != "" {
+		if err := m.userEmail(workspaceID, *p.GrantedBy, &email); err == nil && email != "" {
 			return p.GrantedBy, email, "granted_by"
 		}
 	}
@@ -591,8 +629,7 @@ func (m *certifyManager) Decide(workspaceID, itemID uuid.UUID, in DecisionInput)
 	// reviewer, because passing an item on is not a decision about the access.
 	if in.Decision == models.DecisionDelegate {
 		var email string
-		_ = m.db.Raw(`SELECT COALESCE(email,'') FROM users WHERE id = ? AND workspace_id = ?`,
-			*in.DelegateTo, workspaceID).Scan(&email).Error
+		_ = m.userEmail(workspaceID, *in.DelegateTo, &email)
 		if err := m.db.Model(&models.CertificationItem{}).Where("id = ?", itemID).
 			Updates(map[string]interface{}{
 				"reviewer_user_id": *in.DelegateTo,

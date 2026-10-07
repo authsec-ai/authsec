@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -505,11 +506,18 @@ func (m *lifecycleManager) grantBirthright(workspaceID uuid.UUID, u *userState,
 	}
 
 	return m.db.Transaction(func(tx *gorm.DB) error {
+		// Names for display only, so a miss leaves them empty. The role is the
+		// workspace's own or a global one, as the policy's validation allows.
+		ctx, q, err := txTenant(tx, workspaceID)
+		if err != nil {
+			return err
+		}
 		var rsName string
-		_ = tx.Raw(`SELECT name FROM resource_servers WHERE id = ?`, p.ResourceServerID).
-			Scan(&rsName).Error
+		_ = tenancy.QueryRowContext(ctx, q, `SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2`,
+			[]any{p.ResourceServerID}, &rsName)
 		var roleName string
-		_ = tx.Raw(`SELECT name FROM roles WHERE id = ?`, p.RoleID).Scan(&roleName).Error
+		_ = tenancy.QueryRowContext(ctx, q, `SELECT name FROM roles WHERE (workspace_id = $1 OR workspace_id IS NULL) AND id = $2`,
+			[]any{p.RoleID}, &roleName)
 
 		scopeType := "resource_server"
 		rb := models.RoleBinding{
@@ -529,7 +537,7 @@ func (m *lifecycleManager) grantBirthright(workspaceID uuid.UUID, u *userState,
 		}
 
 		policyID := p.ID
-		_, err := m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
+		_, err = m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
 			EntitlementType: models.EntitlementRoleBinding,
 			RoleBindingID:   &rb.ID,
 			Snapshot: map[string]interface{}{
