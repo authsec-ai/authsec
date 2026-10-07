@@ -347,3 +347,115 @@ func Test_XAA_WorkspaceIssuerMapsOnlyIntoItsWorkspace(t *testing.T) {
 		t.Fatalf("own-workspace redemption rejected: %d %v", code, body)
 	}
 }
+
+// AS-060 (072): an issuer may be registered by more than one workspace (a
+// shared SPIRE server, a public OIDC issuer). A token authenticates in the
+// one workspace that maps its subject; a subject mapped in several workspaces
+// is refused, never guessed. Before 072 the second workspace could not
+// register the issuer at all.
+func Test_SPIFFESVID_SharedIssuerResolvesToTheMappingWorkspace(t *testing.T) {
+	env := testsupport.Get(t)
+	n := emailSafeNonce()
+	wsA, err := SeedWorkspaceWithAdmin(config.DB, n+"a")
+	if err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+	wsB, err := SeedWorkspaceWithAdmin(config.DB, n+"b")
+	if err != nil {
+		t.Fatalf("seed B: %v", err)
+	}
+	rsB, err := AddResourceServer(config.DB, wsB, "https://rs-"+n+".example.com", n)
+	if err != nil {
+		t.Fatalf("AddResourceServer: %v", err)
+	}
+	saB, err := AddServiceAccountWithScopes(config.DB, wsB, rsB, n)
+	if err != nil {
+		t.Fatalf("AddServiceAccountWithScopes: %v", err)
+	}
+	spiffeID := "spiffe://shared-" + n + ".example/workload"
+	mustExec(t, `UPDATE service_accounts SET spiffe_id = $1 WHERE workspace_id = $2 AND id = $3`, spiffeID, wsB.WorkspaceID, saB.SAID)
+
+	ei := startExternalIssuer(t)
+	iss := ei.base + "/shared"
+	for _, ws := range []*WorkspaceScenario{wsA, wsB} {
+		if err := config.DB.Exec(`
+			INSERT INTO workload_identity_providers (workspace_id, name, kind, issuer, jwks_uri)
+			VALUES (?, ?, 'spiffe', ?, ?)`, ws.WorkspaceID, "wip-shared-"+n, iss, ei.base+"/jwks").Error; err != nil {
+			t.Fatalf("register the shared issuer in %s: %v", ws.WorkspaceID, err)
+		}
+	}
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	redeem := func() (int, map[string]interface{}) {
+		now := time.Now()
+		svid := ei.sign(t, "", jwt.MapClaims{"iss": iss, "sub": spiffeID, "aud": tokenEndpoint,
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix()})
+		w := env.Do(http.MethodPost, "/oauth/token", formBody(
+			"grant_type", "client_credentials", "client_id", saB.ClientIDString,
+			"client_assertion_type", spiffeSVIDAssertionType, "client_assertion", svid,
+			"resource", rsB.ResourceURI, "scope", rsB.ScopeStrings[0]), "")
+		var body map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		return w.Code, body
+	}
+
+	if code, body := redeem(); code != http.StatusOK {
+		t.Fatalf("shared issuer, subject mapped only in B: got %d %v, want 200", code, body)
+	}
+
+	// OIDC subjects are not unique: two workspaces may both trust the same
+	// federated subject (say, a CI repository). The client the request names
+	// decides (the token endpoint requires one); a caller that names none and
+	// matches several workspaces is refused as ambiguous.
+	rsA, err := AddResourceServer(config.DB, wsA, "https://rs-a-"+n+".example.com", n+"a")
+	if err != nil {
+		t.Fatalf("AddResourceServer A: %v", err)
+	}
+	saA, err := AddServiceAccountWithScopes(config.DB, wsA, rsA, n+"a")
+	if err != nil {
+		t.Fatalf("AddServiceAccountWithScopes A: %v", err)
+	}
+	oidcIss := ei.base + "/ci"
+	subject := "repo:org-" + n + "/app:ref:refs/heads/main"
+	for _, m := range []struct {
+		ws   *WorkspaceScenario
+		saID uuid.UUID
+	}{{wsA, saA.SAID}, {wsB, saB.SAID}} {
+		if err := config.DB.Exec(`
+			INSERT INTO workload_identity_providers (workspace_id, name, kind, issuer, jwks_uri)
+			VALUES (?, ?, 'oidc', ?, ?)`, m.ws.WorkspaceID, "wip-ci-"+n, oidcIss, ei.base+"/jwks").Error; err != nil {
+			t.Fatalf("register the CI issuer: %v", err)
+		}
+		mustExec(t, `UPDATE service_accounts SET external_subject = $1 WHERE workspace_id = $2 AND id = $3`, subject, m.ws.WorkspaceID, m.saID)
+	}
+	ciToken := func() string {
+		now := time.Now()
+		return ei.sign(t, "", jwt.MapClaims{"iss": oidcIss, "sub": subject, "aud": tokenEndpoint,
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix()})
+	}
+	post := func(fields ...string) (int, map[string]interface{}) {
+		w := env.Do(http.MethodPost, "/oauth/token", formBody(fields...), "")
+		var body map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		return w.Code, body
+	}
+	code, body := post("grant_type", "client_credentials", "client_id", saB.ClientIDString,
+		"client_assertion_type", spiffeSVIDAssertionType, "client_assertion", ciToken(),
+		"resource", rsB.ResourceURI, "scope", rsB.ScopeStrings[0])
+	if code != http.StatusOK {
+		t.Fatalf("CI token naming B's client: got %d %v, want 200", code, body)
+	}
+	// The same token naming A's client authenticates A's workload, in A.
+	code, body = post("grant_type", "client_credentials", "client_id", saA.ClientIDString,
+		"client_assertion_type", spiffeSVIDAssertionType, "client_assertion", ciToken(),
+		"resource", rsA.ResourceURI, "scope", rsA.ScopeStrings[0])
+	if code != http.StatusOK {
+		t.Fatalf("CI token naming A's client: got %d %v, want 200", code, body)
+	}
+	// Naming B's client for A's resource fails: B's client is not registered there.
+	code, body = post("grant_type", "client_credentials", "client_id", saB.ClientIDString,
+		"client_assertion_type", spiffeSVIDAssertionType, "client_assertion", ciToken(),
+		"resource", rsA.ResourceURI, "scope", rsA.ScopeStrings[0])
+	if code == http.StatusOK {
+		t.Fatalf("B's client obtained a token for A's resource: %v", body)
+	}
+}

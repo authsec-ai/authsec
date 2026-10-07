@@ -237,9 +237,9 @@ func Test_TenancySchema_PerWorkspaceUniques(t *testing.T) {
 	}
 }
 
-// Pre-auth identifiers: resource_uri is unique per workspace since 071, with
-// ownership of the URI's host deciding shared URIs (AS-060); workload issuers
-// stay globally unique (the SVID path selects the provider by iss alone).
+// Pre-auth identifiers (AS-060): resource_uri is unique per workspace since
+// 071, with ownership of the URI's host deciding shared URIs; workload issuers
+// are unique per workspace since 072, the token's subject and client deciding.
 // This pins both decisions so a later change is deliberate.
 func Test_TenancySchema_PreAuthIdentifiers(t *testing.T) {
 	a, b := schemaTenants(t)
@@ -263,8 +263,13 @@ func Test_TenancySchema_PreAuthIdentifiers(t *testing.T) {
 	if _, err := db.Exec(ins, a.WS.WorkspaceID, issuer); err != nil {
 		t.Fatalf("issuer in A: %v", err)
 	}
-	if _, err := db.Exec(ins, b.WS.WorkspaceID, issuer); sqlState(err) != "23505" {
-		t.Fatalf("issuer reused in another workspace: want 23505, got %v", err)
+	// 072: issuers are unique per workspace; another workspace may register
+	// the same issuer, the same workspace may not register it twice.
+	if _, err := db.Exec(ins, a.WS.WorkspaceID, issuer); sqlState(err) != "23505" {
+		t.Fatalf("issuer reused in the same workspace: want 23505, got %v", err)
+	}
+	if _, err := db.Exec(ins, b.WS.WorkspaceID, issuer); err != nil {
+		t.Fatalf("issuer in another workspace must be allowed by the schema: %v", err)
 	}
 }
 
