@@ -116,7 +116,7 @@ type ResolvedTarget struct {
 	Consumers           []ConsumerView       `json:"consumers"`
 	ConsumersUnresolved int                  `json:"consumers_unresolved"`
 	UnresolvedConsumers []UnresolvedConsumer `json:"unresolved_consumers"`
-	Owners              []OwnerView          `json:"owners"`
+	Owners              []TargetOwnerView    `json:"owners"`
 	Evidence            *TargetEvidence      `json:"evidence"`
 }
 
@@ -184,12 +184,12 @@ func notSupportedK8s(k TargetKey) ResolvedTarget {
 	return ResolvedTarget{Key: k, Status: TargetNotSupported, Prerequisite: "K-1",
 		Reason:            "Kubernetes is not supported for policy in R1a: it needs an authenticated, ordered RBAC ingest (K-1).",
 		IneligibleReasons: []string{"provider_not_supported:K-1"}, Consumers: []ConsumerView{},
-		UnresolvedConsumers: []UnresolvedConsumer{}, Owners: []OwnerView{}}
+		UnresolvedConsumers: []UnresolvedConsumer{}, Owners: []TargetOwnerView{}}
 }
 
 func emptyTarget(k TargetKey, status, reason string) ResolvedTarget {
 	return ResolvedTarget{Key: k, Status: status, Reason: reason, IneligibleReasons: []string{},
-		Consumers: []ConsumerView{}, UnresolvedConsumers: []UnresolvedConsumer{}, Owners: []OwnerView{}}
+		Consumers: []ConsumerView{}, UnresolvedConsumers: []UnresolvedConsumer{}, Owners: []TargetOwnerView{}}
 }
 
 type identityRow struct {

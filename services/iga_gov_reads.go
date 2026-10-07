@@ -510,7 +510,7 @@ type FindingDetail struct {
 	FindingView
 	ConditionHoldsAtRev bool                            `json:"condition_holds_at_rev"`
 	Evidence            []models.IGAGovActivityEvidence `json:"evidence"`
-	Owners              []OwnerView                     `json:"owners"`
+	Owners              []TargetOwnerView               `json:"owners"`
 	LinkedPolicy        *LinkedPolicy                   `json:"linked_policy"`
 	Consumers           []ConsumerView                  `json:"consumers"`
 }
@@ -535,7 +535,7 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 	d := &FindingDetail{FindingView: rows[0].view()}
 	d.ConditionHoldsAtRev = d.Condition != nil
 	d.Evidence = []models.IGAGovActivityEvidence{}
-	d.Owners, d.Consumers = []OwnerView{}, []ConsumerView{}
+	d.Owners, d.Consumers = []TargetOwnerView{}, []ConsumerView{}
 	if d.IdentityAccountID == nil {
 		return d, nil
 	}
@@ -621,8 +621,8 @@ type ConsumerView struct {
 	Relationship string    `json:"relationship"`
 }
 
-// OwnerView is one owner of a role or of a workload consuming it.
-type OwnerView struct {
+// TargetOwnerView is one owner of a role or of a workload consuming it.
+type TargetOwnerView struct {
 	OwnerID     uuid.UUID  `json:"owner_id"`
 	UserID      uuid.UUID  `json:"user_id"`
 	Role        string     `json:"role"`
@@ -648,7 +648,7 @@ func consumersOf(db *gorm.DB, ws, identity uuid.UUID) ([]ConsumerView, error) {
 
 // ownersOf is the role's own owners plus the owners of every consuming
 // workload ("derived consumer owners", §7.1).
-func ownersOf(db *gorm.DB, ws, identity uuid.UUID, consumers []ConsumerView) ([]OwnerView, error) {
+func ownersOf(db *gorm.DB, ws, identity uuid.UUID, consumers []ConsumerView) ([]TargetOwnerView, error) {
 	names := map[uuid.UUID]string{}
 	var wids []uuid.UUID
 	for _, c := range consumers {
@@ -668,9 +668,9 @@ func ownersOf(db *gorm.DB, ws, identity uuid.UUID, consumers []ConsumerView) ([]
 	if err := q.Order("object_kind, role, user_id").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	out := []OwnerView{}
+	out := []TargetOwnerView{}
 	for _, o := range rows {
-		v := OwnerView{OwnerID: o.ID, UserID: o.UserID, Role: o.Role, Source: o.Source, ObjectKind: o.ObjectKind,
+		v := TargetOwnerView{OwnerID: o.ID, UserID: o.UserID, Role: o.Role, Source: o.Source, ObjectKind: o.ObjectKind,
 			ReviewDueAt: o.ReviewDueAt}
 		if o.WorkloadID != nil {
 			v.ObjectID, v.For = *o.WorkloadID, names[*o.WorkloadID]
