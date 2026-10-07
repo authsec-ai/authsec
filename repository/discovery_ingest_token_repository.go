@@ -30,6 +30,9 @@ const (
 	// written: at most once per interval per token, so a fleet of agents
 	// heartbeating every few seconds is not a write per request.
 	DiscoveryIngestTouchInterval = time.Minute
+	// MaxIngestTokenLifetime is the furthest in the future a token's expiry
+	// may be set. A token meant to live longer is minted without an expiry.
+	MaxIngestTokenLifetime = 2 * 365 * 24 * time.Hour
 )
 
 var (
@@ -39,30 +42,47 @@ var (
 	// ErrIngestTokenSourceNotFound means the discovery source a token was to be
 	// bound to is not a source of the caller's workspace.
 	ErrIngestTokenSourceNotFound = errors.New("discovery source not found in this workspace")
+	// ErrIngestTokenExpiry means a requested expiry is not in the future or is
+	// further out than MaxIngestTokenLifetime.
+	ErrIngestTokenExpiry = errors.New("expires_at must be in the future and at most 2 years (17520h) from now")
 )
 
-// discoveryIngestTokenColumns is every column EXCEPT token_hash: what a list or
-// a revoke reads back. The hash is never selected where it is not needed.
+// discoveryIngestTokenColumns is every column EXCEPT token_hash, plus the two
+// computed flags: what a list or a revoke reads back. The hash is never selected
+// where it is not needed. expired is decided by the database clock, the same
+// clock Verify uses, so a list and the ingress never disagree about a token.
 var discoveryIngestTokenColumns = []string{
-	"id", "workspace_id", "discovery_source_id", "token_prefix", "label",
-	"created_by", "created_at", "last_used_at", "revoked_at",
+	"id", "workspace_id", "discovery_source_id", "source_bound", "token_prefix", "label",
+	"created_by", "created_at", "last_used_at", "revoked_at", "expires_at",
+	"(expires_at IS NOT NULL AND expires_at <= now()) AS expired",
+	"(source_bound AND discovery_source_id IS NULL) AS source_deleted",
 }
+
+// liveIngestTokenSQL is what makes an unrevoked row a usable token: it has not
+// expired, and it is not a source-bound token whose source is gone. The second
+// is also what the table's CHECK (discovery_ingest_tokens_bound_chk) makes
+// impossible for an unrevoked row; it is repeated here so a NULL source can
+// never widen a bound token into a workspace token, whatever reached the row.
+const liveIngestTokenSQL = "(expires_at IS NULL OR expires_at > now()) AND NOT (source_bound AND discovery_source_id IS NULL)"
 
 // DiscoveryIngestTokenRepository stores the credentials a discovery agent
 // presents on the ingress. It holds hashes only.
 type DiscoveryIngestTokenRepository interface {
 	// Mint creates a token for a workspace, optionally bound to one of its
-	// discovery sources, and returns the stored row and the plaintext. The
-	// plaintext is not recoverable afterwards.
-	Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string) (*models.DiscoveryIngestToken, string, error)
-	// List returns the workspace's tokens, newest first, revoked ones included
-	// (with revoked_at set). Hashes are never read.
+	// discovery sources and optionally expiring, and returns the stored row and
+	// the plaintext. The plaintext is not recoverable afterwards. expiresAt, when
+	// set, must be in the future and at most MaxIngestTokenLifetime away
+	// (ErrIngestTokenExpiry otherwise).
+	Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string, expiresAt *time.Time) (*models.DiscoveryIngestToken, string, error)
+	// List returns the workspace's tokens, newest first, revoked and expired
+	// ones included (with revoked_at set / expired true). Hashes are never read.
 	List(workspaceID uuid.UUID) ([]models.DiscoveryIngestToken, error)
 	// Revoke stamps revoked_at. Revoking a revoked token is a no-op that
 	// returns the row; a token of another workspace is ErrIngestTokenNotFound.
 	Revoke(workspaceID, id uuid.UUID) (*models.DiscoveryIngestToken, error)
-	// Verify resolves a presented token to its live (unrevoked) row, or nil
-	// when it is not a valid token. It records last_used_at at most once per
+	// Verify resolves a presented token to its live row -- not revoked, not
+	// expired, and not bound to a source that is gone -- or nil when it is not a
+	// valid token. It records last_used_at at most once per
 	// DiscoveryIngestTouchInterval. An error is a database failure, never an
 	// invalid token.
 	Verify(token string) (*models.DiscoveryIngestToken, error)
@@ -103,7 +123,26 @@ func wellFormedIngestToken(token string) bool {
 	return err == nil
 }
 
-func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string) (*models.DiscoveryIngestToken, string, error) {
+// ValidateIngestTokenExpiry checks a requested expiry against now: nil (never
+// expires) is valid; otherwise it must be after now and no further than
+// MaxIngestTokenLifetime. It returns the expiry as stored (UTC, microseconds,
+// which is what timestamptz keeps).
+func ValidateIngestTokenExpiry(expiresAt *time.Time, now time.Time) (*time.Time, error) {
+	if expiresAt == nil {
+		return nil, nil
+	}
+	if !expiresAt.After(now) || expiresAt.Sub(now) > MaxIngestTokenLifetime {
+		return nil, ErrIngestTokenExpiry
+	}
+	at := expiresAt.UTC().Truncate(time.Microsecond)
+	return &at, nil
+}
+
+func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string, expiresAt *time.Time) (*models.DiscoveryIngestToken, string, error) {
+	expiresAt, err := ValidateIngestTokenExpiry(expiresAt, time.Now())
+	if err != nil {
+		return nil, "", err
+	}
 	if sourceID != nil {
 		var n int64
 		if err := r.db.Table("discovery_sources").
@@ -123,10 +162,14 @@ func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *u
 		ID:                uuid.New(),
 		WorkspaceID:       workspaceID,
 		DiscoverySourceID: sourceID,
-		TokenHash:         HashDiscoveryIngestToken(plain),
-		TokenPrefix:       plain[:discoveryIngestTokenShown],
-		Label:             strings.TrimSpace(label),
-		CreatedBy:         createdBy,
+		// Bound for life: the flag outlives the source, so the row can never
+		// later read as an unbound (workspace-wide) token.
+		SourceBound: sourceID != nil,
+		ExpiresAt:   expiresAt,
+		TokenHash:   HashDiscoveryIngestToken(plain),
+		TokenPrefix: plain[:discoveryIngestTokenShown],
+		Label:       strings.TrimSpace(label),
+		CreatedBy:   createdBy,
 	}
 	if err := r.db.Create(row).Error; err != nil {
 		return nil, "", err
@@ -170,7 +213,9 @@ func (r *discoveryIngestTokenRepository) Verify(token string) (*models.Discovery
 	}
 	h := HashDiscoveryIngestToken(token)
 	var row models.DiscoveryIngestToken
-	err := r.db.Where("token_hash = ? AND revoked_at IS NULL", h).Take(&row).Error
+	err := r.db.Where("token_hash = ? AND revoked_at IS NULL", h).
+		Where(liveIngestTokenSQL).
+		Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -195,4 +240,35 @@ func (r *discoveryIngestTokenRepository) Verify(token string) (*models.Discovery
 			row.ID, DiscoveryIngestTouchInterval.Seconds()).
 		Update("last_used_at", gorm.Expr("now()")).Error
 	return &row, nil
+}
+
+// RevokeSourceIngestTokens revokes every unrevoked token bound to a discovery
+// source, inside tx, and returns how many it revoked. It must run in the same
+// transaction as the source's deletion and BEFORE it: the foreign key then
+// nulls the tokens' discovery_source_id, and the CHECK
+// discovery_ingest_tokens_bound_chk refuses that for a bound token that is not
+// revoked -- so a delete that skipped this fails rather than leaving a bound
+// token that reads as workspace-wide. The rows are kept: revoked, with
+// source_bound true, as the record of what they authorised.
+//
+// source_bound is set on every row bound to the source as well, so a row
+// written by code older than 044 (which did not set it) is marked too.
+// Already-revoked rows keep their first revoked_at.
+func RevokeSourceIngestTokens(tx *gorm.DB, workspaceID, sourceID uuid.UUID) (int64, error) {
+	var live int64
+	if err := tx.Model(&models.DiscoveryIngestToken{}).
+		Where("workspace_id = ? AND discovery_source_id = ? AND revoked_at IS NULL", workspaceID, sourceID).
+		Count(&live).Error; err != nil {
+		return 0, err
+	}
+	err := tx.Model(&models.DiscoveryIngestToken{}).
+		Where("workspace_id = ? AND discovery_source_id = ?", workspaceID, sourceID).
+		Updates(map[string]any{
+			"source_bound": true,
+			"revoked_at":   gorm.Expr("COALESCE(revoked_at, now())"),
+		}).Error
+	if err != nil {
+		return 0, err
+	}
+	return live, nil
 }
