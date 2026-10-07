@@ -255,7 +255,7 @@ func NewPendingRegistrationRepository(db *DBConnection) *PendingRegistrationRepo
 func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *models.PendingRegistration) error {
 	// Phase A: client_id column removed from pending_registrations.
 	query := `
-		INSERT INTO pending_registrations (email, password_hash, first_name, last_name, // TENANT-EXEMPT: sign-up before the workspace exists
+		INSERT INTO pending_registrations (email, password_hash, first_name, last_name, -- TENANT-EXEMPT: sign-up before the workspace exists
 			workspace_id, project_id, expires_at, created_at, updated_at, workspace_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id
