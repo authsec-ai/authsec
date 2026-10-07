@@ -9,7 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// OTPRepository handles OTP database operations without GORM
+// OTPRepository handles the e-mail one-time codes of the admin sign-up,
+// sign-in and password-reset flows. They are issued and checked before any
+// workspace is known (keyed by e-mail; otp_entries has no workspace_id), so
+// every statement here is TENANT-EXEMPT.
 type OTPRepository struct {
 	db *DBConnection
 }
@@ -21,6 +24,7 @@ func NewOTPRepository(db *DBConnection) *OTPRepository {
 
 // CreateOTP creates a new OTP entry
 func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -49,6 +53,7 @@ func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
 
 // GetValidOTP retrieves a valid (non-expired, unverified) OTP for an email
 func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, error) {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		SELECT id, email, otp, expires_at, verified, created_at, updated_at
 		FROM otp_entries
@@ -84,6 +89,7 @@ func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, e
 
 // GetVerifiedOTP retrieves a verified OTP for an email
 func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		SELECT id, email, otp, expires_at, verified, created_at, updated_at
 		FROM otp_entries
@@ -115,6 +121,7 @@ func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) 
 
 // VerifyOTP marks an OTP as verified
 func (or *OTPRepository) VerifyOTP(otpID uuid.UUID) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		UPDATE otp_entries
 		SET verified = true, updated_at = $1
@@ -140,6 +147,7 @@ func (or *OTPRepository) VerifyOTP(otpID uuid.UUID) error {
 
 // DeleteOTPsByEmail deletes all OTP entries for an email (cleanup)
 func (or *OTPRepository) DeleteOTPsByEmail(email string) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `DELETE FROM otp_entries WHERE email = $1`
 
 	_, err := or.db.Exec(query, email)
@@ -148,6 +156,7 @@ func (or *OTPRepository) DeleteOTPsByEmail(email string) error {
 
 // DeleteExpiredOTPs deletes all expired OTP entries (cleanup job)
 func (or *OTPRepository) DeleteExpiredOTPs() error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `DELETE FROM otp_entries WHERE expires_at < $1`
 
 	_, err := or.db.Exec(query, time.Now())
@@ -156,6 +165,7 @@ func (or *OTPRepository) DeleteExpiredOTPs() error {
 
 // HasValidOTP checks if there's a valid OTP for an email
 func (or *OTPRepository) HasValidOTP(email string) (bool, error) {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		SELECT EXISTS(
 			SELECT 1 FROM otp_entries
@@ -172,6 +182,7 @@ func (or *OTPRepository) HasValidOTP(email string) (bool, error) {
 
 // CreateOTPTx creates an OTP within a transaction
 func (or *OTPRepository) CreateOTPTx(tx *sql.Tx, otp *models.OTPEntry) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -200,6 +211,7 @@ func (or *OTPRepository) CreateOTPTx(tx *sql.Tx, otp *models.OTPEntry) error {
 
 // VerifyOTPTx marks an OTP as verified within a transaction
 func (or *OTPRepository) VerifyOTPTx(tx *sql.Tx, otpID uuid.UUID) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
 		UPDATE otp_entries
 		SET verified = true, updated_at = $1
@@ -225,13 +237,16 @@ func (or *OTPRepository) VerifyOTPTx(tx *sql.Tx, otpID uuid.UUID) error {
 
 // DeleteOTPsByEmailTx deletes OTPs by email within a transaction
 func (or *OTPRepository) DeleteOTPsByEmailTx(tx *sql.Tx, email string) error {
+	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `DELETE FROM otp_entries WHERE email = $1`
 
 	_, err := tx.Exec(query, email)
 	return err
 }
 
-// PendingRegistrationRepository handles pending registration database operations
+// PendingRegistrationRepository handles admin sign-ups awaiting their OTP.
+// The row's workspace_id is the id the new workspace will get; that
+// workspace does not exist yet, so every statement here is TENANT-EXEMPT.
 type PendingRegistrationRepository struct {
 	db *DBConnection
 }
@@ -244,6 +259,7 @@ func NewPendingRegistrationRepository(db *DBConnection) *PendingRegistrationRepo
 // CreatePendingRegistration creates a new pending registration
 func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *models.PendingRegistration) error {
 	// Phase A: client_id column removed from pending_registrations.
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
 		INSERT INTO pending_registrations (email, password_hash, first_name, last_name,
 			workspace_id, project_id, expires_at, created_at, updated_at, workspace_domain)
@@ -278,6 +294,7 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 // GetPendingRegistration retrieves a pending registration by email
 func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*models.PendingRegistration, error) {
 	// Phase A: client_id column removed from pending_registrations.
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
 		SELECT id, email, password_hash, first_name, last_name, workspace_id,
 			project_id, expires_at, created_at, updated_at, workspace_domain
@@ -315,6 +332,7 @@ func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*
 
 // DeletePendingRegistrationsByEmail deletes pending registrations by email (cleanup)
 func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmail(email string) error {
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `DELETE FROM pending_registrations WHERE email = $1`
 
 	_, err := pr.db.Exec(query, email)
@@ -323,6 +341,7 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmail(email
 
 // DeleteExpiredPendingRegistrations deletes expired pending registrations (cleanup job)
 func (pr *PendingRegistrationRepository) DeleteExpiredPendingRegistrations() error {
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `DELETE FROM pending_registrations WHERE expires_at < $1`
 
 	_, err := pr.db.Exec(query, time.Now())
@@ -333,6 +352,7 @@ func (pr *PendingRegistrationRepository) DeleteExpiredPendingRegistrations() err
 
 // DeletePendingRegistrationsByEmailTx deletes pending registrations within a transaction
 func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx *sql.Tx, email string) error {
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `DELETE FROM pending_registrations WHERE email = $1`
 
 	_, err := tx.Exec(query, email)
@@ -342,6 +362,7 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx 
 // UpdatePendingRegistration updates an existing pending registration
 func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *models.PendingRegistration) error {
 	// Phase A: client_id column removed from pending_registrations.
+	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
 		UPDATE pending_registrations
 		SET password_hash = $1, workspace_id = $2, project_id = $3,
