@@ -6,8 +6,63 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/testsupport"
+	"github.com/google/uuid"
 )
+
+// Admin sign-up auto-verifies the new workspace's own subdomain. When that
+// domain is already a workspace_domains row of another workspace, the
+// upsert used to take over that row (mark it verified and primary for its
+// owner); the registration is now refused and the row is untouched.
+func Test_AdminScoped_SignupDoesNotTakeOverAnotherWorkspacesDomain(t *testing.T) {
+	a, _ := TwoTenants(t)
+	env := testsupport.Get(t)
+	n := emailSafeNonce()
+	domain := n + ".test.local"
+	if err := config.DB.Exec(`
+		INSERT INTO workspace_domains (workspace_id, domain, kind, is_primary, is_verified, verification_token)
+		VALUES (?, ?, 'custom', false, false, 'tok')`, a.WS.WorkspaceID, domain).Error; err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+
+	email := "owner@" + domain
+	w := env.Do("POST", "/authsec/uflow/auth/admin/register", map[string]string{
+		"email": email, "password": "Passw0rd!Passw0rd", "name": "Squatter", "workspace_domain": n,
+	}, "")
+	assertStatus(t, w, http.StatusCreated)
+	otp := columnValue(t, "otp_entries", "otp", "email = ? ORDER BY created_at DESC LIMIT 1", email)
+	w = env.Do("POST", "/authsec/uflow/auth/admin/complete-registration", map[string]string{"email": email, "otp": otp}, "")
+	assertStatus(t, w, http.StatusConflict)
+
+	assertCount(t, 1, "workspace_domains", "domain = ? AND workspace_id = ? AND is_verified = false AND is_primary = false",
+		domain, a.WS.WorkspaceID)
+	assertCount(t, 0, "workspaces", "workspace_domain = ?", domain)
+	assertCount(t, 0, "users", "LOWER(email) = LOWER(?)", email)
+}
+
+// Admin sign-up writes the new workspace's domain, owner binding and
+// membership on the scoped layer, all in the new workspace.
+func Test_AdminScoped_SignupWritesInNewWorkspace(t *testing.T) {
+	env := testsupport.Get(t)
+	n := emailSafeNonce()
+	domain := n + ".test.local"
+	email := "owner@" + domain
+	w := env.Do("POST", "/authsec/uflow/auth/admin/register", map[string]string{
+		"email": email, "password": "Passw0rd!Passw0rd", "name": "Owner", "workspace_domain": n,
+	}, "")
+	assertStatus(t, w, http.StatusCreated)
+	otp := columnValue(t, "otp_entries", "otp", "email = ? ORDER BY created_at DESC LIMIT 1", email)
+	w = env.Do("POST", "/authsec/uflow/auth/admin/complete-registration", map[string]string{"email": email, "otp": otp}, "")
+	assertStatus(t, w, http.StatusCreated)
+
+	ws := uuid.MustParse(columnValue(t, "workspaces", "id", "workspace_domain = ?", domain))
+	uid := columnValue(t, "users", "id", "LOWER(email) = LOWER(?) AND workspace_id = ?", email, ws)
+	assertCount(t, 1, "workspaces", "id = ? AND owner_user_id = ?", ws, uid)
+	assertCount(t, 1, "workspace_domains", "domain = ? AND workspace_id = ? AND is_verified AND is_primary", domain, ws)
+	assertCount(t, 1, "role_bindings", "user_id = ? AND workspace_id = ? AND scope_type IS NULL", uid, ws)
+	assertCount(t, 1, "workspace_memberships", "user_id = ? AND workspace_id = ? AND status = 'active'", uid, ws)
+}
 
 // The admin controllers' raw SQL runs on the scoped layer (workspace_id = $1,
 // row-level security). These tests drive the same-workspace paths end to end,

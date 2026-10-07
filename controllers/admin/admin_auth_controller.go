@@ -15,6 +15,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/services"
@@ -476,6 +477,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	workspaceDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.WorkspaceDomain), config.AppConfig.WorkspaceDomainSuffix)
 	db := config.GetDatabase()
 	var count int
+	// TENANT-EXEMPT: pre-auth sign-up; workspace_domain is unique across the tenant registry.
 	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("Failed to check tenant domain existence: %v", err)
@@ -864,6 +866,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// Admin registration only ever creates a NEW workspace; a pending row
 	// naming an existing one (e.g. from end-user /user/register/initiate)
 	// must not make its email that workspace's owner.
+	// TENANT-EXEMPT: sign-up creates the tenant registry row (workspaces has no workspace_id).
 	wsRes, err := tx.Exec(`
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, vault_mount, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'admin_registration', 'active', NULL, NOW(), NOW())
@@ -881,6 +884,9 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Registration session is not valid for a new workspace. Please initiate registration again"})
 		return
 	}
+	// The workspace this sign-up just created, from the OTP-verified pending
+	// registration: the rest of its rows are written on the scoped layer.
+	wctx := database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID)
 
 	// Auto-verify the workspace's OWN subdomain as a verified workspace_domains
 	// row, but ONLY when it falls under the deployment's configured base domain
@@ -891,16 +897,27 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// verification. Per-subdomain RP-ID isolation is preserved.
 	if suffix := config.AppConfig.WorkspaceDomainSuffix; suffix != "" &&
 		(pendingReg.WorkspaceDomain == suffix || strings.HasSuffix(pendingReg.WorkspaceDomain, "."+suffix)) {
-		if _, derr := tx.Exec(`
+		// The upsert only ever touches this workspace's row: a domain that is
+		// already another workspace's must not be verified or made primary
+		// for it, so the registration is refused instead.
+		res, derr := tenancy.ExecContext(wctx, tx, `
 			INSERT INTO workspace_domains
 			  (workspace_id, domain, kind, is_primary, is_verified, verification_token, verification_method, verification_txt_name, verification_txt_value, verified_at, created_at, updated_at)
 			VALUES ($1, $2, 'system', true, true, 'single-node-bootstrap', 'bootstrap', $3, 'single-node-bootstrap', NOW(), NOW(), NOW())
 			ON CONFLICT (domain) DO UPDATE SET is_verified = true, is_primary = true,
 			  verified_at = COALESCE(workspace_domains.verified_at, NOW()), updated_at = NOW()
-		`, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, "_authsec-domain."+pendingReg.WorkspaceDomain); derr != nil {
+			  WHERE workspace_domains.workspace_id = $1
+		`, pendingReg.WorkspaceDomain, "_authsec-domain."+pendingReg.WorkspaceDomain)
+		if derr != nil {
 			tx.Rollback()
 			log.Printf("Failed to auto-verify workspace domain %s: %v", pendingReg.WorkspaceDomain, derr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify workspace domain"})
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			tx.Rollback()
+			log.Printf("Admin registration refused: domain %s belongs to another workspace", pendingReg.WorkspaceDomain)
+			c.JSON(http.StatusConflict, gin.H{"error": "Workspace domain already exists"})
 			return
 		}
 	}
@@ -949,16 +966,15 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Insert into role_bindings within transaction (user_roles is deprecated)
-	// scope_type and scope_id are NULL for workspace-wide role assignments
-	bindingID := uuid.New()
-	_, err = tx.Exec(`
+	// scope_type and scope_id are NULL for workspace-wide role assignments.
+	// The user was created in this transaction, so it has no binding yet; the
+	// role must be the new workspace's.
+	_, err = tenancy.ExecContext(wctx, tx, `
 		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-		SELECT $1, $2, $3, $4, NULL, NULL, $5, $5
-		WHERE NOT EXISTS (
-			SELECT 1 FROM role_bindings
-			WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
-		)
-	`, bindingID, pendingReg.WorkspaceID, adminUser.ID, roleID, time.Now())
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, NULL, NULL, NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
+	`, uuid.New(), adminUser.ID, roleID)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to assign admin role: %v", err)
@@ -967,6 +983,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Patch workspace owner_user_id now that the admin user row exists.
+	// TENANT-EXEMPT: the tenant registry row this sign-up created (workspaces has no workspace_id).
 	if _, err := tx.Exec(`UPDATE workspaces SET owner_user_id = $1 WHERE id = $2`, adminUser.ID, pendingReg.WorkspaceID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to update workspace owner: %v", err)
@@ -975,11 +992,13 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Bind the admin user to the workspace with the admin role.
-	if _, err := tx.Exec(`
+	if _, err := tenancy.ExecContext(wctx, tx, `
 		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'active', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
 		ON CONFLICT (workspace_id, user_id) DO NOTHING
-	`, uuid.New(), pendingReg.WorkspaceID, adminUser.ID, roleID); err != nil {
+	`, uuid.New(), adminUser.ID, roleID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace_membership: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace membership"})
@@ -1231,6 +1250,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	// Phase 6: tenants table deleted, workspaces.workspace_domain is the new home.
 	db := config.GetDatabase()
 	var count int
+	// TENANT-EXEMPT: pre-auth bootstrap; workspace_domain is unique across the tenant registry.
 	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("ERROR: Failed to check workspace domain: %v", err)
