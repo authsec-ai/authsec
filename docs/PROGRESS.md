@@ -4,6 +4,52 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-07 (cont. 3) — "complete what's left"
+
+Branches `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
+
+### Done
+- **Ratchet 151 → 0.** Every raw SQL statement outside `internal/tenancy` is either handed to the scoped layer or carries a specific TENANT-EXEMPT reason.
+  - **New scoped helpers:** `tenancy.GormExec` and `tenancy.GormRaw` for GORM code, and `tenancy.InsertContext` for `INSERT ... VALUES` under RLS.
+  - **Ratchet rules:** a scoped or exempt statement covers its whole multi-line SQL string, and every raw string's open/closed state is tracked. This was checked with probe files.
+  - **Quarantined code:** embedded SPIRE (AS-081) is not counted.
+  - **IGA/graph cluster** (agent):
+    - the GitHub and Kubernetes projections now run under RLS;
+    - the claim and recovery loops carry exemption notes;
+    - AS-103 fixed.
+- **Bugs fixed, each with a test that fails on the old code:**
+  - AS-077: a successful PKI retry never marked the workspace active.
+  - AS-103: governance revocation crossed workspaces for a subject with memberships in two workspaces.
+- **Workspace predicates added to lookups that matched by id alone:**
+  - SPIRE cleanup on service-account delete;
+  - the connector broker's last-seen updates;
+  - trusted-issuer revocation;
+  - resource-server tool counts;
+  - the provisioning resource-server name;
+  - the scope resolver's group subquery;
+  - the applications connections joins;
+  - SoD `user_groups`;
+  - birthright lookups.
+  - Policy role ceilings read only the workspace's own roles or platform roles.
+- **Test fixture:** the provisioning fixture failed after AS-061 (`11ca70d`); it now uses an application role.
+- **UI-033:**
+  - per-person UI state (wizard progress, tours, dismissed notices) is keyed by workspace and user;
+  - the `Tenant*` cache tags are renamed.
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding and flagsoff suites pass.
+- The igagraph and ownership (governance, provisioning, agent policy) suites pass on throwaway DBs.
+- UI: 27 files / 167 tests, tsc, lint with 0 errors, and the build all pass.
+
+### Still open (owner decisions or a deploy)
+- AS-060: per-workspace resource URIs need ownership verification first.
+- AS-015, AS-081, AS-097 (contract), AS-098, OPS-001, ENV-001.
+- AS-092: deferred, cosmetic.
+- UI-022: browser end-to-end tests.
+
+---
+
 ## 2026-10-07 (cont. 2) — P2/P3 burn-down, schema parity, ratchet
 
 Branch `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
