@@ -786,6 +786,10 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 		res.RegistrationID = regID
 
 		if in.RoleID != nil {
+			if verr := ValidateConnectionGrant(tx, workspaceID, in.ResourceServerID,
+				*in.RoleID, in.SubjectType, in.SubjectID); verr != nil {
+				return verr
+			}
 			// Preventive check here too: a console approval is just as capable of
 			// creating a conflict as a discovery-driven provision, and a control that
 			// only guards one entry point is not a control.
@@ -883,6 +887,71 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 		return nil, err
 	}
 	return res, nil
+}
+
+// ErrInvalidConnectionGrant is returned when a console approval names a role
+// or subject that the connection cannot carry.
+var ErrInvalidConnectionGrant = errors.New("invalid connection grant")
+
+// ValidateConnectionGrant checks the role and subject of a console connection
+// approval against the workspace and resource server (AS-061):
+//   - the resource server belongs to the workspace;
+//   - the role belongs to the workspace AND is one of that resource server's
+//     roles (its name carries the "rs-<id>:" prefix), so approving a
+//     connection cannot hand out a workspace-wide or another RS's role;
+//   - the subject is a member of the workspace: a user of it (or holding an
+//     active membership in it), or one of its service accounts.
+func ValidateConnectionGrant(tx *gorm.DB, workspaceID, rsID, roleID uuid.UUID, subjectType string, subjectID uuid.UUID) error {
+	var rsCount int64
+	if err := tx.Model(&models.ResourceServer{}).
+		Where("id = ? AND workspace_id = ?", rsID, workspaceID).Count(&rsCount).Error; err != nil {
+		return err
+	}
+	if rsCount == 0 {
+		return fmt.Errorf("%w: resource server not found in this workspace", ErrInvalidConnectionGrant)
+	}
+
+	var roleName string
+	if err := tx.Table("roles").Select("name").
+		Where("id = ? AND workspace_id = ?", roleID, workspaceID).
+		Limit(1).Scan(&roleName).Error; err != nil {
+		return err
+	}
+	if roleName == "" {
+		return fmt.Errorf("%w: role %s not found in this workspace", ErrInvalidConnectionGrant, roleID)
+	}
+	if !strings.HasPrefix(roleName, fmt.Sprintf("rs-%s:", rsID)) {
+		return fmt.Errorf("%w: role %q is not a role of this application", ErrInvalidConnectionGrant, roleName)
+	}
+
+	var member int64
+	switch subjectType {
+	case "user":
+		if err := tx.Table("users").
+			Where("id = ? AND workspace_id = ?", subjectID, workspaceID).
+			Count(&member).Error; err != nil {
+			return err
+		}
+		if member == 0 {
+			if err := tx.Table("workspace_memberships").
+				Where("user_id = ? AND workspace_id = ? AND status = 'active'", subjectID, workspaceID).
+				Count(&member).Error; err != nil {
+				return err
+			}
+		}
+	case "service_account":
+		if err := tx.Table("service_accounts").
+			Where("id = ? AND workspace_id = ?", subjectID, workspaceID).
+			Count(&member).Error; err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: subject_type must be 'user' or 'service_account'", ErrInvalidConnectionGrant)
+	}
+	if member == 0 {
+		return fmt.Errorf("%w: subject is not a member of this workspace", ErrInvalidConnectionGrant)
+	}
+	return nil
 }
 
 // ErrSoDViolation is returned when a grant would breach a blocking SoD rule.
