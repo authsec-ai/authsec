@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -281,13 +283,29 @@ func (ctl *DiscoveryController) ingressConnector(c *gin.Context, rawWS string, s
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid connector credential"})
 			return uuid.Nil, nil, false
 		}
-		// Any other value is an optional sourceToken this endpoint has never
-		// verified; it is ignored, as it always was.
 	}
 
-	wsID, ok := ctl.assertedWorkspace(c, rawWS)
-	if !ok {
+	// A per-workspace collector credential decides the workspace; a body
+	// naming another workspace is not found. Otherwise the workspace is
+	// caller-asserted, which is refused unless the operator opted in.
+	var wsID uuid.UUID
+	if col, err := services.AuthenticateCollectorToken(ctl.db, token); err == nil {
+		if ws, perr := uuid.Parse(rawWS); rawWS != "" && (perr != nil || ws != col.WorkspaceID) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return uuid.Nil, nil, false
+		}
+		wsID = col.WorkspaceID
+	} else if strings.HasPrefix(token, services.CollectorTokenPrefix) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid collector credential"})
 		return uuid.Nil, nil, false
+	} else if !config.EnvFlag("DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS") {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": unauthenticatedIngressMessage})
+		return uuid.Nil, nil, false
+	} else {
+		var ok bool
+		if wsID, ok = ctl.assertedWorkspace(c, rawWS); !ok {
+			return uuid.Nil, nil, false
+		}
 	}
 	locked, err := ctl.credentialedConnector(wsID, *sourceID, lookup)
 	if err != nil {
@@ -300,6 +318,60 @@ func (ctl *DiscoveryController) ingressConnector(c *gin.Context, rawWS string, s
 		return uuid.Nil, nil, false
 	}
 	return wsID, nil, true
+}
+
+// unauthenticatedIngressMessage tells an operator what to configure when a
+// collector reports without a credential.
+const unauthenticatedIngressMessage = "discovery ingress requires a collector credential: " +
+	"mint one with POST /authsec/discovery/collector-tokens (discovery:admin) and set it as the " +
+	"collector's bearer token (Helm: controlPlane.sourceToken; a connector with actuation " +
+	"enabled uses its actuation token instead). To accept unauthenticated reports temporarily, " +
+	"the operator can set DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS=true on the control plane"
+
+// CreateCollectorToken mints a per-workspace collector credential.
+// POST /authsec/discovery/collector-tokens {"name": "..."}; the token is
+// returned once.
+func (ctl *DiscoveryController) CreateCollectorToken(c *gin.Context) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	row, token, err := services.MintCollectorToken(c.Request.Context(), ctl.db, req.Name, ctl.actingUser(c))
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "could not create collector credential"})
+		return
+	}
+	middlewares.Audit(c, "discovery_collector_token", row.ID.String(), "create", &middlewares.AuditChanges{
+		After: map[string]interface{}{"name": row.Name, "token_prefix": row.TokenPrefix},
+	})
+	c.JSON(http.StatusCreated, gin.H{"collector_token": row, "token": token})
+}
+
+// ListCollectorTokens lists the workspace's collector credentials.
+// GET /authsec/discovery/collector-tokens
+func (ctl *DiscoveryController) ListCollectorTokens(c *gin.Context) {
+	rows, err := services.ListCollectorTokens(c.Request.Context(), ctl.db)
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "could not list collector credentials"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"collector_tokens": rows})
+}
+
+// RevokeCollectorToken revokes a collector credential.
+// DELETE /authsec/discovery/collector-tokens/:id
+func (ctl *DiscoveryController) RevokeCollectorToken(c *gin.Context) {
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	if err := services.RevokeCollectorToken(c.Request.Context(), ctl.db, id); err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "collector credential not found"})
+		return
+	}
+	middlewares.Audit(c, "discovery_collector_token", id.String(), "revoke", nil)
+	c.Status(http.StatusNoContent)
 }
 
 // connectorLookup is what an ingress body carries that identifies a connector

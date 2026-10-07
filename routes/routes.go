@@ -1439,11 +1439,15 @@ func SetupRoutes(
 		// permission-checked human can claim one into a governed identity. The worst
 		// case is a polluted Unregistered Agents report, not access.
 		//
-		// Partial containment (AS-014, DiscoveryController.ingressConnector): a
-		// connector may authenticate with its per-connector credential as the
-		// bearer token, which then decides the workspace and the connector; and
-		// a connector that holds a credential can no longer be spoken for
-		// without it. Uncredentialed connectors keep the trade-off above.
+		// Superseded by AS-014 (DiscoveryController.ingressConnector): the
+		// collector authenticates with a bearer token, either a per-connector
+		// actuation credential (decides workspace and connector) or a
+		// per-workspace collector credential minted at
+		// POST /authsec/discovery/collector-tokens (decides the workspace).
+		// Reports without one are refused unless the operator sets
+		// DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS=true, which restores the
+		// trade-off above; a connector holding an actuation credential can
+		// never be spoken for without it.
 		//
 		// Registered on its own group so it cannot accidentally inherit
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
@@ -1497,6 +1501,10 @@ func SetupRoutes(
 			discovery.GET("/sources/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoverySource)
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
+			// Per-workspace collector credentials for the ingress above (AS-014).
+			discovery.POST("/collector-tokens", middlewares.Require("discovery", "admin"), discoveryController.CreateCollectorToken)
+			discovery.GET("/collector-tokens", middlewares.Require("discovery", "admin"), discoveryController.ListCollectorTokens)
+			discovery.DELETE("/collector-tokens/:id", middlewares.Require("discovery", "admin"), discoveryController.RevokeCollectorToken)
 
 			// NOTE: POST /sightings, /agent-registration, /lifecycle and
 			// /resync-manifest are deliberately NOT here — they are registered
