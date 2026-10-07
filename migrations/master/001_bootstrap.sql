@@ -9707,7 +9707,7 @@ CREATE TABLE public.iga_gov_job (
     last_error text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
-    CONSTRAINT iga_gov_job_kind_check CHECK ((kind = ANY (ARRAY['evaluate_owner_rules'::text, 'compile_plans'::text, 'notify'::text, 'refresh_activity'::text, 'observe_tick'::text, 'deploy'::text, 'verify'::text, 'drift_check'::text, 'verify_binding'::text, 'iac_sync'::text, 'prune_evidence'::text, 'metrics_rollup'::text]))),
+    CONSTRAINT iga_gov_job_kind_check CHECK ((kind = ANY (ARRAY['evaluate_owner_rules'::text, 'compile_plans'::text, 'notify'::text, 'refresh_activity'::text, 'observe_tick'::text, 'deploy'::text, 'verify'::text, 'drift_check'::text, 'verify_binding'::text, 'iac_sync'::text, 'prune_evidence'::text, 'metrics_rollup'::text, 'resolve_unknown'::text]))),
     CONSTRAINT iga_gov_job_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'complete'::text, 'failed'::text, 'abandoned'::text])))
 );
 

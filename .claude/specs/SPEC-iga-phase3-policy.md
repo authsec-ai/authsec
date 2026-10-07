@@ -2504,7 +2504,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_job (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id     uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   kind             text NOT NULL CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
-                     'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync','prune_evidence','metrics_rollup')),
+                     'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync','prune_evidence','metrics_rollup','resolve_unknown')),
   subject_id       uuid,
   rev              bigint,
   dedupe_key       text NOT NULL,

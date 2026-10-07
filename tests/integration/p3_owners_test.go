@@ -371,7 +371,11 @@ func p3ErrCode(body map[string]any) string {
 // event in SetManualOwners' transaction.
 func TestP3T307OwnerRoutes(t *testing.T) {
 	db := igaDB(t)
-	p3MetricsOnce.Do(monitoring.InitMetrics) // the audit logger's logrus logger; once per process
+	p3MetricsOnce.Do(func() {
+		if monitoring.GetLogger() == nil { // another test file may already have initialised it
+			monitoring.InitMetrics() // the audit logger's logrus logger; once per process
+		}
+	})
 	prev := config.AuditLogger
 	config.AuditLogger = monitoring.NewAuditLogger(db)
 	t.Cleanup(func() { config.AuditLogger = prev })
