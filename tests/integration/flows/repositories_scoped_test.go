@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
@@ -117,6 +118,98 @@ func Test_ScopedRepo_AdminUsers(t *testing.T) {
 	if _, err := repo.GetAdminUserInWorkspace(ctxA, nu.ID); err != nil {
 		t.Errorf("new admin is not an admin of A: %v", err)
 	}
+}
+
+// OIDC providers, states and identities: the workspace-owned rows are read
+// and written only in the named workspace.
+func Test_ScopedRepo_OIDC(t *testing.T) {
+	a, b := TwoTenants(t)
+	db := config.GetDatabase()
+	n := emailSafeNonce()
+
+	// Providers.
+	prov := "oidc" + n[:8]
+	mustExec(t, `INSERT INTO oidc_providers (provider_name, display_name, client_id, client_secret_vault_path,
+		authorization_url, token_url, userinfo_url, workspace_id) VALUES (?, 'B IdP', 'cid-b', 'p', 'https://i/a', 'https://i/t', 'https://i/u', ?)`,
+		prov, b.WS.WorkspaceID)
+	providers := database.NewOIDCProviderRepository(db)
+	if _, err := providers.GetProviderByWorkspaceAndName(a.WS.WorkspaceID, prov); err == nil {
+		t.Error("A read B's OIDC provider")
+	}
+	if p, err := providers.GetProviderByWorkspaceAndName(b.WS.WorkspaceID, prov); err != nil || p.ClientID != "cid-b" {
+		t.Errorf("B's own provider: %+v, %v", p, err)
+	}
+	if l, _ := providers.GetWorkspaceProviders(a.WS.WorkspaceID); len(l) != 0 {
+		t.Errorf("A lists %d providers", len(l))
+	}
+	if l, _ := providers.GetWorkspaceProviders(b.WS.WorkspaceID); len(l) != 1 {
+		t.Errorf("B lists %d providers, want 1", len(l))
+	}
+	if err := providers.UpdateProvider(a.WS.WorkspaceID, prov, &models.OIDCProviderUpdateInput{ClientID: "hijacked"}); err == nil {
+		t.Error("A updated B's provider")
+	}
+	if err := providers.UpdateProvider(b.WS.WorkspaceID, prov, &models.OIDCProviderUpdateInput{ClientID: "cid-b2"}); err != nil {
+		t.Errorf("B updates its provider: %v", err)
+	}
+	assertCount(t, 1, "oidc_providers", "provider_name = ? AND client_id = 'cid-b2'", prov)
+
+	// States: a workspace's state is written in it; a platform one has none.
+	states := database.NewOIDCStateRepository(db)
+	wsA := a.WS.WorkspaceID
+	st := &models.OIDCState{StateToken: "st-a-" + n, WorkspaceID: &wsA, WorkspaceDomain: "a", ProviderName: "google",
+		Action: "login", ExpiresAt: time.Now().Add(time.Minute)}
+	if err := states.CreateState(st); err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+	got, err := states.GetStateByToken(st.StateToken)
+	if err != nil || got.WorkspaceID == nil || *got.WorkspaceID != wsA || got.ID != st.ID {
+		t.Errorf("state read back: %+v, %v", got, err)
+	}
+	pst := &models.OIDCState{StateToken: "st-p-" + n, WorkspaceDomain: "p", ProviderName: "google",
+		Action: "register", ExpiresAt: time.Now().Add(time.Minute)}
+	if err := states.CreateState(pst); err != nil {
+		t.Fatalf("create platform state: %v", err)
+	}
+	assertCount(t, 1, "oidc_states", "state_token = ? AND workspace_id IS NULL", pst.StateToken)
+	if c, err := states.ConsumeState(pst.StateToken, "register"); err != nil || c.ProviderName != "google" {
+		t.Errorf("consume: %+v, %v", c, err)
+	}
+	if _, err := states.ConsumeState(pst.StateToken, "register"); err == nil {
+		t.Error("state consumed twice")
+	}
+
+	// Identities.
+	ids := database.NewOIDCUserIdentityRepository(db)
+	ident := &models.OIDCUserIdentity{WorkspaceID: a.WS.WorkspaceID, UserID: a.EndUser.UserID, ProviderName: "google",
+		ProviderUserID: "sub-" + n, Email: a.EndUser.Email, ProfileData: "{}"}
+	if err := ids.CreateIdentity(ident); err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+	again := *ident
+	again.ID = uuid.Nil
+	if err := ids.CreateIdentity(&again); err != nil || again.ID != ident.ID {
+		t.Errorf("re-link: id %s, want %s (%v)", again.ID, ident.ID, err)
+	}
+	if i, err := ids.GetIdentityByTenantAndProviderUser(b.WS.WorkspaceID, "google", "sub-"+n); err != nil || i != nil {
+		t.Errorf("B found A's identity: %+v, %v", i, err)
+	}
+	if i, err := ids.GetIdentityByTenantAndProviderUser(a.WS.WorkspaceID, "google", "sub-"+n); err != nil || i == nil || i.ID != ident.ID {
+		t.Errorf("A's identity: %+v, %v", i, err)
+	}
+	if l, _ := ids.GetIdentitiesByUserID(b.WS.WorkspaceID, a.EndUser.UserID); len(l) != 0 {
+		t.Errorf("B lists %d of A's identities", len(l))
+	}
+	if err := ids.UpdateLastLogin(ident.ID); err != nil {
+		t.Errorf("update last login: %v", err)
+	}
+	if err := ids.DeleteIdentity(b.WS.WorkspaceID, a.EndUser.UserID, "google"); err == nil {
+		t.Error("B unlinked A's identity")
+	}
+	assertCount(t, 1, "oidc_user_identities", "id = ?", ident.ID)
+	if err := ids.DeleteIdentity(a.WS.WorkspaceID, a.EndUser.UserID, "google"); err != nil {
+		t.Errorf("unlink: %v", err)
+	}
+	assertCount(t, 0, "oidc_user_identities", "id = ?", ident.ID)
 }
 
 // DeleteTenant removes the ctx workspace's rows and registry row and nothing
