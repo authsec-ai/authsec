@@ -379,6 +379,46 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, e
 
 /* -------------------------- self-registration --------------------------- */
 
+// ClusterUIDConflictStatus is the last_status a self-registered connector
+// carries while an agent registering under its instance reports a cluster UID
+// other than the one the connector recorded first (see UpsertSelfRegistration).
+const ClusterUIDConflictStatus = "cluster_uid_conflict"
+
+// clusterUIDConflictHold is how long a recorded cluster UID conflict stays on
+// the connector after the last conflicting heartbeat. Several heartbeat
+// intervals, so the matching cluster's heartbeats in between do not clear it.
+const clusterUIDConflictHold = 15 * time.Minute
+
+// RecordClusterUIDConflict marks a connector cluster_uid_conflict because
+// something other than a heartbeat -- an RBAC snapshot, a resync manifest, a
+// sighting -- reported a cluster UID other than the one it recorded. The same
+// three fields UpsertSelfRegistration writes for a conflicting heartbeat
+// (last_status, last_error, runtime.cluster_uid_conflict with last_seen_at
+// now), so the console shows one kind of conflict however it was detected, and
+// the heartbeat path's hold keeps it visible. The recorded UID itself is never
+// touched. Never fails the caller's request: the error is returned for the
+// caller to log.
+func RecordClusterUIDConflict(db *gorm.DB, workspaceID, sourceID uuid.UUID,
+	reportedUID, via string) error {
+
+	return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_conflict: this connection belongs to cluster %s, but an incoming %s '
+		        || 'reports cluster %s. Two clusters are installed under one cluster name; '
+		        || 'data from %s is refused. Rename one cluster, or delete and re-add this '
+		        || 'connection to re-bind it.', cluster_uid, ?::text, ?::text, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', ?::text,
+		                              'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ?
+		   AND cluster_uid <> '' AND cluster_uid <> ?`,
+		ClusterUIDConflictStatus, via, reportedUID, reportedUID, reportedUID, via,
+		workspaceID, sourceID, reportedUID).Error
+}
+
 // UpsertSelfRegistration folds an agent heartbeat into its connector row.
 //
 // ON CONFLICT against the PARTIAL unique index discovery_sources_instance_key.
@@ -397,21 +437,70 @@ func (r *discoveryRepository) UpsertSelfRegistration(s *models.DiscoverySource) 
 	// Machine-owned fields only. display_name, enabled, config, created_by and
 	// created_at are deliberately absent: an admin may rename a connector or
 	// disable it, and the next heartbeat 60 seconds later must not undo that.
+	// last_status, last_error, runtime and cluster_uid are set below: each
+	// depends on whether this heartbeat's cluster UID conflicts with the row's.
 	assignments := map[string]interface{}{
 		"cluster_name":      s.ClusterName,
 		"agent_version":     s.AgentVersion,
 		"last_heartbeat_at": s.LastHeartbeatAt,
-		"last_status":       s.LastStatus,
-		"last_error":        s.LastError,
-		"runtime":           s.Runtime,
 		"self_registered":   true,
 		"updated_at":        time.Now(),
 	}
-	// Keep the last non-empty cluster UID. An agent that loses the RBAC to read it
-	// (or is upgraded from a version that never sent it) would otherwise erase the
-	// only evidence of which physical cluster this row belongs to.
+	// THE FIRST RECORDED CLUSTER UID WINS, and nothing a heartbeat says moves it.
+	//
+	// The UID is the only evidence of which physical cluster this row belongs
+	// to, and the RBAC snapshot path refuses any sweep whose UID differs from it
+	// (ErrClusterUIDMismatch). Letting the latest heartbeat overwrite it meant a
+	// second cluster installed under the same name could re-point the row at
+	// itself with one heartbeat -- its sweeps then accepted, the real cluster's
+	// refused, and which one "owned" the row flipping with every heartbeat.
+	//
+	// So: an empty UID is filled once; an empty report never erases one (an
+	// agent that lost the RBAC to read it); and a DIFFERENT non-empty report is
+	// recorded as a conflict -- last_status cluster_uid_conflict, both UIDs in
+	// last_error and runtime.cluster_uid_conflict -- while the heartbeat itself is
+	// still accepted (liveness, version and runtime are refreshed). The only way
+	// to change a recorded UID is to delete the connection and let the agent
+	// register again.
+	//
+	// The conflict is HELD for clusterUIDConflictHold after the last conflicting
+	// heartbeat. Both clusters heartbeat under the same instance_id ("k8s:" +
+	// cluster name), so without the hold the matching cluster's next heartbeat
+	// would clear the status a minute later and the console would show the
+	// conflict only half of the time.
+	//
+	// In ON CONFLICT DO UPDATE every discovery_sources.* reference reads the row
+	// as it was BEFORE this statement, so the expressions below see the same
+	// recorded UID regardless of the order Postgres applies them in.
+	conflict := `(excluded.cluster_uid <> '' AND discovery_sources.cluster_uid <> ''
+	              AND excluded.cluster_uid <> discovery_sources.cluster_uid)`
+	held := `(discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	          AND (discovery_sources.runtime->'cluster_uid_conflict'->>'last_seen_at')::timestamptz
+	              > now() - make_interval(secs => ?))`
+	hold := clusterUIDConflictHold.Seconds()
 	assignments["cluster_uid"] = gorm.Expr(
-		"CASE WHEN excluded.cluster_uid <> '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")
+		"CASE WHEN discovery_sources.cluster_uid = '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")
+	assignments["last_status"] = gorm.Expr(
+		`CASE WHEN `+conflict+` OR `+held+` THEN '`+ClusterUIDConflictStatus+`'
+		      ELSE excluded.last_status END`, hold)
+	assignments["last_error"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN format(
+		          'cluster_uid_conflict: this connection belongs to cluster %s, but an agent '
+		       || 'registering under the same instance (%s) reports cluster %s. Two clusters are '
+		       || 'installed under one cluster name; RBAC snapshots from %s are refused. Rename '
+		       || 'one cluster, or delete and re-add this connection to re-bind it.',
+		          discovery_sources.cluster_uid, discovery_sources.instance_id,
+		          excluded.cluster_uid, excluded.cluster_uid)
+		      WHEN `+held+` THEN discovery_sources.last_error
+		      ELSE excluded.last_error END`, hold)
+	assignments["runtime"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          jsonb_build_object('recorded_uid', discovery_sources.cluster_uid,
+		                             'reported_uid', excluded.cluster_uid,
+		                             'last_seen_at', now()))
+		      WHEN `+held+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          discovery_sources.runtime->'cluster_uid_conflict')
+		      ELSE excluded.runtime END`, hold)
 	// last_sync_at means "last did useful work", which a heartbeat is not — an idle
 	// cluster heartbeats without producing sightings. Only advance it when the
 	// agent says it actually reported something.
