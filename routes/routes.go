@@ -1673,6 +1673,12 @@ func SetupRoutes(
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.
 			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
+			// Phase 3 enforcement binding (SPEC-iga-phase3-policy.md §7.9,
+			// T3.09): the separate, customer-consented enforcement stack of a
+			// connected account. Behind the IGA_POLICY gate, with
+			// discovery:read to read and governance:enforce to change.
+			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
+				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
 
 			// IAM identity discovery: the foundation every later AWS surface
 			// resolves against. Writes cloud_identity and cloud_secret and
