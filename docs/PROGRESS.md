@@ -4,6 +4,57 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-07 (cont.) — Data layer, auth P0/P1 remainders, IGA reads
+
+Same branch (`fix/p0-containment`), nothing pushed.
+
+### Done
+- **Scoped layer:**
+  - Legacy CIBA, device codes, TOTP devices, and the workspace-plane devices, CIBA and TOTP repositories (`b8cf865`, `4a4c2a2`, `5489e6f`, `84b80ac`).
+  - The unused `EndUserRepository` was deleted (`143f93d`).
+  - IGA graph and Kubernetes graph reads take the workspace from the tenant context and run under RLS (`28c92ca`, `b940571`).
+  - Ratchet 464 → 445.
+- **Auth and security:**
+  - AS-014 (`fa5a39c`)
+  - AS-044 and AS-015 (`53e8b81`)
+  - AS-018 (`09a8bff`)
+  - AS-025 (`21396a2`)
+  - AS-038 (`f77562e`)
+  - AS-064 (`ea07bb1`)
+  - AS-083 (`e7ead9d`)
+  - AS-095 (`6a243ce`)
+- **Fixes found while merging:**
+  - A `//` TENANT-EXEMPT note inside a SQL string broke admin sign-up (`6b5a98a`).
+  - The IGA FK catalog test now covers 047's `cloud_*` workspace keys (`2bd9077`).
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding, flagsoff and igagraph suites pass.
+- The ratchet is at 445 against a baseline of 446.
+- Migrations 066–068 were applied twice to a clone of the scratch DB: they apply cleanly and are idempotent.
+- `001_bootstrap.sql` applies to an empty DB and reaches the same end state.
+
+### Release notes (deploy)
+- **Migrations:**
+  - 066 adds `workspace_ciba_auth_requests.resource_server_id`.
+  - 067 adds `discovery_collector_tokens`.
+  - 068 adds `otp_entries.workspace_id` and `purpose`.
+- **Discovery collectors:** collectors without an actuation token stop reporting. To keep them reporting, do one of these:
+  - mint a collector token (`POST /authsec/discovery/collector-tokens`) and set it as `controlPlane.sourceToken`;
+  - set `DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS=true`.
+- **CIBA:** workspace CIBA needs HTTP Basic client authentication. `CIBA_ALLOW_UNAUTHENTICATED_CLIENTS=true` is a temporary opt-out.
+- **Registration:** `POST /uflow/user/register` now only starts registration. The account is created by `/user/register/complete` with the emailed OTP.
+- **OTP codes:** codes issued before the upgrade no longer verify. Users request a new one.
+- **Host checks:** Host, Origin and `X-Forwarded-Host` count only for allow-listed hosts. Set `CORS_ALLOW_ORIGIN`, `BASE_URL` and `TRUSTED_PROXIES` correctly.
+
+### Still open
+- AS-015: retire legacy `/uflow/auth/ciba` (the Python SDK has no client secret).
+- AS-060, 065, 076, 078, 079, 080, 081, 094, 097.
+- The ratchet's remaining 445 raw statements.
+- UI-033, OPS-001, ENV-001.
+
+---
+
 ## 2026-10-07 — Voice tables, row-level security, remaining areas and P2/P3
 
 **Owner asked for:** build the voice-auth tables; switch on RLS; move the remaining areas onto the scoped layer and work through P2/P3. Committed locally on `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI, stacked on `fix/ui-integrations`); nothing pushed.
