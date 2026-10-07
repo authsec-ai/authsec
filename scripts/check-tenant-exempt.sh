@@ -29,11 +29,19 @@ for pkg in "${rls_only[@]}"; do
 done
 rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
 
+# The legacy embedded SPIRE control plane is quarantined: mounted only with
+# ENABLE_EMBEDDED_SPIRE, which startup refuses in production and staging, and
+# its spire_* control-plane tables carry no workspace_id to scope by (AS-081).
+# Fix or remove it before it is ever enabled; until then it is not counted.
+quarantined_re='^internal/spire/'
+
+
 count=$(git ls-files '*.go' \
   | grep -v '_test\.go$' \
   | grep -v '^internal/tenancy/' \
   | grep -v '^tests/' \
   | grep -vE "$rls_only_re" \
+  | grep -vE "$quarantined_re" \
   | xargs awk '
       FNR == 1 { h1 = h2 = h3 = "" }
       {
