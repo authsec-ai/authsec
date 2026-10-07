@@ -32,7 +32,8 @@ const (
 // D24: an uncollected form of a REMOVED namespace is a bundle gap (§2.11's
 // example); the compiler's first-attachment `unanalysed` set (acceptance
 // kind unanalysed_form) may name the same form, and the compiler must not
-// ask for both.
+// ask for both: ProveFirstAttachment leaves a form that is already a gap out
+// of the unanalysed set and lists it under covered_by_gaps.
 const (
 	GapResourcePolicyCoverage = "resource_policy_coverage"
 	GapUnanalysedForm         = "unanalysed_form"
