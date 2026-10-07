@@ -1,14 +1,17 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -162,7 +165,9 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 			"is not evidence of deletion; rows were projected but none retired"
 	}
 
-	err := m.db.Transaction(func(tx *gorm.DB) error {
+	// The whole projection runs under row-level security for the workspace.
+	rlsCtx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(rlsCtx, m.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var ref *sweepRef
 		if sourceID != uuid.Nil {
 			r, err := m.openSweep(tx, workspaceID, sourceID, cluster, snap, observed)
@@ -999,7 +1004,9 @@ func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint stri
 	sourceID := m.resolveSource(workspaceID, probe, cluster)
 	observed := time.Now().UTC().Truncate(time.Microsecond)
 
-	return m.db.Transaction(func(tx *gorm.DB) error {
+	// The whole projection runs under row-level security for the workspace.
+	rlsCtx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	return tenancy.RLSTransaction(rlsCtx, m.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, fingerprint)
 		if err != nil {
 			return fmt.Errorf("load sighting: %w", err)
@@ -1146,16 +1153,20 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 		// Their support ends with them, from every source: "gone" is the
 		// workspace's inventory speaking, not one agent's view. Support left
 		// current on a retired row would list a dead workload as confirmed.
-		if err := tx.Exec(`
+		ctx, q, err := txTenant(tx, workspaceID)
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_object_support
-			   SET state = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND state <> ?
+			   SET state = $2, ended_reason = $3
+			 WHERE workspace_id = $1 AND state <> $2
 			   AND workload_id IN (
 			         SELECT id FROM iga_workload
-			          WHERE workspace_id = ? AND provider = ?
-			            AND source_key IN ? AND lifecycle = ?)`,
-			models.RelEnded, models.EndedNotSeen, workspaceID, models.RelEnded,
-			workspaceID, models.ProviderK8s, dead, models.IGALifecycleRetired).Error; err != nil {
+			          WHERE workspace_id = $1 AND provider = $4
+			            AND source_key = ANY($5) AND lifecycle = $6)`,
+			models.RelEnded, models.EndedNotSeen,
+			models.ProviderK8s, pq.Array(dead), models.IGALifecycleRetired); err != nil {
 			return nil, 0, fmt.Errorf("end gone workload support: %w", err)
 		}
 	}
@@ -1251,25 +1262,41 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 func (m *k8sRBACManager) rekeyWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 	ws []k8sgraph.Workload, observed time.Time) error {
 
+	ctx, q, err := txTenant(tx, workspaceID)
+	if err != nil {
+		return err
+	}
 	for _, w := range ws {
 		if w.LegacyKey == "" || w.LegacyKey == w.SourceKey {
 			continue
 		}
 		var moved []struct{ ID uuid.UUID }
-		if err := tx.Raw(`
+		rows, err := tenancy.QueryContext(ctx, q, `
 			UPDATE iga_workload o
-			   SET source_key = ?, updated_at = ?
-			 WHERE o.workspace_id = ? AND o.provider = ?
-			   AND o.source_key = ? AND o.lifecycle <> ?
-			   AND o.provider_attrs->>'fingerprint' = ?
+			   SET source_key = $2, updated_at = $3
+			 WHERE o.workspace_id = $1 AND o.provider = $4
+			   AND o.source_key = $5 AND o.lifecycle <> $6
+			   AND o.provider_attrs->>'fingerprint' = $7
 			   AND NOT EXISTS (
 			         SELECT 1 FROM iga_workload n
 			          WHERE n.workspace_id = o.workspace_id
-			            AND n.source_key = ? AND n.lifecycle <> ?)
+			            AND n.source_key = $2 AND n.lifecycle <> $6)
 			RETURNING o.id`,
-			w.SourceKey, observed, workspaceID, models.ProviderK8s,
-			w.LegacyKey, models.IGALifecycleRetired, w.Fingerprint,
-			w.SourceKey, models.IGALifecycleRetired).Scan(&moved).Error; err != nil {
+			w.SourceKey, observed, models.ProviderK8s,
+			w.LegacyKey, models.IGALifecycleRetired, w.Fingerprint)
+		if err != nil {
+			return fmt.Errorf("re-key workload %s: %w", w.SourceKey, err)
+		}
+		for rows.Next() {
+			var mv struct{ ID uuid.UUID }
+			if err := rows.Scan(&mv.ID); err != nil {
+				rows.Close()
+				return fmt.Errorf("re-key workload %s: %w", w.SourceKey, err)
+			}
+			moved = append(moved, mv)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return fmt.Errorf("re-key workload %s: %w", w.SourceKey, err)
 		}
 
@@ -1328,22 +1355,39 @@ const legacyExecutesAsTarget = "workload"
 func (m *k8sRBACManager) adoptUnreconciled(tx *gorm.DB, workspaceID uuid.UUID,
 	cluster string, ref *sweepRef, observed time.Time) error {
 
-	var wls []struct {
+	type unsupported struct {
 		ID        uuid.UUID
 		Namespace string
 	}
-	if err := tx.Raw(`
+	var wls []unsupported
+	ctx, q, err := txTenant(tx, workspaceID)
+	if err != nil {
+		return err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `
 		SELECT w.id, COALESCE(w.provider_attrs->>'namespace', '') AS namespace
 		  FROM iga_workload w
-		 WHERE w.workspace_id = ? AND w.provider = ? AND w.lifecycle = ?
-		   AND w.provider_attrs->>'cluster' = ?
+		 WHERE w.workspace_id = $1 AND w.provider = $2 AND w.lifecycle = $3
+		   AND w.provider_attrs->>'cluster' = $4
 		   AND NOT EXISTS (
 		         SELECT 1 FROM iga_object_support s
 		          WHERE s.workspace_id = w.workspace_id
 		            AND s.workload_id = w.id
-		            AND s.discovery_source_id = ?)`,
-		workspaceID, models.ProviderK8s, models.IGALifecycleActive, cluster, ref.SourceID).
-		Scan(&wls).Error; err != nil {
+		            AND s.discovery_source_id = $5)`,
+		models.ProviderK8s, models.IGALifecycleActive, cluster, ref.SourceID)
+	if err != nil {
+		return fmt.Errorf("find unsupported workloads: %w", err)
+	}
+	for rows.Next() {
+		var w unsupported
+		if err := rows.Scan(&w.ID, &w.Namespace); err != nil {
+			rows.Close()
+			return fmt.Errorf("find unsupported workloads: %w", err)
+		}
+		wls = append(wls, w)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return fmt.Errorf("find unsupported workloads: %w", err)
 	}
 	for _, w := range wls {

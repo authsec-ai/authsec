@@ -1,9 +1,11 @@
 package k8sgraph
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -220,7 +222,10 @@ func (rc *Reconciler) reconcileExecutesAs(tx *gorm.DB, in ReconcileInput, part P
 // still supports it. One agent going blind marks its own support stale and
 // changes nothing else.
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.Time) (int, error) {
-	ws := in.WorkspaceID
+	ctx, q, err := txTenant(tx, in.WorkspaceID)
+	if err != nil {
+		return 0, err
+	}
 	total := 0
 
 	// The four node tables a Kubernetes sweep owns, with the column that
@@ -241,37 +246,38 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 		{"iga_entitlements", "entitlement_id", models.EndedStatementRetired, false},
 		{"iga_workload", "workload_id", models.EndedSubjectRetired, true},
 	} {
-		ever := ""
-		if t.everSupported {
-			ever = `
-			   AND EXISTS (
-			         SELECT 1 FROM iga_object_support s
-			          WHERE s.workspace_id = o.workspace_id
-			            AND s.` + t.supportCol + ` = o.id)`
-		}
 		// Retire every live k8s node of this class with no surviving support.
 		// NOT EXISTS over non-ended support is the multi-source rule (§2.10B)
 		// stated once, in SQL, rather than counted in Go where a miscount
-		// deletes a customer's graph.
-		r := tx.Exec(`
+		// deletes a customer's graph. $7 is everSupported: when set, only a
+		// row that has had support at all is retired.
+		r, err := tenancy.ExecContext(ctx, q, `
 			UPDATE `+t.table+` o
-			   SET lifecycle = ?, retired_reason = ?
-			 WHERE o.workspace_id = ?
-			   AND o.provider = ?
-			   AND o.lifecycle = ?
+			   SET lifecycle = $2, retired_reason = $3
+			 WHERE o.workspace_id = $1
+			   AND o.provider = $4
+			   AND o.lifecycle = $5
 			   AND NOT EXISTS (
 			         SELECT 1 FROM iga_object_support s
 			          WHERE s.workspace_id = o.workspace_id
 			            AND s.`+t.supportCol+` = o.id
-			            AND s.state <> ?)`+ever,
+			            AND s.state <> $6)
+			   AND (NOT $7::boolean OR EXISTS (
+			         SELECT 1 FROM iga_object_support s
+			          WHERE s.workspace_id = o.workspace_id
+			            AND s.`+t.supportCol+` = o.id))`,
 			models.IGALifecycleRetired, models.RetiredUnsupported,
-			ws, models.ProviderK8s, models.IGALifecycleActive, models.RelEnded)
-		if r.Error != nil {
-			return total, fmt.Errorf("retire %s: %w", t.table, r.Error)
+			models.ProviderK8s, models.IGALifecycleActive, models.RelEnded, t.everSupported)
+		if err != nil {
+			return total, fmt.Errorf("retire %s: %w", t.table, err)
 		}
-		total += int(r.RowsAffected)
+		n, err := r.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("retire %s: %w", t.table, err)
+		}
+		total += int(n)
 
-		if err := rc.cascade(tx, ws, t.table, t.supportCol, t.endReason, at); err != nil {
+		if err := rc.cascade(ctx, q, t.table, t.supportCol, t.endReason, at); err != nil {
 			return total, err
 		}
 	}
@@ -284,20 +290,21 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 // because a node may have been retired by an earlier sweep whose cascade failed
 // -- and an edge left current under a retired node is a path the console will
 // happily draw.
-func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, table, supportCol, reason string, at time.Time) error {
-	retired := `SELECT id FROM ` + table + `
-	             WHERE workspace_id = ? AND provider = ? AND lifecycle = ?`
-
+//
+// Every statement binds $1 to the workspace, $2-$4 to the end it writes, and
+// $5/$6 to the retired-node set (provider, lifecycle).
+func (rc *Reconciler) cascade(ctx context.Context, q tenancy.Querier, table, supportCol, reason string, at time.Time) error {
 	// A retired workload no longer runs as anything. Its executes_as edges are
 	// the only edges hanging off it, and they live in iga_relationship.
 	if supportCol == "workload_id" {
-		if err := tx.Exec(`
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_relationship
-			   SET state = ?, valid_to = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND relationship_type = ? AND state <> ?
-			   AND source_workload_id IN (`+retired+`)`,
-			models.RelEnded, at, reason, ws, models.RelTypeExecutesAs, models.RelEnded,
-			ws, models.ProviderK8s, models.IGALifecycleRetired).Error; err != nil {
+			   SET state = $2, valid_to = $3, ended_reason = $4
+			 WHERE workspace_id = $1 AND relationship_type = $7 AND state <> $2
+			   AND source_workload_id IN (SELECT id FROM `+table+`
+			                               WHERE workspace_id = $1 AND provider = $5 AND lifecycle = $6)`,
+			models.RelEnded, at, reason, models.ProviderK8s, models.IGALifecycleRetired,
+			models.RelTypeExecutesAs); err != nil {
 			return fmt.Errorf("cascade executes_as from %s: %w", table, err)
 		}
 		return nil
@@ -315,41 +322,55 @@ func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, table, supportCol, reas
 	}
 
 	if assignCol != "" {
-		if err := tx.Exec(`
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_policy_assignment
-			   SET state = ?, valid_to = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND state <> ?
-			   AND `+assignCol+` IN (`+retired+`)`,
-			models.RelEnded, at, reason, ws, models.RelEnded,
-			ws, models.ProviderK8s, models.IGALifecycleRetired).Error; err != nil {
+			   SET state = $2, valid_to = $3, ended_reason = $4
+			 WHERE workspace_id = $1 AND state <> $2
+			   AND `+assignCol+` IN (SELECT id FROM `+table+`
+			                          WHERE workspace_id = $1 AND provider = $5 AND lifecycle = $6)`,
+			models.RelEnded, at, reason, models.ProviderK8s, models.IGALifecycleRetired); err != nil {
 			return fmt.Errorf("cascade assignments from %s: %w", table, err)
 		}
 
 		// A grant hangs off its assignment, so ending the assignment must end
 		// the grant too -- otherwise the path survives its own authorization.
-		if err := tx.Exec(`
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_access_edges
-			   SET state = ?, valid_to = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND provider = ? AND state <> ?
+			   SET state = $2, valid_to = $3, ended_reason = $4
+			 WHERE workspace_id = $1 AND provider = $5 AND state <> $2
 			   AND assignment_id IN (
 			         SELECT id FROM iga_policy_assignment
-			          WHERE workspace_id = ? AND state = ?)`,
-			models.RelEnded, at, reason, ws, models.ProviderK8s, models.RelEnded,
-			ws, models.RelEnded).Error; err != nil {
+			          WHERE workspace_id = $1 AND state = $2)`,
+			models.RelEnded, at, reason, models.ProviderK8s); err != nil {
 			return fmt.Errorf("cascade grants via assignment from %s: %w", table, err)
 		}
 	}
 
 	if edgeCol != "" {
-		if err := tx.Exec(`
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_access_edges
-			   SET state = ?, valid_to = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND provider = ? AND state <> ?
-			   AND `+edgeCol+` IN (`+retired+`)`,
-			models.RelEnded, at, reason, ws, models.ProviderK8s, models.RelEnded,
-			ws, models.ProviderK8s, models.IGALifecycleRetired).Error; err != nil {
+			   SET state = $2, valid_to = $3, ended_reason = $4
+			 WHERE workspace_id = $1 AND provider = $5 AND state <> $2
+			   AND `+edgeCol+` IN (SELECT id FROM `+table+`
+			                        WHERE workspace_id = $1 AND provider = $5 AND lifecycle = $6)`,
+			models.RelEnded, at, reason, models.ProviderK8s, models.IGALifecycleRetired); err != nil {
 			return fmt.Errorf("cascade grants from %s: %w", table, err)
 		}
 	}
 	return nil
+}
+
+// txTenant returns ws as the tenant context, on tx's own context, and tx's
+// connection, so the raw statements of the caller's transaction run through
+// the tenancy layer: workspace_id = $1 is bound to ws. A context already
+// carrying another workspace is refused rather than overridden.
+func txTenant(tx *gorm.DB, ws uuid.UUID) (context.Context, tenancy.Querier, error) {
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, nil, fmt.Errorf("tenancy: a transaction of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), tx.Statement.ConnPool, nil
 }
