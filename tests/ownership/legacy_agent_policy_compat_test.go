@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -256,40 +257,46 @@ func TestLegacyCompatListPagesTheWorkspacesPoliciesWithTheirState(t *testing.T) 
 	l := newCompatLab(t)
 	before := tableState(t, l.raw)
 
-	// Page through with limit=2: every policy of A once, newest first, the
-	// created_at tie broken by id, and none of B's.
-	var got []services.LegacyAgentPolicyView
-	path := compatBase + "?limit=2"
-	for pages := 0; ; pages++ {
-		if pages > 5 {
-			t.Fatal("paging did not terminate")
-		}
-		rec := l.do(t, http.MethodGet, path, l.ws, nil)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
-		}
-		page := decode[compatList](t, rec)
-		if page.Meta.Limit != 2 || page.Meta.LegacyWorkers != "on" || len(page.Data) > 2 {
-			t.Fatalf("meta/page size wrong: %+v (%d rows)", page.Meta, len(page.Data))
-		}
-		got = append(got, page.Data...)
-		if page.Meta.NextCursor == nil {
-			break
-		}
-		path = compatBase + "?limit=2&cursor=" + *page.Meta.NextCursor
-	}
-	// Expected order: created_at DESC, id DESC.
+	// Page through: every policy of A once, newest first, the created_at tie
+	// broken by id, and none of B's. limit=1 and 3 put a page boundary INSIDE
+	// the tie (pSel/pEvict share created_at), which is where a keyset without
+	// the id loses or repeats a row.
 	tie := []uuid.UUID{l.pSel, l.pEvict}
 	if strings.Compare(tie[0].String(), tie[1].String()) < 0 {
 		tie[0], tie[1] = tie[1], tie[0]
 	}
 	want := []uuid.UUID{l.pOffEv, l.pOff, tie[0], tie[1], l.pDirect}
-	if len(got) != len(want) {
-		t.Fatalf("want %d policies across the pages, got %d", len(want), len(got))
-	}
-	for i := range want {
-		if got[i].ID != want[i] {
-			t.Errorf("row %d: got %s (%s), want %s", i, got[i].ID, got[i].Name, want[i])
+	var got []services.LegacyAgentPolicyView
+	for _, limit := range []string{"1", "2", "3"} {
+		got = nil
+		path := compatBase + "?limit=" + limit
+		for pages := 0; ; pages++ {
+			if pages > 6 {
+				t.Fatalf("limit=%s: paging did not terminate", limit)
+			}
+			rec := l.do(t, http.MethodGet, path, l.ws, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+			}
+			page := decode[compatList](t, rec)
+			if strconv.Itoa(page.Meta.Limit) != limit || page.Meta.LegacyWorkers != "on" ||
+				len(page.Data) > page.Meta.Limit {
+				t.Fatalf("meta/page size wrong: %+v (%d rows)", page.Meta, len(page.Data))
+			}
+			got = append(got, page.Data...)
+			if page.Meta.NextCursor == nil {
+				break
+			}
+			path = compatBase + "?limit=" + limit + "&cursor=" + *page.Meta.NextCursor
+		}
+		// Expected order: created_at DESC, id DESC.
+		if len(got) != len(want) {
+			t.Fatalf("limit=%s: want %d policies across the pages, got %d", limit, len(want), len(got))
+		}
+		for i := range want {
+			if got[i].ID != want[i] {
+				t.Errorf("limit=%s row %d: got %s (%s), want %s", limit, i, got[i].ID, got[i].Name, want[i])
+			}
 		}
 	}
 
