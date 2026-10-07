@@ -66,6 +66,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.78.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.63.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol v1.65.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.65.0 // indirect
@@ -79,7 +80,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.61.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.107.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/s3control v1.79.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.7.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sns v1.47.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.35.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.40.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

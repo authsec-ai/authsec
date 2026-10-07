@@ -54,14 +54,40 @@ var CloudFormationTemplate string
 // optional CallbackTopicArn / Custom::AuthSecRegistration callback was added.
 // Role permissions are unchanged by that bump. The AuthSecRegistration
 // resource also carries the version, as a property.
-const TemplateVersion = "2026-09-24"
+//
+// Bumped for IGA Phase 3 (T3.03b, 2026-10-07): the ResourcePolicies statement
+// lists the enumerate and read actions of every collected policy-bearing form
+// (SPEC-iga-phase3-policy.md §3.9), and a MigrationEvidence statement adds the
+// read-only ECS / Lambda / Auto Scaling / EC2 reads of §11. Both explicit,
+// never assumed covered by SecurityAudit. Stacks on an older version keep
+// working: their resource-policy coverage is recorded not_collected
+// ("discovery template update needed") and nothing else changes.
+const TemplateVersion = "2026-10-07"
 
 // PermissionsVersion is the oldest template version that grants every
 // permission this build reads with: the last bump that changed the role's
 // permissions. A bump that changes only the template's plumbing (2026-09-24,
 // the Quick Create callback) leaves it where it is, so existing stacks are not
-// reported outdated for permissions they already hold.
-const PermissionsVersion = "2026-09-23"
+// reported outdated for permissions they already hold. 2026-10-07 changed the
+// role's permissions (ResourcePolicyTemplateVersion), so it moves with it.
+const PermissionsVersion = ResourcePolicyTemplateVersion
+
+// ResourcePolicyTemplateVersion is the oldest template version that grants
+// resource-policy collection (§3.9) and the migration-evidence reads (§11). A
+// connector whose recorded template is older -- or not recorded at all -- has
+// every collected form recorded not_collected and is offered no isolation
+// (migration_evidence_unavailable), with the template update as the remedy.
+const ResourcePolicyTemplateVersion = "2026-10-07"
+
+// GrantsResourcePolicyCollection reports whether a connector's recorded
+// template version grants §3.9's collection. Versions are dates (YYYY-MM-DD),
+// so string order is date order. An empty value is a connector of unknown
+// vintage: not proven, so false (DECISION T3.03b-5: a proof that a role's
+// first boundary cuts off no resource-policy route must never rest on a grant
+// nobody recorded).
+func GrantsResourcePolicyCollection(recorded string) bool {
+	return recorded != "" && recorded >= ResourcePolicyTemplateVersion
+}
 
 // TemplateOutdated reports whether a connector's recorded template version is
 // older than the permissions this build needs -- a FACT about the two versions, never

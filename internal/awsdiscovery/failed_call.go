@@ -120,6 +120,12 @@ var iamPrefixBySDKService = map[string]string{
 	"CloudTrail":                "cloudtrail",
 	"S3":                        "s3",
 	"KMS":                       "kms",
+	// Phase 3 resource-policy collection and migration evidence (T3.03b).
+	"S3 Control":      "s3",
+	"SQS":             "sqs",
+	"SNS":             "sns",
+	"Secrets Manager": "secretsmanager",
+	"Auto Scaling":    "autoscaling",
 }
 
 func apiName(service, operation string) string {
