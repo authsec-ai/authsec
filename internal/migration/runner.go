@@ -224,6 +224,7 @@ func (mr *MigrationRunner) executeSQLContent(content string) error {
 // Using both version and name prevents two files with the same numeric prefix (e.g. from different
 // subdirectories) from incorrectly skipping each other.
 func (mr *MigrationRunner) isMigrationExecuted(version int, name string) bool {
+	// TENANT-EXEMPT: migration_logs is platform state (workspace_id IS NULL rows)
 	query := `SELECT COUNT(*) FROM migration_logs WHERE version = $1 AND name = $2 AND db_type = $3 AND success = true`
 	args := []interface{}{version, name, mr.dbType}
 
@@ -253,6 +254,7 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 	}
 
 	// Fallback without GORM: write directly via raw SQL.
+	// TENANT-EXEMPT: migration_logs is platform state (workspace_id NULL)
 	_, err := mr.db.Exec(
 		`INSERT INTO migration_logs (id, version, name, executed_at, success, error_msg, db_type, workspace_id, execution_ms)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)`,
@@ -271,6 +273,7 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 	}
 
 	queryDB := mr.db
+	// TENANT-EXEMPT: migration_logs is platform state (workspace_id IS NULL rows)
 	baseQuery := `SELECT version, executed_at FROM migration_logs WHERE db_type = $1 AND success = true AND workspace_id IS NULL`
 	args := []interface{}{mr.dbType}
 

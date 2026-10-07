@@ -73,6 +73,7 @@ func Issue(db *sql.DB, realm string, workspaceID, userID uuid.UUID, email, first
 		return "", err
 	}
 	value := base64.RawURLEncoding.EncodeToString(raw)
+	// TENANT-EXEMPT: pre-session; the ticket records the workspace the first factor verified
 	_, err := db.Exec(`
 		INSERT INTO login_tickets (ticket_hash, realm, workspace_id, user_id, email, first_factor, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -109,6 +110,7 @@ func Lookup(db *sql.DB, value string) (*Ticket, error) {
 
 // MarkMFAVerified records that a second factor was verified for the ticket.
 func MarkMFAVerified(db *sql.DB, value string) error {
+	// TENANT-EXEMPT: pre-session lookup by the random ticket's hash
 	res, err := db.Exec(`
 		UPDATE login_tickets SET mfa_verified_at = now()
 		 WHERE ticket_hash = $1 AND consumed_at IS NULL AND expires_at > now()`, hash(value))
@@ -129,6 +131,7 @@ func ConsumeVerified(db *sql.DB, value, realm string) (*Ticket, error) {
 	}
 	t := &Ticket{}
 	var mfa sql.NullTime
+	// TENANT-EXEMPT: pre-session lookup by the random ticket's hash
 	err := db.QueryRow(`
 		UPDATE login_tickets SET consumed_at = now()
 		 WHERE ticket_hash = $1 AND realm = $2 AND consumed_at IS NULL

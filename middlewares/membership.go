@@ -32,12 +32,12 @@ func principalActiveInWorkspace(workspaceID, userID string) (ok bool, checked bo
 	// user's home workspace); otherwise only the home workspace is allowed.
 	err := conn.DB.QueryRow(`
 		SELECT EXISTS (
-		  SELECT 1 FROM users u
+		  SELECT 1 FROM users u -- TENANT-EXEMPT: an operator's user row is in its home workspace
 		   WHERE u.id = $2 AND COALESCE(u.active, true) AND u.deleted_at IS NULL
 		     AND CASE
-		           WHEN EXISTS (SELECT 1 FROM workspace_memberships m
+		           WHEN EXISTS (SELECT 1 FROM workspace_memberships m -- TENANT-EXEMPT: bound to $1 below; this check establishes the tenant context
 		                         WHERE m.workspace_id = $1 AND m.user_id = $2)
-		           THEN EXISTS (SELECT 1 FROM workspace_memberships m
+		           THEN EXISTS (SELECT 1 FROM workspace_memberships m -- TENANT-EXEMPT: bound to $1 below
 		                         WHERE m.workspace_id = $1 AND m.user_id = $2 AND m.status = 'active')
 		           ELSE u.workspace_id = $1
 		         END)`,
