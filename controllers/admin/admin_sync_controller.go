@@ -452,13 +452,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(ctx context.Context, adUser m
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
-		// Write workspace_memberships for the synced user.
-		var memberRoleID uuid.UUID
-		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
-			config.DB.Exec(`INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
-				VALUES (?, ?, ?, ?, 'active', 'ad', NOW(), NOW()) ON CONFLICT (workspace_id, user_id) DO NOTHING`,
-				uuid.New(), workspaceID, newUser.ID, memberRoleID)
-		}
+		addSyncedMembership(ctx, db.DB, newUser.ID)
 
 		log.Printf("Created new AD admin user: %s (%s)", adUser.Email, adUser.ObjectGUID)
 		return true, nil
@@ -638,13 +632,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(ctx context.Context, entra
 			return false, fmt.Errorf("failed to create admin user: %w", err)
 		}
 
-		// Write workspace_memberships for the synced user.
-		var memberRoleID uuid.UUID
-		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
-			config.DB.Exec(`INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
-				VALUES (?, ?, ?, ?, 'active', 'entra', NOW(), NOW()) ON CONFLICT (workspace_id, user_id) DO NOTHING`,
-				uuid.New(), workspaceID, newUser.ID, memberRoleID)
-		}
+		addSyncedMembership(ctx, db.DB, newUser.ID)
 
 		log.Printf("Created new Entra ID admin user: %s (%s)", entraUser.Mail, entraUser.ID)
 		return true, nil
@@ -682,6 +670,26 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(ctx context.Context, entra
 
 	log.Printf("Updated existing Entra ID admin user: %s (%s)", entraUser.Mail, entraUser.ID)
 	return false, nil
+}
+
+// addSyncedMembership gives a newly synced admin user a membership of the
+// caller's workspace with its "member" role, when the workspace has one. It
+// runs on the scoped layer under row-level security. The source is 'api'
+// (the admin's sync call): workspace_memberships_source_chk has no directory
+// sync value, and the 'ad' / 'entra' this wrote before were refused, so synced
+// admins never got a membership.
+func addSyncedMembership(ctx context.Context, db *sql.DB, userID uuid.UUID) {
+	_, err := tenancy.ExecContext(ctx, db, `
+		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'active', 'api', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND LOWER(r.name) = 'member'
+		 LIMIT 1
+		ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+		uuid.New(), userID)
+	if err != nil {
+		log.Printf("sync: membership for user %s not written: %v", userID, err)
+	}
 }
 
 // loadStoredADConfig loads AD configuration from database and decrypts credentials
