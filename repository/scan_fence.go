@@ -46,6 +46,7 @@ type ScanFence struct {
 //     and the write is refused.
 func assertScanFence(tx *gorm.DB, f ScanFence) error {
 	var one int
+	// TENANT-EXEMPT: an ownership check by the run's globally unique random id, lease owner and version; it returns no data, and the write it guards names its own workspace.
 	row := tx.Raw(
 		`SELECT 1 FROM cloud_scan_run
 		  WHERE id = ? AND lease_owner = ? AND lease_version = ?
@@ -126,6 +127,7 @@ func MigrationHead(db *gorm.DB) (int, error) {
 		return 0, nil
 	}
 	var head *int
+	// TENANT-EXEMPT: migration_logs is platform state (the schema version), not a workspace's.
 	if err := db.Raw(
 		`SELECT max(version) FROM migration_logs WHERE db_type = 'master' AND success = true`,
 	).Scan(&head).Error; err != nil {
@@ -153,6 +155,7 @@ func HasRelation(db *gorm.DB, name string) (bool, error) {
 // but incomplete migration is invisible to a relation check (§9).
 func HasColumn(db *gorm.DB, table, column string) (bool, error) {
 	var n int64
+	// TENANT-EXEMPT: Postgres catalog (information_schema), a schema precondition check.
 	err := db.Raw(`SELECT count(*) FROM information_schema.columns
 	               WHERE table_schema = 'public' AND table_name = ? AND column_name = ?`,
 		table, column).Scan(&n).Error
