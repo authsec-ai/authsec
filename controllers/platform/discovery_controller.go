@@ -136,8 +136,10 @@ type ResyncManifestRequest struct {
 	DiscoverySourceID *uuid.UUID `json:"discovery_source_id,omitempty"`
 	ClusterName       string     `json:"cluster" binding:"required"`
 	// ClusterUID is the kube-system namespace UID of the swept cluster.
-	// Optional; when it and the connection's recorded UID are both known and
-	// differ, the manifest is refused (409 cluster_uid_mismatch).
+	// When it and the connection's recorded UID are both known and differ,
+	// the manifest is refused (409 cluster_uid_mismatch). Omitted while the
+	// connection has recorded a UID, it is refused too (409
+	// cluster_uid_required) unless IGA_K8S_REQUIRE_CLUSTER_UID=false.
 	ClusterUID string `json:"cluster_uid,omitempty"`
 	ScanKind   string `json:"scan_kind,omitempty"`
 	// Complete is false when any LIST in the sweep failed. A partial manifest is
@@ -673,6 +675,13 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
 		return
 	}
+	if errors.Is(err, services.ErrClusterUIDRequired) {
+		// The connection recorded a cluster UID and this manifest states none:
+		// it cannot be shown to come from this cluster (IGA_K8S_REQUIRE_CLUSTER_UID).
+		// Refused; nothing was changed.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_required", "detail": err.Error()})
+		return
+	}
 	if err != nil {
 		discoveryError(c, err)
 		return
@@ -1026,6 +1035,12 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		// A different cluster installed under this one's name. Refused, not
 		// merged; nothing was written.
 		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
+	if errors.Is(err, services.ErrClusterUIDRequired) {
+		// The source recorded a cluster UID and this snapshot states none
+		// (IGA_K8S_REQUIRE_CLUSTER_UID). Refused; nothing was written.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_required", "detail": err.Error()})
 		return
 	}
 	if errors.Is(err, services.ErrSweepConflict) {

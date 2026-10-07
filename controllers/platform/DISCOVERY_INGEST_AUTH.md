@@ -132,6 +132,16 @@ A token stops working when any of these happens, and in every case its row is
   refuses it as well. Unbound (workspace) tokens are not affected by deleting a
   source.
 
+  Since migration `046_ingest_token_triggers.sql` the database enforces this
+  itself, so it also holds for a delete that does not go through the
+  application (raw SQL, or a pod still running code from before 044 during a
+  rollout): a `BEFORE DELETE` trigger on `discovery_sources` revokes the
+  source's tokens and marks them `source_bound` before the foreign key nulls
+  their source, and a `BEFORE INSERT OR UPDATE` trigger on
+  `discovery_ingest_tokens` sets `source_bound` on every token that has a
+  `discovery_source_id` (and never clears it once set), whatever the writer
+  said.
+
 In `enforce`, an agent whose token stopped working gets 401 until it is given a
 new one. Deleting the whole **workspace** deletes its tokens with it.
 
@@ -156,3 +166,55 @@ no gap:
 Both tokens work between steps 1 and 4. With expiry, start a rotation well
 before the old token's `expires_at`: once it passes, an agent still holding it
 is refused in `enforce`.
+
+## Cluster UID: `IGA_K8S_REQUIRE_CLUSTER_UID`
+
+A Kubernetes discovery source (connection) records the first cluster UID (the
+`kube-system` namespace UID) an agent reports for it, from a heartbeat or an
+RBAC snapshot, and never changes it. Data from a different UID is refused
+(`409 cluster_uid_mismatch`) and the connection shows `cluster_uid_conflict`.
+Only deleting and re-adding the connection re-binds it.
+
+Leaving the UID out used to skip that check. `IGA_K8S_REQUIRE_CLUSTER_UID`
+on the control plane closes that gap. Default (unset): **on**. Only a value
+that reads as false (`false`, `0`, `f`) turns it off; anything else, a typo
+included, leaves it on.
+
+Once a connection has a recorded UID, with the requirement on:
+
+| call without a cluster UID | result |
+|---|---|
+| `POST /rbac-snapshot` (`cluster_uid` empty or absent) | **409** `{"error":"cluster_uid_required","detail":...}`; nothing written |
+| `POST /resync-manifest` (`cluster_uid` empty or absent) | **409** `{"error":"cluster_uid_required","detail":...}`; nothing marked gone |
+| `POST /sightings` (no `metadata.cluster.uid`) | **accepted** and kept in the inventory, but **not projected** into the graph (not when reported, not by the cluster's next RBAC sweep) |
+| `POST /agent-registration` (heartbeat, `cluster_uid` empty) | **accepted** as liveness, as before; the recorded UID is kept |
+| `POST /lifecycle` | recorded as before (it carries no UID); its graph update follows the stored sighting, so it is not projected for a sighting that stated no UID |
+
+Each refusal flags the connection the same way a mismatch does:
+`last_status` is `cluster_uid_conflict`, `last_error` starts with
+`cluster_uid_required:`, and `runtime.cluster_uid_conflict` holds
+`{"recorded_uid": "<uid>", "reported_uid": "", "reason": "missing", "via": "RBAC snapshot" | "resync manifest" | "sighting"}`.
+The flag (for a mismatch too) is never cleared by a sighting, nor by a
+heartbeat that states no UID. A heartbeat from the recorded cluster UID clears
+it once 15 minutes have passed since the last refusal; an operator can also
+reset the connection's status.
+
+A connection that has **never** recorded a UID is not affected: an agent
+that cannot read the `kube-system` namespace (`cluster.readUID=false`, or the
+`<release>-cluster-uid` ClusterRole missing) keeps working exactly as before.
+What is refused is an agent that stops reporting a UID for a connection that
+has one. Causes, other than a forged payload:
+
+- an agent older than chart 0.4.1, or a sighting path that does not set
+  `metadata.cluster.uid`, reporting to a connection a newer agent or a sweep
+  already pinned;
+- `cluster.readUID` switched to `false` after the UID was recorded;
+- the agent's one-time UID read at startup failed (it logs `could not read
+  the kube-system namespace UID`). Restart the agent once the read works.
+
+The agent logs the refusal as `REFUSED by the control plane (409
+cluster_uid_required)`. To back out, set `IGA_K8S_REQUIRE_CLUSTER_UID=false`
+on the control plane: the setting is read on every call, but set it on the
+Deployment (and restart, so every replica and the next deploy agree). With it
+off, data without a UID is accepted and projected as before; a *different*
+UID is still refused.

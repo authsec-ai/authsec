@@ -219,7 +219,9 @@ func TestHardeningSweepRecordsClusterIdentity(t *testing.T) {
 }
 
 // Two clusters installed under one name: the second UID is refused and writes
-// nothing; a snapshot with no UID (an older agent) is still accepted.
+// nothing; a snapshot with no UID (an older agent) is refused too once the
+// source has recorded one (IGA_K8S_REQUIRE_CLUSTER_UID, default on), and
+// accepted as before with the requirement off.
 func TestHardeningSameNameDifferentClusterIsRejected(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
@@ -258,11 +260,21 @@ func TestHardeningSameNameDifferentClusterIsRejected(t *testing.T) {
 		t.Errorf("source cluster_uid = %q, want uid-first unchanged", got)
 	}
 
-	// No UID at all: accepted as before.
+	// No UID at all: refused while the UID is required, writing nothing;
+	// accepted as before with the requirement off.
 	legacy := snapshot(ws, src, true, true, true)
-	if _, err := mgr.Ingest(ws, legacy); err != nil {
-		t.Errorf("a snapshot with no cluster_uid was refused: %v", err)
+	if _, err := mgr.Ingest(ws, legacy); !errors.Is(err, services.ErrClusterUIDRequired) {
+		t.Errorf("a snapshot with no cluster_uid: err = %v, want ErrClusterUIDRequired", err)
 	}
+	if n := count(t, db, sweeps, ws); n != before {
+		t.Errorf("sweeps %d -> %d: a snapshot refused for its missing UID recorded a sweep", before, n)
+	}
+	t.Setenv(services.RequireClusterUIDEnv, "false")
+	legacy = snapshot(ws, src, true, true, true)
+	if _, err := mgr.Ingest(ws, legacy); err != nil {
+		t.Errorf("a snapshot with no cluster_uid was refused with the requirement off: %v", err)
+	}
+	t.Setenv(services.RequireClusterUIDEnv, "")
 	// The matching UID: accepted.
 	again := snapshot(ws, src, true, true, true)
 	again.ClusterUID = "uid-first"
