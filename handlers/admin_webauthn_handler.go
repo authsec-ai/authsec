@@ -23,6 +23,25 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
+// adminLoginWorkspace is the workspace of the subject RequireLoginSubject
+// admitted (login ticket or console session); empty if there is none.
+func adminLoginWorkspace(c *gin.Context) string {
+	if s, ok := middleware.GetLoginSubject(c); ok {
+		return s.WorkspaceID
+	}
+	return ""
+}
+
+// adminLoginUser finds the admin in the signed-in subject's workspace. An
+// email alone names a user in every workspace that has one (AS-078).
+func adminLoginUser(c *gin.Context, repo *repositories.ClientRepository, email string) (*sharedmodels.User, error) {
+	ws := adminLoginWorkspace(c)
+	if ws == "" {
+		return nil, fmt.Errorf("no signed-in workspace")
+	}
+	return repo.GetClientByEmailAndTenant(&email, &ws, nil)
+}
+
 // AdminWebAuthnHandler handles WebAuthn operations for admin users
 // Uses global database for all operations
 type AdminWebAuthnHandler struct {
@@ -325,7 +344,7 @@ func (h *AdminWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Get admin user by email
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -373,7 +392,7 @@ func (h *AdminWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Store session data
 	reqID := uuid.New().String()
-	challengeKey := buildChallengeKey("registration", req.Email, "admin") // Use "admin" as tenant
+	challengeKey := buildChallengeKey("registration", req.Email, adminLoginWorkspace(c))
 	if err := h.SessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginRegistration: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
@@ -426,7 +445,7 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 
 	// Get admin user
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: User not found - %v", reqID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -434,7 +453,7 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 
 	// Get session data
-	challengeKey := buildChallengeKey("registration", req.Email, "admin")
+	challengeKey := buildChallengeKey("registration", req.Email, adminLoginWorkspace(c))
 	sessionData, found := h.SessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishRegistration: No session found for key=%s", reqID, challengeKey)
@@ -629,7 +648,7 @@ func (h *AdminWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 
 	// Get admin user by email
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] BeginAuthentication: user not found email=%s err=%v", reqID, req.Email, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -683,7 +702,7 @@ func (h *AdminWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	}
 
 	// Save session data
-	challengeKey := buildChallengeKey("authentication", req.Email, "admin")
+	challengeKey := buildChallengeKey("authentication", req.Email, adminLoginWorkspace(c))
 	if err := h.SessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginAuthentication: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
@@ -729,7 +748,7 @@ func (h *AdminWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	}
 
 	// Load session
-	challengeKey := buildChallengeKey("authentication", req.Email, "admin")
+	challengeKey := buildChallengeKey("authentication", req.Email, adminLoginWorkspace(c))
 	sessionData, found := h.SessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishAuthentication: no session found for key=%s", reqID, challengeKey)
@@ -746,7 +765,7 @@ func (h *AdminWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 
 	// Load user from DB
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] FinishAuthentication: user lookup failed for email=%s: %v", reqID, req.Email, err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
