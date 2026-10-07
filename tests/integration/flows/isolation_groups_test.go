@@ -81,3 +81,28 @@ func Test_Isolation_GroupsOwnWorkspace(t *testing.T) {
 		t.Errorf("an admin's group view must list the workspace admins: %s", w.Body.String())
 	}
 }
+
+// The group-membership writes run on the scoped layer and still add the
+// workspace's own users to its own groups.
+func Test_Groups_AddMembersInOwnWorkspace(t *testing.T) {
+	a, _, da, _ := twoTenantsWithData(t)
+	env := testsupport.Get(t)
+	tok := a.AdminToken
+	aWS := a.WS.WorkspaceID.String()
+	admin := a.WS.AdminUserID
+
+	w := env.Do("POST", "/authsec/uflow/admin/groups/"+aWS+"/users/bulk",
+		map[string]interface{}{"group_id": da.GroupID.String(), "user_ids": []string{admin.String()}}, tok)
+	if w.Code >= 300 {
+		t.Fatalf("bulk add: %d %s", w.Code, w.Body.String())
+	}
+	assertCount(t, 1, "user_groups", "workspace_id = ? AND group_id = ? AND user_id = ?", a.WS.WorkspaceID, da.GroupID, admin)
+
+	mustExec(t, `DELETE FROM user_groups WHERE group_id = $1 AND user_id = $2`, da.GroupID, admin)
+	w = env.Do("POST", "/authsec/uflow/user/groups/users/add",
+		map[string]interface{}{"workspace_id": aWS, "user_id": admin.String(), "groups": []string{da.GroupName}}, tok)
+	if w.Code >= 300 {
+		t.Fatalf("add to groups: %d %s", w.Code, w.Body.String())
+	}
+	assertCount(t, 1, "user_groups", "workspace_id = ? AND group_id = ? AND user_id = ?", a.WS.WorkspaceID, da.GroupID, admin)
+}

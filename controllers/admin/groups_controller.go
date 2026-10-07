@@ -862,6 +862,19 @@ func AddUserDefinedGroups(db *gorm.DB, workspaceID uuid.UUID, groups []string) (
 	return createdGroups, nil
 }
 
+// addGroupMember adds a user to a group of the workspace bound to $1. The
+// group is read from the workspace, and the composite key refuses a user of
+// another workspace. Only ever passed to tenancy.GormExec.
+// TENANT-EXEMPT: the statement is run through tenancy.GormExec (workspace_id = $1)
+const addGroupMember = `INSERT INTO user_groups (workspace_id, user_id, group_id)
+	SELECT g.workspace_id, $2, g.id FROM groups g WHERE g.workspace_id = $1 AND g.id = $3
+	ON CONFLICT DO NOTHING`
+
+// wsContext is a context whose tenant is workspace ws.
+func wsContext(ws uuid.UUID) context.Context {
+	return tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
+}
+
 func MapGroupsToClient(db *gorm.DB, workspaceID uuid.UUID, clientID string, groups []string) error {
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {
@@ -885,10 +898,7 @@ func MapGroupsToClient(db *gorm.DB, workspaceID uuid.UUID, clientID string, grou
 	}
 
 	for _, group := range groupModels {
-		if err := db.Exec(
-			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			user.ID, group.ID, workspaceID,
-		).Error; err != nil {
+		if err := tenancy.GormExec(wsContext(workspaceID), db, addGroupMember, user.ID, group.ID).Error; err != nil {
 			return fmt.Errorf("failed to map group to user: %w", err)
 		}
 	}
@@ -974,10 +984,7 @@ func AddUserToGroups(db *gorm.DB, workspaceID uuid.UUID, userID string, groups [
 	}
 
 	for _, group := range groupModels {
-		if err := db.Exec(
-			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			user.ID, group.ID, workspaceID,
-		).Error; err != nil {
+		if err := tenancy.GormExec(wsContext(workspaceID), db, addGroupMember, user.ID, group.ID).Error; err != nil {
 			return fmt.Errorf("failed to add user to group: %w", err)
 		}
 	}
@@ -1180,13 +1187,10 @@ func AddUsersToGroupBulk(db *gorm.DB, workspaceID uuid.UUID, groupID uuid.UUID, 
 
 	return db.Transaction(func(tx *gorm.DB) error {
 		for _, userID := range ids {
-			if err := tx.Exec(
-				// user_groups has no created_at/updated_at and its key is
-				// (workspace_id, user_id, group_id); the old statement named
-				// both wrongly and always failed.
-				"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-				userID, groupID, workspaceID,
-			).Error; err != nil {
+			// user_groups has no created_at/updated_at and its key is
+			// (workspace_id, user_id, group_id); an older statement named both
+			// wrongly and always failed.
+			if err := tenancy.GormExec(wsContext(workspaceID), tx, addGroupMember, userID, groupID).Error; err != nil {
 				return fmt.Errorf("failed to add users to group: %w", err)
 			}
 		}

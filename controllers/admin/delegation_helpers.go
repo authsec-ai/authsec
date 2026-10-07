@@ -1,12 +1,16 @@
 package admin
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/google/uuid"
 )
 
 // getUserRoleNames queries role_bindings to get all distinct role names for a user in a tenant.
@@ -107,16 +111,18 @@ func validateClientActive(clientID, workspaceID string) error {
 
 	// resource_servers has no deleted_at: rows are hard-deleted and `active`
 	// marks a disabled agent (AS-045).
-	query := `
+	ws, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
+	}
+	var id string
+	if err := tenancy.QueryRowContext(tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws}), masterDB.DB, `
 		SELECT id FROM resource_servers
-		WHERE workspace_id::text = $1
+		WHERE workspace_id = $1
 		AND id::text = $2
 		AND application_type = 'ai_agent'
 		AND active = true
-		LIMIT 1
-	`
-	var id string
-	if err := masterDB.DB.QueryRow(query, workspaceID, clientID).Scan(&id); err != nil {
+		LIMIT 1`, []interface{}{clientID}, &id); err != nil {
 		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
 	}
 	return nil
@@ -182,22 +188,28 @@ func getTenantRoleNames(workspaceID string) ([]string, error) {
 		return nil, fmt.Errorf("master database not initialized")
 	}
 
-	query := `SELECT DISTINCT name FROM roles WHERE workspace_id::text = $1 ORDER BY name`
-	rows, err := masterDB.DB.Query(query, workspaceID)
+	ws, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return nil, fmt.Errorf("query tenant roles: %w", err)
+		return nil, fmt.Errorf("invalid workspace id: %w", err)
 	}
-	defer rows.Close()
-
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
 	var names []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return nil, fmt.Errorf("scan role: %w", err)
+	err = tenancy.WithTx(ctx, masterDB.DB, ws, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(ctx, tx, `SELECT DISTINCT name FROM roles WHERE workspace_id = $1 ORDER BY name`)
+		if err != nil {
+			return fmt.Errorf("query tenant roles: %w", err)
 		}
-		names = append(names, n)
-	}
-	return names, nil
+		defer rows.Close()
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				return fmt.Errorf("scan role: %w", err)
+			}
+			names = append(names, n)
+		}
+		return rows.Err()
+	})
+	return names, err
 }
 
 // getTenantPermissionStrings returns all distinct permission strings for a tenant.

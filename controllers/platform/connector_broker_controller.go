@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/connectoradapters"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
@@ -364,11 +365,13 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 
 	// Best-effort lifecycle: mark the SA recently seen (Agent 360) + the
 	// connection last-used.
+	// Both rows belong to the token's workspace (the broker's tenant context).
+	ctx := c.Request.Context()
 	if authCtx.Principal.SubjectType == tokens.SubjectTypeServiceAccount && authCtx.Principal.SubjectID != uuid.Nil {
-		ctl.db.Exec(`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, authCtx.Principal.SubjectID)
+		tenancy.GormExec(ctx, ctl.db, `UPDATE service_accounts SET last_seen_at = NOW() WHERE workspace_id = $1 AND id = $2`, authCtx.Principal.SubjectID)
 	}
 	if resolved.Connection != nil {
-		ctl.db.Exec(`UPDATE connector_connections SET last_used_at = NOW() WHERE id = ?`, resolved.Connection.ID)
+		tenancy.GormExec(ctx, ctl.db, `UPDATE connector_connections SET last_used_at = NOW() WHERE workspace_id = $1 AND id = $2`, resolved.Connection.ID)
 	}
 	return result, http.StatusOK, ""
 }
