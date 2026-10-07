@@ -21,7 +21,10 @@ Fixed by decision: the four primary destinations — **Connections**,
 **Discovery**, **Policy**, **Logs**. Secondary and detail screens are
 unrestricted. The legacy governance screens are **removed**, not hidden.
 New Policy functionality is outside this spec: it reserves the destination
-and fixes the preview boundary, nothing more.
+and fixes the preview boundary. The Policy views, the policy events in Logs
+and the replacements for four retired bookmarks are specified in
+[SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md) §9 and ship behind its
+`IGA_POLICY` gate.
 
 ## Summary
 
@@ -97,8 +100,8 @@ Enforcement queue (`/iga/enforcement`).
 |---|---|---|
 | **Connections** | `/iga/connections` | What is connected, is it reporting, is its data usable? |
 | **Discovery** | `/iga/discovery` | What has been found, and what can each thing do? |
-| **Policy** | `/iga/policy` | Reserved. Preview boundary only (below) |
-| **Logs** | `/iga/logs` | What happened, when, by whom — preview |
+| **Policy** | `/iga/policy` | Decide what discovered identities may do. Preview until Phase 3 R1a ships |
+| **Logs** | `/iga/logs` | What happened, when, by whom — preview; policy events real with Phase 3 R1a |
 
 "Connections" rather than "Accounts & clusters": it covers AWS accounts,
 GCP projects, Kubernetes clusters and GitHub organisations without
@@ -110,8 +113,8 @@ straining. The subtitle names them.
 |---|---|
 | Connections | Add connection (provider picker → provider setup: AWS Quick Create / role ARN, GCP, Kubernetes agent, GitHub); connection detail `/iga/connections/:id` with tabs Overview · Scans · Coverage · Scope; scan detail `/iga/connections/:id/scans/:runId`; scope editor (drawer); scan rules for a GitHub organisation (`/iga/connections/:id/rules`) |
 | Discovery | Workload detail `/iga/estate/:id` (Overview · Identities · Resources · Graph · Changes); identity detail `/iga/identities/:id`; resource detail `/iga/resources/:id`; external-principal detail `/iga/external-principals/:id`; sighting detail `/iga/sightings/:id`; the graph tab on each; evidence panel (`evidence=`, beside the content) |
-| Policy | Reserved; outside this spec |
-| Logs | Event detail (drawer) within the preview |
+| Policy | Defined by `SPEC-iga-phase3-policy.md` §9.2: Overview, Findings, Policies (detail `/iga/policy/policies/:id`), new-policy flow, Approvals, Reviews, Deployments, Setup, Legacy agent policies |
+| Logs | Event detail (drawer) |
 
 ### One interaction rule
 
@@ -151,7 +154,7 @@ redirect that drops an account or tab parameter:
 | `/iga/identities`, `/iga/resources` | `…&type=identities` / `…&type=resources` |
 | `/iga/agents` | `/iga/discovery?type=sightings` (`status=`, `live=` carried) |
 | `/iga/k8s-access` | `/iga/discovery?provider=k8s&type=workloads` |
-| governance routes above | the retired-page state |
+| governance routes above | the retired-page state; with `IGA_POLICY` on, `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement` and `/iga/upcoming` redirect as in `SPEC-iga-phase3-policy.md` §9.2 |
 
 Object detail routes are unchanged.
 
@@ -629,12 +632,13 @@ are not):
 
 ## Policy — reserved destination
 
-`/iga/policy` is reserved. Within this spec it renders one screen: the
-preview banner (*Preview — sample data. Nothing here is evaluated or
-enforced.*), one paragraph on what Policy will hold, and a link to the
-policy specification. Its sample-data screens, if any, are specified in
-`SPEC-iga-phase3-policy.md`, not here. No retired governance screen, dialog
-or API call is reachable from it.
+`/iga/policy` is reserved. Within this spec, and whenever `IGA_POLICY` is
+off, it renders one screen: the preview banner (*Preview — sample data.
+Nothing here is evaluated or enforced.*), one paragraph on what Policy will
+hold, and a link to the policy specification. With the gate on it is
+replaced by the views of `SPEC-iga-phase3-policy.md` §9. No retired
+governance screen, dialog or API call is reachable from it; legacy agent
+policies appear only through that spec's read-only compatibility view.
 
 ## Logs — preview
 
@@ -645,7 +649,11 @@ publication; classification decided; sighting claimed; connection added /
 revoked), filters by kind, source, actor and time, an event drawer with the
 facts and the raw record collapsed. Export is absent, not disabled. The
 banner reads *Preview — sample events.* Nothing from the retired Provenance
-or Enforcement screens is reused.
+or Enforcement screens is reused. With `IGA_POLICY` on, Logs is an audit feed
+of recorded events only: policy kinds from `GET /api/iga/v1/policy/events`;
+kinds without a source are shown as *Not recorded yet*, never as sample
+events. The fixture timeline remains only as the gate-off preview
+(`SPEC-iga-phase3-policy.md` §9.6).
 
 ## Backend dependencies — field level
 
@@ -663,7 +671,8 @@ or Enforcement screens is reused.
 | Declared permissions examples | workload Resources tab first page; identity Permissions | yes | labelled examples | none | — |
 | Workloads bound / resources named / may assume | `used_by_count`, `named_by_count`, used-by first page | yes | `ExactCount` / paged | none | — |
 | Sighting ↔ identity link | `matched_client_id` | yes | — | none | — |
-| Logs events | none | no | — | out of scope (preview) | fixtures |
+| Logs events — policy | `iga_gov_event` via `GET /api/iga/v1/policy/events` | no (proposed, Phase 3 R1a) | append-only, cursor-paged | Phase 3 T3.20 | fixtures |
+| Logs events — discovery | none | no | — | out of scope | gate off: preview fixtures; gate on: *Not recorded yet* |
 
 The three backend changes, named in the table:
 

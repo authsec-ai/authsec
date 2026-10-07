@@ -3,17 +3,19 @@
 > **Phase numbering updated 1 October 2026.** Phase 1 is connect and collect;
 > Phase 2 is the complete scanning-to-declared-access-graph journey, including
 > entitlement relationships, traversal APIs and console; Phase 3 is policy
-> creation and enforcement. Phase 3 R1a/R1b/R2/R3 are release increments, not separate
-> numbered phases. Renumbering does not certify implementation or deployment.
+> creation and enforcement. Phase 3 R1a/R1b/R1k/R2/R3 are release increments, not
+> separate numbered phases. Renumbering does not certify implementation or deployment.
 >
 > Phase 1 contracts: [SPEC-iga-phase1-collect.md](SPEC-iga-phase1-collect.md).
 > Phase 2 target: [SPEC-iga-phase2-graph.md](SPEC-iga-phase2-graph.md).
 > Phase 3 proposed customer requirements:
 > [Phase 3 policy requirements](SPEC-iga-phase3-policy-requirements.md).
 > Phase 3 R1a implementation spec (draft for review):
-> [SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md); R1b, R2 and R3 need
-> their own specs. Existing Kubernetes policy code is review input, not its
-> design authority.
+> [SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md); R1b, R1k, R2 and R3
+> need their own specs. Phase 3 is an independent policy product (its own
+> `iga_gov_*` tables); it does not extend the Kubernetes agent-lifecycle
+> stack, whose disposition is
+> [PLAN-existing-policy-code-disposition.md](PLAN-existing-policy-code-disposition.md).
 >
 > Product context: [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md).
 > Sections 1–3 retain the earlier graph planning/reference material; dated source
@@ -514,14 +516,19 @@ there is no separate Phase 3 “Entitlement graph” or deferred Phase 4/5 graph
 | **0 · Foundations** | Topology, tenant/membership authority, scope/coverage and lifecycle contracts | — | Approved contracts and reproducible baseline checks; no assumed isolation |
 | **1 · Connect and collect** | AWS onboarding, durable scanning, evidence, pagination, coverage and stable inventory | 0 | Real-account scan and recovery; failed reads cannot masquerade as complete; superseded work cannot publish |
 | **2 · End-to-end identity and declared-access graph** | Objects, entitlement/statement/assignment history, typed evidenced relationships, publication/reconciliation, bounded traversal APIs, inventories and usable console | 1 | Customer follows a real workload through identity and declared permissions to resources, examines evidence, changes the source and sees a safe rescan; parser (§5), workspace, lifecycle and UI gates pass |
-| **3 · Policy creation and enforcement** | Findings-driven right-sizing, policy lifecycle and AWS arm, preview, approval, rollout, verification, drift/reversal; later time-bound and runtime increments | 2 plus each capability's evidence prerequisites | Actual supported policy outcome traced from finding/UI to provider artifact and scoped operational evidence, including failure/recovery; relevant MUST gates in the approved Phase 3 spec pass |
+| **3 · Policy creation and enforcement** | Findings-driven right-sizing, independent policy lifecycle for AWS, preview, approval, rollout, verification, drift/reversal; later time-bound and runtime increments | 2 plus each capability's evidence prerequisites | Actual supported policy outcome traced from finding/UI to provider artifact and scoped operational evidence, including failure/recovery; relevant MUST gates in the approved Phase 3 spec pass |
 
-**Phase 3 increments:** R1a delivers service-level right-sizing using existing
-Access Advisor evidence, generated proposals, owner review before observation or
-canary, static impact preview, Slack/UI approval, direct or Terraform/CloudFormation
-PR delivery and scoped verification. It does not depend on upgraded CloudTrail.
-R1b adds action-level right-sizing with attributable history, relevant data events
-and historical what-if, reusing the same workflow. R2 adds broader time-bound
+**Phase 3 increments:** R1a delivers AWS service-level right-sizing using existing
+Access Advisor evidence, plans compiled from immutable evidence bundles, targets
+resolved server-side, owner review before observation or canary, static impact
+preview, Slack/UI approval, direct or Terraform/CloudFormation PR delivery and
+scoped verification, inside the existing Policy and Logs destinations. It does
+not depend on upgraded CloudTrail. R1b adds action-level right-sizing with
+attributable history, relevant data events and historical what-if, reusing the
+same workflow. R1k adds Kubernetes RBAC narrowing (binding and role changes, no
+"unused" findings) and is blocked until Kubernetes evidence is authenticated and
+ordered, objects are readable by identity, and a separate actuation credential
+exists (requirements K-1 to K-3). R2 adds broader time-bound
 access, native expiry, session revocation and expanded identity-split support;
 R1a already includes shared-role impact and a supported split path. R3 adds
 mandatory gateway/tool controls, human approval and session budgets. These labels
