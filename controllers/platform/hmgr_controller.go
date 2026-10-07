@@ -568,19 +568,14 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 
 	// Stash the request origin on the v4 service so it lands on OIDCState
 	// for the eventual post-auth redirect.
-	originDomain := req.OriginDomain
+	// Body, forwarded host, Origin and Host are all client-chosen: only an
+	// allowed host may become the redirect target (AS-064).
+	originDomain := middlewares.AllowedHostOr(req.OriginDomain, "")
 	if originDomain == "" {
-		originDomain = c.GetHeader("X-Forwarded-Host")
+		originDomain = middlewares.AllowedOriginHost(c)
 	}
 	if originDomain == "" {
-		if origin := c.GetHeader("Origin"); origin != "" {
-			if u, err := url.Parse(origin); err == nil {
-				originDomain = u.Host
-			}
-		}
-	}
-	if originDomain == "" {
-		originDomain = c.Request.Host
+		originDomain = middlewares.AllowedHostOr(middlewares.EffectiveHost(c), "")
 	}
 	ctrl.oidcSvc.SetRequestOrigin(originDomain)
 

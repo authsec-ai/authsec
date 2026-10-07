@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -67,8 +68,10 @@ func WorkspaceFromHost(c *gin.Context) (uuid.UUID, error) {
 		return id, nil
 	}
 
-	// 2. Leftmost label as slug or as truncated workspace_domain.
-	if dot := strings.IndexByte(host, '.'); dot > 0 {
+	// 2. Leftmost label as slug or as truncated workspace_domain — only on a
+	// host the platform vouches for (CORS_ALLOW_ORIGIN, the UI/API hosts), so
+	// "<slug>.attacker.example" never selects a workspace (AS-064).
+	if dot := strings.IndexByte(host, '.'); dot > 0 && middlewares.HostAllowed(host) {
 		slug := host[:dot]
 		if err := db.QueryRow(
 			`SELECT id FROM workspaces WHERE LOWER(slug) = $1 OR LOWER(workspace_domain) = $1 LIMIT 1`,

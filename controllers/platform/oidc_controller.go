@@ -203,16 +203,7 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 	log.Printf("DEBUG Initiate: Set requestHost='%s' for OIDC callback", c.Request.Host)
 
 	// Capture origin domain for post-auth redirect (where user came from)
-	origin := c.GetHeader("Origin")
-	if origin == "" {
-		origin = c.GetHeader("Referer")
-		if origin != "" {
-			// Extract domain from referer URL
-			if parsedURL, err := url.Parse(origin); err == nil {
-				origin = parsedURL.Host
-			}
-		}
-	}
+	origin := middlewares.AllowedOriginHost(c) // Origin or Referer, only an allowed host (AS-064)
 	if origin != "" {
 		// Clean up origin (remove https:// prefix if present)
 		origin = strings.TrimPrefix(origin, "https://")
@@ -1694,10 +1685,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 		log.Printf("DEBUG renderOAuthCallbackHTML: Using workspace_domain from data, redirectURL='%s'", redirectURL)
 	} else {
 		// Fallback: Try to extract from Host or X-Forwarded-Host header
-		host := c.GetHeader("X-Forwarded-Host")
-		if host == "" {
-			host = c.Request.Host
-		}
+		host := middlewares.EffectiveHost(c) // X-Forwarded-Host only from a trusted proxy (AS-064)
 
 		// Strip port if present
 		if idx := strings.Index(host, ":"); idx != -1 {
@@ -1711,7 +1699,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 
 		// For platform domains, validate against allowlist
 		// For custom domains, trust them (they came from workspace_domains table via state)
-		if isAllowedFrontendDomain(frontendHost) || (!strings.HasSuffix(frontendHost, ".authsec.dev") && !strings.HasSuffix(frontendHost, ".authsec.ai")) {
+		if isAllowedFrontendDomain(frontendHost) || middlewares.HostAllowed(frontendHost) { // AS-064: no unknown hosts
 			redirectURL = "https://" + frontendHost + "/authsec/uflow/oidc/callback"
 		}
 	}

@@ -134,12 +134,7 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 			return
 		}
 
-		requestHost := c.Request.Host
-		if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-			requestHost = strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-		}
-
-		if strings.EqualFold(requestHost, parsed.Host) {
+		if strings.EqualFold(requestHost(c), parsed.Host) {
 			c.Next()
 			return
 		}
@@ -150,16 +145,12 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 	}
 }
 
-// requestHost reads the effective Host this request arrived on, preferring
-// X-Forwarded-Host (set by the tunnel/proxy in front of local dev, or any
-// production load balancer) over the raw connection Host — the same
-// resolution CanonicalIssuerOnly uses, kept identical on purpose so the two
-// never disagree about what host a request came in on.
+// requestHost reads the effective Host this request arrived on: the
+// X-Forwarded-Host of a trusted proxy (TRUSTED_PROXIES), otherwise the
+// connection's Host (AS-064). CanonicalIssuerOnly uses the same resolution
+// so the two never disagree about what host a request came in on.
 func requestHost(c *gin.Context) string {
-	if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-		return strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-	}
-	return c.Request.Host
+	return middlewares.EffectiveHost(c)
 }
 
 // issuerBaseForRequest picks which base URL this request's OIDC metadata
