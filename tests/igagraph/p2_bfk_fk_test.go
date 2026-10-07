@@ -202,28 +202,7 @@ var bfkNoForeignKey = map[string]string{
 		"(workspace_id, id)",
 	"iga_pipeline_lease.scan_run_id": "027: SPEC QUESTION: no key at all, so a barrier can name another " +
 		"workspace's run or none (§2.9)",
-	"cloud_identity.workspace_id": "011: SPEC QUESTION: anchored by nothing. cloud_identity_connector_id_fkey " +
-		"is single-column, so an identity can name a workspace that does not exist, or one its connector " +
-		"is not in, and 035's cloud_identity_scope_key then pairs that workspace with that connector",
-	"cloud_connector.workspace_id": "001 and 010: SPEC QUESTION: no key to workspaces. Every (workspace_id, " +
-		"connector_id) reference 027-036 added is against cloud_connector (workspace_id, id), so it proves " +
-		"the pair agrees, not that the workspace exists",
-
-	// Phase 1's tables: the workspace_id no key covers, because each table's
-	// connector reference is single-column (bfkLegacySingleColumn).
-	"cloud_secret.workspace_id":          "011" + bfkPhase1Workspace,
-	"cloud_assume_edge.workspace_id":     "012" + bfkPhase1Workspace,
-	"cloud_permission.workspace_id":      "013" + bfkPhase1Workspace,
-	"cloud_resource.workspace_id":        "013" + bfkPhase1Workspace,
-	"cloud_workload.workspace_id":        "015" + bfkPhase1Workspace,
-	"cloud_usage.workspace_id":           "016" + bfkPhase1Workspace,
-	"cloud_scan_checkpoint.workspace_id": "017" + bfkPhase1Workspace,
 }
-
-// bfkPhase1Workspace: why a Phase 1 table's workspace_id is bare.
-const bfkPhase1Workspace = ": Phase 1, SPEC QUESTION: anchored by nothing. The connector key is single-column, " +
-	"so nothing ties the row's workspace to its connector's; the composite connector reference proposed in " +
-	"bfkLegacySingleColumn would"
 
 /* -------------------------------- catalog --------------------------------- */
 
