@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -571,70 +572,47 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		return
 	}
 
-	// Delete all related data using raw SQL (master database)
+	// Delete all related data in one row-level security transaction for the
+	// caller's workspace. Every statement goes through the scoped layer
+	// (workspace_id = $1); every table below has user_id and workspace_id.
 	deletedCounts := make(map[string]int64)
-	tx, err := db.Begin()
-	if err != nil {
-		logger.WithError(err).Error("Failed to start transaction")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Helper function to execute delete and count rows
-	execDelete := func(table, query string, args ...interface{}) error {
-		result, err := tenancy.ExecContext(ctx, tx, query, args...)
+	record := func(table string, res sql.Result, err error) error {
 		if err != nil {
 			return fmt.Errorf("failed to delete from %s: %w", table, err)
 		}
-		if rows, err := result.RowsAffected(); err == nil {
+		if rows, err := res.RowsAffected(); err == nil {
 			deletedCounts[table] = rows
 		}
 		return nil
 	}
-
-	// Every delete goes through the scoped layer (workspace_id = $1). Every
-	// table below has both user_id and workspace_id columns.
-
-	// 1. Delete role_bindings
-	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete role_bindings")
+	err = tenancy.WithTx(ctx, db.DB, workspaceUUID, func(tx *sql.Tx) error {
+		// 1. role_bindings
+		res, err := tenancy.ExecContext(ctx, tx, `DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`, userUUID)
+		if err := record("role_bindings", res, err); err != nil {
+			return err
+		}
+		// 2. totp_secrets
+		res, err = tenancy.ExecContext(ctx, tx, `DELETE FROM totp_secrets WHERE workspace_id = $1 AND user_id = $2`, userUUID)
+		if err := record("totp_secrets", res, err); err != nil {
+			return err
+		}
+		// 3. totp_backup_codes
+		res, err = tenancy.ExecContext(ctx, tx, `DELETE FROM totp_backup_codes WHERE workspace_id = $1 AND user_id = $2`, userUUID)
+		if err := record("totp_backup_codes", res, err); err != nil {
+			return err
+		}
+		// 4. user_groups
+		res, err = tenancy.ExecContext(ctx, tx, `DELETE FROM user_groups WHERE workspace_id = $1 AND user_id = $2`, userUUID)
+		if err := record("user_groups", res, err); err != nil {
+			return err
+		}
+		// 5. Finally, the user
+		res, err = tenancy.ExecContext(ctx, tx, `DELETE FROM users WHERE workspace_id = $1 AND id = $2`, userUUID)
+		return record("users", res, err)
+	})
+	if err != nil {
+		logger.WithError(err).Error("Failed to hard delete admin user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 2. Delete totp_secrets
-	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete totp_secrets")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 3. Delete totp_backup_codes
-	if err := execDelete("totp_backup_codes", "DELETE FROM totp_backup_codes WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete totp_backup_codes")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 4. Delete user_groups
-	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE workspace_id = $1 AND user_id = $2", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete user_groups")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 5. Finally, delete the user
-	if err := execDelete("users", "DELETE FROM users WHERE workspace_id = $1 AND id = $2", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete user")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		logger.WithError(err).Error("Failed to commit transaction")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit deletion"})
 		return
 	}
 
