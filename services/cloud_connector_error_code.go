@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/azure"
 	"github.com/authsec-ai/authsec/internal/gcp"
 )
 
@@ -50,6 +51,12 @@ const (
 	// ConnErrScopeInvalid: the request itself was malformed (bad scope_kind,
 	// missing reader project, unrecognised auth method).
 	ConnErrScopeInvalid = "scope_invalid"
+
+	// ConnErrAzureRBACPending: an Azure Reader assignment exists (or was just
+	// created) but AuthSec's own service principal cannot read the
+	// subscription yet. Azure applies RBAC changes within minutes; a later
+	// verify normally clears it without the customer doing anything.
+	ConnErrAzureRBACPending = "rbac_propagating"
 )
 
 // ClassifyConnectorError reduces an onboarding or verification failure to one
@@ -77,7 +84,8 @@ func ClassifyConnectorError(err error) string {
 	case errors.Is(err, ErrAWSProbeTimeout):
 		return ConnErrTimeout
 
-	case errors.Is(err, awsdiscovery.ErrThrottled), errors.Is(err, gcp.ErrThrottled):
+	case errors.Is(err, awsdiscovery.ErrThrottled), errors.Is(err, gcp.ErrThrottled),
+		errors.Is(err, azure.ErrThrottled):
 		return ConnErrThrottled
 
 	case errors.Is(err, ErrExternalIDNotIssued):
@@ -85,8 +93,18 @@ func ClassifyConnectorError(err error) string {
 
 	case errors.Is(err, awsdiscovery.ErrNoBaseCredentials),
 		errors.Is(err, gcp.ErrWIFIssuerNotHTTPS),
-		errors.Is(err, gcp.ErrWIFIssuerUnreachable):
+		errors.Is(err, gcp.ErrWIFIssuerUnreachable),
+		errors.Is(err, azure.ErrCredentialRejected),
+		errors.Is(err, azure.ErrNotConfigured):
 		return ConnErrDeployment
+
+	case errors.Is(err, azure.ErrRBACPending):
+		return ConnErrAzureRBACPending
+
+	case errors.Is(err, azure.ErrAppNotInTenant),
+		errors.Is(err, azure.ErrGraphPermissionsMissing),
+		errors.Is(err, azure.ErrARMForbidden):
+		return ConnErrAuthRefused
 
 	case errors.Is(err, gcp.ErrVPCServiceControls), errors.Is(err, gcp.ErrOrgPolicyConstrained):
 		return ConnErrPolicyBlocked

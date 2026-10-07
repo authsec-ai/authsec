@@ -20,13 +20,15 @@ const (
 
 // What kind of scope was onboarded. AWS onboards an account; GCP may onboard an
 // org, a folder or a project; Azure onboards a subscription with its tenant in
-// ParentScopeID.
+// ParentScopeID, plus one tenant row for the Entra directory itself (Microsoft
+// Graph access belongs to the tenant, not to any subscription -- see 042).
 const (
 	CloudScopeAccount      = "account"
 	CloudScopeProject      = "project"
 	CloudScopeFolder       = "folder"
 	CloudScopeOrg          = "org"
 	CloudScopeSubscription = "subscription"
+	CloudScopeTenant       = "tenant"
 )
 
 // Connector lifecycle.
@@ -51,7 +53,7 @@ func ValidCloudProviders() []string {
 func ValidCloudScopeKinds() []string {
 	return []string{
 		CloudScopeAccount, CloudScopeProject, CloudScopeFolder,
-		CloudScopeOrg, CloudScopeSubscription,
+		CloudScopeOrg, CloudScopeSubscription, CloudScopeTenant,
 	}
 }
 

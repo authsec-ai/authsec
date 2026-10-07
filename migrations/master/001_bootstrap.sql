@@ -6059,8 +6059,10 @@ CREATE TABLE IF NOT EXISTS public.cloud_connector (
     CONSTRAINT cloud_connector_provider_chk CHECK (
         provider IN ('aws', 'gcp', 'azure')
     ),
+    -- 'tenant' (042): an Entra tenant's Microsoft Graph connection, with its
+    -- subscriptions as 'subscription' rows naming it in parent_scope_id.
     CONSTRAINT cloud_connector_scope_kind_chk CHECK (
-        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription')
+        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription', 'tenant')
     ),
     CONSTRAINT cloud_connector_status_chk CHECK (
         status IN ('active', 'revoked', 'error')

@@ -1762,6 +1762,31 @@ func SetupRoutes(
 			// callback") is what previously 404'd here. Live-confirmed via a
 			// real Google consent round trip.
 			r.GET("/discovery/gcp/google-oauth/callback", cloudGCPOAuth.GoogleOAuthCallback)
+
+			// Azure as a discovery channel: ONE AuthSec multi-tenant Entra app
+			// registration, customer admin consent (Graph), then Reader per
+			// subscription assigned through ARM with the signed-in
+			// administrator's delegated token. Writes the azure rows of
+			// cloud_connector (one tenant row, one row per subscription). See
+			// controllers/platform/cloud_azure_controller.go,
+			// services/azure_onboarding_service.go and
+			// docs/flows/azure-onboarding.md.
+			cloudAzure := platformCtrl.NewCloudAzureController(config.DB)
+			discovery.GET("/azure/oauth/status", middlewares.Require("discovery", "read"), cloudAzure.OAuthStatus)
+			discovery.POST("/azure/oauth/start", middlewares.Require("discovery", "admin"), cloudAzure.StartOAuth)
+			discovery.GET("/azure/oauth/session", middlewares.Require("discovery", "read"), cloudAzure.GetSession)
+			discovery.POST("/azure/oauth/connect", middlewares.Require("discovery", "admin"), cloudAzure.Connect)
+			discovery.GET("/azure/connectors", middlewares.Require("discovery", "read"), cloudAzure.ListConnectors)
+			discovery.GET("/azure/connectors/:id", middlewares.Require("discovery", "read"), cloudAzure.GetConnector)
+			discovery.POST("/azure/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAzure.VerifyConnector)
+			discovery.DELETE("/azure/connectors/:id", middlewares.Require("discovery", "admin"), cloudAzure.RevokeConnector)
+
+			// Microsoft's redirect for BOTH legs (admin consent, then sign-in)
+			// lands here. UNAUTHENTICATED and on the ROOT engine for the same
+			// reasons as the GCP callback above: the browser arrives with no
+			// AuthSec session, and the path must equal the one registered on
+			// the app (AZURE_REDIRECT_URI) with no "/authsec" prefix.
+			r.GET("/api/v1/auth/azure/callback", cloudAzure.OAuthCallback)
 		}
 
 		// ────────────────────────────────────────────────────
