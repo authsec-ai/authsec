@@ -105,8 +105,7 @@ func scanExtendedUser(scan func(dest ...interface{}) error) (*models.ExtendedUse
 // ctx for a first federated application login. It deliberately does not
 // create a workspace_memberships row or an admin role binding.
 func (ur *UserRepository) CreateOIDCEndUser(ctx context.Context, providerName string, userInfo *models.OIDCUserInfo) (*models.ExtendedUser, error) {
-	workspaceID, err := ctxWorkspace(ctx)
-	if err != nil {
+	if _, err := ctxWorkspace(ctx); err != nil {
 		return nil, err
 	}
 	email := strings.ToLower(strings.TrimSpace(userInfo.Email))
@@ -136,9 +135,9 @@ func (ur *UserRepository) CreateOIDCEndUser(ctx context.Context, providerName st
 	if domainSuffix == "" {
 		domainSuffix = "authsec.dev"
 	}
-	// $1 is the context's workspace; row-level security checks the row.
-	err = tenancy.WithTx(ctx, ur.db.DB, workspaceID, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `
+	// An identity that already exists in the workspace (same email) is kept
+	// and returned as it is.
+	err = insertScoped(ctx, ur.db.DB, `
 		INSERT INTO users (
 			workspace_id, id, name, username, email, password_hash, workspace_domain,
 			provider, provider_id, provider_data, avatar_url, active,
@@ -147,27 +146,23 @@ func (ur *UserRepository) CreateOIDCEndUser(ctx context.Context, providerName st
 		VALUES ($1, $2, $3, $4, $5, '', $11,
 		        $6, $7, $8, $9, true, $10, $10, $10)
 		ON CONFLICT (workspace_id, LOWER(email)) WHERE deleted_at IS NULL
-		DO UPDATE SET updated_at = users.updated_at
-		RETURNING id
-	`,
-			workspaceID,
-			userID,
-			name,
-			username,
-			email,
-			providerName,
-			userInfo.Sub,
-			profileData,
-			userInfo.Picture,
-			now,
-			domainSuffix,
-		).Scan(&userID)
-	})
+		DO NOTHING`,
+		userID,
+		name,
+		username,
+		email,
+		providerName,
+		userInfo.Sub,
+		profileData,
+		userInfo.Picture,
+		now,
+		domainSuffix,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create workspace OIDC end user: %w", err)
 	}
 
-	return ur.GetUserByID(ctx, userID)
+	return ur.GetUserByEmailAndTenant(ctx, email)
 }
 
 // UpdateLastLogin records successful consumer authentication.
@@ -310,7 +305,7 @@ func (ur *UserRepository) CreateUserTx(ctx context.Context, tx *sql.Tx, user *mo
 		mfaMethodArray = user.MFAMethod
 	}
 
-	// $1 is the context's workspace.
+	// TENANT-EXEMPT: sign-up creates the workspace and its first user in the caller's transaction; $1 is ctx's workspace, checked equal to user.WorkspaceID above.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO users (workspace_id, id, client_id, project_id, name, username, email,
 			password_hash, workspace_domain, provider, provider_id, provider_data,
