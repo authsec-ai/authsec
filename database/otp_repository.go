@@ -9,10 +9,65 @@ import (
 	"github.com/google/uuid"
 )
 
-// OTPRepository handles the e-mail one-time codes of the admin sign-up,
-// sign-in and password-reset flows. They are issued and checked before any
-// workspace is known (keyed by e-mail; otp_entries has no workspace_id), so
-// every statement here is TENANT-EXEMPT.
+// Purposes of an emailed one-time code (otp_entries.purpose, 068). A code
+// issued for one purpose never verifies, unlocks or deletes another (AS-038).
+const (
+	// OTPPurposeWorkspaceSignup: admin sign-up / workspace bootstrap (no
+	// workspace exists yet).
+	OTPPurposeWorkspaceSignup = "workspace_signup"
+	// OTPPurposeAdminLogin: admin login fallback when no MFA is configured.
+	OTPPurposeAdminLogin = "admin_login"
+	// OTPPurposeAdminPasswordReset: admin forgot-password.
+	OTPPurposeAdminPasswordReset = "admin_password_reset"
+	// OTPPurposeEndUserRegister: end-user self-registration in a workspace.
+	OTPPurposeEndUserRegister = "enduser_register"
+	// OTPPurposeEndUserPasswordReset: end-user forgot-password in a workspace.
+	OTPPurposeEndUserPasswordReset = "enduser_password_reset"
+)
+
+// OTPScope selects the otp_entries rows of one flow: the purpose, and the
+// workspace the code was issued in (nil when the flow has none). AnyWorkspace
+// matches every workspace of that purpose; use it only where the decisive
+// later step re-checks the row's workspace.
+type OTPScope struct {
+	Purpose      string
+	WorkspaceID  *uuid.UUID
+	AnyWorkspace bool
+}
+
+// OTPScopeFor is the scope of purpose in workspace ws (uuid.Nil = none).
+func OTPScopeFor(purpose string, ws uuid.UUID) OTPScope {
+	if ws == uuid.Nil {
+		return OTPScope{Purpose: purpose}
+	}
+	return OTPScope{Purpose: purpose, WorkspaceID: &ws}
+}
+
+// OTPScopeForString is OTPScopeFor with the workspace as a string from a
+// request; an unparsable value selects no workspace, so it matches only rows
+// issued without one.
+func OTPScopeForString(purpose, ws string) OTPScope {
+	id, err := uuid.Parse(ws)
+	if err != nil {
+		id = uuid.Nil
+	}
+	return OTPScopeFor(purpose, id)
+}
+
+// where returns the predicate for scope, with its arguments numbered from n.
+func (s OTPScope) where(n int) (string, []interface{}) {
+	if s.AnyWorkspace {
+		return fmt.Sprintf("purpose = $%d", n), []interface{}{s.Purpose}
+	}
+	return fmt.Sprintf("purpose = $%d AND workspace_id IS NOT DISTINCT FROM $%d", n, n+1),
+		[]interface{}{s.Purpose, s.WorkspaceID}
+}
+
+// OTPRepository handles OTP database operations without GORM.
+//
+// otp_entries is read before authentication, by (email, purpose, workspace):
+// the raw statements below are scoped by that predicate rather than by the
+// tenancy package.
 type OTPRepository struct {
 	db *DBConnection
 }
@@ -22,15 +77,14 @@ func NewOTPRepository(db *DBConnection) *OTPRepository {
 	return &OTPRepository{db: db}
 }
 
-// CreateOTP creates a new OTP entry
-func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `
-		INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`
+type otpQueryRower interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
 
+func createOTP(q otpQueryRower, otp *models.OTPEntry) error {
+	if otp.Purpose == "" {
+		return fmt.Errorf("otp: purpose is required")
+	}
 	now := time.Now()
 	if otp.CreatedAt.IsZero() {
 		otp.CreatedAt = now
@@ -38,92 +92,64 @@ func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
 	if otp.UpdatedAt.IsZero() {
 		otp.UpdatedAt = now
 	}
-
-	err := or.db.QueryRow(query,
-		otp.Email,
-		otp.OTP,
-		otp.ExpiresAt,
-		otp.Verified,
-		otp.CreatedAt,
-		otp.UpdatedAt,
+	// TENANT-EXEMPT: pre-auth code row; workspace_id is part of the row itself
+	return q.QueryRow(`INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at, purpose, workspace_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id`,
+		otp.Email, otp.OTP, otp.ExpiresAt, otp.Verified, otp.CreatedAt, otp.UpdatedAt,
+		otp.Purpose, otp.WorkspaceID,
 	).Scan(&otp.ID)
-
-	return err
 }
 
-// GetValidOTP retrieves a valid (non-expired, unverified) OTP for an email
-func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, error) {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `
-		SELECT id, email, otp, expires_at, verified, created_at, updated_at
-		FROM otp_entries
-		WHERE email = $1 AND otp = $2 AND expires_at > $3 AND verified = false
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
+// CreateOTP creates a new OTP entry. otp.Purpose is required; set
+// otp.WorkspaceID when the flow has a workspace.
+func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
+	return createOTP(or.db, otp)
+}
 
+func (or *OTPRepository) getOTP(scope OTPScope, email string, extra string, extraArgs ...interface{}) (*models.OTPEntry, error) {
+	pred, args := scope.where(2 + len(extraArgs))
+	query := `SELECT id, email, otp, expires_at, verified, created_at, updated_at, purpose, workspace_id
+		FROM otp_entries -- TENANT-EXEMPT: scoped by (email, purpose, workspace_id)
+		WHERE email = $1 AND ` + extra + ` AND ` + pred + `
+		ORDER BY created_at DESC
+		LIMIT 1`
+	all := append(append([]interface{}{email}, extraArgs...), args...)
 	otp := &models.OTPEntry{}
-	// FIX: Add 1-second grace period to handle timing precision issues
-	// This prevents false negatives when verification happens immediately after creation
+	err := or.db.QueryRow(query, all...).Scan(
+		&otp.ID, &otp.Email, &otp.OTP, &otp.ExpiresAt, &otp.Verified, &otp.CreatedAt, &otp.UpdatedAt,
+		&otp.Purpose, &otp.WorkspaceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return otp, nil
+}
+
+// GetValidOTP retrieves a valid (non-expired, unverified) OTP of scope for an email
+func (or *OTPRepository) GetValidOTP(scope OTPScope, email, otpCode string) (*models.OTPEntry, error) {
+	// 1-second grace period for timing precision right after creation.
 	gracePeriod := time.Now().Add(-1 * time.Second)
-
-	err := or.db.QueryRow(query, email, otpCode, gracePeriod).Scan(
-		&otp.ID,
-		&otp.Email,
-		&otp.OTP,
-		&otp.ExpiresAt,
-		&otp.Verified,
-		&otp.CreatedAt,
-		&otp.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("valid OTP not found")
-		}
-		return nil, err
+	otp, err := or.getOTP(scope, email, "otp = $2 AND expires_at > $3 AND verified = false", otpCode, gracePeriod)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("valid OTP not found")
 	}
-
-	return otp, nil
+	return otp, err
 }
 
-// GetVerifiedOTP retrieves a verified OTP for an email
-func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `
-		SELECT id, email, otp, expires_at, verified, created_at, updated_at
-		FROM otp_entries
-		WHERE email = $1 AND verified = true AND expires_at > $2
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-
-	otp := &models.OTPEntry{}
-	err := or.db.QueryRow(query, email, time.Now()).Scan(
-		&otp.ID,
-		&otp.Email,
-		&otp.OTP,
-		&otp.ExpiresAt,
-		&otp.Verified,
-		&otp.CreatedAt,
-		&otp.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("verified OTP not found")
-		}
-		return nil, err
+// GetVerifiedOTP retrieves a verified, unexpired OTP of scope for an email
+func (or *OTPRepository) GetVerifiedOTP(scope OTPScope, email string) (*models.OTPEntry, error) {
+	otp, err := or.getOTP(scope, email, "verified = true AND expires_at > $2", time.Now())
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("verified OTP not found")
 	}
-
-	return otp, nil
+	return otp, err
 }
 
 // VerifyOTP marks an OTP as verified
 func (or *OTPRepository) VerifyOTP(otpID uuid.UUID) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
-		UPDATE otp_entries
+		UPDATE otp_entries -- TENANT-EXEMPT: by primary key of a row read through its scope
 		SET verified = true, updated_at = $1
 		WHERE id = $2
 	`
@@ -145,75 +171,50 @@ func (or *OTPRepository) VerifyOTP(otpID uuid.UUID) error {
 	return nil
 }
 
-// DeleteOTPsByEmail deletes all OTP entries for an email (cleanup)
-func (or *OTPRepository) DeleteOTPsByEmail(email string) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `DELETE FROM otp_entries WHERE email = $1`
+type otpExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
 
-	_, err := or.db.Exec(query, email)
+func deleteOTPs(e otpExecer, scope OTPScope, email string) error {
+	pred, args := scope.where(2)
+	// TENANT-EXEMPT: scoped by (email, purpose, workspace_id)
+	_, err := e.Exec(`DELETE FROM otp_entries WHERE email = $1 AND `+pred, append([]interface{}{email}, args...)...)
 	return err
+}
+
+// DeleteOTPsByEmail deletes the OTP entries of one scope for an email (cleanup)
+func (or *OTPRepository) DeleteOTPsByEmail(scope OTPScope, email string) error {
+	return deleteOTPs(or.db, scope, email)
 }
 
 // DeleteExpiredOTPs deletes all expired OTP entries (cleanup job)
 func (or *OTPRepository) DeleteExpiredOTPs() error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `DELETE FROM otp_entries WHERE expires_at < $1`
+	query := `DELETE FROM otp_entries WHERE expires_at < $1` // TENANT-EXEMPT: platform-wide expiry sweep
 
 	_, err := or.db.Exec(query, time.Now())
 	return err
 }
 
-// HasValidOTP checks if there's a valid OTP for an email
-func (or *OTPRepository) HasValidOTP(email string) (bool, error) {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM otp_entries
-			WHERE email = $1 AND expires_at > $2 AND verified = false
-		)
-	`
-
-	var exists bool
-	err := or.db.QueryRow(query, email, time.Now()).Scan(&exists)
-	return exists, err
+// HasValidOTP checks if there's a valid OTP of scope for an email
+func (or *OTPRepository) HasValidOTP(scope OTPScope, email string) (bool, error) {
+	_, err := or.getOTP(scope, email, "expires_at > $2 AND verified = false", time.Now())
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Transaction support
 
 // CreateOTPTx creates an OTP within a transaction
 func (or *OTPRepository) CreateOTPTx(tx *sql.Tx, otp *models.OTPEntry) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `
-		INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`
-
-	now := time.Now()
-	if otp.CreatedAt.IsZero() {
-		otp.CreatedAt = now
-	}
-	if otp.UpdatedAt.IsZero() {
-		otp.UpdatedAt = now
-	}
-
-	err := tx.QueryRow(query,
-		otp.Email,
-		otp.OTP,
-		otp.ExpiresAt,
-		otp.Verified,
-		otp.CreatedAt,
-		otp.UpdatedAt,
-	).Scan(&otp.ID)
-
-	return err
+	return createOTP(tx, otp)
 }
 
 // VerifyOTPTx marks an OTP as verified within a transaction
 func (or *OTPRepository) VerifyOTPTx(tx *sql.Tx, otpID uuid.UUID) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
 	query := `
-		UPDATE otp_entries
+		UPDATE otp_entries -- TENANT-EXEMPT: by primary key of a row read through its scope
 		SET verified = true, updated_at = $1
 		WHERE id = $2
 	`
@@ -235,18 +236,12 @@ func (or *OTPRepository) VerifyOTPTx(tx *sql.Tx, otpID uuid.UUID) error {
 	return nil
 }
 
-// DeleteOTPsByEmailTx deletes OTPs by email within a transaction
-func (or *OTPRepository) DeleteOTPsByEmailTx(tx *sql.Tx, email string) error {
-	// TENANT-EXEMPT: pre-auth e-mail OTP (sign-up, sign-in, reset); otp_entries has no workspace.
-	query := `DELETE FROM otp_entries WHERE email = $1`
-
-	_, err := tx.Exec(query, email)
-	return err
+// DeleteOTPsByEmailTx deletes the OTPs of one scope for an email within a transaction
+func (or *OTPRepository) DeleteOTPsByEmailTx(tx *sql.Tx, scope OTPScope, email string) error {
+	return deleteOTPs(tx, scope, email)
 }
 
-// PendingRegistrationRepository handles admin sign-ups awaiting their OTP.
-// The row's workspace_id is the id the new workspace will get; that
-// workspace does not exist yet, so every statement here is TENANT-EXEMPT.
+// PendingRegistrationRepository handles pending registration database operations
 type PendingRegistrationRepository struct {
 	db *DBConnection
 }
@@ -259,9 +254,8 @@ func NewPendingRegistrationRepository(db *DBConnection) *PendingRegistrationRepo
 // CreatePendingRegistration creates a new pending registration
 func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *models.PendingRegistration) error {
 	// Phase A: client_id column removed from pending_registrations.
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
-		INSERT INTO pending_registrations (email, password_hash, first_name, last_name,
+		INSERT INTO pending_registrations (email, password_hash, first_name, last_name, // TENANT-EXEMPT: sign-up before the workspace exists
 			workspace_id, project_id, expires_at, created_at, updated_at, workspace_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id
@@ -294,7 +288,6 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 // GetPendingRegistration retrieves a pending registration by email
 func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*models.PendingRegistration, error) {
 	// Phase A: client_id column removed from pending_registrations.
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
 		SELECT id, email, password_hash, first_name, last_name, workspace_id,
 			project_id, expires_at, created_at, updated_at, workspace_domain
@@ -332,8 +325,7 @@ func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*
 
 // DeletePendingRegistrationsByEmail deletes pending registrations by email (cleanup)
 func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmail(email string) error {
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
-	query := `DELETE FROM pending_registrations WHERE email = $1`
+	query := `DELETE FROM pending_registrations WHERE email = $1` // TENANT-EXEMPT: pending sign-up keyed by email before a workspace exists
 
 	_, err := pr.db.Exec(query, email)
 	return err
@@ -341,8 +333,7 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmail(email
 
 // DeleteExpiredPendingRegistrations deletes expired pending registrations (cleanup job)
 func (pr *PendingRegistrationRepository) DeleteExpiredPendingRegistrations() error {
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
-	query := `DELETE FROM pending_registrations WHERE expires_at < $1`
+	query := `DELETE FROM pending_registrations WHERE expires_at < $1` // TENANT-EXEMPT: platform-wide expiry sweep
 
 	_, err := pr.db.Exec(query, time.Now())
 	return err
@@ -352,8 +343,7 @@ func (pr *PendingRegistrationRepository) DeleteExpiredPendingRegistrations() err
 
 // DeletePendingRegistrationsByEmailTx deletes pending registrations within a transaction
 func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx *sql.Tx, email string) error {
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
-	query := `DELETE FROM pending_registrations WHERE email = $1`
+	query := `DELETE FROM pending_registrations WHERE email = $1` // TENANT-EXEMPT: pending sign-up keyed by email before a workspace exists
 
 	_, err := tx.Exec(query, email)
 	return err
@@ -362,7 +352,6 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx 
 // UpdatePendingRegistration updates an existing pending registration
 func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *models.PendingRegistration) error {
 	// Phase A: client_id column removed from pending_registrations.
-	// TENANT-EXEMPT: pre-auth admin sign-up; the workspace does not exist until the OTP is verified.
 	query := `
 		UPDATE pending_registrations
 		SET password_hash = $1, workspace_id = $2, project_id = $3,

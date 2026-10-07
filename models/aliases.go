@@ -69,6 +69,10 @@ type OTPEntry struct {
 	ID        uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	Email     string    `json:"email"`
 	OTP       string    `json:"-"` // never expose OTP value
+	// Purpose and WorkspaceID scope the code to the flow and workspace it was
+	// issued for (068, AS-038).
+	Purpose     string     `json:"purpose" gorm:"column:purpose"`
+	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"column:workspace_id;type:uuid"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Verified  bool      `json:"verified" gorm:"default:false"`
 	CreatedAt time.Time `json:"created_at"`

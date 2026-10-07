@@ -226,7 +226,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// Generate and send OTP
-	if err := uc.generateAndSendOTP(input.Email); err != nil {
+	if err := uc.generateAndSendOTP(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 		log.Printf("Failed to send OTP: %v", err)
 		// Cleanup pending registration if OTP sending fails
 		uc.pendingRepo.DeletePendingRegistrationsByEmail(input.Email)
@@ -281,7 +281,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	}
 
 	// Verify OTP
-	otpEntry, err := uc.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := uc.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email, input.OTP)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -481,7 +481,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 
 	// Clean up pending registration and OTP entries
 	uc.pendingRepo.DeletePendingRegistrationsByEmailTx(tx, input.Email)
-	uc.otpRepo.DeleteOTPsByEmailTx(tx, input.Email)
+	uc.otpRepo.DeleteOTPsByEmailTx(tx, database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email)
 
 	// Commit global transaction so the migration service can see the tenant record
 	if err := tx.Commit(); err != nil {
@@ -741,7 +741,7 @@ func (uc *UserController) Login(c *gin.Context) {
 		// User doesn't have MFA configured but has logged in before - require OTP as fallback
 		log.Printf("User %s has no MFA methods configured, falling back to OTP verification", tenant.Email)
 		// Generate and send OTP for users without MFA setup
-		if err := uc.generateAndSendOTP(tenant.Email); err != nil {
+		if err := uc.generateAndSendOTP(database.OTPScopeFor(database.OTPPurposeAdminLogin, tenant.WorkspaceID), tenant.Email); err != nil {
 			log.Printf("Failed to send OTP for user without MFA: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification code"})
 			return
@@ -885,7 +885,7 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 	input.Email = strings.ToLower(input.Email)
 
 	// Verify OTP using the same pattern as other OTP verifications
-	otpEntry, err := uc.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := uc.otpRepo.GetValidOTP(database.OTPScopeForString(database.OTPPurposeAdminLogin, input.WorkspaceID), input.Email, input.OTP)
 	if err != nil {
 		log.Printf("Invalid OTP for login: %s, error: %v", input.Email, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired OTP"})
@@ -1035,7 +1035,7 @@ func (uc *UserController) ResendOTP(c *gin.Context) {
 	log.Printf("ResendOTP: Found pending registration for %s, expires at: %v", input.Email, pendingReg.ExpiresAt)
 
 	// Generate and send new OTP
-	if err := uc.generateAndSendOTP(input.Email); err != nil {
+	if err := uc.generateAndSendOTP(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 		log.Printf("ResendOTP: Failed to generate/send OTP for %s: %v", input.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resend OTP"})
 		return
@@ -1050,7 +1050,7 @@ func (uc *UserController) ResendOTP(c *gin.Context) {
 }
 
 // Helper function to generate and send OTP
-func (uc *UserController) generateAndSendOTP(email string) error {
+func (uc *UserController) generateAndSendOTP(scope database.OTPScope, email string) error {
 	log.Printf("generateAndSendOTP: starting flow for %s", email)
 	// Generate OTP
 	otp, err := utils.GenerateOTP()
@@ -1062,7 +1062,7 @@ func (uc *UserController) generateAndSendOTP(email string) error {
 	log.Printf("generateAndSendOTP: Generated OTP for %s", email)
 
 	// Delete any existing OTP for this email
-	if err := uc.otpRepo.DeleteOTPsByEmail(email); err != nil {
+	if err := uc.otpRepo.DeleteOTPsByEmail(scope, email); err != nil {
 		log.Printf("generateAndSendOTP: Warning - failed to delete old OTPs for %s: %v", email, err)
 	} else {
 		log.Printf("generateAndSendOTP: Cleared previous OTPs for %s", email)
@@ -1070,10 +1070,12 @@ func (uc *UserController) generateAndSendOTP(email string) error {
 
 	// Create new OTP entry
 	otpEntry := models.OTPEntry{
-		Email:     email,
-		OTP:       otp,
-		ExpiresAt: time.Now().Add(30 * time.Minute), // OTP expires in 30 minutes
-		Verified:  false,
+		Email:       email,
+		OTP:         otp,
+		Purpose:     scope.Purpose,
+		WorkspaceID: scope.WorkspaceID,
+		ExpiresAt:   time.Now().Add(30 * time.Minute), // OTP expires in 30 minutes
+		Verified:    false,
 	}
 
 	log.Printf("generateAndSendOTP: Attempting to insert OTP for %s into database", email)
@@ -1130,7 +1132,7 @@ func (uc *UserController) AdminForgotPassword(c *gin.Context) {
 	}
 
 	// Generate and send OTP using existing utility (following same pattern as InitiateRegistration)
-	if err := uc.generateAndSendOTP(input.Email); err != nil {
+	if err := uc.generateAndSendOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email); err != nil {
 		log.Printf("Failed to send admin password reset OTP: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return
@@ -1164,7 +1166,7 @@ func (uc *UserController) AdminVerifyPasswordResetOTP(c *gin.Context) {
 	input.Email = strings.ToLower(input.Email)
 
 	// Verify OTP using the same pattern as VerifyOTPAndCompleteRegistration
-	otpEntry, err := uc.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := uc.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email, input.OTP)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -1216,8 +1218,8 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	// Check if OTP was verified using custom query
 	db := config.GetDatabase()
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM otp_entries WHERE email = $1 AND verified = $2 AND expires_at > $3",
-		input.Email, true, time.Now()).Scan(&count)
+	err := db.QueryRow("SELECT COUNT(*) FROM otp_entries WHERE email = $1 AND verified = $2 AND expires_at > $3 AND purpose = $4 AND workspace_id IS NULL", // TENANT-EXEMPT: pre-auth, scoped by (email, purpose)
+		input.Email, true, time.Now(), database.OTPPurposeAdminPasswordReset).Scan(&count)
 	if err != nil || count == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "OTP not verified or expired. Please request a new OTP"})
 		return
@@ -1319,7 +1321,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}
 
 	// Clean up OTP entries (following tenant controller cleanup pattern)
-	uc.otpRepo.DeleteOTPsByEmailTx(tx, input.Email)
+	uc.otpRepo.DeleteOTPsByEmailTx(tx, database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email)
 
 	// Commit both transactions
 	if err := tenantTx.Commit(); err != nil {

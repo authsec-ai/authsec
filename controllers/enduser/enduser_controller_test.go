@@ -901,7 +901,7 @@ func TestEndUserController_generateAndSendCustomPasswordResetOTP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			err := controller.generateAndSendCustomPasswordResetOTP(tt.email)
+			err := controller.generateAndSendCustomPasswordResetOTP(tt.email, uuid.New())
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

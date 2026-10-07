@@ -660,18 +660,15 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 
 	userRepo := database.NewUserRepository(dbConn)
 
-	// Use workspace-scoped lookup when workspace_id is available to avoid
-	// returning the wrong user in multi-workspace deployments.
+	// An email names a user only inside one workspace: without the token's
+	// workspace there is no lookup, and a miss there is never retried across
+	// all workspaces (AS-038).
+	wsUUID, parseErr := uuid.Parse(getContextString(c, "workspace_id"))
+	if parseErr != nil || wsUUID == uuid.Nil {
+		return "", fmt.Errorf("workspace_id not available in context")
+	}
 	var user *models.ExtendedUser
-	var lookupErr error
-	if wsID := getContextString(c, "workspace_id"); wsID != "" {
-		if wsUUID, parseErr := uuid.Parse(wsID); parseErr == nil {
-			user, lookupErr = userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsUUID), email)
-		}
-	}
-	if user == nil {
-		user, lookupErr = userRepo.GetUserByEmail(email)
-	}
+	user, lookupErr := userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsUUID), email)
 	if lookupErr != nil || user == nil {
 		if lookupErr == nil {
 			lookupErr = fmt.Errorf("user not found")

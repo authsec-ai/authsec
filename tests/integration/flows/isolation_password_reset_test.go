@@ -33,7 +33,7 @@ func Test_Isolation_AdminPasswordResetNeedsTheWorkspace(t *testing.T) {
 		{"twin membership", `INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
 			VALUES (?, ?, ?, ?, 'active', 'signup', NOW(), NOW())`,
 			[]interface{}{uuid.New(), b.WS.WorkspaceID, twin, b.WS.AdminRoleID}},
-		{"verified otp", `INSERT INTO otp_entries (email, otp, expires_at, verified) VALUES (LOWER(?), '123456', NOW() + INTERVAL '10 minutes', true)`,
+		{"verified otp", `INSERT INTO otp_entries (email, otp, expires_at, verified, purpose) VALUES (LOWER(?), '123456', NOW() + INTERVAL '10 minutes', true, 'admin_password_reset')`,
 			[]interface{}{email}},
 	} {
 		if err := config.DB.Exec(q.sql, q.args...).Error; err != nil {

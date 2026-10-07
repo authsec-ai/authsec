@@ -499,7 +499,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		}
 
 		// Delete existing OTPs
-		if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+		if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 			log.Printf("Warning - failed to delete old OTPs: %v", err)
 		}
 
@@ -507,6 +507,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		otpEntry := models.OTPEntry{
 			Email:     input.Email,
 			OTP:       otp,
+			Purpose:   database.OTPPurposeWorkspaceSignup,
 			ExpiresAt: time.Now().Add(30 * time.Minute),
 			Verified:  false,
 		}
@@ -578,6 +579,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -658,7 +660,7 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 	}
 
 	// ✅ Delete existing OTPs
-	if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+	if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email); err != nil {
 		log.Printf("AdminForgotPassword: failed to delete existing OTPs for %s: %v", input.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 		return
@@ -668,6 +670,7 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeAdminPasswordReset,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -711,7 +714,7 @@ func (aac *AdminAuthController) AdminVerifyOTP(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := aac.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email, input.OTP)
 	if err != nil {
 		log.Printf("AdminVerifyOTP: OTP validation failed for %s: %v", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
@@ -749,7 +752,7 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 	input.Email = strings.ToLower(input.Email)
 
 	// Check if there's a verified OTP for this email
-	_, err := aac.otpRepo.GetVerifiedOTP(input.Email)
+	_, err := aac.otpRepo.GetVerifiedOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "No verified reset code found. Please request a new password reset"})
 		return
@@ -791,7 +794,7 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 	}
 
 	// Clean up the used OTP
-	aac.otpRepo.DeleteOTPsByEmail(input.Email)
+	aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully"})
 }
@@ -817,7 +820,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := aac.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email, input.OTP)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -1302,7 +1305,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	}
 
 	// Delete old OTPs for this email
-	if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+	if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 		log.Printf("WARN: Failed to delete old OTPs: %v", err)
 	}
 
@@ -1310,6 +1313,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -1401,13 +1405,14 @@ func (aac *AdminAuthController) AdminResendOTP(c *gin.Context) {
 	}
 
 	// Replace any prior OTP for this email — only the latest is valid.
-	if delErr := aac.otpRepo.DeleteOTPsByEmail(email); delErr != nil {
+	if delErr := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, email); delErr != nil {
 		log.Printf("WARN: AdminResendOTP failed to delete old OTPs for %s: %v", email, delErr)
 	}
 
 	otpEntry := models.OTPEntry{
 		Email:     email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}

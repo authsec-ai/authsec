@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/controllers/shared"
@@ -1232,14 +1233,14 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 	}
 
 	// Delete any existing OTP for this email
-	if _, err := db.Exec("DELETE FROM otp_entries WHERE email = $1", input.Email); err != nil {
+	if _, err := db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID); err != nil {
 		log.Printf("Warning - failed to delete old OTPs: %v", err)
 	}
 
 	// Create new OTP entry
-	otpInsert := `INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at)
-		VALUES ($1, $2, $3, false, NOW(), NOW())`
-	if _, err := db.Exec(otpInsert, input.Email, otp, time.Now().Add(10*time.Minute)); err != nil {
+	otpInsert := `INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at, purpose, workspace_id)
+		VALUES ($1, $2, $3, false, NOW(), NOW(), $4, $5)`
+	if _, err := db.Exec(otpInsert, input.Email, otp, time.Now().Add(10*time.Minute), database.OTPPurposeEndUserRegister, workspaceID); err != nil {
 		log.Printf("Failed to create OTP: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create OTP"})
 		return
@@ -1258,7 +1259,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		}
 		log.Printf("Failed to send OTP email: %v", err)
 		// Cleanup
-		db.Exec("DELETE FROM otp_entries WHERE email = $1", input.Email)
+		db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
 		db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return
@@ -1309,7 +1310,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	// Verify OTP
 	var otpVerified bool
 	var otpExpiry time.Time
-	err = db.QueryRow("SELECT verified, expires_at FROM otp_entries WHERE email = $1 AND otp = $2", input.Email, input.OTP).Scan(&otpVerified, &otpExpiry)
+	err = db.QueryRow("SELECT verified, expires_at FROM otp_entries WHERE email = $1 AND otp = $2 AND purpose = $3 AND workspace_id = $4", input.Email, input.OTP, database.OTPPurposeEndUserRegister, workspaceID).Scan(&otpVerified, &otpExpiry)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -1321,7 +1322,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	}
 
 	// Mark OTP as verified
-	if _, err := db.Exec("UPDATE otp_entries SET verified = true, updated_at = NOW() WHERE email = $1 AND otp = $2", input.Email, input.OTP); err != nil {
+	if _, err := db.Exec("UPDATE otp_entries SET verified = true, updated_at = NOW() WHERE email = $1 AND otp = $2 AND purpose = $3 AND workspace_id = $4", input.Email, input.OTP, database.OTPPurposeEndUserRegister, workspaceID); err != nil {
 		log.Printf("Failed to mark OTP as verified: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
 		return
@@ -1356,7 +1357,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 
 		// Cleanup
 		db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
-		db.Exec("DELETE FROM otp_entries WHERE email = $1", input.Email)
+		db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Registration completed successfully",
@@ -1409,7 +1410,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 
 	// Cleanup pending registration and OTP
 	db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
-	db.Exec("DELETE FROM otp_entries WHERE email = $1", input.Email)
+	db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
 
 	log.Printf("Custom login registration completed for: %s", input.Email)
 
@@ -1489,7 +1490,7 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 	}
 
 	// Generate and send OTP using existing utility
-	if err := euc.generateAndSendCustomPasswordResetOTP(input.Email); err != nil {
+	if err := euc.generateAndSendCustomPasswordResetOTP(input.Email, workspaceID); err != nil {
 		log.Printf("Failed to send password reset OTP: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return
@@ -1524,8 +1525,8 @@ func (euc *EndUserController) CustomVerifyPasswordResetOTP(c *gin.Context) {
 
 	// Verify OTP using the same pattern as tenant controller
 	var otpEntry models.OTPEntry
-	if err := config.DB.Where("email = ? AND otp = ? AND expires_at > ? AND verified = ?",
-		input.Email, input.OTP, time.Now(), false).First(&otpEntry).Error; err != nil {
+	if err := config.DB.Where("email = ? AND otp = ? AND expires_at > ? AND verified = ? AND purpose = ?",
+		input.Email, input.OTP, time.Now(), false, database.OTPPurposeEndUserPasswordReset).First(&otpEntry).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired OTP"})
 		return
 	}
@@ -1573,8 +1574,8 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 
 	// Check if OTP was verified (following tenant controller pattern)
 	var otpEntry models.OTPEntry
-	if err := config.DB.Where("email = ? AND verified = ? AND expires_at > ?",
-		input.Email, true, time.Now()).First(&otpEntry).Error; err != nil {
+	if err := config.DB.Where("email = ? AND verified = ? AND expires_at > ? AND purpose = ?",
+		input.Email, true, time.Now(), database.OTPPurposeEndUserPasswordReset).First(&otpEntry).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "OTP not verified or expired. Please request a new OTP"})
 		return
 	}
@@ -1584,6 +1585,13 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
+		return
+	}
+
+	// The verified code must have been issued for this workspace (AS-038).
+	if err := config.DB.Where("email = ? AND verified = ? AND expires_at > ? AND purpose = ? AND workspace_id = ?",
+		input.Email, true, time.Now(), database.OTPPurposeEndUserPasswordReset, workspaceID).First(&otpEntry).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "OTP not verified or expired. Please request a new OTP"})
 		return
 	}
 
@@ -1636,7 +1644,7 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 	}
 
 	// Clean up OTP entries (following tenant controller cleanup pattern)
-	tx.Where("email = ?", input.Email).Delete(&models.OTPEntry{})
+	tx.Where("email = ? AND purpose = ? AND workspace_id = ?", input.Email, database.OTPPurposeEndUserPasswordReset, workspaceID).Delete(&models.OTPEntry{})
 
 	// Commit both transactions
 	if err := tenantTx.Commit().Error; err != nil {
@@ -1661,7 +1669,7 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 }
 
 // Helper function to generate and send password reset OTP (reusing existing OTP utilities)
-func (euc *EndUserController) generateAndSendCustomPasswordResetOTP(email string) error {
+func (euc *EndUserController) generateAndSendCustomPasswordResetOTP(email string, workspaceID uuid.UUID) error {
 	log.Printf("generateAndSendCustomPasswordResetOTP: starting for %s", email)
 	// Check if config.DB is available
 	if config.DB == nil {
@@ -1679,7 +1687,7 @@ func (euc *EndUserController) generateAndSendCustomPasswordResetOTP(email string
 	log.Printf("generateAndSendCustomPasswordResetOTP: generated OTP for %s", email)
 
 	// Delete any existing OTP for this email (following tenant controller pattern)
-	if err := config.DB.Where("email = ?", email).Delete(&models.OTPEntry{}).Error; err != nil {
+	if err := config.DB.Where("email = ? AND purpose = ? AND workspace_id = ?", email, database.OTPPurposeEndUserPasswordReset, workspaceID).Delete(&models.OTPEntry{}).Error; err != nil {
 		log.Printf("generateAndSendCustomPasswordResetOTP: warning - failed to delete old OTPs for %s: %v", email, err)
 	} else {
 		log.Printf("generateAndSendCustomPasswordResetOTP: cleared existing OTPs for %s", email)
@@ -1689,6 +1697,8 @@ func (euc *EndUserController) generateAndSendCustomPasswordResetOTP(email string
 	otpEntry := models.OTPEntry{
 		Email:     email,
 		OTP:       otp,
+		Purpose:     database.OTPPurposeEndUserPasswordReset,
+		WorkspaceID: &workspaceID,
 		ExpiresAt: time.Now().Add(30 * time.Minute), // OTP expires in 30 minutes
 		Verified:  false,
 	}
