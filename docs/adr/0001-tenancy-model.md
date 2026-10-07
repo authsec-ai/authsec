@@ -124,6 +124,7 @@ These rules come from AGENTS.md: the deployed DB is never wiped, every change ge
    - The 12 nullable columns are made `NOT NULL`, except where `NULL` deliberately means platform, as decided below.
 5. **Unique constraints:** `resource_servers.resource_uri`, `workload_identity_providers.issuer`, `trusted_issuers.iss`, `spiffe_id`, TOTP backup `code` and `device_token` become per-workspace uniques. The truly global ones stay global: OAuth `client_id`, `workspace_domain`, `jti`.
 6. **Platform rows.** One convention: platform-owned rows use `workspace_id IS NULL` **only** on tables that legitimately hold platform data (the permission catalog, platform OIDC providers, platform trusted issuers). The system-workspace seed rows in 001 are migrated to `NULL`, or the reverse; the decision is recorded in `docs/tenancy/tables.md` per table (AS-079).
+   - *Decided 2026-10-07 (migration 055):* `NULL`. The tables that may hold platform rows are the ones 054 lets read `workspace_id IS NULL`: `permissions`, `roles`, `role_permissions`, `trusted_issuers`, `oidc_providers`, `sod_rules`. The system workspace keeps only its registry row, as the orphan fallback of step 3. A CHECK on `permissions`, `roles` and `role_permissions` refuses new system-workspace rows.
 7. **Identity coupling.** New workspaces get an id independent of the first admin's user id. Existing coupled rows are left as is, since nothing depends on the equality once code stops assuming it (AS-083).
 
 ## 7. Platform (super-admin) access
