@@ -28,6 +28,9 @@ type IGAGraphReadController struct {
 	gate func() *services.GraphProjectionGate
 	db   func() *gorm.DB
 	key  []byte
+	// policyGate is the IGA_POLICY gate a test installed (WithPolicyGate);
+	// nil reads the process-wide one (iga_gov_policy_controller.go).
+	policyGate func() *services.PolicyGate
 
 	readerOnce sync.Once
 	reader     *igaread.Reader
@@ -137,6 +140,10 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		"reason":           nullIfEmpty(reason),
 		"features":         graphFeatures(mode == services.GraphProjectionOn),
 		"schema_head":      nullIfEmpty(head),
+		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the IGA_POLICY
+		// gate and what the policy product serves. Its reason is the one
+		// every /policy route's 503 carries.
+		"policy": policyCapabilities(ctl.policyGateFn()()),
 	}})
 }
 

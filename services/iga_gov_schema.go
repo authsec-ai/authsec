@@ -11,10 +11,10 @@ import (
 
 // Phase 3 schema verification (SPEC-iga-phase3-policy.md §4.3, T3.02).
 //
-// IGA_POLICY=on will require a verified Phase 3 schema, checked by existence
+// IGA_POLICY=on requires a verified Phase 3 schema, checked by existence
 // exactly as VerifyGraphSchema checks the graph's. This file is ONLY that
-// check: the gate itself, its routes and the capabilities block are later
-// T3.02 work and are deliberately not wired here.
+// check; the gate that runs it is iga_gov_gate.go (PolicyGate), its routes
+// and the capabilities block controllers/platform/iga_gov_policy_controller.go.
 
 // PolicySchemaHead is the last Phase 3 migration (047-056; the spec's
 // original 044-053, moved up as a unit when 044-046 landed first).

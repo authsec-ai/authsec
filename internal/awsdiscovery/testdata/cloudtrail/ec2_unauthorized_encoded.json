@@ -1,0 +1,47 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAWJ4EXAMPLEREFUND1:i-0abc1234def567890",
+    "arn": "arn:aws:sts::429418377036:assumed-role/RefundTaskRole/i-0abc1234def567890",
+    "accountId": "429418377036",
+    "accessKeyId": "ASIAWJ4EXAMPLEKEY004",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAWJ4EXAMPLEREFUND1",
+        "arn": "arn:aws:iam::429418377036:role/service-role/RefundTaskRole",
+        "accountId": "429418377036",
+        "userName": "RefundTaskRole"
+      },
+      "ec2RoleDelivery": "2.0"
+    }
+  },
+  "eventTime": "2026-10-06T12:01:00Z",
+  "eventSource": "ec2.amazonaws.com",
+  "eventName": "RunInstances",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "10.0.4.12",
+  "userAgent": "aws-sdk-go-v2/1.30.0",
+  "errorCode": "Client.UnauthorizedOperation",
+  "errorMessage": "You are not authorized to perform this operation. Encoded authorization failure message: 4Ux0EXAMPLEencodedMessageBodyNotDecoded",
+  "requestParameters": {
+    "instancesSet": {
+      "items": [
+        {
+          "imageId": "ami-0123456789abcdef0",
+          "minCount": 1,
+          "maxCount": 1
+        }
+      ]
+    }
+  },
+  "responseElements": null,
+  "requestID": "3d7f5a7a-af61-4f88-bc9d-7e1b5c3a6b54",
+  "eventID": "3d7f5a7a-af61-4f88-bc9d-7e1b5c3a6b54",
+  "readOnly": false,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management"
+}

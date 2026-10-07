@@ -1,0 +1,41 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAWJ4EXAMPLEREFUND1:refund-handler",
+    "arn": "arn:aws:sts::429418377036:assumed-role/RefundTaskRole/refund-handler",
+    "accountId": "429418377036",
+    "accessKeyId": "ASIAWJ4EXAMPLEKEY002",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAWJ4EXAMPLEREFUND1",
+        "arn": "arn:aws:iam::429418377036:role/service-role/RefundTaskRole",
+        "accountId": "429418377036",
+        "userName": "RefundTaskRole"
+      },
+      "attributes": {
+        "creationDate": "2026-10-06T10:00:00Z",
+        "mfaAuthenticated": "false"
+      }
+    },
+    "invokedBy": "lambda.amazonaws.com"
+  },
+  "eventTime": "2026-10-06T10:00:03Z",
+  "eventSource": "s3.amazonaws.com",
+  "eventName": "ListBuckets",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "lambda.amazonaws.com",
+  "userAgent": "lambda.amazonaws.com",
+  "requestParameters": {
+    "Host": "s3.us-east-1.amazonaws.com"
+  },
+  "responseElements": null,
+  "requestID": "Z4V2S8K1M3N5P7Q9",
+  "eventID": "1b9e2d58-8d4f-4d66-9a7b-5c9f3a1e4f32",
+  "readOnly": true,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management"
+}

@@ -1,0 +1,25 @@
+{
+  "eventVersion": "1.08",
+  "userIdentity": {
+    "type": "AWSService",
+    "invokedBy": "cloudtrail.amazonaws.com"
+  },
+  "eventTime": "2026-10-06T13:00:00Z",
+  "eventSource": "kms.amazonaws.com",
+  "eventName": "GenerateDataKey",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "cloudtrail.amazonaws.com",
+  "userAgent": "cloudtrail.amazonaws.com",
+  "requestParameters": {
+    "keySpec": "AES_256"
+  },
+  "responseElements": null,
+  "requestID": "5f9b7c9c-c183-41aa-9ebf-9a3d7e5c8d76",
+  "eventID": "5f9b7c9c-c183-41aa-9ebf-9a3d7e5c8d76",
+  "readOnly": true,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "sharedEventID": "a1b2c3d4-0000-4000-8000-000000000001",
+  "eventCategory": "Management"
+}
