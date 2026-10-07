@@ -17,21 +17,25 @@ import (
 //	503 {"error": {"code": "policy_unavailable", "message": "...", "detail": {"reason": "..."}}}
 //
 // with the same reason GET /api/iga/v1/capabilities reports in policy.reason,
-// before any permission or handler runs. Only GET /policy/status is mounted
-// in this build; the §7 routes are added to RegisterIGAPolicyRoutes by the
-// tasks that implement them, and inherit the gate by being in the group.
+// before any permission or handler runs. GET /policy/status is mounted
+// in this build with the §7.1 / §7.2 reads of T3.06b
+// (iga_gov_findings_controller.go); the other §7 routes are added to
+// RegisterIGAPolicyRoutes by the tasks that implement them, and inherit the
+// gate by being in the group.
 
 // IGAGovPolicyController serves /api/iga/v1/policy.
 type IGAGovPolicyController struct {
 	gate func() *services.PolicyGate
 	db   func() *gorm.DB
+	// key signs list cursors: the graph controller's (IGA_CURSOR_SECRET).
+	key []byte
 }
 
 // Policy returns the policy controller over this graph controller's database
 // and policy gate, so the gate /capabilities reports is the gate the policy
 // routes enforce -- one source, never two that can disagree.
 func (ctl *IGAGraphReadController) Policy() *IGAGovPolicyController {
-	return &IGAGovPolicyController{gate: ctl.policyGateFn(), db: ctl.db}
+	return &IGAGovPolicyController{gate: ctl.policyGateFn(), db: ctl.db, key: ctl.key}
 }
 
 // WithPolicyGate makes this controller (and its Policy() controller) read the
@@ -67,6 +71,15 @@ func MountIGAPolicyRoutes(r gin.IRouter, ctl *IGAGovPolicyController, auth gin.H
 // carries auth and the gate. One table, so tests assert the same one.
 func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require func(resource, action string) gin.HandlerFunc) {
 	g.GET("/status", require("governance", "read"), ctl.GetStatus)
+	// §7.1 / §7.2 reads (T3.06b): findings at a revision, readiness, target
+	// resolution and evidence bundles.
+	g.GET("/findings", require("governance", "read"), ctl.ListFindings)
+	g.GET("/findings/summary", require("governance", "read"), ctl.FindingsSummary)
+	g.GET("/findings/:id", require("governance", "read"), ctl.GetFinding)
+	g.GET("/identities/:id/activity-evidence", require("governance", "read"), ctl.ActivityEvidence)
+	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
+	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
+	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
@@ -125,11 +138,12 @@ type policyFeature struct {
 	notServed string
 }
 
-// policyFeatures are the §4.3 flags in this build. None of their routes have
-// landed yet, so each is false with its own reason even with the gate on; the
-// task that mounts a feature's routes flips its served.
+// policyFeatures are the §4.3 flags in this build. A feature whose routes
+// have not landed is false with its own reason even with the gate on; the
+// task that mounts a feature's routes flips its served (findings: T3.06b).
 var policyFeatures = []policyFeature{
-	{"findings", false, "Findings are not available in this build yet: finding evaluation and the findings routes have not been released."},
+	// T3.06 / T3.06b: evaluation in the projection job and the §7.1 reads.
+	{"findings", true, ""},
 	{"proposals", false, "Policy proposals are not available in this build yet: policy authoring and proposal generation have not been released."},
 	{"export", false, "Policy export is not available in this build yet."},
 	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released."},
