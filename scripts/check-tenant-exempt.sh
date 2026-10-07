@@ -51,7 +51,7 @@ count=$(git ls-files '*.go' \
         # list, including a multi-line SQL string up to its closing backtick.
         scoped = "(tenancy\\.(Exec|Query|QueryRow|Insert|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
       }
-      FNR == 1 { h1 = h2 = h3 = ""; inscoped = 0 }
+      FNR == 1 { h1 = h2 = h3 = ""; instr = 0; cover = 0 }
       {
         line = $0
         tmp = line
@@ -60,10 +60,17 @@ count=$(git ls-files '*.go' \
         # visibly continues onto this one (it ends in "(" or ",").
         call = line ~ scoped || (h1 ~ scoped && h1 ~ /[(,][[:space:]]*$/) \
             || (h2 ~ scoped && h2 ~ /[(,][[:space:]]*$/ && h1 ~ /,[[:space:]]*$/)
-        was = inscoped
-        if (!was && ticks % 2 == 1 && call) inscoped = 1
-        skip = was || inscoped || call
-        if (was && ticks % 2 == 1) inscoped = 0
+        # A statement marked TENANT-EXEMPT (on its line or the three above)
+        # covers its multi-line SQL string the same way.
+        exempt = line ~ /TENANT-EXEMPT/ || h1 ~ /TENANT-EXEMPT/ || h2 ~ /TENANT-EXEMPT/ || h3 ~ /TENANT-EXEMPT/
+        # Every raw string is tracked, so a closing backtick is never taken
+        # for an opening one; coverage is decided when a string opens.
+        closing = 0
+        if (ticks % 2 == 1) {
+          if (!instr) { instr = 1; cover = (call || exempt) } else closing = 1
+        }
+        skip = call || (instr && cover)
+        if (closing) { instr = 0; cover = 0 }
         if (!skip && line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
             && line !~ /^[[:space:]]*\/\//) n++
