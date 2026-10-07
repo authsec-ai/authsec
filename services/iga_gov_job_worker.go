@@ -539,7 +539,7 @@ func RegisterPolicyJobNoops(w *PolicyJobWorker) {
 }
 
 // NewDefaultPolicyJobWorker is the production worker: the handlers that exist
-// in this build (evaluate_owner_rules, T3.07; notify, T3.12) plus the no-op periodic kinds,
+// in this build (evaluate_owner_rules, T3.07; notify, T3.12; compile_plans, T3.11) plus the no-op periodic kinds,
 // and the default schedules. Later tasks Register their kinds here.
 func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w := NewPolicyJobWorker(db, "")
@@ -550,6 +550,11 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// the channels registered with RegisterGovNotificationChannel); retry
 	// attempt x 10 min, dead after 5 (§8.1).
 	w.Register(NewGovNotifier(db).JobKind())
+
+	// T3.11: asynchronous recompiles (in review) and revalidations (approved).
+	w.Register(PolicyJobKind{Kind: repositories.GovJobCompilePlans,
+		Handler: NewGovAuthoring(db, ProcessGovLiveReader()).CompilePlansHandler,
+		Backoff: func(n int) time.Duration { return time.Duration(n) * time.Minute }})
 	return w
 }
 

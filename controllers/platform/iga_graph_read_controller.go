@@ -38,6 +38,11 @@ type IGAGraphReadController struct {
 	// classifier is the classification decision service a test installed
 	// (WithClassificationService); nil builds one over db() per request.
 	classifier *services.ClassificationService
+
+	// govLive is the policy compiler's live reader a test installed
+	// (WithGovLiveReader); nil reads the process-wide one
+	// (services.DefaultGovLiveReader, T3.10's at merge).
+	govLive services.LiveReader
 }
 
 // NewIGAGraphReadController reads the process-wide projection gate on every

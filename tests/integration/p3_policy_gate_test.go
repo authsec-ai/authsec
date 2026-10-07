@@ -280,11 +280,12 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 			}
 			reasons, _ := p["reasons"].(map[string]any)
 			for _, f := range features {
-				// T3.06b mounted the findings routes: served, so true exactly
-				// when the gate is on, with no reason.
-				if f == "findings" && tc.state == services.PolicyOn {
+				// T3.06b mounted the findings routes and T3.11/T3.13 the
+				// proposal routes: served, so true exactly when the gate is
+				// on, with no reason.
+				if (f == "findings" || f == "proposals") && tc.state == services.PolicyOn {
 					if p[f] != true || reasons[f] != nil {
-						t.Errorf("on: policy.findings = %v (reason %v), want true with no reason: its routes are in this build", p[f], reasons[f])
+						t.Errorf("on: policy.%s = %v (reason %v), want true with no reason: its routes are in this build", f, p[f], reasons[f])
 					}
 					continue
 				}
