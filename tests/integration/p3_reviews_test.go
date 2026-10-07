@@ -775,3 +775,45 @@ func TestP3T312DefaultWorkerHasNotify(t *testing.T) {
 		t.Fatal("notify backoff is not attempt x 10 min, dead after 5")
 	}
 }
+
+// A reminder while a notice waits in its backoff starts the new cycle at
+// once with its own 5 attempts (the queued job is made due, attempts 0).
+func TestP3T312RemindDuringBackoff(t *testing.T) {
+	db := igaDB(t)
+	ctx := context.Background()
+	g := p3NewGov(t, db, "p3notify-remind-backoff")
+	svc := services.NewIGAGovOwnerReviewService(db)
+	mail := &p3Outbox{}
+	mail.setFail(errors.New("relay down"))
+	w := p3NotifyWorker(db, mail, &p3Outbox{})
+	role, rid := g.identity("BackoffRole", nil)
+	wl := g.workload("backoff-agent", &role, models.RelTypeExecutesAs)
+	u1, _ := g.member("u1-backoff@p3notify.test", "Una One", "active")
+	p3Manual(t, db, g, models.GovObjectWorkload, wl, u1, models.GovOwnerAccountable)
+	rev := g.reviewVersion(nil, 1, map[string]string{"ec2": igagov.GrantAgeObservedSinceChange},
+		p3RevTarget{identity: role, roleID: rid, name: "BackoffRole", removed: []string{"ec2"}})
+	sync, err := svc.OpenReview(ctx, g.ws, rev.version, g.author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if ran, err := w.RunOnce(ctx); err != nil || !ran {
+			t.Fatalf("try %d: %v %v", i, ran, err)
+		}
+		p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() - interval '1 second' WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, g.ws)
+	}
+	p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() + interval '30 minutes' WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, g.ws)
+	mail.setFail(nil)
+	if _, err := svc.Remind(ctx, g.ws, g.author, sync.ReviewID); err != nil {
+		t.Fatal(err)
+	}
+	var j models.IGAGovJob
+	db.Where("workspace_id = ? AND kind = 'notify'", g.ws).Take(&j)
+	if j.Status != "queued" || j.Attempts != 0 || j.RunAfter.After(time.Now().Add(time.Second)) {
+		t.Fatalf("job after the reminder: %s attempts %d run_after %v", j.Status, j.Attempts, j.RunAfter)
+	}
+	p3Drain(t, w)
+	if len(mail.to("u1-backoff@p3notify.test")) != 1 {
+		t.Fatal("the reminder was not delivered at once")
+	}
+}

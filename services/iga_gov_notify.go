@@ -239,8 +239,18 @@ func EnqueueGovNotificationTx(tx *gorm.DB, ws uuid.UUID, subjectKind string, sub
 	sub := n.ID
 	job := &models.IGAGovJob{WorkspaceID: ws, Kind: repositories.GovJobNotify, SubjectID: &sub,
 		DedupeKey: "notification:" + n.ID.String(), MaxAttempts: GovNotifyMaxAttempts}
-	if _, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, job); err != nil {
+	jobCreated, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, job)
+	if err != nil {
 		return nil, err
+	}
+	if !jobCreated && resend && job.ID != uuid.Nil && job.Status == models.GovJobQueued {
+		// A resend while the previous cycle's job waits in its backoff: the
+		// new cycle starts now with its own 5 attempts (a running try is left
+		// to finish; its outcome is a real attempt).
+		if err := tx.Exec(`UPDATE iga_gov_job SET run_after = now(), attempts = 0, last_error = ''
+			WHERE workspace_id = ? AND id = ? AND status = 'queued'`, ws, job.ID).Error; err != nil {
+			return nil, err
+		}
 	}
 	return &n, nil
 }
