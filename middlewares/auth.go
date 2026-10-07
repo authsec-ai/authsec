@@ -120,23 +120,6 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: uid, PrincipalKind: "user"})
 		}
 
-		// Check admin access for admin paths (server auth)
-		if cfg.RequireServerAuth {
-			path := c.FullPath()
-			if path == "" {
-				path = c.Request.URL.Path
-			}
-
-			// Check admin access for admin paths
-			if strings.HasPrefix(path, "/admin/") {
-				if !stringSliceContains(info.Roles, "admin") {
-					c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
-					c.Abort()
-					return
-				}
-			}
-		}
-
 		// Backfill missing identifiers (workspace_id, user_id, etc.) for legacy controllers
 		ensureWorkspaceContext(c)
 		ensureUserContextIdentifiers(c)
@@ -550,15 +533,6 @@ func claimString(value interface{}) (string, bool) {
 		}
 		return s, true
 	}
-}
-
-func stringSliceContains(values []string, target string) bool {
-	for _, v := range values {
-		if v == target {
-			return true
-		}
-	}
-	return false
 }
 
 // ensureUserContextIdentifiers backfills missing user-related identifiers (like user_id)

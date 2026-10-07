@@ -25,12 +25,10 @@ type MigrationFile struct {
 
 // MigrationRunner executes versioned SQL migrations against a database.
 type MigrationRunner struct {
-	db            *sql.DB  // raw connection (target DB — master or tenant)
-	gormDB        *gorm.DB // used only for master DB migration_logs writes
+	db            *sql.DB  // raw connection to the master DB
+	gormDB        *gorm.DB // used for migration_logs writes
 	migrationsDir string
-	dbType        string  // "master" or "tenant"
-	workspaceID      *string // non-nil for tenant runners
-	masterDB      *sql.DB // used by tenant runners to write migration_logs
+	dbType        string // always "master": per-workspace databases no longer exist
 }
 
 // NewMasterMigrationRunner creates a runner for the master database.
@@ -40,19 +38,6 @@ func NewMasterMigrationRunner(migrationsDir string, rawDB *sql.DB, gormDB *gorm.
 		gormDB:        gormDB,
 		migrationsDir: migrationsDir,
 		dbType:        "master",
-	}
-}
-
-// NewTenantMigrationRunner creates a runner for a tenant database.
-// masterDB is used solely for writing migration_logs (which live in the master DB).
-func NewTenantMigrationRunner(workspaceID string, tenantDBConn *sql.DB, migrationsDir string, masterDB *sql.DB) *MigrationRunner {
-	return &MigrationRunner{
-		db:            tenantDBConn,
-		gormDB:        nil,
-		migrationsDir: migrationsDir,
-		dbType:        "tenant",
-		workspaceID:      &workspaceID,
-		masterDB:      masterDB,
 	}
 }
 
@@ -140,67 +125,12 @@ func parseMigrationFileName(filename string) (int, string, error) {
 func (mr *MigrationRunner) RunMigrations() error {
 	log.Printf("[Migration] Starting %s database migrations", mr.dbType)
 
-	// For tenant databases, execute the base template first if the schema doesn't exist yet.
-	if mr.dbType == "tenant" {
-		templatePath := filepath.Join(mr.migrationsDir, "000_tenant_template.sql")
-		if _, err := os.Stat(templatePath); err == nil {
-			var schemaExists bool
-			if err := mr.db.QueryRow(
-				"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users')",
-			).Scan(&schemaExists); err != nil {
-				log.Printf("[Migration] Warning: failed to check schema existence, will attempt template execution: %v", err)
-				schemaExists = false
-			}
-
-			if schemaExists {
-				log.Printf("[Migration] Tenant schema already exists, skipping template")
-			} else {
-				log.Printf("[Migration] Executing tenant base template")
-				if err := mr.executeTemplateFile(templatePath); err != nil {
-					return fmt.Errorf("tenant template execution failed: %w", err)
-				}
-				log.Printf("[Migration] Tenant base template executed successfully")
-
-				// The template is a complete final-state dump — all incremental migrations
-				// are already baked in. Mark them all as executed so the runner skips them.
-				if allFiles, err := mr.LoadMigrationFiles(); err == nil {
-					for _, m := range allFiles {
-						if m.Version > 0 {
-							mr.logMigration(m.Version, m.Name, true, "", 0)
-						}
-					}
-					log.Printf("[Migration] Marked %d incremental migrations as already applied (included in template)", len(allFiles)-1)
-				}
-				return nil
-			}
-		}
-	}
-
-	// Seed tenant self-reference row so DML migrations can resolve workspace_id.
-	if mr.dbType == "tenant" && mr.workspaceID != nil {
-		seedSQL := `INSERT INTO workspaces (id, workspace_id, status, created_at, updated_at)
-		            VALUES ($1::uuid, $1::uuid, 'active', NOW(), NOW())
-		            ON CONFLICT (id) DO NOTHING`
-		if _, err := mr.db.Exec(seedSQL, *mr.workspaceID); err != nil {
-			log.Printf("[Migration] Warning: failed to seed tenant self-reference row (non-fatal): %v", err)
-		} else {
-			log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.workspaceID)
-		}
-	}
-
 	allMigrations, err := mr.LoadMigrationFiles()
 	if err != nil {
 		return err
 	}
 
-	// Filter version-0 template for tenant (already handled above)
-	var migrations []MigrationFile
-	for _, m := range allMigrations {
-		if mr.dbType == "tenant" && m.Version == 0 {
-			continue
-		}
-		migrations = append(migrations, m)
-	}
+	migrations := allMigrations
 
 	if len(migrations) == 0 {
 		log.Printf("[Migration] No migration files found for %s", mr.dbType)
@@ -290,29 +220,6 @@ func (mr *MigrationRunner) executeSQLContent(content string) error {
 	return nil
 }
 
-// executeTemplateFile reads and executes a tenant template SQL file with retry logic.
-func (mr *MigrationRunner) executeTemplateFile(templatePath string) error {
-	content, err := os.ReadFile(templatePath)
-	if err != nil {
-		return fmt.Errorf("failed to read template file: %w", err)
-	}
-
-	const maxRetries = 3
-	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := mr.executeSQLContent(string(content))
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		log.Printf("[Migration] Template execution attempt %d/%d failed: %v", attempt, maxRetries, err)
-		if attempt < maxRetries {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-		}
-	}
-	return fmt.Errorf("template execution failed after %d attempts: %w", maxRetries, lastErr)
-}
-
 // isMigrationExecuted returns true if the given version+name combo is already recorded as successful.
 // Using both version and name prevents two files with the same numeric prefix (e.g. from different
 // subdirectories) from incorrectly skipping each other.
@@ -320,18 +227,10 @@ func (mr *MigrationRunner) isMigrationExecuted(version int, name string) bool {
 	query := `SELECT COUNT(*) FROM migration_logs WHERE version = $1 AND name = $2 AND db_type = $3 AND success = true`
 	args := []interface{}{version, name, mr.dbType}
 
-	var queryDB *sql.DB
-	if mr.dbType == "tenant" && mr.masterDB != nil {
-		queryDB = mr.masterDB
-		query += ` AND workspace_id = $4`
-		args = append(args, *mr.workspaceID)
-	} else {
-		queryDB = mr.db
-		query += ` AND workspace_id IS NULL`
-	}
+	query += ` AND workspace_id IS NULL`
 
 	var count int64
-	if err := queryDB.QueryRow(query, args...).Scan(&count); err != nil {
+	if err := mr.db.QueryRow(query, args...).Scan(&count); err != nil {
 		return false // table may not exist yet
 	}
 	return count > 0
@@ -348,27 +247,16 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 			Success:     success,
 			ErrorMsg:    errorMsg,
 			DBType:      mr.dbType,
-			WorkspaceID: mr.workspaceID,
 			ExecutionMS: executionMS,
 		})
 		return
 	}
 
-	// Fallback: write directly via raw SQL (used by tenant runners)
-	logDB := mr.db
-	if mr.masterDB != nil {
-		logDB = mr.masterDB
-	}
-
-	workspaceIDVal := sql.NullString{}
-	if mr.workspaceID != nil {
-		workspaceIDVal = sql.NullString{String: *mr.workspaceID, Valid: true}
-	}
-
-	_, err := logDB.Exec(
+	// Fallback without GORM: write directly via raw SQL.
+	_, err := mr.db.Exec(
 		`INSERT INTO migration_logs (id, version, name, executed_at, success, error_msg, db_type, workspace_id, execution_ms)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		uuid.New().String(), version, name, time.Now().UTC(), success, errorMsg, mr.dbType, workspaceIDVal, executionMS,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)`,
+		uuid.New().String(), version, name, time.Now().UTC(), success, errorMsg, mr.dbType, executionMS,
 	)
 	if err != nil {
 		log.Printf("[Migration] Warning: failed to log migration v%d: %v", version, err)
@@ -383,18 +271,8 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 	}
 
 	queryDB := mr.db
-	if mr.dbType == "tenant" && mr.masterDB != nil {
-		queryDB = mr.masterDB
-	}
-
-	baseQuery := `SELECT version, executed_at FROM migration_logs WHERE db_type = $1 AND success = true`
+	baseQuery := `SELECT version, executed_at FROM migration_logs WHERE db_type = $1 AND success = true AND workspace_id IS NULL`
 	args := []interface{}{mr.dbType}
-	if mr.workspaceID != nil {
-		baseQuery += ` AND workspace_id = $2`
-		args = append(args, *mr.workspaceID)
-	} else {
-		baseQuery += ` AND workspace_id IS NULL`
-	}
 
 	var lastMigration int
 	var lastExecuted time.Time
@@ -413,7 +291,6 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	return &MigrationStatusResponse{
 		DBType:          mr.dbType,
-		WorkspaceID:     mr.workspaceID,
 		LastMigration:   lastMigration,
 		TotalMigrations: len(migrations),
 		Status:          status,
