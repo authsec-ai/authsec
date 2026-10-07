@@ -28,8 +28,9 @@ type KubernetesValidator struct {
 
 // KubernetesValidatorConfig holds configuration for Kubernetes validation
 type KubernetesValidatorConfig struct {
-	// UseTokenReview enables production-grade token validation via TokenReview API
-	// If false, falls back to JWT parsing without signature verification (dev only)
+	// UseTokenReview is decided by NewKubernetesValidator: true unless
+	// SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY=true outside production/staging.
+	// A value set by the caller is ignored.
 	UseTokenReview bool
 
 	// KubernetesAPIHost is the Kubernetes API server URL (default: from in-cluster config)
@@ -48,21 +49,14 @@ func NewKubernetesValidator(logger *logrus.Entry, cfg *KubernetesValidatorConfig
 		cfg = &KubernetesValidatorConfig{}
 	}
 
-	// In production, always require TokenReview validation.
-	// Set USE_TOKEN_REVIEW=true or ENVIRONMENT=production to enforce.
-	env := os.Getenv("ENVIRONMENT")
-	if env == "production" || env == "staging" {
-		if !cfg.UseTokenReview {
-			logger.Warn("Forcing UseTokenReview=true because ENVIRONMENT is set to " + env)
-			cfg.UseTokenReview = true
-		}
-	} else if os.Getenv("USE_TOKEN_REVIEW") == "true" {
-		cfg.UseTokenReview = true
-	}
-
+	// PSAT tokens are verified with the TokenReview API. Skipping that needs
+	// the explicit SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY=true, and is refused
+	// in production and staging. ENVIRONMENT alone never turns it off
+	// (AS-076).
+	cfg.UseTokenReview = !insecureK8sTokensAllowed(logger)
 	if !cfg.UseTokenReview {
-		logger.Warn("K8s token validation running in DEV MODE (no signature verification). " +
-			"Set ENVIRONMENT=production or USE_TOKEN_REVIEW=true for production use.")
+		logger.Warn("K8s token validation running WITHOUT signature verification " +
+			"(SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY=true). Never use this outside local development.")
 	}
 
 	// Default to in-cluster configuration
@@ -97,8 +91,8 @@ func NewKubernetesValidator(logger *logrus.Entry, cfg *KubernetesValidatorConfig
 		if cfg.CACertPath != "" {
 			caCert, err := os.ReadFile(cfg.CACertPath)
 			if err != nil {
-				logger.WithFields(logrus.Fields{"ca_path": cfg.CACertPath}).WithError(err).Warn("Failed to load CA certificate, using insecure TLS")
-				tlsConfig.InsecureSkipVerify = true
+				// Fall back to the system roots, never to unverified TLS.
+				logger.WithFields(logrus.Fields{"ca_path": cfg.CACertPath}).WithError(err).Warn("Failed to load CA certificate, using system roots")
 			} else {
 				caCertPool := x509.NewCertPool()
 				caCertPool.AppendCertsFromPEM(caCert)
@@ -123,6 +117,21 @@ func NewKubernetesValidator(logger *logrus.Entry, cfg *KubernetesValidatorConfig
 	}, nil
 }
 
+// insecureK8sTokensAllowed reports whether PSAT tokens may be accepted without
+// verification: only with SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY=true, and never
+// when ENVIRONMENT is production or staging.
+func insecureK8sTokensAllowed(logger *logrus.Entry) bool {
+	if os.Getenv("SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY") != "true" {
+		return false
+	}
+	switch strings.ToLower(os.Getenv("ENVIRONMENT")) {
+	case "production", "staging":
+		logger.Error("SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY is ignored in " + os.Getenv("ENVIRONMENT"))
+		return false
+	}
+	return true
+}
+
 // Validate validates Kubernetes attestation evidence
 func (v *KubernetesValidator) Validate(ctx context.Context, evidence map[string]interface{}) (map[string]string, error) {
 	// Extract PSAT token from evidence
@@ -137,19 +146,22 @@ func (v *KubernetesValidator) Validate(ctx context.Context, evidence map[string]
 	var err error
 
 	// Production: Validate token with Kubernetes TokenReview API
-	if v.useTokenReview && v.k8sAPIHost != "" {
+	if v.useTokenReview {
+		if v.k8sAPIHost == "" {
+			return nil, fmt.Errorf("token review unavailable: no Kubernetes API host configured")
+		}
 		claims, err = v.validateWithTokenReview(ctx, psatToken)
 		if err != nil {
 			return nil, fmt.Errorf("token review validation failed: %w", err)
 		}
 		v.logger.Info("Token validated via TokenReview API")
 	} else {
-		// Development: Parse JWT without signature verification
+		// Explicit insecure development mode only (insecureK8sTokensAllowed).
 		claims, err = v.parseJWT(psatToken)
 		if err != nil {
 			return nil, fmt.Errorf("invalid token: %w", err)
 		}
-		v.logger.Warn("Token validated without signature verification (dev mode)")
+		v.logger.Warn("Token validated without signature verification (SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY)")
 	}
 
 	// Extract selectors from token claims

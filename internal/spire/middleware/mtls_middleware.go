@@ -18,9 +18,12 @@ type MTLSMiddleware struct {
 }
 
 // NewMTLSMiddleware creates a new mTLS middleware.
-// Dev mode bypass is enabled when ENVIRONMENT is "development" or "dev" and TLS_SERVER_CERT_PATH is not set.
+// The dev bypass (identity from X-Tenant-ID, no certificate) needs the explicit
+// SPIRE_DEV_MTLS_BYPASS=true, ENVIRONMENT "development" or "dev", and no
+// TLS_SERVER_CERT_PATH. ENVIRONMENT alone never enables it (AS-076/AS-081).
 func NewMTLSMiddleware(logger *logrus.Logger) *MTLSMiddleware {
-	devMode := os.Getenv("ENVIRONMENT") == "development" || os.Getenv("ENVIRONMENT") == "dev"
+	devMode := os.Getenv("SPIRE_DEV_MTLS_BYPASS") == "true" &&
+		(os.Getenv("ENVIRONMENT") == "development" || os.Getenv("ENVIRONMENT") == "dev")
 	tlsConfigured := os.Getenv("TLS_SERVER_CERT_PATH") != ""
 
 	return &MTLSMiddleware{

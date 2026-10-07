@@ -52,11 +52,9 @@ func NewNodeAttestationService(
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *NodeAttestationService {
-	// Initialize Kubernetes validator in development mode (no TokenReview API)
-	// This bypasses RBAC requirements for the ICP server
-	k8sValidator, err := NewKubernetesValidator(logger, &KubernetesValidatorConfig{
-		UseTokenReview: false, // Disable TokenReview API validation
-	})
+	// PSAT tokens are verified with the TokenReview API (AS-076); the ICP
+	// server's service account needs tokenreviews create.
+	k8sValidator, err := NewKubernetesValidator(logger, &KubernetesValidatorConfig{})
 	if err != nil {
 		logger.WithError(err).Error("Failed to initialize Kubernetes validator")
 		return nil
