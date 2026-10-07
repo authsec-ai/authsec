@@ -393,7 +393,8 @@ func Test_LegacyRegister_CannotClaimSyncedUser(t *testing.T) {
 	w := env.Do("POST", "/authsec/uflow/user/register", map[string]string{
 		"email": email, "password": "AttackerPass123!", "workspace_id": ws.WorkspaceID.String(),
 	}, "")
-	if w.Code == http.StatusOK {
+	// Since AS-018 the legacy route only starts the OTP flow.
+	if strings.Contains(w.Body.String(), "Registration completed") {
 		t.Fatalf("legacy register set a password on a synced account: %s", w.Body.String())
 	}
 	var hash string

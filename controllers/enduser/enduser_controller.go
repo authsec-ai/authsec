@@ -1419,93 +1419,17 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	})
 }
 
-// CustomLoginRegister - Legacy single-step registration endpoint.
-// Deprecated: Use InitiateCustomLoginRegister + CompleteCustomLoginRegister instead.
+// CustomLoginRegister is the legacy single-step registration endpoint
+// (POST /authsec/uflow/user/register). It used to create the account at once
+// with no proof that the caller owns the email (AS-018). It now only starts
+// the verified flow: same request body as /user/register/initiate, an OTP is
+// mailed, and the account is created by /user/register/complete.
+//
+// Deprecated: call /user/register/initiate and /user/register/complete.
 func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
-	var input models.CustomLoginRegister
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	input.Email = strings.ToLower(input.Email)
-
-	// Workspace comes from explicit workspace_id (set by UI from page-data),
-	// ?workspace= query param, or Host header — never from client_id.
-	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
-		return
-	}
-
-	tenantDB := config.DB
-
-	// Check if email already exists in this workspace
-	var existingUser models.User
-	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
-		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
-			// Setting the first password on a directory-synced account claims
-			// it, so it needs proof of the mailbox: only the OTP flow
-			// (/user/register/initiate + /complete) may do that.
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   "email_verification_required",
-				"message": "This account exists. Verify your email with /user/register/initiate and /user/register/complete to set a password.",
-			})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
-		return
-	}
-
-	tempUser := models.ExtendedUser{User: sharedmodels.User{PasswordHash: input.Password}}
-	if err := tempUser.HashPassword(); err != nil {
-		log.Printf("Failed to hash password: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
-		return
-	}
-
-	// Gate: check total-user limit before creating the account. Phase A killed
-	// the client_id-as-tenant-resolver concept — workspaceID is already resolved
-	// above from host / explicit param / JWT (see shared.ResolveWorkspace at the
-	// top of this handler), so we no longer parse input.ClientID/workspaceID here.
-	if currentCount, countErr := countWorkspaceUsers(workspaceID); countErr == nil {
-		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), workspaceID.String(), int(currentCount)); billErr != nil {
-			log.Printf("[REGISTER] billing check failed (fail-open) workspace=%s: %v", workspaceID, billErr)
-		} else if !resp.Allowed {
-			c.JSON(http.StatusPaymentRequired, gin.H{
-				"error":        "user limit reached",
-				"current":      resp.Current,
-				"limit":        resp.Limit,
-				"plan":         resp.PlanID,
-				"upgrade_hint": resp.UpgradeHint,
-			})
-			return
-		}
-	}
-
-	newUser := models.ExtendedUser{
-		User: sharedmodels.User{
-			ID:           uuid.New(),
-			WorkspaceID:  workspaceID,
-			Name:         input.Email,
-			Email:        input.Email,
-			PasswordHash: tempUser.PasswordHash,
-			WorkspaceDomain: config.AppConfig.WorkspaceDomainSuffix,
-			Provider:     "custom",
-			ProviderID:   input.Email,
-			Active:       true,
-			MFAEnabled:   false,
-		},
-	}
-	if err := tenantDB.Create(&newUser).Error; err != nil {
-		log.Printf("Failed to create new user: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Registration completed successfully",
-		"email":   input.Email,
-	})
+	c.Header("Deprecation", "true")
+	c.Header("Link", `</authsec/uflow/user/register/initiate>; rel="successor-version"`)
+	euc.InitiateCustomLoginRegister(c)
 }
 
 // tenantMapping and resolveCustomLoginProjectID deleted in Phase A.
