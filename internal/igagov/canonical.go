@@ -809,6 +809,11 @@ type Impact struct {
 	Retained           []ImpactService  `json:"retained"`
 	StatementRevisions []string         `json:"statement_revisions"`
 	Routes             []Route          `json:"routes"`
+	// Restored is the access a plan gives back (undo, role-only recovery,
+	// remove control: §8.10 "its impact is the access that returns"),
+	// omitted when empty so every apply impact hashes as before (DECISION
+	// D36).
+	Restored []ImpactService `json:"restored,omitempty"`
 }
 
 // Normalized sorts and de-duplicates every member so impact_hash does not
@@ -821,6 +826,9 @@ func (im Impact) Normalized() Impact {
 		Retained:           append([]ImpactService{}, im.Retained...),
 		StatementRevisions: sortedUnique(im.StatementRevisions),
 		Routes:             append([]Route{}, im.Routes...),
+	}
+	if len(im.Restored) > 0 {
+		out.Restored = append([]ImpactService{}, im.Restored...)
 	}
 	sort.Slice(out.Consumers, func(i, j int) bool {
 		a, b := out.Consumers[i], out.Consumers[j]
@@ -840,6 +848,7 @@ func (im Impact) Normalized() Impact {
 	}
 	sort.Slice(out.Removed, svcLess(out.Removed))
 	sort.Slice(out.Retained, svcLess(out.Retained))
+	sort.Slice(out.Restored, svcLess(out.Restored))
 	SortRoutes(out.Routes)
 	return out
 }
