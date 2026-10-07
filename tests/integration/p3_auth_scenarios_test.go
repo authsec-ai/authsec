@@ -384,6 +384,39 @@ func TestP3T311VersionsControlsAndConcurrency(t *testing.T) {
 		t.Fatalf("a version of another policy naming the role: %d %v", code, body)
 	}
 
+	// Editing a draft that was never proposed: the new version keeps the
+	// planned control (it is not released by the older draft's withdrawal).
+	var own map[string]any
+	_ = json.Unmarshal(mustJSON(t, od["version"].(map[string]any)["intent"]), &own)
+	own["observation_days"] = 10
+	code, body = l.call(l.author, http.MethodPost, "/policies/"+other+"/versions", map[string]any{"intent": own, "base_version_no": 1})
+	l.must(code, body, http.StatusCreated, "edit a draft")
+	if l.status(other, 1) != "withdrawn" || l.count(`SELECT count(*) FROM iga_gov_control c JOIN iga_gov_target t ON t.control_id = c.id
+	      WHERE t.version_id = ? AND c.state = 'planned'`, l.versionID(other, 2)) != 1 {
+		t.Fatal("editing a draft released the planned control the new version uses")
+	}
+	// The owner-retain seam T3.12 calls: retaining a removed service makes
+	// the next version (the owner its author); retaining every removal is 422.
+	err := l.db.Transaction(func(tx *gorm.DB) error {
+		_, err := l.authoring().RetainVersionTx(tx, l.ws, l.second.user, l.versionID(other, 2),
+			[]igagov.RetainEntry{{Service: "sqs", Reason: "nightly job", ReviewBy: "2027-01-15"}})
+		return err
+	})
+	if ge := p3aGovErr(err); ge == nil || ge.Code != services.GovCodeNothingToRemove {
+		t.Fatalf("retain every removal: %v", err)
+	}
+	err = l.db.Transaction(func(tx *gorm.DB) error {
+		v, err := l.authoring().RetainVersionTx(tx, l.ws, l.second.user, l.versionID(other, 2),
+			[]igagov.RetainEntry{{Service: "s3", Reason: "exports", ReviewBy: "2027-01-15"}})
+		if err == nil && (v.No != 3 || v.CreatedBy != l.second.user || !strings.Contains(string(v.Intent), `"basis":"owner"`)) {
+			return fmt.Errorf("retain version %+v", v)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Intent validation: 422 with field errors.
 	bad := map[string]any{}
 	_ = json.Unmarshal(mustJSON(t, li), &bad)

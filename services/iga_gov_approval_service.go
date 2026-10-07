@@ -103,21 +103,14 @@ func liveApproval(db *gorm.DB, ws, versionID uuid.UUID) (*models.IGAGovApproval,
 	return &as[0], nil
 }
 
-// holdsPermission reports whether user holds resource:action in workspace ws
-// now: through the role of their active membership or a live role binding
-// (the chains PermissionService resolves tokens from), including the "*"
-// wildcards. DECISION A11: the approval re-check of §2.8 ("the approver
-// still holds governance:approve") reads the database, not a token.
+// holdsPermission is §2.8's re-check that the approver "still holds
+// governance:approve", read from the database rather than a token
+// (DECISION A11). The role/permission tables are platform authorization,
+// not IGA data: the query lives in workspace_permission_check.go, outside
+// the IGA files, the way humanActor's membership check lives in the
+// controllers.
 func holdsPermission(db *gorm.DB, ws, user uuid.UUID, resource, action string) (bool, error) {
-	var n int64
-	err := db.Raw(`SELECT count(*) FROM permissions p JOIN role_permissions rp ON rp.permission_id = p.id
-	                WHERE p.resource IN (?, '*') AND p.action IN (?, '*') AND (p.workspace_id IS NULL OR p.workspace_id = ?)
-	                  AND rp.role_id IN (
-	                        SELECT role_id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ? AND status = 'active'
-	                        UNION
-	                        SELECT role_id FROM role_bindings WHERE workspace_id = ? AND user_id = ? AND (expires_at IS NULL OR expires_at > now()))`,
-		resource, action, ws, ws, user, ws, user).Scan(&n).Error
-	return n > 0, err
+	return WorkspaceUserHoldsPermission(db, ws, user, resource, action)
 }
 
 // Approve records an approval (§7.5). In one transaction, with the version
@@ -256,7 +249,7 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 			return err
 		}
 		for _, pv := range prev {
-			if err := a.closeVersionTx(tx, pv, "superseded", fmt.Sprintf("version %d approved", no)); err != nil {
+			if err := a.closeVersionTx(tx, approver, pv, "superseded", fmt.Sprintf("version %d approved", no), nil); err != nil {
 				return err
 			}
 		}
@@ -406,11 +399,7 @@ func (a *GovAuthoring) Reject(ctx context.Context, ws, approver, policyID uuid.U
 		if err := tx.Create(&out).Error; err != nil {
 			return err
 		}
-		if err := a.closeVersionTx(tx, *v, "rejected", reason); err != nil {
-			return err
-		}
-		k, aid := userActor(approver)
-		return a.event(tx, ws, "version_rejected_by", k, aid, &policyID, &v.ID, map[string]any{"approval_id": out.ID, "reason": out.Reason})
+		return a.closeVersionTx(tx, approver, *v, "rejected", out.Reason, map[string]any{"approval_id": out.ID})
 	})
 	if err != nil {
 		return nil, err

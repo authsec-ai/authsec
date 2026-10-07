@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/services"
@@ -174,5 +175,70 @@ func TestP3T311ProposeCompileApprove(t *testing.T) {
 	code, body = l.call(l.approver, http.MethodGet, "/approvals?status=decided", nil)
 	if code != http.StatusOK || len(p3eList(body)) != 1 {
 		t.Fatalf("decided queue: %d %v", code, body)
+	}
+}
+
+// The seams T3.12 fills (A5's owner gate is T3.12's; this proves what it
+// needs): OnProposed runs in the propose transaction with the apply plans;
+// OwnerGate runs inside the approval transaction and its 409 refuses the
+// approval with nothing written; OnVersionClosed runs when a version leaves
+// review. Rejection needs a reason, is refused to the author, binds the
+// current hashes and returns the findings to open.
+//
+// Safeguard (mutation-checked): the OwnerGate call in Approve.
+func TestP3T313OwnerGateHookAndReject(t *testing.T) {
+	l := newP3aLab(t, "p3-t313-hooks")
+	l.role("HookRole", "AROAHOOKROLE001", map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	var proposed []services.GovProposedVersion
+	var closed []string
+	gate := true
+	prev := services.SetGovAuthoringHooks(services.GovAuthoringHooks{
+		OnProposed: func(tx *gorm.DB, p services.GovProposedVersion) error { proposed = append(proposed, p); return nil },
+		OwnerGate: func(tx *gorm.DB, c services.GovApprovalCheck) error {
+			if gate {
+				return &services.GovError{Status: http.StatusConflict, Code: "review_incomplete", Message: "owners have not responded",
+					Detail: map[string]any{"version_id": c.VersionID, "plans": len(c.ApplyPlans)}}
+			}
+			return nil
+		},
+		OnVersionClosed: func(tx *gorm.DB, ws, v uuid.UUID, status string) error { closed = append(closed, status); return nil },
+	})
+	t.Cleanup(func() { services.SetGovAuthoringHooks(prev) })
+
+	policy, _ := l.proposeTemplate("AROAHOOKROLE001")
+	plans := l.compile(policy, 1)
+	if len(proposed) != 1 || len(proposed[0].ApplyPlans) != 1 || proposed[0].Reproposed || proposed[0].ActorID != l.author.user {
+		t.Fatalf("OnProposed %+v", proposed)
+	}
+	code, body := l.approve(l.approver, policy, 1, p3aApproveBody(plans, nil))
+	if code != http.StatusConflict || p3eErr(body) != "review_incomplete" {
+		t.Fatalf("owner gate: %d %v, want 409 review_incomplete", code, body)
+	}
+	if l.count(`SELECT count(*) FROM iga_gov_approval WHERE workspace_id = ?`, l.ws) != 0 ||
+		l.count(`SELECT count(*) FROM iga_gov_acceptance WHERE workspace_id = ?`, l.ws) != 0 || l.status(policy, 1) != "in_review" {
+		t.Fatal("a refused approval wrote rows")
+	}
+	gate = false
+	path := "/policies/" + policy + "/versions/1/reject"
+	if code, body = l.call(l.approver, http.MethodPost, path, map[string]any{}); code != http.StatusBadRequest {
+		t.Fatalf("reject without a reason: %d %v", code, body)
+	}
+	if code, body = l.call(l.author, http.MethodPost, path, map[string]any{"reason": "mine"}); code != http.StatusForbidden ||
+		p3eErr(body) != services.GovCodeSelfApproval {
+		t.Fatalf("author rejects: %d %v", code, body)
+	}
+	code, body = l.call(l.approver, http.MethodPost, path, map[string]any{"reason": "sqs is used by the nightly job"})
+	rj := l.must(code, body, http.StatusOK, "reject")
+	h := plans["hashes"].(map[string]any)
+	if rj["decision"] != "reject" || rj["intent_hash"] != h["intent_hash"] || len(rj["plan_hashes"].([]any)) != 2 {
+		t.Fatalf("rejection %v", rj)
+	}
+	if l.status(policy, 1) != "rejected" || len(closed) != 1 || closed[0] != "rejected" ||
+		l.count(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND event = 'version_rejected' AND actor_id = ?`, l.ws, l.approver.user.String()) != 1 {
+		t.Fatalf("after reject: status %s closed %v", l.status(policy, 1), closed)
+	}
+	if l.count(`SELECT count(*) FROM iga_gov_finding WHERE workspace_id = ? AND status = 'under_review'`, l.ws) != 0 {
+		t.Fatal("a rejected version left its findings under review")
 	}
 }

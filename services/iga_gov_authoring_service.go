@@ -742,7 +742,7 @@ func (a *GovAuthoring) ArchivePolicy(ctx context.Context, ws, actor, id uuid.UUI
 			return err
 		}
 		for _, v := range open {
-			if err := a.closeVersionTx(tx, v, "withdrawn", "policy archived"); err != nil {
+			if err := a.closeVersionTx(tx, actor, v, "withdrawn", "policy archived", nil); err != nil {
 				return err
 			}
 		}
@@ -767,7 +767,7 @@ func (a *GovAuthoring) ArchivePolicy(ctx context.Context, ws, actor, id uuid.UUI
 // its open owner review cancelled, the findings it put under review go back
 // to open, and its planned controls no other open version uses are
 // released (§7.3 withdraw).
-func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, v models.IGAGovPolicyVersion, status, reason string) error {
+func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, actor uuid.UUID, v models.IGAGovPolicyVersion, status, reason string, extra map[string]any) error {
 	now := a.now()
 	if err := tx.Model(&models.IGAGovPolicyVersion{}).Where("workspace_id = ? AND id = ?", v.WorkspaceID, v.ID).
 		Updates(map[string]any{"status": status, "status_changed_at": now}).Error; err != nil {
@@ -777,6 +777,13 @@ func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, v models.IGAGovPolicyVersion,
 	                    WHERE workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL`,
 		now, "version "+status+": "+reason, v.WorkspaceID, v.ID).Error; err != nil {
 		return err
+	}
+	// T3.12's hook first (CancelReviewTx), while the review is still open;
+	// then the fallback that cancels any review left open.
+	if h := a.hooks().OnVersionClosed; h != nil {
+		if err := h(tx, v.WorkspaceID, v.ID, status); err != nil {
+			return err
+		}
 	}
 	if err := tx.Exec(`UPDATE iga_gov_owner_review SET status = 'cancelled', closed_at = ?
 	                    WHERE workspace_id = ? AND version_id = ? AND status IN ('open','reopened')`, now, v.WorkspaceID, v.ID).Error; err != nil {
@@ -802,13 +809,12 @@ func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, v models.IGAGovPolicyVersion,
 			return err
 		}
 	}
-	if h := a.hooks().OnVersionClosed; h != nil {
-		if err := h(tx, v.WorkspaceID, v.ID, status); err != nil {
-			return err
-		}
+	payload := map[string]any{"version_no": v.VersionNo, "reason": reason}
+	for k, x := range extra {
+		payload[k] = x
 	}
-	return a.event(tx, v.WorkspaceID, "version_"+status, models.GovActorSystem, "", &v.PolicyID, &v.ID,
-		map[string]any{"version_no": v.VersionNo, "reason": reason})
+	k, aid := userActor(actor)
+	return a.event(tx, v.WorkspaceID, "version_"+status, k, aid, &v.PolicyID, &v.ID, payload)
 }
 
 func intentFindingIDs(raw json.RawMessage) []uuid.UUID {
@@ -853,13 +859,12 @@ func (a *GovAuthoring) WithdrawVersion(ctx context.Context, ws, actor, policyID 
 		if inflight > 0 {
 			return govConflict("deployment_in_flight", "A deployment of this version is in flight.", map[string]any{"deployments": inflight})
 		}
-		if err := a.closeVersionTx(tx, *v, "withdrawn", reason); err != nil {
+		if err := a.closeVersionTx(tx, actor, *v, "withdrawn", reason, nil); err != nil {
 			return err
 		}
 		v.Status = "withdrawn"
 		out = v
-		k, aid := userActor(actor)
-		return a.event(tx, ws, "version_withdraw_requested", k, aid, &policyID, &v.ID, map[string]any{"version_no": no, "reason": reason})
+		return nil
 	})
 	return out, err
 }
@@ -924,15 +929,14 @@ func (s subjectIdentity) attrs() roleAttrs {
 
 // connectorForAccount is the workspace's AWS connector of an account.
 func connectorForAccount(db *gorm.DB, ws uuid.UUID, account string) (uuid.UUID, error) {
-	var ids []uuid.UUID
-	if err := db.Raw(`SELECT id FROM cloud_connector WHERE workspace_id = ? AND provider = 'aws' AND scope_kind = 'account' AND scope_id = ?
-	                   ORDER BY created_at LIMIT 1`, ws, account).Scan(&ids).Error; err != nil {
-		return uuid.Nil, err
-	}
-	if len(ids) == 0 {
+	c, err := repositories.NewCloudConnectorRepository(db).GetByScope(ws, "aws", account)
+	if errors.Is(err, repositories.ErrCloudConnectorNotFound) {
 		return uuid.Nil, nil
 	}
-	return ids[0], nil
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return c.ID, nil
 }
 
 // bindSubjectsTx freezes an intent's subjects into controls of the policy
@@ -1094,53 +1098,123 @@ func (a *GovAuthoring) CreateVersion(ctx context.Context, ws, actor, policyID uu
 	if _, err := a.loadPolicy(a.db.WithContext(ctx), ws, policyID, false); err != nil {
 		return nil, err
 	}
+	if _, _, _, err := parseRightSize(raw); err != nil {
+		return nil, err
+	}
+	var out *GovVersionView
+	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		out, err = a.CreateVersionTx(tx, ws, actor, policyID, baseNo, raw)
+		return err
+	})
+	return out, err
+}
+
+// CreateVersionTx is CreateVersion inside the caller's transaction: the seam
+// T3.12's owner review uses when an owner's "retain" response creates the
+// next version (see RetainVersionTx). The actor is recorded as the version's
+// author (created_by), so §2.10's "never one they authored" applies to them.
+func (a *GovAuthoring) CreateVersionTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, baseNo int, raw json.RawMessage) (*GovVersionView, error) {
 	intent, canon, hash, err := parseRightSize(raw)
 	if err != nil {
 		return nil, err
 	}
-	var out *GovVersionView
-	err = a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		pol, err := a.loadPolicy(tx, ws, policyID, true)
-		if err != nil {
-			return err
+	pol, err := a.loadPolicy(tx, ws, policyID, true)
+	if err != nil {
+		return nil, err
+	}
+	if pol.Lifecycle == "archived" {
+		return nil, govConflict(GovCodePolicyArchived, "The policy is archived and read-only.", nil)
+	}
+	var latest models.IGAGovPolicyVersion
+	if err := tx.Where("workspace_id = ? AND policy_id = ?", ws, policyID).Order("version_no DESC").Limit(1).Take(&latest).Error; err != nil {
+		return nil, err
+	}
+	if baseNo != latest.VersionNo {
+		return nil, govConflict(GovCodeVersionConflict, "The policy has a newer version; re-read it and edit that.",
+			map[string]any{"base_version_no": baseNo, "current_version_no": latest.VersionNo, "current_status": latest.Status})
+	}
+	controls, err := a.bindSubjectsTx(tx, ws, policyID, intent.Subjects)
+	if err != nil {
+		return nil, err
+	}
+	// Insert the new version BEFORE withdrawing the older draft, so the
+	// planned controls both use stay referenced by an open version and are
+	// not released by the withdrawal.
+	v, _, err := a.insertVersionTx(tx, ws, policyID, actor, latest.VersionNo+1, intent, canon, hash, controls)
+	if err != nil {
+		return nil, err
+	}
+	if latest.Status == "draft" || latest.Status == "in_review" {
+		if err := a.closeVersionTx(tx, actor, latest, "withdrawn", fmt.Sprintf("replaced by version %d", latest.VersionNo+1), nil); err != nil {
+			return nil, err
 		}
-		if pol.Lifecycle == "archived" {
-			return govConflict(GovCodePolicyArchived, "The policy is archived and read-only.", nil)
+	}
+	if err := a.markFindingsUnderReview(tx, ws, intent.FindingIDs); err != nil {
+		return nil, err
+	}
+	k, aid := userActor(actor)
+	if err := a.event(tx, ws, "version_created", k, aid, &policyID, &v.ID, map[string]any{"version_no": v.VersionNo,
+		"base_version_no": baseNo, "intent_hash": hash}); err != nil {
+		return nil, err
+	}
+	vv, err := a.versionView(tx, *v)
+	return &vv, err
+}
+
+// RetainVersionTx creates the next version of the policy of versionID with
+// each retain item moved from remove to retain (basis owner, with reason and
+// review date): what an owner's "retain" response produces (§7.4, A5).
+// T3.12's GovReviewAuthoringHook.OwnerResponseTx adapter calls it; actor is
+// the responding owner. 422 nothing_to_remove when nothing would be removed.
+func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UUID, items []igagov.RetainEntry) (*GovVersionView, error) {
+	var v models.IGAGovPolicyVersion
+	if err := tx.Where("workspace_id = ? AND id = ?", ws, versionID).Take(&v).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, GovNotFound()
 		}
-		var latest models.IGAGovPolicyVersion
-		if err := tx.Where("workspace_id = ? AND policy_id = ?", ws, policyID).Order("version_no DESC").Limit(1).Take(&latest).Error; err != nil {
-			return err
+		return nil, err
+	}
+	in, err := storedRightSize(v)
+	if err != nil {
+		return nil, err
+	}
+	keep := map[string]igagov.RetainEntry{}
+	for _, it := range items {
+		it.Basis = igagov.RetainOwner
+		keep[it.Service] = it
+	}
+	var remove []igagov.RemoveEntry
+	for _, e := range in.Remove {
+		if _, ok := keep[e.Service]; !ok {
+			remove = append(remove, e)
 		}
-		if baseNo != latest.VersionNo {
-			return govConflict(GovCodeVersionConflict, "The policy has a newer version; re-read it and edit that.",
-				map[string]any{"base_version_no": baseNo, "current_version_no": latest.VersionNo, "current_status": latest.Status})
+	}
+	if len(remove) == 0 {
+		return nil, govUnprocessable(GovCodeNothingToRemove, "Retaining these services leaves nothing to remove.", nil)
+	}
+	in.Remove = remove
+	var retain []igagov.RetainEntry
+	for _, e := range in.Retain {
+		if _, ok := keep[e.Service]; !ok {
+			retain = append(retain, e)
 		}
-		controls, err := a.bindSubjectsTx(tx, ws, policyID, intent.Subjects)
-		if err != nil {
-			return err
-		}
-		if latest.Status == "draft" || latest.Status == "in_review" {
-			if err := a.closeVersionTx(tx, latest, "withdrawn", fmt.Sprintf("replaced by version %d", latest.VersionNo+1)); err != nil {
-				return err
-			}
-		}
-		v, _, err := a.insertVersionTx(tx, ws, policyID, actor, latest.VersionNo+1, intent, canon, hash, controls)
-		if err != nil {
-			return err
-		}
-		if err := a.markFindingsUnderReview(tx, ws, intent.FindingIDs); err != nil {
-			return err
-		}
-		k, aid := userActor(actor)
-		if err := a.event(tx, ws, "version_created", k, aid, &policyID, &v.ID, map[string]any{"version_no": v.VersionNo,
-			"base_version_no": baseNo, "intent_hash": hash}); err != nil {
-			return err
-		}
-		vv, err := a.versionView(tx, *v)
-		out = &vv
-		return err
-	})
-	return out, err
+	}
+	for _, it := range keep {
+		retain = append(retain, it)
+	}
+	sort.Slice(retain, func(i, j int) bool { return retain[i].Service < retain[j].Service })
+	in.Retain = retain
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+	var latest int
+	if err := tx.Raw(`SELECT max(version_no) FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ?`, ws, v.PolicyID).
+		Scan(&latest).Error; err != nil {
+		return nil, err
+	}
+	return a.CreateVersionTx(tx, ws, actor, v.PolicyID, latest, raw)
 }
 
 func (a *GovAuthoring) markFindingsUnderReview(tx *gorm.DB, ws uuid.UUID, ids []string) error {
@@ -1734,10 +1808,11 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 			if _, done := retained[act.Service]; done {
 				continue
 			}
+			if dep, isDep := igagov.IsDependency(act.Service, ctxs); isDep {
+				retained[act.Service] = igagov.RetainEntry{Service: act.Service, Basis: igagov.RetainDependency, Catalog: dep.Catalog}
+				continue
+			}
 			switch {
-			case func() bool { _, d := igagov.IsDependency(act.Service, ctxs); return d }():
-				d, _ := igagov.IsDependency(act.Service, ctxs)
-				retained[act.Service] = igagov.RetainEntry{Service: act.Service, Basis: igagov.RetainDependency, Catalog: d.Catalog}
 			case act.LastAuthenticatedAt != nil:
 				retained[act.Service] = igagov.RetainEntry{Service: act.Service, Basis: igagov.RetainObserved, LastAttempt: *act.LastAuthenticatedAt}
 			default:
