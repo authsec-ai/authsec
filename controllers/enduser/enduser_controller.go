@@ -2,6 +2,7 @@ package enduser
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -25,11 +26,19 @@ import (
 	"gorm.io/gorm"
 )
 
-// countWorkspaceUsers returns the total number of active user records in a workspace.
-func countWorkspaceUsers(workspaceID uuid.UUID) (int64, error) {
-	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ? AND deleted_at IS NULL", workspaceID).Scan(&count).Error
-	return count, err
+// discardEndUserRegistration removes the pending end-user registration and
+// its sign-up codes for email in the workspace carried by ctx, and only
+// there: the same email may be signing up in another workspace, or as a new
+// workspace's admin.
+func discardEndUserRegistration(ctx context.Context, email string) {
+	db := config.GetDatabase().DB
+	if _, err := tenancy.ExecContext(ctx, db, `DELETE FROM otp_entries WHERE workspace_id = $1 AND email = $2 AND purpose = $3`,
+		email, database.OTPPurposeEndUserRegister); err != nil {
+		log.Printf("Failed to delete sign-up OTPs: %v", err)
+	}
+	if _, err := tenancy.ExecContext(ctx, db, `DELETE FROM pending_registrations WHERE workspace_id = $1 AND email = $2`, email); err != nil {
+		log.Printf("Failed to delete pending registration: %v", err)
+	}
 }
 
 // tenantConnectionProvider is a test seam — activation tests swap it for an
@@ -1198,51 +1207,39 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	// Delete any existing pending registration for this email
-	db := config.GetDatabase()
-	if _, err := db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email); err != nil {
-		log.Printf("Error deleting existing pending registration: %v", err)
-	}
-
-	// Phase A: client_id and project_id removed from pending_registrations.
-	// workspace_id is the only scope identifier.
-	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, workspace_id, workspace_domain, expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`
-	if _, err := db.Exec(insertQuery,
-		input.Email,
-		tempUser.PasswordHash,
-		"", // first_name: not collected during custom-login signup
-		"", // last_name:  same
-		workspaceID,
-		config.AppConfig.WorkspaceDomainSuffix,
-		time.Now().Add(30*time.Minute),
-	); err != nil {
-		log.Printf("Failed to create pending registration: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
-		return
-	}
-
-	// Generate and send OTP
 	otp, err := utils.GenerateOTP()
 	if err != nil {
 		log.Printf("Failed to generate OTP: %v", err)
-		// Cleanup pending registration
-		db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return
 	}
 
-	// Delete any existing OTP for this email
-	if _, err := db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID); err != nil {
-		log.Printf("Warning - failed to delete old OTPs: %v", err)
-	}
-
-	// Create new OTP entry
-	otpInsert := `INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at, purpose, workspace_id)
-		VALUES ($1, $2, $3, false, NOW(), NOW(), $4, $5)`
-	if _, err := db.Exec(otpInsert, input.Email, otp, time.Now().Add(10*time.Minute), database.OTPPurposeEndUserRegister, workspaceID); err != nil {
-		log.Printf("Failed to create OTP: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create OTP"})
+	// Replace this workspace's pending registration and sign-up code for the
+	// email, in one transaction under row-level security for the workspace.
+	// Phase A: client_id and project_id removed from pending_registrations;
+	// workspace_id is the only scope identifier.
+	wsCtx := database.WithWorkspace(c.Request.Context(), workspaceID)
+	err = tenancy.WithTx(wsCtx, config.GetDatabase().DB, workspaceID, func(tx *sql.Tx) error {
+		if _, err := tenancy.ExecContext(wsCtx, tx, `
+			WITH replaced AS (DELETE FROM pending_registrations WHERE workspace_id = $1 AND email = $2)
+			INSERT INTO pending_registrations (email, password_hash, first_name, last_name, workspace_id, workspace_domain, expires_at, created_at, updated_at)
+			VALUES ($2, $3, '', '', $1, $4, $5, NOW(), NOW())`,
+			// first_name and last_name are not collected during custom-login signup.
+			input.Email, tempUser.PasswordHash, config.AppConfig.WorkspaceDomainSuffix, time.Now().Add(30*time.Minute)); err != nil {
+			return fmt.Errorf("pending registration: %w", err)
+		}
+		if _, err := tenancy.ExecContext(wsCtx, tx, `
+			WITH replaced AS (DELETE FROM otp_entries WHERE workspace_id = $1 AND email = $2 AND purpose = $3)
+			INSERT INTO otp_entries (email, otp, expires_at, verified, created_at, updated_at, purpose, workspace_id)
+			VALUES ($2, $4, $5, false, NOW(), NOW(), $3, $1)`,
+			input.Email, database.OTPPurposeEndUserRegister, otp, time.Now().Add(10*time.Minute)); err != nil {
+			return fmt.Errorf("sign-up OTP: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Failed to initiate registration: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
 		return
 	}
 
@@ -1258,9 +1255,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 			return
 		}
 		log.Printf("Failed to send OTP email: %v", err)
-		// Cleanup
-		db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
-		db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
+		discardEndUserRegistration(wsCtx, input.Email)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification email"})
 		return
 	}
@@ -1305,12 +1300,16 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	db := config.GetDatabase()
+	// Every statement below runs in the resolved workspace, under row-level
+	// security.
+	wsCtx := database.WithWorkspace(c.Request.Context(), workspaceID)
+	db := config.GetDatabase().DB
 
 	// Verify OTP
 	var otpVerified bool
 	var otpExpiry time.Time
-	err = db.QueryRow("SELECT verified, expires_at FROM otp_entries WHERE email = $1 AND otp = $2 AND purpose = $3 AND workspace_id = $4", input.Email, input.OTP, database.OTPPurposeEndUserRegister, workspaceID).Scan(&otpVerified, &otpExpiry)
+	err = tenancy.QueryRowContext(wsCtx, db, `SELECT verified, expires_at FROM otp_entries WHERE workspace_id = $1 AND email = $2 AND otp = $3 AND purpose = $4`,
+		[]interface{}{input.Email, input.OTP, database.OTPPurposeEndUserRegister}, &otpVerified, &otpExpiry)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -1322,7 +1321,8 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	}
 
 	// Mark OTP as verified
-	if _, err := db.Exec("UPDATE otp_entries SET verified = true, updated_at = NOW() WHERE email = $1 AND otp = $2 AND purpose = $3 AND workspace_id = $4", input.Email, input.OTP, database.OTPPurposeEndUserRegister, workspaceID); err != nil {
+	if _, err := tenancy.ExecContext(wsCtx, db, `UPDATE otp_entries SET verified = true, updated_at = NOW() WHERE workspace_id = $1 AND email = $2 AND otp = $3 AND purpose = $4`,
+		input.Email, input.OTP, database.OTPPurposeEndUserRegister); err != nil {
 		log.Printf("Failed to mark OTP as verified: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
 		return
@@ -1332,8 +1332,8 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	// client_id and project_id columns are no longer selected — client_id was
 	// dropped in Phase A and project_id is unused by the user creation below.
 	var pendingReg models.PendingRegistration
-	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, workspace_id, workspace_domain, expires_at
-		FROM pending_registrations WHERE email = $1 AND workspace_id = $2`, input.Email, workspaceID).Scan(
+	err = tenancy.QueryRowContext(wsCtx, db, `SELECT email, password_hash, first_name, last_name, workspace_id, workspace_domain, expires_at
+		FROM pending_registrations WHERE workspace_id = $1 AND email = $2`, []interface{}{input.Email},
 		&pendingReg.Email, &pendingReg.PasswordHash, &pendingReg.FirstName, &pendingReg.LastName,
 		&pendingReg.WorkspaceID, &pendingReg.WorkspaceDomain, &pendingReg.ExpiresAt)
 	if err != nil {
@@ -1355,9 +1355,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 			return
 		}
 
-		// Cleanup
-		db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
-		db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
+		discardEndUserRegistration(wsCtx, input.Email)
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Registration completed successfully",
@@ -1409,8 +1407,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	}
 
 	// Cleanup pending registration and OTP
-	db.Exec("DELETE FROM pending_registrations WHERE email = $1", input.Email)
-	db.Exec("DELETE FROM otp_entries WHERE email = $1 AND purpose = $2 AND workspace_id = $3", input.Email, database.OTPPurposeEndUserRegister, workspaceID)
+	discardEndUserRegistration(wsCtx, input.Email)
 
 	log.Printf("Custom login registration completed for: %s", input.Email)
 
