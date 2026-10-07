@@ -375,7 +375,7 @@ func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 	}
 
 	// Get pending device codes from device_codes table
-	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(workspaceID, clientID)
+	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(database.WithWorkspace(c.Request.Context(), workspaceID), clientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get pending codes", "details": err.Error()})
 		return
