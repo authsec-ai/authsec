@@ -24,6 +24,13 @@ Branch `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pus
   - 445 → 303.
 - **IGA FK catalog test** updated for 047 (`2bd9077`).
 
+- **Ratchet 303 → 175.** The admin controllers, the platform and end-user controllers, and the OAuth AS follow-up statements moved onto the scoped layer, plus most repositories. Statements that run before a workspace is known carry specific TENANT-EXEMPT reasons. The parallel agents found and fixed three cross-tenant or broken-flow bugs:
+  - AS-099: admin sign-up could take over another workspace's pending domain (`946237b`).
+  - AS-100: AD/Entra sync never created memberships (`64ccc89`).
+  - AS-101: end-user sign-up deleted other workspaces' pending registrations (`30d546a`).
+  Eight unrouted legacy `UserController` handlers were also deleted (`3dabc45`).
+- **Interrupted:** two of the three agents hit the spend limit. Their committed work is merged and verified (build, vet, unit, flows, onboarding and flagsoff all pass). Left to do: `services/oauth_as_service.go`, `scope_resolver.go` and `governance_certify_service.go`, and `database/voice_auth_repository.go`, `agent_action_repository.go`, `ciba_auth_repository.go` and `user_repository.go`. A half-finished voice repository change was not taken.
+
 ### Verification
 - Build, vet and unit tests pass.
 - The flows, onboarding, flagsoff and igagraph suites pass.
