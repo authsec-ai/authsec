@@ -52,8 +52,8 @@ Tenant isolation is a **security property**, not a feature. A cross-tenant data 
 
 | Repo | Path | Stack |
 |---|---|---|
-| Backend | `/home/sauron/k1/authsec/merger/authsec` (branch `authsec-staging`) | Go 1.25, Gin; raw `database/sql` + `lib/pq` and GORM (no AutoMigrate); PostgreSQL 15+ (CI uses 16); Ory Hydra; Vault; optional SPIRE/Redis |
-| Frontend | `/home/sauron/k1/authsec/Authsec-ui` (branch `multitenacyV2` == `authsec-staging`) | React 19 + Vite + TypeScript; Redux Toolkit + RTK Query; react-router 6; Radix/shadcn + Tailwind; Vitest |
+| Backend | `/home/sauron/k1/authsec/merger/authsec` (deployed branch `authsec-staging`; current work on `fix/p0-containment`) | Go 1.25, Gin; raw `database/sql` + `lib/pq` and GORM (no AutoMigrate); PostgreSQL 15+ (CI uses 16); Ory Hydra; Vault; optional SPIRE/Redis |
+| Frontend | `/home/sauron/k1/authsec/Authsec-ui` (deployed branch `authsec-staging`; current work on `feat/ui-voice-perf`) | React 19 + Vite + TypeScript; Redux Toolkit + RTK Query; react-router 6; Radix/shadcn + Tailwind; Vitest |
 
 Sibling repos: `../mt-plugin` (the extracted DB-per-tenant service, no longer used) and `../sharedmodels` (legacy structs).
 
@@ -72,7 +72,7 @@ Verified on 2026-10-06. Details and error output are in `docs/AUDIT.md` §3.
   - If `~/go/pkg/mod` has root-owned dirs, use `GOMODCACHE=<scratch> GOFLAGS=-modcacherw GOPROXY=file://$HOME/go/pkg/mod/cache/download,https://proxy.golang.org,direct`.
 - **Frontend:**
   - `npm ci` · `npm run dev` (Vite) · `npm run build` ✅ · `npx vitest run` ✅
-  - `npm run type-check` ❌ (197 errors) · `npm run lint` ❌ (282 errors)
+  - `npm run type-check` ✅ (0 errors) · `npm run lint` ✅ (0 errors, ~570 warnings) — as of 2026-10-08 on `feat/ui-voice-perf`
 - **Database (local) and migrations:**
   - Start Postgres: `docker run -d --name authsec-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=authsec -p 127.0.0.1:55432:5432 postgres:16`
   - Migrations in `migrations/master/NNN_*.sql` apply automatically at boot (`SKIP_MIGRATIONS=true` skips them) and are recorded in `migration_logs`. `migrations/deltas/` and `migrations/contract/` are not applied by the runner.
@@ -97,7 +97,7 @@ Decided in [`docs/adr/0001-tenancy-model.md`](docs/adr/0001-tenancy-model.md) (a
 2. Tenant context is resolved **once**, at the edge (auth middleware), from a verified token or session. It is **never** taken from a request body, query param, or client-controlled header.
 3. Tenant context flows through a single request-scoped mechanism (context object / async-local storage / DI scope). No function looks up the tenant by itself.
 4. All data access goes through a tenant-scoped repository or query layer that applies the tenant filter automatically. Raw unscoped queries need a `// TENANT-EXEMPT: <reason>` comment and a review.
-5. Use database-level enforcement (e.g. Postgres Row-Level Security) as defense in depth where the DB supports it. *Confirmed:* PostgreSQL 15+ (CI uses 16), which supports RLS. No RLS is used today.
+5. Use database-level enforcement (e.g. Postgres Row-Level Security) as defense in depth where the DB supports it. *Confirmed:* PostgreSQL 15+ (CI uses 16), which supports RLS. *Since 2026-10-07:* RLS is on for every workspace table (migration 054; see §7).
 6. Lookups by ID must also match the tenant. A record from another tenant returns **404**, not 403, so callers can't confirm it exists.
 7. Agent tokens and credentials carry a `tenant_id` claim. The runtime authorization check verifies that the agent, the grant, the policy, and the resource all belong to the **same tenant**.
 8. Unique constraints are scoped per tenant (e.g. `UNIQUE(tenant_id, slug)`), not global, unless the value is truly global.
@@ -159,7 +159,7 @@ Decided in [`docs/adr/0001-tenancy-model.md`](docs/adr/0001-tenancy-model.md) (a
 - 2026-10-06: Phase 0 audit complete. See `docs/AUDIT.md`, `docs/ISSUES.md`, `docs/PROGRESS.md`.
 - 2026-10-06: ADR-0001 accepted: shared DB + `workspace_id`; users belong to one workspace, operators may hold memberships; same-workspace check on every token issuance; separate platform realm; RLS rolled out per domain in Phase 3.
 - 2026-10-06: The owner asked to run all phases back to back, committing locally (never pushing). Work happens on local branches only; `authsec-staging` auto-deploys.
-- 2026-10-06: Tenant isolation is enforced in four layers: (1) `AuthMiddleware` rejects any path/query/body workspace other than the token's (404) and re-checks membership per request; (2) `internal/tenancy` is the scoped data layer; (3) per-endpoint isolation tests use `TwoTenants` in `tests/integration/flows`; (4) the TENANT-EXEMPT ratchet runs in CI. RLS is designed (ADR §4.4) but not yet enabled.
+- 2026-10-06: Tenant isolation is enforced in four layers: (1) `AuthMiddleware` rejects any path/query/body workspace other than the token's (404) and re-checks membership per request; (2) `internal/tenancy` is the scoped data layer; (3) per-endpoint isolation tests use `TwoTenants` in `tests/integration/flows`; (4) the TENANT-EXEMPT ratchet runs in CI. RLS was enabled on 2026-10-07 (054).
 - 2026-10-06: Interactive sign-in uses single-use login tickets (`internal/logintickets`, migration 043). The MFA endpoints and webauthn callbacks never trust client-asserted identity.
 - 2026-10-06: Migration numbers in use: 043–048, 050–055, 065–070 (049 and 056–064 unused).
 - 2026-10-07: Postgres RLS is on (054). Every new workspace table's migration must `SELECT public.tenancy_enable_rls('public.<table>')`; `tests/integration/flows/rls_test.go` fails otherwise. RLS restricts only transactions opened through `internal/tenancy` (they set `app.workspace_id` and run as `authsec_tenant`).
