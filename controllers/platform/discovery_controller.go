@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -389,34 +390,31 @@ type connectorLookup struct {
 func (ctl *DiscoveryController) credentialedConnector(wsID uuid.UUID, sourceID *uuid.UUID,
 	lookup connectorLookup) (bool, error) {
 
-	var conds []string
-	var args []interface{}
-	if sourceID != nil {
-		conds = append(conds, "s.id = ?")
-		args = append(args, *sourceID)
-	}
-	if lookup.ClusterName != "" {
-		conds = append(conds, "s.cluster_name = ?")
-		args = append(args, lookup.ClusterName)
-	}
-	if lookup.InstanceID != "" {
-		conds = append(conds, "s.instance_id = ?")
-		args = append(args, lookup.InstanceID)
-	}
-	if lookup.Fingerprint != "" {
-		conds = append(conds, `s.id IN (SELECT a.discovery_source_id FROM discovered_agents a
-			WHERE a.workspace_id = ? AND a.source = ? AND a.fingerprint = ?
-			AND a.discovery_source_id IS NOT NULL)`)
-		args = append(args, wsID, lookup.Source, lookup.Fingerprint)
-	}
-	if len(conds) == 0 {
+	if sourceID == nil && lookup.ClusterName == "" && lookup.InstanceID == "" && lookup.Fingerprint == "" {
 		return false, nil
 	}
+	// One fixed statement: a lookup field left empty (or a nil source id,
+	// bound as NULL) matches nothing, so only the fields the request named
+	// identify the connector.
+	var source interface{}
+	if sourceID != nil {
+		source = *sourceID
+	}
+	sqlDB, err := ctl.db.DB()
+	if err != nil {
+		return false, err
+	}
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: wsID})
 	var n int64
-	err := ctl.db.Table("discovery_sources s").
-		Where("s.workspace_id = ? AND s.actuation_token_hash <> ''", wsID).
-		Where("("+strings.Join(conds, " OR ")+")", args...).
-		Count(&n).Error
+	err = tenancy.QueryRowContext(ctx, sqlDB, `SELECT count(*) FROM discovery_sources s
+		WHERE s.workspace_id = $1 AND s.actuation_token_hash <> ''
+		  AND (s.id = $2::uuid
+		    OR ($3 <> '' AND s.cluster_name = $3)
+		    OR ($4 <> '' AND s.instance_id = $4)
+		    OR ($6 <> '' AND s.id IN (SELECT a.discovery_source_id FROM discovered_agents a
+		          WHERE a.workspace_id = $1 AND a.source = $5 AND a.fingerprint = $6
+		            AND a.discovery_source_id IS NOT NULL)))`,
+		[]interface{}{source, lookup.ClusterName, lookup.InstanceID, lookup.Source, lookup.Fingerprint}, &n)
 	return n > 0, err
 }
 

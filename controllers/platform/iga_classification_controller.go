@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -9,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // errNotWorkspaceHuman is every refusal of the actor rule: the token is not a
@@ -65,10 +67,21 @@ func humanActor(c *gin.Context, db *gorm.DB, ws uuid.UUID) (string, error) {
 
 	// The membership must be THIS workspace's, THIS user's, and ACTIVE.
 	var live int64
-	if err := db.Raw(`
-		SELECT count(*) FROM workspace_memberships
-		 WHERE id = ? AND workspace_id = ? AND user_id = ? AND status = 'active'`,
-		mid, ws, uid).Scan(&live).Error; err != nil {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return "", fmt.Errorf("verify membership: %w", err)
+	}
+	ctx := context.Background()
+	if c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	if tc, terr := tenancy.FromContext(ctx); terr == nil && tc.WorkspaceID != ws {
+		return "", fmt.Errorf("%w: workspace does not match the session", errNotWorkspaceHuman)
+	}
+	ctx = tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws})
+	if err := tenancy.QueryRowContext(ctx, sqlDB, `SELECT count(*) FROM workspace_memberships
+		 WHERE workspace_id = $1 AND id = $2 AND user_id = $3 AND status = 'active'`,
+		[]any{mid, uid}, &live); err != nil {
 		return "", fmt.Errorf("verify membership: %w", err)
 	}
 	if live == 0 {
