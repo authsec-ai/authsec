@@ -248,6 +248,10 @@ func main() {
 				qc := services.NewAWSQuickCreateService(
 					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
 					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
+				// The enforcement stack's Custom::AuthSecEnforcementRegistration
+				// (Phase 3, T3.09) reports through the same topics and queue.
+				qc.WithEnforcementHandler(services.NewEnforcementBindingService(config.DB, vc, cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN")))
 				// Built inside the goroutine: it reads the queue's settings from
 				// SQS, and a slow or unreachable SQS must never delay boot.
 				go func() {

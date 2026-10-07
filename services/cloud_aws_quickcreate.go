@@ -326,6 +326,22 @@ type AWSQuickCreateService struct {
 	verifier      awsdiscovery.Verifier
 	templateCheck func(ctx context.Context, templateURL string) error
 	sleep         func(ctx context.Context, d time.Duration) error
+
+	// enforcement handles Custom::AuthSecEnforcementRegistration messages
+	// (T3.09). Nil: they are rejected, as any unknown resource is.
+	enforcement EnforcementCallbackHandler
+}
+
+// EnforcementCallbackHandler handles an enforcement registration message that
+// arrived through one of AuthSec's callback topics.
+type EnforcementCallbackHandler interface {
+	HandleEnforcementCallback(ctx context.Context, env *awsdiscovery.SNSEnvelope, lastChance bool) CallbackOutcome
+}
+
+// WithEnforcementHandler routes enforcement registration messages to h.
+func (s *AWSQuickCreateService) WithEnforcementHandler(h EnforcementCallbackHandler) *AWSQuickCreateService {
+	s.enforcement = h
+	return s
 }
 
 // NewAWSQuickCreateService constructs the service. principal is the AuthSec
@@ -624,6 +640,16 @@ func (s *AWSQuickCreateService) HandleCallbackDelivery(ctx context.Context, body
 	}
 	if !s.cfg.IsOurTopic(env.TopicArn) {
 		lg.emit(CallbackReject.String(), "", "message did not arrive through an AuthSec callback topic")
+		return CallbackReject
+	}
+	// The enforcement stack's registration (T3.09) arrives through the same
+	// topics and queue; it is told apart by its resource type and logical id
+	// and handled by the enforcement binding service.
+	if awsdiscovery.IsEnforcementRegistration(env.Message) {
+		if s.enforcement != nil {
+			return s.enforcement.HandleEnforcementCallback(ctx, env, lastChance)
+		}
+		lg.emit(CallbackReject.String(), "", "enforcement registration, but no enforcement handler is configured")
 		return CallbackReject
 	}
 	req, err := awsdiscovery.ParseCFNRequest(env.Message)
@@ -1008,9 +1034,18 @@ func isAuthSecCredentialError(err error) bool {
 func (s *AWSQuickCreateService) deliver(
 	ctx context.Context, target *url.URL, resp awsdiscovery.CFNResponse,
 ) (out CallbackOutcome, rejected bool) {
+	return deliverCFN(ctx, s.http, s.sleep, target, resp)
+}
+
+// deliverCFN is deliver for any CloudFormation callback handler (discovery
+// and enforcement registration answer the same way).
+func deliverCFN(
+	ctx context.Context, client *http.Client, sleep func(context.Context, time.Duration) error,
+	target *url.URL, resp awsdiscovery.CFNResponse,
+) (out CallbackOutcome, rejected bool) {
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		err = awsdiscovery.SendCFNResponse(ctx, s.http, target, resp)
+		err = awsdiscovery.SendCFNResponse(ctx, client, target, resp)
 		if err == nil {
 			return CallbackDone, false
 		}
@@ -1020,7 +1055,7 @@ func (s *AWSQuickCreateService) deliver(
 			return CallbackDone, true
 		}
 		if attempt < 3 {
-			if serr := s.sleep(ctx, time.Duration(attempt)*time.Second); serr != nil {
+			if serr := sleep(ctx, time.Duration(attempt)*time.Second); serr != nil {
 				break
 			}
 		}

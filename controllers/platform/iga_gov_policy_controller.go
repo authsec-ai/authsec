@@ -156,7 +156,11 @@ var policyFeatures = []policyFeature{
 	{"proposals", false, "Policy proposals are not available in this build yet: policy authoring and proposal generation have not been released."},
 	{"export", false, "Policy export is not available in this build yet."},
 	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released."},
-	{"enforcement", false, "Direct enforcement is not available in this build: the AuthSec enforcement role binding and the AWS enforcement adapter have not been released, so every workspace is findings-only."},
+	// T3.09 ships the enforcement role binding (§7.9, under
+	// /authsec/discovery/aws/connectors/:id/enforcement); the flag stays
+	// false because direct enforcement also needs the AWS enforcement adapter
+	// (T3.10) and deployments (T3.15/T3.16), which are not in this build.
+	{"enforcement", false, "Direct enforcement is not available in this build: the AuthSec enforcement role can be bound and self-tested, but the AWS enforcement adapter and deployments have not been released, so every workspace is findings-only."},
 	{"slack", false, "Slack approvals are not available in this build: the Slack app has not been released."},
 }
 
