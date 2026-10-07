@@ -1,0 +1,1 @@
+{"Statement":[{"Effect":"Allow","NotAction":["ec2:*","sqs:*"],"Resource":"*","Sid":"AuthSecAllowAllExceptRemoved"}],"Version":"2012-10-17"}

@@ -1,0 +1,1 @@
+{"artifact_state":{"attachment_set":[{"id":"AROAEXAMPLEREFUND01","kind":"role","name":"RefundTaskRole","usage":"boundary"}],"boundary_arn":"arn:aws:iam::429418377036:policy/authsec/AuthSecBoundary-AROAEXAMPLEREFUND01","boundary_document_hash":"sha256:7702fdaac1fada8875af1927d89c7c32fbf90a5086201d039524a10c8e9f2c29","role_id":"AROAEXAMPLEREFUND01"}}
