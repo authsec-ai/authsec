@@ -60,7 +60,8 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 	controller := &EndUserAuthController{}
 
 	userID := uuid.New()
-	token, err := controller.generateJWTToken("tenant-1", "client-1", "user@example.com", "example.com", &userID, nil)
+	workspaceID := uuid.NewString() // a token is always for a real workspace (AS-095)
+	token, err := controller.generateJWTToken(workspaceID, "client-1", "user@example.com", "example.com", &userID, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, token)
 
@@ -81,8 +82,8 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 	assert.Equal(t, "authsec-ai/auth-manager", claims["iss"])
 	assert.Equal(t, "authsec-enduser", claims["aud"])
 	assert.Equal(t, "enduser", claims["typ"])
-	assert.Equal(t, "tenant-1", claims["workspace_id"])
-	assert.Equal(t, "tenant-1", claims["project_id"]) // project_id defaults to workspace_id for endusers
+	assert.Equal(t, workspaceID, claims["workspace_id"])
+	assert.Equal(t, workspaceID, claims["project_id"]) // project_id defaults to workspace_id for endusers
 	assert.Equal(t, "client-1", claims["client_id"])
 	assert.Equal(t, "user@example.com", claims["email_id"])
 

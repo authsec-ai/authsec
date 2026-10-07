@@ -36,6 +36,20 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 	}, nil
 }
 
+// ErrNoWorkspace refuses a session token that would carry no workspace (or a
+// placeholder such as "admin"): every token is for exactly one workspace
+// (ADR-0001 §5.1, AS-095).
+var ErrNoWorkspace = fmt.Errorf("token: a workspace_id is required")
+
+// requireWorkspace accepts only a real workspace id.
+func requireWorkspace(workspaceID string) error {
+	id, err := uuid.Parse(workspaceID)
+	if err != nil || id == uuid.Nil {
+		return ErrNoWorkspace
+	}
+	return nil
+}
+
 func (s *AuthManagerTokenService) secrets() sessiontoken.Secrets {
 	return sessiontoken.Secrets{Default: string(s.jwtDefaultSecret), SDK: string(s.jwtSDKSecret)}
 }
@@ -99,6 +113,9 @@ func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, works
 
 // Uses the same algorithm as auth-manager's TokenController.GenerateToken()
 func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, tokenType string, class sessiontoken.Class) (string, error) {
+	if err := requireWorkspace(claims.WorkspaceID); err != nil {
+		return "", err
+	}
 	now := time.Now()
 	expiresIn := claims.ExpiresIn
 	if expiresIn == 0 {
@@ -168,6 +185,9 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	// Auth-manager's TokenController.GenerateToken() requires Gin context
 	// Since we're using it programmatically, we replicate its logic here
 	// using the same signing secrets and algorithm
+	if err := requireWorkspace(req.WorkspaceID); err != nil {
+		return "", err
+	}
 
 	tokenType := "default"
 	class := sessiontoken.Admin
@@ -199,11 +219,12 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 
 // GenerateAdminToken generates a token for admin users
 func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, workspaceDomain string, roles []string) (string, error) {
-	// Use actual workspace_id if provided, otherwise default to "admin" for super-admins
-	workspaceIDStr := "admin"
-	if workspaceID != nil && *workspaceID != uuid.Nil {
-		workspaceIDStr = workspaceID.String()
+	// An admin without a workspace gets no token (AS-095); there is no
+	// "admin" pseudo-workspace.
+	if workspaceID == nil || *workspaceID == uuid.Nil {
+		return "", ErrNoWorkspace
 	}
+	workspaceIDStr := workspaceID.String()
 
 	claims := TokenClaims{
 		WorkspaceID:     workspaceIDStr,  // Use actual workspace_id
