@@ -781,7 +781,7 @@ func (asc *AdminSyncController) loadStoredEntraConfig(configID, workspaceID stri
 
 	// Build shared.EntraIDConfig
 	entraConfig := shared.EntraIDConfig{
-		WorkspaceID:     syncConfig.EntraWorkspaceID,
+		WorkspaceID:     syncConfig.EntraTenantID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

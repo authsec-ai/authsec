@@ -762,7 +762,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, workspaceID, clien
 
 	// Build EntraIDConfig
 	entraConfig := EntraIDConfig{
-		WorkspaceID:     syncConfig.EntraWorkspaceID,
+		WorkspaceID:     syncConfig.EntraTenantID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,
