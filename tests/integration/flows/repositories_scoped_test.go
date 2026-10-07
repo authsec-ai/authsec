@@ -62,6 +62,34 @@ func Test_ScopedRepo_CreateOIDCEndUser(t *testing.T) {
 	}
 }
 
+// DeleteTenant removes the ctx workspace's rows and registry row and nothing
+// of another workspace.
+func Test_ScopedRepo_DeleteTenant(t *testing.T) {
+	a, b := TwoTenants(t)
+	repo := database.NewWorkspaceRepository(config.GetDatabase())
+	usersB := countWhere(t, "users", "workspace_id = ?", b.WS.WorkspaceID)
+	bindingsB := countWhere(t, "role_bindings", "workspace_id = ?", b.WS.WorkspaceID)
+	if usersB == 0 || bindingsB == 0 {
+		t.Fatalf("B seeded with %d users, %d bindings", usersB, bindingsB)
+	}
+
+	if _, err := repo.DeleteTenant(context.Background()); err == nil {
+		t.Fatal("DeleteTenant without a workspace in ctx succeeded")
+	}
+	counts, err := repo.DeleteTenant(database.WithWorkspace(context.Background(), a.WS.WorkspaceID))
+	if err != nil {
+		t.Fatalf("delete A: %v", err)
+	}
+	if counts["workspaces"] != 1 || counts["users"] == 0 {
+		t.Errorf("deleted counts: %v", counts)
+	}
+	assertCount(t, 0, "users", "workspace_id = ?", a.WS.WorkspaceID)
+	assertCount(t, 0, "workspaces", "id = ?", a.WS.WorkspaceID)
+	assertCount(t, usersB, "users", "workspace_id = ?", b.WS.WorkspaceID)
+	assertCount(t, bindingsB, "role_bindings", "workspace_id = ?", b.WS.WorkspaceID)
+	assertCount(t, 1, "workspaces", "id = ?", b.WS.WorkspaceID)
+}
+
 // Workspace domains: every by-id statement runs in the caller's workspace, so
 // another workspace's domain id reads, verifies, promotes and deletes nothing.
 func Test_ScopedRepo_WorkspaceDomains(t *testing.T) {

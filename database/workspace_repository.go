@@ -151,26 +151,46 @@ func (tr *WorkspaceRepository) DeleteTenant(ctx context.Context) (map[string]int
 		return nil, err
 	}
 	deletedCounts := make(map[string]int64)
-	steps := []struct{ table, query string }{
-		{"role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1"},
-		{"role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)"},
-		{"roles", "DELETE FROM roles WHERE workspace_id = $1"},
-		{"permissions", "DELETE FROM permissions WHERE workspace_id = $1"},
-		{"oauth_scopes", "DELETE FROM oauth_scopes WHERE workspace_id = $1"},
-		{"totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1"},
-		{"user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)"},
-		{"users", "DELETE FROM users WHERE workspace_id = $1"},
-		{"workspace_memberships", "DELETE FROM workspace_memberships WHERE workspace_id = $1"},
-	}
-	err = tenancy.WithTx(ctx, tr.db.DB, workspaceID, func(tx *sql.Tx) error {
-		for _, step := range steps {
-			result, err := tenancy.ExecContext(ctx, tx, step.query)
+	// deleted records the rows one scoped statement removed from table.
+	deleted := func(table string) func(sql.Result, error) error {
+		return func(result sql.Result, err error) error {
 			if err != nil {
-				return fmt.Errorf("failed to delete from %s: %w", step.table, err)
+				return fmt.Errorf("failed to delete from %s: %w", table, err)
 			}
 			if rows, err := result.RowsAffected(); err == nil {
-				deletedCounts[step.table] = rows
+				deletedCounts[table] = rows
 			}
+			return nil
+		}
+	}
+	err = tenancy.WithTx(ctx, tr.db.DB, workspaceID, func(tx *sql.Tx) error {
+		// Memberships reference roles and users: they go first.
+		if err := deleted("workspace_memberships")(tenancy.ExecContext(ctx, tx, "DELETE FROM workspace_memberships WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("role_bindings")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_bindings WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("role_permissions")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		if err := deleted("roles")(tenancy.ExecContext(ctx, tx, "DELETE FROM roles WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("permissions")(tenancy.ExecContext(ctx, tx, "DELETE FROM permissions WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("oauth_scopes")(tenancy.ExecContext(ctx, tx, "DELETE FROM oauth_scopes WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("totp_secrets")(tenancy.ExecContext(ctx, tx, "DELETE FROM totp_secrets WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("user_groups")(tenancy.ExecContext(ctx, tx, "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		if err := deleted("users")(tenancy.ExecContext(ctx, tx, "DELETE FROM users WHERE workspace_id = $1")); err != nil {
+			return err
 		}
 		// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id
 		// column); this removes the registry row of the scoped workspace.
