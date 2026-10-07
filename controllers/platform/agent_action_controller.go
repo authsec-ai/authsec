@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -115,7 +116,14 @@ func (ctrl *AgentActionController) PollActionStatus(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.actionService.PollActionStatus(actionReqID)
+	// Only a request of the caller's workspace is found (token's workspace).
+	workspaceID, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "workspace not resolved"})
+		return
+	}
+
+	resp, err := ctrl.actionService.PollActionStatus(workspaceID, actionReqID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to poll action status", "details": err.Error()})
 		return

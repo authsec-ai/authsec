@@ -1,11 +1,14 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -23,6 +26,13 @@ func NewAgentActionRepository(db *DBConnection) *AgentActionRepository {
 // GetDB returns the underlying database connection for direct queries
 func (r *AgentActionRepository) GetDB() *DBConnection {
 	return r.db
+}
+
+// in returns a context whose tenant is workspace ws. Every statement of this
+// repository runs through the scoped layer in that workspace (workspace_id =
+// $1), inside a row-level security transaction.
+func (r *AgentActionRepository) in(ws uuid.UUID) context.Context {
+	return WithWorkspace(context.Background(), ws)
 }
 
 // ========================================
@@ -43,12 +53,11 @@ func (r *AgentActionRepository) CreateRiskPolicy(policy *models.RiskPolicy) erro
 			pii_modifier, financial_modifier, off_hours_modifier, first_time_modifier,
 			auto_approve_below, require_approval_above, require_multi_approval_above,
 			is_active, priority, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+		) VALUES ($2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 	`
 
-	_, err := r.db.Exec(query,
+	err := insertScoped(r.in(policy.WorkspaceID), r.db.DB, query,
 		policy.ID,
-		policy.WorkspaceID,
 		policy.Name,
 		policy.Description,
 		policy.ActionPattern,
@@ -91,27 +100,24 @@ func (r *AgentActionRepository) GetRiskPoliciesByTenant(workspaceID uuid.UUID) (
 		ORDER BY priority DESC, created_at ASC
 	`
 
-	rows, err := r.db.Query(query, workspaceID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query risk policies: %w", err)
-	}
-	defer rows.Close()
-
 	var policies []models.RiskPolicy
-	for rows.Next() {
+	err := queryScoped(r.in(workspaceID), r.db.DB, query, nil, func(rows *sql.Rows) error {
 		var p models.RiskPolicy
-		err := rows.Scan(
+		if err := rows.Scan(
 			&p.ID, &p.WorkspaceID, &p.Name, &p.Description,
 			&p.ActionPattern, &p.ResourcePattern, &p.EnvironmentPattern,
 			&p.BaseScore, &p.ScopeBulkThreshold, &p.ScopeBulkModifier,
 			&p.PIIModifier, &p.FinancialModifier, &p.OffHoursModifier, &p.FirstTimeModifier,
 			&p.AutoApproveBelow, &p.RequireApprovalAbove, &p.RequireMultiApprovalAbove,
 			&p.IsActive, &p.Priority, &p.CreatedAt, &p.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan risk policy: %w", err)
+		); err != nil {
+			return fmt.Errorf("failed to scan risk policy: %w", err)
 		}
 		policies = append(policies, p)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query risk policies: %w", err)
 	}
 
 	return policies, nil
@@ -127,11 +133,11 @@ func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, workspaceI
 		       auto_approve_below, require_approval_above, require_multi_approval_above,
 		       is_active, priority, created_at, updated_at
 		FROM risk_policies
-		WHERE id = $1 AND workspace_id = $2
+		WHERE workspace_id = $1 AND id = $2
 	`
 
 	var p models.RiskPolicy
-	err := r.db.QueryRow(query, policyID, workspaceID).Scan(
+	err := tenancy.QueryRowContext(r.in(workspaceID), r.db.DB, query, []interface{}{policyID},
 		&p.ID, &p.WorkspaceID, &p.Name, &p.Description,
 		&p.ActionPattern, &p.ResourcePattern, &p.EnvironmentPattern,
 		&p.BaseScore, &p.ScopeBulkThreshold, &p.ScopeBulkModifier,
@@ -141,7 +147,7 @@ func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, workspaceI
 	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, tenancy.ErrNotFound) {
 			return nil, fmt.Errorf("risk policy not found")
 		}
 		return nil, fmt.Errorf("failed to get risk policy: %w", err)
@@ -157,23 +163,23 @@ func (r *AgentActionRepository) UpdateRiskPolicy(policy *models.RiskPolicy) erro
 
 	query := `
 		UPDATE risk_policies SET
-			name = $1, description = $2,
-			action_pattern = $3, resource_pattern = $4, environment_pattern = $5,
-			base_score = $6, scope_bulk_threshold = $7, scope_bulk_modifier = $8,
-			pii_modifier = $9, financial_modifier = $10, off_hours_modifier = $11, first_time_modifier = $12,
-			auto_approve_below = $13, require_approval_above = $14, require_multi_approval_above = $15,
-			is_active = $16, priority = $17, updated_at = $18
-		WHERE id = $19 AND workspace_id = $20
+			name = $2, description = $3,
+			action_pattern = $4, resource_pattern = $5, environment_pattern = $6,
+			base_score = $7, scope_bulk_threshold = $8, scope_bulk_modifier = $9,
+			pii_modifier = $10, financial_modifier = $11, off_hours_modifier = $12, first_time_modifier = $13,
+			auto_approve_below = $14, require_approval_above = $15, require_multi_approval_above = $16,
+			is_active = $17, priority = $18, updated_at = $19
+		WHERE workspace_id = $1 AND id = $20
 	`
 
-	result, err := r.db.Exec(query,
+	result, err := tenancy.ExecContext(r.in(policy.WorkspaceID), r.db.DB, query,
 		policy.Name, policy.Description,
 		policy.ActionPattern, policy.ResourcePattern, policy.EnvironmentPattern,
 		policy.BaseScore, policy.ScopeBulkThreshold, policy.ScopeBulkModifier,
 		policy.PIIModifier, policy.FinancialModifier, policy.OffHoursModifier, policy.FirstTimeModifier,
 		policy.AutoApproveBelow, policy.RequireApprovalAbove, policy.RequireMultiApprovalAbove,
 		policy.IsActive, policy.Priority, policy.UpdatedAt,
-		policy.ID, policy.WorkspaceID,
+		policy.ID,
 	)
 
 	if err != nil {
@@ -192,11 +198,11 @@ func (r *AgentActionRepository) UpdateRiskPolicy(policy *models.RiskPolicy) erro
 func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, workspaceID uuid.UUID) error {
 	now := time.Now().Unix()
 	query := `
-		UPDATE risk_policies SET is_active = FALSE, updated_at = $1
-		WHERE id = $2 AND workspace_id = $3
+		UPDATE risk_policies SET is_active = FALSE, updated_at = $2
+		WHERE workspace_id = $1 AND id = $3
 	`
 
-	result, err := r.db.Exec(query, now, policyID, workspaceID)
+	result, err := tenancy.ExecContext(r.in(workspaceID), r.db.DB, query, now, policyID)
 	if err != nil {
 		return fmt.Errorf("failed to delete risk policy: %w", err)
 	}
@@ -227,7 +233,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(workspaceID uuid.UUID) (*mod
 	`
 
 	var s models.AgentGuardSettings
-	err := r.db.QueryRow(query, workspaceID).Scan(
+	err := tenancy.QueryRowContext(r.in(workspaceID), r.db.DB, query, nil,
 		&s.ID, &s.WorkspaceID,
 		&s.AutoApproveBelow, &s.RequireApprovalAbove, &s.RequireMultiApprovalAbove,
 		&s.ApprovalTimeoutSeconds, &s.PollingIntervalSeconds,
@@ -240,7 +246,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(workspaceID uuid.UUID) (*mod
 		return &s, nil
 	}
 
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, tenancy.ErrNotFound) {
 		return nil, fmt.Errorf("failed to get agent guard settings: %w", err)
 	}
 
@@ -270,12 +276,12 @@ func (r *AgentActionRepository) GetOrCreateSettings(workspaceID uuid.UUID) (*mod
 			business_hours_start, business_hours_end, business_hours_timezone,
 			default_approver_user_id, require_biometric,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (workspace_id) DO NOTHING
 	`
 
-	_, err = r.db.Exec(insertQuery,
-		s.ID, s.WorkspaceID,
+	err = insertScoped(r.in(workspaceID), r.db.DB, insertQuery,
+		s.ID,
 		s.AutoApproveBelow, s.RequireApprovalAbove, s.RequireMultiApprovalAbove,
 		s.ApprovalTimeoutSeconds, s.PollingIntervalSeconds,
 		s.BusinessHoursStart, s.BusinessHoursEnd, s.BusinessHoursTimezone,
@@ -297,20 +303,20 @@ func (r *AgentActionRepository) UpdateSettings(settings *models.AgentGuardSettin
 
 	query := `
 		UPDATE agent_guard_settings SET
-			auto_approve_below = $1, require_approval_above = $2, require_multi_approval_above = $3,
-			approval_timeout_seconds = $4, polling_interval_seconds = $5,
-			business_hours_start = $6, business_hours_end = $7, business_hours_timezone = $8,
-			default_approver_user_id = $9, require_biometric = $10,
-			updated_at = $11
-		WHERE workspace_id = $12
+			auto_approve_below = $2, require_approval_above = $3, require_multi_approval_above = $4,
+			approval_timeout_seconds = $5, polling_interval_seconds = $6,
+			business_hours_start = $7, business_hours_end = $8, business_hours_timezone = $9,
+			default_approver_user_id = $10, require_biometric = $11,
+			updated_at = $12
+		WHERE workspace_id = $1
 	`
 
-	_, err := r.db.Exec(query,
+	_, err := tenancy.ExecContext(r.in(settings.WorkspaceID), r.db.DB, query,
 		settings.AutoApproveBelow, settings.RequireApprovalAbove, settings.RequireMultiApprovalAbove,
 		settings.ApprovalTimeoutSeconds, settings.PollingIntervalSeconds,
 		settings.BusinessHoursStart, settings.BusinessHoursEnd, settings.BusinessHoursTimezone,
 		settings.DefaultApproverUserID, settings.RequireBiometric,
-		settings.UpdatedAt, settings.WorkspaceID,
+		settings.UpdatedAt,
 	)
 
 	if err != nil {
@@ -348,11 +354,11 @@ func (r *AgentActionRepository) CreateActionRequest(req *models.AgentActionReque
 			status, approval_type, required_approvals, received_approvals,
 			ciba_auth_req_id, device_token_id,
 			expires_at, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		) VALUES ($2, $3, $1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 	`
 
-	_, err = r.db.Exec(query,
-		req.ID, req.ActionReqID, req.WorkspaceID, req.UserID, req.UserEmail,
+	err = insertScoped(r.in(req.WorkspaceID), r.db.DB, query,
+		req.ID, req.ActionReqID, req.UserID, req.UserEmail,
 		req.AgentID, req.AgentName, req.AgentFramework, req.SessionID,
 		req.Action, req.Resource, req.Detail, metadataJSON,
 		req.RiskScore, req.RiskLevel, riskFactorsJSON, req.MatchedPolicyID,
@@ -368,8 +374,9 @@ func (r *AgentActionRepository) CreateActionRequest(req *models.AgentActionReque
 	return nil
 }
 
-// GetActionRequestByID retrieves an agent action request by action_req_id
-func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*models.AgentActionRequest, error) {
+// GetActionRequestByID retrieves an agent action request of workspace ws by
+// action_req_id; another workspace's request is not found.
+func (r *AgentActionRepository) GetActionRequestByID(ws uuid.UUID, actionReqID string) (*models.AgentActionRequest, error) {
 	query := `
 		SELECT id, action_req_id, workspace_id, user_id, user_email,
 		       agent_id, agent_name, agent_framework, session_id,
@@ -379,13 +386,13 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 		       ciba_auth_req_id, device_token_id,
 		       expires_at, created_at, decided_at, last_polled_at
 		FROM agent_action_requests
-		WHERE action_req_id = $1
+		WHERE workspace_id = $1 AND action_req_id = $2
 	`
 
 	var req models.AgentActionRequest
 	var metadataJSON, riskFactorsJSON []byte
 
-	err := r.db.QueryRow(query, actionReqID).Scan(
+	err := tenancy.QueryRowContext(r.in(ws), r.db.DB, query, []interface{}{actionReqID},
 		&req.ID, &req.ActionReqID, &req.WorkspaceID, &req.UserID, &req.UserEmail,
 		&req.AgentID, &req.AgentName, &req.AgentFramework, &req.SessionID,
 		&req.Action, &req.Resource, &req.Detail, &metadataJSON,
@@ -396,7 +403,7 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, tenancy.ErrNotFound) {
 			return nil, fmt.Errorf("agent action request not found")
 		}
 		return nil, fmt.Errorf("failed to get agent action request: %w", err)
@@ -430,14 +437,8 @@ func (r *AgentActionRepository) GetPendingActionsByUser(workspaceID uuid.UUID, u
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.Query(query, workspaceID, userID, now)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query pending actions: %w", err)
-	}
-	defer rows.Close()
-
 	var results []models.AgentActionRequest
-	for rows.Next() {
+	err := queryScoped(r.in(workspaceID), r.db.DB, query, []interface{}{userID, now}, func(rows *sql.Rows) error {
 		var req models.AgentActionRequest
 		var metadataJSON, riskFactorsJSON []byte
 		var matchedPolicyID, deviceTokenID sql.NullString
@@ -453,7 +454,7 @@ func (r *AgentActionRepository) GetPendingActionsByUser(workspaceID uuid.UUID, u
 			&req.ExpiresAt, &req.CreatedAt, &decidedAt, &lastPolledAt,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan pending action: %w", err)
+			return fmt.Errorf("failed to scan pending action: %w", err)
 		}
 
 		if matchedPolicyID.Valid {
@@ -478,21 +479,25 @@ func (r *AgentActionRepository) GetPendingActionsByUser(workspaceID uuid.UUID, u
 		}
 
 		results = append(results, req)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending actions: %w", err)
 	}
 
 	return results, nil
 }
 
-// UpdateActionRequestStatus updates the status of an action request
-func (r *AgentActionRepository) UpdateActionRequestStatus(actionReqID string, status string) error {
+// UpdateActionRequestStatus updates the status of an action request of workspace ws
+func (r *AgentActionRepository) UpdateActionRequestStatus(ws uuid.UUID, actionReqID string, status string) error {
 	now := time.Now().Unix()
 	query := `
 		UPDATE agent_action_requests
-		SET status = $1, decided_at = $2
-		WHERE action_req_id = $3
+		SET status = $2, decided_at = $3
+		WHERE workspace_id = $1 AND action_req_id = $4
 	`
 
-	_, err := r.db.Exec(query, status, now, actionReqID)
+	_, err := tenancy.ExecContext(r.in(ws), r.db.DB, query, status, now, actionReqID)
 	if err != nil {
 		return fmt.Errorf("failed to update action request status: %w", err)
 	}
@@ -501,17 +506,19 @@ func (r *AgentActionRepository) UpdateActionRequestStatus(actionReqID string, st
 }
 
 
-// UpdateLastPolled updates the last_polled_at timestamp
-func (r *AgentActionRepository) UpdateLastPolled(actionReqID string) error {
+// UpdateLastPolled updates the last_polled_at timestamp of a request of workspace ws
+func (r *AgentActionRepository) UpdateLastPolled(ws uuid.UUID, actionReqID string) error {
 	now := time.Now().Unix()
-	query := `UPDATE agent_action_requests SET last_polled_at = $1 WHERE action_req_id = $2`
-	_, err := r.db.Exec(query, now, actionReqID)
+	_, err := tenancy.ExecContext(r.in(ws), r.db.DB,
+		`UPDATE agent_action_requests SET last_polled_at = $2 WHERE workspace_id = $1 AND action_req_id = $3`,
+		now, actionReqID)
 	return err
 }
 
 // ExpireOldActionRequests marks expired pending requests
 func (r *AgentActionRepository) ExpireOldActionRequests() (int64, error) {
 	now := time.Now().Unix()
+	// TENANT-EXEMPT: platform sweeper; expires pending requests of every workspace by time alone
 	query := `
 		UPDATE agent_action_requests
 		SET status = 'expired', decided_at = $1
@@ -532,13 +539,13 @@ func (r *AgentActionRepository) HasPriorAction(agentID string, action string, re
 	query := `
 		SELECT EXISTS(
 			SELECT 1 FROM agent_action_audit_log
-			WHERE agent_id = $1 AND action = $2 AND resource = $3 AND workspace_id = $4
+			WHERE workspace_id = $1 AND agent_id = $2 AND action = $3 AND resource = $4
 			AND final_status IN ('approved', 'auto_approved')
 		)
 	`
 
 	var exists bool
-	err := r.db.QueryRow(query, agentID, action, resource, workspaceID).Scan(&exists)
+	err := tenancy.QueryRowContext(r.in(workspaceID), r.db.DB, query, []interface{}{agentID, action, resource}, &exists)
 	if err != nil {
 		return false, fmt.Errorf("failed to check prior action: %w", err)
 	}
@@ -550,22 +557,28 @@ func (r *AgentActionRepository) HasPriorAction(agentID string, action string, re
 // Agent Action Decision Operations
 // ========================================
 
-// CreateDecision records a human's approval/denial.
+// CreateDecision records a human's approval/denial on a request of workspace ws.
 // Returns (true, nil) if the row was inserted, (false, nil) if the approver already voted
-// (the unique constraint on (action_request_id, approver_user_id) enforces one vote per user).
-func (r *AgentActionRepository) CreateDecision(decision *models.AgentActionDecision) (bool, error) {
+// (the unique constraint on (action_request_id, approver_user_id) enforces one vote per user)
+// or the request is not one of the workspace's.
+func (r *AgentActionRepository) CreateDecision(ws uuid.UUID, decision *models.AgentActionDecision) (bool, error) {
 	now := time.Now().Unix()
 	decision.CreatedAt = now
 
+	// agent_action_decisions has no workspace_id: the decision is written only
+	// for a request of the workspace.
 	query := `
 		INSERT INTO agent_action_decisions (
 			id, action_request_id, approver_user_id, approver_email,
 			decision, reason, biometric_verified, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		)
+		SELECT $2, ar.id, $4, $5, $6, $7, $8, $9
+		  FROM agent_action_requests ar
+		 WHERE ar.workspace_id = $1 AND ar.id = $3
 		ON CONFLICT (action_request_id, approver_user_id) DO NOTHING
 	`
 
-	result, err := r.db.Exec(query,
+	result, err := tenancy.ExecContext(r.in(ws), r.db.DB, query,
 		decision.ID, decision.ActionRequestID, decision.ApproverUserID, decision.ApproverEmail,
 		decision.Decision, decision.Reason, decision.BiometricVerified, decision.CreatedAt,
 	)
@@ -581,7 +594,7 @@ func (r *AgentActionRepository) CreateDecision(decision *models.AgentActionDecis
 // CountDistinctApprovers returns (distinctApproveVotes, requiredApprovals) for the request.
 // It counts only decisions with decision='approved' to prevent a single deny vote from
 // blocking the threshold count.
-func (r *AgentActionRepository) CountDistinctApprovers(actionReqID string) (int, int, error) {
+func (r *AgentActionRepository) CountDistinctApprovers(ws uuid.UUID, actionReqID string) (int, int, error) {
 	query := `
 		SELECT
 			COUNT(DISTINCT d.approver_user_id),
@@ -589,12 +602,12 @@ func (r *AgentActionRepository) CountDistinctApprovers(actionReqID string) (int,
 		FROM agent_action_requests r
 		LEFT JOIN agent_action_decisions d
 			ON d.action_request_id = r.id AND d.decision = 'approved'
-		WHERE r.action_req_id = $1
+		WHERE r.workspace_id = $1 AND r.action_req_id = $2
 		GROUP BY r.required_approvals
 	`
 
 	var received, required int
-	err := r.db.QueryRow(query, actionReqID).Scan(&received, &required)
+	err := tenancy.QueryRowContext(r.in(ws), r.db.DB, query, []interface{}{actionReqID}, &received, &required)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to count approvers: %w", err)
 	}
@@ -628,11 +641,11 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 			action, resource, detail, metadata,
 			risk_score, risk_level, final_status, decided_by,
 			requested_at, decided_at, execution_duration_ms, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		) VALUES ($2, $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`
 
-	_, err = r.db.Exec(query,
-		entry.ID, entry.WorkspaceID, entry.ActionRequestID,
+	err = insertScoped(r.in(entry.WorkspaceID), r.db.DB, query,
+		entry.ID, entry.ActionRequestID,
 		entry.AgentID, entry.AgentName, entry.UserID, entry.UserEmail,
 		entry.Action, entry.Resource, entry.Detail, metadataJSON,
 		entry.RiskScore, entry.RiskLevel, entry.FinalStatus, decidedByJSON,
@@ -649,9 +662,9 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 // GetAuditLog retrieves paginated audit entries for a tenant
 func (r *AgentActionRepository) GetAuditLog(workspaceID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
 	// Count total
-	countQuery := `SELECT COUNT(*) FROM agent_action_audit_log WHERE workspace_id = $1`
+	ctx := r.in(workspaceID)
 	var total int
-	err := r.db.QueryRow(countQuery, workspaceID).Scan(&total)
+	err := tenancy.QueryRowContext(ctx, r.db.DB, `SELECT COUNT(*) FROM agent_action_audit_log WHERE workspace_id = $1`, nil, &total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count audit entries: %w", err)
 	}
@@ -669,14 +682,8 @@ func (r *AgentActionRepository) GetAuditLog(workspaceID uuid.UUID, page, perPage
 		LIMIT $2 OFFSET $3
 	`
 
-	rows, err := r.db.Query(query, workspaceID, perPage, offset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to query audit log: %w", err)
-	}
-	defer rows.Close()
-
 	var entries []models.AgentActionAuditLog
-	for rows.Next() {
+	err = queryScoped(ctx, r.db.DB, query, []interface{}{perPage, offset}, func(rows *sql.Rows) error {
 		var e models.AgentActionAuditLog
 		var metadataJSON, decidedByJSON []byte
 
@@ -688,7 +695,7 @@ func (r *AgentActionRepository) GetAuditLog(workspaceID uuid.UUID, page, perPage
 			&e.RequestedAt, &e.DecidedAt, &e.ExecutionDurationMs, &e.CreatedAt,
 		)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to scan audit entry: %w", err)
+			return fmt.Errorf("failed to scan audit entry: %w", err)
 		}
 
 		if metadataJSON != nil {
@@ -699,6 +706,10 @@ func (r *AgentActionRepository) GetAuditLog(workspaceID uuid.UUID, page, perPage
 		}
 
 		entries = append(entries, e)
+		return nil
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query audit log: %w", err)
 	}
 
 	return entries, total, nil
