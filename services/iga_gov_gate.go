@@ -150,8 +150,10 @@ func (g *PolicyGate) Verify(db *gorm.DB) error {
 }
 
 // VerifyUntilReady retries Verify until it succeeds or ctx ends, logging each
-// decision. A transient error is retried, never cached as an answer.
-func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval time.Duration) {
+// decision. A transient error is retried, never cached as an answer. Each
+// onReady runs once, after the FIRST successful verification (T3.08: the
+// policy job worker starts there, never before the schema is verified).
+func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval time.Duration, onReady ...func()) {
 	if !g.Enabled() {
 		return
 	}
@@ -169,6 +171,11 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 				// it on every request, so the routes open the moment it is.
 				log.Printf("[policy] %s=on: Phase 3 schema verified at %s, but unavailable until the graph is: %s",
 					PolicyEnv, PolicySchemaHead, reason)
+			}
+			for _, f := range onReady {
+				if f != nil {
+					f()
+				}
 			}
 			return
 		}

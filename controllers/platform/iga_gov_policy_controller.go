@@ -17,9 +17,10 @@ import (
 //	503 {"error": {"code": "policy_unavailable", "message": "...", "detail": {"reason": "..."}}}
 //
 // with the same reason GET /api/iga/v1/capabilities reports in policy.reason,
-// before any permission or handler runs. Only GET /policy/status is mounted
-// in this build; the §7 routes are added to RegisterIGAPolicyRoutes by the
-// tasks that implement them, and inherit the gate by being in the group.
+// before any permission or handler runs. GET /policy/status
+// and the §7.1 owners routes (T3.07) are mounted in this build; the other §7
+// routes are added to RegisterIGAPolicyRoutes by the tasks that implement
+// them, and inherit the gate by being in the group.
 
 // IGAGovPolicyController serves /api/iga/v1/policy.
 type IGAGovPolicyController struct {
@@ -67,6 +68,14 @@ func MountIGAPolicyRoutes(r gin.IRouter, ctl *IGAGovPolicyController, auth gin.H
 // carries auth and the gate. One table, so tests assert the same one.
 func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require func(resource, action string) gin.HandlerFunc) {
 	g.GET("/status", require("governance", "read"), ctl.GetStatus)
+
+	// §7.1 owners (T3.07, iga_gov_owners_controller.go).
+	g.GET("/owners", require("governance", "read"), ctl.GetOwners)
+	g.PUT("/owners", require("iga", "admin"), ctl.PutOwners)
+	g.PATCH("/owners/:id", require("iga", "admin"), ctl.PatchOwner)
+	g.GET("/owner-rules", require("iga", "admin"), ctl.ListOwnerRules)
+	g.POST("/owner-rules", require("iga", "admin"), ctl.CreateOwnerRule)
+	g.DELETE("/owner-rules/:id", require("iga", "admin"), ctl.DeleteOwnerRule)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
