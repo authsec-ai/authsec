@@ -67,6 +67,15 @@ type AWSPermissionScanner struct {
 	// evidence records why each permission and resource row exists. Nil writes
 	// nothing.
 	evidence *ObservationWriter
+
+	// Phase 3 resource-policy collection (T3.03b,
+	// cloud_aws_resource_policy_collection.go): 056's writer, and the test
+	// seams that replace the per-region clients, the region listing and the
+	// collector's pacing.
+	rpRepo        repositories.CloudResourcePolicyRepository
+	rpClients     awsdiscovery.ResourcePolicyClientsFunc
+	regionsAPI    awsdiscovery.RegionsAPI
+	collectorOpts *awsdiscovery.CollectorOptions
 }
 
 // WithEvidence attaches an observation writer for this run.
@@ -80,6 +89,7 @@ func (s *AWSPermissionScanner) WithEvidence(w *ObservationWriter) *AWSPermission
 func (s *AWSPermissionScanner) WithFence(f repositories.ScanFence) *AWSPermissionScanner {
 	s.grants = s.grants.Fenced(f)
 	s.policies = s.policies.Fenced(f)
+	s.rpRepo = s.rpRepo.Fenced(f)
 	return s
 }
 
@@ -90,6 +100,7 @@ func NewAWSPermissionScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWS
 		identities: repositories.NewCloudIdentityRepository(db),
 		grants:     repositories.NewCloudPermissionRepository(db),
 		policies:   repositories.NewCloudPolicyRepository(db),
+		rpRepo:     repositories.NewCloudResourcePolicyRepository(db),
 		onboarding: onboarding,
 	}
 }
