@@ -113,22 +113,40 @@ func TestP3T306PostureRouteFactsInTheSharedLockOrder(t *testing.T) {
 	run := l.scanOnly(a)
 	p3eCompleteCoverage(t, l, a, run.ID)
 
-	// An observer holds the control row (§8.7 order 1) while the projection
-	// job evaluates; the evaluation waits for it.
+	// An enforcement observer wins its compare-and-swap on the control row
+	// (§8.7 order 1) and holds it while the projection job evaluates; the
+	// evaluation waits for it. (The swap is a no-key update: only the
+	// evaluation's own FOR UPDATE on the controls conflicts with it -- the
+	// posture rows' foreign key to the control alone would not.)
 	observer := l.db.Begin()
-	if err := observer.Exec(`SELECT id FROM iga_gov_control WHERE id = ? FOR UPDATE`, control).Error; err != nil {
-		t.Fatal(err)
+	if res := observer.Exec(`UPDATE iga_gov_control SET enforcement_seq = enforcement_seq + 1
+	                          WHERE id = ? AND enforcement_seq = 0`, control); res.Error != nil || res.RowsAffected != 1 {
+		t.Fatalf("observer swap: %v (%d rows)", res.Error, res.RowsAffected)
 	}
 	done := make(chan error, 1)
 	go func() {
 		_, err := l.projector("p3e-posture-projector", nil).RunOnce(context.Background())
 		done <- err
 	}()
-	select {
-	case err := <-done:
+	// The evaluation must be seen BLOCKED on its FOR UPDATE of the controls
+	// (§8.7 order 1) -- not merely slow -- before the observer commits.
+	waited := false
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline) && !waited; {
+		select {
+		case err := <-done:
+			observer.Rollback()
+			t.Fatalf("the evaluation finished without waiting for the control row: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		var n int64
+		l.db.Raw(`SELECT count(*) FROM pg_stat_activity
+		           WHERE wait_event_type = 'Lock' AND query LIKE '%FROM iga_gov_control%FOR UPDATE%'`).Scan(&n)
+		waited = n > 0
+	}
+	if !waited {
 		observer.Rollback()
-		t.Fatalf("the evaluation did not wait for the control row: %v", err)
-	case <-time.After(700 * time.Millisecond):
+		<-done
+		t.Fatal("the evaluation never waited on the control row held by the observer")
 	}
 	if err := observer.Commit().Error; err != nil {
 		t.Fatal(err)
