@@ -64,16 +64,19 @@ func (ctl *K8sGraphController) ListIdentities(c *gin.Context) {
 		"identities": out,
 		"meta": gin.H{
 			"note": "a ServiceAccount is an identity, not a workload; grant counts " +
-				"are declared rules, not observed calls",
+				"are declared rules, not observed calls, and include grants reached " +
+				"through implicit group membership",
 		},
 	})
 }
 
 // GetAccess handles GET /authsec/discovery/k8s/identities/:id/access.
 //
-// Returns the whole chain per grant -- binding, role, rule -- because the
-// question behind this screen is "why can this account do that", and three
-// separately-paged objects do not answer it.
+// Returns the whole chain per grant -- binding, role, rule, and the group a
+// grant came through -- because the question behind this screen is "why can
+// this account do that", and three separately-paged objects do not answer it.
+// Grants are declared, not evaluated; each says where its rule applies
+// (effective_scope, D-109) and how it was reached (via, D-112).
 func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 	ws, ok := ctl.ws(c)
 	if !ok {

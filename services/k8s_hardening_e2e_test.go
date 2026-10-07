@@ -37,6 +37,7 @@ import (
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/k8sread"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -589,6 +590,20 @@ func TestHardeningImplicitGroupMembership(t *testing.T) {
 	relID := str(t, db, `SELECT r.id FROM iga_relationship r JOIN iga_identity_accounts m
 	    ON m.id = r.source_identity_account_id WHERE r.workspace_id = ? AND r.relationship_type = 'member_of'
 	    AND m.display_name = 'system:serviceaccount:iga-demo:research'`, ws)
+
+	// The flat access route reads the membership (D-112): the group's grant
+	// is on other's access -- other has no binding of its own -- named, and
+	// marked implicit.
+	otherID := uuid.MustParse(str(t, db, `SELECT id FROM iga_identity_accounts WHERE workspace_id = ?
+	    AND display_name = 'system:serviceaccount:iga-demo:other'`, ws))
+	grants, sum, err := k8sread.New(db, ws).AccessFor(otherID)
+	if err != nil {
+		t.Fatalf("access: %v", err)
+	}
+	if len(grants) != 1 || grants[0].Via == nil || grants[0].Via.Group != "system:serviceaccounts" ||
+		!grants[0].Via.ImplicitMembership || grants[0].RoleName != "secret-reader" || sum.ViaGroup != 1 {
+		t.Errorf("other's access = %+v %+v, want secret-reader via system:serviceaccounts, implicit", grants, sum)
+	}
 
 	// Re-confirmed in place by the next sweep.
 	if _, err := mgr.Ingest(ws, withGroups(true, "system:serviceaccounts", "system:authenticated")); err != nil {

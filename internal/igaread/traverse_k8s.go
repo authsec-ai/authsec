@@ -192,8 +192,8 @@ type GraphAssignment struct {
 
 // Effective scope kinds (D-109).
 const (
-	GraphScopeNamespace = "namespace"
-	GraphScopeCluster   = "cluster"
+	GraphScopeNamespace = k8sread.ScopeNamespace
+	GraphScopeCluster   = k8sread.ScopeCluster
 )
 
 // GraphEffectiveScope is where a Kubernetes grant's rule applies (D-109):
@@ -532,14 +532,19 @@ func (t *graphTraversal) decorateK8sEdges(lv *graphLevel, edges []*GraphEdge, no
 	}
 	for _, r := range rows {
 		a := &GraphAssignment{Ref: R(RefAssignment, r.AssignmentID), Kind: r.AssignmentKind}
-		scope := &GraphEffectiveScope{Kind: GraphScopeCluster}
 		if k, ok := k8sgraph.ParseKey(r.SourceKey); ok {
 			a.Name = k.Name
 			if k.Namespace != "" {
 				ns := k.Namespace
 				a.Namespace = &ns
-				scope = &GraphEffectiveScope{Kind: GraphScopeNamespace, Namespace: &ns}
 			}
+		}
+		// Where the rule applies is the flat access route's rule too
+		// (k8sread.BindingScope, D-112): one statement of D-109.
+		kind, ns := k8sread.BindingScope(r.SourceKey)
+		scope := &GraphEffectiveScope{Kind: kind}
+		if ns != "" {
+			scope.Namespace = &ns
 		}
 		e := byID[r.EdgeID]
 		e.Assignment, e.EffectiveScope = a, scope
@@ -552,12 +557,7 @@ func (t *graphTraversal) decorateK8sEdges(lv *graphLevel, edges []*GraphEdge, no
 // system:serviceaccounts, system:serviceaccounts:<ns> or
 // system:authenticated (D-110).
 func graphK8sImplicitGroup(sourceKey string) bool {
-	k, ok := k8sgraph.ParseKey(sourceKey)
-	if !ok || k.Type != "group" {
-		return false
-	}
-	return k.Name == "system:authenticated" || k.Name == "system:serviceaccounts" ||
-		strings.HasPrefix(k.Name, "system:serviceaccounts:")
+	return k8sread.ImplicitGroupKey(sourceKey)
 }
 
 /* ------------------------------- limitations -------------------------------- */

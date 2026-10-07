@@ -310,16 +310,21 @@ func TestIngestIsReadableBack(t *testing.T) {
 	if len(g.Verbs) == 0 || len(g.Resources) == 0 {
 		t.Errorf("rule read back without verbs or resources: %+v", g)
 	}
-	// Declared, not evaluated: a resolved chain is partial/unknown too.
-	if g.CalculationState != "partial" || g.EffectiveConclusion != "unknown" {
-		t.Errorf("grant = %s/%s, want partial/unknown: Kubernetes grants are declared, not evaluated",
-			g.CalculationState, g.EffectiveConclusion)
+	// Declared, not evaluated: a resolved chain is basis declared,
+	// calculation partial too (D-112: no effective_conclusion on this route).
+	if g.CalculationState != "partial" || g.Basis != "declared" || !g.Resolved {
+		t.Errorf("grant = %s/%s resolved %v, want declared/partial, resolved: Kubernetes grants are declared, not evaluated",
+			g.Basis, g.CalculationState, g.Resolved)
+	}
+	// A ClusterRoleBinding: cluster-wide (D-109).
+	if g.EffectiveScope == nil || g.EffectiveScope.Kind != k8sread.ScopeCluster || g.EffectiveScope.Namespace != nil {
+		t.Errorf("effective_scope = %+v, want cluster", g.EffectiveScope)
 	}
 	if sum.Note == "" {
 		t.Error("summary carries no note; an empty or short list would be unexplained")
 	}
-	if sum.Complete != 0 || sum.Partial == 0 {
-		t.Errorf("summary = %+v, want every grant partial (declared, not evaluated)", sum)
+	if sum.Partial != len(grants) || sum.Resolved != len(grants) || sum.Unresolved != 0 || sum.Direct != len(grants) {
+		t.Errorf("summary = %+v, want every grant partial, resolved, direct", sum)
 	}
 }
 
