@@ -227,43 +227,22 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		return
 	}
 
-	// Assign admin role and binding for this tenant/user (tenant-wide)
-	{
-		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(ctx)
-		if err != nil {
-			log.Printf("User-flow:ERROR: Failed to ensure admin role/perms for invited admin: %v", err)
-		} else {
-			// Insert into role_bindings (user_roles is deprecated)
-			// scope_type and scope_id are NULL for tenant-wide role assignments
-			if _, err := tenancy.ExecContext(ctx, db.DB, `
-				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-				SELECT $2, $1, $3, $4, NULL, NULL, NOW(), NOW()
-				WHERE NOT EXISTS (
-					SELECT 1 FROM role_bindings
-					WHERE workspace_id = $1 AND user_id = $3 AND role_id = $4
-					AND scope_type IS NULL AND scope_id IS NULL
-				)
-			`, uuid.New(), adminUser.ID, roleID); err != nil {
-				log.Printf("User-flow:ERROR: Failed to bind admin role to invited user: %v", err)
-			}
-
-			// Bind to workspace_memberships (RequireWorkspaceRole checks this)
-			if _, err := db.DB.ExecContext(ctx, `
-				INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, 'active', 'invite', NOW(), NOW())
-				ON CONFLICT (workspace_id, user_id) DO NOTHING
-			`, uuid.New(), workspaceUUID, adminUser.ID, roleID); err != nil {
-				log.Printf("User-flow:ERROR: Failed to create workspace_membership for invited admin: %v", err)
-			}
-		}
-
-		// Create corresponding end user account in tenant database
-		if err := aic.createEndUserInWorkspaceDBForInvite(&adminUser, workspaceUUID, clientIDPtr, projectIDPtr); err != nil {
-			log.Printf("User-flow:WARNING: Failed to create end user account in tenant database: %v", err)
-			// Don't fail the invitation - admin can still use global admin account
-		} else {
-			log.Printf("User-flow:INFO: Successfully created end user account in tenant database for invited admin: %s", adminUser.Email)
-		}
+	// CreateAdminUser bound the user to the workspace's admin role
+	// (role_bindings). The same users row is the invitee's end-user account:
+	// admin and end users share one table, scoped by workspace_id.
+	//
+	// Bind to workspace_memberships (RequireWorkspaceRole checks this), with
+	// the workspace's admin role; the role must be the caller's workspace's.
+	if roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(ctx); err != nil {
+		log.Printf("User-flow:ERROR: Failed to ensure admin role/perms for invited admin: %v", err)
+	} else if _, err := tenancy.ExecContext(ctx, db.DB, `
+		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'active', 'invite', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
+		ON CONFLICT (workspace_id, user_id) DO NOTHING
+	`, uuid.New(), adminUser.ID, roleID); err != nil {
+		log.Printf("User-flow:ERROR: Failed to create workspace_membership for invited admin: %v", err)
 	}
 
 	emailSent := false
@@ -362,6 +341,11 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	ws, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
+	}
 
 	// Verify this is a pending invite (temporary_password=true and never logged in)
 	if !user.TemporaryPassword {
@@ -380,24 +364,20 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
 		return
 	}
-	tx, err := db.DB.BeginTx(ctx, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
-		return
-	}
-	defer tx.Rollback()
-	for _, q := range []string{
-		`DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`,
-		`DELETE FROM workspace_memberships WHERE workspace_id = $1 AND user_id = $2`,
-		`DELETE FROM users WHERE workspace_id = $1 AND id = $2`,
-	} {
-		if _, err := tenancy.ExecContext(ctx, tx, q, userUUID); err != nil {
-			log.Printf("User-flow: failed to cancel invite for %s: %v", userUUID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
-			return
+	// One row-level security transaction for the caller's workspace; every
+	// statement binds workspace_id = $1.
+	err = tenancy.WithTx(ctx, db.DB, ws, func(tx *sql.Tx) error {
+		if _, err := tenancy.ExecContext(ctx, tx, `DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`, userUUID); err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
+		if _, err := tenancy.ExecContext(ctx, tx, `DELETE FROM workspace_memberships WHERE workspace_id = $1 AND user_id = $2`, userUUID); err != nil {
+			return err
+		}
+		_, err := tenancy.ExecContext(ctx, tx, `DELETE FROM users WHERE workspace_id = $1 AND id = $2`, userUUID)
+		return err
+	})
+	if err != nil {
+		log.Printf("User-flow: failed to cancel invite for %s: %v", userUUID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
 		return
 	}
@@ -658,66 +638,4 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 		Invites: invites,
 		Total:   len(invites),
 	})
-}
-
-// createEndUserInWorkspaceDBForInvite creates a corresponding end-user account
-// for an invited admin so they can also authenticate as an end user in their
-// workspace. Single master DB architecture: this writes to the master `users`
-// table scoped by workspace_id — there are no per-tenant databases.
-func (aic *AdminInviteController) createEndUserInWorkspaceDBForInvite(adminUser *models.AdminUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) error {
-	db := config.DB
-	if db == nil {
-		return fmt.Errorf("database connection not available")
-	}
-
-	// Determine client_id and project_id (default to the workspace id).
-	effectiveClientID := workspaceID
-	if clientID != nil {
-		effectiveClientID = *clientID
-	}
-	effectiveProjectID := workspaceID
-	if projectID != nil {
-		effectiveProjectID = *projectID
-	} else {
-		var defaultProject models.Project
-		if err := db.Where("workspace_id = ? AND active = true", workspaceID).First(&defaultProject).Error; err == nil {
-			effectiveProjectID = defaultProject.ID
-		}
-	}
-
-	// Idempotent: skip if an end user already exists for this (workspace, email).
-	// The master users table uniqueness is (workspace_id, LOWER(email)) — not
-	// (email, client_id) — so we guard explicitly rather than rely on ON CONFLICT.
-	var existing int64
-	if err := db.Table("users").
-		Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL", workspaceID, adminUser.Email).
-		Count(&existing).Error; err != nil {
-		return fmt.Errorf("failed to check existing end user: %w", err)
-	}
-	if existing > 0 {
-		return nil
-	}
-
-	if err := db.Exec(`
-		INSERT INTO users (id, client_id, workspace_id, project_id, email, name, username,
-			password_hash, workspace_domain, provider, provider_id, active, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, NOW(), NOW())
-	`,
-		adminUser.ID,              // same id as admin for consistency
-		effectiveClientID,         // client_id
-		workspaceID,               // workspace_id
-		effectiveProjectID,        // project_id
-		adminUser.Email,           // email
-		adminUser.Name,            // name
-		adminUser.Username,        // username
-		adminUser.PasswordHash,    // password_hash (same as admin)
-		adminUser.WorkspaceDomain, // workspace_domain
-		adminUser.Provider,        // provider
-		adminUser.Email,           // provider_id
-	).Error; err != nil {
-		return fmt.Errorf("failed to insert end user: %w", err)
-	}
-
-	log.Printf("Created end-user account (master DB) for invited admin: email=%s, user_id=%s", adminUser.Email, adminUser.ID.String())
-	return nil
 }
