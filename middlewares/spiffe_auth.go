@@ -8,6 +8,7 @@ package middlewares
 //   - "auth_method" – "spiffe-jwt-svid"
 //   - "spiffe_id"   – the sub claim (e.g. "spiffe://tenant-id/agent/...")
 //   - "spiffe_workspace_id" – the workspace whose JWKS verified the token
+//   - the tenancy context, for that workspace
 //
 // Ported from external-service/middleware/spiffe_auth.go.
 
@@ -21,6 +22,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -28,8 +30,10 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/delegation"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // SpiffeAuthMiddleware returns a gin.HandlerFunc that accepts either a
@@ -63,21 +67,23 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Determine workspace_id from token claims or issuer.
+		// The unverified claims only say which workspace's trust bundle to
+		// try. The workspace is established by that bundle verifying the
+		// signature; workspace_id and a spiffe:// iss, when both are present,
+		// must agree (AS-065).
 		workspaceID, _ := claims["workspace_id"].(string)
+		iss, _ := claims["iss"].(string)
+		issWS := strings.TrimPrefix(iss, "spiffe://")
 		if workspaceID == "" {
-			iss, _ := claims["iss"].(string)
-			workspaceID = strings.TrimPrefix(iss, "spiffe://")
+			workspaceID = issWS
 		}
-		if workspaceID == "" {
+		wsUUID, perr := uuid.Parse(workspaceID)
+		if perr != nil || wsUUID == uuid.Nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Cannot determine workspace_id from SPIFFE JWT-SVID"})
 			return
 		}
-
-		pubKey, err := spiffeGetPublicKey(workspaceID)
-		if err != nil {
-			log.Printf("[SpiffeAuth] Failed to fetch JWKS for tenant %s: %v", workspaceID, err)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Failed to verify SPIFFE token"})
+		if strings.HasPrefix(iss, "spiffe://") && !strings.EqualFold(issWS, workspaceID) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token workspace and issuer disagree"})
 			return
 		}
 
@@ -85,10 +91,11 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 			}
-			return pubKey, nil
+			kid, _ := t.Header["kid"].(string)
+			return spiffeGetPublicKey(wsUUID.String(), kid)
 		}, jwt.WithExpirationRequired())
 		if err != nil {
-			log.Printf("[SpiffeAuth] Token verification failed: %v", err)
+			log.Printf("[SpiffeAuth] Token verification failed for workspace %s: %v", wsUUID, err)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token verification failed"})
 			return
 		}
@@ -125,7 +132,8 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 		c.Set("auth_method", "spiffe-jwt-svid")
 		c.Set("spiffe_id", sub)
 		// The workspace whose trust bundle verified the signature.
-		c.Set("spiffe_workspace_id", workspaceID)
+		c.Set("spiffe_workspace_id", wsUUID.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: wsUUID, PrincipalKind: "workload", Realm: "spiffe"})
 
 		c.Next()
 	}
@@ -184,38 +192,97 @@ var (
 	spiffeJWKSCacheMu sync.RWMutex
 )
 
+// spiffeJWKSCacheEntry holds every RSA key of one workspace's bundle by kid.
 type spiffeJWKSCacheEntry struct {
-	key       *rsa.PublicKey
+	keys      map[string]*rsa.PublicKey
 	fetchedAt time.Time
 }
 
-const spiffeJWKSCacheTTL = 5 * time.Minute
+const (
+	spiffeJWKSCacheTTL = 5 * time.Minute
+	// An unknown kid refetches the bundle (key rotation), but at most this
+	// often per workspace, so unknown kids cannot drive a fetch per request.
+	spiffeJWKSRefetchAfter = 30 * time.Second
+)
 
-func spiffeGetPublicKey(workspaceID string) (*rsa.PublicKey, error) {
+var spiffeBundleClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// spiffeGetPublicKey returns the key with the given kid from the workspace's
+// trust bundle. A token without a kid is accepted only against a bundle with
+// exactly one key.
+func spiffeGetPublicKey(workspaceID, kid string) (*rsa.PublicKey, error) {
 	spiffeJWKSCacheMu.RLock()
-	if entry, ok := spiffeJWKSCache[workspaceID]; ok && time.Since(entry.fetchedAt) < spiffeJWKSCacheTTL {
-		spiffeJWKSCacheMu.RUnlock()
-		return entry.key, nil
-	}
+	entry := spiffeJWKSCache[workspaceID]
 	spiffeJWKSCacheMu.RUnlock()
 
-	spireURL := os.Getenv("ICP_SERVICE_URL")
-	if spireURL == "" {
-		spireURL = "http://localhost:7001"
+	fresh := entry != nil && time.Since(entry.fetchedAt) < spiffeJWKSCacheTTL
+	if fresh {
+		if k, ok := spiffePickKey(entry.keys, kid); ok {
+			return k, nil
+		}
+		if time.Since(entry.fetchedAt) < spiffeJWKSRefetchAfter {
+			return nil, fmt.Errorf("no key %q in the trust bundle of workspace %s", kid, workspaceID)
+		}
 	}
 
-	// TODO(phase9): ICP service still expects ?workspace_id= here; update to
-	// ?workspace_id= once the SPIRE-layer has been swept in Phase 9.
-	url := fmt.Sprintf("%s/v1/jwt/bundle?workspace_id=%s", spireURL, workspaceID)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	keys, err := spiffeFetchBundle(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	spiffeJWKSCacheMu.Lock()
+	spiffeJWKSCache[workspaceID] = &spiffeJWKSCacheEntry{keys: keys, fetchedAt: time.Now()}
+	spiffeJWKSCacheMu.Unlock()
+
+	if k, ok := spiffePickKey(keys, kid); ok {
+		return k, nil
+	}
+	return nil, fmt.Errorf("no key %q in the trust bundle of workspace %s", kid, workspaceID)
+}
+
+func spiffePickKey(keys map[string]*rsa.PublicKey, kid string) (*rsa.PublicKey, bool) {
+	if kid != "" {
+		k, ok := keys[kid]
+		return k, ok
+	}
+	if len(keys) == 1 {
+		for _, k := range keys {
+			return k, true
+		}
+	}
+	return nil, false
+}
+
+// spiffeBundleURL is the ICP trust-bundle endpoint. ICP_SERVICE_URL is
+// operator configuration; the localhost default is for development only.
+func spiffeBundleURL(workspaceID string) (string, error) {
+	base := strings.TrimRight(os.Getenv("ICP_SERVICE_URL"), "/")
+	if base == "" {
+		if strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") {
+			return "", fmt.Errorf("ICP_SERVICE_URL is not set")
+		}
+		base = "http://localhost:7001"
+	}
+	return base + "/v1/jwt/bundle?workspace_id=" + url.QueryEscape(workspaceID), nil
+}
+
+func spiffeFetchBundle(workspaceID string) (map[string]*rsa.PublicKey, error) {
+	bundleURL, err := spiffeBundleURL(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := spiffeBundleClient.Get(bundleURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("JWKS endpoint returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -227,29 +294,26 @@ func spiffeGetPublicKey(workspaceID string) (*rsa.PublicKey, error) {
 			Kid string `json:"kid"`
 		} `json:"keys"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&jwks); err != nil {
 		return nil, fmt.Errorf("decode JWKS: %w", err)
 	}
-	if len(jwks.Keys) == 0 {
-		return nil, fmt.Errorf("no keys in JWKS response for tenant %s", workspaceID)
+
+	keys := make(map[string]*rsa.PublicKey, len(jwks.Keys))
+	for _, k := range jwks.Keys {
+		if k.Kty != "RSA" {
+			continue
+		}
+		pub, err := spiffeParseRSAPublicKey(k.N, k.E)
+		if err != nil {
+			log.Printf("[SpiffeAuth] Skipping unparsable key %q for workspace %s: %v", k.Kid, workspaceID, err)
+			continue
+		}
+		keys[k.Kid] = pub
 	}
-
-	k := jwks.Keys[0]
-	if k.Kty != "RSA" {
-		return nil, fmt.Errorf("unsupported key type: %s", k.Kty)
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no RSA keys in JWKS response for workspace %s", workspaceID)
 	}
-
-	pubKey, err := spiffeParseRSAPublicKey(k.N, k.E)
-	if err != nil {
-		return nil, fmt.Errorf("parse RSA key: %w", err)
-	}
-
-	spiffeJWKSCacheMu.Lock()
-	spiffeJWKSCache[workspaceID] = &spiffeJWKSCacheEntry{key: pubKey, fetchedAt: time.Now()}
-	spiffeJWKSCacheMu.Unlock()
-
-	log.Printf("[SpiffeAuth] Cached JWKS for tenant %s (kid=%s)", workspaceID, k.Kid)
-	return pubKey, nil
+	return keys, nil
 }
 
 func spiffeParseRSAPublicKey(nBase64, eBase64 string) (*rsa.PublicKey, error) {
