@@ -322,9 +322,10 @@ func (q *Query) countInto(c *Cluster) error {
 
 /* ------------------------------- access rows ------------------------------- */
 
-// accessRowsSQL is every live access row of the workspace's Kubernetes
-// holders: the flat form of the two paths the graph walk takes from an
-// identity to a rule (traverse_edges.go's forward specs, D-110, D-112):
+// accessRowsSQL is every live access row of the HOLDERS BOUND TO IT -- a
+// page's identities, or one identity -- never the whole workspace's (D-113):
+// the flat form of the two paths the graph walk takes from an identity to a
+// rule (traverse_edges.go's forward specs, D-110, D-112):
 //
 //	direct  identity -grant-> rule
 //	group   identity -member_of-> group -grant-> rule
@@ -343,17 +344,24 @@ func (q *Query) countInto(c *Cluster) error {
 // memberships of the same holder is one row (the current membership wins):
 // the row is the grant, and the via names the group it came through.
 //
-// Columns: holder_id, edge_id, state, group_id, membership_state,
-// membership_basis. Two bind variables, both the workspace.
+// The holder restriction is in both branches, on the scanned rows -- the
+// direct grant's subject, the membership's source -- so a list's counts cost
+// its page, not its workspace (idx_iga_access_edges_subject_identity;
+// idx_iga_relationship_source, whose COALESCE expression the second
+// predicate spells out so the index applies).
+//
+// Columns: holder_id, edge_id, entitlement_id, state, group_id,
+// membership_state, membership_basis. Bind values: accessRowsArgs.
 const accessRowsSQL = `
-	SELECT e.subject_identity_account_id AS holder_id, e.id AS edge_id, e.state AS state,
+	SELECT e.subject_identity_account_id AS holder_id, e.id AS edge_id, e.entitlement_id, e.state AS state,
 	       NULL::uuid AS group_id, NULL::text AS membership_state, NULL::text AS membership_basis
 	  FROM iga_access_edges e
-	 WHERE e.workspace_id = ? AND e.provider = 'k8s' AND e.state IN ('current', 'stale')
+	 WHERE e.workspace_id = ? AND e.subject_identity_account_id IN ?
+	   AND e.provider = 'k8s' AND e.state IN ('current', 'stale')
 	UNION ALL
 	SELECT * FROM (
 	  SELECT DISTINCT ON (m.source_identity_account_id, e.id)
-	         m.source_identity_account_id AS holder_id, e.id AS edge_id,
+	         m.source_identity_account_id AS holder_id, e.id AS edge_id, e.entitlement_id,
 	         CASE WHEN e.state = 'current' AND m.state = 'current' THEN 'current' ELSE 'stale' END AS state,
 	         g.id AS group_id, m.state AS membership_state, m.basis AS membership_basis
 	    FROM iga_relationship m
@@ -364,19 +372,90 @@ const accessRowsSQL = `
 	    JOIN iga_access_edges e
 	      ON e.workspace_id = g.workspace_id AND e.subject_identity_account_id = g.id
 	     AND e.provider = 'k8s' AND e.state IN ('current', 'stale')
-	   WHERE m.workspace_id = ? AND m.relationship_type = 'member_of' AND m.state IN ('current', 'stale')
+	   WHERE m.workspace_id = ? AND m.relationship_type = 'member_of'
+	     AND COALESCE(m.source_identity_account_id, m.source_workload_id) IN ?
+	     AND m.source_identity_account_id IN ?
+	     AND m.state IN ('current', 'stale')
 	   ORDER BY m.source_identity_account_id, e.id, (m.state = 'current') DESC) via`
 
-// Identity is one ServiceAccount, with how much it can do.
+// accessRowsArgs is accessRowsSQL's bind values for the holders. Never call
+// it with no holder: the caller has nothing to count.
+func accessRowsArgs(ws uuid.UUID, holders []uuid.UUID) []any {
+	return []any{ws, holders, ws, holders, holders}
+}
+
+// heldCounts is how much each holder can do: the current and stale rows of
+// its access (accessRowsSQL), and whether any current one comes from a
+// wildcard rule.
+type heldCounts struct {
+	Grants   int
+	Stale    int
+	Wildcard bool
+}
+
+// countsFor counts the access rows of the holders, and only theirs (D-113):
+// the one statement behind every list's grants, stale and wildcard, so a
+// list row's counts equal its access summary's partial and stale (D-112).
+func (q *Query) countsFor(holders []uuid.UUID) (map[uuid.UUID]heldCounts, error) {
+	out := map[uuid.UUID]heldCounts{}
+	if len(holders) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		HolderID uuid.UUID
+		Grants   int
+		Stale    int
+		Wildcard bool
+	}
+	args := append(accessRowsArgs(q.WS, holders), q.WS)
+	if err := q.tx.Raw(`
+		WITH acc AS (`+accessRowsSQL+`)
+		SELECT acc.holder_id,
+		       COUNT(*) FILTER (WHERE acc.state = 'current') AS grants,
+		       COUNT(*) FILTER (WHERE acc.state = 'stale')   AS stale,
+		       COALESCE(bool_or((n.normalized_rights->>'wildcard')::bool)
+		                FILTER (WHERE acc.state = 'current'), false) AS wildcard
+		  FROM acc
+		  LEFT JOIN iga_entitlements n
+		         ON n.workspace_id = ? AND n.id = acc.entitlement_id
+		 GROUP BY acc.holder_id`, args...).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.HolderID] = heldCounts{Grants: r.Grants, Stale: r.Stale, Wildcard: r.Wildcard}
+	}
+	return out, nil
+}
+
+// Identity is one Kubernetes identity -- a ServiceAccount, or a User or Group
+// a binding names -- with how much it can do.
 type Identity struct {
-	ID        uuid.UUID `json:"id"`
-	Anchor    string    `json:"anchor"` // system:serviceaccount:<ns>:<name>
-	Namespace string    `json:"namespace"`
-	Lifecycle string    `json:"lifecycle"`
+	ID uuid.UUID `json:"id"`
+	// Anchor is the RBAC subject name: system:serviceaccount:<ns>:<name> for
+	// a ServiceAccount, the User's or Group's own name otherwise.
+	Anchor string `json:"anchor"`
+	// Namespace is a ServiceAccount's; "" for a User or Group, which
+	// Kubernetes does not scope.
+	Namespace string `json:"namespace"`
+	Lifecycle string `json:"lifecycle"`
+
+	// Kind is the account kind: k8s_service_account | k8s_user | k8s_group
+	// (D-113). Name is the object's own name (a ServiceAccount's without its
+	// namespace), Cluster the cluster its key names, LastSeenAt when a sweep
+	// last confirmed it.
+	Kind       string    `json:"kind"`
+	Name       string    `json:"name"`
+	Cluster    string    `json:"cluster"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	// Members is set for a group only: its live (current or stale) member_of
+	// rows -- the ServiceAccounts the projection places in it. Users who
+	// authenticate into a group are not readable from RBAC, so it is a lower
+	// bound, never "everyone in the group".
+	Members *int `json:"members,omitempty"`
 
 	// Grants counts the current rows of its access (AccessFor): its own
-	// grants and those reached through implicit group membership. Equal to
-	// that response's summary.partial.
+	// grants and, for a ServiceAccount, those reached through implicit group
+	// membership. Equal to that response's summary.partial.
 	Grants int `json:"grants"`
 	// Wildcard is true when any current grant reaching this account -- directly
 	// or through a group -- comes from a rule with `*` in a group, resource or
@@ -388,34 +467,15 @@ type Identity struct {
 	Stale int `json:"stale"`
 }
 
-// Identities lists the ServiceAccounts in the workspace's Kubernetes graph.
+// Identities lists the ServiceAccounts in the workspace's Kubernetes graph,
+// the first page of ListIdentities' default filter. Kept for its callers;
+// its clamp is the original one.
 func (q *Query) Identities(limit int) ([]Identity, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	var out []Identity
-	err := q.tx.Raw(`
-		WITH acc AS (`+accessRowsSQL+`)
-		SELECT i.id,
-		       i.display_name AS anchor,
-		       COALESCE(i.provider_attrs->>'namespace', '') AS namespace,
-		       i.lifecycle,
-		       COUNT(acc.edge_id) FILTER (WHERE acc.state = 'current') AS grants,
-		       COUNT(acc.edge_id) FILTER (WHERE acc.state = 'stale')   AS stale,
-		       COALESCE(bool_or((n.normalized_rights->>'wildcard')::bool)
-		                FILTER (WHERE acc.state = 'current'), false) AS wildcard
-		  FROM iga_identity_accounts i
-		  LEFT JOIN acc ON acc.holder_id = i.id
-		  LEFT JOIN iga_access_edges e
-		         ON e.workspace_id = i.workspace_id AND e.id = acc.edge_id
-		  LEFT JOIN iga_entitlements n
-		         ON n.workspace_id = e.workspace_id AND n.id = e.entitlement_id
-		 WHERE i.workspace_id = ? AND i.provider = ?
-		   AND i.account_kind = 'k8s_service_account'
-		 GROUP BY i.id, i.display_name, i.provider_attrs, i.lifecycle
-		 ORDER BY grants DESC, i.display_name
-		 LIMIT ?`, q.WS, q.WS, q.WS, models.ProviderK8s, limit).Scan(&out).Error
-	return out, err
+	page, err := q.ListIdentities(IdentityFilter{Limit: limit})
+	return page.Items, err
 }
 
 // Workload is a runtime object and what it runs as.
@@ -439,24 +499,23 @@ type Workload struct {
 	Grants int `json:"grants"`
 }
 
-// Workloads lists the runtime objects and their execution identities.
+// Workloads lists the runtime objects and their execution identities, by
+// name (then id). The page is chosen first and its identities' counts are
+// read for that page alone (D-113): ordering by grants would need every
+// identity's count before the first row could be chosen.
 func (q *Query) Workloads(limit int) ([]Workload, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	var out []Workload
-	err := q.tx.Raw(`
-		WITH acc AS (`+accessRowsSQL+`),
-		     held AS (SELECT holder_id, count(*) FILTER (WHERE state = 'current') AS n
-		                FROM acc GROUP BY holder_id)
+	if err := q.tx.Raw(`
 		SELECT w.id,
 		       w.display_name,
 		       COALESCE(w.provider_attrs->>'namespace', '') AS namespace,
 		       w.lifecycle,
 		       COALESCE(i.display_name, '') AS runs_as,
 		       i.id   AS runs_as_id,
-		       COALESCE(r.basis, '') AS basis,
-		       COALESCE(h.n, 0) AS grants
+		       COALESCE(r.basis, '') AS basis
 		  FROM iga_workload w
 		  LEFT JOIN iga_relationship r
 		         ON r.workspace_id = w.workspace_id
@@ -465,11 +524,29 @@ func (q *Query) Workloads(limit int) ([]Workload, error) {
 		        AND r.state <> 'ended'
 		  LEFT JOIN iga_identity_accounts i
 		         ON i.workspace_id = w.workspace_id AND i.id = r.target_identity_account_id
-		  LEFT JOIN held h ON h.holder_id = i.id
 		 WHERE w.workspace_id = ? AND w.provider = ?
-		 ORDER BY grants DESC, w.display_name
-		 LIMIT ?`, q.WS, q.WS, q.WS, models.ProviderK8s, limit).Scan(&out).Error
-	return out, err
+		 ORDER BY w.display_name, w.id, i.id
+		 LIMIT ?`, q.WS, models.ProviderK8s, limit).Scan(&out).Error; err != nil {
+		return nil, err
+	}
+	var holders []uuid.UUID
+	seen := map[uuid.UUID]bool{}
+	for _, w := range out {
+		if w.RunsAsID != nil && !seen[*w.RunsAsID] {
+			seen[*w.RunsAsID] = true
+			holders = append(holders, *w.RunsAsID)
+		}
+	}
+	counts, err := q.countsFor(holders)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if id := out[i].RunsAsID; id != nil {
+			out[i].Grants = counts[*id].Grants
+		}
+	}
+	return out, nil
 }
 
 // Grant is one resolved step of what an identity can do.
@@ -588,9 +665,11 @@ const AccessNote = "Kubernetes grants are declared, not evaluated (basis declare
 	"Grants reached through group membership name the group. A grant with no rule is a binding " +
 	"whose role was not in the sweep."
 
-// AccessFor answers "what can this ServiceAccount do, and how much of that did
-// we actually work out": its own grants and those of the groups it is a member
-// of, each with where its rule applies.
+// AccessFor answers "what can this identity do, and how much of that did we
+// actually work out": its own grants and those of the groups it is a member
+// of, each with where its rule applies. Any Kubernetes identity (D-113): a
+// User's or Group's rows are its own grants -- the projection records no
+// membership of either.
 func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) {
 	// Scanned flat, then shaped: the grant's nested fields are built here,
 	// never by the scanner.
@@ -666,7 +745,7 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 		 WHERE acc.holder_id = ?
 		 ORDER BY wildcard DESC, p.display_name, acc.group_id IS NOT NULL, g.display_name,
 		          a.source_key, e.id`,
-		q.WS, q.WS, q.WS, identityID).Scan(&rows).Error
+		append(accessRowsArgs(q.WS, []uuid.UUID{identityID}), q.WS, identityID)...).Scan(&rows).Error
 	if err != nil {
 		return nil, AccessSummary{}, err
 	}

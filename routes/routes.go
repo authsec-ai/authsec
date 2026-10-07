@@ -1702,6 +1702,7 @@ func SetupRoutes(
 			discovery.GET("/k8s/clusters", middlewares.Require("discovery", "read"), k8sGraph.ListClusters)
 			discovery.GET("/k8s/identities", middlewares.Require("discovery", "read"), k8sGraph.ListIdentities)
 			discovery.GET("/k8s/workloads", middlewares.Require("discovery", "read"), k8sGraph.ListWorkloads)
+			discovery.GET("/k8s/identities/:id", middlewares.Require("discovery", "read"), k8sGraph.GetIdentity)
 			discovery.GET("/k8s/identities/:id/access", middlewares.Require("discovery", "read"), k8sGraph.GetAccess)
 			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
 

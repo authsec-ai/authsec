@@ -117,6 +117,7 @@ func newK8sAccessAPI(t *testing.T, db *gorm.DB, ws uuid.UUID) *k8sAccessAPI {
 	g.GET("/k8s/clusters", ctl.ListClusters)
 	g.GET("/k8s/identities", ctl.ListIdentities)
 	g.GET("/k8s/workloads", ctl.ListWorkloads)
+	g.GET("/k8s/identities/:id", ctl.GetIdentity)
 	g.GET("/k8s/identities/:id/access", ctl.GetAccess)
 	a.eng = eng
 	return a
