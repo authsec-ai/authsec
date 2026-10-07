@@ -8546,3 +8546,23 @@ DROP TRIGGER IF EXISTS trg_sync_configurations_entra_tenant ON public.sync_confi
 CREATE TRIGGER trg_sync_configurations_entra_tenant
     BEFORE INSERT OR UPDATE ON public.sync_configurations
     FOR EACH ROW EXECUTE FUNCTION public.sync_configurations_entra_tenant_sync();
+
+-- resource_uri per workspace (071). Kept identical to migrations/master/071_resource_uri_per_workspace.sql.
+-- ============================================================================
+-- 071: resource_servers.resource_uri unique per workspace, not globally (AS-060)
+--
+-- resource_servers_workspace_resource_uri_uq (workspace_id, resource_uri)
+-- already exists. The global unique index is dropped: a workspace that owns a
+-- URI's host (a verified workspace_domains entry for the host or a parent
+-- domain) may now register a URI another workspace registered first, and the
+-- pre-workspace lookup resolves the URI to the owner's resource server
+-- (services/resource_server_service.go GetByResourceURI). The application
+-- refuses the same URI from a workspace that does not own its host, so an
+-- unowned URI stays single-holder. The plain index on resource_uri stays for
+-- the lookup.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DROP INDEX IF EXISTS public.idx_resource_servers_resource_uri_active;
+CREATE INDEX IF NOT EXISTS idx_resource_servers_resource_uri ON public.resource_servers (resource_uri);

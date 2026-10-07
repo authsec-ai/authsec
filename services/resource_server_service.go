@@ -123,20 +123,11 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	}
 	resourceURI := publicURL + basePath
 
-	// Pre-check: detect duplicate resource_uri before the INSERT so we can
-	// return a clean 409-friendly error instead of leaking the raw constraint
-	// name to the operator. The DB unique index is the source of truth.
-	var existingCount int64
-	if err := s.db.Model(&models.ResourceServer{}).
-		Where("resource_uri = ?", resourceURI).
-		Count(&existingCount).Error; err != nil {
-		return nil, nil, fmt.Errorf("check existing resource server: %w", err)
-	}
-	if existingCount > 0 {
-		return nil, nil, fmt.Errorf(
-			"a resource server with this URL already exists (resource_uri=%s) — use a different Public Base URL or Protected Base Path",
-			resourceURI,
-		)
+	// Pre-check: a URI is unique within the workspace, and another
+	// workspace's URI can be registered only by a workspace that owns its host
+	// (AS-060). Returns a clean 409-friendly error instead of a raw constraint.
+	if err := checkResourceURIAvailable(s.db, req.WorkspaceID, resourceURI, nil); err != nil {
+		return nil, nil, err
 	}
 
 	secret, err := generateIntrospectionSecret()
@@ -351,12 +342,112 @@ func (s *ResourceServerService) GetByID(id string) (*models.ResourceServer, erro
 	return &rs, nil
 }
 
+// GetByResourceURI resolves an OAuth resource indicator to its resource
+// server before any workspace is known (authorize, the token grants, DCR,
+// first contact, the connector broker).
+//
+// resource_uri is unique per workspace (AS-060). When more than one workspace
+// has registered the URI, the one that owns the URI's host wins: the workspace
+// with a verified workspace_domains entry equal to the host or, failing that,
+// the most specific verified parent domain. Without a single owner the URI is
+// ambiguous and nothing is returned (ErrResourceURIAmbiguous). Creation keeps
+// such a state from arising: only a host's owner may register a URI another
+// workspace already uses.
 func (s *ResourceServerService) GetByResourceURI(uri string) (*models.ResourceServer, error) {
-	var rs models.ResourceServer
-	if err := s.db.Where("resource_uri = ? AND active = true", uri).First(&rs).Error; err != nil {
+	var candidates []models.ResourceServer
+	// TENANT-EXEMPT: pre-workspace resolution of an OAuth resource indicator; see above
+	if err := s.db.Where("resource_uri = ? AND active = true", uri).Order("created_at").Find(&candidates).Error; err != nil {
 		return nil, err
 	}
-	return &rs, nil
+	switch len(candidates) {
+	case 0:
+		return nil, gorm.ErrRecordNotFound
+	case 1:
+		return &candidates[0], nil
+	}
+	ids := make([]uuid.UUID, 0, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.WorkspaceID)
+	}
+	owner, err := resourceURIOwner(s.db, uri, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range candidates {
+		if owner != uuid.Nil && candidates[i].WorkspaceID == owner {
+			return &candidates[i], nil
+		}
+	}
+	return nil, ErrResourceURIAmbiguous
+}
+
+// ErrResourceURIAmbiguous: several workspaces registered the URI and none of
+// them owns its host.
+var ErrResourceURIAmbiguous = errors.New("resource URI is registered in more than one workspace and none owns its host")
+
+// ErrResourceURITaken: the URI is already used in this workspace, or by
+// another workspace and the caller does not own its host.
+var ErrResourceURITaken = errors.New("a resource server with this URL already exists")
+
+// resourceURIOwner returns which of the given workspaces owns the URI's host:
+// a verified workspace_domains entry equal to the host, else the longest
+// verified parent domain. Domains are globally unique, so the answer is
+// unique; uuid.Nil when none owns it.
+func resourceURIOwner(db *gorm.DB, uri string, workspaces []uuid.UUID) (uuid.UUID, error) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Hostname() == "" || len(workspaces) == 0 {
+		return uuid.Nil, nil
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	var row struct{ WorkspaceID uuid.UUID }
+	// TENANT-EXEMPT: decides which of the candidate workspaces verified the host (domains are globally unique)
+	err = db.Raw(`
+		SELECT workspace_id FROM workspace_domains
+		 WHERE is_verified = true AND workspace_id IN ?
+		   AND (LOWER(domain) = ? OR RIGHT(?, LENGTH(domain) + 1) = '.' || LOWER(domain))
+		 ORDER BY LENGTH(domain) DESC
+		 LIMIT 1`, workspaces, host, host).Scan(&row).Error
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return row.WorkspaceID, nil
+}
+
+// checkResourceURIAvailable enforces the AS-060 registration rule for
+// workspace ws: the URI must not already be used in ws, and if another
+// workspace uses it, ws must own its host. exclude is the resource server
+// being edited, if any.
+func checkResourceURIAvailable(db *gorm.DB, ws uuid.UUID, uri string, exclude *uuid.UUID) error {
+	var holders []uuid.UUID
+	// TENANT-EXEMPT: the registration rule must see every workspace holding the URI
+	q := db.Model(&models.ResourceServer{}).Where("resource_uri = ?", uri)
+	if exclude != nil {
+		q = q.Where("id <> ?", *exclude)
+	}
+	if err := q.Distinct().Pluck("workspace_id", &holders).Error; err != nil {
+		return fmt.Errorf("check existing resource server: %w", err)
+	}
+	if len(holders) == 0 {
+		return nil
+	}
+	for _, h := range holders {
+		if h == ws {
+			return fmt.Errorf("%w (resource_uri=%s) — use a different Public Base URL or Protected Base Path", ErrResourceURITaken, uri)
+		}
+	}
+	owner, err := resourceURIOwner(db, uri, []uuid.UUID{ws})
+	if err != nil {
+		return fmt.Errorf("check resource URI ownership: %w", err)
+	}
+	if owner != ws {
+		u, _ := url.Parse(uri)
+		host := ""
+		if u != nil {
+			host = u.Hostname()
+		}
+		return fmt.Errorf("%w (resource_uri=%s) in another workspace — verify ownership of the domain %q in this workspace to register it here", ErrResourceURITaken, uri, host)
+	}
+	return nil
 }
 
 func (s *ResourceServerService) ListByTenant(workspaceID string) ([]models.ResourceServer, error) {
@@ -444,6 +535,9 @@ func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates m
 			}
 			newURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
 			if newURI != rs.ResourceURI {
+				if err := checkResourceURIAvailable(tx, rs.WorkspaceID, newURI, &rs.ID); err != nil {
+					return err
+				}
 				if err := tx.Model(&rs).Update("resource_uri", newURI).Error; err != nil {
 					return err
 				}

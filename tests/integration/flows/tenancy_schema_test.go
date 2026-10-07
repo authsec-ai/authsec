@@ -237,19 +237,26 @@ func Test_TenancySchema_PerWorkspaceUniques(t *testing.T) {
 	}
 }
 
-// resource_uri and workload issuers stay globally unique on purpose: the AS
-// resolves them before the workspace is known (see 048's header). This pins
-// the decision so a later change to per-workspace uniques is deliberate.
-func Test_TenancySchema_PreAuthIdentifiersStayGlobal(t *testing.T) {
+// Pre-auth identifiers: resource_uri is unique per workspace since 071, with
+// ownership of the URI's host deciding shared URIs (AS-060); workload issuers
+// stay globally unique (the SVID path selects the provider by iss alone).
+// This pins both decisions so a later change is deliberate.
+func Test_TenancySchema_PreAuthIdentifiers(t *testing.T) {
 	a, b := schemaTenants(t)
 	db := config.GetDatabase().DB
 
-	_, err := db.Exec(`
-		INSERT INTO resource_servers (id, workspace_id, name, public_base_url, resource_uri)
-		VALUES (gen_random_uuid(), $1, 'dup', 'https://dup.test', $2)`, b.WS.WorkspaceID, a.RS.ResourceURI)
-	if sqlState(err) != "23505" {
-		t.Fatalf("resource_uri reused in another workspace: want 23505, got %v", err)
+	// AS-060 (071): resource_uri is unique per workspace. Another workspace may
+	// hold the same URI at the database level; the application admits it only
+	// for the owner of the URI's host (Test_ResourceURI_OwnershipDecidesSharedURIs).
+	dup := `INSERT INTO resource_servers (id, workspace_id, name, public_base_url, resource_uri)
+		VALUES (gen_random_uuid(), $1, 'dup', 'https://dup.test', $2)`
+	if _, err := db.Exec(dup, a.WS.WorkspaceID, a.RS.ResourceURI); sqlState(err) != "23505" {
+		t.Fatalf("resource_uri reused in the same workspace: want 23505, got %v", err)
 	}
+	if _, err := db.Exec(dup, b.WS.WorkspaceID, a.RS.ResourceURI); err != nil {
+		t.Fatalf("resource_uri in another workspace must be allowed by the schema: %v", err)
+	}
+	mustExec(t, `DELETE FROM resource_servers WHERE workspace_id = $1 AND resource_uri = $2`, b.WS.WorkspaceID, a.RS.ResourceURI)
 
 	issuer := "https://issuer-" + emailSafeNonce() + ".test"
 	ins := `INSERT INTO workload_identity_providers (workspace_id, name, issuer) VALUES ($1, 'p', $2)`
