@@ -212,6 +212,89 @@ func Test_ScopedRepo_OIDC(t *testing.T) {
 	assertCount(t, 0, "oidc_user_identities", "id = ?", ident.ID)
 }
 
+// Voice identity links and active sessions are read and changed only in their
+// workspace.
+func Test_ScopedRepo_Voice(t *testing.T) {
+	a, b := TwoTenants(t)
+	repo := database.NewVoiceAuthRepository(config.GetDatabase())
+	ctxA := database.WithWorkspace(context.Background(), a.WS.WorkspaceID)
+	ctxB := database.WithWorkspace(context.Background(), b.WS.WorkspaceID)
+	n := emailSafeNonce()
+
+	link := &models.VoiceIdentityLink{ID: uuid.New(), WorkspaceID: a.WS.WorkspaceID, VoicePlatform: "alexa",
+		VoiceUserID: "vu-" + n, UserID: a.EndUser.UserID, UserEmail: a.EndUser.Email, IsActive: true, LinkMethod: "manual"}
+	if err := repo.CreateVoiceIdentityLink(link); err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+	if _, err := repo.FindVoiceIdentityLink(b.WS.WorkspaceID, "alexa", "vu-"+n); err == nil {
+		t.Error("B found A's voice link")
+	}
+	if l, _ := repo.ListVoiceIdentityLinks(b.WS.WorkspaceID, a.EndUser.UserID); len(l) != 0 {
+		t.Errorf("B lists %d of A's links", len(l))
+	}
+	if err := repo.DeactivateVoiceIdentityLink(b.WS.WorkspaceID, "alexa", "vu-"+n); err == nil {
+		t.Error("B deactivated A's link")
+	}
+	_ = repo.UpdateVoiceIdentityLinkLastUsed(ctxB, link.ID)
+	assertCount(t, 1, "voice_identity_links", "id = ? AND last_used_at IS NULL AND is_active = true", link.ID)
+	if err := repo.DeleteVoiceIdentityLink(ctxB, link.ID); err == nil {
+		t.Error("B deleted A's link")
+	}
+	if got, err := repo.FindVoiceIdentityLink(a.WS.WorkspaceID, "alexa", "vu-"+n); err != nil || got.ID != link.ID {
+		t.Errorf("A's link: %+v, %v", got, err)
+	}
+	if err := repo.UpdateVoiceIdentityLinkLastUsed(ctxA, link.ID); err != nil {
+		t.Errorf("last used: %v", err)
+	}
+	assertCount(t, 1, "voice_identity_links", "id = ? AND last_used_at IS NOT NULL", link.ID)
+	if err := repo.DeleteVoiceIdentityLink(ctxA, link.ID); err != nil {
+		t.Errorf("delete link: %v", err)
+	}
+
+	sid := "vs-" + n
+	as := &models.VoiceActiveSession{ID: uuid.New(), WorkspaceID: a.WS.WorkspaceID, UserID: a.EndUser.UserID,
+		UserEmail: a.EndUser.Email, SessionID: sid, ExpiresAt: time.Now().Add(time.Hour).Unix(), IsActive: true}
+	if err := repo.CreateVoiceActiveSession(as); err != nil {
+		t.Fatalf("create active session: %v", err)
+	}
+	if _, err := repo.FindVoiceActiveSessionBySessionID(ctxB, sid); err == nil {
+		t.Error("B found A's active session")
+	}
+	if revoked, _ := repo.IsSessionRevoked(ctxB, sid); !revoked {
+		t.Error("A's session is live in B's context")
+	}
+	if err := repo.RevokeVoiceActiveSession(ctxB, sid, "x"); err == nil {
+		t.Error("B revoked A's session")
+	}
+	if n, _ := repo.RevokeAllVoiceActiveSessions(b.WS.WorkspaceID, a.EndUser.UserID, "x", ""); n != 0 {
+		t.Errorf("B revoked %d of A's sessions", n)
+	}
+	if l, _ := repo.ListVoiceActiveSessions(b.WS.WorkspaceID, a.EndUser.UserID); len(l) != 0 {
+		t.Errorf("B lists %d of A's sessions", len(l))
+	}
+	if revoked, err := repo.IsSessionRevoked(ctxA, sid); err != nil || revoked {
+		t.Errorf("A's session revoked=%v, %v", revoked, err)
+	}
+	if l, _ := repo.ListActiveVoiceSessions(a.WS.WorkspaceID, a.EndUser.UserID); len(l) != 1 {
+		t.Errorf("A lists %d active sessions, want 1", len(l))
+	}
+	if c, _ := repo.CountActiveSessionsForUser(a.WS.WorkspaceID, a.EndUser.UserID); c != 1 {
+		t.Errorf("A counts %d active sessions, want 1", c)
+	}
+	if got, err := repo.FindVoiceActiveSessionByID(ctxA, as.ID); err != nil || got.SessionID != sid {
+		t.Errorf("A's session by id: %+v, %v", got, err)
+	}
+	if err := repo.RevokeVoiceActiveSession(ctxA, sid, "logout"); err != nil {
+		t.Errorf("revoke: %v", err)
+	}
+	if l, _ := repo.ListActiveVoiceSessions(a.WS.WorkspaceID, a.EndUser.UserID); len(l) != 0 {
+		t.Errorf("A lists %d active sessions after revoke", len(l))
+	}
+	if l, _ := repo.ListVoiceActiveSessions(a.WS.WorkspaceID, a.EndUser.UserID); len(l) != 1 {
+		t.Errorf("A lists %d sessions, want 1", len(l))
+	}
+}
+
 // DeleteTenant removes the ctx workspace's rows and registry row and nothing
 // of another workspace.
 func Test_ScopedRepo_DeleteTenant(t *testing.T) {

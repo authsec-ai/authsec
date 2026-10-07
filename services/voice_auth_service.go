@@ -111,10 +111,12 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 			Message: "Invalid session token",
 		}, nil
 	}
+	// The session's own workspace scopes every later statement on it.
+	sctx := database.WithWorkspace(context.Background(), session.WorkspaceID)
 
 	// Check if expired
 	if session.IsExpired() {
-		s.voiceRepo.UpdateVoiceSessionStatus(req.SessionToken, "expired")
+		s.voiceRepo.UpdateVoiceSessionStatus(sctx, req.SessionToken, "expired")
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "expired",
@@ -133,7 +135,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 
 	// Check OTP attempts
 	if !session.CanRetryOTP() {
-		s.voiceRepo.UpdateVoiceSessionStatus(req.SessionToken, "failed")
+		s.voiceRepo.UpdateVoiceSessionStatus(sctx, req.SessionToken, "failed")
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "failed",
@@ -143,7 +145,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 
 	// Verify OTP
 	if session.VoiceOTP != req.VoiceOTP {
-		s.voiceRepo.IncrementOTPAttempts(req.SessionToken)
+		s.voiceRepo.IncrementOTPAttempts(sctx, req.SessionToken)
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "initiated",
@@ -157,10 +159,10 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 		link, err := s.voiceRepo.FindVoiceIdentityLink(session.WorkspaceID, session.VoicePlatform, session.VoiceUserID)
 		if err == nil && link.IsActive {
 			// User is pre-linked - can issue token directly
-			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(link.ID)
+			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(sctx, link.ID)
 
 			// Get user from repository
-			user, err := s.userRepo.GetUserByID(database.WithWorkspace(context.Background(), session.WorkspaceID), link.UserID)
+			user, err := s.userRepo.GetUserByID(sctx, link.UserID)
 			if err != nil {
 				return &models.VoiceVerifyResponse{
 					Success: false,
@@ -197,7 +199,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 			}
 
 			// Mark session as verified
-			s.voiceRepo.VerifyVoiceSession(req.SessionToken, &link.UserID, link.UserEmail)
+			s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, &link.UserID, link.UserEmail)
 
 			return &models.VoiceVerifyResponse{
 				Success:     true,
@@ -245,10 +247,10 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, client
 	}
 
 	// Link device code to voice session
-	s.voiceRepo.LinkDeviceCode(req.SessionToken, deviceResp.DeviceCode)
+	s.voiceRepo.LinkDeviceCode(sctx, req.SessionToken, deviceResp.DeviceCode)
 
 	// Mark session as verified
-	s.voiceRepo.VerifyVoiceSession(req.SessionToken, nil, "")
+	s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, nil, "")
 
 	return &models.VoiceVerifyResponse{
 		Success:         true,
@@ -285,7 +287,8 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 
 	// The user must belong to the session's workspace, which came from the
 	// authenticated voice client, not from the request.
-	user, err := s.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(context.Background(), session.WorkspaceID), req.Email)
+	sctx := database.WithWorkspace(context.Background(), session.WorkspaceID)
+	user, err := s.userRepo.GetUserByEmailAndTenant(sctx, req.Email)
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",
@@ -326,7 +329,7 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 	}
 
 	// Mark session as verified
-	s.voiceRepo.VerifyVoiceSession(req.SessionToken, &user.ID, user.Email)
+	s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, &user.ID, user.Email)
 
 	return &models.VoiceTokenResponse{
 		AccessToken: token,
