@@ -13,6 +13,14 @@
 -- 003_*.sql files alongside this one; the migration runner applies them
 -- incrementally on top of an already-bootstrapped database.
 --
+-- Parity: this file alone produces the end state of the whole numbered chain
+-- (currently through 046), and on a fresh database the runner still applies
+-- every later file after it, so those files must change nothing here. Columns
+-- added by a later migration are marked "-- from NNN_..." inside their CREATE
+-- TABLE; objects created later are in the "018-046 end state" sections at the
+-- end of the file. scripts/bootstrap-parity-check.sh proves both properties;
+-- run it with every new migration.
+--
 -- GORM/SQL schema ownership:
 --   The Go migration runner (internal/migration/runner.go) needs the
 --   `migration_logs` table to exist before it can record migration outcomes,
@@ -4059,7 +4067,9 @@ CREATE TABLE public.iga_source_objects (
         lifecycle <> 'tombstoned' OR tombstoned_at IS NOT NULL),
     CONSTRAINT iga_source_objects_recognition_key
         UNIQUE (workspace_id, integration_id, object_type, recognition_key),
-    CONSTRAINT iga_source_objects_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_source_objects_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 018_source_object_scope.sql
+    integration_scope_id uuid
 );
 
 CREATE INDEX idx_iga_source_objects_workspace_type
@@ -4225,7 +4235,9 @@ CREATE TABLE public.iga_estate_scopes (
         REFERENCES public.iga_estate_scopes (workspace_id, id) ON DELETE SET NULL (parent_scope_id),
     CONSTRAINT iga_estate_scopes_stage_chk CHECK (
         stage IN ('production', 'non_production', 'unknown')),
-    CONSTRAINT iga_estate_scopes_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_estate_scopes_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 028_iga_recognition_keys.sql
+    source_key text DEFAULT ''::text NOT NULL
 );
 
 -- iga_agents — the LOGICAL agent only. A candidate is not an agent: proposals
@@ -4308,7 +4320,18 @@ CREATE TABLE public.iga_identity_accounts (
         REFERENCES public.iga_estate_scopes (workspace_id, id) ON DELETE SET NULL (estate_scope_id),
     CONSTRAINT iga_identity_accounts_rollup_chk CHECK (
         rollup_state IN ('confirmed', 'contested', 'unknown', 'stale')),
-    CONSTRAINT iga_identity_accounts_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_identity_accounts_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 028_iga_recognition_keys.sql
+    provider text DEFAULT ''::text NOT NULL,
+    source_key text DEFAULT ''::text NOT NULL,
+    continuity text DEFAULT 'recognition_only'::text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    provider_attrs jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT iga_identity_accounts_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_identity_accounts_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text)))
 );
 
 -- iga_credentials — NON-SECRET metadata about how an identity authenticates.
@@ -4336,7 +4359,17 @@ CREATE TABLE public.iga_credentials (
         REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT iga_credentials_lifecycle_chk CHECK (
         lifecycle IN ('active', 'expired', 'revoked', 'rotated')),
-    CONSTRAINT iga_credentials_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_credentials_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 028_iga_recognition_keys.sql
+    provider text DEFAULT ''::text NOT NULL,
+    source_key text DEFAULT ''::text NOT NULL,
+    continuity text DEFAULT 'recognition_only'::text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    CONSTRAINT iga_credentials_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_credentials_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text)))
 );
 
 CREATE INDEX idx_iga_credentials_identity
@@ -4361,7 +4394,18 @@ CREATE TABLE public.iga_resources (
         REFERENCES public.iga_estate_scopes (workspace_id, id) ON DELETE SET NULL (estate_scope_id),
     CONSTRAINT iga_resources_stage_chk CHECK (
         stage IN ('production', 'non_production', 'unknown')),
-    CONSTRAINT iga_resources_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_resources_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 028_iga_recognition_keys.sql
+    provider text DEFAULT ''::text NOT NULL,
+    source_key text DEFAULT ''::text NOT NULL,
+    continuity text DEFAULT 'recognition_only'::text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    provider_attrs jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT iga_resources_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_resources_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text)))
 );
 
 -- iga_entitlements — one native access unit. native_rights preserves the
@@ -4385,7 +4429,29 @@ CREATE TABLE public.iga_entitlements (
     CONSTRAINT iga_entitlements_resource_fkey
         FOREIGN KEY (workspace_id, resource_id)
         REFERENCES public.iga_resources (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT iga_entitlements_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_entitlements_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 028_iga_recognition_keys.sql
+    lifecycle text DEFAULT 'active'::text NOT NULL,
+    provider text DEFAULT ''::text NOT NULL,
+    source_key text DEFAULT ''::text NOT NULL,
+    continuity text DEFAULT 'recognition_only'::text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    CONSTRAINT iga_entitlements_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_entitlements_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text))),
+    CONSTRAINT iga_entitlements_lifecycle_chk CHECK ((lifecycle = ANY (ARRAY['active'::text, 'retired'::text, 'tombstoned'::text]))),
+    -- from 036_iga_permission_model.sql
+    policy_id uuid,
+    statement_key text DEFAULT ''::text NOT NULL,
+    sid text DEFAULT ''::text NOT NULL,
+    statement_index integer,
+    effect text DEFAULT ''::text NOT NULL,
+    content_hash text DEFAULT ''::text NOT NULL,
+    negated boolean DEFAULT false NOT NULL,
+    conditional boolean DEFAULT false NOT NULL,
+    CONSTRAINT iga_entitlements_aws_statement_chk CHECK (((provider <> 'aws'::text) OR ((policy_id IS NOT NULL) AND (statement_key <> ''::text) AND (effect = ANY (ARRAY['allow'::text, 'deny'::text])) AND (content_hash <> ''::text))))
 );
 
 -- iga_access_edges — subject -> entitlement -> resource.
@@ -4429,7 +4495,41 @@ CREATE TABLE public.iga_access_edges (
     -- complete. Partial or unknown evidence yields an unknown conclusion.
     CONSTRAINT iga_access_edges_honesty_chk CHECK (
         effective_conclusion = 'unknown' OR calculation_state = 'complete'),
-    CONSTRAINT iga_access_edges_workspace_id_key UNIQUE (workspace_id, id)
+    CONSTRAINT iga_access_edges_workspace_id_key UNIQUE (workspace_id, id),
+    -- from 030_iga_access_edges_typed.sql
+    subject_identity_account_id uuid,
+    provider text DEFAULT ''::text NOT NULL,
+    basis text DEFAULT 'declared'::text NOT NULL,
+    derivation_rule text DEFAULT ''::text NOT NULL,
+    state text DEFAULT 'current'::text NOT NULL,
+    valid_from timestamp with time zone DEFAULT now() NOT NULL,
+    valid_to timestamp with time zone,
+    last_confirmed_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_confirmed_by uuid,
+    ended_reason text DEFAULT ''::text NOT NULL,
+    source_key text DEFAULT ''::text NOT NULL,
+    partition_key text DEFAULT ''::text NOT NULL,
+    connector_id uuid,
+    CONSTRAINT iga_access_edges_basis_chk CHECK ((basis = ANY (ARRAY['declared'::text, 'observed'::text, 'derived'::text, 'asserted'::text]))),
+    CONSTRAINT iga_access_edges_derivation_chk CHECK (((basis <> 'derived'::text) OR (derivation_rule <> ''::text))),
+    CONSTRAINT iga_access_edges_ended_chk CHECK (((state = 'ended'::text) = (valid_to IS NOT NULL))),
+    CONSTRAINT iga_access_edges_ended_reason_chk CHECK (((state = 'ended'::text) = (ended_reason <> ''::text))),
+    CONSTRAINT iga_access_edges_state_chk CHECK ((state = ANY (ARRAY['current'::text, 'stale'::text, 'ended'::text]))),
+    CONSTRAINT iga_access_edges_subject_agree_chk CHECK (((subject_identity_account_id IS NULL) OR ((subject_kind = 'identity_account'::text) AND (subject_id = subject_identity_account_id)))),
+    -- from 036_iga_permission_model.sql
+    assignment_id uuid,
+    CONSTRAINT iga_access_edges_aws_grant_chk CHECK (((provider <> 'aws'::text) OR ((assignment_id IS NOT NULL) AND (entitlement_id IS NOT NULL) AND (subject_identity_account_id IS NOT NULL) AND (resource_id IS NULL)))),
+    -- from 040_k8s_grant_shape.sql
+    CONSTRAINT iga_access_edges_k8s_grant_chk CHECK (((provider <> 'k8s'::text) OR ((subject_identity_account_id IS NOT NULL) AND (resource_id IS NULL)))),
+    -- from 041_k8s_graph_support.sql
+    discovery_source_id uuid,
+    last_confirmed_sweep_id uuid,
+    CONSTRAINT iga_access_edges_confirm_provider_chk CHECK (((provider <> 'k8s'::text) OR (last_confirmed_by IS NULL))),
+    -- from 042_unified_inventory.sql
+    integration_id uuid,
+    last_confirmed_scan_run_id uuid,
+    CONSTRAINT iga_access_edges_github_confirm_chk CHECK (((provider <> 'github'::text) OR (last_confirmed_by IS NULL))),
+    CONSTRAINT iga_access_edges_scan_run_source_chk CHECK (((last_confirmed_scan_run_id IS NULL) OR (integration_id IS NOT NULL)))
 );
 
 CREATE INDEX idx_iga_access_edges_subject
@@ -6072,7 +6172,9 @@ CREATE TABLE IF NOT EXISTS public.cloud_connector (
     CONSTRAINT cloud_connector_auth_ref_chk CHECK (
         status <> 'active' OR auth_ref <> ''
     ),
-    CONSTRAINT cloud_connector_scan_generation_chk CHECK (scan_generation >= 0)
+    CONSTRAINT cloud_connector_scan_generation_chk CHECK (scan_generation >= 0),
+    -- from 039_cloud_connector_error_code.sql
+    last_error_code text DEFAULT ''::text NOT NULL
 );
 
 -- One row per onboarded scope; the conflict target for the onboarding upsert.
@@ -6159,7 +6261,11 @@ CREATE TABLE IF NOT EXISTS public.cloud_identity (
 
     CONSTRAINT cloud_identity_kind_chk CHECK (kind <> ''),
     CONSTRAINT cloud_identity_native_id_chk CHECK (native_id <> ''),
-    CONSTRAINT cloud_identity_generation_chk CHECK (last_seen_generation >= 0)
+    CONSTRAINT cloud_identity_generation_chk CHECK (last_seen_generation >= 0),
+    -- from 035_aws_collection_model.sql
+    trust_document jsonb,
+    trust_document_hash text DEFAULT ''::text NOT NULL,
+    trust_parse_error text DEFAULT ''::text NOT NULL
 );
 
 -- One identity, one row. The conflict target for the scan's upsert, and what
@@ -6781,8 +6887,9 @@ CREATE INDEX IF NOT EXISTS idx_cloud_scan_checkpoint_connector
 CREATE TABLE IF NOT EXISTS public.cloud_scan_run (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id uuid NOT NULL,
-    connector_id uuid NOT NULL
-        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+    -- Workspace-qualified FK to cloud_connector: see "from 027" at the end of
+    -- this file (027 replaced the single-column FK declared here).
+    connector_id uuid NOT NULL,
 
     -- The generation this run stamps its rows with. Assigned when the run is
     -- claimed, not when it is queued: a run that never starts must not burn a
@@ -6831,7 +6938,9 @@ CREATE TABLE IF NOT EXISTS public.cloud_scan_run (
     CONSTRAINT cloud_scan_run_generation_chk CHECK (
         status IN ('queued', 'abandoned') OR generation > 0),
 
-    CONSTRAINT cloud_scan_run_attempts_chk CHECK (attempts >= 0)
+    CONSTRAINT cloud_scan_run_attempts_chk CHECK (attempts >= 0),
+    -- from 024_scan_evidence_durability.sql
+    coverage jsonb DEFAULT '{}'::jsonb NOT NULL
 );
 
 -- AT MOST ONE LIVE RUN PER CONNECTOR.
@@ -6870,21 +6979,25 @@ COMMENT ON COLUMN public.cloud_scan_run.generation IS
 CREATE TABLE IF NOT EXISTS public.cloud_observation (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id uuid NOT NULL,
-    connector_id uuid NOT NULL
-        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+    -- connector_id and scan_run_id carry workspace-qualified FKs (to
+    -- cloud_connector, and RESTRICT to cloud_scan_run): see "from 027" at the
+    -- end of this file, which replaced the single-column FKs declared here.
+    connector_id uuid NOT NULL,
 
     -- The run that produced this fact. RESTRICT, not CASCADE: evidence must not
     -- disappear because someone pruned a scan. Retention is a deliberate policy
     -- with an auditable outcome, never a side effect of housekeeping.
-    scan_run_id uuid NOT NULL
-        REFERENCES public.cloud_scan_run(id) ON DELETE RESTRICT,
+    scan_run_id uuid NOT NULL,
     generation integer NOT NULL,
 
-    -- Exactly one subject. See the header on why these are typed columns.
-    identity_id uuid REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
-    permission_id uuid REFERENCES public.cloud_permission(id) ON DELETE CASCADE,
-    resource_id uuid REFERENCES public.cloud_resource(id) ON DELETE CASCADE,
-    workload_id uuid REFERENCES public.cloud_workload(id) ON DELETE CASCADE,
+    -- At most one subject (024; 035 added policy_id). See the header on why
+    -- these are typed columns. SET NULL, not CASCADE (024): reconciliation
+    -- deleting a subject must not delete the evidence about it --
+    -- subject_native_id keeps the row legible.
+    identity_id uuid REFERENCES public.cloud_identity(id) ON DELETE SET NULL,
+    permission_id uuid REFERENCES public.cloud_permission(id) ON DELETE SET NULL,
+    resource_id uuid REFERENCES public.cloud_resource(id) ON DELETE SET NULL,
+    workload_id uuid REFERENCES public.cloud_workload(id) ON DELETE SET NULL,
 
     -- The AWS call this came from, e.g. "iam:GetRole", "lambda:ListFunctions".
     -- Named as the API, not as our surface, so a reader can go and make the
@@ -6908,26 +7021,36 @@ CREATE TABLE IF NOT EXISTS public.cloud_observation (
     -- Hash of sanitized_facts, so an unchanged re-read writes nothing.
     content_hash text NOT NULL,
 
+    -- At most one subject: "= 1" until 024 made it "<= 1" (a subject SET NULL
+    -- by reconciliation leaves a subjectless row); 035 added policy_id.
     CONSTRAINT cloud_observation_subject_chk CHECK (
         (identity_id IS NOT NULL)::int
       + (permission_id IS NOT NULL)::int
       + (resource_id IS NOT NULL)::int
-      + (workload_id IS NOT NULL)::int = 1
+      + (workload_id IS NOT NULL)::int
+      + (policy_id IS NOT NULL)::int <= 1
     ),
     CONSTRAINT cloud_observation_source_api_chk CHECK (source_api <> ''),
     CONSTRAINT cloud_observation_hash_chk CHECK (content_hash <> ''),
-    CONSTRAINT cloud_observation_generation_chk CHECK (generation > 0)
+    CONSTRAINT cloud_observation_generation_chk CHECK (generation > 0),
+    -- from 024_scan_evidence_durability.sql
+    subject_native_id text NOT NULL,
+    last_confirmed_run_id uuid,
+    last_confirmed_at timestamp with time zone,
+    confirmation_count integer DEFAULT 1 NOT NULL,
+    -- from 035_aws_collection_model.sql
+    policy_id uuid
 );
 
 -- Re-reading unchanged data must not grow the table.
 --
 -- Keyed on the subject columns rather than a single subject id because that is
 -- what exists; COALESCE gives one comparable value without reintroducing a
--- polymorphic column.
+-- polymorphic column. policy_id joined the COALESCE in 035.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_observation_dedupe
     ON public.cloud_observation (
         workspace_id,
-        COALESCE(identity_id, permission_id, resource_id, workload_id),
+        COALESCE(identity_id, permission_id, resource_id, workload_id, policy_id),
         source_api,
         content_hash
     );
@@ -6962,3 +7085,1131 @@ COMMENT ON COLUMN public.cloud_observation.content_hash IS
 COMMENT ON COLUMN public.cloud_observation.surface_state IS
     'The surface coverage state when this was collected, so a fact read during '
     'a partial scan stays readable as such later.';
+
+-- ===========================================================================
+-- 018-046 end state — bootstrap parity (T3.00, SPEC-iga-phase3-policy.md §6.1)
+--
+-- Everything below, plus the columns and constraints marked "-- from NNN_..."
+-- inside earlier CREATE TABLEs, brings this file to the end state of the
+-- numbered chain 001-046, so a fresh database built from this file alone has
+-- the same schema as one that ran every migration -- and 002-046, which the
+-- runner still applies after this file on a fresh database, change nothing.
+--
+-- GENERATED, not hand-copied: each object below is pg_dump's rendering of the
+-- object as it stands after 046, placed in the section of the migration that
+-- created it (constraints, indexes and triggers: the migration that last
+-- changed them). The migration files keep the rationale; read them for WHY.
+-- Proven by scripts/bootstrap-parity-check.sh, which compares this file alone,
+-- this file followed by 002-046, and the numbered chain. Re-run it whenever a
+-- migration lands, and add that migration's end state here.
+--
+-- migrations/contract/037_iga_access_edges_contract.sql is NOT reflected
+-- here: the runner does not apply migrations/contract, so the deployed end
+-- state still has iga_access_edges.subject_kind / subject_id. It moves into
+-- this file when it moves into migrations/master.
+-- ===========================================================================
+
+-- ---- from 018_source_object_scope.sql ----
+-- Records WHICH SCOPE each source object was discovered in, so a scope that
+-- was never read cannot be emptied by a different scope's success.
+-- 1 index, 1 comment
+
+CREATE INDEX idx_iga_source_objects_scope_sweep ON public.iga_source_objects USING btree (workspace_id, integration_id, integration_scope_id, object_type, lifecycle, scan_generation);
+
+COMMENT ON COLUMN public.iga_source_objects.integration_scope_id IS 'Scope this object was observed in. NULL means the scope was not recorded (pre-018 rows) and the object is therefore never eligible for tombstoning.';
+
+-- ---- from 019_permission_constraints.sql ----
+-- record what constrains a permission, not just what it grants.
+-- 1 index, 4 comments
+
+CREATE INDEX idx_cloud_permission_constrained ON public.cloud_permission USING btree (workspace_id, identity_id) WHERE (constraint_state <> 'unconstrained'::text);
+
+COMMENT ON COLUMN public.cloud_permission.condition IS 'Condition block as AWS returned it. Stored, never evaluated.';
+
+COMMENT ON COLUMN public.cloud_permission.constraint_state IS 'unknown | unconstrained | conditional | negated | bounded. Only ''unconstrained'' may be rendered as plain access; ''unknown'' means the row predates constraint collection and has not been rescanned.';
+
+COMMENT ON COLUMN public.cloud_permission.not_actions IS 'NotAction element: every action EXCEPT these. Never empty-means-none - a row with not_actions and no actions is a very broad statement.';
+
+COMMENT ON COLUMN public.cloud_permission.not_resources IS 'NotResource element, verbatim. Must never be widened to ''*''.';
+
+-- ---- from 021_resource_identity.sql ----
+-- say WHICH account a resource belongs to, and WHAT it actually is.
+-- 1 index, 3 comments
+
+CREATE INDEX idx_cloud_resource_external ON public.cloud_resource USING btree (workspace_id, connector_id) WHERE is_external;
+
+COMMENT ON COLUMN public.cloud_resource.is_external IS 'The resource belongs to an account other than the one scanned. Its existence is unverified: a policy naming an ARN is not proof it is there.';
+
+COMMENT ON COLUMN public.cloud_resource.resource_account IS 'Account from the resource''s OWN ARN, not the connector that observed it.';
+
+COMMENT ON COLUMN public.cloud_resource.sensitivity_source IS 'heuristic_service | provider_metadata | customer_classification | unknown. Today everything is heuristic_service -- an AuthSec rule on the ARN''s service segment.';
+
+-- ---- from 023_discovery_enforcement_columns.sql ----
+-- give EXISTING databases the enforcement columns that only new ones have.
+-- 1 comment
+
+COMMENT ON COLUMN public.discovery_sources.enforcement_mode IS '"" | observe | evict | deny. Empty means enforcement was never configured for this source, which is not the same as configured-and-off.';
+
+-- ---- from 024_scan_evidence_durability.sql ----
+-- four defects in how a scan's coverage and evidence survive past the scan
+-- that produced them. Nothing built on cloud_observation or on "was this scan
+-- complete" is trustworthy until these are fixed.
+-- 1 index, 4 comments
+
+CREATE INDEX idx_cloud_observation_last_confirmed_run ON public.cloud_observation USING btree (last_confirmed_run_id);
+
+COMMENT ON COLUMN public.cloud_observation.confirmation_count IS 'How many runs, including the one that first wrote this row, have seen this exact fact. A floor on how long it has been true, not a full history -- the history is scan_run_id plus every later confirming run, which this table does not enumerate.';
+
+COMMENT ON COLUMN public.cloud_observation.last_confirmed_run_id IS 'The most recent run that re-read this exact fact (same subject, api and content hash). Updated on the dedupe path instead of leaving it silent, so reconciliation can ask "did this run confirm this" without the table growing on an unchanged account.';
+
+COMMENT ON COLUMN public.cloud_observation.subject_native_id IS 'The AWS-native id (ARN, role name, ...) of the subject, captured when the observation was written. Exists so a row still says what it was evidence for after its subject_id is SET NULL by reconciliation deleting the row it pointed at -- otherwise SET NULL preserves a row with nothing legible left on it.';
+
+COMMENT ON COLUMN public.cloud_scan_run.coverage IS 'This run''s own final ScanCoverage report, stamped once at publish time. Authoritative for THIS run regardless of what a later run writes to cloud_connector.coverage -- read this column, not the connector''s, when the question is "was this specific run complete".';
+
+-- ---- from 027_workspace_qualified_provenance.sql ----
+-- every provenance reference is workspace-qualified.
+-- 1 table, 4 constraints, 5 fk constraints, 3 comments
+
+CREATE TABLE public.iga_pipeline_lease (
+    workspace_id uuid NOT NULL,
+    state text DEFAULT 'idle'::text NOT NULL,
+    holder text DEFAULT ''::text NOT NULL,
+    scan_run_id uuid,
+    expires_at timestamp with time zone,
+    version bigint DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_pipeline_lease_busy_chk CHECK (((state = 'idle'::text) = ((holder = ''::text) AND (scan_run_id IS NULL)))),
+    CONSTRAINT iga_pipeline_lease_state_chk CHECK ((state = ANY (ARRAY['idle'::text, 'collecting'::text, 'projecting'::text])))
+);
+
+ALTER TABLE ONLY public.cloud_connector
+    ADD CONSTRAINT cloud_connector_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.cloud_observation
+    ADD CONSTRAINT cloud_observation_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.cloud_scan_run
+    ADD CONSTRAINT cloud_scan_run_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_pipeline_lease
+    ADD CONSTRAINT iga_pipeline_lease_pkey PRIMARY KEY (workspace_id);
+
+ALTER TABLE ONLY public.cloud_observation
+    ADD CONSTRAINT cloud_observation_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_observation
+    ADD CONSTRAINT cloud_observation_last_confirmed_fkey FOREIGN KEY (workspace_id, last_confirmed_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE SET NULL (last_confirmed_run_id);
+
+ALTER TABLE ONLY public.cloud_observation
+    ADD CONSTRAINT cloud_observation_run_fkey FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.cloud_scan_run
+    ADD CONSTRAINT cloud_scan_run_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_pipeline_lease
+    ADD CONSTRAINT iga_pipeline_lease_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+COMMENT ON CONSTRAINT cloud_observation_last_confirmed_fkey ON public.cloud_observation IS 'Workspace-qualified (§2.9). SET NULL names its column so a deleted scan run clears the confirmation without clearing the row''s workspace.';
+
+COMMENT ON CONSTRAINT cloud_observation_run_fkey ON public.cloud_observation IS 'Workspace-qualified (§2.9). The single-column form this replaced admitted another workspace''s scan run as the provenance of this observation.';
+
+COMMENT ON TABLE public.iga_pipeline_lease IS 'One row per WORKSPACE. state=projecting is what a later scan claim collides with, and because it is a committed row rather than a session lock it survives the gap between the publish transaction and the projection transaction. Recovery is an expiry sweep, so a dead worker cannot wedge a workspace permanently.';
+
+-- ---- from 028_iga_recognition_keys.sql ----
+-- recognition keys, continuity, provider
+-- 7 indexes
+
+CREATE INDEX idx_iga_identity_accounts_provider ON public.iga_identity_accounts USING btree (workspace_id, provider, lifecycle);
+
+CREATE INDEX idx_iga_resources_provider ON public.iga_resources USING btree (workspace_id, provider, lifecycle);
+
+CREATE UNIQUE INDEX uq_iga_credentials_source_key ON public.iga_credentials USING btree (workspace_id, source_key) WHERE ((source_key <> ''::text) AND (lifecycle <> ALL (ARRAY['revoked'::text, 'expired'::text])));
+
+CREATE UNIQUE INDEX uq_iga_entitlements_source_key ON public.iga_entitlements USING btree (workspace_id, source_key) WHERE ((source_key <> ''::text) AND (lifecycle <> 'retired'::text));
+
+CREATE UNIQUE INDEX uq_iga_estate_scopes_source_key ON public.iga_estate_scopes USING btree (workspace_id, source_key) WHERE (source_key <> ''::text);
+
+CREATE UNIQUE INDEX uq_iga_identity_accounts_source_key ON public.iga_identity_accounts USING btree (workspace_id, source_key) WHERE ((source_key <> ''::text) AND (lifecycle <> 'retired'::text));
+
+CREATE UNIQUE INDEX uq_iga_resources_source_key ON public.iga_resources USING btree (workspace_id, source_key) WHERE ((source_key <> ''::text) AND (lifecycle <> 'retired'::text));
+
+-- ---- from 029_iga_workload.sql ----
+-- iga_workload, execution-role state, classification
+-- 3 tables, 6 constraints, 4 indexes, 5 fk constraints
+
+CREATE TABLE public.iga_classification_clock (
+    workspace_id uuid NOT NULL,
+    seq bigint DEFAULT 0 NOT NULL
+);
+
+CREATE TABLE public.iga_workload (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    estate_scope_id uuid,
+    provider text DEFAULT 'aws'::text NOT NULL,
+    runtime_kind text NOT NULL,
+    display_name text DEFAULT ''::text NOT NULL,
+    region text DEFAULT ''::text NOT NULL,
+    stage text DEFAULT 'unknown'::text NOT NULL,
+    lifecycle text DEFAULT 'active'::text NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    source_key text NOT NULL,
+    continuity text DEFAULT 'recognition_only'::text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    provider_attrs jsonb DEFAULT '{}'::jsonb NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    execution_role_state text DEFAULT 'none'::text NOT NULL,
+    execution_role_arn text DEFAULT ''::text NOT NULL,
+    classification text DEFAULT 'unclassified'::text NOT NULL,
+    classification_version bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT iga_workload_classification_chk CHECK ((classification = ANY (ARRAY['unclassified'::text, 'provider_native_agent'::text, 'classified_agent'::text]))),
+    CONSTRAINT iga_workload_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_workload_exec_role_arn_chk CHECK (((execution_role_state = ANY (ARRAY['not_in_scan'::text, 'not_in_inventory'::text])) = (execution_role_arn <> ''::text))),
+    CONSTRAINT iga_workload_exec_role_state_chk CHECK ((execution_role_state = ANY (ARRAY['resolved'::text, 'not_in_scan'::text, 'not_in_inventory'::text, 'none'::text]))),
+    CONSTRAINT iga_workload_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text))),
+    CONSTRAINT iga_workload_lifecycle_chk CHECK ((lifecycle = ANY (ARRAY['active'::text, 'retired'::text, 'tombstoned'::text]))),
+    CONSTRAINT iga_workload_retired_chk CHECK (((lifecycle = 'retired'::text) = (retired_reason <> ''::text))),
+    CONSTRAINT iga_workload_source_key_chk CHECK ((source_key <> ''::text)),
+    CONSTRAINT iga_workload_stage_chk CHECK ((stage = ANY (ARRAY['production'::text, 'non_production'::text, 'unknown'::text])))
+);
+
+CREATE TABLE public.iga_workload_classification (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    workload_id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    decision text NOT NULL,
+    previous text NOT NULL,
+    purpose text DEFAULT ''::text NOT NULL,
+    reason text NOT NULL,
+    decided_by_user_id uuid NOT NULL,
+    against_version bigint NOT NULL,
+    request_hash text NOT NULL,
+    result_version bigint NOT NULL,
+    undoes_decision_id uuid,
+    decided_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_wc_decision_chk CHECK ((decision = ANY (ARRAY['classified_agent'::text, 'unclassified'::text]))),
+    CONSTRAINT iga_wc_reason_chk CHECK ((reason <> ''::text))
+);
+
+ALTER TABLE ONLY public.iga_classification_clock
+    ADD CONSTRAINT iga_classification_clock_pkey PRIMARY KEY (workspace_id);
+
+ALTER TABLE ONLY public.iga_workload
+    ADD CONSTRAINT iga_workload_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_workload
+    ADD CONSTRAINT iga_workload_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_workload_classification
+    ADD CONSTRAINT iga_wc_operation_key UNIQUE (workspace_id, operation_id);
+
+ALTER TABLE ONLY public.iga_workload_classification
+    ADD CONSTRAINT iga_wc_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_workload_classification
+    ADD CONSTRAINT iga_workload_classification_pkey PRIMARY KEY (id);
+
+CREATE INDEX idx_iga_wc_workload ON public.iga_workload_classification USING btree (workspace_id, workload_id, decided_at DESC);
+
+CREATE INDEX idx_iga_workload_classification ON public.iga_workload USING btree (workspace_id, classification, lower(display_name), id);
+
+CREATE INDEX idx_iga_workload_list ON public.iga_workload USING btree (workspace_id, lifecycle, lower(display_name), id);
+
+CREATE UNIQUE INDEX uq_iga_workload_source_key ON public.iga_workload USING btree (workspace_id, source_key) WHERE (lifecycle <> 'retired'::text);
+
+ALTER TABLE ONLY public.iga_classification_clock
+    ADD CONSTRAINT iga_classification_clock_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_workload
+    ADD CONSTRAINT iga_workload_scope_fkey FOREIGN KEY (workspace_id, estate_scope_id) REFERENCES public.iga_estate_scopes(workspace_id, id) ON DELETE SET NULL (estate_scope_id);
+
+ALTER TABLE ONLY public.iga_workload
+    ADD CONSTRAINT iga_workload_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_workload_classification
+    ADD CONSTRAINT iga_wc_undoes_fkey FOREIGN KEY (workspace_id, undoes_decision_id) REFERENCES public.iga_workload_classification(workspace_id, id);
+
+ALTER TABLE ONLY public.iga_workload_classification
+    ADD CONSTRAINT iga_wc_workload_fkey FOREIGN KEY (workspace_id, workload_id) REFERENCES public.iga_workload(workspace_id, id) ON DELETE CASCADE;
+
+-- ---- from 030_iga_access_edges_typed.sql ----
+-- iga_access_edges: typed subject, lifecycle — expand only
+-- 3 indexes, 3 fk constraints
+
+CREATE INDEX idx_iga_access_edges_partition ON public.iga_access_edges USING btree (workspace_id, connector_id, partition_key) WHERE (state <> 'ended'::text);
+
+CREATE INDEX idx_iga_access_edges_subject_identity ON public.iga_access_edges USING btree (workspace_id, subject_identity_account_id) WHERE (subject_identity_account_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_access_edges_live ON public.iga_access_edges USING btree (workspace_id, source_key) WHERE ((source_key <> ''::text) AND (state <> 'ended'::text));
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE SET NULL (connector_id);
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_run_fkey FOREIGN KEY (workspace_id, last_confirmed_by) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE SET NULL (last_confirmed_by);
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_subject_identity_fkey FOREIGN KEY (workspace_id, subject_identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+-- ---- from 031_iga_relationship.sql ----
+-- iga_relationship
+-- 1 table, 2 constraints, 4 indexes, 6 fk constraints
+
+CREATE TABLE public.iga_relationship (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    relationship_type text NOT NULL,
+    source_identity_account_id uuid,
+    source_workload_id uuid,
+    target_identity_account_id uuid,
+    basis text DEFAULT 'declared'::text NOT NULL,
+    derivation_rule text DEFAULT ''::text NOT NULL,
+    state text DEFAULT 'current'::text NOT NULL,
+    valid_from timestamp with time zone DEFAULT now() NOT NULL,
+    valid_to timestamp with time zone,
+    last_confirmed_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_confirmed_by uuid,
+    ended_reason text DEFAULT ''::text NOT NULL,
+    source_key text NOT NULL,
+    partition_key text DEFAULT ''::text NOT NULL,
+    connector_id uuid,
+    statement_key text DEFAULT ''::text NOT NULL,
+    conditions jsonb,
+    mechanism text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_external_principal_id uuid,
+    CONSTRAINT iga_relationship_basis_chk CHECK ((basis = ANY (ARRAY['declared'::text, 'observed'::text, 'derived'::text, 'asserted'::text]))),
+    CONSTRAINT iga_relationship_derivation_chk CHECK (((basis <> 'derived'::text) OR (derivation_rule <> ''::text))),
+    CONSTRAINT iga_relationship_ended_chk CHECK (((state = 'ended'::text) = (valid_to IS NOT NULL))),
+    CONSTRAINT iga_relationship_ended_reason_chk CHECK (((state = 'ended'::text) = (ended_reason <> ''::text))),
+    CONSTRAINT iga_relationship_pair_chk CHECK (
+CASE relationship_type
+    WHEN 'executes_as'::text THEN (source_workload_id IS NOT NULL)
+    WHEN 'task_execution_role'::text THEN (source_workload_id IS NOT NULL)
+    WHEN 'member_of'::text THEN (source_identity_account_id IS NOT NULL)
+    WHEN 'can_assume'::text THEN ((source_identity_account_id IS NOT NULL) OR (source_external_principal_id IS NOT NULL))
+    ELSE false
+END),
+    CONSTRAINT iga_relationship_source_chk CHECK ((((((source_identity_account_id IS NOT NULL))::integer + ((source_workload_id IS NOT NULL))::integer) + ((source_external_principal_id IS NOT NULL))::integer) = 1)),
+    CONSTRAINT iga_relationship_source_key_chk CHECK ((source_key <> ''::text)),
+    CONSTRAINT iga_relationship_state_chk CHECK ((state = ANY (ARRAY['current'::text, 'stale'::text, 'ended'::text]))),
+    CONSTRAINT iga_relationship_target_chk CHECK ((target_identity_account_id IS NOT NULL)),
+    CONSTRAINT iga_relationship_trust_chk CHECK (((relationship_type = 'can_assume'::text) = (mechanism <> ''::text)))
+);
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_relationship_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_relationship_workspace_id_key UNIQUE (workspace_id, id);
+
+CREATE INDEX idx_iga_relationship_partition ON public.iga_relationship USING btree (workspace_id, connector_id, partition_key) WHERE (state <> 'ended'::text);
+
+CREATE INDEX idx_iga_relationship_source ON public.iga_relationship USING btree (workspace_id, relationship_type, COALESCE(source_identity_account_id, source_workload_id));
+
+CREATE INDEX idx_iga_relationship_target ON public.iga_relationship USING btree (workspace_id, relationship_type, target_identity_account_id);
+
+CREATE UNIQUE INDEX uq_iga_relationship_live ON public.iga_relationship USING btree (workspace_id, source_key) WHERE (state <> 'ended'::text);
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_rel_src_identity_fkey FOREIGN KEY (workspace_id, source_identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_rel_src_workload_fkey FOREIGN KEY (workspace_id, source_workload_id) REFERENCES public.iga_workload(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_rel_tgt_identity_fkey FOREIGN KEY (workspace_id, target_identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_relationship_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE SET NULL (connector_id);
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_relationship_run_fkey FOREIGN KEY (workspace_id, last_confirmed_by) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE SET NULL (last_confirmed_by);
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_relationship_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- ---- from 032_iga_evidence_and_support.sql ----
+-- evidence junctions, and per-source support for shared nodes.
+-- 3 tables, 5 constraints, 3 indexes, 11 fk constraints, 1 comment
+
+CREATE TABLE public.iga_access_edge_evidence (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    access_edge_id uuid NOT NULL,
+    observation_id uuid NOT NULL,
+    relation text DEFAULT 'supports'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_access_edge_evidence_relation_chk CHECK ((relation = ANY (ARRAY['supports'::text, 'contradicts'::text, 'supersedes'::text, 'previously_supported'::text])))
+);
+
+CREATE TABLE public.iga_object_support (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    identity_account_id uuid,
+    workload_id uuid,
+    resource_id uuid,
+    entitlement_id uuid,
+    connector_id uuid,
+    partition_key text NOT NULL,
+    state text DEFAULT 'current'::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_confirmed_run_id uuid,
+    last_confirmed_at timestamp with time zone,
+    ended_reason text DEFAULT ''::text NOT NULL,
+    policy_id uuid,
+    discovery_source_id uuid,
+    last_confirmed_sweep_id uuid,
+    integration_id uuid,
+    last_confirmed_scan_run_id uuid,
+    source_ref uuid GENERATED ALWAYS AS (COALESCE(connector_id, discovery_source_id, integration_id)) STORED,
+    CONSTRAINT iga_object_support_confirm_chk CHECK ((((last_confirmed_run_id IS NULL) OR (connector_id IS NOT NULL)) AND ((last_confirmed_sweep_id IS NULL) OR (discovery_source_id IS NOT NULL)) AND ((last_confirmed_scan_run_id IS NULL) OR (integration_id IS NOT NULL)))),
+    CONSTRAINT iga_object_support_ended_chk CHECK (((state = 'ended'::text) = (ended_reason <> ''::text))),
+    CONSTRAINT iga_object_support_one_chk CHECK ((((((((identity_account_id IS NOT NULL))::integer + ((workload_id IS NOT NULL))::integer) + ((resource_id IS NOT NULL))::integer) + ((entitlement_id IS NOT NULL))::integer) + ((policy_id IS NOT NULL))::integer) = 1)),
+    CONSTRAINT iga_object_support_source_chk CHECK ((((((connector_id IS NOT NULL))::integer + ((discovery_source_id IS NOT NULL))::integer) + ((integration_id IS NOT NULL))::integer) = 1)),
+    CONSTRAINT iga_object_support_state_chk CHECK ((state = ANY (ARRAY['current'::text, 'stale'::text, 'ended'::text])))
+);
+
+CREATE TABLE public.iga_relationship_evidence (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    relationship_id uuid NOT NULL,
+    observation_id uuid NOT NULL,
+    relation text DEFAULT 'supports'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_relationship_evidence_relation_chk CHECK ((relation = ANY (ARRAY['supports'::text, 'contradicts'::text, 'supersedes'::text, 'previously_supported'::text])))
+);
+
+ALTER TABLE ONLY public.iga_access_edge_evidence
+    ADD CONSTRAINT iga_access_edge_evidence_key UNIQUE (workspace_id, access_edge_id, observation_id, relation);
+
+ALTER TABLE ONLY public.iga_access_edge_evidence
+    ADD CONSTRAINT iga_access_edge_evidence_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_object_support_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_relationship_evidence
+    ADD CONSTRAINT iga_relationship_evidence_key UNIQUE (workspace_id, relationship_id, observation_id, relation);
+
+ALTER TABLE ONLY public.iga_relationship_evidence
+    ADD CONSTRAINT iga_relationship_evidence_pkey PRIMARY KEY (id);
+
+CREATE INDEX idx_iga_access_edge_evidence_edge ON public.iga_access_edge_evidence USING btree (workspace_id, access_edge_id);
+
+CREATE INDEX idx_iga_object_support_partition ON public.iga_object_support USING btree (workspace_id, connector_id, partition_key) WHERE (state <> 'ended'::text);
+
+CREATE INDEX idx_iga_relationship_evidence_rel ON public.iga_relationship_evidence USING btree (workspace_id, relationship_id);
+
+ALTER TABLE ONLY public.iga_access_edge_evidence
+    ADD CONSTRAINT iga_access_edge_evidence_edge_fkey FOREIGN KEY (workspace_id, access_edge_id) REFERENCES public.iga_access_edges(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_access_edge_evidence
+    ADD CONSTRAINT iga_access_edge_evidence_obs_fkey FOREIGN KEY (workspace_id, observation_id) REFERENCES public.cloud_observation(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_object_support_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_object_support_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id) REFERENCES public.iga_entitlements(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_identity_fkey FOREIGN KEY (workspace_id, identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_resource_fkey FOREIGN KEY (workspace_id, resource_id) REFERENCES public.iga_resources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_run_fkey FOREIGN KEY (workspace_id, last_confirmed_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE SET NULL (last_confirmed_run_id);
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_workload_fkey FOREIGN KEY (workspace_id, workload_id) REFERENCES public.iga_workload(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_relationship_evidence
+    ADD CONSTRAINT iga_relationship_evidence_obs_fkey FOREIGN KEY (workspace_id, observation_id) REFERENCES public.cloud_observation(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.iga_relationship_evidence
+    ADD CONSTRAINT iga_relationship_evidence_rel_fkey FOREIGN KEY (workspace_id, relationship_id) REFERENCES public.iga_relationship(workspace_id, id) ON DELETE CASCADE;
+
+COMMENT ON TABLE public.iga_object_support IS 'One row per (object, connector, partition). Reconciliation ends SUPPORT; a node retires only when every support of it has ended. The node-side analogue of a partition membership column, and the reason nodes cannot simply carry one.';
+
+-- ---- from 033_iga_projection_job_state.sql ----
+-- the projection job, the per-partition watermark, and publication.
+-- 3 tables, 6 constraints, 2 indexes, 9 fk constraints, 3 comments
+
+CREATE TABLE public.iga_projection_job (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    scan_run_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    generation integer NOT NULL,
+    status text DEFAULT 'queued'::text NOT NULL,
+    lease_owner text DEFAULT ''::text NOT NULL,
+    lease_expires_at timestamp with time zone,
+    lease_version bigint DEFAULT 0 NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    last_error text DEFAULT ''::text NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT iga_projection_job_generation_chk CHECK ((generation > 0)),
+    CONSTRAINT iga_projection_job_status_chk CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'complete'::text, 'failed'::text, 'abandoned'::text])))
+);
+
+CREATE TABLE public.iga_projection_state (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    estate_scope_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    object_class text DEFAULT ''::text NOT NULL,
+    relationship_type text DEFAULT ''::text NOT NULL,
+    partition_key text NOT NULL,
+    last_run_id uuid NOT NULL,
+    last_generation bigint NOT NULL,
+    coverage_state text NOT NULL,
+    reconciled boolean DEFAULT false NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_projection_state_generation_chk CHECK ((last_generation >= 0))
+);
+
+CREATE TABLE public.iga_publication (
+    workspace_id uuid NOT NULL,
+    rev bigint NOT NULL,
+    published_at timestamp with time zone NOT NULL,
+    scan_run_id uuid NOT NULL,
+    manifest jsonb NOT NULL,
+    CONSTRAINT iga_publication_rev_chk CHECK ((rev > 0))
+);
+
+ALTER TABLE ONLY public.iga_projection_job
+    ADD CONSTRAINT iga_projection_job_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_projection_job
+    ADD CONSTRAINT iga_projection_job_run_key UNIQUE (scan_run_id);
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_key UNIQUE (workspace_id, connector_id, partition_key);
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_publication
+    ADD CONSTRAINT iga_publication_pkey PRIMARY KEY (workspace_id, rev);
+
+ALTER TABLE ONLY public.iga_publication
+    ADD CONSTRAINT iga_publication_run_key UNIQUE (workspace_id, scan_run_id);
+
+CREATE INDEX idx_iga_projection_job_claimable ON public.iga_projection_job USING btree (status, lease_expires_at, requested_at) WHERE (status = ANY (ARRAY['queued'::text, 'running'::text]));
+
+CREATE INDEX idx_iga_publication_current ON public.iga_publication USING btree (workspace_id, rev DESC);
+
+ALTER TABLE ONLY public.iga_projection_job
+    ADD CONSTRAINT iga_projection_job_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_job
+    ADD CONSTRAINT iga_projection_job_run_fkey FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_job
+    ADD CONSTRAINT iga_projection_job_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_run_fkey FOREIGN KEY (workspace_id, last_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_scope_fkey FOREIGN KEY (workspace_id, estate_scope_id) REFERENCES public.iga_estate_scopes(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_projection_state
+    ADD CONSTRAINT iga_projection_state_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_publication
+    ADD CONSTRAINT iga_publication_run_fkey FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.iga_publication
+    ADD CONSTRAINT iga_publication_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+COMMENT ON COLUMN public.iga_projection_state.partition_key IS 'The SAME value stamped on iga_relationship.partition_key and iga_access_edges.partition_key, so "what this run reconciles" and "what this run recorded a watermark for" are the same set by construction.';
+
+COMMENT ON TABLE public.iga_projection_job IS 'A wedged projection BLOCKS SCANNING for its connector, by design -- cloud_scan_run.Claim gains a NOT EXISTS predicate on queued/running jobs. That is why attempts has a ceiling and failed/abandoned are terminal: a job must always reach a terminal state, or it becomes an outage. Alert on queued/running jobs older than one lease.';
+
+COMMENT ON TABLE public.iga_publication IS 'One row per committed projection. Written in the same transaction as the graph writes, so a replayed job can tell "I already committed" from "someone newer published over me" -- which a generation comparison alone cannot do.';
+
+-- ---- from 034_iga_external_principal.sql ----
+-- external principals, and cross-provider can_assume.
+-- 1 table, 2 constraints, 2 indexes, 4 fk constraints, 1 comment
+
+CREATE TABLE public.iga_external_principal (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    issuer text NOT NULL,
+    subject_claim text NOT NULL,
+    mechanism text NOT NULL,
+    source_key text NOT NULL,
+    resolved_identity_account_id uuid,
+    resolved_workload_id uuid,
+    resolution_basis text DEFAULT ''::text NOT NULL,
+    resolution_rule text DEFAULT ''::text NOT NULL,
+    resolved_by text DEFAULT ''::text NOT NULL,
+    resolution_state text DEFAULT 'active'::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_external_principal_asserted_chk CHECK (((resolution_basis <> 'asserted'::text) OR (resolved_by <> ''::text))),
+    CONSTRAINT iga_external_principal_basis_chk CHECK ((resolution_basis = ANY (ARRAY[''::text, 'derived'::text, 'asserted'::text]))),
+    CONSTRAINT iga_external_principal_derived_chk CHECK (((resolution_basis <> 'derived'::text) OR (resolution_rule <> ''::text))),
+    CONSTRAINT iga_external_principal_resolution_chk CHECK ((((((resolved_identity_account_id IS NOT NULL))::integer + ((resolved_workload_id IS NOT NULL))::integer) <= 1) AND (((resolved_identity_account_id IS NULL) AND (resolved_workload_id IS NULL)) = (resolution_basis = ''::text)))),
+    CONSTRAINT iga_external_principal_source_key_chk CHECK ((source_key <> ''::text)),
+    CONSTRAINT iga_external_principal_state_chk CHECK ((resolution_state = ANY (ARRAY['active'::text, 'suspended'::text, 'pending_reconfirmation'::text])))
+);
+
+ALTER TABLE ONLY public.iga_external_principal
+    ADD CONSTRAINT iga_external_principal_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_external_principal
+    ADD CONSTRAINT iga_external_principal_workspace_id_key UNIQUE (workspace_id, id);
+
+CREATE INDEX idx_iga_relationship_source_external ON public.iga_relationship USING btree (workspace_id, source_external_principal_id) WHERE (source_external_principal_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_external_principal_key ON public.iga_external_principal USING btree (workspace_id, source_key);
+
+ALTER TABLE ONLY public.iga_external_principal
+    ADD CONSTRAINT iga_ep_resolved_identity_fkey FOREIGN KEY (workspace_id, resolved_identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE SET NULL (resolved_identity_account_id);
+
+ALTER TABLE ONLY public.iga_external_principal
+    ADD CONSTRAINT iga_ep_resolved_workload_fkey FOREIGN KEY (workspace_id, resolved_workload_id) REFERENCES public.iga_workload(workspace_id, id) ON DELETE SET NULL (resolved_workload_id);
+
+ALTER TABLE ONLY public.iga_external_principal
+    ADD CONSTRAINT iga_external_principal_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_relationship
+    ADD CONSTRAINT iga_rel_src_external_fkey FOREIGN KEY (workspace_id, source_external_principal_id) REFERENCES public.iga_external_principal(workspace_id, id) ON DELETE CASCADE;
+
+COMMENT ON TABLE public.iga_external_principal IS 'The far end of a cross-provider trust, recorded by the side that declares it. Unresolved is a legitimate permanent state: we record what the trust policy said, never that the named principal exists.';
+
+-- ---- from 035_aws_collection_model.sql ----
+-- AWS collection model
+-- 3 tables, 9 constraints, 1 index, 9 fk constraints
+
+CREATE TABLE public.cloud_group_membership (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    user_identity_id uuid NOT NULL,
+    group_identity_id uuid NOT NULL,
+    last_seen_generation integer NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+CREATE TABLE public.cloud_policy (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    policy_kind text NOT NULL,
+    native_id text NOT NULL,
+    holder_identity_id uuid,
+    name text NOT NULL,
+    policy_id text DEFAULT ''::text NOT NULL,
+    aws_managed boolean DEFAULT false NOT NULL,
+    version_id text DEFAULT ''::text NOT NULL,
+    document jsonb,
+    document_hash text DEFAULT ''::text NOT NULL,
+    document_error text DEFAULT ''::text NOT NULL,
+    last_seen_generation integer NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cloud_policy_inline_chk CHECK (((policy_kind = 'inline'::text) = (holder_identity_id IS NOT NULL))),
+    CONSTRAINT cloud_policy_kind_chk CHECK ((policy_kind = ANY (ARRAY['managed'::text, 'inline'::text]))),
+    CONSTRAINT cloud_policy_readable_chk CHECK (((document IS NOT NULL) OR (document_error <> ''::text)))
+);
+
+CREATE TABLE public.cloud_policy_attachment (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    policy_row_id uuid NOT NULL,
+    principal_identity_id uuid NOT NULL,
+    attachment_kind text NOT NULL,
+    last_seen_generation integer NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cloud_pa_kind_chk CHECK ((attachment_kind = ANY (ARRAY['attached'::text, 'inline'::text, 'boundary'::text])))
+);
+
+ALTER TABLE ONLY public.cloud_group_membership
+    ADD CONSTRAINT cloud_gm_key UNIQUE (user_identity_id, group_identity_id);
+
+ALTER TABLE ONLY public.cloud_group_membership
+    ADD CONSTRAINT cloud_group_membership_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.cloud_identity
+    ADD CONSTRAINT cloud_identity_scope_key UNIQUE (workspace_id, connector_id, id);
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_key UNIQUE (connector_id, native_id);
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_scope_key UNIQUE (workspace_id, connector_id, id);
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.cloud_policy_attachment
+    ADD CONSTRAINT cloud_pa_key UNIQUE (policy_row_id, principal_identity_id, attachment_kind);
+
+ALTER TABLE ONLY public.cloud_policy_attachment
+    ADD CONSTRAINT cloud_policy_attachment_pkey PRIMARY KEY (id);
+
+CREATE UNIQUE INDEX uq_cloud_observation_dedupe_no_subject ON public.cloud_observation USING btree (workspace_id, source_api, content_hash) WHERE ((identity_id IS NULL) AND (permission_id IS NULL) AND (resource_id IS NULL) AND (workload_id IS NULL) AND (policy_id IS NULL));
+
+ALTER TABLE ONLY public.cloud_group_membership
+    ADD CONSTRAINT cloud_gm_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_group_membership
+    ADD CONSTRAINT cloud_gm_group_fkey FOREIGN KEY (workspace_id, connector_id, group_identity_id) REFERENCES public.cloud_identity(workspace_id, connector_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_group_membership
+    ADD CONSTRAINT cloud_gm_user_fkey FOREIGN KEY (workspace_id, connector_id, user_identity_id) REFERENCES public.cloud_identity(workspace_id, connector_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_observation
+    ADD CONSTRAINT cloud_observation_policy_fkey FOREIGN KEY (workspace_id, connector_id, policy_id) REFERENCES public.cloud_policy(workspace_id, connector_id, id) ON DELETE SET NULL (policy_id);
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_policy
+    ADD CONSTRAINT cloud_policy_holder_fkey FOREIGN KEY (workspace_id, connector_id, holder_identity_id) REFERENCES public.cloud_identity(workspace_id, connector_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_policy_attachment
+    ADD CONSTRAINT cloud_pa_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_policy_attachment
+    ADD CONSTRAINT cloud_pa_policy_fkey FOREIGN KEY (workspace_id, connector_id, policy_row_id) REFERENCES public.cloud_policy(workspace_id, connector_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.cloud_policy_attachment
+    ADD CONSTRAINT cloud_pa_principal_fkey FOREIGN KEY (workspace_id, connector_id, principal_identity_id) REFERENCES public.cloud_identity(workspace_id, connector_id, id) ON DELETE CASCADE;
+
+-- ---- from 036_iga_permission_model.sql ----
+-- the IGA permission model
+-- 6 tables, 10 constraints, 12 indexes, 21 fk constraints
+
+CREATE TABLE public.iga_assignment_evidence (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    assignment_id uuid NOT NULL,
+    observation_id uuid NOT NULL,
+    relation text DEFAULT 'supports'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_ae_relation_chk CHECK ((relation = ANY (ARRAY['supports'::text, 'contradicts'::text, 'supersedes'::text, 'previously_supported'::text])))
+);
+
+CREATE TABLE public.iga_entitlement_target (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    entitlement_id uuid NOT NULL,
+    resource_id uuid NOT NULL,
+    target_mode text NOT NULL,
+    ordinal integer NOT NULL,
+    CONSTRAINT iga_et_mode_chk CHECK ((target_mode = ANY (ARRAY['resource'::text, 'not_resource'::text])))
+);
+
+CREATE TABLE public.iga_lifecycle_event (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    rev bigint NOT NULL,
+    scan_run_id uuid NOT NULL,
+    occurred_at timestamp with time zone NOT NULL,
+    event text NOT NULL,
+    reason text DEFAULT ''::text NOT NULL,
+    identity_account_id uuid,
+    workload_id uuid,
+    resource_id uuid,
+    entitlement_id uuid,
+    policy_id uuid,
+    CONSTRAINT iga_le_event_chk CHECK ((event = ANY (ARRAY['first_seen'::text, 'retired'::text, 'restored'::text]))),
+    CONSTRAINT iga_le_one_chk CHECK ((((((((identity_account_id IS NOT NULL))::integer + ((workload_id IS NOT NULL))::integer) + ((resource_id IS NOT NULL))::integer) + ((entitlement_id IS NOT NULL))::integer) + ((policy_id IS NOT NULL))::integer) = 1)),
+    CONSTRAINT iga_le_reason_chk CHECK (((event = 'retired'::text) = (reason <> ''::text)))
+);
+
+CREATE TABLE public.iga_policy (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    provider text NOT NULL,
+    policy_kind text NOT NULL,
+    display_name text NOT NULL,
+    native_ref text DEFAULT ''::text NOT NULL,
+    source_key text NOT NULL,
+    continuity text NOT NULL,
+    immutable_key text DEFAULT ''::text NOT NULL,
+    version_id text DEFAULT ''::text NOT NULL,
+    document_hash text DEFAULT ''::text NOT NULL,
+    lifecycle text DEFAULT 'active'::text NOT NULL,
+    retired_reason text DEFAULT ''::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT iga_policy_continuity_chk CHECK ((continuity = ANY (ARRAY['immutable'::text, 'recognition_only'::text]))),
+    CONSTRAINT iga_policy_immutable_chk CHECK (((continuity <> 'immutable'::text) OR (immutable_key <> ''::text))),
+    CONSTRAINT iga_policy_kind_chk CHECK ((policy_kind = ANY (ARRAY['aws_managed'::text, 'customer_managed'::text, 'inline'::text, 'k8s_role'::text, 'k8s_cluster_role'::text]))),
+    CONSTRAINT iga_policy_lifecycle_chk CHECK ((lifecycle = ANY (ARRAY['active'::text, 'retired'::text]))),
+    CONSTRAINT iga_policy_retired_chk CHECK (((lifecycle = 'retired'::text) = (retired_reason <> ''::text)))
+);
+
+CREATE TABLE public.iga_policy_assignment (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    policy_id uuid NOT NULL,
+    holder_identity_account_id uuid NOT NULL,
+    assignment_kind text NOT NULL,
+    basis text DEFAULT 'declared'::text NOT NULL,
+    state text DEFAULT 'current'::text NOT NULL,
+    valid_from timestamp with time zone DEFAULT now() NOT NULL,
+    valid_to timestamp with time zone,
+    last_confirmed_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_confirmed_by uuid,
+    ended_reason text DEFAULT ''::text NOT NULL,
+    source_key text NOT NULL,
+    partition_key text NOT NULL,
+    connector_id uuid,
+    discovery_source_id uuid,
+    last_confirmed_sweep_id uuid,
+    CONSTRAINT iga_pa_basis_chk CHECK ((basis = ANY (ARRAY['declared'::text, 'asserted'::text]))),
+    CONSTRAINT iga_pa_confirm_provider_chk CHECK (((assignment_kind <> ALL (ARRAY['k8s_role_binding'::text, 'k8s_cluster_role_binding'::text])) OR (last_confirmed_by IS NULL))),
+    CONSTRAINT iga_pa_ended_chk CHECK (((state = 'ended'::text) = (valid_to IS NOT NULL))),
+    CONSTRAINT iga_pa_ended_reason_chk CHECK (((state = 'ended'::text) = (ended_reason <> ''::text))),
+    CONSTRAINT iga_pa_kind_chk CHECK ((assignment_kind = ANY (ARRAY['attached'::text, 'inline'::text, 'boundary'::text, 'k8s_role_binding'::text, 'k8s_cluster_role_binding'::text]))),
+    CONSTRAINT iga_pa_source_key_chk CHECK ((source_key <> ''::text)),
+    CONSTRAINT iga_pa_state_chk CHECK ((state = ANY (ARRAY['current'::text, 'stale'::text, 'ended'::text])))
+);
+
+CREATE TABLE public.iga_statement_revision (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    entitlement_id uuid NOT NULL,
+    content_hash text NOT NULL,
+    statement jsonb NOT NULL,
+    policy_version_id text DEFAULT ''::text NOT NULL,
+    valid_from timestamp with time zone NOT NULL,
+    valid_to timestamp with time zone,
+    first_seen_run_id uuid NOT NULL
+);
+
+ALTER TABLE ONLY public.iga_assignment_evidence
+    ADD CONSTRAINT iga_ae_key UNIQUE (workspace_id, assignment_id, observation_id, relation);
+
+ALTER TABLE ONLY public.iga_assignment_evidence
+    ADD CONSTRAINT iga_assignment_evidence_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_entitlement_target
+    ADD CONSTRAINT iga_entitlement_target_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_entitlement_target
+    ADD CONSTRAINT iga_et_key UNIQUE (workspace_id, entitlement_id, resource_id, target_mode);
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_lifecycle_event_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_policy
+    ADD CONSTRAINT iga_policy_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_policy
+    ADD CONSTRAINT iga_policy_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_policy_assignment_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_statement_revision
+    ADD CONSTRAINT iga_statement_revision_pkey PRIMARY KEY (id);
+
+CREATE INDEX idx_iga_access_edges_entitlement ON public.iga_access_edges USING btree (workspace_id, entitlement_id) WHERE (state <> 'ended'::text);
+
+CREATE INDEX idx_iga_entitlements_policy ON public.iga_entitlements USING btree (workspace_id, policy_id) WHERE (policy_id IS NOT NULL);
+
+CREATE INDEX idx_iga_et_resource ON public.iga_entitlement_target USING btree (workspace_id, resource_id);
+
+CREATE INDEX idx_iga_le_identity ON public.iga_lifecycle_event USING btree (workspace_id, identity_account_id, occurred_at DESC) WHERE (identity_account_id IS NOT NULL);
+
+CREATE INDEX idx_iga_le_policy ON public.iga_lifecycle_event USING btree (workspace_id, policy_id, occurred_at DESC) WHERE (policy_id IS NOT NULL);
+
+CREATE INDEX idx_iga_le_resource ON public.iga_lifecycle_event USING btree (workspace_id, resource_id, occurred_at DESC) WHERE (resource_id IS NOT NULL);
+
+CREATE INDEX idx_iga_le_workload ON public.iga_lifecycle_event USING btree (workspace_id, workload_id, occurred_at DESC) WHERE (workload_id IS NOT NULL);
+
+CREATE INDEX idx_iga_pa_holder ON public.iga_policy_assignment USING btree (workspace_id, holder_identity_account_id, state);
+
+CREATE INDEX idx_iga_pa_partition ON public.iga_policy_assignment USING btree (workspace_id, connector_id, partition_key) WHERE (state <> 'ended'::text);
+
+CREATE UNIQUE INDEX uq_iga_policy_assignment_live ON public.iga_policy_assignment USING btree (workspace_id, source_key) WHERE (state <> 'ended'::text);
+
+CREATE UNIQUE INDEX uq_iga_policy_source_key ON public.iga_policy USING btree (workspace_id, source_key) WHERE (lifecycle <> 'retired'::text);
+
+CREATE UNIQUE INDEX uq_iga_statement_revision_live ON public.iga_statement_revision USING btree (workspace_id, entitlement_id) WHERE (valid_to IS NULL);
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_assignment_fkey FOREIGN KEY (workspace_id, assignment_id) REFERENCES public.iga_policy_assignment(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_assignment_evidence
+    ADD CONSTRAINT iga_ae_assignment_fkey FOREIGN KEY (workspace_id, assignment_id) REFERENCES public.iga_policy_assignment(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_assignment_evidence
+    ADD CONSTRAINT iga_ae_obs_fkey FOREIGN KEY (workspace_id, observation_id) REFERENCES public.cloud_observation(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.iga_entitlement_target
+    ADD CONSTRAINT iga_et_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id) REFERENCES public.iga_entitlements(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_entitlement_target
+    ADD CONSTRAINT iga_et_resource_fkey FOREIGN KEY (workspace_id, resource_id) REFERENCES public.iga_resources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_entitlements
+    ADD CONSTRAINT iga_entitlements_policy_fkey FOREIGN KEY (workspace_id, policy_id) REFERENCES public.iga_policy(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id) REFERENCES public.iga_entitlements(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_identity_fkey FOREIGN KEY (workspace_id, identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_policy_fkey FOREIGN KEY (workspace_id, policy_id) REFERENCES public.iga_policy(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_publication_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_publication(workspace_id, rev) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_resource_fkey FOREIGN KEY (workspace_id, resource_id) REFERENCES public.iga_resources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_run_fkey FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.iga_lifecycle_event
+    ADD CONSTRAINT iga_le_workload_fkey FOREIGN KEY (workspace_id, workload_id) REFERENCES public.iga_workload(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_policy_fkey FOREIGN KEY (workspace_id, policy_id) REFERENCES public.iga_policy(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_policy
+    ADD CONSTRAINT iga_policy_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_connector_fkey FOREIGN KEY (workspace_id, connector_id) REFERENCES public.cloud_connector(workspace_id, id) ON DELETE SET NULL (connector_id);
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_holder_fkey FOREIGN KEY (workspace_id, holder_identity_account_id) REFERENCES public.iga_identity_accounts(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_policy_fkey FOREIGN KEY (workspace_id, policy_id) REFERENCES public.iga_policy(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_run_fkey FOREIGN KEY (workspace_id, last_confirmed_by) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE SET NULL (last_confirmed_by);
+
+ALTER TABLE ONLY public.iga_statement_revision
+    ADD CONSTRAINT iga_sr_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id) REFERENCES public.iga_entitlements(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_statement_revision
+    ADD CONSTRAINT iga_sr_run_fkey FOREIGN KEY (workspace_id, first_seen_run_id) REFERENCES public.cloud_scan_run(workspace_id, id) ON DELETE RESTRICT;
+
+-- ---- from 039_cloud_connector_error_code.sql ----
+-- a stable classification alongside cloud_connector.last_error
+-- 1 comment
+
+COMMENT ON COLUMN public.cloud_connector.last_error_code IS 'Stable class of the failure in last_error (e.g. assume_denied, throttled). Empty when the error was not classified. The prose stays in last_error.';
+
+-- ---- from 041_k8s_graph_support.sql ----
+-- Kubernetes joins the evidence and reconciliation pipeline.
+-- 1 table, 4 constraints, 6 indexes, 8 fk constraints
+
+CREATE TABLE public.iga_k8s_sweep (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    discovery_source_id uuid NOT NULL,
+    cluster text NOT NULL,
+    generation bigint NOT NULL,
+    scan_kind text DEFAULT 'rbac'::text NOT NULL,
+    complete boolean DEFAULT false NOT NULL,
+    cluster_scoped boolean DEFAULT false NOT NULL,
+    namespaces text[] DEFAULT '{}'::text[] NOT NULL,
+    sweep_started_at timestamp with time zone NOT NULL,
+    observed_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    status text DEFAULT 'received'::text NOT NULL,
+    projected_at timestamp with time zone,
+    error text DEFAULT ''::text NOT NULL,
+    cluster_uid text DEFAULT ''::text NOT NULL,
+    oidc_issuer text DEFAULT ''::text NOT NULL,
+    CONSTRAINT iga_k8s_sweep_cluster_chk CHECK ((cluster <> ''::text)),
+    CONSTRAINT iga_k8s_sweep_error_chk CHECK (((status = 'failed'::text) = (error <> ''::text))),
+    CONSTRAINT iga_k8s_sweep_projected_chk CHECK (((status = 'projected'::text) = (projected_at IS NOT NULL))),
+    CONSTRAINT iga_k8s_sweep_status_chk CHECK ((status = ANY (ARRAY['received'::text, 'projected'::text, 'failed'::text])))
+);
+
+ALTER TABLE ONLY public.discovery_sources
+    ADD CONSTRAINT discovery_sources_workspace_id_key UNIQUE (workspace_id, id);
+
+ALTER TABLE ONLY public.iga_k8s_sweep
+    ADD CONSTRAINT iga_k8s_sweep_generation_key UNIQUE (workspace_id, discovery_source_id, cluster, generation);
+
+ALTER TABLE ONLY public.iga_k8s_sweep
+    ADD CONSTRAINT iga_k8s_sweep_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.iga_k8s_sweep
+    ADD CONSTRAINT iga_k8s_sweep_workspace_id_key UNIQUE (workspace_id, id);
+
+CREATE INDEX idx_iga_k8s_sweep_latest ON public.iga_k8s_sweep USING btree (workspace_id, discovery_source_id, cluster, generation DESC);
+
+CREATE UNIQUE INDEX uq_iga_os_entitlement ON public.iga_object_support USING btree (workspace_id, entitlement_id, source_ref, partition_key) WHERE (entitlement_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_os_identity ON public.iga_object_support USING btree (workspace_id, identity_account_id, source_ref, partition_key) WHERE (identity_account_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_os_policy ON public.iga_object_support USING btree (workspace_id, policy_id, source_ref, partition_key) WHERE (policy_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_os_resource ON public.iga_object_support USING btree (workspace_id, resource_id, source_ref, partition_key) WHERE (resource_id IS NOT NULL);
+
+CREATE UNIQUE INDEX uq_iga_os_workload ON public.iga_object_support USING btree (workspace_id, workload_id, source_ref, partition_key) WHERE (workload_id IS NOT NULL);
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_discovery_source_fkey FOREIGN KEY (workspace_id, discovery_source_id) REFERENCES public.discovery_sources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_sweep_fkey FOREIGN KEY (workspace_id, last_confirmed_sweep_id) REFERENCES public.iga_k8s_sweep(workspace_id, id) ON DELETE SET NULL (last_confirmed_sweep_id);
+
+ALTER TABLE ONLY public.iga_k8s_sweep
+    ADD CONSTRAINT iga_k8s_sweep_source_fkey FOREIGN KEY (workspace_id, discovery_source_id) REFERENCES public.discovery_sources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_k8s_sweep
+    ADD CONSTRAINT iga_k8s_sweep_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_discovery_source_fkey FOREIGN KEY (workspace_id, discovery_source_id) REFERENCES public.discovery_sources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_sweep_fkey FOREIGN KEY (workspace_id, last_confirmed_sweep_id) REFERENCES public.iga_k8s_sweep(workspace_id, id) ON DELETE SET NULL (last_confirmed_sweep_id);
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_discovery_source_fkey FOREIGN KEY (workspace_id, discovery_source_id) REFERENCES public.discovery_sources(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_policy_assignment
+    ADD CONSTRAINT iga_pa_sweep_fkey FOREIGN KEY (workspace_id, last_confirmed_sweep_id) REFERENCES public.iga_k8s_sweep(workspace_id, id) ON DELETE SET NULL (last_confirmed_sweep_id);
+
+-- ---- from 042_unified_inventory.sql ----
+-- GitHub joins the shared graph's provenance, and the inventory reads every
+-- provider.
+-- 2 indexes, 4 fk constraints
+
+CREATE INDEX idx_iga_object_support_integration ON public.iga_object_support USING btree (workspace_id, integration_id, partition_key) WHERE ((state <> 'ended'::text) AND (integration_id IS NOT NULL));
+
+CREATE INDEX idx_iga_workload_provider ON public.iga_workload USING btree (workspace_id, provider, lifecycle);
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_integration_fkey FOREIGN KEY (workspace_id, integration_id) REFERENCES public.iga_integrations(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_access_edges
+    ADD CONSTRAINT iga_access_edges_scan_run_fkey FOREIGN KEY (workspace_id, last_confirmed_scan_run_id) REFERENCES public.iga_scan_runs(workspace_id, id) ON DELETE SET NULL (last_confirmed_scan_run_id);
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_integration_fkey FOREIGN KEY (workspace_id, integration_id) REFERENCES public.iga_integrations(workspace_id, id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_object_support
+    ADD CONSTRAINT iga_os_scan_run_fkey FOREIGN KEY (workspace_id, last_confirmed_scan_run_id) REFERENCES public.iga_scan_runs(workspace_id, id) ON DELETE SET NULL (last_confirmed_scan_run_id);
+
+-- ---- from 043_discovery_ingest_auth.sql ----
+-- authenticate the discovery ingress, and record which cluster (and which
+-- OIDC issuer) a Kubernetes sweep came from.
+-- 1 table, 3 constraints, 1 index, 1 fk constraint
+
+CREATE TABLE public.discovery_ingest_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    discovery_source_id uuid,
+    token_hash text NOT NULL,
+    token_prefix text DEFAULT ''::text NOT NULL,
+    label text DEFAULT ''::text NOT NULL,
+    created_by text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    source_bound boolean DEFAULT false NOT NULL,
+    CONSTRAINT discovery_ingest_tokens_bound_chk CHECK (((NOT source_bound) OR (discovery_source_id IS NOT NULL) OR (revoked_at IS NOT NULL))),
+    CONSTRAINT discovery_ingest_tokens_hash_chk CHECK ((token_hash ~ '^[0-9a-f]{64}$'::text))
+);
+
+ALTER TABLE ONLY public.discovery_ingest_tokens
+    ADD CONSTRAINT discovery_ingest_tokens_hash_key UNIQUE (token_hash);
+
+ALTER TABLE ONLY public.discovery_ingest_tokens
+    ADD CONSTRAINT discovery_ingest_tokens_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.discovery_ingest_tokens
+    ADD CONSTRAINT discovery_ingest_tokens_workspace_id_key UNIQUE (workspace_id, id);
+
+CREATE INDEX idx_discovery_ingest_tokens_workspace ON public.discovery_ingest_tokens USING btree (workspace_id) WHERE (revoked_at IS NULL);
+
+ALTER TABLE ONLY public.discovery_ingest_tokens
+    ADD CONSTRAINT discovery_ingest_tokens_workspace_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- ---- from 044_ingest_token_lifecycle.sql ----
+-- ingest tokens outlive their source, and can expire.
+-- 1 fk constraint
+
+ALTER TABLE ONLY public.discovery_ingest_tokens
+    ADD CONSTRAINT discovery_ingest_tokens_source_fkey FOREIGN KEY (workspace_id, discovery_source_id) REFERENCES public.discovery_sources(workspace_id, id) ON DELETE SET NULL (discovery_source_id);
+
+-- ---- from 045_k8s_sweep_reference_indexes.sql ----
+-- index the references to a Kubernetes sweep, so pruning sweep history does
+-- not scan the workspace.
+-- 3 indexes
+
+CREATE INDEX idx_iga_ae_last_sweep ON public.iga_access_edges USING btree (workspace_id, last_confirmed_sweep_id) WHERE (last_confirmed_sweep_id IS NOT NULL);
+
+CREATE INDEX idx_iga_os_last_sweep ON public.iga_object_support USING btree (workspace_id, last_confirmed_sweep_id) WHERE (last_confirmed_sweep_id IS NOT NULL);
+
+CREATE INDEX idx_iga_pa_last_sweep ON public.iga_policy_assignment USING btree (workspace_id, last_confirmed_sweep_id) WHERE (last_confirmed_sweep_id IS NOT NULL);
+
+-- ---- from 046_ingest_token_triggers.sql ----
+-- the database itself keeps a source-bound ingest token bound, and revokes it
+-- when its source is deleted.
+-- 2 functions, 2 triggers
+
+CREATE FUNCTION public.discovery_ingest_tokens_mark_bound() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.discovery_source_id IS NOT NULL THEN
+        NEW.source_bound := true;
+    ELSIF TG_OP = 'UPDATE' AND OLD.source_bound THEN
+        NEW.source_bound := true;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION public.discovery_sources_revoke_ingest_tokens() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    UPDATE public.discovery_ingest_tokens
+       SET revoked_at   = COALESCE(revoked_at, now()),
+           source_bound = true
+     WHERE workspace_id = OLD.workspace_id
+       AND discovery_source_id = OLD.id
+       AND (revoked_at IS NULL OR NOT source_bound);
+    RETURN OLD;
+END
+$$;
+
+CREATE TRIGGER discovery_ingest_tokens_mark_bound BEFORE INSERT OR UPDATE ON public.discovery_ingest_tokens FOR EACH ROW EXECUTE FUNCTION public.discovery_ingest_tokens_mark_bound();
+
+CREATE TRIGGER discovery_sources_revoke_ingest_tokens BEFORE DELETE ON public.discovery_sources FOR EACH ROW EXECUTE FUNCTION public.discovery_sources_revoke_ingest_tokens();
