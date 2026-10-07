@@ -44,16 +44,28 @@ count=$(git ls-files '*.go' \
   | grep -vE "$rls_only_re" \
   | grep -vE "$quarantined_re" \
   | xargs awk '
-      FNR == 1 { h1 = h2 = h3 = "" }
+      BEGIN {
+        # A statement handed straight to the scoped layer binds workspace_id
+        # to $1 from the tenant context, checked at run time, and is not
+        # counted: the statement on the call line or continuing its argument
+        # list, including a multi-line SQL string up to its closing backtick.
+        scoped = "(tenancy\\.(Exec|Query|QueryRow|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
+      }
+      FNR == 1 { h1 = h2 = h3 = ""; inscoped = 0 }
       {
         line = $0
-        # A statement handed straight to the scoped layer (the call on the
-        # same line or one of the two above) binds workspace_id to $1 from
-        # the tenant context, checked at run time, and is not counted.
-        scoped = "(tenancy\\.(Exec|Query|QueryRow|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
-        if (line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
+        tmp = line
+        ticks = gsub(/`/, "", tmp)
+        # The call is this line, or an earlier line whose argument list
+        # visibly continues onto this one (it ends in "(" or ",").
+        call = line ~ scoped || (h1 ~ scoped && h1 ~ /[(,][[:space:]]*$/) \
+            || (h2 ~ scoped && h2 ~ /[(,][[:space:]]*$/ && h1 ~ /,[[:space:]]*$/)
+        was = inscoped
+        if (!was && ticks % 2 == 1 && call) inscoped = 1
+        skip = was || inscoped || call
+        if (was && ticks % 2 == 1) inscoped = 0
+        if (!skip && line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
-            && line !~ scoped && h1 !~ scoped && h2 !~ scoped \
             && line !~ /^[[:space:]]*\/\//) n++
         h3 = h2; h2 = h1; h1 = line
       }
