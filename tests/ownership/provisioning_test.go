@@ -50,7 +50,9 @@ func newProvFixture(t *testing.T) provFixture {
 	              VALUES ($1,'agent-client-1','hydra-1','research-agent',$2)`, client, wsA)
 	exec(t, raw, `INSERT INTO resource_servers (id,workspace_id,name,resource_uri,public_base_url)
 	              VALUES ($1,$2,'payments','authsec://rs/payments','https://payments.example')`, rs, wsA)
-	exec(t, raw, `INSERT INTO roles (id,name,workspace_id) VALUES ($1,'agent-reader',$2)`, role, wsA)
+	// An application role: its name carries the "rs-<id>:" prefix, which a
+	// connection approval requires (AS-061).
+	exec(t, raw, `INSERT INTO roles (id,name,workspace_id) VALUES ($1,$2,$3)`, role, "rs-"+rs.String()+":agent-reader", wsA)
 
 	// A claimed sighting: status=registered with both an identity and an owner. The
 	// metadata carries the workload identity discovery reported.
