@@ -827,3 +827,48 @@ func TestHardeningPodTerminatedLeavesTheCronJob(t *testing.T) {
 		t.Errorf("CronJob workload = %q after pod_terminated, want active", got)
 	}
 }
+
+// /k8s/clusters counts are each cluster's own, not the workspace's: with two
+// clusters, every cluster row used to show the workspace totals.
+func TestHardeningClusterCountsArePerCluster(t *testing.T) {
+	db := ingestDB(t)
+	ws, srcA := seedWorkspace(t, db) // cluster k3s-master
+	srcB := seedSource(t, db, ws, "cluster-b")
+	mgr := hardeningMgr(db)
+	if _, err := mgr.Ingest(ws, snapshot(ws, srcA, true, true, true)); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if _, err := mgr.Ingest(ws, clusterSnapshot(ws, srcB, "cluster-b")); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+
+	clusters, err := k8sread.New(db, ws).Clusters()
+	if err != nil {
+		t.Fatalf("clusters: %v", err)
+	}
+	if len(clusters) != 2 {
+		t.Fatalf("got %d clusters, want 2", len(clusters))
+	}
+	totalGrants := count(t, db, `SELECT count(*) FROM iga_access_edges
+	    WHERE workspace_id = ? AND provider = 'k8s' AND state = 'current'`, ws)
+	for _, c := range clusters {
+		prefix := k8sgraph.ClusterPrefix(c.Cluster)
+		wantSA := count(t, db, `SELECT count(*) FROM iga_identity_accounts
+		    WHERE workspace_id = ? AND provider = 'k8s' AND lifecycle = 'active'
+		      AND account_kind = 'k8s_service_account' AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		wantRoles := count(t, db, `SELECT count(*) FROM iga_policy
+		    WHERE workspace_id = ? AND provider = 'k8s' AND lifecycle = 'active'
+		      AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		wantGrants := count(t, db, `SELECT count(*) FROM iga_access_edges
+		    WHERE workspace_id = ? AND provider = 'k8s' AND state = 'current'
+		      AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		if wantSA == 0 || wantRoles == 0 || wantGrants == 0 || wantGrants >= totalGrants {
+			t.Fatalf("%s fixture: %d SAs, %d roles, %d of %d grants; want each cluster to own some, not all",
+				c.Cluster, wantSA, wantRoles, wantGrants, totalGrants)
+		}
+		if c.ServiceAccounts != wantSA || c.Roles != wantRoles || c.Grants != wantGrants || c.Stale != 0 {
+			t.Errorf("%s counts = sa %d roles %d grants %d stale %d, want %d %d %d 0 (its own, not the workspace's)",
+				c.Cluster, c.ServiceAccounts, c.Roles, c.Grants, c.Stale, wantSA, wantRoles, wantGrants)
+		}
+	}
+}

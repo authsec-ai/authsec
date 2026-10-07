@@ -276,17 +276,25 @@ func (q *Query) countInto(c *Cluster) error {
 		}
 		return r.N, nil
 	}
+	// Every count is this cluster's, not the workspace's: a row belongs to a
+	// cluster by its key's "k8s␟<cluster>␟" prefix (k8sgraph.Key). Compared
+	// with left() rather than LIKE so a cluster name needs no escaping and
+	// "prod" never matches "prod2". Two clusters that share a name share
+	// keys, and so share these counts (D-112).
+	prefix := k8sgraph.ClusterPrefix(c.Cluster) // "k8s␟<cluster>␟"
 	var err error
 	if c.ServiceAccounts, err = one(`
 		SELECT count(*) AS n FROM iga_identity_accounts
 		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'
-		   AND account_kind = 'k8s_service_account'`, q.WS, models.ProviderK8s); err != nil {
+		   AND account_kind = 'k8s_service_account'
+		   AND left(source_key, length(?)) = ?`, q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Roles, err = one(`
 		SELECT count(*) AS n FROM iga_policy
-		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Bindings, err = one(`
@@ -297,14 +305,16 @@ func (q *Query) countInto(c *Cluster) error {
 	}
 	if c.Grants, err = one(`
 		SELECT count(*) AS n FROM iga_access_edges
-		 WHERE workspace_id = ? AND provider = ? AND state = 'current'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND state = 'current'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Stale, err = one(`
 		SELECT count(*) AS n FROM iga_access_edges
-		 WHERE workspace_id = ? AND provider = ? AND state = 'stale'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND state = 'stale'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	return nil
