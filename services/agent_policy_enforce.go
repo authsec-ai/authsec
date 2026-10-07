@@ -1,10 +1,12 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -56,7 +58,7 @@ func (m *agentPolicyManager) applyRoleCeiling(tx *gorm.DB, workspaceID uuid.UUID
 		return 0, "agent holds no role bindings", nil
 	}
 
-	ceiling, err := rolePermissionIDs(tx, ceilingRoleID)
+	ceiling, err := rolePermissionIDs(tx, workspaceID, ceilingRoleID)
 	if err != nil {
 		return 0, "", err
 	}
@@ -66,7 +68,7 @@ func (m *agentPolicyManager) applyRoleCeiling(tx *gorm.DB, workspaceID uuid.UUID
 		if b.RoleID == ceilingRoleID {
 			continue // already at the ceiling
 		}
-		current, perr := rolePermissionIDs(tx, b.RoleID)
+		current, perr := rolePermissionIDs(tx, workspaceID, b.RoleID)
 		if perr != nil {
 			return changed, "", perr
 		}
@@ -78,7 +80,8 @@ func (m *agentPolicyManager) applyRoleCeiling(tx *gorm.DB, workspaceID uuid.UUID
 				ceilingRoleID, len(extra), b.RoleName))
 			continue
 		}
-		if err := tx.Exec(`UPDATE role_bindings SET role_id = ?, updated_at = now() WHERE id = ?`,
+		if err := tenancy.GormExec(inWorkspace(context.Background(), workspaceID), tx,
+			`UPDATE role_bindings SET role_id = $2, updated_at = now() WHERE workspace_id = $1 AND id = $3`,
 			ceilingRoleID, b.ID).Error; err != nil {
 			return changed, "", fmt.Errorf("narrow binding %s: %w", b.ID, err)
 		}
@@ -87,10 +90,15 @@ func (m *agentPolicyManager) applyRoleCeiling(tx *gorm.DB, workspaceID uuid.UUID
 	return changed, strings.Join(refusals, "; "), nil
 }
 
-// rolePermissionIDs reads a role's permission set from the live chain.
-func rolePermissionIDs(tx *gorm.DB, roleID uuid.UUID) (map[uuid.UUID]bool, error) {
+// rolePermissionIDs reads a role's permission set from the live chain. Only a
+// role of the workspace, or a platform role, is read: a policy naming another
+// workspace's role has no permissions here and so can never pass the subset check.
+func rolePermissionIDs(tx *gorm.DB, workspaceID, roleID uuid.UUID) (map[uuid.UUID]bool, error) {
 	var ids []uuid.UUID
-	if err := tx.Raw(`SELECT permission_id FROM role_permissions WHERE role_id = ?`,
+	if err := tenancy.GormRaw(inWorkspace(context.Background(), workspaceID), tx, `
+		SELECT rp.permission_id FROM role_permissions rp
+		  JOIN roles r ON r.id = rp.role_id
+		 WHERE (r.workspace_id = $1 OR r.workspace_id IS NULL) AND r.id = $2`,
 		roleID).Scan(&ids).Error; err != nil {
 		return nil, fmt.Errorf("read permissions for role %s: %w", roleID, err)
 	}

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -489,13 +490,13 @@ func (s *OAuthASService) UpsertAccessRequest(
 	// pending row (partial-unique index on status='pending'), refreshing the
 	// structured payload too.
 	var reqID uuid.UUID
-	err := config.DB.WithContext(ctx).Raw(`
+	err := tenancy.GormRaw(inWorkspace(ctx, workspaceID), config.DB, `
 		INSERT INTO access_requests
 			(id, workspace_id, resource_server_id, subject_type, subject_id,
 			 requested_by_client, requested_scopes, requested_rar_id, authorization_details,
 			 status, created_at, updated_at, expires_at)
 		VALUES
-			(gen_random_uuid(), ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+			(gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
 		ON CONFLICT (workspace_id, resource_server_id, subject_type, subject_id, requested_by_client)
 			WHERE status = 'pending'
 		DO UPDATE SET updated_at = EXCLUDED.updated_at,
@@ -503,8 +504,9 @@ func (s *OAuthASService) UpsertAccessRequest(
 		              requested_rar_id = EXCLUDED.requested_rar_id,
 		              authorization_details = EXCLUDED.authorization_details,
 		              expires_at = EXCLUDED.expires_at
+		 WHERE access_requests.workspace_id = $1
 		RETURNING id`,
-		workspaceID, rsID, subjectType, subjectID,
+		rsID, subjectType, subjectID,
 		requestedByClient, requestedScopes, rarID, authDetails,
 		now, now, expires,
 	).Scan(&reqID).Error
@@ -578,7 +580,8 @@ func (s *OAuthASService) NotifyAdminsOfPendingAccessRequest(
 	go func() {
 		// Load RS name for the email body.
 		var rsName string
-		s.db.Raw("SELECT name FROM resource_servers WHERE workspace_id = ? AND id = ?", workspaceID, rsID).Scan(&rsName)
+		tenancy.GormRaw(inWorkspace(context.Background(), workspaceID), s.db,
+			"SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2", rsID).Scan(&rsName)
 		if rsName == "" {
 			rsName = rsID.String()
 		}
@@ -758,9 +761,9 @@ func (s *OAuthASService) ApproveClientRegistrationInTx(tx *gorm.DB, rsID, client
 		if err := tx.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found: %w", err)
 		}
-		if err := tx.Raw(
-			`SELECT name FROM roles WHERE id = ? AND workspace_id = ? LIMIT 1`,
-			binding.RoleID, rs.WorkspaceID,
+		if err := tenancy.GormRaw(inWorkspace(context.Background(), rs.WorkspaceID), tx,
+			`SELECT name FROM roles WHERE workspace_id = $1 AND id = $2 LIMIT 1`,
+			binding.RoleID,
 		).Scan(&roleName).Error; err != nil || roleName == "" {
 			return fmt.Errorf("role %s not found in this workspace", binding.RoleID)
 		}
@@ -1710,11 +1713,15 @@ func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string,
 	// so an XAA agent whose actor must hold broker scopes needs an SA to bind to.
 	// Best-effort — a failure here doesn't fail agent registration (the SA can be
 	// linked later); idempotent via the uq_sa_client index on oauth_client_id.
-	if err := s.db.Exec(`
+	sqlDB, err := s.db.DB()
+	if err == nil {
+		_, err = tenancy.InsertContext(inWorkspace(context.Background(), workspaceID), sqlDB, `
 		INSERT INTO service_accounts (id, workspace_id, name, description, status, oauth_client_id, created_at, updated_at)
-		VALUES (gen_random_uuid(), ?, ?, 'Service account backing agent client', 'active', ?, now(), now())
+		VALUES (gen_random_uuid(), $1, $2, 'Service account backing agent client', 'active', $3, now(), now())
 		ON CONFLICT (oauth_client_id) WHERE oauth_client_id IS NOT NULL DO NOTHING`,
-		workspaceID, name, mcpClient.ID).Error; err != nil {
+			name, mcpClient.ID)
+	}
+	if err != nil {
 		log.Printf("[RegisterAgentClient] failed to create backing service account for client %s: %v", clientIDStr, err)
 	}
 

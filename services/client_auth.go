@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/authsec-ai/authsec/internal/safehttp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"io"
 	"log"
 	"math/big"
@@ -406,9 +407,9 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		)
 	}
 	// Best-effort: stamp last_seen_at so the inventory can age out stale workloads.
-	db.WithContext(ctx).Exec(
-		`UPDATE service_accounts SET last_seen_at = ? WHERE workspace_id = ? AND id = ?`,
-		now, sa.WorkspaceID, sa.ID,
+	tenancy.GormExec(inWorkspace(ctx, sa.WorkspaceID), db,
+		`UPDATE service_accounts SET last_seen_at = $2 WHERE workspace_id = $1 AND id = $3`,
+		now, sa.ID,
 	)
 
 	return &client, nil

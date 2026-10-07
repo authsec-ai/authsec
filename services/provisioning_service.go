@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -253,7 +255,7 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		result.RoleBindingID = binding.ID
 
 		// --- 6. provenance -------------------------------------------------
-		rsName, _ := m.resourceServerName(tx, in.ResourceServerID)
+		rsName, _ := m.resourceServerName(tx, workspaceID, in.ResourceServerID)
 		// Read straight from the sighting rather than via sa.SpiffeID. The observed
 		// Kubernetes identity is no longer copied onto the anchor (spiffe_id is
 		// unique per workload; a ServiceAccount is shared), but the provenance record
@@ -429,9 +431,10 @@ func (m *provisioningManager) ensureRegistration(tx *gorm.DB, workspaceID, rsID,
 	return reg.ID, nil
 }
 
-func (m *provisioningManager) resourceServerName(tx *gorm.DB, rsID uuid.UUID) (string, error) {
+func (m *provisioningManager) resourceServerName(tx *gorm.DB, workspaceID, rsID uuid.UUID) (string, error) {
 	var name string
-	err := tx.Raw(`SELECT name FROM resource_servers WHERE id = ?`, rsID).Scan(&name).Error
+	err := tenancy.GormRaw(inWorkspace(context.Background(), workspaceID), tx,
+		`SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2`, rsID).Scan(&name).Error
 	if name == "" {
 		name = rsID.String()
 	}
@@ -850,7 +853,7 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 			return nil
 		}
 
-		rsName, _ := m.resourceServerName(tx, in.ResourceServerID)
+		rsName, _ := m.resourceServerName(tx, workspaceID, in.ResourceServerID)
 		prov, perr := m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
 			EntitlementType: models.EntitlementRoleBinding,
 			RoleBindingID:   &rb.ID,

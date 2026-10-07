@@ -471,7 +471,7 @@ func (m *agentPolicyManager) Effective(workspaceID, agentID uuid.UUID) (*Effecti
 	// are incomparable are NOT silently resolved: picking one would decide somebody's
 	// access by evaluation order.
 	if len(roleCeilings) > 0 {
-		winner, amb, err := m.narrowestRole(roleCeilings)
+		winner, amb, err := m.narrowestRole(workspaceID, roleCeilings)
 		if err != nil {
 			return nil, err
 		}
@@ -1050,13 +1050,13 @@ func gitOpsManaged(metadata json.RawMessage) bool {
 // incomparable — a 3-permission role granting deletes is not narrower than a
 // 5-permission read-only one — and resolving that by count would quietly pick the
 // more dangerous role about as often as not.
-func (m *agentPolicyManager) narrowestRole(ids []uuid.UUID) (uuid.UUID, string, error) {
+func (m *agentPolicyManager) narrowestRole(workspaceID uuid.UUID, ids []uuid.UUID) (uuid.UUID, string, error) {
 	perms := map[uuid.UUID]map[uuid.UUID]bool{}
 	for _, id := range ids {
 		if _, seen := perms[id]; seen {
 			continue
 		}
-		p, err := rolePermissionIDs(m.db, id)
+		p, err := rolePermissionIDs(m.db, workspaceID, id)
 		if err != nil {
 			return uuid.Nil, "", err
 		}

@@ -252,6 +252,7 @@ func (m *actuationManager) Lease(sourceID uuid.UUID, leasedBy string, max int,
 	// instruction. SKIP LOCKED rather than a plain UPDATE ... LIMIT: without it,
 	// concurrent pollers serialise behind each other's row locks and one blocks on work
 	// it will not get.
+	// TENANT-EXEMPT: leased by the authenticated collector's discovery source (unique id); only that source's rows
 	err := m.db.Raw(`
 		UPDATE provisioning_instructions
 		   SET status = 'leased', lease_expires_at = ?, leased_by = ?,
