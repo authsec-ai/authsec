@@ -297,6 +297,13 @@ func opEffects(op Op) []string {
 	return nil
 }
 
+// OpObservable reports whether a live read can see op's effect (it moves a
+// fact). TagPolicy and DeletePolicyVersion cannot be seen: Classify's NextOp
+// stays before them after they ran, so an executor resuming inside one run
+// uses this to tell "an invisible op already done" from "the state went
+// backwards" (T3.10, awsenforce executor).
+func OpObservable(op Op) bool { return len(opEffects(op)) > 0 }
+
 // prefixStates returns, for k = 0..len(ops), the set of fact keys at their
 // after value once ops[0..k) ran.
 func prefixStates(ops []Op) []map[string]bool {

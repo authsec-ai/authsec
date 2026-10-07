@@ -732,6 +732,47 @@ func (s *EnforcementBindingService) RequireVerified(ws, connectorID uuid.UUID) e
 	}
 }
 
+// AssumeForDeployment is §4.4 for one deployment run (T3.10): the connector's
+// binding must be verified (RequireVerified), the ExternalId is read from
+// Vault (the binding's AuthRef, cloud-enforcement path), and the enforcement
+// role is assumed with RoleSessionName authsec-enforce-<deployment id 16hex>
+// and DurationSeconds 900 (LiveAssumer), the session proven to be in the
+// binding's account. The returned client has SDK retries off. It is never
+// cached: every call assumes afresh, and neither the ExternalId nor the
+// credentials are logged or returned.
+func (s *EnforcementBindingService) AssumeForDeployment(ctx context.Context, ws, connectorID, deploymentID uuid.UUID) (awsenforce.IAM, error) {
+	if err := s.RequireVerified(ws, connectorID); err != nil {
+		return nil, err
+	}
+	c, err := s.awsConnector(ws, connectorID)
+	if err != nil {
+		return nil, err
+	}
+	b, err := s.liveBinding(s.db, ws, connectorID, false)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil || b.RoleARN == "" {
+		return nil, enfErr(http.StatusConflict, EnfCodeNotBound, "There is no bound enforcement role for this account.", nil)
+	}
+	ext, err := s.readExternalID(b)
+	if err != nil {
+		return nil, enfErr(http.StatusServiceUnavailable, EnfCodeUnavailable, "The enforcement ExternalId could not be read.", nil)
+	}
+	iam, id, err := s.assumer.AssumeEnforcement(ctx, awsenforce.AssumeInput{
+		RoleARN: b.RoleARN, ExternalID: ext, Region: s.stsRegion(c), SessionName: awsenforce.DeploymentSessionName(deploymentID),
+	})
+	if err != nil {
+		log.Printf("[aws-enf] binding %s deployment %s: assume failed: %s", b.ID, deploymentID, awsenforce.ErrorCode(err))
+		return nil, enfErr(http.StatusConflict, EnfCodeAssumeFailed, "The enforcement role could not be assumed.",
+			map[string]any{"error_code": awsenforce.ErrorCode(err)})
+	}
+	if id == nil || id.AccountID != b.AccountID {
+		return nil, enfErr(http.StatusConflict, EnfCodeAssumeFailed, "The enforcement session is not in the binding's account.", nil)
+	}
+	return iam, nil
+}
+
 /* ------------------------------ claim and bind ----------------------------- */
 
 // claimUnbound moves an unbound row to `verifying` for ONE worker. allowError
