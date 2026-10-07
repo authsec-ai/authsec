@@ -29,13 +29,27 @@ type IGAGovPolicyController struct {
 	db   func() *gorm.DB
 	// key signs list cursors: the graph controller's (IGA_CURSOR_SECRET).
 	key []byte
+	// live is the compiler's discovery-role live reader (T3.11).
+	live func() services.LiveReader
 }
 
 // Policy returns the policy controller over this graph controller's database
 // and policy gate, so the gate /capabilities reports is the gate the policy
 // routes enforce -- one source, never two that can disagree.
 func (ctl *IGAGraphReadController) Policy() *IGAGovPolicyController {
-	return &IGAGovPolicyController{gate: ctl.policyGateFn(), db: ctl.db, key: ctl.key}
+	live := func() services.LiveReader { return services.DefaultGovLiveReader() }
+	if ctl.govLive != nil {
+		r := ctl.govLive
+		live = func() services.LiveReader { return r }
+	}
+	return &IGAGovPolicyController{gate: ctl.policyGateFn(), db: ctl.db, key: ctl.key, live: live}
+}
+
+// WithGovLiveReader makes the policy routes compile with r instead of the
+// process-wide live reader. Tests use it.
+func (ctl *IGAGraphReadController) WithGovLiveReader(r services.LiveReader) *IGAGraphReadController {
+	ctl.govLive = r
+	return ctl
 }
 
 // WithPolicyGate makes this controller (and its Policy() controller) read the
@@ -89,6 +103,26 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
 	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
+
+	// §7.3 policies, versions and plans (T3.11, iga_gov_authoring_controller.go).
+	g.GET("/policies", require("governance", "read"), ctl.ListPolicies)
+	g.POST("/proposals", require("governance", "author"), ctl.CreateProposal)
+	g.GET("/policies/:id", require("governance", "read"), ctl.GetPolicy)
+	g.PATCH("/policies/:id", require("governance", "author"), ctl.PatchPolicy)
+	g.POST("/policies/:id/pause", require("governance", "enforce"), ctl.PausePolicy)
+	g.POST("/policies/:id/resume", require("governance", "enforce"), ctl.ResumePolicy)
+	g.POST("/policies/:id/archive", require("governance", "author"), ctl.ArchivePolicy)
+	g.GET("/policies/:id/versions", require("governance", "read"), ctl.ListVersions)
+	g.POST("/policies/:id/versions", require("governance", "author"), ctl.CreateVersion)
+	g.GET("/policies/:id/versions/:no", require("governance", "read"), ctl.GetVersion)
+	g.POST("/policies/:id/versions/:no/propose", require("governance", "author"), ctl.ProposeVersion)
+	g.GET("/policies/:id/versions/:no/plans", require("governance", "read"), ctl.VersionPlans)
+	g.POST("/policies/:id/versions/:no/withdraw", require("governance", "author"), ctl.WithdrawVersion)
+
+	// §7.5 approval (T3.13, iga_gov_approval_controller.go). Rollout is T3.15.
+	g.GET("/approvals", require("governance", "approve"), ctl.ListApprovals)
+	g.POST("/policies/:id/versions/:no/approve", require("governance", "approve"), ctl.ApproveVersion)
+	g.POST("/policies/:id/versions/:no/reject", require("governance", "approve"), ctl.RejectVersion)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
@@ -153,7 +187,8 @@ type policyFeature struct {
 var policyFeatures = []policyFeature{
 	// T3.06 / T3.06b: evaluation in the projection job and the §7.1 reads.
 	{"findings", true, ""},
-	{"proposals", false, "Policy proposals are not available in this build yet: policy authoring and proposal generation have not been released."},
+	// T3.11 / T3.13: proposals, versions, plans and approval (§7.3, §7.5).
+	{"proposals", true, ""},
 	{"export", false, "Policy export is not available in this build yet."},
 	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released."},
 	// T3.09 ships the enforcement role binding (§7.9, under

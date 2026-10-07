@@ -519,8 +519,15 @@ func (g *GovTargets) BuildEvidenceBundle(ctx context.Context, ws, identity uuid.
 	if err != nil {
 		return nil, err
 	}
+	return g.storeBundle(ctx, ws, identity, b, actorKind, actorID)
+}
+
+// storeBundle persists a built bundle insert-once (the 050 trigger
+// re-verifies the hash; an identical bundle is reused) with its
+// evidence_bundle_created event.
+func (g *GovTargets) storeBundle(ctx context.Context, ws, identity uuid.UUID, b igagov.Bundle, actorKind, actorID string) (*StoredBundle, error) {
 	sb := &StoredBundle{Hash: b.Hash, Trust: b.Trust, TrustReasons: b.TrustReasons, Facts: b.Facts, GapRefs: b.GapRefs}
-	err = g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var ids []uuid.UUID
 		if err := tx.Raw(`INSERT INTO iga_gov_evidence_bundle (workspace_id, provider, trust, bundle_hash, canonical, facts)
 		                   VALUES (?, 'aws', ?, ?, ?, ?::jsonb)
@@ -550,20 +557,41 @@ func (g *GovTargets) BuildEvidenceBundle(ctx context.Context, ws, identity uuid.
 // owners, the FROZEN activity evidence of that evaluation, and the route
 // analyses of the role connector's run (immutable observations, §3.9).
 func (g *GovTargets) build(ctx context.Context, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, error) {
+	b, src, _, err := g.buildBasis(ctx, ws, identity, removed)
+	return b, src, err
+}
+
+// bundleBasis is what a bundle build read beyond the bundle itself, for the
+// compiler (T3.11): the named run's evidence (its immutable resource-policy
+// observations and the account's enabled Regions), the role's consumers at
+// the evaluated revision (dependency contexts), and the role snapshot.
+type bundleBasis struct {
+	Rev       int64
+	Run       igagov.RunEvidence
+	HasRun    bool
+	Consumers []ConsumerView
+	Role      igagov.RoleSnapshot
+}
+
+// buildBasis is build, also returning the bundleBasis.
+func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+	fail := func(err error) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+		return igagov.Bundle{}, igagov.BundleSource{}, nil, err
+	}
 	db := g.db.WithContext(ctx)
 	lc, err := g.repo.LatestComplete(db, ws)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	if lc == nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, ErrNoCompleteEvaluation
+		return fail(ErrNoCompleteEvaluation)
 	}
 	gs, err := loadGovSnapshot(ctx, g.db, ws, lc.Rev, &identity)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	if len(gs.Snap.Roles) != 1 {
-		return igagov.Bundle{}, igagov.BundleSource{}, errRoleNotEvaluated
+		return fail(errRoleNotEvaluated)
 	}
 	role := gs.Snap.Roles[0]
 	at := gs.Snap.EvaluatedAt
@@ -577,11 +605,11 @@ func (g *GovTargets) build(ctx context.Context, ws, identity uuid.UUID, removed 
 	var evRows []models.IGAGovActivityEvidence
 	if err := db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, lc.Rev, identity).
 		Order("service").Find(&evRows).Error; err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	consumers, err := consumersAsOf(db, ws, identity, at)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	window := bundleWindow(gs, consumers)
 	var activity []igagov.BundleActivity
@@ -626,11 +654,11 @@ func (g *GovTargets) build(ctx context.Context, ws, identity uuid.UUID, removed 
 	}
 	unresolved, err := unresolvedConsumersOf(db, ws, role.ARN)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	owners, err := ownersOf(db, ws, identity, consumers)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
 	var ownerIDs []string
 	for _, o := range owners {
@@ -666,9 +694,9 @@ func (g *GovTargets) build(ctx context.Context, ws, identity uuid.UUID, removed 
 		Owners: ownerIDs, Activity: activity, RouteAnalyses: analyses,
 	}, g.rules)
 	if err != nil {
-		return igagov.Bundle{}, igagov.BundleSource{}, err
+		return fail(err)
 	}
-	return b, b.Facts.Sources[0], nil
+	return b, b.Facts.Sources[0], &bundleBasis{Rev: lc.Rev, Run: run, HasRun: hasRun && runID != "", Consumers: consumers, Role: role}, nil
 }
 
 // consumersAsOf is consumersOf at a past instant, by the relationships'
