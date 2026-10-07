@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -40,6 +41,30 @@ func adminLoginUser(c *gin.Context, repo *repositories.ClientRepository, email s
 		return nil, fmt.Errorf("no signed-in workspace")
 	}
 	return repo.GetClientByEmailAndTenant(&email, &ws, nil)
+}
+
+var errAmbiguousAdminEmail = errors.New("email exists in more than one workspace")
+
+// adminStatusUser finds the admin for the pre-login MFA status endpoints: by
+// (email, workspace) when the caller names the workspace; by email alone only
+// while that email exists in a single workspace (AS-078).
+func adminStatusUser(db *gorm.DB, email, workspaceID string) (*sharedmodels.User, error) {
+	repo := repositories.NewClientRepository(db)
+	if workspaceID != "" {
+		if _, err := uuid.Parse(workspaceID); err != nil {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return repo.GetClientByEmailAndTenant(&email, &workspaceID, nil)
+	}
+	var n int64
+	// TENANT-EXEMPT: pre-login, counts the workspaces that hold this email
+	if err := db.Table("users").Where("email = ?", email).Count(&n).Error; err != nil {
+		return nil, err
+	}
+	if n > 1 {
+		return nil, errAmbiguousAdminEmail
+	}
+	return repo.GetClientByEmail(email)
 }
 
 // AdminWebAuthnHandler handles WebAuthn operations for admin users
@@ -112,7 +137,8 @@ func (h *AdminWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context) (
 // GetMFAStatus returns the MFA status for admin users
 func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 	var req struct {
-		Email string `json:"email" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -126,9 +152,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminStatusUser(globalDB, req.Email, req.WorkspaceID)
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -151,7 +179,8 @@ func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 // GetMFAStatusForLogin returns MFA status for admin login flow
 func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	var req struct {
-		Email string `json:"email" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -165,9 +194,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminStatusUser(globalDB, req.Email, req.WorkspaceID)
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -211,7 +242,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		if hasWebAuthnMethod {
 			// Check if user has credentials that are valid for this custom domain
 			// Strategy: Check if credentials were created for this specific RP ID
-			hasValidCreds, err := clientRepo.HasCredentialsForRPID(user.ID.String(), customDomain)
+			hasValidCreds, err := repositories.NewClientRepository(globalDB).HasCredentialsForRPID(user.ID.String(), customDomain)
 			if err != nil {
 				log.Printf("GetMFAStatusForLogin: Error checking credentials for RP ID %s: %v", customDomain, err)
 			} else if hasValidCreds {
@@ -247,9 +278,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(email)
+	user, err := adminStatusUser(globalDB, email, c.Query("workspace_id"))
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -293,7 +326,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 		if hasWebAuthnMethod {
 			// Check if user has credentials that are valid for this custom domain
 			// Strategy: Check if credentials were created for this specific RP ID
-			hasValidCreds, err := clientRepo.HasCredentialsForRPID(user.ID.String(), customDomain)
+			hasValidCreds, err := repositories.NewClientRepository(globalDB).HasCredentialsForRPID(user.ID.String(), customDomain)
 			if err != nil {
 				log.Printf("GetMFAStatusForLoginGET: Error checking credentials for RP ID %s: %v", customDomain, err)
 			} else if hasValidCreds {

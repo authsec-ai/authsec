@@ -64,3 +64,38 @@ func Test_AdminWebAuthn_UsesSubjectWorkspace(t *testing.T) {
 			handle, wsA.AdminUserID, twin)
 	}
 }
+
+// AS-078: the pre-login MFA status answers for the named workspace, and
+// refuses to guess when the email exists in more than one.
+func Test_AdminMFAStatus_NeedsWorkspaceForSharedEmail(t *testing.T) {
+	env := testsupport.Get(t)
+	n := emailSafeNonce()
+	wsA, err := SeedWorkspaceWithAdmin(config.DB, n+"a")
+	if err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+	wsB, err := SeedWorkspaceWithAdmin(config.DB, n+"b")
+	if err != nil {
+		t.Fatalf("seed B: %v", err)
+	}
+	const path = "/authsec/webauthn/admin/mfa/loginStatus"
+	if w := env.Do("POST", path, map[string]string{"email": wsA.AdminEmail}, ""); w.Code != http.StatusOK {
+		t.Fatalf("unique email without workspace: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+
+	mustExec(t, `INSERT INTO users (id, client_id, workspace_id, email, workspace_domain, provider, active, mfa_enabled, created_at, updated_at)
+	             VALUES ($1, $1, $2, $3, $4, 'local', true, true, NOW(), NOW())`,
+		uuid.New(), wsB.WorkspaceID, wsA.AdminEmail, wsB.WorkspaceDomain)
+
+	if w := env.Do("POST", path, map[string]string{"email": wsA.AdminEmail}, ""); w.Code != http.StatusBadRequest {
+		t.Fatalf("shared email without workspace: got %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	w := env.Do("POST", path, map[string]string{"email": wsA.AdminEmail, "workspace_id": wsA.WorkspaceID.String()}, "")
+	assertStatus(t, w, http.StatusOK)
+	if strings.Contains(w.Body.String(), `"mfa_required":true`) {
+		t.Fatalf("A's status reported B's twin (MFA on): %s", w.Body.String())
+	}
+	if w := env.Do("GET", path+"?email="+wsA.AdminEmail+"&workspace_id="+wsA.WorkspaceID.String(), nil, ""); w.Code != http.StatusOK {
+		t.Fatalf("GET with workspace: got %d (%s)", w.Code, w.Body.String())
+	}
+}
