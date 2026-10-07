@@ -443,6 +443,13 @@ func LoadConfig() *Config {
 		log.Fatalf("CRITICAL: invalid XAA feature flags: %v. Cannot start.", err)
 	}
 
+	// The embedded SPIRE control plane provisions PKI and SVIDs anonymously,
+	// trusts X-SPIFFE-ID / X-Tenant-ID and keeps untenanted tables (AS-081).
+	// It must not run where real tenants are.
+	if err := AppConfig.ValidateEmbeddedSpire(); err != nil {
+		log.Fatalf("CRITICAL: %v. Cannot start.", err)
+	}
+
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)
 	requiredSecrets := map[string]string{
 		"DB_USER":        dbUser,
@@ -461,6 +468,19 @@ func LoadConfig() *Config {
 	}
 
 	return AppConfig
+}
+
+// ValidateEmbeddedSpire refuses ENABLE_EMBEDDED_SPIRE in production and
+// staging: the legacy control plane is not tenant-safe (AS-081).
+func (c *Config) ValidateEmbeddedSpire() error {
+	if c == nil || !c.EnableEmbeddedSpire {
+		return nil
+	}
+	switch strings.ToLower(c.Environment) {
+	case "production", "staging":
+		return fmt.Errorf("ENABLE_EMBEDDED_SPIRE is not allowed in %s: the embedded SPIRE control plane is not tenant-safe (AS-081)", c.Environment)
+	}
+	return nil
 }
 
 // ValidateXAAFlags checks the dependencies between the XAA feature flags:
