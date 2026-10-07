@@ -578,7 +578,7 @@ func (s *OAuthASService) NotifyAdminsOfPendingAccessRequest(
 	go func() {
 		// Load RS name for the email body.
 		var rsName string
-		s.db.Raw("SELECT name FROM resource_servers WHERE id = ?", rsID).Scan(&rsName)
+		s.db.Raw("SELECT name FROM resource_servers WHERE workspace_id = ? AND id = ?", workspaceID, rsID).Scan(&rsName)
 		if rsName == "" {
 			rsName = rsID.String()
 		}

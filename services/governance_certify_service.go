@@ -349,9 +349,9 @@ func (m *certifyManager) selectCandidates(workspaceID uuid.UUID, scope CampaignS
 		// An agent anchor is a service account paired to an oauth client.
 		q = q.Where(`subject_type = ? AND EXISTS (
 		               SELECT 1 FROM service_accounts sa
-		                WHERE sa.id = entitlement_provenance.subject_id
+		                WHERE sa.workspace_id = ? AND sa.id = entitlement_provenance.subject_id
 		                  AND sa.oauth_client_id IS NOT NULL)`,
-			models.ProvenanceSubjectServiceAccount)
+			models.ProvenanceSubjectServiceAccount, workspaceID)
 	}
 	if scope.DormantDays > 0 {
 		// No token issued for the subject within the window. The highest-signal filter
@@ -359,8 +359,8 @@ func (m *certifyManager) selectCandidates(workspaceID uuid.UUID, scope CampaignS
 		cutoff := time.Now().AddDate(0, 0, -scope.DormantDays)
 		q = q.Where(`NOT EXISTS (
 		               SELECT 1 FROM native_tokens nt
-		                WHERE nt.subject_id = entitlement_provenance.subject_id
-		                  AND nt.issued_at >= ?)`, cutoff)
+		                WHERE nt.workspace_id = ? AND nt.subject_id = entitlement_provenance.subject_id
+		                  AND nt.issued_at >= ?)`, workspaceID, cutoff)
 	}
 
 	var out []models.EntitlementProvenance
@@ -395,8 +395,8 @@ func (m *certifyManager) assembleEvidence(workspaceID uuid.UUID,
 		if err := m.db.Raw(`
 			SELECT count(*) AS count, max(issued_at) AS last
 			  FROM native_tokens
-			 WHERE subject_id = ? AND subject_type = ?`,
-			p.SubjectID, p.SubjectType).Scan(&usage).Error; err != nil {
+			 WHERE workspace_id = ? AND subject_id = ? AND subject_type = ?`,
+			workspaceID, p.SubjectID, p.SubjectType).Scan(&usage).Error; err != nil {
 			return nil, fmt.Errorf("token usage: %w", err)
 		}
 		ev.TokensIssued = usage.Count
@@ -415,8 +415,8 @@ func (m *certifyManager) assembleEvidence(workspaceID uuid.UUID,
 			RuntimeStatus string
 			LastSeenAt    *time.Time
 		}
-		if err := m.db.Raw(`SELECT runtime_status, last_seen_at FROM discovered_agents WHERE id = ?`,
-			*p.DiscoveredAgentID).Scan(&agent).Error; err == nil {
+		if err := m.db.Raw(`SELECT runtime_status, last_seen_at FROM discovered_agents WHERE workspace_id = ? AND id = ?`,
+			workspaceID, *p.DiscoveredAgentID).Scan(&agent).Error; err == nil {
 			ev.RuntimeStatus = agent.RuntimeStatus
 			ev.LastSeenAt = agent.LastSeenAt
 		}
