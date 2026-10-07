@@ -2,7 +2,8 @@
 # Tenant-isolation ratchet (ADR-0001 §4.3).
 #
 # Counts raw SQL statements in non-test Go code outside internal/tenancy that
-# are neither written through the scoped layer nor marked
+# are neither handed to the scoped layer (tenancy.Exec/Query/QueryRow[Context],
+# database.queryScoped/insertScoped) nor marked
 # "// TENANT-EXEMPT: <reason>" on the same or one of the three preceding
 # lines. The count may only go down: CI fails if it exceeds the recorded
 # baseline. After migrating callers, lower the baseline with --update.
@@ -37,8 +38,13 @@ count=$(git ls-files '*.go' \
       FNR == 1 { h1 = h2 = h3 = "" }
       {
         line = $0
+        # A statement handed straight to the scoped layer (the call on the
+        # same line or one of the two above) binds workspace_id to $1 from
+        # the tenant context, checked at run time, and is not counted.
+        scoped = "(tenancy\\.(Exec|Query|QueryRow)(Context)?|queryScoped|insertScoped)\\("
         if (line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
+            && line !~ scoped && h1 !~ scoped && h2 !~ scoped \
             && line !~ /^[[:space:]]*\/\//) n++
         h3 = h2; h2 = h1; h1 = line
       }
