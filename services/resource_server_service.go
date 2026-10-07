@@ -14,6 +14,7 @@ import (
 	"time"
 
 	mcpclient "github.com/authsec-ai/authsec/internal/mcp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -462,18 +463,26 @@ func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates m
 // Cascades to resource_server_client_registrations (FK lacks ON DELETE CASCADE
 // in older schemas; the explicit delete covers both old and new).
 func (s *ResourceServerService) DeleteByTenant(id, workspaceID string) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	ws, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return fmt.Errorf("resource server not found")
+	}
+	// The whole delete runs under row-level security for the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
+	return tenancy.RLSTransaction(ctx, s.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var rs models.ResourceServer
-		if err := tx.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
+		if err := tx.Where("id = ? AND workspace_id = ?", id, ws).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found")
 		}
 
 		// Clean up role_bindings scoped to this RS (polymorphic — no FK cascade).
 		// Without this, the PDP (ScopeResolver) could still authorize access
-		// to a deleted application via stale role_bindings rows.
-		if err := tx.Exec(
-			`DELETE FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ?`, rs.ID,
-		).Error; err != nil {
+		// to a deleted application via stale role_bindings rows. Only this
+		// workspace's bindings: the PDP never reads another workspace's
+		// bindings for this RS, and they are not this workspace's to delete.
+		if _, err := tenancy.ExecContext(ctx, tx.Statement.ConnPool,
+			`DELETE FROM role_bindings WHERE workspace_id = $1 AND scope_type = 'resource_server' AND scope_id = $2`, rs.ID,
+		); err != nil {
 			return fmt.Errorf("clean up role_bindings: %w", err)
 		}
 
@@ -1258,6 +1267,31 @@ type ChecklistStep struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
+// unmappedToolCount counts the resource server's non-public tools in its
+// policy-effective inventory (SDK manifest, manual, or the last successful
+// scan) that have no admin_override scope mapping. It runs in the resource
+// server's workspace, under row-level security.
+func (s *ResourceServerService) unmappedToolCount(rs *models.ResourceServer) (int64, error) {
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: rs.WorkspaceID})
+	var n int64
+	err := tenancy.RLSTransaction(ctx, s.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
+		return tenancy.QueryRowContext(ctx, tx.Statement.ConnPool, `
+			SELECT COUNT(*) FROM mcp_tools mt
+			  LEFT JOIN mcp_tool_scope_map m
+			    ON m.workspace_id = mt.workspace_id AND m.tool_id = mt.id AND m.source = 'admin_override'
+			 WHERE mt.workspace_id = $1 AND mt.resource_server_id = $2
+			   AND (mt.inventory_source = ANY($3) OR mt.last_scan_generation = $4)
+			   AND mt.is_public = false
+			   AND m.tool_id IS NULL`,
+			[]interface{}{rs.ID, pq.Array([]string{models.InventorySourceSDKManifest, models.InventorySourceManual}), rs.LastSuccessfulGeneration},
+			&n)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count unmapped tools: %w", err)
+	}
+	return n, nil
+}
+
 // SetupChecklist returns the step-by-step status for the wizard rail.
 func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, workspaceID uuid.UUID) ([]ChecklistStep, error) {
 	rs, err := s.GetByIDAndTenant(rsID.String(), workspaceID.String())
@@ -1291,18 +1325,10 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, workspaceID uuid.
 	})
 
 	// Step 4: Map tools — every non-public tool has ≥1 admin_override mapping
-	var unmappedCount int64
-	s.db.Raw(`
-		SELECT COUNT(*) FROM mcp_tools mt
-		 WHERE mt.resource_server_id = ?
-		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
-		   AND mt.is_public = false
-		   AND NOT EXISTS (
-			   SELECT 1 FROM mcp_tool_scope_map m
-			    WHERE m.tool_id = mt.id
-			      AND m.source = 'admin_override'
-		   )
-	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
+	unmappedCount, err := s.unmappedToolCount(rs)
+	if err != nil {
+		return nil, err
+	}
 	step4Complete := toolCount > 0 && unmappedCount == 0
 	steps = append(steps, ChecklistStep{
 		Step:     4,
@@ -1459,18 +1485,10 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, workspaceID uuid.UUID, 
 	}
 
 	// Gate 3: every non-public tool has ≥1 admin_override mapping
-	var unmappedCount int64
-	s.db.Raw(`
-		SELECT COUNT(*) FROM mcp_tools mt
-		 WHERE mt.resource_server_id = ?
-		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
-		   AND mt.is_public = false
-		   AND NOT EXISTS (
-			   SELECT 1 FROM mcp_tool_scope_map m
-			    WHERE m.tool_id = mt.id
-			      AND m.source = 'admin_override'
-		   )
-	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
+	unmappedCount, err := s.unmappedToolCount(rs)
+	if err != nil {
+		return err
+	}
 	if unmappedCount > 0 {
 		failed = append(failed, fmt.Sprintf("step_4_unmapped_tool_count: %d", unmappedCount))
 	}
