@@ -37,6 +37,7 @@ import (
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/k8sread"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -590,6 +591,20 @@ func TestHardeningImplicitGroupMembership(t *testing.T) {
 	    ON m.id = r.source_identity_account_id WHERE r.workspace_id = ? AND r.relationship_type = 'member_of'
 	    AND m.display_name = 'system:serviceaccount:iga-demo:research'`, ws)
 
+	// The flat access route reads the membership (D-112): the group's grant
+	// is on other's access -- other has no binding of its own -- named, and
+	// marked implicit.
+	otherID := uuid.MustParse(str(t, db, `SELECT id FROM iga_identity_accounts WHERE workspace_id = ?
+	    AND display_name = 'system:serviceaccount:iga-demo:other'`, ws))
+	grants, sum, err := k8sread.New(db, ws).AccessFor(otherID)
+	if err != nil {
+		t.Fatalf("access: %v", err)
+	}
+	if len(grants) != 1 || grants[0].Via == nil || grants[0].Via.Group != "system:serviceaccounts" ||
+		!grants[0].Via.ImplicitMembership || grants[0].RoleName != "secret-reader" || sum.ViaGroup != 1 {
+		t.Errorf("other's access = %+v %+v, want secret-reader via system:serviceaccounts, implicit", grants, sum)
+	}
+
 	// Re-confirmed in place by the next sweep.
 	if _, err := mgr.Ingest(ws, withGroups(true, "system:serviceaccounts", "system:authenticated")); err != nil {
 		t.Fatalf("ingest 2: %v", err)
@@ -810,5 +825,50 @@ func TestHardeningPodTerminatedLeavesTheCronJob(t *testing.T) {
 	if got := str(t, db, `SELECT lifecycle FROM iga_workload WHERE workspace_id = ? AND source_key = ?`,
 		ws, k8sgraph.WorkloadKey(cluster, "fp-cron")); got != "active" {
 		t.Errorf("CronJob workload = %q after pod_terminated, want active", got)
+	}
+}
+
+// /k8s/clusters counts are each cluster's own, not the workspace's: with two
+// clusters, every cluster row used to show the workspace totals.
+func TestHardeningClusterCountsArePerCluster(t *testing.T) {
+	db := ingestDB(t)
+	ws, srcA := seedWorkspace(t, db) // cluster k3s-master
+	srcB := seedSource(t, db, ws, "cluster-b")
+	mgr := hardeningMgr(db)
+	if _, err := mgr.Ingest(ws, snapshot(ws, srcA, true, true, true)); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if _, err := mgr.Ingest(ws, clusterSnapshot(ws, srcB, "cluster-b")); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+
+	clusters, err := k8sread.New(db, ws).Clusters()
+	if err != nil {
+		t.Fatalf("clusters: %v", err)
+	}
+	if len(clusters) != 2 {
+		t.Fatalf("got %d clusters, want 2", len(clusters))
+	}
+	totalGrants := count(t, db, `SELECT count(*) FROM iga_access_edges
+	    WHERE workspace_id = ? AND provider = 'k8s' AND state = 'current'`, ws)
+	for _, c := range clusters {
+		prefix := k8sgraph.ClusterPrefix(c.Cluster)
+		wantSA := count(t, db, `SELECT count(*) FROM iga_identity_accounts
+		    WHERE workspace_id = ? AND provider = 'k8s' AND lifecycle = 'active'
+		      AND account_kind = 'k8s_service_account' AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		wantRoles := count(t, db, `SELECT count(*) FROM iga_policy
+		    WHERE workspace_id = ? AND provider = 'k8s' AND lifecycle = 'active'
+		      AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		wantGrants := count(t, db, `SELECT count(*) FROM iga_access_edges
+		    WHERE workspace_id = ? AND provider = 'k8s' AND state = 'current'
+		      AND left(source_key, length(?)) = ?`, ws, prefix, prefix)
+		if wantSA == 0 || wantRoles == 0 || wantGrants == 0 || wantGrants >= totalGrants {
+			t.Fatalf("%s fixture: %d SAs, %d roles, %d of %d grants; want each cluster to own some, not all",
+				c.Cluster, wantSA, wantRoles, wantGrants, totalGrants)
+		}
+		if c.ServiceAccounts != wantSA || c.Roles != wantRoles || c.Grants != wantGrants || c.Stale != 0 {
+			t.Errorf("%s counts = sa %d roles %d grants %d stale %d, want %d %d %d 0 (its own, not the workspace's)",
+				c.Cluster, c.ServiceAccounts, c.Roles, c.Grants, c.Stale, wantSA, wantRoles, wantGrants)
+		}
 	}
 }

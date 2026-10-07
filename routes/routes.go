@@ -1444,9 +1444,11 @@ func SetupRoutes(
 		//   - off      nothing is checked (the old behaviour)
 		//   - warn     DEFAULT. A valid token is attributed; a call without one is
 		//              ACCEPTED but logged and counted, so agents installed before
-		//              tokens existed keep working during rollout
-		//   - enforce  no valid, unrevoked token for the body's workspace (and, if
-		//              bound, for the call's source) -> 401
+		//              tokens existed keep working during rollout. NOT a protected
+		//              ingress: startup logs a banner, discovery_ingest_auth_enforced
+		//              is 0 and the uflow health check says so until enforce
+		//   - enforce  no valid (unrevoked, unexpired) token for the body's
+		//              workspace (and, if bound, for the call's source) -> 401
 		// In warn and enforce a valid token of ANOTHER workspace is always 403: a
 		// token never authorises another workspace. Rollout steps:
 		// controllers/platform/DISCOVERY_INGEST_AUTH.md.

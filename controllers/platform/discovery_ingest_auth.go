@@ -46,6 +46,12 @@ type IngestTokenMintRequest struct {
 	// (and the only kind usable before the agent has registered).
 	DiscoverySourceID *uuid.UUID `json:"discovery_source_id,omitempty"`
 	Label             string     `json:"label,omitempty"`
+	// ExpiresAt (RFC 3339) is when the token stops working, exactly as if it
+	// were revoked then. Optional: omitted, the token never expires. It must be
+	// in the future and at most two years away. Rotate before it passes: mint
+	// a new token, roll the agent's Secret, revoke the old one
+	// (DISCOVERY_INGEST_AUTH.md).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 func (ctl *DiscoveryController) ingestTokens() *services.DiscoveryIngestTokens {
@@ -71,7 +77,11 @@ func (ctl *DiscoveryController) MintIngestToken(c *gin.Context) {
 		return
 	}
 
-	row, plain, err := ctl.ingestTokens().Mint(wsID, req.DiscoverySourceID, req.Label, principal)
+	row, plain, err := ctl.ingestTokens().Mint(wsID, req.DiscoverySourceID, req.Label, principal, req.ExpiresAt)
+	if errors.Is(err, repositories.ErrIngestTokenExpiry) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if errors.Is(err, repositories.ErrIngestTokenSourceNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -89,16 +99,23 @@ func (ctl *DiscoveryController) MintIngestToken(c *gin.Context) {
 		"token_prefix":        row.TokenPrefix,
 		"workspace_id":        row.WorkspaceID,
 		"discovery_source_id": row.DiscoverySourceID,
+		"source_bound":        row.SourceBound,
 		"label":               row.Label,
 		"created_by":          row.CreatedBy,
 		"created_at":          row.CreatedAt,
 		"last_used_at":        row.LastUsedAt,
 		"revoked_at":          row.RevokedAt,
+		"expires_at":          row.ExpiresAt,
+		"expired":             false,
+		"source_deleted":      false,
 	})
 }
 
 // ListIngestTokens handles GET /authsec/discovery/ingest-tokens: the caller's
-// workspace's tokens, newest first, revoked ones included. Never a hash.
+// workspace's tokens, newest first, revoked and expired ones included. Each
+// carries expires_at and expired (by the database clock, the one the ingress
+// checks), and source_deleted for a token whose bound source was deleted (and
+// which that deletion revoked). Never a hash.
 func (ctl *DiscoveryController) ListIngestTokens(c *gin.Context) {
 	wsID, _, err := ctl.workspace(c)
 	if err != nil {
@@ -145,10 +162,27 @@ func (ctl *DiscoveryController) RevokeIngestToken(c *gin.Context) {
 /* -------------------------------------------------------------------------- */
 
 // LogDiscoveryIngestAuthMode logs the ingress auth mode, once, at route setup,
-// so which mode a deployment runs in is never a guess.
+// so which mode a deployment runs in is never a guess, and publishes it as the
+// discovery_ingest_auth_enforced gauge. Any mode but enforce is logged as a
+// banner: warn is the default only so agents installed before tokens existed
+// keep working during rollout, and it does not protect the ingress. The same
+// status is in the uflow health check (checks.discovery_ingest_auth).
 func LogDiscoveryIngestAuthMode() {
-	log.Printf("discovery ingress auth mode: %s (%s)",
-		services.DiscoveryIngestAuthModeFromEnv(), services.DiscoveryIngestAuthEnv)
+	st := services.CurrentDiscoveryIngestAuthStatus()
+	monitoring.SetDiscoveryIngestAuthMode(string(st.Mode), st.Enforced)
+	log.Printf("discovery ingress auth mode: %s (%s)", st.Mode, st.Env)
+	if st.Enforced {
+		return
+	}
+	const bar = "**************************************************************************"
+	log.Print(bar)
+	log.Printf("* WARNING: %s", st.Warning)
+	log.Printf("* The discovery ingress (/authsec/discovery/agent-registration, /sightings, /lifecycle,")
+	log.Printf("* /resync-manifest, /rbac-snapshot) is NOT protected in mode %q.", st.Mode)
+	log.Printf("* To enforce: mint a token per agent, roll it into the agent's Secret, wait until")
+	log.Printf("* auth_requests_total{auth_type=\"discovery_ingest\",result=~\"accepted_unauthenticated_.*\"}")
+	log.Printf("* stops growing, then set %s=enforce and restart.", st.Env)
+	log.Print(bar)
 }
 
 // Context keys set on an authenticated ingress call.

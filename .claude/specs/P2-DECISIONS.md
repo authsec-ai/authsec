@@ -1202,3 +1202,60 @@ Numbered on merge after the Wave C entries (D-104, D-105).
   keyset paging by (far key, claim) neither repeats nor skips an unchanged
   row, and the item is that a publication never makes a Kubernetes
   continuation stale.
+
+## Added by the Kubernetes follow-ups (kf/access)
+
+- **D-112 The flat Kubernetes access route reads what the graph walk reads
+  (`internal/k8sread/read.go`, `scope.go`; `GET
+  /authsec/discovery/k8s/identities/:id/access`, `/k8s/identities`,
+  `/k8s/workloads`).** *Provisional, for review.* The console's Kubernetes
+  Overview and Access tabs read this route; it had fallen behind D-109 and
+  D-110. Shape change, for the console:
+  - *Group grants (D-110).* An identity's access is its own grants plus the
+    grants of every group it is `member_of` -- the projection's
+    ServiceAccount -> `system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+    `system:authenticated` rows -- with the walk's predicates: membership and
+    grant live when `current | stale` (ended hidden, as before), the group a
+    Kubernetes identity with a support row (D-6), every join bound to the
+    workspace. One SQL (`accessRowsSQL`) feeds the access route and both
+    lists' counts. A group-derived row's `state` is the weaker of its two
+    links (stale when the membership or the grant is stale); one grant of one
+    group reached through two live memberships is one row. A grant with no
+    rule (role never seen) is a row on either path, as before.
+  - *New per-grant fields (additive):* `via` -- `null` for a direct grant,
+    else `{relationship: "member_of", group, group_id, implicit_membership,
+    state, basis}` (the membership's own state and basis; `implicit_membership`
+    exactly as the graph's member_of edge computes it); `effective_scope
+    {kind: namespace|cluster, namespace}` -- D-109's rule, from the same
+    function the graph now calls (`k8sread.BindingScope`), so a ClusterRole's
+    rule bound by a RoleBinding is the binding's namespace, never
+    cluster-wide; read from the assignment's key, or for a grant with no
+    assignment row (role never seen) from the grant's own key, which starts
+    with the binding key; `binding_name`; `basis` (always `declared`);
+    `resolved` (binding -> role -> rule resolved; false = the role was not in
+    the sweep, the graph's `k8s_unresolved_bindings`). `namespace` keeps its
+    meaning: the ROLE's namespace, never where the rule applies.
+  - *Removed:* per-grant `effective_conclusion` (it was always `unknown`;
+    grants are declared, not evaluated -- the vocabulary is `basis declared`,
+    `calculation_state partial`, as on the graph) and `summary.complete`,
+    which could never be non-zero once every grant is `partial`. The note no
+    longer uses the word "effective"; the only key containing it is
+    `effective_scope` (D-109's name).
+  - *Summary:* `{total, partial, stale, resolved, unresolved, direct,
+    via_group, note}`; `partial + stale`, `resolved + unresolved` and `direct
+    + via_group` each equal `total`. `partial` keeps its meaning (rows not
+    stale).
+  - *Lists:* `/k8s/identities` `grants`/`stale`/`wildcard` and
+    `/k8s/workloads` `grants` count the same rows (group grants included):
+    an identity's `grants` equals its access summary's `partial`, `stale`
+    its `stale`, and a workload's `grants` its execution identity's
+    `partial`. `/k8s/clusters` is unchanged (it counts grant rows, a group's
+    included, not per-identity paths).
+  - *One statement of each rule.* `k8sgraph.ImplicitGroup` (which group
+    names are implicit), `k8sread.ImplicitGroupKey` and `k8sread.BindingScope`
+    are now what `traverse_k8s.go` calls too, so the walk and the route
+    cannot drift. The readability predicate is written out in
+    `accessRowsSQL` (igaread imports k8sread, not the reverse).
+  - *Tests:* `tests/integration/p2_k8s_access_route_test.go` (real projection,
+    real controller; agreement with `/graph` row for row), the e2e
+    `TestIngestIsReadableBack` and `TestHardeningImplicitGroupMembership`.

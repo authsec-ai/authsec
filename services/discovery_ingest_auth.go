@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -22,10 +23,14 @@ const (
 	// IngestAuthWarn (the default) attributes a call with a valid token and
 	// ACCEPTS one without (logged and counted), so agents installed before
 	// tokens existed keep working while they are rolled out. A valid token for
-	// another workspace is still refused.
+	// another workspace is still refused. Warn does NOT protect the ingress: it
+	// is a rollout stage, and the control plane says so loudly at startup, in
+	// discovery_ingest_auth_enforced and in its health check until the mode is
+	// enforce.
 	IngestAuthWarn DiscoveryIngestAuthMode = "warn"
-	// IngestAuthEnforce refuses every call without a valid, unrevoked token for
-	// the body's workspace (and, for a bound token, the call's source).
+	// IngestAuthEnforce refuses every call without a valid (unrevoked,
+	// unexpired) token for the body's workspace (and, for a bound token, the
+	// call's source).
 	IngestAuthEnforce DiscoveryIngestAuthMode = "enforce"
 )
 
@@ -67,7 +72,7 @@ const (
 // Reasons an ingress call is not authenticated.
 const (
 	IngestReasonMissing     = "missing"      // no bearer token
-	IngestReasonInvalid     = "invalid"      // unknown, malformed or revoked
+	IngestReasonInvalid     = "invalid"      // unknown, malformed, revoked, expired, or its bound source deleted
 	IngestReasonWrongSource = "wrong_source" // bound token, call resolves to another (or no) source
 )
 
@@ -95,9 +100,11 @@ func NewDiscoveryIngestTokens(db *gorm.DB) *DiscoveryIngestTokens {
 
 // Mint creates a token for workspaceID and returns the row and the plaintext.
 // The workspace is always the caller's; sourceID, when set, must be one of its
-// sources (repositories.ErrIngestTokenSourceNotFound otherwise).
-func (s *DiscoveryIngestTokens) Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string) (*models.DiscoveryIngestToken, string, error) {
-	return s.repo.Mint(workspaceID, sourceID, label, createdBy)
+// sources (repositories.ErrIngestTokenSourceNotFound otherwise). expiresAt, when
+// set, must be in the future and at most repositories.MaxIngestTokenLifetime
+// away (repositories.ErrIngestTokenExpiry otherwise).
+func (s *DiscoveryIngestTokens) Mint(workspaceID uuid.UUID, sourceID *uuid.UUID, label, createdBy string, expiresAt *time.Time) (*models.DiscoveryIngestToken, string, error) {
+	return s.repo.Mint(workspaceID, sourceID, label, createdBy, expiresAt)
 }
 
 // List returns the workspace's tokens without their hashes.
@@ -119,7 +126,8 @@ func (s *DiscoveryIngestTokens) Revoke(workspaceID, id uuid.UUID) (*models.Disco
 //
 // The order is the contract:
 //  1. off: accept, nothing is read.
-//  2. no token, or not a live token: 401 in enforce, accept-and-count in warn.
+//  2. no token, or not a live token (unknown, revoked, expired, or bound to a
+//     deleted source): 401 in enforce, accept-and-count in warn.
 //  3. a live token of ANOTHER workspace: 403 in warn and enforce. A token
 //     never authorises another workspace, and in warn this is what turns a
 //     mis-pasted secret into an error instead of a silent cross-tenant write.
@@ -161,7 +169,13 @@ func (s *DiscoveryIngestTokens) Authorize(mode DiscoveryIngestAuthMode, presente
 		d.Outcome = IngestRejectForeignWorkspace
 		return d, nil
 	}
-	if tok.DiscoverySourceID != nil {
+	if tok.SourceBound || tok.DiscoverySourceID != nil {
+		// A bound token whose source is gone is valid for nothing. Verify
+		// never returns one (and the table cannot hold an unrevoked one); this
+		// keeps a NULL source from ever meaning "any source" here either.
+		if tok.DiscoverySourceID == nil {
+			return unauthenticated(IngestReasonInvalid)
+		}
 		src, err := resolveSource()
 		if err != nil {
 			return d, err
@@ -172,4 +186,32 @@ func (s *DiscoveryIngestTokens) Authorize(mode DiscoveryIngestAuthMode, presente
 	}
 	d.Outcome = IngestAccept
 	return d, nil
+}
+
+// DiscoveryIngestAuthStatus describes the ingress auth mode for an operator: a
+// health check, a metric, the startup log. Enforced is false in off and warn,
+// where a caller holding only a workspace id can still write to the
+// workspace's inventory and graph.
+type DiscoveryIngestAuthStatus struct {
+	Mode     DiscoveryIngestAuthMode `json:"mode"`
+	Enforced bool                    `json:"enforced"`
+	Env      string                  `json:"env"`
+	// Warning is set whenever the mode is not enforce.
+	Warning string `json:"warning,omitempty"`
+}
+
+// CurrentDiscoveryIngestAuthStatus reads IGA_DISCOVERY_INGEST_AUTH, as the
+// ingress does on every call, and describes it.
+func CurrentDiscoveryIngestAuthStatus() DiscoveryIngestAuthStatus {
+	mode := DiscoveryIngestAuthModeFromEnv()
+	st := DiscoveryIngestAuthStatus{Mode: mode, Enforced: mode == IngestAuthEnforce, Env: DiscoveryIngestAuthEnv}
+	switch mode {
+	case IngestAuthOff:
+		st.Warning = "discovery ingress authentication is OFF: any caller that knows a workspace id can write to its inventory and graph; set " +
+			DiscoveryIngestAuthEnv + "=enforce (controllers/platform/DISCOVERY_INGEST_AUTH.md)"
+	case IngestAuthWarn:
+		st.Warning = "discovery ingress authentication is in WARN (rollout) mode: calls without a valid ingest token are ACCEPTED and only logged and counted; set " +
+			DiscoveryIngestAuthEnv + "=enforce once accepted_unauthenticated_* stops growing (controllers/platform/DISCOVERY_INGEST_AUTH.md)"
+	}
+	return st
 }

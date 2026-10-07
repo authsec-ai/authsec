@@ -26,8 +26,9 @@ type DiscoveryManager interface {
 	GetSource(workspaceID, id uuid.UUID) (*models.DiscoverySource, error)
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	UpdateSource(workspaceID, id uuid.UUID, in DiscoverySourceUpdateInput) (*models.DiscoverySource, error)
-	// DeleteSource removes the source, its integration and its findings, and
-	// returns a secrets-store path the caller must purge (empty when none).
+	// DeleteSource removes the source, its integration and its findings,
+	// revokes (never deletes) its bound ingest tokens, and returns a
+	// secrets-store path the caller must purge (empty when none).
 	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
 	// RegisterAgent records a heartbeat from a deployed discovery agent, creating
@@ -168,7 +169,10 @@ type ManifestInput struct {
 	Source            string
 	DiscoverySourceID *uuid.UUID
 	ClusterName       string
-	ScanKind          string
+	// ClusterUID is the swept cluster's kube-system UID, when the agent could
+	// read it. Optional: empty means "not stated", never "a different cluster".
+	ClusterUID string
+	ScanKind   string
 	// Complete is false when any LIST in the sweep failed. A partial sweep retires
 	// nothing — see ReconcileManifest.
 	Complete     bool
@@ -390,9 +394,22 @@ func (m *discoveryManager) RegisterAgent(workspaceID uuid.UUID, in AgentRegistra
 		src.LastSyncAt = &now
 	}
 
+	reportedUID := strings.TrimSpace(in.ClusterUID)
 	stored, created, err := m.repo.UpsertSelfRegistration(src)
 	if err != nil {
 		return nil, false, err
+	}
+	// The connector keeps the FIRST cluster UID it recorded; a heartbeat
+	// reporting another is accepted (liveness still counts) but never re-binds
+	// the row, and the repository marks it cluster_uid_conflict for the console.
+	// Logged here too, because a conflict is two clusters' inventories about to
+	// be confused and an operator reading logs should not have to find it in a
+	// status column. Only deleting and re-adding the connection resets the UID.
+	if reportedUID != "" && stored.ClusterUID != "" && reportedUID != stored.ClusterUID {
+		log.Printf("[discovery] cluster_uid_conflict: connector %s (workspace %s, instance %q, cluster %q) "+
+			"belongs to cluster uid %s but a heartbeat reported %s; heartbeat accepted, uid kept, "+
+			"RBAC snapshots from %s will be refused",
+			stored.ID, workspaceID, in.InstanceID, in.ClusterName, stored.ClusterUID, reportedUID, reportedUID)
 	}
 	// Explicit here because AfterFind does not fire for a Create with RETURNING.
 	stored.DeriveConnected(now)
@@ -476,6 +493,44 @@ func (m *discoveryManager) RecordLifecycleEvent(workspaceID uuid.UUID, in Lifecy
 	return agent, event, nil
 }
 
+// checkManifestClusterUID refuses a manifest whose cluster UID differs from the
+// one its connection recorded first (ErrClusterUIDMismatch), exactly as an
+// RBAC snapshot is refused. The connection is the manifest's
+// discovery_source_id, or else -- as for a snapshot -- the oldest connection
+// of its kind registered under the cluster name. Either UID empty means no
+// claim either way, and the manifest is handled as before. A manifest never
+// records a UID itself: registration and the RBAC sweep do.
+func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in ManifestInput) error {
+	uid := strings.TrimSpace(in.ClusterUID)
+	db := m.repo.DB()
+	if uid == "" || db == nil {
+		return nil
+	}
+	var src struct {
+		ID         uuid.UUID
+		ClusterUID string
+	}
+	q := db.Table("discovery_sources").Select("id, cluster_uid").Where("workspace_id = ?", workspaceID)
+	if in.DiscoverySourceID != nil {
+		q = q.Where("id = ?", *in.DiscoverySourceID)
+	} else {
+		q = q.Where("kind = ? AND cluster_name = ?", in.Source, in.ClusterName).Order("created_at ASC")
+	}
+	if err := q.Limit(1).Scan(&src).Error; err != nil {
+		return fmt.Errorf("read connection cluster uid: %w", err)
+	}
+	if src.ClusterUID == "" || src.ClusterUID == uid {
+		return nil
+	}
+	log.Printf("[discovery] cluster_uid_mismatch: resync manifest for cluster %q reports uid %s, "+
+		"connection %s belongs to %s; refused", in.ClusterName, uid, src.ID, src.ClusterUID)
+	if err := repositories.RecordClusterUIDConflict(db, workspaceID, src.ID, uid, "resync manifest"); err != nil {
+		log.Printf("[discovery] could not record the cluster uid conflict on %s: %v", src.ID, err)
+	}
+	return fmt.Errorf("%w: manifest is from cluster %q but connection %s belongs to cluster %q; "+
+		"two clusters are installed under one cluster name", ErrClusterUIDMismatch, uid, src.ID, src.ClusterUID)
+}
+
 // projectK8sSighting copies a Kubernetes sighting into the shared graph at
 // once (K8sRBACManager.ProjectSighting) rather than waiting for the cluster's
 // next RBAC snapshot. A no-op for other sources and while IGA_GRAPH_PROJECTION
@@ -550,6 +605,12 @@ func (m *discoveryManager) ReconcileManifest(workspaceID uuid.UUID, in ManifestI
 		if _, err := m.repo.GetSource(workspaceID, *in.DiscoverySourceID); err != nil {
 			return nil, fmt.Errorf("unknown discovery_source_id for this workspace: %w", err)
 		}
+	}
+	// Before anything is folded in: a manifest from a DIFFERENT cluster that
+	// shares this one's name would mark this cluster's agents gone by their
+	// absence from a cluster they were never in.
+	if err := m.checkManifestClusterUID(workspaceID, in); err != nil {
+		return nil, err
 	}
 
 	observedAt := time.Now()
