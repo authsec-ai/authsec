@@ -3,7 +3,7 @@
 #
 # Counts raw SQL statements in non-test Go code outside internal/tenancy that
 # are neither handed to the scoped layer (tenancy.Exec/Query/QueryRow[Context],
-# tenancy.GormExec/GormRaw,
+# tenancy.InsertContext, tenancy.GormExec/GormRaw,
 # database.queryScoped/insertScoped) nor marked
 # "// TENANT-EXEMPT: <reason>" on the same or one of the three preceding
 # lines. The count may only go down: CI fails if it exceeds the recorded
@@ -49,7 +49,7 @@ count=$(git ls-files '*.go' \
         # to $1 from the tenant context, checked at run time, and is not
         # counted: the statement on the call line or continuing its argument
         # list, including a multi-line SQL string up to its closing backtick.
-        scoped = "(tenancy\\.(Exec|Query|QueryRow|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
+        scoped = "(tenancy\\.(Exec|Query|QueryRow|Insert|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
       }
       FNR == 1 { h1 = h2 = h3 = ""; inscoped = 0 }
       {

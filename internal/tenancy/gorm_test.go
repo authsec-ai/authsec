@@ -36,3 +36,13 @@ func TestGormForms_RefuseUnscopedOrTenantless(t *testing.T) {
 		t.Fatalf("handle poisoned by a refused statement: %v", err)
 	}
 }
+
+func TestInsertContext_RefusesNonInsertAndTenantless(t *testing.T) {
+	ctx := WithContext(context.Background(), Context{WorkspaceID: uuid.New()})
+	if _, err := InsertContext(ctx, nil, `UPDATE t SET a = 1`); !errors.Is(err, ErrNotInsert) {
+		t.Errorf("update: %v, want ErrNotInsert", err)
+	}
+	if _, err := InsertContext(context.Background(), nil, `INSERT INTO t (workspace_id) VALUES ($1)`); !errors.Is(err, ErrNoTenant) {
+		t.Errorf("tenantless: %v, want ErrNoTenant", err)
+	}
+}
