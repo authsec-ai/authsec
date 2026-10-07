@@ -186,13 +186,28 @@ func main() {
 	// gated by it.
 	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
 	services.SetPolicyGate(policyGate)
+	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
+	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
+	// ready hook, never before. It also claims nothing while the gate reads
+	// unavailable (graph gate off, read live). Stopped gracefully on shutdown.
+	policyWorkerCtx, stopPolicyWorker := context.WithCancel(context.Background())
+	defer stopPolicyWorker()
+	policyWorkerDone := make(chan (<-chan struct{}), 1)
 	if policyGate.Enabled() {
 		if state, reason, _ := policyGate.Status(); state != services.PolicyOn {
 			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
 		}
-		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
+			}
+			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
+			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
+		})
 	} else {
 		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
 	}
 
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
@@ -561,6 +576,19 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// The policy job worker stops claiming, gives running jobs their grace,
+	// and hands back what did not finish (§8.1).
+	stopPolicyWorker()
+	select {
+	case done := <-policyWorkerDone:
+		select {
+		case <-done:
+		case <-ctx.Done():
+			log.Println("Policy job worker did not stop within the grace period")
+		}
+	default:
+	}
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced shutdown: %v", err)
