@@ -15,6 +15,7 @@ import (
 // the encrypted backup codes. It is idempotent: a value the current key
 // already opens is left alone, so it is safe to run at every startup.
 func RotateLegacyMFACiphertexts(db *sql.DB) (int, error) {
+	// TENANT-EXEMPT: platform key rotation at startup re-encrypts every workspace's MFA ciphertexts
 	rows, err := db.Query(`SELECT id, method_data, backup_codes FROM mfa_methods`)
 	if err != nil {
 		return 0, fmt.Errorf("list mfa_methods: %w", err)
@@ -83,6 +84,7 @@ func RotateLegacyMFACiphertexts(db *sql.DB) (int, error) {
 		if !changed {
 			continue
 		}
+		// TENANT-EXEMPT: the row just read by the platform key rotation, by primary key
 		if _, err := db.Exec(`UPDATE mfa_methods SET method_data = $1::jsonb, backup_codes = $2, updated_at = now() WHERE id = $3`,
 			methodData, backupCodes, r.id); err != nil {
 			return rotated, fmt.Errorf("update mfa_methods %s: %w", r.id, err)

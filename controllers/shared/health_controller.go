@@ -123,6 +123,7 @@ func (hc *HealthController) checkDatabaseHealth() map[string]interface{} {
 
 	// Verify bootstrap schema is present by checking a critical table
 	var tableCount int64
+	// TENANT-EXEMPT: health check reads the Postgres catalog
 	if err := config.DB.Raw("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'workspaces'").Scan(&tableCount).Error; err != nil || tableCount == 0 {
 		result["healthy"] = false
 		result["message"] = "Bootstrap schema missing: workspaces table not found"

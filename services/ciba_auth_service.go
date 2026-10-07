@@ -431,6 +431,7 @@ func (s *CIBAAuthService) resolveRequestWorkspace(workspaceIDStr, clientIDStr st
 	}
 
 	var active bool
+	// TENANT-EXEMPT: the tenant registry row (workspaces has no workspace_id)
 	if err := s.db.QueryRow(
 		`SELECT EXISTS (SELECT 1 FROM workspaces WHERE id = $1 AND COALESCE(status, 'active') = 'active')`,
 		workspaceID,
@@ -446,6 +447,7 @@ func (s *CIBAAuthService) lookupClientUUID(clientIDStr string) (uuid.UUID, error
 	if strings.TrimSpace(clientIDStr) == "" {
 		return uuid.Nil, fmt.Errorf("client_id is required")
 	}
+	// TENANT-EXEMPT: pre-auth; OAuth client_id is globally unique and decides the workspace
 	err := s.db.QueryRow(`SELECT id FROM mcp_oauth_clients WHERE client_id = $1`, strings.TrimSpace(clientIDStr)).Scan(&id)
 	return id, err
 }

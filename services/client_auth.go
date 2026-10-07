@@ -165,6 +165,7 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 		JTI:       jti,
 		ExpiresAt: expiresAt,
 	}
+	// TENANT-EXEMPT: replay cache keyed by the globally unique client_id and the assertion's jti
 	res := db.WithContext(ctx).Exec(
 		`INSERT INTO client_assertion_replay_cache (client_id, jti, expires_at)
          VALUES (?, ?, ?)

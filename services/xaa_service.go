@@ -333,6 +333,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 // ErrIDJAGReplayed, aborting the issuance transaction.
 func IDJAGReplayInsert(db *gorm.DB, iss, jti string, expiresAt time.Time) func(tx *gorm.DB) error {
 	return func(tx *gorm.DB) error {
+		// TENANT-EXEMPT: replay cache keyed by the assertion's (iss, jti), issuer-wide
 		res := tx.Exec(
 			`INSERT INTO id_jag_replay_cache (iss, jti, expires_at)
              VALUES (?, ?, ?)

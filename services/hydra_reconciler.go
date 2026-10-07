@@ -127,6 +127,7 @@ func (r *HydraReconciler) MarkStaleDCRClients(ctx context.Context, staleDays int
 	// record a native_tokens row but do not stamp last_token_issued_at, so
 	// a client used only through them looked stale and was deleted while
 	// in use (AS-037). Recent issuance in either place keeps it.
+	// TENANT-EXEMPT: platform reconciler over every workspace's DCR clients; client_id is globally unique
 	if err := r.db.WithContext(ctx).Where(
 		"registration_type = 'dcr' AND sync_status = ? AND created_at < ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)"+
 			" AND NOT EXISTS (SELECT 1 FROM native_tokens nt WHERE nt.client_id = mcp_oauth_clients.client_id AND nt.issued_at >= ?)",
@@ -312,6 +313,7 @@ func (r *HydraReconciler) runAccessRequestExpiryAndReminder(ctx context.Context)
 			Name string
 		}
 		var rsList []rsRow
+		// TENANT-EXEMPT: platform reconciler; names the resource servers of the requests it just read (same-workspace key)
 		r.db.WithContext(ctx).Raw("SELECT id, name FROM resource_servers WHERE id IN ?", rsIDs).Scan(&rsList)
 		rsNames := make(map[uuid.UUID]string, len(rsList))
 		for _, rs := range rsList {

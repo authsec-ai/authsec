@@ -22,6 +22,7 @@ func sessionRevoked(claims jwt.MapClaims) bool {
 		return false
 	}
 	var revoked bool
+	// TENANT-EXEMPT: checked by the token's unique jti before the tenant context is set
 	if err := conn.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM revoked_session_tokens WHERE jti = $1)`, jti).Scan(&revoked); err != nil {
 		log.Printf("auth: revocation check failed: %v", err)
 		return true // fail closed
@@ -46,6 +47,7 @@ func Logout(c *gin.Context) {
 	}
 	ws, _ := c.Get("workspace_id")
 	uid, _ := c.Get("user_id")
+	// TENANT-EXEMPT: the denylist row is keyed by jti and records the token's own workspace
 	_, err := config.GetDatabase().DB.Exec(`
 		INSERT INTO revoked_session_tokens (jti, workspace_id, user_id, expires_at, reason)
 		VALUES ($1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4, 'logout')

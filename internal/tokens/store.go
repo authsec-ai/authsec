@@ -66,6 +66,7 @@ func RevokeAccessToken(ctx context.Context, db *gorm.DB, iss, jti, reason string
 // Returns seen=true when the jti was ALREADY present (i.e. this is a replay →
 // caller must reject without minting). Intended to run inside the issuance tx.
 func MarkIDJAGSeen(tx *gorm.DB, iss, jti string, expiresAt time.Time) (seen bool, err error) {
+	// TENANT-EXEMPT: replay cache keyed by the assertion's (iss, jti), issuer-wide
 	res := tx.Exec(
 		`INSERT INTO id_jag_replay_cache (iss, jti, expires_at) VALUES (?, ?, ?) ON CONFLICT (iss, jti) DO NOTHING`,
 		iss, jti, expiresAt,
