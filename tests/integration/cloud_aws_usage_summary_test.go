@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -153,13 +154,21 @@ func TestUsageSummaryFiltersByConnector(t *testing.T) {
 	ws := newWorkspace(t, db, "ws-usage-conn")
 	defer cleanUsage(t, db, ws)
 
-	svc, _ := newOnboarding(db, okVerifier())
+	v := okVerifier()
+	svc, _ := newOnboarding(db, v)
 	a, _, err := svc.Onboard(context.Background(), ws, validInput(mustMint(t, ws)), "admin")
 	if err != nil {
 		t.Fatalf("onboard a: %v", err)
 	}
 	inB := validInput(mustMint(t, ws))
 	inB.RoleARN = "arn:aws:iam::210987654321:role/authsec-reader"
+	// STS must answer for B's own account: onboarding refuses a role whose
+	// ARN names a different account than the one it resolved to.
+	v.identity = &awsdiscovery.Identity{
+		AccountID: "210987654321",
+		ARN:       "arn:aws:sts::210987654321:assumed-role/authsec-reader/authsec-onboarding-b",
+		UserID:    "AROAEXAMPLEB:authsec-onboarding-b",
+	}
 	b, _, err := svc.Onboard(context.Background(), ws, inB, "admin")
 	if err != nil {
 		t.Fatalf("onboard b: %v", err)

@@ -287,8 +287,10 @@ func TestP2S2DeniedDescribeRegionsIsAClearError(t *testing.T) {
 	// AWS call.
 	plain := s2DiscoveryAPI(t, l, services.NewAWSOnboardingService(l.db, newMemVault()).WithVerifier(&stubVerifier{}))
 	code, body = plain.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
-	if code != http.StatusInternalServerError || errCode(body) != "internal" || digs(body, "error", "fault") != "authsec" {
-		t.Fatalf("GET regions with no AWS session possible = %d %v, want 500 internal", code, body)
+	// d45ebe8 names the AuthSec-side cause: the role's external ID could not
+	// be read (this vault holds none), still a 500 with fault=authsec.
+	if code != http.StatusInternalServerError || errCode(body) != "external_id_unreadable" || digs(body, "error", "fault") != "authsec" {
+		t.Fatalf("GET regions with no AWS session possible = %d %v, want 500 external_id_unreadable", code, body)
 	}
 	if code, body := plain.patchRegions(a.conn, "us-east-1"); code != http.StatusInternalServerError {
 		t.Fatalf("PATCH with no AWS session possible = %d %v, want 500", code, body)
