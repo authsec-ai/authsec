@@ -17,6 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -172,6 +173,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		// Check domain existence using a custom query
 		db := config.GetDatabase()
 		var count int
+		// TENANT-EXEMPT: pre-auth sign-up; workspace_domain is unique across the tenant registry.
 		err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 		if err != nil {
 			log.Printf("Error checking tenant domain: %v", err)
@@ -365,6 +367,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// that names an existing one (e.g. an end-user sign-up row from
 	// /user/register/initiate) must never make its email that workspace's
 	// owner/admin, so a conflict fails the whole registration.
+	// TENANT-EXEMPT: sign-up creates the tenant registry row (workspaces has no workspace_id).
 	res, err := tx.Exec(`
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'manual', 'active', NOW(), NOW())
@@ -382,19 +385,22 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Registration session is not valid for a new workspace. Please initiate registration again"})
 		return
 	}
+	// The workspace this sign-up just created, from the OTP-verified pending
+	// registration: the rest of its rows are written on the scoped layer.
+	wctx := database.WithWorkspace(c.Request.Context(), workspace.WorkspaceID)
 
 	// Phase E: the `projects` table was dropped. No project row is created;
 	// user identity is (workspace_id, email).
 
 	// Create user AFTER workspace is created
-	if err := uc.userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), workspace.WorkspaceID), tx, &user); err != nil {
+	if err := uc.userRepo.CreateUserTx(wctx, tx, &user); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create default client user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default client	user"})
 		return
 	}
 
-	adminRoleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), workspace.WorkspaceID), tx)
+	adminRoleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(wctx, tx)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to ensure admin role/permissions in main database: %v", err)
@@ -404,17 +410,23 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 
 	// Phase 6: workspace row was already inserted above (replacing the tenants insert).
 	// Patch owner_user_id now that the user row exists.
+	// TENANT-EXEMPT: the tenant registry row this sign-up created (workspaces has no workspace_id).
 	if _, err := tx.Exec(`UPDATE workspaces SET owner_user_id = $1 WHERE id = $2`, user.ID, workspace.WorkspaceID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to update workspace owner: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update workspace owner"})
 		return
 	}
-	if _, err := tx.Exec(`
+	// The membership, and the bindings below, take the role from the new
+	// workspace's roles. The user was created in this transaction, so it has
+	// no bindings yet.
+	if _, err := tenancy.ExecContext(wctx, tx, `
 		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'active', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
 		ON CONFLICT (workspace_id, user_id) DO NOTHING
-	`, uuid.New(), workspace.WorkspaceID, user.ID, adminRoleID); err != nil {
+	`, uuid.New(), user.ID, adminRoleID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace_membership: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace membership"})
@@ -422,14 +434,12 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	}
 
 	// Create workspace-wide admin role binding (user_roles is deprecated, use role_bindings)
-	if _, err := tx.Exec(`
+	if _, err := tenancy.ExecContext(wctx, tx, `
 		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-		SELECT $1, $2, $3, $4, NULL, NULL, NOW(), NOW()
-		WHERE NOT EXISTS (
-			SELECT 1 FROM role_bindings
-			WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
-		)
-	`, uuid.New(), workspace.WorkspaceID, user.ID, adminRoleID); err != nil {
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, NULL, NULL, NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
+	`, uuid.New(), user.ID, adminRoleID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create admin role binding in main database: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign admin role"})
@@ -438,7 +448,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	log.Printf("Successfully created admin role binding in main database for user: %s", user.Email)
 
 	// Create default role bindings in MAIN DB for admin across core services
-	if err := tx.QueryRow("SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1", workspace.WorkspaceID).Scan(&adminRoleID); err != nil {
+	if err := tenancy.QueryRowContext(wctx, tx, "SELECT id FROM roles WHERE workspace_id = $1 AND LOWER(name) = 'admin' LIMIT 1", nil, &adminRoleID); err != nil {
 		log.Printf("Failed to resolve admin role id for default bindings: %v", err)
 	} else {
 		services := []string{"external-service", "clients", "user-flow", "ooc-manager", "log-service", "hydra-service", "sdk-manager"}
@@ -447,14 +457,13 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 			usernameVal = *user.Username
 		}
 		for _, svc := range services {
-			if _, err := tx.Exec(`
+			// One binding per service, scoped to the workspace itself.
+			if _, err := tenancy.ExecContext(wctx, tx, `
 					INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
-					SELECT $1, $2, $3, $4, 'admin', $5, $6, $7, NOW(), NOW()
-					WHERE NOT EXISTS (
-						SELECT 1 FROM role_bindings
-						WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = $6 AND scope_id = $7
-					)
-				`, uuid.New(), workspace.WorkspaceID, user.ID, adminRoleID, usernameVal, svc, workspace.WorkspaceID); err != nil {
+					SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'admin', $5::text, $6::text, r.workspace_id, NOW(), NOW()
+					  FROM roles r
+					 WHERE r.workspace_id = $1 AND r.id = $4
+				`, uuid.New(), user.ID, adminRoleID, usernameVal, svc); err != nil {
 				tx.Rollback()
 				log.Printf("Failed to create role binding for service=%s tenant=%s user=%s role=%s: %v", svc, workspace.WorkspaceID, user.ID, adminRoleID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
@@ -462,14 +471,12 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 			}
 		}
 		// Add a wildcard binding to grant full access for the admin user.
-		if _, err := tx.Exec(`
+		if _, err := tenancy.ExecContext(wctx, tx, `
 				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
-				SELECT $1, $2, $3, $4, 'admin', $5, '*', NULL, NOW(), NOW()
-				WHERE NOT EXISTS (
-					SELECT 1 FROM role_bindings
-					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = '*' AND scope_id IS NULL
-				)
-			`, uuid.New(), workspace.WorkspaceID, user.ID, adminRoleID, usernameVal); err != nil {
+				SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'admin', $5::text, '*', NULL, NOW(), NOW()
+				  FROM roles r
+				 WHERE r.workspace_id = $1 AND r.id = $4
+			`, uuid.New(), user.ID, adminRoleID, usernameVal); err != nil {
 			tx.Rollback()
 			log.Printf("Failed to create wildcard role binding tenant=%s user=%s role=%s: %v", workspace.WorkspaceID, user.ID, adminRoleID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
@@ -513,6 +520,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 			log.Printf("WARN: PKI provisioning failed for workspace %s: %v", workspaceID, err)
 		} else {
 			log.Printf("PKI provisioned for workspace %s - Mount: %s", workspaceID, icpResp.PKIMount)
+			// TENANT-EXEMPT: the tenant registry row this sign-up created (workspaces has no workspace_id).
 			if _, err := db.Exec(`UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE id = $3`, icpResp.PKIMount, icpResp.CACert, workspaceID); err != nil {
 				log.Printf("WARN: Failed to update workspace with PKI info: %v", err)
 			}
@@ -759,9 +767,9 @@ func (uc *UserController) resolveLoginWorkspace(domain string) (*models.Tenant, 
 		return nil, fmt.Errorf("workspace_domain is required")
 	}
 	rows, err := config.GetDatabase().Query(`
-		SELECT id FROM workspaces WHERE LOWER(workspace_domain) = $1
+		SELECT id FROM workspaces WHERE LOWER(workspace_domain) = $1 -- TENANT-EXEMPT: pre-auth login resolves the workspace from its domain
 		UNION
-		SELECT workspace_id FROM workspace_domains WHERE LOWER(domain) = $1 AND is_verified = true
+		SELECT workspace_id FROM workspace_domains WHERE LOWER(domain) = $1 AND is_verified = true -- TENANT-EXEMPT: pre-auth login resolves the workspace from its domain
 		LIMIT 2`, domain)
 	if err != nil {
 		return nil, err
@@ -1115,6 +1123,7 @@ func (uc *UserController) AdminForgotPassword(c *gin.Context) {
 	// Check if admin user exists in main Tenant table using native query
 	db := config.GetDatabase()
 	var count int
+	// TENANT-EXEMPT: pre-auth forgot-password, looks the email up in the tenant registry.
 	err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE email = $1 AND status = $2 AND provider = $3",
 		input.Email, "active", "local").Scan(&count)
 	if err != nil || count == 0 {
@@ -1237,6 +1246,8 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}
 
 	tenantDB := config.DB
+	// The workspace whose registry row holds this OTP-verified email.
+	wctx := database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID)
 
 	// Find the corresponding user in the tenant database
 	var user models.User
@@ -1250,8 +1261,8 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 			  provider, provider_id, provider_data, avatar_url, active, mfa_enabled, mfa_method,
 			  mfa_default_method, mfa_enrolled_at, mfa_verified,
 			  created_at, updated_at
-			  FROM users WHERE email = $1 AND workspace_id = $2 AND provider = $3`
-	err = sqlDB.QueryRow(query, input.Email, tenant.WorkspaceID.String(), "local").Scan(
+			  FROM users WHERE workspace_id = $1 AND email = $2 AND provider = $3`
+	err = tenancy.QueryRowContext(wctx, sqlDB, query, []interface{}{input.Email, "local"},
 		&user.ID, &user.ClientID, &user.WorkspaceID, &user.ProjectID, &user.Name,
 		&user.Username, &user.Email, &user.PasswordHash, &user.WorkspaceDomain,
 		&user.Provider, &user.ProviderID, &user.ProviderData, &user.AvatarURL,
@@ -1301,6 +1312,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}()
 
 	// Update admin password in main Tenant table
+	// TENANT-EXEMPT: the tenant registry row resolved from the OTP-verified email (workspaces has no workspace_id).
 	updateQuery := `UPDATE workspaces SET password_hash = $1, updated_at = $2 WHERE id = $3`
 	if _, err := tx.Exec(updateQuery, hashedPassword, time.Now(), tenant.ID); err != nil {
 		tx.Rollback()
@@ -1311,8 +1323,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}
 
 	// Update password in tenant database User table as well
-	userUpdateQuery := `UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3`
-	if _, err := tenantTx.Exec(userUpdateQuery, hashedPassword, time.Now(), user.ID); err != nil {
+	if _, err := tenancy.ExecContext(wctx, tenantTx, `UPDATE users SET password_hash = $2, updated_at = $3 WHERE workspace_id = $1 AND id = $4`, hashedPassword, time.Now(), user.ID); err != nil {
 		tx.Rollback()
 		tenantTx.Rollback()
 		log.Printf("Failed to update admin password in User table: %v", err)
@@ -1425,6 +1436,8 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	log.Printf("[SECURITY] MFA verification confirmed for user: %s (tenant: %s)", tenant.Email, user.WorkspaceID.String())
 
 	tenantDB := config.DB
+	// Rows below are written for the user's workspace, on the scoped layer.
+	wctx := database.WithWorkspace(c.Request.Context(), tenant.WorkspaceID)
 
 	// Get the underlying SQL database connection
 	sqlDB, err := tenantDB.DB()
@@ -1436,14 +1449,16 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	// Handle credential storage if credential data is provided
 	if len(input.CredentialID) > 0 && len(input.PublicKey) > 0 {
 
-		// Insert credential into tenant database
-		credentialQuery := `
+		// Insert the credential for the user, in the user's workspace.
+		_, err = tenancy.ExecContext(wctx, sqlDB, `
 			INSERT INTO credentials (
-				client_id, credential_id, public_key, attestation_type,
+				workspace_id, client_id, credential_id, public_key, attestation_type,
 				aaguid, sign_count, transports, backup_eligible, backup_state
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		`
-		_, err = sqlDB.Exec(credentialQuery,
+			)
+			SELECT u.workspace_id, u.id, $3, $4, $5, $6, $7, $8, $9, $10
+			  FROM users u
+			 WHERE u.workspace_id = $1 AND u.id = $2
+		`,
 			user.ID,
 			input.CredentialID,
 			input.PublicKey,
@@ -1461,17 +1476,18 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 		}
 		log.Printf("WebAuthn credentials stored for user: %s", tenant.Email)
 
-		// Insert WebAuthn method into mfa_methods table
-		mfaMethodQuery := `
-			INSERT INTO mfa_methods (user_id, client_id, method_type, is_primary, verified, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		// Insert WebAuthn method into mfa_methods table, in the user's workspace.
+		now := time.Now()
+		_, err = tenancy.ExecContext(wctx, sqlDB, `
+			INSERT INTO mfa_methods (workspace_id, user_id, client_id, method_type, is_primary, verified, created_at, updated_at)
+			SELECT u.workspace_id, u.id, u.id, $3, $4, $5, $6, $7
+			  FROM users u
+			 WHERE u.workspace_id = $1 AND u.id = $2
 			ON CONFLICT (user_id, client_id, method_type) DO UPDATE SET
 				is_primary = EXCLUDED.is_primary,
 				verified = EXCLUDED.verified,
 				updated_at = EXCLUDED.updated_at
-		`
-		now := time.Now()
-		_, err = sqlDB.Exec(mfaMethodQuery, user.ID, user.ID, "webauthn", true, true, now, now)
+		`, user.ID, "webauthn", true, true, now, now)
 		if err != nil {
 			log.Printf("Failed to store WebAuthn MFA method: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store WebAuthn MFA method"})
@@ -1593,17 +1609,20 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 		return
 	}
 
+	// Every lookup below is in the user's workspace (the one it was found in).
+	wctx := database.WithWorkspace(c.Request.Context(), workspaceUUID)
+
 	// Query MFA methods from mfa_methods table
-	// Try with both user_id+client_id AND user_id only (fallback for OIDC users where client_id might vary)
-	mfaQuery := `
+	// Try with both user_id+client_id AND user_id only (fallback for OIDC users where client_id might vary);
+	// the user's workspace_id is workspaceUUID, the workspace it was looked up in.
+	log.Printf("DEBUG: Querying MFA methods for user_id=%s, client_id=%s, email=%s", user.ID, user.ClientID, input.Email)
+	rows, queryErr := tenancy.QueryContext(wctx, sqlDB, `
 		SELECT method_type, is_primary
 		FROM mfa_methods
-		WHERE user_id = $1 AND verified = true
-		  AND (client_id = $2 OR client_id = (SELECT workspace_id FROM users WHERE id = $1 LIMIT 1))
+		WHERE workspace_id = $1 AND user_id = $2 AND verified = true
+		  AND (client_id = $3 OR client_id = $1)
 		ORDER BY is_primary DESC, created_at ASC
-	`
-	log.Printf("DEBUG: Querying MFA methods for user_id=%s, client_id=%s, email=%s", user.ID, user.ClientID, input.Email)
-	rows, queryErr := sqlDB.Query(mfaQuery, user.ID, user.ClientID)
+	`, user.ID, user.ClientID)
 	if queryErr != nil {
 		log.Printf("Failed to query MFA methods: %v", queryErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check MFA status"})
@@ -1639,9 +1658,9 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 		log.Printf("DEBUG: No MFA methods found in mfa_methods table for user %s, checking legacy tables", input.Email)
 
 		// First, check for TOTP secrets (TOTP has priority because it's domain-independent)
-		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND workspace_id = $2 AND is_active = true`
 		var totpCount int
-		if err := sqlDB.QueryRow(totpQuery, user.ID, workspaceUUID).Scan(&totpCount); err == nil && totpCount > 0 {
+		if err := tenancy.QueryRowContext(wctx, sqlDB, `SELECT COUNT(*) FROM totp_secrets WHERE workspace_id = $1 AND user_id = $2 AND is_active = true`,
+			[]interface{}{user.ID}, &totpCount); err == nil && totpCount > 0 {
 			log.Printf("DEBUG: Found %d TOTP secrets for user %s", totpCount, input.Email)
 			// User has TOTP configured but not in mfa_methods table
 			mfaMethods = append(mfaMethods, map[string]interface{}{
@@ -1660,11 +1679,11 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 
 			// Check for credentials matching the current RP ID (domain)
 			// This ensures we only consider credentials registered on the current domain
-			credQuery := `SELECT COUNT(*) FROM credentials
-			              WHERE (user_id = $1 OR client_id = $2)
-			              AND (rp_id = $3 OR rp_id IS NULL)`
 			var credCount int
-			if err := sqlDB.QueryRow(credQuery, user.ID, user.ClientID, currentDomain).Scan(&credCount); err == nil && credCount > 0 {
+			if err := tenancy.QueryRowContext(wctx, sqlDB, `SELECT COUNT(*) FROM credentials
+			              WHERE workspace_id = $1 AND (user_id = $2 OR client_id = $3)
+			              AND (rp_id = $4 OR rp_id IS NULL)`,
+				[]interface{}{user.ID, user.ClientID, currentDomain}, &credCount); err == nil && credCount > 0 {
 				log.Printf("DEBUG: Found %d credentials for RP ID '%s' for user %s", credCount, currentDomain, input.Email)
 				// User has credentials registered but not in mfa_methods table - treat as WebAuthn enabled
 				mfaMethods = append(mfaMethods, map[string]interface{}{
@@ -1674,12 +1693,12 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 				defaultMFAMethod = "webauthn"
 			} else {
 				// Check if user has credentials on other domains
-				otherDomainsQuery := `SELECT COUNT(*) FROM credentials
-				                      WHERE (user_id = $1 OR client_id = $2)
-				                      AND rp_id IS NOT NULL
-				                      AND rp_id != $3`
 				var otherCredCount int
-				if err := sqlDB.QueryRow(otherDomainsQuery, user.ID, user.ClientID, currentDomain).Scan(&otherCredCount); err == nil && otherCredCount > 0 {
+				if err := tenancy.QueryRowContext(wctx, sqlDB, `SELECT COUNT(*) FROM credentials
+				                      WHERE workspace_id = $1 AND (user_id = $2 OR client_id = $3)
+				                      AND rp_id IS NOT NULL
+				                      AND rp_id != $4`,
+					[]interface{}{user.ID, user.ClientID, currentDomain}, &otherCredCount); err == nil && otherCredCount > 0 {
 					log.Printf("DEBUG: User %s has %d credentials on other domains but not on %s - requires re-registration",
 						input.Email, otherCredCount, currentDomain)
 					// User has credentials on other domains but not this one

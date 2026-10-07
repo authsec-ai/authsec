@@ -114,3 +114,29 @@ func Test_AdminScoped_InviteAndCancel(t *testing.T) {
 	assertCount(t, 1, "users", "id = ?", db.InviteeID)
 	assertCount(t, 1, "workspace_memberships", "user_id = ? AND workspace_id = ?", db.InviteeID, b.WS.WorkspaceID)
 }
+
+// The legacy /uflow/register/verify completion writes the new workspace's
+// owner, membership and role bindings (workspace-wide, one per core service
+// and a wildcard) on the scoped layer, all in the new workspace.
+func Test_AdminScoped_LegacyRegisterVerifyWritesInNewWorkspace(t *testing.T) {
+	env := testsupport.Get(t)
+	n := emailSafeNonce()
+	domain := n + ".test.local"
+	email := "owner@" + domain
+	w := env.Do("POST", "/authsec/uflow/auth/admin/register", map[string]string{
+		"email": email, "password": "Passw0rd!Passw0rd", "name": "Owner", "workspace_domain": n,
+	}, "")
+	assertStatus(t, w, http.StatusCreated)
+	otp := columnValue(t, "otp_entries", "otp", "email = ? ORDER BY created_at DESC LIMIT 1", email)
+	w = env.Do("POST", "/authsec/uflow/register/verify", map[string]string{"email": email, "otp": otp}, "")
+	assertStatus(t, w, http.StatusOK)
+
+	ws := uuid.MustParse(columnValue(t, "workspaces", "id", "workspace_domain = ?", domain))
+	uid := columnValue(t, "users", "id", "LOWER(email) = LOWER(?) AND workspace_id = ?", email, ws)
+	assertCount(t, 1, "workspaces", "id = ? AND owner_user_id = ?", ws, uid)
+	assertCount(t, 1, "workspace_memberships", "user_id = ? AND workspace_id = ? AND status = 'active'", uid, ws)
+	assertCount(t, 1, "role_bindings", "user_id = ? AND workspace_id = ? AND scope_type IS NULL", uid, ws)
+	assertCount(t, 7, "role_bindings", "user_id = ? AND workspace_id = ? AND scope_id = ? AND role_name = 'admin'", uid, ws, ws)
+	assertCount(t, 1, "role_bindings", "user_id = ? AND workspace_id = ? AND scope_type = '*' AND scope_id IS NULL", uid, ws)
+	assertCount(t, 0, "role_bindings", "user_id = ? AND workspace_id <> ?", uid, ws)
+}
