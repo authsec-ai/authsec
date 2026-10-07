@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -203,15 +204,20 @@ func adoptBareIDRow(tx *gorm.DB, w *models.CloudWorkload) error {
 	if bare == "" {
 		return nil
 	}
-	if err := tx.Exec(`DELETE FROM cloud_workload
-	                    WHERE workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ? AND native_id = ?
-	                      AND EXISTS (SELECT 1 FROM cloud_workload WHERE workspace_id = ? AND native_id = ?)`,
-		w.WorkspaceID, w.ConnectorID, w.RuntimeKind, w.Region, bare, w.WorkspaceID, w.NativeID).Error; err != nil {
+	ctx, q, err := txTenant(tx, w.WorkspaceID)
+	if err != nil {
 		return err
 	}
-	return tx.Exec(`UPDATE cloud_workload SET native_id = ?
-	                 WHERE workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ? AND native_id = ?`,
-		w.NativeID, w.WorkspaceID, w.ConnectorID, w.RuntimeKind, w.Region, bare).Error
+	if _, err := tenancy.ExecContext(ctx, q, `DELETE FROM cloud_workload
+	                    WHERE workspace_id = $1 AND connector_id = $2 AND runtime_kind = $3 AND region = $4 AND native_id = $5
+	                      AND EXISTS (SELECT 1 FROM cloud_workload WHERE workspace_id = $1 AND native_id = $6)`,
+		w.ConnectorID, w.RuntimeKind, w.Region, bare, w.NativeID); err != nil {
+		return err
+	}
+	_, err = tenancy.ExecContext(ctx, q, `UPDATE cloud_workload SET native_id = $2
+	                 WHERE workspace_id = $1 AND connector_id = $3 AND runtime_kind = $4 AND region = $5 AND native_id = $6`,
+		w.NativeID, w.ConnectorID, w.RuntimeKind, w.Region, bare)
+	return err
 }
 
 // legacyBareID is the bare id an earlier collector stored a row of this kind
