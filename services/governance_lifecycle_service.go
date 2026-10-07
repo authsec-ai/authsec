@@ -586,7 +586,7 @@ func (m *lifecycleManager) revokeBirthright(workspaceID uuid.UUID,
 		}); err != nil {
 			return err
 		}
-		tokens, err := m.repo.LiveTokenJTIsForSubject(prov.SubjectID, prov.SubjectType)
+		tokens, err := m.repo.LiveTokenJTIsForSubject(workspaceID, prov.SubjectID, prov.SubjectType)
 		if err != nil {
 			return err
 		}
@@ -595,7 +595,7 @@ func (m *lifecycleManager) revokeBirthright(workspaceID uuid.UUID,
 				return err
 			}
 		}
-		return m.repo.DeleteRoleBindingTx(tx, bindingID)
+		return m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID)
 	})
 }
 
@@ -665,7 +665,7 @@ func (m *lifecycleManager) processLeaver(workspaceID uuid.UUID, u *userState,
 			}); cerr != nil {
 				return cerr
 			}
-			return m.repo.DeleteRoleBindingTx(tx, bindingID)
+			return m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID)
 		})
 		if err != nil {
 			return fmt.Errorf("revoke binding %s: %w", bindingID, err)
@@ -676,7 +676,7 @@ func (m *lifecycleManager) processLeaver(workspaceID uuid.UUID, u *userState,
 	// Kill live tokens once, after the bindings are gone. Introspection treats
 	// revoked_tokens as authoritative, so this is what makes the revocation immediate
 	// rather than "when their current token expires".
-	tokens, err := m.repo.LiveTokenJTIsForSubject(u.ID, models.ProvenanceSubjectUser)
+	tokens, err := m.repo.LiveTokenJTIsForSubject(workspaceID, u.ID, models.ProvenanceSubjectUser)
 	if err != nil {
 		return err
 	}

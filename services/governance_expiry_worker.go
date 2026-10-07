@@ -156,13 +156,13 @@ func (w *ExpiryWorker) revokeLapsed(p *models.EntitlementProvenance, res *Expiry
 
 		// Kill live tokens riding the lapsed grant. This is the window that read-time
 		// expiry filtering cannot close on its own.
-		n, err := w.revokeSubjectTokens(tx, p.SubjectID, p.SubjectType, "entitlement expired")
+		n, err := w.revokeSubjectTokens(tx, p.WorkspaceID, p.SubjectID, p.SubjectType, "entitlement expired")
 		if err != nil {
 			return err
 		}
 		res.TokensRevoked += n
 
-		if err := w.repo.DeleteRoleBindingTx(tx, bindingID); err != nil {
+		if err := w.repo.DeleteRoleBindingTx(tx, p.WorkspaceID, bindingID); err != nil {
 			return err
 		}
 		res.BindingsRemoved++
@@ -180,13 +180,13 @@ func (w *ExpiryWorker) revokeOrphan(b repositories.ExpiredBinding, res *ExpirySw
 	}
 
 	return w.repo.DB().Transaction(func(tx *gorm.DB) error {
-		n, err := w.revokeSubjectTokens(tx, subjectID, subjectType, "entitlement expired")
+		n, err := w.revokeSubjectTokens(tx, b.WorkspaceID, subjectID, subjectType, "entitlement expired")
 		if err != nil {
 			return err
 		}
 		res.TokensRevoked += n
 
-		if err := w.repo.DeleteRoleBindingTx(tx, b.ID); err != nil {
+		if err := w.repo.DeleteRoleBindingTx(tx, b.WorkspaceID, b.ID); err != nil {
 			return err
 		}
 		res.OrphansRemoved++
@@ -204,13 +204,13 @@ func (w *ExpiryWorker) revokeOrphan(b repositories.ExpiredBinding, res *ExpirySw
 // the whole failure this closes. The cost is that a subject holding several grants
 // re-authenticates when any one of them lapses — acceptable for tokens with a
 // one-hour life, and it errs toward less access (PG-5).
-func (w *ExpiryWorker) revokeSubjectTokens(tx *gorm.DB, subjectID uuid.UUID, subjectType, reason string) (int, error) {
+func (w *ExpiryWorker) revokeSubjectTokens(tx *gorm.DB, ws, subjectID uuid.UUID, subjectType, reason string) (int, error) {
 	// native_tokens.subject_type only ever holds 'user' or 'service_account'. A group
 	// is not a token subject, so there is nothing to revoke for one.
 	if subjectType != models.ProvenanceSubjectUser && subjectType != models.ProvenanceSubjectServiceAccount {
 		return 0, nil
 	}
-	tokens, err := w.repo.LiveTokenJTIsForSubject(subjectID, subjectType)
+	tokens, err := w.repo.LiveTokenJTIsForSubject(ws, subjectID, subjectType)
 	if err != nil {
 		return 0, err
 	}

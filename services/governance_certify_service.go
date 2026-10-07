@@ -687,7 +687,7 @@ func (m *certifyManager) executeRevocation(workspaceID uuid.UUID, item *models.C
 			}
 			// Kill live tokens too: leaving them would keep the revoked access working
 			// for up to their remaining lifetime.
-			tokens, err := m.repo.LiveTokenJTIsForSubject(p.SubjectID, p.SubjectType)
+			tokens, err := m.repo.LiveTokenJTIsForSubject(workspaceID, p.SubjectID, p.SubjectType)
 			if err != nil {
 				return err
 			}
@@ -696,7 +696,7 @@ func (m *certifyManager) executeRevocation(workspaceID uuid.UUID, item *models.C
 					return err
 				}
 			}
-			return m.repo.DeleteRoleBindingTx(tx, bindingID)
+			return m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID)
 		})
 	}
 

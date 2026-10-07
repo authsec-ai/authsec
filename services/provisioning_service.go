@@ -567,7 +567,7 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 				if closed {
 					res.ProvenanceClosed++
 				}
-				if derr := m.repo.DeleteRoleBindingTx(tx, bindingID); derr != nil {
+				if derr := m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID); derr != nil {
 					return fmt.Errorf("delete binding %s: %w", bindingID, derr)
 				}
 				res.BindingsRemoved++
@@ -577,7 +577,7 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 			// rather than eventual: introspection treats revoked_tokens as
 			// authoritative, so without this the agent keeps working until its current
 			// token expires (up to an hour for native M2M).
-			tokens, terr := m.repo.LiveTokenJTIsForSubject(sa.ID, models.ProvenanceSubjectServiceAccount)
+			tokens, terr := m.repo.LiveTokenJTIsForSubject(workspaceID, sa.ID, models.ProvenanceSubjectServiceAccount)
 			if terr != nil {
 				return fmt.Errorf("list live tokens for anchor %s: %w", sa.ID, terr)
 			}
