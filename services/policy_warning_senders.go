@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
 	"net/http"
 	"time"
 
@@ -121,7 +122,8 @@ func (s *HTTPWarningSender) Send(w *models.AgentPolicyWarning, b WarningBody) er
 		// A customer endpoint that hangs must not hold the delivery worker. Ten
 		// seconds is generous for a webhook and short enough that one bad endpoint
 		// cannot stall the queue behind it.
-		client = &http.Client{Timeout: 10 * time.Second}
+		// The endpoint is customer-supplied: SSRF-safe client (AS-042).
+		client = safehttp.New(10 * time.Second)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, b.WebhookURL, bytes.NewReader(body))

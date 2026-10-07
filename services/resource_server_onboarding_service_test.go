@@ -15,7 +15,10 @@ import (
 )
 
 func TestValidateResourceServerAllowsDCRWithoutPreRegisteredClients(t *testing.T) {
-	t.Parallel()
+	// The resource server is an httptest server on loopback, which the
+	// SSRF-safe client refuses unless loopback is explicitly allowed.
+	// (t.Setenv cannot be combined with t.Parallel.)
+	t.Setenv("MCP_ALLOW_LOOPBACK", "true")
 
 	db := newOnboardingTestDB(t)
 	svc := NewResourceServerOnboardingService(db)

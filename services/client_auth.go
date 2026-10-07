@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
 	"io"
 	"log"
 	"math/big"
@@ -603,7 +604,8 @@ func ProbeSpiffeOIDC() (string, error) {
 }
 
 func fetchURL(u string) ([]byte, error) {
-	resp, err := http.Get(u) //nolint:noctx
+	// Tenants choose these URLs: fetch through the SSRF-safe client (AS-042).
+	resp, err := safehttp.Client().Get(u) //nolint:noctx
 	if err != nil {
 		return nil, err
 	}

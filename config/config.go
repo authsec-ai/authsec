@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
 	"log"
 	"net/url"
 	"os"
@@ -261,6 +262,8 @@ func LoadConfig() *Config {
 
 	// SPIFFE / SVID OIDC
 	spiffeOIDCIssuer := getEnv("SPIFFE_OIDC_ISSUER", "")
+	// Operator-configured, so it may live on a private address.
+	safehttp.TrustOperatorURL(spiffeOIDCIssuer)
 	spiffeJWKSKeyID := getEnv("SPIFFE_JWKS_KEY_ID", "")
 	spiffeRSAPrivateKeyB64 := getEnv("SPIFFE_RSA_PRIVATE_KEY_B64", "")
 	spiffeTrustDomain := getEnv("SPIFFE_TRUST_DOMAIN", "")
