@@ -412,16 +412,32 @@ func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, clusterPrefix, table, s
 
 		// A grant hangs off its assignment, so ending the assignment must end
 		// the grant too -- otherwise the path survives its own authorization.
+		//
+		// Driven from THIS cluster's live grants, looking each one's assignment
+		// up by id -- never from "every ended assignment of the workspace". The
+		// old IN (SELECT id ... WHERE state = 'ended') read every ended
+		// assignment of every provider (AWS keeps its history there too) twice
+		// per sweep, to find the few this cluster's grants point at. The
+		// scalar subquery is deliberately not an IN/EXISTS: Postgres does not
+		// flatten it into a join, so it is always one probe of the (workspace_id,
+		// id) unique index per candidate grant, whatever the planner thinks of
+		// the table's size. Semantics are unchanged: a grant of this cluster
+		// whose assignment exists and is ended is ended; the assignment is
+		// additionally required to be a Kubernetes binding of the same cluster,
+		// which every assignment a Kubernetes grant points at is (the projector
+		// resolves it by this cluster's binding key).
 		if err := tx.Exec(`
-			UPDATE iga_access_edges
+			UPDATE iga_access_edges e
 			   SET state = ?, valid_to = ?, ended_reason = ?
-			 WHERE workspace_id = ? AND provider = ? AND state <> ?
+			 WHERE e.workspace_id = ? AND e.provider = ? AND e.state <> ?
 			   AND `+edgeScope+`
-			   AND assignment_id IN (
-			         SELECT id FROM iga_policy_assignment
-			          WHERE workspace_id = ? AND state = ?)`,
+			   AND e.assignment_id IS NOT NULL
+			   AND (SELECT a.state FROM iga_policy_assignment a
+			         WHERE a.workspace_id = e.workspace_id AND a.id = e.assignment_id
+			           AND a.assignment_kind IN ?
+			           AND left(a.source_key, ?) = ?) = ?`,
 			args([]any{models.RelEnded, at, reason, ws, models.ProviderK8s, models.RelEnded},
-				edgeArgs, []any{ws, models.RelEnded})...).Error; err != nil {
+				edgeArgs, []any{K8sAssignmentKinds}, edgeArgs, []any{models.RelEnded})...).Error; err != nil {
 			return fmt.Errorf("cascade grants via assignment from %s: %w", table, err)
 		}
 	}
@@ -540,3 +556,9 @@ func RetireSource(tx *gorm.DB, workspaceID, sourceID uuid.UUID, at time.Time) (i
 	}
 	return retired, nil
 }
+
+// K8sAssignmentKinds are the assignment kinds a Kubernetes sweep writes:
+// iga_policy_assignment has no provider column, and these are how the schema
+// itself tells a Kubernetes binding from an AWS attachment
+// (iga_pa_confirm_provider_chk).
+var K8sAssignmentKinds = []string{models.K8sAssignmentRoleBinding, models.K8sAssignmentClusterRoleBinding}

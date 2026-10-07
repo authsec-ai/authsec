@@ -3,11 +3,15 @@ package services
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -94,6 +98,9 @@ type K8sRBACResult struct {
 	// Unanchored counts workloads whose ServiceAccount could not be resolved.
 	// A gap in the answer, reported rather than rendered as "no access".
 	Unanchored int `json:"unanchored"`
+	// SweepsPruned is how many old sweep rows of this cluster were deleted
+	// after the projection (pruneSweeps). Omitted when none.
+	SweepsPruned int `json:"sweeps_pruned,omitempty"`
 }
 
 // ErrClusterUIDMismatch rejects a snapshot whose cluster UID differs from the
@@ -102,6 +109,40 @@ type K8sRBACResult struct {
 // other, and a complete sweep from either would end the other's rows. The
 // controller maps it to 409 cluster_uid_mismatch; nothing is written.
 var ErrClusterUIDMismatch = errors.New("cluster_uid_mismatch")
+
+// ErrSweepConflict reports that another sweep of the same (workspace, source,
+// cluster) took this sweep's generation first: two snapshots of one cluster
+// were projected at once, and this one lost. Its transaction is rolled back
+// whole -- nothing it read is written -- and it is RETRYABLE: the agent sends
+// its next snapshot on its next cycle, which is projected on top of the
+// winner's. The controller maps it to 409 sweep_conflict.
+var ErrSweepConflict = errors.New("sweep_conflict")
+
+// sweepGenerationKey is the unique constraint two racing sweeps collide on.
+const sweepGenerationKey = "iga_k8s_sweep_generation_key"
+
+// isSweepGenerationConflict is a unique violation (23505) on the sweep
+// generation key specifically; any other violation is the error it is.
+func isSweepGenerationConflict(err error) bool {
+	return sqlState(err) == "23505" && strings.Contains(err.Error(), sweepGenerationKey)
+}
+
+// SweepHistoryEnv sets how many projected sweeps are kept per (workspace,
+// source, cluster); see pruneSweeps. Unset, unparsable or below 1 means
+// DefaultSweepHistory.
+const SweepHistoryEnv = "IGA_K8S_SWEEP_HISTORY"
+
+// DefaultSweepHistory is the projected sweeps kept per cluster by default:
+// about five days of six-hourly sweeps.
+const DefaultSweepHistory = 20
+
+func sweepHistoryFromEnv() int {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(SweepHistoryEnv)))
+	if err != nil || n < 1 {
+		return DefaultSweepHistory
+	}
+	return n
+}
 
 // sweepRef is one accepted sweep's authority to write and to close rows.
 type sweepRef struct {
@@ -113,11 +154,15 @@ type sweepRef struct {
 type k8sRBACManager struct {
 	db   *gorm.DB
 	gate *GraphProjectionGate
+	// keepSweeps is how many projected sweeps pruneSweeps keeps per
+	// (workspace, source, cluster).
+	keepSweeps int
 }
 
-// NewK8sRBACManager builds the manager.
+// NewK8sRBACManager builds the manager. The sweep history it keeps is read
+// from SweepHistoryEnv.
 func NewK8sRBACManager(db *gorm.DB, gate *GraphProjectionGate) K8sRBACManager {
-	return &k8sRBACManager{db: db, gate: gate}
+	return &k8sRBACManager{db: db, gate: gate, keepSweeps: sweepHistoryFromEnv()}
 }
 
 func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
@@ -174,12 +219,17 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 
 	err := m.db.Transaction(func(tx *gorm.DB) error {
 		var ref *sweepRef
+		// The cluster UID the source recorded first, "" when it has none: what
+		// decides which sightings are this cluster's (loadSightings).
+		var recordedUID string
 		if sourceID != uuid.Nil {
 			// Before anything is written: a snapshot from a different cluster
 			// that shares this one's name is refused, not merged.
-			if err := m.claimClusterUID(tx, workspaceID, sourceID, snap.ClusterUID); err != nil {
+			have, err := m.claimClusterUID(tx, workspaceID, sourceID, snap.ClusterUID)
+			if err != nil {
 				return err
 			}
+			recordedUID = have
 			r, err := m.openSweep(tx, workspaceID, sourceID, cluster, snap, observed)
 			if err != nil {
 				return fmt.Errorf("open sweep: %w", err)
@@ -236,7 +286,7 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		// Workloads: who RUNS as these identities. The RBAC sweep never lists a
 		// Pod, so this comes from the discovered-agent inventory and joins on
 		// the anchor both sides already spell identically.
-		sight, err := m.loadSightings(tx, workspaceID, cluster)
+		sight, err := m.loadSightings(tx, workspaceID, cluster, sourceID, recordedUID)
 		if err != nil {
 			return fmt.Errorf("load sightings: %w", err)
 		}
@@ -292,47 +342,136 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 				"projected_at": observed,
 			}).Error
 	})
+	if errors.Is(err, ErrClusterUIDMismatch) {
+		// Refused and rolled back; the conflict is recorded on the connection
+		// afterwards, outside the failed transaction, so the console sees it.
+		if rerr := repositories.RecordClusterUIDConflict(m.db, workspaceID, sourceID,
+			strings.TrimSpace(snap.ClusterUID), "RBAC snapshot"); rerr != nil {
+			log.Printf("[k8s-rbac] could not record the cluster uid conflict on source %s: %v", sourceID, rerr)
+		}
+		return nil, err
+	}
+	if isSweepGenerationConflict(err) {
+		// The loser of two concurrent sweeps of one cluster: it waited on the
+		// winner's generation and found it taken. Rolled back whole.
+		return nil, fmt.Errorf("%w: another sweep of cluster %q from source %s was projected "+
+			"concurrently and took this sweep's generation; nothing from this snapshot was "+
+			"written, send it again", ErrSweepConflict, cluster, sourceID)
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	// History is pruned AFTER the commit and in its own transaction: the
+	// projection is the work that matters, and a prune that fails (or waits on
+	// a lock) must never undo it. The next sweep prunes again.
+	if sourceID != uuid.Nil {
+		if n, perr := m.pruneSweeps(workspaceID, sourceID, cluster); perr != nil {
+			log.Printf("[k8s-rbac] could not prune sweep history of cluster %q (source %s): %v",
+				cluster, sourceID, perr)
+		} else {
+			res.SweepsPruned = n
+		}
 	}
 	return res, nil
 }
 
-// claimClusterUID compares the snapshot's cluster UID with its source's.
+// pruneSweeps deletes old sweep rows of one (workspace, source, cluster),
+// keeping:
 //
-// The source records the first UID it is shown (when it has none), and any
-// later snapshot carrying a different one is refused with
-// ErrClusterUIDMismatch. A snapshot with no UID -- an agent that cannot read
-// kube-system, or one that predates the field -- is accepted as before: absence
-// is not evidence of a different cluster.
+//   - the newest keepSweeps PROJECTED sweeps, by generation. The newest is what
+//     every reader reports a cluster's coverage from (k8sread.latestSweep,
+//     LatestProjectedSweeps, the cross-provider issuer match), and the count is
+//     at least 1, so that one is never touched;
+//   - every sweep still named by a last_confirmed_sweep_id on a support row,
+//     an assignment or a grant -- the three tables that can name one. A stale
+//     or ended row keeps the sweep that last saw it, because the inventory's
+//     as_of reads that sweep's observed_at (igaread asOfLateral). iga_relationship
+//     has no last_confirmed_sweep_id (its reconciler reads last_confirmed_at),
+//     so it holds no sweep;
+//   - every sweep that is not projected: a 'received' row only exists inside
+//     its own transaction, and a 'failed' one is evidence an operator needs.
+//
+// WHY NOT LEAN ON ON DELETE SET NULL. The foreign keys from those three tables
+// would null the reference rather than fail, and reconciliation would survive
+// it: the reconciler compares last_confirmed_sweep_id only with the CURRENT
+// sweep's id (IS DISTINCT FROM), which NULL and an older id both are, and it
+// fences on last_confirmed_at, which no prune touches. But NULL is also what
+// "no sweep ever confirmed this" means -- a sighting's own support, an adopted
+// row -- and what the as_of read renders as unknown, so nulling it would erase
+// a true fact. Keeping the referenced sweeps costs a few rows per cluster; the
+// FKs' SET NULL then never fires, because nothing deleted is referenced.
+//
+// Returns how many sweeps were deleted.
+func (m *k8sRBACManager) pruneSweeps(workspaceID, sourceID uuid.UUID, cluster string) (int, error) {
+	r := m.db.Exec(`
+		DELETE FROM iga_k8s_sweep o
+		 WHERE o.id IN (
+		         SELECT w.id FROM iga_k8s_sweep w
+		          WHERE w.workspace_id = ? AND w.discovery_source_id = ? AND w.cluster = ?
+		            AND w.status = ?
+		          ORDER BY w.generation DESC
+		         OFFSET ?)
+		   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
+		                    WHERE s.workspace_id = o.workspace_id
+		                      AND s.last_confirmed_sweep_id = o.id)
+		   AND NOT EXISTS (SELECT 1 FROM iga_policy_assignment a
+		                    WHERE a.workspace_id = o.workspace_id
+		                      AND a.last_confirmed_sweep_id = o.id)
+		   AND NOT EXISTS (SELECT 1 FROM iga_access_edges e
+		                    WHERE e.workspace_id = o.workspace_id
+		                      AND e.last_confirmed_sweep_id = o.id)`,
+		workspaceID, sourceID, cluster, models.K8sSweepProjected, m.keep())
+	return int(r.RowsAffected), r.Error
+}
+
+// keep is keepSweeps, never below 1: the newest projected sweep is the one
+// every reader reports from.
+func (m *k8sRBACManager) keep() int {
+	if m.keepSweeps < 1 {
+		return DefaultSweepHistory
+	}
+	return m.keepSweeps
+}
+
+// claimClusterUID compares the snapshot's cluster UID with its source's, and
+// returns the UID the source has recorded ("" when none).
+//
+// The source records the FIRST UID it is shown (when it has none) -- here, or
+// from a heartbeat (UpsertSelfRegistration), which keeps the first UID too and
+// never overwrites it -- and any later snapshot carrying a different one is
+// refused with ErrClusterUIDMismatch. The only way to change a source's UID is
+// to delete the connection and let the agent register again. A snapshot with
+// no UID -- an agent that cannot read kube-system, or one that predates the
+// field -- is accepted as before: absence is not evidence of a different
+// cluster.
 //
 // The conditional UPDATE takes the source row's lock, so two clusters racing
 // to record their UID cannot both win: the second waits, finds the first's,
 // and is refused.
 func (m *k8sRBACManager) claimClusterUID(tx *gorm.DB, workspaceID, sourceID uuid.UUID,
-	uid string) error {
+	uid string) (string, error) {
 
 	uid = strings.TrimSpace(uid)
-	if uid == "" {
-		return nil
-	}
-	if err := tx.Exec(`UPDATE discovery_sources SET cluster_uid = ?
-	    WHERE workspace_id = ? AND id = ? AND cluster_uid = ''`,
-		uid, workspaceID, sourceID).Error; err != nil {
-		return fmt.Errorf("record cluster uid: %w", err)
+	if uid != "" {
+		if err := tx.Exec(`UPDATE discovery_sources SET cluster_uid = ?
+		    WHERE workspace_id = ? AND id = ? AND cluster_uid = ''`,
+			uid, workspaceID, sourceID).Error; err != nil {
+			return "", fmt.Errorf("record cluster uid: %w", err)
+		}
 	}
 	var have string
 	if err := tx.Table("discovery_sources").Select("cluster_uid").
 		Where("workspace_id = ? AND id = ?", workspaceID, sourceID).
 		Scan(&have).Error; err != nil {
-		return fmt.Errorf("read cluster uid: %w", err)
+		return "", fmt.Errorf("read cluster uid: %w", err)
 	}
-	if have != uid {
-		return fmt.Errorf("%w: snapshot is from cluster %q but discovery source %s belongs to "+
+	if uid != "" && have != uid {
+		return have, fmt.Errorf("%w: snapshot is from cluster %q but discovery source %s belongs to "+
 			"cluster %q; two clusters are installed under one cluster name",
 			ErrClusterUIDMismatch, uid, sourceID, have)
 	}
-	return nil
+	return have, nil
 }
 
 // resolveSource finds the evidence stream this snapshot belongs to.
@@ -438,6 +577,50 @@ func (m *k8sRBACManager) idsBySourceKey(tx *gorm.DB, workspaceID uuid.UUID,
 	out := make(map[string]uuid.UUID, len(rows))
 	for _, r := range rows {
 		out[r.SourceKey] = r.ID
+	}
+	return out, nil
+}
+
+// idsForKeys is idsBySourceKey narrowed to the given keys: the live row of each
+// key that exists, and nothing else.
+//
+// A single sighting references one workload and at most one ServiceAccount.
+// Resolving those through idsBySourceKey read every Kubernetes identity (or
+// workload) of the workspace -- thousands of rows on a large cluster -- for
+// every sighting the webhook reports. The (workspace_id, source_key) prefix of
+// the table's partial live unique index answers this directly.
+func (m *k8sRBACManager) idsForKeys(tx *gorm.DB, workspaceID uuid.UUID,
+	table string, keys []string) (map[string]uuid.UUID, error) {
+
+	out := make(map[string]uuid.UUID, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	// In batches: a sweep of a large cluster passes every workload key, and
+	// one statement must stay well inside Postgres's bind-parameter limit.
+	const batch = 1000
+	for start := 0; start < len(keys); start += batch {
+		end := start + batch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var rows []struct {
+			ID        uuid.UUID
+			SourceKey string
+		}
+		// The live predicate is spelled as the index spells it
+		// (liveByLifecycle), so the planner can match the partial index.
+		if err := tx.Table(table).
+			Select("id, source_key").
+			Where("workspace_id = ? AND source_key IN ? AND provider = ?",
+				workspaceID, keys[start:end], models.ProviderK8s).
+			Where(liveByLifecycle).
+			Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			out[r.SourceKey] = r.ID
+		}
 	}
 	return out, nil
 }
@@ -1037,25 +1220,47 @@ func (m *k8sRBACManager) upsertSupport(tx *gorm.DB, workspaceID uuid.UUID, ref *
 
 /* ------------------------------- workloads -------------------------------- */
 
-// loadSightings reads the discovered agents belonging to one cluster.
+// loadSightings reads the discovered agents belonging to one cluster -- and,
+// when the sweep is attributed, to its discovery source.
 //
 // The cluster and namespace live in metadata, spelled exactly as the agent
 // policy selector reads them (agent_policy_service.go) -- the same two paths,
 // because two spellings of "which cluster is this in" would silently split the
 // inventory in half.
 //
+// SCOPED BY SOURCE WHERE THE SIGHTING SAYS WHICH. A cluster name is not an
+// identity: two clusters may be installed under one name, each with its own
+// connection. A sighting that carries a discovery_source_id is projected only
+// by THAT source's sweep, so one cluster's sweep never confirms (or, missing
+// it, never ends support for) a workload another cluster's agent reported.
+// What remains name-based, because nothing better is recorded:
+//   - a sighting with no discovery_source_id (an agent that predates
+//     self-registration, or one that reported before registering) is still
+//     matched by cluster name alone, by any source of that name;
+//   - an unattributed sweep (sourceID Nil) matches by name, as before;
+//   - graph keys themselves (k8s<sep>cluster<sep>...) embed the cluster NAME, so
+//     two same-name clusters still share identity, role and workload rows --
+//     only their support and edges are kept apart, by partition.
+//
+// AND BY CLUSTER UID WHERE BOTH SIDES STATE ONE. A sighting carries the
+// cluster's kube-system UID in metadata.cluster.uid (agents from chart 0.4.1);
+// when it and the source's recorded UID are both known, the UID decides: a
+// sighting from another UID is never this source's, whatever name or source
+// id it carries. Either side empty falls back to the rules above.
+//
 // Only the Kubernetes webhook's sightings: the fingerprint that keys a workload
 // is unique per (workspace, source), so another source's row could otherwise
 // claim the same key.
 func (m *k8sRBACManager) loadSightings(tx *gorm.DB, workspaceID uuid.UUID,
-	cluster string) ([]k8sgraph.WorkloadSighting, error) {
-	return m.loadSightingsWhere(tx, workspaceID, cluster, "")
+	cluster string, sourceID uuid.UUID, recordedUID string) ([]k8sgraph.WorkloadSighting, error) {
+	return m.loadSightingsWhere(tx, workspaceID, cluster, sourceID, recordedUID, "")
 }
 
 // loadSightingsWhere is loadSightings, narrowed to one fingerprint when
-// fingerprint is not empty.
+// fingerprint is not empty. sourceID Nil does not narrow by source, and
+// recordedUID "" does not narrow by cluster UID.
 func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
-	cluster, fingerprint string) ([]k8sgraph.WorkloadSighting, error) {
+	cluster string, sourceID uuid.UUID, recordedUID, fingerprint string) ([]k8sgraph.WorkloadSighting, error) {
 
 	var rows []k8sgraph.WorkloadSighting
 	q := tx.Table("discovered_agents").
@@ -1069,6 +1274,12 @@ func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
 		        archetype`).
 		Where("workspace_id = ? AND source = ? AND metadata->'cluster'->>'name' = ?",
 			workspaceID, models.DiscoverySourceK8sWebhook, cluster)
+	if sourceID != uuid.Nil {
+		q = q.Where("(discovery_source_id = ? OR discovery_source_id IS NULL)", sourceID)
+	}
+	if recordedUID != "" {
+		q = q.Where("COALESCE(metadata->'cluster'->>'uid', '') IN ('', ?)", recordedUID)
+	}
 	if fingerprint != "" {
 		q = q.Where("fingerprint = ?", fingerprint)
 	}
@@ -1092,18 +1303,27 @@ func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
 // that is GONE is retired here, as the snapshot path does, because that is a
 // positive observation rather than an absence.
 //
-// A sighting that names no cluster cannot be attributed and is left alone.
+// A sighting that names no cluster cannot be attributed and is left alone. A
+// sighting whose metadata.cluster.uid differs from the UID its source recorded
+// first is not projected at all (ErrClusterUIDMismatch, conflict recorded on
+// the source); the caller has already stored it in the inventory.
+//
+// It reads only the rows the sighting can reference -- its own workload and
+// the ServiceAccount it runs as (idsForKeys) -- never every Kubernetes
+// identity of the workspace.
 func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint string) error {
 	if m.gate == nil || !m.gate.Enabled() || strings.TrimSpace(fingerprint) == "" {
 		return nil
 	}
 
 	var meta struct {
-		Cluster  string
-		SourceID *uuid.UUID
+		Cluster    string
+		ClusterUID string
+		SourceID   *uuid.UUID
 	}
 	err := m.db.Table("discovered_agents").
 		Select(`COALESCE(metadata->'cluster'->>'name', '') AS cluster,
+		        COALESCE(metadata->'cluster'->>'uid', '') AS cluster_uid,
 		        discovery_source_id AS source_id`).
 		Where("workspace_id = ? AND source = ? AND fingerprint = ?",
 			workspaceID, models.DiscoverySourceK8sWebhook, fingerprint).
@@ -1126,15 +1346,48 @@ func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint stri
 		probe.DiscoverySourceID = meta.SourceID.String()
 	}
 	sourceID := m.resolveSource(workspaceID, probe, cluster)
+
+	// A sighting from a cluster other than the one its source recorded first
+	// is kept in the inventory (the caller already stored it) but is not
+	// projected: attributing it to this source would put one cluster's
+	// workload in the other's graph. The conflict is recorded on the
+	// connection for the console. Either UID empty: no claim, projected as
+	// before.
+	if uid := strings.TrimSpace(meta.ClusterUID); uid != "" && sourceID != uuid.Nil {
+		var recorded string
+		if err := m.db.Table("discovery_sources").Select("cluster_uid").
+			Where("workspace_id = ? AND id = ?", workspaceID, sourceID).
+			Scan(&recorded).Error; err != nil {
+			return fmt.Errorf("read source cluster uid: %w", err)
+		}
+		if recorded != "" && recorded != uid {
+			if rerr := repositories.RecordClusterUIDConflict(m.db, workspaceID, sourceID,
+				uid, "sighting"); rerr != nil {
+				log.Printf("[k8s-rbac] could not record the cluster uid conflict on source %s: %v",
+					sourceID, rerr)
+			}
+			return fmt.Errorf("%w: sighting %s is from cluster %q but discovery source %s belongs to "+
+				"cluster %q; kept in the inventory, not projected into the graph",
+				ErrClusterUIDMismatch, fingerprint, uid, sourceID, recorded)
+		}
+	}
 	observed := time.Now().UTC().Truncate(time.Microsecond)
 
 	return m.db.Transaction(func(tx *gorm.DB) error {
-		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, fingerprint)
+		// By fingerprint, which names one row; the source this sighting
+		// belongs to is the one resolved above.
+		sight, err := m.loadSightingsWhere(tx, workspaceID, cluster, uuid.Nil, "", fingerprint)
 		if err != nil {
 			return fmt.Errorf("load sighting: %w", err)
 		}
 		wres := k8sgraph.ProjectWorkloads(cluster, sight)
-		identityIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_identity_accounts")
+		// Only the ServiceAccount(s) this sighting can run as -- its observed
+		// or configured anchor -- not every identity of the workspace.
+		idKeys := make([]string, 0, len(wres.ExecutesAs))
+		for _, e := range wres.ExecutesAs {
+			idKeys = append(idKeys, e.IdentityKey)
+		}
+		identityIDs, err := m.idsForKeys(tx, workspaceID, "iga_identity_accounts", idKeys)
 		if err != nil {
 			return fmt.Errorf("resolve identity ids: %w", err)
 		}
@@ -1289,7 +1542,13 @@ func (m *k8sRBACManager) upsertWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 		}
 	}
 
-	workloadIDs, err := m.idsBySourceKey(tx, workspaceID, "iga_workload")
+	// Only the workloads this result names: every caller reads the map by
+	// those keys alone, and a whole-workspace read here was one per sighting.
+	wKeys := make([]string, 0, len(res.Workloads))
+	for _, w := range res.Workloads {
+		wKeys = append(wKeys, w.SourceKey)
+	}
+	workloadIDs, err := m.idsForKeys(tx, workspaceID, "iga_workload", wKeys)
 	if err != nil {
 		return nil, 0, fmt.Errorf("resolve workload ids: %w", err)
 	}
@@ -1470,8 +1729,18 @@ func (m *k8sRBACManager) adoptUnreconciled(tx *gorm.DB, workspaceID uuid.UUID,
 		         SELECT 1 FROM iga_object_support s
 		          WHERE s.workspace_id = w.workspace_id
 		            AND s.workload_id = w.id
-		            AND s.discovery_source_id = ?)`,
-		workspaceID, models.ProviderK8s, models.IGALifecycleActive, cluster, ref.SourceID).
+		            AND s.discovery_source_id = ?)
+		   -- Not a workload whose sighting another source reported: this sweep
+		   -- does not load it (loadSightings), so adopting it would let this
+		   -- source's complete sweep end the only support it would ever get.
+		   AND NOT EXISTS (
+		         SELECT 1 FROM discovered_agents d
+		          WHERE d.workspace_id = w.workspace_id AND d.source = ?
+		            AND d.fingerprint = w.provider_attrs->>'fingerprint'
+		            AND d.discovery_source_id IS NOT NULL
+		            AND d.discovery_source_id <> ?)`,
+		workspaceID, models.ProviderK8s, models.IGALifecycleActive, cluster, ref.SourceID,
+		models.DiscoverySourceK8sWebhook, ref.SourceID).
 		Scan(&wls).Error; err != nil {
 		return fmt.Errorf("find unsupported workloads: %w", err)
 	}

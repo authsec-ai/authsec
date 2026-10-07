@@ -135,7 +135,11 @@ type ResyncManifestRequest struct {
 	Source            string     `json:"source" binding:"required"`
 	DiscoverySourceID *uuid.UUID `json:"discovery_source_id,omitempty"`
 	ClusterName       string     `json:"cluster" binding:"required"`
-	ScanKind          string     `json:"scan_kind,omitempty"`
+	// ClusterUID is the kube-system namespace UID of the swept cluster.
+	// Optional; when it and the connection's recorded UID are both known and
+	// differ, the manifest is refused (409 cluster_uid_mismatch).
+	ClusterUID string `json:"cluster_uid,omitempty"`
+	ScanKind   string `json:"scan_kind,omitempty"`
 	// Complete is false when any LIST in the sweep failed. A partial manifest is
 	// accepted but retires nothing — see services.ReconcileManifest.
 	Complete     bool     `json:"complete"`
@@ -650,6 +654,7 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		Source:              req.Source,
 		DiscoverySourceID:   req.DiscoverySourceID,
 		ClusterName:         req.ClusterName,
+		ClusterUID:          req.ClusterUID,
 		ScanKind:            req.ScanKind,
 		Complete:            req.Complete,
 		Namespaces:          req.Namespaces,
@@ -658,6 +663,12 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		SweepStartedAt:      req.SweepStartedAt,
 		ObservedAt:          req.ObservedAt,
 	})
+	if errors.Is(err, services.ErrClusterUIDMismatch) {
+		// A different cluster under this connection's name: its absences say
+		// nothing about this cluster's agents. Refused; nothing was changed.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
 	if err != nil {
 		discoveryError(c, err)
 		return
@@ -1011,6 +1022,16 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		// A different cluster installed under this one's name. Refused, not
 		// merged; nothing was written.
 		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
+	if errors.Is(err, services.ErrSweepConflict) {
+		// Another sweep of this cluster was projected at the same moment and
+		// took the generation. Nothing of this snapshot was written, and the
+		// snapshot is not wrong -- it lost a race -- so it is a 409 the agent
+		// retries (its next cycle re-sends), never a 400 it would log as a
+		// malformed payload and drop.
+		c.JSON(http.StatusConflict, gin.H{"error": "sweep_conflict", "retryable": true,
+			"detail": err.Error()})
 		return
 	}
 	if err != nil {
