@@ -16,3 +16,6 @@ main.exe
 # redirect is run under Git Bash, which creates a real file instead of
 # discarding output.
 NUL
+
+# Local environment (secrets). Copy .env.example to .env (AS-098).
+.env
