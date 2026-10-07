@@ -2,9 +2,12 @@
 // (SPEC-iga-phase3-policy.md §3.5, §3.6, §4.4): what the enforcement role may
 // do, and the binding self-test that proves it.
 //
-// T3.09 adds only the self-test: the probes of §3.6 run against the stack's own
-// self-test role, classified per capability. The deployment writes, recovery
-// and readback (T3.10) are a later task and will live beside this file.
+// T3.09 added the self-test: the probes of §3.6 run against the stack's own
+// self-test role, classified per capability. T3.10 adds, beside this file,
+// the deployment side: discovery-role reads into an igagov.LiveRead
+// (reads.go, reads_live.go) and the enforcement-role writes of one
+// deployment (deploy.go): request resolution and hashing, one call per
+// attempt with SDK retries off, and the classification of what AWS answered.
 //
 // An adapter in the awsdiscovery sense: it knows AWS and nothing about
 // AuthSec's database. The binding service (services/
@@ -122,9 +125,10 @@ func (r Report) Failing() []string {
 }
 
 // IAM is the slice of IAM the enforcement role is granted (§3.6), as the
-// self-test uses it. Every method is a single call with SDK retries off: a
-// self-test probe that AWS refused must be reported, not retried into a
-// different answer.
+// self-test and the deployment writes (T3.10) use it. Every method is a
+// single call with SDK retries off: a probe AWS refused must be reported, not
+// retried into a different answer, and a mutation must never be re-signed and
+// re-sent by the SDK without a write-ahead attempt (§8.1).
 type IAM interface {
 	CreatePolicy(ctx context.Context, in CreatePolicyInput) (arn string, err error)
 	CreatePolicyVersion(ctx context.Context, policyARN, document string, setAsDefault bool) (versionID string, err error)
@@ -132,6 +136,8 @@ type IAM interface {
 	PutRolePermissionsBoundary(ctx context.Context, roleName, boundaryARN string) error
 	DeleteRolePermissionsBoundary(ctx context.Context, roleName string) error
 	DeletePolicy(ctx context.Context, policyARN string) error
+	// TagPolicy adds or overwrites tags on a policy (§3.2 authsec:change).
+	TagPolicy(ctx context.Context, policyARN string, tags map[string]string) error
 }
 
 // CreatePolicyInput is a CreatePolicy request.

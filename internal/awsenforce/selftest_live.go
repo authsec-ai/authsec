@@ -3,14 +3,17 @@ package awsenforce
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/middleware"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 )
@@ -67,17 +70,14 @@ func (LiveAssumer) AssumeEnforcement(ctx context.Context, in AssumeInput) (IAM, 
 type liveIAM struct{ c *iam.Client }
 
 func (l liveIAM) CreatePolicy(ctx context.Context, in CreatePolicyInput) (string, error) {
-	tags := make([]iamtypes.Tag, 0, len(in.Tags))
-	for k, v := range in.Tags {
-		tags = append(tags, iamtypes.Tag{Key: aws.String(k), Value: aws.String(v)})
-	}
 	out, err := l.c.CreatePolicy(ctx, &iam.CreatePolicyInput{
 		PolicyName: aws.String(in.Name), Path: aws.String(in.Path),
-		PolicyDocument: aws.String(in.Document), Tags: tags,
+		PolicyDocument: aws.String(in.Document), Tags: iamTags(in.Tags),
 	})
 	if err != nil {
 		return "", err
 	}
+	recordMetadata(ctx, out.ResultMetadata)
 	if out.Policy == nil {
 		return "", nil
 	}
@@ -91,6 +91,7 @@ func (l liveIAM) CreatePolicyVersion(ctx context.Context, policyARN, document st
 	if err != nil {
 		return "", err
 	}
+	recordMetadata(ctx, out.ResultMetadata)
 	if out.PolicyVersion == nil {
 		return "", nil
 	}
@@ -98,27 +99,70 @@ func (l liveIAM) CreatePolicyVersion(ctx context.Context, policyARN, document st
 }
 
 func (l liveIAM) DeletePolicyVersion(ctx context.Context, policyARN, versionID string) error {
-	_, err := l.c.DeletePolicyVersion(ctx, &iam.DeletePolicyVersionInput{
+	out, err := l.c.DeletePolicyVersion(ctx, &iam.DeletePolicyVersionInput{
 		PolicyArn: aws.String(policyARN), VersionId: aws.String(versionID),
 	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
 	return err
 }
 
 func (l liveIAM) PutRolePermissionsBoundary(ctx context.Context, roleName, boundaryARN string) error {
-	_, err := l.c.PutRolePermissionsBoundary(ctx, &iam.PutRolePermissionsBoundaryInput{
+	out, err := l.c.PutRolePermissionsBoundary(ctx, &iam.PutRolePermissionsBoundaryInput{
 		RoleName: aws.String(roleName), PermissionsBoundary: aws.String(boundaryARN),
 	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
 	return err
 }
 
 func (l liveIAM) DeleteRolePermissionsBoundary(ctx context.Context, roleName string) error {
-	_, err := l.c.DeleteRolePermissionsBoundary(ctx, &iam.DeleteRolePermissionsBoundaryInput{
+	out, err := l.c.DeleteRolePermissionsBoundary(ctx, &iam.DeleteRolePermissionsBoundaryInput{
 		RoleName: aws.String(roleName),
 	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
 	return err
 }
 
 func (l liveIAM) DeletePolicy(ctx context.Context, policyARN string) error {
-	_, err := l.c.DeletePolicy(ctx, &iam.DeletePolicyInput{PolicyArn: aws.String(policyARN)})
+	out, err := l.c.DeletePolicy(ctx, &iam.DeletePolicyInput{PolicyArn: aws.String(policyARN)})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
 	return err
+}
+
+func (l liveIAM) TagPolicy(ctx context.Context, policyARN string, tags map[string]string) error {
+	out, err := l.c.TagPolicy(ctx, &iam.TagPolicyInput{PolicyArn: aws.String(policyARN), Tags: iamTags(tags)})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+// iamTags converts a tag map into IAM tags, sorted by key so the request is
+// the same whatever the map's iteration order.
+func iamTags(tags map[string]string) []iamtypes.Tag {
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]iamtypes.Tag, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, iamtypes.Tag{Key: aws.String(k), Value: aws.String(tags[k])})
+	}
+	return out
+}
+
+// recordMetadata hands the AWS request id of a successful call to the
+// recorder in ctx, if any (WithRequestIDRecorder).
+func recordMetadata(ctx context.Context, md middleware.Metadata) {
+	if id, ok := awsmiddleware.GetRequestIDMetadata(md); ok {
+		RecordRequestID(ctx, id)
+	}
 }
