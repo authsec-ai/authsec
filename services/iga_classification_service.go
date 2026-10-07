@@ -240,6 +240,7 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 		// answers it. The EXISTS is a sublink, not a FROM item, so FOR UPDATE
 		// locks the workload row alone.
 		var locked []lockedWorkload
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`SELECT w.id, w.classification, w.classification_version, w.lifecycle
 			FROM iga_workload w
 			WHERE w.workspace_id = ? AND w.id = ? AND w.provider = 'aws'
@@ -260,6 +261,7 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 		// moved since. Found with a different hash: the id is being reused for
 		// another workload, actor or content.
 		var prior []models.IGAWorkloadClassification
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`SELECT * FROM iga_workload_classification
 			WHERE workspace_id = ? AND operation_id = ?`, ws, req.OperationID).Scan(&prior).Error; err != nil {
 			return err
@@ -310,6 +312,7 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 			ID        uuid.UUID
 			DecidedAt time.Time
 		}
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`INSERT INTO iga_workload_classification
 			(workspace_id, workload_id, operation_id, decision, previous, purpose, reason,
 			 decided_by_user_id, against_version, request_hash, result_version, undoes_decision_id)
@@ -343,6 +346,7 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 		if upd.RowsAffected != 1 {
 			return fmt.Errorf("classification update touched %d workload rows", upd.RowsAffected)
 		}
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Exec(`INSERT INTO iga_classification_clock (workspace_id, seq) VALUES (?, 1)
 			ON CONFLICT (workspace_id) DO UPDATE SET seq = iga_classification_clock.seq + 1`, ws).Error; err != nil {
 			return err
