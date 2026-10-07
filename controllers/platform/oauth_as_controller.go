@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/rsa"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/policy"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -1112,21 +1114,28 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 	log.Printf("[M2M] tokenClientCredentialsGrant: issued jti=%s sa=%s client=%s rs=%s scopes=%q",
 		jti, sa.ID, client.ClientID, rs.ID, claims.Scope)
 
+	// The client is authenticated and its service account resolved: the
+	// follow-up writes run in that service account's workspace, under RLS.
+	saCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: sa.WorkspaceID})
+	sqlDB := config.GetDatabase().DB
+
 	// Best-effort: advance attested → token_issued in application_spiffe_identities
 	// for SPIFFE-backed service accounts.
 	if sa.SpiffeID != nil {
-		config.DB.WithContext(ctx).Exec(
-			`UPDATE application_spiffe_identities
-			    SET status = 'token_issued', last_token_issued_at = NOW()
-			  WHERE spiffe_id = ? AND status IN ('attested', 'token_issued')`,
-			*sa.SpiffeID,
-		)
+		if _, err := tenancy.ExecContext(saCtx, sqlDB, `
+			UPDATE application_spiffe_identities SET status = 'token_issued', last_token_issued_at = NOW()
+			 WHERE workspace_id = $1 AND spiffe_id = $2 AND status IN ('attested', 'token_issued')`,
+			*sa.SpiffeID); err != nil {
+			log.Printf("[M2M] tokenClientCredentialsGrant: spiffe identity status sa=%s: %v", sa.ID, err)
+		}
 	}
 
 	// Best-effort: record activity on the service account so Agent 360 can show
 	// "last seen" instead of NULL forever.
-	config.DB.WithContext(ctx).Exec(
-		`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, sa.ID)
+	if _, err := tenancy.ExecContext(saCtx, sqlDB,
+		`UPDATE service_accounts SET last_seen_at = NOW() WHERE workspace_id = $1 AND id = $2`, sa.ID); err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: last_seen_at sa=%s: %v", sa.ID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": tokenStr,
@@ -1788,16 +1797,32 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	// whether it names no resource server or the one this ID-JAG targets.
 	// No matching row = permit (ownership of a valid subject_token is
 	// sufficient consent). A failed lookup refuses issuance (AS-074).
-	type brokeringRow struct{ Effect string }
-	var brokeringRows []brokeringRow
-	if err := config.DB.WithContext(ctx).Raw(`
+	// The workspace is the verified subject_token's. No RLS transaction: the
+	// policy may name a resource server of another workspace (resource_uri is
+	// globally unique, AS-060), which a deny must still match.
+	subjectTenant := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: subject.WorkspaceID})
+	var brokeringEffects []string
+	brokeringRows, err := tenancy.QueryContext(subjectTenant, config.GetDatabase().DB, `
 		SELECT effect FROM a2a_brokering_policies
-		WHERE workspace_id = ? AND side = 'issuance'
-		  AND (client_id IS NULL OR client_id = ?)
+		WHERE workspace_id = $1 AND side = 'issuance'
+		  AND (client_id IS NULL OR client_id = $2)
 		  AND (resource_server_id IS NULL OR resource_server_id IN (
-		        SELECT id FROM resource_servers WHERE resource_uri = ? AND ? <> '')) -- TENANT-EXEMPT: outer query scoped by workspace_id`,
-		subject.WorkspaceID, oauthClient.ClientID, resource, resource,
-	).Scan(&brokeringRows).Error; err != nil {
+		        SELECT id FROM resource_servers WHERE resource_uri = $3 AND $3 <> '')) -- TENANT-EXEMPT: resource_uri is globally unique (AS-060); the outer query is scoped by workspace_id`,
+		oauthClient.ClientID, resource)
+	if err == nil {
+		for brokeringRows.Next() {
+			var effect string
+			if err = brokeringRows.Scan(&effect); err != nil {
+				break
+			}
+			brokeringEffects = append(brokeringEffects, effect)
+		}
+		if err == nil {
+			err = brokeringRows.Err()
+		}
+		brokeringRows.Close()
+	}
+	if err != nil {
 		log.Printf("[MCP_AUTH] tokenExchange: brokering gate lookup failed: %v", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error":             "temporarily_unavailable",
@@ -1805,8 +1830,8 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		})
 		return
 	}
-	for _, br := range brokeringRows {
-		if br.Effect == "deny" {
+	for _, effect := range brokeringEffects {
+		if effect == "deny" {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":             "access_denied",
 				"error_description": "ID-JAG issuance is not permitted for this client in this workspace",
@@ -2081,6 +2106,7 @@ func (ctrl *OAuthASController) RequesterBootstrap(c *gin.Context) {
 	requesterWorkspaces := map[uuid.UUID]bool{}
 	var saWs []uuid.UUID
 	config.DB.WithContext(ctx).
+		// TENANT-EXEMPT: resolves the workspaces the authenticated client backs; the workspace is the result, not an input.
 		Raw(`SELECT workspace_id FROM service_accounts WHERE oauth_client_id = ?`, client.ID).
 		Scan(&saWs)
 	for _, w := range saWs {
@@ -2611,17 +2637,30 @@ func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid strin
 		ext["act"] = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
 	}
 
-	// G9: resolve role_ids for the subject+RS binding.
-	var roleIDs []string
+	// G9: resolve role_ids for the subject+RS binding, in the token's
+	// workspace (the native_tokens row's), under RLS.
+	roleIDs := []string{}
 	roleIDCol := "user_id"
 	if authCtx.Principal.SubjectType == "service_account" {
 		roleIDCol = "service_account_id"
 	}
-	config.DB.WithContext(ctx).
-		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID).
-		Scan(&roleIDs)
-	if roleIDs == nil {
-		roleIDs = []string{}
+	principalCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: authCtx.Principal.WorkspaceID})
+	if err := tenancy.WithTx(principalCtx, config.GetDatabase().DB, authCtx.Principal.WorkspaceID, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(principalCtx, tx, "SELECT role_id::text FROM role_bindings WHERE workspace_id = $1 AND scope_type = 'resource_server' AND scope_id = $2 AND "+roleIDCol+" = $3 AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			roleIDs = append(roleIDs, id)
+		}
+		return rows.Err()
+	}); err != nil {
+		log.Printf("[MCP_AUTH] introspectNative: role_ids lookup failed rs=%s: %v", rs.ResourceURI, err)
 	}
 
 	resp := gin.H{
