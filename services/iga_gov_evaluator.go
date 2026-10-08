@@ -476,6 +476,11 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 			counts["compile_plans"]++
 		}
 	}
+	// T3.15: one observe_tick per rollout observing, in canary or expanding
+	// (§8.6 "on each publication"), dedupe rollout:<id>:rev:<rev>.
+	if err := EnqueueObserveTicksTx(tx, ws, rev); err != nil {
+		return fmt.Errorf("enqueue observe_tick: %w", err)
+	}
 	counts["results"] = len(results)
 	counts["evidence"] = len(evidence)
 	return e.appendEvent(tx, ws, "evaluation_completed", map[string]any{"rev": rev, "counts": counts,

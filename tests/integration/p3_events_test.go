@@ -261,8 +261,9 @@ func TestP3T320EventsAPIAndExport(t *testing.T) {
 		m := c.(map[string]any)
 		rec[m["category"].(string)] = m["recorded"].(bool)
 	}
-	// approval / proposal are recorded since T3.11 / T3.13 (p3-wire); verification since T3.16.
-	if !rec["owner_review"] || !rec["ownership"] || !rec["approval"] || !rec["proposal"] || !rec["verification"] || rec["rollout"] {
+	// approval / proposal recorded since T3.11 / T3.13 (p3-wire), verification since T3.16,
+	// rollout since T3.15; legacy_agent_policy (T3.19) is not yet.
+	if !rec["owner_review"] || !rec["ownership"] || !rec["approval"] || !rec["proposal"] || !rec["verification"] || !rec["rollout"] || rec["legacy_agent_policy"] {
 		t.Fatalf("categories %v", rec)
 	}
 }
@@ -459,6 +460,14 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		"/deployments/:id/validations", "/deployments/:id/health-reports", "/policies/:id/remove-control",
 		"/policies/:id/emergency-remove-control"} {
 		exempt["POST "+prefix+r] = "audited in TestP3T316DeploymentRoutes (T3.16)"
+	}
+	// T3.15's rollout routes need an observed, approved version over a fake
+	// account; p3_rollout_test.go drives each to a 2xx and asserts its
+	// iga_gov_event and audit_events rows (rollout_start, rollout_expand,
+	// rollout_pause, rollout_resume).
+	for _, r := range []string{"/policies/:id/rollout/start", "/policies/:id/rollout/expand",
+		"/policies/:id/rollout/pause", "/policies/:id/rollout/resume"} {
+		exempt["POST "+prefix+r] = "audited in p3_rollout_test.go (T3.15)"
 	}
 
 	role, rid := g.identity("WalkerRole", nil)

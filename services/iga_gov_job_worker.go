@@ -530,16 +530,18 @@ func (r *PolicyJobRun) External(ctx context.Context, margin time.Duration, call 
 
 // RegisterPolicyJobNoops registers a no-op handler for each periodic kind the
 // scheduler produces whose real handler belongs to a later task (drift_check
-// T3.16, refresh_activity T3.15, iac_sync T3.17), so scheduled rows complete
-// instead of piling up queued. The later task's Register replaces it.
+// T3.16, iac_sync T3.17), so scheduled rows complete instead of piling up
+// queued. The later task's Register replaces it. refresh_activity is T3.15's
+// (RegisterRolloutJobs).
 func RegisterPolicyJobNoops(w *PolicyJobWorker) {
-	for _, kind := range []string{repositories.GovJobDriftCheck, repositories.GovJobRefreshActivity, repositories.GovJobIaCSync} {
+	for _, kind := range []string{repositories.GovJobDriftCheck, repositories.GovJobIaCSync} {
 		w.Register(PolicyJobKind{Kind: kind, Handler: func(context.Context, *PolicyJobRun) error { return nil }})
 	}
 }
 
 // NewDefaultPolicyJobWorker is the production worker: the handlers that exist
-// in this build (evaluate_owner_rules, T3.07; notify, T3.12; compile_plans, T3.11) plus the no-op periodic kinds,
+// in this build (evaluate_owner_rules, T3.07; notify, T3.12; compile_plans, T3.11;
+// observe_tick and refresh_activity, T3.15) plus the no-op periodic kinds,
 // and the default schedules. Later tasks Register their kinds here.
 func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w := NewPolicyJobWorker(db, "")
@@ -566,6 +568,9 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobIaCSync,
 		Handler: NewGovIaCDelivery(db, nil, ProcessGovLiveReader()).SyncHandler,
 		Backoff: func(n int) time.Duration { return time.Duration(n) * 5 * time.Minute }})
+	// T3.15: observe_tick (on each publication and every 10 min for canary,
+	// expand, paused) and refresh_activity (queues a connector scan).
+	RegisterRolloutJobs(w, NewGovRollout(db, ProcessGovLiveReader()))
 	return w
 }
 

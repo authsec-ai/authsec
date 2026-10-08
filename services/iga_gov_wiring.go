@@ -130,6 +130,8 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 	// no GitHub adapter (no Vault) a PR target falls back to export at compile
 	// time, so the handler is installed either way.
 	InstallGovIaCDeliveryHandlers(db)
+	// T3.15 rollout over T3.16 deployments: gate facts and remove_control.
+	InstallGovRolloutWiring(db)
 	SetGovNotificationChannelStore(NewGovDBChannelStore(vc))
 	if vc == nil {
 		SetGovLiveReader(nil)
