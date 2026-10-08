@@ -555,6 +555,11 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobCompilePlans,
 		Handler: NewGovAuthoring(db, ProcessGovLiveReader()).CompilePlansHandler,
 		Backoff: func(n int) time.Duration { return time.Duration(n) * time.Minute }})
+
+	// T3.16: deploy, verify, drift_check (replacing its no-op) and
+	// resolve_unknown, over the process-wide deployment environment
+	// (SetGovDeployEnv) read at call time.
+	NewGovDeployments(db, nil).Register(w)
 	return w
 }
 

@@ -203,6 +203,17 @@ func main() {
 				return
 			}
 			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
+			// T3.16: deployments need AWS access (discovery + enforcement
+			// roles) and the binding gate; without Vault the deploy jobs wait.
+			if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
+				if vc, verr := vault.NewClient(va, vt); verr == nil {
+					services.SetGovDeployEnv(services.NewProductionGovDeployEnv(config.DB, vc))
+				} else {
+					log.Printf("[policy] deployments not enabled: %v", verr)
+				}
+			} else {
+				log.Printf("[policy] deployments not enabled: VAULT_ADDR/VAULT_TOKEN not configured")
+			}
 			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
 		})
 	} else {

@@ -261,7 +261,7 @@ func TestP3T320EventsAPIAndExport(t *testing.T) {
 		m := c.(map[string]any)
 		rec[m["category"].(string)] = m["recorded"].(bool)
 	}
-	if !rec["owner_review"] || !rec["ownership"] || rec["approval"] || rec["rollout"] {
+	if !rec["owner_review"] || !rec["ownership"] || !rec["approval"] || !rec["verification"] || rec["rollout"] {
 		t.Fatalf("categories %v", rec)
 	}
 }
@@ -450,6 +450,14 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 	const prefix = "/api/iga/v1/policy"
 	exempt := map[string]string{
 		"POST " + prefix + "/targets/resolve": "a read with a body (§7.2, governance:read)",
+	}
+	// T3.16's §7.6 / §7.7 routes need deployments over a fake AWS account;
+	// TestP3T316DeploymentRoutes calls each with a 2xx answer and asserts its
+	// iga_gov_event and audit_events rows, as this walker does.
+	for _, r := range []string{"/deployments/:id/resolve", "/deployments/:id/undo", "/deployments/:id/emergency-undo",
+		"/deployments/:id/validations", "/deployments/:id/health-reports", "/policies/:id/remove-control",
+		"/policies/:id/emergency-remove-control"} {
+		exempt["POST "+prefix+r] = "audited in TestP3T316DeploymentRoutes (T3.16)"
 	}
 
 	role, rid := g.identity("WalkerRole", nil)

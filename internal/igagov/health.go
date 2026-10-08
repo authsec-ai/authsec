@@ -79,7 +79,19 @@ func ActionForEvent(eventSource, eventName string) (string, bool) {
 	if !reService.MatchString(label) {
 		return "", false
 	}
-	return label + ":" + eventName, true
+	a := label + ":" + eventName
+	if alias, ok := eventActionAlias[a]; ok {
+		return alias, true
+	}
+	return a, true
+}
+
+// eventActionAlias maps the management events whose API name differs from
+// the IAM action they are authorised by (DECISION, T3.16: the S3 API
+// ListBuckets is the IAM action s3:ListAllMyBuckets, §14.1 step 8's
+// expected=allowed item; without it the validation item is never matched).
+var eventActionAlias = map[string]string{
+	"s3:ListBuckets": "s3:ListAllMyBuckets",
 }
 
 // TrailEvent is one CloudTrail management event attributed to a role
@@ -101,6 +113,18 @@ type TrailEvent struct {
 
 func (e TrailEvent) action() string {
 	a, _ := ActionForEvent(e.EventSource, e.EventName)
+	return a
+}
+
+// rawAction is the event's "<namespace>:<eventName>" before aliasing.
+func (e TrailEvent) rawAction() string {
+	a, ok := ActionForEvent(e.EventSource, e.EventName)
+	if !ok {
+		return ""
+	}
+	if ns, _, ok := SplitAction(a); ok {
+		return ns + ":" + e.EventName
+	}
 	return a
 }
 
@@ -288,7 +312,7 @@ func trailCovers(reads []TrailRead, from, to time.Time) (bool, string) {
 // RoleId, the session name, the action and the window all match.
 func belongs(e TrailEvent, v Validation, it ValidationItem) bool {
 	return e.PrincipalID == v.RoleID && e.SessionName == v.SessionName &&
-		strings.EqualFold(e.action(), it.Action) &&
+		(strings.EqualFold(e.action(), it.Action) || strings.EqualFold(e.rawAction(), it.Action)) &&
 		!e.EventTime.Before(v.WindowStart) && !e.EventTime.After(v.WindowEnd)
 }
 
