@@ -102,11 +102,24 @@ import (
 //     revalidation_required makes the rollout call Revalidate once and ask
 //     again; a material change is 409 material_change with the changes.
 //   - R9: pausing stops the rollout from evaluating and creating
-//     deployments; deployments already queued are T3.16's (its executor may
-//     consult RolloutPausedForDeployment). Resume after a gate failure goes
+//     deployments, and holds its queued apply deployments: the deploy job
+//     consults RolloutPausedForDeployment and leaves them queued (retry
+//     later) while paused; resume brings their deploy jobs forward. A
+//     deployment already applying finishes. Resume after a gate failure goes
 //     back to canary; a gate that still fails pauses again at the next tick.
 //   - R10: the canary window starts at the canary deployment's applied_at;
-//     canary_hours is the intent's rollout.canary_hours, else the settings'.
+//     canary_hours is GovCanaryHours (the intent's rollout.canary_hours, else
+//     the settings'), the same function the verify job's window uses.
+//   - R13 (review P1-9): the automatic tick and the manual expand apply one
+//     canary-health rule (canaryHealthy), and both read the gates inside the
+//     transaction that acts on them, with the canary deployment and its
+//     verification rows locked FOR SHARE. A single-target rollout completes
+//     only once its deployment is verified (§8.4: complete means the change
+//     is proven); with its gates passed it waits in canary.
+//   - R14 (review P3): a gate_not_available acceptance is bound to the
+//     rollout AND its version (057's FK) and is unique per (rollout, gate,
+//     window); the gates match acceptances by gate and by the whole window
+//     [window_start, window_end].
 
 // Rollout error codes.
 const (
@@ -196,9 +209,12 @@ type RolloutDeploymentGateFacts struct {
 // RolloutDeploymentFacts is the narrow seam T3.16 implements
 // (DeploymentGateFacts) and the integration merge wires with
 // SetGovRolloutDeploymentFacts. A deployment of another workspace is
-// GovNotFound.
+// GovNotFound. db is the handle to read through: the rollout passes the
+// transaction it acts in, so the gates it decides on are the ones it read
+// under its locks (no read-then-act gap); nil reads through the
+// implementation's own handle.
 type RolloutDeploymentFacts interface {
-	DeploymentGateFacts(ctx context.Context, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error)
+	DeploymentGateFacts(ctx context.Context, db *gorm.DB, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error)
 }
 
 var (
@@ -243,8 +259,11 @@ type GovRowDeploymentFacts struct {
 }
 
 // DeploymentGateFacts implements RolloutDeploymentFacts.
-func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
-	db := f.DB.WithContext(ctx)
+func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, h *gorm.DB, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
+	if h == nil {
+		h = f.DB
+	}
+	db := h.WithContext(ctx)
 	var d models.IGAGovDeployment
 	if err := db.Where("workspace_id = ? AND id = ?", ws, deploymentID).Take(&d).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -635,18 +654,10 @@ func (r *GovRollout) settings(db *gorm.DB, ws uuid.UUID) (*models.IGAGovSettings
 	return repositories.NewIGAGovSettingsRepository(db).Get(ws)
 }
 
+// canaryHours is the version's canary length: GovCanaryHours, the one rule
+// the verify job's window uses too.
 func (r *GovRollout) canaryHours(db *gorm.DB, rc *govRolloutCtx) (int, error) {
-	if rc.Intent.Rollout != nil && rc.Intent.Rollout.CanaryHours > 0 {
-		return rc.Intent.Rollout.CanaryHours, nil
-	}
-	set, err := r.settings(db, rc.Version.WorkspaceID)
-	if err != nil {
-		return 0, err
-	}
-	if set.CanaryHours < 1 {
-		return 48, nil
-	}
-	return set.CanaryHours, nil
+	return GovCanaryHours(db, rc.Version.WorkspaceID, rc.Version.ID)
 }
 
 func policyUsable(p models.IGAGovPolicy) error {
@@ -1155,10 +1166,13 @@ func gateItemHash(g igagov.GateResult) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// evaluateGates reads the canary deployment's facts and runs §8.6's gates
-// over its window, with the accepted not_available gates of that window.
+// evaluateGates reads the canary deployment's facts through db and runs
+// §8.6's gates over its window, with the accepted not_available gates of
+// that window (matched by rollout, version, gate and the whole window).
+// The decisions that act on the result call it with their transaction,
+// after lockCanaryFactsTx.
 func (r *GovRollout) evaluateGates(ctx context.Context, db *gorm.DB, ws uuid.UUID, rc *govRolloutCtx, depID uuid.UUID, rev int64) (*gateEval, error) {
-	f, err := r.deploymentFacts().DeploymentGateFacts(ctx, ws, depID)
+	f, err := r.deploymentFacts().DeploymentGateFacts(ctx, db, ws, depID)
 	if err != nil {
 		return nil, err
 	}
@@ -1189,8 +1203,8 @@ func (r *GovRollout) evaluateGates(ctx context.Context, db *gorm.DB, ws uuid.UUI
 	ev.canary.WindowStart, ev.canary.WindowEnd = &ws0, &we
 	var accs []models.IGAGovAcceptance
 	if rc.Rollout != nil {
-		if err := db.Where("workspace_id = ? AND rollout_id = ? AND kind = ? AND stage = 'canary' AND window_start = ?",
-			ws, rc.Rollout.ID, models.GovAcceptGateNotAvailable, ws0).Find(&accs).Error; err != nil {
+		if err := db.Where("workspace_id = ? AND rollout_id = ? AND version_id = ? AND kind = ? AND stage = 'canary' AND window_start = ? AND window_end = ?",
+			ws, rc.Rollout.ID, rc.Version.ID, models.GovAcceptGateNotAvailable, ws0, we).Find(&accs).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -1308,6 +1322,13 @@ func (r *GovRollout) Resume(ctx context.Context, ws, actor, policyID uuid.UUID, 
 		prev := g.Pause
 		g.Pause, g.UndoOffered = nil, nil
 		if err := r.saveTx(tx, ro, g); err != nil {
+			return err
+		}
+		// The deployments the pause held go now, not at their next recheck.
+		if err := tx.Exec(`UPDATE iga_gov_job SET run_after = now()
+			WHERE workspace_id = ? AND kind = 'deploy' AND status = 'queued' AND run_after > now()
+			  AND subject_id IN (SELECT id FROM iga_gov_deployment WHERE workspace_id = ? AND version_id = ?
+			                       AND kind = 'apply' AND state = 'queued')`, ws, ws, ro.VersionID).Error; err != nil {
 			return err
 		}
 		ak, aid := actorPair(actor)
@@ -1437,27 +1458,17 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 	if g.Canary == nil {
 		return nil, govConflict(GovCodeGatesNotPassed, "The canary has no deployment.", nil)
 	}
-	ev, err := r.evaluateGates(ctx, db, ws, rc, g.Canary.DeploymentID, 0)
+	depID := g.Canary.DeploymentID
+	// A first look outside the transaction: refuse early (no AWS reads for
+	// the other targets' approvals) when the canary cannot expand. The
+	// decision itself is taken again below, on facts read under lock in the
+	// transaction that acts on it.
+	pre, err := r.evaluateGates(ctx, db, ws, rc, depID, 0)
 	if err != nil {
 		return nil, err
 	}
-	if ev.facts.AppliedAt == nil {
-		return nil, govConflict(GovCodeGatesNotPassed, "The canary is not applied yet.", map[string]any{"state": ev.facts.State, "gates": []any{}})
-	}
-	for i, a := range in.AcceptNotAvailable {
-		ok := false
-		for _, gr := range ev.result.Gates {
-			if gr.Gate == a.Gate && gr.Outcome == igagov.OutcomeNotAvailable {
-				ok = true
-			}
-		}
-		if !ok {
-			return nil, GovBadParam(fmt.Sprintf("accept_not_available[%d].gate", i), "Only a gate that is not_available now can be accepted.")
-		}
-	}
-	if !ev.passes(extra) {
-		return nil, govConflict(GovCodeGatesNotPassed, "The canary's gates have not passed.", map[string]any{"gates": ev.failing(extra),
-			"not_available": ev.result.NotAvailable, "accepted": ev.canary.Accepted})
+	if err := expandRefusal(pre, in, extra); err != nil {
+		return nil, err
 	}
 	preps := map[uuid.UUID]*govPrepared{}
 	refused := map[uuid.UUID]GovRolloutRefusal{}
@@ -1493,9 +1504,30 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 		if rc.Rollout == nil || rc.Rollout.Stage != models.GovRolloutCanary {
 			return govConflict(GovCodeRolloutConflict, "The rollout moved on; read it again.", nil)
 		}
+		if err := policyUsable(rc.Policy); err != nil {
+			return err
+		}
+		if gg := rolloutResults(rc.Rollout); gg.Canary == nil || gg.Canary.DeploymentID != depID {
+			return govConflict(GovCodeRolloutConflict, "The rollout moved on; read it again.", nil)
+		}
+		// The decision: gates read here, under lock, and acted on in this
+		// transaction (DECISION R13).
+		if err := lockCanaryFactsTx(tx, ws, depID); err != nil {
+			return err
+		}
+		ev, err := r.evaluateGates(ctx, tx, ws, rc, depID, 0)
+		if err != nil {
+			return err
+		}
+		if err := expandRefusal(ev, in, extra); err != nil {
+			return err
+		}
 		ak, aid := actorPair(actor)
 		now := r.now().UTC()
 		for _, a := range in.AcceptNotAvailable {
+			if ev.accepted[a.Gate] {
+				continue // already accepted for this window: one row per (rollout, gate, window)
+			}
 			var gr igagov.GateResult
 			for _, x := range ev.result.Gates {
 				if x.Gate == a.Gate {
@@ -1509,9 +1541,13 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 				WindowStart: ev.canary.WindowStart, WindowEnd: ev.canary.WindowEnd, Reason: strings.TrimSpace(a.Reason),
 				AcceptedBy: actor, AcceptedAt: now}
 			if err := tx.Create(&row).Error; err != nil {
+				if isUniqueViolation(err, "uq_iga_gov_acceptance_gate") {
+					return govConflict(GovCodeRolloutConflict, "This gate was accepted for this window at the same time; read the rollout again.",
+						map[string]any{"gate": a.Gate})
+				}
 				return err
 			}
-			if err := appendGovEvent(tx, ws, GovEventRolloutGateAccepted, ak, aid, rc.refs(&g.Canary.DeploymentID), map[string]any{
+			if err := appendGovEvent(tx, ws, GovEventRolloutGateAccepted, ak, aid, rc.refs(&depID), map[string]any{
 				"acceptance_id": row.ID, "rollout_id": rid, "gate": a.Gate, "item_hash": row.ItemHash, "gate_reason": gr.Reason,
 				"window_start": row.WindowStart, "window_end": row.WindowEnd, "reason": row.Reason}); err != nil {
 				return err
@@ -1543,6 +1579,37 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 	return r.view(db, ws, *v)
 }
 
+// expandRefusal is the manual expand's check of an evaluation: the canary
+// is applied; every gate named for acceptance is not_available now; and the
+// canary is healthy by the same rule the automatic tick applies
+// (canaryHealthy: healthy state, no failed gate, every gate passed or
+// accepted).
+func expandRefusal(ev *gateEval, in GovRolloutExpandInput, extra map[string]bool) error {
+	if ev.facts.AppliedAt == nil {
+		return govConflict(GovCodeGatesNotPassed, "The canary is not applied yet.", map[string]any{"state": ev.facts.State, "gates": []any{}})
+	}
+	for i, a := range in.AcceptNotAvailable {
+		ok := false
+		for _, gr := range ev.result.Gates {
+			if gr.Gate == a.Gate && gr.Outcome == igagov.OutcomeNotAvailable {
+				ok = true
+			}
+		}
+		if !ok {
+			return GovBadParam(fmt.Sprintf("accept_not_available[%d].gate", i), "Only a gate that is not_available now can be accepted.")
+		}
+	}
+	if !healthyState(ev.facts.State) {
+		return govConflict(GovCodeGatesNotPassed, "The canary deployment is "+ev.facts.State+"; the rollout cannot expand from it.",
+			map[string]any{"state": ev.facts.State, "state_reason": ev.facts.StateReason, "gates": ev.result.Gates})
+	}
+	if !canaryHealthy(ev, extra) {
+		return govConflict(GovCodeGatesNotPassed, "The canary's gates have not passed.", map[string]any{"gates": ev.failing(extra),
+			"not_available": ev.result.NotAvailable, "accepted": ev.canary.Accepted})
+	}
+	return nil
+}
+
 // advanceTx moves a canary whose gates passed on: a single target
 // completes; several expand (one deployment per other target, refusals
 // recorded), then settles. It returns how many deployments it created and
@@ -1552,6 +1619,18 @@ func (r *GovRollout) advanceTx(tx *gorm.DB, ws, actor uuid.UUID, rc *govRolloutC
 	ro := rc.Rollout
 	ak, aid := actorPair(actor)
 	if len(rc.Targets) <= 1 {
+		// §8.4 / DECISION R13: the single target's canary is the whole
+		// rollout, and the rollout is complete only once that deployment is
+		// verified; with its gates passed it waits in canary (the periodic
+		// tick completes it when the verify job proves it).
+		var states []string
+		if err := tx.Raw(`SELECT state FROM iga_gov_deployment WHERE workspace_id = ? AND id = ?`, ws, g.Canary.DeploymentID).
+			Scan(&states).Error; err != nil {
+			return 0, nil, err
+		}
+		if len(states) != 1 || states[0] != models.GovDeployVerified {
+			return 0, nil, r.saveTx(tx, ro, g)
+		}
 		ro.Stage = models.GovRolloutComplete
 		if err := r.saveTx(tx, ro, g); err != nil {
 			return 0, nil, err
@@ -1736,12 +1815,15 @@ func (r *GovRollout) view(db *gorm.DB, ws uuid.UUID, v models.IGAGovPolicyVersio
 	return out, nil
 }
 
-// RolloutPausedForDeployment reports whether the rollout that created a
-// deployment is paused (for T3.16's executor, DECISION R9).
+// RolloutPausedForDeployment reports whether the rollout that created an
+// apply deployment is paused (DECISION R9). The deploy job consults it
+// before starting a queued deployment (and again, under the rollout row's
+// lock, in the transaction that starts it: rolloutHoldsDeploymentTx); an
+// undo or control removal of the version is never held.
 func RolloutPausedForDeployment(db *gorm.DB, ws, deploymentID uuid.UUID) (bool, error) {
 	var n int64
 	err := db.Raw(`SELECT count(*) FROM iga_gov_rollout r JOIN iga_gov_deployment d
 		ON d.workspace_id = r.workspace_id AND d.version_id = r.version_id
-		WHERE d.workspace_id = ? AND d.id = ? AND r.stage = 'paused'`, ws, deploymentID).Scan(&n).Error
+		WHERE d.workspace_id = ? AND d.id = ? AND d.kind = 'apply' AND r.stage = 'paused'`, ws, deploymentID).Scan(&n).Error
 	return n > 0, err
 }
