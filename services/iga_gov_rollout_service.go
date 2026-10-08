@@ -940,8 +940,7 @@ func adminLevelRole(db *gorm.DB, ws, bundleID uuid.UUID) (bool, []string, error)
 				_ = json.Unmarshal(st.Action, &acts)
 			}
 			for _, a := range acts {
-				switch strings.ToLower(a) {
-				case "*", "iam:*", "organizations:*":
+				if isAdminLevelAction(a) {
 					why = append(why, a)
 				}
 			}

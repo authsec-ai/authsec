@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -149,4 +150,80 @@ func lockCanaryFactsTx(tx *gorm.DB, ws, depID uuid.UUID) error {
 	}
 	return tx.Exec(`SELECT deployment_id FROM iga_gov_verification WHERE workspace_id = ? AND deployment_id = ? ORDER BY dimension FOR SHARE`,
 		ws, depID).Error
+}
+
+// isAdminLevelAction is §8.6's administration-level action: "*", "iam:*"
+// or "organizations:*" (AdministratorAccess is matched by its ARN).
+func isAdminLevelAction(a string) bool {
+	switch strings.ToLower(a) {
+	case "*", "iam:*", "organizations:*":
+		return true
+	}
+	return false
+}
+
+// adminLevelIdentityTx reports whether a role's CURRENT identity grants in
+// the graph are administration-level (§8.6: such a role "cannot be the
+// canary"): AdministratorAccess attached, or a live Allow statement whose
+// Action is "*", "iam:*" or "organizations:*". It is the proposal-time
+// reading of the rule canary start enforces on the plan's bundle
+// (adminLevelRole), so the default canary skips such roles instead of
+// failing at canary start.
+func adminLevelIdentityTx(tx *gorm.DB, ws, identityID uuid.UUID) (bool, error) {
+	assigns, statements, err := loadGrantHistory(tx, ws, "?", []any{identityID})
+	if err != nil {
+		return false, err
+	}
+	for _, a := range assigns[identityID] {
+		if a.Kind == igagov.AssignBoundary {
+			continue
+		}
+		live := false
+		for _, iv := range a.Intervals {
+			if iv.To == nil {
+				live = true
+			}
+		}
+		if !live {
+			continue
+		}
+		if strings.HasSuffix(a.PolicyARN, ":policy/AdministratorAccess") {
+			return true, nil
+		}
+		for _, sr := range statements[a.PolicyKey] {
+			if sr.To != nil || !strings.EqualFold(sr.Statement.Effect, "Allow") || sr.Statement.IsNotAction {
+				continue
+			}
+			for _, act := range sr.Statement.Action {
+				if isAdminLevelAction(act) {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+// defaultCanaryTx is the canary of a new version whose intent names none:
+// the first target by RoleId that may be a canary. With two or more
+// targets, a role whose current grants are administration-level is skipped
+// (§8.6); when every role is, the first is kept and canary start refuses it
+// with canary_admin_role, naming the grants.
+func defaultCanaryTx(tx *gorm.DB, ws uuid.UUID, controls []models.IGAGovControl) (string, error) {
+	if len(controls) == 0 {
+		return "", nil
+	}
+	if len(controls) == 1 {
+		return controls[0].RoleID, nil
+	}
+	for _, c := range controls {
+		admin, err := adminLevelIdentityTx(tx, ws, c.IdentityAccountID)
+		if err != nil {
+			return "", err
+		}
+		if !admin {
+			return c.RoleID, nil
+		}
+	}
+	return controls[0].RoleID, nil
 }
