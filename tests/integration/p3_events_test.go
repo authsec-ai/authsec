@@ -261,7 +261,8 @@ func TestP3T320EventsAPIAndExport(t *testing.T) {
 		m := c.(map[string]any)
 		rec[m["category"].(string)] = m["recorded"].(bool)
 	}
-	if !rec["owner_review"] || !rec["ownership"] || rec["approval"] || rec["rollout"] {
+	// rollout is recorded since T3.15; legacy_agent_policy (T3.19) is not yet.
+	if !rec["owner_review"] || !rec["ownership"] || rec["approval"] || !rec["rollout"] || rec["legacy_agent_policy"] {
 		t.Fatalf("categories %v", rec)
 	}
 }
