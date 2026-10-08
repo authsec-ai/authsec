@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -371,7 +370,7 @@ func (d *GovIaCDelivery) checkMigrations(ctx context.Context, run *PolicyJobRun,
 					cl := row.SubjectARN
 					// arn:aws:ecs:r:acct:service/<cluster>/<name>
 					parts := strings.Split(cl[strings.Index(cl, ":service/")+len(":service/"):], "/")
-					clusterARN := strings.Replace(cl[:strings.Index(cl, ":service/")], "", "", 1) + ":cluster/" + parts[0]
+					clusterARN := cl[:strings.Index(cl, ":service/")] + ":cluster/" + parts[0]
 					st, sev := r.ECSService(ctx, awsdiscovery.ECSServiceRef{ClusterARN: clusterARN, ServiceARN: row.SubjectARN})
 					ev = sev
 					fam := ""
@@ -751,7 +750,6 @@ func compileErrorAsGov(err error, roleID string) error {
 	return govUnprocessable(GovCodeTargetIneligible, fmt.Sprintf("This target cannot be compiled (%s).", ce.Code), detail)
 }
 
-var _ = time.Second
 
 // createIsolationVersion is POST /policies/:id/versions for a
 // dedicated_identity intent (§7.3, §11 "Propose dedicated identity"): the

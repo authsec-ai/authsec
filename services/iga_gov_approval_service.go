@@ -173,7 +173,7 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		for _, t := range ts {
 			found := false
 			for _, p := range plans {
-				if p.TargetID == t.ID && p.Kind == igagov.PlanApply {
+				if p.TargetID == t.ID && (p.Kind == igagov.PlanApply || p.Kind == igagov.PlanSplit) { // T3.17: a split is a dedicated-identity version's forward plan
 					found = true
 					if p.Eligibility == igagov.EligibilityIneligible {
 						ineligible = append(ineligible, map[string]any{"target_id": t.ID, "role_id": p.RoleID, "reason": p.IneligibleReason})
@@ -200,9 +200,13 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		if !sameMultiset(req.PlanHashes, cur.PlanHashes) || !sameMultiset(req.MaterialHashes, cur.MaterialHashes) {
 			return govConflict(GovCodePlanChanged, "The plan changed since you loaded it; review the new plan.", map[string]any{"current": cur})
 		}
-		intent, err := storedRightSize(*v)
-		if err != nil {
-			return err
+		// T3.17: a dedicated_identity version (split / split_revert plans) is
+		// approved the same way; the owner gate receives no right-size intent.
+		var intent igagov.RightSizeIntent
+		if pi, perr := igagov.ParseIntent(v.Intent); perr != nil || pi.Kind != igagov.IntentDedicatedIdentity {
+			if intent, err = storedRightSize(*v); err != nil {
+				return err
+			}
 		}
 		if h := a.hooks().OwnerGate; h != nil {
 			if err := h(tx, GovApprovalCheck{WorkspaceID: ws, PolicyID: policyID, VersionID: v.ID, ApproverID: approver,

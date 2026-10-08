@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1143,13 +1142,4 @@ func (d *GovIaCDelivery) keepNewRole(db *gorm.DB, ws uuid.UUID, x *iacDep) (bool
 	return false, nil
 }
 
-// sortedFactKeys is a stable list for evidence payloads.
-func sortedFactKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
 

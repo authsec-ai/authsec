@@ -707,7 +707,7 @@ func requiredAcceptances(db *gorm.DB, ws uuid.UUID, plans []planWithRole) ([]Gov
 func approvalHashes(v models.IGAGovPolicyVersion, plans []planWithRole) GovApprovalHashes {
 	h := GovApprovalHashes{IntentHash: v.IntentHash, ImpactHashes: []string{}, PlanHashes: []string{}, MaterialHashes: []string{}}
 	for _, p := range plans {
-		if p.Kind == igagov.PlanApply {
+		if p.Kind == igagov.PlanApply || p.Kind == igagov.PlanSplit { // T3.17: split plans are forward plans too
 			h.ImpactHashes = append(h.ImpactHashes, p.ImpactHash)
 		}
 		h.PlanHashes = append(h.PlanHashes, p.PlanHash)

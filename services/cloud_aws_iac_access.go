@@ -10,6 +10,8 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/iacpr"
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -107,4 +109,21 @@ func MigrationClientsFor(onboarding *AWSOnboardingService) func(ctx context.Cont
 		}
 		return awsdiscovery.NewMigrationClients(cfg), nil
 	}
+}
+
+// ConfigureGovIaCDelivery installs the production IaC delivery adapters
+// (T3.17): the GitHub App PR adapter, whose installation tokens are minted
+// from the workspace's single App key (the same store and signing as the
+// discovery scanner, ConnectorOAuthService.MintGitHubAppToken), and the
+// migration-evidence clients from each connector's discovery session.
+func ConfigureGovIaCDelivery(db *gorm.DB, vc vault.VaultClient) {
+	oauth := NewConnectorOAuthService(db, vc)
+	SetGovIaCGitHub(&iacpr.REST{Token: func(ctx context.Context, repo iacpr.RepoRef) (string, error) {
+		ws, err := uuid.Parse(repo.WorkspaceID)
+		if err != nil || repo.InstallationID == "" {
+			return "", fmt.Errorf("the IaC source's GitHub installation is not verified")
+		}
+		return oauth.MintGitHubAppToken(ctx, ws, "github", &models.ConnectorConnection{ExternalAccountID: repo.InstallationID})
+	}})
+	SetGovMigrationClients(MigrationClientsFor(NewAWSOnboardingService(db, vc)))
 }
