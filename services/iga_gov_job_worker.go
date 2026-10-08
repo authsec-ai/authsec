@@ -541,8 +541,8 @@ func RegisterPolicyJobNoops(w *PolicyJobWorker) {
 
 // NewDefaultPolicyJobWorker is the production worker: the handlers that exist
 // in this build (evaluate_owner_rules, T3.07; notify, T3.12; compile_plans, T3.11;
-// observe_tick and refresh_activity, T3.15) plus the no-op periodic kinds,
-// and the default schedules. Later tasks Register their kinds here.
+// observe_tick and refresh_activity, T3.15; metrics_rollup, T3.18) plus the
+// no-op periodic kinds, and the default schedules. Later tasks Register their kinds here.
 func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w := NewPolicyJobWorker(db, "")
 	RegisterPolicyJobNoops(w)
@@ -571,6 +571,9 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// T3.15: observe_tick (on each publication and every 10 min for canary,
 	// expand, paused) and refresh_activity (queues a connector scan).
 	RegisterRolloutJobs(w, NewGovRollout(db, ProcessGovLiveReader()))
+	// T3.18: metrics_rollup, hourly per workspace (dedupe hour:<ts>), and
+	// its schedule.
+	RegisterMetricsJobs(w, NewGovMetrics(db, nil))
 	return w
 }
 
