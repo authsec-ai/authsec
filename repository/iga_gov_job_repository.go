@@ -126,6 +126,9 @@ type IGAGovJobRepository interface {
 	// no attempts left: Claim no longer admits it, and without this it would
 	// read `running` forever.
 	FailExhausted(now time.Time) (int64, error)
+	// FailExhaustedJobs is FailExhausted returning the jobs it failed, so
+	// the worker can run each kind's exhaustion hook (review P1-5).
+	FailExhaustedJobs(now time.Time) ([]models.IGAGovJob, error)
 	// PruneFinished deletes complete and abandoned jobs that finished before
 	// the cutoff (periodic jobs leave one row per run). Failed jobs are kept.
 	PruneFinished(before time.Time) (int64, error)
@@ -342,13 +345,20 @@ func (r *igaGovJobRepository) Requeue(f PolicyJobFence, after time.Duration) err
 }
 
 func (r *igaGovJobRepository) FailExhausted(now time.Time) (int64, error) {
-	res := r.db.Exec(`
+	jobs, err := r.FailExhaustedJobs(now)
+	return int64(len(jobs)), err
+}
+
+func (r *igaGovJobRepository) FailExhaustedJobs(now time.Time) ([]models.IGAGovJob, error) {
+	var out []models.IGAGovJob
+	err := r.db.Raw(`
 		UPDATE iga_gov_job SET status = 'failed', completed_at = now(), lease_owner = '', lease_expires_at = NULL,
 		       last_error = CASE WHEN last_error = '' THEN 'lease expired with no attempts left'
 		                         ELSE last_error || ' (lease expired with no attempts left)' END
 		 WHERE status = 'running' AND attempts >= max_attempts
-		   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`, now)
-	return res.RowsAffected, res.Error
+		   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+		RETURNING *`, now).Scan(&out).Error
+	return out, err
 }
 
 func (r *igaGovJobRepository) PruneFinished(before time.Time) (int64, error) {

@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -32,6 +33,9 @@ type AWSEnforcementAccess struct {
 	onboarding *AWSOnboardingService
 	binding    *EnforcementBindingService
 	discovery  func(ctx context.Context, c *models.CloudConnector) (awsenforce.DiscoveryIAM, error)
+	// trail builds the connector's CloudTrail client through the DISCOVERY
+	// role, in the region CloudTrail records IAM events in (review P1-7).
+	trail func(ctx context.Context, c *models.CloudConnector) (awsenforce.TrailAPI, error)
 }
 
 // EnfCodeDiscoveryUnavailable is §3.5's "deployments block with
@@ -48,7 +52,49 @@ func NewAWSEnforcementAccess(connectors repositories.CloudConnectorRepository, o
 		}
 		return awsenforce.NewLiveDiscoveryIAM(iam.NewFromConfig(cfg)), nil
 	}
+	a.trail = func(ctx context.Context, c *models.CloudConnector) (awsenforce.TrailAPI, error) {
+		// DECISION (P1-7): IAM is global; CloudTrail records its events in
+		// the commercial partition's home region. GovCloud and China
+		// connectors are not onboarded in R1a.
+		cfg, _, err := onboarding.ConfigForConnector(ctx, c.WorkspaceID, c.ID, awsenforce.TrailRegion("aws"))
+		if err != nil {
+			return nil, err
+		}
+		return awsenforce.NewLiveTrail(cfg), nil
+	}
 	return a
+}
+
+// WithTrail replaces how the CloudTrail client is built (tests: the fake
+// account's trail). The connector checks still apply.
+func (a *AWSEnforcementAccess) WithTrail(f func(ctx context.Context, c *models.CloudConnector) (awsenforce.TrailAPI, error)) *AWSEnforcementAccess {
+	a.trail = f
+	return a
+}
+
+// EnforcementSessionEvents implements GovEnforcementTrail: §8.1 step 2's
+// CloudTrail lookup of one enforcement session's events for one operation,
+// through the connector's discovery role (cloudtrail:LookupEvents). Any
+// failure -- the connector not active, the session not obtainable, the
+// lookup failing or incomplete -- is an error: the trail is unreadable, which
+// is never evidence that a request was not applied.
+func (a *AWSEnforcementAccess) EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, q GovTrailQuery) ([]GovTrailEvent, error) {
+	c, err := a.connectors.Get(ws, connectorID)
+	if err != nil {
+		return nil, err
+	}
+	if c.Provider != models.CloudProviderAWS || c.Status != models.CloudConnectorActive {
+		return nil, enfErr(http.StatusConflict, EnfCodeDiscoveryUnavailable, "The account's discovery connector is not active.",
+			map[string]any{"connector_status": c.Status})
+	}
+	if a.trail == nil {
+		return nil, errors.New("CloudTrail access is not configured")
+	}
+	api, err := a.trail(ctx, c)
+	if err != nil {
+		return nil, fmt.Errorf("CloudTrail through the discovery role: %w", err)
+	}
+	return awsenforce.LookupSessionEvents(ctx, api, q)
 }
 
 // WithDiscovery replaces how the discovery reader is built (tests: a fake

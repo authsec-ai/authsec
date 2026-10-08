@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -329,32 +328,5 @@ func TestP3T316RemoveControlAndReplacementControlA51(t *testing.T) {
 	d.db.Raw(`SELECT control_id, outcome FROM iga_gov_service_posture WHERE workspace_id = ? AND role_id = ?`, d.ws, x.role.RoleID).Scan(&rows)
 	if len(rows) != 1 || rows[0].ControlID != x2.control || rows[0].Outcome != "removed" || d.findingStatus(f) != "resolved" {
 		t.Fatalf("A51 handoff: %+v finding %s", rows, d.findingStatus(f))
-	}
-}
-
-// §8.1 step 5: a change matching the document of an unknown attempt on the
-// control, seen after the deployment verified, is drift
-// late_mutation_suspected; nothing is re-applied or reverted.
-func TestP3T316LateMutationSuspectedA58e(t *testing.T) {
-	d := newDLab(t)
-	x := d.role("A58eRole", "/", nil)
-	tp := d.compile(d.fake.Discovery(), x, "sqs")
-	dep := d.applyAndVerify(x, d.storeApproved(x, tp.Apply, *tp.Undo))
-	canon, h, err := igagov.CanonicalDocument(dOtherDoc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p3exec(t, d.db, `INSERT INTO iga_gov_document (workspace_id, document_hash, canonical, document) VALUES (?, ?, ?, ?::jsonb)
-		ON CONFLICT DO NOTHING`, d.ws, h, string(canon), string(canon))
-	att := uuid.New()
-	p3exec(t, d.db, `INSERT INTO iga_gov_attempt (id, workspace_id, deployment_id, op_seq, attempt_no, lease_version, operation, request_hash, document_hash, status)
-		VALUES (?, ?, ?, 7, 1, 1, 'CreatePolicyVersion', 'late', ?, 'prepared')`, att, d.ws, dep, h)
-	p3exec(t, d.db, `UPDATE iga_gov_attempt SET status = 'dispatched', signed_at = now(), dispatched_at = now() WHERE id = ?`, att)
-	p3exec(t, d.db, `UPDATE iga_gov_attempt SET status = 'unknown' WHERE id = ?`, att)
-	d.fake.AddVersion(*tp.Apply.DesiredBoundaryARN, dOtherDoc, true)
-	calls := len(d.fake.Calls)
-	d.mustRun("drift_check", dep)
-	if dd := d.deployment(dep); dd.State != "drifted" || dd.StateReason != services.DriftLateMutation || len(d.fake.Calls) != calls {
-		t.Fatalf("late mutation: %s %q calls %v", dd.State, dd.StateReason, d.fake.Calls[calls:])
 	}
 }

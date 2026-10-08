@@ -4,12 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
+	cttypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/smithy-go"
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
@@ -60,6 +65,20 @@ type FakeAWS struct {
 	Assumes []awsenforce.AssumeInput
 	// Reads counts discovery reads.
 	Reads int
+
+	// Now is the account's clock for CloudTrail event times (default
+	// time.Now); tests with a moved clock set it.
+	Now func() time.Time
+	// TrailErr, when set, is what every LookupEvents returns: the trail
+	// cannot be read.
+	TrailErr error
+
+	// trail is the account's CloudTrail: one record per IAM write call AWS
+	// received (applied or refused), in arrival order.
+	trail []TrailRecord
+	// holds delay the next call of an action BEFORE it reaches the account
+	// (HoldNext): the request is in flight until released.
+	holds map[string]chan struct{}
 
 	clock int
 	reqNo int
@@ -280,10 +299,8 @@ func (f *FakeAWS) AssumeEnforcement(_ context.Context, in awsenforce.AssumeInput
 	if in.RoleARN != f.RoleARN || in.ExternalID != f.ExternalID {
 		return nil, nil, APIError("AccessDenied", "User: arn:aws:iam::111111111111:role/AuthSec is not authorized to perform: sts:AssumeRole on resource: "+in.RoleARN)
 	}
-	return f, &awsenforce.Identity{
-		AccountID: f.Account,
-		ARN:       "arn:aws:sts::" + f.Account + ":assumed-role/" + strings.TrimPrefix(in.RoleARN, "arn:aws:iam::"+f.Account+":role/") + "/" + in.SessionName,
-	}, nil
+	arn := "arn:aws:sts::" + f.Account + ":assumed-role/" + strings.TrimPrefix(in.RoleARN, "arn:aws:iam::"+f.Account+":role/") + "/" + in.SessionName
+	return sessionIAM{f: f, arn: arn}, &awsenforce.Identity{AccountID: f.Account, ARN: arn}, nil
 }
 
 // Probe evaluates a request against the role's policy without changing
@@ -316,7 +333,12 @@ func (f *FakeAWS) authorise(action, resource string, ctx map[string]string) erro
 // answered finishes a write: on success it records a request id for the
 // caller (awsenforce.RecordRequestID) and runs the AfterApply hook, outside
 // the lock. unlock must be the caller's deferred-free unlock.
-func (f *FakeAWS) answered(ctx context.Context, action string, err error) error {
+func (f *FakeAWS) answered(ctx context.Context, c call, err error) error {
+	f.record(ctx, c, err)
+	action := ""
+	if err == nil {
+		action = c.action
+	}
 	hook := f.AfterApply[action]
 	if err == nil {
 		f.reqNo++
@@ -347,20 +369,22 @@ func (f *FakeAWS) policyExists(arn string) bool {
 
 // CreatePolicy implements awsenforce.IAM.
 func (f *FakeAWS) CreatePolicy(ctx context.Context, in awsenforce.CreatePolicyInput) (string, error) {
+	f.waitHold("iam:CreatePolicy")
 	f.mu.Lock()
+	c := call{op: "CreatePolicy", action: "iam:CreatePolicy", params: map[string]any{"policyName": in.Name, "path": in.Path, "policyDocument": in.Document}}
 	arn := "arn:aws:iam::" + f.Account + ":policy" + in.Path + in.Name
 	if err := f.authorise("iam:CreatePolicy", arn, nil); err != nil {
-		return "", f.answered(ctx, "", err)
+		return "", f.answered(ctx, c, err)
 	}
 	if len(in.Tags) > 0 {
 		// CreatePolicy with tags also needs iam:TagPolicy (AWS IAM user guide,
 		// "Permissions required to tag IAM entities").
 		if err := f.authorise("iam:TagPolicy", arn, nil); err != nil {
-			return "", f.answered(ctx, "", err)
+			return "", f.answered(ctx, c, err)
 		}
 	}
 	if _, ok := f.Policies[arn]; ok {
-		return "", f.answered(ctx, "", APIError("EntityAlreadyExists", "A policy called "+in.Name+" already exists."))
+		return "", f.answered(ctx, c, APIError("EntityAlreadyExists", "A policy called "+in.Name+" already exists."))
 	}
 	m := &Managed{ARN: arn, Path: in.Path, Name: in.Name, next: 1, Tags: map[string]string{}}
 	for k, v := range in.Tags {
@@ -368,72 +392,82 @@ func (f *FakeAWS) CreatePolicy(ctx context.Context, in awsenforce.CreatePolicyIn
 	}
 	m.Default = m.addVersion(f, in.Document)
 	f.Policies[arn] = m
-	return arn, f.answered(ctx, "iam:CreatePolicy", nil)
+	c.response = map[string]any{"policy": map[string]any{"arn": arn, "defaultVersionId": m.Default}}
+	return arn, f.answered(ctx, c, nil)
 }
 
 // CreatePolicyVersion implements awsenforce.IAM.
 func (f *FakeAWS) CreatePolicyVersion(ctx context.Context, arn, document string, setAsDefault bool) (string, error) {
+	f.waitHold("iam:CreatePolicyVersion")
 	f.mu.Lock()
+	c := call{op: "CreatePolicyVersion", action: "iam:CreatePolicyVersion", params: map[string]any{"policyArn": arn, "policyDocument": document, "setAsDefault": setAsDefault}}
 	if err := f.authorise("iam:CreatePolicyVersion", arn, nil); err != nil {
-		return "", f.answered(ctx, "", err)
+		return "", f.answered(ctx, c, err)
 	}
 	p, ok := f.Policies[arn]
 	if !ok {
-		return "", f.answered(ctx, "", APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
+		return "", f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
 	}
 	if len(p.Versions) >= 5 {
-		return "", f.answered(ctx, "", APIError("LimitExceeded", "A managed policy can have up to 5 versions."))
+		return "", f.answered(ctx, c, APIError("LimitExceeded", "A managed policy can have up to 5 versions."))
 	}
 	v := p.addVersion(f, document)
 	if setAsDefault {
 		p.Default = v
 	}
-	return v, f.answered(ctx, "iam:CreatePolicyVersion", nil)
+	c.response = map[string]any{"policyVersion": map[string]any{"versionId": v, "isDefaultVersion": setAsDefault}}
+	return v, f.answered(ctx, c, nil)
 }
 
 // DeletePolicyVersion implements awsenforce.IAM.
 func (f *FakeAWS) DeletePolicyVersion(ctx context.Context, arn, version string) error {
+	f.waitHold("iam:DeletePolicyVersion")
 	f.mu.Lock()
+	c := call{op: "DeletePolicyVersion", action: "iam:DeletePolicyVersion", params: map[string]any{"policyArn": arn, "versionId": version}}
 	if err := f.authorise("iam:DeletePolicyVersion", arn, nil); err != nil {
-		return f.answered(ctx, "", err)
+		return f.answered(ctx, c, err)
 	}
 	p, ok := f.Policies[arn]
 	if !ok {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
 	}
 	if p.Default == version {
-		return f.answered(ctx, "", APIError("DeleteConflict", "Cannot delete the default version of a policy."))
+		return f.answered(ctx, c, APIError("DeleteConflict", "Cannot delete the default version of a policy."))
 	}
 	for i, v := range p.Versions {
 		if v == version {
 			p.Versions = append(p.Versions[:i], p.Versions[i+1:]...)
 			delete(p.Docs, v)
 			delete(p.Created, v)
-			return f.answered(ctx, "iam:DeletePolicyVersion", nil)
+			return f.answered(ctx, c, nil)
 		}
 	}
-	return f.answered(ctx, "", APIError("NoSuchEntity", "Version "+version+" does not exist"))
+	return f.answered(ctx, c, APIError("NoSuchEntity", "Version "+version+" does not exist"))
 }
 
 // TagPolicy implements awsenforce.IAM.
 func (f *FakeAWS) TagPolicy(ctx context.Context, arn string, tags map[string]string) error {
+	f.waitHold("iam:TagPolicy")
 	f.mu.Lock()
+	c := call{op: "TagPolicy", action: "iam:TagPolicy", params: map[string]any{"policyArn": arn, "tags": tags}}
 	if err := f.authorise("iam:TagPolicy", arn, nil); err != nil {
-		return f.answered(ctx, "", err)
+		return f.answered(ctx, c, err)
 	}
 	p, ok := f.Policies[arn]
 	if !ok {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
 	}
 	for k, v := range tags {
 		p.Tags[k] = v
 	}
-	return f.answered(ctx, "iam:TagPolicy", nil)
+	return f.answered(ctx, c, nil)
 }
 
 // PutRolePermissionsBoundary implements awsenforce.IAM.
 func (f *FakeAWS) PutRolePermissionsBoundary(ctx context.Context, roleName, boundary string) error {
+	f.waitHold("iam:PutRolePermissionsBoundary")
 	f.mu.Lock()
+	c := call{op: "PutRolePermissionsBoundary", action: "iam:PutRolePermissionsBoundary", params: map[string]any{"roleName": roleName, "permissionsBoundary": boundary}}
 	r, ok := f.Roles[roleName]
 	resource := "arn:aws:iam::" + f.Account + ":role/" + roleName
 	actx := map[string]string{"iam:PermissionsBoundary": boundary}
@@ -444,23 +478,25 @@ func (f *FakeAWS) PutRolePermissionsBoundary(ctx context.Context, roleName, boun
 		}
 	}
 	if err := f.authorise("iam:PutRolePermissionsBoundary", resource, actx); err != nil {
-		return f.answered(ctx, "", err)
+		return f.answered(ctx, c, err)
 	}
 	if !ok {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
 	}
 	if !f.policyExists(boundary) {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "Policy "+boundary+" does not exist or is not attachable."))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+boundary+" does not exist or is not attachable."))
 	}
 	r.Boundary = boundary
-	return f.answered(ctx, "iam:PutRolePermissionsBoundary", nil)
+	return f.answered(ctx, c, nil)
 }
 
 // DeleteRolePermissionsBoundary implements awsenforce.IAM. The
 // iam:PermissionsBoundary key carries the boundary CURRENTLY attached, as
 // §3.6 expects AWS to supply it; with none attached the key is absent.
 func (f *FakeAWS) DeleteRolePermissionsBoundary(ctx context.Context, roleName string) error {
+	f.waitHold("iam:DeleteRolePermissionsBoundary")
 	f.mu.Lock()
+	c := call{op: "DeleteRolePermissionsBoundary", action: "iam:DeleteRolePermissionsBoundary", params: map[string]any{"roleName": roleName}}
 	r, ok := f.Roles[roleName]
 	resource := "arn:aws:iam::" + f.Account + ":role/" + roleName
 	actx := map[string]string{}
@@ -472,40 +508,42 @@ func (f *FakeAWS) DeleteRolePermissionsBoundary(ctx context.Context, roleName st
 		}
 	}
 	if err := f.authorise("iam:DeleteRolePermissionsBoundary", resource, actx); err != nil {
-		return f.answered(ctx, "", err)
+		return f.answered(ctx, c, err)
 	}
 	if !ok {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
 	}
 	r.Boundary = ""
-	return f.answered(ctx, "iam:DeleteRolePermissionsBoundary", nil)
+	return f.answered(ctx, c, nil)
 }
 
 // DeletePolicy implements awsenforce.IAM.
 func (f *FakeAWS) DeletePolicy(ctx context.Context, arn string) error {
+	f.waitHold("iam:DeletePolicy")
 	f.mu.Lock()
+	c := call{op: "DeletePolicy", action: "iam:DeletePolicy", params: map[string]any{"policyArn": arn}}
 	if err := f.authorise("iam:DeletePolicy", arn, nil); err != nil {
-		return f.answered(ctx, "", err)
+		return f.answered(ctx, c, err)
 	}
 	p, ok := f.Policies[arn]
 	if !ok {
-		return f.answered(ctx, "", APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
+		return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+arn+" does not exist"))
 	}
 	for _, r := range f.Roles {
 		if r.Boundary == arn {
-			return f.answered(ctx, "", APIError("DeleteConflict", "Cannot delete a policy attached to entities."))
+			return f.answered(ctx, c, APIError("DeleteConflict", "Cannot delete a policy attached to entities."))
 		}
 		for _, a := range r.Attached {
 			if a == arn {
-				return f.answered(ctx, "", APIError("DeleteConflict", "Cannot delete a policy attached to entities."))
+				return f.answered(ctx, c, APIError("DeleteConflict", "Cannot delete a policy attached to entities."))
 			}
 		}
 	}
 	if len(p.Versions) > 1 {
-		return f.answered(ctx, "", APIError("DeleteConflict", "This policy has more than one version. Before you delete a policy, you must delete the policy's versions."))
+		return f.answered(ctx, c, APIError("DeleteConflict", "This policy has more than one version. Before you delete a policy, you must delete the policy's versions."))
 	}
 	delete(f.Policies, arn)
-	return f.answered(ctx, "iam:DeletePolicy", nil)
+	return f.answered(ctx, c, nil)
 }
 
 // RemoveStatement drops a statement by Sid from the simulated policy, as a
@@ -671,4 +709,196 @@ func copyMap(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+/* -------------------------------- CloudTrail -------------------------------- */
+
+// call is one IAM write as CloudTrail records it.
+type call struct {
+	op       string // CloudTrail eventName
+	action   string // the AfterApply key (iam:<op>)
+	params   map[string]any
+	response map[string]any
+}
+
+// TrailRecord is one CloudTrail record of the fake account: what AWS
+// received, applied or refused. Tests edit the trail (EditTrail) to make it
+// disagree with the account (A58 d).
+type TrailRecord struct {
+	EventID   string
+	EventName string
+	EventTime time.Time
+	// PrincipalARN is the caller: an assumed-role session ARN for the
+	// enforcement role's calls, "" for calls made on the account directly.
+	PrincipalARN string
+	ErrorCode    string
+	Request      map[string]any
+	Response     map[string]any
+}
+
+type sessionKey struct{}
+
+// sessionIAM is the enforcement client of one assumed session: its calls are
+// recorded in CloudTrail under the session's ARN.
+type sessionIAM struct {
+	f   *FakeAWS
+	arn string
+}
+
+func (s sessionIAM) ctx(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sessionKey{}, s.arn)
+}
+
+func (s sessionIAM) CreatePolicy(ctx context.Context, in awsenforce.CreatePolicyInput) (string, error) {
+	return s.f.CreatePolicy(s.ctx(ctx), in)
+}
+func (s sessionIAM) CreatePolicyVersion(ctx context.Context, arn, document string, setAsDefault bool) (string, error) {
+	return s.f.CreatePolicyVersion(s.ctx(ctx), arn, document, setAsDefault)
+}
+func (s sessionIAM) DeletePolicyVersion(ctx context.Context, arn, version string) error {
+	return s.f.DeletePolicyVersion(s.ctx(ctx), arn, version)
+}
+func (s sessionIAM) TagPolicy(ctx context.Context, arn string, tags map[string]string) error {
+	return s.f.TagPolicy(s.ctx(ctx), arn, tags)
+}
+func (s sessionIAM) PutRolePermissionsBoundary(ctx context.Context, roleName, boundary string) error {
+	return s.f.PutRolePermissionsBoundary(s.ctx(ctx), roleName, boundary)
+}
+func (s sessionIAM) DeleteRolePermissionsBoundary(ctx context.Context, roleName string) error {
+	return s.f.DeleteRolePermissionsBoundary(s.ctx(ctx), roleName)
+}
+func (s sessionIAM) DeletePolicy(ctx context.Context, arn string) error {
+	return s.f.DeletePolicy(s.ctx(ctx), arn)
+}
+
+func (f *FakeAWS) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
+}
+
+// record appends the CloudTrail record of a write the account received (the
+// caller holds the lock). err is AWS's answer: an API error is recorded with
+// its code; nil is an applied request.
+func (f *FakeAWS) record(ctx context.Context, c call, err error) {
+	if c.op == "" {
+		return
+	}
+	principal, _ := ctx.Value(sessionKey{}).(string)
+	rec := TrailRecord{EventID: fmt.Sprintf("fake-evt-%d", len(f.trail)+1), EventName: c.op, EventTime: f.now().UTC(),
+		PrincipalARN: principal, Request: c.params}
+	if err != nil {
+		var api smithy.APIError
+		if errors.As(err, &api) {
+			rec.ErrorCode = api.ErrorCode()
+		} else {
+			rec.ErrorCode = "InternalFailure"
+		}
+	} else {
+		rec.Response = c.response
+	}
+	f.trail = append(f.trail, rec)
+}
+
+// Trail returns a copy of the account's CloudTrail records.
+func (f *FakeAWS) Trail() []TrailRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]TrailRecord{}, f.trail...)
+}
+
+// EditTrail replaces the account's CloudTrail records with edit's result.
+func (f *FakeAWS) EditTrail(edit func([]TrailRecord) []TrailRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.trail = edit(append([]TrailRecord{}, f.trail...))
+}
+
+// HoldNext delays the NEXT call of action (for example
+// "iam:CreatePolicyVersion") before it reaches the account: the caller
+// waits, as for a request still in flight, until release is called; then
+// the request is applied (or refused) as if it arrived at that moment. The
+// caller's own timeout does not cancel it (A58 b, e).
+func (f *FakeAWS) HoldNext(action string) (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holds == nil {
+		f.holds = map[string]chan struct{}{}
+	}
+	ch := make(chan struct{})
+	f.holds[action] = ch
+	var once sync.Once
+	return func() { once.Do(func() { close(ch) }) }
+}
+
+func (f *FakeAWS) waitHold(action string) {
+	f.mu.Lock()
+	ch := f.holds[action]
+	delete(f.holds, action)
+	f.mu.Unlock()
+	if ch != nil {
+		<-ch
+	}
+}
+
+// LookupEvents is CloudTrail's LookupEvents over the account's records
+// (awsenforce.TrailAPI): the EventName lookup attribute, the time window
+// (inclusive), 50 events per page, newest first, each with the record as
+// CloudTrailEvent JSON. TrailErr fails every call.
+func (f *FakeAWS) LookupEvents(_ context.Context, in *cloudtrail.LookupEventsInput, _ ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.TrailErr != nil {
+		return nil, f.TrailErr
+	}
+	name := ""
+	for _, a := range in.LookupAttributes {
+		if a.AttributeKey == cttypes.LookupAttributeKeyEventName {
+			name = aws.ToString(a.AttributeValue)
+		}
+	}
+	var match []TrailRecord
+	for i := len(f.trail) - 1; i >= 0; i-- {
+		r := f.trail[i]
+		if name != "" && r.EventName != name {
+			continue
+		}
+		if in.StartTime != nil && r.EventTime.Before(*in.StartTime) {
+			continue
+		}
+		if in.EndTime != nil && r.EventTime.After(*in.EndTime) {
+			continue
+		}
+		match = append(match, r)
+	}
+	start := 0
+	if in.NextToken != nil {
+		fmt.Sscanf(*in.NextToken, "%d", &start)
+	}
+	end := start + 50
+	out := &cloudtrail.LookupEventsOutput{}
+	if end < len(match) {
+		out.NextToken = aws.String(fmt.Sprintf("%d", end))
+	} else {
+		end = len(match)
+	}
+	for _, r := range match[start:end] {
+		raw := map[string]any{"eventVersion": "1.08", "eventID": r.EventID, "eventName": r.EventName,
+			"eventTime": r.EventTime.Format(time.RFC3339), "eventSource": "iam.amazonaws.com", "awsRegion": "us-east-1",
+			"requestParameters": r.Request, "responseElements": r.Response}
+		if r.PrincipalARN != "" {
+			raw["userIdentity"] = map[string]any{"type": "AssumedRole", "arn": r.PrincipalARN}
+		} else {
+			raw["userIdentity"] = map[string]any{"type": "IAMUser", "arn": "arn:aws:iam::" + f.Account + ":user/admin"}
+		}
+		if r.ErrorCode != "" {
+			raw["errorCode"] = r.ErrorCode
+		}
+		b, _ := json.Marshal(raw)
+		t := r.EventTime
+		out.Events = append(out.Events, cttypes.Event{EventId: aws.String(r.EventID), EventName: aws.String(r.EventName),
+			EventTime: &t, EventSource: aws.String("iam.amazonaws.com"), CloudTrailEvent: aws.String(string(b))})
+	}
+	return out, nil
 }
