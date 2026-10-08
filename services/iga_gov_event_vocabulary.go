@@ -143,22 +143,6 @@ var GovEventVocabulary = []GovEventKind{
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
 	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
-	// T3.11 / T3.13 authoring, approval and revalidation (listed at T3.16:
-	// written since wave 4, missing from the vocabulary at the merge).
-	{"policy_created", GovCatProposal, GovObjPolicy, "A policy was created from a proposal."},
-	{"proposal_created", GovCatProposal, GovObjPolicy, "A proposal (policy, controls, version 1) was created."},
-	{"policy_updated", GovCatProposal, GovObjPolicy, "A policy's name, purpose or owner changed."},
-	{"policy_paused", GovCatProposal, GovObjPolicy, "A policy was paused."},
-	{"policy_resumed", GovCatProposal, GovObjPolicy, "A policy was resumed."},
-	{"policy_archived", GovCatProposal, GovObjPolicy, "A policy was archived."},
-	{"version_created", GovCatProposal, GovObjVersion, "A draft version was created."},
-	{"version_proposed", GovCatProposal, GovObjVersion, "A version was proposed: plans compiled, review opened."},
-	{"plans_recompiled", GovCatProposal, GovObjVersion, "An in-review version's plans were recompiled."},
-	{"impact_changed", GovCatProposal, GovObjVersion, "A target's impact changed on recompilation."},
-	{"version_approved", GovCatApproval, GovObjVersion, "A version was approved."},
-	{"acceptance_recorded", GovCatAcceptance, GovObjVersion, "An uncertainty was accepted at approval."},
-	{"plan_revalidated", GovCatRevalidation, GovObjVersion, "An approved plan's evidence was revalidated."},
-	{"approval_revoked", GovCatRevalidation, GovObjVersion, "An approval was revoked by a material change."},
 	// T3.16 deployments, verification, drift, undo and control removal
 	// (iga_gov_deploy_*.go).
 	{GovEventDeploymentStarted, GovCatDeploymentAttempt, GovObjDeployment, "A deployment started (authority checked, binding fresh)."},
