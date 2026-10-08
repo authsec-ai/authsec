@@ -121,24 +121,6 @@ var GovEventVocabulary = []GovEventKind{
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
 	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
-	// T3.11 authoring / compile and T3.13 approval (iga_gov_authoring_service.go,
-	// iga_gov_compile_service.go, iga_gov_approval_service.go). Listed by
-	// T3.17: the T3.11/T3.13 merge wrote them without vocabulary entries,
-	// which failed TestP3T320EventVocabularyMatchesWriters.
-	{"policy_created", GovCatProposal, GovObjPolicy, "A policy was created from a proposal."},
-	{"proposal_created", GovCatProposal, GovObjPolicy, "A proposal created a policy, its controls, version 1 and targets."},
-	{"policy_updated", GovCatProposal, GovObjPolicy, "A policy's name, purpose or owner changed."},
-	{"policy_paused", GovCatProposal, GovObjPolicy, "A policy was paused."},
-	{"policy_resumed", GovCatProposal, GovObjPolicy, "A policy was resumed."},
-	{"policy_archived", GovCatProposal, GovObjPolicy, "A policy was archived."},
-	{"version_created", GovCatProposal, GovObjVersion, "A new draft version was created."},
-	{"version_proposed", GovCatProposal, GovObjVersion, "A version's plans were compiled and it went to review."},
-	{"plans_recompiled", GovCatProposal, GovObjVersion, "A version in review was recompiled."},
-	{"impact_changed", GovCatProposal, GovObjVersion, "A recompile changed a target's impact."},
-	{"version_approved", GovCatApproval, GovObjVersion, "A version was approved."},
-	{"acceptance_recorded", GovCatAcceptance, GovObjVersion, "An approver accepted one unanalysed form or evidence gap."},
-	{"plan_revalidated", GovCatRevalidation, GovObjVersion, "An approved plan was revalidated against newer evidence."},
-	{"approval_revoked", GovCatRevalidation, GovObjVersion, "An approval was revoked by a material change."},
 	// T3.17 IaC sources (iga_gov_iac_source_service.go): delivery setup.
 	{GovEventIaCSourceCreated, GovCatEnforcementSetup, GovObjConnector, "An IaC source (repository directory) was mapped to an AWS account."},
 	{GovEventIaCSourceDeleted, GovCatEnforcementSetup, GovObjConnector, "An IaC source was removed."},
