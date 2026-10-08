@@ -1,12 +1,15 @@
 package repositories
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -29,8 +32,8 @@ type DiscoveryRepository interface {
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	TouchSource(workspaceID, id uuid.UUID, status string) error
 	UpdateSource(s *models.DiscoverySource) error
-	// DeleteSource removes a source, its integration, and its findings.
-	// Returns a secrets-store path to purge when this was the workspace's last
+	// DeleteSource removes a source, its integration, and its findings, and
+	// revokes (never deletes) the ingest tokens bound to it. Returns a secrets-store path to purge when this was the workspace's last
 	// GitHub organisation, or "" when there is nothing to purge.
 	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
@@ -63,6 +66,10 @@ type DiscoveryRepository interface {
 	// last seen in the manifest's scope but missing from it is marked gone.
 	// Returns the fingerprints it marked.
 	MarkAbsent(in MarkAbsentInput) ([]string, error)
+	// ApplyPresentRuntime folds a manifest's POSITIVE observations into the
+	// runtime state: fingerprints present but scaled to zero become stopped,
+	// and stopped ones present again with replicas become running. Never gone.
+	ApplyPresentRuntime(in PresentRuntimeInput) (stopped, resumed []string, err error)
 
 	// ClaimAgent links a sighting to a governed identity and an accountable
 	// owner in one conditional update. Refuses a quarantined or already-claimed
@@ -124,6 +131,18 @@ type MarkAbsentInput struct {
 	SweepStartedAt time.Time
 	ObservedAt     time.Time
 	Reason         string
+}
+
+// PresentRuntimeInput is what a manifest observed PRESENT, split by whether it
+// was running: Stopped are workloads that exist with zero replicas, Running the
+// rest. Scoped like MarkAbsent: one workspace, source kind and cluster.
+type PresentRuntimeInput struct {
+	WorkspaceID uuid.UUID
+	Source      string
+	ClusterName string
+	Stopped     []string
+	Running     []string
+	ObservedAt  time.Time
 }
 
 // ClaimAgentInput carries everything a claim needs. OwnerUserID is mandatory —
@@ -210,12 +229,21 @@ func (r *discoveryRepository) ListSources(workspaceID uuid.UUID, kind string, en
 // ignores the error. Without this, last_sync_at is never written by anything and
 // the console shows every integration as "Never run" forever.
 func (r *discoveryRepository) TouchSource(workspaceID, id uuid.UUID, status string) error {
+	// A sighting NEVER clears a recorded cluster UID conflict. The sighting
+	// that touches the source may be the matching cluster's -- or the very
+	// sighting just refused for its UID -- and it proves nothing about the
+	// conflicting one, so letting it reset last_status/last_error hid the
+	// conflict seconds after it was recorded (and made which one the console
+	// showed depend on the order sightings arrived in). The conflict stays
+	// until a heartbeat from the recorded cluster UID clears it after the hold
+	// (UpsertSelfRegistration), or an operator updates the connection.
+	conflicted := `last_status = '` + ClusterUIDConflictStatus + `'`
 	return r.db.Model(&models.DiscoverySource{}).
 		Where("workspace_id = ? AND id = ?", workspaceID, id).
 		Updates(map[string]interface{}{
 			"last_sync_at": time.Now(),
-			"last_status":  status,
-			"last_error":   "",
+			"last_status":  gorm.Expr(`CASE WHEN `+conflicted+` THEN last_status ELSE ? END`, status),
+			"last_error":   gorm.Expr(`CASE WHEN ` + conflicted + ` THEN last_error ELSE '' END`),
 			"updated_at":   time.Now(),
 		}).Error
 }
@@ -248,9 +276,19 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 // Everything that points at discovered_agents (events, access requests,
 // provenance, provisioning instructions, IGA links) is itself ON DELETE SET
 // NULL, so this cannot cascade into an audit trail or fail on a dependent row.
+//
+// The source's ingest tokens are REVOKED, not deleted, in the same transaction
+// and before the source row goes (RevokeSourceIngestTokens). Their foreign key
+// is ON DELETE SET NULL (044), so they stay as revoked history with
+// source_bound true and no source; a NULL source on an unrevoked bound token
+// would read as a workspace-wide token, which the table's CHECK refuses -- so a
+// delete that did not revoke first fails instead of widening a credential.
 func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
 	purgePath := ""
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	// Under row-level security for the workspace: the graph retirement below
+	// (k8sgraph.RetireSource) runs on this transaction.
+	rlsCtx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(rlsCtx, r.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var src models.DiscoverySource
 		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 			return err
@@ -265,12 +303,27 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, e
 			integrationID = cfg.IntegrationID
 		}
 
+		// The graph objects only this source vouched for are retired, and its
+		// own claims ended and kept as history -- BEFORE the source row goes,
+		// because the FK cascade deletes the support rows that say which
+		// objects those are. Left to the cascade, they stayed active with no
+		// support, hidden from every view and retired by none.
+		if _, rerr := k8sgraph.RetireSource(tx, workspaceID, id, time.Now().UTC()); rerr != nil {
+			return fmt.Errorf("retire the source's graph objects: %w", rerr)
+		}
+
 		// BEFORE the source: once the source row goes, the FK nulls
 		// discovery_source_id and there is no way left to tell which findings
 		// belonged to it.
 		if derr := tx.Delete(&models.DiscoveredAgent{},
 			"workspace_id = ? AND discovery_source_id = ?", workspaceID, id).Error; derr != nil {
 			return derr
+		}
+
+		// BEFORE the source, like the findings: an agent holding a token bound
+		// to this source must stop authenticating the moment it is gone.
+		if _, terr := RevokeSourceIngestTokens(tx, workspaceID, id); terr != nil {
+			return fmt.Errorf("revoke the source's ingest tokens: %w", terr)
 		}
 
 		res := tx.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
@@ -340,6 +393,68 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, e
 
 /* -------------------------- self-registration --------------------------- */
 
+// ClusterUIDConflictStatus is the last_status a self-registered connector
+// carries while an agent registering under its instance reports a cluster UID
+// other than the one the connector recorded first (see UpsertSelfRegistration).
+const ClusterUIDConflictStatus = "cluster_uid_conflict"
+
+// clusterUIDConflictHold is how long a recorded cluster UID conflict stays on
+// the connector after the last conflicting heartbeat. Several heartbeat
+// intervals, so the matching cluster's heartbeats in between do not clear it.
+const clusterUIDConflictHold = 15 * time.Minute
+
+// RecordClusterUIDConflict marks a connector cluster_uid_conflict because
+// something other than a heartbeat -- an RBAC snapshot, a resync manifest, a
+// sighting -- reported a cluster UID other than the one it recorded. The same
+// three fields UpsertSelfRegistration writes for a conflicting heartbeat
+// (last_status, last_error, runtime.cluster_uid_conflict with last_seen_at
+// now), so the console shows one kind of conflict however it was detected, and
+// the heartbeat path's hold keeps it visible. The recorded UID itself is never
+// touched. Never fails the caller's request: the error is returned for the
+// caller to log.
+//
+// reportedUID "" records data that stated NO cluster UID for a connector that
+// has one (refused under IGA_K8S_REQUIRE_CLUSTER_UID): the same status and
+// runtime key, with reported_uid "" and reason "missing", and a last_error
+// that says the UID was missing rather than naming an empty cluster.
+func RecordClusterUIDConflict(db *gorm.DB, workspaceID, sourceID uuid.UUID,
+	reportedUID, via string) error {
+
+	if reportedUID == "" {
+		return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_required: this connection belongs to cluster %s, but an incoming %s '
+		        || 'states no cluster UID, so it cannot be shown to come from this cluster and is '
+		        || 'refused. Upgrade the agent so it reports its cluster UID, or set '
+		        || 'IGA_K8S_REQUIRE_CLUSTER_UID=false on the control plane.', cluster_uid, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', '',
+		                              'reason', 'missing', 'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ? AND cluster_uid <> ''`,
+			ClusterUIDConflictStatus, via, via, workspaceID, sourceID).Error
+	}
+
+	return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_conflict: this connection belongs to cluster %s, but an incoming %s '
+		        || 'reports cluster %s. Two clusters are installed under one cluster name; '
+		        || 'data from %s is refused. Rename one cluster, or delete and re-add this '
+		        || 'connection to re-bind it.', cluster_uid, ?::text, ?::text, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', ?::text,
+		                              'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ?
+		   AND cluster_uid <> '' AND cluster_uid <> ?`,
+		ClusterUIDConflictStatus, via, reportedUID, reportedUID, reportedUID, via,
+		workspaceID, sourceID, reportedUID).Error
+}
+
 // UpsertSelfRegistration folds an agent heartbeat into its connector row.
 //
 // ON CONFLICT against the PARTIAL unique index discovery_sources_instance_key.
@@ -358,21 +473,75 @@ func (r *discoveryRepository) UpsertSelfRegistration(s *models.DiscoverySource) 
 	// Machine-owned fields only. display_name, enabled, config, created_by and
 	// created_at are deliberately absent: an admin may rename a connector or
 	// disable it, and the next heartbeat 60 seconds later must not undo that.
+	// last_status, last_error, runtime and cluster_uid are set below: each
+	// depends on whether this heartbeat's cluster UID conflicts with the row's.
 	assignments := map[string]interface{}{
 		"cluster_name":      s.ClusterName,
 		"agent_version":     s.AgentVersion,
 		"last_heartbeat_at": s.LastHeartbeatAt,
-		"last_status":       s.LastStatus,
-		"last_error":        s.LastError,
-		"runtime":           s.Runtime,
 		"self_registered":   true,
 		"updated_at":        time.Now(),
 	}
-	// Keep the last non-empty cluster UID. An agent that loses the RBAC to read it
-	// (or is upgraded from a version that never sent it) would otherwise erase the
-	// only evidence of which physical cluster this row belongs to.
+	// THE FIRST RECORDED CLUSTER UID WINS, and nothing a heartbeat says moves it.
+	//
+	// The UID is the only evidence of which physical cluster this row belongs
+	// to, and the RBAC snapshot path refuses any sweep whose UID differs from it
+	// (ErrClusterUIDMismatch). Letting the latest heartbeat overwrite it meant a
+	// second cluster installed under the same name could re-point the row at
+	// itself with one heartbeat -- its sweeps then accepted, the real cluster's
+	// refused, and which one "owned" the row flipping with every heartbeat.
+	//
+	// So: an empty UID is filled once; an empty report never erases one (an
+	// agent that lost the RBAC to read it); and a DIFFERENT non-empty report is
+	// recorded as a conflict -- last_status cluster_uid_conflict, both UIDs in
+	// last_error and runtime.cluster_uid_conflict -- while the heartbeat itself is
+	// still accepted (liveness, version and runtime are refreshed). The only way
+	// to change a recorded UID is to delete the connection and let the agent
+	// register again.
+	//
+	// The conflict is HELD for clusterUIDConflictHold after the last conflicting
+	// heartbeat. Both clusters heartbeat under the same instance_id ("k8s:" +
+	// cluster name), so without the hold the matching cluster's next heartbeat
+	// would clear the status a minute later and the console would show the
+	// conflict only half of the time.
+	//
+	// In ON CONFLICT DO UPDATE every discovery_sources.* reference reads the row
+	// as it was BEFORE this statement, so the expressions below see the same
+	// recorded UID regardless of the order Postgres applies them in.
+	conflict := `(excluded.cluster_uid <> '' AND discovery_sources.cluster_uid <> ''
+	              AND excluded.cluster_uid <> discovery_sources.cluster_uid)`
+	// A heartbeat stating NO UID never clears a recorded conflict either: it
+	// is not the recorded cluster vouching for itself. Only a heartbeat from
+	// the recorded UID (after the hold) or an operator clears it.
+	held := `((discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	          AND (discovery_sources.runtime->'cluster_uid_conflict'->>'last_seen_at')::timestamptz
+	              > now() - make_interval(secs => ?))
+	         OR (discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	             AND excluded.cluster_uid = ''))`
+	hold := clusterUIDConflictHold.Seconds()
 	assignments["cluster_uid"] = gorm.Expr(
-		"CASE WHEN excluded.cluster_uid <> '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")
+		"CASE WHEN discovery_sources.cluster_uid = '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")
+	assignments["last_status"] = gorm.Expr(
+		`CASE WHEN `+conflict+` OR `+held+` THEN '`+ClusterUIDConflictStatus+`'
+		      ELSE excluded.last_status END`, hold)
+	assignments["last_error"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN format(
+		          'cluster_uid_conflict: this connection belongs to cluster %s, but an agent '
+		       || 'registering under the same instance (%s) reports cluster %s. Two clusters are '
+		       || 'installed under one cluster name; RBAC snapshots from %s are refused. Rename '
+		       || 'one cluster, or delete and re-add this connection to re-bind it.',
+		          discovery_sources.cluster_uid, discovery_sources.instance_id,
+		          excluded.cluster_uid, excluded.cluster_uid)
+		      WHEN `+held+` THEN discovery_sources.last_error
+		      ELSE excluded.last_error END`, hold)
+	assignments["runtime"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          jsonb_build_object('recorded_uid', discovery_sources.cluster_uid,
+		                             'reported_uid', excluded.cluster_uid,
+		                             'last_seen_at', now()))
+		      WHEN `+held+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          discovery_sources.runtime->'cluster_uid_conflict')
+		      ELSE excluded.runtime END`, hold)
 	// last_sync_at means "last did useful work", which a heartbeat is not — an idle
 	// cluster heartbeats without producing sightings. Only advance it when the
 	// agent says it actually reported something.
@@ -786,6 +955,71 @@ func (r *discoveryRepository) MarkAbsent(in MarkAbsentInput) ([]string, error) {
 		return nil, err
 	}
 	return fingerprints, nil
+}
+
+// ApplyPresentRuntime marks present-but-scaled-to-zero agents stopped and
+// stopped agents that are running again running.
+//
+// Both are POSITIVE observations -- the sweep saw the workload -- so neither
+// needs a complete sweep, and neither can ever produce gone: a workload scaled
+// to zero still exists, and retiring it would delete an agent that is one
+// `kubectl scale` from running. Only a row that is currently running/unknown
+// becomes stopped, and only a stopped one becomes running: a gone row is not
+// resurrected here (a sighting does that, with its reappeared event), and the
+// monotonic guard keeps a late manifest from overriding newer evidence.
+func (r *discoveryRepository) ApplyPresentRuntime(in PresentRuntimeInput) ([]string, []string, error) {
+	if in.WorkspaceID == uuid.Nil || in.Source == "" || strings.TrimSpace(in.ClusterName) == "" {
+		return nil, nil, errors.New("workspace, source and cluster are required to apply runtime state")
+	}
+	if in.ObservedAt.IsZero() {
+		in.ObservedAt = time.Now()
+	}
+	// set is a fixed SQL fragment; every value goes through a placeholder.
+	apply := func(fps, from []string, set string, setArgs ...interface{}) ([]string, error) {
+		if len(fps) == 0 {
+			return nil, nil
+		}
+		var rows []struct{ Fingerprint string }
+		args := append(append([]interface{}{}, setArgs...),
+			in.WorkspaceID, in.Source, in.ClusterName, fps, from, models.EvidenceDeclared, in.ObservedAt)
+		if err := r.db.Raw(`
+			UPDATE discovered_agents
+			   SET `+set+`, updated_at = now()
+			 WHERE workspace_id = ? AND source = ?
+			   AND metadata #>> '{cluster,name}' = ?
+			   AND fingerprint IN ?
+			   AND runtime_status IN ?
+			   AND evidence_mode <> ?
+			   AND (runtime_observed_at IS NULL OR runtime_observed_at <= ?)
+			RETURNING fingerprint`, args...).Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.Fingerprint)
+		}
+		return out, nil
+	}
+
+	stopped, err := apply(in.Stopped,
+		[]string{models.RuntimeStatusRunning, models.RuntimeStatusUnknown},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?`,
+		models.RuntimeStatusStopped,
+		"scaled to zero: present in a resync sweep with no running replicas", in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark stopped: %w", err)
+	}
+	resumed, err := apply(in.Running,
+		[]string{models.RuntimeStatusStopped},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?,
+		 last_observed_running_at = GREATEST(COALESCE(last_observed_running_at, ?::timestamptz), ?::timestamptz)`,
+		models.RuntimeStatusRunning,
+		"running again: present in a resync sweep with replicas", in.ObservedAt,
+		in.ObservedAt, in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark running: %w", err)
+	}
+	return stopped, resumed, nil
 }
 
 /* --------------------------- claim / quarantine ------------------------- */

@@ -282,7 +282,7 @@ Same branch (`fix/p0-containment`), nothing pushed.
 
 ### What changed
 - **Login tickets.**
-  - Migration `043_login_tickets.sql`, with the same end state in `001_bootstrap.sql`, plus a new package `internal/logintickets`.
+  - Migration `101_login_tickets.sql`, with the same end state in `001_bootstrap.sql`, plus a new package `internal/logintickets`.
   - Tickets are opaque, stored as SHA-256 hashes, last 15 minutes, are single use, and carry a realm (`admin` or `enduser`).
 - **Issued only after a server-verified first factor:**
   - admin: `/uflow/login`, `/auth/admin/login` (when MFA is required), the OIDC admin login response

@@ -36,16 +36,17 @@ package igaread
 // (§5.4 "Filtered by: statement lifecycle"), so the default reads only active
 // statements' targets, and the edge's state is the statement's (D-1).
 //
-// ONE PROVIDER PER TRAVERSAL. Every node and edge predicate names the
-// provider through graphProviderSlot, which the traversal renders as its
-// root's provider -- 'aws' for an AWS root, so the SQL an AWS request runs is
-// the SQL it always ran, and 'k8s' for a Kubernetes root (traverse_k8s.go).
-// Never `provider IN ('aws', 'k8s')`: no projector writes an edge from one
-// provider's node to the other's, and a predicate that admitted one would let
-// a defect in either projector draw a path across the boundary. The one
-// crossing that exists -- an AWS trust naming a Kubernetes service account
-// (IRSA, EKS Pod Identity) -- runs through an external principal, which is
-// shown and never followed (§5.4, graphResolutionUnfollowed).
+// ONE PROVIDER PER EDGE. Every node and edge predicate names the provider
+// through graphProviderSlot, which the traversal renders as the provider of
+// the frontier nodes a statement reads FROM -- 'aws' for AWS nodes, so the
+// SQL an AWS request runs is the SQL it always ran, and 'k8s' for Kubernetes
+// nodes (traverse_k8s.go). Never `provider IN ('aws', 'k8s')`: no projector
+// writes an edge from one provider's node to the other's, and a predicate
+// that admitted one would let a defect in either projector draw a path
+// across the boundary. The one crossing that exists -- an AWS trust naming a
+// Kubernetes ServiceAccount (IRSA, EKS Pod Identity) -- runs through an
+// external principal resolved at read time, and is read as the AWS claim it
+// is (traverse_cross.go, D-108).
 
 import (
 	"strings"
@@ -73,9 +74,6 @@ func graphRender(sql, provider string) string {
 	}
 	return strings.ReplaceAll(sql, graphProviderSlot, "'"+provider+"'")
 }
-
-// render is graphRender for this traversal's provider.
-func (t *graphTraversal) render(sql string) string { return graphRender(sql, t.provider) }
 
 // graphEdgeSpec is how to read one edge kind in one direction. Every SQL
 // fragment is free of bind variables except where a caller appends them. The
@@ -300,10 +298,11 @@ var graphNodeTables = map[string]string{
 	RefResource:          "iga_resources",
 }
 
-// predicates is the spec's WHERE after the workspace: its own predicates and,
-// unless the request asked for ended edges, its lifecycle filter.
-func (t *graphTraversal) predicates(s *graphEdgeSpec) string {
-	return t.render(graphPredicates(s, t.ended))
+// predicates is the spec's WHERE after the workspace, for one provider: its
+// own predicates and, unless the request asked for ended edges, its
+// lifecycle filter.
+func (t *graphTraversal) predicates(s *graphEdgeSpec, side string) string {
+	return graphRender(graphPredicates(s, t.ended), side)
 }
 
 // graphPredicates is predicates before the provider is rendered.
@@ -315,10 +314,11 @@ func graphPredicates(s *graphEdgeSpec, ended bool) string {
 	return p
 }
 
-// queryEdges is ONE level's statement for one edge kind: every frontier node
-// of the kind's near types at once, ordered by (target source_key, id), at
-// most limit rows, after the keyset when one is given (/graph/expand).
-func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, groups map[string][]uuid.UUID,
+// queryEdges is ONE level's statement for one edge kind in one provider:
+// every frontier node of the kind's near types at once, ordered by (target
+// source_key, id), at most limit rows, after the keyset when one is given
+// (/graph/expand).
+func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, side string, groups map[string][]uuid.UUID,
 	after *graphKeyset, limit int) ([]graphEdgeRow, error) {
 	var ors []string
 	args := []any{t.q.WS}
@@ -335,9 +335,9 @@ func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, groups map
 		return nil, nil
 	}
 	sql := `SELECT ` + s.cols + `, ` + s.farKey + ` AS far_key
-	          FROM ` + t.render(s.from) + `
+	          FROM ` + graphRender(s.from, side) + `
 	         WHERE e0.workspace_id = ? AND (` + strings.Join(ors, " OR ") + `)
-	           AND ` + t.predicates(s)
+	           AND ` + t.predicates(s, side)
 	if after != nil {
 		sql += ` AND (` + s.farKey + `, e0.id) > (?, ?)`
 		args = append(args, after.Key, after.ID)
@@ -358,8 +358,10 @@ func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, groups map
 // countNeighbours counts, per node, its neighbours of one kind in one
 // direction under the SAME predicates the level reads them with -- so a
 // frontier count and an expansion agree -- each count capped at CountCap+1
-// (a hub costs what a leaf costs). One statement per near type (a count needs
-// the near node's table to drive it). A count over the cap is nil: not a
+// (a hub costs what a leaf costs). One statement per provider and near type
+// (a count needs the near node's table to drive it), and for the crossing
+// (forward can_assume of a Kubernetes ServiceAccount) one over its resolved
+// principals, summed per ServiceAccount. A count over the cap is nil: not a
 // number that could read as exact.
 func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes []*GraphNode) (map[string]*int64, error) {
 	s := graphSpecFor(dir, kind)
@@ -367,12 +369,77 @@ func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes
 	if s == nil {
 		return out, nil
 	}
+	var sas []*GraphNode
+	for _, side := range []string{models.ProviderAWS, models.ProviderK8s} {
+		var ns []*GraphNode
+		for _, n := range nodes {
+			if n == nil || n.side() != side {
+				continue
+			}
+			if graphSideHasKind(side, kind) {
+				ns = append(ns, n)
+			} else if kind == GraphEdgeCanAssume && dir == GraphForward && n.typ == RefIdentity {
+				sas = append(sas, n)
+			}
+		}
+		if len(ns) == 0 {
+			continue
+		}
+		c, err := t.countSide(lv, s, side, ns)
+		if err != nil {
+			return nil, err
+		}
+		for ref, n := range c {
+			out[ref] = n
+		}
+	}
+	if len(sas) == 0 {
+		return out, nil
+	}
+	if err := t.loadCross(lv); err != nil {
+		return nil, err
+	}
+	var pseudo []*GraphNode
+	saOf := map[string]string{}
+	for _, n := range sas {
+		zero := int64(0)
+		out[n.Ref] = &zero
+		for _, p := range t.crossPrincipals([]*GraphNode{n}) {
+			ref := R(RefExternalPrincipal, p)
+			pseudo = append(pseudo, &GraphNode{typ: RefExternalPrincipal, id: p, Ref: ref})
+			saOf[ref] = n.Ref
+		}
+	}
+	if len(pseudo) == 0 {
+		return out, nil
+	}
+	c, err := t.countSide(lv, s, models.ProviderAWS, pseudo)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pseudo {
+		sa := saOf[p.Ref]
+		n, ok := c[p.Ref]
+		if !ok || n == nil || out[sa] == nil {
+			out[sa] = nil
+			continue
+		}
+		sum := *out[sa] + *n
+		if sum > CountCap {
+			out[sa] = nil
+			continue
+		}
+		out[sa] = &sum
+	}
+	return out, nil
+}
+
+// countSide is countNeighbours for nodes of one provider.
+func (t *graphTraversal) countSide(lv *graphLevel, s *graphEdgeSpec, side string, nodes []*GraphNode) (map[string]*int64, error) {
+	out := map[string]*int64{}
 	byType := map[string][]uuid.UUID{}
 	refOf := map[uuid.UUID]string{}
 	for _, n := range nodes {
-		if n == nil {
-			continue
-		}
 		byType[n.typ] = append(byType[n.typ], n.id)
 		refOf[n.id] = n.Ref
 	}
@@ -390,9 +457,9 @@ func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes
 			N  int64
 		}
 		if err := tx.Raw(`SELECT n.id, (SELECT count(*) FROM (
-		                          SELECT 1 FROM `+t.render(s.from)+`
+		                          SELECT 1 FROM `+graphRender(s.from, side)+`
 		                           WHERE e0.workspace_id = n.workspace_id AND `+expr+` = n.id
-		                             AND `+t.predicates(s)+`
+		                             AND `+t.predicates(s, side)+`
 		                           LIMIT ?) d) AS n
 		                    FROM `+graphNodeTables[typ]+` n
 		                   WHERE n.workspace_id = ? AND n.id IN ?`,

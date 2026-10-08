@@ -18,6 +18,7 @@ package services_test
 
 import (
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,17 +47,40 @@ func ingestDB(t *testing.T) *gorm.DB {
 
 const cluster = "k3s-master"
 
+// nextTick is a snapshot time: whole seconds (what the agent sends), strictly
+// later than every earlier tick, and later than now. A sweep may end only
+// support confirmed before it STARTED, and agent timestamps carry seconds, so
+// two sweeps in one wall-clock second would otherwise tie -- and a sighting
+// projected "now" must read as before the next sweep, as it would in a
+// cluster swept minutes apart.
+var (
+	tickMu   sync.Mutex
+	lastTick time.Time
+)
+
+func nextTick() time.Time {
+	tickMu.Lock()
+	defer tickMu.Unlock()
+	t := time.Now().UTC().Truncate(time.Second).Add(time.Second)
+	if !t.After(lastTick) {
+		t = lastTick.Add(time.Second)
+	}
+	lastTick = t
+	return t
+}
+
 // snapshot builds a cluster with one ServiceAccount, one ClusterRole granting
 // secrets:get, and optionally the ClusterRoleBinding that connects them.
 func snapshot(ws uuid.UUID, src uuid.UUID, bound, complete, clusterScoped bool) models.K8sRBACSnapshot {
+	at := nextTick()
 	s := models.K8sRBACSnapshot{
 		WorkspaceID:       ws.String(),
 		DiscoverySourceID: src.String(),
 		Source:            "k8s_webhook",
 		Cluster:           cluster,
 		ScanKind:          "rbac",
-		SweepStartedAt:    time.Now().UTC().Format(time.RFC3339),
-		ObservedAt:        time.Now().UTC().Format(time.RFC3339),
+		SweepStartedAt:    at.Format(time.RFC3339),
+		ObservedAt:        at.Format(time.RFC3339),
 		Complete:          complete,
 		ClusterScoped:     clusterScoped,
 		Namespaces:        []string{"iga-demo"},
@@ -286,14 +310,21 @@ func TestIngestIsReadableBack(t *testing.T) {
 	if len(g.Verbs) == 0 || len(g.Resources) == 0 {
 		t.Errorf("rule read back without verbs or resources: %+v", g)
 	}
-	if g.CalculationState != "complete" {
-		t.Errorf("calculation_state = %q, want complete for a fully resolved chain", g.CalculationState)
+	// Declared, not evaluated: a resolved chain is basis declared,
+	// calculation partial too (D-112: no effective_conclusion on this route).
+	if g.CalculationState != "partial" || g.Basis != "declared" || !g.Resolved {
+		t.Errorf("grant = %s/%s resolved %v, want declared/partial, resolved: Kubernetes grants are declared, not evaluated",
+			g.Basis, g.CalculationState, g.Resolved)
+	}
+	// A ClusterRoleBinding: cluster-wide (D-109).
+	if g.EffectiveScope == nil || g.EffectiveScope.Kind != k8sread.ScopeCluster || g.EffectiveScope.Namespace != nil {
+		t.Errorf("effective_scope = %+v, want cluster", g.EffectiveScope)
 	}
 	if sum.Note == "" {
 		t.Error("summary carries no note; an empty or short list would be unexplained")
 	}
-	if sum.Complete == 0 {
-		t.Errorf("summary says nothing was fully calculated: %+v", sum)
+	if sum.Partial != len(grants) || sum.Resolved != len(grants) || sum.Unresolved != 0 || sum.Direct != len(grants) {
+		t.Errorf("summary = %+v, want every grant partial, resolved, direct", sum)
 	}
 }
 

@@ -59,6 +59,8 @@ package igaread
 import (
 	"context"
 	"net/url"
+
+	"github.com/authsec-ai/authsec/models"
 )
 
 // Path outcomes (§5.4).
@@ -126,13 +128,12 @@ func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error)
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
-		// D-4 is readRoot's (an AWS root needs a publication, a Kubernetes
-		// one does not). `from` decides the provider and `to` is read in it:
-		// a `to` of the other provider is not a node of this search, and is
-		// 404 as it always was. (No edge joins the two providers' nodes; the
-		// IRSA trust that links them runs through an external principal,
-		// which is terminal.)
+	err := g.r.Read(ctx, Pin{}, func(q *Query) error {
+		// D-4 is readRoot's (an AWS end needs a publication, a Kubernetes
+		// one does not). The two ends may be of different providers: the
+		// paths between them run through a crossing (traverse_cross.go,
+		// D-108), or there are none. rev pins the request when either end is
+		// AWS's, and is ignored when both are Kubernetes' (D-111).
 		t, err := newGraphTraversal(q, g.b, g.r.budget, false)
 		if err != nil {
 			return err
@@ -141,12 +142,22 @@ func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error)
 		if err != nil {
 			return err
 		}
+		if src == nil || src.side() == models.ProviderAWS {
+			if err := graphRevCheck(q, rev); err != nil {
+				return err
+			}
+		}
 		if src == nil {
 			return NotFound()
 		}
 		dst, err := t.readRoot(to)
 		if err != nil {
 			return err
+		}
+		if dst == nil || dst.side() == models.ProviderAWS {
+			if err := graphRevCheck(q, rev); err != nil {
+				return err
+			}
 		}
 		if dst == nil {
 			return NotFound()
@@ -155,7 +166,7 @@ func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error)
 		if err != nil {
 			return err
 		}
-		out = Envelope{Data: data, Meta: g.meta(q, t.provider)}
+		out = Envelope{Data: data, Meta: g.meta(q, t)}
 		return nil
 	})
 	if err != nil {

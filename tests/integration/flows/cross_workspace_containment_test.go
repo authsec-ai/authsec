@@ -340,9 +340,9 @@ func Test_DiscoveryIngress_ConnectorCredential(t *testing.T) {
 
 // AS-014: an unauthenticated caller no longer reads inventory rows back.
 func Test_DiscoveryIngress_UnauthenticatedGetsNoRowsBack(t *testing.T) {
-	// Unauthenticated ingress is refused by default since AS-014; this covers
-	// the operator opt-in.
-	t.Setenv("DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS", "true")
+	// Unauthenticated ingress is accepted (and logged) only while the ingest
+	// auth mode is warn, the rollout default; enforce refuses it.
+	t.Setenv("IGA_DISCOVERY_INGEST_AUTH", "warn")
 	env := testsupport.Get(t)
 	n := emailSafeNonce()
 	ws := seedWorkspace(t, n)

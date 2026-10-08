@@ -6968,7 +6968,7 @@ COMMENT ON COLUMN public.cloud_observation.surface_state IS
 
 -- ---------------------------------------------------------------------------
 -- login_tickets (043): first-factor proof for the MFA step and the session
--- callbacks. Kept identical to migrations/master/043_login_tickets.sql.
+-- callbacks. Kept identical to migrations/master/101_login_tickets.sql.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.login_tickets (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -8047,7 +8047,7 @@ END $$;
 
 
 -- ---------------------------------------------------------------------------
--- revoked_session_tokens (050). Kept identical to migrations/master/050_session_token_revocations.sql.
+-- revoked_session_tokens (050). Kept identical to migrations/master/107_session_token_revocations.sql.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.revoked_session_tokens (
     jti          text PRIMARY KEY,
@@ -8062,7 +8062,7 @@ CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_expires ON public.revoked_
 CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_workspace ON public.revoked_session_tokens (workspace_id);
 
 -- ---------------------------------------------------------------------------
--- audit_events append-only (051). Kept identical to migrations/master/051_audit_events_append_only.sql.
+-- audit_events append-only (051). Kept identical to migrations/master/108_audit_events_append_only.sql.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.audit_events_immutable() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -8078,7 +8078,7 @@ CREATE TRIGGER trg_audit_events_immutable
 
 -- ---------------------------------------------------------------------------
 -- users:delete in the global permission catalog (052). Kept identical to
--- migrations/master/052_users_delete_permission.sql.
+-- migrations/master/109_users_delete_permission.sql.
 -- ---------------------------------------------------------------------------
 INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
 VALUES (gen_random_uuid(), NULL, 'users', 'delete', 'Delete a user of the workspace', 'users:delete', NOW())
@@ -8096,7 +8096,7 @@ WHERE r.name = 'admin'
 ON CONFLICT (role_id, permission_id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- voice_active_sessions (053). Kept identical to migrations/master/053_voice_active_sessions.sql.
+-- voice_active_sessions (053). Kept identical to migrations/master/110_voice_active_sessions.sql.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.voice_active_sessions (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -8132,7 +8132,7 @@ CREATE INDEX IF NOT EXISTS idx_voice_active_sessions_active
     ON public.voice_active_sessions (is_active);
 
 -- ---------------------------------------------------------------------------
--- row-level security (054). Kept identical to migrations/master/054_row_level_security.sql.
+-- row-level security (054). Kept identical to migrations/master/111_row_level_security.sql.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.tenancy_current_workspace() RETURNS uuid
 LANGUAGE sql STABLE AS $$
@@ -8214,7 +8214,7 @@ BEGIN
     END;
 END $$;
 
--- auth_lockouts (065). Kept identical to migrations/master/065_auth_lockouts.sql.
+-- auth_lockouts (065). Kept identical to migrations/master/113_auth_lockouts.sql.
 -- ============================================================================
 -- 065: auth_lockouts, totp_used_steps
 --
@@ -8262,7 +8262,7 @@ BEGIN
     END IF;
 END $$;
 
--- workspace_ciba_auth_requests.resource_server_id (066). Kept identical to migrations/master/066_ciba_request_resource_binding.sql.
+-- workspace_ciba_auth_requests.resource_server_id (066). Kept identical to migrations/master/114_ciba_request_resource_binding.sql.
 -- ============================================================================
 -- 066: workspace_ciba_auth_requests.resource_server_id
 --
@@ -8278,47 +8278,7 @@ END $$;
 ALTER TABLE public.workspace_ciba_auth_requests
     ADD COLUMN IF NOT EXISTS resource_server_id uuid;
 
--- discovery_collector_tokens (067). Kept identical to migrations/master/067_discovery_collector_tokens.sql.
--- ============================================================================
--- 067: discovery_collector_tokens
---
--- Per-workspace collector credentials for the discovery ingress
--- (/authsec/discovery/sightings, agent-registration, lifecycle,
--- rbac-snapshot, resync-manifest). An admin mints one; the collector sends it
--- as its bearer token (controlPlane.sourceToken) and the workspace is taken
--- from the credential, never from the request body (AS-014).
---
--- Only a SHA-256 hash of the token is stored (it is 32 random bytes, not a
--- password). Workspace-owned: RLS through tenancy_enable_rls (054).
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS public.discovery_collector_tokens (
-    id           uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    name         text NOT NULL DEFAULT '',
-    token_hash   text NOT NULL,
-    token_prefix text NOT NULL DEFAULT '',
-    created_by   uuid,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    last_used_at timestamptz,
-    revoked_at   timestamptz
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_collector_tokens_hash
-    ON public.discovery_collector_tokens (token_hash);
-CREATE INDEX IF NOT EXISTS idx_discovery_collector_tokens_workspace
-    ON public.discovery_collector_tokens (workspace_id);
-
-SELECT public.tenancy_enable_rls('public.discovery_collector_tokens');
-
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authsec_tenant') THEN
-        GRANT SELECT, INSERT, UPDATE, DELETE ON public.discovery_collector_tokens TO authsec_tenant;
-    END IF;
-END $$;
-
--- otp_entries.workspace_id, purpose (068). Kept identical to migrations/master/068_otp_entries_scope.sql.
+-- otp_entries.workspace_id, purpose (068). Kept identical to migrations/master/115_otp_entries_scope.sql.
 -- ============================================================================
 -- 068: otp_entries.workspace_id, otp_entries.purpose
 --
@@ -8345,7 +8305,7 @@ CREATE INDEX IF NOT EXISTS idx_otp_entries_email_purpose
 
 SELECT public.tenancy_enable_rls('public.otp_entries');
 
--- platform rows are workspace_id IS NULL (055). Kept identical to migrations/master/055_platform_rows_null.sql.
+-- platform rows are workspace_id IS NULL (055). Kept identical to migrations/master/112_platform_rows_null.sql.
 -- ============================================================================
 -- 055: one convention for platform rows -- workspace_id IS NULL (AS-079)
 --
@@ -8465,7 +8425,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- workspace_id index backfill (069). Kept identical to migrations/master/069_tenancy_ws_index_backfill.sql.
+-- workspace_id index backfill (069). Kept identical to migrations/master/116_tenancy_ws_index_backfill.sql.
 -- ============================================================================
 -- 069: a full workspace_id-leading index on every workspace table (AS-080)
 --
@@ -8504,7 +8464,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- sync_configurations.entra_tenant_id (070). Kept identical to migrations/master/070_entra_tenant_id_expand.sql.
+-- sync_configurations.entra_tenant_id (070). Kept identical to migrations/master/117_entra_tenant_id_expand.sql.
 -- ============================================================================
 -- 070: sync_configurations.entra_tenant_id (AS-097), expand step
 --
@@ -8547,7 +8507,7 @@ CREATE TRIGGER trg_sync_configurations_entra_tenant
     BEFORE INSERT OR UPDATE ON public.sync_configurations
     FOR EACH ROW EXECUTE FUNCTION public.sync_configurations_entra_tenant_sync();
 
--- resource_uri per workspace (071). Kept identical to migrations/master/071_resource_uri_per_workspace.sql.
+-- resource_uri per workspace (071). Kept identical to migrations/master/118_resource_uri_per_workspace.sql.
 -- ============================================================================
 -- 071: resource_servers.resource_uri unique per workspace, not globally (AS-060)
 --
@@ -8567,7 +8527,7 @@ CREATE TRIGGER trg_sync_configurations_entra_tenant
 DROP INDEX IF EXISTS public.idx_resource_servers_resource_uri_active;
 CREATE INDEX IF NOT EXISTS idx_resource_servers_resource_uri ON public.resource_servers (resource_uri);
 
--- workload identity provider issuer per workspace (072). Kept identical to migrations/master/072_wip_issuer_per_workspace.sql.
+-- workload identity provider issuer per workspace (072). Kept identical to migrations/master/119_wip_issuer_per_workspace.sql.
 -- ============================================================================
 -- 072: workload_identity_providers.issuer unique per workspace (AS-060)
 --

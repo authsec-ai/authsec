@@ -11,11 +11,20 @@ signed-in check against a real workspace, so no screen here is claimed usable
 in production. Where this text says what a provider does, it says what the
 code does, and anything still a proposal is labelled so.
 
+**Evidence rule.** Nothing here, in a commit message, PR text, decision record
+or test suite is proof that a behaviour exists. Trace each dependency to the
+registered route, the handler, the writer, the migration and the collector
+before building on it, and treat a passing test as the author's assumption
+until the real producer and consumer have been exercised end to end.
+
 Fixed by decision: the four primary destinations — **Connections**,
 **Discovery**, **Policy**, **Logs**. Secondary and detail screens are
 unrestricted. The legacy governance screens are **removed**, not hidden.
 New Policy functionality is outside this spec: it reserves the destination
-and fixes the preview boundary, nothing more.
+and fixes the preview boundary. The Policy views, the policy events in Logs
+and the replacements for four retired bookmarks are specified in
+[SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md) §9 and ship behind its
+`IGA_POLICY` gate.
 
 ## Summary
 
@@ -91,8 +100,8 @@ Enforcement queue (`/iga/enforcement`).
 |---|---|---|
 | **Connections** | `/iga/connections` | What is connected, is it reporting, is its data usable? |
 | **Discovery** | `/iga/discovery` | What has been found, and what can each thing do? |
-| **Policy** | `/iga/policy` | Reserved. Preview boundary only (below) |
-| **Logs** | `/iga/logs` | What happened, when, by whom — preview |
+| **Policy** | `/iga/policy` | Decide what discovered identities may do. Preview until Phase 3 R1a ships |
+| **Logs** | `/iga/logs` | What happened, when, by whom — preview; policy events real with Phase 3 R1a |
 
 "Connections" rather than "Accounts & clusters": it covers AWS accounts,
 GCP projects, Kubernetes clusters and GitHub organisations without
@@ -104,8 +113,8 @@ straining. The subtitle names them.
 |---|---|
 | Connections | Add connection (provider picker → provider setup: AWS Quick Create / role ARN, GCP, Kubernetes agent, GitHub); connection detail `/iga/connections/:id` with tabs Overview · Scans · Coverage · Scope; scan detail `/iga/connections/:id/scans/:runId`; scope editor (drawer); scan rules for a GitHub organisation (`/iga/connections/:id/rules`) |
 | Discovery | Workload detail `/iga/estate/:id` (Overview · Identities · Resources · Graph · Changes); identity detail `/iga/identities/:id`; resource detail `/iga/resources/:id`; external-principal detail `/iga/external-principals/:id`; sighting detail `/iga/sightings/:id`; the graph tab on each; evidence panel (`evidence=`, beside the content) |
-| Policy | Reserved; outside this spec |
-| Logs | Event detail (drawer) within the preview |
+| Policy | Defined by `SPEC-iga-phase3-policy.md` §9.2: Overview, Findings, Policies (detail `/iga/policy/policies/:id`), new-policy flow, Approvals, Reviews, Deployments, Setup, Legacy agent policies |
+| Logs | Event detail (drawer) |
 
 ### One interaction rule
 
@@ -145,7 +154,7 @@ redirect that drops an account or tab parameter:
 | `/iga/identities`, `/iga/resources` | `…&type=identities` / `…&type=resources` |
 | `/iga/agents` | `/iga/discovery?type=sightings` (`status=`, `live=` carried) |
 | `/iga/k8s-access` | `/iga/discovery?provider=k8s&type=workloads` |
-| governance routes above | the retired-page state |
+| governance routes above | the retired-page state; with `IGA_POLICY` on, `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement` and `/iga/upcoming` redirect as in `SPEC-iga-phase3-policy.md` §9.2 |
 
 Object detail routes are unchanged.
 
@@ -431,6 +440,75 @@ from the **sweep behind it**, and the header is built from that sweep
 | No sweep | `coverage: not_swept` | *No inventory received yet* — not an empty list |
 | Heartbeat recent, sweep old | both | *Agent online; its last inventory is from <time>* — the discrepancy is stated |
 
+### Kubernetes object pages — requirement (revision 5, 6 Oct 2026)
+
+The Kubernetes workload and ServiceAccount pages at `/iga/k8s/:kind/:id`
+move onto the same shell as the AWS object pages (`ObjectShell`), reading the
+routes that exist at the backend tip and nothing else. Every sentence below is
+a requirement; what the backend cannot answer is said on the page, never
+filled in.
+
+**Reads.** Header, Overview and Access come from `k8sread`
+(`/authsec/discovery/k8s/clusters`, `/workloads`, `/identities`,
+`/identities/:id/access`). The Graph tab comes from `/api/iga/v1/graph`,
+`/graph/expand` and `/graph/path` with a Kubernetes root (`workload:<id>` or
+`identity:<id>`), **without** `rev`: a Kubernetes answer is unrevisioned, the
+page never pins a revision, never shows "newer publication", and treats
+`meta.rev` as absent. The AWS detail routes 404 for Kubernetes ids and are not
+called.
+
+**Header.** Name, kind in words (*Kubernetes workload · Deployment*,
+*ServiceAccount*), cluster and namespace. The publication stamp is replaced by
+the sweep: *Inventory from the sweep at <time> · Fully swept | Namespaces only
+| Sweep incomplete | Never swept*. *Namespaces only* carries a persistent
+warning that cluster-wide bindings were not read. No "Published", no revision
+number, no heartbeat time in the header.
+
+**Overview** answers three things, in this order:
+1. *Runs as* — the ServiceAccount, with basis *Observed running* or
+   *Configured only*, and a mismatch flag when the two differ.
+2. *What the cluster lets it do* — grouped by role, worst first (wildcard,
+   then escalation verbs `escalate` `bind` `impersonate` and `secrets get`,
+   then the rest); each group names the binding and its scope badge
+   *cluster-wide* or *namespace <ns>*.
+3. *Not evaluated* — a panel, not a footnote: admission policies and webhooks,
+   token mounting (`automountServiceAccountToken`), grants through groups
+   (`system:serviceaccounts`, `system:serviceaccounts:<ns>`,
+   `system:authenticated`) unless the API lists them for this identity, and
+   cloud identity links (IRSA, Pod Identity, GKE Workload Identity).
+
+**Access tab** (the name; never *Resources*): one row per rule — verbs on
+resource types, API group, scope badge, the binding as the reason, and pills
+*Wildcard*, *Named instances only* (with the note that `resourceNames` do not
+constrain list, watch or create), *Privilege escalation* for the verbs above.
+Partial chains (binding to a role the sweep did not see) show *Role not in
+the sweep — unresolved, not none*. A ServiceAccount page adds *Workloads that
+run as it* with honest counts (*At least N* at the read cap).
+
+**Graph tab.** Workload → ServiceAccount → rule cards; the binding is the edge
+label, the role is the card title, rules of one role collapse into one card by
+default, the scope badge sits on the card. New node kinds
+`k8s_service_account`, `k8s_user`, `k8s_group` and a rule statement carrying
+`k8s_rule` get icons, categories and sentences; the inspector reads *Rule in
+ClusterRole X, bound to this ServiceAccount by RoleBinding Y in namespace Z*.
+The status bar reads *Declared by RBAC · admission policies and token mounting
+not evaluated*. The word *effective* does not appear anywhere on these pages.
+Paths-to-resource is not offered for Kubernetes; the Paths view is hidden.
+
+**Wording.** *stale* is "unconfirmed, still believed"; *ended* is "the sweep
+no longer sees it". Empty lists say what was not read, never "no access".
+
+**Removal.** The flat `K8sAccessChain` page body is replaced, not kept beside
+the new page; one read path per fact.
+
+**Acceptance.** Type check and lint at the pre-change baseline, the production
+build, and a render pass of both pages against a fixture backend covering:
+full sweep, namespaces-only sweep, never swept, partial chain, wildcard rule,
+escalation rule, stale and ended rows, a workload with no ServiceAccount
+resolved, and a Kubernetes-only workspace with no AWS publication. A passing
+test is not acceptance; the render pass is, and it is still not a signed-in
+check.
+
 ## Summaries — three compositions
 
 Not one universal card. Three compositions with distinct jobs; the facts
@@ -554,12 +632,13 @@ are not):
 
 ## Policy — reserved destination
 
-`/iga/policy` is reserved. Within this spec it renders one screen: the
-preview banner (*Preview — sample data. Nothing here is evaluated or
-enforced.*), one paragraph on what Policy will hold, and a link to the
-policy specification. Its sample-data screens, if any, are specified in
-`SPEC-iga-phase3-policy.md`, not here. No retired governance screen, dialog
-or API call is reachable from it.
+`/iga/policy` is reserved. Within this spec, and whenever `IGA_POLICY` is
+off, it renders one screen: the preview banner (*Preview — sample data.
+Nothing here is evaluated or enforced.*), one paragraph on what Policy will
+hold, and a link to the policy specification. With the gate on it is
+replaced by the views of `SPEC-iga-phase3-policy.md` §9. No retired
+governance screen, dialog or API call is reachable from it; legacy agent
+policies appear only through that spec's read-only compatibility view.
 
 ## Logs — preview
 
@@ -570,7 +649,11 @@ publication; classification decided; sighting claimed; connection added /
 revoked), filters by kind, source, actor and time, an event drawer with the
 facts and the raw record collapsed. Export is absent, not disabled. The
 banner reads *Preview — sample events.* Nothing from the retired Provenance
-or Enforcement screens is reused.
+or Enforcement screens is reused. With `IGA_POLICY` on, Logs is an audit feed
+of recorded events only: policy kinds from `GET /api/iga/v1/policy/events`;
+kinds without a source are shown as *Not recorded yet*, never as sample
+events. The fixture timeline remains only as the gate-off preview
+(`SPEC-iga-phase3-policy.md` §9.6).
 
 ## Backend dependencies — field level
 
@@ -588,7 +671,8 @@ or Enforcement screens is reused.
 | Declared permissions examples | workload Resources tab first page; identity Permissions | yes | labelled examples | none | — |
 | Workloads bound / resources named / may assume | `used_by_count`, `named_by_count`, used-by first page | yes | `ExactCount` / paged | none | — |
 | Sighting ↔ identity link | `matched_client_id` | yes | — | none | — |
-| Logs events | none | no | — | out of scope (preview) | fixtures |
+| Logs events — policy | `iga_gov_event` via `GET /api/iga/v1/policy/events` | no (proposed, Phase 3 R1a) | append-only, cursor-paged | Phase 3 T3.20 | fixtures |
+| Logs events — discovery | none | no | — | out of scope | gate off: preview fixtures; gate on: *Not recorded yet* |
 
 The three backend changes, named in the table:
 

@@ -31,6 +31,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
@@ -58,13 +59,14 @@ func Read(ctx context.Context, db *gorm.DB, fn func(q *Query) error) error {
 	})
 }
 
-// HasIdentity reports whether id is a Kubernetes ServiceAccount of the
-// workspace's graph. Another workspace's id is false, like an unknown one.
+// HasIdentity reports whether id is a Kubernetes identity of the workspace's
+// graph -- a ServiceAccount, User or Group (AccountKinds, D-113). Another
+// workspace's id is false, like an unknown one.
 func (q *Query) HasIdentity(id uuid.UUID) (bool, error) {
 	var n int64
 	err := q.tx.Table("iga_identity_accounts").
-		Where("workspace_id = ? AND provider = ? AND account_kind = 'k8s_service_account' AND id = ?",
-			q.WS, models.ProviderK8s, id).
+		Where("workspace_id = ? AND provider = ? AND account_kind IN ? AND id = ?",
+			q.WS, models.ProviderK8s, AccountKinds, id).
 		Count(&n).Error
 	return n > 0, err
 }
@@ -302,17 +304,25 @@ func (q *Query) countInto(c *Cluster) error {
 		}
 		return r.N, nil
 	}
+	// Every count is this cluster's, not the workspace's: a row belongs to a
+	// cluster by its key's "k8s␟<cluster>␟" prefix (k8sgraph.Key). Compared
+	// with left() rather than LIKE so a cluster name needs no escaping and
+	// "prod" never matches "prod2". Two clusters that share a name share
+	// keys, and so share these counts (D-112).
+	prefix := k8sgraph.ClusterPrefix(c.Cluster) // "k8s␟<cluster>␟"
 	var err error
 	if c.ServiceAccounts, err = one(`
 		SELECT count(*) AS n FROM iga_identity_accounts
 		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'
-		   AND account_kind = 'k8s_service_account'`, q.WS, models.ProviderK8s); err != nil {
+		   AND account_kind = 'k8s_service_account'
+		   AND left(source_key, length(?)) = ?`, q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Roles, err = one(`
 		SELECT count(*) AS n FROM iga_policy
-		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND lifecycle = 'active'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Bindings, err = one(`
@@ -323,63 +333,177 @@ func (q *Query) countInto(c *Cluster) error {
 	}
 	if c.Grants, err = one(`
 		SELECT count(*) AS n FROM iga_access_edges
-		 WHERE workspace_id = ? AND provider = ? AND state = 'current'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND state = 'current'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	if c.Stale, err = one(`
 		SELECT count(*) AS n FROM iga_access_edges
-		 WHERE workspace_id = ? AND provider = ? AND state = 'stale'`,
-		q.WS, models.ProviderK8s); err != nil {
+		 WHERE workspace_id = ? AND provider = ? AND state = 'stale'
+		   AND left(source_key, length(?)) = ?`,
+		q.WS, models.ProviderK8s, prefix, prefix); err != nil {
 		return err
 	}
 	return nil
 }
 
-// Identity is one ServiceAccount, with how much it can do.
-type Identity struct {
-	ID        uuid.UUID `json:"id"`
-	Anchor    string    `json:"anchor"` // system:serviceaccount:<ns>:<name>
-	Namespace string    `json:"namespace"`
-	Lifecycle string    `json:"lifecycle"`
+/* ------------------------------- access rows ------------------------------- */
 
+// accessRowsSQL is every live access row of the HOLDERS BOUND TO IT -- a
+// page's identities, or one identity -- never the whole workspace's (D-113):
+// the flat form of the two paths the graph walk takes from an identity to a
+// rule (traverse_edges.go's forward specs, D-110, D-112):
+//
+//	direct  identity -grant-> rule
+//	group   identity -member_of-> group -grant-> rule
+//
+// with the walk's own predicates: a grant and a membership are live when
+// their state is current or stale (graphRelLive; ended is hidden), a group is
+// a Kubernetes identity with a support row (D-6's readability predicate,
+// igaread.SupportedSQL -- written out here because igaread imports this
+// package, not the reverse), and every join is bound to the row's workspace.
+// A grant with no rule (its binding's role was not in the sweep) is a row
+// too, through either path: unresolved is not none.
+//
+// A group-derived row's state is the weaker of its two links: current only
+// when both the membership and the group's grant are current, stale when
+// either is stale. One grant of one group reached through two live
+// memberships of the same holder is one row (the current membership wins):
+// the row is the grant, and the via names the group it came through.
+//
+// The holder restriction is in both branches, on the scanned rows -- the
+// direct grant's subject, the membership's source -- so a list's counts cost
+// its page, not its workspace (idx_iga_access_edges_subject_identity;
+// idx_iga_relationship_source, whose COALESCE expression the second
+// predicate spells out so the index applies).
+//
+// Columns: holder_id, edge_id, entitlement_id, state, group_id,
+// membership_state, membership_basis. Bind values: accessRowsArgs.
+const accessRowsSQL = `
+	SELECT e.subject_identity_account_id AS holder_id, e.id AS edge_id, e.entitlement_id, e.state AS state,
+	       NULL::uuid AS group_id, NULL::text AS membership_state, NULL::text AS membership_basis
+	  FROM iga_access_edges e
+	 WHERE e.workspace_id = ? AND e.subject_identity_account_id IN ?
+	   AND e.provider = 'k8s' AND e.state IN ('current', 'stale')
+	UNION ALL
+	SELECT * FROM (
+	  SELECT DISTINCT ON (m.source_identity_account_id, e.id)
+	         m.source_identity_account_id AS holder_id, e.id AS edge_id, e.entitlement_id,
+	         CASE WHEN e.state = 'current' AND m.state = 'current' THEN 'current' ELSE 'stale' END AS state,
+	         g.id AS group_id, m.state AS membership_state, m.basis AS membership_basis
+	    FROM iga_relationship m
+	    JOIN iga_identity_accounts g
+	      ON g.workspace_id = m.workspace_id AND g.id = m.target_identity_account_id AND g.provider = 'k8s'
+	     AND EXISTS (SELECT 1 FROM iga_object_support s0
+	                  WHERE s0.workspace_id = g.workspace_id AND s0.identity_account_id = g.id)
+	    JOIN iga_access_edges e
+	      ON e.workspace_id = g.workspace_id AND e.subject_identity_account_id = g.id
+	     AND e.provider = 'k8s' AND e.state IN ('current', 'stale')
+	   WHERE m.workspace_id = ? AND m.relationship_type = 'member_of'
+	     AND COALESCE(m.source_identity_account_id, m.source_workload_id) IN ?
+	     AND m.source_identity_account_id IN ?
+	     AND m.state IN ('current', 'stale')
+	   ORDER BY m.source_identity_account_id, e.id, (m.state = 'current') DESC) via`
+
+// accessRowsArgs is accessRowsSQL's bind values for the holders. Never call
+// it with no holder: the caller has nothing to count.
+func accessRowsArgs(ws uuid.UUID, holders []uuid.UUID) []any {
+	return []any{ws, holders, ws, holders, holders}
+}
+
+// heldCounts is how much each holder can do: the current and stale rows of
+// its access (accessRowsSQL), and whether any current one comes from a
+// wildcard rule.
+type heldCounts struct {
+	Grants   int
+	Stale    int
+	Wildcard bool
+}
+
+// countsFor counts the access rows of the holders, and only theirs (D-113):
+// the one statement behind every list's grants, stale and wildcard, so a
+// list row's counts equal its access summary's partial and stale (D-112).
+func (q *Query) countsFor(holders []uuid.UUID) (map[uuid.UUID]heldCounts, error) {
+	out := map[uuid.UUID]heldCounts{}
+	if len(holders) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		HolderID uuid.UUID
+		Grants   int
+		Stale    int
+		Wildcard bool
+	}
+	args := append(accessRowsArgs(q.WS, holders), q.WS)
+	if err := q.tx.Raw(`
+		WITH acc AS (`+accessRowsSQL+`)
+		SELECT acc.holder_id,
+		       COUNT(*) FILTER (WHERE acc.state = 'current') AS grants,
+		       COUNT(*) FILTER (WHERE acc.state = 'stale')   AS stale,
+		       COALESCE(bool_or((n.normalized_rights->>'wildcard')::bool)
+		                FILTER (WHERE acc.state = 'current'), false) AS wildcard
+		  FROM acc
+		  LEFT JOIN iga_entitlements n
+		         ON n.workspace_id = ? AND n.id = acc.entitlement_id
+		 GROUP BY acc.holder_id`, args...).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.HolderID] = heldCounts{Grants: r.Grants, Stale: r.Stale, Wildcard: r.Wildcard}
+	}
+	return out, nil
+}
+
+// Identity is one Kubernetes identity -- a ServiceAccount, or a User or Group
+// a binding names -- with how much it can do.
+type Identity struct {
+	ID uuid.UUID `json:"id"`
+	// Anchor is the RBAC subject name: system:serviceaccount:<ns>:<name> for
+	// a ServiceAccount, the User's or Group's own name otherwise.
+	Anchor string `json:"anchor"`
+	// Namespace is a ServiceAccount's; "" for a User or Group, which
+	// Kubernetes does not scope.
+	Namespace string `json:"namespace"`
+	Lifecycle string `json:"lifecycle"`
+
+	// Kind is the account kind: k8s_service_account | k8s_user | k8s_group
+	// (D-113). Name is the object's own name (a ServiceAccount's without its
+	// namespace), Cluster the cluster its key names, LastSeenAt when a sweep
+	// last confirmed it.
+	Kind       string    `json:"kind"`
+	Name       string    `json:"name"`
+	Cluster    string    `json:"cluster"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	// Members is set for a group only: its live (current or stale) member_of
+	// rows -- the ServiceAccounts the projection places in it. Users who
+	// authenticate into a group are not readable from RBAC, so it is a lower
+	// bound, never "everyone in the group".
+	Members *int `json:"members,omitempty"`
+
+	// Grants counts the current rows of its access (AccessFor): its own
+	// grants and, for a ServiceAccount, those reached through implicit group
+	// membership. Equal to that response's summary.partial.
 	Grants int `json:"grants"`
-	// Wildcard is true when any grant reaching this account comes from a rule
-	// with `*` in a group, resource or verb. Surfaced rather than expanded: the
-	// rule is the fact, and an expansion is an interpretation with an expiry.
+	// Wildcard is true when any current grant reaching this account -- directly
+	// or through a group -- comes from a rule with `*` in a group, resource or
+	// verb. Surfaced rather than expanded: the rule is the fact, and an
+	// expansion is an interpretation with an expiry.
 	Wildcard bool `json:"wildcard"`
-	// Stale grants exist but could not be reconfirmed by the latest sweep.
+	// Stale counts the rows that could not be reconfirmed by the latest sweep
+	// (the grant or the membership it came through). Equal to summary.stale.
 	Stale int `json:"stale"`
 }
 
-// Identities lists the ServiceAccounts in the workspace's Kubernetes graph.
+// Identities lists the ServiceAccounts in the workspace's Kubernetes graph,
+// the first page of ListIdentities' default filter. Kept for its callers;
+// its clamp is the original one.
 func (q *Query) Identities(limit int) ([]Identity, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	var out []Identity
-	err := q.tx.Raw(`
-		SELECT i.id,
-		       i.display_name AS anchor,
-		       COALESCE(i.provider_attrs->>'namespace', '') AS namespace,
-		       i.lifecycle,
-		       COUNT(*) FILTER (WHERE e.state = 'current') AS grants,
-		       COUNT(*) FILTER (WHERE e.state = 'stale')   AS stale,
-		       COALESCE(bool_or((n.normalized_rights->>'wildcard')::bool)
-		                FILTER (WHERE e.state = 'current'), false) AS wildcard
-		  FROM iga_identity_accounts i
-		  LEFT JOIN iga_access_edges e
-		         ON e.workspace_id = i.workspace_id
-		        AND e.subject_identity_account_id = i.id
-		        AND e.provider = ?
-		  LEFT JOIN iga_entitlements n
-		         ON n.workspace_id = i.workspace_id AND n.id = e.entitlement_id
-		 WHERE i.workspace_id = ? AND i.provider = ?
-		   AND i.account_kind = 'k8s_service_account'
-		 GROUP BY i.id, i.display_name, i.provider_attrs, i.lifecycle
-		 ORDER BY grants DESC, i.display_name
-		 LIMIT ?`, models.ProviderK8s, q.WS, models.ProviderK8s, limit).Scan(&out).Error
-	return out, err
+	page, err := q.ListIdentities(IdentityFilter{Limit: limit})
+	return page.Items, err
 }
 
 // Workload is a runtime object and what it runs as.
@@ -397,30 +521,29 @@ type Workload struct {
 	// Basis is 'observed' when the agent saw the Pod's serviceAccountName and
 	// 'declared' when only the configured anchor is known.
 	Basis string `json:"basis,omitempty"`
-	// Grants is how much that identity can do. This is the number the product
-	// exists to produce: what this agent can actually reach.
+	// Grants is how many current declared grants that identity holds -- its
+	// own and those reached through implicit group membership -- the same
+	// count as its Identities row and its access summary's partial.
 	Grants int `json:"grants"`
 }
 
-// Workloads lists the runtime objects and their execution identities.
+// Workloads lists the runtime objects and their execution identities, by
+// name (then id). The page is chosen first and its identities' counts are
+// read for that page alone (D-113): ordering by grants would need every
+// identity's count before the first row could be chosen.
 func (q *Query) Workloads(limit int) ([]Workload, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	var out []Workload
-	err := q.tx.Raw(`
+	if err := q.tx.Raw(`
 		SELECT w.id,
 		       w.display_name,
 		       COALESCE(w.provider_attrs->>'namespace', '') AS namespace,
 		       w.lifecycle,
 		       COALESCE(i.display_name, '') AS runs_as,
 		       i.id   AS runs_as_id,
-		       COALESCE(r.basis, '') AS basis,
-		       (SELECT count(*) FROM iga_access_edges e
-		         WHERE e.workspace_id = w.workspace_id
-		           AND e.provider = ?
-		           AND e.subject_identity_account_id = i.id
-		           AND e.state = 'current') AS grants
+		       COALESCE(r.basis, '') AS basis
 		  FROM iga_workload w
 		  LEFT JOIN iga_relationship r
 		         ON r.workspace_id = w.workspace_id
@@ -430,22 +553,58 @@ func (q *Query) Workloads(limit int) ([]Workload, error) {
 		  LEFT JOIN iga_identity_accounts i
 		         ON i.workspace_id = w.workspace_id AND i.id = r.target_identity_account_id
 		 WHERE w.workspace_id = ? AND w.provider = ?
-		 ORDER BY grants DESC, w.display_name
-		 LIMIT ?`, models.ProviderK8s, q.WS, models.ProviderK8s, limit).Scan(&out).Error
-	return out, err
+		 ORDER BY w.display_name, w.id, i.id
+		 LIMIT ?`, q.WS, models.ProviderK8s, limit).Scan(&out).Error; err != nil {
+		return nil, err
+	}
+	var holders []uuid.UUID
+	seen := map[uuid.UUID]bool{}
+	for _, w := range out {
+		if w.RunsAsID != nil && !seen[*w.RunsAsID] {
+			seen[*w.RunsAsID] = true
+			holders = append(holders, *w.RunsAsID)
+		}
+	}
+	counts, err := q.countsFor(holders)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if id := out[i].RunsAsID; id != nil {
+			out[i].Grants = counts[*id].Grants
+		}
+	}
+	return out, nil
 }
 
 // Grant is one resolved step of what an identity can do.
 //
 // It is deliberately the WHOLE chain in one row -- binding, role, rule -- rather
 // than three joined objects, because the question a reviewer asks is "why can
-// this account read secrets", and the answer is the chain.
+// this account read secrets", and the answer is the chain. A grant reached
+// through a group carries the group in Via: the chain then starts with the
+// membership.
 type Grant struct {
-	RoleName  string `json:"role_name"`
-	RoleKind  string `json:"role_kind"` // k8s_role | k8s_cluster_role
-	Binding   string `json:"binding"`
-	BindKind  string `json:"binding_kind"`
+	RoleName string `json:"role_name"`
+	RoleKind string `json:"role_kind"` // k8s_role | k8s_cluster_role
+	// Binding is the assignment's source key, as before ("" when the grant
+	// has no assignment row: a binding whose role was never seen).
+	// BindingName is the binding's own name, read back from the assignment's
+	// key or, without one, the grant's.
+	Binding     string `json:"binding"`
+	BindingName string `json:"binding_name"`
+	BindKind    string `json:"binding_kind"`
+	// Namespace is the ROLE's namespace ("" for a ClusterRole), as before.
+	// Where the rule applies is EffectiveScope's, never this field's.
 	Namespace string `json:"namespace"`
+	// EffectiveScope is where the rule applies (D-109): {kind: namespace,
+	// namespace: <the binding's>} for a RoleBinding -- of a Role or of a
+	// ClusterRole -- and {kind: cluster, namespace: null} for a
+	// ClusterRoleBinding. Read from the binding's key -- the assignment's, or
+	// for a binding whose role was never seen (no assignment row) the grant's
+	// own -- so an unresolved grant says where it would apply too. Null only
+	// when neither key names a binding.
+	EffectiveScope *EffectiveScope `json:"effective_scope"`
 
 	Verbs           []string `json:"verbs"`
 	APIGroups       []string `json:"api_groups"`
@@ -457,43 +616,124 @@ type Grant struct {
 	// than the same rule without them.
 	Constrained bool `json:"constrained"`
 
-	State string `json:"state"` // current | stale
+	// State is current | stale; for a group-derived grant, the weaker of the
+	// grant's and the membership's (Via.State is the membership's own).
+	State string `json:"state"`
 
-	// CalculationState is 'complete' only when binding -> role -> rule all
-	// resolved. 'partial' means the role was not in the sweep, and the
-	// conclusion is 'unknown' -- the honest record that something was bound to
-	// something we could not see.
-	CalculationState    string `json:"calculation_state"`
-	EffectiveConclusion string `json:"effective_conclusion"`
+	// Basis is the grant's: always 'declared' for Kubernetes -- RBAC says what
+	// is allowed; nothing observed a request.
+	Basis string `json:"basis"`
+	// CalculationState is always 'partial' for Kubernetes: the chain is
+	// declared, and the layers that can still refuse a request (admission,
+	// token automount and audiences, resourceNames semantics) are not read.
+	CalculationState string `json:"calculation_state"`
+	// Resolved: binding -> role -> rule all resolved. False is a binding whose
+	// role was not in the sweep: no rule, and the honest record that something
+	// was bound to something we could not see.
+	Resolved bool `json:"resolved"`
+
+	// Via is null for a grant held directly, and names the group for one
+	// reached through group membership.
+	Via *Via `json:"via"`
+}
+
+// EffectiveScope is where a grant's rule applies (D-109), the shape of the
+// graph's grant edge field of the same name.
+type EffectiveScope struct {
+	Kind      string  `json:"kind"`
+	Namespace *string `json:"namespace"`
+}
+
+// Via is the membership a group-derived grant came through: the graph walk's
+// member_of edge, flattened onto the grant (D-110, D-112).
+type Via struct {
+	Relationship string    `json:"relationship"` // member_of
+	Group        string    `json:"group"`        // the group's name, e.g. system:serviceaccounts:shop
+	GroupID      uuid.UUID `json:"group_id"`
+	// ImplicitMembership: the holder is a ServiceAccount and the group is one
+	// the API server places it in (system:serviceaccounts,
+	// system:serviceaccounts:<ns>, system:authenticated); no object declares
+	// the membership. The graph's member_of edge carries the same flag.
+	ImplicitMembership bool   `json:"implicit_membership"`
+	State              string `json:"state"` // the membership's: current | stale
+	Basis              string `json:"basis"` // the membership's: declared
 }
 
 // AccessSummary says how much of an answer was actually calculated, so an empty
 // or short list is never mistaken for "no access".
+//
+// Every row is counted in exactly one of each pair: partial + stale = total,
+// resolved + unresolved = total, direct + via_group = total.
 type AccessSummary struct {
-	Total    int `json:"total"`
-	Complete int `json:"complete"`
-	Partial  int `json:"partial"`
-	Stale    int `json:"stale"`
+	Total int `json:"total"`
+	// Partial counts the current rows (calculation_state partial: declared,
+	// not evaluated); Stale the rows not reconfirmed by the latest sweep.
+	Partial int `json:"partial"`
+	Stale   int `json:"stale"`
+	// Resolved counts rows whose binding -> role -> rule chain resolved;
+	// Unresolved rows whose binding names a role the sweep did not see.
+	Resolved   int `json:"resolved"`
+	Unresolved int `json:"unresolved"`
+	// Direct counts grants held by the identity itself; ViaGroup grants
+	// reached through its group memberships.
+	Direct   int `json:"direct"`
+	ViaGroup int `json:"via_group"`
 
-	// Note is always set. Kubernetes RBAC is purely additive -- no deny rules,
-	// no conditions -- which is the only reason a resolved chain here may be
-	// called effective rather than merely configured. Saying so on every
-	// response keeps that claim attached to its justification.
+	// Note is always set: grants are declared, not evaluated, and saying so on
+	// every response keeps the claim attached to its limits.
 	Note string `json:"note"`
 }
 
-// AccessFor answers "what can this ServiceAccount do, and how much of that did
-// we actually work out".
+// AccessNote is the summary's note. No word in it claims that access is
+// evaluated: the route reports declared grants only (D-112).
+const AccessNote = "Kubernetes grants are declared, not evaluated (basis declared, calculation_state " +
+	"partial): RBAC is allow-only, so a resolved chain is what RBAC allows, but admission control, " +
+	"token automount and audiences, and resourceNames semantics are not read, so whether a request " +
+	"would succeed is unknown. A RoleBinding confines even a ClusterRole's rule to its namespace. " +
+	"Grants reached through group membership name the group. A grant with no rule is a binding " +
+	"whose role was not in the sweep."
+
+// AccessFor answers "what can this identity do, and how much of that did we
+// actually work out": its own grants and those of the groups it is a member
+// of, each with where its rule applies. Any Kubernetes identity (D-113): a
+// User's or Group's rows are its own grants -- the projection records no
+// membership of either.
 func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) {
+	// Scanned flat, then shaped: the grant's nested fields are built here,
+	// never by the scanner.
 	var rows []struct {
-		Grant
-		Native []byte
+		RoleName         string
+		RoleKind         string
+		Binding          string
+		BindKind         string
+		BindingKey       string
+		Namespace        string
+		State            string
+		Basis            string
+		CalculationState string
+		Resolved         bool
+		Wildcard         bool
+		Constrained      bool
+		Native           []byte
+		GroupID          *uuid.UUID
+		GroupName        string
+		GroupKey         string
+		HolderKind       string
+		MembershipState  string
+		MembershipBasis  string
 	}
 	err := q.tx.Raw(`
+		WITH acc AS (`+accessRowsSQL+`)
 		SELECT p.display_name AS role_name,
 		       p.policy_kind  AS role_kind,
 		       COALESCE(a.source_key, '') AS binding,
 		       COALESCE(a.assignment_kind, '') AS bind_kind,
+		       -- The binding a grant came through: its assignment's key, or --
+		       -- for a grant whose role was never seen, which has no assignment
+		       -- row -- the grant's own key, which starts with the same
+		       -- binding key (k8sgraph.Edge; the graph names an unresolved
+		       -- binding from it too, k8s_unresolved_bindings).
+		       COALESCE(a.source_key, e.source_key, '') AS binding_key,
 		       -- iga_policy has no namespace column and no provider_attrs, so
 		       -- the namespace is decoded from the source key. The format is
 		       -- k8sgraph.RoleKey's: k8s <US> cluster <US> role <US> ns <US> name
@@ -504,44 +744,82 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 		       -- ever changes, this changes with it.
 		       CASE WHEN p.policy_kind = 'k8s_role'
 		            THEN split_part(p.source_key, E'\037', 4) ELSE '' END AS namespace,
-		       e.state,
+		       acc.state,
+		       e.basis,
 		       e.calculation_state,
-		       e.effective_conclusion,
+		       e.entitlement_id IS NOT NULL AS resolved,
 		       COALESCE((n.normalized_rights->>'wildcard')::bool, false)    AS wildcard,
 		       COALESCE((n.normalized_rights->>'constrained')::bool, false) AS constrained,
-		       n.native_rights AS native
-		  FROM iga_access_edges e
+		       n.native_rights AS native,
+		       acc.group_id,
+		       COALESCE(g.display_name, '') AS group_name,
+		       COALESCE(g.source_key, '')   AS group_key,
+		       COALESCE(h.account_kind, '') AS holder_kind,
+		       COALESCE(acc.membership_state, '') AS membership_state,
+		       COALESCE(acc.membership_basis, '') AS membership_basis
+		  FROM acc
+		  JOIN iga_access_edges e
+		    ON e.workspace_id = ? AND e.id = acc.edge_id
 		  LEFT JOIN iga_entitlements n
 		         ON n.workspace_id = e.workspace_id AND n.id = e.entitlement_id
 		  LEFT JOIN iga_policy_assignment a
 		         ON a.workspace_id = e.workspace_id AND a.id = e.assignment_id
 		  LEFT JOIN iga_policy p
 		         ON p.workspace_id = e.workspace_id AND p.id = a.policy_id
-		 WHERE e.workspace_id = ? AND e.provider = ?
-		   AND e.subject_identity_account_id = ?
-		   AND e.state <> 'ended'
-		 ORDER BY wildcard DESC, p.display_name`,
-		q.WS, models.ProviderK8s, identityID).Scan(&rows).Error
+		  LEFT JOIN iga_identity_accounts g
+		         ON g.workspace_id = e.workspace_id AND g.id = acc.group_id
+		  LEFT JOIN iga_identity_accounts h
+		         ON h.workspace_id = e.workspace_id AND h.id = acc.holder_id
+		 WHERE acc.holder_id = ?
+		 ORDER BY wildcard DESC, p.display_name, acc.group_id IS NOT NULL, g.display_name,
+		          a.source_key, e.id`,
+		append(accessRowsArgs(q.WS, []uuid.UUID{identityID}), q.WS, identityID)...).Scan(&rows).Error
 	if err != nil {
 		return nil, AccessSummary{}, err
 	}
 
 	out := make([]Grant, 0, len(rows))
-	sum := AccessSummary{Total: len(rows), Note: "Kubernetes RBAC is allow-only: it has no " +
-		"deny rules and no conditions, so a resolved chain is access the API server will " +
-		"honour. Admission control may still refuse the action -- that is a different layer " +
-		"and is not an authorization decision."}
+	sum := AccessSummary{Total: len(rows), Note: AccessNote}
 
 	for i := range rows {
-		g := rows[i].Grant
-		expandRights(&g, rows[i].Native)
-		switch {
-		case g.State == models.RelStale:
+		r := rows[i]
+		g := Grant{
+			RoleName: r.RoleName, RoleKind: r.RoleKind, Binding: r.Binding, BindKind: r.BindKind,
+			Namespace: r.Namespace, State: r.State, Basis: r.Basis, CalculationState: r.CalculationState,
+			Resolved: r.Resolved, Wildcard: r.Wildcard, Constrained: r.Constrained,
+		}
+		expandRights(&g, r.Native)
+		if r.BindingKey != "" {
+			kind, ns := BindingScope(r.BindingKey)
+			g.EffectiveScope = &EffectiveScope{Kind: kind}
+			if ns != "" {
+				g.EffectiveScope.Namespace = &ns
+			}
+			if k, ok := k8sgraph.ParseKey(r.BindingKey); ok {
+				g.BindingName = k.Name
+			}
+		}
+		if r.GroupID != nil {
+			g.Via = &Via{
+				Relationship: models.RelTypeMemberOf,
+				Group:        r.GroupName, GroupID: *r.GroupID,
+				ImplicitMembership: r.HolderKind == models.K8sAccountKindServiceAccount &&
+					ImplicitGroupKey(r.GroupKey),
+				State: r.MembershipState, Basis: r.MembershipBasis,
+			}
+			sum.ViaGroup++
+		} else {
+			sum.Direct++
+		}
+		if g.State == models.RelStale {
 			sum.Stale++
-		case g.CalculationState == "complete":
-			sum.Complete++
-		default:
+		} else {
 			sum.Partial++
+		}
+		if g.Resolved {
+			sum.Resolved++
+		} else {
+			sum.Unresolved++
 		}
 		out = append(out, g)
 	}

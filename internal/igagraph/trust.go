@@ -504,3 +504,79 @@ func trustExclusions(snap *Snapshot, r *resolved) (unreadable, unattributedPod [
 	}
 	return unreadable, r.podUnattributed
 }
+
+/* ------------------------- cross-provider resolution ------------------------ */
+
+// An AWS trust can name a Kubernetes ServiceAccount (§2.12, D-42): EKS IRSA
+// as an `oidc` principal (issuer = the cluster's scheme-less OIDC issuer,
+// subject system:serviceaccount:<ns>:<sa>), EKS Pod Identity as a
+// `k8s_service_account` principal (subject PodIdentitySubject(...)). Whether
+// such a principal IS a ServiceAccount the workspace's Kubernetes graph holds
+// is decided at READ time (igaread, D-108), never written by this projector:
+// the Kubernetes side arrives on its own schedule, outside any AWS
+// publication, so a stored resolution would either go stale between AWS runs
+// or have to be written by the Kubernetes ingest into rows a publication
+// owns. The rules below are the one statement of that match, beside the
+// writer of the principals it reads.
+
+// The derived resolution rules of a cross-provider match (034's
+// resolution_rule vocabulary, read-time only -- D-108).
+const (
+	// ResolutionRuleIRSAIssuerMatch: an `oidc` principal whose issuer equals
+	// the OIDC issuer the newest projected sweep of exactly one cluster
+	// reported, and whose subject names a live ServiceAccount of it.
+	ResolutionRuleIRSAIssuerMatch = "irsa_issuer_match"
+	// ResolutionRulePodIdentityCluster: a pod-identity principal whose
+	// association names exactly one cluster, that cluster's name is the
+	// name exactly one Kubernetes source sweeps, and its subject names a live
+	// ServiceAccount of it.
+	ResolutionRulePodIdentityCluster = "pod_identity_cluster_match"
+)
+
+// NormalizeOIDCIssuer is the form two OIDC issuers are compared in: the
+// scheme dropped (the trust names the issuer without one, the cluster's
+// discovery document with https://), trailing slashes dropped, and the host
+// lower-cased (DNS is case-insensitive; the path -- the EKS cluster id -- is
+// not, and is kept as written). "" for an empty issuer.
+func NormalizeOIDCIssuer(issuer string) string {
+	s := strings.TrimSpace(issuer)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	s = strings.TrimRight(s, "/")
+	host, path, hasPath := strings.Cut(s, "/")
+	host = strings.ToLower(host)
+	if hasPath {
+		return host + "/" + path
+	}
+	return host
+}
+
+// K8sServiceAccountSubject reads the ServiceAccount a cross-provider
+// principal's subject names: system:serviceaccount:<ns>:<sa> for an `oidc`
+// principal, the same behind the pod-identity prefix for a
+// `k8s_service_account` one. ok is false for any other mechanism or shape,
+// and for a wildcard (a StringLike subject such as
+// system:serviceaccount:shop:* names no one ServiceAccount, §2.12: anything
+// wildcarded stays unresolved).
+func K8sServiceAccountSubject(mechanism, subject string) (namespace, name string, ok bool) {
+	switch mechanism {
+	case models.ExternalPrincipalOIDC:
+	case models.ExternalPrincipalK8sServiceAccount:
+		var had bool
+		if subject, had = strings.CutPrefix(subject, PodIdentitySubject("")); !had {
+			return "", "", false
+		}
+	default:
+		return "", "", false
+	}
+	rest, had := strings.CutPrefix(subject, "system:serviceaccount:")
+	if !had {
+		return "", "", false
+	}
+	namespace, name, ok = strings.Cut(rest, ":")
+	if !ok || namespace == "" || name == "" || strings.ContainsAny(rest, "*?") || strings.Contains(name, ":") {
+		return "", "", false
+	}
+	return namespace, name, true
+}

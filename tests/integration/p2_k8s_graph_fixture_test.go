@@ -132,7 +132,10 @@ func (w k8sWorld) snapshot(k *k8sGraphLab, at time.Time) models.K8sRBACSnapshot 
 	return models.K8sRBACSnapshot{
 		WorkspaceID: k.ws.String(), DiscoverySourceID: k.src.String(), Source: models.DiscoverySourceK8sWebhook,
 		Cluster: k8sGraphCluster, ScanKind: "rbac",
-		SweepStartedAt: at.Add(-time.Minute).Format(time.RFC3339), ObservedAt: at.Format(time.RFC3339),
+		// Started half a minute before it was observed, so it starts after the
+		// previous sweep (a minute earlier) finished: a sweep may end only what
+		// was last confirmed BEFORE it started (the reconciler's fence).
+		SweepStartedAt: at.Add(-30 * time.Second).Format(time.RFC3339), ObservedAt: at.Format(time.RFC3339),
 		Complete: w.complete, ClusterScoped: w.clusterScoped, Namespaces: w.namespaces,
 		ServiceAccounts: []models.K8sServiceAccount{
 			{Name: "research", Namespace: k8sGraphNS, Anchor: "system:serviceaccount:" + k8sGraphNS + ":research"},
