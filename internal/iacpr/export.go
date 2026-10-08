@@ -135,23 +135,33 @@ func Export(p igagov.Plan, role RoleTarget, docs map[string]string, deploymentID
 		case igagov.OpCreateRole:
 			name := roleNameOf(op.RoleARN)
 			f := "trust-" + name + ".json"
-			if d, ok := docs[op.TrustPolicyHash]; ok {
-				a.Documents[f] = d
+			d, ok := docs[op.TrustPolicyHash]
+			if !ok {
+				// The approved trust policy is archived with the plan (§11);
+				// never an export without it.
+				return a, fmt.Errorf("iacpr: trust policy %s is not archived", op.TrustPolicyHash)
 			}
+			a.Documents[f] = d
 			cmd := fmt.Sprintf("aws iam create-role --role-name %s --path %s --assume-role-policy-document file://%s", name, op.Path, f)
 			if len(op.Tags) > 0 {
 				cmd += " --tags " + cliTags(op.Tags)
 			}
 			a.CLI = append(a.CLI, cmd)
-			fmt.Fprintf(&tf, "resource \"aws_iam_role\" %q {\n  name = %s\n  path = %s\n  # assume_role_policy: the source role's trust policy (%s)\n}\n\n",
-				tfName(name), q(name), q(op.Path), op.TrustPolicyHash)
+			te, err := jsonencodeExpr(d, "  ")
+			if err != nil {
+				return a, err
+			}
+			fmt.Fprintf(&tf, "resource \"aws_iam_role\" %q {\n  name = %s\n  path = %s\n  # the approved trust policy (%s)\n  assume_role_policy = %s\n}\n\n",
+				tfName(name), q(name), q(op.Path), op.TrustPolicyHash, te)
 		case igagov.OpAttachRolePolicy:
 			a.CLI = append(a.CLI, fmt.Sprintf("aws iam attach-role-policy --role-name %s --policy-arn %s", roleNameOf(op.RoleARN), op.PolicyARN))
 		case igagov.OpPutRolePolicy:
 			f := "inline-" + op.InlineName + ".json"
-			if d, ok := docs[op.DocumentHash]; ok {
-				a.Documents[f] = d
+			d, ok := docs[op.DocumentHash]
+			if !ok {
+				return a, fmt.Errorf("iacpr: inline policy %s (%s) is not archived", op.InlineName, op.DocumentHash)
 			}
+			a.Documents[f] = d
 			a.CLI = append(a.CLI, fmt.Sprintf("aws iam put-role-policy --role-name %s --policy-name %s --policy-document file://%s",
 				roleNameOf(op.RoleARN), op.InlineName, f))
 		case igagov.OpBindSubject:

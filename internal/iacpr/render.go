@@ -50,6 +50,15 @@ const (
 	ReasonGeneratedSource = "iac_generated_source"
 	ReasonRoleNotFound    = "iac_role_not_found"
 	ReasonRoleAmbiguous   = "iac_role_ambiguous"
+	// ReasonSourceDiffers: the mapped source no longer says what was
+	// approved (the trust policy, an inline policy or the boundary of the
+	// role being copied differs from the plan's archived documents). AuthSec
+	// never renders an unapproved document; at deploy time this blocks the
+	// deployment (iac_form_changed) for a new plan.
+	ReasonSourceDiffers = "iac_source_differs"
+	// ReasonDocumentNotArchived: a document the plan names is not archived
+	// (a plan compiled before documents were archived); re-propose.
+	ReasonDocumentNotArchived = "iac_document_not_archived"
 )
 
 // Fallback is why a plan cannot be delivered as a PR from its mapped
@@ -311,6 +320,26 @@ func roleNameOf(arn string) string {
 		return arn
 	}
 	return arn[i+1:]
+}
+
+// archived is an approved document of the plan by hash; a missing one is a
+// fallback (the change cannot be rendered from approved texts), never a
+// re-read of the repository.
+func (r Request) archived(hash, what string) (string, error) {
+	d, ok := r.Documents[hash]
+	if !ok {
+		return "", fallback(ReasonDocumentNotArchived, "%s (%s) is not archived with the plan", what, hash)
+	}
+	return d, nil
+}
+
+func sortedSet(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r Request) doc(hash string) (string, error) {
@@ -725,66 +754,138 @@ func (s *tfSource) renderSplit() (*Change, error) {
 		if nr != nil {
 			return nil, fallback(ReasonFormUnsupported, "%s already declares role %s", nr.address(), newName)
 		}
-		var b strings.Builder
-		fmt.Fprintf(&b, "# Dedicated identity for %s, split from %s by AuthSec (same trust policy,\n", d.SubjectARN, srcName)
-		b.WriteString("# managed policies by ARN, inline policy copies and permissions boundary).\n")
-		fmt.Fprintf(&b, "resource \"aws_iam_role\" %q {\n", newTF)
-		fmt.Fprintf(&b, "  name = %s\n", strconv.Quote(newName))
-		fmt.Fprintf(&b, "  path = %s\n", strconv.Quote(pf.createRole.Path))
+		// Everything the new role is made of comes from the APPROVED plan and
+		// its archived documents (§11; review P1-12): the source is read only
+		// to locate things and to check it still says what was approved. A
+		// source that differs is never rendered (iac_source_differs; at
+		// deploy time the deployment is blocked as iac_form_changed).
+		trustDoc, err := req.archived(pf.createRole.TrustPolicyHash, "the trust policy")
+		if err != nil {
+			return nil, err
+		}
 		trust := src.attr("assume_role_policy")
 		if trust == nil {
-			return nil, fallback(ReasonFormUnsupported, "%s has no assume_role_policy to copy", src.address())
+			return nil, fallback(ReasonFormUnsupported, "%s has no assume_role_policy", src.address())
 		}
-		fmt.Fprintf(&b, "  assume_role_policy = %s\n", strings.TrimSpace(trust.Raw))
-		if pf.newBoundary != "" {
-			pb := src.attr("permissions_boundary")
-			if pb == nil {
-				return nil, fallback(ReasonFormUnsupported, "%s has no permissions_boundary to copy", src.address())
+		if text, _, err := policyDocument(trust.Raw); err == nil {
+			if h, err := igagov.DocumentHash(text); err != nil || h != pf.createRole.TrustPolicyHash {
+				return nil, fallback(ReasonSourceDiffers, "the trust policy of %s in the source differs from the approved one (%s)",
+					src.address(), pf.createRole.TrustPolicyHash)
 			}
-			fmt.Fprintf(&b, "  permissions_boundary = %s\n", strings.TrimSpace(pb.Raw))
 		}
-		if len(pf.createRole.Tags) > 0 {
-			fmt.Fprintf(&b, "  tags = %s\n", tfTags(pf.createRole.Tags, "  "))
-		}
-		// Inline policies: nested inline_policy blocks of the source role are
-		// copied verbatim; aws_iam_role_policy resources of the source role
-		// are copied with role re-pointed.
-		inlineFound := map[string]bool{}
-		for _, ib := range src.nested("inline_policy") {
-			if na := ib.attr("name"); na != nil {
-				if v, ok := literalString(na.Raw); ok {
-					inlineFound[v] = true
+		pols := s.policies()
+		boundaryExpr := ""
+		pb := src.attr("permissions_boundary")
+		switch {
+		case pf.newBoundary == "" && pb != nil:
+			return nil, fallback(ReasonSourceDiffers, "%s sets a permissions_boundary; the approved role has none", src.address())
+		case pf.newBoundary != "" && pb == nil:
+			return nil, fallback(ReasonSourceDiffers, "%s sets no permissions_boundary; the approved role has %s", src.address(), pf.newBoundary)
+		case pb != nil:
+			if got, ok := refPolicy(pb.Raw, pols); ok {
+				if got != pf.newBoundary {
+					return nil, fallback(ReasonSourceDiffers, "%s.permissions_boundary is %s in the source; the approved boundary is %s",
+						src.address(), got, pf.newBoundary)
 				}
+				boundaryExpr = strings.TrimSpace(pb.Raw)
+			} else {
+				boundaryExpr = strconv.Quote(pf.newBoundary)
 			}
-			b.WriteString(s.files[src.File][ib.Start:ib.End])
 		}
-		b.WriteString("}\n")
-		var extra []string
-		for _, rp := range s.resources("aws_iam_role_policy") {
-			ra := rp.attr("role")
-			if ra == nil || !refersTo(ra.Raw, src, d.SourceRoleARN, srcName) {
-				continue
-			}
-			na := rp.attr("name")
+		// The source's inline policies must be exactly the approved ones.
+		srcInline := map[string]string{} // name -> literal document ("" = not literal)
+		for _, ib := range src.nested("inline_policy") {
+			na := ib.attr("name")
 			nm := ""
 			if na != nil {
 				nm, _ = literalString(na.Raw)
 			}
 			if nm == "" {
+				return nil, fallback(ReasonFormUnsupported, "an inline_policy of %s has a computed name", src.address())
+			}
+			srcInline[nm] = ""
+			if pa := ib.attr("policy"); pa != nil {
+				if text, _, err := policyDocument(pa.Raw); err == nil {
+					srcInline[nm] = text
+				}
+			}
+		}
+		for _, rp := range s.resources("aws_iam_role_policy") {
+			ra := rp.attr("role")
+			if ra == nil || !refersTo(ra.Raw, src, d.SourceRoleARN, srcName) {
+				continue
+			}
+			nm := ""
+			if na := rp.attr("name"); na != nil {
+				nm, _ = literalString(na.Raw)
+			}
+			if nm == "" {
 				return nil, fallback(ReasonFormUnsupported, "%s has a computed name", rp.address())
 			}
-			inlineFound[nm] = true
-			txt := s.text(rp)
-			rel := ra.ValStart - rp.Start
-			txt = txt[:rel] + "aws_iam_role." + newTF + ".name" + txt[rel+(ra.ValEnd-ra.ValStart):]
-			txt = strings.Replace(txt, strconv.Quote(rp.Labels[1]), strconv.Quote(rp.Labels[1]+"_"+newTF), 1)
-			extra = append(extra, txt)
-		}
-		for _, n := range pf.inline {
-			if !inlineFound[n] {
-				return nil, fallback(ReasonFormUnsupported, "inline policy %s of %s is not declared in %s", n, srcName, req.Source.Directory)
+			srcInline[nm] = ""
+			if pa := rp.attr("policy"); pa != nil {
+				if text, _, err := policyDocument(pa.Raw); err == nil {
+					srcInline[nm] = text
+				}
 			}
 		}
+		approved := map[string]string{} // name -> hash
+		for _, op := range req.Plan.Ops {
+			if op.Op == igagov.OpPutRolePolicy {
+				approved[op.InlineName] = op.DocumentHash
+			}
+		}
+		for nm := range srcInline {
+			if _, ok := approved[nm]; !ok {
+				return nil, fallback(ReasonSourceDiffers, "inline policy %s of %s is in the source but not in the approved role", nm, srcName)
+			}
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "# Dedicated identity for %s, split from %s by AuthSec: the same identity policies\n",
+			strings.Join(d.Subjects(), ", "), srcName)
+		b.WriteString("# (trust policy, managed policies by ARN, inline policy copies and permissions boundary)\n")
+		fmt.Fprintf(&b, "# as approved in plan %s. Access granted to %s by name elsewhere does not follow.\n", req.Plan.PlanHash, srcName)
+		fmt.Fprintf(&b, "resource \"aws_iam_role\" %q {\n", newTF)
+		fmt.Fprintf(&b, "  name = %s\n", strconv.Quote(newName))
+		fmt.Fprintf(&b, "  path = %s\n", strconv.Quote(pf.createRole.Path))
+		te, err := jsonencodeExpr(trustDoc, "  ")
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&b, "  assume_role_policy = %s\n", te)
+		if boundaryExpr != "" {
+			fmt.Fprintf(&b, "  permissions_boundary = %s\n", boundaryExpr)
+		}
+		if len(pf.createRole.Tags) > 0 {
+			fmt.Fprintf(&b, "  tags = %s\n", tfTags(pf.createRole.Tags, "  "))
+		}
+		names := make([]string, 0, len(approved))
+		for nm := range approved {
+			names = append(names, nm)
+		}
+		sort.Strings(names)
+		for _, nm := range names {
+			doc, err := req.archived(approved[nm], "inline policy "+nm)
+			if err != nil {
+				return nil, err
+			}
+			cur, ok := srcInline[nm]
+			if !ok {
+				return nil, fallback(ReasonSourceDiffers, "inline policy %s of %s is not declared in %s", nm, srcName, req.Source.Directory)
+			}
+			if cur != "" {
+				if h, err := igagov.DocumentHash(cur); err != nil || h != approved[nm] {
+					return nil, fallback(ReasonSourceDiffers, "inline policy %s of %s in the source differs from the approved one", nm, srcName)
+				}
+			}
+			ie, err := jsonencodeExpr(doc, "    ")
+			if err != nil {
+				return nil, err
+			}
+			fmt.Fprintf(&b, "  inline_policy {\n    name   = %s\n    policy = %s\n  }\n", strconv.Quote(nm), ie)
+		}
+		b.WriteString("}\n")
+		var extra []string
 		for i, arn := range pf.attach {
 			extra = append(extra, fmt.Sprintf("resource \"aws_iam_role_policy_attachment\" %q {\n  role       = aws_iam_role.%s.name\n  policy_arn = %s\n}\n",
 				fmt.Sprintf("%s_%d", newTF, i+1), newTF, strconv.Quote(arn)))
@@ -794,7 +895,7 @@ func (s *tfSource) renderSplit() (*Change, error) {
 			s.appendTo(src.File, e)
 		}
 		s.sum = append(s.sum, "add aws_iam_role."+newTF+" with "+strconv.Itoa(len(pf.attach))+" managed policies by ARN and "+
-			strconv.Itoa(len(pf.inline))+" inline policy copies")
+			strconv.Itoa(len(approved))+" inline policy copies, from the approved documents")
 		if err := s.moveBinding(d, src, nil, srcName, newName, newTF); err != nil {
 			return nil, err
 		}
@@ -851,43 +952,73 @@ func (s *tfSource) moveBinding(d *igagov.SplitDetail, from, to *tfBlock, fromNam
 	last := subject[strings.LastIndexAny(subject, "/:")+1:]
 	switch d.SubjectKind {
 	case igagov.SubjectECSService:
-		var svc *tfBlock
-		for _, b := range s.resources("aws_ecs_service") {
+		// §11: every ECS service running a source-role revision of the family
+		// is a subject; the task definition's task_role_arn changes (a new
+		// revision) and each service moves to it. A task definition shared
+		// with a service that is not a subject would move that service too.
+		subjects := map[string]bool{}
+		for _, a := range d.Subjects() {
+			subjects[a[strings.LastIndexAny(a, "/:")+1:]] = true
+		}
+		svcName := func(b *tfBlock) string {
 			if a := b.attr("name"); a != nil {
-				if v, ok := literalString(a.Raw); ok && v == last {
+				v, _ := literalString(a.Raw)
+				return v
+			}
+			return ""
+		}
+		tds := map[string]*tfBlock{}
+		var order []string
+		for _, name := range sortedSet(subjects) {
+			var svc *tfBlock
+			for _, b := range s.resources("aws_ecs_service") {
+				if svcName(b) == name {
 					svc = b
 				}
 			}
-		}
-		if svc == nil {
-			return fallback(ReasonRoleNotFound, "ECS service %s is not declared in %s", last, s.req.Source.Directory)
-		}
-		ta := svc.attr("task_definition")
-		if ta == nil {
-			return fallback(ReasonFormUnsupported, "%s has no task_definition", svc.address())
-		}
-		var td *tfBlock
-		for _, b := range s.resources("aws_ecs_task_definition") {
-			if strings.HasPrefix(strings.TrimSpace(ta.Raw), b.address()+".") {
-				td = b
+			if svc == nil {
+				return fallback(ReasonRoleNotFound, "ECS service %s is not declared in %s", name, s.req.Source.Directory)
 			}
-		}
-		if td == nil {
-			return fallback(ReasonFormUnsupported, "%s.task_definition is not a task definition declared in the source", svc.address())
+			ta := svc.attr("task_definition")
+			if ta == nil {
+				return fallback(ReasonFormUnsupported, "%s has no task_definition", svc.address())
+			}
+			var td *tfBlock
+			for _, b := range s.resources("aws_ecs_task_definition") {
+				if strings.HasPrefix(strings.TrimSpace(ta.Raw), b.address()+".") {
+					td = b
+				}
+			}
+			if td == nil {
+				return fallback(ReasonFormUnsupported, "%s.task_definition is not a task definition declared in the source", svc.address())
+			}
+			if _, ok := tds[td.address()]; !ok {
+				order = append(order, td.address())
+			}
+			tds[td.address()] = td
 		}
 		for _, b := range s.resources("aws_ecs_service") {
-			if b != svc {
-				if a := b.attr("task_definition"); a != nil && strings.HasPrefix(strings.TrimSpace(a.Raw), td.address()+".") {
-					return fallback(ReasonFormUnsupported, "%s is also used by %s; moving it would move that service too", td.address(), b.address())
+			if subjects[svcName(b)] {
+				continue
+			}
+			if a := b.attr("task_definition"); a != nil {
+				for _, td := range tds {
+					if strings.HasPrefix(strings.TrimSpace(a.Raw), td.address()+".") {
+						return fallback(ReasonFormUnsupported, "%s is also used by %s, which is not a subject of this change", td.address(), b.address())
+					}
 				}
 			}
 		}
-		ra := td.attr("task_role_arn")
-		if ra == nil || !refersTo(ra.Raw, from, fromARN, fromName) {
-			return fallback(ReasonFormUnsupported, "%s.task_role_arn does not name %s", td.address(), fromName)
+		for _, addr := range order {
+			td := tds[addr]
+			ra := td.attr("task_role_arn")
+			if ra == nil || !refersTo(ra.Raw, from, fromARN, fromName) {
+				return fallback(ReasonFormUnsupported, "%s.task_role_arn does not name %s", td.address(), fromName)
+			}
+			s.edit(td.File, edit{ra.ValStart, ra.ValEnd, roleRef("arn")})
+			s.sum = append(s.sum, "set "+td.address()+".task_role_arn to "+toName+" (a new task-definition revision; services "+
+				strings.Join(sortedSet(subjects), ", ")+" move to it)")
 		}
-		s.edit(td.File, edit{ra.ValStart, ra.ValEnd, roleRef("arn")})
-		s.sum = append(s.sum, "set "+td.address()+".task_role_arn to "+toName+" (a new task-definition revision; "+svc.address()+" moves to it)")
 	case igagov.SubjectLambdaFunction:
 		var fn *tfBlock
 		for _, b := range s.resources("aws_lambda_function") {
@@ -1017,80 +1148,21 @@ func (s *tfSource) moveBinding(d *igagov.SplitDetail, from, to *tfBlock, fromNam
 /* ----------------------------- CloudFormation ------------------------------ */
 
 func renderCFN(req Request) (*Change, error) {
+	ts, err := loadCFN(req)
+	if err != nil {
+		return nil, err
+	}
 	if req.Plan.Kind == igagov.PlanSplit || req.Plan.Kind == igagov.PlanSplitRevert {
-		// DECISION (T3.17): dedicated-identity changes are rendered for
-		// Terraform only in R1a; a CloudFormation source gets the J1 step
-		// list.
-		return nil, fallback(ReasonFormUnsupported, "dedicated-identity changes are not rendered for CloudFormation sources")
+		return renderCFNSplit(req, ts)
 	}
-	type tmpl struct {
-		t   *cfnTemplate
-		src string
+	t, hr, err := locateCFNRole(req, ts, req.Role.Name)
+	if err != nil {
+		return nil, err
 	}
-	var ts []tmpl
-	for _, p := range sortedKeys(req.Files) {
-		ext := strings.ToLower(path.Ext(p))
-		if ext != ".yaml" && ext != ".yml" && ext != ".json" && ext != ".template" {
-			continue
-		}
-		if !isCFNTemplate(req.Files[p]) {
-			continue
-		}
-		t, err := parseCFN(p, req.Files[p])
-		if err != nil {
-			return nil, fallback(ReasonFormUnsupported, "%v", err)
-		}
-		if t.Transform {
-			return nil, fallback(ReasonGeneratedSource, "%s uses Transform (SAM or a macro)", p)
-		}
-		ts = append(ts, tmpl{t, req.Files[p]})
-	}
-	if len(ts) == 0 {
-		return nil, fallback(ReasonRoleNotFound, "no CloudFormation templates in %s", req.Source.Directory)
-	}
-	name := req.Role.Name
-	rule := req.Source.RoleMatch.resourceFor(name)
-	type hit struct {
+	h := struct {
 		t *cfnTemplate
 		r cfnResource
-	}
-	var hits []hit
-	var computed []string
-	for _, x := range ts {
-		for _, r := range x.t.resources() {
-			if r.Type != "AWS::IAM::Role" {
-				continue
-			}
-			if rule != "" {
-				if r.LogicalID == rule {
-					hits = append(hits, hit{x.t, r})
-				}
-				continue
-			}
-			rn := mapGet(r.Props, "RoleName")
-			if v, ok := cfnScalar(rn); ok && v == name {
-				hits = append(hits, hit{x.t, r})
-			} else if rn != nil && !ok {
-				computed = append(computed, x.t.Path+": "+r.LogicalID)
-			}
-		}
-	}
-	switch {
-	case len(hits) > 1:
-		var ids []string
-		for _, h := range hits {
-			ids = append(ids, h.t.Path+": "+h.r.LogicalID)
-		}
-		return nil, fallback(ReasonRoleAmbiguous, "role %s is declared more than once: %s", name, strings.Join(ids, ", "))
-	case len(hits) == 0 && rule != "":
-		return nil, fallback(ReasonRoleNotFound, "role_match names %s, which is not an AWS::IAM::Role in %s", rule, req.Source.Directory)
-	case len(hits) == 0 && len(computed) > 0:
-		return nil, fallback(ReasonFormUnsupported, "role names are computed in %s", strings.Join(computed, ", "))
-	case len(hits) == 0:
-		return nil, fallback(ReasonRoleNotFound, "no AWS::IAM::Role named %s in %s", name, req.Source.Directory)
-	}
-	h := hits[0]
-	t := h.t
+	}{t, hr}
 	pf := readPlan(req.Plan, req.DeploymentID)
 	pols := map[string]cfnResource{}
 	for _, r := range t.resources() {
