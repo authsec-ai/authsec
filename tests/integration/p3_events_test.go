@@ -261,7 +261,7 @@ func TestP3T320EventsAPIAndExport(t *testing.T) {
 		m := c.(map[string]any)
 		rec[m["category"].(string)] = m["recorded"].(bool)
 	}
-	if !rec["owner_review"] || !rec["ownership"] || rec["approval"] || rec["rollout"] {
+	if !rec["owner_review"] || !rec["ownership"] || !rec["approval"] || !rec["verification"] || rec["rollout"] {
 		t.Fatalf("categories %v", rec)
 	}
 }
