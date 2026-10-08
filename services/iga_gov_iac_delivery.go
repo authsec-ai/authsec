@@ -1141,5 +1141,3 @@ func (d *GovIaCDelivery) keepNewRole(db *gorm.DB, ws uuid.UUID, x *iacDep) (bool
 	}
 	return false, nil
 }
-
-

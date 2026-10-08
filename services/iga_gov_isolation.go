@@ -750,7 +750,6 @@ func compileErrorAsGov(err error, roleID string) error {
 	return govUnprocessable(GovCodeTargetIneligible, fmt.Sprintf("This target cannot be compiled (%s).", ce.Code), detail)
 }
 
-
 // createIsolationVersion is POST /policies/:id/versions for a
 // dedicated_identity intent (§7.3, §11 "Propose dedicated identity"): the
 // next version of the policy that controls the source role, with one target
