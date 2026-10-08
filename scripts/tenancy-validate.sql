@@ -1,17 +1,17 @@
 -- ============================================================================
--- tenancy-validate.sql -- operator follow-up to migrations 045-048
+-- tenancy-validate.sql -- operator follow-up to migrations 103-106 (formerly 045-048)
 --
 -- Read-only. Run against the deployed database whenever convenient:
 --
 --   psql "$DATABASE_URL" -X -f scripts/tenancy-validate.sql
 --
--- 047 added its constraints NOT VALID: they hold for new writes, but rows
+-- 105 (formerly 047) added its constraints NOT VALID: they hold for new writes, but rows
 -- that existed before were never checked. This script lists, for each such
 -- constraint, how many existing rows violate it and the statement to run once
 -- that count is zero. VALIDATE CONSTRAINT scans the table under a SHARE UPDATE
 -- EXCLUSIVE lock (reads and writes continue), so it can run online.
 --
--- Tables where 047 installed trg_tenancy_require_ws instead of a CHECK (they
+-- Tables where 105 installed trg_tenancy_require_ws instead of a CHECK (they
 -- still had rows without a workspace) are listed with the CHECK to add and the
 -- trigger to drop once their NULL count is zero.
 --
