@@ -209,9 +209,11 @@ func loadRunEvidence(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID, rev int64) (map
 		return nil, nil, err
 	}
 	for _, r := range rows {
-		cc := models.CloudConnector{Attrs: r.Attrs}
-		regions := append([]string{}, cc.AWSAttrs().Regions...)
-		sort.Strings(regions)
+		coverage := models.DecodeScanCoverage(r.Coverage)
+		regions, known := runRegions(coverage, r.Attrs, ev[r.ID])
+		if e := ev[r.ID]; e != nil {
+			e.EnabledRegionsUnknown = !known
+		}
 		fp := first[r.ConnectorID]
 		if fp.IsZero() && r.PublishedAt != nil {
 			fp = r.PublishedAt.UTC()
@@ -220,10 +222,62 @@ func loadRunEvidence(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID, rev int64) (map
 			AccountID: r.ScopeID, ConnectorFirstPublishedAt: fp, EnabledRegions: regions,
 			ResourcePolicy: ev[r.ID]}
 		metas[r.ID.String()] = govRunMeta{ID: r.ID, ConnectorID: r.ConnectorID, Generation: r.Generation,
-			Coverage: models.DecodeScanCoverage(r.Coverage), AccountID: r.ScopeID, Regions: regions,
+			Coverage: coverage, AccountID: r.ScopeID, Regions: regions,
 			PublishedAt: r.PublishedAt}
 	}
 	return runs, metas, nil
+}
+
+// runRegions is the region set a run's evidence is judged against, and
+// whether it is the account's whole enabled set (review P1-6).
+//
+// The run's own frozen scope (models.ScanCoverage.Regions, stamped at
+// publication by the collection that read it) decides: its selected regions
+// plus the regions enabled in the account when it ran, never the connector's
+// live attrs -- a region selection changed after the scan must not rewrite
+// what the scan covered, and an enabled region the connector did not select
+// is in the set, so its not_collected rows make the evidence not_analysed
+// there instead of "no route".
+//
+// DECISION (P1-6a). A run without a frozen scope (collected before it was
+// recorded, or whose enabled regions could not be listed) is judged against
+// the regions its own coverage rows name, and is NOT known to cover every
+// enabled region: igagov.AnalyzeRoutes then reports each regional form
+// not_analysed (enabled_regions_unknown) until a scan records the scope. Only
+// a run with no coverage rows at all falls back to the connector's attrs, and
+// then only for the activity tracking-start rule -- with no rows, every route
+// is already not_analysed (no_resource_policy_coverage).
+func runRegions(cov models.ScanCoverage, attrs json.RawMessage, ev *igagov.ResourcePolicyEvidence) ([]string, bool) {
+	set := map[string]bool{}
+	add := func(rs []string) {
+		for _, r := range rs {
+			if r != "" {
+				set[r] = true
+			}
+		}
+	}
+	known := false
+	switch {
+	case cov.Regions != nil:
+		add(cov.Regions.Selected)
+		add(cov.Regions.Enabled)
+		known = cov.Regions.EnabledKnown
+	case ev != nil && len(ev.Coverage) > 0:
+		for _, c := range ev.Coverage {
+			if f, ok := igagov.LookupForm(c.Form); ok && f.Scope == igagov.ScopeRegion {
+				set[c.Region] = true
+			}
+		}
+	default:
+		cc := models.CloudConnector{Attrs: attrs}
+		add(cc.AWSAttrs().Regions)
+	}
+	out := make([]string, 0, len(set))
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out, known
 }
 
 // loadResourcePolicyEvidence reads each run's coverage and observations,

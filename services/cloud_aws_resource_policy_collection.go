@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -52,6 +53,10 @@ type ResourcePolicyCollection struct {
 	// enabled-region list still names them, as not_collected).
 	EnabledRegionsKnown bool
 	Coverage            []awsdiscovery.FormCoverage
+	// Regions is the region scope this collection used, frozen with the run
+	// (models.ScanCoverage.Regions): the scan worker stamps it on the run's
+	// coverage at publication.
+	Regions models.ScanRegionScope
 	// FormsWritten counts the (form, region) units this attempt wrote;
 	// FormsAlreadyRecorded the units an earlier attempt of the same run had.
 	FormsWritten, FormsAlreadyRecorded   int
@@ -97,7 +102,8 @@ func (s *AWSPermissionScanner) CollectResourcePolicies(
 	if partition == "" {
 		partition = awsdiscovery.PartitionOf(attrs.RoleARN)
 	}
-	out := &ResourcePolicyCollection{ScanRunID: scanRunID}
+	out := &ResourcePolicyCollection{ScanRunID: scanRunID,
+		Regions: models.ScanRegionScope{Selected: sortedRegionNames(attrs.Regions), Enabled: []string{}}}
 
 	if !awsdiscovery.GrantsResourcePolicyCollection(attrs.TemplateVersion) {
 		// §3.9: "Connectors on the older template record every collected form
@@ -111,6 +117,9 @@ func (s *AWSPermissionScanner) CollectResourcePolicies(
 		out.TemplateCurrent = true
 		enabled, known := s.enabledRegions(ctx, workspaceID, connectorID, attrs.Regions)
 		out.EnabledRegionsKnown = known
+		if known {
+			out.Regions.Enabled, out.Regions.EnabledKnown = sortedRegionNames(enabled), true
+		}
 		opts := awsdiscovery.CollectorOptions{}
 		if s.collectorOpts != nil {
 			opts = *s.collectorOpts
@@ -261,6 +270,20 @@ func (s *AWSPermissionScanner) enabledRegions(ctx context.Context, ws, conn uuid
 		names = append(names, r.Name)
 	}
 	return names, true
+}
+
+// sortedRegionNames is a sorted, de-duplicated copy without empty names.
+func sortedRegionNames(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range in {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resourcePolicyClientsFor returns the per-region client source: an injected

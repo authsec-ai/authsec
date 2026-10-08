@@ -103,6 +103,23 @@ type ResourcePolicyObservation struct {
 type ResourcePolicyEvidence struct {
 	Coverage     []CoverageRow
 	Observations []ResourcePolicyObservation
+	// EnabledRegionsUnknown is true when the scan did not establish the
+	// account's enabled regions (DescribeRegions failed, the connector is on
+	// the older template, or the run predates the frozen region scope): a
+	// regional form is then not known to be complete beyond the regions its
+	// rows name, and AnalyzeRoutes reports it not_analysed
+	// (ReasonEnabledRegionsUnknown) -- never "no route" (review P1-6).
+	EnabledRegionsUnknown bool
+}
+
+// ReasonEnabledRegionsUnknown is the not_analysed reason of a regional form
+// whose scan did not establish which regions are enabled in the account.
+const ReasonEnabledRegionsUnknown = "enabled_regions_unknown"
+
+// coverageOnly is ev's coverage facts without its observations (what the
+// coverage summaries analyse).
+func (ev *ResourcePolicyEvidence) coverageOnly() *ResourcePolicyEvidence {
+	return &ResourcePolicyEvidence{Coverage: ev.Coverage, EnabledRegionsUnknown: ev.EnabledRegionsUnknown}
 }
 
 // RoleRef identifies the role whose routes are analysed.
@@ -233,7 +250,13 @@ func effectFor(principal string) string {
 //   - an uncollected form of the namespace, a collected form not complete in
 //     every enabled Region (account-scoped forms: every row of the form
 //     complete and at least one row), or an unparseable observed policy →
-//     a not_analysed route naming it;
+//     a not_analysed route naming it. "Every enabled Region" is the union of
+//     enabledRegions (the account's enabled regions frozen with the scan) and
+//     every region the form's own rows name: a not_collected row for an
+//     enabled region the connector does not select is not_analysed there,
+//     never "no route" (review P1-6). A scan that did not establish the
+//     enabled regions (EnabledRegionsUnknown) leaves every regional form
+//     not_analysed (enabled_regions_unknown);
 //   - an Allow granting the namespace to the role ARN (limited), a session of
 //     the role (bypass_known) or "*" / {"AWS":"*"} / Allow+NotPrincipal
 //     (effect_unknown) → a route naming the resource.
@@ -273,7 +296,10 @@ func AnalyzeRoutes(service string, role RoleRef, ev *ResourcePolicyEvidence, ena
 			}
 			continue
 		}
-		for _, region := range sortedUnique(enabledRegions) {
+		if ev.EnabledRegionsUnknown {
+			ra.Routes = append(ra.Routes, Route{Service: service, Form: f.Name, Effect: RouteEffectNotAnalysed, Reason: ReasonEnabledRegionsUnknown})
+		}
+		for _, region := range sortedUnique(append(append([]string{}, enabledRegions...), sortedKeys(rows)...)) {
 			c, ok := rows[region]
 			switch {
 			case !ok:
