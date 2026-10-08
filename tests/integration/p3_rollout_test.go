@@ -54,7 +54,14 @@ type p3rLab struct {
 
 func newP3rLab(t *testing.T, name string, enforce bool) *p3rLab {
 	t.Helper()
-	l := &p3rLab{p3aLab: newP3aLab(t, name), trail: &p3rTrail{events: map[uuid.UUID][]igagov.TrailEvent{}, reads: map[uuid.UUID][]igagov.TrailRead{}}}
+	return p3rOn(t, newP3aLab(t, name), name, enforce)
+}
+
+// p3rOn adds the rollout plumbing to an existing T3.11 lab (e.g. the IaC
+// lab's, so one workspace has both).
+func p3rOn(t *testing.T, a *p3aLab, name string, enforce bool) *p3rLab {
+	t.Helper()
+	l := &p3rLab{p3aLab: a, trail: &p3rTrail{events: map[uuid.UUID][]igagov.TrailEvent{}, reads: map[uuid.UUID][]igagov.TrailRead{}}}
 	t.Cleanup(services.SetGovRolloutDeploymentFacts(&services.GovRowDeploymentFacts{DB: l.db, Trail: l.trail.get}))
 	if enforce {
 		p3exec(t, l.db, `INSERT INTO iga_gov_settings (workspace_id, enforcement_mode) VALUES (?, 'enforce')`, l.ws)
