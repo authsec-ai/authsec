@@ -14,8 +14,10 @@ import (
 	"testing"
 
 	"github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // planRouter mounts the two plan routes exactly as routes.go does: the agent's
@@ -28,7 +30,7 @@ func planRouter(t *testing.T, f planFixture) *gin.Engine {
 	r := gin.New()
 	r.GET("/authsec/provisioning/enforcement-plan", ctl.GetEnforcementPlan)
 	r.GET("/authsec/governance/connectors/:id/enforcement-plans",
-		func(c *gin.Context) { c.Set("workspace_id", f.ws.String()) },
+		func(c *gin.Context) { tenancy.Set(c, tenancy.Context{WorkspaceID: f.ws, PrincipalKind: "user"}) },
 		ctl.ListEnforcementPlans)
 	return r
 }
@@ -231,7 +233,9 @@ func TestConsoleViewIsWorkspaceScoped(t *testing.T) {
 	ctl := platform.NewGovernanceController(gormFor(t, f.raw))
 	r := gin.New()
 	r.GET("/authsec/governance/connectors/:id/enforcement-plans",
-		func(c *gin.Context) { c.Set("workspace_id", wsB) },
+		func(c *gin.Context) {
+			tenancy.Set(c, tenancy.Context{WorkspaceID: uuid.MustParse(wsB), PrincipalKind: "user"})
+		},
 		ctl.ListEnforcementPlans)
 
 	rec := get(t, r, "/authsec/governance/connectors/"+f.source.String()+"/enforcement-plans", "", "")
