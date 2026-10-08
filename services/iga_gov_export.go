@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -17,9 +18,10 @@ import (
 // deployment (§8.4: export -> awaiting_apply) of the same plan has its
 // deployment id substituted into the authsec:change tag.
 //
-// DECISION (T3.17): "approved" is the version's live approval (decision
-// approve, not revoked); a version without one answers 409
-// version_not_approved. Every current eligible plan is exported, whatever
+// DECISION (T3.17, review P2): "approved" is an approval in force
+// (UsableApproval: not revoked, not expired, approver still valid); a
+// version without one answers 409 version_not_approved, an expired one 409
+// approval_expired. Every current eligible plan is exported, whatever
 // its delivery: J1 is available for eligible and iac_only plans (§3.4).
 
 // GovCodeVersionNotApproved: export needs an approved version.
@@ -49,14 +51,21 @@ func (a *GovAuthoring) ExportVersion(ctx context.Context, ws, policyID uuid.UUID
 	if err != nil {
 		return nil, err
 	}
-	var n int64
-	if err := db.Model(&models.IGAGovApproval{}).Where("workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL",
-		ws, v.ID).Count(&n).Error; err != nil {
+	// Review P2: the approval must be IN FORCE with the same semantics a
+	// deployment relies on (UsableApproval): approved, not revoked, not
+	// expired (409 approval_expired), the intent unchanged and the approver
+	// still able to approve -- export is the J1 delivery, the customer applies
+	// what it shows. DECISION: evidence freshness (revalidation) is a check
+	// at deployment start, not at download, so the approval-level rules are
+	// applied here and each exported plan must be one the approval names.
+	ua, err := a.UsableApproval(ctx, ws, v.ID, nil)
+	if err != nil {
+		var ge *GovError
+		if errors.As(err, &ge) && ge.Code == GovCodeApprovalRequired {
+			return nil, govErr(http.StatusConflict, GovCodeVersionNotApproved, "Only an approved version can be exported.",
+				map[string]any{"status": v.Status})
+		}
 		return nil, err
-	}
-	if n == 0 {
-		return nil, govErr(http.StatusConflict, GovCodeVersionNotApproved, "Only an approved version can be exported.",
-			map[string]any{"status": v.Status})
 	}
 	plans, err := currentPlans(db, ws, v.ID)
 	if err != nil {
@@ -66,6 +75,9 @@ func (a *GovAuthoring) ExportVersion(ctx context.Context, ws, policyID uuid.UUID
 	for _, pr := range plans {
 		if pr.Eligibility == igagov.EligibilityIneligible {
 			continue
+		}
+		if !containsStr(ua.Approval.PlanHashes, pr.PlanHash) {
+			return nil, govConflict(GovCodePlanChanged, "This plan is not the approved plan.", map[string]any{"plan_id": pr.ID})
 		}
 		p, err := PlanFromRow(pr.IGAGovPlan)
 		if err != nil {

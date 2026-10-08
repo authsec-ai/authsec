@@ -227,18 +227,24 @@ func main() {
 					log.Printf("[slack] Slack app not enabled: %s", reason)
 				}
 			}
-			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
-				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
-				return
-			}
 			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
-			// the GitHub App key and connector credentials.
+			// the GitHub App key and connector credentials. Installed in EVERY
+			// process that serves the policy routes, before the worker check:
+			// proposals decide the IaC form at compile time in the API
+			// process, so a process started with AUTHSEC_DISABLE_POLICY_WORKER
+			// must still read the mapped source -- without an adapter an iac_pr
+			// target answers 503 iac_unavailable, never a silent export
+			// (review P2).
 			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
 				if vc, verr := vault.NewClient(addr, tok); verr == nil {
 					services.ConfigureGovIaCDelivery(config.DB, vc)
 				} else {
 					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
 				}
+			}
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
 			}
 			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
 			// T3.16: deployments need AWS access (discovery + enforcement

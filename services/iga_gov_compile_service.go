@@ -187,6 +187,13 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 		if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
 			return nil, nil, err
 		}
+		// A visible refusal (409 iac_source_missing, iac_installation_unverified,
+		// iac_repository_not_selected; 503 iac_unavailable) keeps its code: the
+		// target is never silently compiled as export (review P2).
+		var ge *GovError
+		if errors.As(err, &ge) {
+			return nil, &compileBlock{Bundle: &b, Reason: ge.Code + ": " + ge.Message, Err: ge}, nil
+		}
 		return nil, &compileBlock{Bundle: &b, Reason: GovCodeIaCUnavailable + ": " + err.Error(),
 			Err: govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "The mapped IaC source could not be read.",
 				map[string]any{"reason": err.Error(), "role_id": c.RoleID})}, nil

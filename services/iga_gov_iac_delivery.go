@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 )
 
 // IaC and export delivery (SPEC-iga-phase3-policy.md §1.1 J1/J2, §8.4 iac_pr
@@ -62,6 +64,10 @@ const (
 	GovEventIaCAppliedOutside = "iac.applied_outside_authsec"
 	GovEventIaCUnexpected     = "iac.unexpected_state"
 	GovEventExportReady       = "export.awaiting_apply"
+	GovEventIaCPRStep         = "iac.pr_step"
+	GovEventIaCPRUpdated      = "iac.pr_updated"
+	GovEventIaCPRSuperseded   = "iac.pr_superseded"
+	GovEventIaCOpenFailed     = "iac.pr_open_failed"
 )
 
 // Notes and reasons.
@@ -260,14 +266,65 @@ type GovIaCForm struct {
 }
 
 // IaCRepoRef resolves an IaC source's repository through its GitHub
-// discovery source's installation.
+// discovery source's installation, and refuses (409) a channel AuthSec must
+// not write through (review P2, IaC source checks):
+//
+//   - iac_installation_unverified: the discovery source's installation id is
+//     not the installation of its VERIFIED integration (iga_integrations:
+//     status active, verified_at set, the same installation_id) -- the token
+//     minted for the PR is for exactly the installation the workspace
+//     verified;
+//   - iac_repository_not_selected: the mapped repository is not one of the
+//     discovery source's selected repositories.
+//
+// The host is the verified integration's ProviderHost (GitHub Enterprise
+// Server: the PR adapter calls https://<host>/api/v3).
 func IaCRepoRef(db *gorm.DB, ws uuid.UUID, src models.IGAGovIaCSource) (iacpr.RepoRef, error) {
 	ch, err := LoadIaCGitHubChannel(db, ws, src.DiscoverySourceID)
 	if err != nil {
+		if errors.Is(err, ErrIaCSourceChannelNotFound) {
+			return iacpr.RepoRef{}, govConflict(GovCodeIaCSourceMissing, "The IaC source's GitHub discovery source no longer exists.",
+				map[string]any{"source_id": src.ID, "discovery_source_id": src.DiscoverySourceID})
+		}
 		return iacpr.RepoRef{}, err
 	}
-	return iacpr.RepoRef{WorkspaceID: ws.String(), IntegrationID: ch.IntegrationID, InstallationID: ch.InstallationID,
-		ProviderHost: ch.ProviderHost, FullName: src.Repository}, nil
+	in, err := verifiedIaCIntegration(db, ws, ch)
+	if err != nil {
+		return iacpr.RepoRef{}, err
+	}
+	if !ch.RepositorySelected(src.Repository) {
+		return iacpr.RepoRef{}, govConflict(GovCodeIaCRepoNotSelected, "The mapped repository is not selected by its GitHub discovery source.",
+			map[string]any{"source_id": src.ID, "repository": src.Repository, "discovery_source_id": src.DiscoverySourceID})
+	}
+	host := in.ProviderHost
+	if host == "" {
+		host = ch.ProviderHost
+	}
+	return iacpr.RepoRef{WorkspaceID: ws.String(), IntegrationID: ch.IntegrationID, InstallationID: *in.InstallationID,
+		ProviderHost: host, FullName: src.Repository}, nil
+}
+
+// verifiedIaCIntegration is the channel's integration when it is verified
+// and bound to the same installation the channel names.
+func verifiedIaCIntegration(db *gorm.DB, ws uuid.UUID, ch *IaCGitHubChannel) (*models.IGAIntegration, error) {
+	in, err := loadIaCIntegration(db, ws, ch.IntegrationID)
+	if err != nil {
+		return nil, err
+	}
+	why := ""
+	switch {
+	case in == nil:
+		why = "integration_missing"
+	case in.Status != "active" || in.VerifiedAt == nil:
+		why = "integration_not_verified"
+	case in.InstallationID == nil || *in.InstallationID == "" || *in.InstallationID != ch.InstallationID:
+		why = "installation_mismatch"
+	}
+	if why != "" {
+		return nil, govConflict(GovCodeIaCInstallUnverified, "The GitHub installation of this IaC source is not the verified installation of its integration.",
+			map[string]any{"reason": why, "integration_id": ch.IntegrationID, "discovery_source_id": ch.SourceID})
+	}
+	return in, nil
 }
 
 // DecideIaCForm renders a plan against every IaC source mapped to the
@@ -279,13 +336,18 @@ func DecideIaCForm(ctx context.Context, db *gorm.DB, gh iacpr.GitHub, ws uuid.UU
 	if err := db.Where("workspace_id = ? AND connector_id = ?", ws, c.ConnectorID).Order("created_at, id").Find(&srcs).Error; err != nil {
 		return nil, err
 	}
+	// Review P2: a J2 target without a mapped source is a visible 409
+	// iac_source_missing (Export stays an explicit choice of the intent),
+	// and an unconfigured PR adapter (e.g. a process started with
+	// AUTHSEC_DISABLE_POLICY_WORKER and no IaC adapters) is a 503 -- neither
+	// silently becomes export.
 	if len(srcs) == 0 {
-		return &GovIaCForm{Fallback: &iacpr.Fallback{Reason: IaCReasonSourceMissing,
-			Detail: "no IaC source is mapped for account " + c.AccountID}}, nil
+		return nil, govConflict(GovCodeIaCSourceMissing, "No IaC source is mapped for this account; map one under Policy > Setup, or choose Export.",
+			map[string]any{"account_id": c.AccountID, "connector_id": c.ConnectorID, "role_id": c.RoleID})
 	}
 	if gh == nil {
-		return &GovIaCForm{Fallback: &iacpr.Fallback{Reason: IaCReasonUnavailable,
-			Detail: "pull requests are not configured in this build"}}, nil
+		return nil, govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "Pull requests are not configured in this process.",
+			map[string]any{"role_id": c.RoleID})
 	}
 	var ok []*GovIaCForm
 	var fbs []*iacpr.Fallback
@@ -473,6 +535,10 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 	if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, depID).Find(&existing).Error; err != nil {
 		return nil, err
 	}
+	if len(existing) == 1 && existing[0].State != "opening" {
+		out.ChangeRow = &existing[0]
+		return out, nil
+	}
 	keep, err := d.keepNewRole(db, ws, x)
 	if err != nil {
 		return nil, err
@@ -483,6 +549,14 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		form = f
 		return err
 	}); err != nil {
+		// A visible setup refusal (the source was removed, its installation
+		// is no longer the verified one, its repository is no longer
+		// selected) blocks the deployment with that code; anything else is
+		// retried.
+		var ge *GovError
+		if errors.As(err, &ge) && ge.Status == http.StatusConflict {
+			return d.blockQueued(ctx, run, ws, x, ge.Code+": "+ge.Message, map[string]any{"reason": ge.Code, "detail": ge.Detail})
+		}
 		return nil, err
 	}
 	out.Form = form
@@ -490,23 +564,11 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		// The source no longer renders as approved: never improvise a
 		// different change; block for a new plan (DECISION T3.17).
 		reason := IaCReasonFormChanged + ": " + form.Fallback.Reason + ": " + form.Fallback.Detail
-		err := run.InTx(ctx, func(tx *gorm.DB) error {
-			if err := d.states.TransitionTx(tx, GovDeploymentTransition{WorkspaceID: ws, DeploymentID: depID, From: []string{"queued"},
-				To: "blocked", Reason: reason}); err != nil {
-				return err
-			}
-			refs, err := govDeploymentRefs(tx, ws, x.dep)
-			if err != nil {
-				return err
-			}
-			return appendGovEvent(tx, ws, GovEventIaCBlocked, models.GovActorSystem, "iac_delivery", refs, map[string]any{
-				"reason": form.Fallback.Reason, "detail": form.Fallback.Detail})
-		})
-		if err != nil {
-			return nil, err
+		o, err := d.blockQueued(ctx, run, ws, x, reason, map[string]any{"reason": form.Fallback.Reason, "detail": form.Fallback.Detail})
+		if o != nil {
+			o.Form = form
 		}
-		out.State, out.Reason = "blocked", reason
-		return out, nil
+		return o, err
 	}
 	ch, err := LoadIaCGitHubChannel(db, ws, form.Source.DiscoverySourceID)
 	if err != nil {
@@ -529,6 +591,12 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 			if err := d.ensureMigrationRows(tx, ws, x); err != nil {
 				return err
 			}
+			if len(existing) == 1 {
+				if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'opening'", ws, existing[0].ID).
+					Updates(map[string]any{"state": "failed", "updated_at": now}).Error; err != nil {
+					return err
+				}
+			}
 			return d.states.TransitionTx(tx, GovDeploymentTransition{WorkspaceID: ws, DeploymentID: depID, From: []string{"queued"},
 				To: "awaiting_apply", Reason: "already_in_source", ApplyDeadlineAt: &deadline})
 		})
@@ -539,18 +607,20 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		return out, nil
 	}
 
+	// Crash safety (review P2): the intent is recorded before every write
+	// GitHub keeps, and everything GitHub keeps is findable by the branch
+	// name, which is the deployment's. The `opening` row is committed before
+	// the first call; the commit is recorded as proposed_sha before the
+	// branch is created (StepRef), and an event records the branch before
+	// the PR is created (StepPull). A run that dies anywhere in between is
+	// resumed by the retried deploy job or by iac_sync's recovery of an
+	// `opening` change: OpenPullRequest finds the PR, or the branch at the
+	// recorded commit, and creates only what is missing.
 	branch := "authsec/" + depID.String()
 	var change models.IGAGovIaCChange
 	if len(existing) == 1 {
 		change = existing[0]
-		if change.State != "opening" {
-			out.ChangeRow = &change
-			return out, nil
-		}
 	} else {
-		// Recorded before GitHub is called: a crash between the two leaves an
-		// `opening` row whose branch the retry reuses (OpenPullRequest is
-		// idempotent on the branch).
 		change = models.IGAGovIaCChange{ID: uuid.New(), WorkspaceID: ws, DeploymentID: depID, SourceID: form.Source.ID, Branch: branch,
 			State: "opening", UpdatedAt: now}
 		if err := run.InTx(ctx, func(tx *gorm.DB) error { return tx.Create(&change).Error }); err != nil {
@@ -560,14 +630,28 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 	full := iacpr.Describe(x.plan, roleTarget(x.control), form.Change)
 	out.Description = &full
 	var pr iacpr.PullRequest
-	if err := run.External(ctx, 0, func(ctx context.Context) error {
+	openErr := run.External(ctx, 0, func(ctx context.Context) error {
 		var err error
 		pr, err = gh.OpenPullRequest(ctx, form.Repo, iacpr.PullRequestInput{BaseBranch: form.Source.BaseBranch, BaseSHA: form.CommitSHA,
-			Branch: branch, Title: full.Title, Body: full.Body, CommitMessage: full.Title + "\n\nPlan hash: " + x.plan.PlanHash,
-			Files: form.Change.Files})
+			Branch: change.Branch, Title: full.Title, Body: full.Body, CommitMessage: iacCommitMessage(full, x.plan, depID),
+			Files: form.Change.Files, ResumeSHA: change.ProposedSHA, OnStep: d.recordStep(run, ws, x, change.ID, "opening")})
 		return err
-	}); err != nil {
-		return nil, err
+	})
+	if errors.Is(openErr, iacpr.ErrBranchConflict) {
+		// The deployment's branch holds a commit AuthSec did not make: never
+		// reused or overwritten; the deployment is blocked, the change failed.
+		o, err := d.blockQueued(ctx, run, ws, x, "iac_branch_conflict: "+openErr.Error(), map[string]any{"reason": "iac_branch_conflict",
+			"branch": change.Branch, "iac_change_id": change.ID})
+		if err == nil {
+			err = run.InTx(ctx, func(tx *gorm.DB) error {
+				return tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'opening'", ws, change.ID).
+					Updates(map[string]any{"state": "failed", "updated_at": d.now().UTC()}).Error
+			})
+		}
+		return o, err
+	}
+	if openErr != nil {
+		return nil, openErr
 	}
 	out.PR = &pr
 	err = run.InTx(ctx, func(tx *gorm.DB) error {
@@ -594,7 +678,7 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		return appendGovEvent(tx, ws, GovEventIaCPROpened, models.GovActorSystem, "iac_delivery", refs, map[string]any{
 			"iac_change_id": change.ID, "repository": form.Source.Repository, "pr_number": pr.Number, "pr_url": pr.URL,
 			"proposed_sha": pr.HeadSHA, "base_sha": form.CommitSHA, "files": files, "location": form.Change.Location,
-			"plan_hash": x.plan.PlanHash})
+			"plan_hash": x.plan.PlanHash, "resumed": len(existing) == 1})
 	})
 	if err != nil {
 		return nil, err
@@ -604,6 +688,58 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 	}
 	out.ChangeID, out.ChangeRow, out.State = &change.ID, &change, "awaiting_merge"
 	return out, nil
+}
+
+// iacCommitMessage is the PR commit's message; it names the plan hash and
+// the deployment, so a resumed attempt recognises its own commit.
+func iacCommitMessage(desc iacpr.Description, p igagov.Plan, depID uuid.UUID) string {
+	return desc.Title + "\n\nPlan hash: " + p.PlanHash + "\nAuthSec deployment: " + depID.String()
+}
+
+// recordStep is PullRequestInput.OnStep: the intent of the next GitHub
+// write, committed (fenced) before it is made. StepRef records the commit as
+// the change's proposed_sha while the change is `opening` (the resume key);
+// every step is an iac.pr_step event.
+func (d *GovIaCDelivery) recordStep(run *PolicyJobRun, ws uuid.UUID, x *iacDep, changeID uuid.UUID, changeState string) func(context.Context, string, string) error {
+	return func(ctx context.Context, step, sha string) error {
+		return run.InTx(ctx, func(tx *gorm.DB) error {
+			if step == iacpr.StepRef && changeState == "opening" {
+				res := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'opening'", ws, changeID).
+					Updates(map[string]any{"proposed_sha": sha, "updated_at": d.now().UTC()})
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return fmt.Errorf("iac change %s is no longer opening", changeID)
+				}
+			}
+			refs, err := govDeploymentRefs(tx, ws, x.dep)
+			if err != nil {
+				return err
+			}
+			return appendGovEvent(tx, ws, GovEventIaCPRStep, models.GovActorSystem, "iac_delivery", refs, map[string]any{
+				"iac_change_id": changeID, "step": step, "sha": sha, "change_state": changeState})
+		})
+	}
+}
+
+// blockQueued moves a queued iac_pr deployment to blocked with the reason.
+func (d *GovIaCDelivery) blockQueued(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, x *iacDep, reason string, payload map[string]any) (*GovIaCOutcome, error) {
+	err := run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := d.states.TransitionTx(tx, GovDeploymentTransition{WorkspaceID: ws, DeploymentID: x.dep.ID, From: []string{"queued"},
+			To: "blocked", Reason: reason}); err != nil {
+			return err
+		}
+		refs, err := govDeploymentRefs(tx, ws, x.dep)
+		if err != nil {
+			return err
+		}
+		return appendGovEvent(tx, ws, GovEventIaCBlocked, models.GovActorSystem, "iac_delivery", refs, payload)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &GovIaCOutcome{DeploymentID: x.dep.ID, State: "blocked", Reason: reason}, nil
 }
 
 // precheck classifies the live state against the plan before anything is
@@ -712,9 +848,12 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 		return nil, err
 	}
 	out := &GovIaCOutcome{DeploymentID: ch.DeploymentID, State: x.dep.State, ChangeID: &ch.ID}
-	if ch.PRNumber == nil || ch.State == "opening" {
+	if ch.State == "opening" {
+		return d.recoverOpening(ctx, run, ws, ch, x)
+	}
+	if ch.PRNumber == nil {
 		out.ChangeRow = &ch
-		return out, nil // Deliver (re)opens it
+		return out, nil
 	}
 	if ch.State == "open" || ch.State == "changed_after_review" {
 		gh := d.gh()
@@ -738,7 +877,9 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 			return nil, err
 		}
 		now := d.now().UTC()
+		refreshable := false
 		err = run.InTx(ctx, func(tx *gorm.DB) error {
+			refreshable = false
 			refs, err := govDeploymentRefs(tx, ws, x.dep)
 			if err != nil {
 				return err
@@ -784,18 +925,30 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 				return appendGovEvent(tx, ws, GovEventIaCClosed, models.GovActorSystem, "iac_sync", refs, map[string]any{
 					"iac_change_id": ch.ID, "pr_number": *ch.PRNumber})
 			default:
-				if st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && ch.State == "open" {
+				if st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && ch.State == "open" && st.HeadSHA == lastUpdateIntent(tx, ws, ch.ID) {
+					// AuthSec's own update, whose completion was not recorded.
+					set["proposed_sha"] = st.HeadSHA
+					refreshable = true
+				} else if st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && ch.State == "open" {
 					set["state"] = "changed_after_review"
 					if err := appendGovEvent(tx, ws, GovEventIaCChangedReview, models.GovActorSystem, "iac_sync", refs, map[string]any{
 						"iac_change_id": ch.ID, "proposed_sha": ch.ProposedSHA, "head_sha": st.HeadSHA}); err != nil {
 						return err
 					}
 				}
+				if st.HeadSHA == ch.ProposedSHA && ch.State == "open" {
+					refreshable = true
+				}
 				return tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ?", ws, ch.ID).Updates(set).Error
 			}
 		})
 		if err != nil {
 			return nil, err
+		}
+		if refreshable && x.dep.State == "awaiting_merge" {
+			if err := d.refreshOpen(ctx, run, ws, ch, x, st, repo, src); err != nil {
+				return nil, err
+			}
 		}
 	} else if ch.State == "merged" {
 		// The apply run of merged_sha may be reported later.
@@ -862,6 +1015,205 @@ func (d *GovIaCDelivery) refreshApplyRun(ctx context.Context, run *PolicyJobRun,
 		}
 		return appendGovEvent(tx, ws, GovEventIaCApplyRun, models.GovActorSystem, "iac_sync", refs, map[string]any{
 			"iac_change_id": ch.ID, "apply_runs": st.ApplyRuns})
+	})
+}
+
+/* ----------------------- opening recovery and PR update -------------------- */
+
+// GovIaCOpeningLimit bounds how long a change may stay `opening` while
+// retries fail: after it, the deployment fails (iac.pr_open_failed) instead
+// of holding the role forever.
+const GovIaCOpeningLimit = 24 * time.Hour
+
+// recoverOpening is iac_sync for a change still `opening` (review P2): the
+// run that was opening it died or exhausted its attempts. While the
+// deployment is queued, Deliver resumes it from what was recorded and what
+// GitHub shows by branch name; a deployment that left queued, or a change
+// that cannot be opened for GovIaCOpeningLimit, ends `failed` -- an
+// `opening` row never lasts forever.
+func (d *GovIaCDelivery) recoverOpening(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ch models.IGAGovIaCChange, x *iacDep) (*GovIaCOutcome, error) {
+	var cause string
+	if x.dep.State == "queued" {
+		o, err := d.Deliver(ctx, run, ws, ch.DeploymentID)
+		if err == nil {
+			o.ChangeID = &ch.ID
+			return o, nil
+		}
+		if errors.Is(err, repositories.ErrPolicyJobLeaseLost) || d.now().UTC().Sub(ch.UpdatedAt) < GovIaCOpeningLimit {
+			return nil, err
+		}
+		cause = err.Error()
+	} else {
+		cause = "the deployment is " + x.dep.State + ", not queued"
+	}
+	now := d.now().UTC()
+	err := run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'opening'", ws, ch.ID).
+			Updates(map[string]any{"state": "failed", "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if x.dep.State == "queued" {
+			if err := d.states.TransitionTx(tx, GovDeploymentTransition{WorkspaceID: ws, DeploymentID: x.dep.ID, From: []string{"queued"},
+				To: "failed", Reason: "pr_open_failed: " + cause}); err != nil {
+				return err
+			}
+		}
+		refs, err := govDeploymentRefs(tx, ws, x.dep)
+		if err != nil {
+			return err
+		}
+		return appendGovEvent(tx, ws, GovEventIaCOpenFailed, models.GovActorSystem, "iac_sync", refs, map[string]any{
+			"iac_change_id": ch.ID, "branch": ch.Branch, "proposed_sha": ch.ProposedSHA, "cause": cause})
+	})
+	if err != nil {
+		return nil, err
+	}
+	var fresh models.IGAGovIaCChange
+	if err := d.db.WithContext(ctx).Where("id = ?", ch.ID).Take(&fresh).Error; err != nil {
+		return nil, err
+	}
+	cur, err := d.load(d.db.WithContext(ctx), ws, ch.DeploymentID)
+	if err != nil {
+		return nil, err
+	}
+	return &GovIaCOutcome{DeploymentID: ch.DeploymentID, State: cur.dep.State, Reason: cur.dep.StateReason, ChangeID: &ch.ID, ChangeRow: &fresh}, nil
+}
+
+// lastUpdateIntent is the commit of the latest PR-update intent recorded for
+// an open change (iac.pr_step, change_state open): a head equal to it is
+// AuthSec's own update whose completion was not recorded, not a change
+// after review.
+func lastUpdateIntent(db *gorm.DB, ws, changeID uuid.UUID) string {
+	var shas []string
+	db.Raw(`SELECT payload->>'sha' FROM iga_gov_event WHERE workspace_id = ? AND event = ? AND payload->>'iac_change_id' = ?
+		AND payload->>'change_state' = 'open' AND payload->>'step' = ? ORDER BY id DESC LIMIT 1`,
+		ws, GovEventIaCPRStep, changeID.String(), iacpr.StepRef).Scan(&shas)
+	if len(shas) == 1 {
+		return shas[0]
+	}
+	return ""
+}
+
+// refreshOpen is the PR update path (review P2) for an `open` change whose
+// head is still AuthSec's:
+//
+//   - the deployment's plan was recompiled: a current plan of the same
+//     target and kind with the SAME plan hash (revalidated, unchanged)
+//     keeps the PR; a different hash (or none) means what the PR proposes is
+//     no longer approved -- AuthSec closes the PR with the reason and the
+//     deployment is blocked (plan_changed); a new approval opens a new one;
+//   - the approved plan is re-rendered against the base branch's current
+//     head (and the description regenerated): a source that no longer
+//     renders it closes the PR and blocks (iac_form_changed); a rendering or
+//     description that differs from the PR's updates the SAME branch and PR
+//     (rebased on the new base) and records the new proposed_sha.
+//
+// DECISION (review P2): "close and reopen" is used only when the approved
+// change itself is gone; a moved base or improved description is an
+// update, so reviewers keep one PR and its history.
+func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ch models.IGAGovIaCChange, x *iacDep,
+	st iacpr.PullRequestState, repo iacpr.RepoRef, src models.IGAGovIaCSource) error {
+	db := d.db.WithContext(ctx)
+	gh := d.gh()
+	closeAndBlock := func(reason string, payload map[string]any) error {
+		comment := "AuthSec closed this pull request: " + reason + ". The approved change can no longer be delivered from it; " +
+			"a new approval will open a new pull request."
+		if err := run.External(ctx, 0, func(ctx context.Context) error { return gh.ClosePullRequest(ctx, repo, *ch.PRNumber, comment) }); err != nil {
+			return err
+		}
+		now := d.now().UTC()
+		return run.InTx(ctx, func(tx *gorm.DB) error {
+			if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'open'", ws, ch.ID).
+				Updates(map[string]any{"state": "closed", "updated_at": now}).Error; err != nil {
+				return err
+			}
+			if err := d.states.TransitionTx(tx, GovDeploymentTransition{WorkspaceID: ws, DeploymentID: x.dep.ID,
+				From: []string{"awaiting_merge"}, To: "blocked", Reason: reason}); err != nil {
+				return err
+			}
+			refs, err := govDeploymentRefs(tx, ws, x.dep)
+			if err != nil {
+				return err
+			}
+			payload["iac_change_id"], payload["pr_number"], payload["reason"] = ch.ID, *ch.PRNumber, reason
+			return appendGovEvent(tx, ws, GovEventIaCPRSuperseded, models.GovActorSystem, "iac_sync", refs, payload)
+		})
+	}
+	if x.planRow.SupersededAt != nil {
+		var cur []models.IGAGovPlan
+		if err := db.Where("workspace_id = ? AND target_id = ? AND kind = ? AND superseded_at IS NULL", ws, x.planRow.TargetID, x.planRow.Kind).
+			Find(&cur).Error; err != nil {
+			return err
+		}
+		if len(cur) != 1 || cur[0].PlanHash != x.planRow.PlanHash {
+			now := ""
+			if len(cur) == 1 {
+				now = cur[0].PlanHash
+			}
+			return closeAndBlock(GovCodePlanChanged, map[string]any{"approved_plan_hash": x.planRow.PlanHash, "current_plan_hash": now})
+		}
+	}
+	keep, err := d.keepNewRole(db, ws, x)
+	if err != nil {
+		return err
+	}
+	var form *GovIaCForm
+	var head iacpr.Snapshot
+	if err := run.External(ctx, 0, func(ctx context.Context) error {
+		f, err := DecideIaCForm(ctx, db, gh, ws, x.control, x.plan, x.docs, x.dep.ID.String(), keep)
+		if err != nil {
+			return err
+		}
+		form = f
+		head, err = gh.ReadDirectory(ctx, repo, ch.Branch, src.Directory)
+		return err
+	}); err != nil {
+		var ge *GovError
+		if errors.As(err, &ge) && ge.Status == http.StatusConflict {
+			return closeAndBlock(IaCReasonFormChanged+": "+ge.Code, map[string]any{"detail": ge.Detail})
+		}
+		return err
+	}
+	if form.Fallback != nil {
+		return closeAndBlock(IaCReasonFormChanged+": "+form.Fallback.Reason, map[string]any{"detail": form.Fallback.Detail})
+	}
+	if form.Source == nil || form.Source.ID != src.ID || form.Change.Empty() {
+		return nil // the role moved to another source, or the base already holds the change: leave the PR to its reviewers
+	}
+	desc := iacpr.Describe(x.plan, roleTarget(x.control), form.Change)
+	filesDiffer := false
+	for _, f := range form.Change.Files {
+		if head.Files[f.Path] != f.After {
+			filesDiffer = true
+		}
+	}
+	descDiffer := st.Title != desc.Title || st.Body != desc.Body
+	if !filesDiffer && !descDiffer {
+		return nil
+	}
+	var pr iacpr.PullRequest
+	if err := run.External(ctx, 0, func(ctx context.Context) error {
+		var err error
+		pr, err = gh.UpdatePullRequest(ctx, repo, *ch.PRNumber, iacpr.PullRequestInput{BaseBranch: src.BaseBranch, BaseSHA: form.CommitSHA,
+			Branch: ch.Branch, Title: desc.Title, Body: desc.Body, CommitMessage: iacCommitMessage(desc, x.plan, x.dep.ID),
+			Files: form.Change.Files, OnStep: d.recordStep(run, ws, x, ch.ID, "open")})
+		return err
+	}); err != nil {
+		return err
+	}
+	now := d.now().UTC()
+	return run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'open'", ws, ch.ID).
+			Updates(map[string]any{"proposed_sha": pr.HeadSHA, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		refs, err := govDeploymentRefs(tx, ws, x.dep)
+		if err != nil {
+			return err
+		}
+		return appendGovEvent(tx, ws, GovEventIaCPRUpdated, models.GovActorSystem, "iac_sync", refs, map[string]any{
+			"iac_change_id": ch.ID, "pr_number": *ch.PRNumber, "previous_sha": ch.ProposedSHA, "proposed_sha": pr.HeadSHA,
+			"base_sha": form.CommitSHA, "files_changed": filesDiffer, "description_changed": descDiffer, "plan_hash": x.plan.PlanHash})
 	})
 }
 
@@ -1068,10 +1420,11 @@ func upsertArtifactVerification(tx *gorm.DB, ws, depID uuid.UUID, outcome string
 // deployment (§8.5 ledger table; §11 dedicated_role / workload_binding).
 func (d *GovIaCDelivery) recordLedgerTx(tx *gorm.DB, ws uuid.UUID, x *iacDep, now time.Time) error {
 	p := x.plan
-	settle := func(kind, keepARN, state string) error {
+	settle := func(kind, keepARN, state string, keepMore ...string) error {
+		keep := pq.StringArray(append([]string{keepARN}, keepMore...))
 		return tx.Exec(`UPDATE iga_gov_artifact SET state = ?, last_deployment_id = ?, last_readback_at = ?, updated_at = ?
-			WHERE workspace_id = ? AND control_id = ? AND kind = ? AND state IN ('intended','present','drifted') AND native_arn <> ?`,
-			state, x.dep.ID, now, now, ws, x.control.ID, kind, keepARN).Error
+			WHERE workspace_id = ? AND control_id = ? AND kind = ? AND state IN ('intended','present','drifted') AND native_arn <> ALL(?)`,
+			state, x.dep.ID, now, now, ws, x.control.ID, kind, keep).Error
 	}
 	present := func(kind, arn string, doc *string) error {
 		var n int64
@@ -1090,12 +1443,22 @@ func (d *GovIaCDelivery) recordLedgerTx(tx *gorm.DB, ws uuid.UUID, x *iacDep, no
 	switch p.Kind {
 	case igagov.PlanSplit:
 		dsp := p.Diff.Split
-		return firstErr(settle("dedicated_role", dsp.NewRoleARN, "released"), present("dedicated_role", dsp.NewRoleARN, nil),
-			settle("workload_binding", dsp.SubjectARN, "released"), present("workload_binding", dsp.SubjectARN, nil))
+		subjects := dsp.Subjects()
+		if err := firstErr(settle("dedicated_role", dsp.NewRoleARN, "released"), present("dedicated_role", dsp.NewRoleARN, nil),
+			settle("workload_binding", subjects[0], "released", subjects[1:]...)); err != nil {
+			return err
+		}
+		for _, sa := range subjects {
+			if err := present("workload_binding", sa, nil); err != nil {
+				return err
+			}
+		}
+		return nil
 	case igagov.PlanSplitRevert:
 		dsp := p.Diff.Split
 		if err := tx.Exec(`UPDATE iga_gov_workload_migration SET state = 'reverted' WHERE workspace_id = ? AND control_id = ?
-			AND subject_arn = ? AND to_role_arn = ? AND plan_id <> ?`, ws, x.control.ID, dsp.SubjectARN, dsp.NewRoleARN, x.planRow.ID).Error; err != nil {
+			AND subject_arn = ANY(?) AND to_role_arn = ? AND plan_id <> ?`, ws, x.control.ID, pq.StringArray(dsp.Subjects()), dsp.NewRoleARN,
+			x.planRow.ID).Error; err != nil {
 			return err
 		}
 		return firstErr(settle("dedicated_role", "", "removed"), settle("workload_binding", "", "removed"))
