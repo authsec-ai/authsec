@@ -999,7 +999,11 @@ type GovRevalidation struct {
 //     the live read failed; nothing is recompiled or stored but the row.
 //
 // The plan must be one the version's live approval names (409 plan_changed
-// otherwise). Without any complete evaluation there is no bundle to record
+// otherwise), and its target must not already carry a deployment of the
+// version (409 target_deployed, fix/p3-appr P0-2: the role then includes
+// this version's own change, which is never a material change). A
+// dedicated-identity version's split / split_revert plans are recompiled
+// with CompileSplit (fix/p3-appr P1-10). Without any complete evaluation there is no bundle to record
 // against, and an error is returned instead of a row.
 func (a *GovAuthoring) Revalidate(ctx context.Context, ws, planID uuid.UUID) (*GovRevalidation, error) {
 	return a.revalidate(ctx, ws, planID, directCall, a.plainTx)
