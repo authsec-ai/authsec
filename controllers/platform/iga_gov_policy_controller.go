@@ -136,10 +136,17 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/policies/:id/versions/:no/plans", require("governance", "read"), ctl.VersionPlans)
 	g.POST("/policies/:id/versions/:no/withdraw", require("governance", "author"), ctl.WithdrawVersion)
 
-	// §7.5 approval (T3.13, iga_gov_approval_controller.go). Rollout is T3.15.
+	// §7.5 approval (T3.13, iga_gov_approval_controller.go).
 	g.GET("/approvals", require("governance", "approve"), ctl.ListApprovals)
 	g.POST("/policies/:id/versions/:no/approve", require("governance", "approve"), ctl.ApproveVersion)
 	g.POST("/policies/:id/versions/:no/reject", require("governance", "approve"), ctl.RejectVersion)
+
+	// §7.5 rollout (T3.15, iga_gov_rollout_controller.go).
+	g.GET("/policies/:id/rollout", require("governance", "read"), ctl.GetRollout)
+	g.POST("/policies/:id/rollout/start", require("governance", "enforce"), ctl.StartRollout)
+	g.POST("/policies/:id/rollout/expand", require("governance", "enforce"), ctl.ExpandRollout)
+	g.POST("/policies/:id/rollout/pause", require("governance", "enforce"), ctl.PauseRollout)
+	g.POST("/policies/:id/rollout/resume", require("governance", "enforce"), ctl.ResumeRollout)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's

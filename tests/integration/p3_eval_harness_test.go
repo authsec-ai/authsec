@@ -104,10 +104,13 @@ func p3ePurge(t *testing.T, db *gorm.DB, ws uuid.UUID) {
 			return err
 		}
 		for _, table := range []string{
-			"iga_gov_event", "iga_gov_job", "iga_gov_acceptance", "iga_gov_revalidation", "iga_gov_rollout",
+			// Deployments (and the posture naming them) before the
+			// revalidations and approvals they reference (T3.15).
+			"iga_gov_event", "iga_gov_job", "iga_gov_acceptance", "iga_gov_service_posture", "iga_gov_deployment",
+			"iga_gov_revalidation", "iga_gov_rollout",
 			"iga_gov_approval", "iga_gov_owner_response", "iga_gov_owner_review",
 			"iga_gov_finding_result", "iga_gov_activity_evidence",
-			"iga_gov_finding", "iga_gov_evaluation", "iga_gov_service_posture", "iga_gov_deployment",
+			"iga_gov_finding", "iga_gov_evaluation",
 			"iga_gov_plan", "iga_gov_target", "iga_gov_evidence_bundle", "iga_gov_control", "iga_gov_document",
 			"iga_gov_policy_version", "iga_gov_owner", "iga_gov_owner_rule", "iga_gov_finding_rule",
 			"iga_gov_settings", "iga_gov_iac_source", "cloud_enforcement_binding",

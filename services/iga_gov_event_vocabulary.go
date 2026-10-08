@@ -121,6 +121,23 @@ var GovEventVocabulary = []GovEventKind{
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
 	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
+	// T3.15 rollout (iga_gov_rollout_service.go, iga_gov_rollout_jobs.go).
+	{GovEventRolloutObservationStarted, GovCatRollout, GovObjVersion, "Observation of a version started (or restarted after it went back to draft)."},
+	{GovEventRolloutObservationChecked, GovCatRollout, GovObjVersion, "A publication's activity evidence was read for an observing version."},
+	{GovEventRolloutObservationCompleted, GovCatRollout, GovObjVersion, "Observation ended: observe_until passed and every target has a fresh report."},
+	{GovEventRolloutReturnedToDraft, GovCatRollout, GovObjVersion, "A removed service was attempted during observation; the version went back to draft."},
+	{GovEventRolloutCanaryStarted, GovCatRollout, GovObjDeployment, "The canary deployment of an approved, observed version was created."},
+	{GovEventRolloutDeploymentCreated, GovCatRollout, GovObjDeployment, "The rollout created a deployment and queued it."},
+	{GovEventRolloutDeploymentRefused, GovCatRollout, GovObjVersion, "The rollout could not create a target's deployment (approval, binding, mode or a change in flight)."},
+	{GovEventRolloutGatesEvaluated, GovCatRollout, GovObjDeployment, "The canary's gates were evaluated."},
+	{GovEventRolloutGateAccepted, GovCatAcceptance, GovObjDeployment, "An approver accepted a canary gate that could not be evaluated."},
+	{GovEventRolloutPaused, GovCatRollout, GovObjVersion, "The rollout was paused (by a person, a failed gate or deployment, drift, or a return to draft)."},
+	{GovEventRolloutResumed, GovCatRollout, GovObjVersion, "A paused rollout was resumed."},
+	{GovEventRolloutExpanded, GovCatRollout, GovObjVersion, "The canary passed and the remaining targets' deployments were created."},
+	{GovEventRolloutCompleted, GovCatRollout, GovObjVersion, "Every target of the rollout was verified."},
+	{GovEventRolloutPartial, GovCatRollout, GovObjVersion, "The rollout finished with some targets failed or refused."},
+	{GovEventRolloutUndone, GovCatRollout, GovObjVersion, "The rollout's applied change was undone."},
+	{GovEventRolloutRefreshQueued, GovCatRollout, GovObjConnector, "A connector scan was queued so observation gets a fresh activity report."},
 }
 
 // Object kinds the events API filters on.
