@@ -1911,7 +1911,8 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 		}
 	}
 	if len(in.Subjects) > 0 {
-		in.Rollout = &igagov.RolloutIntent{CanaryTarget: in.Subjects[0].RoleID}
+		// fix/p3-roll: the default canary skips a role that can never be one.
+		in.Rollout = &igagov.RolloutIntent{CanaryTarget: defaultCanarySubject(a.db, ws, in.Subjects)}
 		if h := settings.CanaryHours; h >= igagov.MinCanaryHours && h <= igagov.MaxCanaryHours {
 			in.Rollout.CanaryHours = h
 		}

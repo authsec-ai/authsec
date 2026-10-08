@@ -106,7 +106,10 @@ func p3ePurge(t *testing.T, db *gorm.DB, ws uuid.UUID) {
 		for _, table := range []string{
 			// Deployments (and the posture naming them) before the
 			// revalidations and approvals they reference (T3.15).
-			"iga_gov_event", "iga_gov_job", "iga_gov_acceptance", "iga_gov_service_posture", "iga_gov_deployment",
+			"iga_gov_event", "iga_gov_job", "iga_gov_acceptance", "iga_gov_service_posture",
+			// The deployment jobs' rows (the rollout labs run them, T3.16).
+			"iga_gov_attempt", "iga_gov_verification", "iga_gov_service_outcome", "iga_gov_validation_item",
+			"iga_gov_validation", "iga_gov_health_report", "iga_gov_artifact", "iga_gov_deployment",
 			"iga_gov_revalidation", "iga_gov_rollout",
 			"iga_gov_approval", "iga_gov_owner_response", "iga_gov_owner_review",
 			"iga_gov_finding_result", "iga_gov_activity_evidence",

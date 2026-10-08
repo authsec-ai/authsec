@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 	"time"
 
@@ -226,4 +227,33 @@ func defaultCanaryTx(tx *gorm.DB, ws uuid.UUID, controls []models.IGAGovControl)
 		}
 	}
 	return controls[0].RoleID, nil
+}
+
+// defaultCanarySubject is the canary a proposal recommends: the first
+// subject that may be a canary (§8.6), by the rule of defaultCanaryTx. A
+// failed read keeps the first subject: canary start enforces the rule on the
+// plan's evidence anyway (canary_admin_role), so the error only loses the
+// early choice, never the check.
+func defaultCanarySubject(db *gorm.DB, ws uuid.UUID, subjects []igagov.Subject) string {
+	if len(subjects) < 2 {
+		if len(subjects) == 1 {
+			return subjects[0].RoleID
+		}
+		return ""
+	}
+	for _, s := range subjects {
+		id, err := uuid.Parse(s.IdentityAccountID)
+		if err != nil {
+			return subjects[0].RoleID
+		}
+		admin, err := adminLevelIdentityTx(db, ws, id)
+		if err != nil {
+			log.Printf("[iga-gov] default canary: reading %s's grants: %v", s.RoleID, err)
+			return subjects[0].RoleID
+		}
+		if !admin {
+			return s.RoleID
+		}
+	}
+	return subjects[0].RoleID
 }
