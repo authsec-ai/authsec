@@ -213,9 +213,8 @@ func (l *p3aLab) must(code int, body map[string]any, want int, what string) map[
 /* --------------------------------- roles ---------------------------------- */
 
 // p3aDoc is an identity policy granting one action of each service. Not
-// <svc>:* on "*": that is a broad_grant, whose fingerprint over a graph
-// statement key (which contains U+001F) currently fails the whole
-// evaluation (reported; T3.06's).
+// <svc>:* on "*": that would add a broad_grant finding to every scenario
+// (it evaluates since p3-wire; TestP3WireBroadGrantEvaluates).
 func p3aDoc(services ...string) string {
 	var acts []string
 	for _, s := range services {

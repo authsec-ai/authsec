@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS iga_gov_settings (
   canary_hours             int NOT NULL DEFAULT 48 CHECK (canary_hours BETWEEN 1 AND 336),
   iac_apply_hours          int NOT NULL DEFAULT 24 CHECK (iac_apply_hours BETWEEN 1 AND 336),
   evidence_retention_revs  int NOT NULL DEFAULT 30 CHECK (evidence_retention_revs BETWEEN 5 AND 365),
+  -- Notification channels (sections 7.8, 9.3 S9): owner email on/off, the
+  -- workspace webhook (https only) and the Vault path of its signing secret
+  -- (never the secret), and where the values came from (default, set through
+  -- PUT /settings, or copied once from the legacy governance settings).
+  notify_email_enabled      boolean NOT NULL DEFAULT true,
+  notify_webhook_url        text NOT NULL DEFAULT '' CHECK (notify_webhook_url = '' OR notify_webhook_url LIKE 'https://%'),
+  notify_webhook_secret_ref text NOT NULL DEFAULT '',
+  notify_channels_source    text NOT NULL DEFAULT 'default' CHECK (notify_channels_source IN ('default','phase3','legacy_copy')),
+  notify_channels_copied_at timestamptz,
   updated_by               uuid REFERENCES users(id),
   updated_at               timestamptz NOT NULL DEFAULT now()
 );

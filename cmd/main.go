@@ -198,6 +198,18 @@ func main() {
 			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
 		}
 		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			// Owner review hooks, notification channels (055 + Vault) and the
+			// compiler's discovery-role live reader: installed only once the
+			// Phase 3 schema has verified, before the worker that uses them.
+			var policyVault vault.VaultClient
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr != nil {
+					log.Printf("[policy] vault client: %v", verr)
+				} else {
+					policyVault = vc
+				}
+			}
+			services.InstallGovPolicyRuntime(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
 			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
 				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
 				return

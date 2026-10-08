@@ -697,7 +697,7 @@ func TestP3T312NotifyRetryAndDead(t *testing.T) {
 			if ran, _ := w.RunOnce(ctx); ran {
 				t.Fatalf("attempt %d: the job ran again before its backoff", attempt)
 			}
-			p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() - interval '1 second' WHERE id = ?`, j.ID)
+			p3exec(t, db, `UPDATE iga_gov_job SET run_after = ? WHERE id = ?`, time.Now().Add(-time.Second), j.ID) // the worker's clock (T3.08)
 		} else {
 			if cur.State != "dead" || j.Status != "failed" || j.Attempts != 5 {
 				t.Fatalf("after 5: notification %s, job %s/%d", cur.State, j.Status, j.Attempts)
@@ -800,9 +800,9 @@ func TestP3T312RemindDuringBackoff(t *testing.T) {
 		if ran, err := w.RunOnce(ctx); err != nil || !ran {
 			t.Fatalf("try %d: %v %v", i, ran, err)
 		}
-		p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() - interval '1 second' WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, g.ws)
+		p3exec(t, db, `UPDATE iga_gov_job SET run_after = ? WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, time.Now().Add(-time.Second), g.ws)
 	}
-	p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() + interval '30 minutes' WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, g.ws)
+	p3exec(t, db, `UPDATE iga_gov_job SET run_after = ? WHERE workspace_id = ? AND kind = 'notify' AND status = 'queued'`, time.Now().Add(30*time.Minute), g.ws)
 	mail.setFail(nil)
 	if _, err := svc.Remind(ctx, g.ws, g.author, sync.ReviewID); err != nil {
 		t.Fatal(err)

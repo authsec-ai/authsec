@@ -107,8 +107,13 @@ func (l *x3Lab) role(name, path string, tags map[string]string) *x3Role {
 	authsec := igagov.AuthSecBoundaryARN("aws", testAccount, r.RoleID)
 	p3exec(l.t, l.db, `INSERT INTO iga_gov_control (id, workspace_id, connector_id, account_id, role_id, role_arn, identity_account_id, policy_id, boundary_policy_arn)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, x.control, l.ws, l.conn.ID, testAccount, r.RoleID, x.arn, x.identity, x.policy, authsec)
-	x.ref = igagov.ControlRef{ID: x.control.String(), PolicyID: x.policy.String(), AccountID: testAccount, RoleID: r.RoleID,
-		WorkspaceRef: "ws-" + l.ws.String()[:8], OwnedPolicyARNs: []string{authsec}}
+	// The production ControlRef (p3-wire item 2): the authsec:workspace tag
+	// is services.GovWorkspaceRef(ws), exactly what the compile service uses.
+	var ctl models.IGAGovControl
+	if err := l.db.Where("workspace_id = ? AND id = ?", l.ws, x.control).Take(&ctl).Error; err != nil {
+		l.t.Fatal(err)
+	}
+	x.ref = services.GovControlRef(l.ws, ctl, []string{authsec})
 	return x
 }
 

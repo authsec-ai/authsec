@@ -164,15 +164,24 @@ func (IGAGovNotification) TableName() string { return "iga_gov_notification" }
 // IGAGovSettings is a workspace's Phase 3 configuration; absent means every
 // default (findings_only, 90-day window, ...).
 type IGAGovSettings struct {
-	WorkspaceID            uuid.UUID  `json:"workspace_id" gorm:"type:uuid;primaryKey"`
-	EnforcementMode        string     `json:"enforcement_mode" gorm:"not null;default:'findings_only'"`
-	DefaultWindowDays      int        `json:"default_window_days" gorm:"not null;default:90"`
-	DefaultObservationDays int        `json:"default_observation_days" gorm:"not null;default:7"`
-	OwnerReviewDays        int        `json:"owner_review_days" gorm:"not null;default:3"`
-	ApprovalValidDays      int        `json:"approval_valid_days" gorm:"not null;default:7"`
-	CanaryHours            int        `json:"canary_hours" gorm:"not null;default:48"`
-	IaCApplyHours          int        `json:"iac_apply_hours" gorm:"column:iac_apply_hours;not null;default:24"`
-	EvidenceRetentionRevs  int        `json:"evidence_retention_revs" gorm:"not null;default:30"`
+	WorkspaceID            uuid.UUID `json:"workspace_id" gorm:"type:uuid;primaryKey"`
+	EnforcementMode        string    `json:"enforcement_mode" gorm:"not null;default:'findings_only'"`
+	DefaultWindowDays      int       `json:"default_window_days" gorm:"not null;default:90"`
+	DefaultObservationDays int       `json:"default_observation_days" gorm:"not null;default:7"`
+	OwnerReviewDays        int       `json:"owner_review_days" gorm:"not null;default:3"`
+	ApprovalValidDays      int       `json:"approval_valid_days" gorm:"not null;default:7"`
+	CanaryHours            int       `json:"canary_hours" gorm:"not null;default:48"`
+	IaCApplyHours          int       `json:"iac_apply_hours" gorm:"column:iac_apply_hours;not null;default:24"`
+	EvidenceRetentionRevs  int       `json:"evidence_retention_revs" gorm:"not null;default:30"`
+	// Notification channels (055, p3-wire). READ-ONLY to GORM and never
+	// serialised: services.GovDBChannelStore writes them (the webhook secret
+	// itself is in Vault; NotifyWebhookSecretRef is its path), and GET
+	// /settings reports them in its notifications block.
+	NotifyEmailEnabled     bool       `json:"-" gorm:"column:notify_email_enabled;->"`
+	NotifyWebhookURL       string     `json:"-" gorm:"column:notify_webhook_url;->"`
+	NotifyWebhookSecretRef string     `json:"-" gorm:"column:notify_webhook_secret_ref;->"`
+	NotifyChannelsSource   string     `json:"-" gorm:"column:notify_channels_source;->"`
+	NotifyChannelsCopiedAt *time.Time `json:"-" gorm:"column:notify_channels_copied_at;->"`
 	UpdatedBy              *uuid.UUID `json:"updated_by,omitempty" gorm:"type:uuid"`
 	UpdatedAt              time.Time  `json:"updated_at" gorm:"not null;default:now()"`
 }
@@ -192,5 +201,7 @@ func DefaultIGAGovSettings(ws uuid.UUID) IGAGovSettings {
 		CanaryHours:            48,
 		IaCApplyHours:          24,
 		EvidenceRetentionRevs:  30,
+		NotifyEmailEnabled:     true,
+		NotifyChannelsSource:   "default",
 	}
 }

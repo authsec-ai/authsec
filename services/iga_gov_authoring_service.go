@@ -814,7 +814,15 @@ func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, actor uuid.UUID, v models.IGA
 		payload[k] = x
 	}
 	k, aid := userActor(actor)
-	return a.event(tx, v.WorkspaceID, "version_"+status, k, aid, &v.PolicyID, &v.ID, payload)
+	// Literal names, so the event vocabulary's source scan sees each one.
+	name := "version_withdrawn"
+	switch status {
+	case "rejected":
+		name = "version_rejected"
+	case "superseded":
+		name = "version_superseded"
+	}
+	return a.event(tx, v.WorkspaceID, name, k, aid, &v.PolicyID, &v.ID, payload)
 }
 
 func intentFindingIDs(raw json.RawMessage) []uuid.UUID {

@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -22,19 +24,16 @@ import (
 // S9; T3.20): GET /settings and PUT /settings over iga_gov_settings (055),
 // plus the notification channels (email and webhook targets).
 //
-// DECISION (T3.20, notification channels -- DDL needed): 055's
-// iga_gov_settings has no column for notification channels, §9.3 S9 lists
-// "email and webhook targets" under Setup, and the disposition plan wants
-// the legacy addresses COPIED into "Phase 3 notification settings". No
-// migration may be added in this task, so the channels are behind
-// GovNotificationChannelStore, whose production implementation reports
-// itself unavailable until the DDL lands (reported with the exact DDL).
-// Everything else -- the API, the copy-on-first-read of the legacy row, the
-// webhook target the notifier resolves -- is built and tested against that
-// interface. While it is unavailable: owners are notified by email (and by
-// any registered channel), no workspace webhook is sent, GET /settings says
-// why, and PUT /settings with notifications is 409
-// notification_settings_unavailable.
+// Notification channels (§9.3 S9 "email and webhook targets"; the
+// disposition plan's copy of the legacy addresses into "Phase 3 notification
+// settings") are behind GovNotificationChannelStore. The production store is
+// GovDBChannelStore (p3-wire): 055's iga_gov_settings notify_* columns, with
+// the webhook signing secret in Vault (notify_webhook_secret_ref holds the
+// path, never the secret). cmd/main.go installs it once the Phase 3 schema
+// verifies. Without a store (the default before installation, and a test
+// seam): owners are notified by email (and by any registered channel), no
+// workspace webhook is sent, GET /settings says why, and PUT /settings with
+// notifications is 409 notification_settings_unavailable.
 
 // GovNotificationChannels are a workspace's notification targets.
 type GovNotificationChannels struct {
@@ -44,6 +43,13 @@ type GovNotificationChannels struct {
 	WebhookURL string `json:"webhook_url"`
 	// WebhookSecret signs the webhook (X-AuthSec-Signature); never returned.
 	WebhookSecret string `json:"-"`
+	// WebhookSecretRef is where the store keeps the secret (GovDBChannelStore:
+	// the Vault path); "" = none. Never returned.
+	WebhookSecretRef string `json:"-"`
+	// SecretUnreadable: a secret is stored but could not be read (Vault
+	// unavailable). The webhook is then never sent unsigned: its target
+	// resolution fails and the notify job retries.
+	SecretUnreadable bool `json:"-"`
 	// Source is "phase3" (set through PUT /settings) or "legacy_copy".
 	Source             string     `json:"source"`
 	CopiedFromLegacyAt *time.Time `json:"copied_from_legacy_at"`
@@ -59,9 +65,9 @@ type GovNotificationChannelStore interface {
 	SaveTx(tx *gorm.DB, ws uuid.UUID, ch GovNotificationChannels) error
 }
 
-// GovChannelsUnavailableReason is why channels cannot be stored in this
-// build (the DDL is pending).
-const GovChannelsUnavailableReason = "Notification channel settings are not stored in this build: the Phase 3 settings table has no channel columns yet. Owners are notified by email."
+// GovChannelsUnavailableReason is why channels cannot be stored when no
+// store is installed.
+const GovChannelsUnavailableReason = "Notification channel settings are not available on this server (the Phase 3 policy product is not enabled). Owners are notified by email."
 
 type unavailableChannelStore struct{}
 
@@ -80,9 +86,9 @@ var (
 	govChannelStore   GovNotificationChannelStore = unavailableChannelStore{}
 )
 
-// SetGovNotificationChannelStore installs the channel store (the DDL's
-// implementation once it lands; tests install a fake). It returns a
-// function restoring the previous store.
+// SetGovNotificationChannelStore installs the channel store (cmd/main.go:
+// GovDBChannelStore; tests may install a fake, or nil for the unavailable
+// store). It returns a function restoring the previous store.
 func SetGovNotificationChannelStore(s GovNotificationChannelStore) (restore func()) {
 	govChannelStoreMu.Lock()
 	prev := govChannelStore
@@ -126,13 +132,215 @@ func govChannels(db *gorm.DB, ws uuid.UUID) GovNotificationChannels {
 }
 
 // GovWorkspaceWebhookTarget is the notifier's webhook resolver: the
-// workspace webhook from the channel store, or nil.
+// workspace webhook from the channel store, or nil. A stored secret that
+// cannot be read is an error (the send is retried), never an unsigned send.
 func GovWorkspaceWebhookTarget(db *gorm.DB, ws uuid.UUID) (*GovWebhookTarget, error) {
 	ch := govChannels(db, ws)
 	if ch.WebhookURL == "" {
 		return nil, nil
 	}
+	if ch.SecretUnreadable {
+		return nil, errGovWebhookSecretUnreadable
+	}
 	return &GovWebhookTarget{URL: ch.WebhookURL, Secret: ch.WebhookSecret}, nil
+}
+
+// GovWorkspaceWebhookConfigured reports whether the workspace has a webhook,
+// without needing its secret (deciding to queue a notice).
+func GovWorkspaceWebhookConfigured(db *gorm.DB, ws uuid.UUID) bool {
+	return govChannels(db, ws).WebhookURL != ""
+}
+
+var errGovWebhookSecretUnreadable = errors.New("the workspace webhook's signing secret cannot be read right now")
+
+/* ------------------------------------------------------------------------- */
+/*                    The production store (055 + Vault)                      */
+/* ------------------------------------------------------------------------- */
+
+// GovDBChannelStore stores a workspace's channels in iga_gov_settings
+// (notify_* columns, 055) and the webhook signing secret in Vault through
+// the existing abstraction (internal/vault), at GovWebhookSecretPath -- under
+// the workspace's iga-gov namespace. notify_webhook_secret_ref holds that
+// path, never the secret.
+//
+// DECISIONS (p3-wire, item 6):
+//   - A changed secret is written to a NEW path (a random nonce per write)
+//     and the row is pointed at it in the caller's transaction, so a rolled
+//     back settings change never leaves the committed row naming a secret it
+//     did not commit. The superseded path is deleted after the commit
+//     (ReleaseSecret, best effort; a leftover is logged).
+//   - "A row exists" (GetTx's exists) means notify_channels_source is not
+//     'default': a settings row saved for other fields has default channels
+//     and is still copied from the legacy row on first read.
+//   - Vault unreadable on read: the channels are returned with
+//     SecretUnreadable (never an error, so GET /settings and owner
+//     notification keep working); the webhook is not sent until the secret
+//     can be read. Vault not configured: a secret cannot be stored (503
+//     notification_secret_store_unavailable); email and the URL still can.
+type GovDBChannelStore struct {
+	vault vault.VaultClient
+}
+
+// NewGovDBChannelStore builds the store; vc may be nil (no secrets).
+func NewGovDBChannelStore(vc vault.VaultClient) *GovDBChannelStore {
+	return &GovDBChannelStore{vault: vc}
+}
+
+// GovWebhookSecretPath is the Vault path of one stored webhook secret.
+func GovWebhookSecretPath(ws uuid.UUID, nonce string) string {
+	return "kv/data/secret/workspaces/" + ws.String() + "/iga-gov/notifications/webhook-secret-" + nonce
+}
+
+// Available implements GovNotificationChannelStore.
+func (s *GovDBChannelStore) Available() (bool, string) { return true, "" }
+
+type govChannelRow struct {
+	NotifyEmailEnabled     bool
+	NotifyWebhookURL       string
+	NotifyWebhookSecretRef string
+	NotifyChannelsSource   string
+	NotifyChannelsCopiedAt *time.Time
+}
+
+func (s *GovDBChannelStore) row(tx *gorm.DB, ws uuid.UUID) (*govChannelRow, error) {
+	var rows []govChannelRow
+	if err := tx.Raw(`SELECT notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref, notify_channels_source,
+	                         notify_channels_copied_at
+	                    FROM iga_gov_settings WHERE workspace_id = ?`, ws).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
+}
+
+func (s *GovDBChannelStore) readSecret(ref string) (string, error) {
+	if s.vault == nil {
+		return "", errors.New("vault is not configured")
+	}
+	sec, err := s.vault.ReadSecret(ref)
+	if err != nil {
+		return "", err
+	}
+	v, _ := sec["secret"].(string)
+	if v == "" {
+		return "", errors.New("the stored webhook secret is empty")
+	}
+	return v, nil
+}
+
+// GetTx implements GovNotificationChannelStore.
+func (s *GovDBChannelStore) GetTx(tx *gorm.DB, ws uuid.UUID) (*GovNotificationChannels, bool, error) {
+	r, err := s.row(tx, ws)
+	if err != nil || r == nil || r.NotifyChannelsSource == "default" {
+		return nil, false, err
+	}
+	ch := &GovNotificationChannels{EmailEnabled: r.NotifyEmailEnabled, WebhookURL: r.NotifyWebhookURL,
+		WebhookSecretRef: r.NotifyWebhookSecretRef, Source: r.NotifyChannelsSource, CopiedFromLegacyAt: r.NotifyChannelsCopiedAt}
+	if ch.WebhookSecretRef != "" {
+		sec, err := s.readSecret(ch.WebhookSecretRef)
+		if err != nil {
+			log.Printf("[policy] workspace %s: the webhook signing secret cannot be read: %v", ws, err)
+			ch.SecretUnreadable = true
+		} else {
+			ch.WebhookSecret = sec
+		}
+	}
+	return ch, true, nil
+}
+
+// SaveTx implements GovNotificationChannelStore.
+func (s *GovDBChannelStore) SaveTx(tx *gorm.DB, ws uuid.UUID, ch GovNotificationChannels) error {
+	cur, err := s.row(tx, ws)
+	if err != nil {
+		return err
+	}
+	curRef := ""
+	if cur != nil {
+		curRef = cur.NotifyWebhookSecretRef
+	}
+	ref := ""
+	switch {
+	case ch.WebhookURL == "":
+		// No webhook, no secret.
+	case ch.WebhookSecret == "" && ch.SecretUnreadable:
+		ref = ch.WebhookSecretRef // unchanged, merely unreadable now
+	case ch.WebhookSecret == "":
+		// A webhook without a secret is sent unsigned (the legacy rule).
+	default:
+		if curRef != "" && ch.WebhookSecretRef == curRef {
+			if old, err := s.readSecret(curRef); err == nil && old == ch.WebhookSecret {
+				ref = curRef
+			}
+		}
+		if ref == "" {
+			if s.vault == nil {
+				return govErr(http.StatusServiceUnavailable, "notification_secret_store_unavailable",
+					"The secrets store is not configured; a webhook signing secret cannot be stored.", nil)
+			}
+			nonce := strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+			p := GovWebhookSecretPath(ws, nonce)
+			if err := s.vault.WriteSecret(p, map[string]interface{}{"secret": ch.WebhookSecret}); err != nil {
+				log.Printf("[policy] workspace %s: storing the webhook signing secret failed: %v", ws, err)
+				return govErr(http.StatusServiceUnavailable, "notification_secret_store_unavailable",
+					"The webhook signing secret could not be stored; try again shortly.", nil)
+			}
+			ref = p
+		}
+	}
+	src := ch.Source
+	if src != "legacy_copy" {
+		src = "phase3"
+	}
+	return tx.Exec(`INSERT INTO iga_gov_settings (workspace_id, notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref,
+	                      notify_channels_source, notify_channels_copied_at)
+	                VALUES (?, ?, ?, ?, ?, ?)
+	                ON CONFLICT (workspace_id) DO UPDATE SET notify_email_enabled = EXCLUDED.notify_email_enabled,
+	                      notify_webhook_url = EXCLUDED.notify_webhook_url, notify_webhook_secret_ref = EXCLUDED.notify_webhook_secret_ref,
+	                      notify_channels_source = EXCLUDED.notify_channels_source,
+	                      notify_channels_copied_at = EXCLUDED.notify_channels_copied_at`,
+		ws, ch.EmailEnabled, ch.WebhookURL, ref, src, ch.CopiedFromLegacyAt).Error
+}
+
+// SecretRefTx is the workspace's stored secret path ("" = none).
+func (s *GovDBChannelStore) SecretRefTx(db *gorm.DB, ws uuid.UUID) (string, error) {
+	r, err := s.row(db, ws)
+	if err != nil || r == nil {
+		return "", err
+	}
+	return r.NotifyWebhookSecretRef, nil
+}
+
+// ReleaseSecret deletes a superseded secret from Vault.
+func (s *GovDBChannelStore) ReleaseSecret(ref string) error {
+	if s.vault == nil || ref == "" {
+		return nil
+	}
+	return s.vault.DeleteSecret(ref)
+}
+
+// govChannelSecretReleaser is the optional post-commit cleanup a store may
+// offer: after a settings change commits, a secret path the row no longer
+// names is released.
+type govChannelSecretReleaser interface {
+	SecretRefTx(db *gorm.DB, ws uuid.UUID) (string, error)
+	ReleaseSecret(ref string) error
+}
+
+// releaseSuperseded releases prev when the committed row no longer names it.
+func releaseSuperseded(db *gorm.DB, st GovNotificationChannelStore, ws uuid.UUID, prev string) {
+	r, ok := st.(govChannelSecretReleaser)
+	if !ok || prev == "" {
+		return
+	}
+	cur, err := r.SecretRefTx(db, ws)
+	if err != nil || cur == prev {
+		return
+	}
+	if err := r.ReleaseSecret(prev); err != nil {
+		log.Printf("[policy] workspace %s: releasing a superseded webhook secret failed (left in Vault): %v", ws, err)
+	}
 }
 
 // GovNotificationSettingsView is the notifications block of GET /settings.
@@ -201,7 +409,10 @@ func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, 
 	ok, reason := st.Available()
 	n := GovNotificationSettingsView{Available: ok, Reason: reason}
 	ch := govChannels(db, ws)
-	n.EmailEnabled, n.WebhookURL, n.WebhookSecretSet = ch.EmailEnabled, ch.WebhookURL, ch.WebhookSecret != ""
+	n.EmailEnabled, n.WebhookURL, n.WebhookSecretSet = ch.EmailEnabled, ch.WebhookURL, ch.WebhookSecret != "" || ch.SecretUnreadable
+	if ch.SecretUnreadable {
+		n.Reason = "The webhook signing secret cannot be read right now; webhook notices wait until it can."
+	}
 	n.Source, n.CopiedFromLegacyAt = ch.Source, ch.CopiedFromLegacyAt
 	if _, has := govNoticeChannel(GovChannelSlack); has {
 		n.Slack = GovChannelAvailability{Available: true}
@@ -232,14 +443,31 @@ func (s *GovSettingsService) copyLegacyChannels(db *gorm.DB, ws uuid.UUID) error
 			return err
 		}
 		now := time.Now().UTC()
-		ch := GovNotificationChannels{EmailEnabled: legacy.EmailEnabled, WebhookURL: legacy.WebhookURL,
+		ch := GovNotificationChannels{EmailEnabled: legacy.EmailEnabled, WebhookURL: strings.TrimSpace(legacy.WebhookURL),
 			WebhookSecret: legacy.WebhookSecret, Source: "legacy_copy", CopiedFromLegacyAt: &now}
+		// DECISION (p3-wire): Phase 3 webhooks are https only (055 CHECK);
+		// a legacy http:// address is not copied, and the event says so.
+		skipped := ""
+		if ch.WebhookURL != "" && !strings.HasPrefix(ch.WebhookURL, "https://") {
+			ch.WebhookURL, ch.WebhookSecret, skipped = "", "", "not https"
+		}
 		if err := st.SaveTx(tx, ws, ch); err != nil {
+			var ge *GovError
+			if errors.As(err, &ge) {
+				// The secret cannot be stored right now (Vault): nothing was
+				// written; the copy is retried on the next read, and the
+				// settings read itself still answers.
+				log.Printf("[policy] workspace %s: legacy notification channels not copied yet: %s", ws, ge.Message)
+				return nil
+			}
 			return err
 		}
-		return appendGovEvent(tx, ws, GovEventSettingsChannelsCopied, models.GovActorSystem, "settings", govEventRefs{},
-			map[string]any{"from": "governance_notification_settings", "email_enabled": legacy.EmailEnabled,
-				"webhook_configured": legacy.WebhookURL != "", "webhook_signed": legacy.WebhookSecret != ""})
+		payload := map[string]any{"from": "governance_notification_settings", "email_enabled": legacy.EmailEnabled,
+			"webhook_configured": ch.WebhookURL != "", "webhook_signed": ch.WebhookSecret != ""}
+		if skipped != "" {
+			payload["webhook_not_copied"] = skipped
+		}
+		return appendGovEvent(tx, ws, GovEventSettingsChannelsCopied, models.GovActorSystem, "settings", govEventRefs{}, payload)
 	})
 }
 
@@ -294,6 +522,7 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 		return nil, nil, err
 	}
 	st := currentGovChannelStore()
+	prevSecretRef := ""
 	if p.Notifications != nil {
 		if ok, reason := st.Available(); !ok {
 			return nil, nil, govErr(http.StatusConflict, "notification_settings_unavailable", reason, nil)
@@ -364,6 +593,7 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 			if exists && got != nil {
 				chBefore = *got
 			}
+			prevSecretRef = chBefore.WebhookSecretRef
 			chAfter = chBefore
 			if v := p.Notifications.EmailEnabled; v != nil && *v != chAfter.EmailEnabled {
 				chAfter.EmailEnabled = *v
@@ -373,11 +603,14 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 				chAfter.WebhookURL = strings.TrimSpace(*v)
 				changed = append(changed, "notifications.webhook_url")
 				if chAfter.WebhookURL == "" {
-					chAfter.WebhookSecret = ""
+					chAfter.WebhookSecret, chAfter.WebhookSecretRef, chAfter.SecretUnreadable = "", "", false
 				}
 			}
-			if v := p.Notifications.WebhookSecret; v != nil && *v != chAfter.WebhookSecret {
-				chAfter.WebhookSecret = *v
+			if v := p.Notifications.WebhookSecret; v != nil && (*v != chAfter.WebhookSecret || chAfter.SecretUnreadable) {
+				chAfter.WebhookSecret, chAfter.SecretUnreadable = *v, false
+				if *v == "" {
+					chAfter.WebhookSecretRef = ""
+				}
 				changed = append(changed, "notifications.webhook_secret")
 			}
 			if chAfter != chBefore {
@@ -413,6 +646,7 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 	if err != nil {
 		return nil, nil, err
 	}
+	releaseSuperseded(db, st, ws, prevSecretRef)
 	return before, after, nil
 }
 

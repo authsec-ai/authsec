@@ -439,6 +439,43 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 		ws, rev, fmt.Sprintf("rev:%d", rev)).Error; err != nil {
 		return fmt.Errorf("enqueue evaluate_owner_rules: %w", err)
 	}
+	// The publication hook (p3-wire, item 4; §2.8 "Revalidation, not silent
+	// recompilation", §8.3, A59): every version still in review is
+	// recompiled against this revision (compile_plans: new current plans; an
+	// impact change reopens its owner review) and every approved version's
+	// approved plans are revalidated (an unchanged rescan records an
+	// `unchanged` revalidation and touches nothing else).
+	//
+	// DECISION W4: enqueued HERE, in the evaluation's own transaction right
+	// after it is marked complete -- not after the commit -- so a completed
+	// evaluation and its compile jobs are one fact: a crash between the two
+	// can neither leave a complete evaluation whose versions were never
+	// rechecked nor queue a recompile against a revision whose findings were
+	// rolled back. The job runs later, outside the barrier, on the worker
+	// (live reads are never made under the pipeline barrier). One open job
+	// per version (dedupe version:<id>): a version already queued keeps its
+	// job, which will read the newest evidence when it runs. "AWS
+	// publication": every Phase 3 control is an AWS role and any revision can
+	// change a role's evidence (a new consumer arrives through another
+	// connector's scan), so every completed evaluation triggers it; a version
+	// with no target has nothing to compile and is skipped.
+	var versions []uuid.UUID
+	if err := tx.Raw(`SELECT v.id FROM iga_gov_policy_version v
+	                   WHERE v.workspace_id = ? AND v.status IN ('in_review','approved')
+	                     AND EXISTS (SELECT 1 FROM iga_gov_target t WHERE t.workspace_id = v.workspace_id AND t.version_id = v.id)
+	                   ORDER BY v.id`, ws).Scan(&versions).Error; err != nil {
+		return fmt.Errorf("open versions: %w", err)
+	}
+	for _, vid := range versions {
+		r := rev
+		created, err := EnqueueCompilePlansTx(tx, ws, vid, &r)
+		if err != nil {
+			return fmt.Errorf("enqueue compile_plans %s: %w", vid, err)
+		}
+		if created {
+			counts["compile_plans"]++
+		}
+	}
 	counts["results"] = len(results)
 	counts["evidence"] = len(evidence)
 	return e.appendEvent(tx, ws, "evaluation_completed", map[string]any{"rev": rev, "counts": counts,

@@ -38,11 +38,12 @@ const (
 	GovCatOwnerReview       = "owner_review"
 	GovCatNotification      = "notification"
 	GovCatSettings          = "settings"
+	// Recorded by T3.11 / T3.13 (listed at integration, p3-wire).
+	GovCatProposal     = "proposal"
+	GovCatApproval     = "approval"
+	GovCatAcceptance   = "acceptance"
+	GovCatRevalidation = "revalidation"
 	// Not recorded yet in this build (their tasks have not landed).
-	GovCatProposal       = "proposal"
-	GovCatApproval       = "approval"
-	GovCatAcceptance     = "acceptance"
-	GovCatRevalidation   = "revalidation"
 	GovCatRollout        = "rollout"
 	GovCatVerification   = "verification"
 	GovCatDrift          = "drift"
@@ -118,6 +119,27 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventNotificationSent, GovCatNotification, GovObjNotification, "A notification was delivered."},
 	{GovEventNotificationFailed, GovCatNotification, GovObjNotification, "A notification attempt failed; it will be retried."},
 	{GovEventNotificationDead, GovCatNotification, GovObjNotification, "A notification failed for good (5 attempts, or a permanent error)."},
+	// T3.11 authoring and compiling (iga_gov_authoring_service.go,
+	// iga_gov_compile_service.go) and T3.13 approval
+	// (iga_gov_approval_service.go); names as their writers chose them
+	// (p3-wire: listed at integration).
+	{"proposal_created", GovCatProposal, GovObjPolicy, "A proposal opened a policy and its first version (from findings, a template or Discovery context)."},
+	{"policy_created", GovCatProposal, GovObjPolicy, "A Phase 3 policy was created."},
+	{"policy_updated", GovCatProposal, GovObjPolicy, "A policy's name, purpose or owner changed."},
+	{"policy_paused", GovCatProposal, GovObjPolicy, "A policy was paused (with a reason)."},
+	{"policy_resumed", GovCatProposal, GovObjPolicy, "A paused policy was resumed (with a reason)."},
+	{"policy_archived", GovCatProposal, GovObjPolicy, "A policy was archived; its open versions were withdrawn."},
+	{"version_created", GovCatProposal, GovObjVersion, "A new policy version was created."},
+	{"version_proposed", GovCatProposal, GovObjVersion, "A version's plans were compiled and it went to review."},
+	{"plans_recompiled", GovCatProposal, GovObjVersion, "An in-review version was recompiled against newer evidence."},
+	{"impact_changed", GovCatProposal, GovObjVersion, "Who or what a target's change affects changed after the version was proposed."},
+	{"version_withdrawn", GovCatProposal, GovObjVersion, "A version was withdrawn (by its author, a newer draft, or the policy's archive)."},
+	{"version_approved", GovCatApproval, GovObjVersion, "A version was approved."},
+	{"version_rejected", GovCatApproval, GovObjVersion, "A version was rejected (with a reason)."},
+	{"version_superseded", GovCatApproval, GovObjVersion, "An approved version was superseded by the approval of a newer one."},
+	{"acceptance_recorded", GovCatAcceptance, GovObjVersion, "An approver accepted an unanalysed form or evidence gap, item by item."},
+	{"plan_revalidated", GovCatRevalidation, GovObjVersion, "An approved plan was revalidated against newer evidence (unchanged, material change or blocked)."},
+	{"approval_revoked", GovCatRevalidation, GovObjVersion, "A version's approval was revoked by a material change."},
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
 	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},

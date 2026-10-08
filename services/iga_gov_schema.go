@@ -58,11 +58,24 @@ var policyRelations = []string{
 	"idx_cloud_rpo_scan_form",
 }
 
-// policyColumns are columns 047-056 ADD to existing tables. There are none:
-// §6.1 forbids altering an existing table, and 055's only change to one is
-// its permission rows (data, not schema). The check is kept so the first
-// Phase 3 migration that does add a column lists it here.
-var policyColumns = []string{}
+// policyColumns are columns a relation check cannot prove. 047-056 add no
+// column to an existing table (§6.1; 055's only change to one is its
+// permission rows, data, not schema), but 055's iga_gov_settings gained the
+// notification channel columns after its first draft (p3-wire): a database
+// built from that draft has the table without them, so they are checked by
+// name: IGA_POLICY stays unavailable on such a database (rebuild it; 055
+// is CREATE TABLE IF NOT EXISTS and never alters an existing table).
+var policyColumns = []string{
+	"iga_gov_settings.notify_email_enabled",
+	"iga_gov_settings.notify_webhook_url",
+	"iga_gov_settings.notify_webhook_secret_ref",
+	"iga_gov_settings.notify_channels_source",
+	"iga_gov_settings.notify_channels_copied_at",
+}
+
+// PolicySchemaColumns returns the "table.column" names VerifyPolicySchema
+// checks by name.
+func PolicySchemaColumns() []string { return append([]string(nil), policyColumns...) }
 
 // PolicySchemaRelations returns the relations VerifyPolicySchema requires.
 func PolicySchemaRelations() []string { return append([]string(nil), policyRelations...) }

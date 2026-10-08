@@ -663,6 +663,23 @@ type grantRef struct {
 	StatementHash string `json:"statement_hash"`
 }
 
+// BroadGrantDetailKey is a broad_grant finding's detail_key: the graph
+// statement key, escaped so it can never contain U+001F (the fingerprint's
+// field separator, which Fingerprint refuses). DECISION (p3-wire, item 5):
+// the AWS graph's statement keys join their parts with U+001F, so the raw
+// key made Fingerprint fail and with it the WHOLE evaluation of a workspace
+// holding any broad grant. The escape is percent-style -- "%" -> "%25" first,
+// then U+001F -> "%1F" -- which is injective (two keys never share a
+// detail_key), deterministic (the same statement keeps the same fingerprint
+// across revisions) and leaves every key without either character
+// unchanged. The raw key stays in the finding's detail (statement_key).
+func BroadGrantDetailKey(statementKey string) string {
+	if !strings.ContainsAny(statementKey, "%"+unitSep) {
+		return statementKey
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(statementKey, "%", "%25"), unitSep, "%1F")
+}
+
 func (ix *evalIndex) newFinding(kind, severity, confidence string, r RoleSnapshot, detailKey, runID string, detail any) (Finding, error) {
 	fp, err := Fingerprint(kind, r.RoleID, detailKey)
 	if err != nil {
@@ -881,7 +898,7 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 			"reasons": sortedUnique(reasons), "service_wildcards": sortedUnique(svcWild), "escalations": esc,
 			"has_condition": len(st.Conditions) > 0,
 		}
-		f, err := ix.newFinding(KindBroadGrant, severity, ConfidenceNotApplicable, r, key, runID, detail)
+		f, err := ix.newFinding(KindBroadGrant, severity, ConfidenceNotApplicable, r, BroadGrantDetailKey(key), runID, detail)
 		if err != nil {
 			return err
 		}
