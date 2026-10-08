@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,6 +196,14 @@ func TestP3T316SharedLockOrderA50(t *testing.T) {
 	}
 
 	t.Run("evaluation first", func(t *testing.T) {
+		var retries int32
+		d.dep.ObserverHook = func(stage string, _ uuid.UUID, _ *gorm.DB) error {
+			if strings.HasPrefix(stage, "retry:") {
+				atomic.AddInt32(&retries, 1)
+			}
+			return nil
+		}
+		defer func() { d.dep.ObserverHook = nil }()
 		hold, locked := make(chan struct{}), make(chan struct{})
 		evalErr := make(chan error, 1)
 		go func() { evalErr <- evaluation(hold, locked) }()
@@ -215,6 +224,9 @@ func TestP3T316SharedLockOrderA50(t *testing.T) {
 		}
 		if d.state(dep) != "drifted" || d.posture(x)["sqs"] != "not_applied/not_removed" {
 			t.Fatalf("after both: %s %v", d.state(dep), d.posture(x))
+		}
+		if n := atomic.LoadInt32(&retries); n != 0 {
+			t.Fatalf("the observer hit %d deadlock / serialization failures: the shared lock order was not kept", n)
 		}
 	})
 

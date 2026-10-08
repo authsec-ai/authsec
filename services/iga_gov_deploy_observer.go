@@ -133,6 +133,7 @@ func (s *GovDeployments) observe(ctx context.Context, run *PolicyJobRun, build f
 			continue // a fresh readback, never the stale one
 		}
 		if st := sqlState(err); st == "40P01" || st == "40001" {
+			_ = s.hook("retry:"+st, uuid.Nil, nil) // test seam: count retries
 			failures++
 			if failures >= govDeployObserverMaxAttempts {
 				return nil, fmt.Errorf("enforcement observer: after %d attempts: %w", failures, err)
