@@ -90,20 +90,16 @@ func (l *p3aLab) publishCollected(w *p3covWorld) models.CloudScanRun {
 	return run
 }
 
-// p3covPosture inserts a control and an sqs posture row for the role (the
-// deploy observer's row; the evaluation only refreshes its route facts).
-func p3covPosture(l *p3aLab, roleID, arn string, ident uuid.UUID) {
+// p3covPosture inserts an sqs posture row on the role's planned control
+// (the proposal's; the deploy observer's row in production -- the
+// evaluation only refreshes its route facts).
+func p3covPosture(l *p3aLab, roleID string) {
 	l.t.Helper()
-	policy, control := uuid.New(), uuid.New()
-	p3exec(l.t, l.db, `INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by) VALUES (?, ?, 'p3cov-posture', 'cloud_access', 'aws', ?)`,
-		policy, l.ws, l.author.user)
-	p3exec(l.t, l.db, `INSERT INTO iga_gov_control (id, workspace_id, connector_id, account_id, role_id, role_arn, identity_account_id, policy_id,
-	                                                boundary_policy_arn, state)
-	                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned')`,
-		control, l.ws, l.a.conn, accountA, roleID, arn, ident, policy, "arn:aws:iam::"+accountA+":policy/authsec/AuthSecBoundary-"+roleID)
+	control := bdbID(l.t, l.p2Lab, `SELECT id FROM iga_gov_control WHERE workspace_id = ? AND role_id = ?`, l.ws, roleID)
 	p3exec(l.t, l.db, `INSERT INTO iga_gov_service_posture (workspace_id, account_id, role_id, service, control_id, exclusion, enforcement_seq,
 	                                                        enforcement_observed_at, route_state, routes, evidence_rev)
-	                   VALUES (?, ?, ?, 'sqs', ?, 'pending', 0, now(), 'not_analysed', '[]', 0)`, l.ws, accountA, roleID, control)
+	                   VALUES (?, ?, ?, 'sqs', ?, 'pending', 0, now(), 'not_analysed', '[{"service":"sqs","effect":"not_analysed"}]', ?)`,
+		l.ws, accountA, roleID, control, l.latestRev())
 }
 
 type p3covFacts struct {
@@ -159,13 +155,11 @@ func (l *p3aLab) p3covFacts(roleID string, ident uuid.UUID) p3covFacts {
 // The connector selects us-east-1 of the enabled us-east-1 + eu-west-1.
 func TestP3CovUnselectedRegionsAreNotAnalysed(t *testing.T) {
 	l := newP3aLab(t, "p3-cov-unselected")
-	arn := l.role("CovRole", "AROACOVROLE0001", map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	const rid = "AROACOVROLE0001"
+	l.role("CovRole", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
 	world := newP3covWorld(accountA, "eu-west-1", "us-east-1")
-	l.publishCollected(world) // the role exists in the graph from here
-	ident := bdbIdentity(t, l.p2Lab, "CovRole")
-	p3covPosture(l, "AROACOVROLE0001", arn, ident)
-
 	run := l.publishCollected(world)
+	ident := bdbIdentity(t, l.p2Lab, "CovRole")
 
 	// The run froze the scope it collected under.
 	cov := models.DecodeScanCoverage(run.Coverage)
@@ -181,9 +175,22 @@ func TestP3CovUnselectedRegionsAreNotAnalysed(t *testing.T) {
 		t.Fatalf("sqs_queue/eu-west-1 = %q, want the collector's not_collected row", unsel)
 	}
 
-	f := l.p3covFacts("AROACOVROLE0001", ident)
+	// The first attachment is refused, naming the region (§3.4: a collected
+	// form not complete in every enabled region makes the plan ineligible).
+	policy, _ := l.proposeTemplate(rid)
+	code, body := l.call(l.author, http.MethodPost, fmt.Sprintf("/policies/%s/versions/1/propose", policy), nil)
+	if code != http.StatusUnprocessableEntity || p3eErr(body) != "target_ineligible" ||
+		!strings.Contains(fmt.Sprint(body), "resource_policy_evidence_incomplete detail:sqs_queue in eu-west-1 not_collected") {
+		t.Fatalf("propose: %d %v, want 422 target_ineligible: sqs_queue in eu-west-1 not_collected", code, body)
+	}
+
+	// The posture row of the role's control; the next evaluation refreshes
+	// its route facts from the next scan.
+	p3covPosture(l, rid)
+	l.publishCollected(world)
+	f := l.p3covFacts(rid, ident)
 	// Posture route facts (evaluation): not_analysed, naming the region.
-	if f.posture != igagov.RouteStateNotAnalysed || !strings.Contains(f.postureRoute, `"region":"eu-west-1"`) {
+	if f.posture != igagov.RouteStateNotAnalysed || !strings.Contains(f.postureRoute, `"region": "eu-west-1"`) || !strings.Contains(f.postureRoute, `"sqs_queue"`) {
 		t.Fatalf("posture route facts %s %s, want not_analysed naming sqs_queue in eu-west-1", f.posture, f.postureRoute)
 	}
 	// Activity evidence (finding evaluation): confirmation required.
@@ -200,22 +207,14 @@ func TestP3CovUnselectedRegionsAreNotAnalysed(t *testing.T) {
 	if !p3eHas(f.readiness, "resource_policy_coverage_partial") {
 		t.Fatalf("readiness reasons %v, want resource_policy_coverage_partial", f.readiness)
 	}
-	// The first attachment is refused, naming the region.
-	policy, _ := l.proposeTemplate("AROACOVROLE0001")
-	plans := l.compile(policy, 1)
-	ap := plans["plans"].([]any)[0].(map[string]any)
-	if ap["kind"] != "apply" || ap["first_attachment"] != true || ap["eligibility"] == "eligible" ||
-		!strings.Contains(fmt.Sprint(ap), "sqs_queue in eu-west-1") {
-		t.Fatalf("apply plan %v, want a first attachment refused for sqs_queue in eu-west-1", ap)
-	}
 
 	// The connector's LIVE selection changing does not rewrite what the
 	// published run covered: the bundle still reads the frozen scope.
-	p3exec(t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{regions}', '["us-east-1","eu-west-1"]') WHERE id = ?`, l.a.conn)
-	p3exec(t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{regions}', '["us-east-1"]') WHERE id = ?`, l.a.conn)
-	if b := l.p3covFacts("AROACOVROLE0001", ident).bundle; b.Trust != igagov.TrustPartial {
+	p3exec(t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{regions}', '["eu-west-1","us-east-1"]') WHERE id = ?`, l.a.conn)
+	if b := l.p3covFacts(rid, ident).bundle; b.Trust != igagov.TrustPartial {
 		t.Fatalf("bundle after a live attrs change: %s", b.Trust)
 	}
+	p3exec(t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{regions}', '["us-east-1"]') WHERE id = ?`, l.a.conn)
 
 	// A later scan selecting every enabled region completes coverage.
 	l.a.svc.WithRegionsAPI(world.enabled)
@@ -226,7 +225,7 @@ func TestP3CovUnselectedRegionsAreNotAnalysed(t *testing.T) {
 	if c := models.DecodeScanCoverage(run2.Coverage); c.Regions == nil || strings.Join(c.Regions.Selected, ",") != "eu-west-1,us-east-1" {
 		t.Fatalf("second run scope %+v", c.Regions)
 	}
-	f = l.p3covFacts("AROACOVROLE0001", ident)
+	f = l.p3covFacts(rid, ident)
 	if f.posture != igagov.RouteStateNoneObserved || f.routeUsage != igagov.RouteUsageNoneObserved {
 		t.Fatalf("after selecting every region: posture %s %s, route_usage %s, want none_observed", f.posture, f.postureRoute, f.routeUsage)
 	}
@@ -238,8 +237,8 @@ func TestP3CovUnselectedRegionsAreNotAnalysed(t *testing.T) {
 			t.Fatalf("readiness still %v", f.readiness)
 		}
 	}
-	policy2, _ := l.proposeTemplate("AROACOVROLE0001")
-	ap = l.compile(policy2, 1)["plans"].([]any)[0].(map[string]any)
+	// The same version recompiled against the complete scan is eligible.
+	ap := l.compile(policy, 1)["plans"].([]any)[0].(map[string]any)
 	if ap["first_attachment"] != true || ap["eligibility"] != "eligible" {
 		t.Fatalf("apply plan after complete coverage %v, want eligible", ap)
 	}
