@@ -175,7 +175,8 @@ type GovImpactChange struct {
 
 // GovAuthoringHooks are the seams later tasks fill. Every hook runs inside
 // the caller's transaction (tx) and its error rolls the mutation back. A nil
-// hook is a no-op (OwnerGate nil: no owner gate, which is this build).
+// hook is a no-op, EXCEPT OwnerGate: without it Approve refuses (503
+// owner_gate_unavailable, fix/p3-appr P1-4) -- the gate fails closed.
 type GovAuthoringHooks struct {
 	// OnProposed (T3.12): create or reopen the owner review and queue the
 	// owner notices for a version just proposed.
@@ -208,6 +209,24 @@ func SetGovAuthoringHooks(h GovAuthoringHooks) GovAuthoringHooks {
 	govHooks = h
 	return prev
 }
+
+// UpdateGovAuthoringHooks composes the process-wide hooks atomically: f
+// receives the installed hooks and returns the ones to install, under the
+// same lock, so a reader never sees a half-installed (empty) set. It
+// returns what was installed before (tests restore it). fix/p3-appr
+// (P1-4): InstallSlackApp chains its notices this way instead of a
+// Set(empty) + Set(chained) pair.
+func UpdateGovAuthoringHooks(f func(GovAuthoringHooks) GovAuthoringHooks) GovAuthoringHooks {
+	govHooksMu.Lock()
+	defer govHooksMu.Unlock()
+	prev := govHooks
+	govHooks = f(prev)
+	return prev
+}
+
+// CurrentGovAuthoringHooks is the installed process-wide hooks (read-only
+// copy; startup checks and tests).
+func CurrentGovAuthoringHooks() GovAuthoringHooks { return currentGovHooks() }
 
 func currentGovHooks() GovAuthoringHooks {
 	govHooksMu.RLock()

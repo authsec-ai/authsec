@@ -354,8 +354,9 @@ func WithSlackApprovalNotices(h GovAuthoringHooks) GovAuthoringHooks {
 // undoing both (tests).
 func InstallSlackApp(svc *SlackIntegrationService) (restore func()) {
 	RegisterGovNotificationChannel(GovChannelSlack, NewSlackNotificationChannel(svc))
-	prev := SetGovAuthoringHooks(GovAuthoringHooks{})
-	SetGovAuthoringHooks(WithSlackApprovalNotices(prev))
+	// fix/p3-appr (P1-4): compose under the hooks' lock -- never a moment
+	// with empty hooks (no owner gate) installed.
+	prev := UpdateGovAuthoringHooks(WithSlackApprovalNotices)
 	return func() {
 		SetGovAuthoringHooks(prev)
 		RegisterGovNotificationChannel(GovChannelSlack, nil)

@@ -209,24 +209,25 @@ func main() {
 					policyVault = vc
 				}
 			}
-			services.InstallGovPolicyRuntime(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
 			// The AuthSec Slack app (Phase 3 §7.11, T3.14): installed when the
 			// signing secret, Vault and the app credentials are configured.
-			// InstallSlackApp chains its approval-request notices onto the
-			// authoring hooks that exist when it runs, so it must come AFTER
-			// InstallGovPolicyRuntime (which sets those hooks) and before the
+			// InstallGovPolicyStartup installs the policy runtime (owner gate
+			// and the other authoring hooks) and THEN chains the Slack app's
+			// approval-request notices onto those hooks atomically, before the
 			// worker can deliver anything; /capabilities reports policy.slack
-			// from the same registration. Its routes are behind the
-			// IGA_POLICY gate, so nothing is served before this point.
-			if slackApp := services.SlackFromEnv(config.DB); slackApp != nil {
-				if ok, reason := slackApp.Configured(); ok {
-					services.SetDefaultSlackService(slackApp)
-					services.InstallSlackApp(slackApp)
-					log.Printf("[slack] Slack app configured: notification channel and interactions enabled")
+			// from the same registration. fix/p3-appr (P1-4): the policy gate
+			// reports verified -- and serves any policy or Slack route -- only
+			// after this whole ready hook has returned, so nothing is served
+			// before the hooks are in place.
+			var slackApp *services.SlackIntegrationService
+			if app := services.SlackFromEnv(config.DB); app != nil {
+				if ok, reason := app.Configured(); ok {
+					slackApp = app
 				} else {
 					log.Printf("[slack] Slack app not enabled: %s", reason)
 				}
 			}
+			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
 			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
 				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
 				return
