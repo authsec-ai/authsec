@@ -41,12 +41,9 @@ func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 // Middleware returns a Gin middleware that rate-limits by client IP.
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// ClientIP honours X-Forwarded-For only from TRUSTED_PROXIES (AS-034);
+		// reading the header directly let any caller pick a fresh bucket.
 		ip := c.ClientIP()
-		// Use X-Forwarded-For if behind a proxy (Gin's ClientIP already handles this,
-		// but we also check explicitly for consistency)
-		if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-			ip = xff
-		}
 
 		if !rl.getLimiter(ip).Allow() {
 			c.Header("Retry-After", "60")
