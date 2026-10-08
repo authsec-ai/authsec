@@ -1,0 +1,28 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "IAMUser",
+    "principalId": "AIDAWJ4EXAMPLEDEPLOY1",
+    "arn": "arn:aws:iam::429418377036:user/ci-deployer",
+    "accountId": "429418377036",
+    "accessKeyId": "AKIAWJ4EXAMPLEKEY003",
+    "userName": "ci-deployer"
+  },
+  "eventTime": "2026-10-06T11:20:10Z",
+  "eventSource": "iam.amazonaws.com",
+  "eventName": "CreateUser",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "198.51.100.40",
+  "userAgent": "aws-sdk-go-v2/1.30.0",
+  "errorCode": "AccessDenied",
+  "errorMessage": "User: arn:aws:iam::429418377036:user/ci-deployer is not authorized to perform: iam:CreateUser on resource: arn:aws:iam::429418377036:user/backdoor with an explicit deny in a service control policy",
+  "requestParameters": null,
+  "responseElements": null,
+  "requestID": "8a3e4f69-9e50-4e77-ab8c-6d0a4b2f5a43",
+  "eventID": "2caf3e69-9e50-4e77-ab8c-6d0a4b2f5a43",
+  "readOnly": false,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management"
+}

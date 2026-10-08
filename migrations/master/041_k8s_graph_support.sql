@@ -38,10 +38,17 @@
 -- 1. §2.9 prerequisite -------------------------------------------------------
 -- No single-column foreign key to a workspace-scoped table. discovery_sources
 -- is about to be referenced, so it needs the workspace-qualified unique first.
+-- T3.00 (bootstrap parity): skipped when the key already exists exactly as
+-- below -- 001 creates it, and dropping it then fails on the foreign keys
+-- that reference it. Anywhere else the statements run unchanged.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.discovery_sources'::regclass AND conname = 'discovery_sources_workspace_id_key'
+      AND pg_get_constraintdef(oid) = 'UNIQUE (workspace_id, id)') THEN
 ALTER TABLE public.discovery_sources
     DROP CONSTRAINT IF EXISTS discovery_sources_workspace_id_key;
 ALTER TABLE public.discovery_sources
     ADD CONSTRAINT discovery_sources_workspace_id_key UNIQUE (workspace_id, id);
+END IF; END $$;
 
 -- 2. The sweep record --------------------------------------------------------
 -- The Kubernetes counterpart of cloud_scan_run. Deliberately NOT a reuse of

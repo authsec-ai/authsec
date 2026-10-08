@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -72,6 +73,12 @@ type AWSScanWorker struct {
 	jobs     repositories.IGAProjectionJobRepository
 	pipeline repositories.IGAPipelineLeaseRepository
 
+	// policy is IGA_POLICY (§4.3). Resource-policy collection (§3.9, T3.03b)
+	// runs inside the scan, under the barrier, only when it is available:
+	// nothing Phase 3 runs half-on, and with it off the scan is exactly the
+	// Phase 2 scan.
+	policy *PolicyGate
+
 	scannerHook ScannerHook
 }
 
@@ -108,6 +115,17 @@ func (w *AWSScanWorker) WithPoll(d time.Duration) *AWSScanWorker { w.poll = d; r
 func (w *AWSScanWorker) WithGraphProjection(g *GraphProjectionGate) *AWSScanWorker {
 	w.gate = g
 	return w
+}
+
+// WithPolicyGate binds the worker to an IGA_POLICY gate. Without one it reads
+// the process-wide gate, which defaults to off.
+func (w *AWSScanWorker) WithPolicyGate(g *PolicyGate) *AWSScanWorker { w.policy = g; return w }
+
+func (w *AWSScanWorker) policyGate() *PolicyGate {
+	if w.policy != nil {
+		return w.policy
+	}
+	return PolicyGateState()
 }
 
 // WithScannerHook configures every run's scanners, e.g. with fake AWS clients.
@@ -315,6 +333,23 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	workloadSnapshot, workloadErr := workloadScanner.ScanFromSnapshot(execCtx, run.WorkspaceID, snapshot)
 	if workloadErr != nil {
 		log.Printf("aws workload scan: run=%s: %v", run.ID, workloadErr)
+	}
+
+	// RESOURCE-POLICY COLLECTION (§3.9, T3.03b): inside the scan, under the
+	// barrier, counted in its lease. Every AWS failure is a coverage fact on
+	// 056's rows, never a scan failure; only a lost fence stops the run (its
+	// publication would be refused anyway).
+	if pipeline && w.policyGate().Available() {
+		rp, rpErr := permissionScanner.CollectResourcePolicies(execCtx, run.WorkspaceID, run.ConnectorID, run.ID)
+		switch {
+		case errors.Is(rpErr, repositories.ErrScanFenceLost):
+			return fmt.Errorf("resource-policy collection: %w", rpErr)
+		case rpErr != nil:
+			log.Printf("aws resource-policy collection: run=%s: %v", run.ID, rpErr)
+		default:
+			log.Printf("aws resource-policy collection: run=%s: %d form/region rows, %d observations, %d documents, %d write errors",
+				run.ID, rp.FormsWritten, rp.Observations, rp.Documents, len(rp.WriteErrors))
+		}
 	}
 
 	var permSurfaces, workloadSurfaces map[string]models.SurfaceCoverage

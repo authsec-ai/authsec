@@ -70,22 +70,38 @@ BEGIN
     END IF;
 END $$;
 
+-- T3.00 (bootstrap parity): 001 now creates what this file creates, and the
+-- runner applies this file after 001 on a fresh database, so statements that
+-- cannot run twice are guarded on the object they create. On a database built
+-- from the earlier chain the guard is true and the statement runs unchanged.
+
 -- composite FK targets -------------------------------------------------------
 -- Each is the target some reference below (or in 030-034) needs. None of the
 -- three tables has one today; all three are workspace-scoped.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_connector'::regclass AND conname = 'cloud_connector_workspace_id_key') THEN
 ALTER TABLE public.cloud_connector
     ADD CONSTRAINT cloud_connector_workspace_id_key UNIQUE (workspace_id, id);
+END IF; END $$;
 
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_scan_run'::regclass AND conname = 'cloud_scan_run_workspace_id_key') THEN
 ALTER TABLE public.cloud_scan_run
     ADD CONSTRAINT cloud_scan_run_workspace_id_key UNIQUE (workspace_id, id);
+END IF; END $$;
 
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_observation'::regclass AND conname = 'cloud_observation_workspace_id_key') THEN
 ALTER TABLE public.cloud_observation
     ADD CONSTRAINT cloud_observation_workspace_id_key UNIQUE (workspace_id, id);
+END IF; END $$;
 
 -- convert the references -----------------------------------------------------
 -- Constraint names below were read off \d cloud_observation in a rehearsal
 -- database built by applying 001-025, not guessed from PostgreSQL's naming
 -- rules. A wrong name fails the migration.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_observation'::regclass AND conname = 'cloud_observation_run_fkey') THEN
 ALTER TABLE public.cloud_observation
     DROP CONSTRAINT cloud_observation_scan_run_id_fkey,
     ADD CONSTRAINT cloud_observation_run_fkey
@@ -106,12 +122,16 @@ ALTER TABLE public.cloud_observation
     ADD CONSTRAINT cloud_observation_connector_fkey
         FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE;
+END IF; END $$;
 
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_scan_run'::regclass AND conname = 'cloud_scan_run_connector_fkey') THEN
 ALTER TABLE public.cloud_scan_run
     DROP CONSTRAINT cloud_scan_run_connector_id_fkey,
     ADD CONSTRAINT cloud_scan_run_connector_fkey
         FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE;
+END IF; END $$;
 
 COMMENT ON CONSTRAINT cloud_observation_run_fkey ON public.cloud_observation IS
     'Workspace-qualified (§2.9). The single-column form this replaced admitted '

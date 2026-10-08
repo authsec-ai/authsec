@@ -8,7 +8,7 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-09-24'
+    TemplateVersion: '2026-10-07'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -265,11 +265,84 @@ Resources:
               # console told the customer was sufficient, and that is exactly
               # the failure mode an unverified "SecurityAudit probably already
               # covers it" would risk.
+              #
+              # Template 2026-10-07 (Phase 3 resource-policy collection): every
+              # resource of each policy-bearing form AuthSec analyses is
+              # ENUMERATED and its policy read, so a policy change can be proven
+              # not to cut off access that a resource policy grants. Each pair is
+              # one form's list call and its policy read, nothing else:
+              #   S3 buckets           s3:ListAllMyBuckets, s3:GetBucketPolicy
+              #   S3 directory buckets s3express:ListAllMyDirectoryBuckets,
+              #                        s3express:GetBucketPolicy
+              #   S3 access points     s3:ListAccessPoints, s3:GetAccessPointPolicy
+              #   Multi-Region APs     s3:ListMultiRegionAccessPoints,
+              #                        s3:GetMultiRegionAccessPointPolicy
+              #   Object Lambda APs    s3:ListAccessPointsForObjectLambda,
+              #                        s3:GetAccessPointPolicyForObjectLambda
+              #   KMS keys             kms:ListKeys, kms:GetKeyPolicy
+              #   SQS queues           sqs:ListQueues, sqs:GetQueueAttributes
+              #                        (requested for the Policy attribute only)
+              #   SNS topics           sns:ListTopics, sns:GetTopicAttributes
+              #   Lambda functions,    lambda:ListFunctions (WorkloadReads),
+              #   versions, aliases    lambda:ListVersionsByFunction,
+              #                        lambda:ListAliases, lambda:GetPolicy
+              #   Lambda layers        lambda:ListLayers, lambda:ListLayerVersions,
+              #                        lambda:GetLayerVersionPolicy
+              #   Secrets Manager      secretsmanager:ListSecrets,
+              #                        secretsmanager:GetResourcePolicy -- the
+              #                        policy only; GetSecretValue stays denied
+              #                        below (NeverReadSecretValues).
               - Sid: ResourcePolicies
                 Effect: Allow
                 Action:
                   - s3:GetBucketPolicy
                   - kms:GetKeyPolicy
+                  - s3:ListAllMyBuckets
+                  - s3express:ListAllMyDirectoryBuckets
+                  - s3express:GetBucketPolicy
+                  - s3:ListAccessPoints
+                  - s3:GetAccessPointPolicy
+                  - s3:ListMultiRegionAccessPoints
+                  - s3:GetMultiRegionAccessPointPolicy
+                  - s3:ListAccessPointsForObjectLambda
+                  - s3:GetAccessPointPolicyForObjectLambda
+                  - kms:ListKeys
+                  - sqs:ListQueues
+                  - sqs:GetQueueAttributes
+                  - sns:ListTopics
+                  - sns:GetTopicAttributes
+                  - lambda:ListVersionsByFunction
+                  - lambda:ListAliases
+                  - lambda:GetPolicy
+                  - lambda:ListLayers
+                  - lambda:ListLayerVersions
+                  - lambda:GetLayerVersionPolicy
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:GetResourcePolicy
+                Resource: '*'
+
+              # Migration evidence (template 2026-10-07). Read only when
+              # AuthSec proposes moving one workload off a shared role onto
+              # its own role, to show that the move has really happened: which
+              # task-definition revision each ECS service and its running tasks
+              # use, which version each Lambda alias and event-source mapping
+              # points at (lambda:ListAliases and lambda:ListVersionsByFunction
+              # are granted above), and which instance profile each Auto
+              # Scaling group's launch template and its instances carry. Never
+              # projected into the inventory; nothing is changed.
+              - Sid: MigrationEvidence
+                Effect: Allow
+                Action:
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListEventSourceMappings
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeIamInstanceProfileAssociations
                 Resource: '*'
 
         # ------------------------------------------------------------------
@@ -350,7 +423,7 @@ Resources:
       RoleArn: !GetAtt AuthSecDiscoveryRole.Arn
       ExternalId: !Ref ExternalId
       AccountId: !Ref 'AWS::AccountId'
-      TemplateVersion: '2026-09-24'
+      TemplateVersion: '2026-10-07'
 
 Outputs:
 
@@ -369,4 +442,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-09-24'
+    Value: '2026-10-07'

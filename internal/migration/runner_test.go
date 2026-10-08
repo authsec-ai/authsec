@@ -3,7 +3,9 @@ package migration
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/lib/pq"
@@ -225,6 +227,46 @@ $func$ LANGUAGE plpgsql;`,
 	}
 }
 
+// TestSplitPhase3Migrations proves the splitter keeps every $$ body of the
+// Phase 3 files (047-056: trigger functions, the guarded DO block) whole, and
+// never emits a fragment of one as a statement of its own -- the failure mode
+// that would only show at runtime inside the one-transaction-per-file model.
+func TestSplitPhase3Migrations(t *testing.T) {
+	dir := filepath.Join(testMigrationsDir(t), "master")
+	for v := 47; v <= 56; v++ {
+		matches, err := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%03d_*.sql", v)))
+		require.NoError(t, err)
+		require.Len(t, matches, 1, "exactly one master file numbered %03d", v)
+		raw, err := os.ReadFile(matches[0])
+		require.NoError(t, err)
+		content := strings.ReplaceAll(string(raw), "\r\n", "\n")
+		bodies := strings.Count(content, "CREATE OR REPLACE FUNCTION") + strings.Count(content, "DO $$")
+		dollar := 0
+		for _, stmt := range splitSQLStatements(content) {
+			body := stripLeadingComments(stmt)
+			upper := strings.ToUpper(body)
+			for _, frag := range []string{"BEGIN", "END", "IF ", "RAISE", "RETURN", "ELSIF", "DECLARE", "SELECT * INTO"} {
+				assert.False(t, strings.HasPrefix(upper, frag), "%s: statement is a fragment of a $$ body: %.80q", filepath.Base(matches[0]), body)
+			}
+			if n := strings.Count(stmt, "$$"); n > 0 {
+				assert.Equal(t, 2, n, "%s: a statement must hold exactly one whole $$ body: %.80q", filepath.Base(matches[0]), body)
+				assert.True(t, strings.HasPrefix(upper, "CREATE OR REPLACE FUNCTION") || strings.HasPrefix(upper, "DO $$"),
+					"%s: $$ in an unexpected statement: %.80q", filepath.Base(matches[0]), body)
+				dollar++
+			}
+		}
+		assert.Equal(t, bodies, dollar, "%s: every function and DO block is one statement", filepath.Base(matches[0]))
+	}
+}
+
+func stripLeadingComments(stmt string) string {
+	lines := strings.Split(strings.TrimSpace(stmt), "\n")
+	for len(lines) > 0 && (strings.HasPrefix(strings.TrimSpace(lines[0]), "--") || strings.TrimSpace(lines[0]) == "") {
+		lines = lines[1:]
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
 // ----- Unit Tests: LoadMigrationFiles -----
 
 func TestLoadMigrationFiles_MasterDir(t *testing.T) {
@@ -295,4 +337,3 @@ func TestMasterMigrations_Flow(t *testing.T) {
 	assert.Equal(t, "master", status.DBType)
 	assert.Greater(t, status.LastMigration, 0)
 }
-

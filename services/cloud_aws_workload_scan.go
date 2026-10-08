@@ -641,12 +641,16 @@ func (s *AWSWorkloadScanner) scanCredentialProviders(
 	out.Surfaces[key] = surfaceResult(len(providers), err)
 }
 
-// scanCloudTrail reads recent management events and records each as evidence
-// against the identity it best-effort matches, per the caveats on
-// CloudTrailReader.RecentEvents. Events that match nothing recorded are
-// still counted in the surface's total -- the read succeeded even where the
-// match did not -- but are not written as evidence with no subject, since
-// evidence with nothing to be evidence FOR is not useful evidence.
+// scanCloudTrail reads recent management events and records each one it can
+// attribute as evidence against that identity (SPEC-iga-phase3-policy.md
+// §8.6, T3.04). Attribution is by the record's own userIdentity -- a session
+// by its sessionContext.sessionIssuer (the role's ARN and RoleId), an IAM
+// user's call by its ARN -- never by matching a session name against role
+// names (awsdiscovery.TrailEvent.Attribution). Events that match nothing
+// recorded are still counted in the surface's total -- the read succeeded
+// even where the match did not -- but are not written as evidence with no
+// subject, since evidence with nothing to be evidence FOR is not useful
+// evidence.
 func (s *AWSWorkloadScanner) scanCloudTrail(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
@@ -657,27 +661,17 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 	key := models.SurfaceRegional(models.SurfaceCloudTrailEventsPrefix, region)
 	events, err := trail.RecentEvents(ctx)
 	if s.evidence != nil && len(events) > 0 {
-		// Matched by NAME, not NativeID: CloudTrail's Username is the IAM
-		// user's bare name for a direct IAM-user call, never the identity's
-		// ARN -- matching against NativeID, as every other reader in this
-		// package keys identities, would never hit even the one case this
-		// CAN confidently resolve. It still will not match an assumed-role
-		// call, where Username is a session name -- see the file header.
-		//
-		// Bounded to 500 identities (clampLimit's own ceiling): matching
-		// against every identity a large account has is this function's job,
-		// not a reason to add pagination to a best-effort join.
-		byName := make(map[string]models.CloudIdentity)
-		if identities, _, ierr := s.identities.ListIdentities(workspaceID,
-			repositories.CloudIdentityFilter{ConnectorID: &snapshot.ConnectorID, Limit: 500}); ierr == nil {
-			for _, id := range identities {
-				if id.Name != "" {
-					byName[id.Name] = id
-				}
-			}
+		resolve, rerr := s.trailAttribution(workspaceID, snapshot.ConnectorID, events)
+		if rerr != nil {
+			// Our own read failed: nothing is attributed this run rather than
+			// something attributed against a partial inventory. The surface's
+			// own state is AWS's, unchanged.
+			log.Printf("aws workload scan: cloudtrail attribution in %s: %v", region, rerr)
+			resolve = func(awsdiscovery.Attribution) (*models.CloudIdentity, bool) { return nil, false }
 		}
 		for _, e := range events {
-			identity, matched := byName[e.Username]
+			att := e.Attribution()
+			identity, matched := resolve(att)
 			if !matched {
 				// No confident match. Recorded in the surface's count above,
 				// not as an orphaned observation -- see the function comment.
@@ -691,20 +685,109 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 			if rerr := s.evidence.Record(
 				IdentitySubject(identity.ID), "cloudtrail:LookupEvents",
 				key, "", e.EventTime, igagraph.CloudTrailEventEvidenceKey(identity.NativeID, e.EventID),
-				map[string]any{
-					"event_id":     e.EventID,
-					"event_name":   e.EventName,
-					"event_source": e.EventSource,
-					"username":     e.Username,
-					"denied":       e.Denied,
-					"error_code":   e.ErrorCode,
-				},
+				cloudTrailFacts(e, att),
 			); rerr != nil {
 				log.Printf("aws workload scan: cloudtrail evidence for %s: %v", e.EventID, rerr)
 			}
 		}
 	}
 	out.Surfaces[key] = surfaceResult(len(events), err)
+}
+
+// trailAttribution resolves the events' attribution keys against the
+// connector's identities in ONE read, and returns the matcher. A key matches
+// only an identity of THIS connector (a session issued by another account's
+// role names no identity here), and an ARN match is refused when both the
+// event and the identity state an immutable id and the two differ: a role
+// deleted and recreated under the same ARN is another principal, and its
+// predecessor's sessions are not its own.
+func (s *AWSWorkloadScanner) trailAttribution(
+	workspaceID, connectorID uuid.UUID, events []awsdiscovery.TrailEvent,
+) (func(awsdiscovery.Attribution) (*models.CloudIdentity, bool), error) {
+	arns, names := map[string]bool{}, map[string]bool{}
+	for _, e := range events {
+		switch att := e.Attribution(); att.How {
+		case awsdiscovery.AttributionSessionIssuer, awsdiscovery.AttributionPrincipalARN:
+			arns[att.ARN] = true
+		case awsdiscovery.AttributionUsername:
+			names[att.UserName] = true
+		}
+	}
+	identities, err := s.identities.FindForAttribution(workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+	if err != nil {
+		return nil, err
+	}
+	byARN := make(map[string]*models.CloudIdentity, len(identities))
+	userByName := map[string]*models.CloudIdentity{}
+	for i := range identities {
+		id := &identities[i]
+		byARN[id.NativeID] = id
+		if id.Kind == models.CloudIdentityIAMUser && id.Name != "" {
+			userByName[id.Name] = id
+		}
+	}
+	return func(att awsdiscovery.Attribution) (*models.CloudIdentity, bool) {
+		switch att.How {
+		case awsdiscovery.AttributionSessionIssuer, awsdiscovery.AttributionPrincipalARN:
+			id, ok := byARN[att.ARN]
+			if !ok {
+				return nil, false
+			}
+			if known := id.AWSAttrs().UniqueID; known != "" && att.UniqueID != "" && known != att.UniqueID {
+				return nil, false
+			}
+			return id, true
+		case awsdiscovery.AttributionUsername:
+			id, ok := userByName[att.UserName]
+			return id, ok
+		}
+		return nil, false
+	}, nil
+}
+
+// cloudTrailFacts is one attributed event's sanitized facts. The first six
+// keys are the storage contract every earlier reader of these observations
+// relies on, unchanged (denied stays "any error code"); the rest are T3.04's
+// (§8.6). errorMessage is classified, never stored.
+func cloudTrailFacts(e awsdiscovery.TrailEvent, att awsdiscovery.Attribution) map[string]any {
+	facts := map[string]any{
+		"event_id":     e.EventID,
+		"event_name":   e.EventName,
+		"event_source": e.EventSource,
+		"username":     e.Username,
+		"denied":       e.Denied,
+		"error_code":   e.ErrorCode,
+		// How the event was tied to its subject: session_issuer,
+		// principal_arn, or the legacy username hint (IAM users only).
+		"attribution": att.How,
+		// Only AccessDenied, AccessDeniedException, UnauthorizedOperation and
+		// Client.UnauthorizedOperation: a throttle is not a denial.
+		"authorization_denied": e.AuthorizationDenied,
+	}
+	if e.PrincipalType != "" {
+		facts["principal_type"] = e.PrincipalType
+	}
+	if e.SessionIssuerARN != "" {
+		facts["session_issuer_arn"] = e.SessionIssuerARN
+		facts["session_issuer_principal_id"] = e.SessionIssuerPrincipalID
+	}
+	if e.SessionName != "" {
+		facts["session_name"] = e.SessionName
+	}
+	if e.AuthorizationDenied {
+		facts["denial_policy_type"] = e.DenialPolicyType
+	}
+	return facts
+}
+
+// sortedKeys lists a set's members in order, for a deterministic query.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // scanTrailStatus reads each trail's configuration and whether it is
@@ -953,9 +1036,12 @@ func (s *AWSWorkloadScanner) scanActivity(
 
 	// The total is kept, not discarded: an account above the cap must say so,
 	// or the identities past it silently read as having no activity (§1.3).
-	// The sample is the first activityIdentityCap identities by ARN (D-86):
-	// the same identities every scan while the inventory is unchanged, and a
-	// set a reader can name from CappedAfter below.
+	// The sample (T3.03, SPEC-iga-phase3-policy.md §2.6) puts the identities
+	// that matter most to a policy decision first -- the ones a workload runs
+	// as, and the ones under a live AuthSec control -- then the rest by ARN
+	// (D-86): the same identities every scan while the inventory is
+	// unchanged, and a set a reader can name from CappedAfter and Prioritized
+	// below.
 	identities, total, err := s.workloads.ActivitySample(workspaceID, snapshot.ConnectorID, activityIdentityCap)
 	if err != nil {
 		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Error: err.Error()}
@@ -1009,12 +1095,30 @@ func (s *AWSWorkloadScanner) scanActivity(
 			// throttled / denied / partial already block; the cap is named too.
 			cov.Error += "; " + capped
 		}
-		// Where the sample ended (D-86): every identity whose ARN sorts after
-		// this one was not read this run -- "not collected", never "no attempt
-		// reported".
-		cov.CappedAfter = identities[len(identities)-1].NativeID
+		// Where the sample ended (D-86, T3.03): the prioritised identities it
+		// read, and the last ARN of the rest. Any other identity was not read
+		// this run -- "not collected", never "no attempt reported"
+		// (SurfaceCoverage.ActivitySampled).
+		cov.CappedAfter, cov.Prioritized = sampleBoundary(identities)
+		log.Printf("aws workload scan: activity sample for connector %s: %d of %d identities, %d prioritised (workload-bound or controlled), rest through %q",
+			snapshot.ConnectorID, len(identities), total, len(cov.Prioritized), cov.CappedAfter)
 	}
 	return cov
+}
+
+// sampleBoundary names a capped activity sample (T3.03): the last ARN read
+// among the identities that were NOT prioritised ("" when the prioritised
+// ones filled the cap), and the prioritised ARNs, sorted (byte order).
+func sampleBoundary(sample []repositories.SampledIdentity) (cappedAfter string, prioritized []string) {
+	for _, id := range sample {
+		if id.Prioritized {
+			prioritized = append(prioritized, id.NativeID)
+		} else {
+			cappedAfter = id.NativeID // the rest are read in byte order: the last is the boundary
+		}
+	}
+	sort.Strings(prioritized)
+	return cappedAfter, prioritized
 }
 
 // activityCall is the call an activity read failed on, for the coverage text;

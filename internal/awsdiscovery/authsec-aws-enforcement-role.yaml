@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec enforcement - a SEPARATE, customer-consented stack that lets AuthSec
+  apply changes a person approved in AuthSec, and nothing else. It can only
+  create, version, attach and remove AuthSec-owned permissions boundaries
+  (IAM policies under the /authsec/ path). It cannot read anything, cannot
+  change your own policies, and cannot touch service-linked roles, AWS
+  reserved roles, AuthSec's own roles or roles tagged authsec:protected=true.
+  Deleting this stack removes AuthSec's ability to change anything.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-10-07'
+    Kind: enforcement
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Filled in by AuthSec - do not change
+        Parameters:
+          - AuthSecPrincipalArn
+          - ExternalId
+          - CallbackTopicArn
+          - NameSuffix
+
+Parameters:
+
+  AuthSecPrincipalArn:
+    Type: String
+    Description: >-
+      The AuthSec AWS principal permitted to assume the enforcement role. Copy
+      it from the AuthSec console.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(root|user\/.+|role\/.+)$'
+    ConstraintDescription: must be an IAM principal ARN.
+
+  # Not NoEcho, for the same reason as the discovery template: Quick Create
+  # ignores NoEcho parameters, and the value is readable in the trust policy
+  # anyway. It is minted separately from the discovery ExternalId and is never
+  # equal to it.
+  ExternalId:
+    Type: String
+    Description: >-
+      The AuthSec-generated ExternalId for enforcement in this account. Filled
+      in by AuthSec; do not change it. It is NOT the discovery ExternalId.
+    MinLength: 32
+    MaxLength: 1224
+    AllowedPattern: '^[\w+=,.@:\/-]+$'
+    ConstraintDescription: must be the ExternalId shown in the AuthSec console.
+
+  # Set only by AuthSec's "Launch in AWS" link. Empty means the manual flow:
+  # no callback resource is created.
+  CallbackTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Filled in by AuthSec's Launch link. Leave empty when deploying this
+      template by hand.
+    AllowedPattern: '^$|^arn:aws:sns:[a-z0-9-]+:\d{12}:[A-Za-z0-9_-]{1,256}$'
+    ConstraintDescription: must be empty or the SNS topic ARN AuthSec provided.
+
+  # Names both roles. AuthSec tells you the value; the self-test role's name is
+  # checked against it before any self-test runs, so the self-test can never be
+  # pointed at one of your own roles.
+  NameSuffix:
+    Type: String
+    Description: >-
+      The suffix AuthSec gave this binding. Names the enforcement role
+      (AuthSecEnforcement-<suffix>) and its self-test role
+      (AuthSecEnforcementSelfTest-<suffix>).
+    AllowedPattern: '^[a-z0-9]{1,16}$'
+    ConstraintDescription: must be the suffix shown in the AuthSec console.
+
+Conditions:
+
+  HasCallback: !Not [!Equals [!Ref CallbackTopicArn, '']]
+
+Resources:
+
+  AuthSecEnforcementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AuthSecEnforcement-${NameSuffix}'
+      Description: >-
+        Write-only role assumed by AuthSec to apply approved changes. It can
+        only manage AuthSec-owned permissions boundaries under /authsec/.
+      MaxSessionDuration: 3600
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthSecAssumeWithExternalId
+            Effect: Allow
+            Principal:
+              AWS: !Ref AuthSecPrincipalArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+
+      # The complete permission set (SPEC-iga-phase3-policy.md section 3.6,
+      # template v1). Nothing else is granted: no reads, no managed policies.
+      # Protection is by PATH and TAG, never by role name.
+      Policies:
+        - PolicyName: AuthSecEnforcementBoundaryWrites
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # Create, version and delete AuthSec's own policies, and only
+              # those: every policy AuthSec writes lives under /authsec/.
+              - Sid: ManageAuthSecPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:TagPolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Attach a permissions boundary only when the boundary being set
+              # is an AuthSec policy. Any other policy (including AWS managed
+              # policies) is refused by this condition.
+              - Sid: AttachOnlyAuthSecBoundaries
+                Effect: Allow
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  ArnLike:
+                    iam:PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Remove a permissions boundary only when the boundary currently
+              # attached is an AuthSec policy, so a boundary you set yourself
+              # can never be removed. Whether AWS supplies this key for
+              # DeleteRolePermissionsBoundary is proven by the self-test
+              # (detach_boundary) and by the Stage A lab check.
+              - Sid: DetachOnlyAuthSecBoundaries
+                Effect: Allow
+                Action:
+                  - iam:DeleteRolePermissionsBoundary
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  ArnLike:
+                    iam:PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Never service-linked roles or AWS reserved (SSO) roles, by path.
+              - Sid: ProtectServiceRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-reserved/*'
+
+              # Never AuthSec's own roles (discovery and enforcement), by tag.
+              - Sid: ProtectAuthSecRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ManagedBy: AuthSec
+
+              # Never a role you have tagged authsec:protected=true.
+              - Sid: ProtectTaggedRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/authsec:protected: 'true'
+
+      Tags:
+        - Key: ManagedBy
+          Value: AuthSec
+        - Key: Purpose
+          Value: policy-enforcement-boundaries
+
+  # The self-test target. AuthSec attaches and removes a test boundary on THIS
+  # role only, to prove the enforcement role's conditions work; it never runs a
+  # self-test against any other role. The role grants nothing: its only policy
+  # denies everything, and only principals of this account that already hold
+  # sts:AssumeRole on it could assume it. Tagged authsec:selftest=true and
+  # deliberately NOT ManagedBy=AuthSec, which would put it out of the
+  # enforcement role's reach and make the self-test meaningless.
+  AuthSecEnforcementSelfTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AuthSecEnforcementSelfTest-${NameSuffix}'
+      Description: >-
+        Inert target for the AuthSec enforcement self-test. Grants nothing.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SameAccountOnly
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AuthSecSelfTestGrantsNothing
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DenyEverything
+                Effect: Deny
+                Action: '*'
+                Resource: '*'
+      Tags:
+        - Key: authsec:selftest
+          Value: 'true'
+        - Key: Purpose
+          Value: policy-enforcement-self-test
+
+  # Reports both roles to AuthSec. It creates nothing in this account. AuthSec
+  # answers SUCCESS only after it has assumed the enforcement role with the
+  # ExternalId and read the account back; FAILED rolls the stack back.
+  AuthSecEnforcementRegistration:
+    Type: Custom::AuthSecEnforcementRegistration
+    Condition: HasCallback
+    Properties:
+      ServiceToken: !Ref CallbackTopicArn
+      ServiceTimeout: 600
+      RoleArn: !GetAtt AuthSecEnforcementRole.Arn
+      SelfTestRoleArn: !GetAtt AuthSecEnforcementSelfTestRole.Arn
+      ExternalId: !Ref ExternalId
+      AccountId: !Ref 'AWS::AccountId'
+      TemplateVersion: '2026-10-07'
+
+Outputs:
+
+  RoleArn:
+    Description: >-
+      When deploying by hand, paste this back into the AuthSec console
+      (Policy > Setup > Enforcement). Not secret.
+    Value: !GetAtt AuthSecEnforcementRole.Arn
+
+  SelfTestRoleArn:
+    Description: >-
+      When deploying by hand, paste this back too. AuthSec's self-test only
+      ever touches this role.
+    Value: !GetAtt AuthSecEnforcementSelfTestRole.Arn
+
+  AccountId:
+    Description: The AWS account this enforcement binding covers.
+    Value: !Ref 'AWS::AccountId'
+
+  TemplateVersion:
+    Description: Identifies which enforcement permission set this stack granted.
+    Value: '2026-10-07'

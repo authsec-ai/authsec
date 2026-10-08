@@ -1511,6 +1511,15 @@ func SetupRoutes(
 		// hangs off /discovery/agents/:id as well as /governance.
 		governanceController := platformCtrl.NewGovernanceController(config.DB)
 
+		// Phase 3 Slack app (SPEC-iga-phase3-policy.md §7.11, T3.14):
+		// /authsec/integrations/slack. Behind the IGA_POLICY gate;
+		// /interactions (Slack signature) and /oauth/callback (signed state
+		// + install cookie) carry no bearer token; the rest are
+		// authenticated with their permission.
+		platformCtrl.MountSlackIntegrationRoutes(authsec,
+			platformCtrl.NewDefaultSlackIntegrationController(config.DB),
+			middlewares.AuthMiddleware(), middlewares.Require)
+
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
@@ -1685,6 +1694,16 @@ func SetupRoutes(
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.
 			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
+			// Phase 3 enforcement binding (SPEC-iga-phase3-policy.md §7.9,
+			// T3.09): the separate, customer-consented enforcement stack of a
+			// connected account. Behind the IGA_POLICY gate, with
+			// discovery:read to read and governance:enforce to change.
+			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
+				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
+			// Phase 3 IaC sources (§7.9, T3.17): an account's mapping to the
+			// Terraform / CloudFormation directory J2 pull requests change.
+			platformCtrl.RegisterIaCSourceRoutes(discovery,
+				platformCtrl.NewCloudIaCSourceController(config.DB), middlewares.Require)
 
 			// IAM identity discovery: the foundation every later AWS surface
 			// resolves against. Writes cloud_identity and cloud_secret and

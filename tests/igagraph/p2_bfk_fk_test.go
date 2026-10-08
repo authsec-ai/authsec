@@ -41,7 +41,8 @@ package igagraph_test
 // TestB9ForeignKeyCatalogGuard is what makes "every" true. Its scope is by
 // table name, not by form: every foreign key on an iga_* or cloud_* table
 // (Phase 1's included) and every key from any other table that points into
-// one (bfkForeignKeys). It reads pg_constraint and fails when such a key has no
+// one (bfkForeignKeys) -- except Phase 3's tables (bfkPhase3Tables), which
+// tests/igagovschema guards. It reads pg_constraint and fails when such a key has no
 // case, when a case's kind does not match its key's shape, when a
 // single-column reference to a workspace-scoped table is not an exemption
 // listed with its reason, when a composite reference does not lead with
@@ -79,6 +80,22 @@ import (
 
 	"github.com/lib/pq"
 )
+
+// bfkPhase3Tables are the Phase 3 cloud_* tables (047-056,
+// SPEC-iga-phase3-policy.md §6.1). They, and every iga_gov_* table by prefix,
+// are OUT of B9's scope: the Phase 3 spec governs them, and tests/igagovschema
+// proves them and carries the equivalent catalog guard
+// (TestPhase3ForeignKeyCatalogGuard: every composite reference
+// workspace-qualified, every single-column reference and every bare uuid
+// listed with its reason). That is NOT an agreed exemption from §2.9: Phase
+// 3's DDL references users(id) single-column and keeps unreferenced audit and
+// subject uuids, and whether §2.9 binds Phase 3 is an open spec question
+// (T3.01). A cloud_* table that is not listed here stays in B9's scope, so a
+// new one is still caught.
+var bfkPhase3Tables = []string{
+	"cloud_enforcement_binding", "cloud_policy_document",
+	"cloud_resource_policy_coverage", "cloud_resource_policy_observation",
+}
 
 // bfkCloudTable says where a cloud_* table's references come from.
 type bfkCloudTable struct {
@@ -262,7 +279,8 @@ func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 		  JOIN pg_class fr     ON fr.oid = c.confrelid
 		 WHERE c.contype = 'f' AND n.nspname = 'public'
 		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%'
-		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')`)
+		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')
+		   AND r.relname NOT LIKE 'iga\_gov\_%' AND r.relname <> ALL ($1)`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read foreign keys: %v", err)
 	}
@@ -578,9 +596,10 @@ func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 		 WHERE n.nspname = 'public' AND r.relkind = 'r'
 		   AND a.atttypid = 'uuid'::regtype AND a.attname <> 'id'
 		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%')
+		   AND r.relname NOT LIKE 'iga\_gov\_%' AND r.relname <> ALL ($1)
 		   AND NOT EXISTS (SELECT 1 FROM pg_constraint c
 		                    WHERE c.contype = 'f' AND c.conrelid = r.oid AND a.attnum = ANY (c.conkey))
-		 ORDER BY 1`)
+		 ORDER BY 1`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read uuid columns: %v", err)
 	}
@@ -608,7 +627,8 @@ func bfkCloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
 		  FROM pg_class r
 		  JOIN pg_namespace n ON n.oid = r.relnamespace
 		 WHERE n.nspname = 'public' AND r.relkind IN ('r', 'p') AND r.relname LIKE 'cloud\_%'
-		 ORDER BY 1`)
+		   AND r.relname <> ALL ($1)
+		 ORDER BY 1`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read cloud tables: %v", err)
 	}

@@ -107,6 +107,8 @@ COMMENT ON TABLE public.iga_external_principal IS
 -- forward-reference this table. Verbatim from SPEC §3 034: the relationship
 -- types are exactly 031's (executes_as, task_execution_role, member_of,
 -- can_assume) -- no realizes, no agent-instance endpoint (§2.2).
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.iga_relationship'::regclass AND conname = 'iga_rel_src_external_fkey') THEN
 ALTER TABLE public.iga_relationship
     ADD COLUMN IF NOT EXISTS source_external_principal_id uuid,
     ADD CONSTRAINT iga_rel_src_external_fkey
@@ -129,6 +131,7 @@ ALTER TABLE public.iga_relationship
                                          OR source_external_principal_id IS NOT NULL
             ELSE false
         END);
+END IF; END $$;
 CREATE INDEX IF NOT EXISTS idx_iga_relationship_source_external
     ON public.iga_relationship (workspace_id, source_external_principal_id)
     WHERE source_external_principal_id IS NOT NULL;

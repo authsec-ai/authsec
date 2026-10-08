@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -10,7 +11,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/google/uuid"
+	"github.com/authsec-ai/authsec/internal/notify"
 )
 
 // buildEmailMessage assembles an RFC 5322–compliant message suitable for
@@ -25,25 +26,10 @@ import (
 // is configured at the relay (here: authsec.ai via ElasticEmail). Mismatch =
 // DMARC fail = silent drop on Gmail.
 func buildEmailMessage(toEmail, subject, body string) []byte {
-	fromAddr := config.AppConfig.SMTPUser
-	if fromName := strings.TrimSpace(config.AppConfig.SMTPFromName); fromName != "" {
-		fromAddr = fmt.Sprintf("%s <%s>", fromName, config.AppConfig.SMTPUser)
-	}
-	messageID := fmt.Sprintf("<%s@authsec.ai>", uuid.NewString())
-	date := time.Now().UTC().Format(time.RFC1123Z)
-
-	var sb strings.Builder
-	sb.WriteString("From: " + fromAddr + "\r\n")
-	sb.WriteString("To: " + toEmail + "\r\n")
-	sb.WriteString("Subject: " + subject + "\r\n")
-	sb.WriteString("Date: " + date + "\r\n")
-	sb.WriteString("Message-ID: " + messageID + "\r\n")
-	sb.WriteString("MIME-Version: 1.0\r\n")
-	sb.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n")
-	sb.WriteString("\r\n")
-	sb.WriteString(body)
-	return []byte(sb.String())
+	// The header set is internal/notify.BuildEmail's (T3.12: one definition
+	// for every mail AuthSec sends).
+	from := notify.SMTPConfig{User: config.AppConfig.SMTPUser, FromName: config.AppConfig.SMTPFromName}.FromHeader()
+	return notify.BuildEmail(from, toEmail, subject, body, notify.EmailDate(time.Now()), notify.NewMessageID())
 }
 
 // GenerateOTPFunc is the function variable for generating OTPs, allowing for mocking in tests
@@ -527,15 +513,51 @@ type PolicyExpiryWarning struct {
 // recorded and surfaced rather than allowed to block the action: an SMTP outage
 // must not quietly turn every destructive policy into a no-op.
 func SendPolicyExpiryWarningEmail(w PolicyExpiryWarning) error {
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendPolicyExpiryWarningEmail: SMTP not configured")
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
+	return SendPolicyExpiryWarningEmailVia(nil, w)
+}
 
+// SendPolicyExpiryWarningEmailVia is SendPolicyExpiryWarningEmail over a
+// given transport; nil means internal/notify's SMTP sender over the
+// application's relay (AppSMTPConfig). The rendering is
+// RenderPolicyExpiryWarning; the transport (headers, PLAIN auth, relay) is
+// internal/notify's (T3.12 extraction: the bytes on the wire are unchanged,
+// tests/integration/p3_notify_legacy_test.go).
+func SendPolicyExpiryWarningEmailVia(transport notify.Sender, w PolicyExpiryWarning) error {
+	if transport == nil {
+		transport = &notify.SMTP{Config: AppSMTPConfig}
+	}
+	if !AppSMTPConfig().Complete() {
+		log.Printf("SendPolicyExpiryWarningEmail: SMTP not configured")
+		return notify.ErrSMTPNotConfigured
+	}
+	subject, body := RenderPolicyExpiryWarning(w)
+	err := transport.Send(context.Background(), notify.Message{
+		Channel: notify.ChannelEmail, To: w.To, Subject: subject, Body: []byte(body),
+	})
+	if err != nil {
+		log.Printf("SendPolicyExpiryWarningEmail: failed to warn %s about %s on %s: %v",
+			w.To, w.Action, w.AgentLabel, err)
+		return err
+	}
+	return nil
+}
+
+// AppSMTPConfig is the application's relay (config.AppConfig's SMTP fields)
+// as internal/notify's configuration.
+func AppSMTPConfig() notify.SMTPConfig {
+	if config.AppConfig == nil {
+		return notify.SMTPConfig{}
+	}
+	return notify.SMTPConfig{
+		Host: config.AppConfig.SMTPHost, Port: config.AppConfig.SMTPPort,
+		User: config.AppConfig.SMTPUser, Password: config.AppConfig.SMTPPassword,
+		FromName: config.AppConfig.SMTPFromName,
+	}
+}
+
+// RenderPolicyExpiryWarning is the warning's subject and text body, exactly
+// as SendPolicyExpiryWarningEmail has always rendered them.
+func RenderPolicyExpiryWarning(w PolicyExpiryWarning) (subject, body string) {
 	where := w.AgentLabel
 	if w.Namespace != "" {
 		where = fmt.Sprintf("%s (namespace %s)", where, w.Namespace)
@@ -546,7 +568,6 @@ func SendPolicyExpiryWarningEmail(w PolicyExpiryWarning) error {
 
 	// The subject has to survive being read on a phone lock screen, so the verb and
 	// the deadline come first and the policy name last.
-	var subject string
 	switch {
 	case w.Action == "evict" && !w.Confirmed:
 		subject = "AuthSec: scheduled deletion of " + w.AgentLabel + " will be REFUSED"
@@ -614,17 +635,5 @@ func SendPolicyExpiryWarningEmail(w PolicyExpiryWarning) error {
 	}
 	fmt.Fprintf(&sb, "\nPolicy ID: %s\nAgent ID:  %s\n", w.PolicyID, w.AgentID)
 	sb.WriteString("\nRegards,\nAuthSec Team\n")
-
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth, smtpUser, []string{w.To},
-		buildEmailMessage(w.To, subject, sb.String()),
-	)
-	if err != nil {
-		log.Printf("SendPolicyExpiryWarningEmail: failed to warn %s about %s on %s: %v",
-			w.To, w.Action, w.AgentLabel, err)
-		return err
-	}
-	return nil
+	return subject, sb.String()
 }
