@@ -178,7 +178,7 @@ func TestP3T314SlackApprovalA14(t *testing.T) {
 		}
 	})
 
-	t.Run("A14 unlinked user, then a console-confirmed link", func(t *testing.T) {
+	t.Run("A14 unlinked user; its link token proves nothing", func(t *testing.T) {
 		code, out := click("USTRANGER", slackapp.ActionApprove, val, tsA, nil)
 		if code != http.StatusForbidden || p3eErr(out) != services.SlackCodeUserNotLinked {
 			t.Fatalf("unlinked user: %d %v, want 403 slack_user_not_linked", code, out)
@@ -201,23 +201,23 @@ func TestP3T314SlackApprovalA14(t *testing.T) {
 		if w, body := app.do(http.MethodPost, "/link/confirm", l.token(l.ws, stranger, "governance:read"), map[string]any{"token": otherWS}); w.Code != http.StatusNotFound {
 			t.Fatalf("another workspace's link token: %d %v", w.Code, body)
 		}
-		w, body := app.do(http.MethodPost, "/link/confirm", l.token(l.ws, stranger, "governance:read"), map[string]any{"token": tok})
-		if w.Code != http.StatusOK || digs(body, "data", "link", "linked_via") != "console_confirmation" ||
-			digs(body, "data", "link", "user_id") != stranger.user.String() {
-			t.Fatalf("POST /link/confirm: %d %v", w.Code, body)
+		// P0-3: the token only names the Slack user. Slack reports that
+		// account's confirmed email as someone-else@..., which is no
+		// member's: neither the stranger nor anyone the token is forwarded
+		// to can claim it.
+		for name, m := range map[string]p3aMember{"stranger": stranger, "second": l.second} {
+			w, body := app.do(http.MethodPost, "/link/confirm", l.token(l.ws, m, "governance:read"), map[string]any{"token": tok})
+			if w.Code != http.StatusForbidden || p3eErr(body) != "slack_link_email_mismatch" || p3sDetail(body, "reason") != "email_mismatch" {
+				t.Fatalf("%s confirms the stranger's Slack account: %d %v", name, w.Code, body)
+			}
 		}
-		if l.events(services.GovEventSlackUserLinked) != 5 ||
-			p3sCountEventually(t, l.db, 1, `SELECT count(*) FROM audit_events WHERE workspace_id = ? AND action = 'link'`, l.ws.String()) != 1 {
-			t.Fatalf("link events %d audits %d", l.events(services.GovEventSlackUserLinked), l.audits("link"))
-		}
-		// Another member cannot take over the link.
-		if w, body = app.do(http.MethodPost, "/link/confirm", l.token(l.ws, l.second, "governance:read"), map[string]any{"token": tok}); w.Code != http.StatusConflict {
-			t.Fatalf("second member confirms the stranger's link: %d %v", w.Code, body)
+		if l.events(services.GovEventSlackUserLinked) != 4 || l.count(`SELECT count(*) FROM slack_user_link WHERE workspace_id = ? AND slack_user_id = 'USTRANGER'`, l.ws) != 0 {
+			t.Fatalf("link events %d", l.events(services.GovEventSlackUserLinked))
 		}
 	})
 
 	t.Run("A14 replay", func(t *testing.T) {
-		body := p3sClick{team: team, user: "USTRANGER", messageTS: tsA, action: slackapp.ActionApprove, value: val, actionTS: app.nextActionTS()}.body()
+		body := p3sClick{team: team, user: "UAPPROVER", messageTS: tsA, action: slackapp.ActionApprove, value: val, actionTS: app.nextActionTS()}.body()
 		code, out, ts, sig := app.signed(body)
 		if code != http.StatusConflict || p3eErr(out) != services.GovCodeResidualsNotAccept {
 			t.Fatalf("first: %d %v", code, out)

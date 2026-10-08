@@ -9936,6 +9936,9 @@ ALTER TABLE ONLY public.workspace_slack_integration
 
 CREATE UNIQUE INDEX uq_workspace_slack_team ON public.workspace_slack_integration USING btree (slack_team_id) WHERE (revoked_at IS NULL);
 
+-- 057: one Slack link per member per workspace (= per Slack team).
+CREATE UNIQUE INDEX uq_slack_user_link_member ON public.slack_user_link USING btree (workspace_id, user_id);
+
 ALTER TABLE ONLY public.iga_gov_notification
     ADD CONSTRAINT iga_gov_notification_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
