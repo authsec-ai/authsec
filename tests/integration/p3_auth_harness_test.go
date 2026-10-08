@@ -23,6 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/config"
 	platform "github.com/authsec-ai/authsec/controllers/platform"
@@ -42,18 +43,24 @@ type p3aLive struct {
 	policies map[string]*igagov.LivePolicy
 	fail     error
 	reads    int
+	// delegate, when set, answers every read (fix/p3-appr: the production
+	// GovAWSLiveReader over a fake AWS account the deploy job writes to).
+	delegate services.LiveReader
 }
 
 func newP3aLive() *p3aLive {
 	return &p3aLive{roles: map[string]*igagov.LiveRole{}, policies: map[string]*igagov.LivePolicy{}}
 }
 
-func (f *p3aLive) ReadRole(_ context.Context, req services.LiveReadRequest) (igagov.LiveRead, error) {
+func (f *p3aLive) ReadRole(ctx context.Context, req services.LiveReadRequest) (igagov.LiveRead, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
 	if f.fail != nil {
 		return igagov.LiveRead{}, f.fail
+	}
+	if f.delegate != nil {
+		return f.delegate.ReadRole(ctx, req)
 	}
 	out := igagov.LiveRead{ReadAt: time.Now().UTC(), Policies: map[string]*igagov.LivePolicy{}}
 	if r, ok := f.roles[req.RoleARN]; ok {
@@ -119,6 +126,13 @@ func newP3aLab(t *testing.T, name string) *p3aLab {
 	l.author = l.member("author", "author")
 	l.approver = l.member("approver", "approve")
 	l.second = l.member("second", "approve")
+	// fix/p3-appr (P1-4): Approve refuses (503 owner_gate_unavailable)
+	// without an owner gate hook. The owner gate is not what these
+	// scenarios test (the review and wiring tests install the real T3.12
+	// wiring over this): an explicit pass-through gate, restored after.
+	prevHooks := services.SetGovAuthoringHooks(services.GovAuthoringHooks{
+		OwnerGate: func(*gorm.DB, services.GovApprovalCheck) error { return nil }})
+	t.Cleanup(func() { services.SetGovAuthoringHooks(prevHooks) })
 
 	p3aAuditOnce.Do(func() {
 		if monitoring.GetLogger() == nil {

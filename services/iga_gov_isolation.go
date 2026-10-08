@@ -596,33 +596,82 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 			map[string]any{"targets": len(ts)})
 	}
 	t, c := ts[0], cs[ts[0].ID]
-	facts, err := LoadIaCConnectorFacts(db, ws, c.ConnectorID)
+	// fix/p3-appr (P0-2): a re-proposed version never rewrites the plans of
+	// a target that already carries one of its deployments.
+	if dep, err := deployedTargets(db, ws, v.ID, uuid.Nil); err != nil {
+		return nil, err
+	} else if dep[t.ID] {
+		return nil, govConflict(GovCodeTargetDeployed, "This target already carries a deployment of this version; its plans are not recompiled.",
+			map[string]any{"target_id": t.ID, "role_id": c.RoleID})
+	}
+	ct, blk, err := a.compileIsolationOne(ctx, ws, di, t, c, directCall)
 	if err != nil {
 		return nil, err
+	}
+	if blk != nil {
+		return nil, blk.Err
+	}
+	if !ct.Plans.Apply.Eligible() {
+		sp := ct.Plans.Apply
+		return nil, govUnprocessable(GovCodeTargetIneligible, "The dedicated identity cannot be proposed.", map[string]any{"targets": []any{
+			map[string]any{"target_id": t.ID, "role_id": c.RoleID, "reasons": sp.Refusals, "ineligible_reason": sp.IneligibleReason}}})
+	}
+	k, aid := userActor(actor)
+	if err := a.storeCompiled(ctx, ws, []*compiledTarget{ct}, k, aid); err != nil {
+		return nil, err
+	}
+	return a.persistIsolationProposal(ctx, ws, actor, policyID, no, v, c, ct)
+}
+
+// compileIsolationOne is the in-memory compile of a dedicated_identity
+// target (§11): a fresh bundle and live reads of the source role and the new
+// role's ARN, igagov.CompileSplit, and the compile-time IaC form decision.
+// Nothing is written. Propose and revalidation (fix/p3-appr P1-10: a stale
+// split must be revalidatable, §2.8) share it, so the recompiled
+// material_hash is comparable with the approved one. A refusal that a
+// revalidation records as `blocked` (untrusted evidence, a failed live
+// read, a compiler refusal, the workload gone from the graph) is a
+// compileBlock whose Err is what propose answers. An ineligible split is
+// returned as compiled (the caller decides) and skips the IaC decision.
+func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di igagov.DedicatedIdentityIntent, t models.IGAGovTarget,
+	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+	db := a.db.WithContext(ctx)
+	facts, err := LoadIaCConnectorFacts(db, ws, c.ConnectorID)
+	if err != nil {
+		return nil, nil, err
 	}
 	b, src, basis, err := a.targets.buildBasis(ctx, ws, c.IdentityAccountID, nil)
 	if err != nil {
 		if ge := bundleBuildError(err, c.RoleID); ge != nil {
-			return nil, ge
+			return nil, &compileBlock{Err: ge, Reason: "evidence_unavailable: " + reasonOf(err)}, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if b.Trust == igagov.TrustUntrusted {
-		return nil, StoredBundle{Hash: b.Hash, Trust: b.Trust, TrustReasons: b.TrustReasons, Facts: b.Facts}.UntrustedError()
+		return nil, &compileBlock{Bundle: &b, Reason: "evidence_untrusted: " + strings.Join(b.TrustReasons, "; "),
+			Err: StoredBundle{Hash: b.Hash, Trust: b.Trust, TrustReasons: b.TrustReasons, Facts: b.Facts}.UntrustedError()}, nil
 	}
 	if a.live == nil {
-		return nil, govErr(http.StatusServiceUnavailable, GovCodeDiscoveryUnavail, "AWS cannot be read through the discovery role right now.", nil)
+		return nil, &compileBlock{Bundle: &b, Reason: "discovery_unavailable: live reads are not configured",
+			Err: govErr(http.StatusServiceUnavailable, GovCodeDiscoveryUnavail, "AWS cannot be read through the discovery role right now.", nil)}, nil
 	}
 	newARN := "arn:" + arnPartition(c.RoleARN) + ":iam::" + c.AccountID + ":role" + di.NewRole.Path + di.NewRole.Name
-	live, err := a.live.ReadRole(ctx, LiveReadRequest{WorkspaceID: ws, ConnectorID: c.ConnectorID, AccountID: c.AccountID, RoleARN: c.RoleARN, RoleID: c.RoleID})
-	if err != nil {
-		return nil, govErr(http.StatusServiceUnavailable, GovCodeDiscoveryUnavail, "AWS cannot be read through the discovery role right now.",
-			map[string]any{"reason": err.Error()})
-	}
-	nl, err := a.live.ReadRole(ctx, LiveReadRequest{WorkspaceID: ws, ConnectorID: c.ConnectorID, AccountID: c.AccountID, RoleARN: newARN})
-	if err != nil {
-		return nil, govErr(http.StatusServiceUnavailable, GovCodeDiscoveryUnavail, "AWS cannot be read through the discovery role right now.",
-			map[string]any{"reason": err.Error()})
+	var live, nl igagov.LiveRead
+	if err := call(ctx, func(ctx context.Context) error {
+		var e error
+		if live, e = a.live.ReadRole(ctx, LiveReadRequest{WorkspaceID: ws, ConnectorID: c.ConnectorID, AccountID: c.AccountID,
+			RoleARN: c.RoleARN, RoleID: c.RoleID}); e != nil {
+			return e
+		}
+		nl, e = a.live.ReadRole(ctx, LiveReadRequest{WorkspaceID: ws, ConnectorID: c.ConnectorID, AccountID: c.AccountID, RoleARN: newARN})
+		return e
+	}); err != nil {
+		if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
+			return nil, nil, err
+		}
+		return nil, &compileBlock{Bundle: &b, Reason: "discovery_unavailable: " + err.Error(),
+			Err: govErr(http.StatusServiceUnavailable, GovCodeDiscoveryUnavail, "AWS cannot be read through the discovery role right now.",
+				map[string]any{"reason": err.Error()})}, nil
 	}
 	live.Roles = map[string]*igagov.LiveRole{newARN: nl.Role}
 	if live.ReadAt.IsZero() {
@@ -630,7 +679,11 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 	}
 	iso, err := a.isolationInput(ctx, ws, c, di)
 	if err != nil {
-		return nil, err
+		var ge *GovError
+		if errors.As(err, &ge) {
+			return nil, &compileBlock{Bundle: &b, Reason: ge.Code + ": " + ge.Message, Err: ge}, nil
+		}
+		return nil, nil, err
 	}
 	in := igagov.SplitInput{
 		Control: igagov.ControlRef{ID: c.ID.String(), PolicyID: c.PolicyID.String(), AccountID: c.AccountID, RoleID: c.RoleID,
@@ -649,23 +702,36 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 	if basis.HasRun {
 		in.ScanEvidence = basis.Run.ResourcePolicy
 	}
+	blocked := func(err error) (*compiledTarget, *compileBlock, error) {
+		var ce *igagov.CompileError
+		if !errors.As(err, &ce) {
+			return nil, nil, err
+		}
+		ge, _ := compileErrorAsGov(err, c.RoleID).(*GovError)
+		return nil, &compileBlock{Bundle: &b, Reason: ce.Code + ": " + strings.Join(ce.Reasons, "; "), Err: ge}, nil
+	}
 	sp, err := igagov.CompileSplit(in)
 	if err != nil {
-		return nil, compileErrorAsGov(err, c.RoleID)
+		return blocked(err)
 	}
-	if !sp.Split.Eligible() {
-		return nil, govUnprocessable(GovCodeTargetIneligible, "The dedicated identity cannot be proposed.", map[string]any{"targets": []any{
-			map[string]any{"target_id": t.ID, "role_id": c.RoleID, "reasons": sp.Split.Refusals, "ineligible_reason": sp.Split.IneligibleReason}}})
-	}
-	if di.Delivery == igagov.DeliveryIaCPR {
+	if sp.Split.Eligible() && di.Delivery == igagov.DeliveryIaCPR {
 		f, err := DecideIaCForm(ctx, db, a.iacGitHub(), ws, c, sp.Split, map[string]string{}, "", false)
 		if err != nil {
-			return nil, err
+			if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
+				return nil, nil, err
+			}
+			var ge *GovError
+			if errors.As(err, &ge) {
+				return nil, &compileBlock{Bundle: &b, Reason: ge.Code + ": " + ge.Message, Err: ge}, nil
+			}
+			return nil, &compileBlock{Bundle: &b, Reason: GovCodeIaCUnavailable + ": " + err.Error(),
+				Err: govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "The mapped IaC source could not be read.",
+					map[string]any{"reason": err.Error(), "role_id": c.RoleID})}, nil
 		}
 		if f.Fallback != nil {
 			in.Intent.Delivery = igagov.DeliveryExport
 			if sp, err = igagov.CompileSplit(in); err != nil {
-				return nil, compileErrorAsGov(err, c.RoleID)
+				return blocked(err)
 			}
 			note := iacFallbackNote(f.Fallback)
 			sp.Split.Diff.Notes = append(sp.Split.Diff.Notes, note)
@@ -674,13 +740,17 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 			}
 		}
 	}
-	ct := &compiledTarget{Target: t, Control: c, Bundle: b, Plans: igagov.TargetPlans{Apply: sp.Split, Undo: sp.Revert}, ReadAt: live.ReadAt}
+	return &compiledTarget{Target: t, Control: c, Bundle: b, Plans: igagov.TargetPlans{Apply: sp.Split, Undo: sp.Revert}, ReadAt: live.ReadAt}, nil, nil
+}
+
+// persistIsolationProposal stores a compiled dedicated-identity target as
+// the version's current plans and moves the version to in_review.
+func (a *GovAuthoring) persistIsolationProposal(ctx context.Context, ws, actor, policyID uuid.UUID, no int, v *models.IGAGovPolicyVersion,
+	c models.IGAGovControl, ct *compiledTarget) (*ProposeResult, error) {
+	db := a.db.WithContext(ctx)
 	k, aid := userActor(actor)
-	if err := a.storeCompiled(ctx, ws, []*compiledTarget{ct}, k, aid); err != nil {
-		return nil, err
-	}
 	var out ProposeResult
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err := db.Transaction(func(tx *gorm.DB) error {
 		cur, err := a.loadVersion(tx, ws, policyID, no, true)
 		if err != nil {
 			return err

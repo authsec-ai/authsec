@@ -211,6 +211,76 @@ func (a *GovAuthoring) versionTargets(db *gorm.DB, ws, versionID uuid.UUID) ([]m
 	return ts, cs, nil
 }
 
+// GovCodeTargetDeployed refuses to recompile or revalidate (and so to
+// supersede) the plans of a target that already carries a deployment of
+// its version (fix/p3-appr P0-2).
+const GovCodeTargetDeployed = "target_deployed"
+
+// govDeployedStates are the states of a FORWARD deployment (apply, split,
+// remove_control) in which its role carries -- or may carry -- the
+// deployment's change in AWS; govInFlightStates are those of any deployment
+// (an undo included) that is changing the role right now.
+var (
+	govDeployedStates = []string{models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved,
+		models.GovDeployRecovered, models.GovDeployAwaitingMerge, models.GovDeployAwaitingApply, models.GovDeployAppliedUnverified,
+		models.GovDeployVerified, models.GovDeployDrifted}
+	govInFlightStates = []string{models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved,
+		models.GovDeployAwaitingMerge, models.GovDeployAwaitingApply}
+)
+
+// deployedTargets is the set of a version's targets that already carry a
+// deployment of that version (other than `except`): a forward deployment in
+// govDeployedStates, or any deployment in govInFlightStates.
+//
+// fix/p3-appr (P0-2, SPEC §2.8 "revalidation before stale deployments",
+// §8.3, A59): such a target's live state now includes this version's own
+// change (the AuthSec boundary it installed, its own document), so a
+// recompile against it differs from the approved plan for a reason that is
+// not a material change -- the precondition, the ops ([] "already in
+// place") and first_attachment all reflect AuthSec's own write. Its approved
+// plan is therefore never recompiled, revalidated or superseded: the
+// compile_plans job and a re-proposal skip it, and revalidate refuses it
+// (409 target_deployed). DECISION: a queued, blocked or failed deployment
+// has changed nothing (a queued one is revalidated by the deploy job when
+// it starts); a verified undo returned the role to its before-state (the
+// forward deployment is then `undone`), so the target is revalidated again
+// before a re-apply.
+func deployedTargets(db *gorm.DB, ws, versionID, except uuid.UUID) (map[uuid.UUID]bool, error) {
+	var ids []uuid.UUID
+	if err := db.Raw(`SELECT DISTINCT p.target_id FROM iga_gov_deployment d
+		JOIN iga_gov_plan p ON p.workspace_id = d.workspace_id AND p.id = d.plan_id
+		WHERE d.workspace_id = ? AND d.version_id = ? AND d.id <> ?
+		  AND ((d.kind IN ('apply','split','remove_control') AND d.state IN ?) OR d.state IN ?)`,
+		ws, versionID, except, govDeployedStates, govInFlightStates).Scan(&ids).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// compileForVersion compiles one target of a stored version in memory, by
+// the version's intent kind: right_size_services (compileOne) or
+// dedicated_identity (compileIsolationOne, fix/p3-appr P1-10). Other kinds
+// (remove_control) are not recompiled here.
+func (a *GovAuthoring) compileForVersion(ctx context.Context, ws uuid.UUID, v models.IGAGovPolicyVersion, t models.IGAGovTarget,
+	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+	pi, err := igagov.ParseIntent(v.Intent)
+	if err != nil {
+		return nil, nil, fmt.Errorf("version %s intent: %w", v.ID, err)
+	}
+	if pi.Kind == igagov.IntentDedicatedIdentity && pi.DedicatedIdentity != nil {
+		return a.compileIsolationOne(ctx, ws, *pi.DedicatedIdentity, t, c, call)
+	}
+	intent, err := storedRightSize(v)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a.compileOne(ctx, ws, intent, t, c, call)
+}
+
 func storedRightSize(v models.IGAGovPolicyVersion) (igagov.RightSizeIntent, error) {
 	in, err := igagov.ParseIntent(v.Intent)
 	if err != nil {
@@ -427,9 +497,18 @@ func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUI
 	if err != nil {
 		return nil, err
 	}
+	// fix/p3-appr (P0-2): a re-proposal (in review again after a material
+	// change) keeps the plans of targets that already carry a deployment.
+	deployed, err := deployedTargets(db, ws, v.ID, uuid.Nil)
+	if err != nil {
+		return nil, err
+	}
 	var cts []*compiledTarget
 	var ineligible []map[string]any
 	for _, t := range ts {
+		if deployed[t.ID] {
+			continue
+		}
 		ct, blk, err := a.compileOne(ctx, ws, intent, t, cs[t.ID], directCall)
 		if err != nil {
 			return nil, err
@@ -476,6 +555,11 @@ func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUI
 			planIDs = append(planIDs, ap.ID)
 			if up != nil {
 				planIDs = append(planIDs, up.ID)
+			}
+		}
+		for _, t := range ts {
+			if p, ok := before[t.ID]; ok && deployed[t.ID] {
+				applies = append(applies, summary(p, cs[t.ID])) // kept as approved
 			}
 		}
 		reproposed := cur.Status == "in_review"
@@ -764,13 +848,25 @@ func (a *GovAuthoring) CompilePlansHandler(ctx context.Context, run *PolicyJobRu
 	call := func(ctx context.Context, fn func(ctx context.Context) error) error { return run.External(ctx, 0, fn) }
 	switch v.Status {
 	case "approved":
-		plans, err := currentApplyPlans(db, ws, v.ID)
+		// fix/p3-appr (P0-2, §2.8): revalidation is "before stale
+		// deployments" -- only the forward plans (apply, split) of targets
+		// with no deployment of this version yet. A deployed target's plan
+		// is never revalidated or superseded: its role now carries this
+		// version's own change.
+		var plans []models.IGAGovPlan
+		if err := db.Where("workspace_id = ? AND version_id = ? AND kind IN ? AND superseded_at IS NULL", ws, v.ID,
+			[]string{igagov.PlanApply, igagov.PlanSplit}).Find(&plans).Error; err != nil {
+			return err
+		}
+		deployed, err := deployedTargets(db, ws, v.ID, uuid.Nil)
 		if err != nil {
 			return err
 		}
 		ids := make([]uuid.UUID, 0, len(plans))
 		for _, p := range plans {
-			ids = append(ids, p.ID)
+			if !deployed[p.TargetID] {
+				ids = append(ids, p.ID)
+			}
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 		for _, id := range ids {
@@ -808,8 +904,18 @@ func (a *GovAuthoring) recompile(ctx context.Context, ws uuid.UUID, v models.IGA
 	if err != nil {
 		return err
 	}
+	// fix/p3-appr (P0-2): targets that already carry a deployment of this
+	// version (in review again after a material change elsewhere) keep
+	// their plans.
+	deployed, err := deployedTargets(a.db.WithContext(ctx), ws, v.ID, uuid.Nil)
+	if err != nil {
+		return err
+	}
 	var cts []*compiledTarget
 	for _, t := range ts {
+		if deployed[t.ID] {
+			continue
+		}
 		ct, blk, err := a.compileOne(ctx, ws, intent, t, cs[t.ID], call)
 		if err != nil {
 			return err
@@ -893,7 +999,11 @@ type GovRevalidation struct {
 //     the live read failed; nothing is recompiled or stored but the row.
 //
 // The plan must be one the version's live approval names (409 plan_changed
-// otherwise). Without any complete evaluation there is no bundle to record
+// otherwise), and its target must not already carry a deployment of the
+// version (409 target_deployed, fix/p3-appr P0-2: the role then includes
+// this version's own change, which is never a material change). A
+// dedicated-identity version's split / split_revert plans are recompiled
+// with CompileSplit (fix/p3-appr P1-10). Without any complete evaluation there is no bundle to record
 // against, and an error is returned instead of a row.
 func (a *GovAuthoring) Revalidate(ctx context.Context, ws, planID uuid.UUID) (*GovRevalidation, error) {
 	return a.revalidate(ctx, ws, planID, directCall, a.plainTx)
@@ -920,9 +1030,13 @@ func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, cal
 		return nil, govConflict("plan_changed", "This plan is not the approved plan of its version.",
 			map[string]any{"plan_id": p.ID, "version_status": v.Status})
 	}
-	intent, err := storedRightSize(v)
-	if err != nil {
+	// fix/p3-appr (P0-2): never revalidate (and so never supersede) the
+	// plan of a target that already carries a deployment of this version.
+	if dep, err := deployedTargets(db, ws, v.ID, uuid.Nil); err != nil {
 		return nil, err
+	} else if dep[p.TargetID] {
+		return nil, govConflict(GovCodeTargetDeployed, "This target already carries a deployment of this version; its approved plan is not revalidated.",
+			map[string]any{"plan_id": p.ID, "target_id": p.TargetID})
 	}
 	var t models.IGAGovTarget
 	if err := db.Where("workspace_id = ? AND id = ?", ws, p.TargetID).Take(&t).Error; err != nil {
@@ -932,7 +1046,9 @@ func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, cal
 	if err := db.Where("workspace_id = ? AND id = ?", ws, p.ControlID).Take(&c).Error; err != nil {
 		return nil, err
 	}
-	ct, blk, err := a.compileOne(ctx, ws, intent, t, c, call)
+	// fix/p3-appr (P1-10): a dedicated-identity version (split /
+	// split_revert) is recompiled in memory like a right-size one.
+	ct, blk, err := a.compileForVersion(ctx, ws, v, t, c, call)
 	if err != nil {
 		return nil, err
 	}
@@ -950,9 +1066,9 @@ func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, cal
 		switch {
 		case !ct.Plans.Apply.Eligible():
 			reason = "target_ineligible: " + ct.Plans.Apply.IneligibleReason
-		case p.Kind == igagov.PlanApply:
+		case p.Kind == igagov.PlanApply || p.Kind == igagov.PlanSplit:
 			np = &ct.Plans.Apply
-		case p.Kind == igagov.PlanUndo && ct.Plans.Undo != nil:
+		case (p.Kind == igagov.PlanUndo || p.Kind == igagov.PlanSplitRevert) && ct.Plans.Undo != nil:
 			np = ct.Plans.Undo
 		default:
 			reason = "plan_kind_not_recompiled: " + p.Kind
@@ -1004,6 +1120,14 @@ func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, cal
 			}
 			if cur.SupersededAt != nil {
 				return govConflict("plan_changed", "The approved plan was superseded meanwhile.", map[string]any{"plan_id": p.ID})
+			}
+			// fix/p3-appr (P0-2): nor may a deployment of this target have
+			// started meanwhile -- its plan is then never superseded.
+			if dep, err := deployedTargets(tx, ws, v.ID, uuid.Nil); err != nil {
+				return err
+			} else if dep[p.TargetID] {
+				return govConflict(GovCodeTargetDeployed, "A deployment of this target started meanwhile; its approved plan is kept.",
+					map[string]any{"plan_id": p.ID, "target_id": p.TargetID})
 			}
 		}
 		if err := tx.Create(&rv).Error; err != nil {

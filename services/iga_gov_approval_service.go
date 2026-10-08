@@ -40,6 +40,9 @@ const (
 	GovCodeRevalidationNeeded  = "revalidation_required"
 	GovCodeRevalidationBlocked = "revalidation_blocked"
 	GovCodeMaterialChange      = "material_change"
+	// GovCodeOwnerGateUnavailable (503): Approve refuses while the owner
+	// gate hook is not installed (fix/p3-appr P1-4).
+	GovCodeOwnerGateUnavailable = "owner_gate_unavailable"
 )
 
 // GovAcceptanceInput is one accepted item in an approval body.
@@ -213,11 +216,17 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 				return err
 			}
 		}
-		if h := a.hooks().OwnerGate; h != nil {
-			if err := h(tx, GovApprovalCheck{WorkspaceID: ws, PolicyID: policyID, VersionID: v.ID, ApproverID: approver,
-				Intent: intent, ApplyPlans: applies, ImpactHashes: cur.ImpactHashes}); err != nil {
-				return err
-			}
+		// fix/p3-appr (P1-4): the owner gate FAILS CLOSED. Without the hook
+		// (the policy runtime not installed yet, or a build without T3.12's
+		// wiring) no approval is recorded: 503 owner_gate_unavailable.
+		h := a.hooks().OwnerGate
+		if h == nil {
+			return govErr(http.StatusServiceUnavailable, GovCodeOwnerGateUnavailable,
+				"The owner review gate is not available on this server yet; no approval can be recorded. Try again shortly.", nil)
+		}
+		if err := h(tx, GovApprovalCheck{WorkspaceID: ws, PolicyID: policyID, VersionID: v.ID, ApproverID: approver,
+			Intent: intent, ApplyPlans: applies, ImpactHashes: cur.ImpactHashes}); err != nil {
+			return err
 		}
 		items, err := requiredAcceptances(tx, ws, plans)
 		if err != nil {
@@ -542,6 +551,22 @@ type GovUsableApproval struct {
 // under 24 hours -- so a scan published after the last revalidation needs
 // another one. It writes nothing.
 func (a *GovAuthoring) UsableApproval(ctx context.Context, ws, versionID uuid.UUID, planIDs []uuid.UUID) (*GovUsableApproval, error) {
+	return a.usableApproval(ctx, ws, versionID, planIDs, true)
+}
+
+// ApprovalInForce is UsableApproval WITHOUT the evidence-freshness rule:
+// every authority check of the approval itself (in force, unexpired,
+// intent unchanged, the approver still an active member holding
+// governance:approve who is not the author, each plan current and named).
+// fix/p3-appr (P1-10): a remove_control deployment is authorised by it
+// (§8.10 "an approval by someone other than the requester, like any
+// version"); its plan restores a recorded baseline and is not recompiled,
+// so its safety against a changed role is the live classification.
+func (a *GovAuthoring) ApprovalInForce(ctx context.Context, ws, versionID uuid.UUID, planIDs []uuid.UUID) (*GovUsableApproval, error) {
+	return a.usableApproval(ctx, ws, versionID, planIDs, false)
+}
+
+func (a *GovAuthoring) usableApproval(ctx context.Context, ws, versionID uuid.UUID, planIDs []uuid.UUID, checkFresh bool) (*GovUsableApproval, error) {
 	db := a.db.WithContext(ctx)
 	var v models.IGAGovPolicyVersion
 	if err := db.Where("workspace_id = ? AND id = ?", ws, versionID).Take(&v).Error; err != nil {
@@ -593,6 +618,10 @@ func (a *GovAuthoring) UsableApproval(ctx context.Context, ws, versionID uuid.UU
 		}
 		if p.SupersededAt != nil || !containsStr(ap.PlanHashes, p.PlanHash) {
 			return nil, govConflict(GovCodePlanChanged, "This plan is not the approved plan.", map[string]any{"plan_id": p.ID})
+		}
+		if !checkFresh {
+			out.Revalidations[p.ID] = nil
+			continue
 		}
 		fresh, why, err := a.EvidenceFreshness(ctx, ws, p.ID)
 		if err != nil {

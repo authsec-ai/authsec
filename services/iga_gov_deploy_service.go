@@ -481,21 +481,39 @@ func mustControlConnector(db *gorm.DB, ws, control uuid.UUID) uuid.UUID {
 // code (and message, detail) when the deployment may not proceed, or the
 // unchanged revalidation it relies on.
 //
-// DECISION (T3.16): apply deployments use T3.13's UsableApproval, and when
-// it answers revalidation_required the deploy job revalidates (fenced,
-// T3.11's revalidate) and asks again; material_change / revalidation_blocked
-// block the deployment with the changes. Undo, role-only recovery,
-// split_revert and remove_control are authorised by the approval naming the
-// plan's hash (§8.9: expiry and revocation do not disable undo; a
-// remove_control plan restores a recorded baseline and its precondition is
-// the artifact_state, so its safety is the live classification, not
-// evidence freshness, which T3.11 cannot recompile for that intent), or by
-// governance:emergency (emergency_by + reason, enforced by 051).
+// DECISION (T3.16, revised by fix/p3-appr P1-10 -- SPEC §2.8, §2.10, §8.4,
+// §8.9, §8.10, §11), by deployment kind:
+//
+//   - apply and split (FORWARD plans of a right-size or dedicated-identity
+//     version): T3.13's UsableApproval -- an approval in force, unexpired,
+//     the intent unchanged, the approver still an active member holding
+//     governance:approve who is not the author, the plan current and named
+//     -- and when it answers revalidation_required the deploy job
+//     revalidates (fenced, T3.11's revalidate; a dedicated-identity version
+//     is recompiled with CompileSplit) and asks again; material_change /
+//     revalidation_blocked block the deployment with the changes;
+//   - remove_control (a forward plan, §8.10 "an approval by someone other
+//     than the requester, like any version"): ApprovalInForce -- the same
+//     authority checks without evidence freshness: a removal restores a
+//     recorded baseline and is not recompiled, so its safety against a
+//     changed role is the live classification;
+//   - undo and split_revert (the INVERSE of an approved forward plan,
+//     including a role-only recovery plan): the approval naming the plan's
+//     hash. §8.9: "Approval expiry and revocation do not disable undo,
+//     because undo returns to the state that existed before that approval
+//     took effect" -- and for the same reason neither does the approver
+//     later losing governance:approve or membership. The requester's
+//     governance:enforce is checked by the undo route.
+//
+// Without an approval the deployment is an emergency (governance:emergency,
+// emergency_by + reason, enforced by 051).
 func (s *GovDeployments) authority(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, p models.IGAGovPlan) (string, string, map[string]any, *uuid.UUID, error) {
 	if d.ApprovalID == nil {
 		return "", "", nil, nil, nil // emergency: 051 iga_gov_pd_authority_chk
 	}
-	if d.Kind != igagov.PlanApply {
+	var ge *GovError
+	switch d.Kind {
+	case igagov.PlanUndo, igagov.PlanSplitRevert:
 		var ap models.IGAGovApproval
 		if err := run.DB().WithContext(ctx).Where("workspace_id = ? AND id = ?", d.WorkspaceID, *d.ApprovalID).Take(&ap).Error; err != nil {
 			return "", "", nil, nil, err
@@ -503,13 +521,25 @@ func (s *GovDeployments) authority(ctx context.Context, run *PolicyJobRun, d mod
 		if ap.Decision != "approve" || !containsStr(ap.PlanHashes, p.PlanHash) {
 			return GovCodeApprovalRequired, "The approval does not name this plan.", map[string]any{"approval_id": ap.ID, "plan_id": p.ID}, nil, nil
 		}
-		if d.Kind == igagov.PlanRemoveControl && (ap.RevokedAt != nil || !s.now().Before(ap.ExpiresAt)) {
-			return GovCodeApprovalExpired, "The approval of this control removal is no longer in force.", map[string]any{"approval_id": ap.ID}, nil, nil
+		return "", "", nil, nil, nil
+	case igagov.PlanRemoveControl:
+		ua, err := s.authoring.ApprovalInForce(ctx, d.WorkspaceID, d.VersionID, []uuid.UUID{d.PlanID})
+		if err != nil {
+			if errors.As(err, &ge) {
+				return ge.Code, ge.Message, ge.Detail, nil, nil
+			}
+			return "", "", nil, nil, err
+		}
+		if ua.Approval.ID != *d.ApprovalID {
+			return GovCodeApprovalInvalid, "The deployment names another approval than the one in force.",
+				map[string]any{"approval_id": ua.Approval.ID}, nil, nil
 		}
 		return "", "", nil, nil, nil
+	case igagov.PlanApply, igagov.PlanSplit:
+	default:
+		return GovCodeApprovalInvalid, "Unknown deployment kind " + d.Kind + ".", nil, nil, nil
 	}
 	ua, err := s.authoring.UsableApproval(ctx, d.WorkspaceID, d.VersionID, []uuid.UUID{d.PlanID})
-	var ge *GovError
 	if err != nil && errors.As(err, &ge) && ge.Code == GovCodeRevalidationNeeded {
 		call := func(ctx context.Context, fn func(ctx context.Context) error) error { return run.External(ctx, 0, fn) }
 		rv, rerr := s.authoring.revalidate(ctx, d.WorkspaceID, d.PlanID, call, run.InTx)

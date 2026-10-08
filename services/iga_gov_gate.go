@@ -132,6 +132,14 @@ func (g *PolicyGate) Verify(db *gorm.DB) error {
 	if g.badValue != "" {
 		return fmt.Errorf("%s", g.badValue)
 	}
+	return g.checkSchema(db, true)
+}
+
+// checkSchema runs VerifyPolicySchema and records a failure's reason. On
+// success it marks the gate verified only when markVerified is set;
+// otherwise the schema head is recorded and the gate stays unavailable
+// until markReady (VerifyUntilReady's ready hooks must run first).
+func (g *PolicyGate) checkSchema(db *gorm.DB, markVerified bool) error {
 	g.mu.RLock()
 	done := g.verified
 	g.mu.RUnlock()
@@ -145,14 +153,35 @@ func (g *PolicyGate) Verify(db *gorm.DB) error {
 		g.reason = err.Error()
 		return err
 	}
-	g.verified, g.reason, g.schemaHead = true, "", PolicySchemaHead
+	g.schemaHead = PolicySchemaHead
+	if markVerified {
+		g.verified, g.reason = true, ""
+	} else {
+		g.reason = "the Phase 3 schema (047-" + PolicySchemaHead + ") is verified; the policy runtime is being installed"
+	}
 	return nil
 }
 
-// VerifyUntilReady retries Verify until it succeeds or ctx ends, logging each
-// decision. A transient error is retried, never cached as an answer. Each
-// onReady runs once, after the FIRST successful verification (T3.08: the
-// policy job worker starts there, never before the schema is verified).
+// markReady makes a schema-verified gate available.
+func (g *PolicyGate) markReady() {
+	g.mu.Lock()
+	g.verified, g.reason = true, ""
+	g.mu.Unlock()
+}
+
+// VerifyUntilReady retries the schema check until it succeeds or ctx ends,
+// logging each decision. A transient error is retried, never cached as an
+// answer. Each onReady runs once, after the FIRST successful schema check
+// (T3.08: the policy job worker starts there, never before the schema is
+// verified).
+//
+// fix/p3-appr (P1-4): the gate reports verified -- and so serves the policy
+// routes and lets the job worker claim -- only AFTER every onReady has
+// returned. cmd/main.go installs the policy runtime there
+// (InstallGovPolicyRuntime: the owner gate and the other authoring hooks,
+// then the Slack app's chained hooks), so no request is ever served while
+// those hooks are absent; until then Status is misconfigured with the
+// reason "... the policy runtime is being installed".
 func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval time.Duration, onReady ...func()) {
 	if !g.Enabled() {
 		return
@@ -161,8 +190,19 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 		interval = 30 * time.Second
 	}
 	for {
-		err := g.Verify(db)
+		var err error
+		if g.badValue != "" {
+			err = fmt.Errorf("%s", g.badValue)
+		} else {
+			err = g.checkSchema(db, false)
+		}
 		if err == nil {
+			for _, f := range onReady {
+				if f != nil {
+					f()
+				}
+			}
+			g.markReady()
 			state, reason, _ := g.Status()
 			if state == PolicyOn {
 				log.Printf("[policy] %s=on: Phase 3 schema verified at %s; policy routes served", PolicyEnv, PolicySchemaHead)
@@ -171,11 +211,6 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 				// it on every request, so the routes open the moment it is.
 				log.Printf("[policy] %s=on: Phase 3 schema verified at %s, but unavailable until the graph is: %s",
 					PolicyEnv, PolicySchemaHead, reason)
-			}
-			for _, f := range onReady {
-				if f != nil {
-					f()
-				}
 			}
 			return
 		}
