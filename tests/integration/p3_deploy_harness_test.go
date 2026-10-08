@@ -277,3 +277,12 @@ func govCode(err error) string {
 	}
 	return ""
 }
+
+// role is x3Lab.role with the production workspace tag value
+// (services.GovWorkspaceRef), which every T3.16 compile (role-only
+// recovery, control removal) uses.
+func (d *dLab) role(name, path string, tags map[string]string) *x3Role {
+	x := d.x3Lab.role(name, path, tags)
+	x.ref.WorkspaceRef = services.GovWorkspaceRef(d.ws)
+	return x
+}
