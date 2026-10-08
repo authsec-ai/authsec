@@ -134,6 +134,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/policies/:id/versions/:no", require("governance", "read"), ctl.GetVersion)
 	g.POST("/policies/:id/versions/:no/propose", require("governance", "author"), ctl.ProposeVersion)
 	g.GET("/policies/:id/versions/:no/plans", require("governance", "read"), ctl.VersionPlans)
+	// §7.3 J1 export (T3.17, iga_gov_export_controller.go).
+	g.GET("/policies/:id/versions/:no/export", require("governance", "read"), ctl.ExportVersion)
 	g.POST("/policies/:id/versions/:no/withdraw", require("governance", "author"), ctl.WithdrawVersion)
 
 	// §7.5 approval (T3.13, iga_gov_approval_controller.go). Rollout is T3.15.
@@ -206,8 +208,11 @@ var policyFeatures = []policyFeature{
 	{"findings", true, ""},
 	// T3.11 / T3.13: proposals, versions, plans and approval (§7.3, §7.5).
 	{"proposals", true, ""},
-	{"export", false, "Policy export is not available in this build yet."},
-	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released."},
+	// T3.17: J1 export (GET .../export, export deployments) and J2 IaC
+	// delivery (IaC sources under /authsec/discovery/aws, the PR adapter,
+	// iac_sync).
+	{"export", true, ""},
+	{"iac", true, ""},
 	// T3.09 ships the enforcement role binding (§7.9, under
 	// /authsec/discovery/aws/connectors/:id/enforcement); the flag stays
 	// false because direct enforcement also needs the AWS enforcement adapter

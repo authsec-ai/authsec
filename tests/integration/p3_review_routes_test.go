@@ -354,7 +354,7 @@ func TestP3T320Settings(t *testing.T) {
 			dig(body, "data", "notifications", "copied_from_legacy_at") == nil {
 			t.Fatalf("GET %d after the copy: %d %v", i, code, body)
 		}
-		if strings.Contains(string(mustJSON(body)), "legacy-secret") {
+		if strings.Contains(string(mustJSONRaw(body)), "legacy-secret") {
 			t.Fatal("GET /settings returned the webhook secret")
 		}
 	}
@@ -440,7 +440,7 @@ func TestP3T320Settings(t *testing.T) {
 	}
 }
 
-func mustJSON(v any) []byte {
+func mustJSONRaw(v any) []byte {
 	raw, _ := json.Marshal(v)
 	return raw
 }

@@ -555,6 +555,13 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobCompilePlans,
 		Handler: NewGovAuthoring(db, ProcessGovLiveReader()).CompilePlansHandler,
 		Backoff: func(n int) time.Duration { return time.Duration(n) * time.Minute }})
+
+	// T3.17: iac_sync (PR state, merge, awaiting_apply -> applied_unverified,
+	// §8.11) replaces the no-op; the GitHub adapter and the live reader are
+	// the process-wide ones, read at call time.
+	w.Register(PolicyJobKind{Kind: repositories.GovJobIaCSync,
+		Handler: NewGovIaCDelivery(db, nil, ProcessGovLiveReader()).SyncHandler,
+		Backoff: func(n int) time.Duration { return time.Duration(n) * 5 * time.Minute }})
 	return w
 }
 

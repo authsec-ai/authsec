@@ -1098,6 +1098,10 @@ func (a *GovAuthoring) CreateVersion(ctx context.Context, ws, actor, policyID uu
 	if _, err := a.loadPolicy(a.db.WithContext(ctx), ws, policyID, false); err != nil {
 		return nil, err
 	}
+	// T3.17: a dedicated_identity intent is its own flow (iga_gov_isolation.go).
+	if pi, perr := igagov.ParseIntent(raw); perr == nil && pi.Kind == igagov.IntentDedicatedIdentity {
+		return a.createIsolationVersion(ctx, ws, actor, policyID, baseNo, &pi)
+	}
 	if _, _, _, err := parseRightSize(raw); err != nil {
 		return nil, err
 	}
