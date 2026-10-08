@@ -101,14 +101,14 @@ type Config struct {
 	// Requires XAA_NATIVE_SEALER. token-exchange is only advertised in AS
 	// metadata when this flag is on.
 	XAAIssuance bool
-	// EnableEmbeddedSpire (default off) mounts the legacy embedded SPIRE control
+	// EnableEmbeddedSpire (default off) mounts the embedded SPIRE control
 	// plane: the /authsec/spire headless routes and the /authsec/spiresvc
-	// identity service. Those paths back onto internal/spire repositories that
-	// query control-plane tables (agents, workloads, certificates, …) which are
-	// not part of the single master bootstrap, so they 500 when mounted. Off by
-	// default quarantines them. The SPIFFE-SVID M2M path (service_accounts,
-	// application_spiffe_identities, external SPIFFE_OIDC_ISSUER verification) is
-	// independent of this flag and always available.
+	// identity service. It is workspace-scoped (AS-081): its spire_* tables
+	// are workspace-owned (migration 120) and every route takes its workspace
+	// from a verified credential, so it may run in production. The
+	// SPIFFE-SVID M2M path (service_accounts, application_spiffe_identities,
+	// external SPIFFE_OIDC_ISSUER verification) is independent of this flag
+	// and always available.
 	EnableEmbeddedSpire bool
 
 	// PolicyEngineMode controls the token-issuance PDP (internal/policy/).
@@ -443,13 +443,6 @@ func LoadConfig() *Config {
 		log.Fatalf("CRITICAL: invalid XAA feature flags: %v. Cannot start.", err)
 	}
 
-	// The embedded SPIRE control plane provisions PKI and SVIDs anonymously,
-	// trusts X-SPIFFE-ID / X-Tenant-ID and keeps untenanted tables (AS-081).
-	// It must not run where real tenants are.
-	if err := AppConfig.ValidateEmbeddedSpire(); err != nil {
-		log.Fatalf("CRITICAL: %v. Cannot start.", err)
-	}
-
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)
 	requiredSecrets := map[string]string{
 		"DB_USER":        dbUser,
@@ -468,19 +461,6 @@ func LoadConfig() *Config {
 	}
 
 	return AppConfig
-}
-
-// ValidateEmbeddedSpire refuses ENABLE_EMBEDDED_SPIRE in production and
-// staging: the legacy control plane is not tenant-safe (AS-081).
-func (c *Config) ValidateEmbeddedSpire() error {
-	if c == nil || !c.EnableEmbeddedSpire {
-		return nil
-	}
-	switch strings.ToLower(c.Environment) {
-	case "production", "staging":
-		return fmt.Errorf("ENABLE_EMBEDDED_SPIRE is not allowed in %s: the embedded SPIRE control plane is not tenant-safe (AS-081)", c.Environment)
-	}
-	return nil
 }
 
 // ValidateXAAFlags checks the dependencies between the XAA feature flags:
