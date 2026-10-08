@@ -171,6 +171,13 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRoleOnlyRecoveryPlan, GovCatUndo, GovObjDeployment, "A role-only recovery plan was compiled for a blocked undo."},
 	{GovEventControlRemovalReq, GovCatControlRemoval, GovObjPolicy, "Removing AuthSec control was requested (review, or emergency)."},
 	{GovEventControlRemoved, GovCatControlRemoval, GovObjPolicy, "AuthSec control of a role ended; the control is retired."},
+	// T3.14 Slack app (slack_integration_service.go, slack_integration_interactions.go).
+	// DECISION: §9.6 names no Slack category; they are notification events.
+	{GovEventSlackInstalled, GovCatNotification, "", "The Slack app was installed (or reinstalled) for the workspace."},
+	{GovEventSlackSettings, GovCatNotification, "", "The Slack approvals channel was changed."},
+	{GovEventSlackDisconnected, GovCatNotification, "", "Slack was disconnected: token revoked, member links removed."},
+	{GovEventSlackUserLinked, GovCatNotification, "", "A Slack user was linked to a member (verified email or console confirmation)."},
+	{GovEventSlackActionReceived, GovCatNotification, GovObjNotification, "An authenticated Slack action was received on a notice (before authorization)."},
 }
 
 // Object kinds the events API filters on.
