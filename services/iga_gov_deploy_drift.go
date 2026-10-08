@@ -179,17 +179,17 @@ func (s *GovDeployments) recordDrift(ctx context.Context, run *PolicyJobRun, d m
 				payload["severity"] = "high"
 				payload["note"] = "AuthSec does not detach its policy from the other entity; undo and re-apply are restricted to role-only plans."
 			}
-			if err := s.sysEvent(tx, *cur, GovEventDeploymentDrifted, payload); err != nil {
+			if err := s.event(tx, *cur, GovEventDeploymentDrifted, payload); err != nil {
 				return err
 			}
 			if reason == DriftLateMutation {
-				if err := s.sysEvent(tx, *cur, GovEventDriftLateMutation, map[string]any{"underlying": sub,
+				if err := s.event(tx, *cur, GovEventDriftLateMutation, map[string]any{"underlying": sub,
 					"note": "A change matching an earlier unknown request appeared; nothing was re-applied or reverted."}); err != nil {
 					return err
 				}
 			}
 			if reason == DriftTargetGone {
-				return s.sysEvent(tx, *cur, GovEventControlRoleGone, map[string]any{"control_id": d.ControlID, "reason": "role_gone"})
+				return s.event(tx, *cur, GovEventControlRoleGone, map[string]any{"control_id": d.ControlID, "reason": "role_gone"})
 			}
 			return nil
 		}
@@ -306,7 +306,7 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 		return err
 	}
 	if err := run.InTx(ctx, func(tx *gorm.DB) error {
-		return s.sysEvent(tx, *d, GovEventUnknownReading, map[string]any{"attempt_id": this.AttemptID, "resolution": this.Resolution,
+		return s.event(tx, *d, GovEventUnknownReading, map[string]any{"attempt_id": this.AttemptID, "resolution": this.Resolution,
 			"read_at": this.ReadAt, "trail": this.Trail, "classification": rd.Resolution.Classification})
 	}); err != nil {
 		return err
@@ -403,7 +403,7 @@ func (s *GovDeployments) markUnresolved(ctx context.Context, run *PolicyJobRun, 
 				", CloudTrail " + orNone(this.Trail)}); err != nil {
 			return err
 		}
-		return s.sysEvent(tx, d, GovEventDeploymentUnresolved, map[string]any{"readings": []unknownReading{*prev, this},
+		return s.event(tx, d, GovEventDeploymentUnresolved, map[string]any{"readings": []unknownReading{*prev, this},
 			"choices":     []string{"reread", "accept_observed", "emergency_undo"},
 			"assigned_to": "the policy owner and every holder of governance:enforce"})
 	})

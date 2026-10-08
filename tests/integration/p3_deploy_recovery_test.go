@@ -161,7 +161,6 @@ func TestP3T316UnresolvedOperatorAndAtomicHandoffA58(t *testing.T) {
 	}
 }
 
-
 // A50 (c): an evaluation-shaped transaction that holds the controls (the
 // §8.2 order: controls, posture, findings) and an enforcement observer on
 // one of those roles wait for each other instead of deadlocking, in both
@@ -470,6 +469,28 @@ func TestP3T316DeploymentRoutes(t *testing.T) {
 		map[string]any{"control_ids": []string{x.control.String()}, "reason": "x"}); code != 403 {
 		t.Fatalf("emergency removal without governance:emergency: %d", code)
 	}
+
+	// Every remaining mutating route answers 2xx with its event and audit row.
+	euser, emem := d.memberM("governance:read", "governance:author", "governance:enforce", "governance:emergency")
+	tok = api.token(d.ws, euser, emem, all+" governance:emergency")
+	x2 := d.role("RouteRole2", "/", nil)
+	tp2 := d.compile(d.fake.Discovery(), x2, "sqs")
+	dep2 := d.applyAndVerify(x2, d.storeApproved(x2, tp2.Apply, *tp2.Undo))
+	mut("/deployments/"+dep2.String()+"/emergency-undo", map[string]any{"reason": "incident"}, 201)
+	x3 := d.role("RouteRole3", "/", nil)
+	tp3 := d.compile(d.fake.Discovery(), x3, "sqs")
+	d.applyAndVerify(x3, d.storeApproved(x3, tp3.Apply, *tp3.Undo))
+	resp = mut("/policies/"+x3.policy.String()+"/remove-control", map[string]any{"control_ids": []string{x3.control.String()}, "reason": "done"}, 201)
+	if digs(resp, "data", "version_id") == "" {
+		t.Fatalf("remove-control: %v", resp)
+	}
+	x4 := d.role("RouteRole4", "/", nil)
+	tp4 := d.compile(d.fake.Discovery(), x4, "sqs")
+	d.applyAndVerify(x4, d.storeApproved(x4, tp4.Apply, *tp4.Undo))
+	mut("/policies/"+x4.policy.String()+"/emergency-remove-control", map[string]any{"control_ids": []string{x4.control.String()}, "reason": "incident"}, 201)
+	_, _, held := dUnknownApply(t, d, "RouteHeld")
+	p3exec(t, d.db, `UPDATE iga_gov_deployment SET settle_after = now() - interval '1 minute' WHERE id = ?`, held)
+	mut("/deployments/"+held.String()+"/resolve", map[string]any{"action": "reread", "reason": "check"}, 200)
 	_ = errors.New
 }
 

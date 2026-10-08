@@ -112,7 +112,7 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 		if err := s.writeValidationResultsTx(tx, *d, cr.Validations); err != nil {
 			return err
 		}
-		return s.sysEvent(tx, *d, GovEventVerificationRecorded, map[string]any{"artifact": artifact, "graph": graph,
+		return s.event(tx, *d, GovEventVerificationRecorded, map[string]any{"artifact": artifact, "graph": graph,
 			"application_health": cr.ApplicationHealth.Outcome, "restriction": cr.Restriction.Outcome})
 	}); err != nil {
 		return err
@@ -490,7 +490,7 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 						"state_reason": "undone by deployment " + d.ID.String()}); err != nil {
 						return err
 					}
-					if err := s.sysEvent(tx, o2, GovEventDeploymentUndone, map[string]any{"undo_deployment_id": d.ID,
+					if err := s.event(tx, o2, GovEventDeploymentUndone, map[string]any{"undo_deployment_id": d.ID,
 						"message": "AuthSec's change was undone; other controls may still restrict this role."}); err != nil {
 						return err
 					}
@@ -499,7 +499,7 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 						"state_reason": "superseded by deployment " + d.ID.String()}); err != nil {
 						return err
 					}
-					if err := s.sysEvent(tx, o2, GovEventDeploymentSuperseded, map[string]any{"by": d.ID}); err != nil {
+					if err := s.event(tx, o2, GovEventDeploymentSuperseded, map[string]any{"by": d.ID}); err != nil {
 						return err
 					}
 				}
@@ -509,7 +509,7 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 					WHERE workspace_id = ? AND control_id = ? AND state IN ('intended','present','drifted')`, d.ID, ws, d.ControlID).Error; err != nil {
 					return err
 				}
-				if err := s.sysEvent(tx, d, GovEventControlRemoved, map[string]any{"control_id": d.ControlID, "enforcement_seq": newSeq,
+				if err := s.event(tx, d, GovEventControlRemoved, map[string]any{"control_id": d.ControlID, "enforcement_seq": newSeq,
 					"message": "AuthSec no longer controls this role; other controls may still restrict it."}); err != nil {
 					return err
 				}
@@ -523,7 +523,7 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 			if err := historyTx(tx, d, p, restr); err != nil {
 				return err
 			}
-			return s.sysEvent(tx, d, GovEventDeploymentVerified, map[string]any{"kind": d.Kind, "enforcement_seq": newSeq,
+			return s.event(tx, d, GovEventDeploymentVerified, map[string]any{"kind": d.Kind, "enforcement_seq": newSeq,
 				"boundary": inForce(live), "summary": verifiedSummary(d, cr)})
 		}
 		return o, nil

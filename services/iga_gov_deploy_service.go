@@ -48,7 +48,7 @@ import (
 
 // Deployment reasons this file names.
 const (
-	GovOutcomeOverdue = "overdue"
+	GovOutcomeOverdue             = "overdue"
 	DepReasonPolicyPaused         = "policy_paused"
 	DepReasonDeliveryUnavailable  = "delivery_not_available"
 	DepReasonApprovalMissingPlan  = "approval_does_not_name_plan"
@@ -65,32 +65,32 @@ const (
 
 // Event names (vocabulary: iga_gov_event_vocabulary.go).
 const (
-	GovEventDeploymentStarted     = "deployment.started"
-	GovEventDeploymentBlocked     = "deployment.blocked"
-	GovEventDeploymentFailed      = "deployment.failed"
-	GovEventDeploymentApplied     = "deployment.applied"
-	GovEventDeploymentVerified    = "deployment.verified"
-	GovEventDeploymentUndone      = "deployment.undone"
-	GovEventDeploymentSuperseded  = "deployment.superseded"
-	GovEventDeploymentDrifted     = "deployment.drifted"
-	GovEventDeploymentUnresolved  = "deployment.outcome_unresolved"
-	GovEventDeploymentRecovered   = "deployment.recovered"
-	GovEventDeploymentResolveReq  = "deployment.resolve_requested"
-	GovEventLedgerSettled         = "deployment.ledger_settled"
-	GovEventUnknownReading        = "deployment.unknown_reading"
-	GovEventVerificationRecorded  = "verification.recorded"
-	GovEventPostureChanged        = "posture.outcome_changed"
-	GovEventFindingPostureStatus  = "finding.posture_status"
-	GovEventValidationDeclared    = "validation.declared"
-	GovEventHealthReported        = "health_report.created"
-	GovEventUndoRequested         = "undo.requested"
-	GovEventEmergencyUndo         = "undo.emergency"
-	GovEventRoleOnlyRecoveryPlan  = "undo.role_only_recovery_compiled"
-	GovEventControlRemovalReq     = "control.removal_requested"
-	GovEventControlRemoved        = "control.removed"
-	GovEventControlRoleGone       = "control.role_gone"
-	GovEventDriftLateMutation     = "drift.late_mutation_suspected"
-	GovEventAcceptObservedOpened  = "deployment.accept_observed_opened"
+	GovEventDeploymentStarted    = "deployment.started"
+	GovEventDeploymentBlocked    = "deployment.blocked"
+	GovEventDeploymentFailed     = "deployment.failed"
+	GovEventDeploymentApplied    = "deployment.applied"
+	GovEventDeploymentVerified   = "deployment.verified"
+	GovEventDeploymentUndone     = "deployment.undone"
+	GovEventDeploymentSuperseded = "deployment.superseded"
+	GovEventDeploymentDrifted    = "deployment.drifted"
+	GovEventDeploymentUnresolved = "deployment.outcome_unresolved"
+	GovEventDeploymentRecovered  = "deployment.recovered"
+	GovEventDeploymentResolveReq = "deployment.resolve_requested"
+	GovEventLedgerSettled        = "deployment.ledger_settled"
+	GovEventUnknownReading       = "deployment.unknown_reading"
+	GovEventVerificationRecorded = "verification.recorded"
+	GovEventPostureChanged       = "posture.outcome_changed"
+	GovEventFindingPostureStatus = "finding.posture_status"
+	GovEventValidationDeclared   = "validation.declared"
+	GovEventHealthReported       = "health_report.created"
+	GovEventUndoRequested        = "undo.requested"
+	GovEventEmergencyUndo        = "undo.emergency"
+	GovEventRoleOnlyRecoveryPlan = "undo.role_only_recovery_compiled"
+	GovEventControlRemovalReq    = "control.removal_requested"
+	GovEventControlRemoved       = "control.removed"
+	GovEventControlRoleGone      = "control.role_gone"
+	GovEventDriftLateMutation    = "drift.late_mutation_suspected"
+	GovEventAcceptObservedOpened = "deployment.accept_observed_opened"
 )
 
 /* --------------------------------- seams ---------------------------------- */
@@ -311,7 +311,7 @@ func depRefs(d models.IGAGovDeployment, policy uuid.UUID) govEventRefs {
 	return r
 }
 
-func (s *GovDeployments) sysEvent(tx *gorm.DB, d models.IGAGovDeployment, name string, payload map[string]any) error {
+func (s *GovDeployments) event(tx *gorm.DB, d models.IGAGovDeployment, name string, payload map[string]any) error {
 	pol, _, err := s.policyOfVersion(tx, d.WorkspaceID, d.VersionID)
 	if err != nil {
 		return err
@@ -451,7 +451,7 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		if err := setStateTx(tx, *d, []string{models.GovDeployQueued}, set); err != nil {
 			return err
 		}
-		return s.sysEvent(tx, *d, GovEventDeploymentStarted, map[string]any{"kind": d.Kind, "delivery": d.Delivery,
+		return s.event(tx, *d, GovEventDeploymentStarted, map[string]any{"kind": d.Kind, "delivery": d.Delivery,
 			"plan_id": d.PlanID, "revalidation_id": revID, "emergency": d.ApprovalID == nil})
 	})
 	if errors.Is(err, errStateMoved) {
@@ -572,7 +572,7 @@ func (s *GovDeployments) stop(ctx context.Context, run *PolicyJobRun, d *models.
 		if cl != nil {
 			payload["classification"] = cl
 		}
-		return s.sysEvent(tx, *d, name, payload)
+		return s.event(tx, *d, name, payload)
 	})
 	if errors.Is(err, errStateMoved) {
 		return nil
@@ -632,7 +632,7 @@ func (s *GovDeployments) settleLedgerTx(tx *gorm.DB, d models.IGAGovDeployment) 
 		}
 		settled = append(settled, map[string]any{"kind": r.Kind, "native_arn": r.NativeARN, "to": to})
 	}
-	return s.sysEvent(tx, d, GovEventLedgerSettled, map[string]any{"rows": settled})
+	return s.event(tx, d, GovEventLedgerSettled, map[string]any{"rows": settled})
 }
 
 // applyOutcome maps T3.10's DeployOutcome to the state machine (the report
@@ -709,7 +709,7 @@ func (s *GovDeployments) applied(ctx context.Context, run *PolicyJobRun, d model
 		if err := enqueueJobTx(tx, d.WorkspaceID, repositories.GovJobVerify, d.ID, at); err != nil {
 			return err
 		}
-		return s.sysEvent(tx, d, GovEventDeploymentApplied, map[string]any{"applied_at": at, "verify_deadline_at": deadline,
+		return s.event(tx, d, GovEventDeploymentApplied, map[string]any{"applied_at": at, "verify_deadline_at": deadline,
 			"readback": out.Readback, "ops": out.Ops})
 	})
 	if errors.Is(err, errStateMoved) {
@@ -740,7 +740,7 @@ type DeploymentGateFacts struct {
 	UnexpectedFailure []igagov.UnexpectedFailure  `json:"unexpected_failures"`
 	Validations       []igagov.ValidationResult   `json:"validations"`
 	ServiceRestrict   map[string]string           `json:"service_restriction"`
-	CheckedAt         map[string]time.Time            `json:"checked_at"`
+	CheckedAt         map[string]time.Time        `json:"checked_at"`
 }
 
 // GovDimensionFact is one dimension's last result.

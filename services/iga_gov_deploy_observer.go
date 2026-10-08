@@ -271,7 +271,7 @@ func (s *GovDeployments) observeTx(tx *gorm.DB, o *govObservation) ([]govPosture
 		changes = append(changes, govPostureChange{Service: sd.Service, From: "", To: out})
 	}
 	for _, ch := range changes {
-		if err := s.sysEvent(tx, o.Dep, GovEventPostureChanged, map[string]any{"control_id": c.ID, "role_id": c.RoleID,
+		if err := s.event(tx, o.Dep, GovEventPostureChanged, map[string]any{"control_id": c.ID, "role_id": c.RoleID,
 			"service": ch.Service, "from": ch.From, "to": ch.To, "enforcement_seq": newSeq, "writer": o.Writer}); err != nil {
 			return nil, err
 		}
