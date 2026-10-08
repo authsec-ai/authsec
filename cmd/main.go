@@ -259,6 +259,18 @@ func main() {
 		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
 	}
 
+	// IGA_LEGACY_AGENT_POLICY (disposition plan §3.2): read ONCE, default on.
+	// Off stops this process starting the two legacy agent-policy workers
+	// (started below, with the other governance workers) and nothing else.
+	// Installed before the routes are mounted: the legacy compatibility routes
+	// consult it.
+	legacyAgentPolicyGate := services.LegacyAgentPolicyGateFromEnv()
+	services.SetLegacyAgentPolicyGate(legacyAgentPolicyGate)
+	if w := legacyAgentPolicyGate.Warning(); w != "" {
+		log.Printf("WARNING: [legacy-agent-policy] %s", w)
+	}
+	log.Print(legacyAgentPolicyGate.Decision())
+
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -578,10 +590,7 @@ func main() {
 		// Five minutes: the same cadence as JML, and the actions are the same
 		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
 		// less access.
-		policyWorker := services.NewPolicyReconcileWorker(config.DB, 5*time.Minute)
-		policyWorker.Start()
-		log.Printf("agent policy reconcile worker started (interval=5m)")
-
+		//
 		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
 		// Runs at five minutes rather than hourly because the DELIVERY half also
 		// retries: an SMTP blip should cost minutes, not a whole warning.
@@ -590,9 +599,14 @@ func main() {
 		// let an SMTP outage quietly turn every destructive policy into a no-op,
 		// which is the failure this exists to prevent. It is recorded instead, and
 		// the action executes as a governance exception.
-		warningWorker := services.NewPolicyWarningWorker(config.DB, 5*time.Minute, 50)
-		warningWorker.Start()
-		log.Printf("policy pre-deadline warning worker started (interval=5m)")
+		//
+		// Both are the legacy agent-policy stack, so both start only while
+		// IGA_LEGACY_AGENT_POLICY is on (read above). ExpiryWorker and the lease
+		// reaper are shared runtime infrastructure and start regardless.
+		for _, name := range services.StartLegacyAgentPolicyWorkers(legacyAgentPolicyGate,
+			services.NewLegacyAgentPolicyWorkers(config.DB)) {
+			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────

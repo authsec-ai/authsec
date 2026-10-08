@@ -281,6 +281,18 @@ func SetupRoutes(
 	// D-100).
 	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
+	// LEGACY compatibility under the IGA prefix (disposition plan §3.1, Phase 3
+	// spec §7.10): a read-only list of the workspace's legacy agent policies
+	// with Pause and Remove, served by the legacy agent-policy service -- not
+	// Phase 3 code, and outside SetupIGARoutes on purpose. Same auth, same
+	// error envelope; the legacy governance permissions (governance:read to
+	// list, governance:admin to pause or remove, as the legacy
+	// /authsec/governance/agent-policies routes). The legacy routes below keep
+	// their behaviour.
+	platformCtrl.MountLegacyAgentPolicyCompatRoutes(r,
+		platformCtrl.NewLegacyAgentPolicyCompatController(config.DB),
+		middlewares.AuthMiddleware(), middlewares.Require)
+
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
