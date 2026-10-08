@@ -4,6 +4,66 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-08 — Owner decisions applied; staging merged
+
+The owner accepted the recommendations. Committed locally; nothing pushed.
+
+### Done
+- **AS-060**, two parts:
+  - Resource URIs are unique per workspace; a URI that another workspace holds can be registered only by the owner of its host (a verified workspace domain), and lookups resolve to that owner (`7ef036a`).
+  - Workload-identity issuers are unique per workspace. The token endpoint tries each provider for the issuer, needs exactly one to accept the token, and binds the result to the requested client (`6d7b64b`).
+- **AS-098:** `.env` is untracked in both repos.
+- **OPS-001:** the deploy jobs already run in a `production` GitHub Environment; required reviewers must be added in the repo settings.
+- **AS-015:** already sends Deprecation and Sunset headers; retirement waits for the SDK.
+- **Two stale IGA integration tests** fixed (`757b337`); the whole `tests/integration` package passes.
+- **CLAUDE.md:** stale facts updated.
+- **`authsec-staging` merged into both branches.** It had moved by 26 backend and 7 UI commits.
+  - **Migration renumbering:** staging's 043–046 have already run in production, so this branch's migrations moved, in the same order, to 101–119.
+  - **Discovery ingress:** staging's ingest tokens replace this branch's collector tokens. The actuation-token binding is kept.
+  - **Kubernetes reads:** staging's new features run under this branch's RLS reads.
+
+### Migration renumbering
+| Former | Now |
+|---|---|
+| `043_login_tickets` | `101_login_tickets` |
+| `044_trusted_issuer_workspace` | `102_trusted_issuer_workspace` |
+| `045_tenancy_expand` | `103_tenancy_expand` |
+| `046_tenancy_backfill` | `104_tenancy_backfill` |
+| `047_tenancy_contract` | `105_tenancy_contract` |
+| `048_tenancy_indexes_uniques` | `106_tenancy_indexes_uniques` |
+| `050_session_token_revocations` | `107_session_token_revocations` |
+| `051_audit_events_append_only` | `108_audit_events_append_only` |
+| `052_users_delete_permission` | `109_users_delete_permission` |
+| `053_voice_active_sessions` | `110_voice_active_sessions` |
+| `054_row_level_security` | `111_row_level_security` |
+| `055_platform_rows_null` | `112_platform_rows_null` |
+| `065_auth_lockouts` | `113_auth_lockouts` |
+| `066_ciba_request_resource_binding` | `114_ciba_request_resource_binding` |
+| `068_otp_entries_scope` | `115_otp_entries_scope` |
+| `069_tenancy_ws_index_backfill` | `116_tenancy_ws_index_backfill` |
+| `070_entra_tenant_id_expand` | `117_entra_tenant_id_expand` |
+| `071_resource_uri_per_workspace` | `118_resource_uri_per_workspace` |
+| `072_wip_issuer_per_workspace` | `119_wip_issuer_per_workspace` |
+
+`067_discovery_collector_tokens` was removed: staging's ingest tokens replace it.
+
+### Release notes (deploy)
+- **Migrations:** staging's 043–046 have already run in production. On deploy, 101–119 apply in order; on a database that never had them, all of them apply.
+- **Discovery ingress:**
+  - `DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS` and `/discovery/collector-tokens` are gone. Use `/discovery/ingest-tokens` and `IGA_DISCOVERY_INGEST_AUTH`.
+  - The default `warn` mode accepts unauthenticated reports. Set `enforce` once every collector has a token.
+- **Resource servers:** registering a URL that another workspace already uses now needs a verified domain covering its host.
+- **Workload federation:** the `client_id` a token request names must be the client of the workload the token maps to.
+
+### Waiting on the owner
+- **AS-081:** the embedded SPIRE control plane. The UI's SPIRE wizard points customers at `/spiresvc`, so this needs a product call before removal. Also check that production does not set `ENABLE_EMBEDDED_SPIRE`: since `deb5645` the server refuses to start with it in production.
+- **OPS-001:** add the required reviewers.
+- **AS-097:** run the contract migration after the next deploy.
+- **AS-098:** rotate the secrets if they were ever used outside dev.
+- **ENV-001.**
+
+---
+
 ## 2026-10-07 (cont. 3) — "complete what's left"
 
 Branches `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
