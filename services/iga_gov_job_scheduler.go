@@ -25,8 +25,9 @@ import (
 // Each schedule names a kind, an interval and a Due query listing the
 // subjects. The built-in schedules (DefaultPolicyJobSchedules) are the ones
 // §8.1 drives from state this schema already has; a later task adds its own
-// with Add (prune_evidence and metrics_rollup belong to T3.06 / T3.18,
-// verify_binding to T3.09, whose binding table an IGA file may not name).
+// with Add (prune_evidence belongs to T3.06, verify_binding to T3.09, whose
+// binding table an IGA file may not name; metrics_rollup is added by
+// RegisterMetricsJobs, T3.18).
 type PolicyJobScheduler struct {
 	db   *gorm.DB
 	jobs repositories.IGAGovJobRepository
@@ -88,6 +89,17 @@ func (s *PolicyJobScheduler) Add(sc PolicyJobSchedule) {
 		}
 	}
 	s.schedules = append(s.schedules, sc)
+}
+
+// ScheduleNames lists the registered schedules' names.
+func (s *PolicyJobScheduler) ScheduleNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.schedules))
+	for _, sc := range s.schedules {
+		out = append(out, sc.Name)
+	}
+	return out
 }
 
 // Tick runs every schedule whose Due query is due, and enqueues its subjects.

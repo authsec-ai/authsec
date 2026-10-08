@@ -120,6 +120,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/events", require("governance", "read"), ctl.ListEvents)
 	g.GET("/events/export", require("governance", "read"), ctl.ExportEvents)
 	g.GET("/events/kinds", require("governance", "read"), ctl.EventKinds)
+	// §7.8 metrics (T3.18, iga_gov_metrics_controller.go).
+	g.GET("/metrics", require("governance", "read"), ctl.GetMetrics)
 
 	// §7.3 policies, versions and plans (T3.11, iga_gov_authoring_controller.go).
 	g.GET("/policies", require("governance", "read"), ctl.ListPolicies)
