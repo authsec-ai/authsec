@@ -801,8 +801,17 @@ func (ctl *GovernanceController) ReportInstruction(c *gin.Context) {
 		Success: req.Success,
 		Error:   req.Error,
 		Result:  req.Result,
+		// The holder name the agent leased under (?pod=, as on the lease call).
+		// Optional: agents that do not send it are fenced on the lease being live.
+		LeasedBy: c.Query("pod"),
 	})
 	if err != nil {
+		// A stale report is a conflict with the current lease, not a bad request:
+		// 409 with a code the agent can log, and nothing recorded.
+		if code := services.InstructionReportRefusalCode(err); code != "" {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": code})
+			return
+		}
 		governanceError(c, err)
 		return
 	}
@@ -872,6 +881,15 @@ func (ctl *GovernanceController) ForceEvictAgent(c *gin.Context) {
 	}
 	log.Printf("FORCE-DELETE authorised by %s for agent %s (%s): %s",
 		actorLabel, agent.ID, agent.DisplayName, req.Reason)
+	// The most destructive decision this controller takes, so the audit record
+	// carries the reason with what was queued -- not only the log line above.
+	auditAdminMutation(c, wsID.String(), "force_evict", "discovered_agent",
+		agentID.String(), http.StatusOK, nil, gin.H{
+			"reason":         req.Reason,
+			"instruction_id": out.InstructionID,
+			"blocked_pods":   out.BlockedPods,
+			"queued":         out.Queued,
+		})
 	c.JSON(http.StatusOK, out)
 }
 
@@ -945,18 +963,38 @@ func (ctl *GovernanceController) UpdateNotificationSettings(c *gin.Context) {
 		in.WarningLead = &d
 	}
 
-	out, err := ctl.warnings().SaveSettings(wsID, in)
+	mgr := ctl.warnings()
+	// The previous settings, for the audit record's old values. Best-effort: an
+	// unreadable "before" must not block the change, it only leaves old values
+	// out of the record.
+	var before gin.H
+	if prev, perr := mgr.Settings(wsID); perr == nil {
+		before = notificationSettingsView(prev)
+	}
+	out, err := mgr.SaveSettings(wsID, in)
 	if err != nil {
 		governanceError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"workspace_id":         out.WorkspaceID,
-		"warning_lead_seconds": int64(out.Lead().Seconds()),
-		"webhook_url":          out.WebhookURL,
-		"webhook_secret_set":   out.WebhookSecret != "",
-		"email_enabled":        out.EmailEnabled,
-	})
+	after := notificationSettingsView(out)
+	// Redirecting warnings is indistinguishable from silencing them, so the
+	// change is audited. The redacted view, never the webhook secret: an audit
+	// log holding credentials is a credential store.
+	auditAdminMutation(c, wsID.String(), "update", "governance_notification_settings",
+		wsID.String(), http.StatusOK, before, after)
+	c.JSON(http.StatusOK, after)
+}
+
+// notificationSettingsView is the console's view of the settings: whether a
+// webhook secret is set, never the secret.
+func notificationSettingsView(s *models.GovernanceNotificationSettings) gin.H {
+	return gin.H{
+		"workspace_id":         s.WorkspaceID,
+		"warning_lead_seconds": int64(s.Lead().Seconds()),
+		"webhook_url":          s.WebhookURL,
+		"webhook_secret_set":   s.WebhookSecret != "",
+		"email_enabled":        s.EmailEnabled,
+	}
 }
 
 // ListPolicyWarnings handles GET /authsec/governance/policy-warnings.

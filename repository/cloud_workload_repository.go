@@ -86,8 +86,9 @@ type CloudWorkloadRepository interface {
 	CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (int64, error)
 
 	// ActivitySample is the connector's identities whose activity (cloud_usage)
-	// one scan reads: the first limit by ARN, byte order, and the total.
-	ActivitySample(workspaceID, connectorID uuid.UUID, limit int) ([]models.CloudIdentity, int64, error)
+	// one scan reads: at most limit, the prioritised ones first (T3.03), then
+	// the rest by ARN, byte order; and the total.
+	ActivitySample(workspaceID, connectorID uuid.UUID, limit int) ([]SampledIdentity, int64, error)
 
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
@@ -502,31 +503,81 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 	return removed, err
 }
 
+// SampledIdentity is one identity of the activity sample, and whether it was
+// taken ahead of byte order (T3.03).
+type SampledIdentity struct {
+	models.CloudIdentity `gorm:"embedded"`
+	// Prioritized: bound to a workload or under a live AuthSec control, so
+	// sampled before every identity that is neither.
+	Prioritized bool `gorm:"column:activity_prioritized"`
+}
+
 // ActivitySample returns the identities one scan reads Access Advisor for: at
-// most limit of the connector's identities, in BYTE order of their ARN
-// (native_id COLLATE "C", then id), and how many the connector holds.
+// most limit of the connector's identities, and how many the connector holds.
 //
-// Deterministic by ARN (D-86), so the sample a capped scan read is one a
-// reader can name: the scanner stamps the last ARN it read on the activity
-// coverage (SurfaceCoverage.CappedAfter), and an identity that sorts after it
-// was not sampled. "C" collation because it is Go's string order too, so that
-// comparison means the same thing in SQL and in code; the default collation
-// would order case and punctuation by locale.
+// The order (SPEC-iga-phase3-policy.md §2.6, T3.03) is two tiers, each in
+// BYTE order of the ARN (native_id COLLATE "C", then id):
+//
+//  1. prioritised -- an identity a workload of this connector runs as
+//     (cloud_workload.identity_id: the graph's executes_as) or that an ECS
+//     task definition names as its execution role (task_execution_role), and
+//     an identity under a live AuthSec control (iga_gov_control in any state
+//     but removed: matched by RoleId, by ARN only when no RoleId is recorded);
+//  2. every other identity.
+//
+// The workloads are the scan's own: the scanner reads activity after it has
+// recorded this run's compute, so they are this run's (and, for a surface
+// that was not reached, the rows it keeps). Over-prioritising costs nothing
+// but order, so a workload row an unreached surface keeps still counts.
+//
+// Deterministic (D-86) within each tier, so the sample a capped scan read is
+// one a reader can name: the scanner stamps the last ARN of tier 2 it read on
+// the activity coverage (SurfaceCoverage.CappedAfter) and the tier-1 ARNs it
+// read (SurfaceCoverage.Prioritized). With no workload and no control, tier 1
+// is empty and the sample is exactly the first limit by ARN, as before. "C"
+// collation because it is Go's string order too, so that comparison means the
+// same thing in SQL and in code; the default collation would order case and
+// punctuation by locale.
 func (r *cloudWorkloadRepository) ActivitySample(
 	workspaceID, connectorID uuid.UUID, limit int,
-) ([]models.CloudIdentity, int64, error) {
+) ([]SampledIdentity, int64, error) {
 	// Two independent statements, never one builder reused across a Count and
 	// a Find: GORM mutates a chained statement in place.
-	scoped := func() *gorm.DB {
-		return r.db.Model(&models.CloudIdentity{}).
-			Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID)
-	}
 	var total int64
-	if err := scoped().Count(&total).Error; err != nil {
+	if err := r.db.Model(&models.CloudIdentity{}).
+		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
+		Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	var out []models.CloudIdentity
-	if err := scoped().Order(`native_id COLLATE "C", id`).Limit(clampLimit(limit)).Find(&out).Error; err != nil {
+
+	// A live control can only exist where Phase 3's schema does (049). The
+	// scanner runs at any schema, so the control clause is added only when the
+	// table is there -- never a query that fails on an older database.
+	controlled := "false"
+	hasControls, err := HasRelation(r.db, "iga_gov_control")
+	if err != nil {
+		return nil, 0, err
+	}
+	if hasControls {
+		controlled = `EXISTS (SELECT 1 FROM iga_gov_control gc
+		                       WHERE gc.workspace_id = ci.workspace_id AND gc.connector_id = ci.connector_id
+		                         AND gc.state <> 'removed'
+		                         AND (gc.role_id = ci.attrs->>'unique_id'
+		                              OR (COALESCE(ci.attrs->>'unique_id', '') = '' AND gc.role_arn = ci.native_id)))`
+	}
+	var out []SampledIdentity
+	err = r.db.Raw(`SELECT ci.*, (
+	                         EXISTS (SELECT 1 FROM cloud_workload w
+	                                  WHERE w.workspace_id = ci.workspace_id AND w.connector_id = ci.connector_id
+	                                    AND (w.identity_id = ci.id
+	                                         OR (w.runtime_kind = ? AND w.attrs->>'execution_role_arn' = ci.native_id)))
+	                         OR `+controlled+`) AS activity_prioritized
+	                  FROM cloud_identity ci
+	                 WHERE ci.workspace_id = ? AND ci.connector_id = ?
+	                 ORDER BY activity_prioritized DESC, ci.native_id COLLATE "C", ci.id
+	                 LIMIT ?`,
+		models.WorkloadECSTaskDefinition, workspaceID, connectorID, clampLimit(limit)).Scan(&out).Error
+	if err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
