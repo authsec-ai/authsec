@@ -4,6 +4,41 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-08 (cont.) — AS-081 multi-tenant SPIRE; Phase 6 complete
+
+Owner decision: make the embedded SPIRE control plane multi-tenant. Committed locally; nothing pushed.
+
+### Done
+- **AS-081** (agent, merged):
+  - Migration 120 adds `spire_*` control-plane tables, one per workspace under RLS. They replace the per-workspace-database tables the code still queried.
+  - Repositories run on the scoped layer.
+  - PKI provisioning and the JWT routes are behind `AuthMiddleware` and need owner or admin.
+  - Node attestation uses single-use workspace join tokens (new `/v1/join-tokens` admin endpoints).
+  - Agent and mTLS routes take the workspace from the verified client certificate, which must chain to that workspace's CA.
+  - The `/spire` headless routes are behind `AuthMiddleware` and scoped. `oidc/exchange/spiffe` returns 410.
+  - The production startup refusal is removed.
+  - Rate limits now key on the trusted client address (`90e3c03`).
+- **Phase 6:**
+  - Legacy gin keys retired (`ad67c6c`).
+  - RLS fails closed for `authsec_tenant` (130, `a9b63f1`).
+  - The `authsec_platform` BYPASSRLS role remains a superuser deploy step.
+- **Deploy:** `docs/DEPLOYMENT_CHECKLIST.md` written for the manual deploy.
+- **Bootstrap fix:** the 120/130 blocks were rebuilt after the merge left a conflict marker (`7916dda`).
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding and flagsoff suites pass, including 7 new SPIRE tenancy tests and 6 certificate-auth unit tests.
+- Ratchet 0; schema parity holds over 66 migrations.
+
+### Left for later (from the AS-081 review)
+- Vault mount `pki/` prefix handling is inconsistent across services.
+- `/v1/jwt/renew` renews any valid token the caller holds.
+- Within one workspace, any SVID can renew any attested workload.
+- The headless OIDC signing key is in process memory only.
+- `spire_audit_logs.workspace_id` is nullable text.
+
+---
+
 ## 2026-10-08 — Owner decisions applied; staging merged
 
 The owner accepted the recommendations. Committed locally; nothing pushed.

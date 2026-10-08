@@ -11,7 +11,7 @@ bottom; each step says how to tell it worked. Background: `docs/PROGRESS.md`
 - [ ] **Rehearse the upgrade on a copy of production.** Restore the backup into
       a throwaway database and start this build against it once:
       the log must end with `[Migration] master done: N applied, 0 failed`.
-      Migrations 101–119, 130 (and the SPIRE migrations 120+, if present) apply
+      Migrations 101–120 and 130 apply
       on top of staging's 002–046. `scripts/schema-parity.sh <binary> <copy>`
       then confirms a fresh install and the upgraded copy end with the same
       schema.
@@ -25,9 +25,9 @@ bottom; each step says how to tell it worked. Background: `docs/PROGRESS.md`
     is `t` for the application user.
   - Optional, later: the `authsec_platform` BYPASSRLS role (ADR §4.4) needs a
     superuser and is not required for this release.
-- [ ] **Production must NOT have `ENABLE_EMBEDDED_SPIRE=true`** unless the
-      AS-081 work (embedded SPIRE made multi-tenant) is part of this build.
-      Without it, startup refuses that flag in production.
+- [ ] **Embedded SPIRE** (`ENABLE_EMBEDDED_SPIRE`, default off) is now
+      multi-tenant (AS-081) and allowed in production. If you enable it, see
+      "Embedded SPIRE" in section 2.
 
 ## 2. Configuration
 
@@ -44,6 +44,16 @@ Set or confirm (names only; values from your secret store):
 | `ICP_SERVICE_URL` | Required in production when SPIFFE SVIDs are used. |
 | `IGA_DISCOVERY_INGEST_AUTH` | `warn` (default) accepts and logs unauthenticated discovery reports; set `enforce` once every collector has an ingest token. |
 | `XAA_NATIVE_SEALER` | Required if any XAA issuance flag is on. |
+
+**Embedded SPIRE** (only if `ENABLE_EMBEDDED_SPIRE=true`):
+- The backend does not terminate TLS. Behind an ingress, the agent and mTLS
+  routes need `SPIRE_TRUST_CLIENT_CERT_HEADER=true`, and the ingress must
+  **overwrite** (never pass through) the client-certificate header.
+- Each workspace's CA must be provisioned
+  (`POST /authsec/spiresvc/admin/pki/provision`, as that workspace's admin).
+- Nodes attest with a single-use join token
+  (`POST /authsec/spiresvc/v1/join-tokens`, shown once).
+- `SPIRE_RECONCILE` (default true) syncs the shared SPIRE server.
 
 Removed settings (delete if present): `ADMIN_CROSS_TENANT_ACCESS`,
 `DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS`.
