@@ -9,12 +9,14 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,7 +38,9 @@ import (
 const (
 	p3sSigning  = "p3-t314-slack-signing-secret"
 	p3sClientID = "p3-t314-client-id"
-	p3sRedirect = "https://authsec.test/authsec/integrations/slack/oauth/callback"
+	// p3sHost is the API host the console calls (requests are sent to it).
+	p3sHost     = "authsec.test"
+	p3sRedirect = "https://" + p3sHost + "/authsec/integrations/slack/oauth/callback"
 )
 
 type p3sApp struct {
@@ -44,20 +48,113 @@ type p3sApp struct {
 	db    *gorm.DB
 	svc   *services.SlackIntegrationService
 	fake  *slacktest.Fake
-	vault *memVault
+	vault *p3sKV
 	eng   *gin.Engine
 	seq   atomic.Int64
+	// outcomes receives every accepted interaction's outcome (the work
+	// Slack's 200 does not wait for).
+	outcomes chan p3sOutcome
+}
+
+// p3sOutcome is an accepted interaction's result.
+type p3sOutcome struct {
+	res *services.SlackInteractionResult
+	err error
+}
+
+// p3sKV is an in-memory Vault KV v2 mount: WriteSecret adds a version,
+// DeleteSecret is KV v2's soft delete (the latest version is marked deleted
+// and stays recoverable), DestroySecret (vault.SecretDestroyer) removes
+// every version.
+type p3sKV struct {
+	mu        sync.Mutex
+	versions  map[string][]p3sKVVersion
+	destroyed []string
+}
+
+type p3sKVVersion struct {
+	data    map[string]interface{}
+	deleted bool
+}
+
+func newP3sKV() *p3sKV { return &p3sKV{versions: map[string][]p3sKVVersion{}} }
+
+func (k *p3sKV) WriteSecret(path string, data map[string]interface{}) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	cp := map[string]interface{}{}
+	for key, v := range data {
+		cp[key] = v
+	}
+	k.versions[path] = append(k.versions[path], p3sKVVersion{data: cp})
+	return nil
+}
+
+func (k *p3sKV) ReadSecret(path string) (map[string]interface{}, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	vs := k.versions[path]
+	if len(vs) == 0 || vs[len(vs)-1].deleted {
+		return nil, fmt.Errorf("no secret found at path: %s", path)
+	}
+	return vs[len(vs)-1].data, nil
+}
+
+func (k *p3sKV) DeleteSecret(path string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if vs := k.versions[path]; len(vs) > 0 {
+		vs[len(vs)-1].deleted = true
+	}
+	return nil
+}
+
+func (k *p3sKV) DestroySecret(path string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	delete(k.versions, path)
+	k.destroyed = append(k.destroyed, path)
+	return nil
+}
+
+// recoverable is every token version still held at path (soft-deleted
+// versions included: an operator can undelete them).
+func (k *p3sKV) recoverable(path string) []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var out []string
+	for _, v := range k.versions[path] {
+		t, _ := v.data["token"].(string)
+		out = append(out, t)
+	}
+	return out
+}
+
+// p3sAsync is the service's background-interaction surface (asserted, so
+// these tests also build against a service without it).
+type p3sAsync interface {
+	WithInteractionObserver(func(*services.SlackInteractionResult, error)) *services.SlackIntegrationService
+	WaitInteractions()
 }
 
 // newP3sApp installs the Slack app over db for this test and mounts its
 // routes on a fresh engine behind gate. Tokens are signed with p3aSecret.
 func newP3sApp(t *testing.T, db *gorm.DB, gate *services.PolicyGate) *p3sApp {
 	t.Helper()
-	a := &p3sApp{t: t, db: db, fake: slacktest.New(), vault: newMemVault()}
+	return newP3sAppWith(t, db, gate, services.SlackConfig{SigningSecret: p3sSigning, RedirectURL: p3sRedirect})
+}
+
+// newP3sAppWith is newP3sApp with the service configuration cfg.
+func newP3sAppWith(t *testing.T, db *gorm.DB, gate *services.PolicyGate, cfg services.SlackConfig) *p3sApp {
+	t.Helper()
+	a := &p3sApp{t: t, db: db, fake: slacktest.New(), vault: newP3sKV(), outcomes: make(chan p3sOutcome, 64)}
 	if err := a.vault.WriteSecret(services.DefaultSlackAppPath, map[string]interface{}{"client_id": p3sClientID, "client_secret": "p3-t314-client-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	a.svc = services.NewSlackIntegrationService(db, a.vault, a.fake, services.SlackConfig{SigningSecret: p3sSigning, RedirectURL: p3sRedirect})
+	a.svc = services.NewSlackIntegrationService(db, a.vault, a.fake, cfg)
+	if as, ok := any(a.svc).(p3sAsync); ok {
+		as.WithInteractionObserver(func(res *services.SlackInteractionResult, err error) { a.outcomes <- p3sOutcome{res, err} })
+	}
 	restore := services.InstallSlackApp(a.svc)
 	t.Cleanup(restore)
 	p3aAuditOnce.Do(func() {
@@ -76,6 +173,11 @@ func newP3sApp(t *testing.T, db *gorm.DB, gate *services.PolicyGate) *p3sApp {
 	a.eng = gin.New()
 	platform.MountSlackIntegrationRoutes(a.eng.Group("/authsec"),
 		platform.NewSlackIntegrationController(db, a.svc).WithPolicyGate(gate), middlewares.AuthMiddleware(), middlewares.Require)
+	// Last registered, first run: no interaction outlives the test (or the
+	// audit logger it writes to).
+	if as, ok := any(a.svc).(p3sAsync); ok {
+		t.Cleanup(as.WaitInteractions)
+	}
 	return a
 }
 
@@ -105,6 +207,7 @@ func (a *p3sApp) do(method, path, bearer string, body any, cookies ...*http.Cook
 		rd = strings.NewReader("")
 	}
 	req := httptest.NewRequest(method, "/authsec/integrations/slack"+path, rd)
+	req.Host = p3sHost
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -211,10 +314,55 @@ func (c p3sClick) body() []byte {
 	return []byte(url.Values{"payload": {string(raw)}}.Encode())
 }
 
-// post sends a raw interaction with explicit headers.
+// post sends a raw interaction with explicit headers. A request Slack is
+// answered 200 {accepted} for runs its action afterwards: post then waits
+// for that outcome and returns it as status + §7 body (the refusal or the
+// result the clicking user is told through the response_url).
 func (a *p3sApp) post(body []byte, ts, sig string) (int, map[string]any) {
 	a.t.Helper()
+	code, out := a.postAck(body, ts, sig)
+	if code != http.StatusOK || dig(out, "data", "accepted") != true {
+		return code, out
+	}
+	return a.next()
+}
+
+// next is the next accepted interaction's outcome as status + §7 body.
+func (a *p3sApp) next() (int, map[string]any) {
+	a.t.Helper()
+	select {
+	case o := <-a.outcomes:
+		return p3sOutcomeBody(o)
+	case <-time.After(60 * time.Second):
+		a.t.Fatal("an accepted Slack interaction did not finish")
+		return 0, nil
+	}
+}
+
+func p3sOutcomeBody(o p3sOutcome) (int, map[string]any) {
+	var raw []byte
+	code := http.StatusOK
+	var ge *services.GovError
+	switch {
+	case o.err == nil:
+		raw, _ = json.Marshal(map[string]any{"data": o.res, "meta": map[string]any{}})
+	case errors.As(o.err, &ge):
+		code = ge.Status
+		raw, _ = json.Marshal(ge.Body())
+	default:
+		code = http.StatusInternalServerError
+		raw, _ = json.Marshal(map[string]any{"error": map[string]any{"code": "internal_error", "message": o.err.Error()}})
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return code, out
+}
+
+// postAck sends a raw interaction and returns Slack's (synchronous) answer.
+func (a *p3sApp) postAck(body []byte, ts, sig string) (int, map[string]any) {
+	a.t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/authsec/integrations/slack/interactions", strings.NewReader(string(body)))
+	req.Host = p3sHost
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if ts != "" {
 		req.Header.Set(slackapp.HeaderTimestamp, ts)

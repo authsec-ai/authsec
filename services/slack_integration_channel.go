@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -381,7 +382,12 @@ func SlackStatusForSettings(db *gorm.DB, ws uuid.UUID) *SlackStatusView {
 // SlackConsoleLink is a console URL for path ("" when no base URL is set).
 func SlackConsoleLink(path string) string { return govConsoleLink(path) }
 
-var defaultSlack *SlackIntegrationService
+// defaultSlack is the process's Slack app. It is written once at startup
+// from the policy gate's VerifyUntilReady goroutine (cmd/main.go) while the
+// HTTP server already reads it per request (NewDefaultSlackIntegrationController),
+// so it is an atomic pointer: a plain variable there was a data race (review
+// fix, P2 Slack; proved with go test -race).
+var defaultSlack atomic.Pointer[SlackIntegrationService]
 
 // SlackFromEnv builds the production Slack app: the signing secret and
 // paths from the environment, Vault from VAULT_ADDR / VAULT_TOKEN, the
@@ -401,7 +407,7 @@ func SlackFromEnv(db *gorm.DB) *SlackIntegrationService {
 
 // SetDefaultSlackService records the process's Slack app (startup); the
 // routes use it. Nil: not configured.
-func SetDefaultSlackService(s *SlackIntegrationService) { defaultSlack = s }
+func SetDefaultSlackService(s *SlackIntegrationService) { defaultSlack.Store(s) }
 
 // DefaultSlackService is the process's Slack app, or nil.
-func DefaultSlackService() *SlackIntegrationService { return defaultSlack }
+func DefaultSlackService() *SlackIntegrationService { return defaultSlack.Load() }

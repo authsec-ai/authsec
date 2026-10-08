@@ -56,6 +56,9 @@ var policyRelations = []string{
 	// 056_cloud_resource_policy
 	"cloud_policy_document", "cloud_resource_policy_coverage", "cloud_resource_policy_observation",
 	"idx_cloud_rpo_scan_form",
+	// 057_slack_link_one_per_member (review fix P0-3): one Slack link per
+	// member; the Slack linking code relies on it against concurrent links.
+	"uq_slack_user_link_member",
 }
 
 // policyColumns are columns a relation check cannot prove. 047-056 add no

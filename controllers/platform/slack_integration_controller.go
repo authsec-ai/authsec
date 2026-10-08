@@ -6,11 +6,13 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -20,7 +22,7 @@ import (
 //
 //	GET    /install          governance:enforce   Slack OAuth v2: the authorize URL; sets the install cookie
 //	GET    /oauth/callback   OAuth state bound to workspace + member + browser session (no bearer token)
-//	POST   /interactions     Slack signature only
+//	POST   /interactions     Slack signature only; answered at once, the action runs after (Slack's 3 s limit)
 //	PUT    /settings         governance:enforce   {approvals_channel_id}
 //	DELETE /                 governance:enforce   disconnect
 //	POST   /link/confirm     member               {token}: confirm a Slack <-> member link
@@ -141,20 +143,25 @@ func (ctl *SlackIntegrationController) Install(c *gin.Context) {
 		policyErr(c, http.StatusForbidden, "forbidden", "Slack setup requires a verified workspace member session.", nil)
 		return
 	}
-	st, err := ctl.service().StartInstall(c.Request.Context(), ws, user, membership)
+	// The cookie is set on the host the browser sent this request to; the
+	// redirect URI is derived from (or checked against) that host so the
+	// callback receives it (services.StartInstall, DECISIONS).
+	st, err := ctl.service().StartInstall(c.Request.Context(), ws, user, membership, c.Request.Host)
 	if err != nil {
 		govError(c, err)
 		return
 	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: st.Nonce, Path: "/authsec/integrations/slack/oauth",
+	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: st.Nonce, Domain: st.CookieDomain, Path: st.CookiePath,
 		MaxAge: 600, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 	c.JSON(http.StatusOK, gin.H{"data": st, "meta": gin.H{}})
 }
 
 // OAuthCallback handles GET /oauth/callback (Slack's browser redirect).
 func (ctl *SlackIntegrationController) OAuthCallback(c *gin.Context) {
-	// The cookie is single use whatever happens.
-	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: "", Path: "/authsec/integrations/slack/oauth",
+	// The cookie is single use whatever happens (cleared with the scope it
+	// was set with).
+	domain, path := ctl.service().CallbackCookieScope(c.Query("state"))
+	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: "", Domain: domain, Path: path,
 		MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 	if !ctl.configured(c) {
 		return
@@ -203,28 +210,47 @@ func (ctl *SlackIntegrationController) callbackOut(c *gin.Context, err error, re
 	c.JSON(http.StatusOK, gin.H{"data": res, "meta": gin.H{}})
 }
 
-// Interactions handles POST /interactions: Slack signature only.
+// Interactions handles POST /interactions: Slack signature only. Slack is
+// answered as soon as the request is verified (200 {accepted}); the action
+// runs after that and its outcome reaches the user through the payload's
+// response_url (services.HandleInteraction). The audit_events row of a
+// completed action is written then, with this request's metadata.
 func (ctl *SlackIntegrationController) Interactions(c *gin.Context) {
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
 	if err != nil {
 		policyErr(c, http.StatusBadRequest, "invalid_parameter", "The body could not be read.", nil)
 		return
 	}
-	if ctl.service() == nil {
+	svc := ctl.service()
+	if svc == nil {
 		policyErr(c, http.StatusUnauthorized, services.SlackCodeSignatureInvalid, "The request is not a valid, fresh Slack request.",
 			gin.H{"reason": "not_configured"})
 		return
 	}
-	res, err := ctl.service().HandleInteraction(c.Request.Context(), c.Request.Header, body)
+	meta := slackAuditMeta{requestID: c.GetString("request_id"), method: c.Request.Method, path: c.Request.URL.Path,
+		ip: c.ClientIP(), userAgent: c.GetHeader("User-Agent")}
+	ack, err := svc.HandleInteraction(c.Request.Context(), c.Request.Header, body, meta.record)
 	if err != nil {
 		govError(c, err)
 		return
 	}
-	if !res.Ignored && res.Resource != "" {
-		c.Set("user_id", res.UserID.String())
-		auditAdminMutation(c, res.WorkspaceID.String(), res.Action, res.Resource, res.ResourceID, http.StatusOK, res.Before, res.After)
+	c.JSON(http.StatusOK, gin.H{"data": ack, "meta": gin.H{}})
+}
+
+// slackAuditMeta is an interaction request's metadata, kept for the audit
+// row written when its action completes (after the request has ended).
+type slackAuditMeta struct {
+	requestID, method, path, ip, userAgent string
+}
+
+// record writes the audit_events row of a completed interaction (the
+// auditAdminMutation row, without the finished gin context).
+func (m slackAuditMeta) record(res *services.SlackInteractionResult, err error) {
+	if err != nil || res == nil || res.Ignored || res.Resource == "" || config.AuditLogger == nil {
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": res, "meta": gin.H{}})
+	config.AuditLogger.LogAdminAction(m.requestID, res.WorkspaceID.String(), res.UserID.String(), res.Action, res.Resource, res.ResourceID,
+		m.method, m.path, m.ip, m.userAgent, http.StatusOK, time.Duration(0), res.Before, res.After, "")
 }
 
 // PutSettings handles PUT /settings {approvals_channel_id}.

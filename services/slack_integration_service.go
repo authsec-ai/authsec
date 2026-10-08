@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,33 +46,81 @@ import (
 //   - OAuth state binding. GET /install (an XHR from the console with the
 //     member's bearer token) returns the Slack authorize URL and sets an
 //     HttpOnly, SameSite=Lax cookie holding a random nonce; the state is
-//     {workspace, user, membership, sha256(nonce), expiry} HMAC-signed with
-//     a key derived from the signing secret. GET /oauth/callback is Slack's
-//     browser redirect (no bearer token), so "bound to workspace + session"
-//     is checked as: the state's signature and 10-minute expiry; the
-//     cookie's nonce matches the state (the browser that started the
-//     install); the membership named in the state is still this user's,
-//     active, in this workspace, and the user still holds
-//     governance:enforce. The state is not stored, so single use rests on
-//     Slack's single-use code and the cookie being cleared by the callback.
+//     {workspace, user, membership, sha256(nonce), redirect URI, expiry}
+//     HMAC-signed with a key derived from the signing secret. GET
+//     /oauth/callback is Slack's browser redirect (no bearer token), so
+//     "bound to workspace + session" is checked as: the state's signature
+//     and 10-minute expiry; the cookie's nonce matches the state (the
+//     browser that started the install); the membership named in the state
+//     is still this user's, active, in this workspace, and the user still
+//     holds governance:enforce. The state is not stored, so single use rests
+//     on Slack's single-use code and the cookie being cleared by the
+//     callback.
+//   - Where the cookie goes (review fix, P2 Slack: "the OAuth nonce cookie
+//     is host-only on the API host while the redirect defaults to the
+//     console host"). The cookie is set by the answer to GET /install, i.e.
+//     on the API host the console calls (VITE_API_URL), and a browser sends
+//     it back only to a host the cookie domain-matches. So the redirect URI
+//     is:
+//       * AUTHSEC_SLACK_REDIRECT_URL when set (an operator's choice; it must
+//         be registered in the Slack app); else
+//       * https://<the host that served GET /install><SlackCallbackPath>:
+//         the callback lands on the very host that set the cookie. It no
+//         longer defaults to the console base URL, whose host does not
+//         receive a cookie set by the API host.
+//     The cookie is host-only unless AUTHSEC_SLACK_COOKIE_DOMAIN is set
+//     (e.g. "authsec.ai": then every host under it receives it), and its
+//     Path is the redirect URI's path. GET /install REFUSES (503
+//     slack_not_configured, detail.reason redirect_cookie_mismatch) when the
+//     redirect URI's host could not receive the cookie, so a mis-deployment
+//     shows at the start of an install instead of as session_mismatch after
+//     the user consented in Slack. DEPLOYMENT ASSUMPTION: the redirect URI
+//     (by default https://<api host>/authsec/integrations/slack/oauth/callback)
+//     is registered among the Slack app's Redirect URLs; that host routes
+//     the path to this service with the browser's Host header preserved;
+//     TLS is terminated in front of it (the cookie is Secure).
 //   - Vault paths: the app at kv/data/secret/authsec/slack/app (override
 //     AUTHSEC_SLACK_APP_VAULT_PATH); a workspace's bot token at
 //     kv/data/secret/workspaces/<ws>/slack/bot (key "token"), which is the
 //     row's bot_token_ref.
-//   - Linking. A Slack user is linked to a member when Slack reports the
-//     user's account email as confirmed (is_email_confirmed) and that email
-//     names exactly one active member (MembersByEmail: ambiguous is
-//     unmatched). Links are made after install (every active member looked
-//     up by email, capped) and on demand when an unlinked Slack user acts.
-//     Otherwise the Slack user is answered, ephemerally, with a link to the
-//     console carrying a signed 24-hour token {workspace, team, slack
-//     user}; POST /link/confirm by the signed-in member records a
-//     console_confirmation link. The token reaches only that Slack user
-//     (ephemeral response), so confirming it proves control of both
-//     accounts.
-//   - Disconnect revokes the token (auth.revoke, best effort), deletes it
-//     from Vault, sets revoked_at and deletes the workspace's user links
-//     (they are ids of the old team).
+//   - Linking (review fix P0-3: "Slack linking bypasses separation of
+//     duties"). A Slack user acts in AuthSec as the member it is linked to,
+//     so a link must prove that the member owns the Slack account. The one
+//     proof used is Slack's own: users.info, read with the bot token when
+//     the link is made, reports the Slack account's email as confirmed
+//     (is_email_confirmed) and that email equals the member's AuthSec
+//     account email (users.email, the sign-in identity; AuthSec keeps no
+//     separate email-verified flag). Nothing a person can forward or retype
+//     proves ownership -- a console link and a one-time code DM'd by the bot
+//     can both be handed to someone else -- so neither is accepted on its
+//     own; that is why this design was chosen over a Slack round trip.
+//       * Automatic: after install (every active member looked up by
+//         email, capped) and when an unlinked Slack user acts, when the
+//         confirmed email names exactly one active member.
+//       * POST /link/confirm (§7.11: "confirm an ambiguous Slack <-> member
+//         link"): when the confirmed email names several active members
+//         (MembersByEmail never guesses), the unlinked Slack user is
+//         answered, ephemerally, with a console link carrying a signed
+//         24-hour token {workspace, team, slack user}. The signed-in member
+//         who confirms it is linked ONLY if Slack, asked at that moment,
+//         reports that Slack user's confirmed email as the member's own
+//         email (else 403 slack_link_email_mismatch). A forwarded token is
+//         useless to anyone else, and an author cannot bind their Slack
+//         account to an approver.
+//     A member holds at most one link per workspace (= per Slack team: a
+//     workspace has one team, and its links are deleted when the team is
+//     disconnected or replaced) and a Slack user maps to at most one member:
+//     057's uq_slack_user_link_member and 054's primary key. /link/confirm
+//     answers 409 slack_member_already_linked / slack_user_already_linked;
+//     the automatic paths make no second link. 057 revoked every link the
+//     old /link/confirm had made.
+//   - Disconnect revokes the token (auth.revoke, best effort), DESTROYS it
+//     in Vault (KV v2 metadata delete: every version, not the soft delete of
+//     the latest one), sets revoked_at and deletes the workspace's user
+//     links (they are ids of the old team). Reinstalling a workspace into
+//     ANOTHER Slack team revokes the old team's token once the new
+//     installation is committed; a reinstall that fails puts the previous
+//     token back (and revokes the new token unless it is the same team's).
 //   - Every mutation writes an iga_gov_event (slack.*) in its transaction;
 //     the controller writes the audit_events row.
 
@@ -80,6 +129,7 @@ const (
 	SlackSigningSecretEnv = "AUTHSEC_SLACK_SIGNING_SECRET"
 	SlackAppVaultPathEnv  = "AUTHSEC_SLACK_APP_VAULT_PATH"
 	SlackRedirectURLEnv   = "AUTHSEC_SLACK_REDIRECT_URL"
+	SlackCookieDomainEnv  = "AUTHSEC_SLACK_COOKIE_DOMAIN"
 	DefaultSlackAppPath   = "kv/data/secret/authsec/slack/app"
 	// SlackInstallCookie carries the install nonce (session binding).
 	SlackInstallCookie = "authsec_slack_install"
@@ -105,6 +155,14 @@ const (
 	SlackCodeInstallFailed    = "slack_install_failed"
 	SlackCodeLinkInvalid      = "slack_link_invalid"
 	SlackCodeAlreadyLinked    = "slack_user_already_linked"
+	// SlackCodeMemberLinked: the member already holds a Slack link in this
+	// workspace (one link per member per Slack team).
+	SlackCodeMemberLinked = "slack_member_already_linked"
+	// SlackCodeLinkEmailMismatch: Slack does not report the Slack user's
+	// confirmed email as the confirming member's email.
+	SlackCodeLinkEmailMismatch = "slack_link_email_mismatch"
+	// SlackCodeUnavailable: Slack could not be asked (users.info failed).
+	SlackCodeUnavailable = "slack_unavailable"
 )
 
 // Event names (vocabulary: iga_gov_event_vocabulary.go).
@@ -120,18 +178,21 @@ const (
 type SlackConfig struct {
 	SigningSecret string
 	AppVaultPath  string
-	RedirectURL   string
+	// RedirectURL is the OAuth redirect URI; "" derives it per install from
+	// the host that served GET /install (DECISIONS above).
+	RedirectURL string
+	// CookieDomain is the install cookie's Domain attribute; "" makes it
+	// host-only on the host that served GET /install.
+	CookieDomain string
 }
 
-// SlackConfigFromEnv reads the configuration; the redirect URL defaults to
-// the console base URL + SlackCallbackPath.
+// SlackConfigFromEnv reads the configuration. An unset redirect URL is
+// derived per install from the API host that served GET /install -- never
+// the console base URL (DECISIONS above).
 func SlackConfigFromEnv() SlackConfig {
-	c := SlackConfig{SigningSecret: strings.TrimSpace(os.Getenv(SlackSigningSecretEnv)),
-		AppVaultPath: strings.TrimSpace(os.Getenv(SlackAppVaultPathEnv)), RedirectURL: strings.TrimSpace(os.Getenv(SlackRedirectURLEnv))}
-	if c.RedirectURL == "" {
-		c.RedirectURL = govConsoleLink(SlackCallbackPath)
-	}
-	return c
+	return SlackConfig{SigningSecret: strings.TrimSpace(os.Getenv(SlackSigningSecretEnv)),
+		AppVaultPath: strings.TrimSpace(os.Getenv(SlackAppVaultPathEnv)), RedirectURL: strings.TrimSpace(os.Getenv(SlackRedirectURLEnv)),
+		CookieDomain: os.Getenv(SlackCookieDomainEnv)}
 }
 
 // SlackIntegrationService is the Slack app's server side.
@@ -143,6 +204,11 @@ type SlackIntegrationService struct {
 	live    LiveReader
 	members WorkspaceMemberDirectory
 	now     func() time.Time
+	// Interactions run after Slack has been answered
+	// (slack_integration_interactions.go): in flight, bounded, observed.
+	inflight sync.WaitGroup
+	slots    chan struct{}
+	observer func(*SlackInteractionResult, error)
 }
 
 // NewSlackIntegrationService builds the service. vc and api must be
@@ -151,7 +217,9 @@ func NewSlackIntegrationService(db *gorm.DB, vc vault.VaultClient, api slackapp.
 	if cfg.AppVaultPath == "" {
 		cfg.AppVaultPath = DefaultSlackAppPath
 	}
-	return &SlackIntegrationService{db: db, vault: vc, api: api, cfg: cfg, now: time.Now}
+	cfg.CookieDomain = strings.ToLower(strings.Trim(strings.TrimSpace(cfg.CookieDomain), "."))
+	return &SlackIntegrationService{db: db, vault: vc, api: api, cfg: cfg, now: time.Now,
+		slots: make(chan struct{}, slackInteractionWorkers)}
 }
 
 // WithClock sets the clock (tests: signature windows, token expiry).
@@ -300,26 +368,79 @@ type slackState struct {
 	U string `json:"u"`
 	M string `json:"m"`
 	N string `json:"n"`
+	// R is the redirect URI the authorize request named (the code exchange
+	// must repeat it); "" in states minted before it was recorded.
+	R string `json:"r,omitempty"`
 	E int64  `json:"e"`
 }
 
 // SlackInstallStart is GET /install's answer.
 type SlackInstallStart struct {
 	AuthorizeURL string    `json:"authorize_url"`
+	RedirectURI  string    `json:"redirect_uri"`
 	ExpiresAt    time.Time `json:"expires_at"`
-	// Nonce is set as the SlackInstallCookie by the controller; never in
-	// the JSON.
-	Nonce string `json:"-"`
+	// Nonce is set as the SlackInstallCookie by the controller, with
+	// CookieDomain ("" host-only) and CookiePath; never in the JSON.
+	Nonce        string `json:"-"`
+	CookieDomain string `json:"-"`
+	CookiePath   string `json:"-"`
 }
 
-// StartInstall begins an install for the member (actor, membership) of ws.
-func (s *SlackIntegrationService) StartInstall(ctx context.Context, ws, actor, membership uuid.UUID) (*SlackInstallStart, error) {
+var slackHostRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$`)
+
+// slackCookieReaches reports whether a cookie set by a response from
+// setter, with Domain domain ("" = host-only), is sent by a browser to
+// target (hostnames, no port: cookies ignore ports).
+func slackCookieReaches(setter, target, domain string) bool {
+	setter, target, domain = strings.ToLower(setter), strings.ToLower(target), strings.ToLower(domain)
+	if domain == "" {
+		return setter != "" && setter == target
+	}
+	under := func(h string) bool { return h == domain || strings.HasSuffix(h, "."+domain) }
+	return under(setter) && under(target)
+}
+
+// installRedirect is the redirect URI of an install started on installHost
+// (the Host the browser sent GET /install to, where the cookie is set), and
+// the cookie path; it refuses a redirect whose host would not receive the
+// cookie (DECISIONS above).
+func (s *SlackIntegrationService) installRedirect(installHost string) (redirect, cookiePath string, err error) {
+	host := strings.ToLower(strings.TrimSpace(installHost))
+	if !slackHostRe.MatchString(host) {
+		return "", "", slackErr(http.StatusBadRequest, "invalid_parameter", "The request has no usable Host.", map[string]any{"parameter": "Host"})
+	}
+	raw := s.cfg.RedirectURL
+	if raw == "" {
+		raw = (&url.URL{Scheme: "https", Host: host, Path: SlackCallbackPath}).String()
+	}
+	u, perr := url.Parse(raw)
+	if perr != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", slackErr(http.StatusServiceUnavailable, SlackCodeNotConfigured,
+			"The Slack app's redirect URL ("+SlackRedirectURLEnv+") is not an absolute http(s) URL without query.", map[string]any{"reason": "redirect_invalid"})
+	}
+	setter := (&url.URL{Host: host}).Hostname()
+	if !slackCookieReaches(setter, u.Hostname(), s.cfg.CookieDomain) {
+		return "", "", slackErr(http.StatusServiceUnavailable, SlackCodeNotConfigured,
+			"The Slack install cannot complete here: the browser would not send this host's install cookie to the redirect URL's host. Set "+
+				SlackRedirectURLEnv+" to this API host's callback, or "+SlackCookieDomainEnv+" to a domain both hosts share.",
+			map[string]any{"reason": "redirect_cookie_mismatch", "install_host": setter, "redirect_host": u.Hostname(), "cookie_domain": s.cfg.CookieDomain})
+	}
+	cookiePath = u.EscapedPath()
+	if cookiePath == "" {
+		cookiePath = "/"
+	}
+	return u.String(), cookiePath, nil
+}
+
+// StartInstall begins an install for the member (actor, membership) of ws;
+// installHost is the Host the browser sent GET /install to.
+func (s *SlackIntegrationService) StartInstall(ctx context.Context, ws, actor, membership uuid.UUID, installHost string) (*SlackInstallStart, error) {
 	if err := s.mustConfigured(); err != nil {
 		return nil, err
 	}
-	if s.cfg.RedirectURL == "" {
-		return nil, slackErr(http.StatusServiceUnavailable, SlackCodeNotConfigured,
-			"The Slack app has no redirect URL: set "+SlackRedirectURLEnv+" or the console base URL.", nil)
+	redirect, cookiePath, err := s.installRedirect(installHost)
+	if err != nil {
+		return nil, err
 	}
 	clientID, _, err := s.appCredentials()
 	if err != nil {
@@ -331,12 +452,30 @@ func (s *SlackIntegrationService) StartInstall(ctx context.Context, ws, actor, m
 	}
 	exp := s.now().Add(slackStateTTL)
 	state, err := s.signToken("oauth_state", slackState{W: ws.String(), U: actor.String(), M: membership.String(),
-		N: nonceDigest(nonce), E: exp.Unix()})
+		N: nonceDigest(nonce), R: redirect, E: exp.Unix()})
 	if err != nil {
 		return nil, err
 	}
-	q := url.Values{"client_id": {clientID}, "scope": {slackapp.Scopes}, "state": {state}, "redirect_uri": {s.cfg.RedirectURL}}
-	return &SlackInstallStart{AuthorizeURL: slackapp.AuthorizeURL + "?" + q.Encode(), ExpiresAt: exp, Nonce: nonce}, nil
+	q := url.Values{"client_id": {clientID}, "scope": {slackapp.Scopes}, "state": {state}, "redirect_uri": {redirect}}
+	return &SlackInstallStart{AuthorizeURL: slackapp.AuthorizeURL + "?" + q.Encode(), RedirectURI: redirect, ExpiresAt: exp,
+		Nonce: nonce, CookieDomain: s.cfg.CookieDomain, CookiePath: cookiePath}, nil
+}
+
+// CallbackCookieScope is the Domain and Path of the install cookie a
+// callback carrying state must clear: from the state's (signed) redirect
+// URI, else the defaults.
+func (s *SlackIntegrationService) CallbackCookieScope(state string) (domain, path string) {
+	path = SlackCallbackPath
+	var st slackState
+	if s != nil && state != "" && s.openToken("oauth_state", state, &st) && st.R != "" {
+		if u, err := url.Parse(st.R); err == nil && u.EscapedPath() != "" {
+			path = u.EscapedPath()
+		}
+	}
+	if s != nil {
+		domain = s.cfg.CookieDomain
+	}
+	return domain, path
 }
 
 // SlackInstallResult is a completed install.
@@ -398,7 +537,11 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.api.OAuthV2Access(ctx, clientID, clientSecret, code, s.cfg.RedirectURL)
+	redirect := st.R
+	if redirect == "" {
+		redirect = s.cfg.RedirectURL
+	}
+	res, err := s.api.OAuthV2Access(ctx, clientID, clientSecret, code, redirect)
 	if err != nil {
 		log.Printf("[slack] workspace %s: oauth.v2.access failed: %v", ws, err)
 		return nil, slackErr(http.StatusBadGateway, SlackCodeInstallFailed, "Slack did not complete the install; try again.", nil)
@@ -416,6 +559,25 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 			"This Slack workspace is already connected to another AuthSec workspace; disconnect it there first.", nil)
 	}
 	path := SlackBotTokenPath(ws)
+	// The token of the installation being replaced: put back if this
+	// install fails; revoked once the new one is committed when it was
+	// another team's.
+	var prevSecret map[string]interface{}
+	prevToken, prevTeam := "", ""
+	if cur, err := activeSlackIntegration(db, ws); err != nil {
+		return nil, err
+	} else if cur != nil && cur.BotTokenRef != "" {
+		prevTeam = cur.SlackTeamID
+		if sec, rerr := s.vault.ReadSecret(cur.BotTokenRef); rerr == nil {
+			prevSecret = sec
+			prevToken, _ = sec["token"].(string)
+		}
+	}
+	// DECISION: only a team change revokes. For the same team Slack keeps
+	// one bot installation (a reinstall normally returns the same token);
+	// auth.revoke of a token of a live installation could uninstall the app
+	// the new token belongs to.
+	teamChanged := prevTeam != "" && prevTeam != res.TeamID
 	if err := s.vault.WriteSecret(path, map[string]interface{}{"token": res.AccessToken, "team_id": res.TeamID,
 		"bot_user_id": res.BotUserID, "scope": res.Scope}); err != nil {
 		log.Printf("[slack] workspace %s: storing the bot token failed: %v", ws, err)
@@ -455,15 +617,24 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 			return err
 		}
 		out.Integration = rows[0]
-		return appendGovEvent(tx, ws, GovEventSlackInstalled, models.GovActorUser, actor.String(), govEventRefs{}, map[string]any{
-			"slack_team_id": res.TeamID, "slack_team_name": res.TeamName, "scopes": res.Scope, "reinstall": len(prev) == 1})
+		payload := map[string]any{"slack_team_id": res.TeamID, "slack_team_name": res.TeamName, "scopes": res.Scope, "reinstall": len(prev) == 1,
+			"previous_token_revoked": teamChanged && prevToken != "" && prevToken != res.AccessToken}
+		if len(prev) == 1 && prev[0].RevokedAt == nil && prev[0].SlackTeamID != res.TeamID {
+			payload["replaced_slack_team_id"] = prev[0].SlackTeamID
+		}
+		return appendGovEvent(tx, ws, GovEventSlackInstalled, models.GovActorUser, actor.String(), govEventRefs{}, payload)
 	})
 	if err != nil {
-		var ge *GovError
-		if errors.As(err, &ge) && ge.Code == SlackCodeTeamBound && (out.Before == nil || out.Before.SlackTeamID != res.TeamID) {
-			_ = s.vault.DeleteSecret(path)
-		}
+		// The new token is stored nowhere now: revoke it, unless it may be
+		// the still-active installation's own (same team).
+		s.undoTokenWrite(ctx, ws, path, prevSecret, res.AccessToken, prevTeam == "" || teamChanged)
 		return nil, err
+	}
+	// The replaced team's token is dead from now on: revoke it at Slack.
+	if teamChanged && prevToken != "" && prevToken != res.AccessToken {
+		if rerr := s.api.AuthRevoke(ctx, prevToken); rerr != nil {
+			log.Printf("[slack] workspace %s: auth.revoke of the replaced token: %v", ws, rerr)
+		}
 	}
 	n, err := s.SyncLinks(ctx, ws)
 	if err != nil {
@@ -471,6 +642,25 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 	}
 	out.Linked = n
 	return out, nil
+}
+
+// undoTokenWrite undoes the Vault write of an install whose transaction
+// failed: the previous installation's secret is written back (it is again
+// the current version), or, with none, the path is destroyed; the new token
+// is revoked when revokeNew.
+func (s *SlackIntegrationService) undoTokenWrite(ctx context.Context, ws uuid.UUID, path string, prevSecret map[string]interface{}, newToken string, revokeNew bool) {
+	if prevSecret != nil {
+		if err := s.vault.WriteSecret(path, prevSecret); err != nil {
+			log.Printf("[slack] workspace %s: restoring the previous bot token after a failed install: %v", ws, err)
+		}
+	} else if _, err := vault.Destroy(s.vault, path); err != nil {
+		log.Printf("[slack] workspace %s: removing the bot token of a failed install: %v", ws, err)
+	}
+	if revokeNew && newToken != "" {
+		if err := s.api.AuthRevoke(ctx, newToken); err != nil {
+			log.Printf("[slack] workspace %s: auth.revoke of a failed install's token: %v", ws, err)
+		}
+	}
 }
 
 /* ------------------------------ settings, disconnect ----------------------- */
@@ -548,8 +738,14 @@ func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid
 		}
 	}
 	if s.vault != nil && before.BotTokenRef != "" {
-		if derr := s.vault.DeleteSecret(before.BotTokenRef); derr != nil {
-			log.Printf("[slack] workspace %s: deleting the bot token: %v", ws, derr)
+		// Destroy, not a soft delete: no version of the token may stay
+		// recoverable from Vault after a disconnect.
+		destroyed, derr := vault.Destroy(s.vault, before.BotTokenRef)
+		switch {
+		case derr != nil:
+			log.Printf("[slack] workspace %s: destroying the bot token: %v", ws, derr)
+		case !destroyed:
+			log.Printf("[slack] workspace %s: the secrets store can only soft-delete the bot token at %s", ws, before.BotTokenRef)
 		}
 	}
 	return before, nil
@@ -579,9 +775,22 @@ func slackStatusFor(db *gorm.DB, ws uuid.UUID) *SlackStatusView {
 
 /* ---------------------------------- links ---------------------------------- */
 
+// insertLinkTx links slackUser to user unless the Slack user is linked
+// already, or the member already holds a link (one per member: 057); it
+// reports whether it made the link.
 func (s *SlackIntegrationService) insertLinkTx(tx *gorm.DB, ws uuid.UUID, slackUser string, user uuid.UUID, via string, actorKind, actorID string) (bool, error) {
+	var held int64
+	if err := tx.Raw(`SELECT count(*) FROM slack_user_link WHERE workspace_id = ? AND user_id = ? AND slack_user_id <> ?`, ws, user, slackUser).
+		Scan(&held).Error; err != nil {
+		return false, err
+	}
+	if held > 0 {
+		return false, nil
+	}
+	// No conflict target: either unique key (the Slack user's, 054; the
+	// member's, 057) makes a concurrent second link a no-op.
 	res := tx.Exec(`INSERT INTO slack_user_link (workspace_id, slack_user_id, user_id, linked_via) VALUES (?, ?, ?, ?)
-		ON CONFLICT (workspace_id, slack_user_id) DO NOTHING`, ws, slackUser, user, via)
+		ON CONFLICT DO NOTHING`, ws, slackUser, user, via)
 	if res.Error != nil {
 		return false, res.Error
 	}
@@ -648,8 +857,24 @@ func (s *SlackIntegrationService) SyncLinks(ctx context.Context, ws uuid.UUID) (
 // slackUserLinkable: a real, current user of the team whose Slack account
 // email is confirmed and equals email.
 func slackUserLinkable(u *slackapp.User, team, email string) bool {
-	return u != nil && u.ID != "" && !u.Deleted && !u.IsBot && u.IsEmailConfirmed &&
-		(u.TeamID == "" || u.TeamID == team) && NormalizeMemberEmail(u.Email) == email
+	return slackLinkRefusal(u, team, email) == ""
+}
+
+// slackLinkRefusal is why u cannot be linked to the member whose email is
+// email ("" when it can): the only proof of ownership is Slack's confirmed
+// account email being the member's.
+func slackLinkRefusal(u *slackapp.User, team, email string) string {
+	switch {
+	case u == nil || u.ID == "" || u.Deleted || u.IsBot:
+		return "slack_user_unusable"
+	case u.TeamID != "" && u.TeamID != team:
+		return "other_team"
+	case !u.IsEmailConfirmed:
+		return "email_unconfirmed"
+	case email == "" || NormalizeMemberEmail(u.Email) != email:
+		return "email_mismatch"
+	}
+	return ""
 }
 
 type slackLinkToken struct {
@@ -674,7 +899,10 @@ type SlackLinkResult struct {
 }
 
 // ConfirmLink is POST /link/confirm {token}: the signed-in member confirms
-// the Slack user the token names is them.
+// that the Slack user the token names is them. The token only says which
+// Slack user to look at -- it proves nothing, since it can be forwarded:
+// the link is made only when Slack, asked now, reports that Slack user's
+// confirmed account email as the member's own (DECISIONS above, P0-3).
 func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uuid.UUID, token string) (*SlackLinkResult, error) {
 	if err := s.mustConfigured(); err != nil {
 		return nil, err
@@ -687,28 +915,63 @@ func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uui
 		// Another workspace's token: the same answer as an absent object.
 		return nil, GovNotFound()
 	}
+	db := s.db.WithContext(ctx)
+	in, err := activeSlackIntegration(db, ws)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil || in.SlackTeamID != lt.T {
+		return nil, slackErr(http.StatusConflict, SlackCodeNotConnected, "That Slack workspace is no longer connected to this workspace.", nil)
+	}
+	m, err := s.members.ActiveMembers(db, ws, []uuid.UUID{actor})
+	if err != nil {
+		return nil, err
+	}
+	member, ok := m[actor]
+	if !ok {
+		return nil, govErr(http.StatusForbidden, "forbidden", "Only an active member of this workspace can link a Slack account.", nil)
+	}
+	bot, err := s.botToken(in)
+	if err != nil {
+		log.Printf("[slack] workspace %s: link confirmation: %v", ws, err)
+		return nil, slackErr(http.StatusBadGateway, SlackCodeUnavailable, "AuthSec could not ask Slack about this account; try again shortly.", nil)
+	}
+	u, err := s.api.UsersInfo(ctx, bot, lt.S)
+	if err != nil {
+		log.Printf("[slack] workspace %s: users.info %s for a link confirmation: %v", ws, lt.S, err)
+		return nil, slackErr(http.StatusBadGateway, SlackCodeUnavailable, "AuthSec could not ask Slack about this account; try again shortly.", nil)
+	}
+	if reason := slackLinkRefusal(u, in.SlackTeamID, NormalizeMemberEmail(member.Email)); reason != "" {
+		return nil, slackErr(http.StatusForbidden, SlackCodeLinkEmailMismatch,
+			"This Slack account can be linked only by the member whose AuthSec email is the Slack account's confirmed email.",
+			map[string]any{"reason": reason})
+	}
 	var out SlackLinkResult
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		in, err := activeSlackIntegration(tx, ws)
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var existing []models.SlackUserLink
+		if err := tx.Raw(`SELECT * FROM slack_user_link WHERE workspace_id = ? AND (slack_user_id = ? OR user_id = ?) FOR UPDATE`,
+			ws, lt.S, actor).Scan(&existing).Error; err != nil {
+			return err
+		}
+		for _, l := range existing {
+			if l.SlackUserID == lt.S {
+				if l.UserID != actor {
+					return slackErr(http.StatusConflict, SlackCodeAlreadyLinked, "This Slack account is linked to another member.", nil)
+				}
+				out.Link = l
+				return nil
+			}
+		}
+		if len(existing) > 0 {
+			return slackErr(http.StatusConflict, SlackCodeMemberLinked,
+				"You already have a Slack account linked in this workspace; one Slack account per member.", nil)
+		}
+		made, err := s.insertLinkTx(tx, ws, lt.S, actor, "console_confirmation", models.GovActorUser, actor.String())
 		if err != nil {
 			return err
 		}
-		if in == nil || in.SlackTeamID != lt.T {
-			return slackErr(http.StatusConflict, SlackCodeNotConnected, "That Slack workspace is no longer connected to this workspace.", nil)
-		}
-		var existing []models.SlackUserLink
-		if err := tx.Where("workspace_id = ? AND slack_user_id = ?", ws, lt.S).Find(&existing).Error; err != nil {
-			return err
-		}
-		if len(existing) == 1 {
-			if existing[0].UserID != actor {
-				return slackErr(http.StatusConflict, SlackCodeAlreadyLinked, "This Slack account is linked to another member.", nil)
-			}
-			out.Link = existing[0]
-			return nil
-		}
-		if _, err := s.insertLinkTx(tx, ws, lt.S, actor, "console_confirmation", models.GovActorUser, actor.String()); err != nil {
-			return err
+		if !made { // a concurrent link took the Slack user or the member
+			return slackErr(http.StatusConflict, SlackCodeAlreadyLinked, "This Slack account or member was linked meanwhile; reload.", nil)
 		}
 		return tx.Where("workspace_id = ? AND slack_user_id = ?", ws, lt.S).Take(&out.Link).Error
 	})
@@ -719,7 +982,8 @@ func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uui
 }
 
 // linkedUser maps a Slack user to a member: the link, else a link made now
-// from a confirmed email naming exactly one active member.
+// from a confirmed email naming exactly one active member who holds no
+// other link.
 func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.WorkspaceSlackIntegration, slackUser string) (uuid.UUID, error) {
 	db := s.db.WithContext(ctx)
 	var links []models.SlackUserLink
@@ -750,12 +1014,26 @@ func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.Wor
 	if !ok {
 		return uuid.Nil, nil // none, or ambiguous: console confirmation
 	}
+	made := false
 	err = db.Transaction(func(tx *gorm.DB) error {
-		_, e2 := s.insertLinkTx(tx, in.WorkspaceID, slackUser, member.UserID, "verified_email", models.GovActorSlackUser, slackUser)
+		var e2 error
+		made, e2 = s.insertLinkTx(tx, in.WorkspaceID, slackUser, member.UserID, "verified_email", models.GovActorSlackUser, slackUser)
 		return e2
 	})
 	if err != nil {
 		return uuid.Nil, err
+	}
+	if !made {
+		// Linked meanwhile (read it back), or the member holds another
+		// Slack link (one per member): this Slack user stays unlinked.
+		links = nil
+		if err := db.Where("workspace_id = ? AND slack_user_id = ?", in.WorkspaceID, slackUser).Limit(1).Find(&links).Error; err != nil {
+			return uuid.Nil, err
+		}
+		if len(links) == 1 {
+			return links[0].UserID, nil
+		}
+		return uuid.Nil, nil
 	}
 	return member.UserID, nil
 }
