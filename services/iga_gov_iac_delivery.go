@@ -1443,17 +1443,13 @@ func (d *GovIaCDelivery) recordLedgerTx(tx *gorm.DB, ws uuid.UUID, x *iacDep, no
 	switch p.Kind {
 	case igagov.PlanSplit:
 		dsp := p.Diff.Split
-		subjects := dsp.Subjects()
-		if err := firstErr(settle("dedicated_role", dsp.NewRoleARN, "released"), present("dedicated_role", dsp.NewRoleARN, nil),
-			settle("workload_binding", subjects[0], "released", subjects[1:]...)); err != nil {
-			return err
-		}
-		for _, sa := range subjects {
-			if err := present("workload_binding", sa, nil); err != nil {
-				return err
-			}
-		}
-		return nil
+		// DECISION (review P1-12 (d)): the ledger keeps ONE workload_binding
+		// per control (051 uq_iga_gov_artifact_live), named by the intent's
+		// binding_ref: for an ECS task role the native binding is the task
+		// definition's taskRoleArn, which every subject service follows. The
+		// per-service state is the migration rows (one per service).
+		return firstErr(settle("dedicated_role", dsp.NewRoleARN, "released"), present("dedicated_role", dsp.NewRoleARN, nil),
+			settle("workload_binding", dsp.SubjectARN, "released"), present("workload_binding", dsp.SubjectARN, nil))
 	case igagov.PlanSplitRevert:
 		dsp := p.Diff.Split
 		if err := tx.Exec(`UPDATE iga_gov_workload_migration SET state = 'reverted' WHERE workspace_id = ? AND control_id = ?
