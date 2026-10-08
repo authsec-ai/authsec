@@ -1317,22 +1317,16 @@ func SetupRoutes(
 		registerLogsRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
-		// Legacy embedded SPIRE control plane — quarantined behind
-		// ENABLE_EMBEDDED_SPIRE (default off). Both mounts back onto
-		// internal/spire repositories that query control-plane tables
-		// (agents, workloads, certificates, …) absent from the single
-		// master bootstrap, so they 500 if mounted. The SPIFFE-SVID M2M
-		// path is independent of this flag and stays available.
+		// Embedded SPIRE control plane — mounted with ENABLE_EMBEDDED_SPIRE
+		// (default off). Workspace-scoped (AS-081): its spire_* tables are
+		// workspace-owned (migration 120) and every route takes its
+		// workspace from a verified credential. The SPIFFE-SVID M2M path is
+		// independent of this flag and stays available.
 		//   - /authsec/spire     : SPIRE Headless (spire-headless microservice)
 		//   - /authsec/spiresvc  : SPIRE Identity Service (authsec-spire)
 		// ────────────────────────────────────────────────────
-		embeddedSpireEnabled := config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire
-		if embeddedSpireEnabled {
-			registerSpireRoutes(authsec)
-			if spireDeps != nil {
-				spiresvc := authsec.Group("/spiresvc")
-				spire.RegisterRoutes(spiresvc, spireDeps)
-			}
+		if config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire {
+			RegisterEmbeddedSpireRoutes(authsec, spireDeps)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -2312,11 +2306,26 @@ func registerLogsRoutes(r gin.IRouter) {
 	}
 }
 
+// RegisterEmbeddedSpireRoutes mounts the embedded SPIRE control plane on the
+// /authsec group: /spire (headless) and, when deps is set, /spiresvc
+// (identity service). SetupRoutes calls it only with ENABLE_EMBEDDED_SPIRE.
+func RegisterEmbeddedSpireRoutes(authsec *gin.RouterGroup, deps *spire.Dependencies) {
+	registerSpireRoutes(authsec)
+	if deps != nil {
+		spire.RegisterRoutes(authsec.Group("/spiresvc"), deps)
+	}
+}
+
 // registerSpireRoutes registers all SPIRE Headless routes under /spire.
 // Previously served by the standalone spire-headless microservice.
+// Everything except OIDC discovery/JWKS needs a workspace token (AS-081);
+// writes need owner/admin.
 func registerSpireRoutes(r gin.IRouter) {
 	sc := platformCtrl.NewSpireController()
 	platformCtrl.SetSharedSpireController(sc)
+
+	auth := middlewares.AuthMiddleware()
+	admin := middlewares.RequireWorkspaceRole("owner", "admin")
 
 	spire := r.Group("/spire")
 
@@ -2328,23 +2337,24 @@ func registerSpireRoutes(r gin.IRouter) {
 	spire.GET("/.well-known/openid-configuration", sc.OIDCDiscovery)
 	spire.GET("/.well-known/jwks.json", sc.OIDCJWKSHandler)
 
-	// ── Registry (requires authentication) ──
-	registry := spire.Group("/registry", middlewares.AuthMiddleware())
+	// ── Registry ──
+	registry := spire.Group("/registry", auth)
 	{
-		registry.POST("/workloads", sc.RegisterWorkload)
-		registry.PUT("/workloads/:id", sc.UpdateWorkload)
-		registry.DELETE("/workloads/:id", sc.DeleteWorkload)
 		registry.GET("/workloads", sc.ListWorkloads)
+		registry.POST("/workloads", admin, sc.RegisterWorkload)
+		registry.PUT("/workloads/:id", admin, sc.UpdateWorkload)
+		registry.DELETE("/workloads/:id", admin, sc.DeleteWorkload)
 	}
 
-	// ── OIDC token operations ──
-	oidc := spire.Group("/oidc")
+	// ── OIDC token operations: the exchanged credential must belong to
+	// the caller's workspace ──
+	oidc := spire.Group("/oidc", auth)
 	{
 		oidc.POST("/token", sc.OIDCTokenExchange)
 		oidc.POST("/introspect", sc.OIDCIntrospect)
 		oidc.POST("/revoke", sc.OIDCRevoke)
 		oidc.POST("/exchange/spiffe", sc.OIDCExchangeSPIFFE)
-		oidc.POST("/issue/jwt-svid", sc.OIDCIssueJWTSVID)
+		oidc.POST("/issue/jwt-svid", admin, sc.OIDCIssueJWTSVID)
 		oidc.POST("/exchange/cloud", sc.OIDCExchangeCloud)
 		oidc.POST("/exchange/aws", sc.OIDCExchangeAWS)
 		oidc.POST("/exchange/azure", sc.OIDCExchangeAzure)
@@ -2352,33 +2362,28 @@ func registerSpireRoutes(r gin.IRouter) {
 	}
 
 	// ── Policy engine ──
-	policy := spire.Group("/policy")
+	policy := spire.Group("/policy", auth)
 	{
-		policy.POST("", sc.CreatePolicy)
 		policy.GET("", sc.ListPolicies)
 		policy.GET("/:id", sc.GetPolicy)
-		policy.PUT("/:id", sc.UpdatePolicy)
-		policy.DELETE("/:id", sc.DeletePolicy)
 		policy.POST("/evaluate", sc.EvaluatePolicy)
 		policy.POST("/batch-evaluate", sc.BatchEvaluatePolicy)
 		policy.POST("/test", sc.TestPolicy)
+		policy.POST("", admin, sc.CreatePolicy)
+		policy.PUT("/:id", admin, sc.UpdatePolicy)
+		policy.DELETE("/:id", admin, sc.DeletePolicy)
 	}
 
 	// ── Role bindings ──
-	roles := spire.Group("/roles")
+	roles := spire.Group("/roles", auth)
 	{
-		roles.POST("/bind", sc.BindRole)
-		roles.POST("/unbind", sc.UnbindRole)
 		roles.GET("/bindings", sc.ListRoleBindings)
+		roles.POST("/bind", admin, sc.BindRole)
+		roles.POST("/unbind", admin, sc.UnbindRole)
 	}
 
 	// ── Audit (admin + workspace-scoped) ──
-	audit := spire.Group("/audit")
-	audit.Use(
-		middlewares.AuthMiddleware(),
-		middlewares.RequireWorkspaceRole("owner", "admin"),
-		middlewares.ValidateWorkspaceFromToken(),
-	)
+	audit := spire.Group("/audit", auth, admin)
 	{
 		audit.GET("/logs", sc.GetAuditLogs)
 		audit.GET("/logs/export", sc.ExportAuditLogs)

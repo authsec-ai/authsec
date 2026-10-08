@@ -8,10 +8,12 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -47,13 +49,13 @@ type SpireWorkload struct {
 
 func (SpireWorkload) TableName() string { return "spire_workloads" }
 
-// WorkloadEntry is the GORM model for workload_entries in tenant databases.
-// Stores the full workload registration with selectors, parent_id, and TTL
-// so that SPIRE agents can look up and attest workloads.
+// WorkloadEntry is the GORM model for spire_workload_entries (migration
+// 120): the workload registration (selectors, parent_id, TTL) SPIRE agents
+// look up to attest workloads. Owned by a workspace.
 type WorkloadEntry struct {
 	ID           uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID  uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
-	SpiffeID     string          `json:"spiffe_id" gorm:"type:varchar(512);uniqueIndex;not null"`
+	SpiffeID     string          `json:"spiffe_id" gorm:"type:varchar(512);not null"`
 	ParentID     string          `json:"parent_id" gorm:"type:varchar(512);not null"`
 	Selectors    json.RawMessage `json:"selectors" gorm:"type:jsonb;not null"`
 	TTL          int             `json:"ttl" gorm:"default:3600"`
@@ -64,20 +66,21 @@ type WorkloadEntry struct {
 	UpdatedAt    time.Time       `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
-func (WorkloadEntry) TableName() string { return "workload_entries" }
+func (WorkloadEntry) TableName() string { return "spire_workload_entries" }
 
 // SpireOIDCToken stores OIDC token metadata for revocation tracking.
 type SpireOIDCToken struct {
-	ID        uint      `json:"id" gorm:"primaryKey"`
-	JWTID     string    `json:"jti" gorm:"uniqueIndex"`
-	Subject   string    `json:"subject"`
-	SPIFFEID  string    `json:"spiffe_id"`
-	TokenType string    `json:"token_type"`
-	Audience  string    `json:"audience"`
-	Scope     string    `json:"scope"`
-	ExpiresAt time.Time `json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
-	Revoked   bool      `json:"revoked"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID `json:"-" gorm:"type:uuid"`
+	JWTID       string    `json:"jti" gorm:"column:jwt_id;uniqueIndex"`
+	Subject     string    `json:"subject"`
+	SPIFFEID    string    `json:"spiffe_id" gorm:"column:spiffe_id"`
+	TokenType   string    `json:"token_type"`
+	Audience    string    `json:"audience"`
+	Scope       string    `json:"scope"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	Revoked     bool      `json:"revoked"`
 }
 
 func (SpireOIDCToken) TableName() string { return "spire_oidc_tokens" }
@@ -85,6 +88,7 @@ func (SpireOIDCToken) TableName() string { return "spire_oidc_tokens" }
 // SpirePolicy represents a policy document.
 type SpirePolicy struct {
 	ID          uint              `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID         `json:"-" gorm:"type:uuid"`
 	Name        string            `json:"name" gorm:"uniqueIndex"`
 	Description string            `json:"description"`
 	Version     string            `json:"version"`
@@ -100,60 +104,65 @@ func (SpirePolicy) TableName() string { return "spire_policies" }
 
 // SpirePolicyRule represents individual policy rules.
 type SpirePolicyRule struct {
-	ID         uint                   `json:"id" gorm:"primaryKey"`
-	PolicyID   uint                   `json:"policy_id"`
-	Name       string                 `json:"name"`
-	Effect     string                 `json:"effect"`
-	Priority   int                    `json:"priority"`
-	Subjects   []SpirePolicySubject   `json:"subjects" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
-	Resources  []SpirePolicyResource  `json:"resources" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
-	Actions    []SpirePolicyAction    `json:"actions" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
-	Conditions []SpirePolicyCondition `json:"conditions" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
-	Attributes map[string]interface{} `json:"attributes" gorm:"serializer:json"`
-	CreatedAt  time.Time              `json:"created_at"`
-	UpdatedAt  time.Time              `json:"updated_at"`
+	ID          uint                   `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID              `json:"-" gorm:"type:uuid"`
+	PolicyID    uint                   `json:"policy_id"`
+	Name        string                 `json:"name"`
+	Effect      string                 `json:"effect"`
+	Priority    int                    `json:"priority"`
+	Subjects    []SpirePolicySubject   `json:"subjects" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
+	Resources   []SpirePolicyResource  `json:"resources" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
+	Actions     []SpirePolicyAction    `json:"actions" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
+	Conditions  []SpirePolicyCondition `json:"conditions" gorm:"foreignKey:RuleID;constraint:OnDelete:CASCADE"`
+	Attributes  map[string]interface{} `json:"attributes" gorm:"serializer:json"`
+	CreatedAt   time.Time              `json:"created_at"`
+	UpdatedAt   time.Time              `json:"updated_at"`
 }
 
 func (SpirePolicyRule) TableName() string { return "spire_policy_rules" }
 
 // SpirePolicySubject, SpirePolicyResource, SpirePolicyAction, SpirePolicyCondition.
 type SpirePolicySubject struct {
-	ID      uint   `json:"id" gorm:"primaryKey"`
-	RuleID  uint   `json:"rule_id"`
-	Type    string `json:"type"`
-	Value   string `json:"value"`
-	Pattern string `json:"pattern"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID `json:"-" gorm:"type:uuid"`
+	RuleID      uint      `json:"rule_id"`
+	Type        string    `json:"type"`
+	Value       string    `json:"value"`
+	Pattern     string    `json:"pattern"`
 }
 
 func (SpirePolicySubject) TableName() string { return "spire_policy_subjects" }
 
 type SpirePolicyResource struct {
-	ID      uint   `json:"id" gorm:"primaryKey"`
-	RuleID  uint   `json:"rule_id"`
-	Type    string `json:"type"`
-	Value   string `json:"value"`
-	Pattern string `json:"pattern"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID `json:"-" gorm:"type:uuid"`
+	RuleID      uint      `json:"rule_id"`
+	Type        string    `json:"type"`
+	Value       string    `json:"value"`
+	Pattern     string    `json:"pattern"`
 }
 
 func (SpirePolicyResource) TableName() string { return "spire_policy_resources" }
 
 type SpirePolicyAction struct {
-	ID     uint   `json:"id" gorm:"primaryKey"`
-	RuleID uint   `json:"rule_id"`
-	Type   string `json:"type"`
-	Value  string `json:"value"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID `json:"-" gorm:"type:uuid"`
+	RuleID      uint      `json:"rule_id"`
+	Type        string    `json:"type"`
+	Value       string    `json:"value"`
 }
 
 func (SpirePolicyAction) TableName() string { return "spire_policy_actions" }
 
 type SpirePolicyCondition struct {
-	ID       uint                   `json:"id" gorm:"primaryKey"`
-	RuleID   uint                   `json:"rule_id"`
-	Type     string                 `json:"type"`
-	Operator string                 `json:"operator"`
-	Key      string                 `json:"key"`
-	Value    string                 `json:"value"`
-	Metadata map[string]interface{} `json:"metadata" gorm:"serializer:json"`
+	ID          uint                   `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID              `json:"-" gorm:"type:uuid"`
+	RuleID      uint                   `json:"rule_id"`
+	Type        string                 `json:"type"`
+	Operator    string                 `json:"operator"`
+	Key         string                 `json:"key"`
+	Value       string                 `json:"value"`
+	Metadata    map[string]interface{} `json:"metadata" gorm:"serializer:json"`
 }
 
 func (SpirePolicyCondition) TableName() string { return "spire_policy_conditions" }
@@ -207,12 +216,13 @@ func (SpireAuditLog) TableName() string { return "spire_audit_logs" }
 
 // SpireRoleBinding represents RBAC role bindings.
 type SpireRoleBinding struct {
-	ID        uint      `json:"id" gorm:"primaryKey"`
-	Subject   string    `json:"subject"`
-	Role      string    `json:"role"`
-	Resource  string    `json:"resource"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	WorkspaceID uuid.UUID `json:"-" gorm:"type:uuid"`
+	Subject     string    `json:"subject"`
+	Role        string    `json:"role"`
+	Resource    string    `json:"resource"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (SpireRoleBinding) TableName() string { return "spire_role_bindings" }
@@ -247,27 +257,29 @@ type spireOIDCProvider struct {
 }
 
 type spireTokenClaims struct {
-	Subject   string                 `json:"sub"`
-	Issuer    string                 `json:"iss"`
-	Audience  []string               `json:"aud"`
-	ExpiresAt int64                  `json:"exp"`
-	IssuedAt  int64                  `json:"iat"`
-	NotBefore int64                  `json:"nbf"`
-	JWTID     string                 `json:"jti"`
-	SPIFFEID  string                 `json:"spiffe_id,omitempty"`
-	Claims    map[string]interface{} `json:"claims,omitempty"`
+	WorkspaceID string                 `json:"workspace_id"`
+	Subject     string                 `json:"sub"`
+	Issuer      string                 `json:"iss"`
+	Audience    []string               `json:"aud"`
+	ExpiresAt   int64                  `json:"exp"`
+	IssuedAt    int64                  `json:"iat"`
+	NotBefore   int64                  `json:"nbf"`
+	JWTID       string                 `json:"jti"`
+	SPIFFEID    string                 `json:"spiffe_id,omitempty"`
+	Claims      map[string]interface{} `json:"claims,omitempty"`
 	jwt.RegisteredClaims
 }
 
 type spireJWTSVIDClaims struct {
-	Subject   string   `json:"sub"`
-	Audience  []string `json:"aud"`
-	Issuer    string   `json:"iss"`
-	ExpiresAt int64    `json:"exp"`
-	IssuedAt  int64    `json:"iat"`
-	NotBefore int64    `json:"nbf"`
-	JWTID     string   `json:"jti"`
-	SPIFFEID  string   `json:"spiffe_id"`
+	WorkspaceID string   `json:"workspace_id"`
+	Subject     string   `json:"sub"`
+	Audience    []string `json:"aud"`
+	Issuer      string   `json:"iss"`
+	ExpiresAt   int64    `json:"exp"`
+	IssuedAt    int64    `json:"iat"`
+	NotBefore   int64    `json:"nbf"`
+	JWTID       string   `json:"jti"`
+	SPIFFEID    string   `json:"spiffe_id"`
 	jwt.RegisteredClaims
 }
 
@@ -298,6 +310,12 @@ type spireTokenExchangeResponse struct {
 // ===== CONTROLLER =====
 
 // SpireController is the merged SPIRE headless platform controller.
+//
+// Every handler acts on the caller's workspace (tenancy.Workspace, set by
+// AuthMiddleware) and reads and writes only that workspace's rows; another
+// workspace's row is 404. The token-exchange endpoints also verify the
+// credential they exchange and require it to belong to the caller's
+// workspace. Only OIDC discovery and JWKS are public (AS-081).
 type SpireController struct {
 	db           *gorm.DB
 	entryClient  entryv1.EntryClient
@@ -317,180 +335,137 @@ func SetSharedSpireController(sc *SpireController) { sharedSpireController = sc 
 // (ENABLE_EMBEDDED_SPIRE) is running, which RegisterAgentWorkload needs.
 func EmbeddedSpireAvailable() bool { return sharedSpireController != nil }
 
-// RegisterAgentWorkload creates a SPIRE workload entry for an AI agent.
-// It writes to both the master DB (spire_workloads) and the tenant DB (workload_entries),
-// and optionally creates a SPIRE entry via gRPC if the server is connected.
-// Returns the generated full SPIFFE ID.
+// workspaceCtx is ctx carrying the workspace, for in-process callers that
+// resolved it from a verified token.
+func workspaceCtx(ws uuid.UUID) context.Context {
+	return tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws, PrincipalKind: "system", Realm: "spire"})
+}
+
+// RegisterAgentWorkload creates a SPIRE workload entry for an AI agent of
+// workspaceID, which the caller took from its verified token. It writes
+// spire_workloads and spire_workload_entries for that workspace, and a SPIRE
+// server entry via gRPC when connected. Returns the full SPIFFE ID.
 func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, selectors map[string]string) (string, error) {
 	sc := sharedSpireController
 	if sc == nil {
 		return "", fmt.Errorf("SPIRE controller not initialized")
 	}
+	wsUUID, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace_id: %w", err)
+	}
+	ctx := workspaceCtx(wsUUID)
+	scoped, err := tenancy.DBContext(ctx, sc.db)
+	if err != nil {
+		return "", err
+	}
 
-	// Resolve the Application ID via legacy_client_id mapping (migration 118).
-	// When an Application has been backfilled, we issue the v4 SPIFFE path:
-	//   spiffe://<trust-domain>/workspaces/{workspace_id}/applications/{application_id}
-	// Otherwise we fall back to the legacy /tenants/<id>/agents/<type>/<id>
-	// path so existing SPIRE entries continue to resolve during the
-	// transition. workspace_id == workspace_id from migration 115's backfill.
-	var (
-		applicationID    *uuid.UUID
-		workspaceUUIDStr = workspaceID
-	)
+	// The Application of this client, in this workspace only (migration 118
+	// legacy_client_id mapping). Backfilled applications get the v4 path
+	// spiffe://<td>/workspaces/<ws>/applications/<app>; others keep the
+	// legacy /tenants/<ws>/agents/<type>/<client> path.
+	var applicationID *uuid.UUID
 	if clientUUID, parseErr := uuid.Parse(clientID); parseErr == nil {
 		var rs models.ResourceServer
-		if err := config.DB.Select("id, workspace_id").
-			Where("legacy_client_id = ?", clientUUID).
-			First(&rs).Error; err == nil {
+		if err := scoped.Select("id, workspace_id").Where("legacy_client_id = ?", clientUUID).First(&rs).Error; err == nil {
 			id := rs.ID
 			applicationID = &id
-			if rs.WorkspaceID != uuid.Nil {
-				workspaceUUIDStr = rs.WorkspaceID.String()
-			}
 		}
 	}
 
-	var spiffeID, parentID string
+	var spiffeID, parentPath string
 	if applicationID != nil {
-		spiffeID = fmt.Sprintf("/workspaces/%s/applications/%s", workspaceUUIDStr, applicationID.String())
-		parentID = fmt.Sprintf("spiffe://%s/workspaces/%s", sc.trustDomain, workspaceUUIDStr)
+		spiffeID = fmt.Sprintf("/workspaces/%s/applications/%s", workspaceID, applicationID.String())
+		parentPath = fmt.Sprintf("/workspaces/%s", workspaceID)
 	} else {
 		spiffeID = fmt.Sprintf("/tenants/%s/agents/%s/%s", workspaceID, agentType, clientID)
-		parentID = fmt.Sprintf("spiffe://%s/tenants/%s/agent", sc.trustDomain, workspaceID)
+		parentPath = fmt.Sprintf("/tenants/%s/agent", workspaceID)
 	}
 	fullSpiffeID := fmt.Sprintf("spiffe://%s%s", sc.trustDomain, spiffeID)
+	parentID := fmt.Sprintf("spiffe://%s%s", sc.trustDomain, parentPath)
 
-	// Build SPIRE selectors from the user-supplied key-value pairs
+	// SPIRE selectors from "type:key" -> value pairs.
 	var spireSelectors []*typespb.Selector
 	for key, value := range selectors {
-		// Split key like "k8s:ns" into type="k8s" value="ns:<user-value>"
-		// or "k8s:pod-label:app" into type="k8s" value="pod-label:app:<user-value>"
 		parts := strings.SplitN(key, ":", 2)
-		selectorType := parts[0]
 		selectorKey := ""
 		if len(parts) > 1 {
 			selectorKey = parts[1]
 		}
-		spireSelectors = append(spireSelectors, &typespb.Selector{
-			Type:  selectorType,
-			Value: fmt.Sprintf("%s:%s", selectorKey, value),
-		})
+		spireSelectors = append(spireSelectors, &typespb.Selector{Type: parts[0], Value: fmt.Sprintf("%s:%s", selectorKey, value)})
 	}
-
-	// Fallback: if no selectors provided, use a default owner-based selector
 	if len(spireSelectors) == 0 {
-		spireSelectors = []*typespb.Selector{
-			{Type: "k8s", Value: fmt.Sprintf("pod-label:owner:%s", clientID)},
-		}
+		spireSelectors = []*typespb.Selector{{Type: "k8s", Value: fmt.Sprintf("pod-label:owner:%s", clientID)}}
 	}
 
-	// Build selectors JSON for the workload_entries record
 	selectorMap := map[string]string{
 		"authsec:client_id":    clientID,
 		"authsec:agent_type":   agentType,
 		"authsec:workspace_id": workspaceID,
 	}
 	for k, v := range selectors {
-		selectorMap[k] = v
+		if !strings.HasPrefix(k, "authsec:") {
+			selectorMap[k] = v
+		}
 	}
 	selectorsJSON, err := json.Marshal(selectorMap)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal selectors: %w", err)
 	}
 
-	// Save workload record to master DB (spire_workloads)
-	w := SpireWorkload{
-		SpiffeID: spiffeID,
-		Owner:    clientID,
-	}
-	if ws, err := uuid.Parse(workspaceUUIDStr); err == nil {
-		w.WorkspaceID = &ws
-	}
-	if err := sc.db.Create(&w).Error; err != nil {
+	w := SpireWorkload{SpiffeID: spiffeID, Owner: clientID, WorkspaceID: &wsUUID}
+	if err := scoped.Create(&w).Error; err != nil {
 		return "", fmt.Errorf("failed to save workload record: %w", err)
 	}
 
-	// Save workload entry to tenant DB (workload_entries)
-	workspaceUUID, err := uuid.Parse(workspaceID)
-	if err != nil {
-		return "", fmt.Errorf("invalid workspace_id: %w", err)
+	entry := WorkloadEntry{
+		ID:          uuid.New(),
+		WorkspaceID: wsUUID,
+		SpiffeID:    fullSpiffeID,
+		ParentID:    parentID,
+		Selectors:   selectorsJSON,
+		TTL:         3600,
 	}
-
-	tenantDB := config.DB
-	{
-		entry := WorkloadEntry{
-			ID:          uuid.New(),
-			WorkspaceID: workspaceUUID,
-			SpiffeID:    fullSpiffeID,
-			ParentID:    parentID,
-			Selectors:   selectorsJSON,
-			TTL:         3600,
-		}
-		if err := tenantDB.Create(&entry).Error; err != nil {
-			log.Printf("[SPIRE] Warning: failed to save workload entry: %v", err)
-			// Continue — don't fail the whole registration
-		} else {
-			log.Printf("[SPIRE] Workload entry saved: id=%s spiffe_id=%s", entry.ID, entry.SpiffeID)
-		}
-	}
-
-	// Create SPIRE entry via gRPC (if server is connected). ParentId mirrors
-	// the chosen path family — workspace/application for backfilled apps,
-	// legacy tenants/agent for unbackfilled rows.
-	parentPath := fmt.Sprintf("/tenants/%s/agent", workspaceID)
-	if applicationID != nil {
-		parentPath = fmt.Sprintf("/workspaces/%s", workspaceUUIDStr)
+	if err := scoped.Create(&entry).Error; err != nil {
+		log.Printf("[SPIRE] Warning: failed to save workload entry: %v", err)
 	}
 
 	if sc.entryClient != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-
-		entry := &typespb.Entry{
-			SpiffeId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
-			ParentId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: parentPath},
-			Selectors:   spireSelectors,
-			X509SvidTtl: 3600,
-			StoreSvid:   true,
-		}
-		_, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
-			Entries: []*typespb.Entry{entry},
+		_, err := sc.entryClient.BatchCreateEntry(gctx, &entryv1.BatchCreateEntryRequest{
+			Entries: []*typespb.Entry{{
+				SpiffeId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
+				ParentId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: parentPath},
+				Selectors:   spireSelectors,
+				X509SvidTtl: 3600,
+				StoreSvid:   true,
+			}},
 		})
 		if err != nil {
-			// Rollback DB records
-			sc.db.Delete(&w)
-			log.Printf("[SPIRE] SPIRE gRPC entry creation failed, rolled back DB records: %v", err)
+			scoped.Where("id = ?", w.ID).Delete(&SpireWorkload{})
+			scoped.Where("id = ?", entry.ID).Delete(&WorkloadEntry{})
 			return "", fmt.Errorf("SPIRE entry creation failed: %w", err)
 		}
 	} else {
 		log.Printf("[SPIRE] Warning: SPIRE gRPC entryClient is nil — workload entry saved to DB but not registered with SPIRE server. Set SPIRE_SERVER_ADDR to enable.")
 	}
 
-	// Persist a workspace-scoped Application SPIFFE identity record when we
-	// were able to resolve the legacy clients.id to a resource_servers.id.
-	// This is the v4 source of truth for SPIFFE → Application mapping; the
-	// existing spire_workloads/workload_entries rows remain for compatibility
-	// until the SPIRE controller is fully cut over to it.
 	if applicationID != nil {
-		if workspaceUUID, err := uuid.Parse(workspaceUUIDStr); err == nil {
-			identity := models.ApplicationSpiffeIdentity{
-				WorkspaceID:   workspaceUUID,
-				ApplicationID: *applicationID,
-				SpiffeID:      fullSpiffeID,
-				TrustDomain:   sc.trustDomain,
-				Selectors:     selectorsJSON,
-				Status:        "active",
-			}
-			// Upsert by unique spiffe_id so re-registration doesn't fail.
-			if err := sc.db.Where("spiffe_id = ?", fullSpiffeID).
-				Assign(identity).
-				FirstOrCreate(&identity).Error; err != nil {
-				log.Printf("[SPIRE] Warning: failed to persist application_spiffe_identities row: %v", err)
-			}
+		identity := models.ApplicationSpiffeIdentity{
+			WorkspaceID:   wsUUID,
+			ApplicationID: *applicationID,
+			SpiffeID:      fullSpiffeID,
+			TrustDomain:   sc.trustDomain,
+			Selectors:     selectorsJSON,
+			Status:        "active",
+		}
+		if err := scoped.Where("spiffe_id = ?", fullSpiffeID).Assign(identity).FirstOrCreate(&identity).Error; err != nil {
+			log.Printf("[SPIRE] Warning: failed to persist application_spiffe_identities row: %v", err)
 		}
 	}
 
-	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s application=%v",
+	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s workspace=%s client=%s application=%v",
 		fullSpiffeID, workspaceID, clientID, applicationID)
 	return fullSpiffeID, nil
 }
@@ -506,7 +481,7 @@ func NewSpireController() *SpireController {
 		sc.trustDomain = spireGetenv("SPIRE_TRUST_DOMAIN", "example.org")
 	}
 
-	// Initialize SPIRE entry client (optional — degrades gracefully)
+	// SPIRE entry client (optional — degrades gracefully).
 	spireAddr := spireGetenv("SPIRE_SERVER_ADDR", "spire-server:8081")
 	spiffeSocket := "/run/spire/sockets/workload_api.sock"
 	ctx := context.Background()
@@ -520,8 +495,6 @@ func NewSpireController() *SpireController {
 			conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 			if err != nil {
 				log.Printf("[spire] mTLS gRPC connect failed: %v — falling back to insecure", err)
-			} else {
-				log.Printf("[spire] Using SPIFFE mTLS for SPIRE server connection")
 			}
 		}
 	}
@@ -529,8 +502,6 @@ func NewSpireController() *SpireController {
 		conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			log.Printf("[spire] Warning: failed to create SPIRE gRPC client: %v", err)
-		} else {
-			log.Printf("[spire] Using insecure gRPC for SPIRE server connection")
 		}
 	}
 	if conn != nil {
@@ -538,7 +509,6 @@ func NewSpireController() *SpireController {
 		sc.entryClient = entryv1.NewEntryClient(conn)
 	}
 
-	// Initialize OIDC provider
 	issuerURL := config.AppConfig.SpiffeOIDCIssuer
 	if issuerURL == "" {
 		issuerURL = spireGetenv("OIDC_ISSUER_URL", "https://spire-headless.example.org")
@@ -556,18 +526,18 @@ func NewSpireController() *SpireController {
 		}
 	}
 
-	// Start SPIRE reconciliation loop in background
-	if sc.entryClient != nil {
+	if sc.entryClient != nil && spireGetenv("SPIRE_RECONCILE", "true") == "true" {
 		go sc.reconcileEntries(context.Background())
 	}
-
-	// Load default policies
-	sc.loadDefaultPolicies()
-
+	// No default policies are seeded: policies belong to a workspace and
+	// each workspace writes its own.
 	return sc
 }
 
-// reconcileEntries periodically syncs workloads DB ↔ SPIRE server.
+// reconcileEntries periodically syncs spire_workloads with the SPIRE server.
+// It is a platform job over the platform's own SPIRE server, which holds
+// every workspace's entries: it reads all workspaces' rows and writes only
+// to the SPIRE server, never across workspaces in the database.
 func (sc *SpireController) reconcileEntries(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -580,6 +550,7 @@ func (sc *SpireController) reconcileEntries(ctx context.Context) {
 				continue
 			}
 			var workloads []SpireWorkload
+			// TENANT-EXEMPT: platform reconciliation of the shared SPIRE server reads every workspace's workloads.
 			if err := sc.db.Find(&workloads).Error; err != nil {
 				log.Printf("[spire] reconcile: DB error: %v", err)
 				continue
@@ -589,27 +560,24 @@ func (sc *SpireController) reconcileEntries(ctx context.Context) {
 				log.Printf("[spire] reconcile: list entries error: %v", err)
 				continue
 			}
+			known := make(map[string]bool, len(workloads))
 			spireMap := make(map[string]*typespb.Entry)
 			for _, e := range resp.Entries {
 				spireMap[e.SpiffeId.Path] = e
 			}
 			for _, w := range workloads {
+				known[w.SpiffeID] = true
 				if _, exists := spireMap[w.SpiffeID]; !exists {
-					_, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
+					if _, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
 						Entries: []*typespb.Entry{spireEntryFromWorkload(w, sc.trustDomain)},
-					})
-					if err != nil {
+					}); err != nil {
 						log.Printf("[spire] reconcile: create entry %s: %v", w.SpiffeID, err)
 					}
 				}
 			}
 			for path, e := range spireMap {
-				var w SpireWorkload
-				if err := sc.db.Where("spiffe_id = ?", path).First(&w).Error; err != nil {
-					_, err := sc.entryClient.BatchDeleteEntry(ctx, &entryv1.BatchDeleteEntryRequest{
-						Ids: []string{e.Id},
-					})
-					if err != nil {
+				if !known[path] {
+					if _, err := sc.entryClient.BatchDeleteEntry(ctx, &entryv1.BatchDeleteEntryRequest{Ids: []string{e.Id}}); err != nil {
 						log.Printf("[spire] reconcile: delete stale entry %s: %v", path, err)
 					}
 				}
@@ -629,31 +597,48 @@ func spireEntryFromWorkload(w SpireWorkload, trustDomain string) *typespb.Entry 
 	}
 }
 
+// scopedDB returns the controller's DB restricted to the caller's workspace,
+// or answers 401 and returns ok=false.
+func (sc *SpireController) scopedDB(c *gin.Context) (*gorm.DB, uuid.UUID, bool) {
+	ws, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return nil, uuid.Nil, false
+	}
+	db, err := tenancy.DB(c, sc.db)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return nil, uuid.Nil, false
+	}
+	return db, ws, true
+}
+
 // ===== REGISTRY HANDLERS =====
 
-// RegisterWorkload registers a new SPIFFE workload.
+// RegisterWorkload registers a SPIFFE workload in the caller's workspace.
 func (sc *SpireController) RegisterWorkload(c *gin.Context) {
+	db, ws, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var w SpireWorkload
 	if err := c.ShouldBindJSON(&w); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	w.WorkspaceID = nil
-	if tc, err := tenancy.From(c); err == nil {
-		w.WorkspaceID = &tc.WorkspaceID
-	}
-	if err := sc.db.Create(&w).Error; err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	w.ID = 0
+	w.WorkspaceID = &ws
+	if err := db.Create(&w).Error; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "workload could not be registered (SPIFFE ID in use?)"})
 		return
 	}
 	if sc.entryClient != nil {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer cancel()
-		_, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
+		if _, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
 			Entries: []*typespb.Entry{spireEntryFromWorkload(w, sc.trustDomain)},
-		})
-		if err != nil {
-			sc.db.Delete(&w)
+		}); err != nil {
+			db.Where("id = ?", w.ID).Delete(&SpireWorkload{})
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("SPIRE entry creation failed: %v", err)})
 			return
 		}
@@ -661,48 +646,68 @@ func (sc *SpireController) RegisterWorkload(c *gin.Context) {
 	c.JSON(http.StatusCreated, w)
 }
 
-// UpdateWorkload updates an existing workload.
-func (sc *SpireController) UpdateWorkload(c *gin.Context) {
-	spiffeID := c.Param("spiffe_id")
+// findWorkload loads the caller's workload :id; another workspace's is 404.
+func (sc *SpireController) findWorkload(c *gin.Context, db *gorm.DB) (*SpireWorkload, bool) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Workload not found"})
+		return nil, false
+	}
 	var w SpireWorkload
-	if err := c.ShouldBindJSON(&w); err != nil {
+	if err := db.Where("id = ?", id).First(&w).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Workload not found"})
+		return nil, false
+	}
+	return &w, true
+}
+
+// UpdateWorkload updates the owner of a workload of the caller's workspace.
+func (sc *SpireController) UpdateWorkload(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	existing, ok := sc.findWorkload(c, db)
+	if !ok {
+		return
+	}
+	var body struct {
+		Owner string `json:"owner"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	var existing SpireWorkload
-	if err := sc.db.Where("spiffe_id = ?", spiffeID).First(&existing).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Workload not found"})
-		return
-	}
-	w.SpiffeID = spiffeID
-	w.WorkspaceID = nil // ownership is not editable
-	if err := sc.db.Model(&existing).Updates(w).Error; err != nil {
+	if err := db.Model(&SpireWorkload{}).Where("id = ?", existing.ID).Update("owner", body.Owner).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	existing.Owner = body.Owner
 	if sc.entryClient != nil {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer cancel()
 		resp, err := sc.entryClient.ListEntries(ctx, &entryv1.ListEntriesRequest{
 			Filter: &entryv1.ListEntriesRequest_Filter{
-				BySpiffeId: &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
+				BySpiffeId: &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: existing.SpiffeID},
 			},
 		})
 		if err == nil && len(resp.Entries) > 0 {
 			entry := resp.Entries[0]
-			entry.Selectors = []*typespb.Selector{{Type: "k8s", Value: fmt.Sprintf("pod-label:owner:%s", w.Owner)}}
+			entry.Selectors = []*typespb.Selector{{Type: "k8s", Value: fmt.Sprintf("pod-label:owner:%s", existing.Owner)}}
 			_, _ = sc.entryClient.BatchUpdateEntry(ctx, &entryv1.BatchUpdateEntryRequest{Entries: []*typespb.Entry{entry}})
 		}
 	}
-	c.JSON(http.StatusOK, w)
+	c.JSON(http.StatusOK, existing)
 }
 
-// DeleteWorkload removes a workload.
+// DeleteWorkload removes a workload of the caller's workspace.
 func (sc *SpireController) DeleteWorkload(c *gin.Context) {
-	spiffeID := c.Param("spiffe_id")
-	var w SpireWorkload
-	if err := sc.db.Where("spiffe_id = ?", spiffeID).First(&w).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Workload not found"})
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	w, ok := sc.findWorkload(c, db)
+	if !ok {
 		return
 	}
 	if sc.entryClient != nil {
@@ -710,26 +715,28 @@ func (sc *SpireController) DeleteWorkload(c *gin.Context) {
 		defer cancel()
 		resp, err := sc.entryClient.ListEntries(ctx, &entryv1.ListEntriesRequest{
 			Filter: &entryv1.ListEntriesRequest_Filter{
-				BySpiffeId: &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
+				BySpiffeId: &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: w.SpiffeID},
 			},
 		})
 		if err == nil && len(resp.Entries) > 0 {
-			_, _ = sc.entryClient.BatchDeleteEntry(ctx, &entryv1.BatchDeleteEntryRequest{
-				Ids: []string{resp.Entries[0].Id},
-			})
+			_, _ = sc.entryClient.BatchDeleteEntry(ctx, &entryv1.BatchDeleteEntryRequest{Ids: []string{resp.Entries[0].Id}})
 		}
 	}
-	if err := sc.db.Delete(&w).Error; err != nil {
+	if err := db.Where("id = ?", w.ID).Delete(&SpireWorkload{}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Workload deleted"})
 }
 
-// ListWorkloads lists all registered workloads.
+// ListWorkloads lists the caller's workspace's workloads.
 func (sc *SpireController) ListWorkloads(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var workloads []SpireWorkload
-	if err := sc.db.Find(&workloads).Error; err != nil {
+	if err := db.Order("id").Find(&workloads).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -757,7 +764,7 @@ func (sc *SpireController) OIDCDiscovery(c *gin.Context) {
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"scopes_supported":                      []string{"openid", "profile", "email", "spiffe"},
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "spiffe_id"},
+		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "spiffe_id", "workspace_id"},
 		"grant_types_supported":                 []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
 	})
 }
@@ -788,11 +795,27 @@ func (sc *SpireController) OIDCJWKSHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"keys": []JWK{jwk}})
 }
 
-// OIDCTokenExchange handles RFC 8693 token exchange.
+// callerWorkspace returns the caller's workspace or answers 401.
+func callerWorkspace(c *gin.Context) (uuid.UUID, bool) {
+	ws, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return uuid.Nil, false
+	}
+	return ws, true
+}
+
+// OIDCTokenExchange handles RFC 8693 token exchange. The subject token's
+// verified workspace claim must be the caller's; the new token is issued
+// for that workspace.
 func (sc *SpireController) OIDCTokenExchange(c *gin.Context) {
 	p := sc.oidcProvider
 	if p == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
+		return
+	}
+	ws, ok := callerWorkspace(c)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -811,7 +834,7 @@ func (sc *SpireController) OIDCTokenExchange(c *gin.Context) {
 		return
 	}
 	claims, err := p.validateToken(req.SubjectToken)
-	if err != nil {
+	if err != nil || claims.WorkspaceID != ws.String() || !p.tokenActive(ws, claims.JWTID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_grant", "error_description": "Invalid subject token"})
 		return
 	}
@@ -819,7 +842,7 @@ func (sc *SpireController) OIDCTokenExchange(c *gin.Context) {
 	if audience == "" {
 		audience = p.cfg.IssuerURL
 	}
-	newToken, err := p.createToken(claims.Subject, claims.SPIFFEID, []string{audience}, req.Scope)
+	newToken, err := p.createToken(ws, claims.Subject, claims.SPIFFEID, []string{audience}, req.Scope)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
 		return
@@ -833,118 +856,108 @@ func (sc *SpireController) OIDCTokenExchange(c *gin.Context) {
 	})
 }
 
-// OIDCIntrospect handles RFC 7662 token introspection.
+// OIDCIntrospect handles RFC 7662 token introspection. A token of another
+// workspace is reported inactive.
 func (sc *SpireController) OIDCIntrospect(c *gin.Context) {
 	p := sc.oidcProvider
 	if p == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
 		return
 	}
+	ws, ok := callerWorkspace(c)
+	if !ok {
+		return
+	}
 	token := c.PostForm("token")
 	if token == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
 		return
 	}
 	claims, err := p.validateToken(token)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"active": false})
-		return
-	}
-	var oidcToken SpireOIDCToken
-	if err := p.db.Where("jti = ?", claims.JWTID).First(&oidcToken).Error; err == nil && oidcToken.Revoked {
+	if err != nil || claims.WorkspaceID != ws.String() || !p.tokenActive(ws, claims.JWTID) {
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"active":    true,
-		"sub":       claims.Subject,
-		"iss":       claims.Issuer,
-		"aud":       claims.Audience,
-		"exp":       claims.ExpiresAt,
-		"iat":       claims.IssuedAt,
-		"jti":       claims.JWTID,
-		"spiffe_id": claims.SPIFFEID,
+		"active":       true,
+		"sub":          claims.Subject,
+		"iss":          claims.Issuer,
+		"aud":          claims.Audience,
+		"exp":          claims.ExpiresAt,
+		"iat":          claims.IssuedAt,
+		"jti":          claims.JWTID,
+		"spiffe_id":    claims.SPIFFEID,
+		"workspace_id": claims.WorkspaceID,
 	})
 }
 
-// OIDCRevoke handles RFC 7009 token revocation.
+// OIDCRevoke handles RFC 7009 token revocation, for the caller's workspace's
+// tokens only.
 func (sc *SpireController) OIDCRevoke(c *gin.Context) {
 	p := sc.oidcProvider
 	if p == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
 		return
 	}
+	db, ws, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	token := c.PostForm("token")
 	if token == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
 		return
 	}
 	claims, err := p.validateToken(token)
-	if err != nil {
+	if err != nil || claims.WorkspaceID != ws.String() {
 		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
-	p.db.Model(&SpireOIDCToken{}).Where("jti = ?", claims.JWTID).Update("revoked", true)
+	db.Model(&SpireOIDCToken{}).Where("jwt_id = ?", claims.JWTID).Update("revoked", true)
 	c.JSON(http.StatusOK, gin.H{})
 }
 
-// OIDCExchangeSPIFFE converts an X.509 SVID to an OIDC token.
+// OIDCExchangeSPIFFE exchanged the platform's own X.509 SVID (from the
+// local workload API socket) for an OIDC token, for any caller. That is the
+// platform's identity, not a workspace's, so it is never handed out.
 func (sc *SpireController) OIDCExchangeSPIFFE(c *gin.Context) {
-	p := sc.oidcProvider
-	if p == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
-		return
-	}
-	ctx := context.Background()
-	spiffeSocket := "/run/spire/sockets/workload_api.sock"
-	if _, err := os.Stat(spiffeSocket); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "spiffe_unavailable"})
-		return
-	}
-	source, err := workloadapi.NewX509Source(ctx)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
-		return
-	}
-	defer source.Close()
-	svid, err := source.GetX509SVID()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
-		return
-	}
-	spiffeID := svid.ID.String()
-	subject := svid.ID.Path()
-	token, err := p.createToken(subject, spiffeID, []string{p.cfg.IssuerURL}, "openid spiffe")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
-		return
-	}
-	c.JSON(http.StatusOK, spireTokenExchangeResponse{
-		AccessToken:     token,
-		IssuedTokenType: "urn:ietf:params:oauth:token-type:access_token",
-		TokenType:       "Bearer",
-		ExpiresIn:       int64(p.cfg.TokenExpiry.Seconds()),
-		Scope:           "openid spiffe",
+	c.JSON(http.StatusGone, gin.H{
+		"error":             "unsupported",
+		"error_description": "exchanging the platform's own SVID is not offered; use /oidc/issue/jwt-svid for a workload of your workspace",
 	})
 }
 
-// OIDCIssueJWTSVID issues a JWT-SVID for the requesting workload.
+// OIDCIssueJWTSVID issues a JWT-SVID for a workload registered in the
+// caller's workspace (spire_workloads). The SPIFFE ID comes from the
+// spiffe_id parameter and must be one of those workloads; it is never taken
+// from an X-SPIFFE-ID header.
 func (sc *SpireController) OIDCIssueJWTSVID(c *gin.Context) {
 	p := sc.oidcProvider
 	if p == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
 		return
 	}
-	spiffeID := sc.extractSPIFFEIDFromContext(c)
-	if spiffeID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+	db, ws, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	spiffeID := c.Query("spiffe_id")
+	path := strings.TrimPrefix(spiffeID, "spiffe://"+sc.trustDomain)
+	if spiffeID == "" || !strings.HasPrefix(path, "/") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "spiffe_id of a registered workload is required"})
+		return
+	}
+	var w SpireWorkload
+	if err := db.Where("spiffe_id = ?", path).First(&w).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Workload not found"})
 		return
 	}
 	audience := c.Query("audience")
 	if audience == "" {
 		audience = p.cfg.IssuerURL
 	}
-	jwtSVID, err := p.createJWTSVID(spiffeID, []string{audience})
+	full := "spiffe://" + sc.trustDomain + w.SpiffeID
+	jwtSVID, err := p.createJWTSVID(ws, full, []string{audience})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
 		return
@@ -957,153 +970,145 @@ func (sc *SpireController) OIDCIssueJWTSVID(c *gin.Context) {
 	})
 }
 
-// OIDCExchangeCloud exchanges a JWT-SVID for a cloud provider token.
-func (sc *SpireController) OIDCExchangeCloud(c *gin.Context) {
+// exchangedSVID verifies the JWT-SVID a cloud exchange presents (body
+// jwt_svid) and requires it to belong to the caller's workspace. It answers
+// the error itself and returns ok=false otherwise.
+func (sc *SpireController) exchangedSVID(c *gin.Context, presented string) (*spireJWTSVIDClaims, bool) {
 	p := sc.oidcProvider
 	if p == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
-		return
+		return nil, false
 	}
-	var req spireCloudTokenRequest
+	ws, ok := callerWorkspace(c)
+	if !ok {
+		return nil, false
+	}
+	if presented == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "jwt_svid is required"})
+		return nil, false
+	}
+	claims, err := p.validateJWTSVID(presented)
+	if err != nil || claims.WorkspaceID != ws.String() || !p.tokenActive(ws, claims.JWTID) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_grant"})
+		return nil, false
+	}
+	return claims, true
+}
+
+// OIDCExchangeCloud exchanges a JWT-SVID of the caller's workspace for a
+// cloud provider token.
+func (sc *SpireController) OIDCExchangeCloud(c *gin.Context) {
+	var req struct {
+		spireCloudTokenRequest
+		JWTSVID string `json:"jwt_svid"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
 		return
 	}
-	jwtSVID := sc.extractBearerToken(c)
-	if jwtSVID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+	claims, ok := sc.exchangedSVID(c, req.JWTSVID)
+	if !ok {
 		return
 	}
-	claims, err := p.validateJWTSVID(jwtSVID)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_grant"})
-		return
-	}
+	p := sc.oidcProvider
 	var resp *spireCloudTokenResponse
+	var err error
 	switch req.Provider {
 	case "aws":
-		resp, err = p.exchangeAWSToken(claims, &req)
+		resp, err = p.exchangeAWSToken(claims, &req.spireCloudTokenRequest)
 	case "azure":
-		resp, err = p.exchangeAzureToken(claims, &req)
+		resp, err = p.exchangeAzureToken(claims, &req.spireCloudTokenRequest)
 	case "gcp":
-		resp, err = p.exchangeGCPToken(claims, &req)
+		resp, err = p.exchangeGCPToken(claims, &req.spireCloudTokenRequest)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported_provider"})
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error", "error_description": err.Error()})
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "server_error", "error_description": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// OIDCExchangeAWS exchanges a JWT-SVID for AWS STS credentials.
+// OIDCExchangeAWS exchanges a JWT-SVID of the caller's workspace for AWS STS credentials.
 func (sc *SpireController) OIDCExchangeAWS(c *gin.Context) {
-	p := sc.oidcProvider
-	if p == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
-		return
-	}
 	var req struct {
 		RoleARN  string `json:"role_arn" binding:"required"`
 		Audience string `json:"audience,omitempty"`
+		JWTSVID  string `json:"jwt_svid"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
+		return
+	}
+	claims, ok := sc.exchangedSVID(c, req.JWTSVID)
+	if !ok {
 		return
 	}
 	if req.Audience == "" {
 		req.Audience = "sts.amazonaws.com"
 	}
-	jwtSVID := sc.extractBearerToken(c)
-	if jwtSVID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
-		return
-	}
-	claims, err := p.validateJWTSVID(jwtSVID)
+	resp, err := sc.oidcProvider.exchangeAWSToken(claims, &spireCloudTokenRequest{Provider: "aws", Audience: req.Audience, RoleARN: req.RoleARN})
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_grant"})
-		return
-	}
-	resp, err := p.exchangeAWSToken(claims, &spireCloudTokenRequest{Provider: "aws", Audience: req.Audience, RoleARN: req.RoleARN})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error", "error_description": err.Error()})
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "server_error", "error_description": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// OIDCExchangeAzure exchanges a JWT-SVID for an Azure AD token.
+// OIDCExchangeAzure exchanges a JWT-SVID of the caller's workspace for an
+// Azure AD token. azure_tenant_id is the Entra directory, not an AuthSec
+// workspace.
 func (sc *SpireController) OIDCExchangeAzure(c *gin.Context) {
-	p := sc.oidcProvider
-	if p == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
-		return
-	}
 	var req struct {
-		WorkspaceID string `json:"workspace_id" binding:"required"`
-		ResourceID  string `json:"resource_id,omitempty"`
-		Scope       string `json:"scope,omitempty"`
+		AzureTenantID string `json:"azure_tenant_id" binding:"required"`
+		ResourceID    string `json:"resource_id,omitempty"`
+		Scope         string `json:"scope,omitempty"`
+		JWTSVID       string `json:"jwt_svid"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
+		return
+	}
+	claims, ok := sc.exchangedSVID(c, req.JWTSVID)
+	if !ok {
 		return
 	}
 	if req.ResourceID == "" {
 		req.ResourceID = "https://management.azure.com/"
 	}
-	audience := "https://login.microsoftonline.com/" + req.WorkspaceID + "/v2.0"
-	jwtSVID := sc.extractBearerToken(c)
-	if jwtSVID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
-		return
-	}
-	claims, err := p.validateJWTSVID(jwtSVID)
+	audience := "https://login.microsoftonline.com/" + url.PathEscape(req.AzureTenantID) + "/v2.0"
+	resp, err := sc.oidcProvider.exchangeAzureToken(claims, &spireCloudTokenRequest{Provider: "azure", Audience: audience, ResourceID: req.ResourceID, Scope: req.Scope})
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_grant"})
-		return
-	}
-	resp, err := p.exchangeAzureToken(claims, &spireCloudTokenRequest{Provider: "azure", Audience: audience, ResourceID: req.ResourceID, Scope: req.Scope})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error", "error_description": err.Error()})
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "server_error", "error_description": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// OIDCExchangeGCP exchanges a JWT-SVID for a GCP access token.
+// OIDCExchangeGCP exchanges a JWT-SVID of the caller's workspace for a GCP access token.
 func (sc *SpireController) OIDCExchangeGCP(c *gin.Context) {
-	p := sc.oidcProvider
-	if p == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OIDC provider not initialized"})
-		return
-	}
 	var req struct {
 		ProjectID    string `json:"project_id" binding:"required"`
 		ServiceEmail string `json:"service_email" binding:"required"`
 		Scope        string `json:"scope,omitempty"`
+		JWTSVID      string `json:"jwt_svid"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
 		return
 	}
+	claims, ok := sc.exchangedSVID(c, req.JWTSVID)
+	if !ok {
+		return
+	}
 	if req.Scope == "" {
 		req.Scope = "https://www.googleapis.com/auth/cloud-platform"
 	}
-	jwtSVID := sc.extractBearerToken(c)
-	if jwtSVID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
-		return
-	}
-	claims, err := p.validateJWTSVID(jwtSVID)
+	resp, err := sc.oidcProvider.exchangeGCPToken(claims, &spireCloudTokenRequest{Provider: "gcp", Audience: "https://sts.googleapis.com/", ServiceEmail: req.ServiceEmail, Scope: req.Scope})
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_grant"})
-		return
-	}
-	resp, err := p.exchangeGCPToken(claims, &spireCloudTokenRequest{Provider: "gcp", Audience: "https://sts.googleapis.com/", ServiceEmail: req.ServiceEmail, Scope: req.Scope})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error", "error_description": err.Error()})
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "server_error", "error_description": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, resp)
@@ -1111,8 +1116,39 @@ func (sc *SpireController) OIDCExchangeGCP(c *gin.Context) {
 
 // ===== POLICY HANDLERS =====
 
-// CreatePolicy creates a new policy.
+// stampPolicy gives a policy and all its nested rows the workspace and
+// clears any ids from the request, so nothing is written over another row.
+func stampPolicy(p *SpirePolicy, ws uuid.UUID) {
+	p.ID = 0
+	p.WorkspaceID = ws
+	for i := range p.Rules {
+		r := &p.Rules[i]
+		r.ID, r.PolicyID, r.WorkspaceID = 0, 0, ws
+		for j := range r.Subjects {
+			r.Subjects[j].ID, r.Subjects[j].RuleID, r.Subjects[j].WorkspaceID = 0, 0, ws
+		}
+		for j := range r.Resources {
+			r.Resources[j].ID, r.Resources[j].RuleID, r.Resources[j].WorkspaceID = 0, 0, ws
+		}
+		for j := range r.Actions {
+			r.Actions[j].ID, r.Actions[j].RuleID, r.Actions[j].WorkspaceID = 0, 0, ws
+		}
+		for j := range r.Conditions {
+			r.Conditions[j].ID, r.Conditions[j].RuleID, r.Conditions[j].WorkspaceID = 0, 0, ws
+		}
+	}
+}
+
+func preloadRules(db *gorm.DB) *gorm.DB {
+	return db.Preload("Rules.Subjects").Preload("Rules.Resources").Preload("Rules.Actions").Preload("Rules.Conditions")
+}
+
+// CreatePolicy creates a policy in the caller's workspace.
 func (sc *SpireController) CreatePolicy(c *gin.Context) {
+	db, ws, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var policy SpirePolicy
 	if err := c.ShouldBindJSON(&policy); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1122,21 +1158,26 @@ func (sc *SpireController) CreatePolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	stampPolicy(&policy, ws)
 	policy.Version = "1.0"
 	policy.Active = true
 	policy.Engine = sc.policyEngine
-	if err := sc.db.Create(&policy).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := db.Create(&policy).Error; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "policy could not be created (name in use?)"})
 		return
 	}
 	sc.spireAuditLog(c, "policy.create", policy.Name, "allow", "Policy created", nil)
 	c.JSON(http.StatusCreated, policy)
 }
 
-// ListPolicies lists policies with optional filters.
+// ListPolicies lists the caller's workspace's policies.
 func (sc *SpireController) ListPolicies(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var policies []SpirePolicy
-	q := sc.db.Preload("Rules.Subjects").Preload("Rules.Resources").Preload("Rules.Actions").Preload("Rules.Conditions")
+	q := preloadRules(db)
 	if name := c.Query("name"); name != "" {
 		q = q.Where("name ILIKE ?", "%"+name+"%")
 	}
@@ -1155,49 +1196,116 @@ func (sc *SpireController) ListPolicies(c *gin.Context) {
 	c.JSON(http.StatusOK, policies)
 }
 
-// GetPolicy retrieves a policy by ID.
+func policyID(c *gin.Context) (uint64, bool) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
+		return 0, false
+	}
+	return id, true
+}
+
+// GetPolicy returns a policy of the caller's workspace; another's is 404.
 func (sc *SpireController) GetPolicy(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	id, ok := policyID(c)
+	if !ok {
+		return
+	}
 	var policy SpirePolicy
-	if err := sc.db.Preload("Rules.Subjects").Preload("Rules.Resources").Preload("Rules.Actions").Preload("Rules.Conditions").
-		First(&policy, c.Param("id")).Error; err != nil {
+	if err := preloadRules(db).Where("id = ?", id).First(&policy).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
 		return
 	}
 	c.JSON(http.StatusOK, policy)
 }
 
-// UpdatePolicy updates an existing policy.
+// UpdatePolicy replaces a policy of the caller's workspace (its rules are
+// rewritten); another workspace's is 404.
 func (sc *SpireController) UpdatePolicy(c *gin.Context) {
-	var policy SpirePolicy
-	if err := sc.db.First(&policy, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
+	ws, ok := callerWorkspace(c)
+	if !ok {
 		return
 	}
-	if err := c.ShouldBindJSON(&policy); err != nil {
+	id, ok := policyID(c)
+	if !ok {
+		return
+	}
+	var body SpirePolicy
+	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := sc.validatePolicy(&policy); err != nil {
+	if err := sc.validatePolicy(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	sc.db.Save(&policy)
-	sc.spireAuditLog(c, "policy.update", policy.Name, "allow", "Policy updated", nil)
-	c.JSON(http.StatusOK, policy)
+	stampPolicy(&body, ws)
+	var updated SpirePolicy
+	err := tenancy.Transaction(c.Request.Context(), sc.db, func(tx *gorm.DB) error {
+		if err := tx.Where("id = ?", id).First(&updated).Error; err != nil {
+			return tenancy.ErrNotFound
+		}
+		if err := tx.Model(&SpirePolicy{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"name": body.Name, "description": body.Description, "active": body.Active, "updated_at": time.Now(),
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("policy_id = ?", id).Delete(&SpirePolicyRule{}).Error; err != nil {
+			return err
+		}
+		for i := range body.Rules {
+			body.Rules[i].PolicyID = uint(id)
+			if err := tx.Create(&body.Rules[i]).Error; err != nil {
+				return err
+			}
+		}
+		return preloadRules(tx).Where("id = ?", id).First(&updated).Error
+	})
+	if err != nil {
+		if errors.Is(err, tenancy.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "policy could not be updated"})
+		return
+	}
+	sc.spireAuditLog(c, "policy.update", updated.Name, "allow", "Policy updated", nil)
+	c.JSON(http.StatusOK, updated)
 }
 
-// DeletePolicy removes a policy.
+// DeletePolicy removes a policy of the caller's workspace; another's is 404.
 func (sc *SpireController) DeletePolicy(c *gin.Context) {
-	if err := sc.db.Delete(&SpirePolicy{}, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	id, ok := policyID(c)
+	if !ok {
+		return
+	}
+	res := db.Where("id = ?", id).Delete(&SpirePolicy{})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
 		return
 	}
 	sc.spireAuditLog(c, "policy.delete", c.Param("id"), "allow", "Policy deleted", nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Policy deleted"})
 }
 
-// EvaluatePolicy evaluates a policy request.
+// EvaluatePolicy evaluates a request against the caller's workspace's policies.
 func (sc *SpireController) EvaluatePolicy(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var eval SpirePolicyEvaluation
 	if err := c.ShouldBindJSON(&eval); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1205,13 +1313,18 @@ func (sc *SpireController) EvaluatePolicy(c *gin.Context) {
 	}
 	requestID := uuid.New().String()
 	eval.Timestamp = time.Now()
-	result := sc.evaluatePolicy(&eval, requestID)
+	result := sc.evaluatePolicy(db, &eval, requestID)
 	sc.spireAuditLog(c, eval.Action, eval.Resource, result.Decision, result.Reason, &requestID)
 	c.JSON(http.StatusOK, result)
 }
 
-// BatchEvaluatePolicy evaluates multiple policy requests.
+// BatchEvaluatePolicy evaluates several requests against the caller's
+// workspace's policies.
 func (sc *SpireController) BatchEvaluatePolicy(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var evals []SpirePolicyEvaluation
 	if err := c.ShouldBindJSON(&evals); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1221,7 +1334,7 @@ func (sc *SpireController) BatchEvaluatePolicy(c *gin.Context) {
 	for _, eval := range evals {
 		requestID := uuid.New().String()
 		eval.Timestamp = time.Now()
-		result := sc.evaluatePolicy(&eval, requestID)
+		result := sc.evaluatePolicy(db, &eval, requestID)
 		results = append(results, *result)
 		sc.spireAuditLog(c, eval.Action, eval.Resource, result.Decision, result.Reason, &requestID)
 	}
@@ -1238,13 +1351,12 @@ func (sc *SpireController) TestPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	requestID := uuid.New().String()
 	result := &SpirePolicyResult{
 		Decision:    "deny",
 		Reason:      "No matching rule",
 		Context:     req.Evaluation.Context,
 		EvaluatedAt: time.Now(),
-		RequestID:   requestID,
+		RequestID:   uuid.New().String(),
 	}
 	if decision := sc.evaluatePolicyRules(&req.Policy, &req.Evaluation, result); decision != "" {
 		result.Decision = decision
@@ -1252,14 +1364,20 @@ func (sc *SpireController) TestPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// BindRole creates a role binding.
+// BindRole creates a role binding in the caller's workspace.
 func (sc *SpireController) BindRole(c *gin.Context) {
+	db, ws, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var binding SpireRoleBinding
 	if err := c.ShouldBindJSON(&binding); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := sc.db.Create(&binding).Error; err != nil {
+	binding.ID = 0
+	binding.WorkspaceID = ws
+	if err := db.Create(&binding).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -1267,11 +1385,14 @@ func (sc *SpireController) BindRole(c *gin.Context) {
 	c.JSON(http.StatusCreated, binding)
 }
 
-// UnbindRole removes a role binding.
+// UnbindRole removes a role binding of the caller's workspace.
 func (sc *SpireController) UnbindRole(c *gin.Context) {
-	subject := c.Query("subject")
-	role := c.Query("role")
-	if err := sc.db.Where("subject = ? AND role = ?", subject, role).Delete(&SpireRoleBinding{}).Error; err != nil {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
+	subject, role := c.Query("subject"), c.Query("role")
+	if err := db.Where("subject = ? AND role = ?", subject, role).Delete(&SpireRoleBinding{}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -1279,10 +1400,14 @@ func (sc *SpireController) UnbindRole(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Role binding removed"})
 }
 
-// ListRoleBindings lists role bindings.
+// ListRoleBindings lists the caller's workspace's role bindings.
 func (sc *SpireController) ListRoleBindings(c *gin.Context) {
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
+		return
+	}
 	var bindings []SpireRoleBinding
-	q := sc.db.Model(&SpireRoleBinding{})
+	q := db.Model(&SpireRoleBinding{})
 	if s := c.Query("subject"); s != "" {
 		q = q.Where("subject ILIKE ?", "%"+s+"%")
 	}
@@ -1296,17 +1421,14 @@ func (sc *SpireController) ListRoleBindings(c *gin.Context) {
 	c.JSON(http.StatusOK, bindings)
 }
 
-// GetAuditLogs returns paginated audit logs, scoped to the caller's workspace.
+// GetAuditLogs returns paginated audit logs of the caller's workspace.
 func (sc *SpireController) GetAuditLogs(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "workspace context required"})
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
 		return
 	}
 	var logs []SpireAuditLog
-	q := sc.db.Model(&SpireAuditLog{}).
-		Where("workspace_id = ?", workspaceID).
-		Order("timestamp DESC")
+	q := db.Model(&SpireAuditLog{}).Order("timestamp DESC")
 	if s := c.Query("subject"); s != "" {
 		q = q.Where("subject ILIKE ?", "%"+s+"%")
 	}
@@ -1331,22 +1453,14 @@ func (sc *SpireController) GetAuditLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"logs": logs, "page": page, "limit": limit})
 }
 
-// ExportAuditLogs exports audit logs as JSON, scoped to the caller's workspace
-// and bounded by a required time window. Never dumps the whole table.
+// ExportAuditLogs exports the caller's workspace's audit logs as JSON,
+// bounded by a required time window.
 func (sc *SpireController) ExportAuditLogs(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "workspace context required"})
+	db, _, ok := sc.scopedDB(c)
+	if !ok {
 		return
 	}
-
 	const maxExportRows = 10000
-	q := sc.db.Model(&SpireAuditLog{}).
-		Where("workspace_id = ?", workspaceID).
-		Order("timestamp DESC")
-
-	// Require an explicit, bounded time window so this can't be used to dump
-	// arbitrarily large slices of history in one call.
 	from, to := c.Query("from"), c.Query("to")
 	if from == "" || to == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "from and to (RFC3339) query params are required"})
@@ -1362,10 +1476,10 @@ func (sc *SpireController) ExportAuditLogs(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'to' timestamp; expected RFC3339"})
 		return
 	}
-	q = q.Where("timestamp >= ? AND timestamp <= ?", fromTS, toTS)
-
 	var logs []SpireAuditLog
-	if err := q.Limit(maxExportRows).Find(&logs).Error; err != nil {
+	if err := db.Model(&SpireAuditLog{}).
+		Where("timestamp >= ? AND timestamp <= ?", fromTS, toTS).
+		Order("timestamp DESC").Limit(maxExportRows).Find(&logs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -1375,7 +1489,9 @@ func (sc *SpireController) ExportAuditLogs(c *gin.Context) {
 
 // ===== POLICY ENGINE INTERNALS =====
 
-func (sc *SpireController) evaluatePolicy(eval *SpirePolicyEvaluation, requestID string) *SpirePolicyResult {
+// evaluatePolicy evaluates against the active policies db (already scoped
+// to the caller's workspace) returns.
+func (sc *SpireController) evaluatePolicy(db *gorm.DB, eval *SpirePolicyEvaluation, requestID string) *SpirePolicyResult {
 	result := &SpirePolicyResult{
 		Decision:    "deny",
 		Reason:      "No matching policy found",
@@ -1384,8 +1500,7 @@ func (sc *SpireController) evaluatePolicy(eval *SpirePolicyEvaluation, requestID
 		RequestID:   requestID,
 	}
 	var policies []SpirePolicy
-	sc.db.Preload("Rules.Subjects").Preload("Rules.Resources").Preload("Rules.Actions").Preload("Rules.Conditions").
-		Where("active = ?", true).Order("created_at ASC").Find(&policies)
+	preloadRules(db).Where("active = ?", true).Order("created_at ASC").Find(&policies)
 	for _, policy := range policies {
 		if decision := sc.evaluatePolicyRules(&policy, eval, result); decision != "" {
 			result.Decision = decision
@@ -1521,18 +1636,19 @@ func (sc *SpireController) validatePolicy(policy *SpirePolicy) error {
 	return nil
 }
 
+// spireAuditLog records a policy-engine decision for the caller's workspace.
 func (sc *SpireController) spireAuditLog(c *gin.Context, action, resource, decision, reason string, requestID *string) {
+	tc, err := tenancy.From(c)
+	if err != nil {
+		return
+	}
 	rid := uuid.New().String()
 	if requestID != nil {
 		rid = *requestID
 	}
-	subject := sc.extractSPIFFEIDFromContext(c)
-	if subject == "" {
-		subject = "unknown"
-	}
 	sc.db.Create(&SpireAuditLog{
-		RequestID: rid, WorkspaceID: c.GetString("workspace_id"),
-		Subject: subject, Resource: resource,
+		RequestID: rid, WorkspaceID: tc.WorkspaceID.String(),
+		Subject: tc.PrincipalID.String(), Resource: resource,
 		Action: action, Decision: decision, Reason: reason,
 		Context:   map[string]interface{}{},
 		IPAddress: c.ClientIP(), UserAgent: c.GetHeader("User-Agent"),
@@ -1540,60 +1656,36 @@ func (sc *SpireController) spireAuditLog(c *gin.Context, action, resource, decis
 	})
 }
 
-func (sc *SpireController) loadDefaultPolicies() {
-	if sc.db == nil {
-		return
-	}
-	defaults := []SpirePolicy{
-		{
-			Name: "default-workload-access", Description: "Default policy for workload access",
-			Engine: sc.policyEngine, Active: true,
-			Rules: []SpirePolicyRule{
-				{
-					Name: "allow-workload-registry-access", Effect: "allow", Priority: 100,
-					Subjects:  []SpirePolicySubject{{Type: "spiffe_id", Pattern: "spiffe://example.org/workload/.*"}},
-					Resources: []SpirePolicyResource{{Type: "service", Value: "registry"}, {Type: "service", Value: "attestation"}},
-					Actions:   []SpirePolicyAction{{Type: "http", Value: "read"}, {Type: "http", Value: "write"}},
-				},
-			},
-		},
-		{
-			Name: "admin-access", Description: "Administrative access policy",
-			Engine: sc.policyEngine, Active: true,
-			Rules: []SpirePolicyRule{
-				{
-					Name: "allow-admin-all-access", Effect: "allow", Priority: 200,
-					Subjects:  []SpirePolicySubject{{Type: "spiffe_id", Value: "spiffe://example.org/admin"}, {Type: "role", Value: "admin"}},
-					Resources: []SpirePolicyResource{{Type: "service", Value: "*"}},
-					Actions:   []SpirePolicyAction{{Type: "http", Value: "*"}},
-				},
-			},
-		},
-	}
-	for _, p := range defaults {
-		var existing SpirePolicy
-		if sc.db.Where("name = ?", p.Name).First(&existing).Error != nil {
-			sc.db.Create(&p)
-			log.Printf("[spire] Created default policy: %s", p.Name)
-		}
-	}
-}
-
 // ===== OIDC PROVIDER INTERNALS =====
 
-func (p *spireOIDCProvider) createToken(subject, spiffeID string, audience []string, scope string) (string, error) {
+// tokenActive reports whether the token jti was issued for ws and is not
+// revoked.
+func (p *spireOIDCProvider) tokenActive(ws uuid.UUID, jti string) bool {
+	db, err := tenancy.DBContext(workspaceCtx(ws), p.db)
+	if err != nil {
+		return false
+	}
+	var record SpireOIDCToken
+	if err := db.Where("jwt_id = ?", jti).First(&record).Error; err != nil {
+		return false
+	}
+	return !record.Revoked
+}
+
+func (p *spireOIDCProvider) createToken(ws uuid.UUID, subject, spiffeID string, audience []string, scope string) (string, error) {
 	now := time.Now()
 	jti := uuid.New().String()
 	claims := spireTokenClaims{
-		Subject:   subject,
-		Issuer:    p.cfg.IssuerURL,
-		Audience:  audience,
-		ExpiresAt: now.Add(p.cfg.TokenExpiry).Unix(),
-		IssuedAt:  now.Unix(),
-		NotBefore: now.Unix(),
-		JWTID:     jti,
-		SPIFFEID:  spiffeID,
-		Claims:    map[string]interface{}{"scope": scope},
+		WorkspaceID: ws.String(),
+		Subject:     subject,
+		Issuer:      p.cfg.IssuerURL,
+		Audience:    audience,
+		ExpiresAt:   now.Add(p.cfg.TokenExpiry).Unix(),
+		IssuedAt:    now.Unix(),
+		NotBefore:   now.Unix(),
+		JWTID:       jti,
+		SPIFFEID:    spiffeID,
+		Claims:      map[string]interface{}{"scope": scope},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = p.keyID
@@ -1601,11 +1693,13 @@ func (p *spireOIDCProvider) createToken(subject, spiffeID string, audience []str
 	if err != nil {
 		return "", err
 	}
-	p.db.Create(&SpireOIDCToken{
-		JWTID: jti, Subject: subject, SPIFFEID: spiffeID,
+	if err := p.db.Create(&SpireOIDCToken{
+		WorkspaceID: ws, JWTID: jti, Subject: subject, SPIFFEID: spiffeID,
 		TokenType: "Bearer", Audience: audience[0], Scope: scope,
 		ExpiresAt: time.Unix(claims.ExpiresAt, 0), CreatedAt: now, Revoked: false,
-	})
+	}).Error; err != nil {
+		return "", err
+	}
 	return tokenString, nil
 }
 
@@ -1619,17 +1713,18 @@ func (p *spireOIDCProvider) validateToken(tokenString string) (*spireTokenClaims
 	if err != nil {
 		return nil, err
 	}
-	if claims, ok := token.Claims.(*spireTokenClaims); ok && token.Valid {
+	if claims, ok := token.Claims.(*spireTokenClaims); ok && token.Valid && claims.WorkspaceID != "" {
 		return claims, nil
 	}
 	return nil, fmt.Errorf("invalid token")
 }
 
-func (p *spireOIDCProvider) createJWTSVID(spiffeID string, audience []string) (string, error) {
+func (p *spireOIDCProvider) createJWTSVID(ws uuid.UUID, spiffeID string, audience []string) (string, error) {
 	now := time.Now()
 	jti := uuid.New().String()
 	claims := spireJWTSVIDClaims{
-		Subject: spiffeID, Audience: audience, Issuer: p.cfg.IssuerURL,
+		WorkspaceID: ws.String(),
+		Subject:     spiffeID, Audience: audience, Issuer: p.cfg.IssuerURL,
 		ExpiresAt: now.Add(p.cfg.TokenExpiry).Unix(), IssuedAt: now.Unix(), NotBefore: now.Unix(),
 		JWTID: jti, SPIFFEID: spiffeID,
 	}
@@ -1640,11 +1735,13 @@ func (p *spireOIDCProvider) createJWTSVID(spiffeID string, audience []string) (s
 	if err != nil {
 		return "", err
 	}
-	p.db.Create(&SpireOIDCToken{
-		JWTID: jti, Subject: spiffeID, SPIFFEID: spiffeID,
+	if err := p.db.Create(&SpireOIDCToken{
+		WorkspaceID: ws, JWTID: jti, Subject: spiffeID, SPIFFEID: spiffeID,
 		TokenType: "JWT-SVID", Audience: audience[0],
 		ExpiresAt: time.Unix(claims.ExpiresAt, 0), CreatedAt: now, Revoked: false,
-	})
+	}).Error; err != nil {
+		return "", err
+	}
 	return tokenString, nil
 }
 
@@ -1658,11 +1755,7 @@ func (p *spireOIDCProvider) validateJWTSVID(tokenString string) (*spireJWTSVIDCl
 	if err != nil {
 		return nil, err
 	}
-	if claims, ok := token.Claims.(*spireJWTSVIDClaims); ok && token.Valid {
-		var record SpireOIDCToken
-		if p.db.Where("jti = ?", claims.JWTID).First(&record).Error == nil && record.Revoked {
-			return nil, fmt.Errorf("JWT-SVID has been revoked")
-		}
+	if claims, ok := token.Claims.(*spireJWTSVIDClaims); ok && token.Valid && claims.WorkspaceID != "" {
 		return claims, nil
 	}
 	return nil, fmt.Errorf("invalid JWT-SVID")
@@ -1687,29 +1780,6 @@ func (p *spireOIDCProvider) exchangeGCPToken(claims *spireJWTSVIDClaims, req *sp
 }
 
 // ===== HELPERS =====
-
-func (sc *SpireController) extractSPIFFEIDFromContext(c *gin.Context) string {
-	if id := c.GetHeader("X-SPIFFE-ID"); id != "" {
-		return id
-	}
-	if sc.oidcProvider != nil {
-		auth := c.GetHeader("Authorization")
-		if len(auth) > 7 && auth[:7] == "Bearer " {
-			if claims, err := sc.oidcProvider.validateJWTSVID(auth[7:]); err == nil {
-				return claims.SPIFFEID
-			}
-		}
-	}
-	return ""
-}
-
-func (sc *SpireController) extractBearerToken(c *gin.Context) string {
-	auth := c.GetHeader("Authorization")
-	if len(auth) > 7 && auth[:7] == "Bearer " {
-		return auth[7:]
-	}
-	return ""
-}
 
 func spireMatchPattern(pattern, value string) bool {
 	if pattern == "" {
