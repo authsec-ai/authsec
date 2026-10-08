@@ -118,7 +118,7 @@ func (pc *PermissionController) RegisterAtomicPermission(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/rbac/permissions [post]
 func (pc *PermissionController) RegisterAtomicPermissionEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -256,7 +256,7 @@ func (pc *PermissionController) DeletePermission(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/rbac/permissions/{id} [delete]
 func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -378,7 +378,7 @@ func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/rbac/permissions [delete]
 func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -467,7 +467,7 @@ func (pc *PermissionController) ListPermissions(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/rbac/permissions [get]
 func (pc *PermissionController) ListPermissionsEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -568,7 +568,7 @@ func (pc *PermissionController) ShowResources(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/rbac/permissions/resources [get]
 func (pc *PermissionController) ShowResourcesEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return

@@ -227,7 +227,7 @@ func (ctl *DiscoveryRuleCatalogController) TestRuleCatalog(c *gin.Context) {
 // "who is calling, and for which workspace" — a second copy is how the two
 // drift and one of them stops checking something.
 func workspaceAndActorFrom(c *gin.Context) (uuid.UUID, string, error) {
-	ws := c.GetString("workspace_id")
+	ws := middlewares.WorkspaceIDString(c)
 	if ws == "" {
 		return uuid.Nil, "", errors.New("workspace_id not found in token")
 	}

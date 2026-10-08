@@ -783,8 +783,6 @@ func setWorkspaceContext(c *gin.Context, workspaceID string) {
 		return
 	}
 
-	c.Set("workspace_id", workspaceID)
-
 	if claimsVal, exists := c.Get("claims"); exists {
 		switch claims := claimsVal.(type) {
 		case jwt.MapClaims:
@@ -849,8 +847,8 @@ func stringFromAny(value interface{}) string {
 
 // setContextValues sets user information in Gin context
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
-	// Phase 6: workspace_id is canonical and the only identity context key.
-	c.Set("workspace_id", userInfo.WorkspaceID)
+	// Phase 6: the workspace is carried only by the tenancy context, which
+	// AuthMiddleware sets after its checks; the legacy "workspace_id" key is gone.
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
 	}
@@ -943,8 +941,12 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		c.Set("claims", claims)
 
 		// Extract and set individual claims
+		// The workspace of the verified token, as the tenancy context.
 		if workspaceID, ok := claims["workspace_id"].(string); ok {
-			c.Set("workspace_id", workspaceID)
+			if ws, err := uuid.Parse(workspaceID); err == nil && ws != uuid.Nil {
+				uid, _ := uuid.Parse(stringFromAny(claims["sub"]))
+				tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: uid, PrincipalKind: "user"})
+			}
 		}
 		if clientID, ok := claims["client_id"].(string); ok {
 			c.Set("client_id", clientID)
@@ -969,16 +971,3 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ExtractTenantFromPath is a middleware that extracts the workspace_id from the URL path
-// and sets it in the Gin context. Phase 5.1 renamed the URL param from :workspace_id to
-// :workspace_id; the function name is kept (deprecated) to avoid churning route
-// registrations — Phase 10 sweeps it.
-func ExtractTenantFromPath() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		workspaceID := c.Param("workspace_id")
-		if workspaceID != "" {
-			c.Set("workspace_id", workspaceID)
-		}
-		c.Next()
-	}
-}

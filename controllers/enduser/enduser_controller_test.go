@@ -928,9 +928,10 @@ func TestAuthMiddleware_WithValidToken(t *testing.T) {
 	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
 	r.GET("/protected", func(c *gin.Context) {
 		// Check if user info is properly extracted
-		workspaceID, exists := c.Get("workspace_id")
-		assert.True(t, exists, "workspace_id should be set")
-		assert.Equal(t, "test-tenant-123", workspaceID)
+		// The workspace is carried by the tenancy context (Phase 6).
+		workspaceID, exists := middlewares.GetWorkspaceIDFromToken(c)
+		assert.True(t, exists, "the tenancy context should carry the workspace")
+		assert.Equal(t, testWorkspaceID, workspaceID)
 
 		userID, exists := c.Get("user_id")
 		assert.True(t, exists, "user_id should be set")
@@ -1003,6 +1004,10 @@ func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 }
 
 // generateTestJWT generates a test JWT token with known claims
+// testWorkspaceID is the workspace of the test session tokens (a real UUID:
+// a session never carries anything else, AS-095).
+const testWorkspaceID = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+
 func generateTestJWT() (string, error) {
 	claims := jwt.MapClaims{
 		"iss":          "authsec-ai/auth-manager",
@@ -1010,7 +1015,7 @@ func generateTestJWT() (string, error) {
 		"exp":          time.Now().Add(time.Hour).Unix(),
 		"iat":          time.Now().Unix(),
 		"nbf":          time.Now().Unix(),
-		"workspace_id": "test-tenant-123",
+		"workspace_id": testWorkspaceID,
 		"project_id":   "test-project-456",
 		"client_id":    "test-client-789",
 		"user_id":      "test-user-456",
@@ -1070,7 +1075,7 @@ func generateTestJWTWithRoles(roles []string) (string, error) {
 		"exp":          time.Now().Add(time.Hour).Unix(),
 		"iat":          time.Now().Unix(),
 		"nbf":          time.Now().Unix(),
-		"workspace_id": "test-tenant-123",
+		"workspace_id": testWorkspaceID,
 		"project_id":   "test-project-456",
 		"client_id":    "test-client-789",
 		"user_id":      "test-user-456",

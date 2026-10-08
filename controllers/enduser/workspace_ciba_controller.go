@@ -1,6 +1,7 @@
 package enduser
 
 import (
+	"github.com/authsec-ai/authsec/middlewares"
 	"log"
 	"net/http"
 	"strings"
@@ -138,7 +139,7 @@ func (tcc *TenantCIBAController) RespondToTenantCIBA(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -256,7 +257,7 @@ func (tcc *TenantCIBAController) RegisterTenantDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -303,7 +304,7 @@ func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -355,7 +356,7 @@ func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -432,7 +433,7 @@ func (tcc *TenantCIBAController) DeleteTenantDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return

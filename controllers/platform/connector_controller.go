@@ -72,7 +72,7 @@ type ConnectorUpdateRequest struct {
 // and the SPIFFE JWT-SVID path (only claims set), reading from claims as a
 // fallback.
 func (ctl *ConnectorController) resolveWorkspace(c *gin.Context) (uuid.UUID, string, error) {
-	workspaceStr := c.GetString("workspace_id")
+	workspaceStr := middlewares.WorkspaceIDString(c)
 	principal := c.GetString("client_id")
 
 	if workspaceStr == "" || principal == "" {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -35,7 +36,7 @@ func gcpOAuthTestRouter(ctl *CloudGCPOAuthController) *gin.Engine {
 	discovery := r.Group("/authsec/discovery")
 	discovery.Use(func(c *gin.Context) {
 		c.Set("claims", jwt.MapClaims{"scope": c.GetHeader("X-Test-Scope")})
-		c.Set("workspace_id", uuid.New().String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: uuid.New(), PrincipalKind: "user"})
 		c.Set("client_id", "test-actor")
 		c.Next()
 	})

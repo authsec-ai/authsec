@@ -69,10 +69,6 @@ func SCIMConnectionAuth() gin.HandlerFunc {
 			return
 		}
 
-		// Populate the same context keys the legacy SCIM middleware sets so
-		// existing handlers don't care which path invoked them.
-		workspaceID := conn.WorkspaceID.String()
-		c.Set("workspace_id", workspaceID)
 		c.Set("scim_connection_id", conn.ID.String())
 		// A machine credential's workspace comes from its own row (ADR-0001
 		// §4.1); handlers read it through the tenant context.

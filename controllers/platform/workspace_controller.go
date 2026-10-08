@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"github.com/authsec-ai/authsec/middlewares"
 	"net/http"
 	"time"
 
@@ -99,7 +100,7 @@ func (wc *WorkspaceController) ListMyWorkspaces(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id missing from token"})
 		return
 	}
-	current := c.GetString("workspace_id")
+	current := middlewares.WorkspaceIDString(c)
 
 	type row struct {
 		WorkspaceID     uuid.UUID `json:"workspace_id"`

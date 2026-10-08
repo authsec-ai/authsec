@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"github.com/authsec-ai/authsec/middlewares"
 	"fmt"
 	"net/http"
 	"strings"
@@ -48,7 +49,7 @@ type DomainResponse struct {
 
 func getWorkspaceIDFromRequest(c *gin.Context) (uuid.UUID, error) {
 	// Get workspace_id from context (set by ValidateTenantFromPath middleware)
-	workspaceIDAny, ok := c.Get("workspace_id")
+	workspaceIDAny, ok := middlewares.WorkspaceValue(c)
 	if !ok {
 		return uuid.Nil, fmt.Errorf("workspace_id not found in request context")
 	}
@@ -219,7 +220,7 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 	}
 
 	// Get workspace_id from context (set by ValidateTenantFromPath middleware)
-	workspaceIDAny, ok := c.Get("workspace_id")
+	workspaceIDAny, ok := middlewares.WorkspaceValue(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in request"})
 		return

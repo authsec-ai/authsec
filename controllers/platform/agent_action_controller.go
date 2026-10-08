@@ -65,7 +65,7 @@ func (ctrl *AgentActionController) EvaluateAction(c *gin.Context) {
 		userEmail = email.(string)
 	}
 	workspaceIDStr := ""
-	if tid, exists := c.Get("workspace_id"); exists {
+	if tid, exists := middlewares.WorkspaceValue(c); exists {
 		workspaceIDStr = tid.(string)
 	}
 
@@ -162,7 +162,7 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 	}
 	userID, _ := uuid.Parse(userIDStr)
 
-	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
 	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
 
 	approverEmail := ""
@@ -487,7 +487,7 @@ func (ctrl *AgentActionController) GetAuditLog(c *gin.Context) {
 // ========================================
 
 func (ctrl *AgentActionController) getWorkspaceID(c *gin.Context) uuid.UUID {
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found"})
 		return uuid.Nil

@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"github.com/authsec-ai/authsec/middlewares"
 	"net/http"
 	"strconv"
 	"time"
@@ -28,7 +29,7 @@ func NewLogsController() *LogsController {
 }
 
 func (lc *LogsController) workspace(c *gin.Context) (string, bool) {
-	ws := c.GetString("workspace_id")
+	ws := middlewares.WorkspaceIDString(c)
 	if ws == "" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "workspace context required"})
 		return "", false

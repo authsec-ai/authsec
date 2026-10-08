@@ -505,7 +505,7 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -530,7 +530,7 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -561,7 +561,7 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -590,7 +590,7 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/user/rbac/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -618,7 +618,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -647,7 +647,7 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return

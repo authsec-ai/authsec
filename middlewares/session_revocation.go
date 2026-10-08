@@ -45,7 +45,7 @@ func Logout(c *gin.Context) {
 	if f, ok := claims["exp"].(float64); ok {
 		exp = time.Unix(int64(f), 0)
 	}
-	ws, _ := c.Get("workspace_id")
+	ws, _ := WorkspaceValue(c)
 	uid, _ := c.Get("user_id")
 	// TENANT-EXEMPT: the denylist row is keyed by jti and records the token's own workspace
 	_, err := config.GetDatabase().DB.Exec(`

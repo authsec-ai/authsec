@@ -76,7 +76,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -152,7 +152,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -222,7 +222,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -318,7 +318,7 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -377,7 +377,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -449,7 +449,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -513,7 +513,7 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return

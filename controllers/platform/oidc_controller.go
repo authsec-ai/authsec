@@ -1383,7 +1383,7 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 		return
 	}
 
-	workspaceID, exists := c.Get("workspace_id")
+	workspaceID, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
@@ -1456,7 +1456,7 @@ func (oc *OIDCController) GetLinkedIdentities(c *gin.Context) {
 		return
 	}
 
-	workspaceID, exists := c.Get("workspace_id")
+	workspaceID, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
@@ -1493,7 +1493,7 @@ func (oc *OIDCController) UnlinkIdentity(c *gin.Context) {
 		return
 	}
 
-	workspaceID, exists := c.Get("workspace_id")
+	workspaceID, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return

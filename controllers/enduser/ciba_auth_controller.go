@@ -123,7 +123,7 @@ func (ctrl *CIBAAuthController) RespondToCIBA(c *gin.Context) {
 	}
 	responderUserID, _ := uuid.Parse(userIDStr)
 
-	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
 	responderWorkspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
 
 	// Respond to CIBA request
@@ -224,7 +224,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
@@ -282,7 +282,7 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
@@ -345,7 +345,7 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return

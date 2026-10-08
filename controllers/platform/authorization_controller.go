@@ -91,7 +91,7 @@ func (ac *AuthorizationController) Decision(c *gin.Context) {
 	}
 	userID, _ := uuid.Parse(userIDStr)
 
-	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
 	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
 
 	// action defaults to tool name when not specified separately

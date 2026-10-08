@@ -201,7 +201,7 @@ func (ctl *DiscoveryController) manager() services.DiscoveryManager {
 // workspace is never taken from the request body — a caller must not be able to
 // name someone else's workspace.
 func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, error) {
-	workspaceStr := c.GetString("workspace_id")
+	workspaceStr := middlewares.WorkspaceIDString(c)
 	if workspaceStr == "" {
 		return uuid.Nil, "", fmt.Errorf("workspace_id not found in token")
 	}

@@ -959,7 +959,6 @@ func SetupRoutes(
 			admin.GET("/invite/pending", adminInviteController.ListPendingInvites)
 
 			adminDomains := admin.Group("/tenants/:workspace_id/domains")
-			adminDomains.Use(middlewares.ExtractTenantFromPath())
 			{
 				adminDomains.POST("", domainController.CreateDomain)
 				adminDomains.GET("", domainController.ListDomains)

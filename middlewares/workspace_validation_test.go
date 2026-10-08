@@ -5,7 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // AS-063: another workspace in the path is answered as "not found", never
@@ -14,7 +16,7 @@ func TestValidateWorkspaceFromToken_MismatchIs404(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.GET("/ws/:workspace_id", func(c *gin.Context) {
-		c.Set("workspace_id", "11111111-1111-1111-1111-111111111111")
+		tenancy.Set(c, tenancy.Context{WorkspaceID: uuid.MustParse("11111111-1111-1111-1111-111111111111")})
 		c.Next()
 	}, ValidateWorkspaceFromToken(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
