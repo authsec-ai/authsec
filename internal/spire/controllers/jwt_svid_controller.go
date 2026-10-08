@@ -8,7 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
-	"github.com/authsec-ai/authsec/internal/spire/dto"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 	"github.com/authsec-ai/authsec/internal/spire/middleware"
 	"github.com/authsec-ai/authsec/internal/spire/services"
@@ -22,11 +21,13 @@ const defaultMaxDelegatedTTL = 86400
 var restrictedCustomClaims = map[string]bool{
 	"role": true, "roles": true, "perms": true,
 	"scopes": true, "scope": true, "admin": true, "is_admin": true,
+	"workspace_id": true, "tenant_id": true,
 }
 
 // JWTSVIDController handles JWT-SVID operations
 type JWTSVIDController struct {
 	service          *services.JWTSVIDService
+	entries          *services.WorkloadEntryService
 	logger           *logrus.Entry
 	defaultAudience  []string
 	allowedAudiences map[string]bool
@@ -50,320 +51,283 @@ func WithAllowedAudiences(aud []string) JWTControllerOption {
 	}
 }
 
+// WithEntryService lets agents request JWT-SVIDs for the workloads they
+// serve (entries whose parent is the agent).
+func WithEntryService(entries *services.WorkloadEntryService) JWTControllerOption {
+	return func(c *JWTSVIDController) { c.entries = entries }
+}
+
 // NewJWTSVIDController creates a new JWT-SVID controller
 func NewJWTSVIDController(service *services.JWTSVIDService, logger *logrus.Entry, opts ...JWTControllerOption) *JWTSVIDController {
-	ctrl := &JWTSVIDController{
-		service: service,
-		logger:  logger,
-	}
+	ctrl := &JWTSVIDController{service: service, logger: logger}
 	for _, o := range opts {
 		o(ctrl)
 	}
 	return ctrl
 }
 
-// IssueJWTSVID handles POST /spire/v1/jwt/issue
-func (ctrl *JWTSVIDController) IssueJWTSVID(c *gin.Context) {
-	var req struct {
-		WorkspaceID     string                 `json:"workspace_id"`
-		SpiffeID     string                 `json:"spiffe_id"`
-		Audience     []string               `json:"audience"`
-		TTL          int                    `json:"ttl"`
-		CustomClaims map[string]interface{} `json:"custom_claims,omitempty"`
+type issueBody struct {
+	WorkspaceID  string                 `json:"workspace_id"`
+	SpiffeID     string                 `json:"spiffe_id"`
+	Audience     []string               `json:"audience"`
+	TTL          int                    `json:"ttl"`
+	CustomClaims map[string]interface{} `json:"custom_claims,omitempty"`
+}
+
+func stripRestricted(claims map[string]interface{}) {
+	for k := range claims {
+		if restrictedCustomClaims[strings.ToLower(k)] {
+			delete(claims, k)
+		}
 	}
+}
+
+// IssueJWTSVID handles POST /spiresvc/v1/jwt/issue (mTLS). The workspace is
+// the client certificate's. The SVID is for the caller's own SPIFFE ID, or,
+// for an agent, for a workload entry of the workspace that the agent serves.
+func (ctrl *JWTSVIDController) IssueJWTSVID(c *gin.Context) {
+	var req issueBody
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		WorkspaceID:     req.WorkspaceID,
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	ws, err := requestWorkspace(c)
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	caller, _ := middleware.GetSpireSpiffeID(c)
+	if req.SpiffeID == "" {
+		req.SpiffeID = caller
+	}
+	if req.SpiffeID != caller {
+		isAgent, _ := middleware.GetSpireIsAgent(c)
+		if !isAgent || ctrl.entries == nil {
+			sendError(c, ctrl.logger, errors.NewForbiddenError("spiffe_id must be the authenticated identity", nil))
+			return
+		}
+		entry, err := ctrl.entries.GetBySpiffeID(c.Request.Context(), req.SpiffeID)
+		if err != nil || entry == nil || (entry.ParentID != "" && entry.ParentID != caller) {
+			sendError(c, ctrl.logger, errors.NewNotFoundError("No workload entry of this agent has that spiffe_id", nil))
+			return
+		}
+	}
+	stripRestricted(req.CustomClaims)
+	resp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
+		WorkspaceID:  ws,
 		SpiffeID:     req.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          req.TTL,
 		CustomClaims: req.CustomClaims,
 	})
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
+		sendError(c, ctrl.logger, errors.NewInternalError(err.Error(), err))
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"spiffe_id":  svidResp.SpiffeID,
-		"token":      svidResp.Token,
-		"expires_at": svidResp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
+		"spiffe_id":  resp.SpiffeID,
+		"token":      resp.Token,
+		"expires_at": resp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }
 
-// ValidateJWTSVID handles POST /spire/v1/jwt/validate
+// ValidateJWTSVID handles POST /spiresvc/v1/jwt/validate (public). The
+// workspace is the token's own issuer, verified by its signature; a body
+// workspace_id may only repeat it.
 func (ctrl *JWTSVIDController) ValidateJWTSVID(c *gin.Context) {
 	var req struct {
 		WorkspaceID string `json:"workspace_id"`
-		Token    string `json:"token"`
-		Audience string `json:"audience"`
+		Token       string `json:"token"`
+		Audience    string `json:"audience"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	validResp, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
+	v, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
 		WorkspaceID: req.WorkspaceID,
-		Token:    req.Token,
-		Audience: req.Audience,
+		Token:       req.Token,
+		Audience:    req.Audience,
 	})
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
+		sendError(c, ctrl.logger, errors.NewInternalError("Failed to validate token", err))
 		return
 	}
-
-	// Build flattened response with key claims at top level
-	resp := gin.H{
-		"spiffe_id": validResp.SpiffeID,
-		"valid":     validResp.Valid,
-		"claims":    validResp.Claims,
-	}
-	if validResp.Valid && validResp.Claims != nil {
-		if sub, ok := validResp.Claims["sub"].(string); ok {
+	resp := gin.H{"spiffe_id": v.SpiffeID, "valid": v.Valid}
+	if v.Valid && v.Claims != nil {
+		resp["claims"] = v.Claims
+		if sub, ok := v.Claims["sub"].(string); ok {
 			resp["sub"] = sub
 		}
-		if tid, ok := validResp.Claims["workspace_id"].(string); ok {
-			resp["workspace_id"] = tid
+		if iss, ok := v.Claims["iss"].(string); ok {
+			resp["workspace_id"] = strings.TrimPrefix(iss, "spiffe://")
 		}
-		if perms, ok := validResp.Claims["permissions"]; ok {
+		if perms, ok := v.Claims["permissions"]; ok {
 			resp["permissions"] = perms
 		}
-		if aud, ok := validResp.Claims["aud"]; ok {
+		if aud, ok := v.Claims["aud"]; ok {
 			resp["audience"] = aud
 		}
-		if exp, ok := validResp.Claims["exp"]; ok {
+		if exp, ok := v.Claims["exp"]; ok {
 			resp["expires_at"] = exp
 		}
-		if iat, ok := validResp.Claims["iat"]; ok {
+		if iat, ok := v.Claims["iat"]; ok {
 			resp["issued_at"] = iat
 		}
 	}
-
 	c.JSON(http.StatusOK, resp)
 }
 
-// GetJWTBundle handles GET /spire/v1/jwt/bundle
+// GetJWTBundle handles GET /spiresvc/v1/jwt/bundle?workspace_id= (public).
+// The id must name an active workspace; no key is created for any other.
 func (ctrl *JWTSVIDController) GetJWTBundle(c *gin.Context) {
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id query parameter is required", nil))
+	ws := c.Query("workspace_id")
+	if err := utils.ValidateUUID(ws, "workspace_id"); err != nil {
+		sendError(c, ctrl.logger, errors.NewBadRequestError(err.Error(), err))
 		return
 	}
-
-	bundle, err := ctrl.service.GetJWTBundle(c.Request.Context(), workspaceID)
+	bundle, err := ctrl.service.GetJWTBundle(c.Request.Context(), ws)
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
+		if services.ErrUnknownWorkspace(err) {
+			sendError(c, ctrl.logger, errors.NewNotFoundError("Workspace not found", nil))
+			return
+		}
+		sendError(c, ctrl.logger, errors.NewInternalError("Failed to load the JWT bundle", err))
 		return
 	}
-
-	// Send raw JWKS JSON
 	c.Data(http.StatusOK, "application/json", []byte(bundle))
 }
 
-// IssueDelegatedJWTSVID handles POST /spire/v1/jwt/issue-delegated
-// Protected by JWT auth middleware rather than mTLS.
-//
-// Authorization checks:
-//  1. Caller's tenant must match the requested workspace_id
-//  2. Requested SPIFFE ID must belong to the caller's tenant trust domain
-//  3. Custom claims cannot inject elevated roles/permissions
-//  4. TTL is capped to prevent long-lived delegated tokens
+// IssueDelegatedJWTSVID handles POST /spiresvc/v1/jwt/issue-delegated
+// (AuthMiddleware + owner/admin). The workspace is the caller's; the SPIFFE
+// ID must be in its trust domain; custom claims cannot carry roles,
+// permissions or a workspace; the TTL is capped.
 func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
-	var req struct {
-		WorkspaceID     string                 `json:"workspace_id"`
-		SpiffeID     string                 `json:"spiffe_id"`
-		Audience     []string               `json:"audience"`
-		TTL          int                    `json:"ttl"`
-		CustomClaims map[string]interface{} `json:"custom_claims,omitempty"`
-	}
+	var req issueBody
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Extract caller identity from context
-	callerWorkspaceID, _ := middleware.GetSpireWorkspaceID(c)
-	claims, _ := middleware.GetSpireClaims(c)
-
-	// Validate delegation authorization
-	if err := ctrl.validateDelegationAuth(claims, callerWorkspaceID, req.WorkspaceID, req.SpiffeID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError(err.Error(), err))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Apply default audience if none specified
+	ws, err := requestWorkspace(c)
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	if !strings.HasPrefix(req.SpiffeID, "spiffe://"+ws+"/") {
+		sendError(c, ctrl.logger, errors.NewForbiddenError(fmt.Sprintf("spiffe_id must be in the workspace trust domain spiffe://%s/", ws), nil))
+		return
+	}
 	if len(req.Audience) == 0 {
-		if len(ctrl.defaultAudience) > 0 {
-			req.Audience = ctrl.defaultAudience
-		} else {
-			ctrl.sendError(c, errors.NewBadRequestError("audience is required", nil))
+		if len(ctrl.defaultAudience) == 0 {
+			sendError(c, ctrl.logger, errors.NewBadRequestError("audience is required", nil))
 			return
 		}
+		req.Audience = ctrl.defaultAudience
 	}
-
-	// Validate audience against whitelist (if configured)
 	if len(ctrl.allowedAudiences) > 0 {
 		for _, aud := range req.Audience {
 			if !ctrl.allowedAudiences[aud] {
-				ctrl.sendError(c, errors.NewForbiddenError(fmt.Sprintf("audience %q is not allowed", aud), nil))
+				sendError(c, ctrl.logger, errors.NewForbiddenError(fmt.Sprintf("audience %q is not allowed", aud), nil))
 				return
 			}
 		}
 	}
-
-	// Default TTL if not specified
-	if req.TTL <= 0 {
+	if req.TTL <= 0 || req.TTL > defaultMaxDelegatedTTL {
 		req.TTL = defaultMaxDelegatedTTL
 	}
-
-	// Strip restricted keys from custom claims
-	for k := range req.CustomClaims {
-		if restrictedCustomClaims[strings.ToLower(k)] {
-			delete(req.CustomClaims, k)
-		}
-	}
-
-	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		WorkspaceID:     req.WorkspaceID,
+	stripRestricted(req.CustomClaims)
+	resp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
+		WorkspaceID:  ws,
 		SpiffeID:     req.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          req.TTL,
 		CustomClaims: req.CustomClaims,
 	})
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
+		sendError(c, ctrl.logger, errors.NewInternalError(err.Error(), err))
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"spiffe_id":  svidResp.SpiffeID,
-		"token":      svidResp.Token,
-		"expires_at": svidResp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
+		"spiffe_id":  resp.SpiffeID,
+		"token":      resp.Token,
+		"expires_at": resp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }
 
-// RenewJWTSVID handles POST /spire/v1/jwt/renew
-// Renews an existing valid JWT-SVID by issuing a new token with the same claims.
+// RenewJWTSVID handles POST /spiresvc/v1/jwt/renew (public): a valid token
+// is re-issued with the same claims and a fresh TTL, by and for the
+// workspace that issued it (its verified iss). A body workspace_id may only
+// repeat it.
 func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 	var req struct {
 		WorkspaceID string `json:"workspace_id"`
-		Token    string `json:"token"`
+		Token       string `json:"token"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	if req.WorkspaceID == "" || req.Token == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id and token are required", nil))
+	if req.Token == "" {
+		sendError(c, ctrl.logger, errors.NewBadRequestError("token is required", nil))
 		return
 	}
-
-	// Validate the existing token (without audience check)
-	validResp, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
+	v, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
 		WorkspaceID: req.WorkspaceID,
-		Token:    req.Token,
+		Token:       req.Token,
 	})
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError("Failed to validate token", err))
+		sendError(c, ctrl.logger, errors.NewInternalError("Failed to validate token", err))
 		return
 	}
-	if !validResp.Valid {
-		ctrl.sendError(c, errors.NewUnauthorizedError("Token is invalid or expired - cannot renew", nil))
+	if !v.Valid {
+		sendError(c, ctrl.logger, errors.NewUnauthorizedError("Token is invalid or expired - cannot renew", nil))
 		return
 	}
+	iss, _ := v.Claims["iss"].(string)
+	ws := strings.TrimPrefix(iss, "spiffe://")
+	spiffeID, _ := v.Claims["sub"].(string)
 
-	// Extract claims to re-issue
-	spiffeID, _ := validResp.Claims["sub"].(string)
-
-	// Reconstruct audience
 	var audience []string
-	if audClaim, ok := validResp.Claims["aud"]; ok {
-		switch aud := audClaim.(type) {
-		case []interface{}:
-			for _, a := range aud {
-				if aStr, ok := a.(string); ok {
-					audience = append(audience, aStr)
-				}
+	switch aud := v.Claims["aud"].(type) {
+	case []interface{}:
+		for _, a := range aud {
+			if s, ok := a.(string); ok {
+				audience = append(audience, s)
 			}
-		case string:
-			audience = []string{aud}
+		}
+	case string:
+		audience = []string{aud}
+	}
+	custom := make(map[string]interface{})
+	for k, val := range v.Claims {
+		switch k {
+		case "iss", "sub", "aud", "exp", "nbf", "iat", "jti":
+		default:
+			custom[k] = val
 		}
 	}
-
-	// Collect custom claims (everything except standard JWT fields)
-	customClaims := make(map[string]interface{})
-	standardClaims := map[string]bool{
-		"iss": true, "sub": true, "aud": true, "exp": true,
-		"nbf": true, "iat": true, "jti": true,
-	}
-	for k, v := range validResp.Claims {
-		if !standardClaims[k] {
-			customClaims[k] = v
-		}
-	}
-
-	// Re-issue with same claims, fresh TTL
-	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		WorkspaceID:     req.WorkspaceID,
+	resp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
+		WorkspaceID:  ws,
 		SpiffeID:     spiffeID,
 		Audience:     audience,
 		TTL:          defaultMaxDelegatedTTL,
-		CustomClaims: customClaims,
+		CustomClaims: custom,
 	})
 	if err != nil {
-		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
+		sendError(c, ctrl.logger, errors.NewInternalError(err.Error(), err))
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"spiffe_id":  svidResp.SpiffeID,
-		"token":      svidResp.Token,
-		"expires_at": svidResp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
-	})
-}
-
-// validateDelegationAuth checks that the caller is authorized to issue a delegated JWT-SVID.
-func (ctrl *JWTSVIDController) validateDelegationAuth(claims *utils.JWTClaims, callerWorkspaceID, reqWorkspaceID, reqSpiffeID string) error {
-	if callerWorkspaceID == "" {
-		return fmt.Errorf("caller tenant ID not found in authentication context")
-	}
-
-	// Tenant must match
-	if callerWorkspaceID != reqWorkspaceID {
-		return fmt.Errorf("tenant mismatch: authenticated as tenant %s but requesting delegation for tenant %s", callerWorkspaceID, reqWorkspaceID)
-	}
-
-	// SPIFFE ID must belong to the caller's tenant trust domain
-	expectedPrefix := fmt.Sprintf("spiffe://%s/", reqWorkspaceID)
-	if !strings.HasPrefix(reqSpiffeID, expectedPrefix) {
-		return fmt.Errorf("spiffe_id %s does not belong to tenant %s trust domain", reqSpiffeID, reqWorkspaceID)
-	}
-
-	return nil
-}
-
-// sendError sends an error response
-func (ctrl *JWTSVIDController) sendError(c *gin.Context, err error) {
-	appErr, ok := err.(*errors.AppError)
-	if !ok {
-		appErr = errors.NewInternalError("Internal server error", err)
-	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"code":    appErr.Code,
-		"message": appErr.Message,
-	}).WithError(appErr.Err).Error("JWT-SVID request failed")
-
-	c.JSON(appErr.Status, dto.ErrorResponse{
-		Error: dto.ErrorDetail{
-			Code:    appErr.Code,
-			Message: appErr.Message,
-		},
+		"spiffe_id":  resp.SpiffeID,
+		"token":      resp.Token,
+		"expires_at": resp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }

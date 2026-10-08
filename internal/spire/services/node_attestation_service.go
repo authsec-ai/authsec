@@ -7,33 +7,44 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
-	"github.com/authsec-ai/authsec/internal/spire/infrastructure/database"
-	infrarepos "github.com/authsec-ai/authsec/internal/spire/infrastructure/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
-
-	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
+	"github.com/authsec-ai/authsec/internal/spire/utils"
 )
 
-// NodeAttestationService handles node attestation for agents
+// AttestationTypeJoinToken attests a node by its join token alone.
+const AttestationTypeJoinToken = "join_token"
+
+// NodeAttestationService attests nodes and issues agent SVIDs. A node proves
+// it may join a workspace with a single-use join token minted by that
+// workspace's admin; the token, never the request, decides the workspace.
+// Attestation evidence (Kubernetes PSAT, ...) is still validated for the
+// node's selectors.
 type NodeAttestationService struct {
-	connManager  *database.ConnectionManager
-	workspaceRepo   repositories.WorkspaceRepository
-	vaultClient  *vault.Client
-	k8sValidator *KubernetesValidator
-	logger       *logrus.Entry
+	workspaceRepo repositories.WorkspaceRepository
+	agentRepo     repositories.AgentRepository
+	joinTokens    repositories.JoinTokenRepository
+	vaultClient   *vault.Client
+	k8sValidator  *KubernetesValidator
+	logger        *logrus.Entry
 }
 
 // NodeAttestRequest represents a node attestation request
 type NodeAttestRequest struct {
-	WorkspaceID        string
-	NodeID          string
-	AttestationType string
-	Evidence        map[string]interface{}
-	CSR             string
+	// JoinToken is the secret an admin minted for this node.
+	JoinToken string
+	// AssertedWorkspaceID is the workspace the caller says it joins; when
+	// set it must be the token's.
+	AssertedWorkspaceID string
+	NodeID              string
+	AttestationType     string
+	Evidence            map[string]interface{}
+	CSR                 string
 }
 
 // NodeAttestResponse represents a node attestation response
@@ -43,12 +54,14 @@ type NodeAttestResponse struct {
 	SpiffeID    string
 	ExpiresAt   time.Time
 	AgentID     string
+	WorkspaceID string
 }
 
 // NewNodeAttestationService creates a new node attestation service
 func NewNodeAttestationService(
-	connManager *database.ConnectionManager,
 	workspaceRepo repositories.WorkspaceRepository,
+	agentRepo repositories.AgentRepository,
+	joinTokens repositories.JoinTokenRepository,
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *NodeAttestationService {
@@ -56,165 +69,142 @@ func NewNodeAttestationService(
 	// server's service account needs tokenreviews create.
 	k8sValidator, err := NewKubernetesValidator(logger, &KubernetesValidatorConfig{})
 	if err != nil {
-		logger.WithError(err).Error("Failed to initialize Kubernetes validator")
-		return nil
+		logger.WithError(err).Error("Failed to initialize Kubernetes validator; kubernetes attestation unavailable")
+		k8sValidator = nil
 	}
-
 	return &NodeAttestationService{
-		connManager:  connManager,
-		workspaceRepo:   workspaceRepo,
-		vaultClient:  vaultClient,
-		k8sValidator: k8sValidator,
-		logger:       logger,
+		workspaceRepo: workspaceRepo,
+		agentRepo:     agentRepo,
+		joinTokens:    joinTokens,
+		vaultClient:   vaultClient,
+		k8sValidator:  k8sValidator,
+		logger:        logger,
 	}
 }
 
-// Attest performs node attestation and issues Agent SVID
+// Attest performs node attestation and issues an agent SVID.
 func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequest) (*NodeAttestResponse, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id":        req.WorkspaceID,
-		"node_id":          req.NodeID,
-		"attestation_type": req.AttestationType,
-	}).Info("Node attestation started")
-
-	// 1. Validate tenant
-	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
-	if err != nil {
-		return nil, errors.NewNotFoundError("Tenant not found", err)
+	if req.JoinToken == "" {
+		return nil, errors.NewUnauthorizedError("join_token is required", nil)
 	}
-	if tenant.Status != "active" {
-		return nil, errors.NewForbiddenError("Tenant is not active", nil)
+	if err := utils.ValidateSpiffeComponent(req.NodeID, "node_id"); err != nil {
+		return nil, errors.NewBadRequestError(err.Error(), err)
 	}
 
-	// 2. Validate attestation evidence
+	// 1. Evidence and CSR first, so a request that fails them does not burn
+	//    the token.
 	nodeSelectors, err := s.validateEvidence(ctx, req.AttestationType, req.Evidence)
 	if err != nil {
-		s.logger.WithField("attestation_type", req.AttestationType).WithError(err).Error("Attestation validation failed")
+		s.logger.WithField("attestation_type", req.AttestationType).WithError(err).Warn("Attestation evidence refused")
 		return nil, errors.NewUnauthorizedError("Attestation failed", err)
 	}
-
-	// 3. Validate CSR
 	csrBlock, _ := pem.Decode([]byte(req.CSR))
 	if csrBlock == nil {
 		return nil, errors.NewBadRequestError("Invalid CSR format", nil)
 	}
-
 	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
 	if err != nil {
 		return nil, errors.NewBadRequestError("Failed to parse CSR", err)
 	}
-
 	if err := csr.CheckSignature(); err != nil {
 		return nil, errors.NewBadRequestError("Invalid CSR signature", err)
 	}
 
-	// 4. Generate SPIFFE ID for agent
-	spiffeID := s.generateAgentSpiffeID(req.WorkspaceID, req.NodeID)
+	// 2. The join token decides the workspace. It is consumed atomically; a
+	//    used, expired, revoked or unknown token, or one for another
+	//    workspace than the asserted one, is refused.
+	token, err := s.joinTokens.Consume(ctx, HashJoinToken(req.JoinToken), req.NodeID, req.AssertedWorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	ctx, err = withWorkspace(ctx, token.WorkspaceID, "spire_node")
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := s.workspaceRepo.GetByID(ctx, token.WorkspaceID)
+	if err != nil {
+		return nil, errors.NewUnauthorizedError("The join token's workspace is not active", err)
+	}
+	s.logger.WithFields(logrus.Fields{
+		"workspace_id": tenant.ID, "node_id": req.NodeID, "join_token_id": token.ID,
+	}).Info("Node attestation: join token accepted")
 
-	// 5. Ensure Vault PKI role allows URI SANs (automatic configuration)
-	if err := s.ensureVaultRoleConfigured(ctx, tenant.VaultMount, req.WorkspaceID); err != nil {
-		s.logger.WithFields(logrus.Fields{
-			"vault_mount": tenant.VaultMount,
-		}).WithError(err).Error("Failed to configure Vault PKI role")
+	if !s.vaultClient.Available() {
+		return nil, vault.ErrUnavailable
+	}
+	if tenant.VaultMount == "" {
+		return nil, errors.NewServiceUnavailableError("Workspace PKI is not provisioned", nil)
+	}
+
+	// 3. Issue the agent SVID.
+	spiffeID := s.generateAgentSpiffeID(tenant.ID, req.NodeID)
+	if err := s.ensureVaultRoleConfigured(ctx, tenant.VaultMount, tenant.ID); err != nil {
 		return nil, errors.NewInternalError("Failed to configure Vault PKI role", err)
 	}
-
-	// 6. Issue certificate via Vault
-	certReq := &vault.CertificateRequest{
+	certResp, err := s.vaultClient.IssueCertificate(ctx, tenant.VaultMount, "agent", &vault.CertificateRequest{
 		CSR:        req.CSR,
 		CommonName: spiffeID,
-		TTL:        "1h", // 1 hour for frequent renewal and better security
+		TTL:        "1h", // short-lived: agents renew often
 		URISANs:    []string{spiffeID},
-	}
-
-	certResp, err := s.vaultClient.IssueCertificate(ctx, tenant.VaultMount, "agent", certReq)
+	})
 	if err != nil {
-		s.logger.WithField("vault_mount", tenant.VaultMount).WithError(err).Error("Failed to issue agent certificate")
 		return nil, errors.NewInternalError("Failed to issue certificate", err)
 	}
 
-	// 6. Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, req.WorkspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", req.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
-	}
-
-	// Create agent repository for this tenant's database
-	agentRepo := infrarepos.NewPostgresAgentRepository(tenantDB, s.logger)
-
-	// 7. Create or update agent record
-	// Check if agent already exists
-	existingAgent, err := agentRepo.GetByTenantAndNode(ctx, req.WorkspaceID, req.NodeID)
+	// 4. Create or update this workspace's agent for the node.
+	agent, err := s.agentRepo.GetByNode(ctx, req.NodeID)
 	if err == nil {
-		// Agent exists, update it
-		existingAgent.SpiffeID = spiffeID
-		existingAgent.AttestationType = req.AttestationType
-		existingAgent.NodeSelectors = nodeSelectors
-		existingAgent.CertificateSerial = certResp.SerialNumber
-		existingAgent.Status = models.AgentStatusActive
-		existingAgent.LastSeen = time.Now()
-
-		if err := agentRepo.Update(ctx, existingAgent); err != nil {
+		agent.SpiffeID = spiffeID
+		agent.AttestationType = req.AttestationType
+		agent.NodeSelectors = nodeSelectors
+		agent.CertificateSerial = certResp.SerialNumber
+		agent.Status = models.AgentStatusActive
+		agent.LastSeen = time.Now()
+		if err := s.agentRepo.Update(ctx, agent); err != nil {
 			return nil, errors.NewInternalError("Failed to update agent", err)
 		}
-
-		s.logger.WithFields(logrus.Fields{
-			"agent_id":  existingAgent.ID,
-			"spiffe_id": spiffeID,
-		}).Info("Agent updated")
-
-		return &NodeAttestResponse{
-			Certificate: certResp.Certificate,
-			CAChain:     certResp.CAChain,
-			SpiffeID:    spiffeID,
-			ExpiresAt:   certResp.ExpirationTime,
-			AgentID:     existingAgent.ID,
-		}, nil
+	} else {
+		agent = &models.Agent{
+			ID:                uuid.New().String(),
+			NodeID:            req.NodeID,
+			SpiffeID:          spiffeID,
+			AttestationType:   req.AttestationType,
+			NodeSelectors:     nodeSelectors,
+			CertificateSerial: certResp.SerialNumber,
+			Status:            models.AgentStatusActive,
+			LastSeen:          time.Now(),
+		}
+		if err := s.agentRepo.Create(ctx, agent); err != nil {
+			return nil, errors.NewInternalError("Failed to store agent", err)
+		}
 	}
 
-	// Agent doesn't exist, create new
-	agent := &models.Agent{
-		ID:                uuid.New().String(),
-		WorkspaceID:          req.WorkspaceID,
-		NodeID:            req.NodeID,
-		SpiffeID:          spiffeID,
-		AttestationType:   req.AttestationType,
-		NodeSelectors:     nodeSelectors,
-		CertificateSerial: certResp.SerialNumber,
-		Status:            models.AgentStatusActive,
-		LastSeen:          time.Now(),
-	}
-
-	if err := agentRepo.Create(ctx, agent); err != nil {
-		return nil, errors.NewInternalError("Failed to store agent", err)
-	}
-
-	s.logger.WithFields(logrus.Fields{
-		"agent_id":  agent.ID,
-		"spiffe_id": spiffeID,
-		"node_id":   req.NodeID,
-	}).Info("Agent created")
-
-	// 8. Return response
 	return &NodeAttestResponse{
 		Certificate: certResp.Certificate,
 		CAChain:     certResp.CAChain,
 		SpiffeID:    spiffeID,
 		ExpiresAt:   certResp.ExpirationTime,
 		AgentID:     agent.ID,
+		WorkspaceID: tenant.ID,
 	}, nil
 }
 
 // validateEvidence validates attestation evidence based on type
 func (s *NodeAttestationService) validateEvidence(ctx context.Context, attestationType string, evidence map[string]interface{}) (map[string]string, error) {
 	switch attestationType {
+	case AttestationTypeJoinToken:
+		// The join token alone attests the node; no selectors.
+		return map[string]string{}, nil
+
 	case models.AttestationTypeKubernetes:
+		if s.k8sValidator == nil {
+			return nil, fmt.Errorf("kubernetes attestation is not available")
+		}
 		return s.k8sValidator.Validate(ctx, evidence)
 
 	case models.AttestationTypeUnix:
-		// Unix attestation - minimal validation for development/testing
-		// In production, this should verify process identity and permissions
+		// Unix attestation: self-reported selectors; the join token is the
+		// proof of authorization.
 		nodeSelectors := make(map[string]string)
 		if pid, ok := evidence["pid"].(float64); ok {
 			nodeSelectors["unix:pid"] = fmt.Sprintf("%d", int(pid))
@@ -228,8 +218,8 @@ func (s *NodeAttestationService) validateEvidence(ctx context.Context, attestati
 		return nodeSelectors, nil
 
 	case models.AttestationTypeDocker:
-		// Docker attestation - minimal validation for development/testing
-		// In production, this should verify container identity
+		// Docker attestation: self-reported selectors; the join token is the
+		// proof of authorization.
 		nodeSelectors := make(map[string]string)
 		if containerID, ok := evidence["container_id"].(string); ok {
 			nodeSelectors["docker:container_id"] = containerID
@@ -240,11 +230,9 @@ func (s *NodeAttestationService) validateEvidence(ctx context.Context, attestati
 		return nodeSelectors, nil
 
 	case models.AttestationTypeTPM:
-		// TODO: Implement TPM validator in future sprint
 		return nil, fmt.Errorf("TPM attestation not yet implemented")
 
 	case models.AttestationTypeAWS:
-		// TODO: Implement AWS validator in future sprint
 		return nil, fmt.Errorf("AWS attestation not yet implemented")
 
 	default:
@@ -253,21 +241,14 @@ func (s *NodeAttestationService) validateEvidence(ctx context.Context, attestati
 }
 
 // generateAgentSpiffeID generates a SPIFFE ID for an agent
-// Format: spiffe://{tenant-id}/agent/{node-id}
+// Format: spiffe://{workspace-id}/agent/{node-id}
 func (s *NodeAttestationService) generateAgentSpiffeID(workspaceID, nodeID string) string {
 	return fmt.Sprintf("spiffe://%s/agent/%s", workspaceID, nodeID)
 }
 
-// ensureVaultRoleConfigured ensures the Vault PKI role allows URI SANs for SPIFFE IDs
-// This is called automatically during node attestation to configure the role if needed
+// ensureVaultRoleConfigured ensures the Vault PKI role allows URI SANs for
+// this workspace's agent SPIFFE IDs.
 func (s *NodeAttestationService) ensureVaultRoleConfigured(ctx context.Context, vaultMount, workspaceID string) error {
-	s.logger.WithFields(logrus.Fields{
-		"vault_mount": vaultMount,
-		"workspace_id":   workspaceID,
-	}).Info("Ensuring Vault PKI role is configured for URI SANs")
-
-	// Configure the agent role to allow URI SANs
-	// This allows SPIFFE IDs in the form: spiffe://{tenant-id}/agent/{node-id}
 	roleConfig := &vault.PKIRoleConfig{
 		AllowedDomains:  []string{},
 		AllowedURISANs:  []string{fmt.Sprintf("spiffe://%s/*", workspaceID)},
@@ -281,19 +262,11 @@ func (s *NodeAttestationService) ensureVaultRoleConfigured(ctx context.Context, 
 		KeyBits:         2048,
 		RequireCN:       false,
 	}
-
-	// Create or update the agent role
-	// This is idempotent - it will update the role if it already exists
-	// Note: vaultMount already includes the full path (e.g., "pki/spire.app.authsec.dev")
+	// Idempotent: creates or updates the agent role. vaultMount already
+	// includes the full path (e.g. "pki/spire.app.authsec.dev").
 	if err := s.vaultClient.CreatePKIRole(ctx, vaultMount, "agent", roleConfig); err != nil {
 		s.logger.WithField("vault_mount", vaultMount).WithError(err).Error("Failed to create/update PKI role")
 		return err
 	}
-
-	s.logger.WithFields(logrus.Fields{
-		"vault_mount": vaultMount,
-		"role":        "agent",
-	}).Info("Vault PKI role configured successfully")
-
 	return nil
 }

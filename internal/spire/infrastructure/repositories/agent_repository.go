@@ -4,365 +4,196 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	stderrors "errors"
 	"time"
 
-	"github.com/authsec-ai/authsec/internal/spire/domain/models"
-	"github.com/authsec-ai/authsec/internal/spire/errors"
-
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+
+	"github.com/authsec-ai/authsec/internal/spire/domain/models"
+	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
+	"github.com/authsec-ai/authsec/internal/spire/errors"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
-// PostgresAgentRepository implements AgentRepository for PostgreSQL
+// PostgresAgentRepository stores attested agents in spire_agents, scoped to
+// the workspace carried by ctx.
 type PostgresAgentRepository struct {
 	db     *sql.DB
 	logger *logrus.Entry
 }
 
-// NewPostgresAgentRepository creates a new PostgreSQL agent repository
-func NewPostgresAgentRepository(db *sql.DB, logger *logrus.Entry) *PostgresAgentRepository {
-	return &PostgresAgentRepository{
-		db:     db,
-		logger: logger,
-	}
+// NewPostgresAgentRepository creates the agent repository.
+func NewPostgresAgentRepository(db *sql.DB, logger *logrus.Entry) repositories.AgentRepository {
+	return &PostgresAgentRepository{db: db, logger: logger}
 }
 
-// Create creates a new agent record
-func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agent) error {
-	now := time.Now()
-	agent.CreatedAt = now
-	agent.UpdatedAt = now
+const agentColumns = `id::text, workspace_id::text, node_id, spiffe_id, attestation_type,
+	node_selectors, COALESCE(certificate_serial, ''), status, COALESCE(cluster_name, ''),
+	last_seen, last_heartbeat, created_at, updated_at`
 
-	nodeSelectorsJSON, err := json.Marshal(agent.NodeSelectors)
+// Create inserts an agent for ctx's workspace.
+func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agent) error {
+	ws, err := workspaceOf(ctx)
+	if err != nil {
+		return err
+	}
+	if agent.ID == "" {
+		agent.ID = uuid.NewString()
+	}
+	now := time.Now()
+	agent.WorkspaceID = ws.String()
+	agent.CreatedAt, agent.UpdatedAt = now, now
+	if agent.LastHeartbeat.IsZero() {
+		agent.LastHeartbeat = agent.LastSeen
+	}
+	selectors, err := json.Marshal(nonNilMap(agent.NodeSelectors))
 	if err != nil {
 		return errors.NewInternalError("Failed to marshal node selectors", err)
 	}
-
-	query := `
-		INSERT INTO agents (
-			id, workspace_id, node_id, spiffe_id, attestation_type,
-			node_selectors, certificate_serial, status, cluster_name,
-			last_seen, last_heartbeat, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`
-
-	// Use LastHeartbeat if set, otherwise use LastSeen for backward compatibility
-	lastHeartbeat := agent.LastHeartbeat
-	if lastHeartbeat.IsZero() {
-		lastHeartbeat = agent.LastSeen
-	}
-
-	_, err = r.db.ExecContext(ctx, query,
-		agent.ID, agent.WorkspaceID, agent.NodeID, agent.SpiffeID,
-		agent.AttestationType, nodeSelectorsJSON, agent.CertificateSerial,
-		agent.Status, agent.ClusterName, agent.LastSeen, lastHeartbeat,
-		agent.CreatedAt, agent.UpdatedAt,
-	)
-
+	_, err = tenancy.InsertContext(ctx, r.db, `
+		INSERT INTO spire_agents (
+			workspace_id, id, node_id, spiffe_id, attestation_type, node_selectors,
+			certificate_serial, status, cluster_name, last_seen, last_heartbeat,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		agent.ID, agent.NodeID, agent.SpiffeID, agent.AttestationType, selectors,
+		nullString(agent.CertificateSerial), agent.Status, nullString(agent.ClusterName),
+		nullTime(agent.LastSeen), nullTime(agent.LastHeartbeat), agent.CreatedAt, agent.UpdatedAt)
 	if err != nil {
 		r.logger.WithError(err).Error("Failed to create agent")
 		return errors.NewInternalError("Failed to create agent", err)
 	}
-
-	r.logger.WithFields(logrus.Fields{
-		"agent_id":  agent.ID,
-		"workspace_id": agent.WorkspaceID,
-		"spiffe_id": agent.SpiffeID,
-	}).Info("Agent created")
-
 	return nil
 }
 
-// GetByID retrieves an agent by ID
+// GetByID returns the agent with this id in ctx's workspace.
 func (r *PostgresAgentRepository) GetByID(ctx context.Context, id string) (*models.Agent, error) {
-	query := `
-		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
-		       node_selectors, certificate_serial, status, cluster_name,
-		       last_seen, last_heartbeat, created_at, updated_at
-		FROM agents
-		WHERE id = $1
-	`
-
-	agent := &models.Agent{}
-	var nodeSelectorsJSON []byte
-	var clusterName sql.NullString
-	var lastHeartbeat sql.NullTime
-
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
-		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
-		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
-		&agent.CreatedAt, &agent.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Agent not found", err)
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, errors.NewNotFoundError("Agent not found", nil)
 	}
-	if err != nil {
-		r.logger.WithError(err).Error("Failed to get agent by ID")
-		return nil, errors.NewInternalError("Failed to get agent", err)
-	}
-
-	// Handle nullable fields
-	if clusterName.Valid {
-		agent.ClusterName = clusterName.String
-	}
-	if lastHeartbeat.Valid {
-		agent.LastHeartbeat = lastHeartbeat.Time
-	}
-
-	if len(nodeSelectorsJSON) > 0 {
-		if err := json.Unmarshal(nodeSelectorsJSON, &agent.NodeSelectors); err != nil {
-			r.logger.WithError(err).Error("Failed to unmarshal node selectors")
-			return nil, errors.NewInternalError("Failed to parse node selectors", err)
-		}
-	}
-
-	return agent, nil
+	return r.getOne(ctx, `SELECT `+agentColumns+` FROM spire_agents WHERE workspace_id = $1 AND id = $2`, id)
 }
 
-// GetBySpiffeID retrieves an agent by SPIFFE ID
+// GetBySpiffeID returns the agent with this SPIFFE ID in ctx's workspace.
 func (r *PostgresAgentRepository) GetBySpiffeID(ctx context.Context, spiffeID string) (*models.Agent, error) {
-	query := `
-		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
-		       node_selectors, certificate_serial, status, cluster_name,
-		       last_seen, last_heartbeat, created_at, updated_at
-		FROM agents
-		WHERE spiffe_id = $1
-	`
+	return r.getOne(ctx, `SELECT `+agentColumns+` FROM spire_agents WHERE workspace_id = $1 AND spiffe_id = $2`, spiffeID)
+}
 
-	agent := &models.Agent{}
-	var nodeSelectorsJSON []byte
-	var clusterName sql.NullString
-	var lastHeartbeat sql.NullTime
+// GetByNode returns the agent for this node in ctx's workspace.
+func (r *PostgresAgentRepository) GetByNode(ctx context.Context, nodeID string) (*models.Agent, error) {
+	return r.getOne(ctx, `SELECT `+agentColumns+` FROM spire_agents WHERE workspace_id = $1 AND node_id = $2`, nodeID)
+}
 
-	err := r.db.QueryRowContext(ctx, query, spiffeID).Scan(
-		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
-		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
-		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
-		&agent.CreatedAt, &agent.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
+func (r *PostgresAgentRepository) getOne(ctx context.Context, query string, arg interface{}) (*models.Agent, error) {
+	a := &models.Agent{}
+	var selectors []byte
+	var lastSeen, lastHeartbeat sql.NullTime
+	err := tenancy.QueryRowContext(ctx, r.db, query, []interface{}{arg},
+		&a.ID, &a.WorkspaceID, &a.NodeID, &a.SpiffeID, &a.AttestationType, &selectors,
+		&a.CertificateSerial, &a.Status, &a.ClusterName, &lastSeen, &lastHeartbeat,
+		&a.CreatedAt, &a.UpdatedAt)
+	if stderrors.Is(err, tenancy.ErrNotFound) {
 		return nil, errors.NewNotFoundError("Agent not found", err)
 	}
 	if err != nil {
-		r.logger.WithError(err).Error("Failed to get agent by SPIFFE ID")
 		return nil, errors.NewInternalError("Failed to get agent", err)
 	}
-
-	// Handle nullable fields
-	if clusterName.Valid {
-		agent.ClusterName = clusterName.String
-	}
-	if lastHeartbeat.Valid {
-		agent.LastHeartbeat = lastHeartbeat.Time
-	}
-
-	if len(nodeSelectorsJSON) > 0 {
-		if err := json.Unmarshal(nodeSelectorsJSON, &agent.NodeSelectors); err != nil {
-			r.logger.WithError(err).Error("Failed to unmarshal node selectors")
+	a.LastSeen, a.LastHeartbeat = lastSeen.Time, lastHeartbeat.Time
+	if len(selectors) > 0 {
+		if err := json.Unmarshal(selectors, &a.NodeSelectors); err != nil {
 			return nil, errors.NewInternalError("Failed to parse node selectors", err)
 		}
 	}
-
-	return agent, nil
+	return a, nil
 }
 
-// GetByTenantAndNode retrieves an agent by tenant ID and node ID
-func (r *PostgresAgentRepository) GetByTenantAndNode(ctx context.Context, workspaceID, nodeID string) (*models.Agent, error) {
-	query := `
-		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
-		       node_selectors, certificate_serial, status, cluster_name,
-		       last_seen, last_heartbeat, created_at, updated_at
-		FROM agents
-		WHERE workspace_id = $1 AND node_id = $2
-	`
-
-	agent := &models.Agent{}
-	var nodeSelectorsJSON []byte
-	var clusterName sql.NullString
-	var lastHeartbeat sql.NullTime
-
-	err := r.db.QueryRowContext(ctx, query, workspaceID, nodeID).Scan(
-		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
-		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
-		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
-		&agent.CreatedAt, &agent.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Agent not found", err)
-	}
-	if err != nil {
-		r.logger.WithError(err).Error("Failed to get agent by tenant and node")
-		return nil, errors.NewInternalError("Failed to get agent", err)
-	}
-
-	// Handle nullable fields
-	if clusterName.Valid {
-		agent.ClusterName = clusterName.String
-	}
-	if lastHeartbeat.Valid {
-		agent.LastHeartbeat = lastHeartbeat.Time
-	}
-
-	if len(nodeSelectorsJSON) > 0 {
-		if err := json.Unmarshal(nodeSelectorsJSON, &agent.NodeSelectors); err != nil {
-			r.logger.WithError(err).Error("Failed to unmarshal node selectors")
-			return nil, errors.NewInternalError("Failed to parse node selectors", err)
-		}
-	}
-
-	return agent, nil
-}
-
-// Update updates an existing agent record
+// Update rewrites an agent of ctx's workspace.
 func (r *PostgresAgentRepository) Update(ctx context.Context, agent *models.Agent) error {
 	agent.UpdatedAt = time.Now()
-
-	nodeSelectorsJSON, err := json.Marshal(agent.NodeSelectors)
+	if agent.LastHeartbeat.IsZero() {
+		agent.LastHeartbeat = agent.LastSeen
+	}
+	selectors, err := json.Marshal(nonNilMap(agent.NodeSelectors))
 	if err != nil {
 		return errors.NewInternalError("Failed to marshal node selectors", err)
 	}
-
-	// Use LastHeartbeat if set, otherwise use LastSeen for backward compatibility
-	lastHeartbeat := agent.LastHeartbeat
-	if lastHeartbeat.IsZero() {
-		lastHeartbeat = agent.LastSeen
-	}
-
-	query := `
-		UPDATE agents
-		SET node_id = $1, spiffe_id = $2, attestation_type = $3,
-		    node_selectors = $4, certificate_serial = $5, status = $6,
-		    cluster_name = $7, last_seen = $8, last_heartbeat = $9,
-		    updated_at = $10
-		WHERE id = $11
-	`
-
-	result, err := r.db.ExecContext(ctx, query,
-		agent.NodeID, agent.SpiffeID, agent.AttestationType,
-		nodeSelectorsJSON, agent.CertificateSerial, agent.Status,
-		agent.ClusterName, agent.LastSeen, lastHeartbeat,
-		agent.UpdatedAt, agent.ID,
-	)
-
+	res, err := tenancy.ExecContext(ctx, r.db, `
+		UPDATE spire_agents
+		   SET node_id = $3, spiffe_id = $4, attestation_type = $5, node_selectors = $6,
+		       certificate_serial = $7, status = $8, cluster_name = $9, last_seen = $10,
+		       last_heartbeat = $11, updated_at = $12
+		 WHERE workspace_id = $1 AND id = $2`,
+		agent.ID, agent.NodeID, agent.SpiffeID, agent.AttestationType, selectors,
+		nullString(agent.CertificateSerial), agent.Status, nullString(agent.ClusterName),
+		nullTime(agent.LastSeen), nullTime(agent.LastHeartbeat), agent.UpdatedAt)
 	if err != nil {
-		r.logger.WithError(err).Error("Failed to update agent")
 		return errors.NewInternalError("Failed to update agent", err)
 	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get rows affected", err)
-	}
-
-	if rowsAffected == 0 {
+	if n, _ := res.RowsAffected(); n == 0 {
 		return errors.NewNotFoundError("Agent not found", nil)
 	}
-
-	r.logger.WithFields(logrus.Fields{
-		"agent_id": agent.ID,
-		"status":   agent.Status,
-	}).Info("Agent updated")
-
 	return nil
 }
 
-// Delete deletes an agent by ID
-func (r *PostgresAgentRepository) Delete(ctx context.Context, id string) error {
-	query := `DELETE FROM agents WHERE id = $1`
-
-	result, err := r.db.ExecContext(ctx, query, id)
+// List returns ctx's workspace's agents, newest first.
+func (r *PostgresAgentRepository) List(ctx context.Context) ([]*models.Agent, error) {
+	rows, err := tenancy.QueryContext(ctx, r.db,
+		`SELECT `+agentColumns+` FROM spire_agents WHERE workspace_id = $1 ORDER BY created_at DESC`)
 	if err != nil {
-		r.logger.WithError(err).Error("Failed to delete agent")
-		return errors.NewInternalError("Failed to delete agent", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get rows affected", err)
-	}
-
-	if rowsAffected == 0 {
-		return errors.NewNotFoundError("Agent not found", nil)
-	}
-
-	r.logger.WithField("agent_id", id).Info("Agent deleted")
-
-	return nil
-}
-
-// ListByTenant lists all agents for a tenant
-func (r *PostgresAgentRepository) ListByTenant(ctx context.Context, workspaceID string) ([]*models.Agent, error) {
-	query := `
-		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
-		       node_selectors, certificate_serial, status, last_seen,
-		       created_at, updated_at
-		FROM agents
-		WHERE workspace_id = $1
-		ORDER BY created_at DESC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query, workspaceID)
-	if err != nil {
-		r.logger.WithError(err).Error("Failed to list agents by tenant")
 		return nil, errors.NewInternalError("Failed to list agents", err)
 	}
 	defer rows.Close()
-
 	agents := []*models.Agent{}
 	for rows.Next() {
-		agent := &models.Agent{}
-		var nodeSelectorsJSON []byte
-
-		err := rows.Scan(
-			&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
-			&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
-			&agent.Status, &agent.LastSeen, &agent.CreatedAt, &agent.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.WithError(err).Error("Failed to scan agent row")
+		a := &models.Agent{}
+		var selectors []byte
+		var lastSeen, lastHeartbeat sql.NullTime
+		if err := rows.Scan(&a.ID, &a.WorkspaceID, &a.NodeID, &a.SpiffeID, &a.AttestationType, &selectors,
+			&a.CertificateSerial, &a.Status, &a.ClusterName, &lastSeen, &lastHeartbeat,
+			&a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, errors.NewInternalError("Failed to scan agent", err)
 		}
-
-		if len(nodeSelectorsJSON) > 0 {
-			if err := json.Unmarshal(nodeSelectorsJSON, &agent.NodeSelectors); err != nil {
-				r.logger.WithError(err).Error("Failed to unmarshal node selectors")
-				continue
-			}
+		a.LastSeen, a.LastHeartbeat = lastSeen.Time, lastHeartbeat.Time
+		if len(selectors) > 0 {
+			_ = json.Unmarshal(selectors, &a.NodeSelectors)
 		}
-
-		agents = append(agents, agent)
+		agents = append(agents, a)
 	}
-
 	if err := rows.Err(); err != nil {
-		r.logger.WithError(err).Error("Error iterating agent rows")
 		return nil, errors.NewInternalError("Failed to iterate agents", err)
 	}
-
 	return agents, nil
 }
 
-// UpdateLastSeen updates the last_seen timestamp for an agent
+// UpdateLastSeen records a heartbeat for an agent of ctx's workspace.
 func (r *PostgresAgentRepository) UpdateLastSeen(ctx context.Context, id string) error {
-	query := `UPDATE agents SET last_seen = $1, updated_at = $2 WHERE id = $3`
-
-	now := time.Now()
-	result, err := r.db.ExecContext(ctx, query, now, now, id)
-	if err != nil {
-		r.logger.WithError(err).Error("Failed to update agent last_seen")
-		return errors.NewInternalError("Failed to update last_seen", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get rows affected", err)
-	}
-
-	if rowsAffected == 0 {
+	if _, err := uuid.Parse(id); err != nil {
 		return errors.NewNotFoundError("Agent not found", nil)
 	}
-
+	now := time.Now()
+	res, err := tenancy.ExecContext(ctx, r.db,
+		`UPDATE spire_agents SET last_seen = $3, last_heartbeat = $3, updated_at = $3 WHERE workspace_id = $1 AND id = $2`,
+		id, now)
+	if err != nil {
+		return errors.NewInternalError("Failed to update last_seen", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.NewNotFoundError("Agent not found", nil)
+	}
 	return nil
+}
+
+func nullTime(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
+func nonNilMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
 }

@@ -33,7 +33,7 @@ type ErrorDetail struct {
 
 // BundleResponse represents the CA bundle response
 type BundleResponse struct {
-	CABundle string `json:"ca_bundle"`
+	CABundle    string `json:"ca_bundle"`
 	WorkspaceID string `json:"workspace_id"`
 }
 

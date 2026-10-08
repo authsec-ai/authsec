@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -10,6 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire/dto"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 	"github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // NodeAttestationController handles node attestation requests
@@ -20,99 +22,129 @@ type NodeAttestationController struct {
 
 // NewNodeAttestationController creates a new node attestation controller
 func NewNodeAttestationController(service *services.NodeAttestationService, logger *logrus.Entry) *NodeAttestationController {
-	return &NodeAttestationController{
-		service: service,
-		logger:  logger,
-	}
+	return &NodeAttestationController{service: service, logger: logger}
 }
 
-// Attest handles POST /spire/v1/node/attest
+// Attest handles POST /spiresvc/v1/node/attest. The caller is anonymous
+// until its join token (body join_token, or Authorization: Bearer) is
+// consumed; the token decides the workspace.
 func (ctrl *NodeAttestationController) Attest(c *gin.Context) {
 	var req dto.NodeAttestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Validate required fields
-	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
-		return
-	}
-	if req.NodeID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("node_id is required", nil))
-		return
-	}
-	if req.CSR == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("csr is required", nil))
-		return
-	}
-	if req.AttestationType == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("attestation_type is required", nil))
-		return
-	}
-	if req.Evidence == nil {
-		ctrl.sendError(c, errors.NewBadRequestError("evidence is required", nil))
-		return
-	}
-
-	// Call service
-	serviceReq := &services.NodeAttestRequest{
-		WorkspaceID:        req.WorkspaceID,
-		NodeID:          req.NodeID,
-		AttestationType: req.AttestationType,
-		Evidence:        req.Evidence,
-		CSR:             req.CSR,
-	}
-
-	resp, err := ctrl.service.Attest(c.Request.Context(), serviceReq)
-	if err != nil {
-		ctrl.sendError(c, err)
-		return
-	}
-
-	// Convert CA chain array to single PEM bundle
-	caBundle := ""
-	if len(resp.CAChain) > 0 {
-		for i, cert := range resp.CAChain {
-			caBundle += cert
-			if i < len(resp.CAChain)-1 {
-				caBundle += "\n"
-			}
+	if req.JoinToken == "" {
+		if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			req.JoinToken = strings.TrimPrefix(h, "Bearer ")
 		}
 	}
+	switch {
+	case req.JoinToken == "":
+		sendError(c, ctrl.logger, errors.NewUnauthorizedError("join_token is required", nil))
+		return
+	case req.NodeID == "":
+		sendError(c, ctrl.logger, errors.NewBadRequestError("node_id is required", nil))
+		return
+	case req.CSR == "":
+		sendError(c, ctrl.logger, errors.NewBadRequestError("csr is required", nil))
+		return
+	case req.AttestationType == "":
+		sendError(c, ctrl.logger, errors.NewBadRequestError("attestation_type is required", nil))
+		return
+	}
 
-	// Calculate TTL in seconds from expiration time
-	ttl := int(resp.ExpiresAt.Sub(time.Now()).Seconds())
+	resp, err := ctrl.service.Attest(c.Request.Context(), &services.NodeAttestRequest{
+		JoinToken:           req.JoinToken,
+		AssertedWorkspaceID: req.WorkspaceID,
+		NodeID:              req.NodeID,
+		AttestationType:     req.AttestationType,
+		Evidence:            req.Evidence,
+		CSR:                 req.CSR,
+	})
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+
+	ttl := int(time.Until(resp.ExpiresAt).Seconds())
 	if ttl < 0 {
 		ttl = 0
 	}
-
 	c.JSON(http.StatusOK, dto.NodeAttestResponse{
 		AgentID:     resp.AgentID,
 		SpiffeID:    resp.SpiffeID,
+		WorkspaceID: resp.WorkspaceID,
 		Certificate: resp.Certificate,
-		CABundle:    caBundle,
+		CABundle:    strings.Join(resp.CAChain, "\n"),
 		TTL:         ttl,
 	})
 }
 
-// sendError sends an error response
-func (ctrl *NodeAttestationController) sendError(c *gin.Context, err error) {
-	appErr, ok := err.(*errors.AppError)
-	if !ok {
-		appErr = errors.NewInternalError("Internal server error", err)
+// JoinTokenController mints, lists and revokes join tokens of the caller's
+// workspace (AuthMiddleware + owner/admin).
+type JoinTokenController struct {
+	service *services.JoinTokenService
+	logger  *logrus.Entry
+}
+
+// NewJoinTokenController creates the join token controller.
+func NewJoinTokenController(service *services.JoinTokenService, logger *logrus.Entry) *JoinTokenController {
+	return &JoinTokenController{service: service, logger: logger}
+}
+
+// Create handles POST /spiresvc/v1/join-tokens. The secret is in this
+// response only.
+func (ctrl *JoinTokenController) Create(c *gin.Context) {
+	var req dto.CreateJoinTokenRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
+			return
+		}
 	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"code":    appErr.Code,
-		"message": appErr.Message,
-	}).WithError(appErr.Err).Error("Node attestation request failed")
-
-	c.JSON(appErr.Status, dto.ErrorResponse{
-		Error: dto.ErrorDetail{
-			Code:    appErr.Code,
-			Message: appErr.Message,
-		},
+	if req.TTLSeconds < 0 {
+		sendError(c, ctrl.logger, errors.NewBadRequestError("ttl_seconds must be positive", nil))
+		return
+	}
+	createdBy := ""
+	if tc, err := tenancy.From(c); err == nil {
+		createdBy = tc.PrincipalID.String()
+	}
+	t, secret, err := ctrl.service.Mint(c.Request.Context(), req.Description, createdBy, time.Duration(req.TTLSeconds)*time.Second)
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusCreated, dto.JoinTokenResponse{
+		ID: t.ID, Token: secret, Description: t.Description, ExpiresAt: t.ExpiresAt, CreatedAt: t.CreatedAt,
 	})
+}
+
+// List handles GET /spiresvc/v1/join-tokens (no secrets, no hashes).
+func (ctrl *JoinTokenController) List(c *gin.Context) {
+	tokens, err := ctrl.service.List(c.Request.Context())
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	out := make([]dto.JoinTokenResponse, 0, len(tokens))
+	for _, t := range tokens {
+		out = append(out, dto.JoinTokenResponse{
+			ID: t.ID, Description: t.Description, ExpiresAt: t.ExpiresAt, UsedAt: t.UsedAt,
+			UsedByNodeID: t.UsedByNodeID, RevokedAt: t.RevokedAt, CreatedAt: t.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"join_tokens": out, "count": len(out)})
+}
+
+// Revoke handles DELETE /spiresvc/v1/join-tokens/:id. Another workspace's
+// token is 404.
+func (ctrl *JoinTokenController) Revoke(c *gin.Context) {
+	if err := ctrl.service.Revoke(c.Request.Context(), c.Param("id")); err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Join token revoked", "id": c.Param("id")})
 }

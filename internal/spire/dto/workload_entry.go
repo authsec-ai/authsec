@@ -4,7 +4,7 @@ import "time"
 
 // CreateWorkloadEntryRequest represents a request to create a workload entry
 type CreateWorkloadEntryRequest struct {
-	WorkspaceID string            `json:"workspace_id" binding:"required"`
+	WorkspaceID string            `json:"workspace_id,omitempty"` // optional; must repeat the authenticated workspace
 	SpiffeID    string            `json:"spiffe_id" binding:"required"`
 	ParentID    string            `json:"parent_id"` // Optional: populated when agent starts running
 	Selectors   map[string]string `json:"selectors" binding:"required"`
@@ -40,7 +40,7 @@ type WorkloadEntryResponse struct {
 // CreateAgentEntryRequest creates a workload entry for an AI agent.
 // authsec-spire generates the SPIFFE ID from workspace_id, client_id, and agent_type.
 type CreateAgentEntryRequest struct {
-	WorkspaceID string            `json:"workspace_id" binding:"required"`
+	WorkspaceID string            `json:"workspace_id,omitempty"` // optional; must repeat the authenticated workspace
 	ClientID    string            `json:"client_id" binding:"required"`
 	AgentType   string            `json:"agent_type" binding:"required"`
 	ParentID    string            `json:"parent_id"` // Optional: auto-populated when agent starts running
@@ -62,7 +62,7 @@ type CreateAgentEntryResponse struct {
 
 // ListWorkloadEntriesRequest represents query parameters for listing workload entries
 type ListWorkloadEntriesRequest struct {
-	WorkspaceID    string `form:"workspace_id" binding:"required"`
+	WorkspaceID    string `form:"workspace_id"`     // optional; must repeat the authenticated workspace
 	ParentID       string `form:"parent_id"`        // Optional: filter by parent agent
 	SpiffeID       string `form:"spiffe_id"`        // Optional: exact SPIFFE ID match
 	SpiffeIDSearch string `form:"spiffe_id_search"` // Optional: partial SPIFFE ID search (use instead of spiffe_id)
