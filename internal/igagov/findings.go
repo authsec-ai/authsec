@@ -1055,6 +1055,20 @@ func postureStatus(current, outcome string) (string, bool) {
 	return current, false
 }
 
+// PostureFindingStatus is postureStatus for enforcement observers (T3.16,
+// §8.7 "Finding resolution follows the current posture"): the status an
+// unused_service finding in status current takes when its posture outcome
+// becomes outcome, and whether that is a change. The same rule the
+// evaluation applies, so the two writers can never disagree.
+func PostureFindingStatus(current, outcome string) (string, bool) {
+	switch current {
+	case StatusSuperseded, StatusExcepted:
+		return current, false
+	}
+	next, changed := postureStatus(current, outcome)
+	return next, changed && next != current
+}
+
 // PlanFindingUpdates (DECISION D19) is the pure part of §8.2 step 3's finding upserts: it
 // decides, for rev N, which iga_gov_finding rows to insert or update and
 // with which status, from the evaluation, the stored findings and the

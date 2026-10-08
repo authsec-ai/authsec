@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -173,7 +174,9 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		for _, t := range ts {
 			found := false
 			for _, p := range plans {
-				if p.TargetID == t.ID && p.Kind == igagov.PlanApply {
+				// T3.16: a remove_control version's forward plan is its
+				// remove_control plan (§8.10 "follows the normal approve path").
+				if p.TargetID == t.ID && (p.Kind == igagov.PlanApply || p.Kind == igagov.PlanRemoveControl) {
 					found = true
 					if p.Eligibility == igagov.EligibilityIneligible {
 						ineligible = append(ineligible, map[string]any{"target_id": t.ID, "role_id": p.RoleID, "reason": p.IneligibleReason})
@@ -200,9 +203,13 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		if !sameMultiset(req.PlanHashes, cur.PlanHashes) || !sameMultiset(req.MaterialHashes, cur.MaterialHashes) {
 			return govConflict(GovCodePlanChanged, "The plan changed since you loaded it; review the new plan.", map[string]any{"current": cur})
 		}
-		intent, err := storedRightSize(*v)
-		if err != nil {
-			return err
+		// T3.16: a remove_control version has no right-size intent; the owner
+		// gate receives the zero intent and the plans.
+		var intent igagov.RightSizeIntent
+		if !isRemoveControlVersion(*v) {
+			if intent, err = storedRightSize(*v); err != nil {
+				return err
+			}
 		}
 		if h := a.hooks().OwnerGate; h != nil {
 			if err := h(tx, GovApprovalCheck{WorkspaceID: ws, PolicyID: policyID, VersionID: v.ID, ApproverID: approver,
@@ -612,4 +619,12 @@ func (a *GovAuthoring) UsableApproval(ctx context.Context, ws, versionID uuid.UU
 		out.Revalidations[p.ID] = &id
 	}
 	return out, nil
+}
+
+// isRemoveControlVersion reports whether a version's intent is remove_control.
+func isRemoveControlVersion(v models.IGAGovPolicyVersion) bool {
+	var k struct {
+		Kind string `json:"kind"`
+	}
+	return json.Unmarshal(v.Intent, &k) == nil && k.Kind == igagov.IntentRemoveControl
 }

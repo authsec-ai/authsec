@@ -140,6 +140,21 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/approvals", require("governance", "approve"), ctl.ListApprovals)
 	g.POST("/policies/:id/versions/:no/approve", require("governance", "approve"), ctl.ApproveVersion)
 	g.POST("/policies/:id/versions/:no/reject", require("governance", "approve"), ctl.RejectVersion)
+
+	// §7.6 deployments, validations, health reports and §7.7 removing
+	// AuthSec control (T3.16, iga_gov_deployments_controller.go). Health
+	// reports check "owner of a consumer, or governance:author" in the handler.
+	g.GET("/deployments", require("governance", "read"), ctl.ListDeployments)
+	g.GET("/deployments/:id", require("governance", "read"), ctl.GetDeployment)
+	g.POST("/deployments/:id/resolve", require("governance", "enforce"), ctl.ResolveDeployment)
+	g.POST("/deployments/:id/undo", require("governance", "enforce"), ctl.UndoDeployment)
+	g.POST("/deployments/:id/emergency-undo", require("governance", "emergency"), ctl.EmergencyUndoDeployment)
+	g.POST("/deployments/:id/validations", require("governance", "author"), ctl.DeclareValidation)
+	g.GET("/deployments/:id/validations", require("governance", "read"), ctl.ListValidations)
+	g.POST("/deployments/:id/health-reports", ctl.CreateHealthReport)
+	g.GET("/deployments/:id/health-reports", require("governance", "read"), ctl.ListHealthReports)
+	g.POST("/policies/:id/remove-control", require("governance", "author"), ctl.RemoveControl)
+	g.POST("/policies/:id/emergency-remove-control", require("governance", "emergency"), ctl.EmergencyRemoveControl)
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
