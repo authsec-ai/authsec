@@ -1,6 +1,8 @@
 package integration
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -59,6 +61,21 @@ func TestP3T314SlackInstallStateBinding(t *testing.T) {
 	i := strings.IndexByte(stateA, '.')
 	refused("tampered state", stateA[:i-2]+"AA"+stateA[i:], cookieA, "state_signature")
 	refused("no state", "", cookieA, "state_signature")
+	// A well-formed state re-pointed at workspace B (its member), keeping A's
+	// signature and A's session: only the signature stands in the way.
+	{
+		raw, err := base64.RawURLEncoding.DecodeString(stateA[:i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st map[string]any
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatal(err)
+		}
+		st["w"], st["u"], st["m"] = gB.ws.String(), gB.author.String(), gB.authorMember.String()
+		forged, _ := json.Marshal(st)
+		refused("state re-pointed at another workspace", base64.RawURLEncoding.EncodeToString(forged)+stateA[i:], cookieA, "state_signature")
+	}
 	app.svc.WithClock(func() time.Time { return time.Now().Add(11 * time.Minute) })
 	refused("expired state", stateA, cookieA, "state_expired")
 	app.svc.WithClock(time.Now)
