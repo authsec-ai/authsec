@@ -196,6 +196,9 @@ type policyFeature struct {
 	// rather than unavailable).
 	served    bool
 	notServed string
+	// available, when set, is a runtime condition on a served feature
+	// (Slack: the app is configured on this server), with its reason.
+	available func() (bool, string)
 }
 
 // policyFeatures are the §4.3 flags in this build. A feature whose routes
@@ -203,17 +206,20 @@ type policyFeature struct {
 // task that mounts a feature's routes flips its served (findings: T3.06b).
 var policyFeatures = []policyFeature{
 	// T3.06 / T3.06b: evaluation in the projection job and the §7.1 reads.
-	{"findings", true, ""},
+	{"findings", true, "", nil},
 	// T3.11 / T3.13: proposals, versions, plans and approval (§7.3, §7.5).
-	{"proposals", true, ""},
-	{"export", false, "Policy export is not available in this build yet."},
-	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released."},
+	{"proposals", true, "", nil},
+	{"export", false, "Policy export is not available in this build yet.", nil},
+	{"iac", false, "Infrastructure-as-code pull requests are not available in this build: IaC sources and the pull-request adapter have not been released.", nil},
 	// T3.09 ships the enforcement role binding (§7.9, under
 	// /authsec/discovery/aws/connectors/:id/enforcement); the flag stays
 	// false because direct enforcement also needs the AWS enforcement adapter
 	// (T3.10) and deployments (T3.15/T3.16), which are not in this build.
-	{"enforcement", false, "Direct enforcement is not available in this build: the AuthSec enforcement role can be bound and self-tested, but the AWS enforcement adapter and deployments have not been released, so every workspace is findings-only."},
-	{"slack", false, "Slack approvals are not available in this build: the Slack app has not been released."},
+	{"enforcement", false, "Direct enforcement is not available in this build: the AuthSec enforcement role can be bound and self-tested, but the AWS enforcement adapter and deployments have not been released, so every workspace is findings-only.", nil},
+	// T3.14: the Slack app's routes (/authsec/integrations/slack) are in this
+	// build; the flag is true only while the app is configured on this
+	// server (signing secret, Vault credentials) and installed at startup.
+	{"slack", true, "", services.SlackAvailable},
 }
 
 // policyProviders is §4.3's provider support for R1a, with the reason for the
@@ -242,13 +248,17 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 	reasons := gin.H{}
 	for _, f := range policyFeatures {
 		available := on && f.served
+		why := f.notServed
+		if available && f.available != nil {
+			available, why = f.available()
+		}
 		out[f.name] = available
 		switch {
 		case available:
 		case !on:
 			reasons[f.name] = reason
 		default:
-			reasons[f.name] = f.notServed
+			reasons[f.name] = why
 		}
 	}
 	out["reasons"] = reasons

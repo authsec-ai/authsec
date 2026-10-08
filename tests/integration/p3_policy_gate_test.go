@@ -303,9 +303,24 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
 				}
 			}
-			for _, f := range []string{"enforcement", "iac", "slack"} {
+			for _, f := range []string{"enforcement", "iac"} {
 				if r, _ := reasons[f].(string); tc.state == services.PolicyOn && !strings.Contains(r, "not available in this build") {
 					t.Errorf("on: reasons.%s = %q, want an honest not-in-this-build reason", f, r)
+				}
+			}
+			// T3.14: Slack's routes are in this build; the flag follows the
+			// app's configuration on this server (not installed here).
+			if r, _ := reasons["slack"].(string); tc.state == services.PolicyOn && !strings.Contains(r, "not configured on this server") {
+				t.Errorf("on: reasons.slack = %q, want the configuration reason", r)
+			}
+			if tc.state == services.PolicyOn {
+				restore := services.InstallSlackApp(services.NewSlackIntegrationService(db, newMemVault(), nil, services.SlackConfig{SigningSecret: "x"}))
+				code, body := a.get("/capabilities")
+				restore()
+				mustStatus(t, "/capabilities", code, body, http.StatusOK)
+				if dig(body, "data", "policy", "slack") != true || dig(body, "data", "policy", "reasons", "slack") != nil {
+					t.Errorf("slack installed: policy.slack = %v (reason %v), want true", dig(body, "data", "policy", "slack"),
+						dig(body, "data", "policy", "reasons", "slack"))
 				}
 			}
 			if dig(p, "providers", "aws") != "supported" || dig(p, "providers", "k8s") != "not_supported" ||

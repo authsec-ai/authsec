@@ -153,6 +153,8 @@ type GovNotificationSettingsView struct {
 type GovChannelAvailability struct {
 	Available bool   `json:"available"`
 	Reason    string `json:"reason,omitempty"`
+	// Status is the workspace's Slack connection (T3.14), when available.
+	Status *SlackStatusView `json:"status,omitempty"`
 }
 
 // GovSettingsView is GET /settings.
@@ -204,9 +206,10 @@ func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, 
 	n.EmailEnabled, n.WebhookURL, n.WebhookSecretSet = ch.EmailEnabled, ch.WebhookURL, ch.WebhookSecret != ""
 	n.Source, n.CopiedFromLegacyAt = ch.Source, ch.CopiedFromLegacyAt
 	if _, has := govNoticeChannel(GovChannelSlack); has {
-		n.Slack = GovChannelAvailability{Available: true}
+		n.Slack = GovChannelAvailability{Available: true, Status: SlackStatusForSettings(db, ws)}
 	} else {
-		n.Slack = GovChannelAvailability{Reason: "Slack is not available in this build: the Slack app has not been released."}
+		_, why := SlackAvailable()
+		n.Slack = GovChannelAvailability{Reason: why}
 	}
 	out.Notifications = n
 	return out, nil

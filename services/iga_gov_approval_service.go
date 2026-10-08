@@ -368,6 +368,15 @@ func matchAcceptances(items []GovAcceptanceItem, in []GovAcceptanceInput) ([]acc
 // cannot reject (403 self_approval), and the version must be in review.
 // The rejection binds the hashes current at the time.
 func (a *GovAuthoring) Reject(ctx context.Context, ws, approver, policyID uuid.UUID, no int, reason string) (*models.IGAGovApproval, error) {
+	return a.RejectVia(ctx, ws, approver, policyID, no, reason, "ui")
+}
+
+// RejectVia is Reject recorded on channel ("ui" or "slack", T3.14: the
+// Slack interaction calls the same decision with its channel).
+func (a *GovAuthoring) RejectVia(ctx context.Context, ws, approver, policyID uuid.UUID, no int, reason, channel string) (*models.IGAGovApproval, error) {
+	if channel != "slack" {
+		channel = "ui"
+	}
 	if strings.TrimSpace(reason) == "" {
 		return nil, GovBadParam("reason", "A rejection needs a reason.")
 	}
@@ -393,13 +402,13 @@ func (a *GovAuthoring) Reject(ctx context.Context, ws, approver, policyID uuid.U
 		cur := approvalHashes(*v, plans)
 		now := a.now()
 		out = models.IGAGovApproval{ID: uuid.New(), WorkspaceID: ws, VersionID: v.ID, Decision: "reject", DecidedBy: approver,
-			Channel: "ui", IntentHash: cur.IntentHash, ImpactHashes: pq.StringArray(cur.ImpactHashes),
+			Channel: channel, IntentHash: cur.IntentHash, ImpactHashes: pq.StringArray(cur.ImpactHashes),
 			PlanHashes: pq.StringArray(cur.PlanHashes), MaterialHashes: pq.StringArray(cur.MaterialHashes), EvidenceRev: v.EvidenceRev,
 			Reason: strings.TrimSpace(reason), ExpiresAt: now, DecidedAt: now}
 		if err := tx.Create(&out).Error; err != nil {
 			return err
 		}
-		return a.closeVersionTx(tx, approver, *v, "rejected", out.Reason, map[string]any{"approval_id": out.ID})
+		return a.closeVersionTx(tx, approver, *v, "rejected", out.Reason, map[string]any{"approval_id": out.ID, "channel": channel})
 	})
 	if err != nil {
 		return nil, err

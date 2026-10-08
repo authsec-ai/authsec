@@ -121,6 +121,13 @@ var GovEventVocabulary = []GovEventKind{
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
 	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
+	// T3.14 Slack app (slack_integration_service.go, slack_integration_interactions.go).
+	// DECISION: §9.6 names no Slack category; they are notification events.
+	{GovEventSlackInstalled, GovCatNotification, "", "The Slack app was installed (or reinstalled) for the workspace."},
+	{GovEventSlackSettings, GovCatNotification, "", "The Slack approvals channel was changed."},
+	{GovEventSlackDisconnected, GovCatNotification, "", "Slack was disconnected: token revoked, member links removed."},
+	{GovEventSlackUserLinked, GovCatNotification, "", "A Slack user was linked to a member (verified email or console confirmation)."},
+	{GovEventSlackActionReceived, GovCatNotification, GovObjNotification, "An authenticated Slack action was received on a notice (before authorization)."},
 }
 
 // Object kinds the events API filters on.

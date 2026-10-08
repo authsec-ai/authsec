@@ -1499,6 +1499,15 @@ func SetupRoutes(
 		// hangs off /discovery/agents/:id as well as /governance.
 		governanceController := platformCtrl.NewGovernanceController(config.DB)
 
+		// Phase 3 Slack app (SPEC-iga-phase3-policy.md §7.11, T3.14):
+		// /authsec/integrations/slack. Behind the IGA_POLICY gate;
+		// /interactions (Slack signature) and /oauth/callback (signed state
+		// + install cookie) carry no bearer token; the rest are
+		// authenticated with their permission.
+		platformCtrl.MountSlackIntegrationRoutes(authsec,
+			platformCtrl.NewDefaultSlackIntegrationController(config.DB),
+			middlewares.AuthMiddleware(), middlewares.Require)
+
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
