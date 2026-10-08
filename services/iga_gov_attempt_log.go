@@ -338,7 +338,8 @@ func (l *IGAGovAttemptLog) markUnknownTx(tx *gorm.DB, att *models.IGAGovAttempt,
 	}
 	settle := signed.Add(l.settle())
 	op := fmt.Sprintf("%d:%s", att.OpSeq, att.Operation)
-	// Only an applying deployment can be waiting on a sent request (§8.4).
+	// An applying deployment waits on the sent request (§8.4): it becomes
+	// outcome_unknown and holds the role.
 	dres := tx.Exec(`UPDATE iga_gov_deployment
 		SET state = 'outcome_unknown', outcome_unknown_op = ?, settle_after = ?, state_reason = ?, updated_at = now()
 		WHERE workspace_id = ? AND id = ? AND state = 'applying'`,
@@ -346,11 +347,27 @@ func (l *IGAGovAttemptLog) markUnknownTx(tx *gorm.DB, att *models.IGAGovAttempt,
 	if dres.Error != nil {
 		return time.Time{}, dres.Error
 	}
+	extra := map[string]any{"reason": reason, "settle_after": settle}
 	if dres.RowsAffected != 1 {
-		return time.Time{}, fmt.Errorf("%w: deployment %s is not applying", ErrAttemptState, att.DeploymentID)
+		// DECISION (review P1-5): a dispatched attempt whose deployment is no
+		// longer applying (moved by an operator or a stop while the request
+		// was in flight) is STILL marked unknown -- refusing it would leave
+		// the attempt dispatched forever and every recovery of the
+		// deployment failing. The deployment keeps its state; the unknown
+		// attempt starts the control's 24-hour late-mutation watch (§8.1
+		// step 5), which reports the request if it lands.
+		var st []string
+		if err := tx.Raw(`SELECT state FROM iga_gov_deployment WHERE workspace_id = ? AND id = ?`,
+			att.WorkspaceID, att.DeploymentID).Scan(&st).Error; err != nil {
+			return time.Time{}, err
+		}
+		if len(st) == 1 {
+			extra["deployment_state"] = st[0]
+		}
+		extra["note"] = "the deployment was not applying; its state is unchanged and the control is watched for a late mutation"
 	}
 	att.Status = models.GovAttemptUnknown
-	return settle, l.event(tx, att, "attempt.unknown", map[string]any{"reason": reason, "settle_after": settle})
+	return settle, l.event(tx, att, "attempt.unknown", extra)
 }
 
 // Recovery actions (the §8.1 replacement-worker table).
@@ -379,8 +396,25 @@ type AttemptRecovery struct {
 // attempt, fenced on THIS run's lease, before anything else is done on the
 // deployment.
 func (l *IGAGovAttemptLog) Recover(ctx context.Context, run *PolicyJobRun, ws, deploymentID uuid.UUID) (*AttemptRecovery, error) {
-	var out AttemptRecovery
+	var out *AttemptRecovery
 	err := run.InTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		out, err = l.RecoverTx(tx, ws, deploymentID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RecoverTx is Recover inside the caller's transaction, for a caller that
+// proves by other means that no worker runs the deployment (the stuck
+// deployment sweeper and the operator path of a stuck applying deployment
+// hold the deployment row locked and see no open job for it).
+func (l *IGAGovAttemptLog) RecoverTx(tx *gorm.DB, ws, deploymentID uuid.UUID) (*AttemptRecovery, error) {
+	var out AttemptRecovery
+	err := func() error {
 		var open []models.IGAGovAttempt
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("workspace_id = ? AND deployment_id = ? AND (status IN ? OR (status = ? AND resolved_as IS NULL))",
@@ -425,7 +459,7 @@ func (l *IGAGovAttemptLog) Recover(ctx context.Context, run *PolicyJobRun, ws, d
 			}
 			return nil
 		}
-	})
+	}()
 	if err != nil {
 		return nil, err
 	}
@@ -452,10 +486,18 @@ func (l *IGAGovAttemptLog) ResolveUnknown(ctx context.Context, run *PolicyJobRun
 		if res.RowsAffected != 1 {
 			return fmt.Errorf("%w: resolve of attempt %s", ErrAttemptState, att.ID)
 		}
-		if err := tx.Exec(`UPDATE iga_gov_deployment SET state = 'applying', state_reason = ?, updated_at = now()
+		dres := tx.Exec(`UPDATE iga_gov_deployment SET state = 'applying', state_reason = ?, updated_at = now()
 			WHERE workspace_id = ? AND id = ? AND state = 'outcome_unknown'`,
-			"outcome of "+att.Operation+" resolved: "+resolvedAs, att.WorkspaceID, att.DeploymentID).Error; err != nil {
-			return err
+			"outcome of "+att.Operation+" resolved: "+resolvedAs, att.WorkspaceID, att.DeploymentID)
+		if dres.Error != nil {
+			return dres.Error
+		}
+		// Review P1-5: a resolution that moves no deployment is refused (the
+		// whole transaction, the attempt's resolved_as included, rolls back):
+		// resolving the attempt while the deployment is elsewhere would
+		// release nothing and leave the record claiming it did.
+		if dres.RowsAffected != 1 {
+			return fmt.Errorf("%w: resolve of attempt %s: deployment %s is not outcome_unknown", ErrAttemptState, att.ID, att.DeploymentID)
 		}
 		att.ResolvedAs, att.ResolvedAt = &resolvedAs, &now
 		return l.event(tx, att, "attempt.resolved", map[string]any{"resolved_as": resolvedAs})
@@ -475,9 +517,29 @@ func (l *IGAGovAttemptLog) ResolveUnknown(ctx context.Context, run *PolicyJobRun
 //   - ErrPolicyJobLeaseShort before dispatch: nothing was sent; the prepared
 //     attempt is abandoned in the same run so the next Execute can re-prepare.
 func (l *IGAGovAttemptLog) Execute(ctx context.Context, run *PolicyJobRun, req AttemptRequest, call AttemptCall) (*AttemptResult, error) {
+	return l.ExecuteChecked(ctx, run, req, nil, call)
+}
+
+// ErrDispatchRefused wraps a pre-dispatch check's refusal: nothing was sent
+// and the prepared attempt was abandoned.
+var ErrDispatchRefused = errors.New("the dispatch was refused before sending")
+
+// ExecuteChecked is Execute with a check run after Prepare and immediately
+// before Dispatch (review P1-8: the enforcement binding is re-read before
+// EACH dispatch). A refusal abandons the prepared attempt -- nothing was
+// sent -- and returns the check's error wrapped in ErrDispatchRefused.
+func (l *IGAGovAttemptLog) ExecuteChecked(ctx context.Context, run *PolicyJobRun, req AttemptRequest, preDispatch func(ctx context.Context) error, call AttemptCall) (*AttemptResult, error) {
 	att, err := l.Prepare(ctx, run, req)
 	if err != nil {
 		return nil, err
+	}
+	if preDispatch != nil {
+		if cerr := preDispatch(ctx); cerr != nil {
+			if aerr := l.abandonOwnReason(ctx, run, att, "refused before dispatch: "+cerr.Error()); aerr != nil {
+				return nil, errors.Join(cerr, aerr)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrDispatchRefused, cerr)
+		}
 	}
 	if err := l.Dispatch(ctx, run, att); err != nil {
 		if errors.Is(err, repositories.ErrPolicyJobLeaseShort) {
@@ -524,6 +586,10 @@ func (l *IGAGovAttemptLog) Execute(ctx context.Context, run *PolicyJobRun, req A
 
 // abandonOwn abandons a prepared attempt this run prepared and never sent.
 func (l *IGAGovAttemptLog) abandonOwn(ctx context.Context, run *PolicyJobRun, att *models.IGAGovAttempt) error {
+	return l.abandonOwnReason(ctx, run, att, "lease margin short before dispatch; never sent")
+}
+
+func (l *IGAGovAttemptLog) abandonOwnReason(ctx context.Context, run *PolicyJobRun, att *models.IGAGovAttempt, reason string) error {
 	return run.InTx(ctx, func(tx *gorm.DB) error {
 		now := l.now()
 		res := tx.Model(&models.IGAGovAttempt{}).
@@ -534,7 +600,7 @@ func (l *IGAGovAttemptLog) abandonOwn(ctx context.Context, run *PolicyJobRun, at
 			return res.Error
 		}
 		att.Status, att.CompletedAt = models.GovAttemptAbandoned, &now
-		return l.event(tx, att, "attempt.abandoned", map[string]any{"reason": "lease margin short before dispatch; never sent"})
+		return l.event(tx, att, "attempt.abandoned", map[string]any{"reason": reason})
 	})
 }
 

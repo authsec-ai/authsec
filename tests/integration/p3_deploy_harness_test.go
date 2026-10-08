@@ -18,38 +18,43 @@ import (
 // dLab is the T3.16 fixture: T3.10's x3Lab (a verified binding over the fake
 // AWS account, compiled and stored plans) plus an approver who holds
 // governance:approve, the deployment state machine over the lab's AWS
-// access with a controllable clock and CloudTrail, and helpers to run one
-// job of a kind the way the worker does.
+// access with a controllable clock, and helpers to run one job of a kind the
+// way the worker does. CloudTrail is the fake account's own (review P1-7):
+// every enforcement-session call is recorded there and read back through
+// the access's LookupEvents path; tests edit it with d.fake.EditTrail and
+// make it unreadable with d.fake.TrailErr. The per-dispatch binding check is
+// the production one over the lab's binding (review P1-8); beforeDispatch,
+// when set, runs first.
 type dLab struct {
 	*x3Lab
-	approver uuid.UUID
-	dep      *services.GovDeployments
-	trail    *dTrail
-	mu       sync.Mutex
-	offset   time.Duration
-	bindErr  error
-	scanGen  int
-	rev      int64
-}
-
-// dTrail is a fake enforcement-session CloudTrail.
-type dTrail struct {
-	mu     sync.Mutex
-	events []services.GovTrailEvent
-}
-
-func (t *dTrail) EnforcementSessionEvents(_ context.Context, _, _ uuid.UUID, _ string, _, _ time.Time) ([]services.GovTrailEvent, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return append([]services.GovTrailEvent{}, t.events...), nil
+	approver       uuid.UUID
+	dep            *services.GovDeployments
+	env            services.GovDeployEnv
+	mu             sync.Mutex
+	offset         time.Duration
+	bindErr        error
+	beforeDispatch func() error
+	scanGen        int
+	rev            int64
 }
 
 func newDLab(t *testing.T) *dLab {
 	t.Helper()
-	d := &dLab{x3Lab: newX3Lab(t), trail: &dTrail{}, scanGen: 1, rev: 1}
+	d := &dLab{x3Lab: newX3Lab(t), scanGen: 1, rev: 1}
 	d.approver = d.memberWith("governance:approve")
-	env := services.GovDeployEnv{AWS: d.access, Trail: d.trail,
-		Binding: func(context.Context, uuid.UUID, uuid.UUID) error { return d.bindErr }}
+	d.fake.Now = d.now
+	dispatch := services.NewEnforcementBindingDispatchCheck(d.enf.svc)
+	d.env = services.GovDeployEnv{AWS: d.access,
+		Binding: func(context.Context, uuid.UUID, uuid.UUID) error { return d.bindErr },
+		BindingState: func(ctx context.Context, ws, conn uuid.UUID) error {
+			if d.beforeDispatch != nil {
+				if err := d.beforeDispatch(); err != nil {
+					return err
+				}
+			}
+			return dispatch(ctx, ws, conn)
+		}}
+	env := d.env
 	d.dep = services.NewGovDeployments(d.db, &env).WithClock(d.now).WithSleep(noSleep)
 	d.dep.Executor = func(e *services.IGAGovAWSExecutor) { e.WithSleep(noSleep) }
 	return d

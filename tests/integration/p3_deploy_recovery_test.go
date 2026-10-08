@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/awsenforce/enforcetest"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -108,7 +109,14 @@ func TestP3T316UnresolvedOperatorAndAtomicHandoffA58(t *testing.T) {
 	ctx := context.Background()
 	x, _, dep := dUnknownApply(t, d, "A58dRole")
 	// CloudTrail says the call was refused; the readings say applied.
-	d.trail.events = []services.GovTrailEvent{{EventTime: d.now(), EventName: "PutRolePermissionsBoundary", ErrorCode: "AccessDenied"}}
+	d.fake.EditTrail(func(rs []enforcetest.TrailRecord) []enforcetest.TrailRecord {
+		for i := range rs {
+			if rs[i].EventName == "PutRolePermissionsBoundary" {
+				rs[i].ErrorCode, rs[i].Response = "AccessDenied", nil
+			}
+		}
+		return rs
+	})
 	d.advance(16 * time.Minute)
 	_ = d.runJob("resolve_unknown", dep)
 	d.advance(6 * time.Minute)
@@ -410,7 +418,7 @@ func TestP3T316DeploymentRoutes(t *testing.T) {
 	d := newDLab(t)
 	api := p3NewOwnersAPI(t, d.db)
 	p3Audit(t, d.db, d.ws)
-	env := services.GovDeployEnv{AWS: d.access, Trail: d.trail}
+	env := services.GovDeployEnv{AWS: d.access}
 	services.SetGovDeployEnv(env)
 	t.Cleanup(func() { services.SetGovDeployEnv(services.GovDeployEnv{}) })
 	x := d.role("RouteRole", "/", nil)

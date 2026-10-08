@@ -6,11 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
 )
@@ -103,8 +106,22 @@ func (s *GovDeployments) DriftHandler(ctx context.Context, run *PolicyJobRun) er
 		}
 		return err
 	}
-	if d.State != models.GovDeployVerified || d.Delivery != igagov.DeliveryDirect {
+	if d.Delivery != igagov.DeliveryDirect {
 		return nil
+	}
+	switch d.State {
+	case models.GovDeployVerified:
+	case models.GovDeployQueued, models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved:
+		return nil // in flight: the deploy / resolve_unknown job owns the live state
+	default:
+		// Review P1-7, §8.1 step 5: for 24 h after an unknown attempt the
+		// CONTROL is watched whatever this deployment's state (the scheduler
+		// picks the control's latest applied deployment, or the attempt's
+		// own when none applied).
+		watched, err := lateWatchActive(db, ws, d.ControlID, s.now())
+		if err != nil || !watched {
+			return err
+		}
 	}
 	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
 	if err != nil {
@@ -114,7 +131,53 @@ func (s *GovDeployments) DriftHandler(ctx context.Context, run *PolicyJobRun) er
 	if err != nil {
 		return err
 	}
+	if d.State != models.GovDeployVerified {
+		return s.lateWatch(ctx, run, *d, plan, *ctl)
+	}
 	return s.recordDrift(ctx, run, *d, plan, *ctl, "", igagov.LiveRead{})
+}
+
+// lateWatchActive reports whether the control had an unknown attempt
+// dispatched within LateMutationWatch of now.
+func lateWatchActive(db *gorm.DB, ws, control uuid.UUID, now time.Time) (bool, error) {
+	var n int64
+	err := db.Raw(`SELECT count(*) FROM iga_gov_attempt a JOIN iga_gov_deployment d ON d.workspace_id = a.workspace_id AND d.id = a.deployment_id
+		WHERE a.workspace_id = ? AND d.control_id = ? AND a.status = 'unknown' AND a.dispatched_at > ?`, ws, control, now.Add(-LateMutationWatch)).Scan(&n).Error
+	return n > 0, err
+}
+
+// lateWatch is §8.1 step 5 for a deployment that is not verified (applied
+// but unverified, drifted, undone, superseded, failed, blocked, recovered):
+// a live read of the role; a change matching an unknown request by
+// operation and target is reported once per (deployment, attempt) as
+// drift.late_mutation_suspected. DECISION (P1-7): only a verified
+// deployment moves to drifted (recordDrift); for any other state the
+// report is the event (with the deployment's state), never a state change,
+// a re-apply or a revert.
+func (s *GovDeployments) lateWatch(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, plan igagov.Plan, ctl models.IGAGovControl) error {
+	live, _, err := s.readPlan(ctx, run, d, plan, ctl)
+	if err != nil {
+		return err
+	}
+	var anchor *igagov.Plan
+	if d.AppliedAt != nil {
+		anchor = &plan
+	}
+	late, err := s.lateMutation(ctx, run, d.WorkspaceID, ctl, live, anchor)
+	if err != nil || late == nil {
+		return err
+	}
+	var seen int64
+	if err := run.DB().WithContext(ctx).Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?
+		AND payload->>'attempt_id' = ?`, d.WorkspaceID, d.ID, GovEventDriftLateMutation, late.Attempt.ID.String()).Scan(&seen).Error; err != nil {
+		return err
+	}
+	if seen > 0 {
+		return nil
+	}
+	return run.InTx(ctx, func(tx *gorm.DB) error {
+		return s.event(tx, d, GovEventDriftLateMutation, late.payload(d.State))
+	})
 }
 
 // recordDrift is the drift observer. reason "" means: read and classify;
@@ -151,7 +214,8 @@ func (s *GovDeployments) recordDrift(ctx context.Context, run *PolicyJobRun, d m
 		}
 		reason := driftReason(p, live, cl)
 		sub := ""
-		if late, err := s.lateMutation(db, ws, d.ControlID, live); err != nil {
+		var late *lateMatch
+		if late, err = s.lateMutation(ctx, run, ws, ctl, live, &p); err != nil {
 			return nil, err
 		} else if late != nil {
 			sub, reason = reason, DriftLateMutation
@@ -183,8 +247,9 @@ func (s *GovDeployments) recordDrift(ctx context.Context, run *PolicyJobRun, d m
 				return err
 			}
 			if reason == DriftLateMutation {
-				if err := s.event(tx, *cur, GovEventDriftLateMutation, map[string]any{"underlying": sub,
-					"note": "A change matching an earlier unknown request appeared; nothing was re-applied or reverted."}); err != nil {
+				pl := late.payload(models.GovDeployVerified)
+				pl["underlying"] = sub
+				if err := s.event(tx, *cur, GovEventDriftLateMutation, pl); err != nil {
 					return err
 				}
 			}
@@ -214,33 +279,190 @@ func (s *GovDeployments) recordDrift(ctx context.Context, run *PolicyJobRun, d m
 	return nil
 }
 
-// lateMutation is §8.1 step 5: an unknown attempt on the control in the last
-// 24 h whose document is the boundary now in force.
-func (s *GovDeployments) lateMutation(db *gorm.DB, ws, control uuid.UUID, live igagov.LiveRead) (*models.IGAGovAttempt, error) {
-	bf := inForce(live)
-	if bf == nil {
-		return nil, nil
-	}
+// lateMatch is an unknown attempt whose effect a live read shows.
+type lateMatch struct {
+	Attempt models.IGAGovAttempt
+	Target  string
+	Effect  string
+}
+
+func (m *lateMatch) payload(state string) map[string]any {
+	return map[string]any{"attempt_id": m.Attempt.ID.String(), "attempt_deployment_id": m.Attempt.DeploymentID,
+		"operation": m.Attempt.Operation, "target": m.Target, "effect": m.Effect, "deployment_state": state,
+		"note": "A change matching an earlier unknown request appeared; nothing was re-applied or reverted."}
+}
+
+// lateMutation is §8.1 step 5, matched by OPERATION AND TARGET (review
+// P1-7), not only by document hash: an unknown attempt on the control in
+// the last LateMutationWatch (resolved not_applied, or never resolved) whose
+// effect the live read shows -- PutRolePermissionsBoundary: the role's
+// boundary is that ARN; DeleteRolePermissionsBoundary: the role has none;
+// CreatePolicy / CreatePolicyVersion: that policy's default document is the
+// request's; DeletePolicy: that policy is gone -- and that the anchor's
+// post-state (the deployment whose state is "the latest verified state";
+// nil: none applied) does not explain. An attempt resolved `applied` is not
+// late: its effect is the record. Ops a read cannot see (TagPolicy,
+// DeletePolicyVersion) change no boundary fact and are not watched by read.
+func (s *GovDeployments) lateMutation(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ctl models.IGAGovControl, live igagov.LiveRead, anchor *igagov.Plan) (*lateMatch, error) {
+	db := run.DB().WithContext(ctx)
 	var atts []models.IGAGovAttempt
 	if err := db.Raw(`SELECT a.* FROM iga_gov_attempt a JOIN iga_gov_deployment d ON d.workspace_id = a.workspace_id AND d.id = a.deployment_id
-		WHERE a.workspace_id = ? AND d.control_id = ? AND a.status = 'unknown' AND a.dispatched_at > ? AND a.document_hash = ?
-		ORDER BY a.dispatched_at DESC LIMIT 1`, ws, control, s.now().Add(-LateMutationWatch), bf.DocHash).Scan(&atts).Error; err != nil {
+		WHERE a.workspace_id = ? AND d.control_id = ? AND a.status = 'unknown' AND a.dispatched_at > ?
+		  AND (a.resolved_as IS NULL OR a.resolved_as = 'not_applied')
+		ORDER BY a.dispatched_at DESC`, ws, ctl.ID, s.now().Add(-LateMutationWatch)).Scan(&atts).Error; err != nil {
 		return nil, err
 	}
-	if len(atts) == 0 {
-		return nil, nil
+	plans := map[uuid.UUID]igagov.Plan{}
+	for _, a := range atts {
+		var dep models.IGAGovDeployment
+		if err := db.Where("workspace_id = ? AND id = ?", ws, a.DeploymentID).Take(&dep).Error; err != nil {
+			return nil, err
+		}
+		p, ok := plans[dep.PlanID]
+		if !ok {
+			var err error
+			if p, err = LoadIGAGovPlan(db, ws, dep.PlanID); err != nil {
+				return nil, err
+			}
+			plans[dep.PlanID] = p
+		}
+		if a.OpSeq >= len(p.Ops) {
+			continue
+		}
+		req, err := awsenforce.NewRequest(p.Ops[a.OpSeq], dep.ID, "")
+		if err != nil {
+			continue // a version selector: not visible to a read
+		}
+		if anchor == nil && laterAttemptDone(db, a) {
+			continue // no applied state to compare with; a retry made this effect
+		}
+		m, err := s.lateEffect(ctx, run, ctl, live, req, anchor)
+		if err != nil {
+			return nil, err
+		}
+		if m != nil {
+			m.Attempt = a
+			return m, nil
+		}
 	}
-	return &atts[0], nil
+	return nil, nil
+}
+
+// laterAttemptDone reports whether a later attempt of the same op of the
+// same deployment completed with the op done.
+func laterAttemptDone(db *gorm.DB, a models.IGAGovAttempt) bool {
+	var n int64
+	db.Raw(`SELECT count(*) FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ? AND attempt_no > ?
+		AND status = 'completed' AND outcome IN ('ok','recognised_done','not_needed')`, a.WorkspaceID, a.DeploymentID, a.OpSeq, a.AttemptNo).Scan(&n)
+	return n > 0
+}
+
+// lateEffect: does live show req's effect, unexplained by the anchor?
+func (s *GovDeployments) lateEffect(ctx context.Context, run *PolicyJobRun, ctl models.IGAGovControl, live igagov.LiveRead, req awsenforce.Request, anchor *igagov.Plan) (*lateMatch, error) {
+	desiredARN, desiredDoc, replaced, present := "", "", "", false
+	deletes := false
+	if anchor != nil {
+		present = anchor.DesiredAttachment == igagov.AttachmentPresent
+		if anchor.DesiredBoundaryARN != nil {
+			desiredARN = *anchor.DesiredBoundaryARN
+		}
+		if anchor.DesiredDocumentHash != nil {
+			desiredDoc = *anchor.DesiredDocumentHash
+		}
+		if anchor.ReplacedBoundaryARN != nil {
+			replaced = *anchor.ReplacedBoundaryARN
+		}
+		deletes = anchor.ArtifactDisposition == igagov.DispositionDelete
+	}
+	policy := func(arn string) (*igagov.LivePolicy, bool, error) {
+		if lp, ok := live.Policies[arn]; ok {
+			return lp, true, nil
+		}
+		env := s.envNow()
+		if env.AWS == nil {
+			return nil, false, nil
+		}
+		var lp *igagov.LivePolicy
+		err := run.External(ctx, 0, func(ctx context.Context) error {
+			disc, err := env.AWS.DiscoveryIAM(ctx, ctl.WorkspaceID, ctl.ConnectorID)
+			if err != nil {
+				return err
+			}
+			lp, _, err = awsenforce.ReadPolicy(ctx, disc, arn)
+			return err
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		live.Policies[arn] = lp
+		return lp, true, nil
+	}
+	docOf := func(lp *igagov.LivePolicy) string {
+		if lp == nil {
+			return ""
+		}
+		h, err := lp.DocumentHash()
+		if err != nil {
+			return ""
+		}
+		return h
+	}
+	role := live.Role
+	switch req.Op {
+	case igagov.OpPutRolePermissionsBoundary:
+		if role != nil && role.BoundaryARN == req.PolicyARN && !(present && desiredARN == req.PolicyARN) {
+			return &lateMatch{Target: req.RoleName, Effect: "boundary " + req.PolicyARN + " attached"}, nil
+		}
+	case igagov.OpDeleteRolePermissionsBoundary:
+		if role != nil && role.BoundaryARN == "" && (anchor == nil || present) {
+			return &lateMatch{Target: req.RoleName, Effect: "boundary removed"}, nil
+		}
+	case igagov.OpCreatePolicy, igagov.OpCreatePolicyVersion:
+		arn := req.PolicyARN
+		if req.Op == igagov.OpCreatePolicy {
+			arn = arnPartitionPrefix(ctl.RoleARN) + ":iam::" + ctl.AccountID + ":policy" + req.Path + req.PolicyName
+		}
+		lp, read, err := policy(arn)
+		if err != nil {
+			return nil, err
+		}
+		if read && lp != nil && docOf(lp) == req.DocumentHash && !(present && desiredARN == arn && desiredDoc == req.DocumentHash) {
+			return &lateMatch{Target: arn, Effect: "default document " + req.DocumentHash}, nil
+		}
+	case igagov.OpDeletePolicy:
+		lp, read, err := policy(req.PolicyARN)
+		if err != nil {
+			return nil, err
+		}
+		if read && lp == nil && anchor != nil && !(deletes && replaced == req.PolicyARN && desiredARN != req.PolicyARN) &&
+			!(!present && deletes && replaced == req.PolicyARN) {
+			return &lateMatch{Target: req.PolicyARN, Effect: "policy deleted"}, nil
+		}
+	}
+	return nil, nil
+}
+
+// arnPartitionPrefix is "arn:<partition>" of an ARN ("arn:aws" by default).
+func arnPartitionPrefix(arn string) string {
+	if p := strings.SplitN(arn, ":", 3); len(p) == 3 && p[0] == "arn" && p[1] != "" {
+		return "arn:" + p[1]
+	}
+	return "arn:aws"
 }
 
 /* ----------------------------- resolve_unknown ------------------------------ */
 
 type unknownReading struct {
-	AttemptID  string    `json:"attempt_id"`
-	Resolution string    `json:"resolution"`
-	ReadAt     time.Time `json:"read_at"`
-	Trail      string    `json:"trail"`
+	AttemptID   string    `json:"attempt_id"`
+	Resolution  string    `json:"resolution"`
+	ReadAt      time.Time `json:"read_at"`
+	Trail       string    `json:"trail"`
+	TrailDetail string    `json:"trail_detail,omitempty"`
 }
+
+// trailUnreadable is the CloudTrail verdict when the enforcement session's
+// events could not be read (no reader, an API error, an incomplete lookup).
+const trailUnreadable = "unknown"
 
 // ResolveUnknownHandler is §8.1 step 2: after settle_after, two readings at
 // least 5 minutes apart (each recorded as an event), consistent with each
@@ -249,10 +471,27 @@ type unknownReading struct {
 // (the deploy job resumes or recognises the op). Anything else makes the
 // deployment outcome_unresolved, which still holds the role.
 //
-// DECISION (T3.16): an op a read cannot see (TagPolicy, a version delete;
-// igagov ResolvedUnobservable) is resolved from CloudTrail when the session
-// shows it, and otherwise as not_applied: the op is idempotent or
-// recognisable (§8.5), so the new attempt that follows is safe.
+// Review P1-7: the CloudTrail verdict comes from cloudtrail:LookupEvents of
+// the enforcement session for the op and its target (trailVerdict):
+// applied (a matching event AWS applied), not_applied (only refused
+// matching events), "" (no matching event) or unknown (the trail could not
+// be read). The decision:
+//
+//	readings disagree, or a conflict                 -> outcome_unresolved
+//	op a read cannot see (TagPolicy, a version
+//	delete; igagov ResolvedUnobservable)             -> CloudTrail ONLY:
+//	                                                    applied / not_applied,
+//	                                                    else outcome_unresolved
+//	                                                    (never not_applied by
+//	                                                    default)
+//	trail unknown                                    -> applied readings
+//	                                                    resolve applied (the
+//	                                                    live state shows the
+//	                                                    effect); not_applied
+//	                                                    readings are
+//	                                                    outcome_unresolved
+//	trail applied / not_applied disagreeing          -> outcome_unresolved
+//	otherwise                                        -> the readings' verdict
 func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJobRun) error {
 	if run.Job.SubjectID == nil {
 		return PolicyJobAbandon("resolve_unknown needs a deployment subject")
@@ -288,7 +527,20 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 			return err
 		}
 		if errors.Is(err, ErrAttemptState) {
-			return nil
+			// No unresolved unknown attempt holds this outcome_unknown
+			// deployment (review P1-5): returning would leave it in flight
+			// forever. The deploy job takes it back and re-reads live state.
+			err := run.InTx(ctx, func(tx *gorm.DB) error {
+				if err := s.rereadWithoutAttemptTx(tx, *d); err != nil {
+					return err
+				}
+				return s.event(tx, *d, GovEventDeploymentRequeued, map[string]any{"kind": "deploy", "state": models.GovDeployApplying,
+					"reason": "outcome_unknown with no unresolved unknown attempt; the deploy job re-reads live state"})
+			})
+			if errors.Is(err, errStateMoved) {
+				return nil
+			}
+			return err
 		}
 		return PolicyJobRetryLater(time.Minute, "unknown-outcome read failed: "+err.Error())
 	}
@@ -296,18 +548,19 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 	if err != nil {
 		return err
 	}
-	verdict, err := s.trailVerdict(ctx, *d, *ctl, rd.Attempt)
+	verdict, trailDetail, err := s.trailVerdict(ctx, run.DB(), *d, *ctl, rd.Attempt, plan)
 	if err != nil {
 		return err
 	}
-	this := unknownReading{AttemptID: rd.Attempt.ID.String(), Resolution: rd.Resolution.Resolution, ReadAt: now.UTC(), Trail: verdict}
+	this := unknownReading{AttemptID: rd.Attempt.ID.String(), Resolution: rd.Resolution.Resolution, ReadAt: now.UTC(), Trail: verdict,
+		TrailDetail: trailDetail}
 	prev, err := s.lastReading(db, *d, rd.Attempt.ID)
 	if err != nil {
 		return err
 	}
 	if err := run.InTx(ctx, func(tx *gorm.DB) error {
 		return s.event(tx, *d, GovEventUnknownReading, map[string]any{"attempt_id": this.AttemptID, "resolution": this.Resolution,
-			"read_at": this.ReadAt, "trail": this.Trail, "classification": rd.Resolution.Classification})
+			"read_at": this.ReadAt, "trail": this.Trail, "trail_detail": this.TrailDetail, "classification": rd.Resolution.Classification})
 	}); err != nil {
 		return err
 	}
@@ -322,9 +575,12 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 	switch {
 	case this.Resolution == unknownResolvedConflict || prev.Resolution != this.Resolution:
 	case this.Resolution == igagov.ResolvedUnobservable:
-		res = unknownVerdictNotApplied
-		if verdict != "" {
+		if verdict == unknownVerdictApplied || verdict == unknownVerdictNotApplied {
 			res = verdict
+		}
+	case verdict == trailUnreadable:
+		if this.Resolution == unknownVerdictApplied {
+			res = unknownVerdictApplied
 		}
 	case verdict != "" && verdict != this.Resolution:
 	default:
@@ -361,46 +617,74 @@ func (s *GovDeployments) lastReading(db *gorm.DB, d models.IGAGovDeployment, att
 	return &r, nil
 }
 
-// trailVerdict reads the enforcement session's CloudTrail events for the
-// attempt's operation: a success means applied, only errors mean not
-// applied, none means no evidence ("").
-func (s *GovDeployments) trailVerdict(ctx context.Context, d models.IGAGovDeployment, ctl models.IGAGovControl, att models.IGAGovAttempt) (string, error) {
+// trailVerdict looks up the enforcement session's CloudTrail events of the
+// attempt's operation (review P1-7): events of the session
+// authsec-enforce-<deployment 16hex>, named as the op, in the attempt's
+// window (from its signing, less a minute of clock skew, but never before an
+// earlier attempt of the same op answered -- that one's events are not this
+// one's), on the op's TARGET and with this attempt's request hash (a version
+// delete matches its version id). A matching event AWS applied -> applied;
+// only refused ones -> not_applied; none -> "" (no evidence); a lookup that
+// fails -> unknown with the reason.
+func (s *GovDeployments) trailVerdict(ctx context.Context, db *gorm.DB, d models.IGAGovDeployment, ctl models.IGAGovControl, att models.IGAGovAttempt, plan igagov.Plan) (string, string, error) {
 	tr := s.envNow().Trail
 	if tr == nil {
-		return "", nil
+		return trailUnreadable, "no CloudTrail reader is configured", nil
 	}
-	from := s.now().Add(-time.Hour)
-	if att.SignedAt != nil {
-		from = att.SignedAt.Add(-time.Minute)
+	if att.OpSeq < 0 || att.OpSeq >= len(plan.Ops) || att.SignedAt == nil {
+		return trailUnreadable, "the attempt names no op of the plan", nil
 	}
-	evs, err := tr.EnforcementSessionEvents(ctx, d.WorkspaceID, ctl.ConnectorID, "authsec-enforce-"+roleSessionHex(d.ID), from, s.now())
+	op := plan.Ops[att.OpSeq]
+	from := att.SignedAt.Add(-time.Minute)
+	var prev []time.Time
+	if err := db.WithContext(ctx).Raw(`SELECT completed_at FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
+		AND attempt_no < ? AND status = 'completed' ORDER BY completed_at DESC LIMIT 1`,
+		d.WorkspaceID, d.ID, att.OpSeq, att.AttemptNo).Scan(&prev).Error; err != nil {
+		return "", "", err
+	}
+	if len(prev) == 1 && prev[0].After(from) {
+		from = prev[0]
+	}
+	evs, err := tr.EnforcementSessionEvents(ctx, d.WorkspaceID, ctl.ConnectorID, GovTrailQuery{
+		SessionName: awsenforce.DeploymentSessionName(d.ID), EventName: att.Operation, From: from, To: s.now()})
 	if err != nil {
-		return "", nil // CloudTrail unavailable: no evidence either way
+		return trailUnreadable, truncate(err.Error(), 500), nil
 	}
-	seen, ok := false, false
-	for _, e := range evs {
-		if e.EventName != att.Operation {
+	applied, refused := false, false
+	for _, ev := range evs {
+		version := ""
+		if op.Op == igagov.OpDeletePolicyVersion {
+			if version = ev.VersionID; version == "" {
+				continue
+			}
+		}
+		req, err := awsenforce.NewRequest(op, d.ID, version)
+		if err != nil {
 			continue
 		}
-		seen = true
-		if e.ErrorCode == "" {
-			ok = true
+		if h, err := req.Hash(); err != nil || h != att.RequestHash || !req.MatchesTrail(ev) {
+			continue
+		}
+		if ev.Applied() {
+			applied = true
+		} else {
+			refused = true
 		}
 	}
 	switch {
-	case ok:
-		return unknownVerdictApplied, nil
-	case seen:
-		return unknownVerdictNotApplied, nil
+	case applied:
+		return unknownVerdictApplied, "", nil
+	case refused:
+		return unknownVerdictNotApplied, "", nil
 	}
-	return "", nil
+	return "", fmt.Sprintf("%d %s event(s) of the session, none for this request", len(evs), att.Operation), nil
 }
 
 func (s *GovDeployments) markUnresolved(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, prev *unknownReading, this unknownReading) error {
 	err := run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := setStateTx(tx, d, []string{models.GovDeployOutcomeUnknown}, map[string]any{"state": models.GovDeployOutcomeUnresolved,
 			"state_reason": DepReasonOutcomeUnresolvable + ": readings " + prev.Resolution + " then " + this.Resolution +
-				", CloudTrail " + orNone(this.Trail)}); err != nil {
+				", CloudTrail " + orNone(this.Trail) + trailNote(this.TrailDetail)}); err != nil {
 			return err
 		}
 		return s.event(tx, d, GovEventDeploymentUnresolved, map[string]any{"readings": []unknownReading{*prev, this},
@@ -414,39 +698,18 @@ func (s *GovDeployments) markUnresolved(ctx context.Context, run *PolicyJobRun, 
 }
 
 func orNone(s string) string {
-	if s == "" {
+	switch s {
+	case "":
 		return "no event"
+	case trailUnreadable:
+		return "unreadable"
 	}
 	return s
 }
 
-// ObservationEnforcementTrail is the default GovEnforcementTrail: the
-// CloudTrail events stored as cloud_observation evidence whose session name
-// is the enforcement session's. DECISION (T3.16): events of the enforcement
-// role are stored only when the scanner attributed them to an identity of
-// the connector; when none is stored the check gives no evidence either way
-// and the two consistent readings decide.
-type ObservationEnforcementTrail struct{ DB *gorm.DB }
-
-// EnforcementSessionEvents implements GovEnforcementTrail.
-func (t ObservationEnforcementTrail) EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, sessionName string, from, to time.Time) ([]GovTrailEvent, error) {
-	var rows []struct {
-		ObservedAt     time.Time
-		SanitizedFacts json.RawMessage
+func trailNote(detail string) string {
+	if detail == "" {
+		return ""
 	}
-	if err := t.DB.WithContext(ctx).Raw(`SELECT observed_at, sanitized_facts FROM cloud_observation
-		WHERE workspace_id = ? AND connector_id = ? AND source_api = 'cloudtrail:LookupEvents'
-		  AND sanitized_facts->>'session_name' = ? AND observed_at BETWEEN ? AND ?`, ws, connectorID, sessionName, from, to).
-		Scan(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make([]GovTrailEvent, 0, len(rows))
-	for _, r := range rows {
-		var f map[string]any
-		_ = json.Unmarshal(r.SanitizedFacts, &f)
-		name, _ := f["event_name"].(string)
-		code, _ := f["error_code"].(string)
-		out = append(out, GovTrailEvent{EventTime: r.ObservedAt, EventName: name, ErrorCode: code})
-	}
-	return out, nil
+	return " (" + detail + ")"
 }

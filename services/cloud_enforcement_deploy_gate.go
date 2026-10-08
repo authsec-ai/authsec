@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 
 	"github.com/google/uuid"
@@ -45,11 +47,39 @@ func NewEnforcementBindingDeployGate(svc *EnforcementBindingService) GovBindingG
 	}
 }
 
+// NewEnforcementBindingDispatchCheck is GovDeployEnv.BindingState: the
+// cheap re-check the executor runs before EACH dispatch (review P1-8). It
+// only reads the binding row (no self-test, no AWS call): nil while the
+// connector's binding is verified; binding_partial; binding_not_verified
+// otherwise, with detail.state "revoked" when the binding was revoked (the
+// enforcement client a run assumed stays valid for up to 15 minutes, so
+// revocation must be seen in the database, not in AWS).
+func NewEnforcementBindingDispatchCheck(svc *EnforcementBindingService) GovBindingGate {
+	return func(ctx context.Context, ws, connectorID uuid.UUID) error {
+		err := svc.RequireVerified(ws, connectorID)
+		var ee *EnforcementError
+		if err == nil || !errors.As(err, &ee) || ee.Code != EnfCodeNotVerified {
+			return err
+		}
+		var revoked int64
+		if cerr := svc.db.WithContext(ctx).Model(&models.CloudEnforcementBinding{}).
+			Where("workspace_id = ? AND connector_id = ? AND state = ?", ws, connectorID, models.EnforcementBindingRevoked).
+			Count(&revoked).Error; cerr != nil {
+			return cerr
+		}
+		if live, lerr := svc.liveBinding(svc.db.WithContext(ctx), ws, connectorID, false); lerr == nil && live == nil && revoked > 0 {
+			return enfErr(http.StatusConflict, EnfCodeNotVerified, "The enforcement binding was revoked.", map[string]any{"state": models.EnforcementBindingRevoked})
+		}
+		return err
+	}
+}
+
 // NewProductionGovDeployEnv builds the deployment environment from the
 // process's Vault client and callback configuration.
 func NewProductionGovDeployEnv(db *gorm.DB, vc vault.VaultClient) GovDeployEnv {
 	cfg, _ := LoadAWSCallbackConfig()
 	bind := NewEnforcementBindingService(db, vc, cfg, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
 	access := NewAWSEnforcementAccess(repositories.NewCloudConnectorRepository(db), NewAWSOnboardingService(db, vc), bind)
-	return GovDeployEnv{AWS: access, Binding: NewEnforcementBindingDeployGate(bind), Trail: ObservationEnforcementTrail{DB: db}}
+	return GovDeployEnv{AWS: access, Binding: NewEnforcementBindingDeployGate(bind),
+		BindingState: NewEnforcementBindingDispatchCheck(bind), Trail: access}
 }

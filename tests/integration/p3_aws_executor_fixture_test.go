@@ -82,7 +82,8 @@ func newX3Lab(t *testing.T) *x3Lab {
 	l.access = services.NewAWSEnforcementAccess(repositories.NewCloudConnectorRepository(l.db), nil, enf.svc).
 		WithDiscovery(func(context.Context, *models.CloudConnector) (awsenforce.DiscoveryIAM, error) {
 			return f.Discovery(), nil
-		})
+		}).
+		WithTrail(func(context.Context, *models.CloudConnector) (awsenforce.TrailAPI, error) { return f, nil })
 	l.attempts = services.NewIGAGovAttemptLog(l.db)
 	l.exec = services.NewIGAGovAWSExecutor(l.db, l.attempts, l.access).WithSleep(noSleep)
 	return l

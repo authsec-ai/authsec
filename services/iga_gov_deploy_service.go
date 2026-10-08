@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -104,24 +105,35 @@ const (
 // the iga_* files because it reads the binding table).
 type GovBindingGate func(ctx context.Context, ws, connectorID uuid.UUID) error
 
-// GovTrailEvent is one CloudTrail event of the enforcement session.
-type GovTrailEvent struct {
-	EventTime time.Time
-	EventName string
-	ErrorCode string
-}
+// GovTrailEvent is one CloudTrail event of the enforcement session: the
+// operation, its target, and whether AWS applied it (awsenforce.TrailEvent).
+type GovTrailEvent = awsenforce.TrailEvent
+
+// GovTrailQuery selects the enforcement session's events of one operation in
+// a time window.
+type GovTrailQuery = awsenforce.TrailQuery
 
 // GovEnforcementTrail reads the CloudTrail events of one deployment's
-// enforcement session (authsec-enforce-<deployment 16hex>) for §8.1 step 2.
+// enforcement session (authsec-enforce-<deployment 16hex>) for §8.1 step 2:
+// cloudtrail:LookupEvents through the connector's DISCOVERY role (review
+// P1-7; production: AWSEnforcementAccess, which implements it). An error
+// means the trail could not be read -- never "no events".
 type GovEnforcementTrail interface {
-	EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, sessionName string, from, to time.Time) ([]GovTrailEvent, error)
+	EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, q GovTrailQuery) ([]GovTrailEvent, error)
 }
 
 // GovDeployEnv is what the deployment jobs need from outside the database.
 type GovDeployEnv struct {
 	AWS     IGAGovAWS
 	Binding GovBindingGate
-	Trail   GovEnforcementTrail
+	// BindingState is the cheap re-check of the binding run before EACH
+	// dispatch (review P1-8): a database read, no self-test. nil falls back
+	// to Binding. Production: NewEnforcementBindingDispatchCheck.
+	BindingState GovBindingGate
+	// Trail reads the enforcement session's CloudTrail events. nil: the AWS
+	// access's own (when it implements GovEnforcementTrail), else none --
+	// resolve_unknown then has no CloudTrail evidence (`unknown`).
+	Trail GovEnforcementTrail
 }
 
 var (
@@ -231,14 +243,23 @@ func (s *GovDeployments) WithAuthoring(a *GovAuthoring) *GovDeployments {
 
 func (s *GovDeployments) envNow() GovDeployEnv {
 	e := s.env
-	if e.AWS == nil && e.Binding == nil && e.Trail == nil {
+	if e.AWS == nil && e.Binding == nil && e.BindingState == nil && e.Trail == nil {
 		e = currentGovDeployEnv()
 	}
 	if e.Trail == nil {
-		e.Trail = ObservationEnforcementTrail{DB: s.db}
+		if t, ok := e.AWS.(GovEnforcementTrail); ok {
+			e.Trail = t
+		}
+	}
+	if e.BindingState == nil {
+		e.BindingState = e.Binding
 	}
 	return e
 }
+
+// AttemptLog is the service's write-ahead attempt log (tests tune its call
+// timeout).
+func (s *GovDeployments) AttemptLog() *IGAGovAttemptLog { return s.attempts }
 
 func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 	env := s.envNow()
@@ -246,6 +267,7 @@ func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 		return nil, errors.New("AWS enforcement access is not configured in this build")
 	}
 	e := NewIGAGovAWSExecutor(s.db, s.attempts, env.AWS).WithClock(s.now)
+	e.BindingCheck = env.BindingState
 	if s.Executor != nil {
 		s.Executor(e)
 	}
@@ -256,10 +278,16 @@ func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 // handlers on w (replacing drift_check's no-op).
 func (s *GovDeployments) Register(w *PolicyJobWorker) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobDeploy, Handler: s.DeployHandler,
-		Backoff: func(n int) time.Duration { return time.Duration(n) * time.Minute }})
+		Backoff:     func(n int) time.Duration { return time.Duration(n) * time.Minute },
+		OnExhausted: s.onJobExhausted})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobVerify, Handler: s.VerifyHandler})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobDriftCheck, Handler: s.DriftHandler})
-	w.Register(PolicyJobKind{Kind: repositories.GovJobResolveUnknown, Handler: s.ResolveUnknownHandler})
+	w.Register(PolicyJobKind{Kind: repositories.GovJobResolveUnknown, Handler: s.ResolveUnknownHandler,
+		OnExhausted: s.onJobExhausted})
+	// Review P1-5: in-flight deployments with no open job are settled or
+	// re-enqueued (iga_gov_deploy_sweep.go).
+	w.AddSweeper(PolicyJobSweeper{Name: "stuck_deployments", Every: DeploySweepEvery,
+		Run: func(ctx context.Context, _ time.Time) error { _, err := s.SweepStuckDeployments(ctx); return err }})
 }
 
 /* ------------------------------- small reads ------------------------------- */

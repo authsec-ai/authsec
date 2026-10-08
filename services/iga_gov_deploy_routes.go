@@ -564,6 +564,14 @@ type GovResolveRequest struct {
 //     precondition), handed off the same way with emergency_by.
 //
 // 409 outcome_unknown_pending while outcome_unknown before settle_after.
+//
+// Review P1-5: a deployment stuck in `applying` is resolved here too
+// (resolveApplying, iga_gov_deploy_sweep.go): reread re-queues its deploy
+// job; accept_observed / emergency_undo first declare it outcome_unresolved
+// (it keeps holding the role) and then proceed as above. A reread of an
+// unresolved deployment with no unresolved unknown attempt (an exhausted
+// deploy job, an operator's declaration) returns it to applying with its
+// deploy job queued.
 func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID, req GovResolveRequest) (any, error) {
 	db := s.db.WithContext(ctx)
 	d, err := s.loadDeployment(db, ws, depID)
@@ -582,8 +590,21 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 		return nil, govConflict(GovCodeOutcomeUnknownPending, "The earlier request may still reach AWS; wait until settle_after.",
 			map[string]any{"settle_after": d.SettleAfter})
 	}
-	if d.State != models.GovDeployOutcomeUnresolved && !(req.Action == "reread" && d.State == models.GovDeployOutcomeUnknown) {
-		return nil, govConflict(GovCodeNotUnresolved, "Only a deployment whose outcome is unresolved is resolved here.", map[string]any{"state": d.State})
+	if d.State != models.GovDeployOutcomeUnresolved && d.State != models.GovDeployApplying &&
+		!(req.Action == "reread" && d.State == models.GovDeployOutcomeUnknown) {
+		return nil, govConflict(GovCodeNotUnresolved, "Only a deployment whose outcome is unresolved, or that is stuck applying, is resolved here.",
+			map[string]any{"state": d.State})
+	}
+	if d.State == models.GovDeployApplying {
+		if err := s.resolveApplying(ctx, *d, actor, req); err != nil {
+			return nil, err
+		}
+		if req.Action == "reread" {
+			return s.loadDeployment(db, ws, d.ID)
+		}
+		if d, err = s.loadDeployment(db, ws, d.ID); err != nil {
+			return nil, err
+		}
 	}
 	pol, _, err := s.policyOfVersion(db, ws, d.VersionID)
 	if err != nil {
@@ -592,7 +613,18 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 	k, a := userActor(actor)
 	switch req.Action {
 	case "reread":
-		err := db.Transaction(func(tx *gorm.DB) error {
+		open, err := s.attempts.OpenAttempt(db, ws, d.ID)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Transaction(func(tx *gorm.DB) error {
+			if open == nil || open.Status != models.GovAttemptUnknown {
+				if err := appendGovEvent(tx, ws, GovEventDeploymentResolveReq, k, a, depRefs(*d, pol),
+					map[string]any{"action": req.Action, "reason": req.Reason, "from_state": d.State}); err != nil {
+					return err
+				}
+				return s.rereadWithoutAttemptTx(tx, *d)
+			}
 			if d.State == models.GovDeployOutcomeUnresolved {
 				if err := setStateTx(tx, *d, []string{models.GovDeployOutcomeUnresolved}, map[string]any{"state": models.GovDeployOutcomeUnknown,
 					"state_reason": "re-read requested"}); err != nil {

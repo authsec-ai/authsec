@@ -75,6 +75,14 @@ type IGAGovAWSExecutor struct {
 	// error stops the run before op opSeq is prepared, as a killed worker
 	// would. Never set in production.
 	FaultBeforeOp func(opSeq int, op igagov.Op) error
+	// BindingCheck is re-run before EACH dispatch (review P1-8): the
+	// enforcement client is assumed once per run, so revoking the binding
+	// (or a self-test turning it partial) mid-run must stop the run before
+	// its next request. A cheap database read of the binding (production:
+	// NewEnforcementBindingDispatchCheck); nil checks nothing. A *GovError /
+	// *EnforcementError stops the run as blocked with its code; any other
+	// error fails the try (the job retries, nothing was sent).
+	BindingCheck func(ctx context.Context, ws, connectorID uuid.UUID) error
 }
 
 // IGAGovAWS is the executor's access to AWS for a control's connector
@@ -854,9 +862,16 @@ func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, do
 		}
 		return AttemptAnswer{Outcome: oc.Outcome, RequestID: resp.RequestID, ErrorCode: resp.ErrorCode, ErrorMessage: msg}, nil
 	}
-	res, err := x.e.attempts.Execute(ctx, x.run, AttemptRequest{WorkspaceID: x.dep.WorkspaceID, DeploymentID: x.dep.ID,
-		OpSeq: k, Operation: req.Op, RequestHash: reqHash, DocumentHash: docHash}, call)
+	var pre func(ctx context.Context) error
+	if chk := x.e.BindingCheck; chk != nil {
+		pre = func(ctx context.Context) error { return chk(ctx, x.dep.WorkspaceID, x.ctl.ConnectorID) }
+	}
+	res, err := x.e.attempts.ExecuteChecked(ctx, x.run, AttemptRequest{WorkspaceID: x.dep.WorkspaceID, DeploymentID: x.dep.ID,
+		OpSeq: k, Operation: req.Op, RequestHash: reqHash, DocumentHash: docHash}, pre, call)
 	if err != nil {
+		if errors.Is(err, ErrDispatchRefused) {
+			return x.bindingStop(err, k, req.Op)
+		}
 		return err
 	}
 	attID := res.Attempt.ID
@@ -892,6 +907,35 @@ func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, do
 		}
 		return x.stop(DeployFailed, reason, detail)
 	}
+}
+
+// bindingStop ends the run when the binding check refused op k's dispatch.
+// DECISION (review P1-8): the run stops as blocked with the binding's code
+// (binding_not_verified -- revoked included, the detail names the state --,
+// binding_partial, enforcement_not_enabled), exactly as the start gate
+// blocks a deployment whose binding is not usable; the stopped deployment
+// releases the role with its ledger settled. A refusal that is not a
+// binding verdict (a database error) is returned: the job retries and the
+// next run re-checks before anything is sent.
+func (x *execRun) bindingStop(err error, k int, op string) error {
+	var ge *GovError
+	var ee *EnforcementError
+	code, msg := "", ""
+	switch {
+	case errors.As(err, &ge):
+		code, msg = ge.Code, ge.Message
+		if st, ok := ge.Detail["state"]; ok {
+			msg = fmt.Sprintf("%s (binding %v)", msg, st)
+		}
+	case errors.As(err, &ee):
+		code, msg = ee.Code, ee.Message
+		if st, ok := ee.Detail["state"]; ok {
+			msg = fmt.Sprintf("%s (binding %v)", msg, st)
+		}
+	default:
+		return err
+	}
+	return x.stop(DeployBlocked, code, fmt.Sprintf("op %d (%s) was not sent: %s", k, op, msg))
 }
 
 // backoff is the jittered exponential delay after the n-th retryable answer.
