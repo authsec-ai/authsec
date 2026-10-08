@@ -881,9 +881,9 @@ func (s *IGAGovOwnerReviewService) syncTx(tx *gorm.DB, ws uuid.UUID, st *govRevi
 		}
 	}
 	if out.Created || out.Reopened {
-		if t, err := GovWorkspaceWebhookTarget(tx, ws); err != nil {
-			return nil, err
-		} else if t != nil {
+		// Configured is enough to queue the notice; the secret is resolved
+		// (and an unreadable one retried) when it is sent.
+		if GovWorkspaceWebhookConfigured(tx, ws) {
 			if _, err := EnqueueGovNotificationTx(tx, ws, GovNoticeOwnerReview, st.Review.ID, GovChannelWebhook,
 				GovRecipientWorkspaceWebhook, true); err != nil {
 				return nil, err
@@ -944,9 +944,17 @@ func (s *IGAGovOwnerReviewService) settleStatusTx(tx *gorm.DB, ws uuid.UUID, st 
 			return nil
 		}
 		now := s.now()
-		if err := tx.Exec(`UPDATE iga_gov_owner_review SET status = 'complete', closed_at = ? WHERE workspace_id = ? AND id = ?`,
-			now, ws, st.Review.ID).Error; err != nil {
-			return err
+		// Conditional on the stored status (p3-wire): the authoring hook of a
+		// response may have cancelled this review in the same transaction
+		// (a retain creates the next version and withdraws this one), and a
+		// cancelled review is never reopened or completed here.
+		res := tx.Exec(`UPDATE iga_gov_owner_review SET status = 'complete', closed_at = ? WHERE workspace_id = ? AND id = ?
+			AND status IN ('open','reopened')`, now, ws, st.Review.ID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
 		}
 		st.Review.Status, st.Review.ClosedAt = GovReviewComplete, &now
 		ua, ur := st.unconfirmed()
@@ -956,9 +964,13 @@ func (s *IGAGovOwnerReviewService) settleStatusTx(tx *gorm.DB, ws uuid.UUID, st 
 		if len(b) == 0 {
 			return nil
 		}
-		if err := tx.Exec(`UPDATE iga_gov_owner_review SET status = 'open', closed_at = NULL WHERE workspace_id = ? AND id = ?`,
-			ws, st.Review.ID).Error; err != nil {
-			return err
+		res := tx.Exec(`UPDATE iga_gov_owner_review SET status = 'open', closed_at = NULL WHERE workspace_id = ? AND id = ?
+			AND status = 'complete'`, ws, st.Review.ID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
 		}
 		st.Review.Status, st.Review.ClosedAt = GovReviewOpen, nil
 	}

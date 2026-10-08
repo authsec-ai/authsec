@@ -77,6 +77,17 @@ func removedServices(in igagov.RightSizeIntent) []string {
 	return sortedUniqueStrings(out)
 }
 
+// GovControlRef is the compiler's ControlRef of a control of workspace ws:
+// the ONE place the authsec:workspace tag value is chosen
+// (GovWorkspaceRef). The compiled ops carry it as the tag the executor
+// writes, and every later compile and recovery compares a live policy's tag
+// with it, so ownership checks and the tag written are the same value by
+// construction (p3-wire, item 2).
+func GovControlRef(ws uuid.UUID, c models.IGAGovControl, owned []string) igagov.ControlRef {
+	return igagov.ControlRef{ID: c.ID.String(), PolicyID: c.PolicyID.String(), AccountID: c.AccountID, RoleID: c.RoleID,
+		WorkspaceRef: GovWorkspaceRef(ws), OwnedPolicyARNs: owned}
+}
+
 func (a *GovAuthoring) ownedPolicyARNs(db *gorm.DB, ws, control uuid.UUID) ([]string, error) {
 	var out []string
 	err := db.Raw(`SELECT native_arn FROM iga_gov_artifact WHERE workspace_id = ? AND control_id = ? AND kind = 'boundary_policy'
@@ -139,8 +150,7 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 		return nil, nil, err
 	}
 	in := igagov.TargetInput{
-		Control: igagov.ControlRef{ID: c.ID.String(), PolicyID: c.PolicyID.String(), AccountID: c.AccountID, RoleID: c.RoleID,
-			WorkspaceRef: GovWorkspaceRef(ws), OwnedPolicyARNs: owned},
+		Control:            GovControlRef(ws, c, owned),
 		Intent:             intent,
 		Live:               live,
 		Evidence:           igagov.EvidenceRef{Bundle: b, EvidenceRev: src.Rev, ScanRunID: src.ConnectorRun},
@@ -706,8 +716,9 @@ func approvalHashes(v models.IGAGovPolicyVersion, plans []planWithRole) GovAppro
 /* ------------------------------------------------------------------------- */
 
 // EnqueueCompilePlansTx queues an asynchronous recompile of a version (one
-// open job per version). The publication hook that calls it for every open
-// version is wired at merge (see the T3.11 report).
+// open job per version). The publication hook calls it for every in-review
+// and approved version in the evaluation's completing transaction
+// (GovEvaluator.writeTx, p3-wire DECISION W4).
 func EnqueueCompilePlansTx(tx *gorm.DB, ws, versionID uuid.UUID, rev *int64) (bool, error) {
 	return repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, &models.IGAGovJob{WorkspaceID: ws,
 		Kind: repositories.GovJobCompilePlans, SubjectID: &versionID, Rev: rev, DedupeKey: "version:" + versionID.String()})

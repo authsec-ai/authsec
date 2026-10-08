@@ -452,7 +452,11 @@ func TestP3T308WorkerLoopAndGracefulShutdown(t *testing.T) {
 	if r := p3JobRow(t, db, ab.ID); r.Status != models.GovJobQueued || r.LastError != "transient" || time.Until(r.RunAfter) < 50*time.Minute {
 		t.Fatalf("after a failure: %+v, want queued with the kind's backoff", r)
 	}
-	p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() WHERE id = ?`, ab.ID)
+	// The worker's clock is authoritative for run_after (T3.08 decision 1:
+	// Claim compares run_after with the WORKER's now). Writing the
+	// database's now() here made the test flaky whenever the database clock
+	// ran ahead of the test process's: the job was not yet due.
+	p3exec(t, db, `UPDATE iga_gov_job SET run_after = ? WHERE id = ?`, time.Now().Add(-time.Second), ab.ID)
 	if ran, err := w2.RunOnce(context.Background()); !ran || err != nil {
 		t.Fatal(ran, err)
 	}

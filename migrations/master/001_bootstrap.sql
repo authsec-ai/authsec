@@ -9954,7 +9954,7 @@ ALTER TABLE ONLY public.workspace_slack_integration
 -- ---- from 055_iga_gov_settings_permissions.sql ----
 -- Phase 3 settings, and the four governance:* permissions bound to every
 -- workspace admin role (the two INSERTs are the migration's own, verbatim).
--- 1 table, 1 constraint, 2 fk constraints
+-- 1 table (with the notification channel columns), 1 constraint, 2 fk constraints
 
 CREATE TABLE public.iga_gov_settings (
     workspace_id uuid NOT NULL,
@@ -9966,6 +9966,11 @@ CREATE TABLE public.iga_gov_settings (
     canary_hours integer DEFAULT 48 NOT NULL,
     iac_apply_hours integer DEFAULT 24 NOT NULL,
     evidence_retention_revs integer DEFAULT 30 NOT NULL,
+    notify_email_enabled boolean DEFAULT true NOT NULL,
+    notify_webhook_url text DEFAULT ''::text NOT NULL,
+    notify_webhook_secret_ref text DEFAULT ''::text NOT NULL,
+    notify_channels_source text DEFAULT 'default'::text NOT NULL,
+    notify_channels_copied_at timestamp with time zone,
     updated_by uuid,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT iga_gov_settings_approval_valid_days_check CHECK (((approval_valid_days >= 1) AND (approval_valid_days <= 30))),
@@ -9975,6 +9980,8 @@ CREATE TABLE public.iga_gov_settings (
     CONSTRAINT iga_gov_settings_enforcement_mode_check CHECK ((enforcement_mode = ANY (ARRAY['findings_only'::text, 'enforce'::text]))),
     CONSTRAINT iga_gov_settings_evidence_retention_revs_check CHECK (((evidence_retention_revs >= 5) AND (evidence_retention_revs <= 365))),
     CONSTRAINT iga_gov_settings_iac_apply_hours_check CHECK (((iac_apply_hours >= 1) AND (iac_apply_hours <= 336))),
+    CONSTRAINT iga_gov_settings_notify_channels_source_check CHECK ((notify_channels_source = ANY (ARRAY['default'::text, 'phase3'::text, 'legacy_copy'::text]))),
+    CONSTRAINT iga_gov_settings_notify_webhook_url_check CHECK (((notify_webhook_url = ''::text) OR (notify_webhook_url ~~ 'https://%'::text))),
     CONSTRAINT iga_gov_settings_owner_review_days_check CHECK (((owner_review_days >= 1) AND (owner_review_days <= 30)))
 );
 

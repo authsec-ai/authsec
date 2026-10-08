@@ -228,31 +228,6 @@ func TestP3T312ReviewRoutes(t *testing.T) {
 
 /* ------------------------------- settings --------------------------------- */
 
-// p3ChannelStore is an in-memory GovNotificationChannelStore: what the
-// pending DDL's implementation will hold, so the copy, the API and the
-// webhook target are tested now.
-type p3ChannelStore struct {
-	mu   sync.Mutex
-	rows map[uuid.UUID]services.GovNotificationChannels
-}
-
-func (s *p3ChannelStore) Available() (bool, string) { return true, "" }
-func (s *p3ChannelStore) GetTx(_ *gorm.DB, ws uuid.UUID) (*services.GovNotificationChannels, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.rows[ws]
-	if !ok {
-		return nil, false, nil
-	}
-	return &c, true, nil
-}
-func (s *p3ChannelStore) SaveTx(_ *gorm.DB, ws uuid.UUID, ch services.GovNotificationChannels) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rows[ws] = ch
-	return nil
-}
-
 func p3LegacyRow(t *testing.T, db *gorm.DB, ws uuid.UUID) string {
 	t.Helper()
 	var s []string
@@ -263,16 +238,47 @@ func p3LegacyRow(t *testing.T, db *gorm.DB, ws uuid.UUID) string {
 	return s[0]
 }
 
-// §7.8 settings: defaults; enforce needs a reason; ranges, unknown fields
-// and stale writes refused; channels unavailable until the DDL lands; with
-// a store, the legacy channel addresses are COPIED on first read (the
-// legacy row unchanged), PUT stores them without echoing the secret, email
-// off makes an owner's delivery fail at once, and the workspace webhook is
-// sent signed.
+// Without a channel store installed (IGA_POLICY not yet verified, or a build
+// that never installs one): GET /settings says notifications are not
+// available and why, and PUT /settings with notifications is 409
+// notification_settings_unavailable; the other settings still work.
+func TestP3T320SettingsWithoutChannelStore(t *testing.T) {
+	db := igaDB(t)
+	api := p3NewOwnersAPI(t, db)
+	g := p3NewGov(t, db, "p3notify-settings-nostore")
+	p3Audit(t, db, g.ws)
+	t.Cleanup(services.SetGovNotificationChannelStore(nil))
+	reader := api.token(g.ws, g.author, g.authorMember, "governance:read")
+	enforcer := api.token(g.ws, g.author, g.authorMember, "governance:read governance:enforce")
+	code, body := api.call(http.MethodGet, "/settings", reader, nil)
+	if code != http.StatusOK || dig(body, "data", "notifications", "available") != false ||
+		digs(body, "data", "notifications", "reason") == "" || dig(body, "data", "notifications", "email_enabled") != true {
+		t.Fatalf("GET without a store: %d %v", code, body)
+	}
+	if code, body := api.call(http.MethodPut, "/settings", enforcer, map[string]any{"notifications": map[string]any{"webhook_url": "https://hooks.example.test/a"}}); code != http.StatusConflict ||
+		errCode(body) != "notification_settings_unavailable" {
+		t.Fatalf("channels without a store: %d %v", code, body)
+	}
+	if code, body := api.call(http.MethodPut, "/settings", enforcer, map[string]any{"canary_hours": 24}); code != http.StatusOK ||
+		dig(body, "data", "canary_hours") != float64(24) {
+		t.Fatalf("other settings without a store: %d %v", code, body)
+	}
+}
+
+// §7.8 settings with the production channel store (GovDBChannelStore: 055's
+// notify_* columns, the webhook secret in Vault): defaults; enforce needs a
+// reason; ranges, unknown fields and stale writes refused; the legacy
+// channel addresses are COPIED on first read (the legacy row unchanged, the
+// legacy secret into Vault), PUT stores them without echoing the secret
+// (the row holds only the Vault path; the superseded secret is released),
+// email off makes an owner's delivery fail at once, and the workspace
+// webhook is sent signed.
 func TestP3T320Settings(t *testing.T) {
 	db := igaDB(t)
 	api := p3NewOwnersAPI(t, db)
 	g := p3NewGov(t, db, "p3notify-settings")
+	vault := newMemVault()
+	t.Cleanup(services.SetGovNotificationChannelStore(services.NewGovDBChannelStore(vault)))
 	other := p3NewGov(t, db, "p3notify-settings-other")
 	p3Audit(t, db, g.ws, other.ws)
 	reader := api.token(g.ws, g.author, g.authorMember, "governance:read")
@@ -282,9 +288,13 @@ func TestP3T320Settings(t *testing.T) {
 
 	code, body := api.call(http.MethodGet, "/settings", reader, nil)
 	if code != http.StatusOK || digs(body, "data", "enforcement_mode") != "findings_only" || dig(body, "data", "saved") != false ||
-		dig(body, "data", "owner_review_days") != float64(3) || dig(body, "data", "notifications", "available") != false ||
-		digs(body, "data", "notifications", "reason") == "" || dig(body, "data", "notifications", "email_enabled") != true {
+		dig(body, "data", "owner_review_days") != float64(3) || dig(body, "data", "notifications", "available") != true ||
+		digs(body, "data", "notifications", "reason") != "" || dig(body, "data", "notifications", "email_enabled") != true ||
+		digs(body, "data", "notifications", "source") != "default" {
 		t.Fatalf("GET defaults: %d %v", code, body)
+	}
+	if strings.Contains(string(mustJSON(t, body)), "notify_") {
+		t.Fatalf("GET /settings exposes the notify_* columns: %v", body)
 	}
 	if code, _ := api.call(http.MethodPut, "/settings", reader, map[string]any{"canary_hours": 24}); code != http.StatusForbidden {
 		t.Fatalf("PUT with governance:read: %d", code)
@@ -324,10 +334,6 @@ func TestP3T320Settings(t *testing.T) {
 		dig(body, "data", "canary_hours") != float64(24) {
 		t.Fatalf("fresh write: %d %v", code, body)
 	}
-	if code, body := api.call(http.MethodPut, "/settings", enforcer, map[string]any{"notifications": map[string]any{"webhook_url": "https://hooks.example.test/a"}}); code != http.StatusConflict ||
-		errCode(body) != "notification_settings_unavailable" {
-		t.Fatalf("channels without a store: %d %v", code, body)
-	}
 	// The other workspace still reads its own defaults.
 	if code, body := api.call(http.MethodGet, "/settings", otherTok, nil); code != http.StatusOK || digs(body, "data", "enforcement_mode") != "findings_only" {
 		t.Fatalf("other workspace: %d %v", code, body)
@@ -340,9 +346,8 @@ func TestP3T320Settings(t *testing.T) {
 	}
 	p3WaitAudit(t, db, g.ws, http.MethodPut, "/api/iga/v1/policy/settings")
 
-	// With a channel store: the legacy channel addresses are copied, never moved.
-	store := &p3ChannelStore{rows: map[uuid.UUID]services.GovNotificationChannels{}}
-	t.Cleanup(services.SetGovNotificationChannelStore(store))
+	// The legacy channel addresses are copied, never moved (the settings row
+	// saved above holds default channels, so the first read still copies).
 	p3exec(t, db, `INSERT INTO governance_notification_settings (workspace_id, webhook_url, webhook_secret, email_enabled)
 		VALUES (?, 'https://hooks.customer.test/legacy', 'legacy-secret', false)`, g.ws)
 	legacyBefore := p3LegacyRow(t, db, g.ws)
@@ -354,12 +359,27 @@ func TestP3T320Settings(t *testing.T) {
 			dig(body, "data", "notifications", "copied_from_legacy_at") == nil {
 			t.Fatalf("GET %d after the copy: %d %v", i, code, body)
 		}
-		if strings.Contains(string(mustJSON(body)), "legacy-secret") {
+		if strings.Contains(string(mustJSON(t, body)), "legacy-secret") {
 			t.Fatal("GET /settings returned the webhook secret")
 		}
 	}
 	if n := len(g.eventsNamed(services.GovEventSettingsChannelsCopied)); n != 1 {
 		t.Fatalf("copy events: %d", n)
+	}
+	// The row holds the Vault path, never the secret; Vault holds it under
+	// the workspace's iga-gov namespace.
+	var legacyRef string
+	db.Raw(`SELECT notify_webhook_secret_ref FROM iga_gov_settings WHERE workspace_id = ?`, g.ws).Scan(&legacyRef)
+	if !strings.HasPrefix(legacyRef, "kv/data/secret/workspaces/"+g.ws.String()+"/iga-gov/notifications/") {
+		t.Fatalf("secret ref %q", legacyRef)
+	}
+	if sec, err := vault.ReadSecret(legacyRef); err != nil || sec["secret"] != "legacy-secret" {
+		t.Fatalf("vault at %s: %v %v", legacyRef, sec, err)
+	}
+	var rowText string
+	db.Raw(`SELECT row_to_json(s)::text FROM iga_gov_settings s WHERE workspace_id = ?`, g.ws).Scan(&rowText)
+	if strings.Contains(rowText, "legacy-secret") {
+		t.Fatalf("the settings row holds the secret: %s", rowText)
 	}
 	if after := p3LegacyRow(t, db, g.ws); after == "" || after != legacyBefore {
 		t.Fatalf("the legacy row changed or moved:\nbefore %s\nafter  %s", legacyBefore, after)
@@ -390,6 +410,17 @@ func TestP3T320Settings(t *testing.T) {
 		"webhook_url": srv.URL + "/authsec", "webhook_secret": "whsec-phase3"}})
 	if code != http.StatusOK || digs(body, "data", "notifications", "source") != "phase3" || dig(body, "data", "notifications", "webhook_secret_set") != true {
 		t.Fatalf("PUT channels: %d %v", code, body)
+	}
+	var newRef string
+	db.Raw(`SELECT notify_webhook_secret_ref FROM iga_gov_settings WHERE workspace_id = ?`, g.ws).Scan(&newRef)
+	if newRef == "" || newRef == legacyRef {
+		t.Fatalf("secret ref after PUT %q (was %q)", newRef, legacyRef)
+	}
+	if sec, err := vault.ReadSecret(newRef); err != nil || sec["secret"] != "whsec-phase3" {
+		t.Fatalf("vault at %s: %v %v", newRef, sec, err)
+	}
+	if _, err := vault.ReadSecret(legacyRef); err == nil {
+		t.Fatalf("the superseded secret at %s was not released", legacyRef)
 	}
 	for _, e := range g.eventsNamed("settings.") {
 		if strings.Contains(string(e.Payload), "whsec-phase3") || strings.Contains(string(e.Payload), "legacy-secret") {
@@ -438,9 +469,18 @@ func TestP3T320Settings(t *testing.T) {
 	if wn.State != "sent" || wn.Recipient != services.GovRecipientWorkspaceWebhook {
 		t.Fatalf("webhook notice %+v", wn)
 	}
-}
 
-func mustJSON(v any) []byte {
-	raw, _ := json.Marshal(v)
-	return raw
+	// Vault cannot give the secret back: the webhook is never sent unsigned
+	// (its target fails, the notify job retries) and GET /settings says so.
+	if err := vault.DeleteSecret(newRef); err != nil {
+		t.Fatal(err)
+	}
+	if tgt, err := services.GovWorkspaceWebhookTarget(db, g.ws); err == nil || tgt != nil {
+		t.Fatalf("webhook target with an unreadable secret: %+v %v", tgt, err)
+	}
+	code, body = api.call(http.MethodGet, "/settings", reader, nil)
+	if code != http.StatusOK || dig(body, "data", "notifications", "webhook_secret_set") != true ||
+		digs(body, "data", "notifications", "reason") == "" || digs(body, "data", "notifications", "webhook_url") != srv.URL+"/authsec" {
+		t.Fatalf("GET with an unreadable secret: %d %v", code, body)
+	}
 }

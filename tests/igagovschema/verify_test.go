@@ -81,3 +81,33 @@ func containsName(msg, name string) bool {
 	}
 	return false
 }
+
+// p3-wire: the notification channel columns of 055's iga_gov_settings are
+// checked by name -- a database built from 055's first draft has the table
+// without them -- and each missing one is named.
+func TestVerifyPolicySchemaFailsWithoutAChannelColumn(t *testing.T) {
+	_, g := testDB(t)
+	cols := services.PolicySchemaColumns()
+	if len(cols) != 5 {
+		t.Fatalf("channel columns checked: %v", cols)
+	}
+	for _, qc := range cols {
+		qc := qc
+		t.Run(qc, func(t *testing.T) {
+			table, col, _ := strings.Cut(qc, ".")
+			err := g.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Exec("ALTER TABLE " + table + " DROP COLUMN " + col).Error; err != nil {
+					return err
+				}
+				verr := services.VerifyPolicySchema(tx)
+				if verr == nil || !containsName(verr.Error(), qc) {
+					t.Errorf("verification without %s: %v", qc, verr)
+				}
+				return errRollback
+			})
+			if !errors.Is(err, errRollback) {
+				t.Fatalf("%s: %v", qc, err)
+			}
+		})
+	}
+}

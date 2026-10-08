@@ -261,7 +261,8 @@ func TestP3T320EventsAPIAndExport(t *testing.T) {
 		m := c.(map[string]any)
 		rec[m["category"].(string)] = m["recorded"].(bool)
 	}
-	if !rec["owner_review"] || !rec["ownership"] || rec["approval"] || rec["rollout"] {
+	// approval / proposal are recorded since T3.11 / T3.13 (p3-wire).
+	if !rec["owner_review"] || !rec["ownership"] || !rec["approval"] || !rec["proposal"] || rec["rollout"] {
 		t.Fatalf("categories %v", rec)
 	}
 }
@@ -519,6 +520,13 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 	for r := range exempt {
 		covered[r] = true
 	}
+	// The §7.3 / §7.5 authoring and approval routes (T3.11 / T3.13) need a
+	// published revision, evidence and a live reader: they are walked by
+	// TestP3T320AuthoringMutationsAudited, over the P3 evaluation lab
+	// (p3-wire; a P2 lab cannot run beside this test's fixture).
+	for _, r := range p3AuthoringRoutes(prefix) {
+		covered[r] = true
+	}
 	for r := range registered {
 		if !covered[r] {
 			t.Errorf("mutating route %s has no audit case in the walker", r)
@@ -629,4 +637,87 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 			}
 		}
 	})
+}
+
+// p3AuthoringRoutes are the §7.3 / §7.5 mutating routes of T3.11 / T3.13.
+func p3AuthoringRoutes(prefix string) []string {
+	return []string{
+		"POST " + prefix + "/proposals",
+		"PATCH " + prefix + "/policies/:id",
+		"POST " + prefix + "/policies/:id/versions/:no/propose",
+		"POST " + prefix + "/policies/:id/versions/:no/approve",
+		"POST " + prefix + "/policies/:id/versions",
+		"POST " + prefix + "/policies/:id/versions/:no/withdraw",
+		"POST " + prefix + "/policies/:id/versions/:no/reject",
+		"POST " + prefix + "/policies/:id/pause",
+		"POST " + prefix + "/policies/:id/resume",
+		"POST " + prefix + "/policies/:id/archive",
+	}
+}
+
+// The walker's authoring half (p3-wire): every §7.3 / §7.5 mutating route
+// answered 2xx writes an iga_gov_event and an audit_events row, and every
+// event it writes is in the vocabulary.
+func TestP3T320AuthoringMutationsAudited(t *testing.T) {
+	const prefix = "/api/iga/v1/policy"
+	l := newP3aLab(t, "p3notify-walker-authoring")
+	roleID := "AROAWALKERAUTH00001"
+	l.role("WalkerAuthRole", roleID, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	var policy string
+	var intent any
+	walked := map[string]bool{}
+	walk := func(route string, m p3aMember, method, path string, body any) map[string]any {
+		t.Helper()
+		before := l.count(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`, l.ws)
+		code, resp := l.call(m, method, path, body)
+		if code < 200 || code > 299 {
+			t.Fatalf("%s: %d %v", route, code, resp)
+		}
+		if l.count(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`, l.ws) <= before {
+			t.Fatalf("%s wrote no iga_gov_event", route)
+		}
+		p3WaitAudit(t, l.db, l.ws, method, prefix+path)
+		walked[route] = true
+		d, _ := resp["data"].(map[string]any)
+		return d
+	}
+	d := walk("POST "+prefix+"/proposals", l.author, http.MethodPost, "/proposals",
+		map[string]any{"template": "right_size_services", "keys": []any{map[string]any{"provider": "aws", "role_id": roleID}}})
+	policy = d["policy"].(map[string]any)["id"].(string)
+	intent = d["version"].(map[string]any)["intent"]
+	pp := "/policies/" + policy
+	walk("PATCH "+prefix+"/policies/:id", l.author, http.MethodPatch, pp, map[string]any{"name": "walker renamed"})
+	walk("POST "+prefix+"/policies/:id/versions/:no/propose", l.author, http.MethodPost, pp+"/versions/1/propose", nil)
+	walk("POST "+prefix+"/policies/:id/versions/:no/approve", l.approver, http.MethodPost, pp+"/versions/1/approve",
+		p3aApproveBody(l.plans(policy, 1), nil))
+	walk("POST "+prefix+"/policies/:id/versions", l.author, http.MethodPost, pp+"/versions",
+		map[string]any{"intent": intent, "base_version_no": 1})
+	walk("POST "+prefix+"/policies/:id/versions/:no/withdraw", l.author, http.MethodPost, pp+"/versions/2/withdraw",
+		map[string]any{"reason": "walker"})
+	code, resp := l.call(l.author, http.MethodPost, pp+"/versions", map[string]any{"intent": intent, "base_version_no": 2})
+	l.must(code, resp, http.StatusCreated, "version 3")
+	code, resp = l.call(l.author, http.MethodPost, pp+"/versions/3/propose", nil)
+	l.must(code, resp, http.StatusOK, "propose 3")
+	walk("POST "+prefix+"/policies/:id/versions/:no/reject", l.approver, http.MethodPost, pp+"/versions/3/reject",
+		map[string]any{"reason": "walker"})
+	walk("POST "+prefix+"/policies/:id/pause", l.author, http.MethodPost, pp+"/pause", map[string]any{"reason": "walker"})
+	walk("POST "+prefix+"/policies/:id/resume", l.author, http.MethodPost, pp+"/resume", map[string]any{"reason": "walker"})
+	walk("POST "+prefix+"/policies/:id/archive", l.author, http.MethodPost, pp+"/archive", map[string]any{"reason": "walker"})
+	for _, r := range p3AuthoringRoutes(prefix) {
+		if !walked[r] {
+			t.Errorf("authoring route %s was not walked", r)
+		}
+	}
+	vocab := map[string]bool{}
+	for _, k := range services.GovEventVocabulary {
+		vocab[k.Name] = true
+	}
+	var names []string
+	l.db.Raw(`SELECT DISTINCT event FROM iga_gov_event WHERE workspace_id = ?`, l.ws).Scan(&names)
+	for _, n := range names {
+		if !vocab[n] {
+			t.Errorf("event %s is not in the vocabulary", n)
+		}
+	}
 }
