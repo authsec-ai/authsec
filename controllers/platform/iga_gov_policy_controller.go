@@ -239,11 +239,12 @@ var policyFeatures = []policyFeature{
 	// iac_sync).
 	{"export", true, "", nil},
 	{"iac", true, "", nil},
-	// T3.09 ships the enforcement role binding (§7.9, under
-	// /authsec/discovery/aws/connectors/:id/enforcement); the flag stays
-	// false because direct enforcement also needs the AWS enforcement adapter
-	// (T3.10) and deployments (T3.15/T3.16), which are not in this build.
-	{"enforcement", false, "Direct enforcement is not available in this build: the AuthSec enforcement role can be bound and self-tested, but the AWS enforcement adapter and deployments have not been released, so every workspace is findings-only.", nil},
+	// Direct enforcement (J3): the enforcement binding (T3.09), the AWS adapter
+	// (T3.10), rollout (T3.15) and deployments (T3.16) are in this build. A
+	// workspace still needs enforcement_mode=enforce and a verified binding;
+	// those are per-workspace refusals (enforcement_not_enabled,
+	// binding_not_verified), not a missing feature.
+	{"enforcement", true, "", nil},
 	// T3.14: the Slack app's routes (/authsec/integrations/slack) are in this
 	// build; the flag is true only while the app is configured on this
 	// server (signing secret, Vault credentials) and installed at startup.

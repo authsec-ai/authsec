@@ -281,9 +281,10 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 			reasons, _ := p["reasons"].(map[string]any)
 			for _, f := range features {
 				// T3.06b mounted the findings routes, T3.11/T3.13 the
-				// proposal routes and T3.17 export and IaC delivery: served,
+				// proposal routes, T3.17 export and IaC delivery and T3.10/T3.15/T3.16
+				// direct enforcement: served,
 				// so true exactly when the gate is on, with no reason.
-				if (f == "findings" || f == "proposals" || f == "export" || f == "iac") && tc.state == services.PolicyOn {
+				if (f == "findings" || f == "proposals" || f == "export" || f == "iac" || f == "enforcement") && tc.state == services.PolicyOn {
 					if p[f] != true || reasons[f] != nil {
 						t.Errorf("on: policy.%s = %v (reason %v), want true with no reason: its routes are in this build", f, p[f], reasons[f])
 					}
@@ -301,11 +302,6 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				}
 				if tc.state == services.PolicyOn && r == services.PolicyEnv+" is off" {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
-				}
-			}
-			for _, f := range []string{"enforcement"} {
-				if r, _ := reasons[f].(string); tc.state == services.PolicyOn && !strings.Contains(r, "not available in this build") {
-					t.Errorf("on: reasons.%s = %q, want an honest not-in-this-build reason", f, r)
 				}
 			}
 			// T3.14: Slack's routes are in this build; the flag follows the
