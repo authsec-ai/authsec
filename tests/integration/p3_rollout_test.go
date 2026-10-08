@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
@@ -704,5 +705,105 @@ func TestP3T315JourneySetupRefusals(t *testing.T) {
 	l.bind("verified")
 	if v := l.must2(l.start(l.author, policy)); p3rStage(v) != models.GovRolloutCanary {
 		t.Fatalf("verified binding: %v", v)
+	}
+}
+
+// p3rVerifyFacts stands in for T3.16's DeploymentGateFacts: the row facts
+// with the gates its last verify run computed (nil gates: none ran yet).
+type p3rVerifyFacts struct {
+	rows  *services.GovRowDeploymentFacts
+	mu    sync.Mutex
+	gates []igagov.GateResult
+}
+
+func (f *p3rVerifyFacts) DeploymentGateFacts(ctx context.Context, ws, dep uuid.UUID) (*services.RolloutDeploymentGateFacts, error) {
+	out, err := f.rows.DeploymentGateFacts(ctx, ws, dep)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out.Gates, out.Canary = append([]igagov.GateResult(nil), f.gates...), nil
+	return out, nil
+}
+
+func (f *p3rVerifyFacts) set(g []igagov.GateResult) {
+	f.mu.Lock()
+	f.gates = g
+	f.mu.Unlock()
+}
+
+func p3rGates(failed string) []igagov.GateResult {
+	var out []igagov.GateResult
+	for _, g := range []string{igagov.GateArtifactVerified, igagov.GateNoUnexpectedFailures, igagov.GateRequiredOperations,
+		igagov.GateNoProblemReports, igagov.GateWindowElapsed} {
+		r := igagov.GateResult{Gate: g, Outcome: igagov.OutcomePassed}
+		if g == failed {
+			r.Outcome, r.Reason = igagov.OutcomeFailed, "problem_reported"
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// The T3.16 shape: gates computed by the verify run are authoritative --
+// none yet keeps the canary waiting, a failed one pauses with Undo offered,
+// all passed completes. Then an approved remove_control version is handed
+// to the remove_control starter (no observation, no canary): refused while
+// none is installed.
+func TestP3T315GatesFromVerifyRunAndRemoveControl(t *testing.T) {
+	l := newP3rLab(t, "p3-t315-verify", true)
+	const rid = "AROAVERIFYROLE1"
+	l.role("VerifyRole", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	policy := l.prepare(rid)
+	vf := &p3rVerifyFacts{rows: &services.GovRowDeploymentFacts{DB: l.db}}
+	t.Cleanup(services.SetGovRolloutDeploymentFacts(vf))
+	dep := l.toCanary(policy)
+	l.applied(dep, models.GovDeployAppliedUnverified, 50*time.Hour)
+	l.tick()
+	if v := l.rollout(policy); p3rStage(v) != models.GovRolloutCanary {
+		t.Fatalf("no verify run yet: %v", v["rollout"])
+	}
+	vf.set(p3rGates(igagov.GateNoProblemReports))
+	l.tick()
+	v := l.rollout(policy)
+	if p3rStage(v) != models.GovRolloutPaused || l.pauseKind(v) != services.GovPauseGateFailed ||
+		digs(v, "results", "undo_offered", 0, "deployment_id") != dep.String() {
+		t.Fatalf("failed verify gate: %v %v", v["rollout"], dig(v, "results", "pause"))
+	}
+	l.resume(policy)
+	vf.set(p3rGates(""))
+	l.tick()
+	if v = l.rollout(policy); p3rStage(v) != models.GovRolloutComplete {
+		t.Fatalf("all gates passed: %v", v["rollout"])
+	}
+
+	// remove_control.
+	var control uuid.UUID
+	l.db.Raw(`SELECT control_id FROM iga_gov_deployment WHERE id = ?`, dep).Scan(&control)
+	p3exec(t, l.db, `UPDATE iga_gov_policy_version SET status = 'superseded' WHERE workspace_id = ?`, l.ws)
+	v2 := uuid.New()
+	intent := `{"kind":"remove_control","control_ids":["` + control.String() + `"],"reason":"hand back to the team"}`
+	p3exec(t, l.db, `INSERT INTO iga_gov_policy_version (id, workspace_id, policy_id, version_no, intent, intent_hash, catalog_version, evidence_rev, status, created_by)
+		VALUES (?, ?, ?, 2, ?::jsonb, 'sha256:p3r', 1, ?, 'approved', ?)`, v2, l.ws, policy, intent, l.latestRev(), l.author.user)
+	code, body := l.call(l.author, http.MethodPost, "/policies/"+policy+"/rollout/start", map[string]any{"version_no": 2})
+	if code != http.StatusConflict || p3eErr(body) != services.GovCodeRemoveControlUnavailable {
+		t.Fatalf("remove_control without a starter: %d %v", code, body)
+	}
+	var started []uuid.UUID
+	t.Cleanup(services.SetGovRemoveControlStarter(func(_ context.Context, _ *gorm.DB, ws, actor, version uuid.UUID) error {
+		if ws != l.ws || actor != l.author.user {
+			return fmt.Errorf("unexpected caller %s %s", ws, actor)
+		}
+		started = append(started, version)
+		return nil
+	}))
+	l.must2(l.call(l.author, http.MethodPost, "/policies/"+policy+"/rollout/start", map[string]any{"version_no": 2}))
+	if len(started) != 1 || started[0] != v2 || l.events(services.GovEventRolloutRemoveControlStarted) != 1 {
+		t.Fatalf("remove_control started %v", started)
+	}
+	if n := l.count(`SELECT count(*) FROM iga_gov_rollout WHERE workspace_id = ? AND version_id = ?`, l.ws, v2); n != 0 {
+		t.Fatal("a remove_control version got a rollout row")
 	}
 }

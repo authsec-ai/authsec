@@ -35,6 +35,10 @@ func rolloutAudit(action string, v *services.GovRolloutView, extra gin.H) *audit
 	for k, x := range extra {
 		after[k] = x
 	}
+	if v.Rollout.ID == uuid.Nil {
+		// A remove_control version has no rollout row: audit the policy.
+		return &audited{action, "iga_gov_policy", v.PolicyID.String(), nil, after}
+	}
 	return &audited{action, "iga_gov_rollout", v.Rollout.ID.String(), nil, after}
 }
 

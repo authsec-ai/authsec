@@ -141,6 +141,7 @@ const (
 	GovEventRolloutPartial              = "rollout.partial"
 	GovEventRolloutUndone               = "rollout.undone"
 	GovEventRolloutRefreshQueued        = "rollout.activity_refresh_queued"
+	GovEventRolloutRemoveControlStarted = "rollout.remove_control_started"
 )
 
 // Pause kinds (gate_results.pause.kind).
@@ -169,20 +170,26 @@ type RolloutDeploymentGateFacts struct {
 	StateReason string `json:"state_reason"`
 	// AppliedAt is when the change took effect (nil: not applied).
 	AppliedAt *time.Time `json:"applied_at,omitempty"`
-	// Dimensions is §8.7's verification outcome per dimension (artifact,
+	// Dimensions is §8.7's verification result per dimension (artifact,
 	// graph, application_health, restriction); a missing key is not yet
 	// assessed.
-	Dimensions map[string]string `json:"dimensions"`
-	// Canary is the evidence for the window from AppliedAt: RoleID,
+	Dimensions map[string]igagov.DimensionResult `json:"dimensions"`
+	// Gates are the five §8.6 gates as T3.16's last verify run computed
+	// them (empty until a verify job ran). When present they are
+	// authoritative, with UnexpectedFailures from the same run.
+	Gates              []igagov.GateResult        `json:"gates"`
+	UnexpectedFailures []igagov.UnexpectedFailure `json:"unexpected_failures"`
+	// Canary is raw evidence for the window from AppliedAt, used only when
+	// Gates is empty (the built-in GovRowDeploymentFacts): RoleID,
 	// AppliedAt, RemovesServices, Removed, Retained, Events (CloudTrail
 	// management events of the role's sessions, T3.04 attribution),
 	// Validations (declared, with items), Reports (owner health reports),
 	// Trail (the CloudTrail reads covering the window, CapHit when the
 	// 10,000-event cap stopped one), PublishedAfterApply and
-	// ArtifactOutcome. Now and CanaryHours are set by the rollout; the
-	// gates, unexpected failures, application_health and restriction are
-	// igagov.EvaluateCanary(Canary).
-	Canary igagov.CanaryInput `json:"-"`
+	// ArtifactOutcome. Now and CanaryHours are set by the rollout and the
+	// gates are igagov.EvaluateCanary(*Canary). With neither, the gates
+	// read awaiting evidence and nothing advances.
+	Canary *igagov.CanaryInput `json:"-"`
 }
 
 // RolloutDeploymentFacts is the narrow seam T3.16 implements
@@ -245,13 +252,13 @@ func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, ws, dep
 		return nil, err
 	}
 	out := &RolloutDeploymentGateFacts{DeploymentID: d.ID, State: d.State, StateReason: d.StateReason,
-		AppliedAt: d.AppliedAt, Dimensions: map[string]string{}}
+		AppliedAt: d.AppliedAt, Dimensions: map[string]igagov.DimensionResult{}}
 	var vs []models.IGAGovVerification
 	if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, d.ID).Find(&vs).Error; err != nil {
 		return nil, err
 	}
 	for _, v := range vs {
-		out.Dimensions[v.Dimension] = v.Outcome
+		out.Dimensions[v.Dimension] = igagov.DimensionResult{Outcome: v.Outcome, Attribution: v.Attribution}
 	}
 	var c models.IGAGovControl
 	if err := db.Where("workspace_id = ? AND id = ?", ws, d.ControlID).Take(&c).Error; err != nil {
@@ -265,7 +272,7 @@ func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, ws, dep
 	if err := db.Where("workspace_id = ? AND id = ?", ws, d.PlanID).Take(&p).Error; err != nil {
 		return nil, err
 	}
-	in := igagov.CanaryInput{RoleID: c.RoleID, ArtifactOutcome: out.Dimensions["artifact"]}
+	in := igagov.CanaryInput{RoleID: c.RoleID, ArtifactOutcome: out.Dimensions["artifact"].Outcome}
 	if d.AppliedAt != nil {
 		in.AppliedAt = d.AppliedAt.UTC()
 	}
@@ -316,7 +323,7 @@ func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, ws, dep
 	if f.Trail != nil {
 		in.Events, in.Trail = f.Trail(ws, d.ID)
 	}
-	out.Canary = in
+	out.Canary = &in
 	return out, nil
 }
 
@@ -694,6 +701,9 @@ func (r *GovRollout) Start(ctx context.Context, ws, actor, policyID uuid.UUID, i
 	if err != nil {
 		return nil, err
 	}
+	if pi, perr := igagov.ParseIntent(v.Intent); perr == nil && pi.Kind == igagov.IntentRemoveControl {
+		return r.startRemoveControl(ctx, ws, actor, *v, in.Reason)
+	}
 	rc, err := r.loadVersionCtx(db, ws, *v, false)
 	if err != nil {
 		return nil, err
@@ -1016,9 +1026,7 @@ func (r *GovRollout) createDeploymentTx(tx *gorm.DB, ws, actor uuid.UUID, rc *go
 		}
 		return nil, err
 	}
-	sub := dep.ID
-	if _, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, &models.IGAGovJob{WorkspaceID: ws,
-		Kind: repositories.GovJobDeploy, SubjectID: &sub, DedupeKey: "deployment:" + dep.ID.String()}); err != nil {
+	if err := enqueueRolloutDeployTx(tx, ws, dep.ID); err != nil {
 		return nil, err
 	}
 	ak, aid := actorPair(actor)
@@ -1029,6 +1037,90 @@ func (r *GovRollout) createDeploymentTx(tx *gorm.DB, ws, actor uuid.UUID, rc *go
 		return nil, err
 	}
 	return dep, nil
+}
+
+// enqueueRolloutDeployTx queues the deploy job of a deployment the rollout
+// created (dedupe deployment:<id>). MERGE NOTE: T3.16's
+// services.EnqueueDeployTx(tx, ws, depID) is the same contract; at the
+// integration merge this body becomes a call to it.
+func enqueueRolloutDeployTx(tx *gorm.DB, ws, depID uuid.UUID) error {
+	sub := depID
+	_, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, &models.IGAGovJob{WorkspaceID: ws,
+		Kind: repositories.GovJobDeploy, SubjectID: &sub, DedupeKey: "deployment:" + depID.String()})
+	return err
+}
+
+/* ---------------------------- remove_control ------------------------------ */
+
+// GovRemoveControlStarter starts the deployments of an approved
+// remove_control version (§8.10): removals have no observation and no
+// canary. T3.16's services.StartRemoveControlDeployments is wired here at
+// the integration merge (SetGovRemoveControlStarter); without it, starting
+// a remove_control version is 409 remove_control_not_available.
+type GovRemoveControlStarter func(ctx context.Context, db *gorm.DB, ws, actor, versionID uuid.UUID) error
+
+var (
+	govRemoveControlMu      sync.RWMutex
+	govRemoveControlStarter GovRemoveControlStarter
+)
+
+// SetGovRemoveControlStarter installs the remove_control starter and
+// returns a restore function.
+func SetGovRemoveControlStarter(f GovRemoveControlStarter) (restore func()) {
+	govRemoveControlMu.Lock()
+	prev := govRemoveControlStarter
+	govRemoveControlStarter = f
+	govRemoveControlMu.Unlock()
+	return func() {
+		govRemoveControlMu.Lock()
+		govRemoveControlStarter = prev
+		govRemoveControlMu.Unlock()
+	}
+}
+
+// GovCodeRemoveControlUnavailable: no remove_control starter in this build.
+const GovCodeRemoveControlUnavailable = "remove_control_not_available"
+
+// startRemoveControl hands an approved remove_control version to T3.16.
+func (r *GovRollout) startRemoveControl(ctx context.Context, ws, actor uuid.UUID, v models.IGAGovPolicyVersion, reason string) (*GovRolloutView, error) {
+	db := r.db.WithContext(ctx)
+	var pol models.IGAGovPolicy
+	if err := db.Where("workspace_id = ? AND id = ?", ws, v.PolicyID).Take(&pol).Error; err != nil {
+		return nil, err
+	}
+	if pol.Lifecycle == "archived" {
+		return nil, govConflict(GovCodePolicyArchived, "The policy is archived and read-only.", nil)
+	}
+	if v.Status != "approved" {
+		return nil, govConflict(GovCodeApprovalRequired, "A remove_control version starts once it is approved.", map[string]any{"status": v.Status})
+	}
+	govRemoveControlMu.RLock()
+	start := govRemoveControlStarter
+	govRemoveControlMu.RUnlock()
+	if start == nil {
+		return nil, govConflict(GovCodeRemoveControlUnavailable, "Removing AuthSec control is not available in this build.", nil)
+	}
+	if err := start(ctx, db, ws, actor, v.ID); err != nil {
+		return nil, err
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		ak, aid := actorPair(actor)
+		p, vid := v.PolicyID, v.ID
+		return appendGovEvent(tx, ws, GovEventRolloutRemoveControlStarted, ak, aid, govEventRefs{PolicyID: &p, VersionID: &vid},
+			map[string]any{"version_no": v.VersionNo, "reason": reason})
+	}); err != nil {
+		return nil, err
+	}
+	out := &GovRolloutView{PolicyID: v.PolicyID, VersionNo: v.VersionNo, Version: v.Status, Deployments: []GovRolloutDeployment{},
+		Acceptances: []models.IGAGovAcceptance{}, Actions: []string{}}
+	if err := db.Raw(`SELECT d.id, t.id AS target_id, c.role_id, false AS canary, d.state, d.applied_at, d.created_at
+		FROM iga_gov_deployment d
+		JOIN iga_gov_control c ON c.workspace_id = d.workspace_id AND c.id = d.control_id
+		LEFT JOIN iga_gov_target t ON t.workspace_id = d.workspace_id AND t.version_id = d.version_id AND t.control_id = d.control_id
+		WHERE d.workspace_id = ? AND d.version_id = ? ORDER BY d.created_at, d.id`, ws, v.ID).Scan(&out.Deployments).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func refusalOf(t govRolloutTarget, err error) (GovRolloutRefusal, bool) {
@@ -1082,13 +1174,19 @@ func (r *GovRollout) evaluateGates(ctx context.Context, db *gorm.DB, ws uuid.UUI
 	if f.AppliedAt == nil {
 		return ev, nil
 	}
-	in := f.Canary
-	in.AppliedAt, in.Now, in.CanaryHours = f.AppliedAt.UTC(), now, hours
-	if in.ArtifactOutcome == "" {
-		in.ArtifactOutcome = f.Dimensions["artifact"]
+	switch {
+	case len(f.Gates) > 0:
+		ev.result = canaryResultOf(f)
+	case f.Canary != nil:
+		in := *f.Canary
+		in.AppliedAt, in.Now, in.CanaryHours = f.AppliedAt.UTC(), now, hours
+		if in.ArtifactOutcome == "" {
+			in.ArtifactOutcome = f.Dimensions["artifact"].Outcome
+		}
+		ev.result = igagov.EvaluateCanary(in)
 	}
-	ev.result = igagov.EvaluateCanary(in)
-	ws0, we := in.AppliedAt, in.AppliedAt.Add(time.Duration(hours)*time.Hour)
+	ws0 := f.AppliedAt.UTC()
+	we := ws0.Add(time.Duration(hours) * time.Hour)
 	ev.canary.WindowStart, ev.canary.WindowEnd = &ws0, &we
 	var accs []models.IGAGovAcceptance
 	if rc.Rollout != nil {
@@ -1111,6 +1209,26 @@ func (r *GovRollout) evaluateGates(ctx context.Context, db *gorm.DB, ws uuid.UUI
 	}
 	ev.canary.Pass = ev.passes(nil)
 	return ev, nil
+}
+
+// canaryResultOf is the gate result of facts whose gates T3.16's verify
+// run computed: pass when all passed, pause when any failed.
+func canaryResultOf(f *RolloutDeploymentGateFacts) igagov.CanaryResult {
+	res := igagov.CanaryResult{Gates: append([]igagov.GateResult(nil), f.Gates...), Pass: true, NotAvailable: []string{},
+		UnexpectedFailures: append([]igagov.UnexpectedFailure{}, f.UnexpectedFailures...),
+		ApplicationHealth:  f.Dimensions["application_health"], Restriction: f.Dimensions["restriction"]}
+	for _, g := range res.Gates {
+		if g.Outcome != igagov.OutcomePassed {
+			res.Pass = false
+		}
+		if g.Outcome == igagov.OutcomeFailed {
+			res.Pause = true
+		}
+		if g.Outcome == igagov.OutcomeNotAvailable {
+			res.NotAvailable = append(res.NotAvailable, g.Gate)
+		}
+	}
+	return res
 }
 
 // passes: every gate passed, or is not_available and accepted (by a row,

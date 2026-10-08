@@ -138,6 +138,7 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRolloutPartial, GovCatRollout, GovObjVersion, "The rollout finished with some targets failed or refused."},
 	{GovEventRolloutUndone, GovCatRollout, GovObjVersion, "The rollout's applied change was undone."},
 	{GovEventRolloutRefreshQueued, GovCatRollout, GovObjConnector, "A connector scan was queued so observation gets a fresh activity report."},
+	{GovEventRolloutRemoveControlStarted, GovCatControlRemoval, GovObjVersion, "An approved remove_control version was started (no observation or canary)."},
 }
 
 // Object kinds the events API filters on.
