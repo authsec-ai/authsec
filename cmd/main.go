@@ -231,6 +231,15 @@ func main() {
 				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
 				return
 			}
+			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
+			// the GitHub App key and connector credentials.
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr == nil {
+					services.ConfigureGovIaCDelivery(config.DB, vc)
+				} else {
+					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
+				}
+			}
 			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
 			// T3.16: deployments need AWS access (discovery + enforcement
 			// roles) and the binding gate; without Vault the deploy jobs wait.

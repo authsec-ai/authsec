@@ -116,6 +116,8 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 // verified, before the job worker starts):
 //
 //   - the owner review wiring (InstallGovOwnerReviewWiring);
+//   - IaC / export delivery for the deploy and verify jobs
+//     (InstallGovIaCDeliveryHandlers);
 //   - the notification channel store (GovDBChannelStore over vc; vc nil:
 //     channels are stored but a webhook secret cannot be);
 //   - the compiler's discovery-role live reader (GovAWSLiveReader over
@@ -124,6 +126,10 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 //     and compilation answers 503 discovery_unavailable.
 func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincipal string) {
 	InstallGovOwnerReviewWiring(db)
+	// T3.17 IaC / export delivery behind T3.16's deploy and verify jobs. With
+	// no GitHub adapter (no Vault) a PR target falls back to export at compile
+	// time, so the handler is installed either way.
+	InstallGovIaCDeliveryHandlers(db)
 	SetGovNotificationChannelStore(NewGovDBChannelStore(vc))
 	if vc == nil {
 		SetGovLiveReader(nil)

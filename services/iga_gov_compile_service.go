@@ -181,6 +181,16 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 		return nil, &compileBlock{Bundle: &b, Reason: ce.Code + ": " + strings.Join(ce.Reasons, "; "),
 			Err: govUnprocessable(GovCodeTargetIneligible, "This target cannot be compiled.", map[string]any{"targets": []any{detail}})}, nil
 	}
+	// T3.17: an iac_pr target whose form is not supported in its mapped
+	// source is compiled as export, with the reason (§8.11, decided here).
+	if plans, err = a.withIaCFallback(ctx, ws, c, in, plans); err != nil {
+		if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
+			return nil, nil, err
+		}
+		return nil, &compileBlock{Bundle: &b, Reason: GovCodeIaCUnavailable + ": " + err.Error(),
+			Err: govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "The mapped IaC source could not be read.",
+				map[string]any{"reason": err.Error(), "role_id": c.RoleID})}, nil
+	}
 	return &compiledTarget{Target: t, Control: c, Bundle: b, Plans: plans, ReadAt: live.ReadAt}, nil, nil
 }
 
@@ -404,6 +414,10 @@ func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUI
 	if v.Status != "draft" && v.Status != "in_review" {
 		return nil, govConflict(GovCodeVersionConflict, "Only a draft or in-review version can be proposed; edit creates a new version.",
 			map[string]any{"status": v.Status})
+	}
+	// T3.17: a dedicated_identity version compiles split / split_revert.
+	if pi, perr := igagov.ParseIntent(v.Intent); perr == nil && pi.Kind == igagov.IntentDedicatedIdentity {
+		return a.proposeIsolation(ctx, ws, actor, policyID, no, v, *pi.DedicatedIdentity)
 	}
 	intent, err := storedRightSize(*v)
 	if err != nil {
@@ -664,7 +678,11 @@ const (
 func requiredAcceptances(db *gorm.DB, ws uuid.UUID, plans []planWithRole) ([]GovAcceptanceItem, error) {
 	out := []GovAcceptanceItem{}
 	for _, p := range plans {
-		if p.Kind != igagov.PlanApply || p.Eligibility == igagov.EligibilityIneligible {
+		// T3.17: a dedicated-identity version's split plan carries the §11
+		// unanalysed items (KMS grants, SCPs/RCPs, standalone tasks, ...),
+		// accepted item by item like an apply plan's; its split_revert
+		// derives from it with the same bundle.
+		if (p.Kind != igagov.PlanApply && p.Kind != igagov.PlanSplit) || p.Eligibility == igagov.EligibilityIneligible {
 			continue
 		}
 		var un []igagov.UnanalysedItem
@@ -699,7 +717,7 @@ func requiredAcceptances(db *gorm.DB, ws uuid.UUID, plans []planWithRole) ([]Gov
 func approvalHashes(v models.IGAGovPolicyVersion, plans []planWithRole) GovApprovalHashes {
 	h := GovApprovalHashes{IntentHash: v.IntentHash, ImpactHashes: []string{}, PlanHashes: []string{}, MaterialHashes: []string{}}
 	for _, p := range plans {
-		if p.Kind == igagov.PlanApply {
+		if p.Kind == igagov.PlanApply || p.Kind == igagov.PlanSplit { // T3.17: split plans are forward plans too
 			h.ImpactHashes = append(h.ImpactHashes, p.ImpactHash)
 		}
 		h.PlanHashes = append(h.PlanHashes, p.PlanHash)

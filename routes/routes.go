@@ -1688,6 +1688,10 @@ func SetupRoutes(
 			// discovery:read to read and governance:enforce to change.
 			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
 				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
+			// Phase 3 IaC sources (§7.9, T3.17): an account's mapping to the
+			// Terraform / CloudFormation directory J2 pull requests change.
+			platformCtrl.RegisterIaCSourceRoutes(discovery,
+				platformCtrl.NewCloudIaCSourceController(config.DB), middlewares.Require)
 
 			// IAM identity discovery: the foundation every later AWS surface
 			// resolves against. Writes cloud_identity and cloud_secret and

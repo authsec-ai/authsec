@@ -178,6 +178,22 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventSlackDisconnected, GovCatNotification, "", "Slack was disconnected: token revoked, member links removed."},
 	{GovEventSlackUserLinked, GovCatNotification, "", "A Slack user was linked to a member (verified email or console confirmation)."},
 	{GovEventSlackActionReceived, GovCatNotification, GovObjNotification, "An authenticated Slack action was received on a notice (before authorization)."},
+	// T3.17 IaC sources (iga_gov_iac_source_service.go): delivery setup.
+	{GovEventIaCSourceCreated, GovCatEnforcementSetup, GovObjConnector, "An IaC source (repository directory) was mapped to an AWS account."},
+	{GovEventIaCSourceDeleted, GovCatEnforcementSetup, GovObjConnector, "An IaC source was removed."},
+	{GovEventIaCPermissionRequest, GovCatEnforcementSetup, GovObjConnector, "The GitHub App was asked for contents and pull-request write on the installation."},
+	// T3.17 IaC and export delivery (iga_gov_iac_delivery.go).
+	{GovEventExportReady, GovCatDeploymentAttempt, GovObjDeployment, "An export deployment is awaiting the customer's apply."},
+	{GovEventIaCPROpened, GovCatDeploymentAttempt, GovObjDeployment, "A pull request was opened for an iac_pr deployment."},
+	{GovEventIaCChangedReview, GovCatDeploymentAttempt, GovObjDeployment, "The pull request's head moved after AuthSec opened it."},
+	{GovEventIaCReviewed, GovCatDeploymentAttempt, GovObjDeployment, "The pull request received its first approving review (reviewed SHA recorded)."},
+	{GovEventIaCMerged, GovCatDeploymentAttempt, GovObjDeployment, "The pull request was merged; the deployment awaits the customer's apply."},
+	{GovEventIaCClosed, GovCatDeploymentAttempt, GovObjDeployment, "The pull request was closed without merging; the deployment failed."},
+	{GovEventIaCBlocked, GovCatDeploymentAttempt, GovObjDeployment, "Blocked before anything was proposed: the live state conflicts with the plan, or the mapped source no longer renders the approved change."},
+	{GovEventIaCApplyRun, GovCatDeploymentAttempt, GovObjDeployment, "The repository reported a check run or deployment for the merge commit."},
+	{GovEventIaCApplyPending, GovCatVerification, GovObjDeployment, "The desired state is not (fully) visible in AWS yet, or became overdue."},
+	{GovEventIaCAppliedOutside, GovCatVerification, GovObjDeployment, "Applied outside AuthSec, matched by role, attachment and document hash."},
+	{GovEventIaCUnexpected, GovCatVerification, GovObjDeployment, "What was applied is not what was reviewed: failed with the diff."},
 }
 
 // Object kinds the events API filters on.

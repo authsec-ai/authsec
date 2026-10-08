@@ -175,8 +175,9 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 			found := false
 			for _, p := range plans {
 				// T3.16: a remove_control version's forward plan is its
-				// remove_control plan (§8.10 "follows the normal approve path").
-				if p.TargetID == t.ID && (p.Kind == igagov.PlanApply || p.Kind == igagov.PlanRemoveControl) {
+				// remove_control plan (§8.10 "follows the normal approve path");
+				// T3.17: a split is a dedicated-identity version's forward plan.
+				if p.TargetID == t.ID && (p.Kind == igagov.PlanApply || p.Kind == igagov.PlanRemoveControl || p.Kind == igagov.PlanSplit) {
 					found = true
 					if p.Eligibility == igagov.EligibilityIneligible {
 						ineligible = append(ineligible, map[string]any{"target_id": t.ID, "role_id": p.RoleID, "reason": p.IneligibleReason})
@@ -203,10 +204,11 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		if !sameMultiset(req.PlanHashes, cur.PlanHashes) || !sameMultiset(req.MaterialHashes, cur.MaterialHashes) {
 			return govConflict(GovCodePlanChanged, "The plan changed since you loaded it; review the new plan.", map[string]any{"current": cur})
 		}
-		// T3.16: a remove_control version has no right-size intent; the owner
-		// gate receives the zero intent and the plans.
+		// T3.16: a remove_control version has no right-size intent; T3.17: a
+		// dedicated_identity version (split / split_revert plans) neither. The
+		// owner gate then receives the zero intent and the plans.
 		var intent igagov.RightSizeIntent
-		if !isRemoveControlVersion(*v) {
+		if pi, perr := igagov.ParseIntent(v.Intent); !isRemoveControlVersion(*v) && (perr != nil || pi.Kind != igagov.IntentDedicatedIdentity) {
 			if intent, err = storedRightSize(*v); err != nil {
 				return err
 			}

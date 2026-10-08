@@ -560,6 +560,12 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// resolve_unknown, over the process-wide deployment environment
 	// (SetGovDeployEnv) read at call time.
 	NewGovDeployments(db, nil).Register(w)
+	// T3.17: iac_sync (PR state, merge, awaiting_apply -> applied_unverified,
+	// §8.11) replaces the no-op; the GitHub adapter and the live reader are
+	// the process-wide ones, read at call time.
+	w.Register(PolicyJobKind{Kind: repositories.GovJobIaCSync,
+		Handler: NewGovIaCDelivery(db, nil, ProcessGovLiveReader()).SyncHandler,
+		Backoff: func(n int) time.Duration { return time.Duration(n) * 5 * time.Minute }})
 	return w
 }
 

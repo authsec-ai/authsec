@@ -239,8 +239,16 @@ func dueIaCSyncs(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPo
 		WorkspaceID uuid.UUID
 		ID          uuid.UUID
 	}
+	// T3.17: plus every awaiting_apply deployment without an open change
+	// (J1 export, or a J2 change already in the source), subject = the
+	// deployment (DECISION in iga_gov_iac_delivery.go).
 	err := db.Raw(`SELECT workspace_id, id FROM iga_gov_iac_change
-		WHERE state IN ('opening','open','changed_after_review','merged')`).Scan(&rows).Error
+		WHERE state IN ('opening','open','changed_after_review','merged')
+		UNION ALL
+		SELECT d.workspace_id, d.id FROM iga_gov_deployment d
+		 WHERE d.state = 'awaiting_apply'
+		   AND NOT EXISTS (SELECT 1 FROM iga_gov_iac_change c WHERE c.workspace_id = d.workspace_id AND c.deployment_id = d.id
+		                     AND c.state IN ('opening','open','changed_after_review','merged'))`).Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}
