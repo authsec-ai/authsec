@@ -89,3 +89,31 @@ func Test_RLS_ScopedQueriesCannotReachAnotherWorkspace(t *testing.T) {
 		t.Fatalf("scoped transactions run as %q, want authsec_tenant", role)
 	}
 }
+
+// Phase 6 (130): the restricted role without a workspace setting sees and
+// writes nothing. Before 130 the transitional clause let it read every
+// workspace's rows -- a scoped transaction that lost its setting would have
+// been unscoped.
+func Test_RLS_RestrictedRoleWithoutWorkspaceSeesNothing(t *testing.T) {
+	a, _ := TwoTenants(t)
+	db := config.GetDatabase().DB
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SET LOCAL ROLE authsec_tenant`); err != nil {
+		t.Fatalf("set role: %v", err)
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT count(*) FROM users`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("authsec_tenant without app.workspace_id read %d users, want 0", n)
+	}
+	if _, err := tx.Exec(`INSERT INTO groups (id, workspace_id, name) VALUES (gen_random_uuid(), $1, 'unscoped')`,
+		a.WS.WorkspaceID); err == nil {
+		t.Fatalf("authsec_tenant without app.workspace_id inserted a row")
+	}
+}
