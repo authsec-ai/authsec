@@ -574,6 +574,11 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// T3.18: metrics_rollup, hourly per workspace (dedupe hour:<ts>), and
 	// its schedule.
 	RegisterMetricsJobs(w, NewGovMetrics(db, nil))
+	// T3.09 / review fix R1a P2: verify_binding, the 24-hour enforcement
+	// self-test per bound binding, and its schedule
+	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
+	// NewProductionGovDeployEnv).
+	RegisterEnforcementBindingJobs(w)
 	return w
 }
 

@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -284,7 +286,7 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				// proposal routes, T3.17 export and IaC delivery and T3.10/T3.15/T3.16
 				// direct enforcement: served,
 				// so true exactly when the gate is on, with no reason.
-				if (f == "findings" || f == "proposals" || f == "export" || f == "iac" || f == "enforcement") && tc.state == services.PolicyOn {
+				if (f == "findings" || f == "proposals" || f == "export") && tc.state == services.PolicyOn {
 					if p[f] != true || reasons[f] != nil {
 						t.Errorf("on: policy.%s = %v (reason %v), want true with no reason: its routes are in this build", f, p[f], reasons[f])
 					}
@@ -302,6 +304,29 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				}
 				if tc.state == services.PolicyOn && r == services.PolicyEnv+" is off" {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
+				}
+			}
+			// Review fix R1a P2: iac and enforcement are true only while this
+			// process can deliver them (the GitHub PR adapter; the deployment
+			// environment), each false with its own reason otherwise.
+			if tc.state == services.PolicyOn {
+				for f, want := range map[string]string{"iac": "GitHub App adapter", "enforcement": "deployment environment"} {
+					if r, _ := reasons[f].(string); !strings.Contains(r, want) {
+						t.Errorf("on, not installed: reasons.%s = %q, want the %s reason", f, r, want)
+					}
+				}
+				services.SetGovIaCGitHub(iacpr.NewFake())
+				services.SetGovDeployEnv(services.GovDeployEnv{AWS: p3CapsAWS{},
+					Binding: func(context.Context, uuid.UUID, uuid.UUID) error { return nil }})
+				code, body := a.get("/capabilities")
+				services.SetGovIaCGitHub(nil)
+				services.SetGovDeployEnv(services.GovDeployEnv{})
+				mustStatus(t, "/capabilities", code, body, http.StatusOK)
+				for _, f := range []string{"iac", "enforcement"} {
+					if dig(body, "data", "policy", f) != true || dig(body, "data", "policy", "reasons", f) != nil {
+						t.Errorf("installed: policy.%s = %v (reason %v), want true", f, dig(body, "data", "policy", f),
+							dig(body, "data", "policy", "reasons", f))
+					}
 				}
 			}
 			// T3.14: Slack's routes are in this build; the flag follows the
@@ -400,3 +425,7 @@ func TestP3PolicyGateVerifiesTriggersAndConstraints(t *testing.T) {
 		t.Errorf("%d triggers on Phase 3 tables, %d listed", len(triggers), len(services.PolicySchemaTriggers()))
 	}
 }
+
+// p3CapsAWS stands in for the deployment environment's AWS access in the
+// capabilities test: the flag reads only whether one is installed.
+type p3CapsAWS struct{ services.IGAGovAWS }

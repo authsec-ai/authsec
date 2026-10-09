@@ -246,14 +246,18 @@ var policyFeatures = []policyFeature{
 	// T3.17: J1 export (GET .../export, export deployments) and J2 IaC
 	// delivery (IaC sources under /authsec/discovery/aws, the PR adapter,
 	// iac_sync).
+	// iac: true only while this process has the GitHub App PR adapter
+	// (services.GovIaCAvailable; review fix R1a P2 -- it was hard-coded).
 	{"export", true, "", nil},
-	{"iac", true, "", nil},
+	{"iac", true, "", services.GovIaCAvailable},
 	// Direct enforcement (J3): the enforcement binding (T3.09), the AWS adapter
-	// (T3.10), rollout (T3.15) and deployments (T3.16) are in this build. A
-	// workspace still needs enforcement_mode=enforce and a verified binding;
-	// those are per-workspace refusals (enforcement_not_enabled,
-	// binding_not_verified), not a missing feature.
-	{"enforcement", true, "", nil},
+	// (T3.10), rollout (T3.15) and deployments (T3.16) are in this build; the
+	// flag is true only while this process has the deployment environment
+	// (services.GovEnforcementAvailable; review fix R1a P2). A workspace still
+	// needs enforcement_mode=enforce and a verified binding; those are
+	// per-workspace refusals (enforcement_not_enabled, binding_not_verified),
+	// not a missing feature (DECISION in services/iga_gov_capabilities.go).
+	{"enforcement", true, "", services.GovEnforcementAvailable},
 	// T3.14: the Slack app's routes (/authsec/integrations/slack) are in this
 	// build; the flag is true only while the app is configured on this
 	// server (signing secret, Vault credentials) and installed at startup.

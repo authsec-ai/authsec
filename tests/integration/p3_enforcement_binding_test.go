@@ -26,6 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -967,4 +968,114 @@ func TestP3EnfRoutes(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, r.a.ws.String())
+}
+
+// Review fix R1a P2 "unscheduled verify_binding" (§3.6: the self-test runs
+// every 24 hours): the default worker registers verify_binding and its
+// schedule; a bound binding whose last self-test is older than 24 hours is
+// due (one job, dedupe binding:<id>; not due again once queued, nor while
+// fresh); the handler runs the REAL self-test through the installed
+// self-tester (a new self_test event by verify_binding, the binding
+// re-verified); a revoked binding completes the job without a probe.
+func TestP3EnfVerifyBindingScheduled(t *testing.T) {
+	l := newEnfLab(t)
+	ctx := context.Background()
+	sess := l.start(t, l.a)
+	l.aws.deploy(t, sess.AccountID, sess.Suffix, sess.ExternalID)
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone {
+		t.Fatalf("bind: %s", out)
+	}
+
+	w := services.NewDefaultPolicyJobWorker(l.db)
+	registered, scheduled := false, false
+	for _, k := range w.Kinds() {
+		registered = registered || k == repositories.GovJobVerifyBinding
+	}
+	for _, n := range w.Scheduler().ScheduleNames() {
+		scheduled = scheduled || n == repositories.GovJobVerifyBinding
+	}
+	if !registered || !scheduled {
+		t.Fatalf("verify_binding registered %v, scheduled %v in the default worker", registered, scheduled)
+	}
+
+	sched := services.VerifyBindingSchedule()
+	due := func(now time.Time) *services.ScheduledPolicyJob {
+		t.Helper()
+		items, err := sched.Due(ctx, l.db, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range items {
+			if items[i].WorkspaceID == l.a.ws {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+	if it := due(time.Now()); it != nil {
+		t.Fatalf("a binding self-tested just now is due: %+v", it)
+	}
+	// A day passes.
+	p3exec(t, l.db, `UPDATE cloud_enforcement_binding SET updated_at = now() - interval '25 hours' WHERE id = ?`, sess.BindingID)
+	it := due(time.Now())
+	if it == nil || it.SubjectID == nil || *it.SubjectID != sess.BindingID || it.DedupeKey != "binding:"+sess.BindingID.String() {
+		t.Fatalf("due after 25 h: %+v", it)
+	}
+	repo := repositories.NewIGAGovJobRepository(l.db)
+	for i := 0; i < 2; i++ {
+		if _, err := repo.EnqueuePeriodicTx(l.db, &models.IGAGovJob{WorkspaceID: l.a.ws, Kind: sched.Kind, SubjectID: it.SubjectID,
+			DedupeKey: it.DedupeKey}, sched.Every); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var jobs []models.IGAGovJob
+	l.db.Where("workspace_id = ? AND kind = ?", l.a.ws, repositories.GovJobVerifyBinding).Find(&jobs)
+	if len(jobs) != 1 {
+		t.Fatalf("verify_binding jobs: %d, want 1", len(jobs))
+	}
+	run := func(j models.IGAGovJob) error {
+		t.Helper()
+		p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'running', lease_owner = 'enf-t', lease_version = lease_version + 1,
+			lease_expires_at = now() + interval '2 minutes', attempts = attempts + 1 WHERE id = ?`, j.ID)
+		l.db.Where("id = ?", j.ID).Take(&j)
+		err := services.VerifyBindingHandler(ctx, services.NewPolicyJobRun(l.db, j, "enf-t"))
+		p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now(), lease_owner = '', lease_expires_at = NULL WHERE id = ?`, j.ID)
+		return err
+	}
+	// Without a self-tester (no Vault in the process) the job waits.
+	restore := services.SetEnforcementSelfTester(nil)
+	if err := run(jobs[0]); err == nil {
+		t.Fatal("verify_binding ran with no self-tester")
+	}
+	restore()
+	t.Cleanup(services.SetEnforcementSelfTester(l.svc))
+	selfTests := func() int64 {
+		var n int64
+		l.db.Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND event = ? AND actor_id = 'verify_binding'`,
+			l.a.ws, services.EventEnforcementSelfTest).Scan(&n)
+		return n
+	}
+	if err := run(jobs[0]); err != nil {
+		t.Fatalf("verify_binding: %v", err)
+	}
+	if n := selfTests(); n != 1 {
+		t.Fatalf("self_test events by verify_binding: %d, want 1", n)
+	}
+	if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingVerified || time.Since(b.UpdatedAt) > time.Hour {
+		t.Fatalf("after the scheduled self-test: %+v", b)
+	}
+	if it := due(time.Now()); it != nil {
+		t.Fatalf("due again right after its self-test: %+v", it)
+	}
+
+	// Revoked: the job completes without probing.
+	if _, err := l.svc.Revoke(ctx, l.a.ws, l.a.connector.ID, l.a.user, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(jobs[0]); err != nil {
+		t.Fatalf("verify_binding of a revoked binding: %v", err)
+	}
+	if n := selfTests(); n != 1 {
+		t.Fatalf("a revoked binding was probed: %d self_test events", n)
+	}
 }
