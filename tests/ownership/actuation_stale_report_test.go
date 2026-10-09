@@ -342,3 +342,67 @@ func TestReportEndpointAnswersAStaleReport409(t *testing.T) {
 		t.Fatalf("a late success must be 200 and recorded, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// The late-success write is fenced, not merely checked: the report reads the
+// instruction as pending, then pod-b re-leases it BEFORE the report's write
+// lands (the write is held on the row lock until the re-lease commits). The
+// write must then match nothing -- pod-b holds a live lease, its run is the
+// one that counts -- and the late report is refused.
+func TestLateSuccessRacingAReLeaseIsRefused(t *testing.T) {
+	f := newActFixture(t)
+	id := leasedQuarantine(t, f, "pod-a")
+	expireLease(t, f, id)
+	if _, err := f.am.ReclaimExpiredLeases(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.raw.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT 1 FROM provisioning_instructions WHERE id = $1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	type res struct {
+		out *models.ProvisioningInstruction
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-a"})
+		done <- res{out, err}
+	}()
+	// Wait until the report's write is blocked on the row lock.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var waiting int
+		if err := f.raw.QueryRow(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+			AND query ILIKE 'UPDATE "provisioning_instructions"%'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the late report's write never reached the row lock")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// pod-b re-leases it (what Lease writes), then the lock is released.
+	if _, err := tx.Exec(`UPDATE provisioning_instructions SET status = 'leased', leased_by = 'pod-b',
+		lease_expires_at = now() + interval '1 minute', attempts = attempts + 1 WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	assertRefused(t, "a late success racing a re-lease", r.err, services.ErrInstructionLeaseNotHeld)
+	var status, holder string
+	if err := f.raw.QueryRow(`SELECT status, leased_by FROM provisioning_instructions WHERE id = $1`, id).Scan(&status, &holder); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.InstructionLeased || holder != "pod-b" {
+		t.Fatalf("after the race: %s/%s, want pod-b's live lease untouched", status, holder)
+	}
+}
