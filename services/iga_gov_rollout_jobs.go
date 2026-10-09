@@ -155,12 +155,14 @@ func (r *GovRollout) locked(ctx context.Context, run *PolicyJobRun, rc0 *govRoll
 // from (DECISION R4) and the newest report at rev with the removed
 // services' last attempts.
 func (r *GovRollout) observationTargets(db *gorm.DB, ws uuid.UUID, rc *govRolloutCtx, rev int64) ([]igagov.ObservationTarget, error) {
-	removed := map[string]bool{}
-	for _, x := range rc.Intent.Remove {
-		removed[x.Service] = true
-	}
 	out := []igagov.ObservationTarget{}
 	for _, t := range rc.Targets {
+		// This subject's removals (an owner's scoped retain keeps its
+		// service for that owner's roles only).
+		removed := map[string]bool{}
+		for _, x := range rc.Intent.ForSubject(t.Control.IdentityAccountID.String()).Remove {
+			removed[x.Service] = true
+		}
 		ot := igagov.ObservationTarget{RoleID: t.Control.RoleID, EvidenceReportAt: rc.Version.CreatedAt.UTC(),
 			LastAttempts: map[string]*time.Time{}}
 		var base []*time.Time

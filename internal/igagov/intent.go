@@ -60,13 +60,65 @@ type Subject struct {
 }
 
 // RetainEntry is one retained service with its basis (§2.7, P-12).
+//
+// Subjects scopes an OWNER retain (basis owner) to the subjects -- by
+// identity_account_id -- its owner owns (§2.9, §7.4): the service is kept
+// for those roles only and still removed for every other subject of the
+// policy. Empty (the field absent, so existing intents and their hashes are
+// unchanged) means the entry applies to every subject. See ForSubject.
 type RetainEntry struct {
-	Service     string `json:"service"`
-	Basis       string `json:"basis"`
-	LastAttempt string `json:"last_attempt,omitempty"`
-	Catalog     string `json:"catalog,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	ReviewBy    string `json:"review_by,omitempty"`
+	Service     string   `json:"service"`
+	Basis       string   `json:"basis"`
+	LastAttempt string   `json:"last_attempt,omitempty"`
+	Catalog     string   `json:"catalog,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	ReviewBy    string   `json:"review_by,omitempty"`
+	Subjects    []string `json:"subjects,omitempty"`
+}
+
+// AppliesTo reports whether the entry retains its service for the subject
+// identityAccountID (an unscoped entry applies to every subject).
+func (e RetainEntry) AppliesTo(identityAccountID string) bool {
+	if len(e.Subjects) == 0 {
+		return true
+	}
+	for _, s := range e.Subjects {
+		if s == identityAccountID {
+			return true
+		}
+	}
+	return false
+}
+
+// ForSubject is the intent as it applies to ONE subject (identity account
+// id): services an owner-scoped retain keeps for this subject leave Remove
+// and join Retain (unscoped, as if retained for the whole policy); scoped
+// retains of other subjects are dropped. Every per-target consumer --
+// compilation, the canary health check, observation -- reads this, never the
+// policy-wide lists, so one owner's retain never changes another owner's
+// role (fix/p3-tidy).
+func (r RightSizeIntent) ForSubject(identityAccountID string) RightSizeIntent {
+	out := r
+	kept := map[string]bool{}
+	out.Retain = []RetainEntry{}
+	for _, e := range r.Retain {
+		if !e.AppliesTo(identityAccountID) {
+			continue
+		}
+		if len(e.Subjects) > 0 {
+			kept[e.Service] = true
+			e.Subjects = nil
+		}
+		out.Retain = append(out.Retain, e)
+	}
+	sort.SliceStable(out.Retain, func(i, j int) bool { return out.Retain[i].Service < out.Retain[j].Service })
+	out.Remove = []RemoveEntry{}
+	for _, e := range r.Remove {
+		if !kept[e.Service] {
+			out.Remove = append(out.Remove, e)
+		}
+	}
+	return out
 }
 
 // IntentRoute is a resource-policy route named on a removal (§2.7, §3.4).
@@ -323,16 +375,41 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 		roles[s.RoleID] = true
 	}
 
-	retained := map[string]bool{}
+	subjectIDs := map[string]bool{}
+	for _, s := range r.Subjects {
+		subjectIDs[s.IdentityAccountID] = true
+	}
+	retained := map[string]bool{}          // unscoped (every subject)
+	scoped := map[string]map[string]bool{} // service -> subjects an owner retains it for
 	for i, e := range r.Retain {
 		f := fmt.Sprintf("retain[%d]", i)
 		if !reService.MatchString(e.Service) {
 			c.add(f+".service", "invalid", "must be an IAM service namespace")
 		}
-		if retained[e.Service] {
-			c.add(f+".service", "duplicate", "service %s is retained twice", e.Service)
+		if len(e.Subjects) > 0 {
+			// An owner-scoped retain (§2.9, §7.4): its service may still be
+			// removed for the other subjects.
+			if e.Basis != RetainOwner {
+				c.add(f+".subjects", "invalid", "only an owner retain is scoped to subjects")
+			}
+			if scoped[e.Service] == nil {
+				scoped[e.Service] = map[string]bool{}
+			}
+			for j, s := range e.Subjects {
+				if !subjectIDs[s] {
+					c.add(fmt.Sprintf("%s.subjects[%d]", f, j), "invalid", "%s is not a subject of this intent", s)
+				}
+				if scoped[e.Service][s] {
+					c.add(fmt.Sprintf("%s.subjects[%d]", f, j), "duplicate", "service %s is retained twice for %s", e.Service, s)
+				}
+				scoped[e.Service][s] = true
+			}
+		} else {
+			if retained[e.Service] {
+				c.add(f+".service", "duplicate", "service %s is retained twice", e.Service)
+			}
+			retained[e.Service] = true
 		}
-		retained[e.Service] = true
 		switch e.Basis {
 		case RetainObserved:
 			if e.LastAttempt == "" || !validDate(e.LastAttempt) {
@@ -355,8 +432,19 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 		}
 	}
 
+	for svc := range scoped {
+		if retained[svc] {
+			c.add("retain", "duplicate", "service %s is retained for every subject and again for some", svc)
+		}
+	}
 	if len(r.Remove) == 0 {
 		c.add("remove", "required", "a right_size_services intent removes at least one service")
+	}
+	// Each subject still removes something once its owners' retains apply.
+	for i, s := range r.Subjects {
+		if len(r.Remove) > 0 && len(r.ForSubject(s.IdentityAccountID).Remove) == 0 {
+			c.add(fmt.Sprintf("subjects[%d]", i), "nothing_to_remove", "the owners' retains leave nothing to remove for role %s", s.RoleID)
+		}
 	}
 	removed := map[string]bool{}
 	for i, e := range r.Remove {

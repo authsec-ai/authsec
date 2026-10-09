@@ -278,6 +278,7 @@ func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, ws, dep
 		in.AppliedAt = d.AppliedAt.UTC()
 	}
 	if intent, err := storedRightSize(v); err == nil {
+		intent = intent.ForSubject(c.IdentityAccountID.String())
 		for _, r := range intent.Remove {
 			in.Removed = append(in.Removed, r.Service)
 		}
