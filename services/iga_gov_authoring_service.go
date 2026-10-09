@@ -1515,7 +1515,10 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	intent, rec := a.recommend(ws, roles, remove, settings, req.Delivery, ctxObj)
+	intent, rec, err := a.recommend(ws, roles, remove, settings, req.Delivery, ctxObj)
+	if err != nil {
+		return nil, err
+	}
 	rec.Warnings = append(rec.Warnings, warnings...)
 	rec.Context = ctxObj
 	if err := igagov.ValidateIntent(igagov.Intent{Kind: igagov.IntentRightSizeServices, RightSize: &intent}); err != nil {
@@ -1728,7 +1731,9 @@ func removableServices(f igagov.BundleFacts, basis *bundleBasis) []string {
 }
 
 // recommend builds the intent and the recommendation from the final bundles.
-func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation) {
+// A database error is returned, never swallowed: an intent built from a
+// failed read would silently omit the findings it addresses.
+func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation, error) {
 	rec := ProposalRecommendation{Retain: []igagov.RetainEntry{}, Remove: []igagov.RemoveEntry{}, Consumers: []ConsumerView{},
 		IndependentGrants: []IndependentGrant{}, ResourcePolicyRoutes: []ProposalRoute{}, Warnings: []string{}}
 	in := igagov.RightSizeIntent{Kind: igagov.IntentRightSizeServices, ObservationDays: settings.DefaultObservationDays,
@@ -1856,9 +1861,11 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 		// role's open unused_service findings of the removed services).
 		if r.findings == nil {
 			var fids []uuid.UUID
-			_ = a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
+			if err := a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
 			               AND detail_key IN ? AND status IN ('open','reopened')`,
-				ws, id.ID, igagov.KindUnusedService, remove).Scan(&fids)
+				ws, id.ID, igagov.KindUnusedService, remove).Scan(&fids).Error; err != nil {
+				return in, rec, fmt.Errorf("findings addressed by the proposal for %s: %w", id.RoleID, err)
+			}
 			for _, f := range fids {
 				findingIDs[f.String()] = true
 			}
@@ -1916,7 +1923,7 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 	}
 	sort.Strings(in.FindingIDs)
 	rec.Remove, rec.Retain = in.Remove, in.Retain
-	return in, rec
+	return in, rec, nil
 }
 
 // currentBoundary is the role's boundary at the evaluated revision ("" =

@@ -586,9 +586,10 @@ func ClassifyOpResponse(p Plan, opIndex int, kind ResponseKind, errorCode string
 	case RespNoAnswer:
 		return OpOutcome{OutcomeUnknown, "no_answer_not_retried"}
 	}
-	switch errorCode {
-	case "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException":
+	if IsIAMThrottle(errorCode) {
 		return OpOutcome{OutcomeRetryable, "throttled"}
+	}
+	switch errorCode {
 	case "ServiceFailure", "InternalFailure", "ServiceUnavailable":
 		return OpOutcome{OutcomeUnknown, "service_failure_not_retried"}
 	}
@@ -662,7 +663,36 @@ func ClassifyOpResponse(p Plan, opIndex int, kind ResponseKind, errorCode string
 		}
 	}
 	if errorCode == "LimitExceeded" {
-		return OpOutcome{OutcomeRetryable, "rate_limited"}
+		// IAM's LimitExceeded (HTTP 409) is a QUOTA, not a rate: "the
+		// request was rejected because it attempted to create resources
+		// beyond the current AWS account limits" (IAM API reference,
+		// CreatePolicy / CreatePolicyVersion / PutRolePermissionsBoundary
+		// errors). Retrying cannot succeed until someone frees quota, so it
+		// is terminal. IAM rate limiting is a different code (Throttling;
+		// IsIAMThrottle).
+		return OpOutcome{OutcomeTerminal, "quota_exceeded"}
 	}
 	return OpOutcome{OutcomeTerminal, errorCode}
+}
+
+// IsIAMThrottle reports whether an AWS error code is a RATE limit -- the
+// request was refused before it was applied, so a new attempt may follow
+// (§8.5). IAM answers throttling with `Throttling` (the API reference's
+// common errors spell it ThrottlingException, HTTP 400); RequestLimitExceeded
+// and TooManyRequestsException are the SDK's other throttle codes for the
+// same condition.
+//
+// DECISION (fix/p3-tidy): §8.5's table groups "`Throttling`, `LimitExceeded`
+// rate errors" together, but IAM's LimitExceeded is an account QUOTA
+// (HTTP 409: "attempted to create resources beyond the current AWS account
+// limits"; e.g. a managed policy's 5 versions, attached-policy or
+// policy-count limits). It is NOT a throttle and never retryable here;
+// ClassifyOpResponse makes it terminal (quota_exceeded, or
+// version_limit_after_prune for CreatePolicyVersion).
+func IsIAMThrottle(errorCode string) bool {
+	switch errorCode {
+	case "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException":
+		return true
+	}
+	return false
 }
