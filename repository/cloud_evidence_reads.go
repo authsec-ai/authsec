@@ -47,6 +47,14 @@ func (CloudEvidenceReads) Runs(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) ([]Cl
 	return out, err
 }
 
+// ResourcePolicyWorkspaces lists the workspaces holding any resource-policy
+// evidence (the daily prune_evidence job's subjects, §3.9 "Retention").
+func (CloudEvidenceReads) ResourcePolicyWorkspaces(tx *gorm.DB) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	err := tx.Raw(`SELECT DISTINCT workspace_id FROM cloud_resource_policy_coverage ORDER BY workspace_id`).Scan(&out).Error
+	return out, err
+}
+
 // ResourcePolicyCoverageRow is one cloud_resource_policy_coverage row.
 type ResourcePolicyCoverageRow struct {
 	ScanRunID    uuid.UUID

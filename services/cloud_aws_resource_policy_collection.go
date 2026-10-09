@@ -360,8 +360,8 @@ func LoadResourcePolicyEvidence(db *gorm.DB, workspaceID, scanRunID uuid.UUID) (
 
 // PruneResourcePolicyEvidence is the prune_evidence job's resource-policy
 // half (§3.9 "Retention"), with the workspace's evidence_retention_revs
-// (055; default 30 when the workspace has no settings row). T3.08 schedules
-// it daily.
+// (055; default 30 when the workspace has no settings row). The daily
+// prune_evidence job (iga_gov_prune_evidence.go) calls it.
 func PruneResourcePolicyEvidence(db *gorm.DB, workspaceID uuid.UUID) (repositories.PruneEvidenceResult, error) {
 	settings, err := repositories.NewIGAGovSettingsRepository(db).Get(workspaceID)
 	if err != nil {

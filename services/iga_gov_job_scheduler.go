@@ -25,7 +25,7 @@ import (
 // Each schedule names a kind, an interval and a Due query listing the
 // subjects. The built-in schedules (DefaultPolicyJobSchedules) are the ones
 // §8.1 drives from state this schema already has; a later task adds its own
-// with Add (prune_evidence belongs to T3.06, verify_binding to T3.09, whose
+// with Add (prune_evidence is added by RegisterPruneEvidenceJob; verify_binding belongs to T3.09, whose
 // binding table an IGA file may not name; metrics_rollup is added by
 // RegisterMetricsJobs, T3.18).
 type PolicyJobScheduler struct {
