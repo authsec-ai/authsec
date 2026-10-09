@@ -135,8 +135,9 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 			added++
 		}
 	}
-	if added != 43 {
-		t.Errorf("047-056 added %d tables, want 43", added)
+	// 047-056 add 43 tables; 057_tidy_eval_pruned (fix/p3-tidy) one more.
+	if added != 44 {
+		t.Errorf("047-057 added %d tables, want 44", added)
 	}
 	if got := s.val(legacyRows); got != rowsBefore {
 		t.Errorf("legacy agent_policies rows changed: %s -> %s", rowsBefore, got)

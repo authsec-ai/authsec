@@ -129,6 +129,17 @@ type IGAGovEvaluation struct {
 
 func (IGAGovEvaluation) TableName() string { return "iga_gov_evaluation" }
 
+// IGAGovEvaluationPruned records that an evaluation's evidence and results
+// were pruned (057): a read at that revision is 410 revision_not_retained
+// whatever the retention setting has become since.
+type IGAGovEvaluationPruned struct {
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;primaryKey"`
+	Rev         int64     `json:"rev" gorm:"primaryKey"`
+	PrunedAt    time.Time `json:"pruned_at" gorm:"not null;default:now()"`
+}
+
+func (IGAGovEvaluationPruned) TableName() string { return "iga_gov_evaluation_pruned" }
+
 // IGAGovActivityEvidence is the activity fact the evaluator relied on for one
 // role and service at one revision, copied out of the mutable cloud_usage.
 // ScanRunID is the role connector's run named in the revision's manifest;
