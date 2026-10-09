@@ -481,7 +481,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 	approverTok := api.token(g.ws, g.approver, g.membershipOf(g.approver), all)
 	ownerTok := api.token(g.ws, u1, m1, "")
 
-	var ownerID, ruleID, reviewID string
+	var ownerID, ruleID, reviewID, findingRuleID, findingID string
 	type step struct {
 		route string // "METHOD <registered path>"
 		call  func() (method, path, tok string, body any)
@@ -521,6 +521,28 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		}, nil},
 		{"PUT " + prefix + "/settings", func() (string, string, string, any) {
 			return http.MethodPut, "/settings", adminTok, map[string]any{"canary_hours": 72}
+		}, nil},
+		// §7.1 finding rules and exceptions (review fix R1a P2).
+		{"POST " + prefix + "/finding-rules", func() (string, string, string, any) {
+			return http.MethodPost, "/finding-rules", adminTok, map[string]any{"kind": "require_review_date",
+				"scope": map[string]any{"stages": []string{"production"}}}
+		}, func(body map[string]any) { findingRuleID = digs(body, "data", "id") }},
+		{"PATCH " + prefix + "/finding-rules/:id", func() (string, string, string, any) {
+			return http.MethodPatch, "/finding-rules/" + findingRuleID, adminTok, map[string]any{"enabled": false}
+		}, nil},
+		{"DELETE " + prefix + "/finding-rules/:id", func() (string, string, string, any) {
+			return http.MethodDelete, "/finding-rules/" + findingRuleID, adminTok, nil
+		}, nil},
+		{"POST " + prefix + "/findings/:id/exception", func() (string, string, string, any) {
+			findingID = uuid.New().String()
+			p3exec(t, db, `INSERT INTO iga_gov_finding (id, workspace_id, fingerprint, kind, family, severity, identity_account_id, role_id,
+				detail_key, first_seen_rev, last_evaluated_rev) VALUES (?, ?, ?, 'unused_service', 'cloud_access', 'medium', ?, ?, 'sqs', 1, 1)`,
+				findingID, g.ws, "fp-walker-"+findingID, role, rid)
+			return http.MethodPost, "/findings/" + findingID + "/exception", adminTok, map[string]any{
+				"until": time.Now().Add(72 * time.Hour).UTC().Format(time.RFC3339), "reason": "walker"}
+		}, nil},
+		{"DELETE " + prefix + "/findings/:id/exception", func() (string, string, string, any) {
+			return http.MethodDelete, "/findings/" + findingID + "/exception", adminTok, nil
 		}, nil},
 	}
 	// The route table as production mounts it.

@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -284,7 +286,7 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				// proposal routes, T3.17 export and IaC delivery and T3.10/T3.15/T3.16
 				// direct enforcement: served,
 				// so true exactly when the gate is on, with no reason.
-				if (f == "findings" || f == "proposals" || f == "export" || f == "iac" || f == "enforcement") && tc.state == services.PolicyOn {
+				if (f == "findings" || f == "proposals" || f == "export") && tc.state == services.PolicyOn {
 					if p[f] != true || reasons[f] != nil {
 						t.Errorf("on: policy.%s = %v (reason %v), want true with no reason: its routes are in this build", f, p[f], reasons[f])
 					}
@@ -302,6 +304,29 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				}
 				if tc.state == services.PolicyOn && r == services.PolicyEnv+" is off" {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
+				}
+			}
+			// Review fix R1a P2: iac and enforcement are true only while this
+			// process can deliver them (the GitHub PR adapter; the deployment
+			// environment), each false with its own reason otherwise.
+			if tc.state == services.PolicyOn {
+				for f, want := range map[string]string{"iac": "GitHub App adapter", "enforcement": "deployment environment"} {
+					if r, _ := reasons[f].(string); !strings.Contains(r, want) {
+						t.Errorf("on, not installed: reasons.%s = %q, want the %s reason", f, r, want)
+					}
+				}
+				services.SetGovIaCGitHub(iacpr.NewFake())
+				services.SetGovDeployEnv(services.GovDeployEnv{AWS: p3CapsAWS{},
+					Binding: func(context.Context, uuid.UUID, uuid.UUID) error { return nil }})
+				code, body := a.get("/capabilities")
+				services.SetGovIaCGitHub(nil)
+				services.SetGovDeployEnv(services.GovDeployEnv{})
+				mustStatus(t, "/capabilities", code, body, http.StatusOK)
+				for _, f := range []string{"iac", "enforcement"} {
+					if dig(body, "data", "policy", f) != true || dig(body, "data", "policy", "reasons", f) != nil {
+						t.Errorf("installed: policy.%s = %v (reason %v), want true", f, dig(body, "data", "policy", f),
+							dig(body, "data", "policy", "reasons", f))
+					}
 				}
 			}
 			// T3.14: Slack's routes are in this build; the flag follows the
@@ -326,3 +351,81 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 		})
 	}
 }
+
+// Review fix R1a P2 "gate leaks": VerifyPolicySchema checks the triggers and
+// key CHECK / UNIQUE constraints of 047-056 by name, not only relations. A
+// dropped trigger, a DISABLED trigger and a dropped CHECK each leave the gate
+// unavailable naming the object; every probe runs in a transaction that is
+// rolled back, after which the same gate verifies.
+func TestP3PolicyGateVerifiesTriggersAndConstraints(t *testing.T) {
+	db := igaDB(t)
+	graphOn := p3GraphOn(t, db)
+	rollback := errors.New("rollback")
+	for _, tc := range []struct {
+		name, ddl, want string
+	}{
+		{"dropped trigger", `DROP TRIGGER iga_gov_event_no_update ON iga_gov_event`, "trigger iga_gov_event.iga_gov_event_no_update"},
+		{"disabled trigger", `ALTER TABLE iga_gov_attempt DISABLE TRIGGER iga_gov_attempt_transition`, "trigger iga_gov_attempt.iga_gov_attempt_transition"},
+		{"dropped check", `ALTER TABLE iga_gov_finding DROP CONSTRAINT iga_gov_finding_exception_chk`, "constraint iga_gov_finding.iga_gov_finding_exception_chk"},
+		{"dropped unique", `ALTER TABLE iga_gov_finding DROP CONSTRAINT iga_gov_finding_workspace_id_fingerprint_key`, "constraint iga_gov_finding.iga_gov_finding_workspace_id_fingerprint_key"},
+		{"056 trigger", `DROP TRIGGER cloud_rpo_immutable ON cloud_resource_policy_observation`, "trigger cloud_resource_policy_observation.cloud_rpo_immutable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := services.NewPolicyGate(true, "", graphOn)
+			err := db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Exec(tc.ddl).Error; err != nil {
+					return err
+				}
+				verr := gate.Verify(tx)
+				if verr == nil || !strings.Contains(verr.Error(), tc.want) {
+					t.Errorf("verify = %v, want it to name %s", verr, tc.want)
+				}
+				if state, reason, _ := gate.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, tc.want) || gate.Available() {
+					t.Errorf("gate %q %q, want unavailable naming %s", state, reason, tc.want)
+				}
+				return rollback
+			})
+			if !errors.Is(err, rollback) {
+				t.Fatalf("probe transaction: %v", err)
+			}
+			if err := gate.Verify(db); err != nil || !gate.Available() {
+				t.Fatalf("after the rollback the gate must verify: %v", err)
+			}
+		})
+	}
+
+	// The lists are the schema: every trigger and every named CHECK / UNIQUE
+	// constraint on a table 047-056 create is listed, and every listed name
+	// exists, so a new invariant cannot be added without the gate checking it.
+	var tables []string
+	for _, r := range services.PolicySchemaRelations() {
+		var kind string
+		db.Raw(`SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		         WHERE n.nspname = 'public' AND c.relname = ?`, r).Scan(&kind)
+		if kind == "r" {
+			tables = append(tables, r)
+		}
+	}
+	var triggers, constraints []string
+	db.Raw(`SELECT c.relname || '.' || t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+	         WHERE NOT t.tgisinternal AND c.relname IN ? ORDER BY 1`, tables).Scan(&triggers)
+	db.Raw(`SELECT c.relname || '.' || k.conname FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+	         WHERE c.relname IN ? AND (k.contype = 'u' OR (k.contype = 'c' AND k.conname LIKE '%\_chk'))
+	         ORDER BY 1`, tables).Scan(&constraints)
+	listed := map[string]bool{}
+	for _, n := range append(services.PolicySchemaTriggers(), services.PolicySchemaConstraints()...) {
+		listed[n] = true
+	}
+	for _, n := range append(triggers, constraints...) {
+		if !listed[n] {
+			t.Errorf("%s is on a Phase 3 table but VerifyPolicySchema does not check it", n)
+		}
+	}
+	if len(triggers) != len(services.PolicySchemaTriggers()) {
+		t.Errorf("%d triggers on Phase 3 tables, %d listed", len(triggers), len(services.PolicySchemaTriggers()))
+	}
+}
+
+// p3CapsAWS stands in for the deployment environment's AWS access in the
+// capabilities test: the flag reads only whether one is installed.
+type p3CapsAWS struct{ services.IGAGovAWS }

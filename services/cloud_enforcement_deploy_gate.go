@@ -80,6 +80,8 @@ func NewProductionGovDeployEnv(db *gorm.DB, vc vault.VaultClient) GovDeployEnv {
 	cfg, _ := LoadAWSCallbackConfig()
 	bind := NewEnforcementBindingService(db, vc, cfg, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
 	access := NewAWSEnforcementAccess(repositories.NewCloudConnectorRepository(db), NewAWSOnboardingService(db, vc), bind)
+	// The verify_binding job's self-tester (cloud_enforcement_binding_jobs.go).
+	SetEnforcementSelfTester(bind)
 	return GovDeployEnv{AWS: access, Binding: NewEnforcementBindingDeployGate(bind),
 		BindingState: NewEnforcementBindingDispatchCheck(bind), Trail: access}
 }

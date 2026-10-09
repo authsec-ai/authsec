@@ -128,6 +128,9 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 	prevLive := DefaultGovLiveReader()
 	prevIaC, prevExport := govDeliveryHandler(igagov.DeliveryIaCPR), govDeliveryHandler(igagov.DeliveryExport)
 	rWire := InstallGovOwnerReviewWiring(db)
+	// Slack's health-report buttons (review fix R1a P2): T3.16's
+	// health-report path, installed for the process (iga_gov_health_reporter.go).
+	rHealth := InstallGovHealthReporter(db)
 	// T3.17 IaC / export delivery behind T3.16's deploy and verify jobs. With
 	// no GitHub adapter (no Vault) a PR target falls back to export at compile
 	// time, so the handler is installed either way.
@@ -136,6 +139,7 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 	rRollout := InstallGovRolloutWiring(db)
 	rStore := SetGovNotificationChannelStore(NewGovDBChannelStore(vc))
 	restore = func() {
+		rHealth()
 		rStore()
 		rRollout()
 		RegisterGovDeliveryHandler(igagov.DeliveryIaCPR, prevIaC)

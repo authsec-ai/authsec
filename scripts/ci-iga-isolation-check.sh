@@ -187,8 +187,7 @@ IGA_FILES="$(
     # perl pass with comments stripped.
     grep -rlE --include='*.go' --exclude-dir=.git --exclude-dir=vendor --exclude-dir=node_modules \
         'iga_[a-z0-9_]+' . 2>/dev/null | sed 's|^\./||' | perl -e "$SQLSCAN" names
-  } | grep -v '_test\.go$' | sort -u | grep -vxF -f <(printf '%s
-' "${NOT_IGA[@]}")
+  } | grep -v '_test\.go$' | sort -u | grep -vxF -f <(printf '%s\n' "${NOT_IGA[@]}")
 )"
 FILE_COUNT=$(printf '%s\n' "$IGA_FILES" | grep -c . || true)
 echo "scanning ${FILE_COUNT} IGA source files (by package, content and name)"

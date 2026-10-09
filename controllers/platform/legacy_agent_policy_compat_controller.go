@@ -43,12 +43,14 @@ import (
 //   - Existence: the routes exist while IGA_LEGACY_AGENT_POLICY is on OR the
 //     workspace has legacy policies; otherwise 404 legacy_agent_policies_unavailable.
 //
-// Permissions. The spec names governance:read and governance:enforce;
-// governance:enforce does not exist yet (a later Phase 3 migration creates
-// it). These routes use what the legacy /authsec/governance/agent-policies
-// routes use for the same acts: governance:read to list (as GET
-// /agent-policies) and governance:admin to pause or remove (as DELETE
-// /agent-policies/:id). No new permission.
+// Permissions (§7.10): governance:read to list; governance:enforce to pause
+// or remove. Review fix R1a P2: these routes first used governance:admin
+// because governance:enforce did not exist yet; 055 now seeds it (bound to
+// every workspace admin role), so they use exactly what the spec names.
+// DECISION: enforce ONLY -- governance:admin alone is refused; workspace
+// admins keep working because 055 granted them governance:enforce. The
+// legacy /authsec/governance/agent-policies routes keep their own
+// permissions (§7.10: "keep their current behaviour").
 
 // legacyCompatRoute is the route bound into this list's cursors.
 const legacyCompatRoute = "legacy/agent-policies"
@@ -100,8 +102,8 @@ func MountLegacyAgentPolicyCompatRoutes(r gin.IRouter, ctl *LegacyAgentPolicyCom
 	g.Use(GraphEnvelope(auth))
 	req := GraphRequire(require)
 	g.GET("/agent-policies", req("governance", "read"), ctl.ListLegacyAgentPolicies)
-	g.POST("/agent-policies/:id/pause", req("governance", "admin"), ctl.PauseLegacyAgentPolicy)
-	g.DELETE("/agent-policies/:id", req("governance", "admin"), ctl.RemoveLegacyAgentPolicy)
+	g.POST("/agent-policies/:id/pause", req("governance", "enforce"), ctl.PauseLegacyAgentPolicy)
+	g.DELETE("/agent-policies/:id", req("governance", "enforce"), ctl.RemoveLegacyAgentPolicy)
 }
 
 func (ctl *LegacyAgentPolicyCompatController) service() *services.LegacyAgentPolicyCompat {

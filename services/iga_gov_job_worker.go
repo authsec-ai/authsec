@@ -675,6 +675,11 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// Review P2: prune_evidence, daily per workspace (dedupe
 	// ws:<id>:day:<date>, §8.1), evaluation and resource-policy evidence.
 	RegisterPruneEvidenceJob(w)
+	// T3.09 / review fix R1a P2: verify_binding, the 24-hour enforcement
+	// self-test per bound binding, and its schedule
+	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
+	// NewProductionGovDeployEnv).
+	RegisterEnforcementBindingJobs(w)
 	return w
 }
 
