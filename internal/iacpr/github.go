@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,7 +49,35 @@ type PullRequestInput struct {
 	Body          string
 	CommitMessage string
 	Files         []FileChange
+	// ResumeSHA is the commit an earlier, interrupted attempt created and
+	// the caller recorded (iga_gov_iac_change.proposed_sha while opening): a
+	// branch whose head is this commit is this change's and is reused.
+	ResumeSHA string
+	// OnStep is called BEFORE each write GitHub keeps: StepRef (the commit
+	// exists, sha known; the branch is about to be created or moved) and
+	// StepPull (the branch exists at sha; the PR is about to be created).
+	// The caller records its intent there, so a crash between any two
+	// writes is resumed from what was recorded and what GitHub shows by
+	// branch name. An error aborts before the write.
+	OnStep func(ctx context.Context, step, sha string) error
 }
+
+// Steps of opening or updating a PR (PullRequestInput.OnStep).
+const (
+	StepRef  = "ref"
+	StepPull = "pull"
+)
+
+func (in PullRequestInput) step(ctx context.Context, step, sha string) error {
+	if in.OnStep == nil {
+		return nil
+	}
+	return in.OnStep(ctx, step, sha)
+}
+
+// ErrBranchConflict: the PR branch exists with a head AuthSec did not
+// create; it is never reused or overwritten.
+var ErrBranchConflict = errors.New("iacpr: the branch exists with a commit AuthSec did not create")
 
 // PullRequest is an opened PR.
 type PullRequest struct {
@@ -70,6 +99,9 @@ type ApplyRun struct {
 // PullRequestState is a PR as GitHub reports it now.
 type PullRequestState struct {
 	Number    int
+	Title     string
+	Body      string
+	Branch    string
 	State     string // open | closed
 	Merged    bool
 	MergedSHA string
@@ -93,6 +125,30 @@ type GitHub interface {
 	// PullRequestState reads a PR, its first approving review and, when
 	// merged, the runs reported for the merge commit.
 	PullRequestState(ctx context.Context, repo RepoRef, number int) (PullRequestState, error)
+	// UpdatePullRequest re-commits the change on in.BaseSHA, moves the PR's
+	// branch (in.Branch) to it and replaces the title and body.
+	UpdatePullRequest(ctx context.Context, repo RepoRef, number int, in PullRequestInput) (PullRequest, error)
+	// ClosePullRequest comments the reason and closes the PR unmerged.
+	ClosePullRequest(ctx context.Context, repo RepoRef, number int, comment string) error
+}
+
+// APIBase is the REST API root of a GitHub host: api.github.com for
+// github.com, https://<host>/api/v3 for GitHub Enterprise Server. fallback
+// (REST.BaseURL) is used for github.com only, so an integration on a GHES
+// host never talks to github.com.
+func APIBase(providerHost, fallback string) string {
+	h := strings.TrimRight(strings.TrimSpace(providerHost), "/")
+	switch strings.ToLower(h) {
+	case "", "github.com", "api.github.com", "https://github.com", "https://api.github.com":
+		if fallback != "" {
+			return strings.TrimRight(fallback, "/")
+		}
+		return "https://api.github.com"
+	}
+	if !strings.HasPrefix(h, "https://") && !strings.HasPrefix(h, "http://") {
+		h = "https://" + h
+	}
+	return h + "/api/v3"
 }
 
 // Permissions the App needs for J2 (requested when an IaC source is mapped).
@@ -119,6 +175,10 @@ type Fake struct {
 	seq   int
 	// Fail makes the next call of a method fail (consumed once).
 	Fail map[string]error
+	// CrashAfter injects a crash AFTER a step's write (consumed once):
+	// StepRef -- the branch was created, the PR was not (the process "died"
+	// between POST git/refs and POST pulls).
+	CrashAfter map[string]bool
 	// Calls counts calls by method.
 	Calls map[string]int
 }
@@ -126,6 +186,7 @@ type Fake struct {
 type fakeRepo struct {
 	branches map[string]string            // branch -> commit
 	commits  map[string]map[string]string // commit -> files
+	messages map[string]string            // commit -> message
 	prs      map[int]*fakePR
 	runs     map[string][]ApplyRun // commit -> runs
 	next     int
@@ -142,17 +203,22 @@ type fakePR struct {
 	reviews  []string // head SHAs of approving reviews
 	title    string
 	body     string
+	comments []string
 }
+
+// ErrInjectedCrash is what a CrashAfter step returns.
+var ErrInjectedCrash = errors.New("iacpr fake: injected crash")
 
 // NewFake builds an empty fake.
 func NewFake() *Fake {
-	return &Fake{repos: map[string]*fakeRepo{}, Fail: map[string]error{}, Calls: map[string]int{}}
+	return &Fake{repos: map[string]*fakeRepo{}, Fail: map[string]error{}, CrashAfter: map[string]bool{}, Calls: map[string]int{}}
 }
 
 func (f *Fake) repo(name string) *fakeRepo {
 	r := f.repos[name]
 	if r == nil {
-		r = &fakeRepo{branches: map[string]string{}, commits: map[string]map[string]string{}, prs: map[int]*fakePR{}, runs: map[string][]ApplyRun{}}
+		r = &fakeRepo{branches: map[string]string{}, commits: map[string]map[string]string{}, messages: map[string]string{}, prs: map[int]*fakePR{},
+			runs: map[string][]ApplyRun{}}
 		f.repos[name] = r
 	}
 	return r
@@ -300,8 +366,10 @@ func (f *Fake) ReadDirectory(_ context.Context, repo RepoRef, ref, dir string) (
 	return out, nil
 }
 
-// OpenPullRequest implements GitHub.
-func (f *Fake) OpenPullRequest(_ context.Context, repo RepoRef, in PullRequestInput) (PullRequest, error) {
+// OpenPullRequest implements GitHub with the REST adapter's protocol: the
+// PR by branch, else the branch (reused only when it is this change's),
+// else a commit, OnStep(StepRef), the branch, OnStep(StepPull), the PR.
+func (f *Fake) OpenPullRequest(ctx context.Context, repo RepoRef, in PullRequestInput) (PullRequest, error) {
 	if err := f.fail("OpenPullRequest"); err != nil {
 		return PullRequest{}, err
 	}
@@ -311,9 +379,41 @@ func (f *Fake) OpenPullRequest(_ context.Context, repo RepoRef, in PullRequestIn
 			return PullRequest{Number: pr.number, URL: fakeURL(repo.FullName, pr.number), HeadSHA: r.branches[pr.branch]}, nil
 		}
 	}
+	head, exists := r.branches[in.Branch]
+	if exists {
+		if !(in.ResumeSHA != "" && head == in.ResumeSHA) && r.messages[head] != in.CommitMessage {
+			return PullRequest{}, fmt.Errorf("%w: %s at %s", ErrBranchConflict, in.Branch, head)
+		}
+	} else {
+		s, err := f.commitOn(r, in)
+		if err != nil {
+			return PullRequest{}, err
+		}
+		if err := in.step(ctx, StepRef, s); err != nil {
+			return PullRequest{}, err
+		}
+		f.Calls["CreateRef"]++
+		r.branches[in.Branch] = s
+		head = s
+		if f.CrashAfter[StepRef] {
+			delete(f.CrashAfter, StepRef)
+			return PullRequest{}, ErrInjectedCrash
+		}
+	}
+	if err := in.step(ctx, StepPull, head); err != nil {
+		return PullRequest{}, err
+	}
+	f.Calls["CreatePull"]++
+	r.next++
+	pr := &fakePR{number: r.next, branch: in.Branch, base: in.BaseBranch, state: "open", title: in.Title, body: in.Body}
+	r.prs[pr.number] = pr
+	return PullRequest{Number: pr.number, URL: fakeURL(repo.FullName, pr.number), HeadSHA: head}, nil
+}
+
+func (f *Fake) commitOn(r *fakeRepo, in PullRequestInput) (string, error) {
 	base := r.commits[in.BaseSHA]
 	if base == nil {
-		return PullRequest{}, fmt.Errorf("base commit %s not found", in.BaseSHA)
+		return "", fmt.Errorf("base commit %s not found", in.BaseSHA)
 	}
 	files := map[string]string{}
 	for k, v := range base {
@@ -324,11 +424,68 @@ func (f *Fake) OpenPullRequest(_ context.Context, repo RepoRef, in PullRequestIn
 	}
 	s := f.sha()
 	r.commits[s] = files
-	r.branches[in.Branch] = s
-	r.next++
-	pr := &fakePR{number: r.next, branch: in.Branch, base: in.BaseBranch, state: "open", title: in.Title, body: in.Body}
-	r.prs[pr.number] = pr
-	return PullRequest{Number: pr.number, URL: fakeURL(repo.FullName, pr.number), HeadSHA: s}, nil
+	r.messages[s] = in.CommitMessage
+	return s, nil
+}
+
+// UpdatePullRequest implements GitHub.
+func (f *Fake) UpdatePullRequest(ctx context.Context, repo RepoRef, number int, in PullRequestInput) (PullRequest, error) {
+	if err := f.fail("UpdatePullRequest"); err != nil {
+		return PullRequest{}, err
+	}
+	r := f.repo(repo.FullName)
+	pr := r.prs[number]
+	if pr == nil {
+		return PullRequest{}, fmt.Errorf("pull request %d not found", number)
+	}
+	s, err := f.commitOn(r, in)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	if err := in.step(ctx, StepRef, s); err != nil {
+		return PullRequest{}, err
+	}
+	r.branches[pr.branch] = s
+	pr.title, pr.body = in.Title, in.Body
+	return PullRequest{Number: number, URL: fakeURL(repo.FullName, number), HeadSHA: s}, nil
+}
+
+// ClosePullRequest implements GitHub.
+func (f *Fake) ClosePullRequest(_ context.Context, repo RepoRef, number int, comment string) error {
+	if err := f.fail("ClosePullRequest"); err != nil {
+		return err
+	}
+	pr := f.repo(repo.FullName).prs[number]
+	if pr == nil {
+		return fmt.Errorf("pull request %d not found", number)
+	}
+	if comment != "" {
+		pr.comments = append(pr.comments, comment)
+	}
+	pr.state = "closed"
+	return nil
+}
+
+// PRComments are the comments AuthSec left on a PR.
+func (f *Fake) PRComments(repo string, number int) []string {
+	if pr := f.repo(repo).prs[number]; pr != nil {
+		return append([]string{}, pr.comments...)
+	}
+	return nil
+}
+
+// HasBranch reports whether a branch exists.
+func (f *Fake) HasBranch(repo, branch string) bool {
+	_, ok := f.repo(repo).branches[branch]
+	return ok
+}
+
+// PRState is a PR's state (open | closed).
+func (f *Fake) PRState(repo string, number int) string {
+	if pr := f.repo(repo).prs[number]; pr != nil {
+		return pr.state
+	}
+	return ""
 }
 
 // PullRequestState implements GitHub.
@@ -341,7 +498,7 @@ func (f *Fake) PullRequestState(_ context.Context, repo RepoRef, number int) (Pu
 	if pr == nil {
 		return PullRequestState{}, fmt.Errorf("pull request %d not found", number)
 	}
-	st := PullRequestState{Number: number, State: pr.state, Merged: pr.merged, MergedSHA: pr.mergeSHA, MergedAt: pr.mergedAt,
+	st := PullRequestState{Number: number, Title: pr.title, Body: pr.body, Branch: pr.branch, State: pr.state, Merged: pr.merged, MergedSHA: pr.mergeSHA, MergedAt: pr.mergedAt,
 		HeadSHA: r.branches[pr.branch]}
 	if len(pr.reviews) > 0 {
 		st.FirstApprovalSHA = pr.reviews[0]
@@ -362,7 +519,10 @@ func fakeURL(repo string, n int) string {
 // token. It is not exercised by tests against GitHub (no real calls); its
 // transport errors are returned as they are.
 type REST struct {
-	BaseURL string // https://api.github.com, or a GHES API root
+	// BaseURL is the github.com API root (default https://api.github.com);
+	// a repository on a GitHub Enterprise Server host (RepoRef.ProviderHost)
+	// is always addressed at https://<host>/api/v3 (APIBase).
+	BaseURL string
 	HTTP    *http.Client
 	// Token mints an installation token for the repository's installation.
 	Token func(ctx context.Context, repo RepoRef) (string, error)
@@ -383,11 +543,7 @@ func (g *REST) do(ctx context.Context, repo RepoRef, method, p string, body any,
 		}
 		rd = bytes.NewReader(b)
 	}
-	base := g.BaseURL
-	if base == "" {
-		base = "https://api.github.com"
-	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+p, rd)
+	req, err := http.NewRequestWithContext(ctx, method, APIBase(repo.ProviderHost, g.BaseURL)+p, rd)
 	if err != nil {
 		return 0, err
 	}
@@ -483,8 +639,70 @@ func escapePath(p string) string {
 }
 
 // OpenPullRequest implements GitHub (git data API: blobs, tree, commit, ref;
-// then the PR).
+// then the PR). It is crash-safe: every state GitHub keeps is findable by
+// the branch name, and the caller records intent before each write
+// (in.OnStep). A run that died after POST git/refs and before POST pulls is
+// resumed by the next call: the PR is looked up by branch, then the branch
+// ref; a branch whose head is the recorded commit (in.ResumeSHA) or a commit
+// with this change's message is reused, and only the PR is created. A
+// branch AuthSec did not create is ErrBranchConflict, never overwritten.
 func (g *REST) OpenPullRequest(ctx context.Context, repo RepoRef, in PullRequestInput) (PullRequest, error) {
+	if pr, ok, err := g.findPull(ctx, repo, in.Branch); err != nil || ok {
+		return pr, err
+	}
+	head, exists, err := g.branchHead(ctx, repo, in.Branch)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	if exists {
+		if err := g.ownBranch(ctx, repo, head, in); err != nil {
+			return PullRequest{}, err
+		}
+	} else {
+		sha, err := g.commitFiles(ctx, repo, in.BaseSHA, in.CommitMessage, in.Files)
+		if err != nil {
+			return PullRequest{}, err
+		}
+		if err := in.step(ctx, StepRef, sha); err != nil {
+			return PullRequest{}, err
+		}
+		status, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/git/refs",
+			map[string]string{"ref": "refs/heads/" + in.Branch, "sha": sha}, nil)
+		if err != nil && status != http.StatusUnprocessableEntity {
+			return PullRequest{}, err
+		}
+		if err != nil { // created meanwhile (a concurrent or replayed attempt)
+			if head, exists, err = g.branchHead(ctx, repo, in.Branch); err != nil || !exists {
+				return PullRequest{}, fmt.Errorf("github: branch %s: %v", in.Branch, err)
+			}
+			if err := g.ownBranch(ctx, repo, head, in); err != nil {
+				return PullRequest{}, err
+			}
+		} else {
+			head = sha
+		}
+	}
+	if err := in.step(ctx, StepPull, head); err != nil {
+		return PullRequest{}, err
+	}
+	var pr struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	status, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/pulls",
+		map[string]any{"title": in.Title, "head": in.Branch, "base": in.BaseBranch, "body": in.Body}, &pr)
+	if err != nil {
+		if status == http.StatusUnprocessableEntity { // "A pull request already exists"
+			if found, ok, ferr := g.findPull(ctx, repo, in.Branch); ferr == nil && ok {
+				return found, nil
+			}
+		}
+		return PullRequest{}, err
+	}
+	return PullRequest{Number: pr.Number, URL: pr.HTMLURL, HeadSHA: head}, nil
+}
+
+func (g *REST) findPull(ctx context.Context, repo RepoRef, branch string) (PullRequest, bool, error) {
 	owner := strings.SplitN(repo.FullName, "/", 2)[0]
 	var existing []struct {
 		Number  int    `json:"number"`
@@ -493,19 +711,61 @@ func (g *REST) OpenPullRequest(ctx context.Context, repo RepoRef, in PullRequest
 			SHA string `json:"sha"`
 		} `json:"head"`
 	}
-	if _, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/pulls?state=all&head="+url.QueryEscape(owner+":"+in.Branch), nil, &existing); err != nil {
-		return PullRequest{}, err
+	if _, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/pulls?state=all&head="+url.QueryEscape(owner+":"+branch), nil, &existing); err != nil {
+		return PullRequest{}, false, err
 	}
-	if len(existing) > 0 {
-		return PullRequest{Number: existing[0].Number, URL: existing[0].HTMLURL, HeadSHA: existing[0].Head.SHA}, nil
+	if len(existing) == 0 {
+		return PullRequest{}, false, nil
 	}
+	return PullRequest{Number: existing[0].Number, URL: existing[0].HTMLURL, HeadSHA: existing[0].Head.SHA}, true, nil
+}
+
+// branchHead reads refs/heads/<branch>; exists is false on 404.
+func (g *REST) branchHead(ctx context.Context, repo RepoRef, branch string) (string, bool, error) {
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	status, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/git/ref/heads/"+escapePath(branch), nil, &ref)
+	if status == http.StatusNotFound {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return ref.Object.SHA, true, nil
+}
+
+// ownBranch: the branch's head is the commit an earlier attempt recorded,
+// or a commit carrying this change's message (the attempt died before it
+// could record it).
+func (g *REST) ownBranch(ctx context.Context, repo RepoRef, head string, in PullRequestInput) error {
+	if in.ResumeSHA != "" && head == in.ResumeSHA {
+		return nil
+	}
+	var c struct {
+		Message string `json:"message"`
+	}
+	if _, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/git/commits/"+head, nil, &c); err != nil {
+		return err
+	}
+	if c.Message != in.CommitMessage {
+		return fmt.Errorf("%w: %s at %s", ErrBranchConflict, in.Branch, head)
+	}
+	return nil
+}
+
+// commitFiles writes the files as one commit on parent (blobs, tree,
+// commit); nothing is visible on a branch yet.
+func (g *REST) commitFiles(ctx context.Context, repo RepoRef, parent, message string, files []FileChange) (string, error) {
 	var base struct {
 		Tree struct {
 			SHA string `json:"sha"`
 		} `json:"tree"`
 	}
-	if _, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/git/commits/"+in.BaseSHA, nil, &base); err != nil {
-		return PullRequest{}, err
+	if _, err := g.do(ctx, repo, http.MethodGet, repoPath(repo)+"/git/commits/"+parent, nil, &base); err != nil {
+		return "", err
 	}
 	type treeEntry struct {
 		Path string `json:"path"`
@@ -514,13 +774,13 @@ func (g *REST) OpenPullRequest(ctx context.Context, repo RepoRef, in PullRequest
 		SHA  string `json:"sha"`
 	}
 	var tree []treeEntry
-	for _, fc := range in.Files {
+	for _, fc := range files {
 		var blob struct {
 			SHA string `json:"sha"`
 		}
 		if _, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/git/blobs",
 			map[string]string{"content": fc.After, "encoding": "utf-8"}, &blob); err != nil {
-			return PullRequest{}, err
+			return "", err
 		}
 		tree = append(tree, treeEntry{Path: fc.Path, Mode: "100644", Type: "blob", SHA: blob.SHA})
 	}
@@ -528,46 +788,77 @@ func (g *REST) OpenPullRequest(ctx context.Context, repo RepoRef, in PullRequest
 		SHA string `json:"sha"`
 	}
 	if _, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/git/trees", map[string]any{"base_tree": base.Tree.SHA, "tree": tree}, &nt); err != nil {
-		return PullRequest{}, err
+		return "", err
 	}
 	var commit struct {
 		SHA string `json:"sha"`
 	}
 	if _, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/git/commits",
-		map[string]any{"message": in.CommitMessage, "tree": nt.SHA, "parents": []string{in.BaseSHA}}, &commit); err != nil {
+		map[string]any{"message": message, "tree": nt.SHA, "parents": []string{parent}}, &commit); err != nil {
+		return "", err
+	}
+	return commit.SHA, nil
+}
+
+// UpdatePullRequest implements GitHub: the change is re-committed on
+// in.BaseSHA (the base branch's current head), the PR branch is moved to it
+// and the title and body are replaced.
+func (g *REST) UpdatePullRequest(ctx context.Context, repo RepoRef, number int, in PullRequestInput) (PullRequest, error) {
+	sha, err := g.commitFiles(ctx, repo, in.BaseSHA, in.CommitMessage, in.Files)
+	if err != nil {
 		return PullRequest{}, err
 	}
-	if _, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/git/refs",
-		map[string]string{"ref": "refs/heads/" + in.Branch, "sha": commit.SHA}, nil); err != nil {
+	if err := in.step(ctx, StepRef, sha); err != nil {
+		return PullRequest{}, err
+	}
+	if _, err := g.do(ctx, repo, http.MethodPatch, repoPath(repo)+"/git/refs/heads/"+escapePath(in.Branch),
+		map[string]any{"sha": sha, "force": true}, nil); err != nil {
 		return PullRequest{}, err
 	}
 	var pr struct {
 		Number  int    `json:"number"`
 		HTMLURL string `json:"html_url"`
 	}
-	if _, err := g.do(ctx, repo, http.MethodPost, repoPath(repo)+"/pulls",
-		map[string]any{"title": in.Title, "head": in.Branch, "base": in.BaseBranch, "body": in.Body}, &pr); err != nil {
+	if _, err := g.do(ctx, repo, http.MethodPatch, fmt.Sprintf("%s/pulls/%d", repoPath(repo), number),
+		map[string]any{"title": in.Title, "body": in.Body}, &pr); err != nil {
 		return PullRequest{}, err
 	}
-	return PullRequest{Number: pr.Number, URL: pr.HTMLURL, HeadSHA: commit.SHA}, nil
+	return PullRequest{Number: number, URL: pr.HTMLURL, HeadSHA: sha}, nil
+}
+
+// ClosePullRequest implements GitHub: a comment with the reason, then the PR
+// is closed unmerged.
+func (g *REST) ClosePullRequest(ctx context.Context, repo RepoRef, number int, comment string) error {
+	if comment != "" {
+		if _, err := g.do(ctx, repo, http.MethodPost, fmt.Sprintf("%s/issues/%d/comments", repoPath(repo), number),
+			map[string]string{"body": comment}, nil); err != nil {
+			return err
+		}
+	}
+	_, err := g.do(ctx, repo, http.MethodPatch, fmt.Sprintf("%s/pulls/%d", repoPath(repo), number), map[string]string{"state": "closed"}, nil)
+	return err
 }
 
 // PullRequestState implements GitHub.
 func (g *REST) PullRequestState(ctx context.Context, repo RepoRef, number int) (PullRequestState, error) {
 	var pr struct {
+		Title          string     `json:"title"`
+		Body           string     `json:"body"`
 		State          string     `json:"state"`
 		Merged         bool       `json:"merged"`
 		MergeCommitSHA string     `json:"merge_commit_sha"`
 		MergedAt       *time.Time `json:"merged_at"`
 		Head           struct {
 			SHA string `json:"sha"`
+			Ref string `json:"ref"`
 		} `json:"head"`
 	}
 	p := fmt.Sprintf("%s/pulls/%d", repoPath(repo), number)
 	if _, err := g.do(ctx, repo, http.MethodGet, p, nil, &pr); err != nil {
 		return PullRequestState{}, err
 	}
-	st := PullRequestState{Number: number, State: pr.State, Merged: pr.Merged, MergedAt: pr.MergedAt, HeadSHA: pr.Head.SHA}
+	st := PullRequestState{Number: number, Title: pr.Title, Body: pr.Body, Branch: pr.Head.Ref, State: pr.State, Merged: pr.Merged,
+		MergedAt: pr.MergedAt, HeadSHA: pr.Head.SHA}
 	if pr.Merged {
 		st.MergedSHA = pr.MergeCommitSHA
 	}

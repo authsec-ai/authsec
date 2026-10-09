@@ -34,6 +34,16 @@ type IaCGitHubChannel struct {
 	InstallationID    string
 	AppRegistrationID string
 	ProviderHost      string
+	// Repositories is the discovery source's repository selection: an IaC
+	// source may map only a repository the source selects.
+	Repositories RepoSelection
+}
+
+// RepositorySelected reports whether the discovery source selects a
+// repository (owner/name, case-insensitive; mode "all" selects every
+// repository the installation grants).
+func (c *IaCGitHubChannel) RepositorySelected(fullName string) bool {
+	return c.Repositories.wants(fullName)
 }
 
 // LoadIaCGitHubChannel reads a workspace's GitHub (repo_scan) discovery
@@ -62,7 +72,7 @@ func LoadIaCGitHubChannel(db *gorm.DB, ws, sourceID uuid.UUID) (*IaCGitHubChanne
 		host = "github.com"
 	}
 	return &IaCGitHubChannel{SourceID: rows[0].ID, IntegrationID: cfg.IntegrationID, InstallationID: cfg.InstallationID,
-		AppRegistrationID: cfg.AppRegistrationID, ProviderHost: host}, nil
+		AppRegistrationID: cfg.AppRegistrationID, ProviderHost: host, Repositories: cfg.Repositories}, nil
 }
 
 // IaCConnectorFacts are the connector facts IaC delivery and isolation use.

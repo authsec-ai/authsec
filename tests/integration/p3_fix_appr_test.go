@@ -36,6 +36,7 @@ import (
 	"gorm.io/gorm"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
@@ -664,8 +665,12 @@ func fxaIsolated(t *testing.T, name string) *fxaIsolation {
 	l := newP3iLab(t, name)
 	srcName, roleID := "FxaSharedRole", "AROAFXASHAREDISO01"
 	src := l.role(srcName, roleID, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	// fix/p3-iac (P1-12 b): the split archives the source role's trust
+	// document, so the live read carries the document, not only its hash.
+	tc, th := p3iTrust(t)
 	l.live.mu.Lock()
-	l.live.roles[src].TrustPolicyHash = p3iTrustHash
+	l.live.roles[src].TrustPolicyHash = th
+	l.live.roles[src].Documents = map[string]string{th: tc}
 	l.live.mu.Unlock()
 	l.publish()
 	managed := l.a.policyARN(srcName + "Work")
@@ -674,7 +679,14 @@ func fxaIsolated(t *testing.T, name string) *fxaIsolation {
 	workload := bdbID(t, l.p2Lab, `SELECT id FROM iga_workload WHERE workspace_id = ? AND source_key = ?`, l.ws, igagraph.Key("aws", fnARN))
 	l.mapSource(iacpr.FormatTerraform, "iam", map[string]string{"iam/main.tf": fmt.Sprintf(p3iIsoTF, srcName, managed, fn)})
 	l.grantWrite()
-	policy, _ := l.isolate(srcName, roleID, "fxa-dedicated-role", workload.String(), igagov.BindingLambdaRole, fnARN)
+	// fix/p3-iac (P1-12 c): isolation is proposed only from complete
+	// migration evidence: the function's live alias on the source role.
+	lamF := &p3iLambda{latest: src, alias: "1", roles: map[string]string{"1": src}}
+	services.SetGovMigrationClients(func(context.Context, uuid.UUID, uuid.UUID, string) (awsdiscovery.MigrationClients, error) {
+		return awsdiscovery.MigrationClients{ECS: &p3iECS{services: map[string]*p3iSvc{}}, Lambda: lamF, AutoScaling: &p3iASG{}, EC2: &p3iASG{}}, nil
+	})
+	t.Cleanup(func() { services.SetGovMigrationClients(nil) })
+	policy := l.isolate(srcName, roleID, "fxa-dedicated-role", workload.String(), igagov.BindingLambdaRole, fnARN)
 	l.compile(policy, 2)
 	l.approveAll(policy, 2)
 	x := &fxaIsolation{l: l, policy: policy, version: l.versionID(policy, 2)}

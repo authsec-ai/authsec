@@ -148,10 +148,11 @@ func ReadRole(ctx context.Context, r DiscoveryIAM, roleName string) (*igagov.Liv
 	acct, part := arnAccount(info.ARN)
 	role := &igagov.LiveRole{RoleID: info.RoleID, ARN: info.ARN, Name: info.Name, Path: info.Path, AccountID: acct,
 		Partition: part, Tags: copyTags(info.Tags), BoundaryARN: info.BoundaryARN,
-		ManagedPolicies: []igagov.PolicyRef{}, InlinePolicies: []igagov.PolicyRef{}}
+		ManagedPolicies: []igagov.PolicyRef{}, InlinePolicies: []igagov.PolicyRef{}, Documents: map[string]string{}}
 	if info.TrustDocument != "" {
-		if h, err := igagov.DocumentHash(info.TrustDocument); err == nil {
+		if c, h, err := igagov.CanonicalDocument(info.TrustDocument); err == nil {
 			role.TrustPolicyHash = h
+			role.Documents[h] = string(c)
 		}
 	}
 	attached, err := r.ListAttachedRolePolicies(ctx, roleName)
@@ -182,10 +183,11 @@ func ReadRole(ctx context.Context, r DiscoveryIAM, roleName string) (*igagov.Liv
 		if err != nil {
 			return nil, fmt.Errorf("GetRolePolicy %s %s: %w", roleName, n, err)
 		}
-		h, err := igagov.DocumentHash(doc)
+		c, h, err := igagov.CanonicalDocument(doc)
 		if err != nil {
 			return nil, fmt.Errorf("inline policy %s: %w", n, err)
 		}
+		role.Documents[h] = string(c)
 		role.InlinePolicies = append(role.InlinePolicies, igagov.PolicyRef{Ref: n, DocumentHash: h})
 	}
 	return role, nil
