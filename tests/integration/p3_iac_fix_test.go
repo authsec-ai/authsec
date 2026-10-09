@@ -108,6 +108,9 @@ func TestP3IaCFixOpeningNeverForever(t *testing.T) {
 		t.Fatalf("branch conflict: %+v change %s", out, l.change(dep).State)
 	}
 
+}
+
+func TestP3IaCFixOpeningTimesOut(t *testing.T) {
 	l2, _, dep2 := p3xApproved(t, "p3x-timeout")
 	l2.gh.Fail["OpenPullRequest"] = errors.New("github: 502 bad gateway")
 	if _, err := l2.delivery.Deliver(context.Background(), l2.run(repositories.GovJobDeploy, dep2), l2.ws, dep2); err == nil {
@@ -183,25 +186,19 @@ func TestP3IaCFixOpenPRIsUpdatedOrClosed(t *testing.T) {
 // P2 IaC source checks.
 func TestP3IaCFixSourceChecks(t *testing.T) {
 	l := newP3iLab(t, "p3x-sources")
-	for i := 1; i <= 8; i++ {
-		l.role(fmt.Sprintf("UseRole%d", i), fmt.Sprintf("AROAUSEROLE000%d", i), p3iReport())
+	// One iac_pr proposal for UseRole, compiled again under each condition (a
+	// refused compile writes nothing, so the version stays a draft).
+	l.roleAndPublish("UseRole", "AROAUSEROLE0001")
+	code, body := l.call(l.author, http.MethodPost, "/proposals", map[string]any{"template": "right_size_services",
+		"keys": []any{map[string]any{"provider": "aws", "role_id": "AROAUSEROLE0001"}}, "delivery": igagov.DeliveryIaCPR})
+	pol := l.must(code, body, http.StatusCreated, "POST /proposals")["policy"].(map[string]any)["id"].(string)
+	proposeCode := func(string) (int, map[string]any) {
+		return l.call(l.author, http.MethodPost, "/policies/"+pol+"/versions/1/propose", nil)
 	}
-	l.publish()
-	next := 0
-	proposeCode := func(delivery string) (int, map[string]any) {
-		next++
-		code, body := l.call(l.author, http.MethodPost, "/proposals", map[string]any{"template": "right_size_services",
-			"keys": []any{map[string]any{"provider": "aws", "role_id": fmt.Sprintf("AROAUSEROLE000%d", next)}}, "delivery": delivery})
-		d := l.must(code, body, http.StatusCreated, "POST /proposals")
-		return l.call(l.author, http.MethodPost, "/policies/"+d["policy"].(map[string]any)["id"].(string)+"/versions/1/propose", nil)
-	}
-	// No IaC source for a J2 target: a visible 409, not a silent export.
+	// No IaC source for a J2 target: a visible 409, not a silent export
+	// (export stays an explicit choice: TestP3IaCFixExportRefusesExpiredApproval).
 	if code, body := proposeCode(igagov.DeliveryIaCPR); code != http.StatusConflict || digs(body, "error", "code") != services.GovCodeIaCSourceMissing {
 		t.Fatalf("no source: %d %v", code, body)
-	}
-	// Export stays an explicit choice.
-	if code, body := proposeCode(igagov.DeliveryExport); code != http.StatusOK {
-		t.Fatalf("explicit export: %d %v", code, body)
 	}
 
 	// The repository must be one the discovery source selects.
@@ -215,7 +212,7 @@ func TestP3IaCFixSourceChecks(t *testing.T) {
 	}
 	p3exec(t, l.db, `UPDATE discovery_sources SET config = jsonb_set(config, '{repositories,include}', to_jsonb(ARRAY['acme/other', ?::text])) WHERE id = ?`,
 		strings.ToUpper(l.repo), l.ds)
-	code, body := l.discCall(http.MethodPost, base, l.author, "governance:enforce", src)
+	code, body = l.discCall(http.MethodPost, base, l.author, "governance:enforce", src)
 	l.must(code, body, http.StatusCreated, "selected repository")
 	l.grantWrite()
 	// Deselected later: compile refuses visibly.
