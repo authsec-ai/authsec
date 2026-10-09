@@ -39,6 +39,8 @@ type OAuthASService struct {
 	authzCtx  *AuthorizationContextService
 	rsService *ResourceServerService
 	jwksCache *jwksCache
+	// hydraIssuer is the issuer Hydra stamps on the id_tokens it issues.
+	hydraIssuer *hydraIssuerCache
 }
 
 var (
@@ -52,10 +54,11 @@ var (
 
 func NewOAuthASService(db *gorm.DB) *OAuthASService {
 	return &OAuthASService{
-		db:        db,
-		authzCtx:  NewAuthorizationContextService(db),
-		rsService: NewResourceServerService(db),
-		jwksCache: &jwksCache{},
+		db:          db,
+		authzCtx:    NewAuthorizationContextService(db),
+		rsService:   NewResourceServerService(db),
+		jwksCache:   &jwksCache{},
+		hydraIssuer: &hydraIssuerCache{},
 	}
 }
 
@@ -695,6 +698,12 @@ type ApprovalRoleBinding struct {
 	RoleID      uuid.UUID
 	SubjectType string // "user" | "service_account"
 	SubjectID   uuid.UUID
+	// ExpiresAt bounds the grant. Nil creates a STANDING binding, which is what this
+	// path did unconditionally before governance existed — every approval was
+	// permanent. Callers that mean "just in time" must set it; the ScopeResolver
+	// already honours it at read time, and the expiry worker closes the remaining
+	// token window.
+	ExpiresAt *time.Time
 }
 
 // ApproveClientRegistration flips a pending_approval registration to approved
@@ -711,6 +720,19 @@ func (s *OAuthASService) ApproveClientRegistration(rsID, clientID string) error 
 // invariant). The role is validated to belong to the RS's workspace first, so an
 // admin cannot graft a foreign-workspace role onto the grant.
 func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID string, binding *ApprovalRoleBinding) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		return s.ApproveClientRegistrationInTx(tx, rsID, clientID, binding)
+	})
+}
+
+// ApproveClientRegistrationInTx is ApproveClientRegistrationWithBinding joined to a
+// caller-supplied transaction.
+//
+// Provisioning needs registration, the role binding, access_requests, provenance, and
+// the agent's governance status to commit together (PG-2). Sequencing two independent
+// transactions would leave a window where an agent has an approved registration but no
+// recorded justification — a state that looks governed and is not.
+func (s *OAuthASService) ApproveClientRegistrationInTx(tx *gorm.DB, rsID, clientID string, binding *ApprovalRoleBinding) error {
 	rsUUID, err := uuid.Parse(rsID)
 	if err != nil {
 		return fmt.Errorf("invalid RS ID: %w", err)
@@ -720,8 +742,8 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		return fmt.Errorf("client not found: %w", err)
 	}
 
-	// When binding, resolve the RS (for workspace) and validate the role lives in
-	// that workspace before opening the transaction.
+	// When binding, resolve the RS (for its workspace) and validate the role lives in
+	// that workspace, so an admin cannot graft a foreign-workspace role onto the grant.
 	var rs models.ResourceServer
 	var roleName string
 	if binding != nil {
@@ -731,10 +753,10 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		if binding.SubjectType != "user" && binding.SubjectType != "service_account" {
 			return fmt.Errorf("role binding subject_type must be 'user' or 'service_account'")
 		}
-		if err := s.db.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
+		if err := tx.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found: %w", err)
 		}
-		if err := s.db.Raw(
+		if err := tx.Raw(
 			`SELECT name FROM roles WHERE id = ? AND workspace_id = ? LIMIT 1`,
 			binding.RoleID, rs.WorkspaceID,
 		).Scan(&roleName).Error; err != nil || roleName == "" {
@@ -742,7 +764,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		}
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	{
 		// Try pending_approval or revoked → approved (covers first-time approval
 		// and re-approval after revocation).
 		result := tx.Model(&models.ResourceServerClientRegistration{}).
@@ -781,6 +803,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 				ScopeID:          &rs.ID,
 				AssignmentSource: "connection_approval",
 				Conditions:       []byte("{}"),
+				ExpiresAt:        binding.ExpiresAt,
 				CreatedAt:        time.Now().UTC(),
 			}
 			if binding.SubjectType == "service_account" {
@@ -807,8 +830,8 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 			now, now, rsUUID, clientID).Error; aerr != nil {
 			return fmt.Errorf("flip access_requests: %w", aerr)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // DenyClientRegistration removes a pending_approval registration and flips any
@@ -1309,9 +1332,33 @@ func (s *OAuthASService) RevokeUserTokensForWorkspace(userID, workspaceID uuid.U
 // additive on this public union only — they are NEVER inserted into the
 // Hydra-only jwksCache used for ID-token/logout verification (§4), so logout and
 // no-kid ID-token fallback are unaffected.
+//
+// Hydra is optional when XAA_NATIVE_SEALER is on: a deployment that mints and
+// verifies only natively-signed tokens (e.g. local dev, or GCP WIF's
+// onboarding token — internal/tokens/issuer.go) has no reason to run Hydra at
+// all. So if the Hydra fetch itself fails, this falls back to native-only
+// keys rather than failing the whole endpoint — a caller that only ever needs
+// the native key (like Google's STS validating a WIF subject token) must not
+// be blocked by an optional, unrelated Hydra instance being unreachable. When
+// XAA_NATIVE_SEALER is off, or there is no native key to fall back to, the
+// original behavior is unchanged: a Hydra fetch failure fails the endpoint.
 func (s *OAuthASService) FetchJWKS() (json.RawMessage, error) {
 	raw, err := s.jwksCache.get()
 	if err != nil {
+		if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+			if native := tokens.NativeKeys().PublicJWKS(); len(native) > 0 {
+				log.Printf("[MCP_AUTH] FetchJWKS: Hydra unreachable (%v); serving native-only JWKS", err)
+				keys := make([]json.RawMessage, 0, len(native))
+				for _, k := range native {
+					if b, merr := json.Marshal(k); merr == nil {
+						keys = append(keys, b)
+					}
+				}
+				return json.Marshal(struct {
+					Keys []json.RawMessage `json:"keys"`
+				}{Keys: keys})
+			}
+		}
 		return nil, err
 	}
 	if config.AppConfig == nil || !config.AppConfig.XAANativeSealer {
@@ -2141,6 +2188,78 @@ func (c *jwksCache) get() (json.RawMessage, error) {
 	return c.data, nil
 }
 
+// --- Hydra issuer ---
+
+// HydraJWKS returns Hydra's own signing keys, without the native keys
+// FetchJWKS adds. An id_token that claims Hydra's issuer must verify against
+// these.
+func (s *OAuthASService) HydraJWKS() (json.RawMessage, error) {
+	return s.jwksCache.get()
+}
+
+// HydraIssuer returns the issuer Hydra's discovery document states, without a
+// trailing slash. Hydra issues the id_tokens that browser login returns and
+// stamps this issuer in `iss`. It differs from the AS's own issuer
+// (config.OAuthBaseURL) whenever Hydra is served from its own host, e.g.
+// https://oauth.prod.authsec.ai beside https://prod.api.authsec.ai.
+func (s *OAuthASService) HydraIssuer() (string, error) {
+	if s.hydraIssuer == nil {
+		s.hydraIssuer = &hydraIssuerCache{}
+	}
+	return s.hydraIssuer.get()
+}
+
+// NormalizeIssuer compares issuers without surrounding space or a trailing
+// slash, which OIDC treats as the same issuer only by configuration accident.
+func NormalizeIssuer(iss string) string {
+	return strings.TrimRight(strings.TrimSpace(iss), "/")
+}
+
+type hydraIssuerCache struct {
+	mu        sync.Mutex
+	issuer    string
+	fetchedAt time.Time
+}
+
+func (c *hydraIssuerCache) get() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.issuer != "" && time.Since(c.fetchedAt) < 5*time.Minute {
+		return c.issuer, nil
+	}
+
+	discoveryURL := strings.TrimRight(config.AppConfig.HydraPublicURL, "/") + "/.well-known/openid-configuration"
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	iss, err := func() (string, error) {
+		resp, err := httpClient.Get(discoveryURL)
+		if err != nil {
+			return "", fmt.Errorf("fetch Hydra discovery: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("fetch Hydra discovery: HTTP %d", resp.StatusCode)
+		}
+		var doc struct {
+			Issuer string `json:"issuer"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&doc); err != nil {
+			return "", fmt.Errorf("parse Hydra discovery: %w", err)
+		}
+		if iss := NormalizeIssuer(doc.Issuer); iss != "" {
+			return iss, nil
+		}
+		return "", fmt.Errorf("Hydra discovery states no issuer")
+	}()
+	if err != nil {
+		if c.issuer != "" {
+			return c.issuer, nil // stale is better than failing every exchange
+		}
+		return "", err
+	}
+	c.issuer, c.fetchedAt = iss, time.Now()
+	return c.issuer, nil
+}
+
 // EnrichUserinfoClaims enriches session-based claims with data from the local user table and
 // OIDC identity repository. Falls back to session claims if DB lookups fail (graceful degradation).
 // The sub may be a UUID (AdminUser.ID) or a composite like "google-<providerUserID>".
@@ -2299,9 +2418,15 @@ func (s *OAuthASService) VerifyIDTokenHint(idToken, expectedIssuer, expectedAudi
 	}
 
 	if expectedIssuer != "" {
-		iss, _ := claims["iss"].(string)
-		if iss != expectedIssuer {
-			return "", fmt.Errorf("id_token issuer mismatch")
+		// The keys above are Hydra's, so a token they verify is Hydra's and
+		// carries Hydra's issuer, which is not the AS's when Hydra has its own
+		// host. Accept either.
+		iss := NormalizeIssuer(fmt.Sprint(claims["iss"]))
+		if iss != NormalizeIssuer(expectedIssuer) {
+			hydraIss, herr := s.HydraIssuer()
+			if herr != nil || iss != hydraIss {
+				return "", fmt.Errorf("id_token issuer mismatch")
+			}
 		}
 	}
 
@@ -2387,6 +2512,10 @@ func stringSlicesEqual(a, b []string) bool {
 
 // WorkspaceClientItem is the DTO returned by GET /authsec/clients.
 type WorkspaceClientItem struct {
+	// ID is mcp_oauth_clients.id — the uuid every FK to a governed identity
+	// points at (e.g. discovered_agents.matched_client_id). ClientID below is
+	// the OAuth protocol string and is NOT interchangeable with it.
+	ID                 string     `json:"id"`
 	ClientID           string     `json:"client_id"`
 	ClientName         string     `json:"client_name"`
 	ClientKind         string     `json:"client_kind"`
@@ -2634,11 +2763,17 @@ func (s *OAuthASService) RevokeNativeTokenByJTI(workspaceID uuid.UUID, jtiStr st
 	}
 
 	now := time.Now().UTC()
+	// The column is `kind`, and the primary key is (iss, kind, jti). This previously
+	// named a `token_type` column that does not exist, so EVERY call failed with
+	// `column "token_type" of relation "revoked_tokens" does not exist` — meaning the
+	// admin token-revocation path never actually revoked anything. Introspection
+	// treats revoked_tokens as authoritative, so a token an admin believed they had
+	// killed stayed valid for its full remaining lifetime.
 	return s.db.Exec(`
-		INSERT INTO revoked_tokens (iss, token_type, jti, revoked_at, expires_at)
-		VALUES (?, 'access_token', ?, ?, ?)
-		ON CONFLICT (iss, token_type, jti) DO NOTHING`,
-		nt.Iss, jti, now, nt.ExpiresAt,
+		INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
+		VALUES (?, 'access_token', ?, ?, ?, ?)
+		ON CONFLICT (iss, kind, jti) DO NOTHING`,
+		nt.Iss, jti, now, "revoked by admin", nt.ExpiresAt,
 	).Error
 }
 
@@ -2710,6 +2845,7 @@ func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID, resourceSer
 		}
 
 		result = append(result, WorkspaceClientItem{
+			ID:                 c.ID.String(),
 			ClientID:           c.ClientID,
 			ClientName:         c.ClientName,
 			ClientKind:         c.ClientKind,

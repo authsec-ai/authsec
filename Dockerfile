@@ -21,9 +21,26 @@ ENV GOOS=linux
 ENV GOARCH=${TARGETARCH}
 ENV CGO_ENABLED=0
 
+# Build identity, injected at link time and served at
+# /authsec/uflow/version.
+#
+# Without these the endpoint reports "unknown", which is correct for a local
+# `go build` and useless for a deployed image -- so every build that produces
+# something deployable must pass them. The CI workflow does; a hand-run
+# `docker build` that forgets will announce itself as unknown rather than
+# quietly claiming to be some commit.
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILT_AT=unknown
+
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -o /main ./cmd/main.go
+    go build \
+      -ldflags "-s -w \
+        -X github.com/authsec-ai/authsec/internal/buildinfo.Commit=${GIT_COMMIT} \
+        -X github.com/authsec-ai/authsec/internal/buildinfo.Branch=${GIT_BRANCH} \
+        -X github.com/authsec-ai/authsec/internal/buildinfo.BuiltAt=${BUILT_AT}" \
+      -o /main ./cmd/main.go
 
 FROM alpine:3.21
 

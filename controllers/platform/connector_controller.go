@@ -203,7 +203,33 @@ func (ctl *ConnectorController) ListConnectors(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"connectors": list})
+
+	// Which of these actually have a workspace credential bound. Callers need
+	// this to avoid offering a connector that cannot talk to the provider yet:
+	// picking one that was created but never finished setup fails later, at use
+	// time, with an error that does not point back at the real cause.
+	//
+	// Non-secret and derived, so it ships alongside the list rather than forcing
+	// a detail fetch per connector.
+	repo := repositories.NewConnectorRepository(ctl.db)
+	summaries := make([]gin.H, 0, len(list))
+	for i := range list {
+		bound, method, status := false, "", ""
+		if conn, err := repo.GetWorkspaceConnection(list[i].ID); err == nil && conn != nil {
+			bound, method, status = true, conn.AuthMethod, conn.Status
+		}
+		// Id only, not the whole connector: the full objects are already in
+		// `connectors` above and duplicating them would double the payload for
+		// three booleans' worth of information.
+		summaries = append(summaries, gin.H{
+			"connector_id":      list[i].ID,
+			"connected":         bound,
+			"connection_method": method,
+			"connection_status": status,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"connectors": list, "connector_status": summaries})
 }
 
 // GetConnector handles GET /authsec/connectors/:id.
@@ -455,6 +481,45 @@ func (ctl *ConnectorController) GetConnectorAudit(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"audit": rows})
+}
+
+// GetProviderApp handles GET /authsec/connectors/providers/:provider/app —
+// report WHETHER this workspace has configured a provider app, and the
+// non-secret identifiers if so. Never returns secret material: the client
+// secret and the GitHub App private key live only in Vault and are not read
+// here at all.
+//
+// This exists because the console previously had no way to tell a configured
+// workspace from an unconfigured one. Both rendered an identical collapsed
+// "set up" affordance, so a returning admin could not see that registration
+// was already done, and a first-time admin could not see that it was still
+// required — they would attempt the install step first and hit a confusing
+// failure from a missing prerequisite.
+func (ctl *ConnectorController) GetProviderApp(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	providerKey := c.Param("provider")
+
+	app, err := repositories.NewConnectorRepository(ctl.db).GetProviderApp(wsID, providerKey)
+	if err != nil || app == nil {
+		// Not an error: "nothing configured yet" is a normal, expected answer
+		// and the caller needs to distinguish it from a failure.
+		c.JSON(http.StatusOK, gin.H{"configured": false, "provider": providerKey})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"configured":    true,
+		"provider":      providerKey,
+		"app_kind":      app.AppKind,
+		"client_id":     app.ClientID,
+		"redirect_uri":  app.RedirectURI,
+		"github_app_id": app.GitHubAppID,
+		"created_at":    app.CreatedAt,
+	})
 }
 
 // SetProviderApp handles POST /authsec/connectors/providers/:provider/app —
@@ -732,4 +797,105 @@ func (ctl *ConnectorController) GetConnectorConfig(c *gin.Context) {
 		"config":        conn.Config,
 		"subscriptions": conn.Subscriptions,
 	})
+}
+
+/* ------------------- GitHub App self-service (console reads) ---------------- */
+
+// DescribeGitHubApp handles GET /authsec/connectors/providers/github/app/describe.
+// Confirms what the stored App actually is, straight from GitHub, so the console
+// can show the operator that the right App was registered rather than trusting a
+// number they typed. Also returns the canonical install URL, which lets the UI
+// offer a button instead of telling someone where to click on github.com.
+func (ctl *ConnectorController) DescribeGitHubApp(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		DescribeGitHubApp(c.Request.Context(), wsID)
+	if err != nil {
+		// 502, not 400: the credentials are ours and the failure is almost always
+		// GitHub-side or a credential mismatch, neither of which the caller's
+		// request can fix by being different.
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": info})
+}
+
+// ListGitHubInstallations handles
+// GET /authsec/connectors/providers/github/installations.
+//
+// Returns everywhere this workspace's App is installed so the console can offer
+// a list to pick from. This exists to delete the worst step in onboarding:
+// copying an installation id out of a browser URL, which is easy to confuse with
+// the App id and fails opaquely much later when it is wrong.
+func (ctl *ConnectorController) ListGitHubInstallations(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	list, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		ListGitHubInstallations(c.Request.Context(), wsID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": list,
+		"meta": gin.H{
+			"note": "installations this App can currently see; installing it on another " +
+				"organisation adds a row here",
+		},
+	})
+}
+
+// ConvertGitHubAppManifest handles
+// POST /authsec/connectors/providers/github/app-manifest/convert.
+//
+// Completes GitHub's App-manifest flow: the operator approves one pre-filled
+// screen on github.com, GitHub redirects back with a single-use code, and this
+// exchanges it for the App id and private key. That removes App creation,
+// permission selection, key generation and key upload from the operator
+// entirely — the values never pass through a human's clipboard.
+func (ctl *ConnectorController) ConvertGitHubAppManifest(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		ConvertGitHubAppManifest(c.Request.Context(), wsID, req.Code, principal)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	// The app id is not secret; the private key it arrived with is never echoed.
+	auditAdminMutation(c, wsID.String(), "create_github_app_via_manifest", "connector_provider",
+		"github", http.StatusOK, nil, gin.H{"app_id": info.AppID, "slug": info.Slug})
+	c.JSON(http.StatusOK, gin.H{"data": info})
 }

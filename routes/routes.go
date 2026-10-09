@@ -40,6 +40,7 @@ import (
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
+	"github.com/authsec-ai/authsec/internal/buildinfo"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
@@ -212,8 +213,18 @@ func SetupRoutes(
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
-	// OpenID Connect Discovery 1.0 — same superset metadata
-	r.GET("/.well-known/openid-configuration", oauthASController.CanonicalIssuerOnly(), oauthASController.OIDCDiscovery)
+	// OpenID Connect Discovery 1.0 — same superset metadata. Relaxed host
+	// check (not CanonicalIssuerOnly): a GCP Workload Identity Federation
+	// provider must be able to fetch this directly from the configured WIF
+	// issuer's own host (GCP_WIF_ISSUER_URL), which in local development is
+	// a public HTTPS tunnel, not the app's canonical BASE_URL host. See
+	// CanonicalIssuerOrWIFIssuer's doc comment.
+	r.GET("/.well-known/openid-configuration", oauthASController.CanonicalIssuerOrWIFIssuer(), oauthASController.OIDCDiscovery)
+	// JWKS: same relaxed reasoning as discovery above — GCP's STS fetches
+	// this directly from the WIF issuer host too. Deliberately NOT inside
+	// the oauth group below (that group's CanonicalIssuerOnly() is correct
+	// and unchanged for every other OAuth endpoint).
+	r.GET("/oauth/jwks", oauthASController.CanonicalIssuerOrWIFIssuer(), oauthASController.JWKS)
 
 	// Global OAuth + OIDC endpoints (unauthenticated — the OAuth flow itself handles authz)
 	oauth := r.Group("/oauth")
@@ -227,7 +238,6 @@ func SetupRoutes(
 		oauth.PUT("/register/:client_id", oauthASController.RFC7592Put)
 		oauth.DELETE("/register/:client_id", oauthASController.RFC7592Delete)
 		oauth.POST("/introspect", middlewares.StrictAuthRateLimitMiddleware(60, time.Minute), oauthASController.Introspect)
-		oauth.GET("/jwks", oauthASController.JWKS)
 		oauth.POST("/revoke", oauthASController.Revoke)
 		// OIDC endpoints
 		oauth.GET("/userinfo", oauthASController.Userinfo)
@@ -258,6 +268,30 @@ func SetupRoutes(
 			oauthSelfService.DELETE("/consent-grants/:id", oauthASController.RevokeUserConsentGrant)
 		}
 	}
+
+	// ════════════════════════════════════════════════════════
+	// AGENTIC IGA — /api/iga/v1
+	// ════════════════════════════════════════════════════════
+	// ADDITIVE. This sits alongside the existing /authsec/discovery/* surface
+	// (Kubernetes sightings, claim/quarantine, coverage) and changes none of
+	// it. The whole surface -- provider ingress, the Phase 1 routes and the
+	// Phase 2 graph catalogue -- is mounted by SetupIGARoutes (iga_routes.go),
+	// the one function the frozen-contract test also mounts, so the 401/403
+	// envelope a graph route answers in production is the tested one (D-9,
+	// D-100).
+	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
+
+	// LEGACY compatibility under the IGA prefix (disposition plan §3.1, Phase 3
+	// spec §7.10): a read-only list of the workspace's legacy agent policies
+	// with Pause and Remove, served by the legacy agent-policy service -- not
+	// Phase 3 code, and outside SetupIGARoutes on purpose. Same auth, same
+	// error envelope; the legacy governance permissions (governance:read to
+	// list, governance:admin to pause or remove, as the legacy
+	// /authsec/governance/agent-policies routes). The legacy routes below keep
+	// their behaviour.
+	platformCtrl.MountLegacyAgentPolicyCompatRoutes(r,
+		platformCtrl.NewLegacyAgentPolicyCompatController(config.DB),
+		middlewares.AuthMiddleware(), middlewares.Require)
 
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
@@ -1223,6 +1257,22 @@ func SetupRoutes(
 			health.GET("/tenants", healthController.CheckAllTenantDatabases)
 		}
 
+		// Which commit is actually serving.
+		//
+		// Unauthenticated on purpose, and it is the same exposure as the health
+		// endpoint beside it: a commit SHA is already public in the repo, and a
+		// deploy check that needs a token is a deploy check nobody runs. It
+		// returns build identity only -- no configuration, no dependency
+		// versions, nothing about the environment.
+		//
+		// This exists because the deployed image tag stopped being a commit
+		// SHA, so "is my push live?" had no answer short of probing for a route
+		// that only new code serves. That trick works once per release and
+		// tells you nothing about WHICH build is running.
+		uflow.GET("/version", func(c *gin.Context) {
+			c.JSON(http.StatusOK, buildinfo.Current())
+		})
+
 		// ────────────────────────────────────────────────────
 		// Hydra Manager (formerly hydra-service)
 		// Served under /authsec/hmgr.
@@ -1339,8 +1389,18 @@ func SetupRoutes(
 		connectors.Use(middlewares.AuthMiddleware())
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
+			// Read-only, non-secret: lets the console tell a configured workspace
+			// from an unconfigured one. Requires only `read`, since it exposes no
+			// secret material.
+			connectors.GET("/providers/:provider/app", middlewares.Require("connector", "read"), connectorController.GetProviderApp)
 			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
 			connectors.POST("/providers/github/app-github", middlewares.Require("connector", "update"), connectorController.SetGitHubApp)
+			// Self-service reads that let the console stop asking humans for
+			// values GitHub already knows. Both are non-secret and read-only.
+			connectors.GET("/providers/github/app/describe", middlewares.Require("connector", "read"), connectorController.DescribeGitHubApp)
+			connectors.GET("/providers/github/installations", middlewares.Require("connector", "read"), connectorController.ListGitHubInstallations)
+			// Completes GitHub's App-manifest flow; writes the App id + key.
+			connectors.POST("/providers/github/app-manifest/convert", middlewares.Require("connector", "update"), connectorController.ConvertGitHubAppManifest)
 			connectors.POST("/:id/connections/github-app", middlewares.Require("connector", "update"), connectorController.ConnectGitHubApp)
 			// R4 — end-user self-service consent (bind to the caller's own identity).
 			connectors.POST("/:id/connections/user/oauth/start", middlewares.Require("connector", "read"), connectorController.StartUserConnect)
@@ -1377,35 +1437,89 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
 
-		// Connector ingress is UNAUTHENTICATED by deliberate choice.
+		// Connector ingress: no AuthMiddleware, an INGEST TOKEN instead.
 		//
 		// A connector runs inside a customer's cluster and is configured with its
-		// workspace_id at deploy time (a Helm --set on the discovery agent), which it
-		// then asserts in the request body. That removes the token-minting step from
-		// the install flow entirely.
+		// workspace_id at deploy time (a Helm value on the discovery agent), which it
+		// asserts in the request body. That alone authenticated nothing: anyone
+		// holding a workspace UUID could add rows to that workspace's inventory and,
+		// since the shared graph projects these payloads synchronously, inject a
+		// cluster-admin grant or post a "complete" sweep that ends a real cluster's
+		// model.
 		//
-		// What this trades away, stated plainly so it is not rediscovered later:
-		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
-		//     any caller who knows a workspace_id can add rows to that workspace's
-		//     inventory
-		//   - there is no rate limit, so inventory growth from this path is unbounded
+		// So each handler now checks the call's `Authorization: Bearer <ingest
+		// token>` against the body's workspace before trusting it
+		// (controllers/platform/discovery_ingest_auth.go). A token is minted by a
+		// discovery:admin for the caller's own workspace (POST
+		// /discovery/ingest-tokens below), optionally bound to one source; only its
+		// sha256 is stored. IGA_DISCOVERY_INGEST_AUTH picks the mode:
+		//   - off      nothing is checked (the old behaviour)
+		//   - warn     DEFAULT. A valid token is attributed; a call without one is
+		//              ACCEPTED but logged and counted, so agents installed before
+		//              tokens existed keep working during rollout. NOT a protected
+		//              ingress: startup logs a banner, discovery_ingest_auth_enforced
+		//              is 0 and the uflow health check says so until enforce
+		//   - enforce  no valid (unrevoked, unexpired) token for the body's
+		//              workspace (and, if bound, for the call's source) -> 401
+		// In warn and enforce a valid token of ANOTHER workspace is always 403: a
+		// token never authorises another workspace. Rollout steps:
+		// controllers/platform/DISCOVERY_INGEST_AUTH.md.
 		//
-		// What keeps the blast radius to noise rather than privilege: a sighting
-		// grants nothing. Rows land `unregistered`, and only an authenticated,
-		// permission-checked human can claim one into a governed identity. The worst
-		// case is a polluted Unregistered Agents report, not access.
+		// There is still no rate limit on this path.
 		//
 		// Registered on its own group so it cannot accidentally inherit
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
+		platformCtrl.LogDiscoveryIngestAuthMode()
 		discoveryIngress := authsec.Group("/discovery")
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
+
+			// Connector self-registration + heartbeat. One control plane serves agents
+			// in many clusters, so each announces itself and gets back a
+			// discovery_source_id it stamps on every sighting — which is what makes
+			// "which cluster did this agent come from" a foreign key rather than a
+			// string buried in metadata, and "has this cluster gone quiet" answerable
+			// at all.
+			discoveryIngress.POST("/agent-registration", discoveryController.RegisterAgent)
+
+			// Runtime lifecycle. Sightings only ever said "this exists"; these carry
+			// the other half — deleted, when, and (on the admission channel, where the
+			// API server authenticates the caller) by whom. They write runtime_status
+			// only, never the governance status, so a claimed-then-deleted agent stays
+			// registered while its runtime state becomes gone.
+			discoveryIngress.POST("/lifecycle", discoveryController.ReportLifecycleEvent)
+
+			// The cluster's AUTHORIZATION MODEL — which ServiceAccount may do what,
+			// through which binding and role. Ingest-token authenticated like the
+			// rest of this group: the caller is a workload in a customer's cluster.
+			// The payload grants nothing here, but it becomes the graph's model of
+			// that cluster, which is why the token check matters most on this route.
+			discoveryIngress.POST("/rbac-snapshot", discoveryController.ReportRBACSnapshot)
+
+			// Per-sweep manifest of everything a connector observed. The only signal
+			// that catches an agent destroyed while nobody was watching — before
+			// install, or during an outage — since admission sees deletions live or
+			// never. A partial sweep retires nothing.
+			discoveryIngress.POST("/resync-manifest", discoveryController.ReportResyncManifest)
 		}
 
 		// Everything else stays authenticated and permission-gated: reading the
 		// inventory exposes hostnames and workload metadata across the workspace, and
 		// claim/quarantine are governance decisions that must be attributable.
+		// Declared before the discovery group because the IGA-correlation bridge
+		// hangs off /discovery/agents/:id as well as /governance.
+		governanceController := platformCtrl.NewGovernanceController(config.DB)
+
+		// Phase 3 Slack app (SPEC-iga-phase3-policy.md §7.11, T3.14):
+		// /authsec/integrations/slack. Behind the IGA_POLICY gate;
+		// /interactions (Slack signature) and /oauth/callback (signed state
+		// + install cookie) carry no bearer token; the rest are
+		// authenticated with their permission.
+		platformCtrl.MountSlackIntegrationRoutes(authsec,
+			platformCtrl.NewDefaultSlackIntegrationController(config.DB),
+			middlewares.AuthMiddleware(), middlewares.Require)
+
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
@@ -1416,24 +1530,496 @@ func SetupRoutes(
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
 
-			// NOTE: POST /sightings is deliberately NOT here — it is registered
-			// unauthenticated on discoveryIngress above. Re-adding it here would make
-			// Gin panic at startup on the duplicate method+path.
+			// Ingest tokens: the credentials agents present on the ingress above.
+			// discovery:admin; the workspace is the caller's, never the body's.
+			//   POST   /ingest-tokens      mint (the plaintext is returned once)
+			//   GET    /ingest-tokens      list (prefixes, never hashes)
+			//   DELETE /ingest-tokens/:id  revoke
+			platformCtrl.MountDiscoveryIngestTokenRoutes(discovery, discoveryController, middlewares.Require)
 
-			// Inventory. ?status=unregistered is the Unregistered Agents report.
+			// NOTE: POST /sightings, /agent-registration, /lifecycle and
+			// /resync-manifest are deliberately NOT here — they are registered
+			// on discoveryIngress above (ingest-token auth). Re-adding any of them here
+			// would make Gin panic at startup on the duplicate method+path.
+
+			// Inventory. ?status=unregistered is the Unregistered Agents report;
+			// add &live=true to drop agents already observed to be destroyed.
+			// ?runtime_status= and ?discovery_source_id= filter by observed state and
+			// by reporting cluster.
 			// The static /agents/lookup must be registered before /agents/:id.
 			discovery.GET("/agents/lookup", middlewares.Require("discovery", "read"), discoveryController.LookupDiscoveredAgent)
 			discovery.GET("/agents", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveredAgents)
 			discovery.GET("/agents/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoveredAgent)
+			// The lifecycle trail behind an agent's runtime status: when it was
+			// deleted, through which channel, and which principal the API server
+			// attributed it to.
+			discovery.GET("/agents/:id/events", middlewares.Require("discovery", "read"), discoveryController.ListAgentLifecycle)
 			discovery.PUT("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoveredAgent)
 			discovery.DELETE("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoveredAgent)
 
 			// The two governance decisions, each with its own permission.
 			discovery.POST("/agents/:id/claim", middlewares.Require("discovery", "claim"), discoveryController.ClaimAgent)
 			discovery.POST("/agents/:id/quarantine", middlewares.Require("discovery", "quarantine"), discoveryController.QuarantineAgent)
+			// Releasing takes the SAME permission as quarantining: whoever can cut an
+			// agent off can restore it. Splitting them would leave an operator able to
+			// contain an incident but not to undo a mistake — which is how a mis-click
+			// becomes an outage nobody on shift can fix.
+			discovery.POST("/agents/:id/unquarantine", middlewares.Require("discovery", "quarantine"), discoveryController.UnquarantineAgent)
+
+			// Which canonical agent in the correlated estate is this workload?
+			// Read is a discovery read; the decision is a correlation decision.
+			// What every matching policy adds up to for this agent, and which
+			// policies caused it — a state without an explanation is unreviewable.
+			discovery.GET("/agents/:id/effective-policy",
+				middlewares.Require("discovery", "read"), governanceController.GetAgentPolicyEffective)
+
+			discovery.GET("/agents/:id/iga-link",
+				middlewares.Require("discovery", "read"), governanceController.GetAgentIGALink)
+			discovery.POST("/agents/:id/iga-link/decisions",
+				middlewares.Require("iga", "review"), governanceController.DecideAgentIGALink)
 
 			// Headline KPI: registered / total, segmented by origin.
 			discovery.GET("/coverage", middlewares.Require("discovery", "read"), discoveryController.GetCoverage)
+
+			// GitHub as a discovery channel, alongside the Kubernetes webhook.
+			// ADDITIVE: one new trigger route on a separate controller. The
+			// sightings it reports land in the SAME discovered_agents
+			// inventory and are governed by the claim/quarantine/coverage
+			// endpoints above, unchanged. Gated on discovery:admin because a
+			// scan spends the workspace's GitHub API budget.
+			// The flow is: register the App once, add an organisation, choose
+			// repositories, scan.
+			//
+			//   github/app*           the ONE GitHub App this workspace owns.
+			//                         Workspace-level, because one App serves
+			//                         every organisation it is installed on.
+			//   github/installations  where that App is installed, read live
+			//                         from GitHub and annotated with what has
+			//                         already been added here
+			//   github/organisations  adds one: creates the verified
+			//                         iga_integrations binding AND the
+			//                         discovery source, in one call
+			//   GET  repositories     what the installation actually exposes
+			//   PUT  repositories     the explicit scan plan
+			//   POST scan             inspects only the selected repositories
+			//
+			// These live under discovery, not under /connectors. The GitHub App
+			// KEY store is shared with the connector broker on purpose -- one
+			// private key, one place -- but the product surface is not: per
+			// SPEC-connectors, Agentic IGA must not depend on that framework,
+			// and nothing here reads or writes a connector row.
+			//
+			// Selection is deliberate: a new source selects nothing, so adding
+			// an organisation can never trigger an unbounded scan by itself.
+			discoveryGitHub := platformCtrl.NewDiscoveryGitHubController(config.DB)
+			discovery.GET("/github/app", middlewares.Require("discovery", "read"), discoveryGitHub.GetGitHubApp)
+			discovery.GET("/github/app/describe", middlewares.Require("discovery", "read"), discoveryGitHub.DescribeGitHubApp)
+			discovery.POST("/github/app", middlewares.Require("discovery", "admin"), discoveryGitHub.SetGitHubApp)
+			discovery.DELETE("/github/app", middlewares.Require("discovery", "admin"), discoveryGitHub.DeleteGitHubApp)
+			discovery.POST("/github/app/manifest/convert", middlewares.Require("discovery", "admin"), discoveryGitHub.ConvertGitHubAppManifest)
+			discovery.GET("/github/installations", middlewares.Require("discovery", "read"), discoveryGitHub.ListGitHubInstallations)
+			discovery.POST("/github/organisations", middlewares.Require("discovery", "admin"), discoveryGitHub.AddOrganisation)
+			discovery.GET("/sources/:id/repositories", middlewares.Require("discovery", "read"), discoveryGitHub.ListSourceRepositories)
+			discovery.PUT("/sources/:id/repositories", middlewares.Require("discovery", "admin"), discoveryGitHub.SetSourceRepositories)
+			discovery.POST("/sources/:id/scan", middlewares.Require("discovery", "admin"), discoveryGitHub.ScanGitHubSource)
+
+			// Scan runs. POST .../scan queues and returns 202 with a run id;
+			// these are how the console follows it and how anyone answers "what
+			// did the last scan actually see?" after the fact. Reading a run is
+			// discovery:read — it reports coverage, it does not change anything.
+			// Detection patterns. What a scan searches for used to be compiled
+			// in; a workspace can now tune the path globs and the token
+			// vocabulary without waiting for a release. The PARSERS stay in
+			// code and are selected by name — config never introduces one.
+			//
+			// Reading is discovery:read (it describes coverage). Writing is
+			// discovery:admin: widening a glob widens what every later scan
+			// downloads, so it is a spending decision as much as a detection one.
+			ruleCatalog := platformCtrl.NewDiscoveryRuleCatalogController(config.DB)
+			discovery.GET("/rule-catalog", middlewares.Require("discovery", "read"), ruleCatalog.GetRuleCatalog)
+			discovery.PUT("/rule-catalog", middlewares.Require("discovery", "admin"), ruleCatalog.SetRuleCatalog)
+			discovery.DELETE("/rule-catalog", middlewares.Require("discovery", "admin"), ruleCatalog.ResetRuleCatalog)
+			discovery.POST("/rule-catalog/test", middlewares.Require("discovery", "read"), ruleCatalog.TestRuleCatalog)
+
+			discovery.GET("/sources/:id/scan-runs", middlewares.Require("discovery", "read"), discoveryGitHub.ListScanRuns)
+			discovery.GET("/scan-runs/:run_id", middlewares.Require("discovery", "read"), discoveryGitHub.GetScanRun)
+			discovery.POST("/scan-runs/:run_id/cancel", middlewares.Require("discovery", "admin"), discoveryGitHub.CancelScanRun)
+
+			// AWS as a discovery channel, alongside Kubernetes and GitHub.
+			//
+			// These endpoints ONBOARD an AWS account: they establish an agentless,
+			// read-only cross-account connection and record the cloud_connector row
+			// that every later AWS surface — IAM identities, access keys, policies,
+			// Bedrock, activity — resolves against. Nothing here discovers anything
+			// yet.
+			//
+			// Under /discovery rather than /connectors, the same boundary the GitHub
+			// channel keeps: the connector broker is the action framework, and
+			// Agentic IGA must not depend on it.
+			//
+			// Reading the onboarding package is discovery:read even though it mints
+			// an ExternalId — the id is worthless until a role that trusts it exists,
+			// and gating it on admin would stop a reader from seeing the permissions
+			// AuthSec is asking for, which is exactly the thing a reviewer needs.
+			// Everything that CHANGES a connection is discovery:admin: connecting an
+			// AWS account decides what a scan may read and what it will cost.
+			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
+			k8sGraph := platformCtrl.NewK8sGraphController(config.DB)
+			// One read of every connection of every provider: connection, latest
+			// scan, coverage and graph state, scope and capabilities
+			// (SPEC-console-revamp B3). discovery:read, like the lists it
+			// summarises; it changes nothing.
+			discovery.GET("/connections", middlewares.Require("discovery", "read"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).ListConnections)
+			// Behind the same discovery:admin middleware as the administrative
+			// connection routes: reaching the handler IS the server's answer, so the
+			// console can show a read-only reader no administrative control.
+			discovery.GET("/connections/can-administer", middlewares.Require("discovery", "admin"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).CanAdminister)
+			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
+			// Quick Create: starting a session is admin, like POST /aws/connectors,
+			// because the link it returns connects an account. Reading one is not.
+			discovery.POST("/aws/onboarding/sessions", middlewares.Require("discovery", "admin"), cloudAWS.StartOnboardingSession)
+			discovery.GET("/aws/onboarding/sessions/:id", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingSession)
+			discovery.POST("/aws/connectors", middlewares.Require("discovery", "admin"), cloudAWS.CreateConnector)
+			discovery.GET("/aws/connectors", middlewares.Require("discovery", "read"), cloudAWS.ListConnectors)
+			discovery.GET("/aws/connectors/:id", middlewares.Require("discovery", "read"), cloudAWS.GetConnector)
+			discovery.POST("/aws/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAWS.VerifyConnector)
+			// Phase 2 (§5.3, T2.1-T2.2): enabled regions, the region selection
+			// (applies from the next scan), and the run history.
+			discovery.GET("/aws/connectors/:id/regions", middlewares.Require("discovery", "read"), cloudAWS.GetConnectorRegions)
+			discovery.PATCH("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.UpdateConnector)
+			discovery.GET("/aws/connectors/:id/scan-runs", middlewares.Require("discovery", "read"), cloudAWS.ListConnectorScanRuns)
+			// DELETE verb, revoke semantics: the connector row and everything it
+			// discovered stay for audit, aligned with GCP's planned behaviour. See
+			// CloudConnectorRepository.Revoke.
+			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
+			// Phase 3 enforcement binding (SPEC-iga-phase3-policy.md §7.9,
+			// T3.09): the separate, customer-consented enforcement stack of a
+			// connected account. Behind the IGA_POLICY gate, with
+			// discovery:read to read and governance:enforce to change.
+			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
+				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
+			// Phase 3 IaC sources (§7.9, T3.17): an account's mapping to the
+			// Terraform / CloudFormation directory J2 pull requests change.
+			platformCtrl.RegisterIaCSourceRoutes(discovery,
+				platformCtrl.NewCloudIaCSourceController(config.DB), middlewares.Require)
+
+			// IAM identity discovery: the foundation every later AWS surface
+			// resolves against. Writes cloud_identity and cloud_secret and
+			// nothing else.
+			//
+			// Starting a scan is discovery:admin because it spends the
+			// customer's API quota and can take minutes on a large account.
+			// Reading the results is discovery:read — and note that an identity
+			// row is a CANDIDATE, not an agent: nothing this endpoint returns
+			// asserts that anything is an AI agent.
+			discovery.POST("/aws/connectors/:id/scan", middlewares.Require("discovery", "admin"), cloudAWS.ScanIAM)
+			// The scan is queued, not performed, by the POST above. This is
+			// where a caller learns whether it finished -- coverage on the
+			// connector is written after publication and so lags the run.
+			discovery.GET("/aws/scan-runs/:id", middlewares.Require("discovery", "read"), cloudAWS.GetScanRun)
+			discovery.GET("/aws/identities", middlewares.Require("discovery", "read"), cloudAWS.ListIdentities)
+
+			// ────────────────────────────────────────────────────────
+			// The Kubernetes identity graph.
+			//
+			// A separate surface from /aws/* because the questions differ. AWS
+			// asks which account and which region; Kubernetes asks which
+			// cluster, which namespace, and -- the one that decides how much
+			// the answer is worth -- whether the agent could read cluster-scoped
+			// objects at all. Every response carries the sweep behind it, so an
+			// empty list is never mistaken for "no access".
+			discovery.GET("/k8s/clusters", middlewares.Require("discovery", "read"), k8sGraph.ListClusters)
+			discovery.GET("/k8s/identities", middlewares.Require("discovery", "read"), k8sGraph.ListIdentities)
+			discovery.GET("/k8s/workloads", middlewares.Require("discovery", "read"), k8sGraph.ListWorkloads)
+			discovery.GET("/k8s/identities/:id", middlewares.Require("discovery", "read"), k8sGraph.GetIdentity)
+			discovery.GET("/k8s/identities/:id/access", middlewares.Require("discovery", "read"), k8sGraph.GetAccess)
+			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
+
+			// Trust relationships and permission/resource extraction: who may
+			// assume each identity, and what each identity may do. No separate
+			// trigger route — this runs chained after the scan above, against
+			// the same generation, so cloud_assume_edge and cloud_permission are
+			// never a scan behind cloud_identity.
+			discovery.GET("/aws/assume-edges", middlewares.Require("discovery", "read"), cloudAWS.ListAssumeEdges)
+			discovery.GET("/aws/permissions", middlewares.Require("discovery", "read"), cloudAWS.ListPermissions)
+			discovery.GET("/aws/resources", middlewares.Require("discovery", "read"), cloudAWS.ListResources)
+
+			// The compute that runs as a discovered identity, and whether an
+			// identity has actually exercised a service. Read-only, same
+			// permission as every other discovery read.
+			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
+			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
+			// The aggregate behind the identities inventory's unused-access column.
+			// A literal path beside /aws/usage, not a wildcard under it.
+			discovery.GET("/aws/usage/summary", middlewares.Require("discovery", "read"), cloudAWS.ListUsageSummary)
+
+			// Evidence: why a cloud_* row exists, or -- for a subject-less fact
+			// like an AgentCore Workload Identity -- what was observed even
+			// though nothing in inventory names it. Same read permission as
+			// every other discovery listing.
+			discovery.GET("/aws/observations", middlewares.Require("discovery", "read"), cloudAWS.ListObservations)
+
+			// GCP as a discovery channel, alongside AWS, Kubernetes and GitHub.
+			//
+			// Same boundary as the AWS block above: these endpoints ONBOARD a GCP
+			// scope (org, folder or project) — an agentless, read-only connection
+			// (Workload Identity Federation preferred, an uploaded service-account
+			// key as fallback) and the cloud_connector row every later GCP surface
+			// resolves against. Nothing here discovers anything yet.
+			//
+			// discovery:read gates the onboarding package for the same reason as
+			// AWS's: a reviewer must be able to see the permissions AuthSec is
+			// asking for before granting them. discovery:admin gates every mutation.
+			cloudGCP := platformCtrl.NewCloudGCPController(config.DB)
+			discovery.GET("/gcp/onboarding", middlewares.Require("discovery", "read"), cloudGCP.GetOnboardingPackage)
+			discovery.POST("/gcp/connectors", middlewares.Require("discovery", "admin"), cloudGCP.CreateConnector)
+			discovery.GET("/gcp/connectors", middlewares.Require("discovery", "read"), cloudGCP.ListConnectors)
+			discovery.GET("/gcp/connectors/:id", middlewares.Require("discovery", "read"), cloudGCP.GetConnector)
+			discovery.POST("/gcp/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudGCP.VerifyConnector)
+			discovery.DELETE("/gcp/connectors/:id", middlewares.Require("discovery", "admin"), cloudGCP.RevokeConnector)
+
+			// Service account and key discovery, mirroring the AWS scan
+			// endpoint above: fire-and-forget, 202, and the connector row is
+			// the durable report you poll.
+			//
+			// Phase 1 reads two surfaces — identities and keys — and writes
+			// only cloud_identity and cloud_secret. IAM bindings, resources and
+			// workloads are later surfaces with their own phases; there is
+			// deliberately no separate trigger route for them, for the same
+			// reason AWS has none.
+			discovery.POST("/gcp/connectors/:id/scan", middlewares.Require("discovery", "admin"), cloudGCP.ScanConnector)
+
+			// Google Authentication — an ADDITIVE second onboarding option for
+			// GCP, alongside WIF and JSON key above (neither modified by this
+			// block). A human's one-time Google OAuth consent auto-provisions
+			// the same Workload Identity Federation resources the manual
+			// Cloud-Shell script creates, then hands off to the existing
+			// CreateConnector/Onboard path above — the resulting connector is
+			// an ordinary "wif"-method connector, indistinguishable from one
+			// created by hand. See controllers/platform/cloud_gcp_oauth_controller.go
+			// and services/gcp_oauth_provision_service.go.
+			cloudGCPOAuth := platformCtrl.NewCloudGCPOAuthController(config.DB)
+			discovery.GET("/gcp/google-oauth/status", middlewares.Require("discovery", "read"), cloudGCPOAuth.GoogleOAuthStatus)
+			discovery.POST("/gcp/google-oauth/start", middlewares.Require("discovery", "admin"), cloudGCPOAuth.StartGoogleOAuth)
+			discovery.GET("/gcp/google-oauth/projects", middlewares.Require("discovery", "read"), cloudGCPOAuth.ListGoogleProjects)
+			discovery.POST("/gcp/google-oauth/preflight", middlewares.Require("discovery", "admin"), cloudGCPOAuth.PreflightGoogleOAuth)
+			discovery.POST("/gcp/google-oauth/connectors", middlewares.Require("discovery", "admin"), cloudGCPOAuth.ProvisionGoogleOAuth)
+
+			// Google's OAuth redirect lands here — UNAUTHENTICATED by
+			// necessity, exactly like /connector-oauth/callback elsewhere in
+			// this file, and for the identical reason: the browser arrives
+			// with no AuthSec session, and this route must sit outside
+			// AuthMiddleware and outside this group's own :id-shaped routes
+			// (/gcp/connectors/:id) to avoid a collision in Gin's routing
+			// tree.
+			//
+			// Registered on the ROOT engine `r`, NOT on `authsec` (which
+			// carries its own "/authsec" path prefix even though it has no
+			// AuthMiddleware of its own — a RouterGroup's prefix always
+			// applies regardless of what middleware is or isn't attached to
+			// it). GCP_OAUTH_REDIRECT_URI — the value registered with Google
+			// and configured in this deployment's .env — is the bare
+			// "http://<host>/discovery/gcp/google-oauth/callback", with no
+			// "/authsec" segment, so the path Google actually redirects back
+			// to must match that exactly: registering this on `authsec`
+			// (which would produce "/authsec/discovery/gcp/google-oauth/
+			// callback") is what previously 404'd here. Live-confirmed via a
+			// real Google consent round trip.
+			r.GET("/discovery/gcp/google-oauth/callback", cloudGCPOAuth.GoogleOAuthCallback)
+		}
+
+		// ────────────────────────────────────────────────────
+		// Provisioning & Governance — /authsec/provisioning/*, /authsec/governance/*.
+		//
+		// Where discovery answers "what exists?", these answer "should it exist, with
+		// what authority, and is that still true?" — and then make it so.
+		//
+		// ALL of these are authenticated and permission-gated. The reasoning that made
+		// the discovery ingress unauthenticated does NOT transfer: a sighting grants
+		// nothing and lands `unregistered`, whereas provisioning grants real authority
+		// and de-provisioning takes it away.
+		//
+		// Provisioning is one transaction (PG-2) and de-provisioning is the single
+		// revocation path every mechanism funnels through (PG-6), which is why both
+		// live behind one controller rather than being spread across callers.
+		// ────────────────────────────────────────────────────
+
+		provisioning := authsec.Group("/provisioning")
+		provisioning.Use(middlewares.AuthMiddleware())
+		{
+			// Claimed sighting -> governed principal. discovery:claim is the permission
+			// that already means "may bring an agent under management", so provisioning
+			// reuses it rather than inventing a second gate for the same decision.
+			provisioning.POST("/agents/:id/provision",
+				middlewares.Require("discovery", "claim"), governanceController.ProvisionAgent)
+			// Taking authority away is its own permission: an operator who may enrol an
+			// agent is not automatically trusted to revoke a production one.
+			provisioning.POST("/agents/:id/deprovision",
+				middlewares.Require("governance", "revoke"), governanceController.DeprovisionAgent)
+		}
+
+		// The in-cluster agent's ACTUATION surface.
+		//
+		// Deliberately NOT under AuthMiddleware: the caller is a workload in a
+		// customer's cluster, not a console user. It authenticates with the
+		// per-connector actuation token, which also determines WHICH cluster is calling
+		// — so an agent never asserts its own identity.
+		//
+		// Unlike the discovery ingress this is authenticated, because the reasoning
+		// there does not carry over. A sighting grants nothing, but a forged
+		// UNQUARANTINE would lift a network deny, which fails OPEN. (A forged quarantine
+		// fails safe: it denies.)
+		actuation := authsec.Group("/provisioning")
+		{
+			actuation.GET("/instructions", governanceController.LeaseInstructions)
+			actuation.POST("/instructions/:id/result", governanceController.ReportInstruction)
+			// The enforcement plan: the WHOLE list of fingerprints this cluster
+			// should be containing, re-fetched on every actuation tick. Whole and
+			// not a delta, because a missed delta silently un-enforces while a
+			// whole plan is self-correcting on the next poll.
+			//
+			// The agent's self-report (mode, the version it is enforcing, its
+			// would-deny count) rides on this fetch as query parameters rather than
+			// on an endpoint of its own — one authenticated round trip that both
+			// reports and refreshes.
+			actuation.GET("/enforcement-plan", governanceController.GetEnforcementPlan)
+		}
+
+		governance := authsec.Group("/governance")
+		governance.Use(middlewares.AuthMiddleware())
+		{
+			// "Why does this subject have this?" — the question the platform could not
+			// answer before provenance existed, and the whole basis of certification.
+			governance.GET("/provenance",
+				middlewares.Require("governance", "read"), governanceController.ListProvenance)
+			governance.GET("/provenance/:id",
+				middlewares.Require("governance", "read"), governanceController.GetProvenance)
+
+			// Separation of duties. Reading rules and violations is a read; resolving a
+			// violation is a governance decision somebody has to answer for, so it needs
+			// governance:certify rather than governance:read.
+			governance.GET("/sod/rules",
+				middlewares.Require("governance", "read"), governanceController.ListSoDRules)
+			governance.GET("/sod/violations",
+				middlewares.Require("governance", "read"), governanceController.ListSoDViolations)
+			governance.POST("/sod/violations/:id/resolve",
+				middlewares.Require("governance", "certify"), governanceController.ResolveSoDViolation)
+			// "Would this grant conflict?" — lets a console warn before an operator
+			// submits, instead of surfacing the refusal as an error afterwards.
+			governance.POST("/sod/simulate",
+				middlewares.Require("governance", "read"), governanceController.SimulateSoD)
+			// Trigger a detective pass on demand, for after writing a new rule.
+			governance.POST("/sod/scan",
+				middlewares.Require("governance", "admin"), governanceController.RunSoDScan)
+
+			// Certification. Creating and closing a campaign is administration;
+			// DECIDING an item is the reviewer's act and needs governance:certify —
+			// which is deliberately NOT governance:admin, so a reviewer can work a
+			// campaign without gaining the ability to grant anything (PG-5).
+			governance.POST("/campaigns",
+				middlewares.Require("governance", "admin"), governanceController.CreateCampaign)
+			governance.GET("/campaigns",
+				middlewares.Require("governance", "read"), governanceController.ListCampaigns)
+			governance.GET("/campaigns/:id",
+				middlewares.Require("governance", "read"), governanceController.GetCampaign)
+			governance.POST("/campaigns/:id/generate",
+				middlewares.Require("governance", "admin"), governanceController.GenerateCampaign)
+			governance.GET("/campaigns/:id/items",
+				middlewares.Require("governance", "read"), governanceController.ListCampaignItems)
+			governance.POST("/campaigns/:id/items/:item/decide",
+				middlewares.Require("governance", "certify"), governanceController.DecideItem)
+			governance.POST("/campaigns/:id/close",
+				middlewares.Require("governance", "admin"), governanceController.CloseCampaign)
+
+			// Actuation. Enabling it mints the cluster's credential, so it is admin-only;
+			// the instruction list is a read.
+			governance.POST("/connectors/:id/actuation",
+				middlewares.Require("governance", "admin"), governanceController.EnableActuation)
+			governance.GET("/instructions",
+				middlewares.Require("governance", "read"), governanceController.ListInstructions)
+
+			// Human lifecycle. Birthright policy is administration; the reconcile is
+			// too, because it grants. The reports are reads.
+			governance.POST("/birthrights",
+				middlewares.Require("governance", "admin"), governanceController.CreateBirthright)
+			governance.GET("/birthrights",
+				middlewares.Require("governance", "read"), governanceController.ListBirthrights)
+			governance.DELETE("/birthrights/:id",
+				middlewares.Require("governance", "admin"), governanceController.DeleteBirthright)
+			// The bridge to the correlated IGA estate. Reading a proposal is a
+			// discovery read; DECIDING one is a correlation decision, so it takes
+			// iga:review — the same permission as the classification and ownership
+			// decisions it sits alongside, rather than a governance permission that
+			// would let an entitlement reviewer redefine what an agent IS.
+			// Agent policies — the declarative layer above enforcement.
+			// Authoring is governance:admin; a destructive on_expiry additionally
+			// needs an attributable confirmation, checked in the service.
+			governance.POST("/agent-policies",
+				middlewares.Require("governance", "admin"), governanceController.CreateAgentPolicy)
+			governance.GET("/agent-policies",
+				middlewares.Require("governance", "read"), governanceController.ListAgentPolicies)
+			governance.GET("/agent-policies/:id",
+				middlewares.Require("governance", "read"), governanceController.GetAgentPolicy)
+			governance.DELETE("/agent-policies/:id",
+				middlewares.Require("governance", "admin"), governanceController.DeleteAgentPolicy)
+			// Dry-run by default; a live run is refused until the phase order allows it.
+			governance.POST("/agent-policies/reconcile",
+				middlewares.Require("governance", "admin"), governanceController.ReconcileAgentPolicies)
+			// The lookahead: what this system will do to the cluster this week. Read
+			// permission on purpose — anyone who can see governance state should be
+			// able to see what is about to happen because of it.
+			governance.GET("/policies/upcoming",
+				middlewares.Require("governance", "read"), governanceController.ListUpcomingPolicyActions)
+
+			// What a cluster has actually been told to contain, and whether it says
+			// it is enforcing it. The gap between the published version and the
+			// reported one is the difference between a decision and its effect.
+			governance.GET("/connectors/:id/enforcement-plans",
+				middlewares.Require("governance", "read"), governanceController.ListEnforcementPlans)
+
+			// Pre-deadline warnings. The LOOKAHEAD above is the system of record —
+			// a pull, with no delivery to fail. These configure and inspect the
+			// escalation layered on top of it.
+			//
+			// Reading which warnings failed is governance:read on purpose: an
+			// undelivered warning is the thing standing between an operator and an
+			// unannounced deletion, so anyone who can see governance state should
+			// see it. CHANGING where warnings go is admin — redirecting them is
+			// indistinguishable from silencing them.
+			governance.GET("/notification-settings",
+				middlewares.Require("governance", "read"), governanceController.GetNotificationSettings)
+			governance.PUT("/notification-settings",
+				middlewares.Require("governance", "admin"), governanceController.UpdateNotificationSettings)
+			governance.GET("/policy-warnings",
+				middlewares.Require("governance", "read"), governanceController.ListPolicyWarnings)
+			// Schedule and send now rather than on the worker's tick, so "did my
+			// policy actually warn anyone" is answerable while setting one up.
+			governance.POST("/policy-warnings/run",
+				middlewares.Require("governance", "admin"), governanceController.RunPolicyWarnings)
+
+			// The force-delete escalation: override a PodDisruptionBudget that
+			// refused an eviction. THE ONLY WAY TO REACH ONE — no reconciler,
+			// policy expiry or retry path can, deliberately.
+			//
+			// governance:admin, not certify: this is not a review, it is
+			// destruction that overrides an availability guarantee somebody else
+			// set. The reason is required here, and again by a database CHECK.
+			governance.POST("/agents/:id/force-evict",
+				middlewares.Require("governance", "admin"), governanceController.ForceEvictAgent)
+
+			governance.GET("/iga-links",
+				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)
+
+			governance.POST("/jml/reconcile",
+				middlewares.Require("governance", "admin"), governanceController.ReconcileJML)
+			// The mover queue: grants whose policy no longer matches the holder.
+			governance.GET("/jml/stale",
+				middlewares.Require("governance", "read"), governanceController.ListStaleBirthrights)
+			// Agents whose accountable owner has been deactivated.
+			governance.GET("/jml/orphans",
+				middlewares.Require("governance", "read"), governanceController.ListOrphanedAgents)
 		}
 
 		// ────────────────────────────────────────────────────

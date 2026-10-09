@@ -1,10 +1,13 @@
 package repositories
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -25,8 +28,17 @@ type DiscoveryRepository interface {
 	CreateSource(s *models.DiscoverySource) error
 	GetSource(workspaceID, id uuid.UUID) (*models.DiscoverySource, error)
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
+	TouchSource(workspaceID, id uuid.UUID, status string) error
 	UpdateSource(s *models.DiscoverySource) error
-	DeleteSource(workspaceID, id uuid.UUID) error
+	// DeleteSource removes a source, its integration, and its findings, and
+	// revokes (never deletes) the ingest tokens bound to it. Returns a secrets-store path to purge when this was the workspace's last
+	// GitHub organisation, or "" when there is nothing to purge.
+	DeleteSource(workspaceID, id uuid.UUID) (string, error)
+
+	// UpsertSelfRegistration records a heartbeat from a deployed agent as ONE
+	// atomic statement keyed by (workspace_id, kind, instance_id). Machine-owned
+	// fields are refreshed; admin-owned ones are never overwritten.
+	UpsertSelfRegistration(s *models.DiscoverySource) (stored *models.DiscoverySource, created bool, err error)
 
 	GetAgent(workspaceID, id uuid.UUID) (*models.DiscoveredAgent, error)
 	GetAgentByFingerprint(workspaceID uuid.UUID, source, fingerprint string) (*models.DiscoveredAgent, error)
@@ -40,6 +52,23 @@ type DiscoveryRepository interface {
 	// human decision fields. Reports whether the row was newly created.
 	UpsertSighting(a *models.DiscoveredAgent) (stored *models.DiscoveredAgent, created bool, err error)
 
+	// ApplyLifecycleEvent appends an immutable event and folds its assertion into
+	// the agent's runtime columns, in one transaction. Returns the matched agent,
+	// or nil when the fingerprint is unknown — the event is still recorded.
+	ApplyLifecycleEvent(e *models.DiscoveredAgentEvent) (*models.DiscoveredAgent, error)
+
+	// ListAgentEvents returns the lifecycle history for one agent, newest first.
+	ListAgentEvents(workspaceID, agentID uuid.UUID, limit int) ([]models.DiscoveredAgentEvent, error)
+
+	// MarkAbsent folds a COMPLETE resync manifest into the inventory: every agent
+	// last seen in the manifest's scope but missing from it is marked gone.
+	// Returns the fingerprints it marked.
+	MarkAbsent(in MarkAbsentInput) ([]string, error)
+	// ApplyPresentRuntime folds a manifest's POSITIVE observations into the
+	// runtime state: fingerprints present but scaled to zero become stopped,
+	// and stopped ones present again with replicas become running. Never gone.
+	ApplyPresentRuntime(in PresentRuntimeInput) (stopped, resumed []string, err error)
+
 	// ClaimAgent links a sighting to a governed identity and an accountable
 	// owner in one conditional update. Refuses a quarantined or already-claimed
 	// agent.
@@ -47,9 +76,16 @@ type DiscoveryRepository interface {
 
 	// QuarantineAgent flags an agent untrusted, which blocks a later claim.
 	QuarantineAgent(workspaceID, id uuid.UUID, reason string, by *uuid.UUID) (*models.DiscoveredAgent, error)
+	// ReleaseQuarantine lifts a quarantine, returning the agent to the status it held
+	// before it. Guarded on status='quarantined' so a race cannot release twice.
+	ReleaseQuarantine(workspaceID, id uuid.UUID, by *uuid.UUID) (*models.DiscoveredAgent, error)
 
 	// Coverage returns registered-over-total segmented by origin and source.
 	Coverage(workspaceID uuid.UUID) (*models.AgentCoverage, error)
+
+	// DB exposes the handle so the service can queue in-cluster enforcement alongside
+	// a governance decision.
+	DB() *gorm.DB
 }
 
 // AgentFilter narrows an inventory listing. Empty fields are ignored. The
@@ -61,8 +97,50 @@ type AgentFilter struct {
 	Source           string
 	Archetype        string
 	UnownedOnly      bool
-	Limit            int
-	Offset           int
+	// RuntimeStatus filters on OBSERVED state (running/stopped/gone/unknown).
+	RuntimeStatus string
+	// LiveOnly excludes agents observed to be gone. This is what the actionable
+	// Unregistered Agents queue wants: a deleted agent needs no claim decision, and
+	// leaving it in the queue means coverage never reaches 100%.
+	LiveOnly bool
+	// DiscoverySourceID scopes to one connector — in practice, "agents in this
+	// cluster", which is the question self-registration exists to make answerable.
+	DiscoverySourceID *uuid.UUID
+	Limit             int
+	Offset            int
+}
+
+// MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
+// inside the scope actually swept, which is why Namespaces is required rather
+// than optional: the agent never looked outside it.
+type MarkAbsentInput struct {
+	WorkspaceID uuid.UUID
+	Source      string
+	SourceID    *uuid.UUID
+	ClusterName string
+	// Present is every fingerprint the sweep observed.
+	Present []string
+	// Namespaces bounds the sweep. An agent in an unswept namespace must not be
+	// marked gone just because this manifest does not mention it.
+	Namespaces []string
+	// SweepStartedAt is when the sweep BEGAN. Absence is only evidence for agents
+	// that already existed then: one created mid-sweep is legitimately missing from
+	// the manifest, and comparing against the sweep's end would retire it.
+	SweepStartedAt time.Time
+	ObservedAt     time.Time
+	Reason         string
+}
+
+// PresentRuntimeInput is what a manifest observed PRESENT, split by whether it
+// was running: Stopped are workloads that exist with zero replicas, Running the
+// rest. Scoped like MarkAbsent: one workspace, source kind and cluster.
+type PresentRuntimeInput struct {
+	WorkspaceID uuid.UUID
+	Source      string
+	ClusterName string
+	Stopped     []string
+	Running     []string
+	ObservedAt  time.Time
 }
 
 // ClaimAgentInput carries everything a claim needs. OwnerUserID is mandatory —
@@ -83,6 +161,8 @@ func NewDiscoveryRepository(db *gorm.DB) DiscoveryRepository {
 	return &discoveryRepository{db}
 }
 
+func (r *discoveryRepository) DB() *gorm.DB { return r.db }
+
 /* ------------------------------- sources -------------------------------- */
 
 func (r *discoveryRepository) CreateSource(s *models.DiscoverySource) error {
@@ -94,6 +174,12 @@ func (r *discoveryRepository) GetSource(workspaceID, id uuid.UUID) (*models.Disc
 	if err := r.db.First(&s, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 		return nil, err
 	}
+	// The same computed-on-read count ListSources produces, so a detail view and
+	// a list view can never disagree about how many agents a source found. Best
+	// effort: a failed count must not turn a readable source into an error.
+	_ = r.db.Model(&models.DiscoveredAgent{}).
+		Where("workspace_id = ? AND discovery_source_id = ?", workspaceID, id).
+		Count(&s.AgentCount).Error
 	return &s, nil
 }
 
@@ -106,23 +192,386 @@ func (r *discoveryRepository) ListSources(workspaceID uuid.UUID, kind string, en
 		q = q.Where("enabled = ?", true)
 	}
 	var sources []models.DiscoverySource
-	err := q.Order("kind, display_name").Find(&sources).Error
-	return sources, err
+	if err := q.Order("kind, display_name").Find(&sources).Error; err != nil {
+		return nil, err
+	}
+	if len(sources) == 0 {
+		return sources, nil
+	}
+
+	// One grouped query for the whole page rather than a count per row.
+	type row struct {
+		DiscoverySourceID uuid.UUID
+		N                 int64
+	}
+	var rows []row
+	if err := r.db.Model(&models.DiscoveredAgent{}).
+		Select("discovery_source_id, count(*) AS n").
+		Where("workspace_id = ? AND discovery_source_id IS NOT NULL", workspaceID).
+		Group("discovery_source_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	counts := make(map[uuid.UUID]int64, len(rows))
+	for _, x := range rows {
+		counts[x.DiscoverySourceID] = x.N
+	}
+	for i := range sources {
+		sources[i].AgentCount = counts[sources[i].ID]
+	}
+	return sources, nil
+}
+
+// TouchSource records that a source just reported. Best-effort: a sighting must
+// never fail because the liveness stamp could not be written, so the caller
+// ignores the error. Without this, last_sync_at is never written by anything and
+// the console shows every integration as "Never run" forever.
+func (r *discoveryRepository) TouchSource(workspaceID, id uuid.UUID, status string) error {
+	// A sighting NEVER clears a recorded cluster UID conflict. The sighting
+	// that touches the source may be the matching cluster's -- or the very
+	// sighting just refused for its UID -- and it proves nothing about the
+	// conflicting one, so letting it reset last_status/last_error hid the
+	// conflict seconds after it was recorded (and made which one the console
+	// showed depend on the order sightings arrived in). The conflict stays
+	// until a heartbeat from the recorded cluster UID clears it after the hold
+	// (UpsertSelfRegistration), or an operator updates the connection.
+	conflicted := `last_status = '` + ClusterUIDConflictStatus + `'`
+	return r.db.Model(&models.DiscoverySource{}).
+		Where("workspace_id = ? AND id = ?", workspaceID, id).
+		Updates(map[string]interface{}{
+			"last_sync_at": time.Now(),
+			"last_status":  gorm.Expr(`CASE WHEN `+conflicted+` THEN last_status ELSE ? END`, status),
+			"last_error":   gorm.Expr(`CASE WHEN ` + conflicted + ` THEN last_error ELSE '' END`),
+			"updated_at":   time.Now(),
+		}).Error
 }
 
 func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 	return r.db.Save(s).Error
 }
 
-func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) error {
-	res := r.db.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
-	if res.Error != nil {
-		return res.Error
+// DeleteSource removes a discovery source and the integration binding it owns.
+//
+// The cascade is the point. A repo_scan source is created together with an
+// iga_integrations row that exists only to serve it, and deleting the source
+// alone used to strand that row: it kept reporting itself as an active,
+// verified GitHub binding for an organisation nobody was scanning any more, and
+// nothing in the console could reach it to clear it.
+//
+// Both statements run in one transaction because a half-applied delete is the
+// same stranded row by another route. This is why the reach into
+// iga_integrations lives here rather than a layer up, where the two deletes
+// could not share a transaction.
+//
+// The findings go too. discovered_agents.discovery_source_id is ON DELETE SET
+// NULL, so leaving the database to it produces rows with no source at all --
+// sightings the console still lists and counts toward coverage, with nothing
+// left that can rescan, refresh or explain them. There is an argument that a
+// finding should outlive its scanner, and this used to implement it; in practice
+// it made "delete" mean "hide the integration and keep its rows forever", which
+// is not what deleting an integration is for. Deleting is now deleting.
+//
+// Everything that points at discovered_agents (events, access requests,
+// provenance, provisioning instructions, IGA links) is itself ON DELETE SET
+// NULL, so this cannot cascade into an audit trail or fail on a dependent row.
+//
+// The source's ingest tokens are REVOKED, not deleted, in the same transaction
+// and before the source row goes (RevokeSourceIngestTokens). Their foreign key
+// is ON DELETE SET NULL (044), so they stay as revoked history with
+// source_bound true and no source; a NULL source on an unrevoked bound token
+// would read as a workspace-wide token, which the table's CHECK refuses -- so a
+// delete that did not revoke first fails instead of widening a credential.
+func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
+	purgePath := ""
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var src models.DiscoverySource
+		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
+			return err
+		}
+
+		integrationID := ""
+		if len(src.Config) > 0 {
+			var cfg struct {
+				IntegrationID string `json:"integration_id"`
+			}
+			_ = json.Unmarshal(src.Config, &cfg)
+			integrationID = cfg.IntegrationID
+		}
+
+		// The graph objects only this source vouched for are retired, and its
+		// own claims ended and kept as history -- BEFORE the source row goes,
+		// because the FK cascade deletes the support rows that say which
+		// objects those are. Left to the cascade, they stayed active with no
+		// support, hidden from every view and retired by none.
+		if _, rerr := k8sgraph.RetireSource(tx, workspaceID, id, time.Now().UTC()); rerr != nil {
+			return fmt.Errorf("retire the source's graph objects: %w", rerr)
+		}
+
+		// BEFORE the source: once the source row goes, the FK nulls
+		// discovery_source_id and there is no way left to tell which findings
+		// belonged to it.
+		if derr := tx.Delete(&models.DiscoveredAgent{},
+			"workspace_id = ? AND discovery_source_id = ?", workspaceID, id).Error; derr != nil {
+			return derr
+		}
+
+		// BEFORE the source, like the findings: an agent holding a token bound
+		// to this source must stop authenticating the moment it is gone.
+		if _, terr := RevokeSourceIngestTokens(tx, workspaceID, id); terr != nil {
+			return fmt.Errorf("revoke the source's ingest tokens: %w", terr)
+		}
+
+		res := tx.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+
+		if integrationID != "" {
+			if integID, perr := uuid.Parse(integrationID); perr == nil {
+				// Not checked for RowsAffected: a source whose integration was
+				// already removed is a source we still want deleted, not an
+				// error that leaves it in place.
+				if derr := tx.Delete(&models.IGAIntegration{},
+					"id = ? AND workspace_id = ?", integID, workspaceID).Error; derr != nil {
+					return derr
+				}
+			}
+		}
+
+		// Removing the LAST GitHub organisation also forgets the workspace's
+		// GitHub App. Otherwise "delete the integration" leaves a registered App
+		// and a private key behind with nothing using them -- which is where the
+		// App appeared to come from after a delete, since the wizard reads it and
+		// skips its own first step.
+		if src.Kind == models.DiscoverySourceRepoScan {
+			var remaining int64
+			if cerr := tx.Model(&models.DiscoverySource{}).
+				Where("workspace_id = ? AND kind = ?", workspaceID, models.DiscoverySourceRepoScan).
+				Count(&remaining).Error; cerr != nil {
+				return cerr
+			}
+
+			// The App key store is SHARED with the connector action broker, whose
+			// shipped use is an agent calling a provider through it. Deleting the
+			// key while a GitHub connector still exists would break that with an
+			// error naming nothing the operator did. Discovery only gets to
+			// remove the App when it is the last thing using it.
+			var brokerConnectors int64
+			if cerr := tx.Table("connectors").
+				Where("workspace_id = ? AND provider_key = ?", workspaceID, "github").
+				Count(&brokerConnectors).Error; cerr != nil {
+				return cerr
+			}
+
+			if remaining == 0 && brokerConnectors == 0 {
+				var app models.ConnectorProviderApp
+				if ferr := tx.First(&app, "workspace_id = ? AND provider_key = ?",
+					workspaceID, "github").Error; ferr == nil {
+					if derr := tx.Delete(&models.ConnectorProviderApp{},
+						"workspace_id = ? AND provider_key = ?", workspaceID, "github").Error; derr != nil {
+						return derr
+					}
+					// Purged by the caller: the secrets store is not part of this
+					// transaction, so it must happen only after the commit that
+					// makes the row's removal real.
+					purgePath = app.VaultPath
+				}
+			}
+		}
+		return nil
+	})
+	return purgePath, err
+}
+
+/* -------------------------- self-registration --------------------------- */
+
+// ClusterUIDConflictStatus is the last_status a self-registered connector
+// carries while an agent registering under its instance reports a cluster UID
+// other than the one the connector recorded first (see UpsertSelfRegistration).
+const ClusterUIDConflictStatus = "cluster_uid_conflict"
+
+// clusterUIDConflictHold is how long a recorded cluster UID conflict stays on
+// the connector after the last conflicting heartbeat. Several heartbeat
+// intervals, so the matching cluster's heartbeats in between do not clear it.
+const clusterUIDConflictHold = 15 * time.Minute
+
+// RecordClusterUIDConflict marks a connector cluster_uid_conflict because
+// something other than a heartbeat -- an RBAC snapshot, a resync manifest, a
+// sighting -- reported a cluster UID other than the one it recorded. The same
+// three fields UpsertSelfRegistration writes for a conflicting heartbeat
+// (last_status, last_error, runtime.cluster_uid_conflict with last_seen_at
+// now), so the console shows one kind of conflict however it was detected, and
+// the heartbeat path's hold keeps it visible. The recorded UID itself is never
+// touched. Never fails the caller's request: the error is returned for the
+// caller to log.
+//
+// reportedUID "" records data that stated NO cluster UID for a connector that
+// has one (refused under IGA_K8S_REQUIRE_CLUSTER_UID): the same status and
+// runtime key, with reported_uid "" and reason "missing", and a last_error
+// that says the UID was missing rather than naming an empty cluster.
+func RecordClusterUIDConflict(db *gorm.DB, workspaceID, sourceID uuid.UUID,
+	reportedUID, via string) error {
+
+	if reportedUID == "" {
+		return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_required: this connection belongs to cluster %s, but an incoming %s '
+		        || 'states no cluster UID, so it cannot be shown to come from this cluster and is '
+		        || 'refused. Upgrade the agent so it reports its cluster UID, or set '
+		        || 'IGA_K8S_REQUIRE_CLUSTER_UID=false on the control plane.', cluster_uid, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', '',
+		                              'reason', 'missing', 'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ? AND cluster_uid <> ''`,
+			ClusterUIDConflictStatus, via, via, workspaceID, sourceID).Error
 	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+
+	return db.Exec(`
+		UPDATE discovery_sources
+		   SET last_status = ?,
+		       last_error = format(
+		           'cluster_uid_conflict: this connection belongs to cluster %s, but an incoming %s '
+		        || 'reports cluster %s. Two clusters are installed under one cluster name; '
+		        || 'data from %s is refused. Rename one cluster, or delete and re-add this '
+		        || 'connection to re-bind it.', cluster_uid, ?::text, ?::text, ?::text),
+		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', ?::text,
+		                              'via', ?::text, 'last_seen_at', now())),
+		       updated_at = now()
+		 WHERE workspace_id = ? AND id = ?
+		   AND cluster_uid <> '' AND cluster_uid <> ?`,
+		ClusterUIDConflictStatus, via, reportedUID, reportedUID, reportedUID, via,
+		workspaceID, sourceID, reportedUID).Error
+}
+
+// UpsertSelfRegistration folds an agent heartbeat into its connector row.
+//
+// ON CONFLICT against the PARTIAL unique index discovery_sources_instance_key.
+// The TargetWhere is not optional decoration: Postgres will only infer a partial
+// index when the statement repeats the index predicate, so without
+// `WHERE instance_id <> ”` this fails to find any arbiter index at all.
+//
+// One statement, so N agent replicas heartbeating concurrently cannot each insert
+// a row for the same cluster.
+func (r *discoveryRepository) UpsertSelfRegistration(s *models.DiscoverySource) (*models.DiscoverySource, bool, error) {
+	if s.InstanceID == "" {
+		return nil, false, errors.New("instance_id is required for self-registration")
 	}
-	return nil
+	proposedID := s.ID
+
+	// Machine-owned fields only. display_name, enabled, config, created_by and
+	// created_at are deliberately absent: an admin may rename a connector or
+	// disable it, and the next heartbeat 60 seconds later must not undo that.
+	// last_status, last_error, runtime and cluster_uid are set below: each
+	// depends on whether this heartbeat's cluster UID conflicts with the row's.
+	assignments := map[string]interface{}{
+		"cluster_name":      s.ClusterName,
+		"agent_version":     s.AgentVersion,
+		"last_heartbeat_at": s.LastHeartbeatAt,
+		"self_registered":   true,
+		"updated_at":        time.Now(),
+	}
+	// THE FIRST RECORDED CLUSTER UID WINS, and nothing a heartbeat says moves it.
+	//
+	// The UID is the only evidence of which physical cluster this row belongs
+	// to, and the RBAC snapshot path refuses any sweep whose UID differs from it
+	// (ErrClusterUIDMismatch). Letting the latest heartbeat overwrite it meant a
+	// second cluster installed under the same name could re-point the row at
+	// itself with one heartbeat -- its sweeps then accepted, the real cluster's
+	// refused, and which one "owned" the row flipping with every heartbeat.
+	//
+	// So: an empty UID is filled once; an empty report never erases one (an
+	// agent that lost the RBAC to read it); and a DIFFERENT non-empty report is
+	// recorded as a conflict -- last_status cluster_uid_conflict, both UIDs in
+	// last_error and runtime.cluster_uid_conflict -- while the heartbeat itself is
+	// still accepted (liveness, version and runtime are refreshed). The only way
+	// to change a recorded UID is to delete the connection and let the agent
+	// register again.
+	//
+	// The conflict is HELD for clusterUIDConflictHold after the last conflicting
+	// heartbeat. Both clusters heartbeat under the same instance_id ("k8s:" +
+	// cluster name), so without the hold the matching cluster's next heartbeat
+	// would clear the status a minute later and the console would show the
+	// conflict only half of the time.
+	//
+	// In ON CONFLICT DO UPDATE every discovery_sources.* reference reads the row
+	// as it was BEFORE this statement, so the expressions below see the same
+	// recorded UID regardless of the order Postgres applies them in.
+	conflict := `(excluded.cluster_uid <> '' AND discovery_sources.cluster_uid <> ''
+	              AND excluded.cluster_uid <> discovery_sources.cluster_uid)`
+	// A heartbeat stating NO UID never clears a recorded conflict either: it
+	// is not the recorded cluster vouching for itself. Only a heartbeat from
+	// the recorded UID (after the hold) or an operator clears it.
+	held := `((discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	          AND (discovery_sources.runtime->'cluster_uid_conflict'->>'last_seen_at')::timestamptz
+	              > now() - make_interval(secs => ?))
+	         OR (discovery_sources.last_status = '` + ClusterUIDConflictStatus + `'
+	             AND excluded.cluster_uid = ''))`
+	hold := clusterUIDConflictHold.Seconds()
+	assignments["cluster_uid"] = gorm.Expr(
+		"CASE WHEN discovery_sources.cluster_uid = '' THEN excluded.cluster_uid ELSE discovery_sources.cluster_uid END")
+	assignments["last_status"] = gorm.Expr(
+		`CASE WHEN `+conflict+` OR `+held+` THEN '`+ClusterUIDConflictStatus+`'
+		      ELSE excluded.last_status END`, hold)
+	assignments["last_error"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN format(
+		          'cluster_uid_conflict: this connection belongs to cluster %s, but an agent '
+		       || 'registering under the same instance (%s) reports cluster %s. Two clusters are '
+		       || 'installed under one cluster name; RBAC snapshots from %s are refused. Rename '
+		       || 'one cluster, or delete and re-add this connection to re-bind it.',
+		          discovery_sources.cluster_uid, discovery_sources.instance_id,
+		          excluded.cluster_uid, excluded.cluster_uid)
+		      WHEN `+held+` THEN discovery_sources.last_error
+		      ELSE excluded.last_error END`, hold)
+	assignments["runtime"] = gorm.Expr(
+		`CASE WHEN `+conflict+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          jsonb_build_object('recorded_uid', discovery_sources.cluster_uid,
+		                             'reported_uid', excluded.cluster_uid,
+		                             'last_seen_at', now()))
+		      WHEN `+held+` THEN excluded.runtime || jsonb_build_object('cluster_uid_conflict',
+		          discovery_sources.runtime->'cluster_uid_conflict')
+		      ELSE excluded.runtime END`, hold)
+	// last_sync_at means "last did useful work", which a heartbeat is not — an idle
+	// cluster heartbeats without producing sightings. Only advance it when the
+	// agent says it actually reported something.
+	if s.LastSyncAt != nil {
+		assignments["last_sync_at"] = s.LastSyncAt
+	}
+
+	err := r.db.Clauses(
+		clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "workspace_id"}, {Name: "kind"}, {Name: "instance_id"},
+			},
+			TargetWhere: clause.Where{
+				Exprs: []clause.Expression{gorm.Expr("instance_id <> ''")},
+			},
+			DoUpdates: clause.Assignments(assignments),
+		},
+		clause.Returning{},
+	).Create(s).Error
+	if err != nil {
+		// A self-registering agent proposes a display name derived from its cluster.
+		// If an admin already created a connector under that exact name, the insert
+		// trips the display-name uniqueness constraint instead of the instance one,
+		// and ON CONFLICT cannot catch a different arbiter. Say so plainly — the
+		// generic Postgres text gives an operator nothing to act on.
+		if strings.Contains(err.Error(), "discovery_sources_workspace_kind_name_key") {
+			return nil, false, fmt.Errorf(
+				"a %s connector named %q already exists in this workspace and is not the "+
+					"self-registered one for cluster %q; rename it in the console so the agent "+
+					"can register", s.Kind, s.DisplayName, s.ClusterName)
+		}
+		return nil, false, err
+	}
+
+	return s, s.ID == proposedID, nil
 }
 
 /* -------------------------------- agents -------------------------------- */
@@ -163,16 +612,33 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	if f.UnownedOnly {
 		q = q.Where("owner_user_id IS NULL")
 	}
+	if f.RuntimeStatus != "" {
+		q = q.Where("runtime_status = ?", f.RuntimeStatus)
+	}
+	if f.LiveOnly {
+		// 'unknown' is included on purpose: never observing an agent's lifecycle is
+		// not evidence it is gone, and excluding it would quietly hide every row that
+		// predates lifecycle tracking.
+		q = q.Where("runtime_status <> ?", models.RuntimeStatusGone)
+	}
+	if f.DiscoverySourceID != nil {
+		q = q.Where("discovery_source_id = ?", *f.DiscoverySourceID)
+	}
 
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	// Manual origin first, then unknown, then automated — the report should lead
-	// with the agents nobody can attribute.
+	// Agents observed gone sort last regardless of origin: a destroyed agent needs
+	// no claim decision, so leading the report with one wastes the reviewer's
+	// attention on work that no longer exists.
+	//
+	// Within the live set: manual origin first, then unknown, then automated — the
+	// report should lead with the agents nobody can attribute.
 	var agents []models.DiscoveredAgent
-	err := q.Order("CASE deployment_origin WHEN 'manual' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END").
+	err := q.Order("CASE WHEN runtime_status = 'gone' THEN 1 ELSE 0 END").
+		Order("CASE deployment_origin WHEN 'manual' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END").
 		Order("last_seen_at DESC").
 		Limit(f.Limit).Offset(f.Offset).
 		Find(&agents).Error
@@ -222,6 +688,25 @@ func (r *discoveryRepository) UpsertSighting(a *models.DiscoveredAgent) (*models
 		"last_seen_at":   time.Now(),
 		"sighting_count": gorm.Expr("discovered_agents.sighting_count + 1"),
 		"updated_at":     time.Now(),
+		// A sighting is positive evidence the workload exists right now, so it is
+		// also a runtime observation — but only if it is NEWER than whatever last set
+		// the runtime state. Without this guard a sighting delayed in the agent's
+		// retry queue would resurrect an agent that was deleted after it was
+		// enqueued, and the inventory would show a destroyed agent as running.
+		"runtime_status": gorm.Expr(`CASE
+			WHEN discovered_agents.runtime_observed_at IS NULL
+			  OR excluded.runtime_observed_at >= discovered_agents.runtime_observed_at
+			THEN excluded.runtime_status
+			ELSE discovered_agents.runtime_status END`),
+		"runtime_reason": gorm.Expr(`CASE
+			WHEN discovered_agents.runtime_observed_at IS NULL
+			  OR excluded.runtime_observed_at >= discovered_agents.runtime_observed_at
+			THEN excluded.runtime_reason
+			ELSE discovered_agents.runtime_reason END`),
+		// GREATEST ignores NULL inputs in Postgres, so a first-ever runtime
+		// observation lands correctly without a special case.
+		"runtime_observed_at": gorm.Expr(
+			"GREATEST(excluded.runtime_observed_at, discovered_agents.runtime_observed_at)"),
 		// Refresh the descriptive fields, but keep the stored value when the
 		// connector sends nothing.
 		"display_name": gorm.Expr(
@@ -237,6 +722,18 @@ func (r *discoveryRepository) UpsertSighting(a *models.DiscoveredAgent) (*models
 			"CASE WHEN discovered_agents.status = 'unregistered' THEN excluded.deployment_origin ELSE discovered_agents.deployment_origin END"),
 		"archetype": gorm.Expr(
 			"CASE WHEN discovered_agents.archetype = '' THEN excluded.archetype ELSE discovered_agents.archetype END"),
+		// evidence_mode is a property of HOW we learned about this agent, so the
+		// incoming sighting is authoritative: a declaration later observed
+		// running is a genuine upgrade in what we know.
+		"evidence_mode": gorm.Expr("excluded.evidence_mode"),
+		// The runtime timestamp only ever moves FORWARD, and a declaration
+		// (which sends NULL) must never erase a real runtime observation made
+		// by a collector. Keeping the best fact from either feed is also what
+		// makes the shadow-agent question answerable later: one row can hold
+		// "declared here" and "seen running there" at the same time.
+		"last_observed_running_at": gorm.Expr(
+			"GREATEST(COALESCE(excluded.last_observed_running_at, discovered_agents.last_observed_running_at), " +
+				"COALESCE(discovered_agents.last_observed_running_at, excluded.last_observed_running_at))"),
 	}
 	// Deliberately NOT updated on conflict: status, matched_client_id,
 	// owner_user_id, claimed_*, quarantined_*, first_seen_at. Those are human
@@ -256,6 +753,268 @@ func (r *discoveryRepository) UpsertSighting(a *models.DiscoveredAgent) (*models
 	}
 
 	return a, a.ID == proposedID, nil
+}
+
+/* ---------------------------- lifecycle events -------------------------- */
+
+// ApplyLifecycleEvent appends the event and folds its assertion into the agent's
+// runtime columns, in one transaction.
+//
+// The event is recorded even when no agent row matches the fingerprint. That is
+// the whole point of allowing a null discovered_agent_id: an agent created and
+// destroyed between two resyncs, or deleted while the reporting queue was backed
+// up, leaves this event as the only evidence it ever existed. Dropping it would
+// erase that.
+func (r *discoveryRepository) ApplyLifecycleEvent(e *models.DiscoveredAgentEvent) (*models.DiscoveredAgent, error) {
+	if e.ID == uuid.Nil {
+		e.ID = uuid.New()
+	}
+	if e.ObservedAt.IsZero() {
+		e.ObservedAt = time.Now()
+	}
+
+	var out *models.DiscoveredAgent
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var agent models.DiscoveredAgent
+		findErr := tx.First(&agent, "workspace_id = ? AND source = ? AND fingerprint = ?",
+			e.WorkspaceID, e.Source, e.Fingerprint).Error
+
+		switch {
+		case findErr == nil:
+			e.DiscoveredAgentID = &agent.ID
+			if e.DiscoverySourceID == nil {
+				e.DiscoverySourceID = agent.DiscoverySourceID
+			}
+			// An observation landing on a row we had written off is worth its own
+			// event kind: "the agent you were told was destroyed is back" is a
+			// governance signal, not a routine sighting.
+			if e.Event == models.AgentEventObserved &&
+				(agent.RuntimeStatus == models.RuntimeStatusGone ||
+					agent.RuntimeStatus == models.RuntimeStatusStopped) {
+				e.Event = models.AgentEventReappeared
+			}
+		case errors.Is(findErr, gorm.ErrRecordNotFound):
+			// Leave DiscoveredAgentID nil; the event still gets written.
+		default:
+			return findErr
+		}
+
+		if err := tx.Create(e).Error; err != nil {
+			return err
+		}
+
+		// Nothing to fold: either no row, or a purely informational event such as a
+		// controller-owned pod being rescheduled, which asserts no runtime state.
+		if e.DiscoveredAgentID == nil || e.RuntimeStatus == "" {
+			if e.DiscoveredAgentID != nil {
+				out = &agent
+			}
+			return nil
+		}
+
+		fields := map[string]interface{}{
+			"runtime_status":      e.RuntimeStatus,
+			"runtime_reason":      e.Reason,
+			"runtime_observed_at": e.ObservedAt,
+			"updated_at":          time.Now(),
+		}
+		// Termination attribution is history, not current state: keep the first
+		// answer to "who destroyed this" rather than overwriting it if the agent is
+		// later recreated and deleted again by someone else. COALESCE on the stored
+		// value would hide that, so only set it when it is currently unset.
+		if e.RuntimeStatus == models.RuntimeStatusGone {
+			fields["terminated_at"] = e.ObservedAt
+			if e.Actor != "" && agent.TerminatedBy == "" {
+				fields["terminated_by"] = e.Actor
+			}
+		}
+
+		// The monotonic guard. Admission and resync observe independently and their
+		// reports can arrive out of order — a resync that started before a delete can
+		// land after it. Applying only observations at least as recent as the stored
+		// one means late evidence is ignored rather than believed.
+		res := tx.Model(&models.DiscoveredAgent{}).
+			Where("id = ? AND workspace_id = ?", agent.ID, e.WorkspaceID).
+			Where("runtime_observed_at IS NULL OR runtime_observed_at <= ?", e.ObservedAt).
+			Updates(fields)
+		if res.Error != nil {
+			return res.Error
+		}
+
+		var refreshed models.DiscoveredAgent
+		if err := tx.First(&refreshed, "id = ?", agent.ID).Error; err != nil {
+			return err
+		}
+		out = &refreshed
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *discoveryRepository) ListAgentEvents(workspaceID, agentID uuid.UUID, limit int) ([]models.DiscoveredAgentEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var events []models.DiscoveredAgentEvent
+	err := r.db.Where("workspace_id = ? AND discovered_agent_id = ?", workspaceID, agentID).
+		Order("observed_at DESC").
+		Limit(limit).
+		Find(&events).Error
+	return events, err
+}
+
+// MarkAbsent folds a completed sweep into the inventory: agents in the swept
+// scope that the sweep did not observe are marked gone.
+//
+// Three scoping conditions, each of which prevents a specific false positive:
+//
+//   - cluster_name — one workspace can hold agents from many clusters, and a sweep
+//     of cluster A says nothing whatsoever about cluster B.
+//   - namespace IN swept — the agent never looked outside its configured scope, so
+//     absence there is not evidence.
+//   - last_seen_at < sweep start — an agent created WHILE the sweep was running is
+//     legitimately missing from the manifest. Comparing against the sweep's start
+//     rather than its end is what stops the reconciler from immediately retiring
+//     a workload that admission reported seconds earlier.
+func (r *discoveryRepository) MarkAbsent(in MarkAbsentInput) ([]string, error) {
+	if in.WorkspaceID == uuid.Nil || in.Source == "" {
+		return nil, errors.New("workspace and source are required to reconcile a manifest")
+	}
+	if len(in.Namespaces) == 0 {
+		// A sweep with no scope observed nothing, so it can prove nothing. Refusing
+		// is important: an empty scope with an empty fingerprint list would otherwise
+		// read as "the whole cluster is empty" and retire the entire inventory.
+		return nil, errors.New("a manifest must name the namespaces it swept")
+	}
+	if in.ObservedAt.IsZero() {
+		in.ObservedAt = time.Now()
+	}
+	sweepStart := in.SweepStartedAt
+	if sweepStart.IsZero() {
+		sweepStart = in.ObservedAt
+	}
+
+	q := r.db.Model(&models.DiscoveredAgent{}).
+		Where("workspace_id = ? AND source = ?", in.WorkspaceID, in.Source).
+		Where("runtime_status <> ?", models.RuntimeStatusGone).
+		Where("metadata #>> '{cluster,name}' = ?", in.ClusterName).
+		Where("metadata #>> '{kubernetes,namespace}' IN ?", in.Namespaces).
+		Where("last_seen_at < ?", sweepStart).
+		Where("runtime_observed_at IS NULL OR runtime_observed_at <= ?", in.ObservedAt)
+
+	if len(in.Present) > 0 {
+		q = q.Where("fingerprint NOT IN ?", in.Present)
+	}
+
+	// Read the victims first so the caller can write an event per fingerprint. The
+	// blind UPDATE would be cheaper, but then "this agent was retired" would exist
+	// nowhere a human could later find it.
+	var victims []models.DiscoveredAgent
+	if err := q.Session(&gorm.Session{}).Find(&victims).Error; err != nil {
+		return nil, err
+	}
+	if len(victims) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(victims))
+	fingerprints := make([]string, 0, len(victims))
+	for _, v := range victims {
+		ids = append(ids, v.ID)
+		fingerprints = append(fingerprints, v.Fingerprint)
+	}
+
+	reason := in.Reason
+	if reason == "" {
+		reason = "absent from a complete resync sweep of this cluster"
+	}
+
+	err := r.db.Model(&models.DiscoveredAgent{}).
+		Where("id IN ?", ids).
+		Updates(map[string]interface{}{
+			"runtime_status":      models.RuntimeStatusGone,
+			"runtime_reason":      reason,
+			"runtime_observed_at": in.ObservedAt,
+			// terminated_by is deliberately NOT set. A sweep can prove that something
+			// is absent; it can never say who removed it. Writing a guess here would
+			// put an unattributable deletion in front of a reviewer as if it were
+			// attributed.
+			"terminated_at": in.ObservedAt,
+			"updated_at":    time.Now(),
+		}).Error
+	if err != nil {
+		return nil, err
+	}
+	return fingerprints, nil
+}
+
+// ApplyPresentRuntime marks present-but-scaled-to-zero agents stopped and
+// stopped agents that are running again running.
+//
+// Both are POSITIVE observations -- the sweep saw the workload -- so neither
+// needs a complete sweep, and neither can ever produce gone: a workload scaled
+// to zero still exists, and retiring it would delete an agent that is one
+// `kubectl scale` from running. Only a row that is currently running/unknown
+// becomes stopped, and only a stopped one becomes running: a gone row is not
+// resurrected here (a sighting does that, with its reappeared event), and the
+// monotonic guard keeps a late manifest from overriding newer evidence.
+func (r *discoveryRepository) ApplyPresentRuntime(in PresentRuntimeInput) ([]string, []string, error) {
+	if in.WorkspaceID == uuid.Nil || in.Source == "" || strings.TrimSpace(in.ClusterName) == "" {
+		return nil, nil, errors.New("workspace, source and cluster are required to apply runtime state")
+	}
+	if in.ObservedAt.IsZero() {
+		in.ObservedAt = time.Now()
+	}
+	// set is a fixed SQL fragment; every value goes through a placeholder.
+	apply := func(fps, from []string, set string, setArgs ...interface{}) ([]string, error) {
+		if len(fps) == 0 {
+			return nil, nil
+		}
+		var rows []struct{ Fingerprint string }
+		args := append(append([]interface{}{}, setArgs...),
+			in.WorkspaceID, in.Source, in.ClusterName, fps, from, models.EvidenceDeclared, in.ObservedAt)
+		if err := r.db.Raw(`
+			UPDATE discovered_agents
+			   SET `+set+`, updated_at = now()
+			 WHERE workspace_id = ? AND source = ?
+			   AND metadata #>> '{cluster,name}' = ?
+			   AND fingerprint IN ?
+			   AND runtime_status IN ?
+			   AND evidence_mode <> ?
+			   AND (runtime_observed_at IS NULL OR runtime_observed_at <= ?)
+			RETURNING fingerprint`, args...).Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.Fingerprint)
+		}
+		return out, nil
+	}
+
+	stopped, err := apply(in.Stopped,
+		[]string{models.RuntimeStatusRunning, models.RuntimeStatusUnknown},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?`,
+		models.RuntimeStatusStopped,
+		"scaled to zero: present in a resync sweep with no running replicas", in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark stopped: %w", err)
+	}
+	resumed, err := apply(in.Running,
+		[]string{models.RuntimeStatusStopped},
+		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?,
+		 last_observed_running_at = GREATEST(COALESCE(last_observed_running_at, ?::timestamptz), ?::timestamptz)`,
+		models.RuntimeStatusRunning,
+		"running again: present in a resync sweep with replicas", in.ObservedAt,
+		in.ObservedAt, in.ObservedAt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mark running: %w", err)
+	}
+	return stopped, resumed, nil
 }
 
 /* --------------------------- claim / quarantine ------------------------- */
@@ -326,30 +1085,96 @@ func (r *discoveryRepository) QuarantineAgent(workspaceID, id uuid.UUID, reason 
 	return r.GetAgent(workspaceID, id)
 }
 
+// ReleaseQuarantine lifts a quarantine and returns the agent to the status it held
+// before it was quarantined.
+//
+// The previous status is DERIVED rather than stored, and the predicate is chosen to
+// match discovered_agents_registered_chk EXACTLY — that constraint requires a
+// 'registered' agent to have both matched_client_id and owner_user_id, so deriving
+// from the same two columns means this update can never violate it.
+//
+// Deriving from claimed_at instead would be a latent trap: both of those columns are
+// ON DELETE SET NULL, so deleting the owning user or the OAuth client leaves
+// claimed_at set with the ids gone. The release would then try to write 'registered'
+// without an owner, hit the constraint, and fail — leaving the agent stuck quarantined
+// with no way out, in exactly the situation where releasing it matters most.
+//
+// So an agent whose owner was deleted comes back 'unregistered', which is also the
+// honest answer: it has no accountable owner, so it needs a fresh claim decision.
+// claimed_at survives, so the history that it was once claimed is not lost.
+//
+// quarantined_at / quarantined_by / quarantine_reason are NOT cleared either. They are
+// the record that this agent was quarantined and why; erasing them on release would
+// destroy exactly the history a reviewer needs. quarantine_released_at is what marks
+// the quarantine as history.
+func (r *discoveryRepository) ReleaseQuarantine(workspaceID, id uuid.UUID,
+	by *uuid.UUID) (*models.DiscoveredAgent, error) {
+
+	now := time.Now()
+
+	// Guard in the WHERE clause, as ClaimAgent does: two admins racing to release the
+	// same agent cannot both succeed, and the loser gets a truthful error rather than
+	// a second release enqueuing a duplicate instruction.
+	res := r.db.Model(&models.DiscoveredAgent{}).
+		Where("id = ? AND workspace_id = ? AND status = ?",
+			id, workspaceID, models.DiscoveredAgentQuarantined).
+		Updates(map[string]interface{}{
+			"status": gorm.Expr(
+				"CASE WHEN matched_client_id IS NOT NULL AND owner_user_id IS NOT NULL "+
+					"THEN ? ELSE ? END",
+				models.DiscoveredAgentRegistered, models.DiscoveredAgentUnregistered),
+			"quarantine_released_at": now,
+			"quarantine_released_by": by,
+			// Enforcement state describes what is true NOW, so it does not survive the
+			// release. Leaving a stale "not enforced" error on a released agent would
+			// read as a live enforcement failure.
+			"quarantine_enforced_at":       nil,
+			"quarantine_enforcement_error": "",
+			"updated_at":                   now,
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		// Say why nothing matched, so the caller can pick the right HTTP status.
+		current, err := r.GetAgent(workspaceID, id)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("agent is not quarantined (status %q), so there is "+
+			"nothing to release", current.Status)
+	}
+	return r.GetAgent(workspaceID, id)
+}
+
 /* -------------------------------- coverage ------------------------------ */
 
 func (r *discoveryRepository) Coverage(workspaceID uuid.UUID) (*models.AgentCoverage, error) {
 	out := &models.AgentCoverage{
-		WorkspaceID: workspaceID,
-		ByOrigin:    map[string]*models.CoverageBucket{},
-		BySource:    map[string]int64{},
-		GeneratedAt: time.Now(),
+		WorkspaceID:     workspaceID,
+		ByOrigin:        map[string]*models.CoverageBucket{},
+		BySource:        map[string]int64{},
+		ByRuntimeStatus: map[string]int64{},
+		GeneratedAt:     time.Now(),
 	}
 
-	// One grouped scan over (deployment_origin, source, status) covers every
-	// number below — cheaper and more consistent than a query per counter.
+	// One grouped scan over (deployment_origin, source, status, runtime_status)
+	// covers every number below — cheaper and more consistent than a query per
+	// counter.
 	type row struct {
 		DeploymentOrigin string
 		Source           string
 		Status           string
+		RuntimeStatus    string
 		OwnerPresent     bool
 		Count            int64
 	}
 	var rows []row
 	err := r.db.Model(&models.DiscoveredAgent{}).
-		Select("deployment_origin, source, status, (owner_user_id IS NOT NULL) AS owner_present, COUNT(*) AS count").
+		Select("deployment_origin, source, status, runtime_status, "+
+			"(owner_user_id IS NOT NULL) AS owner_present, COUNT(*) AS count").
 		Where("workspace_id = ?", workspaceID).
-		Group("deployment_origin, source, status, owner_present").
+		Group("deployment_origin, source, status, runtime_status, owner_present").
 		Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -358,6 +1183,15 @@ func (r *discoveryRepository) Coverage(workspaceID uuid.UUID) (*models.AgentCove
 	for _, rw := range rows {
 		out.Total += rw.Count
 		out.BySource[rw.Source] += rw.Count
+		out.ByRuntimeStatus[rw.RuntimeStatus] += rw.Count
+
+		// The actionable queue: unregistered AND not known to be destroyed. Counting
+		// long-deleted agents as ungoverned is why a diligent team could otherwise
+		// watch coverage stall short of 100% with nothing left to claim.
+		if rw.Status == models.DiscoveredAgentUnregistered &&
+			rw.RuntimeStatus != models.RuntimeStatusGone {
+			out.LiveUnregistered += rw.Count
+		}
 
 		if !rw.OwnerPresent {
 			out.UnownedAgents += rw.Count

@@ -1,21 +1,96 @@
-# Schema — single-state bootstrap
+# Schema — versioned migrations
 
 > Read this before touching any table definition, adding a column, or running
-> a migration. File: `migrations/master/001_bootstrap.sql`.
+> a migration. Files: `migrations/master/`.
 
 ## The one rule
 
-**The schema is single-state and forward-only.**
+**The production database is never wiped. Every change ships as a numbered
+migration.**
 
-- `001_bootstrap.sql` is the authoritative state. It defines all 90 tables in one
-  hand-curated `CREATE TABLE` file (no `pg_dump` output, no ALTER COLUMN sprinkled around).
-- **Never add `ALTER TABLE` patch files.** When you need a new column, edit the
-  `CREATE TABLE` inline in `001_bootstrap.sql`, wipe the database, and re-bootstrap.
-- Future additive migrations land as `002_*.sql`, `003_*.sql` alongside this file.
-  The migration runner (`internal/migration/runner.go`) applies them incrementally on
-  top of an already-bootstrapped database.
-- **`migration_logs` is the only table GORM is allowed to manage** via `AutoMigrate`.
-  Everything else is owned by `001_bootstrap.sql`.
+There are customers in that database; losing it is not a recoverable mistake.
+
+Two files change together for every schema change:
+
+| File | Who it serves | Why |
+|---|---|---|
+| `migrations/master/NNN_description.sql` | **Existing** databases | The runner applies it in order on boot and records it |
+| `migrations/master/001_bootstrap.sql` | **Fresh** databases | One-shot creation of the current state |
+
+They must describe the same end state. Bootstrap answers *"what is the schema"*;
+the numbered migration answers *"how does an older database get there"*.
+
+## How migrations actually run
+
+`internal/migration/runner.go`, invoked from `cmd/main.go` at startup:
+
+1. Reads every `*.sql` in `migrations/master/`, sorted by the numeric prefix.
+2. Parses `NNN_name.sql` — the number is the version, the rest is the name.
+3. Skips anything already recorded in `migration_logs` as `success = true`.
+4. Runs the rest, then logs version, name, duration, and outcome.
+
+So a migration is **applied automatically on the next deploy**, exactly once, and
+is auditable afterwards. You do not run `psql` by hand.
+
+```sql
+-- what has actually been applied
+SELECT version, name, executed_at, success FROM migration_logs ORDER BY version;
+```
+
+`migration_logs` is the only table GORM may manage via `AutoMigrate`. Everything
+else is owned by the migration files.
+
+## Writing a migration
+
+- **Number it next.** `002_`, `003_`, … Never reuse or renumber a version that has
+  shipped; the ledger keys on it.
+- **Make it re-runnable.** `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`,
+  `ON CONFLICT DO NOTHING`. The runner won't re-run it, but a partly-applied
+  migration must be safe to retry.
+- **One concern per file**, so a failure is easy to reason about.
+- **Say why in a comment.** The file is the permanent record of the decision.
+
+## Expand and contract
+
+The dangerous part of a schema change is not the SQL, it is the window where the
+running code and the schema disagree. Sequence by direction:
+
+**Adding** — migrate first, deploy second. New code needs the column; old code
+ignores it. A nullable column, a new table, or a new index is safe to apply while
+the old build is live.
+
+**Removing or tightening** — deploy first, migrate second, and split it across two
+releases:
+
+1. **Expand** — add the new column nullable; deploy code that writes both old and
+   new.
+2. **Backfill** — populate the new column in batches.
+3. **Contract** — once nothing reads the old column, deploy code that stops using
+   it, *then* drop it or add `NOT NULL`.
+
+Adding `NOT NULL` to a populated table, dropping a column still referenced by the
+running binary, or renaming anything in one step will take production down. There
+is no version of this that is safe as a single step.
+
+## Before you touch a deployed database
+
+Production PostgreSQL runs in the `database-prod` namespace on the K3s cluster.
+Create and verify the backup on `k3s-master` before deploying any schema-changing
+backend image:
+
+```bash
+mkdir -p /root/backups
+AUTHSEC_BACKUP_PATH=/root/backups/authsec-pre-migration-$(date +%Y%m%dT%H%M%S).dump
+kubectl exec -n database-prod postgresql-primary-0 -- sh -c \
+  'export PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -Fc' \
+  > "$AUTHSEC_BACKUP_PATH"
+test -s "$AUTHSEC_BACKUP_PATH" && sha256sum "$AUTHSEC_BACKUP_PATH"
+```
+
+A backup you have not restored is a hypothesis. For anything beyond a purely
+additive change, restore it into a scratch database and check the row counts
+before you proceed. Do that in an isolated non-production PostgreSQL instance;
+never create a restore-test database inside the production cluster.
 
 ## Table domains
 
@@ -148,11 +223,21 @@
 
 ## How to change the schema
 
-1. Edit the `CREATE TABLE` statement inline in `001_bootstrap.sql`.
-2. Wipe the database: `docker compose down -v` (removes the Postgres volume).
-3. Re-bootstrap: `docker compose up -d` (runs migrations on fresh DB).
-4. If this is a **new** table being added for the first time and no data exists yet, this is all you need.
-5. If the schema is live (production) and you can't wipe, write a `002_<description>.sql` patch file and document it clearly as an additive migration.
+1. Find the highest shipped migration number and add
+   `migrations/master/NNN_description.sql` with the next number.
+2. Update `migrations/master/001_bootstrap.sql` so a fresh database reaches the
+   same final schema.
+3. Test both paths: upgrade an existing database with the numbered migration and
+   initialize a fresh scratch database from bootstrap.
+4. Back up production as described above.
+5. Deploy the immutable backend image through the K3s procedure in
+   `../../.claude/specs/SPEC-deployment-k3s.md`. The migration runner applies
+   and records the change on startup.
+6. Verify the backend rollout, health endpoint, and the new successful row in
+   `migration_logs` before deploying any dependent UI change.
+
+Production is never reinitialized for a schema change. Do not execute ad-hoc DDL
+against it and do not insert fake success rows into `migration_logs`.
 
 **Never** add `AutoMigrate` calls for non-`migration_logs` tables. GORM will diverge from the hand-curated schema.
 

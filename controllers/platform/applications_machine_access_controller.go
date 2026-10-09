@@ -944,10 +944,14 @@ func (ctrl *ApplicationsController) CreateWorkloadAccess(c *gin.Context) {
 		ResponseTypes:                   pq.StringArray{},
 		RegistrationType:                "admin",
 		AllowedTokenEndpointAuthMethods: pq.StringArray{"urn:authsec:params:oauth:client-assertion-type:spiffe-svid"},
-		HomeWorkspaceID:                 &workspaceID,
-		IsConfidential:                  true,
-		CreatedAt:                       now,
-		UpdatedAt:                       now,
+		// Without this the client defaults to 'human_app', so the agent-claim dialog
+		// -- which filters on 'agent' -- could not see the very identity type a
+		// workload should have.
+		ClientKind:      models.ClientKindAgent,
+		HomeWorkspaceID: &workspaceID,
+		IsConfidential:  true,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 
 	selectorsJSON, _ := json.Marshal(req.Selectors)
@@ -1232,10 +1236,14 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 		ResponseTypes:                   pq.StringArray{},
 		RegistrationType:                "admin",
 		AllowedTokenEndpointAuthMethods: pq.StringArray{"urn:authsec:params:oauth:client-assertion-type:spiffe-svid"},
-		HomeWorkspaceID:                 &workspaceID,
-		IsConfidential:                  true,
-		CreatedAt:                       now,
-		UpdatedAt:                       now,
+		// Without this the client defaults to 'human_app', so the agent-claim dialog
+		// -- which filters on 'agent' -- could not see the very identity type a
+		// workload should have.
+		ClientKind:      models.ClientKindAgent,
+		HomeWorkspaceID: &workspaceID,
+		IsConfidential:  true,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 
 	workloadID := uuid.New()

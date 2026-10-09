@@ -224,6 +224,30 @@ func (tr *WorkspaceRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid
 }
 
 // DeleteTenant permanently deletes a workspace and all related scoped rows.
+//
+// The purge runs in one transaction, in this order (review P0-1):
+//
+//  1. SET LOCAL authsec.workspace_purge = 'on' -- the only way past 052's
+//     append-only trigger on iga_gov_event (iga_gov_event_immutable), which
+//     the workspace cascade reaches. LOCAL: it ends with this transaction.
+//  2. role_bindings, role_permissions, then workspace_memberships BEFORE
+//     roles (workspace_memberships_role_workspace_fk is ON DELETE RESTRICT,
+//     so a role still held by a membership refuses its delete), then roles,
+//     permissions, oauth_scopes (its workspace key is NO ACTION) and
+//     totp_secrets. roles and permissions have no key to workspaces at all.
+//  3. iga_lifecycle_event BEFORE the workspace: 036's iga_le_publication_fkey
+//     is ON DELETE RESTRICT, which PostgreSQL never defers, so the cascade
+//     from workspaces to iga_publication is refused while the events citing
+//     those revisions still exist (P2-DECISIONS D-94).
+//  4. workspaces -- cascades to every workspace-scoped row, including every
+//     Phase 3 table (047-056) and its audit records.
+//  5. user_groups and users LAST: the Phase 3 audit records name users
+//     through ON DELETE NO ACTION keys (created_by, decided_by, accepted_by,
+//     exception_by, consented_by, installed_by, ...), so the users can go
+//     only once the workspace's records are gone. A user of this workspace
+//     still named by ANOTHER workspace's records is refused with
+//     *UserAuditHistoryError and nothing is deleted: those records must
+//     survive.
 func (tr *WorkspaceRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int64, error) {
 	deletedCounts := make(map[string]int64)
 
@@ -233,46 +257,33 @@ func (tr *WorkspaceRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]i
 	}
 	defer tx.Rollback()
 
-	execDelete := func(table, query string, args ...interface{}) error {
-		result, err := tx.Exec(query, args...)
-		if err != nil {
-			return fmt.Errorf("failed to delete from %s: %w", table, err)
-		}
-		if rows, err := result.RowsAffected(); err == nil {
-			deletedCounts[table] = rows
-		}
-		return nil
+	if _, err := tx.Exec(`SET LOCAL authsec.workspace_purge = 'on'`); err != nil {
+		return nil, fmt.Errorf("failed to enter workspace purge mode: %w", err)
 	}
 
-	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("roles", "DELETE FROM roles WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("permissions", "DELETE FROM permissions WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("oauth_scopes", "DELETE FROM oauth_scopes WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("users", "DELETE FROM users WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("workspace_memberships", "DELETE FROM workspace_memberships WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
-	if err := execDelete("workspaces", "DELETE FROM workspaces WHERE id = $1", workspaceID); err != nil {
-		return nil, err
+	for _, step := range []struct{ table, query string }{
+		{"role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1"},
+		{"role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)"},
+		{"workspace_memberships", "DELETE FROM workspace_memberships WHERE workspace_id = $1"},
+		{"roles", "DELETE FROM roles WHERE workspace_id = $1"},
+		{"permissions", "DELETE FROM permissions WHERE workspace_id = $1"},
+		{"oauth_scopes", "DELETE FROM oauth_scopes WHERE workspace_id = $1"},
+		{"totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1"},
+		{"iga_lifecycle_event", "DELETE FROM iga_lifecycle_event WHERE workspace_id = $1"},
+		{"workspaces", "DELETE FROM workspaces WHERE id = $1"},
+		{"user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)"},
+		{"users", "DELETE FROM users WHERE workspace_id = $1"},
+	} {
+		result, err := tx.Exec(step.query, workspaceID)
+		if err != nil {
+			if step.table == "users" {
+				err = ClassifyUserDeleteError(err)
+			}
+			return nil, fmt.Errorf("failed to delete from %s: %w", step.table, err)
+		}
+		if rows, err := result.RowsAffected(); err == nil {
+			deletedCounts[step.table] = rows
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

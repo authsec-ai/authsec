@@ -154,18 +154,18 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 
 	// Store state in database (expires in 30 minutes)
 	state := &models.OIDCState{
-		StateToken:     stateToken,
-		WorkspaceID:    workspaceIDPtr,
-		ApplicationID:  input.ApplicationID,
-		SignedState:    signedState,
-		WorkspaceDomain:   input.WorkspaceDomain,
-		OriginDomain:   s.requestOrigin, // Store origin domain for post-auth redirect
-		ProviderName:   input.Provider,
-		Action:         action, // "login" | "register" | "discover" | "hydra_login"
-		CodeVerifier:   codeVerifier,
-		RedirectAfter:  input.RedirectAfter,
-		LoginChallenge: input.LoginChallenge, // populated only for action=="hydra_login"
-		ExpiresAt:      time.Now().Add(30 * time.Minute),
+		StateToken:      stateToken,
+		WorkspaceID:     workspaceIDPtr,
+		ApplicationID:   input.ApplicationID,
+		SignedState:     signedState,
+		WorkspaceDomain: input.WorkspaceDomain,
+		OriginDomain:    s.requestOrigin, // Store origin domain for post-auth redirect
+		ProviderName:    input.Provider,
+		Action:          action, // "login" | "register" | "discover" | "hydra_login"
+		CodeVerifier:    codeVerifier,
+		RedirectAfter:   input.RedirectAfter,
+		LoginChallenge:  input.LoginChallenge, // populated only for action=="hydra_login"
+		ExpiresAt:       time.Now().Add(30 * time.Minute),
 	}
 	log.Printf("DEBUG InitiateOIDCFlow: Creating state with origin_domain='%s' (request_host column)", s.requestOrigin)
 
@@ -241,7 +241,7 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 	}
 
 	// Get client secret from Vault
-	clientSecret, err := s.getClientSecret(provider.ClientSecretVaultPath)
+	clientSecret, err := s.getClientSecret(provider)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get client secret: %w", err)
 	}
@@ -587,10 +587,14 @@ func (s *OIDCService) getUserInfo(provider *models.OIDCProvider, accessToken str
 	return &userInfo, nil
 }
 
-// getClientSecret retrieves the client secret from Vault
-func (s *OIDCService) getClientSecret(vaultPath string) (string, error) {
-	// For now, try to get from environment as fallback
-	// In production, this should read from HashiCorp Vault
+// getClientSecret retrieves the client secret for a provider.
+//
+// Vault is the only source for workspace-owned providers. The env-var fallback
+// below holds PLATFORM credentials, which are paired with the platform's own
+// client_id — handing them to a workspace provider sends the platform secret
+// to whatever token_url that workspace configured. Fail closed instead.
+func (s *OIDCService) getClientSecret(provider *models.OIDCProvider) (string, error) {
+	vaultPath := provider.ClientSecretVaultPath
 
 	// Try Vault first
 	secret, err := GetSecretFromVault(vaultPath)
@@ -598,7 +602,13 @@ func (s *OIDCService) getClientSecret(vaultPath string) (string, error) {
 		return secret, nil
 	}
 
-	// Fallback to environment variables
+	if provider.WorkspaceID != nil {
+		log.Printf("ERROR getClientSecret: no Vault secret for workspace provider %s/%s at %q (env fallback refused for workspace-scoped providers): %v",
+			provider.WorkspaceID, provider.ProviderName, vaultPath, err)
+		return "", fmt.Errorf("client secret unavailable for workspace provider %q: %w", provider.ProviderName, err)
+	}
+
+	// Fallback to environment variables — platform-global providers only.
 	switch {
 	case strings.Contains(strings.ToLower(vaultPath), "google"):
 		sec := config.AppConfig.GoogleClientSecret

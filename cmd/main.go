@@ -29,6 +29,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire"
 	spirevault "github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 	"github.com/authsec-ai/authsec/internal/tokens"
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -120,6 +121,217 @@ func main() {
 		}
 		reconciler := services.NewHydraReconciler(config.DB, interval)
 		go reconciler.Run(context.Background())
+	}
+
+	// GitHub discovery scan worker: drains discovery_scan_runs.
+	//
+	// POST .../sources/:id/scan only ENQUEUES; without this loop running
+	// somewhere, a queued scan would sit forever and the console would poll a
+	// run that never starts. Safe to run on every replica — runs are claimed
+	// FOR UPDATE SKIP LOCKED under a lease, so two replicas cannot execute the
+	// same scan, and a replica that dies mid-scan has its run picked up by
+	// another once the lease expires.
+	//
+	// Disabled with AUTHSEC_DISABLE_DISCOVERY_SCAN_WORKER=true for unit-test
+	// boots and for replicas deliberately kept API-only.
+	if os.Getenv("AUTHSEC_DISABLE_DISCOVERY_SCAN_WORKER") != "true" {
+		go services.NewDiscoveryScanWorker(config.DB).Run(context.Background())
+	}
+
+	// AWS discovery scan worker: drains cloud_scan_run.
+	//
+	// Same contract as the GitHub worker above, and for the same reason: POST
+	// .../aws/connectors/:id/scan only ENQUEUES. It used to run the scan in a
+	// goroutine off the request, which lost the work on restart, let two
+	// requests walk one account, and let a superseded worker publish stale
+	// results over fresher ones.
+	//
+	// Safe on every replica: runs are claimed FOR UPDATE SKIP LOCKED under a
+	// lease, and publication is fenced on the lease version, so a replica that
+	// stalls past its lease is refused rather than trusted.
+	//
+	// Needs Vault, because a scan assumes the customer's role with the
+	// ExternalId stored there. Without it the worker would claim runs it cannot
+	// execute and fail them, which is worse than not starting: say so once and
+	// leave the runs queued for a replica that is configured.
+	// IGA_GRAPH_PROJECTION (SPEC-iga-phase2-graph.md §2.8): ONE switch, read
+	// ONCE, default off. Off is Phase 1 exactly -- no barrier, no projection
+	// job, no Phase 2 SQL -- and supported at any schema, which is what makes
+	// rolling back to 0e75ad7 and turning the graph on later safe.
+	//
+	// On: the schema is verified (the relations and columns 027-036 add),
+	// retried on error and never cached as an answer. Until it passes, the scan
+	// worker claims nothing (fail closed) and /capabilities says
+	// "misconfigured" with the reason. Only a SUCCESSFUL check starts the
+	// projector, which also runs RecoverStalled on its ticker -- without it the
+	// first scan in every workspace queued a job nobody would claim, and no
+	// scan could run there again.
+	graphGate := services.GraphProjectionGateFromEnv()
+	services.SetGraphProjection(graphGate)
+	if graphGate.Enabled() {
+		go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
+		})
+	} else {
+		log.Printf("[graph] %s is off: Phase 1 scanning, no projection", services.GraphProjectionEnv)
+	}
+
+	// IGA_POLICY (SPEC-iga-phase3-policy.md §4.3, T3.02): the Phase 3 policy
+	// product. ONE switch, read ONCE, default off. On requires
+	// IGA_GRAPH_PROJECTION=on (read live from the graph gate) and the Phase 3
+	// schema (047-056) verified by relation, retried on error and never cached
+	// as an answer. FAIL CLOSED: until all of that holds, every
+	// /api/iga/v1/policy route answers 503 policy_unavailable and
+	// /capabilities says why. Legacy agent-policy routes and workers are not
+	// gated by it.
+	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
+	services.SetPolicyGate(policyGate)
+	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
+	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
+	// ready hook, never before. It also claims nothing while the gate reads
+	// unavailable (graph gate off, read live). Stopped gracefully on shutdown.
+	policyWorkerCtx, stopPolicyWorker := context.WithCancel(context.Background())
+	defer stopPolicyWorker()
+	policyWorkerDone := make(chan (<-chan struct{}), 1)
+	if policyGate.Enabled() {
+		if state, reason, _ := policyGate.Status(); state != services.PolicyOn {
+			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
+		}
+		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			// Owner review hooks, notification channels (055 + Vault) and the
+			// compiler's discovery-role live reader: installed only once the
+			// Phase 3 schema has verified, before the worker that uses them.
+			var policyVault vault.VaultClient
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr != nil {
+					log.Printf("[policy] vault client: %v", verr)
+				} else {
+					policyVault = vc
+				}
+			}
+			// The AuthSec Slack app (Phase 3 §7.11, T3.14): installed when the
+			// signing secret, Vault and the app credentials are configured.
+			// InstallGovPolicyStartup installs the policy runtime (owner gate
+			// and the other authoring hooks) and THEN chains the Slack app's
+			// approval-request notices onto those hooks atomically, before the
+			// worker can deliver anything; /capabilities reports policy.slack
+			// from the same registration. fix/p3-appr (P1-4): the policy gate
+			// reports verified -- and serves any policy or Slack route -- only
+			// after this whole ready hook has returned, so nothing is served
+			// before the hooks are in place.
+			var slackApp *services.SlackIntegrationService
+			if app := services.SlackFromEnv(config.DB); app != nil {
+				if ok, reason := app.Configured(); ok {
+					slackApp = app
+				} else {
+					log.Printf("[slack] Slack app not enabled: %s", reason)
+				}
+			}
+			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
+			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
+			// the GitHub App key and connector credentials. Installed in EVERY
+			// process that serves the policy routes, before the worker check:
+			// proposals decide the IaC form at compile time in the API
+			// process, so a process started with AUTHSEC_DISABLE_POLICY_WORKER
+			// must still read the mapped source -- without an adapter an iac_pr
+			// target answers 503 iac_unavailable, never a silent export
+			// (review P2).
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr == nil {
+					services.ConfigureGovIaCDelivery(config.DB, vc)
+				} else {
+					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
+				}
+			}
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
+			}
+			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
+			// T3.16: deployments need AWS access (discovery + enforcement
+			// roles) and the binding gate; without Vault the deploy jobs wait.
+			if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
+				if vc, verr := vault.NewClient(va, vt); verr == nil {
+					services.SetGovDeployEnv(services.NewProductionGovDeployEnv(config.DB, vc))
+				} else {
+					log.Printf("[policy] deployments not enabled: %v", verr)
+				}
+			} else {
+				log.Printf("[policy] deployments not enabled: VAULT_ADDR/VAULT_TOKEN not configured")
+			}
+			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
+		})
+	} else {
+		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
+	}
+
+	// IGA_LEGACY_AGENT_POLICY (disposition plan §3.2): read ONCE, default on.
+	// Off stops this process starting the two legacy agent-policy workers
+	// (started below, with the other governance workers) and nothing else.
+	// Installed before the routes are mounted: the legacy compatibility routes
+	// consult it.
+	legacyAgentPolicyGate := services.LegacyAgentPolicyGateFromEnv()
+	services.SetLegacyAgentPolicyGate(legacyAgentPolicyGate)
+	if w := legacyAgentPolicyGate.Warning(); w != "" {
+		log.Printf("WARNING: [legacy-agent-policy] %s", w)
+	}
+	log.Print(legacyAgentPolicyGate.Decision())
+
+	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
+		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+		if vaultAddr == "" || vaultToken == "" {
+			log.Printf("AWS scan worker not started: VAULT_ADDR/VAULT_TOKEN not configured")
+		} else if vc, verr := vault.NewClient(vaultAddr, vaultToken); verr != nil {
+			log.Printf("AWS scan worker not started: %v", verr)
+		} else {
+			awsSvc := services.NewAWSOnboardingService(config.DB, vc)
+			go services.NewAWSScanWorker(config.DB, awsSvc).WithGraphProjection(graphGate).
+				Run(context.Background())
+		}
+	}
+
+	// AWS Quick Create callback worker: drains the SQS queue that every
+	// regional callback topic delivers to, and connects the account a stack
+	// launched from AuthSec reports back.
+	//
+	// Starts only when automatic onboarding is configured. Once any customer
+	// stack points at AuthSec's topics this worker must keep running: it is
+	// also what answers the Delete a stack sends when the customer removes it,
+	// and an unanswered Delete fails their stack deletion after 10 minutes.
+	if os.Getenv("AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER") != "true" {
+		cbCfg, cbErr := services.LoadAWSCallbackConfig()
+		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+		switch {
+		case cbErr != nil:
+			log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", cbErr)
+		case !cbCfg.Enabled():
+			log.Printf("AWS callback worker not started: automatic AWS onboarding is not configured")
+		case vaultAddr == "" || vaultToken == "":
+			log.Printf("[aws-onb] ALERT AWS callback worker not started: VAULT_ADDR/VAULT_TOKEN not configured")
+		default:
+			if vc, verr := vault.NewClient(vaultAddr, vaultToken); verr != nil {
+				log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", verr)
+			} else {
+				qc := services.NewAWSQuickCreateService(
+					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
+				// The enforcement stack's Custom::AuthSecEnforcementRegistration
+				// (Phase 3, T3.09) reports through the same topics and queue.
+				qc.WithEnforcementHandler(services.NewEnforcementBindingService(config.DB, vc, cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN")))
+				// Built inside the goroutine: it reads the queue's settings from
+				// SQS, and a slow or unreachable SQS must never delay boot.
+				go func() {
+					w, werr := services.NewAWSCallbackWorker(context.Background(), qc)
+					if werr != nil {
+						log.Printf("[aws-onb] ALERT AWS callback worker not started: %v", werr)
+						return
+					}
+					w.Run(context.Background())
+				}()
+			}
+		}
 	}
 
 	// Initialise Vault (optional; logs warning if not configured)
@@ -335,6 +547,75 @@ func main() {
 		}
 	}
 
+	// Governance expiry sweep.
+	//
+	// Expiry is already honoured at READ time — the ScopeResolver filters
+	// `expires_at IS NULL OR expires_at > NOW()` — so a lapsed binding grants no new
+	// scope without this. What this closes is the window where a token ALREADY minted
+	// under a now-lapsed grant keeps working for its remaining lifetime (up to an hour
+	// for native M2M tokens), plus recording the lapse and cleaning up the row.
+	//
+	// One minute, because the point of a short JIT grant is defeated if it takes
+	// longer than that to actually stop working. It only ever removes access, so a
+	// failure fails toward less access, never more.
+	if config.DB != nil {
+		expiryWorker := services.NewExpiryWorker(config.DB, time.Minute, 200)
+		expiryWorker.Start()
+		log.Printf("governance expiry worker started (interval=1m)")
+
+		// Detective SoD. Hours, not minutes: the preventive check inside the
+		// provisioning transaction already covers anything new, so this is catching up
+		// on history — conflicts that predate a rule, or arrived through a path that
+		// does not call the check yet. It only ever reports; remediation is a human
+		// decision, because auto-revoking on an SoD hit would let a mistyped rule take
+		// down production access.
+		sodWorker := services.NewSoDScanWorker(config.DB, 6*time.Hour)
+		sodWorker.Start()
+		log.Printf("governance SoD scan worker started (interval=6h)")
+
+		// Actuation lease reaper. An agent evicted mid-apply would otherwise leave its
+		// instruction 'leased' forever, so a quarantine would never be enforced while the
+		// console showed it as merely pending — silence looking identical to progress.
+		reaper := services.NewLeaseReaper(config.DB, time.Minute)
+		reaper.Start()
+		log.Printf("actuation lease reaper started (interval=1m)")
+
+		// Human joiner/mover/leaver. Reconciled rather than event-driven, because
+		// scim_events is an HTTP audit log with no semantic payload — see
+		// LifecycleManager. Five minutes because the leaver half is a security control:
+		// a deactivated user keeping access is the failure it exists to prevent.
+		jmlWorker := services.NewJMLWorker(config.DB, 5*time.Minute)
+		jmlWorker.Start()
+		log.Printf("governance JML reconcile worker started (interval=5m)")
+
+		// Agent policy, on a timer. Until this existed, everything the policy
+		// reconciler does — narrowing a role, lapsing a grant at its expiry,
+		// planning a containment — happened only when somebody POSTed to the
+		// reconcile endpoint. A policy is a standing instruction, and a standing
+		// instruction that needs a button pressed is a reminder.
+		//
+		// Five minutes: the same cadence as JML, and the actions are the same
+		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
+		// less access.
+		//
+		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
+		// Runs at five minutes rather than hourly because the DELIVERY half also
+		// retries: an SMTP blip should cost minutes, not a whole warning.
+		//
+		// A failed warning NEVER blocks the action it warns about — blocking would
+		// let an SMTP outage quietly turn every destructive policy into a no-op,
+		// which is the failure this exists to prevent. It is recorded instead, and
+		// the action executes as a governance exception.
+		//
+		// Both are the legacy agent-policy stack, so both start only while
+		// IGA_LEGACY_AGENT_POLICY is on (read above). ExpiryWorker and the lease
+		// reaper are shared runtime infrastructure and start regardless.
+		for _, name := range services.StartLegacyAgentPolicyWorkers(legacyAgentPolicyGate,
+			services.NewLegacyAgentPolicyWorkers(config.DB)) {
+			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
+		}
+	}
+
 	// ─────────────────────────────────────────────────────────
 	// Phase 5: start server
 	// ─────────────────────────────────────────────────────────
@@ -369,6 +650,19 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// The policy job worker stops claiming, gives running jobs their grace,
+	// and hands back what did not finish (§8.1).
+	stopPolicyWorker()
+	select {
+	case done := <-policyWorkerDone:
+		select {
+		case <-done:
+		case <-ctx.Done():
+			log.Println("Policy job worker did not stop within the grace period")
+		}
+	default:
+	}
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced shutdown: %v", err)

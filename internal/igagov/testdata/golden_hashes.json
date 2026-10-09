@@ -1,0 +1,14 @@
+{
+  "bundle.trusted_example": "sha256:189de86c83592c4b4e5f71876cc37fed88770100c2c7fa27836cd3da32024cf0",
+  "document.boundary_example": "sha256:7702fdaac1fada8875af1927d89c7c32fbf90a5086201d039524a10c8e9f2c29",
+  "fingerprint.unused_service.sqs": "sha256:73fbf34410623ff294917cd47775e5e0cc702c81a71612fcdd8c8c1eea4742ab",
+  "gap.unanalysed_form": "sha256:b357eaa67a243753bc224ef31a675703650f5bbb1a977432038ed3834a18a866",
+  "impact.example": "sha256:48ce6a24571a53e74427617b6bb0725c074d0b33b106fb03da01c45b336cdd26",
+  "intent.dedicated_identity": "sha256:b7e5e64b4f60fe3f984ae60880ea8129a3bbe64acd4702fa6dd061480faf8e93",
+  "intent.remove_control": "sha256:b2ad313aade6165ef61278072c0e5afcfc04d5f4868ea96f9dd850c4fe61b882",
+  "intent.right_size_services": "sha256:17821f64bac51ebc86fec2456f14bda4384eda88f89678c55c15ca3219ca2690",
+  "material.example": "sha256:63e293111e3bae4141d6596489df3366e4d268a1a2bd485b9d32d8c3441715be",
+  "plan.example": "sha256:2b58ba53e771d927a996b93bde2f4c9a440bd5a49bd59fe48cb41bbad5a10359",
+  "precondition.apply": "sha256:ba2ce5e9d5e1d8eb80c1e5d40ea46cd86e480eb573e677c5cfe2ebfca9ba281a",
+  "precondition.state_only": "sha256:86654a6b8099876ed4a790a08297ac7a75f6b522c02a0b47d95c5cd75c72ac21"
+}

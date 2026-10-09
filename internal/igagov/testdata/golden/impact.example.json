@@ -1,0 +1,1 @@
+{"consumers":[{"relationship":"executes_as","workload_id":"w1000000-0000-4000-8000-000000000001"}],"owners":["u1"],"removed":[{"basis":"no_attempt","service":"sqs"}],"retained":[{"basis":"dependency","service":"logs"},{"basis":"observed","service":"s3"}],"routes":[],"statement_revisions":["ha","hb"]}

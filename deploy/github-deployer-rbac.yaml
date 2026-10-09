@@ -1,0 +1,105 @@
+# Scoped cluster access for the Deploy workflow.
+#
+# The alternative is putting the k3s cluster-admin kubeconfig into a GitHub
+# secret, which would mean anyone who can push to this repo -- or any compromised
+# third-party action in the workflow -- owns the whole cluster, including
+# database-prod and vault-prod. This ServiceAccount can do exactly what
+# .github/workflows/deploy.yml does and nothing else.
+#
+# Apply once, as a cluster admin:
+#   kubectl apply -f deploy/github-deployer-rbac.yaml
+#
+# Then mint the kubeconfig -- see the header of scripts/make-deployer-kubeconfig.sh.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-deployer
+  namespace: authsec-prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-deployer
+  namespace: authsec-prod
+rules:
+  # `kubectl set image` + `kubectl annotate` + `kubectl rollout status`.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # rollout status reads the ReplicaSets and Pods behind the Deployment.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Deliberately absent: create, delete, exec, secrets, configmaps.
+  # A deploy replaces an image on an existing Deployment. It never needs to
+  # create workloads, read secrets, or open a shell in a customer-serving pod.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-deployer
+  namespace: authsec-prod
+subjects:
+  - kind: ServiceAccount
+    name: github-deployer
+    namespace: authsec-prod
+roleRef:
+  kind: Role
+  name: github-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+# The pre-migration database backup (deploy.yml "Back up the database before
+# migrating") execs into the PostgreSQL primary, which lives in another
+# namespace and is a separate, higher-privilege grant.
+#
+# Keep it separate and keep it narrow: exec on ONE named pod, nothing else in
+# database-prod.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-deployer
+  namespace: database-prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-deployer-backup
+  namespace: database-prod
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+    resourceNames: ["postgresql-primary-0"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-deployer-backup
+  namespace: database-prod
+subjects:
+  # The token is issued in authsec-prod; this binding lets that same identity
+  # take the backup, without giving it a second credential to manage.
+  - kind: ServiceAccount
+    name: github-deployer
+    namespace: authsec-prod
+roleRef:
+  kind: Role
+  name: github-deployer-backup
+  apiGroup: rbac.authorization.k8s.io
+---
+# A non-expiring token for the ServiceAccount. Kubernetes 1.24+ no longer
+# auto-creates these, and a projected token would expire mid-workflow.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-deployer-token
+  namespace: authsec-prod
+  annotations:
+    kubernetes.io/service-account.name: github-deployer
+type: kubernetes.io/service-account-token

@@ -1,0 +1,320 @@
+package platform
+
+import (
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+
+	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/services"
+)
+
+// The Slack app routes, SPEC-iga-phase3-policy.md §7.11 (T3.14), under
+// /authsec/integrations/slack, behind the IGA_POLICY gate (§7 intro: every
+// Phase 3 route answers 503 policy_unavailable while it is off):
+//
+//	GET    /install          governance:enforce   Slack OAuth v2: the authorize URL; sets the install cookie
+//	GET    /oauth/callback   OAuth state bound to workspace + member + browser session (no bearer token)
+//	POST   /interactions     Slack signature only; answered at once, the action runs after (Slack's 3 s limit)
+//	PUT    /settings         governance:enforce   {approvals_channel_id}
+//	DELETE /                 governance:enforce   disconnect
+//	POST   /link/confirm     member               {token}: confirm a Slack <-> member link
+//
+// The workspace is the token's (or, for the two Slack-called routes, the
+// signed state's / the notification's). Every mutation writes its
+// iga_gov_event in the service's transaction and an audit_events row here.
+
+// SlackIntegrationController serves the Slack app routes.
+type SlackIntegrationController struct {
+	db *gorm.DB
+	// svc returns the Slack service per request: production installs it
+	// after the Phase 3 schema verifies (cmd/main.go), after routes mount.
+	svc  func() *services.SlackIntegrationService
+	gate func() *services.PolicyGate
+}
+
+// NewSlackIntegrationController is the controller over svc (nil: the app
+// is not configured; every route says so).
+func NewSlackIntegrationController(db *gorm.DB, svc *services.SlackIntegrationService) *SlackIntegrationController {
+	return &SlackIntegrationController{db: db, svc: func() *services.SlackIntegrationService { return svc }, gate: services.PolicyGateState}
+}
+
+// NewDefaultSlackIntegrationController is the controller over the process's
+// Slack app (services.DefaultSlackService, set at startup; nil when not
+// configured).
+func NewDefaultSlackIntegrationController(db *gorm.DB) *SlackIntegrationController {
+	return &SlackIntegrationController{db: db, svc: services.DefaultSlackService, gate: services.PolicyGateState}
+}
+
+// service is the Slack service for this request (nil: not configured).
+func (ctl *SlackIntegrationController) service() *services.SlackIntegrationService {
+	if ctl.svc == nil {
+		return nil
+	}
+	return ctl.svc()
+}
+
+// WithPolicyGate makes the routes read g instead of the process-wide gate.
+func (ctl *SlackIntegrationController) WithPolicyGate(g *services.PolicyGate) *SlackIntegrationController {
+	ctl.gate = func() *services.PolicyGate { return g }
+	return ctl
+}
+
+// MountSlackIntegrationRoutes mounts §7.11 on the /authsec group: the gate
+// first; the Slack-called routes without bearer auth; the others behind
+// auth and their permission, both rendered as the §7 envelope.
+func MountSlackIntegrationRoutes(authsec gin.IRouter, ctl *SlackIntegrationController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
+	g := authsec.Group("/integrations/slack", ctl.Gate())
+	g.POST("/interactions", ctl.Interactions)
+	g.GET("/oauth/callback", ctl.OAuthCallback)
+	req := GraphRequire(require)
+	a := g.Group("", GraphEnvelope(auth))
+	a.GET("/install", req("governance", "enforce"), ctl.Install)
+	a.PUT("/settings", req("governance", "enforce"), ctl.PutSettings)
+	a.DELETE("", req("governance", "enforce"), ctl.Disconnect)
+	a.POST("/link/confirm", ctl.ConfirmLink)
+}
+
+// Gate is the IGA_POLICY middleware (fail closed).
+func (ctl *SlackIntegrationController) Gate() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var gate *services.PolicyGate
+		if ctl.gate != nil {
+			gate = ctl.gate()
+		}
+		state, reason, _ := gate.Status()
+		if state != services.PolicyOn {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, PolicyUnavailableBody(reason))
+			return
+		}
+		c.Next()
+	}
+}
+
+func (ctl *SlackIntegrationController) configured(c *gin.Context) bool {
+	if ok, reason := ctl.service().Configured(); !ok {
+		policyErr(c, http.StatusServiceUnavailable, services.SlackCodeNotConfigured, reason, nil)
+		return false
+	}
+	return true
+}
+
+// member is the token workspace and its verified human member.
+func (ctl *SlackIntegrationController) member(c *gin.Context) (ws, user uuid.UUID, ok bool) {
+	ws, ok = policyWorkspace(c)
+	if !ok {
+		return
+	}
+	uid, err := humanActor(c, ctl.db, ws)
+	if err != nil {
+		if errors.Is(err, errNotWorkspaceHuman) {
+			policyErr(c, http.StatusForbidden, "forbidden", "Slack setup requires a verified workspace member session.", nil)
+		} else {
+			policyInternal(c, err)
+		}
+		return ws, uuid.Nil, false
+	}
+	user, err = uuid.Parse(uid)
+	if err != nil {
+		policyErr(c, http.StatusForbidden, "forbidden", "Slack setup requires a verified workspace member session.", nil)
+		return ws, uuid.Nil, false
+	}
+	return ws, user, true
+}
+
+// Install handles GET /install.
+func (ctl *SlackIntegrationController) Install(c *gin.Context) {
+	if !ctl.configured(c) {
+		return
+	}
+	ws, user, ok := ctl.member(c)
+	if !ok {
+		return
+	}
+	membership, err := uuid.Parse(c.GetString("workspace_membership_id"))
+	if err != nil {
+		policyErr(c, http.StatusForbidden, "forbidden", "Slack setup requires a verified workspace member session.", nil)
+		return
+	}
+	// The cookie is set on the host the browser sent this request to; the
+	// redirect URI is derived from (or checked against) that host so the
+	// callback receives it (services.StartInstall, DECISIONS).
+	st, err := ctl.service().StartInstall(c.Request.Context(), ws, user, membership, c.Request.Host)
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: st.Nonce, Domain: st.CookieDomain, Path: st.CookiePath,
+		MaxAge: 600, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	c.JSON(http.StatusOK, gin.H{"data": st, "meta": gin.H{}})
+}
+
+// OAuthCallback handles GET /oauth/callback (Slack's browser redirect).
+func (ctl *SlackIntegrationController) OAuthCallback(c *gin.Context) {
+	// The cookie is single use whatever happens (cleared with the scope it
+	// was set with).
+	domain, path := ctl.service().CallbackCookieScope(c.Query("state"))
+	http.SetCookie(c.Writer, &http.Cookie{Name: services.SlackInstallCookie, Value: "", Domain: domain, Path: path,
+		MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	if !ctl.configured(c) {
+		return
+	}
+	if e := c.Query("error"); e != "" {
+		ctl.callbackOut(c, services.GovBadParam("error", "The Slack install was cancelled or refused ("+e+")."), nil)
+		return
+	}
+	nonce, _ := c.Cookie(services.SlackInstallCookie)
+	res, err := ctl.service().CompleteInstall(c.Request.Context(), c.Query("state"), nonce, c.Query("code"))
+	if err != nil {
+		ctl.callbackOut(c, err, nil)
+		return
+	}
+	c.Set("user_id", res.ActorID.String())
+	auditAdminMutation(c, res.WorkspaceID.String(), "install", "workspace_slack_integration", res.WorkspaceID.String(),
+		http.StatusOK, res.Before, res.Integration)
+	ctl.callbackOut(c, nil, res)
+}
+
+// callbackOut answers the browser: back to the console's Setup page when a
+// console URL is configured, else the §7 envelope.
+func (ctl *SlackIntegrationController) callbackOut(c *gin.Context, err error, res *services.SlackInstallResult) {
+	setup := services.SlackConsoleLink("/iga/policy/setup/notifications")
+	if setup != "" {
+		q := url.Values{}
+		if err != nil {
+			code := "slack_install_failed"
+			var ge *services.GovError
+			if errors.As(err, &ge) {
+				code = ge.Code
+			} else {
+				log.Printf("[slack] oauth callback: %v", err)
+			}
+			q.Set("slack_error", code)
+		} else {
+			q.Set("slack", "connected")
+		}
+		c.Redirect(http.StatusFound, setup+"?"+q.Encode())
+		return
+	}
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": res, "meta": gin.H{}})
+}
+
+// Interactions handles POST /interactions: Slack signature only. Slack is
+// answered as soon as the request is verified (200 {accepted}); the action
+// runs after that and its outcome reaches the user through the payload's
+// response_url (services.HandleInteraction). The audit_events row of a
+// completed action is written then, with this request's metadata.
+func (ctl *SlackIntegrationController) Interactions(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		policyErr(c, http.StatusBadRequest, "invalid_parameter", "The body could not be read.", nil)
+		return
+	}
+	svc := ctl.service()
+	if svc == nil {
+		policyErr(c, http.StatusUnauthorized, services.SlackCodeSignatureInvalid, "The request is not a valid, fresh Slack request.",
+			gin.H{"reason": "not_configured"})
+		return
+	}
+	meta := slackAuditMeta{requestID: c.GetString("request_id"), method: c.Request.Method, path: c.Request.URL.Path,
+		ip: c.ClientIP(), userAgent: c.GetHeader("User-Agent")}
+	ack, err := svc.HandleInteraction(c.Request.Context(), c.Request.Header, body, meta.record)
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": ack, "meta": gin.H{}})
+}
+
+// slackAuditMeta is an interaction request's metadata, kept for the audit
+// row written when its action completes (after the request has ended).
+type slackAuditMeta struct {
+	requestID, method, path, ip, userAgent string
+}
+
+// record writes the audit_events row of a completed interaction (the
+// auditAdminMutation row, without the finished gin context).
+func (m slackAuditMeta) record(res *services.SlackInteractionResult, err error) {
+	if err != nil || res == nil || res.Ignored || res.Resource == "" || config.AuditLogger == nil {
+		return
+	}
+	config.AuditLogger.LogAdminAction(m.requestID, res.WorkspaceID.String(), res.UserID.String(), res.Action, res.Resource, res.ResourceID,
+		m.method, m.path, m.ip, m.userAgent, http.StatusOK, time.Duration(0), res.Before, res.After, "")
+}
+
+// PutSettings handles PUT /settings {approvals_channel_id}.
+func (ctl *SlackIntegrationController) PutSettings(c *gin.Context) {
+	if !ctl.configured(c) {
+		return
+	}
+	ws, user, ok := ctl.member(c)
+	if !ok {
+		return
+	}
+	var in services.SlackSettingsInput
+	if err := strictJSON(c, &in); err != nil {
+		policyErr(c, http.StatusBadRequest, "invalid_parameter", "The body must be JSON: {approvals_channel_id}.", gin.H{"parameter": "body"})
+		return
+	}
+	before, after, err := ctl.service().UpdateSettings(c.Request.Context(), ws, user, in)
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	auditAdminMutation(c, ws.String(), "update_settings", "workspace_slack_integration", ws.String(), http.StatusOK, before, after)
+	c.JSON(http.StatusOK, gin.H{"data": after, "meta": gin.H{}})
+}
+
+// Disconnect handles DELETE /.
+func (ctl *SlackIntegrationController) Disconnect(c *gin.Context) {
+	if !ctl.configured(c) {
+		return
+	}
+	ws, user, ok := ctl.member(c)
+	if !ok {
+		return
+	}
+	before, err := ctl.service().Disconnect(c.Request.Context(), ws, user)
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	auditAdminMutation(c, ws.String(), "disconnect", "workspace_slack_integration", ws.String(), http.StatusOK, before, nil)
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"disconnected": true, "slack_team_id": before.SlackTeamID}, "meta": gin.H{}})
+}
+
+// ConfirmLink handles POST /link/confirm {token}.
+func (ctl *SlackIntegrationController) ConfirmLink(c *gin.Context) {
+	if !ctl.configured(c) {
+		return
+	}
+	ws, user, ok := ctl.member(c)
+	if !ok {
+		return
+	}
+	var in struct {
+		Token string `json:"token"`
+	}
+	if err := strictJSON(c, &in); err != nil {
+		policyErr(c, http.StatusBadRequest, "invalid_parameter", "The body must be JSON: {token}.", gin.H{"parameter": "body"})
+		return
+	}
+	res, err := ctl.service().ConfirmLink(c.Request.Context(), ws, user, in.Token)
+	if err != nil {
+		govError(c, err)
+		return
+	}
+	auditAdminMutation(c, ws.String(), "link", "slack_user_link", res.Link.SlackUserID, http.StatusOK, nil, res.Link)
+	c.JSON(http.StatusOK, gin.H{"data": res, "meta": gin.H{}})
+}

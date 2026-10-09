@@ -512,19 +512,35 @@ func isSensitiveKey(key string) bool {
 	return false
 }
 
+// redactURLCredentials masks the password in a URL-shaped value
+// (redis://:pw@host, postgres://user:pw@host) so a variable whose NAME looks
+// harmless never logs the credential inside it. Anything else is returned
+// unchanged.
+func redactURLCredentials(value string) string {
+	u, err := url.Parse(value)
+	if err != nil || u.User == nil {
+		return value
+	}
+	if _, has := u.User.Password(); !has {
+		return value
+	}
+	u.User = url.UserPassword(u.User.Username(), "***")
+	return u.String()
+}
+
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		if isSensitiveKey(key) {
 			log.Printf("Loaded %s: ***", key)
 		} else {
-			log.Printf("Loaded %s: %s", key, value)
+			log.Printf("Loaded %s: %s", key, redactURLCredentials(value))
 		}
 		return value
 	}
 	if isSensitiveKey(key) {
 		log.Printf("Using fallback for %s: ***", key)
 	} else {
-		log.Printf("Using fallback for %s: %s", key, fallback)
+		log.Printf("Using fallback for %s: %s", key, redactURLCredentials(fallback))
 	}
 	return fallback
 }

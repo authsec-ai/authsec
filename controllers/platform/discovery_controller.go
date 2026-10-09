@@ -3,10 +3,15 @@ package platform
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -54,8 +59,9 @@ type DiscoverySourceUpdateRequest struct {
 // connector reports. Idempotent on (source, fingerprint) within the workspace.
 type SightingRequest struct {
 	// WorkspaceID is supplied by the connector, which is configured with it at
-	// deploy time. The sightings route is unauthenticated (see routes.go), so there
-	// is no token to derive the workspace from — the caller asserts it.
+	// deploy time. The sightings route has no user token to derive the workspace
+	// from, so the caller asserts it and its ingest token vouches for it (see
+	// discovery_ingest_auth.go).
 	//
 	// Typed as a string rather than uuid.UUID on purpose: `binding:"required"` on a
 	// uuid.UUID treats the all-zero UUID as absent, and the all-zero UUID is the
@@ -69,6 +75,83 @@ type SightingRequest struct {
 	Metadata          map[string]interface{} `json:"metadata,omitempty"`
 	DeploymentOrigin  string                 `json:"deployment_origin,omitempty"`
 	Archetype         string                 `json:"archetype,omitempty"`
+	// ObservedAt is when the connector saw this, which orders runtime-state
+	// transitions. Optional for backward compatibility with connectors that predate
+	// lifecycle tracking; absent means "now".
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
+	// RuntimeStatus is "running" (the default when absent) or "stopped": a
+	// workload the Kubernetes connector saw scaled to zero. Optional.
+	RuntimeStatus string `json:"runtime_status,omitempty"`
+}
+
+// AgentRegistrationRequest is the body for POST
+// /authsec/discovery/agent-registration — a deployed connector announcing itself
+// and then heartbeating.
+//
+// Ingest-token authenticated, exactly like /sightings, and for the same reason: the
+// agent is configured with its workspace at deploy time and asserts it. WorkspaceID is a
+// string for the same reason too — `binding:"required"` on a uuid.UUID rejects the
+// all-zero UUID, which is the real System workspace.
+type AgentRegistrationRequest struct {
+	WorkspaceID string `json:"workspace_id" binding:"required"`
+	Kind        string `json:"kind" binding:"required"`
+	// InstanceID is the stable key this agent re-registers under, so a restart,
+	// upgrade, or reschedule updates its row instead of creating another.
+	InstanceID   string                 `json:"instance_id" binding:"required"`
+	DisplayName  string                 `json:"display_name,omitempty"`
+	ClusterName  string                 `json:"cluster_name" binding:"required"`
+	ClusterUID   string                 `json:"cluster_uid,omitempty"`
+	AgentVersion string                 `json:"agent_version,omitempty"`
+	Status       string                 `json:"status,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	Runtime      map[string]interface{} `json:"runtime,omitempty"`
+	// ReportedSightings lets a heartbeat advance last_sync_at only when the agent
+	// has actually produced output. An idle cluster's agent is healthy but has
+	// nothing to sync.
+	ReportedSightings int64 `json:"reported_sightings,omitempty"`
+}
+
+// LifecycleEventRequest is the body for POST /authsec/discovery/lifecycle — a
+// connector reporting that an agent's runtime state changed.
+type LifecycleEventRequest struct {
+	WorkspaceID       string                 `json:"workspace_id" binding:"required"`
+	Source            string                 `json:"source" binding:"required"`
+	DiscoverySourceID *uuid.UUID             `json:"discovery_source_id,omitempty"`
+	Fingerprint       string                 `json:"fingerprint" binding:"required"`
+	Event             string                 `json:"event" binding:"required"`
+	Reason            string                 `json:"reason,omitempty"`
+	Actor             string                 `json:"actor,omitempty"`
+	Channel           string                 `json:"channel,omitempty"`
+	ClusterName       string                 `json:"cluster,omitempty"`
+	Metadata          map[string]interface{} `json:"metadata,omitempty"`
+	ObservedAt        *time.Time             `json:"observed_at,omitempty"`
+}
+
+// ResyncManifestRequest is the body for POST /authsec/discovery/resync-manifest —
+// the complete set of agents a sweep observed, which is what makes disappearance
+// detectable by diff.
+type ResyncManifestRequest struct {
+	WorkspaceID       string     `json:"workspace_id" binding:"required"`
+	Source            string     `json:"source" binding:"required"`
+	DiscoverySourceID *uuid.UUID `json:"discovery_source_id,omitempty"`
+	ClusterName       string     `json:"cluster" binding:"required"`
+	// ClusterUID is the kube-system namespace UID of the swept cluster.
+	// When it and the connection's recorded UID are both known and differ,
+	// the manifest is refused (409 cluster_uid_mismatch). Omitted while the
+	// connection has recorded a UID, it is refused too (409
+	// cluster_uid_required) unless IGA_K8S_REQUIRE_CLUSTER_UID=false.
+	ClusterUID string `json:"cluster_uid,omitempty"`
+	ScanKind   string `json:"scan_kind,omitempty"`
+	// Complete is false when any LIST in the sweep failed. A partial manifest is
+	// accepted but retires nothing — see services.ReconcileManifest.
+	Complete     bool     `json:"complete"`
+	Namespaces   []string `json:"namespaces"`
+	Fingerprints []string `json:"fingerprints"`
+	// StoppedFingerprints is the subset of fingerprints seen scaled to zero:
+	// present, so never marked gone. Optional.
+	StoppedFingerprints []string   `json:"stopped_fingerprints,omitempty"`
+	SweepStartedAt      *time.Time `json:"sweep_started_at,omitempty"`
+	ObservedAt          *time.Time `json:"observed_at,omitempty"`
 }
 
 // AgentUpdateRequest is the body for PUT /authsec/discovery/agents/:id.
@@ -86,7 +169,14 @@ type AgentUpdateRequest struct {
 // Both fields are mandatory: an agent needs an identity for its tokens and a
 // human who is accountable for it.
 type ClaimAgentRequest struct {
-	MatchedClientID uuid.UUID `json:"matched_client_id" binding:"required"`
+	// MatchedClientID is OPTIONAL. Omit it and the platform mints a governed
+	// identity from the sighting, named after the workload. Most discovered agents
+	// are workloads that never authenticate to AuthSec, so requiring an operator to
+	// pick a credential-holder for them was ceremony blocking the only judgement
+	// that needs a human: who is accountable.
+	//
+	// Supply it to bind this sighting to an identity that already exists.
+	MatchedClientID uuid.UUID `json:"matched_client_id,omitempty"`
 	OwnerUserID     uuid.UUID `json:"owner_user_id" binding:"required"`
 	Archetype       string    `json:"archetype,omitempty"`
 }
@@ -127,6 +217,42 @@ func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, er
 		principal = workspaceStr
 	}
 	return wsID, principal, nil
+}
+
+// assertedWorkspace resolves the workspace a connector claims in its request
+// body, and confirms it exists.
+//
+// Used by the ingress routes (agent-registration, sightings, lifecycle,
+// resync-manifest, rbac-snapshot) through ingressWorkspace, which first checks
+// the call's ingest token against that workspace (discovery_ingest_auth.go) —
+// the agent is configured with its workspace at deploy time and asserts it.
+//
+// The existence check is not redundant with the foreign key. Without it a typo'd
+// workspace id surfaces as a raw Postgres FK violation, which is a miserable thing
+// to debug from inside a cluster — and a typo is now a likely mistake, because an
+// operator types this into a Helm flag by hand. One indexed primary-key lookup is
+// worth the clarity.
+func (ctl *DiscoveryController) assertedWorkspace(c *gin.Context, raw string) (uuid.UUID, bool) {
+	wsID, err := uuid.Parse(raw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("workspace_id %q is not a valid uuid", raw),
+		})
+		return uuid.Nil, false
+	}
+
+	var exists int64
+	if err := ctl.db.Table("workspaces").Where("id = ?", wsID).Count(&exists).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify workspace"})
+		return uuid.Nil, false
+	}
+	if exists == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("unknown workspace_id %s", wsID),
+		})
+		return uuid.Nil, false
+	}
+	return wsID, true
 }
 
 // actingUser returns the authenticated user id, used to attribute a claim or a
@@ -279,8 +405,29 @@ func (ctl *DiscoveryController) UpdateDiscoverySource(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// DeleteDiscoverySource handles DELETE /authsec/discovery/sources/:id. Agents
-// already discovered by this source are kept; their pointer is simply nulled.
+// vaultClient builds a secrets-store client for the one thing this controller
+// needs it for: purging a GitHub App private key whose registration has just
+// been deleted.
+func (ctl *DiscoveryController) vaultClient() (vault.VaultClient, error) {
+	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+	if addr == "" || token == "" {
+		return nil, errors.New("VAULT_ADDR/VAULT_TOKEN not configured")
+	}
+	return vault.NewClient(addr, token)
+}
+
+// DeleteDiscoverySource handles DELETE /authsec/discovery/sources/:id.
+//
+// Delete means delete: the source, the integration binding it owns, and the
+// agents it found all go. When it was the workspace's last GitHub organisation,
+// the GitHub App registration goes with it and its private key is purged from
+// the secrets store, so nothing GitHub-related is left behind with nothing using
+// it. The App itself remains on github.com -- only its owner can remove it
+// there.
+//
+// The one exception is the source's ingest tokens: they are revoked, not
+// deleted, and kept as history (source_bound, no source) -- see
+// DISCOVERY_INGEST_AUTH.md.
 func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 	wsID, _, err := ctl.workspace(c)
 	if err != nil {
@@ -293,13 +440,30 @@ func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 		return
 	}
 
-	if err := ctl.manager().DeleteSource(wsID, id); err != nil {
+	purgePath, err := ctl.manager().DeleteSource(wsID, id)
+	if err != nil {
 		discoveryError(c, err)
 		return
 	}
 
+	// After the commit, never before: the row's removal has to be real before
+	// the key it points at is destroyed. A failure here is logged and not
+	// returned -- the delete the caller asked for has already succeeded, and a
+	// 500 would tell them it had not.
+	if purgePath != "" {
+		if vc, verr := ctl.vaultClient(); verr == nil {
+			if derr := vc.DeleteSecret(purgePath); derr != nil {
+				log.Printf("[discovery] deleted source %s but could not purge GitHub App key at %s: %v",
+					id, purgePath, derr)
+			}
+		} else {
+			log.Printf("[discovery] deleted source %s but Vault is unreachable, GitHub App key at %s not purged: %v",
+				id, purgePath, verr)
+		}
+	}
+
 	auditAdminMutation(c, wsID.String(), "delete", "discovery_source", id.String(),
-		http.StatusNoContent, nil, nil)
+		http.StatusNoContent, nil, gin.H{"github_app_key_purged": purgePath != ""})
 	c.Status(http.StatusNoContent)
 }
 
@@ -319,36 +483,17 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		return
 	}
 
-	// This route is unauthenticated, so the workspace comes from the body rather
-	// than a token claim. See the ingress comment in routes.go for what that trades.
-	wsID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("workspace_id %q is not a valid uuid", req.WorkspaceID),
-		})
+	// The workspace comes from the body; the ingest token (when the mode asks for
+	// one) is what vouches for it. See discovery_ingest_auth.go.
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	if !ok {
 		return
 	}
 
-	// Confirm the workspace exists. Without this the FK violation surfaces as a raw
-	// Postgres error, which is a miserable thing to debug from inside a cluster —
-	// and a typo'd workspace ID is now a likely mistake, since an operator types it
-	// into a Helm flag by hand. One indexed PK lookup is worth the clarity.
-	var exists int64
-	if err := ctl.db.Table("workspaces").Where("id = ?", wsID).Count(&exists).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify workspace"})
-		return
-	}
-	if exists == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("unknown workspace_id %s", wsID),
-		})
-		return
-	}
-
-	// No authenticated principal on this path. Record an explicitly-marked
-	// attribution rather than something that reads like a verified identity, so a
-	// row's provenance is never overstated when someone reads it later.
-	principal := "unauthenticated:" + req.Source
+	// Attributed to the ingest token that authenticated the call, or explicitly
+	// marked unauthenticated, so a row's provenance is never overstated when
+	// someone reads it later.
+	principal := ingestPrincipal(c, req.Source)
 
 	agent, created, err := ctl.manager().ReportSighting(wsID, principal, services.SightingInput{
 		Source:            req.Source,
@@ -358,6 +503,8 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		Metadata:          req.Metadata,
 		DeploymentOrigin:  req.DeploymentOrigin,
 		Archetype:         req.Archetype,
+		ObservedAt:        req.ObservedAt,
+		RuntimeStatus:     req.RuntimeStatus,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -375,6 +522,208 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 	c.JSON(status, gin.H{"agent": agent, "created": created})
 }
 
+// RegisterAgent handles POST /authsec/discovery/agent-registration — a deployed
+// connector announcing itself, then heartbeating on a timer.
+//
+// This is what makes a fleet legible. One control plane serves discovery agents in
+// many clusters; before this, the only record of which cluster a sighting came
+// from was a string buried in its metadata, so "which clusters are reporting?",
+// "what version is each running?" and "has one gone quiet?" had no answer. The
+// response returns the connector's id, which the agent then stamps on every
+// sighting — turning cluster attribution into a foreign key instead of a jsonb dig.
+//
+// Returns 201 on first registration and 200 for a heartbeat. Neither is an error.
+func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
+	var req AgentRegistrationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, ctl.registrationIngestSource(req.Kind, req.InstanceID))
+	if !ok {
+		return
+	}
+
+	source, created, err := ctl.manager().RegisterAgent(wsID, services.AgentRegistrationInput{
+		Kind:              req.Kind,
+		InstanceID:        req.InstanceID,
+		DisplayName:       req.DisplayName,
+		ClusterName:       req.ClusterName,
+		ClusterUID:        req.ClusterUID,
+		AgentVersion:      req.AgentVersion,
+		Status:            req.Status,
+		Error:             req.Error,
+		Runtime:           req.Runtime,
+		ReportedSightings: req.ReportedSightings,
+	})
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+		// Only first contact is a governance event worth auditing. A heartbeat every
+		// 60 seconds from every cluster would drown the admin-mutation log.
+		auditAdminMutation(c, wsID.String(), "register", "discovery_source",
+			source.ID.String(), status, nil, source)
+	}
+	c.JSON(status, gin.H{
+		// Named discovery_source_id, not id: this is the value the agent copies onto
+		// every sighting and lifecycle event it sends.
+		"discovery_source_id": source.ID,
+		"source":              source,
+		"created":             created,
+	})
+}
+
+// ReportLifecycleEvent handles POST /authsec/discovery/lifecycle — a connector
+// reporting that an agent's observed runtime state changed.
+//
+// The gap this closes: sightings only ever asserted "this exists". A workload that
+// was deleted left a row indistinguishable from a running one, forever. This
+// endpoint carries the other half — that it was deleted, when, and (from admission,
+// where the API server authenticates the caller) by whom.
+//
+// It writes runtime_status, never status: what a human decided about an agent and
+// what we observed about it are separate axes. An agent that was claimed and then
+// deleted must stay registered — the audit trail is the point — while its runtime
+// status becomes gone.
+func (ctl *DiscoveryController) ReportLifecycleEvent(c *gin.Context) {
+	var req LifecycleEventRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	if !ok {
+		return
+	}
+
+	agent, event, err := ctl.manager().RecordLifecycleEvent(wsID, services.LifecycleEventInput{
+		Source:            req.Source,
+		DiscoverySourceID: req.DiscoverySourceID,
+		Fingerprint:       req.Fingerprint,
+		Event:             req.Event,
+		Reason:            req.Reason,
+		Actor:             req.Actor,
+		Channel:           req.Channel,
+		ClusterName:       req.ClusterName,
+		Metadata:          req.Metadata,
+		ObservedAt:        req.ObservedAt,
+	})
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+
+	// 202 when the event was kept but matched no inventory row. That happens for
+	// real: an agent created and destroyed between two resyncs, or deleted while the
+	// reporting queue was backed up. The event is the only evidence it ever existed,
+	// so it is recorded rather than rejected — but the connector should be able to
+	// tell that case from a fold into a known agent.
+	status := http.StatusOK
+	if agent == nil {
+		status = http.StatusAccepted
+	}
+	c.JSON(status, gin.H{"agent": agent, "event": event, "matched": agent != nil})
+}
+
+// ReportResyncManifest handles POST /authsec/discovery/resync-manifest — the
+// complete set of agents one sweep observed.
+//
+// This is the third lifecycle signal, and the only one that catches an agent
+// destroyed while nobody was watching: admission sees deletions live but not the
+// ones that happened before install or during an outage. A manifest states a fact
+// ("at T, sweeping these namespaces, these were present, and my sweep was
+// complete") and the control plane decides what absence means.
+//
+// A partial manifest (complete=false) is accepted and retires NOTHING. One
+// transient RBAC error or API timeout during a sweep would otherwise retire a
+// large part of a customer's inventory in a single request.
+func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
+	var req ResyncManifestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	if !ok {
+		return
+	}
+
+	result, err := ctl.manager().ReconcileManifest(wsID, services.ManifestInput{
+		Source:              req.Source,
+		DiscoverySourceID:   req.DiscoverySourceID,
+		ClusterName:         req.ClusterName,
+		ClusterUID:          req.ClusterUID,
+		ScanKind:            req.ScanKind,
+		Complete:            req.Complete,
+		Namespaces:          req.Namespaces,
+		Fingerprints:        req.Fingerprints,
+		StoppedFingerprints: req.StoppedFingerprints,
+		SweepStartedAt:      req.SweepStartedAt,
+		ObservedAt:          req.ObservedAt,
+	})
+	if errors.Is(err, services.ErrClusterUIDMismatch) {
+		// A different cluster under this connection's name: its absences say
+		// nothing about this cluster's agents. Refused; nothing was changed.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
+	if errors.Is(err, services.ErrClusterUIDRequired) {
+		// The connection recorded a cluster UID and this manifest states none:
+		// it cannot be shown to come from this cluster (IGA_K8S_REQUIRE_CLUSTER_UID).
+		// Refused; nothing was changed.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_required", "detail": err.Error()})
+		return
+	}
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+
+	if result.MarkedGone > 0 {
+		// Retiring agents from the inventory IS a governance-visible change, unlike a
+		// routine sighting, so it is audited even though the caller is a machine.
+		auditAdminMutation(c, wsID.String(), "retire", "discovered_agent",
+			req.ClusterName, http.StatusOK, nil, result)
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ListAgentLifecycle handles GET /authsec/discovery/agents/:id/events — the
+// history behind an agent's current runtime status.
+//
+// The inventory row says an agent is gone; this says when it was deleted, through
+// which channel it was observed, and which principal the API server attributed it
+// to. That is the difference between knowing an agent vanished and being able to
+// answer for it.
+func (ctl *DiscoveryController) ListAgentLifecycle(c *gin.Context) {
+	wsID, _, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	events, err := ctl.manager().ListAgentEvents(wsID, id, limit)
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"events": events, "total": len(events)})
+}
+
 // ListDiscoveredAgents handles GET /authsec/discovery/agents.
 // Filter with ?status=&deployment_origin=&source=&archetype=&unowned=true.
 // status=unregistered is the Unregistered Agents report; manual-origin agents
@@ -389,14 +738,30 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	offset, _ := strconv.Atoi(c.Query("offset"))
 
+	// ?discovery_source_id= is in practice "agents in this cluster" — the question
+	// self-registration exists to make answerable. A malformed value is ignored
+	// rather than fatal: a filter is a narrowing, and silently returning everything
+	// is less surprising in a console than a 400 on a stale bookmark.
+	var sourceID *uuid.UUID
+	if raw := c.Query("discovery_source_id"); raw != "" {
+		if parsed, perr := uuid.Parse(raw); perr == nil {
+			sourceID = &parsed
+		}
+	}
+
 	agents, total, err := ctl.manager().ListAgents(wsID, repositories.AgentFilter{
 		Status:           c.Query("status"),
 		DeploymentOrigin: c.Query("deployment_origin"),
 		Source:           c.Query("source"),
 		Archetype:        c.Query("archetype"),
 		UnownedOnly:      c.Query("unowned") == "true",
-		Limit:            limit,
-		Offset:           offset,
+		RuntimeStatus:    c.Query("runtime_status"),
+		// ?live=true is the actionable queue: drop agents we have observed to be
+		// destroyed, which need no claim decision.
+		LiveOnly:          c.Query("live") == "true",
+		DiscoverySourceID: sourceID,
+		Limit:             limit,
+		Offset:            offset,
 	})
 	if err != nil {
 		discoveryError(c, err)
@@ -583,6 +948,40 @@ func (ctl *DiscoveryController) QuarantineAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
+// UnquarantineAgent handles POST /authsec/discovery/agents/:id/unquarantine — the
+// release half of the quarantine loop.
+//
+// Same permission as quarantine (discovery:quarantine), deliberately: whoever can cut
+// an agent off can restore it. Splitting them would mean an operator able to contain
+// an incident but not to undo a mistake, which is how a mis-click becomes an outage
+// nobody present can fix.
+//
+// No body. A quarantine needs a reason because it is an accusation that must be
+// answerable; a release does not, because it restores the status quo. The actor and
+// timestamp are recorded either way.
+func (ctl *DiscoveryController) UnquarantineAgent(c *gin.Context) {
+	wsID, _, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	out, err := ctl.manager().ReleaseQuarantine(wsID, id, ctl.actingUser(c))
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+
+	auditAdminMutation(c, wsID.String(), "unquarantine", "discovered_agent", id.String(),
+		http.StatusOK, nil, out)
+	c.JSON(http.StatusOK, out)
+}
+
 // GetCoverage handles GET /authsec/discovery/coverage — the headline governance
 // KPI: what share of discovered agents is under management, split by origin.
 func (ctl *DiscoveryController) GetCoverage(c *gin.Context) {
@@ -598,4 +997,74 @@ func (ctl *DiscoveryController) GetCoverage(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+/* ------------------------- Kubernetes RBAC snapshot ----------------------- */
+
+// ReportRBACSnapshot handles POST /authsec/discovery/rbac-snapshot.
+//
+// The in-cluster agent's periodic reading of the cluster's authorization model:
+// ServiceAccounts, Roles, ClusterRoles and the bindings between them. It is
+// projected into the shared iga_* graph under provider 'k8s', which is what lets
+// the console answer "what can this agent actually do in there?".
+//
+// Unauthenticated, on the same ingress and for the same reason as sightings: the
+// caller is a workload in a customer's cluster with no console credential, and
+// the payload GRANTS NOTHING — it describes authorization that already exists
+// somewhere else. The workspace is asserted in the body, as it is for every
+// route in this group.
+//
+// The body carries no secret material by construction. RBAC objects hold
+// authorization structure; the agent never reads a Secret, and the only secret
+// reference here is a token secret's NAME.
+func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
+	var snap models.K8sRBACSnapshot
+	if err := c.ShouldBindJSON(&snap); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	wsID, ok := ctl.ingressWorkspace(c, snap.WorkspaceID, parsedIngestSource(snap.DiscoverySourceID))
+	if !ok {
+		return
+	}
+
+	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).
+		Ingest(wsID, snap)
+	if errors.Is(err, services.ErrClusterUIDMismatch) {
+		// A different cluster installed under this one's name. Refused, not
+		// merged; nothing was written.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_mismatch", "detail": err.Error()})
+		return
+	}
+	if errors.Is(err, services.ErrClusterUIDRequired) {
+		// The source recorded a cluster UID and this snapshot states none
+		// (IGA_K8S_REQUIRE_CLUSTER_UID). Refused; nothing was written.
+		c.JSON(http.StatusConflict, gin.H{"error": "cluster_uid_required", "detail": err.Error()})
+		return
+	}
+	if errors.Is(err, services.ErrSweepConflict) {
+		// Another sweep of this cluster was projected at the same moment and
+		// took the generation. Nothing of this snapshot was written, and the
+		// snapshot is not wrong -- it lost a race -- so it is a 409 the agent
+		// retries (its next cycle re-sends), never a 400 it would log as a
+		// malformed payload and drop.
+		c.JSON(http.StatusConflict, gin.H{"error": "sweep_conflict", "retryable": true,
+			"detail": err.Error()})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 202 when the projection gate is off: the snapshot was well-formed and
+	// received, and nothing was written. A 200 would imply it landed in the
+	// graph; a 4xx would make a correctly-configured agent log errors against a
+	// control plane that is simply not projecting yet.
+	status := http.StatusOK
+	if !out.Accepted {
+		status = http.StatusAccepted
+	}
+	c.JSON(status, out)
 }

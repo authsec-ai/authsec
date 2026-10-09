@@ -900,6 +900,13 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	if err != nil {
 
+		// Audit / approval records still naming the user are kept: an
+		// explicit 409, never a raw foreign-key error (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			log.Printf("INFO: refused hard delete of user %s: %v", userUUID, err)
+			return
+		}
+
 		log.Printf("ERROR: Failed to hard delete user %s: %v", userUUID, err)
 
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user: " + err.Error()})
@@ -1632,16 +1639,16 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	// User identity is (workspace_id, email); no client_id predicate.
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:           uuid.New(),
-			WorkspaceID:  pendingReg.WorkspaceID,
-			Name:         displayName,
-			Email:        pendingReg.Email,
-			PasswordHash: pendingReg.PasswordHash,
+			ID:              uuid.New(),
+			WorkspaceID:     pendingReg.WorkspaceID,
+			Name:            displayName,
+			Email:           pendingReg.Email,
+			PasswordHash:    pendingReg.PasswordHash,
 			WorkspaceDomain: pendingReg.WorkspaceDomain,
-			Provider:     "custom",
-			ProviderID:   pendingReg.Email,
-			Active:       true,
-			MFAEnabled:   false,
+			Provider:        "custom",
+			ProviderID:      pendingReg.Email,
+			Active:          true,
+			MFAEnabled:      false,
 		},
 	}
 
@@ -1732,16 +1739,16 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:           uuid.New(),
-			WorkspaceID:  workspaceID,
-			Name:         input.Email,
-			Email:        input.Email,
-			PasswordHash: tempUser.PasswordHash,
+			ID:              uuid.New(),
+			WorkspaceID:     workspaceID,
+			Name:            input.Email,
+			Email:           input.Email,
+			PasswordHash:    tempUser.PasswordHash,
 			WorkspaceDomain: config.AppConfig.WorkspaceDomainSuffix,
-			Provider:     "custom",
-			ProviderID:   input.Email,
-			Active:       true,
-			MFAEnabled:   false,
+			Provider:        "custom",
+			ProviderID:      input.Email,
+			Active:          true,
+			MFAEnabled:      false,
 		},
 	}
 	if err := tenantDB.Create(&newUser).Error; err != nil {
@@ -2282,7 +2289,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 	const ownerEmail = "a@authnull.com"
 
 	var input struct {
-		UserName     string `json:"user_name,omitempty"`
+		UserName        string `json:"user_name,omitempty"`
 		WorkspaceDomain string `json:"workspace_domain,omitempty"`
 	}
 	// Body is optional — ignore bind errors for empty body

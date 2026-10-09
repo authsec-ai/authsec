@@ -46,3 +46,36 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # The DB-gated suites SKIP unless their DSN env var is set -- so plain
+      # `go test ./...` above prints ok while running none of them. That is
+      # exactly how the Phase 2 evidence defect shipped once: the tests that
+      # would have caught it never ran. These steps point the suites at the
+      # postgres service so they actually execute on every PR.
+      - name: Graph projection tests (self-migrating, isolated DB)
+        env:
+          # A DEDICATED database: the igagraph suite DROPs and rebuilds its
+          # public schema from migrations, so it must never share the DB the
+          # rest of go test uses.
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/iga_graph_test?sslmode=disable
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d authsec \
+            -c "DROP DATABASE IF EXISTS iga_graph_test WITH (FORCE);" \
+            -c "CREATE DATABASE iga_graph_test;"
+          go test ./tests/igagraph/... -count=1
+
+      - name: Evidence path tests (real scanner -> real projector)
+        env:
+          IGA_TEST_DSN: postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable
+        run: |
+          # The integration harness expects a migrated schema; apply every
+          # migration in order, each file in one transaction (006 needs it).
+          for f in migrations/master/0*.sql; do
+            PGPASSWORD=postgres psql -h localhost -U postgres -d authsec \
+              -v ON_ERROR_STOP=1 -1 -f "$f" >/dev/null
+          done
+          # Just the two tests that prove the qualified-subject evidence path.
+          # The full integration suite runs in the opt-in job in pr-checks.yml,
+          # which carries one known-failing, unrelated checkpoint test.
+          go test ./tests/integration/ -count=1 \
+            -run 'TestPermissionEvidenceSubjectKeyIsQualified|TestObservationDedupeUpgradesUnqualifiedKey'

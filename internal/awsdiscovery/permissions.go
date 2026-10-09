@@ -1,0 +1,270 @@
+package awsdiscovery
+
+// The permission baseline, in a form the console and a customer's security
+// reviewer can both read.
+//
+// This list and the inline policy in authsec-aws-discovery-role.yaml describe
+// the same grant and MUST move together. They are in the same package and
+// should be edited in the same change; a mismatch shows up as a scan surface
+// reporting AccessDenied against a stack the console said was sufficient.
+
+// BaselineManagedPolicy is the AWS-managed read-only policy the role carries.
+// It grants metadata reads across the account and does not grant reading secret
+// values, SSM parameter values or decryption keys.
+//
+// The partition is a placeholder: the template substitutes ${AWS::Partition} so
+// the stack also works in GovCloud and China.
+const BaselineManagedPolicy = "arn:${AWS::Partition}:iam::aws:policy/SecurityAudit"
+
+// Permission is one additional read granted beyond the baseline.
+type Permission struct {
+	// Actions is the IAM action list for this group.
+	Actions []string `json:"actions"`
+	// Surface is the discovery surface it serves.
+	Surface string `json:"surface"`
+	// Why explains what AuthSec does with it, in a sentence a customer's
+	// reviewer can evaluate without reading our code.
+	Why string `json:"why"`
+	// Redundant marks a grant that MAY already be covered by the baseline, and
+	// so may be removable.
+	//
+	// It is about necessity, not validity. Every action in this file is a real
+	// IAM action: cfn-lint's W3037 check validates the template's service
+	// prefixes and action names against AWS's own IAM spec, and
+	// TestTemplateAndPermissionListAgree keeps this list and the template in
+	// step. Resolving redundancy is the part that needs the live SecurityAudit
+	// document read from an account.
+	//
+	// Surfaced rather than hidden: an over-grant a customer cannot see is worse
+	// than one they can question.
+	Redundant bool `json:"possibly_redundant_with_baseline,omitempty"`
+}
+
+// AdditionalPermissions returns the reads granted on top of the baseline.
+func AdditionalPermissions() []Permission {
+	return []Permission{
+		{
+			Surface: "onboarding",
+			Actions: []string{"sts:GetCallerIdentity"},
+			Why: "Proves the cross-account role can be assumed and reports which " +
+				"account it lands in. The only call made during onboarding.",
+		},
+		{
+			Surface: "iam",
+			Actions: []string{
+				"iam:GetAccountAuthorizationDetails",
+				"iam:GenerateCredentialReport",
+				"iam:GetCredentialReport",
+				"iam:GenerateServiceLastAccessedDetails",
+				"iam:GetServiceLastAccessedDetails",
+				"iam:ListOpenIDConnectProviders",
+			},
+			Why: "Reads every role, user, attached and inline policy in one " +
+				"paginated call instead of thousands of per-identity calls, and " +
+				"reads last-used data without paying for CloudTrail volume. The " +
+				"Generate* calls produce read-only reports; they create no " +
+				"resource and change no state. ListOpenIDConnectProviders lists " +
+				"the account's OIDC providers as join targets for IRSA and the " +
+				"EKS identity edge.",
+			Redundant: true,
+		},
+		{
+			Surface: "workloads",
+			Actions: []string{
+				"lambda:ListFunctions",
+				"ecs:ListTaskDefinitions",
+				"ecs:DescribeTaskDefinition",
+				"ec2:DescribeInstances",
+				"ec2:DescribeRegions",
+				"iam:GetInstanceProfile",
+			},
+			Why: "Discovers the compute that runs as each role -- Lambda " +
+				"functions, ECS task definitions and EC2 instances -- so a " +
+				"role's permissions can be attributed to something that " +
+				"actually runs. iam:GetInstanceProfile resolves the wrapper " +
+				"EC2 names instead of a role. ec2:DescribeRegions lists the " +
+				"regions enabled in the account (names and opt-in status " +
+				"only), so a region selection can be checked against them. " +
+				"Lambda environment variable NAMES are recorded and values " +
+				"are discarded at parse time; no IAM action grants the names " +
+				"alone, so that one is enforced in code.",
+			Redundant: true,
+		},
+		{
+			Surface: "bedrock-agents",
+			Actions: []string{"bedrock:ListAgents", "bedrock:GetAgent"},
+			Why: "Discovers AWS-native managed agents and the execution role each " +
+				"one runs as. Agent instructions and prompt text are never read.",
+			Redundant: true,
+		},
+		{
+			Surface: "bedrock-agentcore",
+			Actions: []string{
+				"bedrock-agentcore:ListAgentRuntimes",
+				"bedrock-agentcore:GetAgentRuntime",
+				"bedrock-agentcore:ListWorkloadIdentities",
+				"bedrock-agentcore:ListOauth2CredentialProviders",
+				"bedrock-agentcore:ListApiKeyCredentialProviders",
+				"bedrock-agentcore:ListGateways",
+				"bedrock-agentcore:GetGateway",
+				"bedrock-agentcore:ListGatewayTargets",
+			},
+			Why: "Discovers AgentCore runtimes, the workload identities they run " +
+				"as, and what they can reach. GetGateway resolves a gateway's " +
+				"ARN and the execution role it runs as, which ListGateways " +
+				"does not return; a gateway holds no credential value. " +
+				"List-only on credential providers: names and ARNs, never a value.",
+			Redundant: true,
+		},
+		{
+			Surface: "eks",
+			Actions: []string{
+				"eks:ListClusters",
+				"eks:DescribeCluster",
+				"eks:ListPodIdentityAssociations",
+				"eks:DescribePodIdentityAssociation",
+			},
+			Why: "Records which IAM role a Kubernetes service account may assume, " +
+				"and the cluster OIDC issuer that tells two clusters apart. Pods " +
+				"and workloads are not read here.",
+			Redundant: true,
+		},
+		{
+			Surface: "cloudtrail",
+			Actions: []string{
+				"cloudtrail:LookupEvents",
+				"cloudtrail:DescribeTrails",
+				"cloudtrail:GetTrailStatus",
+			},
+			Why: "Reads per-identity API history for liveness and agent " +
+				"classification.",
+		},
+		{
+			Surface: "resource-policies",
+			Actions: []string{
+				"s3:GetBucketPolicy",
+				"kms:GetKeyPolicy",
+			},
+			Why: "Reads the policy DOCUMENT a bucket or key carries, never its " +
+				"data or key material. Needed because an identity-based Allow " +
+				"can be overridden by a resource-based Deny that this scanner " +
+				"would otherwise never see -- reporting access as granted when " +
+				"the resource itself blocks it.",
+		},
+		{
+			Surface: "resource-policy-collection",
+			Actions: ResourcePolicyCollectionActions(),
+			Why: "Lists every S3 bucket, directory bucket, access point, " +
+				"multi-region and Object Lambda access point, KMS key, SQS " +
+				"queue, SNS topic, Lambda function, version, alias and layer " +
+				"version, and Secrets Manager secret, and reads the resource " +
+				"POLICY of each (template 2026-10-07). Only policy text is " +
+				"read: no object, message, key material or secret value. " +
+				"Needed so a proposed permission change can be shown not to " +
+				"cut off access a resource policy grants, form by form and " +
+				"region by region.",
+		},
+		{
+			Surface: "migration-evidence",
+			Actions: MigrationEvidenceActions(),
+			Why: "Read only when AuthSec proposes moving one workload off a " +
+				"shared role: which task-definition revision each ECS service " +
+				"and its running tasks use, which version each Lambda alias " +
+				"and event-source mapping points at, and which instance " +
+				"profile each Auto Scaling group and instance carries -- the " +
+				"evidence that the move happened. Never stored as inventory; " +
+				"nothing is changed (template 2026-10-07).",
+		},
+	}
+}
+
+// ResourcePolicyCollectionActions are the enumerate and read actions of
+// every collected resource-policy form (SPEC-iga-phase3-policy.md §3.9),
+// beyond s3:GetBucketPolicy and kms:GetKeyPolicy (granted since 2026-09-18)
+// and lambda:ListFunctions (WorkloadReads). The template's ResourcePolicies
+// statement grants exactly these plus those two;
+// TestP3RPCTemplateGrantsCollectionActions holds them together.
+func ResourcePolicyCollectionActions() []string {
+	return []string{
+		"s3:ListAllMyBuckets",
+		"s3express:ListAllMyDirectoryBuckets",
+		"s3express:GetBucketPolicy",
+		"s3:ListAccessPoints",
+		"s3:GetAccessPointPolicy",
+		"s3:ListMultiRegionAccessPoints",
+		"s3:GetMultiRegionAccessPointPolicy",
+		"s3:ListAccessPointsForObjectLambda",
+		"s3:GetAccessPointPolicyForObjectLambda",
+		"kms:ListKeys",
+		"sqs:ListQueues",
+		"sqs:GetQueueAttributes",
+		"sns:ListTopics",
+		"sns:GetTopicAttributes",
+		"lambda:ListVersionsByFunction",
+		"lambda:ListAliases",
+		"lambda:GetPolicy",
+		"lambda:ListLayers",
+		"lambda:ListLayerVersions",
+		"lambda:GetLayerVersionPolicy",
+		"secretsmanager:ListSecrets",
+		"secretsmanager:GetResourcePolicy",
+	}
+}
+
+// MigrationEvidenceActions are §11's read-only migration-evidence actions
+// not already granted elsewhere (lambda:ListAliases and
+// lambda:ListVersionsByFunction are in ResourcePolicyCollectionActions;
+// ec2:DescribeInstances is in WorkloadReads).
+func MigrationEvidenceActions() []string {
+	return []string{
+		"ecs:ListClusters",
+		"ecs:ListServices",
+		"ecs:DescribeServices",
+		"ecs:ListTasks",
+		"ecs:DescribeTasks",
+		"lambda:GetFunctionConfiguration",
+		"lambda:ListEventSourceMappings",
+		"autoscaling:DescribeAutoScalingGroups",
+		"ec2:DescribeLaunchTemplateVersions",
+		"ec2:DescribeIamInstanceProfileAssociations",
+	}
+}
+
+// HardDenies are the actions the role is explicitly denied, whatever any Allow
+// says. The baseline does not grant them today; the Deny is what keeps that
+// true if the baseline widens or a later release adds a permission carelessly.
+func HardDenies() []Permission {
+	return []Permission{
+		{
+			Surface: "secret-values",
+			Actions: []string{
+				"secretsmanager:GetSecretValue",
+				"secretsmanager:BatchGetSecretValue",
+				"ssm:GetParameter", "ssm:GetParameters",
+				"ssm:GetParametersByPath", "ssm:GetParameterHistory",
+			},
+			Why: "AuthSec records the existence, age and last use of a secret. It " +
+				"never reads one.",
+		},
+		{
+			Surface: "decryption",
+			Actions: []string{
+				"kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey",
+				"kms:GenerateDataKeyWithoutPlaintext",
+				"kms:ReEncryptFrom", "kms:ReEncryptTo",
+			},
+			Why: "Nothing discovery reads is encrypted at the application layer, " +
+				"so the ability to decrypt has no legitimate use here.",
+		},
+		{
+			Surface: "role-chaining",
+			Actions: []string{
+				"sts:AssumeRole", "sts:AssumeRoleWithWebIdentity",
+				"sts:AssumeRoleWithSAML",
+			},
+			Why: "The discovery session is a leaf. It may be assumed by AuthSec, " +
+				"but it may never assume anything further and pivot deeper into " +
+				"the account.",
+		},
+	}
+}

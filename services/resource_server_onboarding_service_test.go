@@ -130,6 +130,9 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 			introspection_secret TEXT,
 			introspection_secret_hash TEXT,
 			active NUMERIC,
+			-- Same omission as in resource_server_service_test.go: the model has
+			-- Managed, this fixture did not.
+			managed NUMERIC NOT NULL DEFAULT 0,
 			state TEXT NOT NULL,
 			setup_completed_at DATETIME,
 			setup_completed_by TEXT,

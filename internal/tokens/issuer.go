@@ -45,6 +45,14 @@ func NewNativeIssuer(db *gorm.DB, keys *NativeKeyManager, issuer string) *Native
 	return &NativeIssuer{db: db, keys: keys, issuer: issuer}
 }
 
+// IssuerURL returns the exact issuer string this instance was constructed
+// with — every token it mints carries this in `iss`. Satisfies
+// internal/gcp.CloudOnboardingTokenIssuer's IssuerURL() method, so GCP's WIF
+// path can check it's HTTPS before minting anything.
+func (i *NativeIssuer) IssuerURL() string {
+	return i.issuer
+}
+
 // IDJAGClaims carries the inputs for IssueIDJAG.
 type IDJAGClaims struct {
 	// WorkspaceID is the minting workspace, carried as the `issuance_workspace`
@@ -72,6 +80,20 @@ const IDJAGTokenType = "urn:ietf:params:oauth:token-type:id-jag"
 
 // IDJAGTLL is the lifetime of an ID-JAG token (5 minutes; non-refreshable).
 const IDJAGTLL = 5 * time.Minute
+
+// CloudOnboardingTyp is the JWT typ header for a cloud-onboarding token: a
+// one-shot bearer AuthSec presents to a cloud provider's own token-exchange
+// endpoint (GCP's sts.googleapis.com, via workload identity federation) to
+// prove control of a customer-derived subject, not a credential AuthSec's own
+// resource servers ever accept. Distinct typ keeps it out of every other
+// classification path on this issuer (native access tokens, ID-JAGs, SPIFFE
+// JWT-SVIDs), even though it shares the same signing key and public JWKS.
+const CloudOnboardingTyp = "authsec-cloud-onboarding+jwt"
+
+// CloudOnboardingTTL mirrors IDJAGTLL: short and non-refreshable, because a
+// cloud-onboarding token is minted fresh for every credential exchange (at
+// onboarding time and at every later scan/verify), never cached or reused.
+const CloudOnboardingTTL = 5 * time.Minute
 
 // IssueIDJAG mints an ID-JAG credential (intermediary assertion, NOT an RS
 // access token). It is signed with the active native key but NOT inserted into
@@ -105,6 +127,41 @@ func (i *NativeIssuer) IssueIDJAG(ctx context.Context, c IDJAGClaims) (string, u
 		return "", uuid.Nil, err
 	}
 	return tokenStr, jti, nil
+}
+
+// IssueCloudOnboardingToken mints a cloud-onboarding token: a short-lived
+// bearer AuthSec presents as the SUBJECT TOKEN in a workload identity
+// federation token exchange, so a cloud provider's STS can verify AuthSec's
+// own signature (via this issuer's already-public JWKS) and map sub to a
+// customer-derived principal without AuthSec ever holding provider key
+// material. Modeled directly on IssueIDJAG: same short TTL, same "never
+// tracked in native_tokens" reasoning (a one-shot bearer presented to an
+// external party is not an AuthSec resource-server access token AuthSec
+// itself needs to track or revoke — the provider's own token exchange is the
+// only party that ever redeems it, and it does so once, immediately).
+//
+// sub is the deterministic subject the caller derived (GCP:
+// internal/gcp.DeriveWIFParams's wif_subject); audience is the full resource
+// name of the provider-side trust anchor the exchange targets (GCP: the WIF
+// provider resource, "//iam.googleapis.com/projects/.../providers/...").
+// Neither is validated here — shape and scoping are the caller's job, this
+// method only signs what it is given.
+func (i *NativeIssuer) IssueCloudOnboardingToken(ctx context.Context, sub, audience string) (string, error) {
+	_ = ctx
+	jti := uuid.New()
+	now := time.Now().UTC()
+	exp := now.Add(CloudOnboardingTTL)
+
+	claims := jwt.MapClaims{
+		"iss": i.issuer,
+		"sub": sub,
+		"aud": []string{audience},
+		"jti": jti.String(),
+		"iat": now.Unix(),
+		"exp": exp.Unix(),
+	}
+
+	return i.keys.SignWithTyp(claims, CloudOnboardingTyp)
 }
 
 // Issue signs a short-lived, non-refreshable native access token and inserts its
