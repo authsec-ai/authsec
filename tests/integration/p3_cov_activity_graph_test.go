@@ -80,10 +80,15 @@ func TestP3CovActivitySampleUsesGraphRelationships(t *testing.T) {
 		t.Fatalf("published executes_as edges to zz-bound: %d, want 1", n)
 	}
 
-	// Scan 2: the function is gone from this scan's compute, so no
-	// cloud_workload row of this run names zz-bound -- but the published
-	// graph still binds it, and that is what prioritises it.
+	// Scan 2: the function is gone, and no cloud_workload row names zz-bound
+	// any more (within one connector the scan's own rows otherwise keep a
+	// binding until the scan's end -- a stale row is reconciled only after
+	// activity is read, and a failed detail call keeps its attribution,
+	// D-53 -- so the row is removed here to isolate the graph). The
+	// published graph still binds it, and that alone must prioritise it.
 	a.lambda("us-east-1", "bound-fn", "")
+	p3exec(t, l.db, `DELETE FROM cloud_workload WHERE workspace_id = ? AND identity_id IN
+	                   (SELECT id FROM cloud_identity WHERE workspace_id = ? AND native_id = ?)`, l.ws, l.ws, bound)
 	act2 := &s3bActivity{}
 	cov = l.p3covScan(a, act2, true)
 	if n := l.count(`SELECT count(*) FROM cloud_workload w JOIN cloud_identity ci ON ci.id = w.identity_id
