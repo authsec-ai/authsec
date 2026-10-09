@@ -18,6 +18,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,9 +134,9 @@ func TestReclaimedWorkersLateReportIsRefused(t *testing.T) {
 	}
 }
 
-// Reclaimed and not yet re-leased: nobody holds it, so nobody may report --
-// even an agent that does not name itself (every agent deployed today).
-func TestReportOnAReclaimedPendingInstructionIsRefused(t *testing.T) {
+// Reclaimed and not yet re-leased: nobody holds it. A late FAILURE is
+// refused (the instruction is already back in the queue for a retry).
+func TestLateFailureOnAReclaimedPendingInstructionIsRefused(t *testing.T) {
 	f := newActFixture(t)
 	id := leasedQuarantine(t, f, "pod-a")
 	expireLease(t, f, id)
@@ -144,31 +145,103 @@ func TestReportOnAReclaimedPendingInstructionIsRefused(t *testing.T) {
 	}
 
 	before := instructionState(t, f, id)
-	_, err := f.am.Report(f.source, id, services.ReportInput{Success: true})
-	assertRefused(t, "report on a pending instruction", err, services.ErrInstructionLeaseNotHeld)
+	_, err := f.am.Report(f.source, id, services.ReportInput{Success: false, Error: "late"})
+	assertRefused(t, "late failure on a pending instruction", err, services.ErrInstructionLeaseNotHeld)
 	if after := instructionState(t, f, id); after != before {
 		t.Errorf("a refused report must change nothing.\nbefore: %s\nafter:  %s", before, after)
 	}
 }
 
-// The lease ran out before the report arrived and the reaper has not run yet:
-// refused as expired, nothing recorded, and the reaper then reclaims it as usual.
-func TestReportAfterLeaseExpiryIsRefused(t *testing.T) {
+// Review fix R1a P2: a late SUCCESS on a reclaimed, re-queued instruction is
+// RECORDED -- applied, with a note, folded into the agent -- not refused and
+// re-run: the work was done in the cluster, and re-running it is the
+// duplicate apply the fence exists to prevent. Once applied, nothing leases
+// it again; the reaper has nothing to reclaim.
+func TestLateSuccessOnAReclaimedInstructionIsRecordedNotRerun(t *testing.T) {
+	for _, holder := range []string{"pod-a", ""} {
+		t.Run("holder="+holder, func(t *testing.T) {
+			f := newActFixture(t)
+			id := leasedQuarantine(t, f, "pod-a")
+			expireLease(t, f, id)
+			if n, err := f.am.ReclaimExpiredLeases(); err != nil || n != 1 {
+				t.Fatalf("reclaim: %v (%d)", err, n)
+			}
+			out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: holder,
+				Result: map[string]interface{}{"network_policy": "authsec-quarantine-research-agent"}})
+			if err != nil {
+				t.Fatalf("a late success must be recorded: %v", err)
+			}
+			if out.Status != models.InstructionApplied || out.AppliedAt == nil || out.LeasedBy != "" ||
+				!strings.Contains(string(out.Result), "authsec_late_report") || !strings.Contains(string(out.Result), "network_policy") {
+				t.Fatalf("want applied with the agent's result and a note, got %+v (%s)", out, out.Result)
+			}
+			var enforcedAt *time.Time
+			if err := f.raw.QueryRow(`SELECT quarantine_enforced_at FROM discovered_agents WHERE id = $1`, f.agent).Scan(&enforcedAt); err != nil {
+				t.Fatal(err)
+			}
+			if enforcedAt == nil {
+				t.Error("the late success must fold into the agent's state")
+			}
+			// Never handed out again: no duplicate apply through the queue.
+			if again, err := f.am.Lease(f.source, "pod-b", 10, time.Minute); err != nil || len(again) != 0 {
+				t.Fatalf("an applied instruction was leased again: %v %+v", err, again)
+			}
+			// A duplicate of the same report stays idempotent.
+			if dup, err := f.am.Report(f.source, id, services.ReportInput{Success: true}); err != nil || dup.Status != models.InstructionApplied {
+				t.Fatalf("duplicate: %v %+v", err, dup)
+			}
+		})
+	}
+}
+
+// Reclaimed AND re-leased to pod-b: pod-a's late success is refused (pod-b
+// holds a live lease and its run is the one recorded), and changes nothing.
+func TestLateSuccessAfterReLeaseIsRefused(t *testing.T) {
+	f := newActFixture(t)
+	id := leasedQuarantine(t, f, "pod-a")
+	expireLease(t, f, id)
+	if _, err := f.am.ReclaimExpiredLeases(); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := f.am.Lease(f.source, "pod-b", 10, time.Minute); err != nil || len(again) != 1 {
+		t.Fatalf("re-lease: %v %+v", err, again)
+	}
+	before := instructionState(t, f, id)
+	_, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-a"})
+	assertRefused(t, "pod-a's late success on pod-b's lease", err, services.ErrInstructionLeaseNotHeld)
+	if after := instructionState(t, f, id); after != before {
+		t.Errorf("a refused report must change nothing.\nbefore: %s\nafter:  %s", before, after)
+	}
+	// pod-b's run is the one recorded.
+	if out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-b"}); err != nil ||
+		out.Status != models.InstructionApplied || strings.Contains(string(out.Result), "authsec_late_report") {
+		t.Fatalf("pod-b's report: %v %+v", err, out)
+	}
+}
+
+// The lease ran out before the report arrived and the reaper has not run
+// yet: a late failure is refused as expired (the reaper reclaims it as
+// usual); a late success is recorded and the reaper has nothing to reclaim.
+func TestReportAfterLeaseExpiry(t *testing.T) {
 	f := newActFixture(t)
 	id := leasedQuarantine(t, f, "pod-a")
 	expireLease(t, f, id)
 
 	before := instructionState(t, f, id)
 	for _, holder := range []string{"pod-a", ""} {
-		_, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: holder})
-		assertRefused(t, "report on an expired lease (holder "+holder+")", err,
+		_, err := f.am.Report(f.source, id, services.ReportInput{Success: false, Error: "late", LeasedBy: holder})
+		assertRefused(t, "late failure on an expired lease (holder "+holder+")", err,
 			services.ErrInstructionLeaseExpired)
 	}
 	if after := instructionState(t, f, id); after != before {
 		t.Errorf("a refused report must change nothing.\nbefore: %s\nafter:  %s", before, after)
 	}
-	if n, err := f.am.ReclaimExpiredLeases(); err != nil || n != 1 {
-		t.Errorf("the expired lease must still be reclaimed by the reaper: %v (%d)", err, n)
+	out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-a"})
+	if err != nil || out.Status != models.InstructionApplied || !strings.Contains(string(out.Result), "authsec_late_report") {
+		t.Fatalf("late success on an expired lease: %v %+v", err, out)
+	}
+	if n, err := f.am.ReclaimExpiredLeases(); err != nil || n != 0 {
+		t.Errorf("an applied instruction must not be reclaimed: %v (%d)", err, n)
 	}
 }
 
@@ -247,5 +320,89 @@ func TestReportEndpointAnswersAStaleReport409(t *testing.T) {
 
 	if rec := post(id, "pod-b"); rec.Code != http.StatusOK {
 		t.Fatalf("the holder's report must be 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// A late success on a reclaimed instruction: 200 and recorded, not 409.
+	f2 := newActFixture(t)
+	ctl2 := platform.NewGovernanceController(gormFor(t, f2.raw))
+	r2 := gin.New()
+	r2.POST("/authsec/provisioning/instructions/:id/result", ctl2.ReportInstruction)
+	id2 := leasedQuarantine(t, f2, "pod-a")
+	expireLease(t, f2, id2)
+	if _, err := f2.am.ReclaimExpiredLeases(); err != nil {
+		t.Fatal(err)
+	}
+	lateBody, _ := json.Marshal(map[string]any{"success": true})
+	req := httptest.NewRequest(http.MethodPost, "/authsec/provisioning/instructions/"+id2.String()+"/result?pod=pod-a", bytes.NewReader(lateBody))
+	req.Header.Set("Authorization", "Bearer "+f2.token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r2.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"applied"`) {
+		t.Fatalf("a late success must be 200 and recorded, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The late-success write is fenced, not merely checked: the report reads the
+// instruction as pending, then pod-b re-leases it BEFORE the report's write
+// lands (the write is held on the row lock until the re-lease commits). The
+// write must then match nothing -- pod-b holds a live lease, its run is the
+// one that counts -- and the late report is refused.
+func TestLateSuccessRacingAReLeaseIsRefused(t *testing.T) {
+	f := newActFixture(t)
+	id := leasedQuarantine(t, f, "pod-a")
+	expireLease(t, f, id)
+	if _, err := f.am.ReclaimExpiredLeases(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.raw.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT 1 FROM provisioning_instructions WHERE id = $1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	type res struct {
+		out *models.ProvisioningInstruction
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-a"})
+		done <- res{out, err}
+	}()
+	// Wait until the report's write is blocked on the row lock.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var waiting int
+		if err := f.raw.QueryRow(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+			AND query ILIKE 'UPDATE "provisioning_instructions"%'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the late report's write never reached the row lock")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// pod-b re-leases it (what Lease writes), then the lock is released.
+	if _, err := tx.Exec(`UPDATE provisioning_instructions SET status = 'leased', leased_by = 'pod-b',
+		lease_expires_at = now() + interval '1 minute', attempts = attempts + 1 WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	assertRefused(t, "a late success racing a re-lease", r.err, services.ErrInstructionLeaseNotHeld)
+	var status, holder string
+	if err := f.raw.QueryRow(`SELECT status, leased_by FROM provisioning_instructions WHERE id = $1`, id).Scan(&status, &holder); err != nil {
+		t.Fatal(err)
+	}
+	if status != models.InstructionLeased || holder != "pod-b" {
+		t.Fatalf("after the race: %s/%s, want pod-b's live lease untouched", status, holder)
 	}
 }

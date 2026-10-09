@@ -10,7 +10,10 @@ import (
 // delivered only as iac_pr or export, on the SOURCE role's control (050
 // iga_gov_plan_kind_chk). The new role keeps the source role's authorization
 // (same managed policies by ARN, copies of its inline policies, the same
-// trust policy and boundary); no permission is removed for anyone (A61).
+// trust policy and boundary): isolation with the same IDENTITY policies --
+// declared access, not evaluated. Access granted to the source role by name
+// elsewhere does not follow (the compatibility items), so nothing here
+// claims "no permission change" (§11, §9.7; A61).
 // The per-compute-type migration evidence and the IaC rendering are T3.17's;
 // the plan here fixes WHAT changes, its facts, its compatibility list and
 // its unanalysed items.
@@ -62,13 +65,26 @@ type CompatibilityItem struct {
 
 // SplitDetail is the split's part of iga_gov_plan.diff.
 type SplitDetail struct {
-	SourceRoleARN    string              `json:"source_role_arn"`
-	NewRoleARN       string              `json:"new_role_arn"`
-	NewRoleHash      string              `json:"new_role_hash"`
-	SubjectKind      string              `json:"subject_kind"`
-	SubjectARN       string              `json:"subject_arn"`
+	SourceRoleARN string `json:"source_role_arn"`
+	NewRoleARN    string `json:"new_role_arn"`
+	NewRoleHash   string `json:"new_role_hash"`
+	SubjectKind   string `json:"subject_kind"`
+	SubjectARN    string `json:"subject_arn"`
+	// SubjectARNs is every subject the split moves when there is more than
+	// one: for an ECS task role, each ECS service running a source-role
+	// revision of the family (§11 "The migration subject"). Empty means the
+	// single SubjectARN (Subjects()).
+	SubjectARNs      []string            `json:"subject_arns,omitempty"`
 	FromWorkloadKeys []string            `json:"from_workload_keys"`
 	Compatibility    []CompatibilityItem `json:"compatibility"`
+}
+
+// Subjects is every subject the split moves, sorted; one migration row each.
+func (d SplitDetail) Subjects() []string {
+	if len(d.SubjectARNs) > 0 {
+		return append([]string{}, d.SubjectARNs...)
+	}
+	return []string{d.SubjectARN}
 }
 
 // SplitInput is what a dedicated-identity version compiles from.
@@ -78,8 +94,12 @@ type SplitInput struct {
 	Live     LiveRead // the source role; Roles[new role ARN] read (nil = free)
 	Evidence EvidenceRef
 	// The migration subject (§11 "The migration subject").
-	SubjectKind      string
-	SubjectARN       string
+	SubjectKind string
+	SubjectARN  string
+	// SubjectARNs (ECS): every service running a source-role revision of the
+	// family, read through the migration-evidence reader; SubjectARN is
+	// always one of them. Empty means SubjectARN alone.
+	SubjectARNs      []string
 	FromWorkloadKeys []string
 	// ECS: the task family (standalone tasks are unanalysed). Lambda: the
 	// aliases moved and the versions behind no alias (unanalysed).
@@ -241,6 +261,14 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 	if in.SubjectARN == "" {
 		return SplitPlans{}, compileErr(ErrCodeInput, "a split moves a named subject")
 	}
+	subjects := sortedUnique(append(append([]string{}, in.SubjectARNs...), in.SubjectARN))
+	if len(subjects) > 1 && in.SubjectKind != SubjectECSService {
+		return SplitPlans{}, compileErr(ErrCodeInput, "only an ECS task role moves more than one subject")
+	}
+	var multi []string
+	if len(subjects) > 1 {
+		multi = subjects
+	}
 	if err := in.Evidence.validate(in.Control.RoleID); err != nil {
 		return SplitPlans{}, err
 	}
@@ -319,11 +347,15 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 	pre := struct {
 		ArtifactState ArtifactStateFacts `json:"artifact_state"`
 		Subject       subj               `json:"subject"`
+		Subjects      []subj             `json:"subjects,omitempty"`
 		NewRole       struct {
 			ARN    string `json:"arn"`
 			Exists bool   `json:"exists"`
 		} `json:"new_role"`
 	}{ArtifactState: st, Subject: subj{in.SubjectKind, in.SubjectARN, src.ARN}}
+	for _, a := range multi {
+		pre.Subjects = append(pre.Subjects, subj{in.SubjectKind, a, src.ARN})
+	}
 	pre.NewRole.ARN = newARN
 	if sp.Precondition, err = CanonicalizeValue(pre); err != nil {
 		return SplitPlans{}, err
@@ -392,11 +424,24 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 			revertCompat = append(revertCompat, Op{Op: OpRemoveTrustPolicyPrincipal, RoleARN: it.Resource, Principal: newARN})
 		}
 	}
-	sp.Ops = append(sp.Ops, Op{Op: OpBindSubject, SubjectARN: in.SubjectARN, RoleARN: newARN, Binding: in.Intent.Workload.BindingKind,
-		Steps: bindSteps(in.SubjectKind, in.Aliases, false)})
+	for _, a := range subjects {
+		sp.Ops = append(sp.Ops, Op{Op: OpBindSubject, SubjectARN: a, RoleARN: newARN, Binding: in.Intent.Workload.BindingKind,
+			Steps: bindSteps(in.SubjectKind, in.Aliases, false)})
+	}
+	// The documents the new role copies, archived by hash (§11): the PR and
+	// the export render these approved texts, never a re-read of the source.
+	copied := []string{nr.TrustPolicyHash}
+	for _, ip := range intentInline {
+		copied = append(copied, ip.DocumentHash)
+	}
+	for _, h := range copied {
+		if c, ok := src.Documents[h]; ok {
+			sp.archive(h, []byte(c))
+		}
+	}
 
 	detail := &SplitDetail{SourceRoleARN: src.ARN, NewRoleARN: newARN, NewRoleHash: newHash, SubjectKind: in.SubjectKind,
-		SubjectARN: in.SubjectARN, FromWorkloadKeys: sortedUnique(in.FromWorkloadKeys), Compatibility: compat}
+		SubjectARN: in.SubjectARN, SubjectARNs: multi, FromWorkloadKeys: sortedUnique(in.FromWorkloadKeys), Compatibility: compat}
 	sp.Diff.Case = CaseSplitIsolate
 	sp.Diff.Split = detail
 	srcBoundary := src.BoundaryARN
@@ -404,8 +449,10 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 		srcBoundary = ValueNone
 	}
 	sp.Facts = []Fact{factRole(src.RoleID), factBoundary(srcBoundary, srcBoundary),
-		{Key: factKey(FactBinding, in.SubjectARN), Kind: FactBinding, Subject: in.SubjectARN, Before: src.ARN, After: newARN},
 		{Key: factKey(FactNewRole, newARN), Kind: FactNewRole, Subject: newARN, Before: ValueAbsent, After: newHash}}
+	for _, a := range subjects {
+		sp.Facts = append(sp.Facts, Fact{Key: factKey(FactBinding, a), Kind: FactBinding, Subject: a, Before: src.ARN, After: newARN})
+	}
 	if in.Intent.Delivery == DeliveryDirect {
 		sp.refuse(Refusal{RefuseSplitDirect, "isolation is delivered only as a PR or export (§11)"})
 	}
@@ -427,16 +474,23 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 			Hash string `json:"hash"`
 		} `json:"new_role"`
 		Subject   subj     `json:"subject"`
+		Subjects  []subj   `json:"subjects,omitempty"`
 		Consumers []string `json:"new_role_consumers"`
-	}{Subject: subj{in.SubjectKind, in.SubjectARN, newARN}, Consumers: []string{in.SubjectARN}}
+	}{Subject: subj{in.SubjectKind, in.SubjectARN, newARN}, Consumers: subjects}
+	for _, a := range multi {
+		rpre.Subjects = append(rpre.Subjects, subj{in.SubjectKind, a, newARN})
+	}
 	rpre.NewRole.ARN, rpre.NewRole.Hash = newARN, newHash
 	if rv.Precondition, err = CanonicalizeValue(rpre); err != nil {
 		return SplitPlans{}, err
 	}
 	rv.PreconditionHash = taggedHash(domainSplitRevertPrecondition, rv.Precondition)
 	rv.BeforeDocumentHash = st.BoundaryDocumentHash
-	rv.Ops = []Op{{Op: OpBindSubject, SubjectARN: in.SubjectARN, RoleARN: src.ARN, Binding: in.Intent.Workload.BindingKind,
-		Steps: bindSteps(in.SubjectKind, in.Aliases, true)}}
+	rv.Ops = []Op{}
+	for _, a := range subjects {
+		rv.Ops = append(rv.Ops, Op{Op: OpBindSubject, SubjectARN: a, RoleARN: src.ARN, Binding: in.Intent.Workload.BindingKind,
+			Steps: bindSteps(in.SubjectKind, in.Aliases, true)})
+	}
 	rv.Ops = append(rv.Ops, revertCompat...)
 	del := []string{}
 	if nr.BoundaryARN != "" {
@@ -458,8 +512,13 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 	rv.Diff.Case = CaseSplitRevert
 	rv.Diff.Split = detail
 	rv.Facts = []Fact{factRole(src.RoleID), factBoundary(srcBoundary, srcBoundary),
-		{Key: factKey(FactBinding, in.SubjectARN), Kind: FactBinding, Subject: in.SubjectARN, Before: newARN, After: src.ARN},
 		{Key: factKey(FactNewRole, newARN), Kind: FactNewRole, Subject: newARN, Before: newHash, After: ValueAbsent}}
+	for _, a := range subjects {
+		rv.Facts = append(rv.Facts, Fact{Key: factKey(FactBinding, a), Kind: FactBinding, Subject: a, Before: newARN, After: src.ARN})
+	}
+	for _, d := range sp.Documents {
+		rv.archive(d.Hash, []byte(d.Canonical))
+	}
 	if err := rv.seal(); err != nil {
 		return SplitPlans{}, err
 	}

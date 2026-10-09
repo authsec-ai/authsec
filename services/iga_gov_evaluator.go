@@ -25,8 +25,8 @@ import (
 //
 //	ev := iga_gov_evaluation(N)              inserted running in the publication tx
 //	complete | superseded                 -> no-op (replay)
-//	a newer revision's evaluation complete,
-//	  or a newer publication exists        -> N superseded
+//	a newer revision's evaluation complete -> N superseded (§8.2; a newer
+//	                                          publication alone does not)
 //	failed                                -> fenced failed -> running, attempts + 1
 //	snapshot under the barrier, igagov.Evaluate in memory, then ONE fenced
 //	transaction in the shared lock order (§8.7):
@@ -166,13 +166,20 @@ func (e *GovEvaluator) evaluate(ctx context.Context, ws uuid.UUID, rev int64, fe
 		if err != nil {
 			return err
 		}
-		var latest int64
-		if err := tx.Raw(`SELECT COALESCE(max(rev), 0) FROM iga_publication WHERE workspace_id = ?`, ws).Scan(&latest).Error; err != nil {
-			return err
-		}
-		if newer || latest > rev {
-			// A newer revision's evaluation won, or rev N's graph is no
-			// longer the published one (DECISION E3): N cannot be read.
+		if newer {
+			// §8.2: "if a newer revision's evaluation is complete: set N
+			// superseded". ONLY a newer COMPLETE evaluation supersedes N.
+			// DECISION (fix/p3-tidy, replaces E3): a newer publication whose
+			// evaluation is running, failed or absent does not -- N is then
+			// still the newest revision whose findings can be complete, and
+			// skipping it would leave findings at an older revision (or none)
+			// although N is evaluable. Findings are written only WHERE
+			// last_evaluated_rev < N, so N can never overwrite a newer one.
+			var latest int64
+			if err := tx.Raw(`SELECT COALESCE(max(rev), 0) FROM iga_gov_evaluation WHERE workspace_id = ? AND status = 'complete'`, ws).
+				Scan(&latest).Error; err != nil {
+				return err
+			}
 			if _, err := e.repo.SupersedeTx(tx, ws, rev); err != nil {
 				return err
 			}

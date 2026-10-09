@@ -209,36 +209,43 @@ func main() {
 					policyVault = vc
 				}
 			}
-			services.InstallGovPolicyRuntime(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
 			// The AuthSec Slack app (Phase 3 §7.11, T3.14): installed when the
 			// signing secret, Vault and the app credentials are configured.
-			// InstallSlackApp chains its approval-request notices onto the
-			// authoring hooks that exist when it runs, so it must come AFTER
-			// InstallGovPolicyRuntime (which sets those hooks) and before the
+			// InstallGovPolicyStartup installs the policy runtime (owner gate
+			// and the other authoring hooks) and THEN chains the Slack app's
+			// approval-request notices onto those hooks atomically, before the
 			// worker can deliver anything; /capabilities reports policy.slack
-			// from the same registration. Its routes are behind the
-			// IGA_POLICY gate, so nothing is served before this point.
-			if slackApp := services.SlackFromEnv(config.DB); slackApp != nil {
-				if ok, reason := slackApp.Configured(); ok {
-					services.SetDefaultSlackService(slackApp)
-					services.InstallSlackApp(slackApp)
-					log.Printf("[slack] Slack app configured: notification channel and interactions enabled")
+			// from the same registration. fix/p3-appr (P1-4): the policy gate
+			// reports verified -- and serves any policy or Slack route -- only
+			// after this whole ready hook has returned, so nothing is served
+			// before the hooks are in place.
+			var slackApp *services.SlackIntegrationService
+			if app := services.SlackFromEnv(config.DB); app != nil {
+				if ok, reason := app.Configured(); ok {
+					slackApp = app
 				} else {
 					log.Printf("[slack] Slack app not enabled: %s", reason)
 				}
 			}
-			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
-				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
-				return
-			}
+			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
 			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
-			// the GitHub App key and connector credentials.
+			// the GitHub App key and connector credentials. Installed in EVERY
+			// process that serves the policy routes, before the worker check:
+			// proposals decide the IaC form at compile time in the API
+			// process, so a process started with AUTHSEC_DISABLE_POLICY_WORKER
+			// must still read the mapped source -- without an adapter an iac_pr
+			// target answers 503 iac_unavailable, never a silent export
+			// (review P2).
 			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
 				if vc, verr := vault.NewClient(addr, tok); verr == nil {
 					services.ConfigureGovIaCDelivery(config.DB, vc)
 				} else {
 					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
 				}
+			}
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
 			}
 			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
 			// T3.16: deployments need AWS access (discovery + enforcement

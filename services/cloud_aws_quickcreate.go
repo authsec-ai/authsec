@@ -326,6 +326,9 @@ type AWSQuickCreateService struct {
 	verifier      awsdiscovery.Verifier
 	templateCheck func(ctx context.Context, templateURL string) error
 	sleep         func(ctx context.Context, d time.Duration) error
+	// recordTemplate records the template version a stack Update reports
+	// (AWSOnboardingService.RecordStackTemplateVersion).
+	recordTemplate func(ctx context.Context, accountID, roleARN, externalID, version string) (int, error)
 
 	// enforcement handles Custom::AuthSecEnforcementRegistration messages
 	// (T3.09). Nil: they are rejected, as any unknown resource is.
@@ -341,6 +344,20 @@ type EnforcementCallbackHandler interface {
 // WithEnforcementHandler routes enforcement registration messages to h.
 func (s *AWSQuickCreateService) WithEnforcementHandler(h EnforcementCallbackHandler) *AWSQuickCreateService {
 	s.enforcement = h
+	return s
+}
+
+// WithHTTPClient replaces the client CloudFormation responses are PUT with.
+// A test seam.
+func (s *AWSQuickCreateService) WithHTTPClient(c *http.Client) *AWSQuickCreateService {
+	s.http = c
+	return s
+}
+
+// WithTemplateCheck replaces the published-template check StartSession runs.
+// A test seam.
+func (s *AWSQuickCreateService) WithTemplateCheck(f func(ctx context.Context, templateURL string) error) *AWSQuickCreateService {
+	s.templateCheck = f
 	return s
 }
 
@@ -360,6 +377,7 @@ func NewAWSQuickCreateService(
 	}
 	if onboarding != nil {
 		s.onboard = onboarding.Onboard
+		s.recordTemplate = onboarding.RecordStackTemplateVersion
 		s.verifier = onboarding.verifier
 		s.existing = func(ws uuid.UUID, accountID string) (*models.CloudConnector, error) {
 			c, err := onboarding.repo.GetByScope(ws, models.CloudProviderAWS, accountID)
@@ -689,17 +707,53 @@ func (s *AWSQuickCreateService) HandleCallbackDelivery(ctx context.Context, body
 		// Never destructive, never blocking. A Delete must always succeed or the
 		// customer's stack cannot be deleted (including the Delete a rollback
 		// sends), and a forged Delete must not be able to change anything. An
-		// Update (a template upgrade) changes nothing AuthSec holds.
+		// Update (a template upgrade, or the rollback of one) changes one thing
+		// only: the template version recorded for the connector the stack
+		// proves it serves (review P2) -- and is answered SUCCESS either way.
 		lg.stage = strings.ToLower(req.RequestType)
+		msg := "answered SUCCESS without changes"
+		if req.RequestType == awsdiscovery.CFNRequestUpdate {
+			msg = s.recordUpdatedTemplate(ctx, env, req, stack)
+		}
 		physical := req.PhysicalResourceID
 		if physical == "" {
 			physical = "authsec-unregistered-" + shortHash(req.StackID)
 		}
 		out, _ := s.deliver(ctx, target, awsdiscovery.NewCFNResponse(req, awsdiscovery.CFNStatusSuccess, "", physical))
-		lg.emit(out.String(), "", "answered SUCCESS without changes")
+		lg.emit(out.String(), "", msg)
 		return out
 	}
 	return s.handleCreate(ctx, env, req, stack, target, deadline, lastChance, lg)
+}
+
+// recordUpdatedTemplate records the TemplateVersion a stack Update reports
+// on the connector the stack serves, when the request holds together: the
+// topic's region is the stack's, the role is in the stack's account, and
+// RecordStackTemplateVersion finds a connector of that account and role
+// whose stored ExternalId is the one the stack sent. It never fails the
+// Update; it returns the log line.
+func (s *AWSQuickCreateService) recordUpdatedTemplate(ctx context.Context, env *awsdiscovery.SNSEnvelope,
+	req *awsdiscovery.CFNRequest, stack awsdiscovery.StackRef) string {
+	props := req.ResourceProperties
+	if s.recordTemplate == nil {
+		return "answered SUCCESS without changes (no onboarding service)"
+	}
+	if _, topicRegion, err := awsdiscovery.ParseTopicARN(env.TopicArn); err != nil || topicRegion != stack.Region {
+		return "answered SUCCESS without changes (topic and stack regions differ)"
+	}
+	_, roleAccount, err := awsdiscovery.ParseRoleARN(props.RoleArn)
+	if err != nil || roleAccount != stack.AccountID || awsdiscovery.ValidateExternalID(props.ExternalID) != nil {
+		return "answered SUCCESS without changes (role or ExternalId does not match the stack)"
+	}
+	n, err := s.recordTemplate(ctx, stack.AccountID, props.RoleArn, props.ExternalID, props.TemplateVersion)
+	if err != nil {
+		return "answered SUCCESS; template version not recorded: " + err.Error()
+	}
+	if n == 0 {
+		return "answered SUCCESS without changes (no connector of this role and ExternalId)"
+	}
+	return fmt.Sprintf("answered SUCCESS; recorded template version %q on %d connector(s)",
+		awsdiscovery.NormalizeTemplateVersion(props.TemplateVersion), n)
 }
 
 func (s *AWSQuickCreateService) handleCreate(
@@ -885,7 +939,7 @@ func (s *AWSQuickCreateService) handleCreate(
 	// 6-9. AssumeRole with the session's ExternalId, GetCallerIdentity, account
 	//      check, Vault write and upsert: all the existing Onboard().
 	lg.stage = "onboard"
-	connector, err := s.onboardWithRetry(ctx, sess, props.RoleArn, deadline)
+	connector, err := s.onboardWithRetry(ctx, sess, props.RoleArn, props.TemplateVersion, deadline)
 	if err != nil {
 		var oe *AWSOnbError
 		if !errors.As(err, &oe) {
@@ -945,13 +999,16 @@ func (s *AWSQuickCreateService) handleCreate(
 // starts only if a full awsOnboardingTimeout fits before the reserve, and its
 // context ends at the reserve regardless.
 func (s *AWSQuickCreateService) onboardWithRetry(
-	ctx context.Context, sess *AWSOnboardingSession, roleARN string, deadline time.Time,
+	ctx context.Context, sess *AWSOnboardingSession, roleARN, stackTemplateVersion string, deadline time.Time,
 ) (*models.CloudConnector, error) {
 	const baseDelay = 3 * time.Second
 	answerBy := deadline.Add(-awsAnswerReserve)
 	lastStart := answerBy.Add(-awsOnboardingTimeout)
 	start := s.now()
-	in := AWSOnboardInput{RoleARN: roleARN, ExternalID: sess.ExternalID, Regions: sess.Regions}
+	// The version the STACK reported is what is recorded (review P2): an old
+	// stack must look old to every gate that reads it.
+	in := AWSOnboardInput{RoleARN: roleARN, ExternalID: sess.ExternalID, Regions: sess.Regions,
+		StackTemplateVersion: &stackTemplateVersion}
 	for attempt := 1; ; attempt++ {
 		// !Before, not After: the wait below is capped at lastStart, so the loop
 		// lands exactly on it, where After is still false and the next wait

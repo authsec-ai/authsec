@@ -47,6 +47,14 @@ func (CloudEvidenceReads) Runs(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) ([]Cl
 	return out, err
 }
 
+// ResourcePolicyWorkspaces lists the workspaces holding any resource-policy
+// evidence (the daily prune_evidence job's subjects, §3.9 "Retention").
+func (CloudEvidenceReads) ResourcePolicyWorkspaces(tx *gorm.DB) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	err := tx.Raw(`SELECT DISTINCT workspace_id FROM cloud_resource_policy_coverage ORDER BY workspace_id`).Scan(&out).Error
+	return out, err
+}
+
 // ResourcePolicyCoverageRow is one cloud_resource_policy_coverage row.
 type ResourcePolicyCoverageRow struct {
 	ScanRunID    uuid.UUID
@@ -111,6 +119,32 @@ func (CloudEvidenceReads) Roles(tx *gorm.DB, ws uuid.UUID) ([]CloudRoleRow, erro
 	err := tx.Raw(`SELECT id, connector_id, native_id, COALESCE(attrs->>'unique_id', '') AS unique_id, created_at
 	                 FROM cloud_identity WHERE workspace_id = ? AND kind = 'iam_role'`, ws).Scan(&out).Error
 	return out, err
+}
+
+// RoleIDsByARN reads, for each IAM role ARN, the distinct non-empty RoleIds
+// (attrs unique_id) the collected inventory holds for it, across the
+// workspace's connectors: what the LATEST scan saw at that ARN, which may be
+// a newer incarnation than the published graph's.
+func (CloudEvidenceReads) RoleIDsByARN(tx *gorm.DB, ws uuid.UUID, arns []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	if len(arns) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		NativeID string
+		UniqueID string
+	}
+	if err := tx.Raw(`SELECT DISTINCT native_id, attrs->>'unique_id' AS unique_id
+	                    FROM cloud_identity
+	                   WHERE workspace_id = ? AND kind = 'iam_role' AND native_id IN ?
+	                     AND COALESCE(attrs->>'unique_id', '') <> ''
+	                   ORDER BY 1, 2`, ws, arns).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		out[r.NativeID] = append(out[r.NativeID], r.UniqueID)
+	}
+	return out, nil
 }
 
 // UsageRow is one Access Advisor row.

@@ -124,19 +124,33 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 //     AWSEnforcementAccess), only with Vault: the discovery session needs the
 //     connector's ExternalId from it. Without Vault no reader is installed
 //     and compilation answers 503 discovery_unavailable.
-func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincipal string) {
-	InstallGovOwnerReviewWiring(db)
+func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincipal string) (restore func()) {
+	prevLive := DefaultGovLiveReader()
+	prevIaC, prevExport := govDeliveryHandler(igagov.DeliveryIaCPR), govDeliveryHandler(igagov.DeliveryExport)
+	rWire := InstallGovOwnerReviewWiring(db)
+	// Slack's health-report buttons (review fix R1a P2): T3.16's
+	// health-report path, installed for the process (iga_gov_health_reporter.go).
+	rHealth := InstallGovHealthReporter(db)
 	// T3.17 IaC / export delivery behind T3.16's deploy and verify jobs. With
 	// no GitHub adapter (no Vault) a PR target falls back to export at compile
 	// time, so the handler is installed either way.
 	InstallGovIaCDeliveryHandlers(db)
 	// T3.15 rollout over T3.16 deployments: gate facts and remove_control.
-	InstallGovRolloutWiring(db)
-	SetGovNotificationChannelStore(NewGovDBChannelStore(vc))
+	rRollout := InstallGovRolloutWiring(db)
+	rStore := SetGovNotificationChannelStore(NewGovDBChannelStore(vc))
+	restore = func() {
+		rHealth()
+		rStore()
+		rRollout()
+		RegisterGovDeliveryHandler(igagov.DeliveryIaCPR, prevIaC)
+		RegisterGovDeliveryHandler(igagov.DeliveryExport, prevExport)
+		rWire()
+		SetGovLiveReader(prevLive)
+	}
 	if vc == nil {
 		SetGovLiveReader(nil)
 		log.Printf("[policy] live reads not configured: VAULT_ADDR/VAULT_TOKEN not set; compilation answers discovery_unavailable")
-		return
+		return restore
 	}
 	cb, err := LoadAWSCallbackConfig()
 	if err != nil {
@@ -148,4 +162,34 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 		NewEnforcementBindingService(db, vc, cb, discoveryPrincipal))
 	SetGovLiveReader(NewGovAWSLiveReader(access))
 	log.Printf("[policy] owner review wiring, notification channels and discovery-role live reads installed")
+	return restore
+}
+
+// InstallGovPolicyStartup is the IGA_POLICY gate's ready hook body that
+// cmd/main.go runs before anything Phase 3 is served (fix/p3-appr P1-4):
+// the policy runtime (InstallGovPolicyRuntime: the owner gate and the other
+// authoring hooks first), then -- when slackApp is configured (non-nil) --
+// the Slack app, whose approval-request notices are CHAINED onto those
+// hooks atomically (InstallSlackApp / UpdateGovAuthoringHooks). The policy
+// gate reports verified only after the ready hooks return
+// (PolicyGate.VerifyUntilReady), so no approval is ever served without the
+// owner gate; Approve itself refuses (503 owner_gate_unavailable) if the
+// hook is somehow missing. restore undoes everything (tests).
+func InstallGovPolicyStartup(db *gorm.DB, vc vault.VaultClient, discoveryPrincipal string, slackApp *SlackIntegrationService) (restore func()) {
+	rRuntime := InstallGovPolicyRuntime(db, vc, discoveryPrincipal)
+	rSlack := func() {}
+	prevSlack := DefaultSlackService()
+	if slackApp != nil {
+		SetDefaultSlackService(slackApp)
+		rSlack = InstallSlackApp(slackApp)
+		log.Printf("[slack] Slack app configured: notification channel and interactions enabled")
+	}
+	if CurrentGovAuthoringHooks().OwnerGate == nil {
+		log.Printf("[policy] WARNING: the owner gate hook is not installed; every approval answers 503 %s", GovCodeOwnerGateUnavailable)
+	}
+	return func() {
+		rSlack()
+		SetDefaultSlackService(prevSlack)
+		rRuntime()
+	}
 }

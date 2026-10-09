@@ -518,17 +518,29 @@ type SampledIdentity struct {
 // The order (SPEC-iga-phase3-policy.md §2.6, T3.03) is two tiers, each in
 // BYTE order of the ARN (native_id COLLATE "C", then id):
 //
-//  1. prioritised -- an identity a workload of this connector runs as
-//     (cloud_workload.identity_id: the graph's executes_as) or that an ECS
-//     task definition names as its execution role (task_execution_role), and
-//     an identity under a live AuthSec control (iga_gov_control in any state
-//     but removed: matched by RoleId, by ARN only when no RoleId is recorded);
+//  1. prioritised -- an identity the PUBLISHED GRAPH binds a workload to: a
+//     live (not ended) executes_as or task_execution_role relationship of
+//     iga_relationship whose target is the identity's graph row (matched by
+//     its source key, the ARN, and by RoleId when both record one) -- from
+//     ANY connector or source, so a runtime another connector or a
+//     Kubernetes sweep found counts; or, as the fallback where the graph has
+//     no such row yet (the first scan before any publication, a workload new
+//     in this run, a database without the graph schema), a workload of this
+//     connector that runs as it (cloud_workload.identity_id) or an ECS task
+//     definition naming it as its execution role; and an identity under a
+//     live AuthSec control (iga_gov_control in any state but removed:
+//     matched by RoleId, by ARN only when no RoleId is recorded);
 //  2. every other identity.
 //
-// The workloads are the scan's own: the scanner reads activity after it has
-// recorded this run's compute, so they are this run's (and, for a surface
-// that was not reached, the rows it keeps). Over-prioritising costs nothing
-// but order, so a workload row an unreached surface keeps still counts.
+// The graph is the published one: the scan runs under the pipeline barrier,
+// so no projection is writing iga_relationship meanwhile (review P3:
+// "workload-bound" now means the graph's relationships, with the scan's own
+// rows kept as the fallback). The fallback's workloads are the scan's own:
+// the scanner reads activity after it has recorded this run's compute, so
+// they are this run's (and, for a surface that was not reached, the rows it
+// keeps). Over-prioritising costs nothing but order, so a workload row an
+// unreached surface keeps, or a graph relationship a later projection will
+// end, still counts.
 //
 // Deterministic (D-86) within each tier, so the sample a capped scan read is
 // one a reader can name: the scanner stamps the last ARN of tier 2 it read on
@@ -565,8 +577,24 @@ func (r *cloudWorkloadRepository) ActivitySample(
 		                         AND (gc.role_id = ci.attrs->>'unique_id'
 		                              OR (COALESCE(ci.attrs->>'unique_id', '') = '' AND gc.role_arn = ci.native_id)))`
 	}
+	// The graph's binding relationships, where the graph schema is there.
+	graphBound := "false"
+	hasGraph, err := HasRelation(r.db, "iga_relationship")
+	if err != nil {
+		return nil, 0, err
+	}
+	if hasGraph {
+		graphBound = `EXISTS (SELECT 1 FROM iga_relationship rel
+		                       JOIN iga_identity_accounts ia ON ia.workspace_id = rel.workspace_id AND ia.id = rel.target_identity_account_id
+		                      WHERE rel.workspace_id = ci.workspace_id AND rel.state <> 'ended'
+		                        AND rel.relationship_type IN ('` + models.RelTypeExecutesAs + `', '` + models.RelTypeTaskExecutionRole + `')
+		                        AND ia.provider = 'aws' AND ia.source_key = 'aws' || chr(31) || ci.native_id
+		                        AND (ia.immutable_key = '' OR COALESCE(ci.attrs->>'unique_id', '') = ''
+		                             OR ia.immutable_key = ci.attrs->>'unique_id'))`
+	}
 	var out []SampledIdentity
 	err = r.db.Raw(`SELECT ci.*, (
+	                         `+graphBound+` OR
 	                         EXISTS (SELECT 1 FROM cloud_workload w
 	                                  WHERE w.workspace_id = ci.workspace_id AND w.connector_id = ci.connector_id
 	                                    AND (w.identity_id = ci.id

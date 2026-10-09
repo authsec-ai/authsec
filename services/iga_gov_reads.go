@@ -135,15 +135,17 @@ func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (int64, GovRevMet
 			fmt.Sprintf("Findings at revision %d are not available: its evaluation is not complete.", rev),
 			map[string]any{"rev": rev, "status": status})
 	}
-	retention := 30
-	if s, err := repositories.NewIGAGovSettingsRepository(r.db).Get(ws); err == nil {
-		retention = s.EvidenceRetentionRevs
-	}
-	kept, err := r.repo.RetainedRevs(r.db, ws, retention)
+	// Pruning is recorded when it happens (057); it is never inferred from
+	// the retention setting, which may have been raised since.
+	pruned, err := r.repo.Pruned(r.db, ws, rev)
 	if err != nil {
 		return 0, meta, err
 	}
-	if !kept[rev] {
+	if pruned {
+		retention := 30
+		if s, err := repositories.NewIGAGovSettingsRepository(r.db).Get(ws); err == nil {
+			retention = s.EvidenceRetentionRevs
+		}
 		return 0, meta, govErr(http.StatusGone, "revision_not_retained",
 			fmt.Sprintf("Findings at revision %d are no longer retained.", rev),
 			map[string]any{"rev": rev, "retention_revs": retention})

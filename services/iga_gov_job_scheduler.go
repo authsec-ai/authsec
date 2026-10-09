@@ -25,7 +25,7 @@ import (
 // Each schedule names a kind, an interval and a Due query listing the
 // subjects. The built-in schedules (DefaultPolicyJobSchedules) are the ones
 // §8.1 drives from state this schema already has; a later task adds its own
-// with Add (prune_evidence belongs to T3.06, verify_binding to T3.09, whose
+// with Add (prune_evidence is added by RegisterPruneEvidenceJob; verify_binding belongs to T3.09, whose
 // binding table an IGA file may not name; metrics_rollup is added by
 // RegisterMetricsJobs, T3.18).
 type PolicyJobScheduler struct {
@@ -198,7 +198,12 @@ const (
 //
 //   - drift_check: every 10 min per deployment in `verified`; every 5 min for
 //     24 h after an `unknown` attempt on the deployment's control (§8.1
-//     step 5). Dedupe deployment:<id>.
+//     step 5). Review P1-7: the late-mutation watch covers the CONTROL
+//     whatever its deployments' states -- for a control with an unknown
+//     attempt in the last 24 h and no deployment in flight, the control's
+//     latest applied deployment (by applied_at, whatever its state; else the
+//     newest unknown attempt's own deployment) is checked every 5 min.
+//     Dedupe deployment:<id>.
 //   - iac_sync: every 10 min per open IaC change (state opening, open,
 //     changed_after_review or merged -- DECISION: `merged` is still synced,
 //     because the apply after merge is followed through it, §8.11). Dedupe
@@ -235,13 +240,52 @@ func dueDriftChecks(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedule
 		return nil, err
 	}
 	out := make([]ScheduledPolicyJob, 0, len(rows))
+	seen := map[uuid.UUID]bool{}
 	for _, r := range rows {
 		id := r.ID
+		seen[id] = true
 		it := ScheduledPolicyJob{WorkspaceID: r.WorkspaceID, SubjectID: &id, DedupeKey: "deployment:" + id.String()}
 		if r.LateWatch {
 			it.Every = DriftCheckEveryAfterLate
 		}
 		out = append(out, it)
+	}
+	// The watched controls (none in flight: an in-flight deployment's own
+	// job owns the live state): their anchor, the latest applied deployment
+	// whatever its state (a verified one is already listed above).
+	var watched []struct {
+		WorkspaceID uuid.UUID
+		ID          uuid.UUID
+	}
+	if err := db.Raw(`
+		WITH iga_late_watch AS (
+			SELECT DISTINCT ON (ad.control_id) ad.workspace_id, ad.control_id, ad.id AS attempt_deployment_id
+			  FROM iga_gov_attempt a
+			  JOIN iga_gov_deployment ad ON ad.workspace_id = a.workspace_id AND ad.id = a.deployment_id
+			 WHERE a.status = 'unknown' AND a.dispatched_at > ?
+			 ORDER BY ad.control_id, a.dispatched_at DESC)
+		SELECT l.workspace_id,
+		       COALESCE((SELECT d.id FROM iga_gov_deployment d
+		                  WHERE d.workspace_id = l.workspace_id AND d.control_id = l.control_id
+		                    AND (d.applied_at IS NOT NULL OR d.state = 'verified') AND d.delivery = 'direct'
+		                    AND d.state NOT IN ('queued','applying','outcome_unknown','outcome_unresolved','awaiting_merge','awaiting_apply')
+		                  ORDER BY COALESCE(d.applied_at, d.verified_at, d.updated_at) DESC LIMIT 1),
+		                (SELECT d.id FROM iga_gov_deployment d
+		                  WHERE d.id = l.attempt_deployment_id
+		                    AND d.state NOT IN ('queued','applying','outcome_unknown','outcome_unresolved','awaiting_merge','awaiting_apply'))) AS id
+		  FROM iga_late_watch l
+		 WHERE NOT EXISTS (SELECT 1 FROM iga_gov_deployment v WHERE v.workspace_id = l.workspace_id AND v.control_id = l.control_id
+		                     AND v.state IN ('queued','applying','outcome_unknown','outcome_unresolved','awaiting_merge','awaiting_apply'))`, now.Add(-LateMutationWatch)).Scan(&watched).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range watched {
+		if r.ID == uuid.Nil || seen[r.ID] {
+			continue
+		}
+		id := r.ID
+		seen[id] = true
+		out = append(out, ScheduledPolicyJob{WorkspaceID: r.WorkspaceID, SubjectID: &id, DedupeKey: "deployment:" + id.String(),
+			Every: DriftCheckEveryAfterLate})
 	}
 	return out, nil
 }

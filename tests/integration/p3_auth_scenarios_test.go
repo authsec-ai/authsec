@@ -397,7 +397,18 @@ func TestP3T311VersionsControlsAndConcurrency(t *testing.T) {
 	}
 	// The owner-retain seam T3.12 calls: retaining a removed service makes
 	// the next version (the owner its author); retaining every removal is 422.
+	// Only an owner of a subject may retain (fix/p3-tidy: the retain is
+	// scoped to the subjects the actor owns), so the actor owns OtherRole.
 	err := l.db.Transaction(func(tx *gorm.DB) error {
+		_, err := l.authoring().RetainVersionTx(tx, l.ws, l.second.user, l.versionID(other, 2),
+			[]igagov.RetainEntry{{Service: "s3", Reason: "exports", ReviewBy: "2027-01-15"}})
+		return err
+	})
+	if !errors.Is(err, services.ErrNotReviewOwner) {
+		t.Fatalf("retain by a non-owner: %v, want ErrNotReviewOwner", err)
+	}
+	wireOwner(t, l, models.GovObjectIdentityAccount, bdbIdentity(t, l.p2Lab, "OtherRole"), l.second.user)
+	err = l.db.Transaction(func(tx *gorm.DB) error {
 		_, err := l.authoring().RetainVersionTx(tx, l.ws, l.second.user, l.versionID(other, 2),
 			[]igagov.RetainEntry{{Service: "sqs", Reason: "nightly job", ReviewBy: "2027-01-15"}})
 		return err

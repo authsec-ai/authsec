@@ -205,6 +205,12 @@ type LiveRole struct {
 	InlinePolicies  []PolicyRef
 	// TrustPolicyHash is the canonical hash of the trust policy (§11).
 	TrustPolicyHash string
+	// Documents are the canonical texts of the trust policy and the inline
+	// policies, by hash, as the read returned them. A dedicated-identity
+	// split archives them (§11 "All documents are archived in
+	// iga_gov_document and referenced by hash"), so its PR and export are
+	// rendered from the approved texts, never re-read from a repository.
+	Documents map[string]string
 }
 
 // LivePolicy is the discovery-role read of one managed policy (§3.5:
@@ -810,7 +816,7 @@ func ProveFirstAttachment(role RoleRef, scanRunID string, ev *ResourcePolicyEvid
 			p.Incomplete = append(p.Incomplete, IncompleteForm{Form: f.Name, State: CoverageNotCollected})
 			continue
 		}
-		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, &ResourcePolicyEvidence{Coverage: ev.Coverage}, enabledRegions)
+		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, ev.coverageOnly(), enabledRegions)
 		for _, r := range ra.Routes {
 			if r.Form == f.Name && r.Effect == RouteEffectNotAnalysed {
 				p.Incomplete = append(p.Incomplete, IncompleteForm{Form: f.Name, Region: r.Region, State: r.Reason})

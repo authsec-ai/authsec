@@ -61,9 +61,13 @@ type IGAGovAWSExecutor struct {
 	// ReadbackRounds is how many pairs of reads may be taken before the
 	// readback is reported not yet settled; default 3.
 	ReadbackRounds int
-	// MaxOpAttempts bounds retryable answers per op (§8.5: at most 5
-	// attempts within 15 minutes); default 5.
+	// MaxOpAttempts bounds retryable answers per op within RetryWindow
+	// (§8.5: at most 5 attempts within 15 minutes); default 5.
 	MaxOpAttempts int
+	// RetryWindow is the sliding window MaxOpAttempts counts retryable
+	// answers in (by the attempt's completed_at); default 15 min. A
+	// retryable answer older than the window no longer counts.
+	RetryWindow time.Duration
 	// RetryBase is the first backoff after a retryable answer; it doubles
 	// per retryable answer (±20 % jitter, capped at 5 min); default 30 s.
 	RetryBase time.Duration
@@ -75,6 +79,14 @@ type IGAGovAWSExecutor struct {
 	// error stops the run before op opSeq is prepared, as a killed worker
 	// would. Never set in production.
 	FaultBeforeOp func(opSeq int, op igagov.Op) error
+	// BindingCheck is re-run before EACH dispatch (review P1-8): the
+	// enforcement client is assumed once per run, so revoking the binding
+	// (or a self-test turning it partial) mid-run must stop the run before
+	// its next request. A cheap database read of the binding (production:
+	// NewEnforcementBindingDispatchCheck); nil checks nothing. A *GovError /
+	// *EnforcementError stops the run as blocked with its code; any other
+	// error fails the try (the job retries, nothing was sent).
+	BindingCheck func(ctx context.Context, ws, connectorID uuid.UUID) error
 }
 
 // IGAGovAWS is the executor's access to AWS for a control's connector
@@ -121,6 +133,13 @@ func (e *IGAGovAWSExecutor) maxOpAttempts() int {
 		return e.MaxOpAttempts
 	}
 	return 5
+}
+
+func (e *IGAGovAWSExecutor) retryWindow() time.Duration {
+	if e.RetryWindow > 0 {
+		return e.RetryWindow
+	}
+	return 15 * time.Minute
 }
 
 func (e *IGAGovAWSExecutor) retryBase() time.Duration {
@@ -189,6 +208,9 @@ const (
 	DeployReasonDocumentMissing    = "document_not_archived"
 	DeployReasonVersionUnarchived  = "version_document_not_archived"
 	DeployReasonOpUnresolvable     = "op_unresolvable"
+	// DeployReasonOpRoleMismatch: an op of the plan names a role other than
+	// the control's (awsenforce.ErrOpRoleMismatch). Terminal, nothing sent.
+	DeployReasonOpRoleMismatch = "op_role_mismatch"
 )
 
 // DeployOpRecord is what happened to one op (or one version of a version
@@ -331,7 +353,12 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 		out.Result, out.Reason, out.SettleAfter, out.Attempt = DeployHold, DeployReasonUnknownPending, rec.SettleAfter, rec.Attempt
 		return out, nil
 	}
-	if reason, detail := refuseDirect(dep, plan); reason != "" {
+	var ctl models.IGAGovControl
+	if err := e.db.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
+		return nil, err
+	}
+	role := roleNameOfARN(ctl.RoleARN)
+	if reason, detail := refuseDirect(dep, plan, role); reason != "" {
 		out.Result, out.Reason, out.Detail = DeployRefused, reason, detail
 		return out, nil
 	}
@@ -343,11 +370,7 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 		out.Result, out.Reason, out.Detail = DeployRefused, DeployReasonNotApplying, "deployment is "+cur.State
 		return out, nil
 	}
-	var ctl models.IGAGovControl
-	if err := e.db.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
-		return nil, err
-	}
-	x := &execRun{e: e, run: run, dep: cur, plan: plan, ctl: ctl, role: roleNameOfARN(ctl.RoleARN), out: out}
+	x := &execRun{e: e, run: run, dep: cur, plan: plan, ctl: ctl, role: role, out: out}
 	if err := x.discovery(ctx); err != nil {
 		return x.finish(err)
 	}
@@ -373,8 +396,9 @@ func (x *execRun) stop(result, reason, detail string) error {
 }
 
 // refuseDirect is what ExecutePlan never runs: another deployment's plan, a
-// plan that is not direct, a split kind (IaC-only, §11), an ineligible plan.
-func refuseDirect(dep models.IGAGovDeployment, p igagov.Plan) (string, string) {
+// plan that is not direct, a split kind (IaC-only, §11), an ineligible plan,
+// an op naming a role other than the control's (role).
+func refuseDirect(dep models.IGAGovDeployment, p igagov.Plan, role string) (string, string) {
 	switch {
 	case p.ControlID != dep.ControlID.String() || p.Kind != dep.Kind || p.Delivery != dep.Delivery:
 		return DeployReasonPlanMismatch, fmt.Sprintf("plan %s/%s/%s, deployment %s/%s/%s", p.ControlID, p.Kind, p.Delivery,
@@ -391,11 +415,19 @@ func refuseDirect(dep models.IGAGovDeployment, p igagov.Plan) (string, string) {
 		return DeployReasonIneligible, "the plan has no classifier facts"
 	}
 	for _, op := range p.Ops {
-		if _, err := awsenforce.NewRequest(op, uuid.Nil, versionPlaceholder(op)); err != nil {
-			return DeployReasonOpUnresolvable, err.Error()
+		if _, err := awsenforce.NewRequest(op, uuid.Nil, versionPlaceholder(op), role); err != nil {
+			return requestRefusal(err), err.Error()
 		}
 	}
 	return "", ""
+}
+
+// requestRefusal is the reason a NewRequest error stops a run with.
+func requestRefusal(err error) string {
+	if errors.Is(err, awsenforce.ErrOpRoleMismatch) {
+		return DeployReasonOpRoleMismatch
+	}
+	return DeployReasonOpUnresolvable
 }
 
 // versionPlaceholder stands in for a selector's version when checking that
@@ -688,9 +720,9 @@ func (x *execRun) runOp(ctx context.Context, k int) error {
 	if op.Op == igagov.OpDeletePolicyVersion {
 		return x.runVersionDeletes(ctx, k)
 	}
-	req, err := awsenforce.NewRequest(op, x.dep.ID, "")
+	req, err := awsenforce.NewRequest(op, x.dep.ID, "", x.role)
 	if err != nil {
-		return x.stop(DeployFailed, DeployReasonOpUnresolvable, err.Error())
+		return x.stop(DeployFailed, requestRefusal(err), err.Error())
 	}
 	doc := ""
 	if req.SendsDocument() {
@@ -760,9 +792,9 @@ func (x *execRun) runVersionDeletes(ctx context.Context, k int) error {
 			return x.stop(DeployFailed, DeployReasonVersionUnarchived,
 				fmt.Sprintf("%s %s: %v; the version was not deleted", op.PolicyARN, v.VersionID, err))
 		}
-		req, err := awsenforce.NewRequest(op, x.dep.ID, v.VersionID)
+		req, err := awsenforce.NewRequest(op, x.dep.ID, v.VersionID, x.role)
 		if err != nil {
-			return x.stop(DeployFailed, DeployReasonOpUnresolvable, err.Error())
+			return x.stop(DeployFailed, requestRefusal(err), err.Error())
 		}
 		if err := x.attempt(ctx, k, req, "", hash); err != nil {
 			return err
@@ -812,14 +844,19 @@ func (n *answerNote) get() string  { n.mu.Lock(); defer n.mu.Unlock(); return n.
 // attempt sends one request inside the write-ahead attempt lifecycle and
 // turns its result into the run's next step.
 func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, doc, docHash string) error {
+	// §8.5: at most MaxOpAttempts retryable answers within RetryWindow.
+	// Only answers inside the window count (by completed_at, written from
+	// the attempt log's clock); an older throttling episode does not use
+	// up this one's budget.
 	var retryable int64
+	since := x.e.now().Add(-x.e.retryWindow())
 	if err := x.e.db.Raw(`SELECT count(*) FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
-		AND outcome = 'retryable'`, x.dep.WorkspaceID, x.dep.ID, k).Scan(&retryable).Error; err != nil {
+		AND outcome = 'retryable' AND completed_at > ?`, x.dep.WorkspaceID, x.dep.ID, k, since).Scan(&retryable).Error; err != nil {
 		return err
 	}
 	if int(retryable) >= x.e.maxOpAttempts() {
 		return x.stop(DeployFailed, DeployReasonRetriesExhausted,
-			fmt.Sprintf("op %d (%s) was refused as retryable %d times", k, req.Op, retryable))
+			fmt.Sprintf("op %d (%s) was refused as retryable %d times within %s", k, req.Op, retryable, x.e.retryWindow()))
 	}
 	reqHash, err := req.Hash()
 	if err != nil {
@@ -854,9 +891,16 @@ func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, do
 		}
 		return AttemptAnswer{Outcome: oc.Outcome, RequestID: resp.RequestID, ErrorCode: resp.ErrorCode, ErrorMessage: msg}, nil
 	}
-	res, err := x.e.attempts.Execute(ctx, x.run, AttemptRequest{WorkspaceID: x.dep.WorkspaceID, DeploymentID: x.dep.ID,
-		OpSeq: k, Operation: req.Op, RequestHash: reqHash, DocumentHash: docHash}, call)
+	var pre func(ctx context.Context) error
+	if chk := x.e.BindingCheck; chk != nil {
+		pre = func(ctx context.Context) error { return chk(ctx, x.dep.WorkspaceID, x.ctl.ConnectorID) }
+	}
+	res, err := x.e.attempts.ExecuteChecked(ctx, x.run, AttemptRequest{WorkspaceID: x.dep.WorkspaceID, DeploymentID: x.dep.ID,
+		OpSeq: k, Operation: req.Op, RequestHash: reqHash, DocumentHash: docHash}, pre, call)
 	if err != nil {
+		if errors.Is(err, ErrDispatchRefused) {
+			return x.bindingStop(err, k, req.Op)
+		}
 		return err
 	}
 	attID := res.Attempt.ID
@@ -892,6 +936,35 @@ func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, do
 		}
 		return x.stop(DeployFailed, reason, detail)
 	}
+}
+
+// bindingStop ends the run when the binding check refused op k's dispatch.
+// DECISION (review P1-8): the run stops as blocked with the binding's code
+// (binding_not_verified -- revoked included, the detail names the state --,
+// binding_partial, enforcement_not_enabled), exactly as the start gate
+// blocks a deployment whose binding is not usable; the stopped deployment
+// releases the role with its ledger settled. A refusal that is not a
+// binding verdict (a database error) is returned: the job retries and the
+// next run re-checks before anything is sent.
+func (x *execRun) bindingStop(err error, k int, op string) error {
+	var ge *GovError
+	var ee *EnforcementError
+	code, msg := "", ""
+	switch {
+	case errors.As(err, &ge):
+		code, msg = ge.Code, ge.Message
+		if st, ok := ge.Detail["state"]; ok {
+			msg = fmt.Sprintf("%s (binding %v)", msg, st)
+		}
+	case errors.As(err, &ee):
+		code, msg = ee.Code, ee.Message
+		if st, ok := ee.Detail["state"]; ok {
+			msg = fmt.Sprintf("%s (binding %v)", msg, st)
+		}
+	default:
+		return err
+	}
+	return x.stop(DeployBlocked, code, fmt.Sprintf("op %d (%s) was not sent: %s", k, op, msg))
 }
 
 // backoff is the jittered exponential delay after the n-th retryable answer.

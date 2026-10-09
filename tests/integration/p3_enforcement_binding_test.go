@@ -26,6 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -137,6 +138,8 @@ type enfLab struct {
 	svc   *services.EnforcementBindingService
 	qc    *services.AWSQuickCreateService
 	a     enfWorkspace
+	// gateOn is the available IGA_POLICY gate the callback runs under.
+	gateOn *services.PolicyGate
 }
 
 // enfPurgeOnCleanup deletes a workspace in a purge transaction, the only way
@@ -184,6 +187,13 @@ func newEnfLab(t *testing.T) *enfLab {
 		WithAssumer(l.aws).WithClock(l.clock.now).WithSleep(l.clock.sleep).
 		WithHTTPClient(&http.Client{Transport: l.puts}).
 		WithTemplateCheck(func(context.Context, string) error { return nil })
+	// The callback runs only under an available IGA_POLICY gate (review fix
+	// R1a P2 "gate leaks"; TestP3EnfCallbackRefusedWhileGateOff).
+	l.gateOn = services.NewPolicyGate(true, "", p3GraphOn(t, db))
+	if err := l.gateOn.Verify(db); err != nil {
+		t.Fatal(err)
+	}
+	l.svc.WithPolicyGate(l.gateOn)
 	l.qc = services.NewAWSQuickCreateService(nil, nil, cfg, enfPrincipal).WithEnforcementHandler(l.svc)
 	l.a = l.newWorkspace(t, "p3-enf-a")
 	return l
@@ -377,6 +387,69 @@ func TestP3EnfCallbackBindsAndVerifies(t *testing.T) {
 	}
 	if ev := l.events(t, l.a.ws); len(ev) != 3 {
 		t.Fatalf("events after replays = %v", ev)
+	}
+}
+
+// Review fix R1a P2 "gate leaks": an enforcement registration is Phase 3
+// state, so it is never processed while IGA_POLICY is not available. Switch
+// off: the Create is refused explicitly (FAILED policy_not_enabled, done),
+// nothing is bound, no event is written. Switch on but unverified: the
+// message is left for redelivery (retry), nothing is answered or written,
+// and the final delivery answers FAILED. Delete is still answered SUCCESS
+// (a stack can always be deleted). Once the gate is available the same
+// message binds as usual.
+func TestP3EnfCallbackRefusedWhileGateOff(t *testing.T) {
+	l := newEnfLab(t)
+	sess := l.start(t, l.a)
+	l.aws.deploy(t, sess.AccountID, sess.Suffix, sess.ExternalID)
+	before := l.events(t, l.a.ws)
+	unchanged := func(what string) {
+		t.Helper()
+		if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingPending || b.RoleARN != "" {
+			t.Fatalf("%s: binding %+v, want still pending and unbound", what, b)
+		}
+		if ev := l.events(t, l.a.ws); strings.Join(ev, ",") != strings.Join(before, ",") {
+			t.Fatalf("%s: events %v, want %v", what, ev, before)
+		}
+	}
+
+	// Switch off.
+	l.svc.WithPolicyGate(services.NewPolicyGate(false, "", p3GraphOn(t, l.db)))
+	n := l.puts.count()
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone {
+		t.Fatalf("gate off: outcome %s, want done (refused explicitly)", out)
+	}
+	if r := l.puts.last(t); l.puts.count() != n+1 || r.Status != awsdiscovery.CFNStatusFailed || !strings.Contains(r.Reason, "not enabled") {
+		t.Fatalf("gate off: answer %+v, want FAILED policy_not_enabled", r)
+	}
+	unchanged("gate off")
+	l.deliver(l.cfnBody(sess, "Delete", func(req map[string]any, _ map[string]string) {
+		req["PhysicalResourceId"] = "authsec-enforcement-unregistered-x"
+	}))
+	if r := l.puts.last(t); r.Status != awsdiscovery.CFNStatusSuccess {
+		t.Fatalf("gate off: Delete answered %+v, want SUCCESS", r)
+	}
+
+	// Switch on, schema not verified yet: left for redelivery.
+	l.svc.WithPolicyGate(services.NewPolicyGate(true, "", p3GraphOn(t, l.db)))
+	n = l.puts.count()
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackRetry || l.puts.count() != n {
+		t.Fatalf("gate unverified: outcome %s with %d answers, want retry and none", out, l.puts.count()-n)
+	}
+	unchanged("gate unverified")
+	if out := l.qc.HandleCallbackDelivery(context.Background(), l.cfnBody(sess, "Create", nil), true); out != services.CallbackDone ||
+		l.puts.last(t).Status != awsdiscovery.CFNStatusFailed {
+		t.Fatalf("gate unverified, final delivery: %s %+v, want FAILED", out, l.puts.last(t))
+	}
+	unchanged("gate unverified, final delivery")
+
+	// Available: the same registration binds.
+	l.svc.WithPolicyGate(l.gateOn)
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone || l.puts.last(t).Status != awsdiscovery.CFNStatusSuccess {
+		t.Fatalf("gate on: %s %+v", out, l.puts.last(t))
+	}
+	if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingVerified {
+		t.Fatalf("gate on: binding %+v, want verified", b)
 	}
 }
 
@@ -895,4 +968,114 @@ func TestP3EnfRoutes(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, r.a.ws.String())
+}
+
+// Review fix R1a P2 "unscheduled verify_binding" (§3.6: the self-test runs
+// every 24 hours): the default worker registers verify_binding and its
+// schedule; a bound binding whose last self-test is older than 24 hours is
+// due (one job, dedupe binding:<id>; not due again once queued, nor while
+// fresh); the handler runs the REAL self-test through the installed
+// self-tester (a new self_test event by verify_binding, the binding
+// re-verified); a revoked binding completes the job without a probe.
+func TestP3EnfVerifyBindingScheduled(t *testing.T) {
+	l := newEnfLab(t)
+	ctx := context.Background()
+	sess := l.start(t, l.a)
+	l.aws.deploy(t, sess.AccountID, sess.Suffix, sess.ExternalID)
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone {
+		t.Fatalf("bind: %s", out)
+	}
+
+	w := services.NewDefaultPolicyJobWorker(l.db)
+	registered, scheduled := false, false
+	for _, k := range w.Kinds() {
+		registered = registered || k == repositories.GovJobVerifyBinding
+	}
+	for _, n := range w.Scheduler().ScheduleNames() {
+		scheduled = scheduled || n == repositories.GovJobVerifyBinding
+	}
+	if !registered || !scheduled {
+		t.Fatalf("verify_binding registered %v, scheduled %v in the default worker", registered, scheduled)
+	}
+
+	sched := services.VerifyBindingSchedule()
+	due := func(now time.Time) *services.ScheduledPolicyJob {
+		t.Helper()
+		items, err := sched.Due(ctx, l.db, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range items {
+			if items[i].WorkspaceID == l.a.ws {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+	if it := due(time.Now()); it != nil {
+		t.Fatalf("a binding self-tested just now is due: %+v", it)
+	}
+	// A day passes.
+	p3exec(t, l.db, `UPDATE cloud_enforcement_binding SET updated_at = now() - interval '25 hours' WHERE id = ?`, sess.BindingID)
+	it := due(time.Now())
+	if it == nil || it.SubjectID == nil || *it.SubjectID != sess.BindingID || it.DedupeKey != "binding:"+sess.BindingID.String() {
+		t.Fatalf("due after 25 h: %+v", it)
+	}
+	repo := repositories.NewIGAGovJobRepository(l.db)
+	for i := 0; i < 2; i++ {
+		if _, err := repo.EnqueuePeriodicTx(l.db, &models.IGAGovJob{WorkspaceID: l.a.ws, Kind: sched.Kind, SubjectID: it.SubjectID,
+			DedupeKey: it.DedupeKey}, sched.Every); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var jobs []models.IGAGovJob
+	l.db.Where("workspace_id = ? AND kind = ?", l.a.ws, repositories.GovJobVerifyBinding).Find(&jobs)
+	if len(jobs) != 1 {
+		t.Fatalf("verify_binding jobs: %d, want 1", len(jobs))
+	}
+	run := func(j models.IGAGovJob) error {
+		t.Helper()
+		p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'running', lease_owner = 'enf-t', lease_version = lease_version + 1,
+			lease_expires_at = now() + interval '2 minutes', attempts = attempts + 1 WHERE id = ?`, j.ID)
+		l.db.Where("id = ?", j.ID).Take(&j)
+		err := services.VerifyBindingHandler(ctx, services.NewPolicyJobRun(l.db, j, "enf-t"))
+		p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now(), lease_owner = '', lease_expires_at = NULL WHERE id = ?`, j.ID)
+		return err
+	}
+	// Without a self-tester (no Vault in the process) the job waits.
+	restore := services.SetEnforcementSelfTester(nil)
+	if err := run(jobs[0]); err == nil {
+		t.Fatal("verify_binding ran with no self-tester")
+	}
+	restore()
+	t.Cleanup(services.SetEnforcementSelfTester(l.svc))
+	selfTests := func() int64 {
+		var n int64
+		l.db.Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND event = ? AND actor_id = 'verify_binding'`,
+			l.a.ws, services.EventEnforcementSelfTest).Scan(&n)
+		return n
+	}
+	if err := run(jobs[0]); err != nil {
+		t.Fatalf("verify_binding: %v", err)
+	}
+	if n := selfTests(); n != 1 {
+		t.Fatalf("self_test events by verify_binding: %d, want 1", n)
+	}
+	if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingVerified || time.Since(b.UpdatedAt) > time.Hour {
+		t.Fatalf("after the scheduled self-test: %+v", b)
+	}
+	if it := due(time.Now()); it != nil {
+		t.Fatalf("due again right after its self-test: %+v", it)
+	}
+
+	// Revoked: the job completes without probing.
+	if _, err := l.svc.Revoke(ctx, l.a.ws, l.a.connector.ID, l.a.user, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(jobs[0]); err != nil {
+		t.Fatalf("verify_binding of a revoked binding: %v", err)
+	}
+	if n := selfTests(); n != 1 {
+		t.Fatalf("a revoked binding was probed: %d self_test events", n)
+	}
 }

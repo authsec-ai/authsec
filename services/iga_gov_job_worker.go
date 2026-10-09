@@ -47,6 +47,10 @@ type PolicyJobWorker struct {
 
 	scheduler *PolicyJobScheduler
 
+	sweepMu  sync.Mutex
+	sweepers []PolicyJobSweeper
+	sweptAt  map[string]time.Time
+
 	Lease       time.Duration // default PolicyJobLease
 	RenewEvery  time.Duration // default PolicyJobRenewEvery
 	Concurrency int           // jobs run at once by this worker; default 4
@@ -85,6 +89,74 @@ type PolicyJobKind struct {
 	Backoff func(attempts int) time.Duration
 	// Timeout bounds one try; 0 means no bound beyond the lease.
 	Timeout time.Duration
+	// OnExhausted, when set, runs after a job of this kind became terminal
+	// `failed` with no attempts left -- from a handler error at the last
+	// attempt, or from Sweep when its lease lapsed at the ceiling -- so the
+	// job's subject is not left waiting on a job that will never run again
+	// (review P1-5). It runs outside any job lease; lastError is the job's
+	// last error. A failure is logged; the kind's sweeper is the safety net.
+	OnExhausted func(ctx context.Context, job models.IGAGovJob, lastError string)
+}
+
+// PolicyJobSweeper is a periodic repair a task registers on the worker (the
+// deployment sweeper, review P1-5): run on the loop tick at most every Every.
+type PolicyJobSweeper struct {
+	Name  string
+	Every time.Duration
+	Run   func(ctx context.Context, now time.Time) error
+}
+
+// AddSweeper registers a sweeper; one with the same name replaces it.
+func (w *PolicyJobWorker) AddSweeper(sw PolicyJobSweeper) {
+	if sw.Name == "" || sw.Run == nil {
+		panic("a policy job sweeper needs a name and a function")
+	}
+	w.sweepMu.Lock()
+	defer w.sweepMu.Unlock()
+	for i := range w.sweepers {
+		if w.sweepers[i].Name == sw.Name {
+			w.sweepers[i] = sw
+			return
+		}
+	}
+	w.sweepers = append(w.sweepers, sw)
+}
+
+// runSweepers runs every sweeper due at now (all of them when force).
+func (w *PolicyJobWorker) runSweepers(ctx context.Context, now time.Time, force bool) error {
+	w.sweepMu.Lock()
+	if w.sweptAt == nil {
+		w.sweptAt = map[string]time.Time{}
+	}
+	var due []PolicyJobSweeper
+	for _, sw := range w.sweepers {
+		every := sw.Every
+		if every <= 0 {
+			every = time.Minute
+		}
+		if last, ok := w.sweptAt[sw.Name]; ok && !force && now.Sub(last) < every {
+			continue
+		}
+		w.sweptAt[sw.Name] = now
+		due = append(due, sw)
+	}
+	w.sweepMu.Unlock()
+	var first error
+	for _, sw := range due {
+		if err := sw.Run(ctx, now); err != nil {
+			log.Printf("[policy-worker] sweeper %s: %v", sw.Name, err)
+			if first == nil {
+				first = fmt.Errorf("%s: %w", sw.Name, err)
+			}
+		}
+	}
+	return first
+}
+
+// RunSweepersNow runs every registered sweeper regardless of its interval
+// (tests).
+func (w *PolicyJobWorker) RunSweepersNow(ctx context.Context) error {
+	return w.runSweepers(ctx, w.now(), true)
 }
 
 // policyJobOutcome errors.
@@ -247,6 +319,7 @@ func (w *PolicyJobWorker) tick(ctx, jobCtx context.Context, slots chan struct{},
 		return // fail closed: the gate went unavailable; claim nothing
 	}
 	w.Sweep()
+	_ = w.runSweepers(ctx, w.now(), false)
 	if err := w.scheduler.Tick(ctx, w.now()); err != nil {
 		log.Printf("[policy-worker] scheduler: %v", err)
 	}
@@ -277,10 +350,13 @@ func (w *PolicyJobWorker) tick(ctx, jobCtx context.Context, slots chan struct{},
 // prunes finished jobs at most hourly.
 func (w *PolicyJobWorker) Sweep() {
 	now := w.now()
-	if n, err := w.jobs.FailExhausted(now); err != nil {
+	if failed, err := w.jobs.FailExhaustedJobs(now); err != nil {
 		log.Printf("[policy-worker] sweep exhausted: %v", err)
-	} else if n > 0 {
-		log.Printf("[policy-worker] %d job(s) failed: lease expired with no attempts left", n)
+	} else if len(failed) > 0 {
+		log.Printf("[policy-worker] %d job(s) failed: lease expired with no attempts left", len(failed))
+		for _, j := range failed {
+			w.exhausted(j, j.LastError)
+		}
 	}
 	if now.Sub(w.lastPrune) < time.Hour {
 		return
@@ -398,10 +474,32 @@ func (w *PolicyJobWorker) finish(parent context.Context, k PolicyJobKind, run *P
 		}
 		log.Printf("[policy-worker] %s %s attempt %d/%d failed: %v", job.Kind, job.ID, job.Attempts, job.MaxAttempts, err)
 		werr = w.jobs.Fail(fence, err.Error(), backoff)
+		if werr == nil && job.Attempts >= job.MaxAttempts {
+			// Fail decided terminal from the same counters (attempts at
+			// claim = attempts now): the job will never run again.
+			w.exhausted(job, err.Error())
+		}
 	}
 	if werr != nil && !errors.Is(werr, repositories.ErrPolicyJobLeaseLost) {
 		log.Printf("[policy-worker] %s %s: recording the outcome: %v", job.Kind, job.ID, werr)
 	}
+}
+
+// exhausted runs the kind's OnExhausted hook for a job that just became
+// terminal failed.
+func (w *PolicyJobWorker) exhausted(job models.IGAGovJob, lastError string) {
+	k, ok := w.handler(job.Kind)
+	if !ok || k.OnExhausted == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("[policy-worker] %s %s exhausted hook panic: %v", job.Kind, job.ID, p)
+		}
+	}()
+	k.OnExhausted(ctx, job, lastError)
 }
 
 // PolicyJobRun is one claimed job and its fence: what a handler uses to write
@@ -574,6 +672,14 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// T3.18: metrics_rollup, hourly per workspace (dedupe hour:<ts>), and
 	// its schedule.
 	RegisterMetricsJobs(w, NewGovMetrics(db, nil))
+	// Review P2: prune_evidence, daily per workspace (dedupe
+	// ws:<id>:day:<date>, §8.1), evaluation and resource-policy evidence.
+	RegisterPruneEvidenceJob(w)
+	// T3.09 / review fix R1a P2: verify_binding, the 24-hour enforcement
+	// self-test per bound binding, and its schedule
+	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
+	// NewProductionGovDeployEnv).
+	RegisterEnforcementBindingJobs(w)
 	return w
 }
 

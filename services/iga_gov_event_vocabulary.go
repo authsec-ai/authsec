@@ -3,7 +3,6 @@ package services
 import (
 	"encoding/json"
 	"sort"
-	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -38,6 +37,8 @@ const (
 	GovCatOwnerReview       = "owner_review"
 	GovCatNotification      = "notification"
 	GovCatSettings          = "settings"
+	// Finding rules and finding exceptions (§7.1; review fix R1a P2).
+	GovCatFinding = "finding"
 	// Recorded by T3.11 / T3.13 (listed at integration, p3-wire).
 	GovCatProposal     = "proposal"
 	GovCatApproval     = "approval"
@@ -88,6 +89,12 @@ var GovEventVocabulary = []GovEventKind{
 	{"owner_rule.created", GovCatOwnership, GovObjOwnerRule, "An owner tag rule was created."},
 	{"owner_rule.deleted", GovCatOwnership, GovObjOwnerRule, "An owner tag rule was deleted with the owners it assigned."},
 	{"owner_rule.evaluated", GovCatOwnership, "", "Owner tag rules were applied (owners added and removed, unmatched tags)."},
+	// §7.1 finding rules and exceptions (iga_gov_finding_rules.go).
+	{GovEventFindingRuleCreated, GovCatFinding, GovObjFindingRule, "A finding rule (review date or unused window) was created."},
+	{GovEventFindingRuleUpdated, GovCatFinding, GovObjFindingRule, "A finding rule's scope, parameters or enabled flag changed."},
+	{GovEventFindingRuleDeleted, GovCatFinding, GovObjFindingRule, "A finding rule was deleted."},
+	{GovEventFindingExcepted, GovCatFinding, GovObjFinding, "An exception was recorded on a finding until a date, with a reason."},
+	{GovEventFindingExceptionCleared, GovCatFinding, GovObjFinding, "A finding's exception was cleared; the finding is open again."},
 	// T3.06 evaluation (iga_gov_evaluator.go).
 	{"evaluation_completed", GovCatEvaluation, "", "Findings were evaluated for a publication."},
 	{"evaluation_failed", GovCatEvaluation, "", "A publication's finding evaluation failed."},
@@ -152,7 +159,8 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventLedgerSettled, GovCatDeploymentAttempt, GovObjDeployment, "Intended ledger rows of a stopped deployment were settled."},
 	{GovEventUnknownReading, GovCatDeploymentAttempt, GovObjDeployment, "A reading of an unknown outcome was taken after settle_after."},
 	{GovEventDeploymentUnresolved, GovCatDeploymentAttempt, GovObjDeployment, "An unknown outcome could not be resolved; the role stays held for the operator."},
-	{GovEventDeploymentResolveReq, GovCatDeploymentAttempt, GovObjDeployment, "An operator asked to re-read an unresolved outcome."},
+	{GovEventDeploymentResolveReq, GovCatDeploymentAttempt, GovObjDeployment, "An operator chose how to resolve an unresolved outcome or a stuck deployment."},
+	{GovEventDeploymentRequeued, GovCatDeploymentAttempt, GovObjDeployment, "An in-flight deployment had no job to move it; its job was queued again."},
 	{GovEventDeploymentRecovered, GovCatDeploymentAttempt, GovObjDeployment, "An unresolved deployment was handed over to its successor atomically."},
 	{GovEventAcceptObservedOpened, GovCatDeploymentAttempt, GovObjDeployment, "A version accepting the observed state was proposed; the role stays held."},
 	{GovEventVerificationRecorded, GovCatVerification, GovObjDeployment, "Verification dimensions were recorded."},
@@ -190,6 +198,10 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventIaCMerged, GovCatDeploymentAttempt, GovObjDeployment, "The pull request was merged; the deployment awaits the customer's apply."},
 	{GovEventIaCClosed, GovCatDeploymentAttempt, GovObjDeployment, "The pull request was closed without merging; the deployment failed."},
 	{GovEventIaCBlocked, GovCatDeploymentAttempt, GovObjDeployment, "Blocked before anything was proposed: the live state conflicts with the plan, or the mapped source no longer renders the approved change."},
+	{GovEventIaCPRStep, GovCatDeploymentAttempt, GovObjDeployment, "The intent of the next GitHub write (commit, branch, pull request) was recorded before it was made."},
+	{GovEventIaCPRUpdated, GovCatDeploymentAttempt, GovObjDeployment, "The open pull request was updated to the approved change on the current base branch."},
+	{GovEventIaCPRSuperseded, GovCatDeploymentAttempt, GovObjDeployment, "AuthSec closed its pull request: the approved plan changed or the source no longer renders it."},
+	{GovEventIaCOpenFailed, GovCatDeploymentAttempt, GovObjDeployment, "Opening the pull request could not be completed; the deployment failed instead of staying open forever."},
 	{GovEventIaCApplyRun, GovCatDeploymentAttempt, GovObjDeployment, "The repository reported a check run or deployment for the merge commit."},
 	{GovEventIaCApplyPending, GovCatVerification, GovObjDeployment, "The desired state is not (fully) visible in AWS yet, or became overdue."},
 	{GovEventIaCAppliedOutside, GovCatVerification, GovObjDeployment, "Applied outside AuthSec, matched by role, attachment and document hash."},
@@ -223,6 +235,7 @@ const (
 	GovObjReview             = "review"
 	GovObjOwner              = "owner"
 	GovObjOwnerRule          = "owner_rule"
+	GovObjFindingRule        = "finding_rule"
 	GovObjBinding            = "enforcement_binding"
 	GovObjConnector          = "connector"
 	GovObjEvidenceBundle     = "evidence_bundle"
@@ -242,6 +255,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjReview:          {payloadKey: "review_id"},
 	GovObjOwner:           {payloadKey: "owner_id"},
 	GovObjOwnerRule:       {payloadKey: "rule_id"},
+	GovObjFindingRule:     {payloadKey: "finding_rule_id"},
 	GovObjBinding:         {payloadKey: "binding_id"},
 	GovObjConnector:       {payloadKey: "connector_id"},
 	GovObjEvidenceBundle:  {payloadKey: "bundle_id"},
@@ -329,58 +343,11 @@ func appendGovEvent(tx *gorm.DB, ws uuid.UUID, name, actorKind, actorID string, 
 	})
 }
 
-// govRedactKeys are payload keys whose values never leave the server
-// through the events API or its export (§7.8 "redacted payloads").
-var govRedactKeys = []string{"secret", "token", "password", "credential", "external_id", "externalid",
-	"signature", "authorization", "private_key"}
-
-// govRedactKey reports whether a payload key is sensitive: a secret-like
-// substring, or an email address field ("email", "*_email", "emails";
-// not "email_enabled").
-func govRedactKey(k string) bool {
-	lk := strings.ToLower(k)
-	for _, s := range govRedactKeys {
-		if strings.Contains(lk, s) {
-			return true
-		}
-	}
-	return lk == "email" || lk == "emails" || strings.HasSuffix(lk, "_email")
-}
-
-// RedactGovEventPayload returns payload with the value of every sensitive
-// key (govRedactKey, at any depth) replaced by "[redacted]". An unparseable
-// payload is returned as {"unreadable": true}.
+// RedactGovEventPayload is the read-side redaction of the events API and
+// its export (§7.8 "redacted payloads"): models.RedactGovEventPayload, the
+// SAME function the model applies before every insert (review fix R1a P2),
+// so rows written before that fix are redacted on the way out too. An
+// unparseable payload is returned as {"unreadable": true}.
 func RedactGovEventPayload(payload json.RawMessage) json.RawMessage {
-	if len(payload) == 0 {
-		return json.RawMessage(`{}`)
-	}
-	var v any
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return json.RawMessage(`{"unreadable":true}`)
-	}
-	out, err := json.Marshal(govRedactValue(v))
-	if err != nil {
-		return json.RawMessage(`{"unreadable":true}`)
-	}
-	return out
-}
-
-func govRedactValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, x := range t {
-			if govRedactKey(k) {
-				t[k] = "[redacted]"
-			} else {
-				t[k] = govRedactValue(x)
-			}
-		}
-		return t
-	case []any:
-		for i := range t {
-			t[i] = govRedactValue(t[i])
-		}
-		return t
-	}
-	return v
+	return models.RedactGovEventPayload(payload)
 }

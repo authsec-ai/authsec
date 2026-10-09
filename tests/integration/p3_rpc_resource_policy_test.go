@@ -282,10 +282,18 @@ func TestP3RPCCollectionWritesImmutableEvidence(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	sqsRoutes := igagov.AnalyzeRoutes("sqs", rpRole, ev, rpEnabled)
-	if sqsRoutes.Usage != igagov.RouteUsageConfirmRequired || len(sqsRoutes.Routes) != 4 { // refunds + audit in two regions
+	// refunds + audit in two regions, and (review P1-6) ap-south-1 -- enabled
+	// in the account, not selected -- not_analysed, never "no route".
+	if sqsRoutes.Usage != igagov.RouteUsageConfirmRequired || len(sqsRoutes.Routes) != 5 {
 		t.Fatalf("sqs routes = %+v", sqsRoutes)
 	}
 	for _, r := range sqsRoutes.Routes {
+		if r.Region == "ap-south-1" {
+			if r.Effect != igagov.RouteEffectNotAnalysed || r.Form != "sqs_queue" || r.Reason != igagov.CoverageNotCollected {
+				t.Errorf("unselected region route %+v, want not_analysed (not_collected)", r)
+			}
+			continue
+		}
 		if r.Effect != igagov.RouteEffectLimited || r.Form != "sqs_queue" || r.Principal != igagov.PrincipalRoleARN {
 			t.Errorf("sqs route %+v", r)
 		}
@@ -454,6 +462,9 @@ func TestP3RPCA39LambdaAliasAndAccessPointForms(t *testing.T) {
 func TestP3RPCA46CoverageLostInOneRegion(t *testing.T) {
 	e := newRPEnv(t, "p3-rpc-a46")
 	w := newRPWorld()
+	// Every enabled region selected: an unselected one would be not_analysed
+	// (review P1-6), which is not what this scenario is about.
+	w.enabled = s2Regions("us-east-1", "eu-west-1")
 	// No queue grants the role: a clean removal is possible.
 	for _, r := range []string{"us-east-1", "eu-west-1"} {
 		for i := range w.regions[r].Queues {

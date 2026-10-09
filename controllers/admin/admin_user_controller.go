@@ -718,6 +718,12 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 
 	// 5. Finally, delete the user
 	if err := execDelete("users", "DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, workspaceUUID); err != nil {
+		// Audit / approval records still naming the user are kept: an
+		// explicit 409, never a raw foreign-key error (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			logger.WithError(err).Warn("Refused: the user is named by audit records")
+			return
+		}
 		logger.WithError(err).Error("Failed to delete user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1375,6 +1381,12 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	logger.Info("Step 1: Deleting tenant data from master database")
 	deletedCounts, err := auc.workspaceRepo.DeleteTenant(workspaceUUID)
 	if err != nil {
+		// A user of this workspace still named by another workspace's
+		// audit records: refused, nothing deleted (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			logger.WithError(err).Warn("Refused: a user of the workspace is named by another workspace's audit records")
+			return
+		}
 		logger.WithError(err).Error("Failed to delete tenant data from master database")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete tenant data: " + err.Error()})
 		return

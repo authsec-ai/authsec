@@ -22,7 +22,7 @@ import (
 // SCIMAdminController handles SCIM 2.0 provisioning endpoints for admin users (master DB)
 type SCIMAdminController struct {
 	adminUserRepo *database.AdminUserRepository
-	workspaceRepo    *database.WorkspaceRepository
+	workspaceRepo *database.WorkspaceRepository
 }
 
 // NewSCIMAdminController creates a new SCIM admin controller
@@ -34,7 +34,7 @@ func NewSCIMAdminController() (*SCIMAdminController, error) {
 
 	return &SCIMAdminController{
 		adminUserRepo: database.NewAdminUserRepository(db),
-		workspaceRepo:    database.NewWorkspaceRepository(db),
+		workspaceRepo: database.NewWorkspaceRepository(db),
 	}, nil
 }
 
@@ -231,7 +231,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 		Email:        strings.ToLower(email),
 		Username:     input.UserName,
 		Name:         input.GetDisplayName(),
-		WorkspaceID:     &workspaceUUID,
+		WorkspaceID:  &workspaceUUID,
 		Provider:     "scim",
 		ProviderID:   input.UserName,
 		ProviderData: providerData,
@@ -256,7 +256,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 	if err == nil && existingTenant != nil {
 		adminSyncCtrl := &AdminSyncController{
 			adminUserRepo: sac.adminUserRepo,
-			workspaceRepo:    sac.workspaceRepo,
+			workspaceRepo: sac.workspaceRepo,
 		}
 		if err := adminSyncCtrl.createTenantForAdminUser(newUser, existingTenant); err != nil {
 			log.Printf("SCIM Admin: Warning - failed to create tenant record for %s: %v", email, err)
@@ -458,6 +458,12 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 	// Delete the user
 	_, err = db.DB.Exec("DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, workspaceUUID)
 	if err != nil {
+		// Audit / approval records still naming the user are kept (review
+		// P0-1): a SCIM 409 naming user_has_audit_history.
+		if ae, ok := database.AsUserAuditHistory(database.ClassifyUserDeleteError(err)); ok {
+			c.JSON(http.StatusConflict, models.NewSCIMError("409", database.UserHasAuditHistoryCode+": "+ae.Message(), ""))
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
 	}

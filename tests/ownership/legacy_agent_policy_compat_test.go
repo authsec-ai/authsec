@@ -390,8 +390,8 @@ func TestLegacyCompatUsesTheLegacyGovernancePermissionsAndTheEnvelope(t *testing
 	l.do(t, http.MethodDelete, compatBase+"/"+l.pOff.String(), l.ws, map[string]string{"reason": "cleanup"})
 	want := []string{
 		"GET " + compatBase + " governance:read",
-		"POST " + compatBase + "/:id/pause governance:admin",
-		"DELETE " + compatBase + "/:id governance:admin",
+		"POST " + compatBase + "/:id/pause governance:enforce",
+		"DELETE " + compatBase + "/:id governance:enforce",
 	}
 	if strings.Join(*l.perms, "\n") != strings.Join(want, "\n") {
 		t.Errorf("permission checks:\n got %v\nwant %v", *l.perms, want)
@@ -400,11 +400,17 @@ func TestLegacyCompatUsesTheLegacyGovernancePermissionsAndTheEnvelope(t *testing
 	// 401 and 403 from the shared middlewares come back in the §7 envelope.
 	wantErr(t, l.do(t, http.MethodGet, compatBase, uuid.Nil, nil), http.StatusUnauthorized, "unauthenticated")
 	before := tableState(t, l.raw)
-	rec := l.do(t, http.MethodPost, compatBase+"/"+l.pDirect.String()+"/pause", l.ws, nil,
-		"X-Test-Deny", "governance:admin")
-	wantErr(t, rec, http.StatusForbidden, "forbidden")
+	// §7.10 (review fix R1a P2): pause and remove need governance:enforce,
+	// which 055 seeds; governance:admin alone no longer suffices.
+	for _, c := range []struct{ method, path string }{
+		{http.MethodPost, compatBase + "/" + l.pDirect.String() + "/pause"},
+		{http.MethodDelete, compatBase + "/" + l.pDirect.String()},
+	} {
+		rec := l.do(t, c.method, c.path, l.ws, map[string]string{"reason": "x"}, "X-Test-Deny", "governance:enforce")
+		wantErr(t, rec, http.StatusForbidden, "forbidden")
+	}
 	if after := tableState(t, l.raw); after != before {
-		t.Error("a denied pause must change nothing")
+		t.Error("a denied pause or remove must change nothing")
 	}
 }
 

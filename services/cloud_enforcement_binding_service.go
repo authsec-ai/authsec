@@ -136,9 +136,12 @@ type EnforcementBindingService struct {
 	cfg        awsdiscovery.CallbackConfig
 	principal  string
 
-	http          *http.Client
-	now           func() time.Time
-	sleep         func(ctx context.Context, d time.Duration) error
+	http  *http.Client
+	now   func() time.Time
+	sleep func(ctx context.Context, d time.Duration) error
+	// policyGate is the IGA_POLICY gate an enforcement registration Create
+	// is processed under (nil: the process-wide gate, read per message).
+	policyGate    func() *PolicyGate
 	templateCheck func(ctx context.Context, templateURL string) error
 }
 
@@ -159,6 +162,20 @@ func NewEnforcementBindingService(db *gorm.DB, vc vault.VaultClient, cfg awsdisc
 	}
 	s.templateCheck = newTemplateChecker(func() time.Time { return s.now() })
 	return s
+}
+
+// WithPolicyGate makes the callback read g instead of the process-wide
+// IGA_POLICY gate (tests).
+func (s *EnforcementBindingService) WithPolicyGate(g *PolicyGate) *EnforcementBindingService {
+	s.policyGate = func() *PolicyGate { return g }
+	return s
+}
+
+func (s *EnforcementBindingService) gate() *PolicyGate {
+	if s.policyGate != nil {
+		return s.policyGate()
+	}
+	return PolicyGateState()
 }
 
 // WithAssumer swaps the AWS boundary (tests use a fake).
@@ -1280,7 +1297,12 @@ var enfReasons = map[string]string{
 	AWSOnbCodeAssumeDenied:       "AuthSec could not assume the enforcement role. Check the trust policy and ExternalId were not changed.",
 	AWSOnbCodeAuthSecUnavailable: "AuthSec could not complete setup. Try again later.",
 	EnfCodeOwnedElsewhere:        "This AWS account is already bound for enforcement by another AuthSec workspace.",
+	EnfCodePolicyNotEnabled:      "AuthSec policy enforcement is not enabled on this AuthSec server. Delete this stack and start again in AuthSec once it is.",
 }
+
+// EnfCodePolicyNotEnabled answers a registration that arrives while the
+// IGA_POLICY switch is off (review fix R1a P2 "gate leaks").
+const EnfCodePolicyNotEnabled = "policy_not_enabled"
 
 func (s *EnforcementBindingService) handleCreate(
 	ctx context.Context, env *awsdiscovery.SNSEnvelope, req *awsdiscovery.EnforcementCFNRequest,
@@ -1331,6 +1353,25 @@ func (s *EnforcementBindingService) handleCreate(
 	}
 	if !awsdiscovery.KnownEnforcementTemplateVersion(props.TemplateVersion) {
 		return fail(AWSOnbCodeInvalidRequest, "unknown TemplateVersion "+props.TemplateVersion)
+	}
+
+	// 1b. The IGA_POLICY gate (§4.3; review fix R1a P2 "gate leaks"). The
+	// binding, its Vault path and its events are Phase 3 state: nothing is
+	// read or written unless the gate is on. DECISION: switch OFF is an
+	// operator's deliberate state, so the Create is REFUSED explicitly
+	// (FAILED with policy_not_enabled; the customer deletes the stack and
+	// starts again once enabled). Switch ON but not yet available (schema
+	// verifying, graph gate not verified) is transient: the message is left
+	// for redelivery (CallbackRetry) until the gate verifies, and only the
+	// final delivery or the CloudFormation deadline answers FAILED
+	// AuthSecUnavailable. Delete and Update never reach here: they are
+	// answered SUCCESS without changes whatever the gate says, so a stack
+	// can always be deleted.
+	if state, reason, _ := s.gate().Status(); state != PolicyOn {
+		if state == PolicyOff {
+			return fail(EnfCodePolicyNotEnabled, "IGA_POLICY is off: "+reason)
+		}
+		return transient("policy gate not available: " + reason)
 	}
 
 	// 2. The binding, by the account and the ExternalId.

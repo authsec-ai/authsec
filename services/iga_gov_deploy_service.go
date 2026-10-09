@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -104,24 +105,35 @@ const (
 // the iga_* files because it reads the binding table).
 type GovBindingGate func(ctx context.Context, ws, connectorID uuid.UUID) error
 
-// GovTrailEvent is one CloudTrail event of the enforcement session.
-type GovTrailEvent struct {
-	EventTime time.Time
-	EventName string
-	ErrorCode string
-}
+// GovTrailEvent is one CloudTrail event of the enforcement session: the
+// operation, its target, and whether AWS applied it (awsenforce.TrailEvent).
+type GovTrailEvent = awsenforce.TrailEvent
+
+// GovTrailQuery selects the enforcement session's events of one operation in
+// a time window.
+type GovTrailQuery = awsenforce.TrailQuery
 
 // GovEnforcementTrail reads the CloudTrail events of one deployment's
-// enforcement session (authsec-enforce-<deployment 16hex>) for §8.1 step 2.
+// enforcement session (authsec-enforce-<deployment 16hex>) for §8.1 step 2:
+// cloudtrail:LookupEvents through the connector's DISCOVERY role (review
+// P1-7; production: AWSEnforcementAccess, which implements it). An error
+// means the trail could not be read -- never "no events".
 type GovEnforcementTrail interface {
-	EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, sessionName string, from, to time.Time) ([]GovTrailEvent, error)
+	EnforcementSessionEvents(ctx context.Context, ws, connectorID uuid.UUID, q GovTrailQuery) ([]GovTrailEvent, error)
 }
 
 // GovDeployEnv is what the deployment jobs need from outside the database.
 type GovDeployEnv struct {
 	AWS     IGAGovAWS
 	Binding GovBindingGate
-	Trail   GovEnforcementTrail
+	// BindingState is the cheap re-check of the binding run before EACH
+	// dispatch (review P1-8): a database read, no self-test. nil falls back
+	// to Binding. Production: NewEnforcementBindingDispatchCheck.
+	BindingState GovBindingGate
+	// Trail reads the enforcement session's CloudTrail events. nil: the AWS
+	// access's own (when it implements GovEnforcementTrail), else none --
+	// resolve_unknown then has no CloudTrail evidence (`unknown`).
+	Trail GovEnforcementTrail
 }
 
 var (
@@ -231,14 +243,23 @@ func (s *GovDeployments) WithAuthoring(a *GovAuthoring) *GovDeployments {
 
 func (s *GovDeployments) envNow() GovDeployEnv {
 	e := s.env
-	if e.AWS == nil && e.Binding == nil && e.Trail == nil {
+	if e.AWS == nil && e.Binding == nil && e.BindingState == nil && e.Trail == nil {
 		e = currentGovDeployEnv()
 	}
 	if e.Trail == nil {
-		e.Trail = ObservationEnforcementTrail{DB: s.db}
+		if t, ok := e.AWS.(GovEnforcementTrail); ok {
+			e.Trail = t
+		}
+	}
+	if e.BindingState == nil {
+		e.BindingState = e.Binding
 	}
 	return e
 }
+
+// AttemptLog is the service's write-ahead attempt log (tests tune its call
+// timeout).
+func (s *GovDeployments) AttemptLog() *IGAGovAttemptLog { return s.attempts }
 
 func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 	env := s.envNow()
@@ -246,6 +267,7 @@ func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 		return nil, errors.New("AWS enforcement access is not configured in this build")
 	}
 	e := NewIGAGovAWSExecutor(s.db, s.attempts, env.AWS).WithClock(s.now)
+	e.BindingCheck = env.BindingState
 	if s.Executor != nil {
 		s.Executor(e)
 	}
@@ -256,10 +278,16 @@ func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
 // handlers on w (replacing drift_check's no-op).
 func (s *GovDeployments) Register(w *PolicyJobWorker) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobDeploy, Handler: s.DeployHandler,
-		Backoff: func(n int) time.Duration { return time.Duration(n) * time.Minute }})
+		Backoff:     func(n int) time.Duration { return time.Duration(n) * time.Minute },
+		OnExhausted: s.onJobExhausted})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobVerify, Handler: s.VerifyHandler})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobDriftCheck, Handler: s.DriftHandler})
-	w.Register(PolicyJobKind{Kind: repositories.GovJobResolveUnknown, Handler: s.ResolveUnknownHandler})
+	w.Register(PolicyJobKind{Kind: repositories.GovJobResolveUnknown, Handler: s.ResolveUnknownHandler,
+		OnExhausted: s.onJobExhausted})
+	// Review P1-5: in-flight deployments with no open job are settled or
+	// re-enqueued (iga_gov_deploy_sweep.go).
+	w.AddSweeper(PolicyJobSweeper{Name: "stuck_deployments", Every: DeploySweepEvery,
+		Run: func(ctx context.Context, _ time.Time) error { _, err := s.SweepStuckDeployments(ctx); return err }})
 }
 
 /* ------------------------------- small reads ------------------------------- */
@@ -408,6 +436,12 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		// §2.4: no new deployment starts while paused; it stays queued.
 		return PolicyJobRetryLater(5*time.Minute, DepReasonPolicyPaused)
 	}
+	// §8.6: a paused rollout holds its queued deployments (fix/p3-roll).
+	if paused, err := RolloutPausedForDeployment(db, ws, d.ID); err != nil {
+		return err
+	} else if paused {
+		return govRolloutHold()
+	}
 	plan, err := s.loadPlanRow(db, ws, d.PlanID)
 	if err != nil {
 		return err
@@ -448,6 +482,9 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		if revID != nil {
 			set["revalidation_id"], set["revalidation_result"] = *revID, models.GovRevalidationUnchanged
 		}
+		if err := rolloutHoldsDeploymentTx(tx, *d); err != nil { // fix/p3-roll: paused meanwhile
+			return err
+		}
 		if err := setStateTx(tx, *d, []string{models.GovDeployQueued}, set); err != nil {
 			return err
 		}
@@ -456,6 +493,9 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 	})
 	if errors.Is(err, errStateMoved) {
 		return nil
+	}
+	if errors.Is(err, errGovRolloutPaused) {
+		return govRolloutHold()
 	}
 	if err != nil {
 		return err
@@ -481,21 +521,39 @@ func mustControlConnector(db *gorm.DB, ws, control uuid.UUID) uuid.UUID {
 // code (and message, detail) when the deployment may not proceed, or the
 // unchanged revalidation it relies on.
 //
-// DECISION (T3.16): apply deployments use T3.13's UsableApproval, and when
-// it answers revalidation_required the deploy job revalidates (fenced,
-// T3.11's revalidate) and asks again; material_change / revalidation_blocked
-// block the deployment with the changes. Undo, role-only recovery,
-// split_revert and remove_control are authorised by the approval naming the
-// plan's hash (§8.9: expiry and revocation do not disable undo; a
-// remove_control plan restores a recorded baseline and its precondition is
-// the artifact_state, so its safety is the live classification, not
-// evidence freshness, which T3.11 cannot recompile for that intent), or by
-// governance:emergency (emergency_by + reason, enforced by 051).
+// DECISION (T3.16, revised by fix/p3-appr P1-10 -- SPEC §2.8, §2.10, §8.4,
+// §8.9, §8.10, §11), by deployment kind:
+//
+//   - apply and split (FORWARD plans of a right-size or dedicated-identity
+//     version): T3.13's UsableApproval -- an approval in force, unexpired,
+//     the intent unchanged, the approver still an active member holding
+//     governance:approve who is not the author, the plan current and named
+//     -- and when it answers revalidation_required the deploy job
+//     revalidates (fenced, T3.11's revalidate; a dedicated-identity version
+//     is recompiled with CompileSplit) and asks again; material_change /
+//     revalidation_blocked block the deployment with the changes;
+//   - remove_control (a forward plan, §8.10 "an approval by someone other
+//     than the requester, like any version"): ApprovalInForce -- the same
+//     authority checks without evidence freshness: a removal restores a
+//     recorded baseline and is not recompiled, so its safety against a
+//     changed role is the live classification;
+//   - undo and split_revert (the INVERSE of an approved forward plan,
+//     including a role-only recovery plan): the approval naming the plan's
+//     hash. §8.9: "Approval expiry and revocation do not disable undo,
+//     because undo returns to the state that existed before that approval
+//     took effect" -- and for the same reason neither does the approver
+//     later losing governance:approve or membership. The requester's
+//     governance:enforce is checked by the undo route.
+//
+// Without an approval the deployment is an emergency (governance:emergency,
+// emergency_by + reason, enforced by 051).
 func (s *GovDeployments) authority(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, p models.IGAGovPlan) (string, string, map[string]any, *uuid.UUID, error) {
 	if d.ApprovalID == nil {
 		return "", "", nil, nil, nil // emergency: 051 iga_gov_pd_authority_chk
 	}
-	if d.Kind != igagov.PlanApply {
+	var ge *GovError
+	switch d.Kind {
+	case igagov.PlanUndo, igagov.PlanSplitRevert:
 		var ap models.IGAGovApproval
 		if err := run.DB().WithContext(ctx).Where("workspace_id = ? AND id = ?", d.WorkspaceID, *d.ApprovalID).Take(&ap).Error; err != nil {
 			return "", "", nil, nil, err
@@ -503,13 +561,25 @@ func (s *GovDeployments) authority(ctx context.Context, run *PolicyJobRun, d mod
 		if ap.Decision != "approve" || !containsStr(ap.PlanHashes, p.PlanHash) {
 			return GovCodeApprovalRequired, "The approval does not name this plan.", map[string]any{"approval_id": ap.ID, "plan_id": p.ID}, nil, nil
 		}
-		if d.Kind == igagov.PlanRemoveControl && (ap.RevokedAt != nil || !s.now().Before(ap.ExpiresAt)) {
-			return GovCodeApprovalExpired, "The approval of this control removal is no longer in force.", map[string]any{"approval_id": ap.ID}, nil, nil
+		return "", "", nil, nil, nil
+	case igagov.PlanRemoveControl:
+		ua, err := s.authoring.ApprovalInForce(ctx, d.WorkspaceID, d.VersionID, []uuid.UUID{d.PlanID})
+		if err != nil {
+			if errors.As(err, &ge) {
+				return ge.Code, ge.Message, ge.Detail, nil, nil
+			}
+			return "", "", nil, nil, err
+		}
+		if ua.Approval.ID != *d.ApprovalID {
+			return GovCodeApprovalInvalid, "The deployment names another approval than the one in force.",
+				map[string]any{"approval_id": ua.Approval.ID}, nil, nil
 		}
 		return "", "", nil, nil, nil
+	case igagov.PlanApply, igagov.PlanSplit:
+	default:
+		return GovCodeApprovalInvalid, "Unknown deployment kind " + d.Kind + ".", nil, nil, nil
 	}
 	ua, err := s.authoring.UsableApproval(ctx, d.WorkspaceID, d.VersionID, []uuid.UUID{d.PlanID})
-	var ge *GovError
 	if err != nil && errors.As(err, &ge) && ge.Code == GovCodeRevalidationNeeded {
 		call := func(ctx context.Context, fn func(ctx context.Context) error) error { return run.External(ctx, 0, fn) }
 		rv, rerr := s.authoring.revalidate(ctx, d.WorkspaceID, d.PlanID, call, run.InTx)

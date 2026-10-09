@@ -54,12 +54,22 @@ type Request struct {
 // not run (the dedicated-identity steps of §11 are IaC-only).
 var ErrUnresolvedOp = errors.New("awsenforce: the op cannot be sent as it is")
 
-// NewRequest resolves an op of a direct plan for one deployment: every
-// ${deployment_id} (igagov.DeploymentPlaceholder, D27) in a tag value becomes
-// the deployment id, and a DeletePolicyVersion names versionID. The
-// placeholder anywhere else is refused, as is a selector op without a
-// version, or a version for any other op.
-func NewRequest(op igagov.Op, deploymentID uuid.UUID, versionID string) (Request, error) {
+// ErrOpRoleMismatch: a role op names a role other than the control's (or a
+// policy op names a role at all). Terminal: the plan is never sent.
+var ErrOpRoleMismatch = errors.New("awsenforce: the op names a role other than the control's")
+
+// NewRequest resolves an op of a direct plan for one deployment of the
+// control whose role is controlRole (its role NAME, the last segment of the
+// control's role ARN): every ${deployment_id} (igagov.DeploymentPlaceholder,
+// D27) in a tag value becomes the deployment id, and a DeletePolicyVersion
+// names versionID. The placeholder anywhere else is refused, as is a
+// selector op without a version, or a version for any other op.
+//
+// A role op (PutRolePermissionsBoundary, DeleteRolePermissionsBoundary) must
+// name exactly controlRole, and a policy op must name no role: a stored plan
+// whose op would write another role's boundary is refused with
+// ErrOpRoleMismatch before anything is prepared or sent.
+func NewRequest(op igagov.Op, deploymentID uuid.UUID, versionID, controlRole string) (Request, error) {
 	switch op.Op {
 	case igagov.OpCreatePolicy, igagov.OpCreatePolicyVersion, igagov.OpDeletePolicyVersion, igagov.OpTagPolicy,
 		igagov.OpDeletePolicy, igagov.OpPutRolePermissionsBoundary, igagov.OpDeleteRolePermissionsBoundary:
@@ -68,6 +78,9 @@ func NewRequest(op igagov.Op, deploymentID uuid.UUID, versionID string) (Request
 	}
 	if op.RoleARN != "" {
 		return Request{}, fmt.Errorf("%w: %s names another role (%s); only the control's role is written directly", ErrUnresolvedOp, op.Op, op.RoleARN)
+	}
+	if err := CheckOpRole(op, controlRole); err != nil {
+		return Request{}, err
 	}
 	r := Request{Op: op.Op, RoleName: op.RoleName, PolicyARN: op.PolicyARN, PolicyName: op.PolicyName, Path: op.Path,
 		DocumentHash: op.DocumentHash, SetAsDefault: op.SetAsDefault}
@@ -96,6 +109,22 @@ func NewRequest(op igagov.Op, deploymentID uuid.UUID, versionID string) (Request
 		return Request{}, fmt.Errorf("%w: %s carries no document hash", ErrUnresolvedOp, r.Op)
 	}
 	return r, nil
+}
+
+// CheckOpRole is NewRequest's role rule on its own: a role op names exactly
+// controlRole (non-empty), any other op names no role.
+func CheckOpRole(op igagov.Op, controlRole string) error {
+	switch op.Op {
+	case igagov.OpPutRolePermissionsBoundary, igagov.OpDeleteRolePermissionsBoundary:
+		if controlRole == "" || op.RoleName != controlRole {
+			return fmt.Errorf("%w: %s names role %q, the control's role is %q", ErrOpRoleMismatch, op.Op, op.RoleName, controlRole)
+		}
+	default:
+		if op.RoleName != "" {
+			return fmt.Errorf("%w: %s is a policy op but names role %q", ErrOpRoleMismatch, op.Op, op.RoleName)
+		}
+	}
+	return nil
 }
 
 // needsDocument reports whether the request sends a policy document.

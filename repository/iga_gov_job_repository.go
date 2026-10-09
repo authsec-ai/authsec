@@ -23,9 +23,10 @@ var ErrPolicyJobLeaseLost = errors.New("policy job lease no longer held")
 // must have at least 60 s left or the worker stops before sending").
 var ErrPolicyJobLeaseShort = errors.New("policy job lease has too little time left")
 
-// Job kinds (052 iga_gov_job.kind CHECK). resolve_unknown (§8.1 step 2) is NOT
-// in 052's CHECK, so it cannot be enqueued until the DDL is widened (reported
-// by T3.08); the constant exists so the gap is named in one place.
+// Job kinds: exactly the values of 052's iga_gov_job.kind CHECK
+// (iga_gov_job_kind_check), resolve_unknown (§8.1 step 2) included.
+// tests/igagovschema TestGovJobKindsMatch052Check reads the CHECK from
+// pg_constraint and fails when the two lists differ.
 const (
 	GovJobEvaluateOwnerRules = "evaluate_owner_rules"
 	GovJobCompilePlans       = "compile_plans"
@@ -39,15 +40,14 @@ const (
 	GovJobIaCSync            = "iac_sync"
 	GovJobPruneEvidence      = "prune_evidence"
 	GovJobMetricsRollup      = "metrics_rollup"
-	// GovJobResolveUnknown is not accepted by 052's CHECK (see above).
-	GovJobResolveUnknown = "resolve_unknown"
+	GovJobResolveUnknown     = "resolve_unknown"
 )
 
-// GovJobKinds are the kinds 052 accepts.
+// GovJobKinds are the kinds 052 accepts (all of them).
 var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
-	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup,
+	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per
@@ -126,6 +126,9 @@ type IGAGovJobRepository interface {
 	// no attempts left: Claim no longer admits it, and without this it would
 	// read `running` forever.
 	FailExhausted(now time.Time) (int64, error)
+	// FailExhaustedJobs is FailExhausted returning the jobs it failed, so
+	// the worker can run each kind's exhaustion hook (review P1-5).
+	FailExhaustedJobs(now time.Time) ([]models.IGAGovJob, error)
 	// PruneFinished deletes complete and abandoned jobs that finished before
 	// the cutoff (periodic jobs leave one row per run). Failed jobs are kept.
 	PruneFinished(before time.Time) (int64, error)
@@ -342,13 +345,20 @@ func (r *igaGovJobRepository) Requeue(f PolicyJobFence, after time.Duration) err
 }
 
 func (r *igaGovJobRepository) FailExhausted(now time.Time) (int64, error) {
-	res := r.db.Exec(`
+	jobs, err := r.FailExhaustedJobs(now)
+	return int64(len(jobs)), err
+}
+
+func (r *igaGovJobRepository) FailExhaustedJobs(now time.Time) ([]models.IGAGovJob, error) {
+	var out []models.IGAGovJob
+	err := r.db.Raw(`
 		UPDATE iga_gov_job SET status = 'failed', completed_at = now(), lease_owner = '', lease_expires_at = NULL,
 		       last_error = CASE WHEN last_error = '' THEN 'lease expired with no attempts left'
 		                         ELSE last_error || ' (lease expired with no attempts left)' END
 		 WHERE status = 'running' AND attempts >= max_attempts
-		   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`, now)
-	return res.RowsAffected, res.Error
+		   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+		RETURNING *`, now).Scan(&out).Error
+	return out, err
 }
 
 func (r *igaGovJobRepository) PruneFinished(before time.Time) (int64, error) {

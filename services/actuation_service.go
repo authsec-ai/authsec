@@ -340,6 +340,14 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	// worker whose lease was reclaimed (it stalled, the reaper returned the work
 	// to the queue, another worker took it) could land a late outcome over the
 	// current holder's, or reopen an instruction already failed or superseded.
+	//
+	// One exception (review fix R1a P2, see recordLateSuccess): a SUCCESS that
+	// arrives after the reporter's lease was reclaimed -- the instruction is
+	// back in the queue and nobody holds it -- is recorded, not refused, so
+	// the work is not re-run.
+	if inst.Status == models.InstructionPending && in.Success && inst.Attempts > 0 {
+		return m.recordLateSuccess(&inst, in, "the lease was reclaimed and the instruction re-queued")
+	}
 	if inst.Status != models.InstructionLeased {
 		return nil, ErrInstructionLeaseNotHeld
 	}
@@ -391,7 +399,13 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 		return nil, res.Error
 	}
 	if res.RowsAffected == 0 {
-		return m.classifyRefusedReport(&inst)
+		out, err := m.classifyRefusedReport(&inst)
+		if errors.Is(err, ErrInstructionLeaseExpired) && in.Success {
+			// The holder's own lease ran out before its success arrived and
+			// the reaper has not run: nobody else holds it either.
+			return m.recordLateSuccess(&inst, in, "the lease expired before the report arrived")
+		}
+		return out, err
 	}
 
 	// Fold the outcome into the agent's state, so the console can distinguish "I
@@ -408,6 +422,79 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 
 	var out models.ProvisioningInstruction
 	if err := m.db.First(&out, "id = ?", instructionID).Error; err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// recordLateSuccess records a successful report that arrived after the
+// reporter's lease ended (review fix R1a P2, "a late successful agent report
+// gets a 409 and is re-queued instead of recorded").
+//
+// The work WAS done in the cluster: refusing the report re-queued the
+// instruction and a later lease applied it a second time. So a late SUCCESS
+// is recorded as applied, with a note in the result, exactly when nobody
+// else holds the instruction:
+//
+//   - pending (reclaimed by the reaper, not re-leased), attempts > 0 (it was
+//     leased at least once): the write is fenced on status = pending AND the
+//     attempts read, so a re-lease in between (which increments attempts)
+//     makes it match nothing and the report is refused as before -- the new
+//     holder's run is the one recorded;
+//   - leased by the same holder with the lease expired, not yet reaped:
+//     fenced on (leased, leased_by, attempts) as the normal write.
+//
+// Once applied, Lease never hands the instruction out again (it takes only
+// pending rows), so the work cannot be applied twice through the queue. A
+// late FAILURE is still refused (the instruction is already back in the
+// queue for a retry); a superseded, failed or re-leased instruction still
+// refuses any late report.
+func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstruction, in ReportInput,
+	why string) (*models.ProvisioningInstruction, error) {
+
+	result := map[string]interface{}{}
+	for k, v := range in.Result {
+		result[k] = v
+	}
+	result["authsec_late_report"] = fmt.Sprintf("recorded after the reporter's lease ended (%s; attempt %d): "+
+		"the agent reported success, so the instruction was not re-run", why, read.Attempts)
+	resultJSON, err := marshalDiscoveryConfig(result)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	q := m.db.Model(&models.ProvisioningInstruction{}).
+		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ?",
+			read.ID, read.DiscoverySourceID, read.Status, read.Attempts)
+	if read.Status == models.InstructionLeased {
+		q = q.Where("leased_by = ?", read.LeasedBy)
+	}
+	res := q.Updates(map[string]interface{}{
+		"status": models.InstructionApplied, "applied_at": now, "error": "",
+		"result": json.RawMessage(resultJSON), "lease_expires_at": nil, "leased_by": "", "updated_at": now,
+	})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		// Re-leased (or closed) meanwhile: the current holder's run counts.
+		var cur models.ProvisioningInstruction
+		if err := m.db.First(&cur, "id = ?", read.ID).Error; err != nil {
+			return nil, err
+		}
+		if cur.Status == models.InstructionApplied {
+			return &cur, nil
+		}
+		return nil, ErrInstructionLeaseNotHeld
+	}
+	if read.DiscoveredAgentID != nil {
+		if err := m.applyToAgent(read, in, now); err != nil {
+			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", read.ID).
+				Update("error", fmt.Sprintf("(could not update agent state: %v)", err)).Error
+		}
+	}
+	var out models.ProvisioningInstruction
+	if err := m.db.First(&out, "id = ?", read.ID).Error; err != nil {
 		return nil, err
 	}
 	return &out, nil

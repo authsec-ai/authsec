@@ -49,6 +49,8 @@ const (
 	GovCodeIaCPermissionMissing = "iac_permission_missing"
 	GovCodeIaCSourceInUse       = "iac_source_in_use"
 	GovCodeIaCUnavailable       = "iac_unavailable"
+	GovCodeIaCInstallUnverified = "iac_installation_unverified"
+	GovCodeIaCRepoNotSelected   = "iac_repository_not_selected"
 )
 
 // GovIaC event names.
@@ -255,6 +257,18 @@ func (s *GovIaCSourceService) Create(ctx context.Context, ws, connectorID, actor
 				map[string]any{"discovery_source_id": dsID})
 		}
 		return nil, err
+	}
+	// Review P2: the repository must be one the discovery source selects, and
+	// a bound integration must be bound to the source's installation.
+	if !ch.RepositorySelected(in.Repository) {
+		return nil, govUnprocessable(GovCodeIaCRepoNotSelected, "repository must be one of the GitHub discovery source's selected repositories.",
+			map[string]any{"repository": in.Repository, "discovery_source_id": dsID})
+	}
+	if integ, err := loadIaCIntegration(db, ws, ch.IntegrationID); err != nil {
+		return nil, err
+	} else if integ != nil && integ.InstallationID != nil && *integ.InstallationID != ch.InstallationID {
+		return nil, govConflict(GovCodeIaCInstallUnverified, "The discovery source's GitHub installation is not its integration's installation.",
+			map[string]any{"reason": "installation_mismatch", "integration_id": ch.IntegrationID, "discovery_source_id": dsID})
 	}
 	row := models.IGAGovIaCSource{ID: uuid.New(), WorkspaceID: ws, ConnectorID: connectorID, Format: in.Format,
 		DiscoverySourceID: dsID, Repository: in.Repository, BaseBranch: in.BaseBranch, Directory: dir, RoleMatch: rmRaw,

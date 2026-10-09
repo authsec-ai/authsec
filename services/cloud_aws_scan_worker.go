@@ -339,6 +339,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	// barrier, counted in its lease. Every AWS failure is a coverage fact on
 	// 056's rows, never a scan failure; only a lost fence stops the run (its
 	// publication would be refused anyway).
+	var rpRegions *models.ScanRegionScope
 	if pipeline && w.policyGate().Available() {
 		rp, rpErr := permissionScanner.CollectResourcePolicies(execCtx, run.WorkspaceID, run.ConnectorID, run.ID)
 		switch {
@@ -349,6 +350,8 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 		default:
 			log.Printf("aws resource-policy collection: run=%s: %d form/region rows, %d observations, %d documents, %d write errors",
 				run.ID, rp.FormsWritten, rp.Observations, rp.Documents, len(rp.WriteErrors))
+			regions := rp.Regions
+			rpRegions = &regions
 		}
 	}
 
@@ -367,6 +370,11 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	// every partition, and the graph would silently never close anything.
 	merged := scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
 		snapshot.CredentialReportSurface, permErr, permSurfaces, workloadErr, workloadSurfaces)
+	// The region scope the resource-policy evidence was collected under is
+	// frozen WITH the run (review P1-6): every reader of this run's evidence
+	// takes the enabled regions from here, never from the connector's live
+	// attrs, which a later PATCH can change.
+	merged.Regions = rpRegions
 
 	if err := w.runs.PublishWithCoverage(run.ID, w.owner, run.LeaseVersion, merged,
 		func(tx *gorm.DB, published *models.CloudScanRun) error {

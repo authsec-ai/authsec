@@ -220,9 +220,17 @@ func TestP3T306bA63Readiness(t *testing.T) {
 
 // p3eCompleteCoverage writes complete resource-policy coverage for every
 // collected form in the account's regions for a run (what T3.03b's
-// collector will write; not collected by this branch).
+// collector will write; not collected by this branch), and freezes the
+// run's region scope as the collector does (us-east-1 selected and the only
+// enabled region; review P1-6). TestP3CovUnselectedRegions* drive the real
+// collector instead.
 func p3eCompleteCoverage(t *testing.T, l *p3eLab, a *p2Account, run uuid.UUID) {
 	t.Helper()
+	if err := l.db.Exec(`UPDATE cloud_scan_run SET coverage = jsonb_set(coverage, '{regions}',
+	                       '{"selected":["us-east-1"],"enabled":["us-east-1"],"enabled_known":true}'::jsonb, true)
+	                     WHERE workspace_id = ? AND id = ?`, l.ws, run).Error; err != nil {
+		t.Fatalf("region scope: %v", err)
+	}
 	for _, f := range igagov.AllForms() {
 		if f.State != igagov.FormCollected {
 			continue

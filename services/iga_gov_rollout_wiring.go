@@ -29,8 +29,11 @@ type govDeploymentRolloutFacts struct{ db *gorm.DB }
 
 // DeploymentGateFacts implements RolloutDeploymentFacts. Another
 // workspace's deployment is T3.16's 404 GovError, passed through.
-func (f govDeploymentRolloutFacts) DeploymentGateFacts(ctx context.Context, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
-	d, err := NewGovDeployments(f.db, nil).DeploymentGateFacts(ctx, ws, deploymentID)
+func (f govDeploymentRolloutFacts) DeploymentGateFacts(ctx context.Context, db *gorm.DB, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
+	if db == nil {
+		db = f.db
+	}
+	d, err := NewGovDeployments(db, nil).DeploymentGateFacts(ctx, ws, deploymentID)
 	if err != nil {
 		return nil, err
 	}
