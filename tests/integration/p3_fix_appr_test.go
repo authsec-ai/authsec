@@ -831,3 +831,17 @@ func TestP3FixApprSplitAuthorityAndRevalidation(t *testing.T) {
 		t.Fatal("an unchanged revalidation superseded the approved split")
 	}
 }
+
+// p3rClean builds a clean canary window for roleID: one successful
+// management event per retained service an hour after `at`, and a trail read
+// covering the window. (It lived in p3_rollout_test.go until fix/p3-roll moved
+// the rollout tests onto stored CloudTrail; these approval tests still feed
+// the facts directly.)
+func p3rClean(roleID string, at time.Time, retained ...string) ([]igagov.TrailEvent, []igagov.TrailRead) {
+	var evs []igagov.TrailEvent
+	for _, s := range retained {
+		evs = append(evs, igagov.TrailEvent{EventTime: at.Add(time.Hour), PrincipalID: roleID, SessionName: "workload",
+			EventSource: s + ".amazonaws.com", EventName: "DescribeP3a"})
+	}
+	return evs, []igagov.TrailRead{{From: at.Add(-time.Hour), To: time.Now().Add(time.Hour)}}
+}

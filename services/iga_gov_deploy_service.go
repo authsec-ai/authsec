@@ -436,6 +436,12 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		// §2.4: no new deployment starts while paused; it stays queued.
 		return PolicyJobRetryLater(5*time.Minute, DepReasonPolicyPaused)
 	}
+	// §8.6: a paused rollout holds its queued deployments (fix/p3-roll).
+	if paused, err := RolloutPausedForDeployment(db, ws, d.ID); err != nil {
+		return err
+	} else if paused {
+		return govRolloutHold()
+	}
 	plan, err := s.loadPlanRow(db, ws, d.PlanID)
 	if err != nil {
 		return err
@@ -476,6 +482,9 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		if revID != nil {
 			set["revalidation_id"], set["revalidation_result"] = *revID, models.GovRevalidationUnchanged
 		}
+		if err := rolloutHoldsDeploymentTx(tx, *d); err != nil { // fix/p3-roll: paused meanwhile
+			return err
+		}
 		if err := setStateTx(tx, *d, []string{models.GovDeployQueued}, set); err != nil {
 			return err
 		}
@@ -484,6 +493,9 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 	})
 	if errors.Is(err, errStateMoved) {
 		return nil
+	}
+	if errors.Is(err, errGovRolloutPaused) {
+		return govRolloutHold()
 	}
 	if err != nil {
 		return err

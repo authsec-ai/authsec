@@ -9468,6 +9468,10 @@ ALTER TABLE ONLY public.iga_gov_rollout
 ALTER TABLE ONLY public.iga_gov_rollout
     ADD CONSTRAINT iga_gov_rollout_workspace_id_id_key UNIQUE (workspace_id, id);
 
+-- 058_roll_gate_acceptance.sql: the key an acceptance's rollout-and-version FK needs.
+ALTER TABLE ONLY public.iga_gov_rollout
+    ADD CONSTRAINT iga_gov_rollout_workspace_id_id_version_id_key UNIQUE (workspace_id, id, version_id);
+
 ALTER TABLE ONLY public.iga_gov_service_outcome
     ADD CONSTRAINT iga_gov_service_outcome_pkey PRIMARY KEY (workspace_id, deployment_id, service);
 
@@ -9503,6 +9507,9 @@ ALTER TABLE ONLY public.iga_gov_workload_migration
 
 CREATE UNIQUE INDEX uq_iga_gov_acceptance_item ON public.iga_gov_acceptance USING btree (approval_id, plan_id, kind, item_key) WHERE (approval_id IS NOT NULL);
 
+-- 058_roll_gate_acceptance.sql: one gate_not_available acceptance per (rollout, gate, window).
+CREATE UNIQUE INDEX uq_iga_gov_acceptance_gate ON public.iga_gov_acceptance USING btree (rollout_id, item_key, window_start, window_end) WHERE (kind = 'gate_not_available'::text);
+
 CREATE UNIQUE INDEX uq_iga_gov_artifact_live ON public.iga_gov_artifact USING btree (control_id, kind) WHERE (state = ANY (ARRAY['intended'::text, 'present'::text, 'drifted'::text]));
 
 CREATE UNIQUE INDEX uq_iga_gov_attempt_open ON public.iga_gov_attempt USING btree (deployment_id) WHERE ((status = ANY (ARRAY['prepared'::text, 'dispatched'::text])) OR ((status = 'unknown'::text) AND (resolved_as IS NULL)));
@@ -9534,6 +9541,10 @@ ALTER TABLE ONLY public.iga_gov_acceptance
 
 ALTER TABLE ONLY public.iga_gov_acceptance
     ADD CONSTRAINT iga_gov_acceptance_workspace_id_rollout_id_fkey FOREIGN KEY (workspace_id, rollout_id) REFERENCES public.iga_gov_rollout(workspace_id, id);
+
+-- 058_roll_gate_acceptance.sql: an acceptance of a rollout's gate names that rollout's version.
+ALTER TABLE ONLY public.iga_gov_acceptance
+    ADD CONSTRAINT iga_gov_acceptance_rollout_version_fkey FOREIGN KEY (workspace_id, rollout_id, version_id) REFERENCES public.iga_gov_rollout(workspace_id, id, version_id);
 
 ALTER TABLE ONLY public.iga_gov_artifact
     ADD CONSTRAINT iga_gov_artifact_workspace_id_control_id_fkey FOREIGN KEY (workspace_id, control_id) REFERENCES public.iga_gov_control(workspace_id, id);

@@ -13,7 +13,6 @@ import (
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
-	repositories "github.com/authsec-ai/authsec/repository"
 )
 
 // Verification (SPEC-iga-phase3-policy.md §8.7; T3.16). The verify job
@@ -134,20 +133,29 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 	if err != nil {
 		return err
 	}
-	hours := s.canaryHours(db, ws)
-	if cur.State == models.GovDeployAppliedUnverified ||
-		(cur.State == models.GovDeployVerified && now.Before(cur.AppliedAt.Add(time.Duration(hours)*time.Hour))) {
+	if cur.State == models.GovDeployAppliedUnverified {
 		return PolicyJobRetryLater(DefaultVerifyEvery, "verification continues")
+	}
+	if cur.State == models.GovDeployVerified { // fix/p3-roll: until window_elapsed can be decided (§8.6)
+		open, err := govCanaryWindowUndecided(db, ws, ctl.ConnectorID, cur.AppliedAt.UTC(), s.canaryHours(db, *d), now, cr)
+		if err != nil {
+			return err
+		}
+		if open {
+			return PolicyJobRetryLater(DefaultVerifyEvery, "verification continues")
+		}
 	}
 	return nil
 }
 
-func (s *GovDeployments) canaryHours(db *gorm.DB, ws uuid.UUID) int {
-	st, err := repositories.NewIGAGovSettingsRepository(db).Get(ws)
-	if err != nil || st == nil || st.CanaryHours <= 0 {
+// canaryHours is the deployment version's canary length: GovCanaryHours,
+// the same function the rollout's gates use (fix/p3-roll).
+func (s *GovDeployments) canaryHours(db *gorm.DB, d models.IGAGovDeployment) int {
+	h, err := GovCanaryHours(db, d.WorkspaceID, d.VersionID)
+	if err != nil || h <= 0 {
 		return 48
 	}
-	return st.CanaryHours
+	return h
 }
 
 func upsertVerificationTx(tx *gorm.DB, d models.IGAGovDeployment, dim, outcome, attribution string, evidence any) error {
@@ -295,7 +303,7 @@ func (s *GovDeployments) graphDimension(db *gorm.DB, d models.IGAGovDeployment, 
 // cloudtrail-events surface: [scan start - 48 h, scan start], capped when
 // that surface is partial or counted >= 10,000 events.
 func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov.Plan, ctl models.IGAGovControl, now time.Time, artifact string, published bool) (igagov.CanaryResult, error) {
-	in := igagov.CanaryInput{RoleID: ctl.RoleID, AppliedAt: d.AppliedAt.UTC(), Now: now, CanaryHours: s.canaryHours(db, d.WorkspaceID),
+	in := igagov.CanaryInput{RoleID: ctl.RoleID, AppliedAt: d.AppliedAt.UTC(), Now: now, CanaryHours: s.canaryHours(db, d),
 		PublishedAfterApply: published, ArtifactOutcome: artifact}
 	in.RemovesServices = d.Kind == igagov.PlanApply && p.DesiredAttachment == igagov.AttachmentPresent && len(p.Impact.Removed) > 0
 	for _, r := range p.Impact.Removed {

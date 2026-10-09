@@ -284,6 +284,12 @@ func sameGateOutcomes(a *GovRolloutCanary, b GovRolloutCanary) bool {
 	return true
 }
 
+// tickCanary evaluates the canary's gates and acts on them. The gates are
+// read inside the job's transaction with the canary's facts locked
+// (DECISION R13); the first read outside it only decides whether the other
+// targets' approvals are prepared (prepare may read AWS and commits on its
+// own), so a canary that turns healthy between the two reads advances at the
+// next tick instead.
 func (r *GovRollout) tickCanary(ctx context.Context, run *PolicyJobRun, rc *govRolloutCtx, rev int64) error {
 	ws := rc.Version.WorkspaceID
 	g := rolloutResults(rc.Rollout)
@@ -291,7 +297,7 @@ func (r *GovRollout) tickCanary(ctx context.Context, run *PolicyJobRun, rc *govR
 		return nil
 	}
 	depID := g.Canary.DeploymentID
-	ev, err := r.evaluateGates(ctx, run.DB().WithContext(ctx), ws, rc, depID, rev)
+	pre, err := r.evaluateGates(ctx, run.DB().WithContext(ctx), ws, rc, depID, rev)
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) && ge.Status == http.StatusNotFound {
@@ -301,8 +307,8 @@ func (r *GovRollout) tickCanary(ctx context.Context, run *PolicyJobRun, rc *govR
 	}
 	preps := map[uuid.UUID]*govPrepared{}
 	refused := map[uuid.UUID]GovRolloutRefusal{}
-	advance := ev.facts.AppliedAt != nil && !ev.result.Pause && ev.passes(nil) && healthyState(ev.facts.State)
-	if advance && len(rc.Targets) > 1 {
+	prepared := len(rc.Targets) <= 1
+	if canaryHealthy(pre, nil) && len(rc.Targets) > 1 {
 		ct, err := rc.canary()
 		if err != nil {
 			return err
@@ -322,10 +328,26 @@ func (r *GovRollout) tickCanary(ctx context.Context, run *PolicyJobRun, rc *govR
 			}
 			preps[t.Target.ID] = p
 		}
+		prepared = true
 	}
 	return r.locked(ctx, run, rc, models.GovRolloutCanary, func(tx *gorm.DB, rc *govRolloutCtx) error {
 		ro := rc.Rollout
 		gg := rolloutResults(ro)
+		if gg.Canary == nil || gg.Canary.DeploymentID != depID {
+			return nil
+		}
+		if err := lockCanaryFactsTx(tx, ws, depID); err != nil {
+			return err
+		}
+		ev, err := r.evaluateGates(ctx, tx, ws, rc, depID, rev)
+		if err != nil {
+			return err
+		}
+		// One canary-health rule with the manual expand; a single target
+		// completes only once verified (advanceTx), so until then it is not
+		// advanced here and its gates are recorded below.
+		advance := prepared && canaryHealthy(ev, nil) &&
+			(len(rc.Targets) > 1 || ev.facts.State == models.GovDeployVerified)
 		changed := !sameGateOutcomes(gg.Canary, ev.canary)
 		gg.Canary = &ev.canary
 		if ev.facts.AppliedAt != nil {

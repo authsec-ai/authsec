@@ -1069,7 +1069,7 @@ func arnPartition(arn string) string {
 }
 
 // insertVersionTx inserts version no with its targets (one per control;
-// the canary is the intent's canary target, else the first) and points the
+// the canary is the intent's canary target, else defaultCanaryTx's) and points the
 // policy's current version at it.
 func (a *GovAuthoring) insertVersionTx(tx *gorm.DB, ws, policyID, actor uuid.UUID, no int, intent *igagov.RightSizeIntent,
 	canon []byte, hash string, controls []models.IGAGovControl) (*models.IGAGovPolicyVersion, []models.IGAGovTarget, error) {
@@ -1092,8 +1092,13 @@ func (a *GovAuthoring) insertVersionTx(tx *gorm.DB, ws, policyID, actor uuid.UUI
 		canary = intent.Rollout.CanaryTarget
 	}
 	sort.Slice(controls, func(i, j int) bool { return controls[i].RoleID < controls[j].RoleID })
-	if canary == "" && len(controls) > 0 {
-		canary = controls[0].RoleID
+	if canary == "" {
+		// fix/p3-roll: never default to a role that can never be the canary.
+		c, err := defaultCanaryTx(tx, ws, controls)
+		if err != nil {
+			return nil, nil, err
+		}
+		canary = c
 	}
 	var targets []models.IGAGovTarget
 	for _, c := range controls {
@@ -1925,7 +1930,8 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 		}
 	}
 	if len(in.Subjects) > 0 {
-		in.Rollout = &igagov.RolloutIntent{CanaryTarget: in.Subjects[0].RoleID}
+		// fix/p3-roll: the default canary skips a role that can never be one.
+		in.Rollout = &igagov.RolloutIntent{CanaryTarget: defaultCanarySubject(a.db, ws, in.Subjects)}
 		if h := settings.CanaryHours; h >= igagov.MinCanaryHours && h <= igagov.MaxCanaryHours {
 			in.Rollout.CanaryHours = h
 		}
