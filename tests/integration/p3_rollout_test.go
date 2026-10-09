@@ -1130,8 +1130,9 @@ func TestP3T315CanaryChoiceSharedRole(t *testing.T) {
 // Mutation-checked: the default canary's admin-level skip.
 func TestP3T315DefaultCanarySkipsAdminRole(t *testing.T) {
 	l := newP3rLab(t, "p3-t315-admin", true)
-	ids := []string{"AROAADMINROLE01", "AROAPLAINROLE01"} // the admin role sorts first
-	l.role("AdminRoleX", ids[0], map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil}) // names of distinct lengths
+	// The admin role sorts first; role names of distinct lengths.
+	ids := []string{"AROAADMINROLE01", "AROAPLAINROLE01"}
+	l.role("AdminRoleX", ids[0], map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
 	l.role("PlainRole", ids[1], map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
 	adm := l.a.managed("AdminIAM", `{"Version":"2012-10-17","Statement":[{"Sid":"Admin","Effect":"Allow","Action":"iam:*","Resource":"*"}]}`)
 	l.a.attach("AdminRoleX", adm)
