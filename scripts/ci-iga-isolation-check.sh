@@ -127,6 +127,16 @@ WRITE_ALLOWED=(
   "services/k8s_rbac_service.go:discovery_sources"
 )
 
+# Files that name an iga_* table but are NOT IGA code, so rule 2 (scope by
+# content) must not pull them in. Keep this to purges of a whole workspace.
+NOT_IGA=(
+  # The workspace purge (DeleteTenant): it deletes EVERY table of a
+  # workspace -- auth, RBAC and IGA alike -- in one transaction, by design.
+  # It names iga_lifecycle_event only to delete it before workspaces, around
+  # 036's RESTRICT FK (D-94). Review fix P0-1.
+  "database/workspace_repository.go"
+)
+
 echo "== IGA isolation =="
 
 fail=0
@@ -177,7 +187,8 @@ IGA_FILES="$(
     # perl pass with comments stripped.
     grep -rlE --include='*.go' --exclude-dir=.git --exclude-dir=vendor --exclude-dir=node_modules \
         'iga_[a-z0-9_]+' . 2>/dev/null | sed 's|^\./||' | perl -e "$SQLSCAN" names
-  } | grep -v '_test\.go$' | sort -u
+  } | grep -v '_test\.go$' | sort -u | grep -vxF -f <(printf '%s
+' "${NOT_IGA[@]}")
 )"
 FILE_COUNT=$(printf '%s\n' "$IGA_FILES" | grep -c . || true)
 echo "scanning ${FILE_COUNT} IGA source files (by package, content and name)"
