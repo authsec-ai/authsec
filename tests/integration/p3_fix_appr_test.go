@@ -36,9 +36,6 @@ import (
 	"gorm.io/gorm"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
-	"github.com/authsec-ai/authsec/internal/awsdiscovery"
-	"github.com/authsec-ai/authsec/internal/awsenforce"
-	"github.com/authsec-ai/authsec/internal/awsenforce/enforcetest"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
@@ -48,52 +45,26 @@ import (
 	"github.com/authsec-ai/authsec/services"
 )
 
-/* ------------------------------ fake account ------------------------------ */
-
-// fxaAWS is the deploy job's and the live reader's AWS access over one fake
-// account: the discovery role's reads and the enforcement role's writes see
-// the same roles and policies.
-type fxaAWS struct{ f *enforcetest.FakeAWS }
-
-func (a fxaAWS) DiscoveryIAM(context.Context, uuid.UUID, uuid.UUID) (awsenforce.DiscoveryIAM, error) {
-	return a.f.Discovery(), nil
-}
-
-func (a fxaAWS) EnforcementIAM(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (awsenforce.IAM, error) {
-	return a.f, nil
-}
-
 /* ---------------------------------- lab ----------------------------------- */
 
-// fxaLab is the T3.15 rollout lab (real scan, projection, evaluation and
-// rollout jobs, production routes) with the REAL T3.16 deployment jobs and
-// the compile_plans job on the same worker, the real T3.12 owner review
-// wiring, and every live read and write against one fake AWS account.
+// fxaLab is the T3.15 rollout lab (p3rLab: real scan, projection,
+// evaluation and rollout jobs, production routes, the REAL T3.16 deployment
+// jobs on the same worker over its enforcetest fake account, read by the
+// production GovAWSLiveReader; CloudTrail stored by the real scan worker)
+// plus the compile_plans job on that worker and the real T3.12 owner review
+// wiring.
 type fxaLab struct {
 	*p3rLab
-	fake *enforcetest.FakeAWS
-	dep  *services.GovDeployments
 }
 
 func newFxaLab(t *testing.T, name string) *fxaLab {
 	t.Helper()
 	l := &fxaLab{p3rLab: newP3rLab(t, name, true)}
-	f, err := enforcetest.NewFakeAWSFromTemplate(awsdiscovery.EnforcementCloudFormationTemplate, accountA, "fxa", "fxa-external-id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l.fake = f
-	acc := fxaAWS{f: f}
-	// Compile (propose, compile_plans, revalidation, rollout) reads through
-	// the production reader over the fake account.
-	l.live.delegate = services.NewGovAWSLiveReader(acc)
-	// No CloudTrail (the P1-7 fix removed the dTrail stub): these approval
-	// tests never resolve an unknown outcome.
-	env := services.GovDeployEnv{AWS: acc}
-	l.dep = services.NewGovDeployments(l.db, &env).WithAuthoring(services.NewGovAuthoring(l.db, l.live)).WithSleep(noSleep)
-	l.dep.Executor = func(e *services.IGAGovAWSExecutor) { e.WithSleep(noSleep) }
-	l.dep.Register(l.worker)
-	l.worker.Register(services.PolicyJobKind{Kind: repositories.GovJobCompilePlans, Handler: l.authoring().CompilePlansHandler})
+	// Every compile (proposal, compile_plans, revalidation) reads the fake
+	// account the deploy job writes to.
+	l.live.delegate = l.reader
+	l.worker.Register(services.PolicyJobKind{Kind: repositories.GovJobCompilePlans,
+		Handler: services.NewGovAuthoring(l.db, l.reader).CompilePlansHandler})
 	// The real owner review behind the authoring hooks (OwnerGate,
 	// OnImpactChanged reopening the review for new owners).
 	t.Cleanup(services.InstallGovOwnerReviewWiring(l.db))
@@ -113,63 +84,6 @@ func newFxaLab(t *testing.T, name string) *fxaLab {
 		})
 	})
 	return l
-}
-
-// role adds the role to the evaluation lab (scan side) AND to the fake
-// account (same name, RoleId, ARN and permissions policy).
-func (l *fxaLab) role(name, roleID string, report map[string]*time.Time) string {
-	l.t.Helper()
-	arn := l.p3rLab.role(name, roleID, report)
-	var svcs []string
-	for s := range report {
-		svcs = append(svcs, s)
-	}
-	sortStrings(svcs)
-	r := l.fake.AddRole(name, "/", nil)
-	r.RoleID = roleID
-	pol := l.fake.AddPolicy("/", name+"Work", nil, p3aDoc(svcs...))
-	l.fake.AttachPermissions(name, pol.ARN)
-	if pol.ARN != l.a.policyARN(name+"Work") || l.fake.RoleARNOf(r) != arn {
-		l.t.Fatalf("fake account and scan disagree: %s / %s, %s / %s", pol.ARN, l.a.policyARN(name+"Work"), l.fake.RoleARNOf(r), arn)
-	}
-	return arn
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
-}
-
-// mirrorBoundary makes the next scan see the boundary the deploy job
-// installed on a role (the policy, its default version and the role's
-// PermissionsBoundary), as AWS would.
-func (l *fxaLab) mirrorBoundary(roleName, arn string) {
-	l.t.Helper()
-	_, def, doc, _, ok := l.fake.PolicyState(arn)
-	if !ok {
-		l.t.Fatalf("no policy %s in the fake account", arn)
-	}
-	l.a.iam.managedPolicies[arn] = doc
-	l.a.iam.policyVersions[arn] = def
-	l.a.iam.policyIDs[arn] = "ANPAFXABOUNDARY" + strings.ToUpper(roleName[:3])
-	p3eTag(l.a, roleName, nil, arn)
-}
-
-// runVerifyNow makes the queued verify jobs claimable now.
-func (l *fxaLab) runVerifyNow() {
-	p3exec(l.t, l.db, `UPDATE iga_gov_job SET run_after = now() - interval '1 second' WHERE workspace_id = ? AND kind = 'verify' AND status = 'queued'`, l.ws)
-}
-
-func (l *fxaLab) depRow(id uuid.UUID) models.IGAGovDeployment {
-	l.t.Helper()
-	var d models.IGAGovDeployment
-	if err := l.db.First(&d, "id = ?", id).Error; err != nil {
-		l.t.Fatal(err)
-	}
-	return d
 }
 
 // planOfRole is the current (or, with superseded, any) apply plan of the
@@ -201,6 +115,29 @@ type fxaA59 struct {
 	approval            models.IGAGovApproval
 	canaryPlan          models.IGAGovPlan
 	otherPlan           models.IGAGovPlan
+	at                  time.Time // the canary's applied_at
+	canaryARN           string
+}
+
+// retained are the version's retained services (one intent: its retain
+// list is the union over the targets), each needing canary traffic.
+func (x *fxaA59) retained() []string { return []string{"s3", "dynamodb", "sns"} }
+
+// elapseCanary lets the canary window (canary_hours 1) elapse on the lab
+// clock: a scan after the window end covers it and the verify job computes
+// the gates; then the clock returns to the worker's time (the executor
+// fences AWS calls against the job lease, taken on real time).
+func (x *fxaA59) elapseCanary() {
+	l := x.l
+	// Clean canary traffic on every retained service, stored by the scan
+	// from CloudTrail.
+	for _, svc := range x.retained() {
+		l.trail.add(p3rEvent(x.canaryARN, x.canaryRole, "workload", svc, "ListP3r", x.at.Add(5*time.Minute), ""))
+	}
+	l.advance(2 * time.Hour)
+	l.scan()
+	l.drain()
+	l.advance(-2 * time.Hour)
 }
 
 // fxaToVerifiedCanary is A59's start through the real jobs: two roles,
@@ -237,10 +174,7 @@ func fxaToVerifiedCanary(t *testing.T, name string) *fxaA59 {
 	}
 
 	// The REAL deploy job applies the canary in the fake account.
-	l.drain()
-	if d := l.depRow(x.canary); d.State != models.GovDeployAppliedUnverified {
-		t.Fatalf("canary after the deploy job: %s %q", d.State, d.StateReason)
-	}
+	at := l.applied(x.canary)
 	arn := igagov.AuthSecBoundaryARN("aws", accountA, x.canaryRole)
 	if l.fake.BoundaryOf(x.canaryName) != arn {
 		t.Fatalf("the canary role's boundary is %q, want %q", l.fake.BoundaryOf(x.canaryName), arn)
@@ -250,12 +184,13 @@ func fxaToVerifiedCanary(t *testing.T, name string) *fxaA59 {
 	x.canaryPlan, x.otherPlan = cp[len(cp)-1], op[len(op)-1]
 
 	// A publication showing the boundary: the evaluation queues
-	// compile_plans for the approved version; the verify job verifies.
-	l.mirrorBoundary(x.canaryName, arn)
-	l.publish()
-	l.runVerifyNow()
+	// compile_plans for the approved version; the verify job verifies
+	// (artifact + graph).
+	x.at, x.canaryARN = at, arns[x.canaryName]
+	l.mirror(x.canaryRole)
+	l.scan()
 	l.drain()
-	if d := l.depRow(x.canary); d.State != models.GovDeployVerified {
+	if d := l.deployment(x.canary); d.State != models.GovDeployVerified {
 		var dims []struct{ Dimension, Outcome string }
 		l.db.Raw(`SELECT dimension, outcome FROM iga_gov_verification WHERE deployment_id = ?`, x.canary).Scan(&dims)
 		t.Fatalf("canary after the publication: %s %q %+v", d.State, d.StateReason, dims)
@@ -303,7 +238,7 @@ func TestP3FixApprA59RescanAfterCanaryKeepsApproval(t *testing.T) {
 	}
 
 	// Another rescan between canary and expansion.
-	l.publish()
+	l.scan()
 	l.drain()
 	x.assertApprovalUntouched(t, "after a second rescan")
 	rvs = l.revalidations(x.otherPlan.ID)
@@ -320,12 +255,11 @@ func TestP3FixApprA59RescanAfterCanaryKeepsApproval(t *testing.T) {
 		t.Fatalf("%d approval_revoked events", n)
 	}
 
-	// Expansion: the canary window elapsed with clean traffic; the gates
-	// pass and the rollout expands to the other target.
-	p3exec(t, l.db, `UPDATE iga_gov_deployment SET applied_at = applied_at - interval '50 hours' WHERE id = ?`, x.canary)
-	at := *l.depRow(x.canary).AppliedAt
-	evs, reads := p3rClean(x.canaryRole, at, "s3", "dynamodb", "sns")
-	l.trail.set(x.canary, evs, reads)
+	// Expansion: the canary window elapses with clean traffic (one more
+	// rescan, its compile_plans again unchanged for the other target); the
+	// gates pass and the rollout expands to the other target.
+	x.elapseCanary()
+	x.assertApprovalUntouched(t, "after the window's rescan")
 	l.tick()
 	v := l.rollout(x.policy)
 	if p3rStage(v) != models.GovRolloutExpand {
@@ -336,8 +270,13 @@ func TestP3FixApprA59RescanAfterCanaryKeepsApproval(t *testing.T) {
 	if len(created) != 1 {
 		t.Fatalf("expansion %v", dig(v, "results", "expansion"))
 	}
-	second := l.depRow(uuid.MustParse(created[0].(string)))
+	second := l.deployment(uuid.MustParse(created[0].(string)))
 	rvs = l.revalidations(x.otherPlan.ID)
+	for _, rv := range rvs {
+		if rv.Result != models.GovRevalidationUnchanged {
+			t.Fatalf("the not-yet-deployed target's revalidations: %+v", rvs)
+		}
+	}
 	if second.PlanID != x.otherPlan.ID || second.ApprovalID == nil || *second.ApprovalID != x.approval.ID ||
 		second.RevalidationID == nil || *second.RevalidationID != rvs[len(rvs)-1].ID ||
 		second.RevalidationResult == nil || *second.RevalidationResult != models.GovRevalidationUnchanged {
@@ -363,9 +302,7 @@ func TestP3FixApprA59MaterialChangeSparesDeployedTarget(t *testing.T) {
 
 	newOwner := l.member("new-owner", "read")
 	p3eAddLambda(l.a, "us-east-1", "bravo-batch-fn", x.otherARN)
-	run := l.scanOnly(l.a)
-	p3eCompleteCoverage(t, l.p3eLab, l.a, run.ID)
-	l.projectOnly()
+	l.scan() // scan + projection with evaluation: compile_plans queued
 	l.owner(models.GovObjectWorkload, l.workloadID("bravo-batch-fn"), newOwner.user)
 	l.drain()
 
@@ -384,7 +321,7 @@ func TestP3FixApprA59MaterialChangeSparesDeployedTarget(t *testing.T) {
 	if cp[len(cp)-1].ID != x.canaryPlan.ID || cp[len(cp)-1].SupersededAt != nil || len(l.revalidations(x.canaryPlan.ID)) != 0 {
 		t.Fatalf("the deployed canary's plan was touched: %d plans, superseded %v", len(cp), cp[len(cp)-1].SupersededAt)
 	}
-	if d := l.depRow(x.canary); d.State != models.GovDeployVerified {
+	if d := l.deployment(x.canary); d.State != models.GovDeployVerified {
 		t.Fatalf("canary %s", d.State)
 	}
 	op := l.applyPlans(x.policy, x.other)
@@ -399,12 +336,16 @@ func TestP3FixApprA59MaterialChangeSparesDeployedTarget(t *testing.T) {
 		t.Fatal("the new owner was not asked")
 	}
 
-	// No expansion without a new approval.
-	p3exec(t, l.db, `UPDATE iga_gov_deployment SET applied_at = applied_at - interval '50 hours' WHERE id = ?`, x.canary)
-	at := *l.depRow(x.canary).AppliedAt
-	evs, reads := p3rClean(x.canaryRole, at, "s3", "dynamodb", "sns")
-	l.trail.set(x.canary, evs, reads)
+	// No expansion without a new approval: the canary window elapses, the
+	// gates pass, and the expansion refuses the changed target.
+	x.elapseCanary()
 	l.tick()
+	// The window's rescan recompiled the in-review version: the changed
+	// target again (current plan re-read), never the deployed canary.
+	op = l.applyPlans(x.policy, x.other)
+	if cp := l.applyPlans(x.policy, x.canaryRole); cp[len(cp)-1].ID != x.canaryPlan.ID || cp[len(cp)-1].SupersededAt != nil {
+		t.Fatal("the in-review recompile touched the deployed canary's plan")
+	}
 	if n := l.count(`SELECT count(*) FROM iga_gov_deployment WHERE workspace_id = ? AND control_id = ?`, l.ws, op[len(op)-1].ControlID); n != 0 {
 		t.Fatalf("%d deployments of the changed target without a new approval", n)
 	}
@@ -830,18 +771,4 @@ func TestP3FixApprSplitAuthorityAndRevalidation(t *testing.T) {
 	if cur.SupersededAt != nil {
 		t.Fatal("an unchanged revalidation superseded the approved split")
 	}
-}
-
-// p3rClean builds a clean canary window for roleID: one successful
-// management event per retained service an hour after `at`, and a trail read
-// covering the window. (It lived in p3_rollout_test.go until fix/p3-roll moved
-// the rollout tests onto stored CloudTrail; these approval tests still feed
-// the facts directly.)
-func p3rClean(roleID string, at time.Time, retained ...string) ([]igagov.TrailEvent, []igagov.TrailRead) {
-	var evs []igagov.TrailEvent
-	for _, s := range retained {
-		evs = append(evs, igagov.TrailEvent{EventTime: at.Add(time.Hour), PrincipalID: roleID, SessionName: "workload",
-			EventSource: s + ".amazonaws.com", EventName: "DescribeP3a"})
-	}
-	return evs, []igagov.TrailRead{{From: at.Add(-time.Hour), To: time.Now().Add(time.Hour)}}
 }

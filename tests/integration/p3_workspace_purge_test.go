@@ -254,7 +254,8 @@ func TestP3WorkspacePurgeWithPhase3Data(t *testing.T) {
 	a.publish()
 	i.mapSource(iacpr.FormatTerraform, "iam", map[string]string{"iam/main.tf": "# empty\n"})
 	policy := a.prepare("AROAPURGEROLE001") // proposal, compile, owner review excepted by the approver
-	canary := a.toCanary(policy)            // observed, approved (with acceptances), canary queued
+	a.observed(policy)
+	canary := a.toCanary(policy, 1) // approved (with acceptances), canary queued
 	if a.deploymentState(canary) == "" {
 		t.Fatal("setup: no canary deployment")
 	}
