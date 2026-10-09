@@ -136,12 +136,12 @@ type EnforcementBindingService struct {
 	cfg        awsdiscovery.CallbackConfig
 	principal  string
 
-	http          *http.Client
-	now           func() time.Time
-	sleep         func(ctx context.Context, d time.Duration) error
+	http  *http.Client
+	now   func() time.Time
+	sleep func(ctx context.Context, d time.Duration) error
 	// policyGate is the IGA_POLICY gate an enforcement registration Create
 	// is processed under (nil: the process-wide gate, read per message).
-	policyGate func() *PolicyGate
+	policyGate    func() *PolicyGate
 	templateCheck func(ctx context.Context, templateURL string) error
 }
 

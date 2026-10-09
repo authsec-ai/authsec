@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/lib/pq"
 	"gorm.io/gorm"
 
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -231,23 +230,13 @@ func VerifyPolicySchema(db *gorm.DB) error {
 	}
 	// Triggers and key constraints, by name: two catalog queries, so the
 	// check stays cheap however many there are.
-	var haveTriggers []string
-	if err := db.Raw(`SELECT c.relname || '.' || t.tgname
-		  FROM pg_trigger t
-		  JOIN pg_class c ON c.oid = t.tgrelid
-		  JOIN pg_namespace n ON n.oid = c.relnamespace
-		 WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgenabled <> 'D'
-		   AND c.relname || '.' || t.tgname = ANY(?)`, pq.Array(policyTriggers)).Scan(&haveTriggers).Error; err != nil {
+	haveTriggers, err := repositories.EnabledTriggers(db, policyTriggers)
+	if err != nil {
 		return fmt.Errorf("policy schema verification could not run: %w", err)
 	}
 	missing = append(missing, absentNames(policyTriggers, haveTriggers, "trigger ")...)
-	var haveConstraints []string
-	if err := db.Raw(`SELECT c.relname || '.' || k.conname
-		  FROM pg_constraint k
-		  JOIN pg_class c ON c.oid = k.conrelid
-		  JOIN pg_namespace n ON n.oid = c.relnamespace
-		 WHERE n.nspname = 'public' AND k.convalidated
-		   AND c.relname || '.' || k.conname = ANY(?)`, pq.Array(policyConstraints)).Scan(&haveConstraints).Error; err != nil {
+	haveConstraints, err := repositories.ValidatedConstraints(db, policyConstraints)
+	if err != nil {
 		return fmt.Errorf("policy schema verification could not run: %w", err)
 	}
 	missing = append(missing, absentNames(policyConstraints, haveConstraints, "constraint ")...)

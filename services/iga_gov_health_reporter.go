@@ -32,7 +32,9 @@ func InstallGovHealthReporter(db *gorm.DB) (restore func()) {
 }
 
 // NewGovHealthReporter is the production GovHealthReporter over db.
-func NewGovHealthReporter(db *gorm.DB) GovHealthReporter { return &govDeploymentsHealthReporter{db: db} }
+func NewGovHealthReporter(db *gorm.DB) GovHealthReporter {
+	return &govDeploymentsHealthReporter{db: db}
+}
 
 func (h *govDeploymentsHealthReporter) ReportHealth(ctx context.Context, r GovHealthReport) (any, error) {
 	db := h.db.WithContext(ctx)
