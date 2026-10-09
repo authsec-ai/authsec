@@ -49,8 +49,9 @@ type ResourcePolicyCollection struct {
 	// not grant collection: every form was recorded not_collected unread.
 	TemplateCurrent bool
 	// EnabledRegionsKnown is false when the account's enabled regions could
-	// not be listed (unselected regions then have no rows; the compiler's
-	// enabled-region list still names them, as not_collected).
+	// not be listed (unselected regions then have no rows). Regions records
+	// that with the run, and every reader then treats each regional form as
+	// not_analysed (igagov.ReasonEnabledRegionsUnknown), never complete.
 	EnabledRegionsKnown bool
 	Coverage            []awsdiscovery.FormCoverage
 	// Regions is the region scope this collection used, frozen with the run
