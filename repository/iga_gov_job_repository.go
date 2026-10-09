@@ -23,9 +23,10 @@ var ErrPolicyJobLeaseLost = errors.New("policy job lease no longer held")
 // must have at least 60 s left or the worker stops before sending").
 var ErrPolicyJobLeaseShort = errors.New("policy job lease has too little time left")
 
-// Job kinds (052 iga_gov_job.kind CHECK). resolve_unknown (§8.1 step 2) is NOT
-// in 052's CHECK, so it cannot be enqueued until the DDL is widened (reported
-// by T3.08); the constant exists so the gap is named in one place.
+// Job kinds: exactly the values of 052's iga_gov_job.kind CHECK
+// (iga_gov_job_kind_check), resolve_unknown (§8.1 step 2) included.
+// tests/igagovschema TestGovJobKindsMatch052Check reads the CHECK from
+// pg_constraint and fails when the two lists differ.
 const (
 	GovJobEvaluateOwnerRules = "evaluate_owner_rules"
 	GovJobCompilePlans       = "compile_plans"
@@ -39,15 +40,14 @@ const (
 	GovJobIaCSync            = "iac_sync"
 	GovJobPruneEvidence      = "prune_evidence"
 	GovJobMetricsRollup      = "metrics_rollup"
-	// GovJobResolveUnknown is not accepted by 052's CHECK (see above).
-	GovJobResolveUnknown = "resolve_unknown"
+	GovJobResolveUnknown     = "resolve_unknown"
 )
 
-// GovJobKinds are the kinds 052 accepts.
+// GovJobKinds are the kinds 052 accepts (all of them).
 var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
-	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup,
+	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per

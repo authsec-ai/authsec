@@ -35,6 +35,7 @@ func phase3Models() []any {
 		&models.WorkspaceSlackIntegration{}, &models.SlackUserLink{}, &models.IGAGovNotification{},
 		&models.IGAGovSettings{},
 		&models.CloudPolicyDocument{}, &models.CloudResourcePolicyCoverage{}, &models.CloudResourcePolicyObservation{},
+		&models.IGAGovEvaluationPruned{}, // 059_tidy_eval_pruned
 	}
 }
 

@@ -33,7 +33,7 @@ func TestP3FixSessionTrailLookup(t *testing.T) {
 		return iam
 	}
 	put := igagov.Op{Op: igagov.OpPutRolePermissionsBoundary, RoleName: "TrailRole", PolicyARN: b.ARN}
-	req, err := awsenforce.NewRequest(put, dep, "")
+	req, err := awsenforce.NewRequest(put, dep, "", "TrailRole")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,13 +52,13 @@ func TestP3FixSessionTrailLookup(t *testing.T) {
 	if ev := evs[0]; !ev.Applied() || ev.SessionName != session || ev.RoleName != "TrailRole" || ev.BoundaryARN != b.ARN || !req.MatchesTrail(ev) {
 		t.Fatalf("event: %+v", ev)
 	}
-	otherTarget, _ := awsenforce.NewRequest(igagov.Op{Op: igagov.OpPutRolePermissionsBoundary, RoleName: "AnotherRole", PolicyARN: b.ARN}, dep, "")
+	otherTarget, _ := awsenforce.NewRequest(igagov.Op{Op: igagov.OpPutRolePermissionsBoundary, RoleName: "AnotherRole", PolicyARN: b.ARN}, dep, "", "AnotherRole")
 	if otherTarget.MatchesTrail(evs[0]) {
 		t.Fatal("a request on another role matched the event")
 	}
 	// A refused request (no such policy) is recorded with its error code.
 	cpv, _ := awsenforce.NewRequest(igagov.Op{Op: igagov.OpCreatePolicyVersion, PolicyARN: "arn:aws:iam::" + f.Account + ":policy/authsec/Missing",
-		DocumentHash: "sha256:x", SetAsDefault: true}, dep, "")
+		DocumentHash: "sha256:x", SetAsDefault: true}, dep, "", "TrailRole")
 	_ = awsenforce.Send(ctx, assume(dep), cpv, sqsOnly)
 	evs, err = awsenforce.LookupSessionEvents(ctx, f, awsenforce.TrailQuery{SessionName: session, EventName: igagov.OpCreatePolicyVersion,
 		From: q.From, To: q.To})

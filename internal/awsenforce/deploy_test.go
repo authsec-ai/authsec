@@ -43,14 +43,14 @@ func TestP3T310NewRequestSubstitutesAndHashes(t *testing.T) {
 		PolicyName: "AuthSecBoundary-AROAX", Path: "/authsec/", DocumentHash: "sha256:" + strings.Repeat("a", 64),
 		Tags: map[string]string{igagov.TagChange: igagov.DeploymentPlaceholder, igagov.TagControl: "ctl"}}
 	d1, d2 := uuid.New(), uuid.New()
-	r1, err := awsenforce.NewRequest(op, d1, "")
+	r1, err := awsenforce.NewRequest(op, d1, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r1.Tags[igagov.TagChange] != d1.String() || r1.Tags[igagov.TagControl] != "ctl" {
 		t.Fatalf("tags %v", r1.Tags)
 	}
-	r2, _ := awsenforce.NewRequest(op, d2, "")
+	r2, _ := awsenforce.NewRequest(op, d2, "", "")
 	h1, _ := r1.Hash()
 	h1b, _ := r1.Hash()
 	h2, _ := r2.Hash()
@@ -65,26 +65,55 @@ func TestP3T310NewRequestSubstitutesAndHashes(t *testing.T) {
 	// version, a version for another op, a step on another role.
 	bad := op
 	bad.PolicyName = "x-" + igagov.DeploymentPlaceholder
-	if _, err := awsenforce.NewRequest(bad, d1, ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
+	if _, err := awsenforce.NewRequest(bad, d1, "", ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
 		t.Fatalf("placeholder in a name: %v", err)
 	}
 	sel := igagov.Op{Op: igagov.OpDeletePolicyVersion, PolicyARN: op.PolicyARN, Select: igagov.SelectOldestNonDefault, IfVersionsAtLeast: 5}
-	if _, err := awsenforce.NewRequest(sel, d1, ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
+	if _, err := awsenforce.NewRequest(sel, d1, "", ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
 		t.Fatalf("unresolved selector: %v", err)
 	}
-	rv, err := awsenforce.NewRequest(sel, d1, "v2")
+	rv, err := awsenforce.NewRequest(sel, d1, "v2", "")
 	if err != nil || rv.VersionID != "v2" {
 		t.Fatalf("resolved selector: %+v %v", rv, err)
 	}
-	if _, err := awsenforce.NewRequest(op, d1, "v2"); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
+	if _, err := awsenforce.NewRequest(op, d1, "v2", ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
 		t.Fatalf("version on CreatePolicy: %v", err)
 	}
 	other := igagov.Op{Op: igagov.OpPutRolePermissionsBoundary, RoleARN: "arn:aws:iam::1:role/x", PolicyARN: op.PolicyARN}
-	if _, err := awsenforce.NewRequest(other, d1, ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
+	if _, err := awsenforce.NewRequest(other, d1, "", "x"); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
 		t.Fatalf("another role's step: %v", err)
 	}
-	if _, err := awsenforce.NewRequest(igagov.Op{Op: igagov.OpCreateRole}, d1, ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
+	if _, err := awsenforce.NewRequest(igagov.Op{Op: igagov.OpCreateRole}, d1, "", ""); !errors.Is(err, awsenforce.ErrUnresolvedOp) {
 		t.Fatalf("a dedicated-identity step: %v", err)
+	}
+}
+
+// fix/p3-tidy: a role op must name exactly the control's role, a policy op
+// none; anything else is ErrOpRoleMismatch before a request exists.
+func TestP3TidyNewRequestChecksTheControlsRole(t *testing.T) {
+	d := uuid.New()
+	arn := "arn:aws:iam::429418377036:policy/authsec/AuthSecBoundary-AROAX"
+	for _, op := range []igagov.Op{
+		{Op: igagov.OpPutRolePermissionsBoundary, RoleName: "AppRole", PolicyARN: arn},
+		{Op: igagov.OpDeleteRolePermissionsBoundary, RoleName: "AppRole"},
+	} {
+		if r, err := awsenforce.NewRequest(op, d, "", "AppRole"); err != nil || r.RoleName != "AppRole" {
+			t.Fatalf("%s on the control's role: %+v %v", op.Op, r, err)
+		}
+		for _, control := range []string{"OtherRole", "approle", ""} {
+			if _, err := awsenforce.NewRequest(op, d, "", control); !errors.Is(err, awsenforce.ErrOpRoleMismatch) {
+				t.Fatalf("%s naming AppRole for control role %q: %v, want ErrOpRoleMismatch", op.Op, control, err)
+			}
+		}
+		empty := op
+		empty.RoleName = ""
+		if _, err := awsenforce.NewRequest(empty, d, "", "AppRole"); !errors.Is(err, awsenforce.ErrOpRoleMismatch) {
+			t.Fatalf("%s naming no role: %v, want ErrOpRoleMismatch", op.Op, err)
+		}
+	}
+	pol := igagov.Op{Op: igagov.OpDeletePolicy, PolicyARN: arn, RoleName: "AppRole"}
+	if _, err := awsenforce.NewRequest(pol, d, "", "AppRole"); !errors.Is(err, awsenforce.ErrOpRoleMismatch) {
+		t.Fatalf("a policy op naming a role: %v, want ErrOpRoleMismatch", err)
 	}
 }
 
@@ -244,7 +273,7 @@ func TestP3T310ForcedWritesRefusedByTemplateA11(t *testing.T) {
 				before, after = "", b.ARN
 			}
 			f.SetBoundary(r.Name, before)
-			req, err := awsenforce.NewRequest(op, uuid.New(), "")
+			req, err := awsenforce.NewRequest(op, uuid.New(), "", r.Name)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -273,7 +302,7 @@ func TestP3T310ForcedWritesRefusedByTemplateA11(t *testing.T) {
 		t.Fatal("template has no ProtectTaggedRoles statement")
 	}
 	f.SetBoundary("LedgerRole", b.ARN)
-	req, _ := awsenforce.NewRequest(igagov.Op{Op: igagov.OpDeleteRolePermissionsBoundary, RoleName: "LedgerRole"}, uuid.New(), "")
+	req, _ := awsenforce.NewRequest(igagov.Op{Op: igagov.OpDeleteRolePermissionsBoundary, RoleName: "LedgerRole"}, uuid.New(), "", "LedgerRole")
 	if resp := awsenforce.Send(ctx, iam, req, ""); resp.Kind != igagov.RespOK || f.BoundaryOf("LedgerRole") != "" {
 		t.Fatalf("after editing the template: %+v", resp)
 	}
@@ -290,7 +319,7 @@ func TestP3T310SendRecordsRequestIDAndDocument(t *testing.T) {
 	}
 	_, h, _ := igagov.CanonicalDocument(sqsOnly)
 	req, err := awsenforce.NewRequest(igagov.Op{Op: igagov.OpCreatePolicy, PolicyName: "AuthSecBoundary-AROAS", Path: "/authsec/",
-		PolicyARN: f.PolicyARN("/authsec/", "AuthSecBoundary-AROAS"), DocumentHash: h}, uuid.New(), "")
+		PolicyARN: f.PolicyARN("/authsec/", "AuthSecBoundary-AROAS"), DocumentHash: h}, uuid.New(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

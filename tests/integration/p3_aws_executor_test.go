@@ -76,7 +76,7 @@ func TestP3T310ApplyAndUndoFirstDeployment(t *testing.T) {
 		t.Fatalf("attempts: %+v", ats)
 	}
 	for i, at := range ats {
-		req, err := awsenforce.NewRequest(tp.Apply.Ops[i], dep, "")
+		req, err := awsenforce.NewRequest(tp.Apply.Ops[i], dep, "", x.name)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -21,112 +21,210 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# IGA_ISOLATION_ROOT runs the check over another tree (the check's own test
+# plants violations in a scratch tree; CI never sets it).
+ROOT="${IGA_ISOLATION_ROOT:-$ROOT}"
 cd "$ROOT"
 
-# Files that are IGA's own. Anything here may name iga_* freely and nothing else.
-# No mapfile: macOS ships bash 3.2, and this has to run on a developer's laptop
-# as readily as in CI.
-IGA_FILES=""
-while IFS= read -r f; do
-  IGA_FILES="${IGA_FILES}${f}
-"
-done < <(
-  find repository services controllers models -type f -name '*.go' 2>/dev/null \
-    | grep -E '/(iga_[a-z_]*|[a-z_]*_iga)[a-z_]*\.go$' \
-    | grep -v '_test\.go$' \
-    | sort
-)
-FILE_COUNT=$(printf '%s' "$IGA_FILES" | grep -c . || true)
-
-# Tables an IGA file may name even though they are not iga_*.
+# ---------------------------------------------------------------------------
+# SCOPE IS DECIDED BY CONTENT AND PACKAGE, NOT BY FILE NAME.
 #
-# Keep this SHORT and justify every entry. An allowlist that grows without
-# argument is the convention failing quietly, which is the thing the check
-# exists to prevent.
-ALLOWED_NON_IGA=(
-  # The bridge itself. It is the sanctioned seam between the runtime channel
-  # and the correlated estate, with its own state machine and decision record.
-  "discovered_agent_iga_links"
+# A file is IGA code, and is checked, when ANY of these holds:
+#   1. it is in an IGA package (IGA_PACKAGES below) -- whatever it is called;
+#   2. its code (comments stripped) names an iga_* table in a SQL position
+#      (FROM / JOIN / INTO / UPDATE, or gorm .Table("iga_...")), wherever it
+#      lives: a reader of shared tables that also reads the graph is IGA code
+#      for this purpose, whatever its file is called;
+#   3. its name is iga_*.go / *_iga.go under repository, services, controllers
+#      or models (the original rule, kept so a new empty-of-SQL IGA file is
+#      still in scope).
+# Test files are not scanned.
+IGA_PACKAGES="internal/igagov internal/igagraph internal/igaread"
 
-  # The evidence store. Phase 2 FKs iga_access_edge_evidence.observation_id and
-  # iga_relationship_evidence.observation_id straight to cloud_observation (031)
-  # -- evidence IS stored there by construction, so the read path joins it to
-  # show each grant's provenance (the API call, the surface, and the coverage
-  # that surface had at collection time). This is a designed seam, the same
-  # shape as discovered_agent_iga_links, and it is READ-ONLY: writes to cloud_*
-  # from graph code are forbidden by the separate one-way check below, which is
-  # what actually protects the projection's rebuildable guarantee.
-  "cloud_observation"
+# Every non-iga table a checked file may name, with its access mode -- r
+# (read-only) or rw -- and the reason it is a designed seam rather than an
+# undeclared dependency. Keep this SHORT and justify every entry. An allowlist
+# that grows without argument is the convention failing quietly, which is the
+# thing the check exists to prevent. Any table not listed here, named by a
+# checked file, fails the check; a write (INSERT INTO / UPDATE / DELETE FROM)
+# to an r table fails unless the (file, table) pair is in WRITE_ALLOWED.
+ALLOWED_SHARED=(
+  # The bridge between the runtime channel and the correlated estate, with its
+  # own state machine and decision record (the sanctioned seam).
+  "discovered_agent_iga_links:rw"
 
-  # The scan lifecycle the barrier coordinates. §2.10A's abandon transition is
-  # defined as "terminalize the scan run AND its projection job, THEN idle" --
-  # all three in ONE transaction, because nothing may be admitted while either
-  # could still commit. Splitting the run update out to another package would
-  # put it in another transaction and break exactly that guarantee. READ AND
-  # WRITE here is the design; the projection's one-way rule is enforced
-  # separately below, over internal/igagraph.
-  "cloud_scan_run"
+  # The scan lifecycle the pipeline barrier coordinates. §2.10A's abandon
+  # transition terminalizes the scan run AND its projection job in ONE
+  # transaction; splitting the run update out would break that guarantee.
+  "cloud_scan_run:rw"
 
-  # The authorization check for a human decision (§2.14.3). Recording who
-  # classified a workload requires proving the caller is a LIVE member of this
-  # workspace, and membership lives here. There is no bridge table for an
-  # authz lookup -- a bridge would be a cached copy of the answer, which is
-  # the thing least safe to cache. Read-only.
-  "workspace_memberships"
+  # The evidence store. iga_access_edge_evidence / iga_relationship_evidence
+  # FK observation_id straight to cloud_observation (031); the read path joins
+  # it for provenance and Phase 3 reads it for deployment drift and verify
+  # evidence. Read-only (the one-way rule below also forbids writes from the
+  # projection).
+  "cloud_observation:r"
+
+  # The rest of the AWS collected model the projection and policy READ (§2.5,
+  # §3.9): the connector (scope, status, selected regions), IAM role inventory
+  # (CreateDate, RoleId incarnation), Access Advisor rows, cross-account trust
+  # edges, workloads, and the immutable resource-policy evidence. cloud_* is
+  # authoritative and iga_* is derived from it; reading it is the design.
+  # Writes are the collectors' own (WRITE_ALLOWED).
+  "cloud_connector:r"
+  "cloud_identity:r"
+  "cloud_usage:r"
+  "cloud_assume_edge:r"
+  "cloud_workload:r"
+  "cloud_policy_document:r"
+  "cloud_resource_policy_coverage:r"
+  "cloud_resource_policy_observation:r"
+
+  # Phase 3's own tables whose names the spec fixed without the iga_ prefix
+  # (053 cloud_enforcement_binding, 054 slack_user_link and
+  # workspace_slack_integration). Written only by their owning services
+  # (WRITE_ALLOWED).
+  "cloud_enforcement_binding:r"
+  "slack_user_link:r"
+  "workspace_slack_integration:r"
+
+  # The GitHub / Kubernetes collected model: discovery sources and their scan
+  # runs (the IaC source FK, the connections view) and the repository / k8s
+  # sightings the GitHub and Kubernetes projections read, as the AWS
+  # projection reads cloud_*. Read-only, except the k8s sweep's own source
+  # bookkeeping (WRITE_ALLOWED).
+  "discovery_sources:r"
+  "discovery_scan_runs:r"
+  "discovered_agents:r"
+
+  # The authorization check for a human decision (§2.14.3, §2.10) and the
+  # member's display name / email for owners, approvers and notifications.
+  # Membership and identity live here; a bridge would be a cached copy of an
+  # authorization answer, the thing least safe to cache. Read-only.
+  "workspace_memberships:r"
+  "users:r"
+)
+
+# The only writes a checked file may make to an r table: (file, table), each
+# by the component that owns that table.
+WRITE_ALLOWED=(
+  # The resource-policy collector's repository (T3.03b) writes its own
+  # evidence; it names iga_* only to keep evidence a plan still references.
+  "repository/cloud_resource_policy_repository.go:cloud_policy_document"
+  "repository/cloud_resource_policy_repository.go:cloud_resource_policy_coverage"
+  "repository/cloud_resource_policy_repository.go:cloud_resource_policy_observation"
+  # The workload collector's repository writes its workloads; it reads
+  # iga_gov_control only to prioritise activity collection for controlled roles.
+  "repository/cloud_workload_repository.go:cloud_workload"
+  # The enforcement binding service owns 053's binding table.
+  "services/cloud_enforcement_binding_service.go:cloud_enforcement_binding"
+  # The Slack integration owns 054's tables.
+  "services/slack_integration_service.go:slack_user_link"
+  "services/slack_integration_service.go:workspace_slack_integration"
+  "services/slack_integration_channel.go:slack_user_link"
+  "services/slack_integration_channel.go:workspace_slack_integration"
+  # The Kubernetes sweep records its progress on its own discovery source.
+  "services/k8s_rbac_service.go:discovery_sources"
 )
 
 echo "== IGA isolation =="
-echo "scanning ${FILE_COUNT} IGA source files"
 
 fail=0
-found=0
-VIOLATIONS="$(mktemp)"
+# The SQL reading is one perl pass (perl ships with git, macOS and every CI
+# image; a per-file pipeline of greps took minutes on Windows). Line comments
+# are stripped first: prose about a table is not a query. It reads a file
+# list on stdin and, per file:
+#   names <file>        -- scope mode: the file names an iga_* table
+#   T <file> <table>    -- a table named in a SQL position: FROM / JOIN /
+#                          INTO / UPDATE followed by an identifier that is not
+#                          a function call, not alias.column and not one of
+#                          the file's own CTEs (`name AS (`, `name(cols) AS (`,
+#                          the igaread builder's addWith("name", ...)); or
+#                          gorm's .Table("name")
+#   W <file> <table>    -- a write: INSERT INTO / UPDATE / DELETE FROM <table>
+SQLSCAN='
+my $mode = shift @ARGV;
+while (my $f = <STDIN>) {
+  chomp $f; $f =~ s/\r$//;
+  next unless length $f;
+  open(my $h, "<", $f) or next;
+  local $/; my $s = <$h>; close $h;
+  $s =~ s{//[^\n]*}{}g;
+  if ($mode eq "names") {
+    print "$f\n" if $s =~ /(?:FROM|JOIN|INTO|UPDATE)\s+(?:public\.)?iga_[a-z0-9_]+|\.Table\("iga_[a-z0-9_]+/;
+    next;
+  }
+  my %cte;
+  $cte{$1} = 1 while $s =~ /\b([a-z_][a-z0-9_]*)\s*(?:\([a-z0-9_, ]*\))?\s+AS\s+(?:NOT\s+)?(?:MATERIALIZED\s+)?\(/g;
+  $cte{$1} = 1 while $s =~ /addWith\([`"]([a-z_][a-z0-9_]*)/g;
+  my (%t, %w);
+  $t{$1} = 1 while $s =~ /(?:FROM|JOIN|INTO|UPDATE)\s+(?:public\.)?([a-z_][a-z0-9_]*)(?![a-z0-9_]|\s*[(.])/g;
+  $t{$1} = 1 while $s =~ /\.Table\("([a-z_][a-z0-9_]*)"/g;
+  $w{$1} = 1 while $s =~ /(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:public\.)?([a-z_][a-z0-9_]*)(?![a-z0-9_]|\s*[(.])/g;
+  for my $x (sort keys %t) { print "T $f $x\n" unless $x =~ /^iga_/ || $cte{$x}; }
+  for my $x (sort keys %w) { print "W $f $x\n" unless $x =~ /^iga_/ || $cte{$x}; }
+}
+'
 
-printf '%s' "$IGA_FILES" | while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  # Table names in SQL positions only: FROM/JOIN/INTO/UPDATE followed by an
-  # identifier. Deliberately not every string that looks like a table -- a
-  # comment mentioning `workspaces` is not a query.
-  while IFS= read -r ref; do
-    table="${ref##* }"
-    table="${table#public.}"
-
-    # IGA's own tables are the point of the file.
-    [[ "$table" == iga_* ]] && continue
-    # Not a table: SQL keywords and CTE noise that follow the same words.
-    [[ "$table" =~ ^(SELECT|select|VALUES|values|LATERAL|lateral|\(.*)$ ]] && continue
-
-    allowed=0
-    for a in "${ALLOWED_NON_IGA[@]}"; do
-      [[ "$table" == "$a" ]] && allowed=1 && break
+IGA_FILES="$(
+  {
+    for p in $IGA_PACKAGES; do
+      [ -d "$p" ] && find "$p" -type f -name '*.go'
     done
-    [ "$allowed" -eq 1 ] && continue
+    find repository services controllers models -type f -name '*.go' 2>/dev/null \
+      | grep -E '/(iga_[a-z_]*|[a-z_]*_iga)[a-z_]*\.go$'
+    # Candidates by one recursive grep (comments included), confirmed by the
+    # perl pass with comments stripped.
+    grep -rlE --include='*.go' --exclude-dir=.git --exclude-dir=vendor --exclude-dir=node_modules \
+        'iga_[a-z0-9_]+' . 2>/dev/null | sed 's|^\./||' | perl -e "$SQLSCAN" names
+  } | grep -v '_test\.go$' | sort -u
+)"
+FILE_COUNT=$(printf '%s\n' "$IGA_FILES" | grep -c . || true)
+echo "scanning ${FILE_COUNT} IGA source files (by package, content and name)"
 
-    echo "FAIL: $f names non-IGA table '$table'"
-    grep -nE "(FROM|JOIN|INTO|UPDATE)[[:space:]]+(public\.)?${table}\b" "$f" \
-      | head -3 | sed 's/^/    line /'
-  done < <(
-    # Strip line comments first. Prose about the rule is not a breach of it:
-    # this check own justification mentions joining the users table, and
-    # scanning comments made the file that explains the boundary fail it.
-    sed -e 's://.*::' "$f" \
-      | grep -ohE '(FROM|JOIN|INTO|UPDATE)[[:space:]]+(public\.)?[a-z_][a-z0-9_]*' \
-      | tr -s ' ' | sort -u
-  )
+mode_of() { # table -> r | rw | "" (not allowed)
+  local a
+  for a in "${ALLOWED_SHARED[@]}"; do
+    [ "${a%%:*}" == "$1" ] && { echo "${a##*:}"; return; }
+  done
+  echo ""
+}
+
+write_allowed() { # file table
+  local a
+  for a in "${WRITE_ALLOWED[@]}"; do
+    [ "$a" == "$1:$2" ] && return 0
+  done
+  return 1
+}
+
+VIOLATIONS="$(mktemp)"
+printf '%s\n' "$IGA_FILES" | perl -e "$SQLSCAN" tables | while read -r kind f table; do
+  mode="$(mode_of "$table")"
+  case "$kind" in
+    T)
+      if [ -z "$mode" ]; then
+        echo "FAIL: $f names non-IGA table '$table' (not in ALLOWED_SHARED)"
+        grep -nE "((FROM|JOIN|INTO|UPDATE)[[:space:]]+(public\.)?${table}\b|\.Table\(\"${table}\")" "$f" \
+          | head -3 | sed 's/^/    line /'
+      fi ;;
+    W)
+      if [ "$mode" == "r" ] && ! write_allowed "$f" "$table"; then
+        echo "FAIL: $f writes '$table', which IGA code may only read (not in WRITE_ALLOWED)"
+        grep -nE "(INSERT[[:space:]]+INTO|UPDATE|DELETE[[:space:]]+FROM)[[:space:]]+(public\.)?${table}\b" "$f" \
+          | head -3 | sed 's/^/    line /'
+      fi ;;
+  esac
 done > "$VIOLATIONS"
 
-# The loop above runs in a subshell (it is the right-hand side of a pipe), so
-# its `fail` never reaches here. The file is the channel that does.
 if [ -s "$VIOLATIONS" ]; then
-  fail=1; found=1
+  fail=1
   cat "$VIOLATIONS"
+else
+  echo "ok: no IGA file names a table outside iga_* and ALLOWED_SHARED, or writes a read-only one"
+  echo "    (allowed: ${ALLOWED_SHARED[*]})"
 fi
 rm -f "$VIOLATIONS"
-
-if [ "$found" -eq 0 ]; then
-  echo "ok: no IGA file names a legacy table outside the allowlist"
-  echo "    (allowlist: ${ALLOWED_NON_IGA[*]})"
-fi
 
 # ---------------------------------------------------------------------------
 # P2-1 -- THE PROJECTION IS ONE-WAY.
@@ -221,10 +319,11 @@ IGA isolation FAILED.
 
 One of three rules was broken:
 
-  1. A legacy table named directly from IGA code is coupling nobody declared.
-     If the join is genuinely required, route it through a bridge table that
-     records its own state and evidence, as discovered_agent_iga_links does --
-     then add that bridge to ALLOWED_NON_IGA with a sentence saying why.
+  1. A legacy table named directly from IGA code is coupling nobody declared
+     (or a read-only shared table is written). If the join is genuinely
+     required, route it through a bridge table that records its own state and
+     evidence, as discovered_agent_iga_links does -- then add it to
+     ALLOWED_SHARED (or the write to WRITE_ALLOWED) with a sentence saying why.
 
   2. A projection file writes cloud_*. The projection is ONE-WAY: cloud_* is
      authoritative, iga_* is rebuildable from it. A write back makes the two

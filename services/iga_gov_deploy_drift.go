@@ -329,7 +329,7 @@ func (s *GovDeployments) lateMutation(ctx context.Context, run *PolicyJobRun, ws
 		if a.OpSeq >= len(p.Ops) {
 			continue
 		}
-		req, err := awsenforce.NewRequest(p.Ops[a.OpSeq], dep.ID, "")
+		req, err := awsenforce.NewRequest(p.Ops[a.OpSeq], dep.ID, "", roleNameOfARN(ctl.RoleARN))
 		if err != nil {
 			continue // a version selector: not visible to a read
 		}
@@ -658,7 +658,7 @@ func (s *GovDeployments) trailVerdict(ctx context.Context, db *gorm.DB, d models
 				continue
 			}
 		}
-		req, err := awsenforce.NewRequest(op, d.ID, version)
+		req, err := awsenforce.NewRequest(op, d.ID, version, roleNameOfARN(ctl.RoleARN))
 		if err != nil {
 			continue
 		}

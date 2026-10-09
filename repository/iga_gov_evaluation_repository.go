@@ -71,9 +71,15 @@ type IGAGovEvaluationRepository interface {
 	// a policy version's evidence_rev names (§2.5).
 	RetainedRevs(db *gorm.DB, ws uuid.UUID, retention int) (map[int64]bool, error)
 	// PruneTx deletes the evidence and results of complete evaluations
-	// outside RetainedRevs. The evaluation rows stay, so a read at a pruned
-	// revision is 410 revision_not_retained, never "unknown".
+	// outside RetainedRevs and records each such revision in
+	// iga_gov_evaluation_pruned (057) in the same transaction. The
+	// evaluation rows stay, so a read at a pruned revision is 410
+	// revision_not_retained, never "unknown".
 	PruneTx(tx *gorm.DB, ws uuid.UUID, retention int) (int64, error)
+	// Pruned reports whether rev's evidence and results were pruned
+	// (057's record). It never infers pruning from the retention setting:
+	// raising the setting after a prune does not bring the rows back.
+	Pruned(db *gorm.DB, ws uuid.UUID, rev int64) (bool, error)
 }
 
 // FindingEvalUpdate is one evaluation's write to an existing finding.
@@ -252,6 +258,13 @@ func (igaGovEvaluationRepository) PruneTx(tx *gorm.DB, ws uuid.UUID, retention i
 	                     AND e.rev NOT IN (SELECT rev FROM iga_gov_evaluation WHERE workspace_id = ? AND status = 'complete'
 	                                        ORDER BY rev DESC LIMIT ?)
 	                     AND e.rev NOT IN (SELECT evidence_rev FROM iga_gov_policy_version WHERE workspace_id = ?)`
+	// Record the pruning first, by the same rule, so a later read knows
+	// these revisions are gone whatever the retention setting becomes.
+	if err := tx.Exec(`INSERT INTO iga_gov_evaluation_pruned (workspace_id, rev)
+	                   SELECT ?, rev FROM (`+prunable+`) p
+	                   ON CONFLICT (workspace_id, rev) DO NOTHING`, ws, ws, ws, retention, ws).Error; err != nil {
+		return 0, err
+	}
 	var total int64
 	for _, table := range []string{"iga_gov_finding_result", "iga_gov_activity_evidence"} {
 		res := tx.Exec(`DELETE FROM `+table+` WHERE workspace_id = ? AND rev IN (`+prunable+`)`,
@@ -262,4 +275,10 @@ func (igaGovEvaluationRepository) PruneTx(tx *gorm.DB, ws uuid.UUID, retention i
 		total += res.RowsAffected
 	}
 	return total, nil
+}
+
+func (igaGovEvaluationRepository) Pruned(db *gorm.DB, ws uuid.UUID, rev int64) (bool, error) {
+	var n int64
+	err := db.Raw(`SELECT count(*) FROM iga_gov_evaluation_pruned WHERE workspace_id = ? AND rev = ?`, ws, rev).Scan(&n).Error
+	return n > 0, err
 }

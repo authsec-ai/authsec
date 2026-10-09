@@ -102,6 +102,9 @@ func (a *GovAuthoring) ownedPolicyARNs(db *gorm.DB, ws, control uuid.UUID) ([]st
 func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igagov.RightSizeIntent, t models.IGAGovTarget,
 	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
 	db := a.db.WithContext(ctx)
+	// The intent as it applies to THIS subject: an owner's scoped retain
+	// keeps its service for the roles that owner owns only (fix/p3-tidy).
+	intent = intent.ForSubject(c.IdentityAccountID.String())
 	b, src, basis, err := a.targets.buildBasis(ctx, ws, c.IdentityAccountID, removedServices(intent))
 	if err != nil {
 		if ge := bundleBuildError(err, c.RoleID); ge != nil {

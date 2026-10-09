@@ -231,8 +231,9 @@ func phase3CatalogProblems(c p3catalog) []string {
 func TestPhase3ForeignKeyCatalogGuard(t *testing.T) {
 	db, _ := testDB(t)
 	c := phase3Catalog(t, db)
-	if len(c.tables) != 43 {
-		t.Fatalf("%d Phase 3 tables in scope, want 43", len(c.tables))
+	// 047-056's 43 tables, plus 059_tidy_eval_pruned (fix/p3-tidy).
+	if len(c.tables) != 44 {
+		t.Fatalf("%d Phase 3 tables in scope, want 44", len(c.tables))
 	}
 	for _, p := range phase3CatalogProblems(c) {
 		t.Error(p)

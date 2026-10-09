@@ -1199,10 +1199,22 @@ func (a *GovAuthoring) CreateVersionTx(tx *gorm.DB, ws, actor, policyID uuid.UUI
 }
 
 // RetainVersionTx creates the next version of the policy of versionID with
-// each retain item moved from remove to retain (basis owner, with reason and
-// review date): what an owner's "retain" response produces (§7.4, A5).
-// T3.12's GovReviewAuthoringHook.OwnerResponseTx adapter calls it; actor is
-// the responding owner. 422 nothing_to_remove when nothing would be removed.
+// each retain item retained (basis owner, with reason and review date) FOR
+// THE SUBJECTS THE ACTOR OWNS: what an owner's "retain" response produces
+// (§7.4, A5). T3.12's GovReviewAuthoringHook.OwnerResponseTx adapter calls
+// it; actor is the responding owner.
+//
+// Scope (§2.9, fix/p3-tidy): an owner speaks for the roles they own -- the
+// role's own owners plus the accountable owners of every workload that runs
+// as it (ResolveRoleOwners). When the actor owns every subject, the service
+// moves from remove to retain for the whole policy (as before). Otherwise
+// the retain is an owner-scoped entry (RetainEntry.Subjects = the actor's
+// subjects) and the service stays in remove for every other subject; the
+// compiler and the rollout read the per-subject view
+// (RightSizeIntent.ForSubject). A service every subject's owners have
+// retained leaves remove altogether. ErrNotReviewOwner when the actor owns
+// none of the subjects; 422 nothing_to_remove when a subject would be left
+// with nothing to remove.
 func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UUID, items []igagov.RetainEntry) (*GovVersionView, error) {
 	var v models.IGAGovPolicyVersion
 	if err := tx.Where("workspace_id = ? AND id = ?", ws, versionID).Take(&v).Error; err != nil {
@@ -1215,19 +1227,83 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 	if err != nil {
 		return nil, err
 	}
+	owned, err := a.ownedSubjects(tx, ws, actor, in.Subjects)
+	if err != nil {
+		return nil, err
+	}
+	if len(owned) == 0 {
+		return nil, ErrNotReviewOwner
+	}
 	keep := map[string]igagov.RetainEntry{}
 	for _, it := range items {
 		it.Basis = igagov.RetainOwner
+		it.Subjects = nil
 		keep[it.Service] = it
 	}
+	if len(owned) == len(in.Subjects) {
+		retainForAll(&in, keep)
+	} else {
+		retainForSubjects(&in, keep, owned)
+	}
+	var empty []string
+	for _, s := range in.Subjects {
+		if len(in.ForSubject(s.IdentityAccountID).Remove) == 0 {
+			empty = append(empty, s.RoleID)
+		}
+	}
+	if len(in.Remove) == 0 || len(empty) > 0 {
+		return nil, govUnprocessable(GovCodeNothingToRemove, "Retaining these services leaves nothing to remove.",
+			map[string]any{"role_ids": empty})
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+	var latest int
+	if err := tx.Raw(`SELECT max(version_no) FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ?`, ws, v.PolicyID).
+		Scan(&latest).Error; err != nil {
+		return nil, err
+	}
+	return a.CreateVersionTx(tx, ws, actor, v.PolicyID, latest, raw)
+}
+
+// ownedSubjects are the identity_account_ids of the intent's subjects that
+// user owns (§2.9: the role's owners plus the accountable owners of every
+// workload that runs as it), sorted.
+func (a *GovAuthoring) ownedSubjects(tx *gorm.DB, ws, user uuid.UUID, subjects []igagov.Subject) ([]string, error) {
+	owners := NewIGAGovOwnershipService(a.db)
+	var out []string
+	for _, s := range subjects {
+		id, err := uuid.Parse(s.IdentityAccountID)
+		if err != nil {
+			continue
+		}
+		ro, err := owners.ResolveRoleOwners(tx, ws, id)
+		if errors.Is(err, ErrOwnerObjectNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range ro.Resolved {
+			if o.UserID == user {
+				out = append(out, s.IdentityAccountID)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// retainForAll moves each kept service from remove to an unscoped retain
+// (the actor owns every subject), replacing any earlier retain of it.
+func retainForAll(in *igagov.RightSizeIntent, keep map[string]igagov.RetainEntry) {
 	var remove []igagov.RemoveEntry
 	for _, e := range in.Remove {
 		if _, ok := keep[e.Service]; !ok {
 			remove = append(remove, e)
 		}
-	}
-	if len(remove) == 0 {
-		return nil, govUnprocessable(GovCodeNothingToRemove, "Retaining these services leaves nothing to remove.", nil)
 	}
 	in.Remove = remove
 	var retain []igagov.RetainEntry
@@ -1239,18 +1315,92 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 	for _, it := range keep {
 		retain = append(retain, it)
 	}
-	sort.Slice(retain, func(i, j int) bool { return retain[i].Service < retain[j].Service })
-	in.Retain = retain
-	raw, err := json.Marshal(in)
-	if err != nil {
-		return nil, err
+	in.Retain = sortedRetain(retain)
+}
+
+// retainForSubjects records each kept service as an owner retain scoped to
+// owned (the actor's subjects), replacing the actor's earlier scoped retain
+// of it for those subjects; the service stays removed for the others, and
+// leaves remove only once every subject retains it. A service already
+// retained for every subject, or not removed at all, is left as it is.
+func retainForSubjects(in *igagov.RightSizeIntent, keep map[string]igagov.RetainEntry, owned []string) {
+	removed := map[string]bool{}
+	for _, e := range in.Remove {
+		removed[e.Service] = true
 	}
-	var latest int
-	if err := tx.Raw(`SELECT max(version_no) FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ?`, ws, v.PolicyID).
-		Scan(&latest).Error; err != nil {
-		return nil, err
+	mine := map[string]bool{}
+	for _, s := range owned {
+		mine[s] = true
 	}
-	return a.CreateVersionTx(tx, ws, actor, v.PolicyID, latest, raw)
+	var retain []igagov.RetainEntry
+	for _, e := range in.Retain {
+		if _, ok := keep[e.Service]; ok && len(e.Subjects) > 0 && removed[e.Service] {
+			var rest []string
+			for _, s := range e.Subjects {
+				if !mine[s] {
+					rest = append(rest, s)
+				}
+			}
+			if len(rest) == 0 {
+				continue
+			}
+			e.Subjects = rest
+		}
+		retain = append(retain, e)
+	}
+	for svc, it := range keep {
+		if !removed[svc] {
+			continue
+		}
+		it.Subjects = append([]string(nil), owned...)
+		retain = append(retain, it)
+	}
+	in.Retain = sortedRetain(retain)
+	// A service every subject now retains is no longer removed for anyone.
+	var remove []igagov.RemoveEntry
+	for _, e := range in.Remove {
+		if _, ok := keep[e.Service]; ok {
+			all := true
+			for _, s := range in.Subjects {
+				if !retainedFor(in.Retain, e.Service, s.IdentityAccountID) {
+					all = false
+					break
+				}
+			}
+			if all {
+				continue
+			}
+		}
+		remove = append(remove, e)
+	}
+	in.Remove = remove
+}
+
+func retainedFor(retain []igagov.RetainEntry, svc, subject string) bool {
+	for _, e := range retain {
+		if e.Service == svc && len(e.Subjects) > 0 && e.AppliesTo(subject) {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedRetain orders retain entries by service, then by their first subject.
+func sortedRetain(r []igagov.RetainEntry) []igagov.RetainEntry {
+	sort.SliceStable(r, func(i, j int) bool {
+		if r[i].Service != r[j].Service {
+			return r[i].Service < r[j].Service
+		}
+		fi, fj := "", ""
+		if len(r[i].Subjects) > 0 {
+			fi = r[i].Subjects[0]
+		}
+		if len(r[j].Subjects) > 0 {
+			fj = r[j].Subjects[0]
+		}
+		return fi < fj
+	})
+	return r
 }
 
 func (a *GovAuthoring) markFindingsUnderReview(tx *gorm.DB, ws uuid.UUID, ids []string) error {
@@ -1539,7 +1689,10 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	intent, rec := a.recommend(ws, roles, remove, settings, req.Delivery, ctxObj)
+	intent, rec, err := a.recommend(ws, roles, remove, settings, req.Delivery, ctxObj)
+	if err != nil {
+		return nil, err
+	}
 	rec.Warnings = append(rec.Warnings, warnings...)
 	rec.Context = ctxObj
 	if err := igagov.ValidateIntent(igagov.Intent{Kind: igagov.IntentRightSizeServices, RightSize: &intent}); err != nil {
@@ -1752,7 +1905,9 @@ func removableServices(f igagov.BundleFacts, basis *bundleBasis) []string {
 }
 
 // recommend builds the intent and the recommendation from the final bundles.
-func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation) {
+// A database error is returned, never swallowed: an intent built from a
+// failed read would silently omit the findings it addresses.
+func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation, error) {
 	rec := ProposalRecommendation{Retain: []igagov.RetainEntry{}, Remove: []igagov.RemoveEntry{}, Consumers: []ConsumerView{},
 		IndependentGrants: []IndependentGrant{}, ResourcePolicyRoutes: []ProposalRoute{}, Warnings: []string{}}
 	in := igagov.RightSizeIntent{Kind: igagov.IntentRightSizeServices, ObservationDays: settings.DefaultObservationDays,
@@ -1880,9 +2035,11 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 		// role's open unused_service findings of the removed services).
 		if r.findings == nil {
 			var fids []uuid.UUID
-			_ = a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
+			if err := a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
 			               AND detail_key IN ? AND status IN ('open','reopened')`,
-				ws, id.ID, igagov.KindUnusedService, remove).Scan(&fids)
+				ws, id.ID, igagov.KindUnusedService, remove).Scan(&fids).Error; err != nil {
+				return in, rec, fmt.Errorf("findings addressed by the proposal for %s: %w", id.RoleID, err)
+			}
 			for _, f := range fids {
 				findingIDs[f.String()] = true
 			}
@@ -1941,7 +2098,7 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 	}
 	sort.Strings(in.FindingIDs)
 	rec.Remove, rec.Retain = in.Remove, in.Retain
-	return in, rec
+	return in, rec, nil
 }
 
 // currentBoundary is the role's boundary at the evaluated revision ("" =
