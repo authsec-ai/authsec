@@ -42,7 +42,9 @@ type IaCGitHubChannel struct {
 // RepositorySelected reports whether the discovery source selects a
 // repository (owner/name, case-insensitive; mode "all" selects every
 // repository the installation grants).
-func (c *IaCGitHubChannel) RepositorySelected(fullName string) bool { return c.Repositories.wants(fullName) }
+func (c *IaCGitHubChannel) RepositorySelected(fullName string) bool {
+	return c.Repositories.wants(fullName)
+}
 
 // LoadIaCGitHubChannel reads a workspace's GitHub (repo_scan) discovery
 // source and its installation binding.
