@@ -326,3 +326,77 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 		})
 	}
 }
+
+// Review fix R1a P2 "gate leaks": VerifyPolicySchema checks the triggers and
+// key CHECK / UNIQUE constraints of 047-056 by name, not only relations. A
+// dropped trigger, a DISABLED trigger and a dropped CHECK each leave the gate
+// unavailable naming the object; every probe runs in a transaction that is
+// rolled back, after which the same gate verifies.
+func TestP3PolicyGateVerifiesTriggersAndConstraints(t *testing.T) {
+	db := igaDB(t)
+	graphOn := p3GraphOn(t, db)
+	rollback := errors.New("rollback")
+	for _, tc := range []struct {
+		name, ddl, want string
+	}{
+		{"dropped trigger", `DROP TRIGGER iga_gov_event_no_update ON iga_gov_event`, "trigger iga_gov_event.iga_gov_event_no_update"},
+		{"disabled trigger", `ALTER TABLE iga_gov_attempt DISABLE TRIGGER iga_gov_attempt_transition`, "trigger iga_gov_attempt.iga_gov_attempt_transition"},
+		{"dropped check", `ALTER TABLE iga_gov_finding DROP CONSTRAINT iga_gov_finding_exception_chk`, "constraint iga_gov_finding.iga_gov_finding_exception_chk"},
+		{"dropped unique", `ALTER TABLE iga_gov_finding DROP CONSTRAINT iga_gov_finding_workspace_id_fingerprint_key`, "constraint iga_gov_finding.iga_gov_finding_workspace_id_fingerprint_key"},
+		{"056 trigger", `DROP TRIGGER cloud_rpo_immutable ON cloud_resource_policy_observation`, "trigger cloud_resource_policy_observation.cloud_rpo_immutable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := services.NewPolicyGate(true, "", graphOn)
+			err := db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Exec(tc.ddl).Error; err != nil {
+					return err
+				}
+				verr := gate.Verify(tx)
+				if verr == nil || !strings.Contains(verr.Error(), tc.want) {
+					t.Errorf("verify = %v, want it to name %s", verr, tc.want)
+				}
+				if state, reason, _ := gate.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, tc.want) || gate.Available() {
+					t.Errorf("gate %q %q, want unavailable naming %s", state, reason, tc.want)
+				}
+				return rollback
+			})
+			if !errors.Is(err, rollback) {
+				t.Fatalf("probe transaction: %v", err)
+			}
+			if err := gate.Verify(db); err != nil || !gate.Available() {
+				t.Fatalf("after the rollback the gate must verify: %v", err)
+			}
+		})
+	}
+
+	// The lists are the schema: every trigger and every named CHECK / UNIQUE
+	// constraint on a table 047-056 create is listed, and every listed name
+	// exists, so a new invariant cannot be added without the gate checking it.
+	var tables []string
+	for _, r := range services.PolicySchemaRelations() {
+		var kind string
+		db.Raw(`SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		         WHERE n.nspname = 'public' AND c.relname = ?`, r).Scan(&kind)
+		if kind == "r" {
+			tables = append(tables, r)
+		}
+	}
+	var triggers, constraints []string
+	db.Raw(`SELECT c.relname || '.' || t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+	         WHERE NOT t.tgisinternal AND c.relname IN ? ORDER BY 1`, tables).Scan(&triggers)
+	db.Raw(`SELECT c.relname || '.' || k.conname FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+	         WHERE c.relname IN ? AND (k.contype = 'u' OR (k.contype = 'c' AND k.conname LIKE '%\_chk'))
+	         ORDER BY 1`, tables).Scan(&constraints)
+	listed := map[string]bool{}
+	for _, n := range append(services.PolicySchemaTriggers(), services.PolicySchemaConstraints()...) {
+		listed[n] = true
+	}
+	for _, n := range append(triggers, constraints...) {
+		if !listed[n] {
+			t.Errorf("%s is on a Phase 3 table but VerifyPolicySchema does not check it", n)
+		}
+	}
+	if len(triggers) != len(services.PolicySchemaTriggers()) {
+		t.Errorf("%d triggers on Phase 3 tables, %d listed", len(triggers), len(services.PolicySchemaTriggers()))
+	}
+}

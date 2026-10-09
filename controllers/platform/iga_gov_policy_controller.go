@@ -105,6 +105,15 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
 	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
 
+	// §7.1 finding exceptions and finding rules (review fix R1a P2,
+	// iga_gov_finding_rules_controller.go): governance:author.
+	g.POST("/findings/:id/exception", require("governance", "author"), ctl.ExceptFinding)
+	g.DELETE("/findings/:id/exception", require("governance", "author"), ctl.ClearFindingException)
+	g.GET("/finding-rules", require("governance", "author"), ctl.ListFindingRules)
+	g.POST("/finding-rules", require("governance", "author"), ctl.CreateFindingRule)
+	g.PATCH("/finding-rules/:id", require("governance", "author"), ctl.UpdateFindingRule)
+	g.DELETE("/finding-rules/:id", require("governance", "author"), ctl.DeleteFindingRule)
+
 	// §7.4 owner review (T3.12, iga_gov_reviews_controller.go). The member
 	// routes check ownership in the handler, with governance:read as the
 	// fallback for a caller who is not an owner.

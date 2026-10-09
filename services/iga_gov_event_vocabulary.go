@@ -38,6 +38,8 @@ const (
 	GovCatOwnerReview       = "owner_review"
 	GovCatNotification      = "notification"
 	GovCatSettings          = "settings"
+	// Finding rules and finding exceptions (§7.1; review fix R1a P2).
+	GovCatFinding = "finding"
 	// Recorded by T3.11 / T3.13 (listed at integration, p3-wire).
 	GovCatProposal     = "proposal"
 	GovCatApproval     = "approval"
@@ -88,6 +90,12 @@ var GovEventVocabulary = []GovEventKind{
 	{"owner_rule.created", GovCatOwnership, GovObjOwnerRule, "An owner tag rule was created."},
 	{"owner_rule.deleted", GovCatOwnership, GovObjOwnerRule, "An owner tag rule was deleted with the owners it assigned."},
 	{"owner_rule.evaluated", GovCatOwnership, "", "Owner tag rules were applied (owners added and removed, unmatched tags)."},
+	// §7.1 finding rules and exceptions (iga_gov_finding_rules.go).
+	{GovEventFindingRuleCreated, GovCatFinding, GovObjFindingRule, "A finding rule (review date or unused window) was created."},
+	{GovEventFindingRuleUpdated, GovCatFinding, GovObjFindingRule, "A finding rule's scope, parameters or enabled flag changed."},
+	{GovEventFindingRuleDeleted, GovCatFinding, GovObjFindingRule, "A finding rule was deleted."},
+	{GovEventFindingExcepted, GovCatFinding, GovObjFinding, "An exception was recorded on a finding until a date, with a reason."},
+	{GovEventFindingExceptionCleared, GovCatFinding, GovObjFinding, "A finding's exception was cleared; the finding is open again."},
 	// T3.06 evaluation (iga_gov_evaluator.go).
 	{"evaluation_completed", GovCatEvaluation, "", "Findings were evaluated for a publication."},
 	{"evaluation_failed", GovCatEvaluation, "", "A publication's finding evaluation failed."},
@@ -223,6 +231,7 @@ const (
 	GovObjReview             = "review"
 	GovObjOwner              = "owner"
 	GovObjOwnerRule          = "owner_rule"
+	GovObjFindingRule        = "finding_rule"
 	GovObjBinding            = "enforcement_binding"
 	GovObjConnector          = "connector"
 	GovObjEvidenceBundle     = "evidence_bundle"
@@ -242,6 +251,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjReview:          {payloadKey: "review_id"},
 	GovObjOwner:           {payloadKey: "owner_id"},
 	GovObjOwnerRule:       {payloadKey: "rule_id"},
+	GovObjFindingRule:     {payloadKey: "finding_rule_id"},
 	GovObjBinding:         {payloadKey: "binding_id"},
 	GovObjConnector:       {payloadKey: "connector_id"},
 	GovObjEvidenceBundle:  {payloadKey: "bundle_id"},

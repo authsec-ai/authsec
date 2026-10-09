@@ -285,6 +285,19 @@ type govReviewState struct {
 	ownerIdx  map[uuid.UUID]*govDesiredOwner
 	Missing   []GovReviewBlocker
 	Responses []models.IGAGovOwnerResponse
+	// Excepted are the targets' unused_service findings that carry a
+	// finding exception (POST /findings/:id/exception), by identity and
+	// service; the gate compares their until with its clock.
+	Excepted []govExceptedFinding
+}
+
+// govExceptedFinding is one excepted unused_service finding of a target role.
+type govExceptedFinding struct {
+	FindingID         uuid.UUID
+	IdentityAccountID uuid.UUID
+	Service           string
+	Until             time.Time
+	Reason            string
 }
 
 func (st *govReviewState) response(user uuid.UUID) *models.IGAGovOwnerResponse {
@@ -433,6 +446,32 @@ func (s *IGAGovOwnerReviewService) load(db *gorm.DB, ws, versionID uuid.UUID, lo
 		}
 	}
 	sort.Slice(st.Owners, func(i, j int) bool { return st.Owners[i].UserID.String() < st.Owners[j].UserID.String() })
+
+	// Finding exceptions on the target roles (review fix R1a P2: the owner
+	// gate honours them; see govReviewState.exceptedRemovals).
+	if len(st.Targets) > 0 {
+		ids := make([]uuid.UUID, 0, len(st.Targets))
+		for _, t := range st.Targets {
+			ids = append(ids, t.IdentityAccountID)
+		}
+		var ex []struct {
+			ID                uuid.UUID
+			IdentityAccountID uuid.UUID
+			DetailKey         string
+			ExceptedUntil     time.Time
+			ExceptionReason   string
+		}
+		if err := db.Raw(`SELECT id, identity_account_id, detail_key, excepted_until, exception_reason
+		                    FROM iga_gov_finding
+		                   WHERE workspace_id = ? AND kind = ? AND status = 'excepted' AND identity_account_id IN ?
+		                   ORDER BY id`, ws, igagov.KindUnusedService, ids).Scan(&ex).Error; err != nil {
+			return nil, err
+		}
+		for _, e := range ex {
+			st.Excepted = append(st.Excepted, govExceptedFinding{FindingID: e.ID, IdentityAccountID: e.IdentityAccountID,
+				Service: e.DetailKey, Until: e.ExceptedUntil, Reason: e.ExceptionReason})
+		}
+	}
 
 	q := db.Where("workspace_id = ? AND version_id = ?", ws, versionID).Limit(1)
 	if lock {
@@ -586,6 +625,55 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
+// GovBlockFindingExcepted is the owner gate's reason when a removal meets a
+// finding exception.
+const GovBlockFindingExcepted = "finding_excepted"
+
+// GovExceptedRemoval is one removal the gate refuses because its finding is
+// excepted.
+type GovExceptedRemoval struct {
+	TargetID  uuid.UUID `json:"target_id"`
+	FindingID uuid.UUID `json:"finding_id"`
+	Service   string    `json:"service"`
+	Until     time.Time `json:"excepted_until"`
+	Reason    string    `json:"exception_reason"`
+}
+
+// exceptedRemovals lists every (target, removed service) whose role's
+// unused_service finding for that service is excepted with an until after
+// now. The removed services of a target are its plans' impact removals,
+// or the intent's when the impact lists none (as ageItems).
+func (st *govReviewState) exceptedRemovals(now time.Time) []GovExceptedRemoval {
+	if len(st.Excepted) == 0 {
+		return nil
+	}
+	var out []GovExceptedRemoval
+	for _, t := range st.Targets {
+		removed := map[string]bool{}
+		for _, r := range t.Removed {
+			removed[r.Service] = true
+		}
+		if len(removed) == 0 {
+			for svc := range st.Removals {
+				removed[svc] = true
+			}
+		}
+		for _, e := range st.Excepted {
+			if e.IdentityAccountID == t.IdentityAccountID && removed[e.Service] && e.Until.After(now) {
+				out = append(out, GovExceptedRemoval{TargetID: t.TargetID, FindingID: e.FindingID, Service: e.Service,
+					Until: e.Until.UTC(), Reason: e.Reason})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TargetID != out[j].TargetID {
+			return out[i].TargetID.String() < out[j].TargetID.String()
+		}
+		return out[i].Service < out[j].Service
+	})
+	return out
+}
+
 // blockers is everything that keeps the review from completing, live.
 func (st *govReviewState) blockers() []GovReviewBlocker {
 	out := []GovReviewBlocker{}
@@ -653,6 +741,16 @@ func (st *govReviewState) gate(now time.Time) error {
 	if !sameStrings(st.Review.ImpactHashes, st.Hashes) {
 		detail["reason"] = GovBlockImpactChanged
 		return reviewIncomplete("The plans' impact changed since the owners were asked.", detail)
+	}
+	// A finding exception is a recorded decision to keep the access until
+	// its date (§2.5): a version removing that service is refused until the
+	// exception is cleared or the service is retained. Checked before the
+	// review exception: an approver's review exception settles missing
+	// owners and confirmations, not a decision recorded on the finding.
+	if items := st.exceptedRemovals(now); len(items) > 0 {
+		detail["reason"] = GovBlockFindingExcepted
+		detail["items"] = items
+		return reviewIncomplete("The version removes services whose findings carry an exception; clear the exception or retain the service.", detail)
 	}
 	if st.Review.Status == GovReviewExcepted {
 		return nil

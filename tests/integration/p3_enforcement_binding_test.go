@@ -137,6 +137,8 @@ type enfLab struct {
 	svc   *services.EnforcementBindingService
 	qc    *services.AWSQuickCreateService
 	a     enfWorkspace
+	// gateOn is the available IGA_POLICY gate the callback runs under.
+	gateOn *services.PolicyGate
 }
 
 // enfPurgeOnCleanup deletes a workspace in a purge transaction, the only way
@@ -184,6 +186,13 @@ func newEnfLab(t *testing.T) *enfLab {
 		WithAssumer(l.aws).WithClock(l.clock.now).WithSleep(l.clock.sleep).
 		WithHTTPClient(&http.Client{Transport: l.puts}).
 		WithTemplateCheck(func(context.Context, string) error { return nil })
+	// The callback runs only under an available IGA_POLICY gate (review fix
+	// R1a P2 "gate leaks"; TestP3EnfCallbackRefusedWhileGateOff).
+	l.gateOn = services.NewPolicyGate(true, "", p3GraphOn(t, db))
+	if err := l.gateOn.Verify(db); err != nil {
+		t.Fatal(err)
+	}
+	l.svc.WithPolicyGate(l.gateOn)
 	l.qc = services.NewAWSQuickCreateService(nil, nil, cfg, enfPrincipal).WithEnforcementHandler(l.svc)
 	l.a = l.newWorkspace(t, "p3-enf-a")
 	return l
@@ -377,6 +386,69 @@ func TestP3EnfCallbackBindsAndVerifies(t *testing.T) {
 	}
 	if ev := l.events(t, l.a.ws); len(ev) != 3 {
 		t.Fatalf("events after replays = %v", ev)
+	}
+}
+
+// Review fix R1a P2 "gate leaks": an enforcement registration is Phase 3
+// state, so it is never processed while IGA_POLICY is not available. Switch
+// off: the Create is refused explicitly (FAILED policy_not_enabled, done),
+// nothing is bound, no event is written. Switch on but unverified: the
+// message is left for redelivery (retry), nothing is answered or written,
+// and the final delivery answers FAILED. Delete is still answered SUCCESS
+// (a stack can always be deleted). Once the gate is available the same
+// message binds as usual.
+func TestP3EnfCallbackRefusedWhileGateOff(t *testing.T) {
+	l := newEnfLab(t)
+	sess := l.start(t, l.a)
+	l.aws.deploy(t, sess.AccountID, sess.Suffix, sess.ExternalID)
+	before := l.events(t, l.a.ws)
+	unchanged := func(what string) {
+		t.Helper()
+		if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingPending || b.RoleARN != "" {
+			t.Fatalf("%s: binding %+v, want still pending and unbound", what, b)
+		}
+		if ev := l.events(t, l.a.ws); strings.Join(ev, ",") != strings.Join(before, ",") {
+			t.Fatalf("%s: events %v, want %v", what, ev, before)
+		}
+	}
+
+	// Switch off.
+	l.svc.WithPolicyGate(services.NewPolicyGate(false, "", p3GraphOn(t, l.db)))
+	n := l.puts.count()
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone {
+		t.Fatalf("gate off: outcome %s, want done (refused explicitly)", out)
+	}
+	if r := l.puts.last(t); l.puts.count() != n+1 || r.Status != awsdiscovery.CFNStatusFailed || !strings.Contains(r.Reason, "not enabled") {
+		t.Fatalf("gate off: answer %+v, want FAILED policy_not_enabled", r)
+	}
+	unchanged("gate off")
+	l.deliver(l.cfnBody(sess, "Delete", func(req map[string]any, _ map[string]string) {
+		req["PhysicalResourceId"] = "authsec-enforcement-unregistered-x"
+	}))
+	if r := l.puts.last(t); r.Status != awsdiscovery.CFNStatusSuccess {
+		t.Fatalf("gate off: Delete answered %+v, want SUCCESS", r)
+	}
+
+	// Switch on, schema not verified yet: left for redelivery.
+	l.svc.WithPolicyGate(services.NewPolicyGate(true, "", p3GraphOn(t, l.db)))
+	n = l.puts.count()
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackRetry || l.puts.count() != n {
+		t.Fatalf("gate unverified: outcome %s with %d answers, want retry and none", out, l.puts.count()-n)
+	}
+	unchanged("gate unverified")
+	if out := l.qc.HandleCallbackDelivery(context.Background(), l.cfnBody(sess, "Create", nil), true); out != services.CallbackDone ||
+		l.puts.last(t).Status != awsdiscovery.CFNStatusFailed {
+		t.Fatalf("gate unverified, final delivery: %s %+v, want FAILED", out, l.puts.last(t))
+	}
+	unchanged("gate unverified, final delivery")
+
+	// Available: the same registration binds.
+	l.svc.WithPolicyGate(l.gateOn)
+	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone || l.puts.last(t).Status != awsdiscovery.CFNStatusSuccess {
+		t.Fatalf("gate on: %s %+v", out, l.puts.last(t))
+	}
+	if b := l.binding(t, sess.BindingID); b.State != models.EnforcementBindingVerified {
+		t.Fatalf("gate on: binding %+v, want verified", b)
 	}
 }
 
