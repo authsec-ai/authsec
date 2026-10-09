@@ -87,7 +87,9 @@ func newFxaLab(t *testing.T, name string) *fxaLab {
 	// Compile (propose, compile_plans, revalidation, rollout) reads through
 	// the production reader over the fake account.
 	l.live.delegate = services.NewGovAWSLiveReader(acc)
-	env := services.GovDeployEnv{AWS: acc, Trail: &dTrail{}}
+	// No CloudTrail (the P1-7 fix removed the dTrail stub): these approval
+	// tests never resolve an unknown outcome.
+	env := services.GovDeployEnv{AWS: acc}
 	l.dep = services.NewGovDeployments(l.db, &env).WithAuthoring(services.NewGovAuthoring(l.db, l.live)).WithSleep(noSleep)
 	l.dep.Executor = func(e *services.IGAGovAWSExecutor) { e.WithSleep(noSleep) }
 	l.dep.Register(l.worker)
@@ -750,7 +752,7 @@ func fxaIsolated(t *testing.T, name string) *fxaIsolation {
 		services.RegisterGovDeliveryHandler(igagov.DeliveryExport, nil)
 		services.SetGovLiveReader(prevLive)
 	})
-	x.dep = services.NewGovDeployments(l.db, &services.GovDeployEnv{Trail: &dTrail{}}).WithAuthoring(services.NewGovAuthoring(l.db, l.live))
+	x.dep = services.NewGovDeployments(l.db, &services.GovDeployEnv{}).WithAuthoring(services.NewGovAuthoring(l.db, l.live))
 	return x
 }
 
