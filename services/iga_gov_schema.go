@@ -64,6 +64,9 @@ var policyRelations = []string{
 	// 057_slack_link_one_per_member (review fix P0-3): one Slack link per
 	// member; the Slack linking code relies on it against concurrent links.
 	"uq_slack_user_link_member",
+	// 058_roll_gate_acceptance (fix/p3-roll): one gate_not_available
+	// acceptance per (rollout, gate, window).
+	"uq_iga_gov_acceptance_gate",
 	// 059_tidy_eval_pruned (fix/p3-tidy): finding reads answer 410 from it
 	"iga_gov_evaluation_pruned",
 }
@@ -189,6 +192,10 @@ var policyConstraints = []string{
 	// 056
 	"cloud_resource_policy_coverage.cloud_rpc_complete_chk", "cloud_resource_policy_coverage.cloud_rpc_reason_chk",
 	"cloud_resource_policy_observation.cloud_rpo_document_chk",
+	// 058_roll_gate_acceptance (fix/p3-roll): an acceptance of a rollout's
+	// gate names that rollout's version (the key and the FK that enforces it).
+	"iga_gov_rollout.iga_gov_rollout_workspace_id_id_version_id_key",
+	"iga_gov_acceptance.iga_gov_acceptance_rollout_version_fkey",
 }
 
 // PolicySchemaTriggers returns the "table.trigger" names VerifyPolicySchema
