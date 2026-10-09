@@ -207,9 +207,47 @@ type identityRow struct {
 const identityCols = `id, provider, account_kind, display_name, source_key, immutable_key, continuity, lifecycle, provider_attrs`
 
 // Resolve answers every key (§2.12). Keys are validated by the caller.
+//
+// All keys are answered from ONE repeatable-read, read-only transaction:
+// the lookups, every describe and every evidence build (whose snapshot
+// read nests in it as a savepoint) see the same database state, and 50 keys
+// cost one snapshot, not 50 (fix/p3-tidy).
+//
+// An AWS role resolves to an identity INCARNATION, by RoleId
+// (iga_identity_accounts.immutable_key, §2.2/§2.12): an ARN key is turned
+// into the RoleId the collected inventory (cloud_identity, the latest scan)
+// holds for that ARN and read by immutable_key; and whatever the key form,
+// a role whose ARN the inventory now shows under ANOTHER RoleId was
+// recreated after the publication the graph reflects, so the old
+// incarnation is never returned: not_found, reason role_recreated (it
+// resolves again once a publication projects the new incarnation).
 func (g *GovTargets) Resolve(ctx context.Context, ws uuid.UUID, keys []TargetKey) ([]ResolvedTarget, error) {
-	db := g.db.WithContext(ctx)
+	var out []ResolvedTarget
+	err := g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		out, err = g.resolveIn(ctx, tx, ws, keys)
+		return err
+	}, repeatableRead)
+	return out, err
+}
+
+// TargetReasonRoleRecreated: the role at this ARN has a RoleId other than
+// the incarnation the graph holds (§2.2: a recreated role is a new subject).
+const TargetReasonRoleRecreated = "role_recreated"
+
+func (g *GovTargets) resolveIn(ctx context.Context, db *gorm.DB, ws uuid.UUID, keys []TargetKey) ([]ResolvedTarget, error) {
 	out := make([]ResolvedTarget, 0, len(keys))
+	// The inventory's RoleIds by ARN, for every ARN key, in one read.
+	var arns []string
+	for _, k := range keys {
+		if k.RoleARN != "" {
+			arns = append(arns, k.RoleARN)
+		}
+	}
+	inv, err := cloudReads.RoleIDsByARN(db, ws, arns)
+	if err != nil {
+		return nil, err
+	}
 	for _, k := range keys {
 		if k.Provider == "k8s" || k.ClusterUID != "" || k.Namespace != "" || k.ServiceAccount != "" || k.UID != "" {
 			out = append(out, notSupportedK8s(k))
@@ -224,9 +262,42 @@ func (g *GovTargets) Resolve(ctx context.Context, ws uuid.UUID, keys []TargetKey
 				out = append(out, emptyTarget(k, TargetNotFound, "account_mismatch"))
 				continue
 			}
-			err = db.Raw(`SELECT `+identityCols+` FROM iga_identity_accounts
-			               WHERE workspace_id = ? AND provider = 'aws' AND source_key = ? AND lifecycle = 'active'`,
-				ws, igagraph.IdentityARNKey(k.RoleARN)).Scan(&rows).Error
+			ids := inv[k.RoleARN]
+			arnKey := igagraph.IdentityARNKey(k.RoleARN)
+			switch {
+			case len(ids) > 1:
+				// The inventory disagrees with itself about the role at
+				// this ARN (two connectors, two RoleIds): no incarnation.
+				out = append(out, emptyTarget(k, TargetAmbiguous, "several_role_ids_at_arn"))
+				continue
+			case len(ids) == 1:
+				// By RoleId: the incarnation the inventory names, and only
+				// while it still sits at this ARN.
+				err = db.Raw(`SELECT `+identityCols+` FROM iga_identity_accounts
+				               WHERE workspace_id = ? AND provider = 'aws' AND immutable_key = ? AND source_key = ? AND lifecycle = 'active'`,
+					ws, ids[0], arnKey).Scan(&rows).Error
+				if err == nil && len(rows) == 0 {
+					// No incarnation with that RoleId at this ARN in the
+					// graph: an older one (recreated since) or none at all.
+					var older int64
+					if err = db.Raw(`SELECT count(*) FROM iga_identity_accounts
+					                  WHERE workspace_id = ? AND provider = 'aws' AND source_key = ? AND lifecycle = 'active'`,
+						ws, arnKey).Scan(&older).Error; err != nil {
+						return nil, err
+					}
+					if older > 0 {
+						out = append(out, emptyTarget(k, TargetNotFound, TargetReasonRoleRecreated))
+						continue
+					}
+				}
+			default:
+				// Not in the collected inventory (no RoleId to read by):
+				// the graph's live row at this ARN; its incarnation is
+				// still checked below.
+				err = db.Raw(`SELECT `+identityCols+` FROM iga_identity_accounts
+				               WHERE workspace_id = ? AND provider = 'aws' AND source_key = ? AND lifecycle = 'active'`,
+					ws, arnKey).Scan(&rows).Error
+			}
 		case k.RoleID != "":
 			err = db.Raw(`SELECT `+identityCols+` FROM iga_identity_accounts
 			               WHERE workspace_id = ? AND provider = 'aws' AND immutable_key = ? AND lifecycle = 'active'`,
@@ -269,6 +340,14 @@ func (g *GovTargets) Resolve(ctx context.Context, ws uuid.UUID, keys []TargetKey
 			out = append(out, emptyTarget(k, TargetNotFound, "identity_retired"))
 			continue
 		}
+		recreated, err := recreatedSince(db, ws, row)
+		if err != nil {
+			return nil, err
+		}
+		if recreated {
+			out = append(out, emptyTarget(k, TargetNotFound, TargetReasonRoleRecreated))
+			continue
+		}
 		t, err := g.describe(ctx, db, ws, k, row)
 		if err != nil {
 			return nil, err
@@ -277,6 +356,32 @@ func (g *GovTargets) Resolve(ctx context.Context, ws uuid.UUID, keys []TargetKey
 		out = append(out, t)
 	}
 	return out, nil
+}
+
+// recreatedSince reports whether the collected inventory shows the row's
+// ARN under a RoleId other than the row's immutable_key: the incarnation the
+// graph holds was deleted and the name reused after the last publication.
+// A row without a RoleId, or an ARN the inventory does not list, is not
+// judged here.
+func recreatedSince(db *gorm.DB, ws uuid.UUID, row identityRow) (bool, error) {
+	if row.ImmutableKey == "" || row.AccountKind != models.CloudIdentityIAMRole {
+		return false, nil
+	}
+	arn := nativeOfSourceKey(row.SourceKey)
+	inv, err := cloudReads.RoleIDsByARN(db, ws, []string{arn})
+	if err != nil {
+		return false, err
+	}
+	ids := inv[arn]
+	if len(ids) == 0 {
+		return false, nil
+	}
+	for _, id := range ids {
+		if id == row.ImmutableKey {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // resolveObject resolves a graph object id to its holder identity: an
@@ -415,7 +520,7 @@ func (g *GovTargets) describe(ctx context.Context, db *gorm.DB, ws uuid.UUID, k 
 		}
 	}
 	if row.AccountKind == models.CloudIdentityIAMRole && row.ImmutableKey != "" {
-		b, src, err := g.build(ctx, ws, row.ID, nil)
+		b, src, _, err := g.buildBasisIn(ctx, db, ws, row.ID, nil)
 		switch {
 		case err == nil:
 			ev := &TargetEvidence{Trust: b.Trust, TrustReasons: b.TrustReasons, PublishedRev: &src.Rev,
@@ -575,10 +680,17 @@ type bundleBasis struct {
 
 // buildBasis is build, also returning the bundleBasis.
 func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+	return g.buildBasisIn(ctx, g.db, ws, identity, removed)
+}
+
+// buildBasisIn is buildBasis reading through dbIn: g.db, or the caller's
+// transaction (Resolve's one repeatable-read snapshot for every key; the
+// role snapshot's own transaction then nests in it as a savepoint).
+func (g *GovTargets) buildBasisIn(ctx context.Context, dbIn *gorm.DB, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 	fail := func(err error) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 		return igagov.Bundle{}, igagov.BundleSource{}, nil, err
 	}
-	db := g.db.WithContext(ctx)
+	db := dbIn.WithContext(ctx)
 	lc, err := g.repo.LatestComplete(db, ws)
 	if err != nil {
 		return fail(err)
@@ -586,7 +698,7 @@ func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, rem
 	if lc == nil {
 		return fail(ErrNoCompleteEvaluation)
 	}
-	gs, err := loadGovSnapshot(ctx, g.db, ws, lc.Rev, &identity)
+	gs, err := loadGovSnapshot(ctx, dbIn, ws, lc.Rev, &identity)
 	if err != nil {
 		return fail(err)
 	}
