@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -48,10 +49,15 @@ type ResourcePolicyCollection struct {
 	// not grant collection: every form was recorded not_collected unread.
 	TemplateCurrent bool
 	// EnabledRegionsKnown is false when the account's enabled regions could
-	// not be listed (unselected regions then have no rows; the compiler's
-	// enabled-region list still names them, as not_collected).
+	// not be listed (unselected regions then have no rows). Regions records
+	// that with the run, and every reader then treats each regional form as
+	// not_analysed (igagov.ReasonEnabledRegionsUnknown), never complete.
 	EnabledRegionsKnown bool
 	Coverage            []awsdiscovery.FormCoverage
+	// Regions is the region scope this collection used, frozen with the run
+	// (models.ScanCoverage.Regions): the scan worker stamps it on the run's
+	// coverage at publication.
+	Regions models.ScanRegionScope
 	// FormsWritten counts the (form, region) units this attempt wrote;
 	// FormsAlreadyRecorded the units an earlier attempt of the same run had.
 	FormsWritten, FormsAlreadyRecorded   int
@@ -97,7 +103,8 @@ func (s *AWSPermissionScanner) CollectResourcePolicies(
 	if partition == "" {
 		partition = awsdiscovery.PartitionOf(attrs.RoleARN)
 	}
-	out := &ResourcePolicyCollection{ScanRunID: scanRunID}
+	out := &ResourcePolicyCollection{ScanRunID: scanRunID,
+		Regions: models.ScanRegionScope{Selected: sortedRegionNames(attrs.Regions), Enabled: []string{}}}
 
 	if !awsdiscovery.GrantsResourcePolicyCollection(attrs.TemplateVersion) {
 		// §3.9: "Connectors on the older template record every collected form
@@ -111,6 +118,9 @@ func (s *AWSPermissionScanner) CollectResourcePolicies(
 		out.TemplateCurrent = true
 		enabled, known := s.enabledRegions(ctx, workspaceID, connectorID, attrs.Regions)
 		out.EnabledRegionsKnown = known
+		if known {
+			out.Regions.Enabled, out.Regions.EnabledKnown = sortedRegionNames(enabled), true
+		}
 		opts := awsdiscovery.CollectorOptions{}
 		if s.collectorOpts != nil {
 			opts = *s.collectorOpts
@@ -263,6 +273,20 @@ func (s *AWSPermissionScanner) enabledRegions(ctx context.Context, ws, conn uuid
 	return names, true
 }
 
+// sortedRegionNames is a sorted, de-duplicated copy without empty names.
+func sortedRegionNames(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range in {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // resourcePolicyClientsFor returns the per-region client source: an injected
 // one wins (tests); otherwise real clients from the connector's assumed-role
 // config for that region.
@@ -337,8 +361,8 @@ func LoadResourcePolicyEvidence(db *gorm.DB, workspaceID, scanRunID uuid.UUID) (
 
 // PruneResourcePolicyEvidence is the prune_evidence job's resource-policy
 // half (§3.9 "Retention"), with the workspace's evidence_retention_revs
-// (055; default 30 when the workspace has no settings row). T3.08 schedules
-// it daily.
+// (055; default 30 when the workspace has no settings row). The daily
+// prune_evidence job (iga_gov_prune_evidence.go) calls it.
 func PruneResourcePolicyEvidence(db *gorm.DB, workspaceID uuid.UUID) (repositories.PruneEvidenceResult, error) {
 	settings, err := repositories.NewIGAGovSettingsRepository(db).Get(workspaceID)
 	if err != nil {

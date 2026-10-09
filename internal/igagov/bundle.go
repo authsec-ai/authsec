@@ -201,7 +201,7 @@ func SummarizeCoverage(ev *ResourcePolicyEvidence, enabledRegions []string) stri
 		if f.State != FormCollected {
 			continue
 		}
-		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, &ResourcePolicyEvidence{Coverage: ev.Coverage}, enabledRegions)
+		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, ev.coverageOnly(), enabledRegions)
 		for _, r := range ra.Routes {
 			if r.Effect == RouteEffectNotAnalysed && r.Form == f.Name {
 				return CoveragePartial

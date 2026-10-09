@@ -79,6 +79,21 @@ const PermissionsVersion = ResourcePolicyTemplateVersion
 // (migration_evidence_unavailable), with the template update as the remedy.
 const ResourcePolicyTemplateVersion = "2026-10-07"
 
+// templateVersionPattern is the shape of a template version: a date.
+var templateVersionPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+
+// NormalizeTemplateVersion is a stack-reported template version as it is
+// recorded: trimmed, and "" (unknown, read as older by every gate) unless it
+// is a YYYY-MM-DD date -- a version string is compared as a date, so nothing
+// else may be stored as one.
+func NormalizeTemplateVersion(reported string) string {
+	v := strings.TrimSpace(reported)
+	if !templateVersionPattern.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
 // GrantsResourcePolicyCollection reports whether a connector's recorded
 // template version grants §3.9's collection. Versions are dates (YYYY-MM-DD),
 // so string order is date order. An empty value is a connector of unknown

@@ -816,7 +816,7 @@ func ProveFirstAttachment(role RoleRef, scanRunID string, ev *ResourcePolicyEvid
 			p.Incomplete = append(p.Incomplete, IncompleteForm{Form: f.Name, State: CoverageNotCollected})
 			continue
 		}
-		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, &ResourcePolicyEvidence{Coverage: ev.Coverage}, enabledRegions)
+		ra := AnalyzeRoutes(f.Namespace, RoleRef{}, ev.coverageOnly(), enabledRegions)
 		for _, r := range ra.Routes {
 			if r.Form == f.Name && r.Effect == RouteEffectNotAnalysed {
 				p.Incomplete = append(p.Incomplete, IncompleteForm{Form: f.Name, Region: r.Region, State: r.Reason})

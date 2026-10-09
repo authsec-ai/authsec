@@ -674,6 +674,9 @@ func codeOf(err error) string {
 	if c := apiCode(err); c != "" {
 		return c
 	}
+	if c := resolverCode(err); c != "" {
+		return c
+	}
 	return ErrorCode(err)
 }
 
@@ -700,10 +703,12 @@ func (a *formAcc) noteFirst(call string, err error) {
 	}
 }
 
-// listFailed records the form's own listing failure. A regional endpoint that
-// does not resolve on the FIRST page is "not offered here", not a failure.
+// listFailed records the form's own listing failure. Only AWS's documented
+// "not offered in this region" answer on the FIRST page is not a failure
+// (FormNotOfferedIn, review P1-11): any other NXDOMAIN, a DNS timeout or a
+// connection failure is a failed listing, so the form is partial.
 func (a *formAcc) listFailed(err error) {
-	if a.cov.Enumerated == 0 && errors.Is(listErr(a.listCall, err), ErrServiceNotInRegion) {
+	if a.cov.Enumerated == 0 && FormNotOfferedIn(a.cov.Form, a.cov.Region, err) {
 		a.notOffered = true
 		return
 	}
@@ -781,10 +786,10 @@ func (a *formAcc) finish() FormCoverage {
 	case a.noClient:
 		cov.State, cov.Reason = CoverageNotCollected, "no client for this service in "+cov.Region
 	case a.notOffered:
-		// Nothing is offered there, so nothing there is claimed: the empty set
-		// is the whole set (the reading item_failures.go gives
-		// ErrServiceNotInRegion). The reason says why it is empty.
-		cov.State, cov.Reason = CoverageComplete, "service not offered in "+cov.Region
+		// AWS does not offer the service there (FormNotOfferedIn: its
+		// documented regions exclude this one AND its endpoint there does not
+		// exist), so the empty set is the whole set. The reason says why.
+		cov.State, cov.Reason = CoverageComplete, "service not offered in "+cov.Region+" (not among the regions AWS documents it in)"
 	case a.listErr != nil && errors.Is(a.listErr, ErrCollectionBudget):
 		cov.State = CoveragePartial
 		cov.Reason = fmt.Sprintf("%s stopped: %v (%d listed, %d read)", a.listCall, ErrCollectionBudget, cov.Enumerated, cov.ReadOK)

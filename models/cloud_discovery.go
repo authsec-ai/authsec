@@ -443,6 +443,30 @@ type ScanCoverage struct {
 	Counters   map[string]int             `json:"counters,omitempty"`
 	// Error is set only when Status is failed.
 	Error string `json:"error,omitempty"`
+	// Regions is the region scope THIS run collected resource-policy
+	// evidence under, frozen at scan time (SPEC-iga-phase3-policy.md §3.9,
+	// review P1-6): the connector's selected regions as the run read them and
+	// the regions enabled in the account as DescribeRegions listed them then.
+	// The route analysis, the first-attachment proof, the evidence bundle and
+	// readiness read it from the run, never from the connector's live attrs,
+	// so a later region change cannot rewrite what an earlier scan covered.
+	// nil on a run that collected no resource-policy evidence, or that was
+	// collected before the scope was recorded.
+	Regions *ScanRegionScope `json:"regions,omitempty"`
+}
+
+// ScanRegionScope is ScanCoverage.Regions.
+type ScanRegionScope struct {
+	// Selected are the connector's regions the run read.
+	Selected []string `json:"selected"`
+	// Enabled are the regions enabled in the account when the run read them
+	// (empty when EnabledKnown is false).
+	Enabled []string `json:"enabled"`
+	// EnabledKnown is false when the enabled regions could not be listed (a
+	// refused or failed DescribeRegions, or a connector on the older
+	// discovery template, which is not asked): regions beyond Selected are
+	// then not known to be covered.
+	EnabledKnown bool `json:"enabled_known"`
 }
 
 // Complete reports whether every surface was reached. Reconciliation is gated

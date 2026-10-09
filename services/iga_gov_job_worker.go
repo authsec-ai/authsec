@@ -672,6 +672,9 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// T3.18: metrics_rollup, hourly per workspace (dedupe hour:<ts>), and
 	// its schedule.
 	RegisterMetricsJobs(w, NewGovMetrics(db, nil))
+	// Review P2: prune_evidence, daily per workspace (dedupe
+	// ws:<id>:day:<date>, §8.1), evaluation and resource-policy evidence.
+	RegisterPruneEvidenceJob(w)
 	return w
 }
 
