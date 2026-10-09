@@ -3,7 +3,6 @@ package services
 import (
 	"encoding/json"
 	"sort"
-	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -339,58 +338,11 @@ func appendGovEvent(tx *gorm.DB, ws uuid.UUID, name, actorKind, actorID string, 
 	})
 }
 
-// govRedactKeys are payload keys whose values never leave the server
-// through the events API or its export (§7.8 "redacted payloads").
-var govRedactKeys = []string{"secret", "token", "password", "credential", "external_id", "externalid",
-	"signature", "authorization", "private_key"}
-
-// govRedactKey reports whether a payload key is sensitive: a secret-like
-// substring, or an email address field ("email", "*_email", "emails";
-// not "email_enabled").
-func govRedactKey(k string) bool {
-	lk := strings.ToLower(k)
-	for _, s := range govRedactKeys {
-		if strings.Contains(lk, s) {
-			return true
-		}
-	}
-	return lk == "email" || lk == "emails" || strings.HasSuffix(lk, "_email")
-}
-
-// RedactGovEventPayload returns payload with the value of every sensitive
-// key (govRedactKey, at any depth) replaced by "[redacted]". An unparseable
-// payload is returned as {"unreadable": true}.
+// RedactGovEventPayload is the read-side redaction of the events API and
+// its export (§7.8 "redacted payloads"): models.RedactGovEventPayload, the
+// SAME function the model applies before every insert (review fix R1a P2),
+// so rows written before that fix are redacted on the way out too. An
+// unparseable payload is returned as {"unreadable": true}.
 func RedactGovEventPayload(payload json.RawMessage) json.RawMessage {
-	if len(payload) == 0 {
-		return json.RawMessage(`{}`)
-	}
-	var v any
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return json.RawMessage(`{"unreadable":true}`)
-	}
-	out, err := json.Marshal(govRedactValue(v))
-	if err != nil {
-		return json.RawMessage(`{"unreadable":true}`)
-	}
-	return out
-}
-
-func govRedactValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, x := range t {
-			if govRedactKey(k) {
-				t[k] = "[redacted]"
-			} else {
-				t[k] = govRedactValue(x)
-			}
-		}
-		return t
-	case []any:
-		for i := range t {
-			t[i] = govRedactValue(t[i])
-		}
-		return t
-	}
-	return v
+	return models.RedactGovEventPayload(payload)
 }
