@@ -10095,3 +10095,19 @@ ALTER TABLE ONLY public.cloud_resource_policy_observation
 
 ALTER TABLE ONLY public.cloud_resource_policy_observation
     ADD CONSTRAINT cloud_resource_policy_observation_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- 057_tidy_eval_pruned: which revisions' findings were pruned (§2.5).
+CREATE TABLE public.iga_gov_evaluation_pruned (
+    workspace_id uuid NOT NULL,
+    rev bigint NOT NULL,
+    pruned_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.iga_gov_evaluation_pruned
+    ADD CONSTRAINT iga_gov_evaluation_pruned_pkey PRIMARY KEY (workspace_id, rev);
+
+ALTER TABLE ONLY public.iga_gov_evaluation_pruned
+    ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_gov_evaluation_pruned
+    ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_rev_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation(workspace_id, rev) ON DELETE CASCADE;

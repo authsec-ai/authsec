@@ -16,9 +16,9 @@ import (
 // check; the gate that runs it is iga_gov_gate.go (PolicyGate), its routes
 // and the capabilities block controllers/platform/iga_gov_policy_controller.go.
 
-// PolicySchemaHead is the last Phase 3 migration (047-056; the spec's
+// PolicySchemaHead is the last Phase 3 migration (047-057; the spec's
 // original 044-053, moved up as a unit when 044-046 landed first).
-const PolicySchemaHead = "056"
+const PolicySchemaHead = "057"
 
 // policyRelations is every relation 047-056 create: each table, the sequence
 // behind iga_gov_event.id, and every explicitly named index. The indexes are
@@ -56,6 +56,8 @@ var policyRelations = []string{
 	// 056_cloud_resource_policy
 	"cloud_policy_document", "cloud_resource_policy_coverage", "cloud_resource_policy_observation",
 	"idx_cloud_rpo_scan_form",
+	// 057_tidy_eval_pruned (fix/p3-tidy): finding reads answer 410 from it
+	"iga_gov_evaluation_pruned",
 }
 
 // policyColumns are columns a relation check cannot prove. 047-056 add no
