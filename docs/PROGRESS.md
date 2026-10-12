@@ -4,6 +4,26 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-12 — Manual test reports (two interns): verified and fixed
+
+Two manual test reports (Identity Providers, Directory Sync, Custom Domains, Groups/Team; Apps, Clients, Roles, Logs) were checked against the code; every reported failure was reproduced or traced before it was changed. Committed locally; nothing pushed.
+
+### Done
+- **UI-035/UI-036** (UI `4f49ee9`): IdP Edit used the table row key as the id and always opened the SAML page; OIDC had no edit page and its activate/delete used a name slug. All actions now use `identity_providers.id`; new OIDC edit page; breadcrumb and back fixed; Microsoft/GitHub field names and help.
+- **UI-037** (UI `d7ecfac`): the pre-registration mutation dropped `client_kind`, so "AI Agent" clients were stored as `human_app`. "Approved" right after pre-registration is intended (admin pre-registration is the approval).
+- **AS-104** (`8434ffe`, UI `2d616a4`): role delete 500 reproduced (composite FK SET NULL on an application's default role; RESTRICT from memberships for admin/held roles). Now deletes, or 409 with a reason.
+- **AS-105** (`cc29ba4`, `45d556f`, UI `b954a42`): directory sync secure defaults; AD `use_ssl=false` was stored as true (GORM default tag); AD skip-verify refused in production unless `DIRECTORY_SYNC_ALLOW_SKIP_VERIFY=true`; Entra always verifies TLS; editing Entra kept failing (secret required) and loaded the AuthSec workspace/client ids as the Entra tenant/app; duplicate name 409.
+- **UI-038** (UI `b954a42`): the "akashnr" pre-fill was the browser filling the operator's own login (`autoComplete="username"/"current-password"`), not stored data; secrets are masked by the API and never reached the form.
+- **AS-106** (`3700865`, UI `4d999d5`): domain names validated on both sides; DNS verification says why it failed; another workspace's domain is 404.
+- **UI-039** (UI `aad18eb`): Team page Invite member action.
+- Tests: Test_RoleDelete, Test_SyncConfig_TLSSettings, Test_SyncConfig_EntraUpdateKeepsSecret, Test_CustomDomains_ValidateAndExplain (each fails on the old code), TestValidateDomainName, TestMatchTXT, TestCheckADSkipVerify; UI identityProviders, resourceServersApi, syncConfigForm, domainValidation tests.
+- Verified: backend build, vet, unit tests, flows/onboarding/flagsoff integration suites, ratchet 0; UI type-check 0, 181 tests, lint 0 errors, build.
+
+### Not changed (decisions or not reproducible)
+- **UI-040 Groups**: no Groups page exists in this build by design (routes removed; UsersPage says so). Owner decision: build it or leave it out. Found **AS-107** on the way (`/authz/groups/:id` parses UUIDs as integers).
+- **Entra "an error is displayed"** (Directory Sync 9): no error text was captured. Causes fixed: the edit-mode tenant/app id, the secret requirement, autofilled credentials. Remaining causes are configuration (Graph `User.Read.All` application permission with admin consent, now stated in the form). Test Connection still performs a full dry-run fetch, which can hit the 30 s UI timeout on large directories.
+- **Plain LDAP** is still allowed (warned in the UI and logged); refusing it needs StartTLS support or an owner decision.
+
 ## 2026-10-08 (cont.) — AS-081 multi-tenant SPIRE; Phase 6 complete
 
 Owner decision: make the embedded SPIRE control plane multi-tenant. Committed locally; nothing pushed.

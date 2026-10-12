@@ -44,6 +44,7 @@ Set or confirm (names only; values from your secret store):
 | `ICP_SERVICE_URL` | Required in production when SPIFFE SVIDs are used. |
 | `IGA_DISCOVERY_INGEST_AUTH` | `warn` (default) accepts and logs unauthenticated discovery reports; set `enforce` once every collector has an ingest token. |
 | `XAA_NATIVE_SEALER` | Required if any XAA issuance flag is on. |
+| `DIRECTORY_SYNC_ALLOW_SKIP_VERIFY` | Leave unset. In production, saving or testing an AD sync that skips LDAPS certificate verification is refused (AS-105); `true` is the explicit opt-out. Existing configurations keep syncing. |
 
 **Embedded SPIRE** (only if `ENABLE_EMBEDDED_SPIRE=true`):
 - The backend does not terminate TLS. Behind an ingress, the agent and mTLS
@@ -97,6 +98,13 @@ Use two workspaces (A and B) with an admin each.
 - [ ] **Resource servers:** registering a URL another workspace already uses
       now requires a verified domain covering its host (expected 409 otherwise).
 - [ ] **Admin MFA status** callers send `workspace_id` (the console does).
+- [ ] **Manual-test fixes (2026-10-12):** Identity Providers → Edit opens
+      both an OIDC and a SAML provider, Activate/Deactivate and Delete work;
+      a client created as "AI Agent" shows as Agent; deleting an unused role
+      works and `admin` is refused with a reason; Directory Sync forms start
+      with LDAPS on and verification on, and nothing is pre-filled; "bad
+      domain!!" keeps Add Domain disabled, and Verify DNS says why it failed;
+      Team → Invite member opens the invite dialog.
 
 ## 5. After the deploy
 
