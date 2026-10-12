@@ -75,11 +75,13 @@ type CreateSyncConfigRequest struct {
 	EntraConfig *EntraIDSyncConfig `json:"entra_config,omitempty"`
 }
 
-// EntraIDSyncConfig represents Entra ID sync configuration
+// EntraIDSyncConfig represents Entra ID sync configuration. WorkspaceID is the
+// Entra directory (tenant) id. Create requires it and the secret; an update
+// leaves empty fields, the secret included, as they are.
 type EntraIDSyncConfig struct {
-	WorkspaceID     string   `json:"workspace_id" binding:"required"`
+	WorkspaceID     string   `json:"workspace_id"`
 	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret" binding:"required"`
+	ClientSecret string   `json:"client_secret"`
 	Scopes       []string `json:"scopes,omitempty"`
 	SkipVerify   bool     `json:"skip_verify,omitempty"`
 }

@@ -108,6 +108,10 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt Entra ID config if applicable
 	if req.SyncType == "entra_id" && req.EntraConfig != nil {
+		if strings.TrimSpace(req.EntraConfig.WorkspaceID) == "" || strings.TrimSpace(req.EntraConfig.ClientSecret) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "entra_config.workspace_id (the directory tenant id) and entra_config.client_secret are required"})
+			return
+		}
 		syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
 		syncConfig.EntraClientID = req.EntraConfig.ClientID
 		syncConfig.EntraSkipVerify = req.EntraConfig.SkipVerify
