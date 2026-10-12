@@ -185,6 +185,108 @@ func main() {
 		log.Printf("[graph] %s is off: Phase 1 scanning, no projection", services.GraphProjectionEnv)
 	}
 
+	// IGA_POLICY (SPEC-iga-phase3-policy.md §4.3, T3.02): the Phase 3 policy
+	// product. ONE switch, read ONCE, default off. On requires
+	// IGA_GRAPH_PROJECTION=on (read live from the graph gate) and the Phase 3
+	// schema (047-056) verified by relation, retried on error and never cached
+	// as an answer. FAIL CLOSED: until all of that holds, every
+	// /api/iga/v1/policy route answers 503 policy_unavailable and
+	// /capabilities says why. Legacy agent-policy routes and workers are not
+	// gated by it.
+	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
+	services.SetPolicyGate(policyGate)
+	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
+	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
+	// ready hook, never before. It also claims nothing while the gate reads
+	// unavailable (graph gate off, read live). Stopped gracefully on shutdown.
+	policyWorkerCtx, stopPolicyWorker := context.WithCancel(context.Background())
+	defer stopPolicyWorker()
+	policyWorkerDone := make(chan (<-chan struct{}), 1)
+	if policyGate.Enabled() {
+		if state, reason, _ := policyGate.Status(); state != services.PolicyOn {
+			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
+		}
+		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			// Owner review hooks, notification channels (055 + Vault) and the
+			// compiler's discovery-role live reader: installed only once the
+			// Phase 3 schema has verified, before the worker that uses them.
+			var policyVault vault.VaultClient
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr != nil {
+					log.Printf("[policy] vault client: %v", verr)
+				} else {
+					policyVault = vc
+				}
+			}
+			// The AuthSec Slack app (Phase 3 §7.11, T3.14): installed when the
+			// signing secret, Vault and the app credentials are configured.
+			// InstallGovPolicyStartup installs the policy runtime (owner gate
+			// and the other authoring hooks) and THEN chains the Slack app's
+			// approval-request notices onto those hooks atomically, before the
+			// worker can deliver anything; /capabilities reports policy.slack
+			// from the same registration. fix/p3-appr (P1-4): the policy gate
+			// reports verified -- and serves any policy or Slack route -- only
+			// after this whole ready hook has returned, so nothing is served
+			// before the hooks are in place.
+			var slackApp *services.SlackIntegrationService
+			if app := services.SlackFromEnv(config.DB); app != nil {
+				if ok, reason := app.Configured(); ok {
+					slackApp = app
+				} else {
+					log.Printf("[slack] Slack app not enabled: %s", reason)
+				}
+			}
+			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
+			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
+			// the GitHub App key and connector credentials. Installed in EVERY
+			// process that serves the policy routes, before the worker check:
+			// proposals decide the IaC form at compile time in the API
+			// process, so a process started with AUTHSEC_DISABLE_POLICY_WORKER
+			// must still read the mapped source -- without an adapter an iac_pr
+			// target answers 503 iac_unavailable, never a silent export
+			// (review P2).
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr == nil {
+					services.ConfigureGovIaCDelivery(config.DB, vc)
+				} else {
+					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
+				}
+			}
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
+			}
+			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
+			// T3.16: deployments need AWS access (discovery + enforcement
+			// roles) and the binding gate; without Vault the deploy jobs wait.
+			if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
+				if vc, verr := vault.NewClient(va, vt); verr == nil {
+					services.SetGovDeployEnv(services.NewProductionGovDeployEnv(config.DB, vc))
+				} else {
+					log.Printf("[policy] deployments not enabled: %v", verr)
+				}
+			} else {
+				log.Printf("[policy] deployments not enabled: VAULT_ADDR/VAULT_TOKEN not configured")
+			}
+			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
+		})
+	} else {
+		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
+	}
+
+	// IGA_LEGACY_AGENT_POLICY (disposition plan §3.2): read ONCE, default on.
+	// Off stops this process starting the two legacy agent-policy workers
+	// (started below, with the other governance workers) and nothing else.
+	// Installed before the routes are mounted: the legacy compatibility routes
+	// consult it.
+	legacyAgentPolicyGate := services.LegacyAgentPolicyGateFromEnv()
+	services.SetLegacyAgentPolicyGate(legacyAgentPolicyGate)
+	if w := legacyAgentPolicyGate.Warning(); w != "" {
+		log.Printf("WARNING: [legacy-agent-policy] %s", w)
+	}
+	log.Print(legacyAgentPolicyGate.Decision())
+
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -223,6 +325,10 @@ func main() {
 				qc := services.NewAWSQuickCreateService(
 					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
 					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
+				// The enforcement stack's Custom::AuthSecEnforcementRegistration
+				// (Phase 3, T3.09) reports through the same topics and queue.
+				qc.WithEnforcementHandler(services.NewEnforcementBindingService(config.DB, vc, cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN")))
 				// Built inside the goroutine: it reads the queue's settings from
 				// SQS, and a slow or unreachable SQS must never delay boot.
 				go func() {
@@ -512,10 +618,7 @@ func main() {
 		// Five minutes: the same cadence as JML, and the actions are the same
 		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
 		// less access.
-		policyWorker := services.NewPolicyReconcileWorker(config.DB, 5*time.Minute)
-		policyWorker.Start()
-		log.Printf("agent policy reconcile worker started (interval=5m)")
-
+		//
 		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
 		// Runs at five minutes rather than hourly because the DELIVERY half also
 		// retries: an SMTP blip should cost minutes, not a whole warning.
@@ -524,9 +627,14 @@ func main() {
 		// let an SMTP outage quietly turn every destructive policy into a no-op,
 		// which is the failure this exists to prevent. It is recorded instead, and
 		// the action executes as a governance exception.
-		warningWorker := services.NewPolicyWarningWorker(config.DB, 5*time.Minute, 50)
-		warningWorker.Start()
-		log.Printf("policy pre-deadline warning worker started (interval=5m)")
+		//
+		// Both are the legacy agent-policy stack, so both start only while
+		// IGA_LEGACY_AGENT_POLICY is on (read above). ExpiryWorker and the lease
+		// reaper are shared runtime infrastructure and start regardless.
+		for _, name := range services.StartLegacyAgentPolicyWorkers(legacyAgentPolicyGate,
+			services.NewLegacyAgentPolicyWorkers(config.DB)) {
+			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────
@@ -563,6 +671,19 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// The policy job worker stops claiming, gives running jobs their grace,
+	// and hands back what did not finish (§8.1).
+	stopPolicyWorker()
+	select {
+	case done := <-policyWorkerDone:
+		select {
+		case <-done:
+		case <-ctx.Done():
+			log.Println("Policy job worker did not stop within the grace period")
+		}
+	default:
+	}
 
 	if metricsSrv != nil {
 		_ = metricsSrv.Shutdown(ctx)

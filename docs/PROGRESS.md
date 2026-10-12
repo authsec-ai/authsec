@@ -4,6 +4,26 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-12 (cont.) — authsec-staging merged again (PR conflicts)
+
+The PR from fix/p0-containment to authsec-staging had conflicts; staging was merged into the branch locally (120 commits: IGA governance phase 3, migrations 047-059). Nothing pushed.
+
+### Conflicts and how they were resolved
+- `go.mod`: our direct requirements kept; `go mod tidy` (same versions as staging).
+- `cmd/main.go`: both shutdown steps (policy job worker, metrics server).
+- `services/policy_warning_senders.go`: staging's `notify.Webhook`; `internal/notify` now defaults to the SSRF-safe client (AS-042 would otherwise have regressed).
+- User deletes (`admin_invite`, `admin_user`, `enduser`, `scim_admin`): our scoped transactions kept, staging's 409 `user_has_audit_history` added on top.
+- `database/workspace_repository.go` DeleteTenant: our RLS transaction with staging's purge order and `authsec.workspace_purge` flag; users are counted before the cascading workspace delete.
+- `001_bootstrap.sql`: staging's 047-059 block, then ours (101-130), so 111's RLS loop covers the new tables.
+- Semantic: `policyID` declared twice (ours renamed `spirePolicyID`).
+- Four staging tests assumed lenient behaviour: a foreign body workspace is now 404 (AuthMiddleware), users need a home workspace (105), the purge runs as the workspace owner (no super admin), and the tenancy context is set in harnesses.
+- Staging's purge test found AS-109 (workspace delete always 500 on our branch); fixed.
+
+### Verified
+- Upgrade path: a DB migrated by the staging binary (58 migrations) upgrades with this build (21 applied) to the same schema as a fresh install (`scripts/schema-parity.sh`).
+- Ratchet: main 0; staging's 295 statements quarantined (AS-108).
+- TestP3T311ProposeCompileApprove and TestP3T311TrustLiveWithdrawArchiveIsolation fail on staging itself as well (audit rows); not caused by the merge.
+
 ## 2026-10-12 — Manual test reports (two interns): verified and fixed
 
 Two manual test reports (Identity Providers, Directory Sync, Custom Domains, Groups/Team; Apps, Clients, Roles, Logs) were checked against the code; every reported failure was reproduced or traced before it was changed. Committed locally; nothing pushed.

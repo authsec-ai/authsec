@@ -12,6 +12,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 baseline_file=scripts/tenant-exempt-baseline.txt
 
+# Quarantine (AS-108): files merged from authsec-staging (IGA governance,
+# Slack, cloud evidence) before they were moved onto the scoped layer. Their
+# statements are counted apart, against their own baseline, which may only go
+# down; no file may be added to the list. Every other file is held to the
+# main baseline (0).
+quarantine_file=scripts/tenant-exempt-quarantine.txt
+quarantine_baseline_file=scripts/tenant-exempt-quarantine-baseline.txt
+
 # Packages whose every query runs on the transaction tenancy.RLSTransaction
 # opens (app.workspace_id set, role authsec_tenant), so row-level security
 # scopes them whatever the SQL text says. Their raw SQL is not counted, but
@@ -30,7 +38,7 @@ for pkg in "${rls_only[@]}"; do
 done
 rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
 
-count=$(git ls-files '*.go' \
+hits=$(git ls-files '*.go' \
   | grep -v '_test\.go$' \
   | grep -v '^internal/tenancy/' \
   | grep -v '^tests/' \
@@ -65,15 +73,32 @@ count=$(git ls-files '*.go' \
         if (closing) { instr = 0; cover = 0 }
         if (!skip && line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
-            && line !~ /^[[:space:]]*\/\//) n++
+            && line !~ /^[[:space:]]*\/\//) print FILENAME
         h3 = h2; h2 = h1; h1 = line
-      }
-      END { print n + 0 }')
+      }')
+
+quarantined=$(grep -vE '^[[:space:]]*(#|$)' "$quarantine_file" || true)
+if [[ -n "$quarantined" ]]; then
+  qcount=$(grep -cxF -f <(echo "$quarantined") <<<"$hits" || true)
+  count=$(grep -cvxF -f <(echo "$quarantined") <<<"$hits" || true)
+else
+  qcount=0
+  count=$(grep -c . <<<"$hits" || true)
+fi
 
 if [[ "${1:-}" == "--update" ]]; then
   echo "$count" > "$baseline_file"
-  echo "tenant-exempt baseline set to $count"
+  echo "$qcount" > "$quarantine_baseline_file"
+  echo "tenant-exempt baseline set to $count (quarantine $qcount)"
   exit 0
+fi
+
+qbaseline=$(cat "$quarantine_baseline_file")
+echo "quarantined unscoped raw SQL statements: $qcount (baseline $qbaseline)"
+if (( qcount > qbaseline )); then
+  echo "New raw SQL in a quarantined file (see $quarantine_file)." >&2
+  echo "Use the tenancy package, or add '// TENANT-EXEMPT: <reason>'." >&2
+  exit 1
 fi
 
 baseline=$(cat "$baseline_file")

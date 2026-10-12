@@ -151,6 +151,82 @@ func AdditionalPermissions() []Permission {
 				"would otherwise never see -- reporting access as granted when " +
 				"the resource itself blocks it.",
 		},
+		{
+			Surface: "resource-policy-collection",
+			Actions: ResourcePolicyCollectionActions(),
+			Why: "Lists every S3 bucket, directory bucket, access point, " +
+				"multi-region and Object Lambda access point, KMS key, SQS " +
+				"queue, SNS topic, Lambda function, version, alias and layer " +
+				"version, and Secrets Manager secret, and reads the resource " +
+				"POLICY of each (template 2026-10-07). Only policy text is " +
+				"read: no object, message, key material or secret value. " +
+				"Needed so a proposed permission change can be shown not to " +
+				"cut off access a resource policy grants, form by form and " +
+				"region by region.",
+		},
+		{
+			Surface: "migration-evidence",
+			Actions: MigrationEvidenceActions(),
+			Why: "Read only when AuthSec proposes moving one workload off a " +
+				"shared role: which task-definition revision each ECS service " +
+				"and its running tasks use, which version each Lambda alias " +
+				"and event-source mapping points at, and which instance " +
+				"profile each Auto Scaling group and instance carries -- the " +
+				"evidence that the move happened. Never stored as inventory; " +
+				"nothing is changed (template 2026-10-07).",
+		},
+	}
+}
+
+// ResourcePolicyCollectionActions are the enumerate and read actions of
+// every collected resource-policy form (SPEC-iga-phase3-policy.md §3.9),
+// beyond s3:GetBucketPolicy and kms:GetKeyPolicy (granted since 2026-09-18)
+// and lambda:ListFunctions (WorkloadReads). The template's ResourcePolicies
+// statement grants exactly these plus those two;
+// TestP3RPCTemplateGrantsCollectionActions holds them together.
+func ResourcePolicyCollectionActions() []string {
+	return []string{
+		"s3:ListAllMyBuckets",
+		"s3express:ListAllMyDirectoryBuckets",
+		"s3express:GetBucketPolicy",
+		"s3:ListAccessPoints",
+		"s3:GetAccessPointPolicy",
+		"s3:ListMultiRegionAccessPoints",
+		"s3:GetMultiRegionAccessPointPolicy",
+		"s3:ListAccessPointsForObjectLambda",
+		"s3:GetAccessPointPolicyForObjectLambda",
+		"kms:ListKeys",
+		"sqs:ListQueues",
+		"sqs:GetQueueAttributes",
+		"sns:ListTopics",
+		"sns:GetTopicAttributes",
+		"lambda:ListVersionsByFunction",
+		"lambda:ListAliases",
+		"lambda:GetPolicy",
+		"lambda:ListLayers",
+		"lambda:ListLayerVersions",
+		"lambda:GetLayerVersionPolicy",
+		"secretsmanager:ListSecrets",
+		"secretsmanager:GetResourcePolicy",
+	}
+}
+
+// MigrationEvidenceActions are §11's read-only migration-evidence actions
+// not already granted elsewhere (lambda:ListAliases and
+// lambda:ListVersionsByFunction are in ResourcePolicyCollectionActions;
+// ec2:DescribeInstances is in WorkloadReads).
+func MigrationEvidenceActions() []string {
+	return []string{
+		"ecs:ListClusters",
+		"ecs:ListServices",
+		"ecs:DescribeServices",
+		"ecs:ListTasks",
+		"ecs:DescribeTasks",
+		"lambda:GetFunctionConfiguration",
+		"lambda:ListEventSourceMappings",
+		"autoscaling:DescribeAutoScalingGroups",
+		"ec2:DescribeLaunchTemplateVersions",
+		"ec2:DescribeIamInstanceProfileAssociations",
 	}
 }
 

@@ -116,12 +116,13 @@ func TestP2ContractDiscoveryRoutes(t *testing.T) {
 			contractReq("integration", contractConst(refOf("cloud_connector", a.conn))),
 			contractReq("source", contractConst("ec2:DescribeRegions")),
 			contractReq("error", contractNull),
-			// The stack version recorded at onboarding and this build's, as
-			// facts (D-72).
+			// The version recorded at onboarding and this build's, as facts
+			// (D-72). This connector was onboarded by role ARN: the version is
+			// the build's own, not the stack's, so outdated is unknown (null).
 			contractReq("template", contractAll(contractTemplate, contractConst(map[string]any{
-				"deployed": awsdiscovery.TemplateVersion, "current": awsdiscovery.TemplateVersion, "outdated": false,
+				"deployed": awsdiscovery.TemplateVersion, "current": awsdiscovery.TemplateVersion, "outdated": nil,
 			}))),
-			contractReq("template_outdated", contractConst(false)),
+			contractReq("template_outdated", contractNull),
 			contractReq("note", contractNonEmpty),
 		)),
 	))

@@ -2295,6 +2295,100 @@ fail the job forever. (E13)
 
 ---
 
+### 2.16 Kubernetes resources: what a rule reaches, and where
+
+**Status: proposed, 8 Oct 2026. Not implemented; nothing below is built.**
+
+**The gap, traced.** The Kubernetes walk ends at a rule. The projector writes
+no `iga_resources` or `iga_entitlement_target` row for provider `k8s`
+(`internal/k8sgraph/project.go`, `services/k8s_rbac_service.go`), the walk's
+edge kinds are `executes_as`, `grant` and `member_of` only
+(`internal/igaread/traverse_k8s.go`), and nothing collects concrete objects. So
+no screen answers *which workload can reach which secret*. The schema does not
+block it: migration 040's check forbids `resource_id` on a Kubernetes **grant**,
+not on a target; `iga_resources` and `iga_entitlement_target` have no provider
+check; and the AWS `target` traversal is provider-parametrised.
+
+**The constraint that shapes the design: a rule does not know where it
+applies.** A Kubernetes rule says *get secrets*. Where is decided by the
+binding: a RoleBinding applies it in the binding's namespace (even when the
+role is a ClusterRole), a ClusterRoleBinding applies it everywhere. One
+ClusterRole rule bound in two namespaces reaches two different sets of
+secrets. A target edge drawn from the rule as stored today would let every
+holder of that rule appear to reach every namespace any binding names — a
+wrong path, which is worse than a missing one.
+
+**Decision proposed — a rule is projected once per place it applies.** The
+rule row (`iga_entitlements`, provider `k8s`) is keyed by the rule *and* its
+effective scope: a namespaced Role's rule is unchanged (its scope is its
+namespace); a ClusterRole's rule gets one row per distinct binding scope
+(cluster-wide for a ClusterRoleBinding, `<namespace>` for each RoleBinding).
+Grants point at the scoped row. Targets hang off the scoped row, so every
+stored edge is true on its own and the walk stays stateless. The rule card
+keeps grouping by role (`policy_ref`); its scope badge becomes the row's own
+scope. Reconciliation retires today's unscoped ClusterRole rule rows on the
+first complete sweep after release, which the existing rule already does for
+any unconfirmed key. Cost: a ClusterRole bound in *n* namespaces stores *n*
+copies of its rules; measured on the production cluster before release
+(115 roles and 99 bindings in the 8 Oct sweep).
+
+**Resource nodes.** Each scoped rule names targets; each target is an
+`iga_resources` row, provider `k8s`, keyed by cluster, scope, API group,
+resource type and, when given, name. They use §2.14.12's kinds, never a new
+word, and none claims the object exists:
+
+| Rule says | Node | Kind | Label |
+|---|---|---|---|
+| `secrets` in a namespaced scope | one per (group, type, namespace) | selector | *Secrets in payments* |
+| `secrets` via a ClusterRoleBinding | one per (group, type) | selector | *Secrets in every namespace* |
+| `resourceNames: [db-password]` | one per name | exact reference | *Secret payments/db-password* (or *db-password, in any namespace* when cluster-wide) |
+| `pods/exec`, `pods/log` | the subresource is its own type | selector | *Exec into pods in payments* |
+| `*` resources or `*` groups | one wildcard node per scope | selector | *Every resource in payments*, flagged |
+| `nonResourceURLs` | one per URL, cluster scope | selector | *URL /metrics* |
+| cluster-scoped types (`nodes`, `namespaces`, `persistentvolumes`, `clusterroles`, …) | scope is always the cluster | selector | *Nodes* |
+
+Verbs stay on the rule; the target edge says *applies to*, as for AWS.
+Whether a type is namespaced comes from a fixed table of built-in kinds;
+an unknown type (a CRD) is drawn at the scope the binding gives, and its
+inspector says the type was not checked.
+
+**Containment, which AWS cannot compute but Kubernetes can.** A selector
+*Secrets in payments* contains every exact *Secret payments/x*; *Secrets in
+every namespace* contains both. The resource page's *who can reach this*
+includes holders of every containing selector, labelled *through a broader
+rule*. This is string matching on (cluster, namespace, group, type, name),
+exact, and never presented as evaluated access.
+
+**Workload-side objects, a second step.** Sightings already carry the names
+of Secrets a workload mounts or reads into its environment
+(`metadata.provisioning_hints.secret_refs`; names and keys only, never values).
+Drawing *workload mounts Secret payments/db-password* reuses the same exact
+node, but needs a new relationship kind from a workload to a resource
+(`iga_relationship` only targets identities today, so a migration widens its
+check). It is valuable because a mounted Secret is readable by the Pod whatever
+RBAC says. ConfigMaps are not collected and are out of scope.
+
+**Not proposed: enumerating objects.** Listing every Secret, ConfigMap and Pod
+would turn selectors into real objects, but requires the agent to `list
+secrets` cluster-wide, which grants reading their values. That is a trust
+decision for a customer, not a default, and is not part of this section.
+
+**Reads and screens.** Add `target` to the Kubernetes edge kinds and teach the
+Kubernetes node fetch the resource type; make named-by counts and the
+inventory's resource class provider-neutral; a Kubernetes resource page at
+`/iga/k8s/resource/:id` reads the graph routes (root `resource:<id>`, reverse
+direction) because `/api/iga/v1/resources/:id` is AWS-only. The workload's
+Overview groups *what the cluster lets it do* by resource (*Secrets in
+payments: get, list — through RoleBinding x*); the Graph tab draws
+workload → ServiceAccount → rule → resource; Discovery's Kubernetes provider
+gains a Resources type.
+
+**Acceptance.** Against a real sweep, not fixtures: a ClusterRole bound by a
+RoleBinding in one namespace never reaches another namespace's resources;
+a ClusterRoleBinding reaches *every namespace*; removing a binding retires its
+scoped rule copies and their resource edges on the next complete sweep; a
+workload page and a resource page agree on the same path.
+
 ## 3. Schema
 
 **Numbering, verified.** Production (`0e75ad7`) ends at

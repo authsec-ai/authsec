@@ -1,0 +1,1 @@
+{"Statement":[{"Action":["ec2:Describe*","s3:GetObject"],"Condition":{"StringEquals":{"aws:RequestedRegion":"us-east-1"}},"Effect":"Allow","Resource":"*","Sid":"Compute"},{"Action":"iam:*","Effect":"Deny","Resource":"*","Sid":"NoIam"}],"Version":"2012-10-17"}

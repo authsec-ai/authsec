@@ -1,0 +1,37 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAWJ4EXAMPLEREFUND1:refund-handler",
+    "arn": "arn:aws:sts::429418377036:assumed-role/RefundTaskRole/refund-handler",
+    "accountId": "429418377036",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAWJ4EXAMPLEREFUND1",
+        "arn": "arn:aws:iam::429418377036:role/service-role/RefundTaskRole",
+        "accountId": "429418377036",
+        "userName": "RefundTaskRole"
+      }
+    }
+  },
+  "eventTime": "2026-10-06T12:30:00Z",
+  "eventSource": "dynamodb.amazonaws.com",
+  "eventName": "DescribeTable",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "lambda.amazonaws.com",
+  "userAgent": "lambda.amazonaws.com",
+  "errorCode": "ThrottlingException",
+  "errorMessage": "Rate exceeded",
+  "requestParameters": {
+    "tableName": "refunds"
+  },
+  "responseElements": null,
+  "requestID": "4e8a6b8b-b072-4099-8dae-8f2c6d4b7c65",
+  "eventID": "4e8a6b8b-b072-4099-8dae-8f2c6d4b7c65",
+  "readOnly": true,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management"
+}

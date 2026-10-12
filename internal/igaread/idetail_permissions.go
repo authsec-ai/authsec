@@ -732,8 +732,9 @@ const (
 //  2. the run is iga_projection_state's for the identity's own live support
 //     row (current preferred), and its coverage's activity surface decides:
 //     absent -> not read; reached -> collected; partial -> the capped sample
-//     is named by capped_after (D-86, byte order of the ARN, which is Go's
-//     string order): an ARN after it was not sampled; a sampled one counts
+//     is named by capped_after and prioritized (D-86, T3.03; byte order of
+//     the ARN, which is Go's string order): an ARN after capped_after that
+//     was not prioritised was not sampled; a sampled one counts
 //     as collected only when that run's rows for it exist (a partial read
 //     cannot tell "no services" from "report failed"); any other state ->
 //     not collected;
@@ -801,7 +802,7 @@ func idetailActivity(q *Query, ident *idetailIdentityRow) (IdentityActivity, err
 	default:
 		return notCollected(ActivitySurfaceFailed)
 	}
-	if surf.State == models.CloudCoveragePartial && surf.CappedAfter != "" && arn > surf.CappedAfter {
+	if surf.State == models.CloudCoveragePartial && !surf.ActivitySampled(arn) {
 		return notCollected(ActivityOutsideSample)
 	}
 	// A newer scan has touched the connector's activity when it left a row

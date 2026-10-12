@@ -40,13 +40,13 @@ func NewAdminInviteController() (*AdminInviteController, error) {
 
 // InviteAdminRequest represents the request body for inviting an admin
 type InviteAdminRequest struct {
-	Email        string `json:"email" binding:"required,email"`
-	FirstName    string `json:"first_name"`
-	LastName     string `json:"last_name"`
-	Username     string `json:"username" binding:"required"`
-	ClientID     string `json:"client_id"`
+	Email           string `json:"email" binding:"required,email"`
+	FirstName       string `json:"first_name"`
+	LastName        string `json:"last_name"`
+	Username        string `json:"username" binding:"required"`
+	ClientID        string `json:"client_id"`
 	WorkspaceID     string `json:"workspace_id"`
-	ProjectID    string `json:"project_id"`
+	ProjectID       string `json:"project_id"`
 	WorkspaceDomain string `json:"workspace_domain"`
 }
 
@@ -64,12 +64,12 @@ type InviteAdminResponse struct {
 
 // InvitedUserPayload is a sanitized view of the invited admin.
 type InvitedUserPayload struct {
-	ID           string `json:"id"`
-	Email        string `json:"email"`
-	Username     string `json:"username"`
-	ClientID     string `json:"client_id,omitempty"`
+	ID              string `json:"id"`
+	Email           string `json:"email"`
+	Username        string `json:"username"`
+	ClientID        string `json:"client_id,omitempty"`
 	WorkspaceID     string `json:"workspace_id,omitempty"`
-	ProjectID    string `json:"project_id,omitempty"`
+	ProjectID       string `json:"project_id,omitempty"`
 	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
@@ -206,9 +206,9 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		CreatedAt:                  time.Now(),
 		UpdatedAt:                  time.Now(),
 		ClientID:                   clientIDPtr,
-		WorkspaceID:                   workspaceIDPtr,
+		WorkspaceID:                workspaceIDPtr,
 		ProjectID:                  projectIDPtr,
-		WorkspaceDomain:               strings.TrimSpace(req.WorkspaceDomain),
+		WorkspaceDomain:            strings.TrimSpace(req.WorkspaceDomain),
 	}
 
 	// Hash the password
@@ -260,11 +260,11 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	// Audit log: Admin user invited
 	middlewares.Audit(c, "admin_user", adminUser.ID.String(), "invite", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"email":      adminUser.Email,
-			"username":   adminUser.Username,
-			"name":       adminUser.Name,
-			"workspace_id":  workspaceIDFromToken,
-			"email_sent": emailSent,
+			"email":        adminUser.Email,
+			"username":     adminUser.Username,
+			"name":         adminUser.Name,
+			"workspace_id": workspaceIDFromToken,
+			"email_sent":   emailSent,
 		},
 	})
 
@@ -277,12 +277,12 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		ExpiresAt:         expiresAt.Format(time.RFC3339),
 		EmailSent:         emailSent,
 		User: &InvitedUserPayload{
-			ID:           adminUser.ID.String(),
-			Email:        adminUser.Email,
-			Username:     adminUser.Username,
-			ClientID:     uuidOrEmpty(adminUser.ClientID),
+			ID:              adminUser.ID.String(),
+			Email:           adminUser.Email,
+			Username:        adminUser.Username,
+			ClientID:        uuidOrEmpty(adminUser.ClientID),
 			WorkspaceID:     uuidOrEmpty(adminUser.WorkspaceID),
-			ProjectID:    uuidOrEmpty(adminUser.ProjectID),
+			ProjectID:       uuidOrEmpty(adminUser.ProjectID),
 			WorkspaceDomain: adminUser.WorkspaceDomain,
 		},
 	})
@@ -365,7 +365,8 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		return
 	}
 	// One row-level security transaction for the caller's workspace; every
-	// statement binds workspace_id = $1.
+	// statement binds workspace_id = $1. A refused user delete rolls back the
+	// binding and membership deletes with it.
 	err = tenancy.WithTx(ctx, db.DB, ws, func(tx *sql.Tx) error {
 		if _, err := tenancy.ExecContext(ctx, tx, `DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`, userUUID); err != nil {
 			return err
@@ -377,11 +378,15 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		// Audit / approval records still naming the user are kept: an
+		// explicit 409, never a raw foreign-key error (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			return
+		}
 		log.Printf("User-flow: failed to cancel invite for %s: %v", userUUID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
 		return
 	}
-
 	// Audit log
 	middlewares.Audit(c, "admin_user", userUUID.String(), "invite_cancelled", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
@@ -542,14 +547,14 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 
 // PendingInvite represents a pending admin invitation
 type PendingInvite struct {
-	UserID       string  `json:"user_id"`
-	Email        string  `json:"email"`
-	Username     string  `json:"username"`
-	Name         string  `json:"name"`
+	UserID          string  `json:"user_id"`
+	Email           string  `json:"email"`
+	Username        string  `json:"username"`
+	Name            string  `json:"name"`
 	WorkspaceDomain string  `json:"workspace_domain,omitempty"`
-	ExpiresAt    *string `json:"expires_at,omitempty"`
-	IsExpired    bool    `json:"is_expired"`
-	CreatedAt    string  `json:"created_at"`
+	ExpiresAt       *string `json:"expires_at,omitempty"`
+	IsExpired       bool    `json:"is_expired"`
+	CreatedAt       string  `json:"created_at"`
 }
 
 // ListPendingInvitesResponse represents the response for listing pending invites
@@ -598,13 +603,13 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 
 	for rows.Next() {
 		var (
-			id           uuid.UUID
-			email        string
-			username     string
-			name         sql.NullString
+			id              uuid.UUID
+			email           string
+			username        string
+			name            sql.NullString
 			workspaceDomain sql.NullString
-			expiresAt    sql.NullTime
-			createdAt    time.Time
+			expiresAt       sql.NullTime
+			createdAt       time.Time
 		)
 
 		if err := rows.Scan(&id, &email, &username, &name, &workspaceDomain, &expiresAt, &createdAt); err != nil {

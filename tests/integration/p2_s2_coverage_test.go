@@ -75,7 +75,7 @@ func TestP2S2CoverageFromTheCurrentRevision(t *testing.T) {
 	}
 	// The account and its stack are stated as facts (D-72).
 	if dig(accA, "account", "connected") != true || digs(accA, "connector_status") != models.CloudConnectorActive ||
-		digs(accA, "template", "current") != awsdiscovery.TemplateVersion || dig(accA, "template", "outdated") != false ||
+		digs(accA, "template", "current") != awsdiscovery.TemplateVersion || dig(accA, "template", "outdated") != nil ||
 		len(digl(accA, "runs")) != 1 || digs(digl(accA, "runs")[0]) != refOf("cloud_scan_run", runA1.ID) {
 		t.Fatalf("A's account facts = %v", accA)
 	}

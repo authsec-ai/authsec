@@ -1,0 +1,45 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAWJ4EXAMPLEREFUND1:ci-deployer",
+    "arn": "arn:aws:sts::429418377036:assumed-role/RefundTaskRole/ci-deployer",
+    "accountId": "429418377036",
+    "accessKeyId": "ASIAWJ4EXAMPLEKEY001",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAWJ4EXAMPLEREFUND1",
+        "arn": "arn:aws:iam::429418377036:role/service-role/RefundTaskRole",
+        "accountId": "429418377036",
+        "userName": "RefundTaskRole"
+      },
+      "attributes": {
+        "creationDate": "2026-10-06T09:14:02Z",
+        "mfaAuthenticated": "false"
+      }
+    }
+  },
+  "eventTime": "2026-10-06T09:15:44Z",
+  "eventSource": "sqs.amazonaws.com",
+  "eventName": "ListQueues",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "203.0.113.17",
+  "userAgent": "aws-cli/2.17.0 md/Botocore#1.35.0",
+  "errorCode": "AccessDenied",
+  "errorMessage": "User: arn:aws:sts::429418377036:assumed-role/RefundTaskRole/ci-deployer is not authorized to perform: sqs:ListQueues on resource: arn:aws:sqs:us-east-1:429418377036: because no permissions boundary allows the sqs:ListQueues action",
+  "requestParameters": null,
+  "responseElements": null,
+  "requestID": "6f1c1d53-2b0e-5a63-9d55-0b7f4c0e9a11",
+  "eventID": "0a8d1c47-7c3e-4c55-8f6a-4b8e2f0d3e21",
+  "readOnly": true,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management",
+  "tlsDetails": {
+    "tlsVersion": "TLSv1.3",
+    "cipherSuite": "TLS_AES_128_GCM_SHA256",
+    "clientProvidedHostHeader": "sqs.us-east-1.amazonaws.com"
+  }
+}

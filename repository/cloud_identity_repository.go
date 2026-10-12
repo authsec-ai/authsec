@@ -8,6 +8,7 @@ import (
 
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -35,6 +36,13 @@ type CloudIdentityRepository interface {
 	GetIdentity(workspaceID, id uuid.UUID) (*models.CloudIdentity, error)
 	GetIdentityByNativeID(workspaceID uuid.UUID, nativeID string) (*models.CloudIdentity, error)
 	ListIdentities(workspaceID uuid.UUID, f CloudIdentityFilter) ([]models.CloudIdentity, int64, error)
+
+	// FindForAttribution returns the connector's identities whose ARN is one
+	// of nativeIDs, and its IAM USERS whose name is one of iamUserNames: the
+	// candidates a batch of CloudTrail events can be attributed to (T3.04).
+	// Unbounded by the list cap on purpose -- every principal the events name
+	// is looked up, not the first 500 identities of the connector.
+	FindForAttribution(workspaceID, connectorID uuid.UUID, nativeIDs, iamUserNames []string) ([]models.CloudIdentity, error)
 
 	// CountsForConnector reports how many identities and secrets a connector
 	// currently holds, for the scan report.
@@ -290,6 +298,28 @@ func (r *cloudIdentityRepository) ListIdentities(workspaceID uuid.UUID, f CloudI
 		return nil, 0, err
 	}
 	return out, total, nil
+}
+
+func (r *cloudIdentityRepository) FindForAttribution(
+	workspaceID, connectorID uuid.UUID, nativeIDs, iamUserNames []string,
+) ([]models.CloudIdentity, error) {
+	if len(nativeIDs) == 0 && len(iamUserNames) == 0 {
+		return nil, nil
+	}
+	// Empty lists become a never-matching array rather than an IN () that
+	// GORM would render as a syntax error.
+	if nativeIDs == nil {
+		nativeIDs = []string{}
+	}
+	if iamUserNames == nil {
+		iamUserNames = []string{}
+	}
+	var out []models.CloudIdentity
+	err := r.db.Where(`workspace_id = ? AND connector_id = ?
+	                    AND (native_id = ANY(?::text[]) OR (kind = ? AND name = ANY(?::text[])))`,
+		workspaceID, connectorID, pq.StringArray(nativeIDs), models.CloudIdentityIAMUser, pq.StringArray(iamUserNames)).
+		Order("native_id, id").Find(&out).Error
+	return out, err
 }
 
 // Every cloud_* list ORDER BY ends in `id`.

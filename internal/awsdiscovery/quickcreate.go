@@ -109,6 +109,15 @@ func IsKnownRegion(region string) bool {
 // undeclared name is almost certainly a typo that CloudFormation would ignore
 // without a word, and a NoEcho one is ignored by design.
 func QuickCreateURL(region, templateURL, stackName string, params map[string]string) (string, error) {
+	declared, noEcho := templateParameters()
+	return buildQuickCreateURL(region, templateURL, stackName, params, declared, noEcho)
+}
+
+// buildQuickCreateURL is QuickCreateURL against a given template's declared
+// and NoEcho parameters, so the enforcement template (EnforcementQuickCreateURL)
+// gets exactly the same checks as the discovery one.
+func buildQuickCreateURL(region, templateURL, stackName string, params map[string]string,
+	declared, noEcho map[string]struct{}) (string, error) {
 	if err := ValidateRegion(region); err != nil {
 		return "", err
 	}
@@ -122,7 +131,6 @@ func QuickCreateURL(region, templateURL, stackName string, params map[string]str
 		return "", fmt.Errorf("%q is not a valid CloudFormation stack name", stackName)
 	}
 
-	declared, noEcho := templateParameters()
 	q := url.Values{}
 	q.Set("templateURL", templateURL)
 	q.Set("stackName", stackName)

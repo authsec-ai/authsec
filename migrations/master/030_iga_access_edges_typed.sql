@@ -28,6 +28,8 @@ UPDATE public.iga_access_edges
    SET subject_identity_account_id = subject_id, provider = 'github'
  WHERE subject_kind = 'identity_account' AND subject_identity_account_id IS NULL;
 
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.iga_access_edges'::regclass AND conname = 'iga_access_edges_subject_identity_fkey') THEN
 ALTER TABLE public.iga_access_edges
     ADD CONSTRAINT iga_access_edges_subject_identity_fkey
         FOREIGN KEY (workspace_id, subject_identity_account_id)
@@ -47,6 +49,7 @@ ALTER TABLE public.iga_access_edges
     ADD CONSTRAINT iga_access_edges_state_chk CHECK (state IN ('current','stale','ended')),
     ADD CONSTRAINT iga_access_edges_ended_chk CHECK ((state = 'ended') = (valid_to IS NOT NULL)),
     ADD CONSTRAINT iga_access_edges_ended_reason_chk CHECK ((state = 'ended') = (ended_reason <> ''));
+END IF; END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_access_edges_live
     ON public.iga_access_edges (workspace_id, source_key)

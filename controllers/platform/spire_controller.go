@@ -1196,7 +1196,7 @@ func (sc *SpireController) ListPolicies(c *gin.Context) {
 	c.JSON(http.StatusOK, policies)
 }
 
-func policyID(c *gin.Context) (uint64, bool) {
+func spirePolicyID(c *gin.Context) (uint64, bool) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
@@ -1211,7 +1211,7 @@ func (sc *SpireController) GetPolicy(c *gin.Context) {
 	if !ok {
 		return
 	}
-	id, ok := policyID(c)
+	id, ok := spirePolicyID(c)
 	if !ok {
 		return
 	}
@@ -1230,7 +1230,7 @@ func (sc *SpireController) UpdatePolicy(c *gin.Context) {
 	if !ok {
 		return
 	}
-	id, ok := policyID(c)
+	id, ok := spirePolicyID(c)
 	if !ok {
 		return
 	}
@@ -1283,7 +1283,7 @@ func (sc *SpireController) DeletePolicy(c *gin.Context) {
 	if !ok {
 		return
 	}
-	id, ok := policyID(c)
+	id, ok := spirePolicyID(c)
 	if !ok {
 		return
 	}

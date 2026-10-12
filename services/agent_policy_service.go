@@ -31,6 +31,9 @@ type AgentPolicyManager interface {
 	Get(workspaceID, id uuid.UUID) (*models.AgentPolicy, error)
 	List(workspaceID uuid.UUID, enabledOnly bool) ([]models.AgentPolicy, error)
 	Delete(workspaceID, id uuid.UUID) error
+	// Pause sets a policy disabled (agent_policy_legacy_compat.go). The only
+	// mutation the compatibility routes offer besides Delete.
+	Pause(workspaceID, id uuid.UUID) (*models.AgentPolicy, error)
 
 	// Expand resolves a policy to the agents it currently covers. A direct policy
 	// expands to one; a selector expands to whatever matches right now.

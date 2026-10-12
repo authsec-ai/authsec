@@ -611,6 +611,12 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		return record("users", res, err)
 	})
 	if err != nil {
+		// Audit / approval records still naming the user are kept: an
+		// explicit 409, never a raw foreign-key error (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			logger.WithError(err).Warn("Refused: the user is named by audit records")
+			return
+		}
 		logger.WithError(err).Error("Failed to hard delete admin user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1204,13 +1210,15 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	// Only the workspace's owner (its primary admin) may delete it. There is
 	// no platform super admin on a workspace token (ADR-0001 §7).
-	var ownerID *uuid.UUID
-	if err := config.DB.Table("workspaces").Select("owner_user_id").Where("id = ?", tc.WorkspaceID).Scan(&ownerID).Error; err != nil {
+	// uuid.NullUUID through Row().Scan: GORM's Scan into *uuid.UUID reads the
+	// column as a byte array and fails, which made every delete a 500.
+	var owner uuid.NullUUID
+	if err := config.DB.Table("workspaces").Select("owner_user_id").Where("id = ?", tc.WorkspaceID).Row().Scan(&owner); err != nil {
 		logger.WithError(err).Error("Failed to load workspace owner")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch tenant"})
 		return
 	}
-	if ownerID == nil || *ownerID != tc.PrincipalID {
+	if !owner.Valid || owner.UUID != tc.PrincipalID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only the workspace owner can delete the workspace"})
 		return
 	}
@@ -1245,6 +1253,12 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	logger.Info("Step 1: Deleting tenant data from master database")
 	deletedCounts, err := auc.workspaceRepo.DeleteTenant(c.Request.Context())
 	if err != nil {
+		// A user of this workspace still named by another workspace's
+		// audit records: refused, nothing deleted (review P0-1).
+		if shared.RespondUserAuditHistory(c, err) {
+			logger.WithError(err).Warn("Refused: a user of the workspace is named by another workspace's audit records")
+			return
+		}
 		logger.WithError(err).Error("Failed to delete tenant data from master database")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete tenant data: " + err.Error()})
 		return

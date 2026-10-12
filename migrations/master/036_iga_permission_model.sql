@@ -48,6 +48,8 @@ ALTER TABLE public.iga_entitlements
     ADD COLUMN IF NOT EXISTS content_hash    text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS negated         boolean NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS conditional     boolean NOT NULL DEFAULT false;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.iga_entitlements'::regclass AND conname = 'iga_entitlements_policy_fkey') THEN
 ALTER TABLE public.iga_entitlements
     ADD CONSTRAINT iga_entitlements_policy_fkey FOREIGN KEY (workspace_id, policy_id)
         REFERENCES public.iga_policy (workspace_id, id) ON DELETE CASCADE,
@@ -55,6 +57,7 @@ ALTER TABLE public.iga_entitlements
         provider <> 'aws'
         OR (policy_id IS NOT NULL AND statement_key <> '' AND effect IN ('allow','deny')
             AND content_hash <> ''));
+END IF; END $$;
 CREATE INDEX IF NOT EXISTS idx_iga_entitlements_policy
     ON public.iga_entitlements (workspace_id, policy_id) WHERE policy_id IS NOT NULL;
 
@@ -154,6 +157,8 @@ CREATE TABLE IF NOT EXISTS public.iga_assignment_evidence (
 
 -- A grant is reached through exactly one assignment, and only Allow statements
 -- are grants. Enforced for AWS rows; GitHub rows (provider = 'github') are exempt.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.iga_access_edges'::regclass AND conname = 'iga_access_edges_assignment_fkey') THEN
 ALTER TABLE public.iga_access_edges
     ADD COLUMN IF NOT EXISTS assignment_id uuid,
     ADD CONSTRAINT iga_access_edges_assignment_fkey FOREIGN KEY (workspace_id, assignment_id)
@@ -162,10 +167,13 @@ ALTER TABLE public.iga_access_edges
         provider <> 'aws'
         OR (assignment_id IS NOT NULL AND entitlement_id IS NOT NULL
             AND subject_identity_account_id IS NOT NULL AND resource_id IS NULL));
+END IF; END $$;
 CREATE INDEX IF NOT EXISTS idx_iga_access_edges_entitlement
     ON public.iga_access_edges (workspace_id, entitlement_id) WHERE state <> 'ended';
 
 -- Policies are nodes with multi-source support (§2.10B).
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.iga_object_support'::regclass AND conname = 'iga_os_policy_fkey') THEN
 ALTER TABLE public.iga_object_support
     ADD COLUMN IF NOT EXISTS policy_id uuid,
     ADD CONSTRAINT iga_os_policy_fkey FOREIGN KEY (workspace_id, policy_id)
@@ -175,6 +183,7 @@ ALTER TABLE public.iga_object_support ADD CONSTRAINT iga_object_support_one_chk 
     (identity_account_id IS NOT NULL)::int + (workload_id    IS NOT NULL)::int
   + (resource_id         IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int
   + (policy_id           IS NOT NULL)::int = 1);
+END IF; END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_policy
     ON public.iga_object_support (workspace_id, policy_id, connector_id, partition_key)
     WHERE policy_id IS NOT NULL;

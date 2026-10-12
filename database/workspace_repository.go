@@ -164,14 +164,25 @@ func (tr *WorkspaceRepository) DeleteTenant(ctx context.Context) (map[string]int
 		}
 	}
 	err = tenancy.WithTx(ctx, tr.db.DB, workspaceID, func(tx *sql.Tx) error {
-		// Memberships reference roles and users: they go first.
-		if err := deleted("workspace_memberships")(tenancy.ExecContext(ctx, tx, "DELETE FROM workspace_memberships WHERE workspace_id = $1")); err != nil {
-			return err
+		// The only way past 052's append-only trigger on iga_gov_event, which
+		// the workspace cascade reaches; LOCAL ends with this transaction.
+		// TENANT-EXEMPT: sets a transaction-local flag; no table is read or written.
+		if _, err := tx.ExecContext(ctx, `SET LOCAL authsec.workspace_purge = 'on'`); err != nil {
+			return fmt.Errorf("failed to enter workspace purge mode: %w", err)
 		}
+		// Order (review P0-1): bindings and permissions, then memberships
+		// before roles (workspace_memberships_role_workspace_fk is RESTRICT);
+		// iga_lifecycle_event before the workspace (036's publication key is
+		// RESTRICT, never deferred); the workspace itself, whose cascade takes
+		// every workspace-scoped row and its audit records; users last, since
+		// those records name users through NO ACTION keys.
 		if err := deleted("role_bindings")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_bindings WHERE workspace_id = $1")); err != nil {
 			return err
 		}
 		if err := deleted("role_permissions")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		if err := deleted("workspace_memberships")(tenancy.ExecContext(ctx, tx, "DELETE FROM workspace_memberships WHERE workspace_id = $1")); err != nil {
 			return err
 		}
 		if err := deleted("roles")(tenancy.ExecContext(ctx, tx, "DELETE FROM roles WHERE workspace_id = $1")); err != nil {
@@ -186,20 +197,38 @@ func (tr *WorkspaceRepository) DeleteTenant(ctx context.Context) (map[string]int
 		if err := deleted("totp_secrets")(tenancy.ExecContext(ctx, tx, "DELETE FROM totp_secrets WHERE workspace_id = $1")); err != nil {
 			return err
 		}
-		if err := deleted("user_groups")(tenancy.ExecContext(ctx, tx, "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)")); err != nil {
+		if err := deleted("iga_lifecycle_event")(tenancy.ExecContext(ctx, tx, "DELETE FROM iga_lifecycle_event WHERE workspace_id = $1")); err != nil {
 			return err
 		}
-		if err := deleted("users")(tenancy.ExecContext(ctx, tx, "DELETE FROM users WHERE workspace_id = $1")); err != nil {
-			return err
+		// The workspace's users go with it (users.workspace_id cascades), in
+		// the same statement as the audit records naming them: count first.
+		var users int64
+		if err := tenancy.QueryRowContext(ctx, tx, "SELECT count(*) FROM users WHERE workspace_id = $1", nil, &users); err != nil {
+			return fmt.Errorf("failed to count users: %w", err)
 		}
 		// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id
 		// column); this removes the registry row of the scoped workspace.
 		result, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, workspaceID)
 		if err != nil {
-			return fmt.Errorf("failed to delete from workspaces: %w", err)
+			// A user of this workspace still named by another workspace's
+			// records: *UserAuditHistoryError, nothing deleted.
+			return fmt.Errorf("failed to delete from workspaces: %w", ClassifyUserDeleteError(err))
 		}
+		deletedCounts["users"] = users
 		if rows, err := result.RowsAffected(); err == nil {
 			deletedCounts["workspaces"] = rows
+		}
+		if err := deleted("user_groups")(tenancy.ExecContext(ctx, tx, "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		// A user still named by another workspace's records is refused with
+		// *UserAuditHistoryError and nothing is deleted.
+		res, err := tenancy.ExecContext(ctx, tx, "DELETE FROM users WHERE workspace_id = $1")
+		if err != nil {
+			return fmt.Errorf("failed to delete from users: %w", ClassifyUserDeleteError(err))
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			deletedCounts["users"] += n
 		}
 		return nil
 	})

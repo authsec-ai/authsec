@@ -336,6 +336,15 @@ func (s *ConnectorOAuthService) exchangeCode(provider *models.ConnectorProvider,
 // need and injected by the broker. providerKey lets other App-style providers
 // reuse this later; today only 'github' uses it.
 func (s *ConnectorOAuthService) MintGitHubAppToken(ctx context.Context, workspaceID uuid.UUID, providerKey string, conn *models.ConnectorConnection) (string, error) {
+	return s.MintGitHubAppTokenOn(ctx, workspaceID, providerKey, conn, "")
+}
+
+// MintGitHubAppTokenOn is MintGitHubAppToken for an installation on a given
+// GitHub host (blank: github.com). The caller must take providerHost from a
+// verified integration record and gate any non-github.com host
+// (see trustedGitHubHost); the host is validated again before the App JWT is
+// sent to it.
+func (s *ConnectorOAuthService) MintGitHubAppTokenOn(ctx context.Context, workspaceID uuid.UUID, providerKey string, conn *models.ConnectorConnection, providerHost string) (string, error) {
 	app, err := s.repo.GetProviderApp(workspaceID, providerKey)
 	if err != nil || app == nil {
 		return "", fmt.Errorf("no GitHub App configured for provider %q in this workspace", providerKey)
@@ -364,6 +373,7 @@ func (s *ConnectorOAuthService) MintGitHubAppToken(ctx context.Context, workspac
 		AppID:          app.GitHubAppID,
 		PrivateKeyPEM:  privateKey,
 		InstallationID: installationID,
+		ProviderHost:   providerHost,
 	})
 }
 

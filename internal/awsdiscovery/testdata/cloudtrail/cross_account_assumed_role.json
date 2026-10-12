@@ -1,0 +1,38 @@
+{
+  "eventVersion": "1.09",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAZZ9EXAMPLEPARTNR:partner-sync",
+    "arn": "arn:aws:sts::905418271234:assumed-role/PartnerSync/partner-sync",
+    "accountId": "905418271234",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "principalId": "AROAZZ9EXAMPLEPARTNR",
+        "arn": "arn:aws:iam::905418271234:role/PartnerSync",
+        "accountId": "905418271234",
+        "userName": "PartnerSync"
+      }
+    }
+  },
+  "eventTime": "2026-10-06T14:00:00Z",
+  "eventSource": "s3.amazonaws.com",
+  "eventName": "GetBucketPolicy",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "192.0.2.10",
+  "userAgent": "aws-sdk-java/2.25.0",
+  "errorCode": "AccessDenied",
+  "errorMessage": "User: arn:aws:sts::905418271234:assumed-role/PartnerSync/partner-sync is not authorized to perform: s3:GetBucketPolicy on resource: \"arn:aws:s3:::refund-exports\" because no resource-based policy allows the s3:GetBucketPolicy action",
+  "requestParameters": {
+    "bucketName": "refund-exports",
+    "policy": ""
+  },
+  "responseElements": null,
+  "requestID": "6a0c8d0d-d294-42bb-af0c-0b4e8f6d9e87",
+  "eventID": "6a0c8d0d-d294-42bb-af0c-0b4e8f6d9e87",
+  "readOnly": true,
+  "eventType": "AwsApiCall",
+  "managementEvent": true,
+  "recipientAccountId": "429418377036",
+  "eventCategory": "Management"
+}

@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1
+	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.78.0
 	github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.63.0
 	github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol v1.65.0
 	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.65.0
@@ -18,6 +19,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.61.0
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.107.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1
+	github.com/aws/aws-sdk-go-v2/service/s3control v1.79.0
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.0
+	github.com/aws/aws-sdk-go-v2/service/sns v1.47.1
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.47.1
 	github.com/aws/smithy-go v1.28.1
@@ -56,6 +60,7 @@ require (
 	golang.org/x/time v0.15.0
 	google.golang.org/api v0.296.0
 	google.golang.org/grpc v1.83.2
+	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/datatypes v1.2.7
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/driver/sqlite v1.6.0
@@ -208,6 +213,5 @@ require (
 	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 )

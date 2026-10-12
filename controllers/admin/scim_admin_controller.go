@@ -227,7 +227,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 		Email:        strings.ToLower(email),
 		Username:     input.UserName,
 		Name:         input.GetDisplayName(),
-		WorkspaceID:     &workspaceUUID,
+		WorkspaceID:  &workspaceUUID,
 		Provider:     "scim",
 		ProviderID:   input.UserName,
 		ProviderData: providerData,
@@ -438,6 +438,12 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 		DELETE FROM users
 		WHERE workspace_id = $1 AND id = $2`, userUUID)
 	if err != nil {
+		// Audit / approval records still naming the user are kept (review
+		// P0-1): a SCIM 409 naming user_has_audit_history.
+		if ae, ok := database.AsUserAuditHistory(database.ClassifyUserDeleteError(err)); ok {
+			c.JSON(http.StatusConflict, models.NewSCIMError("409", database.UserHasAuditHistoryCode+": "+ae.Message(), ""))
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
 	}

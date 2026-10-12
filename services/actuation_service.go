@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -82,6 +83,40 @@ type ReportInput struct {
 	Success bool
 	Error   string
 	Result  map[string]interface{}
+	// LeasedBy is the reporter's holder name -- the same ?pod= it named itself by
+	// when it leased. When given, it must be the instruction's current holder.
+	// Optional because the agents already deployed do not send it; without it the
+	// report is still fenced on the lease being live (see Report).
+	LeasedBy string
+}
+
+// Report refusals. Both leave the instruction exactly as it was: the outcome of
+// work done under a lease that is no longer the caller's is not evidence about
+// the work the current holder (or the next one) is doing.
+var (
+	// ErrInstructionLeaseNotHeld: the instruction is not leased to the reporter --
+	// it was reclaimed and is pending again, re-leased to another holder, or is
+	// already terminal (failed, superseded).
+	ErrInstructionLeaseNotHeld = errors.New("lease_not_held: this instruction is not leased " +
+		"to the reporter; it was reclaimed, re-leased or closed, so this report is stale " +
+		"and was not recorded")
+	// ErrInstructionLeaseExpired: the reporter's lease ran out before it reported.
+	// The lease reaper will return the instruction to the queue.
+	ErrInstructionLeaseExpired = errors.New("lease_expired: the lease on this instruction " +
+		"expired before the report arrived, so this report was not recorded; the " +
+		"instruction returns to the queue")
+)
+
+// InstructionReportRefusalCode is the machine-readable code for a refused report,
+// or "" when err is not one.
+func InstructionReportRefusalCode(err error) string {
+	switch {
+	case errors.Is(err, ErrInstructionLeaseNotHeld):
+		return "lease_not_held"
+	case errors.Is(err, ErrInstructionLeaseExpired):
+		return "lease_expired"
+	}
+	return ""
 }
 
 // maxAttempts bounds retries. A permanently failing instruction — a NetworkPolicy the
@@ -272,7 +307,9 @@ func (m *actuationManager) Lease(sourceID uuid.UUID, leasedBy string, max int,
 
 func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 	// Back to pending, unless it has already burned its attempts — at which point it
-	// becomes visibly failed rather than looping forever.
+	// becomes visibly failed rather than looping forever. leased_by is KEPT: it is
+	// the only record of who held the lease for attempts, so recordLateSuccess can
+	// tell the holder's late report from anyone else's; the next Lease overwrites it.
 	res := m.db.Exec(`
 		UPDATE provisioning_instructions
 		   SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
@@ -281,7 +318,7 @@ func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 		                    THEN 'abandoned: the agent stopped responding after '
 		                         || attempts || ' attempt(s)'
 		                    ELSE error END,
-		       lease_expires_at = NULL, leased_by = '', updated_at = NOW()
+		       lease_expires_at = NULL, updated_at = NOW()
 		 WHERE status = 'leased' AND lease_expires_at < NOW()`,
 		maxActuationAttempts, maxActuationAttempts, maxActuationAttempts)
 	return int(res.RowsAffected), res.Error
@@ -301,6 +338,25 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	}
 	if inst.Status == models.InstructionApplied {
 		return &inst, nil // idempotent; a duplicate report is not an error
+	}
+
+	// THE LEASE FENCE. Only the holder of a live lease may report. Without it a
+	// worker whose lease was reclaimed (it stalled, the reaper returned the work
+	// to the queue, another worker took it) could land a late outcome over the
+	// current holder's, or reopen an instruction already failed or superseded.
+	//
+	// One exception (review fix R1a P2, see recordLateSuccess): a SUCCESS that
+	// arrives from the identity that held the reclaimed lease -- the
+	// instruction is back in the queue and nobody holds it now -- is recorded,
+	// not refused, so the work is not re-run.
+	if inst.Status == models.InstructionPending && in.Success && inst.Attempts > 0 {
+		return m.recordLateSuccess(&inst, in, "the lease was reclaimed and the instruction re-queued")
+	}
+	if inst.Status != models.InstructionLeased {
+		return nil, ErrInstructionLeaseNotHeld
+	}
+	if in.LeasedBy != "" && in.LeasedBy != inst.LeasedBy {
+		return nil, ErrInstructionLeaseNotHeld
 	}
 
 	resultJSON, err := marshalDiscoveryConfig(in.Result)
@@ -332,9 +388,28 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 		updates["error"] = defaultString(in.Error, "unspecified failure")
 	}
 
-	if err := m.db.Model(&models.ProvisioningInstruction{}).
-		Where("id = ?", instructionID).Updates(updates).Error; err != nil {
-		return nil, err
+	// Conditional on the lease read above still being the live one, in the same
+	// statement as the write: the reaper or a re-lease can run between the read
+	// and here. attempts is the lease's fencing token -- every lease increments
+	// it -- so a reclaimed-and-re-leased row fails this even when the new holder
+	// named itself the same as the old one. Expiry is judged by the database
+	// clock, as the reaper judges it.
+	res := m.db.Model(&models.ProvisioningInstruction{}).
+		Where(`id = ? AND discovery_source_id = ? AND status = ? AND leased_by = ?
+		       AND attempts = ? AND lease_expires_at > NOW()`,
+			instructionID, sourceID, models.InstructionLeased, inst.LeasedBy, inst.Attempts).
+		Updates(updates)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		out, err := m.classifyRefusedReport(&inst)
+		if errors.Is(err, ErrInstructionLeaseExpired) && in.Success {
+			// The holder's own lease ran out before its success arrived and
+			// the reaper has not run: nobody else holds it either.
+			return m.recordLateSuccess(&inst, in, "the lease expired before the report arrived")
+		}
+		return out, err
 	}
 
 	// Fold the outcome into the agent's state, so the console can distinguish "I
@@ -354,6 +429,111 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 		return nil, err
 	}
 	return &out, nil
+}
+
+// recordLateSuccess records a successful report that arrived after the
+// reporter's lease ended (review fix R1a P2, "a late successful agent report
+// gets a 409 and is re-queued instead of recorded").
+//
+// The work WAS done in the cluster: refusing the report re-queued the
+// instruction and a later lease applied it a second time. So a late SUCCESS
+// is recorded as applied, with a note in the result, exactly when nobody
+// else holds the instruction:
+//
+//   - pending (reclaimed by the reaper, not re-leased), attempts > 0 (it was
+//     leased at least once): only the identity that held the lease for that
+//     attempt may report late. The reaper keeps leased_by, so the row still
+//     names it, and the reporter must name itself (?pod=) the same. A source's
+//     credential is shared by every agent of the cluster, so an unnamed or
+//     differently named report is refused (ErrInstructionLeaseNotHeld) and the
+//     instruction stays queued; a row reclaimed before the reaper kept the
+//     holder names nobody and is refused too. The write is fenced on
+//     status = pending, the attempts read and that holder, so a re-lease in
+//     between (which increments attempts) makes it match nothing and the
+//     report is refused as before -- the new holder's run is the one recorded;
+//   - leased by the same holder with the lease expired, not yet reaped:
+//     fenced on (leased, leased_by, attempts) as the normal write.
+//
+// Once applied, Lease never hands the instruction out again (it takes only
+// pending rows), so the work cannot be applied twice through the queue. A
+// late FAILURE is still refused (the instruction is already back in the
+// queue for a retry); a superseded, failed or re-leased instruction still
+// refuses any late report.
+func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstruction, in ReportInput,
+	why string) (*models.ProvisioningInstruction, error) {
+
+	if read.Status == models.InstructionPending && (read.LeasedBy == "" || in.LeasedBy != read.LeasedBy) {
+		log.Printf("[actuation] instruction %s: late success refused: the reporter is not the holder of attempt %d",
+			read.ID, read.Attempts)
+		return nil, ErrInstructionLeaseNotHeld
+	}
+	result := map[string]interface{}{}
+	for k, v := range in.Result {
+		result[k] = v
+	}
+	result["authsec_late_report"] = fmt.Sprintf("recorded after the reporter's lease ended (%s; attempt %d): "+
+		"the agent reported success, so the instruction was not re-run", why, read.Attempts)
+	resultJSON, err := marshalDiscoveryConfig(result)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	q := m.db.Model(&models.ProvisioningInstruction{}).
+		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ? AND leased_by = ?",
+			read.ID, read.DiscoverySourceID, read.Status, read.Attempts, read.LeasedBy)
+	res := q.Updates(map[string]interface{}{
+		"status": models.InstructionApplied, "applied_at": now, "error": "",
+		"result": json.RawMessage(resultJSON), "lease_expires_at": nil, "leased_by": "", "updated_at": now,
+	})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		// Re-leased (or closed) meanwhile: the current holder's run counts.
+		var cur models.ProvisioningInstruction
+		if err := m.db.First(&cur, "id = ?", read.ID).Error; err != nil {
+			return nil, err
+		}
+		if cur.Status == models.InstructionApplied {
+			return &cur, nil
+		}
+		return nil, ErrInstructionLeaseNotHeld
+	}
+	if read.DiscoveredAgentID != nil {
+		if err := m.applyToAgent(read, in, now); err != nil {
+			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", read.ID).
+				Update("error", fmt.Sprintf("(could not update agent state: %v)", err)).Error
+		}
+	}
+	var out models.ProvisioningInstruction
+	if err := m.db.First(&out, "id = ?", read.ID).Error; err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// classifyRefusedReport explains why the fenced write in Report matched no row,
+// from the row as it is now. It changes nothing.
+//
+// The same lease still in place means only expiry can have failed the fence. A
+// row that has since been applied is the duplicate-report case Report already
+// answers idempotently (two copies of the holder's own report racing), so it is
+// answered the same way here. Anything else -- reclaimed, re-leased, closed --
+// is a lease the reporter no longer holds.
+func (m *actuationManager) classifyRefusedReport(read *models.ProvisioningInstruction) (*models.ProvisioningInstruction, error) {
+	var now models.ProvisioningInstruction
+	if err := m.db.First(&now, "id = ?", read.ID).Error; err != nil {
+		return nil, err
+	}
+	switch {
+	case now.Status == models.InstructionApplied:
+		return &now, nil
+	case now.Status == models.InstructionLeased && now.LeasedBy == read.LeasedBy &&
+		now.Attempts == read.Attempts:
+		return nil, ErrInstructionLeaseExpired
+	default:
+		return nil, ErrInstructionLeaseNotHeld
+	}
 }
 
 // applyToAgent folds an instruction outcome into discovered_agents.
