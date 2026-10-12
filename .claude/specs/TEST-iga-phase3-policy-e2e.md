@@ -1,13 +1,13 @@
 # Phase 3 Policy — end-to-end test plan
 
-Target: backend `authsec-staging` at `a16068a` (Ritam's P3 R1a + review fixes), console `Authsec-ui` with the Policy screens (`/iga/policy/...`).
+Target: backend `authsec-staging` at `4fda6b5` (Ritam's P3 R1a + review fixes + the follow-up fixes), console `Authsec-ui` at `66585a9` with the Policy screens (`/iga/policy/...`). Both are deployed to production; the Policy gate was switched on there on 2026-10-12. A junior-friendly run sheet that follows this plan step by step is [`RUNBOOK-iga-phase3-policy-junior-test.md`](RUNBOOK-iga-phase3-policy-junior-test.md); this document is the case catalogue behind it.
 Design reference: [`SPEC-iga-phase3-policy.md`](SPEC-iga-phase3-policy.md). Each case names the spec scenario it exercises where one exists.
 
 **This plan is a checklist for a person to run. Nothing in it has been run yet.** The UI was rendered only against recorded backend responses; the backend's own tests ran only against fake AWS, GitHub and Slack. The purpose of this plan is the first run against real ones.
 
 ## 0. Rules for the run
 
-- **Do not run this against customer data.** The customer cluster (`authsec-prod`) is the only deployment today; the root `AGENTS.md` and `SPEC-deployment-k3s.md` forbid putting unfinished IGA into it without an approved cutover. Use environment A below.
+- **Where this runs.** The owner (Aditya Agarwal) decided on 2026-10-12 to test on the production stack, in the workspace and AWS account named in the run sheet, accepting that the deployment-wide Policy gate is on for every workspace. Use only that workspace and that account. Never touch another customer's data. Environment A below is still the safer choice for the destructive cases (S9, S12.3) and for anything the owner has not approved.
 - Use an AWS account you can break. The enforcement role writes IAM permission boundaries; undo works, but a mistake on a shared account is still a mistake.
 - Never paste tokens, ExternalIds, Slack tokens or GitHub keys into this document, a ticket or chat. Evidence screenshots must hide them.
 - Record each result as **PASS / FAIL / BLOCKED** with the evidence named in the case. A case that could not be run is BLOCKED, not PASS.
@@ -48,7 +48,11 @@ Create these as real members (invite flow), not by inserting rows. Four browser 
 - A **second role shared by two workloads** (two Lambdas) to exercise the shared-role paths, and a **role that no workload uses**.
 - Write down: account id, role names, role ARNs. Put no credentials in this file.
 
-### 2.3 Optional integrations
+### 2.3 The AWS discovery stack must be current
+
+Resource-policy collection runs only when the account's discovery stack reports template version **2026-10-07 or later** (`ResourcePolicyTemplateVersion`, `internal/awsdiscovery/onboarding.go`). On an older stack every resource-policy form is recorded as *not collected: discovery template update needed*, no call is made, and AuthSec cannot trust the evidence enough to propose a change (`evidence_untrusted`). An account connected before that template, or connected by hand-entered role ARN (which records no stack version), needs its stack **updated in AWS** and a **new scan**. Do this first, then confirm the Connections page shows the scan finished and no *update needed* note. The graph's last publication must be after the update; an older publication has no resource-policy evidence.
+
+### 2.4 Optional integrations
 
 - **GitHub:** a GitHub App installed on a test repository with an infrastructure-as-code file that defines the test role (CloudFormation or Terraform). Needed for the pull-request delivery cases (§9).
 - **Slack:** a Slack app and workspace you control. Needed for §6.5.
@@ -78,7 +82,8 @@ Format: **Precondition → Steps → Expected → Evidence**. Console paths are 
 | S1.6 | Connections › the AWS account shows the Enforcement line. | Line reads the same state as Setup. | Screenshot. |
 | S1.7 | Setup › IaC sources: map the repository and directory to the account. | The source is listed with its GitHub permission state. Deleting a source that already opened a pull request is refused. | Screenshot. |
 | S1.8 | Setup › Notifications: add a webhook (https only) and toggle owner email. | Saved. An `http://` webhook is refused. | Screenshot. |
-| S1.9 | Setup › Finding rules: add "Require a review date" for production workloads; add "Unused window" 60 days; turn one off; delete one. | The list updates; a window outside 30–400 is refused; a rule changes nothing until the next scan. | Screenshot; `iga_gov_finding_rule` rows; events in Logs. |
+| S1.9 | Setup › Finding rules: add "Require a review date" for production workloads and, separately, one limited to Lambda functions (the Runtime list offers the kinds discovery really writes); add "Unused window" 60 days; turn one off; delete one. | The list updates; a window outside 30–400 is refused; a rule changes nothing until the next scan. | Screenshot; `iga_gov_finding_rule` rows; events in Logs. |
+| S1.10 | Setup › Owner rules: add rule for tag key `owner`, applies to Roles and workloads, accountable. Tag a test role in AWS `owner=<a member's email>`, rescan. | The role shows that member as accountable owner ("From a tag rule"). A tag whose value is not a member's email, or matches two members, assigns no one and the role still reads "no owner". Deleting the rule removes the owners it assigned and leaves manual owners. | Screenshot; `iga_gov_owner_rule` and owner rows. |
 
 ### S2 — Scan and findings
 
