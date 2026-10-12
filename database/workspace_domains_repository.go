@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -97,11 +98,8 @@ func (tdr *WorkspaceDomainsRepository) Create(ctx context.Context, domain string
 	}
 	// Validate and normalize domain
 	domain = normalizeDomain(domain)
-	if domain == "" {
-		return nil, fmt.Errorf("domain cannot be empty")
-	}
-	if strings.Contains(domain, "/") || strings.Contains(domain, "\\") || strings.Contains(domain, "*") {
-		return nil, fmt.Errorf("invalid domain format")
+	if err := ValidateDomainName(domain); err != nil {
+		return nil, err
 	}
 
 	// Check if domain is already claimed by another tenant
@@ -581,4 +579,42 @@ func (e *RedirectURIValidationError) Error() string {
 		msgs = append(msgs, err.Error())
 	}
 	return strings.Join(msgs, "; ")
+}
+
+// ErrInvalidDomain is wrapped by every ValidateDomainName error.
+var ErrInvalidDomain = errors.New("invalid domain")
+
+var domainLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// ValidateDomainName accepts a normalized (lower-case, no trailing dot) DNS
+// host name a workspace can verify: at least two labels of letters, digits
+// and inner hyphens, 63 characters a label, 253 in all, a top-level label
+// that is not numeric, and no IP address or localhost.
+func ValidateDomainName(domain string) error {
+	if domain == "" {
+		return fmt.Errorf("%w: domain cannot be empty", ErrInvalidDomain)
+	}
+	if len(domain) > 253 {
+		return fmt.Errorf("%w: a domain has at most 253 characters", ErrInvalidDomain)
+	}
+	if net.ParseIP(domain) != nil {
+		return fmt.Errorf("%w: use a domain name, not an IP address", ErrInvalidDomain)
+	}
+	labels := strings.Split(domain, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("%w: %q needs a top-level domain, e.g. auth.example.com", ErrInvalidDomain, domain)
+	}
+	for _, l := range labels {
+		if !domainLabel.MatchString(l) {
+			return fmt.Errorf("%w: %q is not a valid label; use letters, digits and hyphens (not at the start or end)", ErrInvalidDomain, l)
+		}
+	}
+	tld := labels[len(labels)-1]
+	if strings.Trim(tld, "0123456789") == "" {
+		return fmt.Errorf("%w: the top-level domain cannot be numeric", ErrInvalidDomain)
+	}
+	if tld == "localhost" {
+		return fmt.Errorf("%w: localhost cannot be verified", ErrInvalidDomain)
+	}
+	return nil
 }

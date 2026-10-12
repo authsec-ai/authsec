@@ -245,13 +245,17 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 		return
 	}
 	if td.WorkspaceID != workspaceID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to verify this domain"})
+		// Another workspace's domain is answered as a missing one (ADR-0001 §4.3).
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
 
 	err = dc.service.VerifyDomainOwnership(domainID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "verification failed", "details": err.Error()})
+		// error carries the reason (record missing, wrong value, DNS failure);
+		// details is kept for older consoles.
+		reason := strings.TrimPrefix(err.Error(), "verification failed: ")
+		c.JSON(http.StatusBadRequest, gin.H{"error": reason, "details": reason})
 		return
 	}
 
