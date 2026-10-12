@@ -6,11 +6,17 @@ package igagovschema_test
 // routes and capabilities are later T3.02 work and are not exercised here.
 
 import (
+	"database/sql"
 	"errors"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/authsec-ai/authsec/services"
 )
@@ -109,5 +115,75 @@ func TestVerifyPolicySchemaFailsWithoutAChannelColumn(t *testing.T) {
 				t.Fatalf("%s: %v", qc, err)
 			}
 		})
+	}
+}
+
+// A name VerifyPolicySchema checks that the database does not have keeps the
+// gate permanently unverified, and Postgres silently truncates a longer name
+// at 63 bytes (so a constraint named in full never exists under it). Every
+// relation, trigger and constraint the gate names must therefore fit in an
+// identifier AND exist in a database built from 001_bootstrap.sql alone -- the
+// fresh-install path, which the migration-built database of the other tests
+// does not prove.
+//
+// Unnamed single-column enum CHECKs are not checked: they have no stable name
+// to look up, and matching their expression text would restate the DDL.
+func TestVerifyPolicySchemaNamesExistInAFreshBootstrap(t *testing.T) {
+	_, g := testDB(t)
+
+	for _, group := range []struct {
+		kind  string
+		names []string
+	}{
+		{"relation", services.PolicySchemaRelations()},
+		{"trigger", services.PolicySchemaTriggers()},
+		{"constraint", services.PolicySchemaConstraints()},
+	} {
+		for _, n := range group.names {
+			for _, part := range strings.Split(n, ".") {
+				if len(part) > 63 {
+					t.Errorf("%s %q: %q is %d bytes; Postgres truncates identifiers at 63, so it never matches",
+						group.kind, n, part, len(part))
+				}
+			}
+		}
+	}
+
+	var dbname string
+	if err := g.Raw(`SELECT current_database()`).Scan(&dbname).Error; err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil || u.Scheme == "" {
+		t.Skip("TEST_DATABASE_URL is not a URL; cannot derive a second scratch database from it")
+	}
+	boot := dbname + "_bootstrap"
+	if err := g.Exec(`DROP DATABASE IF EXISTS ` + boot).Error; err != nil {
+		t.Fatalf("drop %s: %v", boot, err)
+	}
+	if err := g.Exec(`CREATE DATABASE ` + boot).Error; err != nil {
+		t.Skipf("cannot create a scratch database for the bootstrap check: %v", err)
+	}
+	defer g.Exec(`DROP DATABASE IF EXISTS ` + boot)
+
+	u.Path = "/" + boot
+	raw, err := os.ReadFile(filepath.Join(migrationsDir(), "001_bootstrap.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdb, err := sql.Open("postgres", u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bdb.Close()
+	if _, err := bdb.Exec(string(raw)); err != nil {
+		t.Fatalf("001_bootstrap.sql on an empty database: %v", err)
+	}
+	bg, err := gorm.Open(postgres.New(postgres.Config{Conn: bdb}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := services.VerifyPolicySchema(bg); err != nil {
+		t.Fatalf("VerifyPolicySchema on a database built from 001_bootstrap.sql alone: %v", err)
 	}
 }

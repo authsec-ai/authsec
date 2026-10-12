@@ -297,17 +297,13 @@ func (s *GovDeployments) ensureOutcomeUnknownTx(tx *gorm.DB, d *models.IGAGovDep
 	return at, nil
 }
 
-// deploymentTouchedAWS reports whether the deployment may have changed AWS:
-// an op recorded done, or any attempt that was dispatched.
+// deploymentTouchedAWS reports whether the deployment may have changed AWS
+// (govTouchedAWSSQL).
 func deploymentTouchedAWS(tx *gorm.DB, d models.IGAGovDeployment) (bool, error) {
-	var row struct {
-		Ops  int64
-		Sent int64
-	}
-	err := tx.Raw(`SELECT jsonb_array_length(completed_ops) AS ops,
-		(SELECT count(*) FROM iga_gov_attempt a WHERE a.workspace_id = d.workspace_id AND a.deployment_id = d.id AND a.dispatched_at IS NOT NULL) AS sent
-		FROM iga_gov_deployment d WHERE d.workspace_id = ? AND d.id = ?`, d.WorkspaceID, d.ID).Scan(&row).Error
-	return row.Ops > 0 || row.Sent > 0, err
+	var touched bool
+	err := tx.Raw(`SELECT `+govTouchedAWSSQL+` FROM iga_gov_deployment d WHERE d.workspace_id = ? AND d.id = ?`,
+		d.WorkspaceID, d.ID).Scan(&touched).Error
+	return touched, err
 }
 
 // failTx is stop(failed) inside the caller's transaction (no job fence: the

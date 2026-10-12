@@ -108,13 +108,10 @@ func (r *EKSReader) Clusters(ctx context.Context) ([]EKSCluster, error) {
 		}
 		resp, err := r.api.ListClusters(ctx, &eks.ListClustersInput{NextToken: next})
 		if err != nil {
-			// Named (D-71: coverage stamps the call and AWS's code), and an
-			// endpoint that does not resolve is ErrServiceNotInRegion, as for
-			// every regional listing (T3.8). eks_pod_identity is ONE surface
-			// across every region, so the caller never turns that into
-			// "unsupported" for the whole surface: it skips the one region
-			// when no binding was ever recorded there, and otherwise reports
-			// it as the failure it may be (writePodIdentityEdges).
+			// Named (D-71: coverage stamps the call and AWS's code). EKS is
+			// offered in every region of its partition, so a name that does
+			// not resolve is never "not offered" here: it is
+			// ErrEndpointUnreachable, and the surface is partial.
 			return out, listErr("eks:ListClusters", err)
 		}
 		for _, name := range resp.Clusters {

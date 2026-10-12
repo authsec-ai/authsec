@@ -37,6 +37,7 @@ import (
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/awsenforce/enforcetest"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
@@ -382,6 +383,58 @@ func TestP3FixApprA59MaterialChangeSparesDeployedTarget(t *testing.T) {
 	cp = l.applyPlans(x.policy, x.canaryRole)
 	if cp[len(cp)-1].ID != x.canaryPlan.ID || cp[len(cp)-1].SupersededAt != nil {
 		t.Fatal("the canary's plan changed after the re-approval")
+	}
+}
+
+// A59, P0-2 (residual case): the expansion's deployment of the second target
+// FAILS after its first op was applied (CreatePolicy is in the account; the
+// binding's attachment was refused, the "binding partial" of A58), so the
+// role carries part of AuthSec's change. The deployment's terminal state is
+// `failed`, but a rescan must still leave the approval, the version and the
+// target's approved plan alone: no revalidation row, no supersession, and
+// Revalidate itself refuses the target (409 target_deployed).
+//
+// Fails on the base set of deployedTargets (failed and blocked excluded):
+// compile_plans revalidated the failed target's plan against the role as the
+// partial run left it, and a differing recompile revoked the approval.
+func TestP3FixApprA59FailedAfterAppliedOpStaysDeployed(t *testing.T) {
+	x := fxaToVerifiedCanary(t, "fxa-a59-failed")
+	l := x.l
+	before := len(l.revalidations(x.otherPlan.ID))
+
+	x.elapseCanary()
+	l.fake.Fail["iam:PutRolePermissionsBoundary"] = enforcetest.APIError("AccessDenied", "not authorized to perform: iam:PutRolePermissionsBoundary")
+	l.tick()
+	var deps []models.IGAGovDeployment
+	if err := l.db.Where("workspace_id = ? AND control_id = ?", l.ws, x.otherPlan.ControlID).Find(&deps).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 || deps[0].State != models.GovDeployFailed {
+		t.Fatalf("the second target's deployments after the expansion: %+v, want one failed", deps)
+	}
+	if n := l.count(`SELECT jsonb_array_length(completed_ops) FROM iga_gov_deployment WHERE id = ?`, deps[0].ID); n == 0 {
+		t.Fatal("the failed deployment recorded no applied op; the scenario needs CreatePolicy done in AWS")
+	}
+	if got := l.fake.BoundaryOf(x.otherNm); got != "" {
+		t.Fatalf("the second role's boundary is %q; the attachment should have been refused", got)
+	}
+	rvs := len(l.revalidations(x.otherPlan.ID))
+
+	l.scan()
+	l.drain()
+	x.assertApprovalUntouched(t, "after a rescan following the partial deployment")
+	if op := l.applyPlans(x.policy, x.other); op[len(op)-1].ID != x.otherPlan.ID || op[len(op)-1].SupersededAt != nil {
+		t.Fatal("the failed deployment's approved plan was superseded by a rescan")
+	}
+	if got := len(l.revalidations(x.otherPlan.ID)); got != rvs || rvs < before {
+		t.Fatalf("revalidations of the partially deployed target: %d before the rescan, %d after", rvs, got)
+	}
+	if n := l.events("approval_revoked"); n != 0 {
+		t.Fatalf("%d approval_revoked events", n)
+	}
+	_, err := services.NewGovAuthoring(l.db, l.reader).Revalidate(context.Background(), l.ws, x.otherPlan.ID)
+	if govCode(err) != services.GovCodeTargetDeployed {
+		t.Fatalf("Revalidate of the partially deployed target: %v, want %s", err, services.GovCodeTargetDeployed)
 	}
 }
 

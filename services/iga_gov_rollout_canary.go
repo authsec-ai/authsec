@@ -104,11 +104,14 @@ func govRolloutHold() error {
 // passed and no CloudTrail read can have covered the window's end yet --
 // that is, until a scan of the connector that STARTED at or after the
 // window end has been published (published by now, so this run's gates
-// already read it) -- but no longer than MaxTrailScanGap past the window's
-// end: a later scan reads back only 48 h and can no longer cover any of the
+// already read it) AND carries the CloudTrail coverage the gates evaluate
+// (scanTrailReads: a cloudtrail-events surface that was reached and not
+// capped) -- but no longer than MaxTrailScanGap past the window's end: a
+// later scan reads back only 48 h and can no longer cover any of the
 // window, so the gate's answer cannot change. Stopping at the window's end
 // instead froze window_elapsed at not_available whenever the covering scan
-// came after it.
+// came after it, and stopping at any later scan did so when that scan had no
+// CloudTrail coverage.
 func govCanaryWindowUndecided(db *gorm.DB, ws, connectorID uuid.UUID, appliedAt time.Time, hours int, now time.Time,
 	cr igagov.CanaryResult) (bool, error) {
 	end := appliedAt.Add(time.Duration(hours) * time.Hour)
@@ -123,12 +126,24 @@ func govCanaryWindowUndecided(db *gorm.DB, ws, connectorID uuid.UUID, appliedAt 
 	if !now.Before(end.Add(igagov.MaxTrailScanGap)) {
 		return false, nil
 	}
-	var n int64
-	if err := db.Raw(`SELECT count(*) FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ? AND status = 'published'
-		AND COALESCE(started_at, requested_at) >= ? AND published_at <= ?`, ws, connectorID, end, now).Scan(&n).Error; err != nil {
+	var runs []struct {
+		StartedAt   *time.Time
+		RequestedAt time.Time
+		Coverage    json.RawMessage
+	}
+	if err := db.Raw(`SELECT started_at, requested_at, coverage FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ?
+		AND status = 'published' AND COALESCE(started_at, requested_at) >= ? AND published_at <= ?`,
+		ws, connectorID, end, now).Scan(&runs).Error; err != nil {
 		return false, err
 	}
-	return n == 0, nil
+	for _, r := range runs {
+		for _, tr := range scanTrailReads(r.StartedAt, r.RequestedAt, r.Coverage) {
+			if !tr.CapHit {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 // canaryHealthy is the one canary-health rule of §8.6, shared by the

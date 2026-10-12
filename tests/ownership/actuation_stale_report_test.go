@@ -157,8 +157,11 @@ func TestLateFailureOnAReclaimedPendingInstructionIsRefused(t *testing.T) {
 // re-run: the work was done in the cluster, and re-running it is the
 // duplicate apply the fence exists to prevent. Once applied, nothing leases
 // it again; the reaper has nothing to reclaim.
+//
+// Only for the identity that held the lease for that attempt: it names
+// itself (?pod=) as the holder the reaper kept on the row.
 func TestLateSuccessOnAReclaimedInstructionIsRecordedNotRerun(t *testing.T) {
-	for _, holder := range []string{"pod-a", ""} {
+	for _, holder := range []string{"pod-a"} {
 		t.Run("holder="+holder, func(t *testing.T) {
 			f := newActFixture(t)
 			id := leasedQuarantine(t, f, "pod-a")
@@ -191,6 +194,32 @@ func TestLateSuccessOnAReclaimedInstructionIsRecordedNotRerun(t *testing.T) {
 				t.Fatalf("duplicate: %v %+v", err, dup)
 			}
 		})
+	}
+}
+
+// Reclaimed and not re-leased, but the reporter is not the identity that held
+// the lease for that attempt (pod-a): another holder of the source's shared
+// credential -- naming itself otherwise, or not at all -- cannot mark the
+// re-queued instruction applied. The refusal changes nothing, and pod-a's own
+// late success is still recorded afterwards.
+func TestLateSuccessFromAnotherIdentityIsRefused(t *testing.T) {
+	f := newActFixture(t)
+	id := leasedQuarantine(t, f, "pod-a")
+	expireLease(t, f, id)
+	if n, err := f.am.ReclaimExpiredLeases(); err != nil || n != 1 {
+		t.Fatalf("reclaim: %v (%d)", err, n)
+	}
+	before := instructionState(t, f, id)
+	for _, holder := range []string{"", "pod-c"} {
+		_, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: holder})
+		assertRefused(t, "late success from holder "+holder+" on pod-a's reclaimed attempt", err, services.ErrInstructionLeaseNotHeld)
+		if after := instructionState(t, f, id); after != before {
+			t.Errorf("a refused report must change nothing.\nbefore: %s\nafter:  %s", before, after)
+		}
+	}
+	out, err := f.am.Report(f.source, id, services.ReportInput{Success: true, LeasedBy: "pod-a"})
+	if err != nil || out.Status != models.InstructionApplied || !strings.Contains(string(out.Result), "authsec_late_report") {
+		t.Fatalf("pod-a's own late success: %v %+v", err, out)
 	}
 }
 

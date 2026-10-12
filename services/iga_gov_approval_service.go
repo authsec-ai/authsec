@@ -211,8 +211,8 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		// dedicated_identity version (split / split_revert plans) neither. The
 		// owner gate then receives the zero intent and the plans.
 		var intent igagov.RightSizeIntent
-		if pi, perr := igagov.ParseIntent(v.Intent); !isRemoveControlVersion(*v) && (perr != nil || pi.Kind != igagov.IntentDedicatedIdentity) {
-			if intent, err = storedRightSize(*v); err != nil {
+		if !isRemoveControlVersion(*v) {
+			if intent, err = storedServiceIntent(*v); err != nil {
 				return err
 			}
 		}

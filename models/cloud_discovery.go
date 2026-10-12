@@ -770,6 +770,30 @@ type AWSConnectorAttrs struct {
 	// last reported. When we add a permission for a new surface, this is how an
 	// operator finds the accounts still on the older stack.
 	TemplateVersion string `json:"template_version,omitempty"`
+
+	// TemplateVersionSource is who said TemplateVersion: AWSTemplateVersionFromStack
+	// when the customer's own stack reported it (the Quick Create registration
+	// callback, and a stack Update), empty when AuthSec wrote it -- the manual
+	// role-ARN path records the version THIS BUILD hands out, and every
+	// connector recorded before the stack's version was kept has the build's
+	// version too. Nothing on those rows tells the two apart, so an empty source
+	// is "not verified", never "current": read the version through
+	// StackReportedTemplateVersion wherever a decision rests on it.
+	TemplateVersionSource string `json:"template_version_source,omitempty"`
+}
+
+// AWSTemplateVersionFromStack is the TemplateVersionSource of a version the
+// customer's stack reported itself.
+const AWSTemplateVersionFromStack = "stack"
+
+// StackReportedTemplateVersion is the discovery template version the stack
+// itself reported, or "" (unknown, which every gate reads as older) when the
+// recorded version is the build's own, or was recorded before provenance was.
+func (a AWSConnectorAttrs) StackReportedTemplateVersion() string {
+	if a.TemplateVersionSource != AWSTemplateVersionFromStack {
+		return ""
+	}
+	return a.TemplateVersion
 }
 
 // AWSAttrs decodes Attrs as the AWS shape. A malformed or empty blob decodes to

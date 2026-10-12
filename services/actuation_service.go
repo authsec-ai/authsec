@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -305,7 +306,9 @@ func (m *actuationManager) Lease(sourceID uuid.UUID, leasedBy string, max int,
 
 func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 	// Back to pending, unless it has already burned its attempts — at which point it
-	// becomes visibly failed rather than looping forever.
+	// becomes visibly failed rather than looping forever. leased_by is KEPT: it is
+	// the only record of who held the lease for attempts, so recordLateSuccess can
+	// tell the holder's late report from anyone else's; the next Lease overwrites it.
 	res := m.db.Exec(`
 		UPDATE provisioning_instructions
 		   SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
@@ -314,7 +317,7 @@ func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 		                    THEN 'abandoned: the agent stopped responding after '
 		                         || attempts || ' attempt(s)'
 		                    ELSE error END,
-		       lease_expires_at = NULL, leased_by = '', updated_at = NOW()
+		       lease_expires_at = NULL, updated_at = NOW()
 		 WHERE status = 'leased' AND lease_expires_at < NOW()`,
 		maxActuationAttempts, maxActuationAttempts, maxActuationAttempts)
 	return int(res.RowsAffected), res.Error
@@ -342,9 +345,9 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	// current holder's, or reopen an instruction already failed or superseded.
 	//
 	// One exception (review fix R1a P2, see recordLateSuccess): a SUCCESS that
-	// arrives after the reporter's lease was reclaimed -- the instruction is
-	// back in the queue and nobody holds it -- is recorded, not refused, so
-	// the work is not re-run.
+	// arrives from the identity that held the reclaimed lease -- the
+	// instruction is back in the queue and nobody holds it now -- is recorded,
+	// not refused, so the work is not re-run.
 	if inst.Status == models.InstructionPending && in.Success && inst.Attempts > 0 {
 		return m.recordLateSuccess(&inst, in, "the lease was reclaimed and the instruction re-queued")
 	}
@@ -437,10 +440,16 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 // else holds the instruction:
 //
 //   - pending (reclaimed by the reaper, not re-leased), attempts > 0 (it was
-//     leased at least once): the write is fenced on status = pending AND the
-//     attempts read, so a re-lease in between (which increments attempts)
-//     makes it match nothing and the report is refused as before -- the new
-//     holder's run is the one recorded;
+//     leased at least once): only the identity that held the lease for that
+//     attempt may report late. The reaper keeps leased_by, so the row still
+//     names it, and the reporter must name itself (?pod=) the same. A source's
+//     credential is shared by every agent of the cluster, so an unnamed or
+//     differently named report is refused (ErrInstructionLeaseNotHeld) and the
+//     instruction stays queued; a row reclaimed before the reaper kept the
+//     holder names nobody and is refused too. The write is fenced on
+//     status = pending, the attempts read and that holder, so a re-lease in
+//     between (which increments attempts) makes it match nothing and the
+//     report is refused as before -- the new holder's run is the one recorded;
 //   - leased by the same holder with the lease expired, not yet reaped:
 //     fenced on (leased, leased_by, attempts) as the normal write.
 //
@@ -452,6 +461,11 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstruction, in ReportInput,
 	why string) (*models.ProvisioningInstruction, error) {
 
+	if read.Status == models.InstructionPending && (read.LeasedBy == "" || in.LeasedBy != read.LeasedBy) {
+		log.Printf("[actuation] instruction %s: late success refused: the reporter is not the holder of attempt %d",
+			read.ID, read.Attempts)
+		return nil, ErrInstructionLeaseNotHeld
+	}
 	result := map[string]interface{}{}
 	for k, v := range in.Result {
 		result[k] = v
@@ -464,11 +478,8 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	}
 	now := time.Now()
 	q := m.db.Model(&models.ProvisioningInstruction{}).
-		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ?",
-			read.ID, read.DiscoverySourceID, read.Status, read.Attempts)
-	if read.Status == models.InstructionLeased {
-		q = q.Where("leased_by = ?", read.LeasedBy)
-	}
+		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ? AND leased_by = ?",
+			read.ID, read.DiscoverySourceID, read.Status, read.Attempts, read.LeasedBy)
 	res := q.Updates(map[string]interface{}{
 		"status": models.InstructionApplied, "applied_at": now, "error": "",
 		"result": json.RawMessage(resultJSON), "lease_expires_at": nil, "leased_by": "", "updated_at": now,

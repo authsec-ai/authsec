@@ -320,14 +320,18 @@ func (s *AWSOnboardingService) Onboard(
 		// that later records what each scan could and could not read.
 		Coverage: json.RawMessage("{}"),
 	}
-	if err := connector.SetAWSAttrs(models.AWSConnectorAttrs{
+	attrs := models.AWSConnectorAttrs{
 		DisplayName:     strings.TrimSpace(in.DisplayName),
 		RoleARN:         roleARN,
 		Partition:       partition,
 		Regions:         regions,
 		CallerARN:       identity.ARN,
 		TemplateVersion: recordedTemplateVersion(in.StackTemplateVersion),
-	}); err != nil {
+	}
+	if in.StackTemplateVersion != nil {
+		attrs.TemplateVersionSource = models.AWSTemplateVersionFromStack
+	}
+	if err := connector.SetAWSAttrs(attrs); err != nil {
 		return nil, false, err
 	}
 
@@ -765,7 +769,9 @@ func (s *AWSOnboardingService) assumeRequestFor(
 // out this build's template. A manual connector on an older stack is caught
 // the way it was before (the scan's AccessDenied names the missing call);
 // connectors created by the stack callback, and every stack Update, record
-// the stack's own version.
+// the stack's own version AND say so (AWSConnectorAttrs.TemplateVersionSource):
+// a version without that provenance is the build's, so isolation and the
+// "update available" fact treat it as unverified, never as current.
 func recordedTemplateVersion(reported *string) string {
 	if reported == nil {
 		return awsdiscovery.TemplateVersion
@@ -810,8 +816,10 @@ func (s *AWSOnboardingService) RecordStackTemplateVersion(
 			return updated, err
 		}
 		res := s.db.WithContext(ctx).Exec(`UPDATE cloud_connector
-		       SET attrs = jsonb_set(attrs, '{template_version}', ?::jsonb, true), updated_at = now()
-		     WHERE workspace_id = ? AND id = ? AND status <> ?`, string(raw), c.WorkspaceID, c.ID, models.CloudConnectorRevoked)
+		       SET attrs = jsonb_set(jsonb_set(attrs, '{template_version}', ?::jsonb, true),
+		                             '{template_version_source}', to_jsonb(?::text), true), updated_at = now()
+		     WHERE workspace_id = ? AND id = ? AND status <> ?`, string(raw), models.AWSTemplateVersionFromStack,
+			c.WorkspaceID, c.ID, models.CloudConnectorRevoked)
 		if res.Error != nil {
 			return updated, res.Error
 		}

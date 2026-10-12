@@ -190,7 +190,7 @@ func TestRESTHonoursProviderHost(t *testing.T) {
 			}
 		}
 	}
-	if got := APIBase("ghe.example.com", "https://api.github.com"); got != "https://ghe.example.com/api/v3" {
-		t.Fatalf("APIBase %s", got)
+	if got, err := APIBase("ghe.example.com", "https://api.github.com"); err != nil || got != "https://ghe.example.com/api/v3" {
+		t.Fatalf("APIBase %s %v", got, err)
 	}
 }

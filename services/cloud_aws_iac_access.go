@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/githubhost"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
@@ -82,7 +85,11 @@ type IaCConnectorFacts struct {
 	Partition   string
 	Active      bool
 	// TemplateVersion is the discovery stack's recorded version;
-	// MigrationEvidence is whether it grants §11's migration-evidence reads.
+	// MigrationEvidence is whether the version the STACK reported grants §11's
+	// migration-evidence reads. A version AuthSec recorded itself (the build's,
+	// on the manual path and on every connector recorded before the stack's
+	// version was kept) proves nothing about the deployed stack, so it is
+	// false.
 	TemplateVersion   string
 	MigrationEvidence bool
 }
@@ -106,7 +113,7 @@ func LoadIaCConnectorFacts(db *gorm.DB, ws, connectorID uuid.UUID) (*IaCConnecto
 		part = "aws"
 	}
 	return &IaCConnectorFacts{ConnectorID: c.ID, AccountID: c.ScopeID, Partition: part, Active: c.Status == models.CloudConnectorActive,
-		TemplateVersion: attrs.TemplateVersion, MigrationEvidence: awsdiscovery.GrantsResourcePolicyCollection(attrs.TemplateVersion)}, nil
+		TemplateVersion: attrs.TemplateVersion, MigrationEvidence: awsdiscovery.GrantsResourcePolicyCollection(attrs.StackReportedTemplateVersion())}, nil
 }
 
 // MigrationClientsFor builds one region's migration-evidence clients from
@@ -121,6 +128,32 @@ func MigrationClientsFor(onboarding *AWSOnboardingService) func(ctx context.Cont
 	}
 }
 
+// GitHubEnterpriseHostsEnv lists (comma-separated host names) the GitHub
+// Enterprise Server hosts this deployment may send the App JWT and
+// installation tokens to.
+const GitHubEnterpriseHostsEnv = "AUTHSEC_GITHUB_ENTERPRISE_HOSTS"
+
+// trustedGitHubHost admits github.com and, for any other host, only an
+// operator-allowlisted one. An integration's provider_host is entered when
+// the integration is created and is not checked against the provider (the
+// installation is verified against github.com only), so it is not trusted as
+// a destination for credentials by itself.
+func trustedGitHubHost(providerHost string) error {
+	if githubhost.IsDotCom(providerHost) {
+		return nil
+	}
+	h, err := githubhost.Hostname(providerHost)
+	if err != nil {
+		return err
+	}
+	for _, allowed := range strings.Split(os.Getenv(GitHubEnterpriseHostsEnv), ",") {
+		if strings.EqualFold(strings.TrimSpace(allowed), h) {
+			return nil
+		}
+	}
+	return fmt.Errorf("GitHub Enterprise Server host %q is not enabled for this deployment (%s)", h, GitHubEnterpriseHostsEnv)
+}
+
 // ConfigureGovIaCDelivery installs the production IaC delivery adapters
 // (T3.17): the GitHub App PR adapter, whose installation tokens are minted
 // from the workspace's single App key (the same store and signing as the
@@ -133,7 +166,10 @@ func ConfigureGovIaCDelivery(db *gorm.DB, vc vault.VaultClient) {
 		if err != nil || repo.InstallationID == "" {
 			return "", fmt.Errorf("the IaC source's GitHub installation is not verified")
 		}
-		return oauth.MintGitHubAppToken(ctx, ws, "github", &models.ConnectorConnection{ExternalAccountID: repo.InstallationID})
+		if err := trustedGitHubHost(repo.ProviderHost); err != nil {
+			return "", err
+		}
+		return oauth.MintGitHubAppTokenOn(ctx, ws, "github", &models.ConnectorConnection{ExternalAccountID: repo.InstallationID}, repo.ProviderHost)
 	}})
 	SetGovMigrationClients(MigrationClientsFor(NewAWSOnboardingService(db, vc)))
 }

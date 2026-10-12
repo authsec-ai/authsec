@@ -287,6 +287,11 @@ func (ctl *SlackIntegrationController) Disconnect(c *gin.Context) {
 	}
 	before, err := ctl.service().Disconnect(c.Request.Context(), ws, user)
 	if err != nil {
+		if before != nil {
+			// Disconnected, but the token was not destroyed: audited as
+			// the disconnect it is, answered as the failure it is.
+			auditAdminMutation(c, ws.String(), "disconnect", "workspace_slack_integration", ws.String(), http.StatusBadGateway, before, nil)
+		}
 		govError(c, err)
 		return
 	}

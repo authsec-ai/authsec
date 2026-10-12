@@ -358,29 +358,41 @@ func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov
 		return igagov.CanaryResult{}, err
 	}
 	for _, r := range runs {
-		var cov struct {
-			Surfaces map[string]struct {
-				State string `json:"state"`
-				Count int    `json:"count"`
-			} `json:"surfaces"`
-		}
-		_ = json.Unmarshal(r.Coverage, &cov)
-		at := r.RequestedAt
-		if r.StartedAt != nil {
-			at = *r.StartedAt
-		}
-		for k, sc := range cov.Surfaces {
-			if !strings.HasPrefix(k, models.SurfaceCloudTrailEventsPrefix+":") {
-				continue
-			}
-			if sc.State != models.CloudCoverageReached && sc.State != "partial" {
-				continue
-			}
-			in.Trail = append(in.Trail, igagov.TrailRead{From: at.Add(-igagov.MaxTrailScanGap).UTC(), To: at.UTC(),
-				CapHit: sc.State == "partial" || sc.Count >= 10000})
-		}
+		in.Trail = append(in.Trail, scanTrailReads(r.StartedAt, r.RequestedAt, r.Coverage)...)
 	}
 	return igagov.EvaluateCanary(in), nil
+}
+
+// scanTrailReads are the CloudTrail reads one published scan contributes to
+// the canary gates (no_unexpected_failures, window_elapsed): one
+// [scan start - 48 h, scan start] read per cloudtrail-events surface of its
+// coverage that was reached or partial, capped when the surface is partial
+// or counted >= 10,000 events. This is the ONE place a scan's coverage is
+// turned into trail coverage; govCanaryWindowUndecided reads it too.
+func scanTrailReads(startedAt *time.Time, requestedAt time.Time, coverage json.RawMessage) []igagov.TrailRead {
+	var cov struct {
+		Surfaces map[string]struct {
+			State string `json:"state"`
+			Count int    `json:"count"`
+		} `json:"surfaces"`
+	}
+	_ = json.Unmarshal(coverage, &cov)
+	at := requestedAt
+	if startedAt != nil {
+		at = *startedAt
+	}
+	var out []igagov.TrailRead
+	for k, sc := range cov.Surfaces {
+		if !strings.HasPrefix(k, models.SurfaceCloudTrailEventsPrefix+":") {
+			continue
+		}
+		if sc.State != models.CloudCoverageReached && sc.State != "partial" {
+			continue
+		}
+		out = append(out, igagov.TrailRead{From: at.Add(-igagov.MaxTrailScanGap).UTC(), To: at.UTC(),
+			CapHit: sc.State == "partial" || sc.Count >= 10000})
+	}
+	return out
 }
 
 func loadValidations(db *gorm.DB, d models.IGAGovDeployment) ([]models.IGAGovValidation, map[uuid.UUID][]models.IGAGovValidationItem, error) {

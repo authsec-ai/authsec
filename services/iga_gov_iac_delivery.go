@@ -877,6 +877,7 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 			return nil, err
 		}
 		now := d.now().UTC()
+		reviewed := reviewedSHAOf(ch, st)
 		refreshable := false
 		err = run.InTx(ctx, func(tx *gorm.DB) error {
 			refreshable = false
@@ -912,7 +913,9 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 				}
 				return appendGovEvent(tx, ws, GovEventIaCMerged, models.GovActorSystem, "iac_sync", refs, map[string]any{
 					"iac_change_id": ch.ID, "merged_sha": st.MergedSHA, "merged_at": mergedAt, "apply_deadline_at": deadline,
-					"changed_after_review": ch.State == "changed_after_review", "apply_runs": st.ApplyRuns})
+					"changed_after_review": ch.State == "changed_after_review" || headMovedAfterReview(reviewed, st.HeadSHA) ||
+						(st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && st.HeadSHA != lastUpdateIntent(tx, ws, ch.ID)),
+					"reviewed_sha": reviewed, "head_sha": st.HeadSHA, "apply_runs": st.ApplyRuns})
 			case st.State == "closed":
 				set["state"] = "closed"
 				if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ?", ws, ch.ID).Updates(set).Error; err != nil {
@@ -925,19 +928,35 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 				return appendGovEvent(tx, ws, GovEventIaCClosed, models.GovActorSystem, "iac_sync", refs, map[string]any{
 					"iac_change_id": ch.ID, "pr_number": *ch.PRNumber})
 			default:
-				if st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && ch.State == "open" && st.HeadSHA == lastUpdateIntent(tx, ws, ch.ID) {
+				markChanged := func() error {
+					set["state"] = "changed_after_review"
+					return appendGovEvent(tx, ws, GovEventIaCChangedReview, models.GovActorSystem, "iac_sync", refs, map[string]any{
+						"iac_change_id": ch.ID, "proposed_sha": ch.ProposedSHA, "head_sha": st.HeadSHA, "reviewed_sha": reviewed})
+				}
+				switch {
+				case st.HeadSHA == "" || ch.State != "open":
+				case st.HeadSHA == ch.ProposedSHA:
+					if headMovedAfterReview(reviewed, st.HeadSHA) {
+						if err := markChanged(); err != nil {
+							return err
+						}
+					} else {
+						refreshable = true
+					}
+				case st.HeadSHA == lastUpdateIntent(tx, ws, ch.ID):
 					// AuthSec's own update, whose completion was not recorded.
 					set["proposed_sha"] = st.HeadSHA
-					refreshable = true
-				} else if st.HeadSHA != "" && st.HeadSHA != ch.ProposedSHA && ch.State == "open" {
-					set["state"] = "changed_after_review"
-					if err := appendGovEvent(tx, ws, GovEventIaCChangedReview, models.GovActorSystem, "iac_sync", refs, map[string]any{
-						"iac_change_id": ch.ID, "proposed_sha": ch.ProposedSHA, "head_sha": st.HeadSHA}); err != nil {
+					if headMovedAfterReview(reviewed, st.HeadSHA) {
+						if err := markChanged(); err != nil {
+							return err
+						}
+					} else {
+						refreshable = true
+					}
+				default:
+					if err := markChanged(); err != nil {
 						return err
 					}
-				}
-				if st.HeadSHA == ch.ProposedSHA && ch.State == "open" {
-					refreshable = true
 				}
 				return tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ?", ws, ch.ID).Updates(set).Error
 			}
@@ -1079,6 +1098,22 @@ func (d *GovIaCDelivery) recoverOpening(ctx context.Context, run *PolicyJobRun, 
 	return &GovIaCOutcome{DeploymentID: ch.DeploymentID, State: cur.dep.State, Reason: cur.dep.StateReason, ChangeID: &ch.ID, ChangeRow: &fresh}, nil
 }
 
+// reviewedSHAOf is the commit a human approved: the recorded reviewed_sha,
+// or the first approving review GitHub reports now (recorded by this sync).
+func reviewedSHAOf(ch models.IGAGovIaCChange, st iacpr.PullRequestState) string {
+	if ch.ReviewedSHA != "" {
+		return ch.ReviewedSHA
+	}
+	return st.FirstApprovalSHA
+}
+
+// headMovedAfterReview: the PR has an approving review and its head is not
+// the reviewed commit -- whoever pushed it (a person, or AuthSec rebasing),
+// the approval does not cover the head.
+func headMovedAfterReview(reviewed, head string) bool {
+	return reviewed != "" && head != "" && head != reviewed
+}
+
 // lastUpdateIntent is the commit of the latest PR-update intent recorded for
 // an open change (iac.pr_step, change_state open): a head equal to it is
 // AuthSec's own update whose completion was not recorded, not a change
@@ -1110,7 +1145,10 @@ func lastUpdateIntent(db *gorm.DB, ws, changeID uuid.UUID) string {
 //
 // DECISION (review P2): "close and reopen" is used only when the approved
 // change itself is gone; a moved base or improved description is an
-// update, so reviewers keep one PR and its history.
+// update, so reviewers keep one PR and its history. Once a reviewer has
+// approved (reviewed_sha), a push that moves the head off the reviewed
+// commit makes the change changed_after_review -- the same state and event
+// as a human push -- and a wording-only difference is not pushed at all.
 func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ch models.IGAGovIaCChange, x *iacDep,
 	st iacpr.PullRequestState, repo iacpr.RepoRef, src models.IGAGovIaCSource) error {
 	db := d.db.WithContext(ctx)
@@ -1191,6 +1229,10 @@ func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws 
 	if !filesDiffer && !descDiffer {
 		return nil
 	}
+	reviewed := reviewedSHAOf(ch, st)
+	if reviewed != "" && !filesDiffer {
+		return nil // a new commit for wording alone would void the review; the reviewed change is unchanged
+	}
 	var pr iacpr.PullRequest
 	if err := run.External(ctx, 0, func(ctx context.Context) error {
 		var err error
@@ -1203,12 +1245,21 @@ func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws 
 	}
 	now := d.now().UTC()
 	return run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'open'", ws, ch.ID).
-			Updates(map[string]any{"proposed_sha": pr.HeadSHA, "updated_at": now}).Error; err != nil {
-			return err
-		}
+		set := map[string]any{"proposed_sha": pr.HeadSHA, "updated_at": now}
 		refs, err := govDeploymentRefs(tx, ws, x.dep)
 		if err != nil {
+			return err
+		}
+		// A reviewer approved another commit than the one AuthSec has just
+		// pushed: the change is changed_after_review, as after a human push.
+		if headMovedAfterReview(reviewed, pr.HeadSHA) {
+			set["state"] = "changed_after_review"
+			if err := appendGovEvent(tx, ws, GovEventIaCChangedReview, models.GovActorSystem, "iac_sync", refs, map[string]any{
+				"iac_change_id": ch.ID, "proposed_sha": pr.HeadSHA, "head_sha": pr.HeadSHA, "reviewed_sha": reviewed, "by": "authsec_update"}); err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'open'", ws, ch.ID).Updates(set).Error; err != nil {
 			return err
 		}
 		return appendGovEvent(tx, ws, GovEventIaCPRUpdated, models.GovActorSystem, "iac_sync", refs, map[string]any{

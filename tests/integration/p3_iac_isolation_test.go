@@ -294,7 +294,9 @@ func (l *p3iLab) migrations(dep uuid.UUID) []models.IGAGovWorkloadMigration {
 }
 
 func (l *p3iLab) setTemplate(v string) {
-	p3exec(l.t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{template_version}', to_jsonb(?::text)) WHERE id = ?`, v, l.a.conn)
+	// As a stack Update records it: the version, and that the stack said so.
+	p3exec(l.t, l.db, `UPDATE cloud_connector SET attrs = jsonb_set(jsonb_set(attrs, '{template_version}', to_jsonb(?::text)),
+	                   '{template_version_source}', to_jsonb(?::text)) WHERE id = ?`, v, models.AWSTemplateVersionFromStack, l.a.conn)
 }
 
 const p3iIsoTF = `resource "aws_iam_role" "src" {

@@ -219,9 +219,9 @@ func TestP3RPCDeniedThrottledAndFailedReads(t *testing.T) {
 		{"throttled past retries", FormSecretsManagerSecret, func(r *rpfake.Region) { r.Throttles = map[string]int{"GetResourcePolicy": 5} }, CoveragePartial, "ThrottlingException"},
 		{"list throttled past retries", FormLambdaLayerVersion, func(r *rpfake.Region) { r.Throttles = map[string]int{"ListLayers": 9} }, CoveragePartial, "lambda:ListLayers failed (ThrottlingException)"},
 		{"child listing denied", FormLambdaAlias, func(r *rpfake.Region) { r.Errs = map[string]error{"ListAliases": denied} }, CoverageDenied, "lambda:ListAliases AccessDeniedException"},
-		{"service not offered", FormS3DirectoryBucket, func(r *rpfake.Region) {
+		{"NXDOMAIN where AWS documents the service", FormS3DirectoryBucket, func(r *rpfake.Region) {
 			r.Errs = map[string]error{"ListDirectoryBuckets": &net.DNSError{Err: "no such host", Name: "s3express-control.eu-west-1.amazonaws.com", IsNotFound: true}}
-		}, CoverageComplete, "service not offered"},
+		}, CoveragePartial, "DNSNameNotFound"},
 		{"other error", FormS3ObjectLambdaAccessPoint, func(r *rpfake.Region) {
 			r.Errs = map[string]error{"GetAccessPointPolicyForObjectLambda": rpfake.APIError("InternalError")}
 		}, CoveragePartial, "InternalError"},

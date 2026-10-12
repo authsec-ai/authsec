@@ -117,7 +117,10 @@ import (
 //   - Disconnect revokes the token (auth.revoke, best effort), DESTROYS it
 //     in Vault (KV v2 metadata delete: every version, not the soft delete of
 //     the latest one), sets revoked_at and deletes the workspace's user
-//     links (they are ids of the old team). Reinstalling a workspace into
+//     links (they are ids of the old team). A destroy that fails is 502
+//     slack_token_not_destroyed: the row stays revoked with its
+//     bot_token_ref (settings status token_destroy_pending) and DELETE again
+//     retries; a destroyed token clears the ref. Reinstalling a workspace into
 //     ANOTHER Slack team revokes the old team's token once the new
 //     installation is committed; a reinstall that fails puts the previous
 //     token back (and revokes the new token unless it is the same team's).
@@ -163,6 +166,10 @@ const (
 	SlackCodeLinkEmailMismatch = "slack_link_email_mismatch"
 	// SlackCodeUnavailable: Slack could not be asked (users.info failed).
 	SlackCodeUnavailable = "slack_unavailable"
+	// SlackCodeTokenNotDestroyed: the workspace is disconnected but the bot
+	// token could not be destroyed in Vault; its bot_token_ref is kept, the
+	// settings status says token_destroy_pending, and DELETE again retries.
+	SlackCodeTokenNotDestroyed = "slack_token_not_destroyed"
 )
 
 // Event names (vocabulary: iga_gov_event_vocabulary.go).
@@ -730,6 +737,13 @@ func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid
 			"slack_team_id": b.SlackTeamID, "links_removed": links})
 	})
 	if err != nil {
+		var ge *GovError
+		if errors.As(err, &ge) && ge.Status == http.StatusNotFound && s.vault != nil {
+			if pending := pendingTokenDestroy(s.db.WithContext(ctx), ws); pending != nil {
+				// Already disconnected: retry destroying the token that stayed.
+				return pending, s.destroyToken(ctx, ws, pending.BotTokenRef)
+			}
+		}
 		return nil, err
 	}
 	if token != "" && s.api != nil {
@@ -738,17 +752,33 @@ func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid
 		}
 	}
 	if s.vault != nil && before.BotTokenRef != "" {
-		// Destroy, not a soft delete: no version of the token may stay
-		// recoverable from Vault after a disconnect.
-		destroyed, derr := vault.Destroy(s.vault, before.BotTokenRef)
-		switch {
-		case derr != nil:
-			log.Printf("[slack] workspace %s: destroying the bot token: %v", ws, derr)
-		case !destroyed:
-			log.Printf("[slack] workspace %s: the secrets store can only soft-delete the bot token at %s", ws, before.BotTokenRef)
+		if derr := s.destroyToken(ctx, ws, before.BotTokenRef); derr != nil {
+			// Disconnected, but the token is not destroyed: the caller
+			// hears it, with the disconnect it did make.
+			return before, derr
 		}
 	}
 	return before, nil
+}
+
+// destroyToken destroys the revoked installation's bot token in Vault (not a
+// soft delete: no version may stay recoverable) and then clears its
+// bot_token_ref. A failure keeps the ref -- a revoked row that still has one
+// is "disconnected, token not destroyed" (SlackStatusView.TokenDestroyPending)
+// -- and is an error. The token is never logged.
+func (s *SlackIntegrationService) destroyToken(ctx context.Context, ws uuid.UUID, ref string) error {
+	destroyed, derr := vault.Destroy(s.vault, ref)
+	if derr == nil && !destroyed {
+		derr = errors.New("the secrets store can only soft-delete secrets")
+	}
+	if derr != nil {
+		log.Printf("[slack] workspace %s: destroying the bot token at %s: %v", ws, ref, derr)
+		return slackErr(http.StatusBadGateway, SlackCodeTokenNotDestroyed,
+			"Slack is disconnected, but its bot token could not be destroyed in the secrets store. Disconnect again to retry.",
+			map[string]any{"disconnected": true, "token_destroy_pending": true})
+	}
+	return s.db.WithContext(ctx).Exec(`UPDATE workspace_slack_integration SET bot_token_ref = ''
+		WHERE workspace_id = ? AND revoked_at IS NOT NULL AND bot_token_ref = ?`, ws, ref).Error
 }
 
 // SlackStatusView is the Slack part of GET /policy/settings notifications.
@@ -758,12 +788,31 @@ type SlackStatusView struct {
 	ApprovalsChannelID string     `json:"approvals_channel_id,omitempty"`
 	InstalledAt        *time.Time `json:"installed_at,omitempty"`
 	LinkedUsers        int64      `json:"linked_users"`
+	// TokenDestroyPending: disconnected (Connected is false), but the bot
+	// token could not be destroyed in Vault; DELETE again retries.
+	TokenDestroyPending bool `json:"token_destroy_pending,omitempty"`
+}
+
+// pendingTokenDestroy is the workspace's revoked installation whose bot
+// token was not destroyed, or nil.
+func pendingTokenDestroy(db *gorm.DB, ws uuid.UUID) *models.WorkspaceSlackIntegration {
+	var rows []models.WorkspaceSlackIntegration
+	if err := db.Where("workspace_id = ? AND revoked_at IS NOT NULL AND bot_token_ref <> ''", ws).Limit(1).Find(&rows).Error; err != nil || len(rows) == 0 {
+		return nil
+	}
+	return &rows[0]
 }
 
 // slackStatusFor reads a workspace's Slack status for the settings view.
 func slackStatusFor(db *gorm.DB, ws uuid.UUID) *SlackStatusView {
 	in, err := activeSlackIntegration(db, ws)
-	if err != nil || in == nil {
+	if err != nil {
+		return &SlackStatusView{}
+	}
+	if in == nil {
+		if p := pendingTokenDestroy(db, ws); p != nil {
+			return &SlackStatusView{TeamName: p.SlackTeamName, TokenDestroyPending: true}
+		}
 		return &SlackStatusView{}
 	}
 	v := &SlackStatusView{Connected: true, TeamName: in.SlackTeamName, ApprovalsChannelID: in.ApprovalsChannelID}

@@ -229,18 +229,29 @@ const GovCodeTargetDeployed = "target_deployed"
 // govDeployedStates are the states of a FORWARD deployment (apply, split,
 // remove_control) in which its role carries -- or may carry -- the
 // deployment's change in AWS; govInFlightStates are those of any deployment
-// (an undo included) that is changing the role right now.
+// (an undo included) that is changing the role right now; govStoppedStates
+// are the terminal states a run can stop in after some of its ops were
+// already applied.
 var (
 	govDeployedStates = []string{models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved,
 		models.GovDeployRecovered, models.GovDeployAwaitingMerge, models.GovDeployAwaitingApply, models.GovDeployAppliedUnverified,
 		models.GovDeployVerified, models.GovDeployDrifted}
 	govInFlightStates = []string{models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved,
 		models.GovDeployAwaitingMerge, models.GovDeployAwaitingApply}
+	govStoppedStates = []string{models.GovDeployFailed, models.GovDeployBlocked}
 )
+
+// govTouchedAWSSQL is the ONE rule for "this deployment may have changed
+// AWS": an op recorded done in completed_ops, or any attempt that was
+// dispatched (completed, unknown or still open). d is the deployment's alias.
+const govTouchedAWSSQL = `(jsonb_array_length(d.completed_ops) > 0 OR EXISTS (SELECT 1 FROM iga_gov_attempt a
+	WHERE a.workspace_id = d.workspace_id AND a.deployment_id = d.id AND a.dispatched_at IS NOT NULL))`
 
 // deployedTargets is the set of a version's targets that already carry a
 // deployment of that version (other than `except`): a forward deployment in
-// govDeployedStates, or any deployment in govInFlightStates.
+// govDeployedStates, a forward deployment that stopped (failed or blocked)
+// after it may have changed AWS (govTouchedAWSSQL), or any deployment in
+// govInFlightStates.
 //
 // fix/p3-appr (P0-2, SPEC §2.8 "revalidation before stale deployments",
 // §8.3, A59): such a target's live state now includes this version's own
@@ -250,18 +261,23 @@ var (
 // place") and first_attachment all reflect AuthSec's own write. Its approved
 // plan is therefore never recompiled, revalidated or superseded: the
 // compile_plans job and a re-proposal skip it, and revalidate refuses it
-// (409 target_deployed). DECISION: a queued, blocked or failed deployment
-// has changed nothing (a queued one is revalidated by the deploy job when
-// it starts); a verified undo returned the role to its before-state (the
-// forward deployment is then `undone`), so the target is revalidated again
-// before a re-apply.
+// (409 target_deployed). DECISION: a queued deployment has changed nothing
+// (the deploy job revalidates it when it starts); a failed or blocked one
+// has changed nothing only if no op was recorded done and no attempt was
+// dispatched -- a run that stopped after an applied op (binding_partial,
+// retries exhausted, a missing document, a binding refusal) left the role
+// with a partial boundary, so its target stays deployed whatever the
+// deployment's terminal state; a verified undo returned the role to its
+// before-state (the forward deployment is then `undone`), so the target is
+// revalidated again before a re-apply.
 func deployedTargets(db *gorm.DB, ws, versionID, except uuid.UUID) (map[uuid.UUID]bool, error) {
 	var ids []uuid.UUID
 	if err := db.Raw(`SELECT DISTINCT p.target_id FROM iga_gov_deployment d
 		JOIN iga_gov_plan p ON p.workspace_id = d.workspace_id AND p.id = d.plan_id
 		WHERE d.workspace_id = ? AND d.version_id = ? AND d.id <> ?
-		  AND ((d.kind IN ('apply','split','remove_control') AND d.state IN ?) OR d.state IN ?)`,
-		ws, versionID, except, govDeployedStates, govInFlightStates).Scan(&ids).Error; err != nil {
+		  AND ((d.kind IN ('apply','split','remove_control') AND (d.state IN ? OR (d.state IN ? AND `+govTouchedAWSSQL+`)))
+		       OR d.state IN ?)`,
+		ws, versionID, except, govDeployedStates, govStoppedStates, govInFlightStates).Scan(&ids).Error; err != nil {
 		return nil, err
 	}
 	out := make(map[uuid.UUID]bool, len(ids))
@@ -271,24 +287,43 @@ func deployedTargets(db *gorm.DB, ws, versionID, except uuid.UUID) (map[uuid.UUI
 	return out, nil
 }
 
-// compileForVersion compiles one target of a stored version in memory, by
-// the version's intent kind: right_size_services (compileOne) or
-// dedicated_identity (compileIsolationOne, fix/p3-appr P1-10). Other kinds
-// (remove_control) are not recompiled here.
-func (a *GovAuthoring) compileForVersion(ctx context.Context, ws uuid.UUID, v models.IGAGovPolicyVersion, t models.IGAGovTarget,
-	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+// targetCompiler compiles one target of a stored version in memory.
+type targetCompiler func(ctx context.Context, t models.IGAGovTarget, c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error)
+
+// versionCompiler is the one place a stored version's intent is loaded for
+// recompilation, whatever its kind: right_size_services (compileOne) or
+// dedicated_identity (compileIsolationOne, fix/p3-appr P1-10). The error is
+// the version's (a kind that is not recompiled here, e.g. remove_control, or
+// an unparsable intent).
+func (a *GovAuthoring) versionCompiler(ws uuid.UUID, v models.IGAGovPolicyVersion) (targetCompiler, error) {
 	pi, err := igagov.ParseIntent(v.Intent)
 	if err != nil {
-		return nil, nil, fmt.Errorf("version %s intent: %w", v.ID, err)
+		return nil, fmt.Errorf("version %s intent: %w", v.ID, err)
 	}
 	if pi.Kind == igagov.IntentDedicatedIdentity && pi.DedicatedIdentity != nil {
-		return a.compileIsolationOne(ctx, ws, *pi.DedicatedIdentity, t, c, call)
+		di := *pi.DedicatedIdentity
+		return func(ctx context.Context, t models.IGAGovTarget, c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+			return a.compileIsolationOne(ctx, ws, di, t, c, call)
+		}, nil
 	}
 	intent, err := storedRightSize(v)
 	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, t models.IGAGovTarget, c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+		return a.compileOne(ctx, ws, intent, t, c, call)
+	}, nil
+}
+
+// compileForVersion compiles one target of a stored version in memory by
+// the version's intent kind (versionCompiler).
+func (a *GovAuthoring) compileForVersion(ctx context.Context, ws uuid.UUID, v models.IGAGovPolicyVersion, t models.IGAGovTarget,
+	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
+	compile, err := a.versionCompiler(ws, v)
+	if err != nil {
 		return nil, nil, err
 	}
-	return a.compileOne(ctx, ws, intent, t, c, call)
+	return compile(ctx, t, c, call)
 }
 
 func storedRightSize(v models.IGAGovPolicyVersion) (igagov.RightSizeIntent, error) {
@@ -301,6 +336,17 @@ func storedRightSize(v models.IGAGovPolicyVersion) (igagov.RightSizeIntent, erro
 			map[string]any{"kind": in.Kind})
 	}
 	return *in.RightSize, nil
+}
+
+// storedServiceIntent is the services section of a stored version's intent
+// for the callers that read it whatever the kind (the rollout's observation
+// and canary inputs, the owner gate): the right-size intent, or the zero
+// intent of a dedicated_identity version, which removes no services.
+func storedServiceIntent(v models.IGAGovPolicyVersion) (igagov.RightSizeIntent, error) {
+	if in, err := igagov.ParseIntent(v.Intent); err == nil && in.Kind == igagov.IntentDedicatedIdentity {
+		return igagov.RightSizeIntent{}, nil
+	}
+	return storedRightSize(v)
 }
 
 // planRow renders a compiled plan as an iga_gov_plan row.
@@ -906,7 +952,7 @@ func (a *GovAuthoring) plainTx(ctx context.Context, fn func(tx *gorm.DB) error) 
 // recompile recompiles an in-review version in the background: blocked
 // targets fail the job (retried with backoff); ineligible plans are stored.
 func (a *GovAuthoring) recompile(ctx context.Context, ws uuid.UUID, v models.IGAGovPolicyVersion, call liveCaller, inTx txRunner) error {
-	intent, err := storedRightSize(v)
+	compile, err := a.versionCompiler(ws, v)
 	if err != nil {
 		return PolicyJobAbandon(err.Error())
 	}
@@ -926,7 +972,7 @@ func (a *GovAuthoring) recompile(ctx context.Context, ws uuid.UUID, v models.IGA
 		if deployed[t.ID] {
 			continue
 		}
-		ct, blk, err := a.compileOne(ctx, ws, intent, t, cs[t.ID], call)
+		ct, blk, err := compile(ctx, t, cs[t.ID], call)
 		if err != nil {
 			return err
 		}

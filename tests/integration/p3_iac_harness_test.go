@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -47,6 +48,9 @@ func newP3iLab(t *testing.T, name string) *p3iLab {
 	l := &p3iLab{p3aLab: newP3aLab(t, name), gh: iacpr.NewFake()}
 	l.repo = "acme/infra-" + l.ws.String()[:8]
 	l.clock = time.Now().UTC()
+	// Isolation reads the version the STACK reported: this lab's connector
+	// stands for one whose stack reported the current template.
+	l.setTemplate(awsdiscovery.TemplateVersion)
 	services.SetGovIaCGitHub(l.gh)
 	l.integ, l.ds = uuid.New(), uuid.New()
 	inst := fmt.Sprint(time.Now().UnixNano())

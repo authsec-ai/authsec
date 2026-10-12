@@ -532,7 +532,7 @@ func (s *AWSWorkloadScanner) scanGateways(
 // regionalCoverage is surfaceResult for one compute surface in one region,
 // with one extra guard on "unsupported".
 //
-// An endpoint that does not resolve means the service is not offered there
+// AWS documents the service as absent there and the endpoint does not resolve
 // (ErrServiceNotInRegion), and unsupported blocks nothing. But if an earlier
 // scan COLLECTED this runtime kind in this region, the service evidently is
 // offered there, and a resolver failure is the likelier story; unsupported

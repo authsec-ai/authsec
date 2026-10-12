@@ -478,49 +478,45 @@ func TestP2S3bOrganizationsIsReportedUnsupported(t *testing.T) {
 
 /* --------------------------- not offered in region -------------------------- */
 
-// T3.6 / T3.8 / E9: a service whose regional endpoint does not resolve is not
-// offered there -- unsupported, which blocks nothing (§1.4): the table still
-// reads as authoritative (WorkloadsComplete) and the region's other surfaces
-// still reconcile. It used to be denied, which vetoed workload reconciliation
-// for the whole connector on every run.
+// Review P1-11 (T3.6 / T3.8 / E9, revised): a regional endpoint that does not
+// resolve is NOT "the service is not offered there". Lambda is offered in
+// every region, so a name that fails to resolve is a resolver failure: the
+// surface is partial -- never unsupported -- names the call and the DNS
+// failure, blocks workload reconciliation, and nothing the surface held is
+// deleted, with or without an earlier scan having collected rows there. The
+// only "unsupported" a listing can produce is a service/region pair AWS
+// documents as absent (awsdiscovery.EndpointNotOffered, pinned in
+// internal/awsdiscovery/p3_cov_not_offered_test.go).
 //
-// But once an earlier scan COLLECTED that service in that region, a
-// non-resolving endpoint is not proof it is not offered: it is reported denied,
-// and nothing there is deleted.
-//
-// Safeguards (mutation-checked): the DNS mapping in listErr; the prior-rows
-// guard in regionalCoverage.
-func TestP2S3bServiceNotOfferedInRegionIsUnsupported(t *testing.T) {
+// Safeguards (mutation-checked): the resolver branch of listErr; the
+// ErrEndpointUnreachable case in collectionCoverage.
+func TestP2S3bUnresolvableEndpointIsPartialNeverUnsupported(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "p2-s3b-not-offered")
 	defer cleanWorkloadTables(t, db, ws)
 
 	svc, snap := s3bActivityFixture(t, db, ws, 0)
 	s3bStaleRows(t, db, ws, snap)
-	// The planted stale row becomes an ECS task definition, so us-east-1 has
-	// never had a Lambda -- the genuinely-not-offered case -- and the stale
-	// row belongs to a surface (ecs:us-east-1) that IS reached.
+	// The planted stale row becomes an ECS task definition: it belongs to a
+	// surface (ecs:us-east-1) that IS reached; it does not depend on Lambda.
 	db.Exec(`UPDATE cloud_workload SET runtime_kind = 'ecs_task_definition',
 	                native_id = 'arn:aws:ecs:us-east-1:429418377036:task-definition/s3b-gone:1'
 	          WHERE workspace_id = ? AND name = 's3b-gone'`, ws)
 
 	out := s3bWorkloadScan(t, db, ws, svc, snap, &s3bActivity{}, &s3bDNSLambda{host: "lambda.us-east-1.amazonaws.com"})
 	cov := out.Surfaces["lambda:us-east-1"]
-	if cov.State != models.CloudCoverageUnsupported || !strings.Contains(cov.Error, "not offered in us-east-1") {
-		t.Fatalf("lambda with a non-resolving endpoint = %+v, want unsupported", cov)
+	if cov.State != models.CloudCoveragePartial || !strings.Contains(cov.Error, "DNSNameNotFound") {
+		t.Fatalf("lambda with a non-resolving endpoint = %+v, want partial naming DNSNameNotFound", cov)
 	}
 	if cov.API != "lambda:ListFunctions" || cov.ErrorCode != "" {
-		t.Errorf("unsupported api/error_code = %q/%q, want lambda:ListFunctions and no code (AWS returned none)",
+		t.Errorf("partial api/error_code = %q/%q, want lambda:ListFunctions and no code (AWS returned none)",
 			cov.API, cov.ErrorCode)
 	}
-	if _, listed := out.Errors["lambda:us-east-1"]; listed {
-		t.Error("an unsupported surface is not an error")
+	if _, listed := out.Errors["lambda:us-east-1"]; !listed {
+		t.Error("a partial surface is an error: it must be listed")
 	}
-	if !out.WorkloadsComplete {
-		t.Fatalf("unsupported must not make the workload table unauthoritative: %+v", out.Errors)
-	}
-	if workload, _ := s3bSurvived(t, db, ws); workload {
-		t.Error("the stale ECS row survived: its surface was reached beside an unsupported one")
+	if out.WorkloadsComplete {
+		t.Fatal("a Lambda listing that never reached AWS must make the workload table unauthoritative")
 	}
 
 	// ---- an earlier scan found a Lambda here ---------------------------------
@@ -532,11 +528,9 @@ func TestP2S3bServiceNotOfferedInRegionIsUnsupported(t *testing.T) {
 	snap.Generation++
 	out = s3bWorkloadScan(t, db, ws, svc, snap, &s3bActivity{}, &s3bDNSLambda{host: "lambda.us-east-1.amazonaws.com"})
 	cov = out.Surfaces["lambda:us-east-1"]
-	if cov.State != models.CloudCoverageDenied || !strings.Contains(cov.Error, "earlier scan collected") {
-		t.Fatalf("lambda not resolving where a Lambda was collected before = %+v, want denied, saying why", cov)
-	}
-	if out.WorkloadsComplete {
-		t.Fatal("a denied surface must block workload reconciliation")
+	if cov.State != models.CloudCoveragePartial || out.WorkloadsComplete {
+		t.Fatalf("lambda not resolving where a Lambda was collected before = %+v (complete=%v), want partial and blocking",
+			cov, out.WorkloadsComplete)
 	}
 	var kept int64
 	db.Raw(`SELECT count(*) FROM cloud_workload WHERE workspace_id = ? AND name = 's3b-here'`, ws).Scan(&kept)

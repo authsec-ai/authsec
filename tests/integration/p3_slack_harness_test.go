@@ -465,6 +465,10 @@ func p3sDetail(body map[string]any, key string) string {
 // p3sHealth is a fake T3.15 health reporter.
 type p3sHealth struct{ got []services.GovHealthReport }
 
+func (h *p3sHealth) AuthorizeHealthReport(context.Context, services.GovHealthReport) error {
+	return nil
+}
+
 func (h *p3sHealth) ReportHealth(_ context.Context, r services.GovHealthReport) (any, error) {
 	h.got = append(h.got, r)
 	return map[string]any{"kind": r.Kind, "detail": r.Detail}, nil

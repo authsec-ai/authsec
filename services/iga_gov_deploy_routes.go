@@ -924,10 +924,12 @@ type GovHealthReportRequest struct {
 	Channel string `json:"-"`
 }
 
-// CreateHealthReport records an owner's report. Allowed for an owner of a
-// consumer of the role (a workload in the plan's impact, or the role's
-// identity) or a holder of governance:author (isAuthor).
-func (s *GovDeployments) CreateHealthReport(ctx context.Context, ws, actor, depID uuid.UUID, req GovHealthReportRequest, isAuthor bool) (*models.IGAGovHealthReport, error) {
+// AuthorizeHealthReport is CreateHealthReport's validation and authorization
+// without the write: the report's kind and detail, and that the actor is an
+// owner of a consumer of the role (a workload in the plan's impact, or the
+// role's identity) or a holder of governance:author (isAuthor). The console
+// route and Slack's buttons both authorize here.
+func (s *GovDeployments) AuthorizeHealthReport(ctx context.Context, ws, actor, depID uuid.UUID, req GovHealthReportRequest, isAuthor bool) (*models.IGAGovDeployment, error) {
 	db := s.db.WithContext(ctx)
 	d, err := s.loadDeployment(db, ws, depID)
 	if err != nil {
@@ -966,6 +968,16 @@ func (s *GovDeployments) CreateHealthReport(ctx context.Context, ws, actor, depI
 			return nil, govErr(http.StatusForbidden, GovCodeNotConsumerOwner, "Only an owner of a consumer of this role, or an author, can report.", nil)
 		}
 	}
+	return d, nil
+}
+
+// CreateHealthReport records an owner's report after AuthorizeHealthReport.
+func (s *GovDeployments) CreateHealthReport(ctx context.Context, ws, actor, depID uuid.UUID, req GovHealthReportRequest, isAuthor bool) (*models.IGAGovHealthReport, error) {
+	d, err := s.AuthorizeHealthReport(ctx, ws, actor, depID, req, isAuthor)
+	if err != nil {
+		return nil, err
+	}
+	db := s.db.WithContext(ctx)
 	ch := req.Channel
 	if ch == "" {
 		ch = "ui"

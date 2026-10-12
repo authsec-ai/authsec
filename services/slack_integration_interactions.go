@@ -94,8 +94,8 @@ import (
 //   - Report a problem / It's working go to the health reporter T3.15
 //     registers (SetGovHealthReporter): its authorization (owner of a
 //     consumer, or governance:author) is that reporter's, as for the UI
-//     route; a reporter that also implements GovHealthAuthorizer is asked
-//     before the claim. Unregistered: 503 health_reports_unavailable.
+//     route, asked before the claim. Unregistered: 503
+//     health_reports_unavailable.
 
 const (
 	// slackInteractionWorkers bounds the interactions running at once.
@@ -118,16 +118,13 @@ type GovHealthReport struct {
 
 // GovHealthReporter is T3.15's health-report service as Slack calls it: the
 // same authorization and write as POST /deployments/:id/health-reports.
-// It returns the stored report (for the audit row).
+// AuthorizeHealthReport is the authorization alone, without writing: a Slack
+// click is authorized before its action_ts is claimed, so every reporter
+// must provide it (a reporter that cannot authorize cannot be installed).
+// ReportHealth returns the stored report (for the audit row).
 type GovHealthReporter interface {
-	ReportHealth(ctx context.Context, r GovHealthReport) (any, error)
-}
-
-// GovHealthAuthorizer is optionally implemented by a GovHealthReporter: the
-// reporter's authorization alone, without writing, so a Slack click is
-// authorized before its action_ts is claimed.
-type GovHealthAuthorizer interface {
 	AuthorizeHealthReport(ctx context.Context, r GovHealthReport) error
+	ReportHealth(ctx context.Context, r GovHealthReport) (any, error)
 }
 
 var (
@@ -573,7 +570,7 @@ func (s *SlackIntegrationService) authorizeResponse(ctx context.Context, ic *int
 }
 
 // authorizeHealth checks a Report a problem / It's working click (the
-// reporter's own authorization when it exposes one) and returns the report.
+// reporter's authorization, as for the console route) and returns the report.
 func (s *SlackIntegrationService) authorizeHealth(ctx context.Context, ic *interactionCtx) (slackAction, error) {
 	kind := ""
 	switch ic.act.ActionID {
@@ -595,10 +592,8 @@ func (s *SlackIntegrationService) authorizeHealth(ctx context.Context, ic *inter
 	}
 	r := GovHealthReport{WorkspaceID: ic.n.WorkspaceID, ActorID: ic.user, SubjectKind: ic.n.SubjectKind,
 		SubjectID: ic.n.SubjectID, Kind: kind, Detail: detail, Channel: "slack"}
-	if a, ok := h.(GovHealthAuthorizer); ok {
-		if err := a.AuthorizeHealthReport(ctx, r); err != nil {
-			return nil, err
-		}
+	if err := h.AuthorizeHealthReport(ctx, r); err != nil {
+		return nil, err
 	}
 	return func(ctx context.Context) (*SlackInteractionResult, error) {
 		out, err := h.ReportHealth(ctx, r)

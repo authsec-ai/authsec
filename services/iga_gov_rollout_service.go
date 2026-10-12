@@ -519,7 +519,7 @@ func (r *GovRollout) loadVersionCtx(db *gorm.DB, ws uuid.UUID, v models.IGAGovPo
 	if err := db.Where("workspace_id = ? AND id = ?", ws, v.PolicyID).Take(&rc.Policy).Error; err != nil {
 		return nil, err
 	}
-	intent, err := storedRightSize(v)
+	intent, err := storedServiceIntent(v)
 	if err != nil {
 		return nil, err
 	}

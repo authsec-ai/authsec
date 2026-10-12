@@ -948,9 +948,9 @@ func TestP3T315ManualExpandRunsTheCanaryHealthCheck(t *testing.T) {
 	if st := l.deployment(dep).State; st != models.GovDeployDrifted {
 		t.Fatalf("after the drift check: %s", st)
 	}
-	if l.gateOf(dep, igagov.GateArtifactVerified) != igagov.OutcomePassed {
-		t.Fatal("the last verify run's artifact gate should still read passed")
-	}
+	// (The verify job is still re-checking -- no scan has covered the window
+	// -- so its next run may already read the artifact gate failed; the
+	// refusal below names the deployment's state either way.)
 	if v := l.rollout(policy); p3rStage(v) != models.GovRolloutCanary {
 		t.Fatalf("stage %s before the expand", p3rStage(v))
 	}
@@ -1074,6 +1074,51 @@ func TestP3T315VerifyKeepsCheckingUntilTheWindowIsCovered(t *testing.T) {
 	l.tick()
 	if v := l.rollout(policy); p3rStage(v) != models.GovRolloutComplete {
 		t.Fatalf("rollout %v %v", v["rollout"], dig(v, "results", "canary", "gates"))
+	}
+}
+
+// The first scan after the window's end has NO CloudTrail coverage (the read
+// is denied): it is published, but it cannot decide window_elapsed, so the
+// verify job keeps re-checking until a scan that covers the window arrives.
+//
+// Fails on the version that stopped at any scan started after the window's
+// end: the job completed with window_elapsed frozen at not_available.
+func TestP3T315VerifyIgnoresAScanWithoutTrailCoverage(t *testing.T) {
+	l := newP3rLab(t, "p3-t315-window-nocov", true)
+	const rid = "AROAWINDOWNOCOV1"
+	arn := l.role("WindowNoCov", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	policy := l.prepare(rid)
+	l.observed(policy)
+	dep := l.toCanary(policy, 1)
+	at := l.applied(dep)
+	l.mirror(rid)
+	l.trail.add(p3rEvent(arn, rid, "workload", "s3", "ListBuckets", at.Add(5*time.Minute), ""))
+	l.advance(30 * time.Minute)
+	l.scan() // started inside the window
+	l.drain()
+	if st := l.deployment(dep).State; st != models.GovDeployVerified {
+		t.Fatalf("canary %s", st)
+	}
+	l.advance(40 * time.Minute) // past the 1 h window
+	l.trail.err = enforcetest.APIError("AccessDenied", "cloudtrail:LookupEvents denied")
+	l.scan() // published after the window's end, without trail coverage
+	l.drain()
+	if g := l.gateOf(dep, igagov.GateWindowElapsed); g != igagov.OutcomeNotAvailable {
+		t.Fatalf("window_elapsed after a scan without CloudTrail coverage: %q", g)
+	}
+	if st := l.jobStatus("verify", dep); st != "queued" {
+		t.Fatalf("verify job %s after a published scan that has no trail coverage, want still re-checking", st)
+	}
+	l.trail.err = nil
+	l.advance(10 * time.Minute)
+	l.scan() // covers the window's end
+	l.drain()
+	if g := l.gateOf(dep, igagov.GateWindowElapsed); g != igagov.OutcomePassed {
+		t.Fatalf("window_elapsed after a covering scan: %q", g)
+	}
+	if st := l.jobStatus("verify", dep); st != "complete" {
+		t.Fatalf("verify job %s once window_elapsed is decided", st)
 	}
 }
 
