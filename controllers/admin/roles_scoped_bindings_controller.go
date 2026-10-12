@@ -1304,6 +1304,14 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 
 	log.Printf("INFO: Found role %s (name: %s), proceeding to delete with role_permissions and role_bindings", roleID, role.Name)
 
+	// The built-in roles carry operator access (workspace_memberships points at
+	// them with ON DELETE RESTRICT); a role that members hold cannot go either.
+	// Say so instead of surfacing the foreign-key error.
+	if msg := roleDeleteBlocked(freshDB, role, workspaceID); msg != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": msg})
+		return
+	}
+
 	// Phase H-5 setup: snapshot the users currently bound to this role BEFORE
 	// the cascade. After tx commit, we revoke each user's active OAuth tokens
 	// so the role removal takes effect on the next request — not at access-token
@@ -1333,6 +1341,16 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		}
 		log.Printf("INFO: Deleted %d role_bindings for role %s", result.RowsAffected, roleID)
 
+		// An application whose default role this was keeps its access policy,
+		// without a default. The composite FK's ON DELETE SET NULL would null
+		// workspace_id as well, which is NOT NULL, and fail the delete.
+		if err := tx.Model(&models.ResourceServerAccessPolicy{}).
+			Where("default_role_id = ? AND workspace_id = ?", roleID, workspaceID).
+			Update("default_role_id", nil).Error; err != nil {
+			log.Printf("ERROR: Failed to clear default_role_id for role %s: %v", roleID, err)
+			return err
+		}
+
 		// Delete the role
 		if err := tx.Delete(&role).Error; err != nil {
 			log.Printf("ERROR: Failed to delete role %s: %v", roleID, err)
@@ -1342,7 +1360,7 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		return nil
 	}); err != nil {
 		log.Printf("ERROR: Transaction failed for deleting role %s: %v", roleID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role"})
 		return
 	}
 
@@ -1370,4 +1388,26 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		"message": "Role deleted successfully",
 		"id":      roleID.String(),
 	})
+}
+
+// roleDeleteBlocked says why role may not be deleted, or "" when it may.
+func roleDeleteBlocked(db *gorm.DB, role models.RBACRole, workspaceID uuid.UUID) string {
+	switch strings.ToLower(role.Name) {
+	case "owner", "admin":
+		return fmt.Sprintf("The %s role is built in and can't be deleted", role.Name)
+	}
+	if role.IsSystem {
+		return fmt.Sprintf("The %s role is a system role and can't be deleted", role.Name)
+	}
+	var members int64
+	if err := db.Model(&models.WorkspaceMembership{}).
+		Where("role_id = ? AND workspace_id = ?", role.ID, workspaceID).
+		Count(&members).Error; err != nil {
+		log.Printf("ERROR: count members of role %s: %v", role.ID, err)
+		return "Could not check who holds this role; try again"
+	}
+	if members > 0 {
+		return fmt.Sprintf("%d workspace member(s) hold the %s role; give them another role first", members, role.Name)
+	}
+	return ""
 }
