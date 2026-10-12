@@ -37,12 +37,13 @@ func Test_CIBA_BackchannelAuthorizePollRespond(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddCIBAUser: %v", err)
 	}
+	grantUserRSScope(t, ws, rs, cibaUser.UserID)
 
 	// Step 1: bc-authorize — SA authenticates via Basic auth; login_hint is the
 	// CIBA user's email. Expect 200 with auth_req_id.
 	bcBody := formBody(
 		"login_hint", cibaUser.Email,
-		"scope", "openid",
+		"scope", rs.ScopeStrings[0], // RBAC-intersected (AS-044): the user holds it via grantUserRSScope
 		"resource", rs.ResourceURI,
 	)
 	bcResp := env.DoBasicAuth("POST", "/oauth/bc-authorize", bcBody, sa.ClientIDString, sa.ClientSecret)
@@ -119,11 +120,12 @@ func Test_CIBA_PollBeforeApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddCIBAUser: %v", err)
 	}
+	grantUserRSScope(t, ws, rs, cibaUser.UserID)
 
 	// Step 1: obtain auth_req_id — must succeed because the CIBA user has a device.
 	bcBody := formBody(
 		"login_hint", cibaUser.Email,
-		"scope", "openid",
+		"scope", rs.ScopeStrings[0], // RBAC-intersected (AS-044): the user holds it via grantUserRSScope
 		"resource", rs.ResourceURI,
 	)
 	bcResp := env.DoBasicAuth("POST", "/oauth/bc-authorize", bcBody, sa.ClientIDString, sa.ClientSecret)

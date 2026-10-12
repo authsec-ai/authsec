@@ -16,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -192,7 +193,7 @@ type lockedWorkload struct {
 	Lifecycle             string
 }
 
-// Classify runs the §5.5 transaction for one request in workspace ws and
+// Classify runs the §5.5 transaction for one request in the caller's workspace and
 // returns the POST 200's data. Every refusal is an *igaread.Error: 404
 // not_found, 409 classification_conflict (with the current decision), 422
 // provider_native / invalid_decision / operation_id_reused, 504 query_timeout
@@ -202,15 +203,21 @@ type lockedWorkload struct {
 // Classification is not part of a graph revision: nothing here writes
 // iga_publication, so a decision never triggers the revision-moved banner
 // (§2.14.6). Lists that involve classification see it through the clock.
-func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in ClassifyRequest) (*igaread.ClassifyResult, error) {
+//
+// The workspace is the tenant context's of ctx (the token's), and the
+// transaction runs under row-level security for it.
+func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest) (*igaread.ClassifyResult, error) {
 	req, verr := in.normalized()
 	if verr != nil {
 		return nil, verr
 	}
+	if _, err := tenancy.FromContext(ctx); err != nil {
+		return nil, igaread.Unauthenticated()
+	}
 	hash := ClassificationRequestHash(req)
 
 	var out igaread.ClassifyResult
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.RLSTransaction(ctx, s.db, &sql.TxOptions{Isolation: sql.LevelReadCommitted}, func(tx *gorm.DB, ws uuid.UUID) error {
 		// D-31: a bounded wait for every lock this transaction takes -- the
 		// workload row, the operation key's unique index entry, the clock row.
 		// LOCAL, so it ends with this transaction: the connection returns to
@@ -233,6 +240,7 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 		// answers it. The EXISTS is a sublink, not a FROM item, so FOR UPDATE
 		// locks the workload row alone.
 		var locked []lockedWorkload
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`SELECT w.id, w.classification, w.classification_version, w.lifecycle
 			FROM iga_workload w
 			WHERE w.workspace_id = ? AND w.id = ? AND w.provider = 'aws'
@@ -253,6 +261,7 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 		// moved since. Found with a different hash: the id is being reused for
 		// another workload, actor or content.
 		var prior []models.IGAWorkloadClassification
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`SELECT * FROM iga_workload_classification
 			WHERE workspace_id = ? AND operation_id = ?`, ws, req.OperationID).Scan(&prior).Error; err != nil {
 			return err
@@ -303,6 +312,7 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 			ID        uuid.UUID
 			DecidedAt time.Time
 		}
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Raw(`INSERT INTO iga_workload_classification
 			(workspace_id, workload_id, operation_id, decision, previous, purpose, reason,
 			 decided_by_user_id, against_version, request_hash, result_version, undoes_decision_id)
@@ -336,6 +346,7 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 		if upd.RowsAffected != 1 {
 			return fmt.Errorf("classification update touched %d workload rows", upd.RowsAffected)
 		}
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of Classify
 		if err := tx.Exec(`INSERT INTO iga_classification_clock (workspace_id, seq) VALUES (?, 1)
 			ON CONFLICT (workspace_id) DO UPDATE SET seq = iga_classification_clock.seq + 1`, ws).Error; err != nil {
 			return err
@@ -351,7 +362,7 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 		}
 		// 6. Commit: the Transaction wrapper commits when this returns nil.
 		return nil
-	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	})
 	if err != nil {
 		if isLockTimeout(err) {
 			return nil, igaread.QueryTimeout(err)

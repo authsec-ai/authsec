@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -101,10 +102,18 @@ func main() {
 
 	}
 
+	// MFA secrets were encrypted with a hardcoded key until the key's env var
+	// name was fixed (AS-020); move them to the configured key. Decryption
+	// still falls back to the legacy key, so a failure here locks no one out.
+	if _, err := services.RotateLegacyMFACiphertexts(config.Database.DB); err != nil {
+		log.Printf("WARN: MFA key rotation incomplete: %v", err)
+	}
+
 	// Phase 6: tenants table dropped — workspace is the only identity table.
 	{
 		var workspaces int64
-		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
+		// TENANT-EXEMPT: startup log line counting the tenant registry
+	_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
 		log.Printf("[migration:phase6] workspaces=%d", workspaces)
 	}
 
@@ -416,6 +425,11 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
+	// Client addresses come from forwarding headers only via TRUSTED_PROXIES
+	// (AS-034); by default the TCP peer is the client.
+	if err := middlewares.ConfigureTrustedProxies(r); err != nil {
+		log.Fatalf("invalid TRUSTED_PROXIES: %v", err)
+	}
 	// CIMD-registered OAuth clients carry their metadata URL as the public
 	// client_id (services/oauth_as_service.go:850). URL-encoded slashes in
 	// path params must survive routing, otherwise DELETE
@@ -439,8 +453,11 @@ func main() {
 	// exclude /authsec/metrics from compression so Prometheus can scrape it
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/authsec/metrics"})))
 
-	// Prometheus metrics endpoint
-	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))
+	// Prometheus metrics (AS-075): never public. METRICS_ADDR serves them on a
+	// separate listener (e.g. 127.0.0.1:9100, or a cluster-internal port);
+	// METRICS_TOKEN mounts /authsec/metrics on the main port behind a bearer
+	// token. With neither, the metrics are not exposed.
+	metricsSrv := mountMetrics(r)
 
 	// favicon.ico — browsers automatically request this for every HTML page,
 	// including backend-served pages like /authsec/hmgr/consent. Return 204
@@ -481,6 +498,10 @@ func main() {
 	} else {
 		tokens.InitNativeKeys(nil)
 		log.Printf("[NATIVE_KEYS] Vault not configured — using ephemeral native signing keyset")
+	}
+	// Production never runs on keys that die with the process (AS-036).
+	if err := tokens.NativeKeys().CheckDurable(os.Getenv("ENVIRONMENT")); err != nil {
+		log.Fatalf("[NATIVE_KEYS] refusing to start: %v", err)
 	}
 
 	// All routes (user-flow + webauthn + spire identity)
@@ -664,10 +685,45 @@ func main() {
 	default:
 	}
 
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(ctx)
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced shutdown: %v", err)
 	}
 	log.Println("Server exited cleanly")
+}
+
+// mountMetrics exposes the Prometheus handler without making it public: on
+// its own listener when METRICS_ADDR is set (returned for shutdown), and/or
+// on the main router behind "Authorization: Bearer $METRICS_TOKEN".
+func mountMetrics(r *gin.Engine) *http.Server {
+	if token := os.Getenv("METRICS_TOKEN"); token != "" {
+		want := []byte("Bearer " + token)
+		h := promhttp.Handler()
+		r.GET("/authsec/metrics", func(c *gin.Context) {
+			if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), want) != 1 {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+			h.ServeHTTP(c.Writer, c.Request)
+		})
+	}
+	addr := os.Getenv("METRICS_ADDR")
+	if addr == "" {
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/authsec/metrics", promhttp.Handler())
+	ms := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := ms.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics listener on %s stopped: %v", addr, err)
+		}
+	}()
+	log.Printf("Prometheus metrics served on %s/metrics", addr)
+	return ms
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

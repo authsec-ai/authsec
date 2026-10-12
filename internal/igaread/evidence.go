@@ -195,7 +195,7 @@ const RefObservation = "cloud_observation"
 // a graph row: a GitHub row, a Deny statement as a grant, D-6) -- and when
 // nothing is published (D-4: no claim exists before the first publication);
 // 409 for a stale rev.
-func (r *Reader) Evidence(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (r *Reader) Evidence(ctx context.Context, vals url.Values) (any, error) {
 	for name := range vals {
 		switch name {
 		case "claim", "include", "rev":
@@ -236,7 +236,7 @@ func (r *Reader) Evidence(ctx context.Context, ws uuid.UUID, vals url.Values) (a
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

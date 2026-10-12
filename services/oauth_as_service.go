@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -144,7 +145,9 @@ func (s *OAuthASService) m2mGrantTypes() []string {
 // m2mTokenAuthMethods returns the token_endpoint_auth_methods_supported list.
 // private_key_jwt and client_secret_basic are only advertised when XAA_M2M is on.
 func (s *OAuthASService) m2mTokenAuthMethods() []string {
-	base := []string{"none", "client_secret_basic", "client_secret_post"}
+	// client_secret_post is not implemented by the token endpoint's client
+	// authentication (services/client_auth.go), so it is not advertised (AS-096).
+	base := []string{"none", "client_secret_basic"}
 	if config.AppConfig != nil && config.AppConfig.XAAm2m {
 		base = append(base, "private_key_jwt")
 	}
@@ -487,13 +490,13 @@ func (s *OAuthASService) UpsertAccessRequest(
 	// pending row (partial-unique index on status='pending'), refreshing the
 	// structured payload too.
 	var reqID uuid.UUID
-	err := config.DB.WithContext(ctx).Raw(`
+	err := tenancy.GormRaw(inWorkspace(ctx, workspaceID), config.DB, `
 		INSERT INTO access_requests
 			(id, workspace_id, resource_server_id, subject_type, subject_id,
 			 requested_by_client, requested_scopes, requested_rar_id, authorization_details,
 			 status, created_at, updated_at, expires_at)
 		VALUES
-			(gen_random_uuid(), ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+			(gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
 		ON CONFLICT (workspace_id, resource_server_id, subject_type, subject_id, requested_by_client)
 			WHERE status = 'pending'
 		DO UPDATE SET updated_at = EXCLUDED.updated_at,
@@ -501,8 +504,9 @@ func (s *OAuthASService) UpsertAccessRequest(
 		              requested_rar_id = EXCLUDED.requested_rar_id,
 		              authorization_details = EXCLUDED.authorization_details,
 		              expires_at = EXCLUDED.expires_at
+		 WHERE access_requests.workspace_id = $1
 		RETURNING id`,
-		workspaceID, rsID, subjectType, subjectID,
+		rsID, subjectType, subjectID,
 		requestedByClient, requestedScopes, rarID, authDetails,
 		now, now, expires,
 	).Scan(&reqID).Error
@@ -576,7 +580,8 @@ func (s *OAuthASService) NotifyAdminsOfPendingAccessRequest(
 	go func() {
 		// Load RS name for the email body.
 		var rsName string
-		s.db.Raw("SELECT name FROM resource_servers WHERE id = ?", rsID).Scan(&rsName)
+		tenancy.GormRaw(inWorkspace(context.Background(), workspaceID), s.db,
+			"SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2", rsID).Scan(&rsName)
 		if rsName == "" {
 			rsName = rsID.String()
 		}
@@ -756,9 +761,9 @@ func (s *OAuthASService) ApproveClientRegistrationInTx(tx *gorm.DB, rsID, client
 		if err := tx.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found: %w", err)
 		}
-		if err := tx.Raw(
-			`SELECT name FROM roles WHERE id = ? AND workspace_id = ? LIMIT 1`,
-			binding.RoleID, rs.WorkspaceID,
+		if err := tenancy.GormRaw(inWorkspace(context.Background(), rs.WorkspaceID), tx,
+			`SELECT name FROM roles WHERE workspace_id = $1 AND id = $2 LIMIT 1`,
+			binding.RoleID,
 		).Scan(&roleName).Error; err != nil || roleName == "" {
 			return fmt.Errorf("role %s not found in this workspace", binding.RoleID)
 		}
@@ -1262,6 +1267,64 @@ func (s *OAuthASService) revokeHydraConsentForSubject(subject string) error {
 	return nil
 }
 
+// revokeHydraConsentForClient revokes a subject's Hydra consent sessions for
+// one client, which invalidates the access and refresh tokens issued under
+// them.
+func (s *OAuthASService) revokeHydraConsentForClient(subject, hydraClientID string) error {
+	target := config.AppConfig.HydraAdminURL + "/admin/oauth2/auth/sessions/consent?subject=" +
+		url.QueryEscape(subject) + "&client=" + url.QueryEscape(hydraClientID)
+	req, err := http.NewRequest("DELETE", target, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke-consent request: %w", err)
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra admin unavailable: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("hydra returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// RevokeTokensForConsentGrant revokes the tokens a revoked consent grant
+// backs (AS-068): the user's Hydra consent sessions (and with them the
+// access and refresh tokens) for the grant's client, and the user's live
+// native tokens issued to that client for the grant's resource server.
+// Errors are returned after every step has been tried.
+func (s *OAuthASService) RevokeTokensForConsentGrant(ctx context.Context, grant *models.OAuthConsentGrant) error {
+	if grant == nil {
+		return nil
+	}
+	var client models.MCPOAuthClient
+	if err := s.db.WithContext(ctx).Select("id, client_id, hydra_client_id").
+		Where("id = ?", grant.OAuthClientID).First(&client).Error; err != nil {
+		return fmt.Errorf("load consent client: %w", err)
+	}
+	var errs []error
+	if client.HydraClientID != "" {
+		if err := s.revokeHydraConsentForClient(grant.UserID.String(), client.HydraClientID); err != nil {
+			errs = append(errs, fmt.Errorf("hydra consent revoke: %w", err))
+		}
+	}
+
+	var live []models.NativeToken
+	if err := s.db.WithContext(ctx).
+		Where(`workspace_id = ? AND subject_type = 'user' AND subject_id = ? AND client_id = ?
+		       AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?`,
+			grant.WorkspaceID, grant.UserID, client.ClientID, grant.ResourceServerID, time.Now()).
+		Find(&live).Error; err != nil {
+		errs = append(errs, fmt.Errorf("list native tokens: %w", err))
+	}
+	for _, nt := range live {
+		if err := tokens.RevokeAccessToken(ctx, s.db, nt.Iss, nt.JTI.String(), "consent_revoked", nt.ExpiresAt); err != nil {
+			errs = append(errs, fmt.Errorf("revoke native token %s: %w", nt.JTI, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // RevokeUserTokensForWorkspace invalidates a user's active OAuth tokens + consent
 // in a specific workspace, immediately after an RBAC mutation removes or narrows
 // their permissions. Phase H-5 is the security keystone: without it, removing
@@ -1650,11 +1713,15 @@ func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string,
 	// so an XAA agent whose actor must hold broker scopes needs an SA to bind to.
 	// Best-effort — a failure here doesn't fail agent registration (the SA can be
 	// linked later); idempotent via the uq_sa_client index on oauth_client_id.
-	if err := s.db.Exec(`
+	sqlDB, err := s.db.DB()
+	if err == nil {
+		_, err = tenancy.InsertContext(inWorkspace(context.Background(), workspaceID), sqlDB, `
 		INSERT INTO service_accounts (id, workspace_id, name, description, status, oauth_client_id, created_at, updated_at)
-		VALUES (gen_random_uuid(), ?, ?, 'Service account backing agent client', 'active', ?, now(), now())
+		VALUES (gen_random_uuid(), $1, $2, 'Service account backing agent client', 'active', $3, now(), now())
 		ON CONFLICT (oauth_client_id) WHERE oauth_client_id IS NOT NULL DO NOTHING`,
-		workspaceID, name, mcpClient.ID).Error; err != nil {
+			name, mcpClient.ID)
+	}
+	if err != nil {
 		log.Printf("[RegisterAgentClient] failed to create backing service account for client %s: %v", clientIDStr, err)
 	}
 
@@ -1744,10 +1811,31 @@ func (s *OAuthASService) RevokeClientRegistration(rsID, clientID string) error {
 }
 
 // ApprovePendingRedirects copies pending redirect URIs to approved, updates Hydra, clears flag.
-func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
+//
+// The client is looked up by its public client_id, which is global. It must be
+// registered on rsID in workspaceID and must not be homed in another workspace;
+// otherwise it is not found (AS-027).
+func (s *OAuthASService) ApprovePendingRedirects(workspaceID uuid.UUID, rsID, clientID string) error {
+	rsUUID, err := uuid.Parse(rsID)
+	if err != nil {
+		return fmt.Errorf("invalid RS ID: %w", err)
+	}
 	client, err := s.authzCtx.GetMCPOAuthClientByClientID(clientID)
 	if err != nil {
 		return fmt.Errorf("client not found: %w", err)
+	}
+	if client.HomeWorkspaceID != nil && *client.HomeWorkspaceID != workspaceID {
+		return fmt.Errorf("client not found: %w", gorm.ErrRecordNotFound)
+	}
+	var registered int64
+	if err := s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND oauth_client_id = ? AND workspace_id = ? AND status <> ?",
+			rsUUID, client.ID, workspaceID, models.ClientRegStatusRevoked).
+		Count(&registered).Error; err != nil {
+		return err
+	}
+	if registered == 0 {
+		return fmt.Errorf("client not found: %w", gorm.ErrRecordNotFound)
 	}
 
 	if !client.RedirectReviewPending {
@@ -2121,7 +2209,11 @@ func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
 // Redirect URIs are callback identifiers — the AS never fetches them server-side during
 // the OAuth flow, so SSRF IP-blocklists do NOT apply here. Validation is structural only:
 // absolute URL, no fragment, https scheme (or http for localhost in dev).
-func validateRedirectURIs(uris []string) error {
+func validateRedirectURIs(uris []string) error { return ValidateRedirectURIs(uris) }
+
+// ValidateRedirectURIs is the redirect URI rule shared by every registration
+// path (DCR, PUT, CIMD, review approval).
+func ValidateRedirectURIs(uris []string) error {
 	for _, raw := range uris {
 		u, err := url.Parse(raw)
 		if err != nil || !u.IsAbs() {
@@ -2769,6 +2861,7 @@ func (s *OAuthASService) RevokeNativeTokenByJTI(workspaceID uuid.UUID, jtiStr st
 	// admin token-revocation path never actually revoked anything. Introspection
 	// treats revoked_tokens as authoritative, so a token an admin believed they had
 	// killed stayed valid for its full remaining lifetime.
+	// TENANT-EXEMPT: revoked_tokens is the issuer-wide denylist keyed by (iss, kind, jti)
 	return s.db.Exec(`
 		INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
 		VALUES (?, 'access_token', ?, ?, ?, ?)

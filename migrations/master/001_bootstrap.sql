@@ -2763,11 +2763,14 @@ CREATE TABLE public.trusted_issuers (
     revoked_at      timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- Owning workspace; NULL = platform-owned (see 044).
+    workspace_id    uuid    REFERENCES public.workspaces(id) ON DELETE CASCADE,
     CONSTRAINT trusted_issuers_pkey PRIMARY KEY (id),
     CONSTRAINT trusted_issuers_status_chk CHECK (status IN ('active', 'revoked'))
 );
 CREATE UNIQUE INDEX uq_trusted_issuers_iss ON public.trusted_issuers (iss);
 CREATE INDEX idx_trusted_issuers_provider_name ON public.trusted_issuers (provider_name);
+CREATE INDEX idx_trusted_issuers_workspace ON public.trusted_issuers (workspace_id);
 
 -- a2a_brokering_policies: permit/deny rules for XAA requester→RS pairings.
 -- side='redemption' gates incoming ID-JAG redemption; side='issuance' gates
@@ -10125,3 +10128,1897 @@ ALTER TABLE ONLY public.iga_gov_evaluation_pruned
 
 ALTER TABLE ONLY public.iga_gov_evaluation_pruned
     ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_rev_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation(workspace_id, rev) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- login_tickets (043): first-factor proof for the MFA step and the session
+-- callbacks. Kept identical to migrations/master/101_login_tickets.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.login_tickets (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_hash     text NOT NULL UNIQUE,
+    realm           text NOT NULL CHECK (realm IN ('admin', 'enduser')),
+    workspace_id    uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id         uuid NOT NULL,
+    email           text NOT NULL,
+    first_factor    text NOT NULL,
+    mfa_verified_at timestamptz,
+    consumed_at     timestamptz,
+    expires_at      timestamptz NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_tickets_workspace ON public.login_tickets (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_login_tickets_expires ON public.login_tickets (expires_at);
+
+COMMENT ON TABLE public.login_tickets IS
+    'Short-lived, single-use proof that an interactive sign-in passed its first '
+    'factor; gates the anonymous MFA endpoints and the session-token callbacks. '
+    'Stores only a SHA-256 hash of the ticket.';
+
+-- >>> tenancy hardening (045-048)
+-- ---------------------------------------------------------------------------
+-- Kept identical to migrations/master/045-048, so a fresh bootstrap reaches the
+-- same end state as an upgraded database (those migrations then re-run as
+-- no-ops). On a fresh database every table is empty: the backfill finds
+-- nothing to attribute and the contract adds CHECKs, never trigger guards.
+-- ---------------------------------------------------------------------------
+
+-- ============================================================================
+-- 045: tenancy expand -- workspace_id on tenant data that had none
+--
+-- ADR-0001 §6 step 2 (AS-051). Adds a NULLABLE workspace_id to tenant data
+-- that carried no workspace at all:
+--   services, credentials (WebAuthn), mfa_methods,
+--   role_permissions, oauth_scope_permissions, mcp_tool_scope_map,
+--   spire_oidc_tokens, spire_policies, spire_policy_rules,
+--   spire_policy_subjects, spire_policy_resources, spire_policy_actions,
+--   spire_policy_conditions, spire_role_bindings, spire_workloads.
+-- spire_audit_logs already has a (text) workspace_id and is not touched.
+--
+-- mcp_oauth_clients gets NO owner_workspace_id. Its home_workspace_id already
+-- records the owning workspace: it is set at creation for workspace-created
+-- clients (service accounts, machine access, discovery claims) and stamped
+-- once, guarded by "WHERE home_workspace_id IS NULL", on first bind for
+-- DCR/CIMD clients (services/oauth_as_service.go BindClientToRS). NULL means
+-- a platform client (e.g. the hosted login UI) or a DCR/CIMD client that is
+-- not adopted yet; those serve several workspaces by design, and
+-- authorization comes from the approved resource_server_client_registrations
+-- row in the resource server's workspace. A second column with the same
+-- meaning would only drift.
+--
+-- Also adds:
+--   * tenancy_backfill_orphans -- rows 046 cannot attribute are reported
+--     here, never guessed and never assigned to a customer workspace;
+--   * tenancy_workspace_for_user_ref(uuid) -- the single attribution rule for
+--     rows keyed by a legacy user/client id (credentials, mfa_methods,
+--     services.created_by);
+--   * fill triggers, so rows written by existing code from now on are
+--     attributed with the same rule the backfill uses. The join tables take
+--     the workspace of their parent; credentials and mfa_methods take the
+--     workspace of their user. A supplied workspace_id is never overwritten:
+--     if it disagrees with the parent, the composite FKs added in 047 reject
+--     the row.
+--
+-- Additive and idempotent: nullable columns, a new table, functions and
+-- triggers. Tables missing on a drifted database are skipped, not failed.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.tenancy_backfill_orphans (
+    table_name  text        NOT NULL,
+    row_id      text        NOT NULL,
+    reason      text        NOT NULL,
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_name, row_id)
+);
+
+COMMENT ON TABLE public.tenancy_backfill_orphans IS
+    'Rows the tenancy backfill (046) could not attribute to a workspace. '
+    'Resolve each (fix the row or delete it), then re-run '
+    'SELECT * FROM public.tenancy_backfill_workspace_ids(); and '
+    'scripts/tenancy-validate.sql.';
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'services', 'credentials', 'mfa_methods',
+        'role_permissions', 'oauth_scope_permissions', 'mcp_tool_scope_map',
+        'spire_oidc_tokens', 'spire_policies', 'spire_policy_rules',
+        'spire_policy_subjects', 'spire_policy_resources', 'spire_policy_actions',
+        'spire_policy_conditions', 'spire_role_bindings', 'spire_workloads'
+    ] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE NOTICE 'tenancy expand: table % does not exist, skipped', t;
+            CONTINUE;
+        END IF;
+        EXECUTE format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS workspace_id uuid', t);
+    END LOOP;
+END $$;
+
+-- The workspace of the user a legacy reference points at.
+--   1. ref is a users.id: that user's workspace;
+--   2. otherwise ref is a users.client_id: the workspace shared by every user
+--      with that client_id, only when there is exactly one and none is NULL.
+-- The workspace must exist. Anything else returns NULL (unattributable).
+CREATE OR REPLACE FUNCTION public.tenancy_workspace_for_user_ref(ref uuid)
+RETURNS uuid
+LANGUAGE sql
+STABLE
+AS $fn$
+    SELECT CASE
+        WHEN ref IS NULL THEN NULL
+        WHEN EXISTS (SELECT 1 FROM public.users u WHERE u.id = ref) THEN (
+            SELECT u.workspace_id
+              FROM public.users u
+              JOIN public.workspaces w ON w.id = u.workspace_id
+             WHERE u.id = ref)
+        ELSE (
+            SELECT CASE
+                       WHEN count(*) > 0
+                        AND count(*) = count(w.id)
+                        AND count(DISTINCT u.workspace_id) = 1
+                       THEN min(u.workspace_id::text)::uuid
+                   END
+              FROM public.users u
+              LEFT JOIN public.workspaces w ON w.id = u.workspace_id
+             WHERE u.client_id = ref)
+    END
+$fn$;
+
+-- credentials: keyed by client_id, which the write paths fill with users.id
+-- (controllers/admin/workspace_admin_controller.go, repository/repository.go).
+CREATE OR REPLACE FUNCTION public.tenancy_fill_ws_credentials()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT' OR NEW.client_id IS DISTINCT FROM OLD.client_id) THEN
+        NEW.workspace_id := public.tenancy_workspace_for_user_ref(NEW.client_id);
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- mfa_methods: user_id when set, else client_id. If both resolve and
+-- disagree the row stays unattributed.
+CREATE OR REPLACE FUNCTION public.tenancy_fill_ws_mfa_methods()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+    wu uuid;
+    wc uuid;
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT'
+            OR NEW.client_id IS DISTINCT FROM OLD.client_id
+            OR NEW.user_id IS DISTINCT FROM OLD.user_id) THEN
+        wu := public.tenancy_workspace_for_user_ref(NEW.user_id);
+        wc := public.tenancy_workspace_for_user_ref(NEW.client_id);
+        IF wu IS NULL OR wc IS NULL OR wu = wc THEN
+            NEW.workspace_id := COALESCE(wu, wc);
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- role_permissions: the role's workspace. NULL for a platform (global) role.
+-- The permission must be platform-owned (NULL or the system workspace) or
+-- belong to the same workspace as the role.
+CREATE OR REPLACE FUNCTION public.tenancy_fill_ws_role_permissions()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+    pws uuid;
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT' OR NEW.role_id IS DISTINCT FROM OLD.role_id) THEN
+        SELECT r.workspace_id INTO NEW.workspace_id FROM public.roles r WHERE r.id = NEW.role_id;
+    END IF;
+    IF TG_OP = 'INSERT' OR NEW.permission_id IS DISTINCT FROM OLD.permission_id
+       OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
+        SELECT p.workspace_id INTO pws FROM public.permissions p WHERE p.id = NEW.permission_id;
+        IF pws IS NOT NULL
+           AND pws <> '00000000-0000-0000-0000-000000000000'::uuid
+           AND pws IS DISTINCT FROM NEW.workspace_id THEN
+            RAISE EXCEPTION 'tenancy: permission % belongs to another workspace than role %',
+                NEW.permission_id, NEW.role_id
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- oauth_scope_permissions: the scope's workspace, same permission rule.
+CREATE OR REPLACE FUNCTION public.tenancy_fill_ws_oauth_scope_permissions()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+    pws uuid;
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT' OR NEW.scope_id IS DISTINCT FROM OLD.scope_id) THEN
+        SELECT s.workspace_id INTO NEW.workspace_id FROM public.oauth_scopes s WHERE s.id = NEW.scope_id;
+    END IF;
+    IF TG_OP = 'INSERT' OR NEW.permission_id IS DISTINCT FROM OLD.permission_id
+       OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
+        SELECT p.workspace_id INTO pws FROM public.permissions p WHERE p.id = NEW.permission_id;
+        IF pws IS NOT NULL
+           AND pws <> '00000000-0000-0000-0000-000000000000'::uuid
+           AND pws IS DISTINCT FROM NEW.workspace_id THEN
+            RAISE EXCEPTION 'tenancy: permission % belongs to another workspace than scope %',
+                NEW.permission_id, NEW.scope_id
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- mcp_tool_scope_map: the tool's workspace. The composite FKs in 047 then
+-- require the scope to be in that same workspace.
+CREATE OR REPLACE FUNCTION public.tenancy_fill_ws_mcp_tool_scope_map()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT' OR NEW.tool_id IS DISTINCT FROM OLD.tool_id) THEN
+        SELECT t.workspace_id INTO NEW.workspace_id FROM public.mcp_tools t WHERE t.id = NEW.tool_id;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'credentials', 'mfa_methods',
+        'role_permissions', 'oauth_scope_permissions', 'mcp_tool_scope_map'
+    ] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER trg_tenancy_fill_ws BEFORE INSERT OR UPDATE ON public.%I '
+            'FOR EACH ROW EXECUTE FUNCTION public.%I()',
+            t, 'tenancy_fill_ws_' || t);
+    END LOOP;
+END $$;
+
+-- ============================================================================
+-- 046: tenancy backfill -- attribute the columns added in 045
+--
+-- ADR-0001 §6 step 3 (AS-051). Fills workspace_id deterministically from the
+-- parent row only. Rows that cannot be attributed stay NULL and are reported
+-- in tenancy_backfill_orphans with a reason. Nothing is guessed and nothing is
+-- assigned to a customer workspace or to the system workspace.
+--
+-- Rules (an attributed workspace must exist in workspaces):
+--   credentials              client_id -> tenancy_workspace_for_user_ref
+--                            (users.id, else a users.client_id shared by users
+--                            of exactly one workspace)
+--   mfa_methods              user_id and client_id through the same rule; if
+--                            both resolve they must agree
+--   services                 created_by (the creator's client id, text) through
+--                            the same rule; non-uuid created_by is an orphan
+--   role_permissions         roles.workspace_id. A NULL role workspace is a
+--                            platform role: the row stays NULL by design and is
+--                            NOT an orphan
+--   oauth_scope_permissions  oauth_scopes.workspace_id
+--   mcp_tool_scope_map       mcp_tools.workspace_id, only when the scope is in
+--                            the same workspace (else: cross-workspace link)
+--   spire_workloads          one distinct workspace among: the SPIFFE path
+--                            /workspaces/<ws>/... or /tenants/<ws>/...,
+--                            service_accounts.spiffe_id and
+--                            application_spiffe_identities.spiffe_id
+--   spire_oidc_tokens        one distinct workspace among spire_workloads,
+--                            service_accounts and application_spiffe_identities
+--                            with the same SPIFFE ID
+--   spire_policies,          no ownership source exists (the policy engine was
+--   spire_role_bindings      never workspace-scoped): reported as orphans
+--   spire_policy_rules       the parent policy's workspace
+--   spire_policy_subjects,   the parent rule's workspace
+--   _resources, _actions,
+--   _conditions
+--
+-- The work lives in tenancy_backfill_workspace_ids() so an operator can re-run
+-- it after resolving orphans; each run only touches NULL rows, refreshes the
+-- orphan list, and returns per table the rows it filled and the rows still
+-- unattributed. Idempotent.
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.tenancy_backfill_workspace_ids()
+RETURNS TABLE (table_name text, filled bigint, orphans bigint)
+LANGUAGE plpgsql
+AS $fn$
+#variable_conflict use_column
+DECLARE
+    n bigint;
+    before jsonb := '{}'::jsonb;
+    cnt bigint;
+    uuid_re CONSTANT text := '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+BEGIN
+    -- ---------------------------------------------------------------- credentials
+    IF to_regclass('public.credentials') IS NOT NULL THEN
+        WITH r AS (
+            SELECT c.id, public.tenancy_workspace_for_user_ref(c.client_id) AS ws
+              FROM public.credentials c
+             WHERE c.workspace_id IS NULL)
+        UPDATE public.credentials c SET workspace_id = r.ws
+          FROM r WHERE c.id = r.id AND r.ws IS NOT NULL;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'credentials'
+           AND NOT EXISTS (SELECT 1 FROM public.credentials c
+                            WHERE c.id::text = o.row_id AND c.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'credentials', c.id::text,
+               CASE
+                   WHEN EXISTS (SELECT 1 FROM public.users u WHERE u.id = c.client_id)
+                       THEN 'user has no existing workspace'
+                   WHEN EXISTS (SELECT 1 FROM public.users u WHERE u.client_id = c.client_id)
+                       THEN 'client_id is shared by users of several workspaces or users without one'
+                   ELSE 'client_id matches no user'
+               END
+          FROM public.credentials c
+         WHERE c.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'credentials'; filled := n;
+        SELECT count(*) INTO orphans FROM public.credentials c WHERE c.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- mfa_methods
+    IF to_regclass('public.mfa_methods') IS NOT NULL THEN
+        WITH r AS (
+            SELECT m.id,
+                   public.tenancy_workspace_for_user_ref(m.user_id)   AS wu,
+                   public.tenancy_workspace_for_user_ref(m.client_id) AS wc
+              FROM public.mfa_methods m
+             WHERE m.workspace_id IS NULL)
+        UPDATE public.mfa_methods m SET workspace_id = COALESCE(r.wu, r.wc)
+          FROM r
+         WHERE m.id = r.id
+           AND COALESCE(r.wu, r.wc) IS NOT NULL
+           AND (r.wu IS NULL OR r.wc IS NULL OR r.wu = r.wc);
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'mfa_methods'
+           AND NOT EXISTS (SELECT 1 FROM public.mfa_methods m
+                            WHERE m.id::text = o.row_id AND m.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'mfa_methods', m.id::text,
+               CASE
+                   WHEN public.tenancy_workspace_for_user_ref(m.user_id) IS NOT NULL
+                    AND public.tenancy_workspace_for_user_ref(m.client_id) IS NOT NULL
+                       THEN 'user_id and client_id resolve to different workspaces'
+                   WHEN EXISTS (SELECT 1 FROM public.users u WHERE u.id IN (m.user_id, m.client_id))
+                       THEN 'user has no existing workspace'
+                   ELSE 'user_id/client_id match no user'
+               END
+          FROM public.mfa_methods m
+         WHERE m.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'mfa_methods'; filled := n;
+        SELECT count(*) INTO orphans FROM public.mfa_methods m WHERE m.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- services
+    IF to_regclass('public.services') IS NOT NULL THEN
+        WITH r AS (
+            SELECT s.id,
+                   CASE WHEN s.created_by ~ uuid_re
+                        THEN public.tenancy_workspace_for_user_ref(s.created_by::uuid)
+                   END AS ws
+              FROM public.services s
+             WHERE s.workspace_id IS NULL)
+        UPDATE public.services s SET workspace_id = r.ws
+          FROM r WHERE s.id = r.id AND r.ws IS NOT NULL;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'services'
+           AND NOT EXISTS (SELECT 1 FROM public.services s
+                            WHERE s.id::text = o.row_id AND s.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'services', s.id::text,
+               CASE
+                   WHEN NOT (s.created_by ~ uuid_re) THEN 'created_by is not a user or client id'
+                   ELSE 'created_by matches no user with an existing workspace'
+               END
+          FROM public.services s
+         WHERE s.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'services'; filled := n;
+        SELECT count(*) INTO orphans FROM public.services s WHERE s.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- role_permissions
+    IF to_regclass('public.role_permissions') IS NOT NULL THEN
+        UPDATE public.role_permissions rp SET workspace_id = r.workspace_id
+          FROM public.roles r
+          JOIN public.workspaces w ON w.id = r.workspace_id
+         WHERE rp.workspace_id IS NULL AND r.id = rp.role_id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        -- A NULL row whose role is a platform role (roles.workspace_id IS NULL)
+        -- is platform-owned, not an orphan.
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'role_permissions'
+           AND NOT EXISTS (SELECT 1 FROM public.role_permissions rp
+                             JOIN public.roles r ON r.id = rp.role_id
+                            WHERE rp.role_id::text || ':' || rp.permission_id::text = o.row_id
+                              AND rp.workspace_id IS NULL AND r.workspace_id IS NOT NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'role_permissions', rp.role_id::text || ':' || rp.permission_id::text,
+               'role workspace does not exist'
+          FROM public.role_permissions rp
+          JOIN public.roles r ON r.id = rp.role_id
+         WHERE rp.workspace_id IS NULL AND r.workspace_id IS NOT NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'role_permissions'; filled := n;
+        SELECT count(*) INTO orphans
+          FROM public.role_permissions rp JOIN public.roles r ON r.id = rp.role_id
+         WHERE rp.workspace_id IS NULL AND r.workspace_id IS NOT NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- oauth_scope_permissions
+    IF to_regclass('public.oauth_scope_permissions') IS NOT NULL THEN
+        UPDATE public.oauth_scope_permissions sp SET workspace_id = s.workspace_id
+          FROM public.oauth_scopes s
+          JOIN public.workspaces w ON w.id = s.workspace_id
+         WHERE sp.workspace_id IS NULL AND s.id = sp.scope_id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'oauth_scope_permissions'
+           AND NOT EXISTS (SELECT 1 FROM public.oauth_scope_permissions sp
+                            WHERE sp.scope_id::text || ':' || sp.permission_id::text = o.row_id
+                              AND sp.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'oauth_scope_permissions', sp.scope_id::text || ':' || sp.permission_id::text,
+               'scope workspace does not exist'
+          FROM public.oauth_scope_permissions sp
+         WHERE sp.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'oauth_scope_permissions'; filled := n;
+        SELECT count(*) INTO orphans FROM public.oauth_scope_permissions sp WHERE sp.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- mcp_tool_scope_map
+    IF to_regclass('public.mcp_tool_scope_map') IS NOT NULL THEN
+        UPDATE public.mcp_tool_scope_map m SET workspace_id = t.workspace_id
+          FROM public.mcp_tools t
+          JOIN public.workspaces w ON w.id = t.workspace_id,
+               public.oauth_scopes s
+         WHERE m.workspace_id IS NULL
+           AND t.id = m.tool_id
+           AND s.id = m.scope_id
+           AND s.workspace_id = t.workspace_id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'mcp_tool_scope_map'
+           AND NOT EXISTS (SELECT 1 FROM public.mcp_tool_scope_map m
+                            WHERE m.tool_id::text || ':' || m.scope_id::text = o.row_id
+                              AND m.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'mcp_tool_scope_map', m.tool_id::text || ':' || m.scope_id::text,
+               CASE
+                   WHEN t.workspace_id IS DISTINCT FROM s.workspace_id
+                       THEN 'tool and scope belong to different workspaces'
+                   ELSE 'tool workspace does not exist'
+               END
+          FROM public.mcp_tool_scope_map m
+          LEFT JOIN public.mcp_tools t ON t.id = m.tool_id
+          LEFT JOIN public.oauth_scopes s ON s.id = m.scope_id
+         WHERE m.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'mcp_tool_scope_map'; filled := n;
+        SELECT count(*) INTO orphans FROM public.mcp_tool_scope_map m WHERE m.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- spire_workloads
+    IF to_regclass('public.spire_workloads') IS NOT NULL THEN
+        WITH wl AS (
+            SELECT w.id,
+                   regexp_replace(COALESCE(w.spiffe_id, ''), '^spiffe://[^/]+', '') AS path
+              FROM public.spire_workloads w
+             WHERE w.workspace_id IS NULL),
+        cand AS (
+            SELECT wl.id, substring(wl.path FROM '^/(?:workspaces|tenants)/([0-9a-fA-F-]{36})(?:/|$)')::uuid AS ws
+              FROM wl
+             WHERE wl.path ~ '^/(?:workspaces|tenants)/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:/|$)'
+            UNION
+            SELECT wl.id, sa.workspace_id
+              FROM wl JOIN public.service_accounts sa
+                ON wl.path <> ''
+               AND regexp_replace(sa.spiffe_id, '^spiffe://[^/]+', '') = wl.path
+            UNION
+            SELECT wl.id, a.workspace_id
+              FROM wl JOIN public.application_spiffe_identities a
+                ON wl.path <> ''
+               AND regexp_replace(a.spiffe_id, '^spiffe://[^/]+', '') = wl.path),
+        one AS (
+            SELECT c.id, min(c.ws::text)::uuid AS ws
+              FROM cand c LEFT JOIN public.workspaces w ON w.id = c.ws
+             GROUP BY c.id
+            HAVING count(DISTINCT c.ws) = 1 AND count(w.id) = count(*))
+        UPDATE public.spire_workloads w SET workspace_id = one.ws
+          FROM one WHERE w.id = one.id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'spire_workloads'
+           AND NOT EXISTS (SELECT 1 FROM public.spire_workloads w
+                            WHERE w.id::text = o.row_id AND w.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'spire_workloads', w.id::text,
+               'no single workspace from the SPIFFE path, service accounts or application identities'
+          FROM public.spire_workloads w
+         WHERE w.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'spire_workloads'; filled := n;
+        SELECT count(*) INTO orphans FROM public.spire_workloads w WHERE w.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- spire_oidc_tokens
+    IF to_regclass('public.spire_oidc_tokens') IS NOT NULL THEN
+        WITH tk AS (
+            SELECT t.id,
+                   regexp_replace(COALESCE(t.spiffe_id, ''), '^spiffe://[^/]+', '') AS path
+              FROM public.spire_oidc_tokens t
+             WHERE t.workspace_id IS NULL),
+        cand AS (
+            SELECT tk.id, w.workspace_id AS ws
+              FROM tk JOIN public.spire_workloads w
+                ON tk.path <> ''
+               AND regexp_replace(w.spiffe_id, '^spiffe://[^/]+', '') = tk.path
+             WHERE w.workspace_id IS NOT NULL
+            UNION
+            SELECT tk.id, sa.workspace_id
+              FROM tk JOIN public.service_accounts sa
+                ON tk.path <> ''
+               AND regexp_replace(sa.spiffe_id, '^spiffe://[^/]+', '') = tk.path
+            UNION
+            SELECT tk.id, a.workspace_id
+              FROM tk JOIN public.application_spiffe_identities a
+                ON tk.path <> ''
+               AND regexp_replace(a.spiffe_id, '^spiffe://[^/]+', '') = tk.path),
+        one AS (
+            SELECT c.id, min(c.ws::text)::uuid AS ws
+              FROM cand c LEFT JOIN public.workspaces w ON w.id = c.ws
+             GROUP BY c.id
+            HAVING count(DISTINCT c.ws) = 1 AND count(w.id) = count(*))
+        UPDATE public.spire_oidc_tokens t SET workspace_id = one.ws
+          FROM one WHERE t.id = one.id;
+        GET DIAGNOSTICS n = ROW_COUNT;
+
+        DELETE FROM public.tenancy_backfill_orphans o
+         WHERE o.table_name = 'spire_oidc_tokens'
+           AND NOT EXISTS (SELECT 1 FROM public.spire_oidc_tokens t
+                            WHERE t.id::text = o.row_id AND t.workspace_id IS NULL);
+        INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+        SELECT 'spire_oidc_tokens', t.id::text,
+               'no single workspace owns the token SPIFFE ID'
+          FROM public.spire_oidc_tokens t
+         WHERE t.workspace_id IS NULL
+        ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+        DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now();
+
+        table_name := 'spire_oidc_tokens'; filled := n;
+        SELECT count(*) INTO orphans FROM public.spire_oidc_tokens t WHERE t.workspace_id IS NULL;
+        RETURN NEXT;
+    END IF;
+
+    -- ---------------------------------------------------------------- spire policy engine
+    -- spire_policies and spire_role_bindings have no ownership source; their
+    -- children inherit from the parent (so they stay NULL while it does).
+    DECLARE
+        t text;
+    BEGIN
+        FOREACH t IN ARRAY ARRAY[
+            'spire_policies', 'spire_role_bindings', 'spire_policy_rules',
+            'spire_policy_subjects', 'spire_policy_resources', 'spire_policy_actions',
+            'spire_policy_conditions'
+        ] LOOP
+            IF to_regclass('public.' || t) IS NOT NULL THEN
+                EXECUTE format('SELECT count(*) FROM public.%I x WHERE x.workspace_id IS NULL', t) INTO cnt;
+                before := before || jsonb_build_object(t, cnt);
+            END IF;
+        END LOOP;
+    END;
+    IF to_regclass('public.spire_policy_rules') IS NOT NULL
+       AND to_regclass('public.spire_policies') IS NOT NULL THEN
+        UPDATE public.spire_policy_rules r SET workspace_id = p.workspace_id
+          FROM public.spire_policies p
+         WHERE r.workspace_id IS NULL AND p.id = r.policy_id AND p.workspace_id IS NOT NULL;
+    END IF;
+    IF to_regclass('public.spire_policy_rules') IS NOT NULL THEN
+        IF to_regclass('public.spire_policy_subjects') IS NOT NULL THEN
+            UPDATE public.spire_policy_subjects x SET workspace_id = r.workspace_id
+              FROM public.spire_policy_rules r
+             WHERE x.workspace_id IS NULL AND r.id = x.rule_id AND r.workspace_id IS NOT NULL;
+        END IF;
+        IF to_regclass('public.spire_policy_resources') IS NOT NULL THEN
+            UPDATE public.spire_policy_resources x SET workspace_id = r.workspace_id
+              FROM public.spire_policy_rules r
+             WHERE x.workspace_id IS NULL AND r.id = x.rule_id AND r.workspace_id IS NOT NULL;
+        END IF;
+        IF to_regclass('public.spire_policy_actions') IS NOT NULL THEN
+            UPDATE public.spire_policy_actions x SET workspace_id = r.workspace_id
+              FROM public.spire_policy_rules r
+             WHERE x.workspace_id IS NULL AND r.id = x.rule_id AND r.workspace_id IS NOT NULL;
+        END IF;
+        IF to_regclass('public.spire_policy_conditions') IS NOT NULL THEN
+            UPDATE public.spire_policy_conditions x SET workspace_id = r.workspace_id
+              FROM public.spire_policy_rules r
+             WHERE x.workspace_id IS NULL AND r.id = x.rule_id AND r.workspace_id IS NOT NULL;
+        END IF;
+    END IF;
+
+    DECLARE
+        t text;
+        reason text;
+    BEGIN
+        FOREACH t IN ARRAY ARRAY[
+            'spire_policies', 'spire_role_bindings', 'spire_policy_rules',
+            'spire_policy_subjects', 'spire_policy_resources', 'spire_policy_actions',
+            'spire_policy_conditions'
+        ] LOOP
+            IF to_regclass('public.' || t) IS NULL THEN
+                CONTINUE;
+            END IF;
+            reason := CASE
+                WHEN t IN ('spire_policies', 'spire_role_bindings')
+                    THEN 'no ownership source: the SPIRE policy engine was never workspace-scoped'
+                ELSE 'parent policy is not attributed'
+            END;
+            EXECUTE format(
+                'DELETE FROM public.tenancy_backfill_orphans o
+                  WHERE o.table_name = %L
+                    AND NOT EXISTS (SELECT 1 FROM public.%I x
+                                     WHERE x.id::text = o.row_id AND x.workspace_id IS NULL)',
+                t, t);
+            EXECUTE format(
+                'INSERT INTO public.tenancy_backfill_orphans (table_name, row_id, reason)
+                 SELECT %L, x.id::text, %L FROM public.%I x WHERE x.workspace_id IS NULL
+                 ON CONFLICT ON CONSTRAINT tenancy_backfill_orphans_pkey
+                 DO UPDATE SET reason = EXCLUDED.reason, recorded_at = now()',
+                t, reason, t);
+            table_name := t;
+            EXECUTE format('SELECT count(*) FROM public.%I x WHERE x.workspace_id IS NULL', t) INTO orphans;
+            filled := COALESCE((before ->> t)::bigint, 0) - orphans;
+            RETURN NEXT;
+        END LOOP;
+    END;
+END
+$fn$;
+
+COMMENT ON FUNCTION public.tenancy_backfill_workspace_ids() IS
+    'Fills NULL workspace_id on the tables expanded in 045 from their parents '
+    'and refreshes tenancy_backfill_orphans. Safe to re-run.';
+
+SELECT * FROM public.tenancy_backfill_workspace_ids();
+
+-- ============================================================================
+-- 047: tenancy contract (safe form) -- workspace FKs and NOT NULL for new writes
+--
+-- ADR-0001 §6 step 4 (AS-051, AS-052). Every constraint here is added
+-- NOT VALID: Postgres enforces it for rows written from now on and does not
+-- scan existing rows, so legacy data cannot fail this migration. The operator
+-- validates them later with scripts/tenancy-validate.sql once its violation
+-- counts are zero.
+--
+-- 1. FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+--    NOT VALID, on the tenant tables that had a workspace_id but no FK of
+--    either kind (schema-inventory §0) and on the columns added in 045.
+--    CASCADE matches the neighbouring tables and WorkspaceRepository.DeleteTenant
+--    (database/workspace_repository.go), which deletes a handful of tables and
+--    relies on cascades for the rest. An UPDATE that leaves workspace_id unchanged is not
+--    re-checked, so legacy rows that point at a deleted workspace stay
+--    writable until they are cleaned up.
+--    Not added:
+--      audit_events, spire_audit_logs -- workspace_id is text (a type change
+--        is a separate expand/contract);
+--      pending_registrations -- during admin signup workspace_id holds the id
+--        the workspace will get once the OTP is verified, so no workspaces row
+--        exists yet (database/otp_repository.go); the row is consumed when
+--        the workspace is created.
+--
+-- 2. Composite FKs that pin a join row to its parent's workspace:
+--      role_permissions        (workspace_id, role_id)  -> roles(workspace_id, id)
+--      oauth_scope_permissions (scope_id, workspace_id) -> oauth_scopes(id, workspace_id)
+--      mcp_tool_scope_map      (tool_id, workspace_id)  -> mcp_tools(id, workspace_id)
+--      mcp_tool_scope_map      (scope_id, workspace_id) -> oauth_scopes(id, workspace_id)
+--    plus the missing oauth_scope_permissions.permission_id -> permissions(id).
+--    The 045 triggers fill workspace_id from the parent, so a row whose
+--    supplied workspace disagrees with its parent is rejected here.
+--
+-- 3. workspace_id must be set on new writes, for the tenant tables where NULL
+--    has no meaning: users, delegation_policies, delegation_tokens, services,
+--    credentials, mfa_methods, oauth_scope_permissions, mcp_tool_scope_map,
+--    spire_workloads.
+--      * Table has no NULL row (after 046): CHECK (workspace_id IS NOT NULL)
+--        NOT VALID, named ck_<table>_tenancy_ws_nn.
+--      * Table still has NULL rows (orphans): a CHECK would also reject any
+--        UPDATE of those legacy rows (Postgres re-checks a CHECK on every
+--        updated row, NOT VALID or not), which could break sign-in for an
+--        unattributed user or credential. Such a table gets trigger
+--        trg_tenancy_require_ws instead: it rejects INSERTs with a NULL
+--        workspace_id and UPDATEs that clear one, and leaves legacy NULL rows
+--        writable. tenancy-validate.sql prints the CHECK to add, and the
+--        trigger to drop, once the orphans are resolved.
+--
+-- Exceptions -- NULL deliberately means platform-owned or not-yet-known, so no
+-- NOT NULL rule (each still gets the FK where the column is uuid):
+--   roles                   NULL = platform/global role (idx_roles_global_*)
+--   permissions             NULL = global permission catalog (003/005)
+--   role_permissions        NULL = grant on a platform role
+--   oidc_providers          NULL = platform provider offered to every workspace
+--   sod_rules               NULL = global seeded rule
+--   trusted_issuers         NULL = platform issuer (044)
+--   audit_events            NULL = pre-auth event (also text, no FK)
+--   spire_audit_logs        written by unauthenticated SPIRE routes (text, no FK)
+--   oidc_states             NULL = platform-level login
+--   device_codes            NULL until the user approves at /authorize (RFC 8628)
+--   iga_webhook_deliveries  NULL until the installation is resolved (by design)
+--   spire_policies, spire_policy_rules/_subjects/_resources/_actions/
+--   _conditions, spire_role_bindings, spire_oidc_tokens
+--                           the embedded SPIRE engine (off by default,
+--                           ENABLE_EMBEDDED_SPIRE) writes these from
+--                           unauthenticated routes and seeds platform default
+--                           policies; it has to be scoped before NULL can be
+--                           refused
+--   mcp_oauth_clients       home_workspace_id NULL = platform or not-yet-adopted
+--                           DCR/CIMD client (see 045)
+--
+-- Idempotent: every constraint and trigger is looked up by name first, and a
+-- table or column missing on a drifted database is skipped with a NOTICE.
+-- ============================================================================
+
+-- Rejects a NULL workspace_id on INSERT, and an UPDATE that clears it.
+CREATE OR REPLACE FUNCTION public.tenancy_require_workspace_id()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+    IF NEW.workspace_id IS NULL
+       AND (TG_OP = 'INSERT' OR OLD.workspace_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'tenancy: %.workspace_id is required', TG_TABLE_NAME
+            USING ERRCODE = 'not_null_violation';
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- 1. Direct FKs to workspaces.
+DO $$
+DECLARE
+    t text;
+    att smallint;
+    cname text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        -- had workspace_id, no FK of either kind (schema-inventory §0)
+        'users', 'roles', 'permissions', 'groups', 'service_accounts',
+        'resource_servers', 'workload_identity_providers',
+        'cloud_connector', 'cloud_identity', 'cloud_secret', 'cloud_resource',
+        'cloud_permission', 'cloud_workload', 'cloud_usage', 'cloud_assume_edge',
+        'cloud_scan_checkpoint', 'discovery_scan_runs', 'discovery_rule_catalogs',
+        'connector_oauth_states', 'connector_provider_apps', 'sync_configurations',
+        'native_tokens', 'auth_request_contexts',
+        'saml_requests', 'saml_callback_states', 'oidc_states', 'device_codes',
+        'delegation_policies', 'delegation_tokens', 'agent_action_audit_log',
+        'auth_issuance_audit', 'authorization_decision_logs', 'connector_action_audit',
+        -- added in 045
+        'services', 'credentials', 'mfa_methods',
+        'role_permissions', 'oauth_scope_permissions', 'mcp_tool_scope_map',
+        'spire_oidc_tokens', 'spire_policies', 'spire_policy_rules',
+        'spire_policy_subjects', 'spire_policy_resources', 'spire_policy_actions',
+        'spire_policy_conditions', 'spire_role_bindings', 'spire_workloads'
+    ] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE NOTICE 'tenancy contract: table % does not exist, skipped', t;
+            CONTINUE;
+        END IF;
+        SELECT a.attnum INTO att
+          FROM pg_attribute a
+         WHERE a.attrelid = ('public.' || t)::regclass
+           AND a.attname = 'workspace_id' AND NOT a.attisdropped
+           AND a.atttypid = 'uuid'::regtype;
+        IF att IS NULL THEN
+            RAISE NOTICE 'tenancy contract: %.workspace_id missing or not uuid, skipped', t;
+            CONTINUE;
+        END IF;
+        cname := 'fk_' || t || '_tenancy_ws';
+        -- Skip when this FK, or any FK from workspace_id to workspaces, exists.
+        IF EXISTS (SELECT 1 FROM pg_constraint k
+                    WHERE k.conrelid = ('public.' || t)::regclass
+                      AND (k.conname = cname
+                           OR (k.contype = 'f'
+                               AND k.confrelid = 'public.workspaces'::regclass
+                               AND k.conkey = ARRAY[att]))) THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD CONSTRAINT %I FOREIGN KEY (workspace_id) '
+            'REFERENCES public.workspaces(id) ON DELETE CASCADE NOT VALID',
+            t, cname);
+    END LOOP;
+END $$;
+
+-- 2. Composite FKs for the join tables.
+DO $$
+DECLARE
+    spec text[];
+BEGIN
+    FOREACH spec SLICE 1 IN ARRAY ARRAY[
+        -- table, constraint, local columns, parent, parent columns
+        ARRAY['role_permissions', 'fk_role_permissions_tenancy_role',
+              'workspace_id, role_id', 'roles', 'workspace_id, id'],
+        ARRAY['oauth_scope_permissions', 'fk_oauth_scope_permissions_tenancy_scope',
+              'scope_id, workspace_id', 'oauth_scopes', 'id, workspace_id'],
+        ARRAY['mcp_tool_scope_map', 'fk_mcp_tool_scope_map_tenancy_tool',
+              'tool_id, workspace_id', 'mcp_tools', 'id, workspace_id'],
+        ARRAY['mcp_tool_scope_map', 'fk_mcp_tool_scope_map_tenancy_scope',
+              'scope_id, workspace_id', 'oauth_scopes', 'id, workspace_id'],
+        ARRAY['oauth_scope_permissions', 'fk_oauth_scope_permissions_tenancy_perm',
+              'permission_id', 'permissions', 'id']
+    ] LOOP
+        IF to_regclass('public.' || spec[1]) IS NULL OR to_regclass('public.' || spec[4]) IS NULL THEN
+            RAISE NOTICE 'tenancy contract: % or % missing, % skipped', spec[1], spec[4], spec[2];
+            CONTINUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_attribute a
+                        WHERE a.attrelid = ('public.' || spec[1])::regclass
+                          AND a.attname = 'workspace_id' AND NOT a.attisdropped) THEN
+            CONTINUE;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_constraint k
+                    WHERE k.conrelid = ('public.' || spec[1])::regclass AND k.conname = spec[2]) THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format(
+            'ALTER TABLE public.%I ADD CONSTRAINT %I FOREIGN KEY (%s) '
+            'REFERENCES public.%I (%s) ON DELETE CASCADE NOT VALID',
+            spec[1], spec[2], spec[3], spec[4], spec[5]);
+    END LOOP;
+END $$;
+
+-- 3. workspace_id required on new writes.
+DO $$
+DECLARE
+    t text;
+    cname text;
+    has_null boolean;
+    has_trigger boolean;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'users', 'delegation_policies', 'delegation_tokens',
+        'services', 'credentials', 'mfa_methods',
+        'oauth_scope_permissions', 'mcp_tool_scope_map', 'spire_workloads'
+    ] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE NOTICE 'tenancy contract: table % does not exist, skipped', t;
+            CONTINUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_attribute a
+                        WHERE a.attrelid = ('public.' || t)::regclass
+                          AND a.attname = 'workspace_id' AND NOT a.attisdropped) THEN
+            CONTINUE;
+        END IF;
+        cname := 'ck_' || t || '_tenancy_ws_nn';
+        has_trigger := EXISTS (SELECT 1 FROM pg_trigger g
+                                WHERE g.tgrelid = ('public.' || t)::regclass
+                                  AND g.tgname = 'trg_tenancy_require_ws');
+        IF EXISTS (SELECT 1 FROM pg_constraint k
+                    WHERE k.conrelid = ('public.' || t)::regclass AND k.conname = cname) THEN
+            IF has_trigger THEN
+                EXECUTE format('DROP TRIGGER trg_tenancy_require_ws ON public.%I', t);
+            END IF;
+            CONTINUE;
+        END IF;
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM public.%I WHERE workspace_id IS NULL)', t)
+           INTO has_null;
+        IF has_null THEN
+            RAISE NOTICE 'tenancy contract: % has rows without workspace_id; guarding new writes with a trigger', t;
+            EXECUTE format(
+                'CREATE OR REPLACE TRIGGER trg_tenancy_require_ws BEFORE INSERT OR UPDATE ON public.%I '
+                'FOR EACH ROW EXECUTE FUNCTION public.tenancy_require_workspace_id()', t);
+        ELSE
+            EXECUTE format(
+                'ALTER TABLE public.%I ADD CONSTRAINT %I CHECK (workspace_id IS NOT NULL) NOT VALID',
+                t, cname);
+            IF has_trigger THEN
+                EXECUTE format('DROP TRIGGER trg_tenancy_require_ws ON public.%I', t);
+            END IF;
+        END IF;
+    END LOOP;
+END $$;
+
+-- ============================================================================
+-- 048: tenancy indexes and per-workspace uniques
+--
+-- ADR-0001 §6 steps 4-5 (AS-052, AS-060).
+--
+-- 1. A workspace_id-leading index on every table with a uuid workspace_id that
+--    has none (idx_<table>_tenancy_ws). Found from the catalog, so tables that
+--    exist only through 027-042, or that drifted, are covered too. Plain
+--    CREATE INDEX: the runner wraps each migration in a transaction, where
+--    CONCURRENTLY is not allowed.
+--
+-- 2. Global uniques replaced by per-workspace ones. The new unique is created
+--    first; it is strictly weaker than the global one it replaces, so existing
+--    data satisfies it. Each step checks for duplicates anyway and skips with
+--    a NOTICE (leaving the global unique in place) if it finds any.
+--      totp_backup_codes            UNIQUE (code)
+--        -> UNIQUE (workspace_id, user_id, code)
+--      workspace_totp_backup_codes  UNIQUE (code)
+--        -> UNIQUE (workspace_id, user_id, code)
+--         Backup codes are per-user secrets; every lookup is by
+--         (code, user_id, workspace_id). A global unique made two users'
+--         codes collide across workspaces and the violation an oracle.
+--      workspace_device_tokens      UNIQUE (device_token) dropped; the
+--         existing UNIQUE (device_token, workspace_id) (fk_workspace_device_token)
+--         stays. Lookups are by (device_token, workspace_id); nothing uses
+--         ON CONFLICT (device_token) on this table (the ON CONFLICT in
+--         database/ciba_auth_repository.go is on device_tokens, unchanged).
+--
+--    Kept global, on purpose -- code resolves these before a workspace is known,
+--    so a per-workspace unique would make the lookup ambiguous across tenants:
+--      resource_servers.resource_uri (idx_resource_servers_resource_uri_active)
+--         The OAuth AS resolves the RFC 8707 resource / token audience by URI
+--         alone: ResourceServerService.GetByResourceURI, called from
+--         oauth_as_controller.go (authorize, token, introspection, discovery)
+--         and connector_broker_controller.go; CreateResourceServer pre-checks
+--         the URI globally. Per-workspace URIs need those to resolve through
+--         the client's registration first.
+--      workload_identity_providers.issuer (uq_wip_issuer)
+--         services/client_auth.go authenticateSPIFFESVID picks the provider by
+--         the SVID's iss alone, then binds to that provider's workspace.
+--      service_accounts.spiffe_id (uq_sa_spiffe),
+--      application_spiffe_identities.spiffe_id
+--         The legacy global SPIFFE_OIDC_ISSUER path maps an SVID sub to a
+--         service account across workspaces; spire_controller upserts
+--         application identities by spiffe_id. AuthSec-minted IDs embed the
+--         workspace, so collisions need federated IDs.
+--      trusted_issuers.iss -- ID-JAG validation looks the issuer up first.
+--      spire_workloads.spiffe_id, spire_policies.name -- the SPIRE engine
+--         looks them up globally.
+--
+-- Idempotent.
+-- ============================================================================
+
+-- 1. workspace_id-leading index where missing.
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT c.relname, a.attnum
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+          JOIN pg_attribute a ON a.attrelid = c.oid
+                             AND a.attname = 'workspace_id'
+                             AND NOT a.attisdropped
+                             AND a.atttypid = 'uuid'::regtype
+         WHERE c.relkind = 'r'
+           AND NOT EXISTS (SELECT 1 FROM pg_index i
+                            WHERE i.indrelid = c.oid AND i.indkey[0] = a.attnum)
+         ORDER BY c.relname
+    LOOP
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON public.%I (workspace_id)',
+                       'idx_' || r.relname || '_tenancy_ws', r.relname);
+    END LOOP;
+END $$;
+
+-- 2a. TOTP backup codes: per user within a workspace.
+DO $$
+DECLARE
+    t text;
+    uq text;
+    old text;
+    dup boolean;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['totp_backup_codes', 'workspace_totp_backup_codes'] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE NOTICE 'tenancy uniques: table % does not exist, skipped', t;
+            CONTINUE;
+        END IF;
+        uq := 'uq_' || t || '_ws_user_code';
+        old := t || '_code_key';
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint k
+                        WHERE k.conrelid = ('public.' || t)::regclass AND k.conname = uq) THEN
+            EXECUTE format(
+                'SELECT EXISTS (SELECT 1 FROM public.%I GROUP BY workspace_id, user_id, code HAVING count(*) > 1)',
+                t) INTO dup;
+            IF dup THEN
+                RAISE NOTICE 'tenancy uniques: % has duplicate (workspace_id, user_id, code); global unique kept', t;
+                CONTINUE;
+            END IF;
+            EXECUTE format('ALTER TABLE public.%I ADD CONSTRAINT %I UNIQUE (workspace_id, user_id, code)', t, uq);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_constraint k
+                    WHERE k.conrelid = ('public.' || t)::regclass AND k.conname = old) THEN
+            EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', t, old);
+        END IF;
+    END LOOP;
+END $$;
+
+-- 2b. workspace_device_tokens: drop the redundant global unique.
+DO $$
+DECLARE
+    dup boolean;
+BEGIN
+    IF to_regclass('public.workspace_device_tokens') IS NULL THEN
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint k
+                    WHERE k.conrelid = 'public.workspace_device_tokens'::regclass
+                      AND k.conname = 'fk_workspace_device_token') THEN
+        SELECT EXISTS (SELECT 1 FROM public.workspace_device_tokens
+                        GROUP BY device_token, workspace_id HAVING count(*) > 1) INTO dup;
+        IF dup THEN
+            RAISE NOTICE 'tenancy uniques: workspace_device_tokens has duplicate (device_token, workspace_id); global unique kept';
+            RETURN;
+        END IF;
+        ALTER TABLE public.workspace_device_tokens
+            ADD CONSTRAINT fk_workspace_device_token UNIQUE (device_token, workspace_id);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint k
+                WHERE k.conrelid = 'public.workspace_device_tokens'::regclass
+                  AND k.conname = 'workspace_device_tokens_device_token_key') THEN
+        ALTER TABLE public.workspace_device_tokens
+            DROP CONSTRAINT workspace_device_tokens_device_token_key;
+    END IF;
+END $$;
+
+-- <<< tenancy hardening (045-048)
+
+
+
+-- ---------------------------------------------------------------------------
+-- revoked_session_tokens (050). Kept identical to migrations/master/107_session_token_revocations.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.revoked_session_tokens (
+    jti          text PRIMARY KEY,
+    workspace_id uuid,
+    user_id      uuid,
+    expires_at   timestamptz NOT NULL,
+    revoked_at   timestamptz NOT NULL DEFAULT now(),
+    reason       text NOT NULL DEFAULT 'logout'
+);
+
+CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_expires ON public.revoked_session_tokens (expires_at);
+CREATE INDEX IF NOT EXISTS idx_revoked_session_tokens_workspace ON public.revoked_session_tokens (workspace_id);
+
+-- ---------------------------------------------------------------------------
+-- audit_events append-only (051). Kept identical to migrations/master/108_audit_events_append_only.sql.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.audit_events_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_events rows are append-only';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_immutable ON public.audit_events;
+CREATE TRIGGER trg_audit_events_immutable
+    BEFORE UPDATE ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_immutable();
+
+-- ---------------------------------------------------------------------------
+-- users:delete in the global permission catalog (052). Kept identical to
+-- migrations/master/109_users_delete_permission.sql.
+-- ---------------------------------------------------------------------------
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES (gen_random_uuid(), NULL, 'users', 'delete', 'Delete a user of the workspace', 'users:delete', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+INSERT INTO public.role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM public.roles r
+CROSS JOIN public.permissions p
+WHERE r.name = 'admin'
+  AND r.workspace_id IS NOT NULL
+  AND p.workspace_id IS NULL
+  AND p.resource = 'users'
+  AND p.action = 'delete'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- voice_active_sessions (053). Kept identical to migrations/master/110_voice_active_sessions.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.voice_active_sessions (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id       uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    client_id          uuid,
+    user_id            uuid NOT NULL,
+    user_email         text NOT NULL,
+    session_id         varchar(128) NOT NULL,
+    voice_platform     varchar(50),
+    voice_user_id      text,
+    device_info        jsonb NOT NULL DEFAULT '{}'::jsonb,
+    device_name        text,
+    access_token_hash  varchar(64),
+    refresh_token_hash varchar(64),
+    login_at           bigint NOT NULL DEFAULT 0,
+    last_activity_at   bigint NOT NULL DEFAULT 0,
+    expires_at         bigint NOT NULL,
+    is_active          boolean NOT NULL DEFAULT true,
+    revoked_at         bigint,
+    revoked_reason     varchar(100),
+    created_at         bigint NOT NULL DEFAULT 0,
+    updated_at         bigint NOT NULL DEFAULT 0,
+    CONSTRAINT uq_voice_active_sessions_session_id UNIQUE (session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_active_sessions_workspace_user
+    ON public.voice_active_sessions (workspace_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_voice_active_sessions_platform_user
+    ON public.voice_active_sessions (workspace_id, voice_platform, voice_user_id);
+CREATE INDEX IF NOT EXISTS idx_voice_active_sessions_expires
+    ON public.voice_active_sessions (expires_at);
+CREATE INDEX IF NOT EXISTS idx_voice_active_sessions_active
+    ON public.voice_active_sessions (is_active);
+
+-- ---------------------------------------------------------------------------
+-- row-level security (054). Kept identical to migrations/master/111_row_level_security.sql.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.tenancy_current_workspace() RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT NULLIF(current_setting('app.workspace_id', true), '')::uuid
+$$;
+
+CREATE OR REPLACE FUNCTION public.tenancy_enable_rls(tbl regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    col_type text;
+    ws       text;
+    null_ok  boolean;
+BEGIN
+    SELECT format_type(a.atttypid, a.atttypmod) INTO col_type
+      FROM pg_attribute a
+     WHERE a.attrelid = tbl AND a.attname = 'workspace_id' AND NOT a.attisdropped;
+    IF col_type IS NULL THEN
+        RAISE EXCEPTION 'tenancy_enable_rls: % has no workspace_id column', tbl;
+    END IF;
+
+    -- Compare as the column's type (two legacy tables store text).
+    IF col_type = 'uuid' THEN
+        ws := 'public.tenancy_current_workspace()';
+    ELSE
+        ws := 'public.tenancy_current_workspace()::text';
+    END IF;
+
+    -- Platform catalog tables keep their shared (workspace_id IS NULL) rows
+    -- readable; everywhere else NULL rows are not a tenant's to see.
+    null_ok := tbl::text IN ('permissions', 'roles', 'role_permissions',
+                             'trusted_issuers', 'oidc_providers', 'sod_rules');
+
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
+    EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', tbl);
+    EXECUTE format('DROP POLICY IF EXISTS tenancy_isolation ON %s', tbl);
+    EXECUTE format(
+        'CREATE POLICY tenancy_isolation ON %s
+           USING (public.tenancy_current_workspace() IS NULL%s OR workspace_id = %s)
+           WITH CHECK (public.tenancy_current_workspace() IS NULL OR workspace_id = %s)',
+        tbl, CASE WHEN null_ok THEN ' OR workspace_id IS NULL' ELSE '' END, ws, ws);
+END;
+$$;
+
+DO $$
+DECLARE
+    t regclass;
+BEGIN
+    FOR t IN
+        SELECT c.oid::regclass
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'workspace_id' AND NOT a.attisdropped
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+         ORDER BY 1
+    LOOP
+        PERFORM public.tenancy_enable_rls(t);
+    END LOOP;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authsec_tenant') THEN
+        BEGIN
+            CREATE ROLE authsec_tenant NOLOGIN NOBYPASSRLS;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'authsec_tenant not created (no CREATEROLE); run scripts/create-tenant-role.sql';
+            RETURN;
+        END;
+    END IF;
+    GRANT USAGE ON SCHEMA public TO authsec_tenant;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authsec_tenant;
+    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO authsec_tenant;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authsec_tenant;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO authsec_tenant;
+    BEGIN
+        EXECUTE format('GRANT authsec_tenant TO %I', current_user);
+    EXCEPTION WHEN others THEN
+        RAISE NOTICE 'could not grant authsec_tenant to %: %', current_user, SQLERRM;
+    END;
+END $$;
+
+-- auth_lockouts (065). Kept identical to migrations/master/113_auth_lockouts.sql.
+-- ============================================================================
+-- 065: auth_lockouts, totp_used_steps
+--
+-- auth_lockouts counts failed sign-in and second-factor attempts per account
+-- (workspace, kind, subject) and records a lock (AS-034, AS-004). Updated with
+-- one atomic INSERT ... ON CONFLICT ... RETURNING (internal/lockout); no Redis.
+--
+-- totp_used_steps records each accepted TOTP time step per user, so a code is
+-- accepted once per step (replay protection, AS-004). Rows older than a few
+-- minutes are pruned by the writer.
+--
+-- Both are workspace-owned (ADR-0001): workspace_id NOT NULL with FK, and
+-- row-level security through tenancy_enable_rls (054).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.auth_lockouts (
+    workspace_id      uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind              text NOT NULL,
+    subject           text NOT NULL,
+    failures          integer NOT NULL DEFAULT 0,
+    window_started_at timestamptz NOT NULL DEFAULT now(),
+    locked_until      timestamptz,
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, kind, subject)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_lockouts_locked_until
+    ON public.auth_lockouts (locked_until) WHERE locked_until IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.totp_used_steps (
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id      uuid NOT NULL,
+    step         bigint NOT NULL,
+    used_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, user_id, step)
+);
+
+SELECT public.tenancy_enable_rls('public.auth_lockouts');
+SELECT public.tenancy_enable_rls('public.totp_used_steps');
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authsec_tenant') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON public.auth_lockouts, public.totp_used_steps TO authsec_tenant;
+    END IF;
+END $$;
+
+-- workspace_ciba_auth_requests.resource_server_id (066). Kept identical to migrations/master/114_ciba_request_resource_binding.sql.
+-- ============================================================================
+-- 066: workspace_ciba_auth_requests.resource_server_id
+--
+-- A CIBA request is bound to the client that started it and to the resource
+-- server the user was asked to approve (AS-044). The poll must come from the
+-- same client for the same resource server; the token audience is taken from
+-- this row, never from the poll.
+--
+-- Nullable: requests live five minutes, and rows written before this column
+-- existed are refused at poll time (no binding to compare against).
+-- ============================================================================
+
+ALTER TABLE public.workspace_ciba_auth_requests
+    ADD COLUMN IF NOT EXISTS resource_server_id uuid;
+
+-- otp_entries.workspace_id, purpose (068). Kept identical to migrations/master/115_otp_entries_scope.sql.
+-- ============================================================================
+-- 068: otp_entries.workspace_id, otp_entries.purpose
+--
+-- An emailed one-time code was keyed by email alone, so a code issued for one
+-- flow or workspace (end-user sign-up in workspace A) could be verified or
+-- deleted by another (password reset in workspace B, admin sign-up), and a
+-- "verified" row from one flow unlocked another (AS-038). Each row now names
+-- the flow it was issued for (purpose) and, where the workspace is known at
+-- issue time, the workspace. Readers match both.
+--
+-- workspace_id stays nullable: workspace sign-up and admin password reset
+-- run before a workspace is known. Rows written before this migration have
+-- purpose '' and match no reader; they are short-lived (10-30 minutes), so
+-- in-flight codes at upgrade time must be requested again.
+-- ============================================================================
+
+ALTER TABLE public.otp_entries
+    ADD COLUMN IF NOT EXISTS workspace_id uuid;
+ALTER TABLE public.otp_entries
+    ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_otp_entries_email_purpose
+    ON public.otp_entries (email, purpose);
+
+SELECT public.tenancy_enable_rls('public.otp_entries');
+
+-- platform rows are workspace_id IS NULL (055). Kept identical to migrations/master/112_platform_rows_null.sql.
+-- ============================================================================
+-- 055: one convention for platform rows -- workspace_id IS NULL (AS-079)
+--
+-- ADR-0001 §6.6. Platform-owned rows live only on the tables that hold
+-- platform data (permissions, roles, role_permissions, trusted_issuers,
+-- oidc_providers, sod_rules: the tables 054 lets read workspace_id IS NULL
+-- rows) and carry workspace_id IS NULL. The system workspace
+-- 00000000-0000-0000-0000-000000000000 stays only as the registry row that
+-- orphan backfills may fall back to (ADR §6.3); it owns no catalog rows.
+--
+-- 001_bootstrap.sql seeded permissions into the system workspace:
+--   users:delete              -> already in the catalog (052); references are
+--                                moved to the catalog row, the copy is removed.
+--   users:read, users:write   -> moved into the catalog (workspace_id NULL) and,
+--                                as 003/052 do for the rest of the catalog,
+--                                granted to every workspace admin role.
+--   migrations:*              -> removed. They guarded the per-workspace
+--                                database service, which no longer exists;
+--                                nothing checks them, and in the catalog they
+--                                would be granted to every workspace admin.
+-- Roles of the system workspace (none are seeded today) become platform roles
+-- (workspace_id NULL) with their grants. Rows of the system workspace on any
+-- other table are reported with a NOTICE, not guessed (ADR §6.3).
+--
+-- Finally a CHECK on permissions, roles and role_permissions refuses new
+-- system-workspace rows, so the convention cannot drift back.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+DECLARE
+    sys CONSTANT uuid := '00000000-0000-0000-0000-000000000000';
+    r   record;
+    n   bigint;
+BEGIN
+    -- 1. System-workspace permissions that have a catalog twin: move every
+    --    reference to the twin, then drop the copy.
+    FOR r IN
+        SELECT s.id AS sys_id, c.id AS cat_id
+          FROM public.permissions s
+          JOIN public.permissions c
+            ON c.workspace_id IS NULL AND c.resource = s.resource AND c.action = s.action
+         WHERE s.workspace_id = sys
+    LOOP
+        INSERT INTO public.role_permissions (role_id, permission_id)
+        SELECT role_id, r.cat_id FROM public.role_permissions WHERE permission_id = r.sys_id
+        ON CONFLICT (role_id, permission_id) DO NOTHING;
+        IF to_regclass('public.oauth_scope_permissions') IS NOT NULL THEN
+            EXECUTE 'INSERT INTO public.oauth_scope_permissions (scope_id, permission_id)
+                     SELECT scope_id, $1 FROM public.oauth_scope_permissions WHERE permission_id = $2
+                     ON CONFLICT DO NOTHING' USING r.cat_id, r.sys_id;
+        END IF;
+        DELETE FROM public.permissions WHERE id = r.sys_id;
+    END LOOP;
+
+    -- 2. The legacy migration-service permissions are removed with their grants.
+    DELETE FROM public.permissions WHERE workspace_id = sys AND resource = 'migrations';
+
+    -- 3. users:read / users:write join the catalog.
+    UPDATE public.permissions SET workspace_id = NULL
+     WHERE workspace_id = sys AND resource = 'users' AND action IN ('read', 'write');
+    INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+    VALUES (gen_random_uuid(), NULL, 'users', 'read', 'Read user information', 'users:read', NOW()),
+           (gen_random_uuid(), NULL, 'users', 'write', 'Create and update users', 'users:write', NOW())
+    ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+    UPDATE public.permissions SET full_permission_string = resource || ':' || action
+     WHERE workspace_id IS NULL AND resource = 'users' AND full_permission_string IS NULL;
+
+    INSERT INTO public.role_permissions (role_id, permission_id)
+    SELECT ro.id, p.id
+      FROM public.roles ro
+      JOIN public.permissions p
+        ON p.workspace_id IS NULL AND p.resource = 'users' AND p.action IN ('read', 'write')
+     WHERE ro.name = 'admin' AND ro.workspace_id IS NOT NULL AND ro.workspace_id <> sys
+    ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+    -- 4. Any remaining system-workspace permission (none are known) joins the
+    --    catalog unless the catalog already has it, in which case 1 handled it.
+    UPDATE public.permissions SET workspace_id = NULL WHERE workspace_id = sys;
+
+    -- 5. System-workspace roles become platform roles, with their grants.
+    UPDATE public.role_permissions SET workspace_id = NULL
+     WHERE role_id IN (SELECT id FROM public.roles WHERE workspace_id = sys);
+    UPDATE public.roles SET workspace_id = NULL WHERE workspace_id = sys;
+    UPDATE public.role_permissions SET workspace_id = NULL WHERE workspace_id = sys;
+
+    -- 6. Report, do not guess: system-workspace rows left anywhere else.
+    FOR r IN
+        SELECT c.relname
+          FROM pg_class c
+          JOIN pg_namespace s ON s.oid = c.relnamespace AND s.nspname = 'public'
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'workspace_id' AND NOT a.attisdropped
+         WHERE c.relkind = 'r'
+         ORDER BY 1
+    LOOP
+        EXECUTE format('SELECT count(*) FROM public.%I WHERE workspace_id::text = %L', r.relname, sys::text) INTO n;
+        IF n > 0 THEN
+            RAISE NOTICE 'platform rows: % has % row(s) in the system workspace; left in place', r.relname, n;
+        END IF;
+    END LOOP;
+END $$;
+
+-- 7. Keep the convention: no catalog row in the system workspace.
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['permissions', 'roles', 'role_permissions'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                        WHERE conrelid = ('public.' || t)::regclass
+                          AND conname = 'ck_' || t || '_platform_is_null') THEN
+            EXECUTE format(
+                'ALTER TABLE public.%I ADD CONSTRAINT %I CHECK (workspace_id IS DISTINCT FROM %L::uuid)',
+                t, 'ck_' || t || '_platform_is_null', '00000000-0000-0000-0000-000000000000');
+        END IF;
+    END LOOP;
+END $$;
+
+-- workspace_id index backfill (069). Kept identical to migrations/master/116_tenancy_ws_index_backfill.sql.
+-- ============================================================================
+-- 069: a full workspace_id-leading index on every workspace table (AS-080)
+--
+-- 048 created idx_<table>_tenancy_ws where a table had no index leading with
+-- workspace_id. It counted partial indexes, which cannot serve an arbitrary
+-- workspace-scoped query (cloud_permission had only
+-- idx_cloud_permission_constrained ... WHERE constraint_state <> ...), and it
+-- ran before 068 gave otp_entries a workspace_id. A fresh bootstrap re-runs
+-- the step at its end, so fresh and upgraded databases differed by these
+-- indexes (scripts/schema-parity.sh). This repeats the step, counting only
+-- non-partial indexes.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT c.relname
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+          JOIN pg_attribute a ON a.attrelid = c.oid
+                             AND a.attname = 'workspace_id'
+                             AND NOT a.attisdropped
+                             AND a.atttypid = 'uuid'::regtype
+         WHERE c.relkind = 'r'
+           AND NOT EXISTS (SELECT 1 FROM pg_index i
+                            WHERE i.indrelid = c.oid AND i.indkey[0] = a.attnum
+                              AND i.indpred IS NULL)
+         ORDER BY c.relname
+    LOOP
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON public.%I (workspace_id)',
+                       'idx_' || r.relname || '_tenancy_ws', r.relname);
+    END LOOP;
+END $$;
+
+-- sync_configurations.entra_tenant_id (070). Kept identical to migrations/master/117_entra_tenant_id_expand.sql.
+-- ============================================================================
+-- 070: sync_configurations.entra_tenant_id (AS-097), expand step
+--
+-- The column that holds the Microsoft Entra *tenant* id was renamed to
+-- entra_workspace_id by an over-eager tenant -> workspace rename. It is an
+-- Entra directory id, not an AuthSec workspace. Expand -> backfill ->
+-- contract:
+--   expand (this file): add entra_tenant_id, copy existing values, and keep
+--     the two columns equal with a trigger while binaries that still write
+--     entra_workspace_id may be running.
+--   contract (a later migration, after every running binary uses
+--     entra_tenant_id): drop the trigger, its function and entra_workspace_id.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+ALTER TABLE public.sync_configurations
+    ADD COLUMN IF NOT EXISTS entra_tenant_id character varying(500);
+
+UPDATE public.sync_configurations
+   SET entra_tenant_id = entra_workspace_id
+ WHERE entra_tenant_id IS NULL AND entra_workspace_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION public.sync_configurations_entra_tenant_sync()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.entra_tenant_id    := COALESCE(NEW.entra_tenant_id, NEW.entra_workspace_id);
+        NEW.entra_workspace_id := COALESCE(NEW.entra_workspace_id, NEW.entra_tenant_id);
+    ELSIF NEW.entra_tenant_id IS DISTINCT FROM OLD.entra_tenant_id THEN
+        NEW.entra_workspace_id := NEW.entra_tenant_id;
+    ELSIF NEW.entra_workspace_id IS DISTINCT FROM OLD.entra_workspace_id THEN
+        NEW.entra_tenant_id := NEW.entra_workspace_id;
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_sync_configurations_entra_tenant ON public.sync_configurations;
+CREATE TRIGGER trg_sync_configurations_entra_tenant
+    BEFORE INSERT OR UPDATE ON public.sync_configurations
+    FOR EACH ROW EXECUTE FUNCTION public.sync_configurations_entra_tenant_sync();
+
+-- resource_uri per workspace (071). Kept identical to migrations/master/118_resource_uri_per_workspace.sql.
+-- ============================================================================
+-- 071: resource_servers.resource_uri unique per workspace, not globally (AS-060)
+--
+-- resource_servers_workspace_resource_uri_uq (workspace_id, resource_uri)
+-- already exists. The global unique index is dropped: a workspace that owns a
+-- URI's host (a verified workspace_domains entry for the host or a parent
+-- domain) may now register a URI another workspace registered first, and the
+-- pre-workspace lookup resolves the URI to the owner's resource server
+-- (services/resource_server_service.go GetByResourceURI). The application
+-- refuses the same URI from a workspace that does not own its host, so an
+-- unowned URI stays single-holder. The plain index on resource_uri stays for
+-- the lookup.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DROP INDEX IF EXISTS public.idx_resource_servers_resource_uri_active;
+CREATE INDEX IF NOT EXISTS idx_resource_servers_resource_uri ON public.resource_servers (resource_uri);
+
+-- workload identity provider issuer per workspace (072). Kept identical to migrations/master/119_wip_issuer_per_workspace.sql.
+-- ============================================================================
+-- 072: workload_identity_providers.issuer unique per workspace (AS-060)
+--
+-- A public issuer (GitHub Actions, a shared SPIRE server) could be federated
+-- by one workspace only. The token endpoint now tries every active provider
+-- registered for a token's issuer, each verifying the signature, audience and
+-- trust domain and mapping the subject within its own workspace, and accepts
+-- the token only when exactly one provider does (services/client_auth.go
+-- authenticateSPIFFESVID). Expand first: the per-workspace unique index is
+-- created before the global one is dropped.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_wip_workspace_issuer
+    ON public.workload_identity_providers (workspace_id, issuer);
+DROP INDEX IF EXISTS public.uq_wip_issuer;
+CREATE INDEX IF NOT EXISTS idx_wip_issuer ON public.workload_identity_providers (issuer);
+
+-- embedded SPIRE control plane tables (120). Kept identical to migrations/master/120_spire_control_plane_tenancy.sql.
+-- ============================================================================
+-- 120: embedded SPIRE control plane tables, per workspace (AS-081)
+--
+-- The embedded SPIRE control plane (internal/spire, ENABLE_EMBEDDED_SPIRE)
+-- queried agents, workload_entries, workloads, certificates,
+-- attestation_policies, audit_icp_logs and workload_svids: tables of the old
+-- per-tenant databases that the shared database never had. They are created
+-- here with a spire_ prefix, owned by a workspace:
+--
+--   spire_agents                 attested nodes (agent SVIDs)
+--   spire_join_tokens            single-use node attestation tokens; the
+--                                token, not the caller, decides the workspace
+--   spire_workload_entries       registration entries (selectors -> SPIFFE ID)
+--   spire_workload_svids         X.509 SVIDs issued to workloads by agents
+--   spire_attested_workloads     workloads attested directly (mTLS /v1/attest);
+--                                spire_workloads is the headless registry and
+--                                has a different shape
+--   spire_certificates           certificates issued to attested workloads
+--   spire_attestation_policies   attestation policies
+--   spire_icp_audit_logs         attest / renew / revoke audit trail
+--
+-- Every table: workspace_id NOT NULL with a cascading FK to workspaces, a
+-- workspace-leading index, per-workspace uniques, UNIQUE (workspace_id, id)
+-- where children reference it, and row-level security
+-- (tenancy_enable_rls). spire_join_tokens.token_hash stays globally unique:
+-- it is a SHA-256 of 32 random bytes and is looked up before any workspace is
+-- known.
+--
+-- spire_policies.name becomes unique per workspace instead of globally: the
+-- policy engine now reads only the caller's workspace's policies.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.spire_agents (
+    id                 uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id       uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    node_id            varchar(255) NOT NULL,
+    spiffe_id          varchar(512) NOT NULL,
+    attestation_type   varchar(100) NOT NULL,
+    node_selectors     jsonb DEFAULT '{}'::jsonb NOT NULL,
+    certificate_serial varchar(255),
+    status             varchar(50) DEFAULT 'active' NOT NULL,
+    cluster_name       varchar(255),
+    join_token_id      uuid,
+    last_seen          timestamptz,
+    last_heartbeat     timestamptz,
+    created_at         timestamptz DEFAULT now() NOT NULL,
+    updated_at         timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_agents_pkey PRIMARY KEY (id),
+    CONSTRAINT spire_agents_status_check CHECK (status IN ('active', 'expired', 'revoked')),
+    CONSTRAINT uq_spire_agents_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_agents_workspace_spiffe UNIQUE (workspace_id, spiffe_id),
+    CONSTRAINT uq_spire_agents_workspace_node UNIQUE (workspace_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_spire_agents_workspace_status
+    ON public.spire_agents (workspace_id, status);
+
+CREATE TABLE IF NOT EXISTS public.spire_join_tokens (
+    id               uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id     uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    token_hash       char(64) NOT NULL,
+    description      text,
+    created_by       uuid,
+    expires_at       timestamptz NOT NULL,
+    used_at          timestamptz,
+    used_by_node_id  varchar(255),
+    revoked_at       timestamptz,
+    created_at       timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_join_tokens_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_join_tokens_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_join_tokens_hash UNIQUE (token_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_spire_join_tokens_workspace_created
+    ON public.spire_join_tokens (workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.spire_workload_entries (
+    id              uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id    uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    spiffe_id       varchar(512) NOT NULL,
+    parent_id       varchar(512) DEFAULT '' NOT NULL,
+    selectors       jsonb NOT NULL,
+    ttl             integer,
+    admin           boolean DEFAULT false NOT NULL,
+    downstream      boolean DEFAULT false NOT NULL,
+    federates_with  text[],
+    dns_names       text[],
+    spire_entry_id  varchar(255),
+    created_at      timestamptz DEFAULT now() NOT NULL,
+    updated_at      timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_workload_entries_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_workload_entries_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_workload_entries_workspace_spiffe UNIQUE (workspace_id, spiffe_id)
+);
+CREATE INDEX IF NOT EXISTS idx_spire_workload_entries_workspace_parent
+    ON public.spire_workload_entries (workspace_id, parent_id);
+
+CREATE TABLE IF NOT EXISTS public.spire_workload_svids (
+    id               uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id     uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    entry_id         uuid NOT NULL,
+    agent_spiffe_id  varchar(512),
+    spiffe_id        varchar(512) NOT NULL,
+    serial_number    varchar(255) NOT NULL,
+    ttl              integer,
+    issued_at        timestamptz DEFAULT now() NOT NULL,
+    expires_at       timestamptz,
+    revoked_at       timestamptz,
+    created_at       timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_workload_svids_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_workload_svids_workspace_serial UNIQUE (workspace_id, serial_number),
+    CONSTRAINT fk_spire_workload_svids_entry FOREIGN KEY (workspace_id, entry_id)
+        REFERENCES public.spire_workload_entries (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_spire_workload_svids_workspace_entry
+    ON public.spire_workload_svids (workspace_id, entry_id);
+
+CREATE TABLE IF NOT EXISTS public.spire_attested_workloads (
+    id                uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id      uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    spiffe_id         varchar(512) NOT NULL,
+    selectors         jsonb DEFAULT '{}'::jsonb NOT NULL,
+    vault_role        varchar(255) NOT NULL,
+    status            varchar(50) DEFAULT 'active' NOT NULL,
+    attestation_type  varchar(50) NOT NULL,
+    created_at        timestamptz DEFAULT now() NOT NULL,
+    updated_at        timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_attested_workloads_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_attested_workloads_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_attested_workloads_workspace_spiffe UNIQUE (workspace_id, spiffe_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.spire_certificates (
+    id                  uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id        uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    workload_id         uuid NOT NULL,
+    serial_number       varchar(255) NOT NULL,
+    sha256_fingerprint  varchar(128),
+    spiffe_id           varchar(512) NOT NULL,
+    cert_pem            text NOT NULL,
+    ca_chain            jsonb DEFAULT '[]'::jsonb NOT NULL,
+    issued_at           timestamptz DEFAULT now() NOT NULL,
+    expires_at          timestamptz NOT NULL,
+    revoked_at          timestamptz,
+    status              varchar(50) DEFAULT 'active' NOT NULL,
+    issue_type          varchar(50) NOT NULL,
+    created_at          timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_certificates_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_certificates_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_certificates_workspace_serial UNIQUE (workspace_id, serial_number),
+    CONSTRAINT fk_spire_certificates_workload FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.spire_attested_workloads (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_spire_certificates_workspace_workload
+    ON public.spire_certificates (workspace_id, workload_id, status);
+
+CREATE TABLE IF NOT EXISTS public.spire_attestation_policies (
+    id                uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id      uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    name              varchar(255) NOT NULL,
+    description       text,
+    attestation_type  varchar(50) NOT NULL,
+    selector_rules    jsonb DEFAULT '{}'::jsonb NOT NULL,
+    vault_role        varchar(255) NOT NULL,
+    ttl               integer DEFAULT 3600 NOT NULL,
+    priority          integer DEFAULT 0 NOT NULL,
+    enabled           boolean DEFAULT true NOT NULL,
+    created_at        timestamptz DEFAULT now() NOT NULL,
+    updated_at        timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_attestation_policies_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_spire_attestation_policies_workspace_id UNIQUE (workspace_id, id),
+    CONSTRAINT uq_spire_attestation_policies_workspace_name UNIQUE (workspace_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_spire_attestation_policies_workspace_type
+    ON public.spire_attestation_policies (workspace_id, attestation_type);
+
+CREATE TABLE IF NOT EXISTS public.spire_icp_audit_logs (
+    id              uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id    uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    event_type      varchar(50) NOT NULL,
+    workload_id     varchar(255),
+    certificate_id  varchar(255),
+    spiffe_id       varchar(512),
+    success         boolean NOT NULL,
+    error_message   text,
+    metadata        jsonb,
+    ip_address      varchar(64),
+    user_agent      text,
+    created_at      timestamptz DEFAULT now() NOT NULL,
+    CONSTRAINT spire_icp_audit_logs_pkey PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_spire_icp_audit_logs_workspace_created
+    ON public.spire_icp_audit_logs (workspace_id, created_at DESC);
+
+-- Audit rows are not rewritten (DELETE stays for retention and workspace
+-- deletion, as for audit_events in 108).
+CREATE OR REPLACE FUNCTION public.spire_icp_audit_logs_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'spire_icp_audit_logs rows are append-only';
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_spire_icp_audit_logs_immutable ON public.spire_icp_audit_logs;
+CREATE TRIGGER trg_spire_icp_audit_logs_immutable
+    BEFORE UPDATE ON public.spire_icp_audit_logs
+    FOR EACH ROW EXECUTE FUNCTION public.spire_icp_audit_logs_immutable();
+
+SELECT public.tenancy_enable_rls('public.spire_agents');
+SELECT public.tenancy_enable_rls('public.spire_join_tokens');
+SELECT public.tenancy_enable_rls('public.spire_workload_entries');
+SELECT public.tenancy_enable_rls('public.spire_workload_svids');
+SELECT public.tenancy_enable_rls('public.spire_attested_workloads');
+SELECT public.tenancy_enable_rls('public.spire_certificates');
+SELECT public.tenancy_enable_rls('public.spire_attestation_policies');
+SELECT public.tenancy_enable_rls('public.spire_icp_audit_logs');
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authsec_tenant') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON
+            public.spire_agents, public.spire_join_tokens,
+            public.spire_workload_entries, public.spire_workload_svids,
+            public.spire_attested_workloads, public.spire_certificates,
+            public.spire_attestation_policies, public.spire_icp_audit_logs
+        TO authsec_tenant;
+    END IF;
+END $$;
+
+-- spire_policies.name: unique per workspace (expand, then drop the global one).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spire_policies_workspace_name
+    ON public.spire_policies (workspace_id, name);
+DROP INDEX IF EXISTS public.idx_spire_policies_name;
+
+-- RLS fails closed for the restricted role (130). Kept identical to migrations/master/130_rls_restricted_role_strict.sql.
+-- ============================================================================
+-- 130: RLS fails closed for the restricted role (ADR-0001 §4.4, Phase 6)
+--
+-- The tenancy_isolation policy let every row through when app.workspace_id
+-- was unset (the ADR's transitional clause), for every role. The scoped layer
+-- (internal/tenancy) always sets app.workspace_id and switches to
+-- authsec_tenant, so a statement of that role without the setting would be a
+-- bug -- and it saw every workspace's rows. Now:
+--
+--   - authsec_tenant without app.workspace_id sees and writes nothing;
+--   - with it set, every role sees only that workspace (unchanged);
+--   - other roles without it keep the transitional allowance. Those are the
+--     application's own connections outside the scoped layer and platform
+--     jobs; ADR §4.4's authsec_platform BYPASSRLS role replaces this once the
+--     production role layout is confirmed (a superuser deploy step).
+--
+-- tenancy_enable_rls is redefined and re-applied to every table that has the
+-- policy. Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.tenancy_unscoped_allowed() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT public.tenancy_current_workspace() IS NULL
+       AND current_user <> 'authsec_tenant'
+$$;
+
+CREATE OR REPLACE FUNCTION public.tenancy_enable_rls(tbl regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    col_type text;
+    ws       text;
+    null_ok  boolean;
+BEGIN
+    SELECT format_type(a.atttypid, a.atttypmod) INTO col_type
+      FROM pg_attribute a
+     WHERE a.attrelid = tbl AND a.attname = 'workspace_id' AND NOT a.attisdropped;
+    IF col_type IS NULL THEN
+        RAISE EXCEPTION 'tenancy_enable_rls: % has no workspace_id column', tbl;
+    END IF;
+
+    -- Compare as the column's type (two legacy tables store text).
+    IF col_type = 'uuid' THEN
+        ws := 'public.tenancy_current_workspace()';
+    ELSE
+        ws := 'public.tenancy_current_workspace()::text';
+    END IF;
+
+    -- Platform catalog tables keep their shared (workspace_id IS NULL) rows
+    -- readable; everywhere else NULL rows are not a tenant's to see.
+    null_ok := tbl::text IN ('permissions', 'roles', 'role_permissions',
+                             'trusted_issuers', 'oidc_providers', 'sod_rules');
+
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
+    EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', tbl);
+    EXECUTE format('DROP POLICY IF EXISTS tenancy_isolation ON %s', tbl);
+    EXECUTE format(
+        'CREATE POLICY tenancy_isolation ON %s
+           USING (public.tenancy_unscoped_allowed()%s OR workspace_id = %s)
+           WITH CHECK (public.tenancy_unscoped_allowed() OR workspace_id = %s)',
+        tbl,
+        CASE WHEN null_ok THEN ' OR (workspace_id IS NULL AND public.tenancy_current_workspace() IS NOT NULL)' ELSE '' END,
+        ws, ws);
+END;
+$$;
+
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT DISTINCT format('%I.%I', schemaname, tablename) AS tbl
+          FROM pg_policies
+         WHERE policyname = 'tenancy_isolation' AND schemaname = 'public'
+    LOOP
+        PERFORM public.tenancy_enable_rls(r.tbl::regclass);
+    END LOOP;
+END $$;

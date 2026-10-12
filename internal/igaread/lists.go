@@ -61,18 +61,18 @@ const (
 const listsClassificationChanged = "classification_changed"
 
 // ListWorkloads serves GET /api/iga/v1/workloads (§5.3 Agents & workloads).
-func (r *Reader) ListWorkloads(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsWorkloads)
+func (r *Reader) ListWorkloads(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsWorkloads)
 }
 
 // ListIdentities serves GET /api/iga/v1/identities (§5.3 Identities).
-func (r *Reader) ListIdentities(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsIdentities)
+func (r *Reader) ListIdentities(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsIdentities)
 }
 
 // ListResources serves GET /api/iga/v1/resources (§5.3 Resources).
-func (r *Reader) ListResources(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsResources)
+func (r *Reader) ListResources(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsResources)
 }
 
 /* --------------------------------- engine ---------------------------------- */
@@ -182,7 +182,8 @@ type listsCursorKey struct {
 // listsRun is the whole §5.2 list contract for one route. Parameters (400)
 // are checked before the snapshot is opened (D-10); the revision (409) inside
 // it, by Read.
-func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values, spec *listsSpec[S]) (any, error) {
+func listsRun[S listsScan](ctx context.Context, r *Reader, vals url.Values, spec *listsSpec[S]) (any, error) {
+	ws := workspaceIn(ctx)
 	p, perr := ParseListParams(vals, spec.sorts, spec.defSort, spec.facetNames())
 	if perr != nil {
 		return nil, perr
@@ -221,7 +222,7 @@ func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals ur
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		meta := NewListMeta(q, p.Limit)
 		if !q.Published() {
 			// A distinct first-run state, never "no results" (§5.1).

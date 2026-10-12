@@ -65,10 +65,15 @@ type NativeKeyManager struct {
 	next     nativeKey
 	kv       KVStore
 	loadedAt time.Time
+	// ephemeral is true while the active key exists only in this process
+	// (no Vault, or Vault could not provide or keep it): tokens it signs die
+	// with the process and are not verifiable by other replicas.
+	ephemeral bool
 }
 
 // NewNativeKeyManager loads (or generates) the keyset and returns a ready
-// manager. It never returns nil: a Vault failure degrades to ephemeral keys.
+// manager. It never returns nil: when no durable key can be had it uses an
+// ephemeral one (see Ephemeral and CheckDurable).
 func NewNativeKeyManager(kv KVStore) *NativeKeyManager {
 	m := &NativeKeyManager{kv: kv}
 	m.reload()
@@ -79,51 +84,90 @@ func NewNativeKeyManager(kv KVStore) *NativeKeyManager {
 // to call from a ticker. No-op cost when called more often than the interval.
 func (m *NativeKeyManager) Reload() { m.reload() }
 
+// Ephemeral reports whether the active signing key lives only in this process.
+func (m *NativeKeyManager) Ephemeral() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ephemeral
+}
+
+// CheckDurable refuses an ephemeral active key in production (AS-036): every
+// restart or extra replica would silently invalidate issued tokens. Durable
+// means Vault-backed, or pinned with NATIVE_RSA_PRIVATE_KEY_B64.
+func (m *NativeKeyManager) CheckDurable(environment string) error {
+	if !strings.EqualFold(strings.TrimSpace(environment), "production") || !m.Ephemeral() {
+		return nil
+	}
+	return fmt.Errorf("native signing key is ephemeral (no readable Vault keyset); in production configure Vault (VAULT_ADDR/VAULT_TOKEN) or set %s", nativeKeyEnvB64)
+}
+
 func (m *NativeKeyManager) reload() {
+	m.mu.RLock()
+	prevActive, prevNext, prevEphemeral := m.active, m.next, m.ephemeral
+	m.mu.RUnlock()
+
 	var active nativeKey
+	ephemeral := false
 	if envKey, ok := keyFromEnvB64(); ok {
 		// Env-pinned active key takes precedence over Vault/ephemeral: stable
 		// kid across restarts so outstanding tokens keep validating.
 		active = envKey
-	} else if a, err := m.loadOrCreate(nativeKeyPathActive); err == nil {
-		active = a
+	} else if a, durable, err := m.loadOrCreate(nativeKeyPathActive); err == nil {
+		active, ephemeral = a, !durable
+	} else if prevActive.priv != nil {
+		// A read error must never replace or overwrite a key: keep serving
+		// the one already loaded and retry on the next reload (AS-036).
+		log.Printf("[NATIVE_KEYS] active key reload failed, keeping the loaded key: %v", err)
+		active, ephemeral = prevActive, prevEphemeral
 	} else {
-		log.Printf("[NATIVE_KEYS] active key load failed, using ephemeral: %v", err)
-		active = mustGenerate()
+		log.Printf("[NATIVE_KEYS] active key load failed, using an ephemeral key: %v", err)
+		active, ephemeral = mustGenerate(), true
 	}
-	next, err := m.loadOrCreate(nativeKeyPathNext)
+	next, _, err := m.loadOrCreate(nativeKeyPathNext)
 	if err != nil {
-		log.Printf("[NATIVE_KEYS] next key load failed, using ephemeral: %v", err)
-		next = mustGenerate()
+		if prevNext.priv != nil {
+			log.Printf("[NATIVE_KEYS] next key reload failed, keeping the loaded key: %v", err)
+			next = prevNext
+		} else {
+			log.Printf("[NATIVE_KEYS] next key load failed, using an ephemeral key: %v", err)
+			next = mustGenerate()
+		}
 	}
 	m.mu.Lock()
-	m.active, m.next, m.loadedAt = active, next, time.Now()
+	m.active, m.next, m.loadedAt, m.ephemeral = active, next, time.Now(), ephemeral
 	m.mu.Unlock()
 }
 
-// loadOrCreate reads a key from Vault; if absent it generates one and persists
-// it (best effort). Returns an error only when Vault is configured but the
-// persisted material is unreadable AND generation should not silently mask it.
-func (m *NativeKeyManager) loadOrCreate(path string) (nativeKey, error) {
+// loadOrCreate reads a key from Vault. Only when Vault answers that the path
+// holds no key does it generate one and persist it; durable reports whether
+// the returned key is stored in Vault. A read error, or stored material that
+// cannot be parsed, is returned as an error and nothing is written, so a
+// transient Vault failure can never overwrite (and so invalidate) the keyset.
+func (m *NativeKeyManager) loadOrCreate(path string) (key nativeKey, durable bool, err error) {
 	if m.kv == nil {
 		// No Vault wired (local dev) — ephemeral key, stable for this process.
-		return mustGenerate(), nil
+		return mustGenerate(), false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	data, err := m.kv.ReadKVSecret(ctx, nativeKVMount, path)
-	if err == nil && data != nil {
-		if pemStr, ok := data["private_key_pem"].(string); ok && pemStr != "" {
-			priv, perr := parsePKCS8RSA(pemStr)
-			if perr == nil {
-				return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, nil
-			}
-			log.Printf("[NATIVE_KEYS] stored key at %s unparseable, regenerating: %v", path, perr)
+	if err != nil {
+		return nativeKey{}, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	if data != nil {
+		pemStr, _ := data["private_key_pem"].(string)
+		if pemStr == "" {
+			return nativeKey{}, false, fmt.Errorf("stored key at %s has no private_key_pem; refusing to overwrite it", path)
 		}
+		priv, perr := parsePKCS8RSA(pemStr)
+		if perr != nil {
+			return nativeKey{}, false, fmt.Errorf("stored key at %s is unparseable; refusing to overwrite it: %w", path, perr)
+		}
+		return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, true, nil
 	}
 
-	// Generate + persist (best effort: ephemeral if the write fails).
+	// Not found: generate + persist (ephemeral if the write fails).
 	priv := generate()
 	pemStr := marshalPKCS8RSA(priv)
 	if werr := m.kv.WriteKVSecret(ctx, nativeKVMount, path, map[string]interface{}{
@@ -131,8 +175,9 @@ func (m *NativeKeyManager) loadOrCreate(path string) (nativeKey, error) {
 		"created_at":      time.Now().UTC().Format(time.RFC3339),
 	}); werr != nil {
 		log.Printf("[NATIVE_KEYS] persist to %s failed (key ephemeral until next restart): %v", path, werr)
+		return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, false, nil
 	}
-	return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, nil
+	return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, true, nil
 }
 
 // Sign signs claims with the ACTIVE key as an `at+jwt` RS256 token (§ claim

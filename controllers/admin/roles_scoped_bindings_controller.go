@@ -10,6 +10,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -504,7 +505,7 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -529,7 +530,7 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -560,7 +561,7 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -589,7 +590,7 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/user/rbac/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -617,7 +618,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -646,7 +647,7 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context) {
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := middlewares.WorkspaceIDString(c)
 	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -964,10 +965,18 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 	freshRBAC := services.NewRBACService(freshDB)
+	// Every referent of the binding is looked up through the scoped layer:
+	// another workspace's role, user, group, service account or resource
+	// server does not exist here (AS-062).
+	scoped, err := tenancy.DB(c, freshDB)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace context required"})
+		return
+	}
 
 	// Validate role exists for this workspace.
 	var role models.RBACRole
-	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
+	if err := scoped.Where("id = ?", roleID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found for tenant"})
 		return
 	}
@@ -985,6 +994,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			sid, err := uuid.Parse(req.Scope.ID)
 			if err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Scope ID format (must be UUID or '*' for tenant-wide)"})
+				return
+			}
+			if err := requireBindingScopeInWorkspace(scoped, sid); err != nil {
+				writeBindingLookupError(c, err, "Scope not found")
 				return
 			}
 			scopeID = &sid
@@ -1025,7 +1038,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		// Scope to the binding's workspace and exclude soft-deleted users so a
 		// role binding can't be created for a user outside this workspace.
 		var user models.User
-		if err := freshDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userID, workspaceID).First(&user).Error; err != nil {
+		if err := scoped.Where("id = ? AND deleted_at IS NULL", userID).First(&user).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
 		}
@@ -1040,6 +1053,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Group ID format"})
 			return
 		}
+		if err := requireInWorkspace(scoped, "groups", groupID); err != nil {
+			writeBindingLookupError(c, err, "Group not found")
+			return
+		}
 		binding.GroupID = &groupID
 		auditExtra["group_id"] = req.GroupID
 
@@ -1051,7 +1068,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		}
 		// Verify SA exists in this workspace.
 		var sa models.ServiceAccount
-		if err := freshDB.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
+		if err := scoped.Where("id = ?", saID).First(&sa).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Service account not found"})
 			return
 		}
@@ -1287,6 +1304,14 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 
 	log.Printf("INFO: Found role %s (name: %s), proceeding to delete with role_permissions and role_bindings", roleID, role.Name)
 
+	// The built-in roles carry operator access (workspace_memberships points at
+	// them with ON DELETE RESTRICT); a role that members hold cannot go either.
+	// Say so instead of surfacing the foreign-key error.
+	if msg := roleDeleteBlocked(freshDB, role, workspaceID); msg != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": msg})
+		return
+	}
+
 	// Phase H-5 setup: snapshot the users currently bound to this role BEFORE
 	// the cascade. After tx commit, we revoke each user's active OAuth tokens
 	// so the role removal takes effect on the next request — not at access-token
@@ -1316,6 +1341,16 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		}
 		log.Printf("INFO: Deleted %d role_bindings for role %s", result.RowsAffected, roleID)
 
+		// An application whose default role this was keeps its access policy,
+		// without a default. The composite FK's ON DELETE SET NULL would null
+		// workspace_id as well, which is NOT NULL, and fail the delete.
+		if err := tx.Model(&models.ResourceServerAccessPolicy{}).
+			Where("default_role_id = ? AND workspace_id = ?", roleID, workspaceID).
+			Update("default_role_id", nil).Error; err != nil {
+			log.Printf("ERROR: Failed to clear default_role_id for role %s: %v", roleID, err)
+			return err
+		}
+
 		// Delete the role
 		if err := tx.Delete(&role).Error; err != nil {
 			log.Printf("ERROR: Failed to delete role %s: %v", roleID, err)
@@ -1325,7 +1360,7 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		return nil
 	}); err != nil {
 		log.Printf("ERROR: Transaction failed for deleting role %s: %v", roleID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role"})
 		return
 	}
 
@@ -1353,4 +1388,26 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		"message": "Role deleted successfully",
 		"id":      roleID.String(),
 	})
+}
+
+// roleDeleteBlocked says why role may not be deleted, or "" when it may.
+func roleDeleteBlocked(db *gorm.DB, role models.RBACRole, workspaceID uuid.UUID) string {
+	switch strings.ToLower(role.Name) {
+	case "owner", "admin":
+		return fmt.Sprintf("The %s role is built in and can't be deleted", role.Name)
+	}
+	if role.IsSystem {
+		return fmt.Sprintf("The %s role is a system role and can't be deleted", role.Name)
+	}
+	var members int64
+	if err := db.Model(&models.WorkspaceMembership{}).
+		Where("role_id = ? AND workspace_id = ?", role.ID, workspaceID).
+		Count(&members).Error; err != nil {
+		log.Printf("ERROR: count members of role %s: %v", role.ID, err)
+		return "Could not check who holds this role; try again"
+	}
+	if members > 0 {
+		return fmt.Sprintf("%d workspace member(s) hold the %s role; give them another role first", members, role.Name)
+	}
+	return ""
 }

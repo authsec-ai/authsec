@@ -252,6 +252,20 @@ type samlUpdateConfig struct {
 	AttributeMapping json.RawMessage `json:"attribute_mapping,omitempty"`
 }
 
+// oidcUpdateConfig is the OIDC `config` of an update; empty fields keep their
+// value, client_secret rotates the secret, provider_name is immutable.
+type oidcUpdateConfig struct {
+	ProviderName     string  `json:"provider_name,omitempty"`
+	AuthorizationURL string  `json:"authorization_url,omitempty"`
+	TokenURL         string  `json:"token_url,omitempty"`
+	UserinfoURL      string  `json:"userinfo_url,omitempty"`
+	ClientID         string  `json:"client_id,omitempty"`
+	ClientSecret     string  `json:"client_secret,omitempty"`
+	Scopes           string  `json:"scopes,omitempty"`
+	IconURL          *string `json:"icon_url,omitempty"`
+	RedirectURI      *string `json:"redirect_uri,omitempty"`
+}
+
 // Update handles PUT /authsec/identity-providers/:id — full SAML/OIDC config
 // update. Body shape matches Create: `{provider_type, display_name, config}`.
 // Status toggling stays on its dedicated PUT .../status endpoint.
@@ -309,9 +323,36 @@ func (ctrl *IdentityProvidersController) Update(c *gin.Context) {
 		c.JSON(http.StatusOK, idp)
 
 	case models.IdentityProviderOIDC:
-		// OIDC update is out of scope for this change — keep the door open
-		// rather than 500ing. Add a service method here when needed.
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC full-config update is not yet supported; use PUT .../status for now"})
+		var cfg oidcUpdateConfig
+		if len(req.Config) > 0 {
+			if err := json.Unmarshal(req.Config, &cfg); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid oidc config: " + err.Error()})
+				return
+			}
+		}
+		idp, err := ctrl.service.UpdateOIDC(services.UpdateOIDCIDPRequest{
+			WorkspaceID:      workspaceID,
+			IDPID:            idpID,
+			ProviderName:     cfg.ProviderName,
+			DisplayName:      req.DisplayName,
+			AuthorizationURL: cfg.AuthorizationURL,
+			TokenURL:         cfg.TokenURL,
+			UserinfoURL:      cfg.UserinfoURL,
+			ClientID:         cfg.ClientID,
+			ClientSecret:     cfg.ClientSecret,
+			Scopes:           cfg.Scopes,
+			IconURL:          cfg.IconURL,
+			RedirectURI:      cfg.RedirectURI,
+		})
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "identity provider not found"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, idp)
 
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{

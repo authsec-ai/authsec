@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/internal/k8sread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -42,13 +43,13 @@ func NewK8sGraphController(db *gorm.DB) *K8sGraphController {
 // the counts without reading last_sweep.coverage can draw exactly the wrong
 // conclusion from a cluster whose agent lost cluster-wide read this morning.
 func (ctl *K8sGraphController) ListClusters(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
-		return
-	}
-	out, err := k8sread.New(ctl.db, ws).Clusters()
+	var out []k8sread.Cluster
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Clusters()
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -81,6 +82,17 @@ const (
 // id is the cursor's own).
 type identitiesCursorKey struct {
 	Anchor *string `json:"a"`
+}
+
+// ws is the request's workspace, from the tenant context AuthMiddleware set
+// from the verified token. It writes the error response when there is none.
+func (ctl *K8sGraphController) ws(c *gin.Context) (uuid.UUID, bool) {
+	ws, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "workspace not resolved"})
+		return uuid.Nil, false
+	}
+	return ws, true
 }
 
 func (ctl *K8sGraphController) cursorSigner() *igaread.Reader {
@@ -170,9 +182,13 @@ func (ctl *K8sGraphController) ListIdentities(c *gin.Context) {
 		f.After = &k8sread.IdentityPosition{Anchor: *key.Anchor, ID: cur.ID}
 	}
 
-	page, err := k8sread.New(ctl.db, ws).ListIdentities(f)
+	var page k8sread.IdentityPage
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		page, err = q.ListIdentities(f)
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	var next any
@@ -208,8 +224,7 @@ func (ctl *K8sGraphController) ListIdentities(c *gin.Context) {
 // Kubernetes identity with that id: another workspace's id, an AWS
 // identity's and an unknown one read the same.
 func (ctl *K8sGraphController) GetIdentity(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
+	if _, ok := ctl.ws(c); !ok {
 		return
 	}
 	id, err := uuid.Parse(c.Param("id"))
@@ -217,7 +232,11 @@ func (ctl *K8sGraphController) GetIdentity(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity id"})
 		return
 	}
-	out, err := k8sread.New(ctl.db, ws).Identity(id)
+	var out *k8sread.Identity
+	err = k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Identity(id)
+		return err
+	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -247,8 +266,8 @@ func (ctl *K8sGraphController) GetIdentity(c *gin.Context) {
 // Grants are declared, not evaluated; each says where its rule applies
 // (effective_scope, D-109) and how it was reached (via, D-112).
 func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
+	if _, err := tenancy.Workspace(c); err != nil {
+		respondK8sReadError(c, err)
 		return
 	}
 	id, err := uuid.Parse(c.Param("id"))
@@ -256,9 +275,25 @@ func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity id"})
 		return
 	}
-	grants, sum, err := k8sread.New(ctl.db, ws).AccessFor(id)
+	var (
+		grants []k8sread.Grant
+		sum    k8sread.AccessSummary
+	)
+	err = k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) error {
+		// Another workspace's identity, or an unknown one, is 404 -- never
+		// an empty list that would read as "no access".
+		ok, err := q.HasIdentity(id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return tenancy.ErrNotFound
+		}
+		grants, sum, err = q.AccessFor(id)
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	// The summary ships even when the list is empty, because an empty list has
@@ -273,13 +308,13 @@ func (ctl *K8sGraphController) GetAccess(c *gin.Context) {
 // much that identity can do. Ordered by name (then id); the counts are read
 // for the page's execution identities alone (D-113).
 func (ctl *K8sGraphController) ListWorkloads(c *gin.Context) {
-	ws, ok := ctl.ws(c)
-	if !ok {
-		return
-	}
-	out, err := k8sread.New(ctl.db, ws).Workloads(igaLimit(c))
+	var out []k8sread.Workload
+	err := k8sread.Read(c.Request.Context(), ctl.db, func(q *k8sread.Query) (err error) {
+		out, err = q.Workloads(igaLimit(c))
+		return err
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondK8sReadError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -291,14 +326,17 @@ func (ctl *K8sGraphController) ListWorkloads(c *gin.Context) {
 	})
 }
 
-func (ctl *K8sGraphController) ws(c *gin.Context) (uuid.UUID, bool) {
-	raw := c.GetString("workspace_id")
-	id, err := uuid.Parse(raw)
-	if err != nil {
+// respondK8sReadError maps a read failure: no workspace in the token is 401,
+// an identity outside the caller's workspace 404, anything else 500.
+func respondK8sReadError(c *gin.Context, err error) {
+	switch tenancy.HTTPStatus(err) {
+	case http.StatusUnauthorized:
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
-		return uuid.Nil, false
+	case http.StatusNotFound:
+		c.JSON(http.StatusNotFound, gin.H{"error": "identity not found"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
-	return id, true
 }
 
 func igaLimit(c *gin.Context) int {

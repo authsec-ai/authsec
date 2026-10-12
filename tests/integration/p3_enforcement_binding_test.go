@@ -889,8 +889,14 @@ func TestP3EnfRoutes(t *testing.T) {
 		}
 	}
 
+	// Another workspace named in the body is refused at the edge (404,
+	// AuthMiddleware); the caller's own is accepted.
+	if code, body := r.call("POST", p+"/sessions", enforce, map[string]any{"deployment_region": "us-east-1",
+		"workspace_id": uuid.NewString()}); code != http.StatusNotFound {
+		t.Fatalf("POST sessions with a foreign body workspace: %d %v", code, body)
+	}
 	code, body = r.call("POST", p+"/sessions", enforce, map[string]any{"deployment_region": "us-east-1",
-		"workspace_id": uuid.NewString()}) // a body workspace is ignored
+		"workspace_id": r.a.ws.String()})
 	if code != http.StatusCreated || digs(body, "data", "status") != "waiting_for_stack" || digs(body, "data", "quick_create_url") == "" {
 		t.Fatalf("POST sessions: %d %v", code, body)
 	}

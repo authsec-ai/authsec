@@ -180,7 +180,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 
 	// workspace_id from token claims (set by AuthMiddleware)
 	workspaceIDStr := ""
-	if v, ok := c.Get("workspace_id"); ok && v != nil {
+	if v, ok := middlewares.WorkspaceValue(c); ok && v != nil {
 		workspaceIDStr, _ = v.(string)
 	}
 	if workspaceIDStr == "" {
@@ -274,7 +274,7 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 	}
 
 	workspaceIDStr := ""
-	if v, ok := c.Get("workspace_id"); ok && v != nil {
+	if v, ok := middlewares.WorkspaceValue(c); ok && v != nil {
 		workspaceIDStr, _ = v.(string)
 	}
 	workspaceID := uuid.Nil
@@ -391,7 +391,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		return
 	}
 
-	user, err := ctrl.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
+	user, err := ctrl.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), workspaceID), userInfo.Email)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace", "details": err.Error()})
 		return

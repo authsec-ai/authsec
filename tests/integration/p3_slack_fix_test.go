@@ -107,11 +107,16 @@ func (x *p3sxApproval) confirm(m p3aMember, token string) (int, map[string]any) 
 
 // p3sxSameEmailMember adds an active member whose account email is email
 // (another users row: users are unique per home workspace and email, and
-// this one has no home workspace), holding governance:<perm>.
+// this one's home is a workspace of its own; every user has one, 105's
+// ck_users_tenancy_ws_nn), holding governance:<perm>.
 func p3sxSameEmailMember(t *testing.T, l *p3aLab, email, perm string) p3aMember {
 	t.Helper()
 	m := p3aMember{user: uuid.New(), membership: uuid.New(), role: uuid.New()}
-	p3exec(t, l.db, `INSERT INTO users (id, email, name, workspace_id) VALUES (?, ?, 'same-mailbox', NULL)`, m.user, email)
+	home := uuid.New()
+	p3exec(t, l.db, `INSERT INTO workspaces (id,name,slug,owner_user_id,workspace_type,workspace_domain,email,status,created_at,updated_at)
+		VALUES (?,?,NULL,?,'team',?,?,'active',NOW(),NOW())`, home, "p3sx-home-"+home.String()[:8], home, home.String()+".test", home.String()+"@test.local")
+	t.Cleanup(func() { _ = l.db.Exec(`DELETE FROM workspaces WHERE id = ?`, home).Error })
+	p3exec(t, l.db, `INSERT INTO users (id, email, name, workspace_id) VALUES (?, ?, 'same-mailbox', ?)`, m.user, email, home)
 	p3exec(t, l.db, `INSERT INTO roles (id, name, workspace_id) VALUES (?, ?, ?)`, m.role, "p3sx-"+m.role.String()[:8], l.ws)
 	p3exec(t, l.db, `INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status) VALUES (?, ?, ?, ?, 'active')`,
 		m.membership, l.ws, m.user, m.role)

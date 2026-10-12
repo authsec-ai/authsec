@@ -106,7 +106,7 @@ func SetIGAProvider(p services.IGAProvider) { igaProviderOverride = p }
 /* ------------------------------- helpers ------------------------------- */
 
 func (ctl *IGAController) workspace(c *gin.Context) (uuid.UUID, string, error) {
-	ws := c.GetString("workspace_id")
+	ws := middlewares.WorkspaceIDString(c)
 	if ws == "" {
 		return uuid.Nil, "", fmt.Errorf("workspace_id not found in token")
 	}

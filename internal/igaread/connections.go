@@ -221,9 +221,9 @@ type ConnectionList struct {
 
 // ListConnections serves GET /authsec/discovery/connections for the workspace
 // in the token.
-func (r *Reader) ListConnections(ctx context.Context, ws uuid.UUID) (any, error) {
+func (r *Reader) ListConnections(ctx context.Context) (any, error) {
 	out := ConnectionList{Connections: []Connection{}}
-	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := r.Read(ctx, Pin{}, func(q *Query) error {
 		now := time.Now().UTC()
 		cloud, err := connCloud(q, now)
 		if err != nil {

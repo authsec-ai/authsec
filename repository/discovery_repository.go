@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -283,7 +285,10 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 // delete that did not revoke first fails instead of widening a credential.
 func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
 	purgePath := ""
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	// Under row-level security for the workspace: the graph retirement below
+	// (k8sgraph.RetireSource) runs on this transaction.
+	rlsCtx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(rlsCtx, r.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var src models.DiscoverySource
 		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 			return err

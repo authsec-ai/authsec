@@ -1,12 +1,15 @@
 package services
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -86,19 +89,38 @@ func (m *igaBridgeManager) ProposeForAgent(workspaceID,
 	// Candidates whose normalized display name equals this one. Only ACTIVE
 	// canonical agents: proposing a link to a retired or tombstoned agent would
 	// send a reviewer to resurrect something deliberately closed.
-	var candidates []struct {
+	type candidate struct {
 		ID          uuid.UUID
 		DisplayName string
 	}
-	if err := m.db.Raw(`
-		SELECT id, display_name FROM iga_agents
-		 WHERE workspace_id = ? AND lifecycle = 'active'
+	var candidates []candidate
+	sqlDB, err := m.db.DB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	if err := tenancy.WithTx(ctx, sqlDB, workspaceID, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(ctx, tx, `SELECT id, display_name FROM iga_agents
+		 WHERE workspace_id = $1 AND lifecycle = 'active'
 		   -- btrim mirrors the Trim in normalizeName. Without it the two
 		   -- normalisations disagree on any name with leading or trailing
 		   -- punctuation -- " research-agent " would never match "research-agent"
 		   -- and the correlation would silently just not happen.
-		   AND btrim(regexp_replace(lower(display_name), '[^a-z0-9]+', '-', 'g'), '-') = ?
-		 LIMIT 5`, workspaceID, key).Scan(&candidates).Error; err != nil {
+		   AND btrim(regexp_replace(lower(display_name), '[^a-z0-9]+', '-', 'g'), '-') = $2
+		 LIMIT 5`, key)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.ID, &c.DisplayName); err != nil {
+				return err
+			}
+			candidates = append(candidates, c)
+		}
+		return rows.Err()
+	}); err != nil {
 		return nil, err
 	}
 

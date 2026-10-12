@@ -139,7 +139,7 @@ func loadAccessWalk(t *testing.T, r *igaread.Reader, ws, id uuid.UUID, includeEn
 		if cursor != "" {
 			vals.Set("cursor", cursor)
 		}
-		out, err := r.ResourceAccess(context.Background(), ws, id.String(), vals)
+		out, err := r.ResourceAccess(wsCtx(context.Background(), ws), id.String(), vals)
 		if err != nil {
 			t.Fatalf("access %s: %v", id, err)
 		}

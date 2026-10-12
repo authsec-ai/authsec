@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -24,88 +25,90 @@ func NewClientsRBACRepository(db *gorm.DB) ClientsRBACRepository {
 	return &clientsRbacRepository{db: db}
 }
 
-// GrantUserClientsAccess ensures the tenant has the necessary 'clients' permissions,
-// an admin role exists, and the user is bound to that role.
+// clientsPermissions are the 'clients' permissions every workspace's admin
+// role holds.
+var clientsPermissions = []struct {
+	Action      string
+	Description string
+}{
+	{"create", "Create new clients"},
+	{"read", "View client details"},
+	{"update", "Modify client details"},
+	{"delete", "Delete clients"},
+	{"list", "List all clients"},
+	{"activate", "Activate clients"},
+	{"deactivate", "Deactivate clients"},
+	{"admin", "Full administrative access to clients"},
+}
+
+// GrantUserClientsAccess ensures the workspace has the 'clients' permissions
+// and an admin role holding them, and binds the user to that role. It runs in
+// one transaction under row-level security for workspaceID, every statement
+// bound to it: a user of another workspace is not bound (the call fails). A
+// ctx that already carries a different workspace is refused.
 func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, userID, workspaceID uuid.UUID) error {
 	if r.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != workspaceID {
+		return tenancy.ErrNotFound
+	} else if err != nil {
+		ctx = tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: workspaceID})
+	}
 
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		permissions := []struct {
-			Action      string
-			Description string
-		}{
-			{"create", "Create new clients"},
-			{"read", "View client details"},
-			{"update", "Modify client details"},
-			{"delete", "Delete clients"},
-			{"list", "List all clients"},
-			{"activate", "Activate clients"},
-			{"deactivate", "Deactivate clients"},
-			{"admin", "Full administrative access to clients"},
-		}
-
-		for _, p := range permissions {
-			var permID uuid.UUID
-			err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, workspaceID).Scan(&permID).Error
-			if err != nil {
-				return err
-			}
-			if permID == uuid.Nil {
-				if err := tx.Exec(`
-					INSERT INTO permissions (id, workspace_id, resource, action, description, created_at, updated_at)
-					VALUES (gen_random_uuid(), ?, 'clients', ?, ?, NOW(), NOW())
-					ON CONFLICT (workspace_id, resource, action) DO NOTHING
-				`, workspaceID, p.Action, p.Description).Error; err != nil {
-					return fmt.Errorf("insert permission (clients:%s): %w", p.Action, err)
-				}
-				if err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, workspaceID).Scan(&permID).Error; err != nil {
-					return err
-				}
+	return tenancy.Transaction(ctx, r.db, func(tx *gorm.DB) error {
+		q := sqlConn(tx)
+		for _, p := range clientsPermissions {
+			if _, err := tenancy.ExecContext(ctx, q, `INSERT INTO permissions (id, workspace_id, resource, action, description, created_at, updated_at)
+				SELECT gen_random_uuid(), $1, 'clients', $2::text, $3::text, NOW(), NOW()
+				 WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE workspace_id = $1 AND resource = 'clients' AND action = $2::text)
+				ON CONFLICT (workspace_id, resource, action) DO NOTHING`, p.Action, p.Description); err != nil {
+				return fmt.Errorf("insert permission (clients:%s): %w", p.Action, err)
 			}
 		}
 
+		if _, err := tenancy.ExecContext(ctx, q, `INSERT INTO roles (id, workspace_id, name, description, is_system, created_at, updated_at)
+			SELECT gen_random_uuid(), $1, 'admin', 'Tenant admin', true, NOW(), NOW()
+			 WHERE NOT EXISTS (SELECT 1 FROM roles WHERE workspace_id = $1 AND name = 'admin')
+			ON CONFLICT (workspace_id, name) DO NOTHING`); err != nil {
+			return fmt.Errorf("create admin role: %w", err)
+		}
 		var adminRoleID uuid.UUID
-		if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, workspaceID).
-			Scan(&adminRoleID).Error; err != nil {
+		if err := tenancy.QueryRowContext(ctx, q,
+			`SELECT id FROM roles WHERE workspace_id = $1 AND name = 'admin' LIMIT 1`, nil, &adminRoleID); err != nil {
 			return fmt.Errorf("fetch admin role: %w", err)
 		}
-		if adminRoleID == uuid.Nil {
-			adminRoleID = uuid.New()
-			if err := tx.Exec(`
-				INSERT INTO roles (id, workspace_id, name, description, is_system, created_at, updated_at)
-				VALUES (?, ?, 'admin', 'Tenant admin', true, NOW(), NOW())
-				ON CONFLICT (workspace_id, name) DO NOTHING
-			`, adminRoleID, workspaceID).Error; err != nil {
-				return fmt.Errorf("create admin role: %w", err)
-			}
-			if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, workspaceID).
-				Scan(&adminRoleID).Error; err != nil {
-				return fmt.Errorf("re-fetch admin role: %w", err)
-			}
+
+		if _, err := tenancy.ExecContext(ctx, q, `
+			INSERT INTO role_permissions (role_id, permission_id)
+			SELECT r.id, p.id
+			  FROM roles r
+			  JOIN permissions p ON p.workspace_id = r.workspace_id AND p.resource = 'clients'
+			 WHERE r.workspace_id = $1 AND r.id = $2
+			ON CONFLICT DO NOTHING`, adminRoleID); err != nil {
+			return fmt.Errorf("bind clients permissions to admin role: %w", err)
 		}
 
-		var permIDs []uuid.UUID
-		if err := tx.Raw(`SELECT id FROM permissions WHERE workspace_id = ? AND resource = 'clients'`, workspaceID).
-			Scan(&permIDs).Error; err != nil {
-			return fmt.Errorf("fetch clients permissions: %w", err)
-		}
-		for _, pid := range permIDs {
-			if err := tx.Exec(`INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?) ON CONFLICT DO NOTHING`, adminRoleID, pid).Error; err != nil {
-				return fmt.Errorf("bind permission %s to admin role: %w", pid, err)
-			}
-		}
-
-		if err := tx.Exec(`
-			INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, conditions, created_at, updated_at)
-			VALUES (gen_random_uuid(), ?, ?, ?, NULL, NULL, '{}'::jsonb, NOW(), NOW())
-			ON CONFLICT DO NOTHING
-		`, workspaceID, userID, adminRoleID).Error; err != nil {
+		res, err := tenancy.ExecContext(ctx, q, `INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, conditions, created_at, updated_at)
+			SELECT gen_random_uuid(), u.workspace_id, u.id, $3, NULL, NULL, '{}'::jsonb, NOW(), NOW() FROM users u WHERE u.workspace_id = $1 AND u.id = $2 AND NOT EXISTS (
+				SELECT 1 FROM role_bindings WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL)
+			ON CONFLICT DO NOTHING`, userID, adminRoleID)
+		if err != nil {
 			return fmt.Errorf("bind user to admin role: %w", err)
 		}
+		if n, err := res.RowsAffected(); err == nil && n == 0 {
+			var bound bool
+			if err := tenancy.QueryRowContext(ctx, q,
+				`SELECT EXISTS (SELECT 1 FROM role_bindings WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3)`,
+				[]interface{}{userID, adminRoleID}, &bound); err != nil {
+				return fmt.Errorf("bind user to admin role: %w", err)
+			}
+			if !bound {
+				return fmt.Errorf("bind user to admin role: %w", tenancy.ErrNotFound) // not a user of the workspace
+			}
+		}
 
-		log.Printf("[ClientsRBAC] Granted clients access to user %s in tenant %s", userID, workspaceID)
+		log.Printf("[ClientsRBAC] Granted clients access to user %s in workspace %s", userID, workspaceID)
 		return nil
 	})
 }

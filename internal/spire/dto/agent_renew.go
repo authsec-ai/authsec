@@ -2,11 +2,12 @@ package dto
 
 import "time"
 
-// AgentRenewRequest represents an agent SVID renewal request
+// AgentRenewRequest represents an agent SVID renewal request. The agent is
+// the one whose certificate authenticated the request; agent_id is optional
+// and must name it.
 type AgentRenewRequest struct {
-	AgentID  string `json:"agent_id"`
-	WorkspaceID string `json:"workspace_id,omitempty"` // Optional: for non-mTLS environments
-	CSR      string `json:"csr"`
+	AgentID string `json:"agent_id,omitempty"`
+	CSR     string `json:"csr"`
 }
 
 // AgentRenewResponse represents an agent SVID renewal response

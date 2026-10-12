@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/authsec-ai/authsec/internal/safehttp"
 )
 
 // DefaultUserAgent is the webhook User-Agent (the legacy sender's).
@@ -34,7 +36,8 @@ func Sign(secret string, body []byte) string {
 // Webhook POSTs a JSON body to a customer endpoint, signed when a secret is
 // configured. Any non-2xx answer is a failure.
 type Webhook struct {
-	// Client is optional; nil means a client with DefaultWebhookTimeout.
+	// Client is optional; nil means an SSRF-safe client (internal/safehttp)
+	// with DefaultWebhookTimeout: the URL is customer-supplied (AS-042).
 	Client *http.Client
 }
 
@@ -51,7 +54,7 @@ func (w *Webhook) Send(ctx context.Context, m Message) error {
 		client = w.Client
 	}
 	if client == nil {
-		client = &http.Client{Timeout: DefaultWebhookTimeout}
+		client = safehttp.New(DefaultWebhookTimeout)
 	}
 	if ctx == nil {
 		ctx = context.Background()

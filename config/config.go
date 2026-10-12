@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
 	"log"
 	"net/url"
 	"os"
@@ -100,14 +101,14 @@ type Config struct {
 	// Requires XAA_NATIVE_SEALER. token-exchange is only advertised in AS
 	// metadata when this flag is on.
 	XAAIssuance bool
-	// EnableEmbeddedSpire (default off) mounts the legacy embedded SPIRE control
+	// EnableEmbeddedSpire (default off) mounts the embedded SPIRE control
 	// plane: the /authsec/spire headless routes and the /authsec/spiresvc
-	// identity service. Those paths back onto internal/spire repositories that
-	// query control-plane tables (agents, workloads, certificates, …) which are
-	// not part of the single master bootstrap, so they 500 when mounted. Off by
-	// default quarantines them. The SPIFFE-SVID M2M path (service_accounts,
-	// application_spiffe_identities, external SPIFFE_OIDC_ISSUER verification) is
-	// independent of this flag and always available.
+	// identity service. It is workspace-scoped (AS-081): its spire_* tables
+	// are workspace-owned (migration 120) and every route takes its workspace
+	// from a verified credential, so it may run in production. The
+	// SPIFFE-SVID M2M path (service_accounts, application_spiffe_identities,
+	// external SPIFFE_OIDC_ISSUER verification) is independent of this flag
+	// and always available.
 	EnableEmbeddedSpire bool
 
 	// PolicyEngineMode controls the token-issuance PDP (internal/policy/).
@@ -261,6 +262,8 @@ func LoadConfig() *Config {
 
 	// SPIFFE / SVID OIDC
 	spiffeOIDCIssuer := getEnv("SPIFFE_OIDC_ISSUER", "")
+	// Operator-configured, so it may live on a private address.
+	safehttp.TrustOperatorURL(spiffeOIDCIssuer)
 	spiffeJWKSKeyID := getEnv("SPIFFE_JWKS_KEY_ID", "")
 	spiffeRSAPrivateKeyB64 := getEnv("SPIFFE_RSA_PRIVATE_KEY_B64", "")
 	spiffeTrustDomain := getEnv("SPIFFE_TRUST_DOMAIN", "")
@@ -394,7 +397,7 @@ func LoadConfig() *Config {
 		XAACiba:                 getEnvBool("XAA_CIBA", false),
 		XAAIssuance:             getEnvBool("XAA_ISSUANCE", false),
 		EnableEmbeddedSpire:     getEnvBool("ENABLE_EMBEDDED_SPIRE", false),
-		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "off"),
+		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "enforce"), // deny policies block (AS-035); "shadow"/"off" only for diagnosis
 		OktaDomain:              oktaDomain,
 		OktaClientID:            oktaClientID,
 		OktaClientSecret:        oktaClientSecret,
@@ -433,6 +436,13 @@ func LoadConfig() *Config {
 		OIDCStateHMACKey:              oidcStateHMACKey,
 	}
 
+	// XAA issuance flags mint NativeSealer tokens; without the sealer those
+	// tokens are inactive at introspection and their keys are not on JWKS
+	// (AS-067). Refuse to start rather than issue unusable tokens.
+	if err := AppConfig.ValidateXAAFlags(); err != nil {
+		log.Fatalf("CRITICAL: invalid XAA feature flags: %v. Cannot start.", err)
+	}
+
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)
 	requiredSecrets := map[string]string{
 		"DB_USER":        dbUser,
@@ -451,6 +461,43 @@ func LoadConfig() *Config {
 	}
 
 	return AppConfig
+}
+
+// ValidateXAAFlags checks the dependencies between the XAA feature flags:
+// every issuance flag (XAA_M2M, XAA_REDEMPTION, XAA_CIBA, XAA_ISSUANCE)
+// mints NativeSealer tokens and so needs XAA_NATIVE_SEALER. XAA_DPOP is
+// refused: DPoP proofs are not validated, so the flag would accept them
+// unchecked.
+func (c *Config) ValidateXAAFlags() error {
+	if c == nil {
+		return nil
+	}
+	var missing []string
+	if !c.XAANativeSealer {
+		for _, f := range []struct {
+			name string
+			on   bool
+		}{
+			{"XAA_M2M", c.XAAm2m},
+			{"XAA_REDEMPTION", c.XAARedemption},
+			{"XAA_CIBA", c.XAACiba},
+			{"XAA_ISSUANCE", c.XAAIssuance},
+			{"XAA_DPOP", c.XAADPOP},
+		} {
+			if f.on {
+				missing = append(missing, f.name)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s require XAA_NATIVE_SEALER=true (tokens they mint would be inactive at introspection and absent from JWKS)", strings.Join(missing, ", "))
+	}
+	if c.XAADPOP {
+		// The token endpoint does not validate DPoP proofs; with the flag on
+		// it would accept them unchecked (AS-073). Keep it off until it does.
+		return fmt.Errorf("XAA_DPOP is not supported: DPoP proof validation is not implemented")
+	}
+	return nil
 }
 
 func (c *Config) OAuthBaseURL() string {

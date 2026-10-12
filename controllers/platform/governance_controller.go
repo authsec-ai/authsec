@@ -47,7 +47,7 @@ func (ctl *GovernanceController) provenance() services.ProvenanceManager {
 // workspace resolves the caller's workspace from the token. Never from the body — a
 // caller must not be able to grant authority in someone else's workspace.
 func (ctl *GovernanceController) workspace(c *gin.Context) (uuid.UUID, error) {
-	raw := c.GetString("workspace_id")
+	raw := middlewares.WorkspaceIDString(c)
 	if raw == "" {
 		return uuid.Nil, errors.New("workspace_id not found in token")
 	}

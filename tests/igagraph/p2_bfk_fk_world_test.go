@@ -246,6 +246,13 @@ func (s *bfkSide) arn(kind string) string {
 
 /* -------------------------- builders: cloud_* ------------------------------ */
 
+// cloudConnector is an integration of its own, so the anchor case can write
+// one without colliding with the side's connector.
+func (s *bfkSide) cloudConnector(set ...any) bfkRow {
+	return bfkRowOf("cloud_connector", []any{"id", uuid.New(), "workspace_id", s.ws, "provider", "aws",
+		"scope_kind", "account", "scope_id", uuid.NewString(), "auth_ref", "vault://bfk"}, set)
+}
+
 func (s *bfkSide) cloudIdentity(set ...any) bfkRow {
 	return bfkRowOf("cloud_identity", []any{"id", uuid.New(), "workspace_id", s.ws, "connector_id", s.conn,
 		"kind", "iam_user", "native_id", s.arn("user"), "name", "bfk"}, set)

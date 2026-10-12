@@ -1,14 +1,17 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -198,7 +201,7 @@ func (ctl *DiscoveryController) manager() services.DiscoveryManager {
 // workspace is never taken from the request body — a caller must not be able to
 // name someone else's workspace.
 func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, error) {
-	workspaceStr := c.GetString("workspace_id")
+	workspaceStr := middlewares.WorkspaceIDString(c)
 	if workspaceStr == "" {
 		return uuid.Nil, "", fmt.Errorf("workspace_id not found in token")
 	}
@@ -253,6 +256,107 @@ func (ctl *DiscoveryController) assertedWorkspace(c *gin.Context, raw string) (u
 		return uuid.Nil, false
 	}
 	return wsID, true
+}
+
+// connectorCredentialPrefix marks a per-connector credential minted by
+// POST /authsec/governance/connectors/:id/actuation.
+const connectorCredentialPrefix = "authsec_act_"
+
+// ingress authenticates a discovery report and returns the workspace it may
+// write to, and the connector when one authenticated the call.
+//
+//   - A connector's actuation token (Authorization: Bearer) decides the
+//     workspace and the source; a body naming another workspace or source is
+//     not found. A malformed connector credential is refused.
+//   - Otherwise the ingest token is checked per IGA_DISCOVERY_INGEST_AUTH
+//     (off | warn | enforce; discovery_ingest_auth.go), which vouches for the
+//     body's workspace.
+//   - Either way, a report about a connector that holds an actuation
+//     credential must come with that credential (AS-014): nothing else may
+//     speak for it.
+func (ctl *DiscoveryController) ingress(c *gin.Context, rawWS string, sourceID **uuid.UUID,
+	source func(uuid.UUID) func() (*uuid.UUID, error), lookup connectorLookup) (uuid.UUID, *models.DiscoverySource, bool) {
+
+	token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+	if token != "" {
+		src, err := services.NewActuationManager(ctl.db).AuthenticateAgent(token)
+		if err == nil {
+			if ws, perr := uuid.Parse(rawWS); rawWS != "" && (perr != nil || ws != src.WorkspaceID) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+				return uuid.Nil, nil, false
+			}
+			if *sourceID != nil && **sourceID != src.ID {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+				return uuid.Nil, nil, false
+			}
+			id := src.ID
+			*sourceID = &id
+			return src.WorkspaceID, src, true
+		}
+		if strings.HasPrefix(token, connectorCredentialPrefix) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid connector credential"})
+			return uuid.Nil, nil, false
+		}
+	}
+
+	wsID, ok := ctl.ingressWorkspace(c, rawWS, source)
+	if !ok {
+		return uuid.Nil, nil, false
+	}
+	locked, err := ctl.credentialedConnector(wsID, *sourceID, lookup)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify connector"})
+		return uuid.Nil, nil, false
+	}
+	if locked {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "this connector has a credential: send it as " +
+			"the bearer token (set controlPlane.sourceToken to the connector's actuation token)"})
+		return uuid.Nil, nil, false
+	}
+	return wsID, nil, true
+}
+
+// connectorLookup is what an ingress body carries that identifies a connector
+// besides discovery_source_id.
+type connectorLookup struct {
+	ClusterName string
+	InstanceID  string
+	// Source and Fingerprint identify an inventory row whose connector is checked.
+	Source      string
+	Fingerprint string
+}
+
+// credentialedConnector reports whether the connector a request identifies, in
+// wsID, holds a per-connector credential.
+func (ctl *DiscoveryController) credentialedConnector(wsID uuid.UUID, sourceID *uuid.UUID,
+	lookup connectorLookup) (bool, error) {
+
+	if sourceID == nil && lookup.ClusterName == "" && lookup.InstanceID == "" && lookup.Fingerprint == "" {
+		return false, nil
+	}
+	// One fixed statement: a lookup field left empty (or a nil source id,
+	// bound as NULL) matches nothing, so only the fields the request named
+	// identify the connector.
+	var source interface{}
+	if sourceID != nil {
+		source = *sourceID
+	}
+	sqlDB, err := ctl.db.DB()
+	if err != nil {
+		return false, err
+	}
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: wsID})
+	var n int64
+	err = tenancy.QueryRowContext(ctx, sqlDB, `SELECT count(*) FROM discovery_sources s
+		WHERE s.workspace_id = $1 AND s.actuation_token_hash <> ''
+		  AND (s.id = $2::uuid
+		    OR ($3 <> '' AND s.cluster_name = $3)
+		    OR ($4 <> '' AND s.instance_id = $4)
+		    OR ($6 <> '' AND s.id IN (SELECT a.discovery_source_id FROM discovered_agents a
+		          WHERE a.workspace_id = $1 AND a.source = $5 AND a.fingerprint = $6
+		            AND a.discovery_source_id IS NOT NULL)))`,
+		[]interface{}{source, lookup.ClusterName, lookup.InstanceID, lookup.Source, lookup.Fingerprint}, &n)
+	return n > 0, err
 }
 
 // actingUser returns the authenticated user id, used to attribute a claim or a
@@ -483,17 +587,23 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		return
 	}
 
-	// The workspace comes from the body; the ingest token (when the mode asks for
-	// one) is what vouches for it. See discovery_ingest_auth.go.
-	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	// A connector's actuation token decides workspace and source; otherwise
+	// the ingest token (per IGA_DISCOVERY_INGEST_AUTH) vouches for the body's
+	// workspace. See ingress and discovery_ingest_auth.go.
+	wsID, conn, ok := ctl.ingress(c, req.WorkspaceID, &req.DiscoverySourceID,
+		staticIngestSource(req.DiscoverySourceID),
+		connectorLookup{Source: req.Source, Fingerprint: req.Fingerprint})
 	if !ok {
 		return
 	}
 
-	// Attributed to the ingest token that authenticated the call, or explicitly
-	// marked unauthenticated, so a row's provenance is never overstated when
-	// someone reads it later.
+	// Attributed to the connector or ingest token that authenticated the call,
+	// or explicitly marked unauthenticated, so a row's provenance is never
+	// overstated when someone reads it later.
 	principal := ingestPrincipal(c, req.Source)
+	if conn != nil {
+		principal = "connector:" + conn.ID.String()
+	}
 
 	agent, created, err := ctl.manager().ReportSighting(wsID, principal, services.SightingInput{
 		Source:            req.Source,
@@ -519,6 +629,12 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 		auditAdminMutation(c, wsID.String(), "discover", "discovered_agent",
 			agent.ID.String(), status, nil, agent)
 	}
+	if conn == nil {
+		// An unauthenticated caller does not get the inventory row back: it could
+		// otherwise read another workspace's agent by reporting its fingerprint.
+		c.JSON(status, gin.H{"agent": gin.H{"id": agent.ID}, "created": created})
+		return
+	}
 	c.JSON(status, gin.H{"agent": agent, "created": created})
 }
 
@@ -540,8 +656,16 @@ func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, ctl.registrationIngestSource(req.Kind, req.InstanceID))
+	var sourceID *uuid.UUID
+	wsID, conn, ok := ctl.ingress(c, req.WorkspaceID, &sourceID,
+		ctl.registrationIngestSource(req.Kind, req.InstanceID),
+		connectorLookup{InstanceID: req.InstanceID})
 	if !ok {
+		return
+	}
+	if conn != nil && conn.InstanceID != req.InstanceID {
+		// A credential speaks for its own connector only.
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
@@ -570,13 +694,18 @@ func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
 		auditAdminMutation(c, wsID.String(), "register", "discovery_source",
 			source.ID.String(), status, nil, source)
 	}
-	c.JSON(status, gin.H{
+	resp := gin.H{
 		// Named discovery_source_id, not id: this is the value the agent copies onto
 		// every sighting and lifecycle event it sends.
 		"discovery_source_id": source.ID,
-		"source":              source,
 		"created":             created,
-	})
+	}
+	// The connector row (admin-owned config included) only goes back to an
+	// authenticated connector; the agent reads nothing but the id.
+	if conn != nil {
+		resp["source"] = source
+	}
+	c.JSON(status, resp)
 }
 
 // ReportLifecycleEvent handles POST /authsec/discovery/lifecycle — a connector
@@ -598,7 +727,9 @@ func (ctl *DiscoveryController) ReportLifecycleEvent(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	wsID, conn, ok := ctl.ingress(c, req.WorkspaceID, &req.DiscoverySourceID,
+		staticIngestSource(req.DiscoverySourceID),
+		connectorLookup{ClusterName: req.ClusterName, Source: req.Source, Fingerprint: req.Fingerprint})
 	if !ok {
 		return
 	}
@@ -629,6 +760,11 @@ func (ctl *DiscoveryController) ReportLifecycleEvent(c *gin.Context) {
 	if agent == nil {
 		status = http.StatusAccepted
 	}
+	if conn == nil {
+		// No inventory row back to an unauthenticated caller.
+		c.JSON(status, gin.H{"matched": agent != nil})
+		return
+	}
 	c.JSON(status, gin.H{"agent": agent, "event": event, "matched": agent != nil})
 }
 
@@ -651,7 +787,9 @@ func (ctl *DiscoveryController) ReportResyncManifest(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.ingressWorkspace(c, req.WorkspaceID, staticIngestSource(req.DiscoverySourceID))
+	wsID, _, ok := ctl.ingress(c, req.WorkspaceID, &req.DiscoverySourceID,
+		staticIngestSource(req.DiscoverySourceID),
+		connectorLookup{ClusterName: req.ClusterName})
 	if !ok {
 		return
 	}
@@ -1024,9 +1162,18 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		return
 	}
 
-	wsID, ok := ctl.ingressWorkspace(c, snap.WorkspaceID, parsedIngestSource(snap.DiscoverySourceID))
+	var sourceID *uuid.UUID
+	if id, perr := uuid.Parse(strings.TrimSpace(snap.DiscoverySourceID)); perr == nil {
+		sourceID = &id
+	}
+	wsID, conn, ok := ctl.ingress(c, snap.WorkspaceID, &sourceID,
+		parsedIngestSource(snap.DiscoverySourceID),
+		connectorLookup{ClusterName: snap.Cluster})
 	if !ok {
 		return
+	}
+	if conn != nil {
+		snap.DiscoverySourceID = sourceID.String()
 	}
 
 	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).

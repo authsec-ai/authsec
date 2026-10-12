@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -20,6 +21,7 @@ func GenerateOIDCServiceToken() (string, error) {
 		"exp":     time.Now().Add(24 * time.Hour).Unix(), // Token valid for 24 hours
 	}
 
+	claims["jti"] = uuid.NewString() // revocable by id (AS-031)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
 	// Sign with JWT_DEF_SECRET (same secret ICP uses for validation)

@@ -41,7 +41,7 @@ func (ctrl *BundleController) GetBundle(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, dto.BundleResponse{
-		CABundle: bundle,
+		CABundle:    bundle,
 		WorkspaceID: workspaceID,
 	})
 }

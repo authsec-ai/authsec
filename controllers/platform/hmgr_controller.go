@@ -16,6 +16,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	hydrautils "github.com/authsec-ai/authsec/internal/hydra/utils"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -567,19 +568,14 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 
 	// Stash the request origin on the v4 service so it lands on OIDCState
 	// for the eventual post-auth redirect.
-	originDomain := req.OriginDomain
+	// Body, forwarded host, Origin and Host are all client-chosen: only an
+	// allowed host may become the redirect target (AS-064).
+	originDomain := middlewares.AllowedHostOr(req.OriginDomain, "")
 	if originDomain == "" {
-		originDomain = c.GetHeader("X-Forwarded-Host")
+		originDomain = middlewares.AllowedOriginHost(c)
 	}
 	if originDomain == "" {
-		if origin := c.GetHeader("Origin"); origin != "" {
-			if u, err := url.Parse(origin); err == nil {
-				originDomain = u.Host
-			}
-		}
-	}
-	if originDomain == "" {
-		originDomain = c.Request.Host
+		originDomain = middlewares.AllowedHostOr(middlewares.EffectiveHost(c), "")
 	}
 	ctrl.oidcSvc.SetRequestOrigin(originDomain)
 
@@ -1149,6 +1145,13 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 					arcCtx.ContextID, consentErr)
 			}
 		}
+	} else if mcpClient != nil && workspaceUUID != uuid.Nil && subjectUUID != uuid.Nil {
+		// Consent given again (not remembered) clears an earlier revocation,
+		// which would otherwise refuse the refreshes of these new tokens.
+		if err := ctrl.consentService.MarkReconsented(workspaceUUID, subjectUUID, mcpClient.ID, rs.ID); err != nil {
+			log.Printf("[MCP_AUTH] ConsentHandler: failed to clear revoked consent context_id=%s: %v",
+				arcCtx.ContextID, err)
+		}
 	}
 
 	log.Printf("[MCP_AUTH] ConsentHandler: consent completed context_id=%s client=%s rs=%s remember=%v scopes=%d",
@@ -1531,6 +1534,14 @@ func buildSAMLRedirectURL(redirectTo, loginChallenge string, user *hydramodels.U
 	query.Set("workspace_id", user.WorkspaceID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
+	// The assertion has been processed: hand the UI the ticket its MFA step
+	// and session callback require. /uflow/user/saml/login is anonymous and
+	// must never be treated as proof of a SAML sign-in (AS-029).
+	if ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmEndUser, user.WorkspaceID, user.ID, user.Email, "saml"); err != nil {
+		log.Printf("[SAML] buildSAMLRedirectURL: failed to issue login ticket: %v", err)
+	} else {
+		query.Set(logintickets.ResponseField, ticket)
+	}
 
 	builtURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
 	if err != nil {

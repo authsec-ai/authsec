@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -157,12 +158,13 @@ func (s *ServiceAccountService) DeleteServiceAccount(
 
 			// Managed-SPIRE compatibility rows may exist for older workloads. They
 			// are database registration material, not audit history.
-			if err := tx.Exec("DELETE FROM spire_workloads WHERE spiffe_id = ?", *sa.SpiffeID).Error; err != nil {
+			wctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+			if err := tenancy.GormExec(wctx, tx, "DELETE FROM spire_workloads WHERE workspace_id = $1 AND spiffe_id = $2", *sa.SpiffeID).Error; err != nil {
 				return fmt.Errorf("delete legacy SPIRE workload: %w", err)
 			}
 			// Issued-token rows are retained as history but made unusable.
-			if err := tx.Exec(
-				"UPDATE spire_oidc_tokens SET revoked = true WHERE spiffe_id = ?",
+			if err := tenancy.GormExec(wctx, tx,
+				"UPDATE spire_oidc_tokens SET revoked = true WHERE workspace_id = $1 AND spiffe_id = $2",
 				*sa.SpiffeID,
 			).Error; err != nil {
 				return fmt.Errorf("revoke SPIRE token records: %w", err)

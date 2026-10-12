@@ -15,13 +15,13 @@ import "github.com/gin-gonic/gin"
 // GetResource handles GET /api/iga/v1/resources/:id.
 func (ctl *IGAGraphReadController) GetResource(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.ResourceDetail(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+		return g.Reader.ResourceDetail(g.C.Request.Context(), g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }
 
 // GetResourceAccess handles GET /api/iga/v1/resources/:id/access.
 func (ctl *IGAGraphReadController) GetResourceAccess(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.ResourceAccess(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+		return g.Reader.ResourceAccess(g.C.Request.Context(), g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }

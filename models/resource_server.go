@@ -14,6 +14,7 @@ type ResourceServer struct {
 	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	WorkspaceID             uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ApplicationType         string         `json:"application_type" gorm:"type:text;not null;default:'mcp_server'"`
+	AgentType               *string        `json:"agent_type,omitempty" gorm:"column:agent_type;type:text"` // ai_agent only (AS-046)
 	LegacyClientID          *uuid.UUID     `json:"legacy_client_id,omitempty" gorm:"type:uuid;index"`
 	Name                    string         `json:"name" gorm:"not null"`
 	PublicBaseURL           string         `json:"public_base_url" gorm:"not null"`

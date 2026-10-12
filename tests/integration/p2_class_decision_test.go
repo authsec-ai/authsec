@@ -921,7 +921,7 @@ func TestP2ClassCrossWorkspaceIs404(t *testing.T) {
 	// The other workspace HAS a publication: otherwise the history's 404 would
 	// be D-4's "nothing published", and would prove nothing about scoping.
 	classPublish(t, f.l.db, otherWS)
-	if err := igaread.NewReader(f.l.db, readTestCursorKey).Read(context.Background(), otherWS, igaread.Pin{},
+	if err := igaread.NewReader(f.l.db, readTestCursorKey).Read(wsCtx(context.Background(), otherWS), igaread.Pin{},
 		func(q *igaread.Query) error {
 			if !q.Published() {
 				t.Fatal("the other workspace is not published")
@@ -1041,7 +1041,7 @@ func TestP2ClassClockAndListingChanged(t *testing.T) {
 	r := igaread.NewReader(f.l.db, readTestCursorKey)
 	seqNow := func() int64 {
 		var s int64
-		if err := r.Read(context.Background(), f.l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+		if err := r.Read(wsCtx(context.Background(), f.l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 			var err error
 			s, err = igaread.ClassificationSeq(q)
 			return err
@@ -1051,7 +1051,7 @@ func TestP2ClassClockAndListingChanged(t *testing.T) {
 		return s
 	}
 	check := func(c *igaread.Cursor) *igaread.Error {
-		return igaread.AsError(r.Read(context.Background(), f.l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+		return igaread.AsError(r.Read(wsCtx(context.Background(), f.l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 			return igaread.CheckClassificationSeq(q, c)
 		}))
 	}
@@ -1059,7 +1059,7 @@ func TestP2ClassClockAndListingChanged(t *testing.T) {
 		t.Fatalf("seq before any decision = %d, want 0", s)
 	}
 	var rev int64
-	r.Read(context.Background(), f.l.ws, igaread.Pin{}, func(q *igaread.Query) error { rev = q.Rev.Rev; return nil })
+	r.Read(wsCtx(context.Background(), f.l.ws), igaread.Pin{}, func(q *igaread.Query) error { rev = q.Rev.Rev; return nil })
 	zero := int64(0)
 	page1 := &igaread.Cursor{ClassSeq: &zero}
 	if e := check(page1); e != nil {
@@ -1082,7 +1082,7 @@ func TestP2ClassClockAndListingChanged(t *testing.T) {
 		t.Fatalf("a classification cursor with no clock = %v, want 400 cursor_invalid", e)
 	}
 	// The revision did not move: classification is not part of one.
-	if err := r.Read(context.Background(), f.l.ws, igaread.Pin{Rev: &rev}, func(*igaread.Query) error { return nil }); err != nil {
+	if err := r.Read(wsCtx(context.Background(), f.l.ws), igaread.Pin{Rev: &rev}, func(*igaread.Query) error { return nil }); err != nil {
 		t.Fatalf("rev=%d after a decision = %v, want still current", rev, err)
 	}
 
@@ -1312,7 +1312,7 @@ func TestP2ClassLatestDecisionForTheDetail(t *testing.T) {
 	r := igaread.NewReader(f.l.db, readTestCursorKey)
 	latest := func() *igaread.LatestDecision {
 		var d *igaread.LatestDecision
-		if err := r.Read(context.Background(), f.l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+		if err := r.Read(wsCtx(context.Background(), f.l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 			var err error
 			d, err = igaread.LatestClassification(q, f.workload)
 			return err

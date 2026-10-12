@@ -1,14 +1,18 @@
 package services
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -193,6 +197,29 @@ func (m *sodManager) applicableRules(tx *gorm.DB, workspaceID uuid.UUID,
 	return out, nil
 }
 
+// userGroupsIn lists the groups a user belongs to in workspace ws, on tx. Never
+// nil: no groups is the empty array, which matches nothing.
+func userGroupsIn(tx *gorm.DB, ws, userID uuid.UUID) ([]uuid.UUID, error) {
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `SELECT group_id FROM user_groups WHERE workspace_id = $1 AND user_id = $2`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	groups := []uuid.UUID{}
+	for rows.Next() {
+		var g uuid.UUID
+		if err := rows.Scan(&g); err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
+}
+
 // expandSubject resolves everything a subject holds, optionally including a role about
 // to be bound.
 //
@@ -225,10 +252,13 @@ func (m *sodManager) expandSubject(tx *gorm.DB, workspaceID uuid.UUID,
 	case models.ProvenanceSubjectServiceAccount:
 		q = q.Where("rb.service_account_id = ?", subjectID)
 	case models.ProvenanceSubjectUser:
-		// Groups count: a permission held through a group is held.
-		q = q.Where(`(rb.user_id = ? OR rb.group_id IN
-		              (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ?))`,
-			subjectID, subjectID)
+		// Groups count: a permission held through a group is held -- the
+		// user's groups in this workspace.
+		groups, err := userGroupsIn(tx, workspaceID, subjectID)
+		if err != nil {
+			return nil, fmt.Errorf("expand subject: %w", err)
+		}
+		q = q.Where(`(rb.user_id = ? OR rb.group_id = ANY(?))`, subjectID, pq.Array(groups))
 	case models.ProvenanceSubjectGroup:
 		q = q.Where("rb.group_id = ?", subjectID)
 	default:
@@ -552,14 +582,6 @@ func (m *sodManager) ListRules(workspaceID uuid.UUID) ([]models.SoDRule, error) 
 }
 
 func (m *sodManager) ListViolations(workspaceID uuid.UUID, openOnly bool, limit, offset int) ([]models.SoDViolation, int64, error) {
-	q := m.db.Model(&models.SoDViolation{}).Where("workspace_id = ?", workspaceID)
-	if openOnly {
-		q = q.Where("status = ?", models.SoDViolationOpen)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -567,12 +589,29 @@ func (m *sodManager) ListViolations(workspaceID uuid.UUID, openOnly bool, limit,
 		offset = 0
 	}
 	var out []models.SoDViolation
-	// Critical first: a reviewer's attention should go to the worst thing, not the
-	// newest thing.
-	err := q.Order(`CASE (SELECT severity FROM sod_rules WHERE id = sod_violations.rule_id)
-	                  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`).
-		Order("detected_at DESC").Limit(limit).Offset(offset).Find(&out).Error
-	return out, total, err
+	var total int64
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(ctx, m.db, &sql.TxOptions{ReadOnly: true}, func(tx *gorm.DB, ws uuid.UUID) error {
+		q := tx.Model(&models.SoDViolation{}).Where("workspace_id = ?", ws)
+		if openOnly {
+			q = q.Where("status = ?", models.SoDViolationOpen)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		// Critical first: a reviewer's attention should go to the worst thing, not the
+		// newest thing. A rule is the workspace's own or a global one (NULL).
+		// TENANT-EXEMPT: runs on the tenancy.RLSTransaction tx of ListViolations
+		return q.Order(`CASE (SELECT severity FROM sod_rules
+		                       WHERE (workspace_id IS NULL OR workspace_id = sod_violations.workspace_id)
+		                         AND id = sod_violations.rule_id)
+		                  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`).
+			Order("detected_at DESC").Limit(limit).Offset(offset).Find(&out).Error
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
 }
 
 func (m *sodManager) ResolveViolation(workspaceID, violationID uuid.UUID,

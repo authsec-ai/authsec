@@ -5,34 +5,27 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
 // validateClientActive checks that a delegation policy's client_id references an
-// active ai_agent resource server in the given workspace. Phase B: the legacy
-// `clients` table was dropped; an "agent" is now a resource_servers row with
-// application_type='ai_agent'. The policy's client_id holds that resource_servers.id.
-func validateClientActive(clientID, workspaceID string) error {
-	masterDB := config.GetDatabase()
-	if masterDB == nil {
-		return fmt.Errorf("master database not initialized")
+// active ai_agent resource server in the request's workspace. An agent is a
+// resource_servers row with application_type='ai_agent'; the policy's
+// client_id holds that resource_servers.id. Another workspace's agent is
+// tenancy.ErrNotFound.
+func validateClientActive(c *gin.Context, clientID uuid.UUID) error {
+	db := config.GetDatabase()
+	if db == nil {
+		return fmt.Errorf("database not initialized")
 	}
-
-	query := `
+	var id uuid.UUID
+	return tenancy.QueryRow(c, db.DB, `
 		SELECT id FROM resource_servers
-		WHERE id::text = $1
-		AND workspace_id::text = $2
-		AND application_type = 'ai_agent'
-		AND active = true
-		AND deleted_at IS NULL
-		LIMIT 1
-	`
-	var id string
-	if err := masterDB.DB.QueryRow(query, clientID, workspaceID).Scan(&id); err != nil {
-		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
-	}
-	return nil
+		WHERE workspace_id = $1 AND id = $2
+		  AND application_type = 'ai_agent' AND active = true`,
+		[]interface{}{clientID}, &id)
 }
 
 // isDuplicateKeyError checks if an error is a PostgreSQL unique constraint violation.
@@ -63,15 +56,12 @@ func delegationContextString(c *gin.Context, key string) string {
 	}
 }
 
-// resolveDelegationWorkspaceID extracts the tenant UUID from the gin context.
+// resolveDelegationWorkspaceID returns the request's workspace from the
+// tenancy context set by the auth middleware.
 func resolveDelegationWorkspaceID(c *gin.Context) (*uuid.UUID, error) {
-	workspaceIDStr := delegationContextString(c, "workspace_id")
-	if workspaceIDStr == "" {
+	ws, err := tenancy.Workspace(c)
+	if err != nil {
 		return nil, fmt.Errorf("workspace_id not found in authentication token")
 	}
-	tid, err := uuid.Parse(workspaceIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid workspace_id in token: %w", err)
-	}
-	return &tid, nil
+	return &ws, nil
 }

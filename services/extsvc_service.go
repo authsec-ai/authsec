@@ -57,6 +57,10 @@ func (m *externalServiceManager) Create(in *repositories.ExternalService, client
 
 	in.ID = serviceID
 	in.CreatedBy = clientID
+	in.WorkspaceID = nil
+	if ws, err := uuid.Parse(workspaceID); err == nil {
+		in.WorkspaceID = &ws
+	}
 	in.VaultPath = vaultPath
 	in.CreatedAt = time.Now()
 	in.UpdatedAt = time.Now()

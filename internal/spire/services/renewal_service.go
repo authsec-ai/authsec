@@ -4,64 +4,57 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
-	"github.com/authsec-ai/authsec/internal/spire/infrastructure/database"
-	infraRepos "github.com/authsec-ai/authsec/internal/spire/infrastructure/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 )
 
-// RenewalService handles certificate renewal
+// RenewalService renews certificates of attested workloads of the workspace
+// carried by ctx.
 type RenewalService struct {
-	workloadRepo repositories.WorkloadRepository
-	certRepo     repositories.CertificateRepository
-	auditRepo    repositories.AuditRepository
-	workspaceRepo   repositories.WorkspaceRepository
-	vaultClient  *vault.Client
-	connManager  *database.ConnectionManager // For tenant-specific DB connections
-	logger       *logrus.Entry
+	workspaceRepo repositories.WorkspaceRepository
+	workloadRepo  repositories.WorkloadRepository
+	certRepo      repositories.CertificateRepository
+	auditRepo     repositories.AuditRepository
+	vaultClient   *vault.Client
+	logger        *logrus.Entry
 }
 
-// NewRenewalService creates a new renewal service
+// NewRenewalService creates the renewal service.
 func NewRenewalService(
+	workspaceRepo repositories.WorkspaceRepository,
 	workloadRepo repositories.WorkloadRepository,
 	certRepo repositories.CertificateRepository,
 	auditRepo repositories.AuditRepository,
-	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
-	connManager *database.ConnectionManager,
 	logger *logrus.Entry,
 ) *RenewalService {
 	return &RenewalService{
-		workloadRepo: workloadRepo,
-		certRepo:     certRepo,
-		auditRepo:    auditRepo,
-		workspaceRepo:   workspaceRepo,
-		vaultClient:  vaultClient,
-		connManager:  connManager,
-		logger:       logger,
+		workspaceRepo: workspaceRepo,
+		workloadRepo:  workloadRepo,
+		certRepo:      certRepo,
+		auditRepo:     auditRepo,
+		vaultClient:   vaultClient,
+		logger:        logger,
 	}
 }
 
-// RenewRequest represents a renewal request
+// RenewRequest is a certificate renewal.
 type RenewRequest struct {
-	WorkspaceID       string
 	WorkloadID     string
 	CSR            string
-	OldCertificate string // For validation
+	OldCertificate string
 	IPAddress      string
 	UserAgent      string
 }
 
-// RenewResponse represents a renewal response
+// RenewResponse is the renewed certificate.
 type RenewResponse struct {
 	Certificate  string
 	CAChain      []string
@@ -69,108 +62,77 @@ type RenewResponse struct {
 	SerialNumber string
 }
 
-// Renew renews a certificate
+// Renew issues a new certificate for a workload of ctx's workspace; another
+// workspace's workload is not found.
 func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewResponse, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id":   req.WorkspaceID,
-		"workload_id": req.WorkloadID,
-	}).Info("Starting certificate renewal")
-
-	// Validate tenant
-	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
+	workspaceID, err := workspaceFromContext(ctx)
 	if err != nil {
-		s.auditRenewal(ctx, req, false, err.Error())
 		return nil, err
 	}
-
-	if !tenant.IsActive() {
-		s.auditRenewal(ctx, req, false, "tenant not active")
-		return nil, errors.NewForbiddenError("Tenant is not active", nil)
-	}
-
-	// Get tenant-specific repositories
-	workloadRepo, certRepo, _, err := s.getWorkspaceRepositories(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, workspaceID)
 	if err != nil {
-		s.logger.WithError(err).Error("Failed to get tenant repositories")
-		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
+		return nil, errors.NewNotFoundError("Workspace not found", err)
 	}
-
-	// Get workload
-	workload, err := workloadRepo.GetByID(ctx, req.WorkspaceID, req.WorkloadID)
+	workload, err := s.workloadRepo.GetByID(ctx, req.WorkloadID)
 	if err != nil {
-		s.auditRenewal(ctx, req, false, "workload not found")
+		s.audit(ctx, req, false, "workload not found")
 		return nil, errors.NewNotFoundError("Workload not found", err)
 	}
-
 	if workload.Status != "active" {
-		s.auditRenewal(ctx, req, false, "workload not active")
+		s.audit(ctx, req, false, "workload not active")
 		return nil, errors.NewForbiddenError("Workload is not active", nil)
 	}
-
-	// Validate old certificate if provided
 	if req.OldCertificate != "" {
-		if err := s.validateOldCertificate(ctx, req.WorkspaceID, req.WorkloadID, req.OldCertificate); err != nil {
-			s.auditRenewal(ctx, req, false, "old certificate validation failed")
+		if err := s.validateOldCertificate(ctx, req.WorkloadID, req.OldCertificate); err != nil {
+			s.audit(ctx, req, false, "old certificate validation failed")
 			return nil, err
 		}
 	}
 
-	// Parse CSR
 	csrBlock, _ := pem.Decode([]byte(req.CSR))
 	if csrBlock == nil {
-		s.auditRenewal(ctx, req, false, "invalid CSR format")
+		s.audit(ctx, req, false, "invalid CSR format")
 		return nil, errors.NewBadRequestError("Invalid CSR format", nil)
 	}
-
-	csrParsed, err := x509.ParseCertificateRequest(csrBlock.Bytes)
+	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
 	if err != nil {
-		s.auditRenewal(ctx, req, false, "failed to parse CSR")
+		s.audit(ctx, req, false, "failed to parse CSR")
 		return nil, errors.NewBadRequestError("Failed to parse CSR", err)
 	}
-
-	// Validate CSR signature
-	if err := csrParsed.CheckSignature(); err != nil {
-		s.auditRenewal(ctx, req, false, "invalid CSR signature")
+	if err := csr.CheckSignature(); err != nil {
+		s.audit(ctx, req, false, "invalid CSR signature")
 		return nil, errors.NewBadRequestError("Invalid CSR signature", err)
 	}
 
-	// Issue new certificate from Vault
-	vaultReq := &vault.CertificateRequest{
+	if !s.vaultClient.Available() {
+		return nil, vault.ErrUnavailable
+	}
+	vaultResp, err := s.vaultClient.IssueCertificate(ctx, strings.TrimPrefix(tenant.VaultMount, "pki/"), workload.VaultRole, &vault.CertificateRequest{
 		CSR:        req.CSR,
 		CommonName: workload.SpiffeID,
-		TTL:        "24h", // Default TTL - should come from policy
+		TTL:        "24h",
 		URISANs:    []string{workload.SpiffeID},
-	}
-
-	// Remove redundant "pki/" prefix if present
-	cleanVaultMount := strings.TrimPrefix(tenant.VaultMount, "pki/")
-	vaultResp, err := s.vaultClient.IssueCertificate(ctx, cleanVaultMount, workload.VaultRole, vaultReq)
+	})
 	if err != nil {
-		s.auditRenewal(ctx, req, false, "vault issuance failed")
+		s.audit(ctx, req, false, "vault issuance failed")
 		return nil, err
 	}
 
-	// Store new certificate
-	cert := &models.Certificate{
-		ID:           uuid.New().String(),
-		WorkspaceID:     req.WorkspaceID,
-		WorkloadID:   workload.ID,
-		SerialNumber: vaultResp.SerialNumber,
-		SpiffeID:     workload.SpiffeID,
-		CertPEM:      vaultResp.Certificate,
-		CAChain:      vaultResp.CAChain,
-		IssuedAt:     time.Now(),
-		ExpiresAt:    vaultResp.ExpirationTime,
-		Status:       "active",
-		IssueType:    "renew",
-	}
-
-	if err := certRepo.Create(ctx, cert); err != nil {
+	if err := s.certRepo.Create(ctx, &models.Certificate{
+		WorkloadID:        workload.ID,
+		SerialNumber:      vaultResp.SerialNumber,
+		SHA256Fingerprint: vaultResp.SHA256Fingerprint,
+		SpiffeID:          workload.SpiffeID,
+		CertPEM:           vaultResp.Certificate,
+		CAChain:           vaultResp.CAChain,
+		IssuedAt:          time.Now(),
+		ExpiresAt:         vaultResp.ExpirationTime,
+		Status:            "active",
+		IssueType:         "renew",
+	}); err != nil {
 		s.logger.WithField("serial_number", vaultResp.SerialNumber).WithError(err).Error("Failed to store certificate")
 	}
-
-	// Audit success
-	s.auditRenewal(ctx, req, true, "")
+	s.audit(ctx, req, true, "")
 
 	return &RenewResponse{
 		Certificate:  vaultResp.Certificate,
@@ -180,79 +142,35 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 	}, nil
 }
 
-// getWorkspaceRepositories creates repositories connected to the tenant's database
-func (s *RenewalService) getWorkspaceRepositories(ctx context.Context, workspaceID string) (
-	repositories.WorkloadRepository,
-	repositories.CertificateRepository,
-	repositories.AuditRepository,
-	error,
-) {
-	// Get tenant database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	// Create tenant-specific repositories
-	workloadRepo := infraRepos.NewPostgresWorkloadRepository(tenantDB)
-	certRepo := infraRepos.NewPostgresCertificateRepository(tenantDB)
-	auditRepo := infraRepos.NewPostgresAuditRepository(tenantDB)
-
-	return workloadRepo, certRepo, auditRepo, nil
-}
-
-// validateOldCertificate validates the old certificate
-func (s *RenewalService) validateOldCertificate(ctx context.Context, workspaceID, workloadID, certPEM string) error {
-	// Parse certificate
+func (s *RenewalService) validateOldCertificate(ctx context.Context, workloadID, certPEM string) error {
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
 		return errors.NewBadRequestError("Invalid certificate format", nil)
 	}
-
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return errors.NewBadRequestError("Failed to parse certificate", err)
 	}
-
-	// Get active certificate for workload
-	activeCert, err := s.certRepo.GetActiveByWorkload(ctx, workspaceID, workloadID)
+	active, err := s.certRepo.GetActiveByWorkload(ctx, workloadID)
 	if err != nil {
 		return errors.NewForbiddenError("No active certificate found for workload", err)
 	}
-
-	// Verify serial numbers match
-	if cert.SerialNumber.String() != activeCert.SerialNumber {
+	if cert.SerialNumber.String() != active.SerialNumber {
 		return errors.NewForbiddenError("Certificate serial number mismatch", nil)
 	}
-
-	// Check if certificate is expiring (within renewal window)
-	renewalThreshold := 24 * time.Hour // Allow renewal within 24 hours of expiry
-	if !activeCert.IsExpiringSoon(renewalThreshold) {
-		s.logger.WithFields(logrus.Fields{
-			"serial_number": activeCert.SerialNumber,
-			"expires_at":    activeCert.ExpiresAt,
-		}).Warn("Certificate renewal requested but not yet in renewal window")
-	}
-
 	return nil
 }
 
-// auditRenewal creates an audit log entry for renewal
-func (s *RenewalService) auditRenewal(ctx context.Context, req *RenewRequest, success bool, errorMsg string) {
-	audit := &models.AuditLog{
-		WorkspaceID:     req.WorkspaceID,
+func (s *RenewalService) audit(ctx context.Context, req *RenewRequest, success bool, errorMsg string) {
+	if err := s.auditRepo.Create(ctx, &models.AuditLog{
 		EventType:    models.EventRenew,
 		WorkloadID:   req.WorkloadID,
 		Success:      success,
 		ErrorMessage: errorMsg,
-		Metadata: map[string]interface{}{
-			"workload_id": req.WorkloadID,
-		},
-		IPAddress: req.IPAddress,
-		UserAgent: req.UserAgent,
-	}
-
-	if err := s.auditRepo.Create(ctx, audit); err != nil {
+		Metadata:     map[string]interface{}{"workload_id": req.WorkloadID},
+		IPAddress:    req.IPAddress,
+		UserAgent:    req.UserAgent,
+	}); err != nil {
 		s.logger.WithError(err).Error("Failed to create audit log")
 	}
 }

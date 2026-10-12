@@ -160,8 +160,10 @@ func TestP3T312ReviewRoutes(t *testing.T) {
 	if code, body := api.call(http.MethodPost, rp+"/respond", tOut, map[string]any{"response": "acknowledge"}); code != http.StatusForbidden || errCode(body) != "not_review_owner" {
 		t.Fatalf("respond as non-owner: %d %v", code, body)
 	}
-	if code, body := api.call(http.MethodPost, rp+"/respond", t1, map[string]any{"response": "acknowledge", "workspace_id": other.ws}); code != http.StatusBadRequest {
-		t.Fatalf("unknown body member: %d %v", code, body)
+	// Another workspace named in the body is refused at the edge as a missing
+	// object (AuthMiddleware, ADR-0001 §4.3).
+	if code, body := api.call(http.MethodPost, rp+"/respond", t1, map[string]any{"response": "acknowledge", "workspace_id": other.ws}); code != http.StatusNotFound {
+		t.Fatalf("foreign body workspace: %d %v", code, body)
 	}
 	if code, body := api.call(http.MethodPost, rp+"/respond", t1, map[string]any{"response": "retain"}); code != http.StatusBadRequest || digs(body, "error", "detail", "parameter") != "retain_items" {
 		t.Fatalf("retain without items: %d %v", code, body)

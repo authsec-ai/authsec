@@ -571,7 +571,7 @@ func evidenceClaimLimitations(t *testing.T, l *p2Lab, claims []string, codes map
 		refs = append(refs, r)
 	}
 	var out map[string][]igaread.Limitation
-	err := igaread.NewReader(l.db, readTestCursorKey).Read(context.Background(), l.ws, igaread.Pin{}, func(q *igaread.Query) error {
+	err := igaread.NewReader(l.db, readTestCursorKey).Read(wsCtx(context.Background(), l.ws), igaread.Pin{}, func(q *igaread.Query) error {
 		accts, err := q.LoadAccounts()
 		if err != nil {
 			return err

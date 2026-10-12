@@ -44,9 +44,11 @@ func buildBootstrapTemplate(adminDSN, templateName, migrationsDir, host, port st
 	defer adminDB.Close()
 
 	// Terminate any connections before dropping.
+	// TENANT-EXEMPT: test harness, Postgres catalog (pg_stat_activity, pg_database)
 	_, _ = adminDB.Exec(fmt.Sprintf(
 		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s'`, templateName,
 	))
+	// TENANT-EXEMPT: test harness, Postgres catalog
 	_, _ = adminDB.Exec(fmt.Sprintf(`UPDATE pg_database SET datistemplate=false WHERE datname='%s'`, templateName))
 	_, _ = adminDB.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, templateName))
 	if _, err := adminDB.Exec(fmt.Sprintf(`CREATE DATABASE %q`, templateName)); err != nil {
@@ -92,6 +94,7 @@ func buildBootstrapTemplate(adminDSN, templateName, migrationsDir, host, port st
 	_ = rawDB.Close()
 
 	// Step 3: mark as template so `CREATE DATABASE ... TEMPLATE` works.
+	// TENANT-EXEMPT: test harness, Postgres catalog
 	if _, err := adminDB.Exec(fmt.Sprintf(`UPDATE pg_database SET datistemplate=true WHERE datname='%s'`, templateName)); err != nil {
 		return fmt.Errorf("mark template: %w", err)
 	}
@@ -99,6 +102,7 @@ func buildBootstrapTemplate(adminDSN, templateName, migrationsDir, host, port st
 	// Belt-and-suspenders: terminate any straggler backends still attached to the
 	// template (e.g. a pool connection that hasn't fully torn down) so the
 	// immediate clone in the caller doesn't race them.
+	// TENANT-EXEMPT: test harness, Postgres catalog
 	_, _ = adminDB.Exec(fmt.Sprintf(
 		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()`, templateName,
 	))

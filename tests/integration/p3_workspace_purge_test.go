@@ -49,6 +49,7 @@ import (
 	"github.com/authsec-ai/authsec/controllers/enduser"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/internal/iacpr"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -84,6 +85,11 @@ func newP3pAPI(t *testing.T, db *gorm.DB) *p3pAPI {
 	eng := gin.New()
 	as := func(c *gin.Context) {
 		c.Set("user_info", &middlewares.UserInfo{WorkspaceID: c.GetHeader("X-P3p-Workspace"), UserID: uuid.NewString(), Email: "op@p3purge.test"})
+		// What AuthMiddleware sets for the caller's workspace (Phase 6).
+		if ws, err := uuid.Parse(c.GetHeader("X-P3p-Workspace")); err == nil {
+			principal, _ := uuid.Parse(c.GetHeader("X-P3p-Principal"))
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: principal, PrincipalKind: "user"})
+		}
 		c.Next()
 	}
 	eng.DELETE("/authsec/uflow/admin/tenants/:workspace_id", as, ctl.DeleteTenant)
@@ -92,6 +98,10 @@ func newP3pAPI(t *testing.T, db *gorm.DB) *p3pAPI {
 }
 
 func (a *p3pAPI) do(method, path, callerWS string, body any) (int, map[string]any) {
+	return a.doAs(method, path, callerWS, "", body)
+}
+
+func (a *p3pAPI) doAs(method, path, callerWS, principal string, body any) (int, map[string]any) {
 	a.t.Helper()
 	var rd *bytes.Reader
 	if body != nil {
@@ -103,6 +113,7 @@ func (a *p3pAPI) do(method, path, callerWS string, body any) (int, map[string]an
 	req := httptest.NewRequest(method, path, rd)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-P3p-Workspace", callerWS)
+	req.Header.Set("X-P3p-Principal", principal)
 	w := httptest.NewRecorder()
 	a.eng.ServeHTTP(w, req)
 	var out map[string]any
@@ -110,9 +121,14 @@ func (a *p3pAPI) do(method, path, callerWS string, body any) (int, map[string]an
 	return w.Code, out
 }
 
-// purge deletes a workspace as a super admin through the production route.
+// purge deletes a workspace through the production route as its owner, the
+// only caller allowed to (there is no platform super admin, ADR-0001 §7).
 func (a *p3pAPI) purge(ws uuid.UUID) (int, map[string]any) {
-	return a.do(http.MethodDelete, "/authsec/uflow/admin/tenants/"+ws.String(), "admin", nil)
+	var owner string
+	if err := config.DB.Raw(`SELECT owner_user_id::text FROM workspaces WHERE id = ?`, ws).Row().Scan(&owner); err != nil {
+		a.t.Fatalf("owner of %s: %v", ws, err)
+	}
+	return a.doAs(http.MethodDelete, "/authsec/uflow/admin/tenants/"+ws.String(), ws.String(), owner, nil)
 }
 
 // deleteUser hard-deletes an end user as an admin of ws.

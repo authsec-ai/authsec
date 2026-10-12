@@ -518,8 +518,13 @@ func TestP2IngestTokenAdminEndpoints(t *testing.T) {
 		}
 	}
 
-	// Mint as A naming B in the body: the token is A's.
-	code, minted, raw := l.do(http.MethodPost, base, adminA, map[string]any{"workspace_id": l.wsB.String(), "label": "prod"})
+	// Naming B in the body is refused as not found: AuthMiddleware rejects any
+	// body workspace other than the token's (ADR-0001 §4.1).
+	if code, _, raw := l.do(http.MethodPost, base, adminA, map[string]any{"workspace_id": l.wsB.String(), "label": "prod"}); code != http.StatusNotFound {
+		t.Fatalf("mint naming another workspace: %d %s, want 404", code, raw)
+	}
+	// Mint as A: the token is A's.
+	code, minted, raw := l.do(http.MethodPost, base, adminA, map[string]any{"label": "prod"})
 	if code != http.StatusCreated {
 		t.Fatalf("mint: %d %s", code, raw)
 	}

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -1445,10 +1446,21 @@ func (m *igaManager) AcceptWebhook(in WebhookInput) (*WebhookResult, error) {
 		return nil, repositories.ErrIGASignature
 	}
 
-	// 2. Binding resolved server-side. The payload's installation id is a
+	// 2. Binding resolved server-side. The installation id comes from the
+	//    SIGNED body (installation.id), never from a request header, which the
+	//    signature does not cover (AS-072): a captured delivery replayed with
+	//    another installation header must not land in another workspace. A
+	//    header that disagrees with the body is refused outright. The id is a
 	//    lookup key, never an authorization: it selects a row that must already
 	//    be verified and active, and the workspace comes from THAT row.
-	integ, err := m.repo.ResolveBinding(in.AppRegistrationID, in.InstallationID)
+	installationID := webhookInstallationID(in.Body)
+	var integ *models.IGAIntegration
+	var err error
+	if installationID == "" || (in.InstallationID != "" && in.InstallationID != installationID) {
+		err = repositories.ErrIGABindingFailed
+	} else {
+		integ, err = m.repo.ResolveBinding(in.AppRegistrationID, installationID)
+	}
 	if err != nil {
 		_ = m.repo.RecordRejectedDelivery(&models.IGAWebhookDelivery{
 			ID: uuid.New(), AppRegistrationID: in.AppRegistrationID, DeliveryID: in.DeliveryID,
@@ -1478,6 +1490,30 @@ func (m *igaManager) AcceptWebhook(in WebhookInput) (*WebhookResult, error) {
 		return nil, err
 	}
 	return &WebhookResult{Accepted: true, Redelivery: redelivery}, nil
+}
+
+// webhookInstallationID returns installation.id from a GitHub App webhook
+// body (a number from GitHub; a string is accepted too), or "".
+func webhookInstallationID(body []byte) string {
+	var p struct {
+		Installation struct {
+			ID json.RawMessage `json:"id"`
+		} `json:"installation"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil || len(p.Installation.ID) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(p.Installation.ID, &s); err == nil {
+		return s
+	}
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(p.Installation.ID))
+	dec.UseNumber()
+	if err := dec.Decode(&n); err == nil {
+		return n.String()
+	}
+	return ""
 }
 
 // verifyGitHubSignature checks X-Hub-Signature-256 with a timing-safe compare.

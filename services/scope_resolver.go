@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
@@ -269,8 +270,8 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 	// end-user that somehow slipped past Phase A admin tooling doesn't silently
 	// look like "allowed".
 	var endUserStatus string
-	row := r.db.WithContext(ctx).
-		Raw(`SELECT status FROM workspace_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, workspaceUUID, userID).
+	row := tenancy.GormRaw(inWorkspace(ctx, workspaceUUID), r.db,
+		`SELECT status FROM workspace_end_user_states WHERE workspace_id = $1 AND user_id::text = $2 LIMIT 1`, userID).
 		Row()
 	if scanErr := row.Scan(&endUserStatus); scanErr == nil && endUserStatus != "" && endUserStatus != "active" {
 		return result, nil
@@ -299,7 +300,8 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
 		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
-		Where("(rb.user_id::text = ? OR rb.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id::text = ?))", userID, userID).
+		// TENANT-EXEMPT: GORM builder; every joined table is bound to workspaceUUID below, and the group subquery here
+		Where("(rb.user_id::text = ? OR rb.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.workspace_id = ? AND ug.user_id::text = ?))", userID, workspaceUUID, userID).
 		Where("(rb.workspace_id IS NULL OR rb.workspace_id = ?)", workspaceUUID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(ro.workspace_id IS NULL OR ro.workspace_id = ?)", workspaceUUID).
@@ -530,9 +532,8 @@ func (r *ScopeResolver) resolveServiceAccountEffectiveScopes(
 
 	// Gate: SA must be active.
 	var saStatus string
-	row := r.db.WithContext(ctx).
-		Raw(`SELECT status FROM service_accounts WHERE workspace_id = ? AND id = ? LIMIT 1`,
-			workspaceUUID, saUUID).Row()
+	row := tenancy.GormRaw(inWorkspace(ctx, workspaceUUID), r.db,
+		`SELECT status FROM service_accounts WHERE workspace_id = $1 AND id = $2 LIMIT 1`, saUUID).Row()
 	if scanErr := row.Scan(&saStatus); scanErr != nil || saStatus != "active" {
 		return result, nil
 	}

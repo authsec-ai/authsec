@@ -3,190 +3,83 @@ package repositories
 import (
 	"context"
 	"database/sql"
-	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 )
 
-// PostgresWorkspaceRepository implements the WorkspaceRepository interface
-// using the `workspaces` table (the canonical workspace identity table).
+// PostgresWorkspaceRepository reads the workspace registry (workspaces).
+// workspaces is the tenant table itself, not tenant-owned data: each
+// statement selects one workspace by its own id or domain, which the caller
+// took from a verified credential (a token's claim, a certificate's trust
+// domain, a join token's row) or from the authenticated request.
 type PostgresWorkspaceRepository struct {
 	db *sql.DB
 }
 
+// NewPostgresWorkspaceRepository creates the workspace registry reader.
 func NewPostgresWorkspaceRepository(db *sql.DB) repositories.WorkspaceRepository {
 	return &PostgresWorkspaceRepository{db: db}
 }
 
+func (r *PostgresWorkspaceRepository) get(ctx context.Context, query string, arg interface{}) (*models.Tenant, error) {
+	t := &models.Tenant{}
+	// TENANT-EXEMPT: workspace registry row selected by its own id or domain (see type comment).
+	err := r.db.QueryRowContext(ctx, query, arg).Scan(&t.ID, &t.Name, &t.VaultMount, &t.Domain, &t.Status, &t.CreatedAt, &t.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, errors.NewNotFoundError("Workspace not found", err)
+	}
+	if err != nil {
+		return nil, errors.NewInternalError("Failed to get workspace", err)
+	}
+	return t, nil
+}
+
+// GetByID returns the active workspace with this id.
 func (r *PostgresWorkspaceRepository) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
-	query := `
-		SELECT
-			id::text,
-			name,
-			COALESCE(vault_mount, workspace_domain) as vault_mount,
-			status,
-			created_at,
-			updated_at
-		FROM workspaces
-		WHERE id = $1::uuid AND status = 'active'
-	`
-
-	tenant := &models.Tenant{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&tenant.ID,
-		&tenant.Name,
-		&tenant.VaultMount,
-		&tenant.Status,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Workspace not found", err)
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, errors.NewNotFoundError("Workspace not found", nil)
 	}
-	if err != nil {
-		return nil, errors.NewInternalError("Failed to get workspace", err)
-	}
-
-	return tenant, nil
+	// TENANT-EXEMPT: workspace registry row selected by its own id.
+	return r.get(ctx, `SELECT id::text, COALESCE(name, ''), COALESCE(vault_mount, ''), COALESCE(workspace_domain, ''), COALESCE(status, ''), created_at, updated_at
+		FROM workspaces WHERE id = $1::uuid AND status = 'active'`, id)
 }
 
+// GetByDomain returns the active workspace with this domain.
 func (r *PostgresWorkspaceRepository) GetByDomain(ctx context.Context, domain string) (*models.Tenant, error) {
-	query := `
-		SELECT
-			id::text,
-			name,
-			COALESCE(vault_mount, workspace_domain) as vault_mount,
-			status,
-			created_at,
-			updated_at
-		FROM workspaces
-		WHERE workspace_domain = $1 AND status = 'active'
-	`
-
-	tenant := &models.Tenant{}
-	err := r.db.QueryRowContext(ctx, query, domain).Scan(
-		&tenant.ID,
-		&tenant.Name,
-		&tenant.VaultMount,
-		&tenant.Status,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Workspace not found", err)
+	if domain == "" {
+		return nil, errors.NewNotFoundError("Workspace not found", nil)
 	}
-	if err != nil {
-		return nil, errors.NewInternalError("Failed to get workspace", err)
-	}
-
-	return tenant, nil
+	// TENANT-EXEMPT: workspace registry row selected by its own domain.
+	return r.get(ctx, `SELECT id::text, COALESCE(name, ''), COALESCE(vault_mount, ''), COALESCE(workspace_domain, ''), COALESCE(status, ''), created_at, updated_at
+		FROM workspaces WHERE lower(workspace_domain) = lower($1) AND status = 'active'`, domain)
 }
 
-func (r *PostgresWorkspaceRepository) Create(ctx context.Context, tenant *models.Tenant) error {
-	query := `
-		INSERT INTO workspaces (id, name, vault_mount, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`
-
-	now := time.Now()
-	tenant.CreatedAt = now
-	tenant.UpdatedAt = now
-	if tenant.Status == "" {
-		tenant.Status = "active"
+// GetByTrustDomain maps a SPIFFE trust domain to an active workspace: the
+// embedded control plane names a workspace's trust domain by its id
+// (spiffe://<workspace_id>/...); a workspace domain is accepted too.
+func (r *PostgresWorkspaceRepository) GetByTrustDomain(ctx context.Context, trustDomain string) (*models.Tenant, error) {
+	if _, err := uuid.Parse(trustDomain); err == nil {
+		return r.GetByID(ctx, trustDomain)
 	}
-
-	_, err := r.db.ExecContext(ctx, query,
-		tenant.ID, tenant.Name, tenant.VaultMount, tenant.Status,
-		tenant.CreatedAt, tenant.UpdatedAt,
-	)
-	if err != nil {
-		return errors.NewInternalError("Failed to create workspace", err)
-	}
-	return nil
+	return r.GetByDomain(ctx, trustDomain)
 }
 
-func (r *PostgresWorkspaceRepository) Update(ctx context.Context, tenant *models.Tenant) error {
-	query := `
-		UPDATE workspaces
-		SET name = $2, vault_mount = $3, status = $4, updated_at = $5
-		WHERE id = $1
-	`
-
-	tenant.UpdatedAt = time.Now()
-
-	result, err := r.db.ExecContext(ctx, query,
-		tenant.ID, tenant.Name, tenant.VaultMount, tenant.Status, tenant.UpdatedAt,
-	)
+// UpdateVaultMount records the workspace's PKI mount.
+func (r *PostgresWorkspaceRepository) UpdateVaultMount(ctx context.Context, id, vaultMount string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return errors.NewNotFoundError("Workspace not found", nil)
+	}
+	// TENANT-EXEMPT: writes the workspace registry row itself, selected by its own id.
+	res, err := r.db.ExecContext(ctx, `UPDATE workspaces SET vault_mount = $2, updated_at = now() WHERE id = $1::uuid`, id, vaultMount)
 	if err != nil {
 		return errors.NewInternalError("Failed to update workspace", err)
 	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-	if rows == 0 {
+	if n, _ := res.RowsAffected(); n == 0 {
 		return errors.NewNotFoundError("Workspace not found", nil)
 	}
 	return nil
-}
-
-func (r *PostgresWorkspaceRepository) Delete(ctx context.Context, id string) error {
-	query := `
-		UPDATE workspaces
-		SET status = 'deleted', updated_at = $2
-		WHERE id = $1
-	`
-
-	result, err := r.db.ExecContext(ctx, query, id, time.Now())
-	if err != nil {
-		return errors.NewInternalError("Failed to delete workspace", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-	if rows == 0 {
-		return errors.NewNotFoundError("Workspace not found", nil)
-	}
-	return nil
-}
-
-func (r *PostgresWorkspaceRepository) List(ctx context.Context) ([]*models.Tenant, error) {
-	query := `
-		SELECT id, name, vault_mount, status, created_at, updated_at
-		FROM workspaces
-		WHERE status = 'active'
-		ORDER BY created_at DESC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, errors.NewInternalError("Failed to list workspaces", err)
-	}
-	defer rows.Close()
-
-	var tenants []*models.Tenant
-	for rows.Next() {
-		tenant := &models.Tenant{}
-		err := rows.Scan(
-			&tenant.ID, &tenant.Name, &tenant.VaultMount,
-			&tenant.Status, &tenant.CreatedAt, &tenant.UpdatedAt,
-		)
-		if err != nil {
-			return nil, errors.NewInternalError("Failed to scan workspace", err)
-		}
-		tenants = append(tenants, tenant)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, errors.NewInternalError("Error iterating workspaces", err)
-	}
-
-	return tenants, nil
 }

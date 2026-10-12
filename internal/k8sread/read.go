@@ -26,10 +26,13 @@
 package k8sread
 
 import (
+	"context"
+	"database/sql"
 	"sort"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -41,7 +44,32 @@ type Query struct {
 	WS uuid.UUID
 }
 
+// New binds a read to ws over tx. Callers outside a scoped transaction use
+// Read; igaread uses New inside its own snapshot, whose workspace it passes.
 func New(tx *gorm.DB, ws uuid.UUID) *Query { return &Query{tx: tx, WS: ws} }
+
+// Read runs fn over one read-only snapshot of the workspace that the tenant
+// context of ctx carries (the token's; tenancy.WithContext for a job), under
+// Postgres row-level security for that workspace. Without a tenant context it
+// returns tenancy.ErrNoTenant and runs nothing.
+func Read(ctx context.Context, db *gorm.DB, fn func(q *Query) error) error {
+	opts := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
+	return tenancy.RLSTransaction(ctx, db, opts, func(tx *gorm.DB, ws uuid.UUID) error {
+		return fn(New(tx, ws))
+	})
+}
+
+// HasIdentity reports whether id is a Kubernetes identity of the workspace's
+// graph -- a ServiceAccount, User or Group (AccountKinds, D-113). Another
+// workspace's id is false, like an unknown one.
+func (q *Query) HasIdentity(id uuid.UUID) (bool, error) {
+	var n int64
+	err := q.tx.Table("iga_identity_accounts").
+		Where("workspace_id = ? AND provider = ? AND account_kind IN ? AND id = ?",
+			q.WS, models.ProviderK8s, AccountKinds, id).
+		Count(&n).Error
+	return n > 0, err
+}
 
 // Coverage states. A vocabulary, never a number.
 const (

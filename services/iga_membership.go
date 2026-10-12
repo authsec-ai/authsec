@@ -130,7 +130,7 @@ func (m *legacyMembership) Members(
 		return cached, nil
 	}
 
-	rows, err := m.users.GetUsersByWorkspaceID(workspaceID, membershipPageCap, 0)
+	rows, err := m.users.GetUsersByWorkspaceID(database.WithWorkspace(ctx, workspaceID), membershipPageCap, 0)
 	if err != nil {
 		// Serve the stale snapshot rather than nothing: browsing an inventory
 		// may continue during an outage. The caller decides whether its own

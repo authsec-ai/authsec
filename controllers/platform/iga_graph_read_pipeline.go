@@ -35,7 +35,7 @@ func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{}, func(q *igaread.Query) error {
+		err := g.Reader.Read(c.Request.Context(), igaread.Pin{}, func(q *igaread.Query) error {
 			view, err := q.Pipeline()
 			if err != nil {
 				return err
@@ -68,7 +68,7 @@ func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
+		err := g.Reader.Read(c.Request.Context(), igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
 			data, err := q.Coverage(accounts)
 			if err != nil {
 				return err

@@ -1,10 +1,12 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -71,6 +73,8 @@ const workspaceSelectColsFromAlias = `w.id, COALESCE(w.email, ''), COALESCE(w.pa
 
 // CreateTenant inserts a workspace identity row.
 func (tr *WorkspaceRepository) CreateTenant(t *models.Tenant) error {
+	// TENANT-EXEMPT: workspaces is the tenant registry itself (no
+	// workspace_id column); this creates a new tenant at sign-up.
 	query := `
 		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -93,6 +97,7 @@ func (tr *WorkspaceRepository) CreateTenant(t *models.Tenant) error {
 
 // GetWorkspaceByEmail retrieves a workspace identity by email (case-insensitive).
 func (tr *WorkspaceRepository) GetWorkspaceByEmail(email string) (*models.Tenant, error) {
+	// TENANT-EXEMPT: pre-auth registry lookup (sign-up / sign-in by email).
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE LOWER(email) = LOWER($1)`
 	t := &models.Tenant{}
 	err := scanWorkspaceRow(tr.db.QueryRow(query, email), t)
@@ -107,6 +112,7 @@ func (tr *WorkspaceRepository) GetWorkspaceByEmail(email string) (*models.Tenant
 
 // GetWorkspaceByWorkspaceID retrieves a workspace by its ID (workspace_id == id).
 func (tr *WorkspaceRepository) GetWorkspaceByWorkspaceID(workspaceID string) (*models.Tenant, error) {
+	// TENANT-EXEMPT: registry row of a workspace the caller already resolved.
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE id = $1`
 	t := &models.Tenant{}
 	err := scanWorkspaceRow(tr.db.QueryRow(query, workspaceID), t)
@@ -119,18 +125,6 @@ func (tr *WorkspaceRepository) GetWorkspaceByWorkspaceID(workspaceID string) (*m
 	return t, nil
 }
 
-// UpdateWorkspaceDB is a no-op under the single-DB collapse (workspaces has no workspace_db column).
-func (tr *WorkspaceRepository) UpdateWorkspaceDB(workspaceID uuid.UUID, dbName string) error {
-	return nil
-}
-
-// UpdateTenantLogin is a no-op under the workspaces schema (no last_login column on workspaces yet).
-// If last-login tracking is needed it should live on admin_users or a sessions row.
-func (tr *WorkspaceRepository) UpdateTenantLogin(workspaceID uuid.UUID) error {
-	_, err := tr.db.Exec(`UPDATE workspaces SET updated_at = $1 WHERE id = $2`, time.Now(), workspaceID)
-	return err
-}
-
 // TenantExists checks whether a workspace identity exists for the given email.
 func (tr *WorkspaceRepository) TenantExists(email string) (bool, error) {
 	if tr.db == nil || tr.db.DB == nil {
@@ -139,6 +133,7 @@ func (tr *WorkspaceRepository) TenantExists(email string) (bool, error) {
 	if err := tr.db.DB.Ping(); err != nil {
 		return false, fmt.Errorf("database connection failed: %w", err)
 	}
+	// TENANT-EXEMPT: pre-auth sign-up check across the tenant registry.
 	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE LOWER(email) = LOWER($1))`
 	var exists bool
 	err := tr.db.QueryRow(query, email).Scan(&exists)
@@ -148,146 +143,97 @@ func (tr *WorkspaceRepository) TenantExists(email string) (bool, error) {
 	return exists, nil
 }
 
-// TenantExistsByWorkspaceID checks whether a workspace exists with the given ID.
-func (tr *WorkspaceRepository) TenantExistsByWorkspaceID(workspaceID string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`
-	var exists bool
-	err := tr.db.QueryRow(query, workspaceID).Scan(&exists)
-	return exists, err
-}
-
-// CreateTenantTx inserts a workspace identity row within a transaction.
-func (tr *WorkspaceRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
-	query := `
-		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
-	now := time.Now()
-	if t.ID == uuid.Nil {
-		t.ID = uuid.New()
-	}
-	if t.CreatedAt.IsZero() {
-		t.CreatedAt = now
-	}
-	if t.UpdatedAt.IsZero() {
-		t.UpdatedAt = now
-	}
-	_, err := tx.Exec(query,
-		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.WorkspaceDomain, t.CreatedAt, t.UpdatedAt,
-	)
-	return err
-}
-
-// UpdateWorkspaceDBTx is a no-op under the single-DB collapse.
-func (tr *WorkspaceRepository) UpdateWorkspaceDBTx(tx *sql.Tx, workspaceID uuid.UUID, dbName string) error {
-	return nil
-}
-
-// GetAllTenants retrieves every workspace identity row.
-func (tr *WorkspaceRepository) GetAllTenants() ([]*models.Tenant, error) {
-	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces ORDER BY created_at DESC`
-	rows, err := tr.db.Query(query)
+// DeleteTenant permanently deletes the workspace carried by ctx and its
+// scoped rows, under row-level security for that workspace.
+func (tr *WorkspaceRepository) DeleteTenant(ctx context.Context) (map[string]int64, error) {
+	workspaceID, err := ctxWorkspace(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query workspaces: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-
-	var out []*models.Tenant
-	for rows.Next() {
-		t := &models.Tenant{}
-		if err := scanWorkspaceRow(rows, t); err != nil {
-			return nil, fmt.Errorf("failed to scan workspace row: %w", err)
-		}
-		out = append(out, t)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating workspace rows: %w", err)
-	}
-	return out, nil
-}
-
-// UpdateTenantStatusTx updates a workspace's status within a transaction.
-func (tr *WorkspaceRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid.UUID, status string) error {
-	query := `UPDATE workspaces SET status = $1, updated_at = $2 WHERE id = $3`
-	result, err := tx.Exec(query, status, time.Now(), workspaceID)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return fmt.Errorf("workspace not found")
-	}
-	return nil
-}
-
-// DeleteTenant permanently deletes a workspace and all related scoped rows.
-//
-// The purge runs in one transaction, in this order (review P0-1):
-//
-//  1. SET LOCAL authsec.workspace_purge = 'on' -- the only way past 052's
-//     append-only trigger on iga_gov_event (iga_gov_event_immutable), which
-//     the workspace cascade reaches. LOCAL: it ends with this transaction.
-//  2. role_bindings, role_permissions, then workspace_memberships BEFORE
-//     roles (workspace_memberships_role_workspace_fk is ON DELETE RESTRICT,
-//     so a role still held by a membership refuses its delete), then roles,
-//     permissions, oauth_scopes (its workspace key is NO ACTION) and
-//     totp_secrets. roles and permissions have no key to workspaces at all.
-//  3. iga_lifecycle_event BEFORE the workspace: 036's iga_le_publication_fkey
-//     is ON DELETE RESTRICT, which PostgreSQL never defers, so the cascade
-//     from workspaces to iga_publication is refused while the events citing
-//     those revisions still exist (P2-DECISIONS D-94).
-//  4. workspaces -- cascades to every workspace-scoped row, including every
-//     Phase 3 table (047-056) and its audit records.
-//  5. user_groups and users LAST: the Phase 3 audit records name users
-//     through ON DELETE NO ACTION keys (created_by, decided_by, accepted_by,
-//     exception_by, consented_by, installed_by, ...), so the users can go
-//     only once the workspace's records are gone. A user of this workspace
-//     still named by ANOTHER workspace's records is refused with
-//     *UserAuditHistoryError and nothing is deleted: those records must
-//     survive.
-func (tr *WorkspaceRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int64, error) {
 	deletedCounts := make(map[string]int64)
-
-	tx, err := tr.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to start transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(`SET LOCAL authsec.workspace_purge = 'on'`); err != nil {
-		return nil, fmt.Errorf("failed to enter workspace purge mode: %w", err)
-	}
-
-	for _, step := range []struct{ table, query string }{
-		{"role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1"},
-		{"role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)"},
-		{"workspace_memberships", "DELETE FROM workspace_memberships WHERE workspace_id = $1"},
-		{"roles", "DELETE FROM roles WHERE workspace_id = $1"},
-		{"permissions", "DELETE FROM permissions WHERE workspace_id = $1"},
-		{"oauth_scopes", "DELETE FROM oauth_scopes WHERE workspace_id = $1"},
-		{"totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1"},
-		{"iga_lifecycle_event", "DELETE FROM iga_lifecycle_event WHERE workspace_id = $1"},
-		{"workspaces", "DELETE FROM workspaces WHERE id = $1"},
-		{"user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)"},
-		{"users", "DELETE FROM users WHERE workspace_id = $1"},
-	} {
-		result, err := tx.Exec(step.query, workspaceID)
-		if err != nil {
-			if step.table == "users" {
-				err = ClassifyUserDeleteError(err)
+	// deleted records the rows one scoped statement removed from table.
+	deleted := func(table string) func(sql.Result, error) error {
+		return func(result sql.Result, err error) error {
+			if err != nil {
+				return fmt.Errorf("failed to delete from %s: %w", table, err)
 			}
-			return nil, fmt.Errorf("failed to delete from %s: %w", step.table, err)
-		}
-		if rows, err := result.RowsAffected(); err == nil {
-			deletedCounts[step.table] = rows
+			if rows, err := result.RowsAffected(); err == nil {
+				deletedCounts[table] = rows
+			}
+			return nil
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	err = tenancy.WithTx(ctx, tr.db.DB, workspaceID, func(tx *sql.Tx) error {
+		// The only way past 052's append-only trigger on iga_gov_event, which
+		// the workspace cascade reaches; LOCAL ends with this transaction.
+		// TENANT-EXEMPT: sets a transaction-local flag; no table is read or written.
+		if _, err := tx.ExecContext(ctx, `SET LOCAL authsec.workspace_purge = 'on'`); err != nil {
+			return fmt.Errorf("failed to enter workspace purge mode: %w", err)
+		}
+		// Order (review P0-1): bindings and permissions, then memberships
+		// before roles (workspace_memberships_role_workspace_fk is RESTRICT);
+		// iga_lifecycle_event before the workspace (036's publication key is
+		// RESTRICT, never deferred); the workspace itself, whose cascade takes
+		// every workspace-scoped row and its audit records; users last, since
+		// those records name users through NO ACTION keys.
+		if err := deleted("role_bindings")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_bindings WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("role_permissions")(tenancy.ExecContext(ctx, tx, "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		if err := deleted("workspace_memberships")(tenancy.ExecContext(ctx, tx, "DELETE FROM workspace_memberships WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("roles")(tenancy.ExecContext(ctx, tx, "DELETE FROM roles WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("permissions")(tenancy.ExecContext(ctx, tx, "DELETE FROM permissions WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("oauth_scopes")(tenancy.ExecContext(ctx, tx, "DELETE FROM oauth_scopes WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("totp_secrets")(tenancy.ExecContext(ctx, tx, "DELETE FROM totp_secrets WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		if err := deleted("iga_lifecycle_event")(tenancy.ExecContext(ctx, tx, "DELETE FROM iga_lifecycle_event WHERE workspace_id = $1")); err != nil {
+			return err
+		}
+		// The workspace's users go with it (users.workspace_id cascades), in
+		// the same statement as the audit records naming them: count first.
+		var users int64
+		if err := tenancy.QueryRowContext(ctx, tx, "SELECT count(*) FROM users WHERE workspace_id = $1", nil, &users); err != nil {
+			return fmt.Errorf("failed to count users: %w", err)
+		}
+		// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id
+		// column); this removes the registry row of the scoped workspace.
+		result, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, workspaceID)
+		if err != nil {
+			// A user of this workspace still named by another workspace's
+			// records: *UserAuditHistoryError, nothing deleted.
+			return fmt.Errorf("failed to delete from workspaces: %w", ClassifyUserDeleteError(err))
+		}
+		deletedCounts["users"] = users
+		if rows, err := result.RowsAffected(); err == nil {
+			deletedCounts["workspaces"] = rows
+		}
+		if err := deleted("user_groups")(tenancy.ExecContext(ctx, tx, "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)")); err != nil {
+			return err
+		}
+		// A user still named by another workspace's records is refused with
+		// *UserAuditHistoryError and nothing is deleted.
+		res, err := tenancy.ExecContext(ctx, tx, "DELETE FROM users WHERE workspace_id = $1")
+		if err != nil {
+			return fmt.Errorf("failed to delete from users: %w", ClassifyUserDeleteError(err))
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			deletedCounts["users"] += n
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return deletedCounts, nil
 }

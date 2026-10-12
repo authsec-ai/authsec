@@ -451,6 +451,17 @@ var bfkCases = []bfkCase{
 		return w.A.lifecycleEvent("identity_account_id", nil, "policy_id", p.id("pol"))
 	}},
 
+	// ---------------- master 047: every cloud_* workspace_id keyed to workspaces
+	bfkAnchorCase("fk_cloud_connector_tenancy_ws", (*bfkSide).cloudConnector),
+	bfkAnchorCase("fk_cloud_identity_tenancy_ws", (*bfkSide).cloudIdentity),
+	bfkAnchorCase("fk_cloud_secret_tenancy_ws", (*bfkSide).cloudSecret),
+	bfkAnchorCase("fk_cloud_assume_edge_tenancy_ws", (*bfkSide).cloudAssumeEdge),
+	bfkAnchorCase("fk_cloud_permission_tenancy_ws", (*bfkSide).cloudPermission),
+	bfkAnchorCase("fk_cloud_resource_tenancy_ws", (*bfkSide).cloudResource),
+	bfkAnchorCase("fk_cloud_workload_tenancy_ws", (*bfkSide).cloudWorkload),
+	bfkAnchorCase("fk_cloud_usage_tenancy_ws", (*bfkSide).cloudUsage),
+	bfkAnchorCase("fk_cloud_scan_checkpoint_tenancy_ws", (*bfkSide).cloudScanCheckpoint),
+
 	// ---------------- 041: Kubernetes provenance -----------------------------
 	// The source is a discovery_sources row, the reading an iga_k8s_sweep.
 	bfkAnchorCase("iga_k8s_sweep_workspace_fkey", (*bfkSide).k8sSweep),
