@@ -313,9 +313,10 @@ func (eic *EntraIDController) NewEntraIDService(config *EntraIDConfig) *EntraIDS
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: config.SkipVerify,
-				},
+				// Microsoft's endpoints always present valid certificates;
+				// skip_verify is ignored so the client secret and bearer
+				// token never travel over an unverified connection.
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		},
 	}

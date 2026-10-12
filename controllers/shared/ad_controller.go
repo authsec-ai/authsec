@@ -106,6 +106,10 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 	} else if input.Config != nil {
 		// Use provided config directly
 		adConfig = *input.Config
+		if err := CheckADSkipVerify(adConfig.UseSSL, adConfig.SkipVerify); err != nil {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Insecure configuration", Details: err.Error()})
+			return
+		}
 	} else {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{
 			Error:   "Either config_id or config must be provided",
@@ -228,6 +232,10 @@ func (asc *ADSyncController) TestADConnection(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := CheckADSkipVerify(config.UseSSL, config.SkipVerify); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+		return
+	}
 
 	// Test connection to AD
 	conn, err := asc.connectToAD(config)
@@ -293,12 +301,17 @@ func (asc *ADSyncController) connectToAD(config models.ADSyncConfig) (*ldap.Conn
 
 	if config.UseSSL {
 		// Connect with SSL/TLS
+		if config.SkipVerify {
+			log.Printf("WARN: AD sync to %s skips certificate verification", config.Server)
+		}
 		tlsConfig := &tls.Config{
-			InsecureSkipVerify: config.SkipVerify,
+			InsecureSkipVerify: config.SkipVerify, // #nosec G402 -- admin opt-in, refused in production by CheckADSkipVerify
+			MinVersion:         tls.VersionTLS12,
 		}
 		conn, err = ldap.DialTLS("tcp", config.Server, tlsConfig)
 	} else {
 		// Connect without SSL (not recommended for production)
+		log.Printf("WARN: AD sync to %s uses plain LDAP; the bind password is sent unencrypted", config.Server)
 		conn, err = ldap.Dial("tcp", config.Server)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/controllers/shared"
@@ -84,6 +85,10 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt AD config if applicable
 	if req.SyncType == "active_directory" && req.ADConfig != nil {
+		if err := shared.CheckADSkipVerify(req.ADConfig.UseSSL, req.ADConfig.SkipVerify); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		syncConfig.ADServer = req.ADConfig.Server
 		syncConfig.ADUsername = req.ADConfig.Username
 		syncConfig.ADBaseDN = req.ADConfig.BaseDN
@@ -126,7 +131,11 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	// Save to database
 	if err := db.Create(&syncConfig).Error; err != nil {
 		log.Printf("Failed to create sync configuration: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration", "details": err.Error()})
+		if strings.Contains(err.Error(), "23505") {
+			c.JSON(http.StatusConflict, gin.H{"error": "A sync configuration named \"" + req.ConfigName + "\" already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
 		return
 	}
 
@@ -264,6 +273,10 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 
 	// Update AD config if provided
 	if req.ADConfig != nil && syncConfig.SyncType == "active_directory" {
+		if err := shared.CheckADSkipVerify(req.ADConfig.UseSSL, req.ADConfig.SkipVerify); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		if req.ADConfig.Server != "" {
 			syncConfig.ADServer = req.ADConfig.Server
 		}

@@ -29,8 +29,10 @@ type SyncConfiguration struct {
 	ADPassword   string `json:"ad_password,omitempty" gorm:"type:text"` // Encrypted
 	ADBaseDN     string `json:"ad_base_dn,omitempty" gorm:"type:varchar(500)"`
 	ADFilter     string `json:"ad_filter,omitempty" gorm:"type:text"`
-	ADUseSSL     bool   `json:"ad_use_ssl,omitempty" gorm:"default:true"`
-	ADSkipVerify bool   `json:"ad_skip_verify,omitempty" gorm:"default:false"`
+	// No gorm default tags: GORM leaves a zero value with a default out of the
+	// INSERT, so use_ssl=false was stored as the column default, true.
+	ADUseSSL     bool   `json:"ad_use_ssl"`
+	ADSkipVerify bool   `json:"ad_skip_verify"`
 
 	// Entra ID-specific fields (encrypted in DB)
 	// The Microsoft Entra directory (tenant) id, not an AuthSec workspace (AS-097).
@@ -38,7 +40,7 @@ type SyncConfiguration struct {
 	EntraClientID     string `json:"entra_client_id,omitempty" gorm:"type:varchar(500)"`
 	EntraClientSecret string `json:"entra_client_secret,omitempty" gorm:"type:text"` // Encrypted
 	EntraScopes       string `json:"entra_scopes,omitempty" gorm:"type:text"`        // JSON array as text
-	EntraSkipVerify   bool   `json:"entra_skip_verify,omitempty" gorm:"default:false"`
+	EntraSkipVerify   bool   `json:"entra_skip_verify,omitempty"` // ignored: Graph is always verified
 
 	// Sync metadata
 	LastSyncAt         *time.Time `json:"last_sync_at,omitempty"`
