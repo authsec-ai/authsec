@@ -1130,6 +1130,9 @@ type PlanDiff struct {
 	NewlyExcludedActions   []string `json:"newly_excluded_actions,omitempty"`
 	AlreadyExcludedActions []string `json:"already_excluded_actions,omitempty"`
 	NewlyUnexcludedActions []string `json:"newly_unexcluded_actions,omitempty"`
+	// R2: services and actions the plan keeps only until a date
+	// (DECISION R2-2; omitted for every R1a / R1b plan).
+	TimeBound []TimeBoundItem `json:"time_bound,omitempty"`
 }
 
 // Plan cases (PlanDiff.Case).
@@ -1249,7 +1252,7 @@ func (p Plan) CheckStorable() error {
 	split := p.Kind == PlanSplit || p.Kind == PlanSplitRevert
 	if split != (p.DesiredAttachment == AttachmentUnchanged) ||
 		(p.Kind == PlanApply && p.DesiredAttachment != AttachmentPresent) ||
-		(split && p.Delivery != DeliveryIaCPR && p.Delivery != DeliveryExport) {
+		(split && p.Delivery != DeliveryIaCPR && p.Delivery != DeliveryExport && !p.directLambdaSplit()) {
 		errs = append(errs, "iga_gov_plan_kind_chk")
 	}
 	if (p.DesiredAttachment == AttachmentAbsent && p.ArtifactDisposition != DispositionDelete && p.ArtifactDisposition != DispositionRetainShared) ||
@@ -1265,6 +1268,13 @@ func (p Plan) CheckStorable() error {
 		return fmt.Errorf("igagov: plan violates %s", strings.Join(errs, ", "))
 	}
 	return nil
+}
+
+// directLambdaSplit mirrors 061's widening of iga_gov_plan_kind_chk: a
+// split kind may be delivered directly only for a Lambda subject (R2,
+// DECISION R2-13).
+func (p Plan) directLambdaSplit() bool {
+	return p.Delivery == DeliveryDirect && p.Diff.Split != nil && p.Diff.Split.SubjectKind == SubjectLambdaFunction
 }
 
 // ControlRef is the control a plan is compiled for, with what its tags and
@@ -1619,6 +1629,15 @@ func CompileTarget(in TargetInput) (TargetPlans, error) {
 		}
 	}
 
+	if tb := in.Intent.TimeBoundItems(); len(tb) > 0 {
+		// R2 (DECISION R2-2..R2-5): time-conditioned retention, on AuthSec's
+		// own boundary only, with until inside the allowed range.
+		ap.Diff.TimeBound, ap.Impact.TimeBound = tb, tb
+		ap.refuse(checkTimeBoundRange(tb, in.Live.ReadAt)...)
+		if kind == bkCustomerExclusive || kind == bkCustomerShared {
+			ap.refuse(Refusal{RefuseTimeBoundCustomer, role.BoundaryARN + " is a customer boundary; time-bound retention needs AuthSec's own boundary"})
+		}
+	}
 	ctx := applyCtx{in: in, role: role, plan: &ap, part: part, acct: acct, cur: cur, curHash: curHash,
 		curOthers: curOthers, defHash: defHash}
 	var undo *Plan
@@ -1826,6 +1845,10 @@ func (c applyCtx) removedActions() []string { return c.in.Intent.RemovedActionKe
 // boundaryDocument is the AuthSec boundary for the intent: §3.2's
 // exclusion-only document, with R1b's removed actions when there are any.
 func (c applyCtx) boundaryDocument() ([]byte, string, error) {
+	if tb := c.in.Intent.TimeBoundItems(); len(tb) > 0 {
+		// R2: time-conditioned retention (DECISION R2-2).
+		return TimeBoundBoundaryDocument(c.removed(), c.removedActions(), tb)
+	}
 	if acts := c.removedActions(); len(acts) > 0 {
 		return ExcludeOnlyActionsDocument(c.removed(), acts)
 	}

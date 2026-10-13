@@ -41,13 +41,20 @@ const (
 	GovJobPruneEvidence      = "prune_evidence"
 	GovJobMetricsRollup      = "metrics_rollup"
 	GovJobResolveUnknown     = "resolve_unknown"
+	// R2 (061_r2_time_bound_access, IGA_POLICY_R2): the temporary-grant and
+	// session-revocation lifecycles, and time-bound retention notices and
+	// the posture observation at expiry.
+	GovJobTempGrant     = "temp_grant"
+	GovJobSessionRevoke = "session_revoke"
+	GovJobTimeBound     = "time_bound"
 )
 
-// GovJobKinds are the kinds 052 accepts (all of them).
+// GovJobKinds are the kinds 052 (widened by 061) accepts (all of them).
 var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
 	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
+	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per

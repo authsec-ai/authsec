@@ -74,6 +74,11 @@ type RetainEntry struct {
 	Reason      string   `json:"reason,omitempty"`
 	ReviewBy    string   `json:"review_by,omitempty"`
 	Subjects    []string `json:"subjects,omitempty"`
+	// Until is R2's time-conditioned retention (IGA_POLICY_R2, DECISION
+	// R2-2): an owner retain kept only until this date, after which AWS
+	// itself excludes the service. Omitted when empty, so every R1a intent
+	// and its intent_hash are unchanged.
+	Until string `json:"until,omitempty"`
 }
 
 // AppliesTo reports whether the entry retains its service for the subject
@@ -195,6 +200,10 @@ type RightSizeIntent struct {
 	// keeps (IGA_POLICY_R1B). Omitted when empty, so every R1a intent and
 	// its intent_hash are unchanged.
 	RemoveActions []RemoveActionEntry `json:"remove_actions,omitempty"`
+	// RetainActionsUntil is R2's action-level time-conditioned retention
+	// (IGA_POLICY_R2): actions of kept services kept only until a date.
+	// Omitted when empty, so every R1a/R1b intent hashes as before.
+	RetainActionsUntil []RetainActionUntilEntry `json:"retain_actions_until,omitempty"`
 }
 
 // RemoveControlIntent is the `remove_control` intent (§2.7, §8.10).
@@ -476,13 +485,13 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 			c.add("retain", "duplicate", "service %s is retained for every subject and again for some", svc)
 		}
 	}
-	if len(r.Remove) == 0 && len(r.RemoveActions) == 0 {
+	if len(r.Remove) == 0 && len(r.RemoveActions) == 0 && !r.HasTimeBound() {
 		c.add("remove", "required", "a right_size_services intent removes at least one service")
 	}
 	// Each subject still removes something once its owners' retains apply.
 	for i, s := range r.Subjects {
 		fs := r.ForSubject(s.IdentityAccountID)
-		if (len(r.Remove) > 0 || len(r.RemoveActions) > 0) && len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 {
+		if (len(r.Remove) > 0 || len(r.RemoveActions) > 0) && len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 && !fs.HasTimeBound() {
 			c.add(fmt.Sprintf("subjects[%d]", i), "nothing_to_remove", "the owners' retains leave nothing to remove for role %s", s.RoleID)
 		}
 	}
@@ -513,6 +522,10 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 
 	if len(r.RemoveActions) > 0 {
 		validateRemoveActions(c, r, removed)
+	}
+	if r.HasTimeBound() {
+		// R2 (IGA_POLICY_R2): time-conditioned retention, DECISION R2-6.
+		validateTimeBound(c, r, removed)
 	}
 
 	if r.ObservationDays < MinObservationDays || r.ObservationDays > MaxObservationDays {
@@ -710,7 +723,10 @@ func validateDedicated(c *collector, d DedicatedIdentityIntent) {
 	if nr.BoundaryARN != "" && !reARN.MatchString(nr.BoundaryARN) {
 		c.add("new_role.boundary_arn", "invalid", "must be an ARN")
 	}
-	if d.Delivery != DeliveryIaCPR && d.Delivery != DeliveryExport {
+	if d.Delivery != DeliveryIaCPR && d.Delivery != DeliveryExport &&
+		!(d.Delivery == DeliveryDirect && d.Workload.BindingKind == BindingLambdaRole) {
+		// R2 (DECISION R2-13): a Lambda split may be executed directly; the
+		// service refuses it while IGA_POLICY_R2 is off.
 		c.add("delivery", "invalid", "a dedicated identity is delivered only as iac_pr or export (§11; 050 iga_gov_plan_kind_chk)")
 	}
 }

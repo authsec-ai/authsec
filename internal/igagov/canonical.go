@@ -818,6 +818,9 @@ type Impact struct {
 	// omitted when empty so every R1a impact hashes as before.
 	RemovedActions  []ImpactAction `json:"removed_actions,omitempty"`
 	RestoredActions []ImpactAction `json:"restored_actions,omitempty"`
+	// TimeBound is R2's time-conditioned retention (DECISION R2-2), omitted
+	// when empty so every R1a / R1b impact hashes as before.
+	TimeBound []TimeBoundItem `json:"time_bound,omitempty"`
 }
 
 // ImpactAction is one action an R1b plan removes (or an undo restores),
@@ -859,6 +862,19 @@ func (im Impact) Normalized() Impact {
 	}
 	if len(im.RestoredActions) > 0 {
 		out.RestoredActions = sortImpactActions(im.RestoredActions)
+	}
+	if len(im.TimeBound) > 0 {
+		out.TimeBound = append([]TimeBoundItem{}, im.TimeBound...)
+		sort.Slice(out.TimeBound, func(i, j int) bool {
+			a, b := out.TimeBound[i], out.TimeBound[j]
+			if a.Until != b.Until {
+				return a.Until < b.Until
+			}
+			if a.Kind != b.Kind {
+				return a.Kind < b.Kind
+			}
+			return a.Key < b.Key
+		})
 	}
 	sort.Slice(out.Consumers, func(i, j int) bool {
 		a, b := out.Consumers[i], out.Consumers[j]

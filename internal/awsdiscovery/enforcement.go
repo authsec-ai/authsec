@@ -33,12 +33,39 @@ var EnforcementCloudFormationTemplate string
 // template test checks all three. Independent of TemplateVersion (discovery).
 const EnforcementTemplateVersion = "2026-10-07"
 
+// EnforcementCloudFormationTemplateV2 is the enforcement stack's template v2
+// (SPEC-iga-phase3-policy.md §12.3, release R2): template v1 plus temporary
+// grants and session revocation (attach/detach of AuthSec policies,
+// DECISION R2-14) and, behind the EnableLambdaSplit parameter, direct Lambda
+// execution-role splits (DECISION R2-15). Issued for new bindings only while
+// IGA_POLICY_R2 is on; v1 stays the template of every existing binding.
+//
+//go:embed authsec-aws-enforcement-role-v2.yaml
+var EnforcementCloudFormationTemplateV2 string
+
+// EnforcementTemplateVersionV2 identifies enforcement template v2. Must match
+// the v2 template's Metadata.AuthSec.TemplateVersion, its TemplateVersion
+// output and its registration resource's property.
+const EnforcementTemplateVersionV2 = "2026-10-13"
+
+// enforcementTemplateFileV1 and enforcementTemplateFileV2 are the published
+// object names of the two templates.
+const (
+	enforcementTemplateFileV1 = "authsec-aws-enforcement-role.yaml"
+	enforcementTemplateFileV2 = "authsec-aws-enforcement-role-v2.yaml"
+)
+
+// IsEnforcementTemplateV2 reports whether a binding's template_version is
+// template v2 (the R2 permission set).
+func IsEnforcementTemplateV2(v string) bool { return v == EnforcementTemplateVersionV2 }
+
 // KnownEnforcementTemplateVersion reports whether a callback's TemplateVersion
-// is one this build issued. A stack from an unknown version is refused at the
-// callback rather than recorded, because the binding's template_version is
-// what an operator reads to know which permission set a stack holds.
+// is one this build issued (v1 or v2). A stack from an unknown version is
+// refused at the callback rather than recorded, because the binding's
+// template_version is what an operator reads to know which permission set a
+// stack holds.
 func KnownEnforcementTemplateVersion(v string) bool {
-	return v == EnforcementTemplateVersion
+	return v == EnforcementTemplateVersion || v == EnforcementTemplateVersionV2
 }
 
 // The enforcement callback resource, as the template declares it.
@@ -163,7 +190,25 @@ func (c CallbackConfig) EnforcementTemplateURLFor() string {
 	if c.TemplateBaseURL == "" {
 		return ""
 	}
-	return c.TemplateBaseURL + "/aws/enforcement/" + EnforcementTemplateVersion + "/authsec-aws-enforcement-role.yaml"
+	return c.TemplateBaseURL + "/aws/enforcement/" + EnforcementTemplateVersion + "/" + enforcementTemplateFileV1
+}
+
+// EnforcementTemplateURLForVersion is EnforcementTemplateURLFor for a given
+// template version: .../aws/enforcement/<version>/<file>, the v1 file name
+// for v1 (exactly EnforcementTemplateURLFor) and
+// authsec-aws-enforcement-role-v2.yaml for v2. An unknown version, or no base
+// URL, is "".
+func (c CallbackConfig) EnforcementTemplateURLForVersion(v string) string {
+	switch {
+	case c.TemplateBaseURL == "":
+		return ""
+	case v == EnforcementTemplateVersion:
+		return c.EnforcementTemplateURLFor()
+	case v == EnforcementTemplateVersionV2:
+		return c.TemplateBaseURL + "/aws/enforcement/" + EnforcementTemplateVersionV2 + "/" + enforcementTemplateFileV2
+	default:
+		return ""
+	}
 }
 
 var (
@@ -181,4 +226,28 @@ func EnforcementQuickCreateURL(region, templateURL, stackName string, params map
 		enforcementDeclaredParams, enforcementNoEchoParams = scanTemplateParameters(EnforcementCloudFormationTemplate)
 	})
 	return buildQuickCreateURL(region, templateURL, stackName, params, enforcementDeclaredParams, enforcementNoEchoParams)
+}
+
+var (
+	enforcementV2ParamsOnce     sync.Once
+	enforcementV2DeclaredParams map[string]struct{}
+	enforcementV2NoEchoParams   map[string]struct{}
+)
+
+// EnforcementQuickCreateURLForVersion is EnforcementQuickCreateURL for a
+// given template version: the parameters are checked against THAT version's
+// embedded template (v2 declares EnableLambdaSplit, v1 does not). v1 is
+// exactly EnforcementQuickCreateURL; an unknown version is an error.
+func EnforcementQuickCreateURLForVersion(version, region, templateURL, stackName string, params map[string]string) (string, error) {
+	switch version {
+	case EnforcementTemplateVersion:
+		return EnforcementQuickCreateURL(region, templateURL, stackName, params)
+	case EnforcementTemplateVersionV2:
+		enforcementV2ParamsOnce.Do(func() {
+			enforcementV2DeclaredParams, enforcementV2NoEchoParams = scanTemplateParameters(EnforcementCloudFormationTemplateV2)
+		})
+		return buildQuickCreateURL(region, templateURL, stackName, params, enforcementV2DeclaredParams, enforcementV2NoEchoParams)
+	default:
+		return "", fmt.Errorf("unknown enforcement template version %q", version)
+	}
 }

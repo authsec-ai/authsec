@@ -118,6 +118,10 @@ type SplitInput struct {
 	// MigrationEvidenceAvailable: the connector's discovery template has the
 	// migration-evidence reads (§11); otherwise no isolation is offered.
 	MigrationEvidenceAvailable bool
+	// DirectAllowed is R2's switch for direct (J3) execution of a Lambda
+	// split (IGA_POLICY_R2 on; DECISION R2-13). False keeps §11's rule:
+	// a direct split is refused.
+	DirectAllowed bool
 }
 
 // SplitPlans is a dedicated-identity version's plan pair; Revert is nil when
@@ -400,6 +404,12 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 			tags[k] = v
 		}
 	}
+	if in.Intent.Delivery == DeliveryDirect {
+		// R2 (DECISION R2-13): a role AuthSec creates carries AuthSec's
+		// ownership tags, which the enforcement template v2 requires on
+		// CreateRole and on every later change to the role.
+		tags[TagManagedBy], tags[TagWorkspace], tags[TagSplitControl] = TagManagedByValue, in.Control.WorkspaceRef, in.Control.ID
+	}
 	sp.Ops = []Op{{Op: OpCreateRole, RoleARN: newARN, Path: nr.Path, TrustPolicyHash: nr.TrustPolicyHash, Tags: tags}}
 	for _, m := range sortedUnique(nr.ManagedPolicyARNs) {
 		sp.Ops = append(sp.Ops, Op{Op: OpAttachRolePolicy, RoleARN: newARN, PolicyARN: m})
@@ -454,7 +464,14 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 		sp.Facts = append(sp.Facts, Fact{Key: factKey(FactBinding, a), Kind: FactBinding, Subject: a, Before: src.ARN, After: newARN})
 	}
 	if in.Intent.Delivery == DeliveryDirect {
-		sp.refuse(Refusal{RefuseSplitDirect, "isolation is delivered only as a PR or export (§11)"})
+		// R2 (DECISION R2-13): direct only for a Lambda function, under
+		// /authsec/split/, with no boundary, aliases or PR-edited items;
+		// without IGA_POLICY_R2 a direct split is refused as in R1a.
+		if rs := splitDirectRefusals(in, src); len(rs) > 0 {
+			sp.refuse(rs...)
+		} else {
+			sp.Eligibility = EligibilityEligible
+		}
 	}
 	if err := sp.seal(); err != nil {
 		return SplitPlans{}, err
@@ -465,7 +482,7 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 
 	// split_revert: precondition is the split's post-state.
 	rv := in.Evidence.plan(in.Control.ID, PlanSplitRevert, in.Intent.Delivery, in.Live.ReadAt)
-	rv.Eligibility = EligibilityIaCOnly
+	rv.Eligibility = sp.Eligibility
 	rv.DesiredAttachment = AttachmentUnchanged
 	rv.Impact = sp.Impact
 	rpre := struct {
