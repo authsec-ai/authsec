@@ -717,12 +717,22 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	workspaceID, id uuid.UUID,
 ) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
 
-	var empty awsdiscovery.AssumeRequest
-
 	c, err := s.repo.Get(workspaceID, id)
 	if err != nil {
-		return nil, empty, err
+		return nil, awsdiscovery.AssumeRequest{}, err
 	}
+	return s.assumeRequestForConnector(workspaceID, c)
+}
+
+// assumeRequestForConnector is assumeRequestFor for a connector row already
+// read (the runtime broker reads it in a workspace transaction under RLS
+// and calls the secrets store after that transaction, never inside it).
+func (s *AWSOnboardingService) assumeRequestForConnector(
+	workspaceID uuid.UUID, c *models.CloudConnector,
+) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
+
+	var empty awsdiscovery.AssumeRequest
+	id := c.ID
 	if c.Provider != models.CloudProviderAWS {
 		return nil, empty, fmt.Errorf("connector %s is a %s connector", id, c.Provider)
 	}

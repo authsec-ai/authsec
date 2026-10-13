@@ -1,6 +1,8 @@
 # Files whose database access runs only inside a transaction under row-level
 # security for one workspace (scripts/check-tenant-exempt.sh). A file moves
 # here from tenant-exempt-quarantine.txt once it is converted (AS-108).
+controllers/platform/iga_gov_r2_controller.go
+controllers/platform/iga_gov_r3_controller.go
 controllers/platform/slack_integration_controller.go
 internal/k8sgraph/reconcile.go
 repository/cloud_evidence_reads.go
@@ -15,6 +17,8 @@ services/cloud_aws_iac_access.go
 services/cloud_enforcement_binding_jobs.go
 services/cloud_enforcement_binding_service.go
 services/cloud_enforcement_deploy_gate.go
+services/cloud_enforcement_r2.go
+services/cloud_runtime_broker.go
 services/governance_notification_bridge.go
 services/iga_gov_approval_service.go
 services/iga_gov_attempt_log.go
@@ -37,6 +41,7 @@ services/iga_gov_iac_delivery.go
 services/iga_gov_iac_delivery_handler.go
 services/iga_gov_iac_source_service.go
 services/iga_gov_iac_transitions.go
+services/iga_gov_isolation.go
 services/iga_gov_job_scheduler.go
 services/iga_gov_job_worker.go
 services/iga_gov_metrics.go
@@ -44,6 +49,17 @@ services/iga_gov_notify.go
 services/iga_gov_owner_review_service.go
 services/iga_gov_ownership_service.go
 services/iga_gov_prune_evidence.go
+services/iga_gov_r1b.go
+services/iga_gov_r1b_authoring.go
+services/iga_gov_r1b_evidence.go
+services/iga_gov_r2.go
+services/iga_gov_r2_attach.go
+services/iga_gov_r2_grants.go
+services/iga_gov_r2_split.go
+services/iga_gov_r2_timebound.go
+services/iga_gov_r3.go
+services/iga_gov_r3_policy.go
+services/iga_gov_r3_runtime.go
 services/iga_gov_readiness.go
 services/iga_gov_reads.go
 services/iga_gov_rollout_canary.go

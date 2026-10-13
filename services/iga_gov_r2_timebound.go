@@ -46,6 +46,7 @@ func dueTimeBound(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledP
 		ID          uuid.UUID
 	}
 	// TENANT-EXEMPT: the policy job scheduler runs across workspaces (no request tenant); each job it enqueues carries its row's workspace_id
+	// and runs under RLS for it.
 	if err := db.Raw(`SELECT d.workspace_id, d.id FROM iga_gov_deployment d
 		JOIN iga_gov_plan p ON p.workspace_id = d.workspace_id AND p.id = d.plan_id
 		WHERE d.state = 'verified' AND p.diff -> 'time_bound' IS NOT NULL`).Scan(&rows).Error; err != nil {
@@ -69,8 +70,12 @@ func (s *GovDeployments) TimeBoundHandler(ctx context.Context, run *PolicyJobRun
 		return nil
 	}
 	ws := run.Job.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, *run.Job.SubjectID)
+	var d *models.IGAGovDeployment
+	err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		d, err = s.loadDeployment(tx, ws, *run.Job.SubjectID)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -81,7 +86,7 @@ func (s *GovDeployments) TimeBoundHandler(ctx context.Context, run *PolicyJobRun
 	if d.State != models.GovDeployVerified {
 		return nil
 	}
-	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
+	plan, err := loadGovPlanRun(ctx, run, d.PlanID)
 	if err != nil {
 		return err
 	}
@@ -100,9 +105,11 @@ func (s *GovDeployments) TimeBoundHandler(ctx context.Context, run *PolicyJobRun
 			name = GovEventTimeBoundExpired
 		}
 		var seen int64
-		// TENANT-EXEMPT: fenced time_bound job; bound to workspace_id = ? (the job's workspace) and the deployment
-		if err := db.Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?
-			AND payload->>'key' = ? AND payload->>'until' = ?`, ws, d.ID, name, it.Key, it.Until).Scan(&seen).Error; err != nil {
+		// Under RLS for the job's workspace, and bound to workspace_id = ? and the deployment.
+		if err := runRead(ctx, run, func(tx *gorm.DB) error {
+			return tx.Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?
+				AND payload->>'key' = ? AND payload->>'until' = ?`, ws, d.ID, name, it.Key, it.Until).Scan(&seen).Error
+		}); err != nil {
 			return err
 		}
 		if seen > 0 {
@@ -110,8 +117,12 @@ func (s *GovDeployments) TimeBoundHandler(ctx context.Context, run *PolicyJobRun
 		}
 		if name == GovEventTimeBoundExpired && it.Kind == igagov.TimeBoundKindService && !observed {
 			// Posture follows the expiry (DECISION R2-7, R2-19).
-			ctl, err := s.loadControl(db, ws, d.ControlID)
-			if err != nil {
+			var ctl *models.IGAGovControl
+			if err := runRead(ctx, run, func(tx *gorm.DB) error {
+				var err error
+				ctl, err = s.loadControl(tx, ws, d.ControlID)
+				return err
+			}); err != nil {
 				return err
 			}
 			if err := s.observeTimeBound(ctx, run, *d, plan, *ctl); err != nil {
@@ -138,10 +149,17 @@ func (s *GovDeployments) TimeBoundHandler(ctx context.Context, run *PolicyJobRun
 // compare-and-swap. A read that is not the deployment's after-state is left
 // to the drift check.
 func (s *GovDeployments) observeTimeBound(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, p igagov.Plan, ctl models.IGAGovControl) error {
+	if d.WorkspaceID != run.Job.WorkspaceID {
+		return PolicyJobAbandon("the deployment is not in the job's workspace")
+	}
 	_, err := s.observe(ctx, run, func(ctx context.Context) (*govObservation, error) {
-		db := run.DB().WithContext(ctx)
-		seen, cstate, err := controlSeen(db, d.WorkspaceID, d.ControlID)
-		if err != nil || cstate == "removed" {
+		var seen int64
+		var cstate string
+		if err := runRead(ctx, run, func(tx *gorm.DB) error {
+			var err error
+			seen, cstate, err = controlSeen(tx, d.WorkspaceID, d.ControlID)
+			return err
+		}); err != nil || cstate == "removed" {
 			return nil, err
 		}
 		live, cl, err := s.readPlan(ctx, run, d, p, ctl)

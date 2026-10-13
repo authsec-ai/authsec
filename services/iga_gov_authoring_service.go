@@ -1830,7 +1830,9 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	rec.Warnings = append(rec.Warnings, warnings...)
 	rec.Context = ctxObj
 	if len(removeActs) > 0 {
-		if err := a.recommendActions(ws, roles, removeActs, &intent, &rec); err != nil {
+		if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+			return a.recommendActions(tx, ws, roles, removeActs, &intent, &rec)
+		}); err != nil {
 			return nil, err
 		}
 	}

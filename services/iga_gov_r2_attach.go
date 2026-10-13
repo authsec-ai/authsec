@@ -323,8 +323,11 @@ func (r r2Row) converge(ctx context.Context, run *PolicyJobRun, present bool) (*
 		}
 		doc := ""
 		if op == "CreatePolicy" {
-			var err error
-			if doc, err = r2Document(run.DB().WithContext(ctx), r.WorkspaceID, r.DocumentHash); err != nil {
+			if err := run.ReadTx(ctx, func(tx *gorm.DB) error {
+				var err error
+				doc, err = r2Document(tx, r.WorkspaceID, r.DocumentHash)
+				return err
+			}); err != nil {
 				out.Fail, out.FailDetail = DeployReasonDocumentMissing, err.Error()
 				return out, nil
 			}
@@ -444,14 +447,21 @@ func (r r2Row) verifyPresent(ctx context.Context, run *PolicyJobRun) (drift stri
 
 // r2BindingGate is the binding check before a row deploys: the R1a binding
 // gate (verified, self-test younger than an hour, re-run otherwise) and the
-// template v2 capabilities of the row's feature (DECISION R2-16).
-func r2BindingGate(ctx context.Context, db *gorm.DB, ws, connectorID uuid.UUID, feature string) error {
+// template v2 capabilities of the row's feature (DECISION R2-16). The
+// binding gate may call AWS, so the capability read is its own short read
+// under RLS for the job's workspace, after it.
+func r2BindingGate(ctx context.Context, run *PolicyJobRun, ws, connectorID uuid.UUID, feature string) error {
+	if ws != run.Job.WorkspaceID {
+		return fmt.Errorf("r2 binding gate: workspace %s is not the job's %s", ws, run.Job.WorkspaceID)
+	}
 	if g := r2Env().Binding; g != nil {
 		if err := g(ctx, ws, connectorID); err != nil {
 			return err
 		}
 	}
-	return RequireEnforcementV2(ctx, db, ws, connectorID, feature)
+	return run.ReadTx(ctx, func(tx *gorm.DB) error {
+		return RequireEnforcementV2(ctx, tx, ws, connectorID, feature)
+	})
 }
 
 // errCode is the code of a GovError / EnforcementError, else its text.
