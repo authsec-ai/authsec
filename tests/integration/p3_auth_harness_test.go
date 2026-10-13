@@ -359,6 +359,20 @@ func (l *p3aLab) audits(action string) int64 {
 	return l.count(`SELECT count(*) FROM audit_events WHERE workspace_id = ? AND action = ?`, l.ws.String(), action)
 }
 
+// awaitAudits is audits once at least n rows of action exist, or after 10
+// seconds: monitoring.AuditLogger writes audit_events in a goroutine after
+// the response, so a count read right after the call races that insert.
+func (l *p3aLab) awaitAudits(action string, n int64) int64 {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := l.audits(action)
+		if got >= n || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func p3aStrings(v any) []string {
 	var out []string
 	for _, x := range v.([]any) {

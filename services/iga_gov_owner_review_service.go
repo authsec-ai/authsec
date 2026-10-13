@@ -18,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -860,7 +861,7 @@ func (s *IGAGovOwnerReviewService) OpenReviewTx(tx *gorm.DB, ws, versionID, acto
 // OpenReview is OpenReviewTx in its own transaction.
 func (s *IGAGovOwnerReviewService) OpenReview(ctx context.Context, ws, versionID, actor uuid.UUID) (*GovReviewSync, error) {
 	var out *GovReviewSync
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var err error
 		out, err = s.OpenReviewTx(tx, ws, versionID, actor)
 		return err
@@ -1108,7 +1109,7 @@ func reviewClosed(status string) *GovError {
 // owner of a subject of the review.
 func (s *IGAGovOwnerReviewService) Respond(ctx context.Context, ws, actor, reviewID uuid.UUID, in GovRespondInput) (*GovRespondResult, error) {
 	var out *GovRespondResult
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		vid, err := s.reviewVersion(tx, ws, reviewID)
 		if err != nil {
 			return err
@@ -1309,7 +1310,7 @@ func (s *IGAGovOwnerReviewService) Except(ctx context.Context, ws, actor, review
 	if reason == "" {
 		return nil, nil, GovBadParam("reason", "An exception needs a reason.")
 	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		vid, err := s.reviewVersion(tx, ws, reviewID)
 		if err != nil {
 			return err
@@ -1352,7 +1353,7 @@ func (s *IGAGovOwnerReviewService) Except(ctx context.Context, ws, actor, review
 // every owner who has not responded. It returns who was reminded.
 func (s *IGAGovOwnerReviewService) Remind(ctx context.Context, ws, actor, reviewID uuid.UUID) ([]uuid.UUID, error) {
 	reminded := []uuid.UUID{}
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		vid, err := s.reviewVersion(tx, ws, reviewID)
 		if err != nil {
 			return err
@@ -1480,15 +1481,29 @@ func (s *IGAGovOwnerReviewService) IsOwnerOf(db *gorm.DB, ws, reviewID, user uui
 	return st.owner(user) != nil, nil
 }
 
+// IsReviewOwner is IsOwnerOf in its own read under row-level security for
+// ws (the route's "owner of a subject" check).
+func (s *IGAGovOwnerReviewService) IsReviewOwner(ctx context.Context, ws, reviewID, user uuid.UUID) (bool, error) {
+	var owner bool
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		owner, err = s.IsOwnerOf(tx, ws, reviewID, user)
+		return err
+	})
+	return owner, err
+}
+
 // View is GET /reviews/:id for viewer (uuid.Nil: no personal response).
 func (s *IGAGovOwnerReviewService) View(ctx context.Context, ws, reviewID, viewer uuid.UUID) (*GovReviewView, error) {
-	db := s.db.WithContext(ctx)
-	vid, err := s.reviewVersion(db, ws, reviewID)
-	if err != nil {
-		return nil, err
-	}
-	st, err := s.load(db, ws, vid, false)
-	if err != nil {
+	var st *govReviewState
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		vid, err := s.reviewVersion(db, ws, reviewID)
+		if err != nil {
+			return err
+		}
+		st, err = s.load(db, ws, vid, false)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	return st.view(viewer, s.now()), nil
@@ -1578,7 +1593,6 @@ type GovReviewFilter struct {
 // List is GET /reviews: newest first, cursor-paged (≤ 200), mine = the
 // reviews the viewer was asked in.
 func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f GovReviewFilter, cursor string, limit int, key []byte) ([]GovReviewSummary, *string, error) {
-	db := s.db.WithContext(ctx)
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
@@ -1590,20 +1604,23 @@ func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f Gov
 		}
 	}
 	sort.Strings(f.Statuses)
-	rd := NewGovReader(db, key)
+	rd := NewGovReader(nil, key) // cursors only: signing needs no database
 	want := govCursor{Route: "reviews", WS: ws.String(), Q: fmt.Sprintf("mine=%t;viewer=%s;status=%s", f.Mine, f.Viewer, strings.Join(f.Statuses, ","))}
 	q := `SELECT r.id, r.version_id, v.policy_id, p.name AS policy_name, v.version_no, r.status, r.deadline_at, r.created_at, r.closed_at,
-	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.review_id = r.id) AS owners_asked,
-	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.review_id = r.id AND x.response IS NOT NULL) AS owners_responded,
-	             (SELECT x.response FROM iga_gov_owner_response x WHERE x.review_id = r.id AND x.user_id = ?) AS my_response,
-	             EXISTS (SELECT 1 FROM iga_gov_owner_response x WHERE x.review_id = r.id AND x.user_id = ?) AS asked
+	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id) AS owners_asked,
+	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id
+	                AND x.response IS NOT NULL) AS owners_responded,
+	             (SELECT x.response FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id
+	                AND x.user_id = ?) AS my_response,
+	             EXISTS (SELECT 1 FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id
+	                AND x.user_id = ?) AS asked
 	        FROM iga_gov_owner_review r
 	        JOIN iga_gov_policy_version v ON v.workspace_id = r.workspace_id AND v.id = r.version_id
 	        JOIN iga_gov_policy p ON p.workspace_id = v.workspace_id AND p.id = v.policy_id
 	       WHERE r.workspace_id = ?`
 	args := []any{f.Viewer, f.Viewer, ws}
 	if f.Mine {
-		q += ` AND EXISTS (SELECT 1 FROM iga_gov_owner_response x WHERE x.review_id = r.id AND x.user_id = ?)`
+		q += ` AND EXISTS (SELECT 1 FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id AND x.user_id = ?)`
 		args = append(args, f.Viewer)
 	}
 	if len(f.Statuses) > 0 {
@@ -1627,7 +1644,9 @@ func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f Gov
 	q += ` ORDER BY r.created_at DESC, r.id DESC LIMIT ?`
 	args = append(args, limit+1)
 	var rows []GovReviewSummary
-	if err := db.Raw(q, args...).Scan(&rows).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		return tx.Raw(q, args...).Scan(&rows).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var next *string

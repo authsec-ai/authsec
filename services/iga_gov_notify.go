@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/notify"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/utils"
@@ -21,8 +22,8 @@ import (
 // The Phase 3 notification outbox (SPEC-iga-phase3-policy.md §8.1 job
 // table, `notify`; 054 iga_gov_notification; T3.12).
 //
-// A notice is one iga_gov_notification row -- (subject_kind, subject_id,
-// channel, recipient), unique -- and one `notify` job (dedupe
+// A notice is one iga_gov_notification row -- (workspace_id, subject_kind,
+// subject_id, channel, recipient), unique (132) -- and one `notify` job (dedupe
 // notification:<id>) that delivers it. The row IS the delivery record: state
 // pending -> sent, or failed (retrying) -> ... -> dead after 5 attempts,
 // with attempt_count, last_error, available_at (the next try) and sent_at.
@@ -208,7 +209,7 @@ func EnqueueGovNotificationTx(tx *gorm.DB, ws uuid.UUID, subjectKind string, sub
 	err := tx.Raw(`
 		INSERT INTO iga_gov_notification (workspace_id, subject_kind, subject_id, channel, recipient)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (subject_kind, subject_id, channel, recipient) DO NOTHING
+		ON CONFLICT (workspace_id, subject_kind, subject_id, channel, recipient) DO NOTHING
 		RETURNING *`, ws, subjectKind, subjectID, channel, recipient).Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -313,11 +314,15 @@ func (g *GovNotifier) Handle(ctx context.Context, run *PolicyJobRun) error {
 		return PolicyJobAbandon("notify job without a notification id")
 	}
 	var n models.IGAGovNotification
-	res := run.DB().WithContext(ctx).Where("workspace_id = ? AND id = ?", run.Job.WorkspaceID, *run.Job.SubjectID).Limit(1).Find(&n)
-	if res.Error != nil {
+	var found int64
+	if err := tenancy.InWorkspaceRead(ctx, run.DB(), run.Job.WorkspaceID, func(tx *gorm.DB) error {
+		res := tx.Where("workspace_id = ? AND id = ?", run.Job.WorkspaceID, *run.Job.SubjectID).Limit(1).Find(&n)
+		found = res.RowsAffected
 		return res.Error
+	}); err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	if found == 0 {
 		return PolicyJobAbandon("notification no longer exists")
 	}
 	if n.State == GovNotifySent || n.State == GovNotifyDead {
@@ -407,53 +412,70 @@ func (g *GovNotifier) Handle(ctx context.Context, run *PolicyJobRun) error {
 	}
 }
 
-// deliver renders and sends one notice.
+// deliver renders and sends one notice. The notice, the recipient's
+// address and the webhook target are read in one transaction under
+// row-level security for the notice's workspace; the send runs after it.
 func (g *GovNotifier) deliver(ctx context.Context, n *models.IGAGovNotification, user *uuid.UUID) (string, error) {
 	subj, ok := govNoticeSubject(n.SubjectKind)
 	if !ok || subj.Render == nil {
 		return "", GovNotifyPermanent(fmt.Errorf("no renderer for %s notices", n.SubjectKind))
 	}
-	notice, err := subj.Render(g.db.WithContext(ctx), n, user)
-	if err != nil {
+	var notice *GovNotice
+	var email string
+	var target *GovWebhookTarget
+	if err := tenancy.InWorkspaceRead(ctx, g.db, n.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		if notice, err = subj.Render(tx, n, user); err != nil {
+			return err
+		}
+		switch n.Channel {
+		case GovChannelEmail:
+			if user == nil {
+				return GovNotifyPermanent(fmt.Errorf("email recipient %q is not a member", n.Recipient))
+			}
+			m, err := g.members.ActiveMembers(tx, n.WorkspaceID, []uuid.UUID{*user})
+			if err != nil {
+				return err
+			}
+			member, ok := m[*user]
+			if !ok || strings.TrimSpace(member.Email) == "" {
+				return GovNotifyPermanent(errors.New("the recipient is no longer an active member of the workspace"))
+			}
+			email = member.Email
+		case GovChannelWebhook:
+			if g.WebhookTarget == nil {
+				return GovNotifyPermanent(errors.New("no workspace webhook is configured"))
+			}
+			if target, err = g.WebhookTarget(tx, n.WorkspaceID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return "", err
 	}
 	switch n.Channel {
 	case GovChannelEmail:
-		if user == nil {
-			return "", GovNotifyPermanent(fmt.Errorf("email recipient %q is not a member", n.Recipient))
-		}
-		m, err := g.members.ActiveMembers(g.db.WithContext(ctx), n.WorkspaceID, []uuid.UUID{*user})
-		if err != nil {
-			return "", err
-		}
-		member, ok := m[*user]
-		if !ok || strings.TrimSpace(member.Email) == "" {
-			return "", GovNotifyPermanent(errors.New("the recipient is no longer an active member of the workspace"))
-		}
-		return "", g.Email.Send(ctx, notify.Message{Channel: notify.ChannelEmail, To: member.Email,
+		return "", g.Email.Send(ctx, notify.Message{Channel: notify.ChannelEmail, To: email,
 			Subject: notice.Subject, Body: []byte(notice.Text)})
 	case GovChannelWebhook:
-		if g.WebhookTarget == nil {
-			return "", GovNotifyPermanent(errors.New("no workspace webhook is configured"))
-		}
-		t, err := g.WebhookTarget(g.db.WithContext(ctx), n.WorkspaceID)
-		if err != nil {
-			return "", err
-		}
-		if t == nil || t.URL == "" {
+		if target == nil || target.URL == "" {
 			return "", GovNotifyPermanent(errors.New("no workspace webhook is configured"))
 		}
 		body, err := json.Marshal(notice.Webhook)
 		if err != nil {
 			return "", GovNotifyPermanent(err)
 		}
-		return "", g.Webhook.Send(ctx, notify.Message{Channel: notify.ChannelWebhook, To: t.URL, Body: body,
-			Secret: t.Secret, UserAgent: notify.DefaultUserAgent})
+		return "", g.Webhook.Send(ctx, notify.Message{Channel: notify.ChannelWebhook, To: target.URL, Body: body,
+			Secret: target.Secret, UserAgent: notify.DefaultUserAgent})
 	default:
 		ch, ok := govNoticeChannel(n.Channel)
 		if !ok {
 			return "", fmt.Errorf("the %s channel is not available in this build", n.Channel)
 		}
+		// TENANT-EXEMPT: the channel gets the handle, not a transaction: it calls
+		// its API (Slack) and must not hold one open across that call; its reads
+		// are filtered by n.WorkspaceID (slack_integration_channel.go).
 		return ch.Deliver(ctx, g.db.WithContext(ctx), *n, user, notice)
 	}
 }
