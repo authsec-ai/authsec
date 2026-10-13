@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -75,7 +76,10 @@ const (
 	r2EndReasonNeverDeployed = "expired_before_deploy"
 )
 
-// GovR2 is the R2 service (requests, decisions, jobs).
+// GovR2 is the R2 service (requests, decisions, jobs). Every statement runs
+// in a transaction under row-level security for one workspace: the token's
+// (tenancy.InWorkspace / InWorkspaceRead) or the job's (run.InTx / ReadTx).
+// Only the schedules' due scans span workspaces.
 type GovR2 struct {
 	db      *gorm.DB
 	targets *GovTargets
@@ -124,8 +128,12 @@ func (s *GovR2) resolveRole(ctx context.Context, ws uuid.UUID, k GovR2RoleKey) (
 	if !t.Eligible {
 		return nil, govUnprocessable(GovCodeRoleIneligible, "AuthSec does not change this role.", map[string]any{"reasons": t.IneligibleReasons})
 	}
-	conn, err := connectorForAccount(s.db.WithContext(ctx), ws, t.Identity.AccountID)
-	if err != nil {
+	var conn uuid.UUID
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		conn, err = connectorForAccount(tx, ws, t.Identity.AccountID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	if conn == uuid.Nil {
@@ -257,7 +265,7 @@ func (s *GovR2) CreateGrant(ctx context.Context, ws, actor uuid.UUID, req GovGra
 		Escalations: escRaw, EscalationAck: strings.TrimSpace(req.EscalationAcknowledgement), Reason: strings.TrimSpace(req.Reason),
 		ExpiresAt: exp, PolicyName: name, PolicyARN: arn, DocumentHash: hash, RequestHash: reqHash, RequestKey: key,
 		State: models.R2StateRequested, RequestedBy: actor, Ops: json.RawMessage(`[]`), CreatedAt: now, UpdatedAt: now}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := archiveDocumentTx(tx, ws, string(doc), hash); err != nil {
 			return err
 		}
@@ -293,7 +301,13 @@ func (s *GovR2) loadGrant(db *gorm.DB, ws, id uuid.UUID, lock bool) (*models.IGA
 
 // GetGrant is GET /temporary-grants/:id (404 across workspaces).
 func (s *GovR2) GetGrant(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovTempGrant, error) {
-	return s.loadGrant(s.db.WithContext(ctx), ws, id, false)
+	var out *models.IGAGovTempGrant
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.loadGrant(tx, ws, id, false)
+		return err
+	})
+	return out, err
 }
 
 // ListGrants is GET /temporary-grants (?state, ?role_id; newest first, <= 200).
@@ -301,15 +315,17 @@ func (s *GovR2) ListGrants(ctx context.Context, ws uuid.UUID, state, roleID stri
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if state != "" {
-		q = q.Where("state = ?", state)
-	}
-	if roleID != "" {
-		q = q.Where("role_id = ?", roleID)
-	}
 	out := []models.IGAGovTempGrant{}
-	err := q.Order("created_at DESC").Limit(limit).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if state != "" {
+			q = q.Where("state = ?", state)
+		}
+		if roleID != "" {
+			q = q.Where("role_id = ?", roleID)
+		}
+		return q.Order("created_at DESC").Limit(limit).Find(&out).Error
+	})
 	return out, err
 }
 
@@ -321,7 +337,7 @@ func (s *GovR2) ApproveGrant(ctx context.Context, ws, actor, id uuid.UUID, req G
 		return nil, err
 	}
 	var out *models.IGAGovTempGrant
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		g, err := s.loadGrant(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -376,7 +392,7 @@ func (s *GovR2) RejectGrant(ctx context.Context, ws, actor, id uuid.UUID, req Go
 		return nil, GovBadParam("reason", "A rejection needs a reason.")
 	}
 	var out *models.IGAGovTempGrant
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		g, err := s.loadGrant(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -414,7 +430,7 @@ func (s *GovR2) RevokeGrant(ctx context.Context, ws, actor, id uuid.UUID, req Go
 		return nil, err
 	}
 	var out *models.IGAGovTempGrant
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		g, err := s.loadGrant(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -468,7 +484,12 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 		return PolicyJobRetryLater(10*time.Minute, GovCodeR2Unavailable)
 	}
 	ws := run.Job.WorkspaceID
-	g, err := s.loadGrant(run.DB().WithContext(ctx), ws, *run.Job.SubjectID, false)
+	var g *models.IGAGovTempGrant
+	err := run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		g, err = s.loadGrant(tx, ws, *run.Job.SubjectID, false)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -590,7 +611,7 @@ func (s *GovR2) CreateRevocation(ctx context.Context, ws, actor uuid.UUID, req G
 		AccountID: role.Identity.AccountID, RoleID: role.Identity.RoleID, RoleARN: role.Identity.ARN, Reason: reason,
 		Emergency: req.Emergency, KeepHours: keep, PolicyName: name, PolicyARN: arn, RequestHash: h, State: models.R2StateRequested,
 		RequestedBy: actor, Ops: json.RawMessage(`[]`), CreatedAt: now, UpdatedAt: now}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if req.Emergency {
 			set, err := fixCutoff(tx, ws, &r, now)
 			if err != nil {
@@ -647,7 +668,25 @@ func (s *GovR2) loadRevocation(db *gorm.DB, ws, id uuid.UUID, lock bool) (*model
 
 // GetRevocation is GET /session-revocations/:id.
 func (s *GovR2) GetRevocation(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovSessionRevocation, error) {
-	return s.loadRevocation(s.db.WithContext(ctx), ws, id, false)
+	var out *models.IGAGovSessionRevocation
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.loadRevocation(tx, ws, id, false)
+		return err
+	})
+	return out, err
+}
+
+// HoldsPermission is WorkspaceUserHoldsPermission read under row-level
+// security for ws (the emergency revocation's governance:emergency check).
+func (s *GovR2) HoldsPermission(ctx context.Context, ws, user uuid.UUID, resource, action string) (bool, error) {
+	var ok bool
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		ok, err = WorkspaceUserHoldsPermission(tx, ws, user, resource, action)
+		return err
+	})
+	return ok, err
 }
 
 // ListRevocations is GET /session-revocations.
@@ -655,15 +694,17 @@ func (s *GovR2) ListRevocations(ctx context.Context, ws uuid.UUID, state, roleID
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if state != "" {
-		q = q.Where("state = ?", state)
-	}
-	if roleID != "" {
-		q = q.Where("role_id = ?", roleID)
-	}
 	out := []models.IGAGovSessionRevocation{}
-	err := q.Order("created_at DESC").Limit(limit).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if state != "" {
+			q = q.Where("state = ?", state)
+		}
+		if roleID != "" {
+			q = q.Where("role_id = ?", roleID)
+		}
+		return q.Order("created_at DESC").Limit(limit).Find(&out).Error
+	})
 	return out, err
 }
 
@@ -678,7 +719,7 @@ func (s *GovR2) DecideRevocation(ctx context.Context, ws, actor, id uuid.UUID, a
 		return nil, GovBadParam("reason", "A rejection needs a reason.")
 	}
 	var out *models.IGAGovSessionRevocation
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		r, err := s.loadRevocation(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -743,7 +784,7 @@ func (s *GovR2) LiftRevocation(ctx context.Context, ws, actor, id uuid.UUID, req
 		return nil, err
 	}
 	var out *models.IGAGovSessionRevocation
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		r, err := s.loadRevocation(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -802,7 +843,12 @@ func (s *GovR2) SessionRevokeHandler(ctx context.Context, run *PolicyJobRun) err
 		return PolicyJobRetryLater(10*time.Minute, GovCodeR2Unavailable)
 	}
 	ws := run.Job.WorkspaceID
-	r, err := s.loadRevocation(run.DB().WithContext(ctx), ws, *run.Job.SubjectID, false)
+	var r *models.IGAGovSessionRevocation
+	err := run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		r, err = s.loadRevocation(tx, ws, *run.Job.SubjectID, false)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -892,7 +938,7 @@ func (h r2Handler) settled(err error) error {
 
 // deploy is approved -> deploying behind the binding gate.
 func (h r2Handler) deploy(ctx context.Context, from string) error {
-	if err := r2BindingGate(ctx, h.run.DB(), h.ws, h.row.ConnectorID, h.kind.Feature); err != nil {
+	if err := r2BindingGate(ctx, h.run, h.ws, h.row.ConnectorID, h.kind.Feature); err != nil {
 		code, msg := errCode(err)
 		return h.fail(ctx, from, code, msg)
 	}
@@ -1109,6 +1155,8 @@ func RegisterR2Jobs(w *PolicyJobWorker, db *gorm.DB) {
 					WorkspaceID uuid.UUID
 					ID          uuid.UUID
 				}
+				// TENANT-EXEMPT: the scheduler's due scan spans every workspace (rows
+				// carry workspace_id); each job runs under RLS for its row's workspace.
 				if err := db.Table(k.Table).Select("workspace_id, id").
 					Where("state IN ?", []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive,
 						models.R2StateExpiring, models.R2StateRemoving, models.R2StateOutcomeUnknown}).

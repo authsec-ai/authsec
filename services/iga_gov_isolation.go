@@ -856,10 +856,19 @@ func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di
 	if di.Delivery == igagov.DeliveryIaCPR {
 		// Review P1-12 (b): the form is decided by rendering the approved
 		// documents (DecideIaCForm used to get an empty map here).
-		// DecideIaCForm (iga_gov_iac_delivery.go) interleaves its reads with
-		// GitHub reads, so it is handed the base handle, never a transaction
-		// held open across them; its reads are its owner's to scope (AS-108).
-		f, err := DecideIaCForm(ctx, a.db.WithContext(ctx), a.iacGitHub(), ws, c, sp.Split, docs, "", false)
+		// DecideIaCForm's database part (the mapped sources) is read in a
+		// workspace transaction under RLS first; the GitHub reads run after
+		// it, never inside it (AS-108).
+		var f *GovIaCForm
+		var fs *iacFormSources
+		err := tenancy.InWorkspaceRead(ctx, a.db, ws, func(tx *gorm.DB) error {
+			var err error
+			fs, err = loadIaCFormSources(tx, ws, c)
+			return err
+		})
+		if err == nil {
+			f, err = renderIaCForm(ctx, a.iacGitHub(), ws, c, sp.Split, docs, "", false, fs)
+		}
 		if err != nil {
 			if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
 				return nil, nil, err
