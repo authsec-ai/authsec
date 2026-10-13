@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -329,12 +330,19 @@ type govChannelSecretReleaser interface {
 }
 
 // releaseSuperseded releases prev when the committed row no longer names it.
-func releaseSuperseded(db *gorm.DB, st GovNotificationChannelStore, ws uuid.UUID, prev string) {
+// The row is read under row-level security for ws; Vault is called after
+// that read's transaction ends.
+func (s *GovSettingsService) releaseSuperseded(ctx context.Context, st GovNotificationChannelStore, ws uuid.UUID, prev string) {
 	r, ok := st.(govChannelSecretReleaser)
 	if !ok || prev == "" {
 		return
 	}
-	cur, err := r.SecretRefTx(db, ws)
+	var cur string
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		cur, err = r.SecretRefTx(tx, ws)
+		return err
+	})
 	if err != nil || cur == prev {
 		return
 	}
@@ -388,11 +396,16 @@ func NewGovSettingsService(db *gorm.DB) *GovSettingsService { return &GovSetting
 // with a settings.notification_channels_copied event (disposition plan §2:
 // copy, never move -- the legacy row is only read).
 func (s *GovSettingsService) Get(ctx context.Context, ws uuid.UUID) (*GovSettingsView, error) {
-	db := s.db.WithContext(ctx)
-	if err := s.copyLegacyChannels(db, ws); err != nil {
+	if err := s.copyLegacyChannels(ctx, ws); err != nil {
 		return nil, err
 	}
-	return s.view(db, ws)
+	var out *GovSettingsView
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.view(tx, ws)
+		return err
+	})
+	return out, err
 }
 
 func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, error) {
@@ -426,12 +439,12 @@ func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, 
 	return out, nil
 }
 
-func (s *GovSettingsService) copyLegacyChannels(db *gorm.DB, ws uuid.UUID) error {
+func (s *GovSettingsService) copyLegacyChannels(ctx context.Context, ws uuid.UUID) error {
 	st := currentGovChannelStore()
 	if ok, _ := st.Available(); !ok {
 		return nil
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		// Serialise first reads of one workspace on its settings row lock
 		// (the row may not exist: lock the workspace's settings key instead).
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext('iga_gov_settings_channels:' || ?::text))`, ws.String()).Error; err != nil {
@@ -520,8 +533,7 @@ var govSettingsRanges = []struct {
 // Update is PUT /settings: validated, written with a settings.updated event
 // in one transaction. It returns the views before and after.
 func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p GovSettingsPatch) (before, after *GovSettingsView, err error) {
-	db := s.db.WithContext(ctx)
-	if err := s.copyLegacyChannels(db, ws); err != nil {
+	if err := s.copyLegacyChannels(ctx, ws); err != nil {
 		return nil, nil, err
 	}
 	st := currentGovChannelStore()
@@ -537,7 +549,7 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 			}
 		}
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var rows []models.IGAGovSettings
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("workspace_id = ?", ws).Limit(1).Find(&rows).Error; err != nil {
 			return err
@@ -649,7 +661,7 @@ func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p 
 	if err != nil {
 		return nil, nil, err
 	}
-	releaseSuperseded(db, st, ws, prevSecretRef)
+	s.releaseSuperseded(ctx, st, ws, prevSecretRef)
 	return before, after, nil
 }
 

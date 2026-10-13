@@ -4,3 +4,11 @@
 services/iga_gov_authoring_service.go
 services/iga_gov_approval_service.go
 services/iga_gov_compile_service.go
+services/iga_gov_ownership_service.go
+services/iga_gov_owner_review_service.go
+services/iga_gov_settings_service.go
+services/iga_gov_events_service.go
+services/iga_gov_notify.go
+services/governance_notification_bridge.go
+services/workspace_member_directory.go
+services/workspace_permission_check.go

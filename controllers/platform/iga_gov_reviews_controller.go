@@ -133,7 +133,7 @@ func (ctl *IGAGovPolicyController) GetReview(readPerm gin.HandlerFunc) gin.Handl
 		viewer := ctl.optionalHuman(c, ws)
 		owner := false
 		if viewer != uuid.Nil {
-			if owner, err = svc.IsOwnerOf(ctl.db(), ws, id, viewer); err != nil {
+			if owner, err = svc.IsReviewOwner(c.Request.Context(), ws, id, viewer); err != nil {
 				govErrorOut(c, err)
 				return
 			}
