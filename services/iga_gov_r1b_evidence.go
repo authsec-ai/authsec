@@ -113,7 +113,8 @@ func actionTrailRead(startedAt *time.Time, requestedAt time.Time, raw []byte) (i
 	return read, true
 }
 
-// loadActionTrails reads, for every connector of the workspace, its CloudTrail
+// loadActionTrails reads, on db (the evaluation's transaction under row-level
+// security for ws), for every connector of the workspace, its CloudTrail
 // reads up to `at` and its roles' attributed events aggregated per (source,
 // name): the evaluation's R1b input. Events are cloud_observation rows of
 // cloudtrail:LookupEvents attributed by session issuer (T3.04); the role is
@@ -129,7 +130,7 @@ func loadActionTrails(ctx context.Context, db *gorm.DB, ws uuid.UUID, at time.Ti
 		RequestedAt time.Time
 		Coverage    []byte
 	}
-	// TENANT-EXEMPT: R1b evidence read inside the fenced evaluation job; bound to workspace_id = ? (the job's workspace)
+	// Bound to workspace_id = ? as well as RLS (the evaluation's workspace).
 	if err := db.Raw(`SELECT connector_id, started_at, requested_at, coverage FROM cloud_scan_run
 	                   WHERE workspace_id = ? AND status = 'published'
 	                     AND COALESCE(started_at, requested_at) >= ? AND COALESCE(started_at, requested_at) <= ?
@@ -206,7 +207,8 @@ func insertActionEvidenceTx(tx *gorm.DB, ws uuid.UUID, rev int64, ev []igagov.Ac
 // R1a prune recorded as pruned (iga_gov_evaluation_pruned, 059): R1b's
 // evidence follows the same retention as the activity evidence (§2.5).
 func pruneActionEvidenceTx(tx *gorm.DB, ws uuid.UUID) (int64, error) {
-	// TENANT-EXEMPT: R1b evidence prune inside the fenced prune_evidence job; both subqueries bound to workspace_id = ?
+	// tx is the prune's transaction under RLS for ws; both statements are
+	// bound to workspace_id = ? as well.
 	res := tx.Exec(`DELETE FROM iga_gov_action_evidence
 	                 WHERE workspace_id = ? AND rev IN (SELECT rev FROM iga_gov_evaluation_pruned WHERE workspace_id = ?)`, ws, ws)
 	return res.RowsAffected, res.Error

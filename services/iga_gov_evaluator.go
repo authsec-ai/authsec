@@ -240,20 +240,21 @@ func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (ig
 	}
 	var gs *govSnapshot
 	err = tenancy.RLSTransaction(wctx, e.db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) (err error) {
-		gs, err = readGovSnapshot(tx, ws, rev, nil)
-		return err
+		if gs, err = readGovSnapshot(tx, ws, rev, nil); err != nil || !PolicyActionsOn() {
+			return err
+		}
+		// R1b (IGA_POLICY_R1B): the connectors' CloudTrail history, read
+		// under the same barrier (and the same workspace transaction),
+		// qualifies actions of the services kept.
+		trails, err := loadActionTrails(wctx, tx, ws, gs.Snap.EvaluatedAt)
+		if err != nil {
+			return err
+		}
+		gs.Snap.ActionLevel, gs.Snap.ActionTrails = true, trails
+		return nil
 	})
 	if err != nil {
 		return igagov.Evaluation{}, nil, fmt.Errorf("snapshot: %w", err)
-	}
-	if PolicyActionsOn() {
-		// R1b (IGA_POLICY_R1B): the connectors' CloudTrail history, read
-		// under the same barrier, qualifies actions of the services kept.
-		trails, err := loadActionTrails(ctx, e.db, ws, gs.Snap.EvaluatedAt)
-		if err != nil {
-			return igagov.Evaluation{}, nil, fmt.Errorf("snapshot: %w", err)
-		}
-		gs.Snap.ActionLevel, gs.Snap.ActionTrails = true, trails
 	}
 	if err := e.stage("after_snapshot", rev, nil); err != nil {
 		return igagov.Evaluation{}, nil, err

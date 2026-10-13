@@ -44,6 +44,9 @@ services/iga_gov_notify.go
 services/iga_gov_owner_review_service.go
 services/iga_gov_ownership_service.go
 services/iga_gov_prune_evidence.go
+services/iga_gov_r1b.go
+services/iga_gov_r1b_authoring.go
+services/iga_gov_r1b_evidence.go
 services/iga_gov_readiness.go
 services/iga_gov_reads.go
 services/iga_gov_rollout_canary.go

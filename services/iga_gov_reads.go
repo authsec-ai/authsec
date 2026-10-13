@@ -622,7 +622,7 @@ func (r *GovReader) finding(db *gorm.DB, ws, id uuid.UUID, rev int64) (*FindingD
 		ns, _, _ := igagov.SplitAction(d.DetailKey)
 		q2 = q2.Where("service = ?", ns)
 		d.ActionEvidence = []GovActionEvidence{}
-		if err := r.db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ? AND action_key = ?",
+		if err := db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ? AND action_key = ?",
 			ws, rev, *d.IdentityAccountID, d.DetailKey).Find(&d.ActionEvidence).Error; err != nil {
 			return nil, err
 		}
@@ -662,18 +662,27 @@ func (r *GovReader) finding(db *gorm.DB, ws, id uuid.UUID, rev int64) (*FindingD
 
 // ActionEvidence is GET /identities/:id/action-evidence at rev (R1b).
 func (r *GovReader) ActionEvidence(ws, identity uuid.UUID, rev int64) ([]GovActionEvidence, error) {
-	var n int64
-	// TENANT-EXEMPT: R1b action-evidence identity check; bound to workspace_id = ? (the token's workspace, passed as ws)
-	if err := r.db.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
+	var out []GovActionEvidence
+	err := r.readIn(ws, func(tx *gorm.DB) error {
+		var n int64
+		if err := tx.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n == 0 {
+			return GovNotFound()
+		}
+		if rev == 0 {
+			out = []GovActionEvidence{}
+			return nil
+		}
+		var err error
+		out, err = actionEvidenceAt(tx, ws, rev, identity)
+		return err
+	})
+	if err != nil {
 		return nil, err
 	}
-	if n == 0 {
-		return nil, GovNotFound()
-	}
-	if rev == 0 {
-		return []GovActionEvidence{}, nil
-	}
-	return actionEvidenceAt(r.db, ws, rev, identity)
+	return out, nil
 }
 
 // ActivityEvidence is GET /identities/:id/activity-evidence at rev.

@@ -686,6 +686,13 @@ type bundleBasis struct {
 
 // buildBasis is build, also returning the bundleBasis.
 func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+	return g.buildBasisActions(ctx, ws, identity, removed, nil)
+}
+
+// buildBasisActions is buildBasis for an R1b intent: the bundle also names
+// the removed actions with their frozen action evidence, and their
+// namespaces' resource-policy routes (nil actions: exactly buildBasis).
+func (g *GovTargets) buildBasisActions(ctx context.Context, ws, identity uuid.UUID, removed, removedActions []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 	var b igagov.Bundle
 	var src igagov.BundleSource
 	var basis *bundleBasis
@@ -696,7 +703,7 @@ func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, rem
 	// One repeatable-read transaction under row-level security for ws
 	// (AS-108): every read of the build sees ws's rows only, at one moment.
 	err = tenancy.RLSTransaction(wctx, g.db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) (e error) {
-		b, src, basis, e = g.buildBasisIn(wctx, tx, ws, identity, removed)
+		b, src, basis, e = g.buildBasisInActions(wctx, tx, ws, identity, removed, removedActions)
 		return e
 	})
 	if err != nil {
@@ -711,13 +718,6 @@ func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, rem
 // role snapshot's own transaction then nests in it as a savepoint).
 func (g *GovTargets) buildBasisIn(ctx context.Context, dbIn *gorm.DB, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 	return g.buildBasisInActions(ctx, dbIn, ws, identity, removed, nil)
-}
-
-// buildBasisActions is buildBasis for an R1b intent: the bundle also names
-// the removed actions with their frozen action evidence, and their
-// namespaces' resource-policy routes (nil actions: exactly buildBasis).
-func (g *GovTargets) buildBasisActions(ctx context.Context, ws, identity uuid.UUID, removed, removedActions []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
-	return g.buildBasisInActions(ctx, g.db, ws, identity, removed, removedActions)
 }
 
 func (g *GovTargets) buildBasisInActions(ctx context.Context, dbIn *gorm.DB, ws, identity uuid.UUID, removed, removedActions []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
