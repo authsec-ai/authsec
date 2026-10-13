@@ -2,6 +2,7 @@
 # security for one workspace (scripts/check-tenant-exempt.sh). A file moves
 # here from tenant-exempt-quarantine.txt once it is converted (AS-108).
 controllers/platform/iga_gov_r2_controller.go
+controllers/platform/iga_gov_r3_controller.go
 controllers/platform/slack_integration_controller.go
 internal/k8sgraph/reconcile.go
 repository/cloud_evidence_reads.go
@@ -56,6 +57,9 @@ services/iga_gov_r2_attach.go
 services/iga_gov_r2_grants.go
 services/iga_gov_r2_split.go
 services/iga_gov_r2_timebound.go
+services/iga_gov_r3.go
+services/iga_gov_r3_policy.go
+services/iga_gov_r3_runtime.go
 services/iga_gov_readiness.go
 services/iga_gov_reads.go
 services/iga_gov_rollout_canary.go

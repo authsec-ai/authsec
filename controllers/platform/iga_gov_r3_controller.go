@@ -85,6 +85,8 @@ func R3Gate() gin.HandlerFunc {
 	}
 }
 
+// TENANT-EXEMPT: not a statement here: GovR3 runs every statement in a
+// transaction under row-level security for the token's workspace.
 func (ctl *IGAGovPolicyController) r3() *services.GovR3 { return services.NewGovR3(ctl.db()) }
 
 func (ctl *IGAGovPolicyController) ListRuntimePolicies(c *gin.Context) {
@@ -452,6 +454,15 @@ func NewIGAGovRuntimeController() *IGAGovRuntimeController {
 	return &IGAGovRuntimeController{db: func() *gorm.DB { return config.DB }}
 }
 
+// r3 is the runtime service. The workspace every call runs in is the one
+// SpiffeAuthMiddleware established from the trust bundle that verified the
+// agent's JWT-SVID (runtimeAgent); GovR3 opens its transactions under
+// row-level security for it.
+//
+// TENANT-EXEMPT: not a statement here: the handle is handed to GovR3, which
+// runs every runtime statement under tenancy.InWorkspace(that workspace).
+func (ctl *IGAGovRuntimeController) r3() *services.GovR3 { return services.NewGovR3(ctl.db()) }
+
 // RegisterRuntimeAgentRoutes mounts the runtime routes on a group that
 // already carries SpiffeAuthMiddleware.
 func RegisterRuntimeAgentRoutes(g gin.IRoutes, ctl *IGAGovRuntimeController) {
@@ -565,7 +576,7 @@ func (ctl *IGAGovRuntimeController) Decide(c *gin.Context) {
 		if err := decodeStrict(c, &req, "{tool, action?, target?, arguments | arguments_digest, session_id?, idempotency_key, context?}"); err != nil {
 			return nil, "", 0, err
 		}
-		out, err := services.NewGovR3(ctl.db()).Decide(c.Request.Context(), ws, ag, req)
+		out, err := ctl.r3().Decide(c.Request.Context(), ws, ag, req)
 		if err != nil {
 			return nil, "", 0, err
 		}
@@ -584,7 +595,7 @@ func (ctl *IGAGovRuntimeController) Redeem(c *gin.Context) {
 		if err := decodeStrict(c, &req, "{decision_token, arguments_digest, tool, action?, target?}"); err != nil {
 			return nil, id.String(), 0, err
 		}
-		d, err := services.NewGovR3(ctl.db()).Redeem(c.Request.Context(), ws, ag, id, req)
+		d, err := ctl.r3().Redeem(c.Request.Context(), ws, ag, id, req)
 		if err != nil {
 			return nil, id.String(), 0, err
 		}
@@ -604,7 +615,7 @@ func (ctl *IGAGovRuntimeController) Outcome(c *gin.Context) {
 		if err := decodeStrict(c, &req, "{decision_token, tool_outcome, aws_outcome?, actual_cost?}"); err != nil {
 			return nil, id.String(), 0, err
 		}
-		d, err := services.NewGovR3(ctl.db()).ReportOutcome(c.Request.Context(), ws, ag, id, req)
+		d, err := ctl.r3().ReportOutcome(c.Request.Context(), ws, ag, id, req)
 		if err != nil {
 			return nil, id.String(), 0, err
 		}
@@ -624,7 +635,7 @@ func (ctl *IGAGovRuntimeController) AWSSession(c *gin.Context) {
 		if err := decodeStrict(c, &req, "{decision_token}"); err != nil {
 			return nil, id.String(), 0, err
 		}
-		out, err := services.NewGovR3(ctl.db()).BrokerSession(c.Request.Context(), ws, ag, id, req)
+		out, err := ctl.r3().BrokerSession(c.Request.Context(), ws, ag, id, req)
 		if err != nil {
 			return nil, id.String(), 0, err
 		}
@@ -640,7 +651,7 @@ func (ctl *IGAGovRuntimeController) Hold(c *gin.Context) {
 		if err != nil {
 			return nil, c.Param("id"), 0, err
 		}
-		out, err := services.NewGovR3(ctl.db()).AgentHold(c.Request.Context(), ws, ag, id)
+		out, err := ctl.r3().AgentHold(c.Request.Context(), ws, ag, id)
 		if err != nil {
 			return nil, id.String(), 0, err
 		}
