@@ -1248,7 +1248,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	}
 	if err != nil {
 		if ferr := finish("failed", "connector: "+err.Error(), nil); ferr != nil {
-			log.Printf("[runtime] broker session %s: recording failure: %v", row.ID, ferr)
+			log.Printf("[runtime] workspace %s: broker session %s: recording failure: %v", ws, row.ID, ferr)
 		}
 		return nil, govConflict(GovCodeBrokerFailed, "The account's connector cannot be used for brokering.", map[string]any{"broker_session_id": row.ID})
 	}
@@ -1256,7 +1256,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	creds, aerr := deps.Broker.Assume(ctxW, areq)
 	if aerr != nil {
 		if ferr := finish("failed", aerr.Error(), nil); ferr != nil {
-			log.Printf("[runtime] broker session %s: recording failure: %v", row.ID, ferr)
+			log.Printf("[runtime] workspace %s: broker session %s: recording failure: %v", ws, row.ID, ferr)
 		}
 		return nil, govErr(http.StatusBadGateway, GovCodeBrokerFailed, "sts:AssumeRole failed; the decision is spent, decide again.",
 			map[string]any{"broker_session_id": row.ID})
@@ -1264,7 +1264,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	if err := finish("issued", "", creds); err != nil {
 		// The credentials exist in AWS; returning them is still correct, the
 		// row stays 'requested' (may have been issued).
-		log.Printf("[runtime] broker session %s: recording issue: %v", row.ID, err)
+		log.Printf("[runtime] workspace %s: broker session %s: recording issue: %v", ws, row.ID, err)
 	}
 	return &RuntimeSessionResult{SessionID: row.ID, RoleARN: row.RoleARN, SessionName: row.SessionName, SourceIdentity: row.SourceIdentity,
 		DurationSeconds: row.DurationSeconds, SessionPolicy: json.RawMessage(policyDoc), Tags: areq.Tags, Credentials: creds}, nil
