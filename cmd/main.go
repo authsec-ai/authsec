@@ -113,7 +113,7 @@ func main() {
 	{
 		var workspaces int64
 		// TENANT-EXEMPT: startup log line counting the tenant registry
-	_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
+		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
 		log.Printf("[migration:phase6] workspaces=%d", workspaces)
 	}
 
@@ -272,6 +272,13 @@ func main() {
 					log.Printf("[slack] Slack app not enabled: %s", reason)
 				}
 			}
+			// Ownership mode (decision 2026-10-13): admin by default -- no owner
+			// reviews, notices or findings; IGA_POLICY_OWNERSHIP=owners restores them.
+			ownership, oerr := services.GovOwnershipModeFromEnv()
+			if oerr != nil {
+				log.Printf("[policy] %v", oerr)
+			}
+			services.SetGovOwnershipMode(ownership)
 			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
 			// R3 brokered sessions (DECISION R3-12): the connector ExternalId
 			// comes from Vault and STS is called with AuthSec's ambient AWS

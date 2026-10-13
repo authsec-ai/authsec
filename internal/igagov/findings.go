@@ -123,6 +123,9 @@ type Snapshot struct {
 	Workloads []WorkloadSnapshot
 	Owners    []OwnerRecord
 	Rules     []FindingRule
+	// NoOwnership is admin ownership mode (decision 2026-10-13): no
+	// missing_owner or missing_review_date findings are raised.
+	NoOwnership bool
 	// DefaultWindowDays is iga_gov_settings.default_window_days (0 = 90).
 	DefaultWindowDays int
 	// ActionLevel turns on R1b (IGA_POLICY_R1B on, 060 verified): action
@@ -945,7 +948,7 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 	}
 
 	/* ---- ownership ---- */
-	if bound {
+	if bound && !ix.s.NoOwnership {
 		inWorkloads := map[string]bool{}
 		for _, id := range workloadIDs {
 			inWorkloads[id] = true

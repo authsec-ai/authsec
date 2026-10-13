@@ -546,6 +546,134 @@ func (f *FakeAWS) DeletePolicy(ctx context.Context, arn string) error {
 	return f.answered(ctx, c, nil)
 }
 
+// AttachRolePolicy implements awsenforce.IAMv2 (template v2: iam:PolicyARN
+// is the condition key that scopes it).
+func (f *FakeAWS) AttachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	f.waitHold("iam:AttachRolePolicy")
+	f.mu.Lock()
+	c := call{op: "AttachRolePolicy", action: "iam:AttachRolePolicy", params: map[string]any{"roleName": roleName, "policyArn": policyARN}}
+	r, ok := f.Roles[roleName]
+	resource := "arn:aws:iam::" + f.Account + ":role/" + roleName
+	actx := map[string]string{"iam:PolicyARN": policyARN}
+	if ok {
+		resource = f.RoleARNOf(r)
+		for k, v := range f.roleContext(r) {
+			actx[k] = v
+		}
+	}
+	if err := f.authorise("iam:AttachRolePolicy", resource, actx); err != nil {
+		return f.answered(ctx, c, err)
+	}
+	if !ok {
+		return f.answered(ctx, c, APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
+	}
+	if !f.policyExists(policyARN) {
+		return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+policyARN+" does not exist or is not attachable."))
+	}
+	for _, a := range r.Attached {
+		if a == policyARN {
+			return f.answered(ctx, c, nil)
+		}
+	}
+	if len(r.Attached) >= 10 {
+		return f.answered(ctx, c, APIError("LimitExceeded", "Cannot exceed quota for PoliciesPerRole: 10"))
+	}
+	r.Attached = append(r.Attached, policyARN)
+	return f.answered(ctx, c, nil)
+}
+
+// DetachRolePolicy implements awsenforce.IAMv2.
+func (f *FakeAWS) DetachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	f.waitHold("iam:DetachRolePolicy")
+	f.mu.Lock()
+	c := call{op: "DetachRolePolicy", action: "iam:DetachRolePolicy", params: map[string]any{"roleName": roleName, "policyArn": policyARN}}
+	r, ok := f.Roles[roleName]
+	resource := "arn:aws:iam::" + f.Account + ":role/" + roleName
+	actx := map[string]string{"iam:PolicyARN": policyARN}
+	if ok {
+		resource = f.RoleARNOf(r)
+		for k, v := range f.roleContext(r) {
+			actx[k] = v
+		}
+	}
+	if err := f.authorise("iam:DetachRolePolicy", resource, actx); err != nil {
+		return f.answered(ctx, c, err)
+	}
+	if !ok {
+		return f.answered(ctx, c, APIError("NoSuchEntity", "The role with name "+roleName+" cannot be found."))
+	}
+	for i, a := range r.Attached {
+		if a == policyARN {
+			r.Attached = append(r.Attached[:i:i], r.Attached[i+1:]...)
+			return f.answered(ctx, c, nil)
+		}
+	}
+	return f.answered(ctx, c, APIError("NoSuchEntity", "Policy "+policyARN+" was not found."))
+}
+
+// Detach removes an attachment directly (a customer's change outside AuthSec).
+func (f *FakeAWS) Detach(roleName, policyARN string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.Roles[roleName]; ok {
+		for i, a := range r.Attached {
+			if a == policyARN {
+				r.Attached = append(r.Attached[:i:i], r.Attached[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// AttachedOf lists the managed policies attached to a role.
+func (f *FakeAWS) AttachedOf(roleName string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.Roles[roleName]; ok {
+		return append([]string(nil), r.Attached...)
+	}
+	return nil
+}
+
+var errFakeUnsupported = APIError("UnsupportedOperation", "not simulated by the fake account")
+
+// PutRolePolicy, DeleteRolePolicy, CreateRole, DeleteRole and
+// UpdateFunctionRole complete awsenforce.IAMv2; the fake does not simulate
+// them.
+func (f *FakeAWS) PutRolePolicy(context.Context, string, string, string) error {
+	return errFakeUnsupported
+}
+func (f *FakeAWS) DeleteRolePolicy(context.Context, string, string) error { return errFakeUnsupported }
+func (f *FakeAWS) CreateRole(context.Context, awsenforce.CreateRoleInput) (string, error) {
+	return "", errFakeUnsupported
+}
+func (f *FakeAWS) DeleteRole(context.Context, string) error { return errFakeUnsupported }
+func (f *FakeAWS) UpdateFunctionRole(context.Context, string, string) error {
+	return errFakeUnsupported
+}
+
+func (s sessionIAM) AttachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	return s.f.AttachRolePolicy(s.ctx(ctx), roleName, policyARN)
+}
+func (s sessionIAM) DetachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	return s.f.DetachRolePolicy(s.ctx(ctx), roleName, policyARN)
+}
+func (s sessionIAM) PutRolePolicy(ctx context.Context, roleName, policyName, document string) error {
+	return s.f.PutRolePolicy(s.ctx(ctx), roleName, policyName, document)
+}
+func (s sessionIAM) DeleteRolePolicy(ctx context.Context, roleName, policyName string) error {
+	return s.f.DeleteRolePolicy(s.ctx(ctx), roleName, policyName)
+}
+func (s sessionIAM) CreateRole(ctx context.Context, in awsenforce.CreateRoleInput) (string, error) {
+	return s.f.CreateRole(s.ctx(ctx), in)
+}
+func (s sessionIAM) DeleteRole(ctx context.Context, roleName string) error {
+	return s.f.DeleteRole(s.ctx(ctx), roleName)
+}
+func (s sessionIAM) UpdateFunctionRole(ctx context.Context, functionARN, roleARN string) error {
+	return s.f.UpdateFunctionRole(s.ctx(ctx), functionARN, roleARN)
+}
+
 // RemoveStatement drops a statement by Sid from the simulated policy, as a
 // customer editing the stack would (A22).
 func (f *FakeAWS) RemoveStatement(sid string) bool {

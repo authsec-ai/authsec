@@ -497,7 +497,10 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 			Select(`p.*, v.status AS v_status,
 			        (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = p.workspace_id AND t.version_id = p.current_version_id) AS roles`).
 			Joins("LEFT JOIN iga_gov_policy_version v ON v.workspace_id = p.workspace_id AND v.id = p.current_version_id").
-			Where("p.workspace_id = ?", ws)
+			Where("p.workspace_id = ?", ws).
+			// Access policies (family time_bound) have their own routes and
+			// lifecycle (iga_gov_access_policy.go); R1a never lists or acts on them.
+			Where("p.family <> ?", "time_bound")
 		if f.Family != "" {
 			q = q.Where("p.family = ?", f.Family)
 		}
@@ -542,7 +545,7 @@ func policyView(p models.IGAGovPolicy, status *string, roles int) GovPolicyView 
 
 func (a *GovAuthoring) loadPolicy(db *gorm.DB, ws, id uuid.UUID, lock bool) (*models.IGAGovPolicy, error) {
 	var p models.IGAGovPolicy
-	q := db.Where("workspace_id = ? AND id = ?", ws, id)
+	q := db.Where("workspace_id = ? AND id = ? AND family <> ?", ws, id, "time_bound")
 	if lock {
 		q = q.Clauses(lockForUpdate())
 	}

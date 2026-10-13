@@ -71,9 +71,38 @@ type IGAGovTempGrant struct {
 	Ops                 json.RawMessage `json:"ops" gorm:"type:jsonb;not null;default:'[]'"`
 	CreatedAt           time.Time       `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt           time.Time       `json:"updated_at" gorm:"not null;default:now()"`
+	// Access policies (137): effect allow | deny, the policy and version a
+	// deployment row belongs to, and the window start. Nil / allow for R2
+	// temporary grants.
+	Effect    string     `json:"effect" gorm:"not null;default:'allow'"`
+	PolicyID  *uuid.UUID `json:"policy_id,omitempty" gorm:"type:uuid"`
+	VersionID *uuid.UUID `json:"version_id,omitempty" gorm:"type:uuid"`
+	StartsAt  *time.Time `json:"starts_at,omitempty"`
 }
 
 func (IGAGovTempGrant) TableName() string { return "iga_gov_temp_grant" }
+
+// IGAGovAccessPolicyVersion is one immutable access-policy version (137).
+type IGAGovAccessPolicyVersion struct {
+	ID              uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID     uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
+	PolicyID        uuid.UUID       `json:"policy_id" gorm:"type:uuid;not null"`
+	VersionNo       int             `json:"version_no" gorm:"not null"`
+	Intent          json.RawMessage `json:"intent" gorm:"type:jsonb;not null"`
+	IntentHash      string          `json:"intent_hash" gorm:"not null"`
+	Status          string          `json:"status" gorm:"not null;default:'applied'"`
+	CreatedBy       uuid.UUID       `json:"created_by" gorm:"type:uuid;not null"`
+	CreatedAt       time.Time       `json:"created_at" gorm:"not null;default:now()"`
+	StatusChangedAt time.Time       `json:"status_changed_at" gorm:"not null;default:now()"`
+}
+
+func (IGAGovAccessPolicyVersion) TableName() string { return "iga_gov_access_policy_version" }
+
+// Access-policy version statuses (137).
+const (
+	AccessVersionApplied    = "applied"
+	AccessVersionSuperseded = "superseded"
+)
 
 // IGAGovSessionRevocation is one session revocation
 // (iga_gov_session_revocation).

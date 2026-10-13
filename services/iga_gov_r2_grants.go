@@ -499,7 +499,13 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 	}
 	now := s.now().UTC()
 	h := r2Handler{s: s, run: run, kind: r2GrantKind, ws: ws, id: g.ID, row: grantRow(g), users: []uuid.UUID{g.RequestedBy}}
-	if g.DecidedBy != nil {
+	if g.PolicyID != nil {
+		// An access policy's deployment (iga_gov_access_policy.go).
+		h.kind, h.row = r2AccessKind, accessRow(g)
+		h.refs = govEventRefs{PolicyID: g.PolicyID, VersionID: g.VersionID}
+	}
+	h.endReason = g.EndReason
+	if g.DecidedBy != nil && *g.DecidedBy != g.RequestedBy {
 		h.users = append(h.users, *g.DecidedBy)
 	}
 	ending := g.EndReason != "" || g.State == models.R2StateExpiring
@@ -521,6 +527,7 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 			if err := h.move(ctx, g.State, models.R2StateExpiring, map[string]any{"end_reason": r2EndReasonExpired}); err != nil {
 				return err
 			}
+			h.endReason = r2EndReasonExpired
 			return h.absent(ctx, models.R2StateExpiring, models.R2StateExpired)
 		}
 		return h.check(ctx, g.Drift, g.ExpiresAt)
@@ -530,11 +537,14 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 	return nil
 }
 
+// grantFinal is the terminal state of an ending grant: expired at its
+// expiry, revoked for any early end (revoke; an access policy's paused,
+// ended or superseded).
 func grantFinal(endReason string) string {
-	if endReason == r2EndReasonRevoked {
-		return models.R2StateRevoked
+	if endReason == "" || endReason == r2EndReasonExpired || endReason == r2EndReasonNeverDeployed {
+		return models.R2StateExpired
 	}
-	return models.R2StateExpired
+	return models.R2StateRevoked
 }
 
 /* ---------------------------------------------------------------------------- */
@@ -902,6 +912,14 @@ type r2Handler struct {
 	id    uuid.UUID
 	row   r2Row
 	users []uuid.UUID
+	// refs: the event's policy / version (access policies).
+	refs      govEventRefs
+	endReason string
+}
+
+// event appends a system event of the row.
+func (h r2Handler) event(tx *gorm.DB, ws uuid.UUID, name string, payload map[string]any) error {
+	return appendGovEvent(tx, ws, name, models.GovActorSystem, "policy-worker", h.refs, payload)
 }
 
 
@@ -954,11 +972,7 @@ func (h r2Handler) fail(ctx context.Context, from, code, detail string) error {
 			"ended_at": time.Now().UTC()}); err != nil {
 			return err
 		}
-		name := GovEventRevocationFailed
-		if h.kind.Name == r2GrantKind.Name {
-			name = GovEventGrantFailed
-		}
-		if err := appendEvent(tx, h.ws, name, nil, map[string]any{h.kind.IDKey: h.id, "from": from, "reason": code, "detail": detail}); err != nil {
+		if err := h.event(tx, h.ws, h.kind.EvFailed, map[string]any{h.kind.IDKey: h.id, "from": from, "reason": code, "detail": detail}); err != nil {
 			return err
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
@@ -973,11 +987,7 @@ func (h r2Handler) unknown(ctx context.Context, from string, out *r2Outcome) err
 				igagov.AWSTime(out.SettleAt)}); err != nil {
 				return err
 			}
-			name := GovEventRevocationUnk
-			if h.kind.Name == r2GrantKind.Name {
-				name = GovEventGrantUnknown
-			}
-			return appendEvent(tx, h.ws, name, nil, map[string]any{h.kind.IDKey: h.id, "from": from, "settle_after": out.SettleAt,
+			return h.event(tx, h.ws, h.kind.EvUnknown, map[string]any{h.kind.IDKey: h.id, "from": from, "settle_after": out.SettleAt,
 				"ops": out.Ops})
 		})
 		if err != nil {
@@ -1012,13 +1022,16 @@ func (h r2Handler) present(ctx context.Context, from string) error {
 			"pending_op": "", "pending_op_at": nil, "settle_after": nil}); err != nil {
 			return err
 		}
-		name := GovEventRevocationActive
-		if h.kind.Name == r2GrantKind.Name {
-			name = GovEventGrantActive
-		}
-		if err := appendEvent(tx, h.ws, name, nil, map[string]any{h.kind.IDKey: h.id, "policy_arn": h.row.PolicyARN,
+		if err := h.event(tx, h.ws, h.kind.EvActive, map[string]any{h.kind.IDKey: h.id, "policy_arn": h.row.PolicyARN,
 			"role_id": h.row.RoleID, "readback": out.Readback, "ops": out.Ops, "drift": out.Drift, "until": h.row.Due}); err != nil {
 			return err
+		}
+		if h.kind.Name == r2AccessKind.Name {
+			// The new version is in place: older versions' deployments end
+			// now, never before (an edit leaves no gap).
+			if err := accessAfterActiveTx(tx, h.ws, h.id); err != nil {
+				return err
+			}
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
 	})
@@ -1076,11 +1089,12 @@ func (h r2Handler) finish(ctx context.Context, from, final, endReason string, ou
 		if err := h.moveTx(tx, from, final, set); err != nil {
 			return err
 		}
-		name := GovEventRevocationEnded
-		if h.kind.Name == r2GrantKind.Name {
-			name = GovEventGrantEnded
+		name := h.kind.EvEnded
+		if h.kind.Name == r2AccessKind.Name && final == models.R2StateExpired {
+			name = GovEventAccessExpired
 		}
-		if err := appendEvent(tx, h.ws, name, nil, pl); err != nil {
+		pl["end_reason"] = h.endReason
+		if err := h.event(tx, h.ws, name, pl); err != nil {
 			return err
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
@@ -1094,6 +1108,9 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 	if err != nil {
 		return err
 	}
+	if h.kind.Reapply && drift != "" && drift != R2ReasonAttachedElsewhere {
+		return h.reapply(ctx, drift, read, due)
+	}
 	now := time.Now().UTC()
 	err = h.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
@@ -1103,12 +1120,12 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 		if drift == "" || drift == prior {
 			return nil
 		}
-		name := GovEventRevocationDrift
-		if h.kind.Name == r2GrantKind.Name {
-			name = GovEventGrantDrifted
+		note := "AuthSec does not re-apply or revert; revoke or let the row expire."
+		if h.kind.Reapply {
+			note = "Attached to another entity as well; AuthSec leaves that entity unchanged."
 		}
-		if err := appendEvent(tx, h.ws, name, nil, map[string]any{h.kind.IDKey: h.id, "classification": drift, "read": read,
-			"note": "AuthSec does not re-apply or revert; revoke or let the row expire."}); err != nil {
+		if err := h.event(tx, h.ws, h.kind.EvDrifted, map[string]any{h.kind.IDKey: h.id, "classification": drift, "read": read,
+			"note": note}); err != nil {
 			return err
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
@@ -1117,6 +1134,53 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 		return err
 	}
 	return PolicyJobRetryLater(r2Wait(due), "active; drift checked every 10 minutes")
+}
+
+// reapply puts an access policy back when it was detached or deleted outside
+// AuthSec (a removed block would silently restore access): a drifted event,
+// then the present convergence; done -> a reapplied event; anything it
+// cannot fix (the document was edited, the role was recreated) -> failed.
+func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]any, due time.Time) error {
+	now := time.Now().UTC()
+	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
+			Updates(map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := h.event(tx, h.ws, h.kind.EvDrifted, map[string]any{h.kind.IDKey: h.id, "classification": drift, "read": read,
+			"note": "AuthSec re-applies the policy."}); err != nil {
+			return err
+		}
+		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
+	}); err != nil {
+		return err
+	}
+	if drift != R2ReasonDetached && drift != R2ReasonDeleted {
+		return h.fail(ctx, models.R2StateActive, drift, "AuthSec cannot re-apply: the policy or the role changed outside AuthSec")
+	}
+	out, err := h.row.converge(ctx, h.run, true)
+	if err != nil {
+		return err
+	}
+	switch {
+	case out.Fail != "":
+		return h.fail(ctx, models.R2StateActive, out.Fail, out.FailDetail)
+	case out.Unknown:
+		return h.unknown(ctx, models.R2StateActive, out)
+	case !out.Done:
+		return PolicyJobRetryLater(out.RetryAfter, "re-apply not complete: "+out.FailDetail)
+	}
+	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
+			Updates(map[string]any{"drift": "", "verified_at": now, "last_readback_at": now, "pending_op": "", "pending_op_at": nil,
+				"settle_after": nil, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return h.event(tx, h.ws, GovEventAccessReapplied, map[string]any{h.kind.IDKey: h.id, "was": drift, "ops": out.Ops, "readback": out.Readback})
+	}); err != nil {
+		return err
+	}
+	return PolicyJobRetryLater(r2Wait(due), "re-applied; drift checked every 10 minutes")
 }
 
 func r2Wait(due time.Time) time.Duration {

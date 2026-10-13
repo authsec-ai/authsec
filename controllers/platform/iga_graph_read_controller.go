@@ -149,7 +149,7 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the IGA_POLICY
 		// gate and what the policy product serves. Its reason is the one
 		// every /policy route's 503 carries.
-		"policy": policyCapabilities(ctl.policyGateFn()()),
+		"policy": withAccessPolicies(policyCapabilities(ctl.policyGateFn()()), ctl.db()),
 	}})
 }
 

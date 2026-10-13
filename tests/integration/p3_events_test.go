@@ -390,6 +390,29 @@ func govEventNamesInSource(t *testing.T) map[string][]string {
 			})
 		}
 	}
+	// The R2 engine's row kinds name their lifecycle events in package-level
+	// r2Kind literals (Ev* fields) that its writers pass through.
+	for _, af := range parsed {
+		ast.Inspect(af, func(n ast.Node) bool {
+			cl, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			if id, ok := cl.Type.(*ast.Ident); !ok || id.Name != "r2Kind" {
+				return true
+			}
+			for _, el := range cl.Elts {
+				if kv, ok := el.(*ast.KeyValueExpr); ok {
+					if k, ok := kv.Key.(*ast.Ident); ok && strings.HasPrefix(k.Name, "Ev") {
+						for _, v := range valuesOf(kv.Value, nil) {
+							add(v, fset.Position(cl.Pos()).Filename+":r2Kind")
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
 	return out
 }
 

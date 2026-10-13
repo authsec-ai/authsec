@@ -181,6 +181,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	// switch is on (DECISION R2-21), so with it off the table is R1a's.
 	if services.PolicyR2GateState().Enabled() {
 		RegisterIGAPolicyR2Routes(g, ctl, require)
+		// Access policies (decision 2026-10-13) ride on the R2 switch.
+		RegisterAccessPolicyRoutes(g, ctl, require)
 	}
 	// R3 (IGA_POLICY_R3, iga_gov_r3_controller.go): mounted only while the
 	// switch is on (DECISION R3-17), so with it off the table is R2's.
@@ -287,6 +289,17 @@ var (
 // policyCapabilities is the "policy" block of GET /api/iga/v1/capabilities
 // (§4.3): the gate (state, reason, schema_head), one boolean per feature with
 // a reason in "reasons" for every false one, and provider support.
+// withAccessPolicies adds policy.access_policies {available, reason}
+// (decision 2026-10-13) while the R2 switch is on.
+func withAccessPolicies(out gin.H, db *gorm.DB) gin.H {
+	if !services.PolicyR2GateState().Enabled() || db == nil {
+		return out
+	}
+	ok, reason := services.AccessPoliciesStatus(db)
+	out["access_policies"] = gin.H{"available": ok, "reason": nullIfEmpty(reason)}
+	return out
+}
+
 func policyCapabilities(gate *services.PolicyGate) gin.H {
 	state, reason, head := gate.Status()
 	on := state == services.PolicyOn
