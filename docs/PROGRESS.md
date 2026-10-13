@@ -22,6 +22,11 @@ Review of all 102 non-merge commits by ritam77 / ritamAN77 / Ritam Kundu since 2
 ### Verified
 - build, vet (incl. integration tags), ratchet, unit tests, flows/onboarding/flagsoff, the full Phase 3 suite on a fresh database (all pass), IGA isolation check, schema parity: a database built by current staging upgrades with 131-133 to the fresh schema.
 
+### Later the same day (PR #89 conflicts)
+- authsec-staging gained Phase 3 R1b, R2 and R3 (Ritam, 060-062); merged into the branch and converted to RLS like the rest (AS-114), with cross-workspace tests for R2 grants/revocations, the R2 expiry job and R3 runtime controls.
+- Found and fixed: the RLS-files guard matched nothing on gawk (AS-114); 133 had dropped R2's job kinds (AS-115, migration 134); 061's plan check accepted any direct split through a NULL comparison (AS-116, migration 135); R3 holds/budgets could name another workspace's rows (AS-117, migration 136).
+- tests/igagovschema (failing on staging as well) brought up to date with R1b/R2/R3 and the tenancy migrations.
+
 ### Next
 - AS-112: burn down the 72 older unscoped statements.
 - Before deploying: mint discovery ingest tokens for every collector (production now enforces), see DEPLOYMENT_CHECKLIST.
