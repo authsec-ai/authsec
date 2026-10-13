@@ -16,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -101,7 +102,6 @@ func (a *GovAuthoring) ownedPolicyARNs(db *gorm.DB, ws, control uuid.UUID) ([]st
 // (§8.3). Nothing is written except by the caller.
 func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igagov.RightSizeIntent, t models.IGAGovTarget,
 	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
-	db := a.db.WithContext(ctx)
 	// The intent as it applies to THIS subject: an owner's scoped retain
 	// keeps its service for the roles that owner owns only (fix/p3-tidy).
 	intent = intent.ForSubject(c.IdentityAccountID.String())
@@ -123,8 +123,10 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 				map[string]any{"reason": "live reads are not configured in this build", "role_id": c.RoleID})}, nil
 	}
 	var cont []string
-	if err := db.Raw(`SELECT continuity FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, c.IdentityAccountID).
-		Scan(&cont).Error; err != nil {
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT continuity FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, c.IdentityAccountID).
+			Scan(&cont).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var live igagov.LiveRead
@@ -148,8 +150,12 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 	if live.ReadAt.IsZero() {
 		live.ReadAt = a.now()
 	}
-	owned, err := a.ownedPolicyARNs(db, ws, c.ID)
-	if err != nil {
+	var owned []string
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		owned, err = a.ownedPolicyARNs(tx, ws, c.ID)
+		return err
+	}); err != nil {
 		return nil, nil, err
 	}
 	in := igagov.TargetInput{
@@ -525,16 +531,18 @@ type ProposeResult struct {
 // is written (DECISION A9: the route is all-or-nothing; the compile_plans
 // job, by contrast, stores ineligible plans so the reason stays visible).
 func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUID, no int) (*ProposeResult, error) {
-	db := a.db.WithContext(ctx)
-	pol, err := a.loadPolicy(db, ws, policyID, false)
-	if err != nil {
-		return nil, err
-	}
-	if pol.Lifecycle == "archived" {
-		return nil, govConflict(GovCodePolicyArchived, "The policy is archived and read-only.", nil)
-	}
-	v, err := a.loadVersion(db, ws, policyID, no, false)
-	if err != nil {
+	var v *models.IGAGovPolicyVersion
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		pol, err := a.loadPolicy(tx, ws, policyID, false)
+		if err != nil {
+			return err
+		}
+		if pol.Lifecycle == "archived" {
+			return govConflict(GovCodePolicyArchived, "The policy is archived and read-only.", nil)
+		}
+		v, err = a.loadVersion(tx, ws, policyID, no, false)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	if v.Status != "draft" && v.Status != "in_review" {
@@ -549,14 +557,19 @@ func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUI
 	if err != nil {
 		return nil, err
 	}
-	ts, cs, err := a.versionTargets(db, ws, v.ID)
-	if err != nil {
-		return nil, err
-	}
-	// fix/p3-appr (P0-2): a re-proposal (in review again after a material
-	// change) keeps the plans of targets that already carry a deployment.
-	deployed, err := deployedTargets(db, ws, v.ID, uuid.Nil)
-	if err != nil {
+	var ts []models.IGAGovTarget
+	var cs map[uuid.UUID]models.IGAGovControl
+	var deployed map[uuid.UUID]bool
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if ts, cs, err = a.versionTargets(tx, ws, v.ID); err != nil {
+			return err
+		}
+		// fix/p3-appr (P0-2): a re-proposal (in review again after a material
+		// change) keeps the plans of targets that already carry a deployment.
+		deployed, err = deployedTargets(tx, ws, v.ID, uuid.Nil)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	var cts []*compiledTarget
@@ -586,7 +599,7 @@ func (a *GovAuthoring) Propose(ctx context.Context, ws, actor, policyID uuid.UUI
 		return nil, err
 	}
 	var out ProposeResult
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		cur, err := a.loadVersion(tx, ws, policyID, no, true)
 		if err != nil {
 			return err
@@ -703,12 +716,16 @@ type GovPlansView struct {
 // Plans is GET /policies/:id/versions/:no/plans: every target's current
 // apply and undo plan.
 func (a *GovAuthoring) Plans(ctx context.Context, ws, policyID uuid.UUID, no int) (*GovPlansView, error) {
-	db := a.db.WithContext(ctx)
-	v, err := a.loadVersion(db, ws, policyID, no, false)
-	if err != nil {
-		return nil, err
-	}
-	return a.plansView(db, ws, *v)
+	var out *GovPlansView
+	err := a.readWorkspace(ctx, ws, func(db *gorm.DB) error {
+		v, err := a.loadVersion(db, ws, policyID, no, false)
+		if err != nil {
+			return err
+		}
+		out, err = a.plansView(db, ws, *v)
+		return err
+	})
+	return out, err
 }
 
 func (a *GovAuthoring) plansView(db *gorm.DB, ws uuid.UUID, v models.IGAGovPolicyVersion) (*GovPlansView, error) {
@@ -893,9 +910,11 @@ func (a *GovAuthoring) CompilePlansHandler(ctx context.Context, run *PolicyJobRu
 		return PolicyJobAbandon("compile_plans needs a version subject")
 	}
 	ws := run.Job.WorkspaceID
-	db := run.DB().WithContext(ctx)
+	read := func(fn func(tx *gorm.DB) error) error { return tenancy.InWorkspaceRead(ctx, run.DB(), ws, fn) }
 	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND id = ?", ws, *run.Job.SubjectID).Take(&v).Error; err != nil {
+	if err := read(func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND id = ?", ws, *run.Job.SubjectID).Take(&v).Error
+	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return PolicyJobAbandon("version not found")
 		}
@@ -910,12 +929,16 @@ func (a *GovAuthoring) CompilePlansHandler(ctx context.Context, run *PolicyJobRu
 		// is never revalidated or superseded: its role now carries this
 		// version's own change.
 		var plans []models.IGAGovPlan
-		if err := db.Where("workspace_id = ? AND version_id = ? AND kind IN ? AND superseded_at IS NULL", ws, v.ID,
-			[]string{igagov.PlanApply, igagov.PlanSplit}).Find(&plans).Error; err != nil {
+		var deployed map[uuid.UUID]bool
+		if err := read(func(tx *gorm.DB) error {
+			if err := tx.Where("workspace_id = ? AND version_id = ? AND kind IN ? AND superseded_at IS NULL", ws, v.ID,
+				[]string{igagov.PlanApply, igagov.PlanSplit}).Find(&plans).Error; err != nil {
+				return err
+			}
+			var err error
+			deployed, err = deployedTargets(tx, ws, v.ID, uuid.Nil)
 			return err
-		}
-		deployed, err := deployedTargets(db, ws, v.ID, uuid.Nil)
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		ids := make([]uuid.UUID, 0, len(plans))
@@ -945,8 +968,10 @@ func (a *GovAuthoring) CompilePlansHandler(ctx context.Context, run *PolicyJobRu
 
 type txRunner func(ctx context.Context, fn func(tx *gorm.DB) error) error
 
-func (a *GovAuthoring) plainTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return a.db.WithContext(ctx).Transaction(fn)
+// workspaceTx is the txRunner of a request: a transaction under row-level
+// security for ws.
+func (a *GovAuthoring) workspaceTx(ws uuid.UUID) txRunner {
+	return func(ctx context.Context, fn func(tx *gorm.DB) error) error { return a.inWorkspace(ctx, ws, fn) }
 }
 
 // recompile recompiles an in-review version in the background: blocked
@@ -956,15 +981,20 @@ func (a *GovAuthoring) recompile(ctx context.Context, ws uuid.UUID, v models.IGA
 	if err != nil {
 		return PolicyJobAbandon(err.Error())
 	}
-	ts, cs, err := a.versionTargets(a.db.WithContext(ctx), ws, v.ID)
-	if err != nil {
+	var ts []models.IGAGovTarget
+	var cs map[uuid.UUID]models.IGAGovControl
+	var deployed map[uuid.UUID]bool
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if ts, cs, err = a.versionTargets(tx, ws, v.ID); err != nil {
+			return err
+		}
+		// fix/p3-appr (P0-2): targets that already carry a deployment of this
+		// version (in review again after a material change elsewhere) keep
+		// their plans.
+		deployed, err = deployedTargets(tx, ws, v.ID, uuid.Nil)
 		return err
-	}
-	// fix/p3-appr (P0-2): targets that already carry a deployment of this
-	// version (in review again after a material change elsewhere) keep
-	// their plans.
-	deployed, err := deployedTargets(a.db.WithContext(ctx), ws, v.ID, uuid.Nil)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	var cts []*compiledTarget
@@ -1062,44 +1092,46 @@ type GovRevalidation struct {
 // with CompileSplit (fix/p3-appr P1-10). Without any complete evaluation there is no bundle to record
 // against, and an error is returned instead of a row.
 func (a *GovAuthoring) Revalidate(ctx context.Context, ws, planID uuid.UUID) (*GovRevalidation, error) {
-	return a.revalidate(ctx, ws, planID, directCall, a.plainTx)
+	return a.revalidate(ctx, ws, planID, directCall, a.workspaceTx(ws))
 }
 
 func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, call liveCaller, inTx txRunner) (*GovRevalidation, error) {
-	db := a.db.WithContext(ctx)
 	var p models.IGAGovPlan
-	if err := db.Where("workspace_id = ? AND id = ?", ws, planID).Take(&p).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotFound()
-		}
-		return nil, err
-	}
 	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND id = ?", ws, p.VersionID).Take(&v).Error; err != nil {
-		return nil, err
-	}
-	appr, err := liveApproval(db, ws, v.ID)
-	if err != nil {
-		return nil, err
-	}
-	if v.Status != "approved" || appr == nil || !containsStr(appr.PlanHashes, p.PlanHash) || p.SupersededAt != nil {
-		return nil, govConflict("plan_changed", "This plan is not the approved plan of its version.",
-			map[string]any{"plan_id": p.ID, "version_status": v.Status})
-	}
-	// fix/p3-appr (P0-2): never revalidate (and so never supersede) the
-	// plan of a target that already carries a deployment of this version.
-	if dep, err := deployedTargets(db, ws, v.ID, uuid.Nil); err != nil {
-		return nil, err
-	} else if dep[p.TargetID] {
-		return nil, govConflict(GovCodeTargetDeployed, "This target already carries a deployment of this version; its approved plan is not revalidated.",
-			map[string]any{"plan_id": p.ID, "target_id": p.TargetID})
-	}
+	var appr *models.IGAGovApproval
 	var t models.IGAGovTarget
-	if err := db.Where("workspace_id = ? AND id = ?", ws, p.TargetID).Take(&t).Error; err != nil {
-		return nil, err
-	}
 	var c models.IGAGovControl
-	if err := db.Where("workspace_id = ? AND id = ?", ws, p.ControlID).Take(&c).Error; err != nil {
+	if err := a.readWorkspace(ctx, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND id = ?", ws, planID).Take(&p).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotFound()
+			}
+			return err
+		}
+		if err := db.Where("workspace_id = ? AND id = ?", ws, p.VersionID).Take(&v).Error; err != nil {
+			return err
+		}
+		var err error
+		if appr, err = liveApproval(db, ws, v.ID); err != nil {
+			return err
+		}
+		if v.Status != "approved" || appr == nil || !containsStr(appr.PlanHashes, p.PlanHash) || p.SupersededAt != nil {
+			return govConflict("plan_changed", "This plan is not the approved plan of its version.",
+				map[string]any{"plan_id": p.ID, "version_status": v.Status})
+		}
+		// fix/p3-appr (P0-2): never revalidate (and so never supersede) the
+		// plan of a target that already carries a deployment of this version.
+		if dep, err := deployedTargets(db, ws, v.ID, uuid.Nil); err != nil {
+			return err
+		} else if dep[p.TargetID] {
+			return govConflict(GovCodeTargetDeployed, "This target already carries a deployment of this version; its approved plan is not revalidated.",
+				map[string]any{"plan_id": p.ID, "target_id": p.TargetID})
+		}
+		if err := db.Where("workspace_id = ? AND id = ?", ws, p.TargetID).Take(&t).Error; err != nil {
+			return err
+		}
+		return db.Where("workspace_id = ? AND id = ?", ws, p.ControlID).Take(&c).Error
+	}); err != nil {
 		return nil, err
 	}
 	// fix/p3-appr (P1-10): a dedicated-identity version (split /
@@ -1148,8 +1180,12 @@ func (a *GovAuthoring) revalidate(ctx context.Context, ws, planID uuid.UUID, cal
 			rv.Result = models.GovRevalidationUnchanged
 		} else {
 			rv.Result = models.GovRevalidationMaterialChange
-			oldFacts, err := bundleFacts(db, ws, p.EvidenceBundleID)
-			if err != nil {
+			var oldFacts igagov.BundleFacts
+			if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+				var err error
+				oldFacts, err = bundleFacts(tx, ws, p.EvidenceBundleID)
+				return err
+			}); err != nil {
 				return nil, err
 			}
 			oldGaps, err := bundleGapRefs(oldFacts)
@@ -1354,7 +1390,16 @@ func sameGaps(a, b []igagov.GapRef) bool {
 // whose evidence is not fresh must be revalidated (Revalidate) before a
 // deployment starts; reasons name why.
 func (a *GovAuthoring) EvidenceFreshness(ctx context.Context, ws, planID uuid.UUID) (fresh bool, reasons []string, err error) {
-	db := a.db.WithContext(ctx)
+	err = a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var e error
+		fresh, reasons, e = a.evidenceFreshnessTx(tx, ws, planID)
+		return e
+	})
+	return fresh, reasons, err
+}
+
+// evidenceFreshnessTx is EvidenceFreshness in the caller's transaction.
+func (a *GovAuthoring) evidenceFreshnessTx(db *gorm.DB, ws, planID uuid.UUID) (fresh bool, reasons []string, err error) {
 	var p models.IGAGovPlan
 	if err := db.Where("workspace_id = ? AND id = ?", ws, planID).Take(&p).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
