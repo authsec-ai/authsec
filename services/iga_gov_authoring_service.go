@@ -927,6 +927,10 @@ func parseRightSize(raw json.RawMessage) (*igagov.RightSizeIntent, []byte, strin
 	if len(in.RightSize.RemoveActions) > 0 && !PolicyActionsOn() {
 		return nil, nil, "", actionsUnavailable()
 	}
+	if in.RightSize.HasTimeBound() && !PolicyR2On() {
+		// R2 off: time-conditioned retention is refused (IGA_POLICY_R2).
+		return nil, nil, "", r2Unavailable()
+	}
 	canon, hash, err := igagov.CanonicalIntent(in)
 	if err != nil {
 		return nil, nil, "", intentProblems(err)
@@ -1240,12 +1244,25 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 	keep := map[string]igagov.RetainEntry{}
 	keepActs := map[string]bool{}
 	for _, it := range items {
+		if it.Until != "" && !PolicyR2On() {
+			// R2 off: an owner cannot keep a service only until a date.
+			return nil, r2Unavailable()
+		}
 		if strings.Contains(it.Service, ":") && len(in.RemoveActions) > 0 {
 			// R1b: an owner retains an action by naming it. DECISION R1b-9:
 			// the action leaves remove_actions for every subject (an action
 			// retain is not owner-scoped); the owner's reason and review date
 			// stay on their owner response.
 			keepActs[igagov.ActionKey(it.Service)] = true
+			if it.Until != "" {
+				// R2 (DECISION R2-6): an owner keeps the action only until
+				// a date; afterwards AWS itself excludes it.
+				if a, ok := igagov.CanonicalAction(it.Service); ok {
+					ns, _, _ := igagov.SplitAction(a)
+					in.RetainActionsUntil = append(in.RetainActionsUntil, igagov.RetainActionUntilEntry{
+						Action: a, Service: ns, Until: it.Until, Reason: it.Reason})
+				}
+			}
 			continue
 		}
 		it.Basis = igagov.RetainOwner
@@ -1268,11 +1285,11 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 	}
 	var empty []string
 	for _, s := range in.Subjects {
-		if fs := in.ForSubject(s.IdentityAccountID); len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 {
+		if fs := in.ForSubject(s.IdentityAccountID); len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 && !fs.HasTimeBound() {
 			empty = append(empty, s.RoleID)
 		}
 	}
-	if (len(in.Remove) == 0 && len(in.RemoveActions) == 0) || len(empty) > 0 {
+	if (len(in.Remove) == 0 && len(in.RemoveActions) == 0 && !in.HasTimeBound()) || len(empty) > 0 {
 		return nil, govUnprocessable(GovCodeNothingToRemove, "Retaining these services leaves nothing to remove.",
 			map[string]any{"role_ids": empty})
 	}

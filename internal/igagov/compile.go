@@ -1271,10 +1271,15 @@ func (p Plan) CheckStorable() error {
 }
 
 // directLambdaSplit mirrors 061's widening of iga_gov_plan_kind_chk: a
-// split kind may be delivered directly only for a Lambda subject (R2,
-// DECISION R2-13).
+// split kind may be delivered directly only when the plan is eligible for a
+// Lambda subject, or ineligible (stored with its refusals) (R2, DECISION
+// R2-13).
 func (p Plan) directLambdaSplit() bool {
-	return p.Delivery == DeliveryDirect && p.Diff.Split != nil && p.Diff.Split.SubjectKind == SubjectLambdaFunction
+	if p.Delivery != DeliveryDirect {
+		return false
+	}
+	return p.Eligibility == EligibilityIneligible ||
+		(p.Eligibility == EligibilityEligible && p.Diff.Split != nil && p.Diff.Split.SubjectKind == SubjectLambdaFunction)
 }
 
 // ControlRef is the control a plan is compiled for, with what its tags and

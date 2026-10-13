@@ -8900,7 +8900,8 @@ END)),
     (kind IN ('split','split_revert')) = (desired_attachment = 'unchanged')
     AND (kind <> 'apply' OR desired_attachment = 'present')
     AND (kind NOT IN ('split','split_revert') OR delivery IN ('iac_pr','export')
-         OR (delivery = 'direct' AND (diff -> 'split' ->> 'subject_kind') = 'lambda_function')))
+         OR (delivery = 'direct' AND (eligibility = 'ineligible'
+             OR (eligibility = 'eligible' AND (diff -> 'split' ->> 'subject_kind') = 'lambda_function')))))
 );
 
 CREATE TABLE public.iga_gov_revalidation (

@@ -149,6 +149,11 @@ func (s *GovDeployments) observe(ctx context.Context, run *PolicyJobRun, build f
 }
 
 func excludes(doc *igagov.PolicyDocument, svc string) bool {
+	if doc != nil && PolicyR2On() {
+		// R2 (DECISION R2-7): a time-conditioned grant whose date has passed
+		// grants nothing, so posture reflects a time-bound retention's expiry.
+		return igagov.BoundaryExcludesAt(*doc, svc, time.Now().UTC())
+	}
 	return doc != nil && igagov.BoundaryExcludes(*doc, svc)
 }
 
@@ -383,6 +388,21 @@ func seedsFor(p igagov.Plan) []govPostureSeed {
 	for svc := range set {
 		st, rs := routeFacts(p, svc)
 		out = append(out, govPostureSeed{Service: svc, RouteState: st, Routes: rs, EvidenceRev: p.EvidenceRev, ScanRunID: scanOf(p)})
+	}
+	// R2: a service kept only until a date gets its posture row now, so its
+	// expiry shows in posture (DECISION R2-7). Its resource-policy routes
+	// were not analysed by this plan (it was not removed), so the row says
+	// so and never claims `removed` (§8.7 routes rule); the next evaluation
+	// replaces the route facts from evidence.
+	for _, tb := range p.Diff.TimeBound {
+		if tb.Kind != igagov.TimeBoundKindService || set[tb.Key] {
+			continue
+		}
+		set[tb.Key] = true
+		out = append(out, govPostureSeed{Service: tb.Key, RouteState: igagov.RouteStateNotAnalysed,
+			Routes: []igagov.Route{{Service: tb.Key, Effect: igagov.RouteStateNotAnalysed,
+				Reason: "kept until " + tb.Until + "; resource-policy routes not analysed by this plan"}},
+			EvidenceRev: p.EvidenceRev, ScanRunID: scanOf(p)})
 	}
 	return out
 }

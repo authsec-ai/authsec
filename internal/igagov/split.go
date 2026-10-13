@@ -259,6 +259,11 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 	if err := ValidateIntent(Intent{Kind: IntentDedicatedIdentity, DedicatedIdentity: &in.Intent}); err != nil {
 		return SplitPlans{}, compileErr(ErrCodeInvalidIntent, err.Error())
 	}
+	if in.Intent.Delivery == DeliveryDirect && !in.DirectAllowed {
+		// Without R2 a direct split is refused exactly as R1a's intent
+		// validation refused it (050 iga_gov_plan_kind_chk, probe DB40).
+		return SplitPlans{}, compileErr(ErrCodeInvalidIntent, "delivery: a dedicated identity is delivered only as iac_pr or export (§11)")
+	}
 	if in.Intent.Source.RoleID != in.Control.RoleID || in.Intent.Source.AccountID != in.Control.AccountID {
 		return SplitPlans{}, compileErr(ErrCodeInput, "the intent's source is not the control's role")
 	}

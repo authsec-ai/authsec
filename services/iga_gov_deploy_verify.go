@@ -175,6 +175,16 @@ func (s *GovDeployments) readPlan(ctx context.Context, run *PolicyJobRun, d mode
 	if env.AWS == nil {
 		return igagov.LiveRead{}, igagov.Classification{}, PolicyJobRetryLater(5*time.Minute, "AWS access is not configured")
 	}
+	if isDirectSplit(d, plan) {
+		// R2 (DECISION R2-20): a direct split is read as the IaC path reads
+		// one: source role, new role, and the migration evidence.
+		live, err := s.r2SplitLive(ctx, run, d, plan, ctl)
+		if err != nil {
+			return live, igagov.Classification{}, err
+		}
+		cl, err := igagov.Classify(plan, live)
+		return live, cl, err
+	}
 	var live igagov.LiveRead
 	err := run.External(ctx, 0, func(ctx context.Context) error {
 		disc, err := env.AWS.DiscoveryIAM(ctx, d.WorkspaceID, ctl.ConnectorID)

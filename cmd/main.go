@@ -205,6 +205,17 @@ func main() {
 	if r1bGate.Enabled() {
 		go r1bGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
 	}
+	// IGA_POLICY_R2 (SPEC-iga-phase3-policy.md §12.3): Phase 3 R2,
+	// time-bound access and session response. Its own switch, read ONCE,
+	// default off; on requires IGA_POLICY available (read live) and
+	// migration 061 verified by its own check, so a database without 061
+	// never takes R1a down. Off, R1a and R1b run exactly as before (no R2
+	// route, job kind, schedule or capability flag exists).
+	r2Gate := services.PolicyR2GateFromEnv()
+	services.SetPolicyR2Gate(r2Gate)
+	if r2Gate.Enabled() {
+		go r2Gate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
 	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
 	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
 	// ready hook, never before. It also claims nothing while the gate reads

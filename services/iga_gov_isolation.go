@@ -771,6 +771,8 @@ func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di
 		// the PR cannot add the new role.
 		MappedResources:            map[string]bool{},
 		MigrationEvidenceAvailable: facts.MigrationEvidence,
+		// R2 (DECISION R2-13): a Lambda split may be executed directly.
+		DirectAllowed: PolicyR2On(),
 	}
 	if basis.HasRun {
 		in.ScanEvidence = basis.Run.ResourcePolicy
@@ -930,6 +932,10 @@ func compileErrorAsGov(err error, roleID string) error {
 // evaluation's (a dedicated_identity intent carries none, and 049 requires
 // one); the plan's evidence is the bundle compiled at propose time.
 func (a *GovAuthoring) createIsolationVersion(ctx context.Context, ws, actor, policyID uuid.UUID, baseNo int, in *igagov.Intent) (*GovVersionView, error) {
+	if in.DedicatedIdentity != nil && in.DedicatedIdentity.Delivery == igagov.DeliveryDirect && !PolicyR2On() {
+		// R2 off: a dedicated identity is PR / export only (§11).
+		return nil, r2Unavailable()
+	}
 	canon, hash, err := igagov.CanonicalIntent(*in)
 	if err != nil {
 		return nil, intentProblems(err)

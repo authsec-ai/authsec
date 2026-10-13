@@ -176,6 +176,12 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.POST("/policies/:id/rollout/expand", require("governance", "enforce"), ctl.ExpandRollout)
 	g.POST("/policies/:id/rollout/pause", require("governance", "enforce"), ctl.PauseRollout)
 	g.POST("/policies/:id/rollout/resume", require("governance", "enforce"), ctl.ResumeRollout)
+
+	// R2 (IGA_POLICY_R2, iga_gov_r2_controller.go): mounted only while the
+	// switch is on (DECISION R2-21), so with it off the table is R1a's.
+	if services.PolicyR2GateState().Enabled() {
+		RegisterIGAPolicyR2Routes(g, ctl, require)
+	}
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
@@ -316,6 +322,23 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 				why = reason
 			}
 			reasons["actions"] = why
+		}
+	}
+	// R2 (IGA_POLICY_R2): policy.temporary_grants and policy.session_revoke
+	// (and policy.time_bound, policy.lambda_split_direct) are served only
+	// while the switch is on, so with it off the block is exactly R1a's.
+	if r2 := services.PolicyR2GateState(); r2.Enabled() {
+		state, why := r2.Status()
+		available := on && state == services.PolicyOn
+		for _, name := range []string{"temporary_grants", "session_revoke", "time_bound", "lambda_split_direct"} {
+			out[name] = available
+			if !available {
+				if !on {
+					reasons[name] = reason
+				} else {
+					reasons[name] = why
+				}
+			}
 		}
 	}
 	out["reasons"] = reasons

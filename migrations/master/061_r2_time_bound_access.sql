@@ -47,7 +47,8 @@ ALTER TABLE iga_gov_plan ADD CONSTRAINT iga_gov_plan_kind_chk CHECK (
     (kind IN ('split','split_revert')) = (desired_attachment = 'unchanged')
     AND (kind <> 'apply' OR desired_attachment = 'present')
     AND (kind NOT IN ('split','split_revert') OR delivery IN ('iac_pr','export')
-         OR (delivery = 'direct' AND (diff -> 'split' ->> 'subject_kind') = 'lambda_function')));
+         OR (delivery = 'direct' AND (eligibility = 'ineligible'
+             OR (eligibility = 'eligible' AND (diff -> 'split' ->> 'subject_kind') = 'lambda_function')))));
 
 ALTER TABLE iga_gov_notification DROP CONSTRAINT IF EXISTS iga_gov_notification_subject_kind_check;
 ALTER TABLE iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check
@@ -197,6 +198,18 @@ WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
 ON CONFLICT (role_id, permission_id) DO NOTHING;
 
 -- verify ----------------------------------------------------------------------
+-- Row-level security (CLAUDE.md §7, migration 111): every workspace table
+-- gets the tenancy policy. On a database where 111 already ran (production
+-- upgrades), enable it here; on a fresh database 111 has not run yet when
+-- 061 applies and its loop -- like 001's -- covers these tables later.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.iga_gov_temp_grant');
+        PERFORM public.tenancy_enable_rls('public.iga_gov_session_revocation');
+    END IF;
+END $$;
+
 DO $$
 DECLARE
     n integer;

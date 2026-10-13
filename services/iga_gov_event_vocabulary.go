@@ -51,6 +51,9 @@ const (
 	GovCatUndo           = "undo"
 	GovCatControlRemoval = "control_removal"
 	GovCatLegacy         = "legacy_agent_policy"
+	// R2 (IGA_POLICY_R2): temporary grants, session revocations and
+	// time-bound retention notices.
+	GovCatTimeBoundAccess = "time_bound_access"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -224,6 +227,30 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRolloutUndone, GovCatRollout, GovObjVersion, "The rollout's applied change was undone."},
 	{GovEventRolloutRefreshQueued, GovCatRollout, GovObjConnector, "A connector scan was queued so observation gets a fresh activity report."},
 	{GovEventRolloutRemoveControlStarted, GovCatControlRemoval, GovObjVersion, "An approved remove_control version was started (no observation or canary)."},
+	// R2 (IGA_POLICY_R2, iga_gov_r2_grants.go, iga_gov_r2_timebound.go).
+	{GovEventGrantRequested, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was requested (actions, resources, expiry)."},
+	{GovEventGrantApproved, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was approved (governance:grant, not the requester)."},
+	{GovEventGrantRejected, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was rejected."},
+	{GovEventGrantCancelled, GovCatTimeBoundAccess, GovObjTempGrant, "A pending temporary grant was cancelled."},
+	{GovEventGrantRevokeReq, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was revoked before its expiry."},
+	{GovEventGrantActive, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's policy is attached and verified by readback."},
+	{GovEventGrantEnded, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant ended: its policy was detached and deleted (expired or revoked)."},
+	{GovEventGrantFailed, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant could not be deployed."},
+	{GovEventGrantUnknown, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's AWS write had no answer; it is held until settle_after."},
+	{GovEventGrantDrifted, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's policy changed outside AuthSec (never auto-reconciled)."},
+	{GovEventRevocationReq, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was requested."},
+	{GovEventRevocationEmerg, GovCatTimeBoundAccess, GovObjSessionRevocation, "An emergency session revocation was made without approval (governance:emergency)."},
+	{GovEventRevocationAppr, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was approved; its cutoff was fixed."},
+	{GovEventRevocationRej, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was rejected."},
+	{GovEventRevocationCancel, GovCatTimeBoundAccess, GovObjSessionRevocation, "A pending session revocation was cancelled."},
+	{GovEventRevocationLift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was lifted before its automatic removal."},
+	{GovEventRevocationActive, GovCatTimeBoundAccess, GovObjSessionRevocation, "Sessions issued before the cutoff are denied (policy attached and verified)."},
+	{GovEventRevocationEnded, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's deny was removed."},
+	{GovEventRevocationFailed, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation could not be deployed."},
+	{GovEventRevocationUnk, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's AWS write had no answer; it is held until settle_after."},
+	{GovEventRevocationDrift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's policy changed outside AuthSec (never auto-reconciled)."},
+	{GovEventTimeBoundExpiring, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expires within 7 days."},
+	{GovEventTimeBoundExpired, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expired; posture follows."},
 }
 
 // Object kinds the events API filters on.
@@ -243,6 +270,9 @@ const (
 	GovObjWorkload           = "workload"
 	GovObjIdentityAccount    = "identity_account"
 	GovObjWorkloadOrIdentity = "workload|identity_account"
+	// R2 objects (payload keys).
+	GovObjTempGrant         = "temporary_grant"
+	GovObjSessionRevocation = "session_revocation"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
@@ -262,6 +292,8 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjNotification:    {payloadKey: "notification_id"},
 	GovObjWorkload:        {payloadKey: "object_id"},
 	GovObjIdentityAccount: {payloadKey: "object_id"},
+	GovObjTempGrant:         {payloadKey: "grant_id"},
+	GovObjSessionRevocation: {payloadKey: "revocation_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.
