@@ -1,0 +1,3 @@
+# Files whose database access runs only inside a transaction under row-level
+# security for one workspace (scripts/check-tenant-exempt.sh). A file moves
+# here from tenant-exempt-quarantine.txt once it is converted (AS-108).

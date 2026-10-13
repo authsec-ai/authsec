@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"log"
 	"os"
 	"runtime/debug"
@@ -547,9 +548,11 @@ func (r *PolicyJobRun) Jobs() repositories.IGAGovJobRepository { return r.jobs }
 
 // InTx runs fn in one transaction that first locks the job row and proves the
 // fence (AssertOwnedTx): every write the job makes is fenced, and a reclaim
-// waits for this transaction rather than racing it.
+// waits for this transaction rather than racing it. The transaction runs
+// under row-level security for the job's workspace: nothing a job does can
+// read or write another workspace's rows.
 func (r *PolicyJobRun) InTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return tenancy.InWorkspace(ctx, r.db, r.Job.WorkspaceID, func(tx *gorm.DB) error {
 		if err := r.jobs.AssertOwnedTx(tx, r.Fence); err != nil {
 			if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
 				r.markLost()

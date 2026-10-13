@@ -38,11 +38,41 @@ for pkg in "${rls_only[@]}"; do
 done
 rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
 
+# Files whose every statement runs inside a transaction under row-level
+# security for one workspace (tenancy.InWorkspace / InWorkspaceRead /
+# RLSTransaction, or a policy job's InTx). Their raw SQL is not counted. In
+# exchange, a base database handle (a struct's .db field, config.DB,
+# config.GetDatabase) may appear there only as the handle such a call opens
+# its transaction on, as a struct field being set, or on a statement
+# carrying a TENANT-EXEMPT reason on its line or one of the three above.
+rls_files_list=scripts/tenant-rls-files.txt
+rls_files=$(grep -vE '^[[:space:]]*(#|$)' "$rls_files_list" 2>/dev/null || true)
+if [[ -n "$rls_files" ]]; then
+  bad=$(echo "$rls_files" | xargs awk '
+      FNR == 1 { h1 = h2 = h3 = "" }
+      {
+        line = $0
+        if (line ~ /(\.db\b|config\.(DB|GetDatabase)\b)/ && line !~ /^[[:space:]]*\/\// \
+            && line !~ /tenancy\.(InWorkspace|InWorkspaceRead|RLSTransaction)\(/ \
+            && line !~ /\.InTx\(/ \
+            && line !~ /^[[:space:]]*db:[[:space:]]/ && line !~ /[{,][[:space:]]*db:[[:space:]]/ \
+            && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/)
+          print FILENAME ":" FNR ": " line
+        h3 = h2; h2 = h1; h1 = line
+      }')
+  if [[ -n "$bad" ]]; then
+    echo "RLS files reach the database outside a workspace transaction (see $rls_files_list):" >&2
+    echo "$bad" >&2
+    exit 1
+  fi
+fi
+
 hits=$(git ls-files '*.go' \
   | grep -v '_test\.go$' \
   | grep -v '^internal/tenancy/' \
   | grep -v '^tests/' \
   | grep -vE "$rls_only_re" \
+  | grep -vxF -f <(echo "${rls_files:-/dev/null/none}") \
   | xargs awk '
       BEGIN {
         # A statement handed straight to the scoped layer binds workspace_id
