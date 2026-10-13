@@ -1,8 +1,6 @@
 # Files merged from authsec-staging with raw SQL not yet on the scoped layer
 # (AS-108). Remove a file once its statements are scoped; never add one.
 repository/cloud_evidence_reads.go
-repository/cloud_resource_policy_repository.go
-repository/cloud_workload_repository.go
 repository/iga_gov_evaluation_repository.go
 repository/iga_gov_job_repository.go
 scripts/bootstrap-parity/main.go
