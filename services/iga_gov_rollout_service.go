@@ -18,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -237,13 +238,12 @@ func SetGovRolloutDeploymentFacts(f RolloutDeploymentFacts) (restore func()) {
 	}
 }
 
-func currentGovRolloutFacts(db *gorm.DB) RolloutDeploymentFacts {
+// currentGovRolloutFacts is the installed facts, or nil (the caller's
+// built-in GovRowDeploymentFacts).
+func currentGovRolloutFacts() RolloutDeploymentFacts {
 	govRolloutFactsMu.RLock()
 	defer govRolloutFactsMu.RUnlock()
-	if govRolloutFacts != nil {
-		return govRolloutFacts
-	}
-	return &GovRowDeploymentFacts{DB: db}
+	return govRolloutFacts
 }
 
 // GovRowDeploymentFacts reads a deployment's facts from the rows 051 holds:
@@ -261,7 +261,15 @@ type GovRowDeploymentFacts struct {
 // DeploymentGateFacts implements RolloutDeploymentFacts.
 func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, h *gorm.DB, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
 	if h == nil {
-		h = f.DB
+		// No transaction handed in: read in one of our own, under row-level
+		// security for ws.
+		var out *RolloutDeploymentGateFacts
+		err := tenancy.InWorkspaceRead(ctx, f.DB, ws, func(tx *gorm.DB) error {
+			var err error
+			out, err = f.DeploymentGateFacts(ctx, tx, ws, deploymentID)
+			return err
+		})
+		return out, err
 	}
 	db := h.WithContext(ctx)
 	var d models.IGAGovDeployment
@@ -359,21 +367,34 @@ type GovBindingCheck interface {
 }
 
 // GovRollout is §7.5's rollout and §8.6's observe_tick / refresh_activity.
+//
+// Every statement runs in a transaction under row-level security for the
+// workspace acted for: the route's (the token's), or the job's (run.InTx,
+// or a read-only workspace transaction on the job's handle). The only read
+// across workspaces is the periodic tick's due scan (dueRolloutTicks). No
+// transaction is held across prepare, whose revalidation reads AWS.
 type GovRollout struct {
 	db        *gorm.DB
 	live      LiveReader
 	reviews   *IGAGovOwnerReviewService
 	facts     RolloutDeploymentFacts
+	rowFacts  *GovRowDeploymentFacts
 	binding   GovBindingCheck
 	now       func() time.Time
 	authorFor func(db *gorm.DB) *GovAuthoring
+	// revalidator is the authoring service on the base handle, for
+	// Revalidate only: it reads AWS and commits on its own, so it must not
+	// run inside a rollout transaction.
+	revalidator *GovAuthoring
 }
 
 // NewGovRollout builds the service. live is the discovery-role reader
 // Revalidate needs (nil: a stale plan cannot be revalidated here).
 func NewGovRollout(db *gorm.DB, live LiveReader) *GovRollout {
 	r := &GovRollout{db: db, live: live, reviews: NewIGAGovOwnerReviewService(db), now: time.Now,
-		binding: NewEnforcementBindingService(db, nil, awsdiscovery.CallbackConfig{}, "")}
+		binding:  NewEnforcementBindingService(db, nil, awsdiscovery.CallbackConfig{}, ""),
+		rowFacts: &GovRowDeploymentFacts{DB: db}}
+	r.revalidator = NewGovAuthoring(db, live).WithClock(func() time.Time { return r.now() })
 	return r
 }
 
@@ -382,6 +403,27 @@ func (r *GovRollout) WithClock(now func() time.Time) *GovRollout {
 	r.now = now
 	r.reviews.now = now
 	return r
+}
+
+// read runs fn in a read-only transaction under row-level security for ws.
+func (r *GovRollout) read(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, r.db, ws, fn)
+}
+
+// write runs fn in a transaction under row-level security for ws.
+func (r *GovRollout) write(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, r.db, ws, fn)
+}
+
+// viewOf reads a version's rollout view under row-level security for ws.
+func (r *GovRollout) viewOf(ctx context.Context, ws uuid.UUID, v models.IGAGovPolicyVersion) (*GovRolloutView, error) {
+	var out *GovRolloutView
+	err := r.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = r.view(tx, ws, v)
+		return err
+	})
+	return out, err
 }
 
 // WithFacts makes this service read f instead of the process-wide facts.
@@ -394,7 +436,10 @@ func (r *GovRollout) deploymentFacts() RolloutDeploymentFacts {
 	if r.facts != nil {
 		return r.facts
 	}
-	return currentGovRolloutFacts(r.db)
+	if f := currentGovRolloutFacts(); f != nil {
+		return f
+	}
+	return r.rowFacts
 }
 
 func (r *GovRollout) authoring(db *gorm.DB) *GovAuthoring {
@@ -709,22 +754,31 @@ type GovRolloutStartInput struct {
 // review or approved (owner gate first), or the canary once the version is
 // approved and observed (§7.5). DECISION R3.
 func (r *GovRollout) Start(ctx context.Context, ws, actor, policyID uuid.UUID, in GovRolloutStartInput) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
-	v, err := r.policyVersionFor(db, ws, policyID, in.VersionNo, true)
+	var v *models.IGAGovPolicyVersion
+	var rc *govRolloutCtx
+	removeControl := false
+	err := r.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if v, err = r.policyVersionFor(db, ws, policyID, in.VersionNo, true); err != nil {
+			return err
+		}
+		if pi, perr := igagov.ParseIntent(v.Intent); perr == nil && pi.Kind == igagov.IntentRemoveControl {
+			removeControl = true
+			return nil
+		}
+		rc, err = r.loadVersionCtx(db, ws, *v, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if pi, perr := igagov.ParseIntent(v.Intent); perr == nil && pi.Kind == igagov.IntentRemoveControl {
+	if removeControl {
 		return r.startRemoveControl(ctx, ws, actor, *v, in.Reason)
-	}
-	rc, err := r.loadVersionCtx(db, ws, *v, false)
-	if err != nil {
-		return nil, err
 	}
 	if rc.Rollout != nil && rc.Rollout.Stage == models.GovRolloutAwaitingApproval {
 		return r.startCanary(ctx, ws, actor, *v, in.Reason)
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = r.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Exec(`SELECT 1 FROM iga_gov_policy WHERE workspace_id = ? AND id = ? FOR UPDATE`, ws, policyID).Error; err != nil {
 			return err
 		}
@@ -804,31 +858,35 @@ func (r *GovRollout) Start(ctx context.Context, ws, actor, policyID uuid.UUID, i
 	if err != nil {
 		return nil, err
 	}
-	return r.view(db, ws, *v)
+	return r.viewOf(ctx, ws, *v)
 }
 
 // startCanary is start's second form: the version is approved and observed.
 func (r *GovRollout) startCanary(ctx context.Context, ws, actor uuid.UUID, v models.IGAGovPolicyVersion, reason string) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
-	rc, err := r.loadVersionCtx(db, ws, v, false)
+	var rc *govRolloutCtx
+	var ct *govRolloutTarget
+	err := r.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if rc, err = r.loadVersionCtx(db, ws, v, false); err != nil {
+			return err
+		}
+		if err := policyUsable(rc.Policy); err != nil {
+			return err
+		}
+		if ct, err = rc.canary(); err != nil {
+			return err
+		}
+		return r.checkCanaryChoice(db, ws, rc, ct)
+	})
 	if err != nil {
 		return nil, err
 	}
-	if err := policyUsable(rc.Policy); err != nil {
-		return nil, err
-	}
-	ct, err := rc.canary()
-	if err != nil {
-		return nil, err
-	}
-	if err := r.checkCanaryChoice(db, ws, rc, ct); err != nil {
-		return nil, err
-	}
+	// Outside any transaction: prepare may revalidate, which reads AWS.
 	prep, err := r.prepare(ctx, ws, rc, *ct)
 	if err != nil {
 		return nil, err
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = r.write(ctx, ws, func(tx *gorm.DB) error {
 		var cur models.IGAGovPolicyVersion
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, v.ID).Clauses(lockForUpdate()).Take(&cur).Error; err != nil {
 			return err
@@ -873,7 +931,7 @@ func (r *GovRollout) startCanary(ctx context.Context, ws, actor uuid.UUID, v mod
 	if err != nil {
 		return nil, err
 	}
-	return r.view(db, ws, v)
+	return r.viewOf(ctx, ws, v)
 }
 
 // checkCanaryChoice is §8.6's canary rule (DECISION R5).
@@ -969,14 +1027,24 @@ func (r *GovRollout) prepare(ctx context.Context, ws uuid.UUID, rc *govRolloutCt
 		return nil, govUnprocessable(GovCodeTargetIneligible, "The target's plan is ineligible.",
 			map[string]any{"target_id": t.Target.ID, "reason": t.Plan.IneligibleReason})
 	}
-	a := r.authoring(r.db)
-	ua, err := a.UsableApproval(ctx, ws, rc.Version.ID, []uuid.UUID{t.Plan.ID})
+	usable := func() (*GovUsableApproval, error) {
+		var ua *GovUsableApproval
+		err := r.read(ctx, ws, func(tx *gorm.DB) error {
+			var err error
+			ua, err = r.authoring(tx).UsableApproval(ctx, ws, rc.Version.ID, []uuid.UUID{t.Plan.ID})
+			return err
+		})
+		return ua, err
+	}
+	ua, err := usable()
 	var ge *GovError
 	if errors.As(err, &ge) && ge.Code == GovCodeRevalidationNeeded {
 		if r.live == nil {
 			return nil, err
 		}
-		rv, rerr := a.Revalidate(ctx, ws, t.Plan.ID)
+		// Revalidate reads AWS and commits on its own: never inside a
+		// rollout transaction.
+		rv, rerr := r.revalidator.Revalidate(ctx, ws, t.Plan.ID)
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -984,7 +1052,7 @@ func (r *GovRollout) prepare(ctx context.Context, ws uuid.UUID, rc *govRolloutCt
 			return nil, govConflict(GovCodeMaterialChange, "Revalidation found a material change; a new approval is needed.",
 				map[string]any{"plan_id": t.Plan.ID, "revalidation_id": rv.Revalidation.ID, "changes": rv.Changes})
 		}
-		ua, err = a.UsableApproval(ctx, ws, rc.Version.ID, []uuid.UUID{t.Plan.ID})
+		ua, err = usable()
 	}
 	if err != nil {
 		return nil, err
@@ -1093,9 +1161,10 @@ const GovCodeRemoveControlUnavailable = "remove_control_not_available"
 
 // startRemoveControl hands an approved remove_control version to T3.16.
 func (r *GovRollout) startRemoveControl(ctx context.Context, ws, actor uuid.UUID, v models.IGAGovPolicyVersion, reason string) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
 	var pol models.IGAGovPolicy
-	if err := db.Where("workspace_id = ? AND id = ?", ws, v.PolicyID).Take(&pol).Error; err != nil {
+	if err := r.read(ctx, ws, func(db *gorm.DB) error {
+		return db.Where("workspace_id = ? AND id = ?", ws, v.PolicyID).Take(&pol).Error
+	}); err != nil {
 		return nil, err
 	}
 	if pol.Lifecycle == "archived" {
@@ -1110,10 +1179,11 @@ func (r *GovRollout) startRemoveControl(ctx context.Context, ws, actor uuid.UUID
 	if start == nil {
 		return nil, govConflict(GovCodeRemoveControlUnavailable, "Removing AuthSec control is not available in this build.", nil)
 	}
-	if err := start(ctx, db, ws, actor, v.ID); err != nil {
+	// The starter runs in a transaction under row-level security for ws.
+	if err := r.write(ctx, ws, func(tx *gorm.DB) error { return start(ctx, tx, ws, actor, v.ID) }); err != nil {
 		return nil, err
 	}
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	if err := r.write(ctx, ws, func(tx *gorm.DB) error {
 		ak, aid := actorPair(actor)
 		p, vid := v.PolicyID, v.ID
 		return appendGovEvent(tx, ws, GovEventRolloutRemoveControlStarted, ak, aid, govEventRefs{PolicyID: &p, VersionID: &vid},
@@ -1123,11 +1193,13 @@ func (r *GovRollout) startRemoveControl(ctx context.Context, ws, actor uuid.UUID
 	}
 	out := &GovRolloutView{PolicyID: v.PolicyID, VersionNo: v.VersionNo, Version: v.Status, Deployments: []GovRolloutDeployment{},
 		Acceptances: []models.IGAGovAcceptance{}, Actions: []string{}}
-	if err := db.Raw(`SELECT d.id, t.id AS target_id, c.role_id, false AS canary, d.state, d.applied_at, d.created_at
-		FROM iga_gov_deployment d
-		JOIN iga_gov_control c ON c.workspace_id = d.workspace_id AND c.id = d.control_id
-		LEFT JOIN iga_gov_target t ON t.workspace_id = d.workspace_id AND t.version_id = d.version_id AND t.control_id = d.control_id
-		WHERE d.workspace_id = ? AND d.version_id = ? ORDER BY d.created_at, d.id`, ws, v.ID).Scan(&out.Deployments).Error; err != nil {
+	if err := r.read(ctx, ws, func(db *gorm.DB) error {
+		return db.Raw(`SELECT d.id, t.id AS target_id, c.role_id, false AS canary, d.state, d.applied_at, d.created_at
+			FROM iga_gov_deployment d
+			JOIN iga_gov_control c ON c.workspace_id = d.workspace_id AND c.id = d.control_id
+			LEFT JOIN iga_gov_target t ON t.workspace_id = d.workspace_id AND t.version_id = d.version_id AND t.control_id = d.control_id
+			WHERE d.workspace_id = ? AND d.version_id = ? ORDER BY d.created_at, d.id`, ws, v.ID).Scan(&out.Deployments).Error
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -1340,12 +1412,16 @@ func (r *GovRollout) Resume(ctx context.Context, ws, actor, policyID uuid.UUID, 
 // mutateActive runs fn on the policy's active rollout, locked, then
 // returns the view.
 func (r *GovRollout) mutateActive(ctx context.Context, ws, policyID uuid.UUID, fn func(tx *gorm.DB, rc *govRolloutCtx) error) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
-	v, err := r.policyVersionFor(db, ws, policyID, nil, false)
+	var v *models.IGAGovPolicyVersion
+	err := r.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		v, err = r.policyVersionFor(db, ws, policyID, nil, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = r.write(ctx, ws, func(tx *gorm.DB) error {
 		var cur models.IGAGovPolicyVersion
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, v.ID).Clauses(lockForUpdate()).Take(&cur).Error; err != nil {
 			return err
@@ -1362,7 +1438,7 @@ func (r *GovRollout) mutateActive(ctx context.Context, ws, policyID uuid.UUID, f
 	if err != nil {
 		return nil, err
 	}
-	return r.view(db, ws, *v)
+	return r.viewOf(ctx, ws, *v)
 }
 
 // pauseTx pauses rc's rollout with kind and reason, offering undo of the
@@ -1413,7 +1489,6 @@ type GovRolloutExpandInput struct {
 // acceptance named in the body (stored as a gate_not_available row); then
 // each other target gets its deployment (single target: complete).
 func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, in GovRolloutExpandInput) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
 	extra := map[string]bool{}
 	for i, a := range in.AcceptNotAvailable {
 		if strings.TrimSpace(a.Reason) == "" || a.Gate == "" {
@@ -1424,50 +1499,55 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 		}
 		extra[a.Gate] = true
 	}
-	v, err := r.policyVersionFor(db, ws, policyID, nil, false)
-	if err != nil {
-		return nil, err
-	}
-	if len(extra) > 0 {
-		if v.CreatedBy == actor {
-			return nil, govErr(http.StatusForbidden, GovCodeSelfApproval, "You authored this version; another approver must accept unavailable gates.", nil)
+	var v *models.IGAGovPolicyVersion
+	var rc *govRolloutCtx
+	var depID uuid.UUID
+	err := r.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if v, err = r.policyVersionFor(db, ws, policyID, nil, false); err != nil {
+			return err
 		}
-		ok, err := holdsPermission(db, ws, actor, "governance", "approve")
+		if len(extra) > 0 {
+			if v.CreatedBy == actor {
+				return govErr(http.StatusForbidden, GovCodeSelfApproval, "You authored this version; another approver must accept unavailable gates.", nil)
+			}
+			ok, err := holdsPermission(db, ws, actor, "governance", "approve")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return govErr(http.StatusForbidden, "forbidden", "Accepting an unavailable gate needs governance:approve.", nil)
+			}
+		}
+		if rc, err = r.loadVersionCtx(db, ws, *v, false); err != nil {
+			return err
+		}
+		if rc.Rollout == nil || rc.Rollout.Stage != models.GovRolloutCanary {
+			st := ""
+			if rc.Rollout != nil {
+				st = rc.Rollout.Stage
+			}
+			return govConflict(GovCodeRolloutConflict, "Only a rollout in canary can expand.", map[string]any{"stage": st})
+		}
+		if err := policyUsable(rc.Policy); err != nil {
+			return err
+		}
+		g := rolloutResults(rc.Rollout)
+		if g.Canary == nil {
+			return govConflict(GovCodeGatesNotPassed, "The canary has no deployment.", nil)
+		}
+		depID = g.Canary.DeploymentID
+		// A first look before the transaction that acts: refuse early (no
+		// AWS reads for the other targets' approvals) when the canary cannot
+		// expand. The decision itself is taken again below, on facts read
+		// under lock in the transaction that acts on it.
+		pre, err := r.evaluateGates(ctx, db, ws, rc, depID, 0)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if !ok {
-			return nil, govErr(http.StatusForbidden, "forbidden", "Accepting an unavailable gate needs governance:approve.", nil)
-		}
-	}
-	rc, err := r.loadVersionCtx(db, ws, *v, false)
+		return expandRefusal(pre, in, extra)
+	})
 	if err != nil {
-		return nil, err
-	}
-	if rc.Rollout == nil || rc.Rollout.Stage != models.GovRolloutCanary {
-		st := ""
-		if rc.Rollout != nil {
-			st = rc.Rollout.Stage
-		}
-		return nil, govConflict(GovCodeRolloutConflict, "Only a rollout in canary can expand.", map[string]any{"stage": st})
-	}
-	if err := policyUsable(rc.Policy); err != nil {
-		return nil, err
-	}
-	g := rolloutResults(rc.Rollout)
-	if g.Canary == nil {
-		return nil, govConflict(GovCodeGatesNotPassed, "The canary has no deployment.", nil)
-	}
-	depID := g.Canary.DeploymentID
-	// A first look outside the transaction: refuse early (no AWS reads for
-	// the other targets' approvals) when the canary cannot expand. The
-	// decision itself is taken again below, on facts read under lock in the
-	// transaction that acts on it.
-	pre, err := r.evaluateGates(ctx, db, ws, rc, depID, 0)
-	if err != nil {
-		return nil, err
-	}
-	if err := expandRefusal(pre, in, extra); err != nil {
 		return nil, err
 	}
 	preps := map[uuid.UUID]*govPrepared{}
@@ -1492,7 +1572,7 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 		preps[t.Target.ID] = p
 	}
 	var firstRefusal error
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = r.write(ctx, ws, func(tx *gorm.DB) error {
 		var cur models.IGAGovPolicyVersion
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, v.ID).Clauses(lockForUpdate()).Take(&cur).Error; err != nil {
 			return err
@@ -1576,7 +1656,7 @@ func (r *GovRollout) Expand(ctx context.Context, ws, actor, policyID uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	return r.view(db, ws, *v)
+	return r.viewOf(ctx, ws, *v)
 }
 
 // expandRefusal is the manual expand's check of an evaluation: the canary
@@ -1751,25 +1831,29 @@ func (r *GovRollout) settleTx(tx *gorm.DB, ws uuid.UUID, rc *govRolloutCtx) erro
 // Get is GET /policies/:id/rollout[?version_no]: the policy's active
 // rollout, else the newest version's rollout.
 func (r *GovRollout) Get(ctx context.Context, ws, policyID uuid.UUID, versionNo *int) (*GovRolloutView, error) {
-	db := r.db.WithContext(ctx)
-	v, err := r.policyVersionFor(db, ws, policyID, versionNo, false)
-	if err != nil {
-		var ge *GovError
-		if !errors.As(err, &ge) || ge.Code != GovCodeRolloutNotStarted || versionNo != nil {
-			return nil, err
+	var out *GovRolloutView
+	err := r.read(ctx, ws, func(db *gorm.DB) error {
+		v, err := r.policyVersionFor(db, ws, policyID, versionNo, false)
+		if err != nil {
+			var ge *GovError
+			if !errors.As(err, &ge) || ge.Code != GovCodeRolloutNotStarted || versionNo != nil {
+				return err
+			}
+			var vs []models.IGAGovPolicyVersion
+			if err := db.Raw(`SELECT v.* FROM iga_gov_policy_version v
+				JOIN iga_gov_rollout r ON r.workspace_id = v.workspace_id AND r.version_id = v.id
+				WHERE v.workspace_id = ? AND v.policy_id = ? ORDER BY v.version_no DESC LIMIT 1`, ws, policyID).Scan(&vs).Error; err != nil {
+				return err
+			}
+			if len(vs) == 0 {
+				return govErr(http.StatusNotFound, GovCodeRolloutNotStarted, "The policy has no rollout.", nil)
+			}
+			v = &vs[0]
 		}
-		var vs []models.IGAGovPolicyVersion
-		if err := db.Raw(`SELECT v.* FROM iga_gov_policy_version v
-			JOIN iga_gov_rollout r ON r.workspace_id = v.workspace_id AND r.version_id = v.id
-			WHERE v.workspace_id = ? AND v.policy_id = ? ORDER BY v.version_no DESC LIMIT 1`, ws, policyID).Scan(&vs).Error; err != nil {
-			return nil, err
-		}
-		if len(vs) == 0 {
-			return nil, govErr(http.StatusNotFound, GovCodeRolloutNotStarted, "The policy has no rollout.", nil)
-		}
-		v = &vs[0]
-	}
-	return r.view(db, ws, *v)
+		out, err = r.view(db, ws, *v)
+		return err
+	})
+	return out, err
 }
 
 func (r *GovRollout) view(db *gorm.DB, ws uuid.UUID, v models.IGAGovPolicyVersion) (*GovRolloutView, error) {

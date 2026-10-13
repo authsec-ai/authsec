@@ -1,3 +1,11 @@
 # Files whose database access runs only inside a transaction under row-level
 # security for one workspace (scripts/check-tenant-exempt.sh). A file moves
 # here from tenant-exempt-quarantine.txt once it is converted (AS-108).
+services/cloud_aws_iac_access.go
+services/cloud_enforcement_binding_jobs.go
+services/cloud_enforcement_binding_service.go
+services/cloud_enforcement_deploy_gate.go
+services/iga_gov_rollout_canary.go
+services/iga_gov_rollout_jobs.go
+services/iga_gov_rollout_service.go
+services/iga_gov_rollout_wiring.go
