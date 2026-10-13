@@ -54,6 +54,10 @@ const (
 	// R2 (IGA_POLICY_R2): temporary grants, session revocations and
 	// time-bound retention notices.
 	GovCatTimeBoundAccess = "time_bound_access"
+	// R3 (IGA_POLICY_R3): agent runtime controls. Listed by the Logs kind
+	// filter only while the switch is on (GovEventCategories), so with it off
+	// the filter is exactly R2's.
+	GovCatRuntimeControls = "runtime_controls"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -251,6 +255,32 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRevocationDrift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's policy changed outside AuthSec (never auto-reconciled)."},
 	{GovEventTimeBoundExpiring, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expires within 7 days."},
 	{GovEventTimeBoundExpired, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expired; posture follows."},
+	// R3 (IGA_POLICY_R3, iga_gov_r3_policy.go, iga_gov_r3_runtime.go).
+	{GovEventRuntimePolicyCreated, GovCatRuntimeControls, GovObjPolicy, "A runtime_controls policy was created with its first version in review."},
+	{GovEventRuntimeVersionCreated, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was created in review."},
+	{GovEventRuntimeVersionApproved, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was approved (governance:approve, not its author); the previous one was superseded."},
+	{GovEventRuntimeVersionRejected, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was rejected."},
+	{GovEventRuntimeVersionWithdrawn, GovCatRuntimeControls, GovObjPolicy, "A runtime_controls version in review was withdrawn or replaced."},
+	{GovEventRuntimeSettingsUpdated, GovCatRuntimeControls, "", "Runtime settings (argument retention, redaction, decision TTL, hold timeout) changed."},
+	{GovEventRoutingProofRecorded, GovCatRuntimeControls, "", "A gateway-only routing proof was recorded (asserted, not verified by AuthSec)."},
+	{GovEventRoutingProofRevoked, GovCatRuntimeControls, "", "A routing proof was revoked; the gateway's controls are advisory again."},
+	{GovEventAgentCorePushed, GovCatRuntimeControls, GovObjVersion, "The allow-list was pushed to an AgentCore policy engine and read back."},
+	{GovEventAgentCorePushFailed, GovCatRuntimeControls, GovObjVersion, "Pushing the allow-list to an AgentCore policy engine failed."},
+	{GovEventBrokerRoleBound, GovCatRuntimeControls, "", "A role was opted in to brokered AWS sessions."},
+	{GovEventBrokerRoleDisabled, GovCatRuntimeControls, "", "A role was opted out of brokered AWS sessions."},
+	{GovEventRuntimeDecided, GovCatRuntimeControls, GovObjVersion, "AuthSec decided an agent's tool call (allow, deny or hold), bound to its arguments digest, version and expiry."},
+	{GovEventRuntimeRedeemed, GovCatRuntimeControls, GovObjVersion, "An allow was redeemed (spent once) by the executing point."},
+	{GovEventRuntimeOutcome, GovCatRuntimeControls, GovObjVersion, "The agent reported the tool / AWS outcome (agent-reported, apart from AuthSec's decision); budgets settled."},
+	{GovEventRuntimeHoldOpened, GovCatRuntimeControls, GovObjVersion, "A designated tool call is held for human approval."},
+	{GovEventRuntimeHoldApproved, GovCatRuntimeControls, GovObjVersion, "A held call was approved (governance:approve, not the initiating human)."},
+	{GovEventRuntimeHoldRejected, GovCatRuntimeControls, GovObjVersion, "A held call was rejected."},
+	{GovEventRuntimeHoldExpired, GovCatRuntimeControls, GovObjVersion, "A hold (or its approval) timed out."},
+	{GovEventRuntimeHoldResumed, GovCatRuntimeControls, GovObjVersion, "An approved hold was resumed: exactly one decision was issued for it."},
+	{GovEventRuntimeBudgetSwept, GovCatRuntimeControls, "", "Reservations of unredeemed or unreported allows were released or settled."},
+	{GovEventRuntimeArgsPruned, GovCatRuntimeControls, "", "Retained (redacted) arguments past the retention period were deleted."},
+	{GovEventBrokerSessionRequested, GovCatRuntimeControls, GovObjVersion, "A brokered AWS session was requested for an allow (the allow was spent)."},
+	{GovEventBrokerSessionIssued, GovCatRuntimeControls, GovObjVersion, "sts:AssumeRole issued a brokered session (credentials returned once, never stored)."},
+	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
 }
 
 // Object kinds the events API filters on.
@@ -306,6 +336,22 @@ func GovEventObjectKinds() []string {
 	return out
 }
 
+// GovEventVocabularyServed is the vocabulary GET /events/kinds serves: R3's
+// entries only while IGA_POLICY_R3 is switched on, so with it off the answer
+// is exactly R2's.
+func GovEventVocabularyServed() []GovEventKind {
+	if PolicyR3GateState().Enabled() {
+		return GovEventVocabulary
+	}
+	out := make([]GovEventKind, 0, len(GovEventVocabulary))
+	for _, k := range GovEventVocabulary {
+		if k.Category != GovCatRuntimeControls {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // GovEventCategory is the Logs category of an event name ("" when the name
 // is not in the vocabulary).
 func GovEventCategory(name string) string {
@@ -335,7 +381,11 @@ var govUnrecordedCategories = []string{GovCatProposal, GovCatApproval, GovCatAcc
 func GovEventCategories() []GovEventCategoryView {
 	idx := map[string]int{}
 	var out []GovEventCategoryView
+	r3 := PolicyR3GateState().Enabled()
 	for _, k := range GovEventVocabulary {
+		if k.Category == GovCatRuntimeControls && !r3 {
+			continue
+		}
 		i, ok := idx[k.Category]
 		if !ok {
 			i = len(out)

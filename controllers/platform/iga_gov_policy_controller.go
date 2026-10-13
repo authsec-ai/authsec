@@ -182,6 +182,11 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	if services.PolicyR2GateState().Enabled() {
 		RegisterIGAPolicyR2Routes(g, ctl, require)
 	}
+	// R3 (IGA_POLICY_R3, iga_gov_r3_controller.go): mounted only while the
+	// switch is on (DECISION R3-17), so with it off the table is R2's.
+	if services.PolicyR3GateState().Enabled() {
+		RegisterIGAPolicyR3Routes(g, ctl, require)
+	}
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
@@ -339,6 +344,31 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 					reasons[name] = why
 				}
 			}
+		}
+	}
+	// R3 (IGA_POLICY_R3): policy.runtime_controls and
+	// policy.brokered_sessions are served only while the switch is on, so
+	// with it off the block is exactly R2's. Brokered sessions also need the
+	// process's broker (Vault and AuthSec's AWS identity).
+	if r3 := services.PolicyR3GateState(); r3.Enabled() {
+		state, why := r3.Status()
+		available := on && state == services.PolicyOn
+		if !on {
+			why = reason
+		}
+		out["runtime_controls"] = available
+		if !available {
+			reasons["runtime_controls"] = why
+		}
+		brokered, bwhy := available, why
+		if available {
+			if d := services.CurrentRuntimeBrokerDeps(); d == nil || d.Broker == nil || d.Inputs == nil {
+				brokered, bwhy = false, "Brokered AWS sessions need Vault (the connector ExternalId) and AuthSec's own AWS identity on this server."
+			}
+		}
+		out["brokered_sessions"] = brokered
+		if !brokered {
+			reasons["brokered_sessions"] = bwhy
 		}
 	}
 	out["reasons"] = reasons
