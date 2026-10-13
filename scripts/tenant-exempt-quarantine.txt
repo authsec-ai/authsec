@@ -1,9 +1,5 @@
 # Files merged from authsec-staging with raw SQL not yet on the scoped layer
 # (AS-108). Remove a file once its statements are scoped; never add one.
-repository/cloud_evidence_reads.go
-repository/cloud_resource_policy_repository.go
-repository/cloud_workload_repository.go
-repository/iga_gov_evaluation_repository.go
 repository/iga_gov_job_repository.go
 scripts/bootstrap-parity/main.go
 services/agent_policy_legacy_compat.go
@@ -13,24 +9,16 @@ services/cloud_enforcement_binding_service.go
 services/iga_gov_approval_service.go
 services/iga_gov_authoring_service.go
 services/iga_gov_compile_service.go
-services/iga_gov_evaluator.go
 services/iga_gov_iac_delivery.go
 services/iga_gov_iac_transitions.go
-services/iga_gov_isolation.go
 services/iga_gov_job_scheduler.go
-services/iga_gov_metrics.go
 services/iga_gov_notify.go
 services/iga_gov_owner_review_service.go
 services/iga_gov_ownership_service.go
-services/iga_gov_prune_evidence.go
-services/iga_gov_readiness.go
-services/iga_gov_reads.go
 services/iga_gov_rollout_canary.go
 services/iga_gov_rollout_jobs.go
 services/iga_gov_rollout_service.go
 services/iga_gov_settings_service.go
-services/iga_gov_snapshot.go
-services/iga_gov_targets.go
 services/slack_integration_channel.go
 services/slack_integration_interactions.go
 services/slack_integration_service.go

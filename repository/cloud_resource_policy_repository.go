@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -68,6 +69,17 @@ func NewCloudResourcePolicyRepository(db *gorm.DB) CloudResourcePolicyRepository
 	return &cloudResourcePolicyRepository{db: db}
 }
 
+// read and write run fn in one transaction under row-level security for ws
+// on the repository's handle (a savepoint inside a caller's transaction):
+// every statement sees and writes only ws's rows (AS-108).
+func (r *cloudResourcePolicyRepository) read(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
+func (r *cloudResourcePolicyRepository) write(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
 func (r *cloudResourcePolicyRepository) Fenced(f ScanFence) CloudResourcePolicyRepository {
 	return &cloudResourcePolicyRepository{db: r.db, fence: &f}
 }
@@ -84,7 +96,7 @@ func (r *cloudResourcePolicyRepository) RecordForm(
 		return false, errors.New("record resource-policy form: no coverage row")
 	}
 	inserted := false
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := r.write(cov.WorkspaceID, func(tx *gorm.DB) error {
 		if r.fence != nil {
 			if err := assertScanFence(tx, *r.fence); err != nil {
 				return err
@@ -176,15 +188,19 @@ func storeDocuments(tx *gorm.DB, ws uuid.UUID, docs []models.CloudPolicyDocument
 
 func (r *cloudResourcePolicyRepository) CoverageForScan(ws, scan uuid.UUID) ([]models.CloudResourcePolicyCoverage, error) {
 	var out []models.CloudResourcePolicyCoverage
-	err := r.db.Where("workspace_id = ? AND scan_run_id = ?", ws, scan).
-		Order("resource_form, region").Find(&out).Error
+	err := r.read(ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND scan_run_id = ?", ws, scan).
+			Order("resource_form, region").Find(&out).Error
+	})
 	return out, err
 }
 
 func (r *cloudResourcePolicyRepository) ObservationsForScan(ws, scan uuid.UUID) ([]models.CloudResourcePolicyObservation, error) {
 	var out []models.CloudResourcePolicyObservation
-	err := r.db.Where("workspace_id = ? AND scan_run_id = ?", ws, scan).
-		Order("resource_form, region, resource_arn").Find(&out).Error
+	err := r.read(ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND scan_run_id = ?", ws, scan).
+			Order("resource_form, region, resource_arn").Find(&out).Error
+	})
 	return out, err
 }
 
@@ -194,7 +210,9 @@ func (r *cloudResourcePolicyRepository) Documents(ws uuid.UUID, hashes []string)
 		return out, nil
 	}
 	var rows []models.CloudPolicyDocument
-	if err := r.db.Where("workspace_id = ? AND document_hash IN ?", ws, hashes).Find(&rows).Error; err != nil {
+	if err := r.read(ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND document_hash IN ?", ws, hashes).Find(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	for _, d := range rows {
@@ -222,7 +240,7 @@ func (r *cloudResourcePolicyRepository) PruneEvidence(ws uuid.UUID, keepRevs int
 	if keepRevs < 1 {
 		return out, fmt.Errorf("prune evidence: keepRevs must be positive, got %d", keepRevs)
 	}
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := r.write(ws, func(tx *gorm.DB) error {
 		var victims []uuid.UUID
 		if err := tx.Raw(`
 			WITH retained AS (
