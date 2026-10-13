@@ -94,6 +94,14 @@ func PruneEvidenceHandler(ctx context.Context, run *PolicyJobRun) error {
 		if err != nil {
 			return fmt.Errorf("evaluation evidence: %w", err)
 		}
+		if PolicyActionsOn() {
+			// R1b: action evidence of the revisions just recorded as pruned.
+			n, err := pruneActionEvidenceTx(tx, ws)
+			if err != nil {
+				return fmt.Errorf("action evidence: %w", err)
+			}
+			results += n
+		}
 		rp, err := PruneResourcePolicyEvidence(tx, ws)
 		if err != nil {
 			return fmt.Errorf("resource-policy evidence: %w", err)

@@ -246,6 +246,15 @@ func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (ig
 	if err != nil {
 		return igagov.Evaluation{}, nil, fmt.Errorf("snapshot: %w", err)
 	}
+	if PolicyActionsOn() {
+		// R1b (IGA_POLICY_R1B): the connectors' CloudTrail history, read
+		// under the same barrier, qualifies actions of the services kept.
+		trails, err := loadActionTrails(ctx, e.db, ws, gs.Snap.EvaluatedAt)
+		if err != nil {
+			return igagov.Evaluation{}, nil, fmt.Errorf("snapshot: %w", err)
+		}
+		gs.Snap.ActionLevel, gs.Snap.ActionTrails = true, trails
+	}
 	if err := e.stage("after_snapshot", rev, nil); err != nil {
 		return igagov.Evaluation{}, nil, err
 	}
@@ -349,6 +358,11 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 	}
 	if err := e.repo.InsertEvidenceTx(tx, evidence); err != nil {
 		return fmt.Errorf("activity evidence: %w", err)
+	}
+	if out.ActionLevel {
+		if err := insertActionEvidenceTx(tx, ws, rev, out.ActionEvidence); err != nil {
+			return fmt.Errorf("action evidence: %w", err)
+		}
 	}
 
 	// §8.7 lock order 1: the workspace's live controls.
@@ -499,6 +513,9 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 	}
 	counts["results"] = len(results)
 	counts["evidence"] = len(evidence)
+	if out.ActionLevel {
+		counts["action_evidence"] = len(out.ActionEvidence)
+	}
 	return e.appendEvent(tx, ws, "evaluation_completed", map[string]any{"rev": rev, "counts": counts,
 		"skipped_roles": len(out.Skipped), "unknown_conditions": len(out.Unknown)})
 }
@@ -589,8 +606,14 @@ func (e *GovEvaluator) prune(ctx context.Context, ws uuid.UUID) {
 		if err != nil {
 			return fmt.Errorf("settings: %w", err)
 		}
-		_, err = e.repo.PruneTx(tx, ws, settings.EvidenceRetentionRevs)
-		return err
+		if _, err := e.repo.PruneTx(tx, ws, settings.EvidenceRetentionRevs); err != nil {
+			return err
+		}
+		if PolicyActionsOn() {
+			_, err := pruneActionEvidenceTx(tx, ws)
+			return err
+		}
+		return nil
 	}); err != nil {
 		log.Printf("[policy] prune workspace %s: %v", ws, err)
 	}

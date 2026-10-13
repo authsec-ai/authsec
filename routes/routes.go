@@ -43,6 +43,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -1364,6 +1365,18 @@ func SetupRoutes(
 			extSvcs.PUT("/:id", middlewares.Require("external-service", "update"), extSvcController.UpdateExternalService)
 			extSvcs.DELETE("/:id", middlewares.Require("external-service", "delete"), extSvcController.DeleteExternalService)
 			extSvcs.GET("/:id/credentials", middlewares.Require("external-service", "credentials"), extSvcController.GetExternalServiceCredentials)
+		}
+
+		// Phase 3 R3 agent runtime controls (IGA_POLICY_R3, DECISION R3-17):
+		// the decision / redeem / outcome / brokered-session routes of an AI
+		// agent. Mounted only while the switch is on; behind
+		// SpiffeAuthMiddleware, and the controller accepts ONLY a delegated
+		// agent JWT-SVID (workspace from the verifying trust bundle, human from
+		// the active delegation token). Unavailable: 503, fail closed.
+		if services.PolicyR3GateState().Enabled() {
+			runtimeAgents := authsec.Group("/runtime")
+			runtimeAgents.Use(middlewares.SpiffeAuthMiddleware())
+			platformCtrl.RegisterRuntimeAgentRoutes(runtimeAgents, platformCtrl.NewIGAGovRuntimeController())
 		}
 
 		// ────────────────────────────────────────────────────

@@ -461,6 +461,10 @@ func (s *GovDeployments) DeployHandler(ctx context.Context, run *PolicyJobRun) e
 	if err != nil {
 		return err
 	}
+	if isDirectSplit(*d, plan) {
+		// R2 (DECISION R2-13, R2-20): a direct Lambda split.
+		return s.r2ExecuteSplit(ctx, run, *d, plan)
+	}
 	exec, err := s.executor(run)
 	if err != nil {
 		return PolicyJobRetryLater(5*time.Minute, err.Error())

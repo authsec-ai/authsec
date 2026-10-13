@@ -125,6 +125,13 @@ type Snapshot struct {
 	Rules     []FindingRule
 	// DefaultWindowDays is iga_gov_settings.default_window_days (0 = 90).
 	DefaultWindowDays int
+	// ActionLevel turns on R1b (IGA_POLICY_R1B on, 060 verified): action
+	// evidence and unused_action findings (findings_actions.go). False
+	// leaves Evaluate's output exactly R1a's.
+	ActionLevel bool
+	// ActionTrails is each connector's CloudTrail history, by connector id
+	// (read only when ActionLevel).
+	ActionTrails map[string]ActionTrail
 }
 
 // RunEvidence is one connector run named in the manifest (§2.5 step 2).
@@ -386,6 +393,13 @@ type Evaluation struct {
 	// a stored finding whose RoleId is absent is superseded (§2.2).
 	PresentRoles []string
 	Skipped      []SkippedRole
+	// ActionLevel, ActionEvidence and ActionOutcomes are R1b's
+	// (Snapshot.ActionLevel): the action evidence rows, and per role ×
+	// action key the posture outcome its unused_action finding follows.
+	// Zero when R1b is off.
+	ActionLevel    bool
+	ActionEvidence []ActionEvidence
+	ActionOutcomes map[PostureKey]string
 }
 
 /* ------------------------------- evaluation ------------------------------- */
@@ -455,7 +469,7 @@ func Evaluate(s Snapshot) (Evaluation, error) {
 	for _, w := range s.Workloads {
 		ix.workloads[w.ID] = w
 	}
-	out := Evaluation{Rev: s.Rev, EvaluatedAt: s.EvaluatedAt}
+	out := Evaluation{Rev: s.Rev, EvaluatedAt: s.EvaluatedAt, ActionLevel: s.ActionLevel}
 	roles := append([]RoleSnapshot{}, s.Roles...)
 	sort.Slice(roles, func(i, j int) bool { return roles[i].RoleID < roles[j].RoleID })
 	for _, r := range roles {
@@ -500,6 +514,9 @@ func Evaluate(s Snapshot) (Evaluation, error) {
 		}
 		return a.Qualification.Service < b.Qualification.Service
 	})
+	if s.ActionLevel {
+		sortActionEvidence(out.ActionEvidence)
+	}
 	return out, nil
 }
 
@@ -754,6 +771,8 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 		report := append([]ServiceActivity{}, r.Activity.Services...)
 		sort.Slice(report, func(i, j int) bool { return report[i].Service < report[j].Service })
 		seen := map[string]bool{}
+		quals := map[string]Qualification{} // R1b: the services R1a keeps
+		routeStates := map[string]string{}  // R1b: each service's route state
 		for _, sa := range report {
 			if seen[sa.Service] {
 				return fmt.Errorf("igagov: role %s report lists %s twice", r.RoleID, sa.Service)
@@ -772,6 +791,7 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 			}
 			q := Qualify(qi)
 			ra := AnalyzeRoutes(sa.Service, ref, run.ResourcePolicy, run.EnabledRegions)
+			quals[sa.Service], routeStates[sa.Service] = q, ra.State
 			gen := r.Activity.GeneratedAt
 			out.Evidence = append(out.Evidence, ActivityEvidence{
 				IdentityAccountID: r.IdentityAccountID, RoleID: r.RoleID, Service: sa.Service,
@@ -820,6 +840,11 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 				out.Findings = append(out.Findings, f)
 			}
 		}
+		if ix.s.ActionLevel {
+			if err := ix.evaluateActions(r, run, runID, quals, routeStates, live, workloads, window, out); err != nil {
+				return err
+			}
+		}
 	} else {
 		// No activity facts: one not_collected row per service the live
 		// statements name (DECISION D14), and no absence conclusion.
@@ -835,6 +860,10 @@ func (ix *evalIndex) evaluateRole(r RoleSnapshot, out *Evaluation) error {
 			})
 		}
 		out.Unknown = append(out.Unknown, ConditionScope{RoleID: r.RoleID, Kind: KindUnusedService, Reason: reason})
+		if ix.s.ActionLevel {
+			// R1b: no activity report, no conclusion about its actions.
+			out.Unknown = append(out.Unknown, ConditionScope{RoleID: r.RoleID, Kind: KindUnusedAction, Reason: reason})
+		}
 		if bound {
 			detail := map[string]any{"reason": reason, "scan_run_id": nilIfEmpty(runID),
 				"connector_id": nilIfEmpty(r.ConnectorID), "consumers": consumerDetail}
@@ -1120,10 +1149,20 @@ func PlanFindingUpdates(ev Evaluation, stored []StoredFinding, posture map[Postu
 				status, _ = postureStatus(status, o)
 			}
 		}
+		if f.Kind == KindUnusedAction {
+			if o, ok := ev.ActionOutcomes[PostureKey{RoleID: f.RoleID, Service: f.DetailKey}]; ok {
+				status, _ = postureStatus(status, o)
+			}
+		}
 		out = append(out, FindingUpdate{Fingerprint: fp, Insert: true, Finding: &fc, Status: status,
 			FirstSeenRev: ev.Rev, LastEvaluatedRev: ev.Rev, HasResult: true})
 	}
 	for _, s := range stored {
+		if s.Kind == KindUnusedAction && !ev.ActionLevel {
+			// R1b off (IGA_POLICY_R1B): its findings are left exactly as they
+			// are -- neither cleared nor superseded -- until it is on again.
+			continue
+		}
 		if s.LastEvaluatedRev >= ev.Rev {
 			continue // A21: never overwrite a newer (or the same) revision
 		}
@@ -1154,6 +1193,13 @@ func PlanFindingUpdates(ev Evaluation, stored []StoredFinding, posture map[Postu
 		}
 		if s.Kind == KindUnusedService && next != StatusSuperseded && next != StatusExcepted {
 			if o, ok := posture[PostureKey{RoleID: s.RoleID, Service: s.DetailKey}]; ok {
+				if ps, changed := postureStatus(next, o); changed {
+					next = ps
+				}
+			}
+		}
+		if s.Kind == KindUnusedAction && next != StatusSuperseded && next != StatusExcepted {
+			if o, ok := ev.ActionOutcomes[PostureKey{RoleID: s.RoleID, Service: s.DetailKey}]; ok {
 				if ps, changed := postureStatus(next, o); changed {
 					next = ps
 				}

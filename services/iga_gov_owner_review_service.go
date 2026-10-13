@@ -358,12 +358,25 @@ func (s *IGAGovOwnerReviewService) load(db *gorm.DB, ws, versionID uuid.UUID, lo
 	// The intent's removals and their grant-age basis (§2.6). Decoded
 	// leniently: an intent of another kind simply has none.
 	var intent struct {
-		Kind   string               `json:"kind"`
-		Remove []igagov.RemoveEntry `json:"remove"`
+		Kind          string                     `json:"kind"`
+		Remove        []igagov.RemoveEntry       `json:"remove"`
+		RemoveActions []igagov.RemoveActionEntry `json:"remove_actions"`
 	}
 	if json.Unmarshal(st.Version.Intent, &intent) == nil && intent.Kind == igagov.IntentRightSizeServices {
 		for _, r := range intent.Remove {
 			st.Removals[r.Service] = r.GrantAgeBasis
+		}
+		// R1b: an action removal is reviewed like a service removal, keyed
+		// by the action ("s3:DeleteObject"): an age_unverified grant asks the
+		// owner to confirm it, and an owner can retain it by name. A
+		// data-event removal with no grant age is treated as predating
+		// observation (the owner confirms it too).
+		for _, r := range intent.RemoveActions {
+			basis := r.GrantAgeBasis
+			if basis == "" {
+				basis = igagov.GrantAgePredatesObservation
+			}
+			st.Removals[r.Action] = basis
 		}
 	}
 	var tg []struct {
@@ -401,6 +414,9 @@ func (s *IGAGovOwnerReviewService) load(db *gorm.DB, ws, versionID uuid.UUID, lo
 			var im igagov.Impact
 			if len(p.Impact) > 0 && json.Unmarshal(p.Impact, &im) == nil {
 				rt.Removed = append(rt.Removed, im.Removed...)
+				for _, x := range im.RemovedActions {
+					rt.Removed = append(rt.Removed, igagov.ImpactService{Service: x.Action, Basis: x.Basis})
+				}
 				rt.Retained = append(rt.Retained, im.Retained...)
 				rt.Routes = append(rt.Routes, im.Routes...)
 			}

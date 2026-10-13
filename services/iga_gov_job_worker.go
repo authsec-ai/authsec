@@ -696,6 +696,12 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
 	// NewProductionGovDeployEnv).
 	RegisterEnforcementBindingJobs(w)
+	// R2 (IGA_POLICY_R2): temp_grant, session_revoke and time_bound with
+	// their schedules, only while the switch is on (each handler and
+	// schedule also checks the gate is available).
+	if PolicyR2GateState().Enabled() {
+		RegisterR2Jobs(w, db)
+	}
 	return w
 }
 

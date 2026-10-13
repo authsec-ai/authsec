@@ -8400,7 +8400,7 @@ CREATE TABLE public.iga_gov_finding (
     CONSTRAINT iga_gov_finding_confidence_check CHECK ((confidence = ANY (ARRAY['qualified'::text, 'age_unverified'::text, 'not_applicable'::text]))),
     CONSTRAINT iga_gov_finding_exception_chk CHECK (((status = 'excepted'::text) = (excepted_until IS NOT NULL))),
     CONSTRAINT iga_gov_finding_family_check CHECK ((family = ANY (ARRAY['governance'::text, 'cloud_access'::text]))),
-    CONSTRAINT iga_gov_finding_kind_check CHECK ((kind = ANY (ARRAY['unused_service'::text, 'broad_grant'::text, 'shared_role'::text, 'missing_owner'::text, 'missing_review_date'::text, 'activity_not_read'::text]))),
+    CONSTRAINT iga_gov_finding_kind_check CHECK ((kind = ANY (ARRAY['unused_service'::text, 'broad_grant'::text, 'shared_role'::text, 'missing_owner'::text, 'missing_review_date'::text, 'activity_not_read'::text, 'unused_action'::text]))),
     CONSTRAINT iga_gov_finding_rev_order_chk CHECK ((first_seen_rev <= last_evaluated_rev)),
     CONSTRAINT iga_gov_finding_severity_check CHECK ((severity = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text, 'info'::text]))),
     CONSTRAINT iga_gov_finding_status_check CHECK ((status = ANY (ARRAY['open'::text, 'under_review'::text, 'excepted'::text, 'mitigated'::text, 'resolved'::text, 'cleared'::text, 'superseded'::text, 'reopened'::text])))
@@ -8896,7 +8896,12 @@ END)),
     CONSTRAINT iga_gov_plan_first_attachment_chk CHECK (((NOT first_attachment) OR ((desired_attachment = 'present'::text) AND (resource_policy_scan_run_id IS NOT NULL)))),
     CONSTRAINT iga_gov_plan_ineligible_chk CHECK (((eligibility = 'ineligible'::text) = (ineligible_reason <> ''::text))),
     CONSTRAINT iga_gov_plan_kind_check CHECK ((kind = ANY (ARRAY['apply'::text, 'undo'::text, 'remove_control'::text, 'split'::text, 'split_revert'::text]))),
-    CONSTRAINT iga_gov_plan_kind_chk CHECK ((((kind = ANY (ARRAY['split'::text, 'split_revert'::text])) = (desired_attachment = 'unchanged'::text)) AND ((kind <> 'apply'::text) OR (desired_attachment = 'present'::text)) AND ((kind <> ALL (ARRAY['split'::text, 'split_revert'::text])) OR (delivery = ANY (ARRAY['iac_pr'::text, 'export'::text])))))
+    CONSTRAINT iga_gov_plan_kind_chk CHECK (
+    (kind IN ('split','split_revert')) = (desired_attachment = 'unchanged')
+    AND (kind <> 'apply' OR desired_attachment = 'present')
+    AND (kind NOT IN ('split','split_revert') OR delivery IN ('iac_pr','export')
+         OR (delivery = 'direct' AND (eligibility = 'ineligible'
+             OR (eligibility = 'eligible' AND (diff -> 'split' ->> 'subject_kind') = 'lambda_function')))))
 );
 
 CREATE TABLE public.iga_gov_revalidation (
@@ -9721,7 +9726,7 @@ CREATE TABLE public.iga_gov_job (
     last_error text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
-    CONSTRAINT iga_gov_job_kind_check CHECK ((kind = ANY (ARRAY['evaluate_owner_rules'::text, 'compile_plans'::text, 'notify'::text, 'refresh_activity'::text, 'observe_tick'::text, 'deploy'::text, 'verify'::text, 'drift_check'::text, 'verify_binding'::text, 'iac_sync'::text, 'prune_evidence'::text, 'metrics_rollup'::text, 'resolve_unknown'::text]))),
+    CONSTRAINT iga_gov_job_kind_check CHECK ((kind = ANY (ARRAY['evaluate_owner_rules'::text, 'compile_plans'::text, 'notify'::text, 'refresh_activity'::text, 'observe_tick'::text, 'deploy'::text, 'verify'::text, 'drift_check'::text, 'verify_binding'::text, 'iac_sync'::text, 'prune_evidence'::text, 'metrics_rollup'::text, 'resolve_unknown'::text, 'temp_grant'::text, 'session_revoke'::text, 'time_bound'::text]))),
     CONSTRAINT iga_gov_job_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'complete'::text, 'failed'::text, 'abandoned'::text])))
 );
 
@@ -9909,7 +9914,7 @@ CREATE TABLE public.iga_gov_notification (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT iga_gov_notification_channel_check CHECK ((channel = ANY (ARRAY['email'::text, 'webhook'::text, 'slack'::text]))),
     CONSTRAINT iga_gov_notification_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'dead'::text]))),
-    CONSTRAINT iga_gov_notification_subject_kind_check CHECK ((subject_kind = ANY (ARRAY['owner_review'::text, 'approval_request'::text, 'deployment'::text, 'drift'::text, 'canary_gate'::text, 'finding_digest'::text]))),
+    CONSTRAINT iga_gov_notification_subject_kind_check CHECK ((subject_kind = ANY (ARRAY['owner_review'::text, 'approval_request'::text, 'deployment'::text, 'drift'::text, 'canary_gate'::text, 'finding_digest'::text, 'temporary_grant'::text, 'session_revocation'::text, 'time_bound'::text]))),
     CONSTRAINT iga_gov_pn_sent_chk CHECK (((state = 'sent'::text) = (sent_at IS NOT NULL)))
 );
 
@@ -10025,6 +10030,18 @@ WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
   AND p.resource = 'governance' AND p.action IN ('author','approve','enforce','emergency')
 ON CONFLICT (role_id, permission_id) DO NOTHING;
 
+-- 061_r2_time_bound_access: governance:grant (approve temporary grants).
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+  (gen_random_uuid(), NULL, 'governance', 'grant', 'Approve temporary access grants (privilege expansion)', 'governance:grant', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+INSERT INTO public.role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM public.roles r CROSS JOIN public.permissions p
+WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
+  AND p.resource = 'governance' AND p.action = 'grant'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
 -- ---- from 056_cloud_resource_policy.sql ----
 -- Phase 3 immutable resource-policy observations, coverage and policy documents.
 -- 3 tables, 3 constraints, 1 index, 4 triggers, 7 fk constraints
@@ -10128,6 +10145,512 @@ ALTER TABLE ONLY public.iga_gov_evaluation_pruned
 
 ALTER TABLE ONLY public.iga_gov_evaluation_pruned
     ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_rev_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation(workspace_id, rev) ON DELETE CASCADE;
+
+-- 060_r1b_action_evidence: R1b action-level evidence (§12.1); the
+-- unused_action finding kind is in iga_gov_finding_kind_check above.
+CREATE TABLE IF NOT EXISTS public.iga_gov_action_evidence (
+  workspace_id         uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  rev                  bigint NOT NULL,
+  identity_account_id  uuid NOT NULL,
+  role_id              text NOT NULL,
+  service              text NOT NULL,
+  action               text NOT NULL,
+  action_key           text NOT NULL,
+  state                text NOT NULL CHECK (state IN ('collected','not_collected')),
+  outcome              text NOT NULL CHECK (outcome IN ('observed','no_event','not_enough_history',
+                         'not_observable','unreviewed','not_collected')),
+  reason               text NOT NULL DEFAULT '',
+  last_event_at        timestamptz,
+  event_count          integer NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+  coverage_start       timestamptz,
+  covered_until        timestamptz,
+  window_start         timestamptz,
+  qualified_days       integer NOT NULL DEFAULT 0 CHECK (qualified_days >= 0),
+  grant_observed_since timestamptz,
+  grant_age_basis      text NOT NULL CHECK (grant_age_basis IN ('observed_since_change','predates_observation','unknown')),
+  data_event           boolean NOT NULL DEFAULT false,
+  scan_run_id          uuid,
+  catalog              text NOT NULL,
+  PRIMARY KEY (workspace_id, rev, identity_account_id, action_key),
+  CONSTRAINT iga_gov_xe_key_chk CHECK (action_key = lower(action)),
+  CONSTRAINT iga_gov_xe_state_chk CHECK ((state = 'not_collected') = (outcome = 'not_collected')),
+  CONSTRAINT iga_gov_xe_collected_chk CHECK (state = 'not_collected' OR (covered_until IS NOT NULL AND window_start IS NOT NULL)),
+  FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run (workspace_id, id),
+  FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation (workspace_id, rev) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, identity_account_id) REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE
+);
+
+DROP TRIGGER IF EXISTS iga_gov_action_evidence_frozen ON public.iga_gov_action_evidence;
+CREATE TRIGGER iga_gov_action_evidence_frozen BEFORE INSERT OR UPDATE ON public.iga_gov_action_evidence
+  FOR EACH ROW EXECUTE FUNCTION public.iga_gov_evaluation_rows_frozen();
+
+-- 061_r2_time_bound_access: R2 temporary grants and session revocations
+-- (§12.3); the R2 job kinds, the direct Lambda split in iga_gov_plan_kind_chk
+-- and the R2 notification subjects are in the CHECKs above, and the
+-- governance:grant permission is seeded after 055's governance:* rows.
+CREATE TABLE IF NOT EXISTS public.iga_gov_temp_grant (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id          uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  -- The role's AWS connector and identity incarnation (§2.2). No FK to
+  -- iga_identity_accounts: a grant is an audit record that outlives the row.
+  connector_id          uuid NOT NULL,
+  identity_account_id   uuid NOT NULL,
+  account_id            text NOT NULL CHECK (account_id ~ '^[0-9]{12}$'),
+  role_id               text NOT NULL,
+  role_arn              text NOT NULL,
+  -- Exactly what the request names (DECISION R2-9): literal actions,
+  -- resources as ARNs or "*"; the escalation-catalog patterns they reach and
+  -- the requester's acknowledgement of them.
+  actions               jsonb NOT NULL CHECK (jsonb_typeof(actions) = 'array' AND jsonb_array_length(actions) BETWEEN 1 AND 50),
+  resources             jsonb NOT NULL CHECK (jsonb_typeof(resources) = 'array' AND jsonb_array_length(resources) BETWEEN 1 AND 20),
+  escalations           jsonb NOT NULL DEFAULT '[]'::jsonb,
+  escalation_ack        text NOT NULL DEFAULT '',
+  reason                text NOT NULL CHECK (reason <> ''),
+  expires_at            timestamptz NOT NULL,
+  policy_name           text NOT NULL,
+  policy_arn            text NOT NULL,
+  document_hash         text NOT NULL,
+  -- request_hash binds the approval (role, actions, resources, expiry,
+  -- document); request_key is "the same request for the same role" for the
+  -- one-live-grant index.
+  request_hash          text NOT NULL,
+  request_key           text NOT NULL,
+  state                 text NOT NULL DEFAULT 'requested' CHECK (state IN ('requested','rejected','cancelled','approved',
+                          'deploying','active','expiring','expired','revoked','failed','outcome_unknown')),
+  state_reason          text NOT NULL DEFAULT '',
+  requested_by          uuid NOT NULL REFERENCES public.users(id),
+  decided_by            uuid REFERENCES public.users(id),
+  decided_at            timestamptz,
+  decision_reason       text NOT NULL DEFAULT '',
+  approved_request_hash text,
+  ended_by              uuid REFERENCES public.users(id),
+  end_reason            text NOT NULL DEFAULT '',
+  deployed_at           timestamptz,
+  verified_at           timestamptz,
+  ended_at              timestamptz,
+  last_readback_at      timestamptz,
+  drift                 text NOT NULL DEFAULT '',
+  -- Write-ahead marker of the one AWS write in flight (§8.1's idea for R2):
+  -- set, fenced, immediately before the call; cleared with its answer. A
+  -- marker found by a later run means "may have been sent": the run waits
+  -- until settle_after and recognises the op from a fresh read.
+  pending_op            text NOT NULL DEFAULT '',
+  pending_op_at         timestamptz,
+  settle_after          timestamptz,
+  ops                   jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  -- Separation of duties (§2.10): the approver is never the requester.
+  CONSTRAINT iga_gov_tg_sod_chk CHECK (decided_by IS NULL OR decided_by <> requested_by),
+  -- Undecided exactly while requested or cancelled; everything past approval
+  -- carries the approved request hash, equal to the request's.
+  CONSTRAINT iga_gov_tg_decided_chk CHECK (
+    ((state IN ('requested','cancelled')) = (decided_by IS NULL))
+    AND (state IN ('requested','cancelled','rejected') OR approved_request_hash = request_hash)),
+  -- DECISION R2-10: 15 minutes .. 30 days (plus slack for the request's own clock).
+  CONSTRAINT iga_gov_tg_window_chk CHECK (expires_at > created_at AND expires_at <= created_at + interval '31 days'),
+  FOREIGN KEY (workspace_id, document_hash) REFERENCES public.iga_gov_document (workspace_id, document_hash)
+);
+-- One live temporary grant per (role, request) (§12.3).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_temp_grant_live
+  ON public.iga_gov_temp_grant (workspace_id, account_id, role_id, request_key)
+  WHERE state IN ('requested','approved','deploying','active','expiring','outcome_unknown');
+CREATE INDEX IF NOT EXISTS idx_iga_gov_temp_grant_due ON public.iga_gov_temp_grant (state, expires_at);
+
+CREATE TABLE IF NOT EXISTS public.iga_gov_session_revocation (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id          uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  connector_id          uuid NOT NULL,
+  identity_account_id   uuid NOT NULL,
+  account_id            text NOT NULL CHECK (account_id ~ '^[0-9]{12}$'),
+  role_id               text NOT NULL,
+  role_arn              text NOT NULL,
+  reason                text NOT NULL CHECK (reason <> ''),
+  -- governance:emergency: decided by the requester at request time,
+  -- always notified (DECISION R2-12).
+  emergency             boolean NOT NULL DEFAULT false,
+  -- The cutoff is fixed at approval (DECISION R2-12); the deny is removed
+  -- automatically at remove_after.
+  keep_hours            integer NOT NULL DEFAULT 13 CHECK (keep_hours BETWEEN 13 AND 168),
+  issued_before         timestamptz,
+  remove_after          timestamptz,
+  policy_name           text NOT NULL,
+  policy_arn            text NOT NULL,
+  document_hash         text,
+  request_hash          text NOT NULL,
+  state                 text NOT NULL DEFAULT 'requested' CHECK (state IN ('requested','rejected','cancelled','approved',
+                          'deploying','active','removing','removed','failed','outcome_unknown')),
+  state_reason          text NOT NULL DEFAULT '',
+  requested_by          uuid NOT NULL REFERENCES public.users(id),
+  decided_by            uuid REFERENCES public.users(id),
+  decided_at            timestamptz,
+  decision_reason       text NOT NULL DEFAULT '',
+  approved_request_hash text,
+  ended_by              uuid REFERENCES public.users(id),
+  end_reason            text NOT NULL DEFAULT '',
+  deployed_at           timestamptz,
+  verified_at           timestamptz,
+  ended_at              timestamptz,
+  last_readback_at      timestamptz,
+  drift                 text NOT NULL DEFAULT '',
+  pending_op            text NOT NULL DEFAULT '',
+  pending_op_at         timestamptz,
+  settle_after          timestamptz,
+  ops                   jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  -- Separation of duties, except the audited emergency path.
+  CONSTRAINT iga_gov_sr_sod_chk CHECK (emergency OR decided_by IS NULL OR decided_by <> requested_by),
+  CONSTRAINT iga_gov_sr_decided_chk CHECK (
+    ((state IN ('requested','cancelled')) = (decided_by IS NULL))
+    AND (state IN ('requested','cancelled','rejected')
+         OR (approved_request_hash = request_hash AND issued_before IS NOT NULL
+             AND document_hash IS NOT NULL AND remove_after IS NOT NULL))),
+  -- The deny stays at least the longest session lifetime (12 h) + 1 h.
+  CONSTRAINT iga_gov_sr_window_chk CHECK (remove_after IS NULL
+    OR (issued_before IS NOT NULL AND remove_after >= issued_before + interval '13 hours')),
+  FOREIGN KEY (workspace_id, document_hash) REFERENCES public.iga_gov_document (workspace_id, document_hash)
+);
+-- One live session revocation per role.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_session_revocation_live
+  ON public.iga_gov_session_revocation (workspace_id, account_id, role_id)
+  WHERE state IN ('requested','approved','deploying','active','removing','outcome_unknown');
+CREATE INDEX IF NOT EXISTS idx_iga_gov_session_revocation_due ON public.iga_gov_session_revocation (state, remove_after);
+
+-- 062_r3_runtime_controls: R3 agent runtime controls (§12.4): runtime policy
+-- versions, settings, decisions, holds, session budgets, routing proofs,
+-- AgentCore pushes and brokered sessions. Row-level security comes from the
+-- loop below (every workspace_id table).
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_version (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id         uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  policy_id            uuid NOT NULL,
+  version_no           int  NOT NULL CHECK (version_no > 0),
+  intent               jsonb NOT NULL,
+  intent_hash          text NOT NULL CHECK (intent_hash ~ '^sha256:[0-9a-f]{64}$'),
+  status               text NOT NULL DEFAULT 'in_review' CHECK (status IN ('in_review','approved','superseded','withdrawn','rejected')),
+  created_by           uuid NOT NULL REFERENCES public.users(id),
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  decided_by           uuid REFERENCES public.users(id),
+  decided_at           timestamptz,
+  decision_reason      text NOT NULL DEFAULT '',
+  approved_intent_hash text,
+  status_changed_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  UNIQUE (workspace_id, id, policy_id),
+  UNIQUE (policy_id, version_no),
+  FOREIGN KEY (workspace_id, policy_id) REFERENCES iga_gov_policy (workspace_id, id) ON DELETE CASCADE,
+  -- Separation of duties (§2.10): the approver is never the author.
+  CONSTRAINT iga_gov_rtv_sod_chk CHECK (decided_by IS NULL OR decided_by <> created_by),
+  -- Undecided exactly while in review or withdrawn; an approved (or later
+  -- superseded) version carries the approved hash, equal to its own.
+  CONSTRAINT iga_gov_rtv_decided_chk CHECK (
+    ((status IN ('in_review','withdrawn')) = (decided_by IS NULL))
+    AND (status NOT IN ('approved','superseded') OR approved_intent_hash = intent_hash))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_version_one_approved
+  ON iga_gov_runtime_version (policy_id) WHERE status = 'approved';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_version_one_review
+  ON iga_gov_runtime_version (policy_id) WHERE status = 'in_review';
+
+CREATE OR REPLACE FUNCTION iga_gov_runtime_version_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.intent IS DISTINCT FROM OLD.intent OR NEW.intent_hash IS DISTINCT FROM OLD.intent_hash
+     OR NEW.policy_id IS DISTINCT FROM OLD.policy_id OR NEW.version_no IS DISTINCT FROM OLD.version_no
+     OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
+    RAISE EXCEPTION 'iga_gov_runtime_version % is immutable; create a new version', OLD.id;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS iga_gov_runtime_version_immutable ON iga_gov_runtime_version;
+CREATE TRIGGER iga_gov_runtime_version_immutable BEFORE UPDATE ON iga_gov_runtime_version
+  FOR EACH ROW EXECUTE FUNCTION iga_gov_runtime_version_immutable();
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_settings (
+  workspace_id           uuid PRIMARY KEY REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  -- R-11: digest_only keeps no argument values at all; redacted keeps them
+  -- with the workspace's redact_keys replaced and long strings truncated.
+  argument_retention     text NOT NULL DEFAULT 'digest_only' CHECK (argument_retention IN ('digest_only','redacted')),
+  redact_keys            jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(redact_keys) = 'array' AND jsonb_array_length(redact_keys) <= 100),
+  retention_days         int NOT NULL DEFAULT 30 CHECK (retention_days BETWEEN 1 AND 400),
+  -- R-05: how long a PEP may rely on an allow (it is single-use regardless).
+  decision_ttl_seconds   int NOT NULL DEFAULT 60 CHECK (decision_ttl_seconds BETWEEN 5 AND 300),
+  hold_timeout_minutes   int NOT NULL DEFAULT 60 CHECK (hold_timeout_minutes BETWEEN 1 AND 10080),
+  approval_valid_minutes int NOT NULL DEFAULT 15 CHECK (approval_valid_minutes BETWEEN 1 AND 1440),
+  updated_by             uuid REFERENCES public.users(id),
+  updated_at             timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_decision (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id        uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  -- The runtime policy version that decided; NULL only for a default deny
+  -- (no approved policy governs the agent).
+  policy_id           uuid,
+  version_id          uuid,
+  intent_hash         text,
+  -- R-02: the authenticated workload (from the verified credential only)
+  -- and the initiating human. No FK on the human: a decision is an audit
+  -- record that outlives the user row.
+  agent_ref           text NOT NULL CHECK (agent_ref <> ''),
+  agent_client_id     text NOT NULL DEFAULT '',
+  human_user_id       uuid,
+  credential_kind     text NOT NULL CHECK (credential_kind IN ('delegated_jwt_svid')),
+  tool                text NOT NULL CHECK (tool <> ''),
+  action              text NOT NULL DEFAULT '',
+  target              text NOT NULL DEFAULT '',
+  args_digest         text NOT NULL CHECK (args_digest ~ '^sha256:[0-9a-f]{64}$'),
+  context_digest      text NOT NULL,
+  -- Only the allow-listed context keys (R-11); never a prompt.
+  context             jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- Present only while the workspace retains redacted arguments, and pruned
+  -- after retention_days.
+  args_redacted       jsonb,
+  session_key         text NOT NULL DEFAULT '',
+  idempotency_key     text NOT NULL CHECK (idempotency_key <> '' AND length(idempotency_key) <= 200),
+  decision            text NOT NULL CHECK (decision IN ('allow','deny','hold')),
+  reason_code         text NOT NULL CHECK (reason_code <> ''),
+  reasons             jsonb NOT NULL DEFAULT '[]'::jsonb,
+  -- The hold whose approval this allow carries (a resume).
+  approval_ref        uuid,
+  binding_hash        text NOT NULL,
+  -- sha256 of the single-use decision token; allow only.
+  token_hash          text,
+  expires_at          timestamptz NOT NULL,
+  consumed_at         timestamptz,
+  consumed_by         text CHECK (consumed_by IN ('redeem','broker')),
+  -- R-07: what the agent reports happened, apart from what AuthSec decided.
+  tool_outcome        text CHECK (tool_outcome IN ('succeeded','failed','not_executed','unknown')),
+  aws_outcome         jsonb,
+  actual_cost         bigint CHECK (actual_cost >= 0),
+  outcome_source      text CHECK (outcome_source IN ('agent_reported')),
+  outcome_reported_at timestamptz,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  CONSTRAINT iga_gov_rtd_allow_chk CHECK ((decision = 'allow') = (token_hash IS NOT NULL)),
+  CONSTRAINT iga_gov_rtd_consume_chk CHECK ((consumed_at IS NULL) = (consumed_by IS NULL) AND (consumed_at IS NULL OR decision = 'allow')),
+  CONSTRAINT iga_gov_rtd_outcome_chk CHECK ((tool_outcome IS NULL) = (outcome_reported_at IS NULL) AND (tool_outcome IS NULL OR decision = 'allow')),
+  CONSTRAINT iga_gov_rtd_policy_chk CHECK ((policy_id IS NULL) = (version_id IS NULL) AND (decision = 'deny' OR version_id IS NOT NULL))
+);
+-- Idempotency: one first decision per (agent, key); one resume per approval
+-- (an approved operation executes at most once, R-06).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_decision_idem
+  ON iga_gov_runtime_decision (workspace_id, agent_ref, idempotency_key) WHERE approval_ref IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_decision_resume
+  ON iga_gov_runtime_decision (workspace_id, approval_ref) WHERE approval_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_decision_ws_created
+  ON iga_gov_runtime_decision (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_decision_due
+  ON iga_gov_runtime_decision (expires_at) WHERE decision = 'allow' AND tool_outcome IS NULL;
+
+-- The binding (R-03) never changes after insert; consumption happens once;
+-- an outcome is reported once (an 'unknown' may be settled once more);
+-- retained arguments may only be pruned.
+CREATE OR REPLACE FUNCTION iga_gov_runtime_decision_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.workspace_id IS DISTINCT FROM OLD.workspace_id OR NEW.policy_id IS DISTINCT FROM OLD.policy_id
+     OR NEW.version_id IS DISTINCT FROM OLD.version_id OR NEW.intent_hash IS DISTINCT FROM OLD.intent_hash
+     OR NEW.agent_ref IS DISTINCT FROM OLD.agent_ref OR NEW.agent_client_id IS DISTINCT FROM OLD.agent_client_id
+     OR NEW.human_user_id IS DISTINCT FROM OLD.human_user_id OR NEW.tool IS DISTINCT FROM OLD.tool
+     OR NEW.action IS DISTINCT FROM OLD.action OR NEW.target IS DISTINCT FROM OLD.target
+     OR NEW.args_digest IS DISTINCT FROM OLD.args_digest OR NEW.context_digest IS DISTINCT FROM OLD.context_digest
+     OR NEW.session_key IS DISTINCT FROM OLD.session_key OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+     OR NEW.decision IS DISTINCT FROM OLD.decision OR NEW.reason_code IS DISTINCT FROM OLD.reason_code
+     OR NEW.approval_ref IS DISTINCT FROM OLD.approval_ref OR NEW.binding_hash IS DISTINCT FROM OLD.binding_hash
+     OR NEW.token_hash IS DISTINCT FROM OLD.token_hash OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'iga_gov_runtime_decision % binds its arguments, policy version, approval and expiry; it cannot change', OLD.id;
+  END IF;
+  IF OLD.consumed_at IS NOT NULL AND (NEW.consumed_at IS DISTINCT FROM OLD.consumed_at OR NEW.consumed_by IS DISTINCT FROM OLD.consumed_by) THEN
+    RAISE EXCEPTION 'iga_gov_runtime_decision % was already consumed', OLD.id;
+  END IF;
+  IF OLD.tool_outcome IS NOT NULL AND OLD.tool_outcome <> 'unknown'
+     AND (NEW.tool_outcome IS DISTINCT FROM OLD.tool_outcome OR NEW.aws_outcome IS DISTINCT FROM OLD.aws_outcome
+          OR NEW.actual_cost IS DISTINCT FROM OLD.actual_cost) THEN
+    RAISE EXCEPTION 'iga_gov_runtime_decision % already has its outcome', OLD.id;
+  END IF;
+  IF NEW.args_redacted IS NOT NULL AND NEW.args_redacted IS DISTINCT FROM OLD.args_redacted THEN
+    RAISE EXCEPTION 'iga_gov_runtime_decision % retained arguments can only be pruned', OLD.id;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS iga_gov_runtime_decision_guard ON iga_gov_runtime_decision;
+CREATE TRIGGER iga_gov_runtime_decision_guard BEFORE UPDATE ON iga_gov_runtime_decision
+  FOR EACH ROW EXECUTE FUNCTION iga_gov_runtime_decision_guard();
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_hold (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id         uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  -- The 'hold' decision this row keeps durable.
+  decision_id          uuid NOT NULL,
+  policy_id            uuid NOT NULL,
+  version_id           uuid NOT NULL,
+  agent_ref            text NOT NULL,
+  human_user_id        uuid NOT NULL,
+  tool                 text NOT NULL,
+  action               text NOT NULL DEFAULT '',
+  target               text NOT NULL DEFAULT '',
+  args_digest          text NOT NULL CHECK (args_digest ~ '^sha256:[0-9a-f]{64}$'),
+  idempotency_key      text NOT NULL,
+  reason               text NOT NULL DEFAULT '',
+  state                text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','approved','rejected','expired','cancelled','resumed')),
+  expires_at           timestamptz NOT NULL,
+  decided_by           uuid REFERENCES public.users(id),
+  decided_at           timestamptz,
+  decision_reason      text NOT NULL DEFAULT '',
+  approval_valid_until timestamptz,
+  resumed_decision_id  uuid,
+  resumed_at           timestamptz,
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, decision_id) REFERENCES iga_gov_runtime_decision (workspace_id, id),
+  -- Separation of duties: the human who initiated the operation never
+  -- approves it.
+  CONSTRAINT iga_gov_rth_sod_chk CHECK (decided_by IS NULL OR decided_by <> human_user_id),
+  CONSTRAINT iga_gov_rth_decided_chk CHECK (
+    (state NOT IN ('pending','cancelled') OR decided_by IS NULL)
+    AND (state NOT IN ('approved','rejected','resumed') OR decided_by IS NOT NULL)
+    AND (state NOT IN ('approved','resumed') OR approval_valid_until IS NOT NULL)),
+  CONSTRAINT iga_gov_rth_resumed_chk CHECK ((state = 'resumed') = (resumed_decision_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_hold_decision ON iga_gov_runtime_hold (workspace_id, decision_id);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_hold_due ON iga_gov_runtime_hold (state, expires_at);
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_budget (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  policy_id      uuid NOT NULL,
+  -- The version whose limit opened this ledger (a later version applies to
+  -- new sessions only, DECISION R3-14).
+  version_id     uuid NOT NULL,
+  agent_ref      text NOT NULL,
+  session_key    text NOT NULL CHECK (session_key <> ''),
+  budget_key     text NOT NULL CHECK (budget_key <> ''),
+  unit           text NOT NULL CHECK (unit IN ('calls','cost')),
+  limit_amount   bigint NOT NULL CHECK (limit_amount > 0),
+  reserved       bigint NOT NULL DEFAULT 0 CHECK (reserved >= 0),
+  spent          bigint NOT NULL DEFAULT 0 CHECK (spent >= 0),
+  window_ends_at timestamptz NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  UNIQUE (workspace_id, policy_id, agent_ref, session_key, budget_key),
+  FOREIGN KEY (workspace_id, policy_id) REFERENCES iga_gov_policy (workspace_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_budget_entry (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  budget_id       uuid NOT NULL,
+  decision_id     uuid NOT NULL,
+  reserved_amount bigint NOT NULL CHECK (reserved_amount > 0),
+  settled_amount  bigint CHECK (settled_amount >= 0),
+  overrun         bigint NOT NULL DEFAULT 0 CHECK (overrun >= 0),
+  state           text NOT NULL DEFAULT 'reserved' CHECK (state IN ('reserved','settled','released')),
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  settled_at      timestamptz,
+  UNIQUE (workspace_id, id),
+  UNIQUE (budget_id, decision_id),
+  FOREIGN KEY (workspace_id, budget_id) REFERENCES iga_gov_runtime_budget (workspace_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, decision_id) REFERENCES iga_gov_runtime_decision (workspace_id, id),
+  CONSTRAINT iga_gov_rtbe_state_chk CHECK ((state = 'reserved') = (settled_at IS NULL)
+    AND (state <> 'settled' OR settled_amount IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_budget_entry_open ON iga_gov_runtime_budget_entry (state, created_at) WHERE state = 'reserved';
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_routing_proof (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  gateway_arn   text NOT NULL CHECK (gateway_arn ~ '^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:gateway/.+'),
+  account_id    text NOT NULL CHECK (account_id ~ '^[0-9]{12}$'),
+  method        text NOT NULL CHECK (method IN ('lab_probe','network_isolation','customer_attestation')),
+  statement     text NOT NULL CHECK (statement <> ''),
+  evidence      jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
+  evidence_hash text NOT NULL,
+  recorded_by   uuid NOT NULL REFERENCES public.users(id),
+  recorded_at   timestamptz NOT NULL DEFAULT now(),
+  valid_until   timestamptz NOT NULL,
+  revoked_at    timestamptz,
+  revoked_by    uuid REFERENCES public.users(id),
+  revoke_reason text NOT NULL DEFAULT '',
+  UNIQUE (workspace_id, id),
+  CONSTRAINT iga_gov_rtrp_window_chk CHECK (valid_until > recorded_at AND valid_until <= recorded_at + interval '91 days'),
+  CONSTRAINT iga_gov_rtrp_revoked_chk CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_routing_proof_gw ON iga_gov_runtime_routing_proof (workspace_id, gateway_arn);
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_agentcore_push (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id     uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  policy_id        uuid NOT NULL,
+  version_id       uuid NOT NULL,
+  gateway_arn      text NOT NULL,
+  policy_engine_id text NOT NULL CHECK (policy_engine_id <> ''),
+  cedar            jsonb NOT NULL CHECK (jsonb_typeof(cedar) = 'array'),
+  cedar_hash       text NOT NULL,
+  state            text NOT NULL CHECK (state IN ('pushed','failed','readback_match','readback_mismatch')),
+  remote           jsonb NOT NULL DEFAULT '[]'::jsonb,
+  gateway_mode     text NOT NULL DEFAULT '',
+  error            text NOT NULL DEFAULT '',
+  pushed_by        uuid NOT NULL REFERENCES public.users(id),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  readback_at      timestamptz,
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, version_id, policy_id) REFERENCES iga_gov_runtime_version (workspace_id, id, policy_id)
+);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_runtime_agentcore_push_gw ON iga_gov_runtime_agentcore_push (workspace_id, gateway_arn, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_broker_role (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id        uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  connector_id        uuid NOT NULL,
+  account_id          text NOT NULL CHECK (account_id ~ '^[0-9]{12}$'),
+  role_arn            text NOT NULL CHECK (role_arn ~ '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+'),
+  max_session_seconds int NOT NULL DEFAULT 900 CHECK (max_session_seconds BETWEEN 900 AND 3600),
+  state               text NOT NULL DEFAULT 'active' CHECK (state IN ('active','disabled')),
+  created_by          uuid NOT NULL REFERENCES public.users(id),
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  disabled_by         uuid REFERENCES public.users(id),
+  disabled_at         timestamptz,
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, connector_id) REFERENCES cloud_connector (workspace_id, id),
+  CONSTRAINT iga_gov_rtbr_disabled_chk CHECK ((state = 'disabled') = (disabled_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_runtime_broker_role_live
+  ON iga_gov_runtime_broker_role (workspace_id, role_arn) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS iga_gov_runtime_broker_session (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id        uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  broker_role_id      uuid NOT NULL,
+  decision_id         uuid NOT NULL,
+  agent_ref           text NOT NULL,
+  human_user_id       uuid NOT NULL,
+  role_arn            text NOT NULL,
+  session_name        text NOT NULL,
+  source_identity     text NOT NULL,
+  session_policy_hash text NOT NULL,
+  session_tags        jsonb NOT NULL,
+  duration_seconds    int NOT NULL CHECK (duration_seconds BETWEEN 900 AND 3600),
+  -- Written ahead of the STS call ('requested'), then 'issued' or 'failed'.
+  -- Credentials are returned once and never stored.
+  state               text NOT NULL DEFAULT 'requested' CHECK (state IN ('requested','issued','failed')),
+  assumed_role_arn    text NOT NULL DEFAULT '',
+  expires_at          timestamptz,
+  error               text NOT NULL DEFAULT '',
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  -- One brokered session per allow decision.
+  UNIQUE (workspace_id, decision_id),
+  FOREIGN KEY (workspace_id, broker_role_id) REFERENCES iga_gov_runtime_broker_role (workspace_id, id),
+  FOREIGN KEY (workspace_id, decision_id) REFERENCES iga_gov_runtime_decision (workspace_id, id)
+);
+
 
 -- ---------------------------------------------------------------------------
 -- login_tickets (043): first-factor proof for the MFA step and the session

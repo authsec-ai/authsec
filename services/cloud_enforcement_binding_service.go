@@ -420,7 +420,7 @@ func setupState(b *models.CloudEnforcementBinding) string {
 func viewOf(c *models.CloudConnector, b *models.CloudEnforcementBinding) EnforcementBindingView {
 	v := EnforcementBindingView{
 		ConnectorID: c.ID, AccountID: c.ScopeID, State: "off", SetupState: "off",
-		CurrentTemplateVersion: awsdiscovery.EnforcementTemplateVersion,
+		CurrentTemplateVersion: EnforcementTemplateVersionForNewBindings(),
 		Capabilities:           bindingCapabilities(nil),
 		Failing:                []string{},
 	}
@@ -672,7 +672,7 @@ func (s *EnforcementBindingService) sessionOf(c *models.CloudConnector, b *model
 		Code: b.LastErrorCode, Message: b.LastError, ExternalID: ext, Suffix: suffix,
 		StackName: awsdiscovery.EnforcementStackName(suffix), RoleName: awsdiscovery.EnforcementRoleName(suffix),
 		SelfTestRoleName: awsdiscovery.EnforcementSelfTestRoleName(suffix),
-		TemplateVersion:  awsdiscovery.EnforcementTemplateVersion,
+		TemplateVersion:  EnforcementTemplateVersionForNewBindings(),
 		ExpiresAt:        b.UpdatedAt.Add(enfSessionTTL).UTC(),
 		Binding:          &view,
 	}
@@ -702,14 +702,14 @@ func (s *EnforcementBindingService) attachQuickCreate(ctx context.Context, sess 
 			}
 		}
 	}
-	tplURL := s.cfg.EnforcementTemplateURLFor()
+	tplURL := s.cfg.EnforcementTemplateURLForVersion(EnforcementTemplateVersionForNewBindings())
 	if err := s.templateCheck(ctx, tplURL); err != nil {
 		log.Printf("[aws-enf] ALERT stage=start code=template_missing template=%s err=%v", tplURL, err)
 		sess.AutomaticReason = "The AuthSec enforcement template for this release is not available right now; use manual setup."
 		return
 	}
 	topic, _ := s.cfg.TopicFor(dr)
-	link, err := awsdiscovery.EnforcementQuickCreateURL(dr, tplURL, sess.StackName, map[string]string{
+	link, err := awsdiscovery.EnforcementQuickCreateURLForVersion(EnforcementTemplateVersionForNewBindings(), dr, tplURL, sess.StackName, map[string]string{
 		"AuthSecPrincipalArn": s.principal, "ExternalId": sess.ExternalID, "CallbackTopicArn": topic, "NameSuffix": sess.Suffix,
 	})
 	if err != nil {
@@ -983,9 +983,9 @@ func (s *EnforcementBindingService) BindManual(
 	if templateVersion == "" {
 		templateVersion = awsdiscovery.EnforcementTemplateVersion
 	}
-	if !awsdiscovery.KnownEnforcementTemplateVersion(templateVersion) {
+	if !KnownEnforcementTemplateVersionNow(templateVersion) {
 		return nil, enfErr(http.StatusUnprocessableEntity, EnfCodeValidation, "Unknown enforcement template version.",
-			map[string]any{"field": "template_version", "known": []string{awsdiscovery.EnforcementTemplateVersion}})
+			map[string]any{"field": "template_version", "known": KnownEnforcementTemplateVersionsNow()})
 	}
 	if live == nil {
 		return nil, enfErr(http.StatusConflict, EnfCodeSessionRequired,
@@ -1194,6 +1194,8 @@ func (s *EnforcementBindingService) runAndRecord(
 			BindingID: b.ID, AccountID: b.AccountID, Partition: awsdiscovery.PartitionAWS,
 			RoleARN: b.RoleARN, SelfTestRoleARN: b.SelftestRoleARN, ExternalID: ext, Region: s.stsRegion(c),
 			Now: s.now,
+			// R2: a template v2 stack also proves its v2 capabilities.
+			TemplateV2: awsdiscovery.IsEnforcementTemplateV2(b.TemplateVersion),
 		})
 	}
 	return s.recordReport(b, rep, actor)
@@ -1437,7 +1439,7 @@ func (s *EnforcementBindingService) handleCreate(
 		return fail(AWSOnbCodeAccountMismatch, fmt.Sprintf("stack %s, role %s, self-test role %s, AccountId %s",
 			stack.AccountID, ra, sa, props.AccountID))
 	}
-	if !awsdiscovery.KnownEnforcementTemplateVersion(props.TemplateVersion) {
+	if !KnownEnforcementTemplateVersionNow(props.TemplateVersion) {
 		return fail(AWSOnbCodeInvalidRequest, "unknown TemplateVersion "+props.TemplateVersion)
 	}
 

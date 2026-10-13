@@ -184,6 +184,11 @@ type SelfTestInput struct {
 	// RunID distinguishes this run's test policy from a leaked earlier one.
 	// Empty draws a random one.
 	RunID string
+	// TemplateV2 is true for a binding whose stack is enforcement template
+	// v2 (awsdiscovery.IsEnforcementTemplateV2 of its template_version): the
+	// CapabilitiesV2 probes run too (DECISION R2-14, R2-15). False is the
+	// §3.6 self-test exactly as before.
+	TemplateV2 bool
 }
 
 // SelfTestSessionName names the self-test's assumed session, so CloudTrail
@@ -293,6 +298,11 @@ func untested(at time.Time, why string) CapabilityResult {
 // the reason. refuses_foreign_boundary needs no test policy and always runs
 // once the role is assumed. Cleanup (detach, delete) is attempted whatever
 // failed before it.
+//
+// With in.TemplateV2 the template v2 probes (runV2Probes) run between
+// detach_boundary and delete_policy. They are recorded beside the §3.6
+// capabilities but never change State or Failing, which read Capabilities
+// only, so a binding's state machine is the same for v1 and v2.
 func RunSelfTest(ctx context.Context, a Assumer, in SelfTestInput) Report {
 	now := in.Now
 	if now == nil {
@@ -304,6 +314,13 @@ func RunSelfTest(ctx context.Context, a Assumer, in SelfTestInput) Report {
 		for _, c := range Capabilities {
 			if _, ok := rep.Capabilities[c]; !ok {
 				set(c, untested(now().UTC(), "not run: the role could not be assumed"))
+			}
+		}
+		if in.TemplateV2 {
+			for _, c := range CapabilitiesV2 {
+				if _, ok := rep.Capabilities[c]; !ok {
+					set(c, untested(now().UTC(), "not run: the role could not be assumed"))
+				}
 			}
 		}
 		rep.FinishedAt = now().UTC()
@@ -335,6 +352,11 @@ func RunSelfTest(ctx context.Context, a Assumer, in SelfTestInput) Report {
 	if err != nil {
 		for _, c := range Capabilities[1:] {
 			set(c, CapabilityResult{Status: StatusError, ErrorCode: "InvalidSelfTestRole", Message: err.Error(), CheckedAt: now().UTC()})
+		}
+		if in.TemplateV2 {
+			for _, c := range CapabilitiesV2 {
+				set(c, CapabilityResult{Status: StatusError, ErrorCode: "InvalidSelfTestRole", Message: err.Error(), CheckedAt: now().UTC()})
+			}
 		}
 		return finish()
 	}
@@ -402,6 +424,13 @@ func RunSelfTest(ctx context.Context, a Assumer, in SelfTestInput) Report {
 		set(CapDetachBoundary, untested(now().UTC(), "not run: no AuthSec test boundary is attached"))
 	}
 
+	// template v2: after detach_boundary and before delete_policy, so the
+	// test policy is attached as a role policy and detached again before it
+	// is deleted.
+	if in.TemplateV2 {
+		runV2Probes(ctx, iam, in, roleName, runID, policyARN, created, now, set)
+	}
+
 	// delete_policy
 	if created {
 		derr := iam.DeletePolicy(ctx, policyARN)
@@ -429,4 +458,127 @@ func roleNameOf(arn string) (name, path string, err error) {
 		return rest, "/", nil
 	}
 	return rest[j+1:], "/" + rest[:j+1], nil
+}
+
+// SelfTestSplitRolePath is the path of every AuthSec split role (DECISION
+// R2-15); the split_role_lifecycle probe creates its throwaway role there.
+const SelfTestSplitRolePath = "/authsec/split/"
+
+// SelfTestSplitRoleName names the split_role_lifecycle probe's throwaway role
+// of one run.
+func SelfTestSplitRoleName(runID string) string { return "AuthSecSelfTestSplit-" + runID }
+
+// selfTestSplitInlinePolicy names the inline policy the split_role_lifecycle
+// probe puts on (and deletes from) its throwaway role.
+const selfTestSplitInlinePolicy = "AuthSecSelfTestDenyAll"
+
+// runV2Probes runs the template v2 probes (CapabilitiesV2), against the
+// self-test role and the run's test policy only, plus one throwaway split
+// role it creates and deletes itself:
+//
+//	attach_authsec_policy   AttachRolePolicy(self-test role, test policy)
+//	refuses_foreign_attach  AttachRolePolicy(self-test role, ReadOnlyAccess) must be AccessDenied
+//	detach_authsec_policy   DetachRolePolicy(self-test role, test policy)
+//	split_role_lifecycle    CreateRole /authsec/split/AuthSecSelfTestSplit-<run>, PutRolePolicy,
+//	                        DeleteRolePolicy, DeleteRole
+//	update_function_role    never probed (the self-test has no Lambda function)
+//
+// A client without the v2 operations marks every v2 capability untested.
+func runV2Probes(ctx context.Context, c IAM, in SelfTestInput, roleName, runID, policyARN string, created bool,
+	now func() time.Time, set func(string, CapabilityResult)) {
+	at := func() time.Time { return now().UTC() }
+	v2, ok := AsIAMv2(c)
+	if !ok {
+		for _, cp := range CapabilitiesV2 {
+			set(cp, untested(at(), "not run: the enforcement client has no template v2 operations"))
+		}
+		return
+	}
+
+	// attach_authsec_policy (DECISION R2-14: AttachRolePolicy scoped by
+	// iam:PolicyARN to /authsec/).
+	attached := false
+	if created {
+		err := v2.AttachRolePolicy(ctx, roleName, policyARN)
+		set(CapAttachAuthSecPolicy, classify(err, at()))
+		attached = err == nil
+	} else {
+		set(CapAttachAuthSecPolicy, untested(at(), "not run: no test policy was created"))
+	}
+
+	// refuses_foreign_attach: any non-/authsec/ policy must be refused.
+	foreign := ForeignBoundaryARN(in.Partition)
+	ferr := v2.AttachRolePolicy(ctx, roleName, foreign)
+	switch {
+	case ferr == nil:
+		msg := "AWS accepted the attachment of a non-AuthSec policy; the attach condition does not restrict"
+		// Take it off again at once (the self-test role denies everything
+		// inline, so it granted nothing meanwhile).
+		if derr := v2.DetachRolePolicy(ctx, roleName, foreign); derr != nil {
+			msg += "; detaching it again failed (" + classify(derr, at()).ErrorCode + "): remove " + foreign + " from " + roleName + " by hand"
+		}
+		set(CapRefusesForeignAttach, CapabilityResult{Status: StatusError, ErrorCode: ErrorCodeForeignAttachAccepted,
+			Message: msg, CheckedAt: at()})
+	case IsAccessDenied(ferr):
+		set(CapRefusesForeignAttach, CapabilityResult{Status: StatusOK, ErrorCode: ErrorCode(ferr), CheckedAt: at()})
+	default:
+		set(CapRefusesForeignAttach, classify(ferr, at()))
+	}
+
+	// detach_authsec_policy
+	if attached {
+		set(CapDetachAuthSecPolicy, classify(v2.DetachRolePolicy(ctx, roleName, policyARN), at()))
+	} else {
+		set(CapDetachAuthSecPolicy, untested(at(), "not run: the AuthSec test policy is not attached"))
+	}
+
+	// split_role_lifecycle (DECISION R2-15)
+	set(CapSplitRoleLifecycle, splitRoleProbe(ctx, v2, in, runID, at))
+
+	// update_function_role
+	set(CapUpdateFunctionRole, untested(at(), "not probed: the self-test has no Lambda function; the first direct split proves it"))
+}
+
+// splitRoleProbe is split_role_lifecycle: create a throwaway split role that
+// only this account's root may assume, put and delete a deny-all inline
+// policy, delete the role. The result is the first error; a refused
+// CreateRole is `denied` (the stack was deployed with EnableLambdaSplit
+// 'false'). Cleanup is attempted whatever failed before it.
+func splitRoleProbe(ctx context.Context, v2 IAMv2, in SelfTestInput, runID string, at func() time.Time) CapabilityResult {
+	partition := in.Partition
+	if partition == "" {
+		partition = "aws"
+	}
+	name := SelfTestSplitRoleName(runID)
+	trust := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Sid":"SameAccountRootOnly","Effect":"Allow",`+
+		`"Principal":{"AWS":"arn:%s:iam::%s:root"},"Action":"sts:AssumeRole"}]}`, partition, in.AccountID)
+	if _, err := v2.CreateRole(ctx, CreateRoleInput{
+		Name: name, Path: SelfTestSplitRolePath, TrustDocument: trust,
+		Description: "AuthSec enforcement self-test: throwaway split role, deleted by the same run.",
+		Tags:        map[string]string{"authsec:managed-by": "authsec", "authsec:selftest": in.BindingID.String()},
+	}); err != nil {
+		r := classify(err, at())
+		if r.Status == StatusDenied {
+			r.Message = "CreateRole under " + SelfTestSplitRolePath + " was refused: the stack does not enable Lambda splits (EnableLambdaSplit). " + r.Message
+		}
+		return r
+	}
+	var first error
+	keep := func(err error) {
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	perr := v2.PutRolePolicy(ctx, name, selfTestSplitInlinePolicy, selfTestDocument(1))
+	keep(perr)
+	if perr == nil {
+		keep(v2.DeleteRolePolicy(ctx, name, selfTestSplitInlinePolicy))
+	}
+	derr := v2.DeleteRole(ctx, name)
+	keep(derr)
+	r := classify(first, at())
+	if derr != nil {
+		r.Message = "the throwaway role " + SelfTestSplitRolePath + name + " was left behind; " + r.Message
+	}
+	return r
 }

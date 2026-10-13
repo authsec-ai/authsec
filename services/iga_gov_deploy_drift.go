@@ -560,6 +560,11 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 	if err != nil {
 		return err
 	}
+	if isDirectSplit(*d, plan) {
+		// R2 (DECISION R2-20): a direct split's unknown op is recognised
+		// from one read after settle_after.
+		return s.r2ResolveSplitUnknown(ctx, run, *d, plan)
+	}
 	exec, err := s.executor(run)
 	if err != nil {
 		return PolicyJobRetryLater(5*time.Minute, err.Error())
