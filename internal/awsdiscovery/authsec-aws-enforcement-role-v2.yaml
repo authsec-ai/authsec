@@ -1,0 +1,437 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec enforcement v2 - a SEPARATE, customer-consented stack that lets
+  AuthSec apply changes a person approved in AuthSec, and nothing else. It can
+  create, version and delete AuthSec-owned IAM policies (under /authsec/),
+  set and remove them as permissions boundaries, and attach and detach them
+  as role policies (time-limited temporary grants, and session revocation by
+  an attached deny). With EnableLambdaSplit=true it can also create roles
+  under /authsec/split/ and switch a Lambda function's execution role. It
+  cannot read anything, cannot change your own policies, and cannot touch
+  service-linked roles, AWS reserved roles, AuthSec's own roles or roles
+  tagged authsec:protected=true. Deleting this stack removes AuthSec's
+  ability to change anything.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-10-13'
+    Kind: enforcement
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Filled in by AuthSec - do not change
+        Parameters:
+          - AuthSecPrincipalArn
+          - ExternalId
+          - CallbackTopicArn
+          - NameSuffix
+      - Label:
+          default: Optional - direct Lambda execution-role splits
+        Parameters:
+          - EnableLambdaSplit
+
+Parameters:
+
+  AuthSecPrincipalArn:
+    Type: String
+    Description: >-
+      The AuthSec AWS principal permitted to assume the enforcement role. Copy
+      it from the AuthSec console.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(root|user\/.+|role\/.+)$'
+    ConstraintDescription: must be an IAM principal ARN.
+
+  # Not NoEcho, for the same reason as the discovery template: Quick Create
+  # ignores NoEcho parameters, and the value is readable in the trust policy
+  # anyway. It is minted separately from the discovery ExternalId and is never
+  # equal to it.
+  ExternalId:
+    Type: String
+    Description: >-
+      The AuthSec-generated ExternalId for enforcement in this account. Filled
+      in by AuthSec; do not change it. It is NOT the discovery ExternalId.
+    MinLength: 32
+    MaxLength: 1224
+    AllowedPattern: '^[\w+=,.@:\/-]+$'
+    ConstraintDescription: must be the ExternalId shown in the AuthSec console.
+
+  # Set only by AuthSec's "Launch in AWS" link. Empty means the manual flow:
+  # no callback resource is created.
+  CallbackTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Filled in by AuthSec's Launch link. Leave empty when deploying this
+      template by hand.
+    AllowedPattern: '^$|^arn:aws:sns:[a-z0-9-]+:\d{12}:[A-Za-z0-9_-]{1,256}$'
+    ConstraintDescription: must be empty or the SNS topic ARN AuthSec provided.
+
+  # Names both roles. AuthSec tells you the value; the self-test role's name is
+  # checked against it before any self-test runs, so the self-test can never be
+  # pointed at one of your own roles.
+  NameSuffix:
+    Type: String
+    Description: >-
+      The suffix AuthSec gave this binding. Names the enforcement role
+      (AuthSecEnforcement-<suffix>) and its self-test role
+      (AuthSecEnforcementSelfTest-<suffix>).
+    AllowedPattern: '^[a-z0-9]{1,16}$'
+    ConstraintDescription: must be the suffix shown in the AuthSec console.
+
+  # DECISION R2-15: direct Lambda splits are opt-in. Off (the default), the
+  # stack grants nothing beyond policy writes, boundaries and AuthSec-policy
+  # attachments; AuthSec then offers a split only as a pull request or export.
+  EnableLambdaSplit:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      'true' lets AuthSec carry out an approved split of a Lambda function's
+      execution role directly: create a dedicated role under /authsec/split/,
+      give it the source role's policies, and switch the function to it (and
+      back on revert). Leave 'false' to receive splits as pull requests only.
+
+Conditions:
+
+  HasCallback: !Not [!Equals [!Ref CallbackTopicArn, '']]
+  EnableLambdaSplitCond: !Equals [!Ref EnableLambdaSplit, 'true']
+
+Resources:
+
+  AuthSecEnforcementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AuthSecEnforcement-${NameSuffix}'
+      Description: >-
+        Write-only role assumed by AuthSec to apply approved changes. It can
+        only manage AuthSec-owned policies under /authsec/ and, when enabled,
+        AuthSec split roles under /authsec/split/.
+      MaxSessionDuration: 3600
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthSecAssumeWithExternalId
+            Effect: Allow
+            Principal:
+              AWS: !Ref AuthSecPrincipalArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+
+      # The complete permission set (SPEC-iga-phase3-policy.md sections 3.6
+      # and 12.3, template v2 = template v1 plus the R2 statements). Nothing
+      # else is granted: no reads, no managed policies. Protection is by PATH
+      # and TAG, never by role name.
+      Policies:
+        - PolicyName: AuthSecEnforcementBoundaryWrites
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # ---------------------------------------------------------- v1
+
+              # Create, version and delete AuthSec's own policies, and only
+              # those: every policy AuthSec writes lives under /authsec/.
+              - Sid: ManageAuthSecPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:TagPolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Attach a permissions boundary only when the boundary being set
+              # is an AuthSec policy. Any other policy (including AWS managed
+              # policies) is refused by this condition.
+              - Sid: AttachOnlyAuthSecBoundaries
+                Effect: Allow
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  ArnLike:
+                    iam:PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Remove a permissions boundary only when the boundary currently
+              # attached is an AuthSec policy, so a boundary you set yourself
+              # can never be removed. Whether AWS supplies this key for
+              # DeleteRolePermissionsBoundary is proven by the self-test
+              # (detach_boundary) and by the Stage A lab check.
+              - Sid: DetachOnlyAuthSecBoundaries
+                Effect: Allow
+                Action:
+                  - iam:DeleteRolePermissionsBoundary
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  ArnLike:
+                    iam:PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # ---------------------------------------------------------- v2
+
+              # Temporary grants and session revocation: attach and detach an
+              # AuthSec policy (under /authsec/) as a role policy, and nothing
+              # else. Any other policy ARN (yours, or an AWS managed policy)
+              # is refused by this condition.
+              #
+              # DECISION R2-14: there is deliberately NO iam:PutRolePolicy on
+              # your roles. IAM has no condition key that limits
+              # PutRolePolicy / DeleteRolePolicy to an inline policy NAME (the
+              # resource is the role; the policy name and document cannot be
+              # constrained), so that grant would let this role write any
+              # inline policy to any unprotected role. Session revocation is
+              # therefore an AuthSec-owned MANAGED deny policy under /authsec/
+              # attached with iam:AttachRolePolicy, scoped by iam:PolicyARN
+              # exactly as boundaries are scoped by iam:PermissionsBoundary.
+              - Sid: AttachOnlyAuthSecPolicies
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  ArnLike:
+                    iam:PolicyARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # DECISION R2-15 (EnableLambdaSplit=true only): create an
+              # AuthSec split role, only under /authsec/split/ and only when
+              # the request tags it authsec:managed-by=authsec. IAM offers no
+              # condition key on a new role's trust policy; AuthSec always
+              # copies the source role's trust (flagged for review).
+              - !If
+                - EnableLambdaSplitCond
+                - Sid: CreateAuthSecSplitRoles
+                  Effect: Allow
+                  Action:
+                    - iam:CreateRole
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/authsec/split/*'
+                  Condition:
+                    StringEquals:
+                      aws:RequestTag/authsec:managed-by: authsec
+                - !Ref AWS::NoValue
+
+              # DECISION R2-15 (EnableLambdaSplit=true only): manage split
+              # roles, and only those (path /authsec/split/; and see
+              # DenyUnmanagedSplitRoleChanges below). A split role receives
+              # the source role's managed policies by ARN, so ANY policy ARN
+              # may be attached to a split role -- that is what a split is.
+              # iam:TagRole is also what CreateRole needs to apply its tags.
+              - !If
+                - EnableLambdaSplitCond
+                - Sid: ManageAuthSecSplitRoles
+                  Effect: Allow
+                  Action:
+                    - iam:TagRole
+                    - iam:DeleteRole
+                    - iam:PutRolePolicy
+                    - iam:DeleteRolePolicy
+                    - iam:AttachRolePolicy
+                    - iam:DetachRolePolicy
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/authsec/split/*'
+                - !Ref AWS::NoValue
+
+              # DECISION R2-15 (EnableLambdaSplit=true only): pass a role to
+              # Lambda, and to no other service.
+              #
+              # RISK, flagged for review: the resource is role/* and not only
+              # role/authsec/split/*, because REVERTING a split must hand the
+              # function its ORIGINAL execution role back, and that can be any
+              # role in the account. Together with UpdateFunctionConfiguration
+              # this lets AuthSec set any unprotected role as any Lambda
+              # function's execution role. The Protect* denies below still
+              # keep service-linked, AWS reserved, AuthSec-owned and
+              # authsec:protected roles out of reach. Leave EnableLambdaSplit
+              # 'false' if that is not acceptable.
+              - !If
+                - EnableLambdaSplitCond
+                - Sid: PassRolesToLambdaOnly
+                  Effect: Allow
+                  Action:
+                    - iam:PassRole
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                  Condition:
+                    StringEquals:
+                      iam:PassedToService: lambda.amazonaws.com
+                - !Ref AWS::NoValue
+
+              # DECISION R2-15 (EnableLambdaSplit=true only): switch a Lambda
+              # function's execution role (UpdateFunctionConfiguration with
+              # Role), in any region of this account.
+              - !If
+                - EnableLambdaSplitCond
+                - Sid: SwitchLambdaExecutionRole
+                  Effect: Allow
+                  Action:
+                    - lambda:UpdateFunctionConfiguration
+                  Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
+                - !Ref AWS::NoValue
+
+              # ------------------------------------------------- protections
+
+              # Never service-linked roles or AWS reserved (SSO) roles, by
+              # path: no boundary, no attachment, no pass, no change.
+              - Sid: ProtectServiceRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-reserved/*'
+
+              # Never AuthSec's own roles (discovery and enforcement), by tag.
+              - Sid: ProtectAuthSecRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ManagedBy: AuthSec
+
+              # Never a role you have tagged authsec:protected=true.
+              - Sid: ProtectTaggedRoles
+                Effect: Deny
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/authsec:protected: 'true'
+
+              # A role under /authsec/split/ that AuthSec did not create (it
+              # is not tagged authsec:managed-by=authsec) is never changed or
+              # deleted, whatever else this policy allows. Unconditional: a
+              # Deny only ever narrows.
+              #
+              # iam:TagRole is NOT in this deny: CreateRole authorises its
+              # tags as iam:TagRole on a role that does not exist yet, which
+              # carries no aws:ResourceTag, and StringNotEquals on an absent
+              # key is true, so the deny would refuse every split role's
+              # creation. Tagging is instead limited by CreateRole's
+              # aws:RequestTag condition and the /authsec/split/ path; adding
+              # the managed-by tag to a split-path role AuthSec did not
+              # create remains possible and is flagged for review.
+              - Sid: DenyUnmanagedSplitRoleChanges
+                Effect: Deny
+                Action:
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/authsec/split/*'
+                Condition:
+                  StringNotEquals:
+                    aws:ResourceTag/authsec:managed-by: authsec
+
+      Tags:
+        - Key: ManagedBy
+          Value: AuthSec
+        - Key: Purpose
+          Value: policy-enforcement-boundaries
+
+  # The self-test target. AuthSec attaches and removes a test boundary and a
+  # test policy on THIS role only, to prove the enforcement role's conditions
+  # work; it never runs a self-test against any other role (the split-role
+  # probe creates and deletes its own throwaway role under /authsec/split/).
+  # The role grants nothing: its only policy denies everything, and only
+  # principals of this account that already hold sts:AssumeRole on it could
+  # assume it. Tagged authsec:selftest=true and deliberately NOT
+  # ManagedBy=AuthSec, which would put it out of the enforcement role's reach
+  # and make the self-test meaningless.
+  AuthSecEnforcementSelfTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AuthSecEnforcementSelfTest-${NameSuffix}'
+      Description: >-
+        Inert target for the AuthSec enforcement self-test. Grants nothing.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SameAccountOnly
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AuthSecSelfTestGrantsNothing
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DenyEverything
+                Effect: Deny
+                Action: '*'
+                Resource: '*'
+      Tags:
+        - Key: authsec:selftest
+          Value: 'true'
+        - Key: Purpose
+          Value: policy-enforcement-self-test
+
+  # Reports both roles to AuthSec. It creates nothing in this account. AuthSec
+  # answers SUCCESS only after it has assumed the enforcement role with the
+  # ExternalId and read the account back; FAILED rolls the stack back.
+  AuthSecEnforcementRegistration:
+    Type: Custom::AuthSecEnforcementRegistration
+    Condition: HasCallback
+    Properties:
+      ServiceToken: !Ref CallbackTopicArn
+      ServiceTimeout: 600
+      RoleArn: !GetAtt AuthSecEnforcementRole.Arn
+      SelfTestRoleArn: !GetAtt AuthSecEnforcementSelfTestRole.Arn
+      ExternalId: !Ref ExternalId
+      AccountId: !Ref 'AWS::AccountId'
+      TemplateVersion: '2026-10-13'
+
+Outputs:
+
+  RoleArn:
+    Description: >-
+      When deploying by hand, paste this back into the AuthSec console
+      (Policy > Setup > Enforcement). Not secret.
+    Value: !GetAtt AuthSecEnforcementRole.Arn
+
+  SelfTestRoleArn:
+    Description: >-
+      When deploying by hand, paste this back too. AuthSec's self-test only
+      ever touches this role.
+    Value: !GetAtt AuthSecEnforcementSelfTestRole.Arn
+
+  AccountId:
+    Description: The AWS account this enforcement binding covers.
+    Value: !Ref 'AWS::AccountId'
+
+  TemplateVersion:
+    Description: Identifies which enforcement permission set this stack granted.
+    Value: '2026-10-13'

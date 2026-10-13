@@ -310,6 +310,11 @@ func (f *GovRowDeploymentFacts) DeploymentGateFacts(ctx context.Context, h *gorm
 		}
 	}
 	in.RemovesServices = p.DesiredAttachment == "present" && len(in.Removed) > 0
+	if intent, err := storedRightSize(v); err == nil && len(intent.RemoveActions) > 0 {
+		// R1b: the subject's removed actions.
+		in.RemovedActions = intent.ForSubject(c.IdentityAccountID.String()).RemovedActionKeys()
+		in.RemovesServices = p.DesiredAttachment == "present" && (len(in.Removed) > 0 || len(in.RemovedActions) > 0)
+	}
 	var reports []models.IGAGovHealthReport
 	if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, d.ID).Find(&reports).Error; err != nil {
 		return nil, err

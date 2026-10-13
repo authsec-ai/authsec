@@ -195,6 +195,42 @@ func main() {
 	// gated by it.
 	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
 	services.SetPolicyGate(policyGate)
+	// IGA_POLICY_R1B (SPEC-iga-phase3-policy.md §12.1): Phase 3 R1b,
+	// action-level right-sizing. Its own switch, read ONCE, default off; on
+	// requires IGA_POLICY available (read live) and migration 060 verified by
+	// its own check, so a database without 060 never takes R1a down. Off, every
+	// R1a path runs exactly as before.
+	r1bGate := services.PolicyR1BGateFromEnv()
+	services.SetPolicyR1BGate(r1bGate)
+	if r1bGate.Enabled() {
+		go r1bGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
+	// IGA_POLICY_R2 (SPEC-iga-phase3-policy.md §12.3): Phase 3 R2,
+	// time-bound access and session response. Its own switch, read ONCE,
+	// default off; on requires IGA_POLICY available (read live) and
+	// migration 061 verified by its own check, so a database without 061
+	// never takes R1a down. Off, R1a and R1b run exactly as before (no R2
+	// route, job kind, schedule or capability flag exists).
+	r2Gate := services.PolicyR2GateFromEnv()
+	services.SetPolicyR2Gate(r2Gate)
+	if r2Gate.Enabled() {
+		go r2Gate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
+	// IGA_POLICY_R3 (SPEC-iga-phase3-policy.md §12.4): Phase 3 R3, agent
+	// runtime controls. Its own switch, read ONCE, default off; on requires
+	// IGA_POLICY available (read live) and migration 062 verified by its own
+	// check, so a database without 062 never takes R1a down. Off, R1a, R1b and
+	// R2 run exactly as before (no R3 route, sweeper or capability flag).
+	// Unavailable while on, the agent runtime routes answer 503 and fail
+	// closed. The sweeper (hold expiry, reservation release / settlement,
+	// argument retention) starts once 062 verified.
+	r3Gate := services.PolicyR3GateFromEnv()
+	services.SetPolicyR3Gate(r3Gate)
+	if r3Gate.Enabled() {
+		go r3Gate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			go services.RunR3Sweeper(context.Background(), config.DB, time.Minute)
+		})
+	}
 	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
 	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
 	// ready hook, never before. It also claims nothing while the gate reads
@@ -237,6 +273,14 @@ func main() {
 				}
 			}
 			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
+			// R3 brokered sessions (DECISION R3-12): the connector ExternalId
+			// comes from Vault and STS is called with AuthSec's ambient AWS
+			// identity. Installed only while IGA_POLICY_R3 is on and Vault is
+			// configured; otherwise policy.brokered_sessions is false and the
+			// route answers 503 broker_unavailable. UNVERIFIED against AWS.
+			if services.PolicyR3GateState().Enabled() && policyVault != nil {
+				services.SetRuntimeBrokerDeps(services.LiveRuntimeBrokerDeps(services.NewAWSOnboardingService(config.DB, policyVault)))
+			}
 			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
 			// the GitHub App key and connector credentials. Installed in EVERY
 			// process that serves the policy routes, before the worker check:

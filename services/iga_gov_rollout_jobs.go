@@ -191,6 +191,13 @@ func (r *GovRollout) observationTargets(db *gorm.DB, ws uuid.UUID, rc *govRollou
 				ot.LastAttempts[e.Service] = e.LastAuthenticatedAt
 			}
 		}
+		if acts := rc.Intent.ForSubject(t.Control.IdentityAccountID.String()).RemovedActionKeys(); len(acts) > 0 && PolicyActionsOn() {
+			// R1b (§8.6 at action level): a removed action with an attributed
+			// event after the evidence report sends the version back to draft.
+			if err := actionObservation(db, ws, rev, t.Control.IdentityAccountID, acts, &ot); err != nil {
+				return nil, err
+			}
+		}
 		out = append(out, ot)
 	}
 	return out, nil

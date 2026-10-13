@@ -175,6 +175,16 @@ func (s *GovDeployments) readPlan(ctx context.Context, run *PolicyJobRun, d mode
 	if env.AWS == nil {
 		return igagov.LiveRead{}, igagov.Classification{}, PolicyJobRetryLater(5*time.Minute, "AWS access is not configured")
 	}
+	if isDirectSplit(d, plan) {
+		// R2 (DECISION R2-20): a direct split is read as the IaC path reads
+		// one: source role, new role, and the migration evidence.
+		live, err := s.r2SplitLive(ctx, run, d, plan, ctl)
+		if err != nil {
+			return live, igagov.Classification{}, err
+		}
+		cl, err := igagov.Classify(plan, live)
+		return live, cl, err
+	}
 	var live igagov.LiveRead
 	err := run.External(ctx, 0, func(ctx context.Context) error {
 		disc, err := env.AWS.DiscoveryIAM(ctx, d.WorkspaceID, ctl.ConnectorID)
@@ -308,6 +318,14 @@ func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov
 	in.RemovesServices = d.Kind == igagov.PlanApply && p.DesiredAttachment == igagov.AttachmentPresent && len(p.Impact.Removed) > 0
 	for _, r := range p.Impact.Removed {
 		in.Removed = append(in.Removed, r.Service)
+	}
+	if len(p.Impact.RemovedActions) > 0 {
+		// R1b: the plan removes actions within kept services; restriction
+		// and the denial classes are judged at action level too.
+		for _, x := range p.Impact.RemovedActions {
+			in.RemovedActions = append(in.RemovedActions, x.Action)
+		}
+		in.RemovesServices = d.Kind == igagov.PlanApply && p.DesiredAttachment == igagov.AttachmentPresent
 	}
 	for _, r := range p.Impact.Retained {
 		in.Retained = append(in.Retained, igagov.RetainedService{Service: r.Service, ActiveInQualifiedInterval: r.Basis == "observed"})

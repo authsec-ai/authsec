@@ -101,6 +101,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/findings/summary", require("governance", "read"), ctl.FindingsSummary)
 	g.GET("/findings/:id", require("governance", "read"), ctl.GetFinding)
 	g.GET("/identities/:id/activity-evidence", require("governance", "read"), ctl.ActivityEvidence)
+	// R1b (IGA_POLICY_R1B): action-level evidence; 422 policy_actions_unavailable while off.
+	g.GET("/identities/:id/action-evidence", require("governance", "read"), ctl.ActionEvidence)
 	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
 	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
@@ -174,6 +176,17 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.POST("/policies/:id/rollout/expand", require("governance", "enforce"), ctl.ExpandRollout)
 	g.POST("/policies/:id/rollout/pause", require("governance", "enforce"), ctl.PauseRollout)
 	g.POST("/policies/:id/rollout/resume", require("governance", "enforce"), ctl.ResumeRollout)
+
+	// R2 (IGA_POLICY_R2, iga_gov_r2_controller.go): mounted only while the
+	// switch is on (DECISION R2-21), so with it off the table is R1a's.
+	if services.PolicyR2GateState().Enabled() {
+		RegisterIGAPolicyR2Routes(g, ctl, require)
+	}
+	// R3 (IGA_POLICY_R3, iga_gov_r3_controller.go): mounted only while the
+	// switch is on (DECISION R3-17), so with it off the table is R2's.
+	if services.PolicyR3GateState().Enabled() {
+		RegisterIGAPolicyR3Routes(g, ctl, require)
+	}
 }
 
 // Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
@@ -301,6 +314,61 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 			reasons[f.name] = reason
 		default:
 			reasons[f.name] = why
+		}
+	}
+	// R1b (IGA_POLICY_R1B): policy.actions is served only while its switch is
+	// on, so with it off the block is exactly R1a's.
+	if r1b := services.PolicyR1BGateState(); r1b.Enabled() {
+		state, why := r1b.Status()
+		available := on && state == services.PolicyOn
+		out["actions"] = available
+		if !available {
+			if !on {
+				why = reason
+			}
+			reasons["actions"] = why
+		}
+	}
+	// R2 (IGA_POLICY_R2): policy.temporary_grants and policy.session_revoke
+	// (and policy.time_bound, policy.lambda_split_direct) are served only
+	// while the switch is on, so with it off the block is exactly R1a's.
+	if r2 := services.PolicyR2GateState(); r2.Enabled() {
+		state, why := r2.Status()
+		available := on && state == services.PolicyOn
+		for _, name := range []string{"temporary_grants", "session_revoke", "time_bound", "lambda_split_direct"} {
+			out[name] = available
+			if !available {
+				if !on {
+					reasons[name] = reason
+				} else {
+					reasons[name] = why
+				}
+			}
+		}
+	}
+	// R3 (IGA_POLICY_R3): policy.runtime_controls and
+	// policy.brokered_sessions are served only while the switch is on, so
+	// with it off the block is exactly R2's. Brokered sessions also need the
+	// process's broker (Vault and AuthSec's AWS identity).
+	if r3 := services.PolicyR3GateState(); r3.Enabled() {
+		state, why := r3.Status()
+		available := on && state == services.PolicyOn
+		if !on {
+			why = reason
+		}
+		out["runtime_controls"] = available
+		if !available {
+			reasons["runtime_controls"] = why
+		}
+		brokered, bwhy := available, why
+		if available {
+			if d := services.CurrentRuntimeBrokerDeps(); d == nil || d.Broker == nil || d.Inputs == nil {
+				brokered, bwhy = false, "Brokered AWS sessions need Vault (the connector ExternalId) and AuthSec's own AWS identity on this server."
+			}
+		}
+		out["brokered_sessions"] = brokered
+		if !brokered {
+			reasons["brokered_sessions"] = bwhy
 		}
 	}
 	out["reasons"] = reasons
