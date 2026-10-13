@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -105,7 +106,7 @@ func governanceRouter(t *testing.T, f provFixture) *gin.Engine {
 	ctl := platform.NewGovernanceController(gormFor(t, f.raw))
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
-		c.Set("workspace_id", f.ws.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: f.ws, PrincipalID: claimOwner, PrincipalKind: "user"})
 		c.Set("user_id", claimOwner.String())
 		c.Set("email", "u@a.com")
 	})

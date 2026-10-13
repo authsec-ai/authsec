@@ -17,6 +17,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/agentcore"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -25,7 +26,9 @@ import (
 // broker roles (SPEC-iga-phase3-policy.md §12.4; DECISION R3-2, R3-11,
 // R3-12 in internal/igagov/r3.go). Every mutation writes its iga_gov_event in
 // the same transaction; the routes write audit_events. Every read and write
-// is bound to the token's workspace; another workspace's id is 404.
+// is bound to the token's workspace and runs in a transaction under row-level
+// security for it (tenancy.InWorkspace / InWorkspaceRead); another
+// workspace's id is 404.
 
 // R3 event names (vocabulary: iga_gov_event_vocabulary.go).
 const (
@@ -158,7 +161,7 @@ func (s *GovR3) CreateRuntimePolicy(ctx context.Context, ws, actor uuid.UUID, re
 	}
 	_ = in
 	var out *RuntimePolicyView
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		owner := actor
 		pol := models.IGAGovPolicy{ID: uuid.New(), WorkspaceID: ws, Name: name, Purpose: req.Purpose, Family: runtimeFamily,
 			Provider: runtimeProvider, Lifecycle: "active", OwnerUserID: &owner, CreatedBy: actor}
@@ -205,7 +208,19 @@ func (s *GovR3) policyView(tx *gorm.DB, ws uuid.UUID, p models.IGAGovPolicy) (*R
 
 // ListRuntimePolicies lists the workspace's runtime policies.
 func (s *GovR3) ListRuntimePolicies(ctx context.Context, ws uuid.UUID) ([]RuntimePolicyView, error) {
-	db := s.db.WithContext(ctx)
+	var out []RuntimePolicyView
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.listRuntimePolicies(tx, ws)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *GovR3) listRuntimePolicies(db *gorm.DB, ws uuid.UUID) ([]RuntimePolicyView, error) {
 	var ps []models.IGAGovPolicy
 	if err := db.Where("workspace_id = ? AND family = ?", ws, runtimeFamily).Order("name, id").Limit(MaxGovPage).Find(&ps).Error; err != nil {
 		return nil, err
@@ -223,12 +238,19 @@ func (s *GovR3) ListRuntimePolicies(ctx context.Context, ws uuid.UUID) ([]Runtim
 
 // GetRuntimePolicy reads one runtime policy.
 func (s *GovR3) GetRuntimePolicy(ctx context.Context, ws, id uuid.UUID) (*RuntimePolicyView, error) {
-	db := s.db.WithContext(ctx)
-	p, err := s.loadRuntimePolicy(db, ws, id, false)
+	var out *RuntimePolicyView
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		p, err := s.loadRuntimePolicy(tx, ws, id, false)
+		if err != nil {
+			return err
+		}
+		out, err = s.policyView(tx, ws, *p)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	return s.policyView(db, ws, *p)
+	return out, nil
 }
 
 // CreateRuntimeVersion adds the next version (in review), withdrawing the
@@ -239,7 +261,7 @@ func (s *GovR3) CreateRuntimeVersion(ctx context.Context, ws, actor, policyID uu
 		return nil, runtimeIntentError(err)
 	}
 	var out models.IGAGovRuntimeVersion
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		p, err := s.loadRuntimePolicy(tx, ws, policyID, true)
 		if err != nil {
 			return err
@@ -311,7 +333,7 @@ func (s *GovR3) DecideRuntimeVersion(ctx context.Context, ws, approver, policyID
 		return nil, GovBadParam("intent_hash", "intent_hash is required (the hash of the version you reviewed).")
 	}
 	var out *models.IGAGovRuntimeVersion
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		p, err := s.loadRuntimePolicy(tx, ws, policyID, true)
 		if err != nil {
 			return err
@@ -387,7 +409,7 @@ func (s *GovR3) DecideRuntimeVersion(ctx context.Context, ws, approver, policyID
 // WithdrawRuntimeVersion withdraws a version in review (governance:author).
 func (s *GovR3) WithdrawRuntimeVersion(ctx context.Context, ws, actor, policyID uuid.UUID, no int, reason string) (*models.IGAGovRuntimeVersion, error) {
 	var out *models.IGAGovRuntimeVersion
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if _, err := s.loadRuntimePolicy(tx, ws, policyID, true); err != nil {
 			return err
 		}
@@ -442,12 +464,15 @@ type RuntimeCedar struct {
 // CompileRuntimeCedar compiles a version's allow-list for a gateway (an
 // export the customer may apply themselves). UNVERIFIED Cedar shape.
 func (s *GovR3) CompileRuntimeCedar(ctx context.Context, ws, policyID uuid.UUID, no int, gatewayARN string) (*RuntimeCedar, error) {
-	db := s.db.WithContext(ctx)
-	if _, err := s.loadRuntimePolicy(db, ws, policyID, false); err != nil {
-		return nil, err
-	}
-	v, err := s.loadRuntimeVersion(db, ws, policyID, no, false)
-	if err != nil {
+	var v *models.IGAGovRuntimeVersion
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		if _, err := s.loadRuntimePolicy(tx, ws, policyID, false); err != nil {
+			return err
+		}
+		var err error
+		v, err = s.loadRuntimeVersion(tx, ws, policyID, no, false)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	in, _, _, err := igagov.ParseRuntimeIntent(v.Intent)
@@ -507,7 +532,13 @@ func defaultRuntimeSettings(ws uuid.UUID) models.IGAGovRuntimeSettings {
 // RuntimeSettings reads the workspace's runtime settings (defaults when
 // none were saved).
 func (s *GovR3) RuntimeSettings(ctx context.Context, ws uuid.UUID) (models.IGAGovRuntimeSettings, error) {
-	return s.runtimeSettingsTx(s.db.WithContext(ctx), ws)
+	var st models.IGAGovRuntimeSettings
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		st, err = s.runtimeSettingsTx(tx, ws)
+		return err
+	})
+	return st, err
 }
 
 func (s *GovR3) runtimeSettingsTx(tx *gorm.DB, ws uuid.UUID) (models.IGAGovRuntimeSettings, error) {
@@ -521,7 +552,7 @@ func (s *GovR3) runtimeSettingsTx(tx *gorm.DB, ws uuid.UUID) (models.IGAGovRunti
 
 // PutRuntimeSettings updates the settings (governance:enforce).
 func (s *GovR3) PutRuntimeSettings(ctx context.Context, ws, actor uuid.UUID, p RuntimeSettingsPatch) (before, after models.IGAGovRuntimeSettings, err error) {
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		cur, err := s.runtimeSettingsTx(tx.Clauses(lockForUpdate()), ws)
 		if err != nil {
 			return err
@@ -626,7 +657,7 @@ func (s *GovR3) RecordRoutingProof(ctx context.Context, ws, actor uuid.UUID, req
 	p := models.IGAGovRuntimeRoutingProof{ID: uuid.New(), WorkspaceID: ws, GatewayARN: req.GatewayARN, AccountID: acct,
 		Method: req.Method, Statement: strings.TrimSpace(req.Statement), Evidence: canon, EvidenceHash: igagov.ContentHash(canon),
 		RecordedBy: actor, RecordedAt: now, ValidUntil: now.Add(time.Duration(req.ValidDays) * 24 * time.Hour)}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&p).Error; err != nil {
 			return err
 		}
@@ -641,19 +672,21 @@ func (s *GovR3) RecordRoutingProof(ctx context.Context, ws, actor uuid.UUID, req
 
 // ListRoutingProofs lists the workspace's routing proofs.
 func (s *GovR3) ListRoutingProofs(ctx context.Context, ws uuid.UUID, gatewayARN string) ([]models.IGAGovRuntimeRoutingProof, error) {
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if gatewayARN != "" {
-		q = q.Where("gateway_arn = ?", gatewayARN)
-	}
 	out := []models.IGAGovRuntimeRoutingProof{}
-	err := q.Order("recorded_at DESC").Limit(MaxGovPage).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if gatewayARN != "" {
+			q = q.Where("gateway_arn = ?", gatewayARN)
+		}
+		return q.Order("recorded_at DESC").Limit(MaxGovPage).Find(&out).Error
+	})
 	return out, err
 }
 
 // RevokeRoutingProof revokes a proof (governance:enforce).
 func (s *GovR3) RevokeRoutingProof(ctx context.Context, ws, actor, id uuid.UUID, reason string) (*models.IGAGovRuntimeRoutingProof, error) {
 	var p models.IGAGovRuntimeRoutingProof
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, id).Clauses(lockForUpdate()).Take(&p).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return GovNotFound()
@@ -739,12 +772,18 @@ func (s *GovR3) PushAgentCore(ctx context.Context, ws, actor, policyID uuid.UUID
 		_, why := RuntimeAgentCoreAvailable()
 		return nil, govUnprocessable(GovCodeAgentCoreUnavailable, "AgentCore push is not available on this server.", map[string]any{"reason": why})
 	}
-	db := s.db.WithContext(ctx)
-	if _, err := s.loadRuntimePolicy(db, ws, policyID, false); err != nil {
-		return nil, err
-	}
-	v, in, err := s.approvedRuntimeVersion(db, ws, policyID)
-	if err != nil {
+	// The database reads run before the AgentCore calls, the record after
+	// them: no workspace transaction is held open across AWS.
+	var v *models.IGAGovRuntimeVersion
+	var in *igagov.RuntimeIntent
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		if _, err := s.loadRuntimePolicy(tx, ws, policyID, false); err != nil {
+			return err
+		}
+		var err error
+		v, in, err = s.approvedRuntimeVersion(tx, ws, policyID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	var gw *igagov.RuntimeGateway
@@ -792,7 +831,7 @@ func (s *GovR3) PushAgentCore(ctx context.Context, ws, actor, policyID uuid.UUID
 			row.GatewayMode = g.Mode
 		}
 	}
-	terr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	terr := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&row).Error; err != nil {
 			return err
 		}
@@ -851,7 +890,19 @@ type RuntimePolicyCoverage struct {
 // each control is enforced or advisory (DECISION R3-11). It never claims
 // enforcement without a recorded, unexpired, unrevoked routing proof.
 func (s *GovR3) RuntimeCoverage(ctx context.Context, ws uuid.UUID) ([]RuntimePolicyCoverage, error) {
-	db := s.db.WithContext(ctx)
+	var out []RuntimePolicyCoverage
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.runtimeCoverage(tx, ws)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *GovR3) runtimeCoverage(db *gorm.DB, ws uuid.UUID) ([]RuntimePolicyCoverage, error) {
 	var ps []models.IGAGovPolicy
 	if err := db.Where("workspace_id = ? AND family = ?", ws, runtimeFamily).Order("name, id").Limit(MaxGovPage).Find(&ps).Error; err != nil {
 		return nil, err
@@ -980,7 +1031,12 @@ func (s *GovR3) BindBrokerRole(ctx context.Context, ws, actor uuid.UUID, req Bro
 	if req.MaxSessionSeconds < 900 || req.MaxSessionSeconds > igagov.MaxBrokerSeconds {
 		return nil, GovBadParam("max_session_seconds", "max_session_seconds must be 900..3600.")
 	}
-	c, err := repositories.NewCloudConnectorRepository(s.db.WithContext(ctx)).Get(ws, cid)
+	var c *models.CloudConnector
+	err = tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		c, err = repositories.NewCloudConnectorRepository(tx).Get(ws, cid)
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, repositories.ErrCloudConnectorNotFound) {
 			return nil, GovNotFound()
@@ -993,7 +1049,7 @@ func (s *GovR3) BindBrokerRole(ctx context.Context, ws, actor uuid.UUID, req Bro
 	}
 	row := models.IGAGovRuntimeBrokerRole{ID: uuid.New(), WorkspaceID: ws, ConnectorID: cid, AccountID: acct, RoleARN: req.RoleARN,
 		MaxSessionSeconds: req.MaxSessionSeconds, State: "active", CreatedBy: actor}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&row).Error; err != nil {
 			if isUniqueViolation(err, "uq_iga_gov_runtime_broker_role_live") {
 				return govConflict(GovCodeBrokerRoleExists, "The role is already bound for brokered sessions.", nil)
@@ -1012,7 +1068,9 @@ func (s *GovR3) BindBrokerRole(ctx context.Context, ws, actor uuid.UUID, req Bro
 // ListBrokerRoles lists the workspace's broker roles.
 func (s *GovR3) ListBrokerRoles(ctx context.Context, ws uuid.UUID) ([]models.IGAGovRuntimeBrokerRole, error) {
 	out := []models.IGAGovRuntimeBrokerRole{}
-	err := s.db.WithContext(ctx).Where("workspace_id = ?", ws).Order("created_at DESC").Limit(MaxGovPage).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ?", ws).Order("created_at DESC").Limit(MaxGovPage).Find(&out).Error
+	})
 	return out, err
 }
 
@@ -1020,7 +1078,7 @@ func (s *GovR3) ListBrokerRoles(ctx context.Context, ws uuid.UUID) ([]models.IGA
 // already issued live until their expiry (at most one hour).
 func (s *GovR3) DisableBrokerRole(ctx context.Context, ws, actor, id uuid.UUID, reason string) (*models.IGAGovRuntimeBrokerRole, error) {
 	var row models.IGAGovRuntimeBrokerRole
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, id).Clauses(lockForUpdate()).Take(&row).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return GovNotFound()

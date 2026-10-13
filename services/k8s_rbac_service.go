@@ -1787,7 +1787,7 @@ func (m *k8sRBACManager) rekeyWorkloads(tx *gorm.DB, workspaceID uuid.UUID,
 				if !strings.HasPrefix(r.SourceKey, oldPrefix) {
 					continue
 				}
-				if err := tx.Table("iga_relationship").Where("id = ?", r.ID).
+				if err := tx.Table("iga_relationship").Where("workspace_id = ? AND id = ?", workspaceID, r.ID).
 					Updates(map[string]any{
 						"source_key": newPrefix + strings.TrimPrefix(r.SourceKey, oldPrefix),
 						"updated_at": observed,
@@ -1903,7 +1903,7 @@ func (m *k8sRBACManager) adoptUnreconciled(tx *gorm.DB, workspaceID uuid.UUID,
 		return fmt.Errorf("find unpartitioned executes_as: %w", err)
 	}
 	for _, r := range rels {
-		if err := tx.Table("iga_relationship").Where("id = ?", r.ID).
+		if err := tx.Table("iga_relationship").Where("workspace_id = ? AND id = ?", workspaceID, r.ID).
 			Update("partition_key",
 				k8sgraph.PartitionForEdge(ref.Scope, r.Namespace, k8sgraph.TargetExecutesAs).Key()).
 			Error; err != nil {
@@ -2039,7 +2039,7 @@ func (m *k8sRBACManager) adoptUnattributed(tx *gorm.DB, workspaceID uuid.UUID,
 		return fmt.Errorf("find unpartitioned member_of: %w", err)
 	}
 	for _, r := range rels {
-		if err := tx.Table("iga_relationship").Where("id = ?", r.ID).
+		if err := tx.Table("iga_relationship").Where("workspace_id = ? AND id = ?", workspaceID, r.ID).
 			Update("partition_key",
 				k8sgraph.PartitionForEdge(ref.Scope, r.Namespace, k8sgraph.TargetMemberOf).Key()).
 			Error; err != nil {

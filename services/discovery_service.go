@@ -1146,7 +1146,8 @@ func (m *discoveryManager) QuarantineAgent(workspaceID, agentID uuid.UUID, reaso
 			actor = by.String()
 		}
 		if queued, why := EnforceQuarantine(db, workspaceID, agent, false, actor); !queued && why != "" {
-			if uerr := db.Model(&models.DiscoveredAgent{}).Where("id = ?", agent.ID).
+			if uerr := db.Model(&models.DiscoveredAgent{}).
+				Where("workspace_id = ? AND id = ?", workspaceID, agent.ID).
 				Update("quarantine_enforcement_error",
 					"not enforced in-cluster: "+why).Error; uerr == nil {
 				agent.QuarantineEnforcementError = "not enforced in-cluster: " + why
@@ -1189,7 +1190,8 @@ func (m *discoveryManager) ReleaseQuarantine(workspaceID, agentID uuid.UUID,
 			msg := "released, but the in-cluster NetworkPolicy was NOT removed (" + why +
 				"); delete it manually: kubectl delete networkpolicy -n <ns> " +
 				"-l authsec.ai/quarantine=true"
-			if uerr := db.Model(&models.DiscoveredAgent{}).Where("id = ?", agent.ID).
+			if uerr := db.Model(&models.DiscoveredAgent{}).
+				Where("workspace_id = ? AND id = ?", workspaceID, agent.ID).
 				Update("quarantine_enforcement_error", msg).Error; uerr == nil {
 				agent.QuarantineEnforcementError = msg
 			}

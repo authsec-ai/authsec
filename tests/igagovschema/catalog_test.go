@@ -38,25 +38,40 @@ import (
 // of a workspace is always a users row OF that workspace (memberships span
 // workspaces) is the open question that decides it.
 var phase3UserRefs = map[string]string{
-	"cloud_enforcement_binding.consented_by":   "053: who consented to the enforcement role",
-	"iga_gov_acceptance.accepted_by":           "051: who accepted the uncertainty",
-	"iga_gov_approval.decided_by":              "050: the approver",
-	"iga_gov_deployment.emergency_by":          "051: break-glass actor",
-	"iga_gov_finding_rule.created_by":          "048",
-	"iga_gov_health_report.reported_by":        "051",
-	"iga_gov_iac_source.created_by":            "053",
-	"iga_gov_owner.created_by":                 "047",
-	"iga_gov_owner.user_id":                    "047: the owner (ON DELETE CASCADE)",
-	"iga_gov_owner_response.user_id":           "050: the responding owner",
-	"iga_gov_owner_review.exception_by":        "050",
-	"iga_gov_owner_rule.created_by":            "047",
-	"iga_gov_policy.created_by":                "049: the author (self-approval is refused in code, §2.10)",
-	"iga_gov_policy.owner_user_id":             "049 (ON DELETE SET NULL)",
-	"iga_gov_policy_version.created_by":        "049: the version's author",
-	"iga_gov_settings.updated_by":              "055",
-	"iga_gov_validation.created_by":            "051",
-	"workspace_slack_integration.installed_by": "054",
-	"slack_user_link.user_id":                  "054: the linked member (ON DELETE CASCADE)",
+	"cloud_enforcement_binding.consented_by":    "053: who consented to the enforcement role",
+	"iga_gov_acceptance.accepted_by":            "051: who accepted the uncertainty",
+	"iga_gov_approval.decided_by":               "050: the approver",
+	"iga_gov_deployment.emergency_by":           "051: break-glass actor",
+	"iga_gov_finding_rule.created_by":           "048",
+	"iga_gov_health_report.reported_by":         "051",
+	"iga_gov_iac_source.created_by":             "053",
+	"iga_gov_owner.created_by":                  "047",
+	"iga_gov_owner.user_id":                     "047: the owner (ON DELETE CASCADE)",
+	"iga_gov_owner_response.user_id":            "050: the responding owner",
+	"iga_gov_owner_review.exception_by":         "050",
+	"iga_gov_owner_rule.created_by":             "047",
+	"iga_gov_policy.created_by":                 "049: the author (self-approval is refused in code, §2.10)",
+	"iga_gov_policy.owner_user_id":              "049 (ON DELETE SET NULL)",
+	"iga_gov_policy_version.created_by":         "049: the version's author",
+	"iga_gov_settings.updated_by":               "055",
+	"iga_gov_validation.created_by":             "051",
+	"workspace_slack_integration.installed_by":  "054",
+	"slack_user_link.user_id":                   "054: the linked member (ON DELETE CASCADE)",
+	"iga_gov_runtime_agentcore_push.pushed_by":  "062: who pushed the runtime policy to AgentCore",
+	"iga_gov_runtime_broker_role.created_by":    "062: who registered the broker role",
+	"iga_gov_runtime_broker_role.disabled_by":   "062: who disabled the broker role",
+	"iga_gov_runtime_hold.decided_by":           "062: who decided the hold",
+	"iga_gov_runtime_routing_proof.recorded_by": "062: who recorded the routing proof",
+	"iga_gov_runtime_routing_proof.revoked_by":  "062: who revoked the routing proof",
+	"iga_gov_runtime_settings.updated_by":       "062: who last changed the runtime settings",
+	"iga_gov_runtime_version.created_by":        "062: the runtime version's author",
+	"iga_gov_runtime_version.decided_by":        "062: who approved or rejected the runtime version",
+	"iga_gov_session_revocation.decided_by":     "061: the revocation's approver",
+	"iga_gov_session_revocation.ended_by":       "061: who lifted the revocation",
+	"iga_gov_session_revocation.requested_by":   "061: the revocation's requester",
+	"iga_gov_temp_grant.decided_by":             "061: the grant's approver",
+	"iga_gov_temp_grant.ended_by":               "061: who ended the grant",
+	"iga_gov_temp_grant.requested_by":           "061: the grant's requester",
 }
 
 // phase3BareUUID: uuid columns §6.2 gives no key at all.
@@ -69,8 +84,18 @@ var phase3BareUUID = map[string]string{
 		"cloud_connector (workspace_id, id) would fit (spec question)",
 	"iga_gov_finding.resolved_by_deployment_id": "048 precedes iga_gov_deployment (051); no key declared " +
 		"(spec question: a composite key added in 051)",
-	"iga_gov_job.subject_id":          "052: polymorphic subject, typed by kind",
-	"iga_gov_notification.subject_id": "054: polymorphic subject, typed by subject_kind",
+	"iga_gov_job.subject_id":                         "052: polymorphic subject, typed by kind",
+	"iga_gov_notification.subject_id":                "054: polymorphic subject, typed by subject_kind",
+	"iga_gov_runtime_decision.policy_id":             "062: a decision is an append-only record (frozen by trigger) that outlives the policy it applied",
+	"iga_gov_runtime_decision.version_id":            "062: as policy_id",
+	"iga_gov_runtime_decision.approval_ref":          "062: the idempotency reference of an approved hold's resumed call, not a row key",
+	"iga_gov_runtime_decision.human_user_id":         "062: the delegating human from the delegation token, recorded as it was; may be an operator homed in another workspace (ADR-0001 §3)",
+	"iga_gov_runtime_hold.human_user_id":             "062: as iga_gov_runtime_decision.human_user_id",
+	"iga_gov_runtime_broker_session.human_user_id":   "062: as iga_gov_runtime_decision.human_user_id",
+	"iga_gov_temp_grant.connector_id":                "061: the grant is a record of what was attached in AWS; it outlives the connector and is scoped by RLS",
+	"iga_gov_temp_grant.identity_account_id":         "061: projected identities are rebuilt by projection; the grant keeps the id it was made for",
+	"iga_gov_session_revocation.connector_id":        "061: as iga_gov_temp_grant.connector_id",
+	"iga_gov_session_revocation.identity_account_id": "061: as iga_gov_temp_grant.identity_account_id",
 }
 
 // phase3NoWorkspaceIDKey: tables with an id but no UNIQUE (workspace_id, id).
@@ -231,9 +256,11 @@ func phase3CatalogProblems(c p3catalog) []string {
 func TestPhase3ForeignKeyCatalogGuard(t *testing.T) {
 	db, _ := testDB(t)
 	c := phase3Catalog(t, db)
-	// 047-056's 43 tables, plus 059_tidy_eval_pruned (fix/p3-tidy).
-	if len(c.tables) != 44 {
-		t.Fatalf("%d Phase 3 tables in scope, want 44", len(c.tables))
+	// 047-056's 43 tables, plus 059_tidy_eval_pruned (fix/p3-tidy), plus
+	// the 13 of 060-062 (R1b action evidence, R2 time-bound access, R3
+	// runtime controls).
+	if len(c.tables) != 57 {
+		t.Fatalf("%d Phase 3 tables in scope, want 57", len(c.tables))
 	}
 	for _, p := range phase3CatalogProblems(c) {
 		t.Error(p)

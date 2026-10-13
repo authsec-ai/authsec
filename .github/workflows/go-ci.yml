@@ -52,6 +52,11 @@ jobs:
       - name: Tenant-scoping ratchet
         run: scripts/check-tenant-exempt.sh
 
+      # IGA code names only its own tables and declared shared ones (bounded
+      # contexts). It ran only on deploy; a PR now fails before merge.
+      - name: IGA isolation
+        run: scripts/ci-iga-isolation-check.sh
+
       # Auth, onboarding and cross-tenant isolation flows. Testcontainers
       # starts its own Postgres; -p 1 avoids reaper name races.
       - name: Integration flows (incl. cross-tenant isolation)

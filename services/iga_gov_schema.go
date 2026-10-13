@@ -188,7 +188,7 @@ var policyConstraints = []string{
 	"iga_gov_iac_change.iga_gov_iac_change_workspace_id_id_key",
 	// 054
 	"iga_gov_notification.iga_gov_pn_sent_chk", "iga_gov_notification.iga_gov_notification_workspace_id_id_key",
-	"iga_gov_notification.iga_gov_notification_subject_kind_subject_id_channel_recipi_key",
+	"iga_gov_notification.iga_gov_notification_ws_subject_channel_recipient_key", // 132 (was 054's global key)
 	// 056
 	"cloud_resource_policy_coverage.cloud_rpc_complete_chk", "cloud_resource_policy_coverage.cloud_rpc_reason_chk",
 	"cloud_resource_policy_observation.cloud_rpo_document_chk",

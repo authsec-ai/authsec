@@ -117,3 +117,49 @@ func Test_RLS_RestrictedRoleWithoutWorkspaceSeesNothing(t *testing.T) {
 		t.Fatalf("authsec_tenant without app.workspace_id inserted a row")
 	}
 }
+
+// 131: an operator homed in B who holds a membership in A is readable in A
+// (member reads: owner rules, reviews, approvals), but not writable from A;
+// B's other users stay invisible to A.
+func Test_RLS_MemberOfAnotherWorkspaceIsReadableNotWritable(t *testing.T) {
+	a, b := TwoTenants(t)
+	db := config.GetDatabase().DB
+	if _, err := db.Exec(`INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, 'active', 'api', NOW(), NOW())`,
+		a.WS.WorkspaceID, b.WS.AdminUserID, a.WS.AdminRoleID); err != nil {
+		t.Fatalf("operator membership: %v", err)
+	}
+	ctxA := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: a.WS.WorkspaceID})
+
+	var email string
+	if err := tenancy.QueryRowContext(ctxA, db,
+		`SELECT u.email FROM workspace_memberships m JOIN users u ON u.id = m.user_id
+		  WHERE m.workspace_id = $1 AND m.user_id = $2`,
+		[]interface{}{b.WS.AdminUserID}, &email); err != nil || email != b.WS.AdminEmail {
+		t.Fatalf("A cannot read its operator member homed in B: %q, %v", email, err)
+	}
+
+	res, err := tenancy.ExecContext(ctxA, db,
+		`UPDATE users SET name = 'renamed-by-a' WHERE workspace_id = $1 OR id = $2`, b.WS.AdminUserID)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	_ = res
+	var name sql.NullString
+	db.QueryRow(`SELECT name FROM users WHERE id = $1`, b.WS.AdminUserID).Scan(&name)
+	if name.String == "renamed-by-a" {
+		t.Fatalf("A updated an operator homed in B")
+	}
+
+	var n int
+	if err := tenancy.QueryRowContext(ctxA, db,
+		`SELECT count(*) FROM users WHERE workspace_id = $1 OR id = $2`,
+		[]interface{}{b.EndUser.UserID}, &n); err != nil {
+		t.Fatal(err)
+	}
+	var own int
+	db.QueryRow(`SELECT count(*) FROM users WHERE workspace_id = $1`, a.WS.WorkspaceID).Scan(&own)
+	if n != own {
+		t.Fatalf("A read %d users, want its own %d (B's non-member leaked)", n, own)
+	}
+}

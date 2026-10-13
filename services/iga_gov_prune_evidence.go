@@ -55,9 +55,11 @@ func PruneEvidenceSchedule() PolicyJobSchedule {
 // at most once (EnqueueOnceTx).
 func duePruneEvidence(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPolicyJob, error) {
 	var evaluated []uuid.UUID
+	// TENANT-EXEMPT: the prune_evidence scheduler's due scan lists workspace ids across workspaces; each job then prunes one workspace under RLS (InTx).
 	if err := db.Raw(`SELECT DISTINCT workspace_id FROM iga_gov_evaluation`).Scan(&evaluated).Error; err != nil {
 		return nil, fmt.Errorf("evaluated workspaces: %w", err)
 	}
+	// TENANT-EXEMPT: the same due scan over resource-policy evidence (workspace ids only).
 	collected, err := cloudReads.ResourcePolicyWorkspaces(db)
 	if err != nil {
 		return nil, fmt.Errorf("resource-policy workspaces: %w", err)
@@ -78,7 +80,9 @@ func duePruneEvidence(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedu
 	return out, nil
 }
 
-// PruneEvidenceHandler runs one workspace's daily prune (see above).
+// PruneEvidenceHandler runs one workspace's daily prune (see above), in the
+// job's transaction under row-level security for the job's workspace: it
+// cannot read or delete another workspace's evidence.
 func PruneEvidenceHandler(ctx context.Context, run *PolicyJobRun) error {
 	ws := run.Job.WorkspaceID
 	return run.InTx(ctx, func(tx *gorm.DB) error {

@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -86,15 +88,23 @@ type Readiness struct {
 
 // Readiness computes readiness at the latest complete evaluation; account
 // filters by AWS account (the role ARN's); the page is ordered by identity
-// id with a signed cursor.
-func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor string, limit int) (*Readiness, error) {
+// id with a signed cursor. Every read runs in one read-only transaction
+// under row-level security for ws.
+func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor string, limit int) (out *Readiness, err error) {
+	err = tenancy.InWorkspaceRead(ctx, r.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		out, e = r.readiness(tx, ws, account, cursor, limit)
+		return e
+	}))
+	return out, err
+}
+
+func (r *GovReader) readiness(db *gorm.DB, ws uuid.UUID, account, cursor string, limit int) (*Readiness, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > MaxGovPage {
 		return nil, GovBadParam("limit", "limit must be 1..200.")
 	}
-	db := r.db.WithContext(ctx)
 	out := &Readiness{Counts: map[string]int{}, Roles: []ReadinessRole{}}
 	for _, c := range ReadinessOrder {
 		out.Counts[c] = 0
@@ -180,7 +190,7 @@ func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor
 		notCollected[n.IdentityAccountID] = append(notCollected[n.IdentityAccountID], n.Reason)
 	}
 	// Resource-policy coverage of each connector's run at rev.
-	coverage, err := r.coverageAt(ctx, ws, rev)
+	coverage, err := r.coverageAt(db, ws, rev)
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +322,9 @@ func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor
 
 // coverageAt is the resource-policy coverage summary of each connector's
 // run in rev's manifest.
-func (r *GovReader) coverageAt(ctx context.Context, ws uuid.UUID, rev int64) (map[uuid.UUID]string, error) {
+func (r *GovReader) coverageAt(db *gorm.DB, ws uuid.UUID, rev int64) (map[uuid.UUID]string, error) {
 	var pub struct{ Manifest json.RawMessage }
-	if err := r.db.WithContext(ctx).Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? AND rev = ?`, ws, rev).
+	if err := db.Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? AND rev = ?`, ws, rev).
 		Scan(&pub).Error; err != nil {
 		return nil, err
 	}
@@ -326,7 +336,7 @@ func (r *GovReader) coverageAt(ctx context.Context, ws uuid.UUID, rev int64) (ma
 			ids[id] = true
 		}
 	}
-	runs, metas, err := loadRunEvidence(r.db.WithContext(ctx), ws, keysOf(ids), rev)
+	runs, metas, err := loadRunEvidence(db, ws, keysOf(ids), rev)
 	if err != nil {
 		return nil, err
 	}

@@ -21,6 +21,10 @@ import (
 // typed reads here, on the collection side, instead of table names typed
 // into IGA queries (scripts/ci-iga-isolation-check.sh): the dependency is
 // declared once, it is read-only, and nothing in it writes cloud_*.
+//
+// Every read but ResourcePolicyWorkspaces takes the caller's transaction,
+// which must be one under row-level security for ws (tenancy.InWorkspace,
+// a policy job's InTx): the reads filter on ws themselves as well (AS-108).
 type CloudEvidenceReads struct{}
 
 // CloudRunRow is one scan run with its connector's scope and attributes.
@@ -51,6 +55,7 @@ func (CloudEvidenceReads) Runs(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) ([]Cl
 // evidence (the daily prune_evidence job's subjects, §3.9 "Retention").
 func (CloudEvidenceReads) ResourcePolicyWorkspaces(tx *gorm.DB) ([]uuid.UUID, error) {
 	var out []uuid.UUID
+	// TENANT-EXEMPT: the prune_evidence scheduler's due scan lists the workspaces holding evidence (ids only); each job then prunes one workspace under RLS.
 	err := tx.Raw(`SELECT DISTINCT workspace_id FROM cloud_resource_policy_coverage ORDER BY workspace_id`).Scan(&out).Error
 	return out, err
 }

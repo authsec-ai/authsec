@@ -28,8 +28,10 @@ import (
 // detail}}. None mutates: POST /targets/resolve is a read with a body, so it
 // writes neither iga_gov_event nor audit_events.
 
-func (ctl *IGAGovPolicyController) reader() *services.GovReader {
-	return services.NewGovReader(ctl.db(), ctl.key)
+func (ctl *IGAGovPolicyController) reader(c *gin.Context) *services.GovReader {
+	// The request context: its tenant must agree with the workspace each read
+	// runs under (the token's), and the reads stop with the request.
+	return services.NewGovReader(ctl.db().WithContext(c.Request.Context()), ctl.key)
 }
 
 // govCall resolves the token workspace and renders a GovError or any other
@@ -142,7 +144,7 @@ func (ctl *IGAGovPolicyController) ListFindings(c *gin.Context) {
 		if err := services.ValidateFindingFilter(f); err != nil {
 			return nil, nil, err
 		}
-		r := ctl.reader()
+		r := ctl.reader(c)
 		rev, meta, err := r.ResolveRev(ws, req)
 		if err != nil {
 			return nil, nil, err
@@ -166,7 +168,7 @@ func (ctl *IGAGovPolicyController) FindingsSummary(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		r := ctl.reader()
+		r := ctl.reader(c)
 		rev, meta, err := r.ResolveRev(ws, req)
 		if err != nil {
 			return nil, nil, err
@@ -187,7 +189,7 @@ func (ctl *IGAGovPolicyController) GetFinding(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		r := ctl.reader()
+		r := ctl.reader(c)
 		rev, meta, err := r.ResolveRev(ws, req)
 		if err != nil {
 			return nil, nil, err
@@ -208,7 +210,7 @@ func (ctl *IGAGovPolicyController) ActivityEvidence(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		r := ctl.reader()
+		r := ctl.reader(c)
 		rev, meta, err := r.ResolveRev(ws, req)
 		if err != nil {
 			return nil, nil, err
@@ -234,7 +236,7 @@ func (ctl *IGAGovPolicyController) ActionEvidence(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		r := ctl.reader()
+		r := ctl.reader(c)
 		rev, meta, err := r.ResolveRev(ws, req)
 		if err != nil {
 			return nil, nil, err
@@ -251,7 +253,7 @@ func (ctl *IGAGovPolicyController) GetReadiness(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		rd, err := ctl.reader().Readiness(c.Request.Context(), ws, c.Query("account"), c.Query("cursor"), limit)
+		rd, err := ctl.reader(c).Readiness(c.Request.Context(), ws, c.Query("account"), c.Query("cursor"), limit)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -285,7 +287,7 @@ func (ctl *IGAGovPolicyController) GetEvidenceBundle(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
-		b, err := ctl.reader().EvidenceBundle(ws, id)
+		b, err := ctl.reader(c).EvidenceBundle(ws, id)
 		return b, gin.H{}, err
 	})
 }

@@ -55,6 +55,8 @@ func R2Gate() gin.HandlerFunc {
 	}
 }
 
+// TENANT-EXEMPT: not a statement here: GovR2 runs every statement in a
+// transaction under row-level security for the token's workspace.
 func (ctl *IGAGovPolicyController) r2() *services.GovR2 { return services.NewGovR2(ctl.db()) }
 
 // ListTemporaryGrants handles GET /temporary-grants (?state, ?role_id, ?limit).
@@ -172,7 +174,7 @@ func (ctl *IGAGovPolicyController) CreateSessionRevocation(c *gin.Context) {
 			return nil, nil, err
 		}
 		if req.Emergency {
-			ok, err := services.WorkspaceUserHoldsPermission(ctl.db(), ws, actor, "governance", "emergency")
+			ok, err := ctl.r2().HoldsPermission(c.Request.Context(), ws, actor, "governance", "emergency")
 			if err != nil {
 				return nil, nil, err
 			}

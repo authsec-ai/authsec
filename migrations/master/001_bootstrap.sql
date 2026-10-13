@@ -12545,3 +12545,218 @@ BEGIN
         PERFORM public.tenancy_enable_rls(r.tbl::regclass);
     END LOOP;
 END $$;
+
+-- ============================================================================
+-- 131: row-level security on every workspace table; members' user rows
+--
+-- 1. 111 enabled RLS on the tables that had workspace_id when it ran. A table
+--    created by a migration that sorts before 111 but was applied after it
+--    (047-059 on a database built from the tenancy branch before it merged
+--    authsec-staging) was left without the policy. Every public table with a
+--    workspace_id column and no tenancy_isolation policy gets it now.
+--    Idempotent; a table that already has the policy is not touched.
+--
+-- 2. An operator may hold memberships in workspaces other than their home one
+--    (ADR-0001 §3). Under RLS a workspace saw only the users homed in it, so
+--    such a member vanished from every member read of that workspace (owner
+--    rules, reviews, approvals). The users table gains a second, SELECT-only
+--    policy: a user row is readable in a workspace that has a membership row
+--    for it. Writes stay limited to the home workspace (tenancy_isolation's
+--    WITH CHECK); the membership subquery is itself under RLS, so it sees
+--    only the current workspace's memberships.
+--
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+DECLARE
+    t regclass;
+BEGIN
+    FOR t IN
+        SELECT c.oid::regclass
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'workspace_id' AND NOT a.attisdropped
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+           AND NOT EXISTS (SELECT 1 FROM pg_policies p
+                            WHERE p.schemaname = 'public' AND p.tablename = c.relname
+                              AND p.policyname = 'tenancy_isolation')
+         ORDER BY 1
+    LOOP
+        PERFORM public.tenancy_enable_rls(t);
+    END LOOP;
+END $$;
+
+DROP POLICY IF EXISTS tenancy_member_users ON public.users;
+CREATE POLICY tenancy_member_users ON public.users
+    FOR SELECT
+    USING (EXISTS (SELECT 1 FROM public.workspace_memberships m
+                    WHERE m.user_id = users.id
+                      AND m.workspace_id = public.tenancy_current_workspace()));
+
+-- 132: iga_gov_notification is unique per workspace
+-- (see 132_iga_gov_notification_unique_per_workspace.sql).
+CREATE UNIQUE INDEX IF NOT EXISTS iga_gov_notification_ws_subject_channel_recipient_key
+    ON public.iga_gov_notification (workspace_id, subject_kind, subject_id, channel, recipient);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'public.iga_gov_notification'::regclass
+                      AND conname = 'iga_gov_notification_ws_subject_channel_recipient_key') THEN
+        ALTER TABLE public.iga_gov_notification
+            ADD CONSTRAINT iga_gov_notification_ws_subject_channel_recipient_key
+            UNIQUE USING INDEX iga_gov_notification_ws_subject_channel_recipient_key;
+    END IF;
+END $$;
+
+ALTER TABLE public.iga_gov_notification
+    DROP CONSTRAINT IF EXISTS iga_gov_notification_subject_kind_subject_id_channel_recipi_key;
+
+-- ============================================================================
+-- 133: iga_gov_job's kind CHECK carries every job kind
+--
+-- 052 was edited in place (eef366a0) to add the kind 'resolve_unknown' to
+-- the iga_gov_job.kind CHECK. A database that applied the earlier 052 still
+-- has the old constraint, refuses a resolve_unknown job, and is not caught
+-- by the runner (052 is recorded as applied). The constraint is re-created
+-- here with 052's current kind list (repositories.GovJobKinds; checked by
+-- tests/igagovschema TestGovJobKindsMatch052Check).
+--
+-- Idempotent: dropped and re-added under its own name, skipped when the
+-- table does not exist. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_job') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_job DROP CONSTRAINT IF EXISTS iga_gov_job_kind_check;
+        ALTER TABLE public.iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check
+            CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
+                            'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync',
+                            'prune_evidence','metrics_rollup','resolve_unknown'));
+    END IF;
+END $$;
+-- ============================================================================
+-- 134: iga_gov_job's kind CHECK keeps the R2 kinds; RLS on the R1b/R2/R3
+--      tables of a database that applied 060-062 after 131
+--
+-- 1. 133 re-created iga_gov_job_kind_check with the kinds of 052 (up to
+--    resolve_unknown). 061 (R2, merged from authsec-staging) had widened the
+--    same CHECK with 'temp_grant', 'session_revoke' and 'time_bound'; 133 runs
+--    after 061 on every database (fresh: 001 then 002..133 in order;
+--    upgraded staging: 133 is new) and dropped them, so R2 jobs were refused
+--    and VerifyPolicyR2Schema kept IGA_POLICY_R2 misconfigured. The CHECK is
+--    re-created with every kind (repositories.GovJobKinds; checked by
+--    tests/igagovschema TestGovJobKindsMatch052Check).
+--
+-- 2. 060-062 sort before 111 but a database built from the tenancy branch
+--    before it merged authsec-staging applies them after 111 and 131, and
+--    their tables were left without the tenancy_isolation policy. Every
+--    public table with a workspace_id column and no policy gets it (131's
+--    loop, again). A fresh or upgraded staging database already has it.
+--
+-- Idempotent. 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_job') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_job DROP CONSTRAINT IF EXISTS iga_gov_job_kind_check;
+        ALTER TABLE public.iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check
+            CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
+                            'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync',
+                            'prune_evidence','metrics_rollup','resolve_unknown',
+                            'temp_grant','session_revoke','time_bound'));
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    t regclass;
+BEGIN
+    FOR t IN
+        SELECT c.oid::regclass
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'workspace_id' AND NOT a.attisdropped
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+           AND NOT EXISTS (SELECT 1 FROM pg_policies p
+                            WHERE p.schemaname = 'public' AND p.tablename = c.relname
+                              AND p.policyname = 'tenancy_isolation')
+         ORDER BY 1
+    LOOP
+        PERFORM public.tenancy_enable_rls(t);
+    END LOOP;
+END $$;
+
+-- ============================================================================
+-- 135: iga_gov_plan_kind_chk is NULL-safe (R2, DECISION R2-13)
+--
+-- 061 admits a split / split_revert plan delivered DIRECTLY only when its
+-- subject is a Lambda function: (diff -> 'split' ->> 'subject_kind') =
+-- 'lambda_function'. For a plan whose diff names no subject kind that
+-- comparison is NULL, and a CHECK whose result is NULL passes -- so any
+-- direct split without a subject kind was accepted. The comparison now
+-- treats a missing kind as not a Lambda function. Every row valid under 061's
+-- intent stays valid; the constraint is added NOT VALID and then validated
+-- (a row that slipped through before would fail the validation and is left
+-- for review rather than blocking the upgrade).
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+ALTER TABLE iga_gov_plan DROP CONSTRAINT IF EXISTS iga_gov_plan_kind_chk;
+ALTER TABLE iga_gov_plan ADD CONSTRAINT iga_gov_plan_kind_chk CHECK (
+    (kind IN ('split','split_revert')) = (desired_attachment = 'unchanged')
+    AND (kind <> 'apply' OR desired_attachment = 'present')
+    AND (kind NOT IN ('split','split_revert') OR delivery IN ('iac_pr','export')
+         OR (delivery = 'direct' AND (eligibility = 'ineligible'
+             OR (eligibility = 'eligible'
+                 AND COALESCE(diff -> 'split' ->> 'subject_kind', '') = 'lambda_function'))))) NOT VALID;
+
+DO $$
+BEGIN
+    ALTER TABLE iga_gov_plan VALIDATE CONSTRAINT iga_gov_plan_kind_chk;
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE '135: existing iga_gov_plan rows violate iga_gov_plan_kind_chk (a direct split without a Lambda subject); constraint left NOT VALID for review';
+END $$;
+
+-- ============================================================================
+-- 136: R3 runtime holds and budgets reference their policy, version and
+-- resumed decision within their own workspace
+--
+-- 062 left iga_gov_runtime_hold.policy_id / version_id / resumed_decision_id
+-- and iga_gov_runtime_budget.version_id as bare uuids, so a row could name
+-- another workspace's policy, version or decision. They get composite keys
+-- on (workspace_id, ...), the same shape 062 already uses for the budget's
+-- policy and the budget entry's version. Added NOT VALID, then validated;
+-- a row that already names another workspace's object leaves the key NOT
+-- VALID (new rows are still checked) and is reported for review.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+DO $$
+DECLARE
+    k record;
+BEGIN
+    FOR k IN SELECT * FROM (VALUES
+        ('iga_gov_runtime_hold', 'iga_gov_rth_policy_ws_fkey',
+         'FOREIGN KEY (workspace_id, policy_id) REFERENCES public.iga_gov_policy (workspace_id, id) ON DELETE CASCADE'),
+        ('iga_gov_runtime_hold', 'iga_gov_rth_version_ws_fkey',
+         'FOREIGN KEY (workspace_id, version_id, policy_id) REFERENCES public.iga_gov_runtime_version (workspace_id, id, policy_id) ON DELETE CASCADE'),
+        ('iga_gov_runtime_hold', 'iga_gov_rth_resumed_decision_ws_fkey',
+         'FOREIGN KEY (workspace_id, resumed_decision_id) REFERENCES public.iga_gov_runtime_decision (workspace_id, id)'),
+        ('iga_gov_runtime_budget', 'iga_gov_rtb_version_ws_fkey',
+         'FOREIGN KEY (workspace_id, version_id, policy_id) REFERENCES public.iga_gov_runtime_version (workspace_id, id, policy_id) ON DELETE CASCADE')
+    ) AS v(tbl, name, def)
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = k.name) THEN
+            EXECUTE format('ALTER TABLE public.%I ADD CONSTRAINT %I %s NOT VALID', k.tbl, k.name, k.def);
+        END IF;
+        BEGIN
+            EXECUTE format('ALTER TABLE public.%I VALIDATE CONSTRAINT %I', k.tbl, k.name);
+        EXCEPTION WHEN foreign_key_violation THEN
+            RAISE NOTICE '136: % has rows naming another workspace''s object; % left NOT VALID for review', k.tbl, k.name;
+        END;
+    END LOOP;
+END $$;

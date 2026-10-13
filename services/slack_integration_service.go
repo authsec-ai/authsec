@@ -23,6 +23,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/slackapp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 )
@@ -227,6 +228,25 @@ func NewSlackIntegrationService(db *gorm.DB, vc vault.VaultClient, api slackapp.
 	cfg.CookieDomain = strings.ToLower(strings.Trim(strings.TrimSpace(cfg.CookieDomain), "."))
 	return &SlackIntegrationService{db: db, vault: vc, api: api, cfg: cfg, now: time.Now,
 		slots: make(chan struct{}, slackInteractionWorkers)}
+}
+
+// read runs fn in one read-only transaction under row-level security for
+// ws; write is the same, read-write. Slack and Vault calls are made between
+// such sections, never inside one.
+func (s *SlackIntegrationService) read(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, s.db, ws, fn)
+}
+
+func (s *SlackIntegrationService) write(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, fn)
+}
+
+// handle is the base database handle, for the services this one calls that
+// open their own workspace transactions (GovAuthoring, the owner review).
+func (s *SlackIntegrationService) handle() *gorm.DB {
+	// TENANT-EXEMPT: not a statement: handed to services that open their own
+	// workspace transactions per call.
+	return s.db
 }
 
 // WithClock sets the clock (tests: signature windows, token expiry).
@@ -523,19 +543,23 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 	if err1 != nil || err2 != nil || err3 != nil {
 		return nil, stateRefused("state_payload")
 	}
-	db := s.db.WithContext(ctx)
-	var live int64
-	if err := db.Raw(`SELECT count(*) FROM workspace_memberships WHERE id = ? AND workspace_id = ? AND user_id = ? AND status = 'active'`,
-		membership, ws, actor).Scan(&live).Error; err != nil {
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var live int64
+		if err := db.Raw(`SELECT count(*) FROM workspace_memberships WHERE id = ? AND workspace_id = ? AND user_id = ? AND status = 'active'`,
+			membership, ws, actor).Scan(&live).Error; err != nil {
+			return err
+		}
+		if live == 0 {
+			return stateRefused("membership_not_active")
+		}
+		if ok, err := WorkspaceUserHoldsPermission(db, ws, actor, "governance", "enforce"); err != nil {
+			return err
+		} else if !ok {
+			return stateRefused("permission_revoked")
+		}
+		return nil
+	}); err != nil {
 		return nil, err
-	}
-	if live == 0 {
-		return nil, stateRefused("membership_not_active")
-	}
-	if ok, err := WorkspaceUserHoldsPermission(db, ws, actor, "governance", "enforce"); err != nil {
-		return nil, err
-	} else if !ok {
-		return nil, stateRefused("permission_revoked")
 	}
 	if strings.TrimSpace(code) == "" {
 		return nil, GovBadParam("code", "Slack returned no authorization code.")
@@ -558,7 +582,9 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 	}
 	// A Slack team is bound to one workspace (§10).
 	var other []models.WorkspaceSlackIntegration
-	if err := db.Where("slack_team_id = ? AND revoked_at IS NULL AND workspace_id <> ?", res.TeamID, ws).Limit(1).Find(&other).Error; err != nil {
+	// TENANT-EXEMPT: account-level uniqueness: is this Slack team installed
+	// in ANOTHER workspace (uq_workspace_slack_team also refuses it)?
+	if err := s.db.WithContext(ctx).Where("slack_team_id = ? AND revoked_at IS NULL AND workspace_id <> ?", res.TeamID, ws).Limit(1).Find(&other).Error; err != nil {
 		return nil, err
 	}
 	if len(other) > 0 {
@@ -571,9 +597,15 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 	// another team's.
 	var prevSecret map[string]interface{}
 	prevToken, prevTeam := "", ""
-	if cur, err := activeSlackIntegration(db, ws); err != nil {
+	var cur *models.WorkspaceSlackIntegration
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		cur, err = activeSlackIntegration(db, ws)
+		return err
+	}); err != nil {
 		return nil, err
-	} else if cur != nil && cur.BotTokenRef != "" {
+	}
+	if cur != nil && cur.BotTokenRef != "" {
 		prevTeam = cur.SlackTeamID
 		if sec, rerr := s.vault.ReadSecret(cur.BotTokenRef); rerr == nil {
 			prevSecret = sec
@@ -591,7 +623,7 @@ func (s *SlackIntegrationService) CompleteInstall(ctx context.Context, state, co
 		return nil, slackErr(http.StatusServiceUnavailable, SlackCodeNotConfigured, "AuthSec could not store the Slack token; try again shortly.", nil)
 	}
 	out := &SlackInstallResult{WorkspaceID: ws, ActorID: actor}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		var prev []models.WorkspaceSlackIntegration
 		if err := tx.Raw(`SELECT * FROM workspace_slack_integration WHERE workspace_id = ? FOR UPDATE`, ws).Scan(&prev).Error; err != nil {
 			return err
@@ -685,7 +717,7 @@ func (s *SlackIntegrationService) UpdateSettings(ctx context.Context, ws, actor 
 	if ch != "" && !slackChannelRe.MatchString(ch) {
 		return nil, nil, GovBadParam("approvals_channel_id", "approvals_channel_id must be a Slack channel id (C… or G…).")
 	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		var rows []models.WorkspaceSlackIntegration
 		if err := tx.Raw(`SELECT * FROM workspace_slack_integration WHERE workspace_id = ? AND revoked_at IS NULL FOR UPDATE`, ws).Scan(&rows).Error; err != nil {
 			return err
@@ -710,7 +742,7 @@ func (s *SlackIntegrationService) UpdateSettings(ctx context.Context, ws, actor 
 // Disconnect removes the installation (DELETE /).
 func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid.UUID) (before *models.WorkspaceSlackIntegration, err error) {
 	var token string
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		var rows []models.WorkspaceSlackIntegration
 		if err := tx.Raw(`SELECT * FROM workspace_slack_integration WHERE workspace_id = ? AND revoked_at IS NULL FOR UPDATE`, ws).Scan(&rows).Error; err != nil {
 			return err
@@ -720,9 +752,6 @@ func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid
 		}
 		b := rows[0]
 		before = &b
-		if s.vault != nil {
-			token, _ = s.botToken(&b)
-		}
 		var links int64
 		if err := tx.Raw(`SELECT count(*) FROM slack_user_link WHERE workspace_id = ?`, ws).Scan(&links).Error; err != nil {
 			return err
@@ -739,12 +768,19 @@ func (s *SlackIntegrationService) Disconnect(ctx context.Context, ws, actor uuid
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) && ge.Status == http.StatusNotFound && s.vault != nil {
-			if pending := pendingTokenDestroy(s.db.WithContext(ctx), ws); pending != nil {
+			var pending *models.WorkspaceSlackIntegration
+			_ = s.read(ctx, ws, func(tx *gorm.DB) error { pending = pendingTokenDestroy(tx, ws); return nil })
+			if pending != nil {
 				// Already disconnected: retry destroying the token that stayed.
 				return pending, s.destroyToken(ctx, ws, pending.BotTokenRef)
 			}
 		}
 		return nil, err
+	}
+	// Read after the commit (Vault is not called inside the transaction):
+	// the token is still there, destroyed below.
+	if s.vault != nil {
+		token, _ = s.botToken(before)
 	}
 	if token != "" && s.api != nil {
 		if rerr := s.api.AuthRevoke(ctx, token); rerr != nil {
@@ -777,8 +813,10 @@ func (s *SlackIntegrationService) destroyToken(ctx context.Context, ws uuid.UUID
 			"Slack is disconnected, but its bot token could not be destroyed in the secrets store. Disconnect again to retry.",
 			map[string]any{"disconnected": true, "token_destroy_pending": true})
 	}
-	return s.db.WithContext(ctx).Exec(`UPDATE workspace_slack_integration SET bot_token_ref = ''
+	return s.write(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Exec(`UPDATE workspace_slack_integration SET bot_token_ref = ''
 		WHERE workspace_id = ? AND revoked_at IS NOT NULL AND bot_token_ref = ?`, ws, ref).Error
+	})
 }
 
 // SlackStatusView is the Slack part of GET /policy/settings notifications.
@@ -803,8 +841,21 @@ func pendingTokenDestroy(db *gorm.DB, ws uuid.UUID) *models.WorkspaceSlackIntegr
 	return &rows[0]
 }
 
-// slackStatusFor reads a workspace's Slack status for the settings view.
+// slackStatusFor reads a workspace's Slack status for the settings view, in
+// a read transaction under row-level security for ws on db (a savepoint when
+// db is already the caller's transaction).
 func slackStatusFor(db *gorm.DB, ws uuid.UUID) *SlackStatusView {
+	var out *SlackStatusView
+	if err := tenancy.InWorkspaceRead(db.Statement.Context, db, ws, func(tx *gorm.DB) error {
+		out = slackStatusTx(tx, ws)
+		return nil
+	}); err != nil {
+		return &SlackStatusView{}
+	}
+	return out
+}
+
+func slackStatusTx(db *gorm.DB, ws uuid.UUID) *SlackStatusView {
 	in, err := activeSlackIntegration(db, ws)
 	if err != nil {
 		return &SlackStatusView{}
@@ -854,17 +905,19 @@ func (s *SlackIntegrationService) insertLinkTx(tx *gorm.DB, ws uuid.UUID, slackU
 // email (capped at slackLinkSyncCap members). It returns how many links it
 // made.
 func (s *SlackIntegrationService) SyncLinks(ctx context.Context, ws uuid.UUID) (int, error) {
-	db := s.db.WithContext(ctx)
-	in, err := activeSlackIntegration(db, ws)
-	if err != nil || in == nil {
+	var in *models.WorkspaceSlackIntegration
+	var members []WorkspaceMember
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if in, err = activeSlackIntegration(db, ws); err != nil || in == nil {
+			return err
+		}
+		return db.Raw(activeMemberSQL+` ORDER BY u.id LIMIT ?`, ws, slackLinkSyncCap).Scan(&members).Error
+	}); err != nil || in == nil {
 		return 0, err
 	}
 	token, err := s.botToken(in)
 	if err != nil {
-		return 0, err
-	}
-	var members []WorkspaceMember
-	if err := db.Raw(activeMemberSQL+` ORDER BY u.id LIMIT ?`, ws, slackLinkSyncCap).Scan(&members).Error; err != nil {
 		return 0, err
 	}
 	byEmail := map[string]int{}
@@ -888,7 +941,7 @@ func (s *SlackIntegrationService) SyncLinks(ctx context.Context, ws uuid.UUID) (
 			continue
 		}
 		var ok bool
-		err = db.Transaction(func(tx *gorm.DB) error {
+		err = s.write(ctx, ws, func(tx *gorm.DB) error {
 			var e2 error
 			ok, e2 = s.insertLinkTx(tx, ws, u.ID, m.UserID, "verified_email", models.GovActorSystem, "slack-link-sync")
 			return e2
@@ -964,16 +1017,19 @@ func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uui
 		// Another workspace's token: the same answer as an absent object.
 		return nil, GovNotFound()
 	}
-	db := s.db.WithContext(ctx)
-	in, err := activeSlackIntegration(db, ws)
-	if err != nil {
-		return nil, err
-	}
-	if in == nil || in.SlackTeamID != lt.T {
-		return nil, slackErr(http.StatusConflict, SlackCodeNotConnected, "That Slack workspace is no longer connected to this workspace.", nil)
-	}
-	m, err := s.members.ActiveMembers(db, ws, []uuid.UUID{actor})
-	if err != nil {
+	var in *models.WorkspaceSlackIntegration
+	var m map[uuid.UUID]WorkspaceMember
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if in, err = activeSlackIntegration(db, ws); err != nil {
+			return err
+		}
+		if in == nil || in.SlackTeamID != lt.T {
+			return slackErr(http.StatusConflict, SlackCodeNotConnected, "That Slack workspace is no longer connected to this workspace.", nil)
+		}
+		m, err = s.members.ActiveMembers(db, ws, []uuid.UUID{actor})
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	member, ok := m[actor]
@@ -996,7 +1052,7 @@ func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uui
 			map[string]any{"reason": reason})
 	}
 	var out SlackLinkResult
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		var existing []models.SlackUserLink
 		if err := tx.Raw(`SELECT * FROM slack_user_link WHERE workspace_id = ? AND (slack_user_id = ? OR user_id = ?) FOR UPDATE`,
 			ws, lt.S, actor).Scan(&existing).Error; err != nil {
@@ -1034,9 +1090,13 @@ func (s *SlackIntegrationService) ConfirmLink(ctx context.Context, ws, actor uui
 // from a confirmed email naming exactly one active member who holds no
 // other link.
 func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.WorkspaceSlackIntegration, slackUser string) (uuid.UUID, error) {
-	db := s.db.WithContext(ctx)
 	var links []models.SlackUserLink
-	if err := db.Where("workspace_id = ? AND slack_user_id = ?", in.WorkspaceID, slackUser).Limit(1).Find(&links).Error; err != nil {
+	readLink := func() error {
+		return s.read(ctx, in.WorkspaceID, func(db *gorm.DB) error {
+			return db.Where("workspace_id = ? AND slack_user_id = ?", in.WorkspaceID, slackUser).Limit(1).Find(&links).Error
+		})
+	}
+	if err := readLink(); err != nil {
 		return uuid.Nil, err
 	}
 	if len(links) == 1 {
@@ -1055,8 +1115,12 @@ func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.Wor
 	if e == "" || !slackUserLinkable(u, in.SlackTeamID, e) {
 		return uuid.Nil, nil
 	}
-	m, err := s.members.MembersByEmail(db, in.WorkspaceID, []string{e})
-	if err != nil {
+	var m map[string]WorkspaceMember
+	if err := s.read(ctx, in.WorkspaceID, func(db *gorm.DB) error {
+		var err error
+		m, err = s.members.MembersByEmail(db, in.WorkspaceID, []string{e})
+		return err
+	}); err != nil {
 		return uuid.Nil, err
 	}
 	member, ok := m[e]
@@ -1064,7 +1128,7 @@ func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.Wor
 		return uuid.Nil, nil // none, or ambiguous: console confirmation
 	}
 	made := false
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, in.WorkspaceID, func(tx *gorm.DB) error {
 		var e2 error
 		made, e2 = s.insertLinkTx(tx, in.WorkspaceID, slackUser, member.UserID, "verified_email", models.GovActorSlackUser, slackUser)
 		return e2
@@ -1076,7 +1140,7 @@ func (s *SlackIntegrationService) linkedUser(ctx context.Context, in *models.Wor
 		// Linked meanwhile (read it back), or the member holds another
 		// Slack link (one per member): this Slack user stays unlinked.
 		links = nil
-		if err := db.Where("workspace_id = ? AND slack_user_id = ?", in.WorkspaceID, slackUser).Limit(1).Find(&links).Error; err != nil {
+		if err := readLink(); err != nil {
 			return uuid.Nil, err
 		}
 		if len(links) == 1 {

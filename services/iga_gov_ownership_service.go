@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -156,7 +157,17 @@ func (s *IGAGovOwnershipService) objectName(db *gorm.DB, ws uuid.UUID, kind stri
 // Owners is GET /owners: the object's owners, and for an identity its
 // consumers' accountable owners and the resolved set (§2.9).
 func (s *IGAGovOwnershipService) Owners(ctx context.Context, ws uuid.UUID, kind string, id uuid.UUID) (*ObjectOwnership, error) {
-	db := s.db.WithContext(ctx)
+	var out *ObjectOwnership
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.ownersTx(tx, ws, kind, id)
+		return err
+	})
+	return out, err
+}
+
+// ownersTx is Owners inside the caller's transaction.
+func (s *IGAGovOwnershipService) ownersTx(db *gorm.DB, ws uuid.UUID, kind string, id uuid.UUID) (*ObjectOwnership, error) {
 	name, err := s.objectName(db, ws, kind, id)
 	if err != nil {
 		return nil, err
@@ -411,7 +422,7 @@ func (s *IGAGovOwnershipService) SetManualOwners(ctx context.Context, ws, actor 
 		userIDs = append(userIDs, w.UserID)
 	}
 	var change OwnerChange
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if _, err := s.objectName(tx, ws, kind, id); err != nil {
 			return err
 		}
@@ -444,17 +455,11 @@ func (s *IGAGovOwnershipService) SetManualOwners(ctx context.Context, ws, actor 
 	return &change, nil
 }
 
-// ownersTx is Owners inside a transaction.
-func (s *IGAGovOwnershipService) ownersTx(tx *gorm.DB, ws uuid.UUID, kind string, id uuid.UUID) (*ObjectOwnership, error) {
-	inner := &IGAGovOwnershipService{db: tx, members: s.members, events: s.events, jobs: s.jobs}
-	return inner.Owners(context.Background(), ws, kind, id)
-}
-
 // SetReviewDate sets (or clears, nil) one owner row's review_due_at -- the
 // "Set review date" remedy of missing_review_date (§2.5), for a manual or a
 // tag-rule owner alike. ErrOwnerNotFound when not this workspace's.
 func (s *IGAGovOwnershipService) SetReviewDate(ctx context.Context, ws, actor, ownerID uuid.UUID, due *time.Time) (before, after *OwnerView, err error) {
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		repo := repositories.NewIGAGovOwnershipRepository(tx)
 		o, err := repo.GetOwner(ws, ownerID)
 		if errors.Is(err, repositories.ErrIGAGovNotFound) {
@@ -509,7 +514,7 @@ func (s *IGAGovOwnershipService) CreateRule(ctx context.Context, ws, actor uuid.
 		return nil, &OwnerInputError{Field: "role", Reason: "must be accountable or technical"}
 	}
 	rule := &models.IGAGovOwnerRule{ID: uuid.New(), WorkspaceID: ws, TagKey: tagKey, AppliesTo: appliesTo, Role: role, Enabled: true, CreatedBy: actor}
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var n int64
 		if err := tx.Model(&models.IGAGovOwnerRule{}).
 			Where("workspace_id = ? AND tag_key = ? AND applies_to = ? AND role = ?", ws, tagKey, appliesTo, role).
@@ -542,7 +547,7 @@ func (s *IGAGovOwnershipService) CreateRule(ctx context.Context, ws, actor uuid.
 func (s *IGAGovOwnershipService) DeleteRule(ctx context.Context, ws, actor, id uuid.UUID) (*models.IGAGovOwnerRule, int64, error) {
 	var rule *models.IGAGovOwnerRule
 	var removed int64
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		repo := repositories.NewIGAGovOwnershipRepository(tx)
 		var err error
 		rule, err = repo.GetRule(ws, id)
@@ -574,11 +579,13 @@ func (s *IGAGovOwnershipService) ListRules(ctx context.Context, ws uuid.UUID, af
 		limit = 200
 	}
 	var out []models.IGAGovOwnerRule
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if after != uuid.Nil {
-		q = q.Where("id > ?", after)
-	}
-	if err := q.Order("id").Limit(limit + 1).Find(&out).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if after != uuid.Nil {
+			q = q.Where("id > ?", after)
+		}
+		return q.Order("id").Limit(limit + 1).Find(&out).Error
+	}); err != nil {
 		return nil, false, err
 	}
 	more := len(out) > limit

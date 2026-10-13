@@ -38,11 +38,48 @@ for pkg in "${rls_only[@]}"; do
 done
 rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
 
+# Files whose every statement runs inside a transaction under row-level
+# security for one workspace (tenancy.InWorkspace / InWorkspaceRead /
+# RLSTransaction, or a policy job's InTx). Their raw SQL is not counted. In
+# exchange, a base database handle (a struct's .db field, config.DB,
+# config.GetDatabase) may appear there only as the handle such a call opens
+# its transaction on, as a struct field being set, or on a statement
+# carrying a TENANT-EXEMPT reason on its line or one of the three above.
+rls_files_list=scripts/tenant-rls-files.txt
+rls_files=$(grep -vE '^[[:space:]]*(#|$)' "$rls_files_list" 2>/dev/null || true)
+# The guard's pattern must match on this awk (gawk reads \b as a backspace,
+# which once made it match nothing): refuse to run if a known violation
+# would not be caught.
+if ! echo '_ = s.db.Exec("x")' | awk '{ exit !($0 ~ /(\.db([^A-Za-z0-9_]|$)|config\.(DB|GetDatabase)([^A-Za-z0-9_]|$))/) }'; then
+  echo "check-tenant-exempt: the RLS-files pattern does not match on this awk" >&2
+  exit 1
+fi
+if [[ -n "$rls_files" ]]; then
+  bad=$(echo "$rls_files" | xargs awk '
+      FNR == 1 { h1 = h2 = h3 = "" }
+      {
+        line = $0
+        if (line ~ /(\.db([^A-Za-z0-9_]|$)|config\.(DB|GetDatabase)([^A-Za-z0-9_]|$))/ && line !~ /^[[:space:]]*\/\// \
+            && line !~ /tenancy\.(InWorkspace|InWorkspaceRead|RLSTransaction)\(/ \
+            && line !~ /\.InTx\(/ \
+            && line !~ /^[[:space:]]*db:[[:space:]]/ && line !~ /[{,][[:space:]]*db:[[:space:]]/ \
+            && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/)
+          print FILENAME ":" FNR ": " line
+        h3 = h2; h2 = h1; h1 = line
+      }')
+  if [[ -n "$bad" ]]; then
+    echo "RLS files reach the database outside a workspace transaction (see $rls_files_list):" >&2
+    echo "$bad" >&2
+    exit 1
+  fi
+fi
+
 hits=$(git ls-files '*.go' \
   | grep -v '_test\.go$' \
   | grep -v '^internal/tenancy/' \
   | grep -v '^tests/' \
   | grep -vE "$rls_only_re" \
+  | grep -vxF -f <(echo "${rls_files:-/dev/null/none}") \
   | xargs awk '
       BEGIN {
         # A statement handed straight to the scoped layer binds workspace_id
@@ -51,7 +88,8 @@ hits=$(git ls-files '*.go' \
         # list, including a multi-line SQL string up to its closing backtick.
         scoped = "(tenancy\\.(Exec|Query|QueryRow|Insert|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
       }
-      FNR == 1 { h1 = h2 = h3 = ""; instr = 0; cover = 0 }
+      FNR == 1 { for (v in pend) { print prevfile; delete pend[v] }; h1 = h2 = h3 = ""; instr = 0; cover = 0; svar = ""; prevfile = FILENAME }
+      END { for (v in pend) print prevfile }
       {
         line = $0
         tmp = line
@@ -67,13 +105,34 @@ hits=$(git ls-files '*.go' \
         # for an opening one; coverage is decided when a string opens.
         closing = 0
         if (ticks % 2 == 1) {
-          if (!instr) { instr = 1; cover = (call || exempt) } else closing = 1
+          if (!instr) {
+            instr = 1; cover = (call || exempt); acc = ""; hit = 0; svar = ""
+            if (match(line, /[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:?=[[:space:]]*`/)) {
+              svar = substr(line, RSTART, RLENGTH); sub(/[[:space:]]*:?=.*/, "", svar)
+            }
+          } else closing = 1
         }
         skip = call || (instr && cover)
-        if (closing) { instr = 0; cover = 0 }
+        if (instr) acc = acc " " line
         if (!skip && line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
-            && line !~ /^[[:space:]]*\/\//) print FILENAME
+            && line !~ /^[[:space:]]*\/\//) { print FILENAME; if (instr) hit = 1 }
+        # A statement whose keywords sit on different lines of one raw string
+        # (UPDATE t / SET ..., SELECT ... / FROM ...) is judged on the whole
+        # string when it closes.
+        # A string assigned to a variable (q := `...`) and handed to a scoped
+        # call within the next 25 lines is covered by that call.
+        if (closing) {
+          if (!cover && !hit && acc !~ /TENANT-EXEMPT/ \
+              && acc ~ /(SELECT[[:space:]].*[[:space:]]FROM[[:space:]]|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET[[:space:]]|DELETE[[:space:]]+FROM[[:space:]]|INSERT[[:space:]]+INTO[[:space:]])/) {
+            if (svar != "") { pend[svar] = FNR } else print FILENAME
+          }
+          instr = 0; cover = 0
+        }
+        for (v in pend) {
+          if (line ~ scoped && index(line, v) > 0) delete pend[v]
+          else if (FNR - pend[v] > 25) { print FILENAME; delete pend[v] }
+        }
         h3 = h2; h2 = h1; h1 = line
       }')
 

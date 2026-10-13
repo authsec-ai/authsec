@@ -17,6 +17,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 )
 
 // Approval (SPEC-iga-phase3-policy.md §2.8, §2.10, §7.5; T3.13): a decision
@@ -146,7 +147,7 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 		}
 	}
 	var out GovApprovalResult
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		pol, err := a.loadPolicy(tx, ws, policyID, true)
 		if err != nil {
 			return err
@@ -244,7 +245,7 @@ func (a *GovAuthoring) Approve(ctx context.Context, ws, approver, policyID uuid.
 			// The accepted item binds its plan's bundle (051 FK).
 			accepted[i].bundleID = bundleOf[accepted[i].item.PlanID]
 		}
-		settings, err := a.settings.Get(ws)
+		settings, err := repositories.NewIGAGovSettingsRepository(tx).Get(ws)
 		if err != nil {
 			return err
 		}
@@ -399,7 +400,7 @@ func (a *GovAuthoring) RejectVia(ctx context.Context, ws, approver, policyID uui
 		return nil, GovBadParam("reason", "A rejection needs a reason.")
 	}
 	var out models.IGAGovApproval
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		if _, err := a.loadPolicy(tx, ws, policyID, true); err != nil {
 			return err
 		}
@@ -469,24 +470,24 @@ func (a *GovAuthoring) ListApprovals(ctx context.Context, ws, caller uuid.UUID, 
 		}
 		after = string(raw)
 	}
-	db := a.db.WithContext(ctx)
 	var rows []GovApprovalQueueItem
-	var err error
+	var q string
+	var args []any
 	switch status {
 	case "", "pending":
-		q := `SELECT p.id AS policy_id, p.name AS policy_name, v.id AS version_id, v.version_no, v.status, v.created_by AS author_id,
+		q = `SELECT p.id AS policy_id, p.name AS policy_name, v.id AS version_id, v.version_no, v.status, v.created_by AS author_id,
 		             v.status_changed_at AS proposed_at,
 		             (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = v.workspace_id AND t.version_id = v.id) AS targets
 		        FROM iga_gov_policy_version v JOIN iga_gov_policy p ON p.workspace_id = v.workspace_id AND p.id = v.policy_id
 		       WHERE v.workspace_id = ? AND v.status = 'in_review' AND v.created_by <> ? AND p.lifecycle <> 'archived'`
-		args := []any{ws, caller}
+		args = []any{ws, caller}
 		if after != "" {
 			q += ` AND v.id > ?`
 			args = append(args, after)
 		}
-		err = db.Raw(q+` ORDER BY v.id LIMIT ?`, append(args, limit+1)...).Scan(&rows).Error
+		q += ` ORDER BY v.id LIMIT ?`
 	case "decided":
-		q := `SELECT p.id AS policy_id, p.name AS policy_name, v.id AS version_id, v.version_no, v.status, v.created_by AS author_id,
+		q = `SELECT p.id AS policy_id, p.name AS policy_name, v.id AS version_id, v.version_no, v.status, v.created_by AS author_id,
 		             v.status_changed_at AS proposed_at,
 		             (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = v.workspace_id AND t.version_id = v.id) AS targets,
 		             a.id AS approval_id, a.decision, a.decided_at, a.revoked_at, a.revoked_reason AS revoke_reason
@@ -494,16 +495,18 @@ func (a *GovAuthoring) ListApprovals(ctx context.Context, ws, caller uuid.UUID, 
 		        JOIN iga_gov_policy_version v ON v.workspace_id = a.workspace_id AND v.id = a.version_id
 		        JOIN iga_gov_policy p ON p.workspace_id = v.workspace_id AND p.id = v.policy_id
 		       WHERE a.workspace_id = ? AND a.decided_by = ?`
-		args := []any{ws, caller}
+		args = []any{ws, caller}
 		if after != "" {
 			q += ` AND a.id > ?`
 			args = append(args, after)
 		}
-		err = db.Raw(q+` ORDER BY a.id LIMIT ?`, append(args, limit+1)...).Scan(&rows).Error
+		q += ` ORDER BY a.id LIMIT ?`
 	default:
 		return nil, nil, GovBadParam("status", "status must be pending or decided.")
 	}
-	if err != nil {
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Raw(q, append(args, limit+1)...).Scan(&rows).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -567,7 +570,16 @@ func (a *GovAuthoring) ApprovalInForce(ctx context.Context, ws, versionID uuid.U
 }
 
 func (a *GovAuthoring) usableApproval(ctx context.Context, ws, versionID uuid.UUID, planIDs []uuid.UUID, checkFresh bool) (*GovUsableApproval, error) {
-	db := a.db.WithContext(ctx)
+	var out *GovUsableApproval
+	err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = a.usableApprovalTx(tx, ws, versionID, planIDs, checkFresh)
+		return err
+	})
+	return out, err
+}
+
+func (a *GovAuthoring) usableApprovalTx(db *gorm.DB, ws, versionID uuid.UUID, planIDs []uuid.UUID, checkFresh bool) (*GovUsableApproval, error) {
 	var v models.IGAGovPolicyVersion
 	if err := db.Where("workspace_id = ? AND id = ?", ws, versionID).Take(&v).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -623,7 +635,7 @@ func (a *GovAuthoring) usableApproval(ctx context.Context, ws, versionID uuid.UU
 			out.Revalidations[p.ID] = nil
 			continue
 		}
-		fresh, why, err := a.EvidenceFreshness(ctx, ws, p.ID)
+		fresh, why, err := a.evidenceFreshnessTx(db, ws, p.ID)
 		if err != nil {
 			return nil, err
 		}

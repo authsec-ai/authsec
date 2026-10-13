@@ -17,6 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -144,6 +145,22 @@ func (d *GovIaCDelivery) reader() LiveReader {
 		return d.live
 	}
 	return DefaultGovLiveReader()
+}
+
+// read runs fn in one read-only transaction under row-level security for
+// ws. No external call is made inside it.
+func (d *GovIaCDelivery) read(ctx context.Context, ws uuid.UUID, fn func(db *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, d.db, ws, fn)
+}
+
+// iacRunWorkspace refuses a workspace that is not the job's: every write a
+// job makes runs under RLS for run.Job.WorkspaceID, so another workspace
+// named by the caller is a mistake, never a second scope.
+func iacRunWorkspace(run *PolicyJobRun, ws uuid.UUID) error {
+	if run != nil && run.Job.WorkspaceID != ws {
+		return fmt.Errorf("iac delivery: workspace %s is not job %s's workspace %s", ws, run.Job.ID, run.Job.WorkspaceID)
+	}
+	return nil
 }
 
 func (d *GovIaCDelivery) migrationClients() GovMigrationClients {
@@ -330,12 +347,53 @@ func verifiedIaCIntegration(db *gorm.DB, ws uuid.UUID, ch *IaCGitHubChannel) (*m
 // DecideIaCForm renders a plan against every IaC source mapped to the
 // control's account (§8.11): exactly one source must locate the role and
 // render the change; otherwise the most specific fallback is returned.
+//
+// It reads the database (loadIaCFormSources) and then GitHub
+// (renderIaCForm); a caller under row-level security calls the two apart,
+// so no transaction stays open across the GitHub reads.
 func DecideIaCForm(ctx context.Context, db *gorm.DB, gh iacpr.GitHub, ws uuid.UUID, c models.IGAGovControl, p igagov.Plan,
 	docs map[string]string, deploymentID string, keepNewRole bool) (*GovIaCForm, error) {
-	var srcs []models.IGAGovIaCSource
-	if err := db.Where("workspace_id = ? AND connector_id = ?", ws, c.ConnectorID).Order("created_at, id").Find(&srcs).Error; err != nil {
+	fs, err := loadIaCFormSources(db, ws, c)
+	if err != nil {
 		return nil, err
 	}
+	return renderIaCForm(ctx, gh, ws, c, p, docs, deploymentID, keepNewRole, fs)
+}
+
+// iacFormSources is DecideIaCForm's database part: the sources mapped to the
+// control's connector and, in order, each one's repository reference or the
+// refusal resolving it gave (loading stops at the first refusal, which is
+// where DecideIaCForm stops too).
+type iacFormSources struct {
+	srcs  []models.IGAGovIaCSource
+	repos []iacpr.RepoRef
+	errs  []error
+}
+
+func loadIaCFormSources(db *gorm.DB, ws uuid.UUID, c models.IGAGovControl) (*iacFormSources, error) {
+	fs := &iacFormSources{}
+	if err := db.Where("workspace_id = ? AND connector_id = ?", ws, c.ConnectorID).Order("created_at, id").Find(&fs.srcs).Error; err != nil {
+		return nil, err
+	}
+	for _, s := range fs.srcs {
+		repo, err := IaCRepoRef(db, ws, s)
+		var ge *GovError
+		if err != nil && !errors.As(err, &ge) {
+			return nil, err // a database error: the transaction is no longer usable
+		}
+		fs.repos, fs.errs = append(fs.repos, repo), append(fs.errs, err)
+		if err != nil {
+			break
+		}
+	}
+	return fs, nil
+}
+
+// renderIaCForm is DecideIaCForm's GitHub part, over what
+// loadIaCFormSources read.
+func renderIaCForm(ctx context.Context, gh iacpr.GitHub, ws uuid.UUID, c models.IGAGovControl, p igagov.Plan,
+	docs map[string]string, deploymentID string, keepNewRole bool, fs *iacFormSources) (*GovIaCForm, error) {
+	srcs := fs.srcs
 	// Review P2: a J2 target without a mapped source is a visible 409
 	// iac_source_missing (Export stays an explicit choice of the intent),
 	// and an unconfigured PR adapter (e.g. a process started with
@@ -353,10 +411,10 @@ func DecideIaCForm(ctx context.Context, db *gorm.DB, gh iacpr.GitHub, ws uuid.UU
 	var fbs []*iacpr.Fallback
 	for i := range srcs {
 		s := srcs[i]
-		repo, err := IaCRepoRef(db, ws, s)
-		if err != nil {
-			return nil, err
+		if fs.errs[i] != nil {
+			return nil, fs.errs[i]
 		}
+		repo := fs.repos[i]
 		snap, err := gh.ReadDirectory(ctx, repo, s.BaseBranch, s.Directory)
 		if err != nil {
 			return nil, fmt.Errorf("read %s/%s: %w", s.Repository, s.Directory, err)
@@ -422,14 +480,22 @@ func (a *GovAuthoring) iacTargetFallback(ctx context.Context, ws uuid.UUID, c mo
 	for _, d := range p.Documents {
 		docs[d.Hash] = d.Canonical
 	}
-	extra, err := planDocuments(a.db.WithContext(ctx), ws, p)
-	if err != nil {
+	var extra map[string]string
+	var fs *iacFormSources
+	if err := tenancy.InWorkspaceRead(ctx, a.db, ws, func(tx *gorm.DB) error {
+		var err error
+		if extra, err = planDocuments(tx, ws, p); err != nil {
+			return err
+		}
+		fs, err = loadIaCFormSources(tx, ws, c)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	for k, v := range extra {
 		docs[k] = v
 	}
-	f, err := DecideIaCForm(ctx, a.db.WithContext(ctx), a.iacGitHub(), ws, c, p, docs, "", false)
+	f, err := renderIaCForm(ctx, a.iacGitHub(), ws, c, p, docs, "", false, fs)
 	if err != nil {
 		return nil, err
 	}
@@ -483,9 +549,15 @@ type GovIaCOutcome struct {
 // `queued` (§8.4, §8.11). It is idempotent: a deployment already past
 // queued is returned as it is; a PR already opened for the branch is reused.
 func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, depID uuid.UUID) (*GovIaCOutcome, error) {
-	db := d.db.WithContext(ctx)
-	x, err := d.load(db, ws, depID)
-	if err != nil {
+	if err := iacRunWorkspace(run, ws); err != nil {
+		return nil, err
+	}
+	var x *iacDep
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		x, err = d.load(db, ws, depID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	out := &GovIaCOutcome{DeploymentID: depID, State: x.dep.State}
@@ -503,8 +575,8 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 	out.Description = &desc
 
 	if x.dep.Delivery == igagov.DeliveryExport {
-		deadline := now.Add(d.applyHours(db, ws))
 		err := run.InTx(ctx, func(tx *gorm.DB) error {
+			deadline := now.Add(d.applyHours(tx, ws))
 			if err := d.ensureMigrationRows(tx, ws, x); err != nil {
 				return err
 			}
@@ -532,20 +604,31 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		return nil, govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "Pull requests are not configured in this build.", nil)
 	}
 	var existing []models.IGAGovIaCChange
-	if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, depID).Find(&existing).Error; err != nil {
+	var keep bool
+	var fs *iacFormSources
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, depID).Find(&existing).Error; err != nil {
+			return err
+		}
+		if len(existing) == 1 && existing[0].State != "opening" {
+			return nil
+		}
+		var err error
+		if keep, err = d.keepNewRole(db, ws, x); err != nil {
+			return err
+		}
+		fs, err = loadIaCFormSources(db, ws, x.control)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	if len(existing) == 1 && existing[0].State != "opening" {
 		out.ChangeRow = &existing[0]
 		return out, nil
 	}
-	keep, err := d.keepNewRole(db, ws, x)
-	if err != nil {
-		return nil, err
-	}
 	var form *GovIaCForm
 	if err := run.External(ctx, 0, func(ctx context.Context) error {
-		f, err := DecideIaCForm(ctx, d.db.WithContext(ctx), gh, ws, x.control, x.plan, x.docs, depID.String(), keep)
+		f, err := renderIaCForm(ctx, gh, ws, x.control, x.plan, x.docs, depID.String(), keep, fs)
 		form = f
 		return err
 	}); err != nil {
@@ -570,12 +653,15 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		}
 		return o, err
 	}
-	ch, err := LoadIaCGitHubChannel(db, ws, form.Source.DiscoverySourceID)
-	if err != nil {
-		return nil, err
-	}
-	in, err := loadIaCIntegration(db, ws, ch.IntegrationID)
-	if err != nil {
+	var in *models.IGAIntegration
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		ch, err := LoadIaCGitHubChannel(db, ws, form.Source.DiscoverySourceID)
+		if err != nil {
+			return err
+		}
+		in, err = loadIaCIntegration(db, ws, ch.IntegrationID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	if in == nil || len(iacpr.MissingPermissions(permMap(in.GrantedPermissions))) > 0 {
@@ -586,8 +672,8 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		return nil, PolicyJobRetryLater(30*time.Minute, GovCodeIaCPermissionMissing+": "+strings.Join(missing, ", "))
 	}
 	if form.Change.Empty() {
-		deadline := now.Add(d.applyHours(db, ws))
 		err := run.InTx(ctx, func(tx *gorm.DB) error {
+			deadline := now.Add(d.applyHours(tx, ws))
 			if err := d.ensureMigrationRows(tx, ws, x); err != nil {
 				return err
 			}
@@ -654,7 +740,7 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 		return nil, openErr
 	}
 	out.PR = &pr
-	err = run.InTx(ctx, func(tx *gorm.DB) error {
+	err := run.InTx(ctx, func(tx *gorm.DB) error {
 		n := pr.Number
 		if err := tx.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ? AND state = 'opening'", ws, change.ID).
 			Updates(map[string]any{"state": "open", "pr_number": &n, "pr_url": pr.URL, "proposed_sha": pr.HeadSHA, "updated_at": now}).Error; err != nil {
@@ -683,7 +769,9 @@ func (d *GovIaCDelivery) Deliver(ctx context.Context, run *PolicyJobRun, ws, dep
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Where("id = ?", change.ID).Take(&change).Error; err != nil {
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		return db.Where("workspace_id = ? AND id = ?", ws, change.ID).Take(&change).Error
+	}); err != nil {
 		return nil, err
 	}
 	out.ChangeID, out.ChangeRow, out.State = &change.ID, &change, "awaiting_merge"
@@ -817,7 +905,9 @@ func (d *GovIaCDelivery) SyncHandler(ctx context.Context, run *PolicyJobRun) err
 	}
 	ws, id := run.Job.WorkspaceID, *run.Job.SubjectID
 	var n int64
-	if err := d.db.WithContext(ctx).Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ?", ws, id).Count(&n).Error; err != nil {
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		return db.Model(&models.IGAGovIaCChange{}).Where("workspace_id = ? AND id = ?", ws, id).Count(&n).Error
+	}); err != nil {
 		return err
 	}
 	var err error
@@ -835,16 +925,22 @@ func (d *GovIaCDelivery) SyncHandler(ctx context.Context, run *PolicyJobRun) err
 
 // Sync reads a PR's state and moves the deployment (§8.11 J2).
 func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, changeID uuid.UUID) (*GovIaCOutcome, error) {
-	db := d.db.WithContext(ctx)
-	var ch models.IGAGovIaCChange
-	if err := db.Where("workspace_id = ? AND id = ?", ws, changeID).Take(&ch).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotFound()
-		}
+	if err := iacRunWorkspace(run, ws); err != nil {
 		return nil, err
 	}
-	x, err := d.load(db, ws, ch.DeploymentID)
-	if err != nil {
+	var ch models.IGAGovIaCChange
+	var x *iacDep
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND id = ?", ws, changeID).Take(&ch).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotFound()
+			}
+			return err
+		}
+		var err error
+		x, err = d.load(db, ws, ch.DeploymentID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	out := &GovIaCOutcome{DeploymentID: ch.DeploymentID, State: x.dep.State, ChangeID: &ch.ID}
@@ -861,11 +957,15 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 			return nil, govErr(http.StatusServiceUnavailable, GovCodeIaCUnavailable, "Pull requests are not configured in this build.", nil)
 		}
 		var src models.IGAGovIaCSource
-		if err := db.Where("workspace_id = ? AND id = ?", ws, ch.SourceID).Take(&src).Error; err != nil {
-			return nil, err
-		}
-		repo, err := IaCRepoRef(db, ws, src)
-		if err != nil {
+		var repo iacpr.RepoRef
+		if err := d.read(ctx, ws, func(db *gorm.DB) error {
+			if err := db.Where("workspace_id = ? AND id = ?", ws, ch.SourceID).Take(&src).Error; err != nil {
+				return err
+			}
+			var err error
+			repo, err = IaCRepoRef(db, ws, src)
+			return err
+		}); err != nil {
 			return nil, err
 		}
 		var st iacpr.PullRequestState
@@ -879,7 +979,7 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 		now := d.now().UTC()
 		reviewed := reviewedSHAOf(ch, st)
 		refreshable := false
-		err = run.InTx(ctx, func(tx *gorm.DB) error {
+		err := run.InTx(ctx, func(tx *gorm.DB) error {
 			refreshable = false
 			refs, err := govDeploymentRefs(tx, ws, x.dep)
 			if err != nil {
@@ -975,9 +1075,18 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 			return nil, err
 		}
 	}
-	cur, err := d.load(db, ws, ch.DeploymentID)
-	if err != nil {
+	var cur *iacDep
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		cur, err = d.load(db, ws, ch.DeploymentID)
+		return err
+	}); err != nil {
 		return nil, err
+	}
+	readChange := func(fresh *models.IGAGovIaCChange) error {
+		return d.read(ctx, ws, func(db *gorm.DB) error {
+			return db.Where("workspace_id = ? AND id = ?", ws, ch.ID).Take(fresh).Error
+		})
 	}
 	if cur.dep.State == "awaiting_apply" {
 		o, err := d.ObserveApply(ctx, run, ws, ch.DeploymentID)
@@ -986,13 +1095,13 @@ func (d *GovIaCDelivery) Sync(ctx context.Context, run *PolicyJobRun, ws, change
 		}
 		o.ChangeID = &ch.ID
 		var fresh models.IGAGovIaCChange
-		if db.Where("id = ?", ch.ID).Take(&fresh).Error == nil {
+		if readChange(&fresh) == nil {
 			o.ChangeRow = &fresh
 		}
 		return o, nil
 	}
 	var fresh models.IGAGovIaCChange
-	if err := db.Where("id = ?", ch.ID).Take(&fresh).Error; err != nil {
+	if err := readChange(&fresh); err != nil {
 		return nil, err
 	}
 	out.State, out.ChangeRow = cur.dep.State, &fresh
@@ -1003,13 +1112,16 @@ func (d *GovIaCDelivery) refreshApplyRun(ctx context.Context, run *PolicyJobRun,
 	if ch.ApplyRunRef != "" || ch.PRNumber == nil || d.gh() == nil {
 		return nil
 	}
-	db := d.db.WithContext(ctx)
-	var src models.IGAGovIaCSource
-	if err := db.Where("workspace_id = ? AND id = ?", ws, ch.SourceID).Take(&src).Error; err != nil {
+	var repo iacpr.RepoRef
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		var src models.IGAGovIaCSource
+		if err := db.Where("workspace_id = ? AND id = ?", ws, ch.SourceID).Take(&src).Error; err != nil {
+			return err
+		}
+		var err error
+		repo, err = IaCRepoRef(db, ws, src)
 		return err
-	}
-	repo, err := IaCRepoRef(db, ws, src)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	var st iacpr.PullRequestState
@@ -1088,11 +1200,15 @@ func (d *GovIaCDelivery) recoverOpening(ctx context.Context, run *PolicyJobRun, 
 		return nil, err
 	}
 	var fresh models.IGAGovIaCChange
-	if err := d.db.WithContext(ctx).Where("id = ?", ch.ID).Take(&fresh).Error; err != nil {
-		return nil, err
-	}
-	cur, err := d.load(d.db.WithContext(ctx), ws, ch.DeploymentID)
-	if err != nil {
+	var cur *iacDep
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND id = ?", ws, ch.ID).Take(&fresh).Error; err != nil {
+			return err
+		}
+		var err error
+		cur, err = d.load(db, ws, ch.DeploymentID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	return &GovIaCOutcome{DeploymentID: ch.DeploymentID, State: cur.dep.State, Reason: cur.dep.StateReason, ChangeID: &ch.ID, ChangeRow: &fresh}, nil
@@ -1151,7 +1267,6 @@ func lastUpdateIntent(db *gorm.DB, ws, changeID uuid.UUID) string {
 // as a human push -- and a wording-only difference is not pushed at all.
 func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ch models.IGAGovIaCChange, x *iacDep,
 	st iacpr.PullRequestState, repo iacpr.RepoRef, src models.IGAGovIaCSource) error {
-	db := d.db.WithContext(ctx)
 	gh := d.gh()
 	closeAndBlock := func(reason string, payload map[string]any) error {
 		comment := "AuthSec closed this pull request: " + reason + ". The approved change can no longer be delivered from it; " +
@@ -1179,8 +1294,10 @@ func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws 
 	}
 	if x.planRow.SupersededAt != nil {
 		var cur []models.IGAGovPlan
-		if err := db.Where("workspace_id = ? AND target_id = ? AND kind = ? AND superseded_at IS NULL", ws, x.planRow.TargetID, x.planRow.Kind).
-			Find(&cur).Error; err != nil {
+		if err := d.read(ctx, ws, func(db *gorm.DB) error {
+			return db.Where("workspace_id = ? AND target_id = ? AND kind = ? AND superseded_at IS NULL", ws, x.planRow.TargetID, x.planRow.Kind).
+				Find(&cur).Error
+		}); err != nil {
 			return err
 		}
 		if len(cur) != 1 || cur[0].PlanHash != x.planRow.PlanHash {
@@ -1191,14 +1308,22 @@ func (d *GovIaCDelivery) refreshOpen(ctx context.Context, run *PolicyJobRun, ws 
 			return closeAndBlock(GovCodePlanChanged, map[string]any{"approved_plan_hash": x.planRow.PlanHash, "current_plan_hash": now})
 		}
 	}
-	keep, err := d.keepNewRole(db, ws, x)
-	if err != nil {
+	var keep bool
+	var fs *iacFormSources
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if keep, err = d.keepNewRole(db, ws, x); err != nil {
+			return err
+		}
+		fs, err = loadIaCFormSources(db, ws, x.control)
+		return err
+	}); err != nil {
 		return err
 	}
 	var form *GovIaCForm
 	var head iacpr.Snapshot
 	if err := run.External(ctx, 0, func(ctx context.Context) error {
-		f, err := DecideIaCForm(ctx, db, gh, ws, x.control, x.plan, x.docs, x.dep.ID.String(), keep)
+		f, err := renderIaCForm(ctx, gh, ws, x.control, x.plan, x.docs, x.dep.ID.String(), keep, fs)
 		if err != nil {
 			return err
 		}
@@ -1310,9 +1435,15 @@ func progressOf(c igagov.Classification, deadline *time.Time, overdue bool) GovA
 
 // ObserveApply classifies an awaiting_apply deployment's live state (§8.11).
 func (d *GovIaCDelivery) ObserveApply(ctx context.Context, run *PolicyJobRun, ws, depID uuid.UUID) (*GovIaCOutcome, error) {
-	db := d.db.WithContext(ctx)
-	x, err := d.load(db, ws, depID)
-	if err != nil {
+	if err := iacRunWorkspace(run, ws); err != nil {
+		return nil, err
+	}
+	var x *iacDep
+	if err := d.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		x, err = d.load(db, ws, depID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	out := &GovIaCOutcome{DeploymentID: depID, State: x.dep.State}
