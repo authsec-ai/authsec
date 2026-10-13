@@ -112,6 +112,8 @@ func (ctl *SlackIntegrationController) member(c *gin.Context) (ws, user uuid.UUI
 	if !ok {
 		return
 	}
+	// TENANT-EXEMPT: not a statement here: humanActor reads through
+	// tenancy.QueryRowContext, bound to workspace_id = ws.
 	uid, err := humanActor(c, ctl.db, ws)
 	if err != nil {
 		if errors.Is(err, errNotWorkspaceHuman) {

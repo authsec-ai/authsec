@@ -8,3 +8,7 @@ services/iga_gov_iac_delivery.go
 services/iga_gov_iac_delivery_handler.go
 services/iga_gov_iac_source_service.go
 services/iga_gov_iac_transitions.go
+services/slack_integration_service.go
+services/slack_integration_interactions.go
+services/slack_integration_channel.go
+controllers/platform/slack_integration_controller.go
