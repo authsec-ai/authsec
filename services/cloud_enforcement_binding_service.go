@@ -159,13 +159,13 @@ type EnforcementBindingService struct {
 func NewEnforcementBindingService(db *gorm.DB, vc vault.VaultClient, cfg awsdiscovery.CallbackConfig, principal string) *EnforcementBindingService {
 	s := &EnforcementBindingService{
 		db: db, vault: vc,
-		events:     repositories.NewIGAGovEventRepository(db),
-		assumer:    awsenforce.LiveAssumer{},
-		cfg:        cfg,
-		principal:  strings.TrimSpace(principal),
-		http:       awsdiscovery.NewCFNResponseClient(),
-		now:        time.Now,
-		sleep:      sleepCtx,
+		events:    repositories.NewIGAGovEventRepository(db),
+		assumer:   awsenforce.LiveAssumer{},
+		cfg:       cfg,
+		principal: strings.TrimSpace(principal),
+		http:      awsdiscovery.NewCFNResponseClient(),
+		now:       time.Now,
+		sleep:     sleepCtx,
 	}
 	s.templateCheck = newTemplateChecker(func() time.Time { return s.now() })
 	return s
