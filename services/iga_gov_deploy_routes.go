@@ -112,7 +112,7 @@ func (s *GovDeployments) ListDeployments(ctx context.Context, ws uuid.UUID, f Go
 	q += ` ORDER BY (CASE WHEN d.state = 'outcome_unresolved' THEN 0 ELSE 1 END), d.id LIMIT ?`
 	args = append(args, f.Limit+1)
 	var rows []GovDeploymentView
-	if err := s.db.WithContext(ctx).Raw(q, args...).Scan(&rows).Error; err != nil {
+	if err := s.read(ctx, ws, func(tx *gorm.DB) error { return tx.Raw(q, args...).Scan(&rows).Error }); err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -157,7 +157,16 @@ type GovValidationView struct {
 
 // GetDeployment is GET /deployments/:id.
 func (s *GovDeployments) GetDeployment(ctx context.Context, ws, id uuid.UUID) (*GovDeploymentDetail, error) {
-	db := s.db.WithContext(ctx)
+	var out *GovDeploymentDetail
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.getDeploymentTx(tx, ws, id)
+		return err
+	})
+	return out, err
+}
+
+func (s *GovDeployments) getDeploymentTx(db *gorm.DB, ws, id uuid.UUID) (*GovDeploymentDetail, error) {
 	d, err := s.loadDeployment(db, ws, id)
 	if err != nil {
 		return nil, err
@@ -198,7 +207,7 @@ func (s *GovDeployments) GetDeployment(ctx context.Context, ws, id uuid.UUID) (*
 	for _, v := range vs {
 		out.Validations = append(out.Validations, GovValidationView{IGAGovValidation: v, Items: items[v.ID]})
 	}
-	if out.GateFacts, err = s.DeploymentGateFacts(ctx, ws, d.ID); err != nil {
+	if out.GateFacts, err = s.deploymentGateFactsTx(db, ws, d.ID); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -267,56 +276,58 @@ type GovUndoRequest struct {
 // stored (A35) -- whose hash is not in the original approval, so it needs
 // its own approval or governance:emergency.
 func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, req GovUndoRequest, emergency bool) (*models.IGAGovDeployment, error) {
-	db := s.db.WithContext(ctx)
 	if emergency && strings.TrimSpace(req.Reason) == "" {
 		return nil, GovBadParam("reason", "An emergency undo needs a reason.")
 	}
-	d, err := s.loadDeployment(db, ws, depID)
-	if err != nil {
-		return nil, err
-	}
-	if d.Kind != igagov.PlanApply {
-		return nil, govConflict(GovCodeNotUndoable, "Only an apply deployment is undone; an undo is not undone again.", map[string]any{"kind": d.Kind})
-	}
-	if err := inFlightCheck(db, ws, d.ControlID); err != nil {
-		return nil, err
-	}
-	var deps []models.IGAGovDeployment
-	if err := db.Where("workspace_id = ? AND control_id = ?", ws, d.ControlID).Find(&deps).Error; err != nil {
-		return nil, err
-	}
-	latest := latestUndoable(deps)
-	if latest == nil || latest.ID != d.ID {
-		detail := map[string]any{"deployment_id": d.ID}
-		if latest != nil {
-			detail["latest_deployment_id"] = latest.ID
-		}
-		return nil, govConflict(GovCodeNotLatestDeployment, "Only the latest deployment of this role can be undone; undo in order.", detail)
-	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
-		return nil, err
-	}
+	var d *models.IGAGovDeployment
+	var ctl *models.IGAGovControl
 	var ap models.IGAGovApproval
-	if d.ApprovalID != nil {
-		if err := db.Where("workspace_id = ? AND id = ?", ws, *d.ApprovalID).Take(&ap).Error; err != nil {
-			return nil, err
-		}
-	}
 	var undo models.IGAGovPlan
-	if req.PlanID != nil {
-		if err := db.Where("workspace_id = ? AND id = ? AND control_id = ? AND kind = 'undo' AND version_id = ?",
-			ws, *req.PlanID, d.ControlID, d.VersionID).Take(&undo).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, GovNotFound()
-			}
-			return nil, err
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if d, err = s.loadDeployment(db, ws, depID); err != nil {
+			return err
 		}
-	} else {
+		if d.Kind != igagov.PlanApply {
+			return govConflict(GovCodeNotUndoable, "Only an apply deployment is undone; an undo is not undone again.", map[string]any{"kind": d.Kind})
+		}
+		if err := inFlightCheck(db, ws, d.ControlID); err != nil {
+			return err
+		}
+		var deps []models.IGAGovDeployment
+		if err := db.Where("workspace_id = ? AND control_id = ?", ws, d.ControlID).Find(&deps).Error; err != nil {
+			return err
+		}
+		latest := latestUndoable(deps)
+		if latest == nil || latest.ID != d.ID {
+			detail := map[string]any{"deployment_id": d.ID}
+			if latest != nil {
+				detail["latest_deployment_id"] = latest.ID
+			}
+			return govConflict(GovCodeNotLatestDeployment, "Only the latest deployment of this role can be undone; undo in order.", detail)
+		}
+		if ctl, err = s.loadControl(db, ws, d.ControlID); err != nil {
+			return err
+		}
+		if d.ApprovalID != nil {
+			if err := db.Where("workspace_id = ? AND id = ?", ws, *d.ApprovalID).Take(&ap).Error; err != nil {
+				return err
+			}
+		}
+		if req.PlanID != nil {
+			if err := db.Where("workspace_id = ? AND id = ? AND control_id = ? AND kind = 'undo' AND version_id = ?",
+				ws, *req.PlanID, d.ControlID, d.VersionID).Take(&undo).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return GovNotFound()
+				}
+				return err
+			}
+			return nil
+		}
 		var ps []models.IGAGovPlan
 		if err := db.Where("workspace_id = ? AND version_id = ? AND control_id = ? AND kind = 'undo' AND delivery = ?",
 			ws, d.VersionID, d.ControlID, d.Delivery).Order("created_at DESC").Find(&ps).Error; err != nil {
-			return nil, err
+			return err
 		}
 		for _, p := range ps {
 			if d.ApprovalID == nil || containsStr(ap.PlanHashes, p.PlanHash) {
@@ -325,8 +336,12 @@ func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, r
 			}
 		}
 		if undo.ID == uuid.Nil {
-			return nil, govConflict(GovCodePlanChanged, "No undo plan of this deployment is named by its approval.", nil)
+			return govConflict(GovCodePlanChanged, "No undo plan of this deployment is named by its approval.", nil)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	if !emergency && (d.ApprovalID == nil || !containsStr(ap.PlanHashes, undo.PlanHash)) {
 		return nil, govConflict(GovCodeApprovalRequired,
@@ -374,7 +389,7 @@ func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, r
 	} else {
 		nd.ApprovalID = d.ApprovalID
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&nd).Error; err != nil {
 			if isUniqueViolation(err, "uq_iga_gov_deployment_inflight") {
 				return govConflict(GovCodeDeploymentInFlight, "Another change on this role started meanwhile.", nil)
@@ -478,24 +493,28 @@ func storeSidePlanTx(tx *gorm.DB, ws, versionID, targetID, controlID, bundleID u
 // blocked undo (nil when the compiler refuses one: not needed or not
 // available, recorded in the event).
 func (s *GovDeployments) roleOnlyRecovery(ctx context.Context, ws, actor uuid.UUID, d models.IGAGovDeployment, undo models.IGAGovPlan, ctl models.IGAGovControl, live igagov.LiveRead) (*models.IGAGovPlan, error) {
-	db := s.db.WithContext(ctx)
 	up, err := fullPlanFromRow(undo)
 	if err != nil {
 		return nil, err
 	}
-	ev, err := evidenceOf(db, ws, undo)
-	if err != nil {
-		return nil, err
-	}
+	var ev igagov.EvidenceRef
 	earlier := ""
-	if undo.DesiredDocumentHash != nil {
-		var docs []string
-		_ = db.Raw(`SELECT canonical FROM iga_gov_document WHERE workspace_id = ? AND document_hash = ?`, ws, *undo.DesiredDocumentHash).Scan(&docs)
-		if len(docs) == 1 {
-			earlier = docs[0]
+	var owned []string
+	err = s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if ev, err = evidenceOf(db, ws, undo); err != nil {
+			return err
 		}
-	}
-	owned, err := s.authoring.ownedPolicyARNs(db, ws, ctl.ID)
+		if undo.DesiredDocumentHash != nil {
+			var docs []string
+			_ = db.Raw(`SELECT canonical FROM iga_gov_document WHERE workspace_id = ? AND document_hash = ?`, ws, *undo.DesiredDocumentHash).Scan(&docs)
+			if len(docs) == 1 {
+				earlier = docs[0]
+			}
+		}
+		owned, err = s.authoring.ownedPolicyARNs(db, ws, ctl.ID)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -516,7 +535,7 @@ func (s *GovDeployments) roleOnlyRecovery(ctx context.Context, ws, actor uuid.UU
 		return nil, err
 	}
 	var out *models.IGAGovPlan
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		pol, _, err := s.policyOfVersion(tx, ws, d.VersionID)
 		if err != nil {
 			return err
@@ -573,8 +592,7 @@ type GovResolveRequest struct {
 // deploy job, an operator's declaration) returns it to applying with its
 // deploy job queued.
 func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID, req GovResolveRequest) (any, error) {
-	db := s.db.WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, depID)
+	d, err := s.readDeployment(ctx, ws, depID)
 	if err != nil {
 		return nil, err
 	}
@@ -600,24 +618,32 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 			return nil, err
 		}
 		if req.Action == "reread" {
-			return s.loadDeployment(db, ws, d.ID)
+			return s.readDeployment(ctx, ws, d.ID)
 		}
-		if d, err = s.loadDeployment(db, ws, d.ID); err != nil {
+		if d, err = s.readDeployment(ctx, ws, d.ID); err != nil {
 			return nil, err
 		}
 	}
-	pol, _, err := s.policyOfVersion(db, ws, d.VersionID)
-	if err != nil {
+	var pol uuid.UUID
+	if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		pol, _, err = s.policyOfVersion(tx, ws, d.VersionID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	k, a := userActor(actor)
 	switch req.Action {
 	case "reread":
-		open, err := s.attempts.OpenAttempt(db, ws, d.ID)
-		if err != nil {
+		var open *models.IGAGovAttempt
+		if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+			var err error
+			open, err = s.attempts.OpenAttempt(tx, ws, d.ID)
+			return err
+		}); err != nil {
 			return nil, err
 		}
-		err = db.Transaction(func(tx *gorm.DB) error {
+		err = s.write(ctx, ws, func(tx *gorm.DB) error {
 			if open == nil || open.Status != models.GovAttemptUnknown {
 				if err := appendGovEvent(tx, ws, GovEventDeploymentResolveReq, k, a, depRefs(*d, pol),
 					map[string]any{"action": req.Action, "reason": req.Reason, "from_state": d.State}); err != nil {
@@ -643,18 +669,22 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 		if err != nil {
 			return nil, err
 		}
-		return s.loadDeployment(db, ws, d.ID)
+		return s.readDeployment(ctx, ws, d.ID)
 	case "emergency_undo":
 		var undo []models.IGAGovPlan
-		if err := db.Where("workspace_id = ? AND version_id = ? AND control_id = ? AND kind = 'undo' AND superseded_at IS NULL",
-			ws, d.VersionID, d.ControlID).Find(&undo).Error; err != nil {
-			return nil, err
-		}
-		if d.Kind != igagov.PlanApply || len(undo) != 1 {
-			return nil, govConflict(GovCodeEmergencyUndoUnavail, "No undo plan of this deployment exists.", nil)
-		}
-		ctl, err := s.loadControl(db, ws, d.ControlID)
-		if err != nil {
+		var ctl *models.IGAGovControl
+		if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+			if err := tx.Where("workspace_id = ? AND version_id = ? AND control_id = ? AND kind = 'undo' AND superseded_at IS NULL",
+				ws, d.VersionID, d.ControlID).Find(&undo).Error; err != nil {
+				return err
+			}
+			if d.Kind != igagov.PlanApply || len(undo) != 1 {
+				return govConflict(GovCodeEmergencyUndoUnavail, "No undo plan of this deployment exists.", nil)
+			}
+			var err error
+			ctl, err = s.loadControl(tx, ws, d.ControlID)
+			return err
+		}); err != nil {
 			return nil, err
 		}
 		up, err := fullPlanFromRow(undo[0])
@@ -680,11 +710,13 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 	// accept_observed
 	if req.VersionNo == nil {
 		var v models.IGAGovPolicyVersion
-		if err := db.Where("workspace_id = ? AND id = ?", ws, d.VersionID).Take(&v).Error; err != nil {
-			return nil, err
-		}
 		var maxNo int
-		if err := db.Raw(`SELECT max(version_no) FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ?`, ws, pol).Scan(&maxNo).Error; err != nil {
+		if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+			if err := tx.Where("workspace_id = ? AND id = ?", ws, d.VersionID).Take(&v).Error; err != nil {
+				return err
+			}
+			return tx.Raw(`SELECT max(version_no) FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ?`, ws, pol).Scan(&maxNo).Error
+		}); err != nil {
 			return nil, err
 		}
 		nv, err := s.authoring.CreateVersion(ctx, ws, actor, pol, maxNo, v.Intent)
@@ -695,7 +727,7 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 		if err != nil {
 			return nil, err
 		}
-		if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := s.write(ctx, ws, func(tx *gorm.DB) error {
 			return appendGovEvent(tx, ws, GovEventAcceptObservedOpened, k, a, depRefs(*d, pol), map[string]any{"version_no": nv.No,
 				"reason": req.Reason, "note": "The role stays held until this version is approved and its deployment takes over."})
 		}); err != nil {
@@ -704,15 +736,17 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 		return res, nil
 	}
 	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND policy_id = ? AND version_no = ?", ws, pol, *req.VersionNo).Take(&v).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotFound()
-		}
-		return nil, err
-	}
 	var ap []models.IGAGovPlan
-	if err := db.Where("workspace_id = ? AND version_id = ? AND control_id = ? AND kind = 'apply' AND superseded_at IS NULL",
-		ws, v.ID, d.ControlID).Find(&ap).Error; err != nil {
+	if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		if err := tx.Where("workspace_id = ? AND policy_id = ? AND version_no = ?", ws, pol, *req.VersionNo).Take(&v).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotFound()
+			}
+			return err
+		}
+		return tx.Where("workspace_id = ? AND version_id = ? AND control_id = ? AND kind = 'apply' AND superseded_at IS NULL",
+			ws, v.ID, d.ControlID).Find(&ap).Error
+	}); err != nil {
 		return nil, err
 	}
 	if len(ap) != 1 {
@@ -735,6 +769,18 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 	return succ, nil
 }
 
+// readDeployment is loadDeployment in its own read transaction under
+// row-level security for ws (GovNotFound for another workspace's id).
+func (s *GovDeployments) readDeployment(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovDeployment, error) {
+	var d *models.IGAGovDeployment
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		d, err = s.loadDeployment(tx, ws, id)
+		return err
+	})
+	return d, err
+}
+
 // Handoff is §8.1 step 4: in ONE transaction the unresolved deployment
 // becomes recovered naming its successor and the successor is inserted
 // naming it back on the same control (both FKs checked at commit), then its
@@ -742,7 +788,7 @@ func (s *GovDeployments) Resolve(ctx context.Context, ws, actor, depID uuid.UUID
 func (s *GovDeployments) Handoff(ctx context.Context, unresolved models.IGAGovDeployment, succ *models.IGAGovDeployment, actor uuid.UUID, why string) error {
 	ws := unresolved.WorkspaceID
 	succ.RecoversDeploymentID = &unresolved.ID
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Exec(`SELECT id FROM iga_gov_control WHERE workspace_id = ? AND id = ? FOR UPDATE`, ws, unresolved.ControlID).Error; err != nil {
 			return err
 		}
@@ -793,78 +839,18 @@ type GovValidationRequest struct {
 // for dedicated_workload; every action must map to a CloudTrail event
 // (422 action_not_mappable).
 func (s *GovDeployments) DeclareValidation(ctx context.Context, ws, actor, depID uuid.UUID, req GovValidationRequest) (*GovValidationView, error) {
-	db := s.db.WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, depID)
+	var d *models.IGAGovDeployment
+	var v models.IGAGovValidation
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		d, v, err = s.prepareValidation(db, ws, actor, depID, req)
+		return err
+	})
 	if err != nil {
 		return nil, err
-	}
-	if len(req.Items) == 0 {
-		return nil, GovBadParam("items", "At least one action is declared.")
-	}
-	seen := map[string]bool{}
-	for i, it := range req.Items {
-		ns, _, ok := igagov.SplitAction(it.Action)
-		if !reValidationAction.MatchString(it.Action) || !ok {
-			return nil, govUnprocessable(GovCodeActionNotMappable, "The action cannot be matched to CloudTrail events.",
-				map[string]any{"index": i, "action": it.Action})
-		}
-		if _, ok := igagov.ActionForEvent(ns+".amazonaws.com", strings.SplitN(it.Action, ":", 2)[1]); !ok {
-			return nil, govUnprocessable(GovCodeActionNotMappable, "The action cannot be matched to CloudTrail events.",
-				map[string]any{"index": i, "action": it.Action})
-		}
-		if it.Expected != igagov.ExpectDenied && it.Expected != igagov.ExpectAllowed {
-			return nil, GovBadParam("items", "expected must be denied or allowed.")
-		}
-		if seen[it.Action] {
-			return nil, GovBadParam("items", "An action is declared twice.")
-		}
-		seen[it.Action] = true
-	}
-	if !req.WindowEnd.After(req.WindowStart) {
-		return nil, GovBadParam("window_end", "The window must end after it starts.")
-	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
-		return nil, err
-	}
-	v := models.IGAGovValidation{ID: uuid.New(), WorkspaceID: ws, DeploymentID: d.ID, CreatedBy: actor, RoleID: ctl.RoleID,
-		Correlation: req.Correlation, WindowStart: req.WindowStart.UTC(), WindowEnd: req.WindowEnd.UTC(), Note: req.Note, Result: "pending"}
-	switch req.Correlation {
-	case "assumed_session":
-		b := make([]byte, 6)
-		if _, err := rand.Read(b); err != nil {
-			return nil, err
-		}
-		v.SessionName = "authsec-validate-" + hex.EncodeToString(b)
-	case "dedicated_workload":
-		if req.DedicatedWorkloadID == nil {
-			return nil, GovBadParam("dedicated_workload_id", "A dedicated workload is named.")
-		}
-		var w []struct {
-			ID          uuid.UUID
-			DisplayName string
-		}
-		if err := db.Raw(`SELECT id, display_name FROM iga_workload WHERE workspace_id = ? AND id = ?`, ws, *req.DedicatedWorkloadID).Scan(&w).Error; err != nil {
-			return nil, err
-		}
-		if len(w) == 0 {
-			return nil, GovNotFound()
-		}
-		var dup int64
-		if err := db.Raw(`SELECT count(*) FROM iga_workload WHERE workspace_id = ? AND id <> ? AND display_name = ? AND lifecycle = 'active'`,
-			ws, w[0].ID, w[0].DisplayName).Scan(&dup).Error; err != nil {
-			return nil, err
-		}
-		if dup > 0 {
-			return nil, govUnprocessable(GovCodeSessionNotUnique, "Another workload uses the same session name; its calls could not be told apart.",
-				map[string]any{"session_name": w[0].DisplayName})
-		}
-		v.SessionName, v.DedicatedWorkloadID = w[0].DisplayName, req.DedicatedWorkloadID
-	default:
-		return nil, GovBadParam("correlation", "correlation must be assumed_session or dedicated_workload.")
 	}
 	out := &GovValidationView{IGAGovValidation: v}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&v).Error; err != nil {
 			if isUniqueViolation(err, "uq_iga_gov_validation_session") || strings.Contains(err.Error(), "iga_gov_vr_correlation_chk") ||
 				strings.Contains(err.Error(), "session_name") {
@@ -896,14 +882,94 @@ func (s *GovDeployments) DeclareValidation(ctx context.Context, ws, actor, depID
 	return out, nil
 }
 
-// ListValidations is GET /deployments/:id/validations.
-func (s *GovDeployments) ListValidations(ctx context.Context, ws, depID uuid.UUID) ([]GovValidationView, error) {
-	db := s.db.WithContext(ctx)
+// prepareValidation is DeclareValidation's reads and checks, in the caller's
+// transaction under row-level security for ws.
+func (s *GovDeployments) prepareValidation(db *gorm.DB, ws, actor, depID uuid.UUID, req GovValidationRequest) (*models.IGAGovDeployment, models.IGAGovValidation, error) {
+	var v models.IGAGovValidation
 	d, err := s.loadDeployment(db, ws, depID)
 	if err != nil {
-		return nil, err
+		return nil, v, err
 	}
-	vs, items, err := loadValidations(db, *d)
+	if len(req.Items) == 0 {
+		return nil, v, GovBadParam("items", "At least one action is declared.")
+	}
+	seen := map[string]bool{}
+	for i, it := range req.Items {
+		ns, _, ok := igagov.SplitAction(it.Action)
+		if !reValidationAction.MatchString(it.Action) || !ok {
+			return nil, v, govUnprocessable(GovCodeActionNotMappable, "The action cannot be matched to CloudTrail events.",
+				map[string]any{"index": i, "action": it.Action})
+		}
+		if _, ok := igagov.ActionForEvent(ns+".amazonaws.com", strings.SplitN(it.Action, ":", 2)[1]); !ok {
+			return nil, v, govUnprocessable(GovCodeActionNotMappable, "The action cannot be matched to CloudTrail events.",
+				map[string]any{"index": i, "action": it.Action})
+		}
+		if it.Expected != igagov.ExpectDenied && it.Expected != igagov.ExpectAllowed {
+			return nil, v, GovBadParam("items", "expected must be denied or allowed.")
+		}
+		if seen[it.Action] {
+			return nil, v, GovBadParam("items", "An action is declared twice.")
+		}
+		seen[it.Action] = true
+	}
+	if !req.WindowEnd.After(req.WindowStart) {
+		return nil, v, GovBadParam("window_end", "The window must end after it starts.")
+	}
+	ctl, err := s.loadControl(db, ws, d.ControlID)
+	if err != nil {
+		return nil, v, err
+	}
+	v = models.IGAGovValidation{ID: uuid.New(), WorkspaceID: ws, DeploymentID: d.ID, CreatedBy: actor, RoleID: ctl.RoleID,
+		Correlation: req.Correlation, WindowStart: req.WindowStart.UTC(), WindowEnd: req.WindowEnd.UTC(), Note: req.Note, Result: "pending"}
+	switch req.Correlation {
+	case "assumed_session":
+		b := make([]byte, 6)
+		if _, err := rand.Read(b); err != nil {
+			return nil, v, err
+		}
+		v.SessionName = "authsec-validate-" + hex.EncodeToString(b)
+	case "dedicated_workload":
+		if req.DedicatedWorkloadID == nil {
+			return nil, v, GovBadParam("dedicated_workload_id", "A dedicated workload is named.")
+		}
+		var w []struct {
+			ID          uuid.UUID
+			DisplayName string
+		}
+		if err := db.Raw(`SELECT id, display_name FROM iga_workload WHERE workspace_id = ? AND id = ?`, ws, *req.DedicatedWorkloadID).Scan(&w).Error; err != nil {
+			return nil, v, err
+		}
+		if len(w) == 0 {
+			return nil, v, GovNotFound()
+		}
+		var dup int64
+		if err := db.Raw(`SELECT count(*) FROM iga_workload WHERE workspace_id = ? AND id <> ? AND display_name = ? AND lifecycle = 'active'`,
+			ws, w[0].ID, w[0].DisplayName).Scan(&dup).Error; err != nil {
+			return nil, v, err
+		}
+		if dup > 0 {
+			return nil, v, govUnprocessable(GovCodeSessionNotUnique, "Another workload uses the same session name; its calls could not be told apart.",
+				map[string]any{"session_name": w[0].DisplayName})
+		}
+		v.SessionName, v.DedicatedWorkloadID = w[0].DisplayName, req.DedicatedWorkloadID
+	default:
+		return nil, v, GovBadParam("correlation", "correlation must be assumed_session or dedicated_workload.")
+	}
+	return d, v, nil
+}
+
+// ListValidations is GET /deployments/:id/validations.
+func (s *GovDeployments) ListValidations(ctx context.Context, ws, depID uuid.UUID) ([]GovValidationView, error) {
+	var vs []models.IGAGovValidation
+	var items map[uuid.UUID][]models.IGAGovValidationItem
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		d, err := s.loadDeployment(db, ws, depID)
+		if err != nil {
+			return err
+		}
+		vs, items, err = loadValidations(db, *d)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -930,7 +996,18 @@ type GovHealthReportRequest struct {
 // role's identity) or a holder of governance:author (isAuthor). The console
 // route and Slack's buttons both authorize here.
 func (s *GovDeployments) AuthorizeHealthReport(ctx context.Context, ws, actor, depID uuid.UUID, req GovHealthReportRequest, isAuthor bool) (*models.IGAGovDeployment, error) {
-	db := s.db.WithContext(ctx)
+	var d *models.IGAGovDeployment
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		d, err = s.authorizeHealthReportTx(db, ws, actor, depID, req, isAuthor)
+		return err
+	})
+	return d, err
+}
+
+// authorizeHealthReportTx is AuthorizeHealthReport in the caller's
+// transaction under row-level security for ws.
+func (s *GovDeployments) authorizeHealthReportTx(db *gorm.DB, ws, actor, depID uuid.UUID, req GovHealthReportRequest, isAuthor bool) (*models.IGAGovDeployment, error) {
 	d, err := s.loadDeployment(db, ws, depID)
 	if err != nil {
 		return nil, err
@@ -977,14 +1054,13 @@ func (s *GovDeployments) CreateHealthReport(ctx context.Context, ws, actor, depI
 	if err != nil {
 		return nil, err
 	}
-	db := s.db.WithContext(ctx)
 	ch := req.Channel
 	if ch == "" {
 		ch = "ui"
 	}
 	hr := models.IGAGovHealthReport{ID: uuid.New(), WorkspaceID: ws, DeploymentID: d.ID, ReportedBy: actor, Kind: req.Kind,
 		Service: strings.ToLower(strings.TrimSpace(req.Service)), Detail: strings.TrimSpace(req.Detail), Channel: ch, CreatedAt: s.now().UTC()}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&hr).Error; err != nil {
 			return err
 		}
@@ -1004,14 +1080,18 @@ func (s *GovDeployments) CreateHealthReport(ctx context.Context, ws, actor, depI
 
 // ListHealthReports is GET /deployments/:id/health-reports.
 func (s *GovDeployments) ListHealthReports(ctx context.Context, ws, depID uuid.UUID) ([]models.IGAGovHealthReport, error) {
-	db := s.db.WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, depID)
+	out := []models.IGAGovHealthReport{}
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		d, err := s.loadDeployment(db, ws, depID)
+		if err != nil {
+			return err
+		}
+		return db.Where("workspace_id = ? AND deployment_id = ?", ws, d.ID).Order("created_at, id").Find(&out).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := []models.IGAGovHealthReport{}
-	err = db.Where("workspace_id = ? AND deployment_id = ?", ws, d.ID).Order("created_at, id").Find(&out).Error
-	return out, err
+	return out, nil
 }
 
 // GovForbidden is a 403 forbidden in the §7 envelope.

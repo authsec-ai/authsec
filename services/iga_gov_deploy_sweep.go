@@ -97,19 +97,23 @@ func (s *GovDeployments) onJobExhausted(ctx context.Context, job models.IGAGovJo
 	}
 	act, err := s.settleStuck(ctx, job.WorkspaceID, *job.SubjectID, lastError)
 	if err != nil {
-		log.Printf("[policy-worker] %s %s exhausted; settling deployment %s: %v (the sweeper retries)", job.Kind, job.ID, *job.SubjectID, err)
+		log.Printf("[policy-worker] workspace %s: %s %s exhausted; settling deployment %s: %v (the sweeper retries)",
+			job.WorkspaceID, job.Kind, job.ID, *job.SubjectID, err)
 		return
 	}
-	log.Printf("[policy-worker] %s %s exhausted; deployment %s: %s", job.Kind, job.ID, *job.SubjectID, act)
+	log.Printf("[policy-worker] workspace %s: %s %s exhausted; deployment %s: %s", job.WorkspaceID, job.Kind, job.ID, *job.SubjectID, act)
 }
 
 // SweepStuckDeployments settles every in-flight deployment that has no open
-// job (see the file comment). It returns what it did per deployment.
+// job (see the file comment). It returns what it did per deployment. The scan
+// crosses workspaces by design; each deployment is then settled in its own
+// transaction under row-level security for ITS workspace (settleStuck).
 func (s *GovDeployments) SweepStuckDeployments(ctx context.Context) (map[uuid.UUID]string, error) {
 	var rows []struct {
 		WorkspaceID uuid.UUID
 		ID          uuid.UUID
 	}
+	// TENANT-EXEMPT: the stuck-deployment sweeper scans every workspace's in-flight deployments; each row is acted on under InWorkspace(row.workspace_id).
 	if err := s.db.WithContext(ctx).Raw(`
 		SELECT d.workspace_id, d.id FROM iga_gov_deployment d
 		 WHERE d.state IN ('queued','applying','outcome_unknown') AND d.updated_at < ?
@@ -123,8 +127,9 @@ func (s *GovDeployments) SweepStuckDeployments(ctx context.Context) (map[uuid.UU
 	for _, r := range rows {
 		act, err := s.settleStuck(ctx, r.WorkspaceID, r.ID, "")
 		if err != nil {
+			log.Printf("[policy-worker] workspace %s: settling stuck deployment %s: %v", r.WorkspaceID, r.ID, err)
 			if first == nil {
-				first = fmt.Errorf("deployment %s: %w", r.ID, err)
+				first = fmt.Errorf("workspace %s deployment %s: %w", r.WorkspaceID, r.ID, err)
 			}
 			continue
 		}
@@ -175,7 +180,7 @@ func openJobs(tx *gorm.DB, ws, id uuid.UUID) (open, running int64, err error) {
 // settleStuck applies the file comment's table to one deployment.
 func (s *GovDeployments) settleStuck(ctx context.Context, ws, id uuid.UUID, lastError string) (string, error) {
 	act := StuckNone
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.write(ctx, ws, func(tx *gorm.DB) error {
 		d, err := lockDeploymentTx(tx, ws, id)
 		if err != nil {
 			return err
@@ -274,7 +279,7 @@ func (s *GovDeployments) exhaustedTx(tx *gorm.DB, d *models.IGAGovDeployment, ki
 // applying deployment is moved here) and returns its settle_after.
 func (s *GovDeployments) ensureOutcomeUnknownTx(tx *gorm.DB, d *models.IGAGovDeployment, rec *AttemptRecovery) (time.Time, error) {
 	var cur models.IGAGovDeployment
-	if err := tx.Where("id = ?", d.ID).Take(&cur).Error; err != nil {
+	if err := tx.Where("workspace_id = ? AND id = ?", d.WorkspaceID, d.ID).Take(&cur).Error; err != nil {
 		return time.Time{}, err
 	}
 	if cur.State == models.GovDeployOutcomeUnknown && cur.SettleAfter != nil {
@@ -328,7 +333,7 @@ func nextOpTx(tx *gorm.DB, d models.IGAGovDeployment) (string, error) {
 		return "", err
 	}
 	var cur struct{ CompletedOps json.RawMessage }
-	if err := tx.Raw(`SELECT completed_ops FROM iga_gov_deployment WHERE id = ?`, d.ID).Scan(&cur).Error; err != nil {
+	if err := tx.Raw(`SELECT completed_ops FROM iga_gov_deployment WHERE workspace_id = ? AND id = ?`, d.WorkspaceID, d.ID).Scan(&cur).Error; err != nil {
 		return "", err
 	}
 	var done []struct {
@@ -402,7 +407,7 @@ func (s *GovDeployments) resolveApplying(ctx context.Context, d models.IGAGovDep
 	ws := d.WorkspaceID
 	k, a := userActor(actor)
 	var pending *time.Time
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.write(ctx, ws, func(tx *gorm.DB) error {
 		cur, err := lockDeploymentTx(tx, ws, d.ID)
 		if err != nil {
 			return err
