@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -280,7 +279,9 @@ func NewGovNotifier(db *gorm.DB) *GovNotifier {
 	return &GovNotifier{
 		db:            db,
 		Email:         &notify.SMTP{Config: utils.AppSMTPConfig},
-		Webhook:       &notify.Webhook{Client: &http.Client{Timeout: notify.DefaultWebhookTimeout}},
+		// No client of its own: notify.Webhook's default is the SSRF-safe
+		// client (internal/safehttp). The URL is the workspace's choice.
+		Webhook:       &notify.Webhook{},
 		WebhookTarget: GovWorkspaceWebhookTarget,
 		now:           time.Now,
 	}
