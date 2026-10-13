@@ -252,6 +252,7 @@ func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (ig
 	if err := ctx.Err(); err != nil {
 		return igagov.Evaluation{}, nil, err
 	}
+	gs.Snap.NoOwnership = !GovOwnershipEnabled()
 	out, err := igagov.Evaluate(gs.Snap)
 	if err != nil {
 		return igagov.Evaluation{}, nil, fmt.Errorf("evaluate: %w", err)
@@ -454,11 +455,14 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 		}
 		return err
 	}
-	if err := tx.Exec(`INSERT INTO iga_gov_job (workspace_id, kind, rev, dedupe_key)
-	                   VALUES (?, 'evaluate_owner_rules', ?, ?)
-	                   ON CONFLICT (workspace_id, kind, dedupe_key) WHERE status IN ('queued','running') DO NOTHING`,
-		ws, rev, fmt.Sprintf("rev:%d", rev)).Error; err != nil {
-		return fmt.Errorf("enqueue evaluate_owner_rules: %w", err)
+	// Owner rules run only in owners mode (admin mode has no owners).
+	if GovOwnershipEnabled() {
+		if err := tx.Exec(`INSERT INTO iga_gov_job (workspace_id, kind, rev, dedupe_key)
+		                   VALUES (?, 'evaluate_owner_rules', ?, ?)
+		                   ON CONFLICT (workspace_id, kind, dedupe_key) WHERE status IN ('queued','running') DO NOTHING`,
+			ws, rev, fmt.Sprintf("rev:%d", rev)).Error; err != nil {
+			return fmt.Errorf("enqueue evaluate_owner_rules: %w", err)
+		}
 	}
 	// The publication hook (p3-wire, item 4; §2.8 "Revalidation, not silent
 	// recompilation", §8.3, A59): every version still in review is
