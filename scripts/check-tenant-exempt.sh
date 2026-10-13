@@ -51,7 +51,8 @@ hits=$(git ls-files '*.go' \
         # list, including a multi-line SQL string up to its closing backtick.
         scoped = "(tenancy\\.(Exec|Query|QueryRow|Insert|GormExec|GormRaw)(Context)?|queryScoped|insertScoped)\\("
       }
-      FNR == 1 { h1 = h2 = h3 = ""; instr = 0; cover = 0 }
+      FNR == 1 { for (v in pend) { print prevfile; delete pend[v] }; h1 = h2 = h3 = ""; instr = 0; cover = 0; svar = ""; prevfile = FILENAME }
+      END { for (v in pend) print prevfile }
       {
         line = $0
         tmp = line
@@ -67,13 +68,34 @@ hits=$(git ls-files '*.go' \
         # for an opening one; coverage is decided when a string opens.
         closing = 0
         if (ticks % 2 == 1) {
-          if (!instr) { instr = 1; cover = (call || exempt) } else closing = 1
+          if (!instr) {
+            instr = 1; cover = (call || exempt); acc = ""; hit = 0; svar = ""
+            if (match(line, /[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:?=[[:space:]]*`/)) {
+              svar = substr(line, RSTART, RLENGTH); sub(/[[:space:]]*:?=.*/, "", svar)
+            }
+          } else closing = 1
         }
         skip = call || (instr && cover)
-        if (closing) { instr = 0; cover = 0 }
+        if (instr) acc = acc " " line
         if (!skip && line ~ /(SELECT[[:space:]][^"`]*FROM|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET|DELETE[[:space:]]+FROM|INSERT[[:space:]]+INTO)/ \
             && line !~ /TENANT-EXEMPT/ && h1 !~ /TENANT-EXEMPT/ && h2 !~ /TENANT-EXEMPT/ && h3 !~ /TENANT-EXEMPT/ \
-            && line !~ /^[[:space:]]*\/\//) print FILENAME
+            && line !~ /^[[:space:]]*\/\//) { print FILENAME; if (instr) hit = 1 }
+        # A statement whose keywords sit on different lines of one raw string
+        # (UPDATE t / SET ..., SELECT ... / FROM ...) is judged on the whole
+        # string when it closes.
+        # A string assigned to a variable (q := `...`) and handed to a scoped
+        # call within the next 25 lines is covered by that call.
+        if (closing) {
+          if (!cover && !hit && acc !~ /TENANT-EXEMPT/ \
+              && acc ~ /(SELECT[[:space:]].*[[:space:]]FROM[[:space:]]|UPDATE[[:space:]]+[a-z_."]+[[:space:]]+SET[[:space:]]|DELETE[[:space:]]+FROM[[:space:]]|INSERT[[:space:]]+INTO[[:space:]])/) {
+            if (svar != "") { pend[svar] = FNR } else print FILENAME
+          }
+          instr = 0; cover = 0
+        }
+        for (v in pend) {
+          if (line ~ scoped && index(line, v) > 0) delete pend[v]
+          else if (FNR - pend[v] > 25) { print FILENAME; delete pend[v] }
+        }
         h3 = h2; h2 = h1; h1 = line
       }')
 
