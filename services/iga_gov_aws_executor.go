@@ -15,6 +15,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -96,13 +97,21 @@ type IGAGovAWS interface {
 	EnforcementIAM(ctx context.Context, ws, connectorID, deploymentID uuid.UUID) (awsenforce.IAM, error)
 }
 
-// NewIGAGovAWSExecutor builds the executor.
+// NewIGAGovAWSExecutor builds the executor. Every statement it makes runs in
+// a transaction under row-level security for the deployment's workspace (its
+// reads in read, its writes in the job's InTx).
 func NewIGAGovAWSExecutor(db *gorm.DB, attempts *IGAGovAttemptLog, aws IGAGovAWS) *IGAGovAWSExecutor {
 	return &IGAGovAWSExecutor{db: db, attempts: attempts, aws: aws, events: repositories.NewIGAGovEventRepository(db),
 		now: time.Now, sleep: sleepCtx}
 }
 
 // WithClock replaces the clock (tests).
+// read runs fn in one read-only transaction under row-level security for ws;
+// it is never held across an AWS call.
+func (e *IGAGovAWSExecutor) read(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, e.db, ws, fn)
+}
+
 func (e *IGAGovAWSExecutor) WithClock(now func() time.Time) *IGAGovAWSExecutor {
 	e.now = now
 	return e
@@ -353,18 +362,23 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 		out.Result, out.Reason, out.SettleAfter, out.Attempt = DeployHold, DeployReasonUnknownPending, rec.SettleAfter, rec.Attempt
 		return out, nil
 	}
+	if dep.WorkspaceID != run.Job.WorkspaceID {
+		return nil, fmt.Errorf("deployment %s is not in the job's workspace", dep.ID)
+	}
 	var ctl models.IGAGovControl
-	if err := e.db.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
+	var cur models.IGAGovDeployment
+	if err := e.read(ctx, dep.WorkspaceID, func(tx *gorm.DB) error {
+		if err := tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
+			return err
+		}
+		return tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ID).First(&cur).Error
+	}); err != nil {
 		return nil, err
 	}
 	role := roleNameOfARN(ctl.RoleARN)
 	if reason, detail := refuseDirect(dep, plan, role); reason != "" {
 		out.Result, out.Reason, out.Detail = DeployRefused, reason, detail
 		return out, nil
-	}
-	var cur models.IGAGovDeployment
-	if err := e.db.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ID).First(&cur).Error; err != nil {
-		return nil, err
 	}
 	if cur.State != "applying" {
 		out.Result, out.Reason, out.Detail = DeployRefused, DeployReasonNotApplying, "deployment is "+cur.State
@@ -374,7 +388,7 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 	if err := x.discovery(ctx); err != nil {
 		return x.finish(err)
 	}
-	if x.completed, err = x.loadCompleted(); err != nil {
+	if x.completed, err = x.loadCompleted(ctx); err != nil {
 		return nil, err
 	}
 	return x.finish(x.execute(ctx))
@@ -600,10 +614,12 @@ func conflictDetail(cl igagov.Classification) string {
 // changed by someone else (blocked).
 func (x *execRun) notVisible(ctx context.Context, opSeq int, cl igagov.Classification) error {
 	var at []struct{ CompletedAt time.Time }
-	if err := x.e.db.Raw(`SELECT completed_at FROM iga_gov_attempt
+	if err := x.e.read(ctx, x.dep.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT completed_at FROM iga_gov_attempt
 		WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ? AND status = 'completed'
 		  AND outcome IN ('ok','recognised_done','not_needed') ORDER BY completed_at DESC LIMIT 1`,
-		x.dep.WorkspaceID, x.dep.ID, opSeq).Scan(&at).Error; err != nil {
+			x.dep.WorkspaceID, x.dep.ID, opSeq).Scan(&at).Error
+	}); err != nil {
 		return err
 	}
 	c := cl
@@ -618,10 +634,12 @@ func (x *execRun) notVisible(ctx context.Context, opSeq int, cl igagov.Classific
 
 /* ------------------------------ completed ops ------------------------------ */
 
-func (x *execRun) loadCompleted() (map[int]bool, error) {
+func (x *execRun) loadCompleted(ctx context.Context) (map[int]bool, error) {
 	var rows []struct{ CompletedOps json.RawMessage }
-	if err := x.e.db.Raw(`SELECT completed_ops FROM iga_gov_deployment WHERE workspace_id = ? AND id = ?`,
-		x.dep.WorkspaceID, x.dep.ID).Scan(&rows).Error; err != nil {
+	if err := x.e.read(ctx, x.dep.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT completed_ops FROM iga_gov_deployment WHERE workspace_id = ? AND id = ?`,
+			x.dep.WorkspaceID, x.dep.ID).Scan(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	out := map[int]bool{}
@@ -683,9 +701,11 @@ func (x *execRun) recognise(ctx context.Context, k int) error {
 			rec.Reason = "it precedes, in the op order, an op the live read shows done"
 		}
 		var ids []struct{ ID uuid.UUID }
-		if err := x.e.db.Raw(`SELECT id FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
+		if err := x.e.read(ctx, x.dep.WorkspaceID, func(tx *gorm.DB) error {
+			return tx.Raw(`SELECT id FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
 			AND status = 'unknown' AND resolved_as = 'applied' ORDER BY attempt_no DESC LIMIT 1`,
-			x.dep.WorkspaceID, x.dep.ID, j).Scan(&ids).Error; err != nil {
+				x.dep.WorkspaceID, x.dep.ID, j).Scan(&ids).Error
+		}); err != nil {
 			return err
 		}
 		if len(ids) == 1 {
@@ -727,7 +747,7 @@ func (x *execRun) runOp(ctx context.Context, k int) error {
 	doc := ""
 	if req.SendsDocument() {
 		var ok bool
-		if doc, ok, err = x.document(req.DocumentHash); err != nil {
+		if doc, ok, err = x.document(ctx, req.DocumentHash); err != nil {
 			return err
 		} else if !ok {
 			return x.stop(DeployFailed, DeployReasonDocumentMissing, "document "+req.DocumentHash+" is not in iga_gov_document")
@@ -737,9 +757,11 @@ func (x *execRun) runOp(ctx context.Context, k int) error {
 }
 
 // document returns the canonical text of an archived document.
-func (x *execRun) document(hash string) (string, bool, error) {
+func (x *execRun) document(ctx context.Context, hash string) (string, bool, error) {
 	var docs []models.IGAGovDocument
-	if err := x.e.db.Where("workspace_id = ? AND document_hash = ?", x.dep.WorkspaceID, hash).Limit(1).Find(&docs).Error; err != nil {
+	if err := x.e.read(ctx, x.dep.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND document_hash = ?", x.dep.WorkspaceID, hash).Limit(1).Find(&docs).Error
+	}); err != nil {
 		return "", false, err
 	}
 	if len(docs) == 0 {
@@ -850,8 +872,10 @@ func (x *execRun) attempt(ctx context.Context, k int, req awsenforce.Request, do
 	// up this one's budget.
 	var retryable int64
 	since := x.e.now().Add(-x.e.retryWindow())
-	if err := x.e.db.Raw(`SELECT count(*) FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
-		AND outcome = 'retryable' AND completed_at > ?`, x.dep.WorkspaceID, x.dep.ID, k, since).Scan(&retryable).Error; err != nil {
+	if err := x.e.read(ctx, x.dep.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT count(*) FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
+		AND outcome = 'retryable' AND completed_at > ?`, x.dep.WorkspaceID, x.dep.ID, k, since).Scan(&retryable).Error
+	}); err != nil {
 		return err
 	}
 	if int(retryable) >= x.e.maxOpAttempts() {
@@ -1206,7 +1230,7 @@ func (x *execRun) writeLedger(ctx context.Context, live igagov.LiveRead, detail 
 				// A live row for another policy the plan did not name: it is
 				// no longer this control's artifact.
 				if err := tx.Exec(`UPDATE iga_gov_artifact SET state = 'released', last_readback_at = ?, last_readback_hash = ?,
-					last_deployment_id = ?, updated_at = ? WHERE id = ?`, now, rb.StateHash, x.dep.ID, now, row.ID).Error; err != nil {
+					last_deployment_id = ?, updated_at = ? WHERE workspace_id = ? AND id = ?`, now, rb.StateHash, x.dep.ID, now, ws, row.ID).Error; err != nil {
 					return err
 				}
 				rb.Ledger = append(rb.Ledger, DeployLedgerChange{Kind: kind, NativeARN: row.NativeARN, From: row.State, To: ArtifactReleased})
@@ -1225,8 +1249,8 @@ func (x *execRun) writeLedger(ctx context.Context, live igagov.LiveRead, detail 
 					}
 					args = append(args, doc, version, owner)
 				}
-				q += ` WHERE id = ?`
-				args = append(args, row.ID)
+				q += ` WHERE workspace_id = ? AND id = ?`
+				args = append(args, ws, row.ID)
 				if err := tx.Exec(q, args...).Error; err != nil {
 					return err
 				}
@@ -1308,15 +1332,21 @@ type UnknownReading struct {
 // minutes apart after settle_after, checks the enforcement session's
 // CloudTrail events, and then calls IGAGovAttemptLog.ResolveUnknown.
 func (e *IGAGovAWSExecutor) ClassifyUnknown(ctx context.Context, run *PolicyJobRun, dep models.IGAGovDeployment, plan igagov.Plan) (*UnknownReading, error) {
-	att, err := e.attempts.OpenAttempt(e.db, dep.WorkspaceID, dep.ID)
-	if err != nil {
-		return nil, err
+	if dep.WorkspaceID != run.Job.WorkspaceID {
+		return nil, fmt.Errorf("deployment %s is not in the job's workspace", dep.ID)
 	}
-	if att == nil || att.Status != models.GovAttemptUnknown {
-		return nil, fmt.Errorf("%w: deployment %s has no unresolved unknown attempt", ErrAttemptState, dep.ID)
-	}
+	var att *models.IGAGovAttempt
 	var ctl models.IGAGovControl
-	if err := e.db.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
+	if err := e.read(ctx, dep.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		if att, err = e.attempts.OpenAttempt(tx, dep.WorkspaceID, dep.ID); err != nil {
+			return err
+		}
+		if att == nil || att.Status != models.GovAttemptUnknown {
+			return fmt.Errorf("%w: deployment %s has no unresolved unknown attempt", ErrAttemptState, dep.ID)
+		}
+		return tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error
+	}); err != nil {
 		return nil, err
 	}
 	x := &execRun{e: e, run: run, dep: dep, plan: plan, ctl: ctl, role: roleNameOfARN(ctl.RoleARN), out: &DeployOutcome{}}

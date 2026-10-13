@@ -5,6 +5,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // The production health reporter for Slack's "Report a problem" / "It's
@@ -23,7 +25,12 @@ import (
 //     notifyTx); the report is about its canary, so it is recorded on the
 //     newest deployment of the rollout's canary target (DECISION).
 
-type govDeploymentsHealthReporter struct{ db *gorm.DB }
+type govDeploymentsHealthReporter struct {
+	db *gorm.DB
+	// deployments builds the deployment service over the reporter's database
+	// (it opens its own transactions under row-level security).
+	deployments func() *GovDeployments
+}
 
 // InstallGovHealthReporter installs the production reporter over db for the
 // process (InstallGovPolicyRuntime, at startup); it returns a restore func.
@@ -33,14 +40,23 @@ func InstallGovHealthReporter(db *gorm.DB) (restore func()) {
 
 // NewGovHealthReporter is the production GovHealthReporter over db.
 func NewGovHealthReporter(db *gorm.DB) GovHealthReporter {
-	return &govDeploymentsHealthReporter{db: db}
+	return &govDeploymentsHealthReporter{db: db, deployments: func() *GovDeployments { return NewGovDeployments(db, nil) }}
 }
 
 // resolve is the deployment the report is about, the request GovDeployments
 // takes, and whether the actor holds governance:author (the same permission
 // lookup the console route makes).
+// Every read runs under row-level security for the notice's workspace.
 func (h *govDeploymentsHealthReporter) resolve(ctx context.Context, r GovHealthReport) (dep uuid.UUID, req GovHealthReportRequest, author bool, err error) {
-	db := h.db.WithContext(ctx)
+	err = tenancy.InWorkspaceRead(ctx, h.db, r.WorkspaceID, func(tx *gorm.DB) error {
+		var e error
+		dep, req, author, e = h.resolveTx(tx, r)
+		return e
+	})
+	return
+}
+
+func (h *govDeploymentsHealthReporter) resolveTx(db *gorm.DB, r GovHealthReport) (dep uuid.UUID, req GovHealthReportRequest, author bool, err error) {
 	dep = r.SubjectID
 	switch r.SubjectKind {
 	case GovNoticeDeployment:
@@ -82,7 +98,7 @@ func (h *govDeploymentsHealthReporter) AuthorizeHealthReport(ctx context.Context
 	if err != nil {
 		return err
 	}
-	_, err = NewGovDeployments(h.db, nil).AuthorizeHealthReport(ctx, r.WorkspaceID, r.ActorID, dep, req, author)
+	_, err = h.deployments().AuthorizeHealthReport(ctx, r.WorkspaceID, r.ActorID, dep, req, author)
 	return err
 }
 
@@ -91,5 +107,5 @@ func (h *govDeploymentsHealthReporter) ReportHealth(ctx context.Context, r GovHe
 	if err != nil {
 		return nil, err
 	}
-	return NewGovDeployments(h.db, nil).CreateHealthReport(ctx, r.WorkspaceID, r.ActorID, dep, req, author)
+	return h.deployments().CreateHealthReport(ctx, r.WorkspaceID, r.ActorID, dep, req, author)
 }
