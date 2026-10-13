@@ -22,6 +22,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -1408,5 +1409,80 @@ func TestP3T315RemoveControlStarter(t *testing.T) {
 	}
 	if n := l.count(`SELECT count(*) FROM iga_gov_rollout WHERE workspace_id = ? AND version_id = ?`, l.ws, v2); n != 0 {
 		t.Fatal("a remove_control version got a rollout row")
+	}
+}
+
+// AS-108: the rollout runs under row-level security for the caller's
+// workspace. Workspace B naming A's policy (or A's rollout id) on every
+// rollout route is 404 and changes nothing; an observe_tick job of B naming
+// A's rollout finds no rollout and leaves A's untouched.
+func TestP3T315CrossWorkspaceRolloutIsolation(t *testing.T) {
+	l := newP3rLab(t, "p3-t315-xws", true)
+	const rid = "AROAXWSROLE0001"
+	l.role("XwsRole", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	policy := l.prepare(rid)
+	l.observed(policy)
+	l.toCanary(policy, 1)
+	wsB := newWorkspace(t, l.db, "p3-t315-xws-b")
+	enfPurgeOnCleanup(t, l.db, wsB)
+	actorB := uuid.New()
+	ctx := context.Background()
+	pid := uuid.MustParse(policy)
+
+	type snap struct {
+		Stage       string
+		UpdatedAt   time.Time
+		GateResults string
+		ID          uuid.UUID
+	}
+	read := func() (snap, int64, int64) {
+		t.Helper()
+		var s snap
+		if err := l.db.Raw(`SELECT id, stage, updated_at, gate_results::text AS gate_results FROM iga_gov_rollout WHERE workspace_id = ?`, l.ws).
+			Scan(&s).Error; err != nil {
+			t.Fatal(err)
+		}
+		return s, l.count(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`, l.ws),
+			l.count(`SELECT count(*) FROM iga_gov_deployment WHERE workspace_id = ?`, l.ws)
+	}
+	before, evA, depA := read()
+	if before.ID == uuid.Nil || before.Stage != models.GovRolloutCanary {
+		t.Fatalf("A's rollout = %+v", before)
+	}
+	want404 := func(what string, err error) {
+		t.Helper()
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != http.StatusNotFound {
+			t.Fatalf("%s from workspace B: %v, want 404", what, err)
+		}
+	}
+	for _, id := range []uuid.UUID{pid, before.ID} {
+		_, err := l.ro.Get(ctx, wsB, id, nil)
+		want404("get", err)
+		_, err = l.ro.Start(ctx, wsB, actorB, id, services.GovRolloutStartInput{Reason: "x"})
+		want404("start", err)
+		_, err = l.ro.Pause(ctx, wsB, actorB, id, "freeze")
+		want404("pause", err)
+		_, err = l.ro.Resume(ctx, wsB, actorB, id, "go")
+		want404("resume", err)
+		_, err = l.ro.Expand(ctx, wsB, actorB, id, services.GovRolloutExpandInput{Reason: "go"})
+		want404("expand", err)
+	}
+	// B's job naming A's rollout.
+	err := l.ro.ObserveTickHandler(ctx, services.NewPolicyJobRun(l.db, models.IGAGovJob{ID: uuid.New(), WorkspaceID: wsB,
+		Kind: "observe_tick", SubjectID: &before.ID}, "p3r-xws"))
+	if err == nil || !strings.Contains(err.Error(), "no longer exists") {
+		t.Fatalf("B's observe_tick on A's rollout: %v, want abandoned (not found)", err)
+	}
+	after, evA2, depA2 := read()
+	if after != before || evA2 != evA || depA2 != depA {
+		t.Fatalf("A changed: %+v -> %+v, events %d -> %d, deployments %d -> %d", before, after, evA, evA2, depA, depA2)
+	}
+	for _, q := range []string{`SELECT count(*) FROM iga_gov_rollout WHERE workspace_id = ?`, `SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`,
+		`SELECT count(*) FROM iga_gov_deployment WHERE workspace_id = ?`} {
+		if n := l.count(q, wsB); n != 0 {
+			t.Fatalf("%s for B = %d", q, n)
+		}
 	}
 }

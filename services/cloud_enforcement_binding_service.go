@@ -24,6 +24,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/awsenforce"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -127,14 +128,21 @@ type EnforcementActor struct {
 
 // EnforcementBindingService owns the binding: sessions, the callback, the
 // manual bind, the self-test and revoke.
+//
+// Every statement runs in a transaction under row-level security for the
+// workspace it acts for (read / write below): the workspace of the request,
+// of the job, or -- for a CloudFormation callback -- of the binding the
+// account and HMAC-signed ExternalId identified. Only the account-level
+// facts that must span workspaces (another workspace's bound role for the
+// account, the callback's lookup by account) read the base handle, each
+// marked TENANT-EXEMPT.
 type EnforcementBindingService struct {
-	db         *gorm.DB
-	vault      vault.VaultClient
-	connectors repositories.CloudConnectorRepository
-	events     repositories.IGAGovEventRepository
-	assumer    awsenforce.Assumer
-	cfg        awsdiscovery.CallbackConfig
-	principal  string
+	db        *gorm.DB
+	vault     vault.VaultClient
+	events    repositories.IGAGovEventRepository
+	assumer   awsenforce.Assumer
+	cfg       awsdiscovery.CallbackConfig
+	principal string
 
 	http  *http.Client
 	now   func() time.Time
@@ -151,14 +159,13 @@ type EnforcementBindingService struct {
 func NewEnforcementBindingService(db *gorm.DB, vc vault.VaultClient, cfg awsdiscovery.CallbackConfig, principal string) *EnforcementBindingService {
 	s := &EnforcementBindingService{
 		db: db, vault: vc,
-		connectors: repositories.NewCloudConnectorRepository(db),
-		events:     repositories.NewIGAGovEventRepository(db),
-		assumer:    awsenforce.LiveAssumer{},
-		cfg:        cfg,
-		principal:  strings.TrimSpace(principal),
-		http:       awsdiscovery.NewCFNResponseClient(),
-		now:        time.Now,
-		sleep:      sleepCtx,
+		events:    repositories.NewIGAGovEventRepository(db),
+		assumer:   awsenforce.LiveAssumer{},
+		cfg:       cfg,
+		principal: strings.TrimSpace(principal),
+		http:      awsdiscovery.NewCFNResponseClient(),
+		now:       time.Now,
+		sleep:     sleepCtx,
 	}
 	s.templateCheck = newTemplateChecker(func() time.Time { return s.now() })
 	return s
@@ -440,10 +447,25 @@ func viewOf(c *models.CloudConnector, b *models.CloudEnforcementBinding) Enforce
 
 /* ------------------------------ row helpers ------------------------------- */
 
+// read runs fn in a read-only transaction under row-level security for ws.
+func (s *EnforcementBindingService) read(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, s.db, ws, fn)
+}
+
+// write runs fn in a transaction under row-level security for ws.
+func (s *EnforcementBindingService) write(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, fn)
+}
+
+// connectorTx reads a connector of ws in tx (any provider).
+func connectorTx(tx *gorm.DB, ws, id uuid.UUID) (*models.CloudConnector, error) {
+	return repositories.NewCloudConnectorRepository(tx).Get(ws, id)
+}
+
 // awsConnector reads a connector of this workspace that is an AWS connector;
 // anything else (another workspace's, a GCP one, none) is 404.
-func (s *EnforcementBindingService) awsConnector(ws, id uuid.UUID) (*models.CloudConnector, error) {
-	c, err := s.connectors.Get(ws, id)
+func awsConnector(tx *gorm.DB, ws, id uuid.UUID) (*models.CloudConnector, error) {
+	c, err := connectorTx(tx, ws, id)
 	if errors.Is(err, repositories.ErrCloudConnectorNotFound) || (err == nil && c.Provider != models.CloudProviderAWS) {
 		return nil, enfErr(http.StatusNotFound, EnfCodeNotFound, "Connector not found.", nil)
 	}
@@ -469,13 +491,21 @@ func (s *EnforcementBindingService) liveBinding(db *gorm.DB, ws, connectorID uui
 }
 
 // lockAccount serialises binding changes for one AWS account across
-// workspaces, so the "bound elsewhere" check and the bind are atomic.
+// workspaces, so the "bound elsewhere" check and the bind are atomic: every
+// write of a role to a binding (bind) holds it until its transaction
+// commits, so a boundElsewhere read taken after it sees every bind of the
+// account that could race this one.
 func lockAccount(tx *gorm.DB, accountID string) error {
+	// TENANT-EXEMPT: an advisory lock keyed by the AWS account, which several workspaces may connect (A17); it reads no table.
 	return tx.Exec(`SELECT pg_advisory_xact_lock(hashtext(?))`, "cloud_enforcement_binding:"+accountID).Error
 }
 
 // boundElsewhere reports whether the account is bound (a live binding with a
-// role) to a workspace other than ws.
+// role) to a workspace other than ws. db is the base handle: the question is
+// about OTHER workspaces' rows, which row-level security for ws hides, so it
+// is asked outside the caller's workspace transaction (after lockAccount
+// when it decides a bind). It reads a count only and never names the other
+// workspace.
 //
 // DECISION (T3.09, A17): two workspaces may connect the same AWS account for
 // discovery, but only one may hold an enforcement binding for it: two
@@ -484,6 +514,7 @@ func lockAccount(tx *gorm.DB, accountID string) error {
 // §7.12's artifact_owned_elsewhere (409) and never names the other workspace.
 func boundElsewhere(db *gorm.DB, ws uuid.UUID, accountID string) (bool, error) {
 	var n int64
+	// TENANT-EXEMPT: account-level uniqueness across workspaces (A17): one enforcement binding per AWS account.
 	err := db.Model(&models.CloudEnforcementBinding{}).
 		Where("account_id = ? AND workspace_id <> ? AND state <> ? AND role_arn <> ''", accountID, ws, models.EnforcementBindingRevoked).
 		Count(&n).Error
@@ -557,7 +588,12 @@ type EnforcementSession struct {
 func (s *EnforcementBindingService) StartSession(
 	ctx context.Context, ws, connectorID, userID uuid.UUID, deploymentRegion string,
 ) (*EnforcementSession, error) {
-	c, err := s.awsConnector(ws, connectorID)
+	var c *models.CloudConnector
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		c, err = awsConnector(tx, ws, connectorID)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +604,8 @@ func (s *EnforcementBindingService) StartSession(
 		return nil, enfErr(http.StatusServiceUnavailable, EnfCodeNotConfigured,
 			"This AuthSec deployment has no AWS principal configured for customer roles to trust.", nil)
 	}
-	if other, err := boundElsewhere(s.db, ws, c.ScopeID); err != nil {
+	// TENANT-EXEMPT: account-level uniqueness across workspaces (boundElsewhere).
+	if other, err := boundElsewhere(s.db.WithContext(ctx), ws, c.ScopeID); err != nil {
 		return nil, err
 	} else if other {
 		return nil, ownedElsewhereErr()
@@ -579,11 +616,12 @@ func (s *EnforcementBindingService) StartSession(
 	}
 
 	var b models.CloudEnforcementBinding
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := lockAccount(tx, c.ScopeID); err != nil {
 			return err
 		}
-		if other, err := boundElsewhere(tx, ws, c.ScopeID); err != nil {
+		// TENANT-EXEMPT: account-level uniqueness across workspaces, read under the account lock.
+		if other, err := boundElsewhere(s.db.WithContext(ctx), ws, c.ScopeID); err != nil {
 			return err
 		} else if other {
 			return ownedElsewhereErr()
@@ -684,12 +722,16 @@ func (s *EnforcementBindingService) attachQuickCreate(ctx context.Context, sess 
 // GetSession polls a session (a binding of this connector, any state). The
 // ExternalId is returned only to the user who consented.
 func (s *EnforcementBindingService) GetSession(ws, connectorID, sid, userID uuid.UUID) (*EnforcementSession, error) {
-	c, err := s.awsConnector(ws, connectorID)
-	if err != nil {
-		return nil, err
-	}
+	var c *models.CloudConnector
 	var rows []models.CloudEnforcementBinding
-	if err := s.db.Where("workspace_id = ? AND connector_id = ? AND id = ?", ws, connectorID, sid).Limit(1).Find(&rows).Error; err != nil {
+	err := s.read(context.Background(), ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
+		return tx.Where("workspace_id = ? AND connector_id = ? AND id = ?", ws, connectorID, sid).Limit(1).Find(&rows).Error
+	})
+	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -712,11 +754,16 @@ func (s *EnforcementBindingService) GetSession(ws, connectorID, sid, userID uuid
 
 // Get returns the connector's binding (or state "off").
 func (s *EnforcementBindingService) Get(ws, connectorID uuid.UUID) (*EnforcementBindingView, error) {
-	c, err := s.awsConnector(ws, connectorID)
-	if err != nil {
-		return nil, err
-	}
-	b, err := s.liveBinding(s.db, ws, connectorID, false)
+	var c *models.CloudConnector
+	var b *models.CloudEnforcementBinding
+	err := s.read(context.Background(), ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
+		b, err = s.liveBinding(tx, ws, connectorID, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +776,12 @@ func (s *EnforcementBindingService) Get(ws, connectorID uuid.UUID) (*Enforcement
 // capabilities) or binding_not_verified. For the deployment path (T3.10,
 // T3.15), which runs EnsureFresh first.
 func (s *EnforcementBindingService) RequireVerified(ws, connectorID uuid.UUID) error {
-	b, err := s.liveBinding(s.db, ws, connectorID, false)
+	var b *models.CloudEnforcementBinding
+	err := s.read(context.Background(), ws, func(tx *gorm.DB) error {
+		var err error
+		b, err = s.liveBinding(tx, ws, connectorID, false)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -761,11 +813,16 @@ func (s *EnforcementBindingService) AssumeForDeployment(ctx context.Context, ws,
 	if err := s.RequireVerified(ws, connectorID); err != nil {
 		return nil, err
 	}
-	c, err := s.awsConnector(ws, connectorID)
-	if err != nil {
-		return nil, err
-	}
-	b, err := s.liveBinding(s.db, ws, connectorID, false)
+	var c *models.CloudConnector
+	var b *models.CloudEnforcementBinding
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
+		b, err = s.liveBinding(tx, ws, connectorID, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -795,17 +852,19 @@ func (s *EnforcementBindingService) AssumeForDeployment(ctx context.Context, ws,
 // claimUnbound moves an unbound row to `verifying` for ONE worker. allowError
 // lets the manual path retry a failed attempt; a callback may not (its link
 // was answered FAILED already).
-func (s *EnforcementBindingService) claimUnbound(ws, id uuid.UUID, allowError bool) (*models.CloudEnforcementBinding, error) {
+func (s *EnforcementBindingService) claimUnbound(ctx context.Context, ws, id uuid.UUID, allowError bool) (*models.CloudEnforcementBinding, error) {
 	states := []string{models.EnforcementBindingPending}
 	if allowError {
 		states = append(states, models.EnforcementBindingError)
 	}
 	var rows []models.CloudEnforcementBinding
-	err := s.db.Raw(`UPDATE cloud_enforcement_binding
-		   SET state = 'verifying', updated_at = now()
-		 WHERE workspace_id = ? AND id = ? AND role_arn = ''
-		   AND (state IN ? OR (state = 'verifying' AND updated_at < ?))
-		RETURNING *`, ws, id, states, s.now().Add(-enfClaimStale)).Scan(&rows).Error
+	err := s.write(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`UPDATE cloud_enforcement_binding
+			   SET state = 'verifying', updated_at = now()
+			 WHERE workspace_id = ? AND id = ? AND role_arn = ''
+			   AND (state IN ? OR (state = 'verifying' AND updated_at < ?))
+			RETURNING *`, ws, id, states, s.now().Add(-enfClaimStale)).Scan(&rows).Error
+	})
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
@@ -815,15 +874,18 @@ func (s *EnforcementBindingService) claimUnbound(ws, id uuid.UUID, allowError bo
 // releaseClaim returns a claimed row to pending (a transient failure: the
 // callback will be redelivered).
 func (s *EnforcementBindingService) releaseClaim(b *models.CloudEnforcementBinding) {
-	if err := s.db.Exec(`UPDATE cloud_enforcement_binding SET state = 'pending', updated_at = now()
-		 WHERE workspace_id = ? AND id = ? AND state = 'verifying' AND role_arn = ''`, b.WorkspaceID, b.ID).Error; err != nil {
-		log.Printf("[aws-enf] binding %s: releasing the claim failed: %v", b.ID, err)
+	err := s.write(context.Background(), b.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Exec(`UPDATE cloud_enforcement_binding SET state = 'pending', updated_at = now()
+			 WHERE workspace_id = ? AND id = ? AND state = 'verifying' AND role_arn = ''`, b.WorkspaceID, b.ID).Error
+	})
+	if err != nil {
+		log.Printf("[aws-enf] workspace %s binding %s: releasing the claim failed: %v", b.WorkspaceID, b.ID, err)
 	}
 }
 
 // markUnbound records a failed bind attempt: `error` with nothing bound.
 func (s *EnforcementBindingService) markUnbound(b *models.CloudEnforcementBinding, code, msg string, actor EnforcementActor) {
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	err := s.write(context.Background(), b.WorkspaceID, func(tx *gorm.DB) error {
 		var rows []models.CloudEnforcementBinding
 		if err := tx.Raw(`UPDATE cloud_enforcement_binding
 			   SET state = 'error', role_arn = '', selftest_role_arn = '', last_error = ?, last_error_code = ?, updated_at = now()
@@ -838,7 +900,7 @@ func (s *EnforcementBindingService) markUnbound(b *models.CloudEnforcementBindin
 			bindingPayload(&rows[0], map[string]any{"code": code}))
 	})
 	if err != nil {
-		log.Printf("[aws-enf] binding %s: recording the failed bind failed: %v", b.ID, err)
+		log.Printf("[aws-enf] workspace %s binding %s: recording the failed bind failed: %v", b.WorkspaceID, b.ID, err)
 	}
 }
 
@@ -857,11 +919,12 @@ func (s *EnforcementBindingService) bind(b *models.CloudEnforcementBinding, in b
 		awsenforce.CapAssume: {Status: awsenforce.StatusOK, CheckedAt: assumeAt.UTC()},
 	})
 	var out models.CloudEnforcementBinding
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	err := s.write(context.Background(), b.WorkspaceID, func(tx *gorm.DB) error {
 		if err := lockAccount(tx, b.AccountID); err != nil {
 			return err
 		}
-		if other, err := boundElsewhere(tx, b.WorkspaceID, b.AccountID); err != nil {
+		// TENANT-EXEMPT: account-level uniqueness across workspaces, read under the account lock.
+		if other, err := boundElsewhere(s.db, b.WorkspaceID, b.AccountID); err != nil {
 			return err
 		} else if other {
 			return ownedElsewhereErr()
@@ -901,7 +964,16 @@ func (s *EnforcementBindingService) bind(b *models.CloudEnforcementBinding, in b
 func (s *EnforcementBindingService) BindManual(
 	ctx context.Context, ws, connectorID, userID uuid.UUID, roleARN, selfTestRoleARN, templateVersion string,
 ) (*EnforcementBindingView, error) {
-	c, err := s.awsConnector(ws, connectorID)
+	var c *models.CloudConnector
+	var live *models.CloudEnforcementBinding
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
+		live, err = s.liveBinding(tx, ws, connectorID, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -914,10 +986,6 @@ func (s *EnforcementBindingService) BindManual(
 	if !awsdiscovery.KnownEnforcementTemplateVersion(templateVersion) {
 		return nil, enfErr(http.StatusUnprocessableEntity, EnfCodeValidation, "Unknown enforcement template version.",
 			map[string]any{"field": "template_version", "known": []string{awsdiscovery.EnforcementTemplateVersion}})
-	}
-	live, err := s.liveBinding(s.db, ws, connectorID, false)
-	if err != nil {
-		return nil, err
 	}
 	if live == nil {
 		return nil, enfErr(http.StatusConflict, EnfCodeSessionRequired,
@@ -942,14 +1010,15 @@ func (s *EnforcementBindingService) BindManual(
 		return nil, enfErr(http.StatusUnprocessableEntity, EnfCodeValidation, err.Error(), map[string]any{"field": "selftest_role_arn"})
 	}
 	actor := EnforcementActor{Kind: "user", ID: userID.String()}
-	b, err := s.claimUnbound(ws, live.ID, true)
+	b, err := s.claimUnbound(ctx, ws, live.ID, true)
 	if err != nil {
 		return nil, err
 	}
 	if b == nil {
 		return nil, enfErr(http.StatusConflict, EnfCodeSelfTestInProgress, "This binding is being set up by another request; try again shortly.", nil)
 	}
-	if other, err := boundElsewhere(s.db, ws, b.AccountID); err != nil {
+	// TENANT-EXEMPT: account-level uniqueness across workspaces (checked again under the account lock in bind).
+	if other, err := boundElsewhere(s.db.WithContext(ctx), ws, b.AccountID); err != nil {
 		s.releaseClaim(b)
 		return nil, err
 	} else if other {
@@ -1008,11 +1077,16 @@ func (s *EnforcementBindingService) stsRegion(c *models.CloudConnector) string {
 
 // Verify runs the self-test now (§7.9 POST .../verify).
 func (s *EnforcementBindingService) Verify(ctx context.Context, ws, connectorID uuid.UUID, actor EnforcementActor) (*EnforcementBindingView, error) {
-	c, err := s.awsConnector(ws, connectorID)
-	if err != nil {
-		return nil, err
-	}
-	live, err := s.liveBinding(s.db, ws, connectorID, false)
+	var c *models.CloudConnector
+	var live *models.CloudEnforcementBinding
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
+		live, err = s.liveBinding(tx, ws, connectorID, false)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1031,20 +1105,24 @@ func (s *EnforcementBindingService) Verify(ctx context.Context, ws, connectorID 
 // per-capability result. For the verify_binding job (every 24 h, T3.08) and
 // before a deployment batch (EnsureFresh).
 func (s *EnforcementBindingService) VerifyBinding(ctx context.Context, ws, bindingID uuid.UUID, actor EnforcementActor) (*models.CloudEnforcementBinding, error) {
-	var rows []models.CloudEnforcementBinding
-	err := s.db.Raw(`UPDATE cloud_enforcement_binding
-		   SET state = 'verifying', updated_at = now()
-		 WHERE workspace_id = ? AND id = ? AND role_arn <> ''
-		   AND (state IN ('verified','partial','error') OR (state = 'verifying' AND updated_at < ?))
-		RETURNING *`, ws, bindingID, s.now().Add(-enfSelfTestStale)).Scan(&rows).Error
+	var rows, cur []models.CloudEnforcementBinding
+	err := s.write(ctx, ws, func(tx *gorm.DB) error {
+		if err := tx.Raw(`UPDATE cloud_enforcement_binding
+			   SET state = 'verifying', updated_at = now()
+			 WHERE workspace_id = ? AND id = ? AND role_arn <> ''
+			   AND (state IN ('verified','partial','error') OR (state = 'verifying' AND updated_at < ?))
+			RETURNING *`, ws, bindingID, s.now().Add(-enfSelfTestStale)).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) > 0 {
+			return nil
+		}
+		return tx.Where("workspace_id = ? AND id = ?", ws, bindingID).Limit(1).Find(&cur).Error
+	})
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
-		var cur []models.CloudEnforcementBinding
-		if err := s.db.Where("workspace_id = ? AND id = ?", ws, bindingID).Limit(1).Find(&cur).Error; err != nil {
-			return nil, err
-		}
 		switch {
 		case len(cur) == 0 || cur[0].State == models.EnforcementBindingRevoked:
 			return nil, enfErr(http.StatusNotFound, EnfCodeNotFound, "Binding not found.", nil)
@@ -1054,8 +1132,12 @@ func (s *EnforcementBindingService) VerifyBinding(ctx context.Context, ws, bindi
 			return nil, enfErr(http.StatusConflict, EnfCodeSelfTestInProgress, "A self-test is already running for this binding.", nil)
 		}
 	}
-	c, err := s.connectors.Get(ws, rows[0].ConnectorID)
-	if err != nil {
+	var c *models.CloudConnector
+	if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		c, err = connectorTx(tx, ws, rows[0].ConnectorID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	return s.runAndRecord(ctx, c, &rows[0], actor)
@@ -1066,7 +1148,9 @@ func (s *EnforcementBindingService) VerifyBinding(ctx context.Context, ws, bindi
 // hour is reused"), and re-runs the self-test otherwise.
 func (s *EnforcementBindingService) EnsureFresh(ctx context.Context, ws, bindingID uuid.UUID, maxAge time.Duration) (*models.CloudEnforcementBinding, error) {
 	var rows []models.CloudEnforcementBinding
-	if err := s.db.Where("workspace_id = ? AND id = ?", ws, bindingID).Limit(1).Find(&rows).Error; err != nil {
+	if err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND id = ?", ws, bindingID).Limit(1).Find(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 || rows[0].State == models.EnforcementBindingRevoked {
@@ -1136,7 +1220,7 @@ func (s *EnforcementBindingService) recordReport(b *models.CloudEnforcementBindi
 		}
 	}
 	var out models.CloudEnforcementBinding
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(context.Background(), b.WorkspaceID, func(tx *gorm.DB) error {
 		var rows []models.CloudEnforcementBinding
 		if err := tx.Raw(`UPDATE cloud_enforcement_binding
 			   SET state = ?, capabilities = ?::jsonb, last_error = ?, last_error_code = ?,
@@ -1158,7 +1242,8 @@ func (s *EnforcementBindingService) recordReport(b *models.CloudEnforcementBindi
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[aws-enf] stage=self_test binding=%s state=%s failing=%q leaked=%s", b.ID, out.State, failing, rep.LeakedPolicyARN)
+	log.Printf("[aws-enf] stage=self_test workspace=%s binding=%s state=%s failing=%q leaked=%s",
+		b.WorkspaceID, b.ID, out.State, failing, rep.LeakedPolicyARN)
 	return &out, nil
 }
 
@@ -1186,13 +1271,14 @@ type EnforcementRevokeResult struct {
 // customer knows what remains. Nothing in AWS is changed: the stack is the
 // customer's to delete.
 func (s *EnforcementBindingService) Revoke(ctx context.Context, ws, connectorID, userID uuid.UUID, reason string) (*EnforcementRevokeResult, error) {
-	c, err := s.awsConnector(ws, connectorID)
-	if err != nil {
-		return nil, err
-	}
+	var c *models.CloudConnector
 	var revoked models.CloudEnforcementBinding
 	var artifacts []EnforcementArtifact
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err := s.write(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		if c, err = awsConnector(tx, ws, connectorID); err != nil {
+			return err
+		}
 		live, err := s.liveBinding(tx, ws, connectorID, true)
 		if err != nil {
 			return err
@@ -1399,7 +1485,10 @@ func (s *EnforcementBindingService) handleCreate(
 	if err := expectedSelfTestRole(b, props.SelfTestRoleArn); err != nil {
 		return fail(AWSOnbCodeInvalidRequest, err.Error())
 	}
-	claimed, err := s.claimUnbound(b.WorkspaceID, b.ID, false)
+	// From here on the workspace is the binding's, proven by the ExternalId
+	// (its HMAC names the workspace; Vault holds it for this binding): every
+	// write runs under row-level security for b.WorkspaceID.
+	claimed, err := s.claimUnbound(ctx, b.WorkspaceID, b.ID, false)
 	if err != nil {
 		return transient("claim: " + err.Error())
 	}
@@ -1413,7 +1502,8 @@ func (s *EnforcementBindingService) handleCreate(
 	actor := EnforcementActor{Kind: "aws", ID: req.StackID}
 
 	// 3. Not bound by another workspace (checked again inside bind).
-	if other, err := boundElsewhere(s.db, b.WorkspaceID, b.AccountID); err != nil {
+	// TENANT-EXEMPT: account-level uniqueness across workspaces (boundElsewhere).
+	if other, err := boundElsewhere(s.db.WithContext(ctx), b.WorkspaceID, b.AccountID); err != nil {
 		s.releaseClaim(b)
 		return transient("cross-workspace check: " + err.Error())
 	} else if other {
@@ -1447,9 +1537,14 @@ func (s *EnforcementBindingService) handleCreate(
 	// 6. Answer, then self-test: the stack is never held for the probes.
 	lg.stage = "respond"
 	out := answer(awsdiscovery.CFNStatusSuccess, "", "bound")
-	if c, err := s.connectors.Get(bound.WorkspaceID, bound.ConnectorID); err == nil {
+	var c *models.CloudConnector
+	if err := s.read(ctx, bound.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		c, err = connectorTx(tx, bound.WorkspaceID, bound.ConnectorID)
+		return err
+	}); err == nil {
 		if _, err := s.runAndRecord(ctx, c, bound, EnforcementActor{Kind: "system", ID: "binding_created"}); err != nil {
-			log.Printf("[aws-enf] binding %s: recording the first self-test failed: %v", bound.ID, err)
+			log.Printf("[aws-enf] workspace %s binding %s: recording the first self-test failed: %v", bound.WorkspaceID, bound.ID, err)
 		}
 	}
 	return out
@@ -1458,9 +1553,14 @@ func (s *EnforcementBindingService) handleCreate(
 // findByExternalID finds the live binding an enforcement callback belongs to:
 // the account from the StackId, then the ExternalId -- first its workspace
 // signature (cheap, no Vault call), then an exact constant-time comparison
-// with what Vault holds for that binding.
+// with what Vault holds for that binding. The callback carries no workspace
+// (it arrives from AWS), so the account's bindings are read across
+// workspaces; only the one whose workspace the ExternalId's HMAC names AND
+// whose Vault value it equals is returned, and the caller acts on it under
+// row-level security for that workspace alone.
 func (s *EnforcementBindingService) findByExternalID(accountID, externalID string) (*models.CloudEnforcementBinding, error) {
 	var rows []models.CloudEnforcementBinding
+	// TENANT-EXEMPT: a CloudFormation callback finds its workspace from the account + HMAC-signed ExternalId (verified below).
 	if err := s.db.Where("account_id = ? AND state <> ?", accountID, models.EnforcementBindingRevoked).
 		Order("created_at").Find(&rows).Error; err != nil {
 		return nil, err

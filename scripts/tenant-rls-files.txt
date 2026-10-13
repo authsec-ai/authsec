@@ -6,6 +6,10 @@ repository/cloud_resource_policy_repository.go
 repository/cloud_workload_repository.go
 repository/iga_gov_evaluation_repository.go
 repository/iga_gov_finding_rule_repository.go
+services/cloud_aws_iac_access.go
+services/cloud_enforcement_binding_jobs.go
+services/cloud_enforcement_binding_service.go
+services/cloud_enforcement_deploy_gate.go
 services/governance_notification_bridge.go
 services/iga_gov_approval_service.go
 services/iga_gov_attempt_log.go
@@ -31,6 +35,10 @@ services/iga_gov_ownership_service.go
 services/iga_gov_prune_evidence.go
 services/iga_gov_readiness.go
 services/iga_gov_reads.go
+services/iga_gov_rollout_canary.go
+services/iga_gov_rollout_jobs.go
+services/iga_gov_rollout_service.go
+services/iga_gov_rollout_wiring.go
 services/iga_gov_settings_service.go
 services/iga_gov_snapshot.go
 services/iga_gov_targets.go

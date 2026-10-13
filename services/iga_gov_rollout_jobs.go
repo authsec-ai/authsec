@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -63,6 +64,7 @@ func dueRolloutTicks(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedul
 		WorkspaceID uuid.UUID
 		ID          uuid.UUID
 	}
+	// TENANT-EXEMPT: the observe_tick_periodic schedule's due scan spans workspaces; each rollout becomes a job of its own workspace.
 	if err := db.Raw(`SELECT workspace_id, id FROM iga_gov_rollout WHERE stage IN ('canary','expand','paused')`).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -72,6 +74,12 @@ func dueRolloutTicks(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedul
 		out = append(out, ScheduledPolicyJob{WorkspaceID: r.WorkspaceID, SubjectID: &id, DedupeKey: "rollout:" + id.String() + ":periodic"})
 	}
 	return out, nil
+}
+
+// jobRead runs fn in a read-only transaction under row-level security for
+// the job's workspace (the reads a handler makes outside its fenced InTx).
+func jobRead(ctx context.Context, run *PolicyJobRun, fn func(db *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, run.DB(), run.Job.WorkspaceID, fn)
 }
 
 // RegisterRolloutJobs installs observe_tick and refresh_activity on w and
@@ -94,19 +102,23 @@ func (r *GovRollout) ObserveTickHandler(ctx context.Context, run *PolicyJobRun) 
 		return PolicyJobAbandon("observe_tick without a rollout")
 	}
 	ws := job.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	var ros []models.IGAGovRollout
-	if err := db.Where("workspace_id = ? AND id = ?", ws, *job.SubjectID).Limit(1).Find(&ros).Error; err != nil {
+	var rc *govRolloutCtx
+	err := jobRead(ctx, run, func(db *gorm.DB) error {
+		var ros []models.IGAGovRollout
+		if err := db.Where("workspace_id = ? AND id = ?", ws, *job.SubjectID).Limit(1).Find(&ros).Error; err != nil {
+			return err
+		}
+		if len(ros) == 0 {
+			return PolicyJobAbandon("the rollout no longer exists")
+		}
+		var v models.IGAGovPolicyVersion
+		if err := db.Where("workspace_id = ? AND id = ?", ws, ros[0].VersionID).Take(&v).Error; err != nil {
+			return err
+		}
+		var err error
+		rc, err = r.loadVersionCtx(db, ws, v, false)
 		return err
-	}
-	if len(ros) == 0 {
-		return PolicyJobAbandon("the rollout no longer exists")
-	}
-	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND id = ?", ws, ros[0].VersionID).Take(&v).Error; err != nil {
-		return err
-	}
-	rc, err := r.loadVersionCtx(db, ws, v, false)
+	})
 	if err != nil {
 		return err
 	}
@@ -207,8 +219,12 @@ func (r *GovRollout) tickObserve(ctx context.Context, run *PolicyJobRun, rc *gov
 	if rc.Rollout.ObserveUntil == nil {
 		return PolicyJobAbandon("the rollout has no observe_until")
 	}
-	targets, err := r.observationTargets(run.DB().WithContext(ctx), ws, rc, rev)
-	if err != nil {
+	var targets []igagov.ObservationTarget
+	if err := jobRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		targets, err = r.observationTargets(db, ws, rc, rev)
+		return err
+	}); err != nil {
 		return err
 	}
 	now := r.now().UTC()
@@ -299,7 +315,12 @@ func (r *GovRollout) tickCanary(ctx context.Context, run *PolicyJobRun, rc *govR
 		return nil
 	}
 	depID := g.Canary.DeploymentID
-	pre, err := r.evaluateGates(ctx, run.DB().WithContext(ctx), ws, rc, depID, rev)
+	var pre *gateEval
+	err := jobRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		pre, err = r.evaluateGates(ctx, db, ws, rc, depID, rev)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) && ge.Status == http.StatusNotFound {
@@ -428,8 +449,12 @@ func healthyState(s string) bool {
 // tickPaused marks the rollout undone once every applied deployment of the
 // version has been undone (T3.16's undo after "Undo canary").
 func (r *GovRollout) tickPaused(ctx context.Context, run *PolicyJobRun, rc *govRolloutCtx) error {
-	ds, err := r.versionDeployments(run.DB().WithContext(ctx), rc.Version.WorkspaceID, rc.Version.ID)
-	if err != nil {
+	var ds []models.IGAGovDeployment
+	if err := jobRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		ds, err = r.versionDeployments(db, rc.Version.WorkspaceID, rc.Version.ID)
+		return err
+	}); err != nil {
 		return err
 	}
 	undone, live := 0, 0
@@ -479,7 +504,42 @@ func (r *GovRollout) RefreshActivityHandler(ctx context.Context, run *PolicyJobR
 		return PolicyJobAbandon("refresh_activity dedupe key time: " + err.Error())
 	}
 	ws, conn := job.WorkspaceID, *job.SubjectID
-	db := run.DB().WithContext(ctx)
+	var stale int
+	done := false
+	err = jobRead(ctx, run, func(db *gorm.DB) error {
+		return r.refreshActivityReads(db, ws, conn, after, &stale, &done)
+	})
+	if err != nil {
+		return err
+	}
+	if done {
+		return nil
+	}
+	if r.now().Before(after) {
+		return PolicyJobRetryLater(after.Sub(r.now()), "the required report time has not come")
+	}
+	err = run.InTx(ctx, func(tx *gorm.DB) error {
+		qr, err := repositories.NewCloudScanRunRepository(tx).Enqueue(ws, conn, RolloutScanTrigger)
+		if err != nil {
+			return err
+		}
+		return appendGovEvent(tx, ws, GovEventRolloutRefreshQueued, models.GovActorSystem, "rollout", govEventRefs{}, map[string]any{
+			"connector_id": conn, "scan_run_id": qr.ID, "required_after": after, "targets_waiting": stale})
+	})
+	if errors.Is(err, repositories.ErrScanAlreadyLive) {
+		return PolicyJobRetryLater(RolloutRefreshRecheck, "a scan of the connector is in flight")
+	}
+	if err != nil {
+		return err
+	}
+	return PolicyJobRetryLater(RolloutRefreshRecheck, "waiting for the refresh scan")
+}
+
+// refreshActivityReads is refresh_activity's decision over the evidence and
+// the connector's scans, read in db (the job workspace's transaction). It
+// sets done when nothing waits any more, stale to the targets still waiting,
+// and returns the job's retry or abandon outcome when it has one.
+func (r *GovRollout) refreshActivityReads(db *gorm.DB, ws, conn uuid.UUID, after time.Time, stale *int, done *bool) error {
 	// The identities of the observing rollouts' targets on this connector
 	// that need a report generated at or after `after`.
 	var identities []uuid.UUID
@@ -491,6 +551,7 @@ func (r *GovRollout) RefreshActivityHandler(ctx context.Context, run *PolicyJobR
 		return err
 	}
 	if len(identities) == 0 {
+		*done = true
 		return nil // nothing observing on this connector needs it any more
 	}
 	var fresh []uuid.UUID
@@ -500,8 +561,9 @@ func (r *GovRollout) RefreshActivityHandler(ctx context.Context, run *PolicyJobR
 		ws, identities, after, ws).Scan(&fresh).Error; err != nil {
 		return err
 	}
-	stale := len(identities) - len(fresh)
-	if stale <= 0 {
+	*stale = len(identities) - len(fresh)
+	if *stale <= 0 {
+		*done = true
 		return nil // every target has a fresh report: observe_tick decides
 	}
 	var runs []models.CloudScanRun
@@ -533,24 +595,7 @@ func (r *GovRollout) RefreshActivityHandler(ctx context.Context, run *PolicyJobR
 		return PolicyJobAbandon(fmt.Sprintf("%d refresh scans brought no report generated after %s; observation waits for the next scan",
 			refreshes, after.Format(time.RFC3339)))
 	}
-	if r.now().Before(after) {
-		return PolicyJobRetryLater(after.Sub(r.now()), "the required report time has not come")
-	}
-	err = run.InTx(ctx, func(tx *gorm.DB) error {
-		qr, err := repositories.NewCloudScanRunRepository(tx).Enqueue(ws, conn, RolloutScanTrigger)
-		if err != nil {
-			return err
-		}
-		return appendGovEvent(tx, ws, GovEventRolloutRefreshQueued, models.GovActorSystem, "rollout", govEventRefs{}, map[string]any{
-			"connector_id": conn, "scan_run_id": qr.ID, "required_after": after, "targets_waiting": stale})
-	})
-	if errors.Is(err, repositories.ErrScanAlreadyLive) {
-		return PolicyJobRetryLater(RolloutRefreshRecheck, "a scan of the connector is in flight")
-	}
-	if err != nil {
-		return err
-	}
-	return PolicyJobRetryLater(RolloutRefreshRecheck, "waiting for the refresh scan")
+	return nil
 }
 
 /* -------------------------------- notices --------------------------------- */
