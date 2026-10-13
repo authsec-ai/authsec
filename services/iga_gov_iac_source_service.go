@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/iacpr"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -129,21 +130,27 @@ func cleanDirectory(d string) (string, bool) {
 
 // List is GET .../iac-sources.
 func (s *GovIaCSourceService) List(ctx context.Context, ws, connectorID uuid.UUID) ([]GovIaCSourceView, error) {
-	db := s.db.WithContext(ctx)
-	if err := s.connector(db, ws, connectorID); err != nil {
-		return nil, err
-	}
-	var rows []models.IGAGovIaCSource
-	if err := db.Where("workspace_id = ? AND connector_id = ?", ws, connectorID).Order("created_at, id").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make([]GovIaCSourceView, 0, len(rows))
-	for _, r := range rows {
-		perm, err := s.permissions(db, ws, r.DiscoverySourceID)
-		if err != nil {
-			return nil, err
+	var out []GovIaCSourceView
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		if err := s.connector(db, ws, connectorID); err != nil {
+			return err
 		}
-		out = append(out, GovIaCSourceView{IGAGovIaCSource: r, Permissions: perm})
+		var rows []models.IGAGovIaCSource
+		if err := db.Where("workspace_id = ? AND connector_id = ?", ws, connectorID).Order("created_at, id").Find(&rows).Error; err != nil {
+			return err
+		}
+		out = make([]GovIaCSourceView, 0, len(rows))
+		for _, r := range rows {
+			perm, err := s.permissions(db, ws, r.DiscoverySourceID)
+			if err != nil {
+				return err
+			}
+			out = append(out, GovIaCSourceView{IGAGovIaCSource: r, Permissions: perm})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -221,7 +228,21 @@ func loadIaCIntegration(db *gorm.DB, ws uuid.UUID, integrationID string) (*model
 
 // Create is POST .../iac-sources.
 func (s *GovIaCSourceService) Create(ctx context.Context, ws, connectorID, actor uuid.UUID, in GovIaCSourceInput) (*GovIaCSourceView, error) {
-	db := s.db.WithContext(ctx)
+	var out *GovIaCSourceView
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.create(tx, ws, connectorID, actor, in)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// create is Create in the caller's workspace transaction: the checks, the
+// row, its events and the permission request commit together.
+func (s *GovIaCSourceService) create(db *gorm.DB, ws, connectorID, actor uuid.UUID, in GovIaCSourceInput) (*GovIaCSourceView, error) {
 	if err := s.connector(db, ws, connectorID); err != nil {
 		return nil, err
 	}
@@ -273,7 +294,7 @@ func (s *GovIaCSourceService) Create(ctx context.Context, ws, connectorID, actor
 	row := models.IGAGovIaCSource{ID: uuid.New(), WorkspaceID: ws, ConnectorID: connectorID, Format: in.Format,
 		DiscoverySourceID: dsID, Repository: in.Repository, BaseBranch: in.BaseBranch, Directory: dir, RoleMatch: rmRaw,
 		CreatedBy: actor, CreatedAt: s.now().UTC()}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = db.Transaction(func(tx *gorm.DB) error { // a savepoint inside the workspace transaction
 		if err := tx.Create(&row).Error; err != nil {
 			return err
 		}
@@ -342,11 +363,10 @@ func requestIaCPermissionsTx(tx *gorm.DB, ws uuid.UUID, integrationID string, no
 // Delete is DELETE .../iac-sources/:sid. A source with a PR still being
 // tracked cannot be removed (409 iac_source_in_use).
 func (s *GovIaCSourceService) Delete(ctx context.Context, ws, connectorID, sourceID, actor uuid.UUID) error {
-	db := s.db.WithContext(ctx)
-	if err := s.connector(db, ws, connectorID); err != nil {
-		return err
-	}
-	return db.Transaction(func(tx *gorm.DB) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+		if err := s.connector(tx, ws, connectorID); err != nil {
+			return err
+		}
 		var row models.IGAGovIaCSource
 		err := tx.Where("workspace_id = ? AND connector_id = ? AND id = ?", ws, connectorID, sourceID).Take(&row).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {

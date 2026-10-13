@@ -23,8 +23,6 @@ services/iga_gov_deploy_sweep.go
 services/iga_gov_deploy_verify.go
 services/iga_gov_evaluator.go
 services/iga_gov_health_reporter.go
-services/iga_gov_iac_delivery.go
-services/iga_gov_iac_transitions.go
 services/iga_gov_isolation.go
 services/iga_gov_metrics.go
 services/iga_gov_notify.go
