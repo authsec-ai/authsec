@@ -15,6 +15,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -72,15 +73,55 @@ var cloudReads repositories.CloudEvidenceReads
 var repeatableRead = &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 
 // loadGovSnapshot reads revision rev's snapshot for the whole workspace
-// (roleFilter nil) or one identity.
+// (roleFilter nil) or one identity, in one repeatable-read transaction
+// under row-level security for ws (a savepoint when db is a caller's
+// transaction, which must then be ws's).
 func loadGovSnapshot(ctx context.Context, db *gorm.DB, ws uuid.UUID, rev int64, roleFilter *uuid.UUID) (*govSnapshot, error) {
 	var out *govSnapshot
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := inGovSnapshot(ctx, db, ws, func(tx *gorm.DB) error {
 		var err error
 		out, err = readGovSnapshot(tx, ws, rev, roleFilter)
 		return err
-	}, repeatableRead)
+	})
 	return out, err
+}
+
+// govWorkspaceContext is ctx carrying ws as its tenant. A ctx that already
+// carries ANOTHER workspace (a request's token, a caller's transaction) is
+// refused: a workspace passed in must agree with the authoritative one.
+func govWorkspaceContext(ctx context.Context, ws uuid.UUID) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ws == uuid.Nil {
+		return nil, tenancy.ErrNoTenant
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, fmt.Errorf("tenancy: a context of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), nil
+}
+
+// govAgreeing wraps fn so it refuses to run when ctx (the context the
+// workspace transaction was opened from) carries a workspace other than ws;
+// the transaction is then rolled back.
+func govAgreeing(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) func(tx *gorm.DB) error {
+	return func(tx *gorm.DB) error {
+		if _, err := govWorkspaceContext(ctx, ws); err != nil {
+			return err
+		}
+		return fn(tx)
+	}
+}
+
+// inGovSnapshot runs fn in one repeatable-read, read-only transaction under
+// row-level security for ws: one consistent view across every read.
+func inGovSnapshot(ctx context.Context, db *gorm.DB, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	wctx, err := govWorkspaceContext(ctx, ws)
+	if err != nil {
+		return err
+	}
+	return tenancy.RLSTransaction(wctx, db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) error { return fn(tx) })
 }
 
 func readGovSnapshot(tx *gorm.DB, ws uuid.UUID, rev int64, roleFilter *uuid.UUID) (*govSnapshot, error) {
