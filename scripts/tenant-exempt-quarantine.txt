@@ -1,11 +1,2 @@
 # Files merged from authsec-staging with raw SQL not yet on the scoped layer
 # (AS-108). Remove a file once its statements are scoped; never add one.
-repository/iga_gov_job_repository.go
-scripts/bootstrap-parity/main.go
-services/agent_policy_legacy_compat.go
-services/iga_gov_iac_delivery.go
-services/iga_gov_iac_transitions.go
-services/iga_gov_job_scheduler.go
-services/slack_integration_channel.go
-services/slack_integration_interactions.go
-services/slack_integration_service.go

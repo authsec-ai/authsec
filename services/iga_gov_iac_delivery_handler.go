@@ -23,12 +23,12 @@ import (
 //     or fails it as unexpected_state with the diff.
 //
 // PR polling in awaiting_merge stays in T3.17's iac_sync handler. The GitHub
-// adapter and live reader are the process-wide ones, read per call.
-type govIaCDeliveryHandler struct{ db *gorm.DB }
+// adapter and live reader are the process-wide ones, read per call. The
+// delivery opens its own workspace transactions (row-level security for the
+// deployment's workspace, which must be the job's).
+type govIaCDeliveryHandler struct{ newDelivery func() *GovIaCDelivery }
 
-func (h govIaCDeliveryHandler) delivery() *GovIaCDelivery {
-	return NewGovIaCDelivery(h.db, nil, ProcessGovLiveReader())
-}
+func (h govIaCDeliveryHandler) delivery() *GovIaCDelivery { return h.newDelivery() }
 
 // Start implements GovDeliveryHandler.
 func (h govIaCDeliveryHandler) Start(ctx context.Context, run *PolicyJobRun, dep models.IGAGovDeployment, _ igagov.Plan) error {
@@ -46,7 +46,7 @@ func (h govIaCDeliveryHandler) Verify(ctx context.Context, run *PolicyJobRun, de
 // deploy and verify jobs. InstallGovPolicyRuntime calls it; without it those
 // deployments are blocked as delivery_not_available.
 func InstallGovIaCDeliveryHandlers(db *gorm.DB) {
-	h := govIaCDeliveryHandler{db: db}
+	h := govIaCDeliveryHandler{newDelivery: func() *GovIaCDelivery { return NewGovIaCDelivery(db, nil, ProcessGovLiveReader()) }}
 	RegisterGovDeliveryHandler(igagov.DeliveryIaCPR, h)
 	RegisterGovDeliveryHandler(igagov.DeliveryExport, h)
 }

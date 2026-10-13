@@ -324,6 +324,25 @@ func (m *agentPolicyManager) List(workspaceID uuid.UUID, enabledOnly bool) ([]mo
 	return out, nil
 }
 
+// Pause sets a policy disabled. Every legacy consumer -- the reconcile worker,
+// the warning scheduler, the enforcement plan, the lookahead -- reads enabled
+// policies only, so a paused policy stops acting on its next pass. Nothing it
+// already did is undone, and its recorded actions are kept.
+//
+// Idempotent: a policy already disabled is returned unchanged (updated_at is
+// not bumped). gorm.ErrRecordNotFound for an id that is not this workspace's.
+// (Moved here from agent_policy_legacy_compat.go, its only caller, which
+// builds the manager on its workspace transaction.)
+func (m *agentPolicyManager) Pause(workspaceID, id uuid.UUID) (*models.AgentPolicy, error) {
+	res := m.db.Model(&models.AgentPolicy{}).
+		Where("id = ? AND workspace_id = ? AND enabled", id, workspaceID).
+		Updates(map[string]interface{}{"enabled": false, "updated_at": time.Now()})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	return m.Get(workspaceID, id)
+}
+
 func (m *agentPolicyManager) Delete(workspaceID, id uuid.UUID) error {
 	res := m.db.Where("id = ? AND workspace_id = ?", id, workspaceID).
 		Delete(&models.AgentPolicy{})

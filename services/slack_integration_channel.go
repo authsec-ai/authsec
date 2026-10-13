@@ -16,6 +16,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/slackapp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 )
@@ -56,49 +57,34 @@ func NewSlackNotificationChannel(svc *SlackIntegrationService) *SlackNotificatio
 func (c *SlackNotificationChannel) Channel() string { return GovChannelSlack }
 
 // Reaches implements GovNotificationChannel: Slack is connected and the
-// member has a Slack link.
+// member has a Slack link. The read runs under row-level security for ws on
+// db (a savepoint when db is the caller's transaction).
 func (c *SlackNotificationChannel) Reaches(db *gorm.DB, ws, userID uuid.UUID) (bool, error) {
 	var n int64
-	err := db.Raw(`SELECT count(*) FROM slack_user_link l JOIN workspace_slack_integration i
+	err := tenancy.InWorkspaceRead(db.Statement.Context, db, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT count(*) FROM slack_user_link l JOIN workspace_slack_integration i
 	                 ON i.workspace_id = l.workspace_id AND i.revoked_at IS NULL
 	                WHERE l.workspace_id = ? AND l.user_id = ?`, ws, userID).Scan(&n).Error
+	})
 	return n > 0, err
 }
 
-// Deliver implements GovNotificationChannel.
+// Deliver implements GovNotificationChannel. Everything it reads is read
+// first, under row-level security for the notification's workspace on db;
+// Vault and Slack are called after that transaction ends.
 func (c *SlackNotificationChannel) Deliver(ctx context.Context, db *gorm.DB, n models.IGAGovNotification, user *uuid.UUID, notice *GovNotice) (string, error) {
 	s := c.svc
 	if ok, reason := s.Configured(); !ok {
 		return "", errors.New(reason) // retried: configuration can be fixed
 	}
-	in, err := activeSlackIntegration(db, n.WorkspaceID)
-	if err != nil {
-		return "", err
-	}
-	if in == nil {
-		return "", GovNotifyPermanent(errors.New("Slack is not connected to this workspace"))
-	}
+	var in *models.WorkspaceSlackIntegration
 	var channel string
-	switch {
-	case n.Recipient == SlackRecipientApprovals:
-		if in.ApprovalsChannelID == "" {
-			return "", GovNotifyPermanent(errors.New("no Slack approvals channel is set"))
-		}
-		channel = in.ApprovalsChannelID
-	case user != nil:
-		var links []models.SlackUserLink
-		if err := db.Where("workspace_id = ? AND user_id = ?", n.WorkspaceID, *user).Order("linked_at DESC").Limit(1).Find(&links).Error; err != nil {
-			return "", err
-		}
-		if len(links) == 0 {
-			return "", GovNotifyPermanent(errors.New("the recipient has no linked Slack account"))
-		}
-		channel = links[0].SlackUserID
-	default:
-		return "", GovNotifyPermanent(fmt.Errorf("slack recipient %q is not supported", n.Recipient))
-	}
-	msg, err := c.message(ctx, db, n, user, notice)
-	if err != nil {
+	var msg slackapp.Message
+	if err := tenancy.InWorkspaceRead(ctx, db, n.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		in, channel, msg, err = c.prepare(ctx, tx, n, user, notice)
+		return err
+	}); err != nil {
 		return "", err
 	}
 	token, err := s.botToken(in)
@@ -113,6 +99,43 @@ func (c *SlackNotificationChannel) Deliver(ctx context.Context, db *gorm.DB, n m
 		return "", err
 	}
 	return ts, nil
+}
+
+// prepare reads what Deliver sends: the installation, the destination and
+// the message.
+func (c *SlackNotificationChannel) prepare(ctx context.Context, db *gorm.DB, n models.IGAGovNotification, user *uuid.UUID,
+	notice *GovNotice) (*models.WorkspaceSlackIntegration, string, slackapp.Message, error) {
+	in, err := activeSlackIntegration(db, n.WorkspaceID)
+	if err != nil {
+		return nil, "", slackapp.Message{}, err
+	}
+	if in == nil {
+		return nil, "", slackapp.Message{}, GovNotifyPermanent(errors.New("Slack is not connected to this workspace"))
+	}
+	var channel string
+	switch {
+	case n.Recipient == SlackRecipientApprovals:
+		if in.ApprovalsChannelID == "" {
+			return nil, "", slackapp.Message{}, GovNotifyPermanent(errors.New("no Slack approvals channel is set"))
+		}
+		channel = in.ApprovalsChannelID
+	case user != nil:
+		var links []models.SlackUserLink
+		if err := db.Where("workspace_id = ? AND user_id = ?", n.WorkspaceID, *user).Order("linked_at DESC").Limit(1).Find(&links).Error; err != nil {
+			return nil, "", slackapp.Message{}, err
+		}
+		if len(links) == 0 {
+			return nil, "", slackapp.Message{}, GovNotifyPermanent(errors.New("the recipient has no linked Slack account"))
+		}
+		channel = links[0].SlackUserID
+	default:
+		return nil, "", slackapp.Message{}, GovNotifyPermanent(fmt.Errorf("slack recipient %q is not supported", n.Recipient))
+	}
+	msg, err := c.message(ctx, db, n, user, notice)
+	if err != nil {
+		return nil, "", slackapp.Message{}, err
+	}
+	return in, channel, msg, nil
 }
 
 func (c *SlackNotificationChannel) message(ctx context.Context, db *gorm.DB, n models.IGAGovNotification, user *uuid.UUID, notice *GovNotice) (slackapp.Message, error) {
@@ -288,14 +311,16 @@ func init() {
 
 func renderApprovalRequestNotice(db *gorm.DB, n *models.IGAGovNotification, _ *uuid.UUID) (*GovNotice, error) {
 	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND id = ?", n.WorkspaceID, n.SubjectID).Take(&v).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotifyPermanent(errors.New("the version no longer exists"))
-		}
-		return nil, err
-	}
 	var pol models.IGAGovPolicy
-	if err := db.Where("workspace_id = ? AND id = ?", n.WorkspaceID, v.PolicyID).Take(&pol).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(db.Statement.Context, db, n.WorkspaceID, func(tx *gorm.DB) error {
+		if err := tx.Where("workspace_id = ? AND id = ?", n.WorkspaceID, n.SubjectID).Take(&v).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotifyPermanent(errors.New("the version no longer exists"))
+			}
+			return err
+		}
+		return tx.Where("workspace_id = ? AND id = ?", n.WorkspaceID, v.PolicyID).Take(&pol).Error
+	}); err != nil {
 		return nil, err
 	}
 	link := govConsoleLink("/iga/policy/approvals")
@@ -316,12 +341,15 @@ func EnqueueSlackApprovalRequestTx(tx *gorm.DB, ws, versionID uuid.UUID, resend 
 	if _, ok := govNoticeChannel(GovChannelSlack); !ok {
 		return nil
 	}
-	in, err := activeSlackIntegration(tx, ws)
-	if err != nil || in == nil || in.ApprovalsChannelID == "" {
+	// Under row-level security for ws (a savepoint in the caller's transaction).
+	return tenancy.InWorkspace(tx.Statement.Context, tx, ws, func(tx *gorm.DB) error {
+		in, err := activeSlackIntegration(tx, ws)
+		if err != nil || in == nil || in.ApprovalsChannelID == "" {
+			return err
+		}
+		_, err = EnqueueGovNotificationTx(tx, ws, GovNoticeApprovalRequest, versionID, GovChannelSlack, SlackRecipientApprovals, resend)
 		return err
-	}
-	_, err = EnqueueGovNotificationTx(tx, ws, GovNoticeApprovalRequest, versionID, GovChannelSlack, SlackRecipientApprovals, resend)
-	return err
+	})
 }
 
 // WithSlackApprovalNotices chains the approval-request enqueue onto h's
