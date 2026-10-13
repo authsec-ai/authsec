@@ -57,13 +57,29 @@ type r2Kind struct {
 	Feature  string // enforcement v2 feature
 	Notice   string // iga_gov_notification subject kind
 	EndLabel string
+	// Event names of the lifecycle steps.
+	EvActive, EvEnded, EvFailed, EvUnknown, EvDrifted string
+	// Reapply: an active row whose policy was detached or deleted outside
+	// AuthSec is put back (access policies); otherwise drift is only
+	// reported (DECISION R2-18).
+	Reapply bool
 }
 
 var (
 	r2GrantKind = r2Kind{Name: "temporary_grant", Table: "iga_gov_temp_grant", Job: "temp_grant", TagKey: igagov.TagGrant,
-		IDKey: "grant_id", Feature: EnforcementFeatureGrants, Notice: GovNoticeTemporaryGrant}
+		IDKey: "grant_id", Feature: EnforcementFeatureGrants, Notice: GovNoticeTemporaryGrant,
+		EvActive: GovEventGrantActive, EvEnded: GovEventGrantEnded, EvFailed: GovEventGrantFailed,
+		EvUnknown: GovEventGrantUnknown, EvDrifted: GovEventGrantDrifted}
 	r2RevokeKind = r2Kind{Name: "session_revocation", Table: "iga_gov_session_revocation", Job: "session_revoke",
-		TagKey: "authsec:revocation", IDKey: "revocation_id", Feature: EnforcementFeatureRevoke, Notice: GovNoticeSessionRevocation}
+		TagKey: "authsec:revocation", IDKey: "revocation_id", Feature: EnforcementFeatureRevoke, Notice: GovNoticeSessionRevocation,
+		EvActive: GovEventRevocationActive, EvEnded: GovEventRevocationEnded, EvFailed: GovEventRevocationFailed,
+		EvUnknown: GovEventRevocationUnk, EvDrifted: GovEventRevocationDrift}
+	// An access policy's deployment: a temp_grant row with a policy_id, run by
+	// the same temp_grant job (iga_gov_access_policy.go).
+	r2AccessKind = r2Kind{Name: "access_policy", Table: "iga_gov_temp_grant", Job: "temp_grant", TagKey: igagov.TagAccessDeployment,
+		IDKey: "deployment_id", Feature: EnforcementFeatureGrants, Notice: GovNoticeTemporaryGrant,
+		EvActive: GovEventAccessConfirmed, EvEnded: GovEventAccessRemoved, EvFailed: GovEventAccessFailed,
+		EvUnknown: GovEventAccessUnknown, EvDrifted: GovEventAccessDrifted, Reapply: true}
 )
 
 // R2 notice subjects (061 widened iga_gov_notification.subject_kind).
@@ -88,6 +104,8 @@ type r2Row struct {
 	Due          time.Time // expires_at / remove_after
 	PendingOp    string
 	SettleAfter  *time.Time
+	// Extra tags on the policy (an access policy's policy and version).
+	Extra map[string]string
 }
 
 // r2Outcome is what one converge run established.
@@ -138,8 +156,15 @@ type r2Live struct {
 }
 
 func (r r2Row) tags() map[string]string {
-	return map[string]string{igagov.TagManagedBy: igagov.TagManagedByValue, igagov.TagWorkspace: GovWorkspaceRef(r.WorkspaceID),
+	t := map[string]string{igagov.TagManagedBy: igagov.TagManagedByValue, igagov.TagWorkspace: GovWorkspaceRef(r.WorkspaceID),
 		r.Kind.TagKey: r.ID.String(), igagov.TagExpiresAt: igagov.AWSTime(r.Due)}
+	if r.Due.Equal(igagov.AccessNoEnd) {
+		t[igagov.TagExpiresAt] = "none"
+	}
+	for k, v := range r.Extra {
+		t[k] = v
+	}
+	return t
 }
 
 func (r r2Row) read(ctx context.Context, disc awsenforce.DiscoveryIAM) (*r2Live, error) {

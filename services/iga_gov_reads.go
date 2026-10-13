@@ -45,7 +45,11 @@ func (e *GovError) Body() map[string]any {
 	if d == nil {
 		d = map[string]any{}
 	}
-	return map[string]any{"error": map[string]any{"code": e.Code, "message": e.Message, "detail": d}}
+	body := map[string]any{"code": e.Code, "message": e.Message, "detail": d}
+	if f, ok := d["field"].(string); ok && f != "" {
+		body["field"] = f
+	}
+	return map[string]any{"error": body}
 }
 
 func govErr(status int, code, msg string, detail map[string]any) *GovError {
