@@ -119,7 +119,28 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	rowsBefore := s.val(legacyRows)
 	before := fingerprints(t, db)
 
-	if err := runRunner(db, g, migrationsDir()); err != nil {
+	// Apply Phase 3's own chain (047-099) only. The tenancy program's
+	// migrations (101+) change existing tables on purpose (workspace columns,
+	// RLS policies), which is not what this test is about.
+	phase3Dir := t.TempDir()
+	all, err := filepath.Glob(filepath.Join(migrationsDir(), "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range all {
+		v, err := strconv.Atoi(strings.SplitN(filepath.Base(f), "_", 2)[0])
+		if err != nil || v < phase3First || v >= 100 {
+			continue
+		}
+		body, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(phase3Dir, filepath.Base(f)), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runRunner(db, g, phase3Dir); err != nil {
 		t.Fatalf("apply 047-056 over 046: %v", err)
 	}
 
@@ -135,9 +156,10 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 			added++
 		}
 	}
-	// 047-056 add 43 tables; 059_tidy_eval_pruned (fix/p3-tidy) one more.
-	if added != 44 {
-		t.Errorf("047-059 added %d tables, want 44", added)
+	// 047-056 add 43 tables; 059_tidy_eval_pruned (fix/p3-tidy) one more;
+	// 060-062 (R1b, R2, R3) 13 more.
+	if added != 57 {
+		t.Errorf("047-062 added %d tables, want 57", added)
 	}
 	if got := s.val(legacyRows); got != rowsBefore {
 		t.Errorf("legacy agent_policies rows changed: %s -> %s", rowsBefore, got)
@@ -148,6 +170,13 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	         AND p.action IN ('author', 'approve', 'enforce', 'emergency')`)
 	for _, b := range s.bad {
 		t.Error(b)
+	}
+	// The rest of the chain (the tenancy program's 101+, which the policy
+	// schema also needs: 132's per-workspace notification key), as on any
+	// real database; this also leaves the shared database at the head for
+	// the tests that run after this one.
+	if err := runRunner(db, g, migrationsDir()); err != nil {
+		t.Fatalf("apply the rest of the chain: %v", err)
 	}
 	if err := services.VerifyPolicySchema(g); err != nil {
 		t.Fatalf("VerifyPolicySchema after 047-056: %v", err)
