@@ -1,11 +1,13 @@
 package repositories
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -315,10 +317,18 @@ func (r *cloudIdentityRepository) FindForAttribution(
 		iamUserNames = []string{}
 	}
 	var out []models.CloudIdentity
-	err := r.db.Where(`workspace_id = ? AND connector_id = ?
+	find := func(tx *gorm.DB) error {
+		return tx.Where(`workspace_id = ? AND connector_id = ?
 	                    AND (native_id = ANY(?::text[]) OR (kind = ? AND name = ANY(?::text[])))`,
-		workspaceID, connectorID, pq.StringArray(nativeIDs), models.CloudIdentityIAMUser, pq.StringArray(iamUserNames)).
-		Order("native_id, id").Find(&out).Error
+			workspaceID, connectorID, pq.StringArray(nativeIDs), models.CloudIdentityIAMUser, pq.StringArray(iamUserNames)).
+			Order("native_id, id").Find(&out).Error
+	}
+	// Under row-level security for the workspace. A repository built on the
+	// caller's transaction runs on it: that transaction decides its scope.
+	if _, inTx := r.db.Statement.ConnPool.(gorm.TxCommitter); inTx {
+		return out, find(r.db)
+	}
+	err := tenancy.InWorkspaceRead(context.Background(), r.db, workspaceID, find)
 	return out, err
 }
 
