@@ -4,6 +4,28 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-13 — Ritam's IGA work made multi-tenant (branch `fix/governance-tenancy`)
+
+Review of all 102 non-merge commits by ritam77 / ritamAN77 / Ritam Kundu since 2026-10-05 (7 parallel reviews), then the fixes. Kept every feature and its logic; changed how each transaction is scoped. Committed locally; nothing pushed.
+
+### Done
+- AS-110 webhook SSRF (`bba54ca`); AS-111 cross-workspace user deletes and purges refused (`7005360`); migration 131 (RLS on every workspace table; a workspace reads the users it has memberships for).
+- AS-108: `tenancy.InWorkspace` / `InWorkspaceRead`; policy jobs' `InTx` runs under RLS for the job's workspace; 56 governance/IGA files converted (six implementer groups: findings and evidence; authoring, owners, reviews, settings, events, notify; deployments and the AWS executor; rollout and the enforcement binding; IaC, Slack, job queue, legacy compat; Ritam's older discovery/k8s/actuation code). Cross-workspace statements carry TENANT-EXEMPT reasons. The quarantine is empty.
+- Ratchet: multi-line raw SQL is counted (AS-112); RLS-files guard (`scripts/tenant-rls-files.txt`): a base handle there only opens a workspace transaction. Main baseline 82 → 72.
+- Migrations 132 (iga_gov_notification unique per workspace) and 133 (iga_gov_job kind CHECK re-created; 052 had been edited in place).
+- Discovery ingress: `enforce` by default when `ENVIRONMENT=production` (set `IGA_DISCOVERY_INGEST_AUTH=warn` explicitly to keep the old behaviour); no workspace-existence oracle.
+- AS-113 found during the conversion: an actuation report could change another workspace's agent (id-only update).
+- id-only updates in deployments, IaC, actuation, discovery and k8s now also match workspace_id; IGAGovAttemptLog refuses a workspace other than the job's.
+- The long-failing TestP3T311TrustLiveWithdrawArchiveIsolation was a test race (asynchronous audit write); fixed.
+- CI: the IGA isolation check runs on pull requests.
+
+### Verified
+- build, vet (incl. integration tags), ratchet, unit tests, flows/onboarding/flagsoff, the full Phase 3 suite on a fresh database (all pass), IGA isolation check, schema parity: a database built by current staging upgrades with 131-133 to the fresh schema.
+
+### Next
+- AS-112: burn down the 72 older unscoped statements.
+- Before deploying: mint discovery ingest tokens for every collector (production now enforces), see DEPLOYMENT_CHECKLIST.
+
 ## 2026-10-12 (cont.) — authsec-staging merged again (PR conflicts)
 
 The PR from fix/p0-containment to authsec-staging had conflicts; staging was merged into the branch locally (120 commits: IGA governance phase 3, migrations 047-059). Nothing pushed.
