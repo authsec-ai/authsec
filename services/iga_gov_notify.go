@@ -21,8 +21,8 @@ import (
 // The Phase 3 notification outbox (SPEC-iga-phase3-policy.md §8.1 job
 // table, `notify`; 054 iga_gov_notification; T3.12).
 //
-// A notice is one iga_gov_notification row -- (subject_kind, subject_id,
-// channel, recipient), unique -- and one `notify` job (dedupe
+// A notice is one iga_gov_notification row -- (workspace_id, subject_kind,
+// subject_id, channel, recipient), unique (132) -- and one `notify` job (dedupe
 // notification:<id>) that delivers it. The row IS the delivery record: state
 // pending -> sent, or failed (retrying) -> ... -> dead after 5 attempts,
 // with attempt_count, last_error, available_at (the next try) and sent_at.
@@ -208,7 +208,7 @@ func EnqueueGovNotificationTx(tx *gorm.DB, ws uuid.UUID, subjectKind string, sub
 	err := tx.Raw(`
 		INSERT INTO iga_gov_notification (workspace_id, subject_kind, subject_id, channel, recipient)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (subject_kind, subject_id, channel, recipient) DO NOTHING
+		ON CONFLICT (workspace_id, subject_kind, subject_id, channel, recipient) DO NOTHING
 		RETURNING *`, ws, subjectKind, subjectID, channel, recipient).Scan(&rows).Error
 	if err != nil {
 		return nil, err
