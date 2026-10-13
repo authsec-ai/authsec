@@ -336,10 +336,16 @@ func TestP2IngestAuthWarnCounts(t *testing.T) {
 		t.Errorf("accepted_token grew by %d, want %d", got, n)
 	}
 	// An unknown workspace is not counted against a workspace that does not
-	// exist: the call is the 400 it always was, and nothing is recorded.
+	// exist, and an unauthenticated caller is not told it is unknown: the
+	// answer is enforce mode's 401, not a distinct "unknown workspace_id"
+	// (no oracle for which workspace ids exist).
 	before = platform.DiscoveryIngestAuthCounts()
-	if code, _ := l.post("/sightings", "", ingestRoutes[1].body(uuid.New(), nil, "")); code != http.StatusBadRequest {
-		t.Errorf("warn, unknown workspace: %d, want 400", code)
+	for _, mode := range []string{"warn", "off"} {
+		t.Setenv(services.DiscoveryIngestAuthEnv, mode)
+		code, body := l.post("/sightings", "", ingestRoutes[1].body(uuid.New(), nil, ""))
+		if code != http.StatusUnauthorized || len(body) != 1 || body["error"] != "ingest token required" {
+			t.Errorf("%s, no token, unknown workspace: %d %v, want 401 {\"error\":\"ingest token required\"}", mode, code, body)
+		}
 	}
 	after = platform.DiscoveryIngestAuthCounts()
 	if after["accepted_unauthenticated_missing"] != before["accepted_unauthenticated_missing"] {
@@ -347,7 +353,49 @@ func TestP2IngestAuthWarnCounts(t *testing.T) {
 	}
 }
 
+// With IGA_DISCOVERY_INGEST_AUTH unset, a production deployment enforces:
+// an unauthenticated report naming a real workspace is refused and writes
+// nothing. warn stays available when set explicitly.
+func TestP2IngestAuthProductionDefaultEnforces(t *testing.T) {
+	l := newIngestLab(t)
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv(services.DiscoveryIngestAuthEnv, "")
+	if got := services.DiscoveryIngestAuthModeFromEnv(); got != services.IngestAuthEnforce {
+		t.Fatalf("production default mode %q, want enforce", got)
+	}
+	var before, after int64
+	l.db.Table("discovered_agents").Where("workspace_id = ?", l.wsA).Count(&before)
+	for _, r := range ingestRoutes {
+		code, body := l.post(r.path, "", r.body(l.wsA, &l.srcA1, "kh-a1"))
+		if code != http.StatusUnauthorized || body["error"] != "ingest token required" {
+			t.Errorf("production default %s without a token: %d %v, want 401", r.path, code, body)
+		}
+	}
+	l.db.Table("discovered_agents").Where("workspace_id = ?", l.wsA).Count(&after)
+	if after != before {
+		t.Errorf("refused unauthenticated reports wrote %d discovered agents", after-before)
+	}
+	// A real token still works.
+	tokA, _ := l.mint(l.wsA, nil)
+	if code, body := l.post("/sightings", tokA, ingestRoutes[1].body(l.wsA, &l.srcA1, "kh-a1")); !is2xx(code) {
+		t.Errorf("production default with a token: %d %v, want 2xx", code, body)
+	}
+	// warn is an explicit choice only.
+	t.Setenv(services.DiscoveryIngestAuthEnv, "warn")
+	if got := services.DiscoveryIngestAuthModeFromEnv(); got != services.IngestAuthWarn {
+		t.Errorf("explicit warn in production: %q", got)
+	}
+	if !services.DiscoveryIngestAuthExplicitlyWeakInProduction() {
+		t.Errorf("explicit warn in production is not reported as weak")
+	}
+	out := captureLog(t, platform.LogDiscoveryIngestAuthMode)
+	if !strings.Contains(out, "PRODUCTION") {
+		t.Errorf("explicit warn in production: no production banner in %q", out)
+	}
+}
+
 func TestP2IngestAuthModeFromEnv(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
 	for raw, want := range map[string]services.DiscoveryIngestAuthMode{
 		"": services.IngestAuthWarn, "warn": services.IngestAuthWarn, " OFF ": services.IngestAuthOff,
 		"Enforce": services.IngestAuthEnforce, "enforced": services.IngestAuthEnforce, "on": services.IngestAuthEnforce,

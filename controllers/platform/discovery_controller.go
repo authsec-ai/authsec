@@ -222,40 +222,27 @@ func (ctl *DiscoveryController) workspace(c *gin.Context) (uuid.UUID, string, er
 	return wsID, principal, nil
 }
 
-// assertedWorkspace resolves the workspace a connector claims in its request
-// body, and confirms it exists.
+// workspaceExists reports whether the workspace a connector asserts in its
+// request body exists.
 //
 // Used by the ingress routes (agent-registration, sightings, lifecycle,
 // resync-manifest, rbac-snapshot) through ingressWorkspace, which first checks
 // the call's ingest token against that workspace (discovery_ingest_auth.go) —
 // the agent is configured with its workspace at deploy time and asserts it.
 //
-// The existence check is not redundant with the foreign key. Without it a typo'd
-// workspace id surfaces as a raw Postgres FK violation, which is a miserable thing
-// to debug from inside a cluster — and a typo is now a likely mistake, because an
-// operator types this into a Helm flag by hand. One indexed primary-key lookup is
-// worth the clarity.
-func (ctl *DiscoveryController) assertedWorkspace(c *gin.Context, raw string) (uuid.UUID, bool) {
-	wsID, err := uuid.Parse(raw)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("workspace_id %q is not a valid uuid", raw),
-		})
-		return uuid.Nil, false
-	}
-
+// The existence check is not redundant with the foreign key: without it a
+// typo'd workspace id surfaces as a raw Postgres FK violation. Only a caller
+// whose ingest token vouches for the workspace is told it is unknown;
+// ingressWorkspace answers an unauthenticated one as it answers enforce mode,
+// so the ingress is never an oracle for which workspace ids exist.
+func (ctl *DiscoveryController) workspaceExists(wsID uuid.UUID) (bool, error) {
 	var exists int64
+	// workspaces is the tenant registry itself, not a workspace-owned table:
+	// the lookup is by the asserted id and returns only a count.
 	if err := ctl.db.Table("workspaces").Where("id = ?", wsID).Count(&exists).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify workspace"})
-		return uuid.Nil, false
+		return false, err
 	}
-	if exists == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("unknown workspace_id %s", wsID),
-		})
-		return uuid.Nil, false
-	}
-	return wsID, true
+	return exists > 0, nil
 }
 
 // connectorCredentialPrefix marks a per-connector credential minted by

@@ -164,8 +164,9 @@ func (ctl *DiscoveryController) RevokeIngestToken(c *gin.Context) {
 // LogDiscoveryIngestAuthMode logs the ingress auth mode, once, at route setup,
 // so which mode a deployment runs in is never a guess, and publishes it as the
 // discovery_ingest_auth_enforced gauge. Any mode but enforce is logged as a
-// banner: warn is the default only so agents installed before tokens existed
-// keep working during rollout, and it does not protect the ingress. The same
+// banner: warn (the default outside production; in production only when set
+// explicitly) lets agents installed before tokens existed keep working during
+// rollout, and it does not protect the ingress. The same
 // status is in the uflow health check (checks.discovery_ingest_auth).
 func LogDiscoveryIngestAuthMode() {
 	st := services.CurrentDiscoveryIngestAuthStatus()
@@ -176,6 +177,10 @@ func LogDiscoveryIngestAuthMode() {
 	}
 	const bar = "**************************************************************************"
 	log.Print(bar)
+	if services.DiscoveryIngestAuthExplicitlyWeakInProduction() {
+		log.Printf("* PRODUCTION: %s=%s was set explicitly; the production default is enforce.", st.Env, st.Mode)
+		log.Printf("* Unauthenticated discovery reports that name an existing workspace are ACCEPTED.")
+	}
 	log.Printf("* WARNING: %s", st.Warning)
 	log.Printf("* The discovery ingress (/authsec/discovery/agent-registration, /sightings, /lifecycle,")
 	log.Printf("* /resync-manifest, /rbac-snapshot) is NOT protected in mode %q.", st.Mode)
@@ -315,13 +320,14 @@ func (ctl *DiscoveryController) registrationIngestSource(kind, instanceID string
 	}
 }
 
-// ingressWorkspace replaces assertedWorkspace on the ingress: it parses the
-// body's workspace (400 if not a uuid, unchanged), authorises the call's
-// ingest token against it per IGA_DISCOVERY_INGEST_AUTH, and only then
-// confirms the workspace exists, so an unauthenticated caller in enforce mode
-// learns nothing about which workspace ids are real. On false the response
-// has been written; on true nothing has, and the handler answers exactly as
-// it did before ingest tokens existed.
+// ingressWorkspace parses the body's workspace (400 if not a uuid,
+// unchanged), authorises the call's ingest token against it per
+// IGA_DISCOVERY_INGEST_AUTH, and only then confirms the workspace exists. A
+// caller no token vouches for (warn or off mode) learns nothing about which
+// workspace ids are real: an unknown workspace gets the same 401 enforce mode
+// gives, never a distinct "unknown workspace". On false the response has been
+// written; on true nothing has, and the handler answers exactly as it did
+// before ingest tokens existed.
 //
 // source is a constructor rather than an id because the registration route
 // has to look its source up, and that lookup is only worth doing for a token
@@ -339,7 +345,21 @@ func (ctl *DiscoveryController) ingressWorkspace(c *gin.Context, raw string,
 	if !ok {
 		return uuid.Nil, false
 	}
-	if _, ok = ctl.assertedWorkspace(c, raw); !ok {
+	exists, err := ctl.workspaceExists(wsID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify workspace"})
+		return uuid.Nil, false
+	}
+	if !exists {
+		if c.GetString(ctxIngestTokenID) == "" {
+			// Unauthenticated: the same answer as enforce mode's refusal.
+			c.Header("WWW-Authenticate", `Bearer realm="authsec-discovery"`)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "ingest token required"})
+			return uuid.Nil, false
+		}
+		// A live token's workspace exists, so this is a workspace deleted
+		// between the two reads.
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown workspace_id %s", wsID)})
 		return uuid.Nil, false
 	}
 	// Recorded only for a workspace that exists, so what is logged and
