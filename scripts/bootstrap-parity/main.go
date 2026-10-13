@@ -59,6 +59,7 @@ func main() {
 			log.Fatalf("load: %v", err)
 		}
 		for _, f := range files {
+			// TENANT-EXEMPT: tooling: migration_logs is the runner's own catalog, not workspace data.
 			if _, err := rawDB.Exec(`DELETE FROM migration_logs WHERE version = $1 AND name = $2 AND db_type = 'master'`, f.Version, f.Name); err != nil {
 				log.Fatalf("forget v%d: %v", f.Version, err)
 			}
@@ -68,6 +69,7 @@ func main() {
 		log.Fatalf("run: %v", err)
 	}
 	var failed int
+	// TENANT-EXEMPT: tooling: migration_logs is the runner's own catalog, not workspace data.
 	if err := rawDB.QueryRow(`SELECT count(*) FROM migration_logs WHERE success = false`).Scan(&failed); err != nil {
 		log.Fatalf("count failures: %v", err)
 	}

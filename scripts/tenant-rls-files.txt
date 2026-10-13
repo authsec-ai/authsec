@@ -12,3 +12,4 @@ services/slack_integration_service.go
 services/slack_integration_interactions.go
 services/slack_integration_channel.go
 controllers/platform/slack_integration_controller.go
+services/agent_policy_legacy_compat.go

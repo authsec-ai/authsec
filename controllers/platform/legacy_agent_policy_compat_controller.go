@@ -137,7 +137,7 @@ func (ctl *LegacyAgentPolicyCompatController) admit(c *gin.Context) (uuid.UUID, 
 	if ctl.gate().On {
 		return ws, true
 	}
-	has, err := ctl.service().HasPolicies(ws)
+	has, err := ctl.service().HasPolicies(c.Request.Context(), ws)
 	if err != nil {
 		log.Printf("[legacy-agent-policy] %s %s: %v", c.Request.Method, c.FullPath(), err)
 		legacyCompatError(c, http.StatusInternalServerError, "internal",
@@ -227,7 +227,7 @@ func (ctl *LegacyAgentPolicyCompatController) ListLegacyAgentPolicies(c *gin.Con
 		after = &services.LegacyAgentPolicyPosition{CreatedAt: key.CreatedAt, ID: cur.ID}
 	}
 
-	rows, more, err := ctl.service().Page(ws, after, limit)
+	rows, more, err := ctl.service().Page(c.Request.Context(), ws, after, limit)
 	if err != nil {
 		legacyCompatServiceError(c, err)
 		return
@@ -290,7 +290,7 @@ func (ctl *LegacyAgentPolicyCompatController) PauseLegacyAgentPolicy(c *gin.Cont
 		return
 	}
 
-	before, after, err := ctl.service().Pause(ws, id)
+	before, after, err := ctl.service().Pause(c.Request.Context(), ws, id)
 	if err != nil {
 		legacyCompatServiceError(c, err)
 		return
@@ -325,7 +325,7 @@ func (ctl *LegacyAgentPolicyCompatController) RemoveLegacyAgentPolicy(c *gin.Con
 		return
 	}
 
-	before, err := ctl.service().Remove(ws, id)
+	before, err := ctl.service().Remove(c.Request.Context(), ws, id)
 	if err != nil {
 		legacyCompatServiceError(c, err)
 		return
