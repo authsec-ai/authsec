@@ -7,6 +7,7 @@ package platform
 // its body. Rollout: DISCOVERY_INGEST_AUTH.md next to this file.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +17,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/monitoring"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* -------------------------------------------------------------------------- */
@@ -307,9 +310,13 @@ func (ctl *DiscoveryController) registrationIngestSource(kind, instanceID string
 				return nil, nil
 			}
 			var ids []uuid.UUID
-			if err := ctl.db.Table("discovery_sources").
-				Where("workspace_id = ? AND kind = ? AND instance_id = ?", wsID, kind, instanceID).
-				Limit(1).Pluck("id", &ids).Error; err != nil {
+			// Under row-level security for the asserted workspace: the read
+			// sees that workspace's sources only, whatever the body says.
+			if err := tenancy.InWorkspaceRead(context.Background(), ctl.db, wsID, func(tx *gorm.DB) error {
+				return tx.Table("discovery_sources").
+					Where("workspace_id = ? AND kind = ? AND instance_id = ?", wsID, kind, instanceID).
+					Limit(1).Pluck("id", &ids).Error
+			}); err != nil {
 				return nil, err
 			}
 			if len(ids) == 0 {

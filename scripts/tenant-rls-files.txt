@@ -2,6 +2,7 @@
 # security for one workspace (scripts/check-tenant-exempt.sh). A file moves
 # here from tenant-exempt-quarantine.txt once it is converted (AS-108).
 controllers/platform/slack_integration_controller.go
+internal/k8sgraph/reconcile.go
 repository/cloud_evidence_reads.go
 repository/cloud_resource_policy_repository.go
 repository/cloud_workload_repository.go
