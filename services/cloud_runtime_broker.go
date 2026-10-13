@@ -6,9 +6,12 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsbroker"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 )
 
 // R3 brokered sessions (DECISION R3-12): what the runtime broker needs from
@@ -32,8 +35,18 @@ var ErrBrokerConnectorUnavailable = errors.New("the AWS connector is not active"
 // BrokerAssumeInputs returns the connector's account, ExternalId and signing
 // region, only while the connector is an active AWS connector of the
 // workspace. Another workspace's connector is ErrBrokerConnectorUnavailable.
-func (s *AWSOnboardingService) BrokerAssumeInputs(ws, connectorID uuid.UUID) (*RuntimeBrokerInputs, error) {
-	c, req, err := s.assumeRequestFor(ws, connectorID)
+// The connector row is read in a transaction under row-level security for
+// ws; the ExternalId is read from the secrets store after it.
+func (s *AWSOnboardingService) BrokerAssumeInputs(ctx context.Context, ws, connectorID uuid.UUID) (*RuntimeBrokerInputs, error) {
+	var row *models.CloudConnector
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		row, err = repositories.NewCloudConnectorRepository(tx).Get(ws, connectorID)
+		return err
+	}); err != nil {
+		return nil, ErrBrokerConnectorUnavailable
+	}
+	c, req, err := s.assumeRequestForConnector(ws, row)
 	if err != nil {
 		if c == nil {
 			return nil, ErrBrokerConnectorUnavailable
@@ -78,8 +91,8 @@ func CurrentRuntimeBrokerDeps() *RuntimeBrokerDeps {
 // against AWS.
 func LiveRuntimeBrokerDeps(onboarding *AWSOnboardingService) *RuntimeBrokerDeps {
 	return &RuntimeBrokerDeps{
-		Inputs: func(_ context.Context, ws, connectorID uuid.UUID) (*RuntimeBrokerInputs, error) {
-			return onboarding.BrokerAssumeInputs(ws, connectorID)
+		Inputs: func(ctx context.Context, ws, connectorID uuid.UUID) (*RuntimeBrokerInputs, error) {
+			return onboarding.BrokerAssumeInputs(ctx, ws, connectorID)
 		},
 		Broker: awsbroker.NewLive(),
 	}
