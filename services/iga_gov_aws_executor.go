@@ -366,12 +366,8 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 		return nil, fmt.Errorf("deployment %s is not in the job's workspace", dep.ID)
 	}
 	var ctl models.IGAGovControl
-	var cur models.IGAGovDeployment
 	if err := e.read(ctx, dep.WorkspaceID, func(tx *gorm.DB) error {
-		if err := tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error; err != nil {
-			return err
-		}
-		return tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ID).First(&cur).Error
+		return tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ControlID).First(&ctl).Error
 	}); err != nil {
 		return nil, err
 	}
@@ -379,6 +375,12 @@ func (e *IGAGovAWSExecutor) ExecutePlan(ctx context.Context, run *PolicyJobRun, 
 	if reason, detail := refuseDirect(dep, plan, role); reason != "" {
 		out.Result, out.Reason, out.Detail = DeployRefused, reason, detail
 		return out, nil
+	}
+	var cur models.IGAGovDeployment
+	if err := e.read(ctx, dep.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND id = ?", dep.WorkspaceID, dep.ID).First(&cur).Error
+	}); err != nil {
+		return nil, err
 	}
 	if cur.State != "applying" {
 		out.Result, out.Reason, out.Detail = DeployRefused, DeployReasonNotApplying, "deployment is "+cur.State
