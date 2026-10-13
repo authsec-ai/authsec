@@ -47,12 +47,19 @@ rls_only_re="^($(IFS='|'; echo "${rls_only[*]}"))/"
 # carrying a TENANT-EXEMPT reason on its line or one of the three above.
 rls_files_list=scripts/tenant-rls-files.txt
 rls_files=$(grep -vE '^[[:space:]]*(#|$)' "$rls_files_list" 2>/dev/null || true)
+# The guard's pattern must match on this awk (gawk reads \b as a backspace,
+# which once made it match nothing): refuse to run if a known violation
+# would not be caught.
+if ! echo '_ = s.db.Exec("x")' | awk '{ exit !($0 ~ /(\.db([^A-Za-z0-9_]|$)|config\.(DB|GetDatabase)([^A-Za-z0-9_]|$))/) }'; then
+  echo "check-tenant-exempt: the RLS-files pattern does not match on this awk" >&2
+  exit 1
+fi
 if [[ -n "$rls_files" ]]; then
   bad=$(echo "$rls_files" | xargs awk '
       FNR == 1 { h1 = h2 = h3 = "" }
       {
         line = $0
-        if (line ~ /(\.db\b|config\.(DB|GetDatabase)\b)/ && line !~ /^[[:space:]]*\/\// \
+        if (line ~ /(\.db([^A-Za-z0-9_]|$)|config\.(DB|GetDatabase)([^A-Za-z0-9_]|$))/ && line !~ /^[[:space:]]*\/\// \
             && line !~ /tenancy\.(InWorkspace|InWorkspaceRead|RLSTransaction)\(/ \
             && line !~ /\.InTx\(/ \
             && line !~ /^[[:space:]]*db:[[:space:]]/ && line !~ /[{,][[:space:]]*db:[[:space:]]/ \
