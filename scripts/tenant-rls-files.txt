@@ -4,3 +4,14 @@
 repository/cloud_resource_policy_repository.go
 repository/cloud_workload_repository.go
 repository/iga_gov_finding_rule_repository.go
+repository/cloud_evidence_reads.go
+repository/iga_gov_evaluation_repository.go
+services/iga_gov_evaluator.go
+services/iga_gov_export.go
+services/iga_gov_finding_rules.go
+services/iga_gov_metrics.go
+services/iga_gov_prune_evidence.go
+services/iga_gov_readiness.go
+services/iga_gov_reads.go
+services/iga_gov_snapshot.go
+services/iga_gov_targets.go
