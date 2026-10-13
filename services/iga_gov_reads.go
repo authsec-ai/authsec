@@ -607,6 +607,7 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 // ActionEvidence is GET /identities/:id/action-evidence at rev (R1b).
 func (r *GovReader) ActionEvidence(ws, identity uuid.UUID, rev int64) ([]GovActionEvidence, error) {
 	var n int64
+	// TENANT-EXEMPT: R1b action-evidence identity check; bound to workspace_id = ? (the token's workspace, passed as ws)
 	if err := r.db.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
 		return nil, err
 	}

@@ -129,6 +129,7 @@ func loadActionTrails(ctx context.Context, db *gorm.DB, ws uuid.UUID, at time.Ti
 		RequestedAt time.Time
 		Coverage    []byte
 	}
+	// TENANT-EXEMPT: R1b evidence read inside the fenced evaluation job; bound to workspace_id = ? (the job's workspace)
 	if err := db.Raw(`SELECT connector_id, started_at, requested_at, coverage FROM cloud_scan_run
 	                   WHERE workspace_id = ? AND status = 'published'
 	                     AND COALESCE(started_at, requested_at) >= ? AND COALESCE(started_at, requested_at) <= ?
@@ -205,6 +206,7 @@ func insertActionEvidenceTx(tx *gorm.DB, ws uuid.UUID, rev int64, ev []igagov.Ac
 // R1a prune recorded as pruned (iga_gov_evaluation_pruned, 059): R1b's
 // evidence follows the same retention as the activity evidence (§2.5).
 func pruneActionEvidenceTx(tx *gorm.DB, ws uuid.UUID) (int64, error) {
+	// TENANT-EXEMPT: R1b evidence prune inside the fenced prune_evidence job; both subqueries bound to workspace_id = ?
 	res := tx.Exec(`DELETE FROM iga_gov_action_evidence
 	                 WHERE workspace_id = ? AND rev IN (SELECT rev FROM iga_gov_evaluation_pruned WHERE workspace_id = ?)`, ws, ws)
 	return res.RowsAffected, res.Error

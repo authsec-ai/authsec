@@ -70,6 +70,17 @@ CREATE TRIGGER iga_gov_action_evidence_frozen BEFORE INSERT OR UPDATE ON iga_gov
   FOR EACH ROW EXECUTE FUNCTION iga_gov_evaluation_rows_frozen();
 
 -- verify ----------------------------------------------------------------------
+-- Row-level security (CLAUDE.md §7, migration 111): every workspace table
+-- gets the tenancy policy. On a database where 111 already ran (production
+-- upgrades), enable it here; on a fresh database 111 has not run yet when
+-- 060 applies and its loop -- like 001's -- covers this table later.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.iga_gov_action_evidence');
+    END IF;
+END $$;
+
 DO $$
 DECLARE
     n integer;
