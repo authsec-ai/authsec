@@ -105,7 +105,12 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 	// The intent as it applies to THIS subject: an owner's scoped retain
 	// keeps its service for the roles that owner owns only (fix/p3-tidy).
 	intent = intent.ForSubject(c.IdentityAccountID.String())
-	b, src, basis, err := a.targets.buildBasis(ctx, ws, c.IdentityAccountID, removedServices(intent))
+	if len(intent.RemoveActions) > 0 && !PolicyActionsOn() {
+		// R1b off: an action-level intent is not compiled (IGA_POLICY_R1B).
+		ge := actionsUnavailable()
+		return nil, &compileBlock{Err: ge, Reason: ge.Code + ": " + fmt.Sprint(ge.Detail["reason"])}, nil
+	}
+	b, src, basis, err := a.targets.buildBasisActions(ctx, ws, c.IdentityAccountID, removedServices(intent), intent.RemovedActionKeys())
 	if err != nil {
 		if ge := bundleBuildError(err, c.RoleID); ge != nil {
 			return nil, &compileBlock{Err: ge, Reason: "evidence_unavailable: " + reasonOf(err)}, nil

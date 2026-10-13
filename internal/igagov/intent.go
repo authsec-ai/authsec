@@ -118,7 +118,42 @@ func (r RightSizeIntent) ForSubject(identityAccountID string) RightSizeIntent {
 			out.Remove = append(out.Remove, e)
 		}
 	}
+	// R1b: an owner's retain of a service keeps its actions too (DECISION
+	// R1b-9). nil stays nil, so an R1a intent is unchanged.
+	if len(r.RemoveActions) > 0 {
+		out.RemoveActions = []RemoveActionEntry{}
+		for _, e := range r.RemoveActions {
+			if !kept[e.Service] {
+				out.RemoveActions = append(out.RemoveActions, e)
+			}
+		}
+	}
 	return out
+}
+
+// RemoveActionEntry is one action removed from a service the role keeps
+// (R1b, §12.1): the action, its namespace, and its basis -- a qualified
+// no_event on CloudTrail management events, or, for an action CloudTrail
+// records only as a data event, an explicit acknowledgement that AuthSec
+// cannot observe its use (DECISION R1b-5).
+type RemoveActionEntry struct {
+	Action          string `json:"action"`
+	Service         string `json:"service"`
+	Basis           string `json:"basis"`
+	QualifiedDays   int    `json:"qualified_days,omitempty"`
+	GrantAgeBasis   string `json:"grant_age_basis,omitempty"`
+	Acknowledgement string `json:"acknowledgement,omitempty"`
+}
+
+// RemovedActionKeys lists the intent's removed actions (canonical, sorted).
+func (r RightSizeIntent) RemovedActionKeys() []string {
+	var out []string
+	for _, e := range r.RemoveActions {
+		if a, ok := CanonicalAction(e.Action); ok {
+			out = append(out, a)
+		}
+	}
+	return sortedUnique(out)
 }
 
 // IntentRoute is a resource-policy route named on a removal (§2.7, §3.4).
@@ -156,6 +191,10 @@ type RightSizeIntent struct {
 	Delivery        string         `json:"delivery"`
 	FindingIDs      []string       `json:"finding_ids,omitempty"`
 	EvidenceRev     int64          `json:"evidence_rev"`
+	// RemoveActions is R1b's action-level removal within services the role
+	// keeps (IGA_POLICY_R1B). Omitted when empty, so every R1a intent and
+	// its intent_hash are unchanged.
+	RemoveActions []RemoveActionEntry `json:"remove_actions,omitempty"`
 }
 
 // RemoveControlIntent is the `remove_control` intent (§2.7, §8.10).
@@ -437,12 +476,13 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 			c.add("retain", "duplicate", "service %s is retained for every subject and again for some", svc)
 		}
 	}
-	if len(r.Remove) == 0 {
+	if len(r.Remove) == 0 && len(r.RemoveActions) == 0 {
 		c.add("remove", "required", "a right_size_services intent removes at least one service")
 	}
 	// Each subject still removes something once its owners' retains apply.
 	for i, s := range r.Subjects {
-		if len(r.Remove) > 0 && len(r.ForSubject(s.IdentityAccountID).Remove) == 0 {
+		fs := r.ForSubject(s.IdentityAccountID)
+		if (len(r.Remove) > 0 || len(r.RemoveActions) > 0) && len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 {
 			c.add(fmt.Sprintf("subjects[%d]", i), "nothing_to_remove", "the owners' retains leave nothing to remove for role %s", s.RoleID)
 		}
 	}
@@ -469,6 +509,10 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 			c.add(f+".grant_age_basis", "invalid", "grant_age_basis must be observed_since_change or predates_observation; an unknown grant is unreviewed, never removed")
 		}
 		validateRemoveRoutes(c, f, e)
+	}
+
+	if len(r.RemoveActions) > 0 {
+		validateRemoveActions(c, r, removed)
 	}
 
 	if r.ObservationDays < MinObservationDays || r.ObservationDays > MaxObservationDays {
@@ -499,6 +543,59 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 	}
 	if r.EvidenceRev <= 0 {
 		c.add("evidence_rev", "required", "the revision the intent was proposed from is required")
+	}
+}
+
+// validateRemoveActions is R1b's shape rules for remove_actions: literal
+// actions only (no wildcard: an exclusion of a pattern could remove access
+// nobody selected), in a namespace that is not itself removed, each once,
+// with a basis: no_event needs a qualified window and a known grant age;
+// data_event_acknowledged needs a data-event action and the acknowledgement
+// text.
+func validateRemoveActions(c *collector, r RightSizeIntent, removedSvc map[string]bool) {
+	seen := map[string]bool{}
+	for i, e := range r.RemoveActions {
+		f := fmt.Sprintf("remove_actions[%d]", i)
+		a, ok := CanonicalAction(e.Action)
+		if !ok || a != e.Action {
+			c.add(f+".action", "invalid", "must be one literal IAM action <namespace>:<Name> with a lower-case namespace and no wildcard")
+			continue
+		}
+		ns, _, _ := SplitAction(a)
+		if e.Service != ns {
+			c.add(f+".service", "invalid", "must be the action's namespace %s", ns)
+		}
+		if seen[ActionKey(a)] {
+			c.add(f+".action", "duplicate", "action %s is removed twice", a)
+		}
+		seen[ActionKey(a)] = true
+		if removedSvc[ns] {
+			c.add(f+".action", "conflict", "service %s is removed whole; its actions need no separate removal", ns)
+		}
+		switch e.Basis {
+		case RemoveActionNoEvent:
+			if e.QualifiedDays < MinQualifiedDays {
+				c.add(f+".qualified_days", "not_qualified", "an action removal needs at least %d qualified days (§2.6)", MinQualifiedDays)
+			}
+			if e.GrantAgeBasis != GrantAgeObservedSinceChange && e.GrantAgeBasis != GrantAgePredatesObservation {
+				c.add(f+".grant_age_basis", "invalid", "grant_age_basis must be observed_since_change or predates_observation")
+			}
+			if e.Acknowledgement != "" {
+				c.add(f+".acknowledgement", "invalid", "only a data_event_acknowledged removal carries an acknowledgement")
+			}
+		case RemoveActionDataEventAcknowledged:
+			if !IsDataEventAction(a) {
+				c.add(f+".basis", "invalid", "%s is a management event; remove it on a no_event basis", a)
+			}
+			if strings.TrimSpace(e.Acknowledgement) == "" {
+				c.add(f+".acknowledgement", "required", "removing a data-event action AuthSec cannot observe needs an explicit acknowledgement")
+			}
+			if e.GrantAgeBasis != "" && e.GrantAgeBasis != GrantAgeObservedSinceChange && e.GrantAgeBasis != GrantAgePredatesObservation {
+				c.add(f+".grant_age_basis", "invalid", "grant_age_basis must be observed_since_change or predates_observation")
+			}
+		default:
+			c.add(f+".basis", "invalid", "remove_actions basis must be no_event or data_event_acknowledged")
+		}
 	}
 }
 

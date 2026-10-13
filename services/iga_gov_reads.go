@@ -280,13 +280,26 @@ var (
 	govConfidences = map[string]bool{"qualified": true, "age_unverified": true, "not_applicable": true}
 )
 
+// govKindsNow is the kind filter's vocabulary: R1a's kinds, plus R1b's
+// unused_action while IGA_POLICY_R1B is on.
+func govKindsNow() map[string]bool {
+	if !PolicyActionsOn() {
+		return govKinds
+	}
+	out := map[string]bool{igagov.KindUnusedAction: true}
+	for k, v := range govKinds {
+		out[k] = v
+	}
+	return out
+}
+
 // ValidateFindingFilter checks the enumerations.
 func ValidateFindingFilter(f FindingFilter) error {
 	for _, c := range []struct {
 		param string
 		vals  []string
 		ok    map[string]bool
-	}{{"status", f.Statuses, govStatuses}, {"kind", f.Kinds, govKinds}, {"severity", f.Severities, govSeverities},
+	}{{"status", f.Statuses, govStatuses}, {"kind", f.Kinds, govKindsNow()}, {"severity", f.Severities, govSeverities},
 		{"confidence", f.Confidences, govConfidences}} {
 		for _, v := range c.vals {
 			if !c.ok[v] {
@@ -515,6 +528,9 @@ type FindingDetail struct {
 	Owners              []TargetOwnerView               `json:"owners"`
 	LinkedPolicy        *LinkedPolicy                   `json:"linked_policy"`
 	Consumers           []ConsumerView                  `json:"consumers"`
+	// ActionEvidence is an unused_action finding's frozen R1b evidence at
+	// rev (omitted for every other kind).
+	ActionEvidence []GovActionEvidence `json:"action_evidence,omitempty"`
 }
 
 // LinkedPolicy is the live control on the finding's role, if any.
@@ -544,6 +560,16 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 	q2 := r.db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, rev, *d.IdentityAccountID)
 	if d.Kind == igagov.KindUnusedService {
 		q2 = q2.Where("service = ?", d.DetailKey)
+	}
+	if d.Kind == igagov.KindUnusedAction {
+		// R1b: the service's activity evidence and the action's own.
+		ns, _, _ := igagov.SplitAction(d.DetailKey)
+		q2 = q2.Where("service = ?", ns)
+		d.ActionEvidence = []GovActionEvidence{}
+		if err := r.db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ? AND action_key = ?",
+			ws, rev, *d.IdentityAccountID, d.DetailKey).Find(&d.ActionEvidence).Error; err != nil {
+			return nil, err
+		}
 	}
 	if err := q2.Order("service").Find(&d.Evidence).Error; err != nil {
 		return nil, err
@@ -576,6 +602,21 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 		}
 	}
 	return d, nil
+}
+
+// ActionEvidence is GET /identities/:id/action-evidence at rev (R1b).
+func (r *GovReader) ActionEvidence(ws, identity uuid.UUID, rev int64) ([]GovActionEvidence, error) {
+	var n int64
+	if err := r.db.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, GovNotFound()
+	}
+	if rev == 0 {
+		return []GovActionEvidence{}, nil
+	}
+	return actionEvidenceAt(r.db, ws, rev, identity)
 }
 
 // ActivityEvidence is GET /identities/:id/activity-evidence at rev.

@@ -135,6 +135,9 @@ const (
 	RefuseRoleOnlyUnavailable      = "role_only_recovery_unavailable"
 	RefuseBaselineMissing          = "baseline_boundary_missing"
 	RefuseDirectNeedsAuthSecTarget = "direct_requires_authsec_boundary"
+	// R1b refusals.
+	RefuseActionNotInEvidence = "action_not_in_evidence"
+	RefuseWidensEscalation    = "removal_widens_escalation"
 )
 
 // Refusal is one reason a plan is ineligible, with the object it names
@@ -447,6 +450,171 @@ func ExcludeOnlyDocument(remove []string) ([]byte, string, error) {
 	return c, ContentHash(c), nil
 }
 
+// ExcludeOnlyActionsDocument is R1b's boundary: §3.2's exclusion-only shape
+// with the removed actions added to the same NotAction list as literal
+// entries. DECISION R1b-1: still exclusion-only -- one Allow, NotAction
+// [removed "<ns>:*" + removed actions], Resource "*" -- so every action not
+// listed keeps whatever grants it (preservation by construction). An action
+// whose namespace is removed whole is not listed twice. Removed actions are
+// never collapsed into "<ns>:*" to fit the 6,144-character limit: that would
+// remove the actions the role uses; an oversized document is refused
+// (document_too_large) and the removal must be split. With no actions it is
+// exactly ExcludeOnlyDocument.
+func ExcludeOnlyActionsDocument(remove, actions []string) ([]byte, string, error) {
+	if len(actions) == 0 {
+		return ExcludeOnlyDocument(remove)
+	}
+	rm := map[string]bool{}
+	var entries []string
+	for _, s := range remove {
+		ns := strings.ToLower(strings.TrimSpace(s))
+		if !reService.MatchString(ns) {
+			return nil, "", fmt.Errorf("igagov: %q is not an IAM service namespace", s)
+		}
+		rm[ns] = true
+		entries = append(entries, ns+":*")
+	}
+	seen := map[string]bool{}
+	for _, x := range actions {
+		a, ok := CanonicalAction(x)
+		if !ok {
+			return nil, "", fmt.Errorf("igagov: %q is not one literal IAM action", x)
+		}
+		ns, _, _ := SplitAction(a)
+		if rm[ns] || seen[ActionKey(a)] {
+			continue
+		}
+		seen[ActionKey(a)] = true
+		entries = append(entries, a)
+	}
+	doc := map[string]any{
+		"Version": PolicyVersion20121017,
+		"Statement": []any{map[string]any{
+			"Sid": AuthSecBoundarySid, "Effect": EffectAllow, "NotAction": sortedUnique(entries), "Resource": "*",
+		}},
+	}
+	c, err := CanonicalizeValue(doc)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, ContentHash(c), nil
+}
+
+// ActionExclusionChanges is ExclusionChanges at action level (R1b): over the
+// candidate literal actions, what the change newly excludes, what stays
+// excluded and what it stops excluding. nil text = no boundary.
+func ActionExclusionChanges(beforeText, afterText *string, candidates []string) (newly, already, unexcluded []string, err error) {
+	dec := func(t *string) (*PolicyDocument, error) {
+		if t == nil {
+			return nil, nil
+		}
+		d, err := DecodePolicyDocument(*t)
+		if err != nil {
+			return nil, err
+		}
+		return &d, nil
+	}
+	b, err := dec(beforeText)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	a, err := dec(afterText)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	excl := func(d *PolicyDocument, x string) bool { return d != nil && BoundaryExcludesAction(*d, x) }
+	byKey := map[string]string{}
+	for _, c := range candidates {
+		if ca, ok := CanonicalAction(c); ok {
+			if cur, ok := byKey[ActionKey(ca)]; !ok || ca < cur {
+				byKey[ActionKey(ca)] = ca
+			}
+		}
+	}
+	newly, already, unexcluded = []string{}, []string{}, []string{}
+	for _, k := range sortedKeys(byKey) {
+		x := byKey[k]
+		be, ae := excl(b, x), excl(a, x)
+		switch {
+		case !be && ae:
+			newly = append(newly, x)
+		case be && ae:
+			already = append(already, x)
+		case be && !ae:
+			unexcluded = append(unexcluded, x)
+		}
+	}
+	return newly, already, unexcluded, nil
+}
+
+// notActionActions lists the literal actions in NotAction lists of Allow
+// statements (an R1b AuthSec boundary's action exclusions).
+func notActionActions(text *string) []string {
+	if text == nil {
+		return nil
+	}
+	d, err := DecodePolicyDocument(*text)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, st := range d.Statements {
+		if st.Effect != EffectAllow || !st.IsNotAction {
+			continue
+		}
+		for _, p := range st.NotAction {
+			if a, ok := CanonicalAction(p); ok {
+				out = append(out, a)
+			}
+		}
+	}
+	return out
+}
+
+// escalationsAllowed is the set of escalation-catalog patterns (§3.7) a
+// boundary's Allow statements reach; no boundary reaches every one.
+func escalationsAllowed(text *string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if text == nil {
+		for _, e := range escalationCatalog {
+			out[e.Pattern] = true
+		}
+		return out, nil
+	}
+	d, err := DecodePolicyDocument(*text)
+	if err != nil {
+		return nil, err
+	}
+	for _, st := range d.Statements {
+		for _, e := range EscalationsGranted(st) {
+			out[e] = true
+		}
+	}
+	return out, nil
+}
+
+// EscalationWidening lists the escalation-catalog patterns (§3.7) the new
+// boundary reaches that the boundary in force does not: R1b's guard that a
+// removal never lets the ceiling grant more where it matters most
+// (DECISION R1b-11).
+func EscalationWidening(beforeText, afterText *string) ([]string, error) {
+	b, err := escalationsAllowed(beforeText)
+	if err != nil {
+		return nil, err
+	}
+	a, err := escalationsAllowed(afterText)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for e := range a {
+		if !b[e] {
+			out = append(out, e)
+		}
+	}
+	return sortedUnique(out), nil
+}
+
 // BoundaryExcludes reports whether a boundary document excludes namespace ns
 // entirely: no Allow statement grants any action of ns (Statement
 // .GrantsNamespace, which counts NotAction and wildcards). This is the
@@ -567,6 +735,21 @@ func namespaceWildcard(action string) bool {
 // any Allow uses NotAction, Action "*" or a namespace wildcard, or when
 // nothing would remain. It returns the canonical narrowed text and hash.
 func NarrowCustomerBoundary(text string, remove []string) ([]byte, string, Narrowing, *Refusal, error) {
+	return narrowCustomerBoundary(text, remove, nil)
+}
+
+// NarrowCustomerBoundaryActions is NarrowCustomerBoundary with R1b's action
+// removals: an Action entry is also deleted when it is literally (case-
+// insensitively) one of the removed actions. DECISION R1b-10: narrowing
+// stays structure-preserving -- it never rewrites a pattern -- so it is
+// refused when, after the deletions, any surviving Allow pattern still
+// matches a removed action ("s3:Delete*" still grants s3:DeleteObject).
+// With no actions it is exactly NarrowCustomerBoundary.
+func NarrowCustomerBoundaryActions(text string, remove, actions []string) ([]byte, string, Narrowing, *Refusal, error) {
+	return narrowCustomerBoundary(text, remove, actions)
+}
+
+func narrowCustomerBoundary(text string, remove, actions []string) ([]byte, string, Narrowing, *Refusal, error) {
 	doc, err := DecodePolicyDocument(text)
 	if err != nil {
 		return nil, "", Narrowing{}, nil, err
@@ -587,6 +770,10 @@ func NarrowCustomerBoundary(text string, remove []string) ([]byte, string, Narro
 	rm := map[string]bool{}
 	for _, s := range remove {
 		rm[strings.ToLower(s)] = true
+	}
+	rmAct := map[string]bool{}
+	for _, a := range actions {
+		rmAct[ActionKey(a)] = true
 	}
 	raw, err := DecodePolicyText(text)
 	if err != nil {
@@ -609,11 +796,19 @@ func NarrowCustomerBoundary(text string, remove []string) ([]byte, string, Narro
 		var remaining []string
 		for _, a := range st.Action {
 			ns, _, _ := SplitAction(a)
-			if rm[strings.ToLower(ns)] {
+			if rm[strings.ToLower(ns)] || rmAct[ActionKey(a)] {
 				rec.RemovedActions = append(rec.RemovedActions, a)
 				continue
 			}
 			remaining = append(remaining, a)
+		}
+		for _, x := range actions {
+			for _, a := range remaining {
+				if globMatch(a, x) {
+					return nil, "", Narrowing{}, &Refusal{RefuseNotNarrowable,
+						fmt.Sprintf("statement %d (%s) still grants %s through %q; narrowing would rewrite the pattern", i, st.Sid, x, a)}, nil
+				}
+			}
 		}
 		switch {
 		case len(rec.RemovedActions) == 0:
@@ -931,6 +1126,10 @@ type PlanDiff struct {
 	Split           *SplitDetail          `json:"split,omitempty"`
 	Notes           []string              `json:"notes"`
 	Facts           []Fact                `json:"facts"`
+	// R1b: the action-level exclusion changes (omitted for an R1a plan).
+	NewlyExcludedActions   []string `json:"newly_excluded_actions,omitempty"`
+	AlreadyExcludedActions []string `json:"already_excluded_actions,omitempty"`
+	NewlyUnexcludedActions []string `json:"newly_unexcluded_actions,omitempty"`
 }
 
 // Plan cases (PlanDiff.Case).
@@ -1347,10 +1546,16 @@ func CompileTarget(in TargetInput) (TargetPlans, error) {
 	if strings.Join(sortedUnique(removeSet), ",") != strings.Join(in.Evidence.Bundle.Facts.RemovedServices, ",") {
 		return TargetPlans{}, compileErr(ErrCodeEvidenceMismatch, "the bundle was built for another removal set")
 	}
+	if strings.Join(in.Intent.RemovedActionKeys(), ",") != strings.Join(sortedUnique(in.Evidence.Bundle.Facts.RemovedActions), ",") {
+		return TargetPlans{}, compileErr(ErrCodeEvidenceMismatch, "the bundle was built for another action removal set")
+	}
 
 	ap := in.Evidence.plan(in.Control.ID, PlanApply, in.Intent.Delivery, in.Live.ReadAt)
 	ap.DesiredAttachment = AttachmentPresent
 	ap.Impact = impactFor(in.Evidence.Bundle.Facts, in.Intent.Remove, in.Intent.Retain)
+	if len(in.Intent.RemoveActions) > 0 {
+		impactActions(&ap.Impact, in.Evidence.Bundle.Facts, in.Intent.RemoveActions)
+	}
 
 	// Incarnation and eligibility by path and tag (§2.2, §3.1).
 	if rs := checkIncarnation(in.Live, in.Control.RoleID); rs != nil {
@@ -1365,6 +1570,9 @@ func CompileTarget(in TargetInput) (TargetPlans, error) {
 
 	// §3.4 (1): each removal is justified.
 	ap.refuse(justifyRemovals(in.Intent.Remove, in.Evidence.Bundle.Facts.Activity, in.DependencyContexts)...)
+	if len(in.Intent.RemoveActions) > 0 {
+		ap.refuse(justifyActionRemovals(in.Intent.RemoveActions, in.Evidence.Bundle.Facts, in.DependencyContexts)...)
+	}
 
 	pre, err := ApplyPreconditionFor(in.Live)
 	if err != nil {
@@ -1426,6 +1634,26 @@ func CompileTarget(in TargetInput) (TargetPlans, error) {
 	}
 	if err != nil {
 		return TargetPlans{}, err
+	}
+	if len(in.Intent.RemoveActions) > 0 && ap.DesiredDocumentHash != nil {
+		// R1b: the new ceiling may never reach an escalation the one in
+		// force excludes (DECISION R1b-11).
+		var before *string
+		if cur != nil {
+			before = &cur.DefaultDocument
+		}
+		for _, d := range ap.Documents {
+			if d.Hash == *ap.DesiredDocumentHash {
+				after := d.Canonical
+				wid, err := EscalationWidening(before, &after)
+				if err != nil {
+					return TargetPlans{}, err
+				}
+				for _, e := range wid {
+					ap.refuse(Refusal{RefuseWidensEscalation, e})
+				}
+			}
+		}
 	}
 	if err := ap.seal(); err != nil {
 		return TargetPlans{}, err
@@ -1491,6 +1719,75 @@ func justifyRemovals(remove []RemoveEntry, activity []BundleActivity, ctxs []Dep
 	return out
 }
 
+// justifyActionRemovals is §3.4 (1) at action level (R1b): every removed
+// action has frozen evidence in the bundle with its basis's outcome --
+// no_event with >= MinQualifiedDays and a known grant age, or, for a
+// data_event_acknowledged removal, not_observable -- and its namespace is
+// not a dependency of the workload context (DECISION R1b-7).
+func justifyActionRemovals(remove []RemoveActionEntry, f BundleFacts, ctxs []DependencyContext) []Refusal {
+	act := map[string]BundleActionActivity{}
+	for _, a := range f.ActionActivity {
+		act[ActionKey(a.Action)] = a
+	}
+	var out []Refusal
+	for _, e := range remove {
+		a, ok := act[ActionKey(e.Action)]
+		switch {
+		case !ok || a.State != EvidenceCollected:
+			out = append(out, Refusal{RefuseActionNotInEvidence, e.Action})
+		case e.Basis == RemoveActionDataEventAcknowledged:
+			if a.Outcome != ActionNotObservable {
+				out = append(out, Refusal{RefuseRemovalNotJustified, e.Action + ": action outcome " + a.Outcome})
+			}
+		case a.Outcome != ActionNoEvent:
+			out = append(out, Refusal{RefuseRemovalNotJustified, e.Action + ": action outcome " + a.Outcome})
+		case a.QualifiedDays < MinQualifiedDays:
+			out = append(out, Refusal{RefuseRemovalNotJustified, fmt.Sprintf("%s: %d qualified days", e.Action, a.QualifiedDays)})
+		case a.GrantAgeBasis != GrantAgeObservedSinceChange && a.GrantAgeBasis != GrantAgePredatesObservation:
+			out = append(out, Refusal{RefuseRemovalNotJustified, e.Action + ": grant age " + a.GrantAgeBasis})
+		}
+		if d, dep := IsDependency(e.Service, ctxs); dep {
+			out = append(out, Refusal{RefuseRemovalIsDependency, e.Action + " (" + d.Catalog + ")"})
+		}
+	}
+	return out
+}
+
+// impactActions adds R1b's removed actions to an apply impact: the actions
+// with their basis, the statement revisions granting their namespaces, and
+// their namespaces' resource-policy routes (DECISION R1b-12: route analysis
+// is per namespace, so a route of the namespace is listed for its actions --
+// conservative, it may name a route that does not grant that action).
+func impactActions(im *Impact, b BundleFacts, remove []RemoveActionEntry) {
+	ns := map[string]bool{}
+	for _, e := range remove {
+		im.RemovedActions = append(im.RemovedActions, ImpactAction{Action: e.Action, Service: e.Service, Basis: e.Basis})
+		ns[e.Service] = true
+	}
+	have := map[string]bool{}
+	for _, h := range im.StatementRevisions {
+		have[h] = true
+	}
+	for _, g := range b.Grants {
+		for _, s := range g.Services {
+			if ns[s] && !have[g.StatementHash] {
+				im.StatementRevisions = append(im.StatementRevisions, g.StatementHash)
+				have[g.StatementHash] = true
+				break
+			}
+		}
+	}
+	removedSvc := map[string]bool{}
+	for _, r := range im.Removed {
+		removedSvc[r.Service] = true
+	}
+	for _, r := range b.Routes {
+		if ns[r.Service] && !removedSvc[r.Service] {
+			im.Routes = append(im.Routes, r)
+		}
+	}
+}
+
 type applyCtx struct {
 	in        TargetInput
 	role      *LiveRole
@@ -1523,6 +1820,18 @@ func (c applyCtx) candidates(texts ...*string) []string {
 	return sortedUnique(out)
 }
 
+// removedActions are the intent's removed actions (R1b; empty for R1a).
+func (c applyCtx) removedActions() []string { return c.in.Intent.RemovedActionKeys() }
+
+// boundaryDocument is the AuthSec boundary for the intent: §3.2's
+// exclusion-only document, with R1b's removed actions when there are any.
+func (c applyCtx) boundaryDocument() ([]byte, string, error) {
+	if acts := c.removedActions(); len(acts) > 0 {
+		return ExcludeOnlyActionsDocument(c.removed(), acts)
+	}
+	return ExcludeOnlyDocument(c.removed())
+}
+
 func (c applyCtx) checkSize(canonical []byte) {
 	if n := PolicyChars(canonical); n > MaxPolicyChars {
 		c.plan.refuse(Refusal{RefuseDocumentTooLarge, fmt.Sprintf("%d characters excluding whitespace (limit %d)", n, MaxPolicyChars)})
@@ -1537,6 +1846,14 @@ func (c applyCtx) setDiff(p *Plan, caseName string, before, after *BoundaryRef, 
 		return err
 	}
 	p.Diff.NewlyExcluded, p.Diff.AlreadyExcluded, p.Diff.NewlyUnexcluded = n, a, u
+	if acts := c.removedActions(); len(acts) > 0 {
+		cands := append(append(append([]string{}, acts...), notActionActions(beforeText)...), notActionActions(afterText)...)
+		n, a, u, err := ActionExclusionChanges(beforeText, afterText, cands)
+		if err != nil {
+			return err
+		}
+		p.Diff.NewlyExcludedActions, p.Diff.AlreadyExcludedActions, p.Diff.NewlyUnexcludedActions = n, a, u
+	}
 	return nil
 }
 
@@ -1568,6 +1885,10 @@ func (c applyCtx) restoredImpact(u *Plan) {
 	for _, s := range u.Diff.NewlyUnexcluded {
 		u.Impact.Restored = append(u.Impact.Restored, ImpactService{Service: s, Basis: "undo"})
 	}
+	for _, a := range u.Diff.NewlyUnexcludedActions {
+		ns, _, _ := SplitAction(a)
+		u.Impact.RestoredActions = append(u.Impact.RestoredActions, ImpactAction{Action: a, Service: ns, Basis: "undo"})
+	}
 }
 
 func (c applyCtx) roleFacts(withDefinition bool) []Fact {
@@ -1592,7 +1913,7 @@ func (c applyCtx) none() (*Plan, error) {
 	if len(name) > MaxPolicyNameLen {
 		p.refuse(Refusal{RefusePolicyNameTooLong, name})
 	}
-	doc, h, err := ExcludeOnlyDocument(c.removed())
+	doc, h, err := c.boundaryDocument()
 	if err != nil {
 		return nil, err
 	}
@@ -1681,7 +2002,7 @@ func (c applyCtx) authsec() (*Plan, error) {
 	if len(c.curOthers) > 0 {
 		p.refuse(Refusal{RefuseConsumersChanged, fmt.Sprintf("%s is used by %d other entities", arn, len(c.curOthers))})
 	}
-	doc, h, err := ExcludeOnlyDocument(c.removed())
+	doc, h, err := c.boundaryDocument()
 	if err != nil {
 		return nil, err
 	}
@@ -1744,7 +2065,7 @@ func (c applyCtx) authsec() (*Plan, error) {
 
 // narrow narrows the current customer boundary or records the refusal.
 func (c applyCtx) narrow() ([]byte, string, *Narrowing, error) {
-	doc, h, n, ref, err := NarrowCustomerBoundary(c.cur.DefaultDocument, c.removed())
+	doc, h, n, ref, err := NarrowCustomerBoundaryActions(c.cur.DefaultDocument, c.removed(), c.removedActions())
 	if err != nil {
 		return nil, "", nil, err
 	}

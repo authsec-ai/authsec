@@ -195,6 +195,16 @@ func main() {
 	// gated by it.
 	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
 	services.SetPolicyGate(policyGate)
+	// IGA_POLICY_R1B (SPEC-iga-phase3-policy.md §12.1): Phase 3 R1b,
+	// action-level right-sizing. Its own switch, read ONCE, default off; on
+	// requires IGA_POLICY available (read live) and migration 060 verified by
+	// its own check, so a database without 060 never takes R1a down. Off, every
+	// R1a path runs exactly as before.
+	r1bGate := services.PolicyR1BGateFromEnv()
+	services.SetPolicyR1BGate(r1bGate)
+	if r1bGate.Enabled() {
+		go r1bGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
 	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
 	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
 	// ready hook, never before. It also claims nothing while the gate reads

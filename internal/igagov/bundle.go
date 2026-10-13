@@ -157,6 +157,27 @@ type BundleFacts struct {
 	Activity            []BundleActivity `json:"activity"`
 	Routes              []Route          `json:"routes"`
 	Gaps                []Gap            `json:"gaps"`
+	// R1b (IGA_POLICY_R1B): the removed actions, their action-level
+	// evidence and the action catalog it was judged with. Omitted when
+	// empty, so every R1a bundle and its hash are unchanged.
+	RemovedActions []string               `json:"removed_actions,omitempty"`
+	ActionActivity []BundleActionActivity `json:"action_activity,omitempty"`
+	ActionCatalog  string                 `json:"action_catalog,omitempty"`
+}
+
+// BundleActionActivity is one action's frozen R1b evidence as a plan uses it
+// (iga_gov_action_evidence at the evaluated revision).
+type BundleActionActivity struct {
+	Action            string  `json:"action"`
+	Service           string  `json:"service"`
+	State             string  `json:"state"`
+	Outcome           string  `json:"outcome"`
+	Reason            string  `json:"reason,omitempty"`
+	LastEventAt       *string `json:"last_event_at"`
+	GrantAgeBasis     string  `json:"grant_age_basis"`
+	VerifiedGrantFrom *string `json:"verified_grant_from"`
+	QualifiedDays     int     `json:"qualified_days"`
+	DataEvent         bool    `json:"data_event,omitempty"`
 }
 
 // BundleInput is everything the builder service gathered for one target,
@@ -175,6 +196,11 @@ type BundleInput struct {
 	// RouteAnalyses are AnalyzeRoutes results for the removed services, from
 	// the named scan; their not-analysed entries become gaps, the rest routes.
 	RouteAnalyses []RouteAnalysis
+	// R1b: the removed actions and the action evidence of the role (empty
+	// for an R1a bundle). The removed actions' namespaces' route analyses
+	// are taken from RouteAnalyses like the removed services'.
+	RemovedActions []string
+	ActionActivity []BundleActionActivity
 }
 
 // Bundle is a built, canonical, hashed bundle with its trust.
@@ -315,6 +341,17 @@ func ClassifyBundleTrust(f BundleFacts) (string, []string) {
 			untrusted = append(untrusted, "activity_not_collected:"+svc)
 		}
 	}
+	if len(f.RemovedActions) > 0 {
+		aa := map[string]BundleActionActivity{}
+		for _, a := range f.ActionActivity {
+			aa[ActionKey(a.Action)] = a
+		}
+		for _, x := range f.RemovedActions {
+			if a, ok := aa[ActionKey(x)]; !ok || a.State != EvidenceCollected {
+				untrusted = append(untrusted, "action_activity_not_collected:"+x)
+			}
+		}
+	}
 	for _, g := range f.Gaps {
 		partial = append(partial, "gap "+g.Key)
 	}
@@ -399,6 +436,36 @@ func BuildBundle(in BundleInput, rules TrustRules) (Bundle, error) {
 	removed := map[string]bool{}
 	for _, s := range f.RemovedServices {
 		removed[s] = true
+	}
+	if len(in.RemovedActions) > 0 {
+		// R1b: the actions' namespaces' routes and gaps are the plan's too
+		// (a resource policy may grant the action to the role's session).
+		f.RemovedActions = sortedUnique(in.RemovedActions)
+		f.ActionCatalog = ActionCatalogLabel()
+		for _, a := range f.RemovedActions {
+			if ns, _, ok := SplitAction(a); ok {
+				removed[ns] = true
+			}
+		}
+		// Only the removed actions' facts: the plan's basis, nothing more.
+		want := map[string]bool{}
+		for _, a := range f.RemovedActions {
+			want[ActionKey(a)] = true
+		}
+		f.ActionActivity = []BundleActionActivity{}
+		for _, a := range in.ActionActivity {
+			if want[ActionKey(a.Action)] {
+				f.ActionActivity = append(f.ActionActivity, a)
+			}
+		}
+		sort.Slice(f.ActionActivity, func(i, j int) bool {
+			return ActionKey(f.ActionActivity[i].Action) < ActionKey(f.ActionActivity[j].Action)
+		})
+		for i := 1; i < len(f.ActionActivity); i++ {
+			if ActionKey(f.ActionActivity[i].Action) == ActionKey(f.ActionActivity[i-1].Action) {
+				return Bundle{}, fmt.Errorf("igagov: action activity lists %s twice", f.ActionActivity[i].Action)
+			}
+		}
 	}
 	for _, ra := range in.RouteAnalyses {
 		if !removed[ra.Service] {

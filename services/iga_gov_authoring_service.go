@@ -924,6 +924,9 @@ func parseRightSize(raw json.RawMessage) (*igagov.RightSizeIntent, []byte, strin
 			map[string]any{"errors": []igagov.IntentError{{Field: "kind", Code: "not_supported_here",
 				Message: in.Kind + " versions are created by their own flow"}}})
 	}
+	if len(in.RightSize.RemoveActions) > 0 && !PolicyActionsOn() {
+		return nil, nil, "", actionsUnavailable()
+	}
 	canon, hash, err := igagov.CanonicalIntent(in)
 	if err != nil {
 		return nil, nil, "", intentProblems(err)
@@ -1235,10 +1238,28 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 		return nil, ErrNotReviewOwner
 	}
 	keep := map[string]igagov.RetainEntry{}
+	keepActs := map[string]bool{}
 	for _, it := range items {
+		if strings.Contains(it.Service, ":") && len(in.RemoveActions) > 0 {
+			// R1b: an owner retains an action by naming it. DECISION R1b-9:
+			// the action leaves remove_actions for every subject (an action
+			// retain is not owner-scoped); the owner's reason and review date
+			// stay on their owner response.
+			keepActs[igagov.ActionKey(it.Service)] = true
+			continue
+		}
 		it.Basis = igagov.RetainOwner
 		it.Subjects = nil
 		keep[it.Service] = it
+	}
+	if len(keepActs) > 0 {
+		var acts []igagov.RemoveActionEntry
+		for _, e := range in.RemoveActions {
+			if !keepActs[igagov.ActionKey(e.Action)] {
+				acts = append(acts, e)
+			}
+		}
+		in.RemoveActions = acts
 	}
 	if len(owned) == len(in.Subjects) {
 		retainForAll(&in, keep)
@@ -1247,11 +1268,11 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 	}
 	var empty []string
 	for _, s := range in.Subjects {
-		if len(in.ForSubject(s.IdentityAccountID).Remove) == 0 {
+		if fs := in.ForSubject(s.IdentityAccountID); len(fs.Remove) == 0 && len(fs.RemoveActions) == 0 {
 			empty = append(empty, s.RoleID)
 		}
 	}
-	if len(in.Remove) == 0 || len(empty) > 0 {
+	if (len(in.Remove) == 0 && len(in.RemoveActions) == 0) || len(empty) > 0 {
 		return nil, govUnprocessable(GovCodeNothingToRemove, "Retaining these services leaves nothing to remove.",
 			map[string]any{"role_ids": empty})
 	}
@@ -1490,6 +1511,9 @@ type ProposalRecommendation struct {
 	ResourcePolicyRoutes []ProposalRoute      `json:"resource_policy_routes"`
 	Warnings             []string             `json:"warnings"`
 	Context              *ProposalContext     `json:"context,omitempty"`
+	// RemoveActions is R1b's recommended action removals (omitted when R1b
+	// recommends none, so an R1a response is unchanged).
+	RemoveActions []igagov.RemoveActionEntry `json:"remove_actions,omitempty"`
 }
 
 // ProposalResult is the POST /proposals response body.
@@ -1518,10 +1542,14 @@ type ProposalResult struct {
 type proposalRole struct {
 	target   ResolvedTarget
 	findings map[string]uuid.UUID // service -> finding id (from findings)
-	prelim   igagov.Bundle
-	basis    *bundleBasis
-	final    igagov.Bundle
-	stored   *StoredBundle
+	// R1b: action key -> unused_action finding id (from findings), and the
+	// role's removable actions (frozen evidence at the evaluated revision).
+	actionFindings map[string]uuid.UUID
+	actions        []govActionEvidence
+	prelim         igagov.Bundle
+	basis          *bundleBasis
+	final          igagov.Bundle
+	stored         *StoredBundle
 }
 
 // CreateProposal is POST /proposals: it resolves the targets (§2.12),
@@ -1556,7 +1584,8 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	}
 	db := a.db.WithContext(ctx)
 	var keys []TargetKey
-	wanted := map[uuid.UUID]map[string]uuid.UUID{} // identity -> service -> finding
+	wanted := map[uuid.UUID]map[string]uuid.UUID{}     // identity -> service -> finding
+	wantedActs := map[uuid.UUID]map[string]uuid.UUID{} // R1b: identity -> action key -> finding
 	switch {
 	case req.From != nil:
 		if len(req.From.FindingIDs) == 0 || len(req.From.FindingIDs) > MaxTargetKeys*20 {
@@ -1579,6 +1608,21 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 		}
 		var bad []map[string]any
 		for _, f := range fs {
+			if f.Kind == igagov.KindUnusedAction && PolicyActionsOn() && f.IdentityAccountID != nil &&
+				(f.Status == "open" || f.Status == "reopened") {
+				// R1b: an unused_action finding seeds an action removal; its
+				// role removes no service unless an unused_service finding of
+				// it is selected too.
+				if wanted[*f.IdentityAccountID] == nil {
+					wanted[*f.IdentityAccountID] = map[string]uuid.UUID{}
+					keys = append(keys, TargetKey{ObjectID: f.IdentityAccountID.String()})
+				}
+				if wantedActs[*f.IdentityAccountID] == nil {
+					wantedActs[*f.IdentityAccountID] = map[string]uuid.UUID{}
+				}
+				wantedActs[*f.IdentityAccountID][f.DetailKey] = f.ID
+				continue
+			}
 			if f.Kind != igagov.KindUnusedService || f.IdentityAccountID == nil || (f.Status != "open" && f.Status != "reopened") {
 				bad = append(bad, map[string]any{"finding_id": f.ID, "kind": f.Kind, "status": f.Status})
 				continue
@@ -1614,6 +1658,7 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	}
 	for _, r := range roles {
 		r.findings = wanted[r.target.Identity.ID]
+		r.actionFindings = wantedActs[r.target.Identity.ID]
 	}
 
 	// Recommendation from the evidence: a preliminary bundle per role (no
@@ -1639,7 +1684,12 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 			}
 			set = keep
 		}
-		if len(set) == 0 {
+		if PolicyActionsOn() {
+			if r.actions, err = a.proposalActions(db, ws, r, set); err != nil {
+				return nil, err
+			}
+		}
+		if len(set) == 0 && len(r.actions) == 0 {
 			problems = append(problems, map[string]any{"role_id": r.target.Identity.RoleID, "reason": "no service has a qualified no-attempt basis"})
 		}
 		removeSets = append(removeSets, set)
@@ -1656,14 +1706,15 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 			}
 		}
 	}
-	if len(remove) == 0 {
+	removeActs := commonActions(roles, remove, &warnings)
+	if len(remove) == 0 && len(removeActs) == 0 {
 		return nil, govUnprocessable(GovCodeNothingToRemove, "The selected roles have no removable service in common.",
 			map[string]any{"warnings": warnings})
 	}
 
 	// The bundles the plans will compile from.
 	for _, r := range roles {
-		b, _, basis, err := a.targets.buildBasis(ctx, ws, r.target.Identity.ID, remove)
+		b, _, basis, err := a.targets.buildBasisActions(ctx, ws, r.target.Identity.ID, remove, removeActs)
 		if err != nil {
 			if ge := bundleBuildError(err, r.target.Identity.RoleID); ge != nil {
 				return nil, ge
@@ -1695,6 +1746,11 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	}
 	rec.Warnings = append(rec.Warnings, warnings...)
 	rec.Context = ctxObj
+	if len(removeActs) > 0 {
+		if err := a.recommendActions(ws, roles, removeActs, &intent, &rec); err != nil {
+			return nil, err
+		}
+	}
 	if err := igagov.ValidateIntent(igagov.Intent{Kind: igagov.IntentRightSizeServices, RightSize: &intent}); err != nil {
 		return nil, fmt.Errorf("igagov: the recommended intent is invalid: %w", err)
 	}

@@ -309,6 +309,14 @@ func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov
 	for _, r := range p.Impact.Removed {
 		in.Removed = append(in.Removed, r.Service)
 	}
+	if len(p.Impact.RemovedActions) > 0 {
+		// R1b: the plan removes actions within kept services; restriction
+		// and the denial classes are judged at action level too.
+		for _, x := range p.Impact.RemovedActions {
+			in.RemovedActions = append(in.RemovedActions, x.Action)
+		}
+		in.RemovesServices = d.Kind == igagov.PlanApply && p.DesiredAttachment == igagov.AttachmentPresent
+	}
 	for _, r := range p.Impact.Retained {
 		in.Retained = append(in.Retained, igagov.RetainedService{Service: r.Service, ActiveInQualifiedInterval: r.Basis == "observed"})
 	}

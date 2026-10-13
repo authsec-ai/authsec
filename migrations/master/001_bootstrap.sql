@@ -8400,7 +8400,7 @@ CREATE TABLE public.iga_gov_finding (
     CONSTRAINT iga_gov_finding_confidence_check CHECK ((confidence = ANY (ARRAY['qualified'::text, 'age_unverified'::text, 'not_applicable'::text]))),
     CONSTRAINT iga_gov_finding_exception_chk CHECK (((status = 'excepted'::text) = (excepted_until IS NOT NULL))),
     CONSTRAINT iga_gov_finding_family_check CHECK ((family = ANY (ARRAY['governance'::text, 'cloud_access'::text]))),
-    CONSTRAINT iga_gov_finding_kind_check CHECK ((kind = ANY (ARRAY['unused_service'::text, 'broad_grant'::text, 'shared_role'::text, 'missing_owner'::text, 'missing_review_date'::text, 'activity_not_read'::text]))),
+    CONSTRAINT iga_gov_finding_kind_check CHECK ((kind = ANY (ARRAY['unused_service'::text, 'broad_grant'::text, 'shared_role'::text, 'missing_owner'::text, 'missing_review_date'::text, 'activity_not_read'::text, 'unused_action'::text]))),
     CONSTRAINT iga_gov_finding_rev_order_chk CHECK ((first_seen_rev <= last_evaluated_rev)),
     CONSTRAINT iga_gov_finding_severity_check CHECK ((severity = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text, 'info'::text]))),
     CONSTRAINT iga_gov_finding_status_check CHECK ((status = ANY (ARRAY['open'::text, 'under_review'::text, 'excepted'::text, 'mitigated'::text, 'resolved'::text, 'cleared'::text, 'superseded'::text, 'reopened'::text])))
@@ -10128,6 +10128,44 @@ ALTER TABLE ONLY public.iga_gov_evaluation_pruned
 
 ALTER TABLE ONLY public.iga_gov_evaluation_pruned
     ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_rev_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation(workspace_id, rev) ON DELETE CASCADE;
+
+-- 060_r1b_action_evidence: R1b action-level evidence (§12.1); the
+-- unused_action finding kind is in iga_gov_finding_kind_check above.
+CREATE TABLE IF NOT EXISTS public.iga_gov_action_evidence (
+  workspace_id         uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  rev                  bigint NOT NULL,
+  identity_account_id  uuid NOT NULL,
+  role_id              text NOT NULL,
+  service              text NOT NULL,
+  action               text NOT NULL,
+  action_key           text NOT NULL,
+  state                text NOT NULL CHECK (state IN ('collected','not_collected')),
+  outcome              text NOT NULL CHECK (outcome IN ('observed','no_event','not_enough_history',
+                         'not_observable','unreviewed','not_collected')),
+  reason               text NOT NULL DEFAULT '',
+  last_event_at        timestamptz,
+  event_count          integer NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+  coverage_start       timestamptz,
+  covered_until        timestamptz,
+  window_start         timestamptz,
+  qualified_days       integer NOT NULL DEFAULT 0 CHECK (qualified_days >= 0),
+  grant_observed_since timestamptz,
+  grant_age_basis      text NOT NULL CHECK (grant_age_basis IN ('observed_since_change','predates_observation','unknown')),
+  data_event           boolean NOT NULL DEFAULT false,
+  scan_run_id          uuid,
+  catalog              text NOT NULL,
+  PRIMARY KEY (workspace_id, rev, identity_account_id, action_key),
+  CONSTRAINT iga_gov_xe_key_chk CHECK (action_key = lower(action)),
+  CONSTRAINT iga_gov_xe_state_chk CHECK ((state = 'not_collected') = (outcome = 'not_collected')),
+  CONSTRAINT iga_gov_xe_collected_chk CHECK (state = 'not_collected' OR (covered_until IS NOT NULL AND window_start IS NOT NULL)),
+  FOREIGN KEY (workspace_id, scan_run_id) REFERENCES public.cloud_scan_run (workspace_id, id),
+  FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation (workspace_id, rev) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, identity_account_id) REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE
+);
+
+DROP TRIGGER IF EXISTS iga_gov_action_evidence_frozen ON public.iga_gov_action_evidence;
+CREATE TRIGGER iga_gov_action_evidence_frozen BEFORE INSERT OR UPDATE ON public.iga_gov_action_evidence
+  FOR EACH ROW EXECUTE FUNCTION public.iga_gov_evaluation_rows_frozen();
 
 -- ---------------------------------------------------------------------------
 -- login_tickets (043): first-factor proof for the MFA step and the session

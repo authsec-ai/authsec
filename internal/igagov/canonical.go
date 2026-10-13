@@ -814,6 +814,30 @@ type Impact struct {
 	// omitted when empty so every apply impact hashes as before (DECISION
 	// D36).
 	Restored []ImpactService `json:"restored,omitempty"`
+	// RemovedActions / RestoredActions are R1b's action-level members,
+	// omitted when empty so every R1a impact hashes as before.
+	RemovedActions  []ImpactAction `json:"removed_actions,omitempty"`
+	RestoredActions []ImpactAction `json:"restored_actions,omitempty"`
+}
+
+// ImpactAction is one action an R1b plan removes (or an undo restores),
+// with its namespace and basis.
+type ImpactAction struct {
+	Action  string `json:"action"`
+	Service string `json:"service"`
+	Basis   string `json:"basis"`
+}
+
+func sortImpactActions(in []ImpactAction) []ImpactAction {
+	out := append([]ImpactAction{}, in...)
+	sort.Slice(out, func(i, j int) bool {
+		a, b := strings.ToLower(out[i].Action), strings.ToLower(out[j].Action)
+		if a != b {
+			return a < b
+		}
+		return out[i].Basis < out[j].Basis
+	})
+	return out
 }
 
 // Normalized sorts and de-duplicates every member so impact_hash does not
@@ -829,6 +853,12 @@ func (im Impact) Normalized() Impact {
 	}
 	if len(im.Restored) > 0 {
 		out.Restored = append([]ImpactService{}, im.Restored...)
+	}
+	if len(im.RemovedActions) > 0 {
+		out.RemovedActions = sortImpactActions(im.RemovedActions)
+	}
+	if len(im.RestoredActions) > 0 {
+		out.RestoredActions = sortImpactActions(im.RestoredActions)
 	}
 	sort.Slice(out.Consumers, func(i, j int) bool {
 		a, b := out.Consumers[i], out.Consumers[j]

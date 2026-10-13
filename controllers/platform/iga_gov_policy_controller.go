@@ -101,6 +101,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/findings/summary", require("governance", "read"), ctl.FindingsSummary)
 	g.GET("/findings/:id", require("governance", "read"), ctl.GetFinding)
 	g.GET("/identities/:id/activity-evidence", require("governance", "read"), ctl.ActivityEvidence)
+	// R1b (IGA_POLICY_R1B): action-level evidence; 422 policy_actions_unavailable while off.
+	g.GET("/identities/:id/action-evidence", require("governance", "read"), ctl.ActionEvidence)
 	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
 	g.GET("/evidence-bundles/:id", require("governance", "read"), ctl.GetEvidenceBundle)
@@ -301,6 +303,19 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 			reasons[f.name] = reason
 		default:
 			reasons[f.name] = why
+		}
+	}
+	// R1b (IGA_POLICY_R1B): policy.actions is served only while its switch is
+	// on, so with it off the block is exactly R1a's.
+	if r1b := services.PolicyR1BGateState(); r1b.Enabled() {
+		state, why := r1b.Status()
+		available := on && state == services.PolicyOn
+		out["actions"] = available
+		if !available {
+			if !on {
+				why = reason
+			}
+			reasons["actions"] = why
 		}
 	}
 	out["reasons"] = reasons
