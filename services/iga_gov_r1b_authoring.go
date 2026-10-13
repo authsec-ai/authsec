@@ -155,6 +155,7 @@ func (a *GovAuthoring) recommendActions(ws uuid.UUID, roles []*proposalRole, rem
 			continue
 		}
 		var fids []uuid.UUID
+		// TENANT-EXEMPT: R1b proposal lookup bound to workspace_id = ? (the token's workspace, passed as ws)
 		if err := a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
 		               AND detail_key IN ? AND status IN ('open','reopened')`,
 			ws, r.target.Identity.ID, igagov.KindUnusedAction, keys).Scan(&fids).Error; err != nil {
