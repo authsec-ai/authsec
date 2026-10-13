@@ -59,36 +59,42 @@ type GovRemoveControlResult struct {
 
 // RemoveControl implements both routes (emergency: no review, deployments now).
 func (s *GovDeployments) RemoveControl(ctx context.Context, ws, actor, policyID uuid.UUID, req GovRemoveControlRequest, emergency bool) (*GovRemoveControlResult, error) {
-	db := s.db.WithContext(ctx)
-	pol, err := s.authoring.loadPolicy(db, ws, policyID, false)
+	var pol *models.IGAGovPolicy
+	var ctls []models.IGAGovControl
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		if pol, err = s.authoring.loadPolicy(db, ws, policyID, false); err != nil {
+			return err
+		}
+		if strings.TrimSpace(req.Reason) == "" && emergency {
+			return GovBadParam("reason", "An emergency removal needs a reason.")
+		}
+		if len(req.ControlIDs) == 0 {
+			return GovBadParam("control_ids", "Name the controls to remove.")
+		}
+		if req.Delivery == "" {
+			req.Delivery = igagov.DeliveryDirect
+		}
+		seen := map[uuid.UUID]bool{}
+		for _, raw := range req.ControlIDs {
+			id, err := uuid.Parse(raw)
+			if err != nil || seen[id] {
+				return GovBadParam("control_ids", "control_ids are distinct uuids.")
+			}
+			seen[id] = true
+			c, err := s.loadControl(db, ws, id)
+			if err != nil || c.PolicyID != pol.ID || c.State == "removed" {
+				return govUnprocessable(GovCodeControlNotInPolicy, "Each control must be a live control of this policy.", map[string]any{"control_id": raw})
+			}
+			if err := inFlightCheck(db, ws, c.ID); err != nil {
+				return err
+			}
+			ctls = append(ctls, *c)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	if strings.TrimSpace(req.Reason) == "" && emergency {
-		return nil, GovBadParam("reason", "An emergency removal needs a reason.")
-	}
-	if len(req.ControlIDs) == 0 {
-		return nil, GovBadParam("control_ids", "Name the controls to remove.")
-	}
-	if req.Delivery == "" {
-		req.Delivery = igagov.DeliveryDirect
-	}
-	var ctls []models.IGAGovControl
-	seen := map[uuid.UUID]bool{}
-	for _, raw := range req.ControlIDs {
-		id, err := uuid.Parse(raw)
-		if err != nil || seen[id] {
-			return nil, GovBadParam("control_ids", "control_ids are distinct uuids.")
-		}
-		seen[id] = true
-		c, err := s.loadControl(db, ws, id)
-		if err != nil || c.PolicyID != pol.ID || c.State == "removed" {
-			return nil, govUnprocessable(GovCodeControlNotInPolicy, "Each control must be a live control of this policy.", map[string]any{"control_id": raw})
-		}
-		if err := inFlightCheck(db, ws, c.ID); err != nil {
-			return nil, err
-		}
-		ctls = append(ctls, *c)
 	}
 	sort.Slice(ctls, func(i, j int) bool { return ctls[i].AccountID+ctls[i].RoleID < ctls[j].AccountID+ctls[j].RoleID })
 	type compiled struct {
@@ -113,7 +119,7 @@ func (s *GovDeployments) RemoveControl(ctx context.Context, ws, actor, policyID 
 	}
 	out := &GovRemoveControlResult{Plans: []models.IGAGovPlan{}, Retired: []uuid.UUID{}, Deployments: []models.IGAGovDeployment{}}
 	k, a := userActor(actor)
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		for _, c := range retire {
 			res := tx.Exec(`UPDATE iga_gov_control SET enforcement_seq = enforcement_seq + 1, state = 'removed', updated_at = now()
 				WHERE workspace_id = ? AND id = ? AND state <> 'removed'`, ws, c.ID)
@@ -196,7 +202,7 @@ func (s *GovDeployments) RemoveControl(ctx context.Context, ws, actor, policyID 
 			return err
 		}
 		if !emergency {
-			rv, err := NewIGAGovOwnerReviewService(s.db).OpenReviewTx(tx, ws, v.ID, actor)
+			rv, err := NewIGAGovOwnerReviewService(tx).OpenReviewTx(tx, ws, v.ID, actor)
 			if err != nil {
 				return err
 			}
@@ -212,55 +218,58 @@ func (s *GovDeployments) RemoveControl(ctx context.Context, ws, actor, policyID 
 
 // compileRemoval compiles one control's remove_control plan from a live read.
 func (s *GovDeployments) compileRemoval(ctx context.Context, c models.IGAGovControl, delivery string) (*igagov.Plan, uuid.UUID, int64, error) {
-	db := s.db.WithContext(ctx)
 	ws := c.WorkspaceID
-	var deps []models.IGAGovDeployment
-	if err := db.Where("workspace_id = ? AND control_id = ?", ws, c.ID).Find(&deps).Error; err != nil {
-		return nil, uuid.Nil, 0, err
-	}
-	var src *models.IGAGovDeployment
-	for i := range deps {
-		x := &deps[i]
-		if x.AppliedAt == nil || x.State == models.GovDeployUndone || x.State == models.GovDeployFailed || x.State == models.GovDeployBlocked {
-			continue
-		}
-		if src == nil || x.AppliedAt.After(*src.AppliedAt) {
-			src = x
-		}
-	}
 	var ledger []models.IGAGovArtifact
-	if err := db.Where("workspace_id = ? AND control_id = ? AND kind = 'boundary_policy' AND state IN ('present','drifted')", ws, c.ID).
-		Find(&ledger).Error; err != nil {
-		return nil, uuid.Nil, 0, err
-	}
-	if src == nil || len(ledger) == 0 {
-		return nil, uuid.Nil, 0, &igagov.CompileError{Code: igagov.ErrCodeNoArtifact, Reasons: []string{"no AuthSec artifact recorded"}}
-	}
-	sp, err := s.loadPlanRow(db, ws, src.PlanID)
-	if err != nil {
-		return nil, uuid.Nil, 0, err
-	}
-	ev, err := evidenceOf(db, ws, *sp)
-	if err != nil {
-		return nil, uuid.Nil, 0, err
-	}
+	var sp *models.IGAGovPlan
+	var ev igagov.EvidenceRef
 	base := igagov.Baseline{}
-	if c.BaselineBoundaryARN != nil && c.BaselineDocumentHash != nil {
-		base.BoundaryARN, base.DocumentHash = c.BaselineBoundaryARN, c.BaselineDocumentHash
-		var docs []string
-		_ = db.Raw(`SELECT canonical FROM iga_gov_document WHERE workspace_id = ? AND document_hash = ?`, ws, *c.BaselineDocumentHash).Scan(&docs)
-		if len(docs) == 1 {
-			base.Document = docs[0]
+	var excluded []string
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var deps []models.IGAGovDeployment
+		if err := db.Where("workspace_id = ? AND control_id = ?", ws, c.ID).Find(&deps).Error; err != nil {
+			return err
 		}
+		var src *models.IGAGovDeployment
+		for i := range deps {
+			x := &deps[i]
+			if x.AppliedAt == nil || x.State == models.GovDeployUndone || x.State == models.GovDeployFailed || x.State == models.GovDeployBlocked {
+				continue
+			}
+			if src == nil || x.AppliedAt.After(*src.AppliedAt) {
+				src = x
+			}
+		}
+		if err := db.Where("workspace_id = ? AND control_id = ? AND kind = 'boundary_policy' AND state IN ('present','drifted')", ws, c.ID).
+			Find(&ledger).Error; err != nil {
+			return err
+		}
+		if src == nil || len(ledger) == 0 {
+			return &igagov.CompileError{Code: igagov.ErrCodeNoArtifact, Reasons: []string{"no AuthSec artifact recorded"}}
+		}
+		var err error
+		if sp, err = s.loadPlanRow(db, ws, src.PlanID); err != nil {
+			return err
+		}
+		if ev, err = evidenceOf(db, ws, *sp); err != nil {
+			return err
+		}
+		if c.BaselineBoundaryARN != nil && c.BaselineDocumentHash != nil {
+			base.BoundaryARN, base.DocumentHash = c.BaselineBoundaryARN, c.BaselineDocumentHash
+			var docs []string
+			_ = db.Raw(`SELECT canonical FROM iga_gov_document WHERE workspace_id = ? AND document_hash = ?`, ws, *c.BaselineDocumentHash).Scan(&docs)
+			if len(docs) == 1 {
+				base.Document = docs[0]
+			}
+		}
+		return db.Raw(`SELECT service FROM iga_gov_service_posture WHERE workspace_id = ? AND account_id = ? AND role_id = ? AND exclusion = 'applied'
+			ORDER BY service`, ws, c.AccountID, c.RoleID).Scan(&excluded).Error
+	})
+	if err != nil {
+		return nil, uuid.Nil, 0, err
 	}
 	last := igagov.BoundaryRef{ARN: ledger[0].NativeARN}
 	if ledger[0].DocumentHash != nil {
 		last.DocumentHash = *ledger[0].DocumentHash
-	}
-	var excluded []string
-	if err := db.Raw(`SELECT service FROM iga_gov_service_posture WHERE workspace_id = ? AND account_id = ? AND role_id = ? AND exclusion = 'applied'
-		ORDER BY service`, ws, c.AccountID, c.RoleID).Scan(&excluded).Error; err != nil {
-		return nil, uuid.Nil, 0, err
 	}
 	extra := []string{last.ARN}
 	if base.BoundaryARN != nil {
@@ -270,8 +279,12 @@ func (s *GovDeployments) compileRemoval(ctx context.Context, c models.IGAGovCont
 	if err != nil {
 		return nil, uuid.Nil, 0, err
 	}
-	owned, err := s.authoring.ownedPolicyARNs(db, ws, c.ID)
-	if err != nil {
+	var owned []string
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		owned, err = s.authoring.ownedPolicyARNs(db, ws, c.ID)
+		return err
+	}); err != nil {
 		return nil, uuid.Nil, 0, err
 	}
 	ref := igagov.ControlRef{ID: c.ID.String(), PolicyID: c.PolicyID.String(), AccountID: c.AccountID, RoleID: c.RoleID,
@@ -327,28 +340,31 @@ func (s *GovDeployments) liveForControl(ctx context.Context, c models.IGAGovCont
 // approved version (T3.15's rollout start; DECISION: a control removal has
 // no canary, every control is deployed at once).
 func (s *GovDeployments) StartRemoveControlDeployments(ctx context.Context, ws, actor, policyID uuid.UUID, versionNo int) ([]models.IGAGovDeployment, error) {
-	db := s.db.WithContext(ctx)
 	var v models.IGAGovPolicyVersion
-	if err := db.Where("workspace_id = ? AND policy_id = ? AND version_no = ?", ws, policyID, versionNo).Take(&v).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotFound()
+	var ap *models.IGAGovApproval
+	var ps []models.IGAGovPlan
+	err := s.read(ctx, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND policy_id = ? AND version_no = ?", ws, policyID, versionNo).Take(&v).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotFound()
+			}
+			return err
 		}
-		return nil, err
-	}
-	ap, err := liveApproval(db, ws, v.ID)
+		var err error
+		if ap, err = liveApproval(db, ws, v.ID); err != nil {
+			return err
+		}
+		if v.Status != "approved" || ap == nil || !s.now().Before(ap.ExpiresAt) {
+			return govConflict(GovCodeApprovalRequired, "This removal has no approval in force.", map[string]any{"status": v.Status})
+		}
+		return db.Where("workspace_id = ? AND version_id = ? AND kind = 'remove_control' AND superseded_at IS NULL", ws, v.ID).
+			Order("control_id").Find(&ps).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-	if v.Status != "approved" || ap == nil || !s.now().Before(ap.ExpiresAt) {
-		return nil, govConflict(GovCodeApprovalRequired, "This removal has no approval in force.", map[string]any{"status": v.Status})
-	}
-	var ps []models.IGAGovPlan
-	if err := db.Where("workspace_id = ? AND version_id = ? AND kind = 'remove_control' AND superseded_at IS NULL", ws, v.ID).
-		Order("control_id").Find(&ps).Error; err != nil {
-		return nil, err
-	}
 	out := []models.IGAGovDeployment{}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		for _, p := range ps {
 			if p.Eligibility == igagov.EligibilityIneligible || !containsStr(ap.PlanHashes, p.PlanHash) {
 				continue

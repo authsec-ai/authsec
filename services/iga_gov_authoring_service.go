@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -239,23 +240,35 @@ func currentGovHooks() GovAuthoringHooks {
 /* ------------------------------------------------------------------------- */
 
 // GovAuthoring is the authoring, compile and approval service.
+//
+// AS-108: every database access of this file, iga_gov_compile_service.go
+// and iga_gov_approval_service.go runs in a transaction under row-level
+// security for the caller's workspace (inWorkspace / readWorkspace, or a
+// policy job's InTx); no transaction is held across a live read.
 type GovAuthoring struct {
-	db       *gorm.DB
-	targets  *GovTargets
-	live     LiveReader
-	events   repositories.IGAGovEventRepository
-	jobs     repositories.IGAGovJobRepository
-	settings repositories.IGAGovSettingsRepository
-	now      func() time.Time
-	hooks    func() GovAuthoringHooks
+	db      *gorm.DB
+	targets *GovTargets
+	live    LiveReader
+	events  repositories.IGAGovEventRepository
+	now     func() time.Time
+	hooks   func() GovAuthoringHooks
 }
 
 // NewGovAuthoring builds the service. live may be nil: compilation then
 // answers 503 discovery_unavailable.
 func NewGovAuthoring(db *gorm.DB, live LiveReader) *GovAuthoring {
 	return &GovAuthoring{db: db, targets: NewGovTargets(db), live: live,
-		events: repositories.NewIGAGovEventRepository(db), jobs: repositories.NewIGAGovJobRepository(db),
-		settings: repositories.NewIGAGovSettingsRepository(db), now: time.Now, hooks: currentGovHooks}
+		events: repositories.NewIGAGovEventRepository(db), now: time.Now, hooks: currentGovHooks}
+}
+
+// inWorkspace runs fn in one transaction under row-level security for ws.
+func (a *GovAuthoring) inWorkspace(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, a.db, ws, fn)
+}
+
+// readWorkspace is inWorkspace, read-only.
+func (a *GovAuthoring) readWorkspace(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, a.db, ws, fn)
 }
 
 // WithClock sets the clock of the service and its bundle builder (tests).
@@ -459,28 +472,9 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
-	q := a.db.WithContext(ctx).Table("iga_gov_policy p").
-		Select(`p.*, v.status AS v_status,
-		        (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = p.workspace_id AND t.version_id = p.current_version_id) AS roles`).
-		Joins("LEFT JOIN iga_gov_policy_version v ON v.workspace_id = p.workspace_id AND v.id = p.current_version_id").
-		Where("p.workspace_id = ?", ws).
-		// Access policies (family time_bound) have their own routes and
-		// lifecycle (iga_gov_access_policy.go); R1a never lists or acts on them.
-		Where("p.family <> ?", "time_bound")
-	if f.Family != "" {
-		q = q.Where("p.family = ?", f.Family)
-	}
-	if f.Provider != "" {
-		q = q.Where("p.provider = ?", f.Provider)
-	}
-	if f.Lifecycle != "" {
-		q = q.Where("p.lifecycle = ?", f.Lifecycle)
-	}
-	if f.Status != "" {
-		q = q.Where("v.status = ?", f.Status)
-	}
-	if f.Q != "" {
-		q = q.Where("p.name ILIKE ?", "%"+strings.NewReplacer("%", `\%`, "_", `\_`).Replace(f.Q)+"%")
+	var after *struct {
+		name string
+		id   uuid.UUID
 	}
 	if f.Cursor != "" {
 		raw, err := base64.RawURLEncoding.DecodeString(f.Cursor)
@@ -492,10 +486,41 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 		if err != nil {
 			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid.", map[string]any{"parameter": "cursor"})
 		}
-		q = q.Where("(p.name, p.id) > (?, ?)", parts[0], id)
+		after = &struct {
+			name string
+			id   uuid.UUID
+		}{parts[0], id}
 	}
 	var rows []policyListRow
-	if err := q.Order("p.name, p.id").Limit(limit + 1).Scan(&rows).Error; err != nil {
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		q := tx.Table("iga_gov_policy p").
+			Select(`p.*, v.status AS v_status,
+			        (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = p.workspace_id AND t.version_id = p.current_version_id) AS roles`).
+			Joins("LEFT JOIN iga_gov_policy_version v ON v.workspace_id = p.workspace_id AND v.id = p.current_version_id").
+			Where("p.workspace_id = ?", ws).
+			// Access policies (family time_bound) have their own routes and
+			// lifecycle (iga_gov_access_policy.go); R1a never lists or acts on them.
+			Where("p.family <> ?", "time_bound")
+		if f.Family != "" {
+			q = q.Where("p.family = ?", f.Family)
+		}
+		if f.Provider != "" {
+			q = q.Where("p.provider = ?", f.Provider)
+		}
+		if f.Lifecycle != "" {
+			q = q.Where("p.lifecycle = ?", f.Lifecycle)
+		}
+		if f.Status != "" {
+			q = q.Where("v.status = ?", f.Status)
+		}
+		if f.Q != "" {
+			q = q.Where("p.name ILIKE ?", "%"+strings.NewReplacer("%", `\%`, "_", `\_`).Replace(f.Q)+"%")
+		}
+		if after != nil {
+			q = q.Where("(p.name, p.id) > (?, ?)", after.name, after.id)
+		}
+		return q.Order("p.name, p.id").Limit(limit + 1).Scan(&rows).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -566,7 +591,16 @@ func (a *GovAuthoring) versionView(db *gorm.DB, v models.IGAGovPolicyVersion) (G
 // GetPolicy is GET /policies/:id: the policy, its current version with
 // targets, its controls and the approved version.
 func (a *GovAuthoring) GetPolicy(ctx context.Context, ws, id uuid.UUID) (*GovPolicyView, error) {
-	db := a.db.WithContext(ctx)
+	var out *GovPolicyView
+	err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = a.getPolicyTx(tx, ws, id)
+		return err
+	})
+	return out, err
+}
+
+func (a *GovAuthoring) getPolicyTx(db *gorm.DB, ws, id uuid.UUID) (*GovPolicyView, error) {
 	p, err := a.loadPolicy(db, ws, id, false)
 	if err != nil {
 		return nil, err
@@ -606,7 +640,16 @@ func (a *GovAuthoring) GetPolicy(ctx context.Context, ws, id uuid.UUID) (*GovPol
 
 // ListVersions is GET /policies/:id/versions, newest first.
 func (a *GovAuthoring) ListVersions(ctx context.Context, ws, policyID uuid.UUID) ([]GovVersionView, error) {
-	db := a.db.WithContext(ctx)
+	var out []GovVersionView
+	err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = a.listVersionsTx(tx, ws, policyID)
+		return err
+	})
+	return out, err
+}
+
+func (a *GovAuthoring) listVersionsTx(db *gorm.DB, ws, policyID uuid.UUID) ([]GovVersionView, error) {
 	if _, err := a.loadPolicy(db, ws, policyID, false); err != nil {
 		return nil, err
 	}
@@ -627,13 +670,19 @@ func (a *GovAuthoring) ListVersions(ctx context.Context, ws, policyID uuid.UUID)
 
 // GetVersion is GET /policies/:id/versions/:no.
 func (a *GovAuthoring) GetVersion(ctx context.Context, ws, policyID uuid.UUID, no int) (*GovVersionView, error) {
-	db := a.db.WithContext(ctx)
-	v, err := a.loadVersion(db, ws, policyID, no, false)
+	var vv GovVersionView
+	err := a.readWorkspace(ctx, ws, func(db *gorm.DB) error {
+		v, err := a.loadVersion(db, ws, policyID, no, false)
+		if err != nil {
+			return err
+		}
+		vv, err = a.versionView(db, *v)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	vv, err := a.versionView(db, *v)
-	return &vv, err
+	return &vv, nil
 }
 
 /* ------------------------------------------------------------------------- */
@@ -655,7 +704,7 @@ func (a *GovAuthoring) PatchPolicy(ctx context.Context, ws, actor, id uuid.UUID,
 	if p.Name != nil && strings.TrimSpace(*p.Name) == "" {
 		return nil, nil, GovBadParam("name", "name cannot be empty.")
 	}
-	err = a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		pol, err := a.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -707,7 +756,7 @@ func (a *GovAuthoring) SetLifecycle(ctx context.Context, ws, actor, id uuid.UUID
 		return nil, GovBadParam("reason", "A reason is required.")
 	}
 	var out *models.IGAGovPolicy
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		pol, err := a.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -740,7 +789,7 @@ func (a *GovAuthoring) SetLifecycle(ctx context.Context, ws, actor, id uuid.UUID
 // withdrawn, so an archived policy holds no role and no pending decision.
 func (a *GovAuthoring) ArchivePolicy(ctx context.Context, ws, actor, id uuid.UUID, reason string) (*models.IGAGovPolicy, error) {
 	var out *models.IGAGovPolicy
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		pol, err := a.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -866,7 +915,7 @@ func intentFindingIDs(raw json.RawMessage) []uuid.UUID {
 // flight (DECISION A3; deployments are T3.16's, the check reads them).
 func (a *GovAuthoring) WithdrawVersion(ctx context.Context, ws, actor, policyID uuid.UUID, no int, reason string) (*models.IGAGovPolicyVersion, error) {
 	var out *models.IGAGovPolicyVersion
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		if _, err := a.loadPolicy(tx, ws, policyID, true); err != nil {
 			return err
 		}
@@ -1137,7 +1186,10 @@ func (a *GovAuthoring) insertVersionTx(tx *gorm.DB, ws, policyID, actor uuid.UUI
 // are rows of their version.
 func (a *GovAuthoring) CreateVersion(ctx context.Context, ws, actor, policyID uuid.UUID, baseNo int, raw json.RawMessage) (*GovVersionView, error) {
 	// Another workspace's policy is 404 before anything about the body.
-	if _, err := a.loadPolicy(a.db.WithContext(ctx), ws, policyID, false); err != nil {
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		_, err := a.loadPolicy(tx, ws, policyID, false)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	// T3.17: a dedicated_identity intent is its own flow (iga_gov_isolation.go).
@@ -1148,7 +1200,7 @@ func (a *GovAuthoring) CreateVersion(ctx context.Context, ws, actor, policyID uu
 		return nil, err
 	}
 	var out *GovVersionView
-	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		var err error
 		out, err = a.CreateVersionTx(tx, ws, actor, policyID, baseNo, raw)
 		return err
@@ -1312,7 +1364,7 @@ func (a *GovAuthoring) RetainVersionTx(tx *gorm.DB, ws, actor, versionID uuid.UU
 // user owns (§2.9: the role's owners plus the accountable owners of every
 // workload that runs as it), sorted.
 func (a *GovAuthoring) ownedSubjects(tx *gorm.DB, ws, user uuid.UUID, subjects []igagov.Subject) ([]string, error) {
-	owners := NewIGAGovOwnershipService(a.db)
+	owners := NewIGAGovOwnershipService(tx)
 	var out []string
 	for _, s := range subjects {
 		id, err := uuid.Parse(s.IdentityAccountID)
@@ -1602,7 +1654,6 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	default:
 		return nil, GovBadParam("delivery", "delivery must be direct, iac_pr or export.")
 	}
-	db := a.db.WithContext(ctx)
 	var keys []TargetKey
 	wanted := map[uuid.UUID]map[string]uuid.UUID{}     // identity -> service -> finding
 	wantedActs := map[uuid.UUID]map[string]uuid.UUID{} // R1b: identity -> action key -> finding
@@ -1620,7 +1671,9 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 			ids = append(ids, id)
 		}
 		var fs []models.IGAGovFinding
-		if err := db.Where("workspace_id = ? AND id IN ?", ws, ids).Find(&fs).Error; err != nil {
+		if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+			return tx.Where("workspace_id = ? AND id IN ?", ws, ids).Find(&fs).Error
+		}); err != nil {
 			return nil, err
 		}
 		if len(fs) != len(uniqueUUIDs(ids)) {
@@ -1672,8 +1725,13 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	roles, ctxObj, err := a.checkResolved(db, ws, resolved)
-	if err != nil {
+	var roles []*proposalRole
+	var ctxObj *ProposalContext
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		roles, ctxObj, err = a.checkResolved(tx, ws, resolved)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	for _, r := range roles {
@@ -1705,7 +1763,11 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 			set = keep
 		}
 		if PolicyActionsOn() {
-			if r.actions, err = a.proposalActions(db, ws, r, set); err != nil {
+			if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+				var e error
+				r.actions, e = a.proposalActions(tx, ws, r, set)
+				return e
+			}); err != nil {
 				return nil, err
 			}
 		}
@@ -1756,18 +1818,24 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 		}
 		r.stored = sb
 	}
-	settings, err := a.settings.Get(ws)
-	if err != nil {
-		return nil, err
-	}
-	intent, rec, err := a.recommend(ws, roles, remove, settings, req.Delivery, ctxObj)
-	if err != nil {
+	var intent igagov.RightSizeIntent
+	var rec ProposalRecommendation
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		settings, err := repositories.NewIGAGovSettingsRepository(tx).Get(ws)
+		if err != nil {
+			return err
+		}
+		intent, rec, err = a.recommend(tx, ws, roles, remove, settings, req.Delivery, ctxObj)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	rec.Warnings = append(rec.Warnings, warnings...)
 	rec.Context = ctxObj
 	if len(removeActs) > 0 {
-		if err := a.recommendActions(ws, roles, removeActs, &intent, &rec); err != nil {
+		if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+			return a.recommendActions(tx, ws, roles, removeActs, &intent, &rec)
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -1797,7 +1865,7 @@ func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, 
 			name += fmt.Sprintf(" and %d more", len(roles)-1)
 		}
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = a.inWorkspace(ctx, ws, func(tx *gorm.DB) error {
 		final := name
 		for n := 2; ; n++ {
 			var taken int64
@@ -1983,7 +2051,7 @@ func removableServices(f igagov.BundleFacts, basis *bundleBasis) []string {
 // recommend builds the intent and the recommendation from the final bundles.
 // A database error is returned, never swallowed: an intent built from a
 // failed read would silently omit the findings it addresses.
-func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation, error) {
+func (a *GovAuthoring) recommend(db *gorm.DB, ws uuid.UUID, roles []*proposalRole, remove []string, settings *models.IGAGovSettings, delivery string, ctxObj *ProposalContext) (igagov.RightSizeIntent, ProposalRecommendation, error) {
 	rec := ProposalRecommendation{Retain: []igagov.RetainEntry{}, Remove: []igagov.RemoveEntry{}, Consumers: []ConsumerView{},
 		IndependentGrants: []IndependentGrant{}, ResourcePolicyRoutes: []ProposalRoute{}, Warnings: []string{}}
 	in := igagov.RightSizeIntent{Kind: igagov.IntentRightSizeServices, ObservationDays: settings.DefaultObservationDays,
@@ -2111,7 +2179,7 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 		// role's open unused_service findings of the removed services).
 		if r.findings == nil {
 			var fids []uuid.UUID
-			if err := a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
+			if err := db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
 			               AND detail_key IN ? AND status IN ('open','reopened')`,
 				ws, id.ID, igagov.KindUnusedService, remove).Scan(&fids).Error; err != nil {
 				return in, rec, fmt.Errorf("findings addressed by the proposal for %s: %w", id.RoleID, err)
@@ -2164,7 +2232,7 @@ func (a *GovAuthoring) recommend(ws uuid.UUID, roles []*proposalRole, remove []s
 	}
 	if len(in.Subjects) > 0 {
 		// fix/p3-roll: the default canary skips a role that can never be one.
-		in.Rollout = &igagov.RolloutIntent{CanaryTarget: defaultCanarySubject(a.db, ws, in.Subjects)}
+		in.Rollout = &igagov.RolloutIntent{CanaryTarget: defaultCanarySubject(db, ws, in.Subjects)}
 		if h := settings.CanaryHours; h >= igagov.MinCanaryHours && h <= igagov.MaxCanaryHours {
 			in.Rollout.CanaryHours = h
 		}

@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -235,11 +236,11 @@ func (m *GovMetrics) RollupTx(tx *gorm.DB, ws uuid.UUID, hour time.Time) (*model
 // Rollup runs RollupTx in its own transaction.
 func (m *GovMetrics) Rollup(ctx context.Context, ws uuid.UUID, hour time.Time) (*models.IGAGovMetricsHourly, error) {
 	var out *models.IGAGovMetricsHourly
-	err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, m.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) error {
 		var err error
 		out, err = m.RollupTx(tx, ws, hour)
 		return err
-	})
+	}))
 	return out, err
 }
 
@@ -267,6 +268,7 @@ func dueMetricsRollups(ctx context.Context, db *gorm.DB, now time.Time) ([]Sched
 	hour := now.UTC().Truncate(time.Hour).Add(-time.Hour)
 	key := GovMetricsDedupeKey(hour)
 	var wss []uuid.UUID
+	// TENANT-EXEMPT: the metrics_rollup scheduler's due scan lists workspace ids across workspaces; each job then rolls up one workspace under RLS (InTx).
 	if err := db.Raw(`SELECT DISTINCT p.workspace_id FROM iga_gov_policy p
 		WHERE NOT EXISTS (SELECT 1 FROM iga_gov_job j WHERE j.workspace_id = p.workspace_id AND j.kind = ? AND j.dedupe_key = ?)`,
 		repositories.GovJobMetricsRollup, key).Scan(&wss).Error; err != nil {
@@ -411,14 +413,22 @@ const govMetricsRoutesMax = 50
 
 // List is GET /metrics: the workspace's hourly rows whose hour starts in
 // [from, to), oldest first, cursor-paged (limit <= 200), with the range's
-// summary in every page.
-func (m *GovMetrics) List(ctx context.Context, ws uuid.UUID, from, to time.Time, cursor string, limit int) (*GovMetricsPage, error) {
+// summary in every page. Every read runs in one read-only transaction under
+// row-level security for ws (AS-108).
+func (m *GovMetrics) List(ctx context.Context, ws uuid.UUID, from, to time.Time, cursor string, limit int) (page *GovMetricsPage, err error) {
+	err = tenancy.InWorkspaceRead(ctx, m.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		page, e = m.list(tx, ws, from, to, cursor, limit)
+		return e
+	}))
+	return page, err
+}
+
+func (m *GovMetrics) list(db *gorm.DB, ws uuid.UUID, from, to time.Time, cursor string, limit int) (*GovMetricsPage, error) {
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
 	from, to = from.UTC(), to.UTC()
-	db := m.db.WithContext(ctx)
-	rd := NewGovReader(m.db, m.key)
+	rd := &GovReader{key: m.key} // signs and opens cursors only
 	want := govCursor{Route: "metrics", WS: ws.String(), Q: from.Format(time.RFC3339Nano) + "|" + to.Format(time.RFC3339Nano)}
 	q := db.Where("workspace_id = ? AND hour >= ? AND hour < ?", ws, from, to)
 	if cursor != "" {

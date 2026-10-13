@@ -38,7 +38,10 @@ import (
 //
 // The workspace, the agent and the human always come from the verified
 // credential (the controller); nothing in a body names them. Another
-// workspace's or another agent's decision or hold is 404.
+// workspace's or another agent's decision or hold is 404. Every statement
+// runs in a transaction under row-level security for that workspace
+// (tenancy.InWorkspace / InWorkspaceRead); only the sweeper's due scans span
+// workspaces.
 
 // R3 runtime event names (vocabulary: iga_gov_event_vocabulary.go).
 const (
@@ -280,7 +283,7 @@ func (s *GovR3) Decide(ctx context.Context, ws uuid.UUID, ag RuntimeAgent, req R
 	}
 	var out *RuntimeDecideResult
 	for attempt := 0; attempt < 2; attempt++ {
-		err = s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+		err = tenancy.InWorkspace(ctxW, s.db, ws, func(tx *gorm.DB) error {
 			var first models.IGAGovRuntimeDecision
 			ferr := tx.Where("workspace_id = ? AND agent_ref = ? AND idempotency_key = ? AND approval_ref IS NULL",
 				ws, ag.SpiffeID, req.IdempotencyKey).Clauses(lockForUpdate()).Take(&first).Error
@@ -733,7 +736,7 @@ func (s *GovR3) consume(ctxW context.Context, tx *gorm.DB, d *models.IGAGovRunti
 func (s *GovR3) Redeem(ctx context.Context, ws uuid.UUID, ag RuntimeAgent, id uuid.UUID, req RuntimeRedeemRequest) (*models.IGAGovRuntimeDecision, error) {
 	ctxW := inWorkspace(ctx, ws)
 	var out *models.IGAGovRuntimeDecision
-	err := s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctxW, s.db, ws, func(tx *gorm.DB) error {
 		d, err := s.loadAgentDecision(tx, ws, ag, id)
 		if err != nil {
 			return err
@@ -810,7 +813,7 @@ func (s *GovR3) ReportOutcome(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	}
 	ctxW := inWorkspace(ctx, ws)
 	var out *models.IGAGovRuntimeDecision
-	err := s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctxW, s.db, ws, func(tx *gorm.DB) error {
 		d, err := s.loadAgentDecision(tx, ws, ag, id)
 		if err != nil {
 			return err
@@ -919,7 +922,7 @@ func (s *GovR3) settle(ctxW context.Context, tx *gorm.DB, ws, decisionID uuid.UU
 // AgentHold is GET /authsec/runtime/holds/:id for the agent that is held.
 func (s *GovR3) AgentHold(ctx context.Context, ws uuid.UUID, ag RuntimeAgent, id uuid.UUID) (*RuntimeHoldView, error) {
 	var out *RuntimeHoldView
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var h models.IGAGovRuntimeHold
 		if err := tx.Where("workspace_id = ? AND id = ? AND agent_ref = ?", ws, id, ag.SpiffeID).Clauses(lockForUpdate()).Take(&h).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -942,12 +945,14 @@ func (s *GovR3) ListHolds(ctx context.Context, ws uuid.UUID, state string, limit
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if state != "" {
-		q = q.Where("state = ?", state)
-	}
 	out := []models.IGAGovRuntimeHold{}
-	if err := q.Order("created_at DESC").Limit(limit).Find(&out).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if state != "" {
+			q = q.Where("state = ?", state)
+		}
+		return q.Order("created_at DESC").Limit(limit).Find(&out).Error
+	}); err != nil {
 		return nil, err
 	}
 	now := s.now()
@@ -964,7 +969,9 @@ func (s *GovR3) ListHolds(ctx context.Context, ws uuid.UUID, state string, limit
 // GetHold reads one hold (governance:read).
 func (s *GovR3) GetHold(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovRuntimeHold, error) {
 	var h models.IGAGovRuntimeHold
-	if err := s.db.WithContext(ctx).Where("workspace_id = ? AND id = ?", ws, id).Take(&h).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND id = ?", ws, id).Take(&h).Error
+	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, GovNotFound()
 		}
@@ -981,7 +988,7 @@ func (s *GovR3) DecideHold(ctx context.Context, ws, approver, id uuid.UUID, appr
 		return nil, GovBadParam("reason", "A rejection needs a reason.")
 	}
 	var out models.IGAGovRuntimeHold
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Where("workspace_id = ? AND id = ?", ws, id).Clauses(lockForUpdate()).Take(&out).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return GovNotFound()
@@ -1049,25 +1056,29 @@ func (s *GovR3) ListDecisions(ctx context.Context, ws uuid.UUID, f RuntimeDecisi
 	if f.Limit <= 0 || f.Limit > MaxGovPage {
 		f.Limit = MaxGovPage
 	}
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if f.AgentRef != "" {
-		q = q.Where("agent_ref = ?", f.AgentRef)
-	}
-	if f.Tool != "" {
-		q = q.Where("tool = ?", f.Tool)
-	}
-	if f.Decision != "" {
-		q = q.Where("decision = ?", f.Decision)
-	}
 	out := []models.IGAGovRuntimeDecision{}
-	err := q.Order("created_at DESC").Limit(f.Limit).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if f.AgentRef != "" {
+			q = q.Where("agent_ref = ?", f.AgentRef)
+		}
+		if f.Tool != "" {
+			q = q.Where("tool = ?", f.Tool)
+		}
+		if f.Decision != "" {
+			q = q.Where("decision = ?", f.Decision)
+		}
+		return q.Order("created_at DESC").Limit(f.Limit).Find(&out).Error
+	})
 	return out, err
 }
 
 // GetDecision reads one decision (governance:read).
 func (s *GovR3) GetDecision(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovRuntimeDecision, error) {
 	var d models.IGAGovRuntimeDecision
-	if err := s.db.WithContext(ctx).Where("workspace_id = ? AND id = ?", ws, id).Take(&d).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND id = ?", ws, id).Take(&d).Error
+	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, GovNotFound()
 		}
@@ -1081,15 +1092,17 @@ func (s *GovR3) ListBudgets(ctx context.Context, ws uuid.UUID, agentRef, session
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if agentRef != "" {
-		q = q.Where("agent_ref = ?", agentRef)
-	}
-	if session != "" {
-		q = q.Where("session_key = ?", session)
-	}
 	out := []models.IGAGovRuntimeBudget{}
-	err := q.Order("updated_at DESC").Limit(limit).Find(&out).Error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if agentRef != "" {
+			q = q.Where("agent_ref = ?", agentRef)
+		}
+		if session != "" {
+			q = q.Where("session_key = ?", session)
+		}
+		return q.Order("updated_at DESC").Limit(limit).Find(&out).Error
+	})
 	return out, err
 }
 
@@ -1131,7 +1144,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	var areq awsbroker.Request
 	var policyDoc string
 	var d *models.IGAGovRuntimeDecision
-	err := s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctxW, s.db, ws, func(tx *gorm.DB) error {
 		var err error
 		d, err = s.loadAgentDecision(tx, ws, ag, id)
 		if err != nil {
@@ -1211,7 +1224,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 		return nil, err
 	}
 	finish := func(state, msg string, creds *awsbroker.Credentials) error {
-		return s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+		return tenancy.InWorkspace(ctxW, s.db, ws, func(tx *gorm.DB) error {
 			upd := map[string]any{"state": state, "error": truncate(msg, 2000), "updated_at": s.now()}
 			event := GovEventBrokerSessionFailed
 			payload := map[string]any{"broker_session_id": row.ID, "decision_id": row.DecisionID, "role_arn": row.RoleARN,
@@ -1235,7 +1248,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	}
 	if err != nil {
 		if ferr := finish("failed", "connector: "+err.Error(), nil); ferr != nil {
-			log.Printf("[runtime] broker session %s: recording failure: %v", row.ID, ferr)
+			log.Printf("[runtime] workspace %s: broker session %s: recording failure: %v", ws, row.ID, ferr)
 		}
 		return nil, govConflict(GovCodeBrokerFailed, "The account's connector cannot be used for brokering.", map[string]any{"broker_session_id": row.ID})
 	}
@@ -1243,7 +1256,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	creds, aerr := deps.Broker.Assume(ctxW, areq)
 	if aerr != nil {
 		if ferr := finish("failed", aerr.Error(), nil); ferr != nil {
-			log.Printf("[runtime] broker session %s: recording failure: %v", row.ID, ferr)
+			log.Printf("[runtime] workspace %s: broker session %s: recording failure: %v", ws, row.ID, ferr)
 		}
 		return nil, govErr(http.StatusBadGateway, GovCodeBrokerFailed, "sts:AssumeRole failed; the decision is spent, decide again.",
 			map[string]any{"broker_session_id": row.ID})
@@ -1251,7 +1264,7 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 	if err := finish("issued", "", creds); err != nil {
 		// The credentials exist in AWS; returning them is still correct, the
 		// row stays 'requested' (may have been issued).
-		log.Printf("[runtime] broker session %s: recording issue: %v", row.ID, err)
+		log.Printf("[runtime] workspace %s: broker session %s: recording issue: %v", ws, row.ID, err)
 	}
 	return &RuntimeSessionResult{SessionID: row.ID, RoleARN: row.RoleARN, SessionName: row.SessionName, SourceIdentity: row.SourceIdentity,
 		DurationSeconds: row.DurationSeconds, SessionPolicy: json.RawMessage(policyDoc), Tags: areq.Tags, Credentials: creds}, nil
@@ -1295,13 +1308,13 @@ func (s *GovR3) Sweep(ctx context.Context) error {
 	}
 	for _, h := range holds {
 		h := h
-		if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tenancy.InWorkspace(ctx, s.db, h.WorkspaceID, func(tx *gorm.DB) error {
 			if err := tx.Where("workspace_id = ? AND id = ?", h.WorkspaceID, h.ID).Clauses(lockForUpdate()).Take(&h).Error; err != nil {
 				return err
 			}
 			return s.expireHoldIfDue(tx, h.WorkspaceID, &h, now)
 		}); err != nil {
-			return err
+			return fmt.Errorf("workspace %s: hold %s: %w", h.WorkspaceID, h.ID, err)
 		}
 	}
 	type due struct {
@@ -1332,12 +1345,12 @@ func (s *GovR3) Sweep(ctx context.Context) error {
 		}
 		ctxW := inWorkspace(ctx, e.WorkspaceID)
 		var settled []map[string]any
-		if err := s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+		if err := tenancy.InWorkspace(ctxW, s.db, e.WorkspaceID, func(tx *gorm.DB) error {
 			var err error
 			settled, err = s.settle(ctxW, tx, e.WorkspaceID, e.DecisionID, outcome, nil)
 			return err
 		}); err != nil {
-			return err
+			return fmt.Errorf("workspace %s: decision %s: %w", e.WorkspaceID, e.DecisionID, err)
 		}
 		for _, x := range settled {
 			x["decision_id"] = e.DecisionID
@@ -1350,10 +1363,10 @@ func (s *GovR3) Sweep(ctx context.Context) error {
 	}
 	sort.Slice(wss, func(i, j int) bool { return wss[i].String() < wss[j].String() })
 	for _, ws := range wss {
-		if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 			return s.event(tx, ws, GovEventRuntimeBudgetSwept, nil, nil, nil, map[string]any{"entries": byWS[ws]})
 		}); err != nil {
-			return err
+			return fmt.Errorf("workspace %s: budget sweep event: %w", ws, err)
 		}
 	}
 	// Retention (R-11): prune retained arguments past each workspace's
@@ -1373,7 +1386,7 @@ func (s *GovR3) Sweep(ctx context.Context) error {
 	for _, r := range rets {
 		ctxW := inWorkspace(ctx, r.WorkspaceID)
 		cut := now.Add(-time.Duration(r.Days) * 24 * time.Hour)
-		if err := s.db.WithContext(ctxW).Transaction(func(tx *gorm.DB) error {
+		if err := tenancy.InWorkspace(ctxW, s.db, r.WorkspaceID, func(tx *gorm.DB) error {
 			res := tenancy.GormExec(ctxW, tx, `UPDATE iga_gov_runtime_decision SET args_redacted = NULL
 			     WHERE workspace_id = $1 AND args_redacted IS NOT NULL AND created_at < $2`, cut)
 			if res.Error != nil || res.RowsAffected == 0 {
@@ -1382,7 +1395,7 @@ func (s *GovR3) Sweep(ctx context.Context) error {
 			return s.event(tx, r.WorkspaceID, GovEventRuntimeArgsPruned, nil, nil, nil, map[string]any{"decisions": res.RowsAffected,
 				"older_than": cut, "retention_days": r.Days})
 		}); err != nil {
-			return err
+			return fmt.Errorf("workspace %s: argument retention: %w", r.WorkspaceID, err)
 		}
 	}
 	return nil

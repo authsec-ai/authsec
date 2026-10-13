@@ -6,9 +6,11 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/iacpr"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -46,8 +48,14 @@ type GovExportView struct {
 
 // ExportVersion is GET .../export.
 func (a *GovAuthoring) ExportVersion(ctx context.Context, ws, policyID uuid.UUID, no int) (*GovExportView, error) {
-	db := a.db.WithContext(ctx)
-	v, err := a.loadVersion(db, ws, policyID, no, false)
+	// Each database section is one read-only transaction under row-level
+	// security for ws (AS-108); the approval check between them is
+	// UsableApproval's own.
+	var v *models.IGAGovPolicyVersion
+	err := tenancy.InWorkspaceRead(ctx, a.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		v, e = a.loadVersion(tx, ws, policyID, no, false)
+		return e
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -67,34 +75,46 @@ func (a *GovAuthoring) ExportVersion(ctx context.Context, ws, policyID uuid.UUID
 		}
 		return nil, err
 	}
-	plans, err := currentPlans(db, ws, v.ID)
+	out := &GovExportView{VersionNo: v.VersionNo, Plans: []GovExportPlan{}}
+	err = tenancy.InWorkspaceRead(ctx, a.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) error {
+		return a.exportPlans(tx, ws, v, ua, out)
+	}))
 	if err != nil {
 		return nil, err
 	}
-	out := &GovExportView{VersionNo: v.VersionNo, Plans: []GovExportPlan{}}
+	return out, nil
+}
+
+// exportPlans renders every current eligible plan of the approved version
+// into out, reading through db (ExportVersion's workspace transaction).
+func (a *GovAuthoring) exportPlans(db *gorm.DB, ws uuid.UUID, v *models.IGAGovPolicyVersion, ua *GovUsableApproval, out *GovExportView) error {
+	plans, err := currentPlans(db, ws, v.ID)
+	if err != nil {
+		return err
+	}
 	for _, pr := range plans {
 		if pr.Eligibility == igagov.EligibilityIneligible {
 			continue
 		}
 		if !containsStr(ua.Approval.PlanHashes, pr.PlanHash) {
-			return nil, govConflict(GovCodePlanChanged, "This plan is not the approved plan.", map[string]any{"plan_id": pr.ID})
+			return govConflict(GovCodePlanChanged, "This plan is not the approved plan.", map[string]any{"plan_id": pr.ID})
 		}
 		p, err := PlanFromRow(pr.IGAGovPlan)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		docs, err := planDocuments(db, ws, p)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var c models.IGAGovControl
 		if err := db.Where("workspace_id = ? AND id = ?", ws, pr.ControlID).Take(&c).Error; err != nil {
-			return nil, err
+			return err
 		}
 		ep := GovExportPlan{PlanID: pr.ID, Kind: pr.Kind, Delivery: pr.Delivery, PlanHash: pr.PlanHash}
 		var deps []models.IGAGovDeployment
 		if err := db.Where("workspace_id = ? AND plan_id = ?", ws, pr.ID).Order("created_at DESC").Limit(1).Find(&deps).Error; err != nil {
-			return nil, err
+			return err
 		}
 		depID := ""
 		if len(deps) == 1 {
@@ -103,11 +123,11 @@ func (a *GovAuthoring) ExportVersion(ctx context.Context, ws, policyID uuid.UUID
 		}
 		art, err := iacpr.Export(p, roleTarget(c), docs, depID)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		art.Fallback = IaCFallbackOf(p)
 		ep.Artifact = art
 		out.Plans = append(out.Plans, ep)
 	}
-	return out, nil
+	return nil
 }

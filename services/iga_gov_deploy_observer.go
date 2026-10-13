@@ -310,8 +310,8 @@ func (s *GovDeployments) observeTx(tx *gorm.DB, o *govObservation) ([]govPosture
 				q += `, resolved_by_deployment_id = ?`
 				args = append(args, *o.ResolvedBy)
 			}
-			args = append(args, f.ID)
-			if err := tx.Exec(q+` WHERE id = ?`, args...).Error; err != nil {
+			args = append(args, ws, f.ID)
+			if err := tx.Exec(q+` WHERE workspace_id = ? AND id = ?`, args...).Error; err != nil {
 				return nil, err
 			}
 			fid := f.ID

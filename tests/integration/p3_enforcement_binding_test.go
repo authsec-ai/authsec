@@ -1085,3 +1085,100 @@ func TestP3EnfVerifyBindingScheduled(t *testing.T) {
 		t.Fatalf("a revoked binding was probed: %d self_test events", n)
 	}
 }
+
+// AS-108: a CloudFormation callback finds its binding across workspaces by
+// the account and the HMAC-signed ExternalId, then acts under row-level
+// security for that binding's workspace only. Two workspaces connect the
+// same account and both open sessions: a callback carrying A's ExternalId
+// with B's stack's roles is refused and changes neither; A's own callback
+// binds A and leaves B's session exactly as it was.
+func TestP3EnfCallbackCrossWorkspaceIsolation(t *testing.T) {
+	l := newEnfLab(t)
+	b := l.newWorkspace(t, "p3-enf-xws-b") // same testAccount
+	sessA := l.start(t, l.a)
+	sessB := l.start(t, b)
+	l.aws.deploy(t, sessA.AccountID, sessA.Suffix, sessA.ExternalID)
+	l.aws.deploy(t, sessB.AccountID, sessB.Suffix, sessB.ExternalID)
+	beforeA, beforeB := l.binding(t, sessA.BindingID), l.binding(t, sessB.BindingID)
+	evA, evB := l.events(t, l.a.ws), l.events(t, b.ws)
+	same := func(what string, id uuid.UUID, want models.CloudEnforcementBinding) {
+		t.Helper()
+		got := l.binding(t, id)
+		if got.State != want.State || got.RoleARN != want.RoleARN || got.SelftestRoleARN != want.SelftestRoleARN ||
+			!got.UpdatedAt.Equal(want.UpdatedAt) || got.LastErrorCode != want.LastErrorCode || string(got.Capabilities) != string(want.Capabilities) {
+			t.Fatalf("%s: binding %s changed: %+v -> %+v", what, id, want, got)
+		}
+	}
+
+	// A's ExternalId on B's stack: the ExternalId names A's binding, whose
+	// stack this is not. FAILED; neither binding changes.
+	l.deliver(l.cfnBody(sessB, "Create", func(_ map[string]any, p map[string]string) { p["ExternalId"] = sessA.ExternalID }))
+	if r := l.puts.last(t); r.Status != awsdiscovery.CFNStatusFailed {
+		t.Fatalf("A's ExternalId on B's stack answered %+v", r)
+	}
+	same("A's ExternalId on B's stack", sessA.BindingID, beforeA)
+	same("A's ExternalId on B's stack", sessB.BindingID, beforeB)
+
+	// A's own callback binds A only.
+	if out := l.deliver(l.cfnBody(sessA, "Create", nil)); out != services.CallbackDone || l.puts.last(t).Status != awsdiscovery.CFNStatusSuccess {
+		t.Fatalf("A's callback: %s %+v", out, l.puts.last(t))
+	}
+	if got := l.binding(t, sessA.BindingID); got.State != models.EnforcementBindingVerified || got.WorkspaceID != l.a.ws {
+		t.Fatalf("A = %+v", got)
+	}
+	same("after A bound", sessB.BindingID, beforeB)
+	if ev := l.events(t, b.ws); strings.Join(ev, ",") != strings.Join(evB, ",") {
+		t.Fatalf("B's events changed: %v -> %v", evB, ev)
+	}
+	if ev := l.events(t, l.a.ws); len(ev) != len(evA)+2 {
+		t.Fatalf("A's events = %v (before %v), want bound + self_test added", ev, evA)
+	}
+}
+
+// AS-108: verify_binding acts under row-level security for the job's
+// workspace. A job (and the service) of workspace A naming B's bound binding
+// finds nothing: the job completes without probing, the service is 404, and
+// B's binding and events are untouched.
+func TestP3EnfVerifyBindingForeignWorkspace(t *testing.T) {
+	l := newEnfLab(t)
+	ctx := context.Background()
+	b := l.newWorkspace(t, "p3-enf-xws-vb")
+	sessB := l.start(t, b)
+	l.aws.deploy(t, sessB.AccountID, sessB.Suffix, sessB.ExternalID)
+	if out := l.deliver(l.cfnBody(sessB, "Create", nil)); out != services.CallbackDone {
+		t.Fatalf("bind B: %s", out)
+	}
+	p3exec(t, l.db, `UPDATE cloud_enforcement_binding SET updated_at = now() - interval '25 hours' WHERE id = ?`, sessB.BindingID)
+	before := l.binding(t, sessB.BindingID)
+	evB := l.events(t, b.ws)
+	t.Cleanup(services.SetEnforcementSelfTester(l.svc))
+
+	job := models.IGAGovJob{WorkspaceID: l.a.ws, Kind: repositories.GovJobVerifyBinding, SubjectID: &sessB.BindingID,
+		DedupeKey: "binding:" + sessB.BindingID.String()}
+	if err := services.VerifyBindingHandler(ctx, services.NewPolicyJobRun(l.db, job, "enf-xws")); err != nil {
+		t.Fatalf("A's verify_binding naming B's binding: %v, want completed without a probe", err)
+	}
+	_, err := l.svc.VerifyBinding(ctx, l.a.ws, sessB.BindingID, services.EnforcementActor{Kind: "system"})
+	wantEnfCode(t, err, 404, services.EnfCodeNotFound)
+	_, err = l.svc.EnsureFresh(ctx, l.a.ws, sessB.BindingID, time.Hour)
+	wantEnfCode(t, err, 404, services.EnfCodeNotFound)
+
+	got := l.binding(t, sessB.BindingID)
+	if got.State != before.State || !got.UpdatedAt.Equal(before.UpdatedAt) || string(got.Capabilities) != string(before.Capabilities) {
+		t.Fatalf("B's binding changed: %+v -> %+v", before, got)
+	}
+	if ev := l.events(t, b.ws); strings.Join(ev, ",") != strings.Join(evB, ",") {
+		t.Fatalf("B's events changed: %v -> %v", evB, ev)
+	}
+	if ev := l.events(t, l.a.ws); len(ev) != 0 {
+		t.Fatalf("A has events: %v", ev)
+	}
+	// B's own job still self-tests B.
+	job.WorkspaceID = b.ws
+	if err := services.VerifyBindingHandler(ctx, services.NewPolicyJobRun(l.db, job, "enf-xws")); err != nil {
+		t.Fatalf("B's verify_binding: %v", err)
+	}
+	if got := l.binding(t, sessB.BindingID); got.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatal("B's own verify_binding did not run the self-test")
+	}
+}

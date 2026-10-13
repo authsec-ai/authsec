@@ -14,6 +14,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -261,12 +262,14 @@ func (s *GovDeployments) envNow() GovDeployEnv {
 // timeout).
 func (s *GovDeployments) AttemptLog() *IGAGovAttemptLog { return s.attempts }
 
-func (s *GovDeployments) executor() (*IGAGovAWSExecutor, error) {
+// executor builds the T3.10 executor of one job run over the run's database;
+// it reads and writes under row-level security for the job's workspace.
+func (s *GovDeployments) executor(run *PolicyJobRun) (*IGAGovAWSExecutor, error) {
 	env := s.envNow()
 	if env.AWS == nil {
 		return nil, errors.New("AWS enforcement access is not configured in this build")
 	}
-	e := NewIGAGovAWSExecutor(s.db, s.attempts, env.AWS).WithClock(s.now)
+	e := NewIGAGovAWSExecutor(run.DB(), s.attempts, env.AWS).WithClock(s.now)
 	e.BindingCheck = env.BindingState
 	if s.Executor != nil {
 		s.Executor(e)
@@ -291,6 +294,48 @@ func (s *GovDeployments) Register(w *PolicyJobWorker) {
 }
 
 /* ------------------------------- small reads ------------------------------- */
+
+// read runs fn in one read-only transaction under row-level security for ws
+// (AS-108): every statement on tx sees only ws's rows.
+func (s *GovDeployments) read(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, s.db, ws, fn)
+}
+
+// write runs fn in one transaction under row-level security for ws.
+func (s *GovDeployments) write(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, fn)
+}
+
+// runRead runs a job's reads in one read-only transaction under row-level
+// security for the job's workspace (its writes go through run.InTx). It is
+// never held across an external call.
+func runRead(ctx context.Context, run *PolicyJobRun, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, run.DB(), run.Job.WorkspaceID, fn)
+}
+
+// loadGovPlanRun is loadGovPlan in the job's read transaction.
+func loadGovPlanRun(ctx context.Context, run *PolicyJobRun, planID uuid.UUID) (igagov.Plan, error) {
+	var p igagov.Plan
+	err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		p, err = loadGovPlan(tx, run.Job.WorkspaceID, planID)
+		return err
+	})
+	return p, err
+}
+
+// HoldsPermission is WorkspaceUserHoldsPermission read under row-level
+// security for ws (the deployment routes' governance:emergency and
+// governance:author checks).
+func (s *GovDeployments) HoldsPermission(ctx context.Context, ws, user uuid.UUID, resource, action string) (bool, error) {
+	var ok bool
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		ok, err = WorkspaceUserHoldsPermission(tx, ws, user, resource, action)
+		return err
+	})
+	return ok, err
+}
 
 func (s *GovDeployments) loadDeployment(db *gorm.DB, ws, id uuid.UUID) (*models.IGAGovDeployment, error) {
 	var d models.IGAGovDeployment
@@ -384,7 +429,12 @@ func (s *GovDeployments) DeployHandler(ctx context.Context, run *PolicyJobRun) e
 		return PolicyJobAbandon("deploy needs a deployment subject")
 	}
 	ws := run.Job.WorkspaceID
-	d, err := s.loadDeployment(run.DB().WithContext(ctx), ws, *run.Job.SubjectID)
+	var d *models.IGAGovDeployment
+	err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		d, err = s.loadDeployment(tx, ws, *run.Job.SubjectID)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -407,7 +457,7 @@ func (s *GovDeployments) DeployHandler(ctx context.Context, run *PolicyJobRun) e
 	if d.Delivery != igagov.DeliveryDirect {
 		return nil // handed to the delivery handler in start
 	}
-	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
+	plan, err := loadGovPlanRun(ctx, run, d.PlanID)
 	if err != nil {
 		return err
 	}
@@ -415,7 +465,7 @@ func (s *GovDeployments) DeployHandler(ctx context.Context, run *PolicyJobRun) e
 		// R2 (DECISION R2-13, R2-20): a direct Lambda split.
 		return s.r2ExecuteSplit(ctx, run, *d, plan)
 	}
-	exec, err := s.executor()
+	exec, err := s.executor(run)
 	if err != nil {
 		return PolicyJobRetryLater(5*time.Minute, err.Error())
 	}
@@ -430,9 +480,25 @@ func (s *GovDeployments) DeployHandler(ctx context.Context, run *PolicyJobRun) e
 // paused, the deployment's authority holds (§2.8), revalidation when the
 // approved evidence is stale, and the binding is fresh.
 func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models.IGAGovDeployment) error {
-	db := run.DB().WithContext(ctx)
 	ws := d.WorkspaceID
-	_, lifecycle, err := s.policyOfVersion(db, ws, d.VersionID)
+	var lifecycle string
+	var paused bool
+	var plan *models.IGAGovPlan
+	var connector uuid.UUID
+	err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		if _, lifecycle, err = s.policyOfVersion(tx, ws, d.VersionID); err != nil || lifecycle == "paused" {
+			return err
+		}
+		if paused, err = RolloutPausedForDeployment(tx, ws, d.ID); err != nil || paused {
+			return err
+		}
+		if plan, err = s.loadPlanRow(tx, ws, d.PlanID); err != nil {
+			return err
+		}
+		connector = mustControlConnector(tx, ws, d.ControlID)
+		return nil
+	})
 	if err != nil {
 		return err
 	}
@@ -441,14 +507,8 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 		return PolicyJobRetryLater(5*time.Minute, DepReasonPolicyPaused)
 	}
 	// §8.6: a paused rollout holds its queued deployments (fix/p3-roll).
-	if paused, err := RolloutPausedForDeployment(db, ws, d.ID); err != nil {
-		return err
-	} else if paused {
+	if paused {
 		return govRolloutHold()
-	}
-	plan, err := s.loadPlanRow(db, ws, d.PlanID)
-	if err != nil {
-		return err
 	}
 	var revID *uuid.UUID
 	if code, msg, detail, rv, err := s.authority(ctx, run, *d, *plan); err != nil {
@@ -460,7 +520,7 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 	}
 	if d.Delivery == igagov.DeliveryDirect {
 		if g := s.envNow().Binding; g != nil {
-			if err := g(ctx, ws, mustControlConnector(db, ws, d.ControlID)); err != nil {
+			if err := g(ctx, ws, connector); err != nil {
 				code, msg := DepReasonBindingUnavailable, err.Error()
 				var ge *GovError
 				var ee *EnforcementError
@@ -506,7 +566,7 @@ func (s *GovDeployments) start(ctx context.Context, run *PolicyJobRun, d *models
 	}
 	d.State = next
 	if d.Delivery != igagov.DeliveryDirect {
-		p, err := loadGovPlan(run.DB(), ws, d.PlanID)
+		p, err := loadGovPlanRun(ctx, run, d.PlanID)
 		if err != nil {
 			return err
 		}
@@ -559,7 +619,9 @@ func (s *GovDeployments) authority(ctx context.Context, run *PolicyJobRun, d mod
 	switch d.Kind {
 	case igagov.PlanUndo, igagov.PlanSplitRevert:
 		var ap models.IGAGovApproval
-		if err := run.DB().WithContext(ctx).Where("workspace_id = ? AND id = ?", d.WorkspaceID, *d.ApprovalID).Take(&ap).Error; err != nil {
+		if err := runRead(ctx, run, func(tx *gorm.DB) error {
+			return tx.Where("workspace_id = ? AND id = ?", d.WorkspaceID, *d.ApprovalID).Take(&ap).Error
+		}); err != nil {
 			return "", "", nil, nil, err
 		}
 		if ap.Decision != "approve" || !containsStr(ap.PlanHashes, p.PlanHash) {
@@ -674,7 +736,7 @@ func (s *GovDeployments) settleLedgerTx(tx *gorm.DB, d models.IGAGovDeployment) 
 		return nil
 	}
 	var cur models.IGAGovDeployment
-	if err := tx.Where("id = ?", d.ID).Take(&cur).Error; err != nil {
+	if err := tx.Where("workspace_id = ? AND id = ?", d.WorkspaceID, d.ID).Take(&cur).Error; err != nil {
 		return err
 	}
 	var done []struct {
@@ -701,7 +763,8 @@ func (s *GovDeployments) settleLedgerTx(tx *gorm.DB, d models.IGAGovDeployment) 
 				to = ArtifactPresent
 			}
 		}
-		if err := tx.Exec(`UPDATE iga_gov_artifact SET state = ?, updated_at = now() WHERE id = ?`, to, r.ID).Error; err != nil {
+		if err := tx.Exec(`UPDATE iga_gov_artifact SET state = ?, updated_at = now() WHERE workspace_id = ? AND id = ?`,
+			to, d.WorkspaceID, r.ID).Error; err != nil {
 			return err
 		}
 		settled = append(settled, map[string]any{"kind": r.Kind, "native_arn": r.NativeARN, "to": to})
@@ -767,12 +830,14 @@ func (s *GovDeployments) applied(ctx context.Context, run *PolicyJobRun, d model
 			}
 			_ = json.Unmarshal(plan.Precondition, &pre)
 			if err := tx.Exec(`UPDATE iga_gov_control SET baseline_captured_at = ?, baseline_boundary_arn = ?, baseline_document_hash = ?,
-				updated_at = now() WHERE id = ?`, at, pre.ArtifactState.BoundaryARN, pre.ArtifactState.BoundaryDocumentHash, c.ID).Error; err != nil {
+				updated_at = now() WHERE workspace_id = ? AND id = ?`, at, pre.ArtifactState.BoundaryARN, pre.ArtifactState.BoundaryDocumentHash,
+				d.WorkspaceID, c.ID).Error; err != nil {
 				return err
 			}
 		}
 		if c.State == "planned" && d.Kind == igagov.PlanApply {
-			if err := tx.Exec(`UPDATE iga_gov_control SET state = 'active', updated_at = now() WHERE id = ?`, c.ID).Error; err != nil {
+			if err := tx.Exec(`UPDATE iga_gov_control SET state = 'active', updated_at = now() WHERE workspace_id = ? AND id = ?`,
+				d.WorkspaceID, c.ID).Error; err != nil {
 				return err
 			}
 		}
@@ -828,7 +893,18 @@ type GovDimensionFact struct {
 // (GovNotFound for another workspace's id). Dimensions not yet checked are
 // absent from Dimensions; Gates is empty until the verify job has run.
 func (s *GovDeployments) DeploymentGateFacts(ctx context.Context, ws, deploymentID uuid.UUID) (*DeploymentGateFacts, error) {
-	db := s.db.WithContext(ctx)
+	var out *DeploymentGateFacts
+	err := s.read(ctx, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.deploymentGateFactsTx(tx, ws, deploymentID)
+		return err
+	})
+	return out, err
+}
+
+// deploymentGateFactsTx is DeploymentGateFacts inside the caller's
+// transaction under row-level security for ws.
+func (s *GovDeployments) deploymentGateFactsTx(db *gorm.DB, ws, deploymentID uuid.UUID) (*DeploymentGateFacts, error) {
 	d, err := s.loadDeployment(db, ws, deploymentID)
 	if err != nil {
 		return nil, err

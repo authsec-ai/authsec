@@ -364,6 +364,13 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not available"})
 		return
 	}
+	if err := database.CheckUsersDeletable(ctx, db.DB, ws, []uuid.UUID{userUUID}); err != nil {
+		if shared.RespondUserAuditHistory(c, err) {
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel invitation"})
+		return
+	}
 	// One row-level security transaction for the caller's workspace; every
 	// statement binds workspace_id = $1. A refused user delete rolls back the
 	// binding and membership deletes with it.

@@ -95,7 +95,9 @@ func commonActions(roles []*proposalRole, remove []string, warnings *[]string) [
 // and predates_observation when any role's grant predates observation
 // (owners are then asked to confirm, as for services), and the unused_action
 // findings the proposal addresses.
-func (a *GovAuthoring) recommendActions(ws uuid.UUID, roles []*proposalRole, removeActs []string, in *igagov.RightSizeIntent, rec *ProposalRecommendation) error {
+//
+// db is the caller's transaction under row-level security for ws.
+func (a *GovAuthoring) recommendActions(db *gorm.DB, ws uuid.UUID, roles []*proposalRole, removeActs []string, in *igagov.RightSizeIntent, rec *ProposalRecommendation) error {
 	want := map[string]bool{}
 	for _, x := range removeActs {
 		want[igagov.ActionKey(x)] = true
@@ -155,8 +157,7 @@ func (a *GovAuthoring) recommendActions(ws uuid.UUID, roles []*proposalRole, rem
 			continue
 		}
 		var fids []uuid.UUID
-		// TENANT-EXEMPT: R1b proposal lookup bound to workspace_id = ? (the token's workspace, passed as ws)
-		if err := a.db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
+		if err := db.Raw(`SELECT id FROM iga_gov_finding WHERE workspace_id = ? AND identity_account_id = ? AND kind = ?
 		               AND detail_key IN ? AND status IN ('open','reopened')`,
 			ws, r.target.Identity.ID, igagov.KindUnusedAction, keys).Scan(&fids).Error; err != nil {
 			return fmt.Errorf("action findings addressed by the proposal for %s: %w", r.target.Identity.RoleID, err)

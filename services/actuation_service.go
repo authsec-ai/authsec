@@ -395,9 +395,9 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	// named itself the same as the old one. Expiry is judged by the database
 	// clock, as the reaper judges it.
 	res := m.db.Model(&models.ProvisioningInstruction{}).
-		Where(`id = ? AND discovery_source_id = ? AND status = ? AND leased_by = ?
+		Where(`workspace_id = ? AND id = ? AND discovery_source_id = ? AND status = ? AND leased_by = ?
 		       AND attempts = ? AND lease_expires_at > NOW()`,
-			instructionID, sourceID, models.InstructionLeased, inst.LeasedBy, inst.Attempts).
+			inst.WorkspaceID, instructionID, sourceID, models.InstructionLeased, inst.LeasedBy, inst.Attempts).
 		Updates(updates)
 	if res.Error != nil {
 		return nil, res.Error
@@ -418,14 +418,15 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 		if err := m.applyToAgent(&inst, in, now); err != nil {
 			// The instruction outcome is already recorded; failing here would lose it.
 			// Surfaced through the instruction's error field instead.
-			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", instructionID).
+			_ = m.db.Model(&models.ProvisioningInstruction{}).
+				Where("workspace_id = ? AND id = ?", inst.WorkspaceID, instructionID).
 				Update("error", fmt.Sprintf("%s (could not update agent state: %v)",
 					in.Error, err)).Error
 		}
 	}
 
 	var out models.ProvisioningInstruction
-	if err := m.db.First(&out, "id = ?", instructionID).Error; err != nil {
+	if err := m.db.First(&out, "workspace_id = ? AND id = ?", inst.WorkspaceID, instructionID).Error; err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -479,8 +480,8 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	}
 	now := time.Now()
 	q := m.db.Model(&models.ProvisioningInstruction{}).
-		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ? AND leased_by = ?",
-			read.ID, read.DiscoverySourceID, read.Status, read.Attempts, read.LeasedBy)
+		Where("workspace_id = ? AND id = ? AND discovery_source_id = ? AND status = ? AND attempts = ? AND leased_by = ?",
+			read.WorkspaceID, read.ID, read.DiscoverySourceID, read.Status, read.Attempts, read.LeasedBy)
 	res := q.Updates(map[string]interface{}{
 		"status": models.InstructionApplied, "applied_at": now, "error": "",
 		"result": json.RawMessage(resultJSON), "lease_expires_at": nil, "leased_by": "", "updated_at": now,
@@ -491,7 +492,7 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	if res.RowsAffected == 0 {
 		// Re-leased (or closed) meanwhile: the current holder's run counts.
 		var cur models.ProvisioningInstruction
-		if err := m.db.First(&cur, "id = ?", read.ID).Error; err != nil {
+		if err := m.db.First(&cur, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 			return nil, err
 		}
 		if cur.Status == models.InstructionApplied {
@@ -501,12 +502,13 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	}
 	if read.DiscoveredAgentID != nil {
 		if err := m.applyToAgent(read, in, now); err != nil {
-			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", read.ID).
+			_ = m.db.Model(&models.ProvisioningInstruction{}).
+				Where("workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).
 				Update("error", fmt.Sprintf("(could not update agent state: %v)", err)).Error
 		}
 	}
 	var out models.ProvisioningInstruction
-	if err := m.db.First(&out, "id = ?", read.ID).Error; err != nil {
+	if err := m.db.First(&out, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -522,7 +524,7 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 // is a lease the reporter no longer holds.
 func (m *actuationManager) classifyRefusedReport(read *models.ProvisioningInstruction) (*models.ProvisioningInstruction, error) {
 	var now models.ProvisioningInstruction
-	if err := m.db.First(&now, "id = ?", read.ID).Error; err != nil {
+	if err := m.db.First(&now, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 		return nil, err
 	}
 	switch {
@@ -575,7 +577,7 @@ func (m *actuationManager) applyToAgent(inst *models.ProvisioningInstruction,
 		return nil
 	}
 	return m.db.Model(&models.DiscoveredAgent{}).
-		Where("id = ?", *inst.DiscoveredAgentID).Updates(updates).Error
+		Where("workspace_id = ? AND id = ?", inst.WorkspaceID, *inst.DiscoveredAgentID).Updates(updates).Error
 }
 
 /* --------------------------------- reads --------------------------------- */
@@ -727,7 +729,7 @@ func enqueueEviction(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discovere
 		return
 	}
 	var src models.DiscoverySource
-	if err := db.First(&src, "id = ?", *agent.DiscoverySourceID).Error; err != nil {
+	if err := db.First(&src, "workspace_id = ? AND id = ?", workspaceID, *agent.DiscoverySourceID).Error; err != nil {
 		return
 	}
 	if !src.EnforcementEvict {

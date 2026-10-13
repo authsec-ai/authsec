@@ -1,4 +1,4 @@
--- 063_access_policies.sql
+-- 137_access_policies.sql
 --
 -- Access policies (decision, Aditya, 2026-10-13): an admin picks an S3 bucket
 -- and roles from Discovery, chooses Block or Allow and a time window, and
@@ -104,14 +104,14 @@ END $$;
 DO $$
 BEGIN
     IF to_regclass('public.iga_gov_access_policy_version') IS NULL THEN
-        RAISE EXCEPTION '063: iga_gov_access_policy_version is missing';
+        RAISE EXCEPTION '137: iga_gov_access_policy_version is missing';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'iga_gov_access_policy_version_immutable'
                     AND tgrelid = 'public.iga_gov_access_policy_version'::regclass) THEN
-        RAISE EXCEPTION '063: the version immutability trigger is missing';
+        RAISE EXCEPTION '137: the version immutability trigger is missing';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                     WHERE table_schema = 'public' AND table_name = 'iga_gov_temp_grant' AND column_name = 'effect') THEN
-        RAISE EXCEPTION '063: iga_gov_temp_grant.effect is missing';
+        RAISE EXCEPTION '137: iga_gov_temp_grant.effect is missing';
     END IF;
 END $$;

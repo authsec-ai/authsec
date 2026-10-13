@@ -67,7 +67,7 @@ func (ctl *IGAGovPolicyController) ResolveDeployment(c *gin.Context) {
 			return nil, nil, err
 		}
 		if req.Action == "emergency_undo" {
-			ok, err := services.WorkspaceUserHoldsPermission(ctl.db(), ws, actor, "governance", "emergency")
+			ok, err := ctl.deployments().HoldsPermission(c.Request.Context(), ws, actor, "governance", "emergency")
 			if err != nil {
 				return nil, nil, err
 			}
@@ -158,7 +158,7 @@ func (ctl *IGAGovPolicyController) CreateHealthReport(c *gin.Context) {
 		if err := bindBody(c, &req, "{kind, service?, detail}"); err != nil {
 			return nil, nil, err
 		}
-		author, err := services.WorkspaceUserHoldsPermission(ctl.db(), ws, actor, "governance", "author")
+		author, err := ctl.deployments().HoldsPermission(c.Request.Context(), ws, actor, "governance", "author")
 		if err != nil {
 			return nil, nil, err
 		}

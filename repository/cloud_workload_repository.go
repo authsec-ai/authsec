@@ -125,6 +125,69 @@ func NewCloudWorkloadRepository(db *gorm.DB) CloudWorkloadRepository {
 	return &cloudWorkloadRepository{db: db}
 }
 
+// read runs fn in one read-only transaction under row-level security for
+// ws, on the repository's handle (a savepoint when the handle is a caller's
+// transaction): every statement sees only ws's rows (AS-108).
+func (r *cloudWorkloadRepository) read(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
+// fenced is runFenced, and fencedTx runFencedTx, inside a transaction under
+// row-level security for ws.
+func (r *cloudWorkloadRepository) fenced(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, func(tx *gorm.DB) error { return runFenced(tx, r.fence, fn) }))
+}
+
+func (r *cloudWorkloadRepository) fencedTx(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, func(tx *gorm.DB) error { return runFencedTx(tx, r.fence, fn) }))
+}
+
+// The reads, each in one read-only workspace transaction.
+
+func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) (out []models.CloudWorkload, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, total, e = listWorkloads(tx, workspaceID, f); return e })
+	return out, total, err
+}
+
+func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) (out []models.CloudUsage, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, total, e = listUsage(tx, workspaceID, f); return e })
+	return out, total, err
+}
+
+func (r *cloudWorkloadRepository) UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) (out []CloudUsageSummaryRow, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, e = usageSummary(tx, workspaceID, connectorID); return e })
+	return out, err
+}
+
+func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (workloads, usage int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		workloads, usage, e = countsForConnector(tx, workspaceID, connectorID)
+		return e
+	})
+	return workloads, usage, err
+}
+
+func (r *cloudWorkloadRepository) RegionsForConnector(workspaceID, connectorID uuid.UUID) (out []string, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, e = regionsForConnector(tx, workspaceID, connectorID); return e })
+	return out, err
+}
+
+func (r *cloudWorkloadRepository) CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (n int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		n, e = countWorkloads(tx, workspaceID, connectorID, runtimeKind, region)
+		return e
+	})
+	return n, err
+}
+
+func (r *cloudWorkloadRepository) ActivitySample(workspaceID, connectorID uuid.UUID, limit int) (out []SampledIdentity, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		out, total, e = activitySample(tx, workspaceID, connectorID, limit)
+		return e
+	})
+	return out, total, err
+}
+
 func (r *cloudWorkloadRepository) Fenced(f ScanFence) CloudWorkloadRepository {
 	copy := *r
 	copy.fence = &f
@@ -145,7 +208,7 @@ func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*mode
 	proposed := w.ID
 	now := time.Now()
 
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(w.WorkspaceID, func(tx *gorm.DB) error {
 		if err := adoptBareIDRow(tx, w); err != nil {
 			return err
 		}
@@ -301,7 +364,7 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	proposed := u.ID
 	now := time.Now()
 
-	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fenced(u.WorkspaceID, func(tx *gorm.DB) error {
 		return tx.Clauses(
 			clause.OnConflict{
 				Columns: []clause.Column{
@@ -331,8 +394,8 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	return u, u.ID == proposed, nil
 }
 
-func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error) {
-	q := r.db.Model(&models.CloudWorkload{}).Where("workspace_id = ?", workspaceID)
+func listWorkloads(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error) {
+	q := db.Model(&models.CloudWorkload{}).Where("workspace_id = ?", workspaceID)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -350,8 +413,8 @@ func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWo
 	return out, total, nil
 }
 
-func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
-	q := r.db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
+func listUsage(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
+	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -388,8 +451,8 @@ type CloudUsageSummaryRow struct {
 // Go: the never-used count is the actionable number on the page, and computing
 // it beside the total in one pass is both cheaper and immune to the two numbers
 // disagreeing because rows changed between reads.
-func (r *cloudWorkloadRepository) UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
-	q := r.db.Model(&models.CloudUsage{}).
+func usageSummary(db *gorm.DB, workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
+	q := db.Model(&models.CloudUsage{}).
 		Select("identity_id, count(*) AS services, count(*) FILTER (WHERE last_used_at IS NULL) AS never_used").
 		Where("workspace_id = ?", workspaceID)
 	if connectorID != nil {
@@ -405,14 +468,14 @@ func (r *cloudWorkloadRepository) UsageSummary(workspaceID uuid.UUID, connectorI
 	return out, nil
 }
 
-func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, error) {
+func countsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) (int64, int64, error) {
 	var workloads, usage int64
-	if err := r.db.Model(&models.CloudWorkload{}).
+	if err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
 		Count(&workloads).Error; err != nil {
 		return 0, 0, err
 	}
-	if err := r.db.Model(&models.CloudUsage{}).
+	if err := db.Model(&models.CloudUsage{}).
 		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
 		Count(&usage).Error; err != nil {
 		return 0, 0, err
@@ -420,9 +483,9 @@ func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uu
 	return workloads, usage, nil
 }
 
-func (r *cloudWorkloadRepository) RegionsForConnector(workspaceID, connectorID uuid.UUID) ([]string, error) {
+func regionsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) ([]string, error) {
 	var regions []string
-	err := r.db.Model(&models.CloudWorkload{}).
+	err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ? AND region <> ''", workspaceID, connectorID).
 		Distinct().Order("region").Pluck("region", &regions).Error
 	return regions, err
@@ -437,7 +500,7 @@ func (r *cloudWorkloadRepository) ReconcileGeneration(
 ) (int64, int64, error) {
 
 	var workloadsRemoved, usageRemoved int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
 		if res.Error != nil {
@@ -456,11 +519,11 @@ func (r *cloudWorkloadRepository) ReconcileGeneration(
 	return workloadsRemoved, usageRemoved, err
 }
 
-func (r *cloudWorkloadRepository) CountWorkloads(
+func countWorkloads(db *gorm.DB,
 	workspaceID, connectorID uuid.UUID, runtimeKind, region string,
 ) (int64, error) {
 	var n int64
-	err := r.db.Model(&models.CloudWorkload{}).
+	err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ?",
 			workspaceID, connectorID, runtimeKind, region).
 		Count(&n).Error
@@ -484,7 +547,7 @@ func (r *cloudWorkloadRepository) ReconcileWorkloads(
 		pairs = append(pairs, []interface{}{sc.RuntimeKind, sc.Region})
 	}
 	var removed int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?
 		                 AND (runtime_kind, region) IN ?`,
 			workspaceID, connectorID, generation, pairs).Delete(&models.CloudWorkload{})
@@ -500,7 +563,7 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, error) {
 	var removed int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
 		removed = res.RowsAffected
@@ -556,13 +619,13 @@ type SampledIdentity struct {
 // collation because it is Go's string order too, so that comparison means the
 // same thing in SQL and in code; the default collation would order case and
 // punctuation by locale.
-func (r *cloudWorkloadRepository) ActivitySample(
+func activitySample(db *gorm.DB,
 	workspaceID, connectorID uuid.UUID, limit int,
 ) ([]SampledIdentity, int64, error) {
 	// Two independent statements, never one builder reused across a Count and
 	// a Find: GORM mutates a chained statement in place.
 	var total int64
-	if err := r.db.Model(&models.CloudIdentity{}).
+	if err := db.Model(&models.CloudIdentity{}).
 		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
 		Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -572,7 +635,7 @@ func (r *cloudWorkloadRepository) ActivitySample(
 	// scanner runs at any schema, so the control clause is added only when the
 	// table is there -- never a query that fails on an older database.
 	controlled := "false"
-	hasControls, err := HasRelation(r.db, "iga_gov_control")
+	hasControls, err := HasRelation(db, "iga_gov_control")
 	if err != nil {
 		return nil, 0, err
 	}
@@ -585,7 +648,7 @@ func (r *cloudWorkloadRepository) ActivitySample(
 	}
 	// The graph's binding relationships, where the graph schema is there.
 	graphBound := "false"
-	hasGraph, err := HasRelation(r.db, "iga_relationship")
+	hasGraph, err := HasRelation(db, "iga_relationship")
 	if err != nil {
 		return nil, 0, err
 	}
@@ -599,7 +662,7 @@ func (r *cloudWorkloadRepository) ActivitySample(
 		                             OR ia.immutable_key = ci.attrs->>'unique_id'))`
 	}
 	var out []SampledIdentity
-	err = r.db.Raw(`SELECT ci.*, (
+	err = db.Raw(`SELECT ci.*, (
 	                         `+graphBound+` OR
 	                         EXISTS (SELECT 1 FROM cloud_workload w
 	                                  WHERE w.workspace_id = ci.workspace_id AND w.connector_id = ci.connector_id

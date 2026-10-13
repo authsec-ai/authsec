@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -35,18 +36,26 @@ type AccessReadiness struct {
 // AccessPolicyReadiness reads the workspace's AWS accounts and bindings.
 func AccessPolicyReadiness(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*AccessReadiness, error) {
 	out := &AccessReadiness{Accounts: []AccessReadinessAccount{}}
+	// TENANT-EXEMPT: the 137 schema check reads the Postgres catalog only.
 	out.Available, out.Reason = AccessPoliciesStatus(db)
+	err := tenancy.InWorkspaceRead(ctx, db, ws, func(tx *gorm.DB) error {
+		return accessReadinessTx(ctx, tx, ws, out)
+	})
+	return out, err
+}
+
+func accessReadinessTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, out *AccessReadiness) error {
 	var conns []models.CloudConnector
-	if err := db.WithContext(ctx).Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND status = ?", ws, "aws", "account", "active").
+	if err := db.Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND status = ?", ws, "aws", "account", "active").
 		Order("scope_id").Find(&conns).Error; err != nil {
-		return nil, err
+		return err
 	}
 	for _, c := range conns {
 		a := AccessReadinessAccount{AccountID: c.ScopeID, ConnectorID: c.ID, BindingState: "none"}
 		var b []models.CloudEnforcementBinding
-		if err := db.WithContext(ctx).Where("workspace_id = ? AND connector_id = ? AND state <> ?", ws, c.ID,
+		if err := db.Where("workspace_id = ? AND connector_id = ? AND state <> ?", ws, c.ID,
 			models.EnforcementBindingRevoked).Order("updated_at DESC").Limit(1).Find(&b).Error; err != nil {
-			return nil, err
+			return err
 		}
 		if len(b) > 0 {
 			a.BindingState, a.TemplateVersion = b[0].State, b[0].TemplateVersion
@@ -59,5 +68,5 @@ func AccessPolicyReadiness(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*Acc
 		}
 		out.Accounts = append(out.Accounts, a)
 	}
-	return out, nil
+	return nil
 }

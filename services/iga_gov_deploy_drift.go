@@ -15,6 +15,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -97,39 +98,50 @@ func (s *GovDeployments) DriftHandler(ctx context.Context, run *PolicyJobRun) er
 		return PolicyJobAbandon("drift_check needs a deployment subject")
 	}
 	ws := run.Job.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, *run.Job.SubjectID)
+	var d *models.IGAGovDeployment
+	var plan igagov.Plan
+	var ctl *models.IGAGovControl
+	skip := false
+	err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		if d, err = s.loadDeployment(db, ws, *run.Job.SubjectID); err != nil {
+			return err
+		}
+		if d.Delivery != igagov.DeliveryDirect {
+			skip = true
+			return nil
+		}
+		switch d.State {
+		case models.GovDeployVerified:
+		case models.GovDeployQueued, models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved:
+			skip = true // in flight: the deploy / resolve_unknown job owns the live state
+			return nil
+		default:
+			// Review P1-7, §8.1 step 5: for 24 h after an unknown attempt the
+			// CONTROL is watched whatever this deployment's state (the scheduler
+			// picks the control's latest applied deployment, or the attempt's
+			// own when none applied).
+			watched, err := lateWatchActive(db, ws, d.ControlID, s.now())
+			if err != nil || !watched {
+				skip = true
+				return err
+			}
+		}
+		if plan, err = loadGovPlan(db, ws, d.PlanID); err != nil {
+			return err
+		}
+		ctl, err = s.loadControl(db, ws, d.ControlID)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
-		if errors.As(err, &ge) {
+		if d == nil && errors.As(err, &ge) {
 			return PolicyJobAbandon("deployment not found")
 		}
 		return err
 	}
-	if d.Delivery != igagov.DeliveryDirect {
+	if skip {
 		return nil
-	}
-	switch d.State {
-	case models.GovDeployVerified:
-	case models.GovDeployQueued, models.GovDeployApplying, models.GovDeployOutcomeUnknown, models.GovDeployOutcomeUnresolved:
-		return nil // in flight: the deploy / resolve_unknown job owns the live state
-	default:
-		// Review P1-7, §8.1 step 5: for 24 h after an unknown attempt the
-		// CONTROL is watched whatever this deployment's state (the scheduler
-		// picks the control's latest applied deployment, or the attempt's
-		// own when none applied).
-		watched, err := lateWatchActive(db, ws, d.ControlID, s.now())
-		if err != nil || !watched {
-			return err
-		}
-	}
-	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
-	if err != nil {
-		return err
-	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
-		return err
 	}
 	if d.State != models.GovDeployVerified {
 		return s.lateWatch(ctx, run, *d, plan, *ctl)
@@ -168,8 +180,10 @@ func (s *GovDeployments) lateWatch(ctx context.Context, run *PolicyJobRun, d mod
 		return err
 	}
 	var seen int64
-	if err := run.DB().WithContext(ctx).Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?
-		AND payload->>'attempt_id' = ?`, d.WorkspaceID, d.ID, GovEventDriftLateMutation, late.Attempt.ID.String()).Scan(&seen).Error; err != nil {
+	if err := runRead(ctx, run, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?
+		AND payload->>'attempt_id' = ?`, d.WorkspaceID, d.ID, GovEventDriftLateMutation, late.Attempt.ID.String()).Scan(&seen).Error
+	}); err != nil {
 		return err
 	}
 	if seen > 0 {
@@ -186,17 +200,24 @@ func (s *GovDeployments) recordDrift(ctx context.Context, run *PolicyJobRun, d m
 	ws := d.WorkspaceID
 	clean, retired := false, false
 	_, err := s.observe(ctx, run, func(ctx context.Context) (*govObservation, error) {
-		db := run.DB().WithContext(ctx)
-		cur, err := s.loadDeployment(db, ws, d.ID)
-		if err != nil {
+		var cur *models.IGAGovDeployment
+		var seen int64
+		var cstate string
+		if err := runRead(ctx, run, func(db *gorm.DB) error {
+			var err error
+			if cur, err = s.loadDeployment(db, ws, d.ID); err != nil {
+				return err
+			}
+			if cur.State != models.GovDeployVerified && cur.State != models.GovDeployAppliedUnverified {
+				return nil
+			}
+			seen, cstate, err = controlSeen(db, ws, d.ControlID)
+			return err
+		}); err != nil {
 			return nil, err
 		}
 		if cur.State != models.GovDeployVerified && cur.State != models.GovDeployAppliedUnverified {
 			return nil, nil // undone, superseded or already drifted meanwhile
-		}
-		seen, cstate, err := controlSeen(db, ws, d.ControlID)
-		if err != nil {
-			return nil, err
 		}
 		if cstate == "removed" {
 			return nil, nil // a retired control is fenced: nothing to observe
@@ -304,28 +325,46 @@ func (m *lateMatch) payload(state string) map[string]any {
 // late: its effect is the record. Ops a read cannot see (TagPolicy,
 // DeletePolicyVersion) change no boundary fact and are not watched by read.
 func (s *GovDeployments) lateMutation(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, ctl models.IGAGovControl, live igagov.LiveRead, anchor *igagov.Plan) (*lateMatch, error) {
-	db := run.DB().WithContext(ctx)
-	var atts []models.IGAGovAttempt
-	if err := db.Raw(`SELECT a.* FROM iga_gov_attempt a JOIN iga_gov_deployment d ON d.workspace_id = a.workspace_id AND d.id = a.deployment_id
-		WHERE a.workspace_id = ? AND d.control_id = ? AND a.status = 'unknown' AND a.dispatched_at > ?
-		  AND (a.resolved_as IS NULL OR a.resolved_as = 'not_applied')
-		ORDER BY a.dispatched_at DESC`, ws, ctl.ID, s.now().Add(-LateMutationWatch)).Scan(&atts).Error; err != nil {
+	// The database facts of every candidate attempt are read first, in one
+	// read transaction under row-level security for the job's workspace; the
+	// live reads below are external calls and run outside it.
+	type candidate struct {
+		att       models.IGAGovAttempt
+		dep       models.IGAGovDeployment
+		plan      igagov.Plan
+		laterDone bool
+	}
+	var cands []candidate
+	if err := tenancy.InWorkspaceRead(ctx, run.DB(), ws, func(db *gorm.DB) error {
+		var atts []models.IGAGovAttempt
+		if err := db.Raw(`SELECT a.* FROM iga_gov_attempt a JOIN iga_gov_deployment d ON d.workspace_id = a.workspace_id AND d.id = a.deployment_id
+			WHERE a.workspace_id = ? AND d.control_id = ? AND a.status = 'unknown' AND a.dispatched_at > ?
+			  AND (a.resolved_as IS NULL OR a.resolved_as = 'not_applied')
+			ORDER BY a.dispatched_at DESC`, ws, ctl.ID, s.now().Add(-LateMutationWatch)).Scan(&atts).Error; err != nil {
+			return err
+		}
+		plans := map[uuid.UUID]igagov.Plan{}
+		for _, a := range atts {
+			var dep models.IGAGovDeployment
+			if err := db.Where("workspace_id = ? AND id = ?", ws, a.DeploymentID).Take(&dep).Error; err != nil {
+				return err
+			}
+			p, ok := plans[dep.PlanID]
+			if !ok {
+				var err error
+				if p, err = LoadIGAGovPlan(db, ws, dep.PlanID); err != nil {
+					return err
+				}
+				plans[dep.PlanID] = p
+			}
+			cands = append(cands, candidate{att: a, dep: dep, plan: p, laterDone: anchor == nil && laterAttemptDone(db, a)})
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	plans := map[uuid.UUID]igagov.Plan{}
-	for _, a := range atts {
-		var dep models.IGAGovDeployment
-		if err := db.Where("workspace_id = ? AND id = ?", ws, a.DeploymentID).Take(&dep).Error; err != nil {
-			return nil, err
-		}
-		p, ok := plans[dep.PlanID]
-		if !ok {
-			var err error
-			if p, err = LoadIGAGovPlan(db, ws, dep.PlanID); err != nil {
-				return nil, err
-			}
-			plans[dep.PlanID] = p
-		}
+	for _, c := range cands {
+		a, dep, p := c.att, c.dep, c.plan
 		if a.OpSeq >= len(p.Ops) {
 			continue
 		}
@@ -333,7 +372,7 @@ func (s *GovDeployments) lateMutation(ctx context.Context, run *PolicyJobRun, ws
 		if err != nil {
 			continue // a version selector: not visible to a read
 		}
-		if anchor == nil && laterAttemptDone(db, a) {
+		if anchor == nil && c.laterDone {
 			continue // no applied state to compare with; a retry made this effect
 		}
 		m, err := s.lateEffect(ctx, run, ctl, live, req, anchor)
@@ -497,8 +536,12 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 		return PolicyJobAbandon("resolve_unknown needs a deployment subject")
 	}
 	ws := run.Job.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, *run.Job.SubjectID)
+	var d *models.IGAGovDeployment
+	err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		d, err = s.loadDeployment(db, ws, *run.Job.SubjectID)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -513,7 +556,7 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 	if d.SettleAfter != nil && now.Before(*d.SettleAfter) {
 		return PolicyJobRetryLater(d.SettleAfter.Sub(now), "settle_after not reached")
 	}
-	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
+	plan, err := loadGovPlanRun(ctx, run, d.PlanID)
 	if err != nil {
 		return err
 	}
@@ -522,7 +565,7 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 		// from one read after settle_after.
 		return s.r2ResolveSplitUnknown(ctx, run, *d, plan)
 	}
-	exec, err := s.executor()
+	exec, err := s.executor(run)
 	if err != nil {
 		return PolicyJobRetryLater(5*time.Minute, err.Error())
 	}
@@ -549,8 +592,12 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 		}
 		return PolicyJobRetryLater(time.Minute, "unknown-outcome read failed: "+err.Error())
 	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
+	var ctl *models.IGAGovControl
+	if err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		ctl, err = s.loadControl(db, ws, d.ControlID)
+		return err
+	}); err != nil {
 		return err
 	}
 	verdict, trailDetail, err := s.trailVerdict(ctx, run.DB(), *d, *ctl, rd.Attempt, plan)
@@ -559,8 +606,12 @@ func (s *GovDeployments) ResolveUnknownHandler(ctx context.Context, run *PolicyJ
 	}
 	this := unknownReading{AttemptID: rd.Attempt.ID.String(), Resolution: rd.Resolution.Resolution, ReadAt: now.UTC(), Trail: verdict,
 		TrailDetail: trailDetail}
-	prev, err := s.lastReading(db, *d, rd.Attempt.ID)
-	if err != nil {
+	var prev *unknownReading
+	if err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		prev, err = s.lastReading(db, *d, rd.Attempt.ID)
+		return err
+	}); err != nil {
 		return err
 	}
 	if err := run.InTx(ctx, func(tx *gorm.DB) error {
@@ -642,9 +693,11 @@ func (s *GovDeployments) trailVerdict(ctx context.Context, db *gorm.DB, d models
 	op := plan.Ops[att.OpSeq]
 	from := att.SignedAt.Add(-time.Minute)
 	var prev []time.Time
-	if err := db.WithContext(ctx).Raw(`SELECT completed_at FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
+	if err := tenancy.InWorkspaceRead(ctx, db, d.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT completed_at FROM iga_gov_attempt WHERE workspace_id = ? AND deployment_id = ? AND op_seq = ?
 		AND attempt_no < ? AND status = 'completed' ORDER BY completed_at DESC LIMIT 1`,
-		d.WorkspaceID, d.ID, att.OpSeq, att.AttemptNo).Scan(&prev).Error; err != nil {
+			d.WorkspaceID, d.ID, att.OpSeq, att.AttemptNo).Scan(&prev).Error
+	}); err != nil {
 		return "", "", err
 	}
 	if len(prev) == 1 && prev[0].After(from) {

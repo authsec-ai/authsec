@@ -19,6 +19,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -716,12 +717,22 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	workspaceID, id uuid.UUID,
 ) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
 
-	var empty awsdiscovery.AssumeRequest
-
 	c, err := s.repo.Get(workspaceID, id)
 	if err != nil {
-		return nil, empty, err
+		return nil, awsdiscovery.AssumeRequest{}, err
 	}
+	return s.assumeRequestForConnector(workspaceID, c)
+}
+
+// assumeRequestForConnector is assumeRequestFor for a connector row already
+// read (the runtime broker reads it in a workspace transaction under RLS
+// and calls the secrets store after that transaction, never inside it).
+func (s *AWSOnboardingService) assumeRequestForConnector(
+	workspaceID uuid.UUID, c *models.CloudConnector,
+) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
+
+	var empty awsdiscovery.AssumeRequest
+	id := c.ID
 	if c.Provider != models.CloudProviderAWS {
 		return nil, empty, fmt.Errorf("connector %s is a %s connector", id, c.Provider)
 	}
@@ -794,6 +805,7 @@ func (s *AWSOnboardingService) RecordStackTemplateVersion(
 		return 0, nil
 	}
 	var candidates []models.CloudConnector
+	// TENANT-EXEMPT: a stack UPDATE callback names no workspace; its connector is found by account + role and proven by its ExternalId below.
 	if err := s.db.WithContext(ctx).Where("provider = ? AND scope_id = ? AND status <> ? AND attrs->>'role_arn' = ?",
 		models.CloudProviderAWS, accountID, models.CloudConnectorRevoked, roleARN).
 		Order("id").Find(&candidates).Error; err != nil {
@@ -815,15 +827,21 @@ func (s *AWSOnboardingService) RecordStackTemplateVersion(
 		if err != nil {
 			return updated, err
 		}
-		res := s.db.WithContext(ctx).Exec(`UPDATE cloud_connector
-		       SET attrs = jsonb_set(jsonb_set(attrs, '{template_version}', ?::jsonb, true),
-		                             '{template_version_source}', to_jsonb(?::text), true), updated_at = now()
-		     WHERE workspace_id = ? AND id = ? AND status <> ?`, string(raw), models.AWSTemplateVersionFromStack,
-			c.WorkspaceID, c.ID, models.CloudConnectorRevoked)
-		if res.Error != nil {
-			return updated, res.Error
+		// The ExternalId proved the connector, and so its workspace: the
+		// update runs under row-level security for that workspace alone.
+		var n int64
+		if err := tenancy.InWorkspace(ctx, s.db, c.WorkspaceID, func(tx *gorm.DB) error {
+			res := tx.Exec(`UPDATE cloud_connector
+			       SET attrs = jsonb_set(jsonb_set(attrs, '{template_version}', ?::jsonb, true),
+			                             '{template_version_source}', to_jsonb(?::text), true), updated_at = now()
+			     WHERE workspace_id = ? AND id = ? AND status <> ?`, string(raw), models.AWSTemplateVersionFromStack,
+				c.WorkspaceID, c.ID, models.CloudConnectorRevoked)
+			n = res.RowsAffected
+			return res.Error
+		}); err != nil {
+			return updated, err
 		}
-		updated += int(res.RowsAffected)
+		updated += int(n)
 	}
 	return updated, nil
 }

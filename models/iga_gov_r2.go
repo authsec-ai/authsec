@@ -71,7 +71,7 @@ type IGAGovTempGrant struct {
 	Ops                 json.RawMessage `json:"ops" gorm:"type:jsonb;not null;default:'[]'"`
 	CreatedAt           time.Time       `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt           time.Time       `json:"updated_at" gorm:"not null;default:now()"`
-	// Access policies (063): effect allow | deny, the policy and version a
+	// Access policies (137): effect allow | deny, the policy and version a
 	// deployment row belongs to, and the window start. Nil / allow for R2
 	// temporary grants.
 	Effect    string     `json:"effect" gorm:"not null;default:'allow'"`
@@ -82,7 +82,7 @@ type IGAGovTempGrant struct {
 
 func (IGAGovTempGrant) TableName() string { return "iga_gov_temp_grant" }
 
-// IGAGovAccessPolicyVersion is one immutable access-policy version (063).
+// IGAGovAccessPolicyVersion is one immutable access-policy version (137).
 type IGAGovAccessPolicyVersion struct {
 	ID              uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID     uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
@@ -98,7 +98,7 @@ type IGAGovAccessPolicyVersion struct {
 
 func (IGAGovAccessPolicyVersion) TableName() string { return "iga_gov_access_policy_version" }
 
-// Access-policy version statuses (063).
+// Access-policy version statuses (137).
 const (
 	AccessVersionApplied    = "applied"
 	AccessVersionSuperseded = "superseded"

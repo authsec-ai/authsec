@@ -3,6 +3,7 @@ package admin
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -431,6 +432,19 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 		return
+	}
+
+	// Another workspace's rows naming the user would be changed silently by
+	// the delete's cascades: refuse first.
+	if ws, werr := tenancy.Workspace(c); werr == nil {
+		if err := database.CheckUsersDeletable(c.Request.Context(), db.DB, ws, []uuid.UUID{userUUID}); err != nil {
+			if errors.Is(err, database.ErrUserInAnotherWorkspace) {
+				c.JSON(http.StatusConflict, models.NewSCIMError("409", err.Error(), ""))
+				return
+			}
+			c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
+			return
+		}
 	}
 
 	// Delete the user

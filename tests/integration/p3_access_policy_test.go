@@ -45,7 +45,7 @@ func newAPLab(t *testing.T) *apLab {
 	services.SetPolicyGate(pg)
 	r2 := services.NewPolicyR2Gate(true, "")
 	if err := r2.Verify(d.db); err != nil {
-		t.Fatalf("R2 gate: %v (the integration database must be at 063)", err)
+		t.Fatalf("R2 gate: %v (the integration database must be at 137)", err)
 	}
 	prevR2 := services.PolicyR2GateState()
 	services.SetPolicyR2Gate(r2)

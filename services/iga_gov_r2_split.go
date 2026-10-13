@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -92,7 +93,7 @@ func (r *r2SplitReader) functionRole(ctx context.Context, functionARN string) (s
 
 // opDone recognises an op from a fresh read (DECISION R2-20). skip reports a
 // DeleteRole that must not run because something else runs as the role.
-func (s *GovDeployments) r2SplitOpDone(ctx context.Context, r *r2SplitReader, db *gorm.DB, ws uuid.UUID, ctl models.IGAGovControl,
+func (s *GovDeployments) r2SplitOpDone(ctx context.Context, r *r2SplitReader, run *PolicyJobRun, ws uuid.UUID, ctl models.IGAGovControl,
 	op igagov.Op) (done bool, conflict string, newRole *igagov.LiveRole, err error) {
 	name := roleNameOfARN(op.RoleARN)
 	switch op.Op {
@@ -140,8 +141,12 @@ func (s *GovDeployments) r2SplitOpDone(ctx context.Context, r *r2SplitReader, db
 		if newRole == nil {
 			return true, "", nil, nil
 		}
-		keys, err := workloadsExecutingAsARN(db, ws, op.RoleARN)
-		if err != nil {
+		var keys []string
+		if err := runRead(ctx, run, func(tx *gorm.DB) error {
+			var err error
+			keys, err = workloadsExecutingAsARN(tx, ws, op.RoleARN)
+			return err
+		}); err != nil {
 			return false, "", nil, err
 		}
 		if len(keys) > 0 && op.OnlyIfUnused {
@@ -156,15 +161,29 @@ func (s *GovDeployments) r2SplitOpDone(ctx context.Context, r *r2SplitReader, db
 // r2ExecuteSplit is the deploy job's AWS step for a direct split.
 func (s *GovDeployments) r2ExecuteSplit(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, plan igagov.Plan) error {
 	ws := d.WorkspaceID
-	db := run.DB().WithContext(ctx)
+	if ws != run.Job.WorkspaceID {
+		return PolicyJobAbandon("the deployment is not in the job's workspace")
+	}
 	if !PolicyR2On() {
 		return s.block(ctx, run, &d, GovCodeR2Unavailable, "Direct Lambda isolation needs IGA_POLICY_R2.", nil, nil)
 	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
+	var ctl *models.IGAGovControl
+	var v2err error
+	if err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		if ctl, err = s.loadControl(tx, ws, d.ControlID); err != nil {
+			return err
+		}
+		v2err = RequireEnforcementV2(ctx, tx, ws, ctl.ConnectorID, EnforcementFeatureLambdaSplit)
+		var ge *GovError
+		if v2err != nil && !errors.As(v2err, &ge) {
+			return v2err // a database error
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	if err := RequireEnforcementV2(ctx, run.DB(), ws, ctl.ConnectorID, EnforcementFeatureLambdaSplit); err != nil {
+	if err := v2err; err != nil {
 		code, msg := errCode(err)
 		return s.block(ctx, run, &d, code, msg, nil, nil)
 	}
@@ -191,7 +210,7 @@ func (s *GovDeployments) r2ExecuteSplit(ctx context.Context, run *PolicyJobRun, 
 		var newRole *igagov.LiveRole
 		if err := run.External(ctx, 0, func(ctx context.Context) error {
 			var err error
-			done, conflict, newRole, err = s.r2SplitOpDone(ctx, rd, db, ws, *ctl, op)
+			done, conflict, newRole, err = s.r2SplitOpDone(ctx, rd, run, ws, *ctl, op)
 			return err
 		}); err != nil {
 			if isLeaseErr(err) {
@@ -226,7 +245,12 @@ func (s *GovDeployments) r2ExecuteSplit(ctx context.Context, run *PolicyJobRun, 
 				return s.block(ctx, run, &d, code, msg, nil, nil)
 			}
 		}
-		calls, err := s.r2SplitCalls(db, ws, op, newRole)
+		var calls []r2SplitCall
+		err := runRead(ctx, run, func(tx *gorm.DB) error {
+			var err error
+			calls, err = s.r2SplitCalls(tx, ws, op, newRole)
+			return err
+		})
 		if err != nil {
 			return s.stop(ctx, run, &d, models.GovDeployFailed, DeployReasonDocumentMissing, err.Error(), nil, nil)
 		}
@@ -377,8 +401,7 @@ func (s *GovDeployments) r2SplitCalls(db *gorm.DB, ws uuid.UUID, op igagov.Op, n
 // it. Shared by the deploy readback, verify and drift for direct splits.
 func (s *GovDeployments) r2SplitLive(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, plan igagov.Plan,
 	ctl models.IGAGovControl) (igagov.LiveRead, error) {
-	iac := NewGovIaCDelivery(s.db, nil, ProcessGovLiveReader())
-	x, err := iac.load(run.DB().WithContext(ctx), d.WorkspaceID, d.ID)
+	iac, x, err := s.r2SplitIaC(ctx, run, d)
 	if err != nil {
 		return igagov.LiveRead{}, err
 	}
@@ -419,6 +442,24 @@ func (s *GovDeployments) r2SplitLive(ctx context.Context, run *PolicyJobRun, d m
 	return live, nil
 }
 
+// r2SplitIaC is the IaC delivery's view of a direct split's deployment,
+// loaded under row-level security for the job's workspace. The delivery is
+// built on the job's handle only to reach its migration-evidence and ledger
+// steps, which run on the job's own transactions (InTx), never on it.
+func (s *GovDeployments) r2SplitIaC(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment) (*GovIaCDelivery, *iacDep, error) {
+	if d.WorkspaceID != run.Job.WorkspaceID {
+		return nil, nil, PolicyJobAbandon("the deployment is not in the job's workspace")
+	}
+	iac := NewGovIaCDelivery(run.DB(), nil, ProcessGovLiveReader())
+	var x *iacDep
+	err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		x, err = iac.load(tx, d.WorkspaceID, d.ID)
+		return err
+	})
+	return iac, x, err
+}
+
 // r2SplitReadback: every op is done; applied_unverified only once the
 // classifier sees the after-state (DECISION R2-20), else the deployment
 // stays applying and the job looks again in 10 minutes.
@@ -443,8 +484,7 @@ func (s *GovDeployments) r2SplitReadback(ctx context.Context, run *PolicyJobRun,
 		})
 		return PolicyJobRetryLater(DefaultVerifyEvery, "awaiting the migration evidence of the split")
 	}
-	iac := NewGovIaCDelivery(s.db, nil, ProcessGovLiveReader())
-	x, err := iac.load(run.DB().WithContext(ctx), d.WorkspaceID, d.ID)
+	iac, x, err := s.r2SplitIaC(ctx, run, d)
 	if err != nil {
 		return err
 	}
@@ -470,17 +510,23 @@ func (s *GovDeployments) r2SplitReadback(ctx context.Context, run *PolicyJobRun,
 // -- every op is idempotent or recognisable, so nothing is applied twice).
 func (s *GovDeployments) r2ResolveSplitUnknown(ctx context.Context, run *PolicyJobRun, d models.IGAGovDeployment, plan igagov.Plan) error {
 	ws := d.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	att, err := s.attempts.OpenAttempt(db, ws, d.ID)
-	if err != nil {
+	if ws != run.Job.WorkspaceID {
+		return PolicyJobAbandon("the deployment is not in the job's workspace")
+	}
+	var att *models.IGAGovAttempt
+	var ctl *models.IGAGovControl
+	if err := runRead(ctx, run, func(tx *gorm.DB) error {
+		var err error
+		if att, err = s.attempts.OpenAttempt(tx, ws, d.ID); err != nil || att == nil {
+			return err
+		}
+		ctl, err = s.loadControl(tx, ws, d.ControlID)
+		return err
+	}); err != nil {
 		return err
 	}
 	if att == nil {
 		return run.InTx(ctx, func(tx *gorm.DB) error { return s.rereadWithoutAttemptTx(tx, d) })
-	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
-		return err
 	}
 	k := att.OpSeq / 100
 	if k < 0 || k >= len(plan.Ops) {
@@ -493,7 +539,7 @@ func (s *GovDeployments) r2ResolveSplitUnknown(ctx context.Context, run *PolicyJ
 	var done bool
 	if err := run.External(ctx, 0, func(ctx context.Context) error {
 		var err error
-		done, _, _, err = s.r2SplitOpDone(ctx, rd, db, ws, *ctl, plan.Ops[k])
+		done, _, _, err = s.r2SplitOpDone(ctx, rd, run, ws, *ctl, plan.Ops[k])
 		return err
 	}); err != nil {
 		if isLeaseErr(err) {

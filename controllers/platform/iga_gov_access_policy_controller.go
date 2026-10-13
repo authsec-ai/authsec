@@ -32,9 +32,10 @@ func RegisterAccessPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, requ
 }
 
 // accessGate answers 503 access_policies_unavailable while the R2 gate or
-// the 063 schema is not in place (readiness stays readable: it says why).
+// the 137 schema is not in place (readiness stays readable: it says why).
 func (ctl *IGAGovPolicyController) accessGate() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// TENANT-EXEMPT: the 137 schema check reads the Postgres catalog only.
 		if ok, reason := services.AccessPoliciesStatus(ctl.db()); !ok {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": services.GovCodeAccessUnavailable,
 				"message": "Access policies are not available on this server.", "detail": gin.H{"reason": reason}}})
@@ -44,6 +45,8 @@ func (ctl *IGAGovPolicyController) accessGate() gin.HandlerFunc {
 	}
 }
 
+// TENANT-EXEMPT: not a statement here: GovAccess runs every statement in a
+// transaction under row-level security for the token's workspace.
 func (ctl *IGAGovPolicyController) access() *services.GovAccess {
 	return services.NewGovAccess(ctl.db())
 }
@@ -78,6 +81,7 @@ func (ctl *IGAGovPolicyController) ListAccessPolicies(c *gin.Context) {
 // AccessPolicyReadiness handles GET /access-policies/readiness.
 func (ctl *IGAGovPolicyController) AccessPolicyReadiness(c *gin.Context) {
 	govCall(c, func(ws uuid.UUID) (any, any, error) {
+		// TENANT-EXEMPT: AccessPolicyReadiness reads under RLS for ws.
 		out, err := services.AccessPolicyReadiness(c.Request.Context(), ctl.db(), ws)
 		return out, nil, err
 	})

@@ -18,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -101,7 +102,7 @@ const (
 /*                                   Gate                                       */
 /* ---------------------------------------------------------------------------- */
 
-// accessSchema caches the 063 verification (re-tried at most every minute).
+// accessSchema caches the 137 verification (re-tried at most every minute).
 var accessSchema struct {
 	sync.Mutex
 	ok     bool
@@ -109,7 +110,7 @@ var accessSchema struct {
 	at     time.Time
 }
 
-// VerifyAccessPolicySchema checks the 063 objects access policies need.
+// VerifyAccessPolicySchema checks the 137 objects access policies need.
 func VerifyAccessPolicySchema(db *gorm.DB) error {
 	var missing []string
 	ok, err := repositories.HasRelation(db, "iga_gov_access_policy_version")
@@ -127,13 +128,13 @@ func VerifyAccessPolicySchema(db *gorm.DB) error {
 	}
 	missing = append(missing, absentNames(want, have, "constraint ")...)
 	if len(missing) > 0 {
-		return fmt.Errorf("access policies need migration 063; missing: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("access policies need migration 137; missing: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
 // AccessPoliciesStatus is policy.access_policies of /capabilities: the R2
-// gate (IGA_POLICY_R2, no new flag) and the 063 schema.
+// gate (IGA_POLICY_R2, no new flag) and the 137 schema.
 func AccessPoliciesStatus(db *gorm.DB) (bool, string) {
 	if !PolicyR2On() {
 		_, reason := PolicyR2GateState().Status()
@@ -156,6 +157,7 @@ func AccessPoliciesStatus(db *gorm.DB) (bool, string) {
 }
 
 func (s *GovAccess) require() error {
+	// TENANT-EXEMPT: the 137 schema check reads the Postgres catalog only.
 	if ok, reason := AccessPoliciesStatus(s.db); !ok {
 		return govErr(http.StatusServiceUnavailable, GovCodeAccessUnavailable, "Access policies are not available on this server.",
 			map[string]any{"reason": reason})
@@ -167,7 +169,9 @@ func (s *GovAccess) require() error {
 /*                                 Service                                      */
 /* ---------------------------------------------------------------------------- */
 
-// GovAccess is the access-policy service.
+// GovAccess is the access-policy service. Every statement runs in a
+// transaction under row-level security for the token's workspace
+// (tenancy.InWorkspace / InWorkspaceRead) or the job's (run.InTx).
 type GovAccess struct {
 	db  *gorm.DB
 	r2  *GovR2
@@ -334,11 +338,18 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	if p.hash, err = igagov.AccessIntentHash(norm); err != nil {
 		return nil, err
 	}
-	db := s.db.WithContext(ctx)
-
-	// The bucket: a Discovery resource of this workspace naming an S3 bucket.
+	// The bucket: a Discovery resource of this workspace naming an S3
+	// bucket, and the accounts whose scans name it (an S3 ARN names no
+	// account).
 	var rows []models.IGAResource
-	if err := db.Where("workspace_id = ? AND id = ?", ws, norm.Resource.ResourceID).Limit(1).Find(&rows).Error; err != nil {
+	var seenBy []uuid.UUID
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		if err := db.Where("workspace_id = ? AND id = ?", ws, norm.Resource.ResourceID).Limit(1).Find(&rows).Error; err != nil {
+			return err
+		}
+		return db.Table("iga_object_support").Where("workspace_id = ? AND resource_id = ? AND state = ? AND connector_id IS NOT NULL",
+			ws, norm.Resource.ResourceID, "current").Distinct().Pluck("connector_id", &seenBy).Error
+	}); err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -354,12 +365,6 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	p.target = t
 	p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: t.BucketARN(), Bucket: t.Bucket, Prefix: t.Prefix}
 
-	// The accounts whose scans name the bucket (an S3 ARN names no account).
-	var seenBy []uuid.UUID
-	if err := db.Table("iga_object_support").Where("workspace_id = ? AND resource_id = ? AND state = ? AND connector_id IS NOT NULL",
-		ws, norm.Resource.ResourceID, "current").Distinct().Pluck("connector_id", &seenBy).Error; err != nil {
-		return nil, err
-	}
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
 		seen[c] = true
@@ -423,6 +428,16 @@ func (p *accessPlan) roleIDs() []uuid.UUID {
 
 // usedBy lists the workloads that run as each role (Discovery's used-by).
 func (s *GovAccess) usedBy(ctx context.Context, ws uuid.UUID, ids []uuid.UUID) (map[uuid.UUID][]AccessWorkloadRef, error) {
+	var out map[uuid.UUID][]AccessWorkloadRef
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = usedByTx(tx, ws, ids)
+		return err
+	})
+	return out, err
+}
+
+func usedByTx(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (map[uuid.UUID][]AccessWorkloadRef, error) {
 	out := map[uuid.UUID][]AccessWorkloadRef{}
 	for _, id := range ids {
 		out[id] = []AccessWorkloadRef{}
@@ -436,7 +451,7 @@ func (s *GovAccess) usedBy(ctx context.Context, ws uuid.UUID, ids []uuid.UUID) (
 		DisplayName             string
 		RuntimeKind             string
 	}
-	if err := s.db.WithContext(ctx).Table("iga_relationship AS r").
+	if err := tx.Table("iga_relationship AS r").
 		Select("r.target_identity_account_id, w.id, w.display_name, w.runtime_kind").
 		Joins("JOIN iga_workload AS w ON w.workspace_id = r.workspace_id AND w.id = r.source_workload_id").
 		Where("r.workspace_id = ? AND r.target_identity_account_id IN ? AND r.relationship_type IN ? AND r.state = ?",
@@ -475,7 +490,9 @@ func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []e
 	for _, r := range p.roles {
 		if !done[r.Connector] {
 			done[r.Connector] = true
-			if err := RequireEnforcementV2(ctx, s.db, ws, r.Connector, EnforcementFeatureGrants); err != nil {
+			if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+				return RequireEnforcementV2(ctx, tx, ws, r.Connector, EnforcementFeatureGrants)
+			}); err != nil {
 				errs = append(errs, accessBindingErr(err))
 			}
 		}
@@ -640,7 +657,7 @@ func (s *GovAccess) Create(ctx context.Context, ws, actor uuid.UUID, req AccessP
 		Lifecycle: "active", CreatedBy: actor, CreatedAt: now, UpdatedAt: now}
 	v := models.IGAGovAccessPolicyVersion{ID: uuid.New(), WorkspaceID: ws, PolicyID: pol.ID, VersionNo: 1, Intent: intent,
 		IntentHash: p.hash, Status: models.AccessVersionApplied, CreatedBy: actor, CreatedAt: now, StatusChangedAt: now}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&pol).Error; err != nil {
 			if isUniqueViolation(err, "iga_gov_policy_workspace_id_name_key") {
 				return govConflict(GovCodeNameTaken, "A policy with that name already exists.", map[string]any{"field": "name"})
@@ -681,6 +698,17 @@ func (s *GovAccess) loadPolicy(db *gorm.DB, ws, id uuid.UUID, lock bool) (*model
 		return nil, GovNotFound()
 	}
 	return &rows[0], nil
+}
+
+// policy is loadPolicy in its own read-only workspace transaction.
+func (s *GovAccess) policy(ctx context.Context, ws, id uuid.UUID) (*models.IGAGovPolicy, error) {
+	var out *models.IGAGovPolicy
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.loadPolicy(tx, ws, id, false)
+		return err
+	})
+	return out, err
 }
 
 func (s *GovAccess) currentVersion(db *gorm.DB, ws, policyID uuid.UUID) (*models.IGAGovAccessPolicyVersion, error) {
@@ -775,7 +803,7 @@ func (s *GovAccess) Edit(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 		return nil, err
 	}
 	now := s.now().UTC().Truncate(time.Second)
-	pol, err := s.loadPolicy(s.db.WithContext(ctx), ws, id, false)
+	pol, err := s.policy(ctx, ws, id)
 	if err != nil {
 		return nil, err
 	}
@@ -792,7 +820,7 @@ func (s *GovAccess) Edit(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 		}
 	}
 	intent, _ := json.Marshal(p.intent)
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		pol, err := s.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -862,7 +890,7 @@ func (s *GovAccess) stop(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 		return nil, govUnprocessable(GovCodeAccessInvalid, "A reason is required.", map[string]any{"field": "reason"})
 	}
 	now := s.now().UTC()
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		pol, err := s.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -904,8 +932,7 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 		return nil, govUnprocessable(GovCodeAccessInvalid, "A reason is required.", map[string]any{"field": "reason"})
 	}
 	now := s.now().UTC().Truncate(time.Second)
-	db := s.db.WithContext(ctx)
-	pol, err := s.loadPolicy(db, ws, id, false)
+	pol, err := s.policy(ctx, ws, id)
 	if err != nil {
 		return nil, err
 	}
@@ -915,8 +942,12 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 	case "active":
 		return nil, govConflict(GovCodePolicyNotActive, "The policy is not paused.", map[string]any{"lifecycle": pol.Lifecycle})
 	}
-	cur, err := s.currentVersion(db, ws, id)
-	if err != nil {
+	var cur *models.IGAGovAccessPolicyVersion
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		var err error
+		cur, err = s.currentVersion(tx, ws, id)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	var in igagov.AccessIntent
@@ -936,7 +967,7 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 	if errs := s.checks(ctx, ws, p); len(errs) > 0 {
 		return nil, errs[0]
 	}
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		pol, err := s.loadPolicy(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -983,7 +1014,18 @@ type accessBundle struct {
 }
 
 func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
-	db := s.db.WithContext(ctx)
+	out := []*accessBundle{}
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		var err error
+		out, err = loadAccessBundles(db, ws, ids, q)
+		return err
+	})
+	return out, err
+}
+
+// loadAccessBundles reads the policies, versions and deployments (in the
+// caller's workspace transaction).
+func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
 	pq := db.Where("workspace_id = ? AND family = ?", ws, "time_bound")
 	if ids != nil {
 		pq = pq.Where("id IN ?", ids)
@@ -1142,7 +1184,16 @@ func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason str
 // versions.
 func (s *GovAccess) views(ctx context.Context, ws uuid.UUID, bs []*accessBundle, detail bool) ([]AccessPolicyView, error) {
 	now := s.now().UTC()
-	db := s.db.WithContext(ctx)
+	var out []AccessPolicyView
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		var err error
+		out, err = s.viewsTx(ctx, db, ws, bs, detail, now)
+		return err
+	})
+	return out, err
+}
+
+func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs []*accessBundle, detail bool, now time.Time) ([]AccessPolicyView, error) {
 	// Names: creators (members) and role identities.
 	var users []uuid.UUID
 	idents := map[uuid.UUID]bool{}
@@ -1189,7 +1240,7 @@ func (s *GovAccess) views(ctx context.Context, ws uuid.UUID, bs []*accessBundle,
 	for _, r := range irows {
 		identName[r.ID] = r.DisplayName
 	}
-	usedBy, err := s.usedBy(ctx, ws, ids)
+	usedBy, err := usedByTx(db, ws, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -1320,7 +1371,7 @@ func dedupeDocs(in []AccessDocumentView) []AccessDocumentView {
 
 // Get is GET /:id (404 across workspaces and families).
 func (s *GovAccess) Get(ctx context.Context, ws, id uuid.UUID) (*AccessPolicyView, error) {
-	if _, err := s.loadPolicy(s.db.WithContext(ctx), ws, id, false); err != nil {
+	if _, err := s.policy(ctx, ws, id); err != nil {
 		return nil, err
 	}
 	bs, err := s.bundles(ctx, ws, []uuid.UUID{id}, "")
@@ -1415,13 +1466,14 @@ type AccessEventView struct {
 
 // Events is GET /:id/events (newest first, at most 500).
 func (s *GovAccess) Events(ctx context.Context, ws, id uuid.UUID) ([]AccessEventView, error) {
-	db := s.db.WithContext(ctx)
-	if _, err := s.loadPolicy(db, ws, id, false); err != nil {
-		return nil, err
-	}
 	var rows []models.IGAGovEvent
-	if err := db.Where("workspace_id = ? AND policy_id = ? AND event LIKE ?", ws, id, "access_policy.%").
-		Order("id DESC").Limit(500).Find(&rows).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		if _, err := s.loadPolicy(db, ws, id, false); err != nil {
+			return err
+		}
+		return db.Where("workspace_id = ? AND policy_id = ? AND event LIKE ?", ws, id, "access_policy.%").
+			Order("id DESC").Limit(500).Find(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	out := make([]AccessEventView, 0, len(rows))

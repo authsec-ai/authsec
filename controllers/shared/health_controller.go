@@ -69,8 +69,9 @@ func (hc *HealthController) ComprehensiveHealthCheck(c *gin.Context) {
 	}
 
 	// Discovery ingress auth: reported, never what makes the service
-	// unhealthy -- warn is the default during rollout, and a 503 would take the
-	// control plane out of its load balancer for a configuration choice.
+	// unhealthy -- warn is a rollout setting (the default outside production),
+	// and a 503 would take the control plane out of its load balancer for a
+	// configuration choice.
 	checks["discovery_ingest_auth"] = hc.checkDiscoveryIngestAuth()
 
 	// 5. Metrics Health Check

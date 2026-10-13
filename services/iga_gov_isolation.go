@@ -17,6 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -66,12 +67,16 @@ func DefaultGovMigrationClients() GovMigrationClients {
 // executes_as relationship to the role with this ARN.
 func workloadsExecutingAsARN(db *gorm.DB, ws uuid.UUID, roleARN string) ([]string, error) {
 	var keys []string
-	err := db.Raw(`SELECT DISTINCT w.source_key FROM iga_workload w
+	ctx, err := govWorkspaceContext(govHandleContext(db), ws)
+	if err != nil {
+		return nil, err
+	}
+	err = tenancy.GormRaw(ctx, db, `SELECT DISTINCT w.source_key FROM iga_workload w
 		JOIN iga_relationship r ON r.workspace_id = w.workspace_id AND r.source_workload_id = w.id
-		 AND r.relationship_type = ? AND r.state = 'current'
+		 AND r.relationship_type = $2 AND r.state = 'current'
 		JOIN iga_identity_accounts i ON i.workspace_id = r.workspace_id AND i.id = r.target_identity_account_id
-		WHERE w.workspace_id = ? AND i.source_key = ? ORDER BY w.source_key`,
-		models.RelTypeExecutesAs, ws, igagraph.IdentityARNKey(roleARN)).Scan(&keys).Error
+		WHERE w.workspace_id = $1 AND i.source_key = $3 ORDER BY w.source_key`,
+		models.RelTypeExecutesAs, igagraph.IdentityARNKey(roleARN)).Scan(&keys).Error
 	return keys, err
 }
 
@@ -284,6 +289,10 @@ func (d *GovIaCDelivery) ensureMigrationRows(tx *gorm.DB, ws uuid.UUID, x *iacDe
 	if (x.plan.Kind != igagov.PlanSplit && x.plan.Kind != igagov.PlanSplitRevert) || x.plan.Diff.Split == nil {
 		return nil
 	}
+	wctx, err := govWorkspaceContext(govHandleContext(tx), ws)
+	if err != nil {
+		return err
+	}
 	s := x.plan.Diff.Split
 	for _, subject := range s.Subjects() {
 		from, to, keys := s.SourceRoleARN, s.NewRoleARN, s.FromWorkloadKeys
@@ -302,10 +311,14 @@ func (d *GovIaCDelivery) ensureMigrationRows(tx *gorm.DB, ws uuid.UUID, x *iacDe
 		if keys == nil {
 			keys = []string{}
 		}
-		if err := tx.Exec(`INSERT INTO iga_gov_workload_migration (workspace_id, plan_id, control_id, subject_kind, subject_arn,
-			from_role_arn, to_role_arn, from_workload_keys) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		// Scoped (workspace_id = $1): the row is written only for a control of
+		// ws, on the job's transaction under row-level security for ws.
+		if err := tenancy.GormExec(wctx, tx, `INSERT INTO iga_gov_workload_migration (workspace_id, plan_id, control_id, subject_kind, subject_arn,
+			from_role_arn, to_role_arn, from_workload_keys)
+			SELECT $1::uuid, $2::uuid, c.id, $4::text, $5::text, $6::text, $7::text, $8::text[]
+			  FROM iga_gov_control c WHERE c.workspace_id = $1 AND c.id = $3::uuid
 			ON CONFLICT (plan_id, subject_kind, subject_arn) DO NOTHING`,
-			ws, x.planRow.ID, x.control.ID, s.SubjectKind, subject, from, to, pq.StringArray(keys)).Error; err != nil {
+			x.planRow.ID, x.control.ID, s.SubjectKind, subject, from, to, pq.StringArray(keys)).Error; err != nil {
 			return err
 		}
 	}
@@ -328,18 +341,26 @@ type GovMigrationCheck struct {
 // updates its row, and returns the binding each subject shows (the new role
 // only when moved).
 func (d *GovIaCDelivery) checkMigrations(ctx context.Context, run *PolicyJobRun, ws uuid.UUID, x *iacDep, newRoleID string) ([]GovMigrationCheck, map[string]string, error) {
-	db := d.db.WithContext(ctx)
-	var rows []models.IGAGovWorkloadMigration
-	if err := db.Where("workspace_id = ? AND plan_id = ?", ws, x.planRow.ID).Order("subject_arn").Find(&rows).Error; err != nil {
-		return nil, nil, err
+	// Every database section runs in the job's transaction (InTx: under
+	// row-level security for the job's workspace, fenced), never across the
+	// AWS reads between them; the workspace handed in must be the job's.
+	if ws != run.Job.WorkspaceID {
+		return nil, nil, fmt.Errorf("migration check: workspace %s is not the job's (%s)", ws, run.Job.WorkspaceID)
 	}
-	if len(rows) == 0 {
-		if err := run.InTx(ctx, func(tx *gorm.DB) error { return d.ensureMigrationRows(tx, ws, x) }); err != nil {
-			return nil, nil, err
+	var rows []models.IGAGovWorkloadMigration
+	if err := run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("workspace_id = ? AND plan_id = ?", ws, x.planRow.ID).Order("subject_arn").Find(&rows).Error; err != nil {
+			return err
 		}
-		if err := db.Where("workspace_id = ? AND plan_id = ?", ws, x.planRow.ID).Find(&rows).Error; err != nil {
-			return nil, nil, err
+		if len(rows) > 0 {
+			return nil
 		}
+		if err := d.ensureMigrationRows(tx, ws, x); err != nil {
+			return err
+		}
+		return tx.Where("workspace_id = ? AND plan_id = ?", ws, x.planRow.ID).Find(&rows).Error
+	}); err != nil {
+		return nil, nil, err
 	}
 	bindings := map[string]string{}
 	var checks []GovMigrationCheck
@@ -364,7 +385,8 @@ func (d *GovIaCDelivery) checkMigrations(ctx context.Context, run *PolicyJobRun,
 				return nil, nil, cerr
 			}
 		}
-		toKeys, err := workloadsExecutingAsARN(db, ws, row.ToRoleARN)
+		var toKeys []string
+		err := run.InTx(ctx, func(tx *gorm.DB) (e error) { toKeys, e = workloadsExecutingAsARN(tx, ws, row.ToRoleARN); return e })
 		if err != nil {
 			return nil, nil, err
 		}
@@ -558,22 +580,30 @@ func migrationReadUnavailable(what string, ev *awsdiscovery.MigrationEvidence, e
 // migration_evidence_unavailable.
 func (a *GovAuthoring) isolationInput(ctx context.Context, ws uuid.UUID, c models.IGAGovControl, di igagov.DedicatedIdentityIntent,
 	evidenceAvailable bool) (GovIsolationInput, error) {
-	db := a.db.WithContext(ctx)
 	out := GovIsolationInput{}
 	wid, err := uuid.Parse(di.Workload.WorkloadID)
 	if err != nil {
 		return out, err
 	}
-	var keys []string
-	if err := db.Raw(`SELECT source_key FROM iga_workload WHERE workspace_id = ? AND id = ?`, ws, wid).Scan(&keys).Error; err != nil {
+	// The graph reads, in one read-only transaction under row-level
+	// security for ws, closed before the AWS reads below (AS-108).
+	var keys, bound []string
+	err = tenancy.InWorkspaceRead(ctx, a.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) error {
+		if err := tenancy.GormRaw(tx.Statement.Context, tx, `SELECT source_key FROM iga_workload WHERE workspace_id = $1 AND id = $2`, wid).Scan(&keys).Error; err != nil {
+			return err
+		}
+		if len(keys) != 1 {
+			return nil
+		}
+		var err error
+		bound, err = workloadsExecutingAsARN(tx, ws, c.RoleARN)
+		return err
+	}))
+	if err != nil {
 		return out, err
 	}
 	if len(keys) != 1 {
 		return out, govUnprocessable("workload_not_found", "The intent's workload is not in the graph.", map[string]any{"workload_id": wid})
-	}
-	bound, err := workloadsExecutingAsARN(db, ws, c.RoleARN)
-	if err != nil {
-		return out, err
 	}
 	kind := subjectKindFor(di.Workload.BindingKind, di.Workload.BindingRef)
 	if kind == igagov.SubjectECSService {
@@ -659,8 +689,16 @@ func (a *GovAuthoring) isolationInput(ctx context.Context, ws uuid.UUID, c model
 // split_revert plans persisted with their documents.
 func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID uuid.UUID, no int, v *models.IGAGovPolicyVersion,
 	di igagov.DedicatedIdentityIntent) (*ProposeResult, error) {
-	db := a.db.WithContext(ctx)
-	ts, cs, err := a.versionTargets(db, ws, v.ID)
+	var ts []models.IGAGovTarget
+	var cs map[uuid.UUID]models.IGAGovControl
+	var dep map[uuid.UUID]bool
+	err := tenancy.InWorkspaceRead(ctx, a.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		if ts, cs, e = a.versionTargets(tx, ws, v.ID); e != nil || len(ts) != 1 {
+			return e
+		}
+		dep, e = deployedTargets(tx, ws, v.ID, uuid.Nil)
+		return e
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -671,9 +709,7 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 	t, c := ts[0], cs[ts[0].ID]
 	// fix/p3-appr (P0-2): a re-proposed version never rewrites the plans of
 	// a target that already carries one of its deployments.
-	if dep, err := deployedTargets(db, ws, v.ID, uuid.Nil); err != nil {
-		return nil, err
-	} else if dep[t.ID] {
+	if dep[t.ID] {
 		return nil, govConflict(GovCodeTargetDeployed, "This target already carries a deployment of this version; its plans are not recompiled.",
 			map[string]any{"target_id": t.ID, "role_id": c.RoleID})
 	}
@@ -708,8 +744,11 @@ func (a *GovAuthoring) proposeIsolation(ctx context.Context, ws, actor, policyID
 // returned as compiled (the caller decides) and skips the IaC decision.
 func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di igagov.DedicatedIdentityIntent, t models.IGAGovTarget,
 	c models.IGAGovControl, call liveCaller) (*compiledTarget, *compileBlock, error) {
-	db := a.db.WithContext(ctx)
-	facts, err := LoadIaCConnectorFacts(db, ws, c.ConnectorID)
+	var facts *IaCConnectorFacts
+	err := tenancy.InWorkspaceRead(ctx, a.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		facts, e = LoadIaCConnectorFacts(tx, ws, c.ConnectorID)
+		return e
+	}))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -817,7 +856,19 @@ func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di
 	if di.Delivery == igagov.DeliveryIaCPR {
 		// Review P1-12 (b): the form is decided by rendering the approved
 		// documents (DecideIaCForm used to get an empty map here).
-		f, err := DecideIaCForm(ctx, db, a.iacGitHub(), ws, c, sp.Split, docs, "", false)
+		// DecideIaCForm's database part (the mapped sources) is read in a
+		// workspace transaction under RLS first; the GitHub reads run after
+		// it, never inside it (AS-108).
+		var f *GovIaCForm
+		var fs *iacFormSources
+		err := tenancy.InWorkspaceRead(ctx, a.db, ws, func(tx *gorm.DB) error {
+			var err error
+			fs, err = loadIaCFormSources(tx, ws, c)
+			return err
+		})
+		if err == nil {
+			f, err = renderIaCForm(ctx, a.iacGitHub(), ws, c, sp.Split, docs, "", false, fs)
+		}
 		if err != nil {
 			if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
 				return nil, nil, err
@@ -849,10 +900,9 @@ func (a *GovAuthoring) compileIsolationOne(ctx context.Context, ws uuid.UUID, di
 // the version's current plans and moves the version to in_review.
 func (a *GovAuthoring) persistIsolationProposal(ctx context.Context, ws, actor, policyID uuid.UUID, no int, v *models.IGAGovPolicyVersion,
 	c models.IGAGovControl, ct *compiledTarget) (*ProposeResult, error) {
-	db := a.db.WithContext(ctx)
 	k, aid := userActor(actor)
 	var out ProposeResult
-	err := db.Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, a.db, ws, func(tx *gorm.DB) error {
 		cur, err := a.loadVersion(tx, ws, policyID, no, true)
 		if err != nil {
 			return err
@@ -942,7 +992,7 @@ func (a *GovAuthoring) createIsolationVersion(ctx context.Context, ws, actor, po
 	}
 	di := in.DedicatedIdentity
 	var out *GovVersionView
-	err = a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = tenancy.InWorkspace(ctx, a.db, ws, func(tx *gorm.DB) error {
 		pol, err := a.loadPolicy(tx, ws, policyID, true)
 		if err != nil {
 			return err

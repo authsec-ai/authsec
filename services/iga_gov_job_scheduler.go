@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -46,7 +47,9 @@ type PolicyJobSchedule struct {
 	Kind string
 	// Every is the default interval between runs for one subject.
 	Every time.Duration
-	// Due lists the subjects to run now.
+	// Due lists the subjects to run now. It is a scan across every
+	// workspace on the base handle (each item names its workspace); the
+	// enqueue then runs under row-level security for that workspace.
 	Due func(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPolicyJob, error)
 }
 
@@ -156,6 +159,8 @@ func (s *PolicyJobScheduler) RunSchedulesNow(ctx context.Context, now time.Time)
 }
 
 func (s *PolicyJobScheduler) runSchedule(ctx context.Context, sc PolicyJobSchedule, now time.Time) (int, error) {
+	// TENANT-EXEMPT: the scheduler's due scan spans every workspace (no
+	// leader, one pass for all); each item carries its workspace.
 	items, err := sc.Due(ctx, s.db.WithContext(ctx), now)
 	if err != nil {
 		return 0, err
@@ -165,18 +170,22 @@ func (s *PolicyJobScheduler) runSchedule(ctx context.Context, sc PolicyJobSchedu
 		job := &models.IGAGovJob{WorkspaceID: it.WorkspaceID, Kind: sc.Kind, SubjectID: it.SubjectID, Rev: it.Rev,
 			DedupeKey: it.DedupeKey, RunAfter: it.RunAfter}
 		var created bool
-		switch {
-		case it.Once:
-			created, err = s.jobs.EnqueueOnceTx(s.db.WithContext(ctx), job)
-		default:
-			ev := it.Every
-			if ev <= 0 {
-				ev = sc.Every
+		err = tenancy.InWorkspace(ctx, s.db, it.WorkspaceID, func(tx *gorm.DB) error {
+			var e error
+			switch {
+			case it.Once:
+				created, e = s.jobs.EnqueueOnceTx(tx, job)
+			default:
+				ev := it.Every
+				if ev <= 0 {
+					ev = sc.Every
+				}
+				created, e = s.jobs.EnqueuePeriodicTx(tx, job, ev)
 			}
-			created, err = s.jobs.EnqueuePeriodicTx(s.db.WithContext(ctx), job, ev)
-		}
+			return e
+		})
 		if err != nil {
-			return n, err
+			return n, fmt.Errorf("workspace %s: %w", it.WorkspaceID, err)
 		}
 		if created {
 			n++
@@ -228,6 +237,7 @@ func dueDriftChecks(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedule
 		ID          uuid.UUID
 		LateWatch   bool
 	}
+	// TENANT-EXEMPT: scheduler due scan across every workspace (rows carry workspace_id).
 	err := db.Raw(`
 		SELECT d.workspace_id, d.id,
 		       EXISTS (SELECT 1 FROM iga_gov_attempt a
@@ -257,6 +267,7 @@ func dueDriftChecks(ctx context.Context, db *gorm.DB, now time.Time) ([]Schedule
 		WorkspaceID uuid.UUID
 		ID          uuid.UUID
 	}
+	// TENANT-EXEMPT: scheduler due scan across every workspace (rows carry workspace_id).
 	if err := db.Raw(`
 		WITH iga_late_watch AS (
 			SELECT DISTINCT ON (ad.control_id) ad.workspace_id, ad.control_id, ad.id AS attempt_deployment_id
@@ -298,6 +309,7 @@ func dueIaCSyncs(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPo
 	// T3.17: plus every awaiting_apply deployment without an open change
 	// (J1 export, or a J2 change already in the source), subject = the
 	// deployment (DECISION in iga_gov_iac_delivery.go).
+	// TENANT-EXEMPT: scheduler due scan across every workspace (rows carry workspace_id).
 	err := db.Raw(`SELECT workspace_id, id FROM iga_gov_iac_change
 		WHERE state IN ('opening','open','changed_after_review','merged')
 		UNION ALL
@@ -322,6 +334,7 @@ func dueActivityRefreshes(ctx context.Context, db *gorm.DB, now time.Time) ([]Sc
 		ConnectorID uuid.UUID
 		After       time.Time
 	}
+	// TENANT-EXEMPT: scheduler due scan across every workspace (rows carry workspace_id).
 	err := db.Raw(`
 		SELECT DISTINCT r.workspace_id, c.connector_id, r.observe_evidence_required_after AS after
 		  FROM iga_gov_rollout r
