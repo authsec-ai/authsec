@@ -150,6 +150,16 @@ func (tr *WorkspaceRepository) DeleteTenant(ctx context.Context) (map[string]int
 	if err != nil {
 		return nil, err
 	}
+	// A user of this workspace that another workspace still refers to (a
+	// membership, or that workspace's records) would be removed from under
+	// it, or its rows nulled, by the cascade: refuse the purge.
+	users, err := WorkspaceUserIDs(ctx, tr.db.DB, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list users: %w", err)
+	}
+	if err := CheckUsersDeletable(ctx, tr.db.DB, workspaceID, users); err != nil {
+		return nil, err
+	}
 	deletedCounts := make(map[string]int64)
 	// deleted records the rows one scoped statement removed from table.
 	deleted := func(table string) func(sql.Result, error) error {

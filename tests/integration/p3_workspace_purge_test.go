@@ -18,7 +18,7 @@ package integration
 //   - C: a bystander with fixture rows that is never purged.
 //
 // It proves: D cannot be purged while A's records name its user (409
-// user_has_audit_history, nothing deleted); A purges completely, leaving B,
+// user_in_another_workspace, nothing deleted); A purges completely, leaving B,
 // C and D untouched; then D purges; a single user named by B's approvals is
 // refused with 409 user_has_audit_history while a user with no history is
 // deleted; B purges completely; C is untouched throughout.
@@ -338,12 +338,13 @@ func TestP3WorkspacePurgeWithPhase3Data(t *testing.T) {
 	}
 	p3pAssertSame(t, beforeB, p3pCounts(t, db, tables, wsB), "B after a refused user delete")
 
-	// D cannot be purged while A's records name its user: refused, nothing
-	// deleted, A untouched.
+	// D cannot be purged while A refers to its user (A's membership and
+	// records): refused before anything is deleted, without naming A's
+	// table, nothing deleted, A untouched.
 	beforeA := p3pCounts(t, db, tables, wsA)
 	code, body = api.purge(wsD)
-	if code != http.StatusConflict || body["code"] != database.UserHasAuditHistoryCode {
-		t.Errorf("purge D while A names its user: %d %v, want 409 %s", code, body, database.UserHasAuditHistoryCode)
+	if code != http.StatusConflict || body["code"] != database.UserInAnotherWorkspaceCode || body["detail"] != nil {
+		t.Errorf("purge D while A names its user: %d %v, want 409 %s", code, body, database.UserInAnotherWorkspaceCode)
 	}
 	p3pAssertSame(t, beforeD, p3pCounts(t, db, tables, wsD), "D after its refused purge")
 	p3pAssertSame(t, beforeA, p3pCounts(t, db, tables, wsA), "A after D's refused purge")

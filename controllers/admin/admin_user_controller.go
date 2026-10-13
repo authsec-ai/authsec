@@ -585,6 +585,16 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		}
 		return nil
 	}
+	// Another workspace's rows naming the user would be changed silently by
+	// the delete's cascades: refuse first.
+	if err := database.CheckUsersDeletable(ctx, db.DB, workspaceUUID, []uuid.UUID{userUUID}); err != nil {
+		if shared.RespondUserAuditHistory(c, err) {
+			return
+		}
+		logger.WithError(err).Error("Failed to check references to the user")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
+		return
+	}
 	err = tenancy.WithTx(ctx, db.DB, workspaceUUID, func(tx *sql.Tx) error {
 		// 1. role_bindings
 		res, err := tenancy.ExecContext(ctx, tx, `DELETE FROM role_bindings WHERE workspace_id = $1 AND user_id = $2`, userUUID)

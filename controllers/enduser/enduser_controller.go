@@ -659,6 +659,18 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	log.Printf("INFO: Hard deleting user %s and all related data for tenant %s", userUUID, workspaceUUID)
 
+	// Another workspace's rows naming the user would be changed silently by
+	// the delete's cascades: refuse first.
+	if dbc := config.GetDatabase(); dbc != nil {
+		if err := database.CheckUsersDeletable(c.Request.Context(), dbc.DB, workspaceUUID, []uuid.UUID{userUUID}); err != nil {
+			if shared.RespondUserAuditHistory(c, err) {
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
+			return
+		}
+	}
+
 	// Every delete is restricted to the caller's workspace.
 	deletedCounts := make(map[string]int64)
 	err = scopedDB.Transaction(func(tx *gorm.DB) error {
