@@ -20,7 +20,7 @@ const (
 	// IngestAuthOff checks nothing: the workspace in the body is trusted, as
 	// it was before ingest tokens existed.
 	IngestAuthOff DiscoveryIngestAuthMode = "off"
-	// IngestAuthWarn (the default) attributes a call with a valid token and
+	// IngestAuthWarn (the default outside production) attributes a call with a valid token and
 	// ACCEPTS one without (logged and counted), so agents installed before
 	// tokens existed keep working while they are rolled out. A valid token for
 	// another workspace is still refused. Warn does NOT protect the ingress: it
@@ -38,12 +38,18 @@ const (
 const DiscoveryIngestAuthEnv = "IGA_DISCOVERY_INGEST_AUTH"
 
 // DiscoveryIngestAuthModeFromEnv reads IGA_DISCOVERY_INGEST_AUTH. Unset or
-// empty is warn. An unrecognised value is ENFORCE: a typo in a setting that
-// exists to close the ingress must not quietly leave it open.
+// empty is ENFORCE when ENVIRONMENT=production and warn elsewhere: in
+// production an unauthenticated report naming a workspace must never be
+// written by default, so warn there is only ever an explicit choice. An
+// unrecognised value is ENFORCE: a typo in a setting that exists to close the
+// ingress must not quietly leave it open.
 func DiscoveryIngestAuthModeFromEnv() DiscoveryIngestAuthMode {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv(DiscoveryIngestAuthEnv)))
 	switch DiscoveryIngestAuthMode(raw) {
 	case "":
+		if isProductionEnvironment() {
+			return IngestAuthEnforce
+		}
 		return IngestAuthWarn
 	case IngestAuthOff, IngestAuthWarn, IngestAuthEnforce:
 		return DiscoveryIngestAuthMode(raw)
@@ -51,6 +57,21 @@ func DiscoveryIngestAuthModeFromEnv() DiscoveryIngestAuthMode {
 		log.Printf("discovery ingest auth: %s=%q is not off|warn|enforce; enforcing", DiscoveryIngestAuthEnv, raw)
 		return IngestAuthEnforce
 	}
+}
+
+// isProductionEnvironment reports ENVIRONMENT=production (any case).
+func isProductionEnvironment() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("ENVIRONMENT")), "production")
+}
+
+// DiscoveryIngestAuthExplicitlyWeakInProduction reports a production
+// deployment whose IGA_DISCOVERY_INGEST_AUTH was set to off or warn by hand:
+// the only way the ingress accepts unauthenticated reports there.
+func DiscoveryIngestAuthExplicitlyWeakInProduction() bool {
+	if !isProductionEnvironment() || strings.TrimSpace(os.Getenv(DiscoveryIngestAuthEnv)) == "" {
+		return false
+	}
+	return DiscoveryIngestAuthModeFromEnv() != IngestAuthEnforce
 }
 
 // IngestAuthOutcome is what the ingress does with a call.

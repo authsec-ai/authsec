@@ -42,7 +42,7 @@ Set or confirm (names only; values from your secret store):
 | `METRICS_TOKEN` or `METRICS_ADDR` | Metrics are not exposed otherwise. |
 | `OUTBOUND_ALLOWED_HOSTS`, `OUTBOUND_ALLOWED_CIDRS` | Only if a tenant-configured URL must reach a private address (SSRF guard). |
 | `ICP_SERVICE_URL` | Required in production when SPIFFE SVIDs are used. |
-| `IGA_DISCOVERY_INGEST_AUTH` | `warn` (default) accepts and logs unauthenticated discovery reports; set `enforce` once every collector has an ingest token. |
+| `IGA_DISCOVERY_INGEST_AUTH` | Unset with `ENVIRONMENT=production` means `enforce`: discovery reports without a valid ingest token are refused (401). **Before deploying**, mint an ingest token for every collector and roll it into the collector's Secret (`controllers/platform/DISCOVERY_INGEST_AUTH.md`), or set `warn` explicitly to keep accepting (and logging) unauthenticated reports during rollout; startup then logs a PRODUCTION warning. Outside production the default is `warn`. |
 | `XAA_NATIVE_SEALER` | Required if any XAA issuance flag is on. |
 | `DIRECTORY_SYNC_ALLOW_SKIP_VERIFY` | Leave unset. In production, saving or testing an AD sync that skips LDAPS certificate verification is refused (AS-105); `true` is the explicit opt-out. Existing configurations keep syncing. |
 
@@ -118,7 +118,7 @@ Use two workspaces (A and B) with an admin each.
       used outside local development (the values remain in git history).
 - [ ] **OPS-001:** add required reviewers to the GitHub Environment
       `production` in both repositories.
-- [ ] Switch `IGA_DISCOVERY_INGEST_AUTH=enforce` when every collector has a token.
+- [ ] If `IGA_DISCOVERY_INGEST_AUTH=warn` was set explicitly for rollout, remove it (production default `enforce`) once every collector has a token.
 
 ## 6. Rolling back
 
