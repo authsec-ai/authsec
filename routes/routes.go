@@ -281,6 +281,12 @@ func SetupRoutes(
 	// D-100).
 	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
+	// POLICY UI DEMO -- /api/policy-demo/v1: create, list, edit, pause and delete
+	// a time-boxed S3 access policy for an agent, and preview the AWS documents
+	// it would produce. Stored in policy_demo_policies; nothing is deployed to
+	// AWS and nothing else reads it.
+	platformCtrl.MountPolicyDemoRoutes(r, platformCtrl.NewPolicyDemoController(config.DB))
+
 	// LEGACY compatibility under the IGA prefix (disposition plan §3.1, Phase 3
 	// spec §7.10): a read-only list of the workspace's legacy agent policies
 	// with Pause and Remove, served by the legacy agent-policy service -- not

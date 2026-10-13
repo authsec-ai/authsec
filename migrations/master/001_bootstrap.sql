@@ -1634,6 +1634,34 @@ CREATE TABLE public.webauthn_sessions (
 -- shape used by internal/hydra/models/saml_methods.go.
 --
 
+CREATE TABLE public.policy_demo_policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    name text NOT NULL,
+    description text DEFAULT ''::text NOT NULL,
+    agent text DEFAULT ''::text NOT NULL,
+    identity text DEFAULT ''::text NOT NULL,
+    resource_type text DEFAULT 's3'::text NOT NULL,
+    resource text NOT NULL,
+    prefix text DEFAULT ''::text NOT NULL,
+    actions text[] NOT NULL,
+    protect_bucket boolean DEFAULT true NOT NULL,
+    require_tls boolean DEFAULT true NOT NULL,
+    start_time timestamp with time zone,
+    end_time timestamp with time zone,
+    paused boolean DEFAULT false NOT NULL,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT policy_demo_policies_resource_type_check CHECK ((resource_type = 's3'::text)),
+    CONSTRAINT policy_demo_window_chk CHECK (((start_time IS NULL) OR (end_time IS NULL) OR (end_time > start_time)))
+);
+
+ALTER TABLE ONLY public.policy_demo_policies
+    ADD CONSTRAINT policy_demo_policies_pkey PRIMARY KEY (id);
+
+CREATE INDEX idx_policy_demo_policies_workspace ON public.policy_demo_policies USING btree (workspace_id, created_at DESC);
+
 CREATE TABLE public.workspaces (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name text NOT NULL,
@@ -10122,6 +10150,9 @@ ALTER TABLE ONLY public.iga_gov_evaluation_pruned
 
 ALTER TABLE ONLY public.iga_gov_evaluation_pruned
     ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.policy_demo_policies
+    ADD CONSTRAINT policy_demo_policies_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.iga_gov_evaluation_pruned
     ADD CONSTRAINT iga_gov_evaluation_pruned_workspace_id_rev_fkey FOREIGN KEY (workspace_id, rev) REFERENCES public.iga_gov_evaluation(workspace_id, rev) ON DELETE CASCADE;
