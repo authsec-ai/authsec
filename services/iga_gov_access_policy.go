@@ -76,6 +76,8 @@ const (
 	GovCodeAccessUnavailable    = "access_policies_unavailable"
 	GovCodePolicyBusy           = "policy_busy"
 	GovCodePolicyNotActive      = "policy_not_active"
+	GovCodePolicyNotEnded       = "policy_not_ended"
+	GovCodePolicyRemoving       = "policy_removing"
 )
 
 // Access-policy statuses (the UI's).
@@ -120,6 +122,16 @@ func VerifyAccessPolicySchema(db *gorm.DB) error {
 	if !ok {
 		missing = append(missing, "iga_gov_access_policy_version")
 	}
+	// 138: deleting an ended policy hides it with this column. Without it the
+	// policy queries would fail, so the feature reports itself unavailable
+	// until the migration has run.
+	hasDeleted, err := repositories.HasColumn(db, "iga_gov_policy", "deleted_at")
+	if err != nil {
+		return fmt.Errorf("access-policy schema verification could not run: %w", err)
+	}
+	if !hasDeleted {
+		missing = append(missing, "iga_gov_policy.deleted_at")
+	}
 	want := []string{"iga_gov_temp_grant.iga_gov_tg_access_chk", "iga_gov_temp_grant.iga_gov_tg_effect_chk",
 		"iga_gov_temp_grant.iga_gov_tg_version_fk"}
 	have, err := repositories.ValidatedConstraints(db, want)
@@ -128,7 +140,7 @@ func VerifyAccessPolicySchema(db *gorm.DB) error {
 	}
 	missing = append(missing, absentNames(want, have, "constraint ")...)
 	if len(missing) > 0 {
-		return fmt.Errorf("access policies need migration 137; missing: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("access policies need migrations 137 and 138; missing: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -686,7 +698,7 @@ func (s *GovAccess) Create(ctx context.Context, ws, actor uuid.UUID, req AccessP
 // loadPolicy is one access policy of ws (another workspace's, another
 // family's or a missing one is 404).
 func (s *GovAccess) loadPolicy(db *gorm.DB, ws, id uuid.UUID, lock bool) (*models.IGAGovPolicy, error) {
-	q := db.Where("workspace_id = ? AND id = ? AND family = ?", ws, id, "time_bound")
+	q := db.Where("workspace_id = ? AND id = ? AND family = ? AND deleted_at IS NULL", ws, id, "time_bound")
 	if lock {
 		q = q.Clauses(lockForUpdate())
 	}
@@ -881,6 +893,40 @@ func (s *GovAccess) End(ctx context.Context, ws, actor, id uuid.UUID, req Access
 	return s.stop(ctx, ws, actor, id, req, "archived")
 }
 
+// Delete is DELETE /:id (governance:enforce): hides an ended policy. Only a
+// policy that has ended and has nothing left in AWS can be deleted; the
+// versions, deployments and history are kept, and the name is freed.
+func (s *GovAccess) Delete(ctx context.Context, ws, actor, id uuid.UUID) error {
+	if err := s.require(); err != nil {
+		return err
+	}
+	now := s.now().UTC()
+	return tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+		pol, err := s.loadPolicy(tx, ws, id, true)
+		if err != nil {
+			return err
+		}
+		if pol.Lifecycle != "archived" {
+			return govConflict(GovCodePolicyNotEnded, "End this policy before deleting it.", map[string]any{"lifecycle": pol.Lifecycle})
+		}
+		var live int64
+		if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, id, accessLiveStates).
+			Count(&live).Error; err != nil {
+			return err
+		}
+		if live > 0 {
+			return govConflict(GovCodePolicyRemoving, "AuthSec has not finished taking this policy out of AWS, so it cannot be deleted yet.", nil)
+		}
+		name := pol.Name
+		if r := []rune(name); len(r) > 100 {
+			name = string(r[:100])
+		}
+		name = name + " [deleted " + id.String()[:8] + "]"
+		return tx.Exec("UPDATE iga_gov_policy SET name = ?, deleted_at = ?, updated_at = ? WHERE workspace_id = ? AND id = ?",
+			name, now, now, ws, id).Error
+	})
+}
+
 func (s *GovAccess) stop(ctx context.Context, ws, actor, id uuid.UUID, req AccessReasonRequest, to string) (*AccessPolicyView, error) {
 	if err := s.require(); err != nil {
 		return nil, err
@@ -1026,7 +1072,7 @@ func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, 
 // loadAccessBundles reads the policies, versions and deployments (in the
 // caller's workspace transaction).
 func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
-	pq := db.Where("workspace_id = ? AND family = ?", ws, "time_bound")
+	pq := db.Where("workspace_id = ? AND family = ? AND deleted_at IS NULL", ws, "time_bound")
 	if ids != nil {
 		pq = pq.Where("id IN ?", ids)
 	}
