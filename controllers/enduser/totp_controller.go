@@ -1,12 +1,16 @@
 package enduser
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/middlewares"
 
 	"github.com/authsec-ai/authsec/models"
@@ -72,7 +76,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -148,7 +152,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -218,7 +222,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -232,6 +236,10 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 
 	// Verify TOTP code
 	valid, err := ctrl.totpService.VerifyTOTP(userID, workspaceID, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify TOTP", "details": err.Error()})
 		return
@@ -250,7 +258,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get user details
-	user, err := ctrl.userRepo.GetUserByID(userID)
+	user, err := ctrl.userRepo.GetUserByID(database.WithWorkspace(c.Request.Context(), workspaceID), userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
 		return
@@ -310,7 +318,7 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -369,7 +377,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -441,7 +449,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -505,7 +513,7 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 	}
 
 	// Get workspace_id from context
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -553,8 +561,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
-	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
+	user, err := ctrl.lookupTOTPUser(c, req.Email, req.WorkspaceID, req.WorkspaceDomain)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -562,6 +569,10 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 
 	// Validate TOTP code
 	valid, err := ctrl.totpService.LoginWithTOTPWithUser(user, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -620,8 +631,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
-	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
+	user, err := ctrl.lookupTOTPUser(c, req.Email, req.WorkspaceID, req.WorkspaceDomain)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -629,6 +639,10 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 
 	// Validate TOTP code
 	valid, err := ctrl.totpService.LoginWithTOTPWithUser(user, req.TOTPCode)
+	if errors.Is(err, lockout.ErrLocked) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": lockout.Message})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -699,6 +713,25 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 		Message: "Device approved successfully",
 		Token:   token,
 	})
+}
+
+// lookupTOTPUser finds the user a TOTP request is for. When the request names
+// a workspace (workspace_id, or workspace_domain), the lookup is scoped to it.
+// Without one it falls back to the legacy email-only lookup, which may pick
+// the same email in another workspace (AS-038; the SDK sends no workspace).
+func (ctrl *TOTPController) lookupTOTPUser(c *gin.Context, email, workspaceID, workspaceDomain string) (*models.ExtendedUser, error) {
+	ref := strings.TrimSpace(workspaceID)
+	if ref == "" {
+		ref = strings.TrimSpace(workspaceDomain)
+	}
+	if ref == "" {
+		return ctrl.userRepo.GetUserByEmail(email)
+	}
+	wsID, err := shared.ResolveWorkspace(c, ref)
+	if err != nil {
+		return nil, err
+	}
+	return ctrl.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsID), email)
 }
 
 // generateJWTToken generates a JWT token

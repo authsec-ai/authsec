@@ -3,6 +3,7 @@ package fakes
 import (
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -108,6 +109,11 @@ func (h *HydraFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statusCode, result := fn(r)
 		w.WriteHeader(statusCode)
 		_ = json.NewEncoder(w).Encode(result)
+
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/admin/clients/"):
+		// Client update: accept and echo, like Hydra's admin API.
+		body, _ := io.ReadAll(r.Body)
+		_, _ = w.Write(body)
 
 	default:
 		// Return a generic 404 for routes we haven't implemented yet.

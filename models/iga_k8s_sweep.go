@@ -32,6 +32,10 @@ type IGAK8sSweep struct {
 
 	DiscoverySourceID uuid.UUID `json:"discovery_source_id" gorm:"type:uuid;not null"`
 	Cluster           string    `json:"cluster" gorm:"not null"`
+	// ClusterUID and OIDCIssuer are what the agent reported for this reading
+	// (043). '' when it could not read them.
+	ClusterUID string `json:"cluster_uid" gorm:"column:cluster_uid;not null;default:''"`
+	OIDCIssuer string `json:"oidc_issuer" gorm:"column:oidc_issuer;not null;default:''"`
 
 	// Monotonic per (workspace, source, cluster). Writes and retirements are
 	// fenced to it, so a snapshot arriving mid-projection cannot have its rows

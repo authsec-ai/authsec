@@ -25,9 +25,9 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
-	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -223,7 +223,7 @@ func (ac *AuthmgrController) HealthCheck(c *gin.Context) {
 // GetProfile returns the authenticated user's profile from JWT claims.
 func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"workspace_id": c.GetString("workspace_id"),
+		"workspace_id": middlewares.WorkspaceIDString(c),
 		"client_id":    c.GetString("client_id"),
 		"email_id":     c.GetString("email_id"),
 		"scopes":     c.MustGet("scopes"),
@@ -294,45 +294,16 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	dbType := authmgrGetDBTypeFromPath(c.Request.URL.Path)
 	log.Printf("[authmgr VerifyToken] db=%s path=%s", dbType, c.Request.URL.Path)
 
-	// Parse without verification to read token_type for key selection
-	unverified, _, err := new(jwt.Parser).ParseUnverified(req.Token, jwt.MapClaims{})
+	// Each token class verifies only under its own key (AS-033); the
+	// workspace and client are read from the verified claims.
+	claims, class, err := sessiontoken.Verify(req.Token,
+		sessiontoken.Admin, sessiontoken.EndUser, sessiontoken.SDK, sessiontoken.Legacy)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 		return
 	}
-	unverifiedClaims, ok := unverified.Claims.(jwt.MapClaims)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
-		return
-	}
-
-	workspaceID, _ := unverifiedClaims["workspace_id"].(string)
-	clientID, _ := unverifiedClaims["client_id"].(string)
-	tokenType, _ := unverifiedClaims["token_type"].(string)
-
-	var signingSecret []byte
-	if tokenType == "sdk-agent" {
-		signingSecret = []byte(config.AppConfig.JWTSdkSecret)
-	} else {
-		signingSecret = []byte(config.AppConfig.JWTDefSecret)
-	}
-
-	token, err := jwt.Parse(req.Token, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return signingSecret, nil
-	})
-	if err != nil || !token.Valid {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
-		return
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
-		return
-	}
+	workspaceID, _ := claims["workspace_id"].(string)
+	clientID, _ := claims["client_id"].(string)
 
 	emailID, _ := claims["email_id"].(string)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -353,7 +324,8 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 		"roles":      authzData.Roles,
 		"groups":     authzData.Groups,
 		"resources":  authzData.Resources,
-		"token_type": claims["token_type"],
+		"token_type":  claims["token_type"],
+		"token_class": string(class),
 		"issued_at":  claims["iat"],
 		"expires_at": claims["exp"],
 		"issuer":     claims["iss"],
@@ -380,30 +352,55 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		return
 	}
 
-	var signingSecret []byte
-	var tokenType string
+	// secret_id used to switch the result to an sdk-agent token without ever
+	// checking the secret. Nothing calls it that way; refuse rather than
+	// upgrade the token type on an unverified claim.
 	if req.SecretID != nil {
-		signingSecret = []byte(config.AppConfig.JWTSdkSecret)
-		tokenType = "sdk-agent"
-	} else {
-		signingSecret = []byte(config.AppConfig.JWTDefSecret)
-		tokenType = "default"
+		c.JSON(http.StatusBadRequest, gin.H{"error": "secret_id is not supported"})
+		return
+	}
+	tokenType := "default"
+	// The new token keeps the presented token's class (AS-033). A legacy
+	// token's class cannot be known, so it becomes an end-user token: the
+	// least-privileged class, refused on console surfaces.
+	class := sessiontoken.EndUser
+
+	// The new token never outlives the one presented, so a session cannot be
+	// extended indefinitely by re-minting.
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour)
+	var presentedExp *jwt.NumericDate
+	if claims, ok := c.Get("claims"); ok {
+		if mc, ok := claims.(jwt.MapClaims); ok {
+			presentedExp, _ = mc.GetExpirationTime()
+			if cl := sessiontoken.ClassOf(mc); cl != sessiontoken.Legacy {
+				class = cl
+			}
+		}
+	}
+	if presentedExp == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "presented token has no expiry"})
+		return
+	}
+	if presentedExp.Time.Before(expiresAt) {
+		expiresAt = presentedExp.Time
+	}
+	if !expiresAt.After(now) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "presented token has expired"})
+		return
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	tokenString, err := sessiontoken.Sign(class, jwt.MapClaims{
+		"jti":          uuid.NewString(), // revocable by id (AS-031)
 		"workspace_id": workspaceID,
 		"user_id":      userID,
 		"email_id":     emailID,
 		"token_type":   tokenType,
-		"aud":          "authsec-api",
-		"iat":          time.Now().Unix(),
-		"nbf":          time.Now().Unix(),
-		"exp":          time.Now().Add(24 * time.Hour).Unix(),
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          expiresAt.Unix(),
 		"iss":          "authsec-ai/auth-manager",
 	})
-	token.Header["kid"] = tokenType
-
-	tokenString, err := token.SignedString(signingSecret)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 		return
@@ -412,34 +409,8 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 	c.JSON(http.StatusOK, sharedmodels.TokenResponse{
 		AccessToken: tokenString,
 		TokenType:   "Bearer",
-		ExpiresIn:   24 * 60 * 60,
+		ExpiresIn:   expiresAt.Unix() - now.Unix(),
 	})
-}
-
-// OIDCToken exchanges an OIDC token from Hydra for a JWT.
-func (ac *AuthmgrController) OIDCToken(c *gin.Context) {
-	var req sharedmodels.OIDCTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	tokenResp, err := services.IssueOIDCJWT(ctx, req.OidcToken)
-	if err != nil {
-		status := http.StatusUnauthorized
-		if strings.Contains(err.Error(), "missing required field") {
-			status = http.StatusBadRequest
-		} else if strings.Contains(err.Error(), "failed to generate token") {
-			status = http.StatusInternalServerError
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, tokenResp)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -720,7 +691,7 @@ func (ac *AuthmgrController) ValidateToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":   "Token validation successful",
 		"service":   "auth-manager",
-		"workspace_id": c.GetString("workspace_id"),
+		"workspace_id": middlewares.WorkspaceIDString(c),
 		"client_id": c.GetString("client_id"),
 		"scopes":    c.MustGet("scopes"),
 		"roles":     c.MustGet("roles"),

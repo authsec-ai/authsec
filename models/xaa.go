@@ -27,6 +27,9 @@ type TrustedIssuer struct {
 	RevokedAt             *time.Time     `json:"revoked_at,omitempty" gorm:"column:revoked_at"`
 	CreatedAt             time.Time      `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt             time.Time      `json:"updated_at" gorm:"not null;default:now()"`
+	// WorkspaceID is the owning workspace; nil = platform-owned. A
+	// workspace-owned issuer may only map subjects into its own workspace.
+	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;column:workspace_id"`
 }
 
 func (TrustedIssuer) TableName() string { return "trusted_issuers" }

@@ -74,8 +74,8 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	api := l.api()
 
 	// Everything reached: no row is stale and the identity and resource lists
-	// carry no gap (the workloads list names only the regions nobody selected,
-	// checked below).
+	// carry no gap. A region nobody selected is scope, not a gap, so it is not
+	// named on the workloads list either (checked below).
 	for _, route := range []string{"/identities", "/resources"} {
 		if notes := listsNotes(listsGet(t, api, route)); len(notes) != 0 {
 			t.Errorf("%s coverage after clean scans = %v, want none", route, notes)
@@ -118,32 +118,28 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 		t.Errorf("east-fn carries stale_reason %v: only a stale row explains itself", east["stale_reason"])
 	}
 
-	// Unfiltered: A's denied region, plus one compute:<region> note per region
-	// an account did not select (not_selected, reported stale: D-58, D-73).
-	// Nothing of IAM or of policy documents: they do not bear on workloads.
-	selected := map[string]map[string]bool{accountA: {"us-east-1": true, "eu-west-1": true}, accountB: {"us-east-1": true}}
+	// Unfiltered: A's denied region, and NOTHING for the regions an account did
+	// not select. not_selected is scope, not a gap -- a region nobody chose to
+	// scan has no earlier results to be stale, and reporting one per unselected
+	// region made every subset-of-regions account read as permanently
+	// incomplete. Nothing of IAM or of policy documents either: they do not
+	// bear on workloads.
 	lambdaWest := listsNote(accountA, "lambda:eu-west-1", "denied", "workloads of kind lambda_function in eu-west-1")
 	notes := listsNotes(wl)
-	sawLambda, computes := false, map[string]int{}
+	sawLambda := false
 	for _, n := range notes {
 		if n == lambdaWest {
 			sawLambda = true
 			continue
 		}
-		parts := strings.Split(n, "|")
-		region := strings.TrimPrefix(parts[1], "compute:")
-		if !strings.HasPrefix(parts[1], "compute:") || parts[2] != "stale" || parts[3] != "workloads in "+region ||
-			selected[parts[0]][region] {
-			t.Errorf("unexpected workloads coverage note %q", n)
+		if strings.HasPrefix(strings.Split(n, "|")[1], "compute:") {
+			t.Errorf("unselected region reported as a workloads gap: %q", n)
 			continue
 		}
-		computes[parts[0]]++
+		t.Errorf("unexpected workloads coverage note %q", n)
 	}
 	if !sawLambda {
 		t.Errorf("workloads coverage = %v, want %q", notes, lambdaWest)
-	}
-	if computes[accountA] == 0 || computes[accountB] != computes[accountA]+1 {
-		t.Errorf("unselected-region notes = %v, want one per unselected region (B selected one region fewer than A)", computes)
 	}
 
 	for _, tc := range []struct {
@@ -153,13 +149,11 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 		// Narrowed by region: only the chosen regions' surfaces bear on it.
 		{[]string{"region", "us-east-1"}, nil},
 		{[]string{"region", "eu-west-1", "account", accountA}, []string{lambdaWest}},
-		// Narrowed by kind: a Lambda gap does not bear on EC2 instances, while
-		// B's unselected eu-west-1 bears on every kind in eu-west-1.
-		{[]string{"region", "eu-west-1", "runtime_kind", "ec2_instance"},
-			[]string{listsNote(accountB, "compute:eu-west-1", "stale", "workloads in eu-west-1")}},
-		// Narrowed by account: the other account's gaps are not this list's.
-		{[]string{"region", "eu-west-1", "account", accountB},
-			[]string{listsNote(accountB, "compute:eu-west-1", "stale", "workloads in eu-west-1")}},
+		// Narrowed by kind: a Lambda gap does not bear on EC2 instances, and
+		// B's unselected eu-west-1 is scope, not a gap, so it names nothing.
+		{[]string{"region", "eu-west-1", "runtime_kind", "ec2_instance"}, nil},
+		// Narrowed by account: B's only eu-west-1 surface is unselected, so no note.
+		{[]string{"region", "eu-west-1", "account", accountB}, nil},
 		// A region filter of not_stated alone names no regional surface.
 		{[]string{"region", "not_stated"}, nil},
 	} {

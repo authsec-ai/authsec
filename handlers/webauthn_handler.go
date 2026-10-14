@@ -20,7 +20,6 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
 	"github.com/fxamacker/cbor/v2"
@@ -655,28 +654,10 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: WebAuthn FinishRegistration failed: %v", reqID, err)
 
-		// More comprehensive error handling - handle attestation, validation, and format errors
-		if strings.Contains(err.Error(), "attestation") ||
-			strings.Contains(err.Error(), "Invalid attestation") ||
-			strings.Contains(err.Error(), "format") ||
-			strings.Contains(err.Error(), "validation") {
-
-			log.Printf("[%s] FinishRegistration: Attempting fallback credential creation", reqID)
-
-			fallbackCred, fbErr := buildFallbackCredentialFromContainer(&reqBody.Credential)
-			if fbErr != nil {
-				log.Printf("[%s] FinishRegistration: Fallback credential creation failed: %v", reqID, fbErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid attestation/public key"})
-				return
-			}
-
-			log.Printf("[%s] FinishRegistration: Fallback credential created successfully", reqID)
-			credential = fallbackCred
-		} else {
-			log.Printf("[%s] FinishRegistration: Non-attestation WebAuthn error: %v", reqID, err)
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "WebAuthn registration failed"})
-			return
-		}
+		// A credential whose attestation, challenge or origin did not verify is
+		// rejected; the old fallback accepted forged registrations (AS-003).
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "WebAuthn registration failed"})
+		return
 	}
 
 	// Validate credential is not nil before proceeding
@@ -770,8 +751,8 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		log.Printf("[%s] FinishRegistration: userflow service call failed: %v", reqID, err)
 		// Proceed anyway, but log the error
 	} else {
-		log.Printf("[%s] FinishRegistration: userflow service returned accessToken=%s, refreshToken=%s",
-			reqID, accessToken, refreshToken)
+		log.Printf("[%s] FinishRegistration: userflow service returned tokens (access=%t, refresh=%t)",
+			reqID, accessToken != "", refreshToken != "")
 	}
 
 	// Step 14: Clean up session
@@ -1054,8 +1035,8 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 		log.Printf("[%s] FinishAuthentication: userflow service call failed: %v", reqID, err)
 		// Proceed anyway, but log the error
 	} else {
-		log.Printf("[%s] FinishAuthentication: userflow service returned accessToken=%s, refreshToken=%s",
-			reqID, accessToken, refreshToken)
+		log.Printf("[%s] FinishAuthentication: userflow service returned tokens (access=%t, refresh=%t)",
+			reqID, accessToken != "", refreshToken != "")
 	}
 
 	// Cleanup session
@@ -1536,226 +1517,6 @@ func (h *WebAuthnHandler) VerifyBiometricFinish(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-//
-// --- OTP Setup ---
-//
-
-func (h *WebAuthnHandler) BeginOTPSetup(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	// Generate OTP secret (TOTP)
-	secret := uuid.New().String() // replace with proper TOTP secret generator
-	now := time.Now()
-
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "otp",
-		MethodData: datatypes.JSON(json.RawMessage(fmt.Sprintf(`{"secret":"%s"}`, secret))),
-		Verified:   false,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save otp secret"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"secret": secret})
-}
-
-func (h *WebAuthnHandler) VerifyOTP(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-		Code        string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "otp").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "otp method not found"})
-		return
-	}
-
-	// TODO: verify TOTP code properly
-	if req.Code == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid otp"})
-		return
-	}
-
-	if err := db.Model(&mfa).Update("verified", true).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to update otp"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-//
-// --- SMS Setup ---
-//
-
-func (h *WebAuthnHandler) BeginSMSSetup(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-		Phone       string `json:"phone"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	now := time.Now()
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "sms",
-		MethodData: datatypes.JSON(json.RawMessage(fmt.Sprintf(`{"phone":"%s"}`, req.Phone))),
-		Verified:   false,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save sms"})
-		return
-	}
-
-	// TODO: send SMS code
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "sms code sent"})
-}
-
-func (h *WebAuthnHandler) VerifySMS(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-		Code        string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "sms").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "sms method not found"})
-		return
-	}
-
-	// TODO: verify SMS code properly
-	if req.Code == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid sms code"})
-		return
-	}
-
-	if err := db.Model(&mfa).Update("verified", true).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to update sms"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-//
-// --- Backup Codes ---
-//
-
-func (h *WebAuthnHandler) GenerateBackupCodes(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	// generate backup codes
-	codes := []string{
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-	}
-	codesJSON, _ := json.Marshal(codes)
-	now := time.Now()
-
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "backup",
-		MethodData: datatypes.JSON(codesJSON),
-		Enabled:    true,
-		Verified:   true,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save backup codes"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"backup_codes": codes})
-}
-
 // BeginWebAuthnRegistration is a wrapper for backward compatibility with routes
 func (h *WebAuthnHandler) BeginWebAuthnRegistration(c *gin.Context) {
 	h.BeginRegistration(c)
@@ -1908,43 +1669,3 @@ func (h *WebAuthnHandler) BeginBiometricLoginVerify(c *gin.Context) {
 	c.JSON(http.StatusOK, options)
 }
 
-func (h *WebAuthnHandler) VerifyBackupCode(c *gin.Context) {
-	var req struct {
-		Email       string `json:"email"`
-		WorkspaceID string `json:"workspace_id"`
-		Code        string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.WorkspaceID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "backup").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "backup codes not found"})
-		return
-	}
-
-	var codes []string
-	if err := json.Unmarshal(mfa.MethodData, &codes); err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to parse backup codes"})
-		return
-	}
-
-	valid := false
-	for _, code := range codes {
-		if code == req.Code {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid backup code"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}

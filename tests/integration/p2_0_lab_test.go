@@ -54,6 +54,9 @@ type p2Account struct {
 	svc     *services.AWSOnboardingService
 	iam     *fakeIAM
 	lambdas map[string]*fakeLambda // by region
+	// cloudTrail answers the scan's CloudTrail reads in every region (nil:
+	// an empty trail).
+	cloudTrail awsdiscovery.CloudTrailAPI
 }
 
 // newP2Lab builds a workspace. projection=true verifies the switch against the
@@ -188,9 +191,13 @@ func (a *p2Account) hook() services.ScannerHook {
 			if lam == nil {
 				lam = &fakeLambda{}
 			}
+			var trail awsdiscovery.CloudTrailAPI = &fakeCloudTrail{}
+			if a.cloudTrail != nil {
+				trail = a.cloudTrail
+			}
 			return lam, &fakeECS{defs: map[string]ecstypes.TaskDefinition{}}, &fakeEC2{},
 				&fakeInstanceProfile{roleByProfileName: map[string]string{}},
-				&fakeBedrock{agents: map[string]bedrockagenttypes.Agent{}}, &fakeAgentCore{}, &fakeCloudTrail{}
+				&fakeBedrock{agents: map[string]bedrockagenttypes.Agent{}}, &fakeAgentCore{}, trail
 		}).WithActivityAPI(&fakeActivity{}, noSleep)
 	}
 }

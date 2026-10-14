@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -107,9 +108,17 @@ func main() {
 
 	}
 
+	// MFA secrets were encrypted with a hardcoded key until the key's env var
+	// name was fixed (AS-020); move them to the configured key. Decryption
+	// still falls back to the legacy key, so a failure here locks no one out.
+	if _, err := services.RotateLegacyMFACiphertexts(config.Database.DB); err != nil {
+		log.Printf("WARN: MFA key rotation incomplete: %v", err)
+	}
+
 	// Phase 6: tenants table dropped — workspace is the only identity table.
 	{
 		var workspaces int64
+		// TENANT-EXEMPT: startup log line counting the tenant registry
 		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
 		log.Printf("[migration:phase6] workspaces=%d", workspaces)
 	}
@@ -182,6 +191,159 @@ func main() {
 		log.Printf("[graph] %s is off: Phase 1 scanning, no projection", services.GraphProjectionEnv)
 	}
 
+	// IGA_POLICY (SPEC-iga-phase3-policy.md §4.3, T3.02): the Phase 3 policy
+	// product. ONE switch, read ONCE, default off. On requires
+	// IGA_GRAPH_PROJECTION=on (read live from the graph gate) and the Phase 3
+	// schema (047-056) verified by relation, retried on error and never cached
+	// as an answer. FAIL CLOSED: until all of that holds, every
+	// /api/iga/v1/policy route answers 503 policy_unavailable and
+	// /capabilities says why. Legacy agent-policy routes and workers are not
+	// gated by it.
+	policyGate := services.PolicyGateFromEnv(services.GraphProjection)
+	services.SetPolicyGate(policyGate)
+	// IGA_POLICY_R1B (SPEC-iga-phase3-policy.md §12.1): Phase 3 R1b,
+	// action-level right-sizing. Its own switch, read ONCE, default off; on
+	// requires IGA_POLICY available (read live) and migration 060 verified by
+	// its own check, so a database without 060 never takes R1a down. Off, every
+	// R1a path runs exactly as before.
+	r1bGate := services.PolicyR1BGateFromEnv()
+	services.SetPolicyR1BGate(r1bGate)
+	if r1bGate.Enabled() {
+		go r1bGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
+	// IGA_POLICY_R2 (SPEC-iga-phase3-policy.md §12.3): Phase 3 R2,
+	// time-bound access and session response. Its own switch, read ONCE,
+	// default off; on requires IGA_POLICY available (read live) and
+	// migration 061 verified by its own check, so a database without 061
+	// never takes R1a down. Off, R1a and R1b run exactly as before (no R2
+	// route, job kind, schedule or capability flag exists).
+	r2Gate := services.PolicyR2GateFromEnv()
+	services.SetPolicyR2Gate(r2Gate)
+	if r2Gate.Enabled() {
+		go r2Gate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second)
+	}
+	// IGA_POLICY_R3 (SPEC-iga-phase3-policy.md §12.4): Phase 3 R3, agent
+	// runtime controls. Its own switch, read ONCE, default off; on requires
+	// IGA_POLICY available (read live) and migration 062 verified by its own
+	// check, so a database without 062 never takes R1a down. Off, R1a, R1b and
+	// R2 run exactly as before (no R3 route, sweeper or capability flag).
+	// Unavailable while on, the agent runtime routes answer 503 and fail
+	// closed. The sweeper (hold expiry, reservation release / settlement,
+	// argument retention) starts once 062 verified.
+	r3Gate := services.PolicyR3GateFromEnv()
+	services.SetPolicyR3Gate(r3Gate)
+	if r3Gate.Enabled() {
+		go r3Gate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			go services.RunR3Sweeper(context.Background(), config.DB, time.Minute)
+		})
+	}
+	// The policy job worker (§8.1, T3.08) starts only when IGA_POLICY=on AND
+	// the Phase 3 schema has verified: it is started from VerifyUntilReady's
+	// ready hook, never before. It also claims nothing while the gate reads
+	// unavailable (graph gate off, read live). Stopped gracefully on shutdown.
+	policyWorkerCtx, stopPolicyWorker := context.WithCancel(context.Background())
+	defer stopPolicyWorker()
+	policyWorkerDone := make(chan (<-chan struct{}), 1)
+	if policyGate.Enabled() {
+		if state, reason, _ := policyGate.Status(); state != services.PolicyOn {
+			log.Printf("[policy] %s=on, not yet available: %s", services.PolicyEnv, reason)
+		}
+		go policyGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
+			// Owner review hooks, notification channels (055 + Vault) and the
+			// compiler's discovery-role live reader: installed only once the
+			// Phase 3 schema has verified, before the worker that uses them.
+			var policyVault vault.VaultClient
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr != nil {
+					log.Printf("[policy] vault client: %v", verr)
+				} else {
+					policyVault = vc
+				}
+			}
+			// The AuthSec Slack app (Phase 3 §7.11, T3.14): installed when the
+			// signing secret, Vault and the app credentials are configured.
+			// InstallGovPolicyStartup installs the policy runtime (owner gate
+			// and the other authoring hooks) and THEN chains the Slack app's
+			// approval-request notices onto those hooks atomically, before the
+			// worker can deliver anything; /capabilities reports policy.slack
+			// from the same registration. fix/p3-appr (P1-4): the policy gate
+			// reports verified -- and serves any policy or Slack route -- only
+			// after this whole ready hook has returned, so nothing is served
+			// before the hooks are in place.
+			var slackApp *services.SlackIntegrationService
+			if app := services.SlackFromEnv(config.DB); app != nil {
+				if ok, reason := app.Configured(); ok {
+					slackApp = app
+				} else {
+					log.Printf("[slack] Slack app not enabled: %s", reason)
+				}
+			}
+			// Ownership mode (decision 2026-10-13): admin by default -- no owner
+			// reviews, notices or findings; IGA_POLICY_OWNERSHIP=owners restores them.
+			ownership, oerr := services.GovOwnershipModeFromEnv()
+			if oerr != nil {
+				log.Printf("[policy] %v", oerr)
+			}
+			services.SetGovOwnershipMode(ownership)
+			services.InstallGovPolicyStartup(config.DB, policyVault, os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"), slackApp)
+			// R3 brokered sessions (DECISION R3-12): the connector ExternalId
+			// comes from Vault and STS is called with AuthSec's ambient AWS
+			// identity. Installed only while IGA_POLICY_R3 is on and Vault is
+			// configured; otherwise policy.brokered_sessions is false and the
+			// route answers 503 broker_unavailable. UNVERIFIED against AWS.
+			if services.PolicyR3GateState().Enabled() && policyVault != nil {
+				services.SetRuntimeBrokerDeps(services.LiveRuntimeBrokerDeps(services.NewAWSOnboardingService(config.DB, policyVault)))
+			}
+			// T3.17: IaC (PR) and export delivery adapters, when Vault holds
+			// the GitHub App key and connector credentials. Installed in EVERY
+			// process that serves the policy routes, before the worker check:
+			// proposals decide the IaC form at compile time in the API
+			// process, so a process started with AUTHSEC_DISABLE_POLICY_WORKER
+			// must still read the mapped source -- without an adapter an iac_pr
+			// target answers 503 iac_unavailable, never a silent export
+			// (review P2).
+			if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+				if vc, verr := vault.NewClient(addr, tok); verr == nil {
+					services.ConfigureGovIaCDelivery(config.DB, vc)
+				} else {
+					log.Printf("[policy] IaC delivery adapters not configured: %v", verr)
+				}
+			}
+			if os.Getenv("AUTHSEC_DISABLE_POLICY_WORKER") == "true" {
+				log.Printf("[policy] policy job worker not started: AUTHSEC_DISABLE_POLICY_WORKER=true")
+				return
+			}
+			log.Printf("[policy] %s=on and the Phase 3 schema verified: starting the policy job worker", services.PolicyEnv)
+			// T3.16: deployments need AWS access (discovery + enforcement
+			// roles) and the binding gate; without Vault the deploy jobs wait.
+			if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
+				if vc, verr := vault.NewClient(va, vt); verr == nil {
+					services.SetGovDeployEnv(services.NewProductionGovDeployEnv(config.DB, vc))
+				} else {
+					log.Printf("[policy] deployments not enabled: %v", verr)
+				}
+			} else {
+				log.Printf("[policy] deployments not enabled: VAULT_ADDR/VAULT_TOKEN not configured")
+			}
+			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
+		})
+	} else {
+		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
+	}
+
+	// IGA_LEGACY_AGENT_POLICY (disposition plan §3.2): read ONCE, default on.
+	// Off stops this process starting the two legacy agent-policy workers
+	// (started below, with the other governance workers) and nothing else.
+	// Installed before the routes are mounted: the legacy compatibility routes
+	// consult it.
+	legacyAgentPolicyGate := services.LegacyAgentPolicyGateFromEnv()
+	services.SetLegacyAgentPolicyGate(legacyAgentPolicyGate)
+	if w := legacyAgentPolicyGate.Warning(); w != "" {
+		log.Printf("WARNING: [legacy-agent-policy] %s", w)
+	}
+	log.Print(legacyAgentPolicyGate.Decision())
+
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -231,6 +393,10 @@ func main() {
 				qc := services.NewAWSQuickCreateService(
 					services.NewAWSOnboardingService(config.DB, vc), config.GetRedisClient(), cbCfg,
 					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"))
+				// The enforcement stack's Custom::AuthSecEnforcementRegistration
+				// (Phase 3, T3.09) reports through the same topics and queue.
+				qc.WithEnforcementHandler(services.NewEnforcementBindingService(config.DB, vc, cbCfg,
+					os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN")))
 				// Built inside the goroutine: it reads the queue's settings from
 				// SQS, and a slow or unreachable SQS must never delay boot.
 				go func() {
@@ -327,6 +493,11 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
+	// Client addresses come from forwarding headers only via TRUSTED_PROXIES
+	// (AS-034); by default the TCP peer is the client.
+	if err := middlewares.ConfigureTrustedProxies(r); err != nil {
+		log.Fatalf("invalid TRUSTED_PROXIES: %v", err)
+	}
 	// CIMD-registered OAuth clients carry their metadata URL as the public
 	// client_id (services/oauth_as_service.go:850). URL-encoded slashes in
 	// path params must survive routing, otherwise DELETE
@@ -350,8 +521,11 @@ func main() {
 	// exclude /authsec/metrics from compression so Prometheus can scrape it
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/authsec/metrics"})))
 
-	// Prometheus metrics endpoint
-	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))
+	// Prometheus metrics (AS-075): never public. METRICS_ADDR serves them on a
+	// separate listener (e.g. 127.0.0.1:9100, or a cluster-internal port);
+	// METRICS_TOKEN mounts /authsec/metrics on the main port behind a bearer
+	// token. With neither, the metrics are not exposed.
+	metricsSrv := mountMetrics(r)
 
 	// favicon.ico — browsers automatically request this for every HTML page,
 	// including backend-served pages like /authsec/hmgr/consent. Return 204
@@ -392,6 +566,10 @@ func main() {
 	} else {
 		tokens.InitNativeKeys(nil)
 		log.Printf("[NATIVE_KEYS] Vault not configured — using ephemeral native signing keyset")
+	}
+	// Production never runs on keys that die with the process (AS-036).
+	if err := tokens.NativeKeys().CheckDurable(os.Getenv("ENVIRONMENT")); err != nil {
+		log.Fatalf("[NATIVE_KEYS] refusing to start: %v", err)
 	}
 
 	// All routes (user-flow + webauthn + spire identity)
@@ -508,10 +686,7 @@ func main() {
 		// Five minutes: the same cadence as JML, and the actions are the same
 		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
 		// less access.
-		policyWorker := services.NewPolicyReconcileWorker(config.DB, 5*time.Minute)
-		policyWorker.Start()
-		log.Printf("agent policy reconcile worker started (interval=5m)")
-
+		//
 		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
 		// Runs at five minutes rather than hourly because the DELIVERY half also
 		// retries: an SMTP blip should cost minutes, not a whole warning.
@@ -520,9 +695,14 @@ func main() {
 		// let an SMTP outage quietly turn every destructive policy into a no-op,
 		// which is the failure this exists to prevent. It is recorded instead, and
 		// the action executes as a governance exception.
-		warningWorker := services.NewPolicyWarningWorker(config.DB, 5*time.Minute, 50)
-		warningWorker.Start()
-		log.Printf("policy pre-deadline warning worker started (interval=5m)")
+		//
+		// Both are the legacy agent-policy stack, so both start only while
+		// IGA_LEGACY_AGENT_POLICY is on (read above). ExpiryWorker and the lease
+		// reaper are shared runtime infrastructure and start regardless.
+		for _, name := range services.StartLegacyAgentPolicyWorkers(legacyAgentPolicyGate,
+			services.NewLegacyAgentPolicyWorkers(config.DB)) {
+			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────
@@ -560,10 +740,58 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// The policy job worker stops claiming, gives running jobs their grace,
+	// and hands back what did not finish (§8.1).
+	stopPolicyWorker()
+	select {
+	case done := <-policyWorkerDone:
+		select {
+		case <-done:
+		case <-ctx.Done():
+			log.Println("Policy job worker did not stop within the grace period")
+		}
+	default:
+	}
+
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(ctx)
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced shutdown: %v", err)
 	}
 	log.Println("Server exited cleanly")
+}
+
+// mountMetrics exposes the Prometheus handler without making it public: on
+// its own listener when METRICS_ADDR is set (returned for shutdown), and/or
+// on the main router behind "Authorization: Bearer $METRICS_TOKEN".
+func mountMetrics(r *gin.Engine) *http.Server {
+	if token := os.Getenv("METRICS_TOKEN"); token != "" {
+		want := []byte("Bearer " + token)
+		h := promhttp.Handler()
+		r.GET("/authsec/metrics", func(c *gin.Context) {
+			if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), want) != 1 {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+			h.ServeHTTP(c.Writer, c.Request)
+		})
+	}
+	addr := os.Getenv("METRICS_ADDR")
+	if addr == "" {
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/authsec/metrics", promhttp.Handler())
+	ms := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := ms.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics listener on %s stopped: %v", addr, err)
+		}
+	}()
+	log.Printf("Prometheus metrics served on %s/metrics", addr)
+	return ms
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

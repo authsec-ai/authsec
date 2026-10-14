@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -13,9 +12,12 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 	"github.com/authsec-ai/authsec/internal/spire/middleware"
 	"github.com/authsec-ai/authsec/internal/spire/services"
+	"github.com/authsec-ai/authsec/internal/spire/utils"
 )
 
-// WorkloadController handles workload attestation and entry management
+// WorkloadController handles workload attestation and entry management.
+// The workspace is always the authenticated one: an admin's platform token
+// (entry CRUD) or an agent's certificate (attest, revoke, by-parent).
 type WorkloadController struct {
 	attestationService *services.WorkloadAttestationService
 	entryService       *services.WorkloadEntryService
@@ -23,509 +25,316 @@ type WorkloadController struct {
 }
 
 // NewWorkloadController creates a new workload controller
-func NewWorkloadController(
-	attestationService *services.WorkloadAttestationService,
-	entryService *services.WorkloadEntryService,
-	logger *logrus.Entry,
-) *WorkloadController {
-	return &WorkloadController{
-		attestationService: attestationService,
-		entryService:       entryService,
-		logger:             logger,
-	}
+func NewWorkloadController(attestationService *services.WorkloadAttestationService, entryService *services.WorkloadEntryService, logger *logrus.Entry) *WorkloadController {
+	return &WorkloadController{attestationService: attestationService, entryService: entryService, logger: logger}
 }
 
-// --- Workload Attestation ---
+// --- Workload attestation (agent certificate) ---
 
-// AttestWorkload handles POST /spire/v1/workload/attest
+// AttestWorkload handles POST /spiresvc/v1/workload/attest.
 func (ctrl *WorkloadController) AttestWorkload(c *gin.Context) {
 	var req struct {
-		WorkspaceID  string            `json:"workspace_id"`
-		AgentID   string            `json:"agent_id"`
-		Selectors map[string]string `json:"selectors"`
+		WorkspaceID string            `json:"workspace_id"`
+		AgentID     string            `json:"agent_id"`
+		Selectors   map[string]string `json:"selectors"`
+		CSR         string            `json:"csr"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-	if req.AgentID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("agent_id is required", nil))
+	agentSpiffeID, ok := middleware.GetSpireSpiffeID(c)
+	if !ok {
+		sendError(c, ctrl.logger, errors.NewUnauthorizedError("Agent certificate required", nil))
+		return
+	}
+	if req.AgentID != "" && req.AgentID != agentSpiffeID {
+		sendError(c, ctrl.logger, errors.NewForbiddenError("agent_id does not match the authenticated agent", nil))
 		return
 	}
 	if len(req.Selectors) == 0 {
-		ctrl.sendError(c, errors.NewBadRequestError("selectors are required", nil))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("selectors are required", nil))
 		return
 	}
-
-	// If caller authenticated via mTLS, verify agent identity matches the request
-	callerSpiffeID, _ := middleware.GetSpireSpiffeID(c)
-	if callerSpiffeID != "" && callerSpiffeID != req.AgentID {
-		ctrl.sendError(c, errors.NewForbiddenError("Agent identity mismatch: authenticated SPIFFE ID does not match agent_id in request", nil))
-		return
-	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"workspace_id":      req.WorkspaceID,
-		"agent_id":       req.AgentID,
-		"selector_count": len(req.Selectors),
-	}).Info("Workload attestation request received")
-
-	svcReq := &services.AttestWorkloadRequest{
-		WorkspaceID:  req.WorkspaceID,
-		AgentID:   req.AgentID,
+	resp, err := ctrl.attestationService.AttestWorkload(c.Request.Context(), &services.AttestWorkloadRequest{
+		AgentID:   agentSpiffeID,
 		Selectors: req.Selectors,
-	}
-
-	svidResp, err := ctrl.attestationService.AttestWorkload(c.Request.Context(), svcReq)
+		CSR:       req.CSR,
+	})
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Error("Workload attestation failed")
-		ctrl.sendError(c, errors.NewBadRequestError("Attestation failed: "+err.Error(), err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"spiffe_id": svidResp.SpiffeID,
-		"workspace_id": req.WorkspaceID,
-	}).Info("Workload SVID issued successfully")
-
 	c.JSON(http.StatusOK, gin.H{
-		"spiffe_id":    svidResp.SpiffeID,
-		"certificate":  svidResp.Certificate,
-		"trust_bundle": svidResp.TrustBundle,
-		"expires_at":   svidResp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
-		"ttl":          svidResp.TTL,
+		"spiffe_id":    resp.SpiffeID,
+		"certificate":  resp.Certificate,
+		"trust_bundle": resp.TrustBundle,
+		"expires_at":   resp.ExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
+		"ttl":          resp.TTL,
 	})
 }
 
-// RevokeWorkloadSVID handles POST /spire/v1/workload/revoke
+// RevokeWorkloadSVID handles POST /spiresvc/v1/workload/revoke: an SVID the
+// authenticated agent obtained, in its workspace.
 func (ctrl *WorkloadController) RevokeWorkloadSVID(c *gin.Context) {
 	var req struct {
-		WorkspaceID     string `json:"workspace_id"`
+		WorkspaceID  string `json:"workspace_id"`
 		SerialNumber string `json:"serial_number"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
 	if req.SerialNumber == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("serial_number is required", nil))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("serial_number is required", nil))
 		return
 	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"workspace_id":     req.WorkspaceID,
-		"serial_number": req.SerialNumber,
-	}).Info("Workload SVID revocation request received")
-
-	if err := ctrl.attestationService.RevokeWorkloadSVID(c.Request.Context(), req.WorkspaceID, req.SerialNumber); err != nil {
-		ctrl.logger.WithError(err).WithField("serial_number", req.SerialNumber).Error("Workload SVID revocation failed")
-		ctrl.sendError(c, errors.NewInternalError("Revocation failed: "+err.Error(), err))
+	agentSpiffeID, _ := middleware.GetSpireSpiffeID(c)
+	if err := ctrl.attestationService.RevokeWorkloadSVID(c.Request.Context(), agentSpiffeID, req.SerialNumber); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	ctrl.logger.WithField("serial_number", req.SerialNumber).Info("Workload SVID revoked successfully")
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":       "Workload SVID revoked successfully",
-		"serial_number": req.SerialNumber,
-	})
+	c.JSON(http.StatusOK, gin.H{"message": "Workload SVID revoked successfully", "serial_number": req.SerialNumber})
 }
 
-// --- Workload Entry Management ---
+// ListEntriesByParent handles GET /spiresvc/v1/entries/by-parent: the
+// entries the authenticated agent serves (its own and unassigned ones).
+func (ctrl *WorkloadController) ListEntriesByParent(c *gin.Context) {
+	if err := sameWorkspace(c, c.Query("workspace_id")); err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	agentSpiffeID, ok := middleware.GetSpireSpiffeID(c)
+	if !ok {
+		sendError(c, ctrl.logger, errors.NewUnauthorizedError("Agent certificate required", nil))
+		return
+	}
+	if p := c.Query("parent_id"); p != "" && p != agentSpiffeID {
+		sendError(c, ctrl.logger, errors.NewForbiddenError("parent_id must be the authenticated agent", nil))
+		return
+	}
+	entries, err := ctrl.entryService.ListEntriesByParent(c.Request.Context(), agentSpiffeID)
+	if err != nil {
+		sendError(c, ctrl.logger, err)
+		return
+	}
+	ctrl.sendEntries(c, entries, len(entries))
+}
 
-// CreateEntry handles POST /spire/v1/entries
+// --- Entry management (AuthMiddleware) ---
+
+// CreateEntry handles POST /spiresvc/v1/entries
 func (ctrl *WorkloadController) CreateEntry(c *gin.Context) {
 	var req dto.CreateWorkloadEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, req.WorkspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Convert DTO to domain model
-	entry := &models.WorkloadEntry{
-		WorkspaceID:   req.WorkspaceID,
+	created, err := ctrl.entryService.CreateEntry(c.Request.Context(), &models.WorkloadEntry{
 		SpiffeID:   req.SpiffeID,
 		ParentID:   req.ParentID,
 		Selectors:  req.Selectors,
 		TTL:        req.TTL,
 		Admin:      req.Admin,
 		Downstream: req.Downstream,
-	}
-
-	createdEntry, err := ctrl.entryService.CreateEntry(c.Request.Context(), entry)
+	})
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("spiffe_id", req.SpiffeID).Error("Failed to create workload entry")
-		ctrl.sendError(c, errors.NewInternalError("Failed to create workload entry", err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	c.JSON(http.StatusCreated, ctrl.toEntryResponse(createdEntry))
+	c.JSON(http.StatusCreated, toEntryResponse(created))
 }
 
-// CreateAgentEntry handles POST /spire/v1/entries/agent
-// Generates a SPIFFE ID for an AI agent based on workspace_id, client_id, and agent_type.
+// CreateAgentEntry handles POST /spiresvc/v1/entries/agent: an entry for an
+// AI agent, SPIFFE ID spiffe://<workspace>/agent/<client_id>/<agent_type>.
 func (ctrl *WorkloadController) CreateAgentEntry(c *gin.Context) {
 	var req dto.CreateAgentEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Validate required fields
-	if req.WorkspaceID == "" || req.ClientID == "" || req.AgentType == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id, client_id, and agent_type are required", nil))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, req.WorkspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
+	ws, err := requestWorkspace(c)
+	if err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Generate SPIFFE ID: spiffe://<workspace_id>/agent/<client_id>/<agent_type>
-	spiffeID := "spiffe://" + req.WorkspaceID + "/agent/" + req.ClientID + "/" + req.AgentType
-
-	// Build selectors with authsec-specific selectors
-	selectors := map[string]string{
-		"authsec:client_id":  req.ClientID,
-		"authsec:agent_type": req.AgentType,
-		"authsec:workspace_id":  req.WorkspaceID,
+	if err := utils.ValidateSpiffeComponent(req.ClientID, "client_id"); err != nil {
+		sendError(c, ctrl.logger, errors.NewBadRequestError(err.Error(), err))
+		return
 	}
+	if err := utils.ValidateSpiffeComponent(req.AgentType, "agent_type"); err != nil {
+		sendError(c, ctrl.logger, errors.NewBadRequestError(err.Error(), err))
+		return
+	}
+	selectors := map[string]string{}
 	for k, v := range req.Selectors {
 		selectors[k] = v
 	}
+	selectors["authsec:client_id"] = req.ClientID
+	selectors["authsec:agent_type"] = req.AgentType
+	selectors["authsec:workspace_id"] = ws
 
-	entry := &models.WorkloadEntry{
-		WorkspaceID:  req.WorkspaceID,
-		SpiffeID:  spiffeID,
+	created, err := ctrl.entryService.CreateEntry(c.Request.Context(), &models.WorkloadEntry{
+		SpiffeID:  "spiffe://" + ws + "/agent/" + req.ClientID + "/" + req.AgentType,
 		ParentID:  req.ParentID,
 		Selectors: selectors,
 		TTL:       req.TTL,
-	}
-
-	createdEntry, err := ctrl.entryService.CreateEntry(c.Request.Context(), entry)
+	})
 	if err != nil {
-		ctrl.logger.WithError(err).WithFields(logrus.Fields{
-			"spiffe_id": spiffeID,
-			"client_id": req.ClientID,
-		}).Error("Failed to create agent workload entry")
-		ctrl.sendError(c, errors.NewInternalError("Failed to create agent workload entry", err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
 	c.JSON(http.StatusCreated, dto.CreateAgentEntryResponse{
-		EntryID:   createdEntry.ID,
-		SpiffeID:  createdEntry.SpiffeID,
-		WorkspaceID:  createdEntry.WorkspaceID,
-		ClientID:  req.ClientID,
-		ParentID:  createdEntry.ParentID,
-		Selectors: createdEntry.Selectors,
-		TTL:       createdEntry.TTL,
-		CreatedAt: createdEntry.CreatedAt,
+		EntryID:     created.ID,
+		SpiffeID:    created.SpiffeID,
+		WorkspaceID: created.WorkspaceID,
+		ClientID:    req.ClientID,
+		ParentID:    created.ParentID,
+		Selectors:   created.Selectors,
+		TTL:         created.TTL,
+		CreatedAt:   created.CreatedAt,
 	})
 }
 
-// GetEntry handles GET /spire/v1/entries/:id
+// GetEntry handles GET /spiresvc/v1/entries/:id. Another workspace's entry
+// is 404.
 func (ctrl *WorkloadController) GetEntry(c *gin.Context) {
-	entryID := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
-		return
-	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, workspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
-		return
-	}
-
-	entry, err := ctrl.entryService.GetEntry(c.Request.Context(), workspaceID, entryID)
+	entry, err := ctrl.entryService.GetEntry(c.Request.Context(), c.Param("id"))
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("id", entryID).Error("Failed to get workload entry")
-		ctrl.sendError(c, errors.NewNotFoundError("Workload entry not found", err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	c.JSON(http.StatusOK, ctrl.toEntryResponse(entry))
+	c.JSON(http.StatusOK, toEntryResponse(entry))
 }
 
-// ListEntries handles GET /spire/v1/entries
+// ListEntries handles GET /spiresvc/v1/entries
 func (ctrl *WorkloadController) ListEntries(c *gin.Context) {
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, c.Query("workspace_id")); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, workspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
-		return
-	}
-
-	parentID := c.Query("parent_id")
-	spiffeID := c.Query("spiffe_id")
-	spiffeIDSearch := c.Query("spiffe_id_search")
 	selectorType := c.Query("selector_type")
-
-	// Determine if using partial SPIFFE ID search
-	usePartialSearch := false
-	searchValue := spiffeID
-	if spiffeIDSearch != "" {
-		searchValue = spiffeIDSearch
-		usePartialSearch = true
+	if selectorType != "" && selectorType != "unix" && selectorType != "kubernetes" && selectorType != "docker" {
+		sendError(c, ctrl.logger, errors.NewBadRequestError("selector_type must be one of: unix, kubernetes, docker", nil))
+		return
 	}
-
-	// Validate selector_type if provided
-	if selectorType != "" {
-		validTypes := map[string]bool{"unix": true, "kubernetes": true, "docker": true}
-		if !validTypes[selectorType] {
-			ctrl.sendError(c, errors.NewBadRequestError("selector_type must be one of: unix, kubernetes, docker", nil))
-			return
-		}
-	}
-
-	// Parse pagination parameters
 	limit := 100
-	if limitParam := c.Query("limit"); limitParam != "" {
-		if parsedLimit, err := strconv.Atoi(limitParam); err == nil && parsedLimit > 0 {
-			limit = parsedLimit
-			if limit > 1000 {
-				limit = 1000
-			}
-		}
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
+		limit = min(v, 1000)
 	}
-
 	offset := 0
-	if offsetParam := c.Query("offset"); offsetParam != "" {
-		if parsedOffset, err := strconv.Atoi(offsetParam); err == nil && parsedOffset >= 0 {
-			offset = parsedOffset
-		}
+	if v, err := strconv.Atoi(c.Query("offset")); err == nil && v >= 0 {
+		offset = v
 	}
-
-	// Parse admin filter
-	var adminFilter *bool
-	if adminParam := c.Query("admin"); adminParam != "" {
-		if adminParam == "true" {
-			trueVal := true
-			adminFilter = &trueVal
-		} else if adminParam == "false" {
-			falseVal := false
-			adminFilter = &falseVal
-		}
+	var admin *bool
+	switch c.Query("admin") {
+	case "true":
+		t := true
+		admin = &t
+	case "false":
+		f := false
+		admin = &f
 	}
-
 	filter := &models.WorkloadEntryFilter{
-		WorkspaceID:        workspaceID,
-		ParentID:        parentID,
-		SpiffeID:        searchValue,
-		SpiffeIDPartial: usePartialSearch,
-		SelectorType:    selectorType,
-		Admin:           adminFilter,
-		Limit:           limit,
-		Offset:          offset,
+		ParentID:     c.Query("parent_id"),
+		SpiffeID:     c.Query("spiffe_id"),
+		SelectorType: selectorType,
+		Admin:        admin,
+		Limit:        limit,
+		Offset:       offset,
 	}
-
+	if s := c.Query("spiffe_id_search"); s != "" {
+		filter.SpiffeID, filter.SpiffeIDPartial = s, true
+	}
 	entries, err := ctrl.entryService.ListEntries(c.Request.Context(), filter)
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("workspace_id", workspaceID).Error("Failed to list workload entries")
-		ctrl.sendError(c, errors.NewInternalError("Failed to list workload entries", err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Get total count
-	totalCount, err := ctrl.entryService.CountEntries(c.Request.Context(), filter)
+	total, err := ctrl.entryService.CountEntries(c.Request.Context(), filter)
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("workspace_id", workspaceID).Error("Failed to count workload entries")
-		totalCount = len(entries)
+		total = len(entries)
 	}
-
-	var responseEntries []*dto.WorkloadEntryResponse
-	for _, entry := range entries {
-		responseEntries = append(responseEntries, ctrl.toEntryResponse(entry))
-	}
-
-	c.JSON(http.StatusOK, dto.ListWorkloadEntriesResponse{
-		Entries: responseEntries,
-		Total:   totalCount,
-	})
+	ctrl.sendEntries(c, entries, total)
 }
 
-// ListEntriesByParent handles GET /spire/v1/entries/by-parent
-func (ctrl *WorkloadController) ListEntriesByParent(c *gin.Context) {
-	parentID := c.Query("parent_id")
-	workspaceID := c.Query("workspace_id")
-
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
-		return
-	}
-	if parentID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("parent_id is required", nil))
-		return
-	}
-
-	// Validate tenant ownership if auth context is available
-	callerWorkspaceID, ok := middleware.GetSpireWorkspaceID(c)
-	if ok && callerWorkspaceID != "" && callerWorkspaceID != workspaceID {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant mismatch", nil))
-		return
-	}
-
-	entries, err := ctrl.entryService.ListEntriesByParent(c.Request.Context(), workspaceID, parentID)
-	if err != nil {
-		ctrl.logger.WithError(err).WithField("parent_id", parentID).Error("Failed to list workload entries by parent")
-		ctrl.sendError(c, errors.NewInternalError("Failed to list workload entries", err))
-		return
-	}
-
-	var responseEntries []*dto.WorkloadEntryResponse
-	for _, entry := range entries {
-		responseEntries = append(responseEntries, ctrl.toEntryResponse(entry))
-	}
-
-	c.JSON(http.StatusOK, dto.ListWorkloadEntriesResponse{
-		Entries: responseEntries,
-		Total:   len(responseEntries),
-	})
-}
-
-// UpdateEntry handles PUT /spire/v1/entries/:id
+// UpdateEntry handles PUT /spiresvc/v1/entries/:id. Another workspace's
+// entry is 404.
 func (ctrl *WorkloadController) UpdateEntry(c *gin.Context) {
-	entryID := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, c.Query("workspace_id")); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, workspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
-		return
-	}
-
 	var req dto.UpdateWorkloadEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	entry := &models.WorkloadEntry{
-		ID:         entryID,
-		WorkspaceID:   workspaceID,
+	updated, err := ctrl.entryService.UpdateEntry(c.Request.Context(), &models.WorkloadEntry{
+		ID:         c.Param("id"),
 		SpiffeID:   req.SpiffeID,
 		ParentID:   req.ParentID,
 		Selectors:  req.Selectors,
 		TTL:        req.TTL,
 		Admin:      req.Admin,
 		Downstream: req.Downstream,
-	}
-
-	updatedEntry, err := ctrl.entryService.UpdateEntry(c.Request.Context(), entry)
+	})
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("id", entryID).Error("Failed to update workload entry")
-		ctrl.sendError(c, errors.NewInternalError("Failed to update workload entry", err))
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	c.JSON(http.StatusOK, ctrl.toEntryResponse(updatedEntry))
+	c.JSON(http.StatusOK, toEntryResponse(updated))
 }
 
-// DeleteEntry handles DELETE /spire/v1/entries/:id
+// DeleteEntry handles DELETE /spiresvc/v1/entries/:id. Another workspace's
+// entry is 404.
 func (ctrl *WorkloadController) DeleteEntry(c *gin.Context) {
-	entryID := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-
-	if workspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, c.Query("workspace_id")); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, workspaceID); err != nil {
-		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
+	if err := ctrl.entryService.DeleteEntry(c.Request.Context(), c.Param("id")); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	if err := ctrl.entryService.DeleteEntry(c.Request.Context(), workspaceID, entryID); err != nil {
-		ctrl.logger.WithError(err).WithField("id", entryID).Error("Failed to delete workload entry")
-		ctrl.sendError(c, errors.NewInternalError("Failed to delete workload entry", err))
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Workload entry deleted successfully",
-		"id":      entryID,
-	})
+	c.JSON(http.StatusOK, gin.H{"message": "Workload entry deleted successfully", "id": c.Param("id")})
 }
 
-// --- Helpers ---
+func (ctrl *WorkloadController) sendEntries(c *gin.Context, entries []*models.WorkloadEntry, total int) {
+	out := make([]*dto.WorkloadEntryResponse, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, toEntryResponse(e))
+	}
+	c.JSON(http.StatusOK, dto.ListWorkloadEntriesResponse{Entries: out, Total: total})
+}
 
-// toEntryResponse converts a domain model to response DTO
-func (ctrl *WorkloadController) toEntryResponse(entry *models.WorkloadEntry) *dto.WorkloadEntryResponse {
+func toEntryResponse(e *models.WorkloadEntry) *dto.WorkloadEntryResponse {
 	return &dto.WorkloadEntryResponse{
-		ID:         entry.ID,
-		WorkspaceID:   entry.WorkspaceID,
-		SpiffeID:   entry.SpiffeID,
-		ParentID:   entry.ParentID,
-		Selectors:  entry.Selectors,
-		TTL:        entry.TTL,
-		Admin:      entry.Admin,
-		Downstream: entry.Downstream,
-		CreatedAt:  entry.CreatedAt,
-		UpdatedAt:  entry.UpdatedAt,
+		ID:          e.ID,
+		WorkspaceID: e.WorkspaceID,
+		SpiffeID:    e.SpiffeID,
+		ParentID:    e.ParentID,
+		Selectors:   e.Selectors,
+		TTL:         e.TTL,
+		Admin:       e.Admin,
+		Downstream:  e.Downstream,
+		CreatedAt:   e.CreatedAt,
+		UpdatedAt:   e.UpdatedAt,
 	}
-}
-
-// validateTenantOwnership ensures the workspace_id in the request matches the authenticated caller's tenant
-func (ctrl *WorkloadController) validateTenantOwnership(c *gin.Context, requestWorkspaceID string) error {
-	callerWorkspaceID, ok := middleware.GetSpireWorkspaceID(c)
-	if !ok || callerWorkspaceID == "" {
-		return fmt.Errorf("tenant ID not found in authentication context")
-	}
-	if callerWorkspaceID != requestWorkspaceID {
-		return fmt.Errorf("tenant mismatch: authenticated as %s but requesting %s", callerWorkspaceID, requestWorkspaceID)
-	}
-	return nil
-}
-
-// sendError sends an error response
-func (ctrl *WorkloadController) sendError(c *gin.Context, err error) {
-	appErr, ok := err.(*errors.AppError)
-	if !ok {
-		appErr = errors.NewInternalError("Internal server error", err)
-	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"code":    appErr.Code,
-		"message": appErr.Message,
-	}).WithError(appErr.Err).Error("Workload request failed")
-
-	c.JSON(appErr.Status, dto.ErrorResponse{
-		Error: dto.ErrorDetail{
-			Code:    appErr.Code,
-			Message: appErr.Message,
-		},
-	})
 }

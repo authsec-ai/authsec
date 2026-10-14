@@ -41,6 +41,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/migration"
 	"github.com/authsec-ai/authsec/internal/session"
 	"github.com/authsec-ai/authsec/internal/testsupport/fakes"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
@@ -139,6 +140,10 @@ func Boot(opts ...BootOption) (*Env, error) {
 		gin.SetMode(gin.TestMode)
 		waH, adminWAH, euWAH := buildWebAuthn()
 		router := gin.New()
+		if err := middlewares.ConfigureTrustedProxies(router); err != nil {
+			bootErr = fmt.Errorf("trusted proxies: %w", err)
+			return
+		}
 		router.Use(gin.Recovery())
 		routes.SetupRoutes(router, waH, adminWAH, euWAH, nil)
 
@@ -163,6 +168,9 @@ func Get(t testing.TB) *Env {
 	if sharedEnv == nil {
 		t.Fatal("testsupport: Boot() was not called in TestMain")
 	}
+	// Each test starts with fresh rate-limit budgets: all tests share one
+	// process and one client address.
+	middlewares.ResetRateLimitsForTest()
 	return sharedEnv
 }
 

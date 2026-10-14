@@ -27,7 +27,7 @@ import "github.com/gin-gonic/gin"
 // never a false or a true.
 func (ctl *IGAGraphReadController) GetWorkload(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		d, err := g.Reader.WorkloadDetail(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+		d, err := g.Reader.WorkloadDetail(g.C.Request.Context(), g.C.Param("id"), g.C.Request.URL.Query())
 		if err != nil {
 			return nil, err
 		}
@@ -43,13 +43,13 @@ func (ctl *IGAGraphReadController) GetWorkload(c *gin.Context) {
 // GetWorkloadIdentities handles GET /api/iga/v1/workloads/:id/identities.
 func (ctl *IGAGraphReadController) GetWorkloadIdentities(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.WorkloadIdentities(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+		return g.Reader.WorkloadIdentities(g.C.Request.Context(), g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }
 
 // GetWorkloadResources handles GET /api/iga/v1/workloads/:id/resources.
 func (ctl *IGAGraphReadController) GetWorkloadResources(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.WorkloadResources(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+		return g.Reader.WorkloadResources(g.C.Request.Context(), g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }

@@ -2,6 +2,7 @@ package vault
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/vault/api"
 )
@@ -56,4 +57,30 @@ func (v *Client) ReadSecret(path string) (map[string]interface{}, error) {
 func (v *Client) DeleteSecret(path string) error {
 	_, err := v.client.Logical().Delete(path)
 	return err
+}
+
+// KVMetadataPath is the KV v2 metadata path of a data path
+// ("kv/data/secret/x" -> "kv/metadata/secret/x"), or "" when path is not a
+// KV v2 data path (<mount>/data/<key>).
+func KVMetadataPath(path string) string {
+	p := strings.Trim(path, "/")
+	i := strings.Index(p, "/data/")
+	if i <= 0 || strings.Contains(p[:i], "/") || len(p) == i+len("/data/") {
+		return ""
+	}
+	return p[:i] + "/metadata/" + p[i+len("/data/"):]
+}
+
+// DestroySecret implements SecretDestroyer: on a KV v2 data path it deletes
+// the key's metadata, which destroys every version permanently; any other
+// path (KV v1, where a delete is already permanent) is deleted.
+func (v *Client) DestroySecret(path string) error {
+	meta := KVMetadataPath(path)
+	if meta == "" {
+		return v.DeleteSecret(path)
+	}
+	if _, err := v.client.Logical().Delete(meta); err != nil {
+		return fmt.Errorf("vault destroy error: %w", err)
+	}
+	return nil
 }

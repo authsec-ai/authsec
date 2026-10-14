@@ -57,7 +57,11 @@ func (ctrl *VoiceAuthController) InitiateVoiceAuth(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.InitiateVoiceAuth(&req)
+	client, workspaceID, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.InitiateVoiceAuth(&req, workspaceID, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate voice authentication", "details": err.Error()})
 		return
@@ -93,7 +97,11 @@ func (ctrl *VoiceAuthController) VerifyVoiceOTP(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.VerifyVoiceOTP(&req)
+	client, _, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.VerifyVoiceOTP(&req, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify voice OTP", "details": err.Error()})
 		return
@@ -128,7 +136,11 @@ func (ctrl *VoiceAuthController) GetTokenWithCredentials(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.voiceService.AuthenticateWithCredentials(&req)
+	client, _, ok := authenticateVoiceClient(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.voiceService.AuthenticateWithCredentials(&req, client.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to authenticate", "details": err.Error()})
 		return
@@ -181,7 +193,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -242,7 +254,7 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID from JWT token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -299,7 +311,7 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -337,7 +349,7 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Router /authsec/uflow/auth/voice/device-pending [get]
 func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -363,7 +375,7 @@ func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 	}
 
 	// Get pending device codes from device_codes table
-	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(workspaceID, clientID)
+	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(database.WithWorkspace(c.Request.Context(), workspaceID), clientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get pending codes", "details": err.Error()})
 		return
@@ -443,7 +455,7 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	// Resolve tenant context from JWT claims (set by AuthMiddleware)
 	workspaceID := uuid.Nil
 	workspaceDomain := ""
-	if v, ok := c.Get("workspace_id"); ok && v != nil {
+	if v, ok := middlewares.WorkspaceValue(c); ok && v != nil {
 		if tidStr, ok := v.(string); ok && tidStr != "" {
 			if parsed, parseErr := uuid.Parse(tidStr); parseErr == nil {
 				workspaceID = parsed
@@ -487,4 +499,23 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 		"message": message,
 		"status":  status,
 	})
+}
+
+// authenticateVoiceClient authenticates the voice assistant's backend as an
+// OAuth client (client_secret_basic or private_key_jwt, as at /oauth/token)
+// and returns it with its workspace. The voice endpoints were anonymous and
+// took the workspace from a client_id in the body; anyone could then assert a
+// linked voice identity and receive that user's token (AS-047).
+func authenticateVoiceClient(c *gin.Context) (*models.MCPOAuthClient, uuid.UUID, bool) {
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	client, err := services.AuthenticateClient(c.Request.Context(), config.DB, c.Request, tokenEndpoint)
+	if err != nil || client == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client", "error_description": "voice requests must authenticate as an OAuth client"})
+		return nil, uuid.Nil, false
+	}
+	if client.HomeWorkspaceID == nil || *client.HomeWorkspaceID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client", "error_description": "client is not registered to a workspace"})
+		return nil, uuid.Nil, false
+	}
+	return client, *client.HomeWorkspaceID, true
 }

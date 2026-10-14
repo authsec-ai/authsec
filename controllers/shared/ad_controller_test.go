@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"net"
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
@@ -66,6 +67,7 @@ func setupADTestDB(t *testing.T) *gorm.DB {
 		return config.DB
 	}
 
+	skipWithoutPostgres(t, getenvDefault("DB_HOST", "localhost"), getenvDefault("DB_PORT", "5432"))
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
 		getenvDefault("DB_HOST", "localhost"),
@@ -796,4 +798,15 @@ func TestADSyncController_mapLDAPEntryToUser(t *testing.T) {
 	assert.Contains(t, user.Groups, "Developers")
 	assert.Contains(t, user.Groups, "Users")
 	assert.True(t, user.IsActive)
+}
+
+// skipWithoutPostgres skips a DB-backed test when no Postgres is listening,
+// instead of failing the package (CI provides one on :5432).
+func skipWithoutPostgres(t *testing.T, host, port string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("no Postgres at %s:%s: %v", host, port, err)
+	}
+	conn.Close()
 }

@@ -350,6 +350,15 @@ type SurfaceCoverage struct {
 	// collector so no reader has to re-derive the sample from a later
 	// inventory.
 	CappedAfter string `json:"capped_after,omitempty"`
+	// Prioritized is set, with CappedAfter, when the capped activity sample
+	// read identities AHEAD of byte order (T3.03, SPEC-iga-phase3-policy.md
+	// §2.6): the ARNs of every sampled identity that is bound to a workload or
+	// under a live AuthSec control, sorted. They are read first, so the sample
+	// is exactly these plus every ARN at or before CappedAfter -- which is the
+	// last ARN of the REST, and empty when the prioritised ones alone filled
+	// the cap. Absent when nothing was prioritised: the D-86 sample, unchanged.
+	// ActivitySampled is the one reading of the pair.
+	Prioritized []string `json:"prioritized,omitempty"`
 	// Count is how many objects were read. A total when State is reached; a
 	// FLOOR otherwise -- for partial, the rows that were read, with Error
 	// naming how many were not (§1.4: "the report names how many"). One
@@ -386,6 +395,23 @@ type SurfaceCoverage struct {
 	Truncated bool           `json:"truncated,omitempty"`
 }
 
+// ActivitySampled reports whether the activity read this coverage records
+// attempted the identity with this ARN (D-86, T3.03). A read that was not
+// capped -- no CappedAfter and nothing Prioritized -- attempted every
+// identity it had; a capped one attempted the prioritised ARNs and every ARN
+// at or before CappedAfter in byte order (Go's string order). Whether the
+// attempt succeeded is a separate question: the run's usage rows answer it.
+func (c SurfaceCoverage) ActivitySampled(arn string) bool {
+	if c.CappedAfter == "" && len(c.Prioritized) == 0 {
+		return true
+	}
+	if c.CappedAfter != "" && arn <= c.CappedAfter {
+		return true
+	}
+	i := sort.SearchStrings(c.Prioritized, arn)
+	return i < len(c.Prioritized) && c.Prioritized[i] == arn
+}
+
 // CoverageItem is one document policy_documents could not read (D-71):
 // Policy names it as the operator knows it ("TicketRead", "ReadData (inline
 // on SharedToolRole)", "trust policy of SharedToolRole"), Version is the
@@ -419,6 +445,30 @@ type ScanCoverage struct {
 	Counters   map[string]int             `json:"counters,omitempty"`
 	// Error is set only when Status is failed.
 	Error string `json:"error,omitempty"`
+	// Regions is the region scope THIS run collected resource-policy
+	// evidence under, frozen at scan time (SPEC-iga-phase3-policy.md §3.9,
+	// review P1-6): the connector's selected regions as the run read them and
+	// the regions enabled in the account as DescribeRegions listed them then.
+	// The route analysis, the first-attachment proof, the evidence bundle and
+	// readiness read it from the run, never from the connector's live attrs,
+	// so a later region change cannot rewrite what an earlier scan covered.
+	// nil on a run that collected no resource-policy evidence, or that was
+	// collected before the scope was recorded.
+	Regions *ScanRegionScope `json:"regions,omitempty"`
+}
+
+// ScanRegionScope is ScanCoverage.Regions.
+type ScanRegionScope struct {
+	// Selected are the connector's regions the run read.
+	Selected []string `json:"selected"`
+	// Enabled are the regions enabled in the account when the run read them
+	// (empty when EnabledKnown is false).
+	Enabled []string `json:"enabled"`
+	// EnabledKnown is false when the enabled regions could not be listed (a
+	// refused or failed DescribeRegions, or a connector on the older
+	// discovery template, which is not asked): regions beyond Selected are
+	// then not known to be covered.
+	EnabledKnown bool `json:"enabled_known"`
 }
 
 // Complete reports whether every surface was reached. Reconciliation is gated
@@ -722,6 +772,30 @@ type AWSConnectorAttrs struct {
 	// last reported. When we add a permission for a new surface, this is how an
 	// operator finds the accounts still on the older stack.
 	TemplateVersion string `json:"template_version,omitempty"`
+
+	// TemplateVersionSource is who said TemplateVersion: AWSTemplateVersionFromStack
+	// when the customer's own stack reported it (the Quick Create registration
+	// callback, and a stack Update), empty when AuthSec wrote it -- the manual
+	// role-ARN path records the version THIS BUILD hands out, and every
+	// connector recorded before the stack's version was kept has the build's
+	// version too. Nothing on those rows tells the two apart, so an empty source
+	// is "not verified", never "current": read the version through
+	// StackReportedTemplateVersion wherever a decision rests on it.
+	TemplateVersionSource string `json:"template_version_source,omitempty"`
+}
+
+// AWSTemplateVersionFromStack is the TemplateVersionSource of a version the
+// customer's stack reported itself.
+const AWSTemplateVersionFromStack = "stack"
+
+// StackReportedTemplateVersion is the discovery template version the stack
+// itself reported, or "" (unknown, which every gate reads as older) when the
+// recorded version is the build's own, or was recorded before provenance was.
+func (a AWSConnectorAttrs) StackReportedTemplateVersion() string {
+	if a.TemplateVersionSource != AWSTemplateVersionFromStack {
+		return ""
+	}
+	return a.TemplateVersion
 }
 
 // AWSAttrs decodes Attrs as the AWS shape. A malformed or empty blob decodes to

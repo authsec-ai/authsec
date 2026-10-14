@@ -52,9 +52,10 @@ func TestP2S2RegionsListedWithSelection(t *testing.T) {
 		digs(body, "meta", "integration") != refOf("cloud_connector", a.conn) {
 		t.Fatalf("GET regions envelope = %v, want success, no error, the connector named", body)
 	}
-	// The stack version is stated as a fact: recorded at onboarding, current.
+	// The version is stated as a fact: recorded at onboarding by role ARN, so
+	// it is the build's own and whether the stack is outdated is unknown.
 	if digs(body, "meta", "template", "deployed") != awsdiscovery.TemplateVersion ||
-		dig(body, "meta", "template", "outdated") != false || dig(body, "meta", "template_outdated") != false {
+		dig(body, "meta", "template", "outdated") != nil || dig(body, "meta", "template_outdated") != nil {
 		t.Fatalf("template facts = %v / %v", dig(body, "meta", "template"), dig(body, "meta", "template_outdated"))
 	}
 
@@ -229,7 +230,7 @@ func TestP2S2DeniedDescribeRegionsIsAClearError(t *testing.T) {
 	api := s2DiscoveryAPI(t, l, a.svc)
 	// The stack this account runs predates the one granting DescribeRegions
 	// explicitly: stated as a fact beside the failure, never as its cause.
-	l.db.Exec(`UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{template_version}', '"2026-09-18"') WHERE id = ?`, a.conn)
+	l.db.Exec(`UPDATE cloud_connector SET attrs = attrs || '{"template_version":"2026-09-18","template_version_source":"stack"}'::jsonb WHERE id = ?`, a.conn)
 
 	code, body := api.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
 	mustStatus(t, "GET regions with DescribeRegions denied", code, body, http.StatusOK)
@@ -287,8 +288,10 @@ func TestP2S2DeniedDescribeRegionsIsAClearError(t *testing.T) {
 	// AWS call.
 	plain := s2DiscoveryAPI(t, l, services.NewAWSOnboardingService(l.db, newMemVault()).WithVerifier(&stubVerifier{}))
 	code, body = plain.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
-	if code != http.StatusInternalServerError || errCode(body) != "internal" || digs(body, "error", "fault") != "authsec" {
-		t.Fatalf("GET regions with no AWS session possible = %d %v, want 500 internal", code, body)
+	// d45ebe8 names the AuthSec-side cause: the role's external ID could not
+	// be read (this vault holds none), still a 500 with fault=authsec.
+	if code != http.StatusInternalServerError || errCode(body) != "external_id_unreadable" || digs(body, "error", "fault") != "authsec" {
+		t.Fatalf("GET regions with no AWS session possible = %d %v, want 500 external_id_unreadable", code, body)
 	}
 	if code, body := plain.patchRegions(a.conn, "us-east-1"); code != http.StatusInternalServerError {
 		t.Fatalf("PATCH with no AWS session possible = %d %v, want 500", code, body)

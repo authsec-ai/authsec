@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // TestP2LoadAccessStrategiesAgree walks every page of each reference's Access
@@ -70,7 +71,7 @@ func loadAccessPages(t *testing.T, r *igaread.Reader, ws, id uuid.UUID, includeE
 		if cursor != "" {
 			vals.Set("cursor", cursor)
 		}
-		out, err := r.ResourceAccess(context.Background(), ws, id.String(), vals)
+		out, err := r.ResourceAccess(wsCtx(context.Background(), ws), id.String(), vals)
 		if err != nil {
 			t.Fatalf("access %s: %v", id, err)
 		}
@@ -115,4 +116,10 @@ func loadGroupHeldReference(t *testing.T, env *loadEnv) uuid.UUID {
 		return uuid.Nil
 	}
 	return ids[0]
+}
+
+// wsCtx is ctx carrying ws as its tenant context, as AuthMiddleware's
+// request context does.
+func wsCtx(ctx context.Context, ws uuid.UUID) context.Context {
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws})
 }

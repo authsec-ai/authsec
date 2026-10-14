@@ -31,6 +31,9 @@ type AgentPolicyManager interface {
 	Get(workspaceID, id uuid.UUID) (*models.AgentPolicy, error)
 	List(workspaceID uuid.UUID, enabledOnly bool) ([]models.AgentPolicy, error)
 	Delete(workspaceID, id uuid.UUID) error
+	// Pause sets a policy disabled (agent_policy_legacy_compat.go). The only
+	// mutation the compatibility routes offer besides Delete.
+	Pause(workspaceID, id uuid.UUID) (*models.AgentPolicy, error)
 
 	// Expand resolves a policy to the agents it currently covers. A direct policy
 	// expands to one; a selector expands to whatever matches right now.
@@ -321,6 +324,25 @@ func (m *agentPolicyManager) List(workspaceID uuid.UUID, enabledOnly bool) ([]mo
 	return out, nil
 }
 
+// Pause sets a policy disabled. Every legacy consumer -- the reconcile worker,
+// the warning scheduler, the enforcement plan, the lookahead -- reads enabled
+// policies only, so a paused policy stops acting on its next pass. Nothing it
+// already did is undone, and its recorded actions are kept.
+//
+// Idempotent: a policy already disabled is returned unchanged (updated_at is
+// not bumped). gorm.ErrRecordNotFound for an id that is not this workspace's.
+// (Moved here from agent_policy_legacy_compat.go, its only caller, which
+// builds the manager on its workspace transaction.)
+func (m *agentPolicyManager) Pause(workspaceID, id uuid.UUID) (*models.AgentPolicy, error) {
+	res := m.db.Model(&models.AgentPolicy{}).
+		Where("id = ? AND workspace_id = ? AND enabled", id, workspaceID).
+		Updates(map[string]interface{}{"enabled": false, "updated_at": time.Now()})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	return m.Get(workspaceID, id)
+}
+
 func (m *agentPolicyManager) Delete(workspaceID, id uuid.UUID) error {
 	res := m.db.Where("id = ? AND workspace_id = ?", id, workspaceID).
 		Delete(&models.AgentPolicy{})
@@ -471,7 +493,7 @@ func (m *agentPolicyManager) Effective(workspaceID, agentID uuid.UUID) (*Effecti
 	// are incomparable are NOT silently resolved: picking one would decide somebody's
 	// access by evaluation order.
 	if len(roleCeilings) > 0 {
-		winner, amb, err := m.narrowestRole(roleCeilings)
+		winner, amb, err := m.narrowestRole(workspaceID, roleCeilings)
 		if err != nil {
 			return nil, err
 		}
@@ -1050,13 +1072,13 @@ func gitOpsManaged(metadata json.RawMessage) bool {
 // incomparable — a 3-permission role granting deletes is not narrower than a
 // 5-permission read-only one — and resolving that by count would quietly pick the
 // more dangerous role about as often as not.
-func (m *agentPolicyManager) narrowestRole(ids []uuid.UUID) (uuid.UUID, string, error) {
+func (m *agentPolicyManager) narrowestRole(workspaceID uuid.UUID, ids []uuid.UUID) (uuid.UUID, string, error) {
 	perms := map[uuid.UUID]map[uuid.UUID]bool{}
 	for _, id := range ids {
 		if _, seen := perms[id]; seen {
 			continue
 		}
-		p, err := rolePermissionIDs(m.db, id)
+		p, err := rolePermissionIDs(m.db, workspaceID, id)
 		if err != nil {
 			return uuid.Nil, "", err
 		}

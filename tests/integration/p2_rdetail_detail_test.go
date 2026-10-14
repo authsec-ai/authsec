@@ -707,7 +707,7 @@ func TestP2RDetailOptionalWork(t *testing.T) {
 	var out any
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
-		out, err = r.ResourceAccess(context.Background(), l.ws, res, url.Values{})
+		out, err = r.ResourceAccess(wsCtx(context.Background(), l.ws), res, url.Values{})
 		if e := igaread.AsError(err); e == nil || e.Code != "query_timeout" {
 			break
 		}

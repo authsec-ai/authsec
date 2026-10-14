@@ -233,12 +233,16 @@ func (r *cloudScanRunRepository) claim(
 		//     JOBS OLDER THAN ONE LEASE.
 		//   * scan throughput is bounded by projection. Acceptable at one
 		//     connector per customer and a projection measured in seconds.
+		//
+		// TENANT-EXEMPT: part of the cross-workspace claim below, correlated to the candidate run's own workspace and connector.
 		projectionPredicate = `AND NOT EXISTS (
 			       SELECT 1 FROM iga_projection_job j
-			        WHERE j.connector_id = cloud_scan_run.connector_id
+			        WHERE j.workspace_id = cloud_scan_run.workspace_id
+			          AND j.connector_id = cloud_scan_run.connector_id
 			          AND j.status IN (?, ?))`
 	}
 
+	// TENANT-EXEMPT: the scan worker's claim loop takes the oldest claimable run of any workspace; the run row names its workspace, and the scan that follows is scoped to it.
 	query := `
 		UPDATE cloud_scan_run SET
 			status           = ?,
@@ -250,10 +254,12 @@ func (r *cloudScanRunRepository) claim(
 			generation       = CASE WHEN generation > 0 THEN generation
 			                        ELSE (SELECT COALESCE(c.scan_generation, 0) + 1
 			                                FROM cloud_connector c
-			                               WHERE c.id = cloud_scan_run.connector_id)
+			                               WHERE c.workspace_id = cloud_scan_run.workspace_id
+			                                 AND c.id = cloud_scan_run.connector_id)
 			                   END,
 			updated_at       = ?
 		WHERE id = (
+			-- TENANT-EXEMPT: the claim picks the next run across every workspace (see above).
 			SELECT id FROM cloud_scan_run
 			 WHERE (status = ?
 			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))

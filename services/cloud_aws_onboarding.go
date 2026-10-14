@@ -5,11 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -62,6 +65,13 @@ const maxRegionsPerConnector = 32
 // ErrExternalIDNotIssued means the submitted ExternalId does not carry this
 // workspace's signature. See mintExternalID for why that check exists.
 var ErrExternalIDNotIssued = errors.New("this external id was not issued to this workspace")
+
+// ErrExternalIDUnreadable means the connector's stored ExternalId could not be
+// read back from the secrets store. Deliberately carries no detail: the store's
+// own error names the secret's path, which includes the workspace id and the
+// account, and this error travels into scan runs and API responses that the
+// console shows to users. The underlying error is logged where it happens.
+var ErrExternalIDUnreadable = errors.New("AuthSec could not read the external ID for this role; try again shortly, and reconnect the account if it persists")
 
 // ErrAWSProbeTimeout means the assume-role probe did not finish inside
 // awsOnboardingTimeout. Distinct from the request context dying (the client
@@ -194,6 +204,16 @@ type AWSOnboardInput struct {
 	ExternalID  string   `json:"external_id"`
 	Regions     []string `json:"regions"`
 	DisplayName string   `json:"display_name"`
+	// StackTemplateVersion is the template version the customer's stack
+	// itself reported (the registration custom resource's TemplateVersion
+	// property, Quick Create callback). Never bound from a request body.
+	//
+	// nil: no stack reported one (the manual role-ARN path) and the version
+	// this build hands out is recorded, as before. Non-nil: exactly what the
+	// stack sent is recorded (review P2: an old stack must look old), and a
+	// missing or malformed value is recorded as unknown, which every gate
+	// reads as older (awsdiscovery.GrantsResourcePolicyCollection).
+	StackTemplateVersion *string `json:"-"`
 }
 
 // Onboard proves the connection and records it. Reports whether the connector
@@ -301,14 +321,18 @@ func (s *AWSOnboardingService) Onboard(
 		// that later records what each scan could and could not read.
 		Coverage: json.RawMessage("{}"),
 	}
-	if err := connector.SetAWSAttrs(models.AWSConnectorAttrs{
+	attrs := models.AWSConnectorAttrs{
 		DisplayName:     strings.TrimSpace(in.DisplayName),
 		RoleARN:         roleARN,
 		Partition:       partition,
 		Regions:         regions,
 		CallerARN:       identity.ARN,
-		TemplateVersion: awsdiscovery.TemplateVersion,
-	}); err != nil {
+		TemplateVersion: recordedTemplateVersion(in.StackTemplateVersion),
+	}
+	if in.StackTemplateVersion != nil {
+		attrs.TemplateVersionSource = models.AWSTemplateVersionFromStack
+	}
+	if err := connector.SetAWSAttrs(attrs); err != nil {
 		return nil, false, err
 	}
 
@@ -693,12 +717,22 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	workspaceID, id uuid.UUID,
 ) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
 
-	var empty awsdiscovery.AssumeRequest
-
 	c, err := s.repo.Get(workspaceID, id)
 	if err != nil {
-		return nil, empty, err
+		return nil, awsdiscovery.AssumeRequest{}, err
 	}
+	return s.assumeRequestForConnector(workspaceID, c)
+}
+
+// assumeRequestForConnector is assumeRequestFor for a connector row already
+// read (the runtime broker reads it in a workspace transaction under RLS
+// and calls the secrets store after that transaction, never inside it).
+func (s *AWSOnboardingService) assumeRequestForConnector(
+	workspaceID uuid.UUID, c *models.CloudConnector,
+) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
+
+	var empty awsdiscovery.AssumeRequest
+	id := c.ID
 	if c.Provider != models.CloudProviderAWS {
 		return nil, empty, fmt.Errorf("connector %s is a %s connector", id, c.Provider)
 	}
@@ -720,7 +754,9 @@ func (s *AWSOnboardingService) assumeRequestFor(
 
 	secret, err := s.vault.ReadSecret(c.AuthRef)
 	if err != nil {
-		return nil, empty, fmt.Errorf("failed to read the external id: %w", err)
+		// Logged, not returned: the store's error names where the secret lives.
+		log.Printf("aws connector %s (workspace %s): reading the external id failed: %v", id, workspaceID, err)
+		return nil, empty, ErrExternalIDUnreadable
 	}
 	externalID, _ := secret["external_id"].(string)
 	if externalID == "" {
@@ -733,6 +769,81 @@ func (s *AWSOnboardingService) assumeRequestFor(
 		Region:      region,
 		SessionName: scanSessionName(c.ID),
 	}, nil
+}
+
+// recordedTemplateVersion is the template version Onboard records: what the
+// stack reported when it reported one (normalised; "" when malformed), else
+// this build's version (the manual path, which has no stack report).
+//
+// DECISION (P2-tv1). The manual role-ARN path keeps recording the build's
+// version: no stack speaks there, and the console's manual instructions hand
+// out this build's template. A manual connector on an older stack is caught
+// the way it was before (the scan's AccessDenied names the missing call);
+// connectors created by the stack callback, and every stack Update, record
+// the stack's own version AND say so (AWSConnectorAttrs.TemplateVersionSource):
+// a version without that provenance is the build's, so isolation and the
+// "update available" fact treat it as unverified, never as current.
+func recordedTemplateVersion(reported *string) string {
+	if reported == nil {
+		return awsdiscovery.TemplateVersion
+	}
+	return awsdiscovery.NormalizeTemplateVersion(*reported)
+}
+
+// RecordStackTemplateVersion records the template version a discovery
+// stack's UPDATE reports (a template upgrade, or the rollback of one) on the
+// connector the stack serves. A stack proves which connector it serves the
+// way the create callback does: its role ARN is the connector's, its account
+// the connector's scope, and its ExternalId equals the one AuthSec stored for
+// that connector (constant-time compare). Anything else changes nothing. It
+// returns how many connectors were updated (one per workspace that connected
+// this role with this ExternalId; normally one).
+func (s *AWSOnboardingService) RecordStackTemplateVersion(
+	ctx context.Context, accountID, roleARN, externalID, reported string,
+) (int, error) {
+	if s.vault == nil || accountID == "" || roleARN == "" || externalID == "" {
+		return 0, nil
+	}
+	var candidates []models.CloudConnector
+	// TENANT-EXEMPT: a stack UPDATE callback names no workspace; its connector is found by account + role and proven by its ExternalId below.
+	if err := s.db.WithContext(ctx).Where("provider = ? AND scope_id = ? AND status <> ? AND attrs->>'role_arn' = ?",
+		models.CloudProviderAWS, accountID, models.CloudConnectorRevoked, roleARN).
+		Order("id").Find(&candidates).Error; err != nil {
+		return 0, err
+	}
+	version := awsdiscovery.NormalizeTemplateVersion(reported)
+	updated := 0
+	for _, c := range candidates {
+		secret, err := s.vault.ReadSecret(c.AuthRef)
+		if err != nil {
+			log.Printf("aws connector %s: template version update: reading the external id failed: %v", c.ID, err)
+			continue
+		}
+		stored, _ := secret["external_id"].(string)
+		if stored == "" || subtle.ConstantTimeCompare([]byte(stored), []byte(externalID)) != 1 {
+			continue
+		}
+		raw, err := json.Marshal(version)
+		if err != nil {
+			return updated, err
+		}
+		// The ExternalId proved the connector, and so its workspace: the
+		// update runs under row-level security for that workspace alone.
+		var n int64
+		if err := tenancy.InWorkspace(ctx, s.db, c.WorkspaceID, func(tx *gorm.DB) error {
+			res := tx.Exec(`UPDATE cloud_connector
+			       SET attrs = jsonb_set(jsonb_set(attrs, '{template_version}', ?::jsonb, true),
+			                             '{template_version_source}', to_jsonb(?::text), true), updated_at = now()
+			     WHERE workspace_id = ? AND id = ? AND status <> ?`, string(raw), models.AWSTemplateVersionFromStack,
+				c.WorkspaceID, c.ID, models.CloudConnectorRevoked)
+			n = res.RowsAffected
+			return res.Error
+		}); err != nil {
+			return updated, err
+		}
+		updated += int(n)
+	}
+	return updated, nil
 }
 
 // awsExternalIDPath is where a workspace's ExternalId for one account lives.

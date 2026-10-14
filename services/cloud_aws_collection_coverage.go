@@ -13,7 +13,10 @@ import (
 // T3.7, T3.8), shared by every AWS scanner through surfaceResult so each
 // surface is classified once, the same way:
 //
-//	awsdiscovery.ErrServiceNotInRegion  -> unsupported  nothing there is claimed
+//	awsdiscovery.ErrServiceNotInRegion  -> unsupported  nothing there is claimed (AWS
+//	                                       documents the service absent there; a name that
+//	                                       merely fails to resolve is not that answer)
+//	awsdiscovery.ErrEndpointUnreachable -> partial      the call never reached AWS: unknown set
 //	*awsdiscovery.ItemFailures, detail  -> partial      listed; some detail calls failed
 //	*awsdiscovery.ItemFailures, per-item-> throttled    if any item was throttled
 //	                                       denied       if no item could be read
@@ -44,6 +47,14 @@ func collectionCoverage(count int, err error) (models.SurfaceCoverage, bool) {
 	case errors.Is(err, awsdiscovery.ErrServiceNotInRegion):
 		// No error_code: AWS returned none -- the endpoint does not exist.
 		return models.SurfaceCoverage{State: models.CloudCoverageUnsupported, Count: count,
+			Error: err.Error(), API: awsdiscovery.CallName(err)}, true
+	case errors.Is(err, awsdiscovery.ErrEndpointUnreachable):
+		// The call never reached AWS (a name that does not resolve, a resolver
+		// or connection failure) and AWS does not document the service as
+		// absent there: what it would have listed is unknown. partial -- never
+		// unsupported -- so every reader treats the surface as not analysed.
+		// No error_code: AWS returned none.
+		return models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: count,
 			Error: err.Error(), API: awsdiscovery.CallName(err)}, true
 	case errors.As(err, &items):
 		return itemFailureCoverage(count, items), true
@@ -128,12 +139,9 @@ type podIdentityFailures struct {
 	clusters, associations *awsdiscovery.ItemFailures
 }
 
-// podIdentityListing is one listing that failed outright. why, when set, is
-// appended to the error's own text: the reason a non-resolving endpoint is
-// reported as a failure rather than skipped as "not offered here".
+// podIdentityListing is one listing that failed outright.
 type podIdentityListing struct {
 	err error
-	why string
 }
 
 func newPodIdentityFailures() *podIdentityFailures {
@@ -143,9 +151,9 @@ func newPodIdentityFailures() *podIdentityFailures {
 	}
 }
 
-func (f *podIdentityFailures) addListing(err error, why string) {
+func (f *podIdentityFailures) addListing(err error) {
 	if err != nil {
-		f.listings = append(f.listings, podIdentityListing{err: err, why: why})
+		f.listings = append(f.listings, podIdentityListing{err: err})
 	}
 }
 
@@ -162,7 +170,7 @@ func (f *podIdentityFailures) add(tally *awsdiscovery.ItemFailures, err error) {
 	case errors.As(err, &items):
 		tally.Merge(items)
 	default:
-		f.addListing(err, "")
+		f.addListing(err)
 	}
 }
 
@@ -181,7 +189,7 @@ func (f *podIdentityFailures) err() error {
 func (f *podIdentityFailures) Error() string {
 	var parts []string
 	for _, l := range f.listings {
-		parts = append(parts, l.err.Error()+l.why)
+		parts = append(parts, l.err.Error())
 	}
 	if n := len(f.listings); n > 1 {
 		parts[0] = fmt.Sprintf("%d listings failed: %s", n, parts[0])
@@ -196,8 +204,10 @@ func (f *podIdentityFailures) Error() string {
 
 // podIdentityCoverage is eks_pod_identity's coverage. A listing that failed
 // outright outranks every detail failure -- the region or cluster it covers
-// was not read at all -- and is denied, or throttled when every failed
-// listing was a throttle; with only detail calls failing, the surface is
+// was not read at all -- and is denied, partial when every failed listing
+// never reached AWS (ErrEndpointUnreachable: a resolver or connection failure
+// is no permission to grant), or throttled when every failed listing was a
+// throttle; with only detail calls failing, the surface is
 // partial (§1.4: "a failed detail call makes its surface partial"). All three
 // block. API and ErrorCode name the listing the state came from, else the
 // first failing detail call (D-71). Count is the edges written, a floor
@@ -210,7 +220,11 @@ func podIdentityCoverage(count int, err error) models.SurfaceCoverage {
 	if len(f.listings) > 0 {
 		lead, state := f.listings[0], models.CloudCoverageThrottled
 		for _, l := range f.listings {
-			if !errors.Is(l.err, awsdiscovery.ErrThrottled) {
+			if errors.Is(l.err, awsdiscovery.ErrEndpointUnreachable) {
+				if state == models.CloudCoverageThrottled {
+					lead, state = l, models.CloudCoveragePartial
+				}
+			} else if !errors.Is(l.err, awsdiscovery.ErrThrottled) {
 				lead, state = l, models.CloudCoverageDenied
 				break
 			}

@@ -15,7 +15,10 @@ import (
 )
 
 func TestValidateResourceServerAllowsDCRWithoutPreRegisteredClients(t *testing.T) {
-	t.Parallel()
+	// The resource server is an httptest server on loopback, which the
+	// SSRF-safe client refuses unless loopback is explicitly allowed.
+	// (t.Setenv cannot be combined with t.Parallel.)
+	t.Setenv("MCP_ALLOW_LOOPBACK", "true")
 
 	db := newOnboardingTestDB(t)
 	svc := NewResourceServerOnboardingService(db)
@@ -120,6 +123,7 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
 			application_type TEXT NOT NULL DEFAULT 'mcp_server',
+			agent_type TEXT,
 			legacy_client_id TEXT,
 			name TEXT NOT NULL,
 			public_base_url TEXT NOT NULL,

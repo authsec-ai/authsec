@@ -1,16 +1,14 @@
 package services
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/notify"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
 )
@@ -29,14 +27,27 @@ calling into their cluster. Nothing here opens a path inward.
 // One more sender in the shape of utils.SendAccessRequestNotificationEmail, rather
 // than a notification subsystem: a second mail stack would be a second place for
 // From headers, TLS settings, and delivery failures to diverge.
-type SMTPWarningSender struct{}
+//
+// T3.12: a thin adapter over internal/notify. The warning is rendered by
+// utils.RenderPolicyExpiryWarning and sent by notify.SMTP; the bytes on the
+// wire are unchanged (tests/integration/p3_notify_legacy_test.go compares
+// them with a verbatim copy of the pre-extraction code).
+type SMTPWarningSender struct {
+	// Transport is optional; nil means notify.SMTP over the application's
+	// relay (utils.AppSMTPConfig).
+	Transport notify.Sender
+}
 
 // Send renders and sends the warning.
 func (s *SMTPWarningSender) Send(w *models.AgentPolicyWarning, b WarningBody) error {
 	if w.Channel != models.WarningChannelEmail {
 		return fmt.Errorf("SMTP sender got a %s warning", w.Channel)
 	}
-	return utils.SendPolicyExpiryWarningEmail(utils.PolicyExpiryWarning{
+	var transport notify.Sender
+	if s != nil {
+		transport = s.Transport
+	}
+	return utils.SendPolicyExpiryWarningEmailVia(transport, utils.PolicyExpiryWarning{
 		To:            w.Recipient,
 		RecipientRole: w.RecipientRole,
 		PolicyName:    b.PolicyName,
@@ -86,8 +97,15 @@ type WarningWebhookPayload struct {
 }
 
 // HTTPWarningSender posts a warning to a customer's endpoint.
+//
+// T3.12: a thin adapter over internal/notify. It builds the documented
+// payload and hands the bytes to notify.Webhook, which posts them with the
+// same headers and the same HMAC signature (X-AuthSec-Signature, the scheme
+// the IGA webhook ingress verifies) as before.
 type HTTPWarningSender struct {
-	// Client is optional; a sane default is used when nil.
+	// Client is optional; a sane default is used when nil (a customer
+	// endpoint that hangs must not hold the delivery worker: ten seconds,
+	// notify.DefaultWebhookTimeout).
 	Client *http.Client
 }
 
@@ -115,36 +133,8 @@ func (s *HTTPWarningSender) Send(w *models.AgentPolicyWarning, b WarningBody) er
 	if err != nil {
 		return fmt.Errorf("marshal webhook payload: %w", err)
 	}
-
-	client := s.Client
-	if client == nil {
-		// A customer endpoint that hangs must not hold the delivery worker. Ten
-		// seconds is generous for a webhook and short enough that one bad endpoint
-		// cannot stall the queue behind it.
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-
-	req, err := http.NewRequest(http.MethodPost, b.WebhookURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build webhook request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "authsec-governance")
-	if b.WebhookSecret != "" {
-		// Same HMAC scheme the IGA webhook ingress already verifies, so a customer
-		// who has integrated one has integrated both.
-		mac := hmac.New(sha256.New, []byte(b.WebhookSecret))
-		mac.Write(body)
-		req.Header.Set("X-AuthSec-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("post webhook: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook returned %s", resp.Status)
-	}
-	return nil
+	return (&notify.Webhook{Client: s.Client}).Send(context.Background(), notify.Message{
+		Channel: notify.ChannelWebhook, To: b.WebhookURL, Body: body,
+		Secret: b.WebhookSecret, UserAgent: notify.DefaultUserAgent,
+	})
 }

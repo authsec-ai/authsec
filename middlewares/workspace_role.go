@@ -57,26 +57,17 @@ func RequireWorkspaceRole(allowedRoles ...string) gin.HandlerFunc {
 			return
 		}
 
-		// workspace_memberships is the sole authority for console/operator access.
-		// role_bindings is for OAuth RBAC scope resolution only — never checked here.
-		var count int64
-		query := config.DB.Table("workspace_memberships wm").
-			Joins("JOIN roles r ON r.id = wm.role_id").
-			Where("wm.user_id = ? AND wm.workspace_id = ?", userID, workspaceID).
-			Where("wm.status = ?", "active")
-		if len(allowed) > 0 {
-			names := make([]string, 0, len(allowed))
-			for name := range allowed {
-				names = append(names, name)
-			}
-			query = query.Where("r.name IN ?", names)
+		names := make([]string, 0, len(allowed))
+		for name := range allowed {
+			names = append(names, name)
 		}
-		if err := query.Count(&count).Error; err != nil {
+		held, err := HasWorkspaceRole(workspaceID, userID, names...)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "workspace role check failed"})
 			c.Abort()
 			return
 		}
-		if count == 0 {
+		if !held {
 			c.JSON(http.StatusForbidden, gin.H{"error": "workspace admin role required"})
 			c.Abort()
 			return
@@ -84,4 +75,24 @@ func RequireWorkspaceRole(allowedRoles ...string) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// HasWorkspaceRole reports whether userID is an active member of workspaceID
+// holding one of roles (any role when none are given). For handlers that
+// admit either a resource's owner or a workspace role.
+func HasWorkspaceRole(workspaceID, userID uuid.UUID, roles ...string) (bool, error) {
+	// workspace_memberships is the sole authority for console/operator access.
+	// role_bindings is for OAuth RBAC scope resolution only — never checked here.
+	var count int64
+	query := config.DB.Table("workspace_memberships wm").
+		Joins("JOIN roles r ON r.id = wm.role_id").
+		Where("wm.user_id = ? AND wm.workspace_id = ?", userID, workspaceID).
+		Where("wm.status = ?", "active")
+	if len(roles) > 0 {
+		query = query.Where("r.name IN ?", roles)
+	}
+	if err := query.Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

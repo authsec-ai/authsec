@@ -121,7 +121,7 @@ func (w *WorkloadDetailResponse) SetCanClassify(can bool) {
 // WorkloadDetail serves GET /api/iga/v1/workloads/:id. rawID is the route
 // parameter: a bare UUID or workload:<uuid> (D-5). The only query parameter
 // is rev (§5.1); any other is 400 naming it (D-75).
-func (r *Reader) WorkloadDetail(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (*WorkloadDetailResponse, error) {
+func (r *Reader) WorkloadDetail(ctx context.Context, rawID string, vals url.Values) (*WorkloadDetailResponse, error) {
 	if perr := RouteParams(vals, "rev"); perr != nil {
 		return nil, perr
 	}
@@ -134,7 +134,7 @@ func (r *Reader) WorkloadDetail(ctx context.Context, ws uuid.UUID, rawID string,
 		return nil, nerr
 	}
 	var out *WorkloadDetailResponse
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound() // D-4: no object exists before the first publication
 		}

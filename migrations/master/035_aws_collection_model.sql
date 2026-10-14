@@ -10,8 +10,11 @@
 
 -- Targets for integration-qualified references. id is already the primary
 -- key, so both are always satisfiable.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_identity'::regclass AND conname = 'cloud_identity_scope_key') THEN
 ALTER TABLE public.cloud_identity
     ADD CONSTRAINT cloud_identity_scope_key UNIQUE (workspace_id, connector_id, id);
+END IF; END $$;
 
 -- Groups are identities: kind 'iam_group' (cloud_identity_kind_chk only
 -- requires kind <> '', so no constraint change).
@@ -106,10 +109,13 @@ CREATE TABLE IF NOT EXISTS public.cloud_policy_attachment (
 -- Policy versions as evidence subjects, integration-qualified like the rest.
 -- Widening the subject columns means widening the at-most-one check AND both
 -- dedupe indexes, or a policy observation dedupes against the wrong key.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.cloud_observation'::regclass AND conname = 'cloud_observation_policy_fkey') THEN
 ALTER TABLE public.cloud_observation
     ADD COLUMN IF NOT EXISTS policy_id uuid,
     ADD CONSTRAINT cloud_observation_policy_fkey FOREIGN KEY (workspace_id, connector_id, policy_id)
         REFERENCES public.cloud_policy (workspace_id, connector_id, id) ON DELETE SET NULL (policy_id);
+END IF; END $$;
 ALTER TABLE public.cloud_observation DROP CONSTRAINT IF EXISTS cloud_observation_subject_chk;
 ALTER TABLE public.cloud_observation ADD CONSTRAINT cloud_observation_subject_chk CHECK (
       (identity_id IS NOT NULL)::int + (permission_id IS NOT NULL)::int

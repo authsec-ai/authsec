@@ -1,11 +1,14 @@
 package repositories
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -46,14 +49,15 @@ type GovernanceRepository interface {
 	// need cleaning up, but there is no "why" to close.
 	FindOrphanedExpiredBindings(limit int) ([]ExpiredBinding, error)
 
-	// DeleteRoleBindingTx removes an expired binding inside a transaction. Safe only
-	// because provenance keeps the evidence — see the comment on the method.
-	DeleteRoleBindingTx(tx *gorm.DB, bindingID uuid.UUID) error
+	// DeleteRoleBindingTx removes an expired binding of workspace ws inside a
+	// transaction. Safe only because provenance keeps the evidence — see the
+	// comment on the method. Another workspace's binding is left alone.
+	DeleteRoleBindingTx(tx *gorm.DB, ws, bindingID uuid.UUID) error
 
 	// LiveTokenJTIsForSubject returns unexpired, unrevoked native-token JTIs for a
-	// subject, so revocation can close the window in which a token issued under a
-	// now-lapsed grant still works.
-	LiveTokenJTIsForSubject(subjectID uuid.UUID, subjectType string) ([]LiveToken, error)
+	// subject of workspace ws, so revocation can close the window in which a token
+	// issued under a now-lapsed grant still works.
+	LiveTokenJTIsForSubject(ws, subjectID uuid.UUID, subjectType string) ([]LiveToken, error)
 
 	// RevokeTokensTx bulk-inserts revoked_tokens rows.
 	RevokeTokensTx(tx *gorm.DB, tokens []LiveToken, reason string) error
@@ -330,11 +334,21 @@ func (r *governanceRepository) FindOrphanedExpiredBindings(limit int) ([]Expired
 // mean a second predicate on the most-read table in the system for no gain. The
 // audit trail lives in entitlement_provenance, which is exactly why provenance had
 // to land before an expiry worker could safely delete anything.
-func (r *governanceRepository) DeleteRoleBindingTx(tx *gorm.DB, bindingID uuid.UUID) error {
-	return tx.Exec(`DELETE FROM role_bindings WHERE id = ?`, bindingID).Error
+func (r *governanceRepository) DeleteRoleBindingTx(tx *gorm.DB, ws, bindingID uuid.UUID) error {
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return err
+	}
+	_, err = tenancy.ExecContext(ctx, q, `DELETE FROM role_bindings WHERE workspace_id = $1 AND id = $2`, bindingID)
+	return err
 }
 
-func (r *governanceRepository) LiveTokenJTIsForSubject(subjectID uuid.UUID, subjectType string) ([]LiveToken, error) {
+func (r *governanceRepository) LiveTokenJTIsForSubject(ws, subjectID uuid.UUID, subjectType string) ([]LiveToken, error) {
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return nil, err
+	}
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
 	var out []LiveToken
 	// Only tokens that are still valid and not already revoked matter: revoking an
 	// expired token is a no-op row, and revoking twice is noise in the kill list.
@@ -344,17 +358,33 @@ func (r *governanceRepository) LiveTokenJTIsForSubject(subjectID uuid.UUID, subj
 	// 'access_token' is hardcoded because native_tokens holds access tokens; the
 	// other revoked_tokens kind ('id_jag') is an inbound assertion, revoked by the
 	// trusted-issuer path, not by an entitlement lapsing.
-	err := r.db.Raw(`
+	err = tenancy.WithTx(ctx, sqlDB, ws, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(ctx, tx, `
 		SELECT nt.jti::text AS jti, nt.iss AS issuer,
 		       'access_token' AS kind, nt.expires_at
 		  FROM native_tokens nt
-		 WHERE nt.subject_id = ?
-		   AND nt.subject_type = ?
+		 WHERE nt.workspace_id = $1
+		   AND nt.subject_id = $2
+		   AND nt.subject_type = $3
 		   AND nt.expires_at > NOW()
 		   AND NOT EXISTS (
+		         -- TENANT-EXEMPT: revoked_tokens is the (iss, kind, jti)-keyed kill list, with no workspace_id; matched against this workspace's own tokens.
 		         SELECT 1 FROM revoked_tokens rt
 		          WHERE rt.jti = nt.jti::text AND rt.iss = nt.iss AND rt.kind = 'access_token')`,
-		subjectID, subjectType).Scan(&out).Error
+			subjectID, subjectType)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t LiveToken
+			if err := rows.Scan(&t.JTI, &t.Issuer, &t.Kind, &t.ExpiresAt); err != nil {
+				return err
+			}
+			out = append(out, t)
+		}
+		return rows.Err()
+	})
 	return out, err
 }
 
@@ -367,6 +397,7 @@ func (r *governanceRepository) RevokeTokensTx(tx *gorm.DB, tokens []LiveToken, r
 		// Column is `kind`, PK is (iss, kind, jti) — there is no `token_type` column,
 		// which is what broke RevokeNativeTokenByJTI before this landed. ON CONFLICT
 		// against the real PK so a retried sweep is idempotent.
+		// TENANT-EXEMPT: revoked_tokens is the (iss, kind, jti)-keyed kill list, with no workspace_id; the tokens are the workspace's own, read by LiveTokenJTIsForSubject.
 		err := tx.Exec(`
 			INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
 			VALUES (?, ?, ?, NOW(), ?, ?)

@@ -8,6 +8,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 type readAPI struct {
@@ -36,6 +38,12 @@ type readAPI struct {
 	// lastPerm is the permission the last request's route demanded ("" when
 	// its chain has no permission middleware, e.g. /capabilities).
 	lastPerm string
+}
+
+// wsCtx is ctx carrying ws as its tenant context, as AuthMiddleware's
+// request context does (and as a job builds one with tenancy.WithContext).
+func wsCtx(ctx context.Context, ws uuid.UUID) context.Context {
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws})
 }
 
 // readTestCursorKey signs cursors in the suite; any fixed key works.
@@ -58,7 +66,9 @@ func (l *p2Lab) api() *readAPI {
 		ws, claims := a.ws, a.claims
 		a.mu.Unlock()
 		if ws != uuid.Nil {
+			// As AuthMiddleware does: the legacy key and the tenant context.
 			c.Set("workspace_id", ws.String())
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalKind: "user"})
 		}
 		for k, v := range claims {
 			c.Set(k, v)

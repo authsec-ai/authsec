@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -123,6 +125,9 @@ type ScanReport struct {
 	BlobsSkipped    int                       `json:"blobs_skipped_unchanged"`
 	Coverage        []models.IGACoverageState `json:"coverage"`
 	Issues          []string                  `json:"issues"`
+	// Graph is the keyed projection of this scan into the shared graph, present
+	// only when a projector is configured and IGA_GRAPH_PROJECTION is on.
+	Graph *GitHubGraphResult `json:"graph,omitempty"`
 }
 
 // AgentDetail is the Agent 360 payload: the agent plus the evidence, access and
@@ -182,6 +187,19 @@ type igaManager struct {
 	// binding is refused rather than silently trusted: a deployment that cannot
 	// reach the provider must not be able to bind an integration at all.
 	installs InstallationVerifier
+	// graph projects each scan into the shared graph as keyed rows. Nil means
+	// the scan writes only what it always wrote.
+	graph *GitHubGraphProjector
+}
+
+// IGAOption configures an IGAManager beyond its required collaborators.
+type IGAOption func(*igaManager)
+
+// WithGitHubGraph projects every scan into the shared graph (ghgraph) after it
+// publishes. The projector itself honours IGA_GRAPH_PROJECTION, so a manager
+// built with it writes nothing new while the switch is off.
+func WithGitHubGraph(p *GitHubGraphProjector) IGAOption {
+	return func(m *igaManager) { m.graph = p }
 }
 
 // NewIGAManager constructs an IGAManager. The provider is injected so the
@@ -191,8 +209,12 @@ type igaManager struct {
 // argument rather than an option: binding an integration is a security
 // decision, so every construction site has to state where its ownership proof
 // comes from. Passing nil is allowed and makes binding fail closed.
-func NewIGAManager(repo repositories.IGARepository, provider IGAProvider, installs InstallationVerifier) IGAManager {
-	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog(), installs: installs}
+func NewIGAManager(repo repositories.IGARepository, provider IGAProvider, installs InstallationVerifier, opts ...IGAOption) IGAManager {
+	m := &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog(), installs: installs}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // scopeIDPtr keeps a zero uuid out of the column: an unset scope must read as
@@ -391,15 +413,24 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 	caps, err := m.provider.Capabilities(ctx, pctx)
 	if err != nil {
 		_ = m.repo.FailScan(workspaceID, run.ID, "capability_probe_failed")
+		m.projectFailedScan(workspaceID, integ, run)
 		return nil, err
 	}
 
 	scopes, err := m.provider.ListScopes(ctx, pctx)
 	if err != nil {
 		_ = m.repo.FailScan(workspaceID, run.ID, "scope_enumeration_failed")
+		m.projectFailedScan(workspaceID, integ, run)
 		return nil, err
 	}
 	report.ScopesSeen = len(scopes)
+
+	// What this scan reads, gathered for the keyed graph projection. Nil, and
+	// every call on it a no-op, when no projector is configured.
+	var graph *githubGraphCollector
+	if m.graph != nil {
+		graph = newGitHubGraphCollector(integ)
+	}
 
 	var coverage []models.IGACoverageState
 	now := time.Now()
@@ -431,6 +462,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 				break
 			}
 		}
+		graphRepo := graph.repo(scope)
 
 		perClass := map[string]*classOutcome{}
 		mark := func(class string) *classOutcome {
@@ -449,6 +481,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 			if err != nil {
 				m.degrade(workspaceID, integ.ID, mark(models.ClassAgentProfile), scope, "agent_profile", err, report)
 			} else {
+				graph.agents(graphRepo, objs)
 				for _, o := range objs {
 					m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassAgentProfile, report)
 					mark(models.ClassAgentProfile).inspected++
@@ -474,6 +507,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 		if err != nil {
 			m.degrade(workspaceID, integ.ID, mark(models.ClassDeployKey), scope, "grant", err, report)
 		} else {
+			graph.grants(graphRepo, grants)
 			for _, g := range grants {
 				m.ingestGrant(workspaceID, integ, run, scope, g, report)
 				mark(grantClass(g.SubjectKind)).inspected++
@@ -637,6 +671,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 		}
 
 		for class, o := range perClass {
+			graph.coverage(graphRepo, class, o.state)
 			cs := models.IGACoverageState{
 				ID: uuid.New(), WorkspaceID: workspaceID, IntegrationID: integ.ID,
 				IntegrationScopeID: scopeID, ObjectClass: class,
@@ -665,7 +700,30 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 	}
 	report.Tombstoned = tomb
 
+	if graph != nil {
+		res, err := m.graph.ProjectScan(workspaceID, run.ID, graph.snapshot(), true)
+		if err != nil {
+			// The scan is published and its Phase 1 rows are written; a graph
+			// write that failed is reported, not turned into a failed scan.
+			report.Issues = append(report.Issues, fmt.Sprintf("graph projection skipped: %v", err))
+		}
+		report.Graph = res
+	}
+
 	return report, nil
+}
+
+// projectFailedScan tells the graph a scan of this integration failed, so what
+// the integration supports and this scan could not confirm is marked stale.
+// Never ended: a failed scan read nothing it can vouch for.
+func (m *igaManager) projectFailedScan(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun) {
+	if m.graph == nil {
+		return
+	}
+	snap := newGitHubGraphCollector(integ).snapshot()
+	if _, err := m.graph.ProjectScan(workspaceID, run.ID, snap, false); err != nil {
+		log.Printf("[iga] graph projection of failed scan %s: %v", run.ID, err)
+	}
 }
 
 // maxDisappearanceRatio guards against a permission change or an API outage
@@ -1388,10 +1446,21 @@ func (m *igaManager) AcceptWebhook(in WebhookInput) (*WebhookResult, error) {
 		return nil, repositories.ErrIGASignature
 	}
 
-	// 2. Binding resolved server-side. The payload's installation id is a
+	// 2. Binding resolved server-side. The installation id comes from the
+	//    SIGNED body (installation.id), never from a request header, which the
+	//    signature does not cover (AS-072): a captured delivery replayed with
+	//    another installation header must not land in another workspace. A
+	//    header that disagrees with the body is refused outright. The id is a
 	//    lookup key, never an authorization: it selects a row that must already
 	//    be verified and active, and the workspace comes from THAT row.
-	integ, err := m.repo.ResolveBinding(in.AppRegistrationID, in.InstallationID)
+	installationID := webhookInstallationID(in.Body)
+	var integ *models.IGAIntegration
+	var err error
+	if installationID == "" || (in.InstallationID != "" && in.InstallationID != installationID) {
+		err = repositories.ErrIGABindingFailed
+	} else {
+		integ, err = m.repo.ResolveBinding(in.AppRegistrationID, installationID)
+	}
 	if err != nil {
 		_ = m.repo.RecordRejectedDelivery(&models.IGAWebhookDelivery{
 			ID: uuid.New(), AppRegistrationID: in.AppRegistrationID, DeliveryID: in.DeliveryID,
@@ -1421,6 +1490,30 @@ func (m *igaManager) AcceptWebhook(in WebhookInput) (*WebhookResult, error) {
 		return nil, err
 	}
 	return &WebhookResult{Accepted: true, Redelivery: redelivery}, nil
+}
+
+// webhookInstallationID returns installation.id from a GitHub App webhook
+// body (a number from GitHub; a string is accepted too), or "".
+func webhookInstallationID(body []byte) string {
+	var p struct {
+		Installation struct {
+			ID json.RawMessage `json:"id"`
+		} `json:"installation"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil || len(p.Installation.ID) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(p.Installation.ID, &s); err == nil {
+		return s
+	}
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(p.Installation.ID))
+	dec.UseNumber()
+	if err := dec.Decode(&n); err == nil {
+		return n.String()
+	}
+	return ""
 }
 
 // verifyGitHubSignature checks X-Hub-Signature-256 with a timing-safe compare.

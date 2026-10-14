@@ -72,7 +72,7 @@ func (r *MFARepository) ensureTableExists() error {
 		DO $$
 		BEGIN
 			IF NOT EXISTS (
-				SELECT 1 FROM pg_constraint 
+				SELECT 1 FROM pg_constraint -- TENANT-EXEMPT: Postgres catalog
 				WHERE conname = 'mfa_methods_client_id_method_type_key'
 			) THEN
 				ALTER TABLE mfa_methods ADD CONSTRAINT mfa_methods_client_id_method_type_key UNIQUE(client_id, method_type);

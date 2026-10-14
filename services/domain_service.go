@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -82,23 +83,31 @@ func (ds *DomainService) verifyDNSTXT(txtName, expectedValue string) (bool, stri
 	txtName = strings.TrimSuffix(txtName, ".")
 
 	// Perform DNS TXT lookup
-	txtRecords, err := net.LookupTXT(txtName)
-	if err != nil {
-		return false, fmt.Sprintf("DNS TXT lookup failed: %v", err)
-	}
+	txtRecords, err := lookupTXT(txtName)
+	return matchTXT(txtName, expectedValue, txtRecords, err)
+}
 
-	if len(txtRecords) == 0 {
-		return false, fmt.Sprintf("No TXT records found for %s", txtName)
-	}
+// lookupTXT is net.LookupTXT; tests replace it.
+var lookupTXT = net.LookupTXT
 
-	// Check if any record matches
+// matchTXT decides a TXT lookup's outcome and, on failure, says what the
+// operator should do about it.
+func matchTXT(txtName, expectedValue string, txtRecords []string, err error) (bool, string) {
+	var dnsErr *net.DNSError
+	switch {
+	case err != nil && errors.As(err, &dnsErr) && dnsErr.IsNotFound:
+		return false, fmt.Sprintf("No TXT record found at %s. Add it with the value shown; new DNS records can take a while to propagate.", txtName)
+	case err != nil:
+		return false, fmt.Sprintf("The DNS lookup for %s failed (a temporary DNS problem); try again shortly.", txtName)
+	case len(txtRecords) == 0:
+		return false, fmt.Sprintf("No TXT record found at %s. Add it with the value shown; new DNS records can take a while to propagate.", txtName)
+	}
 	for _, record := range txtRecords {
-		if record == expectedValue {
+		if strings.TrimSpace(record) == expectedValue {
 			return true, ""
 		}
 	}
-
-	return false, fmt.Sprintf("TXT record value mismatch. Expected: %s, Found: %v", expectedValue, txtRecords)
+	return false, fmt.Sprintf("%s has a TXT record, but not the expected value %q (found %q). Update the record; changes can take a while to propagate.", txtName, expectedValue, txtRecords)
 }
 
 // GetVerifiedDomainsForTenant returns list of verified domains (for use in redirect URI validation)

@@ -42,6 +42,13 @@ type ProjectionService struct {
 	// LIVE pass of this service, so what stands between a superseded pass
 	// and the graph is exactly this service's own fencer.
 	beforeGraphTx func(job models.IGAProjectionJob)
+
+	// policyGate is the IGA_POLICY gate the evaluation step checks
+	// (SPEC-iga-phase3-policy.md §8.2): with it not on, no evaluation row is
+	// inserted and the step does nothing. Read on every pass.
+	policyGate func() *PolicyGate
+	// evaluator is the §8.2 finding evaluation step.
+	evaluator *GovEvaluator
 }
 
 func NewProjectionService(
@@ -60,7 +67,43 @@ func NewProjectionService(
 		barrierLease: 15 * time.Minute,
 		maxAttempts:  repositories.MaxProjectionAttempts,
 		now:          time.Now,
+		policyGate:   PolicyGateState,
+		evaluator:    NewGovEvaluator(db),
 	}
+}
+
+// WithPolicyGate makes the evaluation step read this gate instead of the
+// process-wide one. Tests use it.
+func (s *ProjectionService) WithPolicyGate(g *PolicyGate) *ProjectionService {
+	s.policyGate = func() *PolicyGate { return g }
+	return s
+}
+
+// WithEvaluator replaces the evaluation step (tests: a budget or a hook).
+func (s *ProjectionService) WithEvaluator(e *GovEvaluator) *ProjectionService {
+	s.evaluator = e
+	return s
+}
+
+// policyOn reports whether the IGA_POLICY gate is on for this pass.
+func (s *ProjectionService) policyOn() bool {
+	return s.policyGate != nil && s.evaluator != nil && s.policyGate().Available()
+}
+
+// evaluate runs the §8.2 evaluation step for rev between the publication
+// commit and completeAndRelease, fenced on this job and its barrier. It
+// never fails the job: an evaluation failure is recorded on its own row.
+func (s *ProjectionService) evaluate(ctx context.Context, job *models.IGAProjectionJob, version, rev int64) {
+	if rev <= 0 || !s.policyOn() {
+		return
+	}
+	fencer := projectionFencer{jobs: s.jobs, pipeline: s.pipeline, jobID: job.ID}
+	s.evaluator.EvaluateRevision(ctx, job.WorkspaceID, rev, func(tx *gorm.DB) error {
+		if err := fencer.AssertOwnedTx(tx, job.ID, s.owner, job.LeaseVersion); err != nil {
+			return err
+		}
+		return fencer.AssertHeldTx(tx, job.WorkspaceID, job.ScanRunID, version)
+	})
 }
 
 // NewDefaultProjectionService wires the production service. The owner names
@@ -318,14 +361,19 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 		return true, s.failKeepBarrier(ctx, job, version, err)
 	}
 
-	err = s.projectAndReconcile(ctx, snap, job, version)
+	rev, err := s.projectAndReconcile(ctx, snap, job, version)
 
 	// A replay of a run that already committed is SUCCESS, not failure. The
 	// graph transaction wrote nothing on this attempt (§4.6 step 2), so there
 	// is nothing to undo -- only the job and the barrier to settle, in the
 	// same order and transaction as a normal completion.
+	//
+	// The evaluation step (§8.2) runs here too, before the release: a replay
+	// leaves a complete evaluation untouched, continues a running one and
+	// retries a failed one.
 	var done *igagraph.AlreadyPublished
 	if errors.As(err, &done) {
+		s.evaluate(ctx, job, version, done.Rev)
 		return true, s.completeAndRelease(ctx, job, version)
 	}
 	if errors.Is(err, igagraph.ErrSuperseded) {
@@ -334,6 +382,10 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return true, s.failKeepBarrier(ctx, job, version, err)
 	}
+	// Between the publication commit and the release, the barrier still held:
+	// finding evaluation (§8.2). Collection cannot run, so every connector's
+	// cloud_usage rows are still its manifest run's.
+	s.evaluate(ctx, job, version, rev)
 	return true, s.completeAndRelease(ctx, job, version)
 }
 
@@ -442,10 +494,10 @@ func (s *ProjectionService) fence(job *models.IGAProjectionJob, version int64) r
 func (s *ProjectionService) projectAndReconcile(
 	ctx context.Context, snap *igagraph.Snapshot,
 	job *models.IGAProjectionJob, pipelineVersion int64,
-) error {
+) (int64, error) {
 	existing, err := igagraph.LoadExisting(ctx, s.db, snap.Run.WorkspaceID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	fencer := projectionFencer{jobs: s.jobs, pipeline: s.pipeline, jobID: job.ID}
@@ -459,7 +511,8 @@ func (s *ProjectionService) projectAndReconcile(
 	if s.beforeGraphTx != nil {
 		s.beforeGraphTx(*job)
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	policy := s.policyOn()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := projector.Project(tx, snap); err != nil {
 			return err
 		}
@@ -477,8 +530,21 @@ func (s *ProjectionService) projectAndReconcile(
 			log.Printf("[projection] run %s published edges missing evidence: %v",
 				job.ScanRunID, projector.EvidenceMissing)
 		}
-		return projector.Events().Flush(tx, s.graph)
+		if err := projector.Events().Flush(tx, s.graph); err != nil {
+			return err
+		}
+		// §8.2 step 1: with IGA_POLICY on, the revision's evaluation row is
+		// inserted (running, attempt 1) IN the publication transaction, so a
+		// published revision always has one to continue after a crash.
+		if policy {
+			return s.evaluator.InsertRunningTx(tx, snap.Run.WorkspaceID, projector.Rev())
+		}
+		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return projector.Rev(), nil
 }
 
 // heartbeat renews the job lease while the projection runs.

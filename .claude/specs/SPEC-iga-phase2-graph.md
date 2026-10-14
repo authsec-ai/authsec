@@ -5,6 +5,12 @@
 > [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md); the
 > invariants this work must honour are [SPEC-iga-roadmap.md](SPEC-iga-roadmap.md) §3.
 >
+> **Evidence rule.** Nothing in this document, a commit message, PR text, a
+> decision record or a test suite proves a behaviour exists. Trace each part
+> (route, handler, writer, migration, collector, deployed image) before
+> relying on it; a passing test is the author's assumption until the real
+> producer and consumer have been exercised end to end.
+>
 > **Inspected, 2026-09-23.** Every claim about current behaviour below was
 > traced in code at these commits, not taken from names, comments or earlier
 > reports:
@@ -1037,16 +1043,18 @@ rows in `cloud_workload`. The IA exposes all three without distinguishing them.
 **Navigation is grouped by the customer's task**, and every existing route
 keeps working (bookmarks, redirects and `?connector=` links included):
 
-| Group | Item | Route | What it is for, in its own subtitle |
-|---|---|---|---|
-| **Explore** | Agents & workloads | `/iga/estate` | Find a workload and start an investigation — the projected identity graph |
-| | Identities | `/iga/identities` | Roles, users and groups; what runs as them and what they declare |
-| | Resources | `/iga/resources` | Exact references and selectors that declared access names |
-| **Governance** | Provenance, Access Certification, Separation of Duties, Birthrights & Lifecycle, Enforcement queue | unchanged | Unchanged capabilities. They govern workspace users, service accounts and OAuth clients; nothing in them implies an action on AWS objects from the graph |
-| **Data sources** | Integrations | `/iga/integrations` | Connect, verify, scan and troubleshoot collection |
-| | Agent sightings | `/iga/agents` | Agents found in repositories and clusters that need a decision — claim, provision or quarantine. The existing Discovered Agents workflow, renamed for its purpose; it is not a second copy of Agents & workloads |
-| | Cloud Inventory | `/iga/cloud/*` | The rows each scan collected, as collected — the source the graph is built from. Each tab says so and links to the graph object where one exists |
-| | Detection Rules | `/iga/detection-rules` | What a repository scan looks for |
+| Sidebar | Route | What it is for |
+|---|---|---|
+| **Connections** | `/iga/connections` | What is connected, is it reporting, is its data usable — a four-way readiness model per connection (replaces Integrations; scan rules live inside a GitHub organisation) |
+| **Discovery** | `/iga/discovery` | Everything found, provider-scoped — workloads, identities, resources, sightings — one search, explicit filter and count semantics, a *Published* / *Latest collected* view (replaces Agents & workloads, Cloud Inventory, Agent sightings, Kubernetes access and the Identities / Resources lists) |
+| **Policy** | `/iga/policy` | Reserved; a preview boundary only — its functionality is a separate spec |
+| **Logs** | `/iga/logs` | What happened, when, by whom — a labelled preview on sample events |
+
+The design — secondary screens, the interaction rule, redirects that carry
+their parameters, the removal contract for the legacy governance screens,
+the three summary compositions and the field-level backend dependencies —
+is [`SPEC-console-revamp.md`](SPEC-console-revamp.md). Object pages keep
+their routes and are reached from Discovery.
 
 - **One breadcrumb**, the global one, using the sidebar's own labels, ending
   in the current object's name on every object and detail page (graph
@@ -1074,14 +1082,14 @@ and nothing useful is removed — it moves tier.
 |---|---|---|---|
 | Integrations | Connect, verify, scan, troubleshoot | Name/provider, scope, health, last scan | Raw `last_error` → details; connector ids → details |
 | Integration detail / AWS drawer | Verify and scan one source | Scope, health, regions, last scan and its outcome | Role and caller ARNs, template version → details |
-| Agents & workloads | Find a workload | Name with runtime and region, account, classification; freshness when room | ARN, region column, instances → Columns / details |
+| Agents & workloads | Find a workload | Name with runtime and region, account, classification; last confirmed when room | ARN, region column, instances → Columns / details |
 | Workload Overview | What is it, what does it run as | Runtime and location; classification and who decided; **application identity** and, for ECS, the **task execution role** as supporting infrastructure; next action | ARN, sources, continuity → details |
 | Identities | Find an identity | Name with subtype, account, direct workload bindings | ARN → Columns / details |
-| Identity detail | Who uses it, what it declares | Subtype and account, direct workload bindings, trust, policy summary, freshness | Statement documents → evidence |
+| Identity detail | Who uses it, what it declares | Subtype and account, direct workload bindings, trust, policy summary, last confirmed | Statement documents → evidence |
 | Resources | Find what policies name | Reference name, exact vs selector, service/type, account when the reference names one | Full reference → Columns / details |
 | Resource detail | What names it | What the reference identifies; observed resource vs exact reference vs selector; who names it | Statements → evidence |
 | Graph canvas / Paths | Follow relationships | Workload → identity → declared resource relationship | Statement nodes (Detailed view), claims (evidence) |
-| Evidence and coverage | Explain one fact or gap | Explanation, then policy/statement, constraints, source and freshness | Raw record (collapsed) |
+| Evidence and coverage | Explain one fact or gap | Explanation, then policy/statement, constraints, source and confirmation | Raw record (collapsed) |
 | Agent sightings | Decide on a sighting | Sighting, source, decision status, evidence summary | Fingerprint, matched client id, source metadata JSON → details |
 | Cloud Inventory | Inspect collected rows | Name, kind, account, last seen | Native ARN → details |
 | Detection Rules | Tune what a scan looks for | Rules, globs, word lists | Versions → details |
@@ -1412,7 +1420,7 @@ two accounts at every width. Identifiers are not printed under every name.
 
 - **Columns by priority, from the table's own width** (re-measured when the
   sidebar or an inspector changes it): the name is always shown with a way
-  to open it; then account, classification and freshness while they fit.
+  to open it; then account, classification and last confirmed while they fit.
   Region, runtime, ARN and instances are in each row's details (›) unless
   the customer chooses them in **Columns**; a chosen field that does not fit
   moves to details and Columns says so. The table is exactly its
@@ -1616,7 +1624,7 @@ and conflating them is the failure the whole coverage model exists to prevent.
 | **Unavailable** | the backend for this view is not deployed: *"Changes will show configuration and coverage history. Not available yet."* Neither an error nor empty | same | same | same | same | same |
 | **Not authorized** | `403`: *"You need the IGA read permission to view the identity graph."* Never an empty list, never "not found" | same | same | same | same | same |
 | **Refresh failed** | A reload after data was shown failed: the **previous data stays**, dimmed, with *"Could not refresh — showing results from 14:02. [Retry]"* | same | same | same | same | same |
-| **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | freshness shows the queue, not just the age | same | same | same | same |
+| **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | the status line shows the queue, not just the age | same | same | same | same |
 
 **Queued is a real state, because the barrier serializes per workspace.** A
 customer with five accounts will see scans wait. That is the price of §2.10A's
@@ -1661,7 +1669,7 @@ way its header stays in view, and it reads in sections:
    *Permissions boundary recorded; not evaluated*, *Resource existence not
    confirmed*, *Evidence stale*, *Relevant coverage missing*. Distinct
    limitations are all kept; repeats are not.
-4. **Collection source and freshness.** Source API, last confirmed, first
+4. **Collection source and confirmation.** Source API, last confirmed, first
    seen, stale since or ended; then **Supporting records** behind a
    disclosure — each collection of the fact, which is not a separate grant.
 5. **Raw record**, collapsed, fetched only when opened, scrolling in its own
@@ -2286,6 +2294,100 @@ fail the job forever. (E13)
 
 
 ---
+
+### 2.16 Kubernetes resources: what a rule reaches, and where
+
+**Status: proposed, 8 Oct 2026. Not implemented; nothing below is built.**
+
+**The gap, traced.** The Kubernetes walk ends at a rule. The projector writes
+no `iga_resources` or `iga_entitlement_target` row for provider `k8s`
+(`internal/k8sgraph/project.go`, `services/k8s_rbac_service.go`), the walk's
+edge kinds are `executes_as`, `grant` and `member_of` only
+(`internal/igaread/traverse_k8s.go`), and nothing collects concrete objects. So
+no screen answers *which workload can reach which secret*. The schema does not
+block it: migration 040's check forbids `resource_id` on a Kubernetes **grant**,
+not on a target; `iga_resources` and `iga_entitlement_target` have no provider
+check; and the AWS `target` traversal is provider-parametrised.
+
+**The constraint that shapes the design: a rule does not know where it
+applies.** A Kubernetes rule says *get secrets*. Where is decided by the
+binding: a RoleBinding applies it in the binding's namespace (even when the
+role is a ClusterRole), a ClusterRoleBinding applies it everywhere. One
+ClusterRole rule bound in two namespaces reaches two different sets of
+secrets. A target edge drawn from the rule as stored today would let every
+holder of that rule appear to reach every namespace any binding names — a
+wrong path, which is worse than a missing one.
+
+**Decision proposed — a rule is projected once per place it applies.** The
+rule row (`iga_entitlements`, provider `k8s`) is keyed by the rule *and* its
+effective scope: a namespaced Role's rule is unchanged (its scope is its
+namespace); a ClusterRole's rule gets one row per distinct binding scope
+(cluster-wide for a ClusterRoleBinding, `<namespace>` for each RoleBinding).
+Grants point at the scoped row. Targets hang off the scoped row, so every
+stored edge is true on its own and the walk stays stateless. The rule card
+keeps grouping by role (`policy_ref`); its scope badge becomes the row's own
+scope. Reconciliation retires today's unscoped ClusterRole rule rows on the
+first complete sweep after release, which the existing rule already does for
+any unconfirmed key. Cost: a ClusterRole bound in *n* namespaces stores *n*
+copies of its rules; measured on the production cluster before release
+(115 roles and 99 bindings in the 8 Oct sweep).
+
+**Resource nodes.** Each scoped rule names targets; each target is an
+`iga_resources` row, provider `k8s`, keyed by cluster, scope, API group,
+resource type and, when given, name. They use §2.14.12's kinds, never a new
+word, and none claims the object exists:
+
+| Rule says | Node | Kind | Label |
+|---|---|---|---|
+| `secrets` in a namespaced scope | one per (group, type, namespace) | selector | *Secrets in payments* |
+| `secrets` via a ClusterRoleBinding | one per (group, type) | selector | *Secrets in every namespace* |
+| `resourceNames: [db-password]` | one per name | exact reference | *Secret payments/db-password* (or *db-password, in any namespace* when cluster-wide) |
+| `pods/exec`, `pods/log` | the subresource is its own type | selector | *Exec into pods in payments* |
+| `*` resources or `*` groups | one wildcard node per scope | selector | *Every resource in payments*, flagged |
+| `nonResourceURLs` | one per URL, cluster scope | selector | *URL /metrics* |
+| cluster-scoped types (`nodes`, `namespaces`, `persistentvolumes`, `clusterroles`, …) | scope is always the cluster | selector | *Nodes* |
+
+Verbs stay on the rule; the target edge says *applies to*, as for AWS.
+Whether a type is namespaced comes from a fixed table of built-in kinds;
+an unknown type (a CRD) is drawn at the scope the binding gives, and its
+inspector says the type was not checked.
+
+**Containment, which AWS cannot compute but Kubernetes can.** A selector
+*Secrets in payments* contains every exact *Secret payments/x*; *Secrets in
+every namespace* contains both. The resource page's *who can reach this*
+includes holders of every containing selector, labelled *through a broader
+rule*. This is string matching on (cluster, namespace, group, type, name),
+exact, and never presented as evaluated access.
+
+**Workload-side objects, a second step.** Sightings already carry the names
+of Secrets a workload mounts or reads into its environment
+(`metadata.provisioning_hints.secret_refs`; names and keys only, never values).
+Drawing *workload mounts Secret payments/db-password* reuses the same exact
+node, but needs a new relationship kind from a workload to a resource
+(`iga_relationship` only targets identities today, so a migration widens its
+check). It is valuable because a mounted Secret is readable by the Pod whatever
+RBAC says. ConfigMaps are not collected and are out of scope.
+
+**Not proposed: enumerating objects.** Listing every Secret, ConfigMap and Pod
+would turn selectors into real objects, but requires the agent to `list
+secrets` cluster-wide, which grants reading their values. That is a trust
+decision for a customer, not a default, and is not part of this section.
+
+**Reads and screens.** Add `target` to the Kubernetes edge kinds and teach the
+Kubernetes node fetch the resource type; make named-by counts and the
+inventory's resource class provider-neutral; a Kubernetes resource page at
+`/iga/k8s/resource/:id` reads the graph routes (root `resource:<id>`, reverse
+direction) because `/api/iga/v1/resources/:id` is AWS-only. The workload's
+Overview groups *what the cluster lets it do* by resource (*Secrets in
+payments: get, list — through RoleBinding x*); the Graph tab draws
+workload → ServiceAccount → rule → resource; Discovery's Kubernetes provider
+gains a Resources type.
+
+**Acceptance.** Against a real sweep, not fixtures: a ClusterRole bound by a
+RoleBinding in one namespace never reaches another namespace's resources;
+a ClusterRoleBinding reaches *every namespace*; removing a binding retires its
+scoped rule copies and their resource edges on the next complete sweep; a
+workload page and a resource page agree on the same path.
 
 ## 3. Schema
 
@@ -6779,7 +6881,7 @@ query did not finish, never a number that looks exact.
 | **Typed direct bindings** | Identities list *Bindings* column and filter; identity Overview; graph selection card | Identity rows, `/identities/:id` and graph identity nodes add `bindings: { runs_as: Exact, execution_role: Exact }` beside `used_by_count`, which keeps D-17's meaning. The list adds `bound_as=runs_as\|execution_role` beside `used_by=workloads` | Same optional-work rule as `used_by_count`; each half fails independently to `exact: false` | One count, labelled *Direct bindings* and explained as "run as it, or whose ECS agent uses it as the task execution role". The two roles are told apart where the relationship itself is shown (the workload's Identities, the graph's *runs as* / *ECS agent uses*) |
 | **Paged paths** | Paths view once the canvas reaches its limit (§2.14.11) | `/graph/path` adds `cursor=` and returns `next_cursor` when `bound_by: "paths"`; each page is the next shortest paths, full nodes and edges as now | `more_paths` and `bound_by` unchanged; a page past the deadline returns what it has with `bound_by: "time"` | Paths lists the paths in the **loaded** graph and says so, including when a path was cut by the depth limit; a server path with `more_paths` says "More paths exist beyond the search limit" |
 | **Server-side Overview summary** | Overview (§2.14.11 *Views*) on a root whose statements are not all loaded | `GET /graph/summary?root=&direction=&cursor=` → `lines: [{ holder, target, effect, statements: [ref], grants: [claim], targets: [claim] }]`, 100 lines a page | A line keeps every claim behind it (evidence-preserving); Allow and Deny are never one line; `truncated` as `/graph` | The client summarises only statements whose grant and targets are loaded; a statement with more targets to load stays drawn, with its own Load control |
-| **Per-object collection summary** | Selection card's uncertainty line; evidence *Collection source and freshness* | Graph nodes and detail reads add `collection: { surfaces: [{ surface, state, as_of }] }` for the surfaces that could have produced or ended the object | `state` uses the coverage vocabulary (§1.4); an unknown surface is `unknown`, never omitted | The node's own `limitations` and `stale_reason`, and the account's coverage on the list pages |
+| **Per-object collection summary** | Selection card's uncertainty line; evidence *Collection source and confirmation* | Graph nodes and detail reads add `collection: { surfaces: [{ surface, state, as_of }] }` for the surfaces that could have produced or ended the object | `state` uses the coverage vocabulary (§1.4); an unknown surface is `unknown`, never omitted | The node's own `limitations` and `stale_reason`, and the account's coverage on the list pages |
 
 A security judgement is never derived from these: a shared role is not a
 finding, and a declared path is not effective access (§1.2).

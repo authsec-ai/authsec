@@ -40,8 +40,11 @@ func NewIGAController(db *gorm.DB) *IGAController { return &IGAController{db: db
 // default — it exercises the whole pipeline without pretending to have
 // verified GitHub behaviour that nobody has measured yet.
 func (ctl *IGAController) manager() services.IGAManager {
+	// The keyed graph projection reads the process-wide IGA_GRAPH_PROJECTION
+	// gate (nil), so with the switch off a scan writes only what it always did.
 	return services.NewIGAManager(repositories.NewIGARepository(ctl.db), ctl.provider(),
-		ctl.installationVerifier())
+		ctl.installationVerifier(),
+		services.WithGitHubGraph(services.NewGitHubGraphProjector(ctl.db, nil)))
 }
 
 // installationVerifier supplies the provider-side ownership proof binding needs.
@@ -103,7 +106,7 @@ func SetIGAProvider(p services.IGAProvider) { igaProviderOverride = p }
 /* ------------------------------- helpers ------------------------------- */
 
 func (ctl *IGAController) workspace(c *gin.Context) (uuid.UUID, string, error) {
-	ws := c.GetString("workspace_id")
+	ws := middlewares.WorkspaceIDString(c)
 	if ws == "" {
 		return uuid.Nil, "", fmt.Errorf("workspace_id not found in token")
 	}

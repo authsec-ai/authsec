@@ -1,0 +1,2 @@
+# Files merged from authsec-staging with raw SQL not yet on the scoped layer
+# (AS-108). Remove a file once its statements are scoped; never add one.

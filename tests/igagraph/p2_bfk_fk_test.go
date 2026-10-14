@@ -41,7 +41,8 @@ package igagraph_test
 // TestB9ForeignKeyCatalogGuard is what makes "every" true. Its scope is by
 // table name, not by form: every foreign key on an iga_* or cloud_* table
 // (Phase 1's included) and every key from any other table that points into
-// one (bfkForeignKeys). It reads pg_constraint and fails when such a key has no
+// one (bfkForeignKeys) -- except Phase 3's tables (bfkPhase3Tables), which
+// tests/igagovschema guards. It reads pg_constraint and fails when such a key has no
 // case, when a case's kind does not match its key's shape, when a
 // single-column reference to a workspace-scoped table is not an exemption
 // listed with its reason, when a composite reference does not lead with
@@ -79,6 +80,22 @@ import (
 
 	"github.com/lib/pq"
 )
+
+// bfkPhase3Tables are the Phase 3 cloud_* tables (047-056,
+// SPEC-iga-phase3-policy.md §6.1). They, and every iga_gov_* table by prefix,
+// are OUT of B9's scope: the Phase 3 spec governs them, and tests/igagovschema
+// proves them and carries the equivalent catalog guard
+// (TestPhase3ForeignKeyCatalogGuard: every composite reference
+// workspace-qualified, every single-column reference and every bare uuid
+// listed with its reason). That is NOT an agreed exemption from §2.9: Phase
+// 3's DDL references users(id) single-column and keeps unreferenced audit and
+// subject uuids, and whether §2.9 binds Phase 3 is an open spec question
+// (T3.01). A cloud_* table that is not listed here stays in B9's scope, so a
+// new one is still caught.
+var bfkPhase3Tables = []string{
+	"cloud_enforcement_binding", "cloud_policy_document",
+	"cloud_resource_policy_coverage", "cloud_resource_policy_observation",
+}
 
 // bfkCloudTable says where a cloud_* table's references come from.
 type bfkCloudTable struct {
@@ -193,33 +210,16 @@ var bfkNoForeignKey = map[string]string{
 	"iga_workload_classification.operation_id": "029: a client-generated idempotency key (§5.5), not a reference",
 	"iga_workload_classification.decided_by_user_id": "029 (spec verbatim): the deciding user's id; users is " +
 		"not an iga_* table and §3 declares no key",
+	"iga_object_support.source_ref": "041 and 042: a STORED generated column, COALESCE(connector_id, " +
+		"discovery_source_id, integration_id), not a reference. Each of the three carries its own " +
+		"workspace-qualified key (iga_object_support_connector_fkey, iga_os_discovery_source_fkey, " +
+		"iga_os_integration_fkey); source_ref exists so the support upserts' unique indexes have one non-null column",
 	"iga_webhook_deliveries.integration_id": "004: filled when a delivery binds; SPEC QUESTION: no key",
 	"iga_source_objects.integration_scope_id": "004: SPEC QUESTION: no key to iga_integration_scopes " +
 		"(workspace_id, id)",
 	"iga_pipeline_lease.scan_run_id": "027: SPEC QUESTION: no key at all, so a barrier can name another " +
 		"workspace's run or none (§2.9)",
-	"cloud_identity.workspace_id": "011: SPEC QUESTION: anchored by nothing. cloud_identity_connector_id_fkey " +
-		"is single-column, so an identity can name a workspace that does not exist, or one its connector " +
-		"is not in, and 035's cloud_identity_scope_key then pairs that workspace with that connector",
-	"cloud_connector.workspace_id": "001 and 010: SPEC QUESTION: no key to workspaces. Every (workspace_id, " +
-		"connector_id) reference 027-036 added is against cloud_connector (workspace_id, id), so it proves " +
-		"the pair agrees, not that the workspace exists",
-
-	// Phase 1's tables: the workspace_id no key covers, because each table's
-	// connector reference is single-column (bfkLegacySingleColumn).
-	"cloud_secret.workspace_id":          "011" + bfkPhase1Workspace,
-	"cloud_assume_edge.workspace_id":     "012" + bfkPhase1Workspace,
-	"cloud_permission.workspace_id":      "013" + bfkPhase1Workspace,
-	"cloud_resource.workspace_id":        "013" + bfkPhase1Workspace,
-	"cloud_workload.workspace_id":        "015" + bfkPhase1Workspace,
-	"cloud_usage.workspace_id":           "016" + bfkPhase1Workspace,
-	"cloud_scan_checkpoint.workspace_id": "017" + bfkPhase1Workspace,
 }
-
-// bfkPhase1Workspace: why a Phase 1 table's workspace_id is bare.
-const bfkPhase1Workspace = ": Phase 1, SPEC QUESTION: anchored by nothing. The connector key is single-column, " +
-	"so nothing ties the row's workspace to its connector's; the composite connector reference proposed in " +
-	"bfkLegacySingleColumn would"
 
 /* -------------------------------- catalog --------------------------------- */
 
@@ -258,7 +258,8 @@ func bfkForeignKeys(t *testing.T, q bfkQuerier) map[string]bfkFK {
 		  JOIN pg_class fr     ON fr.oid = c.confrelid
 		 WHERE c.contype = 'f' AND n.nspname = 'public'
 		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%'
-		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')`)
+		        OR fr.relname LIKE 'iga\_%' OR fr.relname LIKE 'cloud\_%')
+		   AND r.relname NOT LIKE 'iga\_gov\_%' AND r.relname <> ALL ($1)`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read foreign keys: %v", err)
 	}
@@ -574,9 +575,10 @@ func bfkBareUUIDColumns(t *testing.T, q bfkQuerier) []string {
 		 WHERE n.nspname = 'public' AND r.relkind = 'r'
 		   AND a.atttypid = 'uuid'::regtype AND a.attname <> 'id'
 		   AND (r.relname LIKE 'iga\_%' OR r.relname LIKE 'cloud\_%')
+		   AND r.relname NOT LIKE 'iga\_gov\_%' AND r.relname <> ALL ($1)
 		   AND NOT EXISTS (SELECT 1 FROM pg_constraint c
 		                    WHERE c.contype = 'f' AND c.conrelid = r.oid AND a.attnum = ANY (c.conkey))
-		 ORDER BY 1`)
+		 ORDER BY 1`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read uuid columns: %v", err)
 	}
@@ -604,7 +606,8 @@ func bfkCloudTablesInCatalog(t *testing.T, q bfkQuerier) []string {
 		  FROM pg_class r
 		  JOIN pg_namespace n ON n.oid = r.relnamespace
 		 WHERE n.nspname = 'public' AND r.relkind IN ('r', 'p') AND r.relname LIKE 'cloud\_%'
-		 ORDER BY 1`)
+		   AND r.relname <> ALL ($1)
+		 ORDER BY 1`, pq.Array(bfkPhase3Tables))
 	if err != nil {
 		t.Fatalf("read cloud tables: %v", err)
 	}

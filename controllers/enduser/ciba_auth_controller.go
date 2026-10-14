@@ -37,7 +37,18 @@ func NewCIBAAuthController() (*CIBAAuthController, error) {
 	}, nil
 }
 
-// InitiateCIBAAuth initiates CIBA authentication flow
+// InitiateCIBAAuth initiates CIBA authentication flow.
+//
+// Legacy surface (deprecated; successor /oauth/bc-authorize). It does not
+// authenticate the client: the Python SDK (authsec_sdk.ciba.CIBAClient, admin
+// flow) posts only {login_hint, binding_message} and has no client secret to
+// send, so requiring client authentication here would break every SDK
+// release in the field (AS-015). Containment instead: the request must name
+// workspace_id or an approved client_id, the user is looked up only inside
+// that workspace, a request started for a client can be polled only with that
+// client_id, and the minted session lasts 24h. New integrations use
+// /oauth/bc-authorize, which authenticates the client and binds the poll.
+//
 // @Summary Initiate CIBA authentication
 // @Description Initiates CIBA flow by looking up user by email and sending push notification to their registered device
 // @Tags CIBA Authentication
@@ -65,7 +76,7 @@ func (ctrl *CIBAAuthController) InitiateCIBAAuth(c *gin.Context) {
 	// Check if there was an error in response (user not found, no device, etc.)
 	if resp.Error != "" {
 		statusCode := http.StatusOK // RFC 8628 style - return 200 with error field
-		if resp.Error == models.CIBAErrorUserNotFound {
+		if resp.Error == models.CIBAErrorUserNotFound || resp.Error == models.CIBAErrorInvalidRequest {
 			statusCode = http.StatusBadRequest
 		}
 		c.JSON(statusCode, resp)
@@ -112,7 +123,7 @@ func (ctrl *CIBAAuthController) RespondToCIBA(c *gin.Context) {
 	}
 	responderUserID, _ := uuid.Parse(userIDStr)
 
-	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
 	responderWorkspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
 
 	// Respond to CIBA request
@@ -156,7 +167,7 @@ func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 	}
 
 	// Poll for token
-	resp, err := ctrl.cibaService.PollForToken(req.AuthReqID)
+	resp, err := ctrl.cibaService.PollForToken(req.AuthReqID, req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to poll token", "details": err.Error()})
 		return
@@ -169,6 +180,8 @@ func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 			statusCode = http.StatusForbidden
 		} else if resp.Error == models.CIBAErrorExpiredToken {
 			statusCode = http.StatusBadRequest
+		} else if resp.Error == models.CIBAErrorInvalidClient {
+			statusCode = http.StatusUnauthorized
 		}
 		c.JSON(statusCode, resp)
 		return
@@ -211,7 +224,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
@@ -269,7 +282,7 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
@@ -332,7 +345,7 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get workspace_id from token
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return

@@ -358,7 +358,7 @@ func (ctl *ExternalServiceController) DeleteExternalService(c *gin.Context) {
 
 // GetExternalServiceCredentials handles GET /authsec/services/:id/credentials.
 func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Context) {
-	tenantDB, clientID, _, err := ctl.resolveTenant(c)
+	tenantDB, clientID, workspaceID, err := ctl.resolveTenant(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -369,10 +369,15 @@ func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Conte
 	var svc *repositories.ExternalService
 
 	// SPIFFE JWT-SVID agents may access agent-accessible services directly,
-	// bypassing client ownership checks.
+	// bypassing client ownership checks, but only services created in the
+	// workspace whose trust bundle verified the SVID (AS-013).
 	authMethod, _ := c.Get("auth_method")
 	if authMethod == "spiffe-jwt-svid" {
-		svc, err = repo.GetByID(serviceID)
+		if svidWS := c.GetString("spiffe_workspace_id"); svidWS == "" || svidWS != workspaceID {
+			c.JSON(http.StatusNotFound, gin.H{"error": "service not found"})
+			return
+		}
+		svc, err = repo.GetByIDForWorkspace(serviceID, workspaceID)
 		if err != nil || !svc.AgentAccessible {
 			c.JSON(http.StatusNotFound, gin.H{"error": "service not found"})
 			return
@@ -407,67 +412,6 @@ func (ctl *ExternalServiceController) GetExternalServiceCredentials(c *gin.Conte
 		"credentials":  secrets,
 		"metadata":     gin.H{},
 		"retrieved_at": time.Now().Format(time.RFC3339),
-	})
-}
-
-// DebugExternalServiceAuth dumps JWT claims — useful for troubleshooting.
-func DebugExternalServiceAuth(c *gin.Context) {
-	claimsInterface, exists := c.Get("claims")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "No claims found"})
-		return
-	}
-
-	var claims map[string]interface{}
-	switch v := claimsInterface.(type) {
-	case map[string]interface{}:
-		claims = v
-	case jwt.MapClaims:
-		claims = map[string]interface{}(v)
-	default:
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid claims format", "type": fmt.Sprintf("%T", claimsInterface)})
-		return
-	}
-
-	roles, scopes, resources := []string{}, []string{}, []string{}
-	if rv, ok := claims["roles"].([]interface{}); ok {
-		for _, r := range rv {
-			if s, ok := r.(string); ok {
-				roles = append(roles, s)
-			}
-		}
-	}
-	if sv, ok := claims["scopes"].([]interface{}); ok {
-		for _, s := range sv {
-			if str, ok := s.(string); ok {
-				scopes = append(scopes, str)
-			}
-		}
-	}
-	if perms, ok := claims["perms"].(map[string]interface{}); ok {
-		if allow, ok := perms["allow"].([]interface{}); ok {
-			for _, p := range allow {
-				if s, ok := p.(string); ok {
-					scopes = append(scopes, s)
-				}
-			}
-		}
-	}
-	if rv, ok := claims["resources"].([]interface{}); ok {
-		for _, r := range rv {
-			if s, ok := r.(string); ok {
-				resources = append(resources, s)
-			}
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"claims":              claims,
-		"extracted_roles":     roles,
-		"extracted_scopes":    scopes,
-		"extracted_resources": resources,
-		"client_id":           claims["client_id"],
-		"workspace_id":        claims["workspace_id"],
 	})
 }
 

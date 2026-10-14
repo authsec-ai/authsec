@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/rsa"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/policy"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -85,7 +87,12 @@ func (ctrl *OAuthASController) evalPDP(ctx context.Context, req policy.PolicyReq
 		mode = config.AppConfig.PolicyEngineMode
 	}
 
-	decision, _ := ctrl.pdp.Decide(ctx, req)
+	decision, err := ctrl.pdp.Decide(ctx, req)
+	if err != nil && mode == "enforce" {
+		// Fail closed: policies that could not be read cannot be honoured.
+		log.Printf("[PDP] policy evaluation failed, denying: %v", err)
+		return true
+	}
 
 	// thin gates passed → gateEffect is always permit at this point
 	pdpAgrees := decision.Effect != policy.EffectDeny
@@ -129,12 +136,7 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 			return
 		}
 
-		requestHost := c.Request.Host
-		if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-			requestHost = strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-		}
-
-		if strings.EqualFold(requestHost, parsed.Host) {
+		if strings.EqualFold(requestHost(c), parsed.Host) {
 			c.Next()
 			return
 		}
@@ -145,16 +147,12 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 	}
 }
 
-// requestHost reads the effective Host this request arrived on, preferring
-// X-Forwarded-Host (set by the tunnel/proxy in front of local dev, or any
-// production load balancer) over the raw connection Host — the same
-// resolution CanonicalIssuerOnly uses, kept identical on purpose so the two
-// never disagree about what host a request came in on.
+// requestHost reads the effective Host this request arrived on: the
+// X-Forwarded-Host of a trusted proxy (TRUSTED_PROXIES), otherwise the
+// connection's Host (AS-064). CanonicalIssuerOnly uses the same resolution
+// so the two never disagree about what host a request came in on.
 func requestHost(c *gin.Context) string {
-	if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-		return strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-	}
-	return c.Request.Host
+	return middlewares.EffectiveHost(c)
 }
 
 // issuerBaseForRequest picks which base URL this request's OIDC metadata
@@ -919,6 +917,21 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
+	// Consent the user withdrew (or an admin revoked) ends the refresh chain
+	// even if Hydra still honours it (AS-068). A failed lookup refuses.
+	if subUUID, perr := uuid.Parse(sub); perr == nil {
+		withdrawn, cErr := ctrl.consentService.ConsentWithdrawn(rs.WorkspaceID, subUUID, oauthClient.ID, rs.ID)
+		if cErr != nil || withdrawn {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: consent withdrawn sub=%s rs=%s err=%v", sub, resourceParam, cErr)
+			revokeRefreshed("consent withdrawn")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "consent for this client has been revoked",
+			})
+			return
+		}
+	}
+
 	issuedScopes := strings.Fields(issuedScopeStr)
 	currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 		c.Request.Context(),
@@ -951,6 +964,11 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 
 	// All checks passed — return the refreshed token set.
 	log.Printf("[MCP_AUTH] tokenRefreshGrant: success client=%s resource=%s", oauthClient.ClientID, resourceParam)
+	// A client used only through refresh is in use (AS-037).
+	if dbErr := config.DB.Model(&models.MCPOAuthClient{}).Where("id = ?", oauthClient.ID).
+		Update("last_token_issued_at", time.Now()).Error; dbErr != nil {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: failed to stamp last_token_issued_at for client=%s: %v", oauthClient.ClientID, dbErr)
+	}
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
 
@@ -1056,9 +1074,10 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		return
 	}
 
-	// ── 6. PDP gate (shadow/enforce).
+	// ── 6. PDP gate (shadow/enforce). Policies of the resource server's
+	// workspace govern access to it (ADR-0001 §5.2).
 	if ctrl.evalPDP(ctx, policy.PolicyRequest{
-		WorkspaceID:      sa.WorkspaceID,
+		WorkspaceID:      rs.WorkspaceID,
 		ClientID:         client.ClientID,
 		SubjectType:      "service_account",
 		SubjectID:        sa.ID,
@@ -1095,21 +1114,28 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 	log.Printf("[M2M] tokenClientCredentialsGrant: issued jti=%s sa=%s client=%s rs=%s scopes=%q",
 		jti, sa.ID, client.ClientID, rs.ID, claims.Scope)
 
+	// The client is authenticated and its service account resolved: the
+	// follow-up writes run in that service account's workspace, under RLS.
+	saCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: sa.WorkspaceID})
+	sqlDB := config.GetDatabase().DB
+
 	// Best-effort: advance attested → token_issued in application_spiffe_identities
 	// for SPIFFE-backed service accounts.
 	if sa.SpiffeID != nil {
-		config.DB.WithContext(ctx).Exec(
-			`UPDATE application_spiffe_identities
-			    SET status = 'token_issued', last_token_issued_at = NOW()
-			  WHERE spiffe_id = ? AND status IN ('attested', 'token_issued')`,
-			*sa.SpiffeID,
-		)
+		if _, err := tenancy.ExecContext(saCtx, sqlDB, `
+			UPDATE application_spiffe_identities SET status = 'token_issued', last_token_issued_at = NOW()
+			 WHERE workspace_id = $1 AND spiffe_id = $2 AND status IN ('attested', 'token_issued')`,
+			*sa.SpiffeID); err != nil {
+			log.Printf("[M2M] tokenClientCredentialsGrant: spiffe identity status sa=%s: %v", sa.ID, err)
+		}
 	}
 
 	// Best-effort: record activity on the service account so Agent 360 can show
 	// "last seen" instead of NULL forever.
-	config.DB.WithContext(ctx).Exec(
-		`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, sa.ID)
+	if _, err := tenancy.ExecContext(saCtx, sqlDB,
+		`UPDATE service_accounts SET last_seen_at = NOW() WHERE workspace_id = $1 AND id = $2`, sa.ID); err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: last_seen_at sa=%s: %v", sa.ID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": tokenStr,
@@ -1570,6 +1596,32 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	// ── 1b. Authenticate the client. A body client_id alone proves nothing;
+	// without this, anyone holding a user's token could name its client and
+	// mint an ID-JAG for that user.
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	authClient, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil || authClient == nil {
+		log.Printf("[ISSUANCE] tokenExchangeGrant: client auth failed: %v", err)
+		desc := "client authentication failed"
+		if err != nil {
+			desc = err.Error()
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": desc,
+		})
+		return
+	}
+	if oauthClient != nil && oauthClient.ClientID != authClient.ClientID {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "client_id does not match the authenticated client",
+		})
+		return
+	}
+	oauthClient = authClient
+
 	// ── 2. requested_token_type check.
 	requestedType := c.PostForm("requested_token_type")
 	if requestedType != tokens.IDJAGTokenType {
@@ -1738,19 +1790,48 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	resource := c.PostForm("resource")
+
 	// ── 5. Issuance brokering gate (a2a_brokering_policies side='issuance').
-	// Explicit-deny-wins: any deny row for (workspace, client) blocks issuance.
-	// No matching row = permit (ownership of a valid subject_token is sufficient consent).
-	type brokeringRow struct{ Effect string }
-	var brokeringRows []brokeringRow
-	config.DB.WithContext(ctx).Raw(`
+	// Explicit-deny-wins: a deny row for (workspace, client) blocks issuance,
+	// whether it names no resource server or the one this ID-JAG targets.
+	// No matching row = permit (ownership of a valid subject_token is
+	// sufficient consent). A failed lookup refuses issuance (AS-074).
+	// The workspace is the verified subject_token's. No RLS transaction: the
+	// policy may name a resource server of another workspace (resource_uri is
+	// globally unique, AS-060), which a deny must still match.
+	subjectTenant := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: subject.WorkspaceID})
+	var brokeringEffects []string
+	brokeringRows, err := tenancy.QueryContext(subjectTenant, config.GetDatabase().DB, `
 		SELECT effect FROM a2a_brokering_policies
-		WHERE workspace_id = ? AND side = 'issuance'
-		  AND (client_id IS NULL OR client_id = ?)`,
-		subject.WorkspaceID, oauthClient.ClientID,
-	).Scan(&brokeringRows)
-	for _, br := range brokeringRows {
-		if br.Effect == "deny" {
+		WHERE workspace_id = $1 AND side = 'issuance'
+		  AND (client_id IS NULL OR client_id = $2)
+		  AND (resource_server_id IS NULL OR resource_server_id IN (
+		        SELECT id FROM resource_servers WHERE resource_uri = $3 AND $3 <> '')) -- TENANT-EXEMPT: resource_uri is globally unique (AS-060); the outer query is scoped by workspace_id`,
+		oauthClient.ClientID, resource)
+	if err == nil {
+		for brokeringRows.Next() {
+			var effect string
+			if err = brokeringRows.Scan(&effect); err != nil {
+				break
+			}
+			brokeringEffects = append(brokeringEffects, effect)
+		}
+		if err == nil {
+			err = brokeringRows.Err()
+		}
+		brokeringRows.Close()
+	}
+	if err != nil {
+		log.Printf("[MCP_AUTH] tokenExchange: brokering gate lookup failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":             "temporarily_unavailable",
+			"error_description": "could not evaluate brokering policy",
+		})
+		return
+	}
+	for _, effect := range brokeringEffects {
+		if effect == "deny" {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":             "access_denied",
 				"error_description": "ID-JAG issuance is not permitted for this client in this workspace",
@@ -1766,7 +1847,6 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	if targetIssuer == "" {
 		targetIssuer = selfIssuer
 	}
-	resource := c.PostForm("resource")
 	scope := strings.Join(strings.Fields(c.PostForm("scope")), " ")
 
 	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
@@ -2026,6 +2106,7 @@ func (ctrl *OAuthASController) RequesterBootstrap(c *gin.Context) {
 	requesterWorkspaces := map[uuid.UUID]bool{}
 	var saWs []uuid.UUID
 	config.DB.WithContext(ctx).
+		// TENANT-EXEMPT: resolves the workspaces the authenticated client backs; the workspace is the result, not an input.
 		Raw(`SELECT workspace_id FROM service_accounts WHERE oauth_client_id = ?`, client.ID).
 		Scan(&saWs)
 	for _, w := range saWs {
@@ -2556,17 +2637,30 @@ func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid strin
 		ext["act"] = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
 	}
 
-	// G9: resolve role_ids for the subject+RS binding.
-	var roleIDs []string
+	// G9: resolve role_ids for the subject+RS binding, in the token's
+	// workspace (the native_tokens row's), under RLS.
+	roleIDs := []string{}
 	roleIDCol := "user_id"
 	if authCtx.Principal.SubjectType == "service_account" {
 		roleIDCol = "service_account_id"
 	}
-	config.DB.WithContext(ctx).
-		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID).
-		Scan(&roleIDs)
-	if roleIDs == nil {
-		roleIDs = []string{}
+	principalCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: authCtx.Principal.WorkspaceID})
+	if err := tenancy.WithTx(principalCtx, config.GetDatabase().DB, authCtx.Principal.WorkspaceID, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(principalCtx, tx, "SELECT role_id::text FROM role_bindings WHERE workspace_id = $1 AND scope_type = 'resource_server' AND scope_id = $2 AND "+roleIDCol+" = $3 AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			roleIDs = append(roleIDs, id)
+		}
+		return rows.Err()
+	}); err != nil {
+		log.Printf("[MCP_AUTH] introspectNative: role_ids lookup failed rs=%s: %v", rs.ResourceURI, err)
 	}
 
 	resp := gin.H{
@@ -2795,16 +2889,6 @@ func (ctrl *OAuthASController) EndSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "logged_out"})
 }
 
-// PAR is temporarily disabled while AuthSec is still backed by stock Hydra, which
-// does not expose /oauth2/par in self-hosted mode. A later AuthSec-owned PAR
-// implementation will re-enable this endpoint without depending on Hydra PAR.
-func (ctrl *OAuthASController) PAR(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error":             "unsupported_request",
-		"error_description": "PAR is temporarily disabled; use /oauth/authorize directly",
-	})
-}
-
 // OAuthPolicyResult holds the validated policy state from validateOAuthPolicy.
 type OAuthPolicyResult struct {
 	Client      *models.MCPOAuthClient
@@ -2847,22 +2931,11 @@ func (ctrl *OAuthASController) inferAuthorizeResource(clientID string) (string, 
 		return resourceURI, nil
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceAmbiguous) {
-		// List available resource URIs to help the client developer.
-		var uris []string
-		var servers []models.ResourceServer
-		if dbErr := config.DB.Where("active = true").Select("resource_uri").Find(&servers).Error; dbErr == nil {
-			for _, s := range servers {
-				uris = append(uris, s.ResourceURI)
-			}
-		}
-		desc := "resource parameter required because client maps to multiple resource servers"
-		if len(uris) > 0 {
-			desc += ". Available: " + strings.Join(uris, ", ")
-		}
+		// The caller is unauthenticated: name no resource servers (AS-070).
 		return "", &policyError{
 			Status:      http.StatusBadRequest,
 			Code:        "invalid_request",
-			Description: desc,
+			Description: "resource parameter required because client maps to multiple resource servers",
 		}
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceUnavailable) {
@@ -3124,14 +3197,12 @@ func isExpiryOnlyError(err error) bool {
 
 // --- Helpers ---
 
+// isValidRedirectURI applies the same structural rule as the PUT/CIMD paths
+// (services.ValidateRedirectURIs): an absolute URL without a fragment, https,
+// or http only when the host is exactly a loopback name. A prefix match let
+// http://localhost.evil.com through (AS-096).
 func isValidRedirectURI(uri string) bool {
-	if strings.HasPrefix(uri, "https://") {
-		return true
-	}
-	if strings.HasPrefix(uri, "http://localhost") || strings.HasPrefix(uri, "http://127.0.0.1") {
-		return true
-	}
-	return false
+	return services.ValidateRedirectURIs([]string{uri}) == nil
 }
 
 func containsString(slice []string, s string) bool {
@@ -3283,9 +3354,14 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 	}
 
 	// RevokeConsentByTenant enforces tenant ownership — cross-tenant revocations are rejected.
-	if err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	// Tokens issued under the grant stop working too (AS-068).
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "consent_grant_revoked", "oauth_consent_grant",
@@ -3321,15 +3397,19 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 		return
 	}
 
-	_, userID, err := ctrl.requireAuthenticatedUserContext(c)
+	workspaceID, userID, err := ctrl.requireAuthenticatedUserContext(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := ctrl.consentService.RevokeConsentByUser(grantID, userID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByUser(grantID, userID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeUserConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})

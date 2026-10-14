@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -64,6 +65,13 @@ func DerefString(s *string) string {
 // sites that previously used ResolveWorkspaceIDFromToken (pointer signature preserved
 // for caller compatibility — they often dereference via *workspaceID).
 func ResolveWorkspaceIDFromTokenPtr(c *gin.Context) (*uuid.UUID, error) {
+	// The tenant context set by the auth middleware (ADR-0001 §4.2). The
+	// legacy context key below covers routes authenticated by other
+	// middlewares that do not set it yet.
+	if tc, err := tenancy.From(c); err == nil {
+		ws := tc.WorkspaceID
+		return &ws, nil
+	}
 	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		return nil, fmt.Errorf("Workspace ID not found in context")

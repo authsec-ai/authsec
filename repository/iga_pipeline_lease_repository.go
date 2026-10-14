@@ -1,12 +1,14 @@
 package repositories
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -109,12 +111,13 @@ type PipelineFence struct {
 	Holder      string
 }
 
-// holderClause adds the holder predicate when the fence names one.
-func (f PipelineFence) holderClause() (string, []any) {
+// holderClause adds the holder predicate when the fence names one, as
+// placeholder $n.
+func (f PipelineFence) holderClause(n int) (string, []any) {
 	if f.Holder == "" {
 		return "", nil
 	}
-	return " AND holder = ?", []any{f.Holder}
+	return fmt.Sprintf(" AND holder = $%d", n), []any{f.Holder}
 }
 
 type igaPipelineLeaseRepository struct{ db *gorm.DB }
@@ -131,7 +134,10 @@ func NewIGAPipelineLeaseRepository(db *gorm.DB) IGAPipelineLeaseRepository {
 func (r *igaPipelineLeaseRepository) AcquireForCollection(
 	ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time,
 ) (int64, error) {
-	var out []models.IGAPipelineLease
+	ctx, q, err := txTenant(r.db, ws)
+	if err != nil {
+		return 0, err
+	}
 	// INSERT ... ON CONFLICT so the first scan in a workspace does not need a
 	// separate row-creation step that could race with itself.
 	//
@@ -140,10 +146,11 @@ func (r *igaPipelineLeaseRepository) AcquireForCollection(
 	//   * collecting, EXPIRED, and for THIS run -- recovery of a dead
 	//     collector, staying in the same phase for the same run.
 	// An expired PROJECTING lease matches neither, which is the whole point.
-	err := r.db.Raw(`
+	var version int64
+	err = tenancy.QueryRowContext(ctx, q, `
 		INSERT INTO iga_pipeline_lease
 			(workspace_id, state, holder, scan_run_id, expires_at, version, updated_at)
-		VALUES (?, ?, ?, ?, ?, 1, ?)
+		VALUES ($1, $2, $3, $4, $5, 1, $6)
 		ON CONFLICT (workspace_id) DO UPDATE SET
 			state       = EXCLUDED.state,
 			holder      = EXCLUDED.holder,
@@ -151,23 +158,22 @@ func (r *igaPipelineLeaseRepository) AcquireForCollection(
 			expires_at  = EXCLUDED.expires_at,
 			version     = iga_pipeline_lease.version + 1,
 			updated_at  = EXCLUDED.updated_at
-		WHERE iga_pipeline_lease.state = ?
-		   OR (iga_pipeline_lease.state = ?
-		       AND iga_pipeline_lease.scan_run_id = ?
-		       AND iga_pipeline_lease.expires_at IS NOT NULL
-		       AND iga_pipeline_lease.expires_at <= ?)
-		RETURNING *`,
-		ws, models.PipelineCollecting, holder, runID, now.Add(lease), now,
-		models.PipelineIdle,
-		models.PipelineCollecting, runID, now,
-	).Scan(&out).Error
+		WHERE iga_pipeline_lease.workspace_id = $1
+		  AND (iga_pipeline_lease.state = $7
+		    OR (iga_pipeline_lease.state = $2
+		        AND iga_pipeline_lease.scan_run_id = $4
+		        AND iga_pipeline_lease.expires_at IS NOT NULL
+		        AND iga_pipeline_lease.expires_at <= $6))
+		RETURNING version`,
+		[]any{models.PipelineCollecting, holder, runID, now.Add(lease), now, models.PipelineIdle},
+		&version)
+	if errors.Is(err, tenancy.ErrNotFound) {
+		return 0, fmt.Errorf("%w: workspace=%s is busy", ErrPipelineLost, ws)
+	}
 	if err != nil {
 		return 0, err
 	}
-	if len(out) == 0 {
-		return 0, fmt.Errorf("%w: workspace=%s is busy", ErrPipelineLost, ws)
-	}
-	return out[0].Version, nil
+	return version, nil
 }
 
 // ToProjectingTx runs INSIDE the publish transaction. If publication rolls
@@ -177,28 +183,32 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 	tx *gorm.DB, ws uuid.UUID, scanHolder string, runID uuid.UUID, version int64,
 	jobID uuid.UUID, lease time.Duration,
 ) (int64, error) {
-	var out []models.IGAPipelineLease
-	err := tx.Raw(`
-		UPDATE iga_pipeline_lease SET
-			state      = ?,
-			holder     = ?,
-			expires_at = ?,
-			version    = version + 1,
-			updated_at = now()
-		 WHERE workspace_id = ? AND state = ? AND holder = ?
-		   AND scan_run_id = ? AND version = ?
-		RETURNING *`,
-		models.PipelineProjecting, models.PipelineJobHolder(jobID), time.Now().Add(lease),
-		ws, models.PipelineCollecting, scanHolder, runID, version,
-	).Scan(&out).Error
+	ctx, q, err := txTenant(tx, ws)
 	if err != nil {
 		return 0, err
 	}
-	if len(out) == 0 {
+	var next int64
+	err = tenancy.QueryRowContext(ctx, q, `
+		UPDATE iga_pipeline_lease SET
+			state      = $2,
+			holder     = $3,
+			expires_at = $4,
+			version    = version + 1,
+			updated_at = now()
+		 WHERE workspace_id = $1 AND state = $5 AND holder = $6
+		   AND scan_run_id = $7 AND version = $8
+		RETURNING version`,
+		[]any{models.PipelineProjecting, models.PipelineJobHolder(jobID), time.Now().Add(lease),
+			models.PipelineCollecting, scanHolder, runID, version},
+		&next)
+	if errors.Is(err, tenancy.ErrNotFound) {
 		return 0, fmt.Errorf("%w: workspace=%s not collecting run %s at version %d",
 			ErrPipelineLost, ws, runID, version)
 	}
-	return out[0].Version, nil
+	if err != nil {
+		return 0, err
+	}
+	return next, nil
 }
 
 // RenewHeld is the heartbeat for EITHER phase: it extends the expiry and
@@ -206,16 +216,22 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 func (r *igaPipelineLeaseRepository) RenewHeld(
 	f PipelineFence, lease time.Duration, now time.Time,
 ) error {
-	hc, hargs := f.holderClause()
-	args := append([]any{now.Add(lease), f.WorkspaceID, f.Phase, f.RunID, f.Version}, hargs...)
-	res := r.db.Exec(`
-		UPDATE iga_pipeline_lease SET expires_at = ?, updated_at = now()
-		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`+hc,
-		args...)
-	if res.Error != nil {
-		return res.Error
+	ctx, q, err := txTenant(r.db, f.WorkspaceID)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	hc, hargs := f.holderClause(6)
+	args := append([]any{now.Add(lease), f.Phase, f.RunID, f.Version}, hargs...)
+	res, err := tenancy.ExecContext(ctx, q, `
+		UPDATE iga_pipeline_lease SET expires_at = $2, updated_at = now()
+		 WHERE workspace_id = $1 AND state = $3 AND scan_run_id = $4 AND version = $5`+hc,
+		args...)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
 		return fmt.Errorf("%w: workspace=%s run=%s version=%d not in %s",
 			ErrPipelineLost, f.WorkspaceID, f.RunID, f.Version, f.Phase)
 	}
@@ -223,17 +239,21 @@ func (r *igaPipelineLeaseRepository) RenewHeld(
 }
 
 func (r *igaPipelineLeaseRepository) AssertHeldTx(tx *gorm.DB, f PipelineFence) error {
+	ctx, q, err := txTenant(tx, f.WorkspaceID)
+	if err != nil {
+		return err
+	}
 	var lease models.IGAPipelineLease
 	// FOR UPDATE, not a bare read: the lock is held for the transaction's
 	// life, so the barrier serializes projection per workspace and
 	// rev = max(rev)+1 in InsertPublication cannot race.
-	err := tx.Raw(`SELECT * FROM iga_pipeline_lease WHERE workspace_id = ? FOR UPDATE`,
-		f.WorkspaceID).Scan(&lease).Error
+	err = tenancy.QueryRowContext(ctx, q, `SELECT state, holder, scan_run_id, version FROM iga_pipeline_lease WHERE workspace_id = $1 FOR UPDATE`,
+		nil, &lease.State, &lease.Holder, &lease.ScanRunID, &lease.Version)
+	if errors.Is(err, tenancy.ErrNotFound) {
+		return fmt.Errorf("%w: workspace=%s has no barrier row", ErrPipelineLost, f.WorkspaceID)
+	}
 	if err != nil {
 		return err
-	}
-	if lease.WorkspaceID == uuid.Nil {
-		return fmt.Errorf("%w: workspace=%s has no barrier row", ErrPipelineLost, f.WorkspaceID)
 	}
 	if lease.State != f.Phase || lease.Version != f.Version ||
 		lease.ScanRunID == nil || *lease.ScanRunID != f.RunID ||
@@ -251,18 +271,24 @@ func (r *igaPipelineLeaseRepository) AssertHeldTx(tx *gorm.DB, f PipelineFence) 
 // iga_pipeline_lease_busy_chk requires an empty holder and a NULL scan_run_id
 // exactly when state='idle', so all three move together or the row is refused.
 func (r *igaPipelineLeaseRepository) ReleaseTx(tx *gorm.DB, f PipelineFence) error {
-	hc, hargs := f.holderClause()
-	args := append([]any{models.PipelineIdle, f.WorkspaceID, f.Phase, f.RunID, f.Version}, hargs...)
-	res := tx.Exec(`
-		UPDATE iga_pipeline_lease SET
-			state = ?, holder = '', scan_run_id = NULL, expires_at = NULL,
-			version = version + 1, updated_at = now()
-		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`+hc,
-		args...)
-	if res.Error != nil {
-		return res.Error
+	ctx, q, err := txTenant(tx, f.WorkspaceID)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	hc, hargs := f.holderClause(6)
+	args := append([]any{models.PipelineIdle, f.Phase, f.RunID, f.Version}, hargs...)
+	res, err := tenancy.ExecContext(ctx, q, `
+		UPDATE iga_pipeline_lease SET
+			state = $2, holder = '', scan_run_id = NULL, expires_at = NULL,
+			version = version + 1, updated_at = now()
+		 WHERE workspace_id = $1 AND state = $3 AND scan_run_id = $4 AND version = $5`+hc,
+		args...)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
 		return fmt.Errorf("%w: workspace=%s run=%s version=%d not in %s",
 			ErrPipelineLost, f.WorkspaceID, f.RunID, f.Version, f.Phase)
 	}
@@ -280,34 +306,40 @@ func (r *igaPipelineLeaseRepository) AbandonTx(
 	tx *gorm.DB, f PipelineFence, reason string,
 ) error {
 	ws, runID, version := f.WorkspaceID, f.RunID, f.Version
-	if err := tx.Exec(`
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return err
+	}
+	if _, err := tenancy.ExecContext(ctx, q, `
 		UPDATE cloud_scan_run
-		   SET status = ?, lease_owner = '', lease_expires_at = NULL,
-		       last_error = ?, updated_at = now()
-		 WHERE workspace_id = ? AND id = ? AND status IN (?, ?)`,
+		   SET status = $2, lease_owner = '', lease_expires_at = NULL,
+		       last_error = $3, updated_at = now()
+		 WHERE workspace_id = $1 AND id = $4 AND status IN ($5, $6)`,
 		models.CloudScanRunAbandoned, truncateError(reason),
-		ws, runID, models.CloudScanRunQueued, models.CloudScanRunRunning).Error; err != nil {
+		runID, models.CloudScanRunQueued, models.CloudScanRunRunning); err != nil {
 		return err
 	}
-	if err := tx.Exec(`
+	if _, err := tenancy.ExecContext(ctx, q, `
 		UPDATE iga_projection_job
-		   SET status = ?, lease_owner = '', lease_expires_at = NULL,
-		       last_error = ?, completed_at = now()
-		 WHERE workspace_id = ? AND scan_run_id = ? AND status IN (?, ?)`,
+		   SET status = $2, lease_owner = '', lease_expires_at = NULL,
+		       last_error = $3, completed_at = now()
+		 WHERE workspace_id = $1 AND scan_run_id = $4 AND status IN ($5, $6)`,
 		models.ProjectionAbandoned, truncateError(reason),
-		ws, runID, models.ProjectionQueued, models.ProjectionRunning).Error; err != nil {
+		runID, models.ProjectionQueued, models.ProjectionRunning); err != nil {
 		return err
 	}
-	res := tx.Exec(`
+	res, err := tenancy.ExecContext(ctx, q, `
 		UPDATE iga_pipeline_lease SET
-			state = ?, holder = '', scan_run_id = NULL, expires_at = NULL,
+			state = $2, holder = '', scan_run_id = NULL, expires_at = NULL,
 			version = version + 1, updated_at = now()
-		 WHERE workspace_id = ? AND version = ?`,
-		models.PipelineIdle, ws, version)
-	if res.Error != nil {
-		return res.Error
+		 WHERE workspace_id = $1 AND version = $3`,
+		models.PipelineIdle, version)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
 		return fmt.Errorf("%w: workspace=%s version=%d", ErrPipelineLost, ws, version)
 	}
 	return nil
@@ -323,6 +355,7 @@ func (r *igaPipelineLeaseRepository) ExpiredCandidates(
 		limit = 50
 	}
 	var out []models.IGAPipelineLease
+	// TENANT-EXEMPT: the recovery loop lists every workspace's expired barriers; each row names its workspace, and recovery acts on that workspace alone.
 	err := r.db.Raw(`
 		SELECT * FROM iga_pipeline_lease
 		 WHERE state <> ? AND expires_at IS NOT NULL AND expires_at <= ?

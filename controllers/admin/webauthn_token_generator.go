@@ -1,11 +1,13 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/database"
 	"github.com/google/uuid"
 )
 
@@ -40,7 +42,7 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, workspaceID st
 	}
 
 	// Look up user by email, scoped to the workspace
-	user, err := uc.userRepo.GetUserByEmailAndTenant(email, tenant.WorkspaceID)
+	user, err := uc.userRepo.GetUserByEmailAndTenant(database.WithWorkspace(context.Background(), tenant.WorkspaceID), email)
 	if err != nil {
 		log.Printf("[WebAuthnBridge] User not found for email=%s: %v", email, err)
 		return "", "", fmt.Errorf("user not found: %w", err)

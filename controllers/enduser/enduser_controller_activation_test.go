@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -51,9 +51,9 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	// Authenticated caller in the same workspace (handler derives/validates
-	// workspace from the JWT user_info, not from the body).
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
+	// Authenticated caller in the same workspace: the handler takes the
+	// workspace from the tenant context AuthMiddleware sets, not the body.
+	tenancy.Set(c, tenancy.Context{WorkspaceID: workspaceID})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -105,7 +105,7 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
 	setTokenClaimsInContext(c, workspaceID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
+	tenancy.Set(c, tenancy.Context{WorkspaceID: workspaceID})
 
 	controller.DeleteEndUser(c)
 
@@ -156,9 +156,9 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	// Authenticated caller in the same workspace (handler derives/validates
-	// workspace from the JWT user_info, not from the body).
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
+	// Authenticated caller in the same workspace: the handler takes the
+	// workspace from the tenant context AuthMiddleware sets, not the body.
+	tenancy.Set(c, tenancy.Context{WorkspaceID: workspaceID})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -200,9 +200,9 @@ func TestActiveOrDeactiveEndUser_BlocksLastActive(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	// Authenticated caller in the same workspace (handler derives/validates
-	// workspace from the JWT user_info, not from the body).
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
+	// Authenticated caller in the same workspace: the handler takes the
+	// workspace from the tenant context AuthMiddleware sets, not the body.
+	tenancy.Set(c, tenancy.Context{WorkspaceID: workspaceID})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -237,7 +237,7 @@ func TestDeleteEndUser_BlocksLastActive(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
 	setTokenClaimsInContext(c, workspaceID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
+	tenancy.Set(c, tenancy.Context{WorkspaceID: workspaceID})
 
 	controller.DeleteEndUser(c)
 
@@ -320,12 +320,27 @@ func TestActiveOrDeactiveEndUser_CrossWorkspaceDenied(t *testing.T) {
 
 	callerWorkspace := uuid.New()
 	targetWorkspace := uuid.New() // different workspace supplied in the body
+	targetUser := uuid.New()
 
-	active := true
+	db := setupTenantTestDB(t, targetWorkspace, targetUser, true)
+	overrideTenantConnection(t, db)
+	overrideTimeNow(t)
+	overrideConfigDB(t, db)
+	// The caller's workspace has another active user, so the last-active
+	// guard does not answer first.
+	if err := db.Table("users").Create(map[string]interface{}{
+		"id":           uuid.New().String(),
+		"workspace_id": callerWorkspace.String(),
+		"active":       true,
+		"updated_at":   time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("failed to insert caller-workspace user: %v", err)
+	}
+
 	payload := map[string]interface{}{
 		"workspace_id": targetWorkspace.String(),
-		"user_id":      uuid.New().String(),
-		"active":       active,
+		"user_id":      targetUser.String(),
+		"active":       false,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -334,12 +349,17 @@ func TestActiveOrDeactiveEndUser_CrossWorkspaceDenied(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Authenticated in callerWorkspace, but the body targets targetWorkspace.
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: callerWorkspace.String()})
+	tenancy.Set(c, tenancy.Context{WorkspaceID: callerWorkspace})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
-	assert.Equal(t, http.StatusForbidden, w.Code)
-	var response map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &response)
-	assert.Equal(t, "cross-workspace operation is not allowed", response["error"])
+	// The body's workspace is ignored; the target user does not exist in the
+	// caller's workspace, so it is not found (ADR-0001: 404, not 403).
+	assert.Equal(t, http.StatusNotFound, w.Code)
+
+	var active bool
+	if err := db.Table("users").Where("id = ?", targetUser.String()).Pluck("active", &active).Error; err != nil {
+		t.Fatalf("failed to fetch user row: %v", err)
+	}
+	assert.True(t, active, "another workspace's user must not be changed")
 }

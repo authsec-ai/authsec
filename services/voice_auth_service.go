@@ -1,12 +1,14 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -37,31 +39,11 @@ func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthSer
 	}
 }
 
-// tenantMapping is retired (Phase B). It used to resolve workspace from the
-// legacy `clients` table via client_id, which is wrong under OAuth 2.1 (no
-// general client_id → workspace mapping) and the table no longer exists.
-// Voice auth must be reworked to carry workspace_id explicitly (host header /
-// JWT / resource indicator). Until then this returns a clean error instead of
-// a 500 on a missing relation. Tracked in RESIDUAL_AGENTS_WORK.md.
-func (s *VoiceAuthService) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	_ = clientID
-	return uuid.Nil, fmt.Errorf("legacy client_id→workspace lookup removed (Phase B); voice auth must pass workspace_id explicitly")
-}
-
 // InitiateVoiceAuth creates a new voice authentication session
-func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (*models.VoiceInitiateResponse, error) {
-	// Parse and validate client_id
-	clientID, err := uuid.Parse(req.ClientID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid client_id format")
-	}
-
-	// Look up workspace_id from tenant_mappings table using client_id
-	workspaceID, err := s.tenantMapping(clientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve tenant from client_id: %w", err)
-	}
-
+// The caller is the voice assistant's backend, authenticated as an OAuth
+// client of workspaceID (see the controller); only that client can verify or
+// redeem the session it starts.
+func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest, workspaceID, clientID uuid.UUID) (*models.VoiceInitiateResponse, error) {
 	// Voice platform is optional and accepts any string (alexa, google, siri, web, custom, etc.)
 	// No validation needed - store as-is for flexibility
 
@@ -116,9 +98,12 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 }
 
 // VerifyVoiceOTP verifies the voice OTP and returns device code or token
-func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*models.VoiceVerifyResponse, error) {
-	// Find voice session
+func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest, clientID uuid.UUID) (*models.VoiceVerifyResponse, error) {
+	// Find voice session; another client's session is as good as unknown.
 	session, err := s.voiceRepo.FindVoiceSessionByToken(req.SessionToken)
+	if err == nil && (session.ClientID == nil || *session.ClientID != clientID) {
+		err = fmt.Errorf("session belongs to another client")
+	}
 	if err != nil {
 		return &models.VoiceVerifyResponse{
 			Success: false,
@@ -126,10 +111,12 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 			Message: "Invalid session token",
 		}, nil
 	}
+	// The session's own workspace scopes every later statement on it.
+	sctx := database.WithWorkspace(context.Background(), session.WorkspaceID)
 
 	// Check if expired
 	if session.IsExpired() {
-		s.voiceRepo.UpdateVoiceSessionStatus(req.SessionToken, "expired")
+		s.voiceRepo.UpdateVoiceSessionStatus(sctx, req.SessionToken, "expired")
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "expired",
@@ -148,7 +135,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 
 	// Check OTP attempts
 	if !session.CanRetryOTP() {
-		s.voiceRepo.UpdateVoiceSessionStatus(req.SessionToken, "failed")
+		s.voiceRepo.UpdateVoiceSessionStatus(sctx, req.SessionToken, "failed")
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "failed",
@@ -158,7 +145,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 
 	// Verify OTP
 	if session.VoiceOTP != req.VoiceOTP {
-		s.voiceRepo.IncrementOTPAttempts(req.SessionToken)
+		s.voiceRepo.IncrementOTPAttempts(sctx, req.SessionToken)
 		return &models.VoiceVerifyResponse{
 			Success: false,
 			Status:  "initiated",
@@ -172,10 +159,10 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 		link, err := s.voiceRepo.FindVoiceIdentityLink(session.WorkspaceID, session.VoicePlatform, session.VoiceUserID)
 		if err == nil && link.IsActive {
 			// User is pre-linked - can issue token directly
-			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(link.ID)
+			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(sctx, link.ID)
 
 			// Get user from repository
-			user, err := s.userRepo.GetUserByID(link.UserID)
+			user, err := s.userRepo.GetUserByID(sctx, link.UserID)
 			if err != nil {
 				return &models.VoiceVerifyResponse{
 					Success: false,
@@ -212,7 +199,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 			}
 
 			// Mark session as verified
-			s.voiceRepo.VerifyVoiceSession(req.SessionToken, &link.UserID, link.UserEmail)
+			s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, &link.UserID, link.UserEmail)
 
 			return &models.VoiceVerifyResponse{
 				Success:     true,
@@ -260,10 +247,10 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 	}
 
 	// Link device code to voice session
-	s.voiceRepo.LinkDeviceCode(req.SessionToken, deviceResp.DeviceCode)
+	s.voiceRepo.LinkDeviceCode(sctx, req.SessionToken, deviceResp.DeviceCode)
 
 	// Mark session as verified
-	s.voiceRepo.VerifyVoiceSession(req.SessionToken, nil, "")
+	s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, nil, "")
 
 	return &models.VoiceVerifyResponse{
 		Success:         true,
@@ -277,9 +264,12 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 
 // AuthenticateWithCredentials authenticates user with email/password via voice
 // WARNING: Less secure - credentials spoken aloud
-func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenRequest) (*models.VoiceTokenResponse, error) {
-	// Find voice session
+func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenRequest, clientID uuid.UUID) (*models.VoiceTokenResponse, error) {
+	// Find voice session; another client's session is as good as unknown.
 	session, err := s.voiceRepo.FindVoiceSessionByToken(req.SessionToken)
+	if err == nil && (session.ClientID == nil || *session.ClientID != clientID) {
+		err = fmt.Errorf("session belongs to another client")
+	}
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_request",
@@ -295,17 +285,10 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 		}, nil
 	}
 
-	// Validate tenant
-	tenant, err := s.workspaceRepo.GetWorkspaceByDomain(req.WorkspaceDomain)
-	if err != nil {
-		return &models.VoiceTokenResponse{
-			Error:            "invalid_request",
-			ErrorDescription: "Tenant not found",
-		}, nil
-	}
-
-	// Find user by email and tenant
-	user, err := s.userRepo.GetUserByEmailAndTenant(req.Email, tenant.ID)
+	// The user must belong to the session's workspace, which came from the
+	// authenticated voice client, not from the request.
+	sctx := database.WithWorkspace(context.Background(), session.WorkspaceID)
+	user, err := s.userRepo.GetUserByEmailAndTenant(sctx, req.Email)
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",
@@ -318,6 +301,14 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_grant",
 			ErrorDescription: "Invalid credentials",
+		}, nil
+	}
+
+	tenant, err := s.workspaceRepo.GetWorkspaceByID(session.WorkspaceID.String())
+	if err != nil {
+		return &models.VoiceTokenResponse{
+			Error:            "invalid_request",
+			ErrorDescription: "Workspace not found",
 		}, nil
 	}
 
@@ -338,7 +329,7 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 	}
 
 	// Mark session as verified
-	s.voiceRepo.VerifyVoiceSession(req.SessionToken, &user.ID, user.Email)
+	s.voiceRepo.VerifyVoiceSession(sctx, req.SessionToken, &user.ID, user.Email)
 
 	return &models.VoiceTokenResponse{
 		AccessToken: token,
@@ -453,7 +444,6 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 		"client_id":      user.ClientID.String(),
 		"email":          user.Email,
 		"sub":            user.ID.String(),
-		"aud":            "authsec-api",
 		"iss":            "authsec-ai/auth-manager",
 		"iat":            now.Unix(),
 		"exp":            now.Add(24 * time.Hour).Unix(),
@@ -463,10 +453,9 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 		"device_info":    deviceInfo,
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	token.Header["kid"] = "default"
-
-	tokenString, err := token.SignedString([]byte(jwtSecret))
+	claims["jti"] = uuid.NewString() // revocable by id (AS-031)
+	// End-user class (AS-033): typ/aud and the class key come from sessiontoken.
+	tokenString, err := sessiontoken.SignWith(sessiontoken.Secrets{Default: jwtSecret, SDK: os.Getenv("JWT_SDK_SECRET")}, sessiontoken.EndUser, claims)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign token: %w", err)
 	}

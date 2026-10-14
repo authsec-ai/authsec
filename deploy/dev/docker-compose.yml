@@ -1,0 +1,67 @@
+# Local development stack for the AuthSec backend: Postgres, Ory Hydra and a
+# dev-mode Vault. Not for production. Start with `make dev-up` from the repo
+# root, then run the backend with `make run` (see deploy/dev/README.md).
+name: authsec-dev
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: authsec
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "authsec"]
+      interval: 2s
+      retries: 30
+
+  hydra-migrate:
+    image: oryd/hydra:v2.2.0
+    command: migrate sql -e --yes
+    environment:
+      DSN: postgres://postgres:postgres@postgres:5432/hydra?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  hydra:
+    image: oryd/hydra:v2.2.0
+    command: serve all --dev
+    environment:
+      DSN: postgres://postgres:postgres@postgres:5432/hydra?sslmode=disable
+      URLS_SELF_ISSUER: http://localhost:4444
+      URLS_LOGIN: http://localhost:7468/authsec/hmgr/login
+      URLS_CONSENT: http://localhost:7468/authsec/hmgr/consent
+      SECRETS_SYSTEM: local-dev-hydra-system-secret-change-me
+    ports:
+      - "127.0.0.1:4444:4444"
+      - "127.0.0.1:4445:4445"
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+
+  vault:
+    image: hashicorp/vault:1.15
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "127.0.0.1:8200:8200"
+
+  vault-init:
+    image: hashicorp/vault:1.15
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: dev-root
+    # The backend writes KV v2 secrets under the "kv" mount.
+    entrypoint: ["sh", "-c", "until vault status >/dev/null 2>&1; do sleep 1; done; vault secrets enable -path=kv kv-v2 || true"]
+    depends_on: [vault]
+
+volumes:
+  pgdata:

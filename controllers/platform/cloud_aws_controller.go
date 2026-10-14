@@ -893,6 +893,49 @@ func (ctl *CloudAWSController) ListWorkloads(c *gin.Context) {
 	})
 }
 
+// ListUsageSummary handles GET /authsec/discovery/aws/usage/summary.
+//
+// One row per identity: how many services it is reported against, and how many
+// of those it has never used. The inventory's "which identities have unused
+// access" question, answered where the rows already are.
+//
+// Separate from ListUsage rather than a mode of it, because it answers a
+// different question at a different grain. ListUsage is the per-identity drill
+// -down and stays paged; this is the whole-account aggregate and is NOT paged:
+// it returns one row per identity, so its size tracks the identity count (102
+// in the lab account) rather than the usage count (~9,500 there). Paging it
+// would reintroduce the client-side page walk this replaces, which is what
+// made the inventory report floors instead of totals.
+func (ctl *CloudAWSController) ListUsageSummary(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	rows, err := repositories.NewCloudWorkloadRepository(ctl.db).UsageSummary(workspaceID, connectorID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(), "identities": len(rows),
+			"note": "one row per identity that has ANY usage row; an identity absent " +
+				"here had none reported, which is not the same as having used " +
+				"everything. never_used counts services AWS reports were never " +
+				"accessed in its tracking window. Unpaged by design: the row count " +
+				"is the identity count, not the usage count.",
+		},
+	})
+}
+
 // ListUsage handles GET /authsec/discovery/aws/usage.
 //
 // Whether an identity actually exercised a service, as opposed to merely being
@@ -1057,6 +1100,14 @@ func mapAWSOnboardingError(err error) (int, gin.H) {
 	switch {
 	case errors.Is(err, repositories.ErrCloudConnectorNotFound):
 		return http.StatusNotFound, gin.H{"error": "connector not found"}
+
+	case errors.Is(err, services.ErrExternalIDUnreadable):
+		// AuthSec's own secrets store, not the caller's input: never a 400.
+		return http.StatusInternalServerError, gin.H{
+			"error":      err.Error(),
+			"error_code": services.ConnErrExternalIDUnreadable,
+			"fault":      "authsec",
+		}
 
 	case errors.Is(err, services.ErrExternalIDNotIssued):
 		return http.StatusBadRequest, gin.H{

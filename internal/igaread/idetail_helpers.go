@@ -227,8 +227,8 @@ type idetailSurfaces struct {
 // variables. The runs are those iga_projection_state names for exactly those
 // partitions (D-57), read in this snapshot, so the notes describe the runs
 // the object's rows came from. Per account and surface the newest such run
-// decides. reached and unsupported are not gaps; not_selected is reported
-// stale (D-58: nobody looked, earlier results are kept and marked stale). A
+// decides. reached, unsupported and not_selected are not gaps (see
+// idetailGapState: an unselected region is scope, not a collection gap). A
 // revoked account adds {account_id, surface: "*", state: "revoked"} (D-73,
 // D-89). Mandatory: dropping it would present an incomplete answer as
 // complete.
@@ -269,12 +269,13 @@ func idetailCoverage(q *Query, accts *Accounts, pairs string, pairArgs []any, wa
 				continue // a newer run already reported this surface
 			}
 			decided[k] = true
-			state := s.State
-			switch state {
-			case models.CloudCoverageReached, models.CloudCoverageUnsupported:
+			state, gap := idetailGapState(s.State)
+			// A deselected region keeps stale results: still a gap (D-58).
+			if s.State == models.CloudCoverageNotSelected && notSelectedIsGap(surface, conn.Deselected) {
+				state, gap = models.CloudCoverageStale, true
+			}
+			if !gap {
 				continue
-			case models.CloudCoverageNotSelected:
-				state = models.CloudCoverageStale
 			}
 			if affects := want.affects(surface); affects != "" {
 				notes = append(notes, CoverageNote{AccountID: conn.AccountID, Surface: surface, State: state, Affects: affects})
@@ -294,6 +295,28 @@ func idetailCoverage(q *Query, accts *Accounts, pairs string, pairArgs []any, wa
 		return notes[i].Surface < notes[j].Surface
 	})
 	return notes, nil
+}
+
+// idetailGapState is the state a surface is reported in on a detail route, and
+// whether it is a collection gap at all.
+//
+// reached and unsupported are not gaps (unsupported is ours to build, not the
+// customer's). not_selected is not a gap either, for the reason listsCoverage
+// gives: a region the customer did not select is SCOPE, and its "earlier
+// results kept and marked stale" (D-58) presupposes earlier results a never-
+// selected region does not have. Reporting it here made every identity of an
+// account that scans a subset of regions say "Discovery is incomplete ... some
+// workloads or principals may be missing" -- 16 compute:<region> notes, none
+// of which the customer could act on -- while every surface they chose was
+// fully reached. This route's note is deliberately not stale_reason, which
+// keeps the not_selected -> stale reading because there an unselected region
+// really does explain a row it stopped refreshing.
+func idetailGapState(state string) (string, bool) {
+	switch state {
+	case models.CloudCoverageReached, models.CloudCoverageUnsupported, models.CloudCoverageNotSelected:
+		return "", false
+	}
+	return state, true
 }
 
 func (w idetailSurfaces) affects(surface string) string {

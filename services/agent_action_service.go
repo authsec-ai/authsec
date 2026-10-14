@@ -240,10 +240,11 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	}, nil
 }
 
-// PollActionStatus checks the current status of an action request (agent polls this)
-func (s *AgentActionService) PollActionStatus(actionReqID string) (*models.AgentActionStatusResponse, error) {
+// PollActionStatus checks the current status of an action request (agent
+// polls this). Only a request of the caller's workspace is found.
+func (s *AgentActionService) PollActionStatus(workspaceID uuid.UUID, actionReqID string) (*models.AgentActionStatusResponse, error) {
 
-	req, err := s.actionRepo.GetActionRequestByID(actionReqID)
+	req, err := s.actionRepo.GetActionRequestByID(workspaceID, actionReqID)
 	if err != nil {
 		return &models.AgentActionStatusResponse{
 			Error:            "not_found",
@@ -251,10 +252,10 @@ func (s *AgentActionService) PollActionStatus(actionReqID string) (*models.Agent
 		}, nil
 	}
 
-	s.actionRepo.UpdateLastPolled(actionReqID)
+	s.actionRepo.UpdateLastPolled(req.WorkspaceID, actionReqID)
 
 	if req.Status == "pending" && req.IsExpired() {
-		s.actionRepo.UpdateActionRequestStatus(actionReqID, models.AgentActionExpired)
+		s.actionRepo.UpdateActionRequestStatus(req.WorkspaceID, actionReqID, models.AgentActionExpired)
 		s.writeAuditLog(req, models.AgentActionExpired, nil)
 
 		return &models.AgentActionStatusResponse{
@@ -324,7 +325,7 @@ func (s *AgentActionService) RespondToAction(
 	responderWorkspaceID uuid.UUID,
 ) (*models.AgentActionRespondResponse, error) {
 
-	req, err := s.actionRepo.GetActionRequestByID(actionReqID)
+	req, err := s.actionRepo.GetActionRequestByID(responderWorkspaceID, actionReqID)
 	if err != nil {
 		return &models.AgentActionRespondResponse{
 			Success: false,
@@ -363,7 +364,7 @@ func (s *AgentActionService) RespondToAction(
 		decision.Reason = reason
 	}
 
-	inserted, err := s.actionRepo.CreateDecision(decision)
+	inserted, err := s.actionRepo.CreateDecision(req.WorkspaceID, decision)
 	if err != nil {
 		return nil, fmt.Errorf("failed to record decision: %w", err)
 	}
@@ -376,7 +377,7 @@ func (s *AgentActionService) RespondToAction(
 	}
 
 	if !approved {
-		s.actionRepo.UpdateActionRequestStatus(actionReqID, models.AgentActionDenied)
+		s.actionRepo.UpdateActionRequestStatus(req.WorkspaceID, actionReqID, models.AgentActionDenied)
 		s.writeAuditLog(req, models.AgentActionDenied, []map[string]interface{}{
 			{"user_id": approverUserID.String(), "email": approverEmail, "decision": "denied", "reason": reason},
 		})
@@ -389,13 +390,13 @@ func (s *AgentActionService) RespondToAction(
 
 	// Count distinct approvers (not a blind increment) to prevent one user
 	// from counting multiple times toward the threshold.
-	received, required, err := s.actionRepo.CountDistinctApprovers(actionReqID)
+	received, required, err := s.actionRepo.CountDistinctApprovers(req.WorkspaceID, actionReqID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count approvals: %w", err)
 	}
 
 	if received >= required {
-		s.actionRepo.UpdateActionRequestStatus(actionReqID, models.AgentActionApproved)
+		s.actionRepo.UpdateActionRequestStatus(req.WorkspaceID, actionReqID, models.AgentActionApproved)
 		s.writeAuditLog(req, models.AgentActionApproved, []map[string]interface{}{
 			{"user_id": approverUserID.String(), "email": approverEmail, "decision": "approved"},
 		})

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -29,6 +30,26 @@ type CloudWorkloadRepository interface {
 
 	ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error)
 	ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error)
+
+	// UsageSummary counts, per identity, how many services it is reported
+	// against and how many of those it has never used.
+	//
+	// Exists because the inventory's question -- "which identities have unused
+	// access" -- is an aggregate, and answering it by shipping every usage row
+	// to the browser does not scale: the lab account alone holds ~9,500 rows
+	// across 102 identities, so the client's paged walk stopped at its cap and
+	// could only report floors. One GROUP BY answers it exactly, in one row per
+	// identity.
+	//
+	// Deliberately unpaged: the result is bounded by the identity count, not
+	// the usage count, which is the whole point. connectorID nil means every
+	// connector in the workspace.
+	//
+	// An identity with no usage rows is ABSENT from the result rather than
+	// present with zeroes. "AWS reported nothing for this identity" and "AWS
+	// reported it uses everything it has" are different findings, and the
+	// inventory renders them differently ("Not reported" vs "All N used").
+	UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error)
 
 	// CountsForConnector reports how many rows of each kind a connector holds,
 	// for the scan report.
@@ -66,8 +87,9 @@ type CloudWorkloadRepository interface {
 	CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (int64, error)
 
 	// ActivitySample is the connector's identities whose activity (cloud_usage)
-	// one scan reads: the first limit by ARN, byte order, and the total.
-	ActivitySample(workspaceID, connectorID uuid.UUID, limit int) ([]models.CloudIdentity, int64, error)
+	// one scan reads: at most limit, the prioritised ones first (T3.03), then
+	// the rest by ARN, byte order; and the total.
+	ActivitySample(workspaceID, connectorID uuid.UUID, limit int) ([]SampledIdentity, int64, error)
 
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
@@ -103,6 +125,69 @@ func NewCloudWorkloadRepository(db *gorm.DB) CloudWorkloadRepository {
 	return &cloudWorkloadRepository{db: db}
 }
 
+// read runs fn in one read-only transaction under row-level security for
+// ws, on the repository's handle (a savepoint when the handle is a caller's
+// transaction): every statement sees only ws's rows (AS-108).
+func (r *cloudWorkloadRepository) read(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
+// fenced is runFenced, and fencedTx runFencedTx, inside a transaction under
+// row-level security for ws.
+func (r *cloudWorkloadRepository) fenced(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, func(tx *gorm.DB) error { return runFenced(tx, r.fence, fn) }))
+}
+
+func (r *cloudWorkloadRepository) fencedTx(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, func(tx *gorm.DB) error { return runFencedTx(tx, r.fence, fn) }))
+}
+
+// The reads, each in one read-only workspace transaction.
+
+func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) (out []models.CloudWorkload, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, total, e = listWorkloads(tx, workspaceID, f); return e })
+	return out, total, err
+}
+
+func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) (out []models.CloudUsage, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, total, e = listUsage(tx, workspaceID, f); return e })
+	return out, total, err
+}
+
+func (r *cloudWorkloadRepository) UsageSummary(workspaceID uuid.UUID, connectorID *uuid.UUID) (out []CloudUsageSummaryRow, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, e = usageSummary(tx, workspaceID, connectorID); return e })
+	return out, err
+}
+
+func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (workloads, usage int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		workloads, usage, e = countsForConnector(tx, workspaceID, connectorID)
+		return e
+	})
+	return workloads, usage, err
+}
+
+func (r *cloudWorkloadRepository) RegionsForConnector(workspaceID, connectorID uuid.UUID) (out []string, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) { out, e = regionsForConnector(tx, workspaceID, connectorID); return e })
+	return out, err
+}
+
+func (r *cloudWorkloadRepository) CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (n int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		n, e = countWorkloads(tx, workspaceID, connectorID, runtimeKind, region)
+		return e
+	})
+	return n, err
+}
+
+func (r *cloudWorkloadRepository) ActivitySample(workspaceID, connectorID uuid.UUID, limit int) (out []SampledIdentity, total int64, err error) {
+	err = r.read(workspaceID, func(tx *gorm.DB) (e error) {
+		out, total, e = activitySample(tx, workspaceID, connectorID, limit)
+		return e
+	})
+	return out, total, err
+}
+
 func (r *cloudWorkloadRepository) Fenced(f ScanFence) CloudWorkloadRepository {
 	copy := *r
 	copy.fence = &f
@@ -123,7 +208,7 @@ func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*mode
 	proposed := w.ID
 	now := time.Now()
 
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(w.WorkspaceID, func(tx *gorm.DB) error {
 		if err := adoptBareIDRow(tx, w); err != nil {
 			return err
 		}
@@ -183,15 +268,20 @@ func adoptBareIDRow(tx *gorm.DB, w *models.CloudWorkload) error {
 	if bare == "" {
 		return nil
 	}
-	if err := tx.Exec(`DELETE FROM cloud_workload
-	                    WHERE workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ? AND native_id = ?
-	                      AND EXISTS (SELECT 1 FROM cloud_workload WHERE workspace_id = ? AND native_id = ?)`,
-		w.WorkspaceID, w.ConnectorID, w.RuntimeKind, w.Region, bare, w.WorkspaceID, w.NativeID).Error; err != nil {
+	ctx, q, err := txTenant(tx, w.WorkspaceID)
+	if err != nil {
 		return err
 	}
-	return tx.Exec(`UPDATE cloud_workload SET native_id = ?
-	                 WHERE workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ? AND native_id = ?`,
-		w.NativeID, w.WorkspaceID, w.ConnectorID, w.RuntimeKind, w.Region, bare).Error
+	if _, err := tenancy.ExecContext(ctx, q, `DELETE FROM cloud_workload
+	                    WHERE workspace_id = $1 AND connector_id = $2 AND runtime_kind = $3 AND region = $4 AND native_id = $5
+	                      AND EXISTS (SELECT 1 FROM cloud_workload WHERE workspace_id = $1 AND native_id = $6)`,
+		w.ConnectorID, w.RuntimeKind, w.Region, bare, w.NativeID); err != nil {
+		return err
+	}
+	_, err = tenancy.ExecContext(ctx, q, `UPDATE cloud_workload SET native_id = $2
+	                 WHERE workspace_id = $1 AND connector_id = $3 AND runtime_kind = $4 AND region = $5 AND native_id = $6`,
+		w.NativeID, w.ConnectorID, w.RuntimeKind, w.Region, bare)
+	return err
 }
 
 // legacyBareID is the bare id an earlier collector stored a row of this kind
@@ -274,7 +364,7 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	proposed := u.ID
 	now := time.Now()
 
-	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fenced(u.WorkspaceID, func(tx *gorm.DB) error {
 		return tx.Clauses(
 			clause.OnConflict{
 				Columns: []clause.Column{
@@ -304,8 +394,8 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	return u, u.ID == proposed, nil
 }
 
-func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error) {
-	q := r.db.Model(&models.CloudWorkload{}).Where("workspace_id = ?", workspaceID)
+func listWorkloads(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error) {
+	q := db.Model(&models.CloudWorkload{}).Where("workspace_id = ?", workspaceID)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -323,8 +413,8 @@ func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWo
 	return out, total, nil
 }
 
-func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
-	q := r.db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
+func listUsage(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
+	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -344,14 +434,48 @@ func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorklo
 	return out, total, nil
 }
 
-func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, error) {
+// CloudUsageSummaryRow is one identity's activity totals. See
+// CloudWorkloadRepository.UsageSummary.
+type CloudUsageSummaryRow struct {
+	IdentityID uuid.UUID `json:"identity_id"`
+	// Services is how many (identity, service) rows exist for this identity.
+	Services int64 `json:"services"`
+	// NeverUsed is how many of those carry a null last_used_at -- the service
+	// AWS reports was never accessed in its tracking window.
+	NeverUsed int64 `json:"never_used"`
+}
+
+// UsageSummary aggregates cloud_usage per identity. See the interface.
+//
+// Counted in Postgres with a FILTER clause rather than two queries or a scan in
+// Go: the never-used count is the actionable number on the page, and computing
+// it beside the total in one pass is both cheaper and immune to the two numbers
+// disagreeing because rows changed between reads.
+func usageSummary(db *gorm.DB, workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
+	q := db.Model(&models.CloudUsage{}).
+		Select("identity_id, count(*) AS services, count(*) FILTER (WHERE last_used_at IS NULL) AS never_used").
+		Where("workspace_id = ?", workspaceID)
+	if connectorID != nil {
+		q = q.Where("connector_id = ?", *connectorID)
+	}
+	out := []CloudUsageSummaryRow{}
+	// Ordered for a stable response, not because any caller depends on it: an
+	// unordered GROUP BY may come back differently on each call, which turns a
+	// diff of two captured responses into noise.
+	if err := q.Group("identity_id").Order("identity_id").Scan(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func countsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) (int64, int64, error) {
 	var workloads, usage int64
-	if err := r.db.Model(&models.CloudWorkload{}).
+	if err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
 		Count(&workloads).Error; err != nil {
 		return 0, 0, err
 	}
-	if err := r.db.Model(&models.CloudUsage{}).
+	if err := db.Model(&models.CloudUsage{}).
 		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
 		Count(&usage).Error; err != nil {
 		return 0, 0, err
@@ -359,9 +483,9 @@ func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uu
 	return workloads, usage, nil
 }
 
-func (r *cloudWorkloadRepository) RegionsForConnector(workspaceID, connectorID uuid.UUID) ([]string, error) {
+func regionsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) ([]string, error) {
 	var regions []string
-	err := r.db.Model(&models.CloudWorkload{}).
+	err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ? AND region <> ''", workspaceID, connectorID).
 		Distinct().Order("region").Pluck("region", &regions).Error
 	return regions, err
@@ -376,7 +500,7 @@ func (r *cloudWorkloadRepository) ReconcileGeneration(
 ) (int64, int64, error) {
 
 	var workloadsRemoved, usageRemoved int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
 		if res.Error != nil {
@@ -395,11 +519,11 @@ func (r *cloudWorkloadRepository) ReconcileGeneration(
 	return workloadsRemoved, usageRemoved, err
 }
 
-func (r *cloudWorkloadRepository) CountWorkloads(
+func countWorkloads(db *gorm.DB,
 	workspaceID, connectorID uuid.UUID, runtimeKind, region string,
 ) (int64, error) {
 	var n int64
-	err := r.db.Model(&models.CloudWorkload{}).
+	err := db.Model(&models.CloudWorkload{}).
 		Where("workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ?",
 			workspaceID, connectorID, runtimeKind, region).
 		Count(&n).Error
@@ -423,7 +547,7 @@ func (r *cloudWorkloadRepository) ReconcileWorkloads(
 		pairs = append(pairs, []interface{}{sc.RuntimeKind, sc.Region})
 	}
 	var removed int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?
 		                 AND (runtime_kind, region) IN ?`,
 			workspaceID, connectorID, generation, pairs).Delete(&models.CloudWorkload{})
@@ -439,7 +563,7 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, error) {
 	var removed int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
 		removed = res.RowsAffected
@@ -448,31 +572,109 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 	return removed, err
 }
 
+// SampledIdentity is one identity of the activity sample, and whether it was
+// taken ahead of byte order (T3.03).
+type SampledIdentity struct {
+	models.CloudIdentity `gorm:"embedded"`
+	// Prioritized: bound to a workload or under a live AuthSec control, so
+	// sampled before every identity that is neither.
+	Prioritized bool `gorm:"column:activity_prioritized"`
+}
+
 // ActivitySample returns the identities one scan reads Access Advisor for: at
-// most limit of the connector's identities, in BYTE order of their ARN
-// (native_id COLLATE "C", then id), and how many the connector holds.
+// most limit of the connector's identities, and how many the connector holds.
 //
-// Deterministic by ARN (D-86), so the sample a capped scan read is one a
-// reader can name: the scanner stamps the last ARN it read on the activity
-// coverage (SurfaceCoverage.CappedAfter), and an identity that sorts after it
-// was not sampled. "C" collation because it is Go's string order too, so that
-// comparison means the same thing in SQL and in code; the default collation
-// would order case and punctuation by locale.
-func (r *cloudWorkloadRepository) ActivitySample(
+// The order (SPEC-iga-phase3-policy.md §2.6, T3.03) is two tiers, each in
+// BYTE order of the ARN (native_id COLLATE "C", then id):
+//
+//  1. prioritised -- an identity the PUBLISHED GRAPH binds a workload to: a
+//     live (not ended) executes_as or task_execution_role relationship of
+//     iga_relationship whose target is the identity's graph row (matched by
+//     its source key, the ARN, and by RoleId when both record one) -- from
+//     ANY connector or source, so a runtime another connector or a
+//     Kubernetes sweep found counts; or, as the fallback where the graph has
+//     no such row yet (the first scan before any publication, a workload new
+//     in this run, a database without the graph schema), a workload of this
+//     connector that runs as it (cloud_workload.identity_id) or an ECS task
+//     definition naming it as its execution role; and an identity under a
+//     live AuthSec control (iga_gov_control in any state but removed:
+//     matched by RoleId, by ARN only when no RoleId is recorded);
+//  2. every other identity.
+//
+// The graph is the published one: the scan runs under the pipeline barrier,
+// so no projection is writing iga_relationship meanwhile (review P3:
+// "workload-bound" now means the graph's relationships, with the scan's own
+// rows kept as the fallback). The fallback's workloads are the scan's own:
+// the scanner reads activity after it has recorded this run's compute, so
+// they are this run's (and, for a surface that was not reached, the rows it
+// keeps). Over-prioritising costs nothing but order, so a workload row an
+// unreached surface keeps, or a graph relationship a later projection will
+// end, still counts.
+//
+// Deterministic (D-86) within each tier, so the sample a capped scan read is
+// one a reader can name: the scanner stamps the last ARN of tier 2 it read on
+// the activity coverage (SurfaceCoverage.CappedAfter) and the tier-1 ARNs it
+// read (SurfaceCoverage.Prioritized). With no workload and no control, tier 1
+// is empty and the sample is exactly the first limit by ARN, as before. "C"
+// collation because it is Go's string order too, so that comparison means the
+// same thing in SQL and in code; the default collation would order case and
+// punctuation by locale.
+func activitySample(db *gorm.DB,
 	workspaceID, connectorID uuid.UUID, limit int,
-) ([]models.CloudIdentity, int64, error) {
+) ([]SampledIdentity, int64, error) {
 	// Two independent statements, never one builder reused across a Count and
 	// a Find: GORM mutates a chained statement in place.
-	scoped := func() *gorm.DB {
-		return r.db.Model(&models.CloudIdentity{}).
-			Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID)
-	}
 	var total int64
-	if err := scoped().Count(&total).Error; err != nil {
+	if err := db.Model(&models.CloudIdentity{}).
+		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
+		Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	var out []models.CloudIdentity
-	if err := scoped().Order(`native_id COLLATE "C", id`).Limit(clampLimit(limit)).Find(&out).Error; err != nil {
+
+	// A live control can only exist where Phase 3's schema does (049). The
+	// scanner runs at any schema, so the control clause is added only when the
+	// table is there -- never a query that fails on an older database.
+	controlled := "false"
+	hasControls, err := HasRelation(db, "iga_gov_control")
+	if err != nil {
+		return nil, 0, err
+	}
+	if hasControls {
+		controlled = `EXISTS (SELECT 1 FROM iga_gov_control gc
+		                       WHERE gc.workspace_id = ci.workspace_id AND gc.connector_id = ci.connector_id
+		                         AND gc.state <> 'removed'
+		                         AND (gc.role_id = ci.attrs->>'unique_id'
+		                              OR (COALESCE(ci.attrs->>'unique_id', '') = '' AND gc.role_arn = ci.native_id)))`
+	}
+	// The graph's binding relationships, where the graph schema is there.
+	graphBound := "false"
+	hasGraph, err := HasRelation(db, "iga_relationship")
+	if err != nil {
+		return nil, 0, err
+	}
+	if hasGraph {
+		graphBound = `EXISTS (SELECT 1 FROM iga_relationship rel
+		                       JOIN iga_identity_accounts ia ON ia.workspace_id = rel.workspace_id AND ia.id = rel.target_identity_account_id
+		                      WHERE rel.workspace_id = ci.workspace_id AND rel.state <> 'ended'
+		                        AND rel.relationship_type IN ('` + models.RelTypeExecutesAs + `', '` + models.RelTypeTaskExecutionRole + `')
+		                        AND ia.provider = 'aws' AND ia.source_key = 'aws' || chr(31) || ci.native_id
+		                        AND (ia.immutable_key = '' OR COALESCE(ci.attrs->>'unique_id', '') = ''
+		                             OR ia.immutable_key = ci.attrs->>'unique_id'))`
+	}
+	var out []SampledIdentity
+	err = db.Raw(`SELECT ci.*, (
+	                         `+graphBound+` OR
+	                         EXISTS (SELECT 1 FROM cloud_workload w
+	                                  WHERE w.workspace_id = ci.workspace_id AND w.connector_id = ci.connector_id
+	                                    AND (w.identity_id = ci.id
+	                                         OR (w.runtime_kind = ? AND w.attrs->>'execution_role_arn' = ci.native_id)))
+	                         OR `+controlled+`) AS activity_prioritized
+	                  FROM cloud_identity ci
+	                 WHERE ci.workspace_id = ? AND ci.connector_id = ?
+	                 ORDER BY activity_prioritized DESC, ci.native_id COLLATE "C", ci.id
+	                 LIMIT ?`,
+		models.WorkloadECSTaskDefinition, workspaceID, connectorID, clampLimit(limit)).Scan(&out).Error
+	if err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil

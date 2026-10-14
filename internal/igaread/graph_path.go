@@ -60,7 +60,7 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/google/uuid"
+	"github.com/authsec-ai/authsec/models"
 )
 
 // Path outcomes (§5.4).
@@ -107,7 +107,7 @@ func (s *graphSide) exhausted() bool { return len(s.frontier) == 0 }
 
 // Path serves GET /graph/path. include_ended is not a parameter here: a path
 // is declared among current and stale edges (§5.4, D-12).
-func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "from", "to"); perr != nil {
 		return nil, perr
 	}
@@ -128,10 +128,12 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
-		if !q.Published() {
-			return NotFound()
-		}
+	err := g.r.Read(ctx, Pin{}, func(q *Query) error {
+		// D-4 is readRoot's (an AWS end needs a publication, a Kubernetes
+		// one does not). The two ends may be of different providers: the
+		// paths between them run through a crossing (traverse_cross.go,
+		// D-108), or there are none. rev pins the request when either end is
+		// AWS's, and is ignored when both are Kubernetes' (D-111).
 		t, err := newGraphTraversal(q, g.b, g.r.budget, false)
 		if err != nil {
 			return err
@@ -140,18 +142,31 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 		if err != nil {
 			return err
 		}
+		if src == nil || src.side() == models.ProviderAWS {
+			if err := graphRevCheck(q, rev); err != nil {
+				return err
+			}
+		}
+		if src == nil {
+			return NotFound()
+		}
 		dst, err := t.readRoot(to)
 		if err != nil {
 			return err
 		}
-		if src == nil || dst == nil {
+		if dst == nil || dst.side() == models.ProviderAWS {
+			if err := graphRevCheck(q, rev); err != nil {
+				return err
+			}
+		}
+		if dst == nil {
 			return NotFound()
 		}
 		data, err := t.pathVerdict(src, dst, g.b)
 		if err != nil {
 			return err
 		}
-		out = Envelope{Data: data, Meta: g.meta(q)}
+		out = Envelope{Data: data, Meta: g.meta(q, t)}
 		return nil
 	})
 	if err != nil {

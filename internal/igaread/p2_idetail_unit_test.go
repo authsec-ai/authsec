@@ -194,3 +194,30 @@ func TestIdetailExternalLifecycleOf(t *testing.T) {
 		t.Error("an external principal is active while any edge from it is current or stale, else retired")
 	}
 }
+
+// An unselected region is scope, not a collection gap: it must not put "Discovery
+// is incomplete" on an identity whose every selected surface was reached. The
+// other not-reached states remain gaps, and are reported as they were.
+func TestIdetailGapState(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		gap   bool
+	}{
+		{models.CloudCoverageReached, false},
+		{models.CloudCoverageUnsupported, false},
+		{models.CloudCoverageNotSelected, false},
+		{models.CloudCoveragePartial, true},
+		{models.CloudCoverageDenied, true},
+		{models.CloudCoverageThrottled, true},
+		{models.CloudCoverageUnknown, true},
+		{models.CloudCoverageStale, true},
+	} {
+		got, gap := idetailGapState(tc.state)
+		if gap != tc.gap {
+			t.Errorf("%s: gap = %v, want %v", tc.state, gap, tc.gap)
+		}
+		if gap && got != tc.state {
+			t.Errorf("%s: reported as %q, want it unchanged", tc.state, got)
+		}
+	}
+}

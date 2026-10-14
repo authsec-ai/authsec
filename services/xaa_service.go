@@ -163,11 +163,8 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 				return nil, fmt.Errorf("unsupported signing algorithm: %v", t.Header["alg"])
 			}
 			kid, _ := t.Header["kid"].(string)
-			if key, ok := keyMap[kid]; ok {
+			if key, ok := selectJWK(keyMap, kid); ok {
 				return key, nil
-			}
-			for _, k := range keyMap {
-				return k, nil
 			}
 			return nil, fmt.Errorf("kid not found in issuer JWKS")
 		}
@@ -175,7 +172,10 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 
 	// Step 4: full parse + verify.
 	leeway := time.Duration(issuer.ClockSkewSecs) * time.Second
-	parsed, err := jwt.Parse(assertion, keyFunc, jwt.WithValidMethods(allowedAlgs), jwt.WithLeeway(leeway))
+	// exp is required: the jti replay cache only holds an ID-JAG until it
+	// expires, so a token without one could be replayed forever (AS-066).
+	parsed, err := jwt.Parse(assertion, keyFunc, jwt.WithValidMethods(allowedAlgs), jwt.WithLeeway(leeway),
+		jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return nil, nil, fmt.Errorf("invalid_grant: ID-JAG signature/expiry invalid: %w", err)
 	}
@@ -239,6 +239,13 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 //   - CreateIdentity (one tx); freshly materialized user has zero role bindings.
 //   - If not found and JITProvisioning=false → returns ("", ErrNoLocalUser).
 func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer *models.TrustedIssuer, targetWorkspaceID uuid.UUID) (uuid.UUID, error) {
+	// A workspace-owned issuer vouches only for subjects of its own workspace;
+	// it must never resolve or provision users in another one. Platform issuers
+	// (WorkspaceID nil, including the self-issued provider) are unrestricted.
+	if issuer.WorkspaceID != nil && *issuer.WorkspaceID != targetWorkspaceID {
+		return uuid.Nil, fmt.Errorf("access_denied: issuer is not trusted for this resource's workspace")
+	}
+
 	// Apply subject_mapping transformation if configured (simple prefix-strip for now).
 	mappedSub := externalSub
 	if issuer.SubjectMapping != nil && *issuer.SubjectMapping != "" {
@@ -267,7 +274,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 	// user rooted elsewhere (cross-workspace stays the federated-guest path below).
 	if issuer.ProviderName == selfIssuedProviderName {
 		if subUUID, perr := uuid.Parse(mappedSub); perr == nil {
-			if existing, uerr := s.userRepo.GetUserByID(subUUID); uerr == nil && existing != nil && existing.WorkspaceID == targetWorkspaceID {
+			if existing, uerr := s.userRepo.GetUserByID(database.WithWorkspace(ctx, targetWorkspaceID), subUUID); uerr == nil && existing != nil && existing.WorkspaceID == targetWorkspaceID {
 				// Best-effort link row for audit/traceability (the real email, not a
 				// placeholder). A failure here is non-fatal — the user is already real.
 				now := time.Now().UTC()
@@ -297,7 +304,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 		Email: mappedSub + "@jit.local", // placeholder — real email not in ID-JAG
 		Name:  mappedSub,
 	}
-	user, err := s.userRepo.CreateOIDCEndUser(targetWorkspaceID, issuer.ProviderName, userInfo)
+	user, err := s.userRepo.CreateOIDCEndUser(database.WithWorkspace(ctx, targetWorkspaceID), issuer.ProviderName, userInfo)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("jit_provision: create user: %w", err)
 	}
@@ -326,6 +333,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 // ErrIDJAGReplayed, aborting the issuance transaction.
 func IDJAGReplayInsert(db *gorm.DB, iss, jti string, expiresAt time.Time) func(tx *gorm.DB) error {
 	return func(tx *gorm.DB) error {
+		// TENANT-EXEMPT: replay cache keyed by the assertion's (iss, jti), issuer-wide
 		res := tx.Exec(
 			`INSERT INTO id_jag_replay_cache (iss, jti, expires_at)
              VALUES (?, ?, ?)

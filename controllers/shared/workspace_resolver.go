@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -60,6 +61,7 @@ func WorkspaceFromHost(c *gin.Context) (uuid.UUID, error) {
 
 	// 1. Exact match on full hostname.
 	var id uuid.UUID
+	// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id, no RLS); this resolves the workspace of a pre-authentication request.
 	if err := db.QueryRow(
 		`SELECT id FROM workspaces WHERE LOWER(workspace_domain) = $1 LIMIT 1`,
 		host,
@@ -67,9 +69,12 @@ func WorkspaceFromHost(c *gin.Context) (uuid.UUID, error) {
 		return id, nil
 	}
 
-	// 2. Leftmost label as slug or as truncated workspace_domain.
-	if dot := strings.IndexByte(host, '.'); dot > 0 {
+	// 2. Leftmost label as slug or as truncated workspace_domain — only on a
+	// host the platform vouches for (CORS_ALLOW_ORIGIN, the UI/API hosts), so
+	// "<slug>.attacker.example" never selects a workspace (AS-064).
+	if dot := strings.IndexByte(host, '.'); dot > 0 && middlewares.HostAllowed(host) {
 		slug := host[:dot]
+		// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id, no RLS); this resolves the workspace of a pre-authentication request.
 		if err := db.QueryRow(
 			`SELECT id FROM workspaces WHERE LOWER(slug) = $1 OR LOWER(workspace_domain) = $1 LIMIT 1`,
 			slug,
@@ -95,6 +100,7 @@ func lookupWorkspaceRef(ref string) (uuid.UUID, error) {
 	// UUID form — validate existence.
 	if id, err := uuid.Parse(ref); err == nil {
 		var exists bool
+		// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id, no RLS); checks that a pre-authentication workspace reference exists.
 		if qErr := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id).Scan(&exists); qErr == nil && exists {
 			return id, nil
 		}
@@ -103,6 +109,7 @@ func lookupWorkspaceRef(ref string) (uuid.UUID, error) {
 	// Slug or workspace_domain form.
 	lower := strings.ToLower(ref)
 	var id uuid.UUID
+	// TENANT-EXEMPT: workspaces is the tenant registry (no workspace_id, no RLS); this resolves a pre-authentication workspace reference.
 	if err := db.QueryRow(
 		`SELECT id FROM workspaces WHERE LOWER(slug) = $1 OR LOWER(workspace_domain) = $1 LIMIT 1`,
 		lower,

@@ -61,18 +61,18 @@ const (
 const listsClassificationChanged = "classification_changed"
 
 // ListWorkloads serves GET /api/iga/v1/workloads (§5.3 Agents & workloads).
-func (r *Reader) ListWorkloads(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsWorkloads)
+func (r *Reader) ListWorkloads(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsWorkloads)
 }
 
 // ListIdentities serves GET /api/iga/v1/identities (§5.3 Identities).
-func (r *Reader) ListIdentities(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsIdentities)
+func (r *Reader) ListIdentities(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsIdentities)
 }
 
 // ListResources serves GET /api/iga/v1/resources (§5.3 Resources).
-func (r *Reader) ListResources(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return listsRun(ctx, r, ws, vals, &listsResources)
+func (r *Reader) ListResources(ctx context.Context, vals url.Values) (any, error) {
+	return listsRun(ctx, r, vals, &listsResources)
 }
 
 /* --------------------------------- engine ---------------------------------- */
@@ -182,7 +182,8 @@ type listsCursorKey struct {
 // listsRun is the whole §5.2 list contract for one route. Parameters (400)
 // are checked before the snapshot is opened (D-10); the revision (409) inside
 // it, by Read.
-func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values, spec *listsSpec[S]) (any, error) {
+func listsRun[S listsScan](ctx context.Context, r *Reader, vals url.Values, spec *listsSpec[S]) (any, error) {
+	ws := workspaceIn(ctx)
 	p, perr := ParseListParams(vals, spec.sorts, spec.defSort, spec.facetNames())
 	if perr != nil {
 		return nil, perr
@@ -221,7 +222,7 @@ func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals ur
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		meta := NewListMeta(q, p.Limit)
 		if !q.Published() {
 			// A distinct first-run state, never "no results" (§5.1).
@@ -816,8 +817,10 @@ func listsRegionFacet(counts map[string]int64, _ *Accounts) []FacetValue {
 // this list's objects and are left out. Per account and surface, the newest
 // such run that reports the surface decides its state. Every state but
 // reached is a gap, except unsupported (ours to build, not the customer's
-// estate); not_selected is reported as stale -- nobody looked, earlier results
-// are kept and marked stale (D-58, §2.14.13).
+// estate). not_selected is NOT a gap either: a region the customer did not
+// select is scope, and reporting it would make every subset-of-regions account
+// read as incomplete forever (this deliberately departs from D-58/§2.14.13's
+// "reported as stale" for THIS list -- see the switch below).
 //
 // Which surfaces bear on which list is listsAffects (D-73's table), narrowed
 // by the request's account, region and kind filters as the route's filters
@@ -864,9 +867,28 @@ func listsCoverage(q *Query, accts *Accounts, list string, sc listsScope) ([]Cov
 			decided[k] = true
 			state := s.State
 			switch state {
+			// not_selected joins reached and unsupported as "not a gap".
+			//
+			// It used to be rewritten to stale, per D-58/§2.14.13's "nobody
+			// looked, earlier results are kept and marked stale". That reading
+			// presupposes earlier results: a region the customer never selected
+			// has none, so the note described an absence of data that was never
+			// expected to exist. In practice an account scanning a subset of
+			// regions reported ~16 compute:<region> gaps it could do nothing
+			// about, and the estate banner said discovery was incomplete when
+			// the only thing "incomplete" was the customer's own chosen scope.
+			//
+			// A region not selected is scope, not a collection gap. The region
+			// selection itself is already visible on the connector, which is
+			// where someone who wants more regions goes.
 			case models.CloudCoverageReached, models.CloudCoverageUnsupported:
 				continue
 			case models.CloudCoverageNotSelected:
+				// Except a region selected before and since deselected: its
+				// earlier results are kept and stale, so it stays a stale gap.
+				if !notSelectedIsGap(surface, conn.Deselected) {
+					continue
+				}
 				state = models.CloudCoverageStale
 			}
 			if affects := listsAffects(list, surface, sc); affects != "" {

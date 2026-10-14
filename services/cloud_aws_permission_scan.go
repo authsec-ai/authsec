@@ -67,6 +67,15 @@ type AWSPermissionScanner struct {
 	// evidence records why each permission and resource row exists. Nil writes
 	// nothing.
 	evidence *ObservationWriter
+
+	// Phase 3 resource-policy collection (T3.03b,
+	// cloud_aws_resource_policy_collection.go): 056's writer, and the test
+	// seams that replace the per-region clients, the region listing and the
+	// collector's pacing.
+	rpRepo        repositories.CloudResourcePolicyRepository
+	rpClients     awsdiscovery.ResourcePolicyClientsFunc
+	regionsAPI    awsdiscovery.RegionsAPI
+	collectorOpts *awsdiscovery.CollectorOptions
 }
 
 // WithEvidence attaches an observation writer for this run.
@@ -80,6 +89,7 @@ func (s *AWSPermissionScanner) WithEvidence(w *ObservationWriter) *AWSPermission
 func (s *AWSPermissionScanner) WithFence(f repositories.ScanFence) *AWSPermissionScanner {
 	s.grants = s.grants.Fenced(f)
 	s.policies = s.policies.Fenced(f)
+	s.rpRepo = s.rpRepo.Fenced(f)
 	return s
 }
 
@@ -90,6 +100,7 @@ func NewAWSPermissionScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWS
 		identities: repositories.NewCloudIdentityRepository(db),
 		grants:     repositories.NewCloudPermissionRepository(db),
 		policies:   repositories.NewCloudPolicyRepository(db),
+		rpRepo:     repositories.NewCloudResourcePolicyRepository(db),
 		onboarding: onboarding,
 	}
 }
@@ -440,27 +451,10 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 	for _, region := range regions {
 		reader, err := s.eksReaderFor(ctx, workspaceID, snapshot.ConnectorID, region)
 		if err != nil {
-			failures.addListing(err, "")
+			failures.addListing(err)
 			continue
 		}
 		clusters, err := reader.Clusters(ctx)
-		if errors.Is(err, awsdiscovery.ErrServiceNotInRegion) && len(clusters) == 0 {
-			// T3.8: EKS is not offered in this region -- nothing there to
-			// read, and nothing there claimed, so the region is skipped and
-			// costs the rest of the surface nothing (a region that listed
-			// clusters before failing is no such region, and falls through
-			// as the listing failure it is). Unless an earlier scan recorded
-			// a binding that may come from here: then a resolver failure is
-			// the likelier story, and it is reported as the failure it may be
-			// (the same guard regionalCoverage applies to compute). A
-			// connector whose every region is skipped this way holds no
-			// binding at all, so reached -- no binding in any selected
-			// region -- deletes nothing.
-			if why, blocks := s.podIdentityRegionUnread(workspaceID, snapshot.ConnectorID, region); blocks {
-				failures.addListing(err, why)
-			}
-			continue
-		}
 		failures.addClusters(err)
 		for _, cluster := range clusters {
 			assocs, err := reader.PodIdentityAssociations(ctx, cluster.Name)
@@ -477,26 +471,6 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		}
 	}
 	return failures.err()
-}
-
-// podIdentityRegionUnread decides whether a region whose EKS endpoint does not
-// resolve still blocks eks_pod_identity: yes when an earlier scan recorded a
-// binding that may come from it (or that cannot be checked), with the reason
-// to append to the failure; no when none ever did -- EKS is simply not
-// offered there. Never claim more than the data proves.
-func (s *AWSPermissionScanner) podIdentityRegionUnread(
-	workspaceID, connectorID uuid.UUID, region string,
-) (string, bool) {
-	prior, err := s.grants.CountPodIdentityEdges(workspaceID, connectorID, region)
-	switch {
-	case err != nil:
-		return fmt.Sprintf(" (and whether an earlier scan recorded pod identity bindings in %s could not be checked: %v)",
-			region, err), true
-	case prior > 0:
-		return fmt.Sprintf(", but %d pod identity binding(s) an earlier scan recorded may come from %s; not treated as not offered",
-			prior, region), true
-	}
-	return "", false
 }
 
 // unreadPodIdentityEdges lists this connector's Pod Identity edges that this

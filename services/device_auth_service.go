@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -148,7 +149,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 		// Try end-user table first, then fall back to using JWT claims directly.
 		// Admin users (who authenticated via SSO) are not in the end-user 'users' table,
 		// but we already have their identity from the JWT — no lookup needed.
-		user, uErr := s.userRepo.GetUserByID(userID)
+		user, uErr := s.userRepo.GetUserByID(database.WithWorkspace(context.Background(), workspaceID), userID)
 		if uErr != nil {
 			// User not in end-user table — use JWT claims directly
 			user = &models.ExtendedUser{}

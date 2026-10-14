@@ -78,6 +78,17 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// the body of a denial -- never the decision. The Phase 1 routes
 		// on this group keep the shared middlewares' bodies.
 		platformCtrl.MountIGAGraphReadRoutes(r, igaGraphRead, middlewares.AuthMiddleware(), middlewares.Require)
+		// The unified inventory (AWS, Kubernetes, GitHub): the same graph
+		// controller, gate and envelope, on its own group beside the §5.3
+		// catalogue (iga_inventory_controller.go).
+		platformCtrl.MountIGAInventoryRoutes(r, igaGraphRead, middlewares.AuthMiddleware(), middlewares.Require)
+		// Phase 3 policy (SPEC-iga-phase3-policy.md §7, T3.02): the
+		// /api/iga/v1/policy subgroup of the graph group -- the same auth and
+		// envelope -- behind the IGA_POLICY gate, which answers 503
+		// policy_unavailable on every route while it is off or unverified.
+		// The gate is the graph controller's, so /capabilities and the routes
+		// can never disagree about it.
+		platformCtrl.MountIGAPolicyRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a

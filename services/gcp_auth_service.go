@@ -99,7 +99,7 @@ func (s *GCPAuthService) LoadCredential(authRef string) (option.ClientOption, er
 
 // DeleteCredential purges a json_key connector's stored key from Vault. A
 // no-op (not an error) when there is nothing to delete, mirroring
-// AWSOnboardingService.DeleteConnector's own "authRef == \"\"" guard.
+// AWSOnboardingService.RevokeConnector's own "authRef == \"\"" guard.
 func (s *GCPAuthService) DeleteCredential(authRef string) error {
 	if authRef == "" || s.vault == nil {
 		return nil

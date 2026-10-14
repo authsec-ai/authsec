@@ -98,15 +98,15 @@ func TestProjectedShapesSatisfyTheSchema(t *testing.T) {
 		  DO UPDATE SET state = EXCLUDED.state
 		RETURNING id`, ws, policyID, identityID)
 
-	// --- a RESOLVED edge: complete + effective -------------------------------
+	// --- a RESOLVED edge: declared, partial + unknown (never evaluated) ------
 	mustExec(t, db, `
 		INSERT INTO iga_access_edges
 		  (workspace_id, subject_kind, subject_id, subject_identity_account_id, provider,
 		   entitlement_id, assignment_id, direction, path_kind, basis,
 		   calculation_state, effective_conclusion, native_scope, state,
 		   source_key, partition_key)
-		VALUES ($1,'identity_account',$2,$2,'k8s',$3,$4,'outbound','k8s_rbac','observed',
-		        'complete','effective','k3s','current','k8s|edge|1','k3s')
+		VALUES ($1,'identity_account',$2,$2,'k8s',$3,$4,'outbound','k8s_rbac','declared',
+		        'partial','unknown','k3s','current','k8s|edge|1','k3s')
 		ON CONFLICT (workspace_id, source_key) WHERE source_key <> '' AND state <> 'ended'
 		  DO NOTHING`,
 		ws, identityID, entitlementID, assignmentID)
@@ -119,7 +119,7 @@ func TestProjectedShapesSatisfyTheSchema(t *testing.T) {
 		  (workspace_id, subject_kind, subject_id, subject_identity_account_id, provider,
 		   direction, path_kind, basis, calculation_state, effective_conclusion,
 		   native_scope, state, source_key, partition_key)
-		VALUES ($1,'identity_account',$2,$2,'k8s','outbound','k8s_rbac','observed',
+		VALUES ($1,'identity_account',$2,$2,'k8s','outbound','k8s_rbac','declared',
 		        'partial','unknown','k3s','current','k8s|edge|2','k3s')
 		ON CONFLICT (workspace_id, source_key) WHERE source_key <> '' AND state <> 'ended'
 		  DO NOTHING`, ws, identityID)

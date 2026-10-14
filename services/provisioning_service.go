@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -186,8 +188,11 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		}
 
 		// --- 2. the identity ------------------------------------------------
-		var client models.MCPOAuthClient
-		if err := tx.First(&client, "id = ?", *agent.MatchedClientID).Error; err != nil {
+		// matched_client_id was supplied by whoever claimed the agent, so the client
+		// must be this workspace's own; otherwise provisioning would take over another
+		// workspace's client (AS-026).
+		client, err := loadWorkspaceClient(tx, workspaceID, *agent.MatchedClientID)
+		if err != nil {
 			return fmt.Errorf("matched oauth client not found: %w", err)
 		}
 		result.OAuthClientID = client.ID
@@ -198,7 +203,7 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		// service_account — an oauth client is NOT a bindable principal. So every
 		// provisioned agent gets a paired service account, using the oauth_client_id
 		// column that already exists, and entitlements attach to that.
-		sa, created, err := m.ensureAnchor(tx, workspaceID, &agent, &client)
+		sa, created, err := m.ensureAnchor(tx, workspaceID, &agent, client)
 		if err != nil {
 			return err
 		}
@@ -250,7 +255,7 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 		result.RoleBindingID = binding.ID
 
 		// --- 6. provenance -------------------------------------------------
-		rsName, _ := m.resourceServerName(tx, in.ResourceServerID)
+		rsName, _ := m.resourceServerName(tx, workspaceID, in.ResourceServerID)
 		// Read straight from the sighting rather than via sa.SpiffeID. The observed
 		// Kubernetes identity is no longer copied onto the anchor (spiffe_id is
 		// unique per workload; a ServiceAccount is shared), but the provenance record
@@ -426,9 +431,10 @@ func (m *provisioningManager) ensureRegistration(tx *gorm.DB, workspaceID, rsID,
 	return reg.ID, nil
 }
 
-func (m *provisioningManager) resourceServerName(tx *gorm.DB, rsID uuid.UUID) (string, error) {
+func (m *provisioningManager) resourceServerName(tx *gorm.DB, workspaceID, rsID uuid.UUID) (string, error) {
 	var name string
-	err := tx.Raw(`SELECT name FROM resource_servers WHERE id = ?`, rsID).Scan(&name).Error
+	err := tenancy.GormRaw(inWorkspace(context.Background(), workspaceID), tx,
+		`SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2`, rsID).Scan(&name).Error
 	if name == "" {
 		name = rsID.String()
 	}
@@ -471,6 +477,17 @@ func anchorName(agent *models.DiscoveredAgent, client *models.MCPOAuthClient) st
 	return fmt.Sprintf("agent-%s-%s", base, fp)
 }
 
+// loadWorkspaceClient loads an OAuth client only when workspaceID is its home
+// workspace. mcp_oauth_clients is shared by every workspace, so a client homed
+// elsewhere, or not yet bound anywhere, is reported as not found.
+func loadWorkspaceClient(tx *gorm.DB, workspaceID, clientID uuid.UUID) (*models.MCPOAuthClient, error) {
+	var client models.MCPOAuthClient
+	if err := tx.First(&client, "id = ? AND home_workspace_id = ?", clientID, workspaceID).Error; err != nil {
+		return nil, err
+	}
+	return &client, nil
+}
+
 /* ------------------------------ deprovision ----------------------------- */
 
 func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionInput) (*DeprovisionResult, error) {
@@ -509,6 +526,15 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 		if err := tx.First(&client, "id = ?", clientID).Error; err != nil {
 			return fmt.Errorf("oauth client not found: %w", err)
 		}
+		// mcp_oauth_clients is shared by every workspace. A client this workspace
+		// does not own can only reach here through a claimed agent whose
+		// matched_client_id named it, and is not found (AS-026). An internal caller
+		// holding a foreign client (a cross-workspace connection failing
+		// certification) may only take away what this workspace granted.
+		owned := client.HomeWorkspaceID != nil && *client.HomeWorkspaceID == workspaceID
+		if !owned && in.OAuthClientID == nil {
+			return fmt.Errorf("oauth client not found: %w", gorm.ErrRecordNotFound)
+		}
 
 		// The paired anchors. Plural deliberately: nothing stops an older path having
 		// created more than one, and leaving a stray anchor holding bindings would
@@ -541,7 +567,7 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 				if closed {
 					res.ProvenanceClosed++
 				}
-				if derr := m.repo.DeleteRoleBindingTx(tx, bindingID); derr != nil {
+				if derr := m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID); derr != nil {
 					return fmt.Errorf("delete binding %s: %w", bindingID, derr)
 				}
 				res.BindingsRemoved++
@@ -551,7 +577,7 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 			// rather than eventual: introspection treats revoked_tokens as
 			// authoritative, so without this the agent keeps working until its current
 			// token expires (up to an hour for native M2M).
-			tokens, terr := m.repo.LiveTokenJTIsForSubject(sa.ID, models.ProvenanceSubjectServiceAccount)
+			tokens, terr := m.repo.LiveTokenJTIsForSubject(workspaceID, sa.ID, models.ProvenanceSubjectServiceAccount)
 			if terr != nil {
 				return fmt.Errorf("list live tokens for anchor %s: %w", sa.ID, terr)
 			}
@@ -576,8 +602,11 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 		// 4. Registrations: revoke rather than delete, so the history of the agent
 		// having been connected survives.
 		var regs []models.ResourceServerClientRegistration
-		if err := tx.Where("oauth_client_id = ? AND status <> ?", clientID, models.ClientRegStatusRevoked).
-			Find(&regs).Error; err != nil {
+		regQuery := tx.Where("oauth_client_id = ? AND status <> ?", clientID, models.ClientRegStatusRevoked)
+		if !owned {
+			regQuery = regQuery.Where("workspace_id = ?", workspaceID)
+		}
+		if err := regQuery.Find(&regs).Error; err != nil {
 			return fmt.Errorf("find registrations: %w", err)
 		}
 		for _, reg := range regs {
@@ -603,20 +632,25 @@ func (m *provisioningManager) Deprovision(workspaceID uuid.UUID, in DeprovisionI
 			res.RegistrationsRevoked++
 		}
 
-		// 5. The identity itself.
-		if uerr := tx.Model(&models.MCPOAuthClient{}).Where("id = ?", clientID).
-			Update("governance_status", models.GovernanceStatusDeprovisioned).Error; uerr != nil {
-			return fmt.Errorf("set governance status: %w", uerr)
+		// 5. The identity itself, when it is this workspace's to retire.
+		if owned {
+			if uerr := tx.Model(&models.MCPOAuthClient{}).Where("id = ?", clientID).
+				Update("governance_status", models.GovernanceStatusDeprovisioned).Error; uerr != nil {
+				return fmt.Errorf("set governance status: %w", uerr)
+			}
 		}
 
 		// 6. Zero-residual check. Asserting the outcome rather than assuming it is the
 		// difference between "we revoked" and "we ran some statements".
 		var residual int64
-		if err := tx.Model(&models.RoleBinding{}).
+		residualQuery := tx.Model(&models.RoleBinding{}).
 			Joins("JOIN service_accounts sa ON sa.id = role_bindings.service_account_id").
 			Where("sa.oauth_client_id = ? AND (role_bindings.expires_at IS NULL OR role_bindings.expires_at > NOW())",
-				clientID).
-			Count(&residual).Error; err != nil {
+				clientID)
+		if !owned {
+			residualQuery = residualQuery.Where("role_bindings.workspace_id = ?", workspaceID)
+		}
+		if err := residualQuery.Count(&residual).Error; err != nil {
 			return fmt.Errorf("residual check: %w", err)
 		}
 		res.ResidualBindings = int(residual)
@@ -755,6 +789,10 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 		res.RegistrationID = regID
 
 		if in.RoleID != nil {
+			if verr := ValidateConnectionGrant(tx, workspaceID, in.ResourceServerID,
+				*in.RoleID, in.SubjectType, in.SubjectID); verr != nil {
+				return verr
+			}
 			// Preventive check here too: a console approval is just as capable of
 			// creating a conflict as a discovery-driven provision, and a control that
 			// only guards one entry point is not a control.
@@ -815,7 +853,7 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 			return nil
 		}
 
-		rsName, _ := m.resourceServerName(tx, in.ResourceServerID)
+		rsName, _ := m.resourceServerName(tx, workspaceID, in.ResourceServerID)
 		prov, perr := m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
 			EntitlementType: models.EntitlementRoleBinding,
 			RoleBindingID:   &rb.ID,
@@ -852,6 +890,71 @@ func (m *provisioningManager) GrantEntitlement(workspaceID uuid.UUID, in GrantEn
 		return nil, err
 	}
 	return res, nil
+}
+
+// ErrInvalidConnectionGrant is returned when a console approval names a role
+// or subject that the connection cannot carry.
+var ErrInvalidConnectionGrant = errors.New("invalid connection grant")
+
+// ValidateConnectionGrant checks the role and subject of a console connection
+// approval against the workspace and resource server (AS-061):
+//   - the resource server belongs to the workspace;
+//   - the role belongs to the workspace AND is one of that resource server's
+//     roles (its name carries the "rs-<id>:" prefix), so approving a
+//     connection cannot hand out a workspace-wide or another RS's role;
+//   - the subject is a member of the workspace: a user of it (or holding an
+//     active membership in it), or one of its service accounts.
+func ValidateConnectionGrant(tx *gorm.DB, workspaceID, rsID, roleID uuid.UUID, subjectType string, subjectID uuid.UUID) error {
+	var rsCount int64
+	if err := tx.Model(&models.ResourceServer{}).
+		Where("id = ? AND workspace_id = ?", rsID, workspaceID).Count(&rsCount).Error; err != nil {
+		return err
+	}
+	if rsCount == 0 {
+		return fmt.Errorf("%w: resource server not found in this workspace", ErrInvalidConnectionGrant)
+	}
+
+	var roleName string
+	if err := tx.Table("roles").Select("name").
+		Where("id = ? AND workspace_id = ?", roleID, workspaceID).
+		Limit(1).Scan(&roleName).Error; err != nil {
+		return err
+	}
+	if roleName == "" {
+		return fmt.Errorf("%w: role %s not found in this workspace", ErrInvalidConnectionGrant, roleID)
+	}
+	if !strings.HasPrefix(roleName, fmt.Sprintf("rs-%s:", rsID)) {
+		return fmt.Errorf("%w: role %q is not a role of this application", ErrInvalidConnectionGrant, roleName)
+	}
+
+	var member int64
+	switch subjectType {
+	case "user":
+		if err := tx.Table("users").
+			Where("id = ? AND workspace_id = ?", subjectID, workspaceID).
+			Count(&member).Error; err != nil {
+			return err
+		}
+		if member == 0 {
+			if err := tx.Table("workspace_memberships").
+				Where("user_id = ? AND workspace_id = ? AND status = 'active'", subjectID, workspaceID).
+				Count(&member).Error; err != nil {
+				return err
+			}
+		}
+	case "service_account":
+		if err := tx.Table("service_accounts").
+			Where("id = ? AND workspace_id = ?", subjectID, workspaceID).
+			Count(&member).Error; err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: subject_type must be 'user' or 'service_account'", ErrInvalidConnectionGrant)
+	}
+	if member == 0 {
+		return fmt.Errorf("%w: subject is not a member of this workspace", ErrInvalidConnectionGrant)
+	}
+	return nil
 }
 
 // ErrSoDViolation is returned when a grant would breach a blocking SoD rule.

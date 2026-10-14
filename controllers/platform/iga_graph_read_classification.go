@@ -212,7 +212,7 @@ func (ctl *IGAGraphReadController) ClassifyWorkload(c *gin.Context) {
 		}
 		req.WorkloadID, req.ActorUserID = id, actor
 
-		res, err := ctl.classificationService().Classify(c.Request.Context(), g.WS, req)
+		res, err := ctl.classificationService().Classify(c.Request.Context(), req)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +279,7 @@ func (ctl *IGAGraphReadController) GetWorkloadClassification(c *gin.Context) {
 		}
 
 		var env igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, pin, func(q *igaread.Query) error {
+		err := g.Reader.Read(c.Request.Context(), pin, func(q *igaread.Query) error {
 			if !q.Published() {
 				return igaread.NotFound()
 			}

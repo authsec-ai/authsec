@@ -9,7 +9,6 @@
 //	/authsec/oidc/*          – OIDC federation
 //	/authsec/scim/v2/*       – SCIM 2.0 provisioning
 //	/authsec/health          – health checks
-//	/authsec/debug/*         – debug helpers (dev only)
 //
 // The well-known OAuth/OIDC discovery endpoints remain at the root as required by RFC 8414
 // and OpenID Connect Discovery. They are advertised from the canonical OAuth issuer host.
@@ -41,8 +40,10 @@ import (
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/buildinfo"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -178,10 +179,6 @@ func SetupRoutes(
 		// dead code (RESIDUAL #40) and has been removed.
 		agentController.SetJWTSVIDService(spireDeps.JWTSVIDSvc)
 
-		// Delegation policy controllers (admin + platform)
-		delegationPolicyController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
-		delegationPolicyCtrl.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
-
 		// PKI provisioning — inject into tenant + OIDC controllers
 		if spireDeps.PKIProvisioningSvc != nil {
 			userController.SetPKIService(spireDeps.PKIProvisioningSvc)
@@ -244,7 +241,6 @@ func SetupRoutes(
 		oauth.POST("/userinfo", oauthASController.Userinfo)
 		oauth.GET("/logout", oauthASController.EndSession)
 		// RFC 9126 — Pushed Authorization Request (public)
-		oauth.POST("/par", oauthASController.PAR)
 		// XAA access-request status poll (Journey B — no auth, capability by ID)
 		oauth.GET("/access-requests/:id", oauthASController.AccessRequestStatus)
 		// Requester SDK bootstrap (client-authenticated; XAA_ISSUANCE flag gates it).
@@ -281,14 +277,41 @@ func SetupRoutes(
 	// D-100).
 	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
+	// LEGACY compatibility under the IGA prefix (disposition plan §3.1, Phase 3
+	// spec §7.10): a read-only list of the workspace's legacy agent policies
+	// with Pause and Remove, served by the legacy agent-policy service -- not
+	// Phase 3 code, and outside SetupIGARoutes on purpose. Same auth, same
+	// error envelope; the legacy governance permissions (governance:read to
+	// list, governance:admin to pause or remove, as the legacy
+	// /authsec/governance/agent-policies routes). The legacy routes below keep
+	// their behaviour.
+	platformCtrl.MountLegacyAgentPolicyCompatRoutes(r,
+		platformCtrl.NewLegacyAgentPolicyCompatController(config.DB),
+		middlewares.AuthMiddleware(), middlewares.Require)
+
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
+
+	// Liveness and readiness for probes and smoke tests (AS-093).
+	// Ends the presented session (AS-031).
+	authsec.POST("/auth/logout", middlewares.AuthMiddleware(), middlewares.Logout)
+
+	authsec.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	authsec.GET("/readyz", func(c *gin.Context) {
+		db := config.GetDatabase()
+		if db == nil || db.DB == nil || db.DB.PingContext(c.Request.Context()) != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "database": "down"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "database": "up"})
+	})
 	{
 		workspaces := authsec.Group("/workspaces")
 		workspaces.Use(middlewares.AuthMiddleware())
 		{
+			workspaces.GET("", workspaceController.ListMyWorkspaces)
 			workspaces.POST("/:workspace_id/switch", workspaceController.SwitchWorkspace)
 		}
 
@@ -575,7 +598,6 @@ func SetupRoutes(
 				v1Applications.GET("/:id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccessQuery)
 				v1Applications.POST("/:id/access-simulations", scopeMatrixController.AccessSimulation)
 				v1Applications.POST("/:id/access-change-previews", scopeMatrixController.AccessChangePreview)
-				v1Applications.POST("/:id/evidence-exports", scopeMatrixController.EvidenceExport)
 			}
 		}
 
@@ -933,7 +955,9 @@ func SetupRoutes(
 		)
 		{
 			admin.GET("/tenants", adminUserController.ListTenants)
-			admin.POST("/tenants", adminUserController.CreateTenant)
+			// POST /tenants (create a bare workspace) removed: any workspace admin
+			// could create workspaces and the response echoed a password hash
+			// (AS-041). Workspaces are created by sign-up.
 			admin.PUT("/tenants/:workspace_id", adminUserController.UpdateTenant)
 			admin.DELETE("/tenants/:workspace_id", middlewares.Require("tenants", "delete"), adminUserController.DeleteTenant)
 			admin.GET("/tenants/:workspace_id/users", adminUserController.GetTenantUsers)
@@ -948,7 +972,6 @@ func SetupRoutes(
 			admin.GET("/invite/pending", adminInviteController.ListPendingInvites)
 
 			adminDomains := admin.Group("/tenants/:workspace_id/domains")
-			adminDomains.Use(middlewares.ExtractTenantFromPath())
 			{
 				adminDomains.POST("", domainController.CreateDomain)
 				adminDomains.GET("", domainController.ListDomains)
@@ -998,7 +1021,7 @@ func SetupRoutes(
 
 		// SCIM token
 		scimToken := uflow.Group("/admin/scim")
-		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
+		scimToken.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"), middlewares.ValidateWorkspaceFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
 		}
@@ -1092,16 +1115,19 @@ func SetupRoutes(
 		}
 
 		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
+		// Managing other users' accounts is for the workspace's owners and
+		// admins; any signed-in end user could do it before (AS-023, AS-007).
+		userAdmin := middlewares.RequireWorkspaceRole("owner", "admin")
 		{
-			user.GET("/enduser/:workspace_id/:user_id", endUserController.GetEndUser)
-			user.POST("/enduser/list", endUserController.GetEndUsers)
-			user.GET("/enduser/list", endUserController.GetEndUsers)
-			user.PUT("/enduser/:workspace_id/:user_id", endUserController.UpdateUser)
-			user.PUT("/enduser/:workspace_id/:user_id/status", endUserController.UpdateEndUserStatus)
-			user.POST("/enduser/active", endUserController.ActiveOrDeactiveEndUser)
-			user.POST("/enduser/delete", endUserController.DeleteEndUser)
-			user.DELETE("/enduser/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
-			user.DELETE("/enduser/delete_all/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
+			user.GET("/enduser/:workspace_id/:user_id", userAdmin, endUserController.GetEndUser)
+			user.POST("/enduser/list", userAdmin, endUserController.GetEndUsers)
+			user.GET("/enduser/list", userAdmin, endUserController.GetEndUsers)
+			user.PUT("/enduser/:workspace_id/:user_id", userAdmin, endUserController.UpdateUser)
+			user.PUT("/enduser/:workspace_id/:user_id/status", userAdmin, endUserController.UpdateEndUserStatus)
+			user.POST("/enduser/active", userAdmin, endUserController.ActiveOrDeactiveEndUser)
+			user.POST("/enduser/delete", userAdmin, endUserController.DeleteEndUser)
+			user.DELETE("/enduser/:workspace_id/:user_id", userAdmin, middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
+			user.DELETE("/enduser/delete_all/:workspace_id/:user_id", userAdmin, middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
 			user.POST("/rbac/roles", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/roles", rolesScopedBindingsController.ListRolesEndUser)
 			user.PUT("/rbac/roles/:role_id", forbiddenLegacyRBACMutation)
@@ -1117,12 +1143,12 @@ func SetupRoutes(
 			user.GET("/permissions", permissionController.GetMyPermissions)
 			user.GET("/permissions/effective", permissionController.GetMyEffectivePermissions)
 			user.GET("/permissions/check", permissionController.CheckPermission)
-			user.POST("/groups/users/add", groupController.AddUserToGroups)
-			user.POST("/groups/users/remove", groupController.RemoveUserFromGroups)
+			user.POST("/groups/users/add", userAdmin, groupController.AddUserToGroups)
+			user.POST("/groups/users/remove", userAdmin, groupController.RemoveUserFromGroups)
 			user.GET("/groups/users", groupController.GetMyGroups)
-			user.GET("/groups/:workspace_id/:group_id/users", groupController.GetGroupUsers)
-			user.POST("/admin/change-password", endUserController.AdminChangeUserPassword)
-			user.POST("/admin/reset-password", endUserController.AdminResetUserPassword)
+			user.GET("/groups/:workspace_id/:group_id/users", userAdmin, groupController.GetGroupUsers)
+			user.POST("/admin/change-password", userAdmin, endUserController.AdminChangeUserPassword)
+			user.POST("/admin/reset-password", userAdmin, endUserController.AdminResetUserPassword)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1289,9 +1315,10 @@ func SetupRoutes(
 		mig := authsec.Group("/migration")
 		{
 			master := mig.Group("/migrations/master")
-			master.Use(middlewares.AuthMiddleware())
+			master.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"))
 			{
-				master.POST("/run", migCtrl.RunMasterMigrations)
+				// POST /run removed: migrations run at startup, and any signed-in
+				// user could run the platform's master migrations (AS-039).
 				master.GET("/status", migCtrl.GetMasterMigrationStatus)
 			}
 		}
@@ -1303,22 +1330,16 @@ func SetupRoutes(
 		registerLogsRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
-		// Legacy embedded SPIRE control plane — quarantined behind
-		// ENABLE_EMBEDDED_SPIRE (default off). Both mounts back onto
-		// internal/spire repositories that query control-plane tables
-		// (agents, workloads, certificates, …) absent from the single
-		// master bootstrap, so they 500 if mounted. The SPIFFE-SVID M2M
-		// path is independent of this flag and stays available.
+		// Embedded SPIRE control plane — mounted with ENABLE_EMBEDDED_SPIRE
+		// (default off). Workspace-scoped (AS-081): its spire_* tables are
+		// workspace-owned (migration 120) and every route takes its
+		// workspace from a verified credential. The SPIFFE-SVID M2M path is
+		// independent of this flag and stays available.
 		//   - /authsec/spire     : SPIRE Headless (spire-headless microservice)
 		//   - /authsec/spiresvc  : SPIRE Identity Service (authsec-spire)
 		// ────────────────────────────────────────────────────
-		embeddedSpireEnabled := config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire
-		if embeddedSpireEnabled {
-			registerSpireRoutes(authsec)
-			if spireDeps != nil {
-				spiresvc := authsec.Group("/spiresvc")
-				spire.RegisterRoutes(spiresvc, spireDeps)
-			}
+		if config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire {
+			RegisterEmbeddedSpireRoutes(authsec, spireDeps)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1331,27 +1352,8 @@ func SetupRoutes(
 		exsvc.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"status": "ok", "service": "external-service"})
 		})
-		exsvc.GET("/debug/auth", middlewares.AuthMiddleware(), platformCtrl.DebugExternalServiceAuth)
-		exsvc.GET("/debug/test", middlewares.AuthMiddleware(), func(c *gin.Context) {
-			c.JSON(200, gin.H{"status": "authenticated", "path": "/debug/test"})
-		})
-		exsvc.GET("/debug/token", middlewares.AuthMiddleware(), func(c *gin.Context) {
-			contextData := make(map[string]interface{})
-			if claims, exists := c.Get("claims"); exists {
-				contextData["claims"] = claims
-			}
-			if perms, exists := c.Get("perms"); exists {
-				contextData["perms"] = perms
-			}
-			if scope, exists := c.Get("scope"); exists {
-				contextData["scope"] = scope
-			}
-			if user, exists := c.Get("user"); exists {
-				contextData["user"] = user
-			}
-			contextData["all_context_keys"] = c.Keys
-			c.JSON(200, gin.H{"status": "authenticated", "context_data": contextData})
-		})
+		// /debug/{auth,test,token} echoed the caller's claims and context;
+		// removed (AS-075).
 
 		// Dual-auth: accepts standard auth-manager JWT or SPIFFE JWT-SVID (for agent access).
 		extSvcs := exsvc.Group("/services")
@@ -1363,6 +1365,18 @@ func SetupRoutes(
 			extSvcs.PUT("/:id", middlewares.Require("external-service", "update"), extSvcController.UpdateExternalService)
 			extSvcs.DELETE("/:id", middlewares.Require("external-service", "delete"), extSvcController.DeleteExternalService)
 			extSvcs.GET("/:id/credentials", middlewares.Require("external-service", "credentials"), extSvcController.GetExternalServiceCredentials)
+		}
+
+		// Phase 3 R3 agent runtime controls (IGA_POLICY_R3, DECISION R3-17):
+		// the decision / redeem / outcome / brokered-session routes of an AI
+		// agent. Mounted only while the switch is on; behind
+		// SpiffeAuthMiddleware, and the controller accepts ONLY a delegated
+		// agent JWT-SVID (workspace from the verifying trust bundle, human from
+		// the active delegation token). Unavailable: 503, fail closed.
+		if services.PolicyR3GateState().Enabled() {
+			runtimeAgents := authsec.Group("/runtime")
+			runtimeAgents.Use(middlewares.SpiffeAuthMiddleware())
+			platformCtrl.RegisterRuntimeAgentRoutes(runtimeAgents, platformCtrl.NewIGAGovRuntimeController())
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1425,27 +1439,46 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
 
-		// Connector ingress is UNAUTHENTICATED by deliberate choice.
+		// Connector ingress: no AuthMiddleware, an INGEST TOKEN instead.
 		//
 		// A connector runs inside a customer's cluster and is configured with its
-		// workspace_id at deploy time (a Helm --set on the discovery agent), which it
-		// then asserts in the request body. That removes the token-minting step from
-		// the install flow entirely.
+		// workspace_id at deploy time (a Helm value on the discovery agent), which it
+		// asserts in the request body. That alone authenticated nothing: anyone
+		// holding a workspace UUID could add rows to that workspace's inventory and,
+		// since the shared graph projects these payloads synchronously, inject a
+		// cluster-admin grant or post a "complete" sweep that ends a real cluster's
+		// model.
 		//
-		// What this trades away, stated plainly so it is not rediscovered later:
-		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
-		//     any caller who knows a workspace_id can add rows to that workspace's
-		//     inventory
-		//   - there is no rate limit, so inventory growth from this path is unbounded
+		// So each handler now checks the call's `Authorization: Bearer <ingest
+		// token>` against the body's workspace before trusting it
+		// (controllers/platform/discovery_ingest_auth.go). A token is minted by a
+		// discovery:admin for the caller's own workspace (POST
+		// /discovery/ingest-tokens below), optionally bound to one source; only its
+		// sha256 is stored. IGA_DISCOVERY_INGEST_AUTH picks the mode:
+		//   - off      nothing is checked (the old behaviour)
+		//   - warn     DEFAULT. A valid token is attributed; a call without one is
+		//              ACCEPTED but logged and counted, so agents installed before
+		//              tokens existed keep working during rollout. NOT a protected
+		//              ingress: startup logs a banner, discovery_ingest_auth_enforced
+		//              is 0 and the uflow health check says so until enforce
+		//   - enforce  no valid (unrevoked, unexpired) token for the body's
+		//              workspace (and, if bound, for the call's source) -> 401
+		// In warn and enforce a valid token of ANOTHER workspace is always 403: a
+		// token never authorises another workspace. Rollout steps:
+		// controllers/platform/DISCOVERY_INGEST_AUTH.md.
 		//
-		// What keeps the blast radius to noise rather than privilege: a sighting
-		// grants nothing. Rows land `unregistered`, and only an authenticated,
-		// permission-checked human can claim one into a governed identity. The worst
-		// case is a polluted Unregistered Agents report, not access.
+		// There is still no rate limit on this path.
+		//
+		// A connector's actuation credential (Bearer, minted at
+		// POST /authsec/governance/connectors/:id/actuation) decides workspace
+		// and source ahead of the ingest-token check, and a connector holding
+		// one can never be spoken for without it (AS-014,
+		// DiscoveryController.ingress).
 		//
 		// Registered on its own group so it cannot accidentally inherit
 		// AuthMiddleware from the block below. Same pattern as the connector OAuth
 		// callback above, which is also necessarily unauthenticated.
+		platformCtrl.LogDiscoveryIngestAuthMode()
 		discoveryIngress := authsec.Group("/discovery")
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
@@ -1466,10 +1499,10 @@ func SetupRoutes(
 			discoveryIngress.POST("/lifecycle", discoveryController.ReportLifecycleEvent)
 
 			// The cluster's AUTHORIZATION MODEL — which ServiceAccount may do what,
-			// through which binding and role. Unauthenticated for the same reason as
-			// the rest of this group: the caller is a workload in a customer's
-			// cluster, and the payload grants nothing. It describes authorization
-			// that already exists over there; it creates none here.
+			// through which binding and role. Ingest-token authenticated like the
+			// rest of this group: the caller is a workload in a customer's cluster.
+			// The payload grants nothing here, but it becomes the graph's model of
+			// that cluster, which is why the token check matters most on this route.
 			discoveryIngress.POST("/rbac-snapshot", discoveryController.ReportRBACSnapshot)
 
 			// Per-sweep manifest of everything a connector observed. The only signal
@@ -1486,6 +1519,15 @@ func SetupRoutes(
 		// hangs off /discovery/agents/:id as well as /governance.
 		governanceController := platformCtrl.NewGovernanceController(config.DB)
 
+		// Phase 3 Slack app (SPEC-iga-phase3-policy.md §7.11, T3.14):
+		// /authsec/integrations/slack. Behind the IGA_POLICY gate;
+		// /interactions (Slack signature) and /oauth/callback (signed state
+		// + install cookie) carry no bearer token; the rest are
+		// authenticated with their permission.
+		platformCtrl.MountSlackIntegrationRoutes(authsec,
+			platformCtrl.NewDefaultSlackIntegrationController(config.DB),
+			middlewares.AuthMiddleware(), middlewares.Require)
+
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
@@ -1496,9 +1538,16 @@ func SetupRoutes(
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
 
+			// Ingest tokens: the credentials agents present on the ingress above.
+			// discovery:admin; the workspace is the caller's, never the body's.
+			//   POST   /ingest-tokens      mint (the plaintext is returned once)
+			//   GET    /ingest-tokens      list (prefixes, never hashes)
+			//   DELETE /ingest-tokens/:id  revoke
+			platformCtrl.MountDiscoveryIngestTokenRoutes(discovery, discoveryController, middlewares.Require)
+
 			// NOTE: POST /sightings, /agent-registration, /lifecycle and
 			// /resync-manifest are deliberately NOT here — they are registered
-			// unauthenticated on discoveryIngress above. Re-adding any of them here
+			// on discoveryIngress above (ingest-token auth). Re-adding any of them here
 			// would make Gin panic at startup on the duplicate method+path.
 
 			// Inventory. ?status=unregistered is the Unregistered Agents report;
@@ -1624,6 +1673,17 @@ func SetupRoutes(
 			// AWS account decides what a scan may read and what it will cost.
 			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
 			k8sGraph := platformCtrl.NewK8sGraphController(config.DB)
+			// One read of every connection of every provider: connection, latest
+			// scan, coverage and graph state, scope and capabilities
+			// (SPEC-console-revamp B3). discovery:read, like the lists it
+			// summarises; it changes nothing.
+			discovery.GET("/connections", middlewares.Require("discovery", "read"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).ListConnections)
+			// Behind the same discovery:admin middleware as the administrative
+			// connection routes: reaching the handler IS the server's answer, so the
+			// console can show a read-only reader no administrative control.
+			discovery.GET("/connections/can-administer", middlewares.Require("discovery", "admin"),
+				platformCtrl.NewDiscoveryConnectionsController(config.DB).CanAdminister)
 			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
 			// Quick Create: starting a session is admin, like POST /aws/connectors,
 			// because the link it returns connects an account. Reading one is not.
@@ -1642,6 +1702,16 @@ func SetupRoutes(
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.
 			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
+			// Phase 3 enforcement binding (SPEC-iga-phase3-policy.md §7.9,
+			// T3.09): the separate, customer-consented enforcement stack of a
+			// connected account. Behind the IGA_POLICY gate, with
+			// discovery:read to read and governance:enforce to change.
+			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
+				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
+			// Phase 3 IaC sources (§7.9, T3.17): an account's mapping to the
+			// Terraform / CloudFormation directory J2 pull requests change.
+			platformCtrl.RegisterIaCSourceRoutes(discovery,
+				platformCtrl.NewCloudIaCSourceController(config.DB), middlewares.Require)
 
 			// IAM identity discovery: the foundation every later AWS surface
 			// resolves against. Writes cloud_identity and cloud_secret and
@@ -1671,6 +1741,7 @@ func SetupRoutes(
 			discovery.GET("/k8s/clusters", middlewares.Require("discovery", "read"), k8sGraph.ListClusters)
 			discovery.GET("/k8s/identities", middlewares.Require("discovery", "read"), k8sGraph.ListIdentities)
 			discovery.GET("/k8s/workloads", middlewares.Require("discovery", "read"), k8sGraph.ListWorkloads)
+			discovery.GET("/k8s/identities/:id", middlewares.Require("discovery", "read"), k8sGraph.GetIdentity)
 			discovery.GET("/k8s/identities/:id/access", middlewares.Require("discovery", "read"), k8sGraph.GetAccess)
 			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
 
@@ -1688,6 +1759,9 @@ func SetupRoutes(
 			// permission as every other discovery read.
 			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
 			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
+			// The aggregate behind the identities inventory's unused-access column.
+			// A literal path beside /aws/usage, not a wildcard under it.
+			discovery.GET("/aws/usage/summary", middlewares.Require("discovery", "read"), cloudAWS.ListUsageSummary)
 
 			// Evidence: why a cloud_* row exists, or -- for a subject-less fact
 			// like an AgentCore Workload Identity -- what was observed even
@@ -2065,16 +2139,26 @@ func registerWebAuthnRoutes(
 		c.JSON(200, gin.H{"status": "healthy", "service": "webauthn-service"})
 	})
 
+	// Every enrolment and verification step needs a login ticket (issued only
+	// after a server-verified first factor) or a session, and may act only for
+	// that subject. Status lookups stay open: the SDK's CIBA client calls them.
+	adminStep := middlewares.RequireLoginSubject(logintickets.RealmAdmin, false)
+	adminVerify := middlewares.RequireLoginSubject(logintickets.RealmAdmin, true)
+	endUserStep := middlewares.RequireLoginSubject(logintickets.RealmEndUser, false)
+	endUserVerify := middlewares.RequireLoginSubject(logintickets.RealmEndUser, true)
+	anyStep := middlewares.RequireLoginSubject("", false)
+	anyVerify := middlewares.RequireLoginSubject("", true)
+
 	// Admin WebAuthn (uses global DB)  →  /authsec/webauthn/admin/*
 	admin := router.Group("/admin")
 	{
 		admin.POST("/mfa/status", adminHandler.GetMFAStatus)
 		admin.POST("/mfa/loginStatus", adminHandler.GetMFAStatusForLogin)
 		admin.GET("/mfa/loginStatus", adminHandler.GetMFAStatusForLoginGET)
-		admin.POST("/beginRegistration", adminHandler.BeginRegistration)
-		admin.POST("/finishRegistration", adminHandler.FinishRegistration)
-		admin.POST("/beginAuthentication", adminHandler.BeginAuthentication)
-		admin.POST("/finishAuthentication", adminHandler.FinishAuthentication)
+		admin.POST("/beginRegistration", adminStep, adminHandler.BeginRegistration)
+		admin.POST("/finishRegistration", adminStep, adminHandler.FinishRegistration)
+		admin.POST("/beginAuthentication", adminStep, adminHandler.BeginAuthentication)
+		admin.POST("/finishAuthentication", adminVerify, adminHandler.FinishAuthentication)
 	}
 
 	// End-user WebAuthn (uses tenant-specific DBs)  →  /authsec/webauthn/enduser/*
@@ -2083,47 +2167,47 @@ func registerWebAuthnRoutes(
 		enduser.POST("/mfa/status", endUserHandler.GetMFAStatus)
 		enduser.POST("/mfa/loginStatus", endUserHandler.GetMFAStatusForLogin)
 		enduser.GET("/mfa/loginStatus", endUserHandler.GetMFAStatusForLoginGET)
-		enduser.POST("/beginRegistration", endUserHandler.BeginRegistration)
-		enduser.POST("/finishRegistration", endUserHandler.FinishRegistration)
-		enduser.POST("/beginAuthentication", endUserHandler.BeginAuthentication)
-		enduser.POST("/finishAuthentication", endUserHandler.FinishAuthentication)
+		enduser.POST("/beginRegistration", endUserStep, endUserHandler.BeginRegistration)
+		enduser.POST("/finishRegistration", endUserStep, endUserHandler.FinishRegistration)
+		enduser.POST("/beginAuthentication", endUserStep, endUserHandler.BeginAuthentication)
+		enduser.POST("/finishAuthentication", endUserVerify, endUserHandler.FinishAuthentication)
 	}
 
 	// Legacy flat routes  →  /authsec/webauthn/*
 	router.POST("/mfa/status", webAuthnHandler.GetMFAStatus)
 	router.POST("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLogin)
 	router.GET("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLoginGET)
-	router.POST("/beginRegistration", webAuthnHandler.BeginRegistration)
-	router.POST("/beginAuthRegistration", webAuthnHandler.BeginWebAuthnRegistration)
-	router.POST("/finishRegistration", webAuthnHandler.FinishRegistration)
-	router.POST("/beginAuthentication", webAuthnHandler.BeginAuthentication)
-	router.POST("/finishAuthentication", webAuthnHandler.FinishAuthentication)
+	router.POST("/beginRegistration", anyStep, webAuthnHandler.BeginRegistration)
+	router.POST("/beginAuthRegistration", anyStep, webAuthnHandler.BeginWebAuthnRegistration)
+	router.POST("/finishRegistration", anyStep, webAuthnHandler.FinishRegistration)
+	router.POST("/beginAuthentication", anyStep, webAuthnHandler.BeginAuthentication)
+	router.POST("/finishAuthentication", anyVerify, webAuthnHandler.FinishAuthentication)
 
 	// Biometric (alias flows)
-	router.POST("/biometric/verifyBegin", webAuthnHandler.BeginBiometricVerify)
-	router.POST("/biometric/verifyFinish", webAuthnHandler.FinishBiometricVerify)
-	router.POST("/biometric/beginSetup", webAuthnHandler.BeginBiometricSetup)
-	router.POST("/biometric/confirmSetup", webAuthnHandler.ConfirmBiometricSetup)
-	router.POST("/biometric/beginLoginSetup", webAuthnHandler.BeginBiometricLoginSetup)
-	router.POST("/biometric/confirmLoginSetup", webAuthnHandler.ConfirmBiometricLoginSetup)
-	router.POST("/biometric/verifyLoginBegin", webAuthnHandler.BeginBiometricLoginVerify)
-	router.POST("/biometric/verifyLoginFinish", webAuthnHandler.FinishBiometricLoginVerify)
+	router.POST("/biometric/verifyBegin", anyStep, webAuthnHandler.BeginBiometricVerify)
+	router.POST("/biometric/verifyFinish", anyVerify, webAuthnHandler.FinishBiometricVerify)
+	router.POST("/biometric/beginSetup", anyStep, webAuthnHandler.BeginBiometricSetup)
+	router.POST("/biometric/confirmSetup", anyStep, webAuthnHandler.ConfirmBiometricSetup)
+	router.POST("/biometric/beginLoginSetup", anyStep, webAuthnHandler.BeginBiometricLoginSetup)
+	router.POST("/biometric/confirmLoginSetup", anyStep, webAuthnHandler.ConfirmBiometricLoginSetup)
+	router.POST("/biometric/verifyLoginBegin", anyStep, webAuthnHandler.BeginBiometricLoginVerify)
+	router.POST("/biometric/verifyLoginFinish", anyVerify, webAuthnHandler.FinishBiometricLoginVerify)
 
 	// TOTP (legacy)
 	totpHandler := handlers.NewTOTPHandler()
-	router.POST("/totp/beginLoginSetup", totpHandler.BeginSetup)
-	router.POST("/totp/beginSetup", totpHandler.BeginTOTPSetup)
-	router.POST("/totp/confirmLoginSetup", totpHandler.ConfirmSetup)
-	router.POST("/totp/confirmSetup", totpHandler.ConfirmTOTPSetup)
-	router.POST("/totp/verifyLogin", totpHandler.VerifyLoginTOTP)
-	router.POST("/totp/verify", totpHandler.VerifyTOTP)
+	router.POST("/totp/beginLoginSetup", anyStep, totpHandler.BeginSetup)
+	router.POST("/totp/beginSetup", anyStep, totpHandler.BeginTOTPSetup)
+	router.POST("/totp/confirmLoginSetup", anyStep, totpHandler.ConfirmSetup)
+	router.POST("/totp/confirmSetup", anyStep, totpHandler.ConfirmTOTPSetup)
+	router.POST("/totp/verifyLogin", anyVerify, totpHandler.VerifyLoginTOTP)
+	router.POST("/totp/verify", anyVerify, totpHandler.VerifyTOTP)
 
 	// SMS (legacy)
 	smsHandler := handlers.NewSMSHandler()
-	router.POST("/sms/beginSetup", smsHandler.BeginSMSSetup)
-	router.POST("/sms/confirmSetup", smsHandler.ConfirmSMSSetup)
-	router.POST("/sms/requestCode", smsHandler.RequestSMSCode)
-	router.POST("/sms/verify", smsHandler.VerifySMS)
+	router.POST("/sms/beginSetup", anyStep, smsHandler.BeginSMSSetup)
+	router.POST("/sms/confirmSetup", anyStep, smsHandler.ConfirmSMSSetup)
+	router.POST("/sms/requestCode", anyStep, smsHandler.RequestSMSCode)
+	router.POST("/sms/verify", anyVerify, smsHandler.VerifySMS)
 }
 
 // registerHmgrRoutes registers all Hydra Manager routes under /hmgr.
@@ -2222,14 +2306,13 @@ func registerOocmgrRoutes(r gin.IRouter) {
 	// Workspace lifecycle moved to /authsec/uflow/admin and /authsec/applications.
 	//
 	// The only surviving operator-facing surfaces under /oocmgr are:
-	//   * /oocmgr/oidc/raw-hydra-dump   — raw Hydra-client dump for debugging
 	//   * /oocmgr/hydra-clients/sync    — reconcile MCP client rows with Hydra
-	oidc := secured.Group("/oidc")
-	{
-		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
-	}
+	// /oidc/raw-hydra-dump removed: it dumped other workspaces' Hydra clients
+	// by a prefix of a client-supplied workspace_id (AS-022).
 
+	// Was anonymous (AS-075).
 	hydraClients := secured.Group("/hydra-clients")
+	hydraClients.Use(middlewares.AuthMiddleware(), middlewares.RequireWorkspaceRole("owner", "admin"))
 	{
 		hydraClients.POST("/sync", ac.SyncHydraClients)
 	}
@@ -2242,16 +2325,18 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
 	authzCtrl := platformCtrl.NewAuthorizationController()
 
-	// Token endpoints. /verify and /oidc are intentionally public and
-	// workspace-agnostic: they validate a presented token and return only claims
-	// that token already proves — they must never expand the caller's authority
-	// or expose another workspace's data beyond the token itself. /generate mints
-	// a token and therefore requires authentication.
+	// Token endpoints. /verify is intentionally public and workspace-agnostic:
+	// it validates a presented token and returns only claims that token already
+	// proves — it must never expand the caller's authority or expose another
+	// workspace's data beyond the token itself. /generate mints a token and
+	// therefore requires authentication.
+	//
+	// /oidc was removed (AS-028): it turned any active Hydra access token, for
+	// any client, into a 24h platform session, and nothing calls it.
 	tokenGroup := r.Group("/auth/token")
 	{
 		tokenGroup.POST("/verify", ac.VerifyToken)
 		tokenGroup.POST("/generate", middlewares.AuthMiddleware(), ac.GenerateToken)
-		tokenGroup.POST("/oidc", ac.OIDCToken)
 	}
 
 	// ── /authz/* — single canonical authorization surface ──
@@ -2315,11 +2400,26 @@ func registerLogsRoutes(r gin.IRouter) {
 	}
 }
 
+// RegisterEmbeddedSpireRoutes mounts the embedded SPIRE control plane on the
+// /authsec group: /spire (headless) and, when deps is set, /spiresvc
+// (identity service). SetupRoutes calls it only with ENABLE_EMBEDDED_SPIRE.
+func RegisterEmbeddedSpireRoutes(authsec *gin.RouterGroup, deps *spire.Dependencies) {
+	registerSpireRoutes(authsec)
+	if deps != nil {
+		spire.RegisterRoutes(authsec.Group("/spiresvc"), deps)
+	}
+}
+
 // registerSpireRoutes registers all SPIRE Headless routes under /spire.
 // Previously served by the standalone spire-headless microservice.
+// Everything except OIDC discovery/JWKS needs a workspace token (AS-081);
+// writes need owner/admin.
 func registerSpireRoutes(r gin.IRouter) {
 	sc := platformCtrl.NewSpireController()
 	platformCtrl.SetSharedSpireController(sc)
+
+	auth := middlewares.AuthMiddleware()
+	admin := middlewares.RequireWorkspaceRole("owner", "admin")
 
 	spire := r.Group("/spire")
 
@@ -2331,23 +2431,24 @@ func registerSpireRoutes(r gin.IRouter) {
 	spire.GET("/.well-known/openid-configuration", sc.OIDCDiscovery)
 	spire.GET("/.well-known/jwks.json", sc.OIDCJWKSHandler)
 
-	// ── Registry (requires authentication) ──
-	registry := spire.Group("/registry", middlewares.AuthMiddleware())
+	// ── Registry ──
+	registry := spire.Group("/registry", auth)
 	{
-		registry.POST("/workloads", sc.RegisterWorkload)
-		registry.PUT("/workloads/:id", sc.UpdateWorkload)
-		registry.DELETE("/workloads/:id", sc.DeleteWorkload)
 		registry.GET("/workloads", sc.ListWorkloads)
+		registry.POST("/workloads", admin, sc.RegisterWorkload)
+		registry.PUT("/workloads/:id", admin, sc.UpdateWorkload)
+		registry.DELETE("/workloads/:id", admin, sc.DeleteWorkload)
 	}
 
-	// ── OIDC token operations ──
-	oidc := spire.Group("/oidc")
+	// ── OIDC token operations: the exchanged credential must belong to
+	// the caller's workspace ──
+	oidc := spire.Group("/oidc", auth)
 	{
 		oidc.POST("/token", sc.OIDCTokenExchange)
 		oidc.POST("/introspect", sc.OIDCIntrospect)
 		oidc.POST("/revoke", sc.OIDCRevoke)
 		oidc.POST("/exchange/spiffe", sc.OIDCExchangeSPIFFE)
-		oidc.POST("/issue/jwt-svid", sc.OIDCIssueJWTSVID)
+		oidc.POST("/issue/jwt-svid", admin, sc.OIDCIssueJWTSVID)
 		oidc.POST("/exchange/cloud", sc.OIDCExchangeCloud)
 		oidc.POST("/exchange/aws", sc.OIDCExchangeAWS)
 		oidc.POST("/exchange/azure", sc.OIDCExchangeAzure)
@@ -2355,33 +2456,28 @@ func registerSpireRoutes(r gin.IRouter) {
 	}
 
 	// ── Policy engine ──
-	policy := spire.Group("/policy")
+	policy := spire.Group("/policy", auth)
 	{
-		policy.POST("", sc.CreatePolicy)
 		policy.GET("", sc.ListPolicies)
 		policy.GET("/:id", sc.GetPolicy)
-		policy.PUT("/:id", sc.UpdatePolicy)
-		policy.DELETE("/:id", sc.DeletePolicy)
 		policy.POST("/evaluate", sc.EvaluatePolicy)
 		policy.POST("/batch-evaluate", sc.BatchEvaluatePolicy)
 		policy.POST("/test", sc.TestPolicy)
+		policy.POST("", admin, sc.CreatePolicy)
+		policy.PUT("/:id", admin, sc.UpdatePolicy)
+		policy.DELETE("/:id", admin, sc.DeletePolicy)
 	}
 
 	// ── Role bindings ──
-	roles := spire.Group("/roles")
+	roles := spire.Group("/roles", auth)
 	{
-		roles.POST("/bind", sc.BindRole)
-		roles.POST("/unbind", sc.UnbindRole)
 		roles.GET("/bindings", sc.ListRoleBindings)
+		roles.POST("/bind", admin, sc.BindRole)
+		roles.POST("/unbind", admin, sc.UnbindRole)
 	}
 
 	// ── Audit (admin + workspace-scoped) ──
-	audit := spire.Group("/audit")
-	audit.Use(
-		middlewares.AuthMiddleware(),
-		middlewares.RequireWorkspaceRole("owner", "admin"),
-		middlewares.ValidateWorkspaceFromToken(),
-	)
+	audit := spire.Group("/audit", auth, admin)
 	{
 		audit.GET("/logs", sc.GetAuditLogs)
 		audit.GET("/logs/export", sc.ExportAuditLogs)

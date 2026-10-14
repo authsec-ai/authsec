@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
@@ -152,7 +153,9 @@ func ExternalPrincipalAccount(accts *Accounts, inRevision map[uuid.UUID]bool, ac
 // ExternalPrincipalAccount) or null when the principal states none;
 // account_connected repeats account.connected, and is null with it -- a
 // service principal is not "in an unconnected account". resolution is null
-// when no resolution was ever recorded (D-87), else the stored one;
+// when no resolution was ever recorded (D-87) and none is derived at read
+// time (D-108: an IRSA / Pod Identity principal naming a ServiceAccount of
+// the workspace's own clusters), else the stored -- or read-time -- one;
 // unresolved_reason is null exactly when a resolution is in force (state
 // active, with a target). lifecycle is derived (D-47): active while any
 // can_assume from it is current or stale, retired once every one has ended,
@@ -248,7 +251,7 @@ var idetailExternalSurfaces = idetailSurfaces{
 // GetExternalPrincipal serves GET /external-principals/:id. 404 not_found
 // when nothing is published (D-4), for a malformed id or another type's
 // reference (D-5), and when the principal is not this workspace's.
-func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) GetExternalPrincipal(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	rev, perr := idetailParams(vals, "rev")
 	if perr != nil {
 		return nil, perr
@@ -258,7 +261,7 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 		return nil, nerr
 	}
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}
@@ -290,6 +293,17 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 			FirstSeenAt:     T(ep.FirstSeenAt),
 			LastSeenAt:      T(ep.LastSeenAt),
 			LastConfirmedAt: TS(ep.LastConfirmedAt),
+		}
+		if detail.Resolution == nil {
+			// D-108: a principal naming a Kubernetes ServiceAccount of this
+			// workspace resolves at read time, as the graph draws it.
+			cross, err := readCross(func() (*gorm.DB, error) { return q.DB(), nil }, q.WS, true)
+			if err != nil {
+				return err
+			}
+			if m, ok := cross.match(ep.ID); ok {
+				detail.Resolution = crossDetailResolution(m)
+			}
 		}
 		if detail.Lifecycle == models.IGALifecycleRetired {
 			detail.RetiredReason = strPtr(ExternalRetiredNoLongerReferenced)
@@ -403,7 +417,8 @@ type idetailReferencedScan struct {
 // referenced-by: a single-collection tab in the §5.2 list envelope (D-77),
 // 100 per page (limit 1-200), ordered by the target role's name, then
 // account, then the claim id (D-13); include_ended adds ended edges (D-12).
-func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	rev, perr := idetailParams(vals, "rev", "cursor", "limit", "include_ended")
 	if perr != nil {
 		return nil, perr
@@ -433,7 +448,7 @@ func (r *Reader) ExternalPrincipalReferencedBy(ctx context.Context, ws uuid.UUID
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}

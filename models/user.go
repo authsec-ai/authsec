@@ -31,6 +31,8 @@ type LoginResponse struct {
 	MFAMethod        string   `json:"mfa_method,omitempty"`
 	Methods          []string `json:"methods,omitempty"`
 	Token            string   `json:"token,omitempty"`
+	// LoginTicket proves the first factor to the MFA step that follows.
+	LoginTicket string `json:"login_ticket,omitempty"`
 }
 
 // LoginVerifyOTPInput represents the input for login OTP verification

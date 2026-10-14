@@ -4,259 +4,86 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	stderrors "errors"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
-// PostgresWorkloadRepository implements the WorkloadRepository interface
+// PostgresWorkloadRepository stores directly attested workloads
+// (spire_attested_workloads) of the workspace carried by ctx.
 type PostgresWorkloadRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresWorkloadRepository creates a new workload repository
+// NewPostgresWorkloadRepository creates the attested workload repository.
 func NewPostgresWorkloadRepository(db *sql.DB) repositories.WorkloadRepository {
 	return &PostgresWorkloadRepository{db: db}
 }
 
-// GetByID retrieves a workload by ID
-func (r *PostgresWorkloadRepository) GetByID(ctx context.Context, workspaceID, id string) (*models.Workload, error) {
-	query := `
-		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
-		FROM workloads
-		WHERE id = $1 AND workspace_id = $2
-	`
+const workloadColumns = `id::text, workspace_id::text, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at`
 
-	return r.scanWorkload(ctx, query, id, workspaceID)
+// GetByID returns the workload with this id in ctx's workspace.
+func (r *PostgresWorkloadRepository) GetByID(ctx context.Context, id string) (*models.Workload, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, errors.NewNotFoundError("Workload not found", nil)
+	}
+	return r.getOne(ctx, `SELECT `+workloadColumns+` FROM spire_attested_workloads WHERE workspace_id = $1 AND id = $2`, id)
 }
 
-// GetBySpiffeID retrieves a workload by SPIFFE ID
-func (r *PostgresWorkloadRepository) GetBySpiffeID(ctx context.Context, workspaceID, spiffeID string) (*models.Workload, error) {
-	query := `
-		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
-		FROM workloads
-		WHERE spiffe_id = $1 AND workspace_id = $2
-	`
-
-	return r.scanWorkload(ctx, query, spiffeID, workspaceID)
+// GetBySpiffeID returns the workload with this SPIFFE ID in ctx's workspace.
+func (r *PostgresWorkloadRepository) GetBySpiffeID(ctx context.Context, spiffeID string) (*models.Workload, error) {
+	return r.getOne(ctx, `SELECT `+workloadColumns+` FROM spire_attested_workloads WHERE workspace_id = $1 AND spiffe_id = $2`, spiffeID)
 }
 
-// Create creates a new workload
-func (r *PostgresWorkloadRepository) Create(ctx context.Context, workload *models.Workload) error {
-	query := `
-		INSERT INTO workloads (id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`
-
-	now := time.Now()
-	workload.CreatedAt = now
-	workload.UpdatedAt = now
-
-	selectorsJSON, err := json.Marshal(workload.Selectors)
-	if err != nil {
-		return errors.NewInternalError("Failed to marshal selectors", err)
-	}
-
-	_, err = r.db.ExecContext(ctx, query,
-		workload.ID,
-		workload.WorkspaceID,
-		workload.SpiffeID,
-		selectorsJSON,
-		workload.VaultRole,
-		workload.Status,
-		workload.AttestationType,
-		workload.CreatedAt,
-		workload.UpdatedAt,
-	)
-
-	if err != nil {
-		return errors.NewInternalError("Failed to create workload", err)
-	}
-
-	return nil
-}
-
-// Update updates an existing workload
-func (r *PostgresWorkloadRepository) Update(ctx context.Context, workload *models.Workload) error {
-	query := `
-		UPDATE workloads
-		SET selectors = $3, vault_role = $4, status = $5, attestation_type = $6, updated_at = $7
-		WHERE id = $1 AND workspace_id = $2
-	`
-
-	workload.UpdatedAt = time.Now()
-
-	selectorsJSON, err := json.Marshal(workload.Selectors)
-	if err != nil {
-		return errors.NewInternalError("Failed to marshal selectors", err)
-	}
-
-	result, err := r.db.ExecContext(ctx, query,
-		workload.ID,
-		workload.WorkspaceID,
-		selectorsJSON,
-		workload.VaultRole,
-		workload.Status,
-		workload.AttestationType,
-		workload.UpdatedAt,
-	)
-
-	if err != nil {
-		return errors.NewInternalError("Failed to update workload", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-
-	if rows == 0 {
-		return errors.NewNotFoundError("Workload not found", nil)
-	}
-
-	return nil
-}
-
-// Delete deletes a workload
-func (r *PostgresWorkloadRepository) Delete(ctx context.Context, workspaceID, id string) error {
-	query := `DELETE FROM workloads WHERE id = $1 AND workspace_id = $2`
-
-	result, err := r.db.ExecContext(ctx, query, id, workspaceID)
-	if err != nil {
-		return errors.NewInternalError("Failed to delete workload", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-
-	if rows == 0 {
-		return errors.NewNotFoundError("Workload not found", nil)
-	}
-
-	return nil
-}
-
-// ListByTenant retrieves all workloads for a tenant
-func (r *PostgresWorkloadRepository) ListByTenant(ctx context.Context, workspaceID string) ([]*models.Workload, error) {
-	query := `
-		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
-		FROM workloads
-		WHERE workspace_id = $1
-		ORDER BY created_at DESC
-	`
-
-	return r.queryWorkloads(ctx, query, workspaceID)
-}
-
-// FindBySelectors finds workloads matching the given selectors
-func (r *PostgresWorkloadRepository) FindBySelectors(ctx context.Context, workspaceID string, selectors map[string]string) ([]*models.Workload, error) {
-	// This is a simplified implementation
-	// In production, you'd want more sophisticated JSONB querying
-	query := `
-		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
-		FROM workloads
-		WHERE workspace_id = $1
-	`
-
-	workloads, err := r.queryWorkloads(ctx, query, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Filter by selectors in memory (not ideal for large datasets)
-	var filtered []*models.Workload
-	for _, w := range workloads {
-		if matchesSelectors(w.Selectors, selectors) {
-			filtered = append(filtered, w)
-		}
-	}
-
-	return filtered, nil
-}
-
-// scanWorkload scans a single workload
-func (r *PostgresWorkloadRepository) scanWorkload(ctx context.Context, query string, args ...interface{}) (*models.Workload, error) {
-	workload := &models.Workload{}
-	var selectorsJSON []byte
-
-	err := r.db.QueryRowContext(ctx, query, args...).Scan(
-		&workload.ID,
-		&workload.WorkspaceID,
-		&workload.SpiffeID,
-		&selectorsJSON,
-		&workload.VaultRole,
-		&workload.Status,
-		&workload.AttestationType,
-		&workload.CreatedAt,
-		&workload.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
+func (r *PostgresWorkloadRepository) getOne(ctx context.Context, query string, arg interface{}) (*models.Workload, error) {
+	w := &models.Workload{}
+	var selectors []byte
+	err := tenancy.QueryRowContext(ctx, r.db, query, []interface{}{arg},
+		&w.ID, &w.WorkspaceID, &w.SpiffeID, &selectors, &w.VaultRole, &w.Status,
+		&w.AttestationType, &w.CreatedAt, &w.UpdatedAt)
+	if stderrors.Is(err, tenancy.ErrNotFound) {
 		return nil, errors.NewNotFoundError("Workload not found", err)
 	}
 	if err != nil {
 		return nil, errors.NewInternalError("Failed to get workload", err)
 	}
-
-	if err := json.Unmarshal(selectorsJSON, &workload.Selectors); err != nil {
-		return nil, errors.NewInternalError("Failed to unmarshal selectors", err)
+	if len(selectors) > 0 {
+		if err := json.Unmarshal(selectors, &w.Selectors); err != nil {
+			return nil, errors.NewInternalError("Failed to parse selectors", err)
+		}
 	}
-
-	return workload, nil
+	return w, nil
 }
 
-// queryWorkloads queries multiple workloads
-func (r *PostgresWorkloadRepository) queryWorkloads(ctx context.Context, query string, args ...interface{}) ([]*models.Workload, error) {
-	rows, err := r.db.QueryContext(ctx, query, args...)
+// Create inserts a workload for ctx's workspace.
+func (r *PostgresWorkloadRepository) Create(ctx context.Context, w *models.Workload) error {
+	ws, err := workspaceOf(ctx)
 	if err != nil {
-		return nil, errors.NewInternalError("Failed to query workloads", err)
+		return err
 	}
-	defer rows.Close()
-
-	var workloads []*models.Workload
-	for rows.Next() {
-		workload := &models.Workload{}
-		var selectorsJSON []byte
-
-		err := rows.Scan(
-			&workload.ID,
-			&workload.WorkspaceID,
-			&workload.SpiffeID,
-			&selectorsJSON,
-			&workload.VaultRole,
-			&workload.Status,
-			&workload.AttestationType,
-			&workload.CreatedAt,
-			&workload.UpdatedAt,
-		)
-		if err != nil {
-			return nil, errors.NewInternalError("Failed to scan workload", err)
-		}
-
-		if err := json.Unmarshal(selectorsJSON, &workload.Selectors); err != nil {
-			return nil, errors.NewInternalError("Failed to unmarshal selectors", err)
-		}
-
-		workloads = append(workloads, workload)
+	if w.ID == "" {
+		w.ID = uuid.NewString()
 	}
-
-	if err = rows.Err(); err != nil {
-		return nil, errors.NewInternalError("Error iterating workloads", err)
+	w.WorkspaceID = ws.String()
+	now := time.Now()
+	w.CreatedAt, w.UpdatedAt = now, now
+	selectors, err := json.Marshal(nonNilMap(w.Selectors))
+	if err != nil {
+		return errors.NewInternalError("Failed to marshal selectors", err)
 	}
-
-	return workloads, nil
-}
-
-// matchesSelectors checks if workload selectors match the given selectors
-func matchesSelectors(workloadSelectors, querySelectors map[string]string) bool {
-	for key, value := range querySelectors {
-		if workloadSelectors[key] != value {
-			return false
-		}
+	_, err = tenancy.InsertContext(ctx, r.db, `
+		INSERT INTO spire_attested_workloads (
+			workspace_id, id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		w.ID, w.SpiffeID, selectors, w.VaultRole, w.Status, w.AttestationType, w.CreatedAt, w.UpdatedAt)
+	if err != nil {
+		return errors.NewInternalError("Failed to create workload", err)
 	}
-	return true
+	return nil
 }

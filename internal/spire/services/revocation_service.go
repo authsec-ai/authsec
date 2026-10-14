@@ -2,138 +2,86 @@ package services
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
-	"github.com/authsec-ai/authsec/internal/spire/infrastructure/database"
-	infraRepos "github.com/authsec-ai/authsec/internal/spire/infrastructure/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 )
 
-// RevocationService handles certificate revocation
+// RevocationService revokes certificates of attested workloads of the
+// workspace carried by ctx.
 type RevocationService struct {
-	certRepo    repositories.CertificateRepository
-	auditRepo   repositories.AuditRepository
-	workspaceRepo  repositories.WorkspaceRepository
-	vaultClient *vault.Client
-	connManager *database.ConnectionManager // For tenant-specific DB connections
-	logger      *logrus.Entry
+	workspaceRepo repositories.WorkspaceRepository
+	certRepo      repositories.CertificateRepository
+	auditRepo     repositories.AuditRepository
+	vaultClient   *vault.Client
+	logger        *logrus.Entry
 }
 
-// NewRevocationService creates a new revocation service
+// NewRevocationService creates the revocation service.
 func NewRevocationService(
+	workspaceRepo repositories.WorkspaceRepository,
 	certRepo repositories.CertificateRepository,
 	auditRepo repositories.AuditRepository,
-	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
-	connManager *database.ConnectionManager,
 	logger *logrus.Entry,
 ) *RevocationService {
 	return &RevocationService{
-		certRepo:    certRepo,
-		auditRepo:   auditRepo,
-		workspaceRepo:  workspaceRepo,
-		vaultClient: vaultClient,
-		connManager: connManager,
-		logger:      logger,
+		workspaceRepo: workspaceRepo,
+		certRepo:      certRepo,
+		auditRepo:     auditRepo,
+		vaultClient:   vaultClient,
+		logger:        logger,
 	}
 }
 
-// RevokeRequest represents a revocation request
+// RevokeRequest is a certificate revocation.
 type RevokeRequest struct {
-	WorkspaceID     string
 	SerialNumber string
 	Reason       string
 	IPAddress    string
 	UserAgent    string
 }
 
-// Revoke revokes a certificate
+// Revoke revokes a certificate of ctx's workspace; another workspace's
+// serial is not found.
 func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) error {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id":     req.WorkspaceID,
-		"serial_number": req.SerialNumber,
-	}).Info("Starting certificate revocation")
-
-	// Validate tenant
-	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
+	workspaceID, err := workspaceFromContext(ctx)
 	if err != nil {
-		s.auditRevocation(ctx, req, false, err.Error())
 		return err
 	}
-
-	if !tenant.IsActive() {
-		s.auditRevocation(ctx, req, false, "tenant not active")
-		return errors.NewForbiddenError("Tenant is not active", nil)
-	}
-
-	// Get tenant-specific repositories
-	certRepo, _, err := s.getWorkspaceRepositories(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, workspaceID)
 	if err != nil {
-		s.logger.WithError(err).Error("Failed to get tenant repositories")
-		return errors.NewInternalError("Failed to connect to tenant database", err)
+		return errors.NewNotFoundError("Workspace not found", err)
 	}
-
-	// Get certificate
-	cert, err := certRepo.GetBySerialNumber(ctx, req.WorkspaceID, req.SerialNumber)
+	cert, err := s.certRepo.GetBySerialNumber(ctx, req.SerialNumber)
 	if err != nil {
-		s.auditRevocation(ctx, req, false, "certificate not found")
+		s.audit(ctx, req, false, "certificate not found")
 		return errors.NewNotFoundError("Certificate not found", err)
 	}
-
-	// Check if already revoked
 	if cert.RevokedAt != nil {
-		s.auditRevocation(ctx, req, false, "certificate already revoked")
+		s.audit(ctx, req, false, "certificate already revoked")
 		return errors.NewConflictError("Certificate already revoked", nil)
 	}
-
-	// Revoke in Vault
+	if !s.vaultClient.Available() {
+		return vault.ErrUnavailable
+	}
 	if err := s.vaultClient.RevokeCertificate(ctx, tenant.VaultMount, req.SerialNumber); err != nil {
-		s.auditRevocation(ctx, req, false, "vault revocation failed")
+		s.audit(ctx, req, false, "vault revocation failed")
 		return err
 	}
-
-	// Update certificate status
-	if err := certRepo.Revoke(ctx, req.WorkspaceID, cert.ID); err != nil {
+	if err := s.certRepo.Revoke(ctx, cert.ID); err != nil {
 		s.logger.WithField("serial_number", req.SerialNumber).WithError(err).Error("Failed to update certificate status")
-		// Don't fail - certificate is already revoked in Vault
 	}
-
-	// Audit success
-	s.auditRevocation(ctx, req, true, "")
-
-	s.logger.WithField("serial_number", req.SerialNumber).Info("Certificate revoked successfully")
-
+	s.audit(ctx, req, true, "")
 	return nil
 }
 
-// getWorkspaceRepositories creates repositories connected to the tenant's database
-func (s *RevocationService) getWorkspaceRepositories(ctx context.Context, workspaceID string) (
-	repositories.CertificateRepository,
-	repositories.AuditRepository,
-	error,
-) {
-	// Get tenant database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	// Create tenant-specific repositories
-	certRepo := infraRepos.NewPostgresCertificateRepository(tenantDB)
-	auditRepo := infraRepos.NewPostgresAuditRepository(tenantDB)
-
-	return certRepo, auditRepo, nil
-}
-
-// auditRevocation creates an audit log entry for revocation
-func (s *RevocationService) auditRevocation(ctx context.Context, req *RevokeRequest, success bool, errorMsg string) {
-	audit := &models.AuditLog{
-		WorkspaceID:     req.WorkspaceID,
+func (s *RevocationService) audit(ctx context.Context, req *RevokeRequest, success bool, errorMsg string) {
+	if err := s.auditRepo.Create(ctx, &models.AuditLog{
 		EventType:    models.EventRevoke,
 		Success:      success,
 		ErrorMessage: errorMsg,
@@ -143,9 +91,7 @@ func (s *RevocationService) auditRevocation(ctx context.Context, req *RevokeRequ
 		},
 		IPAddress: req.IPAddress,
 		UserAgent: req.UserAgent,
-	}
-
-	if err := s.auditRepo.Create(ctx, audit); err != nil {
+	}); err != nil {
 		s.logger.WithError(err).Error("Failed to create audit log")
 	}
 }

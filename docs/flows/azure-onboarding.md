@@ -222,7 +222,7 @@ Nothing secret. `cloud_connector.auth_ref` is the handle `azure-app:<client id>`
 
 | Row | scope_kind | scope_id | parent_scope_id | attrs |
 |---|---|---|---|---|
-| Tenant | `tenant` (migration 042) | tenant id | NULL | service principal object id, Graph permissions (granted, and usable, denied or license_required), `licensing` and `guardrails` (written by discovery) |
+| Tenant | `tenant` (migration 138) | tenant id | NULL | service principal object id, Graph permissions (granted, and usable, denied or license_required), `licensing` and `guardrails` (written by discovery) |
 | Subscription | `subscription` | subscription id | tenant id | display name, state, Reader assignment (status, assignment id, verified) |
 
 Inventory goes to `cloud_resource`, one row per resource Azure Resource Graph
@@ -282,7 +282,7 @@ while a pass is in flight). One run per tenant at a time.
 | `GET /v1.0/applications/{id}/federatedIdentityCredentials` | `cloud_assume_edge` `mechanism=oidc_federation` on the app's service principal: `ci_pipeline` (GitHub Actions, GitLab, Terraform Cloud, ...), `k8s_service_account` (with `k8s_ref`), `identity` (another Entra identity) or `external_account` |
 | `GET /beta/reports/servicePrincipalSignInActivities` | `cloud_identity.last_used_at` and last app-only / delegated sign-in in attrs (P1/P2) |
 | `GET /beta/reports/appCredentialSignInActivities` | `cloud_secret.last_used_at` (P1/P2) |
-| `GET /beta/auditLogs/signIns` (servicePrincipal, managedIdentity; last 7 days, newest 20,000 per type) | `cloud_usage` `source=entra_sign_in` (migration 043): one row per identity per resource, with counts, failures, source IPs, `ai_service` for Azure AI (OpenAI, Cognitive Services), and the `cadence`: hours of the day active, days active, the typical gap between sign-ins and whether it is `regular` (a schedule) -- never the raw times. Application permissions are then stamped `last_exercised_at` from the last sign-in to their API |
+| `GET /beta/auditLogs/signIns` (servicePrincipal, managedIdentity; last 7 days, newest 20,000 per type) | `cloud_usage` `source=entra_sign_in` (migration 139): one row per identity per resource, with counts, failures, source IPs, `ai_service` for Azure AI (OpenAI, Cognitive Services), and the `cadence`: hours of the day active, days active, the typical gap between sign-ins and whether it is `regular` (a schedule) -- never the raw times. Application permissions are then stamped `last_exercised_at` from the last sign-in to their API |
 | `GET /v1.0/servicePrincipals/microsoft.graph.agentIdentity` | Microsoft Entra Agent ID agent identities: `cloud_identity` kind `entra_agent_identity`, with the blueprint it was created from (`agent_blueprint_app_id`), its agent user and `agent_listed=true` (`AgentIdentity.Read.All`). A service principal of type `ServiceIdentity` in the base listing is an agent identity too |
 | `GET /v1.0/applications/microsoft.graph.agentIdentityBlueprint` | blueprints: `entra_application` with `agent_type=agent_identity_blueprint` and `agent_count`; their secrets, certificates and federated credentials are read as any app registration's -- they are the credentials the agents sign in with (`AgentIdentityBlueprint.Read.All`) |
 | `GET /v1.0/servicePrincipals/microsoft.graph.agentIdentityBlueprintPrincipal` | the blueprints' service principals: `entra_service_principal` with `agent_type=agent_identity_blueprint_principal` (`AgentIdentityBlueprintPrincipal.Read.All`) |
@@ -323,7 +323,7 @@ assignment's `principalId` joins to its identity directly.
 | `Microsoft.ManagedIdentity/userAssignedIdentities/{id}/federatedIdentityCredentials` | `cloud_assume_edge` on the managed identity (the AKS workload identity join key) |
 | Resource Graph `ResourceContainers` (the subscription and its resource groups) | the subscription connector's attrs `tags` and `stage` (`production`, `non_production`, `unknown`, from `env`/`environment`/`stage`/`tier` tags). Resources with no environment tag of their own take their resource group's, else the subscription's; a role grant on a production scope moves up one sensitivity level (low to med, med to high) |
 | Resource Graph, `Microsoft.Network/publicIPAddresses` and `publicIPPrefixes`, network interfaces | the subscription connector's attrs `public_ips`: each address or prefix and what it is attached to (a VM, a load balancer, a NAT gateway), for sign-in origins |
-| `Microsoft.Insights/eventtypes/management/values` (Activity Log, last 7 days) | `cloud_usage` `source=activity_log` (migration 044): one row per identity per resource provider, from SUCCEEDED operations; and `last_exercised_at` on each Azure RBAC grant whose actions and scope cover an operation its holder performed |
+| `Microsoft.Insights/eventtypes/management/values` (Activity Log, last 7 days) | `cloud_usage` `source=activity_log` (migration 140): one row per identity per resource provider, from SUCCEEDED operations; and `last_exercised_at` on each Azure RBAC grant whose actions and scope cover an operation its holder performed |
 
 A role assigned ABOVE the subscription (a management group or the root) is
 listed by every subscription below it. Each subscription keeps its own copy

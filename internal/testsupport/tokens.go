@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -36,35 +37,52 @@ type UserTokenParams struct {
 	ExpiresIn   time.Duration // defaults to 24h
 }
 
-// MintAdminToken returns a signed HS256 JWT for an admin user.
+// harnessSecrets are the session-token secrets the harness configures.
+var harnessSecrets = sessiontoken.Secrets{Default: HarnessJWTSecret, SDK: HarnessJWTSecret, Other: HarnessJWTSecret}
+
+// MintAdminToken returns an admin-class (console) session token, as the
+// platform mints it (AS-033).
 func MintAdminToken(p AdminTokenParams) (string, error) {
-	exp := time.Now().Add(24 * time.Hour)
-	claims := jwt.MapClaims{
+	return sessiontoken.SignWith(harnessSecrets, sessiontoken.Admin, adminClaims(p))
+}
+
+// MintLegacyAdminToken returns a typ-less admin token signed with a raw
+// secret, as minted before token classes existed.
+func MintLegacyAdminToken(p AdminTokenParams) (string, error) {
+	claims := adminClaims(p)
+	claims["aud"] = []string{"authsec-api"}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tok.Header["kid"] = "default"
+	return tok.SignedString([]byte(HarnessJWTSecret))
+}
+
+func adminClaims(p AdminTokenParams) jwt.MapClaims {
+	return jwt.MapClaims{
 		"iss":          HarnessIssuer,
-		"aud":          []string{"authsec-api"},
 		"sub":          p.UserID.String(),
 		"workspace_id": p.WorkspaceID.String(),
 		"client_id":    p.UserID.String(),
 		"email_id":     p.Email,
 		"roles":        p.Roles,
 		"iat":          time.Now().Unix(),
-		"exp":          exp.Unix(),
-		"kid":          "default",
+		"exp":          time.Now().Add(24 * time.Hour).Unix(),
+		"jti":          uuid.NewString(),
 	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tok.Header["kid"] = "default"
-	return tok.SignedString([]byte(HarnessJWTSecret))
 }
 
-// MintUserToken returns a signed HS256 JWT for an end user.
+// MintUserToken returns an end-user-class session token.
 func MintUserToken(p UserTokenParams) (string, error) {
+	return MintClassToken(sessiontoken.EndUser, p)
+}
+
+// MintClassToken returns a session token of the given class for a user.
+func MintClassToken(class sessiontoken.Class, p UserTokenParams) (string, error) {
 	exp := p.ExpiresIn
 	if exp == 0 {
 		exp = 24 * time.Hour
 	}
 	claims := jwt.MapClaims{
 		"iss":          HarnessIssuer,
-		"aud":          []string{"authsec-api"},
 		"sub":          p.UserID.String(),
 		"workspace_id": p.WorkspaceID.String(),
 		"project_id":   p.WorkspaceID.String(),
@@ -72,11 +90,8 @@ func MintUserToken(p UserTokenParams) (string, error) {
 		"email_id":     p.Email,
 		"iat":          time.Now().Unix(),
 		"exp":          time.Now().Add(exp).Unix(),
-		"kid":          "default",
 	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tok.Header["kid"] = "default"
-	return tok.SignedString([]byte(HarnessJWTSecret))
+	return sessiontoken.SignWith(harnessSecrets, class, claims)
 }
 
 // MintExpiredToken returns a token with exp in the past (for rejection tests).

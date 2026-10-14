@@ -323,15 +323,6 @@ func isAzureAIService(name, appID string) bool {
 	return false
 }
 
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func distinctIdentities(rows []models.CloudUsage) map[uuid.UUID]bool {
 	out := map[uuid.UUID]bool{}
 	for _, r := range rows {
