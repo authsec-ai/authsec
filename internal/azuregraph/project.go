@@ -329,6 +329,10 @@ func (w *writer) upsertIdentity(c models.CloudIdentity) error {
 	_ = json.Unmarshal(c.Attrs, &attrs)
 	attrs["object_id"] = c.NativeID
 	attrs["enabled"] = c.Enabled
+	// The unified inventory's scope (internal/igaread): an Entra object is
+	// the tenant's.
+	attrs["native_id"] = c.NativeID
+	w.tenantScopeAttrs(attrs)
 	if c.LastUsedAt != nil {
 		attrs["last_sign_in_at"] = c.LastUsedAt
 	}
@@ -366,11 +370,13 @@ func (w *writer) projectResources() error {
 	keys := make([]string, 0, len(resources))
 	for _, r := range resources {
 		key := ResourceKey(w.p.TenantID, r.NativeID)
-		raw, err := json.Marshal(map[string]interface{}{
+		ra := map[string]interface{}{
 			"native_id": r.NativeID, "account": r.ResourceAccount,
 			"sensitivity": r.Sensitivity, "sensitivity_source": r.SensitivitySource,
 			"sensitivity_reason": r.SensitivityReason,
-		})
+		}
+		w.nodeScopeAttrs(ra, r.NativeID, "")
+		raw, err := json.Marshal(ra)
 		if err != nil {
 			return err
 		}
@@ -403,6 +409,59 @@ func (w *writer) projectResources() error {
 		return err
 	}
 	return w.support("resource_id", ids, TargetNode, models.ObjectResource)
+}
+
+// The scope kinds the unified inventory (internal/igaread) shows an Azure row
+// under, written into provider_attrs as Kubernetes and GitHub rows state
+// theirs: scope_kind, scope_id, scope_label, sub_scope and native_id. The
+// scope id is the lowercased tenant or subscription id, the id the shared
+// connections list gives the same connection.
+const (
+	ScopeKindTenant       = "azure_tenant"
+	ScopeKindSubscription = "azure_subscription"
+)
+
+// tenantScopeAttrs states the tenant as a row's scope.
+func (w *writer) tenantScopeAttrs(attrs map[string]interface{}) {
+	t := strings.ToLower(w.p.TenantID)
+	attrs["scope_kind"], attrs["scope_id"], attrs["scope_label"] = ScopeKindTenant, t, t
+	delete(attrs, "sub_scope")
+}
+
+// nodeScopeAttrs states a resource's or workload's scope: its subscription,
+// with its resource group (else its region) as the sub-scope, when the pass is
+// a subscription's and the ARM id is under it; the tenant otherwise (an
+// API-plane resource such as an app role).
+func (w *writer) nodeScopeAttrs(attrs map[string]interface{}, armID, region string) {
+	sub := strings.ToLower(w.p.ScopeID)
+	id := strings.ToLower(armID)
+	if w.p.ScopeKind != models.CloudScopeSubscription || sub == "" || !strings.HasPrefix(id, "/subscriptions/"+sub) {
+		w.tenantScopeAttrs(attrs)
+		return
+	}
+	label := w.p.ScopeLabel
+	if label == "" {
+		label = sub
+	}
+	attrs["scope_kind"], attrs["scope_id"], attrs["scope_label"] = ScopeKindSubscription, sub, label
+	if rg := armResourceGroup(armID); rg != "" {
+		attrs["sub_scope"] = rg
+	} else if region != "" {
+		attrs["sub_scope"] = region
+	} else {
+		delete(attrs, "sub_scope")
+	}
+}
+
+// armResourceGroup is the resource group an ARM id names, as written, or "".
+func armResourceGroup(armID string) string {
+	parts := strings.Split(armID, "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if strings.EqualFold(parts[i], "resourceGroups") {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 // scopeForNodes is the estate scope a pass's resources and workloads sit in.
@@ -710,6 +769,19 @@ func (w *writer) projectWorkloads() error {
 		}
 		var attrs map[string]interface{}
 		_ = json.Unmarshal(r.Attrs, &attrs)
+		if attrs == nil {
+			attrs = map[string]interface{}{}
+		}
+		armID, _ := attrs["resource_id"].(string)
+		if armID == "" {
+			armID = strings.SplitN(r.NativeID, "#", 2)[0]
+		}
+		attrs["native_id"] = armID
+		w.nodeScopeAttrs(attrs, armID, r.Region)
+		wattrs, err := json.Marshal(attrs)
+		if err != nil {
+			return err
+		}
 		if identityKey != "" {
 			if _, ok := identityIDs[identityKey]; ok {
 				state = "resolved"
@@ -723,13 +795,13 @@ func (w *writer) projectWorkloads() error {
 			"id": uuid.New(), "workspace_id": w.p.WorkspaceID, "estate_scope_id": w.scopeForNodes(),
 			"provider": models.ProviderAzure, "runtime_kind": r.RuntimeKind, "display_name": r.Name,
 			"region": r.Region, "lifecycle": models.IGALifecycleActive, "source_key": key,
-			"continuity": models.ContinuityRecognitionOnly, "provider_attrs": []byte(r.Attrs),
+			"continuity": models.ContinuityRecognitionOnly, "provider_attrs": wattrs,
 			"execution_role_state": state, "execution_role_arn": ref,
 			"first_seen_at": w.now, "last_seen_at": w.now, "created_at": w.now, "updated_at": w.now,
 		}
 		if err := w.tx.Table("iga_workload").Clauses(conflictOn(liveWorkload, map[string]interface{}{
 			"display_name": r.Name, "runtime_kind": r.RuntimeKind, "region": r.Region,
-			"provider_attrs": []byte(r.Attrs), "execution_role_state": state, "execution_role_arn": ref,
+			"provider_attrs": wattrs, "execution_role_state": state, "execution_role_arn": ref,
 			"last_seen_at": w.now, "updated_at": w.now,
 		})).Create(row).Error; err != nil {
 			return fmt.Errorf("workload %s: %w", r.NativeID, err)

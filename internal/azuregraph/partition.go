@@ -123,7 +123,10 @@ type Pass struct {
 	// way.
 	ScopeID  string
 	TenantID string
-	RunID    uuid.UUID
+	// ScopeLabel is the subscription's display name; empty for a tenant pass
+	// (the tenant is labelled by its id).
+	ScopeLabel string
+	RunID      uuid.UUID
 	// Stage is the subscription's environment from its tags (production,
 	// non_production, unknown); empty for a tenant pass.
 	Stage string

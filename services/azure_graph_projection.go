@@ -37,12 +37,13 @@ func (s *AzureOnboardingService) projectGraph(ctx context.Context, workspaceID u
 		passes = append(passes, s.graphPass(workspaceID, tenantID, models.CloudScopeTenant, tenantID, tenantPass))
 	}
 	for _, sp := range subPasses {
-		subID, stage := "", ""
+		subID, stage, label := "", "", ""
 		if c, err := s.connectors.Get(workspaceID, sp.ConnectorID); err == nil {
-			subID, stage = c.ScopeID, c.AzureSubscriptionAttrs().Stage
+			a := c.AzureSubscriptionAttrs()
+			subID, stage, label = c.ScopeID, a.Stage, a.DisplayName
 		}
 		p := s.graphPass(workspaceID, tenantID, models.CloudScopeSubscription, subID, sp)
-		p.Stage = stage
+		p.Stage, p.ScopeLabel = stage, label
 		passes = append(passes, p)
 	}
 	for _, p := range passes {
