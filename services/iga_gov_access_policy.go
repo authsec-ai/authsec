@@ -425,6 +425,20 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 		p.warnings = append(p.warnings, AccessIssue{Code: "allow_needs_bucket_policy",
 			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
 	}
+	if norm.Effect == igagov.AccessEffectBlock && norm.Resource.Prefix != "" {
+		for _, a := range norm.Access {
+			if a != igagov.AccessRead && a != igagov.AccessAll {
+				continue
+			}
+			p.warnings = append(p.warnings, AccessIssue{Code: "list_root_blocked",
+				Message: "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."})
+			if igagov.AccessListGuardPartial(norm.Effect, norm.Resource.Prefix) {
+				p.warnings = append(p.warnings, AccessIssue{Code: "list_partial_prefix",
+					Message: "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."})
+			}
+			break
+		}
+	}
 	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths",
 		Message: "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."})
 	return p, nil
