@@ -275,6 +275,14 @@ type ServicePrincipal struct {
 	AppOwnerOrganizationID string    `json:"appOwnerOrganizationId"`
 	AccountEnabled         *bool     `json:"accountEnabled"`
 	AppRoles               []AppRole `json:"appRoles,omitempty"`
+	// Read by identity discovery only.
+	ServicePrincipalType string       `json:"servicePrincipalType,omitempty"`
+	AlternativeNames     []string     `json:"alternativeNames,omitempty"`
+	PasswordCredentials  []Credential `json:"passwordCredentials,omitempty"`
+	KeyCredentials       []Credential `json:"keyCredentials,omitempty"`
+	// ODataType is set when the object is a subtype
+	// ("#microsoft.graph.agentIdentity").
+	ODataType string `json:"@odata.type,omitempty"`
 }
 
 // AppRole is one application permission a resource exposes. Value is what a

@@ -17,7 +17,7 @@ import (
 var (
 	// ErrNotConfigured means the AZURE_AUTHSEC_* deployment configuration or
 	// Redis is missing. Fault: authsec.
-	ErrNotConfigured = errors.New("azure: entra onboarding is not configured in this deployment")
+	ErrNotConfigured = errors.New("azure: microsoft entra id onboarding is not configured in this deployment")
 
 	// ErrConsentDenied means the admin-consent leg came back without
 	// admin_consent=True: the admin declined, or the signed-in account cannot

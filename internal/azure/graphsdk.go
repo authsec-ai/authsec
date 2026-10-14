@@ -14,9 +14,11 @@ import (
 )
 
 // Microsoft Graph through the Graph SDK. The SDK builds every request (its
-// v1.0 request builders, or the same adapter with an explicit URL for a
-// nextLink or a permission probe) and sends it. The answer is decoded by
-// decodeResponse into this package's own types: the selected fields only.
+// request builders for v1.0; the same adapter with an explicit URL for beta
+// and for Agent ID, which no builder covers) and sends it. The answer is
+// decoded by decodeResponse into this package's own types, exactly as before:
+// the selected fields, @odata.type, and the secret-bearing fields left
+// undeclared so they are dropped.
 
 var graphHost = strings.TrimPrefix(GraphEndpoint, "https://")
 
@@ -126,8 +128,8 @@ func graphPaged[T any](ctx context.Context, c *Client, token string, first *abs.
 	return out, nil
 }
 
-// graphURL is a GET of an explicit Graph URL: a nextLink or a permission
-// probe. The SDK adapter still sends it.
+// graphURL is a GET of an explicit Graph URL: a nextLink, a beta or Agent ID
+// listing, or a permission probe. The SDK adapter still sends it.
 func graphURL(raw string) (*abs.RequestInformation, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -137,6 +139,15 @@ func graphURL(raw string) (*abs.RequestInformation, error) {
 	ri.Method = abs.GET
 	ri.SetUri(*u)
 	return ri, nil
+}
+
+// graphList builds a GET of path (from "/v1.0/" or "/beta/") with $select and
+// $top, for the listings no SDK builder covers.
+func graphList(path, sel, top string) (*abs.RequestInformation, error) {
+	q := url.Values{}
+	q.Set("$select", sel)
+	q.Set("$top", top)
+	return graphURL(GraphEndpoint + path + "?" + q.Encode())
 }
 
 func graphGet[T any](ctx context.Context, c *Client, token string, ri *abs.RequestInformation, buildErr error) (*T, error) {

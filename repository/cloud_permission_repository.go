@@ -323,7 +323,15 @@ func (r *cloudPermissionRepository) ListPermissions(workspaceID uuid.UUID, f Clo
 }
 
 func (r *cloudPermissionRepository) ListResources(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudResource, int64, error) {
-	q := r.db.Model(&models.CloudResource{}).Where("workspace_id = ?", workspaceID)
+	// Azure writes its subscription inventory to cloud_resource too, under a
+	// different rule (every resource the Reader assignment reaches, not only
+	// those a permission statement names -- see services/azure_discovery.go).
+	// This list is the grant-target list, so it leaves those rows out; Azure's
+	// are listed by CloudAzureRepository.ListResources.
+	azureConnectors := r.db.Model(&models.CloudConnector{}).Select("id").
+		Where("workspace_id = ? AND provider = ?", workspaceID, models.CloudProviderAzure)
+	q := r.db.Model(&models.CloudResource{}).
+		Where("workspace_id = ? AND connector_id NOT IN (?)", workspaceID, azureConnectors)
 	if f.ConnectorID != nil {
 		q = q.Where("connector_id = ?", *f.ConnectorID)
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -36,8 +37,8 @@ import (
 //     session id, for at most azureOAuthSessionTTL.
 //  4. Connect    -> verify the service principal and its Graph permissions,
 //     check the signed-in user may bind the tenant, list subscriptions,
-//     create the Reader assignment on each one AS THE ADMINISTRATOR, and
-//     prove each with AuthSec's OWN app-only token.
+//     create the Reader assignment on each one AS THE ADMINISTRATOR, prove
+//     each with AuthSec's OWN app-only token, and inventory the resources.
 //
 // Graph consent and Azure RBAC are separate grants. Admin consent gives the
 // service principal directory read access and nothing in any subscription;
@@ -55,19 +56,24 @@ type AzureOnboardingService struct {
 	redis      *redis.Client
 	cfg        azure.AppConfig
 	api        *azure.Client
+	vault      vault.VaultClient
 	connectors repositories.CloudConnectorRepository
+	inventory  repositories.CloudAzureRepository
 }
 
 // NewAzureOnboardingService constructs the service. redisClient may be nil, in
 // which case Available reports false and every flow method fails with
-// azure.ErrNotConfigured.
-func NewAzureOnboardingService(db *gorm.DB, redisClient *redis.Client, cfg azure.AppConfig) *AzureOnboardingService {
+// azure.ErrNotConfigured. vc is an optional Vault client for storing custom app
+// credentials; nil disables the custom-app onboarding path.
+func NewAzureOnboardingService(db *gorm.DB, redisClient *redis.Client, cfg azure.AppConfig, vc vault.VaultClient) *AzureOnboardingService {
 	return &AzureOnboardingService{
 		db:         db,
 		redis:      redisClient,
 		cfg:        cfg,
 		api:        azure.NewClient(nil),
+		vault:      vc,
 		connectors: repositories.NewCloudConnectorRepository(db),
+		inventory:  repositories.NewCloudAzureRepository(db),
 	}
 }
 
@@ -88,6 +94,11 @@ var (
 
 	// ErrAzureConnectorRevoked means a verify was asked of a revoked connector.
 	ErrAzureConnectorRevoked = errors.New("azure: this connection was revoked; connect the tenant again")
+
+	// ErrAzureVaultNotConfigured means a custom app flow was attempted but
+	// Vault (VAULT_ADDR/VAULT_TOKEN) is not configured, so the customer's
+	// client secret has nowhere safe to be stored.
+	ErrAzureVaultNotConfigured = errors.New("azure: vault is not configured; custom app credentials cannot be stored securely")
 )
 
 /* ------------------------------ redis payloads ------------------------------ */
@@ -106,6 +117,9 @@ const (
 	// azureVerifyBudget is the most Connect waits for Azure to apply a new
 	// Reader assignment before recording it as pending.
 	azureVerifyBudget = 60 * time.Second
+	// azureInventoryReserve is held back from the verification wait so the
+	// inventory pass always gets to run.
+	azureInventoryReserve = 30 * time.Second
 	// azureAssignConcurrency bounds parallel ARM writes per tenant.
 	azureAssignConcurrency = 4
 )
@@ -456,9 +470,11 @@ func (s *AzureOnboardingService) tenantSubscriptions(ctx context.Context, sess *
 // azureSubscriptionAssignable reports whether a subscription in this state
 // accepts new role assignments. Disabled, Expired and Deleted subscriptions
 // are read-only.
+// Azure allows write operations only in Enabled and PastDue; Warned, Disabled
+// and Expired block PUT/PATCH/POST, and a role assignment is a PUT.
 func azureSubscriptionAssignable(state string) bool {
 	switch strings.ToLower(state) {
-	case "enabled", "warned", "pastdue":
+	case "enabled", "pastdue":
 		return true
 	}
 	return false
@@ -487,6 +503,10 @@ type AzureConnectResult struct {
 	// AuthSec, "partial" otherwise. A tenant with no subscriptions is
 	// active: its Graph connection is the whole connection.
 	Status string `json:"status"`
+	// Discovery is whether the background identity and resource discovery
+	// started ("started") or one was already running ("already_running").
+	// Its progress is each connector's coverage.
+	Discovery string `json:"discovery"`
 }
 
 // Connect performs the onboarding for the session's tenant. subscriptionIDs
@@ -604,6 +624,17 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 		results[i].Status = conn.Status
 	}
 
+	// 10. Discover identities, grants and resources in the background: the
+	//     directory, then every subscription AuthSec can now read. A large
+	//     tenant takes longer than one request may.
+	var targets []azureScanTarget
+	for _, r := range results {
+		if r.ConnectorID != nil && r.Reader.Verified {
+			targets = append(targets, azureScanTarget{ConnectorID: *r.ConnectorID, SubscriptionID: r.SubscriptionID})
+		}
+	}
+	discovery := s.startDiscovery(workspaceID, tid, &storedTenant.ID, targets, models.AzureTriggerConnect)
+
 	// The administrator's token has done its job. Best-effort: the TTL
 	// removes the key regardless.
 	if err := s.redis.Del(context.WithoutCancel(ctx), azureOAuthSessionKey(sessionID)).Err(); err != nil {
@@ -622,6 +653,7 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 		GraphPermissions: perms,
 		Subscriptions:    results,
 		Status:           status,
+		Discovery:        discovery,
 	}, nil
 }
 
@@ -660,6 +692,189 @@ func selectSubscriptions(visible []azure.Subscription, wanted map[string]bool) (
 	return out, nil
 }
 
+/* ------------------------------ connect-custom ------------------------------- */
+
+// azureCustomAppVaultPath is where a workspace's customer-provided Azure app
+// credentials live, keyed by tenant id.
+func azureCustomAppVaultPath(workspaceID uuid.UUID, tenantID string) string {
+	return fmt.Sprintf("kv/data/secret/workspaces/%s/cloud-discovery/azure/%s",
+		workspaceID.String(), tenantID)
+}
+
+// ConnectCustom onboards a tenant using the customer's own Entra app
+// registration: client_credentials with their client_id/client_secret/tenant_id.
+// No browser OAuth flow is involved.
+func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspaceID uuid.UUID, actor string, customCfg azure.AppConfig, tenantID string) (*AzureConnectResult, error) {
+	ctx, cancel := context.WithTimeout(parent, azureConnectBudget)
+	defer cancel()
+
+	if s.vault == nil {
+		return nil, ErrAzureVaultNotConfigured
+	}
+	if s.redis == nil {
+		return nil, azure.ErrNotConfigured
+	}
+
+	// 1. Acquire a Graph token with the customer's credentials.
+	graphToken, err := s.api.AppToken(ctx, customCfg, tenantID, azure.ScopeGraphApp)
+	if err != nil {
+		logAzureError("custom app: graph app token", err)
+		return nil, err
+	}
+
+	// 2. Find the customer's service principal in the tenant.
+	sp, err := s.api.FindServicePrincipal(ctx, graphToken, customCfg.ClientID, false)
+	if err != nil {
+		logAzureError("custom app: find service principal", err)
+		return nil, err
+	}
+
+	// 3. Verify Graph permissions.
+	perms, missing, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("%w: %s", azure.ErrGraphPermissionsMissing, strings.Join(missing, ", "))
+	}
+
+	// 4. Store the customer's client_secret in Vault. The secret never touches
+	//    Postgres: auth_ref is the non-secret handle, vault_path holds the
+	//    Vault KV path on the connector.
+	vaultPath := azureCustomAppVaultPath(workspaceID, tenantID)
+	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{
+		"client_id":     customCfg.ClientID,
+		"client_secret": customCfg.ClientSecret,
+		"tenant_id":     tenantID,
+	}); err != nil {
+		return nil, fmt.Errorf("store custom app credentials: %w", err)
+	}
+
+	// 5. List subscriptions with the app's own ARM token.
+	armToken, err := s.api.AppToken(ctx, customCfg, tenantID, azure.ScopeARMApp)
+	if err != nil {
+		logAzureError("custom app: arm app token", err)
+		return nil, err
+	}
+	allSubs, err := s.api.ListSubscriptions(ctx, armToken)
+	if err != nil {
+		logAzureError("custom app: list subscriptions", err)
+		return nil, err
+	}
+	var subs []azure.Subscription
+	for _, sub := range allSubs {
+		if sub.TenantID != "" && !strings.EqualFold(sub.TenantID, tenantID) {
+			continue
+		}
+		if !azure.IsGUID(sub.SubscriptionID) {
+			continue
+		}
+		sub.SubscriptionID = strings.ToLower(sub.SubscriptionID)
+		subs = append(subs, sub)
+	}
+	sort.Slice(subs, func(i, j int) bool { return subs[i].SubscriptionID < subs[j].SubscriptionID })
+
+	// 6. Create the tenant connector.
+	authRef := azure.AppConfig{ClientID: customCfg.ClientID}.AuthRef()
+	now := time.Now()
+	tenantConn := &models.CloudConnector{
+		WorkspaceID: workspaceID,
+		Provider:    models.CloudProviderAzure,
+		ScopeKind:   models.CloudScopeTenant,
+		ScopeID:     tenantID,
+		AuthRef:     authRef,
+		Status:      models.CloudConnectorActive,
+		VerifiedAt:  &now,
+		CreatedBy:   actor,
+	}
+	if err := tenantConn.SetAzureTenantAttrs(models.AzureTenantAttrs{
+		TenantID:                 tenantID,
+		AppID:                    customCfg.ClientID,
+		ServicePrincipalObjectID: sp.ID,
+		ServicePrincipalName:     sp.DisplayName,
+		GraphPermissions:         perms,
+		GraphVerifiedAt:          &now,
+		SubscriptionsVisible:     len(subs),
+		ProvisionedVia:           models.AzureProvisionedViaClientCredentials,
+		ProvisionedBy:            actor,
+	}); err != nil {
+		return nil, err
+	}
+	storedTenant, tenantCreated, err := s.connectors.Upsert(tenantConn)
+	if err != nil {
+		return nil, fmt.Errorf("record tenant connector: %w", err)
+	}
+
+	// 7. For each subscription, verify the app can read it (Reader already
+	//    assigned by the customer on their own app's service principal).
+	results := make([]AzureSubscriptionResult, len(subs))
+	for i, sub := range subs {
+		results[i] = AzureSubscriptionResult{
+			SubscriptionID: sub.SubscriptionID,
+			DisplayName:    sub.DisplayName,
+			State:          sub.State,
+		}
+		if !azureSubscriptionAssignable(sub.State) {
+			results[i].Reader = models.AzureReaderAssignment{
+				Status:    models.AzureReaderSkipped,
+				CheckedAt: &now,
+			}
+			continue
+		}
+		_, readErr := s.api.GetSubscription(ctx, armToken, sub.SubscriptionID)
+		checkedAt := time.Now()
+		if readErr != nil {
+			results[i].Reader = models.AzureReaderAssignment{
+				Status:    models.AzureReaderDenied,
+				CheckedAt: &checkedAt,
+				Error:     readErr.Error(),
+			}
+		} else {
+			results[i].Reader = models.AzureReaderAssignment{
+				Status:     models.AzureReaderExisting,
+				CheckedAt:  &checkedAt,
+				Verified:   true,
+				VerifiedAt: &checkedAt,
+			}
+		}
+	}
+
+	// 8. Record subscription connectors.
+	for i := range results {
+		conn, err := s.recordSubscriptionWith(workspaceID, tenantID, sp.ID, actor, authRef, models.AzureProvisionedViaClientCredentials, &results[i])
+		if err != nil {
+			results[i].Error = "could not record the subscription: " + err.Error()
+			continue
+		}
+		results[i].ConnectorID = &conn.ID
+		results[i].Status = conn.Status
+	}
+
+	// 9. Start discovery.
+	var targets []azureScanTarget
+	for _, r := range results {
+		if r.ConnectorID != nil && r.Reader.Verified {
+			targets = append(targets, azureScanTarget{ConnectorID: *r.ConnectorID, SubscriptionID: r.SubscriptionID})
+		}
+	}
+	discovery := s.startDiscovery(workspaceID, tenantID, &storedTenant.ID, targets, models.AzureTriggerConnect)
+
+	status := models.CloudConnectorActive
+	for _, r := range results {
+		if !r.Reader.Verified {
+			status = "partial"
+		}
+	}
+	return &AzureConnectResult{
+		Tenant:           storedTenant,
+		TenantCreated:    tenantCreated,
+		GraphPermissions: perms,
+		Subscriptions:    results,
+		Status:           status,
+		Discovery:        discovery,
+	}, nil
+}
+
 /* --------------------------- graph: service principal ------------------------- */
 
 func (s *AzureOnboardingService) findAuthSecServicePrincipal(ctx context.Context, graphToken string) (*azure.ServicePrincipal, error) {
@@ -676,6 +891,24 @@ func (s *AzureOnboardingService) findAuthSecServicePrincipal(ctx context.Context
 	}
 	if sp.AccountEnabled != nil && !*sp.AccountEnabled {
 		return nil, fmt.Errorf("%w: the AuthSec enterprise application is disabled in this tenant", azure.ErrAppNotInTenant)
+	}
+	return sp, nil
+}
+
+// findServicePrincipal locates the service principal for any AppConfig's
+// client id. Unlike findAuthSecServicePrincipal it skips the HomeTenantID
+// check, which applies only to the managed app.
+func (s *AzureOnboardingService) findServicePrincipal(ctx context.Context, graphToken string, cfg azure.AppConfig) (*azure.ServicePrincipal, error) {
+	sp, err := s.api.FindServicePrincipal(ctx, graphToken, cfg.ClientID, false)
+	if err != nil {
+		logAzureError("find service principal", err)
+		return nil, err
+	}
+	if cfg.HomeTenantID != "" && !strings.EqualFold(sp.AppOwnerOrganizationID, cfg.HomeTenantID) {
+		return nil, fmt.Errorf("%w: the application's owning tenant does not match the configured tenant", azure.ErrCredentialRejected)
+	}
+	if sp.AccountEnabled != nil && !*sp.AccountEnabled {
+		return nil, fmt.Errorf("%w: the enterprise application is disabled in this tenant", azure.ErrAppNotInTenant)
 	}
 	return sp, nil
 }
@@ -750,6 +983,11 @@ func (s *AzureOnboardingService) probeGraph(ctx context.Context, graphToken, per
 		if strings.Contains(strings.ToLower(ae.Code+" "+ae.Message), "premium") {
 			return models.AzureGraphPermissionLicense, ae.Error()
 		}
+		// Granted (only granted permissions are probed) yet refused: for an
+		// API that also needs a licence, the licence is what is missing.
+		if lic, ok := azure.LicensedGraphPermissions[permission]; ok {
+			return models.AzureGraphPermissionLicense, "needs a " + lic + " licence in this tenant: " + ae.Error()
+		}
 		return models.AzureGraphPermissionDenied, ae.Error()
 	}
 	return models.AzureGraphPermissionUnknown, err.Error()
@@ -785,7 +1023,7 @@ func (s *AzureOnboardingService) authorizeBinding(ctx context.Context, graphToke
 	roles, err := s.api.UserDirectoryRoleTemplateIDs(ctx, graphToken, userObjectID)
 	if err != nil {
 		logAzureError("read signed-in user's directory roles", err)
-		return fmt.Errorf("%w: the signed-in account's directory roles could not be read", azure.ErrNotAuthorizedToBind)
+		return fmt.Errorf("%w: the signed-in account's Microsoft Entra roles could not be read", azure.ErrNotAuthorizedToBind)
 	}
 	for _, r := range roles {
 		if _, ok := azure.BindingDirectoryRoleTemplateIDs[r]; ok {
@@ -906,7 +1144,7 @@ func (s *AzureOnboardingService) verifyReaderAccess(ctx context.Context, tenantI
 
 	budget := azureVerifyBudget
 	if dl, ok := ctx.Deadline(); ok {
-		if left := time.Until(dl); left < budget {
+		if left := time.Until(dl) - azureInventoryReserve; left < budget {
 			budget = left
 		}
 	}
@@ -952,6 +1190,10 @@ func (s *AzureOnboardingService) verifyReaderAccess(ctx context.Context, tenantI
 
 // recordSubscription upserts the subscription's connector row from its result.
 func (s *AzureOnboardingService) recordSubscription(workspaceID uuid.UUID, tenantID, principalID, actor string, r *AzureSubscriptionResult) (*models.CloudConnector, error) {
+	return s.recordSubscriptionWith(workspaceID, tenantID, principalID, actor, s.cfg.AuthRef(), models.AzureProvisionedViaAdminConsent, r)
+}
+
+func (s *AzureOnboardingService) recordSubscriptionWith(workspaceID uuid.UUID, tenantID, principalID, actor, authRef, provisionedVia string, r *AzureSubscriptionResult) (*models.CloudConnector, error) {
 	parent := tenantID
 	conn := &models.CloudConnector{
 		WorkspaceID:   workspaceID,
@@ -959,7 +1201,7 @@ func (s *AzureOnboardingService) recordSubscription(workspaceID uuid.UUID, tenan
 		ScopeKind:     models.CloudScopeSubscription,
 		ScopeID:       r.SubscriptionID,
 		ParentScopeID: &parent,
-		AuthRef:       s.cfg.AuthRef(),
+		AuthRef:       authRef,
 		CreatedBy:     actor,
 	}
 	if err := conn.SetAzureSubscriptionAttrs(models.AzureSubscriptionAttrs{
@@ -968,7 +1210,7 @@ func (s *AzureOnboardingService) recordSubscription(workspaceID uuid.UUID, tenan
 		State:                    r.State,
 		ServicePrincipalObjectID: principalID,
 		Reader:                   r.Reader,
-		ProvisionedVia:           models.AzureProvisionedViaAdminConsent,
+		ProvisionedVia:           provisionedVia,
 		ProvisionedBy:            actor,
 	}); err != nil {
 		return nil, err
@@ -1013,21 +1255,60 @@ func azureReaderFailure(r models.AzureReaderAssignment) (string, string) {
 // AzureVerifyResult is the outcome of Verify.
 type AzureVerifyResult struct {
 	Connector *models.CloudConnector `json:"connector"`
+	// Discovery is set when the connection was proven and a background
+	// discovery pass was started (or was already running).
+	Discovery string `json:"discovery,omitempty"`
 }
 
 // Verify re-proves a connector with AuthSec's own credentials alone -- no
-// customer sign-in. A tenant connector re-checks the service principal and its
-// Graph permissions; a subscription connector re-checks Reader access. It
-// cannot CREATE a missing Reader assignment: that needs an administrator,
-// which means running the onboarding flow again.
+// customer sign-in -- and, when it holds, starts a fresh discovery pass. A
+// tenant connector re-checks the service principal and its Graph permissions,
+// then rediscovers the directory and every subscription it can read; a
+// subscription connector re-checks Reader access, then rediscovers that
+// subscription. It cannot CREATE a missing Reader assignment: that needs an
+// administrator, which means running the onboarding flow again.
 func (s *AzureOnboardingService) Verify(parent context.Context, workspaceID, connectorID uuid.UUID) (*AzureVerifyResult, error) {
+	return s.verify(parent, workspaceID, connectorID, models.AzureTriggerVerify)
+}
+
+// resolveAppConfig returns the AppConfig for the given connector. For the
+// managed app (AuthRef matches s.cfg), it returns s.cfg. For a custom app, it
+// reads the customer's credentials from Vault.
+func (s *AzureOnboardingService) resolveAppConfig(c *models.CloudConnector) (azure.AppConfig, error) {
+	if s.cfg.Configured() && c.AuthRef == s.cfg.AuthRef() {
+		return s.cfg, nil
+	}
+	if s.vault == nil {
+		return azure.AppConfig{}, ErrAzureVaultNotConfigured
+	}
+	tenantID := c.ScopeID
+	if c.ScopeKind == models.CloudScopeSubscription && c.ParentScopeID != nil {
+		tenantID = *c.ParentScopeID
+	}
+	vaultPath := azureCustomAppVaultPath(c.WorkspaceID, tenantID)
+	secret, err := s.vault.ReadSecret(vaultPath)
+	if err != nil {
+		return azure.AppConfig{}, fmt.Errorf("read custom app credentials: %w", err)
+	}
+	clientID, _ := secret["client_id"].(string)
+	clientSecret, _ := secret["client_secret"].(string)
+	if clientID == "" || clientSecret == "" {
+		return azure.AppConfig{}, fmt.Errorf("%w: custom app credentials in vault are incomplete", azure.ErrNotConfigured)
+	}
+	return azure.AppConfig{ClientID: clientID, ClientSecret: clientSecret}, nil
+}
+
+// verify is Verify with the trigger the passes it starts are recorded under.
+func (s *AzureOnboardingService) verify(parent context.Context, workspaceID, connectorID uuid.UUID, trigger string) (*AzureVerifyResult, error) {
 	ctx, cancel := context.WithTimeout(parent, azureConnectBudget)
 	defer cancel()
 
-	if !s.cfg.Configured() {
-		return nil, azure.ErrNotConfigured
-	}
 	c, err := s.azureConnector(workspaceID, connectorID)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := s.resolveAppConfig(c)
 	if err != nil {
 		return nil, err
 	}
@@ -1036,12 +1317,12 @@ func (s *AzureOnboardingService) Verify(parent context.Context, workspaceID, con
 	}
 
 	if c.ScopeKind == models.CloudScopeTenant {
-		return s.verifyTenant(ctx, c)
+		return s.verifyTenant(ctx, c, cfg, trigger)
 	}
-	return s.verifySubscription(ctx, c)
+	return s.verifySubscription(ctx, c, cfg, trigger)
 }
 
-func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.CloudConnector) (*AzureVerifyResult, error) {
+func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.CloudConnector, cfg azure.AppConfig, trigger string) (*AzureVerifyResult, error) {
 	fail := func(err error) (*AzureVerifyResult, error) {
 		stored, merr := s.connectors.MarkError(c.WorkspaceID, c.ID, err.Error(), ClassifyConnectorError(err))
 		if merr != nil {
@@ -1050,12 +1331,12 @@ func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.Clo
 		return &AzureVerifyResult{Connector: stored}, nil
 	}
 
-	graphToken, err := s.api.AppToken(ctx, s.cfg, c.ScopeID, azure.ScopeGraphApp)
+	graphToken, err := s.api.AppToken(ctx, cfg, c.ScopeID, azure.ScopeGraphApp)
 	if err != nil {
 		logAzureError("graph app token", err)
 		return fail(err)
 	}
-	sp, err := s.findAuthSecServicePrincipal(ctx, graphToken)
+	sp, err := s.findServicePrincipal(ctx, graphToken, cfg)
 	if err != nil {
 		return fail(err)
 	}
@@ -1085,10 +1366,28 @@ func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.Clo
 	if err != nil {
 		return nil, err
 	}
-	return &AzureVerifyResult{Connector: stored}, nil
+	discovery := s.startDiscovery(c.WorkspaceID, c.ScopeID, &c.ID, s.readableSubscriptions(c.WorkspaceID, c.ScopeID), trigger)
+	return &AzureVerifyResult{Connector: stored, Discovery: discovery}, nil
 }
 
-func (s *AzureOnboardingService) verifySubscription(ctx context.Context, c *models.CloudConnector) (*AzureVerifyResult, error) {
+// readableSubscriptions lists the tenant's subscription connectors whose
+// Reader access was last proven.
+func (s *AzureOnboardingService) readableSubscriptions(workspaceID uuid.UUID, tenantID string) []azureScanTarget {
+	all, err := s.connectors.List(workspaceID, models.CloudProviderAzure)
+	if err != nil {
+		return nil
+	}
+	var out []azureScanTarget
+	for _, c := range all {
+		if c.ScopeKind == models.CloudScopeSubscription && c.Status == models.CloudConnectorActive &&
+			c.ParentScopeID != nil && strings.EqualFold(*c.ParentScopeID, tenantID) {
+			out = append(out, azureScanTarget{ConnectorID: c.ID, SubscriptionID: c.ScopeID})
+		}
+	}
+	return out
+}
+
+func (s *AzureOnboardingService) verifySubscription(ctx context.Context, c *models.CloudConnector, cfg azure.AppConfig, trigger string) (*AzureVerifyResult, error) {
 	tenantID := ""
 	if c.ParentScopeID != nil {
 		tenantID = *c.ParentScopeID
@@ -1100,7 +1399,7 @@ func (s *AzureOnboardingService) verifySubscription(ctx context.Context, c *mode
 	now := time.Now()
 	attrs.Reader.CheckedAt = &now
 
-	armToken, err := s.api.AppToken(ctx, s.cfg, tenantID, azure.ScopeARMApp)
+	armToken, err := s.api.AppToken(ctx, cfg, tenantID, azure.ScopeARMApp)
 	if err == nil {
 		_, err = s.api.GetSubscription(ctx, armToken, c.ScopeID)
 	}
@@ -1134,11 +1433,16 @@ func (s *AzureOnboardingService) verifySubscription(ctx context.Context, c *mode
 	if err := c.SetAzureSubscriptionAttrs(attrs); err != nil {
 		return nil, err
 	}
-	stored, err := s.connectors.MarkVerified(c.WorkspaceID, c.ID, c.Attrs)
+	if _, err := s.connectors.MarkVerified(c.WorkspaceID, c.ID, c.Attrs); err != nil {
+		return nil, err
+	}
+	discovery := s.startDiscovery(c.WorkspaceID, tenantID, nil,
+		[]azureScanTarget{{ConnectorID: c.ID, SubscriptionID: c.ScopeID}}, trigger)
+	stored, err := s.connectors.Get(c.WorkspaceID, c.ID)
 	if err != nil {
 		return nil, err
 	}
-	return &AzureVerifyResult{Connector: stored}, nil
+	return &AzureVerifyResult{Connector: stored, Discovery: discovery}, nil
 }
 
 /* ---------------------------------- revoke ----------------------------------- */
@@ -1193,6 +1497,79 @@ func (s *AzureOnboardingService) ListConnectors(workspaceID uuid.UUID) ([]models
 // GetConnector returns one Azure connector.
 func (s *AzureOnboardingService) GetConnector(workspaceID, connectorID uuid.UUID) (*models.CloudConnector, error) {
 	return s.azureConnector(workspaceID, connectorID)
+}
+
+// ListResources returns the workspace's Azure resource inventory.
+func (s *AzureOnboardingService) ListResources(workspaceID uuid.UUID, f repositories.AzureListFilter) ([]models.CloudResource, int64, error) {
+	return s.inventory.ListResources(workspaceID, f)
+}
+
+// ListIdentities returns the workspace's Entra directory objects.
+func (s *AzureOnboardingService) ListIdentities(workspaceID uuid.UUID, f repositories.AzureIdentityFilter) ([]models.CloudIdentity, int64, error) {
+	return s.inventory.ListIdentities(workspaceID, f)
+}
+
+// ListGrants returns who holds which Azure role or directory role, and where.
+func (s *AzureOnboardingService) ListGrants(workspaceID uuid.UUID, f repositories.AzureGrantFilter) ([]repositories.AzureGrant, int64, error) {
+	return s.inventory.ListGrants(workspaceID, f)
+}
+
+// ListSecrets returns credential metadata of app registrations and service
+// principals, soonest expiry first.
+func (s *AzureOnboardingService) ListSecrets(workspaceID uuid.UUID, f repositories.AzureListFilter) ([]repositories.AzureSecret, int64, error) {
+	return s.inventory.ListSecrets(workspaceID, f)
+}
+
+// ListFederation returns who may become each identity: the federated
+// credentials of app registrations and user-assigned managed identities.
+func (s *AzureOnboardingService) ListFederation(workspaceID uuid.UUID, f repositories.AzureListFilter) ([]repositories.AzureFederationEdge, int64, error) {
+	return s.inventory.ListFederation(workspaceID, f)
+}
+
+// ListWorkloads returns the resources that run as a managed identity.
+func (s *AzureOnboardingService) ListWorkloads(workspaceID uuid.UUID, f repositories.AzureListFilter) ([]repositories.AzureWorkload, int64, error) {
+	return s.inventory.ListWorkloads(workspaceID, f)
+}
+
+// ListFoundry returns the workspace's Foundry accounts and projects and who
+// each one's managed identity can become.
+func (s *AzureOnboardingService) ListFoundry(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]repositories.AzureWorkload, []repositories.AzureFoundryTrust, error) {
+	return s.inventory.ListFoundry(workspaceID, connectorID)
+}
+
+// ScanRuns lists one Azure connector's discovery passes, newest first.
+func (s *AzureOnboardingService) ScanRuns(workspaceID, connectorID uuid.UUID, limit int) ([]models.CloudScanRun, error) {
+	if _, err := s.azureConnector(workspaceID, connectorID); err != nil {
+		return nil, err
+	}
+	return s.inventory.ScanRuns(workspaceID, connectorID, limit)
+}
+
+// Neighbourhood is one access graph node and everything one hop from it.
+func (s *AzureOnboardingService) Neighbourhood(workspaceID uuid.UUID, ref string) (*repositories.AzureGraphNeighbourhood, error) {
+	return repositories.AzureNeighbourhoodOf(s.db, workspaceID, ref)
+}
+
+// Evidence is the receipts behind one Entra object and its grants.
+func (s *AzureOnboardingService) Evidence(workspaceID uuid.UUID, objectID string, limit int) ([]repositories.AzureEvidence, error) {
+	return repositories.AzureEvidenceFor(s.db, workspaceID, objectID, limit)
+}
+
+// GraphSummary counts the workspace's Azure rows in the shared IGA graph.
+func (s *AzureOnboardingService) GraphSummary(workspaceID uuid.UUID) ([]repositories.AzureGraphCount, error) {
+	return repositories.AzureGraphSummary(s.db, workspaceID)
+}
+
+// BlastRadius is everything one Entra object can reach in the graph, directly,
+// through its groups, and through the identities it can become.
+func (s *AzureOnboardingService) BlastRadius(workspaceID uuid.UUID, objectID string) (*repositories.AzureBlastRadius, error) {
+	return repositories.AzureBlastRadiusOf(s.db, workspaceID, objectID)
+}
+
+// ListUsage returns sign-in evidence: which identity obtained tokens for which
+// resource, most recent first.
+func (s *AzureOnboardingService) ListUsage(workspaceID uuid.UUID, f repositories.AzureUsageFilter) ([]repositories.AzureUsage, int64, error) {
+	return s.inventory.ListUsage(workspaceID, f)
 }
 
 func (s *AzureOnboardingService) azureConnector(workspaceID, connectorID uuid.UUID) (*models.CloudConnector, error) {

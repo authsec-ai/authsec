@@ -17,7 +17,7 @@ import (
 
 // staticToken hands the SDK a bearer token the caller already holds, so the
 // Client keeps taking its token per call: the administrator's delegated token
-// during Connect, AuthSec's app-only token when it proves its own access.
+// during Connect, AuthSec's app-only token during discovery.
 type staticToken string
 
 func (t staticToken) GetToken(context.Context, policy.TokenRequestOptions) (azcore.AccessToken, error) {
@@ -127,4 +127,17 @@ func str(p *string) string {
 		return ""
 	}
 	return *p
+}
+
+func strs(ps []*string) []string {
+	if ps == nil {
+		return nil
+	}
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		if p != nil {
+			out = append(out, *p)
+		}
+	}
+	return out
 }
