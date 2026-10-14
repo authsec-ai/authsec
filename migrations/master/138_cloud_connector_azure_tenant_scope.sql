@@ -23,13 +23,23 @@
 -- No data changes: no existing row has scope_kind 'tenant', and every value
 -- the old CHECK admitted is still admitted.
 
-ALTER TABLE public.cloud_connector
-    DROP CONSTRAINT IF EXISTS cloud_connector_scope_kind_chk;
-
-ALTER TABLE public.cloud_connector
-    ADD CONSTRAINT cloud_connector_scope_kind_chk CHECK (
-        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription', 'tenant')
-    );
+-- Only ever widened: a constraint that already admits 'tenant' (the
+-- bootstrap's) is left as it is.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'cloud_connector_scope_kind_chk'
+           AND pg_get_constraintdef(oid) LIKE '%tenant%'
+    ) THEN
+        ALTER TABLE public.cloud_connector
+            DROP CONSTRAINT IF EXISTS cloud_connector_scope_kind_chk;
+        ALTER TABLE public.cloud_connector
+            ADD CONSTRAINT cloud_connector_scope_kind_chk CHECK (
+                scope_kind IN ('account', 'project', 'folder', 'org', 'subscription', 'tenant')
+            );
+    END IF;
+END $$;
 
 -- verify ----------------------------------------------------------------------
 DO $$

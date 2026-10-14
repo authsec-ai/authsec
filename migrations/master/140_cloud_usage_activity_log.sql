@@ -17,13 +17,24 @@
 --
 -- No data changes: every value the old CHECK admitted is still admitted.
 
-ALTER TABLE public.cloud_usage
-    DROP CONSTRAINT IF EXISTS cloud_usage_source_chk;
-
-ALTER TABLE public.cloud_usage
-    ADD CONSTRAINT cloud_usage_source_chk CHECK (
-        source IN ('service_last_accessed', 'cloudtrail', 'entra_sign_in', 'activity_log')
-    );
+-- Only ever widened: a constraint that already admits 'activity_log' (the
+-- bootstrap's, or one a later migration widened further) is left as it is,
+-- so this never narrows it under rows a later source wrote.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'cloud_usage_source_chk'
+           AND pg_get_constraintdef(oid) LIKE '%activity_log%'
+    ) THEN
+        ALTER TABLE public.cloud_usage
+            DROP CONSTRAINT IF EXISTS cloud_usage_source_chk;
+        ALTER TABLE public.cloud_usage
+            ADD CONSTRAINT cloud_usage_source_chk CHECK (
+                source IN ('service_last_accessed', 'cloudtrail', 'entra_sign_in', 'activity_log')
+            );
+    END IF;
+END $$;
 
 -- verify ----------------------------------------------------------------------
 DO $$
