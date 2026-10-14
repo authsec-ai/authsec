@@ -411,15 +411,14 @@ func (w *writer) projectResources() error {
 	return w.support("resource_id", ids, TargetNode, models.ObjectResource)
 }
 
-// The scope kinds the unified inventory (internal/igaread) shows an Azure row
+// The scope the unified inventory (internal/igaread) shows an Azure row
 // under, written into provider_attrs as Kubernetes and GitHub rows state
-// theirs: scope_kind, scope_id, scope_label, sub_scope and native_id. The
-// scope id is the lowercased tenant or subscription id, the id the shared
-// connections list gives the same connection.
-const (
-	ScopeKindTenant       = "azure_tenant"
-	ScopeKindSubscription = "azure_subscription"
-)
+// theirs: scope_kind, scope_id, scope_label, sub_scope and native_id. Every
+// row's scope is its tenant -- the one connection the shared connections list
+// gives it, by the same lowercased tenant id -- and a resource's or
+// workload's sub-scope is its subscription. Its subscription id and resource
+// group stay in its attrs.
+const ScopeKindTenant = "azure_tenant"
 
 // tenantScopeAttrs states the tenant as a row's scope.
 func (w *writer) tenantScopeAttrs(attrs map[string]interface{}) {
@@ -428,28 +427,23 @@ func (w *writer) tenantScopeAttrs(attrs map[string]interface{}) {
 	delete(attrs, "sub_scope")
 }
 
-// nodeScopeAttrs states a resource's or workload's scope: its subscription,
-// with its resource group (else its region) as the sub-scope, when the pass is
-// a subscription's and the ARM id is under it; the tenant otherwise (an
-// API-plane resource such as an app role).
-func (w *writer) nodeScopeAttrs(attrs map[string]interface{}, armID, region string) {
+// nodeScopeAttrs states a resource's or workload's scope: the tenant, with
+// its subscription (by name) as the sub-scope when the pass is a
+// subscription's and the ARM id is under it.
+func (w *writer) nodeScopeAttrs(attrs map[string]interface{}, armID, _ string) {
+	w.tenantScopeAttrs(attrs)
 	sub := strings.ToLower(w.p.ScopeID)
-	id := strings.ToLower(armID)
-	if w.p.ScopeKind != models.CloudScopeSubscription || sub == "" || !strings.HasPrefix(id, "/subscriptions/"+sub) {
-		w.tenantScopeAttrs(attrs)
+	if w.p.ScopeKind != models.CloudScopeSubscription || sub == "" || !strings.HasPrefix(strings.ToLower(armID), "/subscriptions/"+sub) {
 		return
 	}
 	label := w.p.ScopeLabel
 	if label == "" {
 		label = sub
 	}
-	attrs["scope_kind"], attrs["scope_id"], attrs["scope_label"] = ScopeKindSubscription, sub, label
+	attrs["sub_scope"] = label
+	attrs["subscription_id"] = sub
 	if rg := armResourceGroup(armID); rg != "" {
-		attrs["sub_scope"] = rg
-	} else if region != "" {
-		attrs["sub_scope"] = region
-	} else {
-		delete(attrs, "sub_scope")
+		attrs["resource_group"] = rg
 	}
 }
 

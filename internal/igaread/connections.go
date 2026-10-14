@@ -49,7 +49,6 @@ const (
 
 	connScopeAccount      = "account"
 	connScopeTenant       = "tenant"
-	connScopeSubscription = "subscription"
 	connScopeProject      = "project"
 	connScopeCluster      = "cluster"
 	connScopeOrganisation = "organisation"
@@ -351,6 +350,11 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 	out := make([]Connection, 0, len(connectors))
 	for i := range connectors {
 		c := &connectors[i]
+		// An Azure tenant is the connection; its subscriptions are inside it
+		// (its scope summary, and the connector's own scope listing).
+		if c.Provider == models.CloudProviderAzure && c.ScopeKind == models.CloudScopeSubscription {
+			continue
+		}
 		cov := models.DecodeScanCoverage(c.Coverage)
 		conn := Connection{
 			ID:        c.ID.String(),
@@ -373,19 +377,13 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 			conn.Graph = connAWSGraph(c, run, pubOf[c.ID])
 			conn.Discovery = connAWSDiscovery(run, cov)
 		case models.CloudProviderAzure:
-			// The scope id is the lowercased tenant or subscription id: what
-			// the unified inventory gives this connection's rows as scope.id
+			// The scope id is the lowercased tenant id: what the unified
+			// inventory gives every row of the tenant as scope.id
 			// (internal/azuregraph). Azure has no publication, so its graph
 			// state is live, as Kubernetes'.
 			conn.Provider, conn.ScopeID = ConnProviderAzure, strings.ToLower(c.ScopeID)
-			if c.ScopeKind == models.CloudScopeTenant {
-				conn.ScopeKind, conn.Name = connScopeTenant, c.ScopeID
-				conn.ScopeSummary = countWord(azureSubs[strings.ToLower(c.ScopeID)], "subscription", "subscriptions", "no subscriptions")
-			} else {
-				conn.ScopeKind = connScopeSubscription
-				conn.Name = nameOr(c.AzureSubscriptionAttrs().DisplayName, c.ScopeID)
-				conn.ScopeSummary = "1 subscription"
-			}
+			conn.ScopeKind, conn.Name = connScopeTenant, c.ScopeID
+			conn.ScopeSummary = countWord(azureSubs[strings.ToLower(c.ScopeID)], "subscription", "subscriptions", "no subscriptions selected")
 			run := runs[c.ID]
 			conn.Scan = connAWSScan(run)
 			conn.Graph = ConnectionGraph{State: connGraphLive}
