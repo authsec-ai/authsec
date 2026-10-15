@@ -167,8 +167,10 @@ jobs:
               backup_dir=/bitnami/postgresql/authsec-release-backups
               mkdir -p "$backup_dir"
               backup="$backup_dir/authprod-$AUTHSEC_RELEASE.dump"
-              export PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"
-              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -Fc > "$backup"
+              # As the superuser: the tables FORCE row-level security, so a
+              # dump as their owner (authprod) is refused, or would be partial.
+              export PGPASSWORD="$(cat "$POSTGRES_POSTGRES_PASSWORD_FILE")"
+              pg_dump -U postgres -d "$POSTGRES_DATABASE" -Fc > "$backup"
               test -s "$backup"
               pg_restore --list "$backup" > /dev/null
               sha256sum "$backup"
