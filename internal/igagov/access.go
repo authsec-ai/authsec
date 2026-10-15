@@ -10,7 +10,8 @@ import (
 )
 
 // Access policies (decision, Aditya, 2026-10-13): an admin blocks or allows
-// roles on an S3 bucket (optionally a key prefix) for a time window. AuthSec
+// roles on an S3 bucket (optionally a key prefix), a DynamoDB table or SSM
+// parameters for a time window. AuthSec
 // attaches one AuthSec-owned managed policy per role per version under
 // /authsec/, named AuthSecAccess-<RoleId>-<policy 8hex>-v<no>; AWS enforces
 // it, and its aws:CurrentTime conditions make it inert outside the window
@@ -181,43 +182,177 @@ func AccessIntentHash(in AccessIntent) (string, error) {
 	return HashCanonicalTagged("authsec.igagov.access_policy.intent.v1", in)
 }
 
-// S3Target is the resolved bucket and optional prefix.
-type S3Target struct {
+// Access-policy services (S3 since v1; DynamoDB and SSM Parameter Store
+// added 2026-10-15).
+const (
+	AccessServiceS3       = "s3"
+	AccessServiceDynamoDB = "dynamodb"
+	AccessServiceSSM      = "ssm"
+	AccessSidTable        = "AuthSecAccessTable"
+	AccessSidParameters   = "AuthSecAccessParameters"
+)
+
+// AccessTarget is the resolved resource of an access policy: an S3 bucket
+// (with an optional key prefix), a DynamoDB table, or SSM parameters (one
+// parameter, or a path ending in "*").
+type AccessTarget struct {
+	Service   string
 	Partition string
-	Bucket    string
-	Prefix    string
+	Region    string // DynamoDB, SSM
+	Account   string // DynamoDB, SSM (an S3 ARN names none)
+	// Name: the bucket; the table; the parameter name as the ARN writes it
+	// after "parameter/" (e.g. "prod/db/password", or "prod/db/*" for a path).
+	Name   string
+	Prefix string // S3 only: a key prefix
 }
 
-var reS3ARN = regexp.MustCompile(`^arn:(aws[a-z-]*):s3:::([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])(/.*)?$`)
+var (
+	reS3ARN       = regexp.MustCompile(`^arn:(aws[a-z-]*):s3:::([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])(/.*)?$`)
+	reDynamoDBARN = regexp.MustCompile(`^arn:(aws[a-z-]*):dynamodb:([a-z0-9-]+):([0-9]{12}):table/([A-Za-z0-9_.\-]{3,255})(/.*)?$`)
+	reSSMARN      = regexp.MustCompile(`^arn:(aws[a-z-]*):ssm:([a-z0-9-]+):([0-9]{12}):parameter/([A-Za-z0-9_.\-/]+\*?)$`)
+)
 
-// ParseS3BucketARN reads arn:<partition>:s3:::<bucket>[/...] (an object or
-// selector ARN names its bucket). ok=false for anything else.
-func ParseS3BucketARN(arn string) (S3Target, bool) {
-	m := reS3ARN.FindStringSubmatch(strings.TrimSpace(arn))
-	if m == nil {
-		return S3Target{}, false
+// ParseAccessResourceARN reads the ARN of a Discovery resource into the
+// target an access policy can name: an S3 bucket (an object or selector ARN
+// names its bucket), a DynamoDB table (an index or stream ARN names its
+// table), or SSM parameters (one parameter, or a path ending in "*"; a "*"
+// anywhere else, or a wildcard region or account, is refused). ok=false for
+// anything else.
+func ParseAccessResourceARN(arn string) (AccessTarget, bool) {
+	arn = strings.TrimSpace(arn)
+	if m := reS3ARN.FindStringSubmatch(arn); m != nil {
+		return AccessTarget{Service: AccessServiceS3, Partition: m[1], Name: m[2]}, true
 	}
-	return S3Target{Partition: m[1], Bucket: m[2]}, true
+	if m := reDynamoDBARN.FindStringSubmatch(arn); m != nil {
+		return AccessTarget{Service: AccessServiceDynamoDB, Partition: m[1], Region: m[2], Account: m[3], Name: m[4]}, true
+	}
+	if m := reSSMARN.FindStringSubmatch(arn); m != nil {
+		return AccessTarget{Service: AccessServiceSSM, Partition: m[1], Region: m[2], Account: m[3], Name: m[4]}, true
+	}
+	return AccessTarget{}, false
 }
 
-// BucketARN is arn:<partition>:s3:::<bucket>.
-func (t S3Target) BucketARN() string { return "arn:" + t.partition() + ":s3:::" + t.Bucket }
-
-// ObjectARN is the bucket's objects under the prefix (all objects without one).
-func (t S3Target) ObjectARN() string { return t.BucketARN() + "/" + t.Prefix + "*" }
-
-func (t S3Target) partition() string {
+func (t AccessTarget) partition() string {
 	if t.Partition == "" {
 		return "aws"
 	}
 	return t.Partition
 }
 
-// AccessActions is the S3 action table: object actions on ObjectARN, bucket
-// actions on BucketARN (s3:ListBucket is limited to the prefix by s3:prefix
-// when a prefix is set).
-func AccessActions(access []string, prefix string) (object, bucket []string) {
+// ResourceARN is the bucket, table or parameter ARN.
+func (t AccessTarget) ResourceARN() string {
+	switch t.Service {
+	case AccessServiceDynamoDB:
+		return "arn:" + t.partition() + ":dynamodb:" + t.Region + ":" + t.Account + ":table/" + t.Name
+	case AccessServiceSSM:
+		return "arn:" + t.partition() + ":ssm:" + t.Region + ":" + t.Account + ":parameter/" + t.Name
+	}
+	return "arn:" + t.partition() + ":s3:::" + t.Name
+}
+
+// ObjectARN is an S3 bucket's objects under the prefix (all without one).
+func (t AccessTarget) ObjectARN() string { return t.ResourceARN() + "/" + t.Prefix + "*" }
+
+// IsPath reports SSM parameters named by a path ("prod/db/*").
+func (t AccessTarget) IsPath() bool { return t.Service == AccessServiceSSM && strings.HasSuffix(t.Name, "*") }
+
+// Display is how the preview names the target.
+func (t AccessTarget) Display() string {
+	switch t.Service {
+	case AccessServiceDynamoDB:
+		return "DynamoDB table " + t.Name + " (" + t.Region + ")"
+	case AccessServiceSSM:
+		name := t.Name
+		if strings.Contains(name, "/") {
+			name = "/" + name
+		}
+		if t.IsPath() {
+			return "SSM parameters " + name + " (" + t.Region + ")"
+		}
+		return "SSM parameter " + name + " (" + t.Region + ")"
+	}
+	return "s3://" + t.Name + "/" + t.Prefix + "*"
+}
+
+// ValidateAccessTarget checks the rule against its target's service: a
+// prefix is an S3 key prefix only; SSM is block-only for now (an allow of a
+// SecureString would also need kms:Decrypt on its key, which the policy
+// does not grant).
+func ValidateAccessTarget(in AccessIntent, t AccessTarget) error {
+	if t.Service != AccessServiceS3 && in.Resource.Prefix != "" {
+		return accessInvalid("resource.prefix", "a prefix applies to S3 buckets only")
+	}
+	if t.Service == AccessServiceSSM && in.Effect == AccessEffectAllow {
+		return accessInvalid("effect", "Allow is not available for SSM parameters yet: a SecureString value would also need kms:Decrypt on its key")
+	}
+	return nil
+}
+
+// accessStatement is one statement of an access policy.
+type accessStatement struct {
+	Sid       string
+	Actions   []string
+	Resources []string
+	Extra     map[string]any
+}
+
+// AccessStatements is the action table of each service.
+//
+//	S3        read   s3:GetObject, s3:GetObjectVersion on bucket/prefix*; s3:ListBucket on the bucket (s3:prefix-limited)
+//	          write  s3:PutObject, s3:AbortMultipartUpload
+//	          delete s3:DeleteObject, s3:DeleteObjectVersion
+//	          all    s3:* (block only; with a prefix only ListBucket on the bucket)
+//	DynamoDB  read   GetItem, BatchGetItem, Query, Scan, ConditionCheckItem on the table and its indexes
+//	          write  PutItem, UpdateItem, BatchWriteItem
+//	          delete DeleteItem, BatchWriteItem (a batch write can delete, so it is in both)
+//	          all    dynamodb:* on the table and everything under it (block only)
+//	SSM       read   GetParameter, GetParameters, GetParameterHistory, GetParametersByPath
+//	          write  PutParameter, LabelParameterVersion
+//	          delete DeleteParameter, DeleteParameters
+//	          all    ssm:* (block only); a path also covers reading the path itself
+func AccessStatements(access []string, t AccessTarget) []accessStatement {
 	add := func(dst *[]string, a ...string) { *dst = append(*dst, a...) }
+	switch t.Service {
+	case AccessServiceDynamoDB:
+		var acts []string
+		res := []string{t.ResourceARN(), t.ResourceARN() + "/index/*"}
+		for _, a := range access {
+			switch a {
+			case AccessRead:
+				add(&acts, "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:ConditionCheckItem")
+			case AccessWrite:
+				add(&acts, "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:BatchWriteItem")
+			case AccessDelete:
+				add(&acts, "dynamodb:DeleteItem", "dynamodb:BatchWriteItem")
+			case AccessAll:
+				add(&acts, "dynamodb:*")
+				res = []string{t.ResourceARN(), t.ResourceARN() + "/*"}
+			}
+		}
+		return []accessStatement{{Sid: AccessSidTable, Actions: sortedUnique(acts), Resources: res}}
+	case AccessServiceSSM:
+		var acts []string
+		res := []string{t.ResourceARN()}
+		if t.IsPath() {
+			// GetParametersByPath is authorised on the path itself.
+			path := strings.TrimSuffix(strings.TrimSuffix(t.ResourceARN(), "*"), "/")
+			res = append(res, path)
+		}
+		for _, a := range access {
+			switch a {
+			case AccessRead:
+				add(&acts, "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:GetParametersByPath")
+			case AccessWrite:
+				add(&acts, "ssm:PutParameter", "ssm:LabelParameterVersion")
+			case AccessDelete:
+				add(&acts, "ssm:DeleteParameter", "ssm:DeleteParameters")
+			case AccessAll:
+				add(&acts, "ssm:*")
+			}
+		}
+		return []accessStatement{{Sid: AccessSidParameters, Actions: sortedUnique(acts), Resources: sortedUnique(res)}}
+	}
+	var object, bucket []string
 	for _, a := range access {
 		switch a {
 		case AccessRead:
@@ -229,26 +364,34 @@ func AccessActions(access []string, prefix string) (object, bucket []string) {
 			add(&object, "s3:DeleteObject", "s3:DeleteObjectVersion")
 		case AccessAll:
 			add(&object, "s3:*")
-			if prefix == "" {
+			if t.Prefix == "" {
 				add(&bucket, "s3:*")
 			} else {
 				add(&bucket, "s3:ListBucket")
 			}
 		}
 	}
-	return sortedUnique(object), sortedUnique(bucket)
+	out := []accessStatement{{Sid: AccessSidObjects, Actions: sortedUnique(object), Resources: []string{t.ObjectARN()}}}
+	if len(bucket) > 0 {
+		var extra map[string]any
+		if t.Prefix != "" {
+			extra = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: t.Prefix + "*"}}
+		}
+		out = append(out, accessStatement{Sid: AccessSidBucket, Actions: sortedUnique(bucket), Resources: []string{t.ResourceARN()}, Extra: extra})
+	}
+	return out
 }
 
 // AccessDocument is the policy of one role: Deny (block) or Allow (allow) of
 // the access levels' actions, inside the window. It returns the canonical
 // document, its hash, and every action and resource it names.
-func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt *time.Time) ([]byte, string, []string, []string, error) {
+func AccessDocument(effect string, access []string, t AccessTarget, startsAt, endsAt *time.Time) ([]byte, string, []string, []string, error) {
 	eff := EffectAllow
 	if effect == AccessEffectBlock {
 		eff = EffectDeny
 	}
-	object, bucket := AccessActions(access, t.Prefix)
-	if len(object) == 0 {
+	stmts := AccessStatements(access, t)
+	if len(stmts) == 0 || len(stmts[0].Actions) == 0 {
 		return nil, "", nil, nil, errors.New("no action for the access levels")
 	}
 	window := map[string]any{}
@@ -258,33 +401,33 @@ func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt
 	if endsAt != nil && !endsAt.Equal(AccessNoEnd) {
 		window[CondDateLessThan] = map[string]any{KeyCurrentTime: AWSTime(*endsAt)}
 	}
-	stmt := func(sid string, acts []string, res string, extra map[string]any) map[string]any {
-		var action any = acts
-		if len(acts) == 1 {
-			action = acts[0]
+	var docStmts []any
+	var actions, resources []string
+	for _, st := range stmts {
+		var action any = st.Actions
+		if len(st.Actions) == 1 {
+			action = st.Actions[0]
 		}
-		s := map[string]any{"Sid": sid, "Effect": eff, "Action": action, "Resource": res}
+		var resource any = st.Resources
+		if len(st.Resources) == 1 {
+			resource = st.Resources[0]
+		}
+		s := map[string]any{"Sid": st.Sid, "Effect": eff, "Action": action, "Resource": resource}
 		cond := map[string]any{}
 		for k, v := range window {
 			cond[k] = v
 		}
-		for k, v := range extra {
+		for k, v := range st.Extra {
 			cond[k] = v
 		}
 		if len(cond) > 0 {
 			s["Condition"] = cond
 		}
-		return s
+		docStmts = append(docStmts, s)
+		actions = append(actions, st.Actions...)
+		resources = append(resources, st.Resources...)
 	}
-	stmts := []any{stmt(AccessSidObjects, object, t.ObjectARN(), nil)}
-	if len(bucket) > 0 {
-		var extra map[string]any
-		if t.Prefix != "" {
-			extra = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: t.Prefix + "*"}}
-		}
-		stmts = append(stmts, stmt(AccessSidBucket, bucket, t.BucketARN(), extra))
-	}
-	doc := map[string]any{"Version": PolicyVersion20121017, "Statement": stmts}
+	doc := map[string]any{"Version": PolicyVersion20121017, "Statement": docStmts}
 	c, err := CanonicalizeValue(doc)
 	if err != nil {
 		return nil, "", nil, nil, err
@@ -292,11 +435,7 @@ func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt
 	if PolicyChars(c) > MaxPolicyChars {
 		return nil, "", nil, nil, fmt.Errorf("the policy document is larger than %d characters", MaxPolicyChars)
 	}
-	resources := []string{t.ObjectARN()}
-	if len(bucket) > 0 {
-		resources = append(resources, t.BucketARN())
-	}
-	return c, ContentHash(c), sortedUnique(append(object, bucket...)), sortedUnique(resources), nil
+	return c, ContentHash(c), sortedUnique(actions), sortedUnique(resources), nil
 }
 
 // AccessPolicyName is AuthSecAccess-<RoleId>-<policy 8hex>-v<no>.
@@ -315,7 +454,7 @@ func AccessDeploymentHash(roleID, accountID, versionID, documentHash string) (st
 }
 
 // AccessSentence is the preview's one plain sentence.
-func AccessSentence(in AccessIntent, t S3Target, roleNames []string) string {
+func AccessSentence(in AccessIntent, t AccessTarget, roleNames []string) string {
 	verb := "Block"
 	if in.Effect == AccessEffectAllow {
 		verb = "Allow"
@@ -324,7 +463,7 @@ func AccessSentence(in AccessIntent, t S3Target, roleNames []string) string {
 	if len(in.Access) == 1 && in.Access[0] == AccessAll {
 		what = "all access"
 	}
-	where := "s3://" + t.Bucket + "/" + t.Prefix + "*"
+	where := t.Display()
 	who := strings.Join(roleNames, ", ")
 	s := fmt.Sprintf("%s %s on %s for %s", verb, what, where, who)
 	if in.StartsAt != nil {

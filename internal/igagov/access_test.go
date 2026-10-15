@@ -70,12 +70,12 @@ func TestNormalizeAccessIntent(t *testing.T) {
 }
 
 func TestAccessDocument(t *testing.T) {
-	bucket, ok := ParseS3BucketARN("arn:aws:s3:::acme-invoices/2026/*")
-	if !ok || bucket.Bucket != "acme-invoices" {
+	bucket, ok := ParseAccessResourceARN("arn:aws:s3:::acme-invoices/2026/*")
+	if !ok || bucket.Service != AccessServiceS3 || bucket.Name != "acme-invoices" {
 		t.Fatalf("parse: %+v %v", bucket, ok)
 	}
-	if _, ok := ParseS3BucketARN("arn:aws:dynamodb:us-east-1:111111111111:table/x"); ok {
-		t.Fatal("a non-S3 ARN parsed as a bucket")
+	if _, ok := ParseAccessResourceARN("arn:aws:sqs:us-east-1:111111111111:q"); ok {
+		t.Fatal("an unsupported ARN parsed as a target")
 	}
 
 	// Block read under a prefix, with an end: object actions on bucket/prefix*,
@@ -133,5 +133,74 @@ func TestAccessDocument(t *testing.T) {
 
 	if n := AccessPolicyName("AROAEXAMPLE1234567890", "abcdef12-3456-7890-abcd-ef1234567890", 2); n != "AuthSecAccess-AROAEXAMPLE1234567890-abcdef12-v2" {
 		t.Errorf("name: %s", n)
+	}
+}
+
+func TestAccessTargetsDynamoDBAndSSM(t *testing.T) {
+	// Parsing: a table (an index ARN names its table), one parameter, a path;
+	// wildcards in the region, account or mid-name are refused.
+	for arn, want := range map[string]AccessTarget{
+		"arn:aws:dynamodb:us-east-1:111111111111:table/Orders":           {Service: AccessServiceDynamoDB, Partition: "aws", Region: "us-east-1", Account: "111111111111", Name: "Orders"},
+		"arn:aws:dynamodb:us-east-1:111111111111:table/Orders/index/byID": {Service: AccessServiceDynamoDB, Partition: "aws", Region: "us-east-1", Account: "111111111111", Name: "Orders"},
+		"arn:aws:ssm:eu-west-1:111111111111:parameter/prod/db/password":   {Service: AccessServiceSSM, Partition: "aws", Region: "eu-west-1", Account: "111111111111", Name: "prod/db/password"},
+		"arn:aws:ssm:eu-west-1:111111111111:parameter/prod/db/*":          {Service: AccessServiceSSM, Partition: "aws", Region: "eu-west-1", Account: "111111111111", Name: "prod/db/*"},
+	} {
+		got, ok := ParseAccessResourceARN(arn)
+		if !ok || got != want {
+			t.Errorf("%s: %+v %v", arn, got, ok)
+		}
+	}
+	for _, bad := range []string{"arn:aws:dynamodb:*:111111111111:table/Orders", "arn:aws:dynamodb:us-east-1:*:table/Orders",
+		"arn:aws:ssm:us-east-1:111111111111:parameter/prod/*/password", "arn:aws:ssm:*:111111111111:parameter/x"} {
+		if _, ok := ParseAccessResourceARN(bad); ok {
+			t.Errorf("%s parsed", bad)
+		}
+	}
+
+	// DynamoDB: block read covers the table and its indexes; delete includes
+	// BatchWriteItem (a batch write can delete).
+	ddb, _ := ParseAccessResourceARN("arn:aws:dynamodb:us-east-1:111111111111:table/Orders")
+	end := accessNow.Add(time.Hour)
+	doc, _, acts, res, err := AccessDocument("block", []string{"read", "delete"}, ddb, nil, &end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(doc)
+	for _, want := range []string{`"Effect":"Deny"`, `"dynamodb:GetItem"`, `"dynamodb:Query"`, `"dynamodb:DeleteItem"`, `"dynamodb:BatchWriteItem"`,
+		`"arn:aws:dynamodb:us-east-1:111111111111:table/Orders"`, `"arn:aws:dynamodb:us-east-1:111111111111:table/Orders/index/*"`, `"Sid":"AuthSecAccessTable"`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("dynamodb document lacks %s: %s", want, text)
+		}
+	}
+	if len(acts) != 7 || len(res) != 2 {
+		t.Errorf("dynamodb actions %v resources %v", acts, res)
+	}
+	if ddb.Display() != "DynamoDB table Orders (us-east-1)" {
+		t.Errorf("display: %s", ddb.Display())
+	}
+
+	// SSM path: read also covers the path itself (GetParametersByPath).
+	ssm, _ := ParseAccessResourceARN("arn:aws:ssm:eu-west-1:111111111111:parameter/prod/db/*")
+	doc, _, _, res, err = AccessDocument("block", []string{"read"}, ssm, nil, nil)
+	if err != nil || !strings.Contains(string(doc), `"ssm:GetParametersByPath"`) || len(res) != 2 ||
+		!strings.Contains(string(doc), `"arn:aws:ssm:eu-west-1:111111111111:parameter/prod/db"`) {
+		t.Fatalf("ssm path: %v %s %v", err, doc, res)
+	}
+	if ssm.Display() != "SSM parameters /prod/db/* (eu-west-1)" {
+		t.Errorf("display: %s", ssm.Display())
+	}
+
+	// Service rules: no prefix outside S3; SSM is block-only.
+	in := accessIntent("block", []string{"read"}, &end)
+	in.Resource.Prefix = "x/"
+	if err := ValidateAccessTarget(in, ddb); err == nil {
+		t.Error("prefix on a DynamoDB table accepted")
+	}
+	in = accessIntent("allow", []string{"read"}, &end)
+	if err := ValidateAccessTarget(in, ssm); err == nil {
+		t.Error("allow on SSM accepted")
+	}
+	if err := ValidateAccessTarget(in, ddb); err != nil {
+		t.Errorf("allow on DynamoDB refused: %v", err)
 	}
 }

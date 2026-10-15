@@ -435,3 +435,89 @@ func TestAccessPolicyEndRunsNow(t *testing.T) {
 		t.Fatal("End left the removal waiting for the next 10-minute check")
 	}
 }
+
+// resourceOf inserts a Discovery resource of kind with ARN text arn.
+func (l *apLab) resourceOf(kind, arn string) uuid.UUID {
+	l.t.Helper()
+	id := uuid.New()
+	p3exec(l.t, l.db, `INSERT INTO iga_resources (id, workspace_id, resource_kind, display_name, provider, source_key)
+		VALUES (?, ?, ?, ?, 'aws', ?)`, id, l.ws, kind, arn, "aws\x1fref\x1f"+arn+"\x1f"+id.String())
+	return id
+}
+
+// DynamoDB tables (block and allow) and SSM parameters (block only).
+func TestAccessPolicyDynamoDBAndSSM(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApTableRole")
+	end := time.Now().Add(time.Hour)
+	table := l.resourceOf("dynamodb_table", "arn:aws:dynamodb:us-east-1:"+testAccount+":table/Orders")
+	params := l.resourceOf("ssm_parameter", "arn:aws:ssm:us-east-1:"+testAccount+":parameter/prod/db/*")
+	foreign := l.resourceOf("dynamodb_table", "arn:aws:dynamodb:us-east-1:999999999999:table/Theirs")
+	intent := func(effect string, res uuid.UUID, access ...string) igagov.AccessIntent {
+		return igagov.AccessIntent{Effect: effect, Resource: igagov.AccessResource{ResourceID: res.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: access, EndsAt: &end}
+	}
+
+	// Block read on a table: Deny of the read actions on the table and its indexes.
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "orders read block", Reason: "test",
+		AccessIntent: intent("block", table, "read")})
+	if err != nil || v.Resource.Service != "dynamodb" || v.Resource.Name != "Orders" || v.Resource.AccountID != testAccount {
+		t.Fatalf("create dynamodb: %+v %v", v, err)
+	}
+	l.run(v.ID)
+	got := l.attachedAuthSec("ApTableRole")
+	if len(got) != 1 {
+		t.Fatalf("attached: %v", got)
+	}
+	_, _, doc, _, _ := l.fake.PolicyState(got[0])
+	for _, want := range []string{`"Effect":"Deny"`, `"dynamodb:GetItem"`, `"dynamodb:Query"`, `:table/Orders/index/*"`} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("dynamodb policy lacks %s: %s", want, doc)
+		}
+	}
+	if v, _ = l.svc.Get(ctx, l.ws, v.ID); v.Status != services.AccessStatusActive {
+		t.Fatalf("dynamodb status: %s %s", v.Status, v.StatusReason)
+	}
+	if _, err := l.svc.End(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+
+	// Allow on a table is accepted (preview without blockers).
+	if pv, err := l.svc.Preview(ctx, l.ws, intent("allow", table, "write")); err != nil || len(pv.Blockers) != 0 ||
+		!strings.Contains(pv.Sentence, "DynamoDB table Orders") {
+		t.Fatalf("allow dynamodb preview: %+v %v", pv, err)
+	}
+
+	// SSM: block is applied; allow is refused; a path also covers reading the path.
+	v, err = l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "prod db params block", Reason: "test",
+		AccessIntent: intent("block", params, "read")})
+	if err != nil {
+		t.Fatalf("create ssm: %v", err)
+	}
+	l.run(v.ID)
+	got = l.attachedAuthSec("ApTableRole")
+	if len(got) != 1 {
+		t.Fatalf("ssm attached: %v", got)
+	}
+	_, _, doc, _, _ = l.fake.PolicyState(got[0])
+	if !strings.Contains(doc, `"ssm:GetParametersByPath"`) || !strings.Contains(doc, `:parameter/prod/db"`) {
+		t.Errorf("ssm policy: %s", doc)
+	}
+	if _, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "ssm allow", Reason: "test",
+		AccessIntent: intent("allow", params, "read")}); apCode(err) != services.GovCodeAccessInvalid {
+		t.Errorf("allow on ssm: %v", err)
+	}
+
+	// Refusals: a prefix on a table; a table in another account.
+	in := intent("block", table, "read")
+	in.Resource.Prefix = "x/"
+	if _, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "prefix", Reason: "t", AccessIntent: in}); apCode(err) != services.GovCodeAccessInvalid {
+		t.Errorf("prefix on a table: %v", err)
+	}
+	if _, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "foreign", Reason: "t",
+		AccessIntent: intent("block", foreign, "read")}); apCode(err) != services.GovCodeRoleNotInAccount {
+		t.Errorf("table in another account: %v", err)
+	}
+}

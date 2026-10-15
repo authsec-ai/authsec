@@ -218,10 +218,16 @@ type (
 	}
 	AccessResourceView struct {
 		ResourceID string `json:"resource_id"`
-		ARN        string `json:"arn"`
-		Bucket     string `json:"bucket"`
-		Prefix     string `json:"prefix"`
-		AccountID  string `json:"account_id"`
+		// Service: s3 | dynamodb | ssm. Name: the bucket, the table, or the
+		// SSM parameter name or path (as the ARN writes it after "parameter/").
+		Service string `json:"service"`
+		Name    string `json:"name"`
+		ARN     string `json:"arn"`
+		// Bucket: the S3 bucket (empty for other services; kept for the v1 UI).
+		Bucket    string `json:"bucket"`
+		Prefix    string `json:"prefix"`
+		Region    string `json:"region"`
+		AccountID string `json:"account_id"`
 	}
 	AccessRoleView struct {
 		IdentityAccountID uuid.UUID           `json:"identity_account_id"`
@@ -307,7 +313,7 @@ type (
 type accessPlan struct {
 	intent   igagov.AccessIntent
 	hash     string
-	target   igagov.S3Target
+	target   igagov.AccessTarget
 	resource AccessResourceView
 	roles    []*r2Role
 	doc      []byte
@@ -356,14 +362,17 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 		return nil, govErr(http.StatusNotFound, GovCodeResourceNotFound, "No such resource in this workspace.",
 			map[string]any{"field": "resource.resource_id"})
 	}
-	t, ok := igagov.ParseS3BucketARN(rows[0].DisplayName)
+	t, ok := igagov.ParseAccessResourceARN(rows[0].DisplayName)
 	if !ok || rows[0].Provider != models.ProviderAWS {
-		return nil, govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets are supported.",
+		return nil, govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets, DynamoDB tables and SSM parameters are supported.",
 			map[string]any{"field": "resource.resource_id", "resource_kind": rows[0].ResourceKind})
+	}
+	if err := igagov.ValidateAccessTarget(norm, t); err != nil {
+		return nil, accessFieldErr(err)
 	}
 	t.Prefix = norm.Resource.Prefix
 	p.target = t
-	p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: t.BucketARN(), Bucket: t.Bucket, Prefix: t.Prefix}
+	p.resource = accessResourceView(norm.Resource.ResourceID, t)
 
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
@@ -381,14 +390,21 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			}
 			return nil, err
 		}
-		if !seen[role.Connector] {
+		// An S3 ARN names no account: the bucket must have been seen in the
+		// role's account. A table or parameter ARN names its account.
+		switch {
+		case t.Service == igagov.AccessServiceS3 && !seen[role.Connector]:
 			return nil, govUnprocessable(GovCodeRoleNotInAccount,
 				"AuthSec has not seen this bucket in the role's AWS account "+role.Identity.AccountID+".",
+				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID})
+		case t.Service != igagov.AccessServiceS3 && role.Identity.AccountID != t.Account:
+			return nil, govUnprocessable(GovCodeRoleNotInAccount,
+				"The "+t.Display()+" is in AWS account "+t.Account+"; the role is in "+role.Identity.AccountID+".",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID})
 		}
 		p.roles = append(p.roles, role)
 	}
-	if len(p.roles) > 0 {
+	if len(p.roles) > 0 && p.resource.AccountID == "" {
 		p.resource.AccountID = p.roles[0].Identity.AccountID
 	}
 
@@ -409,13 +425,27 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	if p.usedBy, err = s.usedBy(ctx, ws, p.roleIDs()); err != nil {
 		return nil, err
 	}
-	if norm.Effect == igagov.AccessEffectAllow {
+	if norm.Effect == igagov.AccessEffectAllow && t.Service == igagov.AccessServiceS3 {
 		p.warnings = append(p.warnings, AccessIssue{Code: "allow_needs_bucket_policy",
 			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
 	}
+	if t.Service == igagov.AccessServiceSSM && !t.IsPath() {
+		p.warnings = append(p.warnings, AccessIssue{Code: "ssm_path_reads",
+			Message: "Reading a parent path (GetParametersByPath) is authorised on that path, not on this parameter, so it is not covered."})
+	}
 	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths",
-		Message: "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."})
+		Message: "This changes only the chosen roles. Other roles, users, groups and resource policies (bucket or table policies) are unchanged."})
 	return p, nil
+}
+
+// accessResourceView describes the target for the UI.
+func accessResourceView(resourceID string, t igagov.AccessTarget) AccessResourceView {
+	v := AccessResourceView{ResourceID: resourceID, Service: t.Service, Name: t.Name, ARN: t.ResourceARN(), Prefix: t.Prefix,
+		Region: t.Region, AccountID: t.Account}
+	if t.Service == igagov.AccessServiceS3 {
+		v.Bucket = t.Name
+	}
+	return v
 }
 
 func (p *accessPlan) roleIDs() []uuid.UUID {
@@ -1280,11 +1310,10 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 			v.VersionNo = cur.VersionNo
 		}
 		v.Status, v.StatusReason, v.EndReason, v.EndedAt = accessStatus(b, now)
-		t, _ := igagov.ParseS3BucketARN(resARN[in.Resource.ResourceID])
-		t.Prefix = in.Resource.Prefix
-		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix}
-		if t.Bucket != "" {
-			v.Resource.ARN = t.BucketARN()
+		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Prefix: in.Resource.Prefix}
+		if t, ok := igagov.ParseAccessResourceARN(resARN[in.Resource.ResourceID]); ok {
+			t.Prefix = in.Resource.Prefix
+			v.Resource = accessResourceView(in.Resource.ResourceID, t)
 		}
 		// Roles: the intent's, with the ARN and account from its deployments.
 		arnOf := map[uuid.UUID]models.IGAGovTempGrant{}
