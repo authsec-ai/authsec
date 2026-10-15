@@ -402,3 +402,36 @@ func TestOwnershipAdminMode(t *testing.T) {
 		t.Fatal("the admin-mode OnProposed must be a no-op")
 	}
 }
+
+// End takes effect now: an active row's open job (the 10-minute check,
+// queued for later) is pulled forward instead of the removal waiting for it.
+func TestAccessPolicyEndRunsNow(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApEndNowRole")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "end now", Reason: "test",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	var row models.IGAGovTempGrant
+	if err := l.db.Where("workspace_id = ? AND policy_id = ?", l.ws, v.ID).Take(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	// What the worker leaves behind for an active row: its job, queued for the next check.
+	p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now() WHERE workspace_id = ? AND kind = 'temp_grant' AND status IN ('queued','running')`, l.ws)
+	p3exec(t, l.db, `INSERT INTO iga_gov_job (workspace_id, kind, subject_id, dedupe_key, status, run_after, max_attempts)
+		VALUES (?, 'temp_grant', ?, ?, 'queued', now() + interval '10 minutes', 5)`, l.ws, row.ID, "temporary_grant:"+row.ID.String())
+	if _, err := l.svc.End(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	var late int64
+	l.db.Model(&models.IGAGovJob{}).Where("workspace_id = ? AND kind = 'temp_grant' AND subject_id = ? AND status = 'queued' AND run_after > now() + interval '1 minute'",
+		l.ws, row.ID).Count(&late)
+	if late != 0 {
+		t.Fatal("End left the removal waiting for the next 10-minute check")
+	}
+}
