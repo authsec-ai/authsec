@@ -920,7 +920,14 @@ func (s *GovAccess) Delete(ctx context.Context, ws, actor, id uuid.UUID) error {
 		if err != nil {
 			return err
 		}
-		if pol.Lifecycle != "archived" {
+		bundles, err := loadAccessBundles(tx, ws, []uuid.UUID{id}, "")
+		if err != nil {
+			return err
+		}
+		if len(bundles) == 0 {
+			return GovNotFound()
+		}
+		if !accessEnded(bundles[0], now) {
 			return govConflict(GovCodePolicyNotEnded, "End this policy before deleting it.", map[string]any{"lifecycle": pol.Lifecycle})
 		}
 		var live int64
@@ -1136,6 +1143,15 @@ func (b *accessBundle) current() (*models.IGAGovAccessPolicyVersion, igagov.Acce
 		}
 	}
 	return nil, in
+}
+
+// accessEnded is whether the console shows the policy as ended: End was
+// pressed (lifecycle archived) or its end time has passed. Delete follows this
+// status, not the stored lifecycle, because nothing archives a policy that
+// expires on its own.
+func accessEnded(b *accessBundle, now time.Time) bool {
+	status, _, _, _ := accessStatus(b, now)
+	return status == AccessStatusEnded
 }
 
 func accessTerminal(state string) bool {
