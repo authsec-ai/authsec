@@ -79,24 +79,22 @@ const (
 	AzureDiscoveryAlreadyRunning = "already_running"
 )
 
+// resolveDiscoveryConfig is the credentials a tenant is read with: AuthSec's
+// app, or the customer's own app from Vault. It fails closed: a tenant whose
+// own-app credentials cannot be read is not read at all, never silently with
+// AuthSec's credentials, which are not what the connection records.
+func (s *AzureOnboardingService) resolveDiscoveryConfig(workspaceID uuid.UUID, tenantID string) (azure.AppConfig, error) {
+	tc, err := s.connectors.GetByScope(workspaceID, models.CloudProviderAzure, tenantID)
+	if err != nil || tc == nil {
+		// No tenant connector (a subscription-only run): AuthSec's app.
+		return s.cfg, nil
+	}
+	return s.resolveAppConfig(tc)
+}
+
 // startDiscovery runs the tenant pass (when tenantConnectorID is set) and then
 // each subscription pass in the background, and returns at once. trigger is
 // recorded on each pass's cloud_scan_run (AzureTrigger*).
-// resolveDiscoveryConfig resolves the AppConfig for discovery: looks up the
-// tenant connector and reads credentials from Vault if it's a custom app.
-func (s *AzureOnboardingService) resolveDiscoveryConfig(workspaceID uuid.UUID, tenantID string) azure.AppConfig {
-	tc, err := s.connectors.GetByScope(workspaceID, models.CloudProviderAzure, tenantID)
-	if err != nil || tc == nil {
-		return s.cfg
-	}
-	cfg, err := s.resolveAppConfig(tc)
-	if err != nil {
-		log.Printf("[azure] discovery: could not resolve config for tenant %s, falling back to env: %v", tenantID, err)
-		return s.cfg
-	}
-	return cfg
-}
-
 func (s *AzureOnboardingService) startDiscovery(workspaceID uuid.UUID, tenantID string, tenantConnectorID *uuid.UUID, subs []azureScanTarget, trigger string) string {
 	key := workspaceID.String() + "/" + tenantID
 	azureDiscoveryRunning.Lock()
@@ -119,7 +117,18 @@ func (s *AzureOnboardingService) startDiscovery(workspaceID uuid.UUID, tenantID 
 		ctx, cancel := context.WithTimeout(context.Background(), azureDiscoveryBudget)
 		defer cancel()
 
-		cfg := s.resolveDiscoveryConfig(workspaceID, tenantID)
+		cfg, err := s.resolveDiscoveryConfig(workspaceID, tenantID)
+		if err != nil {
+			log.Printf("[azure] discovery of tenant %s not started: its credentials could not be read: %v", tenantID, err)
+			if tenantConnectorID != nil {
+				if _, mErr := s.connectors.MarkError(workspaceID, *tenantConnectorID,
+					"AuthSec could not read the stored credentials of your app, so this tenant was not read; "+
+						"connect it again with your app's client secret", ConnErrCredentialInvalid); mErr != nil {
+					log.Printf("[azure] could not record the credential failure on tenant %s: %v", tenantID, mErr)
+				}
+			}
+			return
+		}
 
 		var tenantPass *azurePassResult
 		if tenantConnectorID != nil {

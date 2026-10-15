@@ -46,6 +46,10 @@ var (
 	// ErrCredentialRejected means Entra refused AuthSec's own client
 	// credential (AADSTS7000215 / 7000222 / invalid_client). Fault: authsec.
 	ErrCredentialRejected = errors.New("azure: the authsec application credential was rejected")
+	// ErrTenantNotFound means Microsoft Entra ID has no tenant with the id
+	// signed in to (AADSTS90002), or the id is not a tenant id at all
+	// (AADSTS900023).
+	ErrTenantNotFound = errors.New("azure: no microsoft entra id tenant has this id")
 
 	// ErrGraphPermissionsMissing means one or more required Microsoft Graph
 	// application permissions are not granted to the AuthSec service
@@ -115,6 +119,8 @@ func classifyAPIError(e *APIError) error {
 			return ErrCredentialRejected
 		case "AADSTS65001":
 			return ErrConsentRequired
+		case "AADSTS90002", "AADSTS900023":
+			return ErrTenantNotFound
 		}
 		if e.Code == "invalid_client" {
 			return ErrCredentialRejected

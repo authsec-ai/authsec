@@ -286,8 +286,10 @@ func (s *AzureOnboardingService) attributeSignInIPs(ctx context.Context, workspa
 	}
 	// Microsoft's ranges, through any subscription of the tenant.
 	if len(subs) > 0 {
-		discoveryCfg := s.resolveDiscoveryConfig(workspaceID, tenantID)
-		if armToken, err := s.api.AppToken(ctx, discoveryCfg, tenantID, azure.ScopeARMApp); err == nil {
+		discoveryCfg, cfgErr := s.resolveDiscoveryConfig(workspaceID, tenantID)
+		if cfgErr != nil {
+			logAzureError("azure service tags: credentials", cfgErr)
+		} else if armToken, err := s.api.AppToken(ctx, discoveryCfg, tenantID, azure.ScopeARMApp); err == nil {
 			if tags, err := s.api.ListServiceTags(ctx, armToken, subs[0].ScopeID, azureServiceTagLocation); err == nil {
 				placer.tagsRead = true
 				for i := range tags {

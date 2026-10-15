@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/azure"
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -303,6 +305,8 @@ func azureConnectMessage(r *services.AzureConnectResult) string {
 		}
 	}
 	switch {
+	case len(r.Subscriptions) == 0 && r.Tenant != nil && r.Tenant.AzureTenantAttrs().ProvisionedVia == models.AzureProvisionedViaClientCredentials:
+		return "Microsoft Entra ID tenant connected; your app cannot read any Azure subscription yet -- assign it the Reader role on the subscriptions AuthSec should read"
 	case len(r.Subscriptions) == 0:
 		return "Microsoft Entra ID tenant connected; no Azure subscriptions are visible to the signed-in account"
 	case verified == len(r.Subscriptions):
@@ -833,6 +837,27 @@ func mapAzureOnboardingError(err error) (int, gin.H) {
 	switch {
 	case errors.Is(err, repositories.ErrCloudConnectorNotFound):
 		return http.StatusNotFound, gin.H{"error": "azure connector not found"}
+
+	// The customer's own app ("your own app"): theirs to fix, never
+	// AuthSec's deployment. Checked before the managed-app cases below.
+	case errors.Is(err, services.ErrAzureCustomCredentialRejected):
+		return h(http.StatusBadRequest,
+			"check the client id and client secret of your app registration: the secret may be mistyped, expired or deleted. "+
+				"Create a new client secret in Microsoft Entra ID if needed", "customer_account")
+	case errors.Is(err, services.ErrAzureCustomTenantNotFound):
+		return h(http.StatusBadRequest,
+			"check the tenant id: it is the Directory (tenant) ID on your app registration's Overview page", "customer_account")
+	case errors.Is(err, services.ErrAzureCustomAppNotInTenant):
+		return h(http.StatusBadRequest,
+			"check the client id, and that your app registration lives in, or was consented in, this tenant and is enabled", "customer_account")
+	case errors.Is(err, services.ErrAzureCustomPermissionsMissing):
+		return h(http.StatusBadRequest,
+			"add the listed Microsoft Graph application permissions to your app registration and grant admin consent, then connect again", "customer_account")
+	case errors.Is(err, services.ErrAzureCustomCredentialsStore):
+		return h(http.StatusInternalServerError,
+			"AuthSec could not store your app's credentials securely; try again, and contact support if it keeps failing", "authsec")
+	case errors.Is(err, azure.ErrTenantNotFound):
+		return h(http.StatusBadRequest, "check the tenant id", "customer_account")
 	case errors.Is(err, services.ErrAzureVaultNotConfigured):
 		return h(http.StatusServiceUnavailable,
 			"set VAULT_ADDR and VAULT_TOKEN so custom app credentials can be stored securely", "authsec")
@@ -873,5 +898,8 @@ func mapAzureOnboardingError(err error) (int, gin.H) {
 	if errors.As(err, &ae) {
 		return h(http.StatusBadGateway, "Microsoft returned an unexpected error; see error for its code", "azure")
 	}
-	return http.StatusInternalServerError, gin.H{"error": err.Error()}
+	// Anything else is AuthSec's own failure: its text can name internals
+	// (a Vault path, a database error), so it is logged, not returned.
+	log.Printf("[azure] onboarding failed: %v", err)
+	return http.StatusInternalServerError, gin.H{"error": "AuthSec could not complete the request; try again, and contact support if it keeps failing"}
 }

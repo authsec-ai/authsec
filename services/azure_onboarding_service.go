@@ -46,11 +46,14 @@ import (
 // itself Reader. Every assignment is made with the delegated token of a human
 // who holds that permission, through the same ARM API the portal uses.
 //
-// No credential is persisted. AuthSec's client secret stays in the deployment
-// environment (cloud_connector.auth_ref is the non-secret "azure-app:<id>"),
-// no refresh token is ever requested, and the administrator's access token
-// lives only in Redis until Connect consumes it or the TTL expires it -- the
-// same one-shot discipline as GCPOAuthProvisionService.
+// The managed flow persists no credential. AuthSec's client secret stays in
+// the deployment environment (cloud_connector.auth_ref is the non-secret
+// "azure-app:<id>"), no refresh token is ever requested, and the
+// administrator's access token lives only in Redis until Connect consumes it or
+// the TTL expires it -- the same one-shot discipline as
+// GCPOAuthProvisionService. The own-app flow (ConnectCustom) stores the
+// customer's client secret in Vault only, never in Postgres, and destroys it
+// on revoke (azure_custom_app.go).
 type AzureOnboardingService struct {
 	db         *gorm.DB
 	redis      *redis.Client
@@ -507,6 +510,10 @@ type AzureConnectResult struct {
 	// started ("started") or one was already running ("already_running").
 	// Its progress is each connector's coverage.
 	Discovery string `json:"discovery"`
+	// Warnings are facts the connection was made despite: an app that holds
+	// more than AuthSec needs, subscriptions it cannot read, a tenant that
+	// switched between the AuthSec app and the customer's own app.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Connect performs the onboarding for the session's tenant. subscriptionIDs
@@ -541,7 +548,7 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 	}
 
 	// 3. Graph permissions: granted, then usable.
-	perms, missing, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
+	perms, missing, _, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +621,9 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 	s.verifyReaderAccess(ctx, tid, results)
 
 	// 9. Record each subscription connector.
+	keep := map[string]bool{}
 	for i := range results {
+		keep[results[i].SubscriptionID] = true
 		conn, err := s.recordSubscription(workspaceID, tid, sp.ID, actor, &results[i])
 		if err != nil {
 			results[i].Error = "could not record the subscription: " + err.Error()
@@ -622,6 +631,19 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 		}
 		results[i].ConnectorID = &conn.ID
 		results[i].Status = conn.Status
+	}
+	// A tenant that read with the customer's own app now reads with
+	// AuthSec's: its other subscriptions move off the old credentials, and
+	// the customer's secret is no longer kept.
+	var warnings []string
+	if boundHere && usesCustomApp(existingTenant) {
+		warnings = append(warnings, "this tenant was connected with your own app; it now reads with the AuthSec app, "+
+			"and the client secret AuthSec stored for your app has been removed")
+		s.destroyCustomAppSecret(workspaceID, tid)
+	}
+	if n := s.retargetTenantSubscriptions(workspaceID, tid, s.cfg.AuthRef(), "the AuthSec app", keep); n > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d subscription(s) connected earlier were not selected now and cannot be "+
+			"read by the AuthSec app; connect the tenant again and select them", n))
 	}
 
 	// 10. Discover identities, grants and resources in the background: the
@@ -654,6 +676,7 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 		Subscriptions:    results,
 		Status:           status,
 		Discovery:        discovery,
+		Warnings:         warnings,
 	}, nil
 }
 
@@ -703,7 +726,12 @@ func azureCustomAppVaultPath(workspaceID uuid.UUID, tenantID string) string {
 
 // ConnectCustom onboards a tenant using the customer's own Entra app
 // registration: client_credentials with their client_id/client_secret/tenant_id.
-// No browser OAuth flow is involved.
+// No browser OAuth flow is involved, and AuthSec assigns nothing: the customer
+// gives their app Reader on each subscription it should read.
+//
+// Order matters for the secret: it is stored only once every read it enables
+// has been proven, so a failed connect leaves no secret behind and a reconnect
+// never replaces a working secret with one that does not work.
 func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspaceID uuid.UUID, actor string, customCfg azure.AppConfig, tenantID string) (*AzureConnectResult, error) {
 	ctx, cancel := context.WithTimeout(parent, azureConnectBudget)
 	defer cancel()
@@ -711,55 +739,51 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 	if s.vault == nil {
 		return nil, ErrAzureVaultNotConfigured
 	}
-	if s.redis == nil {
-		return nil, azure.ErrNotConfigured
-	}
 
-	// 1. Acquire a Graph token with the customer's credentials.
+	// 1. A Graph token with the customer's credentials: proves the tenant id,
+	//    the client id and the secret together.
 	graphToken, err := s.api.AppToken(ctx, customCfg, tenantID, azure.ScopeGraphApp)
 	if err != nil {
 		logAzureError("custom app: graph app token", err)
-		return nil, err
+		return nil, customAppError(err)
 	}
 
-	// 2. Find the customer's service principal in the tenant.
+	// 2. The app's service principal in the tenant.
 	sp, err := s.api.FindServicePrincipal(ctx, graphToken, customCfg.ClientID, false)
 	if err != nil {
 		logAzureError("custom app: find service principal", err)
-		return nil, err
+		return nil, customAppError(err)
+	}
+	if sp.AccountEnabled != nil && !*sp.AccountEnabled {
+		return nil, fmt.Errorf("%w: its service principal is disabled", ErrAzureCustomAppNotInTenant)
 	}
 
-	// 3. Verify Graph permissions.
-	perms, missing, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
+	// 3. Its Microsoft Graph application permissions.
+	perms, missing, granted, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
 	if err != nil {
-		return nil, err
+		return nil, customAppError(err)
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("%w: %s", azure.ErrGraphPermissionsMissing, strings.Join(missing, ", "))
+		return nil, fmt.Errorf("%w: %s", ErrAzureCustomPermissionsMissing, strings.Join(missing, ", "))
+	}
+	var warnings []string
+	if w := writeCapableGraphRoles(granted); len(w) > 0 {
+		warnings = append(warnings, "your app holds Microsoft Graph application permissions that can change data: "+
+			strings.Join(w, ", ")+". AuthSec only reads; consider removing them from the app")
 	}
 
-	// 4. Store the customer's client_secret in Vault. The secret never touches
-	//    Postgres: auth_ref is the non-secret handle, vault_path holds the
-	//    Vault KV path on the connector.
-	vaultPath := azureCustomAppVaultPath(workspaceID, tenantID)
-	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{
-		"client_id":     customCfg.ClientID,
-		"client_secret": customCfg.ClientSecret,
-		"tenant_id":     tenantID,
-	}); err != nil {
-		return nil, fmt.Errorf("store custom app credentials: %w", err)
-	}
-
-	// 5. List subscriptions with the app's own ARM token.
+	// 4. The subscriptions the app can read. An app-only token lists only the
+	//    subscriptions where the app holds a role, so one it cannot read is
+	//    simply absent.
 	armToken, err := s.api.AppToken(ctx, customCfg, tenantID, azure.ScopeARMApp)
 	if err != nil {
 		logAzureError("custom app: arm app token", err)
-		return nil, err
+		return nil, customAppError(err)
 	}
 	allSubs, err := s.api.ListSubscriptions(ctx, armToken)
 	if err != nil {
 		logAzureError("custom app: list subscriptions", err)
-		return nil, err
+		return nil, customAppError(err)
 	}
 	var subs []azure.Subscription
 	for _, sub := range allSubs {
@@ -773,8 +797,52 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 		subs = append(subs, sub)
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].SubscriptionID < subs[j].SubscriptionID })
+	if len(subs) == 0 {
+		warnings = append(warnings, "your app cannot read any Azure subscription in this tenant: assign it the Reader role "+
+			"on each subscription AuthSec should read, then verify the connection. Microsoft Entra ID is read meanwhile")
+	}
 
-	// 6. Create the tenant connector.
+	// 5. Prove each one is readable. Nothing is assigned here, so a disabled
+	//    subscription that is still readable is read like any other.
+	results := make([]AzureSubscriptionResult, len(subs))
+	var privileged []string
+	for i, sub := range subs {
+		results[i] = AzureSubscriptionResult{SubscriptionID: sub.SubscriptionID, DisplayName: sub.DisplayName, State: sub.State}
+		_, readErr := s.api.GetSubscription(ctx, armToken, sub.SubscriptionID)
+		checkedAt := time.Now()
+		if readErr != nil {
+			results[i].Reader = models.AzureReaderAssignment{Status: models.AzureReaderDenied, CheckedAt: &checkedAt, Error: readErr.Error()}
+			continue
+		}
+		results[i].Reader = models.AzureReaderAssignment{
+			Status: models.AzureReaderExisting, CheckedAt: &checkedAt, Verified: true, VerifiedAt: &checkedAt,
+		}
+		// Reader is all AuthSec needs; say so when the app holds more.
+		if as, err := s.api.ListRoleAssignmentsForPrincipal(ctx, armToken, sub.SubscriptionID, sp.ID); err == nil {
+			if roles := privilegedAzureRoles(as); len(roles) > 0 {
+				privileged = append(privileged, firstNonEmpty(sub.DisplayName, sub.SubscriptionID)+" ("+strings.Join(roles, ", ")+")")
+			}
+		}
+	}
+	if len(privileged) > 0 {
+		warnings = append(warnings, "your app holds Azure roles that can change resources or grant access, beyond the Reader "+
+			"AuthSec needs: "+strings.Join(privileged, "; ")+". Consider giving it Reader only")
+	}
+
+	// 6. Everything the secret is for has been proven: store it. The secret
+	//    never touches Postgres; auth_ref is the non-secret handle.
+	existing, _ := s.connectors.GetByScope(workspaceID, models.CloudProviderAzure, tenantID)
+	vaultPath := azureCustomAppVaultPath(workspaceID, tenantID)
+	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{
+		"client_id":     customCfg.ClientID,
+		"client_secret": customCfg.ClientSecret,
+		"tenant_id":     tenantID,
+	}); err != nil {
+		log.Printf("[azure] custom app: could not store the credentials of tenant %s: %v", tenantID, err)
+		return nil, ErrAzureCustomCredentialsStore
+	}
+
+	// 7. The tenant connector.
 	authRef := azure.AppConfig{ClientID: customCfg.ClientID}.AuthRef()
 	now := time.Now()
 	tenantConn := &models.CloudConnector{
@@ -802,45 +870,21 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 	}
 	storedTenant, tenantCreated, err := s.connectors.Upsert(tenantConn)
 	if err != nil {
+		// A tenant connected for the first time leaves nothing behind.
+		if existing == nil {
+			s.destroyCustomAppSecret(workspaceID, tenantID)
+		}
 		return nil, fmt.Errorf("record tenant connector: %w", err)
 	}
-
-	// 7. For each subscription, verify the app can read it (Reader already
-	//    assigned by the customer on their own app's service principal).
-	results := make([]AzureSubscriptionResult, len(subs))
-	for i, sub := range subs {
-		results[i] = AzureSubscriptionResult{
-			SubscriptionID: sub.SubscriptionID,
-			DisplayName:    sub.DisplayName,
-			State:          sub.State,
-		}
-		if !azureSubscriptionAssignable(sub.State) {
-			results[i].Reader = models.AzureReaderAssignment{
-				Status:    models.AzureReaderSkipped,
-				CheckedAt: &now,
-			}
-			continue
-		}
-		_, readErr := s.api.GetSubscription(ctx, armToken, sub.SubscriptionID)
-		checkedAt := time.Now()
-		if readErr != nil {
-			results[i].Reader = models.AzureReaderAssignment{
-				Status:    models.AzureReaderDenied,
-				CheckedAt: &checkedAt,
-				Error:     readErr.Error(),
-			}
-		} else {
-			results[i].Reader = models.AzureReaderAssignment{
-				Status:     models.AzureReaderExisting,
-				CheckedAt:  &checkedAt,
-				Verified:   true,
-				VerifiedAt: &checkedAt,
-			}
-		}
+	if existing != nil && existing.Status != models.CloudConnectorRevoked && !usesCustomApp(existing) {
+		warnings = append(warnings, "this tenant was connected with the AuthSec app; it now reads with your app")
 	}
 
-	// 8. Record subscription connectors.
+	// 8. Each subscription connector, and the tenant's other subscriptions
+	//    moved off the credentials they read with before.
+	keep := map[string]bool{}
 	for i := range results {
+		keep[results[i].SubscriptionID] = true
 		conn, err := s.recordSubscriptionWith(workspaceID, tenantID, sp.ID, actor, authRef, models.AzureProvisionedViaClientCredentials, &results[i])
 		if err != nil {
 			results[i].Error = "could not record the subscription: " + err.Error()
@@ -849,8 +893,12 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 		results[i].ConnectorID = &conn.ID
 		results[i].Status = conn.Status
 	}
+	if n := s.retargetTenantSubscriptions(workspaceID, tenantID, authRef, "your app", keep); n > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d subscription(s) connected earlier cannot be read by your app; "+
+			"assign it Reader there and verify them", n))
+	}
 
-	// 9. Start discovery.
+	// 9. Discovery.
 	var targets []azureScanTarget
 	for _, r := range results {
 		if r.ConnectorID != nil && r.Reader.Verified {
@@ -872,6 +920,7 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 		Subscriptions:    results,
 		Status:           status,
 		Discovery:        discovery,
+		Warnings:         warnings,
 	}, nil
 }
 
@@ -919,11 +968,14 @@ func (s *AzureOnboardingService) findServicePrincipal(ctx context.Context, graph
 // that fails onboarding; a granted-but-unusable permission is recorded, not
 // fatal, because the usual cause (a licence, a just-issued token) is not fixed
 // by consenting again.
-func (s *AzureOnboardingService) verifyGraphPermissions(ctx context.Context, graphToken, spID string) ([]models.AzureGraphPermission, []string, error) {
+//
+// granted is every Microsoft Graph application permission the principal holds
+// (by value), required or not.
+func (s *AzureOnboardingService) verifyGraphPermissions(ctx context.Context, graphToken, spID string) (perms []models.AzureGraphPermission, missing []string, granted map[string]bool, err error) {
 	graphSP, err := s.api.FindServicePrincipal(ctx, graphToken, azure.GraphAppID, true)
 	if err != nil {
 		logAzureError("find microsoft graph service principal", err)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	roleValue := map[string]string{}
 	for _, r := range graphSP.AppRoles {
@@ -932,9 +984,9 @@ func (s *AzureOnboardingService) verifyGraphPermissions(ctx context.Context, gra
 	assignments, err := s.api.ListAppRoleAssignments(ctx, graphToken, spID)
 	if err != nil {
 		logAzureError("list app role assignments", err)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	granted := map[string]bool{}
+	granted = map[string]bool{}
 	for _, a := range assignments {
 		if strings.EqualFold(a.ResourceID, graphSP.ID) {
 			if v := roleValue[strings.ToLower(a.AppRoleID)]; v != "" {
@@ -943,8 +995,7 @@ func (s *AzureOnboardingService) verifyGraphPermissions(ctx context.Context, gra
 		}
 	}
 
-	perms := make([]models.AzureGraphPermission, 0, len(azure.RequiredGraphAppRoles)+len(azure.OptionalGraphAppRoles))
-	var missing []string
+	perms = make([]models.AzureGraphPermission, 0, len(azure.RequiredGraphAppRoles)+len(azure.OptionalGraphAppRoles))
 	check := func(name string, optional bool) {
 		p := models.AzureGraphPermission{Name: name, Granted: granted[name], Optional: optional}
 		if !p.Granted {
@@ -966,7 +1017,7 @@ func (s *AzureOnboardingService) verifyGraphPermissions(ctx context.Context, gra
 	for _, name := range azure.OptionalGraphAppRoles {
 		check(name, true)
 	}
-	return perms, missing, nil
+	return perms, missing, granted, nil
 }
 
 func (s *AzureOnboardingService) probeGraph(ctx context.Context, graphToken, permission string) (string, string) {
@@ -1308,12 +1359,13 @@ func (s *AzureOnboardingService) verify(parent context.Context, workspaceID, con
 		return nil, err
 	}
 
+	// Revoked first: a revoked connector has no credentials left to resolve.
+	if c.Status == models.CloudConnectorRevoked {
+		return nil, ErrAzureConnectorRevoked
+	}
 	cfg, err := s.resolveAppConfig(c)
 	if err != nil {
 		return nil, err
-	}
-	if c.Status == models.CloudConnectorRevoked {
-		return nil, ErrAzureConnectorRevoked
 	}
 
 	if c.ScopeKind == models.CloudScopeTenant {
@@ -1324,6 +1376,16 @@ func (s *AzureOnboardingService) verify(parent context.Context, workspaceID, con
 
 func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.CloudConnector, cfg azure.AppConfig, trigger string) (*AzureVerifyResult, error) {
 	fail := func(err error) (*AzureVerifyResult, error) {
+		// A tenant read with the customer's own app: its failures are theirs.
+		if usesCustomApp(c) {
+			err = customAppError(err)
+		}
+		// A passing failure (throttling, Microsoft's 5xx, a timeout) proves
+		// nothing about the connection: it stays as it is, so scheduled
+		// discovery keeps trying, and the caller is told.
+		if azureTransient(err) {
+			return nil, err
+		}
 		stored, merr := s.connectors.MarkError(c.WorkspaceID, c.ID, err.Error(), ClassifyConnectorError(err))
 		if merr != nil {
 			return nil, merr
@@ -1340,7 +1402,7 @@ func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.Clo
 	if err != nil {
 		return fail(err)
 	}
-	perms, missing, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
+	perms, missing, _, err := s.verifyGraphPermissions(ctx, graphToken, sp.ID)
 	if err != nil {
 		return fail(err)
 	}
@@ -1483,6 +1545,11 @@ func (s *AzureOnboardingService) Revoke(workspaceID, connectorID uuid.UUID) ([]m
 			return nil, err
 		}
 		out = append(out, *stored)
+	}
+	// A tenant that read with the customer's own app: its client secret is
+	// no longer AuthSec's to hold.
+	if c.ScopeKind == models.CloudScopeTenant && usesCustomApp(c) {
+		s.destroyCustomAppSecret(workspaceID, c.ScopeID)
 	}
 	return out, nil
 }

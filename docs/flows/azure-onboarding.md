@@ -622,9 +622,11 @@ All routes are under `/authsec/discovery`, require authentication, and need
 | POST | `/azure/oauth/start` | admin | `{tenant?, login_hint?}` returns `{authorize_url, state}` |
 | GET | `/azure/oauth/session?session_id=` | read | Preview tenant and subscriptions, with `can_assign_reader` |
 | POST | `/azure/oauth/connect` | admin | `{session_id, subscription_ids?}`: the onboarding itself |
+| POST | `/azure/connect-custom` | admin | `{tenant_id, client_id, client_secret}`: onboarding with the customer's own app (see "Your own app") |
 | GET | `/azure/connectors` | read | Tenant and subscription rows |
 | GET | `/azure/connectors/:id` | read | One row |
-| POST | `/azure/connectors/:id/verify` | admin | Re-prove with AuthSec's credentials, and start a fresh discovery |
+| GET | `/azure/connectors/:id/scan-runs` | read | The connector's discovery runs |
+| POST | `/azure/connectors/:id/verify` | admin | Re-prove with the tenant's credentials (AuthSec's app, or the customer's own), and start a fresh discovery |
 | DELETE | `/azure/connectors/:id` | admin | Revoke. A tenant revokes its subscriptions too |
 | GET | `/azure/resources?connector_id=&limit=&offset=` | read | Inventory |
 | GET | `/azure/identities?kind=&q=&connector_id=` | read | Users, groups, apps, service principals, managed identities |
@@ -644,11 +646,56 @@ engine.
 Revoking stops AuthSec using the connection. It does not change anything in
 Azure, because AuthSec holds no right to delete its own assignments. The
 customer removes access by deleting the AuthSec enterprise application, which
-removes its role assignments with it.
+removes its role assignments with it. A tenant connected with the customer's
+own app also has its stored client secret destroyed in Vault.
+
+## Your own app
+
+Instead of consenting to the AuthSec app, a customer can connect a tenant with
+an app registration of their own (`POST /azure/connect-custom`). No browser
+sign-in is involved and AuthSec assigns nothing:
+
+1. The customer creates an app registration, adds the Microsoft Graph
+   application permissions listed above (the same required and optional ones),
+   grants admin consent, creates a client secret, and gives the app's service
+   principal the Reader role on each subscription AuthSec should read.
+2. AuthSec proves, with the customer's credentials (client credentials grant):
+   a Graph token for that tenant, the app's service principal in it (enabled),
+   its Graph permissions, and which subscriptions the app can read. An app-only
+   token lists only subscriptions where the app holds a role, so one without
+   Reader is simply absent, and the result says so.
+3. Only then is the secret stored, in Vault at
+   `kv/data/secret/workspaces/<workspace>/cloud-discovery/azure/<tenant>`
+   (`VAULT_ADDR`, `VAULT_TOKEN`). It never touches Postgres: the connector's
+   `auth_ref` is `azure-app:<client id>`, and the tenant's
+   `provisioned_via` is `client_credentials`. A failed connect leaves no secret
+   behind, and a reconnect never replaces a working secret with an unproven one.
+4. The result carries `warnings`: Graph permissions that can change data, Azure
+   roles beyond Reader (Owner, Contributor, User Access Administrator, RBAC
+   Administrator), no readable subscription.
+
+Every failure of the customer's own app is theirs to fix and says so (400,
+`fault: customer_account`): a rejected client id or secret
+(`credential_invalid`), an unknown tenant id, an app with no service principal
+in the tenant, missing Graph permissions (named). None reads as AuthSec's
+deployment, which is what the managed app's `ErrCredentialRejected` means.
+
+Discovery and Verify read the tenant with its own credentials. If they cannot
+be read from Vault, the tenant is not read at all -- never silently with
+AuthSec's app -- and the tenant connector says so (`credential_invalid`).
+
+**Switching.** Connecting a tenant with the other kind of app moves it: the
+tenant connector takes the new credentials, and each of its subscriptions this
+connect did not record is moved to them in error (its Reader belongs to the
+other app) until it is connected again. Moving to the AuthSec app destroys the
+customer's stored secret. The result's `warnings` say what moved.
+
+A passing failure during Verify (throttling, Microsoft's 5xx, a timeout) leaves
+the connector as it was, so scheduled discovery keeps trying.
 
 ## Testing locally
 
-1. Set the three required `AZURE_*` variables and `REDIS_URL`, then start the backend (`IGA_GRAPH_PROJECTION=on` to project into the graph). Migrations 042-044 apply at boot.
+1. Set the three required `AZURE_*` variables and `REDIS_URL`, then start the backend (`IGA_GRAPH_PROJECTION=on` to project into the graph). Migrations 138-140 apply at boot. The own-app flow also needs `VAULT_ADDR` and `VAULT_TOKEN`.
 2. `GET /authsec/discovery/azure/oauth/status` should return `available: true`.
 3. Call `POST /authsec/discovery/azure/oauth/start` with a workspace admin JWT, and open `authorize_url` in a browser.
 4. Consent as a Global Administrator of a test tenant, then sign in with the same account.
