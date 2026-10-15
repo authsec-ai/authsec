@@ -6162,8 +6162,10 @@ CREATE TABLE IF NOT EXISTS public.cloud_connector (
     CONSTRAINT cloud_connector_provider_chk CHECK (
         provider IN ('aws', 'gcp', 'azure')
     ),
+    -- 'tenant' (138): an Entra tenant's Microsoft Graph connection, with its
+    -- subscriptions as 'subscription' rows naming it in parent_scope_id.
     CONSTRAINT cloud_connector_scope_kind_chk CHECK (
-        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription')
+        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription', 'tenant')
     ),
     CONSTRAINT cloud_connector_status_chk CHECK (
         status IN ('active', 'revoked', 'error')
@@ -6773,8 +6775,11 @@ CREATE TABLE IF NOT EXISTS public.cloud_usage (
     row_updated_at timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT cloud_usage_service_chk CHECK (service <> ''),
+    -- 'entra_sign_in' from 139: Azure service principal / managed identity
+    -- sign-ins, aggregated per identity per resource. 'activity_log' from 140:
+    -- Azure management operations, aggregated per identity per provider.
     CONSTRAINT cloud_usage_source_chk CHECK (
-        source IN ('service_last_accessed', 'cloudtrail')
+        source IN ('service_last_accessed', 'cloudtrail', 'entra_sign_in', 'activity_log')
     ),
     CONSTRAINT cloud_usage_generation_chk CHECK (last_seen_generation >= 0)
 );

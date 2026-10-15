@@ -1836,6 +1836,56 @@ func SetupRoutes(
 			// callback") is what previously 404'd here. Live-confirmed via a
 			// real Google consent round trip.
 			r.GET("/discovery/gcp/google-oauth/callback", cloudGCPOAuth.GoogleOAuthCallback)
+
+			// Azure as a discovery channel: ONE AuthSec multi-tenant Entra app
+			// registration, customer admin consent (Graph), then Reader per
+			// subscription assigned through ARM with the signed-in
+			// administrator's delegated token. Writes the azure rows of
+			// cloud_connector (one tenant row, one row per subscription) and the
+			// subscriptions' inventory in cloud_resource. See
+			// controllers/platform/cloud_azure_controller.go,
+			// services/azure_onboarding_service.go and
+			// docs/flows/azure-onboarding.md.
+			cloudAzure := platformCtrl.NewCloudAzureController(config.DB)
+			discovery.GET("/azure/oauth/status", middlewares.Require("discovery", "read"), cloudAzure.OAuthStatus)
+			discovery.POST("/azure/oauth/start", middlewares.Require("discovery", "admin"), cloudAzure.StartOAuth)
+			discovery.GET("/azure/oauth/session", middlewares.Require("discovery", "read"), cloudAzure.GetSession)
+			discovery.POST("/azure/oauth/connect", middlewares.Require("discovery", "admin"), cloudAzure.Connect)
+			discovery.POST("/azure/connect-custom", middlewares.Require("discovery", "admin"), cloudAzure.ConnectCustom)
+			discovery.GET("/azure/connectors", middlewares.Require("discovery", "read"), cloudAzure.ListConnectors)
+			discovery.GET("/azure/connectors/:id", middlewares.Require("discovery", "read"), cloudAzure.GetConnector)
+			discovery.POST("/azure/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAzure.VerifyConnector)
+			discovery.GET("/azure/connectors/:id/scan-runs", middlewares.Require("discovery", "read"), cloudAzure.ScanRuns)
+			discovery.DELETE("/azure/connectors/:id", middlewares.Require("discovery", "admin"), cloudAzure.RevokeConnector)
+			discovery.GET("/azure/resources", middlewares.Require("discovery", "read"), cloudAzure.ListResources)
+			// Identity discovery, filled in the background after Connect and
+			// Verify: Entra users/groups/apps/service principals/managed
+			// identities, who holds which directory role or Azure RBAC role,
+			// and app credential metadata (never values).
+			discovery.GET("/azure/identities", middlewares.Require("discovery", "read"), cloudAzure.ListIdentities)
+			discovery.GET("/azure/grants", middlewares.Require("discovery", "read"), cloudAzure.ListGrants)
+			discovery.GET("/azure/secrets", middlewares.Require("discovery", "read"), cloudAzure.ListSecrets)
+			// Who may become an identity (federated credentials), what runs
+			// as one (workloads), and whether it is used (sign-ins).
+			discovery.GET("/azure/federation", middlewares.Require("discovery", "read"), cloudAzure.ListFederation)
+			discovery.GET("/azure/workloads", middlewares.Require("discovery", "read"), cloudAzure.ListWorkloads)
+			// Microsoft Foundry: accounts, projects, models, connections, and
+			// the agent identities each project's managed identity can become.
+			discovery.GET("/azure/foundry", middlewares.Require("discovery", "read"), cloudAzure.ListFoundry)
+			discovery.GET("/azure/usage", middlewares.Require("discovery", "read"), cloudAzure.ListUsage)
+			// The Azure slice of the shared IGA graph (IGA_GRAPH_PROJECTION).
+			discovery.GET("/azure/graph/summary", middlewares.Require("discovery", "read"), cloudAzure.GraphSummary)
+			discovery.GET("/azure/graph/blast-radius", middlewares.Require("discovery", "read"), cloudAzure.BlastRadius)
+			discovery.GET("/azure/graph/neighbourhood", middlewares.Require("discovery", "read"), cloudAzure.Neighbourhood)
+			// Per-row evidence: which Microsoft API said each fact, and when.
+			discovery.GET("/azure/evidence", middlewares.Require("discovery", "read"), cloudAzure.Evidence)
+
+			// Microsoft's redirect for BOTH legs (admin consent, then sign-in)
+			// lands here. UNAUTHENTICATED and on the ROOT engine for the same
+			// reasons as the GCP callback above: the browser arrives with no
+			// AuthSec session, and the path must equal the one registered on
+			// the app (AZURE_REDIRECT_URI) with no "/authsec" prefix.
+			r.GET("/api/v1/auth/azure/callback", cloudAzure.OAuthCallback)
 		}
 
 		// ────────────────────────────────────────────────────
