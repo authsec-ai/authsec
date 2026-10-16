@@ -1698,6 +1698,10 @@ func SetupRoutes(
 			discovery.GET("/aws/connectors/:id/regions", middlewares.Require("discovery", "read"), cloudAWS.GetConnectorRegions)
 			discovery.PATCH("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.UpdateConnector)
 			discovery.GET("/aws/connectors/:id/scan-runs", middlewares.Require("discovery", "read"), cloudAWS.ListConnectorScanRuns)
+			// Automatic rescans (SPEC-aws-scheduled-scans.md): the per-connector
+			// schedule. The scans themselves are ordinary scan runs.
+			discovery.GET("/aws/connectors/:id/schedule", middlewares.Require("discovery", "read"), cloudAWS.GetScanSchedule)
+			discovery.PUT("/aws/connectors/:id/schedule", middlewares.Require("discovery", "admin"), cloudAWS.UpdateScanSchedule)
 			// DELETE verb, revoke semantics: the connector row and everything it
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.
