@@ -311,6 +311,7 @@ func NewCloudAzureRepository(db *gorm.DB) CloudAzureRepository {
 
 func (r *cloudAzureRepository) AllocateGeneration(workspaceID, connectorID uuid.UUID) (int, error) {
 	var generation int
+	// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 	res := r.db.Raw(`
 		UPDATE cloud_connector
 		   SET scan_generation = scan_generation + 1,
@@ -360,6 +361,7 @@ func (r *cloudAzureRepository) BeginRun(workspaceID, connectorID uuid.UUID, owne
 			return err
 		}
 		var generation int
+		// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 		if err := tx.Raw(`
 			UPDATE cloud_connector
 			   SET scan_generation = scan_generation + 1,
@@ -518,6 +520,7 @@ func (r *cloudAzureRepository) UpsertResources(workspaceID, connectorID uuid.UUI
 	}
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		return tx.Clauses(clause.OnConflict{
+			Where:   azureFenced("cloud_resource"),
 			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
 			// first_seen_at is kept: a resource's first sighting is evidence.
 			// Sensitivity follows AuthSec's rule only while AuthSec's rule set
@@ -620,6 +623,7 @@ func (r *cloudAzureRepository) UpsertIdentities(workspaceID, connectorID uuid.UU
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where:   azureFenced("cloud_identity"),
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
 		// first_seen_at is kept: when AuthSec first saw a principal is evidence.
 		DoUpdates: clause.Assignments(map[string]interface{}{
@@ -665,6 +669,7 @@ func (r *cloudAzureRepository) UpsertSecrets(workspaceID, connectorID uuid.UUID,
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where:   azureFenced("cloud_secret"),
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
@@ -711,6 +716,7 @@ func (r *cloudAzureRepository) UpsertPermissions(workspaceID, connectorID uuid.U
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where: azureFenced("cloud_permission"),
 		// uq_cloud_permission_grant, NULLS NOT DISTINCT: a subscription-wide
 		// grant (resource_id NULL) still conflicts with itself.
 		Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
@@ -812,6 +818,7 @@ func (r *cloudAzureRepository) Reconcile(workspaceID, connectorID uuid.UUID, gen
 				case *models.CloudIdentity:
 					q = q.Where("COALESCE(attrs->>'agent_listed', '') <> 'true'")
 				case *models.CloudSecret, *models.CloudAssumeEdge:
+					// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 					q = q.Where(`identity_id NOT IN (SELECT id FROM cloud_identity
 						WHERE workspace_id = ? AND attrs->>'agent_listed' = 'true')`, workspaceID)
 				case *models.CloudPermission:
@@ -853,6 +860,7 @@ func (r *cloudAzureRepository) UpsertAssumeEdges(workspaceID, connectorID uuid.U
 		e.FirstSeenAt, e.LastSeenAt, e.RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where:   azureFenced("cloud_assume_edge"),
 		Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
@@ -892,6 +900,7 @@ func (r *cloudAzureRepository) UpsertWorkloads(workspaceID, connectorID uuid.UUI
 		w.FirstSeenAt, w.LastSeenAt, w.RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where:   azureFenced("cloud_workload"),
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
@@ -934,6 +943,7 @@ func (r *cloudAzureRepository) UpsertUsage(workspaceID, connectorID uuid.UUID, g
 		u.FirstSeenAt, u.LastSeenAt, u.RowUpdatedAt = now, now, now
 	}
 	err := r.db.Clauses(clause.OnConflict{
+		Where:   azureFenced("cloud_usage"),
 		Columns: []clause.Column{{Name: "identity_id"}, {Name: "service"}, {Name: "source"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"connector_id": gorm.Expr("EXCLUDED.connector_id"),
@@ -1023,6 +1033,7 @@ func (r *cloudAzureRepository) SetLastExercised(workspaceID, connectorID uuid.UU
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		for id, t := range at {
+			// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 			if err := tx.Exec(`UPDATE cloud_permission
 				   SET last_exercised_at = GREATEST(last_exercised_at, ?), row_updated_at = now()
 				 WHERE workspace_id = ? AND connector_id = ? AND id = ?`,
@@ -1060,6 +1071,7 @@ func (r *cloudAzureRepository) MergeAttrs(workspaceID, connectorID uuid.UUID, ge
 	if err != nil {
 		return err
 	}
+	// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 	res := r.db.Exec(`
 		UPDATE cloud_connector
 		   SET attrs      = COALESCE(attrs, '{}'::jsonb) || ?::jsonb,
@@ -1156,6 +1168,7 @@ func (r *cloudAzureRepository) ListFederation(workspaceID uuid.UUID, f AzureList
 		return nil, 0, err
 	}
 	var out []AzureFederationEdge
+	// TENANT-EXEMPT: bound to workspace_id = ? from the caller's own connector row (Azure discovery pass) or the authenticated token (reads)
 	err := q.Select(`e.*, i.name AS identity_name, i.kind AS identity_kind,
 			CASE WHEN e.subject_kind = 'identity' THEN (SELECT s.name FROM cloud_identity s
 				WHERE s.workspace_id = e.workspace_id AND s.native_id = lower(e.subject) LIMIT 1) END AS subject_name`).
@@ -1306,4 +1319,17 @@ func (r *cloudAzureRepository) assertAzure(workspaceID, connectorID uuid.UUID) e
 		return ErrCloudConnectorNotFound
 	}
 	return nil
+}
+
+// azureFenced is the WHERE of an Azure upsert's DO UPDATE: a row is
+// overwritten only by a pass at least as new as the one that wrote it. A pass
+// whose lease expired keeps running until it notices; its generation is lower
+// than the pass that replaced it, so its writes no longer land on rows the
+// newer pass wrote (they would otherwise move last_seen_generation back and
+// let the newer pass's reconciliation delete live rows). A row another
+// connector wrote (generations are per connector) is not compared.
+func azureFenced(table string) clause.Where {
+	return clause.Where{Exprs: []clause.Expression{gorm.Expr(
+		table + ".connector_id IS DISTINCT FROM EXCLUDED.connector_id OR " +
+			"EXCLUDED.last_seen_generation >= " + table + ".last_seen_generation")}}
 }

@@ -196,6 +196,10 @@ type azurePass struct {
 	run  *models.CloudScanRun
 	stop context.CancelFunc
 	done chan struct{}
+	// ctx is the pass's work context: cancelled when the pass loses its
+	// lease, so a pass another one replaced stops reading and writing.
+	ctx     context.Context
+	release context.CancelFunc
 }
 
 // azurePassResult is a finished pass: what the graph projection needs to know
@@ -215,7 +219,8 @@ func (s *AzureOnboardingService) beginPass(ctx context.Context, workspaceID, con
 		return nil, err
 	}
 	hbCtx, stop := context.WithCancel(ctx)
-	p := &azurePass{run: run, stop: stop, done: make(chan struct{})}
+	workCtx, lost := context.WithCancel(ctx)
+	p := &azurePass{run: run, stop: stop, done: make(chan struct{}), ctx: workCtx, release: lost}
 	go func() {
 		defer close(p.done)
 		t := time.NewTicker(azureRunHeartbeat)
@@ -226,7 +231,8 @@ func (s *AzureOnboardingService) beginPass(ctx context.Context, workspaceID, con
 				return
 			case <-t.C:
 				if err := s.inventory.RenewRun(run.ID, azureRunOwner, azureRunLease); err != nil {
-					log.Printf("[azure] pass %s on connector %s lost its lease: %v", run.ID, connectorID, err)
+					log.Printf("[azure] pass %s on connector %s lost its lease, stopping it: %v", run.ID, connectorID, err)
+					lost()
 					return
 				}
 			}
@@ -239,6 +245,7 @@ func (s *AzureOnboardingService) beginPass(ctx context.Context, workspaceID, con
 func (s *AzureOnboardingService) finishPass(p *azurePass, cov models.ScanCoverage) *azurePassResult {
 	p.stop()
 	<-p.done
+	p.release()
 	if err := s.inventory.FinishRun(p.run.ID, azureRunOwner, cov); err != nil {
 		// Lease lost: a later pass abandoned this one. Its rows still carry this
 		// generation, but no projection may treat it as the latest reading.
@@ -273,6 +280,9 @@ func (s *AzureOnboardingService) startPassOrSkip(ctx context.Context, workspaceI
 // stop a deleted user from leaving the inventory.
 func (s *AzureOnboardingService) runTenantScan(ctx context.Context, workspaceID, connectorID uuid.UUID, tenantID, trigger string, cfg azure.AppConfig) *azurePassResult {
 	pass := s.startPassOrSkip(ctx, workspaceID, connectorID, trigger, "tenant scan")
+	if pass != nil {
+		ctx = pass.ctx
+	}
 	if pass == nil {
 		return nil
 	}

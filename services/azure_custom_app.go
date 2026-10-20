@@ -189,3 +189,30 @@ func azureTransient(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne)
 }
+
+// revokeUnselectedSubscriptions takes every subscription of the tenant that
+// this connect did not select (keep) out of scope: revoked, so discovery and
+// Verify no longer read it, whatever credentials it read with. A later connect
+// that selects it again makes it active again. Returns how many it revoked.
+func (s *AzureOnboardingService) revokeUnselectedSubscriptions(workspaceID uuid.UUID, tenantID string, keep map[string]bool) int {
+	all, err := s.connectors.List(workspaceID, models.CloudProviderAzure)
+	if err != nil {
+		log.Printf("[azure] could not list subscriptions of tenant %s to take unselected ones out of scope: %v", tenantID, err)
+		return 0
+	}
+	n := 0
+	for i := range all {
+		c := &all[i]
+		if c.ScopeKind != models.CloudScopeSubscription || c.ParentScopeID == nil ||
+			!strings.EqualFold(*c.ParentScopeID, tenantID) || keep[strings.ToLower(c.ScopeID)] ||
+			c.Status == models.CloudConnectorRevoked {
+			continue
+		}
+		if _, err := s.connectors.Revoke(workspaceID, c.ID); err != nil {
+			log.Printf("[azure] could not take subscription %s out of scope: %v", c.ScopeID, err)
+			continue
+		}
+		n++
+	}
+	return n
+}

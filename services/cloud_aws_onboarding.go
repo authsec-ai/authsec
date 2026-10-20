@@ -446,6 +446,10 @@ func (s *AWSOnboardingService) ConfigForConnector(
 // is untidy; a revoke that fails after the purge would leave a connector that
 // looks usable and is not, and every scan against it would fail confusingly.
 func (s *AWSOnboardingService) RevokeConnector(workspaceID, id uuid.UUID) error {
+	// Never another provider's connector through an AWS route.
+	if _, err := s.awsConnector(workspaceID, id); err != nil {
+		return err
+	}
 	authRef, err := s.repo.Revoke(workspaceID, id)
 	if err != nil {
 		return err
@@ -478,7 +482,9 @@ func (s *AWSOnboardingService) Connector(workspaceID, id uuid.UUID) (*models.Clo
 		cp := *p
 		return &cp, nil
 	}
-	return s.repo.Get(workspaceID, id)
+	// AWS routes act on AWS connectors only: another provider's id (Azure and
+	// GCP share cloud_connector) is not found, never queued or verified here.
+	return s.awsConnector(workspaceID, id)
 }
 
 // ForRun returns a copy of the service pinned to the connector row as it is
@@ -491,7 +497,7 @@ func (s *AWSOnboardingService) Connector(workspaceID, id uuid.UUID) (*models.Clo
 // EKS read the old regions, compute the new ones, and the run's coverage
 // described neither selection. The worker pins right after the claim.
 func (s *AWSOnboardingService) ForRun(workspaceID, connectorID uuid.UUID) (*AWSOnboardingService, error) {
-	c, err := s.repo.Get(workspaceID, connectorID)
+	c, err := s.awsConnector(workspaceID, connectorID)
 	if err != nil {
 		return nil, err
 	}
@@ -726,7 +732,7 @@ func (s *AWSOnboardingService) assumeRequestFor(
 	workspaceID, id uuid.UUID,
 ) (*models.CloudConnector, awsdiscovery.AssumeRequest, error) {
 
-	c, err := s.repo.Get(workspaceID, id)
+	c, err := s.awsConnector(workspaceID, id)
 	if err != nil {
 		return nil, awsdiscovery.AssumeRequest{}, err
 	}

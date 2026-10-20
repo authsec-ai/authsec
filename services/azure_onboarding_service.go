@@ -641,9 +641,12 @@ func (s *AzureOnboardingService) Connect(parent context.Context, sessionID strin
 			"and the client secret AuthSec stored for your app has been removed")
 		s.destroyCustomAppSecret(workspaceID, tid)
 	}
-	if n := s.retargetTenantSubscriptions(workspaceID, tid, s.cfg.AuthRef(), "the AuthSec app", keep); n > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d subscription(s) connected earlier were not selected now and cannot be "+
-			"read by the AuthSec app; connect the tenant again and select them", n))
+	// Connect is the choice of scope: a subscription of this tenant not
+	// selected now leaves it, whatever credentials it read with, so no later
+	// scan reads it. Selecting it again on a later connect restores it.
+	if n := s.revokeUnselectedSubscriptions(workspaceID, tid, keep); n > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d subscription(s) connected earlier were not selected and are no longer read. "+
+			"The Reader role AuthSec was given there stays in Azure until you remove it", n))
 	}
 
 	// 10. Discover identities, grants and resources in the background: the

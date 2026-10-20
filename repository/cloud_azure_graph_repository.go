@@ -78,6 +78,7 @@ type AzureEvidence struct {
 // grant it holds, most recently confirmed first.
 func AzureEvidenceFor(db *gorm.DB, workspaceID uuid.UUID, objectID string, limit int) ([]AzureEvidence, error) {
 	var out []AzureEvidence
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	err := db.Raw(`
 		SELECT o.id, CASE WHEN o.identity_id IS NOT NULL THEN 'identity' ELSE 'grant' END AS subject,
 		       o.subject_native_id, o.source_api, o.surface, o.surface_state, o.scan_run_id,
@@ -103,6 +104,7 @@ const azureReachDepth = 6
 // AzureGraphSummary counts the workspace's Azure graph rows by kind and state.
 func AzureGraphSummary(db *gorm.DB, workspaceID uuid.UUID) ([]AzureGraphCount, error) {
 	var out []AzureGraphCount
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	err := db.Raw(`
 		SELECT 'identity' AS "table", account_kind AS kind, lifecycle AS state, count(*) AS count
 		  FROM iga_identity_accounts WHERE workspace_id = ? AND provider = ? GROUP BY 2, 3
@@ -139,6 +141,7 @@ func AzureGraphSummary(db *gorm.DB, workspaceID uuid.UUID) ([]AzureGraphCount, e
 // (§2.6), so this walk is where it is attributed.
 func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*AzureBlastRadius, error) {
 	var reach []AzureReach
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	err := db.Raw(`
 		WITH RECURSIVE reach(identity_id, via, depth) AS (
 		    SELECT id, 'self'::text, 0
@@ -178,6 +181,7 @@ func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*A
 	}
 
 	var grants []AzureReachGrant
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	err = db.Raw(`
 		SELECT e.id AS edge_id, e.subject_identity_account_id AS holder_id, i.display_name AS holder_name,
 		       e.path_kind, e.native_scope, e.state, e.calculation_state, e.effective_conclusion,

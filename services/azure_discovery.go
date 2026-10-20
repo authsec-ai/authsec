@@ -127,6 +127,9 @@ func azureResourceSensitivity(kind string, tags map[string]string, containerStag
 // Foundry projects' agents are read with it.
 func (s *AzureOnboardingService) runSubscriptionScan(ctx context.Context, workspaceID, connectorID uuid.UUID, subscriptionID, armToken, foundryToken, trigger string) *azurePassResult {
 	pass := s.startPassOrSkip(ctx, workspaceID, connectorID, trigger, "subscription scan")
+	if pass != nil {
+		ctx = pass.ctx
+	}
 	if pass == nil {
 		return nil
 	}

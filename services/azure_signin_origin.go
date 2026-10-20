@@ -339,8 +339,9 @@ func (s *AzureOnboardingService) attributeSignInIPs(ctx context.Context, workspa
 		if err != nil {
 			continue
 		}
-		if err := s.db.Exec(`UPDATE cloud_usage SET attrs = attrs || jsonb_build_object('ip_origins', ?::jsonb) WHERE id = ?`,
-			string(raw), u.ID).Error; err != nil {
+		// TENANT-EXEMPT: bound to workspace_id = ? of this Azure discovery pass
+		if err := s.db.Exec(`UPDATE cloud_usage SET attrs = attrs || jsonb_build_object('ip_origins', ?::jsonb) WHERE workspace_id = ? AND id = ?`,
+			string(raw), workspaceID, u.ID).Error; err != nil {
 			return counts, err
 		}
 	}

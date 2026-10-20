@@ -373,6 +373,7 @@ func (s *AzureOnboardingService) collectFoundryAgents(ctx context.Context, works
 			counters["foundry_project_agents"]++
 		}
 		patch, _ := json.Marshal(map[string]interface{}{"project_agents": facts})
+		// TENANT-EXEMPT: bound to workspace_id = ? and the connector of this Azure discovery pass
 		if err := s.db.Exec("UPDATE cloud_workload SET attrs = attrs || ?::jsonb WHERE workspace_id = ? AND connector_id = ? AND native_id = ?",
 			string(patch), workspaceID, connectorID, p.NativeID).Error; err != nil {
 			log.Printf("[azure] scan: could not record Foundry agents of %s: %v", p.Name, err)

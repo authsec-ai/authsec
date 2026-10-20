@@ -106,6 +106,7 @@ func AzureNeighbourhoodOf(db *gorm.DB, workspaceID uuid.UUID, ref string) (*Azur
 	switch kind {
 	case "object":
 		var row struct{ ID uuid.UUID }
+		// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 		if err := db.Raw(`SELECT id FROM iga_identity_accounts WHERE workspace_id = ? AND provider = ?
 			AND lifecycle <> 'retired' AND provider_attrs->>'object_id' = lower(?) LIMIT 1`,
 			workspaceID, models.ProviderAzure, id).Scan(&row).Error; err != nil {
@@ -119,6 +120,7 @@ func AzureNeighbourhoodOf(db *gorm.DB, workspaceID uuid.UUID, ref string) (*Azur
 		// A resource by its Azure id (an ARM id, or an API permission's native
 		// id), as the inventory lists it.
 		var row struct{ ID uuid.UUID }
+		// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 		if err := db.Raw(`SELECT id FROM iga_resources WHERE workspace_id = ? AND provider = ?
 			AND lifecycle <> 'retired' AND provider_attrs->>'native_id' = lower(?) LIMIT 1`,
 			workspaceID, models.ProviderAzure, id).Scan(&row).Error; err != nil {
@@ -182,6 +184,7 @@ func (b *nbBuilder) loadIdentities(ids []uuid.UUID) (map[uuid.UUID]nbIdentity, e
 		return out, nil
 	}
 	var rows []nbIdentity
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	err := b.db.Raw(`SELECT id, display_name, account_kind, provider_attrs FROM iga_identity_accounts
 		WHERE workspace_id = ? AND id IN ?`, b.ws, ids).Scan(&rows).Error
 	for _, r := range rows {
@@ -205,6 +208,7 @@ type nbGrant struct {
 	Sensitivity  string
 }
 
+// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 const nbGrantSelect = `SELECT e.id, e.subject_identity_account_id AS subject_id, e.resource_id,
 		COALESCE(r.display_name, '') AS resource_name, COALESCE(r.resource_kind, '') AS resource_kind,
 		e.native_scope, e.path_kind, e.state, e.effective_conclusion AS conclusion,
@@ -222,6 +226,7 @@ const nbGrantOrder = ` ORDER BY CASE COALESCE(NULLIF(en.normalized_rights->>'sen
 func (b *nbBuilder) grants(where string, args ...interface{}) ([]nbGrant, int, error) {
 	var total int64
 	countArgs := append([]interface{}{b.ws}, args...)
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	if err := b.db.Raw(`SELECT count(*) FROM iga_access_edges e WHERE e.workspace_id = ? AND e.provider = 'azure'
 		AND e.state <> 'ended' AND `+where, countArgs...).Scan(&total).Error; err != nil {
 		return nil, 0, err
@@ -378,6 +383,7 @@ func (b *nbBuilder) relTotals(id uuid.UUID) error {
 		Type  string
 		Count int
 	}
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	if err := b.db.Raw(`SELECT relationship_type AS type, count(*) AS count FROM iga_relationship
 		WHERE workspace_id = ? AND source_key LIKE ? AND state <> 'ended'
 		  AND (source_identity_account_id = ? OR target_identity_account_id = ?)
@@ -403,6 +409,7 @@ func (b *nbBuilder) addRelationships(rels []nbRel, identities, workloads, extern
 			RuntimeKind string
 			Region      string
 		}
+		// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 		if err := b.db.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id IN ?`,
 			b.ws, workloads).Scan(&rows).Error; err != nil {
 			return err
@@ -420,6 +427,7 @@ func (b *nbBuilder) addRelationships(rels []nbRel, identities, workloads, extern
 			SubjectClaim string
 			Mechanism    string
 		}
+		// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 		if err := b.db.Raw(`SELECT id, issuer, subject_claim, mechanism FROM iga_external_principal WHERE workspace_id = ? AND id IN ?`,
 			b.ws, externals).Scan(&rows).Error; err != nil {
 			return err
@@ -508,6 +516,7 @@ func (b *nbBuilder) resource(id uuid.UUID) (*AzureGraphNeighbourhood, error) {
 		ResourceKind string
 		Attrs        json.RawMessage `gorm:"column:provider_attrs"`
 	}
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	if err := b.db.Raw(`SELECT id, display_name, resource_kind, provider_attrs FROM iga_resources
 		WHERE workspace_id = ? AND id = ? AND provider = ?`, b.ws, id, models.ProviderAzure).Scan(&r).Error; err != nil {
 		return nil, err
@@ -556,6 +565,7 @@ func (b *nbBuilder) workload(id uuid.UUID) (*AzureGraphNeighbourhood, error) {
 		RuntimeKind string
 		Region      string
 	}
+	// TENANT-EXEMPT: a read bound to workspace_id = ? from the authenticated token (Azure graph reads)
 	if err := b.db.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id = ? AND provider = ?`,
 		b.ws, id, models.ProviderAzure).Scan(&w).Error; err != nil {
 		return nil, err

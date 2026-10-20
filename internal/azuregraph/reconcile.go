@@ -139,6 +139,7 @@ func retireUnsupported(tx *gorm.DB, p Pass, at time.Time) (int, error) {
 		{"iga_entitlements", "entitlement_id"},
 		{"iga_workload", "workload_id"},
 	} {
+		// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 		r := tx.Exec(`
 			UPDATE `+t.table+` o
 			   SET lifecycle = ?, retired_reason = ?, updated_at = ?
@@ -164,12 +165,14 @@ func retireUnsupported(tx *gorm.DB, p Pass, at time.Time) (int, error) {
 // console will happily draw.
 func cascade(tx *gorm.DB, p Pass, at time.Time) error {
 	retired := func(table string) string {
+		// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 		return `(SELECT id FROM ` + table + ` WHERE workspace_id = ? AND provider = ? AND lifecycle = ?)`
 	}
 	retArgs := []interface{}{p.WorkspaceID, models.ProviderAzure, models.IGALifecycleRetired}
 	end := func(table, where, reason string, extra ...interface{}) error {
 		args := []interface{}{models.RelEnded, at, reason, p.WorkspaceID, models.RelEnded}
 		args = append(args, extra...)
+		// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 		return tx.Exec(`UPDATE `+table+` SET state = ?, valid_to = ?, ended_reason = ?
 			WHERE workspace_id = ? AND state <> ? AND `+where, args...).Error
 	}
@@ -212,10 +215,12 @@ func revokeCredentials(tx *gorm.DB, p Pass, at time.Time) (int, error) {
 		// pass that could not read Agent ID.
 		agentHold := ""
 		if !p.agentsRead() {
+			// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 			agentHold = ` AND identity_account_id NOT IN (SELECT id FROM iga_identity_accounts
 			                 WHERE workspace_id = iga_credentials.workspace_id AND provider = 'azure'
 			                   AND provider_attrs->>'agent_listed' = 'true')`
 		}
+		// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 		r := tx.Exec(`UPDATE iga_credentials SET lifecycle = 'revoked', retired_reason = ?, updated_at = ?
 			WHERE workspace_id = ? AND provider = ? AND source_key LIKE ?
 			  AND lifecycle IN ('active', 'expired') AND last_seen_at < ?`+agentHold,
@@ -226,6 +231,7 @@ func revokeCredentials(tx *gorm.DB, p Pass, at time.Time) (int, error) {
 		}
 		total += int(r.RowsAffected)
 	}
+	// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 	r := tx.Exec(`UPDATE iga_credentials SET lifecycle = 'revoked', retired_reason = ?, updated_at = ?
 		WHERE workspace_id = ? AND provider = ? AND lifecycle IN ('active', 'expired')
 		  AND identity_account_id IN (SELECT id FROM iga_identity_accounts

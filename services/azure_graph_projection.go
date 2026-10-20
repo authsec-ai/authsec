@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azuregraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -52,7 +53,10 @@ func (s *AzureOnboardingService) projectGraph(ctx context.Context, workspaceID u
 		}
 		started := time.Now()
 		var res *azuregraph.Result
-		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Under row-level security for this workspace, as the Kubernetes
+		// projection runs: the database itself refuses another workspace's
+		// rows, beyond each statement's own workspace_id.
+		err := tenancy.InWorkspace(ctx, s.db, workspaceID, func(tx *gorm.DB) error {
 			r, err := azuregraph.ProjectPass(tx, p, time.Now())
 			res = r
 			return err

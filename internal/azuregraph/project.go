@@ -42,6 +42,7 @@ type Result struct {
 // ErrSuperseded and writes nothing.
 func ProjectPass(tx *gorm.DB, p Pass, now time.Time) (*Result, error) {
 	var generation int
+	// TENANT-EXEMPT: bound to the pass's workspace and run on the caller's tenancy.InWorkspace transaction (Azure projection)
 	if err := tx.Raw(`SELECT scan_generation FROM cloud_connector
 		WHERE workspace_id = ? AND id = ? AND provider = ? FOR UPDATE`,
 		p.WorkspaceID, p.ConnectorID, models.CloudProviderAzure).Scan(&generation).Error; err != nil {
