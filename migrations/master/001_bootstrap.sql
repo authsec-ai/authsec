@@ -12828,3 +12828,87 @@ BEGIN
         END;
     END LOOP;
 END $$;
+
+-- ============================================================================
+-- 139: per-connector schedule for automatic AWS rescans (cloud_scan_schedule)
+-- Same block as migrations/master/139_cloud_scan_schedule.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_scan_schedule (
+    connector_id     uuid        PRIMARY KEY,
+    workspace_id     uuid        NOT NULL,
+    enabled          boolean     NOT NULL DEFAULT false,
+    -- 6 hours .. 7 days. Hourly is deliberately not offered (API cost and
+    -- throttling for little gain until events exist).
+    interval_minutes integer     NOT NULL DEFAULT 1440,
+    next_due_at      timestamptz,
+    last_enqueued_at timestamptz,
+    -- Scheduled runs older than this do not count toward the pause decision.
+    -- Set when the schedule is turned on or resumed, so a resumed schedule is
+    -- not paused again by the failures that paused it.
+    streak_since     timestamptz,
+    -- '' = not paused. Otherwise a short code and the last error.
+    paused_reason    text        NOT NULL DEFAULT '',
+    updated_by       text        NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT cloud_scan_schedule_interval_chk
+        CHECK (interval_minutes BETWEEN 360 AND 10080),
+    -- Workspace-qualified, like every cloud_* table (027): a schedule cannot
+    -- name another workspace's connector.
+    CONSTRAINT cloud_scan_schedule_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE
+);
+
+-- The scheduler's due-scan query reads only schedules that are on and not paused.
+CREATE INDEX IF NOT EXISTS idx_cloud_scan_schedule_due
+    ON public.cloud_scan_schedule (next_due_at)
+    WHERE enabled AND paused_reason = '';
+
+COMMENT ON TABLE public.cloud_scan_schedule IS
+    'When an AWS connector rescans itself. The scans it causes are cloud_scan_run rows with trigger = scheduled.';
+
+-- Required for every workspace table; guarded as in 137_access_policies.sql.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.cloud_scan_schedule');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 140: a chosen time of day, timezone and weekday for automatic AWS rescans.
+--
+-- Until now a schedule ran one interval after it was turned on, so the time of
+-- day was whenever an administrator happened to switch it on. These columns let
+-- the administrator choose it. All three are optional: time_of_day_minutes NULL
+-- keeps the original behaviour, so every existing schedule is unchanged.
+--
+--   time_of_day_minutes  minutes after local midnight, on a quarter hour.
+--   timezone             IANA zone name the time is read in. UTC by default.
+--   day_of_week          0 = Sunday .. 6 = Saturday. Used by weekly schedules.
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+ALTER TABLE public.cloud_scan_schedule
+    ADD COLUMN IF NOT EXISTS time_of_day_minutes integer,
+    ADD COLUMN IF NOT EXISTS timezone            text     NOT NULL DEFAULT 'UTC',
+    ADD COLUMN IF NOT EXISTS day_of_week         smallint;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cloud_scan_schedule_time_chk') THEN
+        ALTER TABLE public.cloud_scan_schedule
+            ADD CONSTRAINT cloud_scan_schedule_time_chk
+            CHECK (time_of_day_minutes IS NULL
+                   OR (time_of_day_minutes BETWEEN 0 AND 1439 AND time_of_day_minutes % 15 = 0));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cloud_scan_schedule_weekday_chk') THEN
+        ALTER TABLE public.cloud_scan_schedule
+            ADD CONSTRAINT cloud_scan_schedule_weekday_chk
+            CHECK (day_of_week IS NULL OR day_of_week BETWEEN 0 AND 6);
+    END IF;
+END $$;

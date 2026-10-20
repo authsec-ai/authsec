@@ -348,6 +348,15 @@ func main() {
 			awsSvc := services.NewAWSOnboardingService(config.DB, vc)
 			go services.NewAWSScanWorker(config.DB, awsSvc).WithGraphProjection(graphGate).
 				Run(context.Background())
+
+			// Automatic rescans: queues scheduled scans for connectors that have
+			// a schedule. Off unless AUTHSEC_AWS_SCHEDULED_SCANS=true; it only
+			// queues work, the worker above runs it.
+			if services.ScheduledScansEnabled() {
+				go services.NewAWSScanScheduler(config.DB).Run(context.Background())
+			} else {
+				log.Printf("[aws-sched] scheduled scans are off: set %s=true to enable", services.ScheduledScansEnv)
+			}
 		}
 	}
 
