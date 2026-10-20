@@ -371,8 +371,11 @@ func main() {
 	if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
 		azureVault, _ = vault.NewClient(va, vt)
 	}
-	go services.NewAzureOnboardingService(config.DB, config.GetRedisClient(), azure.AppConfigFromEnv(), azureVault).
-		RunScheduler(context.Background(), services.AzureDiscoveryIntervalFromEnv())
+	azureSvc := services.NewAzureOnboardingService(config.DB, config.GetRedisClient(), azure.AppConfigFromEnv(), azureVault)
+	// Access policies on Azure resources write role assignments with the same
+	// app (144).
+	services.SetAzureAccessDeps(azureSvc.AccessDeps())
+	go azureSvc.RunScheduler(context.Background(), services.AzureDiscoveryIntervalFromEnv())
 
 	// AWS Quick Create callback worker: drains the SQS queue that every
 	// regional callback topic delivers to, and connects the account a stack

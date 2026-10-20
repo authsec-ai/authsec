@@ -47,6 +47,9 @@ const (
 	GovJobTempGrant     = "temp_grant"
 	GovJobSessionRevoke = "session_revoke"
 	GovJobTimeBound     = "time_bound"
+	// Access policies on Azure resources (144): role assignments created,
+	// or removed and restored, per principal.
+	GovJobAzureAccess = "azure_access"
 )
 
 // GovJobKinds are the kinds 052 (widened by 061) accepts (all of them).
@@ -54,7 +57,7 @@ var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
 	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
-	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound,
+	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound, GovJobAzureAccess,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per

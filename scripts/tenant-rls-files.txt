@@ -23,6 +23,7 @@ services/cloud_enforcement_r2.go
 services/cloud_runtime_broker.go
 services/governance_notification_bridge.go
 services/iga_gov_access_policy.go
+services/iga_gov_access_azure.go
 services/iga_gov_approval_service.go
 services/iga_gov_attempt_log.go
 services/iga_gov_authoring_service.go

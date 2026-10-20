@@ -1218,6 +1218,7 @@ func RegisterR2Jobs(w *PolicyJobWorker, db *gorm.DB) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobTempGrant, Handler: s.TempGrantHandler})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobSessionRevoke, Handler: s.SessionRevokeHandler})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobTimeBound, Handler: NewGovDeployments(db, nil).TimeBoundHandler})
+	RegisterAzureAccessJobs(w, db)
 	for _, k := range []r2Kind{r2GrantKind, r2RevokeKind} {
 		k := k
 		w.Scheduler().Add(PolicyJobSchedule{Name: k.Job, Kind: k.Job, Every: r2ActiveCheckEvery,
