@@ -140,6 +140,9 @@ type azureOAuthState struct {
 	TenantID     string `json:"tenant_id,omitempty"`
 	CodeVerifier string `json:"code_verifier"`
 	LoginHint    string `json:"login_hint,omitempty"`
+	// ReturnOrigin is the workspace UI origin the onboarding was started from
+	// (azure_oauth_return.go); the callback sends the browser back there.
+	ReturnOrigin string `json:"return_origin,omitempty"`
 }
 
 // azureOAuthSession holds the administrator's delegated ARM token. This struct
@@ -172,7 +175,11 @@ func (s *AzureOnboardingService) Available(ctx context.Context) bool {
 // Start begins the flow for the caller's workspace and returns the
 // admin-consent URL to send the browser to. tenantHint (a tenant id or
 // verified domain) and loginHint are optional.
-func (s *AzureOnboardingService) Start(ctx context.Context, workspaceID uuid.UUID, actor, tenantHint, loginHint string) (string, string, error) {
+//
+// origin is the browser's Origin on the start request. Kept only when it is
+// one of this workspace's own UI origins; otherwise the callback returns to
+// the configured UI origin, as before.
+func (s *AzureOnboardingService) Start(ctx context.Context, workspaceID uuid.UUID, actor, tenantHint, loginHint, origin string) (string, string, error) {
 	if !s.Available(ctx) {
 		return "", "", azure.ErrNotConfigured
 	}
@@ -199,6 +206,7 @@ func (s *AzureOnboardingService) Start(ctx context.Context, workspaceID uuid.UUI
 		Stage:        azureStageConsent,
 		CodeVerifier: verifier,
 		LoginHint:    loginHint,
+		ReturnOrigin: s.azureReturnOrigin(workspaceID, origin),
 	}); err != nil {
 		return "", "", err
 	}
@@ -234,6 +242,10 @@ type AzureCallbackParams struct {
 type AzureCallbackOutcome struct {
 	NextURL   string
 	SessionID string
+	// ReturnOrigin is where the UI is to be reached ("" for the configured UI
+	// origin). Set on failures too, once the state was read, so an error
+	// lands on the page the administrator started from.
+	ReturnOrigin string
 }
 
 // HandleCallback serves both legs on the one registered redirect URI. The
@@ -256,13 +268,21 @@ func (s *AzureOnboardingService) HandleCallback(ctx context.Context, p AzureCall
 		return nil, ErrAzureOAuthStateInvalid
 	}
 
+	var out *AzureCallbackOutcome
 	switch st.Stage {
 	case azureStageConsent:
-		return s.handleConsentLeg(ctx, st, p)
+		out, err = s.handleConsentLeg(ctx, st, p)
 	case azureStageSignIn:
-		return s.handleSignInLeg(ctx, st, p)
+		out, err = s.handleSignInLeg(ctx, st, p)
+	default:
+		err = ErrAzureOAuthStateInvalid
 	}
-	return nil, ErrAzureOAuthStateInvalid
+	// Success or failure, the browser goes back to the origin it started from.
+	if out == nil {
+		out = &AzureCallbackOutcome{}
+	}
+	out.ReturnOrigin = st.ReturnOrigin
+	return out, err
 }
 
 func (s *AzureOnboardingService) handleConsentLeg(ctx context.Context, st azureOAuthState, p AzureCallbackParams) (*AzureCallbackOutcome, error) {
@@ -290,6 +310,7 @@ func (s *AzureOnboardingService) handleConsentLeg(ctx context.Context, st azureO
 		TenantID:     tenantID,
 		CodeVerifier: st.CodeVerifier,
 		LoginHint:    st.LoginHint,
+		ReturnOrigin: st.ReturnOrigin,
 	}); err != nil {
 		return nil, err
 	}

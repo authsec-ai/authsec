@@ -167,6 +167,22 @@ UI                  AuthSec backend                    Microsoft
    exists. The access token lives only in Redis and is deleted once Connect
    completes.
 
+### Where the browser comes back to
+
+The onboarding leaves the page for Microsoft (a full-page redirect) and comes
+back through AuthSec's one registered callback. An administrator works on
+their workspace's own UI origin (`https://<workspace>.app.authsec.ai`, or a
+verified custom domain), and the browser keeps their session for that origin
+only. So Start records the origin it was called from (the browser's `Origin`
+header on `POST /azure/oauth/start`) in the OAuth state, and the callback
+returns there, on success and on failure. It is kept only when it is one of
+this workspace's own UI origins: the configured UI origin
+(`PUBLIC_UI_ORIGIN`), the workspace's own domain (`workspaces.workspace_domain`)
+or one of its verified domains (`workspace_domains`), over https (http only on
+a local host), with no path, query or credentials. Anything else is ignored and
+the configured UI origin is used, so the callback cannot redirect anywhere
+AuthSec does not serve this workspace's UI (`services/azure_oauth_return.go`).
+
 ### Which tenant is trusted
 
 The `tenant=` parameter on the consent redirect passes through the browser and

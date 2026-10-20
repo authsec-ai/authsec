@@ -90,7 +90,9 @@ func (ctl *CloudAzureController) StartOAuth(c *gin.Context) {
 			return
 		}
 	}
-	authorizeURL, state, err := ctl.service().Start(c.Request.Context(), workspaceID, actor, req.Tenant, req.LoginHint)
+	// The browser's Origin: the workspace UI to come back to after Microsoft.
+	// The service keeps it only when it is one of this workspace's own.
+	authorizeURL, state, err := ctl.service().Start(c.Request.Context(), workspaceID, actor, req.Tenant, req.LoginHint, c.GetHeader("Origin"))
 	if err != nil {
 		status, body := mapAzureOnboardingError(err)
 		c.JSON(status, body)
@@ -113,9 +115,11 @@ func (ctl *CloudAzureController) StartOAuth(c *gin.Context) {
 //
 // Registered on the ROOT engine so its path matches AZURE_REDIRECT_URI exactly.
 func (ctl *CloudAzureController) OAuthCallback(c *gin.Context) {
-	redirectTo := func(query url.Values) string {
+	// origin is the workspace UI origin recorded at Start (checked there), or
+	// "" for the configured UI origin.
+	redirectTo := func(origin string, query url.Values) string {
 		if config.AppConfig != nil {
-			if u := config.AppConfig.BuildUIRouteURL("/discovery/cloud/azure/oauth/callback", query); u != "" {
+			if u := config.AppConfig.BuildUIRouteURLAt(origin, "/discovery/cloud/azure/oauth/callback", query); u != "" {
 				return u
 			}
 		}
@@ -130,15 +134,19 @@ func (ctl *CloudAzureController) OAuthCallback(c *gin.Context) {
 		Error:            c.Query("error"),
 		ErrorDescription: c.Query("error_description"),
 	})
+	origin := ""
+	if outcome != nil {
+		origin = outcome.ReturnOrigin
+	}
 	if err != nil {
-		c.Redirect(http.StatusFound, redirectTo(url.Values{"error": {azureCallbackErrorCode(err)}}))
+		c.Redirect(http.StatusFound, redirectTo(origin, url.Values{"error": {azureCallbackErrorCode(err)}}))
 		return
 	}
 	if outcome.NextURL != "" {
 		c.Redirect(http.StatusFound, outcome.NextURL)
 		return
 	}
-	c.Redirect(http.StatusFound, redirectTo(url.Values{"session_id": {outcome.SessionID}}))
+	c.Redirect(http.StatusFound, redirectTo(origin, url.Values{"session_id": {outcome.SessionID}}))
 }
 
 // azureCallbackErrorCode is the stable code the UI shows for a failed

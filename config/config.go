@@ -532,6 +532,22 @@ func (c *Config) BuildUIRouteURL(route string, query url.Values) string {
 	return base.String()
 }
 
+// BuildUIRouteURLAt is BuildUIRouteURL on another origin of the UI -- a
+// workspace's own domain -- that the caller has already checked belongs to the
+// UI. An empty or unparsable origin falls back to the configured UI origin.
+func (c *Config) BuildUIRouteURLAt(origin, route string, query url.Values) string {
+	if c == nil {
+		return ""
+	}
+	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(origin), "/"))
+	if strings.TrimSpace(origin) == "" || err != nil || base.Scheme == "" || base.Host == "" {
+		return c.BuildUIRouteURL(route, query)
+	}
+	base.Path = joinURLPath(c.UIBasePath, route)
+	base.RawQuery = query.Encode()
+	return base.String()
+}
+
 func (c *Config) BuildUILoginURL(loginChallenge string) string {
 	query := url.Values{}
 	query.Set("login_challenge", loginChallenge)
