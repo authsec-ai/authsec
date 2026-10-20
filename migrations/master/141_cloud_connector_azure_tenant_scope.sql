@@ -1,4 +1,4 @@
--- 138_cloud_connector_azure_tenant_scope.sql — an Entra tenant is a scope.
+-- 141_cloud_connector_azure_tenant_scope.sql — an Entra tenant is a scope.
 --
 -- expand only. Widens cloud_connector_scope_kind_chk to admit 'tenant'.
 --
@@ -49,6 +49,6 @@ BEGIN
          WHERE conname = 'cloud_connector_scope_kind_chk'
            AND pg_get_constraintdef(oid) LIKE '%tenant%'
     ) THEN
-        RAISE EXCEPTION '138: cloud_connector_scope_kind_chk does not admit tenant';
+        RAISE EXCEPTION '141: cloud_connector_scope_kind_chk does not admit tenant';
     END IF;
 END $$;

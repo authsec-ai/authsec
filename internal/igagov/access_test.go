@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var accessNow = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
@@ -79,7 +80,9 @@ func TestAccessDocument(t *testing.T) {
 	}
 
 	// Block read under a prefix, with an end: object actions on bucket/prefix*,
-	// ListBucket on the bucket limited by s3:prefix, both inside the window.
+	// the listing actions on the bucket limited by s3:prefix (the folder, the
+	// empty prefix and its leading fragments), a second Deny for a request that
+	// names no prefix, all inside the window.
 	bucket.Prefix = "invoices/"
 	end := accessNow.Add(time.Hour)
 	doc, hash, acts, res, err := AccessDocument("block", []string{"read"}, bucket, nil, &end)
@@ -95,12 +98,14 @@ func TestAccessDocument(t *testing.T) {
 	if err := json.Unmarshal(doc, &d); err != nil {
 		t.Fatal(err)
 	}
-	if len(d.Statement) != 2 {
+	if len(d.Statement) != 3 {
 		t.Fatalf("statements: %s", doc)
 	}
 	text := string(doc)
 	for _, want := range []string{`"Effect":"Deny"`, `"arn:aws:s3:::acme-invoices/invoices/*"`, `"Resource":"arn:aws:s3:::acme-invoices"`,
-		`"s3:prefix":"invoices/*"`, `"DateLessThan":{"aws:CurrentTime":"2026-10-14T13:00:00Z"}`, `"s3:GetObject"`, `"s3:ListBucket"`} {
+		`"invoices/*"`, `"inv"`, `"invoice"`, `"Null":{"s3:prefix":"true"}`,
+		`"DateLessThan":{"aws:CurrentTime":"2026-10-14T13:00:00Z"}`, `"s3:GetObject"`, `"s3:ListBucket"`,
+		`"s3:ListBucketVersions"`, `"s3:ListBucketMultipartUploads"`, `"s3:GetObjectAttributes"`} {
 		if !strings.Contains(text, want) {
 			t.Errorf("document lacks %s: %s", want, text)
 		}
@@ -112,8 +117,42 @@ func TestAccessDocument(t *testing.T) {
 			t.Errorf("GetObject on the bucket ARN: %s", text)
 		}
 	}
-	if len(acts) != 3 || len(res) != 2 {
+	if len(acts) != 7 || len(res) != 2 {
 		t.Errorf("actions %v resources %v", acts, res)
+	}
+
+	// A fragment equal to the whole folder is not listed (the folder* value covers it).
+	if strings.Contains(text, `"invoices/"`) {
+		t.Errorf("the whole folder is listed as a fragment: %s", text)
+	}
+	// Every listing Deny carries the window.
+	if strings.Count(text, `"DateLessThan"`) != 3 {
+		t.Errorf("window missing on a statement: %s", text)
+	}
+
+	// An Allow never gains the Block's extra read actions.
+	if o, b := accessActionsFor(AccessEffectAllow, []string{"read"}, "invoices/"); len(o) != 2 || len(b) != 1 {
+		t.Errorf("allow read widened: %v %v", o, b)
+	}
+	// A folder too long to list its fragments keeps folder*, "" and the no-prefix Deny only.
+	long := strings.Repeat("a", MaxListGuardPrefix+1) + "/"
+	if v := accessListGuard(long); len(v) != 2 {
+		t.Errorf("long folder guard: %v", v)
+	}
+	if !AccessListGuardPartial(AccessEffectBlock, long) || AccessListGuardPartial(AccessEffectBlock, "invoices/") || AccessListGuardPartial(AccessEffectAllow, long) {
+		t.Error("partial-guard flag wrong")
+	}
+	// A multi-byte folder is split on characters, never inside one.
+	for _, v := range accessListGuard("é/日本/") {
+		if v != "" && !strings.HasSuffix(v, "*") && !utf8.ValidString(v) {
+			t.Errorf("split inside a character: %q", v)
+		}
+	}
+	// Block write: no listing statement at all.
+	bucket.Prefix = "invoices/"
+	doc, _, _, _, err = AccessDocument("block", []string{"write"}, bucket, nil, &end)
+	if err != nil || strings.Contains(string(doc), AccessSidBucket) || strings.Contains(string(doc), AccessSidBucketNone) {
+		t.Fatalf("block write: %v %s", err, doc)
 	}
 
 	// Block all, no prefix, no end: s3:* on objects and bucket, no condition.

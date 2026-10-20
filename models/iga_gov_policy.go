@@ -271,6 +271,10 @@ type IGAGovPolicy struct {
 	CreatedBy        uuid.UUID  `json:"created_by" gorm:"type:uuid;not null"`
 	CreatedAt        time.Time  `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt        time.Time  `json:"updated_at" gorm:"not null;default:now()"`
+	// DeletedAt hides an ended access policy (138); its history is kept. Read-only
+	// here (->): only the delete writes it, in SQL, so creating any other policy
+	// never touches the column.
+	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"column:deleted_at;->"`
 }
 
 func (IGAGovPolicy) TableName() string { return "iga_gov_policy" }

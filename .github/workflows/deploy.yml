@@ -167,11 +167,18 @@ jobs:
               backup_dir=/bitnami/postgresql/authsec-release-backups
               mkdir -p "$backup_dir"
               backup="$backup_dir/authprod-$AUTHSEC_RELEASE.dump"
-              export PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"
-              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -Fc > "$backup"
-              test -s "$backup"
-              pg_restore --list "$backup" > /dev/null
+              # Leftovers of an interrupted dump are never mistaken for a backup.
+              rm -f "$backup_dir"/*.partial
+              # As the superuser: the tables FORCE row-level security, so a
+              # dump as their owner (authprod) is refused, or would be partial.
+              export PGPASSWORD="$(cat "$POSTGRES_POSTGRES_PASSWORD_FILE")"
+              pg_dump -U postgres -d "$POSTGRES_DATABASE" -Fc > "$backup.partial"
+              test -s "$backup.partial"
+              pg_restore --list "$backup.partial" > /dev/null
+              mv "$backup.partial" "$backup"
               sha256sum "$backup"
+              # Keep the newest 20 release backups; older ones only fill the PVC.
+              ls -1t "$backup_dir"/authprod-*.dump | tail -n +21 | xargs -r rm -f
             '
           # This directory is on the verified PostgreSQL PVC. Customer data
           # stays in the cluster; never upload this dump to Actions artifacts.
@@ -235,26 +242,27 @@ jobs:
             "$REGISTRY/$IMAGE:${{ needs.build.outputs.sha }}"
           echo ":production now points at ${{ needs.build.outputs.sha }}"
 
-      - name: Roll back if verification failed
+      - name: Roll back if the rollout or verification failed
         # `failure()` is required for this step to run at all -- without a
         # status function GitHub implicitly ANDs the condition with success().
-        # The outcome check then narrows it to VERIFY having been the failure,
-        # so a later step breaking cannot roll back a proven-good deploy.
-        if: failure() && steps.verify.outcome == 'failure' && steps.rollout.outputs.image_updated == 'true'
+        # The outcome checks narrow it to the new pods never becoming ready
+        # (a migration that crashes on boot) or VERIFY failing, so a later step
+        # breaking cannot roll back a proven-good deploy.
+        if: failure() && (steps.rollout.outcome == 'failure' || steps.verify.outcome == 'failure') && steps.rollout.outputs.image_updated == 'true'
         run: |
           digest='${{ steps.current.outputs.digest }}'
           if [ -z "$digest" ]; then
-            echo "::error::Verification failed and no previous digest was recorded."
+            echo "::error::The deploy failed and no previous digest was recorded."
             echo "The new image is still live. Roll back by hand:"
             echo "  kubectl rollout undo -n $NAMESPACE deploy/$DEPLOYMENT"
             exit 1
           fi
-          echo "Verification failed — rolling back to $digest"
+          echo "Rollout or verification failed — rolling back to $digest"
           # By digest, not `rollout undo`: undo restores the previous spec's
           # TAG, and a tag can have been repointed since. This cannot.
           kubectl set image -n "$NAMESPACE" "deploy/$DEPLOYMENT" "$CONTAINER=$digest"
           kubectl annotate -n "$NAMESPACE" "deploy/$DEPLOYMENT" \
-            kubernetes.io/change-cause="rollback from ${{ needs.build.outputs.sha }} (verification failed)" \
+            kubernetes.io/change-cause="rollback from ${{ needs.build.outputs.sha }} (rollout or verification failed)" \
             --overwrite
           kubectl rollout status -n "$NAMESPACE" "deploy/$DEPLOYMENT" --timeout=5m
 

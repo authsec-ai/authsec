@@ -29,6 +29,7 @@ func RegisterAccessPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, requ
 	g.POST("/access-policies/:id/pause", gate, require("governance", "enforce"), ctl.PauseAccessPolicy)
 	g.POST("/access-policies/:id/resume", gate, require("governance", "enforce"), ctl.ResumeAccessPolicy)
 	g.POST("/access-policies/:id/end", gate, require("governance", "enforce"), ctl.EndAccessPolicy)
+	g.DELETE("/access-policies/:id", gate, require("governance", "enforce"), ctl.DeleteAccessPolicy)
 }
 
 // accessGate answers 503 access_policies_unavailable while the R2 gate or
@@ -196,5 +197,19 @@ func (ctl *IGAGovPolicyController) ResumeAccessPolicy(c *gin.Context) {
 func (ctl *IGAGovPolicyController) EndAccessPolicy(c *gin.Context) {
 	ctl.accessStep(c, "access_policy_end", func(s *services.GovAccess, ws, actor, id uuid.UUID, req services.AccessReasonRequest) (*services.AccessPolicyView, error) {
 		return s.End(c.Request.Context(), ws, actor, id, req)
+	})
+}
+
+// DeleteAccessPolicy handles DELETE /access-policies/:id: hides an ended policy.
+func (ctl *IGAGovPolicyController) DeleteAccessPolicy(c *gin.Context) {
+	ctl.govMutation(c, http.StatusOK, func(ws, actor uuid.UUID) (any, *audited, error) {
+		id, err := uuidParam(c, "id")
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := ctl.access().Delete(c.Request.Context(), ws, actor, id); err != nil {
+			return nil, nil, err
+		}
+		return gin.H{"id": id, "deleted": true}, &audited{"access_policy_delete", "iga_gov_policy", id.String(), nil, gin.H{"deleted": true}}, nil
 	})
 }

@@ -453,6 +453,15 @@ func (s *AWSOnboardingService) RevokeConnector(workspaceID, id uuid.UUID) error 
 	if authRef != "" && s.vault != nil {
 		_ = s.vault.DeleteSecret(authRef)
 	}
+	// Turn its automatic-rescan schedule off. Re-onboarding the same account
+	// reactivates this same connector row, and an old schedule must not
+	// silently resume with it. Not fatal: the scheduler also skips revoked
+	// connectors, so a failure here only matters after a re-onboard.
+	if s.db != nil {
+		if derr := NewAWSScanScheduleService(s.db, s).DisableForConnector(context.Background(), workspaceID, id); derr != nil {
+			log.Printf("[aws-sched] could not disable the schedule of revoked connector=%s: %v", id, derr)
+		}
+	}
 	return nil
 }
 

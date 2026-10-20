@@ -77,3 +77,5 @@ services/slack_integration_interactions.go
 services/slack_integration_service.go
 services/workspace_member_directory.go
 services/workspace_permission_check.go
+repository/cloud_scan_schedule_repository.go
+services/cloud_aws_scan_schedule.go

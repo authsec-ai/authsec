@@ -152,11 +152,21 @@ func appendEvent(tx *gorm.DB, ws uuid.UUID, name string, actor *uuid.UUID, paylo
 	return appendGovEvent(tx, ws, name, kind, id, govEventRefs{}, payload)
 }
 
+// r2EnqueueTx asks for the row's job to run at `at`. A row already has an
+// open job while it is active (the 10-minute check, queued for later); the
+// enqueue then keeps that job, so it is pulled forward to `at` -- an End,
+// Pause, revoke or edit takes effect now, not at the next check.
 func r2EnqueueTx(tx *gorm.DB, ws uuid.UUID, k r2Kind, id uuid.UUID, at time.Time) error {
 	sub := id
-	_, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, &models.IGAGovJob{WorkspaceID: ws, Kind: k.Job, SubjectID: &sub,
-		DedupeKey: k.Name + ":" + id.String(), RunAfter: at})
-	return err
+	key := k.Name + ":" + id.String()
+	created, err := repositories.NewIGAGovJobRepository(tx).EnqueueTx(tx, &models.IGAGovJob{WorkspaceID: ws, Kind: k.Job, SubjectID: &sub,
+		DedupeKey: key, RunAfter: at})
+	if err != nil || created {
+		return err
+	}
+	return tx.Model(&models.IGAGovJob{}).
+		Where("workspace_id = ? AND kind = ? AND dedupe_key = ? AND status = ? AND run_after > ?", ws, k.Job, key, "queued", at).
+		Update("run_after", at).Error
 }
 
 // r2NotifyTx enqueues an R2 notice for the users and the workspace webhook
