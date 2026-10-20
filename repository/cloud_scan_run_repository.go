@@ -263,6 +263,11 @@ func (r *cloudScanRunRepository) claim(
 			SELECT id FROM cloud_scan_run
 			 WHERE (status = ?
 			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			   -- AWS runs only. Azure records its passes here too (so a pass is a
+			   -- durable, fenced thing and two replicas cannot scan one tenant at
+			   -- once), but runs them itself; this worker would scan an Azure
+			   -- connector as an AWS account.
+			   AND connector_id IN (SELECT c.id FROM cloud_connector c WHERE c.provider = '` + models.CloudProviderAWS + `')
 			   ` + projectionPredicate + `
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED

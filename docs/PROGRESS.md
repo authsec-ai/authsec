@@ -4,6 +4,20 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-20 — Azure discovery made multi-tenant; access policies on Azure (branch `fix/azure-tenancy`)
+
+### Done
+- PR #92 (Azure onboarding): migrations renumbered 141–143; 18 files run under RLS (`scripts/tenant-rls-files.txt`); workspace-qualified joins; `Test_Isolation_AzureDiscovery`, `Test_AzureProjectionUnderRLS`.
+- Access policies on Azure resources (migration 144, table `iga_gov_azure_access`, job `azure_access`), same routes and statuses as AWS. Allow: AuthSec creates a role assignment (Storage Blob Data Reader/Contributor on storage accounts, Reader/Contributor elsewhere) and deletes it at the end. Block: AuthSec records and removes the principal's own assignments on the resource that grant the access, and restores them on End, Pause or expiry. `TestAccessPolicyAzure` (fake RBAC client).
+
+### Known limits
+- Azure RBAC has no customer deny: access from a broader scope (resource group, subscription) is a preview blocker (`azure_inherited_access`); access through Entra groups is not examined.
+- Assignments have no expiry of their own; the end depends on AuthSec's job.
+- AuthSec's Azure app needs `Microsoft.Authorization/roleAssignments/write` and `/delete` on the subscription (blocker `azure_write_access_missing`).
+- Committed locally; nothing pushed.
+
+---
+
 ## 2026-10-13 — Ritam's IGA work made multi-tenant (branch `fix/governance-tenancy`)
 
 Review of all 102 non-merge commits by ritam77 / ritamAN77 / Ritam Kundu since 2026-10-05 (7 parallel reviews), then the fixes. Kept every feature and its logic; changed how each transaction is scoped. Committed locally; nothing pushed.

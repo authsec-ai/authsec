@@ -328,6 +328,15 @@ type accessPlan struct {
 	res      []string
 	usedBy   map[uuid.UUID][]AccessWorkloadRef
 	warnings []AccessIssue
+	azure    *azurePlan // an Azure resource: role assignments, not an IAM policy
+}
+
+// nRoles is how many roles the plan changes.
+func (p *accessPlan) nRoles() int {
+	if p.azure != nil {
+		return len(p.azure.principals)
+	}
+	return len(p.roles)
 }
 
 func accessFieldErr(err error) error {
@@ -367,6 +376,14 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	if len(rows) == 0 {
 		return nil, govErr(http.StatusNotFound, GovCodeResourceNotFound, "No such resource in this workspace.",
 			map[string]any{"field": "resource.resource_id"})
+	}
+	if rows[0].Provider == models.ProviderAzure {
+		p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: rows[0].DisplayName}
+		if err := s.planAzure(ctx, ws, p, rows[0]); err != nil {
+			return nil, err
+		}
+		p.resource.ARN, p.resource.AccountID = p.azure.target.Scope, p.azure.target.SubscriptionID
+		return p, nil
 	}
 	t, ok := igagov.ParseS3BucketARN(rows[0].DisplayName)
 	if !ok || rows[0].Provider != models.ProviderAWS {
@@ -511,6 +528,9 @@ func accessBindingErr(err error) error {
 // checks of every role; extra is the slots an edit needs beside the old
 // version's policy (1 per role).
 func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []error {
+	if p.azure != nil {
+		return s.azureChecks(ctx, ws, p)
+	}
 	var errs []error
 	done := map[uuid.UUID]bool{}
 	for _, r := range p.roles {
@@ -589,6 +609,18 @@ func (s *GovAccess) Preview(ctx context.Context, ws uuid.UUID, in igagov.AccessI
 	for _, e := range s.checks(ctx, ws, p) {
 		out.Blockers = append(out.Blockers, issueOf(e))
 	}
+	if p.azure != nil {
+		names := make([]string, 0, len(p.azure.principals))
+		for _, pr := range p.azure.principals {
+			names = append(names, pr.Name)
+			out.Documents = append(out.Documents, AccessDocumentView{IdentityAccountID: pr.IdentityID, RoleName: pr.Name,
+				PolicyName: "Azure role assignments", Document: p.doc})
+			out.AlsoAffected = append(out.AlsoAffected, AccessAlsoAffected{IdentityAccountID: pr.IdentityID, Workloads: []AccessWorkloadRef{}})
+		}
+		out.Sentence = azureSentence(p.intent, p.azure.target, names)
+		out.Warnings = append(out.Warnings, p.warnings...)
+		return out, nil
+	}
 	names := make([]string, 0, len(p.roles))
 	for _, r := range p.roles {
 		names = append(names, r.Identity.Name)
@@ -615,6 +647,9 @@ func accessNameReason(name, reason string) (string, string, error) {
 // deployTx writes one approved deployment row per role of the version and
 // queues its job.
 func (s *GovAccess) deployTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, v *models.IGAGovAccessPolicyVersion, p *accessPlan, reason string, now time.Time) error {
+	if p.azure != nil {
+		return s.deployAzureTx(tx, ws, actor, policyID, v, p, now)
+	}
 	if err := archiveDocumentTx(tx, ws, string(p.doc), p.docHash); err != nil {
 		return err
 	}
@@ -700,7 +735,7 @@ func (s *GovAccess) Create(ctx context.Context, ws, actor uuid.UUID, req AccessP
 		if err := s.deployTx(tx, ws, actor, pol.ID, &v, p, reason, now); err != nil {
 			return err
 		}
-		return s.event(tx, ws, GovEventAccessApplied, actor, pol.ID, &v.ID, map[string]any{"version_no": 1, "roles": len(p.roles),
+		return s.event(tx, ws, GovEventAccessApplied, actor, pol.ID, &v.ID, map[string]any{"version_no": 1, "roles": p.nRoles(),
 			"document_hash": p.docHash})
 	})
 	if err != nil {
@@ -787,7 +822,8 @@ func endRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason stri
 		}
 		n++
 	}
-	return n, nil
+	m, err := endAzureRowsTx(tx, ws, policyID, keep, reason, now)
+	return n + m, err
 }
 
 // accessAfterActiveTx runs when a deployment row turned active: once every
@@ -888,7 +924,7 @@ func (s *GovAccess) Edit(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 		if err := s.deployTx(tx, ws, actor, id, &v, p, reason, now); err != nil {
 			return err
 		}
-		return s.event(tx, ws, GovEventAccessApplied, actor, id, &v.ID, map[string]any{"version_no": v.VersionNo, "roles": len(p.roles),
+		return s.event(tx, ws, GovEventAccessApplied, actor, id, &v.ID, map[string]any{"version_no": v.VersionNo, "roles": p.nRoles(),
 			"document_hash": p.docHash})
 	})
 	if err != nil {
@@ -930,9 +966,8 @@ func (s *GovAccess) Delete(ctx context.Context, ws, actor, id uuid.UUID) error {
 		if !accessEnded(bundles[0], now) {
 			return govConflict(GovCodePolicyNotEnded, "End this policy before deleting it.", map[string]any{"lifecycle": pol.Lifecycle})
 		}
-		var live int64
-		if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, id, accessLiveStates).
-			Count(&live).Error; err != nil {
+		live, err := accessLiveCount(tx, ws, id)
+		if err != nil {
 			return err
 		}
 		if live > 0 {
@@ -1042,9 +1077,8 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 		if pol.Lifecycle != "paused" {
 			return govConflict(GovCodePolicyNotActive, "The policy is not paused.", map[string]any{"lifecycle": pol.Lifecycle})
 		}
-		var live int64
-		if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, id, accessLiveStates).
-			Count(&live).Error; err != nil {
+		live, err := accessLiveCount(tx, ws, id)
+		if err != nil {
 			return err
 		}
 		if live > 0 {
@@ -1078,6 +1112,8 @@ type accessBundle struct {
 	pol      models.IGAGovPolicy
 	versions []models.IGAGovAccessPolicyVersion
 	rows     []models.IGAGovTempGrant
+	// azureDocs: an Azure row's document, by its rows[] DocumentHash.
+	azureDocs map[string]json.RawMessage
 }
 
 func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
@@ -1130,6 +1166,18 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 	}
 	for _, r := range rows {
 		by[*r.PolicyID].rows = append(by[*r.PolicyID].rows, r)
+	}
+	var az []models.IGAGovAzureAccess
+	if err := db.Where("workspace_id = ? AND policy_id IN ?", ws, pids).Order("created_at").Find(&az).Error; err != nil {
+		return nil, err
+	}
+	for _, a := range az {
+		b := by[a.PolicyID]
+		b.rows = append(b.rows, azureAsGrant(a))
+		if b.azureDocs == nil {
+			b.azureDocs = map[string]json.RawMessage{}
+		}
+		b.azureDocs["azure:"+a.ID.String()] = azureRowDocument(a)
 	}
 	return out, nil
 }
@@ -1361,6 +1409,8 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix}
 		if t.Bucket != "" {
 			v.Resource.ARN = t.BucketARN()
+		} else {
+			v.Resource.ARN = resARN[in.Resource.ResourceID]
 		}
 		// Roles: the intent's, with the ARN and account from its deployments.
 		arnOf := map[uuid.UUID]models.IGAGovTempGrant{}
@@ -1414,6 +1464,9 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 					VersionNo: no, State: r.State, AWSPolicyARN: r.PolicyARN, DocumentHash: r.DocumentHash, DeployedAt: r.DeployedAt,
 					VerifiedAt: r.VerifiedAt, LastReadbackAt: r.LastReadbackAt, Drift: r.Drift, Error: errText, EndReason: r.EndReason})
 				if cur != nil && r.VersionID != nil && *r.VersionID == cur.ID {
+					if d, ok := b.azureDocs[r.DocumentHash]; ok {
+						docs[r.DocumentHash] = d
+					}
 					if _, ok := docs[r.DocumentHash]; !ok {
 						text, err := r2Document(db, ws, r.DocumentHash)
 						if err != nil {

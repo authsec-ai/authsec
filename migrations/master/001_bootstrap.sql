@@ -6162,8 +6162,10 @@ CREATE TABLE IF NOT EXISTS public.cloud_connector (
     CONSTRAINT cloud_connector_provider_chk CHECK (
         provider IN ('aws', 'gcp', 'azure')
     ),
+    -- 'tenant' (141): an Entra tenant's Microsoft Graph connection, with its
+    -- subscriptions as 'subscription' rows naming it in parent_scope_id.
     CONSTRAINT cloud_connector_scope_kind_chk CHECK (
-        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription')
+        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription', 'tenant')
     ),
     CONSTRAINT cloud_connector_status_chk CHECK (
         status IN ('active', 'revoked', 'error')
@@ -6773,8 +6775,11 @@ CREATE TABLE IF NOT EXISTS public.cloud_usage (
     row_updated_at timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT cloud_usage_service_chk CHECK (service <> ''),
+    -- 'entra_sign_in' from 142: Azure service principal / managed identity
+    -- sign-ins, aggregated per identity per resource. 'activity_log' from 143:
+    -- Azure management operations, aggregated per identity per provider.
     CONSTRAINT cloud_usage_source_chk CHECK (
-        source IN ('service_last_accessed', 'cloudtrail')
+        source IN ('service_last_accessed', 'cloudtrail', 'entra_sign_in', 'activity_log')
     ),
     CONSTRAINT cloud_usage_generation_chk CHECK (last_seen_generation >= 0)
 );
@@ -12910,5 +12915,64 @@ BEGIN
         ALTER TABLE public.cloud_scan_schedule
             ADD CONSTRAINT cloud_scan_schedule_weekday_chk
             CHECK (day_of_week IS NULL OR day_of_week BETWEEN 0 AND 6);
+    END IF;
+END $$;
+
+-- 144_azure_access_policies: access policies on Azure resources (role
+-- assignments AuthSec creates, or removes and restores).
+CREATE TABLE IF NOT EXISTS iga_gov_azure_access (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id        uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  policy_id           uuid NOT NULL,
+  version_id          uuid NOT NULL,
+  connector_id        uuid NOT NULL,
+  identity_account_id uuid NOT NULL,
+  tenant_id           text NOT NULL,
+  subscription_id     text NOT NULL,
+  principal_id        text NOT NULL,
+  principal_type      text NOT NULL DEFAULT 'ServicePrincipal',
+  principal_name      text NOT NULL DEFAULT '',
+  scope               text NOT NULL CHECK (scope LIKE '/subscriptions/%'),
+  effect              text NOT NULL CHECK (effect IN ('allow','deny')),
+  access              jsonb NOT NULL DEFAULT '[]'::jsonb,
+  -- allow: the role AuthSec assigns and the assignment's fixed name.
+  role_definition_id  text NOT NULL DEFAULT '',
+  assignment_name     text NOT NULL DEFAULT '',
+  -- block: the assignments removed, each as it was (azure.RoleAssignmentSpec).
+  revoked             jsonb NOT NULL DEFAULT '[]'::jsonb,
+  state               text NOT NULL DEFAULT 'approved' CHECK (state IN ('approved','deploying','active','expiring','expired','revoked','failed')),
+  state_reason        text NOT NULL DEFAULT '',
+  end_reason          text NOT NULL DEFAULT '',
+  drift               text NOT NULL DEFAULT '',
+  starts_at           timestamptz,
+  expires_at          timestamptz NOT NULL,
+  deployed_at         timestamptz,
+  verified_at         timestamptz,
+  last_readback_at    timestamptz,
+  ended_at            timestamptz,
+  created_by          uuid NOT NULL REFERENCES users(id),
+  ops                 jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, version_id, policy_id) REFERENCES iga_gov_access_policy_version (workspace_id, id, policy_id),
+  CONSTRAINT iga_gov_aa_window_chk CHECK (expires_at > created_at AND (starts_at IS NULL OR starts_at < expires_at))
+);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_azure_access_policy ON iga_gov_azure_access (workspace_id, policy_id, version_id);
+CREATE INDEX IF NOT EXISTS idx_iga_gov_azure_access_live ON iga_gov_azure_access (state)
+  WHERE state IN ('approved','deploying','active','expiring');
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_job') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_job DROP CONSTRAINT IF EXISTS iga_gov_job_kind_check;
+        ALTER TABLE public.iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check
+            CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
+                            'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync',
+                            'prune_evidence','metrics_rollup','resolve_unknown',
+                            'temp_grant','session_revoke','time_bound','azure_access'));
+    END IF;
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.iga_gov_azure_access');
     END IF;
 END $$;

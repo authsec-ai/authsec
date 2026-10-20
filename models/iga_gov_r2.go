@@ -146,3 +146,43 @@ type IGAGovSessionRevocation struct {
 }
 
 func (IGAGovSessionRevocation) TableName() string { return "iga_gov_session_revocation" }
+
+// IGAGovAzureAccess is one principal's deployment of an access-policy
+// version on an Azure resource (144): an allow is a role assignment AuthSec
+// creates; a block is the principal's own assignments on the resource,
+// removed and recorded in Revoked so they can be restored.
+type IGAGovAzureAccess struct {
+	ID                uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID       uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
+	PolicyID          uuid.UUID       `json:"policy_id" gorm:"type:uuid;not null"`
+	VersionID         uuid.UUID       `json:"version_id" gorm:"type:uuid;not null"`
+	ConnectorID       uuid.UUID       `json:"connector_id" gorm:"type:uuid;not null"`
+	IdentityAccountID uuid.UUID       `json:"identity_account_id" gorm:"type:uuid;not null"`
+	TenantID          string          `json:"tenant_id" gorm:"not null"`
+	SubscriptionID    string          `json:"subscription_id" gorm:"not null"`
+	PrincipalID       string          `json:"principal_id" gorm:"not null"`
+	PrincipalType     string          `json:"principal_type" gorm:"not null;default:'ServicePrincipal'"`
+	PrincipalName     string          `json:"principal_name" gorm:"not null;default:''"`
+	Scope             string          `json:"scope" gorm:"not null"`
+	Effect            string          `json:"effect" gorm:"not null"`
+	Access            json.RawMessage `json:"access" gorm:"type:jsonb;not null;default:'[]'"`
+	RoleDefinitionID  string          `json:"role_definition_id" gorm:"not null;default:''"`
+	AssignmentName    string          `json:"assignment_name" gorm:"not null;default:''"`
+	Revoked           json.RawMessage `json:"revoked" gorm:"type:jsonb;not null;default:'[]'"`
+	State             string          `json:"state" gorm:"not null;default:'approved'"`
+	StateReason       string          `json:"state_reason" gorm:"not null;default:''"`
+	EndReason         string          `json:"end_reason" gorm:"not null;default:''"`
+	Drift             string          `json:"drift" gorm:"not null;default:''"`
+	StartsAt          *time.Time      `json:"starts_at,omitempty"`
+	ExpiresAt         time.Time       `json:"expires_at" gorm:"not null"`
+	DeployedAt        *time.Time      `json:"deployed_at,omitempty"`
+	VerifiedAt        *time.Time      `json:"verified_at,omitempty"`
+	LastReadbackAt    *time.Time      `json:"last_readback_at,omitempty"`
+	EndedAt           *time.Time      `json:"ended_at,omitempty"`
+	CreatedBy         uuid.UUID       `json:"created_by" gorm:"type:uuid;not null"`
+	Ops               json.RawMessage `json:"ops" gorm:"type:jsonb;not null;default:'[]'"`
+	CreatedAt         time.Time       `json:"created_at" gorm:"not null;default:now()"`
+	UpdatedAt         time.Time       `json:"updated_at" gorm:"not null;default:now()"`
+}
+
+func (IGAGovAzureAccess) TableName() string { return "iga_gov_azure_access" }

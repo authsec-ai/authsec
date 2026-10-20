@@ -24,6 +24,7 @@ import (
 	"github.com/authsec-ai/authsec/clients"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/handlers"
+	"github.com/authsec-ai/authsec/internal/azure"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
@@ -55,6 +56,11 @@ import (
 func main() {
 	// Load .env file if present (optional, for development)
 	godotenv.Load()
+	// Local-only overlay, git-ignored (.git/info/exclude): secrets and
+	// Docker-vs-host overrides that must never land in the tracked .env.
+	if _, err := os.Stat(".env.azure.local"); err == nil {
+		godotenv.Overload(".env.azure.local")
+	}
 
 	// ─────────────────────────────────────────────────────────
 	// Phase 1: user-flow initialisation
@@ -356,6 +362,20 @@ func main() {
 			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
 		}
 	}
+
+	// Azure scheduled discovery: re-verifies and rediscovers every connected
+	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL
+	// (default 12h; "0" turns it off). Safe on every replica: each pass is a
+	// cloud_scan_run, and the live-run index admits one per connector.
+	var azureVault vault.VaultClient
+	if va, vt := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); va != "" && vt != "" {
+		azureVault, _ = vault.NewClient(va, vt)
+	}
+	azureSvc := services.NewAzureOnboardingService(config.DB, config.GetRedisClient(), azure.AppConfigFromEnv(), azureVault)
+	// Access policies on Azure resources write role assignments with the same
+	// app (144).
+	services.SetAzureAccessDeps(azureSvc.AccessDeps())
+	go azureSvc.RunScheduler(context.Background(), services.AzureDiscoveryIntervalFromEnv())
 
 	// AWS Quick Create callback worker: drains the SQS queue that every
 	// regional callback topic delivers to, and connects the account a stack
