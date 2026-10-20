@@ -17,6 +17,10 @@ type DueSchedule struct {
 	ConnectorID     uuid.UUID
 	WorkspaceID     uuid.UUID
 	IntervalMinutes int
+	// The chosen time, when there is one (see models.CloudScanSchedule).
+	TimeOfDayMinutes *int
+	Timezone         string
+	DayOfWeek        *int
 	// PrevDueAt is the due time the schedule had BEFORE the claim moved it
 	// forward. The next slot is anchored on it so the schedule does not drift.
 	PrevDueAt time.Time
@@ -96,21 +100,30 @@ func (r *cloudScanScheduleRepository) get(
 }
 
 func (r *cloudScanScheduleRepository) Upsert(tx *gorm.DB, s *models.CloudScanSchedule) error {
+	tz := s.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
 	return tx.Exec(`
 		INSERT INTO cloud_scan_schedule
 			(connector_id, workspace_id, enabled, interval_minutes, next_due_at,
-			 last_enqueued_at, streak_since, paused_reason, updated_by, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now(), now())
+			 last_enqueued_at, streak_since, paused_reason, updated_by,
+			 time_of_day_minutes, timezone, day_of_week, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), now())
 		ON CONFLICT (connector_id) DO UPDATE SET
-			enabled          = EXCLUDED.enabled,
-			interval_minutes = EXCLUDED.interval_minutes,
-			next_due_at      = EXCLUDED.next_due_at,
-			streak_since     = EXCLUDED.streak_since,
-			paused_reason    = EXCLUDED.paused_reason,
-			updated_by       = EXCLUDED.updated_by,
-			updated_at       = now()`,
+			enabled             = EXCLUDED.enabled,
+			interval_minutes    = EXCLUDED.interval_minutes,
+			next_due_at         = EXCLUDED.next_due_at,
+			streak_since        = EXCLUDED.streak_since,
+			paused_reason       = EXCLUDED.paused_reason,
+			updated_by          = EXCLUDED.updated_by,
+			time_of_day_minutes = EXCLUDED.time_of_day_minutes,
+			timezone            = EXCLUDED.timezone,
+			day_of_week         = EXCLUDED.day_of_week,
+			updated_at          = now()`,
 		s.ConnectorID, s.WorkspaceID, s.Enabled, s.IntervalMinutes, s.NextDueAt,
 		s.LastEnqueuedAt, s.StreakSince, s.PausedReason, s.UpdatedBy,
+		s.TimeOfDayMinutes, tz, s.DayOfWeek,
 	).Error
 }
 
@@ -139,7 +152,8 @@ func (r *cloudScanScheduleRepository) ClaimDue(
 		   SET next_due_at = ?, updated_at = ?
 		  FROM due
 		 WHERE t.connector_id = due.connector_id
-		RETURNING t.connector_id, t.workspace_id, t.interval_minutes, due.prev_due_at`,
+		RETURNING t.connector_id, t.workspace_id, t.interval_minutes,
+		          t.time_of_day_minutes, t.timezone, t.day_of_week, due.prev_due_at`,
 		now, limit, now.Add(lease), now,
 	).Scan(&out).Error
 	if err != nil {

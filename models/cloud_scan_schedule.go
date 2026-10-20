@@ -32,6 +32,14 @@ type CloudScanSchedule struct {
 	Enabled         bool      `json:"enabled" gorm:"not null;default:false"`
 	IntervalMinutes int       `json:"interval_minutes" gorm:"not null;default:1440"`
 
+	// TimeOfDayMinutes is the chosen time, in minutes after local midnight on a
+	// quarter hour. Nil means no time was chosen: the schedule runs one interval
+	// after it was turned on, as before. Timezone is the IANA zone the time is
+	// read in. DayOfWeek (0 = Sunday) is used by weekly schedules.
+	TimeOfDayMinutes *int   `json:"time_of_day_minutes,omitempty" gorm:"column:time_of_day_minutes"`
+	Timezone         string `json:"timezone" gorm:"not null;default:UTC"`
+	DayOfWeek        *int   `json:"day_of_week,omitempty" gorm:"column:day_of_week"`
+
 	NextDueAt      *time.Time `json:"next_due_at,omitempty"`
 	LastEnqueuedAt *time.Time `json:"last_enqueued_at,omitempty"`
 	// StreakSince bounds which scheduled runs count toward pausing: runs

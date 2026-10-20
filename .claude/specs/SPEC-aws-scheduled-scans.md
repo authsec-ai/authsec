@@ -306,3 +306,27 @@ projection job lag, queue age, runs ending `failed`, and how many connectors pau
 
 - `AWS-AUTO-ONBOARDING.md`, `SPEC-aws-quick-create-onboarding.md`
 - `SPEC-iga-phase1-collect.md` (SCAN_SCHEDULE model), `SPEC-iga-phase2-graph.md` (scan worker, barrier, "scheduled scans" deferral)
+
+## Addendum: choosing a time of day (migration 140)
+
+An administrator can choose WHEN a schedule runs, not only how often.
+
+- **Fields** (all optional on `PUT .../schedule`, returned by `GET`):
+  `time_of_day` ("HH:MM", quarter hours), `timezone` (IANA name, default UTC),
+  `day_of_week` (0 = Sunday to 6, weekly only). Omitted fields keep their value.
+- **No time chosen = the original behaviour**: one interval after the schedule
+  was turned on. Existing schedules are unchanged by migration 140.
+- **With a time**: the next scan is the next occurrence of that wall-clock time
+  in the chosen zone. The per-connector jitter is added AFTER it, so a scan
+  starts between the chosen time and 30 minutes later; the UI says so.
+- **Turning on, resuming or changing the interval** recomputes the next scan.
+  **Changing only the time** recomputes it too but does not reset the failure
+  streak.
+- **Weekly with a time requires `day_of_week`** (422 `invalid_parameter`).
+- **Daylight saving** is handled in `internal/scanslot`: a local day always has
+  exactly one slot. A time that does not exist on the day clocks go forward
+  runs at the end of the gap; a time that occurs twice runs once. Tested in
+  `internal/scanslot/slots_test.go` across eight zones and three years.
+- **After an outage** a missed slot runs once, then the next future slot, as before.
+- **Validation errors** are `422 invalid_parameter` naming `time_of_day`,
+  `timezone` or `day_of_week`.

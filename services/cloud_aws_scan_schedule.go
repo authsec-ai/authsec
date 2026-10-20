@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/scanslot"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -126,6 +127,36 @@ func auditSchedule(workspaceID, connectorID uuid.UUID, action string, after map[
 	)
 }
 
+// specOf turns a schedule's chosen time into a scanslot.Spec. ok is false when
+// no time was chosen, or the stored zone cannot be loaded; either way the
+// caller falls back to "one interval later", so a bad row never stops scans.
+func specOf(intervalMinutes int, tod *int, tz string, dow *int) (scanslot.Spec, bool) {
+	if tod == nil {
+		return scanslot.Spec{}, false
+	}
+	loc, err := scanslot.LoadLocation(tz)
+	if err != nil {
+		log.Printf("[aws-sched] stage=timing outcome=bad_timezone tz=%q err=%v", tz, err)
+		return scanslot.Spec{}, false
+	}
+	spec := scanslot.Spec{
+		Interval:  time.Duration(intervalMinutes) * time.Minute,
+		TimeOfDay: *tod,
+		Location:  loc,
+	}
+	if dow != nil {
+		spec.Weekday = time.Weekday(*dow)
+	}
+	return spec, true
+}
+
+func intPtrEq(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 /* -------------------------------- scheduler -------------------------------- */
 
 // AWSScanScheduler queues scheduled scans. Safe to run on every backend
@@ -218,7 +249,13 @@ func (s *AWSScanScheduler) serve(ctx context.Context, d repositories.DueSchedule
 
 	// 2. Move to the next slot BEFORE queueing, so a slow or repeated tick can
 	//    never queue two scans for one slot.
-	next := nextDueAfter(d.PrevDueAt, now, interval, scheduleJitter(d.ConnectorID, interval))
+	jit := scheduleJitter(d.ConnectorID, interval)
+	next := nextDueAfter(d.PrevDueAt, now, interval, jit)
+	if spec, ok := specOf(d.IntervalMinutes, d.TimeOfDayMinutes, d.Timezone, d.DayOfWeek); ok {
+		// The administrator chose a time: the next slot is the next occurrence
+		// of it, not one interval from now.
+		next = scanslot.NextDue(spec, now, jit)
+	}
 	if err := tenancy.InWorkspace(ctx, s.db, d.WorkspaceID, func(tx *gorm.DB) error {
 		return s.sched.Advance(tx, d.WorkspaceID, d.ConnectorID, now, next)
 	}); err != nil {
@@ -268,6 +305,12 @@ type ScanScheduleView struct {
 	NextDueAt       *time.Time `json:"next_due_at"`
 	LastEnqueuedAt  *time.Time `json:"last_enqueued_at"`
 	PausedReason    string     `json:"paused_reason"`
+	// TimeOfDay is the chosen time as "HH:MM" in Timezone, or null when none was
+	// chosen (the schedule then runs one interval after it was turned on).
+	// DayOfWeek is 0 (Sunday) to 6, set for weekly schedules with a chosen time.
+	TimeOfDay *string `json:"time_of_day"`
+	Timezone  string  `json:"timezone"`
+	DayOfWeek *int    `json:"day_of_week"`
 	// SchedulerActive is false when this deployment has the scheduler switched
 	// off: the settings are kept but nothing runs on them.
 	SchedulerActive bool `json:"scheduler_active"`
@@ -276,11 +319,20 @@ type ScanScheduleView struct {
 func scheduleViewOf(s *models.CloudScanSchedule) *ScanScheduleView {
 	v := &ScanScheduleView{
 		IntervalMinutes: models.ScanScheduleDefaultIntervalMinutes,
+		Timezone:        "UTC",
 		SchedulerActive: ScheduledScansEnabled(),
 	}
 	if s == nil {
 		return v
 	}
+	if s.Timezone != "" {
+		v.Timezone = s.Timezone
+	}
+	if s.TimeOfDayMinutes != nil {
+		t := scanslot.FormatTimeOfDay(*s.TimeOfDayMinutes)
+		v.TimeOfDay = &t
+	}
+	v.DayOfWeek = s.DayOfWeek
 	v.Enabled = s.Enabled
 	v.IntervalMinutes = s.IntervalMinutes
 	v.NextDueAt = s.NextDueAt
@@ -332,13 +384,42 @@ func (s *AWSScanScheduleService) Get(ctx context.Context, ws, id uuid.UUID) (*Sc
 	return scheduleViewOf(cur), nil
 }
 
+// ScheduleTiming is an optional chosen time for a schedule. A nil field keeps
+// the schedule's current value.
+type ScheduleTiming struct {
+	TimeOfDay *string // "HH:MM" on a quarter hour
+	Timezone  *string // IANA zone name, e.g. "Asia/Kolkata"
+	DayOfWeek *int    // 0 = Sunday .. 6 = Saturday; weekly schedules
+}
+
+// ScheduleParamError is a rejected schedule parameter and which one it was.
+type ScheduleParamError struct{ Param, Msg string }
+
+func (e *ScheduleParamError) Error() string { return e.Msg }
+
 // Put turns the schedule on or off and sets its interval (nil keeps the
-// current one, or the default). It returns the schedule after the change and
-// as it was before. Turning a schedule on, resuming a paused one, or changing
-// its interval moves the next scan to one interval (plus the connector's
-// jitter) from now; it never scans immediately (Scan now does that).
+// current one, or the default), leaving any chosen time as it is. See
+// PutWithTiming.
 func (s *AWSScanScheduleService) Put(
 	ctx context.Context, ws, id uuid.UUID, enabled bool, intervalMinutes *int, actor string,
+) (after, before *ScanScheduleView, err error) {
+	return s.PutWithTiming(ctx, ws, id, enabled, intervalMinutes, nil, actor)
+}
+
+// PutWithTiming turns the schedule on or off, sets its interval (nil keeps the
+// current one, or the default) and, when timing is given, its time of day,
+// timezone and weekday (nil fields keep their current value). It returns the
+// schedule after the change and as it was before.
+//
+// Turning a schedule on, resuming a paused one, or changing its interval moves
+// the next scan: to the next occurrence of the chosen time when there is one,
+// otherwise to one interval (plus the connector's jitter) from now. Changing
+// only the chosen time of a running schedule moves the next scan the same way
+// and leaves its failure history alone. It never scans immediately (Scan now
+// does that).
+func (s *AWSScanScheduleService) PutWithTiming(
+	ctx context.Context, ws, id uuid.UUID, enabled bool, intervalMinutes *int,
+	timing *ScheduleTiming, actor string,
 ) (after, before *ScanScheduleView, err error) {
 	c, err := s.onboarding.awsConnector(ws, id)
 	if err != nil {
@@ -351,9 +432,39 @@ func (s *AWSScanScheduleService) Put(
 		return nil, nil, ErrScheduleInterval
 	}
 
+	// Validate the chosen time before touching the database.
+	var reqTod, reqDow *int
+	reqTz, tzSet := "", false
+	if timing != nil {
+		if timing.TimeOfDay != nil {
+			m, perr := scanslot.ParseTimeOfDay(*timing.TimeOfDay)
+			if perr != nil {
+				return nil, nil, &ScheduleParamError{Param: "time_of_day", Msg: perr.Error()}
+			}
+			reqTod = &m
+		}
+		if timing.Timezone != nil {
+			if _, lerr := scanslot.LoadLocation(*timing.Timezone); lerr != nil {
+				return nil, nil, &ScheduleParamError{Param: "timezone", Msg: lerr.Error()}
+			}
+			reqTz, tzSet = strings.TrimSpace(*timing.Timezone), true
+			if reqTz == "" {
+				reqTz = "UTC"
+			}
+		}
+		if timing.DayOfWeek != nil {
+			if *timing.DayOfWeek < 0 || *timing.DayOfWeek > 6 {
+				return nil, nil, &ScheduleParamError{
+					Param: "day_of_week", Msg: "day_of_week must be 0 (Sunday) to 6 (Saturday)"}
+			}
+			reqDow = timing.DayOfWeek
+		}
+	}
+
 	// Read and write in one transaction with the row locked: the scheduler may
 	// claim this very schedule while it is being changed, and a write built from
 	// an earlier read would put the old next_due_at back over its claim.
+	var paramErr error
 	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
 		cur, gerr := s.sched.GetForUpdate(tx, ws, id)
 		if errors.Is(gerr, repositories.ErrCloudScanScheduleNotFound) {
@@ -372,23 +483,64 @@ func (s *AWSScanScheduleService) Put(
 			interval = *intervalMinutes
 		}
 
+		// The chosen time: what is stored, with what was asked for on top.
+		var curTod, curDow *int
+		curTz := "UTC"
+		if cur != nil {
+			curTod, curDow = cur.TimeOfDayMinutes, cur.DayOfWeek
+			if cur.Timezone != "" {
+				curTz = cur.Timezone
+			}
+		}
+		newTod, newDow, newTz := curTod, curDow, curTz
+		if reqTod != nil {
+			newTod = reqTod
+		}
+		if reqDow != nil {
+			newDow = reqDow
+		}
+		if tzSet {
+			newTz = reqTz
+		}
+		weekly := interval >= models.ScanScheduleWeeklyMinutes
+		if !weekly {
+			newDow = nil
+		}
+		if weekly && newTod != nil && newDow == nil {
+			paramErr = &ScheduleParamError{
+				Param: "day_of_week", Msg: "day_of_week is required for a weekly schedule with a chosen time"}
+			return nil
+		}
+		timingChanged := !intPtrEq(curTod, newTod) || !intPtrEq(curDow, newDow) || curTz != newTz
+
 		now := s.now()
 		next := &models.CloudScanSchedule{
 			ConnectorID: id, WorkspaceID: ws, Enabled: enabled,
 			IntervalMinutes: interval, UpdatedBy: actor,
+			TimeOfDayMinutes: newTod, Timezone: newTz, DayOfWeek: newDow,
 		}
 		if cur != nil {
 			next.NextDueAt, next.LastEnqueuedAt = cur.NextDueAt, cur.LastEnqueuedAt
 			next.StreakSince, next.PausedReason = cur.StreakSince, cur.PausedReason
 		}
 		dur := time.Duration(interval) * time.Minute
+		jit := scheduleJitter(id, dur)
+		firstDue := func() time.Time {
+			if spec, ok := specOf(interval, newTod, newTz, newDow); ok {
+				return scanslot.NextDue(spec, now, jit)
+			}
+			return now.Add(dur + jit)
+		}
 		switch {
 		case !enabled:
 			next.NextDueAt, next.PausedReason = nil, ""
 		case cur == nil || !cur.Enabled || cur.PausedReason != "" || cur.IntervalMinutes != interval:
-			due := now.Add(dur + scheduleJitter(id, dur))
+			due := firstDue()
 			since := now
 			next.NextDueAt, next.StreakSince, next.PausedReason = &due, &since, ""
+		case timingChanged:
+			due := firstDue()
+			next.NextDueAt = &due
 		}
 		if uerr := s.sched.Upsert(tx, next); uerr != nil {
 			return uerr
@@ -398,6 +550,9 @@ func (s *AWSScanScheduleService) Put(
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if paramErr != nil {
+		return nil, nil, paramErr
 	}
 	return after, before, nil
 }
