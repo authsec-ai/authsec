@@ -440,7 +440,7 @@ const UsageSourceEntraSignIn = "entra_sign_in"
 
 // UsageSourceActivityLog is cloud_usage evidence aggregated from the Azure
 // Activity Log: one row per identity per resource provider whose management
-// operations it performed (migration 140).
+// operations it performed (migration 143).
 const UsageSourceActivityLog = "activity_log"
 
 // SurfaceAzurePublicIPs is a subscription's public IP addresses and prefixes,

@@ -1,4 +1,4 @@
--- 139_cloud_usage_entra_sign_in.sql — Entra sign-ins are usage evidence.
+-- 142_cloud_usage_entra_sign_in.sql — Entra sign-ins are usage evidence.
 --
 -- expand only. Widens cloud_usage_source_chk to admit 'entra_sign_in'.
 --
@@ -47,6 +47,6 @@ BEGIN
          WHERE conname = 'cloud_usage_source_chk'
            AND pg_get_constraintdef(oid) LIKE '%entra_sign_in%'
     ) THEN
-        RAISE EXCEPTION '139: cloud_usage_source_chk does not admit entra_sign_in';
+        RAISE EXCEPTION '142: cloud_usage_source_chk does not admit entra_sign_in';
     END IF;
 END $$;

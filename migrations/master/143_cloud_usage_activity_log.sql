@@ -1,9 +1,9 @@
--- 140_cloud_usage_activity_log.sql — Azure Activity Log is usage evidence.
+-- 143_cloud_usage_activity_log.sql — Azure Activity Log is usage evidence.
 --
 -- expand only. Widens cloud_usage_source_chk to admit 'activity_log'.
 --
 -- WHY A FOURTH SOURCE
--- 139 admitted Entra sign-ins: an identity obtained a token for a resource.
+-- 142 admitted Entra sign-ins: an identity obtained a token for a resource.
 -- The Azure Activity Log is a different and stronger claim about a different
 -- plane: an identity PERFORMED a management operation (an authorization action
 -- such as Microsoft.Compute/virtualMachines/write) in a subscription. It is
@@ -44,6 +44,6 @@ BEGIN
          WHERE conname = 'cloud_usage_source_chk'
            AND pg_get_constraintdef(oid) LIKE '%activity_log%'
     ) THEN
-        RAISE EXCEPTION '140: cloud_usage_source_chk does not admit activity_log';
+        RAISE EXCEPTION '143: cloud_usage_source_chk does not admit activity_log';
     END IF;
 END $$;
