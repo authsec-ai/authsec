@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -28,14 +28,17 @@ import (
 //
 // See .claude/specs/SPEC-aws-scheduled-scans.md.
 
-// ScheduledScansEnv switches the scheduler on. Default off, so the feature
-// ships dark.
-const ScheduledScansEnv = "AUTHSEC_AWS_SCHEDULED_SCANS"
+// There is no environment switch for the scheduler: it starts with the scan
+// worker, and what it scans comes only from the schedules in the database. A
+// connection has no schedule until an administrator turns Auto-scan on, so with
+// none turned on it finds nothing due and does nothing.
+var schedulerRunning atomic.Bool
 
-// ScheduledScansEnabled reports whether the scheduler is switched on.
-func ScheduledScansEnabled() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv(ScheduledScansEnv)), "true")
-}
+// SchedulerRunning reports whether the scheduler loop is running in this
+// process. The schedule API returns it as scheduler_active, so the console can
+// say so when settings are saved but nothing will run (the scan worker is
+// disabled or has no Vault).
+func SchedulerRunning() bool { return schedulerRunning.Load() }
 
 const (
 	schedTick = time.Minute
@@ -53,7 +56,7 @@ const (
 	// one, say) was already running at its due time. Without it the slot would
 	// be lost and the next scan a whole interval away: a week on weekly.
 	schedLiveRetry = time.Hour
-	schedActor      = "system:scheduler"
+	schedActor     = "system:scheduler"
 )
 
 // ErrScheduleInterval is an interval outside the allowed range.
@@ -185,6 +188,8 @@ func (s *AWSScanScheduler) WithClock(f func() time.Time) *AWSScanScheduler { s.n
 // Run ticks until ctx ends.
 func (s *AWSScanScheduler) Run(ctx context.Context) {
 	log.Printf("[aws-sched] scheduler started")
+	schedulerRunning.Store(true)
+	defer schedulerRunning.Store(false)
 	t := time.NewTicker(s.tick)
 	defer t.Stop()
 	for {
@@ -311,8 +316,9 @@ type ScanScheduleView struct {
 	TimeOfDay *string `json:"time_of_day"`
 	Timezone  string  `json:"timezone"`
 	DayOfWeek *int    `json:"day_of_week"`
-	// SchedulerActive is false when this deployment has the scheduler switched
-	// off: the settings are kept but nothing runs on them.
+	// SchedulerActive is false when the scheduler loop is not running in this
+	// process (the scan worker is disabled or has no Vault): the settings are
+	// kept but nothing runs on them.
 	SchedulerActive bool `json:"scheduler_active"`
 }
 
@@ -320,7 +326,7 @@ func scheduleViewOf(s *models.CloudScanSchedule) *ScanScheduleView {
 	v := &ScanScheduleView{
 		IntervalMinutes: models.ScanScheduleDefaultIntervalMinutes,
 		Timezone:        "UTC",
-		SchedulerActive: ScheduledScansEnabled(),
+		SchedulerActive: SchedulerRunning(),
 	}
 	if s == nil {
 		return v

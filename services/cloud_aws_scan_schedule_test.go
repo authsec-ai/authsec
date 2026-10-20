@@ -115,17 +115,14 @@ func TestPauseReason(t *testing.T) {
 	}
 }
 
-func TestScheduledScansEnabled(t *testing.T) {
-	t.Setenv(ScheduledScansEnv, "")
-	if ScheduledScansEnabled() {
-		t.Fatal("must default to off")
+func TestSchedulerActiveFollowsTheRunningLoop(t *testing.T) {
+	t.Cleanup(func() { schedulerRunning.Store(false) })
+	schedulerRunning.Store(false)
+	if scheduleViewOf(nil).SchedulerActive {
+		t.Fatal("not running must read as inactive")
 	}
-	t.Setenv(ScheduledScansEnv, "true")
-	if !ScheduledScansEnabled() {
-		t.Fatal("true must switch it on")
-	}
-	t.Setenv(ScheduledScansEnv, "yes")
-	if ScheduledScansEnabled() {
-		t.Fatal("only 'true' switches it on")
+	schedulerRunning.Store(true)
+	if !scheduleViewOf(nil).SchedulerActive {
+		t.Fatal("running must read as active")
 	}
 }
