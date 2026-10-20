@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,9 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_inference.go proposes AI agents among a tenant's workload
@@ -70,10 +73,12 @@ type azureAgentEvidence struct {
 // many were proposed.
 func (s *AzureOnboardingService) inferAgents(workspaceID, tenantConnectorID uuid.UUID, tenantID string) (int, error) {
 	var identities []models.CloudIdentity
-	if err := s.db.Where("workspace_id = ? AND connector_id = ? AND kind IN ?",
-		workspaceID, tenantConnectorID,
-		[]string{models.CloudIdentityEntraServicePrincipal, models.CloudIdentityEntraManagedIdentity}).
-		Find(&identities).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND connector_id = ? AND kind IN ?",
+			workspaceID, tenantConnectorID,
+			[]string{models.CloudIdentityEntraServicePrincipal, models.CloudIdentityEntraManagedIdentity}).
+			Find(&identities).Error
+	}); err != nil {
 		return 0, err
 	}
 	// The app this tenant is read with: AuthSec's own, or the customer's own
@@ -158,101 +163,110 @@ func (s *AzureOnboardingService) inferAgents(workspaceID, tenantConnectorID uuid
 		ids = append(ids, id)
 	}
 
-	// Sign-ins, per resource.
-	var usage []models.CloudUsage
-	if err := s.db.Where("workspace_id = ? AND identity_id IN ? AND source = ?",
-		workspaceID, ids, models.UsageSourceEntraSignIn).Find(&usage).Error; err != nil {
-		return 0, err
-	}
-	for _, u := range usage {
-		e := ev[u.IdentityID]
-		var a struct {
-			SignIns   int           `json:"sign_ins"`
-			AIService bool          `json:"ai_service"`
-			Cadence   *azureCadence `json:"cadence"`
-		}
-		_ = json.Unmarshal(u.Attrs, &a)
-		if a.SignIns == 0 {
-			continue
-		}
-		e.appOnlySignIns += a.SignIns
-		e.resources[u.Service] = true
-		if a.AIService {
-			e.aiServices[u.Service] = true
-		}
-		if a.Cadence != nil && a.Cadence.machineLike() &&
-			(e.cadence == nil || a.Cadence.HoursActive > e.cadence.HoursActive) {
-			c := *a.Cadence
-			e.cadence = &c
-		}
-		if u.LastUsedAt != nil && (e.lastSignIn == nil || u.LastUsedAt.After(*e.lastSignIn)) {
-			e.lastSignIn = u.LastUsedAt
-		}
-	}
-
-	// API permissions: application permissions by name, delegated by count.
-	var grants []struct {
-		IdentityID uuid.UUID
-		Kind       string
-		Action     string
-	}
-	if err := s.db.Table("cloud_permission p").
-		Select("p.identity_id, r.kind, p.actions[1] AS action").
-		Joins("JOIN cloud_resource r ON r.id = p.resource_id").
-		Where("p.workspace_id = ? AND p.identity_id IN ? AND r.kind IN ?", workspaceID, ids,
-			[]string{models.CloudResourceEntraAppRole, models.CloudResourceEntraDelegatedScope}).
-		Scan(&grants).Error; err != nil {
-		return 0, err
-	}
-	for _, g := range grants {
-		e := ev[g.IdentityID]
-		if g.Kind == models.CloudResourceEntraDelegatedScope {
-			e.delegatedGrants++
-		} else if g.Action != "" && g.Action != "default_access" {
-			e.appPermissions = append(e.appPermissions, g.Action)
-		}
-	}
-
-	// Who may become it from outside, and what compute runs as it. Only a
-	// federated credential is how a workload signs in as an identity; an
-	// owner (who could add a credential) says nothing about how it is used.
-	var edges []struct {
-		IdentityID  uuid.UUID
-		SubjectKind string
-	}
-	if err := s.db.Table("cloud_assume_edge").Select("identity_id, subject_kind").
-		Where("workspace_id = ? AND identity_id IN ? AND mechanism = ?", workspaceID, ids,
-			models.AssumeMechanismOIDCFederation).Scan(&edges).Error; err != nil {
-		return 0, err
-	}
-	for _, e := range edges {
-		ev[e.IdentityID].federation[e.SubjectKind] = true
-	}
-	var workloads []struct {
-		IdentityID  uuid.UUID
-		RuntimeKind string
-	}
-	if err := s.db.Table("cloud_workload").Select("identity_id, runtime_kind").
-		Where("workspace_id = ? AND identity_id IN ?", workspaceID, ids).Scan(&workloads).Error; err != nil {
-		return 0, err
-	}
-	for _, w := range workloads {
-		ev[w.IdentityID].workloads = append(ev[w.IdentityID].workloads, w.RuntimeKind)
-	}
-
-	repo := repositories.NewDiscoveryRepository(s.db)
-	now := time.Now()
+	// The evidence, then the proposals, in one transaction under row-level
+	// security for the workspace: every proposal, or (on an error) none.
 	proposed := 0
-	for _, e := range ev {
-		signals, confidence := azureAgentSignals(e, now)
-		if confidence == "" {
-			continue
+	err = tenancy.InWorkspace(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		proposed = 0
+		// Sign-ins, per resource.
+		var usage []models.CloudUsage
+		if err := tx.Where("workspace_id = ? AND identity_id IN ? AND source = ?",
+			workspaceID, ids, models.UsageSourceEntraSignIn).Find(&usage).Error; err != nil {
+			return err
 		}
-		agent := azureAgentSighting(workspaceID, tenantID, e, signals, confidence, now)
-		if _, _, err := repo.UpsertSighting(agent); err != nil {
-			return proposed, fmt.Errorf("propose %s: %w", e.identity.NativeID, err)
+		for _, u := range usage {
+			e := ev[u.IdentityID]
+			var a struct {
+				SignIns   int           `json:"sign_ins"`
+				AIService bool          `json:"ai_service"`
+				Cadence   *azureCadence `json:"cadence"`
+			}
+			_ = json.Unmarshal(u.Attrs, &a)
+			if a.SignIns == 0 {
+				continue
+			}
+			e.appOnlySignIns += a.SignIns
+			e.resources[u.Service] = true
+			if a.AIService {
+				e.aiServices[u.Service] = true
+			}
+			if a.Cadence != nil && a.Cadence.machineLike() &&
+				(e.cadence == nil || a.Cadence.HoursActive > e.cadence.HoursActive) {
+				c := *a.Cadence
+				e.cadence = &c
+			}
+			if u.LastUsedAt != nil && (e.lastSignIn == nil || u.LastUsedAt.After(*e.lastSignIn)) {
+				e.lastSignIn = u.LastUsedAt
+			}
 		}
-		proposed++
+
+		// API permissions: application permissions by name, delegated by count.
+		var grants []struct {
+			IdentityID uuid.UUID
+			Kind       string
+			Action     string
+		}
+		if err := tx.Table("cloud_permission p").
+			Select("p.identity_id, r.kind, p.actions[1] AS action").
+			Joins("JOIN cloud_resource r ON r.id = p.resource_id").
+			Where("p.workspace_id = ? AND p.identity_id IN ? AND r.kind IN ?", workspaceID, ids,
+				[]string{models.CloudResourceEntraAppRole, models.CloudResourceEntraDelegatedScope}).
+			Scan(&grants).Error; err != nil {
+			return err
+		}
+		for _, g := range grants {
+			e := ev[g.IdentityID]
+			if g.Kind == models.CloudResourceEntraDelegatedScope {
+				e.delegatedGrants++
+			} else if g.Action != "" && g.Action != "default_access" {
+				e.appPermissions = append(e.appPermissions, g.Action)
+			}
+		}
+
+		// Who may become it from outside, and what compute runs as it. Only a
+		// federated credential is how a workload signs in as an identity; an
+		// owner (who could add a credential) says nothing about how it is used.
+		var edges []struct {
+			IdentityID  uuid.UUID
+			SubjectKind string
+		}
+		if err := tx.Table("cloud_assume_edge").Select("identity_id, subject_kind").
+			Where("workspace_id = ? AND identity_id IN ? AND mechanism = ?", workspaceID, ids,
+				models.AssumeMechanismOIDCFederation).Scan(&edges).Error; err != nil {
+			return err
+		}
+		for _, e := range edges {
+			ev[e.IdentityID].federation[e.SubjectKind] = true
+		}
+		var workloads []struct {
+			IdentityID  uuid.UUID
+			RuntimeKind string
+		}
+		if err := tx.Table("cloud_workload").Select("identity_id, runtime_kind").
+			Where("workspace_id = ? AND identity_id IN ?", workspaceID, ids).Scan(&workloads).Error; err != nil {
+			return err
+		}
+		for _, w := range workloads {
+			ev[w.IdentityID].workloads = append(ev[w.IdentityID].workloads, w.RuntimeKind)
+		}
+
+		repo := repositories.NewDiscoveryRepository(tx)
+		now := time.Now()
+		for _, e := range ev {
+			signals, confidence := azureAgentSignals(e, now)
+			if confidence == "" {
+				continue
+			}
+			agent := azureAgentSighting(workspaceID, tenantID, e, signals, confidence, now)
+			if _, _, err := repo.UpsertSighting(agent); err != nil {
+				return fmt.Errorf("propose %s: %w", e.identity.NativeID, err)
+			}
+			proposed++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return proposed, nil
 }

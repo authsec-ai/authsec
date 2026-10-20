@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_details.go reads what Microsoft Entra Agent ID says about each
@@ -496,10 +498,12 @@ var azureCreationActivities = map[string]bool{
 // agentAuditReadAt is when this tenant's audit log was last read.
 func (s *AzureOnboardingService) agentAuditReadAt(workspaceID, connectorID uuid.UUID) *time.Time {
 	var row struct{ At *time.Time }
-	if err := s.db.Model(&models.CloudConnector{}).
-		Select("(attrs->>'agent_audit_read_at')::timestamptz AS at").
-		Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
-		Scan(&row).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudConnector{}).
+			Select("(attrs->>'agent_audit_read_at')::timestamptz AS at").
+			Where("workspace_id = ? AND id = ?", workspaceID, connectorID).
+			Scan(&row).Error
+	}); err != nil {
 		return nil
 	}
 	return row.At
@@ -514,13 +518,15 @@ func (s *AzureOnboardingService) previousAgentAudit(workspaceID, connectorID uui
 		Trail    []byte
 	}
 	out := map[string]*azureAgentAuditTrail{}
-	if err := s.db.Model(&models.CloudIdentity{}).
-		Select(`native_id, jsonb_build_object('audit_changes', attrs->'audit_changes',
-			'audit_actions', attrs->'audit_actions', 'created_by', attrs->'created_by') AS trail`).
-		Where(`workspace_id = ? AND connector_id = ? AND (attrs->'audit_changes' IS NOT NULL
-			OR attrs->'audit_actions' IS NOT NULL OR attrs->'created_by' IS NOT NULL)`,
-			workspaceID, connectorID).
-		Scan(&rows).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudIdentity{}).
+			Select(`native_id, jsonb_build_object('audit_changes', attrs->'audit_changes',
+				'audit_actions', attrs->'audit_actions', 'created_by', attrs->'created_by') AS trail`).
+			Where(`workspace_id = ? AND connector_id = ? AND (attrs->'audit_changes' IS NOT NULL
+				OR attrs->'audit_actions' IS NOT NULL OR attrs->'created_by' IS NOT NULL)`,
+				workspaceID, connectorID).
+			Scan(&rows).Error
+	}); err != nil {
 		logAzureError("previous agent audit trails", err)
 		return out
 	}

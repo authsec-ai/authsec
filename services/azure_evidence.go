@@ -1,16 +1,19 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"gorm.io/gorm"
 )
 
 /* azure_evidence.go records WHY each Azure row exists: for every identity,
@@ -60,24 +63,88 @@ var azureIdentityFactKeys = []string{
 	"agent_type", "agent_blueprint_app_id", "agent_identity_id",
 }
 
+// azureEvidenceBatch is how many observations one transaction writes. Each
+// write asserts the run's fence (FOR SHARE on the run row, held to commit) in
+// a savepoint of its own, so a batch stays small: the run's heartbeat is not
+// held up, and the savepoints stay few.
+const azureEvidenceBatch = 50
+
+// azureObservation is one observation a pass's evidence will record.
+type azureObservation struct {
+	subject   ObservationSubject
+	api       string
+	surface   string
+	state     string
+	nativeID  string
+	facts     map[string]interface{}
+	errPrefix string // prefixed to a write error, as "grant <id>: "
+}
+
 // recordEvidence writes the pass's evidence. Logged, never fatal: evidence
 // explains rows the pass already wrote, and losing it must not lose them.
+//
+// The rows the pass confirmed are read in one read-only transaction under
+// row-level security for the run's workspace; the observations are then
+// written azureEvidenceBatch at a time, each batch in a transaction of its
+// own for that workspace.
 func (s *AzureOnboardingService) recordEvidence(pass *azurePass, scopeKind string, cov models.ScanCoverage, counters map[string]int) {
 	run := pass.run
-	w := NewObservationWriter(s.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation).
-		WithFence(repositories.ScanFence{RunID: run.ID, Owner: azureRunOwner, LeaseVersion: run.LeaseVersion})
-	var err error
-	if scopeKind == models.CloudScopeTenant {
-		err = s.tenantEvidence(w, run, cov)
-	} else {
-		err = s.subscriptionEvidence(w, run, cov)
+	// No run to anchor evidence to (NewObservationWriter would be nil):
+	// nothing to write.
+	if run.ID == uuid.Nil || run.Generation <= 0 {
+		counters["evidence_written"], counters["evidence_confirmed"] = 0, 0
+		return
 	}
-	written, unchanged := w.Counts()
+	ctx := context.Background()
+	var obs []azureObservation
+	err := tenancy.InWorkspaceRead(ctx, s.db, run.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		if scopeKind == models.CloudScopeTenant {
+			obs, err = tenantEvidence(tx, run, cov)
+		} else {
+			obs, err = subscriptionEvidence(tx, run, cov)
+		}
+		return err
+	})
+	written, unchanged := 0, 0
+	if err == nil {
+		written, unchanged, err = s.writeEvidence(ctx, run, obs)
+	}
 	counters["evidence_written"] = written
 	counters["evidence_confirmed"] = unchanged
 	if err != nil {
 		log.Printf("[azure] evidence for pass %s on connector %s stopped: %v", run.ID, run.ConnectorID, err)
 	}
+}
+
+// writeEvidence records obs in batches, stopping at the first write that
+// fails. What was written before it is kept: a failed write rolls back only
+// its own savepoint, and its batch commits the writes before it.
+func (s *AzureOnboardingService) writeEvidence(ctx context.Context, run *models.CloudScanRun, obs []azureObservation) (written, unchanged int, err error) {
+	fence := repositories.ScanFence{RunID: run.ID, Owner: azureRunOwner, LeaseVersion: run.LeaseVersion}
+	for start := 0; start < len(obs) && err == nil; start += azureEvidenceBatch {
+		batch := obs[start:min(start+azureEvidenceBatch, len(obs))]
+		var recErr error
+		var w, u int
+		txErr := tenancy.InWorkspace(ctx, s.db, run.WorkspaceID, func(tx *gorm.DB) error {
+			ow := NewObservationWriter(tx, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation).WithFence(fence)
+			for _, o := range batch {
+				if recErr = ow.Record(o.subject, o.api, o.surface, o.state, time.Now(), o.nativeID, o.facts); recErr != nil {
+					if o.errPrefix != "" {
+						recErr = fmt.Errorf("%s%w", o.errPrefix, recErr)
+					}
+					break
+				}
+			}
+			w, u = ow.Counts()
+			return nil // commit what was written before any failure
+		})
+		if txErr != nil {
+			return written, unchanged, txErr
+		}
+		written, unchanged, err = written+w, unchanged+u, recErr
+	}
+	return written, unchanged, err
 }
 
 // confirmedBy scopes a cloud_* query to the rows this pass confirmed.
@@ -86,12 +153,14 @@ func confirmedBy(run *models.CloudScanRun) (string, []interface{}) {
 		[]interface{}{run.WorkspaceID, run.ConnectorID, run.Generation}
 }
 
-func (s *AzureOnboardingService) tenantEvidence(w *ObservationWriter, run *models.CloudScanRun, cov models.ScanCoverage) error {
+// tenantEvidence is the observations of a tenant pass, read through tx.
+func tenantEvidence(tx *gorm.DB, run *models.CloudScanRun, cov models.ScanCoverage) ([]azureObservation, error) {
 	where, args := confirmedBy(run)
 	var identities []models.CloudIdentity
-	if err := s.db.Where(where, args...).Find(&identities).Error; err != nil {
-		return err
+	if err := tx.Where(where, args...).Find(&identities).Error; err != nil {
+		return nil, err
 	}
+	var out []azureObservation
 	for _, i := range identities {
 		src, ok := azureIdentitySource[i.Kind]
 		if !ok {
@@ -114,28 +183,36 @@ func (s *AzureOnboardingService) tenantEvidence(w *ObservationWriter, run *model
 				facts[k] = v
 			}
 		}
-		if err := w.Record(IdentitySubject(i.ID), src[0], src[1], SurfaceStateOf(cov, src[1]),
-			time.Now(), i.NativeID, facts); err != nil {
-			return err
-		}
+		out = append(out, azureObservation{subject: IdentitySubject(i.ID), api: src[0], surface: src[1],
+			state: SurfaceStateOf(cov, src[1]), nativeID: i.NativeID, facts: facts})
 	}
-	if err := s.grantEvidence(w, run, cov); err != nil {
-		return err
+	grants, err := grantEvidence(tx, run, cov)
+	if err != nil {
+		return nil, err
 	}
-	return s.resourceEvidence(w, run, cov)
+	resources, err := resourceEvidence(tx, run, cov)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(out, grants...), resources...), nil
 }
 
-func (s *AzureOnboardingService) subscriptionEvidence(w *ObservationWriter, run *models.CloudScanRun, cov models.ScanCoverage) error {
-	if err := s.resourceEvidence(w, run, cov); err != nil {
-		return err
+// subscriptionEvidence is the observations of a subscription pass, read
+// through tx.
+func subscriptionEvidence(tx *gorm.DB, run *models.CloudScanRun, cov models.ScanCoverage) ([]azureObservation, error) {
+	out, err := resourceEvidence(tx, run, cov)
+	if err != nil {
+		return nil, err
 	}
-	if err := s.grantEvidence(w, run, cov); err != nil {
-		return err
+	grants, err := grantEvidence(tx, run, cov)
+	if err != nil {
+		return nil, err
 	}
+	out = append(out, grants...)
 	where, args := confirmedBy(run)
 	var workloads []models.CloudWorkload
-	if err := s.db.Where(where, args...).Find(&workloads).Error; err != nil {
-		return err
+	if err := tx.Where(where, args...).Find(&workloads).Error; err != nil {
+		return nil, err
 	}
 	for _, wl := range workloads {
 		attrs := map[string]interface{}{}
@@ -163,20 +240,19 @@ func (s *AzureOnboardingService) subscriptionEvidence(w *ObservationWriter, run 
 				}
 			}
 		}
-		if err := w.Record(WorkloadSubject(wl.ID), api, surface, SurfaceStateOf(cov, surface),
-			time.Now(), wl.NativeID, facts); err != nil {
-			return err
-		}
+		out = append(out, azureObservation{subject: WorkloadSubject(wl.ID), api: api, surface: surface,
+			state: SurfaceStateOf(cov, surface), nativeID: wl.NativeID, facts: facts})
 	}
-	return nil
+	return out, nil
 }
 
-func (s *AzureOnboardingService) resourceEvidence(w *ObservationWriter, run *models.CloudScanRun, cov models.ScanCoverage) error {
+func resourceEvidence(tx *gorm.DB, run *models.CloudScanRun, cov models.ScanCoverage) ([]azureObservation, error) {
 	where, args := confirmedBy(run)
 	var resources []models.CloudResource
-	if err := s.db.Where(where, args...).Find(&resources).Error; err != nil {
-		return err
+	if err := tx.Where(where, args...).Find(&resources).Error; err != nil {
+		return nil, err
 	}
+	out := make([]azureObservation, 0, len(resources))
 	for _, r := range resources {
 		api, surface := "Microsoft.ResourceGraph/resources", models.SurfaceAzureResources
 		switch r.Kind {
@@ -189,12 +265,10 @@ func (s *AzureOnboardingService) resourceEvidence(w *ObservationWriter, run *mod
 			"kind": r.Kind, "name": r.Name, "account": r.ResourceAccount,
 			"sensitivity": r.Sensitivity, "sensitivity_reason": r.SensitivityReason,
 		}
-		if err := w.Record(ResourceSubject(r.ID), api, surface, SurfaceStateOf(cov, surface),
-			time.Now(), r.NativeID, facts); err != nil {
-			return err
-		}
+		out = append(out, azureObservation{subject: ResourceSubject(r.ID), api: api, surface: surface,
+			state: SurfaceStateOf(cov, surface), nativeID: r.NativeID, facts: facts})
 	}
-	return nil
+	return out, nil
 }
 
 // azureGrantEvidenceRow is a grant with who holds it and what it points at.
@@ -214,9 +288,9 @@ type azureGrantEvidenceRow struct {
 	ResourceKind    string
 }
 
-func (s *AzureOnboardingService) grantEvidence(w *ObservationWriter, run *models.CloudScanRun, cov models.ScanCoverage) error {
+func grantEvidence(tx *gorm.DB, run *models.CloudScanRun, cov models.ScanCoverage) ([]azureObservation, error) {
 	var grants []azureGrantEvidenceRow
-	if err := s.db.Table("cloud_permission p").
+	if err := tx.Table("cloud_permission p").
 		Select(`p.id, p.native_id, p.plane, p.role_name, p.actions, p.not_actions, p.scope_kind,
 			p.constraint_state, p.condition::text AS condition, p.sensitivity,
 			i.native_id AS subject_native_id, COALESCE(r.native_id, '') AS resource_native, COALESCE(r.kind, '') AS resource_kind`).
@@ -225,8 +299,9 @@ func (s *AzureOnboardingService) grantEvidence(w *ObservationWriter, run *models
 		Where("p.workspace_id = ? AND p.connector_id = ? AND p.last_seen_generation = ?",
 			run.WorkspaceID, run.ConnectorID, run.Generation).
 		Scan(&grants).Error; err != nil {
-		return err
+		return nil, err
 	}
+	out := make([]azureObservation, 0, len(grants))
 	for _, g := range grants {
 		api, surface := grantSource(g)
 		role := ""
@@ -242,12 +317,11 @@ func (s *AzureOnboardingService) grantEvidence(w *ObservationWriter, run *models
 		if g.Condition != nil {
 			facts["condition"] = json.RawMessage(*g.Condition)
 		}
-		if err := w.Record(PermissionSubject(g.ID), api, surface, SurfaceStateOf(cov, surface),
-			time.Now(), g.NativeID, facts); err != nil {
-			return fmt.Errorf("grant %s: %w", g.NativeID, err)
-		}
+		out = append(out, azureObservation{subject: PermissionSubject(g.ID), api: api, surface: surface,
+			state: SurfaceStateOf(cov, surface), nativeID: g.NativeID, facts: facts,
+			errPrefix: "grant " + g.NativeID + ": "})
 	}
-	return nil
+	return out, nil
 }
 
 // grantSource is the API and surface one grant was read from.

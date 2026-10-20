@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_discovery.go reads Microsoft Entra Agent ID: the agents a
@@ -151,7 +153,9 @@ func distrustUngranted(sc models.SurfaceCoverage, permission string, ungranted m
 func (s *AzureOnboardingService) ungrantedPermissions(workspaceID, connectorID uuid.UUID) map[string]bool {
 	out := map[string]bool{}
 	var c models.CloudConnector
-	if err := s.db.Select("attrs").Where("workspace_id = ? AND id = ?", workspaceID, connectorID).First(&c).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Select("attrs").Where("workspace_id = ? AND id = ?", workspaceID, connectorID).First(&c).Error
+	}); err != nil {
 		return out
 	}
 	var attrs models.AzureTenantAttrs
@@ -366,14 +370,46 @@ func (s *AzureOnboardingService) registerDeclaredAgents(workspaceID, tenantConne
 // agent identities and Microsoft 365 agent registry agents. declared collects
 // their fingerprints.
 func (s *AzureOnboardingService) registerDirectoryAgents(workspaceID, tenantConnectorID uuid.UUID, tenantID string, declared map[string]bool) (int, error) {
+	// What the passes stored, read first; each helper reads in a transaction
+	// of its own under row-level security for the workspace.
 	var agents []models.CloudIdentity
-	if err := s.db.Where("workspace_id = ? AND connector_id = ? AND kind = ?",
-		workspaceID, tenantConnectorID, models.CloudIdentityEntraAgentIdentity).Find(&agents).Error; err != nil {
+	signIns := map[uuid.UUID]int{}
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		if err := tx.Where("workspace_id = ? AND connector_id = ? AND kind = ?",
+			workspaceID, tenantConnectorID, models.CloudIdentityEntraAgentIdentity).Find(&agents).Error; err != nil {
+			return err
+		}
+		if len(agents) == 0 {
+			return nil
+		}
+		ids := make([]uuid.UUID, 0, len(agents))
+		for _, a := range agents {
+			ids = append(ids, a.ID)
+		}
+		var usage []struct {
+			IdentityID uuid.UUID
+			SignIns    int
+		}
+		if err := tx.Table("cloud_usage").
+			Select("identity_id, COALESCE(SUM((attrs->>'sign_ins')::int), 0) AS sign_ins").
+			Where("workspace_id = ? AND identity_id IN ? AND source = ?", workspaceID, ids, models.UsageSourceEntraSignIn).
+			Group("identity_id").Scan(&usage).Error; err != nil {
+			return err
+		}
+		for _, u := range usage {
+			signIns[u.IdentityID] = u.SignIns
+		}
+		return nil
+	}); err != nil {
 		return 0, err
 	}
-	repo := repositories.NewDiscoveryRepository(s.db)
+	spByApp, err := s.servicePrincipalsByAppID(workspaceID, tenantConnectorID)
+	if err != nil {
+		return 0, err
+	}
+	registry := s.tenantRegistry(workspaceID, tenantConnectorID)
+
 	now := time.Now()
-	n := 0
 	// Agents in the Microsoft 365 agent registry with no Entra agent identity
 	// here: declared by the registry. One with an identity is declared below,
 	// through that identity, which carries its registry facts.
@@ -381,60 +417,49 @@ func (s *AzureOnboardingService) registerDirectoryAgents(workspaceID, tenantConn
 	for _, a := range agents {
 		known[a.NativeID] = true
 	}
-	spByApp, err := s.servicePrincipalsByAppID(workspaceID, tenantConnectorID)
+	// Every sighting is written in one transaction under row-level security
+	// for the workspace: all of them, or (on an error) none.
+	n := 0
+	recorded := map[string]bool{}
+	err = tenancy.InWorkspace(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		n = 0
+		repo := repositories.NewDiscoveryRepository(tx)
+		for _, e := range registry {
+			if id, _ := e["agent_identity_id"].(string); id != "" && known[id] {
+				continue
+			}
+			if pid, _ := e["package_id"].(string); pid == "" {
+				continue
+			}
+			appID, _ := e["app_id"].(string)
+			sighting := registryAgentSighting(workspaceID, tenantID, e, spByApp[strings.ToLower(appID)], now)
+			if err := readyForDeclared(tx, workspaceID, sighting.Fingerprint); err != nil {
+				return err
+			}
+			if _, _, err := repo.UpsertSighting(sighting); err != nil {
+				return fmt.Errorf("declare registry agent: %w", err)
+			}
+			recorded[sighting.Fingerprint] = true
+			n++
+		}
+		for _, a := range agents {
+			sighting := declaredAgentSighting(workspaceID, tenantID, a, signIns[a.ID], now)
+			if err := readyForDeclared(tx, workspaceID, sighting.Fingerprint); err != nil {
+				return err
+			}
+			if _, _, err := repo.UpsertSighting(sighting); err != nil {
+				return fmt.Errorf("declare %s: %w", a.NativeID, err)
+			}
+			recorded[sighting.Fingerprint] = true
+			n++
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	for _, e := range s.tenantRegistry(workspaceID, tenantConnectorID) {
-		if id, _ := e["agent_identity_id"].(string); id != "" && known[id] {
-			continue
-		}
-		if pid, _ := e["package_id"].(string); pid == "" {
-			continue
-		}
-		appID, _ := e["app_id"].(string)
-		sighting := registryAgentSighting(workspaceID, tenantID, e, spByApp[strings.ToLower(appID)], now)
-		if err := s.readyForDeclared(workspaceID, sighting.Fingerprint); err != nil {
-			return n, err
-		}
-		if _, _, err := repo.UpsertSighting(sighting); err != nil {
-			return n, fmt.Errorf("declare registry agent: %w", err)
-		}
-		declared[sighting.Fingerprint] = true
-		n++
-	}
-	if len(agents) == 0 {
-		return n, nil
-	}
-	ids := make([]uuid.UUID, 0, len(agents))
-	for _, a := range agents {
-		ids = append(ids, a.ID)
-	}
-	signIns := map[uuid.UUID]int{}
-	var usage []struct {
-		IdentityID uuid.UUID
-		SignIns    int
-	}
-	if err := s.db.Table("cloud_usage").
-		Select("identity_id, COALESCE(SUM((attrs->>'sign_ins')::int), 0) AS sign_ins").
-		Where("workspace_id = ? AND identity_id IN ? AND source = ?", workspaceID, ids, models.UsageSourceEntraSignIn).
-		Group("identity_id").Scan(&usage).Error; err != nil {
-		return 0, err
-	}
-	for _, u := range usage {
-		signIns[u.IdentityID] = u.SignIns
-	}
-
-	for _, a := range agents {
-		sighting := declaredAgentSighting(workspaceID, tenantID, a, signIns[a.ID], now)
-		if err := s.readyForDeclared(workspaceID, sighting.Fingerprint); err != nil {
-			return n, err
-		}
-		if _, _, err := repo.UpsertSighting(sighting); err != nil {
-			return n, fmt.Errorf("declare %s: %w", a.NativeID, err)
-		}
-		declared[sighting.Fingerprint] = true
-		n++
+	for f := range recorded {
+		declared[f] = true
 	}
 	return n, nil
 }
@@ -555,11 +580,13 @@ func (s *AzureOnboardingService) servicePrincipalsByAppID(workspaceID, tenantCon
 		NativeID string
 		AppID    string
 	}
-	if err := s.db.Model(&models.CloudIdentity{}).
-		Select("native_id, lower(attrs->>'app_id') AS app_id").
-		Where("workspace_id = ? AND connector_id = ? AND kind = ? AND attrs->>'app_id' <> ''",
-			workspaceID, tenantConnectorID, models.CloudIdentityEntraServicePrincipal).
-		Scan(&rows).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudIdentity{}).
+			Select("native_id, lower(attrs->>'app_id') AS app_id").
+			Where("workspace_id = ? AND connector_id = ? AND kind = ? AND attrs->>'app_id' <> ''",
+				workspaceID, tenantConnectorID, models.CloudIdentityEntraServicePrincipal).
+			Scan(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(rows))
@@ -586,9 +613,10 @@ func (s *AzureOnboardingService) registryAppIDs(workspaceID, tenantConnectorID u
 // be recorded as declared: an agent first inferred (which an older inference
 // marked running) is upgraded in place, and a declared row may not carry it
 // (discovered_agents_declared_never_running_check). Its running state stays
-// in runtime_status and runtime_reason.
-func (s *AzureOnboardingService) readyForDeclared(workspaceID uuid.UUID, fingerprint string) error {
-	return s.db.Model(&models.DiscoveredAgent{}).
+// in runtime_status and runtime_reason. tx is the caller's transaction under
+// row-level security for workspaceID, in which the sighting is then recorded.
+func readyForDeclared(tx *gorm.DB, workspaceID uuid.UUID, fingerprint string) error {
+	return tx.Model(&models.DiscoveredAgent{}).
 		Where("workspace_id = ? AND source = ? AND fingerprint = ? AND last_observed_running_at IS NOT NULL",
 			workspaceID, models.DiscoverySourceAzure, fingerprint).
 		Update("last_observed_running_at", nil).Error

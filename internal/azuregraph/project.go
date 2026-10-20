@@ -175,8 +175,8 @@ func (w *writer) loadGrants() ([]azureGrantRow, error) {
 	err := w.tx.Table("cloud_permission p").
 		Select("p.*, i.native_id AS subject_native_id, COALESCE(r.native_id, '') AS resource_native_id, "+
 			"COALESCE(r.kind, '') AS resource_kind, COALESCE(r.name, '') AS resource_name").
-		Joins("JOIN cloud_identity i ON i.id = p.identity_id").
-		Joins("LEFT JOIN cloud_resource r ON r.id = p.resource_id").
+		Joins("JOIN cloud_identity i ON i.workspace_id = p.workspace_id AND i.id = p.identity_id").
+		Joins("LEFT JOIN cloud_resource r ON r.workspace_id = p.workspace_id AND r.id = p.resource_id").
 		Where(w.confirmed("p"), w.args()...).
 		Scan(&rows).Error
 	return rows, err
@@ -186,7 +186,7 @@ func (w *writer) loadEdges() ([]azureEdgeRow, error) {
 	var rows []azureEdgeRow
 	err := w.tx.Table("cloud_assume_edge e").
 		Select("e.*, i.native_id AS target_native_id").
-		Joins("JOIN cloud_identity i ON i.id = e.identity_id").
+		Joins("JOIN cloud_identity i ON i.workspace_id = e.workspace_id AND i.id = e.identity_id").
 		Where(w.confirmed("e"), w.args()...).
 		Scan(&rows).Error
 	return rows, err
@@ -238,7 +238,7 @@ func (w *writer) projectTenant() error {
 	// Credentials: metadata of app and service principal secrets.
 	var secrets []azureSecretRow
 	if err := w.tx.Table("cloud_secret s").Select("s.*, i.native_id AS owner_native_id").
-		Joins("JOIN cloud_identity i ON i.id = s.identity_id").
+		Joins("JOIN cloud_identity i ON i.workspace_id = s.workspace_id AND i.id = s.identity_id").
 		Where(w.confirmed("s"), w.args()...).Scan(&secrets).Error; err != nil {
 		return fmt.Errorf("load secrets: %w", err)
 	}
@@ -738,7 +738,7 @@ func (w *writer) projectWorkloads() error {
 	var rows []azureWorkloadRow
 	if err := w.tx.Table("cloud_workload c").
 		Select("c.*, COALESCE(i.native_id, '') AS identity_native_id").
-		Joins("LEFT JOIN cloud_identity i ON i.id = c.identity_id").
+		Joins("LEFT JOIN cloud_identity i ON i.workspace_id = c.workspace_id AND i.id = c.identity_id").
 		Where(w.confirmed("c"), w.args()...).Scan(&rows).Error; err != nil {
 		return fmt.Errorf("load workloads: %w", err)
 	}

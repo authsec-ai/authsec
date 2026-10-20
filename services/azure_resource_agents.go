@@ -1,15 +1,18 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_resource_agents.go registers the agents Azure Resource Manager lists
@@ -57,15 +60,17 @@ type azureTenantWorkload struct {
 // runtime kind is one of kinds.
 func (s *AzureOnboardingService) tenantWorkloads(workspaceID uuid.UUID, tenantID string, kinds []string) ([]azureTenantWorkload, error) {
 	var rows []azureTenantWorkload
-	err := s.db.Table("cloud_workload w").
-		Select("w.native_id, w.name, w.runtime_kind, w.region, w.attrs, i.native_id AS identity_native_id, c.scope_id AS subscription_id").
-		Joins("JOIN cloud_connector c ON c.id = w.connector_id").
-		Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id").
-		Where("w.workspace_id = ? AND c.workspace_id = ? AND c.provider = ? AND c.scope_kind = ? AND lower(c.parent_scope_id) = lower(?)",
-			workspaceID, workspaceID, models.CloudProviderAzure, models.CloudScopeSubscription, tenantID).
-		Where("w.runtime_kind IN ?", kinds).
-		Order("w.native_id").
-		Scan(&rows).Error
+	err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Table("cloud_workload w").
+			Select("w.native_id, w.name, w.runtime_kind, w.region, w.attrs, i.native_id AS identity_native_id, c.scope_id AS subscription_id").
+			Joins("JOIN cloud_connector c ON c.id = w.connector_id").
+			Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id").
+			Where("w.workspace_id = ? AND c.workspace_id = ? AND c.provider = ? AND c.scope_kind = ? AND lower(c.parent_scope_id) = lower(?)",
+				workspaceID, workspaceID, models.CloudProviderAzure, models.CloudScopeSubscription, tenantID).
+			Where("w.runtime_kind IN ?", kinds).
+			Order("w.native_id").
+			Scan(&rows).Error
+	})
 	return rows, err
 }
 
@@ -73,28 +78,24 @@ func (s *AzureOnboardingService) tenantWorkloads(workspaceID uuid.UUID, tenantID
 // Azure Bot Service bots as declared agents. declared holds the fingerprints
 // Agent ID and the registry recorded in this pass. Returns how many it
 // recorded.
+//
+// What the passes stored is read first, each read in a transaction of its own;
+// the agents are then recorded in one transaction under row-level security for
+// the workspace: all of them, or (on an error) none.
 func (s *AzureOnboardingService) registerResourceAgents(workspaceID, tenantConnectorID uuid.UUID, tenantID string, declared map[string]bool, now time.Time) (int, error) {
-	repo := repositories.NewDiscoveryRepository(s.db)
 	tenant := strings.ToLower(tenantID)
-	n := 0
-	record := func(a *models.DiscoveredAgent) error {
-		if declared[a.Fingerprint] {
-			return nil
+	var pending []*models.DiscoveredAgent
+	queued := map[string]bool{}
+	record := func(a *models.DiscoveredAgent) {
+		if !declared[a.Fingerprint] && !queued[a.Fingerprint] {
+			queued[a.Fingerprint] = true
+			pending = append(pending, a)
 		}
-		if err := s.readyForDeclared(workspaceID, a.Fingerprint); err != nil {
-			return err
-		}
-		if _, _, err := repo.UpsertSighting(a); err != nil {
-			return fmt.Errorf("declare %s: %w", a.DisplayName, err)
-		}
-		declared[a.Fingerprint] = true
-		n++
-		return nil
 	}
 
 	projects, err := s.tenantWorkloads(workspaceID, tenantID, []string{"microsoft.cognitiveservices/accounts/projects"})
 	if err != nil {
-		return n, err
+		return 0, err
 	}
 	for _, p := range projects {
 		var attrs struct {
@@ -104,20 +105,16 @@ func (s *AzureOnboardingService) registerResourceAgents(workspaceID, tenantConne
 		}
 		_ = json.Unmarshal(p.Attrs, &attrs)
 		for _, app := range attrs.Apps {
-			if err := record(foundryAppSighting(workspaceID, tenant, p, attrs.ResourceID, app, now)); err != nil {
-				return n, err
-			}
+			record(foundryAppSighting(workspaceID, tenant, p, attrs.ResourceID, app, now))
 		}
 		for _, a := range attrs.Agents {
-			if err := record(foundryProjectAgentSighting(workspaceID, tenant, p, attrs.ResourceID, a, now)); err != nil {
-				return n, err
-			}
+			record(foundryProjectAgentSighting(workspaceID, tenant, p, attrs.ResourceID, a, now))
 		}
 	}
 
 	logic, err := s.tenantWorkloads(workspaceID, tenantID, []string{azureLogicRuntimeKind})
 	if err != nil {
-		return n, err
+		return 0, err
 	}
 	// One agent per workflow, whichever identities it runs as.
 	byWorkflow := map[string][]azureTenantWorkload{}
@@ -138,35 +135,50 @@ func (s *AzureOnboardingService) registerResourceAgents(workspaceID, tenantConne
 		byWorkflow[id] = append(byWorkflow[id], w)
 	}
 	for _, id := range order {
-		if err := record(logicAgentSighting(workspaceID, tenant, id, byWorkflow[id], now)); err != nil {
-			return n, err
-		}
+		record(logicAgentSighting(workspaceID, tenant, id, byWorkflow[id], now))
 	}
 
 	bots, err := s.tenantWorkloads(workspaceID, tenantID, []string{azureBotRuntimeKind})
 	if err != nil {
-		return n, err
+		return 0, err
 	}
 	for _, b := range bots {
-		if err := record(botSighting(workspaceID, tenant, b, now)); err != nil {
-			return n, err
-		}
+		record(botSighting(workspaceID, tenant, b, now))
 	}
 
 	teams := s.tenantTeamsAgents(workspaceID, tenantConnectorID)
 	if len(teams) > 0 {
 		spByApp, err := s.servicePrincipalsByAppID(workspaceID, tenantConnectorID)
 		if err != nil {
-			return n, err
+			return 0, err
 		}
 		for _, e := range teams {
 			appID, _ := e["bot_app_id"].(string)
-			if err := record(teamsAgentSighting(workspaceID, tenant, e, spByApp[strings.ToLower(appID)], now)); err != nil {
-				return n, err
-			}
+			record(teamsAgentSighting(workspaceID, tenant, e, spByApp[strings.ToLower(appID)], now))
 		}
 	}
-	return n, nil
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	if err := tenancy.InWorkspace(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		repo := repositories.NewDiscoveryRepository(tx)
+		for _, a := range pending {
+			if err := readyForDeclared(tx, workspaceID, a.Fingerprint); err != nil {
+				return err
+			}
+			if _, _, err := repo.UpsertSighting(a); err != nil {
+				return fmt.Errorf("declare %s: %w", a.DisplayName, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	for _, a := range pending {
+		declared[a.Fingerprint] = true
+	}
+	return len(pending), nil
 }
 
 // foundryAppSighting is one published Foundry agent as a declared agent.

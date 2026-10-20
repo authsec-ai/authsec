@@ -9,8 +9,10 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_sources.go reads the agent sources that need no licence, beyond
@@ -116,8 +118,10 @@ func teamsAgentEntries(apps []azure.TeamsApp, counters map[string]int) []map[str
 // tenantTeamsAgents is the Teams catalog the last tenant pass stored.
 func (s *AzureOnboardingService) tenantTeamsAgents(workspaceID, tenantConnectorID uuid.UUID) []map[string]interface{} {
 	var row struct{ Apps []byte }
-	if err := s.db.Model(&models.CloudConnector{}).Select("attrs->'teams_agents' AS apps").
-		Where("workspace_id = ? AND id = ?", workspaceID, tenantConnectorID).Scan(&row).Error; err != nil || len(row.Apps) == 0 {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudConnector{}).Select("attrs->'teams_agents' AS apps").
+			Where("workspace_id = ? AND id = ?", workspaceID, tenantConnectorID).Scan(&row).Error
+	}); err != nil || len(row.Apps) == 0 {
 		return nil
 	}
 	var out []map[string]interface{}
@@ -333,11 +337,13 @@ type azureFoundryProject struct {
 func (s *AzureOnboardingService) collectFoundryAgents(ctx context.Context, workspaceID, connectorID uuid.UUID, foundryToken string, counters map[string]int) models.SurfaceCoverage {
 	sc := models.SurfaceCoverage{State: models.CloudCoverageReached, API: "GET {project}/agents?api-version=v1 (Foundry data plane)"}
 	var projects []azureFoundryProject
-	if err := s.db.Table("cloud_workload p").
-		Select("p.native_id, p.name, a.attrs->>'endpoint' AS account_endpoint").
-		Joins("JOIN cloud_workload a ON a.workspace_id = p.workspace_id AND a.connector_id = p.connector_id AND lower(a.attrs->>'resource_id') = lower(p.attrs->>'account_id') AND a.attrs->>'foundry_kind' = 'account'").
-		Where("p.workspace_id = ? AND p.connector_id = ? AND p.attrs->>'foundry_kind' = 'project'", workspaceID, connectorID).
-		Scan(&projects).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Table("cloud_workload p").
+			Select("p.native_id, p.name, a.attrs->>'endpoint' AS account_endpoint").
+			Joins("JOIN cloud_workload a ON a.workspace_id = p.workspace_id AND a.connector_id = p.connector_id AND lower(a.attrs->>'resource_id') = lower(p.attrs->>'account_id') AND a.attrs->>'foundry_kind' = 'account'").
+			Where("p.workspace_id = ? AND p.connector_id = ? AND p.attrs->>'foundry_kind' = 'project'", workspaceID, connectorID).
+			Scan(&projects).Error
+	}); err != nil {
 		return surfaceFailure(sc, err, 0)
 	}
 	if len(projects) == 0 {
@@ -373,8 +379,11 @@ func (s *AzureOnboardingService) collectFoundryAgents(ctx context.Context, works
 			counters["foundry_project_agents"]++
 		}
 		patch, _ := json.Marshal(map[string]interface{}{"project_agents": facts})
-		if err := s.db.Exec("UPDATE cloud_workload SET attrs = attrs || ?::jsonb WHERE workspace_id = ? AND connector_id = ? AND native_id = ?",
-			string(patch), workspaceID, connectorID, p.NativeID).Error; err != nil {
+		// Its own transaction: none is held open across the data-plane calls.
+		if err := tenancy.InWorkspace(ctx, s.db, workspaceID, func(tx *gorm.DB) error {
+			return tx.Exec("UPDATE cloud_workload SET attrs = attrs || ?::jsonb WHERE workspace_id = ? AND connector_id = ? AND native_id = ?",
+				string(patch), workspaceID, connectorID, p.NativeID).Error
+		}); err != nil {
 			log.Printf("[azure] scan: could not record Foundry agents of %s: %v", p.Name, err)
 			failed++
 		}

@@ -25,7 +25,12 @@ import (
    Every edge kind is capped and the most sensitive grants come first, so a
    group like "All Users" or an app with hundreds of delegated permissions
    says how many more there are instead of flooding the canvas. Only live
-   rows: ended grants and relationships are history, not access. */
+   rows: ended grants and relationships are history, not access.
+
+   One read is one read-only transaction under row-level security for the
+   workspace (AS-108): the builder holds that transaction, never the base
+   handle. The workspace_id filters stay as defence in depth, and every join
+   also matches the workspace. */
 
 // ErrGraphNodeNotFound is a ref that names nothing live in the graph.
 var ErrGraphNodeNotFound = errors.New("graph node not found")
@@ -71,7 +76,8 @@ type AzureGraphNeighbourhood struct {
 }
 
 type nbBuilder struct {
-	db    *gorm.DB
+	// tx is the read's workspace transaction (inWorkspaceRead).
+	tx    *gorm.DB
 	ws    uuid.UUID
 	out   *AzureGraphNeighbourhood
 	nodes map[string]bool
@@ -94,21 +100,35 @@ func (b *nbBuilder) total(kind string, n int) {
 	}
 }
 
-// AzureNeighbourhoodOf reads one node's neighbourhood.
+// AzureNeighbourhoodOf reads one node's neighbourhood, in one read-only
+// transaction under row-level security for the workspace.
 func AzureNeighbourhoodOf(db *gorm.DB, workspaceID uuid.UUID, ref string) (*AzureGraphNeighbourhood, error) {
 	kind, id, ok := strings.Cut(ref, ":")
 	if !ok || id == "" {
 		return nil, fmt.Errorf("%w: %q is not <type>:<id>", ErrGraphNodeNotFound, ref)
 	}
-	b := &nbBuilder{db: db, ws: workspaceID, nodes: map[string]bool{},
-		out: &AzureGraphNeighbourhood{Nodes: []AzureGraphNode{}, Edges: []AzureGraphEdge{}, Totals: map[string]int{}}}
+	var out *AzureGraphNeighbourhood
+	err := inWorkspaceRead(db, workspaceID, func(tx *gorm.DB) error {
+		b := &nbBuilder{tx: tx, ws: workspaceID, nodes: map[string]bool{},
+			out: &AzureGraphNeighbourhood{Nodes: []AzureGraphNode{}, Edges: []AzureGraphEdge{}, Totals: map[string]int{}}}
+		var err error
+		out, err = b.read(kind, id)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
+// read dispatches on the ref's type, on the builder's transaction.
+func (b *nbBuilder) read(kind, id string) (*AzureGraphNeighbourhood, error) {
 	switch kind {
 	case "object":
 		var row struct{ ID uuid.UUID }
-		if err := db.Raw(`SELECT id FROM iga_identity_accounts WHERE workspace_id = ? AND provider = ?
+		if err := b.tx.Raw(`SELECT id FROM iga_identity_accounts WHERE workspace_id = ? AND provider = ?
 			AND lifecycle <> 'retired' AND provider_attrs->>'object_id' = lower(?) LIMIT 1`,
-			workspaceID, models.ProviderAzure, id).Scan(&row).Error; err != nil {
+			b.ws, models.ProviderAzure, id).Scan(&row).Error; err != nil {
 			return nil, err
 		}
 		if row.ID == uuid.Nil {
@@ -119,9 +139,9 @@ func AzureNeighbourhoodOf(db *gorm.DB, workspaceID uuid.UUID, ref string) (*Azur
 		// A resource by its Azure id (an ARM id, or an API permission's native
 		// id), as the inventory lists it.
 		var row struct{ ID uuid.UUID }
-		if err := db.Raw(`SELECT id FROM iga_resources WHERE workspace_id = ? AND provider = ?
+		if err := b.tx.Raw(`SELECT id FROM iga_resources WHERE workspace_id = ? AND provider = ?
 			AND lifecycle <> 'retired' AND provider_attrs->>'native_id' = lower(?) LIMIT 1`,
-			workspaceID, models.ProviderAzure, id).Scan(&row).Error; err != nil {
+			b.ws, models.ProviderAzure, id).Scan(&row).Error; err != nil {
 			return nil, err
 		}
 		if row.ID == uuid.Nil {
@@ -182,7 +202,7 @@ func (b *nbBuilder) loadIdentities(ids []uuid.UUID) (map[uuid.UUID]nbIdentity, e
 		return out, nil
 	}
 	var rows []nbIdentity
-	err := b.db.Raw(`SELECT id, display_name, account_kind, provider_attrs FROM iga_identity_accounts
+	err := b.tx.Raw(`SELECT id, display_name, account_kind, provider_attrs FROM iga_identity_accounts
 		WHERE workspace_id = ? AND id IN ?`, b.ws, ids).Scan(&rows).Error
 	for _, r := range rows {
 		out[r.ID] = r
@@ -212,8 +232,8 @@ const nbGrantSelect = `SELECT e.id, e.subject_identity_account_id AS subject_id,
 		COALESCE(en.native_rights->'actions'->>0, '') AS action,
 		COALESCE(NULLIF(en.normalized_rights->>'sensitivity', ''), r.provider_attrs->>'sensitivity', 'low') AS sensitivity
 	  FROM iga_access_edges e
-	  LEFT JOIN iga_entitlements en ON en.id = e.entitlement_id
-	  LEFT JOIN iga_resources r ON r.id = e.resource_id
+	  LEFT JOIN iga_entitlements en ON en.id = e.entitlement_id AND en.workspace_id = e.workspace_id
+	  LEFT JOIN iga_resources r ON r.id = e.resource_id AND r.workspace_id = e.workspace_id
 	 WHERE e.workspace_id = ? AND e.provider = 'azure' AND e.state <> 'ended' AND `
 
 const nbGrantOrder = ` ORDER BY CASE COALESCE(NULLIF(en.normalized_rights->>'sensitivity', ''), r.provider_attrs->>'sensitivity', 'low')
@@ -222,12 +242,12 @@ const nbGrantOrder = ` ORDER BY CASE COALESCE(NULLIF(en.normalized_rights->>'sen
 func (b *nbBuilder) grants(where string, args ...interface{}) ([]nbGrant, int, error) {
 	var total int64
 	countArgs := append([]interface{}{b.ws}, args...)
-	if err := b.db.Raw(`SELECT count(*) FROM iga_access_edges e WHERE e.workspace_id = ? AND e.provider = 'azure'
+	if err := b.tx.Raw(`SELECT count(*) FROM iga_access_edges e WHERE e.workspace_id = ? AND e.provider = 'azure'
 		AND e.state <> 'ended' AND `+where, countArgs...).Scan(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var rows []nbGrant
-	err := b.db.Raw(nbGrantSelect+where+nbGrantOrder, append(countArgs, azureGraphEdgeCap)...).Scan(&rows).Error
+	err := b.tx.Raw(nbGrantSelect+where+nbGrantOrder, append(countArgs, azureGraphEdgeCap)...).Scan(&rows).Error
 	return rows, int(total), err
 }
 
@@ -299,11 +319,11 @@ func (b *nbBuilder) rels(where string, args ...interface{}) ([]nbRel, int, error
 	all := append([]interface{}{b.ws, models.ProviderAzure + "\x1f%"}, args...)
 	base := ` FROM iga_relationship WHERE workspace_id = ? AND source_key LIKE ? AND state <> 'ended' AND ` + where
 	var total int64
-	if err := b.db.Raw(`SELECT count(*)`+base, all...).Scan(&total).Error; err != nil {
+	if err := b.tx.Raw(`SELECT count(*)`+base, all...).Scan(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var rows []nbRel
-	err := b.db.Raw(`SELECT id, relationship_type AS type, source_identity_account_id AS source_id,
+	err := b.tx.Raw(`SELECT id, relationship_type AS type, source_identity_account_id AS source_id,
 		source_workload_id AS workload, source_external_principal_id AS external,
 		target_identity_account_id AS target_id, state, mechanism`+base+` ORDER BY id LIMIT ?`,
 		append(all, azureGraphEdgeCap)...).Scan(&rows).Error
@@ -378,7 +398,7 @@ func (b *nbBuilder) relTotals(id uuid.UUID) error {
 		Type  string
 		Count int
 	}
-	if err := b.db.Raw(`SELECT relationship_type AS type, count(*) AS count FROM iga_relationship
+	if err := b.tx.Raw(`SELECT relationship_type AS type, count(*) AS count FROM iga_relationship
 		WHERE workspace_id = ? AND source_key LIKE ? AND state <> 'ended'
 		  AND (source_identity_account_id = ? OR target_identity_account_id = ?)
 		GROUP BY 1`, b.ws, models.ProviderAzure+"\x1f%", id, id).Scan(&rows).Error; err != nil {
@@ -403,7 +423,7 @@ func (b *nbBuilder) addRelationships(rels []nbRel, identities, workloads, extern
 			RuntimeKind string
 			Region      string
 		}
-		if err := b.db.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id IN ?`,
+		if err := b.tx.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id IN ?`,
 			b.ws, workloads).Scan(&rows).Error; err != nil {
 			return err
 		}
@@ -420,7 +440,7 @@ func (b *nbBuilder) addRelationships(rels []nbRel, identities, workloads, extern
 			SubjectClaim string
 			Mechanism    string
 		}
-		if err := b.db.Raw(`SELECT id, issuer, subject_claim, mechanism FROM iga_external_principal WHERE workspace_id = ? AND id IN ?`,
+		if err := b.tx.Raw(`SELECT id, issuer, subject_claim, mechanism FROM iga_external_principal WHERE workspace_id = ? AND id IN ?`,
 			b.ws, externals).Scan(&rows).Error; err != nil {
 			return err
 		}
@@ -508,7 +528,7 @@ func (b *nbBuilder) resource(id uuid.UUID) (*AzureGraphNeighbourhood, error) {
 		ResourceKind string
 		Attrs        json.RawMessage `gorm:"column:provider_attrs"`
 	}
-	if err := b.db.Raw(`SELECT id, display_name, resource_kind, provider_attrs FROM iga_resources
+	if err := b.tx.Raw(`SELECT id, display_name, resource_kind, provider_attrs FROM iga_resources
 		WHERE workspace_id = ? AND id = ? AND provider = ?`, b.ws, id, models.ProviderAzure).Scan(&r).Error; err != nil {
 		return nil, err
 	}
@@ -556,7 +576,7 @@ func (b *nbBuilder) workload(id uuid.UUID) (*AzureGraphNeighbourhood, error) {
 		RuntimeKind string
 		Region      string
 	}
-	if err := b.db.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id = ? AND provider = ?`,
+	if err := b.tx.Raw(`SELECT id, display_name, runtime_kind, region FROM iga_workload WHERE workspace_id = ? AND id = ? AND provider = ?`,
 		b.ws, id, models.ProviderAzure).Scan(&w).Error; err != nil {
 		return nil, err
 	}

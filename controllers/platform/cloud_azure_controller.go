@@ -37,6 +37,7 @@ func NewCloudAzureController(db *gorm.DB) *CloudAzureController {
 // service builds the Azure service. The app registration, secret included, is
 // read from the environment per request and never stored anywhere else.
 func (ctl *CloudAzureController) service() *services.AzureOnboardingService {
+	// TENANT-EXEMPT: not a statement here: the Azure service runs every statement in a workspace transaction under row-level security.
 	return services.NewAzureOnboardingService(ctl.db, config.GetRedisClient(), azure.AppConfigFromEnv(), ctl.vaultClient())
 }
 

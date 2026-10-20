@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_registry.go reads the Microsoft 365 agent registry -- the
@@ -231,8 +233,10 @@ func registryAgentSighting(workspaceID uuid.UUID, tenantID string, e map[string]
 // tenantRegistry is the catalog the last tenant pass stored.
 func (s *AzureOnboardingService) tenantRegistry(workspaceID, tenantConnectorID uuid.UUID) []map[string]interface{} {
 	var row struct{ Registry []byte }
-	if err := s.db.Model(&models.CloudConnector{}).Select("attrs->'agent_registry' AS registry").
-		Where("workspace_id = ? AND id = ?", workspaceID, tenantConnectorID).Scan(&row).Error; err != nil || len(row.Registry) == 0 {
+	if err := tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.CloudConnector{}).Select("attrs->'agent_registry' AS registry").
+			Where("workspace_id = ? AND id = ?", workspaceID, tenantConnectorID).Scan(&row).Error
+	}); err != nil || len(row.Registry) == 0 {
 		return nil
 	}
 	var out []map[string]interface{}

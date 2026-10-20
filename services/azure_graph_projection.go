@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azuregraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -52,7 +53,8 @@ func (s *AzureOnboardingService) projectGraph(ctx context.Context, workspaceID u
 		}
 		started := time.Now()
 		var res *azuregraph.Result
-		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// One transaction per pass, under row-level security for its workspace.
+		err := tenancy.InWorkspace(ctx, s.db, p.WorkspaceID, func(tx *gorm.DB) error {
 			r, err := azuregraph.ProjectPass(tx, p, time.Now())
 			res = r
 			return err

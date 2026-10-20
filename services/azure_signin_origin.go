@@ -9,8 +9,10 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_signin_origin.go answers WHERE an identity signs in from. Entra's
@@ -257,9 +259,11 @@ func isAzureCloudTag(t *azure.ServiceTag) bool {
 func (s *AzureOnboardingService) attributeSignInIPs(ctx context.Context, workspaceID, tenantConnectorID uuid.UUID, tenantID string) (map[string]int, error) {
 	placer := &azureIPPlacer{}
 	var subs []models.CloudConnector
-	if err := s.db.Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND status = ? AND lower(parent_scope_id) = ?",
-		workspaceID, models.CloudProviderAzure, models.CloudScopeSubscription, models.CloudConnectorActive, strings.ToLower(tenantID)).
-		Order("scope_id").Find(&subs).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND status = ? AND lower(parent_scope_id) = ?",
+			workspaceID, models.CloudProviderAzure, models.CloudScopeSubscription, models.CloudConnectorActive, strings.ToLower(tenantID)).
+			Order("scope_id").Find(&subs).Error
+	}); err != nil {
 		return nil, err
 	}
 	for _, c := range subs {
@@ -305,44 +309,52 @@ func (s *AzureOnboardingService) attributeSignInIPs(ctx context.Context, workspa
 		}
 	}
 
-	var usage []struct {
-		ID    uuid.UUID
-		Attrs []byte
-	}
-	if err := s.db.Model(&models.CloudUsage{}).Select("id, attrs").
-		Where("workspace_id = ? AND connector_id = ? AND source = ?", workspaceID, tenantConnectorID, models.UsageSourceEntraSignIn).
-		Scan(&usage).Error; err != nil {
-		return nil, err
-	}
+	// The sign-ins are read and placed in one transaction under row-level
+	// security for the workspace, after the Azure calls above.
 	counts := map[string]int{}
-	cache := map[string]azureIPOrigin{}
-	for _, u := range usage {
-		var attrs struct {
-			IPs []string `json:"ip_addresses"`
+	err := tenancy.InWorkspace(ctx, s.db, workspaceID, func(tx *gorm.DB) error {
+		var usage []struct {
+			ID    uuid.UUID
+			Attrs []byte
 		}
-		_ = json.Unmarshal(u.Attrs, &attrs)
-		if len(attrs.IPs) == 0 {
-			continue
+		if err := tx.Model(&models.CloudUsage{}).Select("id, attrs").
+			Where("workspace_id = ? AND connector_id = ? AND source = ?", workspaceID, tenantConnectorID, models.UsageSourceEntraSignIn).
+			Scan(&usage).Error; err != nil {
+			return err
 		}
-		origins := make([]azureIPOrigin, 0, len(attrs.IPs))
-		for _, ip := range attrs.IPs {
-			o, ok := cache[ip]
-			if !ok {
-				o = placer.place(ip)
-				cache[ip] = o
-				counts[o.Where]++
+		cache := map[string]azureIPOrigin{}
+		for _, u := range usage {
+			var attrs struct {
+				IPs []string `json:"ip_addresses"`
 			}
-			origins = append(origins, o)
+			_ = json.Unmarshal(u.Attrs, &attrs)
+			if len(attrs.IPs) == 0 {
+				continue
+			}
+			origins := make([]azureIPOrigin, 0, len(attrs.IPs))
+			for _, ip := range attrs.IPs {
+				o, ok := cache[ip]
+				if !ok {
+					o = placer.place(ip)
+					cache[ip] = o
+					counts[o.Where]++
+				}
+				origins = append(origins, o)
+			}
+			sort.Slice(origins, func(i, j int) bool { return origins[i].IP < origins[j].IP })
+			raw, err := json.Marshal(origins)
+			if err != nil {
+				continue
+			}
+			if err := tx.Exec(`UPDATE cloud_usage SET attrs = attrs || jsonb_build_object('ip_origins', ?::jsonb) WHERE id = ? AND workspace_id = ?`,
+				string(raw), u.ID, workspaceID).Error; err != nil {
+				return err
+			}
 		}
-		sort.Slice(origins, func(i, j int) bool { return origins[i].IP < origins[j].IP })
-		raw, err := json.Marshal(origins)
-		if err != nil {
-			continue
-		}
-		if err := s.db.Exec(`UPDATE cloud_usage SET attrs = attrs || jsonb_build_object('ip_origins', ?::jsonb) WHERE id = ?`,
-			string(raw), u.ID).Error; err != nil {
-			return counts, err
-		}
+		return nil
+	})
+	if err != nil {
+		return counts, err
 	}
 	return counts, nil
 }

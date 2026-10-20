@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -1413,9 +1414,13 @@ func (s *AzureOnboardingService) verifyTenant(ctx context.Context, c *models.Clo
 	attrs.GraphPermissions = perms
 	if len(missing) > 0 {
 		if err := c.SetAzureTenantAttrs(attrs); err == nil {
-			_ = s.db.Model(&models.CloudConnector{}).
-				Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
-				Update("attrs", c.Attrs).Error
+			// Without cancel: the verify budget may be spent, and the write is
+			// best effort either way.
+			_ = tenancy.InWorkspace(context.WithoutCancel(ctx), s.db, c.WorkspaceID, func(tx *gorm.DB) error {
+				return tx.Model(&models.CloudConnector{}).
+					Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
+					Update("attrs", c.Attrs).Error
+			})
 		}
 		return fail(fmt.Errorf("%w: %s", azure.ErrGraphPermissionsMissing, strings.Join(missing, ", ")))
 	}
@@ -1478,9 +1483,13 @@ func (s *AzureOnboardingService) verifySubscription(ctx context.Context, c *mode
 			attrs.Reader.Error = err.Error()
 		}
 		if serr := c.SetAzureSubscriptionAttrs(attrs); serr == nil {
-			_ = s.db.Model(&models.CloudConnector{}).
-				Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
-				Update("attrs", c.Attrs).Error
+			// Without cancel: the failure being recorded may be the verify
+			// budget running out.
+			_ = tenancy.InWorkspace(context.WithoutCancel(ctx), s.db, c.WorkspaceID, func(tx *gorm.DB) error {
+				return tx.Model(&models.CloudConnector{}).
+					Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
+					Update("attrs", c.Attrs).Error
+			})
 		}
 		stored, merr := s.connectors.MarkError(c.WorkspaceID, c.ID, reason, code)
 		if merr != nil {
@@ -1613,24 +1622,40 @@ func (s *AzureOnboardingService) ScanRuns(workspaceID, connectorID uuid.UUID, li
 }
 
 // Neighbourhood is one access graph node and everything one hop from it.
-func (s *AzureOnboardingService) Neighbourhood(workspaceID uuid.UUID, ref string) (*repositories.AzureGraphNeighbourhood, error) {
-	return repositories.AzureNeighbourhoodOf(s.db, workspaceID, ref)
+func (s *AzureOnboardingService) Neighbourhood(workspaceID uuid.UUID, ref string) (out *repositories.AzureGraphNeighbourhood, err error) {
+	err = tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) (err error) {
+		out, err = repositories.AzureNeighbourhoodOf(tx, workspaceID, ref)
+		return err
+	})
+	return out, err
 }
 
 // Evidence is the receipts behind one Entra object and its grants.
-func (s *AzureOnboardingService) Evidence(workspaceID uuid.UUID, objectID string, limit int) ([]repositories.AzureEvidence, error) {
-	return repositories.AzureEvidenceFor(s.db, workspaceID, objectID, limit)
+func (s *AzureOnboardingService) Evidence(workspaceID uuid.UUID, objectID string, limit int) (out []repositories.AzureEvidence, err error) {
+	err = tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) (err error) {
+		out, err = repositories.AzureEvidenceFor(tx, workspaceID, objectID, limit)
+		return err
+	})
+	return out, err
 }
 
 // GraphSummary counts the workspace's Azure rows in the shared IGA graph.
-func (s *AzureOnboardingService) GraphSummary(workspaceID uuid.UUID) ([]repositories.AzureGraphCount, error) {
-	return repositories.AzureGraphSummary(s.db, workspaceID)
+func (s *AzureOnboardingService) GraphSummary(workspaceID uuid.UUID) (out []repositories.AzureGraphCount, err error) {
+	err = tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) (err error) {
+		out, err = repositories.AzureGraphSummary(tx, workspaceID)
+		return err
+	})
+	return out, err
 }
 
 // BlastRadius is everything one Entra object can reach in the graph, directly,
 // through its groups, and through the identities it can become.
-func (s *AzureOnboardingService) BlastRadius(workspaceID uuid.UUID, objectID string) (*repositories.AzureBlastRadius, error) {
-	return repositories.AzureBlastRadiusOf(s.db, workspaceID, objectID)
+func (s *AzureOnboardingService) BlastRadius(workspaceID uuid.UUID, objectID string) (out *repositories.AzureBlastRadius, err error) {
+	err = tenancy.InWorkspaceRead(context.Background(), s.db, workspaceID, func(tx *gorm.DB) (err error) {
+		out, err = repositories.AzureBlastRadiusOf(tx, workspaceID, objectID)
+		return err
+	})
+	return out, err
 }
 
 // ListUsage returns sign-in evidence: which identity obtained tokens for which

@@ -1,14 +1,17 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_agent_retire.go closes the Azure agents a tenant pass no longer saw.
@@ -76,103 +79,112 @@ func (s *AzureOnboardingService) retireAzureAgents(workspaceID, tenantConnectorI
 		return 0, nil
 	}
 
-	var stale []models.DiscoveredAgent
-	if err := s.db.Where("workspace_id = ? AND source = ? AND lower(metadata->>'tenant_id') = lower(?)",
-		workspaceID, models.DiscoverySourceAzure, tenantID).
-		Where("runtime_status <> ?", models.RuntimeStatusGone).
-		Where("last_seen_at < ?", cutoff).
-		Find(&stale).Error; err != nil {
-		return 0, err
-	}
-	if len(stale) == 0 {
-		return 0, nil
-	}
-
-	// The identities the tenant pass stored, by object id: an inferred agent
-	// whose identity is here still exists.
-	present := map[string]bool{}
-	if principalsRead {
-		var ids []string
-		if err := s.db.Model(&models.CloudIdentity{}).
-			Where("workspace_id = ? AND connector_id = ?", workspaceID, tenantConnectorID).
-			Pluck("native_id", &ids).Error; err != nil {
-			return 0, err
-		}
-		for _, id := range ids {
-			present[id] = true
-		}
-	}
-
-	repo := repositories.NewDiscoveryRepository(s.db)
-	now := time.Now()
+	// One transaction under row-level security for the workspace: the agents
+	// to close are read and closed together, all or (on an error) none.
 	n := 0
-	for _, a := range stale {
-		var meta struct {
-			EvidenceSource string `json:"evidence_source"`
-			PackageID      string `json:"package_id"`
-			ObjectID       string `json:"object_id"`
-			SubscriptionID string `json:"subscription_id"`
+	err := tenancy.InWorkspace(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+		n = 0
+		var stale []models.DiscoveredAgent
+		if err := tx.Where("workspace_id = ? AND source = ? AND lower(metadata->>'tenant_id') = lower(?)",
+			workspaceID, models.DiscoverySourceAzure, tenantID).
+			Where("runtime_status <> ?", models.RuntimeStatusGone).
+			Where("last_seen_at < ?", cutoff).
+			Find(&stale).Error; err != nil {
+			return err
 		}
-		_ = json.Unmarshal(a.Metadata, &meta)
+		if len(stale) == 0 {
+			return nil
+		}
 
-		status, reason := "", ""
-		switch {
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceAgentID:
-			if agentIDRead {
-				status, reason = models.RuntimeStatusGone, "no longer listed by Microsoft Entra Agent ID"
+		// The identities the tenant pass stored, by object id: an inferred agent
+		// whose identity is here still exists.
+		present := map[string]bool{}
+		if principalsRead {
+			var ids []string
+			if err := tx.Model(&models.CloudIdentity{}).
+				Where("workspace_id = ? AND connector_id = ?", workspaceID, tenantConnectorID).
+				Pluck("native_id", &ids).Error; err != nil {
+				return err
 			}
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceBotService:
-			if botsRead && subs.covers(meta.SubscriptionID) {
-				status, reason = models.RuntimeStatusGone, "the Azure Bot Service bot no longer exists"
-			}
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceLogicApps:
-			if botsRead && subs.covers(meta.SubscriptionID) {
-				status, reason = models.RuntimeStatusGone, "the Logic Apps workflow no longer runs an agent loop, or no longer exists"
-			}
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceFoundryAgent:
-			if foundryAgentsRead && subs.covers(meta.SubscriptionID) {
-				status, reason = models.RuntimeStatusGone, "no longer listed by its Microsoft Foundry project"
-			}
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceTeamsApp:
-			if teamsRead {
-				status, reason = models.RuntimeStatusGone, "no longer in the organization's Teams app catalog"
-			}
-		case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceFoundryApp:
-			if foundryRead && subs.covers(meta.SubscriptionID) {
-				status, reason = models.RuntimeStatusGone, "no longer published as a Microsoft Foundry agent application"
-			}
-		case a.EvidenceMode == models.EvidenceDeclared && (meta.EvidenceSource == azureEvidenceRegistry || meta.PackageID != ""):
-			if registryRead {
-				status, reason = models.RuntimeStatusGone, "no longer listed in the Microsoft 365 agent registry"
-			}
-		case a.EvidenceMode == models.EvidenceInferred:
-			if !principalsRead {
-				break
-			}
-			if meta.ObjectID != "" && !present[meta.ObjectID] {
-				status, reason = models.RuntimeStatusGone, "its identity is no longer in the Microsoft Entra ID tenant"
-			} else if a.RuntimeStatus != models.RuntimeStatusUnknown {
-				status, reason = models.RuntimeStatusUnknown, "no longer meets the agent inference rule"
+			for _, id := range ids {
+				present[id] = true
 			}
 		}
-		if status == "" {
-			continue
+
+		repo := repositories.NewDiscoveryRepository(tx)
+		now := time.Now()
+		for _, a := range stale {
+			var meta struct {
+				EvidenceSource string `json:"evidence_source"`
+				PackageID      string `json:"package_id"`
+				ObjectID       string `json:"object_id"`
+				SubscriptionID string `json:"subscription_id"`
+			}
+			_ = json.Unmarshal(a.Metadata, &meta)
+
+			status, reason := "", ""
+			switch {
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceAgentID:
+				if agentIDRead {
+					status, reason = models.RuntimeStatusGone, "no longer listed by Microsoft Entra Agent ID"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceBotService:
+				if botsRead && subs.covers(meta.SubscriptionID) {
+					status, reason = models.RuntimeStatusGone, "the Azure Bot Service bot no longer exists"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceLogicApps:
+				if botsRead && subs.covers(meta.SubscriptionID) {
+					status, reason = models.RuntimeStatusGone, "the Logic Apps workflow no longer runs an agent loop, or no longer exists"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceFoundryAgent:
+				if foundryAgentsRead && subs.covers(meta.SubscriptionID) {
+					status, reason = models.RuntimeStatusGone, "no longer listed by its Microsoft Foundry project"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceTeamsApp:
+				if teamsRead {
+					status, reason = models.RuntimeStatusGone, "no longer in the organization's Teams app catalog"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && meta.EvidenceSource == azureEvidenceFoundryApp:
+				if foundryRead && subs.covers(meta.SubscriptionID) {
+					status, reason = models.RuntimeStatusGone, "no longer published as a Microsoft Foundry agent application"
+				}
+			case a.EvidenceMode == models.EvidenceDeclared && (meta.EvidenceSource == azureEvidenceRegistry || meta.PackageID != ""):
+				if registryRead {
+					status, reason = models.RuntimeStatusGone, "no longer listed in the Microsoft 365 agent registry"
+				}
+			case a.EvidenceMode == models.EvidenceInferred:
+				if !principalsRead {
+					break
+				}
+				if meta.ObjectID != "" && !present[meta.ObjectID] {
+					status, reason = models.RuntimeStatusGone, "its identity is no longer in the Microsoft Entra ID tenant"
+				} else if a.RuntimeStatus != models.RuntimeStatusUnknown {
+					status, reason = models.RuntimeStatusUnknown, "no longer meets the agent inference rule"
+				}
+			}
+			if status == "" {
+				continue
+			}
+			event := models.AgentEventAbsent
+			if _, err := repo.ApplyLifecycleEvent(&models.DiscoveredAgentEvent{
+				WorkspaceID:   workspaceID,
+				Source:        models.DiscoverySourceAzure,
+				Fingerprint:   a.Fingerprint,
+				Event:         event,
+				RuntimeStatus: status,
+				Reason:        reason,
+				// No actor: a pass can show an agent is missing, never who removed it.
+				Channel:    "azure_tenant_pass",
+				ObservedAt: now,
+			}); err != nil {
+				return err
+			}
+			n++
 		}
-		event := models.AgentEventAbsent
-		if _, err := repo.ApplyLifecycleEvent(&models.DiscoveredAgentEvent{
-			WorkspaceID:   workspaceID,
-			Source:        models.DiscoverySourceAzure,
-			Fingerprint:   a.Fingerprint,
-			Event:         event,
-			RuntimeStatus: status,
-			Reason:        reason,
-			// No actor: a pass can show an agent is missing, never who removed it.
-			Channel:    "azure_tenant_pass",
-			ObservedAt: now,
-		}); err != nil {
-			return n, err
-		}
-		n++
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return n, nil
 }

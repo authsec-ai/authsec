@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -11,7 +12,17 @@ import (
 
 /* cloud_azure_graph_repository.go reads the Azure slice of the shared IGA
    graph (provider 'azure', written by internal/azuregraph). Read-only: the
-   projector is the only writer. */
+   projector is the only writer.
+
+   Each read runs in one read-only transaction under row-level security for
+   the workspace (inWorkspaceRead, AS-108). The workspace_id filters stay as
+   defence in depth, and every join also matches the workspace. */
+
+// inWorkspaceRead runs fn in one read-only transaction under row-level
+// security for ws on db (a savepoint when db is a caller's transaction).
+func inWorkspaceRead(db *gorm.DB, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(wsTxContext(db), db, ws, wsTxGuard(db, ws, fn))
+}
 
 // AzureGraphCount is how many graph rows of one kind are in one state.
 type AzureGraphCount struct {
@@ -76,23 +87,28 @@ type AzureEvidence struct {
 
 // AzureEvidenceFor returns the evidence behind one Entra object and every
 // grant it holds, most recently confirmed first.
+//
+// A grant's observation is found through cloud_permission (read-only, in
+// ALLOWED_SHARED), so the lookup keeps idx_cloud_observation_permission.
 func AzureEvidenceFor(db *gorm.DB, workspaceID uuid.UUID, objectID string, limit int) ([]AzureEvidence, error) {
 	var out []AzureEvidence
-	err := db.Raw(`
-		SELECT o.id, CASE WHEN o.identity_id IS NOT NULL THEN 'identity' ELSE 'grant' END AS subject,
-		       o.subject_native_id, o.source_api, o.surface, o.surface_state, o.scan_run_id,
-		       o.observed_at, o.last_confirmed_at, o.confirmation_count, o.sanitized_facts AS facts
-		  FROM cloud_observation o
-		 WHERE o.workspace_id = ?
-		   AND o.connector_id IN (SELECT id FROM cloud_connector WHERE workspace_id = ? AND provider = ?)
-		   AND (o.identity_id IN (SELECT id FROM cloud_identity WHERE workspace_id = ? AND native_id = lower(?))
-		        OR o.permission_id IN (SELECT p.id FROM cloud_permission p
-		                                 JOIN cloud_identity i ON i.id = p.identity_id
-		                                WHERE p.workspace_id = ? AND i.native_id = lower(?)))
-		 ORDER BY o.identity_id IS NULL, o.last_confirmed_at DESC NULLS LAST, o.id
-		 LIMIT ?`,
-		workspaceID, workspaceID, models.CloudProviderAzure, workspaceID, objectID, workspaceID, objectID,
-		clampLimit(limit)).Scan(&out).Error
+	err := inWorkspaceRead(db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`
+			SELECT o.id, CASE WHEN o.identity_id IS NOT NULL THEN 'identity' ELSE 'grant' END AS subject,
+			       o.subject_native_id, o.source_api, o.surface, o.surface_state, o.scan_run_id,
+			       o.observed_at, o.last_confirmed_at, o.confirmation_count, o.sanitized_facts AS facts
+			  FROM cloud_observation o
+			 WHERE o.workspace_id = ?
+			   AND o.connector_id IN (SELECT id FROM cloud_connector WHERE workspace_id = ? AND provider = ?)
+			   AND (o.identity_id IN (SELECT id FROM cloud_identity WHERE workspace_id = ? AND native_id = lower(?))
+			        OR o.permission_id IN (SELECT p.id FROM cloud_permission p
+			                                 JOIN cloud_identity i ON i.workspace_id = p.workspace_id AND i.id = p.identity_id
+			                                WHERE p.workspace_id = ? AND i.native_id = lower(?)))
+			 ORDER BY o.identity_id IS NULL, o.last_confirmed_at DESC NULLS LAST, o.id
+			 LIMIT ?`,
+			workspaceID, workspaceID, models.CloudProviderAzure, workspaceID, objectID, workspaceID, objectID,
+			clampLimit(limit)).Scan(&out).Error
+	})
 	return out, err
 }
 
@@ -103,7 +119,8 @@ const azureReachDepth = 6
 // AzureGraphSummary counts the workspace's Azure graph rows by kind and state.
 func AzureGraphSummary(db *gorm.DB, workspaceID uuid.UUID) ([]AzureGraphCount, error) {
 	var out []AzureGraphCount
-	err := db.Raw(`
+	err := inWorkspaceRead(db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Raw(`
 		SELECT 'identity' AS "table", account_kind AS kind, lifecycle AS state, count(*) AS count
 		  FROM iga_identity_accounts WHERE workspace_id = ? AND provider = ? GROUP BY 2, 3
 		UNION ALL
@@ -125,10 +142,11 @@ func AzureGraphSummary(db *gorm.DB, workspaceID uuid.UUID) ([]AzureGraphCount, e
 		SELECT 'relationship', relationship_type, state, count(*)
 		  FROM iga_relationship WHERE workspace_id = ? AND source_key LIKE ? GROUP BY 2, 3
 		ORDER BY 1, 2, 3`,
-		workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
-		workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
-		workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
-		workspaceID, models.ProviderAzure+"\x1f%").Scan(&out).Error
+			workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
+			workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
+			workspaceID, models.ProviderAzure, workspaceID, models.ProviderAzure,
+			workspaceID, models.ProviderAzure+"\x1f%").Scan(&out).Error
+	})
 	return out, err
 }
 
@@ -138,8 +156,22 @@ func AzureGraphSummary(db *gorm.DB, workspaceID uuid.UUID) ([]AzureGraphCount, e
 // to a group is reached through membership rather than copied onto the member
 // (§2.6), so this walk is where it is attributed.
 func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*AzureBlastRadius, error) {
+	var out *AzureBlastRadius
+	err := inWorkspaceRead(db, workspaceID, func(tx *gorm.DB) error {
+		var err error
+		out, err = azureBlastRadius(tx, workspaceID, objectID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// azureBlastRadius is AzureBlastRadiusOf on tx, its workspace transaction.
+func azureBlastRadius(tx *gorm.DB, workspaceID uuid.UUID, objectID string) (*AzureBlastRadius, error) {
 	var reach []AzureReach
-	err := db.Raw(`
+	err := tx.Raw(`
 		WITH RECURSIVE reach(identity_id, via, depth) AS (
 		    SELECT id, 'self'::text, 0
 		      FROM iga_identity_accounts
@@ -154,9 +186,9 @@ func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*A
 		       AND reach.depth < ?
 		)
 		SELECT DISTINCT ON (i.id) i.id AS identity_id, i.display_name, i.account_kind, reach.via, reach.depth
-		  FROM reach JOIN iga_identity_accounts i ON i.id = reach.identity_id
+		  FROM reach JOIN iga_identity_accounts i ON i.id = reach.identity_id AND i.workspace_id = ?
 		 ORDER BY i.id, reach.depth`,
-		workspaceID, models.ProviderAzure, objectID, workspaceID, azureReachDepth).Scan(&reach).Error
+		workspaceID, models.ProviderAzure, objectID, workspaceID, azureReachDepth, workspaceID).Scan(&reach).Error
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +210,7 @@ func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*A
 	}
 
 	var grants []AzureReachGrant
-	err = db.Raw(`
+	err = tx.Raw(`
 		SELECT e.id AS edge_id, e.subject_identity_account_id AS holder_id, i.display_name AS holder_name,
 		       e.path_kind, e.native_scope, e.state, e.calculation_state, e.effective_conclusion,
 		       COALESCE(en.native_grant_kind, '') AS entitlement_kind,
@@ -187,9 +219,9 @@ func AzureBlastRadiusOf(db *gorm.DB, workspaceID uuid.UUID, objectID string) (*A
 		       COALESCE(NULLIF(en.normalized_rights->>'sensitivity', ''), r.provider_attrs->>'sensitivity', 'low') AS sensitivity,
 		       e.last_confirmed_at
 		  FROM iga_access_edges e
-		  JOIN iga_identity_accounts i ON i.id = e.subject_identity_account_id
-		  LEFT JOIN iga_entitlements en ON en.id = e.entitlement_id
-		  LEFT JOIN iga_resources r ON r.id = e.resource_id
+		  JOIN iga_identity_accounts i ON i.id = e.subject_identity_account_id AND i.workspace_id = e.workspace_id
+		  LEFT JOIN iga_entitlements en ON en.id = e.entitlement_id AND en.workspace_id = e.workspace_id
+		  LEFT JOIN iga_resources r ON r.id = e.resource_id AND r.workspace_id = e.workspace_id
 		 WHERE e.workspace_id = ? AND e.provider = ? AND e.state <> 'ended'
 		   AND e.subject_identity_account_id IN ?
 		 ORDER BY CASE COALESCE(NULLIF(en.normalized_rights->>'sensitivity', ''), r.provider_attrs->>'sensitivity', 'low')

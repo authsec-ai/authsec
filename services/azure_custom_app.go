@@ -10,9 +10,11 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/azure"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 /* azure_custom_app.go is what the "your own app" onboarding (ConnectCustom)
@@ -158,12 +160,14 @@ func (s *AzureOnboardingService) retargetTenantSubscriptions(workspaceID uuid.UU
 		}
 		reason := "the tenant now connects with " + mode + ", which cannot read this subscription yet: " +
 			"assign it the Reader role here, then verify the subscription or connect the tenant again"
-		if err := s.db.Model(&models.CloudConnector{}).
-			Where("workspace_id = ? AND id = ?", workspaceID, c.ID).
-			Updates(map[string]interface{}{
-				"auth_ref": authRef, "status": models.CloudConnectorError,
-				"last_error": reason, "last_error_code": ConnErrAuthRefused,
-			}).Error; err != nil {
+		if err := tenancy.InWorkspace(context.Background(), s.db, workspaceID, func(tx *gorm.DB) error {
+			return tx.Model(&models.CloudConnector{}).
+				Where("workspace_id = ? AND id = ?", workspaceID, c.ID).
+				Updates(map[string]interface{}{
+					"auth_ref": authRef, "status": models.CloudConnectorError,
+					"last_error": reason, "last_error_code": ConnErrAuthRefused,
+				}).Error
+		}); err != nil {
 			log.Printf("[azure] could not move subscription %s to the new credentials: %v", c.ScopeID, err)
 			continue
 		}

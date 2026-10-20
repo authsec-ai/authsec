@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -28,7 +29,15 @@ import (
    WHY EVERY STATEMENT CARRIES provider = 'azure'. The same structural guard
    the GCP repository uses: nothing here can bump the generation of, write
    coverage onto, or delete the resources of an AWS or GCP connector, even
-   given the wrong id. */
+   given the wrong id.
+
+   WHY EVERY METHOD RUNS IN ONE WORKSPACE TRANSACTION. Each method's
+   statements run on the tx of one read or write call: a transaction under
+   row-level security for the method's workspace (AS-108), so a missing
+   workspace_id filter could not reach another workspace's rows. The explicit
+   filters stay as defence in depth. The exceptions, each marked TENANT-EXEMPT,
+   are the scheduler's scan across workspaces (DueTenants) and a run's lease
+   renewal and release (RenewRun, FinishRun), which name a run by id alone. */
 
 // CloudAzureRepository is the inventory lifecycle of an Azure connector row.
 type CloudAzureRepository interface {
@@ -309,22 +318,41 @@ func NewCloudAzureRepository(db *gorm.DB) CloudAzureRepository {
 	return &cloudAzureRepository{db: db}
 }
 
+// read runs fn in one read-only transaction under row-level security for ws,
+// on the repository's handle (a savepoint when the handle is a caller's
+// transaction): every statement sees only ws's rows (AS-108).
+func (r *cloudAzureRepository) read(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
+// write is read for a method that writes: one read-write transaction under
+// row-level security for ws.
+func (r *cloudAzureRepository) write(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(wsTxContext(r.db), r.db, ws, wsTxGuard(r.db, ws, fn))
+}
+
 func (r *cloudAzureRepository) AllocateGeneration(workspaceID, connectorID uuid.UUID) (int, error) {
 	var generation int
-	res := r.db.Raw(`
-		UPDATE cloud_connector
-		   SET scan_generation = scan_generation + 1,
-		       updated_at      = now()
-		 WHERE workspace_id = ?
-		   AND id           = ?
-		   AND provider     = ?
-		RETURNING scan_generation
-	`, workspaceID, connectorID, models.CloudProviderAzure).Scan(&generation)
-	if res.Error != nil {
-		return 0, res.Error
-	}
-	if res.RowsAffected == 0 {
-		return 0, ErrCloudConnectorNotFound
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		res := tx.Raw(`
+			UPDATE cloud_connector
+			   SET scan_generation = scan_generation + 1,
+			       updated_at      = now()
+			 WHERE workspace_id = ?
+			   AND id           = ?
+			   AND provider     = ?
+			RETURNING scan_generation
+		`, workspaceID, connectorID, models.CloudProviderAzure).Scan(&generation)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrCloudConnectorNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return generation, nil
 }
@@ -335,7 +363,7 @@ func (r *cloudAzureRepository) BeginRun(workspaceID, connectorID uuid.UUID, owne
 	}
 	now := time.Now()
 	var run *models.CloudScanRun
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
 		var n int64
 		if err := tx.Model(&models.CloudConnector{}).
 			Where("workspace_id = ? AND id = ? AND provider = ?", workspaceID, connectorID, models.CloudProviderAzure).
@@ -402,6 +430,7 @@ func (r *cloudAzureRepository) BeginRun(workspaceID, connectorID uuid.UUID, owne
 }
 
 func (r *cloudAzureRepository) RenewRun(runID uuid.UUID, owner string, lease time.Duration) error {
+	// TENANT-EXEMPT: fenced by the run id and the lease owner that BeginRun wrote in the run's workspace; the run carries no workspace in this signature.
 	res := r.db.Model(&models.CloudScanRun{}).
 		Where("id = ? AND lease_owner = ? AND status = ?", runID, owner, models.CloudScanRunRunning).
 		Updates(map[string]interface{}{"lease_expires_at": time.Now().Add(lease), "updated_at": time.Now()})
@@ -435,6 +464,7 @@ func (r *cloudAzureRepository) FinishRun(runID uuid.UUID, owner string, coverage
 		updates["status"] = models.CloudScanRunPublished
 		updates["published_at"] = now
 	}
+	// TENANT-EXEMPT: fenced by the run id and the lease owner that BeginRun wrote in the run's workspace; the run carries no workspace in this signature.
 	res := r.db.Model(&models.CloudScanRun{}).
 		Where("id = ? AND lease_owner = ? AND status = ?", runID, owner, models.CloudScanRunRunning).
 		Updates(updates)
@@ -449,6 +479,7 @@ func (r *cloudAzureRepository) FinishRun(runID uuid.UUID, owner string, coverage
 
 func (r *cloudAzureRepository) DueTenants(finishedBefore, runningStartedBefore time.Time) ([]models.CloudConnector, error) {
 	var out []models.CloudConnector
+	// TENANT-EXEMPT: the scheduler's scan of due Azure tenants across workspaces; every pass it starts is then run for the connector's own workspace.
 	err := r.db.Where(`provider = ? AND scope_kind = ? AND status = ?
 		AND (
 		      (COALESCE(coverage->>'status', '') <> ?
@@ -476,20 +507,22 @@ func (r *cloudAzureRepository) WriteCoverage(workspaceID, connectorID uuid.UUID,
 	if len(coverage) == 0 {
 		return errors.New("cloud azure scan: refusing to write an empty coverage blob")
 	}
-	res := r.db.Model(&models.CloudConnector{}).
-		Where("workspace_id = ? AND id = ? AND provider = ? AND scan_generation = ?",
-			workspaceID, connectorID, models.CloudProviderAzure, generation).
-		Updates(map[string]interface{}{
-			"coverage":   coverage,
-			"updated_at": time.Now(),
-		})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrScanSuperseded
-	}
-	return nil
+	return r.write(workspaceID, func(tx *gorm.DB) error {
+		res := tx.Model(&models.CloudConnector{}).
+			Where("workspace_id = ? AND id = ? AND provider = ? AND scan_generation = ?",
+				workspaceID, connectorID, models.CloudProviderAzure, generation).
+			Updates(map[string]interface{}{
+				"coverage":   coverage,
+				"updated_at": time.Now(),
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrScanSuperseded
+		}
+		return nil
+	})
 }
 
 // azureUpsertBatch keeps one INSERT's bind parameters well under Postgres'
@@ -500,9 +533,6 @@ func (r *cloudAzureRepository) UpsertResources(workspaceID, connectorID uuid.UUI
 	rows = dedupeLast(rows, func(res models.CloudResource) string { return res.NativeID })
 	if len(rows) == 0 {
 		return 0, nil
-	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
 	}
 	now := time.Now()
 	for i := range rows {
@@ -516,7 +546,10 @@ func (r *cloudAzureRepository) UpsertResources(workspaceID, connectorID uuid.UUI
 		rows[i].LastSeenAt = now
 		rows[i].RowUpdatedAt = now
 	}
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
 		return tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
 			// first_seen_at is kept: a resource's first sighting is evidence.
@@ -546,27 +579,28 @@ func (r *cloudAzureRepository) UpsertResources(workspaceID, connectorID uuid.UUI
 }
 
 func (r *cloudAzureRepository) ListResources(workspaceID uuid.UUID, f AzureListFilter) ([]models.CloudResource, int64, error) {
-	azureConnectors := r.db.Model(&models.CloudConnector{}).Select("id").
-		Where("workspace_id = ? AND provider = ?", workspaceID, models.CloudProviderAzure)
-	q := r.db.Model(&models.CloudResource{}).
-		Where("workspace_id = ? AND connector_id IN (?)", workspaceID, azureConnectors)
-	if f.ConnectorID != nil {
-		q = q.Where("connector_id = ?", *f.ConnectorID)
-	}
-	if f.Kind != "" {
-		q = q.Where("kind = ?", strings.ToLower(f.Kind))
-	}
-	if f.Search != "" {
-		like := "%" + f.Search + "%"
-		q = q.Where("(name ILIKE ? OR native_id ILIKE ?)", like, like)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []models.CloudResource
-	if err := q.Order("CASE sensitivity WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, kind, name, id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Model(&models.CloudResource{}).
+			Where("workspace_id = ? AND connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.ConnectorID != nil {
+			q = q.Where("connector_id = ?", *f.ConnectorID)
+		}
+		if f.Kind != "" {
+			q = q.Where("kind = ?", strings.ToLower(f.Kind))
+		}
+		if f.Search != "" {
+			like := "%" + f.Search + "%"
+			q = q.Where("(name ILIKE ? OR native_id ILIKE ?)", like, like)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Order("CASE sensitivity WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, kind, name, id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error
+	})
+	if err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
@@ -575,8 +609,9 @@ func (r *cloudAzureRepository) ListResources(workspaceID uuid.UUID, f AzureListF
 /* ------------------------------ identity discovery ------------------------------ */
 
 // azureConnectorIDs is the subquery every Azure read and delete is bounded by.
-func (r *cloudAzureRepository) azureConnectorIDs(workspaceID uuid.UUID) *gorm.DB {
-	return r.db.Model(&models.CloudConnector{}).Select("id").
+// It is built on the caller's workspace transaction, so it runs inside it.
+func azureConnectorIDs(tx *gorm.DB, workspaceID uuid.UUID) *gorm.DB {
+	return tx.Model(&models.CloudConnector{}).Select("id").
 		Where("workspace_id = ? AND provider = ?", workspaceID, models.CloudProviderAzure)
 }
 
@@ -603,9 +638,6 @@ func (r *cloudAzureRepository) UpsertIdentities(workspaceID, connectorID uuid.UU
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
-	}
 	now := time.Now()
 	for i := range rows {
 		rows[i].WorkspaceID = workspaceID
@@ -619,24 +651,29 @@ func (r *cloudAzureRepository) UpsertIdentities(workspaceID, connectorID uuid.UU
 		}
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-		// first_seen_at is kept: when AuthSec first saw a principal is evidence.
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id": gorm.Expr("EXCLUDED.connector_id"),
-			"kind":         gorm.Expr("EXCLUDED.kind"),
-			"name":         gorm.Expr("EXCLUDED.name"),
-			"created_at":   gorm.Expr("EXCLUDED.created_at"),
-			"enabled":      gorm.Expr("EXCLUDED.enabled"),
-			"attrs":        gorm.Expr("EXCLUDED.attrs"),
-			// nil is UNKNOWN (sign-in activity not read this pass), never
-			// "unused": keep what an earlier pass learned.
-			"last_used_at":         gorm.Expr("COALESCE(EXCLUDED.last_used_at, cloud_identity.last_used_at)"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+			// first_seen_at is kept: when AuthSec first saw a principal is evidence.
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id": gorm.Expr("EXCLUDED.connector_id"),
+				"kind":         gorm.Expr("EXCLUDED.kind"),
+				"name":         gorm.Expr("EXCLUDED.name"),
+				"created_at":   gorm.Expr("EXCLUDED.created_at"),
+				"enabled":      gorm.Expr("EXCLUDED.enabled"),
+				"attrs":        gorm.Expr("EXCLUDED.attrs"),
+				// nil is UNKNOWN (sign-in activity not read this pass), never
+				// "unused": keep what an earlier pass learned.
+				"last_used_at":         gorm.Expr("COALESCE(EXCLUDED.last_used_at, cloud_identity.last_used_at)"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -648,9 +685,6 @@ func (r *cloudAzureRepository) UpsertSecrets(workspaceID, connectorID uuid.UUID,
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
-	}
 	now := time.Now()
 	for i := range rows {
 		rows[i].WorkspaceID = workspaceID
@@ -664,22 +698,27 @@ func (r *cloudAzureRepository) UpsertSecrets(workspaceID, connectorID uuid.UUID,
 		}
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
-			"identity_id":          gorm.Expr("EXCLUDED.identity_id"),
-			"kind":                 gorm.Expr("EXCLUDED.kind"),
-			"created_at":           gorm.Expr("EXCLUDED.created_at"),
-			"expires_at":           gorm.Expr("EXCLUDED.expires_at"),
-			"status":               gorm.Expr("EXCLUDED.status"),
-			"attrs":                gorm.Expr("EXCLUDED.attrs"),
-			"last_used_at":         gorm.Expr("COALESCE(EXCLUDED.last_used_at, cloud_secret.last_used_at)"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
+				"identity_id":          gorm.Expr("EXCLUDED.identity_id"),
+				"kind":                 gorm.Expr("EXCLUDED.kind"),
+				"created_at":           gorm.Expr("EXCLUDED.created_at"),
+				"expires_at":           gorm.Expr("EXCLUDED.expires_at"),
+				"status":               gorm.Expr("EXCLUDED.status"),
+				"attrs":                gorm.Expr("EXCLUDED.attrs"),
+				"last_used_at":         gorm.Expr("COALESCE(EXCLUDED.last_used_at, cloud_secret.last_used_at)"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -697,9 +736,6 @@ func (r *cloudAzureRepository) UpsertPermissions(workspaceID, connectorID uuid.U
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
-	}
 	now := time.Now()
 	for i := range rows {
 		rows[i].WorkspaceID = workspaceID
@@ -710,26 +746,31 @@ func (r *cloudAzureRepository) UpsertPermissions(workspaceID, connectorID uuid.U
 		}
 		rows[i].FirstSeenAt, rows[i].LastSeenAt, rows[i].RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		// uq_cloud_permission_grant, NULLS NOT DISTINCT: a subscription-wide
-		// grant (resource_id NULL) still conflicts with itself.
-		Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
-			"plane":                gorm.Expr("EXCLUDED.plane"),
-			"effect":               gorm.Expr("EXCLUDED.effect"),
-			"role_name":            gorm.Expr("EXCLUDED.role_name"),
-			"actions":              gorm.Expr("EXCLUDED.actions"),
-			"not_actions":          gorm.Expr("EXCLUDED.not_actions"),
-			"condition":            gorm.Expr("EXCLUDED.condition"),
-			"constraint_state":     gorm.Expr("EXCLUDED.constraint_state"),
-			"scope_kind":           gorm.Expr("EXCLUDED.scope_kind"),
-			"sensitivity":          gorm.Expr("EXCLUDED.sensitivity"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			// uq_cloud_permission_grant, NULLS NOT DISTINCT: a subscription-wide
+			// grant (resource_id NULL) still conflicts with itself.
+			Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
+				"plane":                gorm.Expr("EXCLUDED.plane"),
+				"effect":               gorm.Expr("EXCLUDED.effect"),
+				"role_name":            gorm.Expr("EXCLUDED.role_name"),
+				"actions":              gorm.Expr("EXCLUDED.actions"),
+				"not_actions":          gorm.Expr("EXCLUDED.not_actions"),
+				"condition":            gorm.Expr("EXCLUDED.condition"),
+				"constraint_state":     gorm.Expr("EXCLUDED.constraint_state"),
+				"scope_kind":           gorm.Expr("EXCLUDED.scope_kind"),
+				"sensitivity":          gorm.Expr("EXCLUDED.sensitivity"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -749,34 +790,37 @@ func (r *cloudAzureRepository) ResourceIDs(workspaceID uuid.UUID, nativeIDs []st
 
 func (r *cloudAzureRepository) lookupIDs(model interface{}, workspaceID uuid.UUID, nativeIDs []string) (map[string]uuid.UUID, error) {
 	out := make(map[string]uuid.UUID, len(nativeIDs))
-	for start := 0; start < len(nativeIDs); start += azureLookupChunk {
-		end := start + azureLookupChunk
-		if end > len(nativeIDs) {
-			end = len(nativeIDs)
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		for start := 0; start < len(nativeIDs); start += azureLookupChunk {
+			end := start + azureLookupChunk
+			if end > len(nativeIDs) {
+				end = len(nativeIDs)
+			}
+			var rows []struct {
+				ID       uuid.UUID
+				NativeID string
+			}
+			err := tx.Model(model).Select("id, native_id").
+				Where("workspace_id = ? AND native_id IN ? AND connector_id IN (?)",
+					workspaceID, nativeIDs[start:end], azureConnectorIDs(tx, workspaceID)).
+				Scan(&rows).Error
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				out[row.NativeID] = row.ID
+			}
 		}
-		var rows []struct {
-			ID       uuid.UUID
-			NativeID string
-		}
-		err := r.db.Model(model).Select("id, native_id").
-			Where("workspace_id = ? AND native_id IN ? AND connector_id IN (?)",
-				workspaceID, nativeIDs[start:end], r.azureConnectorIDs(workspaceID)).
-			Scan(&rows).Error
-		if err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			out[row.NativeID] = row.ID
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 func (r *cloudAzureRepository) Reconcile(workspaceID, connectorID uuid.UUID, generation int, parts AzureReconcileParts) (AzureReconcileCounts, error) {
 	var counts AzureReconcileCounts
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return counts, err
-	}
 	// Children before parents, so each count is the table's own stale rows,
 	// not rows a cascade took along. An identity that left the directory still
 	// takes with it what other connectors recorded for it (Azure RBAC grants,
@@ -797,7 +841,10 @@ func (r *cloudAzureRepository) Reconcile(workspaceID, connectorID uuid.UUID, gen
 		{parts.Resources, &models.CloudResource{}, &counts.Resources, ""},
 		{parts.Identities, &models.CloudIdentity{}, &counts.Identities, ""},
 	}
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
 		for _, st := range steps {
 			if !st.on {
 				continue
@@ -837,9 +884,6 @@ func (r *cloudAzureRepository) UpsertAssumeEdges(workspaceID, connectorID uuid.U
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
-	}
 	now := time.Now()
 	for i := range rows {
 		e := &rows[i]
@@ -852,19 +896,24 @@ func (r *cloudAzureRepository) UpsertAssumeEdges(workspaceID, connectorID uuid.U
 		}
 		e.FirstSeenAt, e.LastSeenAt, e.RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
-			"issuer":               gorm.Expr("EXCLUDED.issuer"),
-			"mechanism":            gorm.Expr("EXCLUDED.mechanism"),
-			"k8s_ref":              gorm.Expr("EXCLUDED.k8s_ref"),
-			"attrs":                gorm.Expr("EXCLUDED.attrs"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
+				"issuer":               gorm.Expr("EXCLUDED.issuer"),
+				"mechanism":            gorm.Expr("EXCLUDED.mechanism"),
+				"k8s_ref":              gorm.Expr("EXCLUDED.k8s_ref"),
+				"attrs":                gorm.Expr("EXCLUDED.attrs"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -875,9 +924,6 @@ func (r *cloudAzureRepository) UpsertWorkloads(workspaceID, connectorID uuid.UUI
 	rows = dedupeLast(rows, func(w models.CloudWorkload) string { return w.NativeID })
 	if len(rows) == 0 {
 		return 0, nil
-	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
 	}
 	now := time.Now()
 	for i := range rows {
@@ -891,20 +937,25 @@ func (r *cloudAzureRepository) UpsertWorkloads(workspaceID, connectorID uuid.UUI
 		}
 		w.FirstSeenAt, w.LastSeenAt, w.RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
-			"identity_id":          gorm.Expr("EXCLUDED.identity_id"),
-			"runtime_kind":         gorm.Expr("EXCLUDED.runtime_kind"),
-			"name":                 gorm.Expr("EXCLUDED.name"),
-			"region":               gorm.Expr("EXCLUDED.region"),
-			"attrs":                gorm.Expr("EXCLUDED.attrs"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
+				"identity_id":          gorm.Expr("EXCLUDED.identity_id"),
+				"runtime_kind":         gorm.Expr("EXCLUDED.runtime_kind"),
+				"name":                 gorm.Expr("EXCLUDED.name"),
+				"region":               gorm.Expr("EXCLUDED.region"),
+				"attrs":                gorm.Expr("EXCLUDED.attrs"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -918,9 +969,6 @@ func (r *cloudAzureRepository) UpsertUsage(workspaceID, connectorID uuid.UUID, g
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := r.assertAzure(workspaceID, connectorID); err != nil {
-		return 0, err
-	}
 	now := time.Now()
 	for i := range rows {
 		u := &rows[i]
@@ -933,20 +981,25 @@ func (r *cloudAzureRepository) UpsertUsage(workspaceID, connectorID uuid.UUID, g
 		}
 		u.FirstSeenAt, u.LastSeenAt, u.RowUpdatedAt = now, now, now
 	}
-	err := r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "identity_id"}, {Name: "service"}, {Name: "source"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"connector_id": gorm.Expr("EXCLUDED.connector_id"),
-			// The sign-in window slides: the most recent use AuthSec has seen
-			// stands until a newer one replaces it.
-			"last_used_at":         gorm.Expr("GREATEST(EXCLUDED.last_used_at, cloud_usage.last_used_at)"),
-			"generated_at":         gorm.Expr("EXCLUDED.generated_at"),
-			"attrs":                gorm.Expr("EXCLUDED.attrs"),
-			"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
-			"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
-			"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
-		}),
-	}).CreateInBatches(&rows, azureUpsertBatch).Error
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, connectorID); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "identity_id"}, {Name: "service"}, {Name: "source"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"connector_id": gorm.Expr("EXCLUDED.connector_id"),
+				// The sign-in window slides: the most recent use AuthSec has seen
+				// stands until a newer one replaces it.
+				"last_used_at":         gorm.Expr("GREATEST(EXCLUDED.last_used_at, cloud_usage.last_used_at)"),
+				"generated_at":         gorm.Expr("EXCLUDED.generated_at"),
+				"attrs":                gorm.Expr("EXCLUDED.attrs"),
+				"last_seen_generation": gorm.Expr("EXCLUDED.last_seen_generation"),
+				"last_seen_at":         gorm.Expr("EXCLUDED.last_seen_at"),
+				"row_updated_at":       gorm.Expr("EXCLUDED.row_updated_at"),
+			}),
+		}).CreateInBatches(&rows, azureUpsertBatch).Error
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -955,65 +1008,79 @@ func (r *cloudAzureRepository) UpsertUsage(workspaceID, connectorID uuid.UUID, g
 
 func (r *cloudAzureRepository) ManagedIdentityIDs(workspaceID uuid.UUID, resourceIDs []string) (map[string]uuid.UUID, error) {
 	out := make(map[string]uuid.UUID, len(resourceIDs))
-	for start := 0; start < len(resourceIDs); start += azureLookupChunk {
-		end := start + azureLookupChunk
-		if end > len(resourceIDs) {
-			end = len(resourceIDs)
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		for start := 0; start < len(resourceIDs); start += azureLookupChunk {
+			end := start + azureLookupChunk
+			if end > len(resourceIDs) {
+				end = len(resourceIDs)
+			}
+			var rows []struct {
+				ID       uuid.UUID
+				Resource string
+			}
+			err := tx.Model(&models.CloudIdentity{}).
+				Select("id, attrs->>'managed_identity_resource' AS resource").
+				Where("workspace_id = ? AND kind = ? AND attrs->>'managed_identity_resource' IN ? AND connector_id IN (?)",
+					workspaceID, models.CloudIdentityEntraManagedIdentity, resourceIDs[start:end], azureConnectorIDs(tx, workspaceID)).
+				Scan(&rows).Error
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				out[row.Resource] = row.ID
+			}
 		}
-		var rows []struct {
-			ID       uuid.UUID
-			Resource string
-		}
-		err := r.db.Model(&models.CloudIdentity{}).
-			Select("id, attrs->>'managed_identity_resource' AS resource").
-			Where("workspace_id = ? AND kind = ? AND attrs->>'managed_identity_resource' IN ? AND connector_id IN (?)",
-				workspaceID, models.CloudIdentityEntraManagedIdentity, resourceIDs[start:end], r.azureConnectorIDs(workspaceID)).
-			Scan(&rows).Error
-		if err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			out[row.Resource] = row.ID
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 func (r *cloudAzureRepository) ServicePrincipalIDsByAppID(workspaceID uuid.UUID, appIDs []string) (map[string]uuid.UUID, error) {
 	out := make(map[string]uuid.UUID, len(appIDs))
-	for start := 0; start < len(appIDs); start += azureLookupChunk {
-		end := start + azureLookupChunk
-		if end > len(appIDs) {
-			end = len(appIDs)
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		for start := 0; start < len(appIDs); start += azureLookupChunk {
+			end := start + azureLookupChunk
+			if end > len(appIDs) {
+				end = len(appIDs)
+			}
+			var rows []struct {
+				ID    uuid.UUID
+				AppID string
+			}
+			err := tx.Model(&models.CloudIdentity{}).
+				Select("id, lower(attrs->>'app_id') AS app_id").
+				Where("workspace_id = ? AND kind IN ? AND lower(attrs->>'app_id') IN ? AND connector_id IN (?)",
+					workspaceID, []string{models.CloudIdentityEntraServicePrincipal, models.CloudIdentityEntraManagedIdentity},
+					appIDs[start:end], azureConnectorIDs(tx, workspaceID)).
+				Scan(&rows).Error
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				out[row.AppID] = row.ID
+			}
 		}
-		var rows []struct {
-			ID    uuid.UUID
-			AppID string
-		}
-		err := r.db.Model(&models.CloudIdentity{}).
-			Select("id, lower(attrs->>'app_id') AS app_id").
-			Where("workspace_id = ? AND kind IN ? AND lower(attrs->>'app_id') IN ? AND connector_id IN (?)",
-				workspaceID, []string{models.CloudIdentityEntraServicePrincipal, models.CloudIdentityEntraManagedIdentity},
-				appIDs[start:end], r.azureConnectorIDs(workspaceID)).
-			Scan(&rows).Error
-		if err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			out[row.AppID] = row.ID
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 func (r *cloudAzureRepository) RBACGrants(workspaceID, connectorID uuid.UUID) ([]AzureRBACGrant, error) {
 	var out []AzureRBACGrant
-	err := r.db.Table("cloud_permission p").
-		Select("p.id, p.native_id, p.actions, p.not_actions, i.native_id AS subject_native_id").
-		Joins("JOIN cloud_identity i ON i.id = p.identity_id").
-		Where("p.workspace_id = ? AND p.connector_id = ? AND p.plane = ? AND p.native_id NOT LIKE ?",
-			workspaceID, connectorID, models.PermissionPlaneCloud, "%/accesspolicies/%").
-		Scan(&out).Error
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		return tx.Table("cloud_permission p").
+			Select("p.id, p.native_id, p.actions, p.not_actions, i.native_id AS subject_native_id").
+			Joins("JOIN cloud_identity i ON i.id = p.identity_id AND i.workspace_id = p.workspace_id").
+			Where("p.workspace_id = ? AND p.connector_id = ? AND p.plane = ? AND p.native_id NOT LIKE ?",
+				workspaceID, connectorID, models.PermissionPlaneCloud, "%/accesspolicies/%").
+			Scan(&out).Error
+	})
 	return out, err
 }
 
@@ -1021,7 +1088,7 @@ func (r *cloudAzureRepository) SetLastExercised(workspaceID, connectorID uuid.UU
 	if len(at) == 0 {
 		return nil
 	}
-	return r.db.Transaction(func(tx *gorm.DB) error {
+	return r.write(workspaceID, func(tx *gorm.DB) error {
 		for id, t := range at {
 			if err := tx.Exec(`UPDATE cloud_permission
 				   SET last_exercised_at = GREATEST(last_exercised_at, ?), row_updated_at = now()
@@ -1035,24 +1102,29 @@ func (r *cloudAzureRepository) SetLastExercised(workspaceID, connectorID uuid.UU
 }
 
 func (r *cloudAzureRepository) MarkAppPermissionsExercised(workspaceID, tenantConnectorID uuid.UUID) (int64, error) {
-	if err := r.assertAzure(workspaceID, tenantConnectorID); err != nil {
-		return 0, err
-	}
-	// An app role resource's native id is "<api service principal>/approles/<role>";
-	// a sign-in names the API by its appId (resource_app_id on the usage row),
-	// which the API's own service principal carries in attrs.app_id.
-	res := r.db.Exec(`
-		UPDATE cloud_permission p
-		   SET last_exercised_at = GREATEST(p.last_exercised_at, u.last_used_at), row_updated_at = now()
-		  FROM cloud_resource res, cloud_identity api, cloud_usage u
-		 WHERE p.workspace_id = ? AND p.connector_id = ?
-		   AND res.id = p.resource_id AND res.kind = ?
-		   AND api.workspace_id = p.workspace_id AND api.native_id = split_part(res.native_id, '/', 1)
-		   AND u.workspace_id = p.workspace_id AND u.identity_id = p.identity_id AND u.source = ?
-		   AND u.attrs->>'resource_app_id' = api.attrs->>'app_id'
-		   AND u.last_used_at IS NOT NULL`,
-		workspaceID, tenantConnectorID, models.CloudResourceEntraAppRole, models.UsageSourceEntraSignIn)
-	return res.RowsAffected, res.Error
+	var n int64
+	err := r.write(workspaceID, func(tx *gorm.DB) error {
+		if err := assertAzure(tx, workspaceID, tenantConnectorID); err != nil {
+			return err
+		}
+		// An app role resource's native id is "<api service principal>/approles/<role>";
+		// a sign-in names the API by its appId (resource_app_id on the usage row),
+		// which the API's own service principal carries in attrs.app_id.
+		res := tx.Exec(`
+			UPDATE cloud_permission p
+			   SET last_exercised_at = GREATEST(p.last_exercised_at, u.last_used_at), row_updated_at = now()
+			  FROM cloud_resource res, cloud_identity api, cloud_usage u
+			 WHERE p.workspace_id = ? AND p.connector_id = ?
+			   AND res.workspace_id = p.workspace_id AND res.id = p.resource_id AND res.kind = ?
+			   AND api.workspace_id = p.workspace_id AND api.native_id = split_part(res.native_id, '/', 1)
+			   AND u.workspace_id = p.workspace_id AND u.identity_id = p.identity_id AND u.source = ?
+			   AND u.attrs->>'resource_app_id' = api.attrs->>'app_id'
+			   AND u.last_used_at IS NOT NULL`,
+			workspaceID, tenantConnectorID, models.CloudResourceEntraAppRole, models.UsageSourceEntraSignIn)
+		n = res.RowsAffected
+		return res.Error
+	})
+	return n, err
 }
 
 func (r *cloudAzureRepository) MergeAttrs(workspaceID, connectorID uuid.UUID, generation int, patch map[string]interface{}) error {
@@ -1060,84 +1132,91 @@ func (r *cloudAzureRepository) MergeAttrs(workspaceID, connectorID uuid.UUID, ge
 	if err != nil {
 		return err
 	}
-	res := r.db.Exec(`
-		UPDATE cloud_connector
-		   SET attrs      = COALESCE(attrs, '{}'::jsonb) || ?::jsonb,
-		       updated_at = now()
-		 WHERE workspace_id    = ?
-		   AND id              = ?
-		   AND provider        = ?
-		   AND scan_generation = ?
-	`, string(raw), workspaceID, connectorID, models.CloudProviderAzure, generation)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrScanSuperseded
-	}
-	return nil
+	return r.write(workspaceID, func(tx *gorm.DB) error {
+		res := tx.Exec(`
+			UPDATE cloud_connector
+			   SET attrs      = COALESCE(attrs, '{}'::jsonb) || ?::jsonb,
+			       updated_at = now()
+			 WHERE workspace_id    = ?
+			   AND id              = ?
+			   AND provider        = ?
+			   AND scan_generation = ?
+		`, string(raw), workspaceID, connectorID, models.CloudProviderAzure, generation)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrScanSuperseded
+		}
+		return nil
+	})
 }
 
 func (r *cloudAzureRepository) ListIdentities(workspaceID uuid.UUID, f AzureIdentityFilter) ([]models.CloudIdentity, int64, error) {
-	q := r.db.Model(&models.CloudIdentity{}).
-		Where("workspace_id = ? AND connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.ConnectorID != nil {
-		q = q.Where("connector_id = ?", *f.ConnectorID)
-	}
-	if f.Kind != "" {
-		q = q.Where("kind = ?", f.Kind)
-	}
-	if f.AgentType != "" {
-		q = q.Where("attrs->>'agent_type' = ?", f.AgentType)
-	}
-	if f.Search != "" {
-		like := "%" + f.Search + "%"
-		q = q.Where("(name ILIKE ? OR native_id ILIKE ? OR attrs->>'user_principal_name' ILIKE ?)", like, like, like)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []models.CloudIdentity
-	if err := q.Order("kind, name, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Model(&models.CloudIdentity{}).
+			Where("workspace_id = ? AND connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.ConnectorID != nil {
+			q = q.Where("connector_id = ?", *f.ConnectorID)
+		}
+		if f.Kind != "" {
+			q = q.Where("kind = ?", f.Kind)
+		}
+		if f.AgentType != "" {
+			q = q.Where("attrs->>'agent_type' = ?", f.AgentType)
+		}
+		if f.Search != "" {
+			like := "%" + f.Search + "%"
+			q = q.Where("(name ILIKE ? OR native_id ILIKE ? OR attrs->>'user_principal_name' ILIKE ?)", like, like, like)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Order("kind, name, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error
+	})
+	if err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
 }
 
 func (r *cloudAzureRepository) ListGrants(workspaceID uuid.UUID, f AzureGrantFilter) ([]AzureGrant, int64, error) {
-	q := r.db.Table("cloud_permission p").
-		Joins("JOIN cloud_identity i ON i.id = p.identity_id").
-		Joins("LEFT JOIN cloud_resource res ON res.id = p.resource_id").
-		Where("p.workspace_id = ? AND p.connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.ConnectorID != nil {
-		q = q.Where("p.connector_id = ?", *f.ConnectorID)
-	}
-	if f.IdentityID != nil {
-		q = q.Where("p.identity_id = ?", *f.IdentityID)
-	}
-	if f.Plane != "" {
-		q = q.Where("p.plane = ?", f.Plane)
-	}
-	if f.Source != "" {
-		q = q.Where("("+azureGrantSourceSQL+") = ?", f.Source)
-	}
-	if f.ResourceID != nil {
-		q = q.Where("p.resource_id = ?", *f.ResourceID)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []AzureGrant
-	err := q.Select(`p.id, p.connector_id, p.identity_id, i.name AS identity_name, i.kind AS identity_kind,
-			p.resource_id, COALESCE(res.name, '') AS resource_name, COALESCE(res.kind, '') AS resource_kind,
-			` + azureGrantSourceSQL + ` AS source, strpos(p.native_id, '` + models.InheritedGrantMarker + `') > 0 AS inherited,
-			p.condition::text AS condition, p.last_exercised_at,
-			p.plane, COALESCE(p.role_name, '') AS role_name,
-			p.scope_kind, p.constraint_state, p.sensitivity, p.actions, p.not_actions, p.native_id, p.last_seen_at`).
-		Order("CASE p.sensitivity WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, role_name, identity_name, p.id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_permission p").
+			Joins("JOIN cloud_identity i ON i.id = p.identity_id AND i.workspace_id = p.workspace_id").
+			Joins("LEFT JOIN cloud_resource res ON res.id = p.resource_id AND res.workspace_id = p.workspace_id").
+			Where("p.workspace_id = ? AND p.connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.ConnectorID != nil {
+			q = q.Where("p.connector_id = ?", *f.ConnectorID)
+		}
+		if f.IdentityID != nil {
+			q = q.Where("p.identity_id = ?", *f.IdentityID)
+		}
+		if f.Plane != "" {
+			q = q.Where("p.plane = ?", f.Plane)
+		}
+		if f.Source != "" {
+			q = q.Where("("+azureGrantSourceSQL+") = ?", f.Source)
+		}
+		if f.ResourceID != nil {
+			q = q.Where("p.resource_id = ?", *f.ResourceID)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Select(`p.id, p.connector_id, p.identity_id, i.name AS identity_name, i.kind AS identity_kind,
+				p.resource_id, COALESCE(res.name, '') AS resource_name, COALESCE(res.kind, '') AS resource_kind,
+				` + azureGrantSourceSQL + ` AS source, strpos(p.native_id, '` + models.InheritedGrantMarker + `') > 0 AS inherited,
+				p.condition::text AS condition, p.last_exercised_at,
+				p.plane, COALESCE(p.role_name, '') AS role_name,
+				p.scope_kind, p.constraint_state, p.sensitivity, p.actions, p.not_actions, p.native_id, p.last_seen_at`).
+			Order("CASE p.sensitivity WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, role_name, identity_name, p.id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1145,22 +1224,24 @@ func (r *cloudAzureRepository) ListGrants(workspaceID uuid.UUID, f AzureGrantFil
 }
 
 func (r *cloudAzureRepository) ListFederation(workspaceID uuid.UUID, f AzureListFilter) ([]AzureFederationEdge, int64, error) {
-	q := r.db.Table("cloud_assume_edge e").
-		Joins("JOIN cloud_identity i ON i.id = e.identity_id").
-		Where("e.workspace_id = ? AND e.connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.IdentityID != nil {
-		q = q.Where("e.identity_id = ?", *f.IdentityID)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []AzureFederationEdge
-	err := q.Select(`e.*, i.name AS identity_name, i.kind AS identity_kind,
-			CASE WHEN e.subject_kind = 'identity' THEN (SELECT s.name FROM cloud_identity s
-				WHERE s.workspace_id = e.workspace_id AND s.native_id = lower(e.subject) LIMIT 1) END AS subject_name`).
-		Order("e.subject_kind, i.name, e.subject, e.id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_assume_edge e").
+			Joins("JOIN cloud_identity i ON i.id = e.identity_id AND i.workspace_id = e.workspace_id").
+			Where("e.workspace_id = ? AND e.connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.IdentityID != nil {
+			q = q.Where("e.identity_id = ?", *f.IdentityID)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Select(`e.*, i.name AS identity_name, i.kind AS identity_kind,
+				CASE WHEN e.subject_kind = 'identity' THEN (SELECT s.name FROM cloud_identity s
+					WHERE s.workspace_id = e.workspace_id AND s.native_id = lower(e.subject) LIMIT 1) END AS subject_name`).
+			Order("e.subject_kind, i.name, e.subject, e.id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1168,27 +1249,29 @@ func (r *cloudAzureRepository) ListFederation(workspaceID uuid.UUID, f AzureList
 }
 
 func (r *cloudAzureRepository) ListWorkloads(workspaceID uuid.UUID, f AzureListFilter) ([]AzureWorkload, int64, error) {
-	q := r.db.Table("cloud_workload w").
-		Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id").
-		Where("w.workspace_id = ? AND w.connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.IdentityID != nil {
-		q = q.Where("w.identity_id = ?", *f.IdentityID)
-	}
-	if f.Kind != "" {
-		q = q.Where("w.runtime_kind = ?", strings.ToLower(f.Kind))
-	}
-	if f.Search != "" {
-		like := "%" + f.Search + "%"
-		q = q.Where("(w.name ILIKE ? OR w.native_id ILIKE ?)", like, like)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []AzureWorkload
-	err := q.Select("w.*, COALESCE(i.name, '') AS identity_name, COALESCE(i.kind, '') AS identity_kind").
-		Order("w.runtime_kind, w.name, w.id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_workload w").
+			Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id AND i.workspace_id = w.workspace_id").
+			Where("w.workspace_id = ? AND w.connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.IdentityID != nil {
+			q = q.Where("w.identity_id = ?", *f.IdentityID)
+		}
+		if f.Kind != "" {
+			q = q.Where("w.runtime_kind = ?", strings.ToLower(f.Kind))
+		}
+		if f.Search != "" {
+			like := "%" + f.Search + "%"
+			q = q.Where("(w.name ILIKE ? OR w.native_id ILIKE ?)", like, like)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Select("w.*, COALESCE(i.name, '') AS identity_name, COALESCE(i.kind, '') AS identity_kind").
+			Order("w.runtime_kind, w.name, w.id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1196,44 +1279,46 @@ func (r *cloudAzureRepository) ListWorkloads(workspaceID uuid.UUID, f AzureListF
 }
 
 func (r *cloudAzureRepository) ListFoundry(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]AzureWorkload, []AzureFoundryTrust, error) {
-	q := r.db.Table("cloud_workload w").
-		Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id").
-		Where("w.workspace_id = ? AND w.connector_id IN (?) AND w.runtime_kind IN ?",
-			workspaceID, r.azureConnectorIDs(workspaceID), models.AzureFoundryRuntimeKinds)
-	if connectorID != nil {
-		q = q.Where("w.connector_id = ?", *connectorID)
-	}
 	var rows []AzureWorkload
-	if err := q.Select("w.*, COALESCE(i.name, '') AS identity_name, COALESCE(i.kind, '') AS identity_kind").
-		Order("w.runtime_kind, w.name, w.id").Limit(azureFoundryRowCap).Scan(&rows).Error; err != nil {
-		return nil, nil, err
-	}
-	principals := make([]string, 0, len(rows))
-	for _, w := range rows {
-		var attrs struct {
-			PrincipalID string `json:"principal_id"`
-		}
-		if json.Unmarshal(w.Attrs, &attrs) == nil && attrs.PrincipalID != "" {
-			principals = append(principals, strings.ToLower(attrs.PrincipalID))
-		}
-	}
 	var trusts []AzureFoundryTrust
-	if len(principals) == 0 {
-		return rows, trusts, nil
-	}
-	// e1: a federated credential naming the managed identity as its subject.
-	// e2: an agent identity whose tokens that credential's holder obtains.
-	err := r.db.Table("cloud_assume_edge e1").
-		Joins("JOIN cloud_identity h ON h.id = e1.identity_id").
-		Joins("LEFT JOIN cloud_assume_edge e2 ON e2.workspace_id = e1.workspace_id AND e2.mechanism = ? AND lower(e2.subject) = lower(h.native_id)",
-			models.AssumeMechanismAgentBlueprint).
-		Joins("LEFT JOIN cloud_identity a ON a.id = e2.identity_id").
-		Where("e1.workspace_id = ? AND e1.connector_id IN (?) AND e1.subject_kind = ? AND lower(e1.subject) IN ?",
-			workspaceID, r.azureConnectorIDs(workspaceID), models.AssumeSubjectIdentity, principals).
-		Select(`lower(e1.subject) AS principal_id, h.id AS trusted_identity_id, h.name AS trusted_name,
-			h.kind AS trusted_kind, COALESCE(h.attrs->>'agent_type', '') AS trusted_agent_type,
-			a.id AS agent_identity_id, COALESCE(a.name, '') AS agent_name, COALESCE(a.native_id, '') AS agent_object_id`).
-		Order("h.name, a.name").Scan(&trusts).Error
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_workload w").
+			Joins("LEFT JOIN cloud_identity i ON i.id = w.identity_id AND i.workspace_id = w.workspace_id").
+			Where("w.workspace_id = ? AND w.connector_id IN (?) AND w.runtime_kind IN ?",
+				workspaceID, azureConnectorIDs(tx, workspaceID), models.AzureFoundryRuntimeKinds)
+		if connectorID != nil {
+			q = q.Where("w.connector_id = ?", *connectorID)
+		}
+		if err := q.Select("w.*, COALESCE(i.name, '') AS identity_name, COALESCE(i.kind, '') AS identity_kind").
+			Order("w.runtime_kind, w.name, w.id").Limit(azureFoundryRowCap).Scan(&rows).Error; err != nil {
+			return err
+		}
+		principals := make([]string, 0, len(rows))
+		for _, w := range rows {
+			var attrs struct {
+				PrincipalID string `json:"principal_id"`
+			}
+			if json.Unmarshal(w.Attrs, &attrs) == nil && attrs.PrincipalID != "" {
+				principals = append(principals, strings.ToLower(attrs.PrincipalID))
+			}
+		}
+		if len(principals) == 0 {
+			return nil
+		}
+		// e1: a federated credential naming the managed identity as its subject.
+		// e2: an agent identity whose tokens that credential's holder obtains.
+		return tx.Table("cloud_assume_edge e1").
+			Joins("JOIN cloud_identity h ON h.id = e1.identity_id AND h.workspace_id = e1.workspace_id").
+			Joins("LEFT JOIN cloud_assume_edge e2 ON e2.workspace_id = e1.workspace_id AND e2.mechanism = ? AND lower(e2.subject) = lower(h.native_id)",
+				models.AssumeMechanismAgentBlueprint).
+			Joins("LEFT JOIN cloud_identity a ON a.id = e2.identity_id AND a.workspace_id = e2.workspace_id").
+			Where("e1.workspace_id = ? AND e1.connector_id IN (?) AND e1.subject_kind = ? AND lower(e1.subject) IN ?",
+				workspaceID, azureConnectorIDs(tx, workspaceID), models.AssumeSubjectIdentity, principals).
+			Select(`lower(e1.subject) AS principal_id, h.id AS trusted_identity_id, h.name AS trusted_name,
+				h.kind AS trusted_kind, COALESCE(h.attrs->>'agent_type', '') AS trusted_agent_type,
+				a.id AS agent_identity_id, COALESCE(a.name, '') AS agent_name, COALESCE(a.native_id, '') AS agent_object_id`).
+			Order("h.name, a.name").Scan(&trusts).Error
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1241,23 +1326,25 @@ func (r *cloudAzureRepository) ListFoundry(workspaceID uuid.UUID, connectorID *u
 }
 
 func (r *cloudAzureRepository) ListUsage(workspaceID uuid.UUID, f AzureUsageFilter) ([]AzureUsage, int64, error) {
-	q := r.db.Table("cloud_usage u").
-		Joins("JOIN cloud_identity i ON i.id = u.identity_id").
-		Where("u.workspace_id = ? AND u.connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.IdentityID != nil {
-		q = q.Where("u.identity_id = ?", *f.IdentityID)
-	}
-	if f.AIOnly {
-		q = q.Where("(u.attrs->>'ai_service')::boolean")
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []AzureUsage
-	err := q.Select("u.*, i.name AS identity_name, i.kind AS identity_kind").
-		Order("u.last_used_at DESC NULLS LAST, i.name, u.service, u.id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_usage u").
+			Joins("JOIN cloud_identity i ON i.id = u.identity_id AND i.workspace_id = u.workspace_id").
+			Where("u.workspace_id = ? AND u.connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.IdentityID != nil {
+			q = q.Where("u.identity_id = ?", *f.IdentityID)
+		}
+		if f.AIOnly {
+			q = q.Where("(u.attrs->>'ai_service')::boolean")
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Select("u.*, i.name AS identity_name, i.kind AS identity_kind").
+			Order("u.last_used_at DESC NULLS LAST, i.name, u.service, u.id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1265,20 +1352,22 @@ func (r *cloudAzureRepository) ListUsage(workspaceID uuid.UUID, f AzureUsageFilt
 }
 
 func (r *cloudAzureRepository) ListSecrets(workspaceID uuid.UUID, f AzureListFilter) ([]AzureSecret, int64, error) {
-	q := r.db.Table("cloud_secret s").
-		Joins("JOIN cloud_identity i ON i.id = s.identity_id").
-		Where("s.workspace_id = ? AND s.connector_id IN (?)", workspaceID, r.azureConnectorIDs(workspaceID))
-	if f.IdentityID != nil {
-		q = q.Where("s.identity_id = ?", *f.IdentityID)
-	}
-	var total int64
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
 	var out []AzureSecret
-	err := q.Select("s.*, i.name AS identity_name, i.kind AS identity_kind").
-		Order("s.expires_at NULLS LAST, s.id").
-		Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	var total int64
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		q := tx.Table("cloud_secret s").
+			Joins("JOIN cloud_identity i ON i.id = s.identity_id AND i.workspace_id = s.workspace_id").
+			Where("s.workspace_id = ? AND s.connector_id IN (?)", workspaceID, azureConnectorIDs(tx, workspaceID))
+		if f.IdentityID != nil {
+			q = q.Where("s.identity_id = ?", *f.IdentityID)
+		}
+		if err := q.Count(&total).Error; err != nil {
+			return err
+		}
+		return q.Select("s.*, i.name AS identity_name, i.kind AS identity_kind").
+			Order("s.expires_at NULLS LAST, s.id").
+			Limit(clampLimit(f.Limit)).Offset(f.Offset).Scan(&out).Error
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1287,17 +1376,20 @@ func (r *cloudAzureRepository) ListSecrets(workspaceID uuid.UUID, f AzureListFil
 
 func (r *cloudAzureRepository) ScanRuns(workspaceID, connectorID uuid.UUID, limit int) ([]models.CloudScanRun, error) {
 	var out []models.CloudScanRun
-	err := r.db.Where("workspace_id = ? AND connector_id = ? AND connector_id IN (?)",
-		workspaceID, connectorID, r.azureConnectorIDs(workspaceID)).
-		Order("requested_at DESC, id DESC").Limit(clampLimit(limit)).Find(&out).Error
+	err := r.read(workspaceID, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND connector_id = ? AND connector_id IN (?)",
+			workspaceID, connectorID, azureConnectorIDs(tx, workspaceID)).
+			Order("requested_at DESC, id DESC").Limit(clampLimit(limit)).Find(&out).Error
+	})
 	return out, err
 }
 
 // assertAzure refuses an id that is not an Azure connector in this workspace,
-// before any resource row is written or deleted under it.
-func (r *cloudAzureRepository) assertAzure(workspaceID, connectorID uuid.UUID) error {
+// before any resource row is written or deleted under it. tx is the caller's
+// workspace transaction, so the check and the write it guards are one.
+func assertAzure(tx *gorm.DB, workspaceID, connectorID uuid.UUID) error {
 	var n int64
-	if err := r.db.Model(&models.CloudConnector{}).
+	if err := tx.Model(&models.CloudConnector{}).
 		Where("workspace_id = ? AND id = ? AND provider = ?", workspaceID, connectorID, models.CloudProviderAzure).
 		Count(&n).Error; err != nil {
 		return err
