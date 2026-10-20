@@ -354,6 +354,12 @@ func main() {
 			awsSvc := services.NewAWSOnboardingService(config.DB, vc)
 			go services.NewAWSScanWorker(config.DB, awsSvc).WithGraphProjection(graphGate).
 				Run(context.Background())
+
+			// Automatic rescans: queues scheduled scans for connectors whose
+			// administrator turned Auto-scan on (stored in the database; every
+			// connection starts off). It only queues work, the worker above runs
+			// it, and it needs no environment switch.
+			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
 		}
 	}
 

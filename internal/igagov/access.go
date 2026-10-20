@@ -22,11 +22,13 @@ const (
 	AccessPolicyPrefix   = "AuthSecAccess-"
 	AccessSidObjects     = "AuthSecAccessObjects"
 	AccessSidBucket      = "AuthSecAccessBucket"
+	AccessSidBucketNone  = "AuthSecAccessBucketNoPrefix"
 	TagAccessPolicy      = "authsec:policy"
 	TagAccessVersion     = "authsec:version"
 	TagAccessDeployment  = "authsec:deployment"
 	CondDateGreaterThan  = "DateGreaterThan"
 	CondStringLike       = "StringLike"
+	CondNull             = "Null"
 	KeyS3Prefix          = "s3:prefix"
 	AccessEffectBlock    = "block"
 	AccessEffectAllow    = "allow"
@@ -41,6 +43,11 @@ const (
 	MaxAllowWindow       = 30 * 24 * time.Hour
 	MaxAccessStartLead   = 30 * 24 * time.Hour
 )
+
+// MaxListGuardPrefix is the longest folder whose leading fragments a Block
+// lists out one by one (see accessListGuard): the fragments grow with the
+// square of the length and the document has 6144 characters.
+const MaxListGuardPrefix = 48
 
 // AccessNoEnd is the stored expiry of a block without an end: the deployment
 // row needs a time, the document carries no DateLessThan.
@@ -239,6 +246,53 @@ func AccessActions(access []string, prefix string) (object, bucket []string) {
 	return sortedUnique(object), sortedUnique(bucket)
 }
 
+// accessActionsFor is AccessActions plus, for a Block, the read-side actions
+// that expose the same keys or their metadata: listing versions and in-flight
+// multipart uploads (both honour s3:prefix) and the attribute reads. An Allow
+// never gains them: it must not widen beyond what the person chose.
+func accessActionsFor(effect string, access []string, prefix string) (object, bucket []string) {
+	object, bucket = AccessActions(access, prefix)
+	if effect != AccessEffectBlock {
+		return object, bucket
+	}
+	for _, a := range access {
+		switch a {
+		case AccessRead:
+			object = append(object, "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes")
+			bucket = append(bucket, "s3:ListBucketVersions", "s3:ListBucketMultipartUploads")
+		case AccessAll:
+			if prefix != "" {
+				bucket = append(bucket, "s3:ListBucketVersions", "s3:ListBucketMultipartUploads")
+			}
+		}
+	}
+	return sortedUnique(object), sortedUnique(bucket)
+}
+
+// AccessListGuardPartial reports that a Block of this folder cannot list out
+// every leading fragment of it, so a list request for a fragment such as
+// "sand" (for folder "sandbox/") is not denied.
+func AccessListGuardPartial(effect, prefix string) bool {
+	return effect == AccessEffectBlock && len([]rune(prefix)) > MaxListGuardPrefix
+}
+
+// accessListGuard is the s3:prefix values a Block's listing Deny matches for a
+// folder. A Deny with only "<folder>*" is skipped by a list request that names
+// no prefix, the empty prefix, or a fragment of the folder ("sand"), and any of
+// those returns the folder's keys. So it also matches "" and, up to
+// MaxListGuardPrefix characters, every proper leading fragment. A request that
+// names no prefix at all carries no s3:prefix key: accessNoPrefixStatement.
+func accessListGuard(prefix string) []string {
+	vals := []string{prefix + "*", ""}
+	if len([]rune(prefix)) <= MaxListGuardPrefix {
+		r := []rune(prefix)
+		for i := 1; i < len(r); i++ {
+			vals = append(vals, string(r[:i]))
+		}
+	}
+	return sortedUnique(vals)
+}
+
 // AccessDocument is the policy of one role: Deny (block) or Allow (allow) of
 // the access levels' actions, inside the window. It returns the canonical
 // document, its hash, and every action and resource it names.
@@ -247,7 +301,7 @@ func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt
 	if effect == AccessEffectBlock {
 		eff = EffectDeny
 	}
-	object, bucket := AccessActions(access, t.Prefix)
+	object, bucket := accessActionsFor(effect, access, t.Prefix)
 	if len(object) == 0 {
 		return nil, "", nil, nil, errors.New("no action for the access levels")
 	}
@@ -280,9 +334,19 @@ func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt
 	if len(bucket) > 0 {
 		var extra map[string]any
 		if t.Prefix != "" {
-			extra = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: t.Prefix + "*"}}
+			var like any = t.Prefix + "*"
+			if effect == AccessEffectBlock {
+				like = accessListGuard(t.Prefix)
+			}
+			extra = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: like}}
 		}
 		stmts = append(stmts, stmt(AccessSidBucket, bucket, t.BucketARN(), extra))
+		if t.Prefix != "" && effect == AccessEffectBlock {
+			// A list request without a prefix has no s3:prefix key, so
+			// StringLike cannot match it: a second Deny catches it.
+			stmts = append(stmts, stmt(AccessSidBucketNone, bucket, t.BucketARN(),
+				map[string]any{CondNull: map[string]any{KeyS3Prefix: "true"}}))
+		}
 	}
 	doc := map[string]any{"Version": PolicyVersion20121017, "Statement": stmts}
 	c, err := CanonicalizeValue(doc)
