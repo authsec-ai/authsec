@@ -45,8 +45,10 @@ const (
 	ConnProviderGCP    = "gcp"
 	ConnProviderK8s    = "k8s"
 	ConnProviderGitHub = "github"
+	ConnProviderAzure  = "azure"
 
 	connScopeAccount      = "account"
+	connScopeTenant       = "tenant"
 	connScopeProject      = "project"
 	connScopeCluster      = "cluster"
 	connScopeOrganisation = "organisation"
@@ -212,6 +214,10 @@ var connCapabilities = map[string]ConnectionCapabilities{
 	ConnProviderGCP:    {Scan: true, Verify: true, Revoke: true},
 	ConnProviderK8s:    {Revoke: true},
 	ConnProviderGitHub: {Scan: true, EditScope: true, Revoke: true, Rules: true}, // no verify route exists for GitHub
+	// Azure rescans through Verify (POST /azure/connectors/:id/verify), which
+	// re-checks access and starts a discovery run; its scope is chosen at
+	// onboarding.
+	ConnProviderAzure: {Scan: true, Verify: true, Revoke: true},
 }
 
 // ConnectionList is the response body.
@@ -243,7 +249,7 @@ func (r *Reader) ListConnections(ctx context.Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	rank := map[string]int{ConnProviderAWS: 0, ConnProviderGCP: 1, ConnProviderK8s: 2, ConnProviderGitHub: 3}
+	rank := map[string]int{ConnProviderAWS: 0, ConnProviderGCP: 1, ConnProviderAzure: 2, ConnProviderK8s: 3, ConnProviderGitHub: 4}
 	sort.SliceStable(out.Connections, func(i, j int) bool {
 		a, b := out.Connections[i], out.Connections[j]
 		if rank[a.Provider] != rank[b.Provider] {
@@ -286,7 +292,7 @@ func reasonOf(code string) *string {
 func connCloud(q *Query, now time.Time) ([]Connection, error) {
 	var connectors []models.CloudConnector
 	if err := q.DB().Where("workspace_id = ? AND provider IN ?", q.WS,
-		[]string{models.CloudProviderAWS, models.CloudProviderGCP}).
+		[]string{models.CloudProviderAWS, models.CloudProviderGCP, models.CloudProviderAzure}).
 		Order("created_at, id").Find(&connectors).Error; err != nil {
 		return nil, err
 	}
@@ -302,9 +308,26 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 		q.WS, models.CloudProviderAWS).Scan(&latest).Error; err != nil {
 		return nil, err
 	}
+	// Azure: each connector's latest discovery run, by the same statement.
+	var azureLatest []pipelineRun
+	if err := q.DB().Raw(PipelineLatestRunsSQL,
+		models.CloudScanRunQueued, models.CloudScanRunRunning,
+		q.WS, models.CloudProviderAzure).Scan(&azureLatest).Error; err != nil {
+		return nil, err
+	}
+	latest = append(latest, azureLatest...)
 	runs := make(map[uuid.UUID]*pipelineRun, len(latest))
 	for i := range latest {
 		runs[latest[i].ConnectorID] = &latest[i]
+	}
+	// An Azure tenant's subscriptions in scope, for its summary.
+	azureSubs := map[string]int{}
+	for i := range connectors {
+		c := &connectors[i]
+		if c.Provider == models.CloudProviderAzure && c.ScopeKind == models.CloudScopeSubscription &&
+			c.Status == models.CloudConnectorActive && c.ParentScopeID != nil {
+			azureSubs[strings.ToLower(*c.ParentScopeID)]++
+		}
 	}
 	var pubs []struct {
 		ConnectorID uuid.UUID
@@ -327,6 +350,11 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 	out := make([]Connection, 0, len(connectors))
 	for i := range connectors {
 		c := &connectors[i]
+		// An Azure tenant is the connection; its subscriptions are inside it
+		// (its scope summary, and the connector's own scope listing).
+		if c.Provider == models.CloudProviderAzure && c.ScopeKind == models.CloudScopeSubscription {
+			continue
+		}
 		cov := models.DecodeScanCoverage(c.Coverage)
 		conn := Connection{
 			ID:        c.ID.String(),
@@ -347,6 +375,18 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 			run := runs[c.ID]
 			conn.Scan = connAWSScan(run)
 			conn.Graph = connAWSGraph(c, run, pubOf[c.ID])
+			conn.Discovery = connAWSDiscovery(run, cov)
+		case models.CloudProviderAzure:
+			// The scope id is the lowercased tenant id: what the unified
+			// inventory gives every row of the tenant as scope.id
+			// (internal/azuregraph). Azure has no publication, so its graph
+			// state is live, as Kubernetes'.
+			conn.Provider, conn.ScopeID = ConnProviderAzure, strings.ToLower(c.ScopeID)
+			conn.ScopeKind, conn.Name = connScopeTenant, c.ScopeID
+			conn.ScopeSummary = countWord(azureSubs[strings.ToLower(c.ScopeID)], "subscription", "subscriptions", "no subscriptions selected")
+			run := runs[c.ID]
+			conn.Scan = connAWSScan(run)
+			conn.Graph = ConnectionGraph{State: connGraphLive}
 			conn.Discovery = connAWSDiscovery(run, cov)
 		default: // gcp
 			attrs := c.GCPAttrs()

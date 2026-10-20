@@ -74,9 +74,9 @@ const (
 const InventoryDefaultLimit = 50
 
 // InventoryProviders are the providers the inventory lists.
-var InventoryProviders = []string{models.ProviderAWS, models.ProviderK8s, models.ProviderGitHub}
+var InventoryProviders = []string{models.ProviderAWS, models.ProviderK8s, models.ProviderGitHub, models.ProviderAzure}
 
-// The provider_attrs keys a k8s or github row states its scope and native id
+// The provider_attrs keys a k8s, github or azure row states its scope and native id
 // in. They are the row's scope, sub_scope and native_id, never its attrs.
 var inventoryScopeKeys = []string{"scope_kind", "scope_id", "scope_label", "sub_scope", "native_id"}
 
@@ -367,10 +367,11 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
 // row; the count and facet statements do not join it.
 func (c *inventoryClass) asOfLateral() string {
 	return `LEFT JOIN LATERAL (
-	        SELECT max(COALESCE(sw.observed_at, gr.completed_at, gr.started_at)) AS as_of
+	        SELECT max(COALESCE(sw.observed_at, gr.completed_at, gr.started_at, cr.published_at, cr.started_at)) AS as_of
 	          FROM iga_object_support s2
 	          LEFT JOIN iga_k8s_sweep sw ON sw.workspace_id = s2.workspace_id AND sw.id = s2.last_confirmed_sweep_id
 	          LEFT JOIN iga_scan_runs gr ON gr.workspace_id = s2.workspace_id AND gr.id = s2.last_confirmed_scan_run_id
+	          LEFT JOIN cloud_scan_run cr ON cr.workspace_id = s2.workspace_id AND cr.id = s2.last_confirmed_run_id
 	         WHERE ` + c.alias + `.provider <> 'aws' AND s2.workspace_id = ` + c.alias + `.workspace_id
 	           AND s2.` + c.supportCol + ` = ` + c.alias + `.id AND s2.state <> 'ended') asof ON true`
 }
@@ -612,6 +613,7 @@ var inventoryProviderLabels = map[string]string{
 	models.ProviderAWS:    "AWS",
 	models.ProviderK8s:    "Kubernetes",
 	models.ProviderGitHub: "GitHub",
+	models.ProviderAzure:  "Microsoft Azure",
 }
 
 // inventoryKindLabels names the kinds the contract lists; any other kind is
@@ -642,6 +644,16 @@ var inventoryKindLabels = map[string]string{
 	"github_app_installation":           "GitHub App installation",
 	"github_deploy_key":                 "GitHub deploy key",
 	"github_repository":                 "GitHub repository",
+	// Microsoft Entra ID and Azure (internal/azuregraph).
+	models.CloudIdentityEntraUser:             "Microsoft Entra user",
+	models.CloudIdentityEntraGroup:            "Microsoft Entra group",
+	models.CloudIdentityEntraApplication:      "Microsoft Entra application",
+	models.CloudIdentityEntraServicePrincipal: "Service principal",
+	models.CloudIdentityEntraManagedIdentity:  "Managed identity",
+	models.CloudIdentityEntraAgentIdentity:    "Agent identity",
+	models.CloudIdentityEntraAgentUser:        "Agent's user account",
+	models.CloudResourceEntraAppRole:          "Application permission",
+	models.CloudResourceEntraDelegatedScope:   "Delegated permission",
 }
 
 // inventoryScopeFacet folds the scope facet's id ␟ kind ␟ label groups into one
