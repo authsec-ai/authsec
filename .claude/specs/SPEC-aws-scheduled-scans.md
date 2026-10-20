@@ -51,7 +51,7 @@ Manual scan stays unchanged.
 | `Authsec-ui` | Auto-scan section in the connection detail; 2 RTK Query endpoints on the discovery slice | Admins need to set and see it |
 | `sdk-authsec` | none | Admin-console configuration of a connector; no agent, workload or MCP server calls it |
 | `authsec-doc` | Update the AWS discovery/onboarding page: scheduled scans, what customers see in CloudTrail, how to turn off | Operators and customers need to know AuthSec will call their account daily |
-| Production K3s | New env var `AUTHSEC_AWS_SCHEDULED_SCANS` (default off). No new workload: runs in the existing backend | Topology unchanged; verify the env in deployment checks |
+| Production K3s | No new env var: schedules live in the database. No new workload: runs in the existing backend | Topology unchanged; verify the env in deployment checks |
 
 ## Backend spec (authsec)
 
@@ -179,11 +179,12 @@ statement (`ClaimDue`) carries its `TENANT-EXEMPT` reason.
 
 ### Gate
 
-`AUTHSEC_AWS_SCHEDULED_SCANS` (default off; same style as the `IGA_*` gates). Off:
-the loop never starts, the schedule endpoints still read and write (so settings can
-be prepared) but the response says `scheduler_active: false` and the UI shows
-"Scheduling is not active on this deployment". The scheduler also refuses to run
-when the scan worker is disabled.
+There is no environment switch (envs reset on a Helm upgrade and there are already
+too many). The scheduler starts with the scan worker and reads what to scan from the
+database: a connection has no schedule until an administrator turns Auto-scan on, so
+with none on it finds nothing due. If the scan worker is disabled or has no Vault the
+loop does not start; the schedule endpoints still read and write but the response says
+`scheduler_active: false` and the UI says nothing will run yet.
 
 ### New endpoints
 

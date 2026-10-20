@@ -349,14 +349,11 @@ func main() {
 			go services.NewAWSScanWorker(config.DB, awsSvc).WithGraphProjection(graphGate).
 				Run(context.Background())
 
-			// Automatic rescans: queues scheduled scans for connectors that have
-			// a schedule. Off unless AUTHSEC_AWS_SCHEDULED_SCANS=true; it only
-			// queues work, the worker above runs it.
-			if services.ScheduledScansEnabled() {
-				go services.NewAWSScanScheduler(config.DB).Run(context.Background())
-			} else {
-				log.Printf("[aws-sched] scheduled scans are off: set %s=true to enable", services.ScheduledScansEnv)
-			}
+			// Automatic rescans: queues scheduled scans for connectors whose
+			// administrator turned Auto-scan on (stored in the database; every
+			// connection starts off). It only queues work, the worker above runs
+			// it, and it needs no environment switch.
+			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
 		}
 	}
 
