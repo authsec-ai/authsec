@@ -14,7 +14,7 @@ import "github.com/gin-gonic/gin"
 // reads (inventory.go): parameters, the snapshot, cursors, totals and facets.
 //
 // The routes are served by the graph read controller, so they share its
-// contract exactly: 503 graph_unavailable unless IGA_GRAPH_PROJECTION is on
+// contract exactly: 503 graph_unavailable unless the graph pipeline is available
 // and verified, the workspace only from the token, and every error in the
 // §5.2 envelope. They are mounted on their own /api/iga/v1 group with the same
 // GraphEnvelope / GraphRequire wrapping as the graph catalogue, and are not in

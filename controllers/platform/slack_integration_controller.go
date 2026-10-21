@@ -17,7 +17,7 @@ import (
 )
 
 // The Slack app routes, SPEC-iga-phase3-policy.md §7.11 (T3.14), under
-// /authsec/integrations/slack, behind the IGA_POLICY gate (§7 intro: every
+// /authsec/integrations/slack, behind the policy gate (§7 intro: every
 // Phase 3 route answers 503 policy_unavailable while it is off):
 //
 //	GET    /install          governance:enforce   Slack OAuth v2: the authorize URL; sets the install cookie
@@ -82,7 +82,7 @@ func MountSlackIntegrationRoutes(authsec gin.IRouter, ctl *SlackIntegrationContr
 	a.POST("/link/confirm", ctl.ConfirmLink)
 }
 
-// Gate is the IGA_POLICY middleware (fail closed).
+// Gate is the policy middleware (fail closed).
 func (ctl *SlackIntegrationController) Gate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var gate *services.PolicyGate

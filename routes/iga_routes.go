@@ -84,7 +84,7 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		platformCtrl.MountIGAInventoryRoutes(r, igaGraphRead, middlewares.AuthMiddleware(), middlewares.Require)
 		// Phase 3 policy (SPEC-iga-phase3-policy.md §7, T3.02): the
 		// /api/iga/v1/policy subgroup of the graph group -- the same auth and
-		// envelope -- behind the IGA_POLICY gate, which answers 503
+		// envelope -- behind the policy gate, which answers 503
 		// policy_unavailable on every route while it is off or unverified.
 		// The gate is the graph controller's, so /capabilities and the routes
 		// can never disagree about it.

@@ -146,12 +146,12 @@ func VerifyAccessPolicySchema(db *gorm.DB) error {
 }
 
 // AccessPoliciesStatus is policy.access_policies of /capabilities: the R2
-// gate (IGA_POLICY_R2, no new flag) and the 137 schema.
+// gate and the 137 schema.
 func AccessPoliciesStatus(db *gorm.DB) (bool, string) {
 	if !PolicyR2On() {
 		_, reason := PolicyR2GateState().Status()
 		if reason == "" {
-			reason = PolicyR2Env + " is off"
+			reason = "R2 is not available"
 		}
 		return false, reason
 	}

@@ -106,12 +106,12 @@ func (a *GovAuthoring) compileOne(ctx context.Context, ws uuid.UUID, intent igag
 	// keeps its service for the roles that owner owns only (fix/p3-tidy).
 	intent = intent.ForSubject(c.IdentityAccountID.String())
 	if len(intent.RemoveActions) > 0 && !PolicyActionsOn() {
-		// R1b off: an action-level intent is not compiled (IGA_POLICY_R1B).
+		// R1b off: an action-level intent is not compiled (R1b).
 		ge := actionsUnavailable()
 		return nil, &compileBlock{Err: ge, Reason: ge.Code + ": " + fmt.Sprint(ge.Detail["reason"])}, nil
 	}
 	if intent.HasTimeBound() && !PolicyR2On() {
-		// R2 off: a time-bound intent is not compiled (IGA_POLICY_R2).
+		// R2 off: a time-bound intent is not compiled (R2).
 		ge := r2Unavailable()
 		return nil, &compileBlock{Err: ge, Reason: ge.Code + ": " + fmt.Sprint(ge.Detail["reason"])}, nil
 	}

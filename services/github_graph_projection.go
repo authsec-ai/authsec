@@ -30,7 +30,7 @@ longer reports is retired rather than kept forever. The legacy rows keep
 source_key = '' and the legacy readers select only those, so neither reading
 can see the other's rows.
 
-Gated on IGA_GRAPH_PROJECTION, like the Kubernetes path: with the switch off
+Gated on the graph gate, like the Kubernetes path: until it is verified
 nothing here writes.
 */
 

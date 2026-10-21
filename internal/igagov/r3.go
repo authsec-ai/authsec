@@ -17,7 +17,7 @@ import (
 // R2-1). This file is pure: the runtime_controls intent, its validation and
 // hash, the decision function, the Cedar compilation for AgentCore, and the
 // brokered-session policy. The database, the routes and AWS live behind
-// IGA_POLICY_R3 (services/iga_gov_r3*.go, internal/agentcore,
+// R3 (services/iga_gov_r3*.go, internal/agentcore,
 // internal/awsbroker).
 //
 // THERE IS NO R3 IMPLEMENTATION SPEC. §12.4 requires four contracts to be

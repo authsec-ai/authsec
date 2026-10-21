@@ -20,7 +20,7 @@ import (
 	"github.com/authsec-ai/authsec/services"
 )
 
-// R3 routes (SPEC-iga-phase3-policy.md §12.4; IGA_POLICY_R3).
+// R3 routes (SPEC-iga-phase3-policy.md §12.4; R3).
 //
 // Management routes live under the gated /api/iga/v1/policy group, with the
 // workspace from the member's token (another workspace's row is 404) and
@@ -31,9 +31,9 @@ import (
 // subject, the human its signed user_id (DECISION R3-3).
 //
 // DECISION R3-17 (mounting): like R2-21, both route sets are MOUNTED only
-// while IGA_POLICY_R3 is switched on at startup, so with it off the route
+// while R3 is available at startup, so with it off the route
 // table is exactly R2's (the R1a audit walker and route tests see no
-// change). Mounted but not available (schema 062 unverified, or IGA_POLICY
+// change). Mounted but not available (schema 062 unverified, or policy
 // unavailable), management routes answer 422 policy_r3_unavailable and
 // runtime routes 503 runtime_unavailable with fail_closed: true.
 //

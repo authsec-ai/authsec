@@ -21,7 +21,7 @@ import (
 // a recreated role never inherits its predecessor's history.
 //
 // Everything here is pure: the trail reads, the aggregated events, the grant
-// history and every time are inputs. Everything is behind IGA_POLICY_R1B:
+// history and every time are inputs. Everything is behind R1b:
 // with it off Snapshot.ActionLevel is false and nothing in this file runs.
 
 // ActionCatalogVersion versions the event→action map and the data-event

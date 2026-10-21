@@ -13,7 +13,7 @@ import (
 
 // Access-policy routes (decision 2026-10-13; iga_gov_access_policy.go):
 // under /api/iga/v1/policy/access-policies, mounted with the R2 routes
-// (IGA_POLICY_R2, no new flag). The workspace is the token's only; reads
+// (R2, no new flag). The workspace is the token's only; reads
 // need governance:read, writes governance:enforce. Every write is audited.
 
 // RegisterAccessPolicyRoutes adds the routes to the policy group.

@@ -15,7 +15,7 @@ import (
 // Integration wiring (p3-wire): T3.12's owner review behind T3.11/T3.13's
 // authoring hooks, and T3.11's RetainVersionTx behind T3.12's review hook.
 // cmd/main.go installs both with InstallGovOwnerReviewWiring once the Phase 3
-// schema has verified (IGA_POLICY=on); tests install the same function.
+// schema has verified (policy available); tests install the same function.
 //
 //	OnProposed      -> OpenReviewTx (create, or resync/reopen on a re-propose)
 //	OwnerGate       -> CheckGate (409 review_incomplete / age_unconfirmed /
@@ -130,7 +130,7 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 
 // InstallGovPolicyRuntime installs everything the Phase 3 policy product
 // needs at runtime beyond its routes and worker (cmd/main.go calls it from
-// the IGA_POLICY gate's ready hook, i.e. only once the Phase 3 schema has
+// the policy gate's ready hook, i.e. only once the Phase 3 schema has
 // verified, before the job worker starts):
 //
 //   - the owner review wiring (InstallGovOwnerReviewWiring);
@@ -189,7 +189,7 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 	return restore
 }
 
-// InstallGovPolicyStartup is the IGA_POLICY gate's ready hook body that
+// InstallGovPolicyStartup is the policy gate's ready hook body that
 // cmd/main.go runs before anything Phase 3 is served (fix/p3-appr P1-4):
 // the policy runtime (InstallGovPolicyRuntime: the owner gate and the other
 // authoring hooks first), then -- when slackApp is configured (non-nil) --

@@ -341,7 +341,7 @@ var (
 )
 
 // govKindsNow is the kind filter's vocabulary: R1a's kinds, plus R1b's
-// unused_action while IGA_POLICY_R1B is on.
+// unused_action while R1b is available.
 func govKindsNow() map[string]bool {
 	if !PolicyActionsOn() {
 		return govKinds

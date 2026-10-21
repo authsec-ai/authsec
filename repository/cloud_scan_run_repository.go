@@ -42,7 +42,7 @@ type CloudScanRunRepository interface {
 
 	// ClaimForPipeline is Claim with the projection predicate: a connector
 	// whose previous run is still being projected is not claimable (§4.5).
-	// Used ONLY when IGA_GRAPH_PROJECTION is on and verified -- the switch
+	// Used ONLY when the graph pipeline is available and verified -- the switch
 	// decides, never a probe of the schema (§2.8).
 	ClaimForPipeline(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
 
@@ -217,7 +217,7 @@ func (r *cloudScanRunRepository) claim(
 	var out []models.CloudScanRun
 
 	// The projection predicate names iga_projection_job. It is included only
-	// in pipeline mode, which the IGA_GRAPH_PROJECTION switch decides after
+	// in pipeline mode, which the the graph pipeline decides after
 	// verifying the schema -- so the Phase 1 claim never names a Phase 2 table
 	// and runs unchanged against any schema (S1, §7.5).
 	projectionPredicate := ""
@@ -524,7 +524,7 @@ func (row scanRunHistoryRow) projection() *RunProjection {
 // It names iga_projection_job and iga_publication, so it is NOT part of the
 // Phase 1 scan path (whose claim names no Phase 2 table): it serves read
 // routes of a binary that migrates to 036 before it serves anything, where
-// both tables exist whatever IGA_GRAPH_PROJECTION says -- and runs projected
+// both tables exist whatever the graph pipeline says -- and runs projected
 // before a switch-off stay visible with their revision.
 const historySelect = `
 	SELECT r.*, j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,

@@ -1082,8 +1082,9 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractReq("policy", contractPolicyCapabilities),
 )))
 
-// The /capabilities policy block (§4.3): the IGA_POLICY gate, one boolean per
-// feature with a reason for each false one, and provider support.
+// The /capabilities policy block (§4.3): the policy gate, one boolean per
+// feature with a reason for each false one (R1b, R2 and R3 included), the
+// access-policy block, and provider support.
 var contractPolicyCapabilities = contractObj(
 	contractReq("state", contractEnum("on", "off", "misconfigured")),
 	contractReq("reason", contractNullable(contractNonEmpty)),
@@ -1091,6 +1092,12 @@ var contractPolicyCapabilities = contractObj(
 	contractReq("findings", contractBool), contractReq("proposals", contractBool),
 	contractReq("export", contractBool), contractReq("iac", contractBool),
 	contractReq("enforcement", contractBool), contractReq("slack", contractBool),
+	contractReq("actions", contractBool),
+	contractReq("temporary_grants", contractBool), contractReq("session_revoke", contractBool),
+	contractReq("time_bound", contractBool), contractReq("lambda_split_direct", contractBool),
+	contractReq("runtime_controls", contractBool), contractReq("brokered_sessions", contractBool),
+	contractOpt("access_policies", contractObj(
+		contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)))),
 	contractReq("reasons", contractMap(contractNonEmpty)),
 	contractReq("providers", contractObj(
 		contractReq("aws", contractConst("supported")), contractReq("k8s", contractConst("not_supported")))),

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,33 +14,26 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
-// The IGA_POLICY_R3 gate: Phase 3 R3, agent runtime controls
-// (SPEC-iga-phase3-policy.md §12.4). There is no R3 implementation spec; the
-// decisions are DECISION R3-n comments (internal/igagov/r3.go lists them).
+// The Phase 3 R3 gate: agent runtime controls (SPEC-iga-phase3-policy.md §12.4). There is no R3
+// implementation spec; the decisions are DECISION R3-n comments (internal/igagov/r3.go lists them). R3 is always on; it serves
+// once the policy gate is available and its own migration has verified.
 //
-//	IGA_POLICY_R3   IGA_POLICY gate    062 schema     state           R3
-//	off/unset       any                any            off             nothing runs; every R1a / R1b / R2 path as before
-//	on              not available      any            misconfigured   nothing runs (runtime routes 503, fail closed)
-//	on              available          not verified   misconfigured   nothing runs (runtime routes 503, fail closed)
-//	on              available          verified       on              runtime policies, decide / redeem / outcome,
-//	                                                                  holds, budgets, routing proofs, AgentCore
-//	                                                                  push and coverage, brokered sessions
-//	other value     any                any            misconfigured   nothing runs
+//	policy gate     R3 schema   state           R3
+//	not available   any         misconfigured   nothing runs
+//	available       not verified misconfigured  nothing runs
+//	available       verified    on              runtime policies, decide / redeem / outcome,
+//	                                     holds, budgets, routing proofs, AgentCore
+//	                                     push and coverage, brokered sessions
 //
-// FAIL CLOSED, like IGA_POLICY, IGA_POLICY_R1B and IGA_POLICY_R2: anything
-// wrong leaves R3 off with a reason (/capabilities policy.runtime_controls
-// and policy.brokered_sessions). R3 never takes the R1a gate down: R1a's
-// schema check (VerifyPolicySchema, head 059) reads nothing of 062, and this
-// gate's own check (VerifyPolicyR3Schema) is separate. R3 needs neither R1b
-// nor R2.
-
-// PolicyR3Env is the switch.
-const PolicyR3Env = "IGA_POLICY_R3"
+// FAIL CLOSED: anything missing leaves R3 unavailable with a reason
+// (/capabilities policy.runtime_controls and policy.brokered_sessions; the agent runtime routes answer 503 and fail closed). R3 never takes the R1a gate down: R1a's schema check
+// (VerifyPolicySchema, head 059) reads nothing of R3's migration, and this
+// gate's own check (VerifyPolicyR3Schema) is separate.
 
 // PolicyR3SchemaHead is the migration R3 needs.
 const PolicyR3SchemaHead = "062"
 
-// PolicyR3Gate carries the switch and whether 062 has been verified.
+// PolicyR3Gate carries whether 062 has been verified.
 type PolicyR3Gate struct {
 	enabled  bool
 	badValue string
@@ -60,33 +52,26 @@ func NewPolicyR3Gate(enabled bool, badValue string) *PolicyR3Gate {
 	return g
 }
 
-// PolicyR3GateFromEnv reads IGA_POLICY_R3 once: unset, off, false, 0 are
-// off; on, true, 1 are on; anything else is misconfigured.
-func PolicyR3GateFromEnv() *PolicyR3Gate {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(PolicyR3Env))); v {
-	case "", "off", "false", "0":
-		return NewPolicyR3Gate(false, "")
-	case "on", "true", "1":
-		return NewPolicyR3Gate(true, "")
-	default:
-		return NewPolicyR3Gate(true, fmt.Sprintf("%s=%q is not on or off", PolicyR3Env, v))
-	}
+// DefaultPolicyR3Gate is the gate main installs: on, serving once its schema
+// verifies and the policy gate is available.
+func DefaultPolicyR3Gate() *PolicyR3Gate {
+	return NewPolicyR3Gate(true, "")
 }
 
-// Enabled reports whether the switch is on (verified or not).
+// Enabled reports whether the gate is on (verified or not).
 func (g *PolicyR3Gate) Enabled() bool { return g != nil && g.enabled }
 
-// Status is the gate's state and the reason when it is not on. The IGA_POLICY
+// Status is the gate's state and the reason when it is not on. The policy
 // gate is read live: R3 is on only while R1a is.
 func (g *PolicyR3Gate) Status() (state, reason string) {
 	if g == nil || !g.enabled {
-		return PolicyOff, PolicyR3Env + " is off"
+		return PolicyOff, "R3 is off"
 	}
 	if g.badValue != "" {
 		return PolicyMisconfigured, g.badValue
 	}
 	if ps, pr, _ := PolicyGateState().Status(); ps != PolicyOn {
-		r := fmt.Sprintf("%s=on requires %s=on and available; the policy gate is %s", PolicyR3Env, PolicyEnv, ps)
+		r := fmt.Sprintf("R3 needs the policy gate available; it is %s", ps)
 		if pr != "" {
 			r += ": " + pr
 		}
@@ -138,14 +123,13 @@ func (g *PolicyR3Gate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interv
 	for {
 		err := g.Verify(db)
 		if err == nil {
-			log.Printf("[policy] %s=on: R3 schema verified at %s; agent runtime controls run while %s is available",
-				PolicyR3Env, PolicyR3SchemaHead, PolicyEnv)
+			log.Printf("[policy] R3 schema verified at %s; agent runtime controls run while policy is available", PolicyR3SchemaHead)
 			if ready != nil {
 				ready()
 			}
 			return
 		}
-		log.Printf("[policy] %s=on but not ready, R3 stays off (runtime routes fail closed): %v", PolicyR3Env, err)
+		log.Printf("[policy] R3 not ready, R3 stays off (runtime routes fail closed): %v", err)
 		if g.badValue != "" {
 			return
 		}
@@ -211,7 +195,7 @@ func VerifyPolicyR3Schema(db *gorm.DB) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("%s=on needs migration %s; missing: %s", PolicyR3Env, PolicyR3SchemaHead, strings.Join(missing, ", "))
+		return fmt.Errorf("R3 needs migration %s; missing: %s", PolicyR3SchemaHead, strings.Join(missing, ", "))
 	}
 	return nil
 }

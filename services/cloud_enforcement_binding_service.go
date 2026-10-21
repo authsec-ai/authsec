@@ -147,7 +147,7 @@ type EnforcementBindingService struct {
 	http  *http.Client
 	now   func() time.Time
 	sleep func(ctx context.Context, d time.Duration) error
-	// policyGate is the IGA_POLICY gate an enforcement registration Create
+	// policyGate is the policy gate an enforcement registration Create
 	// is processed under (nil: the process-wide gate, read per message).
 	policyGate    func() *PolicyGate
 	templateCheck func(ctx context.Context, templateURL string) error
@@ -172,7 +172,7 @@ func NewEnforcementBindingService(db *gorm.DB, vc vault.VaultClient, cfg awsdisc
 }
 
 // WithPolicyGate makes the callback read g instead of the process-wide
-// IGA_POLICY gate (tests).
+// policy gate (tests).
 func (s *EnforcementBindingService) WithPolicyGate(g *PolicyGate) *EnforcementBindingService {
 	s.policyGate = func() *PolicyGate { return g }
 	return s
@@ -1389,7 +1389,7 @@ var enfReasons = map[string]string{
 }
 
 // EnfCodePolicyNotEnabled answers a registration that arrives while the
-// IGA_POLICY switch is off (review fix R1a P2 "gate leaks").
+// policy is off (review fix R1a P2 "gate leaks").
 const EnfCodePolicyNotEnabled = "policy_not_enabled"
 
 func (s *EnforcementBindingService) handleCreate(
@@ -1443,7 +1443,7 @@ func (s *EnforcementBindingService) handleCreate(
 		return fail(AWSOnbCodeInvalidRequest, "unknown TemplateVersion "+props.TemplateVersion)
 	}
 
-	// 1b. The IGA_POLICY gate (§4.3; review fix R1a P2 "gate leaks"). The
+	// 1b. The policy gate (§4.3; review fix R1a P2 "gate leaks"). The
 	// binding, its Vault path and its events are Phase 3 state: nothing is
 	// read or written unless the gate is on. DECISION: switch OFF is an
 	// operator's deliberate state, so the Create is REFUSED explicitly
@@ -1457,7 +1457,7 @@ func (s *EnforcementBindingService) handleCreate(
 	// can always be deleted.
 	if state, reason, _ := s.gate().Status(); state != PolicyOn {
 		if state == PolicyOff {
-			return fail(EnfCodePolicyNotEnabled, "IGA_POLICY is off: "+reason)
+			return fail(EnfCodePolicyNotEnabled, "policy is not available: "+reason)
 		}
 		return transient("policy gate not available: " + reason)
 	}

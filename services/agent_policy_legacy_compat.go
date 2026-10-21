@@ -87,7 +87,7 @@ func NewLegacyAgentPolicyCompat(db *gorm.DB) *LegacyAgentPolicyCompat {
 }
 
 // HasPolicies reports whether the workspace has any legacy policy, enabled or
-// not. With IGA_LEGACY_AGENT_POLICY off, the compatibility routes exist only
+// not. With the legacy agent-policy stack off, the compatibility routes exist only
 // for a workspace where this is true.
 func (s *LegacyAgentPolicyCompat) HasPolicies(ctx context.Context, workspaceID uuid.UUID) (bool, error) {
 	var found bool

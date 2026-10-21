@@ -1163,7 +1163,7 @@ func (ctl *DiscoveryController) ReportRBACSnapshot(c *gin.Context) {
 		snap.DiscoverySourceID = sourceID.String()
 	}
 
-	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjectionGateFromEnv()).
+	out, err := services.NewK8sRBACManager(ctl.db, services.GraphProjection()).
 		Ingest(wsID, snap)
 	if errors.Is(err, services.ErrClusterUIDMismatch) {
 		// A different cluster installed under this one's name. Refused, not

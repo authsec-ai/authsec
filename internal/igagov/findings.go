@@ -128,7 +128,7 @@ type Snapshot struct {
 	NoOwnership bool
 	// DefaultWindowDays is iga_gov_settings.default_window_days (0 = 90).
 	DefaultWindowDays int
-	// ActionLevel turns on R1b (IGA_POLICY_R1B on, 060 verified): action
+	// ActionLevel turns on R1b (R1b on, 060 verified): action
 	// evidence and unused_action findings (findings_actions.go). False
 	// leaves Evaluate's output exactly R1a's.
 	ActionLevel bool
@@ -1162,7 +1162,7 @@ func PlanFindingUpdates(ev Evaluation, stored []StoredFinding, posture map[Postu
 	}
 	for _, s := range stored {
 		if s.Kind == KindUnusedAction && !ev.ActionLevel {
-			// R1b off (IGA_POLICY_R1B): its findings are left exactly as they
+			// R1b off (R1b): its findings are left exactly as they
 			// are -- neither cleared nor superseded -- until it is on again.
 			continue
 		}

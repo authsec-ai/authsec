@@ -12,7 +12,7 @@ import (
 // (SPEC-iga-phase3-policy.md §12.3; requirements C-10, E-09, R-08). There is
 // no R2 implementation spec: every assumption is a DECISION R2-n comment,
 // listed here and repeated where the code applies it. Everything R2 runs
-// behind IGA_POLICY_R2 (services/iga_gov_r2.go); this file is pure.
+// behind R2 (services/iga_gov_r2.go); this file is pure.
 //
 // DECISION R2-1 (PRODUCT, made by the coordinator as the default; flag for
 // Aditya): requirement R-08 "scoped temporary sessions" is restated for R2
@@ -646,7 +646,7 @@ func RevocationRemoveAfter(issuedBefore time.Time, keep time.Duration) time.Time
 func splitDirectRefusals(in SplitInput, src *LiveRole) []Refusal {
 	var out []Refusal
 	if !in.DirectAllowed {
-		return []Refusal{{RefuseSplitDirect, "isolation is delivered only as a PR or export (§11); direct execution needs IGA_POLICY_R2"}}
+		return []Refusal{{RefuseSplitDirect, "isolation is delivered only as a PR or export (§11); direct execution needs R2 to be available"}}
 	}
 	if in.SubjectKind != SubjectLambdaFunction {
 		out = append(out, Refusal{RefuseSplitDirectScope, "direct isolation moves Lambda functions only; " + in.SubjectKind + " stays PR/export"})

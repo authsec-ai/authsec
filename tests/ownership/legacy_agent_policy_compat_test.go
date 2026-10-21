@@ -49,7 +49,6 @@ const compatBase = "/api/iga/v1/legacy/agent-policies"
 type compatLab struct {
 	provFixture
 	r       *gin.Engine
-	gate    *services.LegacyAgentPolicyGate
 	perms   *[]string
 	wsB     uuid.UUID
 	pDirect uuid.UUID // direct, quarantined, two recorded actions
@@ -66,8 +65,6 @@ func newCompatLab(t *testing.T) *compatLab {
 	t.Helper()
 	f := newProvFixture(t)
 	l := &compatLab{provFixture: f, wsB: uuid.MustParse(wsB)}
-	gate := services.ParseLegacyAgentPolicyGate("on")
-	l.gate = &gate
 	pm := policyMgr(t, f)
 
 	l.agent1 = claimedAgent(t, f, "compat-a1", "iga-demo", "crewai", "automated")
@@ -122,7 +119,7 @@ func newCompatLab(t *testing.T) *compatLab {
 			Selector: &models.AgentPolicySelector{Namespace: n}}))
 	}
 
-	l.r, l.perms = compatRouter(t, f.raw, func() services.LegacyAgentPolicyGate { return *l.gate })
+	l.r, l.perms = compatRouter(t, f.raw)
 	return l
 }
 
@@ -131,7 +128,7 @@ func newCompatLab(t *testing.T) *compatLab {
 // stand-in takes the workspace from X-Test-WS (none: 401 in the shared
 // middleware's own body); the permission stand-in records each check and
 // denies the one named in X-Test-Deny (403 in the shared middleware's body).
-func compatRouter(t *testing.T, raw *sql.DB, gate func() services.LegacyAgentPolicyGate) (*gin.Engine, *[]string) {
+func compatRouter(t *testing.T, raw *sql.DB) (*gin.Engine, *[]string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db := gormFor(t, raw)
@@ -161,7 +158,7 @@ func compatRouter(t *testing.T, raw *sql.DB, gate func() services.LegacyAgentPol
 	}
 	r := gin.New()
 	platform.MountLegacyAgentPolicyCompatRoutes(r,
-		platform.NewLegacyAgentPolicyCompatControllerWith(db, gate, compatCursorKey), auth, require)
+		platform.NewLegacyAgentPolicyCompatControllerWith(db, compatCursorKey), auth, require)
 
 	gov := platform.NewGovernanceController(db)
 	g := r.Group("/authsec/governance")
@@ -198,9 +195,8 @@ func (l *compatLab) do(t *testing.T, method, path string, ws uuid.UUID, body any
 type compatList struct {
 	Data []services.LegacyAgentPolicyView `json:"data"`
 	Meta struct {
-		NextCursor    *string `json:"next_cursor"`
-		Limit         int     `json:"limit"`
-		LegacyWorkers string  `json:"legacy_workers"`
+		NextCursor *string `json:"next_cursor"`
+		Limit      int     `json:"limit"`
 	} `json:"meta"`
 }
 
@@ -279,7 +275,7 @@ func TestLegacyCompatListPagesTheWorkspacesPoliciesWithTheirState(t *testing.T) 
 				t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
 			}
 			page := decode[compatList](t, rec)
-			if strconv.Itoa(page.Meta.Limit) != limit || page.Meta.LegacyWorkers != "on" ||
+			if strconv.Itoa(page.Meta.Limit) != limit ||
 				len(page.Data) > page.Meta.Limit {
 				t.Fatalf("meta/page size wrong: %+v (%d rows)", page.Meta, len(page.Data))
 			}
@@ -555,52 +551,21 @@ func TestLegacyCompatRemoveIsAuditedAndVisibleThroughTheLegacyRoute(t *testing.T
 
 /* ------------------------------ existence rule ----------------------------- */
 
-func TestLegacyCompatRoutesExistWhileTheGateIsOnOrPoliciesRemain(t *testing.T) {
+// The compatibility routes exist for every workspace.
+func TestLegacyCompatRoutesExistForEveryWorkspace(t *testing.T) {
 	l := newCompatLab(t)
 	// A third workspace with no legacy policies.
 	wsC := uuid.New()
 	exec(t, l.raw, `INSERT INTO workspaces (id, name) VALUES ($1,'ws-C')`, wsC)
 
-	// On: every workspace has the routes, even one with nothing in them.
+	// Every workspace has the routes, even one with nothing in them.
 	rec := l.do(t, http.MethodGet, compatBase, wsC, nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("gate on, empty workspace: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("empty workspace: %d %s", rec.Code, rec.Body.String())
 	}
 	if c := decode[compatList](t, rec); len(c.Data) != 0 || c.Data == nil {
 		t.Errorf("an empty workspace lists [] (not null): %s", rec.Body.String())
 	}
-
-	// Off: only a workspace that still has legacy policies.
-	*l.gate = services.ParseLegacyAgentPolicyGate("off")
-	for _, call := range []struct{ method, path string }{
-		{http.MethodGet, compatBase},
-		{http.MethodPost, compatBase + "/" + l.pDirect.String() + "/pause"},
-		{http.MethodDelete, compatBase + "/" + l.pDirect.String()},
-	} {
-		wantErr(t, l.do(t, call.method, call.path, wsC, map[string]string{"reason": "r"}),
-			http.StatusNotFound, "legacy_agent_policies_unavailable")
-	}
-	rec = l.do(t, http.MethodGet, compatBase, l.ws, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("gate off, workspace with policies: %d %s", rec.Code, rec.Body.String())
-	}
-	if c := decode[compatList](t, rec); len(c.Data) != 5 || c.Meta.LegacyWorkers != "off" {
-		t.Errorf("gate off must still list the workspace's policies and say the workers are off: %+v", c.Meta)
-	}
-	// ...including a workspace whose policies are all paused: they still exist.
-	exec(t, l.raw, `UPDATE agent_policies SET enabled = false WHERE workspace_id = $1`, l.wsB)
-	if rec := l.do(t, http.MethodGet, compatBase, l.wsB, nil); rec.Code != http.StatusOK {
-		t.Errorf("paused policies still count: %d", rec.Code)
-	}
-	// Once the last one is removed, the routes are gone for that workspace.
-	for _, id := range l.bPols {
-		if rec := l.do(t, http.MethodDelete, compatBase+"/"+id.String(), l.wsB,
-			map[string]string{"reason": "cleanup"}); rec.Code != http.StatusOK {
-			t.Fatalf("remove %s: %d %s", id, rec.Code, rec.Body.String())
-		}
-	}
-	wantErr(t, l.do(t, http.MethodGet, compatBase, l.wsB, nil),
-		http.StatusNotFound, "legacy_agent_policies_unavailable")
 }
 
 /* ------------------------- A8: legacy routes unchanged --------------------- */
@@ -698,7 +663,7 @@ func TestLegacyCompatMountsBesideTheIGASurface(t *testing.T) {
 	routes.SetupIGARoutes(eng, platform.NewIGAController(db),
 		platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false, ""), compatCursorKey))
 	platform.MountLegacyAgentPolicyCompatRoutes(eng,
-		platform.NewLegacyAgentPolicyCompatControllerWith(db, services.LegacyAgentPolicy, compatCursorKey),
+		platform.NewLegacyAgentPolicyCompatControllerWith(db, compatCursorKey),
 		func(c *gin.Context) { c.Next() }, func(string, string) gin.HandlerFunc { return func(c *gin.Context) { c.Next() } })
 
 	found := 0

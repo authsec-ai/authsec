@@ -180,7 +180,7 @@ func TestIdentHeartbeatKeepsTheFirstClusterUID(t *testing.T) {
 func TestIdentHeartbeatUIDGovernsSnapshots(t *testing.T) {
 	db := ingestDB(t)
 	ws, _ := seedWorkspace(t, db)
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	src := heartbeat(t, db, ws, "prod-west", "uid-first")
 	heartbeat(t, db, ws, "prod-west", "uid-second") // must not re-bind
 
@@ -319,7 +319,7 @@ func TestIdentAnotherSourcesWorkloadIsNotAdopted(t *testing.T) {
 func TestIdentConcurrentSweepsOneWinsOneConflicts(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	r := snapshotRouter(db)
 
 	blocker := db.Begin()
@@ -683,7 +683,7 @@ func TestIdentSightingFromAnotherClusterUIDIsNotProjected(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	setRecordedUID(t, db, src, "uid-a")
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	t.Setenv(services.RequireClusterUIDEnv, "false")
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
@@ -865,4 +865,13 @@ func TestIdentLargeSweepResolvesEveryWorkload(t *testing.T) {
 	    AND last_confirmed_sweep_id IS NOT NULL`, ws, src); got != n {
 		t.Errorf("%d workloads confirmed by the sweep, want %d", got, n)
 	}
+}
+
+// useGraphGateOn installs an on graph gate for the test, as main does at
+// startup, and restores the previous one after.
+func useGraphGateOn(t *testing.T) {
+	t.Helper()
+	prev := services.GraphProjection()
+	services.SetGraphProjection(services.NewGraphProjectionGate(true, ""))
+	t.Cleanup(func() { services.SetGraphProjection(prev) })
 }

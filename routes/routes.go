@@ -43,7 +43,6 @@ import (
 	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
-	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -1367,13 +1366,12 @@ func SetupRoutes(
 			extSvcs.GET("/:id/credentials", middlewares.Require("external-service", "credentials"), extSvcController.GetExternalServiceCredentials)
 		}
 
-		// Phase 3 R3 agent runtime controls (IGA_POLICY_R3, DECISION R3-17):
-		// the decision / redeem / outcome / brokered-session routes of an AI
-		// agent. Mounted only while the switch is on; behind
-		// SpiffeAuthMiddleware, and the controller accepts ONLY a delegated
-		// agent JWT-SVID (workspace from the verifying trust bundle, human from
-		// the active delegation token). Unavailable: 503, fail closed.
-		if services.PolicyR3GateState().Enabled() {
+		// Phase 3 R3 agent runtime controls (DECISION R3-17): the decision /
+		// redeem / outcome / brokered-session routes of an AI agent, behind
+		// SpiffeAuthMiddleware; the controller accepts ONLY a delegated agent
+		// JWT-SVID (workspace from the verifying trust bundle, human from the
+		// active delegation token). Until R3 is available: 503, fail closed.
+		{
 			runtimeAgents := authsec.Group("/runtime")
 			runtimeAgents.Use(middlewares.SpiffeAuthMiddleware())
 			platformCtrl.RegisterRuntimeAgentRoutes(runtimeAgents, platformCtrl.NewIGAGovRuntimeController())
@@ -1520,7 +1518,7 @@ func SetupRoutes(
 		governanceController := platformCtrl.NewGovernanceController(config.DB)
 
 		// Phase 3 Slack app (SPEC-iga-phase3-policy.md §7.11, T3.14):
-		// /authsec/integrations/slack. Behind the IGA_POLICY gate;
+		// /authsec/integrations/slack. Behind the policy gate;
 		// /interactions (Slack signature) and /oauth/callback (signed state
 		// + install cookie) carry no bearer token; the rest are
 		// authenticated with their permission.
@@ -1708,7 +1706,7 @@ func SetupRoutes(
 			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
 			// Phase 3 enforcement binding (SPEC-iga-phase3-policy.md §7.9,
 			// T3.09): the separate, customer-consented enforcement stack of a
-			// connected account. Behind the IGA_POLICY gate, with
+			// connected account. Behind the policy gate, with
 			// discovery:read to read and governance:enforce to change.
 			platformCtrl.RegisterEnforcementBindingRoutes(discovery,
 				platformCtrl.NewCloudEnforcementBindingController(config.DB), middlewares.Require)
@@ -1877,7 +1875,7 @@ func SetupRoutes(
 			// the agent identities each project's managed identity can become.
 			discovery.GET("/azure/foundry", middlewares.Require("discovery", "read"), cloudAzure.ListFoundry)
 			discovery.GET("/azure/usage", middlewares.Require("discovery", "read"), cloudAzure.ListUsage)
-			// The Azure slice of the shared IGA graph (IGA_GRAPH_PROJECTION).
+			// The Azure slice of the shared IGA graph (the graph pipeline).
 			discovery.GET("/azure/graph/summary", middlewares.Require("discovery", "read"), cloudAzure.GraphSummary)
 			discovery.GET("/azure/graph/blast-radius", middlewares.Require("discovery", "read"), cloudAzure.BlastRadius)
 			discovery.GET("/azure/graph/neighbourhood", middlewares.Require("discovery", "read"), cloudAzure.Neighbourhood)

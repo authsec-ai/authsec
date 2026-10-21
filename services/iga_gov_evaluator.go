@@ -243,7 +243,7 @@ func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (ig
 		if gs, err = readGovSnapshot(tx, ws, rev, nil); err != nil || !PolicyActionsOn() {
 			return err
 		}
-		// R1b (IGA_POLICY_R1B): the connectors' CloudTrail history, read
+		// R1b (R1b): the connectors' CloudTrail history, read
 		// under the same barrier (and the same workspace transaction),
 		// qualifies actions of the services kept.
 		trails, err := loadActionTrails(wctx, tx, ws, gs.Snap.EvaluatedAt)

@@ -980,7 +980,7 @@ func parseRightSize(raw json.RawMessage) (*igagov.RightSizeIntent, []byte, strin
 		return nil, nil, "", actionsUnavailable()
 	}
 	if in.RightSize.HasTimeBound() && !PolicyR2On() {
-		// R2 off: time-conditioned retention is refused (IGA_POLICY_R2).
+		// R2 off: time-conditioned retention is refused (R2).
 		return nil, nil, "", r2Unavailable()
 	}
 	canon, hash, err := igagov.CanonicalIntent(in)

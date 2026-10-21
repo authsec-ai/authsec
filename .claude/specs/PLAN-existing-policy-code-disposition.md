@@ -100,10 +100,8 @@ any screen that shows or controls those policies.
    operations proxied to the legacy manager and audited: **Pause** (set the
    policy disabled) and **Remove**. No create or edit. This is the only legacy
    surface; the retired screens stay retired.
-2. **Worker control.** A new environment gate `IGA_LEGACY_AGENT_POLICY`
-   (`on` by default until G1, so behavior does not change silently) stops both
-   legacy workers when `off`. Turning it off is a recorded release decision
-   per environment.
+2. **Worker control.** Both legacy workers always run. There is no switch
+   (removed 2026-10-21); stopping them is a code change with its own release.
 3. **No shared ownership.** The legacy stack owns NetworkPolicies it created
    for quarantine and AuthSec `role_bindings`. Phase 3 owns AWS permissions
    boundaries (R1a) and, later, Kubernetes RBAC bindings (R1k). These sets do
@@ -136,8 +134,7 @@ UNION ALL SELECT 'provisioning_instructions (30d)', count(*), count(DISTINCT wor
 UNION ALL SELECT 'governance_notification_settings', count(*), count(DISTINCT workspace_id) FROM governance_notification_settings;
 ```
 
-Rollback for each step: turning `IGA_LEGACY_AGENT_POLICY` back on restores
-the previous behavior; the compatibility view is read-mostly; archives are
+Rollback for each step: the compatibility view is read-mostly; archives are
 copies.
 
 ## 5. Order of work

@@ -222,7 +222,7 @@ func (ctl *IGAGovPolicyController) ActivityEvidence(c *gin.Context) {
 
 // ActionEvidence handles GET /identities/:id/action-evidence (R1b, §12.1):
 // the role's frozen action-level evidence at ?rev. 422
-// policy_actions_unavailable while IGA_POLICY_R1B is off.
+// policy_actions_unavailable while R1b is unavailable.
 func (ctl *IGAGovPolicyController) ActionEvidence(c *gin.Context) {
 	govCall(c, func(ws uuid.UUID) (any, any, error) {
 		if err := services.RequirePolicyActions(); err != nil {

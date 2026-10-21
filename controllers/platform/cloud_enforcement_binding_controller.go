@@ -31,7 +31,7 @@ import (
 //	DELETE /aws/connectors/:id/enforcement                governance:enforce  revoke; lists artifacts still in AWS
 //
 // They follow the Phase 3 rules (§7 intro) although they sit outside
-// /api/iga/v1/policy: the IGA_POLICY gate (503 policy_unavailable while it is
+// /api/iga/v1/policy: the policy gate (503 policy_unavailable while it is
 // off or unverified -- the binding is a Phase 3 table), the workspace from the
 // token only, another workspace's connector 404, the {data, meta} /
 // {error:{code,message,detail}} envelope, and every mutation writing an
@@ -99,7 +99,7 @@ func (ctl *CloudEnforcementBindingController) service() (*services.EnforcementBi
 }
 
 // RegisterEnforcementBindingRoutes mounts the §7.9 binding routes on the
-// authenticated /authsec/discovery group: the IGA_POLICY gate first, then
+// authenticated /authsec/discovery group: the policy gate first, then
 // each route's permission (require, wrapped so a 401/403 is the envelope).
 func RegisterEnforcementBindingRoutes(discovery gin.IRouter, ctl *CloudEnforcementBindingController, require func(resource, action string) gin.HandlerFunc) {
 	req := GraphRequire(require)
@@ -112,7 +112,7 @@ func RegisterEnforcementBindingRoutes(discovery gin.IRouter, ctl *CloudEnforceme
 	enf.POST("/verify", req("governance", "enforce"), ctl.Verify)
 }
 
-// Gate is the IGA_POLICY middleware for these routes (fail closed).
+// Gate is the policy middleware for these routes (fail closed).
 func (ctl *CloudEnforcementBindingController) Gate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var gate *services.PolicyGate

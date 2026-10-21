@@ -18,7 +18,7 @@ import (
 // history the evaluation qualifies actions on, the frozen action evidence it
 // writes (060 iga_gov_action_evidence), and the reads the bundle, the
 // recommendation, observation and the finding detail make of it. Everything
-// here runs only while PolicyActionsOn() (IGA_POLICY_R1B).
+// here runs only while PolicyActionsOn() (R1b).
 
 // govActionEvidence is one iga_gov_action_evidence row.
 type govActionEvidence struct {

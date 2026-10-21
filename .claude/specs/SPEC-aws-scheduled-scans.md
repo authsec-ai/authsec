@@ -71,7 +71,7 @@ Manual scan stays unchanged.
 - Re-onboarding an account upserts the same `cloud_connector` row and writes
   `status` back to active, so a revoked connector that is re-connected becomes
   schedulable again. See "Revoke and re-onboard".
-- In pipeline mode (`IGA_GRAPH_PROJECTION` on) a workspace barrier lets only one
+- In pipeline mode (once the graph schema verifies) a workspace barrier lets only one
   connector per workspace collect/project at a time; a refused run goes to the back
   of the queue. So several scheduled accounts in one workspace run one at a time.
   The scheduler does not need to know; jitter keeps it from piling up.

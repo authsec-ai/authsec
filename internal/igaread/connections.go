@@ -5,7 +5,7 @@ package igaread
 // conditions the console never collapses into one word -- connection, latest
 // scan, coverage and graph publication -- plus what Discovery may do with it.
 //
-// It is NOT a graph read: it does not need IGA_GRAPH_PROJECTION, takes the
+// It is NOT a graph read: it does not need the graph pipeline, takes the
 // workspace only from the token and writes nothing. It reads through the
 // Reader only to get what the graph reads get -- one REPEATABLE READ snapshot
 // under one deadline -- so a publication that commits while the request runs

@@ -9,17 +9,17 @@ import (
 	"github.com/authsec-ai/authsec/services"
 )
 
-// R2 routes (SPEC-iga-phase3-policy.md §12.3; IGA_POLICY_R2): temporary
+// R2 routes (SPEC-iga-phase3-policy.md §12.3; R2): temporary
 // grants and session revocations under the gated /api/iga/v1/policy group.
 // The workspace is the token's; another workspace's row is 404. Every
 // mutation writes its iga_gov_event in the service transaction and an
 // audit_events row here (govMutation).
 //
-// DECISION R2-21: the routes are MOUNTED only while IGA_POLICY_R2 is switched
+// DECISION R2-21: the routes are MOUNTED only while R2 is switched
 // on at startup (the route table is then exactly R1a's with it off, so the
 // R1a audit walker and route tests see no change), and each answers 422
 // policy_r2_unavailable while the R2 gate is not on (schema 061 unverified,
-// or IGA_POLICY unavailable). Permissions: requesting a grant
+// or policy unavailable). Permissions: requesting a grant
 // governance:author; approving / rejecting it governance:grant (the new
 // permission, 061); revoking it early governance:enforce; requesting a
 // session revocation governance:enforce (governance:emergency in addition for

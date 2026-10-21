@@ -126,7 +126,7 @@ type ScanReport struct {
 	Coverage        []models.IGACoverageState `json:"coverage"`
 	Issues          []string                  `json:"issues"`
 	// Graph is the keyed projection of this scan into the shared graph, present
-	// only when a projector is configured and IGA_GRAPH_PROJECTION is on.
+	// only when a projector is configured and the graph pipeline is available.
 	Graph *GitHubGraphResult `json:"graph,omitempty"`
 }
 
@@ -196,7 +196,7 @@ type igaManager struct {
 type IGAOption func(*igaManager)
 
 // WithGitHubGraph projects every scan into the shared graph (ghgraph) after it
-// publishes. The projector itself honours IGA_GRAPH_PROJECTION, so a manager
+// publishes. The projector itself honours the graph pipeline, so a manager
 // built with it writes nothing new while the switch is off.
 func WithGitHubGraph(p *GitHubGraphProjector) IGAOption {
 	return func(m *igaManager) { m.graph = p }

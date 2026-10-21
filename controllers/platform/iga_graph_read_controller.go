@@ -29,7 +29,7 @@ type IGAGraphReadController struct {
 	gate func() *services.GraphProjectionGate
 	db   func() *gorm.DB
 	key  []byte
-	// policyGate is the IGA_POLICY gate a test installed (WithPolicyGate);
+	// policyGate is the policy gate a test installed (WithPolicyGate);
 	// nil reads the process-wide one (iga_gov_policy_controller.go).
 	policyGate func() *services.PolicyGate
 
@@ -146,7 +146,7 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		"reason":           nullIfEmpty(reason),
 		"features":         graphFeatures(mode == services.GraphProjectionOn),
 		"schema_head":      nullIfEmpty(head),
-		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the IGA_POLICY
+		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the policy
 		// gate and what the policy product serves. Its reason is the one
 		// every /policy route's 503 carries.
 		"policy": withAccessPolicies(policyCapabilities(ctl.policyGateFn()()), ctl.db()),
@@ -162,7 +162,7 @@ type graphCall struct {
 
 // serve runs one graph read under the contract every route shares:
 //
-//   - 503 graph_unavailable unless IGA_GRAPH_PROJECTION is on AND verified
+//   - 503 graph_unavailable unless the graph pipeline is available AND verified
 //     (§2.8, T6.9): the console shows Unavailable, never an empty graph;
 //   - the workspace ONLY from the token, never a parameter (§5);
 //   - errors rendered as {"error": {...}} with the §5.2 status, nothing partial.

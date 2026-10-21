@@ -1277,7 +1277,7 @@ names only `iga_*` tables and the allowlisted shared tables.
 
 | Gate | Values | Effect |
 |---|---|---|
-| `IGA_POLICY` env | `off` (default), `on` | `on` requires `IGA_GRAPH_PROJECTION=on` and a verified Phase 3 schema: every relation and added column of `047`–`056` checked by existence, as `VerifyGraphSchema` does for the graph (`services/iga_graph_projection.go:74-101`). Fail closed: on with verification failing, every Phase 3 route returns `503 policy_unavailable` and the evaluation step is skipped. Off: the same, and the Policy destination keeps its preview. Legacy routes and workers are unaffected either way |
+| Policy schema verification | verified / not verified | Policy is always on; it serves once the graph schema is verified and the Phase 3 schema is: every relation and added column of `047`–`059` checked by existence, as `VerifyGraphSchema` does for the graph. Fail closed: until both verify, every Phase 3 route returns `503 policy_unavailable` with the reason. R1b (`060`), R2 (`061`, which also carries access policies, `137`–`138`) and R3 (`062`) each verify their own migration the same way; a database missing a later one never takes an earlier part down. There are no switches. |
 | `iga_gov_settings.enforcement_mode` | `findings_only` (default), `enforce` | `findings_only`: findings, proposals, reviews, approvals and J1 export; `direct` and `iac_pr` deployments refused with `enforcement_not_enabled` |
 | `cloud_enforcement_binding.state = verified` | per account | Required for `direct` (J3) |
 | `iga_gov_iac_source` covering the role | per account/repository | Required for `iac_pr` (J2) |
@@ -1285,8 +1285,8 @@ names only `iga_*` tables and the allowlisted shared tables.
 | Evidence trust | per bundle (§2.11) | `untrusted` blocks compilation; `partial` requires per-gap acceptance at approval |
 | `GET /api/iga/v1/capabilities` | adds `policy: { findings, proposals, export, iac, enforcement, slack, providers: { aws: "supported", k8s: "not_supported" } }` with a reason per unavailable flag | The UI explains disabled actions from these flags |
 
-`IGA_LEGACY_AGENT_POLICY` (default `on`) belongs to the disposition plan; it
-gates the legacy workers, not Phase 3.
+The legacy agent-policy workers always run (disposition plan); Phase 3 does not
+gate them.
 
 ### 4.4 Credentials
 
@@ -3119,7 +3119,7 @@ group. The `policy` prefix keeps Phase 3 out of the graph's own namespace
 - **Concurrency.** Writes that change a version or a decision carry the
   expected state (`base_version_no`, hashes); a mismatch is `409`, never a
   silent overwrite.
-- **Gate.** With `IGA_POLICY` off or unverified, every route returns
+- **Gate.** Until the policy schema verifies, every route returns
   `503 policy_unavailable` with the reason from `/capabilities`.
 
 **Evaluation rule.** Findings are evaluated per AWS publication (§8.2). Finding
@@ -3291,8 +3291,7 @@ The version then follows the normal approve → deploy path (§8.10).
 | `POST /api/iga/v1/legacy/agent-policies/:id/pause` | `governance:enforce` | Proxied to the legacy manager: sets the policy disabled; audited |
 | `DELETE /api/iga/v1/legacy/agent-policies/:id` | `governance:enforce` | Proxied removal; audited; `{ reason }` |
 
-These routes exist only while `agent_policies` has rows or
-`IGA_LEGACY_AGENT_POLICY=on`. They never create or edit a legacy policy, and
+These routes exist for every workspace. They never create or edit a legacy policy, and
 no Phase 3 route reads or writes `agent_policies`. The legacy
 `/authsec/governance/agent-policies` routes keep their current behaviour.
 
@@ -3337,8 +3336,7 @@ no Phase 3 route reads or writes `agent_policies`. The legacy
 
 ### 8.1 The policy job worker and fencing
 
-`PolicyJobWorker` starts from `cmd/main.go` only when `IGA_POLICY=on` and the
-schema is verified. It claims `iga_gov_job` rows with the fenced lease of
+`PolicyJobWorker` starts from `cmd/main.go` once the schema is verified. It claims `iga_gov_job` rows with the fenced lease of
 `iga_projection_job`: one `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED
 LIMIT 1) RETURNING *` that bumps `lease_version` and `attempts`. Every write the
 job makes is fenced on `(id, lease_owner, lease_version)` and returns
@@ -3451,7 +3449,7 @@ deployments per workspace run concurrently.
 
 ```
 publish rev N (existing transaction; inserts iga_gov_evaluation(N, running, attempts 1) in it)
-if IGA_POLICY=on:
+if the policy gate is available:
     ev := read iga_gov_evaluation(N)
     if ev.status in (complete, superseded): skip                                       // replay is a no-op
     if a newer revision's evaluation is complete: set N superseded; skip
@@ -3482,8 +3480,8 @@ A replayed projection job (crash after publication) hits `AlreadyPublished`
 and runs this step again before releasing: a `complete` evaluation is left
 untouched, a `running` one is continued, and a `failed` one is retried through
 the fenced transition. When rev N+1's evaluation has already completed, N is marked
-`superseded` and skipped. With `IGA_POLICY=off` the row is not inserted and the
-step does nothing.
+`superseded` and skipped. While the policy gate is unavailable the row is not inserted and
+the step does nothing.
 
 ### 8.3 Compiling plans
 
@@ -4164,7 +4162,7 @@ Logs' real events are the whole of the new surface.
 
 | Route | View |
 |---|---|
-| `/iga/policy` | Overview: **readiness** first (below), then what needs a decision now (approvals, reviews due, deployments needing attention), coming deadlines. With `IGA_POLICY` off, the current reference preview stays |
+| `/iga/policy` | Overview: **readiness** first (below), then what needs a decision now (approvals, reviews due, deployments needing attention), coming deadlines. |
 | `/iga/policy/findings` (`?finding=<id>` opens the drawer) | S1 Findings, S2 drawer |
 | `/iga/policy/policies` | S7 Policies |
 | `/iga/policy/policies/:id/:tab?` | S5 Policy detail: `overview`, `targets`, `owners`, `rollout`, `deployments`, `events`, `versions` |
@@ -4176,7 +4174,7 @@ Logs' real events are the whole of the new surface.
 | `/iga/policy/legacy` | Read-only **Legacy agent policies** (§7.10), shown only when the compatibility read returns rows |
 | `/iga/logs` | Logs (§9.6) |
 
-**Retired-route replacements.** Once `IGA_POLICY` is on, the bookmarks that
+**Retired-route replacements.** The bookmarks that
 today render `RetiredPage` (`App.tsx:839-930`) redirect:
 
 | Bookmark | Replacement |
@@ -4187,7 +4185,6 @@ today render `RetiredPage` (`App.tsx:839-930`) redirect:
 | `/iga/upcoming` | `/iga/policy` (Overview › Coming up) |
 | `/iga/provenance`, `/iga/certification[/:id]`, `/iga/sod`, `/iga/birthrights` | Unchanged: `RetiredPage` |
 
-With `IGA_POLICY` off they keep rendering `RetiredPage`.
 
 ### 9.3 Policy views
 
@@ -4519,8 +4516,8 @@ legacy reconciler until its retirement gate.
 
 ### 9.6 Logs
 
-`/iga/logs` keeps its layout (`LogsPage`, `EventDrawer`, `KindGlyph`). With
-`IGA_POLICY` on it is an audit feed of **recorded events only**: policy kinds
+`/iga/logs` keeps its layout (`LogsPage`, `EventDrawer`, `KindGlyph`). It is
+an audit feed of **recorded events only**: policy kinds
 from `GET /policy/events` (§7.8) — proposal, review response, approval and
 each acceptance, revalidation, rollout stage, deployment attempt (with AWS
 request id, including `unknown` attempts), verification, drift, undo, control
@@ -4531,14 +4528,14 @@ disabled, with one line explaining it; no sample event is mixed into the
 feed. Export uses `/policy/events/export` and contains only recorded events.
 
 The fixture timeline (`fixtures.ts`) remains only as the separate preview
-shown while `IGA_POLICY` is off, under its *Preview — sample events* banner;
-it is never shown beside real events.
+shown while the policy gate is unavailable, under its *Preview — sample events*
+banner; it is never shown beside real events.
 
 ### 9.7 States and copy
 
 | Situation | What the user sees |
 |---|---|
-| `IGA_POLICY` off | Policy shows the current reference preview; Logs stays a preview |
+| Policy schema not verified | Policy says it is not available on this server, with the reason; Logs stays a preview |
 | Never evaluated | "Findings appear after the next scan publishes" |
 | `findings_only` | Banner; deliveries other than Export disabled with the reason |
 | Evidence untrusted | "AuthSec cannot propose a change from this evidence: <source> is <stale / not authenticated / incomplete>." with the Connections link |
@@ -4934,7 +4931,7 @@ stack touches.
 
 | Stage | Exit |
 |---|---|
-| **0. Legacy containment** (disposition plan §5 steps 1–2) — stale-report repair, legacy audit gaps, `IGA_LEGACY_AGENT_POLICY` (default `on`), compatibility read | Gate and compatibility read merged; G1 counts requested from the operator |
+| **0. Legacy containment** (disposition plan §5 steps 1–2) — stale-report repair, legacy audit gaps, compatibility read | Gate and compatibility read merged; G1 counts requested from the operator |
 | **A. Lock** — this spec approved; migration numbers re-checked against the files; bootstrap parity to `046` (T3.00); `047`–`056` rehearsed on a production-schema copy (the fresh-database rehearsal is §6.3); enforcement template written; its §3.6 self-test run by hand in the lab account, including the `DeleteRolePermissionsBoundary` condition-key check | Rehearsal log; template review; self-test transcript |
 | **B. UI/UX** — every §9 view against the §7 contracts with typed fixtures, reviewed in the running console | `ui-reviewer` pass; walkthrough recorded |
 | **C. Backend** — services, workers, adapters, routes | `authsec-reviewer` pass; existing checks and `ci-iga-isolation-check.sh` green; §6.3 probes re-run |
@@ -4949,7 +4946,7 @@ work items owned by the discovery and agent repositories (§12.2).
 |---|---|---|
 | T3.00 | Bring `001_bootstrap.sql` to the end state of `001`–`046`, proven by the three-way schema comparison of §6.1; fix any later file that is not re-runnable over it | A |
 | T3.01 | Migrations `047`–`056` as in §6.2, and the same objects in `001` (three-way comparison to `056`); Go models; repositories | T3.00 |
-| T3.02 | `IGA_POLICY` gate; Phase 3 schema verification by relation and column; capabilities `policy` block with provider support | T3.01 |
+| T3.02 | Policy gate; Phase 3 schema verification by relation and column; capabilities `policy` block with provider support | T3.01 |
 | T3.03 | Activity sample prioritises workload-bound and controlled roles (§2.6) | — |
 | T3.03b | Discovery template version: resource-policy collection (§3.9) — the collected forms; immutable observations, documents and coverage; region completeness; retention — and the read-only migration-evidence actions of §11 (ECS services and tasks, Lambda aliases, versions and event-source mappings, Auto Scaling groups, launch template versions, instance-profile associations) | T3.01 |
 | T3.04 | CloudTrail reader: session-issuer and session-name attribution, authorization error codes, denial classification (§8.6) | — |
@@ -5121,7 +5118,7 @@ The gate passes only when every expectation is observed and recorded (§14.4).
 | A5 | Owner gate | No response; missing owner; retain `dynamodb`; age not confirmed | Blocked until exception; new version; `age_unconfirmed` |
 | A6 | Observation and canary | Attempt a removed service during observation; deny a retained service during canary | Version to draft; rollout paused with Undo offered |
 | A7 | Versions immutable | Edit an approved version | New version; old approval does not apply |
-| A8 | Legacy stack untouched | With `IGA_LEGACY_AGENT_POLICY=on`, existing legacy policies reconcile while A1 runs; compare `agent_policies` and `agent_policy_actions` before and after | Legacy rows and reconcile outcomes as without Phase 3; no Phase 3 route reads or writes `agent_policies`; `/authsec/governance/agent-policies` responses unchanged |
+| A8 | Legacy stack untouched | Existing legacy policies reconcile while A1 runs; compare `agent_policies` and `agent_policy_actions` before and after | Legacy rows and reconcile outcomes as without Phase 3; no Phase 3 route reads or writes `agent_policies`; `/authsec/governance/agent-policies` responses unchanged |
 | A9 | Duplicate grants | Two policies grant `sqs:*` | Boundary still removes it; both grants remain declared |
 | A10 | Shared role | Two workloads, one role | Both owners asked; canary requires both acknowledgements |
 | A11 | Ineligible roles | Service-linked; `authsec:protected`; a role tagged `ManagedBy=AuthSec` with a customer name; oversized document | Ineligible with reasons; nothing written; AWS denies a forced attempt |
@@ -5169,8 +5166,8 @@ The gate passes only when every expectation is observed and recorded (§14.4).
 | A53 | Evidence not trustworthy | (a) Activity report older than the freshness rule; (b) resource-policy coverage `partial`; (c) a Kubernetes ServiceAccount key | (a) `422 evidence_untrusted` naming the source, Connections link; (b) bundle `partial`, approval `409 evidence_gaps_not_accepted` until each gap is accepted; (c) `not_supported` with `K-1`, no finding, no plan |
 | A54 | Target beyond list caps | A workspace with more than 10,000 inventory rows; target a role absent from the first inventory page and from the graph's loaded view, by ARN and by Discovery object id | Resolved by `RoleId`; consumers and owners complete (`consumers_unresolved = 0`); the proposal matches one made for a role on the first page |
 | A55 | Verification stays unknown | Apply succeeds; block scans of the account (stop the scanner) for longer than the verification deadline | `applied_unverified`, then `overdue` with the reason; never `verified` by elapsed time; restoring scans verifies it |
-| A56 | Legacy coexistence | A workspace with one enabled legacy policy: list it in Policy › Legacy; Pause it; Remove another; turn `IGA_LEGACY_AGENT_POLICY` off and on | Both actions audited in `audit_events` and shown in Logs; workers stop with the gate off and resume with it on; no Phase 3 artifact or row changes |
-| A57 | Bookmarks and placement | Open `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement`, `/iga/upcoming`, `/iga/sod` with `IGA_POLICY` on and off | On: redirects of §9.2; `/iga/sod` stays retired. Off: `RetiredPage` for all. No sidebar entry beyond the four destinations |
+| A56 | Legacy coexistence | A workspace with one enabled legacy policy: list it in Policy › Legacy; Pause it; Remove another | Both actions audited in `audit_events` and shown in Logs; no Phase 3 artifact or row changes |
+| A57 | Bookmarks and placement | Open `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement`, `/iga/upcoming`, `/iga/sod` | Redirects of §9.2; `/iga/sod` stays retired. No sidebar entry beyond the four destinations |
 | A58 | Unknown and late mutations | Fault injection at the adapter: (a) kill the worker after AWS accepted `CreatePolicyVersion` and before the response is recorded; (b) delay a `CreatePolicyVersion` past the client timeout; (c) try an undo and a version-3 deployment while (a) or (b) is unknown; (d) make readback disagree with CloudTrail; (e) release (b)'s request after version 3 verified; (f) in (d), choose Accept observed state | (a) the replacement finds the attempt `dispatched`, marks it `unknown`, never re-sends; a `prepared` attempt is `abandoned` and re-prepared; (b) `unknown`, no SDK retry; (c) refused (`409 outcome_unknown_pending`); (d) `outcome_unresolved`, owner notified, role still locked; (e) `late_mutation_suspected` drift within 5 minutes, nothing reverted; (f) the role stays locked until the new plan is approved, then the handoff releases it in one transaction |
 | A59 | Rescan after approval | Approve; publish two unchanged scans before the canary and one between canary and expansion; then add a consumer of the role and rescan | Three `unchanged` revalidations, the approved `plan_hash` untouched, no new approval or owner notice; after the new consumer: `material_change` naming `consumers`, deployment `blocked`, review reopened for the new owner, re-approval required |
 | A60 | Undo of a split copy | A customer boundary shared by two roles; J2 split copy for role A merged and applied; then Undo | The undo plan names the copy as replaced with `delete`; the revert PR re-points role A to the shared boundary and deletes the copy; verified only when the copy is `NoSuchEntity` and the shared policy and role B are unchanged. If the copy is attached to a third role first: undo `blocked: artifact_consumers_changed`, role-only recovery `retain_shared` |
@@ -5265,7 +5262,7 @@ by a recorded run, never by code review.
 25. Bootstrap parity to `046` is a prerequisite of the Phase 3 migrations, not
     a deferred question (§6.1).
 26. Logs shows recorded events only; sample events exist only in the preview
-    shown while `IGA_POLICY` is off (§9.6).
+    shown while the policy gate is unavailable (§9.6).
 27. One classifier, by fact, decides before / intermediate / after /
     conflict for direct, PR and export delivery; an intermediate IaC state is
     pending, never verified or failed (§2.8).

@@ -51,10 +51,10 @@ const (
 	GovCatUndo           = "undo"
 	GovCatControlRemoval = "control_removal"
 	GovCatLegacy         = "legacy_agent_policy"
-	// R2 (IGA_POLICY_R2): temporary grants, session revocations and
+	// R2 (R2): temporary grants, session revocations and
 	// time-bound retention notices.
 	GovCatTimeBoundAccess = "time_bound_access"
-	// R3 (IGA_POLICY_R3): agent runtime controls. Listed by the Logs kind
+	// R3 (R3): agent runtime controls. Listed by the Logs kind
 	// filter only while the switch is on (GovEventCategories), so with it off
 	// the filter is exactly R2's.
 	GovCatRuntimeControls = "runtime_controls"
@@ -231,7 +231,7 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRolloutUndone, GovCatRollout, GovObjVersion, "The rollout's applied change was undone."},
 	{GovEventRolloutRefreshQueued, GovCatRollout, GovObjConnector, "A connector scan was queued so observation gets a fresh activity report."},
 	{GovEventRolloutRemoveControlStarted, GovCatControlRemoval, GovObjVersion, "An approved remove_control version was started (no observation or canary)."},
-	// R2 (IGA_POLICY_R2, iga_gov_r2_grants.go, iga_gov_r2_timebound.go).
+	// R2 (R2, iga_gov_r2_grants.go, iga_gov_r2_timebound.go).
 	{GovEventAccessCreated, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was created (its rule, name and reason)."},
 	{GovEventAccessApplied, GovCatTimeBoundAccess, GovObjPolicy, "An access policy version was applied by a workspace admin; its deployments were queued."},
 	{GovEventAccessConfirmed, GovCatTimeBoundAccess, GovObjPolicy, "An access policy is attached to a role and verified by readback."},
@@ -268,7 +268,7 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRevocationDrift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's policy changed outside AuthSec (never auto-reconciled)."},
 	{GovEventTimeBoundExpiring, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expires within 7 days."},
 	{GovEventTimeBoundExpired, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expired; posture follows."},
-	// R3 (IGA_POLICY_R3, iga_gov_r3_policy.go, iga_gov_r3_runtime.go).
+	// R3 (R3, iga_gov_r3_policy.go, iga_gov_r3_runtime.go).
 	{GovEventRuntimePolicyCreated, GovCatRuntimeControls, GovObjPolicy, "A runtime_controls policy was created with its first version in review."},
 	{GovEventRuntimeVersionCreated, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was created in review."},
 	{GovEventRuntimeVersionApproved, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was approved (governance:approve, not its author); the previous one was superseded."},
@@ -349,20 +349,9 @@ func GovEventObjectKinds() []string {
 	return out
 }
 
-// GovEventVocabularyServed is the vocabulary GET /events/kinds serves: R3's
-// entries only while IGA_POLICY_R3 is switched on, so with it off the answer
-// is exactly R2's.
+// GovEventVocabularyServed is the vocabulary GET /events/kinds serves.
 func GovEventVocabularyServed() []GovEventKind {
-	if PolicyR3GateState().Enabled() {
-		return GovEventVocabulary
-	}
-	out := make([]GovEventKind, 0, len(GovEventVocabulary))
-	for _, k := range GovEventVocabulary {
-		if k.Category != GovCatRuntimeControls {
-			out = append(out, k)
-		}
-	}
-	return out
+	return GovEventVocabulary
 }
 
 // GovEventCategory is the Logs category of an event name ("" when the name
@@ -394,11 +383,7 @@ var govUnrecordedCategories = []string{GovCatProposal, GovCatApproval, GovCatAcc
 func GovEventCategories() []GovEventCategoryView {
 	idx := map[string]int{}
 	var out []GovEventCategoryView
-	r3 := PolicyR3GateState().Enabled()
 	for _, k := range GovEventVocabulary {
-		if k.Category == GovCatRuntimeControls && !r3 {
-			continue
-		}
 		i, ok := idx[k.Category]
 		if !ok {
 			i = len(out)
