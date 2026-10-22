@@ -126,7 +126,7 @@ func TestSightingNeverRetiresAWorkloadOnItsOwn(t *testing.T) {
 func TestReportedSightingAndDeletionReachTheGraphAtOnce(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 
 	_, _, err := disco.ReportSighting(ws, "test", services.SightingInput{

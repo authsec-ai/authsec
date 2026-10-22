@@ -39,27 +39,6 @@ func p3GraphOn(t *testing.T, db *gorm.DB) func() *services.GraphProjectionGate {
 	return func() *services.GraphProjectionGate { return g }
 }
 
-// The switch is read like IGA_GRAPH_PROJECTION's: a typo is misconfigured,
-// never silently on or off.
-func TestP3T302PolicyEnvParsing(t *testing.T) {
-	graphOff := func() *services.GraphProjectionGate { return services.NewGraphProjectionGate(false, "") }
-	for v, want := range map[string]string{
-		"": services.PolicyOff, "off": services.PolicyOff, "FALSE": services.PolicyOff, "0": services.PolicyOff,
-		"on": services.PolicyMisconfigured, "true": services.PolicyMisconfigured, " 1 ": services.PolicyMisconfigured,
-		"maybe": services.PolicyMisconfigured,
-	} {
-		t.Setenv(services.PolicyEnv, v)
-		g := services.PolicyGateFromEnv(graphOff)
-		state, reason, _ := g.Status()
-		if state != want || reason == "" || g.Available() {
-			t.Errorf("%s=%q: state %q reason %q available %v, want %q with a reason, unavailable", services.PolicyEnv, v, state, reason, g.Available(), want)
-		}
-		if v == "maybe" && !strings.Contains(reason, "is not on or off") {
-			t.Errorf("a bad value's reason = %q", reason)
-		}
-	}
-}
-
 // Fail closed, every way: the graph gate off or misconfigured, the schema not
 // yet verified, a Phase 3 relation missing, a bad switch value. Only the
 // complete combination is on, and a verified schema follows the graph gate
@@ -78,8 +57,8 @@ func TestP3T302PolicyGateFailsClosed(t *testing.T) {
 	if err := g.Verify(db); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if state, reason, _ := g.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, services.GraphProjectionEnv) {
-		t.Fatalf("graph off: %q %q, want misconfigured naming %s", state, reason, services.GraphProjectionEnv)
+	if state, reason, _ := g.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, "graph") {
+		t.Fatalf("graph off: %q %q, want misconfigured naming the graph", state, reason)
 	}
 	// Graph switched on but its schema unverified: still unavailable.
 	graphGate = services.NewGraphProjectionGate(true, "")
@@ -130,7 +109,7 @@ func TestP3T302PolicyGateFailsClosed(t *testing.T) {
 	// Off is off, verified or not.
 	off := services.NewPolicyGate(false, "", graphOn)
 	_ = off.Verify(db)
-	if state, reason, _ := off.Status(); state != services.PolicyOff || reason != services.PolicyEnv+" is off" {
+	if state, reason, _ := off.Status(); state != services.PolicyOff || reason != "policy is off" {
 		t.Fatalf("off: %q %q", state, reason)
 	}
 	var nilGate *services.PolicyGate
@@ -260,7 +239,7 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 		state  string
 		reason any
 	}{
-		{"off", services.NewPolicyGate(false, "", graphOn), services.PolicyOff, services.PolicyEnv + " is off"},
+		{"off", services.NewPolicyGate(false, "", graphOn), services.PolicyOff, "policy is off"},
 		{"on", verified, services.PolicyOn, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,10 +278,10 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				if r == "" {
 					t.Errorf("policy.%s is false with no reason", f)
 				}
-				if tc.state == services.PolicyOff && r != services.PolicyEnv+" is off" {
+				if tc.state == services.PolicyOff && r != "policy is off" {
 					t.Errorf("off: reasons.%s = %q, want the gate's reason", f, r)
 				}
-				if tc.state == services.PolicyOn && r == services.PolicyEnv+" is off" {
+				if tc.state == services.PolicyOn && r == "policy is off" {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
 				}
 			}

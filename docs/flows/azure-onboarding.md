@@ -608,7 +608,7 @@ can only get one by name.
 
 ### The IGA graph
 
-With `IGA_GRAPH_PROJECTION=on`, each finished pass is projected into the
+Once the graph schema has verified, each finished pass is projected into the
 shared `iga_*` graph under provider `azure` (`internal/azuregraph`), in its own
 transaction, the tenant first: Entra objects, credentials, API permissions,
 resources, entitlements, workloads, access edges (`iga_access_edges`), group
@@ -711,7 +711,7 @@ the connector as it was, so scheduled discovery keeps trying.
 
 ## Testing locally
 
-1. Set the three required `AZURE_*` variables and `REDIS_URL`, then start the backend (`IGA_GRAPH_PROJECTION=on` to project into the graph). Migrations 141-143 apply at boot. The own-app flow also needs `VAULT_ADDR` and `VAULT_TOKEN`.
+1. Set the three required `AZURE_*` variables and `REDIS_URL`, then start the backend. Migrations 141-143 apply at boot. The own-app flow also needs `VAULT_ADDR` and `VAULT_TOKEN`.
 2. `GET /authsec/discovery/azure/oauth/status` should return `available: true`.
 3. Call `POST /authsec/discovery/azure/oauth/start` with a workspace admin JWT, and open `authorize_url` in a browser.
 4. Consent as a Global Administrator of a test tenant, then sign in with the same account.

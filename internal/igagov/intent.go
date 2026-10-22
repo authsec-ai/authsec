@@ -74,7 +74,7 @@ type RetainEntry struct {
 	Reason      string   `json:"reason,omitempty"`
 	ReviewBy    string   `json:"review_by,omitempty"`
 	Subjects    []string `json:"subjects,omitempty"`
-	// Until is R2's time-conditioned retention (IGA_POLICY_R2, DECISION
+	// Until is R2's time-conditioned retention (R2, DECISION
 	// R2-2): an owner retain kept only until this date, after which AWS
 	// itself excludes the service. Omitted when empty, so every R1a intent
 	// and its intent_hash are unchanged.
@@ -197,11 +197,11 @@ type RightSizeIntent struct {
 	FindingIDs      []string       `json:"finding_ids,omitempty"`
 	EvidenceRev     int64          `json:"evidence_rev"`
 	// RemoveActions is R1b's action-level removal within services the role
-	// keeps (IGA_POLICY_R1B). Omitted when empty, so every R1a intent and
+	// keeps (R1b). Omitted when empty, so every R1a intent and
 	// its intent_hash are unchanged.
 	RemoveActions []RemoveActionEntry `json:"remove_actions,omitempty"`
 	// RetainActionsUntil is R2's action-level time-conditioned retention
-	// (IGA_POLICY_R2): actions of kept services kept only until a date.
+	// (R2): actions of kept services kept only until a date.
 	// Omitted when empty, so every R1a/R1b intent hashes as before.
 	RetainActionsUntil []RetainActionUntilEntry `json:"retain_actions_until,omitempty"`
 }
@@ -524,7 +524,7 @@ func validateRightSize(c *collector, r RightSizeIntent) {
 		validateRemoveActions(c, r, removed)
 	}
 	if r.HasTimeBound() {
-		// R2 (IGA_POLICY_R2): time-conditioned retention, DECISION R2-6.
+		// R2 (R2): time-conditioned retention, DECISION R2-6.
 		validateTimeBound(c, r, removed)
 	}
 
@@ -726,7 +726,7 @@ func validateDedicated(c *collector, d DedicatedIdentityIntent) {
 	if d.Delivery != DeliveryIaCPR && d.Delivery != DeliveryExport &&
 		!(d.Delivery == DeliveryDirect && d.Workload.BindingKind == BindingLambdaRole) {
 		// R2 (DECISION R2-13): a Lambda split may be executed directly; the
-		// service refuses it while IGA_POLICY_R2 is off.
+		// service refuses it while R2 is unavailable.
 		c.add("delivery", "invalid", "a dedicated identity is delivered only as iac_pr or export (§11; 050 iga_gov_plan_kind_chk)")
 	}
 }

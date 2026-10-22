@@ -119,7 +119,7 @@ type SplitInput struct {
 	// migration-evidence reads (§11); otherwise no isolation is offered.
 	MigrationEvidenceAvailable bool
 	// DirectAllowed is R2's switch for direct (J3) execution of a Lambda
-	// split (IGA_POLICY_R2 on; DECISION R2-13). False keeps §11's rule:
+	// split (R2 on; DECISION R2-13). False keeps §11's rule:
 	// a direct split is refused.
 	DirectAllowed bool
 }
@@ -471,7 +471,7 @@ func CompileSplit(in SplitInput) (SplitPlans, error) {
 	if in.Intent.Delivery == DeliveryDirect {
 		// R2 (DECISION R2-13): direct only for a Lambda function, under
 		// /authsec/split/, with no boundary, aliases or PR-edited items;
-		// without IGA_POLICY_R2 a direct split is refused as in R1a.
+		// without R2 a direct split is refused as in R1a.
 		if rs := splitDirectRefusals(in, src); len(rs) > 0 {
 			sp.refuse(rs...)
 		} else {

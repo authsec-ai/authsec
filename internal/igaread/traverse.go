@@ -55,8 +55,10 @@ import (
 // graphNodeTypes are the reference types a traversal may start from or reach
 // (§5.4 "The traversal graph", D-39), in the order a level reads them. A
 // policy is not a traversal node (its statements are), and a claim is not a
-// node at all: either as a root is 400.
-var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource}
+// node at all: either as a root is 400. An Azure role assignment is a node of
+// its own (traverse_azure.go); an Azure scope node is a leaf, never a root and
+// never expanded, and is not listed.
+var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource, RefRoleAssignment}
 
 // Edge kinds (§5.4). The claim behind each: relationship (the first four and
 // can_assume), grant, target.
@@ -232,11 +234,15 @@ type GraphNode struct {
 	SubScope *graphOptional `json:"sub_scope,omitempty"`
 	NativeID string         `json:"native_id,omitempty"`
 	K8sRule  *GraphK8sRule  `json:"k8s_rule,omitempty"`
+	// AzureRole is an Azure role assignment node's role (traverse_azure.go):
+	// absent on every other node. provider, scope, sub_scope and native_id
+	// above carry Azure nodes' too ("azure", the azure_tenant scope).
+	AzureRole *GraphAzureRole `json:"azure_role,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
-	provider  string // the node's provider (aws | k8s); "" for an external principal
-	want      string // the provider the node is read as (aws | k8s); "" for a root: either
+	provider  string // the node's provider (aws | k8s | azure); "" for an AWS external principal
+	want      string // the provider the node is read as (aws | k8s | azure); "" for a root: any
 	typ       string
 	id        uuid.UUID
 	key       string // source_key
@@ -423,7 +429,9 @@ func (g *GraphTraversal) meta(q *Query, t *graphTraversal) GraphMeta {
 			{"code": graphLimOrganizations},
 		},
 	}
-	switch aws, k8s := t.sides(); {
+	switch aws, k8s, azure := t.sides(); {
+	case azure:
+		graphAzureMeta(&m, aws, k8s)
 	case aws && k8s:
 		graphMixedMeta(&m)
 	case k8s:
@@ -523,8 +531,9 @@ type graphTraversal struct {
 	budget time.Duration
 
 	// provider is the (first) ROOT's provider: "" until the root is read,
-	// then models.ProviderAWS or models.ProviderK8s. An external principal
-	// root is AWS's: principals are the AWS trust graph's. Every edge is read
+	// then models.ProviderAWS, models.ProviderK8s or models.ProviderAzure. An
+	// external principal root is AWS's (principals are the AWS trust graph's)
+	// unless the Azure projection wrote it. Every edge is read
 	// in the provider of the node it is read FROM (graphProviderSlot), so a
 	// walk stays in its root's provider except across a crossing
 	// (traverse_cross.go).
@@ -535,6 +544,8 @@ type graphTraversal struct {
 	// (traverse_cross.go): with a Kubernetes root, or the first time a level
 	// meets an external principal.
 	cross *graphCross
+	// az is what an Azure walk reads once per request (traverse_azure.go).
+	az *graphAzureState
 
 	nodes   map[string]*GraphNode
 	order   []*GraphNode
@@ -569,7 +580,8 @@ func (t *graphTraversal) node(ref string) *GraphNode { return t.nodes[ref] }
 // of this workspace (404, no hint).
 //
 // A root is looked for among AWS's nodes (and external principals), then
-// Kubernetes'; the first root read sets t.provider. An AWS root exists only
+// Kubernetes', then Azure's (traverse_azure.go: like Kubernetes', no
+// publication is needed); the first root read sets t.provider. An AWS root exists only
 // in a published graph (D-4: nothing exists before the first publication), so
 // without a publication it is 404 exactly as before. Kubernetes rows are not
 // tied to a publication (they are written straight from a sweep), so a
@@ -681,14 +693,14 @@ func (t *graphTraversal) units(lv *graphLevel, frontier []*GraphNode, dir, kind 
 		return nil, nil
 	}
 	var out []graphUnit
-	for _, side := range []string{models.ProviderAWS, models.ProviderK8s} {
-		if graphSideHasKind(side, kind) {
-			u := graphUnit{kind: kind, side: side, spec: spec, groups: map[string][]uuid.UUID{}}
+	for _, side := range []string{models.ProviderAWS, models.ProviderK8s, models.ProviderAzure} {
+		if s := graphSpecForSide(dir, kind, side); s != nil && graphSideHasKind(side, kind) {
+			u := graphUnit{kind: kind, side: side, spec: s, groups: map[string][]uuid.UUID{}}
 			for _, n := range frontier {
 				if n.side() != side {
 					continue
 				}
-				if _, ok := spec.near[n.typ]; !ok {
+				if _, ok := s.near[n.typ]; !ok {
 					continue
 				}
 				if kind == GraphEdgeCanAssume && opts.noAssume[n.Ref] {
@@ -811,7 +823,9 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 				farSide := u.side
 				var crossing *graphCrossMatch
 				principal := row.FromID
-				if kind == GraphEdgeCanAssume && row.FromType == RefExternalPrincipal &&
+				// An Azure walk never crosses (traverse_azure.go): its
+				// principals are shown, as they were read, and not re-pointed.
+				if kind == GraphEdgeCanAssume && row.FromType == RefExternalPrincipal && u.side != models.ProviderAzure &&
 					(u.cross || (dir == GraphReverse && !t.held(R(RefExternalPrincipal, row.FromID), staged))) {
 					if m, ok := t.cross.match(row.FromID); ok {
 						crossing = &m
@@ -947,13 +961,19 @@ func nearOf(e *GraphEdge, dir string) string {
 
 // graphKindsFor is every edge kind that can lead out of a node of this type
 // in this direction (§5.4's table). An external principal is terminal in
-// reverse (nothing targets one), and a resource in forward.
+// reverse (nothing targets one), and a resource in forward. Azure's own
+// grant and target specs (traverse_azure.go) are read too: a role assignment
+// has a grant in reverse and a target forward.
 func graphKindsFor(typ, dir string) []string {
 	var out []string
 	for _, k := range graphEdgeKinds {
-		if s := graphSpecFor(dir, k); s != nil {
+		for _, s := range []*graphEdgeSpec{graphSpecFor(dir, k), graphAzureSpecs[dir][k]} {
+			if s == nil {
+				continue
+			}
 			if _, ok := s.near[typ]; ok {
 				out = append(out, k)
+				break
 			}
 		}
 	}

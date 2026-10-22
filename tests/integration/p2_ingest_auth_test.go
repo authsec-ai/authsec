@@ -51,7 +51,6 @@ func newIngestLab(t *testing.T) *ingestLab {
 	t.Setenv("JWT_DEF_SECRET", ingestJWTSecret+"-default")
 	t.Setenv("AUTH_EXPECT_ISS", "authsec-ai/auth-manager")
 	t.Setenv("REQUIRE_SERVER_AUTH", "true")
-	t.Setenv(services.GraphProjectionEnv, "off")
 	t.Setenv(services.DiscoveryIngestAuthEnv, "off")
 
 	l := &ingestLab{t: t, db: db, tokens: services.NewDiscoveryIngestTokens(db)}

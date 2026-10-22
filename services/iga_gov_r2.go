@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,32 +13,26 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
-// The IGA_POLICY_R2 gate: Phase 3 R2, time-bound access and session response
-// (SPEC-iga-phase3-policy.md §12.3). There is no R2 implementation spec; the
-// decisions are DECISION R2-n comments (internal/igagov/r2.go lists them) and
-// in the R2 report.
+// The Phase 3 R2 gate: time-bound access and session response (SPEC-iga-phase3-policy.md §12.3). There is no R2
+// implementation spec; the decisions are DECISION R2-n comments (internal/igagov/r2.go lists them) and
+// in the R2 report. R2 is always on; it serves
+// once the policy gate is available and its own migration has verified.
 //
-//	IGA_POLICY_R2   IGA_POLICY gate    061 schema     state           R2
-//	off/unset       any                any            off             nothing runs; every R1a / R1b path as before
-//	on              not available      any            misconfigured   nothing runs
-//	on              available          not verified   misconfigured   nothing runs
-//	on              available          verified       on              time-bound retention, temporary grants,
-//	                                                                  session revocation, direct Lambda splits
-//	other value     any                any            misconfigured   nothing runs
+//	policy gate     R2 schema   state           R2
+//	not available   any         misconfigured   nothing runs
+//	available       not verified misconfigured  nothing runs
+//	available       verified    on              time-bound retention, temporary grants,
+//	                                     session revocation, direct Lambda splits, access policies
 //
-// FAIL CLOSED, like IGA_POLICY and IGA_POLICY_R1B: anything wrong leaves R2
-// off with a reason (/capabilities policy.temporary_grants and
-// policy.session_revoke). R2 never takes the R1a gate down: R1a's schema
-// check (VerifyPolicySchema, head 059) reads nothing of 061, and this gate's
-// own check (VerifyPolicyR2Schema) is separate. R2 does not need R1b.
-
-// PolicyR2Env is the switch.
-const PolicyR2Env = "IGA_POLICY_R2"
+// FAIL CLOSED: anything missing leaves R2 unavailable with a reason
+// (/capabilities policy.temporary_grants and policy.session_revoke). R2 never takes the R1a gate down: R1a's schema check
+// (VerifyPolicySchema, head 059) reads nothing of R2's migration, and this
+// gate's own check (VerifyPolicyR2Schema) is separate.
 
 // PolicyR2SchemaHead is the migration R2 needs.
 const PolicyR2SchemaHead = "061"
 
-// PolicyR2Gate carries the switch and whether 061 has been verified.
+// PolicyR2Gate carries whether 061 has been verified.
 type PolicyR2Gate struct {
 	enabled  bool
 	badValue string
@@ -58,33 +51,26 @@ func NewPolicyR2Gate(enabled bool, badValue string) *PolicyR2Gate {
 	return g
 }
 
-// PolicyR2GateFromEnv reads IGA_POLICY_R2 once: unset, off, false, 0 are
-// off; on, true, 1 are on; anything else is misconfigured.
-func PolicyR2GateFromEnv() *PolicyR2Gate {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(PolicyR2Env))); v {
-	case "", "off", "false", "0":
-		return NewPolicyR2Gate(false, "")
-	case "on", "true", "1":
-		return NewPolicyR2Gate(true, "")
-	default:
-		return NewPolicyR2Gate(true, fmt.Sprintf("%s=%q is not on or off", PolicyR2Env, v))
-	}
+// DefaultPolicyR2Gate is the gate main installs: on, serving once its schema
+// verifies and the policy gate is available.
+func DefaultPolicyR2Gate() *PolicyR2Gate {
+	return NewPolicyR2Gate(true, "")
 }
 
-// Enabled reports whether the switch is on (verified or not).
+// Enabled reports whether the gate is on (verified or not).
 func (g *PolicyR2Gate) Enabled() bool { return g != nil && g.enabled }
 
-// Status is the gate's state and the reason when it is not on. The IGA_POLICY
+// Status is the gate's state and the reason when it is not on. The policy
 // gate is read live: R2 is on only while R1a is.
 func (g *PolicyR2Gate) Status() (state, reason string) {
 	if g == nil || !g.enabled {
-		return PolicyOff, PolicyR2Env + " is off"
+		return PolicyOff, "R2 is off"
 	}
 	if g.badValue != "" {
 		return PolicyMisconfigured, g.badValue
 	}
 	if ps, pr, _ := PolicyGateState().Status(); ps != PolicyOn {
-		r := fmt.Sprintf("%s=on requires %s=on and available; the policy gate is %s", PolicyR2Env, PolicyEnv, ps)
+		r := fmt.Sprintf("R2 needs the policy gate available; it is %s", ps)
 		if pr != "" {
 			r += ": " + pr
 		}
@@ -135,11 +121,10 @@ func (g *PolicyR2Gate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interv
 	for {
 		err := g.Verify(db)
 		if err == nil {
-			log.Printf("[policy] %s=on: R2 schema verified at %s; time-bound access and session response run while %s is available",
-				PolicyR2Env, PolicyR2SchemaHead, PolicyEnv)
+			log.Printf("[policy] R2 schema verified at %s; time-bound access and session response run while policy is available", PolicyR2SchemaHead)
 			return
 		}
-		log.Printf("[policy] %s=on but not ready, R2 stays off: %v", PolicyR2Env, err)
+		log.Printf("[policy] R2 not ready, R2 stays off: %v", err)
 		if g.badValue != "" {
 			return
 		}
@@ -203,7 +188,7 @@ func VerifyPolicyR2Schema(db *gorm.DB) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("%s=on needs migration %s; missing: %s", PolicyR2Env, PolicyR2SchemaHead, strings.Join(missing, ", "))
+		return fmt.Errorf("R2 needs migration %s; missing: %s", PolicyR2SchemaHead, strings.Join(missing, ", "))
 	}
 	return nil
 }

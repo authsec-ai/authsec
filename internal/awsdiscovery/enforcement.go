@@ -38,7 +38,7 @@ const EnforcementTemplateVersion = "2026-10-07"
 // grants and session revocation (attach/detach of AuthSec policies,
 // DECISION R2-14) and, behind the EnableLambdaSplit parameter, direct Lambda
 // execution-role splits (DECISION R2-15). Issued for new bindings only while
-// IGA_POLICY_R2 is on; v1 stays the template of every existing binding.
+// R2 is available; v1 stays the template of every existing binding.
 //
 //go:embed authsec-aws-enforcement-role-v2.yaml
 var EnforcementCloudFormationTemplateV2 string

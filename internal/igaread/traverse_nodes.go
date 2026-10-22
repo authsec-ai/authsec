@@ -40,14 +40,19 @@ import (
 // to the same rule.
 //
 // Each node is read as the provider the edge that reached it is of (want,
-// traverse_k8s.go, traverse_cross.go); a root's provider is not known, and it
-// is looked for among AWS's nodes, then Kubernetes'.
+// traverse_k8s.go, traverse_cross.go, traverse_azure.go); a root's provider is
+// not known, and it is looked for among AWS's nodes, then Kubernetes', then
+// Azure's. An external principal root an Azure projection wrote (its source
+// key is Azure's) is Azure's, not AWS's.
 func (t *graphTraversal) fetchNodes(lv *graphLevel, nodes []*GraphNode) error {
-	var aws, k8s []*GraphNode
+	var aws, k8s, az []*GraphNode
 	for _, n := range nodes {
-		if n.want == models.ProviderK8s {
+		switch n.want {
+		case models.ProviderK8s:
 			k8s = append(k8s, n)
-		} else {
+		case models.ProviderAzure:
+			az = append(az, n)
+		default:
 			aws = append(aws, n)
 		}
 	}
@@ -56,13 +61,28 @@ func (t *graphTraversal) fetchNodes(lv *graphLevel, nodes []*GraphNode) error {
 			return err
 		}
 	}
+	var roots []*GraphNode
 	for _, n := range aws {
-		if !n.fetched && n.want == "" {
+		switch {
+		case !n.fetched && n.want == "":
 			k8s = append(k8s, n)
+		case n.fetched && n.want == "" && n.typ == RefExternalPrincipal && graphAzureKey(n.key):
+			*n = GraphNode{typ: n.typ, id: n.id, Ref: n.Ref}
+			az = append(az, n)
 		}
 	}
 	if len(k8s) > 0 {
-		return t.fetchK8sNodes(lv, k8s)
+		if err := t.fetchK8sNodes(lv, k8s); err != nil {
+			return err
+		}
+		for _, n := range k8s {
+			if !n.fetched && n.want == "" {
+				roots = append(roots, n)
+			}
+		}
+	}
+	if az = append(az, roots...); len(az) > 0 {
+		return t.fetchAzureNodes(lv, az)
 	}
 	return nil
 }
@@ -527,6 +547,12 @@ func graphDedupe(xs []string) []string {
 // Each provider's nodes by its own decorations: Kubernetes nodes by
 // decorateK8sNodes, the rest as below.
 func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error {
+	nodes, az := graphSplitAzureNodes(nodes)
+	if len(az) > 0 {
+		if err := t.decorateAzureNodes(lv, az); err != nil {
+			return err
+		}
+	}
 	nodes, k8s := graphSplitNodes(nodes)
 	if len(k8s) > 0 {
 		if err := t.decorateK8sNodes(lv, k8s); err != nil {

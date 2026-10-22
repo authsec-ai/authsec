@@ -40,7 +40,7 @@ import (
 //     inventory API.
 //   - Audit: both mutations write audit_events through auditAdminMutation,
 //     with the reason.
-//   - Existence: the routes exist while IGA_LEGACY_AGENT_POLICY is on OR the
+//   - Existence: the routes exist while the legacy agent-policy stack is available OR the
 //     workspace has legacy policies; otherwise 404 legacy_agent_policies_unavailable.
 //
 // Permissions (§7.10): governance:read to list; governance:enforce to pause
@@ -66,28 +66,25 @@ const (
 
 // LegacyAgentPolicyCompatController serves the compatibility routes.
 type LegacyAgentPolicyCompatController struct {
-	db   func() *gorm.DB
-	gate func() services.LegacyAgentPolicyGate
-	key  []byte
+	db  func() *gorm.DB
+	key []byte
 
 	signerOnce sync.Once
 	signer     *igaread.Reader
 }
 
-// NewLegacyAgentPolicyCompatController is the production controller: the
-// process gate main installed, and the shared cursor secret.
+// NewLegacyAgentPolicyCompatController is the production controller, with the
+// shared cursor secret.
 func NewLegacyAgentPolicyCompatController(db *gorm.DB) *LegacyAgentPolicyCompatController {
-	return NewLegacyAgentPolicyCompatControllerWith(db, services.LegacyAgentPolicy, cursorKeyFromEnv())
+	return NewLegacyAgentPolicyCompatControllerWith(db, cursorKeyFromEnv())
 }
 
 // NewLegacyAgentPolicyCompatControllerWith builds a controller over an explicit
-// database, gate and cursor key. Tests use it.
-func NewLegacyAgentPolicyCompatControllerWith(db *gorm.DB, gate func() services.LegacyAgentPolicyGate,
-	cursorKey []byte) *LegacyAgentPolicyCompatController {
+// database and cursor key. Tests use it.
+func NewLegacyAgentPolicyCompatControllerWith(db *gorm.DB, cursorKey []byte) *LegacyAgentPolicyCompatController {
 	return &LegacyAgentPolicyCompatController{
-		db:   func() *gorm.DB { return db },
-		gate: gate,
-		key:  cursorKey,
+		db:  func() *gorm.DB { return db },
+		key: cursorKey,
 	}
 }
 
@@ -124,30 +121,12 @@ func legacyCompatError(c *gin.Context, status int, code, message string, detail 
 	c.AbortWithStatusJSON(status, gin.H{"error": inner})
 }
 
-// admit resolves the token's workspace and applies the existence rule: with
-// the legacy stack off, the routes exist only for a workspace that still has
-// legacy policies to see or clean up.
+// admit resolves the token's workspace.
 func (ctl *LegacyAgentPolicyCompatController) admit(c *gin.Context) (uuid.UUID, bool) {
 	ws, ok := tokenWorkspace(c)
 	if !ok {
 		legacyCompatError(c, http.StatusUnauthorized, "unauthenticated",
 			"No workspace in the token.", nil)
-		return uuid.Nil, false
-	}
-	if ctl.gate().On {
-		return ws, true
-	}
-	has, err := ctl.service().HasPolicies(c.Request.Context(), ws)
-	if err != nil {
-		log.Printf("[legacy-agent-policy] %s %s: %v", c.Request.Method, c.FullPath(), err)
-		legacyCompatError(c, http.StatusInternalServerError, "internal",
-			"Could not read the legacy agent policies.", nil)
-		return uuid.Nil, false
-	}
-	if !has {
-		legacyCompatError(c, http.StatusNotFound, "legacy_agent_policies_unavailable",
-			"The legacy agent-policy stack is off ("+services.LegacyAgentPolicyEnv+
-				"=off) and this workspace has no legacy agent policies.", nil)
 		return uuid.Nil, false
 	}
 	return ws, true
@@ -245,9 +224,6 @@ func (ctl *LegacyAgentPolicyCompatController) ListLegacyAgentPolicies(c *gin.Con
 		"meta": gin.H{
 			"next_cursor": next,
 			"limit":       limit,
-			// Whether this process runs the legacy reconciler and warning workers,
-			// so the console can say whether these policies are still acting.
-			"legacy_workers": ctl.gate().State(),
 		},
 	})
 }

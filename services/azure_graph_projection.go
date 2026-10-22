@@ -18,8 +18,8 @@ import (
    appear wherever the product reads the graph.
 
    Runs at the end of each discovery run, after every pass has finished, behind
-   the same switch as the AWS and Kubernetes projections (IGA_GRAPH_PROJECTION):
-   off, discovery is unchanged and nothing is written to iga_*.
+   the same graph gate as the AWS and Kubernetes projections: until it is
+   verified, discovery is unchanged and nothing is written to iga_*.
 
    Each pass is projected in its own transaction, the tenant pass first so the
    subscription passes' grants and workloads find the identities they name.

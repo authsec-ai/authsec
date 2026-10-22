@@ -301,7 +301,7 @@ func TestP3EnfSessionIssuesExternalIDAndLink(t *testing.T) {
 	}
 	if !sess.Automatic || !strings.Contains(sess.QuickCreateURL, "param_NameSuffix="+sess.Suffix) ||
 		!strings.Contains(sess.QuickCreateURL, "AuthSec-Enforcement-"+sess.Suffix) ||
-		!strings.Contains(sess.TemplateURL, "/aws/enforcement/"+awsdiscovery.EnforcementTemplateVersion+"/") ||
+		!strings.Contains(sess.TemplateURL, "/aws/enforcement/"+awsdiscovery.EnforcementTemplateVersionV2+"/") ||
 		sess.StackParameters["NameSuffix"] != sess.Suffix || sess.SelfTestRoleName != "AuthSecEnforcementSelfTest-"+sess.Suffix {
 		t.Fatalf("session = %+v", sess)
 	}
@@ -879,7 +879,7 @@ func TestP3EnfRoutes(t *testing.T) {
 		t.Fatalf("no token: %d %v", code, body)
 	}
 	code, body := r.call("GET", p, reader, nil)
-	if code != http.StatusOK || digs(body, "data", "state") != "off" || digs(body, "data", "current_template_version") != awsdiscovery.EnforcementTemplateVersion {
+	if code != http.StatusOK || digs(body, "data", "state") != "off" || digs(body, "data", "current_template_version") != awsdiscovery.EnforcementTemplateVersionV2 {
 		t.Fatalf("GET off: %d %v", code, body)
 	}
 	for _, rt := range [][2]string{{"POST", p + "/sessions"}, {"POST", p}, {"DELETE", p}, {"POST", p + "/verify"},

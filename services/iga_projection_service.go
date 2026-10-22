@@ -43,7 +43,7 @@ type ProjectionService struct {
 	// and the graph is exactly this service's own fencer.
 	beforeGraphTx func(job models.IGAProjectionJob)
 
-	// policyGate is the IGA_POLICY gate the evaluation step checks
+	// policyGate is the policy gate the evaluation step checks
 	// (SPEC-iga-phase3-policy.md §8.2): with it not on, no evaluation row is
 	// inserted and the step does nothing. Read on every pass.
 	policyGate func() *PolicyGate
@@ -85,7 +85,7 @@ func (s *ProjectionService) WithEvaluator(e *GovEvaluator) *ProjectionService {
 	return s
 }
 
-// policyOn reports whether the IGA_POLICY gate is on for this pass.
+// policyOn reports whether the policy gate is on for this pass.
 func (s *ProjectionService) policyOn() bool {
 	return s.policyGate != nil && s.evaluator != nil && s.policyGate().Available()
 }
@@ -152,7 +152,7 @@ func (f projectionFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version
 
 // Run claims jobs until the context ends.
 //
-// main starts it ONLY once IGA_GRAPH_PROJECTION is on and the schema verified
+// main starts it ONLY once the graph pipeline is available and the schema verified
 // (GraphProjectionGate.VerifyUntilReady), so it never runs against a schema it
 // cannot use -- the switch decides, not a probe here.
 func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
@@ -533,7 +533,7 @@ func (s *ProjectionService) projectAndReconcile(
 		if err := projector.Events().Flush(tx, s.graph); err != nil {
 			return err
 		}
-		// §8.2 step 1: with IGA_POLICY on, the revision's evaluation row is
+		// §8.2 step 1: with policy on, the revision's evaluation row is
 		// inserted (running, attempt 1) IN the publication transaction, so a
 		// published revision always has one to continue after a crash.
 		if policy {

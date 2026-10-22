@@ -41,7 +41,7 @@ const (
 	GovJobPruneEvidence      = "prune_evidence"
 	GovJobMetricsRollup      = "metrics_rollup"
 	GovJobResolveUnknown     = "resolve_unknown"
-	// R2 (061_r2_time_bound_access, IGA_POLICY_R2): the temporary-grant and
+	// R2 (061_r2_time_bound_access, R2): the temporary-grant and
 	// session-revocation lifecycles, and time-bound retention notices and
 	// the posture observation at expiry.
 	GovJobTempGrant     = "temp_grant"

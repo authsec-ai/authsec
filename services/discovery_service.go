@@ -551,7 +551,7 @@ func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in Man
 
 // projectK8sSighting copies a Kubernetes sighting into the shared graph at
 // once (K8sRBACManager.ProjectSighting) rather than waiting for the cluster's
-// next RBAC snapshot. A no-op for other sources and while IGA_GRAPH_PROJECTION
+// next RBAC snapshot. A no-op for other sources and while the graph pipeline
 // is off.
 //
 // Best-effort for the same reason as the correlation proposal: the graph is
@@ -565,7 +565,7 @@ func (m *discoveryManager) projectK8sSighting(workspaceID uuid.UUID, source, fin
 	if db == nil {
 		return
 	}
-	if err := NewK8sRBACManager(db, GraphProjectionGateFromEnv()).
+	if err := NewK8sRBACManager(db, GraphProjection()).
 		ProjectSighting(workspaceID, fingerprint); err != nil {
 		log.Printf("[discovery] could not project sighting %s into the graph: %v", fingerprint, err)
 	}

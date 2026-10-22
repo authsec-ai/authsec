@@ -12,7 +12,7 @@ import (
 
 // Phase 3 schema verification (SPEC-iga-phase3-policy.md §4.3, T3.02).
 //
-// IGA_POLICY=on requires a verified Phase 3 schema, checked by existence
+// policy available requires a verified Phase 3 schema, checked by existence
 // as VerifyGraphSchema checks the graph's -- relations and added columns --
 // and, since the R1a review fix ("gate leaks"), every trigger and key
 // CHECK / UNIQUE constraint of 047-056 by name (triggers enabled,
@@ -76,7 +76,7 @@ var policyRelations = []string{
 // permission rows, data, not schema), but 055's iga_gov_settings gained the
 // notification channel columns after its first draft (p3-wire): a database
 // built from that draft has the table without them, so they are checked by
-// name: IGA_POLICY stays unavailable on such a database (rebuild it; 055
+// name: policy stays unavailable on such a database (rebuild it; 055
 // is CREATE TABLE IF NOT EXISTS and never alters an existing table).
 var policyColumns = []string{
 	"iga_gov_settings.notify_email_enabled",
@@ -217,7 +217,7 @@ func PolicySchemaRelations() []string { return append([]string(nil), policyRelat
 //
 // As VerifyGraphSchema: a database ERROR is returned as an error for the
 // caller to retry (never treated as an answer), and a MISSING relation or
-// column is an error naming every one, because it means IGA_POLICY is on
+// column is an error naming every one, because it means policy is available
 // against a schema that cannot run it.
 func VerifyPolicySchema(db *gorm.DB) error {
 	var missing []string
@@ -253,7 +253,7 @@ func VerifyPolicySchema(db *gorm.DB) error {
 	}
 	missing = append(missing, absentNames(policyConstraints, haveConstraints, "constraint ")...)
 	if len(missing) > 0 {
-		return fmt.Errorf("IGA_POLICY=on needs migrations 047-%s; missing: %s",
+		return fmt.Errorf("policy needs migrations 047-%s; missing: %s",
 			PolicySchemaHead, strings.Join(missing, ", "))
 	}
 	return nil

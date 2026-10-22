@@ -624,7 +624,7 @@ func (ctl *CloudAzureController) Neighbourhood(c *gin.Context) {
 	switch {
 	case errors.Is(err, repositories.ErrGraphNodeNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "that node is not in the graph: discovery has not projected it, " +
-			"it has no live connections, or IGA_GRAPH_PROJECTION is off"})
+			"it has no live connections, or the graph is not ready yet"})
 		return
 	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -662,7 +662,7 @@ func (ctl *CloudAzureController) Evidence(c *gin.Context) {
 
 // GraphSummary handles GET /authsec/discovery/azure/graph/summary: the Azure
 // rows of the shared IGA graph, by kind and state. Empty unless
-// IGA_GRAPH_PROJECTION is on.
+// the graph pipeline is available.
 func (ctl *CloudAzureController) GraphSummary(c *gin.Context) {
 	workspaceID, _, err := workspaceAndActorFrom(c)
 	if err != nil {
@@ -702,7 +702,7 @@ func (ctl *CloudAzureController) BlastRadius(c *gin.Context) {
 		return
 	}
 	if out.Identity == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "that object is not in the graph: discovery has not projected it, or IGA_GRAPH_PROJECTION is off"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "that object is not in the graph: discovery has not projected it, or the graph is not ready yet"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

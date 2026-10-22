@@ -8,7 +8,7 @@ import (
 // R1b's part of the §8.2 evaluation step: action-level activity evidence
 // and unused_action findings, computed in the same in-memory pass as R1a's
 // findings and written in the same fenced transaction. It runs only when
-// Snapshot.ActionLevel is set (IGA_POLICY_R1B on and the 060 schema
+// Snapshot.ActionLevel is set (R1b on and the 060 schema
 // verified); otherwise Evaluate's output is exactly R1a's.
 
 // ActionEvidence is one iga_gov_action_evidence row (060), field for field;

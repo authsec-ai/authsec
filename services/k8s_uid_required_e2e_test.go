@@ -68,7 +68,7 @@ func errorCode(w *httptest.ResponseRecorder) (string, string) {
 func TestIdentUIDRequiredSnapshot(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	t.Setenv(services.RequireClusterUIDEnv, "") // the default: required
 	r := snapshotRouter(db)
 
@@ -229,7 +229,7 @@ func TestIdentUIDRequiredSighting(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	setRecordedUID(t, db, src, "uid-a")
-	t.Setenv(services.GraphProjectionEnv, "on")
+	useGraphGateOn(t)
 	t.Setenv(services.RequireClusterUIDEnv, "")
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()

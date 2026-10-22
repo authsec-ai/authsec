@@ -115,16 +115,3 @@ func TestGraphSwitchOffIsPhaseOne(t *testing.T) {
 		t.Fatal("off must claim in Phase 1 mode, never pipeline mode")
 	}
 }
-
-// A typo is neither on nor off: misconfigured, and it never verifies.
-func TestGraphSwitchBadValueIsMisconfigured(t *testing.T) {
-	t.Setenv(services.GraphProjectionEnv, "yes-please")
-	gate := services.GraphProjectionGateFromEnv()
-	if mode, reason, _ := gate.Status(); mode != services.GraphProjectionMisconfigured ||
-		!strings.Contains(reason, "yes-please") {
-		t.Fatalf("status = (%q, %q), want misconfigured naming the value", mode, reason)
-	}
-	if gate.ClaimAllowed() {
-		t.Fatal("an unrecognised switch value allowed claims")
-	}
-}

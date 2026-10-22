@@ -17,6 +17,15 @@ const (
 	RefResource          = "resource"           // iga_resources
 	RefPolicy            = "policy"             // iga_policy
 	RefStatement         = "statement"          // iga_entitlements (provider = 'aws')
+	// RefRoleAssignment is an Azure role assignment on the traversal routes
+	// (traverse_azure.go): one iga_access_edges row (provider = 'azure') drawn
+	// as the node between its holder and what it applies to.
+	RefRoleAssignment = "role_assignment" // iga_access_edges (provider = 'azure')
+	// RefScope is an Azure scope a role assignment applies to that is not a
+	// resource row (a subscription, a resource group, the tenant root, the
+	// Entra directory): scope:<uuid v5 of the lowercased path>. It is a leaf
+	// of the traversal, backed by no row, and never accepted as a parameter.
+	RefScope = "scope"
 
 	// Claims.
 	RefRelationship = "relationship" // iga_relationship
@@ -39,6 +48,7 @@ var refTables = map[string]string{
 	RefResource:          "iga_resources",
 	RefPolicy:            "iga_policy",
 	RefStatement:         "iga_entitlements",
+	RefRoleAssignment:    "iga_access_edges",
 	RefRelationship:      "iga_relationship",
 	RefAssignment:        "iga_policy_assignment",
 	RefGrant:             "iga_access_edges",

@@ -58,7 +58,7 @@ type AWSScanWorker struct {
 	poll    time.Duration
 	nowFunc func() time.Time
 
-	// gate is IGA_GRAPH_PROJECTION (§2.8), and the ONLY thing that decides
+	// gate is the graph pipeline (§2.8), and the ONLY thing that decides
 	// whether this worker uses the barrier and enqueues projection jobs:
 	//
 	//	off                 Phase 1 exactly: no barrier, no job, no Phase 2 SQL
@@ -73,7 +73,7 @@ type AWSScanWorker struct {
 	jobs     repositories.IGAProjectionJobRepository
 	pipeline repositories.IGAPipelineLeaseRepository
 
-	// policy is IGA_POLICY (§4.3). Resource-policy collection (§3.9, T3.03b)
+	// policy is policy (§4.3). Resource-policy collection (§3.9, T3.03b)
 	// runs inside the scan, under the barrier, only when it is available:
 	// nothing Phase 3 runs half-on, and with it off the scan is exactly the
 	// Phase 2 scan.
@@ -117,7 +117,7 @@ func (w *AWSScanWorker) WithGraphProjection(g *GraphProjectionGate) *AWSScanWork
 	return w
 }
 
-// WithPolicyGate binds the worker to an IGA_POLICY gate. Without one it reads
+// WithPolicyGate binds the worker to an policy gate. Without one it reads
 // the process-wide gate, which defaults to off.
 func (w *AWSScanWorker) WithPolicyGate(g *PolicyGate) *AWSScanWorker { w.policy = g; return w }
 
@@ -203,7 +203,7 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 
 	if !pipeline {
-		// IGA_GRAPH_PROJECTION off: exactly the Phase 1 behaviour. No barrier,
+		// the graph pipeline off: exactly the Phase 1 behaviour. No barrier,
 		// no job, and nothing in this path names a Phase 2 table -- so it runs
 		// unchanged against any schema, any number of consecutive times (S1).
 		if err := w.execute(ctx, run, 0); err != nil {

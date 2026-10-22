@@ -643,22 +643,23 @@ mirroring `cloud_scan_run`'s proven pattern: `Enqueue/Claim/Renew/Complete/Fail`
   and it inserts the workspace publication row (§5.1). Readers see the
   previous revision or the next, never the gap.
 
-**One explicit switch: `IGA_GRAPH_PROJECTION`.** The graph branch decided
+**Always on, fail closed until the schema verifies.** The graph branch decided
 whether to use the barrier and enqueue jobs by probing for tables. With no
 projector wired into the binary, that meant the first scan in a workspace
 queued a job nobody would ever claim, and no scan could run there again. The
-decision is now a single configuration value, read once at startup:
+pipeline is now always on; what decides whether it runs is a schema check made
+at startup:
 
-| `IGA_GRAPH_PROJECTION` | Scan worker | Projector | Supported at schema |
-|---|---|---|---|
-| `off` (default) | Exactly the Phase 1 behaviour: no barrier, no job | Not started | any |
-| `on` | Barrier, job enqueue, hand-off | Started; runs `RecoverStalled` | head ≥ `036`, verified at startup |
+| Graph schema | Scan worker | Projector |
+|---|---|---|
+| Verified (head ≥ `036`) | Barrier, job enqueue, hand-off | Started; runs `RecoverStalled` |
+| Not verified | Claims nothing | Not started |
 
-With `on` and the schema verification **failing or erroring**, both
-components **fail closed**: the worker does not claim scans and the projector
-does not start, and `/api/iga/v1/capabilities` reports
-`graph_projection: "misconfigured"` with the reason. A transient database error
-during verification is retried, never cached as an answer.
+With the schema verification **failing or erroring**, both components **fail
+closed**: the worker does not claim scans and the projector does not start, and
+`/api/iga/v1/capabilities` reports `graph_projection: "misconfigured"` with the
+reason. A transient database error during verification is retried, never
+cached as an answer. There is no configuration switch.
 
 ### 2.9 Every provenance reference is workspace-qualified
 
@@ -2412,10 +2413,9 @@ the rollback window.
 | `036` | `iga_permission_model` | — | **New**: policies, statements, revisions, targets, assignments; grants reference assignments |
 | `037` | `iga_access_edges_contract` | — | **New, later release**: drop the legacy subject columns once rollback to a pre-`030` binary is no longer supported |
 
-**Rollout.** `027`–`036` ship in **one release** with `IGA_GRAPH_PROJECTION=off`
-(§2.8). They are additive for the previous binary, so rolling back to
-`0e75ad7` is supported until `037`. Projection is switched on separately, after
-the release is verified.
+**Rollout.** `027`–`036` ship in **one release** (§2.8). They are additive for
+the previous binary, so rolling back to `0e75ad7` is supported until `037`. The
+pipeline runs once the release's schema verifies.
 
 **The runner continues past a failed file and then refuses to boot**
 (`runner.go:213-259`, `cmd/main.go:96-97`). A migration that fails in
@@ -5710,9 +5710,8 @@ func (s *ProjectionService) holdBarrier(job *models.IGAProjectionJob) (int64, er
 }
 ```
 
-**Starting it.** `cmd/main.go` reads `IGA_GRAPH_PROJECTION` once (§2.8). When
-`on`, it verifies the schema by the presence of the `036` relations, retrying
-on error; only after a **successful** check does it start both the AWS scan
+**Starting it.** `cmd/main.go` verifies the schema at startup (§2.8) by the
+presence of the `036` relations, retrying on error; only after a **successful** check does it start both the AWS scan
 worker in pipeline mode and `ProjectionService.Run`, which claims jobs and runs
 `RecoverStalled` on its ticker. When the check keeps failing, neither claims
 work and `/capabilities` reports why.
@@ -6000,7 +5999,7 @@ unless `lifecycle` asks.
 | `404` | `not_found` | Not in this table in this workspace |
 | `409` | `revision_stale`, `listing_changed`, `classification_conflict` | §5.1, §5.5 |
 | `422` | `provider_native`, `invalid_decision`, `operation_id_reused` | Classification rules |
-| `503` | `graph_unavailable` | `IGA_GRAPH_PROJECTION` off or misconfigured (§2.8), with `reason` |
+| `503` | `graph_unavailable` | The graph schema is not verified (§2.8), with `reason` |
 | `500` | `internal` | A database error; nothing partial is returned |
 | `504` | `query_timeout` | A mandatory query did not finish within the request deadline (§5.1); nothing partial is returned. A graph that ran out of time returns `200` with `truncated` instead |
 
@@ -6898,7 +6897,7 @@ in most of what it built, and the corrections are specific:
 | `027`, `032`–`034`, the barrier table, job/state/publication, `PublishWithCoverage`, fenced upserts, `RecoverStalled`, the three projection exits, `AlreadyPublished` replay, restoration, suspension, `canEnd`, support rows, `retireUnsupported`, the actor rule, the schema-gate tests, the S0 fallback tests | **Keep** |
 | `028`–`031` | **Edit in place** per §3 |
 | `ToProjectingTx` leaving the scan worker as holder; `holdBarrier` matching worker names | **Correct**: job-held barrier (§2.10A) |
-| `phase2Available()` / `hasProjectionJobs()` probing tables and caching errors as "absent" | **Replace** with the `IGA_GRAPH_PROJECTION` switch and fail-closed verification (§2.8) |
+| `phase2Available()` / `hasProjectionJobs()` probing tables and caching errors as "absent" | **Replace** with fail-closed schema verification (§2.8) |
 | Nothing starts `ProjectionService` | **Wire** in `cmd/main.go` (§4.11) |
 | `Requeue` then immediate re-claim | **Correct**: fresh `requested_at` and a poll sleep (§2.10A) |
 | Unfenced `ReconcileGeneration` deletes | **Fence** |
@@ -6926,7 +6925,7 @@ check. `Proof` is the §7 scenario that fails without it.
 
 | Task | Files | Change | Gate |
 |---|---|---|---|
-| T1.1 | `services/cloud_aws_scan_worker.go`, `cmd/main.go`, `internal/config` | `IGA_GRAPH_PROJECTION` switch; fail-closed schema verification with retry; start `ProjectionService.Run` when on | Two consecutive worker scans at `036`, switch off: both publish, no job, no barrier row changes. Switch on: scan → projection → scan completes. E13 |
+| T1.1 | `services/cloud_aws_scan_worker.go`, `cmd/main.go`, `internal/config` | Fail-closed schema verification with retry; start `ProjectionService.Run` once verified | Two consecutive worker scans at `036`, switch off: both publish, no job, no barrier row changes. Switch on: scan → projection → scan completes. E13 |
 | T1.2 | `repository/iga_pipeline_lease_repository.go`, `services/iga_projection_service.go` | Job-held barrier; `holdBarrier` by holder `job:<id>`; `RenewHeld` for both phases | Scan worker and projector with **different** owner names: projection completes on its **first** pass. E13 |
 | T1.3 | `repository/cloud_scan_run_repository.go`, `services/cloud_aws_scan_worker.go` | Refused claim: `requested_at = now()`, worker sleeps its poll interval | Two workspaces, one blocked: the other's scan is claimed within one poll interval. E13 |
 | T1.4 | `repository/cloud_*_repository.go` | Fence `ReconcileGeneration` deletes | A superseded worker's reconcile deletes nothing. E13 |
@@ -7207,16 +7206,15 @@ the graph branch's integration suite skips 130 of 145 tests without
 Migrations run on boot, so a rollout passes through intermediate states in
 production. Only these are supported:
 
-| State | Schema | `IGA_GRAPH_PROJECTION` | Must hold |
-|---|---|---|---|
-| **S0** | `001`–`026` | — | Today |
-| **S1** | `001`–`036` | `off` | Phase 1 scanning exactly as today, any number of consecutive scans; nothing written to graph tables; GitHub and Kubernetes unchanged; rollback to `0e75ad7` works |
-| **S2** | `001`–`036` | `on` | The full pipeline; §7.1 |
-| **S3** | `001`–`037` | `on` | After the rollback window; GitHub no longer references the legacy subject columns |
+| State | Schema | Must hold |
+|---|---|---|
+| **S0** | `001`–`026` | Before the graph release |
+| **S2** | `001`–`036` | The full pipeline; §7.1 |
+| **S3** | `001`–`037` | After the rollback window; GitHub no longer references the legacy subject columns |
 
-`027`–`036` ship in one release in S1. Switching to S2 is a configuration
-change after the release is verified, and switching back to `off` returns to
-S1 behaviour immediately.
+`027`–`036` ship in one release; the pipeline runs once they verify. A
+database missing any of them is not a supported state: the pipeline stays
+closed and `/capabilities` names what is missing.
 
 ### 7.6 What has actually been demonstrated
 

@@ -11,7 +11,7 @@ import (
 
 // The Phase 3 policy surface, /api/iga/v1/policy (SPEC-iga-phase3-policy.md
 // §7, T3.02): a subgroup of the graph route group -- the same AuthMiddleware
-// and §5.2 envelope (GraphEnvelope / GraphRequire) -- behind the IGA_POLICY
+// and §5.2 envelope (GraphEnvelope / GraphRequire) -- behind the policy
 // gate. With the gate off or unverified, EVERY route under it answers
 //
 //	503 {"error": {"code": "policy_unavailable", "message": "...", "detail": {"reason": "..."}}}
@@ -72,7 +72,7 @@ func (ctl *IGAGraphReadController) policyGateFn() func() *services.PolicyGate {
 
 // MountIGAPolicyRoutes mounts /api/iga/v1/policy on its own /api/iga/v1 group
 // of r: behind auth wrapped by GraphEnvelope (the graph group's contract), then
-// the IGA_POLICY gate, then each route's permission built by require wrapped
+// the policy gate, then each route's permission built by require wrapped
 // by GraphEnvelope. Production calls it from routes.SetupIGARoutes.
 func MountIGAPolicyRoutes(r gin.IRouter, ctl *IGAGovPolicyController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1")
@@ -101,7 +101,7 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.GET("/findings/summary", require("governance", "read"), ctl.FindingsSummary)
 	g.GET("/findings/:id", require("governance", "read"), ctl.GetFinding)
 	g.GET("/identities/:id/activity-evidence", require("governance", "read"), ctl.ActivityEvidence)
-	// R1b (IGA_POLICY_R1B): action-level evidence; 422 policy_actions_unavailable while off.
+	// R1b (R1b): action-level evidence; 422 policy_actions_unavailable while off.
 	g.GET("/identities/:id/action-evidence", require("governance", "read"), ctl.ActionEvidence)
 	g.GET("/readiness", require("governance", "read"), ctl.GetReadiness)
 	g.POST("/targets/resolve", require("governance", "read"), ctl.ResolveTargets)
@@ -177,21 +177,15 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 	g.POST("/policies/:id/rollout/pause", require("governance", "enforce"), ctl.PauseRollout)
 	g.POST("/policies/:id/rollout/resume", require("governance", "enforce"), ctl.ResumeRollout)
 
-	// R2 (IGA_POLICY_R2, iga_gov_r2_controller.go): mounted only while the
-	// switch is on (DECISION R2-21), so with it off the table is R1a's.
-	if services.PolicyR2GateState().Enabled() {
-		RegisterIGAPolicyR2Routes(g, ctl, require)
-		// Access policies (decision 2026-10-13) ride on the R2 switch.
-		RegisterAccessPolicyRoutes(g, ctl, require)
-	}
-	// R3 (IGA_POLICY_R3, iga_gov_r3_controller.go): mounted only while the
-	// switch is on (DECISION R3-17), so with it off the table is R2's.
-	if services.PolicyR3GateState().Enabled() {
-		RegisterIGAPolicyR3Routes(g, ctl, require)
-	}
+	// R2 (iga_gov_r2_controller.go), access policies (decision 2026-10-13,
+	// which run on R2) and R3 (iga_gov_r3_controller.go). Each route answers
+	// 503 until its part is available.
+	RegisterIGAPolicyR2Routes(g, ctl, require)
+	RegisterAccessPolicyRoutes(g, ctl, require)
+	RegisterIGAPolicyR3Routes(g, ctl, require)
 }
 
-// Gate is the IGA_POLICY middleware: 503 policy_unavailable, with the gate's
+// Gate is the policy middleware: 503 policy_unavailable, with the gate's
 // reason, unless the gate is on (switch on, graph on and verified, Phase 3
 // schema verified). Fail closed: a nil gate is off.
 func (ctl *IGAGovPolicyController) Gate() gin.HandlerFunc {
@@ -290,9 +284,9 @@ var (
 // (§4.3): the gate (state, reason, schema_head), one boolean per feature with
 // a reason in "reasons" for every false one, and provider support.
 // withAccessPolicies adds policy.access_policies {available, reason}
-// (decision 2026-10-13) while the R2 switch is on.
+// (decision 2026-10-13).
 func withAccessPolicies(out gin.H, db *gorm.DB) gin.H {
-	if !services.PolicyR2GateState().Enabled() || db == nil {
+	if db == nil {
 		return out
 	}
 	ok, reason := services.AccessPoliciesStatus(db)
@@ -329,9 +323,8 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 			reasons[f.name] = why
 		}
 	}
-	// R1b (IGA_POLICY_R1B): policy.actions is served only while its switch is
-	// on, so with it off the block is exactly R1a's.
-	if r1b := services.PolicyR1BGateState(); r1b.Enabled() {
+	// R1b: policy.actions.
+	if r1b := services.PolicyR1BGateState(); r1b != nil {
 		state, why := r1b.Status()
 		available := on && state == services.PolicyOn
 		out["actions"] = available
@@ -342,10 +335,9 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 			reasons["actions"] = why
 		}
 	}
-	// R2 (IGA_POLICY_R2): policy.temporary_grants and policy.session_revoke
-	// (and policy.time_bound, policy.lambda_split_direct) are served only
-	// while the switch is on, so with it off the block is exactly R1a's.
-	if r2 := services.PolicyR2GateState(); r2.Enabled() {
+	// R2: policy.temporary_grants, policy.session_revoke, policy.time_bound
+	// and policy.lambda_split_direct.
+	if r2 := services.PolicyR2GateState(); r2 != nil {
 		state, why := r2.Status()
 		available := on && state == services.PolicyOn
 		for _, name := range []string{"temporary_grants", "session_revoke", "time_bound", "lambda_split_direct"} {
@@ -359,11 +351,10 @@ func policyCapabilities(gate *services.PolicyGate) gin.H {
 			}
 		}
 	}
-	// R3 (IGA_POLICY_R3): policy.runtime_controls and
-	// policy.brokered_sessions are served only while the switch is on, so
-	// with it off the block is exactly R2's. Brokered sessions also need the
-	// process's broker (Vault and AuthSec's AWS identity).
-	if r3 := services.PolicyR3GateState(); r3.Enabled() {
+	// R3: policy.runtime_controls and policy.brokered_sessions. Brokered
+	// sessions also need the process's broker (Vault and AuthSec's AWS
+	// identity).
+	if r3 := services.PolicyR3GateState(); r3 != nil {
 		state, why := r3.Status()
 		available := on && state == services.PolicyOn
 		if !on {

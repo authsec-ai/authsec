@@ -165,7 +165,7 @@ func (s *GovDeployments) r2ExecuteSplit(ctx context.Context, run *PolicyJobRun, 
 		return PolicyJobAbandon("the deployment is not in the job's workspace")
 	}
 	if !PolicyR2On() {
-		return s.block(ctx, run, &d, GovCodeR2Unavailable, "Direct Lambda isolation needs IGA_POLICY_R2.", nil, nil)
+		return s.block(ctx, run, &d, GovCodeR2Unavailable, "Direct Lambda isolation needs R2 to be available.", nil, nil)
 	}
 	var ctl *models.IGAGovControl
 	var v2err error

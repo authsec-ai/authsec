@@ -106,7 +106,7 @@ func Conflict(code, msg string) *Error { return newErr(http.StatusConflict, code
 // operation_id_reused).
 func Unprocessable(code, msg string) *Error { return newErr(http.StatusUnprocessableEntity, code, msg) }
 
-// GraphUnavailable is 503 graph_unavailable: IGA_GRAPH_PROJECTION is off or
+// GraphUnavailable is 503 graph_unavailable: the graph pipeline is unavailable or
 // misconfigured (§2.8), with the reason.
 func GraphUnavailable(mode, reason string) *Error {
 	e := newErr(http.StatusServiceUnavailable, "graph_unavailable", "The identity graph is not available.").

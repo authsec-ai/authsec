@@ -157,7 +157,7 @@ type BundleFacts struct {
 	Activity            []BundleActivity `json:"activity"`
 	Routes              []Route          `json:"routes"`
 	Gaps                []Gap            `json:"gaps"`
-	// R1b (IGA_POLICY_R1B): the removed actions, their action-level
+	// R1b (R1b): the removed actions, their action-level
 	// evidence and the action catalog it was judged with. Omitted when
 	// empty, so every R1a bundle and its hash are unchanged.
 	RemovedActions []string               `json:"removed_actions,omitempty"`

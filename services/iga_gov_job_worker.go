@@ -35,7 +35,7 @@ import (
 // are not given no-op handlers; only the periodic kinds the scheduler
 // produces are, so their rows do not pile up -- see RegisterPolicyJobNoops).
 //
-// It is started from cmd/main.go only when IGA_POLICY=on and the Phase 3
+// It is started from cmd/main.go only when policy available and the Phase 3
 // schema verified, and claims nothing while the gate reads unavailable.
 type PolicyJobWorker struct {
 	db    *gorm.DB
@@ -696,12 +696,9 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
 	// NewProductionGovDeployEnv).
 	RegisterEnforcementBindingJobs(w)
-	// R2 (IGA_POLICY_R2): temp_grant, session_revoke and time_bound with
-	// their schedules, only while the switch is on (each handler and
-	// schedule also checks the gate is available).
-	if PolicyR2GateState().Enabled() {
-		RegisterR2Jobs(w, db)
-	}
+	// R2: temp_grant, session_revoke and time_bound with their schedules
+	// (each handler and schedule checks R2 is available).
+	RegisterR2Jobs(w, db)
 	return w
 }
 

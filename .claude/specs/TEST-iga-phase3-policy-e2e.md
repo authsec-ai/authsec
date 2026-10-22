@@ -19,7 +19,7 @@ Design reference: [`SPEC-iga-phase3-policy.md`](SPEC-iga-phase3-policy.md). Each
 | Item | Setting |
 |---|---|
 | Database | New PostgreSQL 15+. Load `migrations/master/001_bootstrap.sql` (it carries everything through `059`). Never point at the deployed database. |
-| Backend | `cp .env.example .env`, then set the database, `IGA_CURSOR_SECRET`, Vault (needed for the enforcement ExternalId, the GitHub App key and Slack tokens), `IGA_GRAPH_PROJECTION=on`, `IGA_POLICY=on`. Do **not** set `AUTHSEC_DISABLE_POLICY_WORKER`, `AUTHSEC_DISABLE_AWS_SCAN_WORKER` or `AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER`. `go run ./cmd/` listens on `7468`. |
+| Backend | `cp .env.example .env`, then set the database, `IGA_CURSOR_SECRET`, Vault (needed for the enforcement ExternalId, the GitHub App key and Slack tokens). Do **not** set `AUTHSEC_DISABLE_POLICY_WORKER`, `AUTHSEC_DISABLE_AWS_SCAN_WORKER` or `AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER`. `go run ./cmd/` listens on `7468`. |
 | Reachability | AWS CloudFormation calls back to the backend, so the backend needs a public HTTPS URL for the enforcement and discovery stacks (a tunnel is fine). The same URL is the OAuth redirect for GitHub and Slack. |
 | Console | `Authsec-ui` pointed at that backend (`VITE_API_URL`, `VITE_OAUTH_BASE_URL`). |
 | Check | `GET /api/iga/v1/capabilities` shows a `policy` block with `state: "on"`. `enforcement` and `iac` are `true` only when the process has Vault, the AWS deployment environment and the GitHub App; a `false` carries its reason. |
@@ -65,9 +65,8 @@ Format: **Precondition → Steps → Expected → Evidence**. Console paths are 
 
 | ID | Steps | Expected | Evidence |
 |---|---|---|---|
-| S0.1 | Start the backend with `IGA_POLICY` off. Open `/iga/policy` and `/iga/logs`. | Policy and Logs show their labelled preview content; the new pages say Policy is not available here; nothing errors. | Screenshot; `GET /api/iga/v1/capabilities` has `policy.state != "on"`. |
-| S0.2 | Turn `IGA_POLICY` on, restart. Reload. | The sidebar drops the Preview tag on Policy and Logs; the Overview renders. | Screenshot. |
-| S0.3 | Open the retired routes `/iga/policies`, `/iga/upcoming`, `/iga/policy-warnings`, `/iga/enforcement`. | Each redirects to the matching new page when the gate is on, or shows the retired notice when off. | URL after redirect. |
+| S0.1 | Start the backend. Open `/iga/policy` and `/iga/logs`. | Policy renders (no Preview tag on Policy or Logs). Before the schema verifies, Policy says it is not available here, with the reason; nothing errors. | Screenshot; `GET /api/iga/v1/capabilities` shows `policy.state`. |
+| S0.3 | Open the retired routes `/iga/policies`, `/iga/upcoming`, `/iga/policy-warnings`, `/iga/enforcement`. | Each redirects to the matching new page. | URL after redirect. |
 | S0.4 | As **Viewer**, open every Policy page. | Pages load. Buttons that need author, approve or enforce are absent or disabled with words; nothing is a bare 403. | Screenshot per page. |
 
 ### S1 — Setup
