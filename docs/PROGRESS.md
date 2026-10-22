@@ -4,6 +4,18 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-22 — Azure access policies reach data planes (branch `fix/azure-access-data-actions`)
+
+### Done
+- Found in production: a block on a Foundry project's identity left its agent answering, because the agent reads an Azure AI Search index with Search Index Data Reader, a role with data actions only, and a block outside storage accounts looked at management actions only.
+- `azureActions` now adds data actions (and key listings) for AI Search, Key Vault secrets, Service Bus and Event Hubs (`azureDataPlanes` in `services/iga_gov_access_azure.go`); an allow assigns Search Index Data Reader/Contributor and Key Vault Secrets User/Officer there. Storage accounts and every other type are unchanged. The preview notes AI Search API keys and Key Vault access policies, which role assignments do not cover.
+- Tests: `TestAzureActions*`, `TestAzureBlockReachesSearchIndexData`, `TestAzureAllowAssignsDataRoles`, `TestAzureDataPlaneChildTypes` (unit); `TestAccessPolicyAzureSearchIndex` (integration). The existing `TestAccessPolicyAzure` and the AWS access-policy tests still pass.
+
+### Known limits
+- Cognitive Services / Azure OpenAI and Cosmos DB are not in the table: Cosmos DB's data RBAC is not ARM role assignments, and OpenAI's data actions need a decision on what "read" means for a model.
+
+---
+
 ## 2026-10-20 — Azure discovery made multi-tenant; access policies on Azure (branch `fix/azure-tenancy`)
 
 ### Done
