@@ -1341,7 +1341,8 @@ Numbered on merge after the Wave C entries (D-104, D-105).
 ## Added for Azure parity (feat/policy-azure)
 
 - **D-114 Azure on `/graph`, `/graph/expand`, `/graph/path`
-  (`internal/igaread/traverse_azure.go`).** *Proposed, not built.* The
+  (`internal/igaread/traverse_azure.go`).** *Built 2026-10-22
+  (`feat/policy-azure-backend`); notes on the build at the end.* The
   traversal routes read the Azure projection's rows (`internal/azuregraph`,
   provider `azure`, the same tables) as they read Kubernetes' (D-107), so the
   console draws an Azure object with the graph it draws an AWS one with, and
@@ -1406,3 +1407,19 @@ Numbered on merge after the Wave C entries (D-104, D-105).
     `stale_reason` is `{surface: azure_scan, state: stale}`.
   - *Not done.* `/evidence` for Azure claims; following the AKS join;
     per-partition coverage limitations; scope roots.
+  - *As built (2026-10-22).* `scope:` is not a parseable ref: `root=scope:`
+    and `node=scope:` are 400. Scope labels beyond the four named:
+    "Management group X", "Resource <name>" (a resource path with no
+    resource row), "Entra directory scope <rest>", otherwise the path. The
+    v5 id is of the lower-cased path alone, so two tenants of one workspace
+    share a "/" or directory scope node (one walk stays in one tenant).
+    `azure_role.grant_kind` is the access edge's `path_kind`; role name,
+    actions, not_actions and condition come from the entitlement's
+    `native_rights`, read, never walked. `stale_reason` is
+    `[{account_id: <tenant>, surface: azure_scan, state: stale}]` (the tenant
+    where k8s puts the cluster). `azure_scope_access_not_drawn` is the one
+    element limitation: on an Azure resource node, in either direction, when a
+    live assignment in its tenant sits at the tenant root, any management
+    group, or a path above its ARM id. A root is looked up in AWS, then k8s,
+    then Azure. A `/graph/path` with an Azure end and an AWS or k8s end reads
+    `graph_state: "mixed"` with both sets of limitations (not tested).

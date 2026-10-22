@@ -96,20 +96,31 @@ func (c *graphCross) match(principal uuid.UUID) (graphCrossMatch, bool) {
 }
 
 // side is the provider whose reads and decorations a node takes: Kubernetes
-// for a Kubernetes node, AWS for everything else (an external principal is
-// AWS's: principals are the AWS trust graph's).
+// for a Kubernetes node, Azure for an Azure node (traverse_azure.go), AWS for
+// everything else (an external principal not read as Azure's is AWS's:
+// principals are the AWS trust graph's).
 func (n *GraphNode) side() string {
-	if n.provider == models.ProviderK8s {
+	switch n.provider {
+	case models.ProviderK8s:
 		return models.ProviderK8s
+	case models.ProviderAzure:
+		return models.ProviderAzure
 	}
 	return models.ProviderAWS
 }
 
 // graphSideHasKind reports whether a provider's projection writes edges of a
 // kind in a direction (the crossing aside, which is its own unit): AWS every
-// kind; Kubernetes executes_as, grant and member_of (graphK8sEdgeKinds).
+// kind; Kubernetes executes_as, grant and member_of (graphK8sEdgeKinds);
+// Azure every kind but task_execution_role (graphAzureEdgeKinds).
 func graphSideHasKind(side, kind string) bool {
-	return side != models.ProviderK8s || contains(graphK8sEdgeKinds, kind)
+	switch side {
+	case models.ProviderK8s:
+		return contains(graphK8sEdgeKinds, kind)
+	case models.ProviderAzure:
+		return contains(graphAzureEdgeKinds, kind)
+	}
+	return true
 }
 
 // graphSplitNodes splits nodes into AWS's (external principals included) and
@@ -139,15 +150,18 @@ func graphSplitEdges(edges []*GraphEdge) (aws, k8s []*GraphEdge) {
 }
 
 // sides reports which providers the response's nodes are of.
-func (t *graphTraversal) sides() (aws, k8s bool) {
+func (t *graphTraversal) sides() (aws, k8s, azure bool) {
 	for _, n := range t.order {
-		if n.side() == models.ProviderK8s {
+		switch n.side() {
+		case models.ProviderK8s:
 			k8s = true
-		} else {
+		case models.ProviderAzure:
+			azure = true
+		default:
 			aws = true
 		}
 	}
-	return aws, k8s
+	return aws, k8s, azure
 }
 
 // held reports whether the traversal holds (or this level staged) a node.
