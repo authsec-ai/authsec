@@ -288,6 +288,11 @@ func azureDefs(defs []azure.RoleDefinition) map[string]azure.RoleDefinition {
 
 // planAzure resolves the Azure part of the plan (called from plan()).
 func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, row models.IGAResource) error {
+	// TENANT-EXEMPT: the 144 schema check reads the Postgres catalog only.
+	if ok, reason := AzureAccessSchemaStatus(s.db); !ok {
+		return govErr(http.StatusServiceUnavailable, GovCodeAccessUnavailable, "Azure access policies are not available on this server.",
+			map[string]any{"reason": reason})
+	}
 	if p.intent.Resource.Prefix != "" {
 		return govUnprocessable(GovCodeAccessInvalid, "A prefix applies to S3 buckets only.", map[string]any{"field": "resource.prefix"})
 	}
@@ -355,21 +360,9 @@ func azureDocument(p *accessPlan, ap *azurePlan) map[string]any {
 func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan) []error {
 	ap := p.azure
 	deps := currentAzureAccessDeps()
-	if deps == nil || deps.RBAC == nil || deps.Token == nil {
-		return []error{govErr(http.StatusServiceUnavailable, GovCodeAzureUnavailable, "Azure access is not configured on this server.", nil)}
-	}
-	token, err := deps.Token(ctx, ws, ap.target.TenantID)
+	token, err := azureWriteCheck(ctx, deps, ws, ap.target.TenantID, ap.target.SubscriptionID)
 	if err != nil {
-		return []error{govConflict(GovCodeAzureWriteMissing, "AuthSec cannot get a token for this Azure tenant: "+err.Error(), nil)}
-	}
-	perms, err := deps.RBAC.CallerPermissions(ctx, token, ap.target.SubscriptionID)
-	if err != nil {
-		return []error{govConflict(GovCodeAzureWriteMissing, "AuthSec cannot read its own permissions on the subscription: "+err.Error(), nil)}
-	}
-	if !azure.AllowsAction(perms, "Microsoft.Authorization/roleAssignments/write") || !azure.AllowsAction(perms, "Microsoft.Authorization/roleAssignments/delete") {
-		return []error{govConflict(GovCodeAzureWriteMissing,
-			"AuthSec's Azure app cannot manage role assignments on subscription "+ap.target.SubscriptionID+
-				": give it the Role Based Access Control Administrator role there.", map[string]any{"subscription_id": ap.target.SubscriptionID})}
+		return []error{err}
 	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		return nil
@@ -409,6 +402,118 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	return errs
 }
 
+// azureWriteCheck is the live check that AuthSec's Azure app can write and
+// delete role assignments on the subscription (preview, create and
+// readiness). It returns the ARM token on success; the error is a GovError
+// whose Code is the readiness reason.
+func azureWriteCheck(ctx context.Context, deps *AzureAccessDeps, ws uuid.UUID, tenantID, subscriptionID string) (string, error) {
+	if deps == nil || deps.RBAC == nil || deps.Token == nil {
+		return "", govErr(http.StatusServiceUnavailable, GovCodeAzureUnavailable, "Azure access is not configured on this server.", nil)
+	}
+	token, err := deps.Token(ctx, ws, tenantID)
+	if err != nil {
+		return "", govConflict(GovCodeAzureWriteMissing, "AuthSec cannot get a token for this Azure tenant: "+err.Error(), nil)
+	}
+	perms, err := deps.RBAC.CallerPermissions(ctx, token, subscriptionID)
+	if err != nil {
+		return "", govConflict(GovCodeAzureWriteMissing, "AuthSec cannot read its own permissions on the subscription: "+err.Error(), nil)
+	}
+	if !azure.AllowsAction(perms, "Microsoft.Authorization/roleAssignments/write") || !azure.AllowsAction(perms, "Microsoft.Authorization/roleAssignments/delete") {
+		return "", govConflict(GovCodeAzureWriteMissing,
+			"AuthSec's Azure app cannot manage role assignments on subscription "+subscriptionID+
+				": give it the Role Based Access Control Administrator role there.", map[string]any{"subscription_id": subscriptionID})
+	}
+	return token, nil
+}
+
+// azureWriteReady is azureWriteCheck for readiness, cached for a minute per
+// workspace and subscription (each check is two Azure calls).
+func azureWriteReady(ctx context.Context, ws uuid.UUID, tenantID, subscriptionID string) (bool, string) {
+	key := ws.String() + "|" + strings.ToLower(subscriptionID)
+	azureReadyCache.Lock()
+	e, ok := azureReadyCache.m[key]
+	azureReadyCache.Unlock()
+	if ok && time.Since(e.at) < azureReadyTTL {
+		return e.ok, e.reason
+	}
+	_, err := azureWriteCheck(ctx, currentAzureAccessDeps(), ws, tenantID, subscriptionID)
+	e = azureReadyEntry{ok: err == nil, at: time.Now()}
+	if err != nil {
+		e.reason, _ = errCode(err)
+	}
+	azureReadyCache.Lock()
+	if azureReadyCache.m == nil {
+		azureReadyCache.m = map[string]azureReadyEntry{}
+	}
+	azureReadyCache.m[key] = e
+	azureReadyCache.Unlock()
+	return e.ok, e.reason
+}
+
+const azureReadyTTL = time.Minute
+
+type azureReadyEntry struct {
+	ok     bool
+	reason string
+	at     time.Time
+}
+
+var azureReadyCache struct {
+	sync.Mutex
+	m map[string]azureReadyEntry
+}
+
+// VerifyAzureAccessSchema checks migration 144. It is separate from
+// VerifyAccessPolicySchema on purpose: without 144 only Azure access policies
+// are unavailable (503); AWS ones keep working.
+func VerifyAzureAccessSchema(db *gorm.DB) error {
+	ok, err := repositories.HasRelation(db, "iga_gov_azure_access")
+	if err != nil {
+		return fmt.Errorf("Azure access-policy schema verification could not run: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("Azure access policies need migration 144; missing: iga_gov_azure_access")
+	}
+	return nil
+}
+
+var azureSchema struct {
+	sync.Mutex
+	ok     bool
+	reason string
+	at     time.Time
+}
+
+// AzureAccessSchemaStatus is VerifyAzureAccessSchema, re-checked at most once
+// a minute until it passes.
+func AzureAccessSchemaStatus(db *gorm.DB) (bool, string) {
+	azureSchema.Lock()
+	defer azureSchema.Unlock()
+	if !azureSchema.ok && time.Since(azureSchema.at) > time.Minute {
+		azureSchema.at = time.Now()
+		if err := VerifyAzureAccessSchema(db); err != nil {
+			azureSchema.reason = err.Error()
+		} else {
+			azureSchema.ok, azureSchema.reason = true, ""
+		}
+	}
+	return azureSchema.ok, azureSchema.reason
+}
+
+// azureARMIDOfKey is the ARM resource id in an Azure resource's source key
+// ("" for any other key).
+func azureARMIDOfKey(sourceKey string) string {
+	parts := azureKeyParts(sourceKey)
+	if len(parts) < 4 || parts[0] != models.ProviderAzure || parts[2] != "resource" {
+		return ""
+	}
+	id := strings.Join(parts[3:], azuregraph.Sep)
+	if !strings.HasPrefix(id, "/subscriptions/") {
+		return ""
+	}
+	return id
+}
+
 // azureSentence is the preview's one line.
 func azureSentence(in igagov.AccessIntent, t azureTarget, names []string) string {
 	name := t.Name
@@ -436,6 +541,9 @@ func accessLiveCount(tx *gorm.DB, ws, policyID uuid.UUID) (int64, error) {
 	if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, policyID, accessLiveStates).
 		Count(&aws).Error; err != nil {
 		return 0, err
+	}
+	if ok, _ := AzureAccessSchemaStatus(tx); !ok {
+		return aws, nil
 	}
 	if err := tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, policyID,
 		[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}).Count(&az).Error; err != nil {
@@ -515,6 +623,9 @@ func azureEnqueueTx(tx *gorm.DB, ws, id uuid.UUID, at time.Time) error {
 // endAzureRowsTx ends the policy's live Azure rows (all versions, or all but
 // keep), as endRowsTx does for AWS rows.
 func endAzureRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason string, now time.Time) (int, error) {
+	if ok, _ := AzureAccessSchemaStatus(tx); !ok {
+		return 0, nil
+	}
 	q := tx.Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, policyID,
 		[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring})
 	if keep != nil {
@@ -911,6 +1022,10 @@ func RegisterAzureAccessJobs(w *PolicyJobWorker, db *gorm.DB) {
 	w.Scheduler().Add(PolicyJobSchedule{Name: repositories.GovJobAzureAccess, Kind: repositories.GovJobAzureAccess, Every: azureCheckEvery,
 		Due: func(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPolicyJob, error) {
 			if !PolicyR2On() {
+				return nil, nil
+			}
+			// TENANT-EXEMPT: the 144 schema check reads the Postgres catalog only.
+			if ok, _ := AzureAccessSchemaStatus(db); !ok {
 				return nil, nil
 			}
 			var rows []struct {

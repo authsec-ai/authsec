@@ -67,7 +67,7 @@ func (ctl *IGAGovPolicyController) ListAccessPolicies(c *gin.Context) {
 		}
 		out, next, err := ctl.access().List(c.Request.Context(), ws, services.AccessListQuery{Status: c.Query("status"),
 			Effect: c.Query("effect"), Q: c.Query("q"), ResourceID: c.Query("resource_id"),
-			IdentityAccountID: c.Query("identity_account_id"), Cursor: c.Query("cursor"), Limit: limit})
+			IdentityAccountID: c.Query("identity_account_id"), Cursor: c.Query("cursor"), Provider: c.Query("provider"), Limit: limit})
 		if err != nil {
 			return nil, nil, err
 		}

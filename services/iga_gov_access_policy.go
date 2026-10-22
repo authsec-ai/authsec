@@ -89,6 +89,11 @@ const (
 	AccessStatusActive    = "active"
 	AccessStatusPaused    = "paused"
 	AccessStatusEnded     = "ended"
+	// AccessStatusEnding: ended (End, or the end time passed) while AuthSec
+	// is still taking it out of the cloud -- on Azure, putting back the role
+	// assignments a block removed. "ended" only once every deployment has
+	// finished.
+	AccessStatusEnding = "ending"
 )
 
 const (
@@ -228,18 +233,28 @@ type (
 		Name string    `json:"name"`
 		Kind string    `json:"kind"`
 	}
+	// AccessResourceView: provider is aws or azure. On Azure, arn is the ARM
+	// resource id and account_id the subscription id; bucket and prefix are
+	// empty.
 	AccessResourceView struct {
 		ResourceID string `json:"resource_id"`
 		ARN        string `json:"arn"`
 		Bucket     string `json:"bucket"`
 		Prefix     string `json:"prefix"`
 		AccountID  string `json:"account_id"`
+		Provider   string `json:"provider"`
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
 	}
+	// AccessRoleView: kind is the Discovery identity kind (iam_role,
+	// entra_service_principal, entra_managed_identity, ...). On Azure, arn is
+	// empty and account_id the subscription id.
 	AccessRoleView struct {
 		IdentityAccountID uuid.UUID           `json:"identity_account_id"`
 		Name              string              `json:"name"`
 		ARN               string              `json:"arn"`
 		AccountID         string              `json:"account_id"`
+		Kind              string              `json:"kind"`
 		UsedBy            []AccessWorkloadRef `json:"used_by"`
 	}
 	AccessDeploymentView struct {
@@ -248,7 +263,10 @@ type (
 		VersionNo         int        `json:"version_no"`
 		State             string     `json:"state"`
 		AWSPolicyARN      string     `json:"aws_policy_arn"`
-		DocumentHash      string     `json:"document_hash"`
+		// TargetRef is what the deployment changes: the AWS policy ARN, or
+		// the ARM scope of the Azure resource.
+		TargetRef      string     `json:"target_ref"`
+		DocumentHash   string     `json:"document_hash"`
 		DeployedAt        *time.Time `json:"deployed_at"`
 		VerifiedAt        *time.Time `json:"verified_at"`
 		LastReadbackAt    *time.Time `json:"last_readback_at"`
@@ -1112,8 +1130,10 @@ type accessBundle struct {
 	pol      models.IGAGovPolicy
 	versions []models.IGAGovAccessPolicyVersion
 	rows     []models.IGAGovTempGrant
-	// azureDocs: an Azure row's document, by its rows[] DocumentHash.
+	// azureDocs: an Azure row's document, by its rows[] DocumentHash;
+	// azureRows: the Azure rows behind rows[], by id.
 	azureDocs map[string]json.RawMessage
+	azureRows map[uuid.UUID]models.IGAGovAzureAccess
 }
 
 func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
@@ -1167,6 +1187,10 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 	for _, r := range rows {
 		by[*r.PolicyID].rows = append(by[*r.PolicyID].rows, r)
 	}
+	// Without 144 there are no Azure rows, and AWS policies read as before.
+	if ok, _ := AzureAccessSchemaStatus(db); !ok {
+		return out, nil
+	}
 	var az []models.IGAGovAzureAccess
 	if err := db.Where("workspace_id = ? AND policy_id IN ?", ws, pids).Order("created_at").Find(&az).Error; err != nil {
 		return nil, err
@@ -1176,8 +1200,10 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 		b.rows = append(b.rows, azureAsGrant(a))
 		if b.azureDocs == nil {
 			b.azureDocs = map[string]json.RawMessage{}
+			b.azureRows = map[uuid.UUID]models.IGAGovAzureAccess{}
 		}
 		b.azureDocs["azure:"+a.ID.String()] = azureRowDocument(a)
+		b.azureRows[a.ID] = a
 	}
 	return out, nil
 }
@@ -1199,7 +1225,7 @@ func (b *accessBundle) current() (*models.IGAGovAccessPolicyVersion, igagov.Acce
 // expires on its own.
 func accessEnded(b *accessBundle, now time.Time) bool {
 	status, _, _, _ := accessStatus(b, now)
-	return status == AccessStatusEnded
+	return status == AccessStatusEnded || status == AccessStatusEnding
 }
 
 func accessTerminal(state string) bool {
@@ -1212,6 +1238,18 @@ func accessTerminal(state string) bool {
 
 // status works out the UI status from the lifecycle, the current version's
 // deployments and the window.
+// accessRemovingText is the status reason while a policy comes out of the
+// cloud.
+func accessRemovingText(b *accessBundle, in igagov.AccessIntent) string {
+	if len(b.azureRows) == 0 {
+		return "removing from AWS"
+	}
+	if in.Effect == igagov.AccessEffectBlock {
+		return "restoring access in Azure"
+	}
+	return "removing from Azure"
+}
+
 func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason string, endedAt *time.Time) {
 	cur, in := b.current()
 	latestEnd := func(rows []models.IGAGovTempGrant) *time.Time {
@@ -1236,14 +1274,13 @@ func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason str
 			u := b.pol.UpdatedAt
 			t = &u
 		}
-		reason = ""
 		if removing {
-			reason = "removing from AWS"
+			return AccessStatusEnding, accessRemovingText(b, in), accessEndEnded, nil
 		}
-		return AccessStatusEnded, reason, accessEndEnded, t
+		return AccessStatusEnded, "", accessEndEnded, t
 	case "paused":
 		if removing {
-			return AccessStatusPaused, "removing from AWS", "", nil
+			return AccessStatusPaused, accessRemovingText(b, in), "", nil
 		}
 		return AccessStatusPaused, "", "", nil
 	}
@@ -1293,7 +1330,7 @@ func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason str
 	case len(failed) > 0:
 		return AccessStatusFailed, strings.Join(failed, "; "), "", nil
 	case ended:
-		return AccessStatusEnded, "removing from AWS", r2EndReasonExpired, nil
+		return AccessStatusEnding, accessRemovingText(b, in), r2EndReasonExpired, nil
 	case len(applying) > 0:
 		return AccessStatusApplying, "applying to " + strings.Join(applying, ", "), "", nil
 	case len(drift) > 0:
@@ -1352,17 +1389,18 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 	type identRow struct {
 		ID          uuid.UUID
 		DisplayName string
+		AccountKind string
 	}
 	var irows []identRow
 	if len(ids) > 0 {
-		if err := db.Table("iga_identity_accounts").Select("id, display_name").Where("workspace_id = ? AND id IN ?", ws, ids).
+		if err := db.Table("iga_identity_accounts").Select("id, display_name, account_kind").Where("workspace_id = ? AND id IN ?", ws, ids).
 			Scan(&irows).Error; err != nil {
 			return nil, err
 		}
 	}
-	identName := map[uuid.UUID]string{}
+	identName, identKind := map[uuid.UUID]string{}, map[uuid.UUID]string{}
 	for _, r := range irows {
-		identName[r.ID] = r.DisplayName
+		identName[r.ID], identKind[r.ID] = r.DisplayName, r.AccountKind
 	}
 	usedBy, err := usedByTx(db, ws, ids)
 	if err != nil {
@@ -1387,8 +1425,10 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		}
 	}
 	resARN := map[string]string{}
+	resRow := map[string]models.IGAResource{}
 	for _, r := range resRows {
 		resARN[r.ID.String()] = r.DisplayName
+		resRow[r.ID.String()] = r
 	}
 
 	out := make([]AccessPolicyView, 0, len(bs))
@@ -1406,11 +1446,23 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		v.Status, v.StatusReason, v.EndReason, v.EndedAt = accessStatus(b, now)
 		t, _ := igagov.ParseS3BucketARN(resARN[in.Resource.ResourceID])
 		t.Prefix = in.Resource.Prefix
-		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix}
-		if t.Bucket != "" {
-			v.Resource.ARN = t.BucketARN()
-		} else {
-			v.Resource.ARN = resARN[in.Resource.ResourceID]
+		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix, Provider: models.ProviderAWS}
+		rr := resRow[in.Resource.ResourceID]
+		v.Resource.Kind = rr.ResourceKind
+		switch {
+		case rr.Provider == models.ProviderAzure || len(b.azureRows) > 0:
+			v.Resource.Provider, v.Resource.Name = models.ProviderAzure, rr.DisplayName
+			v.Resource.ARN = azureARMIDOfKey(rr.SourceKey)
+			for _, a := range b.azureRows {
+				if v.Resource.ARN == "" {
+					v.Resource.ARN = a.Scope
+				}
+				v.Resource.AccountID = a.SubscriptionID
+			}
+		case t.Bucket != "":
+			v.Resource.ARN, v.Resource.Name = t.BucketARN(), t.Bucket
+		default:
+			v.Resource.ARN, v.Resource.Name = resARN[in.Resource.ResourceID], resARN[in.Resource.ResourceID]
 		}
 		// Roles: the intent's, with the ARN and account from its deployments.
 		arnOf := map[uuid.UUID]models.IGAGovTempGrant{}
@@ -1419,14 +1471,21 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		}
 		for _, r := range in.Roles {
 			id, _ := uuid.Parse(r.IdentityAccountID)
-			rv := AccessRoleView{IdentityAccountID: id, Name: identName[id], UsedBy: usedBy[id]}
+			rv := AccessRoleView{IdentityAccountID: id, Name: identName[id], Kind: identKind[id], UsedBy: usedBy[id]}
 			if rv.UsedBy == nil {
 				rv.UsedBy = []AccessWorkloadRef{}
 			}
 			if g, ok := arnOf[id]; ok {
-				rv.ARN, rv.AccountID = g.RoleARN, g.AccountID
-				if rv.Name == "" {
-					rv.Name = roleNameOfARN(g.RoleARN)
+				if a, az := b.azureRows[g.ID]; az {
+					rv.AccountID = a.SubscriptionID
+					if rv.Name == "" {
+						rv.Name = a.PrincipalName
+					}
+				} else {
+					rv.ARN, rv.AccountID = g.RoleARN, g.AccountID
+					if rv.Name == "" {
+						rv.Name = roleNameOfARN(g.RoleARN)
+					}
 				}
 			}
 			if v.Resource.AccountID == "" {
@@ -1460,8 +1519,15 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				if r.VersionID != nil {
 					no = verNo[*r.VersionID]
 				}
+				awsARN, target := r.PolicyARN, r.PolicyARN
+				if a, az := b.azureRows[r.ID]; az {
+					awsARN, target = "", a.Scope
+					if name == "" || name == r.RoleARN {
+						name = a.PrincipalName
+					}
+				}
 				v.Deployments = append(v.Deployments, AccessDeploymentView{IdentityAccountID: r.IdentityAccountID, RoleName: name,
-					VersionNo: no, State: r.State, AWSPolicyARN: r.PolicyARN, DocumentHash: r.DocumentHash, DeployedAt: r.DeployedAt,
+					VersionNo: no, State: r.State, AWSPolicyARN: awsARN, TargetRef: target, DocumentHash: r.DocumentHash, DeployedAt: r.DeployedAt,
 					VerifiedAt: r.VerifiedAt, LastReadbackAt: r.LastReadbackAt, Drift: r.Drift, Error: errText, EndReason: r.EndReason})
 				if cur != nil && r.VersionID != nil && *r.VersionID == cur.ID {
 					if d, ok := b.azureDocs[r.DocumentHash]; ok {
@@ -1519,8 +1585,8 @@ func (s *GovAccess) Get(ctx context.Context, ws, id uuid.UUID) (*AccessPolicyVie
 
 // AccessListQuery is GET /.
 type AccessListQuery struct {
-	Status, Effect, Q, ResourceID, IdentityAccountID, Cursor string
-	Limit                                                    int
+	Status, Effect, Q, ResourceID, IdentityAccountID, Cursor, Provider string
+	Limit                                                              int
 }
 
 // List is GET / (newest first; filters on status, effect, q, resource and
@@ -1528,6 +1594,10 @@ type AccessListQuery struct {
 func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) ([]AccessPolicyView, string, error) {
 	if q.Limit <= 0 || q.Limit > MaxGovPage {
 		q.Limit = 50
+	}
+	q.Provider = strings.ToLower(strings.TrimSpace(q.Provider))
+	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure {
+		return nil, "", GovBadParam("provider", "provider is aws or azure.")
 	}
 	off := 0
 	if q.Cursor != "" {
@@ -1551,6 +1621,9 @@ func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) (
 	filtered := make([]AccessPolicyView, 0, len(vs))
 	for _, v := range vs {
 		if q.Status != "" && v.Status != q.Status {
+			continue
+		}
+		if q.Provider != "" && v.Resource.Provider != q.Provider {
 			continue
 		}
 		if effect != "" && v.Effect != effect {

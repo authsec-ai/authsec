@@ -18,6 +18,22 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-22 — Azure access policies match AWS in the console (branch `feat/policy-azure-backend`)
+
+On top of 2784c81 (switch removal) and 1ad9b4d (SPEC-access-policies.md, D-114). Committed locally; nothing pushed.
+
+### Done
+- D-114: Azure on `/graph`, `/graph/expand`, `/graph/path` (`internal/igaread/traverse_azure.go`): identity -> role assignment -> resource or leaf scope; reverse from a resource lists the assignments and their holders. AWS and k8s responses unchanged (contract test).
+- Policy views say the cloud (`resource.provider/name/kind`, `roles[].kind`, `deployments[].target_ref`, `?provider=`); readiness `azure_subscriptions`; provider wording; new status `ending` until every deployment has left the cloud; migration 144 checked on its own (Azure 503 without it, AWS unaffected).
+- Tests: `TestP2AzureGraph*` (reverse, forward, isolation), `TestP2AzureGraph*` unit tests, `TestAccessPolicyAzure` extended, `TestAccessPolicyAzureWithout144`.
+
+### To check after deploy
+- `GET /api/iga/v1/graph?root=resource:9cbb0fd8-5c8f-4c70-a972-672c93d10873&direction=reverse`: storage account <- Storage Blob Data Reader <- authsec-agent-iga-project-test-01.
+- `root=identity:302bd535-ef0c-4196-af09-c975eb3c5b82`: its storage and Search assignments.
+- `GET /api/iga/v1/policy/access-policies/readiness`: Authnull (6811c717…) ready.
+
+---
+
 ## 2026-10-13 — Ritam's IGA work made multi-tenant (branch `fix/governance-tenancy`)
 
 Review of all 102 non-merge commits by ritam77 / ritamAN77 / Ritam Kundu since 2026-10-05 (7 parallel reviews), then the fixes. Kept every feature and its logic; changed how each transaction is scoped. Committed locally; nothing pushed.

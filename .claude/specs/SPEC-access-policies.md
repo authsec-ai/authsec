@@ -1,9 +1,10 @@
 # Access policies — AWS and Azure
 
 Status: **AWS built and in production; Azure backend built (migration 144, job
-`azure_access`) and verified once in production by API; Azure console and
-shared graph are proposed here, not built.** Code is the evidence for what is
-built; this file is the target.
+`azure_access`) and verified once in production by API; the backend changes of
+§4 and the shared graph read (D-114) built on `feat/policy-azure-backend`
+(2026-10-22); the Azure console is proposed here, not built.** Code is the
+evidence for what is built; this file is the target.
 
 An admin blocks or allows identities on one resource for a window. The admin
 owns everything (decision 2026-10-13): no owner, approver or review step. The
@@ -108,17 +109,32 @@ way they read Kubernetes ones. The middle node is the role assignment (one per
 drawn; subscriptions, resource groups and the directory are leaf scope nodes.
 The policy form's identity list is that walk, reversed from the resource.
 
-## 4. Backend changes this needs
+## 4. Backend changes this needs (built 2026-10-22)
 
 1. D-114 in `internal/igaread` (`traverse_azure.go`, the slot accepting
    `azure`, meta, node and edge decoration).
 2. The policy view states the provider: `resource {provider, name, kind}`
-   (bucket and ARN stay for AWS) and `roles[].kind`.
-3. Readiness covers Azure: per connected subscription, whether AuthSec's app
-   holds role-assignment write and delete there (the check the preview runs).
-4. Status reasons name the provider ("removing from Azure", "restoring in
-   Azure"); a block that is ending reads ending until its assignments are
-   restored.
+   (bucket and ARN stay for AWS; on Azure `arn` is the ARM resource id and
+   `account_id` the subscription) and `roles[].kind` (on Azure `arn` is
+   empty). Deployments add `target_ref`: the AWS policy ARN, or the ARM scope
+   (`aws_policy_arn` is empty for Azure). The list takes
+   `?provider=aws|azure`.
+3. Readiness covers Azure: `azure_subscriptions [{subscription_id, name,
+   connector_id, ready, reason}]` per connected subscription, `ready` when
+   AuthSec's app holds role-assignment write and delete there (the check the
+   preview runs, cached for a minute). `reason` is `azure_unavailable`,
+   `azure_write_access_missing`, or `access_policies_unavailable: <why>`
+   without migration 144.
+4. Status reasons name the provider: "removing from AWS", "removing from
+   Azure" (allow), "restoring access in Azure" (block). A new status
+   `ending` holds from End (or the end time) until every deployment has left
+   the cloud; only then `ended` with `ended_at`. Delete accepts `ending` and
+   refuses with `policy_removing` until it is done. Pause keeps `paused` with
+   the same reason.
+5. Migration 144 is checked on its own (`VerifyAzureAccessSchema`), not in
+   `VerifyAccessPolicySchema`: without it, Azure preview and create return 503
+   `access_policies_unavailable` with the reason, and AWS policies (list,
+   detail, create, End) work as before.
 
 ## 5. Demo (Azure)
 
