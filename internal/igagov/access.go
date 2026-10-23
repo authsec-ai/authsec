@@ -210,7 +210,12 @@ func ParseS3BucketARN(arn string) (S3Target, bool) {
 func (t S3Target) BucketARN() string { return "arn:" + t.partition() + ":s3:::" + t.Bucket }
 
 // ObjectARN is the bucket's objects under the prefix (all objects without one).
-func (t S3Target) ObjectARN() string { return t.BucketARN() + "/" + t.Prefix + "*" }
+func (t S3Target) ObjectARN() string { return t.BucketARN() + "/" + IAMLiteral(t.Prefix) + "*" }
+
+// IAMLiteral writes s so a policy document reads it literally: "${" starts a
+// policy variable in the 2012-10-17 language, so every "$" is written "${$}".
+// A key prefix may contain "$"; nothing else AuthSec writes does.
+func IAMLiteral(s string) string { return strings.ReplaceAll(s, "$", "${$}") }
 
 func (t S3Target) partition() string {
 	if t.Partition == "" {
@@ -316,9 +321,13 @@ func (t S3Target) Statements(effect string, access []string) ([]AccessStatement,
 	if len(bucket) > 0 {
 		var cond map[string]any
 		if t.Prefix != "" {
-			var like any = t.Prefix + "*"
+			var like any = IAMLiteral(t.Prefix) + "*"
 			if effect == AccessEffectBlock {
-				like = accessListGuard(t.Prefix)
+				guard := accessListGuard(t.Prefix)
+				for i := range guard {
+					guard[i] = IAMLiteral(guard[i])
+				}
+				like = guard
 			}
 			cond = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: like}}
 		}
