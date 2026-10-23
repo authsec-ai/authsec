@@ -637,3 +637,42 @@ func TestAccessPolicyListTruncated(t *testing.T) {
 		t.Fatalf("a search that narrows it: %+v %v", pg, err)
 	}
 }
+
+// Resume after a pause whose policy was kept (someone attached it to another
+// role too, so AuthSec only detached it from ours): the resumed deployment
+// gets its own name instead of colliding with the kept policy.
+func TestAccessPolicyResumeAfterKeptPolicy(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApResumeRole")
+	l.role("ApBorrower")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "resume kept", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	first := l.attachedAuthSec("ApResumeRole")[0]
+	l.fake.AttachPermissions("ApBorrower", first) // attached elsewhere by someone
+	if _, err := l.svc.Pause(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	if _, _, _, _, ok := l.fake.PolicyState(first); !ok {
+		t.Fatal("the policy attached elsewhere should have been kept")
+	}
+	if _, err := l.svc.Resume(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	got, err := l.svc.Get(ctx, l.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusActive {
+		t.Fatalf("after resume: %s %q %v", got.Status, got.StatusReason, err)
+	}
+	att := l.attachedAuthSec("ApResumeRole")
+	if len(att) != 1 || att[0] == first {
+		t.Fatalf("resumed policy: %v (first was %s)", att, first)
+	}
+}

@@ -730,6 +730,17 @@ func (s *GovAccess) deployTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, v *mode
 	res, _ := json.Marshal(p.res)
 	for _, r := range p.roles {
 		name := igagov.AccessPolicyName(r.Identity.RoleID, policyID.String(), v.VersionNo)
+		// A version deployed again (Resume) gets its own name: the earlier
+		// deployment's policy may still exist, kept because it is attached
+		// elsewhere, and is not this row's.
+		var earlier int64
+		if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND (policy_name = ? OR policy_name LIKE ?)",
+			ws, name, name+"-r%").Count(&earlier).Error; err != nil {
+			return err
+		}
+		if earlier > 0 {
+			name = fmt.Sprintf("%s-r%d", name, earlier+1)
+		}
 		h, err := igagov.AccessDeploymentHash(r.Identity.RoleID, r.Identity.AccountID, v.ID.String(), p.docHash)
 		if err != nil {
 			return err

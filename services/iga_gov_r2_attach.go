@@ -286,6 +286,11 @@ func (r r2Row) converge(ctx context.Context, run *PolicyJobRun, present bool) (*
 		out.Readback = live.summary()
 		roleOK := live.Role != nil && live.Role.RoleID == r.RoleID
 		if live.Policy != nil && !live.Ours {
+			if !present {
+				// Nothing of this row's is there to remove.
+				out.Drift, out.Done = R2ReasonOwnedElsewhere, true
+				return out, nil
+			}
 			out.Fail, out.FailDetail = R2ReasonOwnedElsewhere, r.PolicyARN+" exists and is not this row's policy"
 			return out, nil
 		}
