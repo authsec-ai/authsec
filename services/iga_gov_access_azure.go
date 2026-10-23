@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -442,6 +443,19 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 		if ap.roleGUID == azure.RoleContributor {
 			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
 				Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on this resource type: Contributor allows every management write on it."})
+		}
+		if ap.roleGUID == azure.RoleStorageBlobDataContributor {
+			// The data role for write or delete covers all three.
+			var also []string
+			for _, a := range []string{igagov.AccessRead, igagov.AccessWrite, igagov.AccessDelete} {
+				if !slices.Contains(p.intent.Access, a) {
+					also = append(also, a)
+				}
+			}
+			if len(also) > 0 {
+				p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+					Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on blobs: Storage Blob Data Contributor also allows " + strings.Join(also, " and ") + "."})
+			}
 		}
 		p.warnings = append(p.warnings, AccessIssue{Code: "azure_end_by_job",
 			Message: "An Azure role assignment has no expiry of its own: AuthSec removes it at the end time."})

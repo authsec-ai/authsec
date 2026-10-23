@@ -722,3 +722,20 @@ func TestAccessPolicyAzureScheduled(t *testing.T) {
 		t.Fatalf("a policy that starts in an hour: %s %q %v", got.Status, got.StatusReason, err)
 	}
 }
+
+// An Azure allow of write on a storage account assigns Storage Blob Data
+// Contributor, which also reads and deletes: the preview says so.
+func TestAccessPolicyAzureAllowBroaderRoleWarned(t *testing.T) {
+	z := newAzLab(t)
+	who, _ := z.principal("sp-writer")
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("allow", z.res, who, "write"))
+	if err != nil || len(pv.Blockers) != 0 {
+		t.Fatalf("preview: %+v %v", pv, err)
+	}
+	for _, w := range pv.Warnings {
+		if w.Code == "azure_broad_role" && strings.Contains(w.Message, "also allows read and delete") {
+			return
+		}
+	}
+	t.Fatalf("no warning that the role also reads and deletes: %+v", pv.Warnings)
+}
