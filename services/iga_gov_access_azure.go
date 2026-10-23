@@ -932,6 +932,10 @@ func (s *GovAccess) AzureAccessHandler(ctx context.Context, run *PolicyJobRun) e
 	}
 	h := azureHandler{s: s, run: run, deps: deps, token: token, row: row}
 	now := time.Now().UTC()
+	if !PolicyR2On() && row.State != models.R2StateExpiring && now.Before(row.ExpiresAt) {
+		// R2 unavailable: no deploys or checks, removals only (above).
+		return PolicyJobRetryLater(10*time.Minute, GovCodeR2Unavailable)
+	}
 	switch row.State {
 	case models.R2StateApproved:
 		if !now.Before(row.ExpiresAt) {
@@ -1411,9 +1415,6 @@ func RegisterAzureAccessJobs(w *PolicyJobWorker, db *gorm.DB) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobAzureAccess, Handler: s.AzureAccessHandler})
 	w.Scheduler().Add(PolicyJobSchedule{Name: repositories.GovJobAzureAccess, Kind: repositories.GovJobAzureAccess, Every: azureCheckEvery,
 		Due: func(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPolicyJob, error) {
-			if !PolicyR2On() {
-				return nil, nil
-			}
 			// TENANT-EXEMPT: the 144 schema check reads the Postgres catalog only.
 			if ok, _ := AzureAccessSchemaStatus(db); !ok {
 				return nil, nil
@@ -1424,9 +1425,14 @@ func RegisterAzureAccessJobs(w *PolicyJobWorker, db *gorm.DB) {
 			}
 			// TENANT-EXEMPT: the schedule's scan of live Azure rows across
 			// workspaces; each job then runs in its row's own workspace.
-			if err := db.Table("iga_gov_azure_access").Select("workspace_id, id").
-				Where("state IN ?", []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}).
-				Scan(&rows).Error; err != nil {
+			q := db.Table("iga_gov_azure_access").Select("workspace_id, id").
+				Where("state IN ?", []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring})
+			if !PolicyR2On() {
+				// Only what must come out: Azure assignments have no expiry of
+				// their own, so an allow would outlive its end.
+				q = q.Where("state = ? OR expires_at <= ?", models.R2StateExpiring, now)
+			}
+			if err := q.Scan(&rows).Error; err != nil {
 				return nil, err
 			}
 			out := make([]ScheduledPolicyJob, 0, len(rows))

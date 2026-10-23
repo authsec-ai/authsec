@@ -660,3 +660,48 @@ func TestAccessPolicyAzureInheritedAfterApply(t *testing.T) {
 		t.Fatalf("after the broader assignment is gone: %s", got.Status)
 	}
 }
+
+// With R2 unavailable (its schema not verified) the Azure schedule still takes
+// out what must end: an Azure assignment has no expiry of its own, so an
+// allow past its end would stay. Nothing is deployed or checked meanwhile.
+func TestAccessPolicyAzureRemovalWithoutR2(t *testing.T) {
+	z := newAzLab(t)
+	allowWho, allowOID := z.principal("sp-allow-r2-off")
+	blockWho, blockOID := z.principal("sp-block-r2-off")
+	z.assign(z.scope, "keep-1", azure.RoleStorageBlobDataReader, blockOID)
+	allow := z.create("az allow r2 off", z.intent("allow", z.res, allowWho))
+	block := z.create("az block r2 off", z.intent("block", z.res, blockWho))
+	z.run(allow.ID)
+	z.run(block.ID)
+	allowRow := z.rows(allow.ID, models.R2StateActive)[0]
+	// The allow's window is over.
+	p3exec(t, z.db, `UPDATE iga_gov_azure_access SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 minute'
+		WHERE workspace_id = ? AND id = ?`, z.ws, allowRow.ID)
+	// No job ran recently (a periodic job is not queued again within its interval).
+	p3exec(t, z.db, `DELETE FROM iga_gov_job WHERE workspace_id = ? AND kind = 'azure_access'`, z.ws)
+
+	prev := services.PolicyR2GateState()
+	services.SetPolicyR2Gate(services.NewPolicyR2Gate(true)) // not verified: unavailable
+	t.Cleanup(func() { services.SetPolicyR2Gate(prev) })
+	w := services.NewPolicyJobWorker(z.db, "az-r2-off")
+	services.RegisterAzureAccessJobs(w, z.db)
+	if _, err := w.Scheduler().RunSchedulesNow(z.ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var queued []uuid.UUID
+	z.db.Model(&models.IGAGovJob{}).Where("workspace_id = ? AND kind = 'azure_access' AND status = 'queued'", z.ws).Pluck("subject_id", &queued)
+	if len(queued) != 1 || queued[0] != allowRow.ID {
+		t.Fatalf("queued %v, want only the expired allow %s", queued, allowRow.ID)
+	}
+	z.step(allowRow.ID)
+	if got := z.fake.roles(allowOID); len(got) != 0 {
+		t.Fatalf("the expired allow's assignment is still there: %v", got)
+	}
+	// The block is not checked while R2 is unavailable.
+	blockRow := z.rows(block.ID, models.R2StateActive)[0]
+	z.assign(z.scope, "back-1", azure.RoleStorageBlobDataReader, blockOID)
+	z.step(blockRow.ID)
+	if got := z.fake.roles(blockOID); len(got) != 1 {
+		t.Fatalf("a check ran while R2 is unavailable: %v", got)
+	}
+}
