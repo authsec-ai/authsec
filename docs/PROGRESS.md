@@ -14,9 +14,11 @@ On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure acc
 - AS-120: preview blocker `azure_policy_conflict` (block and allow on the same principal, overlapping scopes; the policy's own rows excluded on edit/resume); blocks never record AuthSec's allow assignments.
 - AS-121: on non-storage resources "all" also removes roles with data actions in the provider namespace; read/write/delete with such a role is a preview blocker `azure_data_access_unclassified`.
 - Tests: `TestAccessPolicyAzureOverlappingBlocks`, `TestAccessPolicyAzureBlockAndAllow`, `TestAccessPolicyAzureNonStorageData` (all three fail on the old code); the Azure test setup is shared (`azLab`).
+- AS-122: a restore Azure can never accept (principal, role or resource gone) is skipped and recorded, and the row ends, so the policy can be deleted; transient errors keep retrying. AS-123: a block that fails to deploy after removing assignments restores them first, then ends `failed`. `TestAccessPolicyAzureRestoreFailures`, `TestAccessPolicyAzureFailedDeployRestores` (both fail on the old code).
+- The full governance suite (`IGA_TEST_DSN` only; with `TEST_DATABASE_URL` also set, one test resets the database under the others) and all unit tests pass.
 
 ### Next
-- Step 0, remaining: Azure restore failing forever, partial deploy failure, allow re-apply, Slack links to `/iga/policy/setup`, Azure gap notices on Discovery (UI), schema guard count, `ConnectCustom` concurrency, the v2 template gate.
+- Step 0, remaining: allow re-apply (waiting on a decision: it contradicts the 2026-10-14 re-apply rule and AWS), Slack links to `/iga/policy/setup`, Azure gap notices on Discovery (UI), schema guard count, `ConnectCustom` concurrency, the v2 template gate.
 
 ---
 

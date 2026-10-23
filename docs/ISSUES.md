@@ -142,6 +142,8 @@ Rows are sorted by severity, then ID.
 | AS-115 | Migration 133 (this program) re-created the iga_gov_job kind CHECK without R2's kinds, so R2 jobs were refused and IGA_POLICY_R2 could not verify | BE | P1 | R | `133_iga_gov_job_kinds.sql` | Migration 134 restores them | fixed (134; TestGovJobKindsMatch052Check) |
 | AS-116 | 061's iga_gov_plan_kind_chk compared a JSON subject kind that may be NULL; a NULL CHECK passes, so any direct split plan was accepted (R2-13 allows only Lambda) | BE | P2 | R | `061_r2_time_bound_access.sql` | NULL-safe check | fixed (135; probes DB40/DB43) |
 | AS-117 | R3 runtime holds and budgets stored policy/version/decision ids as bare uuids: a row could name another workspace's policy, version or decision | BE | P2 | C | `062_r3_runtime_controls.sql` | Composite (workspace_id, ...) keys | fixed (136; catalog guard) |
+| AS-122 | An Azure block whose restore Azure could never accept (principal deleted in Entra, role or resource gone) retried forever: the policy stayed "ending" and could not be deleted | BE | P2 | R | `services/iga_gov_access_azure.go` remove (staging review 2026-10-23) | Skip what no longer exists, record it (NotRestored, state reason) and end; transient errors keep retrying | fixed on `feat/iga-enforcement` (TestAccessPolicyAzureRestoreFailures) |
+| AS-123 | An Azure block whose deploy failed (inherited access found) after an earlier attempt had removed assignments went straight to `failed`, leaving them removed with nothing to restore them | BE | P2 | R | `services/iga_gov_access_azure.go` fail | Restore the recorded assignments, then end `failed` | fixed on `feat/iga-enforcement` (TestAccessPolicyAzureFailedDeployRestores) |
 
 ## P3: minor / hygiene
 

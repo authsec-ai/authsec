@@ -978,6 +978,7 @@ type azureHandler struct {
 	deps  *AzureAccessDeps
 	token string
 	row   models.IGAGovAzureAccess
+	note  string // the final state_reason (finish)
 }
 
 func (h azureHandler) event(tx *gorm.DB, name string, payload map[string]any) error {
@@ -1009,6 +1010,25 @@ func (h azureHandler) external(ctx context.Context, fn func(ctx context.Context)
 }
 
 func (h azureHandler) fail(ctx context.Context, reason string) error {
+	// A block that already removed assignments (an earlier attempt of this
+	// deploy, or ones handed to it) restores them before it fails: failing
+	// straight away left them removed with no row to bring them back.
+	if h.row.Effect == "deny" {
+		var held []models.IGAGovAzureAccess
+		if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+			return tx.Where("workspace_id = ? AND id = ? AND revoked <> '[]'::jsonb", h.row.WorkspaceID, h.row.ID).Limit(1).Find(&held).Error
+		}); err != nil {
+			return err
+		}
+		if len(held) == 1 {
+			if err := h.move(ctx, h.row.State, models.R2StateExpiring, map[string]any{"end_reason": azureEndFailed, "state_reason": reason}); err != nil {
+				return err
+			}
+			h.row = held[0]
+			h.row.State, h.row.EndReason, h.row.StateReason = models.R2StateExpiring, azureEndFailed, reason
+			return h.remove(ctx)
+		}
+	}
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND id = ? AND state = ?", h.row.WorkspaceID, h.row.ID, h.row.State).
 			Updates(map[string]any{"state": models.R2StateFailed, "state_reason": reason, "ended_at": time.Now().UTC(), "updated_at": time.Now().UTC()}).Error; err != nil {
@@ -1183,19 +1203,40 @@ func (h azureHandler) remove(ctx context.Context) error {
 		for _, hd := range handed {
 			ops = append(ops, map[string]any{"op": "HandedOver", "assignment": hd.spec.Scope + "/" + hd.spec.Name, "to": hd.to, "at": now})
 		}
+		lost := 0
 		for _, spec := range rest {
 			spec := spec
 			if err := h.external(ctx, func(ctx context.Context) error {
 				_, err := h.deps.RBAC.PutRoleAssignment(ctx, h.token, spec)
 				return err
 			}); err != nil {
-				return h.retry(err)
+				if !azureGone(err) {
+					return h.retry(err)
+				}
+				// The principal, role or resource no longer exists: the
+				// assignment cannot come back, and retrying would keep the
+				// policy ending (and undeletable) for good.
+				lost++
+				ops = append(ops, map[string]any{"op": "NotRestored", "assignment": spec.Scope + "/" + spec.Name, "reason": err.Error(), "at": now})
+				continue
 			}
 			ops = append(ops, map[string]any{"op": "PutRoleAssignment", "restored": spec.Scope + "/" + spec.Name, "at": now})
 		}
+		if lost > 0 {
+			h.note = fmt.Sprintf("%d role assignment(s) could not be restored: the principal, role or resource no longer exists in Azure", lost)
+		}
 	}
 	h.row.Ops = mustOps(ops)
-	return h.finish(ctx, grantFinal(h.row.EndReason), h.row.EndReason)
+	final := grantFinal(h.row.EndReason)
+	if h.row.EndReason == azureEndFailed {
+		final = models.R2StateFailed
+		if h.note == "" {
+			h.note = h.row.StateReason
+		} else {
+			h.note = h.row.StateReason + "; " + h.note
+		}
+	}
+	return h.finish(ctx, final, h.row.EndReason)
 }
 
 // azureHoldStates are the states of a block that can take assignments over:
@@ -1292,7 +1333,7 @@ func mustOps(ops []map[string]any) json.RawMessage {
 func (h azureHandler) finish(ctx context.Context, final, endReason string) error {
 	now := time.Now().UTC()
 	return h.run.InTx(ctx, func(tx *gorm.DB) error {
-		set := map[string]any{"state": final, "ended_at": now, "state_reason": "", "updated_at": now}
+		set := map[string]any{"state": final, "ended_at": now, "state_reason": h.note, "updated_at": now}
 		if endReason != "" {
 			set["end_reason"] = endReason
 		}
@@ -1304,11 +1345,33 @@ func (h azureHandler) finish(ctx context.Context, final, endReason string) error
 			return PolicyJobRetryLater(time.Second, "the row's state moved; reloading")
 		}
 		name := GovEventAccessRemoved
-		if final == models.R2StateExpired {
+		switch final {
+		case models.R2StateExpired:
 			name = GovEventAccessExpired
+		case models.R2StateFailed:
+			name = GovEventAccessFailed
 		}
 		return h.event(tx, name, map[string]any{"state": final, "end_reason": endReason, "ops": json.RawMessage(h.row.Ops)})
 	})
+}
+
+// azureEndFailed is the end reason of a block that failed to deploy after
+// removing assignments: it restores them, then ends failed.
+const azureEndFailed = "failed"
+
+// azureGone reports an Azure answer that no retry can change: the principal,
+// role definition, resource, group or subscription no longer exists.
+func azureGone(err error) bool {
+	var ae *azure.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch strings.ToLower(ae.Code) {
+	case "principalnotfound", "invalidprincipalid", "roledefinitiondoesnotexist", "resourcenotfound",
+		"parentresourcenotfound", "resourcegroupnotfound", "subscriptionnotfound":
+		return true
+	}
+	return ae.Status == http.StatusNotFound
 }
 
 // retry turns an Azure error into a retry (a lost lease is returned as is).

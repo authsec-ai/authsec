@@ -28,6 +28,9 @@ type fakeRBAC struct {
 	mu   sync.Mutex
 	defs []azure.RoleDefinition
 	as   map[string]azure.RoleAssignment // by lower-case id
+	// putErr / delErr, when set, answer a write instead of the fake.
+	putErr func(azure.RoleAssignmentSpec) error
+	delErr func(id string) error
 }
 
 func (f *fakeRBAC) ListRoleAssignmentsForPrincipal(_ context.Context, _, _, principal string) ([]azure.RoleAssignment, error) {
@@ -49,6 +52,11 @@ func (f *fakeRBAC) ListRoleDefinitions(context.Context, string, string) ([]azure
 func (f *fakeRBAC) PutRoleAssignment(_ context.Context, _ string, s azure.RoleAssignmentSpec) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.putErr != nil {
+		if err := f.putErr(s); err != nil {
+			return "", err
+		}
+	}
 	id := s.Scope + "/providers/Microsoft.Authorization/roleAssignments/" + s.Name
 	var a azure.RoleAssignment
 	a.ID, a.Name = id, s.Name
@@ -70,6 +78,11 @@ func (f *fakeRBAC) GetRoleAssignment(_ context.Context, _, id string) (*azure.Ro
 func (f *fakeRBAC) DeleteRoleAssignment(_ context.Context, _, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.delErr != nil {
+		if err := f.delErr(id); err != nil {
+			return err
+		}
+	}
 	delete(f.as, strings.ToLower(id))
 	return nil
 }
@@ -531,5 +544,86 @@ func TestAccessPolicyAzureNonStorageData(t *testing.T) {
 	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, wideWho, "all"))
 	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureInherited {
 		t.Fatalf("all block over a subscription-wide data role: %+v %v", pv, err)
+	}
+}
+
+// A restore Azure can never accept (the principal, role or resource is gone)
+// ends the policy and records what was not restored; before, it retried
+// forever, so the policy stayed "ending" and could not be deleted. A
+// transient failure keeps retrying and keeps the policy undeletable.
+func TestAccessPolicyAzureRestoreFailures(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-deleted-later")
+	z.assign(z.scope, "gone-1", azure.RoleStorageBlobDataReader, oid)
+	v := z.create("az restore gone", z.intent("block", z.res, who))
+	z.run(v.ID)
+
+	// Transient: still ending, not deletable.
+	z.fake.putErr = func(azure.RoleAssignmentSpec) error {
+		return &azure.APIError{Service: "arm", Status: 503, Code: "ServiceUnavailable", Message: "try later"}
+	}
+	z.end(v.ID)
+	row := z.rows(v.ID, models.R2StateExpiring)[0]
+	z.step(row.ID)
+	if got := z.rows(v.ID, models.R2StateExpiring); len(got) != 1 {
+		t.Fatalf("a transient restore failure ended the row: %+v", got)
+	}
+	var ge *services.GovError
+	if err := z.svc.Delete(z.ctx, z.ws, z.user, v.ID); !errors.As(err, &ge) || ge.Code != services.GovCodePolicyRemoving {
+		t.Fatalf("delete while restoring: %v, want policy_removing", err)
+	}
+
+	// Permanent: the principal was deleted in Entra.
+	z.fake.putErr = func(azure.RoleAssignmentSpec) error {
+		return &azure.APIError{Service: "arm", Status: 400, Code: "PrincipalNotFound", Message: "Principal does not exist"}
+	}
+	z.step(row.ID)
+	var done models.IGAGovAzureAccess
+	if err := z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).First(&done).Error; err != nil {
+		t.Fatal(err)
+	}
+	if done.State != models.R2StateRevoked || !strings.Contains(done.StateReason, "could not be restored") {
+		t.Fatalf("after a permanent failure: state %s, reason %q", done.State, done.StateReason)
+	}
+	if err := z.svc.Delete(z.ctx, z.ws, z.user, v.ID); err != nil {
+		t.Fatalf("delete after the restore gave up: %v", err)
+	}
+}
+
+// A block whose deploy fails after removing some assignments restores them
+// before it ends failed. Before, it failed at once and they stayed removed
+// with no row left to bring them back.
+func TestAccessPolicyAzureFailedDeployRestores(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-partial")
+	z.assign(z.scope, "partial-1", azure.RoleStorageBlobDataReader, oid)
+	z.assign(z.scope+"/blobservices/default/containers/c1", "partial-2", azure.RoleStorageBlobDataReader, oid)
+	deletes := 0
+	z.fake.delErr = func(string) error {
+		if deletes++; deletes == 2 {
+			return &azure.APIError{Service: "arm", Status: 503, Code: "ServiceUnavailable", Message: "try later"}
+		}
+		return nil
+	}
+	v := z.create("az partial", z.intent("block", z.res, who))
+	row := z.rows(v.ID, models.R2StateApproved)[0]
+	z.step(row.ID) // one removed, the other fails: retry
+	if got := z.fake.roles(oid); len(got) != 1 {
+		t.Fatalf("after the partial deploy: %v", got)
+	}
+	// Meanwhile the principal gains the access from the subscription: the
+	// deploy cannot complete.
+	z.fake.delErr = nil
+	z.assign("/subscriptions/"+z.sub, "partial-wide", azure.RoleStorageBlobDataReader, oid)
+	z.step(row.ID)
+	var done models.IGAGovAzureAccess
+	if err := z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).First(&done).Error; err != nil {
+		t.Fatal(err)
+	}
+	if done.State != models.R2StateFailed || !strings.Contains(done.StateReason, services.GovCodeAzureInherited) {
+		t.Fatalf("after the failed deploy: state %s, reason %q", done.State, done.StateReason)
+	}
+	if got := z.fake.roles(oid); len(got) != 3 {
+		t.Fatalf("the failed deploy left %v, want both resource assignments back plus the subscription one", got)
 	}
 }
