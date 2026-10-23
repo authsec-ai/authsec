@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,9 +58,16 @@ func main() {
 	// Load .env file if present (optional, for development)
 	godotenv.Load()
 	// Local-only overlay, git-ignored (.git/info/exclude): secrets and
-	// Docker-vs-host overrides that must never land in the tracked .env.
+	// Docker-vs-host overrides that must never land in the tracked .env. It
+	// overrides the environment, so it is never read in production, where a
+	// stray copy in the working directory would replace the deployment's own
+	// settings and secrets.
 	if _, err := os.Stat(".env.azure.local"); err == nil {
-		godotenv.Overload(".env.azure.local")
+		if strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") {
+			log.Printf("[config] ignoring .env.azure.local: ENVIRONMENT is production")
+		} else {
+			godotenv.Overload(".env.azure.local")
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────
