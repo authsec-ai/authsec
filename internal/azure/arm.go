@@ -469,3 +469,40 @@ func (c *Client) ListUserAssignedIdentityFederatedCredentials(ctx context.Contex
 		return out
 	})
 }
+
+// GetResourceProperties reads one ARM resource's properties at apiVersion
+// (the resource provider's own version): nil when the resource does not
+// exist. Access policies read a vault's permission model and a search
+// service's authentication options with it.
+func (c *Client) GetResourceProperties(ctx context.Context, armToken, resourceID, apiVersion string) (map[string]any, error) {
+	cl, err := arm.NewClient("authsec.azure", "v1.0.0", staticToken(armToken), c.armOptions())
+	if err != nil {
+		return nil, err
+	}
+	u := runtime.JoinPaths(cl.Endpoint(), resourceID) + "?api-version=" + url.QueryEscape(apiVersion)
+	req, err := runtime.NewRequest(ctx, http.MethodGet, u)
+	if err != nil {
+		return nil, err
+	}
+	req.Raw().Header.Set("Accept", "application/json")
+	resp, err := cl.Pipeline().Do(req)
+	if err != nil {
+		return nil, armError(err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if !runtime.HasStatusCode(resp, http.StatusOK) {
+		return nil, armError(runtime.NewResponseError(resp))
+	}
+	var body struct {
+		Properties map[string]any `json:"properties"`
+	}
+	if err := runtime.UnmarshalAsJSON(resp, &body); err != nil {
+		return nil, err
+	}
+	if body.Properties == nil {
+		body.Properties = map[string]any{}
+	}
+	return body.Properties, nil
+}

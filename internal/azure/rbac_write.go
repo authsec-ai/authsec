@@ -17,8 +17,13 @@ import (
 
 // Built-in role definition ids (the same in every tenant).
 const (
-	RoleReader                     = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
-	RoleContributor                = "b24988ac-6180-42a0-ab88-20f7382dd24c"
+	RoleReader      = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+	RoleContributor = "b24988ac-6180-42a0-ab88-20f7382dd24c"
+	// Data roles of the types access policies map (Microsoft built-in roles).
+	RoleSearchIndexDataReader      = "1407120a-92aa-4202-b7e9-c0e197c71c8f"
+	RoleSearchIndexDataContributor = "8ebe5a00-799e-43f5-93ac-243d3dce84a7"
+	RoleKeyVaultSecretsUser        = "4633458b-17de-408a-b874-0445c86b69e6"
+	RoleKeyVaultSecretsOfficer     = "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
 	RoleStorageBlobDataReader      = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
 	RoleStorageBlobDataContributor = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 )

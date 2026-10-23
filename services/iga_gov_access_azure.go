@@ -62,6 +62,7 @@ const (
 type AzureRBACClient interface {
 	ListRoleAssignmentsForPrincipal(ctx context.Context, armToken, subscriptionID, principalID string) ([]azure.RoleAssignment, error)
 	ListRoleDefinitions(ctx context.Context, armToken, subscriptionID string) ([]azure.RoleDefinition, error)
+	GetResourceProperties(ctx context.Context, armToken, resourceID, apiVersion string) (map[string]any, error)
 	PutRoleAssignment(ctx context.Context, armToken string, spec azure.RoleAssignmentSpec) (string, error)
 	GetRoleAssignment(ctx context.Context, armToken, id string) (*azure.RoleAssignment, error)
 	DeleteRoleAssignment(ctx context.Context, armToken, id string) error
@@ -201,7 +202,17 @@ func indexOf(s []string, v string) int {
 // (control-plane actions, and for storage the blob data actions and the key
 // listing that gives the same data access).
 func azureActions(t *azureTarget, access []string) (actions, dataActions []string) {
+	dp := azureDataPlaneOf(t)
 	for _, a := range access {
+		if dp != nil {
+			// A mapped data plane: its data and key actions, and for "all" the
+			// management ones too (below).
+			acts, data := dp.dataActionsOf([]string{a})
+			actions, dataActions = append(actions, acts...), append(dataActions, data...)
+			if a != igagov.AccessAll {
+				continue
+			}
+		}
 		switch {
 		case t.Storage && a == igagov.AccessRead:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
@@ -236,6 +247,12 @@ func azureAllowRole(t *azureTarget, access []string) (guid, name string) {
 	writes := false
 	for _, a := range access {
 		writes = writes || a == igagov.AccessWrite || a == igagov.AccessDelete
+	}
+	if dp := azureDataPlaneOf(t); dp != nil {
+		if writes {
+			return dp.writeRole, dp.writeRoleName
+		}
+		return dp.readRole, dp.readRoleName
 	}
 	switch {
 	case t.Storage && writes:
@@ -302,10 +319,10 @@ func accessHasAll(access []string) bool {
 }
 
 // azureGrants reports whether a block of access on t removes an assignment of
-// def: its management actions (and, for storage, the blob data actions and
-// key listing) match; for any other type "all" also takes every role with
-// data access in the type's provider (Key Vault Secrets User, Search Index
-// Data Reader, ...), whose data actions read, write and delete do not map yet.
+// def: its actions match (storage's and the mapped data planes' data and key
+// actions, other types' management actions); for a type other than storage
+// "all" also takes every role with data access in the type's provider,
+// including data the planes do not map (Key Vault keys or certificates).
 func azureGrants(t *azureTarget, access []string, def azure.RoleDefinition, actions, dataActions []string) bool {
 	if roleGrants(def, actions, dataActions) {
 		return true
@@ -444,7 +461,8 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
 				Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on this resource type: Contributor allows every management write on it."})
 		}
-		if ap.roleGUID == azure.RoleStorageBlobDataContributor {
+		dp := azureDataPlaneOf(&ap.target)
+		if ap.roleGUID == azure.RoleStorageBlobDataContributor || (dp != nil && ap.roleGUID == dp.writeRole) {
 			// The data role for write or delete covers all three.
 			var also []string
 			for _, a := range []string{igagov.AccessRead, igagov.AccessWrite, igagov.AccessDelete} {
@@ -454,7 +472,7 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 			}
 			if len(also) > 0 {
 				p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
-					Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on blobs: Storage Blob Data Contributor also allows " + strings.Join(also, " and ") + "."})
+					Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on " + azureDataWhat(&ap.target) + ": " + ap.roleName + " also allows " + strings.Join(also, " and ") + "."})
 			}
 		}
 		p.warnings = append(p.warnings, AccessIssue{Code: "azure_end_by_job",
@@ -491,6 +509,28 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	if errs := s.azureConflicts(ctx, ws, p); len(errs) > 0 {
 		return errs
 	}
+	// A mapped type whose data role assignments do not control (a vault on
+	// access policies, a search service on API keys only): refused for a
+	// block and an allow alike.
+	if dp := azureDataPlaneOf(&ap.target); dp != nil && dp.authMode != nil {
+		props, err := deps.RBAC.GetResourceProperties(ctx, token, ap.target.Scope, dp.apiVersion)
+		if err != nil || props == nil {
+			why := "the resource was not found"
+			if err != nil {
+				why = err.Error()
+			}
+			p.warnings = append(p.warnings, AccessIssue{Code: GovCodeAzureAuthUnchecked,
+				Message: "AuthSec could not read how this resource checks access to its " + dp.what + ": " + why})
+		} else {
+			blocker, warning := dp.authMode(props)
+			if blocker != nil {
+				return []error{govUnprocessable(blocker.Code, blocker.Message, map[string]any{"field": "resource.resource_id"})}
+			}
+			if warning != nil {
+				p.warnings = append(p.warnings, *warning)
+			}
+		}
+	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		return nil
 	}
@@ -522,7 +562,7 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 		if unc := azureUnclassified(&ap.target, p.intent.Access, as, dm, rev); len(unc) > 0 {
 			errs = append(errs, govUnprocessable(GovCodeAzureDataUnclassified,
 				pr.Name+" has data access to this resource through "+strings.Join(unc, ", ")+
-					", which a "+strings.Join(p.intent.Access, ", ")+" block cannot remove yet on this resource type. Choose access \"all\" to remove those roles too.",
+					", which a "+strings.Join(p.intent.Access, ", ")+" block cannot remove yet: "+azureUnmappedWhat(&ap.target)+" Choose access \"all\" to remove those roles too.",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "roles": unc}))
 			continue
 		}
@@ -546,6 +586,23 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	return errs
 }
 
+// azureDataWhat is the data a type's allow role reaches, in words.
+func azureDataWhat(t *azureTarget) string {
+	if dp := azureDataPlaneOf(t); dp != nil {
+		return dp.what
+	}
+	return "blobs"
+}
+
+// azureUnmappedWhat says which data a read, write or delete block cannot
+// classify on the type.
+func azureUnmappedWhat(t *azureTarget) string {
+	if dp := azureDataPlaneOf(t); dp != nil {
+		return "they reach data of this resource other than its " + dp.what + "."
+	}
+	return "this resource type's data actions are not mapped."
+}
+
 // azureUnclassified names the roles assigned on the resource, below or above
 // it that give data access in the type's provider but that a read, write or
 // delete block on a non-storage type would leave in place ("all" removes
@@ -567,6 +624,11 @@ func azureUnclassified(t *azureTarget, access []string, as []azure.RoleAssignmen
 		}
 		def, ok := defs[strings.ToLower(a.Properties.RoleDefinitionID)]
 		if !ok || !roleDataIn(def, ns) {
+			continue
+		}
+		// A mapped plane classifies its own data: only a role with data
+		// outside it (Key Vault keys or certificates) is unclassified.
+		if dp := azureDataPlaneOf(t); dp != nil && !roleDataOutside(def, ns, dp.mapped) {
 			continue
 		}
 		name := def.Properties.RoleName

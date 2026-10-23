@@ -31,6 +31,14 @@ type fakeRBAC struct {
 	// putErr / delErr, when set, answer a write instead of the fake.
 	putErr func(azure.RoleAssignmentSpec) error
 	delErr func(id string) error
+	// props are resources' ARM properties by lower-case id (absent: not found).
+	props map[string]map[string]any
+}
+
+func (f *fakeRBAC) GetResourceProperties(_ context.Context, _, id, _ string) (map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.props[strings.ToLower(id)], nil
 }
 
 func (f *fakeRBAC) ListRoleAssignmentsForPrincipal(_ context.Context, _, _, principal string) ([]azure.RoleAssignment, error) {
@@ -138,15 +146,21 @@ func newAzLab(t *testing.T) *azLab {
 		azureDef(t, z.sub, azure.RoleStorageBlobDataReader, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"}),
 		azureDef(t, z.sub, azure.RoleStorageBlobDataContributor, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*"}),
 		azureDef(t, z.sub, azure.RoleReader, []string{"*/read"}, nil),
-		azureDef(t, z.sub, roleKeyVaultSecretsUser, nil, []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action"}),
-	}}
+		azureDef(t, z.sub, roleKeyVaultSecretsUser, nil, []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action"}),
+		azureDef(t, z.sub, roleKeyVaultCryptoUser, nil, []string{"Microsoft.KeyVault/vaults/keys/decrypt/action", "Microsoft.KeyVault/vaults/keys/read"}),
+		azureDef(t, z.sub, azure.RoleSearchIndexDataReader, nil, []string{"Microsoft.Search/searchServices/indexes/documents/read"}),
+		azureDef(t, z.sub, azure.RoleSearchIndexDataContributor, nil, []string{"Microsoft.Search/searchServices/indexes/documents/*"}),
+	}, props: map[string]map[string]any{}}
 	t.Cleanup(services.SetAzureAccessDeps(&services.AzureAccessDeps{RBAC: z.fake,
 		Token: func(context.Context, uuid.UUID, string) (string, error) { return "tok", nil }}))
 	return z
 }
 
-// Key Vault Secrets User: data actions only.
-const roleKeyVaultSecretsUser = "4633458b-17de-408a-b874-0445c86b69e6"
+// Key Vault Secrets User and Crypto User: data actions only.
+const (
+	roleKeyVaultSecretsUser = azure.RoleKeyVaultSecretsUser
+	roleKeyVaultCryptoUser  = "12338af0-0e69-4776-bea7-57ae8d297424"
+)
 
 func (z *azLab) resource(kind, name, scope string) uuid.UUID {
 	id := uuid.New()
@@ -507,43 +521,102 @@ func TestAccessPolicyAzureBlockAndAllow(t *testing.T) {
 	}
 }
 
-// Resources other than storage: "all" also removes the roles with data access
-// in the type's provider (Key Vault Secrets User); read, write and delete do
-// not map to data actions there yet, so a block that would leave such a role
-// is refused rather than reported active.
+// Key Vault secrets are mapped (step 2): read, write and delete name their
+// data actions, so a read block removes Key Vault Secrets User and End puts it
+// back. Data the mapping does not cover (Key Vault keys) is still refused for
+// read/write/delete and removed by "all" (AS-121).
 func TestAccessPolicyAzureNonStorageData(t *testing.T) {
 	z := newAzLab(t)
 	kvScope := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.keyvault/vaults/kvdemo"
+	z.fake.props[kvScope] = map[string]any{"enableRbacAuthorization": true}
 	kv := z.resource("key_vault", "kvdemo", kvScope)
 	who, oid := z.principal("sp-secrets")
 	z.assign(kvScope, "kv-1", roleKeyVaultSecretsUser, oid)
 
 	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, who, "read"))
-	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureDataUnclassified {
-		t.Fatalf("read block with a data role: %+v %v", pv, err)
-	}
-
-	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, who, "all"))
 	if err != nil || len(pv.Blockers) != 0 {
-		t.Fatalf("all block: %+v %v", pv, err)
+		t.Fatalf("read block over Secrets User: %+v %v", pv, err)
 	}
-	v := z.create("az kv all", z.intent("block", kv, who, "all"))
+	v := z.create("az kv read", z.intent("block", kv, who, "read"))
 	z.run(v.ID)
 	if got := z.fake.roles(oid); len(got) != 0 {
-		t.Fatalf("an all block left %v", got)
+		t.Fatalf("a read block left %v", got)
 	}
 	z.end(v.ID)
 	z.run(v.ID)
 	if got := z.fake.roles(oid); len(got) != 1 || got[0] != roleKeyVaultSecretsUser {
 		t.Fatalf("after End: %v", got)
 	}
+	// A write block leaves a read-only secrets role alone, with no refusal.
+	if pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, who, "write")); err != nil || len(pv.Blockers) != 0 {
+		t.Fatalf("write block over Secrets User: %+v %v", pv, err)
+	}
 
-	// A subscription-wide data role is inherited, for "all" too.
+	// Keys are not mapped: a read block over Crypto User is refused, "all" removes it.
+	keyWho, keyOID := z.principal("sp-keys")
+	z.assign(kvScope, "kv-keys", roleKeyVaultCryptoUser, keyOID)
+	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, keyWho, "read"))
+	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureDataUnclassified ||
+		!strings.Contains(pv.Blockers[0].Message, "other than its Key Vault secrets") {
+		t.Fatalf("read block over a keys role: %+v %v", pv, err)
+	}
+	v = z.create("az kv all", z.intent("block", kv, keyWho, "all"))
+	z.run(v.ID)
+	if got := z.fake.roles(keyOID); len(got) != 0 {
+		t.Fatalf("an all block left %v", got)
+	}
+
+	// A subscription-wide secrets role is inherited (read now maps to it).
 	wideWho, wideOID := z.principal("sp-secrets-wide")
 	z.assign("/subscriptions/"+z.sub, "kv-wide", roleKeyVaultSecretsUser, wideOID)
-	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, wideWho, "all"))
+	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, wideWho, "read"))
 	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureInherited {
-		t.Fatalf("all block over a subscription-wide data role: %+v %v", pv, err)
+		t.Fatalf("read block over a subscription-wide secrets role: %+v %v", pv, err)
+	}
+}
+
+// What role assignments cannot control is refused: a vault on access
+// policies, a search service on API keys only. A search service that also
+// takes keys is warned. An allow assigns the type's data role.
+func TestAccessPolicyAzureKeyVaultAndSearch(t *testing.T) {
+	z := newAzLab(t)
+	legacy := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.keyvault/vaults/kvlegacy"
+	z.fake.props[legacy] = map[string]any{"enableRbacAuthorization": false}
+	legacyRes := z.resource("key_vault", "kvlegacy", legacy)
+	keysOnly := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.search/searchservices/srchkeys"
+	z.fake.props[keysOnly] = map[string]any{}
+	keysOnlyRes := z.resource("search_service", "srchkeys", keysOnly)
+	both := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.search/searchservices/srchboth"
+	z.fake.props[both] = map[string]any{"authOptions": map[string]any{"aadOrApiKey": map[string]any{}}}
+	bothRes := z.resource("search_service", "srchboth", both)
+	who, oid := z.principal("sp-search")
+
+	for _, c := range []struct {
+		name   string
+		res    uuid.UUID
+		effect string
+		code   string
+	}{
+		{"block on a vault on access policies", legacyRes, "block", services.GovCodeAzureVaultAccessPolicies},
+		{"allow on a vault on access policies", legacyRes, "allow", services.GovCodeAzureVaultAccessPolicies},
+		{"block on a keys-only search service", keysOnlyRes, "block", services.GovCodeAzureSearchKeysOnly},
+	} {
+		pv, err := z.svc.Preview(z.ctx, z.ws, z.intent(c.effect, c.res, who, "read"))
+		if err != nil || len(pv.Blockers) == 0 || pv.Blockers[0].Code != c.code {
+			t.Errorf("%s: %+v %v", c.name, pv, err)
+		}
+	}
+
+	// Allow read on a search service that also takes keys: warned, and
+	// Search Index Data Reader is assigned.
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("allow", bothRes, who, "read"))
+	if err != nil || len(pv.Blockers) != 0 || !strings.Contains(fmt.Sprint(pv.Warnings), services.GovCodeAzureSearchKeys) {
+		t.Fatalf("allow on a search service with keys too: %+v %v", pv, err)
+	}
+	v := z.create("az search allow", z.intent("allow", bothRes, who, "read"))
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 1 || got[0] != azure.RoleSearchIndexDataReader {
+		t.Fatalf("the allow assigned %v", got)
 	}
 }
 

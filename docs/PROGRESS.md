@@ -4,6 +4,21 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, step 2: Azure Key Vault and AI Search (both repos)
+
+### Done
+- A per-type table of Azure data planes (`services/iga_gov_access_azure_planes.go`), built on Aman's `fix/azure-access-data-actions` review (its Key Vault and Search entries and role GUIDs kept; Service Bus and Event Hubs left for step 7 with their correct roles).
+- Key Vault secrets: read getSecret/readMetadata/backup, write setSecret/update/restore/recover, delete delete/purge; allow Key Vault Secrets User / Officer. AI Search documents: read/write/delete; query keys for read, admin keys for read, write and delete; allow Search Index Data Reader / Contributor.
+- Read on a mapped type no longer means the management read (a Reader role grants no secret): no false inherited-access blocker from a subscription Reader.
+- AS-121 narrowed: a data role is unclassified only if it has data outside the mapped plane (Key Vault keys and certificates are still refused; "all" removes them).
+- A live ARM read of the resource: vault on access policies and keys-only search service are blockers; a search service that also takes keys is a warning; an unreadable one a warning.
+- UI: access-level wording for vaults and search services.
+
+### To check against Azure
+- The four data role GUIDs and the data action names were checked against the reviewer's notes and memory, not against a live tenant; verify with `az role definition list` before release.
+
+---
+
 ## 2026-10-24 (cont.) — Staging review findings, round 1 (both repos, `feat/iga-enforcement`)
 
 ### Done
