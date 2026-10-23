@@ -227,7 +227,7 @@ func (s *SlackIntegrationService) approvalRequest(ctx context.Context, db *gorm.
 	if err != nil {
 		return nil, err
 	}
-	r := &slackapp.ApprovalRequest{PolicyName: pol.Name, VersionNo: v.VersionNo, Link: govConsoleLink("/iga/policy/approvals"),
+	r := &slackapp.ApprovalRequest{PolicyName: pol.Name, VersionNo: v.VersionNo, Link: govConsoleLink("/iga/policy"),
 		Value: slackapp.ButtonValue{Notification: n.ID.String(), Digest: approvalDigest(pv.Hashes)}.Encode()}
 	consumers := map[string]bool{}
 	for _, p := range pv.Plans {
@@ -323,7 +323,7 @@ func renderApprovalRequestNotice(db *gorm.DB, n *models.IGAGovNotification, _ *u
 	}); err != nil {
 		return nil, err
 	}
-	link := govConsoleLink("/iga/policy/approvals")
+	link := govConsoleLink("/iga/policy")
 	title := fmt.Sprintf("Approval requested: %s (v%d)", pol.Name, v.VersionNo)
 	text := title + "\n"
 	if link != "" {

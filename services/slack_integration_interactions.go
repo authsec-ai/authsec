@@ -701,15 +701,9 @@ func (s *SlackIntegrationService) answerOutcome(ctx context.Context, ic *interac
 	s.respondURL(ctx, ic, slackapp.Outcome(title, line))
 }
 
-// slackNoticeLink is the console page a notice is about.
-func slackNoticeLink(n models.IGAGovNotification) string {
-	switch n.SubjectKind {
-	case GovNoticeApprovalRequest:
-		return govConsoleLink("/iga/policy/approvals")
-	case GovNoticeOwnerReview:
-		return govConsoleLink("/iga/policy/reviews/" + n.SubjectID.String())
-	case GovNoticeDeployment, GovNoticeCanaryGate:
-		return govConsoleLink("/iga/policy/deployments")
-	}
+// slackNoticeLink is the console page a notice is about: the Policy area
+// (the approvals, owner reviews and deployments pages were removed from the
+// console with the R1a pages; their paths would open as a policy id).
+func slackNoticeLink(models.IGAGovNotification) string {
 	return govConsoleLink("/iga/policy")
 }
