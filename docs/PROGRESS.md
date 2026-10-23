@@ -16,10 +16,12 @@ On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure acc
 - Tests: `TestAccessPolicyAzureOverlappingBlocks`, `TestAccessPolicyAzureBlockAndAllow`, `TestAccessPolicyAzureNonStorageData` (all three fail on the old code); the Azure test setup is shared (`azLab`).
 - AS-122: a restore Azure can never accept (principal, role or resource gone) is skipped and recorded, and the row ends, so the policy can be deleted; transient errors keep retrying. AS-123: a block that fails to deploy after removing assignments restores them first, then ends `failed`. `TestAccessPolicyAzureRestoreFailures`, `TestAccessPolicyAzureFailedDeployRestores` (both fail on the old code).
 - AS-124 (both repos): `/iga/policy/setup[/section]` forwards to a connection's tab with the query kept, so Slack messages already sent work; Notifications appear on Azure connections; readiness remedies name the identity page or the connection's IaC tab.
+- AS-125: the schema guard counts 137/144's tables, and its key checks (hidden behind the count) list 144's connector/identity ids and both tables' `created_by` with reasons; `tests/igagovschema` passes.
+- Azure gap notices on Discovery: not a bug. Akash removed the strip on purpose (1d1d9d9, abaa356); gaps stay on the connection's Overview and Coverage tabs. Only the stale comment was fixed (UI `da15334`).
 - The full governance suite (`IGA_TEST_DSN` only; with `TEST_DATABASE_URL` also set, one test resets the database under the others) and all unit tests pass.
 
 ### Next
-- Step 0, remaining: allow re-apply (waiting on a decision: it contradicts the 2026-10-14 re-apply rule and AWS), Azure gap notices on Discovery (UI), schema guard count, `ConnectCustom` concurrency, the v2 template gate.
+- Step 0, remaining: allow re-apply (waiting on a decision: it contradicts the 2026-10-14 re-apply rule and AWS), `ConnectCustom` concurrency, the v2 template gate.
 
 ---
 
