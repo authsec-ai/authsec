@@ -135,7 +135,9 @@ type RoleAssignment struct {
 		PrincipalID      string `json:"principalId"`
 		PrincipalType    string `json:"principalType"`
 		// Condition is an ABAC condition expression; empty when unconditional.
-		Condition string `json:"condition"`
+		Condition        string `json:"condition"`
+		ConditionVersion string `json:"conditionVersion,omitempty"`
+		Description      string `json:"description,omitempty"`
 	} `json:"properties"`
 }
 
@@ -147,6 +149,8 @@ func roleAssignmentFrom(a *armauthorization.RoleAssignment) RoleAssignment {
 		out.Properties.RoleDefinitionID = str(p.RoleDefinitionID)
 		out.Properties.PrincipalID = str(p.PrincipalID)
 		out.Properties.Condition = str(p.Condition)
+		out.Properties.ConditionVersion = str(p.ConditionVersion)
+		out.Properties.Description = str(p.Description)
 		if p.PrincipalType != nil {
 			out.Properties.PrincipalType = string(*p.PrincipalType)
 		}

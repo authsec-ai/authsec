@@ -41,10 +41,12 @@ type RoleAssignmentSpec struct {
 	ConditionVersion string `json:"condition_version,omitempty"`
 }
 
-// SpecOf is the spec that recreates a listed assignment.
+// SpecOf is the spec that recreates a listed assignment, condition (and its
+// version) and description included.
 func SpecOf(a RoleAssignment) RoleAssignmentSpec {
 	return RoleAssignmentSpec{Scope: a.Properties.Scope, Name: a.Name, RoleDefinitionID: a.Properties.RoleDefinitionID,
-		PrincipalID: a.Properties.PrincipalID, PrincipalType: a.Properties.PrincipalType, Condition: a.Properties.Condition}
+		PrincipalID: a.Properties.PrincipalID, PrincipalType: a.Properties.PrincipalType, Condition: a.Properties.Condition,
+		ConditionVersion: a.Properties.ConditionVersion, Description: a.Properties.Description}
 }
 
 // PutRoleAssignment creates (or leaves in place) the assignment named spec.Name
