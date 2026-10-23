@@ -109,8 +109,11 @@ type AgentFilter struct {
 	// DiscoverySourceID scopes to one connector — in practice, "agents in this
 	// cluster", which is the question self-registration exists to make answerable.
 	DiscoverySourceID *uuid.UUID
-	Limit             int
-	Offset            int
+	// TenantID scopes to one Entra tenant: an Azure agent comes from a tenant
+	// connector and has no discovery source, so its metadata names the tenant.
+	TenantID string
+	Limit    int
+	Offset   int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -635,6 +638,9 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	}
 	if f.DiscoverySourceID != nil {
 		q = q.Where("discovery_source_id = ?", *f.DiscoverySourceID)
+	}
+	if f.TenantID != "" {
+		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
 	}
 
 	var total int64

@@ -885,8 +885,11 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		// destroyed, which need no claim decision.
 		LiveOnly:          c.Query("live") == "true",
 		DiscoverySourceID: sourceID,
-		Limit:             limit,
-		Offset:            offset,
+		// ?tenant_id= narrows Azure agents to one Entra tenant, on the server so
+		// paging and totals count only that tenant.
+		TenantID: strings.TrimSpace(c.Query("tenant_id")),
+		Limit:    limit,
+		Offset:   offset,
 	})
 	if err != nil {
 		discoveryError(c, err)
