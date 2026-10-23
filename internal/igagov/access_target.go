@@ -80,6 +80,10 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseS3BucketARN(arn)
 			return t, ok
 		}},
+		{Type: AccessTypeDynamoDBTable, Service: "dynamodb", Noun: "table", Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseDynamoDBTableARN(arn)
+			return t, ok
+		}},
 	}
 }
 
