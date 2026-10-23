@@ -4,6 +4,19 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 — IGA enforcement, step 1: DynamoDB tables (branch `feat/iga-enforcement`, both repos)
+
+### Done
+- Backend: S3 documents pinned byte for byte (`71a413a`); a resource type is now an `AWSAccessTarget` registered in `igagov.AccessKinds()`, with one statement builder for every type (`ef6e8b6`); the service plans, previews and builds views through the target and the view gains `resource_type` and `region` (`fa9e531`); the DynamoDB table target (`31dd58b`); DynamoDB in the service (`4eaa3d3`) and its integration tests (`fd6fc4d`).
+- DynamoDB semantics (checked against the AWS Service Authorization Reference, copies in the session scratchpad): a block denies the item actions on the table and everything under it, plus for read the stream, export, restores, AWS Backup jobs, Kinesis streaming, cross-account replicas, every PartiQL write and writes that ask for the item back; for delete DeleteTable and TTL; creating a replica of the table in any region (checked on the replica's ARN). An allow is item access on the table and its indexes only (DescribeTable with read; without read no PartiQL and ReturnValues NONE). Not closable in IAM, so a preview note: a write whose condition fails returns the item.
+- Owner decisions applied: a block may name a table in another account, an allow may not (`resource_other_account`); a row no current scan supports is `resource_not_current`; patterns and global-table ARNs are refused.
+- UI: resource-type registry (`18d634b`), API types (`50cd45a`), S3 pins (`c972595`), bucket/table switch and table picker (`e923bfe`), graph marks and card (`e5f606c`).
+
+### To check against a live AWS account
+- `aws iam simulate-principal-policy` for the generated documents (action names, the replica-region ARN). Condition keys DynamoDB actually sets (PartiQL `RETURNING`, `ReturnValuesOnConditionCheckFailure`) need real calls on a test table.
+
+---
+
 ## 2026-10-23 — IGA enforcement, step 0: Azure access fixes (branch `feat/iga-enforcement`)
 
 On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure access bugs first, then extend enforcement one service at a time (DynamoDB, Key Vault/AI Search, Secrets Manager, ...), then Kubernetes. Committed locally; nothing pushed.
