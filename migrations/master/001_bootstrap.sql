@@ -12835,6 +12835,16 @@ BEGIN
 END $$;
 
 -- ============================================================================
+-- 138: deleting an ended access policy hides it (iga_gov_policy.deleted_at).
+-- Same block as migrations/master/138_access_policy_delete.sql.
+-- ============================================================================
+
+ALTER TABLE public.iga_gov_policy ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+
+CREATE INDEX IF NOT EXISTS idx_iga_gov_policy_not_deleted
+  ON public.iga_gov_policy (workspace_id, family) WHERE deleted_at IS NULL;
+
+-- ============================================================================
 -- 139: per-connector schedule for automatic AWS rescans (cloud_scan_schedule)
 -- Same block as migrations/master/139_cloud_scan_schedule.sql.
 -- ============================================================================
@@ -12976,3 +12986,11 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.iga_gov_azure_access');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 145: cloud_scan_schedule's workspace index (idx_<table>_tenancy_ws, 048).
+-- Same block as migrations/master/145_cloud_scan_schedule_tenancy_index.sql.
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_cloud_scan_schedule_tenancy_ws
+    ON public.cloud_scan_schedule (workspace_id);
