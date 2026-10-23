@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -202,6 +203,42 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 	l.db.Model(&models.IGAGovPolicy{}).Where("workspace_id = ? AND family = 'time_bound'", l.ws).Count(&n)
 	if n != 0 {
 		t.Fatalf("preview stored %d policies", n)
+	}
+	// The warnings, exactly and in order: an allow, a block of a folder
+	// (and of one too long to guard every fragment), a block of writes.
+	const (
+		allowNeeds  = "If the bucket is in another AWS account, its bucket policy must allow the role as well."
+		listRoot    = "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."
+		listPartial = "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."
+		otherPaths  = "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."
+	)
+	allowIn := intent
+	allowIn.Effect, allowIn.Resource.Prefix = "allow", ""
+	longIn := intent
+	longIn.Resource.Prefix = strings.Repeat("abcdefghij", 5) + "_reports_/"
+	writeIn := intent
+	writeIn.Access = []string{"write"}
+	for _, c := range []struct {
+		name string
+		in   igagov.AccessIntent
+		pv   *services.AccessPreview
+		want []services.AccessIssue
+	}{
+		{"block read folder", intent, pv, []services.AccessIssue{{Code: "list_root_blocked", Message: listRoot}, {Code: "other_paths", Message: otherPaths}}},
+		{"allow read bucket", allowIn, nil, []services.AccessIssue{{Code: "allow_needs_bucket_policy", Message: allowNeeds}, {Code: "other_paths", Message: otherPaths}}},
+		{"block read long folder", longIn, nil, []services.AccessIssue{{Code: "list_root_blocked", Message: listRoot},
+			{Code: "list_partial_prefix", Message: listPartial}, {Code: "other_paths", Message: otherPaths}}},
+		{"block write folder", writeIn, nil, []services.AccessIssue{{Code: "other_paths", Message: otherPaths}}},
+	} {
+		got := c.pv
+		if got == nil {
+			if got, err = l.svc.Preview(ctx, l.ws, c.in); err != nil || len(got.Blockers) != 0 {
+				t.Fatalf("%s preview: %+v %v", c.name, got, err)
+			}
+		}
+		if !reflect.DeepEqual(got.Warnings, c.want) {
+			t.Errorf("%s warnings:\n got %+v\nwant %+v", c.name, got.Warnings, c.want)
+		}
 	}
 
 	// Create and apply: no approver; the job attaches and verifies.
