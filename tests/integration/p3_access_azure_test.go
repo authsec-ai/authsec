@@ -739,3 +739,25 @@ func TestAccessPolicyAzureAllowBroaderRoleWarned(t *testing.T) {
 	}
 	t.Fatalf("no warning that the role also reads and deletes: %+v", pv.Warnings)
 }
+
+// The 144 check also requires the job queue to admit azure_access: a job-kind
+// CHECK re-created without it (AS-115's kind of regression) refused every
+// Azure deployment's job while Azure policies read available.
+func TestVerifyAzureAccessSchemaNeedsJobKind(t *testing.T) {
+	l := newAPLab(t)
+	if err := services.VerifyAzureAccessSchema(l.db); err != nil {
+		t.Skip(err.Error())
+	}
+	tx := l.db.Begin()
+	defer tx.Rollback()
+	if err := tx.Exec(`ALTER TABLE iga_gov_job DROP CONSTRAINT iga_gov_job_kind_check`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(`ALTER TABLE iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check CHECK (kind IS NOT NULL)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := services.VerifyAzureAccessSchema(tx)
+	if err == nil || !strings.Contains(err.Error(), "azure_access") {
+		t.Fatalf("a queue that does not admit azure_access verified: %v", err)
+	}
+}

@@ -691,6 +691,19 @@ func VerifyAzureAccessSchema(db *gorm.DB) error {
 	if !ok {
 		return fmt.Errorf("Azure access policies need migration 144; missing: iga_gov_azure_access")
 	}
+	// The job that does the work must be admitted by the queue: a database
+	// whose job-kind CHECK was re-created without it (AS-115) would refuse
+	// every Azure deployment's job.
+	var n int64
+	// TENANT-EXEMPT: Postgres catalog (pg_constraint), a schema precondition check.
+	if err := db.Raw(`SELECT count(*) FROM pg_constraint
+	                   WHERE conrelid = to_regclass('public.iga_gov_job') AND conname = 'iga_gov_job_kind_check'
+	                     AND convalidated AND pg_get_constraintdef(oid) LIKE ?`, "%"+repositories.GovJobAzureAccess+"%").Scan(&n).Error; err != nil {
+		return fmt.Errorf("Azure access-policy schema verification could not run: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("Azure access policies need migration 144; missing: constraint iga_gov_job.iga_gov_job_kind_check admitting %s", repositories.GovJobAzureAccess)
+	}
 	return nil
 }
 
