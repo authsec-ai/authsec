@@ -6720,6 +6720,16 @@ direction:
 | `target` (`mode = resource`) | statement → resource | resource → statements | statement lifecycle |
 | exclusion (`mode = not_resource`) | **not an edge** | **not an edge** | — |
 
+**Providers.** This section is written for AWS. The same three routes serve
+Kubernetes (`P2-DECISIONS.md` D-107 to D-113) and Azure (D-114), one provider
+per traversal, never a path across providers except D-108's resolved crossing.
+A Kubernetes rule names resource types, so it has no `target`. An Azure
+statement is the **role assignment** (one per `iga_access_edges` row, never the
+shared role definition, which would draw false paths), and its `target` is the
+resource or a leaf scope node (subscription, resource group, directory). The
+lists of §5.3 stay AWS-only (D-75); the unified inventory
+(`/api/iga/v1/inventory/*`) lists every provider.
+
 A **path** is a sequence of these edges. The forward path of the product's
 teaching case is workload → `executes_as` → role → `grant` → statement →
 `target` → resource; with groups, user → `member_of` → group → `grant` → …;
