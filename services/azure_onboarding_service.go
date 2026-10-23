@@ -739,6 +739,49 @@ func selectSubscriptions(visible []azure.Subscription, wanted map[string]bool) (
 
 /* ------------------------------ connect-custom ------------------------------- */
 
+// customSubscriptionARM is what customSubscriptionReads needs of *azure.Client.
+type customSubscriptionARM interface {
+	GetSubscription(ctx context.Context, armToken, subscriptionID string) (*azure.Subscription, error)
+	ListRoleAssignmentsForPrincipal(ctx context.Context, armToken, subscriptionID, principalID string) ([]azure.RoleAssignment, error)
+}
+
+// customSubscriptionReads proves each subscription readable with the
+// customer's app and names those where the app holds more than Reader.
+// Nothing is assigned, so a disabled subscription that is still readable is
+// read like any other. Two ARM reads per subscription, run in parallel: one
+// at a time, a tenant with a few dozen subscriptions ran past the connect
+// budget. The results and the warning keep the subscriptions' order.
+func customSubscriptionReads(ctx context.Context, api customSubscriptionARM, armToken, spID string, subs []azure.Subscription) ([]AzureSubscriptionResult, []string) {
+	results := make([]AzureSubscriptionResult, len(subs))
+	privilegedOf := make([]string, len(subs))
+	forEachLimited(len(subs), azureAssignConcurrency, func(i int) {
+		sub := subs[i]
+		results[i] = AzureSubscriptionResult{SubscriptionID: sub.SubscriptionID, DisplayName: sub.DisplayName, State: sub.State}
+		_, readErr := api.GetSubscription(ctx, armToken, sub.SubscriptionID)
+		checkedAt := time.Now()
+		if readErr != nil {
+			results[i].Reader = models.AzureReaderAssignment{Status: models.AzureReaderDenied, CheckedAt: &checkedAt, Error: readErr.Error()}
+			return
+		}
+		results[i].Reader = models.AzureReaderAssignment{
+			Status: models.AzureReaderExisting, CheckedAt: &checkedAt, Verified: true, VerifiedAt: &checkedAt,
+		}
+		// Reader is all AuthSec needs; say so when the app holds more.
+		if as, err := api.ListRoleAssignmentsForPrincipal(ctx, armToken, sub.SubscriptionID, spID); err == nil {
+			if roles := privilegedAzureRoles(as); len(roles) > 0 {
+				privilegedOf[i] = firstNonEmpty(sub.DisplayName, sub.SubscriptionID) + " (" + strings.Join(roles, ", ") + ")"
+			}
+		}
+	})
+	var privileged []string
+	for _, p := range privilegedOf {
+		if p != "" {
+			privileged = append(privileged, p)
+		}
+	}
+	return results, privileged
+}
+
 // azureCustomAppVaultPath is where a workspace's customer-provided Azure app
 // credentials live, keyed by tenant id.
 func azureCustomAppVaultPath(workspaceID uuid.UUID, tenantID string) string {
@@ -824,28 +867,8 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 			"on each subscription AuthSec should read, then verify the connection. Microsoft Entra ID is read meanwhile")
 	}
 
-	// 5. Prove each one is readable. Nothing is assigned here, so a disabled
-	//    subscription that is still readable is read like any other.
-	results := make([]AzureSubscriptionResult, len(subs))
-	var privileged []string
-	for i, sub := range subs {
-		results[i] = AzureSubscriptionResult{SubscriptionID: sub.SubscriptionID, DisplayName: sub.DisplayName, State: sub.State}
-		_, readErr := s.api.GetSubscription(ctx, armToken, sub.SubscriptionID)
-		checkedAt := time.Now()
-		if readErr != nil {
-			results[i].Reader = models.AzureReaderAssignment{Status: models.AzureReaderDenied, CheckedAt: &checkedAt, Error: readErr.Error()}
-			continue
-		}
-		results[i].Reader = models.AzureReaderAssignment{
-			Status: models.AzureReaderExisting, CheckedAt: &checkedAt, Verified: true, VerifiedAt: &checkedAt,
-		}
-		// Reader is all AuthSec needs; say so when the app holds more.
-		if as, err := s.api.ListRoleAssignmentsForPrincipal(ctx, armToken, sub.SubscriptionID, sp.ID); err == nil {
-			if roles := privilegedAzureRoles(as); len(roles) > 0 {
-				privileged = append(privileged, firstNonEmpty(sub.DisplayName, sub.SubscriptionID)+" ("+strings.Join(roles, ", ")+")")
-			}
-		}
-	}
+	// 5. Prove each one is readable (customSubscriptionReads).
+	results, privileged := customSubscriptionReads(ctx, s.api, armToken, sp.ID, subs)
 	if len(privileged) > 0 {
 		warnings = append(warnings, "your app holds Azure roles that can change resources or grant access, beyond the Reader "+
 			"AuthSec needs: "+strings.Join(privileged, "; ")+". Consider giving it Reader only")
