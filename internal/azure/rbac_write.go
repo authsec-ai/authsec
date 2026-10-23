@@ -25,6 +25,12 @@ const (
 	RoleSearchIndexDataContributor = "8ebe5a00-799e-43f5-93ac-243d3dce84a7"
 	RoleKeyVaultSecretsUser        = "4633458b-17de-408a-b874-0445c86b69e6"
 	RoleKeyVaultSecretsOfficer     = "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
+	RoleServiceBusDataReceiver     = "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"
+	RoleServiceBusDataSender       = "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
+	RoleServiceBusDataOwner        = "090c5cfd-751d-490a-894a-3ce6f1109419"
+	RoleEventHubsDataReceiver      = "a638d3c7-ab3a-418d-83e6-5f17a39d4fde"
+	RoleEventHubsDataSender        = "2b629674-e913-4c01-ae53-ef4638d8f975"
+	RoleEventHubsDataOwner         = "f526a384-b230-433a-b45c-95f59c4a2dec"
 )
 
 // RoleDefinitionResourceID is a built-in role's id under a subscription.

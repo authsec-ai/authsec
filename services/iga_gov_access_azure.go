@@ -248,9 +248,11 @@ type azureDataPlane struct {
 	// keys are management actions that hand out keys with the same data
 	// access, as storage's listKeys does.
 	keys []string
-	// The built-in roles an allow assigns (GUID, name); "" keeps Reader and
-	// Contributor, which reach no data.
-	readRole, readRoleName, writeRole, writeRoleName string
+	// The built-in roles an allow assigns (GUID, name). writeRole includes
+	// reading where the service has such a role (Search, Key Vault); where the
+	// sending role cannot read (Service Bus, Event Hubs), bothRole is the one
+	// for read and write together.
+	readRole, readRoleName, writeRole, writeRoleName, bothRole, bothRoleName string
 	// note is said in the preview for this type.
 	note string
 }
@@ -276,14 +278,20 @@ var azureDataPlanes = map[string]azureDataPlane{
 		note: "Covers secrets in a vault that uses Azure RBAC. A vault that uses access policies grants through them, which AuthSec does not change.",
 	},
 	"microsoft.servicebus/namespaces": {
-		read:  []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"},
-		write: []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
-		keys:  []string{"Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"},
+		read:     []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"},
+		write:    []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
+		keys:     []string{"Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"},
+		readRole: azure.RoleServiceBusDataReceiver, readRoleName: "Azure Service Bus Data Receiver",
+		writeRole: azure.RoleServiceBusDataSender, writeRoleName: "Azure Service Bus Data Sender",
+		bothRole: azure.RoleServiceBusDataOwner, bothRoleName: "Azure Service Bus Data Owner",
 	},
 	"microsoft.eventhub/namespaces": {
-		read:  []string{"Microsoft.EventHub/namespaces/messages/receive/action"},
-		write: []string{"Microsoft.EventHub/namespaces/messages/send/action"},
-		keys:  []string{"Microsoft.EventHub/namespaces/authorizationRules/listKeys/action"},
+		read:     []string{"Microsoft.EventHub/namespaces/messages/receive/action"},
+		write:    []string{"Microsoft.EventHub/namespaces/messages/send/action"},
+		keys:     []string{"Microsoft.EventHub/namespaces/authorizationRules/listKeys/action"},
+		readRole: azure.RoleEventHubsDataReceiver, readRoleName: "Azure Event Hubs Data Receiver",
+		writeRole: azure.RoleEventHubsDataSender, writeRoleName: "Azure Event Hubs Data Sender",
+		bothRole: azure.RoleEventHubsDataOwner, bothRoleName: "Azure Event Hubs Data Owner",
 	},
 }
 
@@ -306,7 +314,14 @@ func azureAllowRole(t *azureTarget, access []string) (guid, name string) {
 		writes = writes || a == igagov.AccessWrite || a == igagov.AccessDelete
 	}
 	if dp, ok := azureDataPlaneOf(t); ok && dp.readRole != "" {
-		if writes {
+		reads := false
+		for _, a := range access {
+			reads = reads || a == igagov.AccessRead
+		}
+		switch {
+		case writes && reads && dp.bothRole != "":
+			return dp.bothRole, dp.bothRoleName
+		case writes:
 			return dp.writeRole, dp.writeRoleName
 		}
 		return dp.readRole, dp.readRoleName

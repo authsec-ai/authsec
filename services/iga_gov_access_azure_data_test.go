@@ -111,10 +111,25 @@ func TestAzureAllowAssignsDataRoles(t *testing.T) {
 	if g, _ := azureAllowRole(kv, []string{igagov.AccessRead}); g != azure.RoleKeyVaultSecretsUser {
 		t.Fatalf("key vault allow read = %s", g)
 	}
-	// Service Bus has no allow role in the table: Reader, as before.
+	// Service Bus and Event Hubs: Reader would reach no message, so an allow
+	// assigns the data role -- Receiver, Sender, or Owner for both.
 	sb := azureTestTarget("microsoft.servicebus/namespaces")
-	if g, _ := azureAllowRole(sb, []string{igagov.AccessRead}); g != azure.RoleReader {
+	if g, _ := azureAllowRole(sb, []string{igagov.AccessRead}); g != azure.RoleServiceBusDataReceiver {
 		t.Fatalf("service bus allow read = %s", g)
+	}
+	if g, _ := azureAllowRole(sb, []string{igagov.AccessWrite}); g != azure.RoleServiceBusDataSender {
+		t.Fatalf("service bus allow write = %s", g)
+	}
+	if g, _ := azureAllowRole(sb, []string{igagov.AccessRead, igagov.AccessWrite}); g != azure.RoleServiceBusDataOwner {
+		t.Fatalf("service bus allow read+write = %s", g)
+	}
+	eh := azureTestTarget("microsoft.eventhub/namespaces/eventhubs")
+	if g, _ := azureAllowRole(eh, []string{igagov.AccessRead}); g != azure.RoleEventHubsDataReceiver {
+		t.Fatalf("event hubs allow read = %s", g)
+	}
+	// Search and Key Vault keep their contributor role for read+write.
+	if g, _ := azureAllowRole(kv, []string{igagov.AccessRead, igagov.AccessWrite}); g != azure.RoleKeyVaultSecretsOfficer {
+		t.Fatalf("key vault allow read+write = %s", g)
 	}
 }
 
