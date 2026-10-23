@@ -233,18 +233,22 @@ type (
 		Name string    `json:"name"`
 		Kind string    `json:"kind"`
 	}
-	// AccessResourceView: provider is aws or azure. On Azure, arn is the ARM
+	// AccessResourceView: provider is aws or azure; resource_type is the
+	// access type (s3_bucket, dynamodb_table, ... from igagov.AccessTypes, or
+	// azure_resource), kind the Discovery row's kind. On Azure, arn is the ARM
 	// resource id and account_id the subscription id; bucket and prefix are
-	// empty.
+	// S3's only. region is set when the ARN names one.
 	AccessResourceView struct {
-		ResourceID string `json:"resource_id"`
-		ARN        string `json:"arn"`
-		Bucket     string `json:"bucket"`
-		Prefix     string `json:"prefix"`
-		AccountID  string `json:"account_id"`
-		Provider   string `json:"provider"`
-		Name       string `json:"name"`
-		Kind       string `json:"kind"`
+		ResourceID   string `json:"resource_id"`
+		ARN          string `json:"arn"`
+		Bucket       string `json:"bucket"`
+		Prefix       string `json:"prefix"`
+		AccountID    string `json:"account_id"`
+		Provider     string `json:"provider"`
+		Name         string `json:"name"`
+		Kind         string `json:"kind"`
+		ResourceType string `json:"resource_type"`
+		Region       string `json:"region,omitempty"`
 	}
 	// AccessRoleView: kind is the Discovery identity kind (iam_role,
 	// entra_service_principal, entra_managed_identity, ...). On Azure, arn is
@@ -337,7 +341,7 @@ type (
 type accessPlan struct {
 	intent   igagov.AccessIntent
 	hash     string
-	target   igagov.S3Target
+	target   igagov.AWSAccessTarget
 	resource AccessResourceView
 	roles    []*r2Role
 	doc      []byte
@@ -358,6 +362,25 @@ func (p *accessPlan) nRoles() int {
 		return len(p.azure.principals)
 	}
 	return len(p.roles)
+}
+
+// accessTypeAzure is resource_type for an Azure resource.
+const accessTypeAzure = "azure_resource"
+
+// accessNotSupported refuses a Discovery row no access type reads.
+func accessNotSupported(row models.IGAResource) error {
+	return govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets are supported.",
+		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
+}
+
+// accessResourceOf is the view of an AWS target (bucket and prefix are S3's).
+func accessResourceOf(id string, t igagov.AWSAccessTarget) AccessResourceView {
+	v := AccessResourceView{ResourceID: id, ARN: t.ARN(), Name: t.Name(), AccountID: t.ARNAccount(), Region: t.ARNRegion(),
+		ResourceType: t.Type(), Provider: models.ProviderAWS}
+	if s, ok := t.(igagov.S3Target); ok {
+		v.Bucket, v.Prefix = s.Bucket, s.Prefix
+	}
+	return v
 }
 
 func accessFieldErr(err error) error {
@@ -399,21 +422,25 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			map[string]any{"field": "resource.resource_id"})
 	}
 	if rows[0].Provider == models.ProviderAzure {
-		p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: rows[0].DisplayName}
+		p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: rows[0].DisplayName, ResourceType: accessTypeAzure}
 		if err := s.planAzure(ctx, ws, p, rows[0]); err != nil {
 			return nil, err
 		}
 		p.resource.ARN, p.resource.AccountID = p.azure.target.Scope, p.azure.target.SubscriptionID
 		return p, nil
 	}
-	t, ok := igagov.ParseS3BucketARN(rows[0].DisplayName)
-	if !ok || rows[0].Provider != models.ProviderAWS {
-		return nil, govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets are supported.",
-			map[string]any{"field": "resource.resource_id", "resource_kind": rows[0].ResourceKind})
+	if rows[0].Provider != models.ProviderAWS {
+		return nil, accessNotSupported(rows[0])
 	}
-	t.Prefix = norm.Resource.Prefix
+	t, err := igagov.ParseAWSAccessTarget(rows[0].DisplayName, norm.Resource.Prefix)
+	if errors.Is(err, igagov.ErrAccessNotSupported) {
+		return nil, accessNotSupported(rows[0])
+	}
+	if err != nil {
+		return nil, accessFieldErr(err)
+	}
 	p.target = t
-	p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: t.BucketARN(), Bucket: t.Bucket, Prefix: t.Prefix}
+	p.resource = accessResourceOf(norm.Resource.ResourceID, t)
 
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
@@ -433,7 +460,7 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 		}
 		if !seen[role.Connector] {
 			return nil, govUnprocessable(GovCodeRoleNotInAccount,
-				"AuthSec has not seen this bucket in the role's AWS account "+role.Identity.AccountID+".",
+				"AuthSec has not seen this "+t.Noun()+" in the role's AWS account "+role.Identity.AccountID+".",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID})
 		}
 		p.roles = append(p.roles, role)
@@ -459,26 +486,10 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	if p.usedBy, err = s.usedBy(ctx, ws, p.roleIDs()); err != nil {
 		return nil, err
 	}
-	if norm.Effect == igagov.AccessEffectAllow {
-		p.warnings = append(p.warnings, AccessIssue{Code: "allow_needs_bucket_policy",
-			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
+	for _, n := range t.Notes(norm.Effect, norm.Access) {
+		p.warnings = append(p.warnings, AccessIssue{Code: n.Code, Message: n.Message})
 	}
-	if norm.Effect == igagov.AccessEffectBlock && norm.Resource.Prefix != "" {
-		for _, a := range norm.Access {
-			if a != igagov.AccessRead && a != igagov.AccessAll {
-				continue
-			}
-			p.warnings = append(p.warnings, AccessIssue{Code: "list_root_blocked",
-				Message: "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."})
-			if igagov.AccessListGuardPartial(norm.Effect, norm.Resource.Prefix) {
-				p.warnings = append(p.warnings, AccessIssue{Code: "list_partial_prefix",
-					Message: "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."})
-			}
-			break
-		}
-	}
-	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths",
-		Message: "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."})
+	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths", Message: t.OtherPaths()})
 	return p, nil
 }
 
@@ -1449,14 +1460,14 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 			v.VersionNo = cur.VersionNo
 		}
 		v.Status, v.StatusReason, v.EndReason, v.EndedAt = accessStatus(b, now)
-		t, _ := igagov.ParseS3BucketARN(resARN[in.Resource.ResourceID])
-		t.Prefix = in.Resource.Prefix
-		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix, Provider: models.ProviderAWS}
+		t, terr := igagov.ParseAWSAccessTarget(resARN[in.Resource.ResourceID], in.Resource.Prefix)
+		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Prefix: in.Resource.Prefix, Provider: models.ProviderAWS}
 		rr := resRow[in.Resource.ResourceID]
 		v.Resource.Kind = rr.ResourceKind
 		switch {
 		case rr.Provider == models.ProviderAzure || len(b.azureRows) > 0:
-			v.Resource.Provider, v.Resource.Name = models.ProviderAzure, rr.DisplayName
+			v.Resource.Provider, v.Resource.Name, v.Resource.ResourceType = models.ProviderAzure, rr.DisplayName, accessTypeAzure
+			v.Resource.Prefix = ""
 			v.Resource.ARN = azureARMIDOfKey(rr.SourceKey)
 			for _, a := range b.azureRows {
 				if v.Resource.ARN == "" {
@@ -1464,8 +1475,10 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				}
 				v.Resource.AccountID = a.SubscriptionID
 			}
-		case t.Bucket != "":
-			v.Resource.ARN, v.Resource.Name = t.BucketARN(), t.Bucket
+		case terr == nil:
+			kind := v.Resource.Kind
+			v.Resource = accessResourceOf(in.Resource.ResourceID, t)
+			v.Resource.Kind = kind
 		default:
 			v.Resource.ARN, v.Resource.Name = resARN[in.Resource.ResourceID], resARN[in.Resource.ResourceID]
 		}

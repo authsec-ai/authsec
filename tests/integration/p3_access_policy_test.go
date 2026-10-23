@@ -261,6 +261,9 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 	if v, err = l.svc.Get(ctx, l.ws, v.ID); err != nil || v.Status != services.AccessStatusActive || v.Deployments[0].VerifiedAt == nil {
 		t.Fatalf("after apply: %+v %v", v, err)
 	}
+	if r := v.Resource; r.ResourceType != "s3_bucket" || r.Bucket == "" || r.Name != r.Bucket || r.Region != "" || r.Provider != "aws" {
+		t.Fatalf("S3 resource view: %+v", r)
+	}
 
 	// Edit: version 2 (read + write, both roles) is attached before version
 	// 1 is removed, so access never comes back in between.

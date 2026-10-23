@@ -268,7 +268,7 @@ func TestAccessPolicyAzure(t *testing.T) {
 	}
 	// The views say which cloud: resource provider/name/kind, role kind,
 	// the deployment's ARM scope.
-	if v.Resource.Provider != "azure" || v.Resource.Name != "stdemo" || v.Resource.Kind != "storage_account" ||
+	if v.Resource.Provider != "azure" || v.Resource.Name != "stdemo" || v.Resource.Kind != "storage_account" || v.Resource.ResourceType != "azure_resource" ||
 		v.Resource.ARN != scope || v.Resource.AccountID != sub || v.Resource.Bucket != "" {
 		t.Fatalf("resource view: %+v", v.Resource)
 	}
