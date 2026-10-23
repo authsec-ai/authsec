@@ -493,17 +493,16 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		"/policies/:id/rollout/pause", "/policies/:id/rollout/resume"} {
 		exempt["POST "+prefix+r] = "audited in p3_rollout_test.go (T3.15)"
 	}
-	// R2, access-policy and R3 routes are always mounted now that their
-	// switches are gone (2026-10-21). This R1a walker never covered them --
-	// they were not mounted when it ran -- and still does not: their events
-	// are exercised by p3_access_policy_test.go and p3_r2_r3_isolation_test.go,
-	// which do NOT assert audit_events rows. Listed so the gap stays visible.
+	// R2 and R3 routes are always mounted now that their switches are gone
+	// (2026-10-21). This R1a walker never covered them -- they were not
+	// mounted when it ran -- and still does not: their events are exercised
+	// by p3_r2_r3_isolation_test.go, which does NOT assert audit_events rows
+	// (each handler returns an audited record on success, govMutation).
+	// Listed so the gap stays visible.
 	for _, r := range []string{
 		"POST /temporary-grants", "POST /temporary-grants/:id/approve", "POST /temporary-grants/:id/reject",
 		"POST /temporary-grants/:id/revoke", "POST /session-revocations", "POST /session-revocations/:id/approve",
 		"POST /session-revocations/:id/reject", "POST /session-revocations/:id/revoke",
-		"POST /access-policies", "POST /access-policies/:id/versions", "POST /access-policies/:id/pause",
-		"POST /access-policies/:id/resume", "POST /access-policies/:id/end", "DELETE /access-policies/:id",
 		"POST /runtime/policies", "POST /runtime/policies/:id/versions", "POST /runtime/policies/:id/versions/:no/approve",
 		"POST /runtime/policies/:id/versions/:no/reject", "POST /runtime/policies/:id/versions/:no/withdraw",
 		"POST /runtime/policies/:id/agentcore/push", "PUT /runtime/settings", "POST /runtime/routing-proofs",
@@ -511,7 +510,15 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		"POST /runtime/broker-roles", "POST /runtime/broker-roles/:id/disable",
 	} {
 		method, path, _ := strings.Cut(r, " ")
-		exempt[method+" "+prefix+path] = "R2 / access-policy / R3 route: no audit_events assertion yet (not walked here)"
+		exempt[method+" "+prefix+path] = "R2 / R3 route: no audit_events assertion yet (not walked here)"
+	}
+	// Access-policy routes need a fake AWS account with a template v2
+	// binding: TestAccessPolicyRoutesAudited calls each over HTTP and asserts
+	// its audit_events row.
+	for _, r := range []string{"POST /access-policies", "POST /access-policies/:id/versions", "POST /access-policies/:id/pause",
+		"POST /access-policies/:id/resume", "POST /access-policies/:id/end", "DELETE /access-policies/:id"} {
+		method, path, _ := strings.Cut(r, " ")
+		exempt[method+" "+prefix+path] = "audited in TestAccessPolicyRoutesAudited"
 	}
 
 	role, rid := g.identity("WalkerRole", nil)
