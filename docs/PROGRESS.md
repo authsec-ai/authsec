@@ -4,6 +4,25 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — Staging review findings, round 1 (both repos, `feat/iga-enforcement`)
+
+### Done
+- Plan items 9 and 11 finished: Azure gaps on Discovery as a closeable notice (UI-042); an own-app subscription read that timed out or was throttled is `not_checked`, not "Reader denied" (AS-126).
+- Access policies: failed AWS rows removed (AS-129), `$` in S3 folders (AS-130), End during a running check (AS-131), Azure inherited access after apply is drift (AS-132), Azure removals without R2 (AS-133), restore keeps condition version and description (AS-134), Azure scheduled status (AS-136), allow role warning (AS-139), 144 job-kind check (AS-140), quota warn at 10 / refuse at 20 (AS-141), list truncation (AS-142), Resume after a kept policy (AS-143), S3 tag/ACL/lifecycle/access points (AS-144), cross-workspace Edit/Pause/Resume/Delete tests, audit rows for the six access-policy routes (AS-138, part).
+- Azure onboarding: fail-closed credential lookups and recorded unconfigured app (AS-145), env overlay never in production (AS-146), internal errors hidden and session mismatch 404 (AS-147).
+- Links: every console path the backend writes is a page the console serves (AS-148, TestConsoleLinksNameServedPages).
+- Auto-scan scheduler: change after claim wins (AS-149), time zone without time (AS-150), cross-workspace test, CI runs the scheduler and governance schema suites (AS-151), scheduler_active deployment-wide (AS-152).
+- UI: UI-043 to UI-048.
+- Checkpoint: full governance suite (529 s), all unit tests, ratchet 72.
+
+### Open
+- AS-135 (PIM activations restored as permanent): needs a live tenant with PIM.
+- AS-138: the 21 R2/R3 mutation routes still have no audit_events assertion.
+- UI-049 (shared TableCell clipping): needs a visual pass.
+- AS-155 (deploy.yml rollback and backups): owner decision.
+
+---
+
 ## 2026-10-24 — IGA enforcement, step 1: DynamoDB tables (branch `feat/iga-enforcement`, both repos)
 
 ### Done
