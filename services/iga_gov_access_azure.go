@@ -219,7 +219,92 @@ func azureActions(t *azureTarget, access []string) (actions, dataActions []strin
 			}
 		}
 	}
+	// Other data planes: their data actions and key listings, in addition to
+	// the management actions above (a role granting only the data, such as
+	// Search Index Data Reader, grants no management action at all).
+	if dp, ok := azureDataPlaneOf(t); ok {
+		for _, a := range access {
+			switch a {
+			case igagov.AccessRead:
+				dataActions = append(dataActions, dp.read...)
+			case igagov.AccessWrite:
+				dataActions = append(dataActions, dp.write...)
+			case igagov.AccessDelete:
+				dataActions = append(dataActions, dp.del...)
+			case igagov.AccessAll:
+				dataActions = append(append(append(dataActions, dp.read...), dp.write...), dp.del...)
+			}
+			actions = append(actions, dp.keys...)
+		}
+	}
 	return sortedUniqueStrings(actions), sortedUniqueStrings(dataActions)
+}
+
+// azureDataPlane is a resource type whose data is reached through data
+// actions (and keys) rather than its management actions. Storage accounts are
+// handled above, as they were first.
+type azureDataPlane struct {
+	read, write, del []string // the data actions each access level stands for
+	// keys are management actions that hand out keys with the same data
+	// access, as storage's listKeys does.
+	keys []string
+	// The built-in roles an allow assigns (GUID, name). writeRole includes
+	// reading where the service has such a role (Search, Key Vault); where the
+	// sending role cannot read (Service Bus, Event Hubs), bothRole is the one
+	// for read and write together.
+	readRole, readRoleName, writeRole, writeRoleName, bothRole, bothRoleName string
+	// note is said in the preview for this type.
+	note string
+}
+
+// azureDataPlanes are keyed by ARM type (lowercase); a child type
+// (microsoft.servicebus/namespaces/queues) uses its parent's entry.
+var azureDataPlanes = map[string]azureDataPlane{
+	"microsoft.search/searchservices": {
+		read:     []string{"Microsoft.Search/searchServices/indexes/documents/read"},
+		write:    []string{"Microsoft.Search/searchServices/indexes/documents/write"},
+		del:      []string{"Microsoft.Search/searchServices/indexes/documents/delete"},
+		keys:     []string{"Microsoft.Search/searchServices/listQueryKeys/action", "Microsoft.Search/searchServices/listAdminKeys/action"},
+		readRole: azure.RoleSearchIndexDataReader, readRoleName: "Search Index Data Reader",
+		writeRole: azure.RoleSearchIndexDataContributor, writeRoleName: "Search Index Data Contributor",
+		note: "A search service whose API keys are enabled can still be queried with a key held elsewhere; turning key access off in Azure closes that.",
+	},
+	"microsoft.keyvault/vaults": {
+		read:     []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action"},
+		write:    []string{"Microsoft.KeyVault/vaults/secrets/setSecret/action"},
+		del:      []string{"Microsoft.KeyVault/vaults/secrets/delete"},
+		readRole: azure.RoleKeyVaultSecretsUser, readRoleName: "Key Vault Secrets User",
+		writeRole: azure.RoleKeyVaultSecretsOfficer, writeRoleName: "Key Vault Secrets Officer",
+		note: "Covers secrets in a vault that uses Azure RBAC. A vault that uses access policies grants through them, which AuthSec does not change.",
+	},
+	"microsoft.servicebus/namespaces": {
+		read:     []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"},
+		write:    []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
+		keys:     []string{"Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"},
+		readRole: azure.RoleServiceBusDataReceiver, readRoleName: "Azure Service Bus Data Receiver",
+		writeRole: azure.RoleServiceBusDataSender, writeRoleName: "Azure Service Bus Data Sender",
+		bothRole: azure.RoleServiceBusDataOwner, bothRoleName: "Azure Service Bus Data Owner",
+	},
+	"microsoft.eventhub/namespaces": {
+		read:     []string{"Microsoft.EventHub/namespaces/messages/receive/action"},
+		write:    []string{"Microsoft.EventHub/namespaces/messages/send/action"},
+		keys:     []string{"Microsoft.EventHub/namespaces/authorizationRules/listKeys/action"},
+		readRole: azure.RoleEventHubsDataReceiver, readRoleName: "Azure Event Hubs Data Receiver",
+		writeRole: azure.RoleEventHubsDataSender, writeRoleName: "Azure Event Hubs Data Sender",
+		bothRole: azure.RoleEventHubsDataOwner, bothRoleName: "Azure Event Hubs Data Owner",
+	},
+}
+
+func azureDataPlaneOf(t *azureTarget) (azureDataPlane, bool) {
+	if t.Storage {
+		return azureDataPlane{}, false
+	}
+	for typ, dp := range azureDataPlanes {
+		if t.TypePath == typ || strings.HasPrefix(t.TypePath, typ+"/") {
+			return dp, true
+		}
+	}
+	return azureDataPlane{}, false
 }
 
 // azureAllowRole is the built-in role an allow assigns.
@@ -227,6 +312,19 @@ func azureAllowRole(t *azureTarget, access []string) (guid, name string) {
 	writes := false
 	for _, a := range access {
 		writes = writes || a == igagov.AccessWrite || a == igagov.AccessDelete
+	}
+	if dp, ok := azureDataPlaneOf(t); ok && dp.readRole != "" {
+		reads := false
+		for _, a := range access {
+			reads = reads || a == igagov.AccessRead
+		}
+		switch {
+		case writes && reads && dp.bothRole != "":
+			return dp.bothRole, dp.bothRoleName
+		case writes:
+			return dp.writeRole, dp.writeRoleName
+		}
+		return dp.readRole, dp.readRoleName
 	}
 	switch {
 	case t.Storage && writes:
@@ -335,6 +433,9 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 		}
 		p.warnings = append(p.warnings, AccessIssue{Code: "azure_end_by_job",
 			Message: "An Azure role assignment has no expiry of its own: AuthSec removes it at the end time."})
+	}
+	if dp, ok := azureDataPlaneOf(&ap.target); ok && dp.note != "" {
+		p.warnings = append(p.warnings, AccessIssue{Code: "azure_data_plane", Message: dp.note})
 	}
 	p.azure = ap
 	doc, _ := json.Marshal(azureDocument(p, ap))
