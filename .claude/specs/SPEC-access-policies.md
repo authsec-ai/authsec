@@ -1,10 +1,12 @@
 # Access policies — AWS and Azure
 
-Status: **AWS built and in production; Azure backend built (migration 144, job
-`azure_access`) and verified once in production by API; the backend changes of
-§4 and the shared graph read (D-114) built on `feat/policy-azure-backend`
-(2026-10-22); the Azure console is proposed here, not built.** Code is the
-evidence for what is built; this file is the target.
+Status (2026-10-23): **AWS and Azure built and in production**, backend and
+console. Azure was verified end to end in production on 2026-10-22: a block on
+a storage account removed the managed identity's Storage Blob Data Reader
+assignment (and nothing else) and End restored it, checked in Azure IAM; the
+admin then ran the console flow. §6 lists what is not verified and the known
+limits. Code is the evidence for what is built; where this file and the code
+differ, §2 says how the build differs from the plan.
 
 An admin blocks or allows identities on one resource for a window. The admin
 owns everything (decision 2026-10-13): no owner, approver or review step. The
@@ -31,7 +33,16 @@ history for both. The provider is the resource's.
 Policy is a list, a detail and one form. Everything else is reached from the
 graph or Discovery.
 
-### 2.1 Create policy (`/iga/policy/new`)
+### 2.1 Create policy (`/iga/policy/new`) — built
+
+Built as below, with these differences: the form is opened filled from
+`?resource_id=`, `?identity_account_id=`, `?effect=` and, for an Azure object,
+`?provider=azure` (the Azure object is read off the shared graph); Azure's
+*Identities* list shows the identities holding a role on the resource for both
+Block and Allow (badge *Holds a role here*; search results *No role here*),
+because holding a role is not holding the access chosen, and the preview says
+what changes; a holder whose grant here is not a role assignment (Key Vault
+access policy, app permission) cannot be chosen.
 
 Left column, top to bottom:
 
@@ -73,33 +84,55 @@ Right column, the summary (identical frame for both):
 Footer: the reason Apply is disabled, Cancel, **Apply block** (red) / **Apply
 allow** (primary blue, white text).
 
-### 2.2 Policies (`/iga/policy`)
+### 2.2 Policies (`/iga/policy`) — built
 
-The list as built, with a **Cloud** column (AWS / Azure glyph) and filter.
+Each row carries the cloud's glyph; the **Cloud** filter (`?cloud=`) appears
+once policies of both clouds exist.
 The resource column reads the bucket (and folder) for AWS, the resource name
 for Azure.
 
-### 2.3 Policy detail (`/iga/policy/:id`)
+### 2.3 Policy detail (`/iga/policy/:id`) — built
 
-As built: sentence, status, window progress, lifecycle (Edit, Pause, Resume,
+Tabs Overview · In AWS / In Azure · History: sentence, status, window progress, lifecycle (Edit, Pause, Resume,
 End now, Delete), versions, history. Provider wording:
 
 | | AWS | Azure |
 |---|---|---|
-| per-identity state | In AWS / Removing / Removed | In Azure / Restoring / Restored (block); Assigned / Removing / Removed (allow) |
+| per-identity state | In AWS / Removing / Removed | Access removed / Restoring / Restored (block); Assigned / Removing / Removed (allow) |
 | the change | IAM policy document | assignments removed (role, scope) or created |
 | status hints | "…into AWS…" | "…in Azure…" |
 
-While a block is ending, the policy reads *Ending — restoring access* until
-every assignment is back, never *Ended* first.
+The status `ending` (§4.4) reads **Ending** and offers no Edit, Pause or End
+until every deployment has left the cloud. The Azure resource links to its
+page; Azure identities are listed by name (their page is keyed by the Entra
+object id, which the policy does not carry).
 
-### 2.4 Graph
+### 2.4 Graph — built
 
-An Azure object opens the same graph as an AWS one (§3): identity → role
-assignment → resource or scope, plus memberships, who can become whom and the
-workloads that run as an identity. The selection card offers **Create policy**
-on an identity or resource, opening §2.1 with both filled. An active block is
-drawn on the blocked identity's edges to the resource, as on AWS.
+An Azure object opens the same graph as an AWS one, read from the shared
+`/api/iga/v1/graph` (§3): identity → role assignment → resource or scope, plus
+memberships, who can become whom and the workloads that run as an identity.
+Summary folds the assignment into one identity → resource line labelled with
+the role ("Storage Blob Data Reader", "+N" for more); Detailed draws the
+assignment card (role, its kind, what it allows, a condition if any); Paths
+lists them. A resource opens in reverse (who holds roles on it).
+
+The selection card offers **New access policy**, as on AWS:
+
+| Selected | The card |
+|---|---|
+| service principal, managed identity, agent identity | a policy for it; the policies in force naming it |
+| ARM resource | a policy on it; the policies in force on it; the identities drawn holding a role on it, each a shortcut filling both |
+| a summary line from such an identity to a resource | a policy for that identity on that resource |
+| workload | points at the identity it runs as |
+| user, group, app registration, scope, app permission | one line saying why no policy can be set there |
+
+Block marks come from AuthSec's own record of block policies in force (no
+rescan needed): an identity card reads *Blocked* / *Partly blocked* while any
+block policy names it, whatever its resource; a resource card and the summary
+line into it only while a policy is on that resource. *Partly* means some
+access levels, not all. Once a rescan has run after an Azure block, the
+removed assignment is no longer drawn (it is gone); the cards keep the mark.
 
 ## 3. The shared graph read for Azure
 
@@ -138,15 +171,47 @@ The policy form's identity list is that walk, reversed from the resource.
 
 ## 5. Demo (Azure)
 
+Before: run **Scan now** on the Azure connection, so the graph shows the role
+assignments as they are; open the storage account's **Access control (IAM)**
+and **Activity log** in the Azure portal.
+
 1. Connections: the Azure tenant and subscription are connected; AuthSec's app
    has Role Based Access Control Administrator on the subscription.
-2. Discovery → the storage account → Graph: the managed identity holds Storage
-   Blob Data Reader on it.
-3. Create policy from the selection card: Block, Read, 1 hour, a reason.
-   Preview shows the assignment AuthSec will remove. Apply.
-4. Policy detail: Applying → Active; the graph shows the block.
-5. Azure portal → the storage account → Access control (IAM) → Role
-   assignments: the identity's Storage Blob Data Reader is gone. Activity log:
-   *Delete role assignment* by Authsec Azure Onboarding.
-6. End now: detail shows Restored; the portal shows the assignment back and a
-   *Create role assignment* entry in the Activity log.
+2. Discovery → the storage account → Access Graph: workload → runs as →
+   managed identity → *Storage Blob Data Reader* → storage account.
+3. Select the line (or the identity, or the storage account) → **New access
+   policy**: the form opens filled. Block, Read, 1 hour, a reason. The summary
+   says AuthSec can change role assignments in the subscription and *View the
+   role assignment changes* lists what it will remove. **Apply block**.
+4. Policy detail: Applying → Active (about 20 seconds); *In Azure* reads Access
+   removed; History: Created, Applied, In place on identity (verified). The graph cards
+   read Blocked / Partly blocked.
+5. Azure portal, refreshed: the identity's Storage Blob Data Reader is gone and
+   its other roles are untouched; Activity log: *Delete role assignment* by
+   Authsec Azure Onboarding.
+6. **End now** with a reason: Ending → Ended; *In Azure* reads Restored;
+   History: Access restored. The portal shows the assignment back and *Create
+   role assignment* in the Activity log.
+
+## 6. Verified, and known limits
+
+Verified in production (2026-10-22): the block, End and restore above, by API
+and in Azure IAM and the Activity log; the console flow, by the admin. Not
+verified: an agent's data-plane read failing while blocked (only the role
+assignments were checked), and Allow end to end on Azure.
+
+Known limits, by design or not yet built:
+
+- A block removes role assignments on the resource or below it. Access from a
+  resource group, subscription or management group is refused in the preview
+  (`azure_inherited_access`); access through an Entra group is not examined
+  (`azure_groups_not_checked`); deny assignments and ABAC conditions are not
+  evaluated.
+- Azure assignments have no expiry: an Allow, and the restore after a block,
+  happen when AuthSec's job runs.
+- The Azure object pages still read three Azure-only endpoints: the
+  neighbourhood (a resource's ARM id, a workload's name and the identity it
+  runs as), *What it can reach* (blast radius) and the Discovery summary strip.
+  The graph tab and the policy screens use the shared reads.
+- On the shared graph (D-114) a scope node is a leaf, `/evidence` does not
+  serve Azure claims, and the AKS federation join is not walked.
