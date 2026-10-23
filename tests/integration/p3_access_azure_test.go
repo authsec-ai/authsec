@@ -705,3 +705,20 @@ func TestAccessPolicyAzureRemovalWithoutR2(t *testing.T) {
 		t.Fatalf("a check ran while R2 is unavailable: %v", got)
 	}
 }
+
+// An Azure policy that starts later waits with its rows approved: it reads
+// scheduled, not applying (nothing is being applied yet).
+func TestAccessPolicyAzureScheduled(t *testing.T) {
+	z := newAzLab(t)
+	who, _ := z.principal("sp-later")
+	in := z.intent("block", z.res, who)
+	start := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	end := start.Add(time.Hour)
+	in.StartsAt, in.EndsAt = &start, &end
+	v := z.create("az later", in)
+	z.step(z.rows(v.ID, models.R2StateApproved)[0].ID) // waits for its start
+	got, err := z.svc.Get(z.ctx, z.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusScheduled {
+		t.Fatalf("a policy that starts in an hour: %s %q %v", got.Status, got.StatusReason, err)
+	}
+}

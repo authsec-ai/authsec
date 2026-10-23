@@ -771,6 +771,8 @@ func (s *GovAccess) Create(ctx context.Context, ws, actor uuid.UUID, req AccessP
 		return nil, errs[0]
 	}
 	intent, _ := json.Marshal(p.intent)
+	// provider is the policy family's (049 admits only aws); an access
+	// policy's cloud is its resource's (views, ?provider=).
 	pol := models.IGAGovPolicy{ID: uuid.New(), WorkspaceID: ws, Name: name, Purpose: reason, Family: "time_bound", Provider: "aws",
 		Lifecycle: "active", CreatedBy: actor, CreatedAt: now, UpdatedAt: now}
 	v := models.IGAGovAccessPolicyVersion{ID: uuid.New(), WorkspaceID: ws, PolicyID: pol.ID, VersionNo: 1, Intent: intent,
@@ -1348,6 +1350,11 @@ func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason str
 		case models.R2StateFailed:
 			failed = append(failed, r.RoleARN+": "+r.StateReason)
 		case models.R2StateApproved, models.R2StateDeploying, models.R2StateOutcomeUnknown:
+			// An Azure row waits approved until its start: that is scheduled,
+			// not applying.
+			if r.State == models.R2StateApproved && r.StartsAt != nil && now.Before(*r.StartsAt) {
+				break
+			}
 			applying = append(applying, r.RoleARN)
 		case models.R2StateActive:
 			if r.Drift != "" && r.Drift != R2ReasonAttachedElsewhere {
