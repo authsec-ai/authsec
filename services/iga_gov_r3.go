@@ -35,18 +35,18 @@ const PolicyR3SchemaHead = "062"
 
 // PolicyR3Gate carries whether 062 has been verified.
 type PolicyR3Gate struct {
-	enabled  bool
-	badValue string
+	enabled bool
 
 	mu       sync.RWMutex
 	verified bool
 	reason   string
 }
 
-// NewPolicyR3Gate builds a gate; badValue makes it misconfigured forever.
-func NewPolicyR3Gate(enabled bool, badValue string) *PolicyR3Gate {
-	g := &PolicyR3Gate{enabled: enabled || badValue != "", badValue: badValue}
-	if g.enabled && badValue == "" {
+// NewPolicyR3Gate builds a gate: on (main, through DefaultPolicyR3Gate), or
+// off (the process default before main installs one, and tests).
+func NewPolicyR3Gate(enabled bool) *PolicyR3Gate {
+	g := &PolicyR3Gate{enabled: enabled}
+	if g.enabled {
 		g.reason = "the R3 schema (" + PolicyR3SchemaHead + ") has not been verified yet"
 	}
 	return g
@@ -55,7 +55,7 @@ func NewPolicyR3Gate(enabled bool, badValue string) *PolicyR3Gate {
 // DefaultPolicyR3Gate is the gate main installs: on, serving once its schema
 // verifies and the policy gate is available.
 func DefaultPolicyR3Gate() *PolicyR3Gate {
-	return NewPolicyR3Gate(true, "")
+	return NewPolicyR3Gate(true)
 }
 
 // Enabled reports whether the gate is on (verified or not).
@@ -66,9 +66,6 @@ func (g *PolicyR3Gate) Enabled() bool { return g != nil && g.enabled }
 func (g *PolicyR3Gate) Status() (state, reason string) {
 	if g == nil || !g.enabled {
 		return PolicyOff, "R3 is off"
-	}
-	if g.badValue != "" {
-		return PolicyMisconfigured, g.badValue
 	}
 	if ps, pr, _ := PolicyGateState().Status(); ps != PolicyOn {
 		r := fmt.Sprintf("R3 needs the policy gate available; it is %s", ps)
@@ -96,9 +93,6 @@ func (g *PolicyR3Gate) Available() bool {
 func (g *PolicyR3Gate) Verify(db *gorm.DB) error {
 	if g == nil || !g.enabled {
 		return nil
-	}
-	if g.badValue != "" {
-		return fmt.Errorf("%s", g.badValue)
 	}
 	err := VerifyPolicyR3Schema(db)
 	g.mu.Lock()
@@ -130,9 +124,6 @@ func (g *PolicyR3Gate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interv
 			return
 		}
 		log.Printf("[policy] R3 not ready, R3 stays off (runtime routes fail closed): %v", err)
-		if g.badValue != "" {
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
@@ -203,7 +194,7 @@ func VerifyPolicyR3Schema(db *gorm.DB) error {
 // The process-wide gate (default off). main installs it once.
 var (
 	policyR3GateMu sync.RWMutex
-	policyR3Gate   = NewPolicyR3Gate(false, "")
+	policyR3Gate   = NewPolicyR3Gate(false)
 )
 
 // PolicyR3GateState returns the process-wide R3 gate.

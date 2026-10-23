@@ -30,11 +30,11 @@ import (
 // gates afterwards.
 func p3R23Gates(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	graph := services.NewGraphProjectionGate(true, "")
+	graph := services.NewGraphProjectionGate(true)
 	if err := graph.Verify(db); err != nil {
 		t.Fatalf("graph projection gate: %v", err)
 	}
-	pol := services.NewPolicyGate(true, "", func() *services.GraphProjectionGate { return graph })
+	pol := services.NewPolicyGate(true, func() *services.GraphProjectionGate { return graph })
 	if err := pol.Verify(db); err != nil {
 		t.Fatalf("policy gate: %v", err)
 	}
@@ -45,12 +45,12 @@ func p3R23Gates(t *testing.T, db *gorm.DB) {
 		services.SetPolicyR2Gate(prev2)
 		services.SetPolicyR3Gate(prev3)
 	})
-	r2 := services.NewPolicyR2Gate(true, "")
+	r2 := services.NewPolicyR2Gate(true)
 	if err := r2.Verify(db); err != nil {
 		t.Fatalf("R2 gate (061, 134): %v", err)
 	}
 	services.SetPolicyR2Gate(r2)
-	r3 := services.NewPolicyR3Gate(true, "")
+	r3 := services.NewPolicyR3Gate(true)
 	if err := r3.Verify(db); err != nil {
 		t.Fatalf("R3 gate (062): %v", err)
 	}

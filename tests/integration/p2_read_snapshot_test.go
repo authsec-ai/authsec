@@ -179,8 +179,8 @@ func TestP2ReadGraphUnavailable(t *testing.T) {
 		gate *services.GraphProjectionGate
 		mode string
 	}{
-		{"off", services.NewGraphProjectionGate(false, ""), services.GraphProjectionOff},
-		{"misconfigured", services.NewGraphProjectionGate(true, ""), services.GraphProjectionMisconfigured},
+		{"off", services.NewGraphProjectionGate(false), services.GraphProjectionOff},
+		{"misconfigured", services.NewGraphProjectionGate(true), services.GraphProjectionMisconfigured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newP2Lab(t, "p2-read-503-"+tc.name, false)

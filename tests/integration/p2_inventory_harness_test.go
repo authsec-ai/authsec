@@ -78,7 +78,7 @@ func newInvLab(t *testing.T, gate *services.GraphProjectionGate) *invLab {
 	t.Helper()
 	db := igaDB(t)
 	if gate == nil {
-		gate = services.NewGraphProjectionGate(true, "")
+		gate = services.NewGraphProjectionGate(true)
 		if err := gate.Verify(db); err != nil {
 			t.Fatalf("the integration database must be at 042 for the inventory: %v", err)
 		}

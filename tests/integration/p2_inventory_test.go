@@ -465,9 +465,8 @@ func TestP2InventoryUnavailable(t *testing.T) {
 		gate *services.GraphProjectionGate
 		mode string
 	}{
-		{"off", services.NewGraphProjectionGate(false, ""), services.GraphProjectionOff},
-		{"misconfigured", services.NewGraphProjectionGate(true, `IGA_GRAPH_PROJECTION="maybe" is not on or off`), services.GraphProjectionMisconfigured},
-		{"on, not verified", services.NewGraphProjectionGate(true, ""), services.GraphProjectionMisconfigured},
+		{"off", services.NewGraphProjectionGate(false), services.GraphProjectionOff},
+		{"on, not verified", services.NewGraphProjectionGate(true), services.GraphProjectionMisconfigured},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			l := newInvLab(t, c.gate)

@@ -928,7 +928,7 @@ func TestInventoryScopeKeysAreWritten(t *testing.T) {
 // verifies: projectors write the graph only then, so a test that expects
 // projection verifies it against its own database first.
 func verifiedGraphGate(db *gorm.DB) *services.GraphProjectionGate {
-	g := services.NewGraphProjectionGate(true, "")
+	g := services.NewGraphProjectionGate(true)
 	if err := g.Verify(db); err != nil {
 		panic("the graph schema did not verify on the test database: " + err.Error())
 	}

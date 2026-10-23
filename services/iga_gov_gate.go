@@ -41,9 +41,7 @@ const (
 // schema has been verified.
 type PolicyGate struct {
 	enabled bool
-	// badValue makes a gate built misconfigured (tests): it never verifies.
-	badValue string
-	graph    func() *GraphProjectionGate
+	graph   func() *GraphProjectionGate
 
 	mu         sync.RWMutex
 	verified   bool
@@ -52,10 +50,11 @@ type PolicyGate struct {
 }
 
 // NewPolicyGate builds a gate. graph returns the graph gate it depends on (nil
-// is read as off). badValue, when non-empty, makes the gate misconfigured.
-func NewPolicyGate(enabled bool, badValue string, graph func() *GraphProjectionGate) *PolicyGate {
-	g := &PolicyGate{enabled: enabled || badValue != "", badValue: badValue, graph: graph}
-	if g.enabled && badValue == "" {
+// is read as off). Off is the process default before main installs one, and
+// tests'.
+func NewPolicyGate(enabled bool, graph func() *GraphProjectionGate) *PolicyGate {
+	g := &PolicyGate{enabled: enabled, graph: graph}
+	if g.enabled {
 		g.reason = "the Phase 3 schema (047-" + PolicySchemaHead + ") has not been verified yet"
 	}
 	return g
@@ -64,10 +63,10 @@ func NewPolicyGate(enabled bool, badValue string, graph func() *GraphProjectionG
 // DefaultPolicyGate is the gate main installs: on, depending on the graph
 // gate `graph` returns, and serving once its schema verifies.
 func DefaultPolicyGate(graph func() *GraphProjectionGate) *PolicyGate {
-	return NewPolicyGate(true, "", graph)
+	return NewPolicyGate(true, graph)
 }
 
-// Enabled reports whether the gate is on (verified or not, valid or not).
+// Enabled reports whether the gate is on (verified or not).
 func (g *PolicyGate) Enabled() bool { return g != nil && g.enabled }
 
 // Status is the gate's state, the reason when it is not on, and the Phase 3
@@ -76,9 +75,6 @@ func (g *PolicyGate) Enabled() bool { return g != nil && g.enabled }
 func (g *PolicyGate) Status() (state, reason, schemaHead string) {
 	if g == nil || !g.enabled {
 		return PolicyOff, "policy is off", ""
-	}
-	if g.badValue != "" {
-		return PolicyMisconfigured, g.badValue, ""
 	}
 	var graph *GraphProjectionGate
 	if g.graph != nil {
@@ -109,13 +105,10 @@ func (g *PolicyGate) Available() bool {
 // Verify runs the Phase 3 schema check (VerifyPolicySchema) and records the
 // outcome. A success is final; a failure -- a missing relation or a database
 // error -- is recorded with its reason and can be retried. A gate that is off
-// or was built misconfigured never verifies.
+// never verifies.
 func (g *PolicyGate) Verify(db *gorm.DB) error {
 	if g == nil || !g.enabled {
 		return nil
-	}
-	if g.badValue != "" {
-		return fmt.Errorf("%s", g.badValue)
 	}
 	return g.checkSchema(db, true)
 }
@@ -175,12 +168,7 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 		interval = 30 * time.Second
 	}
 	for {
-		var err error
-		if g.badValue != "" {
-			err = fmt.Errorf("%s", g.badValue)
-		} else {
-			err = g.checkSchema(db, false)
-		}
+		err := g.checkSchema(db, false)
 		if err == nil {
 			for _, f := range onReady {
 				if f != nil {
@@ -200,9 +188,6 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 			return
 		}
 		log.Printf("[policy] not ready, every policy route answers 503 policy_unavailable: %v", err)
-		if g.badValue != "" {
-			return // a gate built misconfigured never verifies; retrying changes nothing
-		}
 		select {
 		case <-ctx.Done():
 			return
@@ -215,7 +200,7 @@ func (g *PolicyGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, interval
 // reads it. Defaults to off.
 var (
 	policyGateMu sync.RWMutex
-	policyGate   = NewPolicyGate(false, "", GraphProjection)
+	policyGate   = NewPolicyGate(false, GraphProjection)
 )
 
 // PolicyGateState returns the process-wide gate.

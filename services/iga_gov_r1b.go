@@ -33,18 +33,18 @@ const PolicyR1BSchemaHead = "060"
 
 // PolicyR1BGate carries whether 060 has been verified.
 type PolicyR1BGate struct {
-	enabled  bool
-	badValue string
+	enabled bool
 
 	mu       sync.RWMutex
 	verified bool
 	reason   string
 }
 
-// NewPolicyR1BGate builds a gate; badValue makes it misconfigured forever.
-func NewPolicyR1BGate(enabled bool, badValue string) *PolicyR1BGate {
-	g := &PolicyR1BGate{enabled: enabled || badValue != "", badValue: badValue}
-	if g.enabled && badValue == "" {
+// NewPolicyR1BGate builds a gate: on (main, through DefaultPolicyR1BGate), or
+// off (the process default before main installs one, and tests).
+func NewPolicyR1BGate(enabled bool) *PolicyR1BGate {
+	g := &PolicyR1BGate{enabled: enabled}
+	if g.enabled {
 		g.reason = "the R1b schema (" + PolicyR1BSchemaHead + ") has not been verified yet"
 	}
 	return g
@@ -53,7 +53,7 @@ func NewPolicyR1BGate(enabled bool, badValue string) *PolicyR1BGate {
 // DefaultPolicyR1BGate is the gate main installs: on, serving once its schema
 // verifies and the policy gate is available.
 func DefaultPolicyR1BGate() *PolicyR1BGate {
-	return NewPolicyR1BGate(true, "")
+	return NewPolicyR1BGate(true)
 }
 
 // Enabled reports whether the gate is on (verified or not).
@@ -64,9 +64,6 @@ func (g *PolicyR1BGate) Enabled() bool { return g != nil && g.enabled }
 func (g *PolicyR1BGate) Status() (state, reason string) {
 	if g == nil || !g.enabled {
 		return PolicyOff, "R1b is off"
-	}
-	if g.badValue != "" {
-		return PolicyMisconfigured, g.badValue
 	}
 	if ps, pr, _ := PolicyGateState().Status(); ps != PolicyOn {
 		r := fmt.Sprintf("R1b needs the policy gate available; it is %s", ps)
@@ -95,9 +92,6 @@ func (g *PolicyR1BGate) Verify(db *gorm.DB) error {
 	if g == nil || !g.enabled {
 		return nil
 	}
-	if g.badValue != "" {
-		return fmt.Errorf("%s", g.badValue)
-	}
 	err := VerifyPolicyR1BSchema(db)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -124,9 +118,6 @@ func (g *PolicyR1BGate) VerifyUntilReady(ctx context.Context, db *gorm.DB, inter
 			return
 		}
 		log.Printf("[policy] R1b not ready, R1b stays off: %v", err)
-		if g.badValue != "" {
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
@@ -173,7 +164,7 @@ func VerifyPolicyR1BSchema(db *gorm.DB) error {
 // The process-wide gate (default off). main installs it once.
 var (
 	policyR1BGateMu sync.RWMutex
-	policyR1BGate   = NewPolicyR1BGate(false, "")
+	policyR1BGate   = NewPolicyR1BGate(false)
 )
 
 // PolicyR1BGateState returns the process-wide R1b gate.

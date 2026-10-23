@@ -25,7 +25,7 @@ import (
 
 func sightingMgr(db *gorm.DB, on bool) services.K8sRBACManager {
 	if !on {
-		return services.NewK8sRBACManager(db, services.NewGraphProjectionGate(false, ""))
+		return services.NewK8sRBACManager(db, services.NewGraphProjectionGate(false))
 	}
 	return services.NewK8sRBACManager(db, verifiedGraphGate(db))
 }

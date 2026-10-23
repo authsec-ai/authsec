@@ -115,8 +115,6 @@ func VerifyGraphSchema(db *gorm.DB) error {
 // tests) is the pre-pipeline path.
 type GraphProjectionGate struct {
 	enabled bool
-	// broken: built misconfigured with a fixed reason (tests); it never verifies.
-	broken bool
 
 	mu       sync.RWMutex
 	verified bool
@@ -127,14 +125,13 @@ type GraphProjectionGate struct {
 	schemaHead string
 }
 
-// NewGraphProjectionGate builds a gate. main builds it on with no reason
-// (DefaultGraphProjectionGate). enabled=false is the pre-pipeline path, and a
-// non-empty reason starts it misconfigured for good; both exist for tests.
-func NewGraphProjectionGate(enabled bool, reason string) *GraphProjectionGate {
+// NewGraphProjectionGate builds a gate: on (main, through
+// DefaultGraphProjectionGate), serving once its schema verifies, or off -- the
+// pre-pipeline path, which the process default before main installs a gate
+// is, and which tests use to scan without the graph on a full schema.
+func NewGraphProjectionGate(enabled bool) *GraphProjectionGate {
 	g := &GraphProjectionGate{enabled: enabled}
-	if reason != "" {
-		g.enabled, g.reason, g.broken = true, reason, true
-	} else if enabled {
+	if enabled {
 		g.reason = "schema not yet verified"
 	}
 	return g
@@ -143,7 +140,7 @@ func NewGraphProjectionGate(enabled bool, reason string) *GraphProjectionGate {
 // DefaultGraphProjectionGate is the gate main installs: on, and serving once
 // its schema verifies.
 func DefaultGraphProjectionGate() *GraphProjectionGate {
-	return NewGraphProjectionGate(true, "")
+	return NewGraphProjectionGate(true)
 }
 
 // Enabled reports whether the gate is on (verified or not).
@@ -193,13 +190,10 @@ func (g *GraphProjectionGate) Verify(db *gorm.DB) error {
 		return nil
 	}
 	g.mu.RLock()
-	done, preset := g.verified, g.reason
+	done := g.verified
 	g.mu.RUnlock()
 	if done {
 		return nil
-	}
-	if g.broken {
-		return fmt.Errorf("%s", preset) // a gate built misconfigured never verifies
 	}
 	err := VerifyGraphSchema(db)
 	absent := false
@@ -260,7 +254,7 @@ func (g *GraphProjectionGate) VerifyUntilReady(
 // else reads it. Before that it is off, the pre-pipeline path.
 var (
 	graphGateMu sync.RWMutex
-	graphGate   = NewGraphProjectionGate(false, "")
+	graphGate   = NewGraphProjectionGate(false)
 )
 
 // GraphProjection returns the process-wide gate.

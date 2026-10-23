@@ -661,7 +661,7 @@ func TestLegacyCompatMountsBesideTheIGASurface(t *testing.T) {
 	t.Setenv("AUTH_EXPECT_ISS", "authsec-ai/auth-manager")
 	eng := gin.New()
 	routes.SetupIGARoutes(eng, platform.NewIGAController(db),
-		platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false, ""), compatCursorKey))
+		platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false), compatCursorKey))
 	platform.MountLegacyAgentPolicyCompatRoutes(eng,
 		platform.NewLegacyAgentPolicyCompatControllerWith(db, compatCursorKey),
 		func(c *gin.Context) { c.Next() }, func(string, string) gin.HandlerFunc { return func(c *gin.Context) { c.Next() } })

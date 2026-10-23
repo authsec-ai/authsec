@@ -358,7 +358,7 @@ type loadAPI struct {
 
 func newLoadAPI(db *gorm.DB, ws uuid.UUID) (*loadAPI, error) {
 	gin.SetMode(gin.ReleaseMode)
-	gate := services.NewGraphProjectionGate(true, "")
+	gate := services.NewGraphProjectionGate(true)
 	if err := gate.Verify(db); err != nil {
 		return nil, fmt.Errorf("the load database must be a Phase 2 database at 036: %w", err)
 	}

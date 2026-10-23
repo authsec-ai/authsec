@@ -17,7 +17,7 @@ import (
 
 func p3sGate(t *testing.T, db *gorm.DB) *services.PolicyGate {
 	t.Helper()
-	g := services.NewPolicyGate(true, "", p3GraphOn(t, db))
+	g := services.NewPolicyGate(true, p3GraphOn(t, db))
 	if err := g.Verify(db); err != nil {
 		t.Fatal(err)
 	}

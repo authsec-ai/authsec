@@ -489,7 +489,7 @@ func TestP3FixApprStartupInstallsHooksBeforeServing(t *testing.T) {
 	prev := services.SetGovAuthoringHooks(services.GovAuthoringHooks{})
 	t.Cleanup(func() { services.SetGovAuthoringHooks(prev) })
 
-	gate := services.NewPolicyGate(true, "", func() *services.GraphProjectionGate { return l.gate })
+	gate := services.NewPolicyGate(true, func() *services.GraphProjectionGate { return l.gate })
 	eng := gin.New()
 	ctl := platform.NewIGAGraphReadControllerWith(l.db, l.gate, readTestCursorKey).WithPolicyGate(gate).WithGovLiveReader(l.live)
 	routes.SetupIGARoutes(eng, platform.NewIGAController(l.db), ctl)

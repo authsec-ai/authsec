@@ -251,7 +251,7 @@ func rdetailPhase1Scan(l *p2Lab, a *p2Account, f *s3bFakes) models.CloudScanRun 
 		l.t.Fatalf("enqueue: %v", err)
 	}
 	w := services.NewAWSScanWorker(l.db, a.svc).WithOwner("scan-worker-rdetail-phase1").
-		WithGraphProjection(services.NewGraphProjectionGate(false, "")).WithScannerHook(f.hook(a))
+		WithGraphProjection(services.NewGraphProjectionGate(false)).WithScannerHook(f.hook(a))
 	if worked, err := w.RunOnce(context.Background()); err != nil || !worked {
 		l.t.Fatalf("phase 1 scan: worked=%v err=%v", worked, err)
 	}

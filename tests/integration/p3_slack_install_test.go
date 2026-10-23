@@ -147,7 +147,7 @@ func TestP3T314SlackInstallStateBinding(t *testing.T) {
 	}
 
 	// The gate: off, every Slack route is 503 policy_unavailable.
-	off := newP3sApp(t, db, services.NewPolicyGate(false, "", p3GraphOn(t, db)))
+	off := newP3sApp(t, db, services.NewPolicyGate(false, p3GraphOn(t, db)))
 	if w, body := off.do(http.MethodGet, "/install", tokA, nil); w.Code != http.StatusServiceUnavailable || p3eErr(body) != "policy_unavailable" {
 		t.Fatalf("gate off /install: %d %v", w.Code, body)
 	}

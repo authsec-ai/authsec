@@ -85,7 +85,7 @@ type p3eLab struct {
 func newP3eLab(t *testing.T, name string) *p3eLab {
 	t.Helper()
 	l := newP2Lab(t, name, true)
-	gate := services.NewPolicyGate(true, "", func() *services.GraphProjectionGate { return l.gate })
+	gate := services.NewPolicyGate(true, func() *services.GraphProjectionGate { return l.gate })
 	if err := gate.Verify(l.db); err != nil || !gate.Available() {
 		t.Fatalf("the policy gate must verify against the integration database (056): %v", err)
 	}

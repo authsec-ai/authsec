@@ -37,13 +37,13 @@ func newAPLab(t *testing.T) *apLab {
 	t.Helper()
 	d := newDLab(t)
 	// Gates: IGA_POLICY (verified), then R2.
-	pg := services.NewPolicyGate(true, "", p3GraphOn(t, d.db))
+	pg := services.NewPolicyGate(true, p3GraphOn(t, d.db))
 	if err := pg.Verify(d.db); err != nil {
 		t.Fatal(err)
 	}
 	prevP := services.PolicyGateState()
 	services.SetPolicyGate(pg)
-	r2 := services.NewPolicyR2Gate(true, "")
+	r2 := services.NewPolicyR2Gate(true)
 	if err := r2.Verify(d.db); err != nil {
 		t.Fatalf("R2 gate: %v (the integration database must be at 137)", err)
 	}

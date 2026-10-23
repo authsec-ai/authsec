@@ -189,7 +189,7 @@ func newEnfLab(t *testing.T) *enfLab {
 		WithTemplateCheck(func(context.Context, string) error { return nil })
 	// The callback runs only under an available IGA_POLICY gate (review fix
 	// R1a P2 "gate leaks"; TestP3EnfCallbackRefusedWhileGateOff).
-	l.gateOn = services.NewPolicyGate(true, "", p3GraphOn(t, db))
+	l.gateOn = services.NewPolicyGate(true, p3GraphOn(t, db))
 	if err := l.gateOn.Verify(db); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestP3EnfCallbackRefusedWhileGateOff(t *testing.T) {
 	}
 
 	// Switch off.
-	l.svc.WithPolicyGate(services.NewPolicyGate(false, "", p3GraphOn(t, l.db)))
+	l.svc.WithPolicyGate(services.NewPolicyGate(false, p3GraphOn(t, l.db)))
 	n := l.puts.count()
 	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackDone {
 		t.Fatalf("gate off: outcome %s, want done (refused explicitly)", out)
@@ -431,7 +431,7 @@ func TestP3EnfCallbackRefusedWhileGateOff(t *testing.T) {
 	}
 
 	// Switch on, schema not verified yet: left for redelivery.
-	l.svc.WithPolicyGate(services.NewPolicyGate(true, "", p3GraphOn(t, l.db)))
+	l.svc.WithPolicyGate(services.NewPolicyGate(true, p3GraphOn(t, l.db)))
 	n = l.puts.count()
 	if out := l.deliver(l.cfnBody(sess, "Create", nil)); out != services.CallbackRetry || l.puts.count() != n {
 		t.Fatalf("gate unverified: outcome %s with %d answers, want retry and none", out, l.puts.count()-n)
@@ -843,14 +843,14 @@ func (r *enfRouteLab) call(method, path, bearer string, body any) (int, map[stri
 func TestP3EnfRoutes(t *testing.T) {
 	db := igaDB(t)
 	graphOn := p3GraphOn(t, db)
-	verified := services.NewPolicyGate(true, "", graphOn)
+	verified := services.NewPolicyGate(true, graphOn)
 	if err := verified.Verify(db); err != nil {
 		t.Fatal(err)
 	}
 	base := func(c uuid.UUID) string { return "/aws/connectors/" + c.String() + "/enforcement" }
 
 	t.Run("gate off: every route 503 policy_unavailable", func(t *testing.T) {
-		r := newEnfRouteLab(t, services.NewPolicyGate(false, "", graphOn))
+		r := newEnfRouteLab(t, services.NewPolicyGate(false, graphOn))
 		tok := r.token(t, r.a, "discovery:read governance:enforce")
 		p := base(r.a.connector.ID)
 		for _, rt := range [][2]string{{"GET", p}, {"POST", p}, {"DELETE", p}, {"POST", p + "/sessions"},

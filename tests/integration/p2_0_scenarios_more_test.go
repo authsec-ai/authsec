@@ -628,7 +628,7 @@ func TestP2SchemaVerificationErrorFailsClosed(t *testing.T) {
 
 	// A verification that ERRORS: a closed connection pool, as a database
 	// that is unreachable at startup looks to the check.
-	gate := services.NewGraphProjectionGate(true, "")
+	gate := services.NewGraphProjectionGate(true)
 	if err := gate.Verify(closedGorm(t)); err == nil {
 		t.Fatal("verification against an unreachable database succeeded")
 	}
@@ -778,6 +778,17 @@ func closedGorm(t *testing.T) *gorm.DB {
 	}
 	_ = sqlDB.Close()
 	return db
+}
+
+// misconfiguredGraphGate is a gate whose schema check could not run (an
+// unreachable database): on, unverified, failing closed with the reason.
+func misconfiguredGraphGate(t *testing.T) *services.GraphProjectionGate {
+	t.Helper()
+	g := services.NewGraphProjectionGate(true)
+	if err := g.Verify(closedGorm(t)); err == nil {
+		t.Fatal("verification against an unreachable database succeeded")
+	}
+	return g
 }
 
 // E16 / T4.8. AWS rows share the canonical tables with GitHub's, and must never

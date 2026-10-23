@@ -82,13 +82,13 @@ func ghGraphFixture() *services.FixtureProvider {
 // ghGateOn is the graph gate verified against db, as main installs it once the
 // schema verifies: the GitHub projector writes only then.
 func ghGateOn(db *gorm.DB) *services.GraphProjectionGate {
-	g := services.NewGraphProjectionGate(true, "")
+	g := services.NewGraphProjectionGate(true)
 	if err := g.Verify(db); err != nil {
 		panic("the graph schema did not verify on the test database: " + err.Error())
 	}
 	return g
 }
-func ghGateOff() *services.GraphProjectionGate { return services.NewGraphProjectionGate(false, "") }
+func ghGateOff() *services.GraphProjectionGate { return services.NewGraphProjectionGate(false) }
 
 func ghManager(db *gorm.DB, fx services.IGAProvider, gate *services.GraphProjectionGate, installs ...string) services.IGAManager {
 	return services.NewIGAManager(repositories.NewIGARepository(db), fx, ownedInstall(installs...),

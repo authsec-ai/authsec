@@ -657,7 +657,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 
 	t.Run("enforcement binding routes", func(t *testing.T) {
 		graphOn := p3GraphOn(t, db)
-		gate := services.NewPolicyGate(true, "", graphOn)
+		gate := services.NewPolicyGate(true, graphOn)
 		if err := gate.Verify(db); err != nil {
 			t.Fatal(err)
 		}

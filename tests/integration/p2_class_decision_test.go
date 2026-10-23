@@ -1258,7 +1258,7 @@ func TestP2ClassCapabilitiesFeature(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newP2Lab(t, "p2-class-caps-"+tc.name, false)
-			l.gate = services.NewGraphProjectionGate(tc.projection, "")
+			l.gate = services.NewGraphProjectionGate(tc.projection)
 			if tc.verify {
 				if err := l.gate.Verify(l.db); err != nil {
 					t.Fatalf("verify: %v", err)

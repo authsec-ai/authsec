@@ -45,7 +45,7 @@ func openAt(t *testing.T, env string) *gorm.DB {
 // no process can be projecting. The removed switch's "off" gave the same.
 func TestGraphGateScansWithoutGraphBelow027(t *testing.T) {
 	db := openAt(t, "S0_DSN")
-	gate := services.NewGraphProjectionGate(true, "")
+	gate := services.NewGraphProjectionGate(true)
 	err := gate.Verify(db)
 	if err == nil {
 		t.Fatal("the gate verified against a 026 schema")
@@ -69,7 +69,7 @@ func TestGraphGateScansWithoutGraphBelow027(t *testing.T) {
 // The gate against 036: verified, pipeline mode, claims allowed.
 func TestGraphGateVerifiesAt036(t *testing.T) {
 	db := openAt(t, "S1_DSN")
-	gate := services.NewGraphProjectionGate(true, "")
+	gate := services.NewGraphProjectionGate(true)
 	if err := gate.Verify(db); err != nil {
 		t.Fatalf("verification failed at 036: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestGraphGateTransientErrorIsNotCached(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = sqlDB.Close()
-	gate := services.NewGraphProjectionGate(true, "")
+	gate := services.NewGraphProjectionGate(true)
 	if err := gate.Verify(bad); err == nil {
 		t.Fatal("verification succeeded against an unreachable database")
 	}
@@ -113,7 +113,7 @@ func TestGraphGateTransientErrorIsNotCached(t *testing.T) {
 // Off (the process default before main installs the gate, and tests) is
 // Phase 1: claims allowed, no pipeline, whatever the schema.
 func TestGraphGateOffIsPhaseOne(t *testing.T) {
-	gate := services.NewGraphProjectionGate(false, "")
+	gate := services.NewGraphProjectionGate(false)
 	if mode, _, _ := gate.Status(); mode != services.GraphProjectionOff {
 		t.Fatalf("mode = %q, want off", mode)
 	}
