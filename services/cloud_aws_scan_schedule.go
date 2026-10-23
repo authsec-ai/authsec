@@ -170,6 +170,9 @@ type AWSScanScheduler struct {
 	runs  repositories.CloudScanRunRepository
 	now   func() time.Time
 	tick  time.Duration
+	// claimed runs between the claim and serving each schedule (tests: an
+	// administrator's change landing in that window).
+	claimed func(repositories.DueSchedule)
 }
 
 func NewAWSScanScheduler(db *gorm.DB) *AWSScanScheduler {
@@ -184,6 +187,12 @@ func NewAWSScanScheduler(db *gorm.DB) *AWSScanScheduler {
 
 // WithClock replaces time.Now, so a test can move through slots.
 func (s *AWSScanScheduler) WithClock(f func() time.Time) *AWSScanScheduler { s.now = f; return s }
+
+// WithClaimed runs f after each schedule is claimed and before it is served.
+func (s *AWSScanScheduler) WithClaimed(f func(repositories.DueSchedule)) *AWSScanScheduler {
+	s.claimed = f
+	return s
+}
 
 // Run ticks until ctx ends.
 func (s *AWSScanScheduler) Run(ctx context.Context) {
@@ -214,6 +223,9 @@ func (s *AWSScanScheduler) RunOnce(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("claim due schedules: %w", err)
 	}
 	for _, d := range due {
+		if s.claimed != nil {
+			s.claimed(d)
+		}
 		s.serve(ctx, d, now)
 	}
 	return len(due), nil
@@ -262,8 +274,14 @@ func (s *AWSScanScheduler) serve(ctx context.Context, d repositories.DueSchedule
 		next = scanslot.NextDue(spec, now, jit)
 	}
 	if err := tenancy.InWorkspace(ctx, s.db, d.WorkspaceID, func(tx *gorm.DB) error {
-		return s.sched.Advance(tx, d.WorkspaceID, d.ConnectorID, now, next)
+		return s.sched.Advance(tx, d.WorkspaceID, d.ConnectorID, now, next, d.ClaimedUntil)
 	}); err != nil {
+		if errors.Is(err, repositories.ErrScheduleChanged) {
+			// Turned off, paused or given a new time since the claim: the
+			// administrator's version stands, and nothing is queued.
+			log.Printf("[aws-sched] stage=advance outcome=schedule_changed %s", lg)
+			return
+		}
 		log.Printf("[aws-sched] stage=advance outcome=error %s err=%v", lg, err)
 		return
 	}
