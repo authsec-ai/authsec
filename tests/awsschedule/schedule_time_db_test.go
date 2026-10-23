@@ -188,3 +188,25 @@ func TestNoChosenTimeKeepsTheOldBehaviour(t *testing.T) {
 	now := time.Now()
 	within(t, "next_due_at", f.row(t).NextDueAt, now.Add(24*time.Hour), now.Add(24*time.Hour+jitterMax))
 }
+
+// With no chosen time, a time zone (or a weekday) changes nothing: the next
+// scan stays where it was, and the weekday is not stored unused.
+func TestTimezoneWithoutTimeKeepsTheNextScan(t *testing.T) {
+	f := newFixture(t)
+	f.put(t, true, 10080)
+	before := f.row(t).NextDueAt
+	if _, err := f.putTimed(t, true, 10080, &services.ScheduleTiming{Timezone: strp("Asia/Kolkata"), DayOfWeek: intp(3)}); err != nil {
+		t.Fatal(err)
+	}
+	r := f.row(t)
+	if before == nil || r.NextDueAt == nil || !r.NextDueAt.Equal(*before) {
+		t.Fatalf("next scan moved from %v to %v on a time-zone-only change", before, r.NextDueAt)
+	}
+	var dow *int
+	if err := f.db.Raw(`SELECT day_of_week FROM cloud_scan_schedule WHERE connector_id = ?`, f.id).Scan(&dow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if dow != nil {
+		t.Fatalf("day_of_week %d stored without a time of day", *dow)
+	}
+}

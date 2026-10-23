@@ -535,7 +535,12 @@ func (s *AWSScanScheduleService) PutWithTiming(
 				Param: "day_of_week", Msg: "day_of_week is required for a weekly schedule with a chosen time"}
 			return nil
 		}
-		timingChanged := !intPtrEq(curTod, newTod) || !intPtrEq(curDow, newDow) || curTz != newTz
+		if newTod == nil {
+			// A weekday or a time zone means nothing without a chosen time:
+			// the weekday is not kept, and neither moves the next scan.
+			newDow = nil
+		}
+		timingChanged := !intPtrEq(curTod, newTod) || (newTod != nil && (!intPtrEq(curDow, newDow) || curTz != newTz))
 
 		now := s.now()
 		next := &models.CloudScanSchedule{
