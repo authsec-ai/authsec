@@ -218,7 +218,7 @@ func (t DynamoTableTarget) Notes(effect string, access []string) []AccessNote {
 		if read && !all {
 			if !(write && del) {
 				add("return_values_blocked", "Writes that ask for the stored item back are refused too.")
-				add("partiql_writes_blocked", "PartiQL INSERT, UPDATE and DELETE statements are refused too: they can return the stored item.")
+				add("partiql_writes_blocked", "PartiQL statements that insert, update or delete items are refused too: they can return the stored item.")
 			}
 		}
 		if !all && write != del {
