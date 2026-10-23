@@ -621,3 +621,19 @@ func TestAccessPolicyCrossWorkspaceWrites(t *testing.T) {
 		}
 	}
 }
+
+// The list reads at most the newest 1000 policies (status is worked out per
+// policy); past that it says so instead of silently showing part of them.
+func TestAccessPolicyListTruncated(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	p3exec(t, l.db, `INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by, lifecycle)
+		SELECT gen_random_uuid(), ?, 'bulk ' || g, 'time_bound', 'aws', ?, 'active' FROM generate_series(1, 1001) g`, l.ws, l.user)
+	pg, err := l.svc.ListPage(ctx, l.ws, services.AccessListQuery{Limit: 10})
+	if err != nil || !pg.Truncated {
+		t.Fatalf("1001 policies: truncated %v, %v", pg != nil && pg.Truncated, err)
+	}
+	if pg, err = l.svc.ListPage(ctx, l.ws, services.AccessListQuery{Q: "bulk 1000", Limit: 10}); err != nil || pg.Truncated || len(pg.Policies) != 1 {
+		t.Fatalf("a search that narrows it: %+v %v", pg, err)
+	}
+}

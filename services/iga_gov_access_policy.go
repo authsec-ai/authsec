@@ -1197,16 +1197,23 @@ func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, 
 	return out, err
 }
 
-// loadAccessBundles reads the policies, versions and deployments (in the
-// caller's workspace transaction).
-func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
+// accessPolicyQuery is the workspace's live access policies matching q (name
+// or reason).
+func accessPolicyQuery(db *gorm.DB, ws uuid.UUID, q string) *gorm.DB {
 	pq := db.Where("workspace_id = ? AND family = ? AND deleted_at IS NULL", ws, "time_bound")
-	if ids != nil {
-		pq = pq.Where("id IN ?", ids)
-	}
 	if q = strings.TrimSpace(q); q != "" {
 		like := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(q) + "%"
 		pq = pq.Where("(name ILIKE ? OR purpose ILIKE ?)", like, like)
+	}
+	return pq
+}
+
+// loadAccessBundles reads the policies, versions and deployments (in the
+// caller's workspace transaction).
+func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
+	pq := accessPolicyQuery(db, ws, q)
+	if ids != nil {
+		pq = pq.Where("id IN ?", ids)
 	}
 	var pols []models.IGAGovPolicy
 	if err := pq.Order("created_at DESC, id DESC").Limit(accessMaxList).Find(&pols).Error; err != nil {
@@ -1647,15 +1654,33 @@ type AccessListQuery struct {
 	Limit                                                              int
 }
 
+// AccessListPage is one page of the list. Truncated: the workspace has more
+// than accessMaxList policies matching q, and only the newest were read
+// (status is worked out per policy, so the filters run over those).
+type AccessListPage struct {
+	Policies  []AccessPolicyView
+	Next      string
+	Truncated bool
+}
+
 // List is GET / (newest first; filters on status, effect, q, resource and
 // role; an opaque offset cursor).
 func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) ([]AccessPolicyView, string, error) {
+	pg, err := s.ListPage(ctx, ws, q)
+	if err != nil {
+		return nil, "", err
+	}
+	return pg.Policies, pg.Next, nil
+}
+
+// ListPage is List, saying whether the read stopped at accessMaxList.
+func (s *GovAccess) ListPage(ctx context.Context, ws uuid.UUID, q AccessListQuery) (*AccessListPage, error) {
 	if q.Limit <= 0 || q.Limit > MaxGovPage {
 		q.Limit = 50
 	}
 	q.Provider = strings.ToLower(strings.TrimSpace(q.Provider))
 	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure {
-		return nil, "", GovBadParam("provider", "provider is aws or azure.")
+		return nil, GovBadParam("provider", "provider is aws or azure.")
 	}
 	off := 0
 	if q.Cursor != "" {
@@ -1664,16 +1689,26 @@ func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) (
 			off, err = strconv.Atoi(strings.TrimPrefix(string(raw), "o:"))
 		}
 		if err != nil || off < 0 {
-			return nil, "", GovBadParam("cursor", "Malformed cursor.")
+			return nil, GovBadParam("cursor", "Malformed cursor.")
 		}
 	}
 	bs, err := s.bundles(ctx, ws, nil, q.Q)
 	if err != nil {
-		return nil, "", err
+		return nil, err
+	}
+	truncated := false
+	if len(bs) >= accessMaxList {
+		var n int64
+		if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+			return accessPolicyQuery(db, ws, q.Q).Model(&models.IGAGovPolicy{}).Count(&n).Error
+		}); err != nil {
+			return nil, err
+		}
+		truncated = n > accessMaxList
 	}
 	vs, err := s.views(ctx, ws, bs, false)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	effect := strings.ToLower(strings.TrimSpace(q.Effect))
 	filtered := make([]AccessPolicyView, 0, len(vs))
@@ -1711,7 +1746,7 @@ func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) (
 	} else {
 		end = len(filtered)
 	}
-	return filtered[off:end], next, nil
+	return &AccessListPage{Policies: filtered[off:end], Next: next, Truncated: truncated}, nil
 }
 
 // AccessEventView is one history row.
