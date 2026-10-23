@@ -556,3 +556,58 @@ func TestAccessPolicyEndDuringReapply(t *testing.T) {
 		t.Fatalf("still attached after End: %v", got)
 	}
 }
+
+// Another workspace's policy is 404 on every write too (Edit, Pause, Resume,
+// Delete, End), and is left as it was; a preview naming another workspace's
+// role is refused as not found.
+func TestAccessPolicyCrossWorkspaceWrites(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	mine := l.role("ApMineRole")
+	end := time.Now().Add(time.Hour)
+	in := igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+		Roles: []igagov.AccessRole{{IdentityAccountID: mine.String()}}, Access: []string{"read"}, EndsAt: &end}
+
+	other := p3NewGov(t, l.db, "ap-other-writes")
+	pid := uuid.New()
+	p3exec(t, l.db, `INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by, lifecycle) VALUES (?, ?, 'theirs', 'time_bound', 'aws', ?, 'active')`,
+		pid, other.ws, other.author)
+	notFound := func(name string, err error) {
+		t.Helper()
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != 404 {
+			t.Errorf("%s on another workspace's policy: %v, want 404", name, err)
+		}
+	}
+	_, err := l.svc.Edit(ctx, l.ws, l.user, pid, services.AccessPolicyRequest{AccessIntent: in, Name: "mine now", Reason: "x", BaseVersionNo: 1})
+	notFound("edit", err)
+	_, err = l.svc.Pause(ctx, l.ws, l.user, pid, services.AccessReasonRequest{Reason: "x"})
+	notFound("pause", err)
+	_, err = l.svc.Resume(ctx, l.ws, l.user, pid, services.AccessReasonRequest{Reason: "x"})
+	notFound("resume", err)
+	notFound("delete", l.svc.Delete(ctx, l.ws, l.user, pid))
+	var pol models.IGAGovPolicy
+	if err := l.db.Where("id = ?", pid).Take(&pol).Error; err != nil || pol.Name != "theirs" || pol.Lifecycle != "active" || pol.DeletedAt != nil {
+		t.Fatalf("another workspace's policy changed: %+v %v", pol, err)
+	}
+
+	// A role of another workspace in my preview: not found, nothing about it shown.
+	theirRole := uuid.New()
+	p3exec(t, l.db, `INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key, display_name, provider_attrs)
+		VALUES (?, ?, ?, 'aws', ?, 'immutable', ?, 'TheirSecretRole', '{"path":"/"}'::jsonb)`,
+		theirRole, other.ws, models.CloudIdentityIAMRole, "aws\x1fidentity\x1farn:aws:iam::111111111111:role/TheirSecretRole", "AROATHEIRS")
+	in.Roles = []igagov.AccessRole{{IdentityAccountID: theirRole.String()}}
+	pv, err := l.svc.Preview(ctx, l.ws, in)
+	code := previewCode(pv, err)
+	if code == "" || (pv != nil && strings.Contains(pv.Sentence, "TheirSecretRole")) {
+		t.Fatalf("preview with another workspace's role: %q %+v", code, pv)
+	}
+	if _, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{AccessIntent: in, Name: "x", Reason: "x"}); err == nil {
+		t.Fatal("created a policy on another workspace's role")
+	} else {
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != 404 {
+			t.Errorf("create with another workspace's role: %v, want 404", err)
+		}
+	}
+}
