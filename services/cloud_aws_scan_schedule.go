@@ -334,21 +334,32 @@ type ScanScheduleView struct {
 	TimeOfDay *string `json:"time_of_day"`
 	Timezone  string  `json:"timezone"`
 	DayOfWeek *int    `json:"day_of_week"`
-	// SchedulerActive is false when the scheduler loop is not running in this
-	// process (the scan worker is disabled or has no Vault): the settings are
-	// kept but nothing runs on them.
+	// SchedulerActive is false when no scheduler is evidently serving this
+	// schedule: not this process, and the schedule is overdue (no scheduler
+	// anywhere picked it up). Behind a load balancer the process answering may
+	// not run the loop while another does, so the process alone cannot say.
 	SchedulerActive bool `json:"scheduler_active"`
 }
 
+// schedOverdueAfter: a running scheduler serves a due schedule within a tick
+// and a claim lease; one left due longer has no scheduler serving it.
+const schedOverdueAfter = schedTick + schedClaimLease + 9*time.Minute
+
 func scheduleViewOf(s *models.CloudScanSchedule) *ScanScheduleView {
+	return scheduleViewAt(s, time.Now(), SchedulerRunning())
+}
+
+func scheduleViewAt(s *models.CloudScanSchedule, now time.Time, running bool) *ScanScheduleView {
 	v := &ScanScheduleView{
 		IntervalMinutes: models.ScanScheduleDefaultIntervalMinutes,
 		Timezone:        "UTC",
-		SchedulerActive: SchedulerRunning(),
+		SchedulerActive: running,
 	}
 	if s == nil {
 		return v
 	}
+	overdue := s.Enabled && s.PausedReason == "" && s.NextDueAt != nil && now.Sub(*s.NextDueAt) > schedOverdueAfter
+	v.SchedulerActive = running || !overdue
 	if s.Timezone != "" {
 		v.Timezone = s.Timezone
 	}
