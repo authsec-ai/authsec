@@ -521,3 +521,38 @@ func TestAccessPolicyFailedRowIsRemoved(t *testing.T) {
 		t.Fatal("a policy with versions AuthSec did not write was deleted")
 	}
 }
+
+// End during a re-apply: the job notices the row moved and runs again at once
+// to remove the policy, instead of re-scheduling the 10-minute check with the
+// policy just put back on the role.
+func TestAccessPolicyEndDuringReapply(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApEndRace")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "end race", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	arn := l.attachedAuthSec("ApEndRace")[0]
+	var row models.IGAGovTempGrant
+	l.db.Where("workspace_id = ? AND policy_arn = ?", l.ws, arn).Take(&row)
+	l.fake.Detach("ApEndRace", arn)
+	// The admin ends the policy while the re-apply's attach is in flight.
+	l.fake.AfterApply["iam:AttachRolePolicy"] = func(context.Context) error {
+		delete(l.fake.AfterApply, "iam:AttachRolePolicy")
+		_, err := l.svc.End(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "now"})
+		return err
+	}
+	err = l.runRow(services.NewGovR2(l.db), row.ID)
+	if err == nil || !strings.Contains(err.Error(), "state moved") {
+		t.Fatalf("the re-apply after End answered %v; want an immediate rerun", err)
+	}
+	l.run(v.ID)
+	if got := l.attachedAuthSec("ApEndRace"); len(got) != 0 {
+		t.Fatalf("still attached after End: %v", got)
+	}
+}

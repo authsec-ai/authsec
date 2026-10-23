@@ -1150,8 +1150,7 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 	}
 	now := time.Now().UTC()
 	err = h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}).Error; err != nil {
+		if err := h.activeUpdateTx(tx, map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}); err != nil {
 			return err
 		}
 		if drift == "" || drift == prior {
@@ -1168,9 +1167,23 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
 	})
 	if err != nil {
-		return err
+		return h.settled(err)
 	}
 	return PolicyJobRetryLater(r2Wait(due), "active; drift checked every 10 minutes")
+}
+
+// activeUpdateTx updates the row while it is still active; errStateMoved when
+// it is not (End, Pause or an edit moved it during the check), so the job
+// runs again at once for the new state instead of in 10 minutes.
+func (h r2Handler) activeUpdateTx(tx *gorm.DB, set map[string]any) error {
+	res := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).Updates(set)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected != 1 {
+		return errStateMoved
+	}
+	return nil
 }
 
 // reapply puts an access policy back when it was detached or deleted outside
@@ -1180,8 +1193,7 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]any, due time.Time) error {
 	now := time.Now().UTC()
 	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}).Error; err != nil {
+		if err := h.activeUpdateTx(tx, map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}); err != nil {
 			return err
 		}
 		if err := h.event(tx, h.ws, h.kind.EvDrifted, map[string]any{h.kind.IDKey: h.id, "classification": drift, "read": read,
@@ -1190,7 +1202,7 @@ func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]an
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
 	}); err != nil {
-		return err
+		return h.settled(err)
 	}
 	if drift != R2ReasonDetached && drift != R2ReasonDeleted {
 		return h.fail(ctx, models.R2StateActive, drift, "AuthSec cannot re-apply: the policy or the role changed outside AuthSec")
@@ -1208,14 +1220,14 @@ func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]an
 		return PolicyJobRetryLater(out.RetryAfter, "re-apply not complete: "+out.FailDetail)
 	}
 	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"drift": "", "verified_at": now, "last_readback_at": now, "pending_op": "", "pending_op_at": nil,
-				"settle_after": nil, "updated_at": now}).Error; err != nil {
+		// Moved while re-applying (ended, paused): the next run removes it.
+		if err := h.activeUpdateTx(tx, map[string]any{"drift": "", "verified_at": now, "last_readback_at": now, "pending_op": "",
+			"pending_op_at": nil, "settle_after": nil, "updated_at": now}); err != nil {
 			return err
 		}
 		return h.event(tx, h.ws, GovEventAccessReapplied, map[string]any{h.kind.IDKey: h.id, "was": drift, "ops": out.Ops, "readback": out.Readback})
 	}); err != nil {
-		return err
+		return h.settled(err)
 	}
 	return PolicyJobRetryLater(r2Wait(due), "re-applied; drift checked every 10 minutes")
 }
