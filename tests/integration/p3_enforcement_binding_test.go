@@ -194,6 +194,20 @@ func newEnfLab(t *testing.T) *enfLab {
 		t.Fatal(err)
 	}
 	l.svc.WithPolicyGate(l.gateOn)
+	// New bindings get template v2 while R2 is available, as on a server
+	// whose 061 verified (TestP3EnfSessionV1WithoutR2 covers the other case).
+	// R2 reads the process-wide policy gate.
+	r2 := services.NewPolicyR2Gate(true)
+	if err := r2.Verify(db); err != nil {
+		t.Fatalf("R2 gate: %v", err)
+	}
+	prevP, prevR2 := services.PolicyGateState(), services.PolicyR2GateState()
+	services.SetPolicyGate(l.gateOn)
+	services.SetPolicyR2Gate(r2)
+	t.Cleanup(func() {
+		services.SetPolicyR2Gate(prevR2)
+		services.SetPolicyGate(prevP)
+	})
 	l.qc = services.NewAWSQuickCreateService(nil, nil, cfg, enfPrincipal).WithEnforcementHandler(l.svc)
 	l.a = l.newWorkspace(t, "p3-enf-a")
 	return l
@@ -328,6 +342,23 @@ func TestP3EnfSessionIssuesExternalIDAndLink(t *testing.T) {
 // The callback binds the stack to the workspace and account, answers
 // SUCCESS, and the self-test verifies every capability. A duplicate delivery
 // replays SUCCESS without binding again; Delete and Update change nothing.
+// A server where R2 is not available (061 unverified) offers template v1: the
+// customer is not asked for v2's wider IAM rights it cannot use. Since the
+// switch removal (2784c81) v2 was issued regardless.
+func TestP3EnfSessionV1WithoutR2(t *testing.T) {
+	l := newEnfLab(t)
+	prev := services.PolicyR2GateState()
+	services.SetPolicyR2Gate(services.NewPolicyR2Gate(true)) // not verified: unavailable
+	t.Cleanup(func() { services.SetPolicyR2Gate(prev) })
+	sess := l.start(t, l.a)
+	if !strings.Contains(sess.TemplateURL, "/aws/enforcement/"+awsdiscovery.EnforcementTemplateVersion+"/") {
+		t.Fatalf("template %s, want v1 (%s) without R2", sess.TemplateURL, awsdiscovery.EnforcementTemplateVersion)
+	}
+	if sess.TemplateVersion != awsdiscovery.EnforcementTemplateVersion {
+		t.Fatalf("session template %s, want v1", sess.TemplateVersion)
+	}
+}
+
 func TestP3EnfCallbackBindsAndVerifies(t *testing.T) {
 	l := newEnfLab(t)
 	sess := l.start(t, l.a)

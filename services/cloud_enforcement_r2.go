@@ -18,14 +18,20 @@ import (
 // the iga_* files because it reads cloud_enforcement_binding
 // (scripts/ci-iga-isolation-check.sh).
 //
-// DECISION R2-16: new enforcement bindings are offered template v2. An
+// DECISION R2-16: new enforcement bindings are offered template v2 while R2
+// is available (its schema verified: no switch since 2026-10-21); until then
+// the session, Quick Create link and binding view are R1a's, so a customer is
+// never asked for v2's wider IAM rights by a server that cannot use them. An
 // existing v1 binding keeps working for R1a; every R2 feature requires the
 // account's binding to be on v2 with the feature's self-test capabilities ok
 // (RequireEnforcementV2), so a v1 customer re-runs setup to use them.
 
-// EnforcementTemplateVersionForNewBindings is the version new bindings get: v2.
+// EnforcementTemplateVersionForNewBindings is v2 while R2 is available, else v1.
 func EnforcementTemplateVersionForNewBindings() string {
-	return awsdiscovery.EnforcementTemplateVersionV2
+	if PolicyR2On() {
+		return awsdiscovery.EnforcementTemplateVersionV2
+	}
+	return awsdiscovery.EnforcementTemplateVersion
 }
 
 // KnownEnforcementTemplateVersionNow is a version a callback or a manual bind
