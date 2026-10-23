@@ -132,7 +132,7 @@ func count(t *testing.T, db *gorm.DB, q string, args ...any) int {
 func TestIngestClosesABindingThatDisappeared(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 
 	first, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true))
 	if err != nil {
@@ -186,7 +186,7 @@ func TestIngestClosesABindingThatDisappeared(t *testing.T) {
 func TestIngestIncompleteSweepClosesNothing(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first ingest: %v", err)
@@ -223,7 +223,7 @@ func TestIngestIncompleteSweepClosesNothing(t *testing.T) {
 func TestIngestIsIdempotent(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 
 	snap := snapshot(ws, src, true, true, true)
 	if _, err := mgr.Ingest(ws, snap); err != nil {
@@ -252,7 +252,7 @@ func TestIngestIsIdempotent(t *testing.T) {
 func TestIngestIsReadableBack(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -333,7 +333,7 @@ func TestIngestIsReadableBack(t *testing.T) {
 func TestReadReportsAPartialSweepHonestly(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 
 	// Complete, but namespaced only.
 	snap := snapshot(ws, src, true, true, false)
@@ -382,7 +382,7 @@ func TestWorkloadsLinkToTheirIdentities(t *testing.T) {
 	ws, src := seedWorkspace(t, db)
 	seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
 
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	res, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true))
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -418,7 +418,7 @@ func TestWorkloadWithABareNameIsNotGuessed(t *testing.T) {
 	ws, src := seedWorkspace(t, db)
 	seedAgent(t, db, ws, "research", "running") // bare, not an anchor
 
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	res, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true))
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -438,7 +438,7 @@ func TestGoneWorkloadIsRetired(t *testing.T) {
 	ws, src := seedWorkspace(t, db)
 	fp := seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
 
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestWorkloadReadsBackWithItsAccess(t *testing.T) {
 	ws, src := seedWorkspace(t, db)
 	seedAgent(t, db, ws, "system:serviceaccount:iga-demo:research", "running")
 
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -557,7 +557,7 @@ func TestSameNameWorkloadsStayTwoRows(t *testing.T) {
 	seedSighting(t, db, ws, "fp-one", "research-agent", "Deployment", researchAnchor)
 	seedSighting(t, db, ws, "fp-two", "research-agent", "Deployment", researchAnchor)
 
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestSameNameWorkloadsStayTwoRows(t *testing.T) {
 func TestLegacyKeyedWorkloadIsRekeyedInPlace(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	// A first sweep with no agents, so the ServiceAccount exists to point at.
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
@@ -663,7 +663,7 @@ func TestVanishedWorkloadRetiresOnACompleteSweep(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	seedSighting(t, db, ws, "fp-v", "research-agent", "Deployment", researchAnchor)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -694,7 +694,7 @@ func TestVanishedWorkloadIsOnlyStaleOnAnIncompleteSweep(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	seedSighting(t, db, ws, "fp-v", "research-agent", "Deployment", researchAnchor)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -720,7 +720,7 @@ func TestGoneWorkloadSupportEnds(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	seedSighting(t, db, ws, "fp-g", "research-agent", "", researchAnchor)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -749,7 +749,7 @@ func TestRuntimeKindComesFromTheSighting(t *testing.T) {
 	ws, src := seedWorkspace(t, db)
 	seedSighting(t, db, ws, "fp-s", "store", "StatefulSet", researchAnchor)
 	seedSighting(t, db, ws, "fp-n", "nokind", "", researchAnchor)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -788,7 +788,7 @@ func TestExecutesAsFollowsAChangedServiceAccount(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	seedSighting(t, db, ws, "fp-m", "mover", "Deployment", researchAnchor)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	snap := func() models.K8sRBACSnapshot {
 		s := snapshot(ws, src, true, true, true)
 		s.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -852,7 +852,7 @@ func TestPreSupportWorkloadsAreAdoptedByTheirOwnCluster(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -868,7 +868,7 @@ func TestPreSupportWorkloadsAreAdoptedByTheirOwnCluster(t *testing.T) {
 func TestStatementsLinkToTheirRole(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snapshot(ws, src, true, true, true)); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -894,7 +894,7 @@ func TestInventoryScopeKeysAreWritten(t *testing.T) {
 	snap := snapshot(ws, src, true, true, true)
 	snap.Bindings[0].Subjects = append(snap.Bindings[0].Subjects,
 		models.K8sSubject{Kind: models.K8sSubjectGroup, Name: "admins"})
-	mgr := services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	mgr := services.NewK8sRBACManager(db, verifiedGraphGate(db))
 	if _, err := mgr.Ingest(ws, snap); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -922,4 +922,15 @@ func TestInventoryScopeKeysAreWritten(t *testing.T) {
 			t.Errorf("%s: scope keys missing or wrong, or existing key %q lost", c.what, c.keep)
 		}
 	}
+}
+
+// verifiedGraphGate is the graph gate as main installs it once the graph schema
+// verifies: projectors write the graph only then, so a test that expects
+// projection verifies it against its own database first.
+func verifiedGraphGate(db *gorm.DB) *services.GraphProjectionGate {
+	g := services.NewGraphProjectionGate(true, "")
+	if err := g.Verify(db); err != nil {
+		panic("the graph schema did not verify on the test database: " + err.Error())
+	}
+	return g
 }

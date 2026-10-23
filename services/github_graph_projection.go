@@ -38,8 +38,8 @@ nothing here writes.
 type GitHubGraphProjector struct {
 	db *gorm.DB
 	// gate nil means the process-wide gate, read when a projection runs rather
-	// than when the projector is built -- a worker started before main sets the
-	// switch must still see it.
+	// than when the projector is built -- a worker started before main installs
+	// the gate, or before the schema verifies, must still see it.
 	gate *GraphProjectionGate
 	now  func() time.Time
 }
@@ -54,7 +54,7 @@ func (p *GitHubGraphProjector) enabled() bool {
 	if g == nil {
 		g = GraphProjection()
 	}
-	return g.Enabled()
+	return g.PipelineMode()
 }
 
 // GitHubGraphResult reports one IGA-scan projection.

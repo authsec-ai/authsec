@@ -186,8 +186,8 @@ func RegisterIGAPolicyRoutes(g gin.IRoutes, ctl *IGAGovPolicyController, require
 }
 
 // Gate is the policy middleware: 503 policy_unavailable, with the gate's
-// reason, unless the gate is on (switch on, graph on and verified, Phase 3
-// schema verified). Fail closed: a nil gate is off.
+// reason, unless the gate is on (graph schema verified, Phase 3 schema
+// verified). Fail closed: a nil gate is off.
 func (ctl *IGAGovPolicyController) Gate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var gate *services.PolicyGate

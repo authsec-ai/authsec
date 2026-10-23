@@ -223,11 +223,11 @@ func (m *k8sRBACManager) Ingest(workspaceID uuid.UUID,
 		ClusterScoped: snap.ClusterScoped,
 	}
 
-	// The projection gate is the same switch the AWS pipeline uses. With it off
-	// the snapshot is accepted and acknowledged but nothing is written — so an
-	// agent enabled ahead of the control plane does not accumulate errors, and
-	// turning the gate on later back-fills from the next sweep.
-	if m.gate == nil || !m.gate.Enabled() {
+	// The projection gate is the one the AWS pipeline uses. Until the graph
+	// schema verifies the snapshot is accepted and acknowledged but nothing is
+	// written -- so an agent running ahead of the control plane's migrations
+	// does not accumulate errors, and the next sweep after they verify fills it.
+	if !m.gate.PipelineMode() {
 		res.Accepted = false
 		return res, nil
 	}
@@ -1382,7 +1382,7 @@ func (m *k8sRBACManager) loadSightingsWhere(tx *gorm.DB, workspaceID uuid.UUID,
 // the ServiceAccount it runs as (idsForKeys) -- never every Kubernetes
 // identity of the workspace.
 func (m *k8sRBACManager) ProjectSighting(workspaceID uuid.UUID, fingerprint string) error {
-	if m.gate == nil || !m.gate.Enabled() || strings.TrimSpace(fingerprint) == "" {
+	if !m.gate.PipelineMode() || strings.TrimSpace(fingerprint) == "" {
 		return nil
 	}
 

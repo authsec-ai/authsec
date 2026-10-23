@@ -650,16 +650,25 @@ queued a job nobody would ever claim, and no scan could run there again. The
 pipeline is now always on; what decides whether it runs is a schema check made
 at startup:
 
-| Graph schema | Scan worker | Projector |
+| Graph schema | AWS scan worker | Projectors (AWS, Azure, Kubernetes, GitHub) |
 |---|---|---|
-| Verified (head ≥ `036`) | Barrier, job enqueue, hand-off | Started; runs `RecoverStalled` |
-| Not verified | Claims nothing | Not started |
+| Verified (head ≥ `036`) | Barrier, job enqueue, hand-off | Write the graph; AWS's runs `RecoverStalled` |
+| Absent: the catalog was read and `iga_pipeline_lease` (`027`) is not there | Scans without the graph: no barrier, no job (the old switch-off path) | Write nothing |
+| Partial (the barrier table exists, the rest does not verify), or the check errored | Claims nothing | Write nothing |
 
-With the schema verification **failing or erroring**, both components **fail
-closed**: the worker does not claim scans and the projector does not start, and
+**Absent** is a positive answer, so no process on that database can be
+projecting and a scan without the barrier overwrites nothing a projection
+reads: AWS keeps scanning on a database that has not reached the graph
+migrations (`SKIP_MIGRATIONS=true`, or one migrated by something else; a
+failed migration stops the process at boot). Before each claim that would skip
+the barrier the worker reads the schema again, so a migration applied
+meanwhile moves it to the pipeline. **Partial** fails closed: a process on
+another schema version may be projecting, and scanning without the barrier
+could overwrite what it reads. A transient database error during verification
+is retried, never cached as an answer. In every unverified state
 `/api/iga/v1/capabilities` reports `graph_projection: "misconfigured"` with the
-reason. A transient database error during verification is retried, never
-cached as an answer. There is no configuration switch.
+reason, which says when AWS scans run without the graph. There is no
+configuration switch.
 
 ### 2.9 Every provenance reference is workspace-qualified
 

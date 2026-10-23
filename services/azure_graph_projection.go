@@ -29,8 +29,8 @@ import (
 
 // projectGraph projects every finished pass of one discovery run.
 func (s *AzureOnboardingService) projectGraph(ctx context.Context, workspaceID uuid.UUID, tenantID string, tenantPass *azurePassResult, subPasses []*azurePassResult) {
-	gate := GraphProjection()
-	if gate == nil || !gate.Enabled() {
+	// Only on a verified graph schema; until then the scan stands without a projection.
+	if !GraphProjection().PipelineMode() {
 		return
 	}
 	var passes []azuregraph.Pass

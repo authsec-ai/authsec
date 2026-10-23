@@ -677,7 +677,7 @@ func (ctl *CloudAzureController) GraphSummary(c *gin.Context) {
 	gate := services.GraphProjection()
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
-		"meta": gin.H{"as_of": time.Now().UTC(), "projection_enabled": gate != nil && gate.Enabled()},
+		"meta": gin.H{"as_of": time.Now().UTC(), "projection_enabled": gate.PipelineMode()},
 	})
 }
 

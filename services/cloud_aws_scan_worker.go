@@ -61,9 +61,9 @@ type AWSScanWorker struct {
 	// gate is the graph pipeline (§2.8), and the ONLY thing that decides
 	// whether this worker uses the barrier and enqueues projection jobs:
 	//
-	//	off                 Phase 1 exactly: no barrier, no job, no Phase 2 SQL
-	//	on, not verified    claims nothing (fail closed)
-	//	on, verified        barrier + job enqueue + hand-off to the job
+	//	off, or graph schema absent   Phase 1 exactly: no barrier, no job, no Phase 2 SQL
+	//	partial or unreadable schema  claims nothing (fail closed)
+	//	verified                      barrier + job enqueue + hand-off to the job
 	gate *GraphProjectionGate
 
 	// The Phase 2 pipeline (§2.10A). jobs enqueues the projection work inside
@@ -171,10 +171,18 @@ func (w *AWSScanWorker) Run(ctx context.Context) {
 // polling loop.
 func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	gate := w.projectionGate()
+	// Read the schema again before a claim that would skip the barrier (the
+	// graph schema absent), so a migration applied since the last check moves
+	// this worker to the pipeline rather than letting it scan beside a new
+	// projector. A gate that is failing closed is left to its own retry.
+	if gate.Enabled() && gate.ClaimAllowed() && !gate.PipelineMode() {
+		_ = gate.Verify(w.db)
+	}
 	if !gate.ClaimAllowed() {
-		// FAIL CLOSED (§2.8). The switch is on and the schema is not verified.
-		// Falling back to Phase 1 here would scan without the barrier while a
-		// projector elsewhere may run, which is the overwrite it prevents.
+		// FAIL CLOSED (§2.8). The barrier table exists but the schema does not
+		// verify (or could not be read): a process on another schema version
+		// may be projecting, and scanning without the barrier would overwrite
+		// what it reads. /capabilities and the gate's log say why.
 		return false, nil
 	}
 	pipeline := gate.PipelineMode()

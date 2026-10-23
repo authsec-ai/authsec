@@ -22,7 +22,7 @@ import (
 //
 // Everything here is pure: the trail reads, the aggregated events, the grant
 // history and every time are inputs. Everything is behind R1b:
-// with it off Snapshot.ActionLevel is false and nothing in this file runs.
+// until it is available Snapshot.ActionLevel is false and nothing in this file runs.
 
 // ActionCatalogVersion versions the event→action map and the data-event
 // catalog below (§12.1 "a versioned event→action map with unknown kept as

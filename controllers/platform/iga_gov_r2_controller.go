@@ -15,8 +15,8 @@ import (
 // mutation writes its iga_gov_event in the service transaction and an
 // audit_events row here (govMutation).
 //
-// DECISION R2-21: the routes are MOUNTED only while R2 is switched
-// on at startup (the route table is then exactly R1a's with it off, so the
+// DECISION R2-21: the routes are MOUNTED only while the R2 gate is on at
+// startup (the route table is then exactly R1a's without it, so the
 // R1a audit walker and route tests see no change), and each answers 422
 // policy_r2_unavailable while the R2 gate is not on (schema 061 unverified,
 // or policy unavailable). Permissions: requesting a grant

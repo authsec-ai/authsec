@@ -96,29 +96,40 @@ func VerifyGraphSchema(db *gorm.DB) error {
 }
 
 // GraphProjectionGate carries whether the graph schema has been verified.
+// There is no switch: main installs it on, and the schema decides.
 //
-//	verified   scan worker            projector
-//	no         claims NOTHING         not started
-//	yes        barrier + job enqueue  started
+//	schema                          AWS scan worker         projectors
+//	verified                        barrier + job enqueue   write the graph
+//	absent (no iga_pipeline_lease)  scans without the graph write nothing
+//	partial, or not readable        claims NOTHING          write nothing
 //
-// FAIL CLOSED. Until verification succeeds the worker must not fall back to
-// scanning without the barrier: that would scan while a projector elsewhere
-// might run, which is the overwrite the barrier exists to prevent. It claims
-// nothing, and /capabilities says why. A gate built "off" (the zero process
-// default before main installs one, and some tests) is the pre-pipeline path.
+// Absent is a positive answer -- the catalog was read and the barrier table
+// is not there -- so no process on this database can be projecting, and a
+// scan without the barrier overwrites nothing a projection reads: AWS keeps
+// scanning on a database that has not reached the graph migrations (the
+// behaviour the removed IGA_GRAPH_PROJECTION=off gave). Anything else FAILS
+// CLOSED: with the barrier table present but the schema not verified, a
+// process on another schema version may be projecting, and a database error
+// is never an answer (B14). /capabilities says why in every case. A gate
+// built "off" (the zero process default before main installs one, and some
+// tests) is the pre-pipeline path.
 type GraphProjectionGate struct {
 	enabled bool
-	// broken: built misconfigured (a fixed reason); it never verifies.
+	// broken: built misconfigured with a fixed reason (tests); it never verifies.
 	broken bool
 
-	mu         sync.RWMutex
-	verified   bool
+	mu       sync.RWMutex
+	verified bool
+	// absent: the last verification read the catalog and found no barrier
+	// table, so no graph can exist on this database yet.
+	absent     bool
 	reason     string
 	schemaHead string
 }
 
-// NewGraphProjectionGate builds a gate. enabled=false is Phase 1; reason, when
-// non-empty, starts the gate misconfigured (an unrecognised switch value).
+// NewGraphProjectionGate builds a gate. main builds it on with no reason
+// (DefaultGraphProjectionGate). enabled=false is the pre-pipeline path, and a
+// non-empty reason starts it misconfigured for good; both exist for tests.
 func NewGraphProjectionGate(enabled bool, reason string) *GraphProjectionGate {
 	g := &GraphProjectionGate{enabled: enabled}
 	if reason != "" {
@@ -138,8 +149,9 @@ func DefaultGraphProjectionGate() *GraphProjectionGate {
 // Enabled reports whether the gate is on (verified or not).
 func (g *GraphProjectionGate) Enabled() bool { return g != nil && g.enabled }
 
-// PipelineMode reports whether the worker should use the barrier and enqueue
-// projection jobs: on AND verified.
+// PipelineMode reports whether the graph schema is verified: the AWS worker
+// uses the barrier and enqueues projection jobs, and every projector (AWS,
+// Azure, Kubernetes, GitHub) writes the graph. On AND verified.
 func (g *GraphProjectionGate) PipelineMode() bool {
 	if g == nil || !g.enabled {
 		return false
@@ -149,10 +161,16 @@ func (g *GraphProjectionGate) PipelineMode() bool {
 	return g.verified
 }
 
-// ClaimAllowed reports whether the worker may claim scans at all: always when
-// off (Phase 1), only once verified when on.
+// ClaimAllowed reports whether the worker may claim scans at all: when off
+// (Phase 1), when verified (pipeline), and when the graph schema is absent
+// (scans without the graph). Never on a partial or unreadable schema.
 func (g *GraphProjectionGate) ClaimAllowed() bool {
-	return g == nil || !g.enabled || g.PipelineMode()
+	if g == nil || !g.enabled {
+		return true
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.verified || g.absent
 }
 
 // Status is what /capabilities reports.
@@ -184,16 +202,28 @@ func (g *GraphProjectionGate) Verify(db *gorm.DB) error {
 		return fmt.Errorf("%s", preset) // a gate built misconfigured never verifies
 	}
 	err := VerifyGraphSchema(db)
+	absent := false
+	if err != nil {
+		// Only a successful catalog read that finds no barrier table is
+		// "absent"; an error reading it is not an answer.
+		if ok, herr := repositories.HasRelation(db, "iga_pipeline_lease"); herr == nil && !ok {
+			absent = true
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err != nil {
+		g.absent = absent
 		g.reason = err.Error()
+		if absent {
+			g.reason += "; AWS scans run without the graph until the graph migrations are applied"
+		}
 		if head, herr := repositories.MigrationHead(db); herr == nil && head > 0 {
 			g.schemaHead = fmt.Sprintf("%03d", head)
 		}
 		return err
 	}
-	g.verified, g.reason, g.schemaHead = true, "", GraphSchemaHead
+	g.verified, g.absent, g.reason, g.schemaHead = true, false, "", GraphSchemaHead
 	return nil
 }
 

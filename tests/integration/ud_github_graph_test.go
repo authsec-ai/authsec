@@ -79,7 +79,15 @@ func ghGraphFixture() *services.FixtureProvider {
 	}
 }
 
-func ghGateOn() *services.GraphProjectionGate  { return services.NewGraphProjectionGate(true, "") }
+// ghGateOn is the graph gate verified against db, as main installs it once the
+// schema verifies: the GitHub projector writes only then.
+func ghGateOn(db *gorm.DB) *services.GraphProjectionGate {
+	g := services.NewGraphProjectionGate(true, "")
+	if err := g.Verify(db); err != nil {
+		panic("the graph schema did not verify on the test database: " + err.Error())
+	}
+	return g
+}
 func ghGateOff() *services.GraphProjectionGate { return services.NewGraphProjectionGate(false, "") }
 
 func ghManager(db *gorm.DB, fx services.IGAProvider, gate *services.GraphProjectionGate, installs ...string) services.IGAManager {
@@ -215,7 +223,7 @@ func ghEdges(t *testing.T, db *gorm.DB, ws uuid.UUID) []ghEdge {
 func TestUDGitHubScanProjectsEachKindOnce(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "ud-gh-once")
-	mgr := ghManager(db, ghGraphFixture(), ghGateOn(), "inst-gh")
+	mgr := ghManager(db, ghGraphFixture(), ghGateOn(db), "inst-gh")
 	integ := verifiedIntegration(t, mgr, ws, "inst-gh")
 
 	legacyBefore := countRows(db, `SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND source_key = ''`, ws)
@@ -394,7 +402,7 @@ func TestUDGitHubDroppedRepositoryRetires(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "ud-gh-drop")
 	fx := ghGraphFixture()
-	mgr := ghManager(db, fx, ghGateOn(), "inst-gh-drop")
+	mgr := ghManager(db, fx, ghGateOn(db), "inst-gh-drop")
 	integ := verifiedIntegration(t, mgr, ws, "inst-gh-drop")
 	ghScan(t, mgr, ws, integ.ID)
 
@@ -486,7 +494,7 @@ func TestUDGitHubPartialScanOnlyStales(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "ud-gh-partial")
 	fx := ghGraphFixture()
-	mgr := ghManager(db, fx, ghGateOn(), "inst-gh-partial")
+	mgr := ghManager(db, fx, ghGateOn(db), "inst-gh-partial")
 	integ := verifiedIntegration(t, mgr, ws, "inst-gh-partial")
 	run1, _ := ghScan(t, mgr, ws, integ.ID)
 
@@ -535,7 +543,7 @@ func TestUDGitHubPartialScanOnlyStales(t *testing.T) {
 
 	// A scan that fails outright stales everything still current; it ends
 	// nothing.
-	failing := ghManager(db, failingListing{fx}, ghGateOn(), "inst-gh-partial")
+	failing := ghManager(db, failingListing{fx}, ghGateOn(db), "inst-gh-partial")
 	run3, err := failing.StartScan(ws, integ.ID, models.ScanModeFull, "tester")
 	if err != nil {
 		t.Fatalf("start failing scan: %v", err)
@@ -648,7 +656,7 @@ func TestUDGitHubLegacyListsUnchanged(t *testing.T) {
 	db := igaDB(t)
 	on := newWorkspace(t, db, "ud-gh-legacy-on")
 	off := newWorkspace(t, db, "ud-gh-legacy-off")
-	mgrOn := ghManager(db, ghGraphFixture(), ghGateOn(), "inst-gh-legacy-on", "inst-gh-legacy-off")
+	mgrOn := ghManager(db, ghGraphFixture(), ghGateOn(db), "inst-gh-legacy-on", "inst-gh-legacy-off")
 	mgrOff := ghManager(db, ghGraphFixture(), ghGateOff(), "inst-gh-legacy-on", "inst-gh-legacy-off")
 	integOn := verifiedIntegration(t, mgrOn, on, "inst-gh-legacy-on")
 	integOff := verifiedIntegration(t, mgrOff, off, "inst-gh-legacy-off")
@@ -718,7 +726,7 @@ func TestUDGitHubRepoScanDeclaredAgents(t *testing.T) {
 		"repositories":    map[string]interface{}{"mode": "all"},
 	})
 	worker := services.NewDiscoveryScanWorkerWithScanner(db,
-		services.NewGitHubRepoScannerWithProvider(db, fx)).WithGraphProjection(ghGateOn())
+		services.NewGitHubRepoScannerWithProvider(db, fx)).WithGraphProjection(ghGateOn(db))
 	scan := func() *models.DiscoveryScanRun {
 		t.Helper()
 		run, err := services.EnqueueGitHubScan(db, ws, srcID, "alice")

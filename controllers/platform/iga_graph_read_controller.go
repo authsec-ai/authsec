@@ -98,7 +98,7 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 
 // graphFeatures is what THIS build serves NOW (§5.3 /capabilities). A feature
 // is true only when its routes are implemented AND graph_projection is on
-// (D-11): with the switch off or misconfigured every graph route answers 503,
+// (D-11): while the graph schema is not verified every graph route answers 503,
 // so nothing is usable. The console hides a feature it is told is
 // unavailable, and a feature reported available with no route behind it would
 // render as empty rather than as unavailable -- which §2.14.7 forbids. And only
@@ -123,9 +123,9 @@ func graphFeatures(on bool) gin.H {
 // deployment supports. Any authenticated caller; no permission beyond a token.
 //
 // graph_projection is on | off | misconfigured, with the reason when it is
-// not on. "misconfigured" is the fail-closed state (§2.8): the switch is on and
-// schema verification failed or errored, so the scan worker claims nothing and
-// the projector is not running.
+// not on. "misconfigured" is every unverified state (§2.8): the graph schema is
+// absent (AWS scans run without the graph), partial or unreadable (the scan
+// worker claims nothing); in each, no projector writes. The reason says which.
 func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 	// D-82: live state, never pinned -- a rev (or any parameter: the route
 	// takes none) is 400, as on /pipeline, rather than silently ignored.

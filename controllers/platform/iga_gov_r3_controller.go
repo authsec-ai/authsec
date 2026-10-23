@@ -31,7 +31,7 @@ import (
 // subject, the human its signed user_id (DECISION R3-3).
 //
 // DECISION R3-17 (mounting): like R2-21, both route sets are MOUNTED only
-// while R3 is available at startup, so with it off the route
+// while R3 is available at startup, so without it the route
 // table is exactly R2's (the R1a audit walker and route tests see no
 // change). Mounted but not available (schema 062 unverified, or policy
 // unavailable), management routes answer 422 policy_r3_unavailable and

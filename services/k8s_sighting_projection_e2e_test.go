@@ -24,7 +24,10 @@ import (
 )
 
 func sightingMgr(db *gorm.DB, on bool) services.K8sRBACManager {
-	return services.NewK8sRBACManager(db, services.NewGraphProjectionGate(on, ""))
+	if !on {
+		return services.NewK8sRBACManager(db, services.NewGraphProjectionGate(false, ""))
+	}
+	return services.NewK8sRBACManager(db, verifiedGraphGate(db))
 }
 
 // A sighting projected before any snapshot is a live workload with the sweep's
@@ -126,7 +129,7 @@ func TestSightingNeverRetiresAWorkloadOnItsOwn(t *testing.T) {
 func TestReportedSightingAndDeletionReachTheGraphAtOnce(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 
 	_, _, err := disco.ReportSighting(ws, "test", services.SightingInput{

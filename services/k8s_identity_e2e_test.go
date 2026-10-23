@@ -180,7 +180,7 @@ func TestIdentHeartbeatKeepsTheFirstClusterUID(t *testing.T) {
 func TestIdentHeartbeatUIDGovernsSnapshots(t *testing.T) {
 	db := ingestDB(t)
 	ws, _ := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	src := heartbeat(t, db, ws, "prod-west", "uid-first")
 	heartbeat(t, db, ws, "prod-west", "uid-second") // must not re-bind
 
@@ -319,7 +319,7 @@ func TestIdentAnotherSourcesWorkloadIsNotAdopted(t *testing.T) {
 func TestIdentConcurrentSweepsOneWinsOneConflicts(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	r := snapshotRouter(db)
 
 	blocker := db.Begin()
@@ -683,7 +683,7 @@ func TestIdentSightingFromAnotherClusterUIDIsNotProjected(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
 	setRecordedUID(t, db, src, "uid-a")
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	t.Setenv(services.RequireClusterUIDEnv, "false")
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
@@ -867,11 +867,11 @@ func TestIdentLargeSweepResolvesEveryWorkload(t *testing.T) {
 	}
 }
 
-// useGraphGateOn installs an on graph gate for the test, as main does at
-// startup, and restores the previous one after.
-func useGraphGateOn(t *testing.T) {
+// useGraphGateOn installs a verified graph gate for the test, as main does at
+// startup once the schema verifies, and restores the previous one after.
+func useGraphGateOn(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	prev := services.GraphProjection()
-	services.SetGraphProjection(services.NewGraphProjectionGate(true, ""))
+	services.SetGraphProjection(verifiedGraphGate(db))
 	t.Cleanup(func() { services.SetGraphProjection(prev) })
 }

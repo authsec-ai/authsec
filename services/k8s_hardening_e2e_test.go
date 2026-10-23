@@ -47,7 +47,7 @@ import (
 )
 
 func hardeningMgr(db *gorm.DB) services.K8sRBACManager {
-	return services.NewK8sRBACManager(db, services.NewGraphProjectionGate(true, ""))
+	return services.NewK8sRBACManager(db, verifiedGraphGate(db))
 }
 
 // seedSource adds a discovery source for a cluster to an existing workspace.
@@ -287,7 +287,7 @@ func TestHardeningSameNameDifferentClusterIsRejected(t *testing.T) {
 func TestHardeningClusterUIDMismatchIs409(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	if err := db.Exec(`UPDATE discovery_sources SET cluster_uid = 'uid-recorded' WHERE id = ?`, src).Error; err != nil {
 		t.Fatalf("seed uid: %v", err)
 	}
@@ -679,7 +679,7 @@ func agentRuntime(t *testing.T, db *gorm.DB, ws uuid.UUID, fp string) string {
 func TestHardeningStoppedSightingKeepsTheWorkload(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
 
@@ -756,7 +756,7 @@ func TestHardeningSightingRuntimeStatusIsValidated(t *testing.T) {
 func TestHardeningManifestStoppedFingerprintsAreNotGone(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
 	for _, fp := range []string{"fp-run", "fp-stop", "fp-only-stopped", "fp-gone"} {
@@ -818,7 +818,7 @@ func TestHardeningManifestStoppedFingerprintsAreNotGone(t *testing.T) {
 func TestHardeningPodTerminatedLeavesTheCronJob(t *testing.T) {
 	db := ingestDB(t)
 	ws, src := seedWorkspace(t, db)
-	useGraphGateOn(t)
+	useGraphGateOn(t, db)
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(db))
 	now := time.Now().UTC()
 	if _, _, err := disco.ReportSighting(ws, "test", k8sSightingInput(src, "fp-cron", "CronJob", "", now)); err != nil {

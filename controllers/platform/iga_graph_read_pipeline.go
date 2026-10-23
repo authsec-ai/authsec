@@ -14,7 +14,7 @@ import (
 // §2.14.13; T2.3; D-55..D-59, D-72, D-82, D-92).
 //
 // Both run behind serve(): 503 graph_unavailable while the graph pipeline is
-// off or misconfigured (D-10, D-11) -- with the switch off there is no barrier,
+// off or misconfigured (D-10, D-11) -- without a verified schema there is no barrier,
 // no job and no publication, so every account would sit in "first publication
 // pending" forever, which is a lie the Unavailable state does not tell. Both
 // read inside ONE §5.1 snapshot, so the barrier, the runs and the revision they

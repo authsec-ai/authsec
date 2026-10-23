@@ -1,13 +1,16 @@
 package igagraph_test
 
-// The IGA_GRAPH_PROJECTION switch and its schema verification (SPEC §2.8,
-// T1.1, B13/B14). The switch replaces the graph branch's table probing, which
-// cached a transient database error as "absent" for the life of the process
-// and so silently disabled the barrier.
+// The graph gate and its schema verification (SPEC §2.8, T1.1, B13/B14).
+// There is no switch: main installs the gate on, and the schema decides. It
+// replaces the graph branch's table probing, which cached a transient database
+// error as "absent" for the life of the process and so silently disabled the
+// barrier.
 //
-//	off                 Phase 1 exactly; claims allowed; no pipeline
-//	on, not verified    FAIL CLOSED: no claims; /capabilities misconfigured
-//	on, verified        pipeline mode
+//	off (tests)                  Phase 1 exactly; claims allowed; no pipeline
+//	graph schema absent          claims allowed in Phase 1 (no barrier table:
+//	                             nothing can be projecting); /capabilities says so
+//	partial, or a database error FAIL CLOSED: no claims; /capabilities misconfigured
+//	verified                     pipeline mode
 //
 // S0_DSN is a database at 026; S1_DSN one at 036.
 
@@ -36,33 +39,35 @@ func openAt(t *testing.T, env string) *gorm.DB {
 	return db
 }
 
-// Switch ON against a 026 schema: verification fails, the gate FAILS CLOSED,
-// and the reason names what is missing.
-func TestGraphSwitchFailsClosedBelow036(t *testing.T) {
+// The gate against a 026 schema, before the graph's first migration (027, the
+// barrier table): verification fails and names what is missing, there is no
+// pipeline, and AWS scans still run -- in Phase 1, since with no barrier table
+// no process can be projecting. The removed switch's "off" gave the same.
+func TestGraphGateScansWithoutGraphBelow027(t *testing.T) {
 	db := openAt(t, "S0_DSN")
 	gate := services.NewGraphProjectionGate(true, "")
 	err := gate.Verify(db)
 	if err == nil {
-		t.Fatal("the switch verified against a 026 schema")
+		t.Fatal("the gate verified against a 026 schema")
 	}
 	mode, reason, _ := gate.Status()
 	if mode != services.GraphProjectionMisconfigured {
 		t.Errorf("mode = %q, want misconfigured", mode)
 	}
-	if !strings.Contains(reason, "iga_policy") || !strings.Contains(reason, "036") {
-		t.Errorf("the reason must name the missing relations and the head it needs, got %q", reason)
+	if !strings.Contains(reason, "iga_policy") || !strings.Contains(reason, "036") || !strings.Contains(reason, "without the graph") {
+		t.Errorf("the reason must name the missing relations, the head it needs and that scans run without the graph, got %q", reason)
 	}
-	if gate.ClaimAllowed() {
-		t.Fatal("an unverified ON switch allowed scan claims; it must fail closed")
+	if !gate.ClaimAllowed() {
+		t.Fatal("AWS scans stopped on a database without the graph schema; they must run in Phase 1")
 	}
 	if gate.PipelineMode() {
-		t.Fatal("an unverified switch reported pipeline mode")
+		t.Fatal("an unverified gate reported pipeline mode")
 	}
-	t.Logf("fail-closed reason: %s", reason)
+	t.Logf("reason: %s", reason)
 }
 
-// Switch ON against 036: verified, pipeline mode, claims allowed.
-func TestGraphSwitchVerifiesAt036(t *testing.T) {
+// The gate against 036: verified, pipeline mode, claims allowed.
+func TestGraphGateVerifiesAt036(t *testing.T) {
 	db := openAt(t, "S1_DSN")
 	gate := services.NewGraphProjectionGate(true, "")
 	if err := gate.Verify(db); err != nil {
@@ -73,13 +78,13 @@ func TestGraphSwitchVerifiesAt036(t *testing.T) {
 		t.Fatalf("status = (%q, %q, %q), want (on, '', %s)", mode, reason, head, services.GraphSchemaHead)
 	}
 	if !gate.ClaimAllowed() || !gate.PipelineMode() {
-		t.Fatal("a verified switch must allow claims in pipeline mode")
+		t.Fatal("a verified gate must allow claims in pipeline mode")
 	}
 }
 
 // B14: a transient error is RETRIED, never cached as an answer. The graph
 // branch's sync.Once turned one failed probe into "tables absent" forever.
-func TestGraphSwitchTransientErrorIsNotCached(t *testing.T) {
+func TestGraphGateTransientErrorIsNotCached(t *testing.T) {
 	good := openAt(t, "S1_DSN")
 	// A connection that fails every query: the transient database error a
 	// startup check can meet. (GORM pings at open, so an unreachable host
@@ -105,8 +110,9 @@ func TestGraphSwitchTransientErrorIsNotCached(t *testing.T) {
 	}
 }
 
-// Off is Phase 1: claims allowed, no pipeline, whatever the schema.
-func TestGraphSwitchOffIsPhaseOne(t *testing.T) {
+// Off (the process default before main installs the gate, and tests) is
+// Phase 1: claims allowed, no pipeline, whatever the schema.
+func TestGraphGateOffIsPhaseOne(t *testing.T) {
 	gate := services.NewGraphProjectionGate(false, "")
 	if mode, _, _ := gate.Status(); mode != services.GraphProjectionOff {
 		t.Fatalf("mode = %q, want off", mode)
