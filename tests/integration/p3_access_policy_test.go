@@ -93,9 +93,15 @@ func currentEnvForTest() services.GovDeployEnv { return services.GovDeployEnv{} 
 // resource inserts an S3 bucket resource, named by conn's scan when set.
 func (l *apLab) resource(arn string, conn *uuid.UUID) uuid.UUID {
 	l.t.Helper()
+	return l.resourceOf(arn, "s3_bucket", conn)
+}
+
+// resourceOf inserts a Discovery resource of kind, named by conn's scan when set.
+func (l *apLab) resourceOf(arn, kind string, conn *uuid.UUID) uuid.UUID {
+	l.t.Helper()
 	id := uuid.New()
 	p3exec(l.t, l.db, `INSERT INTO iga_resources (id, workspace_id, resource_kind, display_name, provider, source_key)
-		VALUES (?, ?, 's3_bucket', ?, 'aws', ?)`, id, l.ws, arn, "aws\x1fref\x1f"+arn+"\x1f"+id.String())
+		VALUES (?, ?, ?, ?, 'aws', ?)`, id, l.ws, kind, arn, "aws\x1fref\x1f"+arn+"\x1f"+id.String())
 	if conn != nil {
 		p3exec(l.t, l.db, `INSERT INTO iga_object_support (workspace_id, resource_id, connector_id, partition_key, state)
 			VALUES (?, ?, ?, ?, 'current')`, l.ws, id, *conn, "aws:"+testAccount)
