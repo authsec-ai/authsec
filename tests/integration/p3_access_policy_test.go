@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -393,11 +394,20 @@ func TestAccessPolicyRefusals(t *testing.T) {
 	if _, err := l.svc.Create(ctx, l.ws, l.user, req(in)); apCode(err) != services.GovCodeResourceNotFound {
 		t.Errorf("unknown resource: %v", err)
 	}
-	// Ten managed policies attached: refused before anything is written.
-	for i := 0; i < 10; i++ {
-		p := l.fake.AddPolicy("/", "Filler"+uuid.NewString()[:6], nil, `{"Version":"2012-10-17","Statement":[]}`)
-		l.fake.AttachPermissions("ApRefusedRole", p.ARN)
+	// Ten managed policies attached (IAM's default limit): a warning, since
+	// the account's quota may have been raised.
+	fill := func(n int) {
+		for i := 0; i < n; i++ {
+			p := l.fake.AddPolicy("/", "Filler"+uuid.NewString()[:6], nil, `{"Version":"2012-10-17","Statement":[]}`)
+			l.fake.AttachPermissions("ApRefusedRole", p.ARN)
+		}
 	}
+	fill(10)
+	if pv, err := l.svc.Preview(ctx, l.ws, base()); err != nil || len(pv.Blockers) != 0 || !strings.Contains(fmt.Sprint(pv.Warnings), "quota_may_be_reached") {
+		t.Errorf("at the default quota: %+v %v", pv, err)
+	}
+	// Twenty (the most IAM allows): refused before anything is written.
+	fill(10)
 	if _, err := l.svc.Create(ctx, l.ws, l.user, req(base())); apCode(err) != services.GovCodeRolePolicyQuota {
 		t.Errorf("quota: %v", err)
 	}

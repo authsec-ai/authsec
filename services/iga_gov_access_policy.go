@@ -102,8 +102,11 @@ const (
 	accessEndPaused     = "paused"
 	accessEndEnded      = "ended"
 	accessEndSuperseded = "superseded"
-	// IAM's default quota of managed policies attached to a role.
-	accessAttachedQuota = 10
+	// Managed policies attached to a role: IAM's default quota, and the most
+	// an account can raise it to. Between the two AuthSec cannot read the
+	// account's own quota, so it warns; at the most, it refuses.
+	accessAttachedQuota    = 10
+	accessAttachedQuotaMax = 20
 	accessMaxList       = 1000
 )
 
@@ -607,10 +610,15 @@ func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []e
 				Message: "AuthSec could not read how many policies " + r.Identity.Name + " has attached: " + err.Error()})
 			continue
 		}
-		if n >= accessAttachedQuota {
+		switch {
+		case n >= accessAttachedQuotaMax:
 			errs = append(errs, govUnprocessable(GovCodeRolePolicyQuota,
-				fmt.Sprintf("%s already has %d managed policies attached, the IAM limit.", r.Identity.Name, n),
+				fmt.Sprintf("%s already has %d managed policies attached, the most IAM allows.", r.Identity.Name, n),
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "attached": n}))
+		case n >= accessAttachedQuota:
+			p.warnings = append(p.warnings, AccessIssue{Code: "quota_may_be_reached",
+				Message: fmt.Sprintf("%s already has %d managed policies attached; IAM's default limit is %d. This works only if the account's quota was raised; otherwise AWS refuses it and AuthSec removes what it created.",
+					r.Identity.Name, n, accessAttachedQuota)})
 		}
 	}
 	return errs
