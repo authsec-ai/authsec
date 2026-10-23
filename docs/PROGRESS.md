@@ -23,7 +23,8 @@ On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure acc
 - The full governance suite (`IGA_TEST_DSN` only; with `TEST_DATABASE_URL` also set, one test resets the database under the others) and all unit tests pass.
 
 ### Next
-- Step 0, remaining: allow re-apply (waiting on a decision: it contradicts the 2026-10-14 re-apply rule and AWS).
+- Step 0 is done. Allow re-apply stays as it is (owner's decision, 2026-10-23): an allow removed outside AuthSec is re-applied at the next check on AWS and Azure, and ending the policy is how access is revoked.
+- Next: step 1, AWS DynamoDB access policies.
 
 ---
 
