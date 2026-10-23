@@ -1396,6 +1396,10 @@ func (s *AzureOnboardingService) resolveAppConfig(c *models.CloudConnector) (azu
 	if s.cfg.Configured() && c.AuthRef == s.cfg.AuthRef() {
 		return s.cfg, nil
 	}
+	if !usesCustomApp(c) {
+		// Connected with AuthSec's app: nothing is in Vault to fall back on.
+		return azure.AppConfig{}, fmt.Errorf("%w: this connection reads with AuthSec's Azure app, which is not configured on this server", azure.ErrNotConfigured)
+	}
 	if s.vault == nil {
 		return azure.AppConfig{}, ErrAzureVaultNotConfigured
 	}
@@ -1431,6 +1435,19 @@ func (s *AzureOnboardingService) verify(parent context.Context, workspaceID, con
 		return nil, ErrAzureConnectorRevoked
 	}
 	cfg, err := s.resolveAppConfig(c)
+	if errors.Is(err, azure.ErrNotConfigured) {
+		// Not a passing failure: recorded on the connection, which stops the
+		// scheduled retries until someone fixes it and verifies again.
+		code := ConnErrDeployment
+		if usesCustomApp(c) {
+			code = ConnErrCredentialInvalid
+		}
+		stored, merr := s.connectors.MarkError(c.WorkspaceID, c.ID, err.Error(), code)
+		if merr != nil {
+			return nil, merr
+		}
+		return &AzureVerifyResult{Connector: stored}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -75,6 +75,8 @@ func (s *AzureOnboardingService) workspaceUIHosts(workspaceID uuid.UUID) []strin
 		return nil
 	}
 	var own string
+	// TENANT-EXEMPT: workspaces is the tenant table itself (no workspace_id
+	// for RLS to scope); read by the token's own workspace id.
 	if err := s.db.Table("workspaces").Select("workspace_domain").
 		Where("id = ?", workspaceID).Limit(1).Pluck("workspace_domain", &own).Error; err != nil {
 		return nil
