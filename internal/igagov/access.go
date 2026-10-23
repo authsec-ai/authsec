@@ -1,7 +1,6 @@
 package igagov
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -293,74 +292,81 @@ func accessListGuard(prefix string) []string {
 	return sortedUnique(vals)
 }
 
-// AccessDocument is the policy of one role: Deny (block) or Allow (allow) of
-// the access levels' actions, inside the window. It returns the canonical
-// document, its hash, and every action and resource it names.
-func AccessDocument(effect string, access []string, t S3Target, startsAt, endsAt *time.Time) ([]byte, string, []string, []string, error) {
-	eff := EffectAllow
-	if effect == AccessEffectBlock {
-		eff = EffectDeny
-	}
+// S3Target is an AWSAccessTarget.
+func (t S3Target) Type() string         { return AccessTypeS3Bucket }
+func (t S3Target) Service() string      { return "s3" }
+func (t S3Target) Noun() string         { return "bucket" }
+func (t S3Target) ARN() string          { return t.BucketARN() }
+func (t S3Target) Name() string         { return t.Bucket }
+func (t S3Target) ARNAccount() string   { return "" }
+func (t S3Target) ARNRegion() string    { return "" }
+func (t S3Target) ARNPartition() string { return t.partition() }
+func (t S3Target) Where() string        { return "s3://" + t.Bucket + "/" + t.Prefix + "*" }
+
+// Statements is the S3 document: the object actions on ObjectARN, the bucket
+// actions on BucketARN (limited by s3:prefix under a prefix: the folder for
+// an Allow, the list guard for a Block), and for a Block under a prefix a
+// second listing Deny for a request that names no prefix.
+func (t S3Target) Statements(effect string, access []string) ([]AccessStatement, error) {
 	object, bucket := accessActionsFor(effect, access, t.Prefix)
 	if len(object) == 0 {
-		return nil, "", nil, nil, errors.New("no action for the access levels")
+		return nil, nil
 	}
-	window := map[string]any{}
-	if startsAt != nil {
-		window[CondDateGreaterThan] = map[string]any{KeyCurrentTime: AWSTime(*startsAt)}
-	}
-	if endsAt != nil && !endsAt.Equal(AccessNoEnd) {
-		window[CondDateLessThan] = map[string]any{KeyCurrentTime: AWSTime(*endsAt)}
-	}
-	stmt := func(sid string, acts []string, res string, extra map[string]any) map[string]any {
-		var action any = acts
-		if len(acts) == 1 {
-			action = acts[0]
-		}
-		s := map[string]any{"Sid": sid, "Effect": eff, "Action": action, "Resource": res}
-		cond := map[string]any{}
-		for k, v := range window {
-			cond[k] = v
-		}
-		for k, v := range extra {
-			cond[k] = v
-		}
-		if len(cond) > 0 {
-			s["Condition"] = cond
-		}
-		return s
-	}
-	stmts := []any{stmt(AccessSidObjects, object, t.ObjectARN(), nil)}
+	stmts := []AccessStatement{{Sid: AccessSidObjects, Actions: object, Resources: []string{t.ObjectARN()}}}
 	if len(bucket) > 0 {
-		var extra map[string]any
+		var cond map[string]any
 		if t.Prefix != "" {
 			var like any = t.Prefix + "*"
 			if effect == AccessEffectBlock {
 				like = accessListGuard(t.Prefix)
 			}
-			extra = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: like}}
+			cond = map[string]any{CondStringLike: map[string]any{KeyS3Prefix: like}}
 		}
-		stmts = append(stmts, stmt(AccessSidBucket, bucket, t.BucketARN(), extra))
+		stmts = append(stmts, AccessStatement{Sid: AccessSidBucket, Actions: bucket, Resources: []string{t.BucketARN()}, Cond: cond})
 		if t.Prefix != "" && effect == AccessEffectBlock {
 			// A list request without a prefix has no s3:prefix key, so
 			// StringLike cannot match it: a second Deny catches it.
-			stmts = append(stmts, stmt(AccessSidBucketNone, bucket, t.BucketARN(),
-				map[string]any{CondNull: map[string]any{KeyS3Prefix: "true"}}))
+			stmts = append(stmts, AccessStatement{Sid: AccessSidBucketNone, Actions: bucket, Resources: []string{t.BucketARN()},
+				Cond: map[string]any{CondNull: map[string]any{KeyS3Prefix: "true"}}})
 		}
 	}
-	doc := map[string]any{"Version": PolicyVersion20121017, "Statement": stmts}
-	c, err := CanonicalizeValue(doc)
+	return stmts, nil
+}
+
+// Notes: an Allow may also need the bucket policy; a Block of reads under a
+// prefix also blocks listing the root and the folder's leading fragments
+// (only some of them for a long folder).
+func (t S3Target) Notes(effect string, access []string) []AccessNote {
+	var out []AccessNote
+	if effect == AccessEffectAllow {
+		out = append(out, AccessNote{Code: "allow_needs_bucket_policy",
+			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
+	}
+	if effect == AccessEffectBlock && t.Prefix != "" && accessHas(access, AccessRead, AccessAll) {
+		out = append(out, AccessNote{Code: "list_root_blocked",
+			Message: "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."})
+		if AccessListGuardPartial(effect, t.Prefix) {
+			out = append(out, AccessNote{Code: "list_partial_prefix",
+				Message: "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."})
+		}
+	}
+	return out
+}
+
+// OtherPaths is the other_paths warning.
+func (t S3Target) OtherPaths() string {
+	return "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."
+}
+
+// AccessDocument is the policy of one role: Deny (block) or Allow (allow) of
+// the access levels' actions on t, inside the window. It returns the
+// canonical document, its hash, and every action and resource it names.
+func AccessDocument(effect string, access []string, t AWSAccessTarget, startsAt, endsAt *time.Time) ([]byte, string, []string, []string, error) {
+	stmts, err := t.Statements(effect, access)
 	if err != nil {
 		return nil, "", nil, nil, err
 	}
-	if PolicyChars(c) > MaxPolicyChars {
-		return nil, "", nil, nil, fmt.Errorf("the policy document is larger than %d characters", MaxPolicyChars)
-	}
-	resources := []string{t.ObjectARN()}
-	if len(bucket) > 0 {
-		resources = append(resources, t.BucketARN())
-	}
-	return c, ContentHash(c), sortedUnique(append(object, bucket...)), sortedUnique(resources), nil
+	return BuildAccessDocument(effect, stmts, startsAt, endsAt)
 }
 
 // AccessPolicyName is AuthSecAccess-<RoleId>-<policy 8hex>-v<no>.
@@ -379,7 +385,7 @@ func AccessDeploymentHash(roleID, accountID, versionID, documentHash string) (st
 }
 
 // AccessSentence is the preview's one plain sentence.
-func AccessSentence(in AccessIntent, t S3Target, roleNames []string) string {
+func AccessSentence(in AccessIntent, t AWSAccessTarget, roleNames []string) string {
 	verb := "Block"
 	if in.Effect == AccessEffectAllow {
 		verb = "Allow"
@@ -388,9 +394,8 @@ func AccessSentence(in AccessIntent, t S3Target, roleNames []string) string {
 	if len(in.Access) == 1 && in.Access[0] == AccessAll {
 		what = "all access"
 	}
-	where := "s3://" + t.Bucket + "/" + t.Prefix + "*"
 	who := strings.Join(roleNames, ", ")
-	s := fmt.Sprintf("%s %s on %s for %s", verb, what, where, who)
+	s := fmt.Sprintf("%s %s on %s for %s", verb, what, t.Where(), who)
 	if in.StartsAt != nil {
 		s += " from " + in.StartsAt.UTC().Format("2006-01-02 15:04 UTC")
 	}
