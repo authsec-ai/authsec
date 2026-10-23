@@ -4,6 +4,22 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-23 — IGA enforcement, step 0: Azure access fixes (branch `feat/iga-enforcement`)
+
+On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure access bugs first, then extend enforcement one service at a time (DynamoDB, Key Vault/AI Search, Secrets Manager, ...), then Kubernetes. Committed locally; nothing pushed.
+
+### Done
+- AS-118: Azure onboarding returns only to origins AuthSec serves (`3dc402d`).
+- AS-119: a block that ends hands the assignments it removed to another live block on the same principal that still needs them gone (an edited policy's new version, another policy) instead of restoring them; an approved row holding handed assignments ends through `expiring`, so they are restored. `revoked` is appended atomically.
+- AS-120: preview blocker `azure_policy_conflict` (block and allow on the same principal, overlapping scopes; the policy's own rows excluded on edit/resume); blocks never record AuthSec's allow assignments.
+- AS-121: on non-storage resources "all" also removes roles with data actions in the provider namespace; read/write/delete with such a role is a preview blocker `azure_data_access_unclassified`.
+- Tests: `TestAccessPolicyAzureOverlappingBlocks`, `TestAccessPolicyAzureBlockAndAllow`, `TestAccessPolicyAzureNonStorageData` (all three fail on the old code); the Azure test setup is shared (`azLab`).
+
+### Next
+- Step 0, remaining: Azure restore failing forever, partial deploy failure, allow re-apply, Slack links to `/iga/policy/setup`, Azure gap notices on Discovery (UI), schema guard count, `ConnectCustom` concurrency, the v2 template gate.
+
+---
+
 ## 2026-10-20 — Azure discovery made multi-tenant; access policies on Azure (branch `fix/azure-tenancy`)
 
 ### Done

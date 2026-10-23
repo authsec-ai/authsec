@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,13 @@ const (
 	GovCodeAzureWriteMissing = "azure_write_access_missing"
 	GovCodeAzureInherited    = "azure_inherited_access"
 	GovCodeAzureUnavailable  = "azure_unavailable"
+	// GovCodeAzureConflict: a block and an allow would act on the same
+	// principal and resource at once (Azure has no deny to settle it).
+	GovCodeAzureConflict = "azure_policy_conflict"
+	// GovCodeAzureDataUnclassified: the principal holds a role with data
+	// access on this resource type that a read, write or delete block cannot
+	// map yet; only "all" removes it.
+	GovCodeAzureDataUnclassified = "azure_data_access_unclassified"
 )
 
 // AzureRBACClient is the role-assignment surface access policies use
@@ -258,13 +266,115 @@ func roleGrants(def azure.RoleDefinition, actions, dataActions []string) bool {
 	return false
 }
 
+// azureNamespace is the target's resource provider ("microsoft.keyvault").
+func azureNamespace(t *azureTarget) string {
+	if i := strings.Index(t.TypePath, "/"); i > 0 {
+		return t.TypePath[:i]
+	}
+	return t.TypePath
+}
+
+// roleDataIn reports whether a role grants data actions of the provider ns
+// (or every data action).
+func roleDataIn(def azure.RoleDefinition, ns string) bool {
+	if ns == "" {
+		return false
+	}
+	for _, p := range def.Properties.Permissions {
+		for _, a := range p.DataActions {
+			a = strings.ToLower(a)
+			if a == "*" || strings.HasPrefix(a, ns+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func accessHasAll(access []string) bool {
+	for _, a := range access {
+		if a == igagov.AccessAll {
+			return true
+		}
+	}
+	return false
+}
+
+// azureGrants reports whether a block of access on t removes an assignment of
+// def: its management actions (and, for storage, the blob data actions and
+// key listing) match; for any other type "all" also takes every role with
+// data access in the type's provider (Key Vault Secrets User, Search Index
+// Data Reader, ...), whose data actions read, write and delete do not map yet.
+func azureGrants(t *azureTarget, access []string, def azure.RoleDefinition, actions, dataActions []string) bool {
+	if roleGrants(def, actions, dataActions) {
+		return true
+	}
+	return !t.Storage && accessHasAll(access) && roleDataIn(def, azureNamespace(t))
+}
+
+// azureScopeCovers reports whether an assignment at scope lies on outer or
+// below it.
+func azureScopeCovers(outer, scope string) bool {
+	outer = strings.ToLower(strings.TrimSuffix(outer, "/"))
+	scope = strings.ToLower(strings.TrimSuffix(scope, "/"))
+	return scope == outer || strings.HasPrefix(scope, outer+"/")
+}
+
+// azureTargetOfScope rebuilds the target of a stored row's scope.
+func azureTargetOfScope(scope, subscriptionID string) *azureTarget {
+	segs := strings.Split(strings.TrimPrefix(strings.ToLower(scope), "/"), "/")
+	t := &azureTarget{Scope: strings.ToLower(strings.TrimSuffix(scope, "/")), SubscriptionID: subscriptionID}
+	if i := indexOf(segs, "providers"); i >= 0 && i+2 < len(segs) {
+		tp := []string{segs[i+1], segs[i+2]}
+		for j := i + 4; j < len(segs); j += 2 {
+			tp = append(tp, segs[j])
+		}
+		t.TypePath = strings.Join(tp, "/")
+	}
+	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	return t
+}
+
+// withoutNames drops the assignments named in skip (AuthSec's own allows).
+func withoutNames(as []azure.RoleAssignment, skip map[string]bool) []azure.RoleAssignment {
+	if len(skip) == 0 {
+		return as
+	}
+	out := as[:0:0]
+	for _, a := range as {
+		if !skip[strings.ToLower(a.Name)] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+var azureLiveStates = []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}
+
+// azureAllowNames are the role assignment names AuthSec's allows hold for the
+// principal in the workspace: a block never removes them (it would record
+// one and later restore it as standing access).
+func azureAllowNames(tx *gorm.DB, ws uuid.UUID, principal string) (map[string]bool, error) {
+	var names []string
+	if err := tx.Model(&models.IGAGovAzureAccess{}).
+		Where("workspace_id = ? AND principal_id = ? AND effect = ? AND state IN ? AND assignment_name <> ''", ws, principal, "allow", azureLiveStates).
+		Pluck("assignment_name", &names).Error; err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, n := range names {
+		out[strings.ToLower(n)] = true
+	}
+	return out, nil
+}
+
 // azureSplit sorts a principal's assignments that grant the access into those
 // on the resource or below it (revocable) and those at a broader scope
 // (inherited: a block on one resource cannot remove them).
-func azureSplit(t *azureTarget, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, actions, dataActions []string) (revocable, inherited []azure.RoleAssignment) {
+func azureSplit(t *azureTarget, access []string, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, actions, dataActions []string) (revocable, inherited []azure.RoleAssignment) {
 	for _, a := range as {
 		def, ok := defs[strings.ToLower(a.Properties.RoleDefinitionID)]
-		if !ok || !roleGrants(def, actions, dataActions) {
+		if !ok || !azureGrants(t, access, def, actions, dataActions) {
 			continue
 		}
 		scope := strings.ToLower(strings.TrimSuffix(a.Properties.Scope, "/"))
@@ -364,6 +474,9 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	if err != nil {
 		return []error{err}
 	}
+	if errs := s.azureConflicts(ctx, ws, p); len(errs) > 0 {
+		return errs
+	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		return nil
 	}
@@ -380,8 +493,25 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 			errs = append(errs, govConflict(GovCodeAzureUnavailable, "AuthSec cannot read "+pr.Name+"'s role assignments: "+err.Error(), nil))
 			continue
 		}
-		rev, inh := azureSplit(&ap.target, as, dm, acts, data)
+		var allows map[string]bool
+		if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+			var err error
+			allows, err = azureAllowNames(tx, ws, pr.ObjectID)
+			return err
+		}); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		as = withoutNames(as, allows)
+		rev, inh := azureSplit(&ap.target, p.intent.Access, as, dm, acts, data)
 		ap.revocable[pr.ObjectID], ap.inherited[pr.ObjectID] = rev, inh
+		if unc := azureUnclassified(&ap.target, p.intent.Access, as, dm, rev); len(unc) > 0 {
+			errs = append(errs, govUnprocessable(GovCodeAzureDataUnclassified,
+				pr.Name+" has data access to this resource through "+strings.Join(unc, ", ")+
+					", which a "+strings.Join(p.intent.Access, ", ")+" block cannot remove yet on this resource type. Choose access \"all\" to remove those roles too.",
+				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "roles": unc}))
+			continue
+		}
 		if len(inh) > 0 {
 			var where []string
 			for _, a := range inh {
@@ -399,6 +529,79 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	}
 	p.warnings = append(p.warnings, AccessIssue{Code: "azure_groups_not_checked",
 		Message: "Access through Entra group membership is not examined."})
+	return errs
+}
+
+// azureUnclassified names the roles assigned on the resource, below or above
+// it that give data access in the type's provider but that a read, write or
+// delete block on a non-storage type would leave in place ("all" removes
+// those on the resource or below).
+func azureUnclassified(t *azureTarget, access []string, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, rev []azure.RoleAssignment) []string {
+	if t.Storage || accessHasAll(access) {
+		return nil
+	}
+	taken := map[string]bool{}
+	for _, a := range rev {
+		taken[strings.ToLower(a.ID)] = true
+	}
+	ns := azureNamespace(t)
+	var out []string
+	for _, a := range as {
+		if taken[strings.ToLower(a.ID)] ||
+			!(azureScopeCovers(t.Scope, a.Properties.Scope) || azureScopeCovers(a.Properties.Scope, t.Scope)) {
+			continue
+		}
+		def, ok := defs[strings.ToLower(a.Properties.RoleDefinitionID)]
+		if !ok || !roleDataIn(def, ns) {
+			continue
+		}
+		name := def.Properties.RoleName
+		if name == "" {
+			name = def.Name
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// azureConflicts refuses a block and an allow acting on the same principal and
+// overlapping scopes at the same time: Azure has no deny to settle it, so the
+// two jobs would undo each other every check. The policy's own rows (an edit,
+// a resume) are not a conflict.
+func (s *GovAccess) azureConflicts(ctx context.Context, ws uuid.UUID, p *accessPlan) []error {
+	ap := p.azure
+	other := "allow"
+	if p.intent.Effect == igagov.AccessEffectAllow {
+		other = "deny"
+	}
+	var errs []error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		for i, pr := range ap.principals {
+			q := tx.Model(&models.IGAGovAzureAccess{}).
+				Where("workspace_id = ? AND principal_id = ? AND effect = ? AND state IN ?", ws, pr.ObjectID, other,
+					[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive})
+			if p.self != nil {
+				q = q.Where("policy_id <> ?", *p.self)
+			}
+			var rows []models.IGAGovAzureAccess
+			if err := q.Find(&rows).Error; err != nil {
+				return err
+			}
+			for _, r := range rows {
+				if azureScopeCovers(r.Scope, ap.target.Scope) || azureScopeCovers(ap.target.Scope, r.Scope) {
+					errs = append(errs, govConflict(GovCodeAzureConflict,
+						pr.Name+" is already under an access policy with the opposite effect on this resource; end that policy first.",
+						map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "policy_id": r.PolicyID}))
+					break
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return []error{err}
+	}
 	return errs
 }
 
@@ -638,10 +841,14 @@ func endAzureRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason
 	n := 0
 	for _, r := range rows {
 		set := map[string]any{"end_reason": reason, "updated_at": now}
-		switch r.State {
-		case models.R2StateApproved:
+		var held []azure.RoleAssignmentSpec
+		_ = json.Unmarshal(r.Revoked, &held)
+		switch {
+		// An approved row never deployed, unless another block handed it
+		// assignments to keep removed (handOver): then it restores them.
+		case r.State == models.R2StateApproved && len(held) == 0:
 			set["state"], set["ended_at"] = models.R2StateRevoked, now
-		case models.R2StateExpiring:
+		case r.State == models.R2StateExpiring:
 			continue
 		default:
 			set["state"] = models.R2StateExpiring
@@ -728,7 +935,17 @@ func (s *GovAccess) AzureAccessHandler(ctx context.Context, run *PolicyJobRun) e
 	switch row.State {
 	case models.R2StateApproved:
 		if !now.Before(row.ExpiresAt) {
-			return h.finish(ctx, models.R2StateExpired, r2EndReasonNeverDeployed)
+			var held []azure.RoleAssignmentSpec
+			_ = json.Unmarshal(row.Revoked, &held)
+			if len(held) == 0 {
+				return h.finish(ctx, models.R2StateExpired, r2EndReasonNeverDeployed)
+			}
+			// Handed assignments (handOver) are restored, as on any end.
+			if err := h.move(ctx, models.R2StateApproved, models.R2StateExpiring, map[string]any{"end_reason": r2EndReasonExpired}); err != nil {
+				return err
+			}
+			h.row.State, h.row.EndReason = models.R2StateExpiring, r2EndReasonExpired
+			return h.remove(ctx)
 		}
 		if row.StartsAt != nil && now.Before(*row.StartsAt) {
 			return PolicyJobRetryLater(time.Until(*row.StartsAt), "starts at "+igagov.AWSTime(*row.StartsAt))
@@ -807,17 +1024,16 @@ func (h azureHandler) fail(ctx context.Context, reason string) error {
 func (h azureHandler) live(ctx context.Context) (rev, inh []azure.RoleAssignment, err error) {
 	var access []string
 	_ = json.Unmarshal(h.row.Access, &access)
-	segs := strings.Split(strings.TrimPrefix(h.row.Scope, "/"), "/")
-	t := &azureTarget{Scope: strings.ToLower(h.row.Scope), SubscriptionID: h.row.SubscriptionID}
-	if i := indexOf(segs, "providers"); i >= 0 && i+2 < len(segs) {
-		tp := []string{segs[i+1], segs[i+2]}
-		for j := i + 4; j < len(segs); j += 2 {
-			tp = append(tp, segs[j])
-		}
-		t.TypePath = strings.ToLower(strings.Join(tp, "/"))
-	}
-	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	t := azureTargetOfScope(h.row.Scope, h.row.SubscriptionID)
 	acts, data := azureActions(t, access)
+	var allows map[string]bool
+	if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		allows, err = azureAllowNames(tx, h.row.WorkspaceID, h.row.PrincipalID)
+		return err
+	}); err != nil {
+		return nil, nil, err
+	}
 	err = h.external(ctx, func(ctx context.Context) error {
 		defs, err := h.deps.RBAC.ListRoleDefinitions(ctx, h.token, h.row.SubscriptionID)
 		if err != nil {
@@ -827,7 +1043,7 @@ func (h azureHandler) live(ctx context.Context) (rev, inh []azure.RoleAssignment
 		if err != nil {
 			return err
 		}
-		rev, inh = azureSplit(t, as, azureDefs(defs), acts, data)
+		rev, inh = azureSplit(t, access, withoutNames(as, allows), azureDefs(defs), acts, data)
 		return nil
 	})
 	return rev, inh, err
@@ -881,20 +1097,20 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 				drift = R2ReasonDetached
 			}
 			// Write-ahead: each assignment is recorded before it is deleted, so
-			// the restore never loses one.
-			var revoked []azure.RoleAssignmentSpec
-			_ = json.Unmarshal(h.row.Revoked, &revoked)
+			// the restore never loses one. Appended in the database, not
+			// rewritten: another block's removal may hand assignments over to
+			// this row meanwhile (handOver).
+			var fresh []azure.RoleAssignmentSpec
 			for _, a := range rev {
-				revoked = append(revoked, azure.SpecOf(a))
+				fresh = append(fresh, azure.SpecOf(a))
 			}
-			raw, _ := json.Marshal(revoked)
+			raw, _ := json.Marshal(fresh)
 			if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 				return tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND id = ?", h.row.WorkspaceID, h.row.ID).
-					Updates(map[string]any{"revoked": raw, "updated_at": now}).Error
+					Updates(map[string]any{"revoked": gorm.Expr("revoked || ?::jsonb", string(raw)), "updated_at": now}).Error
 			}); err != nil {
 				return err
 			}
-			h.row.Revoked = raw
 			for _, a := range rev {
 				a := a
 				if err := h.external(ctx, func(ctx context.Context) error {
@@ -960,7 +1176,14 @@ func (h azureHandler) remove(ctx context.Context) error {
 	} else {
 		var revoked []azure.RoleAssignmentSpec
 		_ = json.Unmarshal(h.row.Revoked, &revoked)
-		for _, spec := range revoked {
+		rest, handed, err := h.handOver(ctx, revoked)
+		if err != nil {
+			return h.retry(err)
+		}
+		for _, hd := range handed {
+			ops = append(ops, map[string]any{"op": "HandedOver", "assignment": hd.spec.Scope + "/" + hd.spec.Name, "to": hd.to, "at": now})
+		}
+		for _, spec := range rest {
 			spec := spec
 			if err := h.external(ctx, func(ctx context.Context) error {
 				_, err := h.deps.RBAC.PutRoleAssignment(ctx, h.token, spec)
@@ -973,6 +1196,92 @@ func (h azureHandler) remove(ctx context.Context) error {
 	}
 	h.row.Ops = mustOps(ops)
 	return h.finish(ctx, grantFinal(h.row.EndReason), h.row.EndReason)
+}
+
+// azureHoldStates are the states of a block that can take assignments over:
+// it will restore them when it ends (endAzureRowsTx sends an approved row
+// holding some through expiring).
+var azureHoldStates = []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive}
+
+type handedSpec struct {
+	spec azure.RoleAssignmentSpec
+	to   uuid.UUID
+}
+
+// handOver gives the assignments this block removed to another live block on
+// the same principal that still needs them gone -- the next version of an
+// edited policy, or another policy covering the resource -- instead of
+// restoring them. Without it, ending one block re-created the access and the
+// other block removed it again only at its next check (up to 10 minutes).
+// It returns the specs still to restore.
+func (h azureHandler) handOver(ctx context.Context, specs []azure.RoleAssignmentSpec) (rest []azure.RoleAssignmentSpec, handed []handedSpec, err error) {
+	if h.row.Effect != "deny" || len(specs) == 0 {
+		return specs, nil, nil
+	}
+	var others []models.IGAGovAzureAccess
+	if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND principal_id = ? AND effect = ? AND id <> ? AND state IN ?",
+			h.row.WorkspaceID, h.row.PrincipalID, "deny", h.row.ID, azureHoldStates).
+			Where("expires_at > now() AND (starts_at IS NULL OR starts_at <= now())").
+			Order("created_at").Find(&others).Error
+	}); err != nil {
+		return nil, nil, err
+	}
+	if len(others) == 0 {
+		return specs, nil, nil
+	}
+	var defs map[string]azure.RoleDefinition
+	if err := h.external(ctx, func(ctx context.Context) error {
+		ds, err := h.deps.RBAC.ListRoleDefinitions(ctx, h.token, h.row.SubscriptionID)
+		defs = azureDefs(ds)
+		return err
+	}); err != nil {
+		return nil, nil, err
+	}
+	byRow := map[uuid.UUID][]azure.RoleAssignmentSpec{}
+	for _, spec := range specs {
+		def, ok := defs[strings.ToLower(spec.RoleDefinitionID)]
+		taken := false
+		for _, o := range others {
+			if !ok || o.SubscriptionID != h.row.SubscriptionID || !azureScopeCovers(o.Scope, spec.Scope) {
+				continue
+			}
+			var access []string
+			_ = json.Unmarshal(o.Access, &access)
+			t := azureTargetOfScope(o.Scope, o.SubscriptionID)
+			acts, data := azureActions(t, access)
+			if azureGrants(t, access, def, acts, data) {
+				byRow[o.ID] = append(byRow[o.ID], spec)
+				handed = append(handed, handedSpec{spec: spec, to: o.ID})
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			rest = append(rest, spec)
+		}
+	}
+	if len(byRow) == 0 {
+		return specs, nil, nil
+	}
+	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+		for id, sp := range byRow {
+			raw, _ := json.Marshal(sp)
+			res := tx.Model(&models.IGAGovAzureAccess{}).
+				Where("workspace_id = ? AND id = ? AND state IN ?", h.row.WorkspaceID, id, azureHoldStates).
+				Updates(map[string]any{"revoked": gorm.Expr("revoked || ?::jsonb", string(raw)), "updated_at": time.Now().UTC()})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return PolicyJobRetryLater(time.Second, "the receiving block moved; reloading")
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	return rest, handed, nil
 }
 
 func mustOps(ops []map[string]any) json.RawMessage {

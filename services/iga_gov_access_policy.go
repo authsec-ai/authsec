@@ -347,6 +347,9 @@ type accessPlan struct {
 	usedBy   map[uuid.UUID][]AccessWorkloadRef
 	warnings []AccessIssue
 	azure    *azurePlan // an Azure resource: role assignments, not an IAM policy
+	// self is the policy being edited or resumed (nil on create): its own
+	// rows are not a conflict with it.
+	self *uuid.UUID
 }
 
 // nRoles is how many roles the plan changes.
@@ -894,6 +897,7 @@ func (s *GovAccess) Edit(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 	if err != nil {
 		return nil, err
 	}
+	p.self = &id
 	if pol.Lifecycle == "active" {
 		if errs := s.checks(ctx, ws, p); len(errs) > 0 {
 			return nil, errs[0]
@@ -1084,6 +1088,7 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 	if err != nil {
 		return nil, err
 	}
+	p.self = &id
 	if errs := s.checks(ctx, ws, p); len(errs) > 0 {
 		return nil, errs[0]
 	}
