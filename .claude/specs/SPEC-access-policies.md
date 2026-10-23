@@ -20,13 +20,27 @@ separate resources screen.
 | Resource | an S3 bucket, or a folder (`prefix/`) of it | one ARM resource (storage account, key vault, …) |
 | Who | IAM roles | service principals, managed identities, agent identities |
 | Block | AuthSec attaches its own IAM policy with a Deny to each role; the window is written into the policy, so AWS honours it if AuthSec is down | Azure has no customer deny. AuthSec records, then deletes, each of the identity's own role assignments on the resource (or below it) whose role grants the access, and puts them back at the end, on Pause and on End |
-| Allow | an IAM policy with an Allow and the window | a built-in role assignment (Storage Blob Data Reader for read on storage, Storage Blob Data Contributor for write/delete, Reader / Contributor otherwise), deleted at the end by AuthSec's job — Azure assignments have no expiry |
+| Allow | an IAM policy with an Allow and the window | a built-in role assignment, deleted at the end by AuthSec's job — Azure assignments have no expiry. The role is the data role where the resource has a data plane (table below), else Reader / Contributor |
 | Can't do | — | access from a broader scope (resource group, subscription) or through a group: a block on one resource cannot remove it. The preview refuses (`azure_inherited_access`); group access is a warning (`azure_groups_not_checked`) |
 | Write access AuthSec needs | the AWS access stack (template v2) in the account | Role Based Access Control Administrator (or User Access Administrator / Owner) for AuthSec's Entra app on the subscription |
 | Access levels | Read, Write, Delete; Block also All | the same |
 
 Same routes (`/api/iga/v1/policy/access-policies`), statuses, lifecycle and
 history for both. The provider is the resource's.
+
+On Azure, a block removes the identity's assignments whose role grants the
+access in either plane: the resource type's management actions, and on these
+resources its data actions (and key listings) too. An Allow assigns the data
+role:
+
+| Resource | Read | Write or delete | Read and write |
+|---|---|---|---|
+| Storage account (blobs) | Storage Blob Data Reader | Storage Blob Data Contributor | Storage Blob Data Contributor |
+| AI Search service (indexes) | Search Index Data Reader | Search Index Data Contributor | Search Index Data Contributor |
+| Key Vault (secrets) | Key Vault Secrets User | Key Vault Secrets Officer | Key Vault Secrets Officer |
+| Service Bus namespace | Azure Service Bus Data Receiver | Azure Service Bus Data Sender | Azure Service Bus Data Owner |
+| Event Hubs namespace | Azure Event Hubs Data Receiver | Azure Event Hubs Data Sender | Azure Event Hubs Data Owner |
+| any other resource | Reader | Contributor | Contributor |
 
 ## 2. Screens and flow
 
@@ -209,6 +223,13 @@ Known limits, by design or not yet built:
   evaluated.
 - Azure assignments have no expiry: an Allow, and the restore after a block,
   happen when AuthSec's job runs.
+- Role assignments are all a block changes: an AI Search service's API keys and
+  a Key Vault's access policies (vaults not on Azure RBAC) keep working, and the
+  preview says so.
+- The console names only the storage, Reader and Contributor roles in a
+  policy's change; the AI Search, Key Vault, Service Bus and Event Hubs data
+  roles appear by their role id, and the access levels' descriptions on those
+  resources read as management access.
 - The Azure object pages still read three Azure-only endpoints: the
   neighbourhood (a resource's ARM id, a workload's name and the identity it
   runs as), *What it can reach* (blast radius) and the Discovery summary strip.
