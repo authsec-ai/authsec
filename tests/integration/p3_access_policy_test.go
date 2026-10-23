@@ -481,3 +481,43 @@ func TestAccessPolicyEndRunsNow(t *testing.T) {
 		t.Fatal("End left the removal waiting for the next 10-minute check")
 	}
 }
+
+// A deployment that fails after attaching is taken out of AWS before it ends
+// failed. Before, a policy whose AuthSec document was changed outside AuthSec
+// failed its re-apply and stayed attached to the role for good: a failed row
+// is never worked again, and End, Pause and Delete skip it.
+func TestAccessPolicyFailedRowIsRemoved(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApEditedOutside")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "edited outside", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	att := l.attachedAuthSec("ApEditedOutside")
+	if len(att) != 1 {
+		t.Fatalf("attached: %v", att)
+	}
+	// Someone rewrites AuthSec's policy (a new default version).
+	l.fake.SetDefaultDocument(att[0], `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`)
+	var row models.IGAGovTempGrant
+	l.db.Where("workspace_id = ? AND policy_arn = ?", l.ws, att[0]).Take(&row)
+	l.runRow(services.NewGovR2(l.db), row.ID)
+
+	if got := l.attachedAuthSec("ApEditedOutside"); len(got) != 0 {
+		t.Fatalf("the failed deployment's policy is still attached: %v", got)
+	}
+	l.db.Where("workspace_id = ? AND id = ?", l.ws, row.ID).Take(&row)
+	if row.State != models.R2StateFailed || !strings.Contains(row.StateReason, "document_changed") || row.Drift != services.R2ReasonDocumentChanged {
+		t.Fatalf("row: state %s, reason %q, drift %q", row.State, row.StateReason, row.Drift)
+	}
+	// The edited policy holds versions AuthSec did not write: it is left in
+	// place, detached, for its owner.
+	if _, _, _, _, ok := l.fake.PolicyState(att[0]); !ok {
+		t.Fatal("a policy with versions AuthSec did not write was deleted")
+	}
+}

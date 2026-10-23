@@ -315,7 +315,11 @@ func (r r2Row) converge(ctx context.Context, run *PolicyJobRun, present bool) (*
 			out.Drift, out.Done = R2ReasonAttachedElsewhere, true
 			return out, nil
 		case live.Policy != nil && live.Policy.VersionCount > 1:
-			out.Fail, out.FailDetail = R2ReasonDocumentChanged, r.PolicyARN+" has versions AuthSec did not create; delete it by hand"
+			// Detached (above) and used by nothing else, but it holds versions
+			// AuthSec did not write: deleting it would discard them, so it is
+			// left for its owner, recorded as drift. Retrying could never
+			// finish the removal.
+			out.Drift, out.Done = R2ReasonDocumentChanged, true
 			return out, nil
 		case live.Policy != nil:
 			op = "DeletePolicy"

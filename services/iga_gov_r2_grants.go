@@ -74,6 +74,9 @@ const (
 	r2EndReasonRevoked       = "revoked"
 	r2EndReasonLifted        = "lifted"
 	r2EndReasonNeverDeployed = "expired_before_deploy"
+	// r2EndReasonFailed: an access policy's deployment failed after it may
+	// have changed IAM; it is removed, then ends failed.
+	r2EndReasonFailed = "failed"
 )
 
 // GovR2 is the R2 service (requests, decisions, jobs). Every statement runs
@@ -551,6 +554,9 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 // expiry, revoked for any early end (revoke; an access policy's paused,
 // ended or superseded).
 func grantFinal(endReason string) string {
+	if endReason == r2EndReasonFailed {
+		return models.R2StateFailed
+	}
 	if endReason == "" || endReason == r2EndReasonExpired || endReason == r2EndReasonNeverDeployed {
 		return models.R2StateExpired
 	}
@@ -977,6 +983,24 @@ func (h r2Handler) deploy(ctx context.Context, from string) error {
 }
 
 func (h r2Handler) fail(ctx context.Context, from, code, detail string) error {
+	// An access policy's deployment that may already have changed IAM (it got
+	// past approved) is taken out before it ends failed: a failed row is never
+	// worked again, so whatever it attached would stay on the role.
+	if h.kind.Name == r2AccessKind.Name && from != models.R2StateApproved {
+		err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+			if err := h.moveTx(tx, from, models.R2StateExpiring, map[string]any{"state_reason": code + ": " + detail,
+				"end_reason": r2EndReasonFailed}); err != nil {
+				return err
+			}
+			return h.event(tx, h.ws, h.kind.EvFailed, map[string]any{h.kind.IDKey: h.id, "from": from, "reason": code, "detail": detail,
+				"note": "AuthSec removes what it attached."})
+		})
+		if err != nil {
+			return h.settled(err)
+		}
+		h.endReason = r2EndReasonFailed
+		return h.absent(ctx, models.R2StateExpiring, models.R2StateFailed)
+	}
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := h.moveTx(tx, from, models.R2StateFailed, map[string]any{"state_reason": code + ": " + detail,
 			"ended_at": time.Now().UTC()}); err != nil {
@@ -1085,6 +1109,9 @@ func (h r2Handler) finish(ctx context.Context, from, final, endReason string, ou
 	now := time.Now().UTC()
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		set := map[string]any{"ended_at": now, "state_reason": "", "pending_op": "", "pending_op_at": nil, "settle_after": nil}
+		if final == models.R2StateFailed {
+			delete(set, "state_reason") // the failure's reason stays
+		}
 		if endReason != "" {
 			set["end_reason"] = endReason
 		}
