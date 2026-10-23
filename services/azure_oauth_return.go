@@ -24,9 +24,10 @@ import (
    So Start records the origin the onboarding was started from -- the browser's
    Origin header on POST /azure/oauth/start, which page script cannot set --
    and the callback returns there. It is accepted only when it is one of THIS
-   workspace's own UI origins: the configured UI origin, the workspace's own
-   domain (workspaces.workspace_domain) or one of its verified domains
-   (workspace_domains). The workspace is the token's, never the request's.
+   workspace's own UI origins that AuthSec serves: the configured UI origin or
+   the workspace's own domain under the workspace domain suffix. Verified
+   custom domains are not accepted: the callback carries the onboarding
+   session id, and only hosts AuthSec serves may receive it. The workspace is the token's, never the request's.
    Anything else -- another workspace's domain, a look-alike host, plain http
    outside a local host, a path or credentials -- is ignored, and the
    configured origin is used as before. The callback therefore cannot be made
@@ -54,31 +55,34 @@ func (s *AzureOnboardingService) azureReturnOrigin(workspaceID uuid.UUID, origin
 	return ""
 }
 
-// workspaceUIHosts are the hosts this workspace's UI is served on: its own
-// domain and its verified domains, lowercased, without a port.
+// workspaceUIHosts are the hosts this workspace's UI is served on BY AUTHSEC:
+// its own domain (workspaces.workspace_domain), lowercased, without a port,
+// and only when it lies under AuthSec's workspace domain suffix
+// (TENANT_DOMAIN_SUFFIX). A verified custom domain is not one: verification
+// proves control of DNS, not that AuthSec serves the host, and the callback
+// carries the onboarding session id there -- a workspace admin could have a
+// victim tenant's administrator consent and receive that session on a host of
+// their own (review 2026-10-23).
 func (s *AzureOnboardingService) workspaceUIHosts(workspaceID uuid.UUID) []string {
 	if s.db == nil || workspaceID == uuid.Nil {
 		return nil
 	}
-	var hosts []string
+	suffix := ""
+	if config.AppConfig != nil {
+		suffix = strings.ToLower(strings.Trim(config.AppConfig.WorkspaceDomainSuffix, ". "))
+	}
+	if suffix == "" {
+		return nil
+	}
 	var own string
 	if err := s.db.Table("workspaces").Select("workspace_domain").
-		Where("id = ?", workspaceID).Limit(1).Pluck("workspace_domain", &own).Error; err == nil {
-		if h := bareHost(own); h != "" {
-			hosts = append(hosts, h)
-		}
+		Where("id = ?", workspaceID).Limit(1).Pluck("workspace_domain", &own).Error; err != nil {
+		return nil
 	}
-	var verified []string
-	if err := s.db.Table("workspace_domains").Select("domain").
-		Where("workspace_id = ? AND is_verified = ?", workspaceID, true).
-		Pluck("domain", &verified).Error; err == nil {
-		for _, d := range verified {
-			if h := bareHost(d); h != "" {
-				hosts = append(hosts, h)
-			}
-		}
+	if h := bareHost(own); h != "" && strings.HasSuffix(h, "."+suffix) {
+		return []string{h}
 	}
-	return hosts
+	return nil
 }
 
 // parseUIOrigin accepts an origin and nothing more: https (http only for a

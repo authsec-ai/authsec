@@ -16,7 +16,7 @@ import (
 func withUIOrigin(t *testing.T, origin string) {
 	t.Helper()
 	prev := config.AppConfig
-	config.AppConfig = &config.Config{UIOrigin: origin}
+	config.AppConfig = &config.Config{UIOrigin: origin, WorkspaceDomainSuffix: "app.authsec.ai"}
 	t.Cleanup(func() { config.AppConfig = prev })
 }
 
@@ -112,9 +112,9 @@ func setupReturnOriginDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// Each workspace comes back to its own domain or a verified domain of its own;
-// another workspace's domain, an unverified domain and a look-alike are not
-// accepted.
+// Each workspace comes back to its own AuthSec-served domain; a custom domain
+// (verified or not), another workspace's domain and a look-alike are not
+// accepted: the callback carries the onboarding session id.
 func TestAzureReturnOriginIsTheWorkspacesOwn(t *testing.T) {
 	db := setupReturnOriginDB(t)
 	withUIOrigin(t, "https://app.authsec.ai")
@@ -140,7 +140,6 @@ func TestAzureReturnOriginIsTheWorkspacesOwn(t *testing.T) {
 
 	accept := map[string]string{
 		"https://aman.app.authsec.ai": "https://aman.app.authsec.ai",
-		"https://iam.aman-corp.com/":  "https://iam.aman-corp.com",
 		"https://app.authsec.ai":      "https://app.authsec.ai",
 	}
 	for in, want := range accept {
@@ -150,6 +149,7 @@ func TestAzureReturnOriginIsTheWorkspacesOwn(t *testing.T) {
 	}
 	reject := []string{
 		"https://contoso.app.authsec.ai",           // another workspace's domain
+		"https://iam.aman-corp.com",                // verified, but not served by AuthSec: the session id must not go there
 		"https://pending.aman-corp.com",            // not verified
 		"https://aman.app.authsec.ai.evil.example", // look-alike
 		"https://evil.example",
