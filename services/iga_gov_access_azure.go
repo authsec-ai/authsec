@@ -1082,6 +1082,7 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 	now := time.Now().UTC()
 	drift := ""
 	var ops []map[string]any
+	var inherited []string // block: scopes above the resource that grant the access
 	if h.row.Effect == "allow" {
 		id := h.row.Scope + "/providers/Microsoft.Authorization/roleAssignments/" + h.row.AssignmentName
 		var got *azure.RoleAssignment
@@ -1111,6 +1112,12 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		}
 		if len(inh) > 0 && !check {
 			return h.fail(ctx, GovCodeAzureInherited+": the principal gets this access from a broader scope")
+		}
+		// Access that appeared at a broader scope after the block went live:
+		// AuthSec cannot remove it from one resource, so the block no longer
+		// holds. Recorded as drift (shown, notified once), not hidden.
+		for _, a := range inh {
+			inherited = append(inherited, a.Properties.Scope)
 		}
 		if len(rev) > 0 {
 			if check {
@@ -1145,6 +1152,11 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 	opsRaw, _ := json.Marshal(ops)
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		set := map[string]any{"verified_at": now, "last_readback_at": now, "drift": "", "state_reason": "", "updated_at": now}
+		if len(inherited) > 0 {
+			set["drift"] = GovCodeAzureInherited
+			set["state_reason"] = "the principal now gets this access from a broader scope (" + strings.Join(inherited, ", ") +
+				"); AuthSec cannot remove it from this resource"
+		}
 		if len(ops) > 0 {
 			set["ops"] = gorm.Expr("ops || ?::jsonb", string(opsRaw))
 		}
@@ -1157,6 +1169,12 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		}
 		if res.RowsAffected != 1 {
 			return PolicyJobRetryLater(time.Second, "the row's state moved; reloading")
+		}
+		if check && len(inherited) > 0 && h.row.Drift != GovCodeAzureInherited {
+			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": GovCodeAzureInherited, "scopes": inherited,
+				"note": "The principal gets this access from a broader scope; AuthSec cannot remove it from this resource. End the policy or remove that assignment."}); err != nil {
+				return err
+			}
 		}
 		if check && drift != "" {
 			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": drift, "note": "AuthSec re-applies the policy."}); err != nil {

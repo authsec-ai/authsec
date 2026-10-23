@@ -627,3 +627,36 @@ func TestAccessPolicyAzureFailedDeployRestores(t *testing.T) {
 		t.Fatalf("the failed deploy left %v, want both resource assignments back plus the subscription one", got)
 	}
 }
+
+// Access that appears at a broader scope after a block went live cannot be
+// removed from one resource: the policy reads drift with the scope, instead
+// of staying "active" while the access is back.
+func TestAccessPolicyAzureInheritedAfterApply(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-later-wide")
+	z.assign(z.scope, "own-1", azure.RoleStorageBlobDataReader, oid)
+	v := z.create("az inherited later", z.intent("block", z.res, who))
+	z.run(v.ID)
+	row := z.rows(v.ID, models.R2StateActive)[0]
+	z.assign("/subscriptions/"+z.sub, "later-wide", azure.RoleStorageBlobDataReader, oid)
+	z.step(row.ID)
+
+	got, err := z.svc.Get(z.ctx, z.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusDrift || !strings.Contains(got.StatusReason, services.GovCodeAzureInherited) {
+		t.Fatalf("after the broader assignment: %s %q %v", got.Status, got.StatusReason, err)
+	}
+	if d := got.Deployments[0]; d.Drift != services.GovCodeAzureInherited {
+		t.Fatalf("deployment: %+v", d)
+	}
+	var stored models.IGAGovAzureAccess
+	z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).Take(&stored)
+	if !strings.Contains(stored.StateReason, "/subscriptions/"+z.sub) {
+		t.Fatalf("state reason does not name the scope: %q", stored.StateReason)
+	}
+	// Removed again: the next check clears the drift.
+	z.fake.DeleteRoleAssignment(z.ctx, "", "/subscriptions/"+z.sub+"/providers/Microsoft.Authorization/roleAssignments/later-wide")
+	z.step(row.ID)
+	if got, _ = z.svc.Get(z.ctx, z.ws, v.ID); got.Status != services.AccessStatusActive {
+		t.Fatalf("after the broader assignment is gone: %s", got.Status)
+	}
+}
