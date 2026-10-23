@@ -18,6 +18,7 @@ import (
 type slowARM struct {
 	delay          time.Duration
 	denied, wide   string
+	throttled      string
 	inFlight, peak atomic.Int32
 }
 
@@ -37,6 +38,9 @@ func (f *slowARM) GetSubscription(_ context.Context, _, id string) (*azure.Subsc
 	defer f.enter()()
 	if id == f.denied {
 		return nil, errors.New("AuthorizationFailed")
+	}
+	if id == f.throttled {
+		return nil, azure.ErrThrottled
 	}
 	return &azure.Subscription{SubscriptionID: id}, nil
 }
@@ -58,7 +62,7 @@ func TestCustomSubscriptionReadsRunInParallel(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		subs = append(subs, azure.Subscription{SubscriptionID: fmt.Sprintf("sub-%02d", i), DisplayName: fmt.Sprintf("Sub %02d", i)})
 	}
-	f := &slowARM{delay: 40 * time.Millisecond, denied: "sub-03", wide: "sub-07"}
+	f := &slowARM{delay: 40 * time.Millisecond, denied: "sub-03", wide: "sub-07", throttled: "sub-05"}
 	start := time.Now()
 	results, privileged := customSubscriptionReads(context.Background(), f, "tok", "sp", subs)
 	elapsed := time.Since(start)
@@ -78,8 +82,12 @@ func TestCustomSubscriptionReadsRunInParallel(t *testing.T) {
 			t.Fatalf("result %d is %s: order lost", i, r.SubscriptionID)
 		}
 		want := models.AzureReaderExisting
-		if r.SubscriptionID == "sub-03" {
+		switch r.SubscriptionID {
+		case "sub-03":
 			want = models.AzureReaderDenied
+		case "sub-05":
+			// Throttled: nothing is known, so not "denied" (item 11).
+			want = models.AzureReaderUnchecked
 		}
 		if r.Reader.Status != want {
 			t.Fatalf("%s: reader %s, want %s", r.SubscriptionID, r.Reader.Status, want)
@@ -87,5 +95,20 @@ func TestCustomSubscriptionReadsRunInParallel(t *testing.T) {
 	}
 	if len(privileged) != 1 || !strings.HasPrefix(privileged[0], "Sub 07 (Contributor") {
 		t.Fatalf("privileged %v", privileged)
+	}
+}
+
+// A subscription that could not be checked is recorded as a passing failure
+// to verify again, never as a refused Reader.
+func TestAzureReaderFailureUnchecked(t *testing.T) {
+	msg, code := azureReaderFailure(models.AzureReaderAssignment{Status: models.AzureReaderUnchecked, Error: azure.ErrThrottled.Error()})
+	if code != ConnErrThrottled || !strings.Contains(msg, "verify it again") || strings.Contains(msg, "Reader could not be assigned") {
+		t.Fatalf("throttled: %q %q", msg, code)
+	}
+	if _, code := azureReaderFailure(models.AzureReaderAssignment{Status: models.AzureReaderUnchecked, Error: "context deadline exceeded"}); code != ConnErrTimeout {
+		t.Fatalf("timeout: %q", code)
+	}
+	if _, code := azureReaderFailure(models.AzureReaderAssignment{Status: models.AzureReaderDenied, Error: "AuthorizationFailed"}); code != ConnErrAuthRefused {
+		t.Fatalf("denied: %q", code)
 	}
 }

@@ -760,7 +760,13 @@ func customSubscriptionReads(ctx context.Context, api customSubscriptionARM, arm
 		_, readErr := api.GetSubscription(ctx, armToken, sub.SubscriptionID)
 		checkedAt := time.Now()
 		if readErr != nil {
-			results[i].Reader = models.AzureReaderAssignment{Status: models.AzureReaderDenied, CheckedAt: &checkedAt, Error: readErr.Error()}
+			// Only a refusal says the app lacks Reader; a timeout or
+			// throttling says nothing, and the admin is told to verify again.
+			status := models.AzureReaderDenied
+			if azureTransient(readErr) {
+				status = models.AzureReaderUnchecked
+			}
+			results[i].Reader = models.AzureReaderAssignment{Status: status, CheckedAt: &checkedAt, Error: readErr.Error()}
 			return
 		}
 		results[i].Reader = models.AzureReaderAssignment{
@@ -869,6 +875,16 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 
 	// 5. Prove each one is readable (customSubscriptionReads).
 	results, privileged := customSubscriptionReads(ctx, s.api, armToken, sp.ID, subs)
+	var unchecked []string
+	for _, r := range results {
+		if r.Reader.Status == models.AzureReaderUnchecked {
+			unchecked = append(unchecked, firstNonEmpty(r.DisplayName, r.SubscriptionID))
+		}
+	}
+	if len(unchecked) > 0 {
+		warnings = append(warnings, fmt.Sprintf("AuthSec could not check %d subscription(s) in time (Azure was slow or busy): %s. "+
+			"Verify them again; nothing about their access is known yet", len(unchecked), strings.Join(unchecked, ", ")))
+	}
 	if len(privileged) > 0 {
 		warnings = append(warnings, "your app holds Azure roles that can change resources or grant access, beyond the Reader "+
 			"AuthSec needs: "+strings.Join(privileged, "; ")+". Consider giving it Reader only")
@@ -1338,6 +1354,12 @@ func azureReaderFailure(r models.AzureReaderAssignment) (string, string) {
 		return "Reader was not assigned: " + r.Error, ConnErrScopeInvalid
 	case models.AzureReaderFailed:
 		return "Reader could not be assigned: " + r.Error, ""
+	case models.AzureReaderUnchecked:
+		code := ConnErrTimeout
+		if e := strings.ToLower(r.Error); strings.Contains(e, "throttl") || strings.Contains(e, "429") {
+			code = ConnErrThrottled
+		}
+		return "AuthSec could not check this subscription (Azure was slow or busy): " + r.Error + "; verify it again", code
 	}
 	if r.Error == "" || r.Error == azure.ErrRBACPending.Error() {
 		return "Reader is assigned but Azure has not applied it yet; verify this subscription again in a few minutes",
