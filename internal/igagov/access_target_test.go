@@ -46,3 +46,26 @@ func TestS3PrefixDollarIsLiteral(t *testing.T) {
 		t.Fatalf("guard fragment not escaped: %s", doc)
 	}
 }
+
+// A block of delete on the whole bucket also denies setting a lifecycle rule
+// (it expires objects); under a folder it cannot (bucket-wide), and an allow
+// never gains it.
+func TestS3DeleteBlocksLifecycle(t *testing.T) {
+	has := func(effect, prefix string) bool {
+		tg, _ := ParseAWSAccessTarget("arn:aws:s3:::acme", prefix)
+		end := AccessNoEnd
+		_, _, acts, _, err := AccessDocument(effect, []string{AccessDelete}, tg, nil, &end)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range acts {
+			if a == "s3:PutLifecycleConfiguration" {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(AccessEffectBlock, "") || has(AccessEffectBlock, "invoices/") || has(AccessEffectAllow, "") {
+		t.Fatalf("lifecycle: block bucket %v, block folder %v, allow %v", has(AccessEffectBlock, ""), has(AccessEffectBlock, "invoices/"), has(AccessEffectAllow, ""))
+	}
+}

@@ -252,8 +252,10 @@ func AccessActions(access []string, prefix string) (object, bucket []string) {
 
 // accessActionsFor is AccessActions plus, for a Block, the read-side actions
 // that expose the same keys or their metadata: listing versions and in-flight
-// multipart uploads (both honour s3:prefix) and the attribute reads. An Allow
-// never gains them: it must not widen beyond what the person chose.
+// multipart uploads (both honour s3:prefix) and the metadata reads
+// (attributes, tags, ACL); for a delete of the whole bucket, setting a
+// lifecycle rule (it expires objects). An Allow never gains them: it must not
+// widen beyond what the person chose.
 func accessActionsFor(effect string, access []string, prefix string) (object, bucket []string) {
 	object, bucket = AccessActions(access, prefix)
 	if effect != AccessEffectBlock {
@@ -262,8 +264,16 @@ func accessActionsFor(effect string, access []string, prefix string) (object, bu
 	for _, a := range access {
 		switch a {
 		case AccessRead:
-			object = append(object, "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes")
+			// What reads an object's metadata: attributes, tags and ACL.
+			object = append(object, "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes",
+				"s3:GetObjectTagging", "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl")
 			bucket = append(bucket, "s3:ListBucketVersions", "s3:ListBucketMultipartUploads")
+		case AccessDelete:
+			// A lifecycle rule expires (deletes) objects. It is bucket-wide,
+			// so only a block of the whole bucket denies setting one.
+			if prefix == "" {
+				bucket = append(bucket, "s3:PutLifecycleConfiguration")
+			}
 		case AccessAll:
 			if prefix != "" {
 				bucket = append(bucket, "s3:ListBucketVersions", "s3:ListBucketMultipartUploads")
@@ -350,6 +360,14 @@ func (t S3Target) Notes(effect string, access []string) []AccessNote {
 	if effect == AccessEffectAllow {
 		out = append(out, AccessNote{Code: "allow_needs_bucket_policy",
 			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
+	}
+	if effect == AccessEffectBlock {
+		out = append(out, AccessNote{Code: "access_points_not_covered",
+			Message: "Requests through S3 Access Points or Multi-Region Access Points are not covered: they name the access point, not the bucket."})
+		if t.Prefix != "" && accessHas(access, AccessDelete) {
+			out = append(out, AccessNote{Code: "lifecycle_not_covered",
+				Message: "A bucket lifecycle rule can still expire objects in the folder; setting one is blocked only by a rule on the whole bucket."})
+		}
 	}
 	if effect == AccessEffectBlock && t.Prefix != "" && accessHas(access, AccessRead, AccessAll) {
 		out = append(out, AccessNote{Code: "list_root_blocked",

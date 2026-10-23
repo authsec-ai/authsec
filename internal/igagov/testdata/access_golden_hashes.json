@@ -66,12 +66,16 @@
     "sentence": "Block all access on s3://acme-invoices/invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
   },
   "access.s3.block_read_gov_partition": {
-    "document_hash": "sha256:009491d9d381df63ecd8214eb44edc071e76a895d7b2f64dd0fe2337c85123ff",
+    "document_hash": "sha256:5b3627d7faf63224ab53db659e81cd37efb799bc50f80a033f3f7d5fdaef2cfc",
     "actions": [
       "s3:GetObject",
+      "s3:GetObjectAcl",
       "s3:GetObjectAttributes",
+      "s3:GetObjectTagging",
       "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
       "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
       "s3:ListBucket",
       "s3:ListBucketMultipartUploads",
       "s3:ListBucketVersions"
@@ -83,12 +87,16 @@
     "sentence": "Block read on s3://acme-invoices/invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
   },
   "access.s3.block_read_long_prefix": {
-    "document_hash": "sha256:b0767ab04df424450ffcc4685586a26c7420b0b3e7eb791ebb6c84d0182f01f2",
+    "document_hash": "sha256:f823b26abc7322f9ac6db0874ba6ffa58490ab12894804cc91bb2b83bdf4139d",
     "actions": [
       "s3:GetObject",
+      "s3:GetObjectAcl",
       "s3:GetObjectAttributes",
+      "s3:GetObjectTagging",
       "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
       "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
       "s3:ListBucket",
       "s3:ListBucketMultipartUploads",
       "s3:ListBucketVersions"
@@ -100,12 +108,16 @@
     "sentence": "Block read on s3://acme-invoices/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij_reports_/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
   },
   "access.s3.block_read_prefix": {
-    "document_hash": "sha256:dc836757ed32ce5cb798e3432120e9a9ccd9394453310b71856a35c66e2cc75c",
+    "document_hash": "sha256:e21ef0d35e5b69b67b834f2658d6ebaab1c083ce6d6abdc270f3b086ec4fe558",
     "actions": [
       "s3:GetObject",
+      "s3:GetObjectAcl",
       "s3:GetObjectAttributes",
+      "s3:GetObjectTagging",
       "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
       "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
       "s3:ListBucket",
       "s3:ListBucketMultipartUploads",
       "s3:ListBucketVersions"

@@ -218,6 +218,7 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 		listRoot    = "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."
 		listPartial = "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."
 		otherPaths  = "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."
+		accessPts   = "Requests through S3 Access Points or Multi-Region Access Points are not covered: they name the access point, not the bucket."
 	)
 	allowIn := intent
 	allowIn.Effect, allowIn.Resource.Prefix = "allow", ""
@@ -231,11 +232,12 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 		pv   *services.AccessPreview
 		want []services.AccessIssue
 	}{
-		{"block read folder", intent, pv, []services.AccessIssue{{Code: "list_root_blocked", Message: listRoot}, {Code: "other_paths", Message: otherPaths}}},
+		{"block read folder", intent, pv, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts},
+			{Code: "list_root_blocked", Message: listRoot}, {Code: "other_paths", Message: otherPaths}}},
 		{"allow read bucket", allowIn, nil, []services.AccessIssue{{Code: "allow_needs_bucket_policy", Message: allowNeeds}, {Code: "other_paths", Message: otherPaths}}},
-		{"block read long folder", longIn, nil, []services.AccessIssue{{Code: "list_root_blocked", Message: listRoot},
+		{"block read long folder", longIn, nil, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts}, {Code: "list_root_blocked", Message: listRoot},
 			{Code: "list_partial_prefix", Message: listPartial}, {Code: "other_paths", Message: otherPaths}}},
-		{"block write folder", writeIn, nil, []services.AccessIssue{{Code: "other_paths", Message: otherPaths}}},
+		{"block write folder", writeIn, nil, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts}, {Code: "other_paths", Message: otherPaths}}},
 	} {
 		got := c.pv
 		if got == nil {
