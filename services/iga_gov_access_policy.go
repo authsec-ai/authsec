@@ -70,6 +70,8 @@ const (
 	GovCodeRolePolicyQuota      = "role_policy_quota"
 	GovCodeResourceNotFound     = "resource_not_found"
 	GovCodeResourceNotSupported = "resource_not_supported"
+	GovCodeResourceOtherAccount = "resource_other_account"
+	GovCodeResourceNotCurrent   = "resource_not_current"
 	GovCodeBindingMissing       = "binding_missing"
 	GovCodePolicyEnded          = "policy_ended"
 	GovCodeNameTaken            = "name_taken"
@@ -369,7 +371,11 @@ const accessTypeAzure = "azure_resource"
 
 // accessNotSupported refuses a Discovery row no access type reads.
 func accessNotSupported(row models.IGAResource) error {
-	return govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets are supported.",
+	msg := "Only S3 buckets and DynamoDB tables are supported."
+	if strings.Contains(row.DisplayName, ":dynamodb:") {
+		msg = "Pick one DynamoDB table; a pattern or a global-table ARN cannot be used."
+	}
+	return govUnprocessable(GovCodeResourceNotSupported, msg,
 		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
 }
 
@@ -441,6 +447,12 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	}
 	p.target = t
 	p.resource = accessResourceOf(norm.Resource.ResourceID, t)
+	// An ARN that names its account (a table) is placed by it; one that
+	// names none (a bucket) by the accounts whose scans saw it.
+	if t.ARNAccount() != "" && len(seenBy) == 0 {
+		return nil, govUnprocessable(GovCodeResourceNotCurrent, "AuthSec no longer sees this "+t.Noun()+" in a current scan.",
+			map[string]any{"field": "resource.resource_id"})
+	}
 
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
@@ -458,14 +470,27 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			}
 			return nil, err
 		}
-		if !seen[role.Connector] {
+		if t.ARNAccount() != "" {
+			// A Deny works on a table in any account; an Allow there would
+			// also need the table's resource policy, which AuthSec does not
+			// change.
+			field := map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID,
+				"resource_account_id": t.ARNAccount()}
+			if arnPartition(role.Identity.ARN) != t.ARNPartition() {
+				return nil, govUnprocessable(GovCodeResourceOtherAccount, "The "+t.Noun()+" is in another AWS partition than the role.", field)
+			}
+			if norm.Effect == igagov.AccessEffectAllow && role.Identity.AccountID != t.ARNAccount() {
+				return nil, govUnprocessable(GovCodeResourceOtherAccount,
+					"The "+t.Noun()+" is in AWS account "+t.ARNAccount()+", not the role's ("+role.Identity.AccountID+"); an allow works only in the same account.", field)
+			}
+		} else if !seen[role.Connector] {
 			return nil, govUnprocessable(GovCodeRoleNotInAccount,
 				"AuthSec has not seen this "+t.Noun()+" in the role's AWS account "+role.Identity.AccountID+".",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID})
 		}
 		p.roles = append(p.roles, role)
 	}
-	if len(p.roles) > 0 {
+	if len(p.roles) > 0 && p.resource.AccountID == "" {
 		p.resource.AccountID = p.roles[0].Identity.AccountID
 	}
 

@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -283,14 +284,15 @@ var (
 // policyCapabilities is the "policy" block of GET /api/iga/v1/capabilities
 // (§4.3): the gate (state, reason, schema_head), one boolean per feature with
 // a reason in "reasons" for every false one, and provider support.
-// withAccessPolicies adds policy.access_policies {available, reason}
-// (decision 2026-10-13).
+// withAccessPolicies adds policy.access_policies {available, reason,
+// resource_types} (decision 2026-10-13; resource_types are the AWS access
+// types, igagov.AccessTypes).
 func withAccessPolicies(out gin.H, db *gorm.DB) gin.H {
 	if db == nil {
 		return out
 	}
 	ok, reason := services.AccessPoliciesStatus(db)
-	out["access_policies"] = gin.H{"available": ok, "reason": nullIfEmpty(reason)}
+	out["access_policies"] = gin.H{"available": ok, "reason": nullIfEmpty(reason), "resource_types": igagov.AccessTypes()}
 	return out
 }
 
