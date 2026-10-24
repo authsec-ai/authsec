@@ -4,6 +4,20 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, step 4: Azure OpenAI / AI Services (both repos)
+
+### Done
+- A data-plane entry for `microsoft.cognitiveservices/accounts` (and `/deployments`). Read: every inference action (chat, completions, embeddings, audio, realtime, images, search) and reading files, stored completions, thread messages and responses. Write: files, fine-tunes, assistants, responses, batches, stored completions, deployments. Delete: the same objects. Every level includes `listKeys`/`regenerateKey` (a key reaches all data). The management read is not included, so Reader is never removed.
+- Allow: Cognitive Services OpenAI User (read; warned that it also creates assistants, responses and generations) or Contributor (write/delete).
+- ARM properties: no `customSubDomainName` → blocker `azure_ai_keys_only` (Entra tokens need it); local auth on → warning `azure_ai_keys_also`.
+- Role GUIDs and every action name were checked against Microsoft's built-in roles page and the provider operations page (2026-10-24); the Search role GUIDs from step 2 match as well.
+- UI: OpenAI access-level wording.
+
+### Not covered
+- Other data planes of an AI Services account (Speech, Language, Content Safety, MaaS): a role reaching only those is refused for read/write/delete (unclassified) and removed by "all".
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, step 3: AWS Secrets Manager, block only (both repos)
 
 ### Done
