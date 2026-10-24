@@ -50,6 +50,7 @@ const (
 	// Access policies on Azure resources (144): role assignments created,
 	// or removed and restored, per principal.
 	GovJobAzureAccess = "azure_access"
+	GovJobK8sAccess   = "k8s_access"
 )
 
 // GovJobKinds are the kinds 052 (widened by 061) accepts (all of them).

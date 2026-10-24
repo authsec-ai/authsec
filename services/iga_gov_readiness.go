@@ -355,16 +355,20 @@ func (r *GovReader) coverageAt(db *gorm.DB, ws uuid.UUID, rev int64) (map[uuid.U
 	return out, nil
 }
 
+// readinessRemedy is the console page that answers a role's category: the
+// connection's coverage or IaC sources, or the role's own page (the console
+// has no findings page since policy setup moved onto the connections).
 func readinessRemedy(rr ReadinessRole) string {
 	switch rr.Category {
 	case ReadinessBlockedByCollection:
 		return connectionCoverageLink(rr.ConnectorID)
-	case ReadinessNeedsOwner:
-		return "/iga/policy/findings?kind=missing_owner&identity_id=" + rr.IdentityAccountID.String()
 	case ReadinessIaCOnly:
-		return "/iga/policy/setup"
-	case ReadinessIneligible, ReadinessDirectEligible:
-		return "/iga/policy/findings?identity_id=" + rr.IdentityAccountID.String()
+		if rr.ConnectorID == nil {
+			return "/iga/connections"
+		}
+		return "/iga/connections/" + rr.ConnectorID.String() + "/iac"
+	case ReadinessNeedsOwner, ReadinessIneligible, ReadinessDirectEligible:
+		return "/iga/identities/" + rr.IdentityAccountID.String()
 	}
 	return ""
 }

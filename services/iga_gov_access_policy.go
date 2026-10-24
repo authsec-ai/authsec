@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/igagraph"
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -70,6 +73,8 @@ const (
 	GovCodeRolePolicyQuota      = "role_policy_quota"
 	GovCodeResourceNotFound     = "resource_not_found"
 	GovCodeResourceNotSupported = "resource_not_supported"
+	GovCodeResourceOtherAccount = "resource_other_account"
+	GovCodeResourceNotCurrent   = "resource_not_current"
 	GovCodeBindingMissing       = "binding_missing"
 	GovCodePolicyEnded          = "policy_ended"
 	GovCodeNameTaken            = "name_taken"
@@ -100,8 +105,11 @@ const (
 	accessEndPaused     = "paused"
 	accessEndEnded      = "ended"
 	accessEndSuperseded = "superseded"
-	// IAM's default quota of managed policies attached to a role.
-	accessAttachedQuota = 10
+	// Managed policies attached to a role: IAM's default quota, and the most
+	// an account can raise it to. Between the two AuthSec cannot read the
+	// account's own quota, so it warns; at the most, it refuses.
+	accessAttachedQuota    = 10
+	accessAttachedQuotaMax = 20
 	accessMaxList       = 1000
 )
 
@@ -233,18 +241,22 @@ type (
 		Name string    `json:"name"`
 		Kind string    `json:"kind"`
 	}
-	// AccessResourceView: provider is aws or azure. On Azure, arn is the ARM
+	// AccessResourceView: provider is aws or azure; resource_type is the
+	// access type (s3_bucket, dynamodb_table, ... from igagov.AccessTypes, or
+	// azure_resource), kind the Discovery row's kind. On Azure, arn is the ARM
 	// resource id and account_id the subscription id; bucket and prefix are
-	// empty.
+	// S3's only. region is set when the ARN names one.
 	AccessResourceView struct {
-		ResourceID string `json:"resource_id"`
-		ARN        string `json:"arn"`
-		Bucket     string `json:"bucket"`
-		Prefix     string `json:"prefix"`
-		AccountID  string `json:"account_id"`
-		Provider   string `json:"provider"`
-		Name       string `json:"name"`
-		Kind       string `json:"kind"`
+		ResourceID   string `json:"resource_id"`
+		ARN          string `json:"arn"`
+		Bucket       string `json:"bucket"`
+		Prefix       string `json:"prefix"`
+		AccountID    string `json:"account_id"`
+		Provider     string `json:"provider"`
+		Name         string `json:"name"`
+		Kind         string `json:"kind"`
+		ResourceType string `json:"resource_type"`
+		Region       string `json:"region,omitempty"`
 	}
 	// AccessRoleView: kind is the Discovery identity kind (iam_role,
 	// entra_service_principal, entra_managed_identity, ...). On Azure, arn is
@@ -337,7 +349,7 @@ type (
 type accessPlan struct {
 	intent   igagov.AccessIntent
 	hash     string
-	target   igagov.S3Target
+	target   igagov.AWSAccessTarget
 	resource AccessResourceView
 	roles    []*r2Role
 	doc      []byte
@@ -347,6 +359,10 @@ type accessPlan struct {
 	usedBy   map[uuid.UUID][]AccessWorkloadRef
 	warnings []AccessIssue
 	azure    *azurePlan // an Azure resource: role assignments, not an IAM policy
+	k8s      *k8sPlan   // a Kubernetes role: binding subjects the agent removes
+	// self is the policy being edited or resumed (nil on create): its own
+	// rows are not a conflict with it.
+	self *uuid.UUID
 }
 
 // nRoles is how many roles the plan changes.
@@ -354,7 +370,74 @@ func (p *accessPlan) nRoles() int {
 	if p.azure != nil {
 		return len(p.azure.principals)
 	}
+	if p.k8s != nil {
+		return len(p.k8s.subjects)
+	}
 	return len(p.roles)
+}
+
+// accessTypeAzure is resource_type for an Azure resource.
+const accessTypeAzure = "azure_resource"
+
+// accessNotSupported refuses a Discovery row no access type reads.
+func accessNotSupported(row models.IGAResource) error {
+	msg := "Only S3 buckets, DynamoDB tables, Secrets Manager secrets, SSM parameters, Bedrock models and agents, and AgentCore runtimes are supported."
+	switch {
+	case strings.Contains(row.DisplayName, ":dynamodb:"):
+		msg = "Pick one DynamoDB table; a pattern or a global-table ARN cannot be used."
+	case strings.Contains(row.DisplayName, ":secretsmanager:"):
+		msg = "Pick one secret: its full ARN, or <name>-??????. Other patterns and ARNs without the 6-character suffix cannot be used."
+	case strings.Contains(row.DisplayName, ":ssm:"):
+		msg = "Pick one SSM parameter by its full name; a pattern cannot be used."
+	case strings.Contains(row.DisplayName, ":bedrock:") || strings.Contains(row.DisplayName, ":bedrock-agentcore:"):
+		msg = "Pick one Bedrock model (or a cross-region inference profile of it), one agent or one AgentCore runtime; a pattern cannot be used."
+	}
+	return govUnprocessable(GovCodeResourceNotSupported, msg,
+		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
+}
+
+// accessWorkloadKinds are the discovered workloads an access policy can name
+// by their workload id (step 6): Bedrock agents and AgentCore runtimes, which
+// IAM policies seldom name one by one.
+var accessWorkloadKinds = []string{models.WorkloadBedrockAgent, models.WorkloadBedrockAgentCoreRT}
+
+// accessWorkloadRows reads the discovered workloads among ids as resource
+// rows: the ARN is the workload's recognition key (igagraph.WorkloadKey).
+func accessWorkloadRows(db *gorm.DB, ws uuid.UUID, ids []string) ([]models.IGAResource, error) {
+	var valid []uuid.UUID
+	for _, id := range ids {
+		if u, err := uuid.Parse(id); err == nil {
+			valid = append(valid, u)
+		}
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+	var wls []models.IGAWorkload
+	if err := db.Where("workspace_id = ? AND id IN ? AND provider = ? AND runtime_kind IN ?", ws, valid, models.ProviderAWS, accessWorkloadKinds).
+		Find(&wls).Error; err != nil {
+		return nil, err
+	}
+	out := make([]models.IGAResource, 0, len(wls))
+	for _, w := range wls {
+		arn := strings.TrimPrefix(w.SourceKey, "aws"+igagraph.Sep)
+		if !strings.HasPrefix(arn, "arn:") {
+			continue
+		}
+		out = append(out, models.IGAResource{ID: w.ID, WorkspaceID: w.WorkspaceID, ResourceKind: w.RuntimeKind, DisplayName: arn,
+			Provider: models.ProviderAWS, SourceKey: w.SourceKey})
+	}
+	return out, nil
+}
+
+// accessResourceOf is the view of an AWS target (bucket and prefix are S3's).
+func accessResourceOf(id string, t igagov.AWSAccessTarget) AccessResourceView {
+	v := AccessResourceView{ResourceID: id, ARN: t.ARN(), Name: t.Name(), AccountID: t.ARNAccount(), Region: t.ARNRegion(),
+		ResourceType: t.Type(), Provider: models.ProviderAWS}
+	if s, ok := t.(igagov.S3Target); ok {
+		v.Bucket, v.Prefix = s.Bucket, s.Prefix
+	}
+	return v
 }
 
 func accessFieldErr(err error) error {
@@ -386,8 +469,26 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 		if err := db.Where("workspace_id = ? AND id = ?", ws, norm.Resource.ResourceID).Limit(1).Find(&rows).Error; err != nil {
 			return err
 		}
-		return db.Table("iga_object_support").Where("workspace_id = ? AND resource_id = ? AND state = ? AND connector_id IS NOT NULL",
-			ws, norm.Resource.ResourceID, "current").Distinct().Pluck("connector_id", &seenBy).Error
+		support := db.Table("iga_object_support").Where("workspace_id = ? AND state = ? AND connector_id IS NOT NULL", ws, "current")
+		if len(rows) == 0 {
+			// A discovered agent or agent runtime, named by its workload id.
+			var err error
+			if rows, err = accessWorkloadRows(db, ws, []string{norm.Resource.ResourceID}); err != nil {
+				return err
+			}
+			support = support.Where("workload_id = ?", norm.Resource.ResourceID)
+			if len(rows) == 0 {
+				// A Kubernetes Role or ClusterRole, named by its graph id.
+				if ok, _ := K8sAccessSchemaStatus(db); ok {
+					if rows, err = accessK8sRoleRows(db, ws, []string{norm.Resource.ResourceID}); err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			support = support.Where("resource_id = ?", norm.Resource.ResourceID)
+		}
+		return support.Distinct().Pluck("connector_id", &seenBy).Error
 	}); err != nil {
 		return nil, err
 	}
@@ -396,21 +497,57 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			map[string]any{"field": "resource.resource_id"})
 	}
 	if rows[0].Provider == models.ProviderAzure {
-		p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: rows[0].DisplayName}
+		p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: rows[0].DisplayName, ResourceType: accessTypeAzure}
 		if err := s.planAzure(ctx, ws, p, rows[0]); err != nil {
 			return nil, err
 		}
 		p.resource.ARN, p.resource.AccountID = p.azure.target.Scope, p.azure.target.SubscriptionID
 		return p, nil
 	}
-	t, ok := igagov.ParseS3BucketARN(rows[0].DisplayName)
-	if !ok || rows[0].Provider != models.ProviderAWS {
-		return nil, govUnprocessable(GovCodeResourceNotSupported, "Only S3 buckets are supported.",
-			map[string]any{"field": "resource.resource_id", "resource_kind": rows[0].ResourceKind})
+	if rows[0].Provider == models.ProviderK8s {
+		if err := s.planK8s(ctx, ws, p, rows[0]); err != nil {
+			return nil, err
+		}
+		return p, nil
 	}
-	t.Prefix = norm.Resource.Prefix
+	if rows[0].Provider != models.ProviderAWS {
+		return nil, accessNotSupported(rows[0])
+	}
+	t, err := igagov.ParseAWSAccessTarget(rows[0].DisplayName, norm.Resource.Prefix)
+	if errors.Is(err, igagov.ErrAccessNotSupported) {
+		return nil, accessNotSupported(rows[0])
+	}
+	if err != nil {
+		return nil, accessFieldErr(err)
+	}
 	p.target = t
-	p.resource = AccessResourceView{ResourceID: norm.Resource.ResourceID, ARN: t.BucketARN(), Bucket: t.Bucket, Prefix: t.Prefix}
+	p.resource = accessResourceOf(norm.Resource.ResourceID, t)
+	if k, _ := igagov.AccessKindOf(t.Type()); k.BlockOnly && norm.Effect == igagov.AccessEffectAllow {
+		return nil, govUnprocessable(GovCodeAccessInvalid, "A "+t.Noun()+" can only be blocked in this release.",
+			map[string]any{"field": "effect", "resource_type": t.Type()})
+	}
+	// An ARN that names its account (a table) is placed by it; one that
+	// names none (a bucket) by the accounts whose scans saw it.
+	if t.ARNAccount() != "" && len(seenBy) == 0 {
+		return nil, govUnprocessable(GovCodeResourceNotCurrent, "AuthSec no longer sees this "+t.Noun()+" in a current scan.",
+			map[string]any{"field": "resource.resource_id"})
+	}
+	var existence *AccessIssue
+	if sec, ok := t.(igagov.SecretTarget); ok {
+		if existence, err = s.secretListed(ctx, ws, seenBy, sec); err != nil {
+			return nil, err
+		}
+	}
+	if fn, ok := t.(igagov.LambdaTarget); ok && norm.Effect == igagov.AccessEffectBlock &&
+		(slices.Contains(norm.Access, igagov.AccessRead) || slices.Contains(norm.Access, igagov.AccessAll)) {
+		public, err := s.functionURLPublic(ctx, ws, seenBy, fn)
+		if err != nil {
+			return nil, err
+		}
+		if public {
+			existence = &AccessIssue{Code: GovCodeFunctionURLPublic, Message: "This function has a function URL with auth type NONE: anyone with the URL can invoke it, and no IAM policy can stop that. Remove the URL or set its auth type to AWS_IAM."}
+		}
+	}
 
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
@@ -428,14 +565,27 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			}
 			return nil, err
 		}
-		if !seen[role.Connector] {
+		if t.ARNAccount() != "" {
+			// A Deny works on a table in any account; an Allow there would
+			// also need the table's resource policy, which AuthSec does not
+			// change.
+			field := map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID,
+				"resource_account_id": t.ARNAccount()}
+			if arnPartition(role.Identity.ARN) != t.ARNPartition() {
+				return nil, govUnprocessable(GovCodeResourceOtherAccount, "The "+t.Noun()+" is in another AWS partition than the role.", field)
+			}
+			if norm.Effect == igagov.AccessEffectAllow && role.Identity.AccountID != t.ARNAccount() {
+				return nil, govUnprocessable(GovCodeResourceOtherAccount,
+					"The "+t.Noun()+" is in AWS account "+t.ARNAccount()+", not the role's ("+role.Identity.AccountID+"); an allow works only in the same account.", field)
+			}
+		} else if !seen[role.Connector] {
 			return nil, govUnprocessable(GovCodeRoleNotInAccount,
-				"AuthSec has not seen this bucket in the role's AWS account "+role.Identity.AccountID+".",
+				"AuthSec has not seen this "+t.Noun()+" in the role's AWS account "+role.Identity.AccountID+".",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "account_id": role.Identity.AccountID})
 		}
 		p.roles = append(p.roles, role)
 	}
-	if len(p.roles) > 0 {
+	if len(p.roles) > 0 && p.resource.AccountID == "" {
 		p.resource.AccountID = p.roles[0].Identity.AccountID
 	}
 
@@ -445,6 +595,10 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	}
 	p.doc, p.docHash, p.actions, p.res, err = igagov.AccessDocument(norm.Effect, norm.Access, t, norm.StartsAt, end)
 	if err != nil {
+		var fe *igagov.AccessFieldError
+		if errors.As(err, &fe) {
+			return nil, accessFieldErr(err)
+		}
 		return nil, govUnprocessable(GovCodeAccessInvalid, err.Error(), nil)
 	}
 	if norm.Effect == igagov.AccessEffectAllow {
@@ -456,27 +610,122 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	if p.usedBy, err = s.usedBy(ctx, ws, p.roleIDs()); err != nil {
 		return nil, err
 	}
-	if norm.Effect == igagov.AccessEffectAllow {
-		p.warnings = append(p.warnings, AccessIssue{Code: "allow_needs_bucket_policy",
-			Message: "If the bucket is in another AWS account, its bucket policy must allow the role as well."})
+	for _, n := range t.Notes(norm.Effect, norm.Access) {
+		p.warnings = append(p.warnings, AccessIssue{Code: n.Code, Message: n.Message})
 	}
-	if norm.Effect == igagov.AccessEffectBlock && norm.Resource.Prefix != "" {
-		for _, a := range norm.Access {
-			if a != igagov.AccessRead && a != igagov.AccessAll {
-				continue
-			}
-			p.warnings = append(p.warnings, AccessIssue{Code: "list_root_blocked",
-				Message: "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."})
-			if igagov.AccessListGuardPartial(norm.Effect, norm.Resource.Prefix) {
-				p.warnings = append(p.warnings, AccessIssue{Code: "list_partial_prefix",
-					Message: "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."})
-			}
-			break
+	if existence != nil {
+		p.warnings = append(p.warnings, *existence)
+	}
+	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths", Message: t.OtherPaths()})
+	return p, nil
+}
+
+// completeScansOf is, per connector among seenBy that scans account, its
+// latest published scan when that scan's resource-policy collection of form
+// in region is complete.
+func completeScansOf(db *gorm.DB, ws uuid.UUID, seenBy []uuid.UUID, account, form, region string) ([]uuid.UUID, error) {
+	if len(seenBy) == 0 {
+		return nil, nil
+	}
+	var conns []uuid.UUID
+	if err := db.Table("cloud_connector").Where("workspace_id = ? AND id IN ? AND provider = ? AND scope_id = ?",
+		ws, seenBy, models.ProviderAWS, account).Pluck("id", &conns).Error; err != nil {
+		return nil, err
+	}
+	var out []uuid.UUID
+	for _, c := range conns {
+		var runs []uuid.UUID
+		if err := db.Raw(`SELECT id FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ? AND status = 'published'
+		                   ORDER BY generation DESC, published_at DESC LIMIT 1`, ws, c).Scan(&runs).Error; err != nil {
+			return nil, err
+		}
+		if len(runs) == 0 {
+			continue
+		}
+		var n int64
+		if err := db.Table("cloud_resource_policy_coverage").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND region = ? AND state = ?",
+			ws, runs[0], form, region, "complete").Count(&n).Error; err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			out = append(out, runs[0])
 		}
 	}
-	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths",
-		Message: "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."})
-	return p, nil
+	return out, nil
+}
+
+// GovCodeFunctionURLPublic: the function has a function URL anyone can call.
+const GovCodeFunctionURLPublic = "function_url_public"
+
+// functionURLPublic reports whether the latest complete scan of the
+// function's account read a resource policy letting anyone invoke its
+// function URL (auth type NONE): no IAM policy reaches such a caller.
+func (s *GovAccess) functionURLPublic(ctx context.Context, ws uuid.UUID, seenBy []uuid.UUID, t igagov.LambdaTarget) (bool, error) {
+	public := false
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		runs, err := completeScansOf(db, ws, seenBy, t.Account, igagov.AccessTypeLambdaFunction, t.Region)
+		if err != nil || len(runs) == 0 {
+			return err
+		}
+		var docs []json.RawMessage
+		if err := db.Table("cloud_resource_policy_observation o").
+			Joins("JOIN cloud_policy_document d ON d.workspace_id = o.workspace_id AND d.document_hash = o.document_hash").
+			Where("o.workspace_id = ? AND o.scan_run_id IN ? AND o.resource_arn = ? AND o.policy_present", ws, runs, t.ARN()).
+			Pluck("d.document", &docs).Error; err != nil {
+			return err
+		}
+		for _, d := range docs {
+			public = public || igagov.PublicFunctionURL(d)
+		}
+		return nil
+	})
+	return public, err
+}
+
+// GovCodeExistenceNotVerified: no complete scan says whether the secret
+// exists.
+const GovCodeExistenceNotVerified = "existence_not_verified"
+
+// secretListed checks the secret against ListSecrets of the latest published
+// scan of its own account: a partial ARN whose name ends in six characters
+// ("prod/db-backup") reads as a shorter name, so a name no complete scan
+// lists is refused. With no complete scan of the account and region it is a
+// warning. ListSecrets leaves out a secret scheduled for deletion.
+func (s *GovAccess) secretListed(ctx context.Context, ws uuid.UUID, seenBy []uuid.UUID, t igagov.SecretTarget) (*AccessIssue, error) {
+	checked, found := false, false
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		runs, err := completeScansOf(db, ws, seenBy, t.Account, igagov.AccessTypeSecretsManagerSecret, t.Region)
+		if err != nil {
+			return err
+		}
+		prefix := "arn:" + t.Partition + ":secretsmanager:" + t.Region + ":" + t.Account + ":secret:"
+		for _, run := range runs {
+			checked = true
+			var arns []string
+			if err := db.Table("cloud_resource_policy_observation").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND starts_with(resource_arn, ?)",
+				ws, run, igagov.AccessTypeSecretsManagerSecret, prefix).Pluck("resource_arn", &arns).Error; err != nil {
+				return err
+			}
+			for _, a := range arns {
+				if o, ok := igagov.ParseSecretsManagerSecretARN(a); ok && o.Secret == t.Secret && (t.Suffix == "" || o.Suffix == t.Suffix) {
+					found = true
+					return nil
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	switch {
+	case found:
+		return nil, nil
+	case checked:
+		return nil, govUnprocessable(GovCodeResourceNotCurrent,
+			"AuthSec's last scan of account "+t.Account+" lists no secret named "+t.Secret+" in "+t.Region+" (a secret scheduled for deletion is not listed).",
+			map[string]any{"field": "resource.resource_id"})
+	}
+	return &AccessIssue{Code: GovCodeExistenceNotVerified, Message: "AuthSec could not confirm from a complete scan that this secret exists; check the name."}, nil
 }
 
 func (p *accessPlan) roleIDs() []uuid.UUID {
@@ -549,6 +798,9 @@ func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []e
 	if p.azure != nil {
 		return s.azureChecks(ctx, ws, p)
 	}
+	if p.k8s != nil {
+		return s.k8sChecks(ctx, ws, p)
+	}
 	var errs []error
 	done := map[uuid.UUID]bool{}
 	for _, r := range p.roles {
@@ -568,10 +820,15 @@ func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []e
 				Message: "AuthSec could not read how many policies " + r.Identity.Name + " has attached: " + err.Error()})
 			continue
 		}
-		if n >= accessAttachedQuota {
+		switch {
+		case n >= accessAttachedQuotaMax:
 			errs = append(errs, govUnprocessable(GovCodeRolePolicyQuota,
-				fmt.Sprintf("%s already has %d managed policies attached, the IAM limit.", r.Identity.Name, n),
+				fmt.Sprintf("%s already has %d managed policies attached, the most IAM allows.", r.Identity.Name, n),
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "attached": n}))
+		case n >= accessAttachedQuota:
+			p.warnings = append(p.warnings, AccessIssue{Code: "quota_may_be_reached",
+				Message: fmt.Sprintf("%s already has %d managed policies attached; IAM's default limit is %d. This works only if the account's quota was raised; otherwise AWS refuses it and AuthSec removes what it created.",
+					r.Identity.Name, n, accessAttachedQuota)})
 		}
 	}
 	return errs
@@ -639,6 +896,18 @@ func (s *GovAccess) Preview(ctx context.Context, ws uuid.UUID, in igagov.AccessI
 		out.Warnings = append(out.Warnings, p.warnings...)
 		return out, nil
 	}
+	if p.k8s != nil {
+		names := make([]string, 0, len(p.k8s.subjects))
+		for _, sp := range p.k8s.subjects {
+			names = append(names, sp.name)
+			out.Documents = append(out.Documents, AccessDocumentView{IdentityAccountID: sp.identity, RoleName: sp.name,
+				PolicyName: "Kubernetes binding subjects", Document: p.doc})
+			out.AlsoAffected = append(out.AlsoAffected, AccessAlsoAffected{IdentityAccountID: sp.identity, Workloads: []AccessWorkloadRef{}})
+		}
+		out.Sentence = k8sSentence(p.intent, p.k8s, names)
+		out.Warnings = append(out.Warnings, p.warnings...)
+		return out, nil
+	}
 	names := make([]string, 0, len(p.roles))
 	for _, r := range p.roles {
 		names = append(names, r.Identity.Name)
@@ -668,6 +937,9 @@ func (s *GovAccess) deployTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, v *mode
 	if p.azure != nil {
 		return s.deployAzureTx(tx, ws, actor, policyID, v, p, now)
 	}
+	if p.k8s != nil {
+		return s.deployK8sTx(tx, ws, actor, policyID, v, p, now)
+	}
 	if err := archiveDocumentTx(tx, ws, string(p.doc), p.docHash); err != nil {
 		return err
 	}
@@ -683,6 +955,17 @@ func (s *GovAccess) deployTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, v *mode
 	res, _ := json.Marshal(p.res)
 	for _, r := range p.roles {
 		name := igagov.AccessPolicyName(r.Identity.RoleID, policyID.String(), v.VersionNo)
+		// A version deployed again (Resume) gets its own name: the earlier
+		// deployment's policy may still exist, kept because it is attached
+		// elsewhere, and is not this row's.
+		var earlier int64
+		if err := tx.Model(&models.IGAGovTempGrant{}).Where("workspace_id = ? AND (policy_name = ? OR policy_name LIKE ?)",
+			ws, name, name+"-r%").Count(&earlier).Error; err != nil {
+			return err
+		}
+		if earlier > 0 {
+			name = fmt.Sprintf("%s-r%d", name, earlier+1)
+		}
 		h, err := igagov.AccessDeploymentHash(r.Identity.RoleID, r.Identity.AccountID, v.ID.String(), p.docHash)
 		if err != nil {
 			return err
@@ -732,6 +1015,8 @@ func (s *GovAccess) Create(ctx context.Context, ws, actor uuid.UUID, req AccessP
 		return nil, errs[0]
 	}
 	intent, _ := json.Marshal(p.intent)
+	// provider is the policy family's (049 admits only aws); an access
+	// policy's cloud is its resource's (views, ?provider=).
 	pol := models.IGAGovPolicy{ID: uuid.New(), WorkspaceID: ws, Name: name, Purpose: reason, Family: "time_bound", Provider: "aws",
 		Lifecycle: "active", CreatedBy: actor, CreatedAt: now, UpdatedAt: now}
 	v := models.IGAGovAccessPolicyVersion{ID: uuid.New(), WorkspaceID: ws, PolicyID: pol.ID, VersionNo: 1, Intent: intent,
@@ -841,7 +1126,11 @@ func endRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason stri
 		n++
 	}
 	m, err := endAzureRowsTx(tx, ws, policyID, keep, reason, now)
-	return n + m, err
+	if err != nil {
+		return n + m, err
+	}
+	k, err := endK8sRowsTx(tx, ws, policyID, keep, reason, now)
+	return n + m + k, err
 }
 
 // accessAfterActiveTx runs when a deployment row turned active: once every
@@ -894,6 +1183,7 @@ func (s *GovAccess) Edit(ctx context.Context, ws, actor, id uuid.UUID, req Acces
 	if err != nil {
 		return nil, err
 	}
+	p.self = &id
 	if pol.Lifecycle == "active" {
 		if errs := s.checks(ctx, ws, p); len(errs) > 0 {
 			return nil, errs[0]
@@ -1084,6 +1374,7 @@ func (s *GovAccess) Resume(ctx context.Context, ws, actor, id uuid.UUID, req Acc
 	if err != nil {
 		return nil, err
 	}
+	p.self = &id
 	if errs := s.checks(ctx, ws, p); len(errs) > 0 {
 		return nil, errs[0]
 	}
@@ -1131,6 +1422,8 @@ type accessBundle struct {
 	versions []models.IGAGovAccessPolicyVersion
 	rows     []models.IGAGovTempGrant
 	// azureDocs: an Azure row's document, by its rows[] DocumentHash;
+	// k8sRows: the Kubernetes rows behind rows[], by id.
+	k8sRows map[uuid.UUID]models.IGAGovK8sAccess
 	// azureRows: the Azure rows behind rows[], by id.
 	azureDocs map[string]json.RawMessage
 	azureRows map[uuid.UUID]models.IGAGovAzureAccess
@@ -1146,16 +1439,23 @@ func (s *GovAccess) bundles(ctx context.Context, ws uuid.UUID, ids []uuid.UUID, 
 	return out, err
 }
 
-// loadAccessBundles reads the policies, versions and deployments (in the
-// caller's workspace transaction).
-func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
+// accessPolicyQuery is the workspace's live access policies matching q (name
+// or reason).
+func accessPolicyQuery(db *gorm.DB, ws uuid.UUID, q string) *gorm.DB {
 	pq := db.Where("workspace_id = ? AND family = ? AND deleted_at IS NULL", ws, "time_bound")
-	if ids != nil {
-		pq = pq.Where("id IN ?", ids)
-	}
 	if q = strings.TrimSpace(q); q != "" {
 		like := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(q) + "%"
 		pq = pq.Where("(name ILIKE ? OR purpose ILIKE ?)", like, like)
+	}
+	return pq
+}
+
+// loadAccessBundles reads the policies, versions and deployments (in the
+// caller's workspace transaction).
+func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]*accessBundle, error) {
+	pq := accessPolicyQuery(db, ws, q)
+	if ids != nil {
+		pq = pq.Where("id IN ?", ids)
 	}
 	var pols []models.IGAGovPolicy
 	if err := pq.Order("created_at DESC, id DESC").Limit(accessMaxList).Find(&pols).Error; err != nil {
@@ -1187,6 +1487,24 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 	for _, r := range rows {
 		by[*r.PolicyID].rows = append(by[*r.PolicyID].rows, r)
 	}
+	if ok, _ := K8sAccessSchemaStatus(db); ok {
+		var ks []models.IGAGovK8sAccess
+		if err := db.Where("workspace_id = ? AND policy_id IN ?", ws, pids).Order("created_at").Find(&ks).Error; err != nil {
+			return nil, err
+		}
+		for _, a := range ks {
+			b := by[a.PolicyID]
+			b.rows = append(b.rows, k8sAsGrant(a))
+			if b.azureDocs == nil {
+				b.azureDocs = map[string]json.RawMessage{}
+			}
+			if b.k8sRows == nil {
+				b.k8sRows = map[uuid.UUID]models.IGAGovK8sAccess{}
+			}
+			b.azureDocs["k8s:"+a.ID.String()] = k8sRowDocument(a)
+			b.k8sRows[a.ID] = a
+		}
+	}
 	// Without 144 there are no Azure rows, and AWS policies read as before.
 	if ok, _ := AzureAccessSchemaStatus(db); !ok {
 		return out, nil
@@ -1200,6 +1518,8 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 		b.rows = append(b.rows, azureAsGrant(a))
 		if b.azureDocs == nil {
 			b.azureDocs = map[string]json.RawMessage{}
+		}
+		if b.azureRows == nil {
 			b.azureRows = map[uuid.UUID]models.IGAGovAzureAccess{}
 		}
 		b.azureDocs["azure:"+a.ID.String()] = azureRowDocument(a)
@@ -1241,6 +1561,9 @@ func accessTerminal(state string) bool {
 // accessRemovingText is the status reason while a policy comes out of the
 // cloud.
 func accessRemovingText(b *accessBundle, in igagov.AccessIntent) string {
+	if len(b.k8sRows) > 0 {
+		return "putting ServiceAccounts back into their bindings"
+	}
 	if len(b.azureRows) == 0 {
 		return "removing from AWS"
 	}
@@ -1307,6 +1630,11 @@ func accessStatus(b *accessBundle, now time.Time) (status, reason, endReason str
 		case models.R2StateFailed:
 			failed = append(failed, r.RoleARN+": "+r.StateReason)
 		case models.R2StateApproved, models.R2StateDeploying, models.R2StateOutcomeUnknown:
+			// An Azure row waits approved until its start: that is scheduled,
+			// not applying.
+			if r.State == models.R2StateApproved && r.StartsAt != nil && now.Before(*r.StartsAt) {
+				break
+			}
 			applying = append(applying, r.RoleARN)
 		case models.R2StateActive:
 			if r.Drift != "" && r.Drift != R2ReasonAttachedElsewhere {
@@ -1423,6 +1751,31 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		if err := db.Where("workspace_id = ? AND id IN ?", ws, rids).Find(&resRows).Error; err != nil {
 			return nil, err
 		}
+		if len(resRows) < len(rids) {
+			// The rest may be discovered agents named by their workload id.
+			found := map[string]bool{}
+			for _, r := range resRows {
+				found[r.ID.String()] = true
+			}
+			var rest []string
+			for _, id := range rids {
+				if !found[id] {
+					rest = append(rest, id)
+				}
+			}
+			wl, err := accessWorkloadRows(db, ws, rest)
+			if err != nil {
+				return nil, err
+			}
+			resRows = append(resRows, wl...)
+			if ok, _ := K8sAccessSchemaStatus(db); ok && len(wl) < len(rest) {
+				kr, err := accessK8sRoleRows(db, ws, rest)
+				if err != nil {
+					return nil, err
+				}
+				resRows = append(resRows, kr...)
+			}
+		}
 	}
 	resARN := map[string]string{}
 	resRow := map[string]models.IGAResource{}
@@ -1444,14 +1797,26 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 			v.VersionNo = cur.VersionNo
 		}
 		v.Status, v.StatusReason, v.EndReason, v.EndedAt = accessStatus(b, now)
-		t, _ := igagov.ParseS3BucketARN(resARN[in.Resource.ResourceID])
-		t.Prefix = in.Resource.Prefix
-		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Bucket: t.Bucket, Prefix: t.Prefix, Provider: models.ProviderAWS}
+		t, terr := igagov.ParseAWSAccessTarget(resARN[in.Resource.ResourceID], in.Resource.Prefix)
+		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Prefix: in.Resource.Prefix, Provider: models.ProviderAWS}
 		rr := resRow[in.Resource.ResourceID]
 		v.Resource.Kind = rr.ResourceKind
 		switch {
+		case rr.Provider == models.ProviderK8s || len(b.k8sRows) > 0:
+			v.Resource.Provider, v.Resource.ResourceType, v.Resource.Prefix = models.ProviderK8s, accessTypeK8sRole, ""
+			v.Resource.ARN = rr.SourceKey
+			if k, ok := k8sgraph.ParseKey(rr.SourceKey); ok {
+				v.Resource.Name, v.Resource.AccountID = k8sRoleLabel(k), k.Cluster
+			}
+			for _, a := range b.k8sRows {
+				if v.Resource.Name == "" {
+					v.Resource.Name = a.RoleName
+				}
+				v.Resource.AccountID = a.Cluster
+			}
 		case rr.Provider == models.ProviderAzure || len(b.azureRows) > 0:
-			v.Resource.Provider, v.Resource.Name = models.ProviderAzure, rr.DisplayName
+			v.Resource.Provider, v.Resource.Name, v.Resource.ResourceType = models.ProviderAzure, rr.DisplayName, accessTypeAzure
+			v.Resource.Prefix = ""
 			v.Resource.ARN = azureARMIDOfKey(rr.SourceKey)
 			for _, a := range b.azureRows {
 				if v.Resource.ARN == "" {
@@ -1459,8 +1824,10 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				}
 				v.Resource.AccountID = a.SubscriptionID
 			}
-		case t.Bucket != "":
-			v.Resource.ARN, v.Resource.Name = t.BucketARN(), t.Bucket
+		case terr == nil:
+			kind := v.Resource.Kind
+			v.Resource = accessResourceOf(in.Resource.ResourceID, t)
+			v.Resource.Kind = kind
 		default:
 			v.Resource.ARN, v.Resource.Name = resARN[in.Resource.ResourceID], resARN[in.Resource.ResourceID]
 		}
@@ -1476,7 +1843,12 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				rv.UsedBy = []AccessWorkloadRef{}
 			}
 			if g, ok := arnOf[id]; ok {
-				if a, az := b.azureRows[g.ID]; az {
+				if a, ok := b.k8sRows[g.ID]; ok {
+					rv.AccountID = a.Cluster
+					if rv.Name == "" {
+						rv.Name = k8sSubjectName(a)
+					}
+				} else if a, az := b.azureRows[g.ID]; az {
 					rv.AccountID = a.SubscriptionID
 					if rv.Name == "" {
 						rv.Name = a.PrincipalName
@@ -1524,6 +1896,12 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 					awsARN, target = "", a.Scope
 					if name == "" || name == r.RoleARN {
 						name = a.PrincipalName
+					}
+				}
+				if a, ok := b.k8sRows[r.ID]; ok {
+					awsARN, target = "", k8sBindingRef(a)
+					if name == "" || name == r.RoleARN {
+						name = k8sSubjectName(a)
 					}
 				}
 				v.Deployments = append(v.Deployments, AccessDeploymentView{IdentityAccountID: r.IdentityAccountID, RoleName: name,
@@ -1589,15 +1967,33 @@ type AccessListQuery struct {
 	Limit                                                              int
 }
 
+// AccessListPage is one page of the list. Truncated: the workspace has more
+// than accessMaxList policies matching q, and only the newest were read
+// (status is worked out per policy, so the filters run over those).
+type AccessListPage struct {
+	Policies  []AccessPolicyView
+	Next      string
+	Truncated bool
+}
+
 // List is GET / (newest first; filters on status, effect, q, resource and
 // role; an opaque offset cursor).
 func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) ([]AccessPolicyView, string, error) {
+	pg, err := s.ListPage(ctx, ws, q)
+	if err != nil {
+		return nil, "", err
+	}
+	return pg.Policies, pg.Next, nil
+}
+
+// ListPage is List, saying whether the read stopped at accessMaxList.
+func (s *GovAccess) ListPage(ctx context.Context, ws uuid.UUID, q AccessListQuery) (*AccessListPage, error) {
 	if q.Limit <= 0 || q.Limit > MaxGovPage {
 		q.Limit = 50
 	}
 	q.Provider = strings.ToLower(strings.TrimSpace(q.Provider))
-	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure {
-		return nil, "", GovBadParam("provider", "provider is aws or azure.")
+	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure && q.Provider != models.ProviderK8s {
+		return nil, GovBadParam("provider", "provider is aws, azure or k8s.")
 	}
 	off := 0
 	if q.Cursor != "" {
@@ -1606,16 +2002,26 @@ func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) (
 			off, err = strconv.Atoi(strings.TrimPrefix(string(raw), "o:"))
 		}
 		if err != nil || off < 0 {
-			return nil, "", GovBadParam("cursor", "Malformed cursor.")
+			return nil, GovBadParam("cursor", "Malformed cursor.")
 		}
 	}
 	bs, err := s.bundles(ctx, ws, nil, q.Q)
 	if err != nil {
-		return nil, "", err
+		return nil, err
+	}
+	truncated := false
+	if len(bs) >= accessMaxList {
+		var n int64
+		if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+			return accessPolicyQuery(db, ws, q.Q).Model(&models.IGAGovPolicy{}).Count(&n).Error
+		}); err != nil {
+			return nil, err
+		}
+		truncated = n > accessMaxList
 	}
 	vs, err := s.views(ctx, ws, bs, false)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	effect := strings.ToLower(strings.TrimSpace(q.Effect))
 	filtered := make([]AccessPolicyView, 0, len(vs))
@@ -1653,7 +2059,7 @@ func (s *GovAccess) List(ctx context.Context, ws uuid.UUID, q AccessListQuery) (
 	} else {
 		end = len(filtered)
 	}
-	return filtered[off:end], next, nil
+	return &AccessListPage{Policies: filtered[off:end], Next: next, Truncated: truncated}, nil
 }
 
 // AccessEventView is one history row.

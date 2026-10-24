@@ -74,6 +74,9 @@ const (
 	r2EndReasonRevoked       = "revoked"
 	r2EndReasonLifted        = "lifted"
 	r2EndReasonNeverDeployed = "expired_before_deploy"
+	// r2EndReasonFailed: an access policy's deployment failed after it may
+	// have changed IAM; it is removed, then ends failed.
+	r2EndReasonFailed = "failed"
 )
 
 // GovR2 is the R2 service (requests, decisions, jobs). Every statement runs
@@ -551,6 +554,9 @@ func (s *GovR2) TempGrantHandler(ctx context.Context, run *PolicyJobRun) error {
 // expiry, revoked for any early end (revoke; an access policy's paused,
 // ended or superseded).
 func grantFinal(endReason string) string {
+	if endReason == r2EndReasonFailed {
+		return models.R2StateFailed
+	}
 	if endReason == "" || endReason == r2EndReasonExpired || endReason == r2EndReasonNeverDeployed {
 		return models.R2StateExpired
 	}
@@ -977,6 +983,24 @@ func (h r2Handler) deploy(ctx context.Context, from string) error {
 }
 
 func (h r2Handler) fail(ctx context.Context, from, code, detail string) error {
+	// An access policy's deployment that may already have changed IAM (it got
+	// past approved) is taken out before it ends failed: a failed row is never
+	// worked again, so whatever it attached would stay on the role.
+	if h.kind.Name == r2AccessKind.Name && from != models.R2StateApproved {
+		err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+			if err := h.moveTx(tx, from, models.R2StateExpiring, map[string]any{"state_reason": code + ": " + detail,
+				"end_reason": r2EndReasonFailed}); err != nil {
+				return err
+			}
+			return h.event(tx, h.ws, h.kind.EvFailed, map[string]any{h.kind.IDKey: h.id, "from": from, "reason": code, "detail": detail,
+				"note": "AuthSec removes what it attached."})
+		})
+		if err != nil {
+			return h.settled(err)
+		}
+		h.endReason = r2EndReasonFailed
+		return h.absent(ctx, models.R2StateExpiring, models.R2StateFailed)
+	}
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := h.moveTx(tx, from, models.R2StateFailed, map[string]any{"state_reason": code + ": " + detail,
 			"ended_at": time.Now().UTC()}); err != nil {
@@ -1085,6 +1109,9 @@ func (h r2Handler) finish(ctx context.Context, from, final, endReason string, ou
 	now := time.Now().UTC()
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		set := map[string]any{"ended_at": now, "state_reason": "", "pending_op": "", "pending_op_at": nil, "settle_after": nil}
+		if final == models.R2StateFailed {
+			delete(set, "state_reason") // the failure's reason stays
+		}
 		if endReason != "" {
 			set["end_reason"] = endReason
 		}
@@ -1123,8 +1150,7 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 	}
 	now := time.Now().UTC()
 	err = h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}).Error; err != nil {
+		if err := h.activeUpdateTx(tx, map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}); err != nil {
 			return err
 		}
 		if drift == "" || drift == prior {
@@ -1141,9 +1167,23 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
 	})
 	if err != nil {
-		return err
+		return h.settled(err)
 	}
 	return PolicyJobRetryLater(r2Wait(due), "active; drift checked every 10 minutes")
+}
+
+// activeUpdateTx updates the row while it is still active; errStateMoved when
+// it is not (End, Pause or an edit moved it during the check), so the job
+// runs again at once for the new state instead of in 10 minutes.
+func (h r2Handler) activeUpdateTx(tx *gorm.DB, set map[string]any) error {
+	res := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).Updates(set)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected != 1 {
+		return errStateMoved
+	}
+	return nil
 }
 
 // reapply puts an access policy back when it was detached or deleted outside
@@ -1153,8 +1193,7 @@ func (h r2Handler) check(ctx context.Context, prior string, due time.Time) error
 func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]any, due time.Time) error {
 	now := time.Now().UTC()
 	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}).Error; err != nil {
+		if err := h.activeUpdateTx(tx, map[string]any{"last_readback_at": now, "drift": drift, "updated_at": now}); err != nil {
 			return err
 		}
 		if err := h.event(tx, h.ws, h.kind.EvDrifted, map[string]any{h.kind.IDKey: h.id, "classification": drift, "read": read,
@@ -1163,7 +1202,7 @@ func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]an
 		}
 		return r2NotifyTx(tx, h.ws, h.kind.Notice, h.id, h.users)
 	}); err != nil {
-		return err
+		return h.settled(err)
 	}
 	if drift != R2ReasonDetached && drift != R2ReasonDeleted {
 		return h.fail(ctx, models.R2StateActive, drift, "AuthSec cannot re-apply: the policy or the role changed outside AuthSec")
@@ -1181,14 +1220,14 @@ func (h r2Handler) reapply(ctx context.Context, drift string, read map[string]an
 		return PolicyJobRetryLater(out.RetryAfter, "re-apply not complete: "+out.FailDetail)
 	}
 	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Table(h.kind.Table).Where("workspace_id = ? AND id = ? AND state = ?", h.ws, h.id, models.R2StateActive).
-			Updates(map[string]any{"drift": "", "verified_at": now, "last_readback_at": now, "pending_op": "", "pending_op_at": nil,
-				"settle_after": nil, "updated_at": now}).Error; err != nil {
+		// Moved while re-applying (ended, paused): the next run removes it.
+		if err := h.activeUpdateTx(tx, map[string]any{"drift": "", "verified_at": now, "last_readback_at": now, "pending_op": "",
+			"pending_op_at": nil, "settle_after": nil, "updated_at": now}); err != nil {
 			return err
 		}
 		return h.event(tx, h.ws, GovEventAccessReapplied, map[string]any{h.kind.IDKey: h.id, "was": drift, "ops": out.Ops, "readback": out.Readback})
 	}); err != nil {
-		return err
+		return h.settled(err)
 	}
 	return PolicyJobRetryLater(r2Wait(due), "re-applied; drift checked every 10 minutes")
 }
@@ -1219,6 +1258,7 @@ func RegisterR2Jobs(w *PolicyJobWorker, db *gorm.DB) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobSessionRevoke, Handler: s.SessionRevokeHandler})
 	w.Register(PolicyJobKind{Kind: repositories.GovJobTimeBound, Handler: NewGovDeployments(db, nil).TimeBoundHandler})
 	RegisterAzureAccessJobs(w, db)
+	RegisterK8sAccessJobs(w, db)
 	for _, k := range []r2Kind{r2GrantKind, r2RevokeKind} {
 		k := k
 		w.Scheduler().Add(PolicyJobSchedule{Name: k.Job, Kind: k.Job, Every: r2ActiveCheckEvery,

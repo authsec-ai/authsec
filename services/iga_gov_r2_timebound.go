@@ -198,8 +198,11 @@ func init() {
 	RegisterGovNoticeSubject(GovNoticeTimeBound, GovNoticeSubject{Render: renderTimeBoundNotice})
 }
 
-func r2Notice(kind string, n *models.IGAGovNotification, user *uuid.UUID, title string, doc map[string]any, lines []string) *GovNotice {
-	link := govConsoleLink("/iga/policy/" + kind)
+// r2Notice builds an R2 notice of kind (its webhook type) whose console link
+// is path: the console has no page per R2 grant or revocation, so most link
+// to the Policy area; an access policy's deployment links to its policy.
+func r2Notice(kind, path string, n *models.IGAGovNotification, user *uuid.UUID, title string, doc map[string]any, lines []string) *GovNotice {
+	link := govConsoleLink(path)
 	doc["type"], doc["version"], doc["workspace_id"] = "iga.policy."+strings.ReplaceAll(kind, "-", "_"), 1, n.WorkspaceID.String()
 	if link != "" {
 		doc["link"] = link
@@ -238,7 +241,13 @@ func renderGrantNotice(db *gorm.DB, n *models.IGAGovNotification, user *uuid.UUI
 	if g.Drift != "" {
 		lines = append(lines, "Drift: "+g.Drift)
 	}
-	return r2Notice("temporary-grants", n, user, title, map[string]any{"grant_id": g.ID.String(), "state": g.State,
+	path := "/iga/policy"
+	if g.PolicyID != nil {
+		// An access policy's deployment, not a temporary grant.
+		title = fmt.Sprintf("Access policy on %s: %s", g.RoleARN, g.State)
+		path = "/iga/policy/" + g.PolicyID.String()
+	}
+	return r2Notice("temporary-grants", path, n, user, title, map[string]any{"grant_id": g.ID.String(), "state": g.State,
 		"role_arn": g.RoleARN, "actions": acts, "expires_at": g.ExpiresAt, "drift": g.Drift}, lines), nil
 }
 
@@ -262,7 +271,7 @@ func renderRevocationNotice(db *gorm.DB, n *models.IGAGovNotification, user *uui
 	if r.RemoveAfter != nil {
 		lines = append(lines, "The deny is removed after "+igagov.AWSTime(*r.RemoveAfter)+".")
 	}
-	return r2Notice("session-revocations", n, user, title, map[string]any{"revocation_id": r.ID.String(), "state": r.State,
+	return r2Notice("session-revocations", "/iga/policy", n, user, title, map[string]any{"revocation_id": r.ID.String(), "state": r.State,
 		"role_arn": r.RoleARN, "emergency": r.Emergency, "issued_before": r.IssuedBefore, "remove_after": r.RemoveAfter}, lines), nil
 }
 
@@ -292,6 +301,6 @@ func renderTimeBoundNotice(db *gorm.DB, n *models.IGAGovNotification, user *uuid
 		lines = append(lines, fmt.Sprintf("%s %s: %s %s", it.Kind, it.Key, state, it.Until))
 	}
 	title := "Time-bound access on " + c.RoleARN
-	return r2Notice("policies", n, user, title, map[string]any{"deployment_id": deps[0].ID.String(), "role_arn": c.RoleARN,
+	return r2Notice("policies", "/iga/policy", n, user, title, map[string]any{"deployment_id": deps[0].ID.String(), "role_arn": c.RoleARN,
 		"time_bound": p.Diff.TimeBound}, lines), nil
 }

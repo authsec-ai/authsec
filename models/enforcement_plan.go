@@ -176,4 +176,6 @@ type EnforcementReport struct {
 	Delete *bool
 	// ForceEvict is whether the agent may override a PodDisruptionBudget.
 	ForceEvict *bool
+	// Bindings is whether the agent may remove and restore binding subjects (146).
+	Bindings *bool
 }

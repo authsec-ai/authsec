@@ -44,6 +44,10 @@ const (
 	AzureReaderSkipped = "skipped"
 	// AzureReaderFailed: ARM refused the assignment for another reason.
 	AzureReaderFailed = "failed"
+	// AzureReaderUnchecked: the read that proves access failed for a passing
+	// reason (a timeout, throttling, Microsoft's 5xx), so nothing is known
+	// about the subscription; verifying it again settles it.
+	AzureReaderUnchecked = "not_checked"
 )
 
 // Azure onboarding paths.

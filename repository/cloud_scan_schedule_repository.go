@@ -24,7 +24,15 @@ type DueSchedule struct {
 	// PrevDueAt is the due time the schedule had BEFORE the claim moved it
 	// forward. The next slot is anchored on it so the schedule does not drift.
 	PrevDueAt time.Time
+	// ClaimedUntil is the due time the claim wrote (its lease). Advance only
+	// moves a row that still holds it: anything else means an administrator
+	// changed or turned off the schedule since the claim.
+	ClaimedUntil time.Time
 }
+
+// ErrScheduleChanged: the schedule was changed, turned off or paused after it
+// was claimed; the claim's slot is dropped.
+var ErrScheduleChanged = errors.New("the scan schedule changed after it was claimed")
 
 // CloudScanScheduleRepository stores the per-connector rescan schedule.
 //
@@ -50,7 +58,7 @@ type CloudScanScheduleRepository interface {
 	// Advance moves the schedule to its next slot. It does not say a scan was
 	// queued: the slot may be skipped (a scan already running), so
 	// last_enqueued_at is written separately by MarkEnqueued.
-	Advance(tx *gorm.DB, workspaceID, connectorID uuid.UUID, now, nextDue time.Time) error
+	Advance(tx *gorm.DB, workspaceID, connectorID uuid.UUID, now, nextDue, claimedUntil time.Time) error
 	MarkEnqueued(tx *gorm.DB, workspaceID, connectorID uuid.UUID, at time.Time) error
 	RetrySoon(tx *gorm.DB, workspaceID, connectorID uuid.UUID, at time.Time) error
 	Pause(tx *gorm.DB, workspaceID, connectorID uuid.UUID, reason string, now time.Time) error
@@ -153,7 +161,8 @@ func (r *cloudScanScheduleRepository) ClaimDue(
 		  FROM due
 		 WHERE t.connector_id = due.connector_id
 		RETURNING t.connector_id, t.workspace_id, t.interval_minutes,
-		          t.time_of_day_minutes, t.timezone, t.day_of_week, due.prev_due_at`,
+		          t.time_of_day_minutes, t.timezone, t.day_of_week, due.prev_due_at,
+		          t.next_due_at AS claimed_until`,
 		now, limit, now.Add(lease), now,
 	).Scan(&out).Error
 	if err != nil {
@@ -171,12 +180,19 @@ func (r *cloudScanScheduleRepository) update(
 }
 
 func (r *cloudScanScheduleRepository) Advance(
-	tx *gorm.DB, workspaceID, connectorID uuid.UUID, now, nextDue time.Time,
+	tx *gorm.DB, workspaceID, connectorID uuid.UUID, now, nextDue, claimedUntil time.Time,
 ) error {
-	return r.update(tx, workspaceID, connectorID, map[string]any{
-		"next_due_at": nextDue,
-		"updated_at":  now,
-	})
+	res := tx.Model(&models.CloudScanSchedule{}).
+		Where("workspace_id = ? AND connector_id = ? AND enabled AND paused_reason = '' AND next_due_at = ?",
+			workspaceID, connectorID, claimedUntil).
+		Updates(map[string]any{"next_due_at": nextDue, "updated_at": now})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected != 1 {
+		return ErrScheduleChanged
+	}
+	return nil
 }
 
 func (r *cloudScanScheduleRepository) MarkEnqueued(

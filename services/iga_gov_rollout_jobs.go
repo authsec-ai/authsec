@@ -671,7 +671,7 @@ func renderRolloutNotice(db *gorm.DB, n *models.IGAGovNotification, user *uuid.U
 	if g.Pause != nil {
 		reason = g.Pause.Reason
 	}
-	link := govConsoleLink("/iga/policy/policies/" + p.ID.String())
+	link := govConsoleLink("/iga/policy") // the R1a policy pages were removed
 	if user == nil {
 		doc := map[string]any{"type": "iga.policy.rollout", "version": 1, "workspace_id": n.WorkspaceID.String(),
 			"rollout_id": ro.ID.String(), "stage": ro.Stage, "policy_id": p.ID.String(), "policy_name": p.Name,

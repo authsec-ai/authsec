@@ -335,7 +335,7 @@ func (ctl *CloudAzureController) ListConnectors(c *gin.Context) {
 	}
 	rows, err := ctl.service().ListConnectors(workspaceID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -419,7 +419,7 @@ func (ctl *CloudAzureController) ListResources(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListResources(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -456,7 +456,7 @@ func (ctl *CloudAzureController) ListIdentities(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListIdentities(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -522,7 +522,7 @@ func (ctl *CloudAzureController) ListGrants(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListGrants(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -553,7 +553,7 @@ func (ctl *CloudAzureController) ListFederation(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListFederation(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -577,7 +577,7 @@ func (ctl *CloudAzureController) ListWorkloads(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListWorkloads(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -602,7 +602,7 @@ func (ctl *CloudAzureController) ListFoundry(c *gin.Context) {
 	}
 	rows, trusts, err := ctl.service().ListFoundry(workspaceID, f.ConnectorID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": rows, "trusts": trusts, "meta": gin.H{"as_of": time.Now().UTC(), "total": len(rows)}})
@@ -627,7 +627,7 @@ func (ctl *CloudAzureController) Neighbourhood(c *gin.Context) {
 			"it has no live connections, or the graph is not ready yet"})
 		return
 	case err != nil:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out, "meta": gin.H{"as_of": time.Now().UTC()}})
@@ -651,7 +651,7 @@ func (ctl *CloudAzureController) Evidence(c *gin.Context) {
 	limit := atoiDefault(c.Query("limit"), 100)
 	rows, err := ctl.service().Evidence(workspaceID, objectID, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -671,7 +671,7 @@ func (ctl *CloudAzureController) GraphSummary(c *gin.Context) {
 	}
 	rows, err := ctl.service().GraphSummary(workspaceID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	gate := services.GraphProjection()
@@ -698,7 +698,7 @@ func (ctl *CloudAzureController) BlastRadius(c *gin.Context) {
 	}
 	out, err := ctl.service().BlastRadius(workspaceID, objectID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	if out.Identity == nil {
@@ -738,7 +738,7 @@ func (ctl *CloudAzureController) ListUsage(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListUsage(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -767,7 +767,7 @@ func (ctl *CloudAzureController) ListSecrets(c *gin.Context) {
 	}
 	rows, total, err := ctl.service().ListSecrets(workspaceID, f)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		azureInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -878,7 +878,9 @@ func mapAzureOnboardingError(err error) (int, gin.H) {
 	case errors.Is(err, services.ErrAzureSessionInvalid), errors.Is(err, services.ErrAzureOAuthStateInvalid):
 		return h(http.StatusBadRequest, "start the Azure connection again and complete the Microsoft sign-in", "customer_account")
 	case errors.Is(err, services.ErrAzureSessionMismatch):
-		return h(http.StatusForbidden, "start the Azure connection again from your own AuthSec account", "customer_account")
+		// Another workspace's or user's session answers as one that does not
+		// exist (CLAUDE.md rule 6).
+		return h(http.StatusNotFound, "start the Azure connection again from your own AuthSec account", "customer_account")
 	case errors.Is(err, services.ErrAzureConnectorRevoked):
 		return h(http.StatusConflict, "connect the tenant again to restore this connection", "customer_account")
 	case errors.Is(err, azure.ErrCredentialRejected):
@@ -911,4 +913,11 @@ func mapAzureOnboardingError(err error) (int, gin.H) {
 	// (a Vault path, a database error), so it is logged, not returned.
 	log.Printf("[azure] onboarding failed: %v", err)
 	return http.StatusInternalServerError, gin.H{"error": "AuthSec could not complete the request; try again, and contact support if it keeps failing"}
+}
+
+// azureInternalError answers a read that failed inside AuthSec: the error can
+// name internals (a database error), so it is logged, not returned.
+func azureInternalError(c *gin.Context, err error) {
+	log.Printf("[azure] %s %s failed: %v", c.Request.Method, c.FullPath(), err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "AuthSec could not complete the request; try again, and contact support if it keeps failing"})
 }

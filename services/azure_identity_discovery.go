@@ -85,9 +85,13 @@ const (
 // AuthSec's credentials, which are not what the connection records.
 func (s *AzureOnboardingService) resolveDiscoveryConfig(workspaceID uuid.UUID, tenantID string) (azure.AppConfig, error) {
 	tc, err := s.connectors.GetByScope(workspaceID, models.CloudProviderAzure, tenantID)
-	if err != nil || tc == nil {
+	if errors.Is(err, repositories.ErrCloudConnectorNotFound) {
 		// No tenant connector (a subscription-only run): AuthSec's app.
 		return s.cfg, nil
+	}
+	if err != nil {
+		// The connector could not be read: which app it uses is unknown.
+		return azure.AppConfig{}, fmt.Errorf("read the tenant connector: %w", err)
 	}
 	return s.resolveAppConfig(tc)
 }
@@ -121,9 +125,12 @@ func (s *AzureOnboardingService) startDiscovery(workspaceID uuid.UUID, tenantID 
 		if err != nil {
 			log.Printf("[azure] discovery of tenant %s not started: its credentials could not be read: %v", tenantID, err)
 			if tenantConnectorID != nil {
-				if _, mErr := s.connectors.MarkError(workspaceID, *tenantConnectorID,
-					"AuthSec could not read the stored credentials of your app, so this tenant was not read; "+
-						"connect it again with your app's client secret", ConnErrCredentialInvalid); mErr != nil {
+				msg, code := "AuthSec could not read the stored credentials of your app, so this tenant was not read; "+
+					"connect it again with your app's client secret", ConnErrCredentialInvalid
+				if errors.Is(err, azure.ErrNotConfigured) && strings.Contains(err.Error(), "AuthSec's Azure app") {
+					msg, code = err.Error(), ConnErrDeployment
+				}
+				if _, mErr := s.connectors.MarkError(workspaceID, *tenantConnectorID, msg, code); mErr != nil {
 					log.Printf("[azure] could not record the credential failure on tenant %s: %v", tenantID, mErr)
 				}
 			}

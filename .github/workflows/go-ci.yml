@@ -79,6 +79,26 @@ jobs:
             -c "CREATE DATABASE iga_graph_test;"
           go test ./tests/igagraph/... -count=1
 
+      # Two more suites that rebuild their own schema from migrations, each on
+      # a dedicated database whose name contains "test" (they refuse others).
+      - name: AWS auto-scan scheduler tests (self-migrating, isolated DB)
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/aws_schedule_test?sslmode=disable
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d authsec \
+            -c "DROP DATABASE IF EXISTS aws_schedule_test WITH (FORCE);" \
+            -c "CREATE DATABASE aws_schedule_test;"
+          go test ./tests/awsschedule/... -count=1
+
+      - name: Governance schema tests (self-migrating, isolated DB)
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/iga_gov_schema_test?sslmode=disable
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d authsec \
+            -c "DROP DATABASE IF EXISTS iga_gov_schema_test WITH (FORCE);" \
+            -c "CREATE DATABASE iga_gov_schema_test;"
+          go test ./tests/igagovschema/... -count=1
+
       - name: Evidence path tests (real scanner -> real projector)
         env:
           IGA_TEST_DSN: postgres://postgres:postgres@localhost:5432/authsec?sslmode=disable

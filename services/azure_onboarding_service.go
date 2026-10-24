@@ -739,6 +739,55 @@ func selectSubscriptions(visible []azure.Subscription, wanted map[string]bool) (
 
 /* ------------------------------ connect-custom ------------------------------- */
 
+// customSubscriptionARM is what customSubscriptionReads needs of *azure.Client.
+type customSubscriptionARM interface {
+	GetSubscription(ctx context.Context, armToken, subscriptionID string) (*azure.Subscription, error)
+	ListRoleAssignmentsForPrincipal(ctx context.Context, armToken, subscriptionID, principalID string) ([]azure.RoleAssignment, error)
+}
+
+// customSubscriptionReads proves each subscription readable with the
+// customer's app and names those where the app holds more than Reader.
+// Nothing is assigned, so a disabled subscription that is still readable is
+// read like any other. Two ARM reads per subscription, run in parallel: one
+// at a time, a tenant with a few dozen subscriptions ran past the connect
+// budget. The results and the warning keep the subscriptions' order.
+func customSubscriptionReads(ctx context.Context, api customSubscriptionARM, armToken, spID string, subs []azure.Subscription) ([]AzureSubscriptionResult, []string) {
+	results := make([]AzureSubscriptionResult, len(subs))
+	privilegedOf := make([]string, len(subs))
+	forEachLimited(len(subs), azureAssignConcurrency, func(i int) {
+		sub := subs[i]
+		results[i] = AzureSubscriptionResult{SubscriptionID: sub.SubscriptionID, DisplayName: sub.DisplayName, State: sub.State}
+		_, readErr := api.GetSubscription(ctx, armToken, sub.SubscriptionID)
+		checkedAt := time.Now()
+		if readErr != nil {
+			// Only a refusal says the app lacks Reader; a timeout or
+			// throttling says nothing, and the admin is told to verify again.
+			status := models.AzureReaderDenied
+			if azureTransient(readErr) {
+				status = models.AzureReaderUnchecked
+			}
+			results[i].Reader = models.AzureReaderAssignment{Status: status, CheckedAt: &checkedAt, Error: readErr.Error()}
+			return
+		}
+		results[i].Reader = models.AzureReaderAssignment{
+			Status: models.AzureReaderExisting, CheckedAt: &checkedAt, Verified: true, VerifiedAt: &checkedAt,
+		}
+		// Reader is all AuthSec needs; say so when the app holds more.
+		if as, err := api.ListRoleAssignmentsForPrincipal(ctx, armToken, sub.SubscriptionID, spID); err == nil {
+			if roles := privilegedAzureRoles(as); len(roles) > 0 {
+				privilegedOf[i] = firstNonEmpty(sub.DisplayName, sub.SubscriptionID) + " (" + strings.Join(roles, ", ") + ")"
+			}
+		}
+	})
+	var privileged []string
+	for _, p := range privilegedOf {
+		if p != "" {
+			privileged = append(privileged, p)
+		}
+	}
+	return results, privileged
+}
+
 // azureCustomAppVaultPath is where a workspace's customer-provided Azure app
 // credentials live, keyed by tenant id.
 func azureCustomAppVaultPath(workspaceID uuid.UUID, tenantID string) string {
@@ -824,27 +873,17 @@ func (s *AzureOnboardingService) ConnectCustom(parent context.Context, workspace
 			"on each subscription AuthSec should read, then verify the connection. Microsoft Entra ID is read meanwhile")
 	}
 
-	// 5. Prove each one is readable. Nothing is assigned here, so a disabled
-	//    subscription that is still readable is read like any other.
-	results := make([]AzureSubscriptionResult, len(subs))
-	var privileged []string
-	for i, sub := range subs {
-		results[i] = AzureSubscriptionResult{SubscriptionID: sub.SubscriptionID, DisplayName: sub.DisplayName, State: sub.State}
-		_, readErr := s.api.GetSubscription(ctx, armToken, sub.SubscriptionID)
-		checkedAt := time.Now()
-		if readErr != nil {
-			results[i].Reader = models.AzureReaderAssignment{Status: models.AzureReaderDenied, CheckedAt: &checkedAt, Error: readErr.Error()}
-			continue
+	// 5. Prove each one is readable (customSubscriptionReads).
+	results, privileged := customSubscriptionReads(ctx, s.api, armToken, sp.ID, subs)
+	var unchecked []string
+	for _, r := range results {
+		if r.Reader.Status == models.AzureReaderUnchecked {
+			unchecked = append(unchecked, firstNonEmpty(r.DisplayName, r.SubscriptionID))
 		}
-		results[i].Reader = models.AzureReaderAssignment{
-			Status: models.AzureReaderExisting, CheckedAt: &checkedAt, Verified: true, VerifiedAt: &checkedAt,
-		}
-		// Reader is all AuthSec needs; say so when the app holds more.
-		if as, err := s.api.ListRoleAssignmentsForPrincipal(ctx, armToken, sub.SubscriptionID, sp.ID); err == nil {
-			if roles := privilegedAzureRoles(as); len(roles) > 0 {
-				privileged = append(privileged, firstNonEmpty(sub.DisplayName, sub.SubscriptionID)+" ("+strings.Join(roles, ", ")+")")
-			}
-		}
+	}
+	if len(unchecked) > 0 {
+		warnings = append(warnings, fmt.Sprintf("AuthSec could not check %d subscription(s) in time (Azure was slow or busy): %s. "+
+			"Verify them again; nothing about their access is known yet", len(unchecked), strings.Join(unchecked, ", ")))
 	}
 	if len(privileged) > 0 {
 		warnings = append(warnings, "your app holds Azure roles that can change resources or grant access, beyond the Reader "+
@@ -1315,6 +1354,12 @@ func azureReaderFailure(r models.AzureReaderAssignment) (string, string) {
 		return "Reader was not assigned: " + r.Error, ConnErrScopeInvalid
 	case models.AzureReaderFailed:
 		return "Reader could not be assigned: " + r.Error, ""
+	case models.AzureReaderUnchecked:
+		code := ConnErrTimeout
+		if e := strings.ToLower(r.Error); strings.Contains(e, "throttl") || strings.Contains(e, "429") {
+			code = ConnErrThrottled
+		}
+		return "AuthSec could not check this subscription (Azure was slow or busy): " + r.Error + "; verify it again", code
 	}
 	if r.Error == "" || r.Error == azure.ErrRBACPending.Error() {
 		return "Reader is assigned but Azure has not applied it yet; verify this subscription again in a few minutes",
@@ -1351,6 +1396,10 @@ func (s *AzureOnboardingService) resolveAppConfig(c *models.CloudConnector) (azu
 	if s.cfg.Configured() && c.AuthRef == s.cfg.AuthRef() {
 		return s.cfg, nil
 	}
+	if !usesCustomApp(c) {
+		// Connected with AuthSec's app: nothing is in Vault to fall back on.
+		return azure.AppConfig{}, fmt.Errorf("%w: this connection reads with AuthSec's Azure app, which is not configured on this server", azure.ErrNotConfigured)
+	}
 	if s.vault == nil {
 		return azure.AppConfig{}, ErrAzureVaultNotConfigured
 	}
@@ -1386,6 +1435,19 @@ func (s *AzureOnboardingService) verify(parent context.Context, workspaceID, con
 		return nil, ErrAzureConnectorRevoked
 	}
 	cfg, err := s.resolveAppConfig(c)
+	if errors.Is(err, azure.ErrNotConfigured) {
+		// Not a passing failure: recorded on the connection, which stops the
+		// scheduled retries until someone fixes it and verifies again.
+		code := ConnErrDeployment
+		if usesCustomApp(c) {
+			code = ConnErrCredentialInvalid
+		}
+		stored, merr := s.connectors.MarkError(c.WorkspaceID, c.ID, err.Error(), code)
+		if merr != nil {
+			return nil, merr
+		}
+		return &AzureVerifyResult{Connector: stored}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

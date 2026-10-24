@@ -24,17 +24,26 @@ func azureTestTarget(typePath string) *azureTarget {
 	return &azureTarget{TypePath: typePath, Storage: strings.HasPrefix(typePath, "microsoft.storage/storageaccounts")}
 }
 
-// Storage accounts keep exactly the actions and allow roles they had.
+// A storage account's block covers blobs and, since step 7, its queues,
+// tables and file shares and every key and SAS path; a container keeps its
+// blobs only. Allow roles are unchanged (blobs).
 func TestAzureActionsStorageUnchanged(t *testing.T) {
 	st := azureTestTarget("microsoft.storage/storageaccounts")
 	acts, data := azureActions(st, []string{igagov.AccessRead})
-	if strings.Join(acts, ",") != "Microsoft.Storage/storageAccounts/listKeys/action" ||
-		strings.Join(data, ",") != "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" {
-		t.Fatalf("storage read = %v / %v", acts, data)
+	for _, want := range []string{"Microsoft.Storage/storageAccounts/listKeys/action", "Microsoft.Storage/storageAccounts/listAccountSas/action"} {
+		if !containsString(acts, want) {
+			t.Fatalf("storage read actions %v lack %s", acts, want)
+		}
 	}
-	acts, data = azureActions(st, []string{igagov.AccessAll})
-	if len(acts) != 4 || len(data) != 3 {
-		t.Fatalf("storage all = %v / %v", acts, data)
+	for _, want := range []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+		"Microsoft.Storage/storageAccounts/queueServices/queues/messages/read"} {
+		if !containsString(data, want) {
+			t.Fatalf("storage read data %v lack %s", data, want)
+		}
+	}
+	container := &azureTarget{TypePath: "microsoft.storage/storageaccounts/blobservices/containers", Storage: true}
+	if _, data := azureActions(container, []string{igagov.AccessRead}); strings.Join(data, ",") != "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" {
+		t.Fatalf("container read = %v", data)
 	}
 	if g, n := azureAllowRole(st, []string{igagov.AccessRead}); g != azure.RoleStorageBlobDataReader || n != "Storage Blob Data Reader" {
 		t.Fatalf("storage allow read = %s %s", g, n)
@@ -65,10 +74,14 @@ func TestAzureActionsOtherTypesUnchanged(t *testing.T) {
 func TestAzureBlockReachesSearchIndexData(t *testing.T) {
 	search := azureTestTarget("microsoft.search/searchservices")
 	acts, data := azureActions(search, []string{igagov.AccessRead})
-	for _, want := range []string{"microsoft.search/searchservices/read", "Microsoft.Search/searchServices/listQueryKeys/action", "Microsoft.Search/searchServices/listAdminKeys/action"} {
+	for _, want := range []string{"Microsoft.Search/searchServices/listQueryKeys/action", "Microsoft.Search/searchServices/listAdminKeys/action"} {
 		if !containsString(acts, want) {
 			t.Fatalf("search read actions %v lack %s", acts, want)
 		}
+	}
+	// Not the management read: a Reader role reaches no document (step 2).
+	if containsString(acts, "microsoft.search/searchservices/read") {
+		t.Fatalf("search read takes the management read: %v", acts)
 	}
 	if strings.Join(data, ",") != "Microsoft.Search/searchServices/indexes/documents/read" {
 		t.Fatalf("search read data actions = %v", data)
@@ -145,7 +158,7 @@ func TestAzureDataPlaneChildTypes(t *testing.T) {
 		t.Fatal("Azure Service Bus Data Receiver is not removed by a read block")
 	}
 	// A prefix that is not a child type does not match.
-	if _, ok := azureDataPlaneOf(azureTestTarget("microsoft.search/searchservicesx")); ok {
+	if azureDataPlaneOf(azureTestTarget("microsoft.search/searchservicesx")) != nil {
 		t.Fatal("a look-alike type matched a data plane")
 	}
 }

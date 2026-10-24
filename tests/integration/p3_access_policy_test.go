@@ -3,6 +3,8 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -92,9 +94,15 @@ func currentEnvForTest() services.GovDeployEnv { return services.GovDeployEnv{} 
 // resource inserts an S3 bucket resource, named by conn's scan when set.
 func (l *apLab) resource(arn string, conn *uuid.UUID) uuid.UUID {
 	l.t.Helper()
+	return l.resourceOf(arn, "s3_bucket", conn)
+}
+
+// resourceOf inserts a Discovery resource of kind, named by conn's scan when set.
+func (l *apLab) resourceOf(arn, kind string, conn *uuid.UUID) uuid.UUID {
+	l.t.Helper()
 	id := uuid.New()
 	p3exec(l.t, l.db, `INSERT INTO iga_resources (id, workspace_id, resource_kind, display_name, provider, source_key)
-		VALUES (?, ?, 's3_bucket', ?, 'aws', ?)`, id, l.ws, arn, "aws\x1fref\x1f"+arn+"\x1f"+id.String())
+		VALUES (?, ?, ?, ?, 'aws', ?)`, id, l.ws, kind, arn, "aws\x1fref\x1f"+arn+"\x1f"+id.String())
 	if conn != nil {
 		p3exec(l.t, l.db, `INSERT INTO iga_object_support (workspace_id, resource_id, connector_id, partition_key, state)
 			VALUES (?, ?, ?, ?, 'current')`, l.ws, id, *conn, "aws:"+testAccount)
@@ -203,6 +211,44 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("preview stored %d policies", n)
 	}
+	// The warnings, exactly and in order: an allow, a block of a folder
+	// (and of one too long to guard every fragment), a block of writes.
+	const (
+		allowNeeds  = "If the bucket is in another AWS account, its bucket policy must allow the role as well."
+		listRoot    = "To keep the folder's keys from being listed, these roles also cannot list the bucket root or a prefix that starts like the folder."
+		listPartial = "The folder name is too long to block listing of every leading fragment of it; a list request for a short fragment of the name is not blocked."
+		otherPaths  = "This changes only the chosen roles. Other roles, users, groups and bucket policies are unchanged."
+		accessPts   = "Requests through S3 Access Points or Multi-Region Access Points are not covered: they name the access point, not the bucket."
+	)
+	allowIn := intent
+	allowIn.Effect, allowIn.Resource.Prefix = "allow", ""
+	longIn := intent
+	longIn.Resource.Prefix = strings.Repeat("abcdefghij", 5) + "_reports_/"
+	writeIn := intent
+	writeIn.Access = []string{"write"}
+	for _, c := range []struct {
+		name string
+		in   igagov.AccessIntent
+		pv   *services.AccessPreview
+		want []services.AccessIssue
+	}{
+		{"block read folder", intent, pv, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts},
+			{Code: "list_root_blocked", Message: listRoot}, {Code: "other_paths", Message: otherPaths}}},
+		{"allow read bucket", allowIn, nil, []services.AccessIssue{{Code: "allow_needs_bucket_policy", Message: allowNeeds}, {Code: "other_paths", Message: otherPaths}}},
+		{"block read long folder", longIn, nil, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts}, {Code: "list_root_blocked", Message: listRoot},
+			{Code: "list_partial_prefix", Message: listPartial}, {Code: "other_paths", Message: otherPaths}}},
+		{"block write folder", writeIn, nil, []services.AccessIssue{{Code: "access_points_not_covered", Message: accessPts}, {Code: "other_paths", Message: otherPaths}}},
+	} {
+		got := c.pv
+		if got == nil {
+			if got, err = l.svc.Preview(ctx, l.ws, c.in); err != nil || len(got.Blockers) != 0 {
+				t.Fatalf("%s preview: %+v %v", c.name, got, err)
+			}
+		}
+		if !reflect.DeepEqual(got.Warnings, c.want) {
+			t.Errorf("%s warnings:\n got %+v\nwant %+v", c.name, got.Warnings, c.want)
+		}
+	}
 
 	// Create and apply: no approver; the job attaches and verifies.
 	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{AccessIntent: intent, Name: "Block invoice reads", Reason: "incident 42"})
@@ -223,6 +269,9 @@ func TestAccessPolicyLifecycle(t *testing.T) {
 	}
 	if v, err = l.svc.Get(ctx, l.ws, v.ID); err != nil || v.Status != services.AccessStatusActive || v.Deployments[0].VerifiedAt == nil {
 		t.Fatalf("after apply: %+v %v", v, err)
+	}
+	if r := v.Resource; r.ResourceType != "s3_bucket" || r.Bucket == "" || r.Name != r.Bucket || r.Region != "" || r.Provider != "aws" {
+		t.Fatalf("S3 resource view: %+v", r)
 	}
 
 	// Edit: version 2 (read + write, both roles) is attached before version
@@ -347,11 +396,20 @@ func TestAccessPolicyRefusals(t *testing.T) {
 	if _, err := l.svc.Create(ctx, l.ws, l.user, req(in)); apCode(err) != services.GovCodeResourceNotFound {
 		t.Errorf("unknown resource: %v", err)
 	}
-	// Ten managed policies attached: refused before anything is written.
-	for i := 0; i < 10; i++ {
-		p := l.fake.AddPolicy("/", "Filler"+uuid.NewString()[:6], nil, `{"Version":"2012-10-17","Statement":[]}`)
-		l.fake.AttachPermissions("ApRefusedRole", p.ARN)
+	// Ten managed policies attached (IAM's default limit): a warning, since
+	// the account's quota may have been raised.
+	fill := func(n int) {
+		for i := 0; i < n; i++ {
+			p := l.fake.AddPolicy("/", "Filler"+uuid.NewString()[:6], nil, `{"Version":"2012-10-17","Statement":[]}`)
+			l.fake.AttachPermissions("ApRefusedRole", p.ARN)
+		}
 	}
+	fill(10)
+	if pv, err := l.svc.Preview(ctx, l.ws, base()); err != nil || len(pv.Blockers) != 0 || !strings.Contains(fmt.Sprint(pv.Warnings), "quota_may_be_reached") {
+		t.Errorf("at the default quota: %+v %v", pv, err)
+	}
+	// Twenty (the most IAM allows): refused before anything is written.
+	fill(10)
 	if _, err := l.svc.Create(ctx, l.ws, l.user, req(base())); apCode(err) != services.GovCodeRolePolicyQuota {
 		t.Errorf("quota: %v", err)
 	}
@@ -433,5 +491,190 @@ func TestAccessPolicyEndRunsNow(t *testing.T) {
 		l.ws, row.ID).Count(&late)
 	if late != 0 {
 		t.Fatal("End left the removal waiting for the next 10-minute check")
+	}
+}
+
+// A deployment that fails after attaching is taken out of AWS before it ends
+// failed. Before, a policy whose AuthSec document was changed outside AuthSec
+// failed its re-apply and stayed attached to the role for good: a failed row
+// is never worked again, and End, Pause and Delete skip it.
+func TestAccessPolicyFailedRowIsRemoved(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApEditedOutside")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "edited outside", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	att := l.attachedAuthSec("ApEditedOutside")
+	if len(att) != 1 {
+		t.Fatalf("attached: %v", att)
+	}
+	// Someone rewrites AuthSec's policy (a new default version).
+	l.fake.SetDefaultDocument(att[0], `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`)
+	var row models.IGAGovTempGrant
+	l.db.Where("workspace_id = ? AND policy_arn = ?", l.ws, att[0]).Take(&row)
+	l.runRow(services.NewGovR2(l.db), row.ID)
+
+	if got := l.attachedAuthSec("ApEditedOutside"); len(got) != 0 {
+		t.Fatalf("the failed deployment's policy is still attached: %v", got)
+	}
+	l.db.Where("workspace_id = ? AND id = ?", l.ws, row.ID).Take(&row)
+	if row.State != models.R2StateFailed || !strings.Contains(row.StateReason, "document_changed") || row.Drift != services.R2ReasonDocumentChanged {
+		t.Fatalf("row: state %s, reason %q, drift %q", row.State, row.StateReason, row.Drift)
+	}
+	// The edited policy holds versions AuthSec did not write: it is left in
+	// place, detached, for its owner.
+	if _, _, _, _, ok := l.fake.PolicyState(att[0]); !ok {
+		t.Fatal("a policy with versions AuthSec did not write was deleted")
+	}
+}
+
+// End during a re-apply: the job notices the row moved and runs again at once
+// to remove the policy, instead of re-scheduling the 10-minute check with the
+// policy just put back on the role.
+func TestAccessPolicyEndDuringReapply(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApEndRace")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "end race", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	arn := l.attachedAuthSec("ApEndRace")[0]
+	var row models.IGAGovTempGrant
+	l.db.Where("workspace_id = ? AND policy_arn = ?", l.ws, arn).Take(&row)
+	l.fake.Detach("ApEndRace", arn)
+	// The admin ends the policy while the re-apply's attach is in flight.
+	l.fake.AfterApply["iam:AttachRolePolicy"] = func(context.Context) error {
+		delete(l.fake.AfterApply, "iam:AttachRolePolicy")
+		_, err := l.svc.End(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "now"})
+		return err
+	}
+	err = l.runRow(services.NewGovR2(l.db), row.ID)
+	if err == nil || !strings.Contains(err.Error(), "state moved") {
+		t.Fatalf("the re-apply after End answered %v; want an immediate rerun", err)
+	}
+	l.run(v.ID)
+	if got := l.attachedAuthSec("ApEndRace"); len(got) != 0 {
+		t.Fatalf("still attached after End: %v", got)
+	}
+}
+
+// Another workspace's policy is 404 on every write too (Edit, Pause, Resume,
+// Delete, End), and is left as it was; a preview naming another workspace's
+// role is refused as not found.
+func TestAccessPolicyCrossWorkspaceWrites(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	mine := l.role("ApMineRole")
+	end := time.Now().Add(time.Hour)
+	in := igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+		Roles: []igagov.AccessRole{{IdentityAccountID: mine.String()}}, Access: []string{"read"}, EndsAt: &end}
+
+	other := p3NewGov(t, l.db, "ap-other-writes")
+	pid := uuid.New()
+	p3exec(t, l.db, `INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by, lifecycle) VALUES (?, ?, 'theirs', 'time_bound', 'aws', ?, 'active')`,
+		pid, other.ws, other.author)
+	notFound := func(name string, err error) {
+		t.Helper()
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != 404 {
+			t.Errorf("%s on another workspace's policy: %v, want 404", name, err)
+		}
+	}
+	_, err := l.svc.Edit(ctx, l.ws, l.user, pid, services.AccessPolicyRequest{AccessIntent: in, Name: "mine now", Reason: "x", BaseVersionNo: 1})
+	notFound("edit", err)
+	_, err = l.svc.Pause(ctx, l.ws, l.user, pid, services.AccessReasonRequest{Reason: "x"})
+	notFound("pause", err)
+	_, err = l.svc.Resume(ctx, l.ws, l.user, pid, services.AccessReasonRequest{Reason: "x"})
+	notFound("resume", err)
+	notFound("delete", l.svc.Delete(ctx, l.ws, l.user, pid))
+	var pol models.IGAGovPolicy
+	if err := l.db.Where("id = ?", pid).Take(&pol).Error; err != nil || pol.Name != "theirs" || pol.Lifecycle != "active" || pol.DeletedAt != nil {
+		t.Fatalf("another workspace's policy changed: %+v %v", pol, err)
+	}
+
+	// A role of another workspace in my preview: not found, nothing about it shown.
+	theirRole := uuid.New()
+	p3exec(t, l.db, `INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key, display_name, provider_attrs)
+		VALUES (?, ?, ?, 'aws', ?, 'immutable', ?, 'TheirSecretRole', '{"path":"/"}'::jsonb)`,
+		theirRole, other.ws, models.CloudIdentityIAMRole, "aws\x1fidentity\x1farn:aws:iam::111111111111:role/TheirSecretRole", "AROATHEIRS")
+	in.Roles = []igagov.AccessRole{{IdentityAccountID: theirRole.String()}}
+	pv, err := l.svc.Preview(ctx, l.ws, in)
+	code := previewCode(pv, err)
+	if code == "" || (pv != nil && strings.Contains(pv.Sentence, "TheirSecretRole")) {
+		t.Fatalf("preview with another workspace's role: %q %+v", code, pv)
+	}
+	if _, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{AccessIntent: in, Name: "x", Reason: "x"}); err == nil {
+		t.Fatal("created a policy on another workspace's role")
+	} else {
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != 404 {
+			t.Errorf("create with another workspace's role: %v, want 404", err)
+		}
+	}
+}
+
+// The list reads at most the newest 1000 policies (status is worked out per
+// policy); past that it says so instead of silently showing part of them.
+func TestAccessPolicyListTruncated(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	p3exec(t, l.db, `INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by, lifecycle)
+		SELECT gen_random_uuid(), ?, 'bulk ' || g, 'time_bound', 'aws', ?, 'active' FROM generate_series(1, 1001) g`, l.ws, l.user)
+	pg, err := l.svc.ListPage(ctx, l.ws, services.AccessListQuery{Limit: 10})
+	if err != nil || !pg.Truncated {
+		t.Fatalf("1001 policies: truncated %v, %v", pg != nil && pg.Truncated, err)
+	}
+	if pg, err = l.svc.ListPage(ctx, l.ws, services.AccessListQuery{Q: "bulk 1000", Limit: 10}); err != nil || pg.Truncated || len(pg.Policies) != 1 {
+		t.Fatalf("a search that narrows it: %+v %v", pg, err)
+	}
+}
+
+// Resume after a pause whose policy was kept (someone attached it to another
+// role too, so AuthSec only detached it from ours): the resumed deployment
+// gets its own name instead of colliding with the kept policy.
+func TestAccessPolicyResumeAfterKeptPolicy(t *testing.T) {
+	l := newAPLab(t)
+	ctx := context.Background()
+	a := l.role("ApResumeRole")
+	l.role("ApBorrower")
+	end := time.Now().Add(time.Hour)
+	v, err := l.svc.Create(ctx, l.ws, l.user, services.AccessPolicyRequest{Name: "resume kept", Reason: "t",
+		AccessIntent: igagov.AccessIntent{Effect: "block", Resource: igagov.AccessResource{ResourceID: l.bucket.String()},
+			Roles: []igagov.AccessRole{{IdentityAccountID: a.String()}}, Access: []string{"read"}, EndsAt: &end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	first := l.attachedAuthSec("ApResumeRole")[0]
+	l.fake.AttachPermissions("ApBorrower", first) // attached elsewhere by someone
+	if _, err := l.svc.Pause(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	if _, _, _, _, ok := l.fake.PolicyState(first); !ok {
+		t.Fatal("the policy attached elsewhere should have been kept")
+	}
+	if _, err := l.svc.Resume(ctx, l.ws, l.user, v.ID, services.AccessReasonRequest{Reason: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v.ID)
+	got, err := l.svc.Get(ctx, l.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusActive {
+		t.Fatalf("after resume: %s %q %v", got.Status, got.StatusReason, err)
+	}
+	att := l.attachedAuthSec("ApResumeRole")
+	if len(att) != 1 || att[0] == first {
+		t.Fatalf("resumed policy: %v (first was %s)", att, first)
 	}
 }

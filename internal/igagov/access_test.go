@@ -117,7 +117,9 @@ func TestAccessDocument(t *testing.T) {
 			t.Errorf("GetObject on the bucket ARN: %s", text)
 		}
 	}
-	if len(acts) != 7 || len(res) != 2 {
+	// Read on objects (2), the metadata reads a block adds (attributes, tags,
+	// ACL: 6) and the three listings.
+	if len(acts) != 11 || len(res) != 2 {
 		t.Errorf("actions %v resources %v", acts, res)
 	}
 

@@ -1750,7 +1750,7 @@ func renderOwnerReviewNotice(db *gorm.DB, n *models.IGAGovNotification, user *uu
 		return nil, err
 	}
 	rv := st.Review
-	link := govConsoleLink("/iga/policy/reviews/" + rv.ID.String())
+	link := govConsoleLink("/iga/policy") // the owner review pages were removed
 	due := rv.DeadlineAt.UTC()
 	if user == nil {
 		targets := []map[string]any{}

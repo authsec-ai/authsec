@@ -446,3 +446,24 @@ func TestBusyConnectorRetriesSoonNotNextInterval(t *testing.T) {
 	within(t, "next_due_at", f.row(t).NextDueAt, at.Add(59*time.Minute), at.Add(61*time.Minute))
 	t.Logf("busy connector: slot retried in about an hour, not in a week")
 }
+
+// An administrator who turns the schedule off (or gives it a new time) after
+// the scheduler claimed it, but before it queued the scan, wins: nothing is
+// queued and the saved schedule is not overwritten with the old timing.
+func TestChangeAfterClaimWins(t *testing.T) {
+	f := newFixture(t)
+	f.put(t, true, 1440)
+	due := f.row(t).NextDueAt.Add(time.Minute)
+	n, err := services.NewAWSScanScheduler(f.db).WithClock(func() time.Time { return due }).
+		WithClaimed(func(repositories.DueSchedule) { f.put(t, false, 1440) }).
+		RunOnce(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("RunOnce: %d %v", n, err)
+	}
+	if total, _ := f.runs(t, "scheduled"); total != 0 {
+		t.Fatalf("a scan was queued for a schedule turned off after the claim (%d)", total)
+	}
+	if r := f.row(t); r.Enabled {
+		t.Fatalf("the schedule was turned back on: %+v", r)
+	}
+}
