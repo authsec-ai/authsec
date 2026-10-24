@@ -506,3 +506,62 @@ func (c *Client) GetResourceProperties(ctx context.Context, armToken, resourceID
 	}
 	return body.Properties, nil
 }
+
+// RoleAssignmentScheduleInstance is one Privileged Identity Management
+// schedule instance of a role assignment (Microsoft.Authorization
+// roleAssignmentScheduleInstances, api 2020-10-01): AssignmentType is
+// "Assigned" or "Activated" (a PIM activation), and EndDateTime is set for a
+// time-bound one.
+type RoleAssignmentScheduleInstance struct {
+	OriginRoleAssignmentID string `json:"originRoleAssignmentId"`
+	AssignmentType         string `json:"assignmentType"`
+	EndDateTime            string `json:"endDateTime"`
+	MemberType             string `json:"memberType"`
+}
+
+// TimeBound reports an activation or an assignment with an end: one that
+// expires on its own.
+func (i RoleAssignmentScheduleInstance) TimeBound() bool {
+	return strings.EqualFold(i.AssignmentType, "Activated") || i.EndDateTime != ""
+}
+
+// ListRoleAssignmentScheduleInstances returns the principal's PIM schedule
+// instances at scope and below ($filter=assignedTo, the documented filter for
+// one principal), following nextLink.
+func (c *Client) ListRoleAssignmentScheduleInstances(ctx context.Context, armToken, scope, principalID string) ([]RoleAssignmentScheduleInstance, error) {
+	cl, err := arm.NewClient("authsec.azure", "v1.0.0", staticToken(armToken), c.armOptions())
+	if err != nil {
+		return nil, err
+	}
+	u := runtime.JoinPaths(cl.Endpoint(), scope, "providers/Microsoft.Authorization/roleAssignmentScheduleInstances") +
+		"?api-version=2020-10-01&$filter=" + url.QueryEscape("assignedTo('"+principalID+"')")
+	var out []RoleAssignmentScheduleInstance
+	for page := 0; u != "" && page < 50; page++ {
+		req, err := runtime.NewRequest(ctx, http.MethodGet, u)
+		if err != nil {
+			return nil, err
+		}
+		req.Raw().Header.Set("Accept", "application/json")
+		resp, err := cl.Pipeline().Do(req)
+		if err != nil {
+			return nil, armError(err)
+		}
+		if !runtime.HasStatusCode(resp, http.StatusOK) {
+			return nil, armError(runtime.NewResponseError(resp))
+		}
+		var body struct {
+			Value []struct {
+				Properties RoleAssignmentScheduleInstance `json:"properties"`
+			} `json:"value"`
+			NextLink string `json:"nextLink"`
+		}
+		if err := runtime.UnmarshalAsJSON(resp, &body); err != nil {
+			return nil, err
+		}
+		for _, v := range body.Value {
+			out = append(out, v.Properties)
+		}
+		u = body.NextLink
+	}
+	return out, nil
+}

@@ -67,6 +67,37 @@ type AzureRBACClient interface {
 	GetRoleAssignment(ctx context.Context, armToken, id string) (*azure.RoleAssignment, error)
 	DeleteRoleAssignment(ctx context.Context, armToken, id string) error
 	CallerPermissions(ctx context.Context, armToken, subscriptionID string) ([]azure.Permission, error)
+	ListRoleAssignmentScheduleInstances(ctx context.Context, armToken, scope, principalID string) ([]azure.RoleAssignmentScheduleInstance, error)
+}
+
+// GovCodeAzureTimeBound: an assignment the block would remove is a PIM
+// activation or has an end of its own: restoring it at the end would make it
+// permanent (AS-135).
+const GovCodeAzureTimeBound = "azure_time_bound_assignment"
+
+// azureTimeBound is the assignments among rev that Privileged Identity
+// Management says expire on their own (an activation, or an end date).
+func azureTimeBound(ctx context.Context, rbac AzureRBACClient, token, subscriptionID, principalID string, rev []azure.RoleAssignment) ([]azure.RoleAssignment, error) {
+	if len(rev) == 0 {
+		return nil, nil
+	}
+	inst, err := rbac.ListRoleAssignmentScheduleInstances(ctx, token, "/subscriptions/"+subscriptionID, principalID)
+	if err != nil {
+		return nil, err
+	}
+	bound := map[string]bool{}
+	for _, i := range inst {
+		if i.TimeBound() && i.OriginRoleAssignmentID != "" {
+			bound[strings.ToLower(i.OriginRoleAssignmentID)] = true
+		}
+	}
+	var out []azure.RoleAssignment
+	for _, a := range rev {
+		if bound[strings.ToLower(a.ID)] {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // AzureAccessDeps is the process's Azure access: the client and an ARM token
@@ -626,6 +657,15 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 			}
 			errs = append(errs, govUnprocessable(GovCodeAzureInherited,
 				pr.Name+" gets this access from a broader scope ("+strings.Join(where, ", ")+"), which a block on one resource cannot remove.",
+				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i)}))
+			continue
+		}
+		if bound, err := azureTimeBound(ctx, deps.RBAC, token, ap.target.SubscriptionID, pr.ObjectID, rev); err != nil {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_pim_unchecked",
+				Message: "AuthSec could not read Privileged Identity Management for " + pr.Name + " (" + err.Error() + "); the block waits until it can, rather than risk restoring a time-bound assignment as permanent."})
+		} else if len(bound) > 0 {
+			errs = append(errs, govUnprocessable(GovCodeAzureTimeBound,
+				pr.Name+" holds this access through a time-bound assignment (a Privileged Identity Management activation, or one with an end date). Removing it and restoring it at the end would make it permanent: end it in Privileged Identity Management instead.",
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i)}))
 			continue
 		}
@@ -1233,6 +1273,7 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 	drift := ""
 	var ops []map[string]any
 	var inherited []string // block: scopes above the resource that grant the access
+	var timeBound []string // block: time-bound (PIM) assignments left in place
 	if h.row.Effect == "allow" {
 		id := h.row.Scope + "/providers/Microsoft.Authorization/roleAssignments/" + h.row.AssignmentName
 		var got *azure.RoleAssignment
@@ -1262,6 +1303,33 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		}
 		if len(inh) > 0 && !check {
 			return h.fail(ctx, GovCodeAzureInherited+": the principal gets this access from a broader scope")
+		}
+		// A time-bound (PIM) assignment is never taken: restoring it at the end
+		// would make it permanent (AS-135). Unreadable PIM waits.
+		var bound []azure.RoleAssignment
+		if err := h.external(ctx, func(ctx context.Context) error {
+			var err error
+			bound, err = azureTimeBound(ctx, h.deps.RBAC, h.token, h.row.SubscriptionID, h.row.PrincipalID, rev)
+			return err
+		}); err != nil {
+			return h.retry(err)
+		}
+		if len(bound) > 0 {
+			if !check {
+				return h.fail(ctx, GovCodeAzureTimeBound+": the principal holds this access through a time-bound (PIM) assignment")
+			}
+			skip := map[string]bool{}
+			for _, a := range bound {
+				skip[strings.ToLower(a.ID)] = true
+				timeBound = append(timeBound, a.ID)
+			}
+			kept := rev[:0]
+			for _, a := range rev {
+				if !skip[strings.ToLower(a.ID)] {
+					kept = append(kept, a)
+				}
+			}
+			rev = kept
 		}
 		// Access that appeared at a broader scope after the block went live:
 		// AuthSec cannot remove it from one resource, so the block no longer
@@ -1307,6 +1375,11 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 			set["state_reason"] = "the principal now gets this access from a broader scope (" + strings.Join(inherited, ", ") +
 				"); AuthSec cannot remove it from this resource"
 		}
+		if len(timeBound) > 0 {
+			set["drift"] = GovCodeAzureTimeBound
+			set["state_reason"] = "the principal now holds this access through a time-bound (PIM) assignment, which AuthSec leaves in place: " +
+				"restoring it at the end would make it permanent. End it in Privileged Identity Management"
+		}
 		if len(ops) > 0 {
 			set["ops"] = gorm.Expr("ops || ?::jsonb", string(opsRaw))
 		}
@@ -1323,6 +1396,12 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		if check && len(inherited) > 0 && h.row.Drift != GovCodeAzureInherited {
 			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": GovCodeAzureInherited, "scopes": inherited,
 				"note": "The principal gets this access from a broader scope; AuthSec cannot remove it from this resource. End the policy or remove that assignment."}); err != nil {
+				return err
+			}
+		}
+		if check && len(timeBound) > 0 && h.row.Drift != GovCodeAzureTimeBound {
+			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": GovCodeAzureTimeBound, "assignments": timeBound,
+				"note": "A time-bound (PIM) assignment grants the access; AuthSec leaves it in place. End it in Privileged Identity Management."}); err != nil {
 				return err
 			}
 		}

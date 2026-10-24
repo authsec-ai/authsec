@@ -33,6 +33,10 @@ type fakeRBAC struct {
 	delErr func(id string) error
 	// props are resources' ARM properties by lower-case id (absent: not found).
 	props map[string]map[string]any
+	// pim are Privileged Identity Management schedule instances by principal;
+	// pimErr, when set, answers instead.
+	pim    map[string][]azure.RoleAssignmentScheduleInstance
+	pimErr error
 }
 
 func (f *fakeRBAC) GetResourceProperties(_ context.Context, _, id, _ string) (map[string]any, error) {
@@ -93,6 +97,15 @@ func (f *fakeRBAC) DeleteRoleAssignment(_ context.Context, _, id string) error {
 	}
 	delete(f.as, strings.ToLower(id))
 	return nil
+}
+
+// ListRoleAssignmentScheduleInstances answers the PIM instances set in pim
+// (by principal).
+func (f *fakeRBAC) ListRoleAssignmentScheduleInstances(_ context.Context, _, _, principal string) ([]azure.RoleAssignmentScheduleInstance, error) {
+	if f.pimErr != nil {
+		return nil, f.pimErr
+	}
+	return f.pim[principal], nil
 }
 
 func (f *fakeRBAC) CallerPermissions(context.Context, string, string) ([]azure.Permission, error) {
@@ -832,5 +845,51 @@ func TestVerifyAzureAccessSchemaNeedsJobKind(t *testing.T) {
 	err := services.VerifyAzureAccessSchema(tx)
 	if err == nil || !strings.Contains(err.Error(), "azure_access") {
 		t.Fatalf("a queue that does not admit azure_access verified: %v", err)
+	}
+}
+
+// AS-135: an assignment Privileged Identity Management activated (or one with
+// an end date) is never removed: restoring it at the end would make it
+// permanent. The preview refuses; one activated while a block is on is left
+// in place and reported as drift; PIM that cannot be read is warned.
+func TestAccessPolicyAzureTimeBoundAssignments(t *testing.T) {
+	z := newAzLab(t)
+	z.fake.pim = map[string][]azure.RoleAssignmentScheduleInstance{}
+	who, oid := z.principal("sp-pim")
+	z.assign(z.scope, "pim-1", azure.RoleStorageBlobDataReader, oid)
+	id := strings.ToLower(z.scope + "/providers/Microsoft.Authorization/roleAssignments/pim-1")
+	z.fake.pim[oid] = []azure.RoleAssignmentScheduleInstance{{OriginRoleAssignmentID: id, AssignmentType: "Activated", EndDateTime: "2026-10-25T00:00:00Z"}}
+	if got := previewCode(z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who))); got != services.GovCodeAzureTimeBound {
+		t.Fatalf("a PIM activation: %s", got)
+	}
+
+	// A standing assignment is blocked; an activation that appears later is
+	// left in place and is drift.
+	z.fake.pim[oid] = []azure.RoleAssignmentScheduleInstance{{OriginRoleAssignmentID: id, AssignmentType: "Assigned"}}
+	v := z.create("az pim", z.intent("block", z.res, who))
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 0 {
+		t.Fatalf("the standing assignment stayed: %v", got)
+	}
+	z.assign(z.scope, "pim-2", azure.RoleStorageBlobDataReader, oid)
+	id2 := strings.ToLower(z.scope + "/providers/Microsoft.Authorization/roleAssignments/pim-2")
+	z.fake.pim[oid] = append(z.fake.pim[oid], azure.RoleAssignmentScheduleInstance{OriginRoleAssignmentID: id2, AssignmentType: "Activated"})
+	row := z.rows(v.ID, models.R2StateActive)[0]
+	z.step(row.ID)
+	got := z.rows(v.ID, models.R2StateActive)
+	if len(got) != 1 || got[0].Drift != services.GovCodeAzureTimeBound || len(z.fake.roles(oid)) != 1 {
+		t.Fatalf("after a PIM activation: %+v %v", got, z.fake.roles(oid))
+	}
+	if strings.Contains(string(got[0].Revoked), "pim-2") {
+		t.Fatal("the activation was recorded for restore")
+	}
+
+	// PIM unreadable: warned, not refused.
+	z.fake.pimErr = errors.New("forbidden")
+	who2, oid2 := z.principal("sp-pim-unread")
+	z.assign(z.scope, "pim-3", azure.RoleStorageBlobDataReader, oid2)
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who2))
+	if err != nil || len(pv.Blockers) != 0 || !hasWarning(pv, "azure_pim_unchecked") {
+		t.Fatalf("PIM unreadable: %+v %v", pv, err)
 	}
 }
