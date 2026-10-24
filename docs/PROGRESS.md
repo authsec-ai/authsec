@@ -19,6 +19,9 @@ Newest first. Each session records what was done, what was learned, and what's n
   - Wildcard data actions (`Microsoft.Storage/*`) count.
   - The auth mode is read on the top-level resource. Before, an OpenAI deployment, search index or Service Bus queue read its own properties and was refused.
 
+### Resource-type descriptor (AS-163)
+- Capabilities' `access_policies.types` (`igagov.AccessKindViews`) list each AWS type: service, noun, prefix, block only, the levels a block may name and the levels an allow may name. The form takes its rules from it (`typeRules`) and falls back to its registry for an older server.
+
 ### Step 8: Lambda, KMS, SQS, SNS
 - **Lambda.**
   - Block: the function with every version and alias. A read block also refuses AddPermission, PutResourcePolicy and Create/UpdateFunctionUrlConfig.
