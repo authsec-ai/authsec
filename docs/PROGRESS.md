@@ -4,6 +4,26 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — Open items closed
+
+- **AS-138:** all 21 R2/R3 mutation routes now assert their audit row over HTTP (TestP3R2R3RoutesAudited, with a fake AgentCore for the push).
+- **AS-135:** an Azure block never removes a PIM-activated or time-bound assignment, so the restore at the end can no longer make it permanent.
+  - The check reads `roleAssignmentScheduleInstances` (api 2020-10-01).
+  - In the preview, a time-bound assignment is a blocker.
+  - If PIM activates one while a block is on, the job leaves it in place and records it as drift.
+  - If PIM cannot be read, the preview warns and the job waits rather than removing.
+- **AS-155** (recommended defaults; the owner may revisit):
+  - The deploy's rollout waits 20 minutes, and it rolls back only after a crash or a failed verification, never on a timeout alone.
+  - The pre-migration dump refuses to run unless the database volume has at least the database's size free.
+- **UI-049:** reviewed in code. Only checkbox cells could clip their own focus ring, and they are now overflow-visible.
+- **AS-154:** reviewed and accepted as a risk, with the reasons in ISSUES.
+- **Final check, all green:**
+  - backend: vet, unit tests, ratchet 72, full governance suite (449 s), RLS flows;
+  - UI: type-check, 354 tests, lint with 0 errors;
+  - agent: every test except the two chart NOTES tests, which need a reachable cluster and were already failing before these changes.
+
+---
+
 ## 2026-10-24 (cont.) — Verification pass, and Kubernetes access policies (backend, UI, iga-agent)
 
 ### Checked against primary sources
