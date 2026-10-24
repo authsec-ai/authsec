@@ -90,6 +90,10 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseSecretsManagerSecretARN(arn)
 			return t, ok
 		}},
+		{Type: AccessTypeSSMParameter, Service: "ssm", Noun: "parameter", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseSSMParameterARN(arn)
+			return t, ok
+		}},
 	}
 }
 

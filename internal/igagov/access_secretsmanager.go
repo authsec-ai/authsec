@@ -32,7 +32,7 @@ const (
 )
 
 // ErrAccessBlockOnly: the type takes blocks only in this release.
-var ErrAccessBlockOnly = errors.New("Secrets Manager secrets can be blocked only")
+var ErrAccessBlockOnly = errors.New("this resource type can be blocked only")
 
 // The actions per level a block denies on the secret.
 var (

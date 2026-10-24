@@ -374,12 +374,14 @@ const accessTypeAzure = "azure_resource"
 
 // accessNotSupported refuses a Discovery row no access type reads.
 func accessNotSupported(row models.IGAResource) error {
-	msg := "Only S3 buckets, DynamoDB tables and Secrets Manager secrets are supported."
+	msg := "Only S3 buckets, DynamoDB tables, Secrets Manager secrets and SSM parameters are supported."
 	switch {
 	case strings.Contains(row.DisplayName, ":dynamodb:"):
 		msg = "Pick one DynamoDB table; a pattern or a global-table ARN cannot be used."
 	case strings.Contains(row.DisplayName, ":secretsmanager:"):
 		msg = "Pick one secret: its full ARN, or <name>-??????. Other patterns and ARNs without the 6-character suffix cannot be used."
+	case strings.Contains(row.DisplayName, ":ssm:"):
+		msg = "Pick one SSM parameter by its full name; a pattern cannot be used."
 	}
 	return govUnprocessable(GovCodeResourceNotSupported, msg,
 		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
@@ -454,7 +456,7 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	p.target = t
 	p.resource = accessResourceOf(norm.Resource.ResourceID, t)
 	if k, _ := igagov.AccessKindOf(t.Type()); k.BlockOnly && norm.Effect == igagov.AccessEffectAllow {
-		return nil, govUnprocessable(GovCodeAccessInvalid, "Secrets Manager secrets can only be blocked in this release.",
+		return nil, govUnprocessable(GovCodeAccessInvalid, "A "+t.Noun()+" can only be blocked in this release.",
 			map[string]any{"field": "effect", "resource_type": t.Type()})
 	}
 	// An ARN that names its account (a table) is placed by it; one that
