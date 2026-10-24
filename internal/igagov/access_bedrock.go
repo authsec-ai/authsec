@@ -78,6 +78,14 @@ func ParseBedrockModelARN(arn string) (BedrockModelTarget, bool) {
 
 // ModelARN is the model in every region; ProfileARN every system inference
 // profile routing to it.
+// GlobalModelARN is the model as a global cross-Region inference profile
+// names it: with no Region ("arn:aws:bedrock:::foundation-model/..."), per the
+// Bedrock inference-profile prerequisites. Denied explicitly rather than
+// trusting the Region wildcard to match an empty field.
+func (t BedrockModelTarget) GlobalModelARN() string {
+	return "arn:" + t.Partition + ":bedrock:::foundation-model/" + t.Model
+}
+
 func (t BedrockModelTarget) ModelARN() string {
 	return "arn:" + t.Partition + ":bedrock:*::foundation-model/" + t.Model
 }
@@ -118,7 +126,7 @@ func (t BedrockModelTarget) Statements(effect string, access []string) ([]Access
 			acts = append(acts, bedrockModelWrite...)
 		}
 	}
-	res := []string{t.ModelARN()}
+	res := []string{t.ModelARN(), t.GlobalModelARN()}
 	if read || all {
 		res = append(res, t.ProfileARN())
 	}
@@ -136,7 +144,8 @@ func (t BedrockModelTarget) Notes(effect string, access []string) []AccessNote {
 	var out []AccessNote
 	add := func(code, msg string) { out = append(out, AccessNote{Code: code, Message: msg}) }
 	if read || all {
-		add("model_routes_blocked", "Calling the model through cross-region inference profiles, prompt routers and batch inference jobs is refused too, in every region.")
+		add("model_routes_blocked", "Calling the model through cross-Region and global inference profiles and batch inference jobs is refused too, in every Region.")
+		add("app_profiles_unverified", "Calls through an application inference profile or a prompt router are refused only if AWS also checks the model they route to, which AuthSec has not verified: test one before relying on it.")
 		add("other_models_not_covered", "Other versions of the model (another model ID) are not covered, nor custom, imported or Marketplace models, or provisioned throughput already bought on this model.")
 	}
 	return out

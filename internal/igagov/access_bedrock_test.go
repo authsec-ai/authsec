@@ -50,17 +50,18 @@ func TestBedrockAccessDocuments(t *testing.T) {
 	window := `"Condition":{"DateLessThan":{"aws:CurrentTime":"2026-11-01T00:00:00Z"}}`
 	const M = "arn:aws:bedrock:*::foundation-model/" + claude
 	const IP = "arn:aws:bedrock:*:*:inference-profile/*." + claude
+	const G = "arn:aws:bedrock:::foundation-model/" + claude
 	routes := `{"Sid":"AuthSecAccessModelRoutes","Effect":"Deny","Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"],"Resource":"*",
 		"Condition":{"DateLessThan":{"aws:CurrentTime":"2026-11-01T00:00:00Z"},"StringLike":{"bedrock:ModelArn":"` + M + `"}}}`
 	sameDoc(t, "model read", blockDoc(t, bedrockClaude, AccessRead), `{"Version":"2012-10-17","Statement":[
-		{"Sid":"AuthSecAccessModel","Effect":"Deny","Resource":["`+IP+`","`+M+`"],`+window+`,
+		{"Sid":"AuthSecAccessModel","Effect":"Deny","Resource":["`+IP+`","`+M+`","`+G+`"],`+window+`,
 			"Action":["bedrock:CreateModelInvocationJob","bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"]},`+routes+`]}`)
 	sameDoc(t, "model write", blockDoc(t, bedrockClaude, AccessWrite), `{"Version":"2012-10-17","Statement":[
-		{"Sid":"AuthSecAccessModel","Effect":"Deny","Resource":"`+M+`",`+window+`,"Action":["bedrock:CreateAdvancedPromptOptimizationJob",
+		{"Sid":"AuthSecAccessModel","Effect":"Deny","Resource":["`+M+`","`+G+`"],`+window+`,"Action":["bedrock:CreateAdvancedPromptOptimizationJob",
 			"bedrock:CreateEvaluationJob","bedrock:CreateInferenceProfile","bedrock:CreateModelCustomizationJob","bedrock:CreateModelEvaluationJob",
 			"bedrock:CreatePromptRouter","bedrock:CreateProvisionedModelThroughput","bedrock:UpdateProvisionedModelThroughput"]}]}`)
 	sameDoc(t, "model all", blockDoc(t, bedrockClaude, AccessAll), `{"Version":"2012-10-17","Statement":[
-		{"Sid":"AuthSecAccessModel","Effect":"Deny","Action":"bedrock:*","Resource":["`+IP+`","`+M+`"],`+window+`},`+routes+`]}`)
+		{"Sid":"AuthSecAccessModel","Effect":"Deny","Action":"bedrock:*","Resource":["`+IP+`","`+M+`","`+G+`"],`+window+`},`+routes+`]}`)
 
 	const AG = "arn:aws:bedrock:us-east-1:111122223333:agent/AGENT12345"
 	const AL = "arn:aws:bedrock:us-east-1:111122223333:agent-alias/AGENT12345/*"
@@ -158,7 +159,7 @@ func TestBedrockAccessProperties(t *testing.T) {
 		own := map[string]bool{}
 		switch x := tg.(type) {
 		case BedrockModelTarget:
-			own[x.ModelARN()], own[x.ProfileARN()], own["*"] = true, true, true
+			own[x.ModelARN()], own[x.GlobalModelARN()], own[x.ProfileARN()], own["*"] = true, true, true, true
 		case BedrockAgentTarget:
 			own[x.ARN()], own[x.AliasesARN()] = true, true
 		case AgentCoreRuntimeTarget:
@@ -209,7 +210,7 @@ func TestBedrockAccessNotes(t *testing.T) {
 		want string
 		acc  []string
 	}{
-		{bedrockClaude, "model_routes_blocked,other_models_not_covered", []string{AccessRead}},
+		{bedrockClaude, "model_routes_blocked,app_profiles_unverified,other_models_not_covered", []string{AccessRead}},
 		{bedrockClaude, "", []string{AccessWrite}},
 		{bedrockAgent, "aliases_covered,agent_role_unchanged", []string{AccessRead}},
 		{bedrockAgent, "aliases_covered", []string{AccessDelete}},
