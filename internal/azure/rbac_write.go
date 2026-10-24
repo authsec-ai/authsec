@@ -24,6 +24,8 @@ const (
 	RoleSearchIndexDataContributor = "8ebe5a00-799e-43f5-93ac-243d3dce84a7"
 	RoleKeyVaultSecretsUser        = "4633458b-17de-408a-b874-0445c86b69e6"
 	RoleKeyVaultSecretsOfficer     = "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
+	RoleCognitiveOpenAIUser        = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
+	RoleCognitiveOpenAIContributor = "a001fd3d-188f-4b5d-821b-7da978bf7442"
 	RoleStorageBlobDataReader      = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
 	RoleStorageBlobDataContributor = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 )

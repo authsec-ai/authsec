@@ -462,6 +462,10 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 				Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on this resource type: Contributor allows every management write on it."})
 		}
 		dp := azureDataPlaneOf(&ap.target)
+		if dp != nil && ap.roleGUID == dp.readRole && dp.readRoleAlso != "" {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+				Message: "Azure has no built-in role for only reading " + dp.what + ": " + ap.roleName + " also allows " + dp.readRoleAlso + "."})
+		}
 		if ap.roleGUID == azure.RoleStorageBlobDataContributor || (dp != nil && ap.roleGUID == dp.writeRole) {
 			// The data role for write or delete covers all three.
 			var also []string

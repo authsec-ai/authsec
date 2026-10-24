@@ -74,6 +74,8 @@ func TestAzureAllowRolesDataPlanes(t *testing.T) {
 		{"microsoft.keyvault/vaults", []string{"write"}, azure.RoleKeyVaultSecretsOfficer},
 		{"microsoft.search/searchservices", []string{"read"}, azure.RoleSearchIndexDataReader},
 		{"microsoft.search/searchservices", []string{"delete"}, azure.RoleSearchIndexDataContributor},
+		{"microsoft.cognitiveservices/accounts", []string{"read"}, azure.RoleCognitiveOpenAIUser},
+		{"microsoft.cognitiveservices/accounts/deployments", []string{"write"}, azure.RoleCognitiveOpenAIContributor},
 		{"microsoft.web/sites", []string{"read"}, azure.RoleReader},
 	} {
 		if got, _ := azureAllowRole(planeTarget(c.tp), c.access); got != c.want {
@@ -113,5 +115,61 @@ func TestAzureAuthModes(t *testing.T) {
 	}
 	if b, w := search.authMode(map[string]any{"disableLocalAuth": true}); b != nil || w != nil {
 		t.Fatal("role-only search refused")
+	}
+}
+
+// Azure OpenAI: read is inference and stored data, never the management read;
+// every level hands out keys; the built-in OpenAI and Cognitive Services roles
+// classify by what they grant.
+func TestAzureActionsOpenAI(t *testing.T) {
+	acct := planeTarget("microsoft.cognitiveservices/accounts")
+	acts, data := azureActions(acct, []string{"read"})
+	if !slices.Contains(data, "Microsoft.CognitiveServices/accounts/OpenAI/deployments/chat/completions/action") ||
+		slices.Contains(data, "Microsoft.CognitiveServices/accounts/OpenAI/files/write") ||
+		!slices.Equal(acts, []string{"Microsoft.CognitiveServices/accounts/listKeys/action", "Microsoft.CognitiveServices/accounts/regenerateKey/action"}) {
+		t.Fatalf("read: %v %v", acts, data)
+	}
+	ns, mapped := "microsoft.cognitiveservices", azureDataPlaneOf(acct).mapped
+	openAIUser := planeDef(t, []string{"Microsoft.CognitiveServices/*/read"}, []string{"Microsoft.CognitiveServices/accounts/OpenAI/*/read",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/chat/completions/action"})
+	cogUser := planeDef(t, []string{"Microsoft.CognitiveServices/*/read", "Microsoft.CognitiveServices/accounts/listkeys/action"}, []string{"Microsoft.CognitiveServices/*"})
+	speech := planeDef(t, nil, []string{"Microsoft.CognitiveServices/accounts/SpeechServices/*"})
+	reader := planeDef(t, []string{"*/read"}, nil)
+	_, del := azureActions(acct, []string{"delete"})
+	delActs, _ := azureActions(acct, []string{"delete"})
+	for _, c := range []struct {
+		name  string
+		def   azure.RoleDefinition
+		acts  []string
+		data  []string
+		grant bool
+	}{
+		{"OpenAI User grants read", openAIUser, acts, data, true},
+		{"OpenAI User grants no delete", openAIUser, nil, del, false},
+		{"Cognitive Services User grants read (data and keys)", cogUser, acts, data, true},
+		{"Cognitive Services User grants delete", cogUser, delActs, del, true},
+		{"Reader grants nothing of the data", reader, acts, data, false},
+		{"Speech User grants no OpenAI data", speech, acts, data, false},
+	} {
+		if got := roleGrants(c.def, c.acts, c.data); got != c.grant {
+			t.Errorf("%s: %v", c.name, got)
+		}
+	}
+	if !roleDataOutside(speech, ns, mapped) || roleDataOutside(openAIUser, ns, mapped) {
+		t.Fatal("Speech data is outside the plane, OpenAI data inside")
+	}
+	if azureDataPlaneOf(planeTarget("microsoft.cognitiveservices/accounts/deployments")) == nil ||
+		azureDataPlaneOf(planeTarget("microsoft.cognitiveservices/accountsx")) != nil {
+		t.Fatal("deployments mapped, a look-alike not")
+	}
+	dp := azureDataPlaneOf(acct)
+	if b, _ := dp.authMode(map[string]any{}); b == nil || b.Code != GovCodeAzureAIKeysOnly {
+		t.Fatalf("no custom subdomain: %+v", b)
+	}
+	if b, w := dp.authMode(map[string]any{"customSubDomainName": "acme-ai"}); b != nil || w == nil || w.Code != GovCodeAzureAIKeys {
+		t.Fatalf("keys also: %+v %+v", b, w)
+	}
+	if b, w := dp.authMode(map[string]any{"customSubDomainName": "acme-ai", "disableLocalAuth": true}); b != nil || w != nil {
+		t.Fatal("Entra only refused")
 	}
 }

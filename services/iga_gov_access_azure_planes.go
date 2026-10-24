@@ -7,7 +7,10 @@ import (
 )
 
 // Azure data planes access policies map, beyond storage blobs (step 2:
-// Key Vault secrets, AI Search documents). For such a type read, write and
+// Key Vault secrets, AI Search documents; step 4: Azure OpenAI on an Azure
+// OpenAI or AI Services account). Action names and role GUIDs were checked
+// against Microsoft's built-in roles and provider operations pages
+// (2026-10-24). For such a type read, write and
 // delete name its data actions and the management actions that hand out its
 // keys -- never the management read: a block of reading secrets has nothing to
 // do with a Reader role, which grants none. An allow assigns the type's data
@@ -29,11 +32,55 @@ type azureDataPlane struct {
 	// The roles an allow assigns, and what the write role allows beyond
 	// write (warned).
 	readRole, readRoleName, writeRole, writeRoleName string
-	apiVersion                                       string
+	// readRoleAlso is what the read role allows beyond read, warned on an
+	// allow of read ("" when nothing).
+	readRoleAlso string
+	apiVersion   string
 	// authMode reads the resource's properties: a blocker when role
 	// assignments do not control its data, a warning when keys still can.
 	authMode func(props map[string]any) (blocker, warning *AccessIssue)
 }
+
+// Azure OpenAI data actions per level. Read is using the models (every
+// inference call) and reading what the account stores; write creates and
+// changes data (files, fine-tunes, assistants, responses, batches, deployments
+// through the data plane); delete removes it.
+var (
+	openAIRead = []string{
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/chat/completions/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/completions/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/embeddings/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/audio/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/realtime/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/search/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/extensions/chat/completions/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/images/generations/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/engines/completions/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/files/read",
+		"Microsoft.CognitiveServices/accounts/OpenAI/stored-completions/read",
+		"Microsoft.CognitiveServices/accounts/OpenAI/assistants/threads/messages/read",
+		"Microsoft.CognitiveServices/accounts/OpenAI/responses/read",
+	}
+	openAIWrite = []string{
+		"Microsoft.CognitiveServices/accounts/OpenAI/files/write",
+		"Microsoft.CognitiveServices/accounts/OpenAI/fine-tunes/write",
+		"Microsoft.CognitiveServices/accounts/OpenAI/assistants/write",
+		"Microsoft.CognitiveServices/accounts/OpenAI/responses/write",
+		"Microsoft.CognitiveServices/accounts/OpenAI/batches/action",
+		"Microsoft.CognitiveServices/accounts/OpenAI/stored-completions/write",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/write",
+	}
+	openAIDelete = []string{
+		"Microsoft.CognitiveServices/accounts/OpenAI/files/delete",
+		"Microsoft.CognitiveServices/accounts/OpenAI/fine-tunes/delete",
+		"Microsoft.CognitiveServices/accounts/OpenAI/assistants/delete",
+		"Microsoft.CognitiveServices/accounts/OpenAI/responses/delete",
+		"Microsoft.CognitiveServices/accounts/OpenAI/stored-completions/delete",
+		"Microsoft.CognitiveServices/accounts/OpenAI/deployments/delete",
+	}
+	// An account key reaches every data action.
+	cognitiveKeys = []string{"Microsoft.CognitiveServices/accounts/listKeys/action", "Microsoft.CognitiveServices/accounts/regenerateKey/action"}
+)
 
 var azureDataPlanes = []azureDataPlane{
 	{
@@ -79,6 +126,33 @@ var azureDataPlanes = []azureDataPlane{
 				Message: "This search service accepts API keys only, so Azure role assignments do not control its data. Turn on role-based access on the service first."}, nil
 		},
 	},
+	{
+		// An Azure OpenAI or AI Services account. Its other data planes
+		// (Speech, Language, Content Safety...) are not mapped: a role
+		// reaching only those is refused as unclassified unless the block is
+		// "all".
+		typePath: "microsoft.cognitiveservices/accounts", children: []string{"deployments"}, what: "Azure OpenAI models and data",
+		read: openAIRead, write: openAIWrite, del: openAIDelete,
+		readKeys: cognitiveKeys, writeKeys: cognitiveKeys,
+		mapped:   []string{"microsoft.cognitiveservices/accounts/openai/"},
+		readRole: azure.RoleCognitiveOpenAIUser, readRoleName: "Cognitive Services OpenAI User",
+		writeRole: azure.RoleCognitiveOpenAIContributor, writeRoleName: "Cognitive Services OpenAI Contributor",
+		readRoleAlso: "creating assistants and responses, and image and video generations",
+		apiVersion:   "2023-05-01",
+		authMode: func(props map[string]any) (*AccessIssue, *AccessIssue) {
+			// Entra tokens need the account's custom subdomain: without it
+			// only keys work, so role assignments do not reach the data.
+			if sub, _ := props["customSubDomainName"].(string); sub == "" {
+				return &AccessIssue{Code: GovCodeAzureAIKeysOnly,
+					Message: "This account has no custom subdomain, so it accepts API keys only and Azure role assignments do not control its data. Give it a custom domain name first."}, nil
+			}
+			if off, _ := props["disableLocalAuth"].(bool); off {
+				return nil, nil
+			}
+			return nil, &AccessIssue{Code: GovCodeAzureAIKeys,
+				Message: "This account also accepts API keys: anyone already holding a key keeps access. Disable local authentication on the account to make a block complete."}
+		},
+	},
 }
 
 // Preview codes of the mapped types.
@@ -86,6 +160,8 @@ const (
 	GovCodeAzureVaultAccessPolicies = "azure_keyvault_access_policies"
 	GovCodeAzureSearchKeysOnly      = "azure_search_keys_only"
 	GovCodeAzureSearchKeys          = "azure_search_keys_also"
+	GovCodeAzureAIKeysOnly          = "azure_ai_keys_only"
+	GovCodeAzureAIKeys              = "azure_ai_keys_also"
 	GovCodeAzureAuthUnchecked       = "azure_auth_mode_unchecked"
 )
 
