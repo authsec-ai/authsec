@@ -1098,7 +1098,7 @@ var contractPolicyCapabilities = contractObj(
 	contractReq("runtime_controls", contractBool), contractReq("brokered_sessions", contractBool),
 	contractOpt("access_policies", contractObj(
 		contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
-		contractReq("resource_types", contractArrMin(1, contractNonEmpty)))),
+		contractReq("resource_types", contractArrMin(1, contractNonEmpty)), contractReq("block_only", contractArr(contractNonEmpty)))),
 	contractReq("reasons", contractMap(contractNonEmpty)),
 	contractReq("providers", contractObj(
 		contractReq("aws", contractConst("supported")), contractReq("k8s", contractConst("not_supported")))),

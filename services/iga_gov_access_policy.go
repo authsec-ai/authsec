@@ -374,9 +374,12 @@ const accessTypeAzure = "azure_resource"
 
 // accessNotSupported refuses a Discovery row no access type reads.
 func accessNotSupported(row models.IGAResource) error {
-	msg := "Only S3 buckets and DynamoDB tables are supported."
-	if strings.Contains(row.DisplayName, ":dynamodb:") {
+	msg := "Only S3 buckets, DynamoDB tables and Secrets Manager secrets are supported."
+	switch {
+	case strings.Contains(row.DisplayName, ":dynamodb:"):
 		msg = "Pick one DynamoDB table; a pattern or a global-table ARN cannot be used."
+	case strings.Contains(row.DisplayName, ":secretsmanager:"):
+		msg = "Pick one secret: its full ARN, or <name>-??????. Other patterns and ARNs without the 6-character suffix cannot be used."
 	}
 	return govUnprocessable(GovCodeResourceNotSupported, msg,
 		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
@@ -450,11 +453,21 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	}
 	p.target = t
 	p.resource = accessResourceOf(norm.Resource.ResourceID, t)
+	if k, _ := igagov.AccessKindOf(t.Type()); k.BlockOnly && norm.Effect == igagov.AccessEffectAllow {
+		return nil, govUnprocessable(GovCodeAccessInvalid, "Secrets Manager secrets can only be blocked in this release.",
+			map[string]any{"field": "effect", "resource_type": t.Type()})
+	}
 	// An ARN that names its account (a table) is placed by it; one that
 	// names none (a bucket) by the accounts whose scans saw it.
 	if t.ARNAccount() != "" && len(seenBy) == 0 {
 		return nil, govUnprocessable(GovCodeResourceNotCurrent, "AuthSec no longer sees this "+t.Noun()+" in a current scan.",
 			map[string]any{"field": "resource.resource_id"})
+	}
+	var existence *AccessIssue
+	if sec, ok := t.(igagov.SecretTarget); ok {
+		if existence, err = s.secretListed(ctx, ws, seenBy, sec); err != nil {
+			return nil, err
+		}
 	}
 
 	seen := map[uuid.UUID]bool{}
@@ -517,8 +530,76 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	for _, n := range t.Notes(norm.Effect, norm.Access) {
 		p.warnings = append(p.warnings, AccessIssue{Code: n.Code, Message: n.Message})
 	}
+	if existence != nil {
+		p.warnings = append(p.warnings, *existence)
+	}
 	p.warnings = append(p.warnings, AccessIssue{Code: "other_paths", Message: t.OtherPaths()})
 	return p, nil
+}
+
+// GovCodeExistenceNotVerified: no complete scan says whether the secret
+// exists.
+const GovCodeExistenceNotVerified = "existence_not_verified"
+
+// secretListed checks the secret against ListSecrets of the latest published
+// scan of its own account: a partial ARN whose name ends in six characters
+// ("prod/db-backup") reads as a shorter name, so a name no complete scan
+// lists is refused. With no complete scan of the account and region it is a
+// warning. ListSecrets leaves out a secret scheduled for deletion.
+func (s *GovAccess) secretListed(ctx context.Context, ws uuid.UUID, seenBy []uuid.UUID, t igagov.SecretTarget) (*AccessIssue, error) {
+	checked, found := false, false
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		var conns []uuid.UUID
+		if len(seenBy) > 0 {
+			if err := db.Table("cloud_connector").Where("workspace_id = ? AND id IN ? AND provider = ? AND scope_id = ?",
+				ws, seenBy, models.ProviderAWS, t.Account).Pluck("id", &conns).Error; err != nil {
+				return err
+			}
+		}
+		prefix := "arn:" + t.Partition + ":secretsmanager:" + t.Region + ":" + t.Account + ":secret:"
+		for _, c := range conns {
+			var runs []uuid.UUID
+			if err := db.Raw(`SELECT id FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ? AND status = 'published'
+			                   ORDER BY generation DESC, published_at DESC LIMIT 1`, ws, c).Scan(&runs).Error; err != nil {
+				return err
+			}
+			if len(runs) == 0 {
+				continue
+			}
+			var n int64
+			if err := db.Table("cloud_resource_policy_coverage").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND region = ? AND state = ?",
+				ws, runs[0], igagov.AccessTypeSecretsManagerSecret, t.Region, "complete").Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				continue
+			}
+			checked = true
+			var arns []string
+			if err := db.Table("cloud_resource_policy_observation").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND starts_with(resource_arn, ?)",
+				ws, runs[0], igagov.AccessTypeSecretsManagerSecret, prefix).Pluck("resource_arn", &arns).Error; err != nil {
+				return err
+			}
+			for _, a := range arns {
+				if o, ok := igagov.ParseSecretsManagerSecretARN(a); ok && o.Secret == t.Secret && (t.Suffix == "" || o.Suffix == t.Suffix) {
+					found = true
+					return nil
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	switch {
+	case found:
+		return nil, nil
+	case checked:
+		return nil, govUnprocessable(GovCodeResourceNotCurrent,
+			"AuthSec's last scan of account "+t.Account+" lists no secret named "+t.Secret+" in "+t.Region+" (a secret scheduled for deletion is not listed).",
+			map[string]any{"field": "resource.resource_id"})
+	}
+	return &AccessIssue{Code: GovCodeExistenceNotVerified, Message: "AuthSec could not confirm from a complete scan that this secret exists; check the name."}, nil
 }
 
 func (p *accessPlan) roleIDs() []uuid.UUID {
