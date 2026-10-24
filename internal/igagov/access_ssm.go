@@ -10,8 +10,8 @@ import (
 // GetParametersByPath on every path above it, the root included: AWS
 // evaluates a path listing on the path only, so a role denied /a/b can still
 // read it by listing /a recursively (GetParametersByPath API reference). The
-// action table was checked against the AWS Service Authorization Reference
-// for Systems Manager (2026-10-24).
+// action table was checked against the AWS service reference for Systems
+// Manager (servicereference.us-east-1.amazonaws.com, 2026-10-24).
 //
 // Unverified against a live account, so chosen to fail safe:
 //   - the ARN a listing of the root path "/" is authorized on: the block
@@ -29,9 +29,11 @@ const (
 
 // The actions per level a block denies on the parameter.
 var (
-	// read: the value (GetParameterHistory returns the current value too)
-	// and tags, which can satisfy another principal's tag-based Allow.
-	ssmRead  = []string{"ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource"}
+	// read: the value (GetParameterHistory returns the current value too),
+	// the resource policy (sharing it with another account) and tags, which
+	// can satisfy another principal's tag-based Allow.
+	ssmRead = []string{"ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "ssm:PutResourcePolicy", "ssm:DeleteResourcePolicy",
+		"ssm:AddTagsToResource", "ssm:RemoveTagsFromResource"}
 	ssmWrite = []string{"ssm:PutParameter", "ssm:LabelParameterVersion", "ssm:UnlabelParameterVersion", "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource"}
 	ssmDel   = []string{"ssm:DeleteParameter", "ssm:DeleteParameters"}
 )
@@ -137,7 +139,7 @@ func (t SSMParameterTarget) Notes(effect string, access []string) []AccessNote {
 		add("path_listing_blocked", "Listing parameters by path under "+strings.Join(paths, ", ")+" is refused too, for every parameter there: a listing of a path above this parameter returns it, and AWS cannot leave one parameter out.")
 	}
 	if read && !all {
-		add("history_blocked", "Reading the parameter's history is refused too: it returns the current value.")
+		add("history_blocked", "Reading the parameter's history, sharing it with another account and tagging it are refused too: each can hand its value on.")
 	}
 	if del && !write && !all {
 		add("overwrite_not_covered", "Putting a new value with overwrite can still replace the parameter's value.")

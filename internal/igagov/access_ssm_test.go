@@ -33,7 +33,7 @@ func TestSSMAccessDocuments(t *testing.T) {
 		want   string
 	}{
 		{"read", []string{AccessRead}, &end, `{"Version":"2012-10-17","Statement":[` +
-			main("AddTagsToResource", "GetParameter", "GetParameterHistory", "GetParameters", "RemoveTagsFromResource") + `,` + path + `]}`},
+			main("AddTagsToResource", "DeleteResourcePolicy", "GetParameter", "GetParameterHistory", "GetParameters", "PutResourcePolicy", "RemoveTagsFromResource") + `,` + path + `]}`},
 		{"write", []string{AccessWrite}, &end, `{"Version":"2012-10-17","Statement":[` +
 			main("AddTagsToResource", "LabelParameterVersion", "PutParameter", "RemoveTagsFromResource", "UnlabelParameterVersion") + `]}`},
 		{"delete", []string{AccessDelete}, &end, `{"Version":"2012-10-17","Statement":[` + main("DeleteParameter", "DeleteParameters") + `]}`},
