@@ -4,6 +4,33 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, steps 7 and 8 (both repos)
+
+### Step 7: Azure storage services, Service Bus, Event Hubs
+- A storage account block now covers blobs, queue messages, table entities and files, plus every key and SAS path (listKeys, listAccountSas, listServiceSas). A container stays blobs only. An allow on an account still assigns a blob role and says so (`azure_allow_blobs_only`).
+- New planes:
+  - queues (Storage Queue Data Reader/Contributor);
+  - tables (Table Data Reader/Contributor);
+  - file shares (SMB Share Reader/Contributor, which keep file ACLs);
+  - Service Bus and Event Hubs: receive is read, send is write, delete is refused. An allow names one level, because no built-in role does both without managing the namespace. SAS keys being on is warned (`azure_sas_keys_also`).
+- All role GUIDs and data actions were checked against Microsoft's built-in-roles and permissions pages.
+- Fixes:
+  - Each plane has its own data prefix (`dataNS`), so a blob role on the account neither reaches a queue nor counts as inherited.
+  - Wildcard data actions (`Microsoft.Storage/*`) count.
+  - The auth mode is read on the top-level resource. Before, an OpenAI deployment, search index or Service Bus queue read its own properties and was refused.
+
+### Step 8: Lambda, KMS, SQS, SNS
+- **Lambda.**
+  - Block: the function with every version and alias. A read block also refuses AddPermission, PutResourcePolicy and Create/UpdateFunctionUrlConfig.
+  - Allow: invoking only.
+  - The preview reads the function's resource policy from the last complete scan and warns `function_url_public` when a URL takes auth type NONE. No IAM block reaches such callers.
+- **KMS.** Block only. Read is decrypt and CreateGrant; write is encrypt, data keys, sign and administration; delete is deletion, disable and imported material. Multi-Region keys are denied in every Region.
+- **SQS.** Block every level and its hand-offs; allow the plain message actions.
+- **SNS.** Block subscribe, publish, delete and hand-offs; allow publishing only.
+- **UI.** One generic reader for these single-ARN types. The form shows only the levels an allow may name.
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, step 6: Bedrock and AgentCore, block only (both repos)
 
 ### Done
