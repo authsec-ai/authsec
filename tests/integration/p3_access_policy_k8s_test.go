@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/k8sread"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -135,6 +136,12 @@ func (k *kapLab) agentApplies(row models.IGAGovK8sAccess, kind string, result st
 func TestAccessPolicyK8sLifecycle(t *testing.T) {
 	k := newKapLab(t)
 	ctx := context.Background()
+	// The ServiceAccount's access names the role by its graph id: what the
+	// console's picker sends as the policy's resource.
+	grants, _, err := k8sread.New(k.db, k.ws).AccessFor(k.booker)
+	if err != nil || len(grants) == 0 || grants[0].RoleID != k.role.String() {
+		t.Fatalf("access of booker: %+v %v", grants, err)
+	}
 	in := k.intent("block", []uuid.UUID{k.booker}, "all")
 	pv, err := k.svc.Preview(ctx, k.ws, in)
 	if err != nil || len(pv.Blockers) != 0 || !strings.Contains(pv.Sentence, "Block all access on Kubernetes Role agents/secret-reader (cluster "+kapCluster+")") ||

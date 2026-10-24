@@ -585,6 +585,9 @@ func (q *Query) Workloads(limit int) ([]Workload, error) {
 // through a group carries the group in Via: the chain then starts with the
 // membership.
 type Grant struct {
+	// RoleID is the role's graph id (iga_policy), "" when the role was never
+	// seen: what an access policy on the role names.
+	RoleID   string `json:"role_id,omitempty"`
 	RoleName string `json:"role_name"`
 	RoleKind string `json:"role_kind"` // k8s_role | k8s_cluster_role
 	// Binding is the assignment's source key, as before ("" when the grant
@@ -702,6 +705,7 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 	// Scanned flat, then shaped: the grant's nested fields are built here,
 	// never by the scanner.
 	var rows []struct {
+		RoleID           *uuid.UUID
 		RoleName         string
 		RoleKind         string
 		Binding          string
@@ -724,7 +728,8 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 	}
 	err := q.tx.Raw(`
 		WITH acc AS (`+accessRowsSQL+`)
-		SELECT p.display_name AS role_name,
+		SELECT p.id           AS role_id,
+		       p.display_name AS role_name,
 		       p.policy_kind  AS role_kind,
 		       COALESCE(a.source_key, '') AS binding,
 		       COALESCE(a.assignment_kind, '') AS bind_kind,
@@ -787,6 +792,9 @@ func (q *Query) AccessFor(identityID uuid.UUID) ([]Grant, AccessSummary, error) 
 			RoleName: r.RoleName, RoleKind: r.RoleKind, Binding: r.Binding, BindKind: r.BindKind,
 			Namespace: r.Namespace, State: r.State, Basis: r.Basis, CalculationState: r.CalculationState,
 			Resolved: r.Resolved, Wildcard: r.Wildcard, Constrained: r.Constrained,
+		}
+		if r.RoleID != nil {
+			g.RoleID = r.RoleID.String()
 		}
 		expandRights(&g, r.Native)
 		if r.BindingKey != "" {
