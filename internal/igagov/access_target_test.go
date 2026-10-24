@@ -72,3 +72,27 @@ func TestS3DeleteBlocksLifecycle(t *testing.T) {
 		t.Fatalf("lifecycle: block bucket %v, block folder %v, allow %v", has(AccessEffectBlock, ""), has(AccessEffectBlock, "invoices/"), has(AccessEffectAllow, ""))
 	}
 }
+
+// The descriptor capabilities send: a block-only type allows nothing, a type
+// with nothing to delete lists no delete, a limited allow lists its levels.
+func TestAccessKindViews(t *testing.T) {
+	by := map[string]AccessKindView{}
+	for _, v := range AccessKindViews() {
+		by[v.Type] = v
+	}
+	if len(by) != len(AccessKinds()) || !by[AccessTypeS3Bucket].Prefix || len(by[AccessTypeS3Bucket].AllowLevels) != 3 {
+		t.Fatalf("views: %+v", by)
+	}
+	if v := by[AccessTypeKMSKey]; !v.BlockOnly || len(v.AllowLevels) != 0 || v.AllowLevels == nil {
+		t.Fatalf("kms: %+v", v)
+	}
+	if v := by[AccessTypeBedrockModel]; len(v.Levels) != 2 {
+		t.Fatalf("model levels: %+v", v)
+	}
+	if v := by[AccessTypeLambdaFunction]; len(v.AllowLevels) != 1 || v.AllowLevels[0] != AccessRead {
+		t.Fatalf("lambda: %+v", v)
+	}
+	if v := by[AccessTypeSNSTopic]; len(v.AllowLevels) != 1 || v.AllowLevels[0] != AccessWrite {
+		t.Fatalf("sns: %+v", v)
+	}
+}

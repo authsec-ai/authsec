@@ -285,15 +285,16 @@ var (
 // (§4.3): the gate (state, reason, schema_head), one boolean per feature with
 // a reason in "reasons" for every false one, and provider support.
 // withAccessPolicies adds policy.access_policies {available, reason,
-// resource_types, block_only} (decision 2026-10-13; resource_types are the
-// AWS access types, igagov.AccessTypes; block_only those that take no allow).
+// resource_types, block_only, types} (decision 2026-10-13; resource_types are
+// the AWS access types, igagov.AccessTypes; block_only those that take no
+// allow; types describes each, igagov.AccessKindViews).
 func withAccessPolicies(out gin.H, db *gorm.DB) gin.H {
 	if db == nil {
 		return out
 	}
 	ok, reason := services.AccessPoliciesStatus(db)
 	out["access_policies"] = gin.H{"available": ok, "reason": nullIfEmpty(reason), "resource_types": igagov.AccessTypes(),
-		"block_only": igagov.AccessBlockOnlyTypes()}
+		"block_only": igagov.AccessBlockOnlyTypes(), "types": igagov.AccessKindViews()}
 	return out
 }
 

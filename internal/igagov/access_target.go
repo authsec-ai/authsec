@@ -68,7 +68,44 @@ type AccessKind struct {
 	Prefix  bool
 	// BlockOnly: the type takes no allow in this release.
 	BlockOnly bool
-	Parse     func(arn string) (AWSAccessTarget, bool)
+	// AllowLevels are the levels an allow may name when not all three;
+	// NoDelete: the type has nothing to delete.
+	AllowLevels []string
+	NoDelete    bool
+	Parse       func(arn string) (AWSAccessTarget, bool)
+}
+
+// AccessKindView is a type as capabilities describe it to the console.
+type AccessKindView struct {
+	Type        string   `json:"type"`
+	Service     string   `json:"service"`
+	Noun        string   `json:"noun"`
+	Prefix      bool     `json:"prefix"`
+	BlockOnly   bool     `json:"block_only"`
+	AllowLevels []string `json:"allow_levels"`
+	Levels      []string `json:"levels"`
+}
+
+// AccessKindViews describes every type: what it is called and which levels a
+// block and an allow may name.
+func AccessKindViews() []AccessKindView {
+	out := []AccessKindView{}
+	for _, k := range AccessKinds() {
+		levels := []string{AccessRead, AccessWrite}
+		if !k.NoDelete {
+			levels = append(levels, AccessDelete)
+		}
+		allow := k.AllowLevels
+		switch {
+		case k.BlockOnly:
+			allow = []string{}
+		case allow == nil:
+			allow = levels
+		}
+		out = append(out, AccessKindView{Type: k.Type, Service: k.Service, Noun: k.Noun, Prefix: k.Prefix, BlockOnly: k.BlockOnly,
+			AllowLevels: allow, Levels: levels})
+	}
+	return out
 }
 
 // ErrAccessNotSupported is an ARN no access kind reads.
@@ -94,7 +131,7 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseSSMParameterARN(arn)
 			return t, ok
 		}},
-		{Type: AccessTypeBedrockModel, Service: "bedrock", Noun: "model", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+		{Type: AccessTypeBedrockModel, Service: "bedrock", Noun: "model", BlockOnly: true, NoDelete: true, Parse: func(arn string) (AWSAccessTarget, bool) {
 			t, ok := ParseBedrockModelARN(arn)
 			return t, ok
 		}},
@@ -106,7 +143,7 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseAgentCoreRuntimeARN(arn)
 			return t, ok
 		}},
-		{Type: AccessTypeLambdaFunction, Service: "lambda", Noun: "function", Parse: func(arn string) (AWSAccessTarget, bool) {
+		{Type: AccessTypeLambdaFunction, Service: "lambda", Noun: "function", AllowLevels: []string{AccessRead}, Parse: func(arn string) (AWSAccessTarget, bool) {
 			t, ok := ParseLambdaFunctionARN(arn)
 			return t, ok
 		}},
@@ -118,7 +155,7 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseSQSQueueARN(arn)
 			return t, ok
 		}},
-		{Type: AccessTypeSNSTopic, Service: "sns", Noun: "topic", Parse: func(arn string) (AWSAccessTarget, bool) {
+		{Type: AccessTypeSNSTopic, Service: "sns", Noun: "topic", AllowLevels: []string{AccessWrite}, Parse: func(arn string) (AWSAccessTarget, bool) {
 			t, ok := ParseSNSTopicARN(arn)
 			return t, ok
 		}},
