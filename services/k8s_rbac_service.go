@@ -158,6 +158,13 @@ func missingClusterUID(uid, recorded string, require bool) bool {
 // winner's. The controller maps it to 409 sweep_conflict.
 var ErrSweepConflict = errors.New("sweep_conflict")
 
+// ErrSweepStale reports a snapshot whose sweep started no later than the last
+// accepted sweep of the same (workspace, source, cluster): a replayed or
+// delayed reading. Projected, it would become the newest generation and end
+// grants a newer reading confirmed (K-1). Refused whole, NOT retryable: the
+// controller maps it to 409 sweep_stale.
+var ErrSweepStale = errors.New("sweep_stale")
+
 // sweepGenerationKey is the unique constraint two racing sweeps collide on.
 const sweepGenerationKey = "iga_k8s_sweep_generation_key"
 
@@ -582,6 +589,22 @@ func (m *k8sRBACManager) openSweep(tx *gorm.DB, workspaceID, sourceID uuid.UUID,
 	started := observed
 	if t := parseSnapshotTime(snap.SweepStartedAt); !t.IsZero() {
 		started = t
+	}
+
+	// K-1 ordering: a reading not newer than the last one accepted (any sweep
+	// that did not fail) is a replay or arrived late, and is refused rather
+	// than projected as the newest generation.
+	var lastStarted []time.Time
+	if err := tx.Table("iga_k8s_sweep").
+		Where("workspace_id = ? AND discovery_source_id = ? AND cluster = ? AND status <> ?",
+			workspaceID, sourceID, cluster, models.K8sSweepFailed).
+		Order("sweep_started_at DESC").Limit(1).
+		Pluck("sweep_started_at", &lastStarted).Error; err != nil {
+		return nil, err
+	}
+	if len(lastStarted) == 1 && !started.After(lastStarted[0]) {
+		return nil, fmt.Errorf("%w: cluster %q from source %s: this sweep started at %s, not after the last accepted one (%s)",
+			ErrSweepStale, cluster, sourceID, started.Format(time.RFC3339), lastStarted[0].UTC().Format(time.RFC3339))
 	}
 
 	row := &models.IGAK8sSweep{

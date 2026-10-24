@@ -4,6 +4,31 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — Kubernetes enforcement: prerequisites
+
+### Done
+- Mapped what Kubernetes access policies need (spec R1k, "blocked" until K-1 to K-3):
+  - The instruction kind CHECK (last set in 026) needs a migration for new kinds.
+  - The agent refuses payloads without `namespace` and `workload_name`, and has no RBAC client methods or RBAC write verbs.
+  - A binding is stored only as per-subject `iga_policy_assignment` rows; its UID and resourceVersion are dropped.
+  - Snapshots carry no ordering.
+- K-1, ordering half (AS-164): a snapshot whose sweep started no later than the last accepted sweep of its source and cluster is refused with 409 `sweep_stale`. The authentication half was already done (AS-014).
+
+### Next (needs the owner's go-ahead: it changes what the in-cluster agent may do in customer clusters)
+- **K-2:** keep the binding's UID and resourceVersion (agent and wire model), and read bindings by identity.
+- **K-3:** a separate actuation permission set in the Helm chart, per opted-in namespace:
+  - `get`/`list`/`patch` on rolebindings;
+  - `bind` limited by `resourceNames`;
+  - `create` on subjectaccessreviews;
+  - no `escalate`.
+- **Instruction kinds:**
+  - `remove_binding_subject` / `restore_binding_subject`, with a resourceVersion precondition and the before-state recorded;
+  - `apply_rolebinding` / `delete_rolebinding` for an allow;
+  - migration 146 for the kind CHECK;
+  - an `iga_gov_k8s_access` deployment table mirroring `iga_gov_azure_access`.
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, steps 7 and 8 (both repos)
 
 ### Step 7: Azure storage services, Service Bus, Event Hubs
