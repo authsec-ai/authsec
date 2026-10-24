@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -518,6 +519,16 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			return nil, err
 		}
 	}
+	if fn, ok := t.(igagov.LambdaTarget); ok && norm.Effect == igagov.AccessEffectBlock &&
+		(slices.Contains(norm.Access, igagov.AccessRead) || slices.Contains(norm.Access, igagov.AccessAll)) {
+		public, err := s.functionURLPublic(ctx, ws, seenBy, fn)
+		if err != nil {
+			return nil, err
+		}
+		if public {
+			existence = &AccessIssue{Code: GovCodeFunctionURLPublic, Message: "This function has a function URL with auth type NONE: anyone with the URL can invoke it, and no IAM policy can stop that. Remove the URL or set its auth type to AWS_IAM."}
+		}
+	}
 
 	seen := map[uuid.UUID]bool{}
 	for _, c := range seenBy {
@@ -590,6 +601,68 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	return p, nil
 }
 
+// completeScansOf is, per connector among seenBy that scans account, its
+// latest published scan when that scan's resource-policy collection of form
+// in region is complete.
+func completeScansOf(db *gorm.DB, ws uuid.UUID, seenBy []uuid.UUID, account, form, region string) ([]uuid.UUID, error) {
+	if len(seenBy) == 0 {
+		return nil, nil
+	}
+	var conns []uuid.UUID
+	if err := db.Table("cloud_connector").Where("workspace_id = ? AND id IN ? AND provider = ? AND scope_id = ?",
+		ws, seenBy, models.ProviderAWS, account).Pluck("id", &conns).Error; err != nil {
+		return nil, err
+	}
+	var out []uuid.UUID
+	for _, c := range conns {
+		var runs []uuid.UUID
+		if err := db.Raw(`SELECT id FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ? AND status = 'published'
+		                   ORDER BY generation DESC, published_at DESC LIMIT 1`, ws, c).Scan(&runs).Error; err != nil {
+			return nil, err
+		}
+		if len(runs) == 0 {
+			continue
+		}
+		var n int64
+		if err := db.Table("cloud_resource_policy_coverage").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND region = ? AND state = ?",
+			ws, runs[0], form, region, "complete").Count(&n).Error; err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			out = append(out, runs[0])
+		}
+	}
+	return out, nil
+}
+
+// GovCodeFunctionURLPublic: the function has a function URL anyone can call.
+const GovCodeFunctionURLPublic = "function_url_public"
+
+// functionURLPublic reports whether the latest complete scan of the
+// function's account read a resource policy letting anyone invoke its
+// function URL (auth type NONE): no IAM policy reaches such a caller.
+func (s *GovAccess) functionURLPublic(ctx context.Context, ws uuid.UUID, seenBy []uuid.UUID, t igagov.LambdaTarget) (bool, error) {
+	public := false
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
+		runs, err := completeScansOf(db, ws, seenBy, t.Account, igagov.AccessTypeLambdaFunction, t.Region)
+		if err != nil || len(runs) == 0 {
+			return err
+		}
+		var docs []json.RawMessage
+		if err := db.Table("cloud_resource_policy_observation o").
+			Joins("JOIN cloud_policy_document d ON d.workspace_id = o.workspace_id AND d.document_hash = o.document_hash").
+			Where("o.workspace_id = ? AND o.scan_run_id IN ? AND o.resource_arn = ? AND o.policy_present", ws, runs, t.ARN()).
+			Pluck("d.document", &docs).Error; err != nil {
+			return err
+		}
+		for _, d := range docs {
+			public = public || igagov.PublicFunctionURL(d)
+		}
+		return nil
+	})
+	return public, err
+}
+
 // GovCodeExistenceNotVerified: no complete scan says whether the secret
 // exists.
 const GovCodeExistenceNotVerified = "existence_not_verified"
@@ -602,35 +675,16 @@ const GovCodeExistenceNotVerified = "existence_not_verified"
 func (s *GovAccess) secretListed(ctx context.Context, ws uuid.UUID, seenBy []uuid.UUID, t igagov.SecretTarget) (*AccessIssue, error) {
 	checked, found := false, false
 	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
-		var conns []uuid.UUID
-		if len(seenBy) > 0 {
-			if err := db.Table("cloud_connector").Where("workspace_id = ? AND id IN ? AND provider = ? AND scope_id = ?",
-				ws, seenBy, models.ProviderAWS, t.Account).Pluck("id", &conns).Error; err != nil {
-				return err
-			}
+		runs, err := completeScansOf(db, ws, seenBy, t.Account, igagov.AccessTypeSecretsManagerSecret, t.Region)
+		if err != nil {
+			return err
 		}
 		prefix := "arn:" + t.Partition + ":secretsmanager:" + t.Region + ":" + t.Account + ":secret:"
-		for _, c := range conns {
-			var runs []uuid.UUID
-			if err := db.Raw(`SELECT id FROM cloud_scan_run WHERE workspace_id = ? AND connector_id = ? AND status = 'published'
-			                   ORDER BY generation DESC, published_at DESC LIMIT 1`, ws, c).Scan(&runs).Error; err != nil {
-				return err
-			}
-			if len(runs) == 0 {
-				continue
-			}
-			var n int64
-			if err := db.Table("cloud_resource_policy_coverage").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND region = ? AND state = ?",
-				ws, runs[0], igagov.AccessTypeSecretsManagerSecret, t.Region, "complete").Count(&n).Error; err != nil {
-				return err
-			}
-			if n == 0 {
-				continue
-			}
+		for _, run := range runs {
 			checked = true
 			var arns []string
 			if err := db.Table("cloud_resource_policy_observation").Where("workspace_id = ? AND scan_run_id = ? AND resource_form = ? AND starts_with(resource_arn, ?)",
-				ws, runs[0], igagov.AccessTypeSecretsManagerSecret, prefix).Pluck("resource_arn", &arns).Error; err != nil {
+				ws, run, igagov.AccessTypeSecretsManagerSecret, prefix).Pluck("resource_arn", &arns).Error; err != nil {
 				return err
 			}
 			for _, a := range arns {

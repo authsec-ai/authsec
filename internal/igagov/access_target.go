@@ -106,6 +106,22 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseAgentCoreRuntimeARN(arn)
 			return t, ok
 		}},
+		{Type: AccessTypeLambdaFunction, Service: "lambda", Noun: "function", Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseLambdaFunctionARN(arn)
+			return t, ok
+		}},
+		{Type: AccessTypeKMSKey, Service: "kms", Noun: "key", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseKMSKeyARN(arn)
+			return t, ok
+		}},
+		{Type: AccessTypeSQSQueue, Service: "sqs", Noun: "queue", Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseSQSQueueARN(arn)
+			return t, ok
+		}},
+		{Type: AccessTypeSNSTopic, Service: "sns", Noun: "topic", Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseSNSTopicARN(arn)
+			return t, ok
+		}},
 	}
 }
 

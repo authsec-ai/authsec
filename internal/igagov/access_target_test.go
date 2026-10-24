@@ -16,13 +16,13 @@ func TestParseAWSAccessTargetS3(t *testing.T) {
 		got.ARN() != "arn:aws:s3:::reports-prod" || got.ARNAccount() != "" || got.ARNPartition() != "aws" {
 		t.Fatalf("parsed %#v", got)
 	}
-	if _, err := ParseAWSAccessTarget("arn:aws:sqs:us-east-1:111122223333:queue", ""); !errors.Is(err, ErrAccessNotSupported) {
-		t.Fatalf("an SQS ARN: %v, want ErrAccessNotSupported", err)
+	if _, err := ParseAWSAccessTarget("arn:aws:ec2:us-east-1:111122223333:instance/i-0abc", ""); !errors.Is(err, ErrAccessNotSupported) {
+		t.Fatalf("an EC2 ARN: %v, want ErrAccessNotSupported", err)
 	}
-	if got := AccessTypes(); len(got) == 0 || got[0] != AccessTypeS3Bucket || got[len(got)-1] != AccessTypeAgentCoreRuntime {
+	if got := AccessTypes(); len(got) == 0 || got[0] != AccessTypeS3Bucket || got[len(got)-1] != AccessTypeSNSTopic {
 		t.Fatalf("AccessTypes %v", got)
 	}
-	if got := AccessBlockOnlyTypes(); len(got) != 5 || got[0] != AccessTypeSecretsManagerSecret || got[1] != AccessTypeSSMParameter {
+	if got := AccessBlockOnlyTypes(); len(got) != 6 || got[0] != AccessTypeSecretsManagerSecret || got[1] != AccessTypeSSMParameter {
 		t.Fatalf("AccessBlockOnlyTypes %v", got)
 	}
 }
