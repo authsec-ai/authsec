@@ -493,12 +493,9 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		"/policies/:id/rollout/pause", "/policies/:id/rollout/resume"} {
 		exempt["POST "+prefix+r] = "audited in p3_rollout_test.go (T3.15)"
 	}
-	// R2 and R3 routes are always mounted now that their switches are gone
-	// (2026-10-21). This R1a walker never covered them -- they were not
-	// mounted when it ran -- and still does not: their events are exercised
-	// by p3_r2_r3_isolation_test.go, which does NOT assert audit_events rows
-	// (each handler returns an audited record on success, govMutation).
-	// Listed so the gap stays visible.
+	// R2 and R3 routes need an AWS role with an R2 binding, approvers distinct
+	// from requesters and a held runtime decision: TestP3R2R3RoutesAudited
+	// calls each over HTTP and asserts its audit_events row (AS-138).
 	for _, r := range []string{
 		"POST /temporary-grants", "POST /temporary-grants/:id/approve", "POST /temporary-grants/:id/reject",
 		"POST /temporary-grants/:id/revoke", "POST /session-revocations", "POST /session-revocations/:id/approve",
@@ -510,7 +507,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 		"POST /runtime/broker-roles", "POST /runtime/broker-roles/:id/disable",
 	} {
 		method, path, _ := strings.Cut(r, " ")
-		exempt[method+" "+prefix+path] = "R2 / R3 route: no audit_events assertion yet (not walked here)"
+		exempt[method+" "+prefix+path] = "audited in TestP3R2R3RoutesAudited"
 	}
 	// Access-policy routes need a fake AWS account with a template v2
 	// binding: TestAccessPolicyRoutesAudited calls each over HTTP and asserts
