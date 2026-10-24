@@ -236,3 +236,19 @@ func TestAzureStep7Planes(t *testing.T) {
 		t.Fatalf("SAS keys: %+v %+v", b, w)
 	}
 }
+
+// Writing a secret through ARM (a management action) is part of a write block.
+func TestKeyVaultARMSecretWrite(t *testing.T) {
+	acts, _ := azureActions(planeTarget("microsoft.keyvault/vaults"), []string{"write"})
+	if !slices.Contains(acts, "Microsoft.KeyVault/vaults/secrets/write") {
+		t.Fatalf("vault write: %v", acts)
+	}
+	contributor := planeDef(t, []string{"Microsoft.KeyVault/*"}, nil)
+	acts, data := azureActions(planeTarget("microsoft.keyvault/vaults"), []string{"write"})
+	if !roleGrants(contributor, acts, data) {
+		t.Fatal("a role that writes secrets through ARM is not taken by a write block")
+	}
+	if acts, _ := azureActions(planeTarget("microsoft.keyvault/vaults"), []string{"read"}); len(acts) != 0 {
+		t.Fatalf("vault read takes management actions: %v", acts)
+	}
+}

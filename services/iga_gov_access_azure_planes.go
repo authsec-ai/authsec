@@ -133,11 +133,13 @@ func localAuthMode(what string) func(props map[string]any) (*AccessIssue, *Acces
 var azureDataPlanes = []azureDataPlane{
 	{
 		typePath: "microsoft.keyvault/vaults", children: []string{"secrets"}, what: "Key Vault secrets",
-		read:     []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action", "Microsoft.KeyVault/vaults/secrets/backup/action"},
-		write:    []string{"Microsoft.KeyVault/vaults/secrets/setSecret/action", "Microsoft.KeyVault/vaults/secrets/update/action", "Microsoft.KeyVault/vaults/secrets/restore/action", "Microsoft.KeyVault/vaults/secrets/recover/action"},
-		del:      []string{"Microsoft.KeyVault/vaults/secrets/delete", "Microsoft.KeyVault/vaults/secrets/purge/action"},
-		mapped:   []string{"microsoft.keyvault/vaults/secrets/"},
-		readRole: azure.RoleKeyVaultSecretsUser, readRoleName: "Key Vault Secrets User",
+		read:  []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action", "Microsoft.KeyVault/vaults/secrets/backup/action"},
+		write: []string{"Microsoft.KeyVault/vaults/secrets/setSecret/action", "Microsoft.KeyVault/vaults/secrets/update/action", "Microsoft.KeyVault/vaults/secrets/restore/action", "Microsoft.KeyVault/vaults/secrets/recover/action"},
+		del:   []string{"Microsoft.KeyVault/vaults/secrets/delete", "Microsoft.KeyVault/vaults/secrets/purge/action"},
+		// ARM's secrets/write (a management action) sets a secret's value too.
+		writeKeys: []string{"Microsoft.KeyVault/vaults/secrets/write"},
+		mapped:    []string{"microsoft.keyvault/vaults/secrets/"},
+		readRole:  azure.RoleKeyVaultSecretsUser, readRoleName: "Key Vault Secrets User",
 		writeRole: azure.RoleKeyVaultSecretsOfficer, writeRoleName: "Key Vault Secrets Officer",
 		apiVersion: "2023-07-01",
 		authMode: func(props map[string]any) (*AccessIssue, *AccessIssue) {
