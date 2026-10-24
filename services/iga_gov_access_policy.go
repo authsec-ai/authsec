@@ -20,6 +20,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
+	"github.com/authsec-ai/authsec/internal/k8sgraph"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -358,6 +359,7 @@ type accessPlan struct {
 	usedBy   map[uuid.UUID][]AccessWorkloadRef
 	warnings []AccessIssue
 	azure    *azurePlan // an Azure resource: role assignments, not an IAM policy
+	k8s      *k8sPlan   // a Kubernetes role: binding subjects the agent removes
 	// self is the policy being edited or resumed (nil on create): its own
 	// rows are not a conflict with it.
 	self *uuid.UUID
@@ -367,6 +369,9 @@ type accessPlan struct {
 func (p *accessPlan) nRoles() int {
 	if p.azure != nil {
 		return len(p.azure.principals)
+	}
+	if p.k8s != nil {
+		return len(p.k8s.subjects)
 	}
 	return len(p.roles)
 }
@@ -472,6 +477,14 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 				return err
 			}
 			support = support.Where("workload_id = ?", norm.Resource.ResourceID)
+			if len(rows) == 0 {
+				// A Kubernetes Role or ClusterRole, named by its graph id.
+				if ok, _ := K8sAccessSchemaStatus(db); ok {
+					if rows, err = accessK8sRoleRows(db, ws, []string{norm.Resource.ResourceID}); err != nil {
+						return err
+					}
+				}
+			}
 		} else {
 			support = support.Where("resource_id = ?", norm.Resource.ResourceID)
 		}
@@ -489,6 +502,12 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 			return nil, err
 		}
 		p.resource.ARN, p.resource.AccountID = p.azure.target.Scope, p.azure.target.SubscriptionID
+		return p, nil
+	}
+	if rows[0].Provider == models.ProviderK8s {
+		if err := s.planK8s(ctx, ws, p, rows[0]); err != nil {
+			return nil, err
+		}
 		return p, nil
 	}
 	if rows[0].Provider != models.ProviderAWS {
@@ -779,6 +798,9 @@ func (s *GovAccess) checks(ctx context.Context, ws uuid.UUID, p *accessPlan) []e
 	if p.azure != nil {
 		return s.azureChecks(ctx, ws, p)
 	}
+	if p.k8s != nil {
+		return s.k8sChecks(ctx, ws, p)
+	}
 	var errs []error
 	done := map[uuid.UUID]bool{}
 	for _, r := range p.roles {
@@ -874,6 +896,18 @@ func (s *GovAccess) Preview(ctx context.Context, ws uuid.UUID, in igagov.AccessI
 		out.Warnings = append(out.Warnings, p.warnings...)
 		return out, nil
 	}
+	if p.k8s != nil {
+		names := make([]string, 0, len(p.k8s.subjects))
+		for _, sp := range p.k8s.subjects {
+			names = append(names, sp.name)
+			out.Documents = append(out.Documents, AccessDocumentView{IdentityAccountID: sp.identity, RoleName: sp.name,
+				PolicyName: "Kubernetes binding subjects", Document: p.doc})
+			out.AlsoAffected = append(out.AlsoAffected, AccessAlsoAffected{IdentityAccountID: sp.identity, Workloads: []AccessWorkloadRef{}})
+		}
+		out.Sentence = k8sSentence(p.intent, p.k8s, names)
+		out.Warnings = append(out.Warnings, p.warnings...)
+		return out, nil
+	}
 	names := make([]string, 0, len(p.roles))
 	for _, r := range p.roles {
 		names = append(names, r.Identity.Name)
@@ -902,6 +936,9 @@ func accessNameReason(name, reason string) (string, string, error) {
 func (s *GovAccess) deployTx(tx *gorm.DB, ws, actor, policyID uuid.UUID, v *models.IGAGovAccessPolicyVersion, p *accessPlan, reason string, now time.Time) error {
 	if p.azure != nil {
 		return s.deployAzureTx(tx, ws, actor, policyID, v, p, now)
+	}
+	if p.k8s != nil {
+		return s.deployK8sTx(tx, ws, actor, policyID, v, p, now)
 	}
 	if err := archiveDocumentTx(tx, ws, string(p.doc), p.docHash); err != nil {
 		return err
@@ -1089,7 +1126,11 @@ func endRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason stri
 		n++
 	}
 	m, err := endAzureRowsTx(tx, ws, policyID, keep, reason, now)
-	return n + m, err
+	if err != nil {
+		return n + m, err
+	}
+	k, err := endK8sRowsTx(tx, ws, policyID, keep, reason, now)
+	return n + m + k, err
 }
 
 // accessAfterActiveTx runs when a deployment row turned active: once every
@@ -1381,6 +1422,8 @@ type accessBundle struct {
 	versions []models.IGAGovAccessPolicyVersion
 	rows     []models.IGAGovTempGrant
 	// azureDocs: an Azure row's document, by its rows[] DocumentHash;
+	// k8sRows: the Kubernetes rows behind rows[], by id.
+	k8sRows map[uuid.UUID]models.IGAGovK8sAccess
 	// azureRows: the Azure rows behind rows[], by id.
 	azureDocs map[string]json.RawMessage
 	azureRows map[uuid.UUID]models.IGAGovAzureAccess
@@ -1444,6 +1487,24 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 	for _, r := range rows {
 		by[*r.PolicyID].rows = append(by[*r.PolicyID].rows, r)
 	}
+	if ok, _ := K8sAccessSchemaStatus(db); ok {
+		var ks []models.IGAGovK8sAccess
+		if err := db.Where("workspace_id = ? AND policy_id IN ?", ws, pids).Order("created_at").Find(&ks).Error; err != nil {
+			return nil, err
+		}
+		for _, a := range ks {
+			b := by[a.PolicyID]
+			b.rows = append(b.rows, k8sAsGrant(a))
+			if b.azureDocs == nil {
+				b.azureDocs = map[string]json.RawMessage{}
+			}
+			if b.k8sRows == nil {
+				b.k8sRows = map[uuid.UUID]models.IGAGovK8sAccess{}
+			}
+			b.azureDocs["k8s:"+a.ID.String()] = k8sRowDocument(a)
+			b.k8sRows[a.ID] = a
+		}
+	}
 	// Without 144 there are no Azure rows, and AWS policies read as before.
 	if ok, _ := AzureAccessSchemaStatus(db); !ok {
 		return out, nil
@@ -1457,6 +1518,8 @@ func loadAccessBundles(db *gorm.DB, ws uuid.UUID, ids []uuid.UUID, q string) ([]
 		b.rows = append(b.rows, azureAsGrant(a))
 		if b.azureDocs == nil {
 			b.azureDocs = map[string]json.RawMessage{}
+		}
+		if b.azureRows == nil {
 			b.azureRows = map[uuid.UUID]models.IGAGovAzureAccess{}
 		}
 		b.azureDocs["azure:"+a.ID.String()] = azureRowDocument(a)
@@ -1498,6 +1561,9 @@ func accessTerminal(state string) bool {
 // accessRemovingText is the status reason while a policy comes out of the
 // cloud.
 func accessRemovingText(b *accessBundle, in igagov.AccessIntent) string {
+	if len(b.k8sRows) > 0 {
+		return "putting ServiceAccounts back into their bindings"
+	}
 	if len(b.azureRows) == 0 {
 		return "removing from AWS"
 	}
@@ -1702,6 +1768,13 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				return nil, err
 			}
 			resRows = append(resRows, wl...)
+			if ok, _ := K8sAccessSchemaStatus(db); ok && len(wl) < len(rest) {
+				kr, err := accessK8sRoleRows(db, ws, rest)
+				if err != nil {
+					return nil, err
+				}
+				resRows = append(resRows, kr...)
+			}
 		}
 	}
 	resARN := map[string]string{}
@@ -1729,6 +1802,18 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 		rr := resRow[in.Resource.ResourceID]
 		v.Resource.Kind = rr.ResourceKind
 		switch {
+		case rr.Provider == models.ProviderK8s || len(b.k8sRows) > 0:
+			v.Resource.Provider, v.Resource.ResourceType, v.Resource.Prefix = models.ProviderK8s, accessTypeK8sRole, ""
+			v.Resource.ARN = rr.SourceKey
+			if k, ok := k8sgraph.ParseKey(rr.SourceKey); ok {
+				v.Resource.Name, v.Resource.AccountID = k8sRoleLabel(k), k.Cluster
+			}
+			for _, a := range b.k8sRows {
+				if v.Resource.Name == "" {
+					v.Resource.Name = a.RoleName
+				}
+				v.Resource.AccountID = a.Cluster
+			}
 		case rr.Provider == models.ProviderAzure || len(b.azureRows) > 0:
 			v.Resource.Provider, v.Resource.Name, v.Resource.ResourceType = models.ProviderAzure, rr.DisplayName, accessTypeAzure
 			v.Resource.Prefix = ""
@@ -1758,7 +1843,12 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 				rv.UsedBy = []AccessWorkloadRef{}
 			}
 			if g, ok := arnOf[id]; ok {
-				if a, az := b.azureRows[g.ID]; az {
+				if a, ok := b.k8sRows[g.ID]; ok {
+					rv.AccountID = a.Cluster
+					if rv.Name == "" {
+						rv.Name = k8sSubjectName(a)
+					}
+				} else if a, az := b.azureRows[g.ID]; az {
 					rv.AccountID = a.SubscriptionID
 					if rv.Name == "" {
 						rv.Name = a.PrincipalName
@@ -1806,6 +1896,12 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 					awsARN, target = "", a.Scope
 					if name == "" || name == r.RoleARN {
 						name = a.PrincipalName
+					}
+				}
+				if a, ok := b.k8sRows[r.ID]; ok {
+					awsARN, target = "", k8sBindingRef(a)
+					if name == "" || name == r.RoleARN {
+						name = k8sSubjectName(a)
 					}
 				}
 				v.Deployments = append(v.Deployments, AccessDeploymentView{IdentityAccountID: r.IdentityAccountID, RoleName: name,
@@ -1896,8 +1992,8 @@ func (s *GovAccess) ListPage(ctx context.Context, ws uuid.UUID, q AccessListQuer
 		q.Limit = 50
 	}
 	q.Provider = strings.ToLower(strings.TrimSpace(q.Provider))
-	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure {
-		return nil, GovBadParam("provider", "provider is aws or azure.")
+	if q.Provider != "" && q.Provider != models.ProviderAWS && q.Provider != models.ProviderAzure && q.Provider != models.ProviderK8s {
+		return nil, GovBadParam("provider", "provider is aws, azure or k8s.")
 	}
 	off := 0
 	if q.Cursor != "" {

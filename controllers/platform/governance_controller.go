@@ -1129,6 +1129,10 @@ func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
 		b := v == "true" || v == "1"
 		rep.ForceEvict = &b
 	}
+	if v := c.Query("bindings"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Bindings = &b
+	}
 	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
 		// Never fatal to the fetch. Refusing to serve a plan because the agent's
 		// self-report was unparseable would take enforcement away over telemetry.

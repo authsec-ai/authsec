@@ -1101,7 +1101,8 @@ var contractPolicyCapabilities = contractObj(
 		contractReq("resource_types", contractArrMin(1, contractNonEmpty)), contractReq("block_only", contractArr(contractNonEmpty)),
 		contractReq("types", contractArrMin(1, contractObj(contractReq("type", contractNonEmpty), contractReq("service", contractNonEmpty),
 			contractReq("noun", contractNonEmpty), contractReq("prefix", contractBool), contractReq("block_only", contractBool),
-			contractReq("allow_levels", contractArr(contractNonEmpty)), contractReq("levels", contractArrMin(1, contractNonEmpty))))))),
+			contractReq("allow_levels", contractArr(contractNonEmpty)), contractReq("levels", contractArrMin(1, contractNonEmpty))))),
+		contractReq("k8s", contractObj(contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)))))),
 	contractReq("reasons", contractMap(contractNonEmpty)),
 	contractReq("providers", contractObj(
 		contractReq("aws", contractConst("supported")), contractReq("k8s", contractConst("not_supported")))),

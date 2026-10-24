@@ -293,8 +293,14 @@ func withAccessPolicies(out gin.H, db *gorm.DB) gin.H {
 		return out
 	}
 	ok, reason := services.AccessPoliciesStatus(db)
+	k8sOK, k8sReason := services.K8sAccessSchemaStatus(db)
+	if !ok {
+		k8sReason = reason
+	}
 	out["access_policies"] = gin.H{"available": ok, "reason": nullIfEmpty(reason), "resource_types": igagov.AccessTypes(),
-		"block_only": igagov.AccessBlockOnlyTypes(), "types": igagov.AccessKindViews()}
+		"block_only": igagov.AccessBlockOnlyTypes(), "types": igagov.AccessKindViews(),
+		// Kubernetes: block a ServiceAccount from a Role (migration 146).
+		"k8s": gin.H{"available": ok && k8sOK, "reason": nullIfEmpty(k8sReason)}}
 	return out
 }
 

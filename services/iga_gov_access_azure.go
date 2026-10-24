@@ -887,14 +887,18 @@ func accessLiveCount(tx *gorm.DB, ws, policyID uuid.UUID) (int64, error) {
 		Count(&aws).Error; err != nil {
 		return 0, err
 	}
+	k, err := k8sLiveCount(tx, ws, policyID)
+	if err != nil {
+		return 0, err
+	}
 	if ok, _ := AzureAccessSchemaStatus(tx); !ok {
-		return aws, nil
+		return aws + k, nil
 	}
 	if err := tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, policyID,
 		[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}).Count(&az).Error; err != nil {
 		return 0, err
 	}
-	return aws + az, nil
+	return aws + az + k, nil
 }
 
 // accessSupersedeTx: once every Azure row of the applied version is active,

@@ -470,6 +470,13 @@ const (
 	// produce one. It exists only behind an explicit human action, and the schema
 	// refuses to store one that does not name who asked and why.
 	InstructionForceDeletePods = "force_delete_pods"
+	// InstructionRemoveBindingSubject takes one subject out of a RoleBinding
+	// or ClusterRoleBinding (a Kubernetes access-policy block, 146), behind
+	// the agent's own enforcement.bindings switch and namespace list; the
+	// result names the binding's uid. InstructionRestoreBindingSubject puts it
+	// back into that same object, never into a recreated one.
+	InstructionRemoveBindingSubject  = "remove_binding_subject"
+	InstructionRestoreBindingSubject = "restore_binding_subject"
 )
 
 // Instruction lifecycle. 'leased' is time-bounded, so a crashed agent's work returns to
@@ -498,7 +505,7 @@ func InstructionOpen(status string) bool {
 func ValidInstructionKinds() []string {
 	return []string{InstructionQuarantine, InstructionUnquarantine,
 		InstructionVerifyUptake, InstructionEvictPods, InstructionDeleteWorkload,
-		InstructionForceDeletePods}
+		InstructionForceDeletePods, InstructionRemoveBindingSubject, InstructionRestoreBindingSubject}
 }
 
 // ProvisioningInstruction is one unit of cluster-side work.
