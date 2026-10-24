@@ -4,6 +4,19 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, step 5: AWS SSM parameters, block only (both repos)
+
+### Done
+- `SSMParameterTarget` (`internal/igagov/access_ssm.go`), block only. Read: GetParameter(s), GetParameterHistory (it returns the current value), tags, and `AuthSecAccessPath`: GetParametersByPath on `parameter/` and every path above the parameter. The GetParametersByPath API reference says a role denied `/a/b` can still read it by listing `/a` recursively, so the block refuses listing those paths for its whole window (warned as `path_listing_blocked`). Write: PutParameter, labels, tags. Delete: DeleteParameter(s).
+- Discovery already types these ARNs as `ssm_parameter` (generic fallback); no existence check: the ARN is exact.
+- The block-only refusal now names the type's noun.
+- UI: the SSM parameter type (Allow off), `parameterOf`/`groupParameters`, graph coverage of the exact parameter.
+
+### To check against AWS
+- Which ARN a listing of the root path "/" is authorized on.
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, step 4: Azure OpenAI / AI Services (both repos)
 
 ### Done
