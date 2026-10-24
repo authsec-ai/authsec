@@ -94,6 +94,18 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseSSMParameterARN(arn)
 			return t, ok
 		}},
+		{Type: AccessTypeBedrockModel, Service: "bedrock", Noun: "model", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseBedrockModelARN(arn)
+			return t, ok
+		}},
+		{Type: AccessTypeBedrockAgent, Service: "bedrock", Noun: "agent", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseBedrockAgentARN(arn)
+			return t, ok
+		}},
+		{Type: AccessTypeAgentCoreRuntime, Service: "bedrock-agentcore", Noun: "agent runtime", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseAgentCoreRuntimeARN(arn)
+			return t, ok
+		}},
 	}
 }
 

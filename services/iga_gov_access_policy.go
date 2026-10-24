@@ -18,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsenforce"
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -374,7 +375,7 @@ const accessTypeAzure = "azure_resource"
 
 // accessNotSupported refuses a Discovery row no access type reads.
 func accessNotSupported(row models.IGAResource) error {
-	msg := "Only S3 buckets, DynamoDB tables, Secrets Manager secrets and SSM parameters are supported."
+	msg := "Only S3 buckets, DynamoDB tables, Secrets Manager secrets, SSM parameters, Bedrock models and agents, and AgentCore runtimes are supported."
 	switch {
 	case strings.Contains(row.DisplayName, ":dynamodb:"):
 		msg = "Pick one DynamoDB table; a pattern or a global-table ARN cannot be used."
@@ -382,9 +383,45 @@ func accessNotSupported(row models.IGAResource) error {
 		msg = "Pick one secret: its full ARN, or <name>-??????. Other patterns and ARNs without the 6-character suffix cannot be used."
 	case strings.Contains(row.DisplayName, ":ssm:"):
 		msg = "Pick one SSM parameter by its full name; a pattern cannot be used."
+	case strings.Contains(row.DisplayName, ":bedrock:") || strings.Contains(row.DisplayName, ":bedrock-agentcore:"):
+		msg = "Pick one Bedrock model (or a cross-region inference profile of it), one agent or one AgentCore runtime; a pattern cannot be used."
 	}
 	return govUnprocessable(GovCodeResourceNotSupported, msg,
 		map[string]any{"field": "resource.resource_id", "resource_kind": row.ResourceKind, "supported": igagov.AccessTypes()})
+}
+
+// accessWorkloadKinds are the discovered workloads an access policy can name
+// by their workload id (step 6): Bedrock agents and AgentCore runtimes, which
+// IAM policies seldom name one by one.
+var accessWorkloadKinds = []string{models.WorkloadBedrockAgent, models.WorkloadBedrockAgentCoreRT}
+
+// accessWorkloadRows reads the discovered workloads among ids as resource
+// rows: the ARN is the workload's recognition key (igagraph.WorkloadKey).
+func accessWorkloadRows(db *gorm.DB, ws uuid.UUID, ids []string) ([]models.IGAResource, error) {
+	var valid []uuid.UUID
+	for _, id := range ids {
+		if u, err := uuid.Parse(id); err == nil {
+			valid = append(valid, u)
+		}
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+	var wls []models.IGAWorkload
+	if err := db.Where("workspace_id = ? AND id IN ? AND provider = ? AND runtime_kind IN ?", ws, valid, models.ProviderAWS, accessWorkloadKinds).
+		Find(&wls).Error; err != nil {
+		return nil, err
+	}
+	out := make([]models.IGAResource, 0, len(wls))
+	for _, w := range wls {
+		arn := strings.TrimPrefix(w.SourceKey, "aws"+igagraph.Sep)
+		if !strings.HasPrefix(arn, "arn:") {
+			continue
+		}
+		out = append(out, models.IGAResource{ID: w.ID, WorkspaceID: w.WorkspaceID, ResourceKind: w.RuntimeKind, DisplayName: arn,
+			Provider: models.ProviderAWS, SourceKey: w.SourceKey})
+	}
+	return out, nil
 }
 
 // accessResourceOf is the view of an AWS target (bucket and prefix are S3's).
@@ -426,8 +463,18 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 		if err := db.Where("workspace_id = ? AND id = ?", ws, norm.Resource.ResourceID).Limit(1).Find(&rows).Error; err != nil {
 			return err
 		}
-		return db.Table("iga_object_support").Where("workspace_id = ? AND resource_id = ? AND state = ? AND connector_id IS NOT NULL",
-			ws, norm.Resource.ResourceID, "current").Distinct().Pluck("connector_id", &seenBy).Error
+		support := db.Table("iga_object_support").Where("workspace_id = ? AND state = ? AND connector_id IS NOT NULL", ws, "current")
+		if len(rows) == 0 {
+			// A discovered agent or agent runtime, named by its workload id.
+			var err error
+			if rows, err = accessWorkloadRows(db, ws, []string{norm.Resource.ResourceID}); err != nil {
+				return err
+			}
+			support = support.Where("workload_id = ?", norm.Resource.ResourceID)
+		} else {
+			support = support.Where("resource_id = ?", norm.Resource.ResourceID)
+		}
+		return support.Distinct().Pluck("connector_id", &seenBy).Error
 	}); err != nil {
 		return nil, err
 	}
@@ -518,6 +565,10 @@ func (s *GovAccess) plan(ctx context.Context, ws uuid.UUID, in igagov.AccessInte
 	}
 	p.doc, p.docHash, p.actions, p.res, err = igagov.AccessDocument(norm.Effect, norm.Access, t, norm.StartsAt, end)
 	if err != nil {
+		var fe *igagov.AccessFieldError
+		if errors.As(err, &fe) {
+			return nil, accessFieldErr(err)
+		}
 		return nil, govUnprocessable(GovCodeAccessInvalid, err.Error(), nil)
 	}
 	if norm.Effect == igagov.AccessEffectAllow {
@@ -1579,6 +1630,24 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 	if len(rids) > 0 {
 		if err := db.Where("workspace_id = ? AND id IN ?", ws, rids).Find(&resRows).Error; err != nil {
 			return nil, err
+		}
+		if len(resRows) < len(rids) {
+			// The rest may be discovered agents named by their workload id.
+			found := map[string]bool{}
+			for _, r := range resRows {
+				found[r.ID.String()] = true
+			}
+			var rest []string
+			for _, id := range rids {
+				if !found[id] {
+					rest = append(rest, id)
+				}
+			}
+			wl, err := accessWorkloadRows(db, ws, rest)
+			if err != nil {
+				return nil, err
+			}
+			resRows = append(resRows, wl...)
 		}
 	}
 	resARN := map[string]string{}
