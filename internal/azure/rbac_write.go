@@ -35,6 +35,8 @@ const (
 	RoleServiceBusDataSender        = "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
 	RoleEventHubsDataReceiver       = "a638d3c7-ab3a-418d-83e6-5f17a39d4fde"
 	RoleEventHubsDataSender         = "2b629674-e913-4c01-ae53-ef4638d8f975"
+	RoleServiceBusDataOwner         = "090c5cfd-751d-490a-894a-3ce6f1109419"
+	RoleEventHubsDataOwner          = "f526a384-b230-433a-b45c-95f59c4a2dec"
 	RoleCognitiveOpenAIContributor  = "a001fd3d-188f-4b5d-821b-7da978bf7442"
 	RoleStorageBlobDataReader       = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
 	RoleStorageBlobDataContributor  = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"

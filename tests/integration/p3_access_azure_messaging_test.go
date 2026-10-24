@@ -11,8 +11,8 @@ import (
 
 // Step 7: a storage account block covers its queues, tables and file shares;
 // a queue is its own plane (a blob role on the account neither reaches it nor
-// blocks it as inherited); Service Bus blocks receive or send, refuses
-// delete, and an allow names one of them.
+// blocks it as inherited); Service Bus blocks receive or send and refuses
+// delete; an allow of both assigns Data Owner, warned (staging #98).
 func TestAccessPolicyAzureQueuesAndServiceBus(t *testing.T) {
 	z := newAzLab(t)
 	z.fake.defs = append(z.fake.defs,
@@ -60,7 +60,6 @@ func TestAccessPolicyAzureQueuesAndServiceBus(t *testing.T) {
 		code         string
 	}{
 		{"delete", "block", []string{"delete"}, services.GovCodeAccessInvalid},
-		{"allow read and write", "allow", []string{"read", "write"}, services.GovCodeAccessInvalid},
 		// The receiver role sits on the namespace, above the queue.
 		{"block receive inherited from the namespace", "block", []string{"read"}, services.GovCodeAzureInherited},
 	} {
@@ -78,6 +77,12 @@ func TestAccessPolicyAzureQueuesAndServiceBus(t *testing.T) {
 	z.run(v.ID)
 	if got := z.fake.roles(workerOID); len(got) != 1 || got[0] != azure.RoleServiceBusDataReceiver {
 		t.Fatalf("after the send block: %v", got)
+	}
+	// Allow receive and send: Data Owner, warned as broader.
+	owner, _ := z.principal("sp-owner")
+	if pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("allow", sbQueue, owner, "read", "write")); err != nil || len(pv.Blockers) != 0 ||
+		!strings.Contains(fmt.Sprint(pv.Warnings), "Azure Service Bus Data Owner also manages") {
+		t.Fatalf("allow read and write: %+v %v", pv, err)
 	}
 	// Allow send: Azure Service Bus Data Sender.
 	newcomer, newcomerOID := z.principal("sp-producer")

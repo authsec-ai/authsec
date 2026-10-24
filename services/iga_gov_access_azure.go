@@ -302,7 +302,15 @@ func azureAllowRole(t *azureTarget, access []string) (guid, name string) {
 		writes = writes || a == igagov.AccessWrite || a == igagov.AccessDelete
 	}
 	if dp := azureDataPlaneOf(t); dp != nil {
-		if writes {
+		reads := false
+		for _, a := range access {
+			reads = reads || a == igagov.AccessRead || a == igagov.AccessAll
+		}
+		switch {
+		case writes && reads && dp.bothRole != "":
+			// Service Bus and Event Hubs: the sending role cannot receive.
+			return dp.bothRole, dp.bothRoleName
+		case writes:
 			return dp.writeRole, dp.writeRoleName
 		}
 		return dp.readRole, dp.readRoleName
@@ -525,11 +533,6 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 			return govUnprocessable(GovCodeAccessInvalid, "There is nothing to delete in "+dp.what+": receiving removes them. Choose read, write or all.",
 				map[string]any{"field": "access"})
 		}
-		if dp.oneAllowLevel && p.intent.Effect == igagov.AccessEffectAllow &&
-			slices.Contains(p.intent.Access, igagov.AccessRead) && slices.Contains(p.intent.Access, igagov.AccessWrite) {
-			return govUnprocessable(GovCodeAccessInvalid, "Azure has no built-in role for receiving and sending "+dp.what+" without managing the namespace: allow read and write in two policies.",
-				map[string]any{"field": "access"})
-		}
 	}
 	if p.intent.Effect == igagov.AccessEffectAllow && ap.target.TypePath == "microsoft.storage/storageaccounts" {
 		p.warnings = append(p.warnings, AccessIssue{Code: "azure_allow_blobs_only",
@@ -542,6 +545,10 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 				Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on this resource type: Contributor allows every management write on it."})
 		}
 		dp := azureDataPlaneOf(&ap.target)
+		if dp != nil && dp.bothRole != "" && ap.roleGUID == dp.bothRole {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+				Message: "Azure has no built-in role that only receives and sends " + dp.what + ": " + ap.roleName + " also manages the namespace and its entities. Allow read and write in two policies to avoid that."})
+		}
 		if dp != nil && ap.roleGUID == dp.readRole && dp.readRoleAlso != "" {
 			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
 				Message: "Azure has no built-in role for only reading " + dp.what + ": " + ap.roleName + " also allows " + dp.readRoleAlso + "."})

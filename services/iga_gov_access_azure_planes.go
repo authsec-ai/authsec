@@ -34,10 +34,12 @@ type azureDataPlane struct {
 	// case, no trailing "/"); "" is the provider namespace. A queue's is the
 	// account's queue service: a blob role on the account never reaches it.
 	dataNS string
-	// noDelete: the type has no delete (messages are removed by receiving);
-	// oneAllowLevel: no built-in role allows read and write without
-	// management, so an allow names one of them.
-	noDelete, oneAllowLevel bool
+	// noDelete: the type has no delete (messages are removed by receiving).
+	noDelete bool
+	// bothRole is what an allow of read and write assigns where the write
+	// role cannot read (Service Bus, Event Hubs: Data Owner, which also
+	// manages the namespace -- warned).
+	bothRole, bothRoleName string
 	// The roles an allow assigns, and what the write role allows beyond
 	// write (warned).
 	readRole, readRoleName, writeRole, writeRoleName string
@@ -230,17 +232,19 @@ var azureDataPlanes = []azureDataPlane{
 	{
 		typePath: "microsoft.servicebus/namespaces", children: []string{"queues", "topics", "topics/subscriptions"}, what: "Service Bus messages",
 		read: []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"}, write: []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
-		readKeys: serviceBusKeys, writeKeys: serviceBusKeys, mapped: []string{"microsoft.servicebus/"}, noDelete: true, oneAllowLevel: true,
+		readKeys: serviceBusKeys, writeKeys: serviceBusKeys, mapped: []string{"microsoft.servicebus/"}, noDelete: true,
 		readRole: azure.RoleServiceBusDataReceiver, readRoleName: "Azure Service Bus Data Receiver",
 		writeRole: azure.RoleServiceBusDataSender, writeRoleName: "Azure Service Bus Data Sender",
+		bothRole: azure.RoleServiceBusDataOwner, bothRoleName: "Azure Service Bus Data Owner",
 		apiVersion: "2021-11-01", authMode: localAuthMode("namespace"),
 	},
 	{
 		typePath: "microsoft.eventhub/namespaces", children: []string{"eventhubs", "eventhubs/consumergroups"}, what: "Event Hubs events",
 		read: []string{"Microsoft.EventHub/namespaces/messages/receive/action"}, write: []string{"Microsoft.EventHub/namespaces/messages/send/action"},
-		readKeys: eventHubKeys, writeKeys: eventHubKeys, mapped: []string{"microsoft.eventhub/"}, noDelete: true, oneAllowLevel: true,
+		readKeys: eventHubKeys, writeKeys: eventHubKeys, mapped: []string{"microsoft.eventhub/"}, noDelete: true,
 		readRole: azure.RoleEventHubsDataReceiver, readRoleName: "Azure Event Hubs Data Receiver",
 		writeRole: azure.RoleEventHubsDataSender, writeRoleName: "Azure Event Hubs Data Sender",
+		bothRole: azure.RoleEventHubsDataOwner, bothRoleName: "Azure Event Hubs Data Owner",
 		apiVersion: "2021-11-01", authMode: localAuthMode("namespace"),
 	},
 }

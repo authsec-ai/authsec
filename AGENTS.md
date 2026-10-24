@@ -39,15 +39,37 @@ issuance, and the ORY Hydra boundary.
   isolated scratch database**. Check fresh bootstrap separately for parity;
   bootstrap-only success does not establish upgrade compatibility. Never apply
   rehearsal SQL to the deployed database.
+- Check the bootstrap **on its own** too: load `001_bootstrap.sql` alone and
+  compare it with a database the backend migrates from empty (they differ only
+  by `migration_logs`, which boot creates). A fresh install runs every numbered
+  migration after `001`, so `scripts/schema-parity.sh` (fresh vs upgraded)
+  passes even when `001` lacks a later migration's column. A catalog-driven
+  migration (048's per-table indexes) misses tables created after it ran:
+  give such a table its own migration.
 - Follow [`../.claude/commands/schema-change.md`](../.claude/commands/schema-change.md).
 
 ## Agentic IGA
 
 - The active graph design is
-  [`.claude/specs/SPEC-iga-phase2-graph.md`](.claude/specs/SPEC-iga-phase2-graph.md).
-  The objective is the complete AWS scanning-to-graph experience, including
-  read APIs and UI integration. Treat unfinished contracts as work to resolve,
-  not as implemented behavior or an automatic reason to defer the user journey.
+  [`.claude/specs/SPEC-iga-phase2-graph.md`](.claude/specs/SPEC-iga-phase2-graph.md),
+  with its recorded decisions in
+  [`.claude/specs/P2-DECISIONS.md`](.claude/specs/P2-DECISIONS.md). The
+  objective is the complete scanning-to-graph experience, including read APIs
+  and UI integration. Treat unfinished contracts as work to resolve, not as
+  implemented behavior or an automatic reason to defer the user journey.
+- The graph traversal routes (`/graph`, `/graph/expand`, `/graph/path`) serve
+  AWS, Kubernetes (D-107 to D-113) and Azure (D-114), one provider per
+  traversal (`internal/igaread/traverse*.go`). Add a provider the same way;
+  never as a second, provider-only graph endpoint. The graph lists stay AWS;
+  the unified inventory (`/api/iga/v1/inventory/*`) lists every provider.
+- Access policies (block or allow identities on one resource for a window, AWS
+  and Azure) are specified in
+  [`.claude/specs/SPEC-access-policies.md`](.claude/specs/SPEC-access-policies.md).
+- No IGA switches: the graph gate and the policy gates are on, and the schema
+  decides (`SPEC-iga-phase2-graph.md` §2.8). With the graph schema absent, AWS
+  scans run without the graph; partial or unreadable fails closed; projectors
+  write only on a verified schema. A gate's "off" exists only before `main`
+  installs it and in tests.
 - Inspect [migrations/master](migrations/master) and the current source before
   assigning migration numbers or claiming a task is complete. Dated status
   reports do not override either; do not require reading a separate historical

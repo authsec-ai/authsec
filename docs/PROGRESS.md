@@ -4,6 +4,17 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — authsec-staging merged into `feat/iga-enforcement`
+
+- Staging's PR #98 added an Azure data-plane table for AI Search, Key Vault, Service Bus and Event Hubs. This branch already maps those types, and more, in `services/iga_gov_access_azure_planes.go`. The merge keeps that table and drops staging's duplicate in `iga_gov_access_azure.go`.
+- **Adopted from #98:** an allow of read and write on Service Bus or Event Hubs assigns Data Owner. A preview warning says it also manages the namespace. This branch had refused that combination.
+- **#98's unit tests adapted to this branch's behaviour:**
+  - a storage account block also covers queues, tables, files and the SAS paths;
+  - a mapped type's read is its data and key actions, not the management read.
+- Every removal and restore case those tests check still holds. #98's integration test (TestAccessPolicyAzureSearchIndex) runs unchanged.
+
+---
+
 ## 2026-10-24 (cont.) — Open items closed
 
 - **AS-138:** all 21 R2/R3 mutation routes now assert their audit row over HTTP (TestP3R2R3RoutesAudited, with a fake AgentCore for the push).
@@ -240,6 +251,18 @@ On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure acc
 ### Next
 - Step 0 is done. Allow re-apply stays as it is (owner's decision, 2026-10-23): an allow removed outside AuthSec is re-applied at the next check on AWS and Azure, and ending the policy is how access is revoked.
 - Next: step 1, AWS DynamoDB access policies.
+
+---
+
+## 2026-10-22 — Azure access policies reach data planes (branch `fix/azure-access-data-actions`)
+
+### Done
+- Found in production: a block on a Foundry project's identity left its agent answering, because the agent reads an Azure AI Search index with Search Index Data Reader, a role with data actions only, and a block outside storage accounts looked at management actions only.
+- `azureActions` now adds data actions (and key listings) for AI Search, Key Vault secrets, Service Bus and Event Hubs (`azureDataPlanes` in `services/iga_gov_access_azure.go`); an allow assigns Search Index Data Reader/Contributor and Key Vault Secrets User/Officer there. Storage accounts and every other type are unchanged. The preview notes AI Search API keys and Key Vault access policies, which role assignments do not cover.
+- Tests: `TestAzureActions*`, `TestAzureBlockReachesSearchIndexData`, `TestAzureAllowAssignsDataRoles`, `TestAzureDataPlaneChildTypes` (unit); `TestAccessPolicyAzureSearchIndex` (integration). The existing `TestAccessPolicyAzure` and the AWS access-policy tests still pass.
+
+### Known limits
+- Cognitive Services / Azure OpenAI and Cosmos DB are not in the table: Cosmos DB's data RBAC is not ARM role assignments, and OpenAI's data actions need a decision on what "read" means for a model.
 
 ---
 

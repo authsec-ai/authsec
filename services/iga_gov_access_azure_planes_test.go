@@ -220,8 +220,8 @@ func TestAzureStep7Planes(t *testing.T) {
 	if roleDataOutside(sender, "microsoft.servicebus", azureDataPlaneOf(sb).mapped) {
 		t.Fatal("Sender reads as unclassified")
 	}
-	if dp := azureDataPlaneOf(sb); !dp.noDelete || !dp.oneAllowLevel {
-		t.Fatal("Service Bus: no delete, one allow level")
+	if dp := azureDataPlaneOf(sb); !dp.noDelete || dp.bothRole != azure.RoleServiceBusDataOwner {
+		t.Fatal("Service Bus: no delete; Data Owner for read and write")
 	}
 	for scope, want := range map[string]string{
 		"/subscriptions/s/resourcegroups/rg/providers/microsoft.servicebus/namespaces/ns/queues/q":           "/subscriptions/s/resourcegroups/rg/providers/microsoft.servicebus/namespaces/ns",
