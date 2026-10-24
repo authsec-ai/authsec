@@ -4,6 +4,39 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — Verification pass, and Kubernetes access policies (backend, UI, iga-agent)
+
+### Checked against primary sources
+- **Bedrock.** Global inference profiles check the model as `arn:aws:bedrock:::foundation-model/<model>`, with no Region. That ARN is now denied explicitly. Whether application profiles and prompt routers also check the model is not settled by AWS's docs; the preview says so (`app_profiles_unverified`).
+- **Secrets Manager.** ListSecrets leaves out secrets scheduled for deletion by default, which is the documented `IncludePlannedDeletion` behaviour.
+- **KMS.** Grants only allow, so an identity Deny still wins.
+- **Lambda.** A function URL with auth type NONE skips IAM.
+- **Azure.**
+  - Every role GUID in the code matches Microsoft's built-in role pages: Key Vault, Search, Storage, Cognitive Services, Service Bus, Event Hubs, Reader, Contributor.
+  - The Key Vault plane missed ARM's `Microsoft.KeyVault/vaults/secrets/write`, which sets a value through management. A write block now takes it, and a broader holder is reported as inherited.
+- **Not checkable without an account:** the ARN a listing of SSM's root path is authorized on, DynamoDB's conditions, and the AS-135 PIM case.
+- **The one unexplained full-suite failure** did not recur in four further runs.
+
+### Kubernetes access policies (AS-165)
+- **Backend.**
+  - Migration 146: `iga_gov_k8s_access`, job `k8s_access`, instructions `remove_binding_subject`/`restore_binding_subject`, and `discovery_sources.enforcement_bindings`.
+  - A policy names a Role or ClusterRole (graph id) and ServiceAccounts. Only block and all access are allowed.
+  - One row per (ServiceAccount, binding), placed by the binding's `discovery_source_id`.
+  - The job queues the instruction in its own workspace transaction, waits for the agent, removes again on drift (a sweep at least 15 minutes after the removal still lists the subject), and restores into the recorded binding uid.
+  - Refusals: an agent without the switch (`k8s_agent_cannot_act`), no binding of the role (`k8s_no_binding`), and a second live block on the same subject and binding (`k8s_policy_conflict`).
+  - Capabilities report `access_policies.k8s`. A ServiceAccount's access names each role's `role_id`.
+  - Schema parity holds: fresh bootstrap equals an upgraded database.
+- **iga-agent** (branch `feat/iga-enforcement`, chart and app 0.5.0).
+  - Gated by `enforcement.bindings.enabled`, `namespaces`, `roles` and `clusterWide`.
+  - The agent reads and writes the whole binding object, conditional on `resourceVersion`, and retries on conflict.
+  - It reports the binding's uid only when it removed something. A restore into a replaced or deleted binding is reported, not done.
+  - The chart grants get/update on bindings and `bind` with `resourceNames` limited to the listed roles. It never grants `escalate`, `create` or `delete`. Unset value blocks fall back to chart defaults.
+  - The agent reports `bindings=` on its plan poll.
+- **UI.** Kubernetes is a provider when the server serves it. The picker chooses a ServiceAccount, then a role it holds. The rule is fixed to block all access.
+- **Not done:** allow (creating RoleBindings, which needs `bind` on every role customers want to grant), User/Group subjects, and a test against a live cluster. The NOTES chart tests need a reachable cluster in this environment and were already failing before this change.
+
+---
+
 ## 2026-10-24 (cont.) — Kubernetes enforcement: prerequisites
 
 ### Done
