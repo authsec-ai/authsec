@@ -19,8 +19,11 @@ func TestParseAWSAccessTargetS3(t *testing.T) {
 	if _, err := ParseAWSAccessTarget("arn:aws:sqs:us-east-1:111122223333:queue", ""); !errors.Is(err, ErrAccessNotSupported) {
 		t.Fatalf("an SQS ARN: %v, want ErrAccessNotSupported", err)
 	}
-	if got := AccessTypes(); len(got) == 0 || got[0] != AccessTypeS3Bucket {
+	if got := AccessTypes(); len(got) == 0 || got[0] != AccessTypeS3Bucket || got[len(got)-1] != AccessTypeSecretsManagerSecret {
 		t.Fatalf("AccessTypes %v", got)
+	}
+	if got := AccessBlockOnlyTypes(); len(got) != 1 || got[0] != AccessTypeSecretsManagerSecret {
+		t.Fatalf("AccessBlockOnlyTypes %v", got)
 	}
 }
 

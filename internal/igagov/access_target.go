@@ -66,7 +66,9 @@ type AccessKind struct {
 	Service string
 	Noun    string
 	Prefix  bool
-	Parse   func(arn string) (AWSAccessTarget, bool)
+	// BlockOnly: the type takes no allow in this release.
+	BlockOnly bool
+	Parse     func(arn string) (AWSAccessTarget, bool)
 }
 
 // ErrAccessNotSupported is an ARN no access kind reads.
@@ -84,6 +86,10 @@ func AccessKinds() []AccessKind {
 			t, ok := ParseDynamoDBTableARN(arn)
 			return t, ok
 		}},
+		{Type: AccessTypeSecretsManagerSecret, Service: "secretsmanager", Noun: "secret", BlockOnly: true, Parse: func(arn string) (AWSAccessTarget, bool) {
+			t, ok := ParseSecretsManagerSecretARN(arn)
+			return t, ok
+		}},
 	}
 }
 
@@ -93,6 +99,27 @@ func AccessTypes() []string {
 	out := make([]string, 0, len(kinds))
 	for _, k := range kinds {
 		out = append(out, k.Type)
+	}
+	return out
+}
+
+// AccessKindOf is the kind of a type.
+func AccessKindOf(typ string) (AccessKind, bool) {
+	for _, k := range AccessKinds() {
+		if k.Type == typ {
+			return k, true
+		}
+	}
+	return AccessKind{}, false
+}
+
+// AccessBlockOnlyTypes is the types that take blocks only.
+func AccessBlockOnlyTypes() []string {
+	out := []string{}
+	for _, k := range AccessKinds() {
+		if k.BlockOnly {
+			out = append(out, k.Type)
+		}
 	}
 	return out
 }
