@@ -9,7 +9,7 @@ import (
 )
 
 func planeTarget(typePath string) *azureTarget {
-	return &azureTarget{TypePath: typePath, Storage: typePath == "microsoft.storage/storageaccounts"}
+	return &azureTarget{TypePath: typePath, Storage: azureIsStorage(typePath)}
 }
 
 func planeDef(t *testing.T, actions, dataActions []string) azure.RoleDefinition {
@@ -22,12 +22,21 @@ func planeDef(t *testing.T, actions, dataActions []string) azure.RoleDefinition 
 	return d
 }
 
-// Storage and unmapped types keep their mapping exactly.
+// A storage account covers every data service and every way to a key or a
+// SAS; a container its blobs only; unmapped types keep their mapping.
 func TestAzureActionsUnmappedTypesUnchanged(t *testing.T) {
 	acts, data := azureActions(planeTarget("microsoft.storage/storageaccounts"), []string{"read"})
-	if !slices.Equal(acts, []string{"Microsoft.Storage/storageAccounts/listKeys/action"}) ||
-		!slices.Equal(data, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"}) {
+	if !slices.Equal(acts, []string{"Microsoft.Storage/storageAccounts/listAccountSas/action", "Microsoft.Storage/storageAccounts/listKeys/action",
+		"Microsoft.Storage/storageAccounts/listServiceSas/action"}) ||
+		!slices.Equal(data, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+			"Microsoft.Storage/storageAccounts/fileServices/fileshares/files/read", "Microsoft.Storage/storageAccounts/fileServices/readFileBackupSemantics/action",
+			"Microsoft.Storage/storageAccounts/queueServices/queues/messages/process/action", "Microsoft.Storage/storageAccounts/queueServices/queues/messages/read",
+			"Microsoft.Storage/storageAccounts/tableServices/tables/entities/read"}) {
 		t.Fatalf("storage read: %v %v", acts, data)
+	}
+	container := &azureTarget{TypePath: "microsoft.storage/storageaccounts/blobservices/containers", Storage: azureIsStorage("microsoft.storage/storageaccounts/blobservices/containers")}
+	if _, data := azureActions(container, []string{"read"}); !slices.Equal(data, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"}) {
+		t.Fatalf("container read: %v", data)
 	}
 	acts, data = azureActions(planeTarget("microsoft.web/sites"), []string{"write"})
 	if !slices.Equal(acts, []string{"microsoft.web/sites/write"}) || len(data) != 0 {
@@ -76,6 +85,14 @@ func TestAzureAllowRolesDataPlanes(t *testing.T) {
 		{"microsoft.search/searchservices", []string{"delete"}, azure.RoleSearchIndexDataContributor},
 		{"microsoft.cognitiveservices/accounts", []string{"read"}, azure.RoleCognitiveOpenAIUser},
 		{"microsoft.cognitiveservices/accounts/deployments", []string{"write"}, azure.RoleCognitiveOpenAIContributor},
+		{"microsoft.storage/storageaccounts/queueservices/queues", []string{"read"}, azure.RoleStorageQueueDataReader},
+		{"microsoft.storage/storageaccounts/tableservices/tables", []string{"delete"}, azure.RoleStorageTableDataContributor},
+		{"microsoft.storage/storageaccounts/fileservices/shares", []string{"read"}, azure.RoleStorageFileSMBReader},
+		{"microsoft.servicebus/namespaces/topics/subscriptions", []string{"read"}, azure.RoleServiceBusDataReceiver},
+		{"microsoft.servicebus/namespaces/queues", []string{"write"}, azure.RoleServiceBusDataSender},
+		{"microsoft.eventhub/namespaces/eventhubs", []string{"read"}, azure.RoleEventHubsDataReceiver},
+		{"microsoft.eventhub/namespaces", []string{"write"}, azure.RoleEventHubsDataSender},
+		{"microsoft.storage/storageaccounts", []string{"read"}, azure.RoleStorageBlobDataReader},
 		{"microsoft.web/sites", []string{"read"}, azure.RoleReader},
 	} {
 		if got, _ := azureAllowRole(planeTarget(c.tp), c.access); got != c.want {
@@ -171,5 +188,51 @@ func TestAzureActionsOpenAI(t *testing.T) {
 	}
 	if b, w := dp.authMode(map[string]any{"customSubDomainName": "acme-ai", "disableLocalAuth": true}); b != nil || w != nil {
 		t.Fatal("Entra only refused")
+	}
+}
+
+// Step 7: a queue, table or file share is its own plane: a blob role on the
+// account never reaches it, a role with all storage data does; Service Bus
+// and Event Hubs roles classify by receive and send.
+func TestAzureStep7Planes(t *testing.T) {
+	queue := planeTarget("microsoft.storage/storageaccounts/queueservices/queues")
+	if queue.Storage || azureDataNS(queue) != "microsoft.storage/storageaccounts/queueservices" {
+		t.Fatalf("queue: %+v %s", queue, azureDataNS(queue))
+	}
+	blobReader := planeDef(t, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"})
+	allStorage := planeDef(t, nil, []string{"Microsoft.Storage/*"})
+	queueReader := planeDef(t, []string{"Microsoft.Storage/storageAccounts/queueServices/queues/read"}, []string{"Microsoft.Storage/storageAccounts/queueServices/queues/messages/read"})
+	acts, data := azureActions(queue, []string{"read"})
+	if roleGrants(blobReader, acts, data) || roleDataIn(blobReader, azureDataNS(queue)) || azureGrants(queue, []string{"all"}, blobReader, nil, nil) {
+		t.Fatal("a blob role reaches a queue")
+	}
+	if !roleGrants(queueReader, acts, data) || !roleDataIn(allStorage, azureDataNS(queue)) || !roleGrants(allStorage, acts, data) {
+		t.Fatal("queue roles not matched")
+	}
+	sb := planeTarget("microsoft.servicebus/namespaces/queues")
+	receiver := planeDef(t, []string{"Microsoft.ServiceBus/*/queues/read"}, []string{"Microsoft.ServiceBus/*/receive/action"})
+	sender := planeDef(t, []string{"Microsoft.ServiceBus/*/queues/read"}, []string{"Microsoft.ServiceBus/*/send/action"})
+	ra, rd := azureActions(sb, []string{"read"})
+	wa, wd := azureActions(sb, []string{"write"})
+	if !roleGrants(receiver, ra, rd) || roleGrants(receiver, nil, wd) || !roleGrants(sender, wa, wd) || roleGrants(sender, nil, rd) {
+		t.Fatal("Service Bus roles misclassified")
+	}
+	if roleDataOutside(sender, "microsoft.servicebus", azureDataPlaneOf(sb).mapped) {
+		t.Fatal("Sender reads as unclassified")
+	}
+	if dp := azureDataPlaneOf(sb); !dp.noDelete || !dp.oneAllowLevel {
+		t.Fatal("Service Bus: no delete, one allow level")
+	}
+	for scope, want := range map[string]string{
+		"/subscriptions/s/resourcegroups/rg/providers/microsoft.servicebus/namespaces/ns/queues/q":           "/subscriptions/s/resourcegroups/rg/providers/microsoft.servicebus/namespaces/ns",
+		"/subscriptions/s/resourcegroups/rg/providers/microsoft.cognitiveservices/accounts/ai/deployments/d": "/subscriptions/s/resourcegroups/rg/providers/microsoft.cognitiveservices/accounts/ai",
+		"/subscriptions/s/resourcegroups/rg/providers/microsoft.keyvault/vaults/kv":                          "/subscriptions/s/resourcegroups/rg/providers/microsoft.keyvault/vaults/kv",
+	} {
+		if got := azureTopResource(scope); got != want {
+			t.Errorf("%s: %s", scope, got)
+		}
+	}
+	if b, w := localAuthMode("namespace")(map[string]any{}); b != nil || w == nil || w.Code != GovCodeAzureSASKeys {
+		t.Fatalf("SAS keys: %+v %+v", b, w)
 	}
 }

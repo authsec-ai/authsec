@@ -174,7 +174,7 @@ func resolveAzureTarget(tx *gorm.DB, ws uuid.UUID, row models.IGAResource) (*azu
 	} else {
 		return nil, govUnprocessable(GovCodeResourceNotSupported, "Pick a resource, not a resource group or subscription.", map[string]any{"field": "resource.resource_id"})
 	}
-	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	t.Storage = azureIsStorage(t.TypePath)
 	var conns []models.CloudConnector
 	if err := tx.Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND lower(scope_id) = ? AND status = ?",
 		ws, models.CloudProviderAzure, models.CloudScopeSubscription, t.SubscriptionID, models.CloudConnectorActive).
@@ -187,6 +187,12 @@ func resolveAzureTarget(tx *gorm.DB, ws uuid.UUID, row models.IGAResource) (*azu
 	}
 	t.ConnectorID = conns[0].ID
 	return t, nil
+}
+
+// azureIsStorage: the account (every data service) or its blobs; queues,
+// tables and file shares are data planes of their own.
+func azureIsStorage(typePath string) bool {
+	return typePath == "microsoft.storage/storageaccounts" || strings.HasPrefix(typePath, "microsoft.storage/storageaccounts/blobservices")
 }
 
 func indexOf(s []string, v string) int {
@@ -213,16 +219,27 @@ func azureActions(t *azureTarget, access []string) (actions, dataActions []strin
 				continue
 			}
 		}
+		// The whole account also covers its queues, tables and file shares.
+		account := t.TypePath == "microsoft.storage/storageaccounts"
 		switch {
 		case t.Storage && a == igagov.AccessRead:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueRead...), tableRead...), fileRead...)
+			}
+			actions = append(actions, storageKeys...)
 		case t.Storage && a == igagov.AccessWrite:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueWrite...), tableWrite...), fileWrite...)
+			}
+			actions = append(actions, storageKeys...)
 		case t.Storage && a == igagov.AccessDelete:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueDel...), tableDel...), fileDel...)
+			}
+			actions = append(actions, storageKeys...)
 		case a == igagov.AccessRead:
 			actions = append(actions, t.TypePath+"/read")
 		case a == igagov.AccessWrite:
@@ -232,10 +249,15 @@ func azureActions(t *azureTarget, access []string) (actions, dataActions []strin
 		case a == igagov.AccessAll:
 			actions = append(actions, t.TypePath+"/read", t.TypePath+"/write", t.TypePath+"/delete")
 			if t.Storage {
-				actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+				actions = append(actions, storageKeys...)
 				dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
 					"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
 					"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete")
+				if account {
+					for _, l := range [][]string{queueRead, queueWrite, queueDel, tableRead, tableWrite, tableDel, fileRead, fileWrite, fileDel} {
+						dataActions = append(dataActions, l...)
+					}
+				}
 			}
 		}
 	}
@@ -292,19 +314,31 @@ func azureNamespace(t *azureTarget) string {
 	return t.TypePath
 }
 
-// roleDataIn reports whether a role grants data actions of the provider ns
-// (or every data action).
+// roleDataIn reports whether a role grants data actions under ns (a provider
+// or a plane's prefix), or every data action.
 func roleDataIn(def azure.RoleDefinition, ns string) bool {
 	if ns == "" {
 		return false
 	}
 	for _, p := range def.Properties.Permissions {
 		for _, a := range p.DataActions {
-			a = strings.ToLower(a)
-			if a == "*" || strings.HasPrefix(a, ns+"/") {
+			if dataPatternIn(strings.ToLower(a), ns) {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// dataPatternIn reports whether a lower-case data-action pattern can match
+// an action under ns: it starts with ns, or its text before a "*" is a
+// prefix of ns ("microsoft.storage/*" reaches the queue service).
+func dataPatternIn(a, ns string) bool {
+	if a == "*" || strings.HasPrefix(a, ns+"/") {
+		return true
+	}
+	if i := strings.Index(a, "*"); i >= 0 {
+		return strings.HasPrefix(ns+"/", a[:i])
 	}
 	return false
 }
@@ -327,7 +361,7 @@ func azureGrants(t *azureTarget, access []string, def azure.RoleDefinition, acti
 	if roleGrants(def, actions, dataActions) {
 		return true
 	}
-	return !t.Storage && accessHasAll(access) && roleDataIn(def, azureNamespace(t))
+	return !t.Storage && accessHasAll(access) && roleDataIn(def, azureDataNS(t))
 }
 
 // azureScopeCovers reports whether an assignment at scope lies on outer or
@@ -349,7 +383,7 @@ func azureTargetOfScope(scope, subscriptionID string) *azureTarget {
 		}
 		t.TypePath = strings.Join(tp, "/")
 	}
-	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	t.Storage = azureIsStorage(t.TypePath)
 	return t
 }
 
@@ -455,6 +489,21 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 	}); err != nil {
 		return err
 	}
+	if dp := azureDataPlaneOf(&ap.target); dp != nil {
+		if dp.noDelete && slices.Contains(p.intent.Access, igagov.AccessDelete) {
+			return govUnprocessable(GovCodeAccessInvalid, "There is nothing to delete in "+dp.what+": receiving removes them. Choose read, write or all.",
+				map[string]any{"field": "access"})
+		}
+		if dp.oneAllowLevel && p.intent.Effect == igagov.AccessEffectAllow &&
+			slices.Contains(p.intent.Access, igagov.AccessRead) && slices.Contains(p.intent.Access, igagov.AccessWrite) {
+			return govUnprocessable(GovCodeAccessInvalid, "Azure has no built-in role for receiving and sending "+dp.what+" without managing the namespace: allow read and write in two policies.",
+				map[string]any{"field": "access"})
+		}
+	}
+	if p.intent.Effect == igagov.AccessEffectAllow && ap.target.TypePath == "microsoft.storage/storageaccounts" {
+		p.warnings = append(p.warnings, AccessIssue{Code: "azure_allow_blobs_only",
+			Message: "An allow on a storage account gives blob access. To allow a queue, table or file share, choose it instead."})
+	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		ap.roleGUID, ap.roleName = azureAllowRole(&ap.target, p.intent.Access)
 		if ap.roleGUID == azure.RoleContributor {
@@ -517,7 +566,7 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	// access policies, a search service on API keys only): refused for a
 	// block and an allow alike.
 	if dp := azureDataPlaneOf(&ap.target); dp != nil && dp.authMode != nil {
-		props, err := deps.RBAC.GetResourceProperties(ctx, token, ap.target.Scope, dp.apiVersion)
+		props, err := deps.RBAC.GetResourceProperties(ctx, token, azureTopResource(ap.target.Scope), dp.apiVersion)
 		if err != nil || props == nil {
 			why := "the resource was not found"
 			if err != nil {
@@ -619,7 +668,7 @@ func azureUnclassified(t *azureTarget, access []string, as []azure.RoleAssignmen
 	for _, a := range rev {
 		taken[strings.ToLower(a.ID)] = true
 	}
-	ns := azureNamespace(t)
+	ns := azureDataNS(t)
 	var out []string
 	for _, a := range as {
 		if taken[strings.ToLower(a.ID)] ||

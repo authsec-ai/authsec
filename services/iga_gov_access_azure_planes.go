@@ -8,8 +8,9 @@ import (
 
 // Azure data planes access policies map, beyond storage blobs (step 2:
 // Key Vault secrets, AI Search documents; step 4: Azure OpenAI on an Azure
-// OpenAI or AI Services account). Action names and role GUIDs were checked
-// against Microsoft's built-in roles and provider operations pages
+// OpenAI or AI Services account; step 7: storage queues, tables and file
+// shares, Service Bus and Event Hubs). Action names and role GUIDs were
+// checked against Microsoft's built-in roles and provider operations pages
 // (2026-10-24). For such a type read, write and
 // delete name its data actions and the management actions that hand out its
 // keys -- never the management read: a block of reading secrets has nothing to
@@ -29,6 +30,14 @@ type azureDataPlane struct {
 	// mapped are the data-action prefixes the levels cover (lower case): a
 	// data role outside them is unclassified.
 	mapped []string
+	// dataNS is the data-action prefix that can reach this type's data (lower
+	// case, no trailing "/"); "" is the provider namespace. A queue's is the
+	// account's queue service: a blob role on the account never reaches it.
+	dataNS string
+	// noDelete: the type has no delete (messages are removed by receiving);
+	// oneAllowLevel: no built-in role allows read and write without
+	// management, so an allow names one of them.
+	noDelete, oneAllowLevel bool
 	// The roles an allow assigns, and what the write role allows beyond
 	// write (warned).
 	readRole, readRoleName, writeRole, writeRoleName string
@@ -81,6 +90,45 @@ var (
 	// An account key reaches every data action.
 	cognitiveKeys = []string{"Microsoft.CognitiveServices/accounts/listKeys/action", "Microsoft.CognitiveServices/accounts/regenerateKey/action"}
 )
+
+// Storage data services beyond blobs, and the account-wide actions that hand
+// out every service's data (keys and SAS).
+const storageNS = "Microsoft.Storage/storageAccounts/"
+
+var storageKeys = []string{storageNS + "listKeys/action", storageNS + "listAccountSas/action", storageNS + "listServiceSas/action"}
+
+var (
+	queueRead  = []string{storageNS + "queueServices/queues/messages/read", storageNS + "queueServices/queues/messages/process/action"}
+	queueWrite = []string{storageNS + "queueServices/queues/messages/write", storageNS + "queueServices/queues/messages/add/action"}
+	queueDel   = []string{storageNS + "queueServices/queues/messages/delete", storageNS + "queueServices/queues/messages/process/action"}
+	tableRead  = []string{storageNS + "tableServices/tables/entities/read"}
+	tableWrite = []string{storageNS + "tableServices/tables/entities/write", storageNS + "tableServices/tables/entities/add/action",
+		storageNS + "tableServices/tables/entities/update/action"}
+	tableDel  = []string{storageNS + "tableServices/tables/entities/delete"}
+	fileRead  = []string{storageNS + "fileServices/fileshares/files/read", storageNS + "fileServices/readFileBackupSemantics/action"}
+	fileWrite = []string{storageNS + "fileServices/fileshares/files/write", storageNS + "fileServices/fileshares/files/modifypermissions/action",
+		storageNS + "fileServices/writeFileBackupSemantics/action"}
+	fileDel = []string{storageNS + "fileServices/fileshares/files/delete"}
+)
+
+// SAS keys of a Service Bus or Event Hubs namespace and its entities.
+var (
+	serviceBusKeys = []string{"Microsoft.ServiceBus/namespaces/authorizationRules/listkeys/action", "Microsoft.ServiceBus/namespaces/queues/authorizationRules/listkeys/action",
+		"Microsoft.ServiceBus/namespaces/topics/authorizationRules/listkeys/action", "Microsoft.ServiceBus/namespaces/disasterRecoveryConfigs/authorizationRules/listkeys/action"}
+	eventHubKeys = []string{"Microsoft.EventHub/namespaces/authorizationRules/listkeys/action", "Microsoft.EventHub/namespaces/eventhubs/authorizationRules/listkeys/action",
+		"Microsoft.EventHub/namespaces/disasterRecoveryConfigs/authorizationRules/listkeys/action"}
+)
+
+// localAuthMode warns when a namespace still takes SAS keys.
+func localAuthMode(what string) func(props map[string]any) (*AccessIssue, *AccessIssue) {
+	return func(props map[string]any) (*AccessIssue, *AccessIssue) {
+		if off, _ := props["disableLocalAuth"].(bool); off {
+			return nil, nil
+		}
+		return nil, &AccessIssue{Code: GovCodeAzureSASKeys,
+			Message: "This " + what + " also accepts SAS keys: anyone already holding a key or SAS token keeps access. Disable local authentication on it to make a block complete."}
+	}
+}
 
 var azureDataPlanes = []azureDataPlane{
 	{
@@ -139,6 +187,7 @@ var azureDataPlanes = []azureDataPlane{
 		writeRole: azure.RoleCognitiveOpenAIContributor, writeRoleName: "Cognitive Services OpenAI Contributor",
 		readRoleAlso: "creating assistants and responses, and image and video generations",
 		apiVersion:   "2023-05-01",
+		dataNS:       "microsoft.cognitiveservices/accounts",
 		authMode: func(props map[string]any) (*AccessIssue, *AccessIssue) {
 			// Entra tokens need the account's custom subdomain: without it
 			// only keys work, so role assignments do not reach the data.
@@ -153,6 +202,63 @@ var azureDataPlanes = []azureDataPlane{
 				Message: "This account also accepts API keys: anyone already holding a key keeps access. Disable local authentication on the account to make a block complete."}
 		},
 	},
+	{
+		typePath: "microsoft.storage/storageaccounts/queueservices", children: []string{"queues"}, what: "queue messages",
+		read: queueRead, write: queueWrite, del: queueDel, readKeys: storageKeys, writeKeys: storageKeys,
+		mapped: []string{"microsoft.storage/storageaccounts/queueservices/"}, dataNS: "microsoft.storage/storageaccounts/queueservices",
+		readRole: azure.RoleStorageQueueDataReader, readRoleName: "Storage Queue Data Reader",
+		writeRole: azure.RoleStorageQueueDataContributor, writeRoleName: "Storage Queue Data Contributor",
+	},
+	{
+		typePath: "microsoft.storage/storageaccounts/tableservices", children: []string{"tables"}, what: "table entities",
+		read: tableRead, write: tableWrite, del: tableDel, readKeys: storageKeys, writeKeys: storageKeys,
+		mapped: []string{"microsoft.storage/storageaccounts/tableservices/"}, dataNS: "microsoft.storage/storageaccounts/tableservices",
+		readRole: azure.RoleStorageTableDataReader, readRoleName: "Storage Table Data Reader",
+		writeRole: azure.RoleStorageTableDataContributor, writeRoleName: "Storage Table Data Contributor",
+	},
+	{
+		// SMB roles: they keep the share's file permissions (the privileged
+		// REST roles bypass them).
+		typePath: "microsoft.storage/storageaccounts/fileservices", children: []string{"shares"}, what: "file share data",
+		read: fileRead, write: fileWrite, del: fileDel, readKeys: storageKeys, writeKeys: storageKeys,
+		mapped: []string{"microsoft.storage/storageaccounts/fileservices/"}, dataNS: "microsoft.storage/storageaccounts/fileservices",
+		readRole: azure.RoleStorageFileSMBReader, readRoleName: "Storage File Data SMB Share Reader",
+		writeRole: azure.RoleStorageFileSMBContributor, writeRoleName: "Storage File Data SMB Share Contributor",
+	},
+	{
+		typePath: "microsoft.servicebus/namespaces", children: []string{"queues", "topics", "topics/subscriptions"}, what: "Service Bus messages",
+		read: []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"}, write: []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
+		readKeys: serviceBusKeys, writeKeys: serviceBusKeys, mapped: []string{"microsoft.servicebus/"}, noDelete: true, oneAllowLevel: true,
+		readRole: azure.RoleServiceBusDataReceiver, readRoleName: "Azure Service Bus Data Receiver",
+		writeRole: azure.RoleServiceBusDataSender, writeRoleName: "Azure Service Bus Data Sender",
+		apiVersion: "2021-11-01", authMode: localAuthMode("namespace"),
+	},
+	{
+		typePath: "microsoft.eventhub/namespaces", children: []string{"eventhubs", "eventhubs/consumergroups"}, what: "Event Hubs events",
+		read: []string{"Microsoft.EventHub/namespaces/messages/receive/action"}, write: []string{"Microsoft.EventHub/namespaces/messages/send/action"},
+		readKeys: eventHubKeys, writeKeys: eventHubKeys, mapped: []string{"microsoft.eventhub/"}, noDelete: true, oneAllowLevel: true,
+		readRole: azure.RoleEventHubsDataReceiver, readRoleName: "Azure Event Hubs Data Receiver",
+		writeRole: azure.RoleEventHubsDataSender, writeRoleName: "Azure Event Hubs Data Sender",
+		apiVersion: "2021-11-01", authMode: localAuthMode("namespace"),
+	},
+}
+
+// azureDataNS is the data-action prefix that can reach t's data.
+func azureDataNS(t *azureTarget) string {
+	if dp := azureDataPlaneOf(t); dp != nil && dp.dataNS != "" {
+		return dp.dataNS
+	}
+	return azureNamespace(t)
+}
+
+// azureTopResource is the top-level resource of a scope (a queue's storage
+// account, a deployment's AI account): where a plane's auth mode is set.
+func azureTopResource(scope string) string {
+	segs := strings.Split(scope, "/")
+	if i := indexOf(segs, "providers"); i >= 0 && i+4 <= len(segs) {
+		return strings.Join(segs[:i+4], "/")
+	}
+	return scope
 }
 
 // Preview codes of the mapped types.
@@ -162,6 +268,7 @@ const (
 	GovCodeAzureSearchKeys          = "azure_search_keys_also"
 	GovCodeAzureAIKeysOnly          = "azure_ai_keys_only"
 	GovCodeAzureAIKeys              = "azure_ai_keys_also"
+	GovCodeAzureSASKeys             = "azure_sas_keys_also"
 	GovCodeAzureAuthUnchecked       = "azure_auth_mode_unchecked"
 )
 
@@ -209,7 +316,7 @@ func roleDataOutside(def azure.RoleDefinition, ns string, mapped []string) bool 
 	for _, p := range def.Properties.Permissions {
 		for _, a := range p.DataActions {
 			a = strings.ToLower(a)
-			if a != "*" && !strings.HasPrefix(a, ns+"/") {
+			if a != "*" && !dataPatternIn(a, ns) {
 				continue
 			}
 			inside := false
