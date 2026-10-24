@@ -680,9 +680,17 @@ func (h k8sHandler) active(ctx context.Context) error {
 			return h.waiting(ctx, inst)
 		case models.InstructionApplied:
 			now := time.Now().UTC()
+			set := map[string]any{"drift": "", "state_reason": "", "deployed_at": now, "verified_at": now, "updated_at": now}
+			// This removal took the subject out: it is what the end puts back.
+			var rm k8sRemoved
+			_ = json.Unmarshal(inst.Result, &rm)
+			if rm.Removed && rm.BindingUID != "" {
+				raw, _ := json.Marshal(rm)
+				set["removed"] = raw
+			}
 			return h.run.InTx(ctx, func(tx *gorm.DB) error {
 				return tx.Model(&models.IGAGovK8sAccess{}).Where("workspace_id = ? AND id = ? AND state = ?", h.row.WorkspaceID, h.row.ID, models.R2StateActive).
-					Updates(map[string]any{"drift": "", "state_reason": "", "deployed_at": now, "verified_at": now, "updated_at": now}).Error
+					Updates(set).Error
 			})
 		case models.InstructionFailed:
 			return h.run.InTx(ctx, func(tx *gorm.DB) error {

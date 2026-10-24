@@ -178,10 +178,12 @@ func TestAccessPolicyK8sLifecycle(t *testing.T) {
 	if row.Drift != "subject_readded" {
 		t.Fatalf("drift: %+v", row)
 	}
-	k.agentApplies(row, models.InstructionRemoveBindingSubject, `{"binding_uid":"uid-1","removed":true}`)
+	// The binding was re-created meanwhile: the re-removal names the new uid,
+	// which is what the end restores into.
+	k.agentApplies(row, models.InstructionRemoveBindingSubject, `{"binding_uid":"uid-2","removed":true}`)
 	p3exec(t, k.db, `UPDATE iga_policy_assignment SET state = 'ended', valid_to = now(), ended_reason = 'deleted' WHERE workspace_id = ? AND policy_id = ?`, k.ws, k.role)
 	k.step(row.ID)
-	if row = k.rowOf(v.ID); row.Drift != "" || row.State != models.R2StateActive {
+	if row = k.rowOf(v.ID); row.Drift != "" || row.State != models.R2StateActive || !strings.Contains(string(row.Removed), "uid-2") {
 		t.Fatalf("after re-removal: %+v", row)
 	}
 
@@ -192,7 +194,7 @@ func TestAccessPolicyK8sLifecycle(t *testing.T) {
 	k.step(row.ID)
 	row = k.rowOf(v.ID)
 	payload = k.agentApplies(row, models.InstructionRestoreBindingSubject, `{"outcome":"restored"}`)
-	if payload["binding_uid"] != "uid-1" {
+	if payload["binding_uid"] != "uid-2" {
 		t.Fatalf("restore payload: %v", payload)
 	}
 	k.step(row.ID)
