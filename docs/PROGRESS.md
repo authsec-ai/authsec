@@ -4,6 +4,22 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, step 6: Bedrock and AgentCore, block only (both repos)
+
+### Done
+- Action tables are now read from AWS's machine-readable service reference (`https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json`). The Secrets Manager and SSM tables were re-checked against it, and SSM gained the parameter resource policy (sharing) in its read block.
+- `BedrockModelTarget`: picked through a foundation-model ARN or a system inference profile (`us.`, `eu.`, `global.`...) of it. Denied in every region, together with the profiles that route to it. Also denied: InvokeModel/InvokeModelWithResponseStream on `*` with `StringLike bedrock:ModelArn`, which covers application profiles and prompt routers when AWS sets the key. Read means calling the model (Converse authorizes as InvokeModel) and batch jobs. Write means building on it (customization, provisioned throughput, profiles, routers, evaluations). Delete is refused.
+- `BedrockAgentTarget` (every alias and version) and `AgentCoreRuntimeTarget` (every endpoint), with read = invoke.
+- New discovery source for picking: the resolver accepts a discovered Bedrock agent or AgentCore runtime by its `iga_workload` id. Its ARN comes from the recognition key, and its placement from the workload's support rows. This works in preview, create, edit and every view. No collector change was needed: the workload scan already lists them.
+- UI: three new types (Allow off; Delete off for a model). Agents and runtimes are picked from the workloads list, models from records. The graph marks covered nodes.
+
+### Not covered / to check
+- OAuth (JWT authorizer) callers of a runtime do not use IAM.
+- Whether `bedrock:ModelArn` is present for application profiles and prompt routers.
+- Foundation models that no IAM policy names cannot be picked yet. A model list from the agents' `FoundationModel` attribute or from ListFoundationModels would add them.
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, step 5: AWS SSM parameters, block only (both repos)
 
 ### Done
