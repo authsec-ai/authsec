@@ -4,6 +4,23 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-24 (cont.) — IGA enforcement, step 3: AWS Secrets Manager, block only (both repos)
+
+### Done
+- `SecretTarget` (`internal/igagov/access_secretsmanager.go`), registered with `BlockOnly`. A block denies every secret named N in the account in every region (`arn:p:secretsmanager:*:A:secret:N-??????`): replicas, a secret re-created under the name and a pick through a selector row write the same document.
+- Read denies GetSecretValue (BatchGetSecretValue checks it per secret) and the paths that hand the value on: replicate, rotate, resource policy, tags. Write and delete add `AuthSecAccessOverwrite` (CreateSecret on `*` with `ForceOverwriteReplicaSecret` and `secretsmanager:Name`). Never denied: actions without a resource type (ListSecrets, BatchGetSecretValue, GetRandomPassword), which a scoped Deny cannot reach.
+- Service: an allow on a block-only type is refused (preview, create, edit); capabilities list `block_only`. The name is checked against ListSecrets of the latest published scan of the secret's own account: a complete scan that does not list it refuses (`resource_not_current`; this also catches a partial ARN such as `prod/db-backup` read as `prod/db`, and a secret scheduled for deletion), otherwise the warning `existence_not_verified`.
+- UI: the Secret type in the form (Allow off), `secretOf`/`groupSecrets`, graph coverage by account and name in any region.
+
+### To check against AWS
+- Which ARN CreateSecret is authorized against when it overwrites a replica (the statement uses `*` and the name condition until then). Whether ListSecrets leaves out secrets scheduled for deletion by default.
+- Step 3b (allow): the exact suffix and the UpdateSecret/DeleteSecret conditions on a live account.
+
+### Known gap
+- A secret reachable only through `Resource: "*"` has no Discovery row to pick. Projecting ListSecrets observations into `iga_resources` is a separate change.
+
+---
+
 ## 2026-10-24 (cont.) — IGA enforcement, step 2: Azure Key Vault and AI Search (both repos)
 
 ### Done
