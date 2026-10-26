@@ -71,6 +71,7 @@ var phase3UserRefs = map[string]string{
 	"iga_gov_session_revocation.requested_by":   "061: the revocation's requester",
 	"iga_gov_access_policy_version.created_by":  "137: who applied the version",
 	"iga_gov_azure_access.created_by":           "144: who applied the policy",
+	"iga_gov_k8s_access.created_by":             "146: who applied the policy",
 	"iga_gov_temp_grant.decided_by":             "061: the grant's approver",
 	"iga_gov_temp_grant.ended_by":               "061: who ended the grant",
 	"iga_gov_temp_grant.requested_by":           "061: the grant's requester",
@@ -100,6 +101,9 @@ var phase3BareUUID = map[string]string{
 	"iga_gov_session_revocation.identity_account_id": "061: as iga_gov_temp_grant.identity_account_id",
 	"iga_gov_azure_access.connector_id":              "144: as iga_gov_temp_grant.connector_id (a record of what was changed in Azure; written from the workspace's own connector under RLS)",
 	"iga_gov_azure_access.identity_account_id":       "144: as iga_gov_temp_grant.identity_account_id",
+	"iga_gov_k8s_access.connector_id":                "146: the discovery source (in-cluster agent) that acts; as iga_gov_azure_access.connector_id",
+	"iga_gov_k8s_access.identity_account_id":         "146: as iga_gov_temp_grant.identity_account_id",
+	"iga_gov_k8s_access.instruction_id":              "146: the provisioning_instructions row the job waits on; that table has no UNIQUE (workspace_id, id) to reference, and the job reads it under RLS in its own workspace",
 }
 
 // phase3NoWorkspaceIDKey: tables with an id but no UNIQUE (workspace_id, id).
@@ -263,9 +267,9 @@ func TestPhase3ForeignKeyCatalogGuard(t *testing.T) {
 	// 047-056's 43 tables, plus 059_tidy_eval_pruned (fix/p3-tidy), plus
 	// the 13 of 060-062 (R1b action evidence, R2 time-bound access, R3
 	// runtime controls), plus access policies' iga_gov_access_policy_version
-	// (137) and iga_gov_azure_access (144).
-	if len(c.tables) != 59 {
-		t.Fatalf("%d Phase 3 tables in scope, want 59", len(c.tables))
+	// (137), iga_gov_azure_access (144) and iga_gov_k8s_access (146).
+	if len(c.tables) != 60 {
+		t.Fatalf("%d Phase 3 tables in scope, want 60", len(c.tables))
 	}
 	for _, p := range phase3CatalogProblems(c) {
 		t.Error(p)
