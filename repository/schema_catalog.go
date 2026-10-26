@@ -37,3 +37,15 @@ func ValidatedConstraints(db *gorm.DB, names []string) ([]string, error) {
 		   AND c.relname || '.' || k.conname = ANY(?)`, pq.Array(names)).Scan(&have).Error
 	return have, err
 }
+
+// ConstraintAdmits reports whether the validated constraint name on
+// public.table exists and its definition mentions needle (a CHECK's list of
+// values, e.g. a job kind a migration added).
+func ConstraintAdmits(db *gorm.DB, table, name, needle string) (bool, error) {
+	var n int64
+	// TENANT-EXEMPT: Postgres catalog (pg_constraint), a schema precondition check.
+	err := db.Raw(`SELECT count(*) FROM pg_constraint
+		 WHERE conrelid = to_regclass(?) AND conname = ? AND convalidated
+		   AND pg_get_constraintdef(oid) LIKE ?`, "public."+table, name, "%"+needle+"%").Scan(&n).Error
+	return n == 1, err
+}

@@ -93,14 +93,11 @@ func VerifyK8sAccessSchema(db *gorm.DB) error {
 		{"iga_gov_job", "iga_gov_job_kind_check", repositories.GovJobK8sAccess},
 		{"provisioning_instructions", "provisioning_instructions_kind_chk", models.InstructionRestoreBindingSubject},
 	} {
-		var n int64
-		// TENANT-EXEMPT: Postgres catalog (pg_constraint), a schema precondition check.
-		if err := db.Raw(`SELECT count(*) FROM pg_constraint
-		                   WHERE conrelid = to_regclass(?) AND conname = ? AND convalidated AND pg_get_constraintdef(oid) LIKE ?`,
-			"public."+c.table, c.name, "%"+c.want+"%").Scan(&n).Error; err != nil {
+		ok, err := repositories.ConstraintAdmits(db, c.table, c.name, c.want)
+		if err != nil {
 			return fmt.Errorf("Kubernetes access-policy schema verification could not run: %w", err)
 		}
-		if n != 1 {
+		if !ok {
 			return fmt.Errorf("Kubernetes access policies need migration 146; missing: constraint %s.%s admitting %s", c.table, c.name, c.want)
 		}
 	}
