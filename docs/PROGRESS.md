@@ -17,7 +17,12 @@ The tester's report (9 bugs, aditya.app.authsec.ai) was checked against the code
 - **UI-055:** S3 rows say "No account in the ARN" instead of "Unknown account".
 - **UI-054 (found during the review, ours):** Kubernetes pages said policy is not supported although Kubernetes access policies are; they now offer one.
 
-Open: **UI-056** (Entra permissions listed among Azure resources) is a product decision. The report did not exercise any access-policy enforcement; those checks, and agent 0.5.0 on the cluster, are still to run.
+Then the rest, on the recommended options:
+- **UI-056:** Azure Resources leaves Entra permissions out of its list and count (new inventory parameter `exclude_kind`), says how many, and shows them on request. Deploy the backend before the UI.
+- **UI-055:** pattern rows (`*`, `/apis/*`) stay listed (a pattern can reach many resources); the list counts them and offers exact references only.
+- **UI-051:** Kubernetes workloads lead with their own name instead of the agent's "container (Kind/name) in ns/namespace".
+
+The report did not exercise any access-policy enforcement; those checks, and agent 0.5.0 on the cluster, are still to run.
 
 ---
 
