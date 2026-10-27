@@ -304,8 +304,10 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 			}
 			// T3.14: Slack's routes are in this build; the flag follows the
 			// app's configuration on this server (not installed here).
-			if r, _ := reasons["slack"].(string); tc.state == services.PolicyOn && !strings.Contains(r, "not configured on this server") {
-				t.Errorf("on: reasons.slack = %q, want the configuration reason", r)
+			// The reason is for a console user: no server setting names (AS-166).
+			if r, _ := reasons["slack"].(string); tc.state == services.PolicyOn &&
+				(r != services.SlackNotSetUp || strings.Contains(r, services.SlackSigningSecretEnv) || strings.Contains(r, "Vault")) {
+				t.Errorf("on: reasons.slack = %q, want %q", r, services.SlackNotSetUp)
 			}
 			if tc.state == services.PolicyOn {
 				restore := services.InstallSlackApp(services.NewSlackIntegrationService(db, newMemVault(), nil, services.SlackConfig{SigningSecret: "x"}))

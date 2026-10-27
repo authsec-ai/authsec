@@ -262,7 +262,8 @@ func (s *SlackIntegrationService) WithLiveReader(r LiveReader) *SlackIntegration
 	return s
 }
 
-// Configured reports whether the app can run, and why not.
+// Configured reports whether the app can run, and why not. The reason names
+// server settings: for the operator's log, not for a response (SlackNotSetUp).
 func (s *SlackIntegrationService) Configured() (bool, string) {
 	switch {
 	case s == nil:
@@ -278,8 +279,8 @@ func (s *SlackIntegrationService) Configured() (bool, string) {
 }
 
 func (s *SlackIntegrationService) mustConfigured() error {
-	if ok, reason := s.Configured(); !ok {
-		return govErr(http.StatusServiceUnavailable, SlackCodeNotConfigured, reason, nil)
+	if ok, _ := s.Configured(); !ok {
+		return govErr(http.StatusServiceUnavailable, SlackCodeNotConfigured, SlackNotSetUp, nil)
 	}
 	return nil
 }
