@@ -2,6 +2,7 @@ package azure
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -224,6 +225,28 @@ func (c *Client) ListSubscribedSkus(ctx context.Context, graphToken string) ([]S
 			Select: []string{"skuPartNumber", "capabilityStatus", "servicePlans"},
 		}})
 	return graphPaged[SubscribedSku](ctx, c, graphToken, ri, err, maxPages)
+}
+
+/* -------------------------------- organization -------------------------------- */
+
+// Organization is the tenant's own directory record.
+type Organization struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+}
+
+// GetOrganization returns the tenant's organization record, for its display
+// name (Directory.Read.All, which discovery already holds).
+func (c *Client) GetOrganization(ctx context.Context, graphToken string) (Organization, error) {
+	ri, err := graphURL(GraphEndpoint + "/v1.0/organization?$select=id,displayName")
+	orgs, err := graphPaged[Organization](ctx, c, graphToken, ri, err, 1)
+	if err != nil {
+		return Organization{}, err
+	}
+	if len(orgs) == 0 {
+		return Organization{}, fmt.Errorf("azure graph: the tenant returned no organization record")
+	}
+	return orgs[0], nil
 }
 
 /* --------------------------------- guardrails --------------------------------- */

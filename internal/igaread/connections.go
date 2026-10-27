@@ -382,7 +382,9 @@ func connCloud(q *Query, now time.Time) ([]Connection, error) {
 			// (internal/azuregraph). Azure has no publication, so its graph
 			// state is live, as Kubernetes'.
 			conn.Provider, conn.ScopeID = ConnProviderAzure, strings.ToLower(c.ScopeID)
-			conn.ScopeKind, conn.Name = connScopeTenant, c.ScopeID
+			// Named by the tenant's organization name once a scan has read
+			// it; until then by its id (AS-168).
+			conn.ScopeKind, conn.Name = connScopeTenant, nameOr(c.AzureTenantAttrs().TenantDisplayName, c.ScopeID)
 			conn.ScopeSummary = countWord(azureSubs[strings.ToLower(c.ScopeID)], "subscription", "subscriptions", "no subscriptions selected")
 			run := runs[c.ID]
 			conn.Scan = connAWSScan(run)

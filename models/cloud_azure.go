@@ -110,6 +110,10 @@ type AzureTenantAttrs struct {
 	// onboarding. Nil until a tenant pass has read them.
 	Licensing  *AzureLicensing  `json:"licensing,omitempty"`
 	Guardrails *AzureGuardrails `json:"guardrails,omitempty"`
+
+	// TenantDisplayName is the tenant's organization name, read by identity
+	// discovery (GET /v1.0/organization). Empty until a tenant pass reads it.
+	TenantDisplayName string `json:"tenant_display_name,omitempty"`
 }
 
 // AzureLicensing is what the tenant's licences make readable or enforceable.
