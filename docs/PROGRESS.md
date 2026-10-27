@@ -4,6 +4,23 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-27 — Manual test report: fixes on `feat/iga-enforcement`
+
+The tester's report (9 bugs, aditya.app.authsec.ai) was checked against the code. None came from the access-policy work. Fixed, each with a test:
+- **UI-050:** an Azure connection's Graph card read the Kubernetes sentence; the sentence now follows the provider.
+- **AS-166:** the Slack message showed operator settings and Vault; users now read "Slack is not set up on this server", and the detail stays in the startup log.
+- **AS-167:** the cluster counters read agent fields no agent sends (0.5.0 included); the panel now counts what Discovery holds for the cluster.
+- **UI-051:** the Policy list's "Used by" line shows its full value on hover.
+- **UI-052:** resource pages have Create policy. The form now fills a resource of every AWS type; before, the graph card's "New access policy" on Lambda, KMS, SQS, SNS or a Bedrock model opened with no resource.
+- **AS-168:** an Azure tenant is named by its organization name (read on its next scan) instead of its GUID.
+- **UI-053:** an unknown connection's breadcrumb reads "Not found", not "Bad Id".
+- **UI-055:** S3 rows say "No account in the ARN" instead of "Unknown account".
+- **UI-054 (found during the review, ours):** Kubernetes pages said policy is not supported although Kubernetes access policies are; they now offer one.
+
+Open: **UI-056** (Entra permissions listed among Azure resources) is a product decision. The report did not exercise any access-policy enforcement; those checks, and agent 0.5.0 on the cluster, are still to run.
+
+---
+
 ## 2026-10-24 (cont.) — authsec-staging merged into `feat/iga-enforcement`
 
 - Staging's PR #98 added an Azure data-plane table for AI Search, Key Vault, Service Bus and Event Hubs. This branch already maps those types, and more, in `services/iga_gov_access_azure_planes.go`. The merge keeps that table and drops staging's duplicate in `iga_gov_access_azure.go`.
