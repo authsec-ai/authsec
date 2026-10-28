@@ -4,6 +4,16 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-28 (cont.) — Enforcement on k3s-master; turning it off (UI-058, UI-059)
+
+- Enforcement turned on for k3s-master from the console. Minting the token cut the cluster's discovery for 7 minutes (UI-058): the server then accepts its reports only under that token. The agent (Helm revision 7-9) now sends it for discovery and actuation; quarantine and access policies act only in `agent-live-demo` (role `llm-key-reader`).
+- Live demo: `support-bot` in `agent-live-demo` (iga-agent `examples/live-demo`) logs WORKING / ACCESS BLOCKED / NETWORK BLOCKED every 5 s. An access policy on `rag-agent` / `rag-reader` was proven end to end (binding emptied, `can-i` no, then restored on end).
+- `agent-demo`, `iga-demo` and `iga-test` deleted with their bots, and the demo ClusterRoles and the stale cluster-viewer binding of `agent-demo/ops-agent`.
+- UI-059: enforcement can be turned off (refused while something is in force).
+- Open: quarantine selects pods by one label (could match more than the workload); a token rotation needs the agent's pods restarted.
+
+---
+
 ## 2026-10-28 (cont.) — Kubernetes enforcement from the console (UI-057)
 
 - A Kubernetes connection has an **Enforcement** tab: "Turn on enforcement" mints the cluster's actuation token (governance:admin; "Rotate token" after a confirmation), shown once with the two commands to run in the cluster (a Secret, then a Helm upgrade with the quarantine namespaces and, for access policies, the binding roles and namespaces). It shows what the agent reports: quarantine and access policies "Can act" / "Waiting for the agent" / "Off", the mode, the plan.
