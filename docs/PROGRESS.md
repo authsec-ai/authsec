@@ -4,6 +4,14 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-28 (cont.) — Kubernetes enforcement from the console (UI-057)
+
+- A Kubernetes connection has an **Enforcement** tab: "Turn on enforcement" mints the cluster's actuation token (governance:admin; "Rotate token" after a confirmation), shown once with the two commands to run in the cluster (a Secret, then a Helm upgrade with the quarantine namespaces and, for access policies, the binding roles and namespaces). It shows what the agent reports: quarantine and access policies "Can act" / "Waiting for the agent" / "Off", the mode, the plan.
+- A sighting's page has **Quarantine** (reason required) and **Release**, and says whether the quarantine is blocked in the cluster, waiting, or not blocked (with the server's reason).
+- Both need this UI deployed; the backend endpoints were already on authsec-staging. The cluster steps stay manual by design: the console never reaches into a cluster.
+
+---
+
 ## 2026-10-28 — authsec-staging merged again; iga-agent 0.5.0 on k3s-master
 
 - UI: 12 staging commits merged (Azure vocabulary, Azure agent Access Graph, tabs). `azureGraphSummary.ts` stays deleted (nothing imports it); 396 tests, lint 0 errors, build OK. Backend: nothing new on staging.
