@@ -4,6 +4,16 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-28 — authsec-staging merged again; iga-agent 0.5.0 on k3s-master
+
+- UI: 12 staging commits merged (Azure vocabulary, Azure agent Access Graph, tabs). `azureGraphSummary.ts` stays deleted (nothing imports it); 396 tests, lint 0 errors, build OK. Backend: nothing new on staging.
+- **iga-agent 0.5.0 deployed** to `authsec-system` on k3s-master, the production cluster (Helm revision 6, image `iga-agent:0.5.0`, commit `3dc0e408b1ef`, amd64+arm64, pushed as its own tag; the registry's `production` tag was not touched). Behaviour unchanged: roles `discovery`, enforcement `observe`, no actuation token, `enforcement.bindings` off. It re-registered as the same discovery source and swept as before.
+- Drift found and folded in: the release's values said `workspace.id` f25343ed…, but the ConfigMap had been changed with `kubectl apply` to 884d366f… (what the agent reports to). The upgrade sets 884d366f… in Helm, so a later upgrade no longer moves the agent to another workspace.
+- The registry holds only `production` and `0.5.0` of iga-agent; 0.4.2 ran from the node's local image (`IfNotPresent`).
+- Not yet possible here: Kubernetes access policies need the backend from this branch (prod runs `authsec-staging`), an actuation token, and `enforcement.bindings` on for chosen roles.
+
+---
+
 ## 2026-10-27 — Manual test report: fixes on `feat/iga-enforcement`
 
 The tester's report (9 bugs, aditya.app.authsec.ai) was checked against the code. None came from the access-policy work. Fixed, each with a test:
