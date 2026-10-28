@@ -20,6 +20,7 @@ const (
 	RuntimePolicyStateRevoked    = "revoked"
 
 	RuntimePolicyFormatV1 = "authsec.runtime.v1"
+	RuntimePolicyFormatV2 = "authsec.runtime.v2"
 
 	// RuntimePolicyActorCandidateSystem is the actor kind of the account that
 	// generates candidates. That account cannot approve or enforce.
@@ -76,9 +77,13 @@ type RuntimePolicyRevision struct {
 	ContentHash    string    `json:"content_hash" gorm:"not null"`
 	AuthorUserID   uuid.UUID `json:"author_user_id" gorm:"type:uuid;not null"`
 	State          string    `json:"state" gorm:"not null"`
-	GraphRevision  int64     `json:"graph_revision" gorm:"not null"`
-	CompilerFormat string    `json:"compiler_format" gorm:"not null"`
-	CreatedAt      time.Time `json:"created_at"`
+	GraphRevision    int64     `json:"graph_revision" gorm:"not null"`
+	CompilerFormat   string    `json:"compiler_format" gorm:"not null"`
+	CompilerVersion  string    `json:"compiler_version,omitempty" gorm:"type:text"`
+	BackendProfile   string    `json:"backend_profile,omitempty" gorm:"type:text"`
+	CapabilityDigest string    `json:"capability_digest,omitempty" gorm:"type:text"`
+	OriginContextID  *uuid.UUID `json:"origin_context_id,omitempty" gorm:"type:uuid"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 func (RuntimePolicyRevision) TableName() string { return "runtime_policy_revisions" }

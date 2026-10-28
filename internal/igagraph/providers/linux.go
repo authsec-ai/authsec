@@ -7,6 +7,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/directory/adresolve"
 	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/pkg/collectorcontract"
 )
 
 func normalizeLinux(in Input) (*Plan, error) {
@@ -22,7 +23,7 @@ func normalizeLinux(in Input) (*Plan, error) {
 		if ob.Preview || !strings.HasPrefix(ob.Kind, "runtime.") {
 			continue
 		}
-		if err := linuxObservation(p, in.EstateID, ob, byRef); err != nil {
+		if err := linuxObservation(p, in.EstateID, in.CollectorEpoch, ob, byRef); err != nil {
 			p.Skipped = append(p.Skipped, Skipped{Kind: ob.Kind, Ref: ob.SubjectRef, Reason: err.Error()})
 		}
 	}
@@ -85,6 +86,8 @@ func linuxObject(p *Plan, estate string, o Object) error {
 			Provider: models.ProviderLinux, Kind: models.AccountKindLocalUser,
 			Name: name, State: models.AccountStateEnabled, Backing: "host",
 			Attrs: displayAttrs(o.Native, o.Attrs), Ref: o.Ref,
+			CredentialProvenance: o.CredentialProvenance,
+			MappingProvenance:    o.MappingProvenance,
 		}
 		applyDirectory(p, &idn, o)
 		p.Identities = append(p.Identities, idn)
@@ -102,6 +105,8 @@ func linuxObject(p *Plan, estate string, o Object) error {
 			Provider: models.ProviderLinux, Kind: models.AccountKindLocalGroup,
 			Name: str(o.Attrs, "name"), State: models.AccountStateEnabled, Backing: "host",
 			Attrs: displayAttrs(o.Native, o.Attrs), Ref: o.Ref,
+			CredentialProvenance: o.CredentialProvenance,
+			MappingProvenance:    o.MappingProvenance,
 		}
 		applyDirectory(p, &idn, o)
 		p.Identities = append(p.Identities, idn)
@@ -193,12 +198,18 @@ func linuxConstraint(p *Plan, estate, workloadKey, kind, schema, bind, name stri
 	return nil
 }
 
-func linuxObservation(p *Plan, estate string, ob Observation, byRef map[string]Object) error {
+func linuxObservation(p *Plan, estate, collectorEpoch string, ob Observation, byRef map[string]Object) error {
 	rt := ob.Runtime
 	key, err := igraph.ProcessRuntimeKey(estate, str(rt, "boot_id"), str(rt, "pid_namespace"), str(rt, "pid"), str(rt, "start_ticks"))
 	if err != nil {
 		return err
 	}
+	// Stable runtime instance key: when collector_epoch, pid and start_time
+	// are all present they form an alternative stable key that survives
+	// boot_id rotation. The key is appended to the runtime attrs for the
+	// writer; the source key still uses the traditional components.
+	stableKey := stableRuntimeKey(collectorEpoch, str(rt, "pid"), str(rt, "start_ticks"))
+
 	subject := byRef[ob.SubjectRef]
 	wkey := workloadKey(p, subject.Ref)
 	if wkey == "" {
@@ -212,13 +223,26 @@ func linuxObservation(p *Plan, estate string, ob Observation, byRef map[string]O
 			Attrs: jsonOrEmpty(nil), Ref: ob.SubjectRef,
 		})
 	}
+	incarnation := str(rt, "boot_id")
+	if stableKey != "" {
+		incarnation = stableKey
+	}
 	p.Runtimes = append(p.Runtimes, Runtime{
 		SourceKey: key, WorkloadKey: wkey, Kind: "process",
-		Incarnation: str(rt, "boot_id"), ObservedAt: ob.ObservedAt, Observation: ob.ID,
+		Incarnation: incarnation, ObservedAt: ob.ObservedAt, Observation: ob.ID,
 	})
-	if idKey := identityKey(p, byRef[ob.IdentityRef].Ref); idKey != "" {
+
+	// Extract credential provenance from the identity object if available.
+	idObj := byRef[ob.IdentityRef]
+	var credProv *collectorcontract.CredentialProvenance
+	if idObj.CredentialProvenance != nil {
+		credProv = idObj.CredentialProvenance
+	}
+
+	if idKey := identityKey(p, idObj.Ref); idKey != "" {
 		p.Bindings = append(p.Bindings, Binding{
 			RuntimeKey: key, IdentityKey: idKey, Kind: "uid", Observation: ob.ID, From: ob.ObservedAt,
+			CredentialProvenance: credProv,
 		})
 	} else if uid := str(rt, "uid"); uid != "" {
 		ns := str(rt, "user_namespace")
@@ -236,15 +260,83 @@ func linuxObservation(p *Plan, estate string, ob Observation, byRef map[string]O
 		})
 		p.Bindings = append(p.Bindings, Binding{
 			RuntimeKey: key, IdentityKey: idKey, Kind: "uid", Observation: ob.ID, From: ob.ObservedAt,
+			CredentialProvenance: credProv,
 		})
+		// Preserve effective/saved/fs UID dimensions when available.
+		linuxUIDDimensions(p, estate, ns, key, ob, rt)
 	}
+	// Extract ActionDetail fields for the observed access fact.
+	phase, resultDetail, source := extractActionDetail(ob)
+	var credRef, mappingRef string
+	if idObj.CredentialProvenance != nil {
+		credRef = idObj.CredentialProvenance.Method
+	}
+	if idObj.MappingProvenance != nil {
+		mappingRef = idObj.MappingProvenance.Resolver
+	}
+
 	if res := resourceKey(p, byRef[ob.ResourceRef].Ref); res != "" {
 		p.Observed = append(p.Observed, Observed{
 			WorkloadKey: wkey, RuntimeKey: key, ResourceKey: res, Observation: ob.ID,
 			Action: ob.Kind, Outcome: outcome(ob.Outcome), Attribution: ob.Attribution, ObservedAt: ob.ObservedAt,
+			Phase: phase, ResultDetail: resultDetail, Source: source,
+			CredentialRef: credRef, MappingRef: mappingRef,
 		})
 	}
 	return nil
+}
+
+// extractActionDetail reads phase, result, and source from the observation's
+// ActionDetail and Source fields. Missing values return empty strings.
+func extractActionDetail(ob Observation) (phase, result, source string) {
+	if ob.ActionDetail != nil {
+		phase = ob.ActionDetail.Phase
+		result = ob.ActionDetail.Result
+		if ob.ActionDetail.SourceSensor != "" {
+			source = ob.ActionDetail.SourceSensor
+		}
+	}
+	if source == "" && ob.Source != "" {
+		source = ob.Source
+	}
+	return phase, result, source
+}
+
+// stableRuntimeKey builds a stable runtime identifier from collector epoch,
+// PID and start ticks. If any component is missing the key is empty and the
+// caller falls back to the boot_id incarnation.
+func stableRuntimeKey(epoch, pid, startTicks string) string {
+	if epoch == "" || pid == "" || startTicks == "" {
+		return ""
+	}
+	return epoch + ":" + pid + ":" + startTicks
+}
+
+// linuxUIDDimensions creates additional bindings for effective, saved and
+// filesystem UIDs when they differ from the real UID. Each dimension uses
+// its own binding kind so the graph can distinguish privilege escalation.
+func linuxUIDDimensions(p *Plan, estate, ns, runtimeKey string, ob Observation, rt map[string]any) {
+	realUID := str(rt, "uid")
+	for _, dim := range []struct {
+		field string
+		kind  string
+	}{
+		{"euid", "euid"},
+		{"suid", "suid"},
+		{"fsuid", "fsuid"},
+	} {
+		v := str(rt, dim.field)
+		if v == "" || v == realUID {
+			continue
+		}
+		idKey, err := igraph.LocalIdentityKey(estate, ns, v)
+		if err != nil {
+			continue
+		}
+		p.Bindings = append(p.Bindings, Binding{
+			RuntimeKey: runtimeKey, IdentityKey: idKey, Kind: dim.kind, Observation: ob.ID, From: ob.ObservedAt,
+		})
+	}
 }
 
 func workloadKey(p *Plan, ref string) string {

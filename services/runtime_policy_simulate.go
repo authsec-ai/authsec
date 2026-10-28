@@ -94,6 +94,9 @@ func (s *RuntimePolicyService) Simulate(ctx context.Context, actor Actor, id uui
 			map[string]any{"state": cur.State}, map[string]any{"state": state, "simulation_id": simID}); err != nil {
 			return 0, nil, err
 		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicySimulation, cur.Revision, cur.ContentHash, "simulated", "", map[string]any{
+			"simulation_id": simID, "target_digest": result.TargetDigest, "graph_revision": graph,
+		})
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(cur.Revision, cur.ContentHash),
 			"data": map[string]any{
@@ -217,8 +220,27 @@ func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, 
 			"policy_revision": cur.Revision, "graph_revision": graph,
 			"quarantined": outcome.Source == precedence.SourceQuarantine && outcome.Effect == "deny",
 		}
-		decision := s.engine().Eval(ctx, ws.String(), cur.ContentHash, data, input)
-		effect := decision.Effect
+
+		// V2 documents use typed replay; V1 falls back to OPA.
+		var effect string
+		var reasonCodes []string
+		if IsV2Document(cur.Document) {
+			simInput := SimulationInput{
+				WorkloadID: row.WorkloadID,
+				Primitive:  row.Action,
+				Resource:   row.ResourceID,
+				Action:     row.Action,
+			}
+			var v2Doc models.RuntimePolicyV2Document
+			_ = json.Unmarshal([]byte(cur.Document), &v2Doc)
+			simResult := TypedEval(v2Doc, simInput)
+			effect = simResult.Decision
+			reasonCodes = simResult.Reasons
+		} else {
+			decision := s.engine().Eval(ctx, ws.String(), cur.ContentHash, data, input)
+			effect = decision.Effect
+			reasonCodes = decision.ReasonCodes
+		}
 		if effect != "allow" {
 			effect = "deny"
 		}
@@ -232,7 +254,7 @@ func (s *RuntimePolicyService) evaluateWindow(ctx context.Context, tx *gorm.DB, 
 			}
 		}
 		if len(summary.Samples) < 20 {
-			reasons := decision.ReasonCodes
+			reasons := reasonCodes
 			if reasons == nil {
 				reasons = []string{}
 			}

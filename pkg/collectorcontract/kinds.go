@@ -102,6 +102,54 @@ func OpenClusterKind(kind string) bool {
 	}
 }
 
+// --- ActionDetail phase constants ---
+
+const (
+	// PhaseAttempt means the action was requested but not yet executed.
+	PhaseAttempt = "attempt"
+	// PhaseExec means execution is in progress.
+	PhaseExec = "exec"
+	// PhaseComplete means the action finished.
+	PhaseComplete = "complete"
+)
+
+// KnownPhases returns the valid ActionDetail.Phase values.
+func KnownPhases() []string {
+	return []string{PhaseAttempt, PhaseExec, PhaseComplete}
+}
+
+// KnownPhase reports whether phase is a recognized ActionDetail phase.
+func KnownPhase(phase string) bool { return contains(KnownPhases(), phase) }
+
+// --- ActionDetail result constants ---
+
+const (
+	ResultSuccess = "success"
+	ResultDenied  = "denied"
+	ResultError   = "error"
+	ResultUnknown = "unknown"
+)
+
+// KnownResults returns the valid ActionDetail.Result values.
+func KnownResults() []string {
+	return []string{ResultSuccess, ResultDenied, ResultError, ResultUnknown}
+}
+
+// KnownResult reports whether result is a recognized ActionDetail result.
+func KnownResult(result string) bool { return contains(KnownResults(), result) }
+
+// --- Source sensor constants ---
+//
+// These are advisory. The validator accepts any non-empty Source string.
+
+const (
+	SourceTetragon      = "tetragon"
+	SourceAuditd        = "auditd"
+	SourceProcfs        = "procfs"
+	SourceGatewayDriver = "gateway_driver"
+	SourceAdmission     = "admission"
+)
+
 func contains(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {

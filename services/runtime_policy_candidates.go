@@ -105,7 +105,7 @@ func (s *RuntimePolicyService) CreateCandidate(ctx context.Context, caller Actor
 				return 0, nil, statusErr(http.StatusConflict, "admin_revision_preserved", "This candidate has left draft and was not overwritten.")
 			} else {
 				revision = row.Revision + 1
-				if err := insertRevision(tx, sys, policyID, revision, canonical, hash, req.GraphRevision, models.RuntimePolicyStateDraft); err != nil {
+				if err := insertRevision(tx, sys, policyID, revision, canonical, hash, req.GraphRevision, models.RuntimePolicyStateDraft, nil); err != nil {
 					return 0, nil, err
 				}
 				if err := tx.Exec(`UPDATE runtime_policies SET current_draft_revision = ?, lifecycle = 'draft', updated_at = now()
@@ -122,7 +122,7 @@ func (s *RuntimePolicyService) CreateCandidate(ctx context.Context, caller Actor
 				policyID, caller.WorkspaceID, name, sys.UserID).Error; err != nil {
 				return 0, nil, err
 			}
-			if err := insertRevision(tx, sys, policyID, 1, canonical, hash, req.GraphRevision, models.RuntimePolicyStateDraft); err != nil {
+			if err := insertRevision(tx, sys, policyID, 1, canonical, hash, req.GraphRevision, models.RuntimePolicyStateDraft, nil); err != nil {
 				return 0, nil, err
 			}
 		}
@@ -134,6 +134,11 @@ func (s *RuntimePolicyService) CreateCandidate(ctx context.Context, caller Actor
 				}); err != nil {
 				return 0, nil, err
 			}
+			s.recordIGAPolicyAudit(tx, sys, &policyID, IGAAuditEventPolicyCreation, revision, hash, "candidate_created", "", map[string]any{
+				"input_hash":   gen.InputHash,
+				"partial":      gen.Partial,
+				"requested_by": caller.UserID,
+			})
 		}
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(revision, hash),
@@ -141,6 +146,116 @@ func (s *RuntimePolicyService) CreateCandidate(ctx context.Context, caller Actor
 		})
 		return status, out, nil
 	})
+}
+
+// GetCandidate retrieves a single candidate job by ID.
+func (s *RuntimePolicyService) GetCandidate(ctx context.Context, wsID, candidateID uuid.UUID) (int, []byte, error) {
+	var rows []struct {
+		ID               uuid.UUID
+		WorkspaceID      uuid.UUID
+		WorkloadIDs      string
+		GraphRevision    int64
+		EvidenceWindow   string
+		TemplateVersion  string
+		GeneratorVersion string
+		InputDigest      string
+		State            string
+		Warnings         string
+		DraftPolicyID    *uuid.UUID
+		ErrorMessage     string
+		CreatedAt        string
+		CompletedAt      *string
+	}
+	err := s.db.WithContext(ctx).Raw(`SELECT id, workspace_id, workload_ids::text AS workload_ids,
+		graph_revision, evidence_window, template_version, generator_version, input_digest,
+		state, warnings::text AS warnings, draft_policy_id, error_message,
+		created_at::text AS created_at, completed_at::text AS completed_at
+		FROM policy_candidate_jobs WHERE workspace_id = ? AND id = ?`, wsID, candidateID).Scan(&rows).Error
+	if err != nil {
+		return 0, nil, statusFrom(err)
+	}
+	if len(rows) == 0 {
+		return 0, nil, statusErr(http.StatusNotFound, "not_found", "Not found.")
+	}
+	row := rows[0]
+	var wlIDs []string
+	_ = json.Unmarshal([]byte(row.WorkloadIDs), &wlIDs)
+	var warnings []string
+	_ = json.Unmarshal([]byte(row.Warnings), &warnings)
+	data := map[string]any{
+		"candidate_id":      row.ID,
+		"workload_ids":      wlIDs,
+		"graph_revision":    row.GraphRevision,
+		"evidence_window":   row.EvidenceWindow,
+		"template_version":  row.TemplateVersion,
+		"generator_version": row.GeneratorVersion,
+		"input_digest":      row.InputDigest,
+		"state":             row.State,
+		"warnings":          warnings,
+		"created_at":        row.CreatedAt,
+	}
+	if row.DraftPolicyID != nil {
+		data["draft_policy_id"] = row.DraftPolicyID
+	}
+	if row.CompletedAt != nil {
+		data["completed_at"] = *row.CompletedAt
+	}
+	if row.ErrorMessage != "" {
+		data["error"] = row.ErrorMessage
+	}
+	out, _ := json.Marshal(map[string]any{"data": data})
+	return http.StatusOK, out, nil
+}
+
+// GetRevisionArtifacts returns compiled artifacts for a specific revision.
+func (s *RuntimePolicyService) GetRevisionArtifacts(ctx context.Context, wsID, policyID uuid.UUID, revision string) (int, []byte, error) {
+	var rows []struct {
+		Revision      int
+		ContentHash   string
+		Document      string
+		GraphRevision int64
+	}
+	q := `SELECT revision, content_hash, document::text AS document, graph_revision FROM runtime_policy_revisions
+		WHERE workspace_id = ? AND policy_id = ?`
+	args := []any{wsID, policyID}
+	if revision == "latest" {
+		q += ` ORDER BY revision DESC LIMIT 1`
+	} else {
+		q += ` AND revision = ?`
+		args = append(args, revision)
+	}
+	if err := s.db.WithContext(ctx).Raw(q, args...).Scan(&rows).Error; err != nil {
+		return 0, nil, statusFrom(err)
+	}
+	if len(rows) == 0 {
+		return 0, nil, statusErr(http.StatusNotFound, "not_found", "Revision not found.")
+	}
+	row := rows[0]
+	// Look up any publications for this revision to find artifacts.
+	var pubs []struct {
+		ID          uuid.UUID
+		RolloutPlan string
+	}
+	s.db.WithContext(ctx).Raw(`SELECT id, rollout_plan::text AS rollout_plan
+		FROM runtime_policy_publications
+		WHERE workspace_id = ? AND policy_id = ? AND revision = ?
+		ORDER BY created_at DESC LIMIT 1`, wsID, policyID, row.Revision).Scan(&pubs)
+
+	artifacts := map[string]any{
+		"revision":       row.Revision,
+		"content_hash":   row.ContentHash,
+		"graph_revision": row.GraphRevision,
+	}
+	if len(pubs) > 0 {
+		var plan map[string]any
+		_ = json.Unmarshal([]byte(pubs[0].RolloutPlan), &plan)
+		if arts, ok := plan["artifacts"]; ok {
+			artifacts["artifacts"] = arts
+		}
+		artifacts["publication_id"] = pubs[0].ID
+	}
+	out, _ := json.Marshal(map[string]any{"data": artifacts})
+	return http.StatusOK, out, nil
 }
 
 func candidateResponse(id uuid.UUID, revision int, hash string, gen candidates.Result, start, end time.Time, graph int64) map[string]any {

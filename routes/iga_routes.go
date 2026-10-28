@@ -86,3 +86,94 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
 	}
 }
+
+// MountAccessGovernance registers the access-request and access-lease routes on
+// /api/iga/v2, behind AuthMiddleware and the iga permission family.
+//
+// Batch 9 (S23-S28): the lease-based access governance surface. A request is
+// created, reviewed (approve/deny/cancel), and an approved request materialises
+// a time-bounded, use-bounded lease that can be redeemed and revoked.
+func MountAccessGovernance(r gin.IRouter, reqCtl *platformCtrl.AccessRequestController, leaseCtl *platformCtrl.AccessLeaseController) {
+	if r == nil || reqCtl == nil || leaseCtl == nil {
+		return
+	}
+
+	v2 := r.Group("/api/iga/v2")
+	v2.Use(middlewares.AuthMiddleware())
+	{
+		// Access requests — the ask-and-decide flow.
+		v2.POST("/access-requests", middlewares.Require("iga", "admin"), reqCtl.CreateAccessRequest)
+		v2.GET("/access-requests/:id", middlewares.Require("iga", "read"), reqCtl.GetAccessRequest)
+		v2.POST("/access-requests/:id/approve", middlewares.Require("iga", "admin"), reqCtl.ApproveAccessRequest)
+		v2.POST("/access-requests/:id/deny", middlewares.Require("iga", "admin"), reqCtl.DenyAccessRequest)
+		v2.POST("/access-requests/:id/cancel", middlewares.Require("iga", "admin"), reqCtl.CancelAccessRequest)
+
+		// Access leases — the materialised grants.
+		v2.GET("/access-leases/:id", middlewares.Require("iga", "read"), leaseCtl.GetLease)
+		v2.POST("/access-leases/:id/redeem", middlewares.Require("iga", "admin"), leaseCtl.RedeemLease)
+		v2.POST("/access-leases/:id/revoke", middlewares.Require("iga", "admin"), leaseCtl.RevokeLease)
+	}
+}
+
+// MountEnforcementBindings registers the per-agent enforcement binding and
+// instance routes on /api/iga/v2, behind AuthMiddleware and the iga permission
+// family.
+//
+// Enforcement A/B: per-agent backend selection, enforcement binding CRUD,
+// agent instance listing, and effective-policy reads.
+func MountEnforcementBindings(r gin.IRouter, bindingCtl *platformCtrl.EnforcementBindingController, instanceCtl *platformCtrl.AgentInstanceController) {
+	if r == nil || bindingCtl == nil || instanceCtl == nil {
+		return
+	}
+
+	v2 := r.Group("/api/iga/v2")
+	v2.Use(middlewares.AuthMiddleware())
+	{
+		// Enforcement binding CRUD.
+		v2.GET("/discovery/agents/:id/enforcement-binding", middlewares.Require("iga", "read"), bindingCtl.GetBinding)
+		v2.PUT("/discovery/agents/:id/enforcement-binding/draft", middlewares.Require("iga", "admin"), bindingCtl.PutDraft)
+		v2.GET("/discovery/agents/:id/enforcement-binding/resolution", middlewares.Require("iga", "read"), bindingCtl.GetResolution)
+
+		// Agent instances and effective policy.
+		v2.GET("/discovery/agents/:id/instances", middlewares.Require("iga", "read"), instanceCtl.ListInstances)
+		v2.GET("/discovery/agents/:id/effective-policy", middlewares.Require("iga", "read"), instanceCtl.GetEffectivePolicy)
+	}
+}
+
+// MountGraphReviews registers the graph-review routes on /api/iga/v2,
+// behind AuthMiddleware and the iga permission family.
+//
+// Batch 11 (S20-S21): graph review decisions — attest, remediate, reject.
+// A graph review records a governance decision against a specific entity at a
+// specific graph revision.
+func MountGraphReviews(r gin.IRouter, ctl *platformCtrl.GraphReviewController) {
+	if r == nil || ctl == nil {
+		return
+	}
+
+	v2 := r.Group("/api/iga/v2")
+	v2.Use(middlewares.AuthMiddleware())
+	{
+		// Graph reviews — governance decisions on graph entities.
+		v2.POST("/graph-reviews", middlewares.Require("iga", "review"), ctl.CreateGraphReview)
+		v2.GET("/graph-reviews/:id", middlewares.Require("iga", "read"), ctl.GetGraphReview)
+	}
+}
+
+// MountIGAAudit registers the IGA audit query endpoint on /api/iga/v2,
+// behind AuthMiddleware and the iga permission family.
+//
+// Batch 16 (AU01-AU10): normalised audit events linking discovery, identity,
+// policy, enforcement and access decisions into a continuous chain.
+func MountIGAAudit(r gin.IRouter, ctl *platformCtrl.IGAAuditController) {
+	if r == nil || ctl == nil {
+		return
+	}
+
+	v2 := r.Group("/api/iga/v2")
+	v2.Use(middlewares.AuthMiddleware())
+	{
+		// IGA audit — filtered, cursor-paginated audit event query.
+		v2.GET("/audit", middlewares.Require("iga", "audit:read"), ctl.QueryAuditEvents)
+	}
+}

@@ -15,7 +15,23 @@ func MountRuntimePolicy(r gin.IRouter, db *gorm.DB, auth gin.HandlerFunc) {
 	if r == nil || db == nil || auth == nil || !services.V2PolicyEnabled() {
 		return
 	}
-	MountRuntimePolicyService(r, services.NewRuntimePolicyService(db), auth)
+	svc := services.NewRuntimePolicyService(db)
+	svc.SetIGAAudit(services.NewIGAAuditService(db))
+	MountRuntimePolicyService(r, svc, auth)
+
+	// Per-workload policy bindings (needs db directly).
+	wbSvc := services.NewWorkloadBindingService(db)
+	wbCtl := platformCtrl.NewWorkloadBindingController(wbSvc)
+	wb := r.Group("/api/iga/v2/workloads/:id/runtime-policy-binding", auth)
+	wb.GET("", middlewares.Require("runtime_policy", "read"), wbCtl.Get)
+	wb.PUT("", middlewares.Require("runtime_policy", "write"), wbCtl.Put)
+
+	// BG05: policy context preparation (needs db directly).
+	pcSvc := services.NewPolicyContextService(db)
+	pcCtl := platformCtrl.NewPolicyContextController(pcSvc)
+	ctxG := r.Group("/api/iga/v2/runtime-policies/contexts", auth)
+	ctxG.POST("", middlewares.Require("runtime_policy", "write"), pcCtl.Prepare)
+	ctxG.GET("/:id", middlewares.Require("runtime_policy", "read"), pcCtl.Get)
 }
 
 // MountRuntimePolicyService registers the runtime-policy routes on an
@@ -42,4 +58,12 @@ func MountRuntimePolicyService(r gin.IRouter, svc *services.RuntimePolicyService
 	g.POST("/:id/publications", middlewares.Require("runtime_policy", "enforce"), ctl.Publish)
 	g.POST("/:id/rollback", middlewares.Require("runtime_policy", "enforce"), ctl.Rollback)
 	g.POST("/:id/revoke", middlewares.Require("runtime_policy", "enforce"), ctl.Revoke)
+	g.GET("/:id/revisions/:revision/artifacts", middlewares.Require("runtime_policy", "read"), ctl.GetRevisionArtifacts)
+
+	g.GET("/candidates/:candidate_id", middlewares.Require("runtime_policy", "read"), ctl.GetCandidate)
+
+	// Batch 11 (S14): per-workload enforcement capabilities.
+	capCtl := platformCtrl.NewCapabilityController()
+	caps := r.Group("/api/iga/v2/runtime-policy-capabilities", auth)
+	caps.GET("", middlewares.Require("runtime_policy", "read"), capCtl.GetCapabilities)
 }

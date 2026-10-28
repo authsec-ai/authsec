@@ -180,6 +180,8 @@ func (s *RuntimePolicyService) Revoke(ctx context.Context, actor Actor, id uuid.
 			actor.WorkspaceID, id).Error; err != nil {
 			return 0, nil, err
 		}
+		// Mark per-workload bindings as revoked.
+		_ = revokeWorkloadPolicyBindings(tx, actor.WorkspaceID, id)
 		return status, payload, nil
 	})
 }
@@ -372,12 +374,23 @@ func (s *RuntimePolicyService) insertPublication(ctx context.Context, tx *gorm.D
 			return 0, nil, err
 		}
 	}
+	// Upsert per-workload policy bindings on publish.
+	_ = upsertWorkloadPolicyBindings(tx, actor.WorkspaceID, policyID, cur.Revision, delivery, targets)
 	if err := writeAudit(tx, actor, &policyID, routeAction(req, advance), req.Reason, requestHash(route, ifMatch, body), doc.Targets.WorkloadIDs,
 		map[string]any{"state": cur.State}, map[string]any{
 			"publication_id": pubID, "delivery_revision": delivery, "mode": req.Mode, "rollout_phase": phase,
 		}); err != nil {
 		return 0, nil, err
 	}
+	s.recordIGAPolicyAudit(tx, actor, &policyID, IGAAuditEventPolicyPublication, cur.Revision, cur.ContentHash, routeAction(req, advance), req.Reason, map[string]any{
+		"publication_id":    pubID,
+		"delivery_revision": delivery,
+		"mode":              req.Mode,
+		"rollout_phase":     phase,
+		"target_digest":     result.TargetDigest,
+		"plan_digest":       manifestHash,
+		"binary_digest":     bundle.SHA256,
+	})
 	out, _ := json.Marshal(map[string]any{
 		"etag": etag(cur.Revision, cur.ContentHash),
 		"data": map[string]any{

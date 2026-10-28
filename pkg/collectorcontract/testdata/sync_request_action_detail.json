@@ -1,0 +1,97 @@
+{
+  "schema_version": "2.0",
+  "batch_id": "10000000-0000-4000-8000-000000000042",
+  "collector_epoch": "20000000-0000-4000-8000-000000000001",
+  "sequence": 12,
+  "sent_at": "2026-09-25T09:00:00Z",
+  "objects": [
+    {
+      "ref": "o_workload",
+      "kind": "linux.systemd_workload",
+      "native": {"unit": "invoice-worker.service"}
+    },
+    {
+      "ref": "o_identity",
+      "kind": "linux.local_account",
+      "native": {"uid": 995, "user_namespace": "host"},
+      "attributes": {"name": "svc-invoice"},
+      "credential_provenance": {
+        "method": "nss_passwd",
+        "source": "/etc/passwd",
+        "resolved_at": "2026-09-25T08:55:00Z"
+      },
+      "mapping_provenance": {
+        "resolver": "sssd",
+        "source": "nss_sss",
+        "mapped_at": "2026-09-25T08:55:01Z"
+      }
+    },
+    {
+      "ref": "o_file",
+      "kind": "linux.file",
+      "native": {"path": "/srv/output/report.csv"}
+    }
+  ],
+  "observations": [
+    {
+      "event_id": "e-file-write-99",
+      "kind": "runtime.file_open",
+      "subject_ref": "o_workload",
+      "identity_ref": "o_identity",
+      "resource_ref": "o_file",
+      "runtime": {
+        "boot_id": "boot-a",
+        "pid_namespace": "host",
+        "pid": 824,
+        "start_ticks": 93401
+      },
+      "observed_at": "2026-09-25T08:59:58Z",
+      "outcome": "success",
+      "attribution": "kernel_process_credentials",
+      "source": "tetragon",
+      "action_detail": {
+        "operation": "file.write",
+        "phase": "complete",
+        "result": "success",
+        "source_sensor": "tetragon",
+        "source_version": "1.2.0",
+        "source_sequence": 4201,
+        "count": 1,
+        "executable_digest": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      }
+    },
+    {
+      "event_id": "e-denied-100",
+      "kind": "runtime.network_connect",
+      "subject_ref": "o_workload",
+      "identity_ref": "o_identity",
+      "runtime": {
+        "boot_id": "boot-a",
+        "pid_namespace": "host",
+        "pid": 824,
+        "start_ticks": 93401
+      },
+      "observed_at": "2026-09-25T09:00:01Z",
+      "outcome": "denied",
+      "source": "tetragon",
+      "action_detail": {
+        "operation": "network.connect",
+        "phase": "attempt",
+        "result": "denied",
+        "policy_decision": "explicit_deny",
+        "errno": 13,
+        "source_sensor": "tetragon",
+        "source_version": "1.2.0",
+        "enforcement_refs": [
+          {
+            "assignment_id": "50000000-0000-4000-8000-000000000001",
+            "rule_id": "deny-outbound-db",
+            "control_id": "ctl-net-001"
+          }
+        ]
+      }
+    }
+  ],
+  "applied": [],
+  "health": {"events_lost": 0, "queue_depth": 2}
+}

@@ -1,12 +1,14 @@
 package services
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/directory/adresolve"
 	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/internal/igagraph/providers"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/pkg/collectorcontract"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -58,6 +60,9 @@ func resolveDirectoryBacking(tx *gorm.DB, in CollectorPass, plan *providers.Plan
 			return err
 		}
 		if err := confirmDirectoryBacking(tx, in, relKey, rel.DerivationRule); err != nil {
+			return err
+		}
+		if err := storeMappingProvenance(tx, in, relKey, idn.MappingProvenance); err != nil {
 			return err
 		}
 		if err := linkDirectoryEvidence(tx, in, relKey, idn.Directory.ObservationIDs); err != nil {
@@ -192,6 +197,24 @@ func linkDirectoryEvidence(tx *gorm.DB, in CollectorPass, sourceKey string, obse
 		}
 	}
 	return nil
+}
+
+// storeMappingProvenance persists the collector-reported mapping provenance
+// on the backed_by_directory relationship. When provenance is nil the column
+// is left unchanged so an earlier provenance is not erased by a pass that
+// omits it.
+func storeMappingProvenance(tx *gorm.DB, in CollectorPass, sourceKey string, prov *collectorcontract.MappingProvenance) error {
+	if prov == nil {
+		return nil
+	}
+	b, err := json.Marshal(prov)
+	if err != nil {
+		return err
+	}
+	return tx.Exec(`UPDATE iga_relationship
+		SET mapping_provenance = ?
+		WHERE workspace_id = ? AND source_key = ? AND state <> 'ended'`,
+		json.RawMessage(b), in.WorkspaceID, sourceKey).Error
 }
 
 // endAbsentDirectoryBacking ends backed_by_directory edges in this pass's

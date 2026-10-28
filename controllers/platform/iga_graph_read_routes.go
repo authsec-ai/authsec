@@ -45,9 +45,24 @@ func RegisterIGAGraphReadRoutes(g gin.IRoutes, ctl *IGAGraphReadController, requ
 	g.GET("/resources/:id/access", read, ctl.GetResourceAccess)
 	g.GET("/resources/:id/changes", read, ctl.GetResourceChanges)
 
+	g.GET("/collectors/:id/workloads", read, ctl.GetCollectorWorkloads)
+
 	g.GET("/graph", read, ctl.GetGraph)
 	g.GET("/graph/expand", read, ctl.ExpandGraph)
 	g.GET("/graph/path", read, ctl.GetGraphPath)
 	g.GET("/evidence", read, ctl.GetEvidence)
 	g.GET("/lookup", read, ctl.Lookup)
+}
+
+// RegisterActionsOnGraphRoutes mounts the workload actions route on the same
+// /api/iga/v1 group. It is called separately because the ActionsController
+// is a different struct from IGAGraphReadController, and existing callers of
+// RegisterIGAGraphReadRoutes (including tests) must not be forced to supply
+// one.
+func RegisterActionsOnGraphRoutes(g gin.IRoutes, actionsCtl *ActionsController, require func(resource, action string) gin.HandlerFunc) {
+	if actionsCtl == nil {
+		return
+	}
+	read := require("iga", "read")
+	g.GET("/workloads/:id/actions", read, actionsCtl.ListForWorkload)
 }

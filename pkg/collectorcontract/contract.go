@@ -11,8 +11,11 @@ const (
 	// PackageVersion is the pin agents record. It is not the wire schema string.
 	// 2.1.0 adds an optional artifact body for include_policy=inline.
 	// 2.1.1 adds optional desired.mode, desired.revoked, and desired.quarantine.
+	// 2.2.0 adds optional ActionDetail, Source on Observation;
+	//        CredentialProvenance, MappingProvenance on Object;
+	//        NegotiatedCapability struct.
 	// SchemaVersion stays 2.0.
-	PackageVersion = "2.1.1"
+	PackageVersion = "2.2.0"
 	// DecompressedMaxBytes is the 2 MiB uncompressed cap from §11.1.
 	DecompressedMaxBytes = 2 << 20
 	// CompressedMaxBytes is the cap on a gzip body before it is inflated.
@@ -58,10 +61,12 @@ type Snapshot struct {
 // Object is a native object with a batch-local ref. The server assigns
 // recognition keys; ref is not a canonical id.
 type Object struct {
-	Ref        string         `json:"ref"`
-	Kind       string         `json:"kind"`
-	Native     map[string]any `json:"native"`
-	Attributes map[string]any `json:"attributes,omitempty"`
+	Ref                  string                `json:"ref"`
+	Kind                 string                `json:"kind"`
+	Native               map[string]any        `json:"native"`
+	Attributes           map[string]any        `json:"attributes,omitempty"`
+	CredentialProvenance *CredentialProvenance  `json:"credential_provenance,omitempty"`
+	MappingProvenance    *MappingProvenance     `json:"mapping_provenance,omitempty"`
 }
 
 // Observation is one source-local fact.
@@ -81,6 +86,10 @@ type Observation struct {
 	// a configuration existence claim. Ingest does not write a canonical graph
 	// node for it.
 	Preview bool `json:"preview,omitempty"`
+	// ActionDetail carries canonical action semantics (added in 2.2.0).
+	ActionDetail *ActionDetail `json:"action_detail,omitempty"`
+	// Source identifies the producing sensor or driver (added in 2.2.0).
+	Source string `json:"source,omitempty"`
 }
 
 // AppliedReceipt is the §22.3 control receipt carried in applied[].

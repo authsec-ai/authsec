@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/directory/adresolve"
+	"github.com/authsec-ai/authsec/pkg/collectorcontract"
 	"github.com/google/uuid"
 )
 
@@ -25,6 +26,10 @@ type Object struct {
 	// ObservationIDs are the facts this object was read from. The directory
 	// resolver records them as the inputs of a derived relationship.
 	ObservationIDs []uuid.UUID
+	// CredentialProvenance describes how the identity credential was obtained.
+	CredentialProvenance *collectorcontract.CredentialProvenance
+	// MappingProvenance describes how a UID was mapped to a directory identity.
+	MappingProvenance *collectorcontract.MappingProvenance
 }
 
 // Observation is one stored fact. Preview observations are not existence.
@@ -39,14 +44,19 @@ type Observation struct {
 	Outcome     string
 	Attribution string
 	Preview     bool
+	// ActionDetail carries canonical action semantics from the collector.
+	ActionDetail *collectorcontract.ActionDetail
+	// Source identifies the producing sensor or driver.
+	Source string
 }
 
 // Input is one collector or directory pass.
 type Input struct {
-	Provider     string
-	EstateID     string
-	Objects      []Object
-	Observations []Observation
+	Provider       string
+	EstateID       string
+	CollectorEpoch string
+	Objects        []Object
+	Observations   []Observation
 }
 
 // Identity is a canonical account the writer upserts.
@@ -65,6 +75,10 @@ type Identity struct {
 	// Directory is an authoritative NSS mapping. Nil means the collector
 	// reported none. A display name is not a mapping. The writer resolves it.
 	Directory *adresolve.Hint
+	// CredentialProvenance describes how this identity credential was obtained.
+	CredentialProvenance *collectorcontract.CredentialProvenance
+	// MappingProvenance describes how a UID was mapped to a directory identity.
+	MappingProvenance *collectorcontract.MappingProvenance
 }
 
 // Workload is a canonical runtime.
@@ -168,19 +182,26 @@ type Binding struct {
 	Kind        string
 	Observation uuid.UUID
 	From        time.Time
+	// CredentialProvenance describes how the binding credential was obtained.
+	CredentialProvenance *collectorcontract.CredentialProvenance
 }
 
 // Observed is one access fact.
 type Observed struct {
-	WorkloadKey string
-	RuntimeKey  string
-	IdentityKey string
-	ResourceKey string
-	Observation uuid.UUID
-	Action      string
-	Outcome     string
-	Attribution string
-	ObservedAt  time.Time
+	WorkloadKey  string
+	RuntimeKey   string
+	IdentityKey  string
+	ResourceKey  string
+	Observation  uuid.UUID
+	Action       string
+	Outcome      string
+	Attribution  string
+	ObservedAt   time.Time
+	Phase        string
+	ResultDetail string
+	Source       string
+	CredentialRef string
+	MappingRef   string
 }
 
 // PolicyBinding attaches a constraint to a workload. It is not a grant.

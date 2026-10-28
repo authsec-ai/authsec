@@ -43,7 +43,9 @@
         "ref": { "type": "string", "pattern": "^o_[A-Za-z0-9_]+$" },
         "kind": { "type": "string", "minLength": 1 },
         "native": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } },
-        "attributes": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } }
+        "attributes": { "type": "object", "propertyNames": { "$ref": "#/$defs/notSecret" } },
+        "credential_provenance": { "$ref": "#/$defs/credentialProvenance" },
+        "mapping_provenance": { "$ref": "#/$defs/mappingProvenance" }
       }
     },
     "observation": {
@@ -60,7 +62,59 @@
         "observed_at": { "type": "string", "format": "date-time" },
         "outcome": { "enum": ["attempted", "success", "denied", "unknown"] },
         "attribution": { "type": "string" },
-        "preview": { "type": "boolean" }
+        "preview": { "type": "boolean" },
+        "action_detail": { "$ref": "#/$defs/actionDetail" },
+        "source": { "type": "string" }
+      }
+    },
+    "actionDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "type": "string" },
+        "phase": { "enum": ["attempt", "exec", "complete"] },
+        "result": { "enum": ["success", "denied", "error", "unknown"] },
+        "policy_decision": { "type": "string" },
+        "operation_id": { "type": "string" },
+        "source_sequence": { "type": "integer" },
+        "count": { "type": "integer", "minimum": 0 },
+        "aggregation": { "type": "string" },
+        "errno": { "type": "integer" },
+        "executable_digest": { "type": "string" },
+        "source_sensor": { "type": "string" },
+        "source_version": { "type": "string" },
+        "enforcement_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/enforcementRef" }
+        }
+      }
+    },
+    "enforcementRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "assignment_id": { "type": "string" },
+        "rule_id": { "type": "string" },
+        "control_id": { "type": "string" }
+      }
+    },
+    "credentialProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string" },
+        "source": { "type": "string" },
+        "resolved_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "mappingProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resolver": { "type": "string" },
+        "source": { "type": "string" },
+        "mapped_at": { "type": "string", "format": "date-time" },
+        "ambiguous": { "type": "boolean" }
       }
     },
     "notSecret": {

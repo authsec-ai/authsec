@@ -416,6 +416,21 @@ type DiscoveredAgent struct {
 	CreatedBy string    `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Policies are runtime policies whose current revision targets the workload
+	// adopted from this sighting. Filled on read. Not a column.
+	Policies []DiscoveredAgentPolicy `json:"policies,omitempty" gorm:"-"`
+
+	// WorkloadID is the adopted iga_workload whose source_key is
+	// discovered-agent:<this id>. Filled on read. Not a column.
+	WorkloadID *uuid.UUID `json:"workload_id,omitempty" gorm:"-"`
+}
+
+// DiscoveredAgentPolicy is the runtime policy linked to one sighting.
+type DiscoveredAgentPolicy struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Lifecycle string    `json:"lifecycle"`
 }
 
 func (DiscoveredAgent) TableName() string { return "discovered_agents" }

@@ -264,6 +264,7 @@ var graphNodeTables = map[string]string{
 	RefExternalPrincipal: "iga_external_principal",
 	RefStatement:         "iga_entitlements",
 	RefResource:          "iga_resources",
+	runtimeRef:           "iga_runtime_instances",
 }
 
 // predicates is the spec's WHERE after the workspace: its own predicates and,

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,7 +51,15 @@ type DiscoveryManager interface {
 	// ReportSighting is the ONLY way an inventory row is created. It is an
 	// idempotent upsert on (workspace, source, fingerprint), so a connector may
 	// re-report the same agent on every scan.
+	//
+	// A sighting the filter holds returns a nil agent and created=false. That
+	// is success: the candidate was recorded and is not an inventory row.
+	// Callers must not treat a nil agent as an error.
 	ReportSighting(workspaceID uuid.UUID, reportedBy string, in SightingInput) (agent *models.DiscoveredAgent, created bool, err error)
+
+	// ListCandidates returns filtered discovery rows. decision is hold, promote,
+	// or all. An empty decision means hold.
+	ListCandidates(workspaceID uuid.UUID, decision string, limit, offset int) ([]models.DiscoveryCandidate, int64, error)
 
 	GetAgent(workspaceID, id uuid.UUID) (*models.DiscoveredAgent, error)
 	GetAgentByFingerprint(workspaceID uuid.UUID, source, fingerprint string) (*models.DiscoveredAgent, error)
@@ -663,14 +672,43 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 		}
 	}
 
-	metadataJSON, err := marshalDiscoveryConfig(in.Metadata)
-	if err != nil {
-		return nil, false, err
-	}
-
 	observedAt := time.Now()
 	if in.ObservedAt != nil && !in.ObservedAt.IsZero() {
 		observedAt = *in.ObservedAt
+	}
+	// Hold before any inventory write. A candidate-store failure is returned:
+	// dropping the sighting would hide that the filter did not run.
+	linked, hold, err := m.recordCandidate(workspaceID, &in, observedAt)
+	if err != nil {
+		return nil, false, err
+	}
+	if hold {
+		return nil, false, nil
+	}
+	if linked != nil {
+		if in.DiscoverySourceID != nil {
+			if terr := m.repo.TouchSource(workspaceID, *in.DiscoverySourceID, "ok"); terr != nil {
+				log.Printf("[discovery] could not stamp source %s as live: %v",
+					in.DiscoverySourceID, terr)
+			}
+		}
+		// An attach with no activity must not refresh a runtime-policy draft.
+		// The primary agent's own sightings still do that.
+		if hasActivity(in.Metadata) && V2PolicyEnabled() {
+			if db := m.repo.DB(); db != nil {
+				svc := NewRuntimePolicyService(db)
+				svc.SetIGAAudit(NewIGAAuditService(db))
+				if derr := svc.DiscoverFromAgent(context.Background(), linked); derr != nil {
+					log.Printf("[runtime-policy] discovery for linked sighting %s: %v", linked.ID, derr)
+				}
+			}
+		}
+		return linked, false, nil
+	}
+
+	metadataJSON, err := marshalDiscoveryConfig(in.Metadata)
+	if err != nil {
+		return nil, false, err
 	}
 
 	// Runtime state follows the EVIDENCE. An observed sighting is direct proof
@@ -719,6 +757,9 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	if err != nil {
 		return nil, false, err
 	}
+	if lerr := linkCandidate(m.repo.DB(), workspaceID, in.Source, in.Fingerprint, stored.ID); lerr != nil {
+		return nil, false, lerr
+	}
 
 	// Record that this source is alive. Best-effort by design: a failed liveness
 	// stamp must never cost us the sighting itself, which is the actual payload.
@@ -750,13 +791,33 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 			}
 		}
 	}
+	// Every sighting that carries activity refreshes that agent's draft.
+	// A projector failure is logged and does not drop the sighting.
+	if V2PolicyEnabled() {
+		if db := m.repo.DB(); db != nil {
+			svc := NewRuntimePolicyService(db)
+			svc.SetIGAAudit(NewIGAAuditService(db))
+			if derr := svc.DiscoverFromAgent(context.Background(), stored); derr != nil {
+				log.Printf("[runtime-policy] discovery for sighting %s: %v", stored.ID, derr)
+			}
+		}
+	}
 	return stored, created, nil
 }
 
 /* -------------------------------- agents -------------------------------- */
 
 func (m *discoveryManager) GetAgent(workspaceID, id uuid.UUID) (*models.DiscoveredAgent, error) {
-	return m.repo.GetAgent(workspaceID, id)
+	agent, err := m.repo.GetAgent(workspaceID, id)
+	if err != nil || agent == nil {
+		return agent, err
+	}
+	one := []models.DiscoveredAgent{*agent}
+	attachAgentPolicies(m.repo.DB(), workspaceID, one)
+	attachAgentWorkloads(m.repo.DB(), workspaceID, one)
+	agent.Policies = one[0].Policies
+	agent.WorkloadID = one[0].WorkloadID
+	return agent, nil
 }
 
 func (m *discoveryManager) GetAgentByFingerprint(workspaceID uuid.UUID, source, fingerprint string) (*models.DiscoveredAgent, error) {
@@ -782,7 +843,13 @@ func (m *discoveryManager) ListAgents(workspaceID uuid.UUID, f repositories.Agen
 	if f.Offset < 0 {
 		f.Offset = 0
 	}
-	return m.repo.ListAgents(workspaceID, f)
+	agents, total, err := m.repo.ListAgents(workspaceID, f)
+	if err != nil {
+		return nil, 0, err
+	}
+	attachAgentPolicies(m.repo.DB(), workspaceID, agents)
+	attachAgentWorkloads(m.repo.DB(), workspaceID, agents)
+	return agents, total, nil
 }
 
 func (m *discoveryManager) UpdateAgent(workspaceID, id uuid.UUID, in AgentUpdateInput) (*models.DiscoveredAgent, error) {

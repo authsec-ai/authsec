@@ -28,3 +28,9 @@ func (ctl *IGAGraphReadController) GetObservedUse(c *gin.Context) {
 		return g.Reader.ObservedUse(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
 	})
 }
+
+func (ctl *IGAGraphReadController) GetCollectorWorkloads(c *gin.Context) {
+	ctl.serve(c, func(g graphCall) (any, error) {
+		return g.Reader.CollectorWorkloads(g.C.Request.Context(), g.WS, g.C.Param("id"), g.C.Request.URL.Query())
+	})
+}

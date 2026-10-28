@@ -56,7 +56,7 @@ import (
 // (§5.4 "The traversal graph", D-39), in the order a level reads them. A
 // policy is not a traversal node (its statements are), and a claim is not a
 // node at all: either as a root is 400.
-var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource}
+var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource, runtimeRef}
 
 // Edge kinds (§5.4). The claim behind each: relationship (the first four and
 // can_assume), grant, target.
@@ -91,6 +91,7 @@ var graphV2EdgeKinds = []string{
 	GraphEdgeCanAssume, GraphEdgeExecutesAs, GraphEdgeGrant,
 	GraphEdgeMemberOf, GraphEdgeTarget, GraphEdgeTaskExecutionRole,
 	GraphEdgeBackedByDirectory, GraphEdgeObservedAccess,
+	GraphEdgeRuntimeBinding, GraphEdgeRuntimeExecIdentity,
 }
 
 // Directions (§5.4): forward answers "what can this reach, declared"; reverse

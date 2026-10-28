@@ -43,6 +43,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/buildinfo"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -804,6 +805,7 @@ func SetupRoutes(
 				adminAuth.POST("/login/bootstrap", adminAuthController.AdminBootstrap)
 				adminAuth.POST("/login/resend-otp", adminAuthController.AdminResendOTP)
 				adminAuth.POST("/login", adminAuthController.AdminLogin)
+				adminAuth.POST("/login/simple", adminAuthController.SimpleLogin)
 				adminAuth.POST("/register", adminAuthController.AdminRegister)
 				adminAuth.POST("/complete-registration", adminAuthController.AdminCompleteRegistration)
 				adminAuth.POST("/forgot-password", adminAuthController.AdminForgotPassword)
@@ -1429,6 +1431,34 @@ func SetupRoutes(
 		MountRuntimePolicy(r, config.DB, middlewares.AuthMiddleware())
 		MountITDR(r, config.DB, middlewares.AuthMiddleware())
 
+		// Batch 9 (S23-S28): access governance — request/approve/lease/redeem.
+		accessLeaseSvc := services.NewAccessLeaseService()
+		MountAccessGovernance(r,
+			platformCtrl.NewAccessRequestController(accessLeaseSvc),
+			platformCtrl.NewAccessLeaseController(accessLeaseSvc),
+		)
+
+		// Batch 11 (S20-S21): graph reviews — attest/remediate/reject decisions.
+		graphReviewSvc := services.NewGraphReviewService()
+		MountGraphReviews(r, platformCtrl.NewGraphReviewController(graphReviewSvc))
+
+		// Enforcement A/B: per-agent binding, instances, and effective policy.
+		// The console calls these routes from the policy screens.
+		MountEnforcementBindings(r,
+			platformCtrl.NewEnforcementBindingController(services.NewEnforcementBindingService(config.DB)),
+			platformCtrl.NewAgentInstanceController(config.DB),
+		)
+
+		// Batch 16 (AU01-AU10): IGA audit — normalised lifecycle event query.
+		igaAuditSvc := services.NewIGAAuditService(config.DB)
+		MountIGAAudit(r, platformCtrl.NewIGAAuditController(igaAuditSvc))
+
+		// Batch 4 (BG03+BG07): Activity Index & Actions APIs.
+		actionsSvc := services.NewActionsService(config.DB)
+		actionsCtl := platformCtrl.NewActionsController(actionsSvc)
+		platformCtrl.MountActionsOnGraphRoutes(r, actionsCtl, middlewares.AuthMiddleware(), middlewares.Require)
+		MountActions(r, actionsCtl)
+
 		// Connector ingress is UNAUTHENTICATED by deliberate choice.
 		//
 		// A connector runs inside a customer's cluster and is configured with its
@@ -1520,6 +1550,8 @@ func SetupRoutes(
 			// The static /agents/lookup must be registered before /agents/:id.
 			discovery.GET("/agents/lookup", middlewares.Require("discovery", "read"), discoveryController.LookupDiscoveredAgent)
 			discovery.GET("/agents", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveredAgents)
+			// Not under /agents/:id. Held rows are candidates, not inventory.
+			discovery.GET("/candidates", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveryCandidates)
 			discovery.GET("/agents/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoveredAgent)
 			// The lifecycle trail behind an agent's runtime status: when it was
 			// deleted, through which channel, and which principal the API server

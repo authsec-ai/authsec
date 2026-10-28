@@ -72,22 +72,35 @@ func (t *graphTraversal) decorateLimitations(lv *graphLevel, nodes []*GraphNode,
 	}
 	refs := make([]Ref, 0, len(nodes)+len(edges))
 	for _, n := range nodes {
+		if graphClaimSkipped(n.typ) {
+			continue
+		}
 		refs = append(refs, Ref{Type: n.typ, ID: n.id})
 	}
 	for _, e := range edges {
+		if graphClaimSkipped(e.claimRef.Type) {
+			continue
+		}
 		refs = append(refs, e.claimRef)
 	}
-	if _, err := lv.db(); err != nil { // the level's allowance is spent
-		return err
+	byRef := map[string][]Limitation{}
+	if len(refs) > 0 {
+		if _, err := lv.db(); err != nil { // the level's allowance is spent
+			return err
+		}
+		// ClaimLimitations is a dozen statements (claims, restrictions, coverage,
+		// a nested optional history read): the level's query holds each of them
+		// to the level's allowance.
+		var err error
+		byRef, err = lv.query().ClaimLimitations(t.accts, refs, FactFreeLimitations)
+		if err != nil {
+			return err
+		}
 	}
-	// ClaimLimitations is a dozen statements (claims, restrictions, coverage,
-	// a nested optional history read): the level's query holds each of them
-	// to the level's allowance.
-	byRef, err := lv.query().ClaimLimitations(t.accts, refs, FactFreeLimitations)
-	if err != nil {
-		return err
-	}
-	of := func(ref string) ([]GraphLimitation, error) {
+	of := func(ref string, skipped bool) ([]GraphLimitation, error) {
+		if skipped {
+			return []GraphLimitation{}, nil
+		}
 		ls, ok := byRef[ref]
 		if !ok {
 			// The traversal read it in this same snapshot, by the same
@@ -98,20 +111,27 @@ func (t *graphTraversal) decorateLimitations(lv *graphLevel, nodes []*GraphNode,
 		return ls, nil
 	}
 	for _, n := range nodes {
-		ls, err := of(n.Ref)
+		ls, err := of(n.Ref, graphClaimSkipped(n.typ))
 		if err != nil {
 			return err
 		}
 		n.Limitations = graphWith(ls, graphRestrictionLimitations(n))
 	}
 	for _, e := range edges {
-		ls, err := of(e.Claim)
+		ls, err := of(e.Claim, graphClaimSkipped(e.claimRef.Type))
 		if err != nil {
 			return err
 		}
 		e.Limitations = graphWith(ls, e.farCoverage)
 	}
 	return nil
+}
+
+// graphClaimSkipped is a traversal element the evidence claim loader does not
+// model. Runtime instances and their bindings are v2 graph nodes; they draw
+// with an empty limitation list rather than failing the neighbourhood.
+func graphClaimSkipped(typ string) bool {
+	return typ == runtimeRef || typ == RefRuntimeBinding
 }
 
 // graphWith is a claim's own limitations plus the graph's additions. With

@@ -68,6 +68,8 @@ func (t *graphTraversal) fetchNodes(lv *graphLevel, nodes []*GraphNode) error {
 			err = t.fetchStatements(lv, ids, set)
 		case RefResource:
 			err = t.fetchResources(lv, ids, set)
+		case runtimeRef:
+			err = t.fetchRuntimes(lv, ids, set)
 		}
 		if err != nil {
 			return err
@@ -94,6 +96,46 @@ func (t *graphTraversal) fetchWorkloads(lv *graphLevel, ids []uuid.UUID, set map
 		t.ownAccount(n, r.AccountID)
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
 		n.stale = r.StaleSubject()
+		n.fetched = true
+	}
+	return t.fillRuntimeFacts(lv, nodesOf(set))
+}
+
+// fetchRuntimes reads iga_runtime_instances the v2 runtime_binding edge
+// reached. A runtime instance has no iga_object_support row; the edge query
+// already required its workload to be a supported graph object.
+func (t *graphTraversal) fetchRuntimes(lv *graphLevel, ids []uuid.UUID, set map[uuid.UUID]*GraphNode) error {
+	tx, err := lv.db()
+	if err != nil {
+		return err
+	}
+	var rows []struct {
+		ID             uuid.UUID
+		RuntimeKey     string
+		RuntimeKind    string
+		EndedAt        *time.Time
+		LastObservedAt time.Time
+	}
+	if err := tx.Raw(`SELECT id, runtime_key, runtime_kind, ended_at, last_observed_at
+	                    FROM iga_runtime_instances
+	                   WHERE workspace_id = ? AND id IN ?`, t.q.WS, ids).Scan(&rows).Error; err != nil {
+		return err
+	}
+	for _, r := range rows {
+		n := set[r.ID]
+		n.Kind, n.key, n.RuntimeKind = runtimeRef, r.RuntimeKey, r.RuntimeKind
+		n.Label = r.RuntimeKey
+		if i := strings.LastIndex(r.RuntimeKey, ":"); i >= 0 && i+1 < len(r.RuntimeKey) {
+			n.Label = r.RuntimeKey[i+1:]
+		}
+		if n.Label == "" {
+			n.Label = r.RuntimeKind
+		}
+		n.State, n.Lifecycle = StateCurrent, models.IGALifecycleActive
+		if r.EndedAt != nil {
+			n.State = StateEnded
+		}
+		n.LastConfirmedAt = TS(&r.LastObservedAt)
 		n.fetched = true
 	}
 	return nil

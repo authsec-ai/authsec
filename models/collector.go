@@ -182,6 +182,10 @@ type CollectorInstance struct {
 	Version               string          `json:"version" gorm:"not null;default:''"`
 	RowVersion            int64           `json:"row_version" gorm:"not null;default:1"`
 	CapabilityDigest      string          `json:"capability_digest" gorm:"not null;default:''"`
+	IdentityMode          string          `json:"identity_mode" gorm:"type:text;not null;default:'spiffe'"` // spiffe, enrolled_mtls
+	IdentityBindingID     *uuid.UUID      `json:"identity_binding_id,omitempty" gorm:"type:uuid"`
+	VerifiedPrincipalID   string          `json:"verified_principal_id" gorm:"type:text;not null;default:''"`
+	CertificateProfile    string          `json:"certificate_profile" gorm:"type:text;not null;default:''"`
 	LastSeenAt            *time.Time      `json:"last_seen_at,omitempty"`
 	Status                string          `json:"status" gorm:"not null;default:'active'"`
 	RevokedAt             *time.Time      `json:"revoked_at,omitempty"`

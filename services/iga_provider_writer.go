@@ -13,6 +13,7 @@ import (
 	igraph "github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/internal/igagraph/providers"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/pkg/collectorcontract"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -50,6 +51,7 @@ func (ProviderWriter) Project(tx *gorm.DB, in CollectorPass) error {
 	}
 	plan, err := providers.Normalize(providers.Input{
 		Provider: provider, EstateID: estate.String(),
+		CollectorEpoch: in.Epoch.String(),
 		Objects: facts.objects, Observations: facts.observations,
 	})
 	if err != nil {
@@ -173,8 +175,10 @@ func loadFacts(tx *gorm.DB, in CollectorPass) (factSet, error) {
 
 func objectFrom(row loadedFact) providers.Object {
 	var wrap struct {
-		Native     map[string]any `json:"native"`
-		Attributes map[string]any `json:"attributes"`
+		Native               map[string]any                        `json:"native"`
+		Attributes           map[string]any                        `json:"attributes"`
+		CredentialProvenance *collectorcontract.CredentialProvenance `json:"credential_provenance,omitempty"`
+		MappingProvenance    *collectorcontract.MappingProvenance    `json:"mapping_provenance,omitempty"`
 	}
 	_ = json.Unmarshal(row.Payload, &wrap)
 	var loc struct {
@@ -188,6 +192,8 @@ func objectFrom(row loadedFact) providers.Object {
 	obj := providers.Object{
 		Ref: ref, Kind: row.ObjectType, Recognition: row.Recognition,
 		Native: wrap.Native, Attrs: wrap.Attributes,
+		CredentialProvenance: wrap.CredentialProvenance,
+		MappingProvenance:    wrap.MappingProvenance,
 	}
 	if wrap.Native == nil {
 		obj.Raw = row.Payload
@@ -197,14 +203,16 @@ func objectFrom(row loadedFact) providers.Object {
 
 func observationFrom(row loadedFact) (providers.Observation, bool) {
 	var body struct {
-		Kind        string         `json:"kind"`
-		SubjectRef  string         `json:"subject_ref"`
-		IdentityRef string         `json:"identity_ref"`
-		ResourceRef string         `json:"resource_ref"`
-		Runtime     map[string]any `json:"runtime"`
-		Outcome     string         `json:"outcome"`
-		Attribution string         `json:"attribution"`
-		Preview     bool           `json:"preview"`
+		Kind         string                       `json:"kind"`
+		SubjectRef   string                       `json:"subject_ref"`
+		IdentityRef  string                       `json:"identity_ref"`
+		ResourceRef  string                       `json:"resource_ref"`
+		Runtime      map[string]any               `json:"runtime"`
+		Outcome      string                       `json:"outcome"`
+		Attribution  string                       `json:"attribution"`
+		Preview      bool                         `json:"preview"`
+		ActionDetail *collectorcontract.ActionDetail `json:"action_detail,omitempty"`
+		Source       string                       `json:"source,omitempty"`
 	}
 	if len(row.Fact) == 0 || string(row.Fact) == "{}" || string(row.Fact) == "null" {
 		return providers.Observation{}, false
@@ -216,6 +224,7 @@ func observationFrom(row loadedFact) (providers.Observation, bool) {
 		ID: row.ObsID, Kind: body.Kind, SubjectRef: body.SubjectRef, IdentityRef: body.IdentityRef,
 		ResourceRef: body.ResourceRef, Runtime: body.Runtime, ObservedAt: row.ObservedAt,
 		Outcome: body.Outcome, Attribution: body.Attribution, Preview: body.Preview,
+		ActionDetail: body.ActionDetail, Source: body.Source,
 	}, true
 }
 

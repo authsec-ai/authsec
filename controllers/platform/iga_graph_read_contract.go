@@ -37,6 +37,19 @@ func MountIGAGraphReadRoutes(r gin.IRouter, ctl *IGAGraphReadController, auth gi
 	RegisterIGAGraphReadRoutes(g, ctl, GraphRequire(require))
 }
 
+// MountActionsOnGraphRoutes mounts the workload actions route on the same
+// /api/iga/v1 group as the graph catalogue. Called from routes.SetupIGARoutes
+// after MountIGAGraphReadRoutes. When actionsCtl is nil the route is not
+// registered — startup continues without the activity index.
+func MountActionsOnGraphRoutes(r gin.IRouter, actionsCtl *ActionsController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
+	if actionsCtl == nil {
+		return
+	}
+	g := r.Group("/api/iga/v1")
+	g.Use(GraphEnvelope(auth))
+	RegisterActionsOnGraphRoutes(g, actionsCtl, GraphRequire(require))
+}
+
 // GraphEnvelope wraps an authentication or permission middleware so that a
 // 401 or 403 it answers with is rendered as the §5.2 envelope: code
 // unauthenticated or forbidden, the middleware's own description as the

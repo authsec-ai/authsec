@@ -47,11 +47,12 @@ func statusErr(status int, code, msg string) *StatusError {
 // Tests that must accept a test-only digest use NewRuntimePolicyServiceWithRegistry
 // with Registry.WithTestDigests. Production must not.
 type RuntimePolicyService struct {
-	db   *gorm.DB
-	reg  *profiles.Registry
-	lock time.Duration
-	eval opa.Evaluator
-	now  func() time.Time
+	db       *gorm.DB
+	reg      *profiles.Registry
+	lock     time.Duration
+	eval     opa.Evaluator
+	now      func() time.Time
+	igaAudit *IGAAuditService
 }
 
 // NewRuntimePolicyService builds the service from the certified profiles.
@@ -74,6 +75,39 @@ func NewRuntimePolicyServiceWithRegistry(db *gorm.DB, reg *profiles.Registry) *R
 	return &RuntimePolicyService{db: db, reg: reg, lock: ClassificationLockTimeout, eval: opa.NewEngine(), now: time.Now}
 }
 
+// SetIGAAudit attaches the IGA audit service for normalised lifecycle event
+// recording. This is optional — when nil, only the existing writeAudit path
+// fires. The setter avoids changing the constructor signature and breaking
+// existing callers.
+func (s *RuntimePolicyService) SetIGAAudit(svc *IGAAuditService) {
+	if s != nil {
+		s.igaAudit = svc
+	}
+}
+
+// recordIGAPolicyAudit writes a normalised IGA audit event alongside the
+// existing runtime_policy_audit row. It is a no-op when igaAudit is nil.
+func (s *RuntimePolicyService) recordIGAPolicyAudit(tx *gorm.DB, actor Actor, policyID *uuid.UUID, eventType string, revision int, contentHash string, outcome string, reason string, extra map[string]any) {
+	if s == nil || s.igaAudit == nil || policyID == nil {
+		return
+	}
+	// Fire-and-record inside the same transaction. Errors are intentionally
+	// swallowed so the existing mutation is not blocked by an audit failure.
+	_ = s.igaAudit.RecordPolicyMutationEvent(
+		tx,
+		actor.WorkspaceID,
+		actor.UserID,
+		*policyID,
+		eventType,
+		revision,
+		contentHash,
+		outcome,
+		reason,
+		"", // correlation_id — not available at this layer
+		extra,
+	)
+}
+
 func (s *RuntimePolicyService) clock() time.Time {
 	if s == nil || s.now == nil {
 		return time.Now().UTC()
@@ -89,11 +123,12 @@ func (s *RuntimePolicyService) engine() opa.Evaluator {
 }
 
 type policyHead struct {
-	ID                   uuid.UUID `json:"id"`
-	Name                 string    `json:"name"`
-	OwnerUserID          uuid.UUID `json:"owner_user_id"`
-	CurrentDraftRevision int       `json:"current_draft_revision"`
-	Lifecycle            string    `json:"lifecycle"`
+	ID                   uuid.UUID         `json:"id"`
+	Name                 string            `json:"name"`
+	OwnerUserID          uuid.UUID         `json:"owner_user_id"`
+	CurrentDraftRevision int               `json:"current_draft_revision"`
+	Lifecycle            string            `json:"lifecycle"`
+	Agents               []policyAgentLink `json:"agents,omitempty" gorm:"-"`
 }
 
 type revisionHead struct {
@@ -105,12 +140,39 @@ type revisionHead struct {
 	GraphRevision int64     `json:"graph_revision"`
 }
 
-func (s *RuntimePolicyService) Create(ctx context.Context, actor Actor, key string, body []byte) (int, []byte, error) {
+func (s *RuntimePolicyService) Create(ctx context.Context, actor Actor, key string, body []byte, link ...ContextLinkage) (int, []byte, error) {
+	var cl ContextLinkage
+	if len(link) > 0 {
+		cl = link[0]
+	}
+	format, err := DetectFormat(body)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	switch format {
+	case compile.FormatV2:
+		return s.createV2(ctx, actor, key, body, cl)
+	default:
+		return s.createV1(ctx, actor, key, body, cl)
+	}
+}
+
+func (s *RuntimePolicyService) createV1(ctx context.Context, actor Actor, key string, body []byte, cl ContextLinkage) (int, []byte, error) {
 	doc, err := compile.Parse(body)
 	if err != nil {
 		return 0, nil, statusFrom(err)
 	}
 	return s.once(ctx, actor, key, "POST /api/iga/v2/runtime-policies", "", body, func(tx *gorm.DB) (int, []byte, error) {
+		// Validate optional origin context linkage.
+		var prov *ContextProvenance
+		if cl.OriginContextID != nil {
+			p, err := validateContextLinkage(tx, s.clock(), actor.WorkspaceID, actor.UserID, *cl.OriginContextID)
+			if err != nil {
+				return 0, nil, err
+			}
+			prov = p
+		}
 		var n int64
 		if err := tx.Raw(`SELECT count(*) FROM runtime_policies WHERE workspace_id = ? AND name = ?`,
 			actor.WorkspaceID, doc.Name).Scan(&n).Error; err != nil {
@@ -130,16 +192,84 @@ func (s *RuntimePolicyService) Create(ctx context.Context, actor Actor, key stri
 			id, actor.WorkspaceID, doc.Name, actor.UserID).Error; err != nil {
 			return 0, nil, err
 		}
-		if err := insertRevision(tx, actor, id, 1, canonical, hash, doc.EvidenceGraphRevision, models.RuntimePolicyStateDraft); err != nil {
+		if err := insertRevision(tx, actor, id, 1, canonical, hash, doc.EvidenceGraphRevision, models.RuntimePolicyStateDraft, contextIDFromProv(prov)); err != nil {
 			return 0, nil, err
 		}
 		if err := writeAudit(tx, actor, &id, "create", "", requestHash("POST /api/iga/v2/runtime-policies", "", body),
 			doc.Targets.WorkloadIDs, map[string]any{}, map[string]any{"revision": 1, "state": "draft"}); err != nil {
 			return 0, nil, err
 		}
+		extra := map[string]any{"before_hash": "", "after_hash": hash, "format": "v1"}
+		if prov != nil {
+			extra["origin_context_id"] = prov.OriginContextID
+		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicyCreation, 1, hash, "created", "", extra)
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(1, hash),
 			"data": map[string]any{"policy_id": id, "revision": 1, "lifecycle": models.RuntimePolicyStateDraft, "content_hash": hash},
+		})
+		return http.StatusCreated, out, nil
+	})
+}
+
+func (s *RuntimePolicyService) createV2(ctx context.Context, actor Actor, key string, body []byte, cl ContextLinkage) (int, []byte, error) {
+	doc, err := compile.ParseV2(body)
+	if err != nil {
+		return 0, nil, statusFrom(err)
+	}
+	result := compile.ValidateV2(doc)
+	if !result.Valid {
+		return 0, nil, &StatusError{
+			Status:  http.StatusUnprocessableEntity,
+			Code:    "validation_failed",
+			Message: fmt.Sprintf("%d validation error(s)", len(result.Errors)),
+			Extra:   map[string]any{"errors": result.Errors},
+		}
+	}
+	return s.once(ctx, actor, key, "POST /api/iga/v2/runtime-policies", "", body, func(tx *gorm.DB) (int, []byte, error) {
+		// Validate optional origin context linkage.
+		var prov *ContextProvenance
+		if cl.OriginContextID != nil {
+			p, err := validateContextLinkage(tx, s.clock(), actor.WorkspaceID, actor.UserID, *cl.OriginContextID)
+			if err != nil {
+				return 0, nil, err
+			}
+			prov = p
+		}
+		var n int64
+		if err := tx.Raw(`SELECT count(*) FROM runtime_policies WHERE workspace_id = ? AND name = ?`,
+			actor.WorkspaceID, doc.Name).Scan(&n).Error; err != nil {
+			return 0, nil, err
+		}
+		if n > 0 {
+			return 0, nil, statusErr(http.StatusConflict, "name_taken", "A runtime policy with this name already exists.")
+		}
+		canonical, hash, err := compile.CanonicalV2(doc)
+		if err != nil {
+			return 0, nil, err
+		}
+		id := uuid.New()
+		if err := tx.Exec(`INSERT INTO runtime_policies
+			(id, workspace_id, name, owner_user_id, current_draft_revision, lifecycle)
+			VALUES (?, ?, ?, ?, 1, 'draft')`,
+			id, actor.WorkspaceID, doc.Name, actor.UserID).Error; err != nil {
+			return 0, nil, err
+		}
+		if err := insertRevisionV2(tx, actor, id, 1, canonical, hash, doc.EvidenceGraphRevision, models.RuntimePolicyStateDraft, doc.Enforcement.Profile, contextIDFromProv(prov)); err != nil {
+			return 0, nil, err
+		}
+		if err := writeAudit(tx, actor, &id, "create", "", requestHash("POST /api/iga/v2/runtime-policies", "", body),
+			doc.Targets.WorkloadIDs, map[string]any{}, map[string]any{"revision": 1, "state": "draft", "format": "v2"}); err != nil {
+			return 0, nil, err
+		}
+		extra := map[string]any{"before_hash": "", "after_hash": hash, "format": "v2"}
+		if prov != nil {
+			extra["origin_context_id"] = prov.OriginContextID
+		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicyCreation, 1, hash, "created", "", extra)
+		out, _ := json.Marshal(map[string]any{
+			"etag": etag(1, hash),
+			"data": map[string]any{"policy_id": id, "revision": 1, "lifecycle": models.RuntimePolicyStateDraft, "content_hash": hash, "format": models.RuntimePolicyFormatV2},
 		})
 		return http.StatusCreated, out, nil
 	})
@@ -155,6 +285,7 @@ func (s *RuntimePolicyService) List(ctx context.Context, ws uuid.UUID) (int, []b
 	if rows == nil {
 		rows = []policyHead{}
 	}
+	attachPolicyAgents(s.db.WithContext(ctx), ws, rows)
 	out, _ := json.Marshal(map[string]any{"data": rows})
 	return http.StatusOK, out, nil
 }
@@ -169,6 +300,7 @@ func (s *RuntimePolicyService) Get(ctx context.Context, ws, id uuid.UUID) (int, 
 	if len(heads) == 0 {
 		return 0, nil, statusErr(http.StatusNotFound, "not_found", "Not found.")
 	}
+	attachPolicyAgents(s.db.WithContext(ctx), ws, heads)
 	var revs []revisionHead
 	if err := s.db.WithContext(ctx).Raw(`SELECT revision, document::text AS document, content_hash, author_user_id, state, graph_revision
 		FROM runtime_policy_revisions WHERE workspace_id = ? AND policy_id = ? ORDER BY revision`,
@@ -184,7 +316,11 @@ func (s *RuntimePolicyService) Get(ctx context.Context, ws, id uuid.UUID) (int, 
 	return http.StatusOK, out, nil
 }
 
-func (s *RuntimePolicyService) PutDraft(ctx context.Context, actor Actor, id uuid.UUID, key, ifMatch string, body []byte) (int, []byte, error) {
+func (s *RuntimePolicyService) PutDraft(ctx context.Context, actor Actor, id uuid.UUID, key, ifMatch string, body []byte, link ...ContextLinkage) (int, []byte, error) {
+	var cl ContextLinkage
+	if len(link) > 0 {
+		cl = link[0]
+	}
 	doc, err := compile.Parse(body)
 	if err != nil {
 		return 0, nil, statusFrom(err)
@@ -194,12 +330,21 @@ func (s *RuntimePolicyService) PutDraft(ctx context.Context, actor Actor, id uui
 		if etag(cur.Revision, cur.ContentHash) != ifMatch {
 			return 0, nil, statusErr(http.StatusPreconditionFailed, "precondition_failed", "If-Match does not match the current revision.")
 		}
+		// Validate optional origin context linkage.
+		var prov *ContextProvenance
+		if cl.OriginContextID != nil {
+			p, err := validateContextLinkage(tx, s.clock(), actor.WorkspaceID, actor.UserID, *cl.OriginContextID)
+			if err != nil {
+				return 0, nil, err
+			}
+			prov = p
+		}
 		canonical, hash, err := compile.Canonical(doc)
 		if err != nil {
 			return 0, nil, err
 		}
 		next := cur.Revision + 1
-		if err := insertRevision(tx, actor, id, next, canonical, hash, doc.EvidenceGraphRevision, models.RuntimePolicyStateDraft); err != nil {
+		if err := insertRevision(tx, actor, id, next, canonical, hash, doc.EvidenceGraphRevision, models.RuntimePolicyStateDraft, contextIDFromProv(prov)); err != nil {
 			return 0, nil, err
 		}
 		if err := tx.Exec(`UPDATE runtime_policies SET name = ?, current_draft_revision = ?, lifecycle = 'draft', updated_at = now()
@@ -213,11 +358,21 @@ func (s *RuntimePolicyService) PutDraft(ctx context.Context, actor Actor, id uui
 			return 0, nil, err
 		}
 		diff := ruleDiff(cur.Document, doc, cur.Revision, next)
+		structDiff := BuildStructuredRuleDiff(cur.Document, string(canonical), cur.Revision, next, cur.ContentHash, hash)
 		if err := writeAudit(tx, actor, &id, "draft", "", requestHash(route, ifMatch, body),
 			doc.Targets.WorkloadIDs, map[string]any{"revision": cur.Revision, "state": cur.State},
-			map[string]any{"revision": next, "state": "draft"}); err != nil {
+			map[string]any{"revision": next, "state": "draft"}, structDiff); err != nil {
 			return 0, nil, err
 		}
+		extra := map[string]any{
+			"before_hash": cur.ContentHash, "after_hash": hash,
+			"before_revision": cur.Revision, "after_revision": next,
+			"diff": diff,
+		}
+		if prov != nil {
+			extra["origin_context_id"] = prov.OriginContextID
+		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicyEdit, next, hash, "drafted", "", extra)
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(next, hash),
 			"data": map[string]any{"policy_id": id, "revision": next, "lifecycle": "draft", "content_hash": hash, "diff": diff},
@@ -265,6 +420,9 @@ func (s *RuntimePolicyService) Validate(ctx context.Context, actor Actor, id uui
 			doc.Targets.WorkloadIDs, map[string]any{"state": cur.State}, map[string]any{"state": "validated"}); err != nil {
 			return 0, nil, err
 		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicyValidation, cur.Revision, cur.ContentHash, "validated", "", map[string]any{
+			"target_digest": result.TargetDigest,
+		})
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(cur.Revision, cur.ContentHash),
 			"data": map[string]any{
@@ -367,6 +525,12 @@ func (s *RuntimePolicyService) Approve(ctx context.Context, actor Actor, id uuid
 			doc.Targets.WorkloadIDs, map[string]any{"state": cur.State}, map[string]any{"state": "approved", "approval_id": approvalID}); err != nil {
 			return 0, nil, err
 		}
+		s.recordIGAPolicyAudit(tx, actor, &id, IGAAuditEventPolicyApproval, cur.Revision, cur.ContentHash, "approved", req.Reason, map[string]any{
+			"approval_id":   approvalID,
+			"simulation_id": req.SimulationID,
+			"target_digest": req.TargetDigest,
+			"reviewer":      actor.UserID,
+		})
 		out, _ := json.Marshal(map[string]any{
 			"etag": etag(cur.Revision, cur.ContentHash),
 			"data": map[string]any{"policy_id": id, "approval_id": approvalID, "revision": cur.Revision, "state": "approved"},
@@ -517,24 +681,45 @@ func storeIdempotent(tx *gorm.DB, ws uuid.UUID, key, route, hash string, status 
 	return row, nil
 }
 
-func insertRevision(tx *gorm.DB, actor Actor, policyID uuid.UUID, revision int, document []byte, hash string, graph int64, state string) error {
+func insertRevision(tx *gorm.DB, actor Actor, policyID uuid.UUID, revision int, document []byte, hash string, graph int64, state string, originContextID *uuid.UUID) error {
 	return tx.Exec(`INSERT INTO runtime_policy_revisions
-		(id, workspace_id, policy_id, revision, document, content_hash, author_user_id, state, graph_revision, compiler_format)
-		VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?)`,
-		uuid.New(), actor.WorkspaceID, policyID, revision, string(document), hash, actor.UserID, state, graph, models.RuntimePolicyFormatV1).Error
+		(id, workspace_id, policy_id, revision, document, content_hash, author_user_id, state, graph_revision, compiler_format, origin_context_id)
+		VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?)`,
+		uuid.New(), actor.WorkspaceID, policyID, revision, string(document), hash, actor.UserID, state, graph, models.RuntimePolicyFormatV1, originContextID).Error
 }
 
-func writeAudit(tx *gorm.DB, actor Actor, policyID *uuid.UUID, action, reason, hash string, targets []string, before, after any) error {
+func insertRevisionV2(tx *gorm.DB, actor Actor, policyID uuid.UUID, revision int, document []byte, hash string, graph int64, state, backendProfile string, originContextID *uuid.UUID) error {
+	return tx.Exec(`INSERT INTO runtime_policy_revisions
+		(id, workspace_id, policy_id, revision, document, content_hash, author_user_id, state, graph_revision, compiler_format, compiler_version, backend_profile, origin_context_id)
+		VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, ?)`,
+		uuid.New(), actor.WorkspaceID, policyID, revision, string(document), hash, actor.UserID, state, graph, models.RuntimePolicyFormatV2, CompilerVersion, backendProfile, originContextID).Error
+}
+
+// contextIDFromProv extracts the origin context ID from provenance, or nil.
+func contextIDFromProv(prov *ContextProvenance) *uuid.UUID {
+	if prov == nil {
+		return nil
+	}
+	return prov.OriginContextID
+}
+
+func writeAudit(tx *gorm.DB, actor Actor, policyID *uuid.UUID, action, reason, hash string, targets []string, before, after any, diffOpt ...*StructuredRuleDiff) error {
 	if targets == nil {
 		targets = []string{}
 	}
 	tb, _ := json.Marshal(targets)
 	bb, _ := json.Marshal(before)
 	ab, _ := json.Marshal(after)
+	var diffJSON *string
+	if len(diffOpt) > 0 && diffOpt[0] != nil {
+		b, _ := json.Marshal(diffOpt[0])
+		s := string(b)
+		diffJSON = &s
+	}
 	return tx.Exec(`INSERT INTO runtime_policy_audit
-		(id, workspace_id, policy_id, actor_user_id, action, reason, request_hash, affected_targets, before_state, after_state)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb))`,
-		uuid.New(), actor.WorkspaceID, policyID, actor.UserID, action, reason, hash, string(tb), string(bb), string(ab)).Error
+		(id, workspace_id, policy_id, actor_user_id, action, reason, request_hash, affected_targets, before_state, after_state, rule_diff)
+		VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb))`,
+		uuid.New(), actor.WorkspaceID, policyID, actor.UserID, action, reason, hash, string(tb), string(bb), string(ab), diffJSON).Error
 }
 
 func capabilityTargets(tx *gorm.DB, ws uuid.UUID, doc compile.Document) ([]compile.TargetRef, error) {
@@ -670,12 +855,18 @@ func (c dbCatalog) ResolveWorkload(_ context.Context, ws, id uuid.UUID) (compile
 	if rows[0].WorkspaceID != ws {
 		return compile.WorkloadTarget{}, compile.ErrCrossWorkspace
 	}
-	var inst []uuid.UUID
+	var inst []struct {
+		ID uuid.UUID `gorm:"column:id"`
+	}
 	if err := c.tx.Raw(`SELECT id FROM iga_runtime_instances WHERE workspace_id = ? AND workload_id = ? ORDER BY id`,
 		ws, id).Scan(&inst).Error; err != nil {
 		return compile.WorkloadTarget{}, err
 	}
-	return compile.WorkloadTarget{ID: id, RuntimeInstanceIDs: inst}, nil
+	ids := make([]uuid.UUID, 0, len(inst))
+	for _, row := range inst {
+		ids = append(ids, row.ID)
+	}
+	return compile.WorkloadTarget{ID: id, RuntimeInstanceIDs: ids}, nil
 }
 
 func (c dbCatalog) BrokerConfigured(_ context.Context, ws uuid.UUID, adapter string) (bool, error) {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -492,10 +493,11 @@ func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
 	}
 
 	status := http.StatusOK
-	if created {
+	if created && agent != nil {
 		status = http.StatusCreated
 		// Only a first sighting is a governance event worth auditing; a bump is
-		// routine telemetry and would flood the admin-mutation log.
+		// routine telemetry and would flood the admin-mutation log. A held
+		// candidate has no agent and is not audited.
 		auditAdminMutation(c, wsID.String(), "discover", "discovered_agent",
 			agent.ID.String(), status, nil, agent)
 	}
@@ -733,6 +735,31 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"agents": agents, "total": total})
+}
+
+// ListDiscoveryCandidates handles GET /authsec/discovery/candidates.
+// Default decision=hold: workloads that were seen and not classified as agents.
+func (ctl *DiscoveryController) ListDiscoveryCandidates(c *gin.Context) {
+	wsID, _, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	decision := c.Query("decision")
+	if decision == "" {
+		decision = "hold"
+	}
+	rows, total, err := ctl.manager().ListCandidates(wsID, decision, limit, offset)
+	if err != nil {
+		discoveryError(c, err)
+		return
+	}
+	if rows == nil {
+		rows = []models.DiscoveryCandidate{}
+	}
+	c.JSON(http.StatusOK, gin.H{"candidates": rows, "total": total})
 }
 
 // GetDiscoveredAgent handles GET /authsec/discovery/agents/:id. Pass

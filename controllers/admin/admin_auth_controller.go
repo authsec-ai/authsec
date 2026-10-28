@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -1089,6 +1090,76 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	}
 
 	return token, nil
+}
+
+// simpleLoginEnabled is the experimental username-and-password sign-in.
+// It stays off unless AUTHSEC_SIMPLE_LOGIN is set or /app/simple-login.on exists.
+func simpleLoginEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AUTHSEC_SIMPLE_LOGIN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	_, err := os.Stat("/app/simple-login.on")
+	return err == nil
+}
+
+// SimpleLogin signs in with a username and password and returns a session token.
+// It does not send email and it does not ask for a security key. Disabled unless
+// simpleLoginEnabled is true.
+func (aac *AdminAuthController) SimpleLogin(c *gin.Context) {
+	if !simpleLoginEnabled() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+
+	var input struct {
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
+		return
+	}
+
+	identifier := strings.TrimSpace(input.Username)
+	var adminUser *models.AdminUser
+	var err error
+	if strings.Contains(identifier, "@") {
+		adminUser, err = aac.adminUserRepo.GetAdminUserByEmail(identifier)
+	} else {
+		adminUser, err = aac.adminUserRepo.GetAdminUserByUsername(identifier)
+	}
+	if err != nil || adminUser == nil || !adminUser.CheckPassword(input.Password) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+	if adminUser.AccountLockedAt != nil && time.Since(*adminUser.AccountLockedAt) < 30*time.Minute {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account is temporarily locked"})
+		return
+	}
+
+	if err := aac.adminUserRepo.UpdateLastLogin(adminUser.ID); err != nil {
+		log.Printf("simple login: failed to update last login: %v", err)
+	}
+	token, err := aac.generateAdminJWTToken(adminUser)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign in"})
+		return
+	}
+
+	workspaceID := ""
+	if adminUser.WorkspaceID != nil {
+		workspaceID = adminUser.WorkspaceID.String()
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"token":            token,
+		"email":            adminUser.Email,
+		"username":         adminUser.Username,
+		"workspace_id":     workspaceID,
+		"workspace_domain": adminUser.WorkspaceDomain,
+		"mfa_required":     false,
+		"first_login":      false,
+	})
 }
 
 // AdminLoginPrecheck validates admin email and returns tenant context

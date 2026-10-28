@@ -481,7 +481,14 @@ func main() {
 		if services.V2PolicyEnabled() {
 			go services.NewRolloutWorker(config.DB).Run(context.Background())
 			log.Printf("runtime policy rollout worker started (interval=5s)")
+			go services.RunRuntimePolicyDiscovery(context.Background(), config.DB, time.Minute)
+			log.Printf("runtime policy discovery started (interval=1m)")
 		}
+
+		// Host processes, systemd units, and files become candidates through
+		// the same filter as cluster workloads. Not gated on policy publication.
+		go services.RunDiscoveryProjector(context.Background(), config.DB, time.Minute)
+		log.Printf("discovery candidate projector started (interval=1m)")
 	}
 
 	// ─────────────────────────────────────────────────────────

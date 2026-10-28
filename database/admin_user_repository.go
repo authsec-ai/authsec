@@ -450,6 +450,23 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	return nil
 }
 
+// GetAdminUserByUsername resolves an admin by username, then applies the same
+// admin-role checks as GetAdminUserByEmail.
+func (aur *AdminUserRepository) GetAdminUserByUsername(username string) (*models.AdminUser, error) {
+	var email string
+	err := aur.db.QueryRow(`
+		SELECT email FROM users
+		WHERE LOWER(username) = LOWER($1) AND active = true AND deleted_at IS NULL
+		LIMIT 1`, username).Scan(&email)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, sql.ErrNoRows
+		}
+		return nil, fmt.Errorf("failed to get admin user by username: %w", err)
+	}
+	return aur.GetAdminUserByEmail(email)
+}
+
 // GetAdminUserByEmail retrieves an admin user by email (case-insensitive)
 // Uses role_bindings for role assignments (user_roles is deprecated)
 func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.AdminUser, error) {

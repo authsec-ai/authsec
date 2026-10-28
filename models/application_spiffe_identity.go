@@ -15,6 +15,14 @@ type ApplicationSpiffeIdentity struct {
 	SpiffeID      string          `json:"spiffe_id" gorm:"type:text;not null;uniqueIndex"`
 	TrustDomain   string          `json:"trust_domain" gorm:"type:text;not null"`
 	Selectors     json.RawMessage `json:"selectors" gorm:"type:jsonb;default:'{}'"`
+	IdentityMode        string     `json:"identity_mode" gorm:"type:text;not null;default:'spiffe'"` // spiffe, enrolled_mtls
+	ExecutionBindingID  *uuid.UUID `json:"execution_binding_id,omitempty" gorm:"type:uuid"`
+	BindingGeneration   int        `json:"binding_generation" gorm:"not null;default:0"`
+	VerifiedPrincipalID string     `json:"verified_principal_id,omitempty" gorm:"type:text"`
+	EnrollmentState     string     `json:"enrollment_state" gorm:"type:text;not null;default:''"`
+	CertificateSerial   *string    `json:"certificate_serial,omitempty" gorm:"type:text"`
+	KeyIdentifier       *string    `json:"key_identifier,omitempty" gorm:"type:text"`
+	PublicKeyHash       *string    `json:"public_key_hash,omitempty" gorm:"type:text"`
 	Status            string          `json:"status" gorm:"type:text;not null;default:'attestation_pending'"`
 	LastAttestedAt    *time.Time      `json:"last_attested_at,omitempty" gorm:"column:last_attested_at"`
 	LastTokenIssuedAt *time.Time      `json:"last_token_issued_at,omitempty" gorm:"column:last_token_issued_at"`

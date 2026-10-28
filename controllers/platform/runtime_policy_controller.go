@@ -144,6 +144,34 @@ func (ctl *RuntimePolicyController) Revoke(c *gin.Context) {
 	})
 }
 
+func (ctl *RuntimePolicyController) GetCandidate(c *gin.Context) {
+	actor, ok := policyActor(c)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(c.Param("candidate_id"))
+	if err != nil {
+		writePolicy(c, 0, nil, &services.StatusError{Status: http.StatusNotFound, Code: "not_found", Message: "Not found."})
+		return
+	}
+	status, body, err := ctl.svc.GetCandidate(c.Request.Context(), actor.WorkspaceID, id)
+	writePolicy(c, status, body, err)
+}
+
+func (ctl *RuntimePolicyController) GetRevisionArtifacts(c *gin.Context) {
+	actor, ok := policyActor(c)
+	if !ok {
+		return
+	}
+	id, ok := policyID(c)
+	if !ok {
+		return
+	}
+	revision := c.Param("revision")
+	status, body, err := ctl.svc.GetRevisionArtifacts(c.Request.Context(), actor.WorkspaceID, id, revision)
+	writePolicy(c, status, body, err)
+}
+
 func (ctl *RuntimePolicyController) enforce(c *gin.Context, fn func(services.Actor, string, string, []byte) (int, []byte, error)) {
 	ctl.mutate(c, true, func(actor services.Actor, key, match string, body []byte) (int, []byte, error) {
 		if models.IsRuntimePolicyCandidateSystem(actor.UserID, actor.Kind) {

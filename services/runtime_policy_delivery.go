@@ -58,6 +58,7 @@ type desiredArtifact struct {
 }
 
 type desiredState struct {
+	WorkloadID     string          `json:"workload_id"`
 	Revision       int64           `json:"revision"`
 	GraphRevision  int64           `json:"graph_revision"`
 	ManifestID     string          `json:"manifest_id"`
@@ -71,6 +72,11 @@ type desiredState struct {
 	Mode       string `json:"mode,omitempty"`
 	Revoked    bool   `json:"revoked,omitempty"`
 	Quarantine bool   `json:"quarantine,omitempty"`
+
+	// V2 fields for signed binary policy packages.
+	BundleArtifact *desiredArtifact `json:"bundle_artifact,omitempty"` // V2 signed .aspol bundle
+	Backend        string           `json:"backend,omitempty"`         // V2 enforcement backend
+	BackendProfile string           `json:"backend_profile,omitempty"` // V2 backend profile
 }
 
 // GetRollout reports per-target §15.2 state for the latest publication.
@@ -246,7 +252,8 @@ func loadDesired(tx *gorm.DB, ws, collector uuid.UUID, inline bool) (json.RawMes
 	if err != nil {
 		return nil, err
 	}
-	var chosen *struct {
+	// Collect ALL visible targets instead of breaking on the first one (B04 fix).
+	type visibleRow struct {
 		Delivery int64
 		Graph    int64
 		PubID    uuid.UUID
@@ -254,80 +261,99 @@ func loadDesired(tx *gorm.DB, ws, collector uuid.UUID, inline bool) (json.RawMes
 		Plan     string
 		Workload string
 	}
+	var visible []visibleRow
 	for i := range rows {
 		row := rows[i]
 		if !desiredVisible(row.Phase, row.Plan, row.Workload) {
 			continue
 		}
-		chosen = &row
-		break
+		visible = append(visible, visibleRow{
+			Delivery: row.Delivery, Graph: row.Graph, PubID: row.PubID,
+			Phase: row.Phase, Plan: row.Plan, Workload: row.Workload,
+		})
 	}
-	if chosen == nil {
+	if len(visible) == 0 {
 		return json.RawMessage("null"), nil
 	}
-	var plan rolloutPlan
-	if err := json.Unmarshal([]byte(chosen.Plan), &plan); err != nil {
+
+	var bindings []desiredState
+	for _, chosen := range visible {
+		var plan rolloutPlan
+		if err := json.Unmarshal([]byte(chosen.Plan), &plan); err != nil {
+			continue
+		}
+		bundle, okB := plan.Artifacts["opa_bundle"]
+		controls, okC := plan.Artifacts["controls"]
+		manifest, okM := plan.Artifacts["manifest"]
+		if !okB || !okC || !okM {
+			continue
+		}
+		_, err := base64.StdEncoding.DecodeString(bundle.Body)
+		if err != nil {
+			continue
+		}
+		_, err = base64.StdEncoding.DecodeString(controls.Body)
+		if err != nil {
+			continue
+		}
+		manifestRaw, err := base64.StdEncoding.DecodeString(manifest.Body)
+		if err != nil {
+			continue
+		}
+		doc := desiredState{
+			WorkloadID: chosen.Workload,
+			Revision: chosen.Delivery, GraphRevision: chosen.Graph, ManifestID: chosen.PubID.String(),
+			PolicyFormat: models.RuntimePolicyFormatV1,
+			OPABundle: desiredArtifact{
+				URL: "/api/iga/v2/policy-artifacts/" + bundle.ID, SHA256: bundle.SHA256, RegoVersion: "v1",
+			},
+			Controls: desiredArtifact{
+				URL: "/api/iga/v2/policy-artifacts/" + controls.ID, SHA256: controls.SHA256,
+			},
+			SignedManifest: string(manifestRaw),
+			Mode:           plan.Mode,
+			Revoked:        plan.Revoked,
+		}
+		// Check if the target workload is quarantined.
+		var quarantined []struct{ N int }
+		if err := tx.Raw(`SELECT 1 AS n FROM runtime_policy_targets t
+			WHERE t.workspace_id = ? AND t.publication_id = ? AND t.collector_id = ?
+			  AND (
+			    EXISTS (
+			      SELECT 1 FROM discovered_agent_workloads w
+			      JOIN discovered_agents a ON a.workspace_id = w.workspace_id AND a.id = w.discovered_agent_id
+			      WHERE w.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
+			        AND w.link_state = 'accepted' AND a.status = 'quarantined'
+			    )
+			    OR EXISTS (
+			      SELECT 1 FROM agent_policies p
+			      JOIN discovered_agent_workloads w
+			        ON w.workspace_id = p.workspace_id AND w.discovered_agent_id = p.discovered_agent_id
+			      WHERE p.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
+			        AND p.enabled AND p.desired_state = 'quarantined' AND w.link_state = 'accepted'
+			    )
+			  )
+			LIMIT 1`, ws, chosen.PubID, collector).Scan(&quarantined).Error; err != nil {
+			continue
+		}
+		doc.Quarantine = len(quarantined) == 1
+		if inline {
+			bundleRaw, _ := base64.StdEncoding.DecodeString(bundle.Body)
+			controlsRaw, _ := base64.StdEncoding.DecodeString(controls.Body)
+			if len(bundleRaw)+len(controlsRaw) <= inlineArtifactLimit {
+				doc.OPABundle.Body = bundle.Body
+				doc.Controls.Body = controls.Body
+			}
+		}
+		bindings = append(bindings, doc)
+	}
+
+	if len(bindings) == 0 {
 		return json.RawMessage("null"), nil
 	}
-	bundle, okB := plan.Artifacts["opa_bundle"]
-	controls, okC := plan.Artifacts["controls"]
-	manifest, okM := plan.Artifacts["manifest"]
-	if !okB || !okC || !okM {
-		return json.RawMessage("null"), nil
-	}
-	bundleRaw, err := base64.StdEncoding.DecodeString(bundle.Body)
-	if err != nil {
-		return nil, err
-	}
-	controlsRaw, err := base64.StdEncoding.DecodeString(controls.Body)
-	if err != nil {
-		return nil, err
-	}
-	manifestRaw, err := base64.StdEncoding.DecodeString(manifest.Body)
-	if err != nil {
-		return nil, err
-	}
-	putBody := inline && len(bundleRaw)+len(controlsRaw) <= inlineArtifactLimit
-	doc := desiredState{
-		Revision: chosen.Delivery, GraphRevision: chosen.Graph, ManifestID: chosen.PubID.String(),
-		PolicyFormat: models.RuntimePolicyFormatV1,
-		OPABundle: desiredArtifact{
-			URL: "/api/iga/v2/policy-artifacts/" + bundle.ID, SHA256: bundle.SHA256, RegoVersion: "v1",
-		},
-		Controls: desiredArtifact{
-			URL: "/api/iga/v2/policy-artifacts/" + controls.ID, SHA256: controls.SHA256,
-		},
-		SignedManifest: string(manifestRaw),
-		Mode:           plan.Mode,
-		Revoked:        plan.Revoked,
-	}
-	var quarantined []struct{ N int }
-	if err := tx.Raw(`SELECT 1 AS n FROM runtime_policy_targets t
-		WHERE t.workspace_id = ? AND t.publication_id = ? AND t.collector_id = ?
-		  AND (
-		    EXISTS (
-		      SELECT 1 FROM discovered_agent_workloads w
-		      JOIN discovered_agents a ON a.workspace_id = w.workspace_id AND a.id = w.discovered_agent_id
-		      WHERE w.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
-		        AND w.link_state = 'accepted' AND a.status = 'quarantined'
-		    )
-		    OR EXISTS (
-		      SELECT 1 FROM agent_policies p
-		      JOIN discovered_agent_workloads w
-		        ON w.workspace_id = p.workspace_id AND w.discovered_agent_id = p.discovered_agent_id
-		      WHERE p.workspace_id = t.workspace_id AND w.workload_id = t.workload_id
-		        AND p.enabled AND p.desired_state = 'quarantined' AND w.link_state = 'accepted'
-		    )
-		  )
-		LIMIT 1`, ws, chosen.PubID, collector).Scan(&quarantined).Error; err != nil {
-		return nil, err
-	}
-	doc.Quarantine = len(quarantined) == 1
-	if putBody {
-		doc.OPABundle.Body = bundle.Body
-		doc.Controls.Body = controls.Body
-	}
-	raw, err := json.Marshal(doc)
+
+	// Return multi-binding format for the collector.
+	raw, err := json.Marshal(map[string]any{"bindings": bindings})
 	if err != nil {
 		return nil, err
 	}

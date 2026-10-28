@@ -2,6 +2,7 @@ package routes
 
 import (
 	"log"
+	"log/slog"
 	"time"
 
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
@@ -76,6 +77,11 @@ func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorCon
 	machine.GET("/policy-artifacts/:id", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), ctl.PolicyArtifact)
 	machine.GET("/receipts/:id", middlewares.RequireCollectorScope(models.CollectorScopeReceiptWrite), syncCtl.GetReceipt)
 
+	// Cursor-based runtime-policy sync for collectors.
+	policySyncSvc := services.NewPolicySyncService(db)
+	policySyncCtl := platformCtrl.NewPolicySyncController(policySyncSvc)
+	machine.POST("/collectors/self/runtime-policy-sync", middlewares.RequireCollectorScope(models.CollectorScopePolicyRead), policySyncCtl.Sync)
+
 	// Sync is on its own group so the body cap is the 2 MiB decompressed limit,
 	// not the 64 KiB enrollment cap. Auth still runs before the handler reads.
 	sync := v2.Group("")
@@ -85,5 +91,16 @@ func MountCollectorV2(r gin.IRouter, db *gorm.DB, ctl *platformCtrl.CollectorCon
 		middlewares.LimitBody(collectorcontract.DecompressedMaxBytes),
 	)
 	sync.POST("/agent-sync", middlewares.RequireCollectorScope(models.CollectorScopeIngest), syncCtl.AgentSync)
+
+	// Agent stream (WebSocket) — uses machine auth, no body limit (WebSocket frames).
+	streamCtl := platformCtrl.NewAgentStreamController(slog.Default())
+	stream := v2.Group("")
+	stream.Use(
+		middlewares.CollectorRateLimit(collectorRatePerMin, time.Minute),
+		middlewares.AuthenticateCollector(db, now),
+	)
+	stream.GET("/agent-stream", middlewares.RequireCollectorScope(models.CollectorScopeIngest), streamCtl.Upgrade)
+	stream.GET("/agent-stream/status", middlewares.RequireCollectorScope(models.CollectorScopeIngest), streamCtl.GetStatus)
+
 	return syncSvc
 }
