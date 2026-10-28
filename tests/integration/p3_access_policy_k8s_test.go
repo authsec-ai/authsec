@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -176,6 +177,12 @@ func TestAccessPolicyK8sLifecycle(t *testing.T) {
 	if list, _, err := k.svc.List(ctx, k.ws, services.AccessListQuery{Provider: "k8s"}); err != nil || len(list) != 1 {
 		t.Fatalf("list k8s: %v %v", list, err)
 	}
+	// Enforcement cannot be turned off while the agent still has a binding to put back.
+	am := services.NewActuationManager(k.db)
+	var inUse *services.ActuationInUseError
+	if err := am.DisableActuation(k.ws, k.src); !errors.As(err, &inUse) || inUse.AccessPolicy != 1 {
+		t.Fatalf("disable with an active block = %v, want ActuationInUseError{1 access policy}", err)
+	}
 
 	// A sweep well after the removal shows the subject back: removed again.
 	p3exec(t, k.db, `UPDATE iga_policy_assignment SET state = 'current', last_confirmed_at = now() + interval '1 hour'
@@ -210,6 +217,10 @@ func TestAccessPolicyK8sLifecycle(t *testing.T) {
 	}
 	if got, _ := k.svc.Get(ctx, k.ws, v.ID); got.Status != services.AccessStatusEnded {
 		t.Fatalf("ended: %s", got.Status)
+	}
+	// Restored and ended: now it can be turned off.
+	if err := am.DisableActuation(k.ws, k.src); err != nil {
+		t.Fatalf("disable after the block ended: %v", err)
 	}
 }
 

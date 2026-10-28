@@ -341,6 +341,21 @@ func (s *GovAccess) k8sChecks(ctx context.Context, ws uuid.UUID, p *accessPlan) 
 
 var k8sLiveStates = []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}
 
+// K8sAccessLiveOnSource counts the access-policy deployments still live on a
+// cluster's agent: a deployment it has yet to apply, or a removal it must
+// still put back. 0 when access policies on Kubernetes are not installed.
+func K8sAccessLiveOnSource(db *gorm.DB, ws, source uuid.UUID) (int64, error) {
+	if ok, _ := K8sAccessSchemaStatus(db); !ok { // TENANT-EXEMPT: Postgres catalog check, no tenant rows
+		return 0, nil
+	}
+	var n int64
+	err := tenancy.InWorkspaceRead(context.Background(), db, ws, func(tx *gorm.DB) error {
+		return tx.Model(&models.IGAGovK8sAccess{}).
+			Where("workspace_id = ? AND connector_id = ? AND state IN ?", ws, source, k8sLiveStates).Count(&n).Error
+	})
+	return n, err
+}
+
 // k8sSentence is the preview's sentence.
 func k8sSentence(in igagov.AccessIntent, kp *k8sPlan, names []string) string {
 	out := "Block all access on Kubernetes " + k8sRoleKind(kp.role) + " " + kp.roleName + " (cluster " + kp.role.Cluster + ") for " + strings.Join(names, ", ")

@@ -42,6 +42,13 @@ type ActuationManager interface {
 	// hash is stored.
 	EnableActuation(workspaceID, sourceID uuid.UUID) (token string, err error)
 
+	// DisableActuation turns a cluster's enforcement off: its token stops working
+	// and the cluster reports under its discovery ingest token again. Refused
+	// (*ActuationInUseError) while anything it enforces is still in force -- a
+	// quarantine, a live access policy, an open instruction -- because the agent
+	// could then no longer undo it.
+	DisableActuation(workspaceID, sourceID uuid.UUID) error
+
 	// AuthenticateAgent resolves a presented token to its connector. The token
 	// identifies WHICH cluster is calling, so an agent never asserts its own identity.
 	AuthenticateAgent(token string) (*models.DiscoverySource, error)
@@ -171,6 +178,63 @@ func (m *actuationManager) EnableActuation(workspaceID, sourceID uuid.UUID) (str
 	// Returned once. Re-enabling mints a new token and invalidates the old one, which is
 	// the rotation path.
 	return token, nil
+}
+
+// ActuationInUseError is DisableActuation's refusal: what still needs the
+// cluster's agent to act, by kind.
+type ActuationInUseError struct {
+	Quarantined  int64 `json:"quarantined"`
+	AccessPolicy int64 `json:"access_policies"`
+	Instructions int64 `json:"open_instructions"`
+}
+
+func (e *ActuationInUseError) Error() string {
+	return fmt.Sprintf("enforcement is in use on this cluster: %d quarantined agent(s), %d live access-policy deployment(s), "+
+		"%d open instruction(s); release and end them first, or the agent could not undo them", e.Quarantined, e.AccessPolicy, e.Instructions)
+}
+
+func (m *actuationManager) DisableActuation(workspaceID, sourceID uuid.UUID) error {
+	var src models.DiscoverySource
+	if err := m.db.First(&src, "id = ? AND workspace_id = ?", sourceID, workspaceID).Error; err != nil {
+		return err
+	}
+	if src.ActuationTokenHash == "" {
+		return nil // already off
+	}
+	var use ActuationInUseError
+	if err := m.db.Model(&models.DiscoveredAgent{}).
+		Where("workspace_id = ? AND discovery_source_id = ? AND status = ?", workspaceID, sourceID, models.DiscoveredAgentQuarantined).
+		Count(&use.Quarantined).Error; err != nil {
+		return err
+	}
+	if err := m.db.Model(&models.ProvisioningInstruction{}).
+		Where("workspace_id = ? AND discovery_source_id = ? AND status IN ?", workspaceID, sourceID,
+			[]string{models.InstructionPending, models.InstructionLeased}).
+		Count(&use.Instructions).Error; err != nil {
+		return err
+	}
+	n, err := K8sAccessLiveOnSource(m.db, workspaceID, sourceID)
+	if err != nil {
+		return err
+	}
+	use.AccessPolicy = n
+	if use.Quarantined+use.Instructions+use.AccessPolicy > 0 {
+		return &use
+	}
+	// The token goes, and so does what the agent last reported it could do: the
+	// console must not show a power the cluster can no longer use.
+	return m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ?", sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash":    "",
+			"actuation_enabled_at":    nil,
+			"enforcement_mode":        "",
+			"enforcement_bindings":    false,
+			"enforcement_evict":       false,
+			"enforcement_delete":      false,
+			"enforcement_force_evict": false,
+			"updated_at":              time.Now(),
+		}).Error
 }
 
 func (m *actuationManager) AuthenticateAgent(token string) (*models.DiscoverySource, error) {

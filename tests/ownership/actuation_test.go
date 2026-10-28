@@ -10,6 +10,7 @@
 package ownership
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // actFixture registers a connector, enables actuation on it, and attributes a
@@ -127,6 +129,59 @@ func TestReEnablingRotatesTheToken(t *testing.T) {
 	}
 	if _, err := f.am.AuthenticateAgent(newToken); err != nil {
 		t.Errorf("the new token must work: %v", err)
+	}
+}
+
+// Enforcement can be turned off: the token stops working, the reported powers
+// go, and turning it off again is harmless. Refused while a quarantine or an
+// open instruction still needs the agent, and another workspace's cluster is
+// not found.
+func TestDisablingActuation(t *testing.T) {
+	f := newActFixture(t)
+
+	// In force: a quarantine (which also queues its NetworkPolicy instruction).
+	if _, err := f.dm.QuarantineAgent(f.ws, f.agent, "demo", nil); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	err := f.am.DisableActuation(f.ws, f.source)
+	var inUse *services.ActuationInUseError
+	if !errors.As(err, &inUse) || inUse.Quarantined != 1 || inUse.Instructions != 1 {
+		t.Fatalf("disable with a quarantine in force = %v, want ActuationInUseError{1 quarantined, 1 instruction}", err)
+	}
+	if _, err := f.am.AuthenticateAgent(f.token); err != nil {
+		t.Fatalf("a refused disable must leave the token working: %v", err)
+	}
+
+	// Released and applied: nothing left for the agent to do.
+	exec(t, f.raw, `UPDATE discovered_agents SET status = 'unregistered' WHERE id = $1`, f.agent)
+	exec(t, f.raw, `UPDATE provisioning_instructions SET status = 'applied', applied_at = now() WHERE discovery_source_id = $1`, f.source)
+	exec(t, f.raw, `UPDATE discovery_sources SET enforcement_mode = 'observe', enforcement_bindings = true WHERE id = $1`, f.source)
+
+	// Another workspace's cluster: not found, and nothing changes.
+	if err := f.am.DisableActuation(uuid.New(), f.source); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("another workspace's cluster = %v, want not found", err)
+	}
+	if _, err := f.am.AuthenticateAgent(f.token); err != nil {
+		t.Fatalf("another workspace's disable changed this cluster: %v", err)
+	}
+
+	if err := f.am.DisableActuation(f.ws, f.source); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if _, err := f.am.AuthenticateAgent(f.token); err == nil {
+		t.Fatal("the token must stop working once enforcement is off")
+	}
+	var hash, mode string
+	var bindings bool
+	if err := f.raw.QueryRow(`SELECT actuation_token_hash, enforcement_mode, enforcement_bindings FROM discovery_sources WHERE id = $1`,
+		f.source).Scan(&hash, &mode, &bindings); err != nil {
+		t.Fatal(err)
+	}
+	if hash != "" || mode != "" || bindings {
+		t.Fatalf("after disable: hash set=%v mode=%q bindings=%v, want all cleared", hash != "", mode, bindings)
+	}
+	if err := f.am.DisableActuation(f.ws, f.source); err != nil {
+		t.Fatalf("disabling twice: %v", err)
 	}
 }
 

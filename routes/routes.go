@@ -1997,6 +1997,8 @@ func SetupRoutes(
 			// the instruction list is a read.
 			governance.POST("/connectors/:id/actuation",
 				middlewares.Require("governance", "admin"), governanceController.EnableActuation)
+			governance.DELETE("/connectors/:id/actuation",
+				middlewares.Require("governance", "admin"), governanceController.DisableActuation)
 			governance.GET("/instructions",
 				middlewares.Require("governance", "read"), governanceController.ListInstructions)
 
