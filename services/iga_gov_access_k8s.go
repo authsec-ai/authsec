@@ -303,6 +303,7 @@ func k8sRoleKind(k k8sgraph.ObjectKey) string {
 // is checked, and the agent itself refuses what it may not do.
 type k8sAgentLimits struct {
 	canAct     bool
+	allRoles   bool
 	roles      []string
 	namespaces []string
 	cluster    *bool
@@ -320,6 +321,11 @@ func k8sAgentLimitsOf(src []models.DiscoverySource) *k8sAgentLimits {
 	}
 	if json.Unmarshal(src[0].Runtime, &rt) == nil {
 		lim.roles, lim.namespaces, lim.cluster = rt.Roles, rt.Namespaces, rt.Cluster
+	}
+	if containsString(lim.roles, "*") {
+		// Every role (iga-agent 0.6.2+), ClusterRoleBindings included; the
+		// agent itself refuses system: roles and the cluster's own namespaces.
+		lim.allRoles, lim.roles = true, nil
 	}
 	return lim
 }
@@ -352,10 +358,13 @@ func (s *GovAccess) k8sChecks(ctx context.Context, ws uuid.UUID, p *accessPlan) 
 				case !lim.canAct:
 					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change bindings: turn enforcement on for it (Connections > the cluster > Enforcement), and turn on enforcement.bindings in its chart with "+p.k8s.role.Name+" in enforcement.bindings.roles.",
 						map[string]any{"field": "resource.resource_id", "connector_id": b.connector})
+				case strings.HasPrefix(p.k8s.role.Name, "system:"):
+					refuse("AuthSec never changes bindings of the cluster's own system: roles.",
+						map[string]any{"field": "resource.resource_id", "role": p.k8s.role.Name})
 				case lim.roles != nil && !containsString(lim.roles, p.k8s.role.Name):
 					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change bindings of "+p.k8s.role.Name+" yet: add it to enforcement.bindings.roles in its chart.",
 						map[string]any{"field": "resource.resource_id", "connector_id": b.connector, "role": p.k8s.role.Name, "allowed_roles": lim.roles})
-				case k8sBindingKind(b.key) == models.K8sKindClusterRoleBinding && lim.cluster != nil && !*lim.cluster:
+				case k8sBindingKind(b.key) == models.K8sKindClusterRoleBinding && lim.cluster != nil && !*lim.cluster && !lim.allRoles:
 					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change ClusterRoleBindings: turn on enforcement.bindings.clusterWide in its chart.",
 						map[string]any{"field": "resource.resource_id", "connector_id": b.connector, "role": p.k8s.role.Name})
 				case k8sBindingKind(b.key) == models.K8sKindRoleBinding && len(lim.namespaces) > 0 && !containsString(lim.namespaces, b.key.Namespace) && (lim.cluster == nil || !*lim.cluster):

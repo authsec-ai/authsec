@@ -269,6 +269,16 @@ func TestAccessPolicyK8sRefusals(t *testing.T) {
 	if got := previewCode(k.svc.Preview(ctx, k.ws, k.intent("block", []uuid.UUID{k.booker}, "all"))); got != "" {
 		t.Fatalf("role allowed in every namespace: %s", got)
 	}
+	// Every role (iga-agent 0.6.2+): no role to allow, ever; a namespace list,
+	// when the chart sets one, still confines RoleBindings, as in the agent.
+	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = '{"binding_roles":["*"],"cluster_bindings":false}' WHERE id = ?`, k.src)
+	if got := previewCode(k.svc.Preview(ctx, k.ws, k.intent("block", []uuid.UUID{k.booker}, "all"))); got != "" {
+		t.Fatalf("every role allowed: %s", got)
+	}
+	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = '{"binding_roles":["*"],"binding_namespaces":["elsewhere"],"cluster_bindings":false}' WHERE id = ?`, k.src)
+	if got := previewCode(k.svc.Preview(ctx, k.ws, k.intent("block", []uuid.UUID{k.booker}, "all"))); got != services.GovCodeK8sAgentCannotAct {
+		t.Fatalf("every role, confined to another namespace: %s", got)
+	}
 	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = '{}' WHERE id = ?`, k.src)
 
 	// A second block on the same subject and binding is refused.
