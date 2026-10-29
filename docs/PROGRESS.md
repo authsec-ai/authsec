@@ -4,6 +4,15 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-29 (cont.) — Kubernetes onboarding without cloning anything (UI-061)
+
+- The iga-agent chart is published as an OCI artifact beside the image: `oci://docker-repo-public.authnull.com/charts/authsec-iga-agent` (pulls are anonymous, checked). `make chart-push` publishes it, `make release` pushes the image under its appVersion and then the chart. `image.tag` defaults to the appVersion, not the mutable `production` tag (which points at an old build reporting "dev").
+- Add connection > Kubernetes is one dialog: a cluster name, optional namespaces to enforce in, and the command with everything filled in (chart and version, `VITE_API_URL`, workspace, a new ingest token). It waits for the agent to register and links to it. The old five-step wizard is gone: its chart path needed a clone, its control plane URL was the console's, it set no ingest token, and its hand-made row's name collided with the agent's registration.
+- Enforcement and Scope commands name the same published chart.
+- To do: push chart 0.6.0 (`make chart-push` in iga-agent; the automated push was refused by the session's permission check as a new public surface).
+
+---
+
 ## 2026-10-29 — Enforcement turns on from the console alone (UI-060)
 
 - Why: turning enforcement on still meant copying a token into a Secret and a Helm upgrade that swapped the agent's discovery credential, and discovery was refused until that ran. On k3s-master the upgrade failed (no `actuation.namespaces`) and discovery was 401 again.
