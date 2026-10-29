@@ -11,6 +11,7 @@ Newest first. Each session records what was done, what was learned, and what's n
 - UI: the setup dialog has "Let AuthSec enforce" instead of namespaces; the Enforcement tab has no namespace fields and says why access policies are off.
 - AS-169: on omniman, support-bot showed "0 rules" after k3s-master's connection was removed and re-created (a read-only query on the replica showed its new grants ended `subject_retired` each sweep). The sweep's assignment-id lookup returned the removed connection's ended row for the same binding key; it now reads live rows only.
 - UI-063 (owner's call after testing research-bot: per-role allowing does not scale): access policies act on every role (`enforcement.bindings.roles="*"`, iga-agent 0.6.2), installed by the console's setup command. The agent restores only subjects it recorded removing and never touches system: roles or the cluster's own namespaces.
+- AS-170: upgrading k3s-master's agent to every role stranded support-bot (removed by 0.6.1, no receipt; restore refused). Restored by hand; 0.6.3 adds `enforcement.bindings.legacyRoles`, filled in by the console, so older removals stay restorable across the upgrade.
 - To do: release iga-agent 0.6.1 (`make release` in iga-agent; the session's push was refused as a new public surface). The UI's commands name chart 0.6.1, so release it before deploying this UI.
 
 ---
