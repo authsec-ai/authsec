@@ -312,7 +312,7 @@ func (s *GovAccess) k8sChecks(ctx context.Context, ws uuid.UUID, p *accessPlan) 
 					}
 					if len(src) == 0 || src[0].ActuationTokenHash == "" || !src[0].EnforcementBindings {
 						errs = append(errs, govUnprocessable(GovCodeK8sAgentCannotAct,
-							"The agent in cluster "+p.k8s.role.Cluster+" may not change bindings: give it an actuation token, turn on enforcement.bindings in its chart and list "+p.k8s.role.Name+" in enforcement.bindings.roles.",
+							"The agent in cluster "+p.k8s.role.Cluster+" may not change bindings: turn enforcement on for it (Connections > the cluster > Enforcement), and turn on enforcement.bindings in its chart with "+p.k8s.role.Name+" in enforcement.bindings.roles.",
 							map[string]any{"field": "resource.resource_id", "connector_id": b.connector}))
 					}
 				}
