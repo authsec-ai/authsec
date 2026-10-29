@@ -85,9 +85,13 @@ const (
 // AuthSec's credentials, which are not what the connection records.
 func (s *AzureOnboardingService) resolveDiscoveryConfig(workspaceID uuid.UUID, tenantID string) (azure.AppConfig, error) {
 	tc, err := s.connectors.GetByScope(workspaceID, models.CloudProviderAzure, tenantID)
-	if err != nil || tc == nil {
+	if errors.Is(err, repositories.ErrCloudConnectorNotFound) {
 		// No tenant connector (a subscription-only run): AuthSec's app.
 		return s.cfg, nil
+	}
+	if err != nil {
+		// The connector could not be read: which app it uses is unknown.
+		return azure.AppConfig{}, fmt.Errorf("read the tenant connector: %w", err)
 	}
 	return s.resolveAppConfig(tc)
 }
@@ -121,9 +125,12 @@ func (s *AzureOnboardingService) startDiscovery(workspaceID uuid.UUID, tenantID 
 		if err != nil {
 			log.Printf("[azure] discovery of tenant %s not started: its credentials could not be read: %v", tenantID, err)
 			if tenantConnectorID != nil {
-				if _, mErr := s.connectors.MarkError(workspaceID, *tenantConnectorID,
-					"AuthSec could not read the stored credentials of your app, so this tenant was not read; "+
-						"connect it again with your app's client secret", ConnErrCredentialInvalid); mErr != nil {
+				msg, code := "AuthSec could not read the stored credentials of your app, so this tenant was not read; "+
+					"connect it again with your app's client secret", ConnErrCredentialInvalid
+				if errors.Is(err, azure.ErrNotConfigured) && strings.Contains(err.Error(), "AuthSec's Azure app") {
+					msg, code = err.Error(), ConnErrDeployment
+				}
+				if _, mErr := s.connectors.MarkError(workspaceID, *tenantConnectorID, msg, code); mErr != nil {
 					log.Printf("[azure] could not record the credential failure on tenant %s: %v", tenantID, mErr)
 				}
 			}
@@ -362,6 +369,12 @@ func (s *AzureOnboardingService) runTenantScan(ctx context.Context, workspaceID,
 	// The organization's Teams apps with a bot (azure_agent_sources.go).
 	teamsAgents, teamsRead := s.readTeamsAgents(ctx, graphToken, surfaces, counters, ungranted)
 
+	// The tenant's name, so the console need not show its id. Best effort:
+	// an unread name keeps the one the last pass stored.
+	org, orgErr := s.api.GetOrganization(ctx, graphToken)
+	if orgErr != nil {
+		logAzureError("read organization", orgErr)
+	}
 	licensing, sc := s.readLicensing(ctx, graphToken)
 	surfaces[models.SurfaceEntraLicenses] = sc
 	activity, sc := s.readSignInActivity(ctx, graphToken)
@@ -564,6 +577,9 @@ func (s *AzureOnboardingService) runTenantScan(ctx context.Context, workspaceID,
 	}
 	if teamsRead {
 		patch["teams_agents"] = teamsAgents
+	}
+	if orgErr == nil && strings.TrimSpace(org.DisplayName) != "" {
+		patch["tenant_display_name"] = strings.TrimSpace(org.DisplayName)
 	}
 	if licensing != nil {
 		// What the sign-in read proved outranks what the plan list implies.

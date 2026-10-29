@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +48,13 @@ const (
 	GovCodeAzureWriteMissing = "azure_write_access_missing"
 	GovCodeAzureInherited    = "azure_inherited_access"
 	GovCodeAzureUnavailable  = "azure_unavailable"
+	// GovCodeAzureConflict: a block and an allow would act on the same
+	// principal and resource at once (Azure has no deny to settle it).
+	GovCodeAzureConflict = "azure_policy_conflict"
+	// GovCodeAzureDataUnclassified: the principal holds a role with data
+	// access on this resource type that a read, write or delete block cannot
+	// map yet; only "all" removes it.
+	GovCodeAzureDataUnclassified = "azure_data_access_unclassified"
 )
 
 // AzureRBACClient is the role-assignment surface access policies use
@@ -53,10 +62,42 @@ const (
 type AzureRBACClient interface {
 	ListRoleAssignmentsForPrincipal(ctx context.Context, armToken, subscriptionID, principalID string) ([]azure.RoleAssignment, error)
 	ListRoleDefinitions(ctx context.Context, armToken, subscriptionID string) ([]azure.RoleDefinition, error)
+	GetResourceProperties(ctx context.Context, armToken, resourceID, apiVersion string) (map[string]any, error)
 	PutRoleAssignment(ctx context.Context, armToken string, spec azure.RoleAssignmentSpec) (string, error)
 	GetRoleAssignment(ctx context.Context, armToken, id string) (*azure.RoleAssignment, error)
 	DeleteRoleAssignment(ctx context.Context, armToken, id string) error
 	CallerPermissions(ctx context.Context, armToken, subscriptionID string) ([]azure.Permission, error)
+	ListRoleAssignmentScheduleInstances(ctx context.Context, armToken, scope, principalID string) ([]azure.RoleAssignmentScheduleInstance, error)
+}
+
+// GovCodeAzureTimeBound: an assignment the block would remove is a PIM
+// activation or has an end of its own: restoring it at the end would make it
+// permanent (AS-135).
+const GovCodeAzureTimeBound = "azure_time_bound_assignment"
+
+// azureTimeBound is the assignments among rev that Privileged Identity
+// Management says expire on their own (an activation, or an end date).
+func azureTimeBound(ctx context.Context, rbac AzureRBACClient, token, subscriptionID, principalID string, rev []azure.RoleAssignment) ([]azure.RoleAssignment, error) {
+	if len(rev) == 0 {
+		return nil, nil
+	}
+	inst, err := rbac.ListRoleAssignmentScheduleInstances(ctx, token, "/subscriptions/"+subscriptionID, principalID)
+	if err != nil {
+		return nil, err
+	}
+	bound := map[string]bool{}
+	for _, i := range inst {
+		if i.TimeBound() && i.OriginRoleAssignmentID != "" {
+			bound[strings.ToLower(i.OriginRoleAssignmentID)] = true
+		}
+	}
+	var out []azure.RoleAssignment
+	for _, a := range rev {
+		if bound[strings.ToLower(a.ID)] {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // AzureAccessDeps is the process's Azure access: the client and an ARM token
@@ -164,7 +205,7 @@ func resolveAzureTarget(tx *gorm.DB, ws uuid.UUID, row models.IGAResource) (*azu
 	} else {
 		return nil, govUnprocessable(GovCodeResourceNotSupported, "Pick a resource, not a resource group or subscription.", map[string]any{"field": "resource.resource_id"})
 	}
-	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	t.Storage = azureIsStorage(t.TypePath)
 	var conns []models.CloudConnector
 	if err := tx.Where("workspace_id = ? AND provider = ? AND scope_kind = ? AND lower(scope_id) = ? AND status = ?",
 		ws, models.CloudProviderAzure, models.CloudScopeSubscription, t.SubscriptionID, models.CloudConnectorActive).
@@ -177,6 +218,12 @@ func resolveAzureTarget(tx *gorm.DB, ws uuid.UUID, row models.IGAResource) (*azu
 	}
 	t.ConnectorID = conns[0].ID
 	return t, nil
+}
+
+// azureIsStorage: the account (every data service) or its blobs; queues,
+// tables and file shares are data planes of their own.
+func azureIsStorage(typePath string) bool {
+	return typePath == "microsoft.storage/storageaccounts" || strings.HasPrefix(typePath, "microsoft.storage/storageaccounts/blobservices")
 }
 
 func indexOf(s []string, v string) int {
@@ -192,17 +239,38 @@ func indexOf(s []string, v string) int {
 // (control-plane actions, and for storage the blob data actions and the key
 // listing that gives the same data access).
 func azureActions(t *azureTarget, access []string) (actions, dataActions []string) {
+	dp := azureDataPlaneOf(t)
 	for _, a := range access {
+		if dp != nil {
+			// A mapped data plane: its data and key actions, and for "all" the
+			// management ones too (below).
+			acts, data := dp.dataActionsOf([]string{a})
+			actions, dataActions = append(actions, acts...), append(dataActions, data...)
+			if a != igagov.AccessAll {
+				continue
+			}
+		}
+		// The whole account also covers its queues, tables and file shares.
+		account := t.TypePath == "microsoft.storage/storageaccounts"
 		switch {
 		case t.Storage && a == igagov.AccessRead:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueRead...), tableRead...), fileRead...)
+			}
+			actions = append(actions, storageKeys...)
 		case t.Storage && a == igagov.AccessWrite:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueWrite...), tableWrite...), fileWrite...)
+			}
+			actions = append(actions, storageKeys...)
 		case t.Storage && a == igagov.AccessDelete:
 			dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete")
-			actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+			if account {
+				dataActions = append(append(append(dataActions, queueDel...), tableDel...), fileDel...)
+			}
+			actions = append(actions, storageKeys...)
 		case a == igagov.AccessRead:
 			actions = append(actions, t.TypePath+"/read")
 		case a == igagov.AccessWrite:
@@ -212,99 +280,19 @@ func azureActions(t *azureTarget, access []string) (actions, dataActions []strin
 		case a == igagov.AccessAll:
 			actions = append(actions, t.TypePath+"/read", t.TypePath+"/write", t.TypePath+"/delete")
 			if t.Storage {
-				actions = append(actions, "Microsoft.Storage/storageAccounts/listKeys/action")
+				actions = append(actions, storageKeys...)
 				dataActions = append(dataActions, "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
 					"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
 					"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete")
+				if account {
+					for _, l := range [][]string{queueRead, queueWrite, queueDel, tableRead, tableWrite, tableDel, fileRead, fileWrite, fileDel} {
+						dataActions = append(dataActions, l...)
+					}
+				}
 			}
-		}
-	}
-	// Other data planes: their data actions and key listings, in addition to
-	// the management actions above (a role granting only the data, such as
-	// Search Index Data Reader, grants no management action at all).
-	if dp, ok := azureDataPlaneOf(t); ok {
-		for _, a := range access {
-			switch a {
-			case igagov.AccessRead:
-				dataActions = append(dataActions, dp.read...)
-			case igagov.AccessWrite:
-				dataActions = append(dataActions, dp.write...)
-			case igagov.AccessDelete:
-				dataActions = append(dataActions, dp.del...)
-			case igagov.AccessAll:
-				dataActions = append(append(append(dataActions, dp.read...), dp.write...), dp.del...)
-			}
-			actions = append(actions, dp.keys...)
 		}
 	}
 	return sortedUniqueStrings(actions), sortedUniqueStrings(dataActions)
-}
-
-// azureDataPlane is a resource type whose data is reached through data
-// actions (and keys) rather than its management actions. Storage accounts are
-// handled above, as they were first.
-type azureDataPlane struct {
-	read, write, del []string // the data actions each access level stands for
-	// keys are management actions that hand out keys with the same data
-	// access, as storage's listKeys does.
-	keys []string
-	// The built-in roles an allow assigns (GUID, name). writeRole includes
-	// reading where the service has such a role (Search, Key Vault); where the
-	// sending role cannot read (Service Bus, Event Hubs), bothRole is the one
-	// for read and write together.
-	readRole, readRoleName, writeRole, writeRoleName, bothRole, bothRoleName string
-	// note is said in the preview for this type.
-	note string
-}
-
-// azureDataPlanes are keyed by ARM type (lowercase); a child type
-// (microsoft.servicebus/namespaces/queues) uses its parent's entry.
-var azureDataPlanes = map[string]azureDataPlane{
-	"microsoft.search/searchservices": {
-		read:     []string{"Microsoft.Search/searchServices/indexes/documents/read"},
-		write:    []string{"Microsoft.Search/searchServices/indexes/documents/write"},
-		del:      []string{"Microsoft.Search/searchServices/indexes/documents/delete"},
-		keys:     []string{"Microsoft.Search/searchServices/listQueryKeys/action", "Microsoft.Search/searchServices/listAdminKeys/action"},
-		readRole: azure.RoleSearchIndexDataReader, readRoleName: "Search Index Data Reader",
-		writeRole: azure.RoleSearchIndexDataContributor, writeRoleName: "Search Index Data Contributor",
-		note: "A search service whose API keys are enabled can still be queried with a key held elsewhere; turning key access off in Azure closes that.",
-	},
-	"microsoft.keyvault/vaults": {
-		read:     []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action"},
-		write:    []string{"Microsoft.KeyVault/vaults/secrets/setSecret/action"},
-		del:      []string{"Microsoft.KeyVault/vaults/secrets/delete"},
-		readRole: azure.RoleKeyVaultSecretsUser, readRoleName: "Key Vault Secrets User",
-		writeRole: azure.RoleKeyVaultSecretsOfficer, writeRoleName: "Key Vault Secrets Officer",
-		note: "Covers secrets in a vault that uses Azure RBAC. A vault that uses access policies grants through them, which AuthSec does not change.",
-	},
-	"microsoft.servicebus/namespaces": {
-		read:     []string{"Microsoft.ServiceBus/namespaces/messages/receive/action"},
-		write:    []string{"Microsoft.ServiceBus/namespaces/messages/send/action"},
-		keys:     []string{"Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"},
-		readRole: azure.RoleServiceBusDataReceiver, readRoleName: "Azure Service Bus Data Receiver",
-		writeRole: azure.RoleServiceBusDataSender, writeRoleName: "Azure Service Bus Data Sender",
-		bothRole: azure.RoleServiceBusDataOwner, bothRoleName: "Azure Service Bus Data Owner",
-	},
-	"microsoft.eventhub/namespaces": {
-		read:     []string{"Microsoft.EventHub/namespaces/messages/receive/action"},
-		write:    []string{"Microsoft.EventHub/namespaces/messages/send/action"},
-		keys:     []string{"Microsoft.EventHub/namespaces/authorizationRules/listKeys/action"},
-		readRole: azure.RoleEventHubsDataReceiver, readRoleName: "Azure Event Hubs Data Receiver",
-		writeRole: azure.RoleEventHubsDataSender, writeRoleName: "Azure Event Hubs Data Sender",
-		bothRole: azure.RoleEventHubsDataOwner, bothRoleName: "Azure Event Hubs Data Owner",
-	},
-}
-
-func azureDataPlaneOf(t *azureTarget) (azureDataPlane, bool) {
-	if t.Storage {
-		return azureDataPlane{}, false
-	}
-	for typ, dp := range azureDataPlanes {
-		if t.TypePath == typ || strings.HasPrefix(t.TypePath, typ+"/") {
-			return dp, true
-		}
-	}
-	return azureDataPlane{}, false
 }
 
 // azureAllowRole is the built-in role an allow assigns.
@@ -313,13 +301,14 @@ func azureAllowRole(t *azureTarget, access []string) (guid, name string) {
 	for _, a := range access {
 		writes = writes || a == igagov.AccessWrite || a == igagov.AccessDelete
 	}
-	if dp, ok := azureDataPlaneOf(t); ok && dp.readRole != "" {
+	if dp := azureDataPlaneOf(t); dp != nil {
 		reads := false
 		for _, a := range access {
-			reads = reads || a == igagov.AccessRead
+			reads = reads || a == igagov.AccessRead || a == igagov.AccessAll
 		}
 		switch {
 		case writes && reads && dp.bothRole != "":
+			// Service Bus and Event Hubs: the sending role cannot receive.
 			return dp.bothRole, dp.bothRoleName
 		case writes:
 			return dp.writeRole, dp.writeRoleName
@@ -356,13 +345,127 @@ func roleGrants(def azure.RoleDefinition, actions, dataActions []string) bool {
 	return false
 }
 
+// azureNamespace is the target's resource provider ("microsoft.keyvault").
+func azureNamespace(t *azureTarget) string {
+	if i := strings.Index(t.TypePath, "/"); i > 0 {
+		return t.TypePath[:i]
+	}
+	return t.TypePath
+}
+
+// roleDataIn reports whether a role grants data actions under ns (a provider
+// or a plane's prefix), or every data action.
+func roleDataIn(def azure.RoleDefinition, ns string) bool {
+	if ns == "" {
+		return false
+	}
+	for _, p := range def.Properties.Permissions {
+		for _, a := range p.DataActions {
+			if dataPatternIn(strings.ToLower(a), ns) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dataPatternIn reports whether a lower-case data-action pattern can match
+// an action under ns: it starts with ns, or its text before a "*" is a
+// prefix of ns ("microsoft.storage/*" reaches the queue service).
+func dataPatternIn(a, ns string) bool {
+	if a == "*" || strings.HasPrefix(a, ns+"/") {
+		return true
+	}
+	if i := strings.Index(a, "*"); i >= 0 {
+		return strings.HasPrefix(ns+"/", a[:i])
+	}
+	return false
+}
+
+func accessHasAll(access []string) bool {
+	for _, a := range access {
+		if a == igagov.AccessAll {
+			return true
+		}
+	}
+	return false
+}
+
+// azureGrants reports whether a block of access on t removes an assignment of
+// def: its actions match (storage's and the mapped data planes' data and key
+// actions, other types' management actions); for a type other than storage
+// "all" also takes every role with data access in the type's provider,
+// including data the planes do not map (Key Vault keys or certificates).
+func azureGrants(t *azureTarget, access []string, def azure.RoleDefinition, actions, dataActions []string) bool {
+	if roleGrants(def, actions, dataActions) {
+		return true
+	}
+	return !t.Storage && accessHasAll(access) && roleDataIn(def, azureDataNS(t))
+}
+
+// azureScopeCovers reports whether an assignment at scope lies on outer or
+// below it.
+func azureScopeCovers(outer, scope string) bool {
+	outer = strings.ToLower(strings.TrimSuffix(outer, "/"))
+	scope = strings.ToLower(strings.TrimSuffix(scope, "/"))
+	return scope == outer || strings.HasPrefix(scope, outer+"/")
+}
+
+// azureTargetOfScope rebuilds the target of a stored row's scope.
+func azureTargetOfScope(scope, subscriptionID string) *azureTarget {
+	segs := strings.Split(strings.TrimPrefix(strings.ToLower(scope), "/"), "/")
+	t := &azureTarget{Scope: strings.ToLower(strings.TrimSuffix(scope, "/")), SubscriptionID: subscriptionID}
+	if i := indexOf(segs, "providers"); i >= 0 && i+2 < len(segs) {
+		tp := []string{segs[i+1], segs[i+2]}
+		for j := i + 4; j < len(segs); j += 2 {
+			tp = append(tp, segs[j])
+		}
+		t.TypePath = strings.Join(tp, "/")
+	}
+	t.Storage = azureIsStorage(t.TypePath)
+	return t
+}
+
+// withoutNames drops the assignments named in skip (AuthSec's own allows).
+func withoutNames(as []azure.RoleAssignment, skip map[string]bool) []azure.RoleAssignment {
+	if len(skip) == 0 {
+		return as
+	}
+	out := as[:0:0]
+	for _, a := range as {
+		if !skip[strings.ToLower(a.Name)] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+var azureLiveStates = []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}
+
+// azureAllowNames are the role assignment names AuthSec's allows hold for the
+// principal in the workspace: a block never removes them (it would record
+// one and later restore it as standing access).
+func azureAllowNames(tx *gorm.DB, ws uuid.UUID, principal string) (map[string]bool, error) {
+	var names []string
+	if err := tx.Model(&models.IGAGovAzureAccess{}).
+		Where("workspace_id = ? AND principal_id = ? AND effect = ? AND state IN ? AND assignment_name <> ''", ws, principal, "allow", azureLiveStates).
+		Pluck("assignment_name", &names).Error; err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, n := range names {
+		out[strings.ToLower(n)] = true
+	}
+	return out, nil
+}
+
 // azureSplit sorts a principal's assignments that grant the access into those
 // on the resource or below it (revocable) and those at a broader scope
 // (inherited: a block on one resource cannot remove them).
-func azureSplit(t *azureTarget, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, actions, dataActions []string) (revocable, inherited []azure.RoleAssignment) {
+func azureSplit(t *azureTarget, access []string, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, actions, dataActions []string) (revocable, inherited []azure.RoleAssignment) {
 	for _, a := range as {
 		def, ok := defs[strings.ToLower(a.Properties.RoleDefinitionID)]
-		if !ok || !roleGrants(def, actions, dataActions) {
+		if !ok || !azureGrants(t, access, def, actions, dataActions) {
 			continue
 		}
 		scope := strings.ToLower(strings.TrimSuffix(a.Properties.Scope, "/"))
@@ -425,17 +528,46 @@ func (s *GovAccess) planAzure(ctx context.Context, ws uuid.UUID, p *accessPlan, 
 	}); err != nil {
 		return err
 	}
+	if dp := azureDataPlaneOf(&ap.target); dp != nil {
+		if dp.noDelete && slices.Contains(p.intent.Access, igagov.AccessDelete) {
+			return govUnprocessable(GovCodeAccessInvalid, "There is nothing to delete in "+dp.what+": receiving removes them. Choose read, write or all.",
+				map[string]any{"field": "access"})
+		}
+	}
+	if p.intent.Effect == igagov.AccessEffectAllow && ap.target.TypePath == "microsoft.storage/storageaccounts" {
+		p.warnings = append(p.warnings, AccessIssue{Code: "azure_allow_blobs_only",
+			Message: "An allow on a storage account gives blob access. To allow a queue, table or file share, choose it instead."})
+	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		ap.roleGUID, ap.roleName = azureAllowRole(&ap.target, p.intent.Access)
 		if ap.roleGUID == azure.RoleContributor {
 			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
 				Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on this resource type: Contributor allows every management write on it."})
 		}
+		dp := azureDataPlaneOf(&ap.target)
+		if dp != nil && dp.bothRole != "" && ap.roleGUID == dp.bothRole {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+				Message: "Azure has no built-in role that only receives and sends " + dp.what + ": " + ap.roleName + " also manages the namespace and its entities. Allow read and write in two policies to avoid that."})
+		}
+		if dp != nil && ap.roleGUID == dp.readRole && dp.readRoleAlso != "" {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+				Message: "Azure has no built-in role for only reading " + dp.what + ": " + ap.roleName + " also allows " + dp.readRoleAlso + "."})
+		}
+		if ap.roleGUID == azure.RoleStorageBlobDataContributor || (dp != nil && ap.roleGUID == dp.writeRole) {
+			// The data role for write or delete covers all three.
+			var also []string
+			for _, a := range []string{igagov.AccessRead, igagov.AccessWrite, igagov.AccessDelete} {
+				if !slices.Contains(p.intent.Access, a) {
+					also = append(also, a)
+				}
+			}
+			if len(also) > 0 {
+				p.warnings = append(p.warnings, AccessIssue{Code: "azure_broad_role",
+					Message: "Azure has no built-in role for only " + strings.Join(p.intent.Access, ", ") + " on " + azureDataWhat(&ap.target) + ": " + ap.roleName + " also allows " + strings.Join(also, " and ") + "."})
+			}
+		}
 		p.warnings = append(p.warnings, AccessIssue{Code: "azure_end_by_job",
 			Message: "An Azure role assignment has no expiry of its own: AuthSec removes it at the end time."})
-	}
-	if dp, ok := azureDataPlaneOf(&ap.target); ok && dp.note != "" {
-		p.warnings = append(p.warnings, AccessIssue{Code: "azure_data_plane", Message: dp.note})
 	}
 	p.azure = ap
 	doc, _ := json.Marshal(azureDocument(p, ap))
@@ -465,6 +597,31 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	if err != nil {
 		return []error{err}
 	}
+	if errs := s.azureConflicts(ctx, ws, p); len(errs) > 0 {
+		return errs
+	}
+	// A mapped type whose data role assignments do not control (a vault on
+	// access policies, a search service on API keys only): refused for a
+	// block and an allow alike.
+	if dp := azureDataPlaneOf(&ap.target); dp != nil && dp.authMode != nil {
+		props, err := deps.RBAC.GetResourceProperties(ctx, token, azureTopResource(ap.target.Scope), dp.apiVersion)
+		if err != nil || props == nil {
+			why := "the resource was not found"
+			if err != nil {
+				why = err.Error()
+			}
+			p.warnings = append(p.warnings, AccessIssue{Code: GovCodeAzureAuthUnchecked,
+				Message: "AuthSec could not read how this resource checks access to its " + dp.what + ": " + why})
+		} else {
+			blocker, warning := dp.authMode(props)
+			if blocker != nil {
+				return []error{govUnprocessable(blocker.Code, blocker.Message, map[string]any{"field": "resource.resource_id"})}
+			}
+			if warning != nil {
+				p.warnings = append(p.warnings, *warning)
+			}
+		}
+	}
 	if p.intent.Effect == igagov.AccessEffectAllow {
 		return nil
 	}
@@ -481,8 +638,25 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 			errs = append(errs, govConflict(GovCodeAzureUnavailable, "AuthSec cannot read "+pr.Name+"'s role assignments: "+err.Error(), nil))
 			continue
 		}
-		rev, inh := azureSplit(&ap.target, as, dm, acts, data)
+		var allows map[string]bool
+		if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+			var err error
+			allows, err = azureAllowNames(tx, ws, pr.ObjectID)
+			return err
+		}); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		as = withoutNames(as, allows)
+		rev, inh := azureSplit(&ap.target, p.intent.Access, as, dm, acts, data)
 		ap.revocable[pr.ObjectID], ap.inherited[pr.ObjectID] = rev, inh
+		if unc := azureUnclassified(&ap.target, p.intent.Access, as, dm, rev); len(unc) > 0 {
+			errs = append(errs, govUnprocessable(GovCodeAzureDataUnclassified,
+				pr.Name+" has data access to this resource through "+strings.Join(unc, ", ")+
+					", which a "+strings.Join(p.intent.Access, ", ")+" block cannot remove yet: "+azureUnmappedWhat(&ap.target)+" Choose access \"all\" to remove those roles too.",
+				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "roles": unc}))
+			continue
+		}
 		if len(inh) > 0 {
 			var where []string
 			for _, a := range inh {
@@ -493,6 +667,15 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i)}))
 			continue
 		}
+		if bound, err := azureTimeBound(ctx, deps.RBAC, token, ap.target.SubscriptionID, pr.ObjectID, rev); err != nil {
+			p.warnings = append(p.warnings, AccessIssue{Code: "azure_pim_unchecked",
+				Message: "AuthSec could not read Privileged Identity Management for " + pr.Name + " (" + err.Error() + "); the block waits until it can, rather than risk restoring a time-bound assignment as permanent."})
+		} else if len(bound) > 0 {
+			errs = append(errs, govUnprocessable(GovCodeAzureTimeBound,
+				pr.Name+" holds this access through a time-bound assignment (a Privileged Identity Management activation, or one with an end date). Removing it and restoring it at the end would make it permanent: end it in Privileged Identity Management instead.",
+				map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i)}))
+			continue
+		}
 		if len(rev) == 0 {
 			p.warnings = append(p.warnings, AccessIssue{Code: "azure_nothing_to_remove",
 				Message: pr.Name + " has no role assignment on this resource that grants this access now; AuthSec removes any that appear while the block is on."})
@@ -500,6 +683,101 @@ func (s *GovAccess) azureChecks(ctx context.Context, ws uuid.UUID, p *accessPlan
 	}
 	p.warnings = append(p.warnings, AccessIssue{Code: "azure_groups_not_checked",
 		Message: "Access through Entra group membership is not examined."})
+	return errs
+}
+
+// azureDataWhat is the data a type's allow role reaches, in words.
+func azureDataWhat(t *azureTarget) string {
+	if dp := azureDataPlaneOf(t); dp != nil {
+		return dp.what
+	}
+	return "blobs"
+}
+
+// azureUnmappedWhat says which data a read, write or delete block cannot
+// classify on the type.
+func azureUnmappedWhat(t *azureTarget) string {
+	if dp := azureDataPlaneOf(t); dp != nil {
+		return "they reach data of this resource other than its " + dp.what + "."
+	}
+	return "this resource type's data actions are not mapped."
+}
+
+// azureUnclassified names the roles assigned on the resource, below or above
+// it that give data access in the type's provider but that a read, write or
+// delete block on a non-storage type would leave in place ("all" removes
+// those on the resource or below).
+func azureUnclassified(t *azureTarget, access []string, as []azure.RoleAssignment, defs map[string]azure.RoleDefinition, rev []azure.RoleAssignment) []string {
+	if t.Storage || accessHasAll(access) {
+		return nil
+	}
+	taken := map[string]bool{}
+	for _, a := range rev {
+		taken[strings.ToLower(a.ID)] = true
+	}
+	ns := azureDataNS(t)
+	var out []string
+	for _, a := range as {
+		if taken[strings.ToLower(a.ID)] ||
+			!(azureScopeCovers(t.Scope, a.Properties.Scope) || azureScopeCovers(a.Properties.Scope, t.Scope)) {
+			continue
+		}
+		def, ok := defs[strings.ToLower(a.Properties.RoleDefinitionID)]
+		if !ok || !roleDataIn(def, ns) {
+			continue
+		}
+		// A mapped plane classifies its own data: only a role with data
+		// outside it (Key Vault keys or certificates) is unclassified.
+		if dp := azureDataPlaneOf(t); dp != nil && !roleDataOutside(def, ns, dp.mapped) {
+			continue
+		}
+		name := def.Properties.RoleName
+		if name == "" {
+			name = def.Name
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// azureConflicts refuses a block and an allow acting on the same principal and
+// overlapping scopes at the same time: Azure has no deny to settle it, so the
+// two jobs would undo each other every check. The policy's own rows (an edit,
+// a resume) are not a conflict.
+func (s *GovAccess) azureConflicts(ctx context.Context, ws uuid.UUID, p *accessPlan) []error {
+	ap := p.azure
+	other := "allow"
+	if p.intent.Effect == igagov.AccessEffectAllow {
+		other = "deny"
+	}
+	var errs []error
+	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		for i, pr := range ap.principals {
+			q := tx.Model(&models.IGAGovAzureAccess{}).
+				Where("workspace_id = ? AND principal_id = ? AND effect = ? AND state IN ?", ws, pr.ObjectID, other,
+					[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive})
+			if p.self != nil {
+				q = q.Where("policy_id <> ?", *p.self)
+			}
+			var rows []models.IGAGovAzureAccess
+			if err := q.Find(&rows).Error; err != nil {
+				return err
+			}
+			for _, r := range rows {
+				if azureScopeCovers(r.Scope, ap.target.Scope) || azureScopeCovers(ap.target.Scope, r.Scope) {
+					errs = append(errs, govConflict(GovCodeAzureConflict,
+						pr.Name+" is already under an access policy with the opposite effect on this resource; end that policy first.",
+						map[string]any{"field": fmt.Sprintf("roles[%d].identity_account_id", i), "policy_id": r.PolicyID}))
+					break
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return []error{err}
+	}
 	return errs
 }
 
@@ -575,6 +853,16 @@ func VerifyAzureAccessSchema(db *gorm.DB) error {
 	if !ok {
 		return fmt.Errorf("Azure access policies need migration 144; missing: iga_gov_azure_access")
 	}
+	// The job that does the work must be admitted by the queue: a database
+	// whose job-kind CHECK was re-created without it (AS-115) would refuse
+	// every Azure deployment's job.
+	ok, err = repositories.ConstraintAdmits(db, "iga_gov_job", "iga_gov_job_kind_check", repositories.GovJobAzureAccess)
+	if err != nil {
+		return fmt.Errorf("Azure access-policy schema verification could not run: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("Azure access policies need migration 144; missing: constraint iga_gov_job.iga_gov_job_kind_check admitting %s", repositories.GovJobAzureAccess)
+	}
 	return nil
 }
 
@@ -643,14 +931,18 @@ func accessLiveCount(tx *gorm.DB, ws, policyID uuid.UUID) (int64, error) {
 		Count(&aws).Error; err != nil {
 		return 0, err
 	}
+	k, err := k8sLiveCount(tx, ws, policyID)
+	if err != nil {
+		return 0, err
+	}
 	if ok, _ := AzureAccessSchemaStatus(tx); !ok {
-		return aws, nil
+		return aws + k, nil
 	}
 	if err := tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND policy_id = ? AND state IN ?", ws, policyID,
 		[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}).Count(&az).Error; err != nil {
 		return 0, err
 	}
-	return aws + az, nil
+	return aws + az + k, nil
 }
 
 // accessSupersedeTx: once every Azure row of the applied version is active,
@@ -739,10 +1031,14 @@ func endAzureRowsTx(tx *gorm.DB, ws, policyID uuid.UUID, keep *uuid.UUID, reason
 	n := 0
 	for _, r := range rows {
 		set := map[string]any{"end_reason": reason, "updated_at": now}
-		switch r.State {
-		case models.R2StateApproved:
+		var held []azure.RoleAssignmentSpec
+		_ = json.Unmarshal(r.Revoked, &held)
+		switch {
+		// An approved row never deployed, unless another block handed it
+		// assignments to keep removed (handOver): then it restores them.
+		case r.State == models.R2StateApproved && len(held) == 0:
 			set["state"], set["ended_at"] = models.R2StateRevoked, now
-		case models.R2StateExpiring:
+		case r.State == models.R2StateExpiring:
 			continue
 		default:
 			set["state"] = models.R2StateExpiring
@@ -826,10 +1122,24 @@ func (s *GovAccess) AzureAccessHandler(ctx context.Context, run *PolicyJobRun) e
 	}
 	h := azureHandler{s: s, run: run, deps: deps, token: token, row: row}
 	now := time.Now().UTC()
+	if !PolicyR2On() && row.State != models.R2StateExpiring && now.Before(row.ExpiresAt) {
+		// R2 unavailable: no deploys or checks, removals only (above).
+		return PolicyJobRetryLater(10*time.Minute, GovCodeR2Unavailable)
+	}
 	switch row.State {
 	case models.R2StateApproved:
 		if !now.Before(row.ExpiresAt) {
-			return h.finish(ctx, models.R2StateExpired, r2EndReasonNeverDeployed)
+			var held []azure.RoleAssignmentSpec
+			_ = json.Unmarshal(row.Revoked, &held)
+			if len(held) == 0 {
+				return h.finish(ctx, models.R2StateExpired, r2EndReasonNeverDeployed)
+			}
+			// Handed assignments (handOver) are restored, as on any end.
+			if err := h.move(ctx, models.R2StateApproved, models.R2StateExpiring, map[string]any{"end_reason": r2EndReasonExpired}); err != nil {
+				return err
+			}
+			h.row.State, h.row.EndReason = models.R2StateExpiring, r2EndReasonExpired
+			return h.remove(ctx)
 		}
 		if row.StartsAt != nil && now.Before(*row.StartsAt) {
 			return PolicyJobRetryLater(time.Until(*row.StartsAt), "starts at "+igagov.AWSTime(*row.StartsAt))
@@ -862,6 +1172,7 @@ type azureHandler struct {
 	deps  *AzureAccessDeps
 	token string
 	row   models.IGAGovAzureAccess
+	note  string // the final state_reason (finish)
 }
 
 func (h azureHandler) event(tx *gorm.DB, name string, payload map[string]any) error {
@@ -893,6 +1204,25 @@ func (h azureHandler) external(ctx context.Context, fn func(ctx context.Context)
 }
 
 func (h azureHandler) fail(ctx context.Context, reason string) error {
+	// A block that already removed assignments (an earlier attempt of this
+	// deploy, or ones handed to it) restores them before it fails: failing
+	// straight away left them removed with no row to bring them back.
+	if h.row.Effect == "deny" {
+		var held []models.IGAGovAzureAccess
+		if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+			return tx.Where("workspace_id = ? AND id = ? AND revoked <> '[]'::jsonb", h.row.WorkspaceID, h.row.ID).Limit(1).Find(&held).Error
+		}); err != nil {
+			return err
+		}
+		if len(held) == 1 {
+			if err := h.move(ctx, h.row.State, models.R2StateExpiring, map[string]any{"end_reason": azureEndFailed, "state_reason": reason}); err != nil {
+				return err
+			}
+			h.row = held[0]
+			h.row.State, h.row.EndReason, h.row.StateReason = models.R2StateExpiring, azureEndFailed, reason
+			return h.remove(ctx)
+		}
+	}
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND id = ? AND state = ?", h.row.WorkspaceID, h.row.ID, h.row.State).
 			Updates(map[string]any{"state": models.R2StateFailed, "state_reason": reason, "ended_at": time.Now().UTC(), "updated_at": time.Now().UTC()}).Error; err != nil {
@@ -908,17 +1238,16 @@ func (h azureHandler) fail(ctx context.Context, reason string) error {
 func (h azureHandler) live(ctx context.Context) (rev, inh []azure.RoleAssignment, err error) {
 	var access []string
 	_ = json.Unmarshal(h.row.Access, &access)
-	segs := strings.Split(strings.TrimPrefix(h.row.Scope, "/"), "/")
-	t := &azureTarget{Scope: strings.ToLower(h.row.Scope), SubscriptionID: h.row.SubscriptionID}
-	if i := indexOf(segs, "providers"); i >= 0 && i+2 < len(segs) {
-		tp := []string{segs[i+1], segs[i+2]}
-		for j := i + 4; j < len(segs); j += 2 {
-			tp = append(tp, segs[j])
-		}
-		t.TypePath = strings.ToLower(strings.Join(tp, "/"))
-	}
-	t.Storage = strings.HasPrefix(t.TypePath, "microsoft.storage/storageaccounts")
+	t := azureTargetOfScope(h.row.Scope, h.row.SubscriptionID)
 	acts, data := azureActions(t, access)
+	var allows map[string]bool
+	if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		allows, err = azureAllowNames(tx, h.row.WorkspaceID, h.row.PrincipalID)
+		return err
+	}); err != nil {
+		return nil, nil, err
+	}
 	err = h.external(ctx, func(ctx context.Context) error {
 		defs, err := h.deps.RBAC.ListRoleDefinitions(ctx, h.token, h.row.SubscriptionID)
 		if err != nil {
@@ -928,7 +1257,7 @@ func (h azureHandler) live(ctx context.Context) (rev, inh []azure.RoleAssignment
 		if err != nil {
 			return err
 		}
-		rev, inh = azureSplit(t, as, azureDefs(defs), acts, data)
+		rev, inh = azureSplit(t, access, withoutNames(as, allows), azureDefs(defs), acts, data)
 		return nil
 	})
 	return rev, inh, err
@@ -947,6 +1276,8 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 	now := time.Now().UTC()
 	drift := ""
 	var ops []map[string]any
+	var inherited []string // block: scopes above the resource that grant the access
+	var timeBound []string // block: time-bound (PIM) assignments left in place
 	if h.row.Effect == "allow" {
 		id := h.row.Scope + "/providers/Microsoft.Authorization/roleAssignments/" + h.row.AssignmentName
 		var got *azure.RoleAssignment
@@ -977,25 +1308,58 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		if len(inh) > 0 && !check {
 			return h.fail(ctx, GovCodeAzureInherited+": the principal gets this access from a broader scope")
 		}
+		// A time-bound (PIM) assignment is never taken: restoring it at the end
+		// would make it permanent (AS-135). Unreadable PIM waits.
+		var bound []azure.RoleAssignment
+		if err := h.external(ctx, func(ctx context.Context) error {
+			var err error
+			bound, err = azureTimeBound(ctx, h.deps.RBAC, h.token, h.row.SubscriptionID, h.row.PrincipalID, rev)
+			return err
+		}); err != nil {
+			return h.retry(err)
+		}
+		if len(bound) > 0 {
+			if !check {
+				return h.fail(ctx, GovCodeAzureTimeBound+": the principal holds this access through a time-bound (PIM) assignment")
+			}
+			skip := map[string]bool{}
+			for _, a := range bound {
+				skip[strings.ToLower(a.ID)] = true
+				timeBound = append(timeBound, a.ID)
+			}
+			kept := rev[:0]
+			for _, a := range rev {
+				if !skip[strings.ToLower(a.ID)] {
+					kept = append(kept, a)
+				}
+			}
+			rev = kept
+		}
+		// Access that appeared at a broader scope after the block went live:
+		// AuthSec cannot remove it from one resource, so the block no longer
+		// holds. Recorded as drift (shown, notified once), not hidden.
+		for _, a := range inh {
+			inherited = append(inherited, a.Properties.Scope)
+		}
 		if len(rev) > 0 {
 			if check {
 				drift = R2ReasonDetached
 			}
 			// Write-ahead: each assignment is recorded before it is deleted, so
-			// the restore never loses one.
-			var revoked []azure.RoleAssignmentSpec
-			_ = json.Unmarshal(h.row.Revoked, &revoked)
+			// the restore never loses one. Appended in the database, not
+			// rewritten: another block's removal may hand assignments over to
+			// this row meanwhile (handOver).
+			var fresh []azure.RoleAssignmentSpec
 			for _, a := range rev {
-				revoked = append(revoked, azure.SpecOf(a))
+				fresh = append(fresh, azure.SpecOf(a))
 			}
-			raw, _ := json.Marshal(revoked)
+			raw, _ := json.Marshal(fresh)
 			if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 				return tx.Model(&models.IGAGovAzureAccess{}).Where("workspace_id = ? AND id = ?", h.row.WorkspaceID, h.row.ID).
-					Updates(map[string]any{"revoked": raw, "updated_at": now}).Error
+					Updates(map[string]any{"revoked": gorm.Expr("revoked || ?::jsonb", string(raw)), "updated_at": now}).Error
 			}); err != nil {
 				return err
 			}
-			h.row.Revoked = raw
 			for _, a := range rev {
 				a := a
 				if err := h.external(ctx, func(ctx context.Context) error {
@@ -1010,6 +1374,16 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 	opsRaw, _ := json.Marshal(ops)
 	err := h.run.InTx(ctx, func(tx *gorm.DB) error {
 		set := map[string]any{"verified_at": now, "last_readback_at": now, "drift": "", "state_reason": "", "updated_at": now}
+		if len(inherited) > 0 {
+			set["drift"] = GovCodeAzureInherited
+			set["state_reason"] = "the principal now gets this access from a broader scope (" + strings.Join(inherited, ", ") +
+				"); AuthSec cannot remove it from this resource"
+		}
+		if len(timeBound) > 0 {
+			set["drift"] = GovCodeAzureTimeBound
+			set["state_reason"] = "the principal now holds this access through a time-bound (PIM) assignment, which AuthSec leaves in place: " +
+				"restoring it at the end would make it permanent. End it in Privileged Identity Management"
+		}
 		if len(ops) > 0 {
 			set["ops"] = gorm.Expr("ops || ?::jsonb", string(opsRaw))
 		}
@@ -1022,6 +1396,18 @@ func (h azureHandler) apply(ctx context.Context, check bool) error {
 		}
 		if res.RowsAffected != 1 {
 			return PolicyJobRetryLater(time.Second, "the row's state moved; reloading")
+		}
+		if check && len(inherited) > 0 && h.row.Drift != GovCodeAzureInherited {
+			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": GovCodeAzureInherited, "scopes": inherited,
+				"note": "The principal gets this access from a broader scope; AuthSec cannot remove it from this resource. End the policy or remove that assignment."}); err != nil {
+				return err
+			}
+		}
+		if check && len(timeBound) > 0 && h.row.Drift != GovCodeAzureTimeBound {
+			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": GovCodeAzureTimeBound, "assignments": timeBound,
+				"note": "A time-bound (PIM) assignment grants the access; AuthSec leaves it in place. End it in Privileged Identity Management."}); err != nil {
+				return err
+			}
 		}
 		if check && drift != "" {
 			if err := h.event(tx, GovEventAccessDrifted, map[string]any{"classification": drift, "note": "AuthSec re-applies the policy."}); err != nil {
@@ -1061,19 +1447,133 @@ func (h azureHandler) remove(ctx context.Context) error {
 	} else {
 		var revoked []azure.RoleAssignmentSpec
 		_ = json.Unmarshal(h.row.Revoked, &revoked)
-		for _, spec := range revoked {
+		rest, handed, err := h.handOver(ctx, revoked)
+		if err != nil {
+			return h.retry(err)
+		}
+		for _, hd := range handed {
+			ops = append(ops, map[string]any{"op": "HandedOver", "assignment": hd.spec.Scope + "/" + hd.spec.Name, "to": hd.to, "at": now})
+		}
+		lost := 0
+		for _, spec := range rest {
 			spec := spec
 			if err := h.external(ctx, func(ctx context.Context) error {
 				_, err := h.deps.RBAC.PutRoleAssignment(ctx, h.token, spec)
 				return err
 			}); err != nil {
-				return h.retry(err)
+				if !azureGone(err) {
+					return h.retry(err)
+				}
+				// The principal, role or resource no longer exists: the
+				// assignment cannot come back, and retrying would keep the
+				// policy ending (and undeletable) for good.
+				lost++
+				ops = append(ops, map[string]any{"op": "NotRestored", "assignment": spec.Scope + "/" + spec.Name, "reason": err.Error(), "at": now})
+				continue
 			}
 			ops = append(ops, map[string]any{"op": "PutRoleAssignment", "restored": spec.Scope + "/" + spec.Name, "at": now})
 		}
+		if lost > 0 {
+			h.note = fmt.Sprintf("%d role assignment(s) could not be restored: the principal, role or resource no longer exists in Azure", lost)
+		}
 	}
 	h.row.Ops = mustOps(ops)
-	return h.finish(ctx, grantFinal(h.row.EndReason), h.row.EndReason)
+	final := grantFinal(h.row.EndReason)
+	if h.row.EndReason == azureEndFailed {
+		final = models.R2StateFailed
+		if h.note == "" {
+			h.note = h.row.StateReason
+		} else {
+			h.note = h.row.StateReason + "; " + h.note
+		}
+	}
+	return h.finish(ctx, final, h.row.EndReason)
+}
+
+// azureHoldStates are the states of a block that can take assignments over:
+// it will restore them when it ends (endAzureRowsTx sends an approved row
+// holding some through expiring).
+var azureHoldStates = []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive}
+
+type handedSpec struct {
+	spec azure.RoleAssignmentSpec
+	to   uuid.UUID
+}
+
+// handOver gives the assignments this block removed to another live block on
+// the same principal that still needs them gone -- the next version of an
+// edited policy, or another policy covering the resource -- instead of
+// restoring them. Without it, ending one block re-created the access and the
+// other block removed it again only at its next check (up to 10 minutes).
+// It returns the specs still to restore.
+func (h azureHandler) handOver(ctx context.Context, specs []azure.RoleAssignmentSpec) (rest []azure.RoleAssignmentSpec, handed []handedSpec, err error) {
+	if h.row.Effect != "deny" || len(specs) == 0 {
+		return specs, nil, nil
+	}
+	var others []models.IGAGovAzureAccess
+	if err := h.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		return tx.Where("workspace_id = ? AND principal_id = ? AND effect = ? AND id <> ? AND state IN ?",
+			h.row.WorkspaceID, h.row.PrincipalID, "deny", h.row.ID, azureHoldStates).
+			Where("expires_at > now() AND (starts_at IS NULL OR starts_at <= now())").
+			Order("created_at").Find(&others).Error
+	}); err != nil {
+		return nil, nil, err
+	}
+	if len(others) == 0 {
+		return specs, nil, nil
+	}
+	var defs map[string]azure.RoleDefinition
+	if err := h.external(ctx, func(ctx context.Context) error {
+		ds, err := h.deps.RBAC.ListRoleDefinitions(ctx, h.token, h.row.SubscriptionID)
+		defs = azureDefs(ds)
+		return err
+	}); err != nil {
+		return nil, nil, err
+	}
+	byRow := map[uuid.UUID][]azure.RoleAssignmentSpec{}
+	for _, spec := range specs {
+		def, ok := defs[strings.ToLower(spec.RoleDefinitionID)]
+		taken := false
+		for _, o := range others {
+			if !ok || o.SubscriptionID != h.row.SubscriptionID || !azureScopeCovers(o.Scope, spec.Scope) {
+				continue
+			}
+			var access []string
+			_ = json.Unmarshal(o.Access, &access)
+			t := azureTargetOfScope(o.Scope, o.SubscriptionID)
+			acts, data := azureActions(t, access)
+			if azureGrants(t, access, def, acts, data) {
+				byRow[o.ID] = append(byRow[o.ID], spec)
+				handed = append(handed, handedSpec{spec: spec, to: o.ID})
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			rest = append(rest, spec)
+		}
+	}
+	if len(byRow) == 0 {
+		return specs, nil, nil
+	}
+	if err := h.run.InTx(ctx, func(tx *gorm.DB) error {
+		for id, sp := range byRow {
+			raw, _ := json.Marshal(sp)
+			res := tx.Model(&models.IGAGovAzureAccess{}).
+				Where("workspace_id = ? AND id = ? AND state IN ?", h.row.WorkspaceID, id, azureHoldStates).
+				Updates(map[string]any{"revoked": gorm.Expr("revoked || ?::jsonb", string(raw)), "updated_at": time.Now().UTC()})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return PolicyJobRetryLater(time.Second, "the receiving block moved; reloading")
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	return rest, handed, nil
 }
 
 func mustOps(ops []map[string]any) json.RawMessage {
@@ -1084,7 +1584,7 @@ func mustOps(ops []map[string]any) json.RawMessage {
 func (h azureHandler) finish(ctx context.Context, final, endReason string) error {
 	now := time.Now().UTC()
 	return h.run.InTx(ctx, func(tx *gorm.DB) error {
-		set := map[string]any{"state": final, "ended_at": now, "state_reason": "", "updated_at": now}
+		set := map[string]any{"state": final, "ended_at": now, "state_reason": h.note, "updated_at": now}
 		if endReason != "" {
 			set["end_reason"] = endReason
 		}
@@ -1096,11 +1596,33 @@ func (h azureHandler) finish(ctx context.Context, final, endReason string) error
 			return PolicyJobRetryLater(time.Second, "the row's state moved; reloading")
 		}
 		name := GovEventAccessRemoved
-		if final == models.R2StateExpired {
+		switch final {
+		case models.R2StateExpired:
 			name = GovEventAccessExpired
+		case models.R2StateFailed:
+			name = GovEventAccessFailed
 		}
 		return h.event(tx, name, map[string]any{"state": final, "end_reason": endReason, "ops": json.RawMessage(h.row.Ops)})
 	})
+}
+
+// azureEndFailed is the end reason of a block that failed to deploy after
+// removing assignments: it restores them, then ends failed.
+const azureEndFailed = "failed"
+
+// azureGone reports an Azure answer that no retry can change: the principal,
+// role definition, resource, group or subscription no longer exists.
+func azureGone(err error) bool {
+	var ae *azure.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch strings.ToLower(ae.Code) {
+	case "principalnotfound", "invalidprincipalid", "roledefinitiondoesnotexist", "resourcenotfound",
+		"parentresourcenotfound", "resourcegroupnotfound", "subscriptionnotfound":
+		return true
+	}
+	return ae.Status == http.StatusNotFound
 }
 
 // retry turns an Azure error into a retry (a lost lease is returned as is).
@@ -1122,9 +1644,6 @@ func RegisterAzureAccessJobs(w *PolicyJobWorker, db *gorm.DB) {
 	w.Register(PolicyJobKind{Kind: repositories.GovJobAzureAccess, Handler: s.AzureAccessHandler})
 	w.Scheduler().Add(PolicyJobSchedule{Name: repositories.GovJobAzureAccess, Kind: repositories.GovJobAzureAccess, Every: azureCheckEvery,
 		Due: func(ctx context.Context, db *gorm.DB, now time.Time) ([]ScheduledPolicyJob, error) {
-			if !PolicyR2On() {
-				return nil, nil
-			}
 			// TENANT-EXEMPT: the 144 schema check reads the Postgres catalog only.
 			if ok, _ := AzureAccessSchemaStatus(db); !ok {
 				return nil, nil
@@ -1135,9 +1654,14 @@ func RegisterAzureAccessJobs(w *PolicyJobWorker, db *gorm.DB) {
 			}
 			// TENANT-EXEMPT: the schedule's scan of live Azure rows across
 			// workspaces; each job then runs in its row's own workspace.
-			if err := db.Table("iga_gov_azure_access").Select("workspace_id, id").
-				Where("state IN ?", []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring}).
-				Scan(&rows).Error; err != nil {
+			q := db.Table("iga_gov_azure_access").Select("workspace_id, id").
+				Where("state IN ?", []string{models.R2StateApproved, models.R2StateDeploying, models.R2StateActive, models.R2StateExpiring})
+			if !PolicyR2On() {
+				// Only what must come out: Azure assignments have no expiry of
+				// their own, so an allow would outlive its end.
+				q = q.Where("state = ? OR expires_at <= ?", models.R2StateExpiring, now)
+			}
+			if err := q.Scan(&rows).Error; err != nil {
 				return nil, err
 			}
 			out := make([]ScheduledPolicyJob, 0, len(rows))

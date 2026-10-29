@@ -99,8 +99,8 @@ func (ctl *SlackIntegrationController) Gate() gin.HandlerFunc {
 }
 
 func (ctl *SlackIntegrationController) configured(c *gin.Context) bool {
-	if ok, reason := ctl.service().Configured(); !ok {
-		policyErr(c, http.StatusServiceUnavailable, services.SlackCodeNotConfigured, reason, nil)
+	if ok, _ := ctl.service().Configured(); !ok {
+		policyErr(c, http.StatusServiceUnavailable, services.SlackCodeNotConfigured, services.SlackNotSetUp, nil)
 		return false
 	}
 	return true

@@ -186,3 +186,43 @@ type IGAGovAzureAccess struct {
 }
 
 func (IGAGovAzureAccess) TableName() string { return "iga_gov_azure_access" }
+
+// IGAGovK8sAccess is one Kubernetes access-policy deployment (146): one
+// ServiceAccount removed from one binding by the in-cluster agent for the
+// window, and put back at the end. Removed is what the agent reported taking
+// out (the binding's uid), so the restore touches that object only.
+type IGAGovK8sAccess struct {
+	ID                uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey"`
+	WorkspaceID       uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
+	PolicyID          uuid.UUID       `json:"policy_id" gorm:"type:uuid;not null"`
+	VersionID         uuid.UUID       `json:"version_id" gorm:"type:uuid;not null"`
+	ConnectorID       uuid.UUID       `json:"connector_id" gorm:"type:uuid;not null"`
+	IdentityAccountID uuid.UUID       `json:"identity_account_id" gorm:"type:uuid;not null"`
+	Cluster           string          `json:"cluster"`
+	BindingKind       string          `json:"binding_kind"`
+	BindingNamespace  string          `json:"binding_namespace"`
+	BindingName       string          `json:"binding_name"`
+	RoleKind          string          `json:"role_kind"`
+	RoleName          string          `json:"role_name"`
+	Subject           json.RawMessage `json:"subject" gorm:"type:jsonb"`
+	Effect            string          `json:"effect"`
+	Access            json.RawMessage `json:"access" gorm:"type:jsonb"`
+	Removed           json.RawMessage `json:"removed" gorm:"type:jsonb"`
+	InstructionID     *uuid.UUID      `json:"instruction_id,omitempty" gorm:"type:uuid"`
+	State             string          `json:"state"`
+	StateReason       string          `json:"state_reason"`
+	EndReason         string          `json:"end_reason"`
+	Drift             string          `json:"drift"`
+	StartsAt          *time.Time      `json:"starts_at,omitempty"`
+	ExpiresAt         time.Time       `json:"expires_at"`
+	DeployedAt        *time.Time      `json:"deployed_at,omitempty"`
+	VerifiedAt        *time.Time      `json:"verified_at,omitempty"`
+	LastReadbackAt    *time.Time      `json:"last_readback_at,omitempty"`
+	EndedAt           *time.Time      `json:"ended_at,omitempty"`
+	CreatedBy         uuid.UUID       `json:"created_by" gorm:"type:uuid;not null"`
+	Ops               json.RawMessage `json:"ops" gorm:"type:jsonb"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
+}
+
+func (IGAGovK8sAccess) TableName() string { return "iga_gov_k8s_access" }

@@ -44,6 +44,10 @@ const (
 	AzureReaderSkipped = "skipped"
 	// AzureReaderFailed: ARM refused the assignment for another reason.
 	AzureReaderFailed = "failed"
+	// AzureReaderUnchecked: the read that proves access failed for a passing
+	// reason (a timeout, throttling, Microsoft's 5xx), so nothing is known
+	// about the subscription; verifying it again settles it.
+	AzureReaderUnchecked = "not_checked"
 )
 
 // Azure onboarding paths.
@@ -106,6 +110,10 @@ type AzureTenantAttrs struct {
 	// onboarding. Nil until a tenant pass has read them.
 	Licensing  *AzureLicensing  `json:"licensing,omitempty"`
 	Guardrails *AzureGuardrails `json:"guardrails,omitempty"`
+
+	// TenantDisplayName is the tenant's organization name, read by identity
+	// discovery (GET /v1.0/organization). Empty until a tenant pass reads it.
+	TenantDisplayName string `json:"tenant_display_name,omitempty"`
 }
 
 // AzureLicensing is what the tenant's licences make readable or enforceable.

@@ -176,7 +176,9 @@ func TestP3T306bA63Readiness(t *testing.T) {
 	if got["CollectRole"]["remedy"] != "/iga/connections/"+a.conn.String()+"/coverage" {
 		t.Fatalf("collection remedy %v", got["CollectRole"]["remedy"])
 	}
-	if !strings.HasPrefix(fmt.Sprint(got["OwnerlessRole"]["remedy"]), "/iga/policy/findings?kind=missing_owner") {
+	// Remedies name pages the console has: the role's own page, not the
+	// findings page that went away with policy setup.
+	if !strings.HasPrefix(fmt.Sprint(got["OwnerlessRole"]["remedy"]), "/iga/identities/") {
 		t.Fatalf("owner remedy %v", got["OwnerlessRole"]["remedy"])
 	}
 	// Paging: limit 4 then the cursor; every role once; counts unchanged.

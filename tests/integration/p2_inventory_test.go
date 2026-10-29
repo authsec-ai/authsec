@@ -230,6 +230,18 @@ func TestP2InventoryFilters(t *testing.T) {
 		digs(body, "meta", "facets", "scope", 1, "value"), digs(body, "meta", "facets", "scope", 2, "value")},
 		[]string{invOrg, invCluster, invAccountHome})
 
+	// exclude_kind (UI-056) leaves kinds out of a list and of the summary; the
+	// kind facet still counts what it leaves out.
+	rows, body = l.list(invWorkloads + "?exclude_kind=k8s_deployment&exclude_kind=github_actions_workflow&facets=kind")
+	invWant(t, "exclude_kind", invNames(rows), []string{"billing-fn", "repo-agent", "stale-mixed"})
+	if got := invFacet(body, "kind")["k8s_deployment"]; got != "Kubernetes Deployment:1" {
+		t.Errorf("kind facet under exclude_kind: k8s_deployment = %q", got)
+	}
+	code, sum := l.get("/inventory/summary" + qs("exclude_kind", "k8s_deployment"))
+	if code != http.StatusOK || num(sum, "data", "workloads", "value") != 4 {
+		t.Errorf("summary with exclude_kind: %d %v, want 4 workloads", code, sum)
+	}
+
 	// 400s, all in the envelope, naming the parameter.
 	for _, c := range []struct{ path, param string }{
 		{qs("provider", "gcp"), "provider"},

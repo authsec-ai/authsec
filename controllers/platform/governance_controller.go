@@ -707,6 +707,35 @@ func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 	})
 }
 
+// DisableActuation handles DELETE /authsec/governance/connectors/:id/actuation:
+// the cluster's token stops working and it reports under its discovery ingest
+// token again. 409 enforcement_in_use, with what is still in force, while a
+// quarantine, a live access policy or an open instruction needs the agent.
+func (ctl *GovernanceController) DisableActuation(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := ctl.actuation().DisableActuation(wsID, id); err != nil {
+		var inUse *services.ActuationInUseError
+		if errors.As(err, &inUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": "enforcement_in_use", "message": inUse.Error(), "in_use": inUse})
+			return
+		}
+		governanceError(c, err)
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "disable_actuation", "discovery_source",
+		id.String(), http.StatusOK, nil, gin.H{"actuation_enabled": false})
+	c.JSON(http.StatusOK, gin.H{"actuation_enabled": false})
+}
+
 // ListInstructions handles GET /authsec/governance/instructions?open=true — the
 // operator's view of what enforcement is pending or has failed.
 func (ctl *GovernanceController) ListInstructions(c *gin.Context) {
@@ -1128,6 +1157,10 @@ func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
 	if v := c.Query("force_evict"); v != "" {
 		b := v == "true" || v == "1"
 		rep.ForceEvict = &b
+	}
+	if v := c.Query("bindings"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Bindings = &b
 	}
 	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
 		// Never fatal to the fetch. Refusing to serve a plan because the agent's

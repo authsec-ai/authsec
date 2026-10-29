@@ -4,6 +4,306 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-28 (cont.) — Enforcement on k3s-master; turning it off (UI-058, UI-059)
+
+- Enforcement turned on for k3s-master from the console. Minting the token cut the cluster's discovery for 7 minutes (UI-058): the server then accepts its reports only under that token. The agent (Helm revision 7-9) now sends it for discovery and actuation; quarantine and access policies act only in `agent-live-demo` (role `llm-key-reader`).
+- Live demo: `support-bot` in `agent-live-demo` (iga-agent `examples/live-demo`) logs WORKING / ACCESS BLOCKED / NETWORK BLOCKED every 5 s. An access policy on `rag-agent` / `rag-reader` was proven end to end (binding emptied, `can-i` no, then restored on end).
+- `agent-demo`, `iga-demo` and `iga-test` deleted with their bots, and the demo ClusterRoles and the stale cluster-viewer binding of `agent-demo/ops-agent`.
+- UI-059: enforcement can be turned off (refused while something is in force).
+- Open: quarantine selects pods by one label (could match more than the workload); a token rotation needs the agent's pods restarted.
+
+---
+
+## 2026-10-28 (cont.) — Kubernetes enforcement from the console (UI-057)
+
+- A Kubernetes connection has an **Enforcement** tab: "Turn on enforcement" mints the cluster's actuation token (governance:admin; "Rotate token" after a confirmation), shown once with the two commands to run in the cluster (a Secret, then a Helm upgrade with the quarantine namespaces and, for access policies, the binding roles and namespaces). It shows what the agent reports: quarantine and access policies "Can act" / "Waiting for the agent" / "Off", the mode, the plan.
+- A sighting's page has **Quarantine** (reason required) and **Release**, and says whether the quarantine is blocked in the cluster, waiting, or not blocked (with the server's reason).
+- Both need this UI deployed; the backend endpoints were already on authsec-staging. The cluster steps stay manual by design: the console never reaches into a cluster.
+
+---
+
+## 2026-10-28 — authsec-staging merged again; iga-agent 0.5.0 on k3s-master
+
+- UI: 12 staging commits merged (Azure vocabulary, Azure agent Access Graph, tabs). `azureGraphSummary.ts` stays deleted (nothing imports it); 396 tests, lint 0 errors, build OK. Backend: nothing new on staging.
+- **iga-agent 0.5.0 deployed** to `authsec-system` on k3s-master, the production cluster (Helm revision 6, image `iga-agent:0.5.0`, commit `3dc0e408b1ef`, amd64+arm64, pushed as its own tag; the registry's `production` tag was not touched). Behaviour unchanged: roles `discovery`, enforcement `observe`, no actuation token, `enforcement.bindings` off. It re-registered as the same discovery source and swept as before.
+- Drift found and folded in: the release's values said `workspace.id` f25343ed…, but the ConfigMap had been changed with `kubectl apply` to 884d366f… (what the agent reports to). The upgrade sets 884d366f… in Helm, so a later upgrade no longer moves the agent to another workspace.
+- The registry holds only `production` and `0.5.0` of iga-agent; 0.4.2 ran from the node's local image (`IfNotPresent`).
+- Not yet possible here: Kubernetes access policies need the backend from this branch (prod runs `authsec-staging`), an actuation token, and `enforcement.bindings` on for chosen roles.
+
+---
+
+## 2026-10-27 — Manual test report: fixes on `feat/iga-enforcement`
+
+The tester's report (9 bugs, aditya.app.authsec.ai) was checked against the code. None came from the access-policy work. Fixed, each with a test:
+- **UI-050:** an Azure connection's Graph card read the Kubernetes sentence; the sentence now follows the provider.
+- **AS-166:** the Slack message showed operator settings and Vault; users now read "Slack is not set up on this server", and the detail stays in the startup log.
+- **AS-167:** the cluster counters read agent fields no agent sends (0.5.0 included); the panel now counts what Discovery holds for the cluster.
+- **UI-051:** the Policy list's "Used by" line shows its full value on hover.
+- **UI-052:** resource pages have Create policy. The form now fills a resource of every AWS type; before, the graph card's "New access policy" on Lambda, KMS, SQS, SNS or a Bedrock model opened with no resource.
+- **AS-168:** an Azure tenant is named by its organization name (read on its next scan) instead of its GUID.
+- **UI-053:** an unknown connection's breadcrumb reads "Not found", not "Bad Id".
+- **UI-055:** S3 rows say "No account in the ARN" instead of "Unknown account".
+- **UI-054 (found during the review, ours):** Kubernetes pages said policy is not supported although Kubernetes access policies are; they now offer one.
+
+Then the rest, on the recommended options:
+- **UI-056:** Azure Resources leaves Entra permissions out of its list and count (new inventory parameter `exclude_kind`), says how many, and shows them on request. Deploy the backend before the UI.
+- **UI-055:** pattern rows (`*`, `/apis/*`) stay listed (a pattern can reach many resources); the list counts them and offers exact references only.
+- **UI-051:** Kubernetes workloads lead with their own name instead of the agent's "container (Kind/name) in ns/namespace".
+
+The report did not exercise any access-policy enforcement; those checks, and agent 0.5.0 on the cluster, are still to run.
+
+---
+
+## 2026-10-24 (cont.) — authsec-staging merged into `feat/iga-enforcement`
+
+- Staging's PR #98 added an Azure data-plane table for AI Search, Key Vault, Service Bus and Event Hubs. This branch already maps those types, and more, in `services/iga_gov_access_azure_planes.go`. The merge keeps that table and drops staging's duplicate in `iga_gov_access_azure.go`.
+- **Adopted from #98:** an allow of read and write on Service Bus or Event Hubs assigns Data Owner. A preview warning says it also manages the namespace. This branch had refused that combination.
+- **#98's unit tests adapted to this branch's behaviour:**
+  - a storage account block also covers queues, tables, files and the SAS paths;
+  - a mapped type's read is its data and key actions, not the management read.
+- Every removal and restore case those tests check still holds. #98's integration test (TestAccessPolicyAzureSearchIndex) runs unchanged.
+
+---
+
+## 2026-10-24 (cont.) — Open items closed
+
+- **AS-138:** all 21 R2/R3 mutation routes now assert their audit row over HTTP (TestP3R2R3RoutesAudited, with a fake AgentCore for the push).
+- **AS-135:** an Azure block never removes a PIM-activated or time-bound assignment, so the restore at the end can no longer make it permanent.
+  - The check reads `roleAssignmentScheduleInstances` (api 2020-10-01).
+  - In the preview, a time-bound assignment is a blocker.
+  - If PIM activates one while a block is on, the job leaves it in place and records it as drift.
+  - If PIM cannot be read, the preview warns and the job waits rather than removing.
+- **AS-155** (recommended defaults; the owner may revisit):
+  - The deploy's rollout waits 20 minutes, and it rolls back only after a crash or a failed verification, never on a timeout alone.
+  - The pre-migration dump refuses to run unless the database volume has at least the database's size free.
+- **UI-049:** reviewed in code. Only checkbox cells could clip their own focus ring, and they are now overflow-visible.
+- **AS-154:** reviewed and accepted as a risk, with the reasons in ISSUES.
+- **Final check, all green:**
+  - backend: vet, unit tests, ratchet 72, full governance suite (449 s), RLS flows;
+  - UI: type-check, 354 tests, lint with 0 errors;
+  - agent: every test except the two chart NOTES tests, which need a reachable cluster and were already failing before these changes.
+
+---
+
+## 2026-10-24 (cont.) — Verification pass, and Kubernetes access policies (backend, UI, iga-agent)
+
+### Checked against primary sources
+- **Bedrock.** Global inference profiles check the model as `arn:aws:bedrock:::foundation-model/<model>`, with no Region. That ARN is now denied explicitly. Whether application profiles and prompt routers also check the model is not settled by AWS's docs; the preview says so (`app_profiles_unverified`).
+- **Secrets Manager.** ListSecrets leaves out secrets scheduled for deletion by default, which is the documented `IncludePlannedDeletion` behaviour.
+- **KMS.** Grants only allow, so an identity Deny still wins.
+- **Lambda.** A function URL with auth type NONE skips IAM.
+- **Azure.**
+  - Every role GUID in the code matches Microsoft's built-in role pages: Key Vault, Search, Storage, Cognitive Services, Service Bus, Event Hubs, Reader, Contributor.
+  - The Key Vault plane missed ARM's `Microsoft.KeyVault/vaults/secrets/write`, which sets a value through management. A write block now takes it, and a broader holder is reported as inherited.
+- **Not checkable without an account:** the ARN a listing of SSM's root path is authorized on, DynamoDB's conditions, and the AS-135 PIM case.
+- **The one unexplained full-suite failure** did not recur in four further runs.
+
+### Kubernetes access policies (AS-165)
+- **Backend.**
+  - Migration 146: `iga_gov_k8s_access`, job `k8s_access`, instructions `remove_binding_subject`/`restore_binding_subject`, and `discovery_sources.enforcement_bindings`.
+  - A policy names a Role or ClusterRole (graph id) and ServiceAccounts. Only block and all access are allowed.
+  - One row per (ServiceAccount, binding), placed by the binding's `discovery_source_id`.
+  - The job queues the instruction in its own workspace transaction, waits for the agent, removes again on drift (a sweep at least 15 minutes after the removal still lists the subject), and restores into the recorded binding uid.
+  - Refusals: an agent without the switch (`k8s_agent_cannot_act`), no binding of the role (`k8s_no_binding`), and a second live block on the same subject and binding (`k8s_policy_conflict`).
+  - Capabilities report `access_policies.k8s`. A ServiceAccount's access names each role's `role_id`.
+  - Schema parity holds: fresh bootstrap equals an upgraded database.
+- **iga-agent** (branch `feat/iga-enforcement`, chart and app 0.5.0).
+  - Gated by `enforcement.bindings.enabled`, `namespaces`, `roles` and `clusterWide`.
+  - The agent reads and writes the whole binding object, conditional on `resourceVersion`, and retries on conflict.
+  - It reports the binding's uid only when it removed something. A restore into a replaced or deleted binding is reported, not done.
+  - The chart grants get/update on bindings and `bind` with `resourceNames` limited to the listed roles. It never grants `escalate`, `create` or `delete`. Unset value blocks fall back to chart defaults.
+  - The agent reports `bindings=` on its plan poll.
+- **UI.** Kubernetes is a provider when the server serves it. The picker chooses a ServiceAccount, then a role it holds. The rule is fixed to block all access.
+- **Not done:** allow (creating RoleBindings, which needs `bind` on every role customers want to grant), User/Group subjects, and a test against a live cluster. The NOTES chart tests need a reachable cluster in this environment and were already failing before this change.
+
+---
+
+## 2026-10-24 (cont.) — Kubernetes enforcement: prerequisites
+
+### Done
+- Mapped what Kubernetes access policies need (spec R1k, "blocked" until K-1 to K-3):
+  - The instruction kind CHECK (last set in 026) needs a migration for new kinds.
+  - The agent refuses payloads without `namespace` and `workload_name`, and has no RBAC client methods or RBAC write verbs.
+  - A binding is stored only as per-subject `iga_policy_assignment` rows; its UID and resourceVersion are dropped.
+  - Snapshots carry no ordering.
+- K-1, ordering half (AS-164): a snapshot whose sweep started no later than the last accepted sweep of its source and cluster is refused with 409 `sweep_stale`. The authentication half was already done (AS-014).
+
+### Next (needs the owner's go-ahead: it changes what the in-cluster agent may do in customer clusters)
+- **K-2:** keep the binding's UID and resourceVersion (agent and wire model), and read bindings by identity.
+- **K-3:** a separate actuation permission set in the Helm chart, per opted-in namespace:
+  - `get`/`list`/`patch` on rolebindings;
+  - `bind` limited by `resourceNames`;
+  - `create` on subjectaccessreviews;
+  - no `escalate`.
+- **Instruction kinds:**
+  - `remove_binding_subject` / `restore_binding_subject`, with a resourceVersion precondition and the before-state recorded;
+  - `apply_rolebinding` / `delete_rolebinding` for an allow;
+  - migration 146 for the kind CHECK;
+  - an `iga_gov_k8s_access` deployment table mirroring `iga_gov_azure_access`.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, steps 7 and 8 (both repos)
+
+### Step 7: Azure storage services, Service Bus, Event Hubs
+- A storage account block now covers blobs, queue messages, table entities and files, plus every key and SAS path (listKeys, listAccountSas, listServiceSas). A container stays blobs only. An allow on an account still assigns a blob role and says so (`azure_allow_blobs_only`).
+- New planes:
+  - queues (Storage Queue Data Reader/Contributor);
+  - tables (Table Data Reader/Contributor);
+  - file shares (SMB Share Reader/Contributor, which keep file ACLs);
+  - Service Bus and Event Hubs: receive is read, send is write, delete is refused. An allow names one level, because no built-in role does both without managing the namespace. SAS keys being on is warned (`azure_sas_keys_also`).
+- All role GUIDs and data actions were checked against Microsoft's built-in-roles and permissions pages.
+- Fixes:
+  - Each plane has its own data prefix (`dataNS`), so a blob role on the account neither reaches a queue nor counts as inherited.
+  - Wildcard data actions (`Microsoft.Storage/*`) count.
+  - The auth mode is read on the top-level resource. Before, an OpenAI deployment, search index or Service Bus queue read its own properties and was refused.
+
+### Resource-type descriptor (AS-163)
+- Capabilities' `access_policies.types` (`igagov.AccessKindViews`) list each AWS type: service, noun, prefix, block only, the levels a block may name and the levels an allow may name. The form takes its rules from it (`typeRules`) and falls back to its registry for an older server.
+
+### Step 8: Lambda, KMS, SQS, SNS
+- **Lambda.**
+  - Block: the function with every version and alias. A read block also refuses AddPermission, PutResourcePolicy and Create/UpdateFunctionUrlConfig.
+  - Allow: invoking only.
+  - The preview reads the function's resource policy from the last complete scan and warns `function_url_public` when a URL takes auth type NONE. No IAM block reaches such callers.
+- **KMS.** Block only. Read is decrypt and CreateGrant; write is encrypt, data keys, sign and administration; delete is deletion, disable and imported material. Multi-Region keys are denied in every Region.
+- **SQS.** Block every level and its hand-offs; allow the plain message actions.
+- **SNS.** Block subscribe, publish, delete and hand-offs; allow publishing only.
+- **UI.** One generic reader for these single-ARN types. The form shows only the levels an allow may name.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 6: Bedrock and AgentCore, block only (both repos)
+
+### Done
+- Action tables are now read from AWS's machine-readable service reference (`https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json`). The Secrets Manager and SSM tables were re-checked against it, and SSM gained the parameter resource policy (sharing) in its read block.
+- `BedrockModelTarget`: picked through a foundation-model ARN or a system inference profile (`us.`, `eu.`, `global.`...) of it. Denied in every region, together with the profiles that route to it. Also denied: InvokeModel/InvokeModelWithResponseStream on `*` with `StringLike bedrock:ModelArn`, which covers application profiles and prompt routers when AWS sets the key. Read means calling the model (Converse authorizes as InvokeModel) and batch jobs. Write means building on it (customization, provisioned throughput, profiles, routers, evaluations). Delete is refused.
+- `BedrockAgentTarget` (every alias and version) and `AgentCoreRuntimeTarget` (every endpoint), with read = invoke.
+- New discovery source for picking: the resolver accepts a discovered Bedrock agent or AgentCore runtime by its `iga_workload` id. Its ARN comes from the recognition key, and its placement from the workload's support rows. This works in preview, create, edit and every view. No collector change was needed: the workload scan already lists them.
+- UI: three new types (Allow off; Delete off for a model). Agents and runtimes are picked from the workloads list, models from records. The graph marks covered nodes.
+
+### Not covered / to check
+- OAuth (JWT authorizer) callers of a runtime do not use IAM.
+- Whether `bedrock:ModelArn` is present for application profiles and prompt routers.
+- Foundation models that no IAM policy names cannot be picked yet. A model list from the agents' `FoundationModel` attribute or from ListFoundationModels would add them.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 5: AWS SSM parameters, block only (both repos)
+
+### Done
+- `SSMParameterTarget` (`internal/igagov/access_ssm.go`), block only. Read: GetParameter(s), GetParameterHistory (it returns the current value), tags, and `AuthSecAccessPath`: GetParametersByPath on `parameter/` and every path above the parameter. The GetParametersByPath API reference says a role denied `/a/b` can still read it by listing `/a` recursively, so the block refuses listing those paths for its whole window (warned as `path_listing_blocked`). Write: PutParameter, labels, tags. Delete: DeleteParameter(s).
+- Discovery already types these ARNs as `ssm_parameter` (generic fallback); no existence check: the ARN is exact.
+- The block-only refusal now names the type's noun.
+- UI: the SSM parameter type (Allow off), `parameterOf`/`groupParameters`, graph coverage of the exact parameter.
+
+### To check against AWS
+- Which ARN a listing of the root path "/" is authorized on.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 4: Azure OpenAI / AI Services (both repos)
+
+### Done
+- A data-plane entry for `microsoft.cognitiveservices/accounts` (and `/deployments`). Read: every inference action (chat, completions, embeddings, audio, realtime, images, search) and reading files, stored completions, thread messages and responses. Write: files, fine-tunes, assistants, responses, batches, stored completions, deployments. Delete: the same objects. Every level includes `listKeys`/`regenerateKey` (a key reaches all data). The management read is not included, so Reader is never removed.
+- Allow: Cognitive Services OpenAI User (read; warned that it also creates assistants, responses and generations) or Contributor (write/delete).
+- ARM properties: no `customSubDomainName` → blocker `azure_ai_keys_only` (Entra tokens need it); local auth on → warning `azure_ai_keys_also`.
+- Role GUIDs and every action name were checked against Microsoft's built-in roles page and the provider operations page (2026-10-24); the Search role GUIDs from step 2 match as well.
+- UI: OpenAI access-level wording.
+
+### Not covered
+- Other data planes of an AI Services account (Speech, Language, Content Safety, MaaS): a role reaching only those is refused for read/write/delete (unclassified) and removed by "all".
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 3: AWS Secrets Manager, block only (both repos)
+
+### Done
+- `SecretTarget` (`internal/igagov/access_secretsmanager.go`), registered with `BlockOnly`. A block denies every secret named N in the account in every region (`arn:p:secretsmanager:*:A:secret:N-??????`): replicas, a secret re-created under the name and a pick through a selector row write the same document.
+- Read denies GetSecretValue (BatchGetSecretValue checks it per secret) and the paths that hand the value on: replicate, rotate, resource policy, tags. Write and delete add `AuthSecAccessOverwrite` (CreateSecret on `*` with `ForceOverwriteReplicaSecret` and `secretsmanager:Name`). Never denied: actions without a resource type (ListSecrets, BatchGetSecretValue, GetRandomPassword), which a scoped Deny cannot reach.
+- Service: an allow on a block-only type is refused (preview, create, edit); capabilities list `block_only`. The name is checked against ListSecrets of the latest published scan of the secret's own account: a complete scan that does not list it refuses (`resource_not_current`; this also catches a partial ARN such as `prod/db-backup` read as `prod/db`, and a secret scheduled for deletion), otherwise the warning `existence_not_verified`.
+- UI: the Secret type in the form (Allow off), `secretOf`/`groupSecrets`, graph coverage by account and name in any region.
+
+### To check against AWS
+- Which ARN CreateSecret is authorized against when it overwrites a replica (the statement uses `*` and the name condition until then). Whether ListSecrets leaves out secrets scheduled for deletion by default.
+- Step 3b (allow): the exact suffix and the UpdateSecret/DeleteSecret conditions on a live account.
+
+### Known gap
+- A secret reachable only through `Resource: "*"` has no Discovery row to pick. Projecting ListSecrets observations into `iga_resources` is a separate change.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 2: Azure Key Vault and AI Search (both repos)
+
+### Done
+- A per-type table of Azure data planes (`services/iga_gov_access_azure_planes.go`), built on Aman's `fix/azure-access-data-actions` review (its Key Vault and Search entries and role GUIDs kept; Service Bus and Event Hubs left for step 7 with their correct roles).
+- Key Vault secrets: read getSecret/readMetadata/backup, write setSecret/update/restore/recover, delete delete/purge; allow Key Vault Secrets User / Officer. AI Search documents: read/write/delete; query keys for read, admin keys for read, write and delete; allow Search Index Data Reader / Contributor.
+- Read on a mapped type no longer means the management read (a Reader role grants no secret): no false inherited-access blocker from a subscription Reader.
+- AS-121 narrowed: a data role is unclassified only if it has data outside the mapped plane (Key Vault keys and certificates are still refused; "all" removes them).
+- A live ARM read of the resource: vault on access policies and keys-only search service are blockers; a search service that also takes keys is a warning; an unreadable one a warning.
+- UI: access-level wording for vaults and search services.
+
+### To check against Azure
+- The four data role GUIDs and the data action names were checked against the reviewer's notes and memory, not against a live tenant; verify with `az role definition list` before release.
+
+---
+
+## 2026-10-24 (cont.) — Staging review findings, round 1 (both repos, `feat/iga-enforcement`)
+
+### Done
+- Plan items 9 and 11 finished: Azure gaps on Discovery as a closeable notice (UI-042); an own-app subscription read that timed out or was throttled is `not_checked`, not "Reader denied" (AS-126).
+- Access policies: failed AWS rows removed (AS-129), `$` in S3 folders (AS-130), End during a running check (AS-131), Azure inherited access after apply is drift (AS-132), Azure removals without R2 (AS-133), restore keeps condition version and description (AS-134), Azure scheduled status (AS-136), allow role warning (AS-139), 144 job-kind check (AS-140), quota warn at 10 / refuse at 20 (AS-141), list truncation (AS-142), Resume after a kept policy (AS-143), S3 tag/ACL/lifecycle/access points (AS-144), cross-workspace Edit/Pause/Resume/Delete tests, audit rows for the six access-policy routes (AS-138, part).
+- Azure onboarding: fail-closed credential lookups and recorded unconfigured app (AS-145), env overlay never in production (AS-146), internal errors hidden and session mismatch 404 (AS-147).
+- Links: every console path the backend writes is a page the console serves (AS-148, TestConsoleLinksNameServedPages).
+- Auto-scan scheduler: change after claim wins (AS-149), time zone without time (AS-150), cross-workspace test, CI runs the scheduler and governance schema suites (AS-151), scheduler_active deployment-wide (AS-152).
+- UI: UI-043 to UI-048.
+- Checkpoint: full governance suite (529 s), all unit tests, ratchet 72.
+
+### Open
+- AS-135 (PIM activations restored as permanent): needs a live tenant with PIM.
+- AS-138: the 21 R2/R3 mutation routes still have no audit_events assertion.
+- UI-049 (shared TableCell clipping): needs a visual pass.
+- AS-155 (deploy.yml rollback and backups): owner decision.
+
+---
+
+## 2026-10-24 — IGA enforcement, step 1: DynamoDB tables (branch `feat/iga-enforcement`, both repos)
+
+### Done
+- Backend: S3 documents pinned byte for byte (`71a413a`); a resource type is now an `AWSAccessTarget` registered in `igagov.AccessKinds()`, with one statement builder for every type (`ef6e8b6`); the service plans, previews and builds views through the target and the view gains `resource_type` and `region` (`fa9e531`); the DynamoDB table target (`31dd58b`); DynamoDB in the service (`4eaa3d3`) and its integration tests (`fd6fc4d`).
+- DynamoDB semantics (checked against the AWS Service Authorization Reference, copies in the session scratchpad): a block denies the item actions on the table and everything under it, plus for read the stream, export, restores, AWS Backup jobs, Kinesis streaming, cross-account replicas, every PartiQL write and writes that ask for the item back; for delete DeleteTable and TTL; creating a replica of the table in any region (checked on the replica's ARN). An allow is item access on the table and its indexes only (DescribeTable with read; without read no PartiQL and ReturnValues NONE). Not closable in IAM, so a preview note: a write whose condition fails returns the item.
+- Owner decisions applied: a block may name a table in another account, an allow may not (`resource_other_account`); a row no current scan supports is `resource_not_current`; patterns and global-table ARNs are refused.
+- UI: resource-type registry (`18d634b`), API types (`50cd45a`), S3 pins (`c972595`), bucket/table switch and table picker (`e923bfe`), graph marks and card (`e5f606c`).
+
+### To check against a live AWS account
+- `aws iam simulate-principal-policy` for the generated documents (action names, the replica-region ARN). Condition keys DynamoDB actually sets (PartiQL `RETURNING`, `ReturnValuesOnConditionCheckFailure`) need real calls on a test table.
+
+---
+
+## 2026-10-23 — IGA enforcement, step 0: Azure access fixes (branch `feat/iga-enforcement`)
+
+On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure access bugs first, then extend enforcement one service at a time (DynamoDB, Key Vault/AI Search, Secrets Manager, ...), then Kubernetes. Committed locally; nothing pushed.
+
+### Done
+- AS-118: Azure onboarding returns only to origins AuthSec serves (`3dc402d`).
+- AS-119: a block that ends hands the assignments it removed to another live block on the same principal that still needs them gone (an edited policy's new version, another policy) instead of restoring them; an approved row holding handed assignments ends through `expiring`, so they are restored. `revoked` is appended atomically.
+- AS-120: preview blocker `azure_policy_conflict` (block and allow on the same principal, overlapping scopes; the policy's own rows excluded on edit/resume); blocks never record AuthSec's allow assignments.
+- AS-121: on non-storage resources "all" also removes roles with data actions in the provider namespace; read/write/delete with such a role is a preview blocker `azure_data_access_unclassified`.
+- Tests: `TestAccessPolicyAzureOverlappingBlocks`, `TestAccessPolicyAzureBlockAndAllow`, `TestAccessPolicyAzureNonStorageData` (all three fail on the old code); the Azure test setup is shared (`azLab`).
+- AS-122: a restore Azure can never accept (principal, role or resource gone) is skipped and recorded, and the row ends, so the policy can be deleted; transient errors keep retrying. AS-123: a block that fails to deploy after removing assignments restores them first, then ends `failed`. `TestAccessPolicyAzureRestoreFailures`, `TestAccessPolicyAzureFailedDeployRestores` (both fail on the old code).
+- AS-124 (both repos): `/iga/policy/setup[/section]` forwards to a connection's tab with the query kept, so Slack messages already sent work; Notifications appear on Azure connections; readiness remedies name the identity page or the connection's IaC tab.
+- AS-125: the schema guard counts 137/144's tables, and its key checks (hidden behind the count) list 144's connector/identity ids and both tables' `created_by` with reasons; `tests/igagovschema` passes.
+- Azure gap notices on Discovery: not a bug. Akash removed the strip on purpose (1d1d9d9, abaa356); gaps stay on the connection's Overview and Coverage tabs. Only the stale comment was fixed (UI `da15334`).
+- AS-126: `ConnectCustom` reads subscriptions 4 at a time (`customSubscriptionReads`), so large tenants no longer time out.
+- AS-127: new enforcement bindings get template v2 only while R2 is available (schema verified), else v1.
+- The full governance suite (`IGA_TEST_DSN` only; with `TEST_DATABASE_URL` also set, one test resets the database under the others) and all unit tests pass.
+
+### Next
+- Step 0 is done. Allow re-apply stays as it is (owner's decision, 2026-10-23): an allow removed outside AuthSec is re-applied at the next check on AWS and Azure, and ending the policy is how access is revoked.
+- Next: step 1, AWS DynamoDB access policies.
+
+---
+
 ## 2026-10-22 — Azure access policies reach data planes (branch `fix/azure-access-data-actions`)
 
 ### Done

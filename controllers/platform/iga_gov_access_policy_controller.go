@@ -65,17 +65,18 @@ func (ctl *IGAGovPolicyController) ListAccessPolicies(c *gin.Context) {
 			}
 			limit = n
 		}
-		out, next, err := ctl.access().List(c.Request.Context(), ws, services.AccessListQuery{Status: c.Query("status"),
+		pg, err := ctl.access().ListPage(c.Request.Context(), ws, services.AccessListQuery{Status: c.Query("status"),
 			Effect: c.Query("effect"), Q: c.Query("q"), ResourceID: c.Query("resource_id"),
 			IdentityAccountID: c.Query("identity_account_id"), Cursor: c.Query("cursor"), Provider: c.Query("provider"), Limit: limit})
 		if err != nil {
 			return nil, nil, err
 		}
 		var cur any
-		if next != "" {
-			cur = next
+		if pg.Next != "" {
+			cur = pg.Next
 		}
-		return out, gin.H{"next_cursor": cur}, nil
+		// truncated: only the newest policies were read; search to narrow.
+		return pg.Policies, gin.H{"next_cursor": cur, "truncated": pg.Truncated}, nil
 	})
 }
 

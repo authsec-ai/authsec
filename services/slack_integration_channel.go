@@ -227,7 +227,7 @@ func (s *SlackIntegrationService) approvalRequest(ctx context.Context, db *gorm.
 	if err != nil {
 		return nil, err
 	}
-	r := &slackapp.ApprovalRequest{PolicyName: pol.Name, VersionNo: v.VersionNo, Link: govConsoleLink("/iga/policy/approvals"),
+	r := &slackapp.ApprovalRequest{PolicyName: pol.Name, VersionNo: v.VersionNo, Link: govConsoleLink("/iga/policy"),
 		Value: slackapp.ButtonValue{Notification: n.ID.String(), Digest: approvalDigest(pv.Hashes)}.Encode()}
 	consumers := map[string]bool{}
 	for _, p := range pv.Plans {
@@ -323,7 +323,7 @@ func renderApprovalRequestNotice(db *gorm.DB, n *models.IGAGovNotification, _ *u
 	}); err != nil {
 		return nil, err
 	}
-	link := govConsoleLink("/iga/policy/approvals")
+	link := govConsoleLink("/iga/policy")
 	title := fmt.Sprintf("Approval requested: %s (v%d)", pol.Name, v.VersionNo)
 	text := title + "\n"
 	if link != "" {
@@ -392,14 +392,18 @@ func InstallSlackApp(svc *SlackIntegrationService) (restore func()) {
 	}
 }
 
+// SlackNotSetUp is what a console user reads when the Slack app is not
+// installed. The operator's detail (which setting is missing) is logged at
+// startup (cmd/main.go), never shown to workspace users.
+const SlackNotSetUp = "Slack is not set up on this server. Ask your AuthSec administrator to set it up."
+
 // SlackAvailable is the capabilities "slack" flag: the Slack app is
 // installed in this process (configured: signing secret, Vault, API).
 func SlackAvailable() (bool, string) {
 	if _, ok := govNoticeChannel(GovChannelSlack); ok {
 		return true, ""
 	}
-	return false, "Slack is not configured on this server: set " + SlackSigningSecretEnv +
-		" and the Slack app's client_id / client_secret in Vault."
+	return false, SlackNotSetUp
 }
 
 // SlackStatusForSettings is the Slack block of GET /policy/settings.

@@ -86,7 +86,7 @@ const inventoryScopeAWSAccount = "aws_account"
 // inventoryParams are every parameter the inventory lists accept; anything
 // else is 400 invalid_parameter.
 var inventoryParams = map[string]bool{
-	"provider": true, "kind": true, "scope": true, "q": true, "lifecycle": true,
+	"provider": true, "kind": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
 	"limit": true, "cursor": true, "facets": true, "sort": true,
 }
 
@@ -94,7 +94,7 @@ var inventoryParams = map[string]bool{
 // the filters that apply to all three classes. kind is class-specific, and
 // paging, sort and facets have no meaning for counts.
 var inventorySummaryParams = map[string]bool{
-	"provider": true, "scope": true, "q": true, "lifecycle": true,
+	"provider": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
 }
 
 // inventorySorts are the sort values: by name (then id), or most recently
@@ -591,6 +591,12 @@ func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *i
 	req := &inventoryRequest{providers: providers, scopes: inventoryValues(p, "scope"), kinds: inventoryValues(p, "kind")}
 	fs = append(fs, listsIn("provider", c.alias+".provider", providers)...)
 	fs = append(fs, listsIn("kind", c.kindCol, req.kinds)...)
+	// exclude_kind leaves kinds out (UI-056: Azure's Resources list without
+	// Entra permissions). Tagged as the kind facet, so the kind chips still
+	// count what it leaves out and one click shows them.
+	if ex := inventoryValues(p, "exclude_kind"); len(ex) > 0 {
+		fs = append(fs, listsFilter{facet: "kind", sql: c.kindCol + " NOT IN ?", args: []any{ex}})
+	}
 	fs = append(fs, listsIn("scope", c.scopeIDSQL(), req.scopes)...)
 	return fs, req, nil
 }

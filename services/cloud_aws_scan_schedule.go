@@ -170,6 +170,9 @@ type AWSScanScheduler struct {
 	runs  repositories.CloudScanRunRepository
 	now   func() time.Time
 	tick  time.Duration
+	// claimed runs between the claim and serving each schedule (tests: an
+	// administrator's change landing in that window).
+	claimed func(repositories.DueSchedule)
 }
 
 func NewAWSScanScheduler(db *gorm.DB) *AWSScanScheduler {
@@ -184,6 +187,12 @@ func NewAWSScanScheduler(db *gorm.DB) *AWSScanScheduler {
 
 // WithClock replaces time.Now, so a test can move through slots.
 func (s *AWSScanScheduler) WithClock(f func() time.Time) *AWSScanScheduler { s.now = f; return s }
+
+// WithClaimed runs f after each schedule is claimed and before it is served.
+func (s *AWSScanScheduler) WithClaimed(f func(repositories.DueSchedule)) *AWSScanScheduler {
+	s.claimed = f
+	return s
+}
 
 // Run ticks until ctx ends.
 func (s *AWSScanScheduler) Run(ctx context.Context) {
@@ -214,6 +223,9 @@ func (s *AWSScanScheduler) RunOnce(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("claim due schedules: %w", err)
 	}
 	for _, d := range due {
+		if s.claimed != nil {
+			s.claimed(d)
+		}
 		s.serve(ctx, d, now)
 	}
 	return len(due), nil
@@ -262,8 +274,14 @@ func (s *AWSScanScheduler) serve(ctx context.Context, d repositories.DueSchedule
 		next = scanslot.NextDue(spec, now, jit)
 	}
 	if err := tenancy.InWorkspace(ctx, s.db, d.WorkspaceID, func(tx *gorm.DB) error {
-		return s.sched.Advance(tx, d.WorkspaceID, d.ConnectorID, now, next)
+		return s.sched.Advance(tx, d.WorkspaceID, d.ConnectorID, now, next, d.ClaimedUntil)
 	}); err != nil {
+		if errors.Is(err, repositories.ErrScheduleChanged) {
+			// Turned off, paused or given a new time since the claim: the
+			// administrator's version stands, and nothing is queued.
+			log.Printf("[aws-sched] stage=advance outcome=schedule_changed %s", lg)
+			return
+		}
 		log.Printf("[aws-sched] stage=advance outcome=error %s err=%v", lg, err)
 		return
 	}
@@ -316,21 +334,32 @@ type ScanScheduleView struct {
 	TimeOfDay *string `json:"time_of_day"`
 	Timezone  string  `json:"timezone"`
 	DayOfWeek *int    `json:"day_of_week"`
-	// SchedulerActive is false when the scheduler loop is not running in this
-	// process (the scan worker is disabled or has no Vault): the settings are
-	// kept but nothing runs on them.
+	// SchedulerActive is false when no scheduler is evidently serving this
+	// schedule: not this process, and the schedule is overdue (no scheduler
+	// anywhere picked it up). Behind a load balancer the process answering may
+	// not run the loop while another does, so the process alone cannot say.
 	SchedulerActive bool `json:"scheduler_active"`
 }
 
+// schedOverdueAfter: a running scheduler serves a due schedule within a tick
+// and a claim lease; one left due longer has no scheduler serving it.
+const schedOverdueAfter = schedTick + schedClaimLease + 9*time.Minute
+
 func scheduleViewOf(s *models.CloudScanSchedule) *ScanScheduleView {
+	return scheduleViewAt(s, time.Now(), SchedulerRunning())
+}
+
+func scheduleViewAt(s *models.CloudScanSchedule, now time.Time, running bool) *ScanScheduleView {
 	v := &ScanScheduleView{
 		IntervalMinutes: models.ScanScheduleDefaultIntervalMinutes,
 		Timezone:        "UTC",
-		SchedulerActive: SchedulerRunning(),
+		SchedulerActive: running,
 	}
 	if s == nil {
 		return v
 	}
+	overdue := s.Enabled && s.PausedReason == "" && s.NextDueAt != nil && now.Sub(*s.NextDueAt) > schedOverdueAfter
+	v.SchedulerActive = running || !overdue
 	if s.Timezone != "" {
 		v.Timezone = s.Timezone
 	}
@@ -517,7 +546,12 @@ func (s *AWSScanScheduleService) PutWithTiming(
 				Param: "day_of_week", Msg: "day_of_week is required for a weekly schedule with a chosen time"}
 			return nil
 		}
-		timingChanged := !intPtrEq(curTod, newTod) || !intPtrEq(curDow, newDow) || curTz != newTz
+		if newTod == nil {
+			// A weekday or a time zone means nothing without a chosen time:
+			// the weekday is not kept, and neither moves the next scan.
+			newDow = nil
+		}
+		timingChanged := !intPtrEq(curTod, newTod) || (newTod != nil && (!intPtrEq(curDow, newDow) || curTz != newTz))
 
 		now := s.now()
 		next := &models.CloudScanSchedule{

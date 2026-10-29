@@ -271,6 +271,10 @@ type DiscoverySource struct {
 	// PodDisruptionBudget. The last and narrowest capability: an operator may well
 	// permit deleting a workload while never permitting a budget to be overruled.
 	EnforcementForceEvict bool `json:"enforcement_force_evict" gorm:"not null;default:false"`
+	// EnforcementBindings is whether the agent may remove a subject from a
+	// RoleBinding or ClusterRoleBinding and put it back (146; Kubernetes
+	// access policies).
+	EnforcementBindings bool `json:"enforcement_bindings" gorm:"not null;default:false"`
 
 	CreatedBy string    `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt time.Time `json:"created_at"`

@@ -12,6 +12,7 @@ package integration
 //	sp-reader  --grant-->  [Reader]                     --target-->  scope "Subscription Authnull"
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -296,5 +297,38 @@ func TestP2AzureGraphIsolation(t *testing.T) {
 	if code, body := graphDirect(t, r, igaread.DefaultGraphBudgets, f.ws, "/graph", "root", refOf("resource", f.storage),
 		"direction", "reverse"); code != 200 {
 		t.Errorf("workspace A: %d %v", code, body)
+	}
+}
+
+// AS-168: an Azure tenant's connection is named by its organization name once
+// a scan has stored it, and by its id until then -- never another workspace's.
+func TestP2AzureConnectionNamedByTenant(t *testing.T) {
+	f := newAzGraphFixture(t, "p2-azure-conn-name")
+	r := igaread.NewReader(f.db, readTestCursorKey)
+	nameOf := func(ws uuid.UUID) string {
+		t.Helper()
+		res, err := r.ListConnections(wsCtx(context.Background(), ws))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range res.(igaread.ConnectionList).Connections {
+			if c.Provider == "azure" && c.ScopeID == f.tenant {
+				return c.Name
+			}
+		}
+		return ""
+	}
+	if got := nameOf(f.ws); got != f.tenant {
+		t.Fatalf("before a scan read the name: %q, want the tenant id", got)
+	}
+	if err := f.db.Exec(`UPDATE cloud_connector SET attrs = attrs || '{"tenant_display_name":"Authnull"}'::jsonb
+	                      WHERE workspace_id = ? AND scope_kind = 'tenant' AND scope_id = ?`, f.ws, f.tenant).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := nameOf(f.ws); got != "Authnull" {
+		t.Fatalf("after: %q, want Authnull", got)
+	}
+	if got := nameOf(newP2Lab(t, "p2-azure-conn-name-b", false).ws); got != "" {
+		t.Fatalf("another workspace lists the tenant as %q", got)
 	}
 }

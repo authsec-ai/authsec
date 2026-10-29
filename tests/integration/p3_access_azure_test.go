@@ -28,6 +28,21 @@ type fakeRBAC struct {
 	mu   sync.Mutex
 	defs []azure.RoleDefinition
 	as   map[string]azure.RoleAssignment // by lower-case id
+	// putErr / delErr, when set, answer a write instead of the fake.
+	putErr func(azure.RoleAssignmentSpec) error
+	delErr func(id string) error
+	// props are resources' ARM properties by lower-case id (absent: not found).
+	props map[string]map[string]any
+	// pim are Privileged Identity Management schedule instances by principal;
+	// pimErr, when set, answers instead.
+	pim    map[string][]azure.RoleAssignmentScheduleInstance
+	pimErr error
+}
+
+func (f *fakeRBAC) GetResourceProperties(_ context.Context, _, id, _ string) (map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.props[strings.ToLower(id)], nil
 }
 
 func (f *fakeRBAC) ListRoleAssignmentsForPrincipal(_ context.Context, _, _, principal string) ([]azure.RoleAssignment, error) {
@@ -49,6 +64,11 @@ func (f *fakeRBAC) ListRoleDefinitions(context.Context, string, string) ([]azure
 func (f *fakeRBAC) PutRoleAssignment(_ context.Context, _ string, s azure.RoleAssignmentSpec) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.putErr != nil {
+		if err := f.putErr(s); err != nil {
+			return "", err
+		}
+	}
 	id := s.Scope + "/providers/Microsoft.Authorization/roleAssignments/" + s.Name
 	var a azure.RoleAssignment
 	a.ID, a.Name = id, s.Name
@@ -70,8 +90,22 @@ func (f *fakeRBAC) GetRoleAssignment(_ context.Context, _, id string) (*azure.Ro
 func (f *fakeRBAC) DeleteRoleAssignment(_ context.Context, _, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.delErr != nil {
+		if err := f.delErr(id); err != nil {
+			return err
+		}
+	}
 	delete(f.as, strings.ToLower(id))
 	return nil
+}
+
+// ListRoleAssignmentScheduleInstances answers the PIM instances set in pim
+// (by principal).
+func (f *fakeRBAC) ListRoleAssignmentScheduleInstances(_ context.Context, _, _, principal string) ([]azure.RoleAssignmentScheduleInstance, error) {
+	if f.pimErr != nil {
+		return nil, f.pimErr
+	}
+	return f.pim[principal], nil
 }
 
 func (f *fakeRBAC) CallerPermissions(context.Context, string, string) ([]azure.Permission, error) {
@@ -98,81 +132,150 @@ func azureDef(t *testing.T, sub, guid string, actions, dataActions []string) azu
 	return d
 }
 
-func TestAccessPolicyAzure(t *testing.T) {
+// azLab is a workspace with one connected subscription holding the storage
+// account stdemo, over a fakeRBAC.
+type azLab struct {
+	*apLab
+	t             *testing.T
+	ctx           context.Context
+	fake          *fakeRBAC
+	tenantID, sub string
+	scope         string // stdemo
+	res           uuid.UUID
+}
+
+func newAzLab(t *testing.T) *azLab {
 	l := newAPLab(t)
 	if err := services.VerifyAzureAccessSchema(l.db); err != nil {
 		t.Skip(err.Error())
 	}
-	ctx := context.Background()
-	tenantID, sub := uuid.NewString(), uuid.NewString()
-	scope := "/subscriptions/" + sub + "/resourcegroups/rg/providers/microsoft.storage/storageaccounts/stdemo"
-
+	z := &azLab{apLab: l, t: t, ctx: context.Background(), tenantID: uuid.NewString(), sub: uuid.NewString()}
+	z.scope = "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.storage/storageaccounts/stdemo"
 	p3exec(t, l.db, `INSERT INTO cloud_connector (workspace_id, provider, scope_kind, scope_id, parent_scope_id, status, auth_ref, attrs)
 		VALUES (?, 'azure', 'subscription', ?, ?, 'active', 'vault://azure/test', jsonb_build_object('display_name', 'Authnull', 'tenant_id', ?::text))`,
-		l.ws, sub, tenantID, tenantID)
-	res := uuid.New()
-	p3exec(t, l.db, `INSERT INTO iga_resources (id, workspace_id, resource_kind, display_name, provider, source_key)
-		VALUES (?, ?, 'storage_account', 'stdemo', 'azure', ?)`, res, l.ws, "azure\x1f"+tenantID+"\x1fresource\x1f"+scope)
-	principal := func(name string) (uuid.UUID, string) {
-		id, oid := uuid.New(), uuid.NewString()
-		p3exec(t, l.db, `INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key, display_name, provider_attrs)
-			VALUES (?, ?, ?, 'azure', ?, 'immutable', ?, ?, '{}'::jsonb)`,
-			id, l.ws, models.CloudIdentityEntraServicePrincipal, "azure\x1f"+tenantID+"\x1fobject\x1f"+oid, oid, name)
-		return id, oid
+		l.ws, z.sub, z.tenantID, z.tenantID)
+	z.res = z.resource("storage_account", "stdemo", z.scope)
+	z.fake = &fakeRBAC{as: map[string]azure.RoleAssignment{}, defs: []azure.RoleDefinition{
+		azureDef(t, z.sub, azure.RoleStorageBlobDataReader, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"}),
+		azureDef(t, z.sub, azure.RoleStorageBlobDataContributor, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*"}),
+		azureDef(t, z.sub, azure.RoleReader, []string{"*/read"}, nil),
+		azureDef(t, z.sub, roleKeyVaultSecretsUser, nil, []string{"Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/secrets/readMetadata/action"}),
+		azureDef(t, z.sub, roleKeyVaultCryptoUser, nil, []string{"Microsoft.KeyVault/vaults/keys/decrypt/action", "Microsoft.KeyVault/vaults/keys/read"}),
+		azureDef(t, z.sub, azure.RoleSearchIndexDataReader, nil, []string{"Microsoft.Search/searchServices/indexes/documents/read"}),
+		azureDef(t, z.sub, azure.RoleSearchIndexDataContributor, nil, []string{"Microsoft.Search/searchServices/indexes/documents/*"}),
+	}, props: map[string]map[string]any{}}
+	t.Cleanup(services.SetAzureAccessDeps(&services.AzureAccessDeps{RBAC: z.fake,
+		Token: func(context.Context, uuid.UUID, string) (string, error) { return "tok", nil }}))
+	return z
+}
+
+// Key Vault Secrets User and Crypto User: data actions only.
+const (
+	roleKeyVaultSecretsUser = azure.RoleKeyVaultSecretsUser
+	roleKeyVaultCryptoUser  = "12338af0-0e69-4776-bea7-57ae8d297424"
+)
+
+func (z *azLab) resource(kind, name, scope string) uuid.UUID {
+	id := uuid.New()
+	p3exec(z.t, z.db, `INSERT INTO iga_resources (id, workspace_id, resource_kind, display_name, provider, source_key)
+		VALUES (?, ?, ?, ?, 'azure', ?)`, id, z.ws, kind, name, "azure\x1f"+z.tenantID+"\x1fresource\x1f"+scope)
+	return id
+}
+
+func (z *azLab) principal(name string) (uuid.UUID, string) {
+	id, oid := uuid.New(), uuid.NewString()
+	p3exec(z.t, z.db, `INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key, display_name, provider_attrs)
+		VALUES (?, ?, ?, 'azure', ?, 'immutable', ?, ?, '{}'::jsonb)`,
+		id, z.ws, models.CloudIdentityEntraServicePrincipal, "azure\x1f"+z.tenantID+"\x1fobject\x1f"+oid, oid, name)
+	return id, oid
+}
+
+// assign gives the principal a role on scope.
+func (z *azLab) assign(scope, name, roleGUID, oid string) {
+	z.fake.PutRoleAssignment(z.ctx, "", azure.RoleAssignmentSpec{Scope: scope, Name: name,
+		RoleDefinitionID: azure.RoleDefinitionResourceID(z.sub, roleGUID), PrincipalID: oid, PrincipalType: "ServicePrincipal"})
+}
+
+// step runs the azure_access job of one row once.
+func (z *azLab) step(row uuid.UUID) {
+	t := z.t
+	t.Helper()
+	p3exec(t, z.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now(), lease_owner = '', lease_expires_at = NULL
+		WHERE workspace_id = ? AND kind = 'azure_access' AND status IN ('queued','running')`, z.ws)
+	if _, err := repositories.NewIGAGovJobRepository(z.db).EnqueueTx(z.db, &models.IGAGovJob{WorkspaceID: z.ws,
+		Kind: repositories.GovJobAzureAccess, SubjectID: &row, DedupeKey: "azure_access:" + row.String(), RunAfter: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
 	}
-	blocked, blockedOID := principal("sp-reader")
-	allowed, allowedOID := principal("sp-new")
-	wide, wideOID := principal("sp-sub-wide")
+	j := p3ClaimOwn(t, z.db, z.ws, "worker-az", 2*time.Minute, time.Now(), repositories.GovJobAzureAccess)
+	if j == nil {
+		t.Fatalf("no azure_access job for %s", row)
+	}
+	err := services.NewGovAccess(z.db).AzureAccessHandler(z.ctx, services.NewPolicyJobRun(z.db, *j, "worker-az"))
+	p3exec(t, z.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now() WHERE id = ?`, j.ID)
+	if err != nil && !isRetryLater(err) {
+		t.Fatalf("azure_access %s: %v", row, err)
+	}
+}
 
-	readerDef := azure.RoleDefinitionResourceID(sub, azure.RoleStorageBlobDataReader)
-	fake := &fakeRBAC{as: map[string]azure.RoleAssignment{}, defs: []azure.RoleDefinition{
-		azureDef(t, sub, azure.RoleStorageBlobDataReader, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"}),
-		azureDef(t, sub, azure.RoleStorageBlobDataContributor, nil, []string{"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*"}),
-		azureDef(t, sub, azure.RoleReader, []string{"*/read"}, nil),
-	}}
-	fake.PutRoleAssignment(ctx, "", azure.RoleAssignmentSpec{Scope: scope, Name: "orig-1", RoleDefinitionID: readerDef,
-		PrincipalID: blockedOID, PrincipalType: "ServicePrincipal"})
-	fake.PutRoleAssignment(ctx, "", azure.RoleAssignmentSpec{Scope: "/subscriptions/" + sub, Name: "wide-1",
-		RoleDefinitionID: azure.RoleDefinitionResourceID(sub, azure.RoleStorageBlobDataContributor), PrincipalID: wideOID, PrincipalType: "ServicePrincipal"})
-	defer services.SetAzureAccessDeps(&services.AzureAccessDeps{RBAC: fake,
-		Token: func(context.Context, uuid.UUID, string) (string, error) { return "tok", nil }})()
+// rows are the policy's Azure rows in a state, oldest version first.
+func (z *azLab) rows(policy uuid.UUID, states ...string) []models.IGAGovAzureAccess {
+	var rows []models.IGAGovAzureAccess
+	if err := z.db.Where("workspace_id = ? AND policy_id = ? AND state IN ?", z.ws, policy, states).Order("created_at").Find(&rows).Error; err != nil {
+		z.t.Fatal(err)
+	}
+	return rows
+}
 
-	run := func(policy uuid.UUID) {
-		t.Helper()
-		gov := services.NewGovAccess(l.db)
-		for pass := 0; pass < 6; pass++ {
-			var rows []models.IGAGovAzureAccess
-			l.db.Where("workspace_id = ? AND policy_id = ? AND state IN ?", l.ws, policy,
-				[]string{models.R2StateApproved, models.R2StateDeploying, models.R2StateExpiring}).Find(&rows)
-			if len(rows) == 0 {
-				return
-			}
-			for _, r := range rows {
-				p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now(), lease_owner = '', lease_expires_at = NULL
-					WHERE workspace_id = ? AND kind = 'azure_access' AND status IN ('queued','running')`, l.ws)
-				id := r.ID
-				if _, err := repositories.NewIGAGovJobRepository(l.db).EnqueueTx(l.db, &models.IGAGovJob{WorkspaceID: l.ws,
-					Kind: repositories.GovJobAzureAccess, SubjectID: &id, DedupeKey: "azure_access:" + id.String(), RunAfter: time.Now().Add(-time.Hour)}); err != nil {
-					t.Fatal(err)
-				}
-				j := p3ClaimOwn(t, l.db, l.ws, "worker-az", 2*time.Minute, time.Now(), repositories.GovJobAzureAccess)
-				if j == nil {
-					t.Fatalf("no azure_access job for %s", id)
-				}
-				err := gov.AzureAccessHandler(ctx, services.NewPolicyJobRun(l.db, *j, "worker-az"))
-				p3exec(t, l.db, `UPDATE iga_gov_job SET status = 'complete', completed_at = now() WHERE id = ?`, j.ID)
-				if err != nil && !isRetryLater(err) {
-					t.Fatalf("azure_access %s: %v", id, err)
-				}
-			}
+// run settles every row of the policy.
+func (z *azLab) run(policy uuid.UUID) {
+	z.t.Helper()
+	for pass := 0; pass < 6; pass++ {
+		rows := z.rows(policy, models.R2StateApproved, models.R2StateDeploying, models.R2StateExpiring)
+		if len(rows) == 0 {
+			return
 		}
-		t.Fatalf("Azure rows of %s did not settle", policy)
+		for _, r := range rows {
+			z.step(r.ID)
+		}
 	}
+	z.t.Fatalf("Azure rows of %s did not settle", policy)
+}
+
+func (z *azLab) intent(effect string, res, who uuid.UUID, access ...string) igagov.AccessIntent {
 	end := time.Now().Add(time.Hour)
-	intent := func(effect string, who uuid.UUID) igagov.AccessIntent {
-		return igagov.AccessIntent{Effect: effect, Resource: igagov.AccessResource{ResourceID: res.String()},
-			Roles: []igagov.AccessRole{{IdentityAccountID: who.String()}}, Access: []string{"read"}, EndsAt: &end}
+	if len(access) == 0 {
+		access = []string{"read"}
 	}
+	return igagov.AccessIntent{Effect: effect, Resource: igagov.AccessResource{ResourceID: res.String()},
+		Roles: []igagov.AccessRole{{IdentityAccountID: who.String()}}, Access: access, EndsAt: &end}
+}
+
+func (z *azLab) create(name string, in igagov.AccessIntent) *services.AccessPolicyView {
+	z.t.Helper()
+	v, err := z.svc.Create(z.ctx, z.ws, z.user, services.AccessPolicyRequest{AccessIntent: in, Name: name, Reason: "t"})
+	if err != nil {
+		z.t.Fatalf("create %s: %v", name, err)
+	}
+	return v
+}
+
+func (z *azLab) end(id uuid.UUID) {
+	z.t.Helper()
+	if _, err := z.svc.End(z.ctx, z.ws, z.user, id, services.AccessReasonRequest{Reason: "done"}); err != nil {
+		z.t.Fatal(err)
+	}
+}
+
+func TestAccessPolicyAzure(t *testing.T) {
+	z := newAzLab(t)
+	l, ctx, fake, sub, scope, res := z.apLab, z.ctx, z.fake, z.sub, z.scope, z.res
+	blocked, blockedOID := z.principal("sp-reader")
+	allowed, allowedOID := z.principal("sp-new")
+	wide, wideOID := z.principal("sp-sub-wide")
+	z.assign(scope, "orig-1", azure.RoleStorageBlobDataReader, blockedOID)
+	z.assign("/subscriptions/"+sub, "wide-1", azure.RoleStorageBlobDataContributor, wideOID)
+	run := z.run
+	intent := func(effect string, who uuid.UUID) igagov.AccessIntent { return z.intent(effect, res, who) }
 
 	// Block: the principal's own assignment is removed, then restored on End.
 	pv, err := l.svc.Preview(ctx, l.ws, intent("block", blocked))
@@ -192,7 +295,7 @@ func TestAccessPolicyAzure(t *testing.T) {
 	}
 	// The views say which cloud: resource provider/name/kind, role kind,
 	// the deployment's ARM scope.
-	if v.Resource.Provider != "azure" || v.Resource.Name != "stdemo" || v.Resource.Kind != "storage_account" ||
+	if v.Resource.Provider != "azure" || v.Resource.Name != "stdemo" || v.Resource.Kind != "storage_account" || v.Resource.ResourceType != "azure_resource" ||
 		v.Resource.ARN != scope || v.Resource.AccountID != sub || v.Resource.Bucket != "" {
 		t.Fatalf("resource view: %+v", v.Resource)
 	}
@@ -290,5 +393,503 @@ func TestAccessPolicyAzureWithout144(t *testing.T) {
 	l.run(v.ID)
 	if got, _, err := l.svc.List(ctx, l.ws, services.AccessListQuery{}); err != nil || len(got) != 1 || got[0].Resource.Provider != "aws" {
 		t.Fatalf("AWS list without 144: %+v %v", got, err)
+	}
+}
+
+// Two blocks keeping the same assignment removed: whichever ends first hands
+// it to the other instead of restoring it. Before, ending the first one gave
+// the access back while the second was active (until its next check), and
+// editing a block did the same whenever the old version ended after the new
+// one had deployed (it had found nothing left to record).
+func TestAccessPolicyAzureOverlappingBlocks(t *testing.T) {
+	z := newAzLab(t)
+	stillBlocked := func(oid, when string) {
+		t.Helper()
+		if got := z.fake.roles(oid); len(got) != 0 {
+			t.Fatalf("%s: the principal has %v back while a block is active", when, got)
+		}
+	}
+
+	// Two policies.
+	{
+		who, oid := z.principal("sp-two")
+		z.assign(z.scope, "two-1", azure.RoleStorageBlobDataReader, oid)
+		a := z.create("az block a", z.intent("block", z.res, who))
+		z.run(a.ID)
+		b := z.create("az block b", z.intent("block", z.res, who))
+		z.run(b.ID)
+		z.end(a.ID)
+		z.run(a.ID)
+		stillBlocked(oid, "after the first block ended")
+		z.end(b.ID)
+		z.run(b.ID)
+		if got := z.fake.roles(oid); len(got) != 1 || got[0] != azure.RoleStorageBlobDataReader {
+			t.Fatalf("after both ended: %v, want the reader back", got)
+		}
+	}
+
+	// An edit is make-before-break: the new version deploys (the assignment
+	// is already gone, so it records nothing), then the old one is
+	// superseded and ends.
+	// Editing a block.
+	{
+		who, oid := z.principal("sp-edit")
+		z.assign(z.scope, "edit-1", azure.RoleStorageBlobDataReader, oid)
+		v := z.create("az edit", z.intent("block", z.res, who))
+		z.run(v.ID)
+		stillBlocked(oid, "after the first version")
+		in := z.intent("block", z.res, who, "read", "write")
+		if _, err := z.svc.Edit(z.ctx, z.ws, z.user, v.ID, services.AccessPolicyRequest{AccessIntent: in, Name: v.Name, Reason: "wider",
+			BaseVersionNo: 1}); err != nil {
+			t.Fatalf("edit: %v", err)
+		}
+		cur := z.rows(v.ID, models.R2StateApproved)
+		if len(cur) != 1 {
+			t.Fatalf("after edit: %d approved rows", len(cur))
+		}
+		z.step(cur[0].ID)
+		old := z.rows(v.ID, models.R2StateExpiring)
+		if len(old) != 1 {
+			t.Fatalf("the new version is active but %d old rows are expiring", len(old))
+		}
+		z.step(old[0].ID)
+		stillBlocked(oid, "after the edit settled")
+		z.end(v.ID)
+		z.run(v.ID)
+		if got := z.fake.roles(oid); len(got) != 1 {
+			t.Fatalf("after End: %v, want the reader back", got)
+		}
+	}
+
+	// A handed assignment on a block that ends undeployed is restored.
+	{
+		who, oid := z.principal("sp-undeployed")
+		z.assign(z.scope, "undeployed-1", azure.RoleStorageBlobDataReader, oid)
+		a := z.create("az undeployed a", z.intent("block", z.res, who))
+		z.run(a.ID)
+		b := z.create("az undeployed b", z.intent("block", z.res, who))
+		bRow := z.rows(b.ID, models.R2StateApproved)[0]
+		z.end(a.ID)
+		z.run(a.ID) // hands over to b's approved row
+		stillBlocked(oid, "after the hand-over")
+		z.end(b.ID) // b never deployed; it holds the assignment
+		if got := z.rows(b.ID, models.R2StateExpiring); len(got) != 1 || got[0].ID != bRow.ID {
+			t.Fatalf("b's row should be expiring to restore: %+v", got)
+		}
+		z.run(b.ID)
+		if got := z.fake.roles(oid); len(got) != 1 {
+			t.Fatalf("after b ended: %v, want the reader back", got)
+		}
+	}
+}
+
+// A block and an allow on the same principal and resource cannot run at the
+// same time: Azure has no deny, so the two would undo each other. And a block
+// never takes over AuthSec's own allow assignment: it would restore it at its
+// end as standing access.
+func TestAccessPolicyAzureBlockAndAllow(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-both")
+
+	allow := z.create("az allow", z.intent("allow", z.res, who))
+	z.run(allow.ID)
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who))
+	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureConflict {
+		t.Fatalf("block over an active allow: %+v %v", pv, err)
+	}
+	if _, err := z.svc.Create(z.ctx, z.ws, z.user, services.AccessPolicyRequest{AccessIntent: z.intent("block", z.res, who),
+		Name: "az conflicting block", Reason: "t"}); err == nil {
+		t.Fatal("a block over an active allow was created")
+	}
+	z.end(allow.ID)
+	z.run(allow.ID)
+
+	other, _ := z.principal("sp-blocked-first")
+	block := z.create("az block first", z.intent("block", z.res, other))
+	z.run(block.ID)
+	if pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("allow", z.res, other)); err != nil || len(pv.Blockers) != 1 ||
+		pv.Blockers[0].Code != services.GovCodeAzureConflict {
+		t.Fatalf("allow over an active block: %+v %v", pv, err)
+	}
+	z.end(block.ID)
+	z.run(block.ID)
+
+	// Editing an allow into a block: the new block deploys while the old
+	// allow's assignment is still there. It is not the block's to record.
+	v := z.create("az allow then block", z.intent("allow", z.res, who))
+	z.run(v.ID)
+	if _, err := z.svc.Edit(z.ctx, z.ws, z.user, v.ID, services.AccessPolicyRequest{AccessIntent: z.intent("block", z.res, who),
+		Name: v.Name, Reason: "now block", BaseVersionNo: 1}); err != nil {
+		t.Fatalf("edit allow into block: %v", err)
+	}
+	z.step(z.rows(v.ID, models.R2StateApproved)[0].ID)
+	z.step(z.rows(v.ID, models.R2StateExpiring)[0].ID)
+	if got := z.fake.roles(oid); len(got) != 0 {
+		t.Fatalf("while blocked: %v", got)
+	}
+	z.end(v.ID)
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 0 {
+		t.Fatalf("the block's end gave the allow's assignment back as standing access: %v", got)
+	}
+}
+
+// Key Vault secrets are mapped (step 2): read, write and delete name their
+// data actions, so a read block removes Key Vault Secrets User and End puts it
+// back. Data the mapping does not cover (Key Vault keys) is still refused for
+// read/write/delete and removed by "all" (AS-121).
+func TestAccessPolicyAzureNonStorageData(t *testing.T) {
+	z := newAzLab(t)
+	kvScope := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.keyvault/vaults/kvdemo"
+	z.fake.props[kvScope] = map[string]any{"enableRbacAuthorization": true}
+	kv := z.resource("key_vault", "kvdemo", kvScope)
+	who, oid := z.principal("sp-secrets")
+	z.assign(kvScope, "kv-1", roleKeyVaultSecretsUser, oid)
+
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, who, "read"))
+	if err != nil || len(pv.Blockers) != 0 {
+		t.Fatalf("read block over Secrets User: %+v %v", pv, err)
+	}
+	v := z.create("az kv read", z.intent("block", kv, who, "read"))
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 0 {
+		t.Fatalf("a read block left %v", got)
+	}
+	z.end(v.ID)
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 1 || got[0] != roleKeyVaultSecretsUser {
+		t.Fatalf("after End: %v", got)
+	}
+	// A write block leaves a read-only secrets role alone, with no refusal.
+	if pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, who, "write")); err != nil || len(pv.Blockers) != 0 {
+		t.Fatalf("write block over Secrets User: %+v %v", pv, err)
+	}
+
+	// Keys are not mapped: a read block over Crypto User is refused, "all" removes it.
+	keyWho, keyOID := z.principal("sp-keys")
+	z.assign(kvScope, "kv-keys", roleKeyVaultCryptoUser, keyOID)
+	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, keyWho, "read"))
+	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureDataUnclassified ||
+		!strings.Contains(pv.Blockers[0].Message, "other than its Key Vault secrets") {
+		t.Fatalf("read block over a keys role: %+v %v", pv, err)
+	}
+	v = z.create("az kv all", z.intent("block", kv, keyWho, "all"))
+	z.run(v.ID)
+	if got := z.fake.roles(keyOID); len(got) != 0 {
+		t.Fatalf("an all block left %v", got)
+	}
+
+	// A subscription-wide secrets role is inherited (read now maps to it).
+	wideWho, wideOID := z.principal("sp-secrets-wide")
+	z.assign("/subscriptions/"+z.sub, "kv-wide", roleKeyVaultSecretsUser, wideOID)
+	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", kv, wideWho, "read"))
+	if err != nil || len(pv.Blockers) != 1 || pv.Blockers[0].Code != services.GovCodeAzureInherited {
+		t.Fatalf("read block over a subscription-wide secrets role: %+v %v", pv, err)
+	}
+}
+
+// What role assignments cannot control is refused: a vault on access
+// policies, a search service on API keys only. A search service that also
+// takes keys is warned. An allow assigns the type's data role.
+func TestAccessPolicyAzureKeyVaultAndSearch(t *testing.T) {
+	z := newAzLab(t)
+	legacy := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.keyvault/vaults/kvlegacy"
+	z.fake.props[legacy] = map[string]any{"enableRbacAuthorization": false}
+	legacyRes := z.resource("key_vault", "kvlegacy", legacy)
+	keysOnly := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.search/searchservices/srchkeys"
+	z.fake.props[keysOnly] = map[string]any{}
+	keysOnlyRes := z.resource("search_service", "srchkeys", keysOnly)
+	both := "/subscriptions/" + z.sub + "/resourcegroups/rg/providers/microsoft.search/searchservices/srchboth"
+	z.fake.props[both] = map[string]any{"authOptions": map[string]any{"aadOrApiKey": map[string]any{}}}
+	bothRes := z.resource("search_service", "srchboth", both)
+	who, oid := z.principal("sp-search")
+
+	for _, c := range []struct {
+		name   string
+		res    uuid.UUID
+		effect string
+		code   string
+	}{
+		{"block on a vault on access policies", legacyRes, "block", services.GovCodeAzureVaultAccessPolicies},
+		{"allow on a vault on access policies", legacyRes, "allow", services.GovCodeAzureVaultAccessPolicies},
+		{"block on a keys-only search service", keysOnlyRes, "block", services.GovCodeAzureSearchKeysOnly},
+	} {
+		pv, err := z.svc.Preview(z.ctx, z.ws, z.intent(c.effect, c.res, who, "read"))
+		if err != nil || len(pv.Blockers) == 0 || pv.Blockers[0].Code != c.code {
+			t.Errorf("%s: %+v %v", c.name, pv, err)
+		}
+	}
+
+	// Allow read on a search service that also takes keys: warned, and
+	// Search Index Data Reader is assigned.
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("allow", bothRes, who, "read"))
+	if err != nil || len(pv.Blockers) != 0 || !strings.Contains(fmt.Sprint(pv.Warnings), services.GovCodeAzureSearchKeys) {
+		t.Fatalf("allow on a search service with keys too: %+v %v", pv, err)
+	}
+	v := z.create("az search allow", z.intent("allow", bothRes, who, "read"))
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 1 || got[0] != azure.RoleSearchIndexDataReader {
+		t.Fatalf("the allow assigned %v", got)
+	}
+}
+
+// A restore Azure can never accept (the principal, role or resource is gone)
+// ends the policy and records what was not restored; before, it retried
+// forever, so the policy stayed "ending" and could not be deleted. A
+// transient failure keeps retrying and keeps the policy undeletable.
+func TestAccessPolicyAzureRestoreFailures(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-deleted-later")
+	z.assign(z.scope, "gone-1", azure.RoleStorageBlobDataReader, oid)
+	v := z.create("az restore gone", z.intent("block", z.res, who))
+	z.run(v.ID)
+
+	// Transient: still ending, not deletable.
+	z.fake.putErr = func(azure.RoleAssignmentSpec) error {
+		return &azure.APIError{Service: "arm", Status: 503, Code: "ServiceUnavailable", Message: "try later"}
+	}
+	z.end(v.ID)
+	row := z.rows(v.ID, models.R2StateExpiring)[0]
+	z.step(row.ID)
+	if got := z.rows(v.ID, models.R2StateExpiring); len(got) != 1 {
+		t.Fatalf("a transient restore failure ended the row: %+v", got)
+	}
+	var ge *services.GovError
+	if err := z.svc.Delete(z.ctx, z.ws, z.user, v.ID); !errors.As(err, &ge) || ge.Code != services.GovCodePolicyRemoving {
+		t.Fatalf("delete while restoring: %v, want policy_removing", err)
+	}
+
+	// Permanent: the principal was deleted in Entra.
+	z.fake.putErr = func(azure.RoleAssignmentSpec) error {
+		return &azure.APIError{Service: "arm", Status: 400, Code: "PrincipalNotFound", Message: "Principal does not exist"}
+	}
+	z.step(row.ID)
+	var done models.IGAGovAzureAccess
+	if err := z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).First(&done).Error; err != nil {
+		t.Fatal(err)
+	}
+	if done.State != models.R2StateRevoked || !strings.Contains(done.StateReason, "could not be restored") {
+		t.Fatalf("after a permanent failure: state %s, reason %q", done.State, done.StateReason)
+	}
+	if err := z.svc.Delete(z.ctx, z.ws, z.user, v.ID); err != nil {
+		t.Fatalf("delete after the restore gave up: %v", err)
+	}
+}
+
+// A block whose deploy fails after removing some assignments restores them
+// before it ends failed. Before, it failed at once and they stayed removed
+// with no row left to bring them back.
+func TestAccessPolicyAzureFailedDeployRestores(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-partial")
+	z.assign(z.scope, "partial-1", azure.RoleStorageBlobDataReader, oid)
+	z.assign(z.scope+"/blobservices/default/containers/c1", "partial-2", azure.RoleStorageBlobDataReader, oid)
+	deletes := 0
+	z.fake.delErr = func(string) error {
+		if deletes++; deletes == 2 {
+			return &azure.APIError{Service: "arm", Status: 503, Code: "ServiceUnavailable", Message: "try later"}
+		}
+		return nil
+	}
+	v := z.create("az partial", z.intent("block", z.res, who))
+	row := z.rows(v.ID, models.R2StateApproved)[0]
+	z.step(row.ID) // one removed, the other fails: retry
+	if got := z.fake.roles(oid); len(got) != 1 {
+		t.Fatalf("after the partial deploy: %v", got)
+	}
+	// Meanwhile the principal gains the access from the subscription: the
+	// deploy cannot complete.
+	z.fake.delErr = nil
+	z.assign("/subscriptions/"+z.sub, "partial-wide", azure.RoleStorageBlobDataReader, oid)
+	z.step(row.ID)
+	var done models.IGAGovAzureAccess
+	if err := z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).First(&done).Error; err != nil {
+		t.Fatal(err)
+	}
+	if done.State != models.R2StateFailed || !strings.Contains(done.StateReason, services.GovCodeAzureInherited) {
+		t.Fatalf("after the failed deploy: state %s, reason %q", done.State, done.StateReason)
+	}
+	if got := z.fake.roles(oid); len(got) != 3 {
+		t.Fatalf("the failed deploy left %v, want both resource assignments back plus the subscription one", got)
+	}
+}
+
+// Access that appears at a broader scope after a block went live cannot be
+// removed from one resource: the policy reads drift with the scope, instead
+// of staying "active" while the access is back.
+func TestAccessPolicyAzureInheritedAfterApply(t *testing.T) {
+	z := newAzLab(t)
+	who, oid := z.principal("sp-later-wide")
+	z.assign(z.scope, "own-1", azure.RoleStorageBlobDataReader, oid)
+	v := z.create("az inherited later", z.intent("block", z.res, who))
+	z.run(v.ID)
+	row := z.rows(v.ID, models.R2StateActive)[0]
+	z.assign("/subscriptions/"+z.sub, "later-wide", azure.RoleStorageBlobDataReader, oid)
+	z.step(row.ID)
+
+	got, err := z.svc.Get(z.ctx, z.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusDrift || !strings.Contains(got.StatusReason, services.GovCodeAzureInherited) {
+		t.Fatalf("after the broader assignment: %s %q %v", got.Status, got.StatusReason, err)
+	}
+	if d := got.Deployments[0]; d.Drift != services.GovCodeAzureInherited {
+		t.Fatalf("deployment: %+v", d)
+	}
+	var stored models.IGAGovAzureAccess
+	z.db.Where("workspace_id = ? AND id = ?", z.ws, row.ID).Take(&stored)
+	if !strings.Contains(stored.StateReason, "/subscriptions/"+z.sub) {
+		t.Fatalf("state reason does not name the scope: %q", stored.StateReason)
+	}
+	// Removed again: the next check clears the drift.
+	z.fake.DeleteRoleAssignment(z.ctx, "", "/subscriptions/"+z.sub+"/providers/Microsoft.Authorization/roleAssignments/later-wide")
+	z.step(row.ID)
+	if got, _ = z.svc.Get(z.ctx, z.ws, v.ID); got.Status != services.AccessStatusActive {
+		t.Fatalf("after the broader assignment is gone: %s", got.Status)
+	}
+}
+
+// With R2 unavailable (its schema not verified) the Azure schedule still takes
+// out what must end: an Azure assignment has no expiry of its own, so an
+// allow past its end would stay. Nothing is deployed or checked meanwhile.
+func TestAccessPolicyAzureRemovalWithoutR2(t *testing.T) {
+	z := newAzLab(t)
+	allowWho, allowOID := z.principal("sp-allow-r2-off")
+	blockWho, blockOID := z.principal("sp-block-r2-off")
+	z.assign(z.scope, "keep-1", azure.RoleStorageBlobDataReader, blockOID)
+	allow := z.create("az allow r2 off", z.intent("allow", z.res, allowWho))
+	block := z.create("az block r2 off", z.intent("block", z.res, blockWho))
+	z.run(allow.ID)
+	z.run(block.ID)
+	allowRow := z.rows(allow.ID, models.R2StateActive)[0]
+	// The allow's window is over.
+	p3exec(t, z.db, `UPDATE iga_gov_azure_access SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 minute'
+		WHERE workspace_id = ? AND id = ?`, z.ws, allowRow.ID)
+	// No job ran recently (a periodic job is not queued again within its interval).
+	p3exec(t, z.db, `DELETE FROM iga_gov_job WHERE workspace_id = ? AND kind = 'azure_access'`, z.ws)
+
+	prev := services.PolicyR2GateState()
+	services.SetPolicyR2Gate(services.NewPolicyR2Gate(true)) // not verified: unavailable
+	t.Cleanup(func() { services.SetPolicyR2Gate(prev) })
+	w := services.NewPolicyJobWorker(z.db, "az-r2-off")
+	services.RegisterAzureAccessJobs(w, z.db)
+	if _, err := w.Scheduler().RunSchedulesNow(z.ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var queued []uuid.UUID
+	z.db.Model(&models.IGAGovJob{}).Where("workspace_id = ? AND kind = 'azure_access' AND status = 'queued'", z.ws).Pluck("subject_id", &queued)
+	if len(queued) != 1 || queued[0] != allowRow.ID {
+		t.Fatalf("queued %v, want only the expired allow %s", queued, allowRow.ID)
+	}
+	z.step(allowRow.ID)
+	if got := z.fake.roles(allowOID); len(got) != 0 {
+		t.Fatalf("the expired allow's assignment is still there: %v", got)
+	}
+	// The block is not checked while R2 is unavailable.
+	blockRow := z.rows(block.ID, models.R2StateActive)[0]
+	z.assign(z.scope, "back-1", azure.RoleStorageBlobDataReader, blockOID)
+	z.step(blockRow.ID)
+	if got := z.fake.roles(blockOID); len(got) != 1 {
+		t.Fatalf("a check ran while R2 is unavailable: %v", got)
+	}
+}
+
+// An Azure policy that starts later waits with its rows approved: it reads
+// scheduled, not applying (nothing is being applied yet).
+func TestAccessPolicyAzureScheduled(t *testing.T) {
+	z := newAzLab(t)
+	who, _ := z.principal("sp-later")
+	in := z.intent("block", z.res, who)
+	start := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	end := start.Add(time.Hour)
+	in.StartsAt, in.EndsAt = &start, &end
+	v := z.create("az later", in)
+	z.step(z.rows(v.ID, models.R2StateApproved)[0].ID) // waits for its start
+	got, err := z.svc.Get(z.ctx, z.ws, v.ID)
+	if err != nil || got.Status != services.AccessStatusScheduled {
+		t.Fatalf("a policy that starts in an hour: %s %q %v", got.Status, got.StatusReason, err)
+	}
+}
+
+// An Azure allow of write on a storage account assigns Storage Blob Data
+// Contributor, which also reads and deletes: the preview says so.
+func TestAccessPolicyAzureAllowBroaderRoleWarned(t *testing.T) {
+	z := newAzLab(t)
+	who, _ := z.principal("sp-writer")
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("allow", z.res, who, "write"))
+	if err != nil || len(pv.Blockers) != 0 {
+		t.Fatalf("preview: %+v %v", pv, err)
+	}
+	for _, w := range pv.Warnings {
+		if w.Code == "azure_broad_role" && strings.Contains(w.Message, "also allows read and delete") {
+			return
+		}
+	}
+	t.Fatalf("no warning that the role also reads and deletes: %+v", pv.Warnings)
+}
+
+// The 144 check also requires the job queue to admit azure_access: a job-kind
+// CHECK re-created without it (AS-115's kind of regression) refused every
+// Azure deployment's job while Azure policies read available.
+func TestVerifyAzureAccessSchemaNeedsJobKind(t *testing.T) {
+	l := newAPLab(t)
+	if err := services.VerifyAzureAccessSchema(l.db); err != nil {
+		t.Skip(err.Error())
+	}
+	tx := l.db.Begin()
+	defer tx.Rollback()
+	if err := tx.Exec(`ALTER TABLE iga_gov_job DROP CONSTRAINT iga_gov_job_kind_check`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(`ALTER TABLE iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check CHECK (kind IS NOT NULL)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := services.VerifyAzureAccessSchema(tx)
+	if err == nil || !strings.Contains(err.Error(), "azure_access") {
+		t.Fatalf("a queue that does not admit azure_access verified: %v", err)
+	}
+}
+
+// AS-135: an assignment Privileged Identity Management activated (or one with
+// an end date) is never removed: restoring it at the end would make it
+// permanent. The preview refuses; one activated while a block is on is left
+// in place and reported as drift; PIM that cannot be read is warned.
+func TestAccessPolicyAzureTimeBoundAssignments(t *testing.T) {
+	z := newAzLab(t)
+	z.fake.pim = map[string][]azure.RoleAssignmentScheduleInstance{}
+	who, oid := z.principal("sp-pim")
+	z.assign(z.scope, "pim-1", azure.RoleStorageBlobDataReader, oid)
+	id := strings.ToLower(z.scope + "/providers/Microsoft.Authorization/roleAssignments/pim-1")
+	z.fake.pim[oid] = []azure.RoleAssignmentScheduleInstance{{OriginRoleAssignmentID: id, AssignmentType: "Activated", EndDateTime: "2026-10-25T00:00:00Z"}}
+	if got := previewCode(z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who))); got != services.GovCodeAzureTimeBound {
+		t.Fatalf("a PIM activation: %s", got)
+	}
+
+	// A standing assignment is blocked; an activation that appears later is
+	// left in place and is drift.
+	z.fake.pim[oid] = []azure.RoleAssignmentScheduleInstance{{OriginRoleAssignmentID: id, AssignmentType: "Assigned"}}
+	v := z.create("az pim", z.intent("block", z.res, who))
+	z.run(v.ID)
+	if got := z.fake.roles(oid); len(got) != 0 {
+		t.Fatalf("the standing assignment stayed: %v", got)
+	}
+	z.assign(z.scope, "pim-2", azure.RoleStorageBlobDataReader, oid)
+	id2 := strings.ToLower(z.scope + "/providers/Microsoft.Authorization/roleAssignments/pim-2")
+	z.fake.pim[oid] = append(z.fake.pim[oid], azure.RoleAssignmentScheduleInstance{OriginRoleAssignmentID: id2, AssignmentType: "Activated"})
+	row := z.rows(v.ID, models.R2StateActive)[0]
+	z.step(row.ID)
+	got := z.rows(v.ID, models.R2StateActive)
+	if len(got) != 1 || got[0].Drift != services.GovCodeAzureTimeBound || len(z.fake.roles(oid)) != 1 {
+		t.Fatalf("after a PIM activation: %+v %v", got, z.fake.roles(oid))
+	}
+	if strings.Contains(string(got[0].Revoked), "pim-2") {
+		t.Fatal("the activation was recorded for restore")
+	}
+
+	// PIM unreadable: warned, not refused.
+	z.fake.pimErr = errors.New("forbidden")
+	who2, oid2 := z.principal("sp-pim-unread")
+	z.assign(z.scope, "pim-3", azure.RoleStorageBlobDataReader, oid2)
+	pv, err := z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who2))
+	if err != nil || len(pv.Blockers) != 0 || !hasWarning(pv, "azure_pim_unchecked") {
+		t.Fatalf("PIM unreadable: %+v %v", pv, err)
 	}
 }
