@@ -237,7 +237,8 @@ func TestP2IngestAuthMatrix(t *testing.T) {
 	}
 
 	// Accepted bodies are the handlers' own: the same keys with a token in
-	// enforce as with auth off.
+	// enforce as with auth off -- bar the registration's "actuation", which
+	// only a verified caller is told (p2_actuation_handover_test.go).
 	offKeys := map[string]string{}
 	for _, mode := range []string{"off", "warn", "enforce"} {
 		t.Setenv(services.DiscoveryIngestAuthEnv, mode)
@@ -251,6 +252,9 @@ func TestP2IngestAuthMatrix(t *testing.T) {
 					if !is2xx(code) {
 						t.Errorf("%s: %d %v, want 2xx", label, code, body)
 						continue
+					}
+					if r.path == "/agent-registration" && c.bearer != "" {
+						delete(body, "actuation")
 					}
 					if mode == "off" && c.bearer == "" {
 						offKeys[r.path] = sortedKeys(body)

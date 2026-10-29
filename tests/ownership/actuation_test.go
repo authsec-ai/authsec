@@ -288,7 +288,7 @@ func TestQuarantineEnqueueIsIdempotent(t *testing.T) {
 // like enforcement is pending when nothing will ever pick it up.
 func TestEnqueueRefusesAClusterWithoutActuation(t *testing.T) {
 	f := newActFixture(t)
-	exec(t, f.raw, `UPDATE discovery_sources SET actuation_token_hash = '' WHERE id = $1`, f.source)
+	exec(t, f.raw, `UPDATE discovery_sources SET actuation_token_hash = '', actuation_enabled_at = NULL WHERE id = $1`, f.source)
 
 	if _, _, err := f.am.Enqueue(f.ws, services.EnqueueInstructionInput{
 		DiscoverySourceID: f.source,

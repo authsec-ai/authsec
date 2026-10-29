@@ -285,6 +285,10 @@ type DiscoverySource struct {
 	Connected bool `json:"connected" gorm:"-"`
 	// SecondsSinceHeartbeat is nil when the connector has never heartbeated.
 	SecondsSinceHeartbeat *int64 `json:"seconds_since_heartbeat,omitempty" gorm:"-"`
+	// ActuationState is derived at read time from the actuation columns: off,
+	// pending (turned on, waiting for the cluster's agent to hand over its
+	// credential) or on.
+	ActuationState string `json:"actuation_state" gorm:"-"`
 
 	// AgentCount is how many discovered agents this source has produced. Computed
 	// on read, not stored — a count that can drift from the rows it counts is
@@ -313,7 +317,30 @@ const HeartbeatGracePeriod = 5 * time.Minute
 // path derives explicitly.
 func (s *DiscoverySource) AfterFind(*gorm.DB) error {
 	s.DeriveConnected(time.Now())
+	s.DeriveActuationState()
 	return nil
+}
+
+// Actuation states (DiscoverySource.ActuationState).
+const (
+	ActuationOff = "off"
+	// ActuationPending: turned on in the console; the cluster's agent has not
+	// yet handed over the credential it generated. Discovery still reports
+	// under the ingest token, and queued work waits for the agent.
+	ActuationPending = "pending"
+	ActuationOn      = "on"
+)
+
+// DeriveActuationState fills ActuationState from the stored columns.
+func (s *DiscoverySource) DeriveActuationState() {
+	switch {
+	case s.ActuationTokenHash != "":
+		s.ActuationState = ActuationOn
+	case s.ActuationEnabledAt != nil:
+		s.ActuationState = ActuationPending
+	default:
+		s.ActuationState = ActuationOff
+	}
 }
 
 // DeriveConnected fills the read-time liveness fields from LastHeartbeatAt.

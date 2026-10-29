@@ -673,11 +673,21 @@ func (ctl *GovernanceController) actuation() services.ActuationManager {
 	return services.NewActuationManager(ctl.db)
 }
 
+// EnableActuationRequest is the optional body of POST .../actuation.
+type EnableActuationRequest struct {
+	// Delivery "agent" lets the cluster's agent generate its credential and hand
+	// it over on its next heartbeat, so nobody copies a token into a Secret.
+	// Empty mints a token and returns it once, for an agent configured by hand.
+	Delivery string `json:"delivery"`
+}
+
 // EnableActuation handles POST /authsec/governance/connectors/:id/actuation.
 //
-// Mints the per-connector actuation token and returns it ONCE. Only a hash is stored,
-// so a leaked database backup yields nothing usable — and re-calling this rotates the
-// credential, invalidating the previous one.
+// With {"delivery":"agent"} the connector turns pending and its agent hands
+// over the credential it generated (RequestActuation). Otherwise it mints the
+// per-connector actuation token and returns it ONCE. Only a hash is stored,
+// so a leaked database backup yields nothing usable — and re-calling either
+// rotates the credential, invalidating the previous one.
 func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 	wsID, err := ctl.workspace(c)
 	if err != nil {
@@ -687,6 +697,28 @@ func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 	id, err := pathID(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req EnableActuationRequest
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	switch req.Delivery {
+	case "":
+	case "agent":
+		if err := ctl.actuation().RequestActuation(wsID, id); err != nil {
+			governanceError(c, err)
+			return
+		}
+		auditAdminMutation(c, wsID.String(), "enable_actuation", "discovery_source",
+			id.String(), http.StatusOK, nil, gin.H{"actuation_enabled": true, "delivery": "agent"})
+		c.JSON(http.StatusOK, gin.H{"actuation_enabled": true, "actuation_state": models.ActuationPending})
+		return
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": `delivery is "agent" or empty`})
 		return
 	}
 

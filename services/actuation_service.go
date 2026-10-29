@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -41,6 +42,20 @@ type ActuationManager interface {
 	// EnableActuation mints a per-connector actuation token, returning it ONCE. Only a
 	// hash is stored.
 	EnableActuation(workspaceID, sourceID uuid.UUID) (token string, err error)
+
+	// RequestActuation turns enforcement on without showing anyone a token: the
+	// cluster's agent (0.6.0+, actuation role) generates its own credential and
+	// hands it over on its next heartbeat (AcceptAgentToken). Until then the
+	// connector is pending: discovery still reports under the ingest token, so
+	// turning enforcement on never cuts discovery off. Calling it on a connector
+	// that is on rotates: the old credential stops working at once and the agent
+	// hands over a new one.
+	RequestActuation(workspaceID, sourceID uuid.UUID) error
+
+	// AcceptAgentToken takes the credential a pending connector's agent offers,
+	// returning whether it was taken. Only a pending connector takes one, and
+	// only once: after that, discovery for the connector needs the credential.
+	AcceptAgentToken(workspaceID, sourceID uuid.UUID, token string) (bool, error)
 
 	// DisableActuation turns a cluster's enforcement off: its token stops working
 	// and the cluster reports under its discovery ingest token again. Refused
@@ -180,6 +195,46 @@ func (m *actuationManager) EnableActuation(workspaceID, sourceID uuid.UUID) (str
 	return token, nil
 }
 
+func (m *actuationManager) RequestActuation(workspaceID, sourceID uuid.UUID) error {
+	var src models.DiscoverySource
+	if err := m.db.First(&src, "id = ? AND workspace_id = ?", sourceID, workspaceID).Error; err != nil {
+		return err
+	}
+	if !src.SelfRegistered {
+		return errors.New("actuation can only be enabled on a self-registered connector: " +
+			"there must be an agent in the cluster to act")
+	}
+	now := time.Now()
+	return m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ?", sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash": "",
+			"actuation_enabled_at": now,
+			"updated_at":           now,
+		}).Error
+}
+
+// agentTokenBody is what follows "authsec_act_" in a credential an agent
+// generates: at least 32 random bytes, base64url without padding, as
+// EnableActuation mints them.
+var agentTokenBody = regexp.MustCompile(`^[A-Za-z0-9_-]{43,128}$`)
+
+func (m *actuationManager) AcceptAgentToken(workspaceID, sourceID uuid.UUID, token string) (bool, error) {
+	if !strings.HasPrefix(token, "authsec_act_") || !agentTokenBody.MatchString(strings.TrimPrefix(token, "authsec_act_")) {
+		return false, errors.New("an actuation credential is authsec_act_ and at least 32 random bytes, base64url")
+	}
+	// Conditional on still being pending, so two replicas offering at once (or
+	// an offer racing a Turn off) cannot replace a credential already taken.
+	res := m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ? AND actuation_enabled_at IS NOT NULL AND actuation_token_hash = ''",
+			sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash": hashActuationToken(token),
+			"updated_at":           time.Now(),
+		})
+	return res.RowsAffected == 1, res.Error
+}
+
 // ActuationInUseError is DisableActuation's refusal: what still needs the
 // cluster's agent to act, by kind.
 type ActuationInUseError struct {
@@ -198,7 +253,7 @@ func (m *actuationManager) DisableActuation(workspaceID, sourceID uuid.UUID) err
 	if err := m.db.First(&src, "id = ? AND workspace_id = ?", sourceID, workspaceID).Error; err != nil {
 		return err
 	}
-	if src.ActuationTokenHash == "" {
+	if src.ActuationTokenHash == "" && src.ActuationEnabledAt == nil {
 		return nil // already off
 	}
 	var use ActuationInUseError
@@ -279,7 +334,9 @@ func (m *actuationManager) Enqueue(workspaceID uuid.UUID,
 		in.DiscoverySourceID, workspaceID).Error; err != nil {
 		return nil, false, fmt.Errorf("unknown connector for this workspace: %w", err)
 	}
-	if src.ActuationTokenHash == "" {
+	// Pending counts: the agent takes the work up as soon as it has handed over
+	// its credential, within a heartbeat.
+	if src.ActuationEnabledAt == nil {
 		return nil, false, errors.New("actuation is not enabled for this cluster: enable it " +
 			"and install the agent with the actuation role before queuing work")
 	}

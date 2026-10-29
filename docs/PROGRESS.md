@@ -4,6 +4,18 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-29 — Enforcement turns on from the console alone (UI-060)
+
+- Why: turning enforcement on still meant copying a token into a Secret and a Helm upgrade that swapped the agent's discovery credential, and discovery was refused until that ran. On k3s-master the upgrade failed (no `actuation.namespaces`) and discovery was 401 again.
+- Backend: `POST /governance/connectors/:id/actuation` with `{"delivery":"agent"}` turns the connector **pending** (`actuation_enabled_at` set, no hash). Discovery stays on the ingest token. The registration response carries `actuation` (off/pending/on) to a verified caller; a pending connector takes the credential the agent offers (`actuation_token` in the body) once, only from a call a valid ingest token authenticated (never warn/off-mode unauthenticated), then refuses the ingest token as before. Re-posting rotates; DELETE turns off. Work can queue while pending. No migration: pending is "enabled, no hash". The old token-shown-once path (empty body) is unchanged.
+- iga-agent 0.6.0 (`internal/credential`): with the actuation role and no token given by hand, the agent generates its credential, stores it in `<release>-actuation` (chart renders it with no data and grants get/update on that name only) with a conditional update so replicas converge on one, and offers it when the heartbeat says pending. A refused credential is dropped for good and discovery falls back to the ingest token (a hand-given token too). The heartbeat reports `actuation_credential` none/fixed/managed.
+- UI: Turn on / Rotate / Turn off are one click; the tab says when the agent cannot take it up (no role, a hand-given token, older than 0.6.0) and gives the one Helm command (namespaces and binding roles, `--reset-then-reuse-values`, copy disabled while incomplete). No token panel, no Secret command, no switch-back step.
+- Still a cluster-admin step by design: which namespaces the agent may write in (Kubernetes RBAC cannot be widened from the console).
+- iga-agent 0.6.0 (`f854ec2`, image `iga-agent:0.6.0`, amd64+arm64) deployed to k3s-master as Helm revision 12, keeping the release's values: it still uses the hand-minted token (`actuation.existingSecret=authsec-iga-actuation`, controlPlane on the same Secret), so it behaves as 0.5.0 did until the backend with the hand-over is live. Then: run the Enforcement tab's command (it points controlPlane back at `authsec-iga-ingest` and clears the hand-given token), press Rotate, and delete the `authsec-iga-actuation` Secret.
+- Backend and UI are committed on `authsec-staging`; the owner builds and deploys them.
+
+---
+
 ## 2026-10-28 (cont.) — Enforcement on k3s-master; turning it off (UI-058, UI-059)
 
 - Enforcement turned on for k3s-master from the console. Minting the token cut the cluster's discovery for 7 minutes (UI-058): the server then accepts its reports only under that token. The agent (Helm revision 7-9) now sends it for discovery and actuation; quarantine and access policies act only in `agent-live-demo` (role `llm-key-reader`).

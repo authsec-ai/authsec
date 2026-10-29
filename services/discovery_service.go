@@ -415,6 +415,7 @@ func (m *discoveryManager) RegisterAgent(workspaceID uuid.UUID, in AgentRegistra
 	}
 	// Explicit here because AfterFind does not fire for a Create with RETURNING.
 	stored.DeriveConnected(now)
+	stored.DeriveActuationState()
 	return stored, created, nil
 }
 

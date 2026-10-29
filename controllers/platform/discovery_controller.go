@@ -112,6 +112,10 @@ type AgentRegistrationRequest struct {
 	// has actually produced output. An idle cluster's agent is healthy but has
 	// nothing to sync.
 	ReportedSightings int64 `json:"reported_sightings,omitempty"`
+	// ActuationToken is the credential the agent generated, offered while its
+	// connector is pending (the response's "actuation"). Taken only from a call
+	// a valid ingest token authenticated; see RegisterAgent.
+	ActuationToken string `json:"actuation_token,omitempty"`
 }
 
 // LifecycleEventRequest is the body for POST /authsec/discovery/lifecycle — a
@@ -692,7 +696,49 @@ func (ctl *DiscoveryController) RegisterAgent(c *gin.Context) {
 	if conn != nil {
 		resp["source"] = source
 	}
+	// Where enforcement stands, so an agent with the actuation role knows when
+	// to hand over its credential. Only to a verified caller: it says whether
+	// this cluster is enforcing.
+	verified := conn != nil || c.GetString(ctxIngestTokenID) != ""
+	if verified {
+		resp["actuation"] = source.ActuationState
+	}
+	if req.ActuationToken != "" && conn == nil {
+		ctl.acceptAgentToken(c, wsID, source, req.ActuationToken, verified, resp)
+	}
 	c.JSON(status, resp)
+}
+
+// acceptAgentToken takes the credential a pending connector's agent offers.
+//
+// The offer rides on the agent's ingest token, so only a call that token
+// verified may make it -- in warn or off mode an unauthenticated registration
+// would otherwise let anyone who knows a workspace and instance id become the
+// cluster's enforcer. It is taken once: from then on discovery for the
+// connector needs the credential (ingress), so an ingest-token holder cannot
+// replace it. Turning enforcement on again (rotation) is what reopens it.
+func (ctl *DiscoveryController) acceptAgentToken(c *gin.Context, wsID uuid.UUID,
+	source *models.DiscoverySource, token string, verified bool, resp gin.H) {
+
+	if !verified {
+		resp["actuation_error"] = "an actuation credential is only taken from a call a valid ingest token authenticates"
+		return
+	}
+	if source.ActuationState != models.ActuationPending {
+		return
+	}
+	ok, err := services.NewActuationManager(ctl.db).AcceptAgentToken(wsID, source.ID, token)
+	if err != nil {
+		resp["actuation_error"] = err.Error()
+		return
+	}
+	if !ok {
+		// Taken by another replica's offer, or turned off, since the row was read.
+		return
+	}
+	resp["actuation"] = models.ActuationOn
+	auditAdminMutation(c, wsID.String(), "accept_actuation_credential", "discovery_source",
+		source.ID.String(), http.StatusOK, nil, gin.H{"actuation_state": models.ActuationOn})
 }
 
 // ReportLifecycleEvent handles POST /authsec/discovery/lifecycle — a connector
