@@ -786,6 +786,12 @@ func (m *k8sRBACManager) upsertAssignments(tx *gorm.DB, workspaceID uuid.UUID,
 // assignmentIDs maps live assignment source keys to ids. iga_policy_assignment
 // has no provider column of its own, so it is narrowed by the key prefix every
 // Kubernetes key carries.
+//
+// LIVE ONLY. A key keeps its ended rows (a removed connection ends them with
+// connection_removed) beside the live one a later sweep writes. Without the
+// live predicate the map held whichever row the scan returned last, a grant
+// could be attached to an ended assignment, and the reconcile cascade then
+// ended the grant on every sweep.
 func (m *k8sRBACManager) assignmentIDs(tx *gorm.DB,
 	workspaceID uuid.UUID) (map[string]uuid.UUID, error) {
 
@@ -797,6 +803,7 @@ func (m *k8sRBACManager) assignmentIDs(tx *gorm.DB,
 		Select("id, source_key").
 		Where("workspace_id = ? AND source_key LIKE ?", workspaceID,
 			models.ProviderK8s+k8sgraph.Sep+"%").
+		Where(liveAssignment).
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
