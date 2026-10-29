@@ -4,6 +4,15 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-10-30 — Enforcement with nothing to list (UI-062)
+
+- Owner's call: the agent watches the whole cluster and agents can land in any namespace, so the namespace entry is unnecessary. Quarantine now reaches every namespace by default (iga-agent 0.6.1: one ClusterRole for networkpolicies and reading pods; the agent itself refuses kube-system, kube-public, kube-node-lease and its own namespace). Destruction stays in Roles per `enforcement.deleteNamespaces`.
+- Access policies keep named roles (owner chose "named roles, offered when needed"): `bind` on every role would let a compromised agent or control plane make itself cluster-admin. RoleBindings are changed in every namespace; the agent reports `binding_roles` on its heartbeat; a policy for a role not allowed is refused naming it (`detail.role`, `detail.allowed_roles` on the preview blocker) and the form shows the command that adds it.
+- UI: the setup dialog has "Let AuthSec enforce" instead of namespaces; the Enforcement tab has no namespace fields and says why access policies are off.
+- To do: release iga-agent 0.6.1 (`make release` in iga-agent; the session's push was refused as a new public surface). The UI's commands name chart 0.6.1, so release it before deploying this UI.
+
+---
+
 ## 2026-10-29 (cont.) — Kubernetes onboarding without cloning anything (UI-061)
 
 - The iga-agent chart is published as an OCI artifact beside the image: `oci://docker-repo-public.authnull.com/charts/authsec-iga-agent` (pulls are anonymous, checked). `make chart-push` publishes it, `make release` pushes the image under its appVersion and then the chart. `image.tag` defaults to the appVersion, not the mutable `production` tag (which points at an old build reporting "dev").
