@@ -330,6 +330,9 @@ type (
 		Code    string `json:"code"`
 		Message string `json:"message"`
 		Field   string `json:"field,omitempty"`
+		// Detail is the refusal's own detail besides the field, e.g. the role and
+		// connector an agent may not change, so the console can say what to do.
+		Detail map[string]any `json:"detail,omitempty"`
 	}
 	// AccessPreview is POST /preview: nothing is stored.
 	AccessPreview struct {
@@ -860,7 +863,16 @@ func issueOf(err error) AccessIssue {
 	var ge *GovError
 	if errors.As(err, &ge) {
 		f, _ := ge.Detail["field"].(string)
-		return AccessIssue{Code: ge.Code, Message: ge.Message, Field: f}
+		var detail map[string]any
+		for k, v := range ge.Detail {
+			if k != "field" {
+				if detail == nil {
+					detail = map[string]any{}
+				}
+				detail[k] = v
+			}
+		}
+		return AccessIssue{Code: ge.Code, Message: ge.Message, Field: f, Detail: detail}
 	}
 	return AccessIssue{Code: "internal", Message: err.Error()}
 }

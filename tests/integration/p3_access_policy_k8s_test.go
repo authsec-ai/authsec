@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -248,6 +249,27 @@ func TestAccessPolicyK8sRefusals(t *testing.T) {
 		t.Fatalf("agent without bindings: %s", got)
 	}
 	p3exec(t, k.db, `UPDATE discovery_sources SET enforcement_bindings = true WHERE id = ?`, k.src)
+
+	// An agent (0.6.1+) that reports which roles it may change refuses any
+	// other role, and the refusal names it; the console reads the allowed roles
+	// from the same report to write the command that adds it.
+	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = '{"binding_roles":["pod-reader"]}' WHERE id = ?`, k.src)
+	v, err := k.svc.Preview(ctx, k.ws, k.intent("block", []uuid.UUID{k.booker}, "all"))
+	if got := previewCode(v, err); got != services.GovCodeK8sAgentCannotAct {
+		t.Fatalf("role not allowed: %s", got)
+	}
+	if msg := fmt.Sprint(v.Blockers); !strings.Contains(msg, "bindings of secret-reader yet") {
+		t.Errorf("the refusal must name the role to allow: %s", msg)
+	}
+	if d := v.Blockers[0].Detail; d["role"] != "secret-reader" || fmt.Sprint(d["allowed_roles"]) != "[pod-reader]" || d["connector_id"] == nil {
+		t.Errorf("the blocker must carry the role, the allowed roles and the connector: %v", d)
+	}
+	// No namespaces reported: every namespace. The role allowed: no blocker.
+	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = jsonb_build_object('binding_roles', jsonb_build_array('secret-reader')) WHERE id = ?`, k.src)
+	if got := previewCode(k.svc.Preview(ctx, k.ws, k.intent("block", []uuid.UUID{k.booker}, "all"))); got != "" {
+		t.Fatalf("role allowed in every namespace: %s", got)
+	}
+	p3exec(t, k.db, `UPDATE discovery_sources SET runtime = '{}' WHERE id = ?`, k.src)
 
 	// A second block on the same subject and binding is refused.
 	if _, err := k.svc.Create(ctx, k.ws, k.user, services.AccessPolicyRequest{AccessIntent: k.intent("block", []uuid.UUID{k.booker}, "all"),

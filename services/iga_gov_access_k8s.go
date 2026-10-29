@@ -296,25 +296,71 @@ func k8sRoleKind(k k8sgraph.ObjectKey) string {
 	return models.K8sKindRole
 }
 
+// k8sAgentLimits is what a cluster's agent says it may do to bindings. The
+// agent reports enforcement_bindings on its plan poll; iga-agent 0.6.1+ also
+// reports, on its heartbeat, the roles, namespaces and ClusterRoleBinding switch
+// its chart allows. Nil means not reported (an older agent): only the switch
+// is checked, and the agent itself refuses what it may not do.
+type k8sAgentLimits struct {
+	canAct     bool
+	roles      []string
+	namespaces []string
+	cluster    *bool
+}
+
+func k8sAgentLimitsOf(src []models.DiscoverySource) *k8sAgentLimits {
+	if len(src) == 0 {
+		return &k8sAgentLimits{}
+	}
+	lim := &k8sAgentLimits{canAct: src[0].ActuationTokenHash != "" && src[0].EnforcementBindings}
+	var rt struct {
+		Roles      []string `json:"binding_roles"`
+		Namespaces []string `json:"binding_namespaces"`
+		Cluster    *bool    `json:"cluster_bindings"`
+	}
+	if json.Unmarshal(src[0].Runtime, &rt) == nil {
+		lim.roles, lim.namespaces, lim.cluster = rt.Roles, rt.Namespaces, rt.Cluster
+	}
+	return lim
+}
+
 // k8sChecks is checks() for Kubernetes: the agent of every binding may change
 // bindings, and no other live block already holds the subject.
 func (s *GovAccess) k8sChecks(ctx context.Context, ws uuid.UUID, p *accessPlan) []error {
 	var errs []error
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
-		seen := map[uuid.UUID]bool{}
+		agents := map[uuid.UUID]*k8sAgentLimits{}
+		refused := map[string]bool{}
+		refuse := func(msg string, details map[string]any) {
+			if !refused[msg] {
+				refused[msg] = true
+				errs = append(errs, govUnprocessable(GovCodeK8sAgentCannotAct, msg, details))
+			}
+		}
 		for _, sp := range p.k8s.subjects {
 			for _, b := range sp.bindings {
-				if !seen[b.connector] {
-					seen[b.connector] = true
+				lim, ok := agents[b.connector]
+				if !ok {
 					var src []models.DiscoverySource
 					if err := tx.Where("workspace_id = ? AND id = ?", ws, b.connector).Limit(1).Find(&src).Error; err != nil {
 						return err
 					}
-					if len(src) == 0 || src[0].ActuationTokenHash == "" || !src[0].EnforcementBindings {
-						errs = append(errs, govUnprocessable(GovCodeK8sAgentCannotAct,
-							"The agent in cluster "+p.k8s.role.Cluster+" may not change bindings: turn enforcement on for it (Connections > the cluster > Enforcement), and turn on enforcement.bindings in its chart with "+p.k8s.role.Name+" in enforcement.bindings.roles.",
-							map[string]any{"field": "resource.resource_id", "connector_id": b.connector}))
-					}
+					lim = k8sAgentLimitsOf(src)
+					agents[b.connector] = lim
+				}
+				switch {
+				case !lim.canAct:
+					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change bindings: turn enforcement on for it (Connections > the cluster > Enforcement), and turn on enforcement.bindings in its chart with "+p.k8s.role.Name+" in enforcement.bindings.roles.",
+						map[string]any{"field": "resource.resource_id", "connector_id": b.connector})
+				case lim.roles != nil && !containsString(lim.roles, p.k8s.role.Name):
+					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change bindings of "+p.k8s.role.Name+" yet: add it to enforcement.bindings.roles in its chart.",
+						map[string]any{"field": "resource.resource_id", "connector_id": b.connector, "role": p.k8s.role.Name, "allowed_roles": lim.roles})
+				case k8sBindingKind(b.key) == models.K8sKindClusterRoleBinding && lim.cluster != nil && !*lim.cluster:
+					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change ClusterRoleBindings: turn on enforcement.bindings.clusterWide in its chart.",
+						map[string]any{"field": "resource.resource_id", "connector_id": b.connector, "role": p.k8s.role.Name})
+				case k8sBindingKind(b.key) == models.K8sKindRoleBinding && len(lim.namespaces) > 0 && !containsString(lim.namespaces, b.key.Namespace) && (lim.cluster == nil || !*lim.cluster):
+					refuse("The agent in cluster "+p.k8s.role.Cluster+" may not change RoleBindings in "+b.key.Namespace+": add it to enforcement.bindings.namespaces in its chart, or clear that list for every namespace.",
+						map[string]any{"field": "resource.resource_id", "connector_id": b.connector, "namespace": b.key.Namespace})
 				}
 				q := tx.Model(&models.IGAGovK8sAccess{}).Where("workspace_id = ? AND identity_account_id = ? AND cluster = ? AND binding_kind = ? AND binding_namespace = ? AND binding_name = ? AND state IN ?",
 					ws, sp.identity, b.key.Cluster, k8sBindingKind(b.key), b.key.Namespace, b.key.Name, k8sLiveStates)
