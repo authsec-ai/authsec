@@ -87,6 +87,7 @@ const inventoryScopeAWSAccount = "aws_account"
 // else is 400 invalid_parameter.
 var inventoryParams = map[string]bool{
 	"provider": true, "kind": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
+	"subscription": true, "resource_group": true,
 	"limit": true, "cursor": true, "facets": true, "sort": true,
 }
 
@@ -95,13 +96,14 @@ var inventoryParams = map[string]bool{
 // paging, sort and facets have no meaning for counts.
 var inventorySummaryParams = map[string]bool{
 	"provider": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
+	"subscription": true, "resource_group": true,
 }
 
 // inventorySorts are the sort values: by name (then id), or most recently
 // seen first (then id, descending).
 var inventorySorts = []string{"name", "-last_seen"}
 
-var inventoryFacetNames = []string{"provider", "kind", "scope"}
+var inventoryFacetNames = []string{"provider", "kind", "scope", "subscription", "resource_group"}
 
 // ListInventoryWorkloads serves GET /api/iga/v1/inventory/workloads.
 func (r *Reader) ListInventoryWorkloads(ctx context.Context, vals url.Values) (any, error) {
@@ -352,6 +354,9 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
 			// id ␟ kind ␟ label, so the chip can be labelled; finalized per id.
 			"scope": {expr: c.scopeIDSQL() + " || chr(31) || " + c.scopeKindSQL() + " || chr(31) || " + c.scopeLabelSQL(),
 				finalize: inventoryScopeFacet},
+			// value ␟ label: a subscription by its name, a resource group as written.
+			"subscription":   {expr: c.subscriptionSQL() + " || chr(31) || " + c.attr("sub_scope"), finalize: inventoryNamedFacet},
+			"resource_group": {expr: c.resourceGroupSQL() + " || chr(31) || " + c.attr("resource_group"), finalize: inventoryNamedFacet},
 		},
 	}
 	return &c
@@ -402,6 +407,21 @@ func (c *inventoryClass) scopeLabelSQL() string {
 
 func (c *inventoryClass) subScopeSQL() string {
 	return `(CASE WHEN ` + c.isAWS() + ` THEN ` + c.awsSubScope + ` ELSE ` + c.attr("sub_scope") + ` END)`
+}
+
+// subscriptionSQL is an Azure resource's or workload's subscription id,
+// lowercased; empty for a row with none (an Entra object, any other provider).
+func (c *inventoryClass) subscriptionSQL() string {
+	return `lower(` + c.attr("subscription_id") + `)`
+}
+
+// resourceGroupSQL is an Azure row's resource group as the filter takes it:
+// "<subscription id>/<resource group>", lowercased, since a resource group's
+// name is unique only within its subscription and Azure compares names without
+// case. Empty for a row with none.
+func (c *inventoryClass) resourceGroupSQL() string {
+	return `(CASE WHEN ` + c.attr("resource_group") + ` <> '' AND ` + c.subscriptionSQL() + ` <> ''
+	              THEN ` + c.subscriptionSQL() + ` || '/' || lower(` + c.attr("resource_group") + `) ELSE '' END)`
 }
 
 // nativeSQL is the row's native id, computed in SQL so q matches exactly what
@@ -598,6 +618,9 @@ func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *i
 		fs = append(fs, listsFilter{facet: "kind", sql: c.kindCol + " NOT IN ?", args: []any{ex}})
 	}
 	fs = append(fs, listsIn("scope", c.scopeIDSQL(), req.scopes)...)
+	// Azure's subscription and resource group (as their facets give them).
+	fs = append(fs, listsIn("subscription", c.subscriptionSQL(), inventoryLower(p, "subscription"))...)
+	fs = append(fs, listsIn("resource_group", c.resourceGroupSQL(), inventoryLower(p, "resource_group"))...)
 	return fs, req, nil
 }
 
@@ -607,6 +630,18 @@ func inventoryValues(p *ListParams, param string) []string {
 	var out []string
 	for _, v := range p.Raw[param] {
 		if v = strings.TrimSpace(v); v != "" && !contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// inventoryLower is inventoryValues lowercased, for values compared without
+// case (Azure's ids and names).
+func inventoryLower(p *ListParams, param string) []string {
+	var out []string
+	for _, v := range inventoryValues(p, param) {
+		if v = strings.ToLower(v); !contains(out, v) {
 			out = append(out, v)
 		}
 	}
@@ -688,6 +723,36 @@ func inventoryScopeFacet(counts map[string]int64, accts *Accounts) []FacetValue 
 	}
 	out := make([]FacetValue, 0, len(byID))
 	for _, fv := range byID {
+		if fv.Label == "" {
+			fv.Label = fv.Value
+		}
+		out = append(out, *fv)
+	}
+	return listsFacetOrder(out, "")
+}
+
+// inventoryNamedFacet folds a value ␟ label facet into one chip per value,
+// labelled by the row's name for it (the value when no row names it). Rows
+// with no value have no chip.
+func inventoryNamedFacet(counts map[string]int64, _ *Accounts) []FacetValue {
+	byValue := map[string]*FacetValue{}
+	for v, n := range counts {
+		value, label, _ := strings.Cut(v, "\x1f")
+		if value == "" {
+			continue
+		}
+		fv := byValue[value]
+		if fv == nil {
+			fv = &FacetValue{Value: value}
+			byValue[value] = fv
+		}
+		fv.Count += n
+		if fv.Label == "" || (label != "" && label < fv.Label) {
+			fv.Label = label // deterministic when two rows disagree
+		}
+	}
+	out := make([]FacetValue, 0, len(byValue))
+	for _, fv := range byValue {
 		if fv.Label == "" {
 			fv.Label = fv.Value
 		}
