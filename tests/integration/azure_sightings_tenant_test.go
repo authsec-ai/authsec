@@ -1,6 +1,8 @@
 package integration
 
 import (
+	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 
@@ -32,5 +34,63 @@ func TestListAgentsByTenant(t *testing.T) {
 	// Case-insensitive, as tenant ids are stored lower case.
 	if _, total, _ := repo.ListAgents(ws, repositories.AgentFilter{TenantID: strings.ToUpper(tB)}); total != 1 {
 		t.Fatalf("tenant B: total %d", total)
+	}
+}
+
+// An Azure agent lives where its resource or Foundry project does: the
+// subscription and resource group filters read its metadata's subscription_id
+// and the resource group in its ARM id, as the inventory's filters of the same
+// names do. An Entra agent (no subscription) matches neither, and another
+// workspace's agents are never counted.
+func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-sightings-subscription")
+	other := newWorkspace(t, db, "ws-sightings-subscription-other")
+	prod, sales := strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString())
+	seed := func(w uuid.UUID, name, sub, key, arm string) {
+		t.Helper()
+		meta := map[string]string{"tenant_id": "t1"}
+		if sub != "" {
+			meta["subscription_id"], meta[key] = sub, arm
+		}
+		raw, _ := json.Marshal(meta)
+		if err := db.Exec(`INSERT INTO discovered_agents (workspace_id, source, fingerprint, display_name, metadata, status, runtime_status)
+			VALUES (?, ?, ?, ?, ?::jsonb, 'unregistered', 'running')`,
+			w, models.DiscoverySourceAzure, "fp-"+uuid.NewString(), name, string(raw)).Error; err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+	seed(ws, "foundry-agent", prod, "foundry_project_id", "/subscriptions/"+prod+"/resourceGroups/IGA-Test/providers/Microsoft.CognitiveServices/accounts/a/projects/p")
+	seed(ws, "bot", prod, "resource_id", "/subscriptions/"+prod+"/resourcegroups/rg-bots/providers/microsoft.botservice/botservices/b")
+	seed(ws, "logic-app", sales, "resource_id", "/subscriptions/"+sales+"/resourcegroups/iga-test/providers/microsoft.logic/workflows/l")
+	seed(ws, "entra-agent", "", "", "")
+	seed(other, "elsewhere", prod, "resource_id", "/subscriptions/"+prod+"/resourcegroups/iga-test/providers/microsoft.logic/workflows/x")
+
+	repo := repositories.NewDiscoveryRepository(db)
+	for _, c := range []struct {
+		f    repositories.AgentFilter
+		want []string
+	}{
+		{repositories.AgentFilter{Subscription: prod}, []string{"bot", "foundry-agent"}},
+		{repositories.AgentFilter{Subscription: strings.ToUpper(sales)}, []string{"logic-app"}},
+		// A resource group is its subscription's: iga-test in Sales is another group.
+		{repositories.AgentFilter{ResourceGroup: prod + "/iga-test"}, []string{"foundry-agent"}},
+		{repositories.AgentFilter{ResourceGroup: sales + "/IGA-TEST"}, []string{"logic-app"}},
+		{repositories.AgentFilter{ResourceGroup: "iga-test"}, nil},
+		{repositories.AgentFilter{Subscription: sales, ResourceGroup: prod + "/rg-bots"}, nil},
+	} {
+		c.f.Limit = 50
+		rows, total, err := repo.ListAgents(ws, c.f)
+		if err != nil {
+			t.Fatalf("%+v: %v", c.f, err)
+		}
+		var names []string
+		for _, r := range rows {
+			names = append(names, r.DisplayName)
+		}
+		sort.Strings(names)
+		if strings.Join(names, ",") != strings.Join(c.want, ",") || int(total) != len(c.want) {
+			t.Fatalf("%+v: got %v (total %d), want %v", c.f, names, total, c.want)
+		}
 	}
 }

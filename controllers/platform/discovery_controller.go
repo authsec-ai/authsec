@@ -934,8 +934,11 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		// ?tenant_id= narrows Azure agents to one Entra tenant, on the server so
 		// paging and totals count only that tenant.
 		TenantID: strings.TrimSpace(c.Query("tenant_id")),
-		Limit:    limit,
-		Offset:   offset,
+		// ?subscription= and ?resource_group= narrow Azure agents to where they live.
+		Subscription:  strings.TrimSpace(c.Query("subscription")),
+		ResourceGroup: strings.TrimSpace(c.Query("resource_group")),
+		Limit:         limit,
+		Offset:        offset,
 	})
 	if err != nil {
 		discoveryError(c, err)

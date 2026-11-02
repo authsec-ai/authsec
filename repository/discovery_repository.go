@@ -112,8 +112,14 @@ type AgentFilter struct {
 	// TenantID scopes to one Entra tenant: an Azure agent comes from a tenant
 	// connector and has no discovery source, so its metadata names the tenant.
 	TenantID string
-	Limit    int
-	Offset   int
+	// Subscription and ResourceGroup scope Azure agents to where they live, as
+	// the inventory's filters of the same names: a subscription id, and
+	// "<subscription id>/<resource group>". An agent with no subscription (an
+	// Entra object) matches neither.
+	Subscription  string
+	ResourceGroup string
+	Limit         int
+	Offset        int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -641,6 +647,16 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	}
 	if f.TenantID != "" {
 		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
+	}
+	if f.Subscription != "" {
+		q = q.Where("lower(metadata->>'subscription_id') = lower(?)", f.Subscription)
+	}
+	if f.ResourceGroup != "" {
+		// The group is read from the agent's ARM id: its resource's, or its Foundry project's.
+		sub, group, _ := strings.Cut(f.ResourceGroup, "/")
+		q = q.Where(`lower(metadata->>'subscription_id') = lower(?)
+			AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?)`,
+			sub, group)
 	}
 
 	var total int64
