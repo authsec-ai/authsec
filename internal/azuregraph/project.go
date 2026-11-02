@@ -34,6 +34,9 @@ type Result struct {
 	// AKSServiceAccountsJoined counts federation subjects newly tied to a
 	// Kubernetes ServiceAccount in the graph.
 	AKSServiceAccountsJoined int `json:"aks_service_accounts_joined"`
+	// ManagedIdentitiesPlaced counts managed identities whose subscription and
+	// resource group were (re)stated from the resource they belong to.
+	ManagedIdentitiesPlaced int `json:"managed_identities_placed"`
 }
 
 // ProjectPass applies one finished pass to the graph, in the caller's
@@ -80,7 +83,70 @@ func ProjectPass(tx *gorm.DB, p Pass, now time.Time) (*Result, error) {
 		return nil, fmt.Errorf("aks service accounts: %w", err)
 	}
 	w.res.AKSServiceAccountsJoined = int(joined)
+	placed, err := PlaceManagedIdentities(tx, p.WorkspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("managed identity placement: %w", err)
+	}
+	w.res.ManagedIdentitiesPlaced = int(placed)
 	return w.res, nil
+}
+
+// PlaceManagedIdentities states each Azure managed identity's subscription
+// (subscription_id, sub_scope) and resource group in its provider_attrs, as a
+// resource's are, so the inventory's subscription and resource group filters
+// list it with the resource it belongs to.
+//
+// Entra keeps that resource's ARM id from when the identity was made: a
+// resource moved to another subscription or resource group keeps its old id
+// there. So the resource is found by the id below its resource group (from
+// /providers/) among the resources and workloads the latest passes confirmed:
+// the one with the identity's whole id if it is still there, else the only
+// one with that path. An identity whose resource no pass confirms is not
+// placed. It runs after every pass, tenant or subscription, so their order
+// does not matter; a tenant pass rewrites provider_attrs and this restates them.
+func PlaceManagedIdentities(tx *gorm.DB, workspaceID uuid.UUID) (int64, error) {
+	res := tx.Exec(`
+		WITH owner AS (
+			SELECT lower(r.provider_attrs->>'native_id') AS arm, lower(r.provider_attrs->>'subscription_id') AS sub,
+			       coalesce(r.provider_attrs->>'sub_scope', '') AS label, coalesce(r.provider_attrs->>'resource_group', '') AS rg
+			  FROM iga_resources r
+			 WHERE r.workspace_id = ? AND r.provider = ? AND r.lifecycle <> 'retired'
+			   AND coalesce(r.provider_attrs->>'subscription_id', '') <> ''
+			   AND EXISTS (SELECT 1 FROM iga_object_support s
+			                WHERE s.workspace_id = r.workspace_id AND s.resource_id = r.id AND s.state = 'current')
+			UNION
+			SELECT lower(w.provider_attrs->>'native_id'), lower(w.provider_attrs->>'subscription_id'),
+			       coalesce(w.provider_attrs->>'sub_scope', ''), coalesce(w.provider_attrs->>'resource_group', '')
+			  FROM iga_workload w
+			 WHERE w.workspace_id = ? AND w.provider = ? AND w.lifecycle <> 'retired'
+			   AND coalesce(w.provider_attrs->>'subscription_id', '') <> ''
+			   AND EXISTS (SELECT 1 FROM iga_object_support s
+			                WHERE s.workspace_id = w.workspace_id AND s.workload_id = w.id AND s.state = 'current')
+		), placed_at AS (
+			SELECT arm, substring(arm from '/providers/.*$') AS rel, sub, label, rg FROM owner
+		), mi AS (
+			SELECT a.id, lower(a.provider_attrs->>'managed_identity_resource') AS arm,
+			       substring(lower(a.provider_attrs->>'managed_identity_resource') from '/providers/.*$') AS rel
+			  FROM iga_identity_accounts a
+			 WHERE a.workspace_id = ? AND a.provider = ? AND a.account_kind = ? AND a.lifecycle <> 'retired'
+		), placed AS (
+			SELECT DISTINCT ON (mi.id) mi.id, o.sub, CASE WHEN o.label = '' THEN o.sub ELSE o.label END AS label, o.rg
+			  FROM mi JOIN placed_at o ON o.rel = mi.rel
+			 WHERE o.arm = mi.arm OR (SELECT count(DISTINCT o2.arm) FROM placed_at o2 WHERE o2.rel = mi.rel) = 1
+			 ORDER BY mi.id, (o.arm = mi.arm) DESC
+		)
+		UPDATE iga_identity_accounts a
+		   SET provider_attrs = a.provider_attrs || jsonb_build_object('subscription_id', p.sub, 'sub_scope', p.label, 'resource_group', p.rg)
+		  FROM placed p
+		 WHERE a.workspace_id = ? AND a.id = p.id
+		   AND (a.provider_attrs->>'subscription_id' IS DISTINCT FROM p.sub
+		        OR a.provider_attrs->>'sub_scope' IS DISTINCT FROM p.label
+		        OR a.provider_attrs->>'resource_group' IS DISTINCT FROM p.rg)`,
+		workspaceID, models.ProviderAzure,
+		workspaceID, models.ProviderAzure,
+		workspaceID, models.ProviderAzure, models.CloudIdentityEntraManagedIdentity,
+		workspaceID)
+	return res.RowsAffected, res.Error
 }
 
 // aksJoinRule names how an Azure federation subject was tied to a Kubernetes

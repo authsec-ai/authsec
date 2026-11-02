@@ -153,3 +153,118 @@ func TestP2AzureInventorySubscriptionAndResourceGroup(t *testing.T) {
 		t.Errorf("workspace B filtered by A's subscription: total %d", n)
 	}
 }
+
+// arm adds a resource, or with workload a workload, at its ARM id, confirmed by
+// the latest pass.
+func (w *azInvWorld) arm(name, native, sub, subName, rg string, workload bool) {
+	w.t.Helper()
+	raw, _ := json.Marshal(map[string]any{"scope_kind": azuregraph.ScopeKindTenant, "scope_id": w.tenant, "scope_label": w.tenant,
+		"native_id": native, "sub_scope": subName, "subscription_id": sub, "resource_group": rg})
+	id, table, kindCol, col, key := uuid.New(), "iga_resources", "resource_kind", "resource_id", azuregraph.ResourceKey(w.tenant, native)
+	if workload {
+		table, kindCol, col, key = "iga_workload", "runtime_kind", "workload_id", azuregraph.WorkloadKey(w.tenant, native)
+	}
+	if err := w.db.Exec(`INSERT INTO `+table+` (id, workspace_id, `+kindCol+`, display_name, provider, source_key, provider_attrs, lifecycle)
+	      VALUES (?, ?, 'azure-test', ?, 'azure', ?, ?::jsonb, 'active')`, id, w.ws, name, key, string(raw)).Error; err != nil {
+		w.t.Fatalf("%s %s: %v", table, name, err)
+	}
+	if err := w.db.Exec(`INSERT INTO iga_object_support (workspace_id, `+col+`, connector_id, partition_key, state, last_confirmed_at)
+	      VALUES (?, ?, ?, 'azure-test-inv', 'current', ?)`, w.ws, id, w.connID, time.Now().UTC()).Error; err != nil {
+		w.t.Fatalf("support %s: %v", name, err)
+	}
+}
+
+// identity adds an Entra object; a managed identity names its resource's ARM
+// id as Entra keeps it (lowercased).
+func (w *azInvWorld) identity(name, kind, resource string) {
+	w.t.Helper()
+	oid := strings.ToLower(uuid.NewString())
+	attrs := map[string]any{"scope_kind": azuregraph.ScopeKindTenant, "scope_id": w.tenant, "scope_label": w.tenant, "native_id": oid}
+	if resource != "" {
+		attrs["managed_identity_resource"] = strings.ToLower(resource)
+	}
+	raw, _ := json.Marshal(attrs)
+	id := uuid.New()
+	if err := w.db.Exec(`INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key,
+	                                        display_name, provider_attrs, lifecycle)
+	      VALUES (?, ?, ?, 'azure', ?, 'immutable', ?, ?, ?::jsonb, 'active')`,
+		id, w.ws, kind, azuregraph.IdentityKey(w.tenant, oid), oid, name, string(raw)).Error; err != nil {
+		w.t.Fatalf("identity %s: %v", name, err)
+	}
+	if err := w.db.Exec(`INSERT INTO iga_object_support (workspace_id, identity_account_id, connector_id, partition_key, state, last_confirmed_at)
+	      VALUES (?, ?, ?, 'azure-test-inv', 'current', ?)`, w.ws, id, w.connID, time.Now().UTC()).Error; err != nil {
+		w.t.Fatalf("support %s: %v", name, err)
+	}
+}
+
+func azInvIdentities(t *testing.T, w *azInvWorld, kv ...string) []string {
+	t.Helper()
+	vals := url.Values{"provider": {"azure"}}
+	for i := 0; i+1 < len(kv); i += 2 {
+		vals.Add(kv[i], kv[i+1])
+	}
+	res, err := igaread.NewReader(w.db, readTestCursorKey).ListInventoryIdentities(wsCtx(context.Background(), w.ws), vals)
+	if err != nil {
+		e := igaread.AsError(err)
+		t.Fatalf("identities %v: %d %v", vals, e.Status, e.Body())
+	}
+	names := []string{}
+	for _, r := range digl(graphJSON(t, res), "data") {
+		names = append(names, digs(r, "name"))
+	}
+	return names
+}
+
+// A managed identity is listed under the subscription and resource group of
+// the resource it belongs to, where that resource is NOW: Entra keeps the ARM
+// id from when the identity was made, so a moved resource is found by its id
+// below the resource group. Users and other Entra objects belong to the tenant
+// and are under no subscription.
+func TestP2AzureManagedIdentityPlacement(t *testing.T) {
+	a := newAzInvWorld(t, "p2-azure-mi-placement-a")
+	prod, sales, gone := strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString())
+	at := func(sub, rg, rel string) string { return "/subscriptions/" + sub + "/resourceGroups/" + rg + "/providers/" + rel }
+
+	a.arm("kv-app", at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"), prod, "Prod", "rg-app", false)
+	a.identity("mi-kv", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"))
+	// Moved from Prod/rg-old to Sales/rg-new; Entra still names the old id.
+	a.arm("proj", at(sales, "rg-new", "Microsoft.CognitiveServices/accounts/acc/projects/proj"), sales, "Sales", "rg-new", true)
+	a.identity("mi-proj", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-old", "Microsoft.CognitiveServices/accounts/acc/projects/proj"))
+	// Two VMs of one name: each identity is its own VM's; one whose VM is in
+	// neither subscription cannot be told apart and is not placed.
+	a.arm("demo", at(prod, "rg-a", "Microsoft.Compute/virtualMachines/demo"), prod, "Prod", "rg-a", true)
+	a.arm("demo", at(sales, "rg-b", "Microsoft.Compute/virtualMachines/demo"), sales, "Sales", "rg-b", true)
+	a.identity("mi-demo-prod", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-a", "Microsoft.Compute/virtualMachines/demo"))
+	a.identity("mi-demo-gone", models.CloudIdentityEntraManagedIdentity, at(gone, "rg-c", "Microsoft.Compute/virtualMachines/demo"))
+	a.identity("mi-unseen", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.Web/sites/never-scanned"))
+	a.identity("alice", models.CloudIdentityEntraUser, "")
+
+	b := newAzInvWorld(t, "p2-azure-mi-placement-b")
+	b.identity("mi-kv-b", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"))
+
+	n, err := azuregraph.PlaceManagedIdentities(a.db, a.ws)
+	if err != nil || n != 3 {
+		t.Fatalf("placed %d, %v; want 3", n, err)
+	}
+	if n, err := azuregraph.PlaceManagedIdentities(a.db, a.ws); err != nil || n != 0 {
+		t.Fatalf("second run placed %d, %v; want 0 (nothing changed)", n, err)
+	}
+	if n, err := azuregraph.PlaceManagedIdentities(b.db, b.ws); err != nil || n != 0 {
+		t.Fatalf("workspace B placed %d, %v; want 0 (its resources are not A's)", n, err)
+	}
+
+	for _, c := range []struct {
+		kv   []string
+		want []string
+	}{
+		{nil, []string{"alice", "mi-demo-gone", "mi-demo-prod", "mi-kv", "mi-proj", "mi-unseen"}},
+		{[]string{"subscription", prod}, []string{"mi-demo-prod", "mi-kv"}},
+		{[]string{"subscription", sales}, []string{"mi-proj"}},
+		{[]string{"resource_group", sales + "/rg-new"}, []string{"mi-proj"}},
+		{[]string{"resource_group", prod + "/rg-old"}, []string{}},
+		{[]string{"subscription", gone}, []string{}},
+	} {
+		invWant(t, "identities "+strings.Join(c.kv, "="), azInvIdentities(t, a, c.kv...), c.want)
+	}
+	invWant(t, "workspace B under A's subscription", azInvIdentities(t, b, "subscription", prod), []string{})
+}
