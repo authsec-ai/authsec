@@ -124,3 +124,52 @@ func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
 		}
 	}
 }
+
+// OnlyAgents lists agents, not identities that only look like one: an
+// identity inferred from its sign-ins, or an Entra agent identity with no
+// agentName tag (a Foundry project's shared one), is left out; an agent's own
+// identity (agentName:<agent>) and a Foundry agent stay.
+func TestListAgentsOnlyAgents(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-sightings-only-agents")
+	seed := func(name string, meta map[string]any) {
+		t.Helper()
+		meta["tenant_id"] = "t1"
+		raw, _ := json.Marshal(meta)
+		if err := db.Exec(`INSERT INTO discovered_agents (workspace_id, source, fingerprint, display_name, metadata, status, runtime_status)
+			VALUES (?, ?, ?, ?, ?::jsonb, 'unregistered', 'running')`,
+			ws, models.DiscoverySourceAzure, "fp-"+uuid.NewString(), name, string(raw)).Error; err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+	seed("agent-own-identity", map[string]any{"evidence_source": "entra_agent_id", "tags": []string{"agentName:sales-bot", "projectName:p"}})
+	seed("project-identity", map[string]any{"evidence_source": "entra_agent_id", "tags": []string{"projectName:p"}})
+	seed("untagged-identity", map[string]any{"evidence_source": "entra_agent_id"})
+	seed("inferred-identity", map[string]any{"inference_rule": "ai_tokens_and_active", "confidence": "high"})
+	seed("foundry-agent", map[string]any{"evidence_source": "foundry_agent", "foundry_project_id": "/subscriptions/s/resourcegroups/r/providers/x/y"})
+
+	repo := repositories.NewDiscoveryRepository(db)
+	names := func(f repositories.AgentFilter) []string {
+		t.Helper()
+		f.Limit = 50
+		rows, total, err := repo.ListAgents(ws, f)
+		if err != nil {
+			t.Fatalf("%+v: %v", f, err)
+		}
+		var out []string
+		for _, r := range rows {
+			out = append(out, r.DisplayName)
+		}
+		sort.Strings(out)
+		if int(total) != len(out) {
+			t.Fatalf("%+v: total %d for %d rows", f, total, len(out))
+		}
+		return out
+	}
+	if got := strings.Join(names(repositories.AgentFilter{OnlyAgents: true}), ","); got != "agent-own-identity,foundry-agent" {
+		t.Fatalf("only agents: %s", got)
+	}
+	if got := len(names(repositories.AgentFilter{})); got != 5 {
+		t.Fatalf("without the filter: %d rows, want 5", got)
+	}
+}

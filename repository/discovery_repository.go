@@ -118,8 +118,13 @@ type AgentFilter struct {
 	// list; one with no subscription (an Entra object) matches neither.
 	Subscriptions  []string
 	ResourceGroups []string
-	Limit          int
-	Offset         int
+	// OnlyAgents leaves out what is not one agent: identities inferred to be
+	// agents from their sign-ins, and Entra agent identities not tied to one
+	// agent (Foundry tags an agent's own identity agentName:<agent>; a
+	// project's shared identity has no such tag).
+	OnlyAgents bool
+	Limit      int
+	Offset     int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -647,6 +652,12 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	}
 	if f.TenantID != "" {
 		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
+	}
+	if f.OnlyAgents {
+		// TENANT-EXEMPT: reads the agent row's own metadata column only.
+		q = q.Where(`coalesce(metadata->>'inference_rule', '') = '' AND NOT (metadata->>'evidence_source' = 'entra_agent_id' AND NOT EXISTS (
+			SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(metadata->'tags') = 'array' THEN metadata->'tags' ELSE '[]'::jsonb END) t
+			 WHERE t LIKE 'agentName:%'))`)
 	}
 	// An agent with no ARM id of its own (one Agent ID lists, or one inferred
 	// from an identity's sign-ins) is where its identity is: the Azure

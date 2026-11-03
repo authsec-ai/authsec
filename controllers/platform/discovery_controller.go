@@ -952,8 +952,11 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		// repeated or comma-separated, any one of each.
 		Subscriptions:  queryList(c, "subscription"),
 		ResourceGroups: queryList(c, "resource_group"),
-		Limit:          limit,
-		Offset:         offset,
+		// ?only_agents=true leaves out identities that are not one agent
+		// (inferred from sign-ins, or an agent identity not tied to one agent).
+		OnlyAgents: c.Query("only_agents") == "true",
+		Limit:      limit,
+		Offset:     offset,
 	})
 	if err != nil {
 		discoveryError(c, err)
