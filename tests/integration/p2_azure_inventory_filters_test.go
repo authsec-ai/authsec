@@ -174,14 +174,22 @@ func (w *azInvWorld) arm(name, native, sub, subName, rg string, workload bool) {
 	}
 }
 
-// identity adds an Entra object; a managed identity names its resource's ARM
-// id as Entra keeps it (lowercased).
-func (w *azInvWorld) identity(name, kind, resource string) {
+// identity adds an Entra object and returns its object id; a managed identity
+// names its resource's ARM id as Entra keeps it (lowercased), an agent identity
+// its owners' object ids.
+func (w *azInvWorld) identity(name, kind, resource string, owners ...string) string {
 	w.t.Helper()
 	oid := strings.ToLower(uuid.NewString())
-	attrs := map[string]any{"scope_kind": azuregraph.ScopeKindTenant, "scope_id": w.tenant, "scope_label": w.tenant, "native_id": oid}
+	attrs := map[string]any{"scope_kind": azuregraph.ScopeKindTenant, "scope_id": w.tenant, "scope_label": w.tenant, "native_id": oid, "object_id": oid}
 	if resource != "" {
 		attrs["managed_identity_resource"] = strings.ToLower(resource)
+	}
+	if len(owners) > 0 {
+		var list []map[string]any
+		for _, o := range owners {
+			list = append(list, map[string]any{"id": o, "kind": "servicePrincipal", "active": true})
+		}
+		attrs["owners"] = list
 	}
 	raw, _ := json.Marshal(attrs)
 	id := uuid.New()
@@ -195,6 +203,7 @@ func (w *azInvWorld) identity(name, kind, resource string) {
 	      VALUES (?, ?, ?, 'azure-test-inv', 'current', ?)`, w.ws, id, w.connID, time.Now().UTC()).Error; err != nil {
 		w.t.Fatalf("support %s: %v", name, err)
 	}
+	return oid
 }
 
 func azInvIdentities(t *testing.T, w *azInvWorld, kv ...string) []string {
@@ -223,21 +232,29 @@ func azInvIdentities(t *testing.T, w *azInvWorld, kv ...string) []string {
 func TestP2AzureManagedIdentityPlacement(t *testing.T) {
 	a := newAzInvWorld(t, "p2-azure-mi-placement-a")
 	prod, sales, gone := strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString())
-	at := func(sub, rg, rel string) string { return "/subscriptions/" + sub + "/resourceGroups/" + rg + "/providers/" + rel }
+	at := func(sub, rg, rel string) string {
+		return "/subscriptions/" + sub + "/resourceGroups/" + rg + "/providers/" + rel
+	}
 
 	a.arm("kv-app", at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"), prod, "Prod", "rg-app", false)
-	a.identity("mi-kv", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"))
+	miKV := a.identity("mi-kv", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"))
 	// Moved from Prod/rg-old to Sales/rg-new; Entra still names the old id.
 	a.arm("proj", at(sales, "rg-new", "Microsoft.CognitiveServices/accounts/acc/projects/proj"), sales, "Sales", "rg-new", true)
-	a.identity("mi-proj", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-old", "Microsoft.CognitiveServices/accounts/acc/projects/proj"))
+	miProj := a.identity("mi-proj", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-old", "Microsoft.CognitiveServices/accounts/acc/projects/proj"))
 	// Two VMs of one name: each identity is its own VM's; one whose VM is in
 	// neither subscription cannot be told apart and is not placed.
 	a.arm("demo", at(prod, "rg-a", "Microsoft.Compute/virtualMachines/demo"), prod, "Prod", "rg-a", true)
 	a.arm("demo", at(sales, "rg-b", "Microsoft.Compute/virtualMachines/demo"), sales, "Sales", "rg-b", true)
-	a.identity("mi-demo-prod", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-a", "Microsoft.Compute/virtualMachines/demo"))
+	miDemo := a.identity("mi-demo-prod", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-a", "Microsoft.Compute/virtualMachines/demo"))
 	a.identity("mi-demo-gone", models.CloudIdentityEntraManagedIdentity, at(gone, "rg-c", "Microsoft.Compute/virtualMachines/demo"))
-	a.identity("mi-unseen", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.Web/sites/never-scanned"))
-	a.identity("alice", models.CloudIdentityEntraUser, "")
+	miUnseen := a.identity("mi-unseen", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.Web/sites/never-scanned"))
+	alice := a.identity("alice", models.CloudIdentityEntraUser, "")
+	// Agent identities are where the managed identity owning them is (a
+	// Foundry project's, for its agents): not by a user owner, an unplaced
+	// owner, or owners in two resource groups.
+	a.identity("ag-proj", models.CloudIdentityEntraAgentIdentity, "", alice, miProj)
+	a.identity("ag-two", models.CloudIdentityEntraAgentIdentity, "", miKV, miDemo)
+	a.identity("ag-unplaced", models.CloudIdentityEntraAgentIdentity, "", miUnseen)
 
 	b := newAzInvWorld(t, "p2-azure-mi-placement-b")
 	b.identity("mi-kv-b", models.CloudIdentityEntraManagedIdentity, at(prod, "rg-app", "Microsoft.KeyVault/vaults/kv-app"))
@@ -252,15 +269,21 @@ func TestP2AzureManagedIdentityPlacement(t *testing.T) {
 	if n, err := azuregraph.PlaceManagedIdentities(b.db, b.ws); err != nil || n != 0 {
 		t.Fatalf("workspace B placed %d, %v; want 0 (its resources are not A's)", n, err)
 	}
+	if n, err := azuregraph.PlaceAgentIdentities(a.db, a.ws); err != nil || n != 1 {
+		t.Fatalf("agent identities placed %d, %v; want 1", n, err)
+	}
+	if n, err := azuregraph.PlaceAgentIdentities(a.db, a.ws); err != nil || n != 0 {
+		t.Fatalf("agent identities second run placed %d, %v; want 0", n, err)
+	}
 
 	for _, c := range []struct {
 		kv   []string
 		want []string
 	}{
-		{nil, []string{"alice", "mi-demo-gone", "mi-demo-prod", "mi-kv", "mi-proj", "mi-unseen"}},
+		{nil, []string{"ag-proj", "ag-two", "ag-unplaced", "alice", "mi-demo-gone", "mi-demo-prod", "mi-kv", "mi-proj", "mi-unseen"}},
 		{[]string{"subscription", prod}, []string{"mi-demo-prod", "mi-kv"}},
-		{[]string{"subscription", sales}, []string{"mi-proj"}},
-		{[]string{"resource_group", sales + "/rg-new"}, []string{"mi-proj"}},
+		{[]string{"subscription", sales}, []string{"ag-proj", "mi-proj"}},
+		{[]string{"resource_group", sales + "/rg-new"}, []string{"ag-proj", "mi-proj"}},
 		{[]string{"resource_group", prod + "/rg-old"}, []string{}},
 		{[]string{"subscription", gone}, []string{}},
 	} {

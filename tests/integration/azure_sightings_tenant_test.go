@@ -65,6 +65,33 @@ func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
 	seed(ws, "logic-app", sales, "resource_id", "/subscriptions/"+sales+"/resourcegroups/iga-test/providers/microsoft.logic/workflows/l")
 	seed(ws, "entra-agent", "", "", "")
 	seed(other, "elsewhere", prod, "resource_id", "/subscriptions/"+prod+"/resourcegroups/iga-test/providers/microsoft.logic/workflows/x")
+	// An agent with no ARM id of its own (Agent ID's, or inferred from sign-ins)
+	// is where the Azure projection placed its identity; another workspace's
+	// identity with the same object id never places it.
+	identity := func(w uuid.UUID, oid, sub, rg string) {
+		t.Helper()
+		attrs, _ := json.Marshal(map[string]string{"object_id": oid, "subscription_id": sub, "sub_scope": "S", "resource_group": rg})
+		if err := db.Exec(`INSERT INTO iga_identity_accounts (id, workspace_id, account_kind, provider, source_key, continuity, immutable_key,
+		                                        display_name, provider_attrs, lifecycle)
+		      VALUES (?, ?, ?, 'azure', ?, 'immutable', ?, ?, ?::jsonb, 'active')`,
+			uuid.New(), w, models.CloudIdentityEntraAgentIdentity, "azure:test:"+uuid.NewString(), uuid.NewString(), oid, string(attrs)).Error; err != nil {
+			t.Fatalf("identity %s: %v", oid, err)
+		}
+	}
+	placedOID, otherOID := strings.ToLower(uuid.NewString()), strings.ToLower(uuid.NewString())
+	identity(ws, placedOID, sales, "IGA-Test")
+	identity(other, otherOID, prod, "iga-test")
+	agentOf := func(name, oid string) {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]string{"tenant_id": "t1", "object_id": strings.ToUpper(oid)})
+		if err := db.Exec(`INSERT INTO discovered_agents (workspace_id, source, fingerprint, display_name, metadata, status, runtime_status)
+			VALUES (?, ?, ?, ?, ?::jsonb, 'unregistered', 'running')`,
+			ws, models.DiscoverySourceAzure, "fp-"+uuid.NewString(), name, string(raw)).Error; err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+	agentOf("placed-agent", placedOID)
+	agentOf("cross-workspace-agent", otherOID)
 
 	repo := repositories.NewDiscoveryRepository(db)
 	for _, c := range []struct {
@@ -72,12 +99,12 @@ func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
 		want []string
 	}{
 		{repositories.AgentFilter{Subscriptions: []string{prod}}, []string{"bot", "foundry-agent"}},
-		{repositories.AgentFilter{Subscriptions: []string{strings.ToUpper(sales)}}, []string{"logic-app"}},
+		{repositories.AgentFilter{Subscriptions: []string{strings.ToUpper(sales)}}, []string{"logic-app", "placed-agent"}},
 		// Any one of several.
-		{repositories.AgentFilter{Subscriptions: []string{prod, sales}}, []string{"bot", "foundry-agent", "logic-app"}},
+		{repositories.AgentFilter{Subscriptions: []string{prod, sales}}, []string{"bot", "foundry-agent", "logic-app", "placed-agent"}},
 		// A resource group is its subscription's: iga-test in Sales is another group.
 		{repositories.AgentFilter{ResourceGroups: []string{prod + "/iga-test"}}, []string{"foundry-agent"}},
-		{repositories.AgentFilter{ResourceGroups: []string{sales + "/IGA-TEST"}}, []string{"logic-app"}},
+		{repositories.AgentFilter{ResourceGroups: []string{sales + "/IGA-TEST"}}, []string{"logic-app", "placed-agent"}},
 		{repositories.AgentFilter{ResourceGroups: []string{prod + "/iga-test", prod + "/rg-bots"}}, []string{"bot", "foundry-agent"}},
 		{repositories.AgentFilter{ResourceGroups: []string{"iga-test"}}, nil},
 		{repositories.AgentFilter{Subscriptions: []string{sales}, ResourceGroups: []string{prod + "/rg-bots"}}, nil},

@@ -37,6 +37,9 @@ type Result struct {
 	// ManagedIdentitiesPlaced counts managed identities whose subscription and
 	// resource group were (re)stated from the resource they belong to.
 	ManagedIdentitiesPlaced int `json:"managed_identities_placed"`
+	// AgentIdentitiesPlaced counts Entra agent identities placed where the
+	// managed identity that owns them is.
+	AgentIdentitiesPlaced int `json:"agent_identities_placed"`
 }
 
 // ProjectPass applies one finished pass to the graph, in the caller's
@@ -88,7 +91,52 @@ func ProjectPass(tx *gorm.DB, p Pass, now time.Time) (*Result, error) {
 		return nil, fmt.Errorf("managed identity placement: %w", err)
 	}
 	w.res.ManagedIdentitiesPlaced = int(placed)
+	agents, err := PlaceAgentIdentities(tx, p.WorkspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("agent identity placement: %w", err)
+	}
+	w.res.AgentIdentitiesPlaced = int(agents)
 	return w.res, nil
+}
+
+// PlaceAgentIdentities states each Entra agent identity's subscription and
+// resource group as those of the managed identity that owns it: Microsoft
+// Foundry makes a project's managed identity an owner of the agent identities
+// of its agents, and PlaceManagedIdentities has placed that identity where the
+// project is now. The agent identity's own tags name the project's
+// subscription and resource group from when it was made, and a moved project
+// keeps the old ones there, so they are not read. An agent identity owned by
+// no placed managed identity, or by two placed in different resource groups,
+// is not placed. It runs after PlaceManagedIdentities, after every pass.
+func PlaceAgentIdentities(tx *gorm.DB, workspaceID uuid.UUID) (int64, error) {
+	res := tx.Exec(`
+		WITH owner AS (
+			SELECT ag.id, lower(mi.provider_attrs->>'subscription_id') AS sub,
+			       coalesce(mi.provider_attrs->>'sub_scope', '') AS label, coalesce(mi.provider_attrs->>'resource_group', '') AS rg
+			  FROM iga_identity_accounts ag
+			 CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(ag.provider_attrs->'owners') = 'array'
+			                                              THEN ag.provider_attrs->'owners' ELSE '[]'::jsonb END) o
+			  JOIN iga_identity_accounts mi ON mi.workspace_id = ag.workspace_id AND mi.provider = ag.provider
+			   AND mi.account_kind = ? AND mi.lifecycle <> 'retired'
+			   AND lower(mi.provider_attrs->>'object_id') = lower(o->>'id')
+			 WHERE ag.workspace_id = ? AND ag.provider = ? AND ag.account_kind = ? AND ag.lifecycle <> 'retired'
+			   AND coalesce(mi.provider_attrs->>'subscription_id', '') <> ''
+		), placed AS (
+			SELECT id, min(sub) AS sub, min(CASE WHEN label = '' THEN sub ELSE label END) AS label, min(rg) AS rg
+			  FROM owner GROUP BY id
+			HAVING count(DISTINCT sub || '/' || lower(rg)) = 1
+		)
+		UPDATE iga_identity_accounts a
+		   SET provider_attrs = a.provider_attrs || jsonb_build_object('subscription_id', p.sub, 'sub_scope', p.label, 'resource_group', p.rg)
+		  FROM placed p
+		 WHERE a.workspace_id = ? AND a.id = p.id
+		   AND (a.provider_attrs->>'subscription_id' IS DISTINCT FROM p.sub
+		        OR a.provider_attrs->>'sub_scope' IS DISTINCT FROM p.label
+		        OR a.provider_attrs->>'resource_group' IS DISTINCT FROM p.rg)`,
+		models.CloudIdentityEntraManagedIdentity,
+		workspaceID, models.ProviderAzure, models.CloudIdentityEntraAgentIdentity,
+		workspaceID)
+	return res.RowsAffected, res.Error
 }
 
 // PlaceManagedIdentities states each Azure managed identity's subscription
