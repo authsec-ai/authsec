@@ -525,6 +525,11 @@ func (i RoleAssignmentScheduleInstance) TimeBound() bool {
 	return strings.EqualFold(i.AssignmentType, "Activated") || i.EndDateTime != ""
 }
 
+// CodePIMUnlicensed is ARM's answer (400) to a Privileged Identity Management
+// read in a tenant without Microsoft Entra ID P2 or ID Governance: PIM is not
+// available there, so the tenant has no PIM schedules at all.
+const CodePIMUnlicensed = "AadPremiumLicenseRequired"
+
 // ListRoleAssignmentScheduleInstances returns the principal's PIM schedule
 // instances at scope and below ($filter=assignedTo, the documented filter for
 // one principal), following nextLink.

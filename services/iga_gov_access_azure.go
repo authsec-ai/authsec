@@ -82,6 +82,12 @@ func azureTimeBound(ctx context.Context, rbac AzureRBACClient, token, subscripti
 		return nil, nil
 	}
 	inst, err := rbac.ListRoleAssignmentScheduleInstances(ctx, token, "/subscriptions/"+subscriptionID, principalID)
+	if azure.IsAPICode(err, azure.CodePIMUnlicensed) {
+		// The tenant has no PIM licence, so no assignment can be time-bound:
+		// a definite answer, not an unreadable one. Waiting on it held every
+		// block in such a tenant at applying forever.
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}

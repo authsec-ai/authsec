@@ -892,4 +892,32 @@ func TestAccessPolicyAzureTimeBoundAssignments(t *testing.T) {
 	if err != nil || len(pv.Blockers) != 0 || !hasWarning(pv, "azure_pim_unchecked") {
 		t.Fatalf("PIM unreadable: %+v %v", pv, err)
 	}
+	// ...and the block waits rather than remove an assignment it could not check.
+	held := z.create("az pim unread", z.intent("block", z.res, who2))
+	for pass := 0; pass < 2; pass++ {
+		for _, r := range z.rows(held.ID, models.R2StateApproved, models.R2StateDeploying) {
+			z.step(r.ID)
+		}
+	}
+	if len(z.fake.roles(oid2)) != 1 || len(z.rows(held.ID, models.R2StateActive)) != 0 {
+		t.Fatalf("PIM unreadable: the block went ahead: %v", z.fake.roles(oid2))
+	}
+
+	// No PIM licence in the tenant (Entra ID P2 / ID Governance): ARM answers
+	// 400 AadPremiumLicenseRequired. That is "no PIM here", a definite answer:
+	// the preview neither refuses nor warns, and the block removes the role
+	// (it waited forever, every block in such a tenant left at applying).
+	z.fake.pimErr = &azure.APIError{Service: "arm", Status: 400, Code: azure.CodePIMUnlicensed,
+		Message: "The tenant needs to have Microsoft Entra ID P2 or Microsoft Entra ID Governance license."}
+	who3, oid3 := z.principal("sp-pim-unlicensed")
+	z.assign(z.scope, "pim-4", azure.RoleStorageBlobDataReader, oid3)
+	pv, err = z.svc.Preview(z.ctx, z.ws, z.intent("block", z.res, who3))
+	if err != nil || len(pv.Blockers) != 0 || hasWarning(pv, "azure_pim_unchecked") {
+		t.Fatalf("PIM unlicensed preview: %+v %v", pv, err)
+	}
+	unlicensed := z.create("az pim unlicensed", z.intent("block", z.res, who3))
+	z.run(unlicensed.ID)
+	if got := z.fake.roles(oid3); len(got) != 0 || len(z.rows(unlicensed.ID, models.R2StateActive)) != 1 {
+		t.Fatalf("PIM unlicensed: the block did not remove the role: %v", got)
+	}
 }

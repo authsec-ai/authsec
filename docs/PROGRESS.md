@@ -4,6 +4,12 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-04 — Azure blocks in tenants without PIM (AS-171)
+
+- A colleague found every Azure access block stuck on "Applying" in a tenant without Entra ID P2: the PIM schedule read (added after 22 Oct, so AI Search had worked then) answers 400 `AadPremiumLicenseRequired`, and the block retried it every minute forever. That answer now means the tenant has no PIM, so nothing is time-bound and the block proceeds; any other PIM error still waits. Stuck blocks proceed on their next retry once deployed.
+
+---
+
 ## 2026-10-30 — Enforcement with nothing to list (UI-062)
 
 - Owner's call: the agent watches the whole cluster and agents can land in any namespace, so the namespace entry is unnecessary. Quarantine now reaches every namespace by default (iga-agent 0.6.1: one ClusterRole for networkpolicies and reading pods; the agent itself refuses kube-system, kube-public, kube-node-lease and its own namespace). Destruction stays in Roles per `enforcement.deleteNamespaces`.
