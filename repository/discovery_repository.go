@@ -112,8 +112,19 @@ type AgentFilter struct {
 	// TenantID scopes to one Entra tenant: an Azure agent comes from a tenant
 	// connector and has no discovery source, so its metadata names the tenant.
 	TenantID string
-	Limit    int
-	Offset   int
+	// Subscriptions and ResourceGroups scope Azure agents to where they live, as
+	// the inventory's filters of the same names: subscription ids, and
+	// "<subscription id>/<resource group>"s. An agent matches any one of each
+	// list; one with no subscription (an Entra object) matches neither.
+	Subscriptions  []string
+	ResourceGroups []string
+	// OnlyAgents leaves out what is not one agent: identities inferred to be
+	// agents from their sign-ins, and Entra agent identities not tied to one
+	// agent (Foundry tags an agent's own identity agentName:<agent>; a
+	// project's shared identity has no such tag).
+	OnlyAgents bool
+	Limit      int
+	Offset     int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -641,6 +652,43 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	}
 	if f.TenantID != "" {
 		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
+	}
+	if f.OnlyAgents {
+		// TENANT-EXEMPT: reads the agent row's own metadata column only.
+		q = q.Where(`coalesce(metadata->>'inference_rule', '') = '' AND NOT (metadata->>'evidence_source' = 'entra_agent_id' AND NOT EXISTS (
+			SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(metadata->'tags') = 'array' THEN metadata->'tags' ELSE '[]'::jsonb END) t
+			 WHERE t LIKE 'agentName:%'))`)
+	}
+	// An agent with no ARM id of its own (one Agent ID lists, or one inferred
+	// from an identity's sign-ins) is where its identity is: the Azure
+	// projection places managed identities, and the agent identities they own,
+	// in their resource's subscription and resource group.
+	// TENANT-EXEMPT: a condition of ListAgents' query, already bound to workspace_id; the identity must be the agent row's own workspace's.
+	const placedIdentity = `EXISTS (SELECT 1 FROM iga_identity_accounts a
+		WHERE a.workspace_id = discovered_agents.workspace_id AND a.provider = 'azure' AND a.lifecycle <> 'retired'
+		  AND lower(a.provider_attrs->>'object_id') = lower(discovered_agents.metadata->>'object_id')
+		  AND `
+	if len(f.Subscriptions) > 0 {
+		subs := make([]string, len(f.Subscriptions))
+		for i, s := range f.Subscriptions {
+			subs[i] = strings.ToLower(s)
+		}
+		q = q.Where("(lower(metadata->>'subscription_id') IN ? OR "+placedIdentity+"lower(a.provider_attrs->>'subscription_id') IN ?))", subs, subs)
+	}
+	if len(f.ResourceGroups) > 0 {
+		// A group is its subscription's, and is read from the agent's ARM id: its resource's, or its Foundry project's.
+		conds, args := make([]string, 0, len(f.ResourceGroups)), make([]interface{}, 0, 2*len(f.ResourceGroups)+1)
+		groups := make([]string, 0, len(f.ResourceGroups))
+		for _, g := range f.ResourceGroups {
+			sub, group, _ := strings.Cut(g, "/")
+			conds = append(conds, `(lower(metadata->>'subscription_id') = lower(?)
+				AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?))`)
+			args = append(args, sub, group)
+			groups = append(groups, strings.ToLower(sub)+"/"+strings.ToLower(group))
+		}
+		conds = append(conds, placedIdentity+"lower(a.provider_attrs->>'subscription_id') || '/' || lower(a.provider_attrs->>'resource_group') IN ?)")
+		args = append(args, groups)
+		q = q.Where("("+strings.Join(conds, " OR ")+")", args...)
 	}
 
 	var total int64
