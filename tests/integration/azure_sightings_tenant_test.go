@@ -71,13 +71,16 @@ func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
 		f    repositories.AgentFilter
 		want []string
 	}{
-		{repositories.AgentFilter{Subscription: prod}, []string{"bot", "foundry-agent"}},
-		{repositories.AgentFilter{Subscription: strings.ToUpper(sales)}, []string{"logic-app"}},
+		{repositories.AgentFilter{Subscriptions: []string{prod}}, []string{"bot", "foundry-agent"}},
+		{repositories.AgentFilter{Subscriptions: []string{strings.ToUpper(sales)}}, []string{"logic-app"}},
+		// Any one of several.
+		{repositories.AgentFilter{Subscriptions: []string{prod, sales}}, []string{"bot", "foundry-agent", "logic-app"}},
 		// A resource group is its subscription's: iga-test in Sales is another group.
-		{repositories.AgentFilter{ResourceGroup: prod + "/iga-test"}, []string{"foundry-agent"}},
-		{repositories.AgentFilter{ResourceGroup: sales + "/IGA-TEST"}, []string{"logic-app"}},
-		{repositories.AgentFilter{ResourceGroup: "iga-test"}, nil},
-		{repositories.AgentFilter{Subscription: sales, ResourceGroup: prod + "/rg-bots"}, nil},
+		{repositories.AgentFilter{ResourceGroups: []string{prod + "/iga-test"}}, []string{"foundry-agent"}},
+		{repositories.AgentFilter{ResourceGroups: []string{sales + "/IGA-TEST"}}, []string{"logic-app"}},
+		{repositories.AgentFilter{ResourceGroups: []string{prod + "/iga-test", prod + "/rg-bots"}}, []string{"bot", "foundry-agent"}},
+		{repositories.AgentFilter{ResourceGroups: []string{"iga-test"}}, nil},
+		{repositories.AgentFilter{Subscriptions: []string{sales}, ResourceGroups: []string{prod + "/rg-bots"}}, nil},
 	} {
 		c.f.Limit = 50
 		rows, total, err := repo.ListAgents(ws, c.f)

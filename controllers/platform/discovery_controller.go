@@ -895,6 +895,20 @@ func (ctl *DiscoveryController) ListAgentLifecycle(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"events": events, "total": len(events)})
 }
 
+// queryList is a query parameter's values, repeated (?a=x&a=y) or
+// comma-separated (?a=x,y), trimmed, empty ones dropped.
+func queryList(c *gin.Context, name string) []string {
+	var out []string
+	for _, raw := range c.QueryArray(name) {
+		for _, v := range strings.Split(raw, ",") {
+			if v = strings.TrimSpace(v); v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
 // ListDiscoveredAgents handles GET /authsec/discovery/agents.
 // Filter with ?status=&deployment_origin=&source=&archetype=&unowned=true.
 // status=unregistered is the Unregistered Agents report; manual-origin agents
@@ -934,11 +948,12 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		// ?tenant_id= narrows Azure agents to one Entra tenant, on the server so
 		// paging and totals count only that tenant.
 		TenantID: strings.TrimSpace(c.Query("tenant_id")),
-		// ?subscription= and ?resource_group= narrow Azure agents to where they live.
-		Subscription:  strings.TrimSpace(c.Query("subscription")),
-		ResourceGroup: strings.TrimSpace(c.Query("resource_group")),
-		Limit:         limit,
-		Offset:        offset,
+		// ?subscription= and ?resource_group= narrow Azure agents to where they live:
+		// repeated or comma-separated, any one of each.
+		Subscriptions:  queryList(c, "subscription"),
+		ResourceGroups: queryList(c, "resource_group"),
+		Limit:          limit,
+		Offset:         offset,
 	})
 	if err != nil {
 		discoveryError(c, err)

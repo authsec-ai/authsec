@@ -112,14 +112,14 @@ type AgentFilter struct {
 	// TenantID scopes to one Entra tenant: an Azure agent comes from a tenant
 	// connector and has no discovery source, so its metadata names the tenant.
 	TenantID string
-	// Subscription and ResourceGroup scope Azure agents to where they live, as
-	// the inventory's filters of the same names: a subscription id, and
-	// "<subscription id>/<resource group>". An agent with no subscription (an
-	// Entra object) matches neither.
-	Subscription  string
-	ResourceGroup string
-	Limit         int
-	Offset        int
+	// Subscriptions and ResourceGroups scope Azure agents to where they live, as
+	// the inventory's filters of the same names: subscription ids, and
+	// "<subscription id>/<resource group>"s. An agent matches any one of each
+	// list; one with no subscription (an Entra object) matches neither.
+	Subscriptions  []string
+	ResourceGroups []string
+	Limit          int
+	Offset         int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -648,15 +648,23 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	if f.TenantID != "" {
 		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
 	}
-	if f.Subscription != "" {
-		q = q.Where("lower(metadata->>'subscription_id') = lower(?)", f.Subscription)
+	if len(f.Subscriptions) > 0 {
+		subs := make([]string, len(f.Subscriptions))
+		for i, s := range f.Subscriptions {
+			subs[i] = strings.ToLower(s)
+		}
+		q = q.Where("lower(metadata->>'subscription_id') IN ?", subs)
 	}
-	if f.ResourceGroup != "" {
-		// The group is read from the agent's ARM id: its resource's, or its Foundry project's.
-		sub, group, _ := strings.Cut(f.ResourceGroup, "/")
-		q = q.Where(`lower(metadata->>'subscription_id') = lower(?)
-			AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?)`,
-			sub, group)
+	if len(f.ResourceGroups) > 0 {
+		// A group is its subscription's, and is read from the agent's ARM id: its resource's, or its Foundry project's.
+		conds, args := make([]string, 0, len(f.ResourceGroups)), make([]interface{}, 0, 2*len(f.ResourceGroups))
+		for _, g := range f.ResourceGroups {
+			sub, group, _ := strings.Cut(g, "/")
+			conds = append(conds, `(lower(metadata->>'subscription_id') = lower(?)
+				AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?))`)
+			args = append(args, sub, group)
+		}
+		q = q.Where("("+strings.Join(conds, " OR ")+")", args...)
 	}
 
 	var total int64
