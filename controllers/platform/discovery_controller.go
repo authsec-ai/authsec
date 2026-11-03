@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -934,6 +935,18 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		}
 	}
 
+	// ?subscription= and ?resource_group= narrow Azure agents to where they live:
+	// repeated or comma-separated, any one of each. An agent with no ARM id of
+	// its own is where its identity is, as the Azure projection placed it.
+	subscriptions, groups := queryList(c, "subscription"), queryList(c, "resource_group")
+	var subIDs, groupIDs []string
+	if len(subscriptions) > 0 || len(groups) > 0 {
+		if subIDs, groupIDs, err = igaread.PlacedIdentityObjectIDs(c.Request.Context(), ctl.db, wsID, subscriptions, groups); err != nil {
+			discoveryError(c, err)
+			return
+		}
+	}
+
 	agents, total, err := ctl.manager().ListAgents(wsID, repositories.AgentFilter{
 		Status:           c.Query("status"),
 		DeploymentOrigin: c.Query("deployment_origin"),
@@ -947,11 +960,11 @@ func (ctl *DiscoveryController) ListDiscoveredAgents(c *gin.Context) {
 		DiscoverySourceID: sourceID,
 		// ?tenant_id= narrows Azure agents to one Entra tenant, on the server so
 		// paging and totals count only that tenant.
-		TenantID: strings.TrimSpace(c.Query("tenant_id")),
-		// ?subscription= and ?resource_group= narrow Azure agents to where they live:
-		// repeated or comma-separated, any one of each.
-		Subscriptions:  queryList(c, "subscription"),
-		ResourceGroups: queryList(c, "resource_group"),
+		TenantID:              strings.TrimSpace(c.Query("tenant_id")),
+		Subscriptions:         subscriptions,
+		ResourceGroups:        groups,
+		SubscriptionObjectIDs: subIDs,
+		GroupObjectIDs:        groupIDs,
 		// ?only_agents=true leaves out identities that are not one agent
 		// (inferred from sign-ins, or an agent identity not tied to one agent).
 		OnlyAgents: c.Query("only_agents") == "true",

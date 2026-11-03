@@ -118,6 +118,13 @@ type AgentFilter struct {
 	// list; one with no subscription (an Entra object) matches neither.
 	Subscriptions  []string
 	ResourceGroups []string
+	// SubscriptionObjectIDs and GroupObjectIDs are the object ids of the Azure
+	// identities placed in those subscriptions and resource groups
+	// (igaread.PlacedIdentityObjectIDs): an agent with no ARM id of its own
+	// (one Agent ID lists, or one inferred from sign-ins) is where its
+	// identity is.
+	SubscriptionObjectIDs []string
+	GroupObjectIDs        []string
 	// OnlyAgents leaves out what is not one agent: identities inferred to be
 	// agents from their sign-ins, and Entra agent identities not tied to one
 	// agent (Foundry tags an agent's own identity agentName:<agent>; a
@@ -659,35 +666,30 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 			SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(metadata->'tags') = 'array' THEN metadata->'tags' ELSE '[]'::jsonb END) t
 			 WHERE t LIKE 'agentName:%'))`)
 	}
-	// An agent with no ARM id of its own (one Agent ID lists, or one inferred
-	// from an identity's sign-ins) is where its identity is: the Azure
-	// projection places managed identities, and the agent identities they own,
-	// in their resource's subscription and resource group.
-	// TENANT-EXEMPT: a condition of ListAgents' query, already bound to workspace_id; the identity must be the agent row's own workspace's.
-	const placedIdentity = `EXISTS (SELECT 1 FROM iga_identity_accounts a
-		WHERE a.workspace_id = discovered_agents.workspace_id AND a.provider = 'azure' AND a.lifecycle <> 'retired'
-		  AND lower(a.provider_attrs->>'object_id') = lower(discovered_agents.metadata->>'object_id')
-		  AND `
 	if len(f.Subscriptions) > 0 {
 		subs := make([]string, len(f.Subscriptions))
 		for i, s := range f.Subscriptions {
 			subs[i] = strings.ToLower(s)
 		}
-		q = q.Where("(lower(metadata->>'subscription_id') IN ? OR "+placedIdentity+"lower(a.provider_attrs->>'subscription_id') IN ?))", subs, subs)
+		cond, args := "lower(metadata->>'subscription_id') IN ?", []interface{}{subs}
+		if len(f.SubscriptionObjectIDs) > 0 {
+			cond, args = "("+cond+" OR lower(metadata->>'object_id') IN ?)", append(args, f.SubscriptionObjectIDs)
+		}
+		q = q.Where(cond, args...)
 	}
 	if len(f.ResourceGroups) > 0 {
 		// A group is its subscription's, and is read from the agent's ARM id: its resource's, or its Foundry project's.
-		conds, args := make([]string, 0, len(f.ResourceGroups)), make([]interface{}, 0, 2*len(f.ResourceGroups)+1)
-		groups := make([]string, 0, len(f.ResourceGroups))
+		conds, args := make([]string, 0, len(f.ResourceGroups)+1), make([]interface{}, 0, 2*len(f.ResourceGroups)+1)
 		for _, g := range f.ResourceGroups {
 			sub, group, _ := strings.Cut(g, "/")
 			conds = append(conds, `(lower(metadata->>'subscription_id') = lower(?)
 				AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?))`)
 			args = append(args, sub, group)
-			groups = append(groups, strings.ToLower(sub)+"/"+strings.ToLower(group))
 		}
-		conds = append(conds, placedIdentity+"lower(a.provider_attrs->>'subscription_id') || '/' || lower(a.provider_attrs->>'resource_group') IN ?)")
-		args = append(args, groups)
+		if len(f.GroupObjectIDs) > 0 {
+			conds = append(conds, "lower(metadata->>'object_id') IN ?")
+			args = append(args, f.GroupObjectIDs)
+		}
 		q = q.Where("("+strings.Join(conds, " OR ")+")", args...)
 	}
 

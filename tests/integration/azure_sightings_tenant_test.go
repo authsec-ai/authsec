@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -110,6 +112,11 @@ func TestListAgentsBySubscriptionAndResourceGroup(t *testing.T) {
 		{repositories.AgentFilter{Subscriptions: []string{sales}, ResourceGroups: []string{prod + "/rg-bots"}}, nil},
 	} {
 		c.f.Limit = 50
+		// As the controller does: the identities placed there, read by IGA's reader for this workspace only.
+		var err error
+		if c.f.SubscriptionObjectIDs, c.f.GroupObjectIDs, err = igaread.PlacedIdentityObjectIDs(context.Background(), db, ws, c.f.Subscriptions, c.f.ResourceGroups); err != nil {
+			t.Fatalf("%+v: placed identities: %v", c.f, err)
+		}
 		rows, total, err := repo.ListAgents(ws, c.f)
 		if err != nil {
 			t.Fatalf("%+v: %v", c.f, err)
