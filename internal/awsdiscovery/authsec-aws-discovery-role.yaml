@@ -8,7 +8,7 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-10-07'
+    TemplateVersion: '2026-11-05'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -345,6 +345,43 @@ Resources:
                   - ec2:DescribeIamInstanceProfileAssociations
                 Resource: '*'
 
+              # DNS query logs (template 2026-11-05). Detects workloads that
+              # call a model provider (OpenAI, Anthropic, Google...) directly,
+              # from Route 53 Resolver query logs: which VPCs log their DNS
+              # queries and where, and -- for a CloudWatch Logs destination --
+              # one Logs Insights query per log group that returns ONLY the
+              # lookups of model providers' API hosts, filtered inside the
+              # query, so no other DNS data leaves the account. Logs Insights
+              # is charged per GB scanned: AuthSec reads 24 hours on the first
+              # read and at most 7 days per log group per scan, and stops a
+              # query it no longer waits for. ec2:DescribeNetworkInterfaces
+              # maps a source address to the network interface (Lambda, ECS
+              # task, instance) holding it; the ECS task reads are granted
+              # under MigrationEvidence above. S3 and Firehose destinations are
+              # listed, never read.
+              - Sid: DnsQueryLogConfigs
+                Effect: Allow
+                Action:
+                  - route53resolver:ListResolverQueryLogConfigs
+                  - route53resolver:ListResolverQueryLogConfigAssociations
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+
+              # StartQuery names the log groups it reads, so it is scoped to
+              # this account's log groups. GetQueryResults and StopQuery act on
+              # a query id and support no resource scoping.
+              - Sid: DnsQueryLogInsights
+                Effect: Allow
+                Action:
+                  - logs:StartQuery
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+              - Sid: DnsQueryLogInsightsResults
+                Effect: Allow
+                Action:
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+
         # ------------------------------------------------------------------
         # Explicit denies. SecurityAudit does not grant any of these, so this
         # policy changes nothing about what the role can do today. It is here so
@@ -423,7 +460,7 @@ Resources:
       RoleArn: !GetAtt AuthSecDiscoveryRole.Arn
       ExternalId: !Ref ExternalId
       AccountId: !Ref 'AWS::AccountId'
-      TemplateVersion: '2026-10-07'
+      TemplateVersion: '2026-11-05'
 
 Outputs:
 
@@ -442,4 +479,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-10-07'
+    Value: '2026-11-05'
