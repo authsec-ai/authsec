@@ -1,6 +1,6 @@
 # SPEC: Agent runtime visibility on AWS — discover, detect, contain
 
-> **Status: proposed, revision 2, for review** (Ritam, 2026-11-05). Reviewer:
+> **Status: revision 2, build started 2026-11-05 on `feat/agent-runtime-aws`** (Q1–Q5, Q7 taken at the defaults below until review says otherwise; Q6 decided) (Ritam, 2026-11-05). Reviewer:
 > Aditya Agarwal and his agents. Revision 1 (AWS, Azure, Kubernetes, gateways)
 > was reviewed the same day; this revision is **AWS only** and answers that
 > review point by point (§9). Nothing here is built.
@@ -342,7 +342,7 @@ P1.
 3. **Q3** Alerts: new table, or `iga_gov_event` kinds in Logs?
 4. **Q4** Enforcement template v3 (Lambda concurrency, ECS desired count): acceptable widening of the enforcement role?
 5. **Q5** Single agent inventory long term: graph classification plus a mirror into `discovered_agents` (this spec), or one of them only?
-6. **Q6** Human approval: Ritam decided against it for this scope; NIST design tenet 5 is human-in-the-loop for sensitive actions. Keep it out, or require approval for identity-level containment?
+6. **Q6 — decided (Ritam, 2026-11-05): no human approval** in this scope, containment included. NIST design tenet 5 noted; revisit only on a customer requirement.
 7. **Q7** Detection thresholds (D5, D6) defaults.
 
 ## 9. Review of revision 1 (Aditya, 2026-11-05) and what changed
