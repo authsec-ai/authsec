@@ -1,6 +1,6 @@
 # SPEC: Agent runtime visibility on AWS — discover, detect, contain
 
-> **Status: revision 2, build started 2026-11-05 on `feat/agent-runtime-aws`** (Q1–Q5, Q7 taken at the defaults below until review says otherwise; Q6 decided) (Ritam, 2026-11-05). Reviewer:
+> **Status: revision 2, build started 2026-11-05 on `feat/agent-runtime-aws`** (Q1–Q4 answered in review 2, §10; Q6 decided; Q5, Q7 at the build defaults in §10) (Ritam, 2026-11-05). Reviewer:
 > Aditya Agarwal and his agents. Revision 1 (AWS, Azure, Kubernetes, gateways)
 > was reviewed the same day; this revision is **AWS only** and answers that
 > review point by point (§9). Nothing here is built.
@@ -367,3 +367,72 @@ P1.
 | "Only GitHub writes `iga_agents`" unverified | Removed |
 | Kubernetes ingress described too harshly | Removed (Kubernetes deferred) |
 | 9–11 weeks optimistic | Smaller scope; P1–P3 6–7 weeks backend, stated as estimates |
+
+## 10. Decisions from review 2 (Aditya, 2026-11-05) — binding for the build
+
+These override §3–§8 where they differ.
+
+**Q1 — signed off, with conditions.** Suggestions are allowed; a suggestion
+never sets classification (phase-2 §2.14.3 gets a pointer line when this
+merges). Measure suggestion precision on the lab account and record it in the
+P1 acceptance results (a fixed pipeline — read S3, summarise, write S3 — also
+matches the rule; false positives are expected). **No suggestion on a shared
+role:** classification lives on `iga_workload`, so when several workloads share
+the role, show only the shared-role finding until the role is split.
+
+**Q2 — a new table keyed to `iga_workload`.** `agent_suggestion` keyed
+`(workspace_id, workload_id)` → `iga_workload` (each row is one incarnation, so
+suppression per incarnation is free): rule id and version, evidence references
+(the `cloud_usage` / `cloud_observation` rows), state `pending | confirmed |
+dismissed | superseded`, deciding user, time, reason, version. **Confirm** calls
+the existing classify transaction (`POST /workloads/:id/classification`, same
+`operation_id` and version contract) and closes the suggestion in the same
+transaction. Workspace FK, index, RLS, bootstrap mirror, parity check.
+`iga_classification_candidates` is not used (GitHub-only, promotes to
+`iga_agents`, uniqueness only while pending).
+
+**Q3 — new tables plus log entries.** `agent_alert` (detection, identity,
+workload, severity, dedupe key, first/last seen, count, state `open |
+acknowledged | resolved`, evidence references — never secret values) and
+`agent_alert_delivery` (channel, attempt, status, time). Write "alert opened" and
+"alert resolved" into `iga_gov_event` with the alert id in the payload so they
+appear in Logs and the audit trail stays append-only (R7). Slack through
+`services/iga_gov_notify.go` (`GovChannelSlack`). Alerts have their own default
+retention, separate from the log.
+
+**Q4 — widen the enforcement role only as an opt-in stack parameter**, following
+`EnableLambdaSplit` in template v2 (no new template file). Identity- and
+model-level containment need no widening (v2's `ManageAuthSecPolicies` and
+`AttachOnlyAuthSecPolicies`). Workload containment, behind the parameter:
+Lambda `GetFunctionConcurrency`, `PutFunctionConcurrency`,
+`DeleteFunctionConcurrency`; ECS `DescribeServices`, `UpdateService`;
+Application Auto Scaling describe and register scalable target (to suspend
+scaling, otherwise it raises `desiredCount` again); `iam:ListAccessKeys`,
+`iam:UpdateAccessKey` (IAM user keys). Deny all of these on resources tagged
+`authsec:protected=true`, as v2 does for roles (verify Lambda and ECS honour
+`aws:ResourceTag` on these actions). Bindings without the parameter report
+workload containment unavailable, with the reason, in `/api/iga/v1/capabilities`.
+
+**§5.4 changes.** No permissions-boundary variant: a role has one boundary and
+R1a already writes AuthSec boundaries (`internal/awsenforce/deploy.go`). Without
+Organizations, the template is an AuthSec-owned **deny policy** attached to
+chosen roles (v2 allows it). The gate must not be bypassable through session
+tags: also deny setting the `authsec:agent` tag key through `sts:TagSession`,
+`sts:AssumeRole*` (with tags) and `iam:TagRole` / `iam:UntagRole`, except for
+named administrator principals (a template parameter).
+
+**§5.2 change.** The session-name claims (Lambda = function name, ECS = task id)
+are unverified: both go into the P1 lab acceptance; until verified, session
+names are shown as unverified weak evidence only.
+
+**§5.8 change.** The preview states side effects: zero Lambda concurrency does
+not stop event source mappings (queue messages are retried and may dead-letter);
+ECS `desiredCount = 0` does not stop tasks started with `RunTask`.
+
+**§5.7 change.** D1 on `kms:Decrypt` would duplicate every `GetSecretValue`
+alert (Secrets Manager decrypts on the caller's behalf): drop `kms:Decrypt`
+calls made on a principal's behalf by Secrets Manager or SSM (`invokedBy`), and
+check in the lab.
+
+Q5 and Q7 remain open; the build uses: Q5 graph classification authoritative +
+mirror into `discovered_agents`; Q7 defaults D5 N=10/M=5 min, D6 k=5.
