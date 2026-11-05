@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec tag-gated model access (deny mode, without AWS Organizations) - an
+  AuthSec-owned IAM policy under /authsec/ that, attached to the roles you
+  choose, refuses their Bedrock model calls unless the role (or its session)
+  carries the authsec:agent tag, and refuses those roles setting or removing
+  that tag. Run the audit mode first: this one breaks every chosen role that
+  calls a model without the tag.
+
+# What it does (SPEC-agent-runtime-visibility.md section 5.4 as amended in
+# section 10): the same statements as the SCP form, as an identity policy.
+# It is a DENY POLICY attached to roles, never a permissions boundary: a role
+# has one boundary and AuthSec access policies already write AuthSec
+# boundaries. The AuthSec enforcement role (template v2) may attach and
+# detach it, because it lives under /authsec/.
+#
+# Weaker than the SCP form, stated plainly:
+#   - it covers only the roles it is attached to; a role it is not attached
+#     to calls models freely and is not reported as refused;
+#   - it stops the gated roles from tagging, but another principal allowed
+#     iam:TagRole can still tag a gated role authsec:agent. Restrict
+#     iam:TagRole for authsec:agent in your administrators' policies, or use
+#     the SCP form. AdminPrincipalArns matters only if an administrator role
+#     is itself gated.
+#   - bedrock-mantle's IAM action prefix is UNVERIFIED (bedrock-mantle:*).
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-11-05'
+    Kind: model-access-policy
+
+Parameters:
+
+  RoleNames:
+    Type: CommaDelimitedList
+    Description: >-
+      The names (not ARNs) of the roles to gate. Start with one role you know
+      calls a model.
+
+  AdminPrincipalArns:
+    Type: CommaDelimitedList
+    Description: >-
+      ARNs (wildcards allowed) of the principals that may set or remove the
+      authsec:agent tag even when gated.
+
+  PolicySuffix:
+    Type: String
+    Default: default
+    AllowedPattern: '^[A-Za-z0-9_-]{1,64}$'
+    Description: Names the policy AuthSecModelAccessGate-<suffix>.
+
+Resources:
+
+  AuthSecModelAccessGate:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'AuthSecModelAccessGate-${PolicySuffix}'
+      Path: /authsec/
+      Description: AuthSec tag-gated model access - refuses model calls by attached roles without the authsec:agent tag
+      Roles: !Ref RoleNames
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUntaggedModelCalls
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel*
+              - bedrock:Converse*
+              - bedrock:InvokeAgent
+              - bedrock:InvokeInlineAgent
+              - bedrock:RetrieveAndGenerate*
+              - bedrock:InvokeFlow
+              - bedrock-mantle:*
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:PrincipalTag/authsec:agent: 'true'
+          - Sid: DenyAgentTagByKey
+            Effect: Deny
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:TagUser
+              - iam:UntagUser
+              - iam:CreateRole
+              - iam:CreateUser
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEqualsIgnoreCase:
+                aws:TagKeys:
+                  - authsec:agent
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+          - Sid: DenyAgentTagByRequest
+            Effect: Deny
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - iam:TagRole
+              - iam:TagUser
+              - iam:CreateRole
+              - iam:CreateUser
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:RequestTag/authsec:agent: 'false'
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+
+Outputs:
+  TemplateVersion:
+    Description: The AuthSec template version of this stack.
+    Value: '2026-11-05'
+  PolicyArn:
+    Description: The AuthSec gate policy.
+    Value: !Ref AuthSecModelAccessGate

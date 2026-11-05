@@ -1,0 +1,42 @@
+{
+  "template_version": "2026-11-05",
+  "mode": "audit",
+  "denies": false,
+  "summary": "Audit mode changes nothing in AWS. It describes what deny mode would refuse, so you can tag every agent before turning the gate on.",
+  "would_deny": {
+    "actions": [
+      "bedrock:InvokeModel*",
+      "bedrock:Converse*",
+      "bedrock:InvokeAgent",
+      "bedrock:InvokeInlineAgent",
+      "bedrock:RetrieveAndGenerate*",
+      "bedrock:InvokeFlow",
+      "bedrock-mantle:* (UNVERIFIED action prefix)"
+    ],
+    "unless": "the calling principal carries the authsec:agent tag (a role tag, an IAM user tag, or a session tag set by an administrator)",
+    "tag_protection": [
+      "setting authsec:agent as a session tag (sts:TagSession, sts:AssumeRole* with tags)",
+      "setting authsec:agent on a role or user (iam:TagRole, iam:TagUser, iam:CreateRole, iam:CreateUser)",
+      "removing authsec:agent (iam:UntagRole, iam:UntagUser)",
+      "all refused except for the administrator principals you name (aws:PrincipalArn)"
+    ]
+  },
+  "affected": {
+    "scp": "Every principal in the targeted accounts that calls one of the actions above without the tag, except in the management account and service-linked roles (SCPs do not apply there).",
+    "policy": "Only the roles you attach the AuthSec policy to, when they call one of the actions above without the tag."
+  },
+  "report": [
+    "In AuthSec, open the AI workloads of this account: every identity listed there was seen calling a model (CloudTrail).",
+    "Each identity without the authsec:agent tag is one deny mode would refuse. For a shared role, every workload on it is refused together.",
+    "Model calls through the agents runtime, bedrock-mantle and AgentCore appear only with the event stream and its data events turned on; without them, an untagged caller of those endpoints is not in the list and would still be refused.",
+    "After deny mode is on, refused calls appear in AuthSec as refused model calls with the identity, so anything missed here shows up there."
+  ],
+  "tagging_guide": [
+    "Decide which roles are agents. Tag only those: the tag is what lets them call models once the gate is on.",
+    "Tag a role: aws iam tag-role --role-name <role> --tags Key=authsec:agent,Value=<agent name>",
+    "Tag an IAM user (prefer moving the agent to a role): aws iam tag-user --user-name <user> --tags Key=authsec:agent,Value=<agent name>",
+    "Tag with the principals you will name as administrators: deny mode refuses everyone else setting or removing the tag, including pipelines and CloudFormation roles you do not list.",
+    "Do not pass authsec:agent as a session tag from an application; set it on the role.",
+    "Re-scan in AuthSec and check that no identity you want to keep calling models is still untagged, then deploy the deny template for your form (mode=deny)."
+  ]
+}
