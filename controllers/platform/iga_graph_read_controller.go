@@ -150,6 +150,8 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		// gate and what the policy product serves. Its reason is the one
 		// every /policy route's 503 carries.
 		"policy": withAccessPolicies(policyCapabilities(ctl.policyGateFn()()), ctl.db()),
+		// Agent runtime visibility P3: containment levels per AWS account.
+		"agent_containment": agentContainCapabilities(c, ctl.db()),
 	}})
 }
 

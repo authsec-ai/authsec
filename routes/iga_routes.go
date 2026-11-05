@@ -89,6 +89,9 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// The gate is the graph controller's, so /capabilities and the routes
 		// can never disagree about it.
 		platformCtrl.MountIGAPolicyRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
+		// Agent runtime visibility P3: agent containment, the same auth,
+		// envelope and policy gate (agent_runtime_contain_controller.go).
+		platformCtrl.MountAgentRuntimeContainRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a
