@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec agent runtime event stream - sends the CloudTrail events AuthSec
+  needs (model calls and what an AI workload does next) from this account and
+  region to AuthSec within about a minute, through an EventBridge rule and an
+  API destination. It reads nothing and changes nothing in your account
+  beyond the resources below. Deleting this stack stops the stream; AuthSec
+  keeps reading CloudTrail during scans as before.
+
+# Deploy it in every region you want watched (a StackSet works), and in
+# us-east-1 for IAM, STS (global endpoint) and CloudTrail console events:
+# global-service events reach EventBridge in us-east-1 only.
+#
+# REQUIRES A TRAIL. Read-only management events (Converse, InvokeModel,
+# GetSecretValue, ...) reach EventBridge only from a trail that logs them and
+# only for a rule whose state is ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS.
+# Set CreateTrail=true in ONE region's stack (the trail it creates is
+# multi-region) or keep your own trail (CreateTrail=false). Data events
+# (Bedrock agents runtime, bedrock-mantle, AgentCore, S3) are logged only by
+# a trail whose selectors include them, and CloudTrail charges for them: the
+# DataEvents* parameters add them to the trail this stack creates; for your
+# own trail, add the same selectors to it yourself.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-11-05'
+    Kind: agent-event-stream
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Filled in by AuthSec - do not change
+        Parameters:
+          - EndpointUrl
+          - EventSecret
+          - ConnectorId
+      - Label:
+          default: Trail
+        Parameters:
+          - CreateTrail
+      - Label:
+          default: Optional data events (charged by CloudTrail per event)
+        Parameters:
+          - DataEventsBedrockAgents
+          - DataEventsBedrockMantle
+          - MantleEventSource
+          - MantleDataResourceType
+          - DataEventsAgentCore
+          - DataEventsS3
+      - Label:
+          default: Delivery
+        Parameters:
+          - InvocationRateLimit
+
+Parameters:
+
+  EndpointUrl:
+    Type: String
+    Description: >-
+      The AuthSec ingest endpoint (https://.../authsec/ingest/aws/events).
+      Copy it from the AuthSec console.
+    AllowedPattern: '^https://[^\s]+/authsec/ingest/aws/events$'
+    ConstraintDescription: must be the https endpoint shown in the AuthSec console.
+
+  # The connector's event secret, shown ONCE by AuthSec when the stream is
+  # created or rotated. EventBridge keeps it in a Secrets Manager secret it
+  # owns (events!connection/...) and sends it as the X-AuthSec-Event-Secret
+  # header. It identifies this account's connector to AuthSec; it grants
+  # nothing in your account.
+  EventSecret:
+    Type: String
+    NoEcho: true
+    Description: >-
+      The event secret AuthSec showed when you turned the stream on (starts
+      with aev_). Rotating it in AuthSec stops the stream until you update
+      this parameter.
+    AllowedPattern: '^aev_[A-Za-z0-9_-]{43}$'
+    ConstraintDescription: must be the aev_ secret shown in the AuthSec console.
+
+  ConnectorId:
+    Type: String
+    Description: The AuthSec connector this account is connected as. Used in names and tags only.
+    AllowedPattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    ConstraintDescription: must be the connector id shown in the AuthSec console.
+
+  CreateTrail:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      'true' creates a multi-region trail (and its S3 bucket) logging all
+      management events, plus the data events chosen below. Set it in one
+      region only. 'false' reuses a trail you already have, which must log
+      management events (read and write) in this region.
+
+  DataEventsBedrockAgents:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Log Bedrock agents runtime data events (InvokeAgent, InvokeInlineAgent,
+      Retrieve, RetrieveAndGenerate, InvokeFlow) on the created trail. Charged
+      per event by CloudTrail.
+
+  DataEventsBedrockMantle:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Log the OpenAI/Anthropic-compatible Bedrock endpoint (bedrock-mantle)
+      data events on the created trail. Needs MantleDataResourceType. Charged
+      per event by CloudTrail.
+
+  # UNVERIFIED: the mantle endpoint's CloudTrail eventSource. AuthSec matches
+  # bedrock-mantle* as well; change this only if a lab call shows another
+  # value.
+  MantleEventSource:
+    Type: String
+    Default: bedrock-mantle.amazonaws.com
+    AllowedPattern: '^[a-z0-9.-]+\.amazonaws\.com$'
+    Description: >-
+      The eventSource of bedrock-mantle calls in CloudTrail (UNVERIFIED
+      default). The rule forwards events from this source.
+
+  # UNVERIFIED: the resources.type CloudTrail uses for mantle data events
+  # (see the CloudTrail logging page of the mantle endpoint). Empty means no
+  # mantle selector is added even when DataEventsBedrockMantle is 'true'.
+  MantleDataResourceType:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^AWS::[A-Za-z0-9]+::[A-Za-z0-9]+$'
+    Description: >-
+      The CloudTrail data resource type of bedrock-mantle (AWS::Service::Type).
+      Leave empty until it is confirmed for your account.
+
+  DataEventsAgentCore:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Log Bedrock AgentCore data events (InvokeAgentRuntime, gateway and
+      token-vault calls) on the created trail. Charged per event by CloudTrail.
+
+  DataEventsS3:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Log S3 object-level data events (GetObject, PutObject, ...) for every
+      bucket on the created trail. This can be by far the most expensive
+      option on a busy account; turn it on only where object access by AI
+      workloads matters to you.
+
+  InvocationRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 300
+    Description: >-
+      The most events per second EventBridge sends to AuthSec. Events above it
+      wait in EventBridge and are retried for up to 24 hours.
+
+Conditions:
+
+  CreateTrailCond: !Equals [!Ref CreateTrail, 'true']
+  BedrockAgentsCond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsBedrockAgents, 'true']]
+  MantleCond: !And
+    - !Condition CreateTrailCond
+    - !Equals [!Ref DataEventsBedrockMantle, 'true']
+    - !Not [!Equals [!Ref MantleDataResourceType, '']]
+  AgentCoreCond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsAgentCore, 'true']]
+  S3Cond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsS3, 'true']]
+
+Resources:
+
+  # ------------------------------------------------------------------ trail
+
+  AuthSecTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateTrailCond
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTrailLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+        - Key: authsec:connector
+          Value: !Ref ConnectorId
+
+  AuthSecTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateTrailCond
+    Properties:
+      Bucket: !Ref AuthSecTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuthSecTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/AuthSecAgentRuntime-${ConnectorId}'
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AuthSecTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/AuthSecAgentRuntime-${ConnectorId}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AuthSecTrailBucket.Arn
+              - !Sub '${AuthSecTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  AuthSecTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateTrailCond
+    DependsOn: AuthSecTrailBucketPolicy
+    Properties:
+      TrailName: !Sub 'AuthSecAgentRuntime-${ConnectorId}'
+      S3BucketName: !Ref AuthSecTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      AdvancedEventSelectors:
+        # Every management event, read and write: what EventBridge forwards.
+        - Name: Management events
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Management]
+        # Data events, opt-in per kind. Resource types other than S3 are as
+        # the CloudTrail data-event table lists them; confirm them for your
+        # account (AuthSec records what arrives).
+        - !If
+          - BedrockAgentsCond
+          - Name: Bedrock agent aliases
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::Bedrock::AgentAlias']
+          - !Ref AWS::NoValue
+        - !If
+          - BedrockAgentsCond
+          - Name: Bedrock knowledge bases
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::Bedrock::KnowledgeBase']
+          - !Ref AWS::NoValue
+        - !If
+          - BedrockAgentsCond
+          - Name: Bedrock flow aliases
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::Bedrock::FlowAlias']
+          - !Ref AWS::NoValue
+        - !If
+          - MantleCond
+          - Name: Bedrock mantle endpoint
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: [!Ref MantleDataResourceType]
+          - !Ref AWS::NoValue
+        - !If
+          - AgentCoreCond
+          - Name: AgentCore runtimes
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::BedrockAgentCore::Runtime']
+          - !Ref AWS::NoValue
+        - !If
+          - AgentCoreCond
+          - Name: AgentCore gateways
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::BedrockAgentCore::Gateway']
+          - !Ref AWS::NoValue
+        - !If
+          - S3Cond
+          - Name: S3 objects
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::S3::Object']
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+        - Key: authsec:connector
+          Value: !Ref ConnectorId
+
+  # ------------------------------------------------------------- delivery
+
+  # API-key auth: EventBridge stores the secret in a Secrets Manager secret
+  # it owns and sends it as the X-AuthSec-Event-Secret header.
+  AuthSecEventConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Description: AuthSec agent runtime event stream (API key auth)
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: X-AuthSec-Event-Secret
+          ApiKeyValue: !Ref EventSecret
+
+  AuthSecEventApiDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      Description: AuthSec agent runtime ingest endpoint
+      ConnectionArn: !GetAtt AuthSecEventConnection.Arn
+      HttpMethod: POST
+      InvocationEndpoint: !Ref EndpointUrl
+      InvocationRateLimitPerSecond: !Ref InvocationRateLimit
+
+  # May invoke this API destination and nothing else.
+  AuthSecEventInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets the AuthSec event rule invoke the AuthSec API destination, and nothing else.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeAuthSecApiDestination
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:InvokeApiDestination
+                Resource: !GetAtt AuthSecEventApiDestination.Arn
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+        - Key: authsec:connector
+          Value: !Ref ConnectorId
+
+  # CloudTrail events from the services AuthSec reads. The state is what
+  # makes read-only management events (Converse, InvokeModel, Get*) reach
+  # the rule at all.
+  AuthSecEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AuthSec agent runtime - CloudTrail events of model calls and what follows them
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+          - AWS Service Event via CloudTrail
+        detail:
+          eventSource:
+            - bedrock.amazonaws.com
+            - !Ref MantleEventSource
+            - bedrock-agentcore.amazonaws.com
+            - iam.amazonaws.com
+            - sts.amazonaws.com
+            - secretsmanager.amazonaws.com
+            - ssm.amazonaws.com
+            - kms.amazonaws.com
+            - cloudtrail.amazonaws.com
+            - s3.amazonaws.com
+            - lambda.amazonaws.com
+            - logs.amazonaws.com
+      Targets:
+        - Id: AuthSecIngest
+          Arn: !GetAtt AuthSecEventApiDestination.Arn
+          RoleArn: !GetAtt AuthSecEventInvokeRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 185
+            MaximumEventAgeInSeconds: 86400
+
+Outputs:
+  TemplateVersion:
+    Description: The AuthSec template version of this stack.
+    Value: '2026-11-05'
+  RuleArn:
+    Description: The EventBridge rule forwarding events to AuthSec.
+    Value: !GetAtt AuthSecEventRule.Arn
+  ApiDestinationArn:
+    Description: The API destination for the AuthSec ingest endpoint.
+    Value: !GetAtt AuthSecEventApiDestination.Arn
+  TrailArn:
+    Condition: CreateTrailCond
+    Description: The trail this stack created.
+    Value: !GetAtt AuthSecTrail.Arn
