@@ -7,7 +7,10 @@ Description: >-
   set and remove them as permissions boundaries, and attach and detach them
   as role policies (time-limited temporary grants, and session revocation by
   an attached deny). With EnableLambdaSplit=true it can also create roles
-  under /authsec/split/ and switch a Lambda function's execution role. It
+  under /authsec/split/ and switch a Lambda function's execution role. With
+  EnableWorkloadContainment=true it can also contain an agent's workload
+  (Lambda reserved concurrency, ECS desired count and its auto scaling) and
+  an IAM user (AuthSec policies and access-key status). It
   cannot read anything, cannot change your own policies, and cannot touch
   service-linked roles, AWS reserved roles, AuthSec's own roles or roles
   tagged authsec:protected=true. Deleting this stack removes AuthSec's
@@ -30,6 +33,10 @@ Metadata:
           default: Optional - direct Lambda execution-role splits
         Parameters:
           - EnableLambdaSplit
+      - Label:
+          default: Optional - agent containment of workloads and IAM users
+        Parameters:
+          - EnableWorkloadContainment
 
 Parameters:
 
@@ -93,10 +100,31 @@ Parameters:
       give it the source role's policies, and switch the function to it (and
       back on revert). Leave 'false' to receive splits as pull requests only.
 
+  # SPEC-agent-runtime-visibility.md section 10 Q4: workload containment is
+  # opt-in. Off (the default), AuthSec contains an agent only at the identity
+  # or model level (an AuthSec deny policy attached to the role, which the
+  # statements below already allow); the workload level and IAM users are then
+  # reported unavailable in AuthSec, with this parameter as the reason.
+  EnableWorkloadContainment:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      'true' lets AuthSec contain an agent's workload and restore it exactly:
+      set a Lambda function's reserved concurrency to 0, an ECS service's
+      desired count to 0 with its Application Auto Scaling suspended, and,
+      for an agent on an IAM user, attach an AuthSec deny policy to the user
+      and deactivate its access keys. Never on resources tagged
+      authsec:protected=true. Leave 'false' to contain at the identity and
+      model levels only.
+
 Conditions:
 
   HasCallback: !Not [!Equals [!Ref CallbackTopicArn, '']]
   EnableLambdaSplitCond: !Equals [!Ref EnableLambdaSplit, 'true']
+  EnableWorkloadContainmentCond: !Equals [!Ref EnableWorkloadContainment, 'true']
 
 Resources:
 
@@ -272,6 +300,79 @@ Resources:
                   Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
                 - !Ref AWS::NoValue
 
+              # ---------------------------------------- agent containment
+
+              # Q4 (EnableWorkloadContainment=true only): read, zero and
+              # restore a Lambda function's reserved concurrency, in any
+              # region of this account.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ContainLambdaConcurrency
+                  Effect: Allow
+                  Action:
+                    - lambda:GetFunctionConcurrency
+                    - lambda:PutFunctionConcurrency
+                    - lambda:DeleteFunctionConcurrency
+                  Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
+                - !Ref AWS::NoValue
+
+              # Q4 (EnableWorkloadContainment=true only): read and set an ECS
+              # service's desired count (0 to contain, the recorded count on
+              # release).
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ContainECSServices
+                  Effect: Allow
+                  Action:
+                    - ecs:DescribeServices
+                    - ecs:UpdateService
+                  Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*'
+                - !Ref AWS::NoValue
+
+              # Q4 (EnableWorkloadContainment=true only): suspend and resume an
+              # ECS service's Application Auto Scaling, which would otherwise
+              # raise the desired count again. DescribeScalableTargets has no
+              # resource-level permission and a scalable target's ARN carries a
+              # random id, so the resource is '*'. AuthSec only ever
+              # re-registers an EXISTING target with its SuspendedState.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ContainServiceScaling
+                  Effect: Allow
+                  Action:
+                    - application-autoscaling:DescribeScalableTargets
+                    - application-autoscaling:RegisterScalableTarget
+                  Resource: '*'
+                - !Ref AWS::NoValue
+
+              # Q4 (EnableWorkloadContainment=true only): an agent on an IAM
+              # user -- list and (de)activate its access keys.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ContainIAMUserKeys
+                  Effect: Allow
+                  Action:
+                    - iam:ListAccessKeys
+                    - iam:UpdateAccessKey
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+                - !Ref AWS::NoValue
+
+              # Q4 (EnableWorkloadContainment=true only): attach and detach an
+              # AuthSec policy (under /authsec/) to an IAM user, and nothing
+              # else, exactly as AttachOnlyAuthSecPolicies does for roles.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: AttachOnlyAuthSecUserPolicies
+                  Effect: Allow
+                  Action:
+                    - iam:AttachUserPolicy
+                    - iam:DetachUserPolicy
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+                  Condition:
+                    ArnLike:
+                      iam:PolicyARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+                - !Ref AWS::NoValue
+
               # ------------------------------------------------- protections
 
               # Never service-linked roles or AWS reserved (SSO) roles, by
@@ -353,6 +454,48 @@ Resources:
                 Condition:
                   StringNotEquals:
                     aws:ResourceTag/authsec:managed-by: authsec
+
+              # Never a function, service, scalable target or user you have
+              # tagged authsec:protected=true, and never AuthSec's own (tagged
+              # ManagedBy=AuthSec), as ProtectTaggedRoles does for roles.
+              # UNVERIFIED, check in the lab: that Lambda and ECS evaluate
+              # aws:ResourceTag on these actions, and that Application Auto
+              # Scaling reads the scalable target's own tags (not the ECS
+              # service's). AuthSec also refuses tagged resources itself.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ProtectTaggedContainmentTargets
+                  Effect: Deny
+                  Action:
+                    - lambda:PutFunctionConcurrency
+                    - lambda:DeleteFunctionConcurrency
+                    - ecs:UpdateService
+                    - application-autoscaling:RegisterScalableTarget
+                    - iam:UpdateAccessKey
+                    - iam:AttachUserPolicy
+                    - iam:DetachUserPolicy
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      aws:ResourceTag/authsec:protected: 'true'
+                - !Ref AWS::NoValue
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ProtectAuthSecContainmentTargets
+                  Effect: Deny
+                  Action:
+                    - lambda:PutFunctionConcurrency
+                    - lambda:DeleteFunctionConcurrency
+                    - ecs:UpdateService
+                    - application-autoscaling:RegisterScalableTarget
+                    - iam:UpdateAccessKey
+                    - iam:AttachUserPolicy
+                    - iam:DetachUserPolicy
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      aws:ResourceTag/ManagedBy: AuthSec
+                - !Ref AWS::NoValue
 
       Tags:
         - Key: ManagedBy

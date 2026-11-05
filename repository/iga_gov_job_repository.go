@@ -51,6 +51,8 @@ const (
 	// or removed and restored, per principal.
 	GovJobAzureAccess = "azure_access"
 	GovJobK8sAccess   = "k8s_access"
+	// Agent containment (151): contain, verify and release one containment.
+	GovJobAgentContain = "agent_contain"
 )
 
 // GovJobKinds are the kinds 052 (widened by 061) accepts (all of them).
@@ -58,7 +60,8 @@ var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
 	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
-	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound, GovJobAzureAccess,
+	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound, GovJobAzureAccess, GovJobK8sAccess,
+	GovJobAgentContain,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per

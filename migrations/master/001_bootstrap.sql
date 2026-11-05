@@ -13116,8 +13116,7 @@ COMMENT ON TABLE public.cloud_trail_cursor IS
     'How far CloudTrail LookupEvents was read per connector, region and stream (general | bedrock); partial = a page cap left [window_from, covered_from) unread.';
 -- 149: agent runtime event stream (agent_event_stream, agent_event_seen).
 -- Same objects as migrations/master/149_agent_event_stream.sql.
--- ============================================================================
-
+-- =====================================================================
 CREATE TABLE IF NOT EXISTS public.agent_event_stream (
     connector_id     uuid        PRIMARY KEY,
     workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
@@ -13450,5 +13449,90 @@ BEGIN
 =======
         PERFORM public.tenancy_enable_rls('public.agent_event_stream');
         PERFORM public.tenancy_enable_rls('public.agent_event_seen');
+=======
+-- 151: agent containment (agent_containment, agent_containment_step, job
+-- agent_contain). Same objects as migrations/master/151_agent_containment.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_containment (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id         uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  connector_id         uuid NOT NULL,
+  identity_id          uuid NOT NULL,
+  identity_kind        text NOT NULL CHECK (identity_kind IN ('iam_role','iam_user')),
+  identity_arn         text NOT NULL CHECK (identity_arn <> ''),
+  -- The identity's AWS unique id (AROA... / AIDA...) at request time: a
+  -- role recreated under the same name is not this identity.
+  unique_id            text NOT NULL DEFAULT '',
+  workload_ids         uuid[] NOT NULL DEFAULT '{}',
+  level                text NOT NULL CHECK (level IN ('workload','identity','model')),
+  state                text NOT NULL DEFAULT 'previewed'
+                       CHECK (state IN ('previewed','containing','contained','partially_contained','failed','releasing','released')),
+  state_reason         text NOT NULL DEFAULT '',
+  reason               text NOT NULL CHECK (btrim(reason) <> ''),
+  release_reason       text NOT NULL DEFAULT '',
+  -- Behavioural verification: NULL until decided; false with the late
+  -- events in verification when a successful call followed containment.
+  effective            boolean,
+  verification         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_by           uuid NOT NULL REFERENCES users(id),
+  contained_at         timestamptz,
+  verified_at          timestamptz,
+  release_requested_at timestamptz,
+  released_at          timestamptz,
+  released_by          uuid REFERENCES users(id),
+  -- A deferred restore (the session revocation) is due at this time.
+  pending_restore_at   timestamptz,
+  preview              jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  CONSTRAINT agent_containment_workload_ids_chk CHECK (level = 'workload' OR cardinality(workload_ids) = 0),
+  CONSTRAINT agent_containment_released_chk CHECK ((state = 'released') = (released_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_live ON agent_containment (workspace_id, identity_id, level)
+  WHERE state IN ('previewed','containing','contained','partially_contained','releasing');
+CREATE INDEX IF NOT EXISTS idx_agent_containment_ws_state ON agent_containment (workspace_id, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_identity ON agent_containment (workspace_id, identity_id);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_open ON agent_containment (state)
+  WHERE state IN ('previewed','containing','contained','partially_contained','releasing') OR pending_restore_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS agent_containment_step (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id uuid NOT NULL,
+  seq            integer NOT NULL,
+  kind           text NOT NULL CHECK (kind IN ('lambda_concurrency','ecs_desired','ecs_autoscaling','iam_policy','session_revoke','access_key')),
+  target         text NOT NULL CHECK (target <> ''),
+  region         text NOT NULL DEFAULT '',
+  before         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  after          jsonb NOT NULL DEFAULT '{}'::jsonb,
+  state          text NOT NULL DEFAULT 'pending'
+                 CHECK (state IN ('pending','applied','skipped','failed','restoring','restored','restore_failed')),
+  error          text NOT NULL DEFAULT '',
+  restore_after  timestamptz,
+  applied_at     timestamptz,
+  restored_at    timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, containment_id, kind, target),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_step_seq ON agent_containment_step (workspace_id, containment_id, seq);
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_job') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_job DROP CONSTRAINT IF EXISTS iga_gov_job_kind_check;
+        ALTER TABLE public.iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check
+            CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
+                            'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync',
+                            'prune_evidence','metrics_rollup','resolve_unknown',
+                            'temp_grant','session_revoke','time_bound','azure_access','k8s_access',
+                            'agent_contain'));
+    END IF;
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_containment');
+        PERFORM public.tenancy_enable_rls('public.agent_containment_step');
     END IF;
 END $$;
