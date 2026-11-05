@@ -191,6 +191,7 @@ func main() {
 	// scan could run there again.
 	graphGate := services.DefaultGraphProjectionGate()
 	services.SetGraphProjection(graphGate)
+	services.InstallAgentRuntimeResolver(config.DB) // agentruntime.SubjectResolver for detections and containment
 	go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
 		go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
 	})

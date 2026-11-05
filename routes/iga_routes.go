@@ -89,6 +89,7 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// The gate is the graph controller's, so /capabilities and the routes
 		// can never disagree about it.
 		platformCtrl.MountIGAPolicyRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
+		platformCtrl.MountAgentRuntimeRoutes(r, platformCtrl.NewAgentRuntimeController(), middlewares.AuthMiddleware(), middlewares.Require) // agent runtime (SPEC-agent-runtime-visibility.md)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a
