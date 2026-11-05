@@ -324,6 +324,12 @@ func main() {
 		}
 	}
 
+	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §5.7): the
+	// "agent_alerts" event sink (detections D1-D8 on events the poller and the
+	// stream dispatch), and the SIEM delivery / retention worker.
+	services.InstallAgentRuntimeAlerts(config.DB)
+	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL
 	// (default 12h; "0" turns it off). Safe on every replica: each pass is a

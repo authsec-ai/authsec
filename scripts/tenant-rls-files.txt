@@ -104,3 +104,7 @@ controllers/platform/agent_runtime_controller.go
 services/agent_runtime_findings.go
 services/agent_runtime_inference.go
 services/agent_runtime_suggest.go
+controllers/platform/agent_runtime_alerts_controller.go
+services/agent_runtime_alerts.go
+services/agent_runtime_alert_delivery.go
+services/agent_runtime_alert_siem.go

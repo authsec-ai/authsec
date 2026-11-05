@@ -58,6 +58,9 @@ const (
 	// filter only while the switch is on (GovEventCategories), so with it off
 	// the filter is exactly R2's.
 	GovCatRuntimeControls = "runtime_controls"
+	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §10 Q3,
+	// agent_runtime_alerts.go): an alert opened and resolved.
+	GovCatAgentAlert = "agent_alert"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -294,6 +297,9 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventBrokerSessionRequested, GovCatRuntimeControls, GovObjVersion, "A brokered AWS session was requested for an allow (the allow was spent)."},
 	{GovEventBrokerSessionIssued, GovCatRuntimeControls, GovObjVersion, "sts:AssumeRole issued a brokered session (credentials returned once, never stored)."},
 	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
+	// Agent runtime alerts (agent_runtime_alerts.go).
+	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
+	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member (with the reason given)."},
 }
 
 // Object kinds the events API filters on.
@@ -316,6 +322,8 @@ const (
 	// R2 objects (payload keys).
 	GovObjTempGrant         = "temporary_grant"
 	GovObjSessionRevocation = "session_revocation"
+	// Agent runtime alerts (payload key alert_id).
+	GovObjAgentAlert = "agent_alert"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
@@ -337,6 +345,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjIdentityAccount: {payloadKey: "object_id"},
 	GovObjTempGrant:         {payloadKey: "grant_id"},
 	GovObjSessionRevocation: {payloadKey: "revocation_id"},
+	GovObjAgentAlert:        {payloadKey: "alert_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.
