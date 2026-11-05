@@ -117,3 +117,4 @@ controllers/platform/agent_runtime_ingest_controller.go
 services/agent_runtime_ingest.go
 services/agent_runtime_live.go
 services/agent_runtime_config_hints.go
+services/agent_runtime_graph.go

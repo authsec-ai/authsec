@@ -4,6 +4,14 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-05 — Agent runtime on the access graph (branch `feat/agent-runtime-graph`)
+
+- `/graph`, `/graph/expand`, `/graph/path` and the identity and workload details: an AWS role, user or workload carries an additive `agent_runtime` object (label, model calls, open alerts, open findings, suggestion, containment) only when there is something to say; a contained role's grant edges carry `contained: {id, level}` while the containment is in force (identity level: every grant; model level: grants whose statement allows a model action). Nodes and edges without agent-runtime data are unchanged byte for byte.
+- Labels come from the inference service's own rules through an `igaread.AgentRuntimeSource` installed at startup (`services/agent_runtime_graph.go`); one statement per table per graph level, inside the level's RLS transaction.
+- `/capabilities` `features` is not extended: the frozen contract fixes it at eight keys.
+
+---
+
 ## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
 
 Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.

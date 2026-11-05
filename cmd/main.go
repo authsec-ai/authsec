@@ -192,6 +192,7 @@ func main() {
 	graphGate := services.DefaultGraphProjectionGate()
 	services.SetGraphProjection(graphGate)
 	services.InstallAgentRuntimeResolver(config.DB) // agentruntime.SubjectResolver for detections and containment
+	services.InstallAgentRuntimeGraph()             // agent_runtime on the graph's AWS identity and workload nodes
 	go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
 		go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
 	})
