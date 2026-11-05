@@ -60,4 +60,10 @@ func TestSelectRateLimitConfig_AuthsecPaths(t *testing.T) {
 	if got := selectRateLimitConfig("/authsec/applications"); got.Endpoint != GeneralRateLimit.Endpoint {
 		t.Errorf("/authsec/applications: %q", got.Endpoint)
 	}
+	if got := selectRateLimitConfig("/authsec/ingest/aws/events"); got.Endpoint != IngestRateLimit.Endpoint {
+		t.Errorf("/authsec/ingest/aws/events: %q, want ingest", got.Endpoint)
+	}
+	if got := selectRateLimitConfig("/authsec/ingest/aws/events/x"); got.Endpoint != GeneralRateLimit.Endpoint {
+		t.Errorf("/authsec/ingest/aws/events/x: %q, want general", got.Endpoint)
+	}
 }
