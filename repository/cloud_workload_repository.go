@@ -557,15 +557,18 @@ func (r *cloudWorkloadRepository) ReconcileWorkloads(
 	return removed, err
 }
 
-// ReconcileUsage removes the usage rows this connector did not see in the
-// given generation. The caller invokes it only when activity was reached.
+// ReconcileUsage removes the Access Advisor usage rows this connector did not
+// see in the given generation. The caller invokes it only when activity was
+// reached, which licenses deleting those rows and no others: the CloudTrail
+// model-call rows (source cloudtrail) are cumulative evidence over the windows
+// read, not a report the activity surface re-reads whole every scan.
 func (r *cloudWorkloadRepository) ReconcileUsage(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, error) {
 	var removed int64
 	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
-		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
+		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ? AND source = ?`,
+			workspaceID, connectorID, generation, models.UsageSourceServiceLastAccessed).Delete(&models.CloudUsage{})
 		removed = res.RowsAffected
 		return res.Error
 	})

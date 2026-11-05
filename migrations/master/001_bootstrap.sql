@@ -13070,3 +13070,57 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.iga_gov_k8s_access');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 147: CloudTrail read cursors for model-call evidence (cloud_trail_cursor).
+-- Same block as migrations/master/147_cloud_trail_cursor.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_trail_cursor (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id    uuid        NOT NULL,
+    region          text        NOT NULL,
+    stream          text        NOT NULL,
+    -- The window the last successful read was asked to settle: from the
+    -- previous read_to (or the 90-day limit) ...
+    window_from     timestamptz NOT NULL,
+    -- ... how far back it actually reached (= window_from unless a cap was
+    -- hit) ...
+    covered_from    timestamptz NOT NULL,
+    -- ... and the high-water mark the next read starts from.
+    read_to         timestamptz NOT NULL,
+    partial         boolean     NOT NULL DEFAULT false,
+    pages           integer     NOT NULL DEFAULT 0,
+    events          integer     NOT NULL DEFAULT 0,
+    -- The last failed attempt, '' after a successful one.
+    last_error      text        NOT NULL DEFAULT '',
+    last_attempt_at timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT cloud_trail_cursor_stream_chk CHECK (stream IN ('general', 'bedrock')),
+    CONSTRAINT cloud_trail_cursor_region_chk CHECK (region <> ''),
+    CONSTRAINT cloud_trail_cursor_window_chk
+        CHECK (window_from <= covered_from AND covered_from <= read_to),
+    CONSTRAINT cloud_trail_cursor_counts_chk CHECK (pages >= 0 AND events >= 0),
+    -- Workspace-qualified, like every cloud_* table (027): a cursor cannot
+    -- name another workspace's connector.
+    CONSTRAINT cloud_trail_cursor_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+    -- One cursor per stream per region per connector. Leads with
+    -- workspace_id, so it is also the table's workspace index.
+    CONSTRAINT uq_cloud_trail_cursor
+        UNIQUE (workspace_id, connector_id, region, stream)
+);
+
+COMMENT ON TABLE public.cloud_trail_cursor IS
+    'How far CloudTrail LookupEvents was read per connector, region and stream (general | bedrock); partial = a page cap left [window_from, covered_from) unread.';
+
+-- Required for every workspace table; guarded as in 139_cloud_scan_schedule.sql.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.cloud_trail_cursor');
+    END IF;
+END $$;
