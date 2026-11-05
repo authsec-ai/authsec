@@ -41,6 +41,12 @@ type AgentRuntimeAlertsController struct {
 	db func() *gorm.DB
 }
 
+// NewAgentRuntimeAlertsControllerFor builds the controller over the graph
+// controller's database (see NewAgentRuntimeControllerFor).
+func NewAgentRuntimeAlertsControllerFor(g *IGAGraphReadController) *AgentRuntimeAlertsController {
+	return &AgentRuntimeAlertsController{db: g.db}
+}
+
 // NewAgentRuntimeAlertsController is the production controller (config.DB).
 func NewAgentRuntimeAlertsController() *AgentRuntimeAlertsController {
 	return &AgentRuntimeAlertsController{db: func() *gorm.DB { return config.DB }}

@@ -46,6 +46,14 @@ func NewAgentRuntimeController() *AgentRuntimeController {
 	return &AgentRuntimeController{db: func() *gorm.DB { return config.DB }}
 }
 
+// NewAgentRuntimeControllerFor builds the controller over the graph
+// controller's database and classification service, so the routes mounted
+// beside the graph use the same handle (in production config.DB; in tests the
+// harness's).
+func NewAgentRuntimeControllerFor(g *IGAGraphReadController) *AgentRuntimeController {
+	return &AgentRuntimeController{db: g.db, classifier: g.classifier}
+}
+
 // NewAgentRuntimeControllerWith builds the controller over an explicit
 // database and classification service (tests).
 func NewAgentRuntimeControllerWith(db *gorm.DB, classifier *services.ClassificationService) *AgentRuntimeController {
