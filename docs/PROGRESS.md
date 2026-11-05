@@ -4,6 +4,24 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
+
+Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.
+
+### Done
+- P1a model-call evidence (147), P1b AI workloads / suggestions / findings / Agents-list mirror (148), P2a event-stream ingest and model-access templates (149), P2b detections D1-D8 and alerts (150), P3 containment (151).
+- Fixes found in testing: alert links named a console page that does not exist (now the connection page, AS-124); the agent runtime and alert routes used `config.DB` instead of the graph controller's handle; the event ingest has its own per-IP rate budget.
+- Tests: unit (all packages), integration for each part including isolation, regression suites (access policies, capabilities contract, Logs vocabulary, R1b, R2, AWS scans), tenancy ratchet 72/72.
+
+### To verify in the lab (220171243705)
+- `bedrock-mantle` event source and IAM namespace; Bedrock token field names; Lambda/ECS session-name format; Lambda/ECS `aws:ResourceTag` on the containment actions; `kms:Decrypt` invokedBy for Secrets Manager; suggestion precision (Q1 condition).
+
+### Open
+- UI: AI workloads and suggestions, alerts page (then switch the alert link), alert settings and SIEM endpoints, containment preview/confirm/release, event-stream setup.
+- Production ingress: 1 MB body limit on `/authsec/ingest/aws/events`.
+
+---
+
 ## 2026-11-04 — Azure blocks in tenants without PIM (AS-171)
 
 - A colleague found every Azure access block stuck on "Applying" in a tenant without Entra ID P2: the PIM schedule read (added after 22 Oct, so AI Search had worked then) answers 400 `AadPremiumLicenseRequired`, and the block retried it every minute forever. That answer now means the tenant has no PIM, so nothing is time-bound and the block proceeds; any other PIM error still waits. Stuck blocks proceed on their next retry once deployed.
