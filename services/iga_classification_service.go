@@ -207,6 +207,18 @@ type lockedWorkload struct {
 // The workspace is the tenant context's of ctx (the token's), and the
 // transaction runs under row-level security for it.
 func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest) (*igaread.ClassifyResult, error) {
+	return s.ClassifyThen(ctx, in, nil)
+}
+
+// ClassifyThen is Classify with also run inside the SAME transaction, after
+// the decision is written (or found and replayed) and before the commit, with
+// the workload row still locked. also's error rolls the decision back and is
+// returned as Classify returns its own (an *igaread.Error passes through).
+// Confirming an agent suggestion uses it to close the suggestion in the
+// decision's transaction (SPEC-agent-runtime-visibility.md §10 Q2); the
+// decision contract itself is unchanged.
+func (s *ClassificationService) ClassifyThen(ctx context.Context, in ClassifyRequest,
+	also func(tx *gorm.DB, ws uuid.UUID, res *igaread.ClassifyResult) error) (*igaread.ClassifyResult, error) {
 	req, verr := in.normalized()
 	if verr != nil {
 		return nil, verr
@@ -275,6 +287,9 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 				return err
 			}
 			out = res
+			if also != nil {
+				return also(tx, ws, &out)
+			}
 			return nil
 		}
 
@@ -357,6 +372,11 @@ func (s *ClassificationService) Classify(ctx context.Context, in ClassifyRequest
 			return err
 		}
 		out = res
+		if also != nil {
+			if err := also(tx, ws, &out); err != nil {
+				return err
+			}
+		}
 		if s.beforeCommit != nil {
 			s.beforeCommit()
 		}

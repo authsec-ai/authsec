@@ -421,6 +421,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	written, skipped := evidence.Counts()
 	log.Printf("aws scan run %s published: evidence %d new, %d unchanged",
 		run.ID, written, skipped)
+	RunAgentInferenceAfterScan(ctx, w.db, run.WorkspaceID, run.ConnectorID) // agent runtime (logs, never fails the scan)
 	return nil
 }
 
