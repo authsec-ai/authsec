@@ -32,7 +32,7 @@ var (
 	sqsAllowWrite  = []string{"sqs:SendMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"}
 	sqsAllowDelete = []string{"sqs:DeleteMessage", "sqs:GetQueueUrl"}
 
-	snsRead = []string{"sns:Subscribe", "sns:ConfirmSubscription", "sns:AddPermission", "sns:SetTopicAttributes", "sns:SetSubscriptionAttributes",
+	snsRead = []string{"sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:Subscribe", "sns:ConfirmSubscription", "sns:AddPermission", "sns:SetTopicAttributes", "sns:SetSubscriptionAttributes",
 		"sns:TagResource", "sns:UntagResource"}
 	snsWrite = []string{"sns:Publish", "sns:SetTopicAttributes", "sns:SetSubscriptionAttributes", "sns:PutDataProtectionPolicy", "sns:AddPermission",
 		"sns:RemovePermission", "sns:TagResource", "sns:UntagResource"}

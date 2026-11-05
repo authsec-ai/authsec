@@ -53,7 +53,7 @@ func TestStep8AccessDocuments(t *testing.T) {
 	}
 	const T = "arn:aws:sns:us-east-1:111122223333:alerts"
 	sameDoc(t, "sns read", blockDoc(t, snsT, AccessRead), `{"Version":"2012-10-17","Statement":[
-		{"Sid":"AuthSecAccessTopic","Effect":"Deny","Resource":"`+T+`",`+window+`,"Action":["sns:AddPermission","sns:ConfirmSubscription",
+		{"Sid":"AuthSecAccessTopic","Effect":"Deny","Resource":"`+T+`",`+window+`,"Action":["sns:AddPermission","sns:ConfirmSubscription","sns:GetTopicAttributes","sns:ListTagsForResource",
 			"sns:SetSubscriptionAttributes","sns:SetTopicAttributes","sns:Subscribe","sns:TagResource","sns:UntagResource"]}]}`)
 
 	// Allows the types refuse.

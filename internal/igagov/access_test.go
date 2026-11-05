@@ -3,6 +3,8 @@ package igagov
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -118,8 +120,8 @@ func TestAccessDocument(t *testing.T) {
 		}
 	}
 	// Read on objects (2), the metadata reads a block adds (attributes, tags,
-	// ACL: 6) and the three listings.
-	if len(acts) != 11 || len(res) != 2 {
+	// ACL, retention, legal hold: 8) and the three listings.
+	if len(acts) != 13 || len(res) != 2 {
 		t.Errorf("actions %v resources %v", acts, res)
 	}
 
@@ -155,6 +157,30 @@ func TestAccessDocument(t *testing.T) {
 	doc, _, _, _, err = AccessDocument("block", []string{"write"}, bucket, nil, &end)
 	if err != nil || strings.Contains(string(doc), AccessSidBucket) || strings.Contains(string(doc), AccessSidBucketNone) {
 		t.Fatalf("block write: %v %s", err, doc)
+	}
+	// A write block also stops changing a protected object without replacing it:
+	// its ACL, tags, retention and legal hold, and restoring it from archive
+	// (found live: PutObjectAcl and PutObjectTagging were still allowed).
+	for _, want := range []string{"s3:PutObject", "s3:AbortMultipartUpload", "s3:PutObjectAcl", "s3:PutObjectVersionAcl",
+		"s3:PutObjectTagging", "s3:PutObjectVersionTagging", "s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging",
+		"s3:PutObjectRetention", "s3:PutObjectLegalHold", "s3:RestoreObject"} {
+		if !strings.Contains(string(doc), `"`+want+`"`) {
+			t.Errorf("block write lacks %s: %s", want, doc)
+		}
+	}
+	// A read block also stops reading retention and legal hold.
+	if o, _ := accessActionsFor(AccessEffectBlock, []string{AccessRead}, "invoices/"); !slices.Contains(o, "s3:GetObjectRetention") ||
+		!slices.Contains(o, "s3:GetObjectLegalHold") {
+		t.Errorf("block read lacks a metadata read: %v", o)
+	}
+	// An Allow of write never gains them: it stays the two plain write actions.
+	if o, _ := accessActionsFor(AccessEffectAllow, []string{AccessWrite}, "invoices/"); !reflect.DeepEqual(o, []string{"s3:AbortMultipartUpload", "s3:PutObject"}) {
+		t.Errorf("allow write widened: %v", o)
+	}
+	// The widest Block of a folder (read, write and delete) stays far under the
+	// 6,144 character limit of an IAM managed policy.
+	if doc, _, _, _, err := AccessDocument("block", []string{"read", "write", "delete"}, bucket, nil, &end); err != nil || len(doc) > 3000 {
+		t.Errorf("read+write+delete block: %v, %d bytes", err, len(doc))
 	}
 
 	// Block all, no prefix, no end: s3:* on objects and bucket, no condition.
