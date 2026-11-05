@@ -1510,6 +1510,16 @@ func SetupRoutes(
 			discoveryIngress.POST("/resync-manifest", discoveryController.ReportResyncManifest)
 		}
 
+		// Agent runtime event stream (SPEC-agent-runtime-visibility.md §5.6):
+		// CloudTrail events from a connected AWS account's EventBridge API
+		// destination. No AuthMiddleware: the X-AuthSec-Event-Secret header
+		// (the connector's event secret) is the credential and alone decides
+		// workspace and connector; the body is never trusted for either. One
+		// controller instance also serves the admin routes below (it holds the
+		// per-connector rate limits).
+		agentRuntimeIngest := platformCtrl.NewAgentRuntimeIngestController(config.DB)
+		authsec.POST("/ingest/aws/events", agentRuntimeIngest.IngestAWSEvents)
+
 		// Everything else stays authenticated and permission-gated: reading the
 		// inventory exposes hostnames and workload metadata across the workspace, and
 		// claim/quarantine are governance decisions that must be attributable.
@@ -1700,6 +1710,15 @@ func SetupRoutes(
 			// schedule. The scans themselves are ordinary scan runs.
 			discovery.GET("/aws/connectors/:id/schedule", middlewares.Require("discovery", "read"), cloudAWS.GetScanSchedule)
 			discovery.PUT("/aws/connectors/:id/schedule", middlewares.Require("discovery", "admin"), cloudAWS.UpdateScanSchedule)
+			// Agent runtime event stream (SPEC-agent-runtime-visibility.md
+			// §5.6): turn on / rotate (the secret is returned once), read
+			// (incl. "silent since"), revoke, and the CloudFormation stack.
+			// The tag-gated model access template (§5.4 as amended in §10).
+			discovery.POST("/aws/connectors/:id/event-stream", middlewares.Require("discovery", "admin"), agentRuntimeIngest.CreateEventStream)
+			discovery.GET("/aws/connectors/:id/event-stream", middlewares.Require("discovery", "read"), agentRuntimeIngest.GetEventStream)
+			discovery.DELETE("/aws/connectors/:id/event-stream", middlewares.Require("discovery", "admin"), agentRuntimeIngest.RevokeEventStream)
+			discovery.GET("/aws/connectors/:id/event-stream/template", middlewares.Require("discovery", "read"), agentRuntimeIngest.GetEventStreamTemplate)
+			discovery.GET("/aws/templates/model-access", middlewares.Require("discovery", "read"), agentRuntimeIngest.GetModelAccessTemplate)
 			// DELETE verb, revoke semantics: the connector row and everything it
 			// discovered stay for audit, aligned with GCP's planned behaviour. See
 			// CloudConnectorRepository.Revoke.

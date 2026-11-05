@@ -13070,3 +13070,490 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.iga_gov_k8s_access');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 147: CloudTrail read cursors for model-call evidence (cloud_trail_cursor).
+-- Same block as migrations/master/147_cloud_trail_cursor.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_trail_cursor (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id    uuid        NOT NULL,
+    region          text        NOT NULL,
+    stream          text        NOT NULL,
+    -- The window the last successful read was asked to settle: from the
+    -- previous read_to (or the 90-day limit) ...
+    window_from     timestamptz NOT NULL,
+    -- ... how far back it actually reached (= window_from unless a cap was
+    -- hit) ...
+    covered_from    timestamptz NOT NULL,
+    -- ... and the high-water mark the next read starts from.
+    read_to         timestamptz NOT NULL,
+    partial         boolean     NOT NULL DEFAULT false,
+    pages           integer     NOT NULL DEFAULT 0,
+    events          integer     NOT NULL DEFAULT 0,
+    -- The last failed attempt, '' after a successful one.
+    last_error      text        NOT NULL DEFAULT '',
+    last_attempt_at timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT cloud_trail_cursor_stream_chk CHECK (stream IN ('general', 'bedrock')),
+    CONSTRAINT cloud_trail_cursor_region_chk CHECK (region <> ''),
+    CONSTRAINT cloud_trail_cursor_window_chk
+        CHECK (window_from <= covered_from AND covered_from <= read_to),
+    CONSTRAINT cloud_trail_cursor_counts_chk CHECK (pages >= 0 AND events >= 0),
+    -- Workspace-qualified, like every cloud_* table (027): a cursor cannot
+    -- name another workspace's connector.
+    CONSTRAINT cloud_trail_cursor_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+    -- One cursor per stream per region per connector. Leads with
+    -- workspace_id, so it is also the table's workspace index.
+    CONSTRAINT uq_cloud_trail_cursor
+        UNIQUE (workspace_id, connector_id, region, stream)
+);
+
+COMMENT ON TABLE public.cloud_trail_cursor IS
+    'How far CloudTrail LookupEvents was read per connector, region and stream (general | bedrock); partial = a page cap left [window_from, covered_from) unread.';
+
+-- Required for every workspace table; guarded as in 139_cloud_scan_schedule.sql.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.cloud_trail_cursor');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 148: agent runtime inference on AWS (agent_suggestion, agent_finding).
+-- Same objects as migrations/master/148_agent_runtime_inference.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_suggestion (
+    id             uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL,
+    -- The workload incarnation (iga_workload is one row per incarnation).
+    workload_id    uuid        NOT NULL,
+    -- The account whose evidence proposed it.
+    connector_id   uuid        NOT NULL,
+    -- The identity whose model calls are the evidence (cloud_identity).
+    identity_id    uuid,
+    rule           text        NOT NULL,
+    rule_version   integer     NOT NULL,
+    evidence       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    state          text        NOT NULL DEFAULT 'pending',
+    -- The deciding user (confirmed, dismissed); NULL for a superseded row,
+    -- which the system closed. A user id, never an email.
+    decided_by     uuid,
+    decided_at     timestamptz,
+    -- Dismiss: the person's reason. Confirm: the classification reason.
+    -- Superseded: classified | shared_role.
+    reason         text        NOT NULL DEFAULT '',
+    -- Confirm: the classification decision it ran (same transaction).
+    decision_id    uuid,
+    operation_id   uuid,
+    version        integer     NOT NULL DEFAULT 1,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_suggestion_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_suggestion_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_suggestion_workspace_id_key UNIQUE (workspace_id, id),
+    -- One row per incarnation: a dismissed row is never replaced.
+    CONSTRAINT agent_suggestion_workload_key UNIQUE (workspace_id, workload_id),
+    CONSTRAINT agent_suggestion_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_suggestion_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_suggestion_identity_fkey FOREIGN KEY (identity_id)
+        REFERENCES public.cloud_identity (id) ON DELETE SET NULL,
+    CONSTRAINT agent_suggestion_decision_fkey FOREIGN KEY (workspace_id, decision_id)
+        REFERENCES public.iga_workload_classification (workspace_id, id),
+    CONSTRAINT agent_suggestion_state_chk
+        CHECK (state IN ('pending', 'confirmed', 'dismissed', 'superseded')),
+    CONSTRAINT agent_suggestion_rule_chk CHECK (rule <> '' AND rule_version > 0),
+    CONSTRAINT agent_suggestion_version_chk CHECK (version > 0),
+    CONSTRAINT agent_suggestion_decided_chk
+        CHECK ((state = 'pending') = (decided_at IS NULL)),
+    CONSTRAINT agent_suggestion_decider_chk
+        CHECK (state NOT IN ('confirmed', 'dismissed') OR decided_by IS NOT NULL),
+    CONSTRAINT agent_suggestion_reason_chk
+        CHECK (state NOT IN ('dismissed', 'superseded') OR reason <> ''),
+    CONSTRAINT agent_suggestion_confirm_chk
+        CHECK (state <> 'confirmed' OR (decision_id IS NOT NULL AND operation_id IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_suggestion_state
+    ON public.agent_suggestion (workspace_id, state, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_agent_suggestion_connector
+    ON public.agent_suggestion (workspace_id, connector_id);
+CREATE INDEX IF NOT EXISTS idx_agent_suggestion_identity
+    ON public.agent_suggestion (identity_id) WHERE identity_id IS NOT NULL;
+
+COMMENT ON TABLE public.agent_suggestion IS
+    'Likely agents proposed from observed behaviour (rule aws_agent_suggest_v1), one per workload incarnation. Never sets classification.';
+
+CREATE TABLE IF NOT EXISTS public.agent_finding (
+    id            uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL,
+    connector_id  uuid        NOT NULL,
+    kind          text        NOT NULL,
+    -- What the finding is about, stable across scans: the identity's ARN and
+    -- immutable id (shared_role, human_credentials, long_lived_key) or the
+    -- secret's ARN (model_key_secret).
+    subject_key   text        NOT NULL,
+    -- The identity it names, when it names one (cloud_identity).
+    identity_id   uuid,
+    -- References and display: {arn, name, kind, workloads[], secret{}...}.
+    subject       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    evidence      jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    state         text        NOT NULL DEFAULT 'open',
+    first_seen    timestamptz NOT NULL DEFAULT now(),
+    last_seen     timestamptz NOT NULL DEFAULT now(),
+    resolved_at   timestamptz,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_finding_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_finding_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_finding_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_finding_subject_key UNIQUE (workspace_id, kind, subject_key),
+    CONSTRAINT agent_finding_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_finding_identity_fkey FOREIGN KEY (identity_id)
+        REFERENCES public.cloud_identity (id) ON DELETE SET NULL,
+    CONSTRAINT agent_finding_kind_chk
+        CHECK (kind IN ('shared_role', 'human_credentials', 'long_lived_key', 'model_key_secret')),
+    CONSTRAINT agent_finding_subject_chk CHECK (subject_key <> ''),
+    CONSTRAINT agent_finding_state_chk CHECK (state IN ('open', 'resolved')),
+    CONSTRAINT agent_finding_resolved_chk CHECK ((state = 'resolved') = (resolved_at IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_finding_list
+    ON public.agent_finding (workspace_id, state, kind, last_seen DESC, id);
+CREATE INDEX IF NOT EXISTS idx_agent_finding_connector
+    ON public.agent_finding (workspace_id, connector_id, state);
+CREATE INDEX IF NOT EXISTS idx_agent_finding_identity
+    ON public.agent_finding (identity_id) WHERE identity_id IS NOT NULL;
+
+COMMENT ON TABLE public.agent_finding IS
+    'Risky credentials and identities of AI workloads on AWS: shared roles, human or long-lived credentials, model-key secrets (names only).';
+
+-- Required for every workspace table; guarded as in 139 and 146.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_suggestion');
+        PERFORM public.tenancy_enable_rls('public.agent_finding');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 149: agent runtime event stream (agent_event_stream, agent_event_seen).
+-- Same objects as migrations/master/149_agent_event_stream.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_event_stream (
+    connector_id     uuid        PRIMARY KEY,
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- sha256 of the secret, lower-case hex. The secret is shown once.
+    secret_hash      text        NOT NULL,
+    -- The first characters of the secret, to tell secrets apart.
+    secret_prefix    text        NOT NULL,
+    created_by       text        NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    rotated_at       timestamptz,
+    revoked_at       timestamptz,
+    -- When an accepted event last arrived, and the newest eventTime seen.
+    last_received_at timestamptz,
+    last_event_time  timestamptz,
+    -- Events accepted (new and duplicate) and refused (wrong account,
+    -- unparseable, oversize).
+    received_count   bigint      NOT NULL DEFAULT 0,
+    rejected_count   bigint      NOT NULL DEFAULT 0,
+    silent_after     interval    NOT NULL DEFAULT interval '6 hours',
+    CONSTRAINT agent_event_stream_hash_chk
+        CHECK (secret_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT agent_event_stream_silent_after_chk
+        CHECK (silent_after BETWEEN interval '15 minutes' AND interval '7 days'),
+    CONSTRAINT agent_event_stream_workspace_id_key
+        UNIQUE (workspace_id, connector_id),
+    -- Workspace-qualified, like every cloud_* table (027): a stream cannot
+    -- name another workspace's connector.
+    CONSTRAINT agent_event_stream_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE
+);
+
+-- The ingest's credential lookup.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_event_stream_secret_hash
+    ON public.agent_event_stream (secret_hash);
+
+COMMENT ON TABLE public.agent_event_stream IS
+    'Per-connector CloudTrail event stream (EventBridge API destination): the event secret hash and the stream health.';
+
+CREATE TABLE IF NOT EXISTS public.agent_event_seen (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id uuid        NOT NULL,
+    -- CloudTrail eventID.
+    event_id     text        NOT NULL,
+    received_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_event_seen_event_id_chk
+        CHECK (event_id <> '' AND length(event_id) <= 128),
+    CONSTRAINT agent_event_seen_workspace_event_key
+        UNIQUE (workspace_id, event_id),
+    CONSTRAINT agent_event_seen_stream_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.agent_event_stream (workspace_id, connector_id) ON DELETE CASCADE
+);
+
+-- The purge (per workspace, by age) and the FK.
+CREATE INDEX IF NOT EXISTS idx_agent_event_seen_received
+    ON public.agent_event_seen (workspace_id, received_at);
+CREATE INDEX IF NOT EXISTS idx_agent_event_seen_connector
+    ON public.agent_event_seen (workspace_id, connector_id);
+
+COMMENT ON TABLE public.agent_event_seen IS
+    'CloudTrail eventIDs the event stream already accepted (idempotency), kept 14 days.';
+
+-- Required for every workspace table; guarded as in 139_cloud_scan_schedule.sql.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_event_stream');
+        PERFORM public.tenancy_enable_rls('public.agent_event_seen');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 150: agent runtime alerts (agent_alert, agent_alert_delivery,
+-- agent_alert_baseline, agent_alert_setting, agent_alert_siem_endpoint,
+-- agent_alert_event_seen; iga_gov_notification admits 'agent_alert').
+-- Same objects as migrations/master/150_agent_runtime_alerts.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_alert (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id     uuid        NOT NULL,
+    identity_id      uuid        NOT NULL,
+    workload_ids     jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    subject_label    text        NOT NULL CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent')),
+    subject_name     text        NOT NULL DEFAULT '',
+    detection        text        NOT NULL CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8')),
+    severity         text        NOT NULL CHECK (severity IN ('high', 'medium')),
+    title            text        NOT NULL,
+    dedupe_key       text        NOT NULL,
+    first_seen       timestamptz NOT NULL,
+    last_seen        timestamptz NOT NULL,
+    event_count      integer     NOT NULL DEFAULT 1 CHECK (event_count >= 1),
+    evidence         jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    state            text        NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'acknowledged', 'resolved')),
+    state_changed_by uuid,
+    state_changed_at timestamptz,
+    reason           text        NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    CONSTRAINT agent_alert_seen_chk CHECK (last_seen >= first_seen)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_ws_created
+    ON public.agent_alert (workspace_id, created_at DESC, id DESC);
+-- The dedupe lookup reads only alerts that are not resolved.
+CREATE INDEX IF NOT EXISTS idx_agent_alert_dedupe
+    ON public.agent_alert (workspace_id, dedupe_key, last_seen) WHERE state <> 'resolved';
+CREATE INDEX IF NOT EXISTS idx_agent_alert_ws_identity
+    ON public.agent_alert (workspace_id, identity_id);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_retention
+    ON public.agent_alert (workspace_id, last_seen);
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_siem_endpoint (
+    id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    url          text        NOT NULL CHECK (url LIKE 'https://%'),
+    -- Vault path of the HMAC secret; '' once the endpoint is deleted.
+    secret_ref   text        NOT NULL DEFAULT '',
+    enabled      boolean     NOT NULL DEFAULT true,
+    created_by   uuid        NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    deleted_at   timestamptz,
+    UNIQUE (workspace_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_siem_endpoint_ws
+    ON public.agent_alert_siem_endpoint (workspace_id) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_delivery (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    alert_id        uuid        NOT NULL,
+    channel         text        NOT NULL CHECK (channel IN ('slack', 'siem')),
+    endpoint_id     uuid,
+    attempt         integer     NOT NULL DEFAULT 0,
+    status          text        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    leased_until    timestamptz,
+    last_error      text        NOT NULL DEFAULT '',
+    sent_at         timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, alert_id) REFERENCES public.agent_alert (workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, endpoint_id) REFERENCES public.agent_alert_siem_endpoint (workspace_id, id),
+    CONSTRAINT agent_alert_delivery_endpoint_chk CHECK ((channel = 'siem') = (endpoint_id IS NOT NULL)),
+    CONSTRAINT agent_alert_delivery_sent_chk CHECK ((status = 'sent') = (sent_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_delivery_alert
+    ON public.agent_alert_delivery (workspace_id, alert_id);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_delivery_endpoint
+    ON public.agent_alert_delivery (workspace_id, endpoint_id) WHERE endpoint_id IS NOT NULL;
+-- The delivery worker's scan: due SIEM rows.
+CREATE INDEX IF NOT EXISTS idx_agent_alert_delivery_due
+    ON public.agent_alert_delivery (next_attempt_at) WHERE status = 'pending' AND channel = 'siem';
+-- One delivery per channel and endpoint per alert.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_delivery_target
+    ON public.agent_alert_delivery (workspace_id, alert_id, channel, COALESCE(endpoint_id, '00000000-0000-0000-0000-000000000000'::uuid));
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_baseline (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    identity_id  uuid        NOT NULL,
+    kind         text        NOT NULL CHECK (kind IN ('model', 'role', 'ip', 'region', 'hourly', 'denied', 'observed')),
+    key          text        NOT NULL,
+    first_seen   timestamptz NOT NULL,
+    last_seen    timestamptz NOT NULL,
+    count        bigint      NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, identity_id, kind, key)
+);
+-- Retention of the hourly and per-minute counters.
+CREATE INDEX IF NOT EXISTS idx_agent_alert_baseline_counters
+    ON public.agent_alert_baseline (workspace_id, last_seen) WHERE kind IN ('hourly', 'denied');
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_setting (
+    workspace_id          uuid        PRIMARY KEY REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- {"D5": {"enabled": true, "n": 10, "minutes": 5}, "D6": {"enabled": true, "k": 5}, ...}
+    detections            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    slack_enabled         boolean     NOT NULL DEFAULT true,
+    dedupe_window_minutes integer     NOT NULL DEFAULT 60 CHECK (dedupe_window_minutes BETWEEN 5 AND 1440),
+    retention_days        integer     NOT NULL DEFAULT 90 CHECK (retention_days BETWEEN 7 AND 3650),
+    updated_by            uuid,
+    updated_at            timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_event_seen (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    event_id     text        NOT NULL,
+    identity_id  uuid        NOT NULL,
+    event_time   timestamptz NOT NULL,
+    seen_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_event_seen_age
+    ON public.agent_alert_event_seen (workspace_id, seen_at);
+
+COMMENT ON TABLE public.agent_alert IS
+    'Agent runtime alerts (D1-D8) on AI workloads and agents; opened and resolved are also logged in iga_gov_event.';
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_notification') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_notification DROP CONSTRAINT IF EXISTS iga_gov_notification_subject_kind_check;
+        ALTER TABLE public.iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check
+            CHECK (subject_kind IN ('owner_review','approval_request','deployment','drift','canary_gate','finding_digest',
+                                    'temporary_grant','session_revocation','time_bound','agent_alert'));
+    END IF;
+    -- Required for every workspace table; guarded as in 139 and 146.
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_alert');
+        PERFORM public.tenancy_enable_rls('public.agent_alert_siem_endpoint');
+        PERFORM public.tenancy_enable_rls('public.agent_alert_delivery');
+        PERFORM public.tenancy_enable_rls('public.agent_alert_baseline');
+        PERFORM public.tenancy_enable_rls('public.agent_alert_setting');
+        PERFORM public.tenancy_enable_rls('public.agent_alert_event_seen');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 151: agent containment (agent_containment, agent_containment_step, job
+-- agent_contain). Same objects as migrations/master/151_agent_containment.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_containment (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id         uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  connector_id         uuid NOT NULL,
+  identity_id          uuid NOT NULL,
+  identity_kind        text NOT NULL CHECK (identity_kind IN ('iam_role','iam_user')),
+  identity_arn         text NOT NULL CHECK (identity_arn <> ''),
+  -- The identity's AWS unique id (AROA... / AIDA...) at request time: a
+  -- role recreated under the same name is not this identity.
+  unique_id            text NOT NULL DEFAULT '',
+  workload_ids         uuid[] NOT NULL DEFAULT '{}',
+  level                text NOT NULL CHECK (level IN ('workload','identity','model')),
+  state                text NOT NULL DEFAULT 'previewed'
+                       CHECK (state IN ('previewed','containing','contained','partially_contained','failed','releasing','released')),
+  state_reason         text NOT NULL DEFAULT '',
+  reason               text NOT NULL CHECK (btrim(reason) <> ''),
+  release_reason       text NOT NULL DEFAULT '',
+  -- Behavioural verification: NULL until decided; false with the late
+  -- events in verification when a successful call followed containment.
+  effective            boolean,
+  verification         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_by           uuid NOT NULL REFERENCES users(id),
+  contained_at         timestamptz,
+  verified_at          timestamptz,
+  release_requested_at timestamptz,
+  released_at          timestamptz,
+  released_by          uuid REFERENCES users(id),
+  -- A deferred restore (the session revocation) is due at this time.
+  pending_restore_at   timestamptz,
+  preview              jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  CONSTRAINT agent_containment_workload_ids_chk CHECK (level = 'workload' OR cardinality(workload_ids) = 0),
+  CONSTRAINT agent_containment_released_chk CHECK ((state = 'released') = (released_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_live ON agent_containment (workspace_id, identity_id, level)
+  WHERE state IN ('previewed','containing','contained','partially_contained','releasing');
+CREATE INDEX IF NOT EXISTS idx_agent_containment_ws_state ON agent_containment (workspace_id, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_identity ON agent_containment (workspace_id, identity_id);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_open ON agent_containment (state)
+  WHERE state IN ('previewed','containing','contained','partially_contained','releasing') OR pending_restore_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS agent_containment_step (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id uuid NOT NULL,
+  seq            integer NOT NULL,
+  kind           text NOT NULL CHECK (kind IN ('lambda_concurrency','ecs_desired','ecs_autoscaling','iam_policy','session_revoke','access_key')),
+  target         text NOT NULL CHECK (target <> ''),
+  region         text NOT NULL DEFAULT '',
+  before         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  after          jsonb NOT NULL DEFAULT '{}'::jsonb,
+  state          text NOT NULL DEFAULT 'pending'
+                 CHECK (state IN ('pending','applied','skipped','failed','restoring','restored','restore_failed')),
+  error          text NOT NULL DEFAULT '',
+  restore_after  timestamptz,
+  applied_at     timestamptz,
+  restored_at    timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, containment_id, kind, target),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_step_seq ON agent_containment_step (workspace_id, containment_id, seq);
+
+DO $$
+BEGIN
+    IF to_regclass('public.iga_gov_job') IS NOT NULL THEN
+        ALTER TABLE public.iga_gov_job DROP CONSTRAINT IF EXISTS iga_gov_job_kind_check;
+        ALTER TABLE public.iga_gov_job ADD CONSTRAINT iga_gov_job_kind_check
+            CHECK (kind IN ('evaluate_owner_rules','compile_plans','notify','refresh_activity',
+                            'observe_tick','deploy','verify','drift_check','verify_binding','iac_sync',
+                            'prune_evidence','metrics_rollup','resolve_unknown',
+                            'temp_grant','session_revoke','time_bound','azure_access','k8s_access',
+                            'agent_contain'));
+    END IF;
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_containment');
+        PERFORM public.tenancy_enable_rls('public.agent_containment_step');
+    END IF;
+END $$;

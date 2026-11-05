@@ -89,11 +89,20 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// The gate is the graph controller's, so /capabilities and the routes
 		// can never disagree about it.
 		platformCtrl.MountIGAPolicyRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
+		platformCtrl.MountAgentRuntimeRoutes(r, platformCtrl.NewAgentRuntimeControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require) // agent runtime (SPEC-agent-runtime-visibility.md)
+		// Agent runtime visibility P3: agent containment, the same auth,
+		// envelope and policy gate (agent_runtime_contain_controller.go).
+		platformCtrl.MountAgentRuntimeContainRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a
 		// stale decision is rejected rather than last-write-wins.
 		iga.POST("/classification-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideCandidate)
 		iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
+
+		// Agent runtime alerts (SPEC-agent-runtime-visibility.md §5.7):
+		// /api/iga/v1/agent-runtime/{alerts,alert-settings,siem-endpoints}
+		// (agent_runtime_alerts_controller.go).
+		platformCtrl.MountAgentRuntimeAlertRoutes(iga, platformCtrl.NewAgentRuntimeAlertsControllerFor(igaGraphRead))
 	}
 }

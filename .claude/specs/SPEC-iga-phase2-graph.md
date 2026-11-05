@@ -1142,7 +1142,7 @@ What is in, and what stays out:
 
 | In | Out |
 |---|---|
-| A **Classify as agent** action on a workload's Overview | Automatic inference from names, tags, env vars or dependencies (§1.2) |
+| A **Classify as agent** action on a workload's Overview | Automatic inference from names, tags, env vars or dependencies (§1.2). *Amended 2026-11-05:* AuthSec may **suggest** an agent from observed behaviour; a suggestion never sets classification — see [SPEC-agent-runtime-visibility.md §3, §10](SPEC-agent-runtime-visibility.md) |
 | An optional free-text purpose ("Customer support triage") | Grouping several workloads into one logical agent |
 | Undo, which records its own decision rather than deleting the first | Bulk classification |
 | The decision shown on Overview: *"Classified as agent by priya@ · 22 Sep · 'handles tier-1 tickets'"* | Classification affecting any access conclusion |

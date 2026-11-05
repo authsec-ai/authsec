@@ -191,6 +191,7 @@ func main() {
 	// scan could run there again.
 	graphGate := services.DefaultGraphProjectionGate()
 	services.SetGraphProjection(graphGate)
+	services.InstallAgentRuntimeResolver(config.DB) // agentruntime.SubjectResolver for detections and containment
 	go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
 		go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
 	})
@@ -304,6 +305,7 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -322,6 +324,12 @@ func main() {
 			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
 		}
 	}
+
+	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §5.7): the
+	// "agent_alerts" event sink (detections D1-D8 on events the poller and the
+	// stream dispatch), and the SIEM delivery / retention worker.
+	services.InstallAgentRuntimeAlerts(config.DB)
+	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL

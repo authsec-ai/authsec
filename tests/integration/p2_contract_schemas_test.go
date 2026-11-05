@@ -1080,7 +1080,23 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractReq("schema_head", contractNullable(contractNonEmpty)),
 	// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02).
 	contractReq("policy", contractPolicyCapabilities),
+	// Agent runtime visibility P3 (SPEC-agent-runtime-visibility.md §10 Q4).
+	contractOpt("agent_containment", contractAgentContainCapabilities),
 )))
+
+// The /capabilities agent_containment block: the server's state and, per AWS
+// account, the identity/model levels and the workload level
+// (EnableWorkloadContainment), each with its reason when unavailable.
+var contractAgentContainCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+	contractReq("levels", contractArrMin(1, contractNonEmpty)),
+	contractReq("workload_containment", contractObj(contractReq("available", contractBool),
+		contractReq("reason", contractNullable(contractNonEmpty)))),
+	contractReq("accounts", contractArr(contractObj(
+		contractReq("connector_id", contractNonEmpty), contractReq("account_id", contractNonEmpty),
+		contractReq("identity_and_model", contractBool), contractOpt("identity_and_model_reason", contractNonEmpty),
+		contractReq("workload_containment", contractBool), contractOpt("workload_containment_reason", contractNonEmpty)))),
+)
 
 // The /capabilities policy block (§4.3): the policy gate, one boolean per
 // feature with a reason for each false one (R1b, R2 and R3 included), the

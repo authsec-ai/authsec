@@ -127,7 +127,21 @@ var (
 		Window:   time.Minute,
 		Endpoint: "admin",
 	}
+
+	// Event ingest (EventBridge API destinations): EventBridge delivers from
+	// shared AWS addresses, one event per request, so the general per-IP
+	// budget would throttle a busy account. The ingest has its own
+	// per-connector limit after the secret check; this per-IP ceiling only
+	// bounds unauthenticated traffic.
+	IngestRateLimit = RateLimitConfig{
+		Limit:    6000,
+		Window:   time.Minute,
+		Endpoint: "ingest",
+	}
 )
+
+// ingestRateLimitPaths are the event-ingest endpoints, relative to /authsec.
+var ingestRateLimitPaths = []string{"/ingest/aws/events"}
 
 // MennovRateLimitMiddleware creates rate limiting middleware using in-memory sliding window
 func MennovRateLimitMiddleware() gin.HandlerFunc {
@@ -219,6 +233,11 @@ var authRateLimitPrefixes = []string{
 // request path starts with, so the strict limits never applied).
 func selectRateLimitConfig(path string) RateLimitConfig {
 	rel := strings.TrimPrefix(path, "/authsec")
+	for _, p := range ingestRateLimitPaths {
+		if rel == p {
+			return IngestRateLimit
+		}
+	}
 	for _, authPath := range authRateLimitPrefixes {
 		if strings.HasPrefix(rel, authPath) {
 			return AuthRateLimit

@@ -699,6 +699,8 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// R2: temp_grant, session_revoke and time_bound with their schedules
 	// (each handler and schedule checks R2 is available).
 	RegisterR2Jobs(w, db)
+	// Agent runtime visibility P3: agent_contain and its schedule.
+	RegisterAgentContainJobs(w, db)
 	return w
 }
 

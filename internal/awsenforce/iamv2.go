@@ -77,6 +77,8 @@ const (
 var CapabilitiesV2 = []string{
 	CapAttachAuthSecPolicy, CapRefusesForeignAttach, CapDetachAuthSecPolicy,
 	CapSplitRoleLifecycle, CapUpdateFunctionRole,
+	// Agent containment, EnableWorkloadContainment (contain.go).
+	CapWorkloadContainment,
 }
 
 // The R2 features a v2 binding's capabilities enable.
@@ -106,6 +108,8 @@ func V2CapabilitiesFor(feature string) []string {
 		return []string{CapCreatePolicy, CapDeletePolicy, CapAttachAuthSecPolicy, CapRefusesForeignAttach, CapDetachAuthSecPolicy}
 	case FeatureLambdaSplit:
 		return []string{CapSplitRoleLifecycle}
+	case FeatureWorkloadContainment:
+		return []string{CapWorkloadContainment}
 	default:
 		return nil
 	}
