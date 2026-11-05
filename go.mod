@@ -19,6 +19,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1
+	github.com/aws/aws-sdk-go-v2/service/applicationautoscaling v1.51.0
 	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.78.0
 	github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.63.0
 	github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol v1.65.0

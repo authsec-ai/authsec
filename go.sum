@@ -77,6 +77,8 @@ github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 h1:MUaM4f+kj1ZIBPZfUS8
 github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3/go.mod h1:6YmVmEVRI5ZZzRjCSsb9SryKH0hAlMRdgA7kG9aDvBU=
 github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3 h1:fuSCw4Z2qfRCztMPO3GXJNSiEp6Wee+WOLwrHHUMy9c=
 github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3/go.mod h1:6SxcHheD1pPR5+kWm1wGvjlL/YqUsh267sAfEmN4K7A=
+github.com/aws/aws-sdk-go-v2/service/applicationautoscaling v1.51.0 h1:XdDWYE3Ft43qo7Sw0GeYv5f2lnD0hVP0YtcIZV9dbm0=
+github.com/aws/aws-sdk-go-v2/service/applicationautoscaling v1.51.0/go.mod h1:RqvoGvc8dX09wb1E0ZTgsuUE398TxFgl+G4DmWwLfus=
 github.com/aws/aws-sdk-go-v2/service/autoscaling v1.78.0 h1:CN7ZkNEZb5Ob0DtntBQLE7cdpT13gzS1Gn+QMoZOjHA=
 github.com/aws/aws-sdk-go-v2/service/autoscaling v1.78.0/go.mod h1:nkWNnRTHDlkZZrZzhmcPrOkoF+werzJzCOHGpbIpcfA=
 github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.63.0 h1:1quSHRfSOLfMiOOpL+pT1Qlv9b/2LfsWnHCA3HOhpP8=

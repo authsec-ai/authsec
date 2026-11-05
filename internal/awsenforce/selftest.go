@@ -537,6 +537,9 @@ func runV2Probes(ctx context.Context, c IAM, in SelfTestInput, roleName, runID, 
 
 	// update_function_role
 	set(CapUpdateFunctionRole, untested(at(), "not probed: the self-test has no Lambda function; the first direct split proves it"))
+
+	// workload_containment (EnableWorkloadContainment, contain.go)
+	set(CapWorkloadContainment, workloadContainmentProbe(ctx, c, in, runID, at))
 }
 
 // splitRoleProbe is split_role_lifecycle: create a throwaway split role that
