@@ -198,6 +198,7 @@ func loadAgentRuntimeStateFor(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (*agen
 		usage: map[uuid.UUID]*arUsage{}, workloads: map[uuid.UUID][]*arWorkload{},
 		k8s: map[uuid.UUID][]string{}, saml: map[uuid.UUID]bool{},
 		suggestions: map[uuid.UUID]*arSuggestion{}, openFindings: map[uuid.UUID]int{},
+		hints: map[uuid.UUID][]*arFinding{}, network: map[uuid.UUID][]*arFinding{},
 	}
 	var conns []arConnector
 	if err := tx.Table("cloud_connector").Select("id, scope_id, attrs").
@@ -297,6 +298,23 @@ func loadAgentRuntimeStateFor(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (*agen
 	}
 	for _, c := range counts {
 		st.openFindings[c.IdentityID] = c.N
+	}
+	// Label evidence other than model calls (loadAgentRuntimeState's
+	// statement for these identities): configuration hints make a possible
+	// AI workload, network traffic an AI workload.
+	var hintRows []*arFinding
+	if err := tx.Table("agent_finding").Select("id, kind, identity_id, subject, evidence").
+		Where("workspace_id = ? AND state = ? AND kind IN ? AND identity_id IN ?",
+			ws, FindingOpen, []string{FindingAIConfigHint, FindingAINetworkTraffic}, ids).
+		Order("kind, subject_key, id").Scan(&hintRows).Error; err != nil {
+		return nil, fmt.Errorf("read hint findings: %w", err)
+	}
+	for _, h := range hintRows {
+		if h.Kind == FindingAINetworkTraffic {
+			st.network[h.IdentityID] = append(st.network[h.IdentityID], h)
+		} else {
+			st.hints[h.IdentityID] = append(st.hints[h.IdentityID], h)
+		}
 	}
 	return st, nil
 }

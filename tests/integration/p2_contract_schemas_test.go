@@ -836,7 +836,7 @@ var contractResourceAccess = contractObj(
 // additive and optional on graph nodes and on the identity and workload
 // details: present only when there is something to say.
 var contractAgentRuntime = contractObj(
-	contractReq("label", contractNullable(contractEnum("ai_workload", "suggested_agent", "agent"))),
+	contractReq("label", contractNullable(contractEnum("possible_ai_workload", "ai_workload", "suggested_agent", "agent"))),
 	contractReq("model_calls", contractNullable(contractObj(
 		contractReq("calls", contractInt),
 		contractReq("denied", contractInt),

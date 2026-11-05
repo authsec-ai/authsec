@@ -160,7 +160,7 @@ func agentRuntimeSource() AgentRuntimeSource {
 
 // GraphAgentRuntime is a node's agent_runtime object.
 type GraphAgentRuntime struct {
-	// Label is ai_workload | suggested_agent | agent; null when the node is
+	// Label is possible_ai_workload | ai_workload | suggested_agent | agent; null when the node is
 	// shown only for an alert, a finding or a containment and the inference
 	// rule gives it no label (a workload on a shared role, an identity whose
 	// calls aged out of the evidence).
