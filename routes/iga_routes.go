@@ -95,5 +95,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// stale decision is rejected rather than last-write-wins.
 		iga.POST("/classification-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideCandidate)
 		iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
+
+		// Agent runtime alerts (SPEC-agent-runtime-visibility.md §5.7):
+		// /api/iga/v1/agent-runtime/{alerts,alert-settings,siem-endpoints}
+		// (agent_runtime_alerts_controller.go).
+		platformCtrl.MountAgentRuntimeAlertRoutes(iga, platformCtrl.NewAgentRuntimeAlertsController())
 	}
 }
