@@ -25,15 +25,23 @@ Azure and Kubernetes:
 4. **control**: a verified kill switch per agent, and per-tool-call allow/deny for
    agents behind a policy enforcement point.
 
-The promise we can keep, and the one the console states: **every AI agent that
-leaves a trace in a connected cloud or cluster**. Not every agent anywhere
-(§2, out of scope).
+**Inference is the primary discovery mechanism.** Most shadow agents are a
+Lambda, a container or a pod in the customer's own estate calling OpenAI,
+Anthropic or Gemini directly with an API key: no platform declares them and no
+Bedrock or Azure OpenAI log names them. They are recognised from what the
+workload carries (key names, images, dependencies), where it connects (model
+provider endpoints) and what the provider bills (usage per key), whichever
+model provider they use (§5.2).
+
+The promise we can keep, and the one the console states: **every AI agent
+running on connected compute (AWS, Azure, Kubernetes), whichever model provider
+it calls**. Not agents on laptops or inside SaaS products (§2, out of scope).
 
 ## 1. Requirements
 
 | # | Requirement | NIST anchor |
 |---|---|---|
-| R1 | Inventory every agent per workspace: platform-declared (Bedrock, AgentCore, Foundry, Entra Agent ID, Copilot registry, Teams, Logic Apps, Kubernetes workloads labelled or detected) and inferred (calls a model, carries a model credential, behaves like an agent) | Design tenet 1; Key Practices "asset inventory" |
+| R1 | Inventory every agent per workspace: platform-declared (Bedrock, AgentCore, Foundry, Entra Agent ID, Copilot registry, Teams, Logic Apps, Kubernetes workloads labelled or detected) and **inferred**, the primary path: any workload on connected compute that calls a model of **any** provider (Bedrock, Azure OpenAI, OpenAI, Anthropic, Google, self-hosted), carries a model credential, or behaves like an agent | Design tenet 1; Key Practices "asset inventory" |
 | R2 | Flag risky agent credentials: a human's credentials, long-lived keys, model API keys held in secrets (names only) | NCCoE comments summary; IR 8587 |
 | R3 | Show the access graph of each agent and the delegation chain (human → agent → sub-agent) where the source states it | Tenet 2 |
 | R4 | Show each agent's activity: model calls, tool calls, cloud actions, resources read/written/deleted, on whose behalf, including refused actions | Tenets 9, 10; Key Practices 3.2, 5.1, 5.3 |
@@ -55,26 +63,28 @@ and CIBA are out of scope; R8 is allow/deny only.
 ## 2. Scope
 
 **In scope:** AWS, Azure, Kubernetes (EKS, AKS, any cluster running
-`authsec-iga-agent`). Phases P1–P5 (§6).
+`authsec-iga-agent`), and every agent running on that compute whatever model
+provider it calls — including OpenAI, Anthropic and Google called directly
+with an API key (§5.2), found from configuration, network and provider-usage
+signals. Phases P1–P5 (§6).
 
 **Out of scope (deferred):**
-- Agents that call a model provider (OpenAI, Anthropic, Google) directly with
-  their own key and leave nothing in a connected cloud's logs; agents on
-  laptops (Claude Code, Cursor). Needs DNS/egress logs or provider admin APIs.
-- GCP agents (Agent Engine, Agent Registry), SaaS agents (Agentforce,
-  ServiceNow).
+- Agents on laptops (Claude Code, Cursor, desktop MCP clients): needs an
+  endpoint integration.
+- SaaS agents (Agentforce, ServiceNow) and GCP agents (Agent Engine, Agent
+  Registry).
 - Human approval (holds, CIBA), signed mandates (NIST tenet 6).
 - Effective-access evaluation (conditions, SCPs, boundaries, group inheritance)
   — the graph keeps saying `effective_access_not_evaluated`.
 - Prompt and response content. We record that a model was called, by whom, with
-  which model and outcome; never the text.
+  which model and outcome; never the text (the LLM gateway, §5.7, included).
 
 ## 3. Today, by cloud
 
 | | AWS | Azure | Kubernetes |
 |---|---|---|---|
 | Declared agents | Bedrock agents, AgentCore runtimes and gateways → `cloud_workload` (`internal/awsdiscovery/bedrock.go:123,209,302`; `services/cloud_aws_workload_scan.go:457-483`), graph `iga_workload` with `classification='provider_native_agent'` (`internal/igagraph/project.go:553-558`). **Not in `discovered_agents`.** AgentCore workload identities and credential providers are `cloud_observation` evidence only | Entra Agent ID objects, Foundry agents, Copilot registry, Teams bots, Logic Apps (`services/azure_agent_discovery.go`, `azure_agent_sources.go`, `azure_agent_registry.go`) | Admission webhook reports agent-shaped containers (framework tokens, env var **names**, MCP and model endpoints, `authsec.ai/agent` label) as sightings (iga-agent `internal/detect/vocabulary.go:115-223`) |
-| Inferred (unregistered) | **None.** CloudTrail `InvokeModel`/`Converse` are read only as generic events | `inferAgents` (`services/azure_agent_inference.go:74`): service principals and managed identities with AI-service sign-ins and machine cadence → `discovered_agents` `evidence_mode=inferred`, rule `azure_agent_v1` | Every sighting lands `status='unregistered'` (`services/discovery_service.go:902`) |
+| Inferred (unregistered) | **None.** CloudTrail `InvokeModel`/`Converse` are read only as generic events. The raw signals partly exist and nothing infers from them: Lambda env var **names** are collected (`internal/awsdiscovery/workloads.go:207`, `EnvVarNames`, never values); Secrets Manager names are read (`resource_policies.go:1402`) | `inferAgents` (`services/azure_agent_inference.go:74`): service principals and managed identities with AI-service sign-ins and machine cadence → `discovered_agents` `evidence_mode=inferred`, rule `azure_agent_v1` | Every sighting lands `status='unregistered'` (`services/discovery_service.go:902`) |
 | Activity | CloudTrail `LookupEvents`, 48 h window, ≤10,000 events per region per scan, all management events, no filter (`internal/awsdiscovery/cloudtrail_events.go:77,84-87`); attributed by session issuer (`:228-246`); stored as `cloud_observation` (`cloud_aws_workload_scan.go:752-781`); unmatched events counted, not stored. Access Advisor → `cloud_usage` | Activity Log 7 d (`azure_activity_discovery.go:52`) and Entra sign-ins 7 d (`azure_access_discovery.go:207`) → `cloud_usage` aggregates | **None.** No audit logs (`SPEC-iga-phase3-policy.md:72`). Admission actor on sightings; lifecycle events in `discovered_agent_events` |
 | Freshness | Scheduled scan daily or weekly (`cloud_aws_scan_schedule.go:62`), or "Scan now" | `AZURE_DISCOVERY_INTERVAL`, default 12 h (`azure_scheduler.go:31-58`) | Admission push on CREATE/DELETE (real time); resync and RBAC sweep off by default, 6 h when on |
 | Access graph | Built | Built (D-114) | Built (RBAC sweep) |
@@ -91,7 +101,7 @@ reach only the second. P1 resolves this (§5.1).
 |---|---|---|
 | `authsec` | Collectors (AWS Bedrock events, AWS sightings, Azure Key Vault metadata), event-stream ingress, activity store and API, OTLP receiver, kill switch service, PEP decision API; migrations 147+ | All server work |
 | `Authsec-ui` | Agents list (declared/inferred/confidence), agent detail with Activity timeline and Access tabs, Contain/Release, event-stream setup wizard | Console is how customers use it |
-| `iga-agent` | Azure workload identity annotation, informer watches instead of 6 h list, Kubernetes audit forwarding, kill-switch instruction kinds, sighting sequence numbers | Kubernetes signals come only from the in-cluster agent |
+| `iga-agent` | Azure workload identity annotation, informer watches instead of 6 h list, Kubernetes audit forwarding, kill-switch instruction kinds, sighting sequence numbers, node sensor (eBPF) promoted from `origin/experimental` as an opt-in component | Kubernetes signals come only from the in-cluster agent |
 | `sdk-authsec` | none | No SDK caller creates inventory or activity; the PEP (P5) is a gateway, not an SDK |
 | `authsec-doc` | Setup pages: event streams (AWS, Azure), CloudTrail data events, tracing (AgentCore, Foundry), iga-agent upgrade | Customers must enable sources |
 | Production K3s | OTLP and event ingress hostnames/paths, ingress body limits, retention job | New public ingress |
@@ -125,7 +135,45 @@ already never touches status, owner or claim fields
 inventory, or should `iga_agents` / `iga_agent_instances` (004) become it? Today
 only the GitHub pipeline writes `iga_agents`; every cloud projector writes none.
 
-### 5.2 Inferred agents on AWS (P1)
+### 5.2 Inferred agents — the primary path (P1, P2, P4)
+
+An agent is inferred from the **workload** (the compute) and the **identity**
+it runs as, from signals in three families. No single signal decides; the
+rule scores them and records every signal it used.
+
+#### 5.2.1 Signals for agents calling any model provider
+
+| Family | Signal | AWS | Azure | Kubernetes | Customer setup | Today |
+|---|---|---|---|---|---|---|
+| Configuration | env var **names** of model keys and agent frameworks (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`, `AZURE_OPENAI_*`, `LANGCHAIN_*`, `LANGSMITH_*`, `MCP_*`, …) | Lambda (collected, `workloads.go:207`), ECS task definitions (new), EC2 launch-template user data **not read** | Function App / App Service / Container Apps app-setting **names** (new; ARM `listApplicationSettings` returns values — keep names, discard values in memory, never log) | collected (`env_marker_keys`) | none | Lambda ✅, K8s ✅, ECS ❌, Azure ❌ |
+| Configuration | container image or package of an agent framework or model SDK (langchain, langgraph, crewai, autogen, openai, anthropic, MCP servers) | ECS image names (new), Lambda layers names (new) | Container Apps image (new) | collected (vocabulary) | none | K8s ✅ |
+| Configuration | secret **names** that look like model keys (`openai`, `anthropic`, `gemini`, `llm`, `*-api-key`) and which workload reads them | Secrets Manager names (read), which role may `GetSecretValue` (resource policies, graph) | Key Vault secret names (new, §5.3) | `secret_refs` names (collected) | none | partly |
+| Configuration | code dependencies (`openai`, `anthropic`, `google-genai`, `langchain`, MCP SDKs) in the repo that deploys the workload | linked through image or function source → GitHub repo (new link) | same | same | GitHub connected | scanner exists; repo↔workload link ❌ |
+| Network | DNS lookups / connections to model endpoints (`api.openai.com`, `*.openai.azure.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`, `*.aiplatform.googleapis.com`, `api.mistral.ai`, `api.cohere.com`, `api.groq.com`, `openrouter.ai`, …) mapped to the source ENI / IP → workload | Route 53 Resolver query logs (source VPC, ENI); Network Firewall TLS SNI logs | Azure DNS / Firewall logs (Log Analytics) | node sensor (eBPF, process → destination); on iga-agent `origin/experimental` (`cmd/iga-node-sensor`) | DNS query logging, or sensor install | ❌ |
+| Provider usage | usage per API key / project: calls, tokens, models, last use | OpenAI Admin + Usage API, Anthropic Admin + usage report (1-minute buckets, ~5 min lag) | same | same | connect the provider org (admin key, stored per workspace in Vault) | ❌ |
+| Cloud model calls | Bedrock `InvokeModel`/`Converse`, Azure OpenAI sign-ins | §5.2.2 | `azure_agent_v1` (built) | via IRSA / workload identity | none | Azure ✅, AWS ❌ |
+
+**Scoring** (rule `workload_agent_v1`; thresholds are review items):
+- **high** — a network or provider-usage signal (it *calls* a model) together
+  with a configuration signal on the same workload, or a cloud model call by the
+  workload's identity;
+- **medium** — a network or provider-usage signal alone, or two configuration
+  signals of different kinds (key name + framework image);
+- **low** — one configuration signal (a key name alone); listed, not alerted.
+
+**Mapping a signal to a workload.** DNS and flow logs name an ENI or IP: map
+ENI → Lambda/ECS task/EC2 instance (AWS `DescribeNetworkInterfaces`
+attachment), pod IP → pod (iga-agent), Azure NIC/IP → App Service/Container
+App/VM. A signal that maps to no known workload is kept as "model traffic from
+an unknown source" on the VPC/subnet, itself a finding.
+
+**Provider usage without a workload.** We never see key values, so a provider
+key is tied to a workload only by name agreement (secret or env name ↔ key
+name / project name) and is marked `weak`. Usage on keys that match nothing is
+reported as **unaccounted model usage** per provider project: the shadow-agent
+alarm when no workload signal exists.
+
+#### 5.2.2 Cloud model calls on AWS
 
 Rule `aws_agent_v1`, evaluated per IAM role (and IAM user) per scan:
 
@@ -139,7 +187,11 @@ Rule `aws_agent_v1`, evaluated per IAM role (and IAM user) per scan:
 
 Output: a sighting `source='aws'`, fingerprint `aws:<account>:role:<RoleId>`
 (the incarnation, never the name), `evidence_mode=inferred`, `confidence`
-high/medium, `signals`, and the workloads that run as the role.
+high/medium, `signals`, and the workloads that run as the role. A workload
+inferred by §5.2.1 gets fingerprint `aws:<account>:<runtime_kind>:<native_id>`
+(Azure: `azure:<subscription>:<resource id>`; Kubernetes keeps the collector's
+fingerprint), and its identity's sighting and its own are linked, not
+duplicated: one agent, the workload and the identity it runs as.
 
 **Collection change.** The general `LookupEvents` pass caps at 10,000 events
 per region per scan and drops unmatched events; in a busy account Bedrock calls
@@ -226,7 +278,18 @@ Sources and what each gives:
 | Defender `CloudAppEvents` (`InvokeAgent`, `ExecuteToolBy*`) | tool calls of Microsoft agents | Agent 365 licence |
 | Kubernetes audit (EKS CloudWatch `/aws/eks/<cluster>/cluster`, AKS diagnostic logs) | API calls by ServiceAccount | control-plane audit logging |
 | OTLP receiver | any framework emitting OpenTelemetry GenAI spans | point the exporter at AuthSec |
+| DNS / egress logs (Route 53 Resolver, Network Firewall, Azure DNS/Firewall) | when and how often a workload reaches which model provider | DNS query logging |
+| Kubernetes node sensor (eBPF) | per process: connections to model providers, MCP servers, cloud APIs | install the sensor (iga-agent) |
+| Provider usage APIs (OpenAI, Anthropic) | calls, tokens, models per key per minute | connect the provider org |
+| AuthSec LLM / MCP gateway (§5.7) | every model call and tool call of an agent routed through it: provider, model, tokens, tool, arguments digest, outcome | point the agent's model base URL / MCP client at the gateway |
 | AuthSec decisions (R3, P5 PEP, access policies) | allow/deny, refused actions | nothing |
+
+**What we see of an agent that calls a provider directly**, by what the
+customer enables: with nothing, its cloud actions (its identity) and that it is
+an agent (configuration signals); with DNS logs or the sensor, when and how
+often it calls which provider; with provider usage, tokens and models per key;
+**with the gateway, each model and tool call** — the only way to see and
+control individual calls of an agent that sends no traces.
 
 **OpenTelemetry.** Accept `gen_ai.*` and `mcp.*` spans
 ([GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai),
@@ -289,6 +352,16 @@ the agent:
   Kong) that authorizes each `tools/call` using the `Mcp-Method` / `Mcp-Name`
   headers (MCP spec 2026-07-28), refuses token passthrough, pins tool
   definitions by hash, and asks the PDP.
+- **LLM gateway:** the same process proxies model calls for agents that call a
+  provider directly. The agent's base URL points at the gateway
+  (OpenAI-compatible and Anthropic Messages endpoints); the gateway
+  authenticates the agent (workload identity or a per-agent AuthSec key),
+  asks the PDP (allowed provider, model, budget), and forwards with the
+  provider key, which it holds per workspace in Vault — so the agent no longer
+  holds the key. It records metadata per call (provider, model, tokens,
+  latency, tool-use names, outcome), never prompt or completion text.
+  Redirecting traffic is the customer's change; detection (§5.2) tells them
+  which agents still bypass it.
 - **Wire format:** OpenID AuthZEN Authorization API 1.0 (Final 2026-01-12),
   so third-party gateways can call us.
 - Every decision is an `agent_activity_event` (`source='authsec_decision'`,
@@ -317,13 +390,13 @@ review). Migration numbers from 147, re-checked at merge.
 
 | Phase | Deliverable | Covers | Backend | Live |
 |---|---|---|---|---|
-| **P1** | AWS declared agents as sightings (§5.1); AWS inference `aws_agent_v1` with the focused Bedrock pass (§5.2); risky-credential findings on all three (§5.3); Azure Key Vault secret names | R1, R2 | 4–5 d | ~1.5 wk |
-| **P2** | Event ingress AWS/Azure + setup templates; iga-agent informers, UPDATE admission, sighting sequence (§5.4) | R5 | ~1 wk | ~2 wk |
+| **P1** | AWS declared agents as sightings (§5.1); inference `workload_agent_v1` from configuration signals on AWS, Azure, Kubernetes (env/app-setting names, images, layers, secret names; §5.2.1) and `aws_agent_v1` with the focused Bedrock pass (§5.2.2); risky-credential findings (§5.3); Azure Key Vault secret names | R1, R2 | 7–8 d | ~2 wk |
+| **P2** | Event ingress AWS/Azure + setup templates; iga-agent informers, UPDATE admission, sighting sequence (§5.4); **network signals**: Route 53 Resolver / Network Firewall and Azure DNS/Firewall logs mapped to workloads, iga-agent node sensor promoted from `experimental` (§5.2.1) | R1, R5 | ~2 wk | ~3 wk |
 | **P3** | Contain / release (§5.6) | R7 | ~1 wk | ~1.5 wk |
-| **P4** | `agent_activity_event`, collectors (CloudTrail data events, AgentCore spans, Foundry, Entra, Defender, K8s audit), OTLP receiver, activity and access APIs, delegation chain (§5.5) | R3, R4, R9 | 2–2.5 wk | ~3.5 wk |
-| **P5** | PDP over AuthZEN, R3 allow/deny for AgentCore, MCP gateway (§5.7) | R8, R9 | 2–3 wk | ~4 wk |
+| **P4** | `agent_activity_event`, collectors (CloudTrail data events, AgentCore spans, Foundry, Entra, Defender, K8s audit, DNS/sensor), OTLP receiver, **provider usage (OpenAI, Anthropic) and unaccounted model usage**, repo ↔ workload link, activity and access APIs, delegation chain (§5.5) | R1, R3, R4, R9 | 2.5–3 wk | ~4 wk |
+| **P5** | PDP over AuthZEN, R3 allow/deny for AgentCore, MCP gateway **and LLM gateway** (§5.7) | R4, R8, R9 | 3–3.5 wk | ~4.5 wk |
 
-Total ≈ 7–9 weeks backend, 10–12 weeks live. UI for a phase runs alongside the
+Total ≈ 9–11 weeks backend, 12–14 weeks live. UI for a phase runs alongside the
 next phase's backend. iga-agent changes ship as a chart release; customers
 upgrade per cluster.
 
@@ -331,14 +404,21 @@ upgrade per cluster.
 
 - **P1:** in the lab account (220171243705), a Lambda calling Bedrock with no
   declared agent appears as an inferred agent (confidence high, signals listed,
-  the Lambda named) after one scan; a Bedrock agent appears as declared; a
-  Secrets Manager secret named `openai-api-key` produces a finding with no
-  value read. Azure and Kubernetes equivalents. Cross-workspace test: B sees
-  none of A's sightings or findings.
+  the Lambda named) after one scan; a Lambda with `OPENAI_API_KEY` and the
+  `openai` package in a layer appears as inferred (medium) without any Bedrock
+  call; a Bedrock agent appears as declared; a Secrets Manager secret named
+  `openai-api-key` produces a finding with no value read. An Azure Container
+  App with `ANTHROPIC_API_KEY` and a pod with a LangGraph image are inferred
+  the same way; no app-setting value is stored or logged (test asserts on the
+  stored rows and the log output). Cross-workspace test: B sees none of A's
+  sightings or findings.
 - **P2:** a role assignment created in the Azure portal and an `InvokeModel`
   call in AWS show in AuthSec within 60 s with streams on; a forged or
   cross-workspace event is refused (401/404); stopping the stream shows
-  "silent" within one polling interval.
+  "silent" within one polling interval. With Resolver query logs on, an ECS
+  task calling `api.anthropic.com` is raised to high confidence and named as
+  the source; traffic from an IP that maps to no workload is reported against
+  its VPC.
 - **P3:** contain an agent with an AWS role, an Azure identity and a K8s
   ServiceAccount: each provider read back shows no access; release restores
   exactly (diff of before/after equals none); partial failure is reported per
@@ -347,8 +427,14 @@ upgrade per cluster.
   timeline with the human it acted for; an OTLP span from a LangGraph agent
   attaches to its sighting; retention purge removes only the workspace's rows
   past the window.
+- **P4 (provider usage):** with an OpenAI org connected, usage on a key that
+  matches no workload appears as unaccounted model usage; usage on a key whose
+  name matches the inferred Lambda's secret is shown on that agent (weak link).
 - **P5:** a denied `tools/call` is refused at the gateway, logged as a refused
-  decision, and visible on the timeline; AuthZEN conformance tests pass.
+  decision, and visible on the timeline; AuthZEN conformance tests pass. An
+  agent pointed at the LLM gateway has each model call on its timeline
+  (provider, model, tokens) with no prompt text stored; a model outside the
+  policy is refused.
 
 ## 7. Open questions for review
 
@@ -360,6 +446,10 @@ upgrade per cluster.
 6. **Q6** Own MCP gateway, or AuthZEN PDP first and third-party gateways?
 7. **Q7** Order: P3 (kill switch) before P2 (streams) for an earlier demo?
 8. **Q8** Azure disable of an agent identity needs a high-privilege Graph permission; offer it at all?
+9. **Q9** Azure app settings: the ARM call returns values; reading names and discarding values in memory is the only way. Acceptable, or require a narrower source?
+10. **Q10** Promote the iga-agent node sensor (eBPF/Tetragon, `origin/experimental`) to a supported, opt-in component?
+11. **Q11** Provider admin keys (OpenAI, Anthropic) are customer secrets we must hold (Vault, per workspace). Accept, or read usage only from exports the customer pushes?
+12. **Q12** Inference thresholds (§5.2.1): is "one configuration signal = low, listed but not alerted" right?
 
 ## 8. Risks
 
@@ -371,3 +461,9 @@ upgrade per cluster.
 - Microsoft gates agent-level Defender and registry data behind Agent 365.
 - Inference has false positives (a batch job calling Bedrock is not an agent);
   confidence and the `ignored` status are the release valve.
+- DNS logs and the node sensor see traffic metadata of every workload, not only
+  agents; we keep only lookups/connections to the model and MCP endpoint list
+  and drop the rest on ingest.
+- An agent can rename its key variable or bake the key into the image;
+  configuration signals then miss it, and only network or provider-usage
+  signals find it. The console says which signal families are on.
