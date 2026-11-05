@@ -99,3 +99,7 @@ services/azure_graph_projection.go
 services/azure_onboarding_service.go
 services/azure_resource_agents.go
 services/azure_signin_origin.go
+controllers/platform/agent_runtime_alerts_controller.go
+services/agent_runtime_alerts.go
+services/agent_runtime_alert_delivery.go
+services/agent_runtime_alert_siem.go
