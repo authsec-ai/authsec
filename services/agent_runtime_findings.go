@@ -371,7 +371,7 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 		return fmt.Errorf("read open findings: %w", err)
 	}
 	for _, f := range open {
-		if seen[f.Kind+"\x1f"+f.SubjectKey] {
+		if seen[f.Kind+"\x1f"+f.SubjectKey] || findingKindsOutsideInference[f.Kind] {
 			continue
 		}
 		if f.Kind == FindingModelKeySecret && (secrets == nil || !secrets.known) {
@@ -435,7 +435,7 @@ type FindingListFilter struct {
 // ListFindings returns the workspace's findings, most recently seen first.
 func (s *AgentRuntimeService) ListFindings(ctx context.Context, ws uuid.UUID, f FindingListFilter) ([]AgentFinding, *string, error) {
 	if f.Kind != "" && !FindingKinds[f.Kind] {
-		return nil, nil, GovBadParam("kind", "kind must be shared_role, human_credentials, long_lived_key, model_key_secret, ai_config_hint or ai_network_traffic.")
+		return nil, nil, GovBadParam("kind", "kind must be one of "+strings.Join(sortedKeys(FindingKinds), ", ")+".")
 	}
 	if f.State != "" && !FindingStates[f.State] {
 		return nil, nil, GovBadParam("state", "state must be open or resolved.")

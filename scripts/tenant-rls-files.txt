@@ -118,3 +118,4 @@ services/agent_runtime_ingest.go
 services/agent_runtime_live.go
 services/agent_runtime_config_hints.go
 services/agent_runtime_graph.go
+services/agent_runtime_dns.go

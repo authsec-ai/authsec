@@ -323,7 +323,33 @@ const (
 	SurfaceAgentCoreCredProviderPrefix = "agentcore-credential-providers"
 	SurfaceCloudTrailEventsPrefix      = "cloudtrail-events"
 	SurfaceCloudTrailStatusPrefix      = "cloudtrail-status"
+	// SurfaceDNSQueryLogsPrefix is the read of Route 53 Resolver query logs
+	// delivered to CloudWatch Logs, for model-endpoint lookups
+	// (SPEC-agent-runtime-visibility.md §11). Bonus evidence: it gates no
+	// reconciliation.
+	SurfaceDNSQueryLogsPrefix = "dns-query-logs"
+	// SurfaceDNSQueryLogsUnreadPrefix lists the region's query logging
+	// configurations AuthSec does not read (S3 or Firehose destinations, a
+	// log group in another account or region): always unsupported.
+	SurfaceDNSQueryLogsUnreadPrefix = "dns-query-logs-unread"
 )
+
+// SurfaceDNSBlindSpots is the fixed entry an AWS scan that read DNS query logs
+// reports: what DNS-based detection cannot see, whatever was read.
+const SurfaceDNSBlindSpots = "dns_blind_spots"
+
+// DNSBlindSpotsCoverage is SurfaceDNSBlindSpots' entry. unsupported, like
+// OrganizationsCoverage: it gates nothing and states what is never claimed.
+func DNSBlindSpotsCoverage() SurfaceCoverage {
+	return SurfaceCoverage{
+		State: CloudCoverageUnsupported,
+		Error: "DNS-based detection of model-provider calls does not see Lambda functions that are not " +
+			"attached to a VPC, workloads that use a resolver other than the Route 53 Resolver (a custom " +
+			"DNS server, DNS over HTTPS in the application), VPCs without Resolver query logging to " +
+			"CloudWatch Logs, or lookups answered from a cache; attribution by private address names " +
+			"the network interface that holds the address at scan time",
+	}
+}
 
 // SurfaceRegional names one service's surface in one region: "ecs:eu-west-1".
 func SurfaceRegional(prefix, region string) string { return prefix + ":" + region }

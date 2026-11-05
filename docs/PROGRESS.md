@@ -9,6 +9,16 @@ Newest first. Each session records what was done, what was learned, and what's n
 - `/graph`, `/graph/expand`, `/graph/path` and the identity and workload details: an AWS role, user or workload carries an additive `agent_runtime` object (label, model calls, open alerts, open findings, suggestion, containment) only when there is something to say; a contained role's grant edges carry `contained: {id, level}` while the containment is in force (identity level: every grant; model level: grants whose statement allows a model action). Nodes and edges without agent-runtime data are unchanged byte for byte.
 - Labels come from the inference service's own rules through an `igaread.AgentRuntimeSource` installed at startup (`services/agent_runtime_graph.go`); one statement per table per graph level, inside the level's RLS transaction.
 - `/capabilities` `features` is not extended: the frozen contract fixes it at eight keys.
+## 2026-11-05 (cont.) — DNS-based detection of direct model-provider calls (branch `feat/agent-runtime-dns`)
+
+Spec `SPEC-agent-runtime-visibility.md` §11. Committed locally; nothing pushed.
+
+### Done
+- Route 53 Resolver query logs (CloudWatch Logs destinations) read per region with one Logs Insights query per log group that returns only lookups of the model-endpoint list; findings `ai_network_traffic` attributed to the EC2 instance, Lambda or ECS task (or the VPC), resolved after 30 gap-free quiet days. Migration 153 (kind CHECK incl. `ai_config_hint`, `cloud_dns_cursor`). Discovery template 2026-11-05 (route53resolver List, logs StartQuery/GetQueryResults/StopQuery, ec2:DescribeNetworkInterfaces).
+- Tests: unit (domain list and in-query filter, configs, windows, truncation, attribution, coverage, permission missing, S3 unsupported), integration (attribution, no other domain stored, cumulative windows, resolve and gap, two-workspace isolation under RLS); tenancy ratchet 72/72.
+
+### Open
+- Publish template 2026-11-05 to the template bucket before release; verify the Logs Insights query (field names, `coalesce`, `(?i)`) and the Lambda/ECS interface descriptions against the lab account; UI for the new finding kind and surfaces.
 
 ---
 

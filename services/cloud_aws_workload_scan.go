@@ -64,6 +64,8 @@ type AWSWorkloadScanner struct {
 	fence *repositories.ScanFence
 	// trailClock replaces the CloudTrail reader's clock (tests).
 	trailClock func() time.Time
+	// dns holds the DNS query-log read's test seams (agent_runtime_dns.go).
+	dns dnsScanConfig
 }
 
 // NewAWSWorkloadScanner constructs the scanner.
@@ -171,6 +173,9 @@ type WorkloadSnapshot struct {
 	// ModelCallUsageWritten counts the cloud_usage model-call rows written
 	// (source cloudtrail, service bedrock; §5.1), across regions.
 	ModelCallUsageWritten int
+	// DNSTrafficFindings counts the ai_network_traffic findings opened or
+	// refreshed from Route 53 Resolver query logs (§11), across regions.
+	DNSTrafficFindings int
 	// Warnings are failures that cost evidence but not the scan: the focused
 	// Bedrock CloudTrail pass, the model-call evidence write, the dispatch to
 	// agent-runtime sinks. Never a reason to fail or to mark coverage.
@@ -500,6 +505,7 @@ func (s *AWSWorkloadScanner) scanRegion(
 	s.scanCredentialProviders(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
 	s.scanTrailStatus(ctx, workspaceID, snapshot, region, trail, out)
+	s.scanDNSQueryLogs(ctx, workspaceID, snapshot, scope, region, out)
 }
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are
