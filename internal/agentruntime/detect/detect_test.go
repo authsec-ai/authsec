@@ -51,9 +51,11 @@ func TestD1SecretReads(t *testing.T) {
 		{"GetSecretValue", ev("secretsmanager.amazonaws.com", "GetSecretValue"), SeverityHigh},
 		{"BatchGetSecretValue", ev("secretsmanager.amazonaws.com", "BatchGetSecretValue"), SeverityHigh},
 		{"ListSecrets is not a read of a value", ev("secretsmanager.amazonaws.com", "ListSecrets"), ""},
-		{"GetParameter", ev("ssm.amazonaws.com", "GetParameter"), SeverityMedium},
-		{"GetParametersByPath", ev("ssm.amazonaws.com", "GetParametersByPath"), SeverityMedium},
-		{"kms Decrypt by the caller", ev("kms.amazonaws.com", "Decrypt"), SeverityMedium},
+		{"GetParameter", withFacts(ev("ssm.amazonaws.com", "GetParameter"), FactWithDecryption, "true"), SeverityMedium},
+		{"GetParameter without decryption", ev("ssm.amazonaws.com", "GetParameter"), ""},
+		{"GetParametersByPath", withFacts(ev("ssm.amazonaws.com", "GetParametersByPath"), FactWithDecryption, "true"), SeverityMedium},
+		{"kms Decrypt of a secret by the caller", withFacts(ev("kms.amazonaws.com", "Decrypt"), agentruntime.FactSecretContext, "true"), SeverityMedium},
+		{"kms Decrypt, no secret context", ev("kms.amazonaws.com", "Decrypt"), ""},
 	}
 	for _, c := range cases {
 		fs := Evaluate(cfg, established(), c.e, t0)
@@ -75,10 +77,15 @@ func TestD1KMSDecryptViaSecretsManagerOrSSMDropped(t *testing.T) {
 		e.InvokedBy = by
 		none(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
 	}
-	// Another service's decrypt on the caller's behalf still counts.
-	e := ev("kms.amazonaws.com", "Decrypt")
+	// Any service-made decrypt is dropped; only direct calls count.
+	e := withFacts(ev("kms.amazonaws.com", "Decrypt"), agentruntime.FactSecretContext, "true")
 	e.InvokedBy = "lambda.amazonaws.com"
-	only(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
+	none(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
+}
+
+func withFacts(e agentruntime.Event, k, v string) agentruntime.Event {
+	e.RequestFacts = map[string]string{k: v}
+	return e
 }
 
 func TestD1SSMWithDecryptionFalseDropped(t *testing.T) {

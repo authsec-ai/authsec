@@ -89,6 +89,12 @@ const (
 	FactKeyID     = "key_id"     // kms keyId
 	FactFunction  = "function"   // lambda functionName
 	FactBucket    = "bucket"     // s3 bucketName
+	// FactWithDecryption is ssm requestParameters.withDecryption, "true"/"false".
+	FactWithDecryption = "with_decryption"
+	// FactSecretContext is "true" when a kms request's encryptionContext has a
+	// key naming a Secrets Manager secret or SSM parameter (SecretARN,
+	// PARAMETER_ARN, aws:secretsmanager:*, aws:ssm:*). Keys only, never values.
+	FactSecretContext = "secret_context"
 )
 
 // Attribution is how an event is tied to an identity, mirroring

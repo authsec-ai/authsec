@@ -415,11 +415,19 @@ workload containment unavailable, with the reason, in `/api/iga/v1/capabilities`
 
 **§5.4 changes.** No permissions-boundary variant: a role has one boundary and
 R1a already writes AuthSec boundaries (`internal/awsenforce/deploy.go`). Without
-Organizations, the template is an AuthSec-owned **deny policy** attached to
-chosen roles (v2 allows it). The gate must not be bypassable through session
+Organizations, the template is a **deny policy** attached to chosen roles,
+under `/authsec-gate/` so the enforcement role's `/authsec/` policy rights
+cannot rewrite or detach it. The gate must not be bypassable through session
 tags: also deny setting the `authsec:agent` tag key through `sts:TagSession`,
 `sts:AssumeRole*` (with tags) and `iam:TagRole` / `iam:UntagRole`, except for
-named administrator principals (a template parameter).
+named administrator principals (a template parameter). A policy on the gated
+role never sees the assumer's call, so tags set by the assumer are stopped
+only by the SCP (in-organization callers) and a **resource control policy**
+form (`form=rcp`, any caller); an empty `authsec:agent` value counts as
+untagged. The deny list covers Bedrock Runtime, agents, flows, batch
+inference, AgentCore runtime invocation and `bedrock-mantle:CreateInference`.
+Bedrock's own service roles (agent, knowledge base, flow, batch, AgentCore
+runtime) must be tagged too.
 
 **§5.2 change.** The session-name claims (Lambda = function name, ECS = task id)
 are unverified: both go into the P1 lab acceptance; until verified, session
@@ -427,7 +435,15 @@ names are shown as unverified weak evidence only.
 
 **§5.8 change.** The preview states side effects: zero Lambda concurrency does
 not stop event source mappings (queue messages are retried and may dead-letter);
-ECS `desiredCount = 0` does not stop tasks started with `RunTask`.
+ECS `desiredCount = 0` does not stop tasks started with `RunTask`. Workload
+containment selects ECS services running the workload's exact task-definition
+revision, and one target is held by one live containment at a time (152).
+**Verified** needs evidence: CloudTrail events from after contained-at plus the
+grace were received (stream or scan cursor) and none was a successful call by
+the identity (calls a deny cannot block, such as `sts:GetCallerIdentity`, and
+calls made by an AWS service do not count). Without such events within 24 h,
+or when no event can be attributed to the contained workloads, the
+containment is recorded **unverifiable** with the reason, never verified.
 
 **§5.7 change.** D1 on `kms:Decrypt` would duplicate every `GetSecretValue`
 alert (Secrets Manager decrypts on the caller's behalf): drop `kms:Decrypt`

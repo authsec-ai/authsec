@@ -74,6 +74,9 @@ const (
 const (
 	GovEventAgentAlertOpened   = "agent_alert.opened"
 	GovEventAgentAlertResolved = "agent_alert.resolved"
+	// SIEM delivery outcomes that end a delivery (not each retry).
+	GovEventAgentAlertSIEMDelivered = "agent_alert.siem_delivered"
+	GovEventAgentAlertSIEMFailed    = "agent_alert.siem_failed"
 
 	GovNoticeAgentAlert = "agent_alert"
 )
@@ -382,6 +385,15 @@ func (s *AgentAlertSink) Name() string { return AgentAlertSinkName }
 func (s *AgentAlertSink) Process(ctx context.Context, workspaceID, connectorID uuid.UUID, events []agentruntime.Event) error {
 	r := agentruntime.Resolver()
 	if r == nil || workspaceID == uuid.Nil || len(events) == 0 {
+		return nil
+	}
+	// Without migration 150 the sink is absent, not failing: events are not
+	// alerted on, and the ingest must not treat that as a dispatch failure.
+	// TENANT-EXEMPT: the 150 schema check below reads the Postgres catalog only.
+	if s.db == nil {
+		// no database to gate (tests); nothing below reads one before resolving
+	} else if ok, reason := AgentAlertsStatus(s.db); !ok { // TENANT-EXEMPT: catalog-only schema check
+		agentAlertsGate.logWait("alert sink", reason)
 		return nil
 	}
 	groups := map[agentruntime.Attribution][]agentruntime.Event{}

@@ -29,9 +29,19 @@ var AgentEventStreamTemplate string
 //go:embed authsec-model-access-scp.yaml
 var ModelAccessSCPTemplate string
 
+// ModelAccessRCPTemplate is the tag guard of the tag-gated template, deny
+// mode, as a resource control policy (AWS Organizations): it refuses the
+// authsec:agent session tag on role assumption by any caller, which the SCP
+// (in-organization callers only) and the policy form cannot. Deployed with
+// the SCP form; it gates no model call itself.
+//
+//go:embed authsec-model-access-rcp.yaml
+var ModelAccessRCPTemplate string
+
 // ModelAccessPolicyTemplate is the tag-gated model access template, deny
-// mode, without Organizations: an AuthSec-owned deny policy under /authsec/
-// attached to chosen roles (never a permissions boundary, §10).
+// mode, without Organizations: an AuthSec-owned deny policy under
+// /authsec-gate/ (outside the enforcement role's /authsec/ reach) attached
+// to chosen roles (never a permissions boundary, §10).
 //
 //go:embed authsec-model-access-policy.yaml
 var ModelAccessPolicyTemplate string
@@ -46,5 +56,6 @@ var ModelAccessAuditDocument []byte
 const (
 	AgentEventStreamTemplateFile  = "authsec-agent-event-stream.yaml"
 	ModelAccessSCPTemplateFile    = "authsec-model-access-scp.yaml"
+	ModelAccessRCPTemplateFile    = "authsec-model-access-rcp.yaml"
 	ModelAccessPolicyTemplateFile = "authsec-model-access-policy.yaml"
 )

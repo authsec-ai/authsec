@@ -208,14 +208,12 @@ func enqueueAgentAlertDeliveries(tx *gorm.DB, ws, alertID uuid.UUID, st AgentAle
 /* ------------------------------------------------------------------------- */
 
 // AgentAlertConsoleLink is the console URL an alert links to ("" without a
-// base URL): the AWS account's connection page. The console has no alerts
-// page yet, and a link must name a page it serves (AS-124); point it at
-// /iga/agent-runtime/alerts/<id> when the console adds one.
-func AgentAlertConsoleLink(connectorID uuid.UUID) string {
-	if connectorID == uuid.Nil {
+// base URL): the console's alert page.
+func AgentAlertConsoleLink(alertID uuid.UUID) string {
+	if alertID == uuid.Nil {
 		return ""
 	}
-	return govConsoleLink("/iga/connections/" + connectorID.String())
+	return govConsoleLink("/iga/agent-runtime/alerts/" + alertID.String())
 }
 
 func renderAgentAlertNotice(db *gorm.DB, n *models.IGAGovNotification, _ *uuid.UUID) (*GovNotice, error) {
@@ -229,7 +227,7 @@ func renderAgentAlertNotice(db *gorm.DB, n *models.IGAGovNotification, _ *uuid.U
 		return nil, GovNotifyPermanent(errors.New("the alert no longer exists"))
 	}
 	a := rows[0]
-	link := AgentAlertConsoleLink(a.ConnectorID)
+	link := AgentAlertConsoleLink(a.ID)
 	title := fmt.Sprintf("AuthSec alert (%s): %s", a.Severity, a.Title)
 	lines := []string{
 		fmt.Sprintf("Detection %s: %s", a.Detection, detect.Name(detect.ID(a.Detection))),
@@ -326,7 +324,7 @@ func BuildAgentAlertSIEMPayload(a AgentAlert, deliveryID string, now time.Time) 
 		Alert: AgentAlertSIEMAlert{ID: a.ID, WorkspaceID: a.WorkspaceID, ConnectorID: a.ConnectorID, IdentityID: a.IdentityID,
 			WorkloadIDs: wl, SubjectLabel: a.SubjectLabel, SubjectName: a.SubjectName, Detection: a.Detection,
 			DetectionName: detect.Name(detect.ID(a.Detection)), Severity: a.Severity, Title: a.Title, State: a.State,
-			FirstSeen: a.FirstSeen.UTC(), LastSeen: a.LastSeen.UTC(), EventCount: a.EventCount, Link: AgentAlertConsoleLink(a.ConnectorID)},
+			FirstSeen: a.FirstSeen.UTC(), LastSeen: a.LastSeen.UTC(), EventCount: a.EventCount, Link: AgentAlertConsoleLink(a.ID)},
 		Evidence: refs})
 }
 
@@ -342,7 +340,7 @@ func PostAgentAlertSIEM(ctx context.Context, client *http.Client, url, secret, d
 	ts := strconv.FormatInt(now.Unix(), 10)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, &agentAlertPermanent{fmt.Errorf("build request: %w", err)}
+		return 0, &agentAlertPermanent{fmt.Errorf("build request: %w", sanitizeAgentAlertSIEMError(err))}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", AgentAlertSIEMUserAgent)
@@ -356,7 +354,7 @@ func PostAgentAlertSIEM(ctx context.Context, client *http.Client, url, secret, d
 		if errors.Is(err, safehttp.ErrBlockedAddress) {
 			return 0, &agentAlertPermanent{fmt.Errorf("the endpoint's address is not allowed")}
 		}
-		return 0, fmt.Errorf("post: %w", err)
+		return 0, fmt.Errorf("post: %w", sanitizeAgentAlertSIEMError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -407,6 +405,15 @@ func RunAgentRuntimeAlertWorker(ctx context.Context, db *gorm.DB) {
 	d := NewAgentAlertDeliverer(db)
 	var lastPurge time.Time
 	for {
+		if ok, reason := AgentAlertsStatus(db); !ok {
+			agentAlertsGate.logWait("alert delivery worker", reason)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
+			continue
+		}
 		if _, err := d.DeliverDue(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("[agent-alerts] delivery: %v", err)
 		}
@@ -485,8 +492,10 @@ func (d *AgentAlertDeliverer) deliverOne(ctx context.Context, ws, id uuid.UUID) 
 		}
 		cl := &agentAlertClaim{delivery: rows[0]}
 		cl.delivery.Attempt++
-		if err := tx.Exec(`UPDATE agent_alert_delivery SET attempt = ?, leased_until = ?
-		                    WHERE workspace_id = ? AND id = ?`, cl.delivery.Attempt, d.now().Add(agentAlertSIEMLease), ws, id).Error; err != nil {
+		// The lease is set from the database clock, the one the claim
+		// comparisons above and in DeliverDue use.
+		if err := tx.Exec(`UPDATE agent_alert_delivery SET attempt = ?, leased_until = now() + make_interval(secs => ?)
+		                    WHERE workspace_id = ? AND id = ?`, cl.delivery.Attempt, agentAlertSIEMLease.Seconds(), ws, id).Error; err != nil {
 			return err
 		}
 		var alerts []AgentAlert
@@ -545,22 +554,39 @@ func (d *AgentAlertDeliverer) send(ctx context.Context, c *agentAlertClaim) erro
 }
 
 // record writes one attempt's outcome, fenced on the attempt number this
-// worker claimed (a lease taken over by another worker writes nothing).
+// worker claimed (a lease taken over by another worker writes nothing). The
+// outcomes that end a delivery (delivered, failed for good) are also
+// iga_gov_event entries, as Slack's notify path writes its own; the error
+// shown is sanitised (no endpoint URL).
 func (d *AgentAlertDeliverer) record(ctx context.Context, ws uuid.UUID, dl AgentAlertDelivery, sendErr error) error {
 	return tenancy.InWorkspace(ctx, d.db, ws, func(tx *gorm.DB) error {
 		var perm *agentAlertPermanent
+		payload := map[string]any{"alert_id": dl.AlertID, "delivery_id": dl.ID, "endpoint_id": dl.EndpointID, "attempt": dl.Attempt}
+		var res *gorm.DB
+		event := ""
 		switch {
 		case sendErr == nil:
-			return tx.Exec(`UPDATE agent_alert_delivery SET status = 'sent', sent_at = now(), last_error = '', leased_until = NULL
-			                 WHERE workspace_id = ? AND id = ? AND attempt = ?`, ws, dl.ID, dl.Attempt).Error
+			res = tx.Exec(`UPDATE agent_alert_delivery SET status = 'sent', sent_at = now(), last_error = '', leased_until = NULL
+			                 WHERE workspace_id = ? AND id = ? AND attempt = ?`, ws, dl.ID, dl.Attempt)
+			event = GovEventAgentAlertSIEMDelivered
 		case errors.As(sendErr, &perm) || dl.Attempt >= agentAlertSIEMMaxAttempts:
-			return tx.Exec(`UPDATE agent_alert_delivery SET status = 'failed', last_error = ?, leased_until = NULL
-			                 WHERE workspace_id = ? AND id = ? AND attempt = ?`, truncate(sendErr.Error(), 1000), ws, dl.ID, dl.Attempt).Error
+			msg := truncate(sendErr.Error(), 1000)
+			res = tx.Exec(`UPDATE agent_alert_delivery SET status = 'failed', last_error = ?, leased_until = NULL
+			                 WHERE workspace_id = ? AND id = ? AND attempt = ?`, msg, ws, dl.ID, dl.Attempt)
+			payload["error"] = truncate(msg, 300)
+			event = GovEventAgentAlertSIEMFailed
 		default:
 			return tx.Exec(`UPDATE agent_alert_delivery SET last_error = ?, leased_until = NULL, next_attempt_at = ?
 			                 WHERE workspace_id = ? AND id = ? AND attempt = ?`,
 				truncate(sendErr.Error(), 1000), d.now().Add(agentAlertSIEMBackoff(dl.Attempt)), ws, dl.ID, dl.Attempt).Error
 		}
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return appendGovEvent(tx, ws, event, models.GovActorSystem, AgentAlertSinkName, govEventRefs{}, payload)
 	})
 }
 
@@ -593,6 +619,19 @@ func (d *AgentAlertDeliverer) purgeWorkspace(ctx context.Context, ws uuid.UUID) 
 		}
 		now := d.now().UTC()
 		cutoff := now.AddDate(0, 0, -st.RetentionDays)
+		// An alert still open or acknowledged is closed on the record first.
+		var stale []AgentAlert
+		if err := tx.Raw(`SELECT `+agentAlertColumns+` FROM agent_alert
+		                   WHERE workspace_id = ? AND last_seen < ? AND state <> ?`, ws, cutoff, AgentAlertResolved).Scan(&stale).Error; err != nil {
+			return err
+		}
+		for _, a := range stale {
+			if err := appendGovEvent(tx, ws, GovEventAgentAlertResolved, models.GovActorSystem, AgentAlertSinkName, govEventRefs{},
+				map[string]any{"alert_id": a.ID, "detection": a.Detection, "identity_id": a.IdentityID, "reason": "retention",
+					"event_count": a.EventCount}); err != nil {
+				return err
+			}
+		}
 		if err := tx.Exec(`DELETE FROM agent_alert WHERE workspace_id = ? AND last_seen < ?`, ws, cutoff).Error; err != nil {
 			return err
 		}

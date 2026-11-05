@@ -68,16 +68,24 @@ func MountAgentRuntimeAlertRoutes(g *gin.RouterGroup, ctl *AgentRuntimeAlertsCon
 // RegisterAgentRuntimeAlertRoutes is the route table (one table, so tests
 // mount the same one).
 func RegisterAgentRuntimeAlertRoutes(g gin.IRoutes, ctl *AgentRuntimeAlertsController, read, write gin.HandlerFunc) {
-	g.GET("/alerts", read, ctl.ListAlerts)
-	g.GET("/alerts/:id", read, ctl.GetAlert)
-	g.POST("/alerts/:id/acknowledge", write, ctl.AcknowledgeAlert)
-	g.POST("/alerts/:id/resolve", write, ctl.ResolveAlert)
-	g.GET("/alert-settings", read, ctl.GetSettings)
-	g.PUT("/alert-settings", write, ctl.PutSettings)
-	g.GET("/siem-endpoints", read, ctl.ListSIEMEndpoints)
-	g.POST("/siem-endpoints", write, ctl.CreateSIEMEndpoint)
-	g.DELETE("/siem-endpoints/:id", write, ctl.DeleteSIEMEndpoint)
-	g.POST("/siem-endpoints/:id/test", write, ctl.TestSIEMEndpoint)
+	g.GET("/alerts", read, ctl.requireSchema, ctl.ListAlerts)
+	g.GET("/alerts/:id", read, ctl.requireSchema, ctl.GetAlert)
+	g.POST("/alerts/:id/acknowledge", write, ctl.requireSchema, ctl.AcknowledgeAlert)
+	g.POST("/alerts/:id/resolve", write, ctl.requireSchema, ctl.ResolveAlert)
+	g.GET("/alert-settings", read, ctl.requireSchema, ctl.GetSettings)
+	g.PUT("/alert-settings", write, ctl.requireSchema, ctl.PutSettings)
+	g.GET("/siem-endpoints", read, ctl.requireSchema, ctl.ListSIEMEndpoints)
+	g.POST("/siem-endpoints", write, ctl.requireSchema, ctl.CreateSIEMEndpoint)
+	g.DELETE("/siem-endpoints/:id", write, ctl.requireSchema, ctl.DeleteSIEMEndpoint)
+	g.POST("/siem-endpoints/:id/test", write, ctl.requireSchema, ctl.TestSIEMEndpoint)
+}
+
+// requireSchema answers 503 with the reason until migration 150 verifies.
+func (ctl *AgentRuntimeAlertsController) requireSchema(c *gin.Context) {
+	// TENANT-EXEMPT: the 150 schema check reads the Postgres catalog only.
+	if err := services.RequireAgentAlerts(ctl.db()); err != nil {
+		govErrorOut(c, err)
+	}
 }
 
 // TENANT-EXEMPT: not a statement here: the service runs every statement in a

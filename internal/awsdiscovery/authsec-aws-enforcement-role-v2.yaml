@@ -319,6 +319,18 @@ Resources:
               # Q4 (EnableWorkloadContainment=true only): read and set an ECS
               # service's desired count (0 to contain, the recorded count on
               # release).
+              #
+              # BREADTH, stated plainly: IAM cannot limit ecs:UpdateService to
+              # the desired count. This grant also lets the role change any
+              # unprotected service's task definition, network configuration,
+              # capacity providers, deployment settings and ECS Exec.
+              # AuthSec's code only ever sets desiredCount. The service
+              # reference lists ecs:task-definition, ecs:capacity-provider,
+              # ecs:subnet and ecs:enable-execute-command as UpdateService
+              # condition keys, but whether they are present on a request that
+              # sets only desiredCount is UNVERIFIED, so no deny on them is
+              # added (it could refuse containment itself). Leave
+              # EnableWorkloadContainment 'false' if that is not acceptable.
               - !If
                 - EnableWorkloadContainmentCond
                 - Sid: ContainECSServices
@@ -329,20 +341,41 @@ Resources:
                   Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*'
                 - !Ref AWS::NoValue
 
+              # Q4 (EnableWorkloadContainment=true only): read an ECS service's
+              # Application Auto Scaling target. DescribeScalableTargets has no
+              # resource-level permission (service reference), so the
+              # resource is '*'; it reads, it changes nothing.
+              - !If
+                - EnableWorkloadContainmentCond
+                - Sid: ReadServiceScaling
+                  Effect: Allow
+                  Action:
+                    - application-autoscaling:DescribeScalableTargets
+                  Resource: '*'
+                - !Ref AWS::NoValue
+
               # Q4 (EnableWorkloadContainment=true only): suspend and resume an
               # ECS service's Application Auto Scaling, which would otherwise
-              # raise the desired count again. DescribeScalableTargets has no
-              # resource-level permission and a scalable target's ARN carries a
-              # random id, so the resource is '*'. AuthSec only ever
-              # re-registers an EXISTING target with its SuspendedState.
+              # raise the desired count again. Only scalable targets of this
+              # account, and only the ECS service desired-count dimension
+              # (application-autoscaling:service-namespace and
+              # :scalable-dimension, both RegisterScalableTarget condition keys
+              # in the service reference): no other service's capacity. A
+              # target's ARN ends in a random id, so it cannot be narrowed to
+              # one service. Within ECS desired count it could still set
+              # MinCapacity/MaxCapacity; AuthSec only ever re-registers an
+              # EXISTING target with its SuspendedState.
               - !If
                 - EnableWorkloadContainmentCond
                 - Sid: ContainServiceScaling
                   Effect: Allow
                   Action:
-                    - application-autoscaling:DescribeScalableTargets
                     - application-autoscaling:RegisterScalableTarget
-                  Resource: '*'
+                  Resource: !Sub 'arn:${AWS::Partition}:application-autoscaling:*:${AWS::AccountId}:scalable-target/*'
+                  Condition:
+                    StringEquals:
+                      application-autoscaling:service-namespace: ecs
+                      application-autoscaling:scalable-dimension: 'ecs:service:DesiredCount'
                 - !Ref AWS::NoValue
 
               # Q4 (EnableWorkloadContainment=true only): an agent on an IAM
@@ -458,10 +491,22 @@ Resources:
               # Never a function, service, scalable target or user you have
               # tagged authsec:protected=true, and never AuthSec's own (tagged
               # ManagedBy=AuthSec), as ProtectTaggedRoles does for roles.
-              # UNVERIFIED, check in the lab: that Lambda and ECS evaluate
-              # aws:ResourceTag on these actions, and that Application Auto
-              # Scaling reads the scalable target's own tags (not the ECS
-              # service's). AuthSec also refuses tagged resources itself.
+              #
+              # aws:ResourceTag, per the IAM service reference (2026-11-05): it
+              # is a condition key of the resource each action is authorized
+              # on -- Lambda function (PutFunctionConcurrency,
+              # DeleteFunctionConcurrency), ECS service (UpdateService; also
+              # ecs:ResourceTag), Application Auto Scaling ScalableTarget
+              # (RegisterScalableTarget) and IAM user (UpdateAccessKey,
+              # AttachUserPolicy, DetachUserPolicy). That each service enforces
+              # it on these calls is still to be confirmed in the lab.
+              #
+              # Application Auto Scaling evaluates the SCALABLE TARGET's own
+              # tags, not the ECS service's: tag a protected service's
+              # scalable target authsec:protected=true as well
+              # (aws application-autoscaling tag-resource), or its scaling can
+              # be suspended even though UpdateService on the service is
+              # refused. Do not rely on AuthSec's code to check tags for you.
               - !If
                 - EnableWorkloadContainmentCond
                 - Sid: ProtectTaggedContainmentTargets

@@ -5,15 +5,17 @@
   "summary": "Audit mode changes nothing in AWS. It describes what deny mode would refuse, so you can tag every agent before turning the gate on.",
   "would_deny": {
     "actions": [
-      "bedrock:InvokeModel*",
+      "bedrock:InvokeModel* (also Converse, ConverseStream and StartAsyncInvoke, which AWS authorizes as InvokeModel)",
       "bedrock:Converse*",
+      "bedrock:CreateModelInvocationJob",
       "bedrock:InvokeAgent",
       "bedrock:InvokeInlineAgent",
       "bedrock:RetrieveAndGenerate*",
       "bedrock:InvokeFlow",
-      "bedrock-mantle:* (UNVERIFIED action prefix)"
+      "bedrock-agentcore:InvokeAgentRuntime*",
+      "bedrock-mantle:CreateInference (that every mantle inference API is authorized as this action is UNVERIFIED)"
     ],
-    "unless": "the calling principal carries the authsec:agent tag (a role tag, an IAM user tag, or a session tag set by an administrator)",
+    "unless": "the calling principal carries a non-empty authsec:agent tag (a role tag, an IAM user tag, or a session tag set by an administrator)",
     "tag_protection": [
       "setting authsec:agent as a session tag (sts:TagSession, sts:AssumeRole* with tags)",
       "setting authsec:agent on a role or user (iam:TagRole, iam:TagUser, iam:CreateRole, iam:CreateUser)",
@@ -22,21 +24,25 @@
     ]
   },
   "affected": {
-    "scp": "Every principal in the targeted accounts that calls one of the actions above without the tag, except in the management account and service-linked roles (SCPs do not apply there).",
-    "policy": "Only the roles you attach the AuthSec policy to, when they call one of the actions above without the tag."
+    "scp": "Every principal in the targeted accounts that calls one of the actions above without the tag, except in the management account and service-linked roles (SCPs do not apply there). The SCP stops tagging only by principals inside your organization: deploy the RCP form with it to stop session tags set by outside assumers and identity providers.",
+    "rcp": "No model call: the RCP refuses setting authsec:agent as a session tag when any caller (another account, a SAML or OIDC identity provider, or a principal in your organization) assumes a role in the targeted accounts, except the administrator principals you name. Identity providers may no longer issue authsec:agent as a session tag. Deploy it together with the SCP form.",
+    "policy": "Only the roles you attach the AuthSec policy to, when they call one of the actions above without the tag. It cannot stop whoever assumes a gated role from setting authsec:agent as a session tag: that is authorized by the role's trust policy, not by the gate."
   },
   "report": [
     "In AuthSec, open the AI workloads of this account: every identity listed there was seen calling a model (CloudTrail).",
-    "Each identity without the authsec:agent tag is one deny mode would refuse. For a shared role, every workload on it is refused together.",
-    "Model calls through the agents runtime, bedrock-mantle and AgentCore appear only with the event stream and its data events turned on; without them, an untagged caller of those endpoints is not in the list and would still be refused.",
+    "Each identity without the authsec:agent tag, or with it set to an empty value, is one deny mode would refuse. For a shared role, every workload on it is refused together.",
+    "Bedrock's own service roles count as callers: the roles a Bedrock agent, knowledge base, flow, batch inference job or AgentCore runtime runs as make their own model calls and appear here under those roles.",
+    "Model calls through the agents runtime, bedrock-mantle and AgentCore are CloudTrail data events: AuthSec sees them only with the event stream and its data events turned on. Without them, an untagged caller of those endpoints is missing from this list, but deny mode would still refuse it, so you would first learn of it as a refused call.",
+    "Check every role you will gate for session tags: a trust policy that allows sts:TagSession without an aws:TagKeys condition excluding authsec:agent lets whoever assumes the role tag the session and pass the gate. The SCP and RCP forms together refuse that; the policy form alone does not. AuthSec does not check trust policies for this: review them yourself.",
     "After deny mode is on, refused calls appear in AuthSec as refused model calls with the identity, so anything missed here shows up there."
   ],
   "tagging_guide": [
-    "Decide which roles are agents. Tag only those: the tag is what lets them call models once the gate is on.",
+    "Decide which roles are agents. Tag only those: the tag is what lets them call models once the gate is on. The value must not be empty.",
     "Tag a role: aws iam tag-role --role-name <role> --tags Key=authsec:agent,Value=<agent name>",
     "Tag an IAM user (prefer moving the agent to a role): aws iam tag-user --user-name <user> --tags Key=authsec:agent,Value=<agent name>",
+    "Tag the roles Bedrock assumes for your agents as well, or their model calls are refused: the agent service role (AmazonBedrockExecutionRoleForAgents_*), the knowledge base service role (AmazonBedrockExecutionRoleForKnowledgeBase_*), the flow service role, the batch inference (model invocation job) service role, and the AgentCore runtime execution role. Names are the console defaults; use the role each resource actually names.",
     "Tag with the principals you will name as administrators: deny mode refuses everyone else setting or removing the tag, including pipelines and CloudFormation roles you do not list.",
-    "Do not pass authsec:agent as a session tag from an application; set it on the role.",
-    "Re-scan in AuthSec and check that no identity you want to keep calling models is still untagged, then deploy the deny template for your form (mode=deny)."
+    "Do not pass authsec:agent as a session tag from an application or an identity provider; set it on the role.",
+    "Re-scan in AuthSec and check that no identity you want to keep calling models is still untagged, then deploy the deny template for your form (mode=deny), and with Organizations also form=rcp."
   ]
 }

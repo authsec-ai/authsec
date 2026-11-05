@@ -111,6 +111,7 @@ const (
 	GovEventContainmentFailed          = "containment.failed"
 	GovEventContainmentVerified        = "containment.verified"
 	GovEventContainmentNotEffective    = "containment.not_effective"
+	GovEventContainmentUnverifiable    = "containment.unverifiable"
 	GovEventContainmentDrifted         = "containment.drifted"
 	GovEventContainmentReleaseReq      = "containment.release_requested"
 	GovEventContainmentStepRestored    = "containment.step_restored"
@@ -137,6 +138,7 @@ func init() {
 		GovEventKind{GovEventContainmentPartial, GovCatAgentContainment, GovObjContainment, "Some containment changes are in place; others were refused."},
 		GovEventKind{GovEventContainmentFailed, GovCatAgentContainment, GovObjContainment, "No containment change could be applied."},
 		GovEventKind{GovEventContainmentVerified, GovCatAgentContainment, GovObjContainment, "No successful call by the contained identity was seen after the grace period."},
+		GovEventKind{GovEventContainmentUnverifiable, GovCatAgentContainment, GovObjContainment, "The containment's effect cannot be confirmed from CloudTrail (no events received since it, or its workloads cannot be told apart); it is neither verified nor not effective."},
 		GovEventKind{GovEventContainmentNotEffective, GovCatAgentContainment, GovObjContainment, "A successful call by the contained identity after the grace period: the containment is not effective (events attached)."},
 		GovEventKind{GovEventContainmentDrifted, GovCatAgentContainment, GovObjContainment, "A containment change was undone outside AuthSec (read back while contained)."},
 		GovEventKind{GovEventContainmentReleaseReq, GovCatAgentContainment, GovObjContainment, "Release of a containment was requested (with a reason)."},
@@ -148,7 +150,7 @@ func init() {
 }
 
 // AgentContainSchemaHead is the migration containment needs.
-const AgentContainSchemaHead = "151"
+const AgentContainSchemaHead = "152"
 
 var agentContainSchema struct {
 	sync.Mutex
@@ -157,10 +159,10 @@ var agentContainSchema struct {
 	at     time.Time
 }
 
-// VerifyAgentContainSchema checks 151's objects.
+// VerifyAgentContainSchema checks 151's objects and 152's index.
 func VerifyAgentContainSchema(db *gorm.DB) error {
 	var missing []string
-	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live"} {
+	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target"} {
 		ok, err := repositories.HasRelation(db, rel)
 		if err != nil {
 			return fmt.Errorf("agent containment schema verification could not run: %w", err)

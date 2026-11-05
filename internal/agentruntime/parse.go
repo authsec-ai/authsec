@@ -121,6 +121,30 @@ func ParseCloudTrailRecord(raw []byte) (Event, error) {
 			e.RequestFacts[fk] = s
 		}
 	}
+	if raw, ok := r.RequestParameters["withDecryption"]; ok {
+		var b bool
+		if json.Unmarshal(raw, &b) == nil {
+			if e.RequestFacts == nil {
+				e.RequestFacts = map[string]string{}
+			}
+			e.RequestFacts[FactWithDecryption] = fmt.Sprintf("%t", b)
+		}
+	}
+	if raw, ok := r.RequestParameters["encryptionContext"]; ok {
+		var ctx map[string]json.RawMessage
+		if json.Unmarshal(raw, &ctx) == nil {
+			for k := range ctx {
+				lk := strings.ToLower(k)
+				if lk == "secretarn" || lk == "parameter_arn" || strings.HasPrefix(lk, "aws:secretsmanager:") || strings.HasPrefix(lk, "aws:ssm:") {
+					if e.RequestFacts == nil {
+						e.RequestFacts = map[string]string{}
+					}
+					e.RequestFacts[FactSecretContext] = "true"
+					break
+				}
+			}
+		}
+	}
 	for _, res := range r.Resources {
 		if res.ARN != "" {
 			e.Resources = append(e.Resources, res.ARN)

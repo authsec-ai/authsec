@@ -135,6 +135,11 @@ const (
 	WorkloadECSTaskDef = "ecs_task_definition"
 	WorkloadEC2        = "ec2_instance"
 	WorkloadEKSPod     = "eks_service_account"
+	// WorkloadAssumer is any other principal the identity's trust policy lets
+	// assume it (another identity, a CI pipeline, an external account, SAML
+	// federation, an AWS service): part of the blast radius of an identity or
+	// model containment, never stopped by a workload containment.
+	WorkloadAssumer = "assume_principal"
 )
 
 // Refusal codes (preview and create).
@@ -150,6 +155,7 @@ const (
 	RefuseWorkloadUnavailable = "workload_containment_unavailable"
 	RefuseUserNeedsParameter  = "iam_user_needs_workload_containment"
 	RefuseNoECSService        = "no_ecs_service"
+	RefuseTagsUnread          = "tags_unread"
 	RefuseBindingUnavailable  = "binding_unavailable"
 	RefuseIAMUserModelOnly    = "iam_user_workload_level"
 	RefuseIdentityUnknown     = "identity_detail_incomplete"

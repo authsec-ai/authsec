@@ -61,7 +61,24 @@ const (
 const (
 	SupersededClassified = "classified"
 	SupersededSharedRole = "shared_role"
+	// The workload now runs as another identity than the one the suggestion
+	// was made for.
+	SupersededIdentityChanged = "identity_changed"
+	// No model call by the identity inside the evaluation window
+	// (AgentRuntimeWindowDays): the evidence the suggestion rested on lapsed.
+	SupersededNoModelCalls = "no_model_calls"
 )
+
+// suggestionReproposable: a suggestion the system closed for a reason that can
+// stop holding is proposed again when the rule matches again. A
+// classification, a retirement and a person's decision are final.
+func suggestionReproposable(reason string) bool {
+	switch reason {
+	case SupersededSharedRole, SupersededIdentityChanged, SupersededNoModelCalls:
+		return true
+	}
+	return false
+}
 
 // agent_finding kinds and states (§5.5).
 const (
@@ -155,6 +172,7 @@ func (s *AgentRuntimeService) RunAgentInference(ctx context.Context, ws, connect
 		if _, ok := st.connectors[connectorID]; !ok {
 			return nil // not an AWS connector of this workspace: nothing to infer
 		}
+		st.now = now
 		ais := st.aiWorkloads()
 		res.AIWorkloads = len(ais)
 
@@ -247,7 +265,17 @@ type arUsage struct {
 	ConnectorID uuid.UUID
 	IdentityID  uuid.UUID
 	Attrs       json.RawMessage
-	usage       agentruntime.ModelCallUsage
+	// usage is the cumulative document; doc also carries the per-day buckets
+	// the rule and the findings read through windowed.
+	usage agentruntime.ModelCallUsage
+	doc   modelCallDoc
+}
+
+// windowed is the evidence of the last AgentRuntimeWindowDays days.
+func (u *arUsage) windowed(now time.Time) agentruntime.ModelCallUsage {
+	doc := u.doc
+	doc.ModelCallUsage = u.usage
+	return doc.windowedUsage(now)
 }
 
 type arEdge struct {
@@ -275,8 +303,20 @@ type agentRuntimeState struct {
 	workloads    map[uuid.UUID][]*arWorkload // by identity
 	k8s          map[uuid.UUID][]string      // k8s service accounts, by identity
 	saml         map[uuid.UUID]bool          // identities a SAML provider may assume
+	others       map[uuid.UUID]bool          // identities another principal may assume (human, IAM, CI, external)
 	suggestions  map[uuid.UUID]*arSuggestion // by graph workload id
 	openFindings map[uuid.UUID]int           // open findings, by identity
+
+	// now is the clock the evaluation window is read against; zero: the real
+	// clock.
+	now time.Time
+}
+
+func (st *agentRuntimeState) clock() time.Time {
+	if st.now.IsZero() {
+		return time.Now().UTC()
+	}
+	return st.now
 }
 
 // loadAgentRuntimeState reads the state for the workspace, optionally only one
@@ -287,12 +327,14 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 		connectors: map[uuid.UUID]arConnector{}, identities: map[uuid.UUID]*arIdentity{},
 		usage: map[uuid.UUID]*arUsage{}, workloads: map[uuid.UUID][]*arWorkload{},
 		k8s: map[uuid.UUID][]string{}, saml: map[uuid.UUID]bool{},
+		others:      map[uuid.UUID]bool{},
 		suggestions: map[uuid.UUID]*arSuggestion{}, openFindings: map[uuid.UUID]int{},
+		now: time.Now().UTC(),
 	}
 
 	var conns []arConnector
 	q := tx.Table("cloud_connector").Select("id, scope_id, attrs").
-		Where("workspace_id = ? AND provider = ?", ws, models.CloudProviderAWS)
+		Where("workspace_id = ? AND provider = ? AND status <> ?", ws, models.CloudProviderAWS, models.CloudConnectorRevoked)
 	if connector != nil {
 		q = q.Where("id = ?", *connector)
 	}
@@ -324,8 +366,9 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 	idSet := map[uuid.UUID]bool{}
 	for _, u := range usage {
 		if len(u.Attrs) > 0 {
-			_ = json.Unmarshal(u.Attrs, &u.usage)
+			_ = json.Unmarshal(u.Attrs, &u.doc)
 		}
+		u.usage = u.doc.ModelCallUsage
 		st.usage[u.IdentityID] = u
 		idSet[u.IdentityID] = true
 	}
@@ -366,8 +409,8 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 
 	var edges []arEdge
 	if err := tx.Table("cloud_assume_edge").Select("identity_id, subject_kind, subject, mechanism, k8s_ref").
-		Where("workspace_id = ? AND identity_id IN ? AND (subject_kind = ? OR mechanism = ?)",
-			ws, ids, models.AssumeSubjectK8sSA, arMechanismSAML).Scan(&edges).Error; err != nil {
+		Where("workspace_id = ? AND identity_id IN ? AND (subject_kind <> ? OR mechanism = ?)",
+			ws, ids, models.AssumeSubjectCloudService, arMechanismSAML).Scan(&edges).Error; err != nil {
 		return nil, fmt.Errorf("read assume edges: %w", err)
 	}
 	for _, e := range edges {
@@ -378,8 +421,15 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 				ref = *e.K8sRef
 			}
 			st.k8s[e.IdentityID] = arAppendUnique(st.k8s[e.IdentityID], ref)
-		case e.Mechanism == arMechanismSAML:
-			st.saml[e.IdentityID] = true
+		default:
+			// Any other principal that may assume the role: a person (SAML,
+			// Identity Center), an IAM user or role, a CI pipeline or an
+			// external account. Their calls cannot be told from a workload's
+			// (§10 Q1), so the role is not one workload's.
+			if e.Mechanism == arMechanismSAML {
+				st.saml[e.IdentityID] = true
+			}
+			st.others[e.IdentityID] = true
 		}
 	}
 
@@ -501,6 +551,12 @@ type AIWorkload struct {
 	ident  *arIdentity
 	wls    []*arWorkload
 	usageR *arUsage
+	// win is the evidence of the last AgentRuntimeWindowDays days: what the
+	// rule and the findings evaluate. Calls, Models, ... above stay the
+	// cumulative totals.
+	win agentruntime.ModelCallUsage
+	// others: another principal than a workload may assume the identity.
+	others bool
 }
 
 // AIIdentityRef is the identity the calls are attributed to.
@@ -588,6 +644,7 @@ func (st *agentRuntimeState) buildAIWorkload(ident *arIdentity, u *arUsage) *AIW
 		OpenFindings: st.openFindings[ident.ID],
 		UsageID:      u.ID,
 		ident:        ident, wls: wls, usageR: u,
+		win: u.windowed(st.clock()), others: st.others[ident.ID],
 	}
 	for _, w := range wls {
 		ai.Workloads = append(ai.Workloads, AIWorkloadRef{CloudWorkloadID: w.ID, WorkloadID: w.GraphID,
@@ -605,9 +662,11 @@ func (st *agentRuntimeState) buildAIWorkload(ident *arIdentity, u *arUsage) *AIW
 }
 
 // single is the AI workload's one workload: exactly one candidate on the
-// identity and it is a collected workload (not an EKS service account).
+// identity, a collected workload (not an EKS service account), and no other
+// principal (a person, an IAM user, CI, an external account) that may assume
+// the role.
 func (ai *AIWorkload) single() *arWorkload {
-	if len(ai.wls) == 1 && len(ai.K8sServiceAccounts) == 0 {
+	if len(ai.wls) == 1 && len(ai.K8sServiceAccounts) == 0 && !ai.others {
 		return ai.wls[0]
 	}
 	return nil
@@ -631,8 +690,8 @@ func (st *agentRuntimeState) label(ai *AIWorkload) string {
 			switch {
 			case s.State == SuggestionPending:
 				return agentruntime.LabelSuggestedAgent
-			case s.State == SuggestionSuperseded && s.Reason == SupersededSharedRole:
-				// The role was split since: the rule decides again below.
+			case s.State == SuggestionSuperseded && suggestionReproposable(s.Reason):
+				// What closed it no longer holds: the rule decides again below.
 			default:
 				// Dismissed, confirmed, or superseded by a classification: this
 				// incarnation is never suggested again.
@@ -640,10 +699,21 @@ func (st *agentRuntimeState) label(ai *AIWorkload) string {
 			}
 		}
 	}
-	if ok, _ := suggestEligible(ai.usageR.usage, ai.single(), len(ai.wls)+len(ai.K8sServiceAccounts)); ok {
+	if ok, _ := suggestEligible(ai.win, ai.single(), ai.candidates()); ok {
 		return agentruntime.LabelSuggestedAgent
 	}
 	return agentruntime.LabelAIWorkload
+}
+
+// candidates is how many principals the identity's calls may belong to: its
+// workloads, its EKS service accounts, and one for every other kind of
+// assumer.
+func (ai *AIWorkload) candidates() int {
+	n := len(ai.wls) + len(ai.K8sServiceAccounts)
+	if ai.others {
+		n++
+	}
+	return n
 }
 
 func arClassification(w *arWorkload) string {
@@ -764,8 +834,14 @@ func (r *agentRuntimeResolver) Resolve(ctx context.Context, ws, connectorID uuid
 	}
 	err := tenancy.InWorkspaceRead(ctx, r.db, ws, func(tx *gorm.DB) error {
 		var idents []*arIdentity
-		if err := tx.Table("cloud_identity").Select("id, connector_id, kind, native_id, name, attrs").
-			Where("workspace_id = ? AND native_id = ?", ws, a.ARN).Limit(1).Scan(&idents).Error; err != nil {
+		q := tx.Table("cloud_identity").Select("id, connector_id, kind, native_id, name, attrs").
+			Where("workspace_id = ? AND native_id = ?", ws, a.ARN)
+		if connectorID != uuid.Nil {
+			// The account the event came from: the same ARN in another
+			// connector is another account's identity.
+			q = q.Where("connector_id = ?", connectorID)
+		}
+		if err := q.Order("id").Limit(1).Scan(&idents).Error; err != nil {
 			return err
 		}
 		if len(idents) == 0 {
@@ -858,16 +934,69 @@ func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time)
 	}
 	repo := repositories.NewDiscoveryRepository(tx)
 	n := 0
+	agents := map[string]bool{}  // fingerprints of workloads that are agents now
+	present := map[string]bool{} // fingerprints of workloads the inventory still holds
 	for _, w := range wls {
+		fp := AWSAgentFingerprint(conn.ScopeID, w.RuntimeKind, w.NativeID)
+		present[fp] = true
 		if w.GraphID == nil || !w.isAgent() {
 			continue
 		}
 		if _, _, err := repo.UpsertSighting(awsAgentSighting(ws, conn, w, identityARN, now)); err != nil {
 			return n, fmt.Errorf("mirror %s: %w", w.NativeID, err)
 		}
+		agents[fp] = true
 		n++
 	}
+	if err := retireAWSAgents(tx, repo, ws, conn, agents, present, now); err != nil {
+		return n, err
+	}
 	return n, nil
+}
+
+// retireAWSAgents closes the connector's mirrored agents that are not agents
+// of this pass, the way Azure closes the ones a tenant pass no longer saw
+// (retireAzureAgents): a lifecycle event (absent, no actor) sets the runtime
+// status to gone and records why; the row is never deleted and a person's
+// decision on it (status, owner) is never changed. An agent seen again is
+// refreshed by its next sighting (it carries a newer runtime observation).
+//
+// A workload the inventory still holds but the graph no longer calls an agent
+// was reclassified; one it no longer holds was deleted or aged out (cloud_workload
+// rows are removed only by a surface the scan read completely, so a partial
+// scan never retires anything here). Rows of other connectors are untouched.
+func retireAWSAgents(tx *gorm.DB, repo repositories.DiscoveryRepository, ws uuid.UUID, conn arConnector,
+	agents, present map[string]bool, now time.Time) error {
+	var rows []struct{ Fingerprint string }
+	if err := tx.Table("discovered_agents").Select("fingerprint").
+		Where("workspace_id = ? AND source = ? AND metadata->>'connector_id' = ? AND runtime_status <> ?",
+			ws, models.DiscoverySourceAWS, conn.ID.String(), models.RuntimeStatusGone).
+		Scan(&rows).Error; err != nil {
+		return fmt.Errorf("read mirrored agents: %w", err)
+	}
+	for _, r := range rows {
+		if agents[r.Fingerprint] {
+			continue
+		}
+		reason := "its workload is no longer in the AWS inventory"
+		if present[r.Fingerprint] {
+			reason = "its workload is no longer classified as an agent"
+		}
+		if _, err := repo.ApplyLifecycleEvent(&models.DiscoveredAgentEvent{
+			WorkspaceID:   ws,
+			Source:        models.DiscoverySourceAWS,
+			Fingerprint:   r.Fingerprint,
+			Event:         models.AgentEventAbsent,
+			RuntimeStatus: models.RuntimeStatusGone,
+			Reason:        reason,
+			// No actor: a pass can show an agent is missing, never who removed it.
+			Channel:    "aws_agent_inference",
+			ObservedAt: now,
+		}); err != nil {
+			return fmt.Errorf("retire %s: %w", r.Fingerprint, err)
+		}
+	}
+	return nil
 }
 
 func awsAgentSighting(ws uuid.UUID, conn arConnector, w *arWorkload, identityARN map[uuid.UUID]string, now time.Time) *models.DiscoveredAgent {
@@ -902,9 +1031,13 @@ func awsAgentSighting(ws uuid.UUID, conn arConnector, w *arWorkload, identityARN
 		EvidenceMode:     mode,
 		// No LastObservedRunningAt: a declared row may not carry one (database
 		// constraint), and classification is not an observation that it ran.
-		Status:        models.DiscoveredAgentUnregistered,
-		RuntimeStatus: models.RuntimeStatusUnknown,
-		FirstSeenAt:   now, LastSeenAt: now, SightingCount: 1,
+		// The runtime observation is the pass itself, as Azure's sightings: an
+		// agent retired by an earlier pass is refreshed when seen again
+		// (UpsertSighting applies only an observation at least as recent).
+		Status:            models.DiscoveredAgentUnregistered,
+		RuntimeStatus:     models.RuntimeStatusUnknown,
+		RuntimeObservedAt: &now,
+		FirstSeenAt:       now, LastSeenAt: now, SightingCount: 1,
 		CreatedBy: "aws-discovery",
 	}
 }

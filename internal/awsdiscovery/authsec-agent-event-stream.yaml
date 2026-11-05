@@ -21,6 +21,38 @@ Description: >-
 # a trail whose selectors include them, and CloudTrail charges for them: the
 # DataEvents* parameters add them to the trail this stack creates; for your
 # own trail, add the same selectors to it yourself.
+#
+# STACKSETS: CreateTrail=true in every region's instance creates one
+# multi-region trail PER REGION -- duplicate trails, each copy of management
+# events beyond the first charged by CloudTrail. Deploy the StackSet with
+# CreateTrail=false and set it to true in one region's stack only (a
+# parameter override), or keep your own trail.
+#
+# WHAT IS FORWARDED (the rule's pattern). Every event of the model
+# endpoints (bedrock, bedrock-mantle, bedrock-agentcore), IAM, Secrets
+# Manager, CloudTrail and Lambda. From the busy read-heavy sources (KMS, STS,
+# S3, SSM, CloudWatch Logs) only what detections D1-D8 and the model-call
+# evidence use, and never a call an AWS service made on the caller's behalf
+# (userIdentity.invokedBy set): writes (readOnly false; not Logs, whose
+# writes are the workload's own telemetry), the calls D1, D2, D4 and D7
+# read (kms:Decrypt, sts:AssumeRole, sts:GetFederationToken,
+# ssm:GetParameter/GetParameters/GetParametersByPath, s3:GetObject when S3
+# data events are on, logs:DeleteLogGroup), and authorization denials (D5).
+# Everything else from those sources reaches AuthSec only through polling
+# during scans.
+#
+# COST, beyond the trail: EventBridge charges for API destination
+# invocations (USD 0.20 per million in us-east-1 at the time of writing; one
+# per forwarded event); CloudTrail charges for data events per event and for
+# any copy of management events beyond the first trail; the dead-letter
+# queue and its alarm cost SQS requests and one CloudWatch alarm. Matching
+# AWS service events on the default bus is not charged.
+#
+# DELIVERY FAILURES. An event AuthSec refuses (401 after the secret was
+# rotated or revoked, 413) is not retried, and one still undelivered after
+# 24 hours of retries is dropped: both go to the SQS dead-letter queue below
+# (kept 14 days, encrypted) and its alarm fires. Redrive or inspect them
+# there.
 
 Metadata:
   AuthSec:
@@ -51,6 +83,7 @@ Metadata:
           default: Delivery
         Parameters:
           - InvocationRateLimit
+          - DeadLetterAlarmTopicArn
 
 Parameters:
 
@@ -89,9 +122,10 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       'true' creates a multi-region trail (and its S3 bucket) logging all
-      management events, plus the data events chosen below. Set it in one
-      region only. 'false' reuses a trail you already have, which must log
-      management events (read and write) in this region.
+      management events, plus the data events chosen below. Set it in ONE
+      region only: in a StackSet, 'true' in every region creates a duplicate
+      trail per region, each charged. 'false' reuses a trail you already have,
+      which must log management events (read and write) in this region.
 
   DataEventsBedrockAgents:
     Type: String
@@ -158,7 +192,16 @@ Parameters:
     MaxValue: 300
     Description: >-
       The most events per second EventBridge sends to AuthSec. Events above it
-      wait in EventBridge and are retried for up to 24 hours.
+      wait in EventBridge and are retried for up to 24 hours, then go to the
+      dead-letter queue.
+
+  DeadLetterAlarmTopicArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$'
+    Description: >-
+      Optional SNS topic the dead-letter alarm notifies. Empty: the alarm is
+      only shown in CloudWatch.
 
 Conditions:
 
@@ -170,6 +213,7 @@ Conditions:
     - !Not [!Equals [!Ref MantleDataResourceType, '']]
   AgentCoreCond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsAgentCore, 'true']]
   S3Cond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsS3, 'true']]
+  HasAlarmTopic: !Not [!Equals [!Ref DeadLetterAlarmTopicArn, '']]
 
 Resources:
 
@@ -368,6 +412,7 @@ Resources:
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/AuthSecAgentRuntime-${ConnectorId}'
       Policies:
         - PolicyName: InvokeAuthSecApiDestination
           PolicyDocument:
@@ -382,12 +427,73 @@ Resources:
         - Key: authsec:connector
           Value: !Ref ConnectorId
 
+  # Events EventBridge could not deliver: refused by AuthSec (401, 413 and
+  # other non-retryable answers) or still failing after 24 hours. Encrypted
+  # with SQS-managed keys; only this rule may send to it.
+  AuthSecEventDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+        - Key: authsec:connector
+          Value: !Ref ConnectorId
+
+  AuthSecEventDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuthSecEventDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthSecEventRuleDeadLetters
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AuthSecEventDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AuthSecEventRule.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt AuthSecEventDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # Any dead letter means events AuthSec did not get.
+  AuthSecEventDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: AuthSec agent runtime event stream - events EventBridge could not deliver to AuthSec are waiting in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AuthSecEventDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref DeadLetterAlarmTopicArn], !Ref AWS::NoValue]
+
   # CloudTrail events from the services AuthSec reads. The state is what
   # makes read-only management events (Converse, InvokeModel, Get*) reach
-  # the rule at all.
+  # the rule at all. The rule is named so the invoke role's trust can name
+  # it (aws:SourceArn); a stack created before the name was set replaces the
+  # rule on update.
   AuthSecEventRule:
     Type: AWS::Events::Rule
     Properties:
+      Name: !Sub 'AuthSecAgentRuntime-${ConnectorId}'
       Description: AuthSec agent runtime - CloudTrail events of model calls and what follows them
       State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
       EventPattern:
@@ -395,19 +501,58 @@ Resources:
           - AWS API Call via CloudTrail
           - AWS Service Event via CloudTrail
         detail:
-          eventSource:
-            - bedrock.amazonaws.com
-            - !Ref MantleEventSource
-            - bedrock-agentcore.amazonaws.com
-            - iam.amazonaws.com
-            - sts.amazonaws.com
-            - secretsmanager.amazonaws.com
-            - ssm.amazonaws.com
-            - kms.amazonaws.com
-            - cloudtrail.amazonaws.com
-            - s3.amazonaws.com
-            - lambda.amazonaws.com
-            - logs.amazonaws.com
+          $or:
+            # Everything from the model endpoints and the low-volume sources.
+            - eventSource:
+                - bedrock.amazonaws.com
+                - !Ref MantleEventSource
+                - bedrock-agentcore.amazonaws.com
+                - iam.amazonaws.com
+                - secretsmanager.amazonaws.com
+                - cloudtrail.amazonaws.com
+                - lambda.amazonaws.com
+            # Busy sources: writes, by the caller itself.
+            - eventSource:
+                - kms.amazonaws.com
+                - sts.amazonaws.com
+                - s3.amazonaws.com
+                - ssm.amazonaws.com
+              readOnly: [false]
+              userIdentity:
+                invokedBy: [{exists: false}]
+            # Busy sources: the reads detections use (D1, D2, D4, D7), by the
+            # caller itself.
+            - eventSource:
+                - kms.amazonaws.com
+                - sts.amazonaws.com
+                - s3.amazonaws.com
+                - ssm.amazonaws.com
+                - logs.amazonaws.com
+              eventName:
+                - Decrypt
+                - AssumeRole
+                - GetFederationToken
+                - GetParameter
+                - GetParameters
+                - GetParametersByPath
+                - GetObject
+                - DeleteLogGroup
+              userIdentity:
+                invokedBy: [{exists: false}]
+            # Busy sources: authorization denials (D5), by the caller itself.
+            - eventSource:
+                - kms.amazonaws.com
+                - sts.amazonaws.com
+                - s3.amazonaws.com
+                - ssm.amazonaws.com
+                - logs.amazonaws.com
+              errorCode:
+                - AccessDenied
+                - AccessDeniedException
+                - UnauthorizedOperation
+                - Client.UnauthorizedOperation
+              userIdentity:
+                invokedBy: [{exists: false}]
       Targets:
         - Id: AuthSecIngest
           Arn: !GetAtt AuthSecEventApiDestination.Arn
@@ -415,6 +560,8 @@ Resources:
           RetryPolicy:
             MaximumRetryAttempts: 185
             MaximumEventAgeInSeconds: 86400
+          DeadLetterConfig:
+            Arn: !GetAtt AuthSecEventDeadLetterQueue.Arn
 
 Outputs:
   TemplateVersion:
@@ -426,6 +573,9 @@ Outputs:
   ApiDestinationArn:
     Description: The API destination for the AuthSec ingest endpoint.
     Value: !GetAtt AuthSecEventApiDestination.Arn
+  DeadLetterQueueUrl:
+    Description: The queue holding events EventBridge could not deliver to AuthSec.
+    Value: !Ref AuthSecEventDeadLetterQueue
   TrailArn:
     Condition: CreateTrailCond
     Description: The trail this stack created.

@@ -54,6 +54,10 @@ type Workload struct {
 	ECSServices []ECSService `json:"ecs_services,omitempty"`
 	// ECSServicesRead is false when the services could not be read.
 	ECSServicesRead bool `json:"ecs_services_read"`
+	// TagsRead is true when the function's tags were read live (Tags is then
+	// authoritative); a Lambda function whose tags could not be read is
+	// refused, because authsec:protected cannot be checked.
+	TagsRead bool `json:"tags_read"`
 	// EventSourceMappings is the Lambda function's event source mapping
 	// count, -1 when unread.
 	EventSourceMappings int `json:"event_source_mappings"`
@@ -280,6 +284,11 @@ func workloadLevel(in PreviewInput, idRef []Refusal) LevelOption {
 
 		switch w.Kind {
 		case WorkloadLambda:
+			if !w.TagsRead {
+				o.Refusals = append(o.Refusals, Refusal{Code: RefuseTagsUnread, WorkloadID: &id,
+					Message: "The tags of " + w.Name + " could not be read, so AuthSec cannot check authsec:protected; preview again."})
+				continue
+			}
 			if Protected(w.Tags) {
 				o.Refusals = append(o.Refusals, Refusal{Code: RefuseProtected, WorkloadID: &id,
 					Message: w.Name + " is tagged authsec:protected=true; AuthSec never changes it."})
@@ -457,6 +466,8 @@ func kindWords(k string) string {
 		return "an EC2 instance"
 	case WorkloadEKSPod:
 		return "an EKS pod (IRSA / Pod Identity)"
+	case WorkloadAssumer:
+		return "a principal the role's trust policy lets assume it (not compute AuthSec can stop)"
 	case WorkloadLambda:
 		return "a Lambda function"
 	case WorkloadECSTaskDef:

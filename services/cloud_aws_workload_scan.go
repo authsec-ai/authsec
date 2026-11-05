@@ -171,6 +171,12 @@ type WorkloadSnapshot struct {
 	// ModelCallUsageWritten counts the cloud_usage model-call rows written
 	// (source cloudtrail, service bedrock; §5.1), across regions.
 	ModelCallUsageWritten int
+	// regions are the connector's selected regions for this scan.
+	regions []string
+	// trackedFrom is the oldest counted-event id kept for the connector,
+	// read once per scan (trackedKnown) before any region writes.
+	trackedFrom  *time.Time
+	trackedKnown bool
 	// Warnings are failures that cost evidence but not the scan: the focused
 	// Bedrock CloudTrail pass, the model-call evidence write, the dispatch to
 	// agent-runtime sinks. Never a reason to fail or to mark coverage.
@@ -201,6 +207,7 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	}
 	connAttrs := connector.AWSAttrs()
 	regions := connAttrs.Regions
+	out.regions = regions
 	// The scope a constructed ARN is built in (T3.6): the connector's own
 	// partition and account, never assumed.
 	scope := arnScope{partition: connAttrs.Partition, account: snapshot.AccountID}
@@ -782,26 +789,61 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 	out.Surfaces[key] = legacyTrailCoverage(general, err)
 
 	if evidenceOK {
-		w := modelCallWrite{
-			WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
-			Generation: snapshot.Generation, Region: region,
-			Reads: reads, Errors: readErrs,
-			Deltas: aggregateModelCalls(general, bedrock, records, modelCallResolverFrom(resolve)),
+		// The reads overlap the previous ones by awsdiscovery.TrailLateLookback:
+		// events already counted are skipped by their id.
+		from := general.WindowFrom
+		if !bedrock.WindowFrom.IsZero() && (from.IsZero() || bedrock.WindowFrom.Before(from)) {
+			from = bedrock.WindowFrom
 		}
-		n, werr := store.Record(ctx, w)
-		if werr != nil {
-			warn("recording model-call evidence: %v", werr)
+		seen, serr := store.SeenEvents(ctx, workspaceID, snapshot.ConnectorID, from)
+		if serr != nil {
+			warn("reading counted events: %v; model-call evidence skipped this scan", serr)
+			evidenceOK = false
 		}
-		out.ModelCallUsageWritten += n
+		counting := unseenRecords(records, seen)
+		// Whether ids are tracked for this connector is decided once per scan,
+		// before any region writes, so every region sees the same answer.
+		if evidenceOK && !out.trackedKnown {
+			out.trackedFrom, serr = store.TrackedFrom(ctx, workspaceID, snapshot.ConnectorID)
+			if serr != nil {
+				warn("reading counted-event tracking: %v; model-call evidence skipped this scan", serr)
+				evidenceOK = false
+			}
+			out.trackedKnown = serr == nil
+		}
+		cgeneral, cbedrock := countFloored(general, out.trackedFrom), countFloored(bedrock, out.trackedFrom)
+		if evidenceOK {
+			w := modelCallWrite{
+				WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
+				Generation: snapshot.Generation, Region: region,
+				Reads: reads, Errors: readErrs, CurrentRegions: out.regions,
+				Deltas: aggregateModelCalls(cgeneral, cbedrock, counting, modelCallResolverFrom(resolve)),
+				Root:   aggregateRootModelCalls(cgeneral, cbedrock, counting),
+			}
+			n, werr := store.Record(ctx, w)
+			if werr != nil {
+				warn("recording model-call evidence: %v", werr)
+			}
+			out.ModelCallUsageWritten += n
+		}
 	}
 
 	normalised := make([]agentruntime.Event, 0, len(records))
 	for _, rec := range records {
 		normalised = append(normalised, rec.Event)
 	}
-	if derr := agentruntime.Dispatch(ctx, workspaceID, snapshot.ConnectorID, normalised); derr != nil {
-		warn("agent-runtime dispatch: %v", derr)
-	}
+	// A sink that panics must not take the scan down with it (the dispatch is
+	// bonus evidence, never a reason to fail one).
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				warn("agent-runtime dispatch panicked: %v", r)
+			}
+		}()
+		if derr := agentruntime.Dispatch(ctx, workspaceID, snapshot.ConnectorID, normalised); derr != nil {
+			warn("agent-runtime dispatch: %v", derr)
+		}
+	}()
 }
 
 // legacyTrailCoverage is the cloudtrail-events surface as it has always read:

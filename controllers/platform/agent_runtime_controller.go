@@ -72,13 +72,27 @@ func MountAgentRuntimeRoutes(r gin.IRouter, ctl *AgentRuntimeController, auth gi
 // RegisterAgentRuntimeRoutes is the route table, on a group that already
 // carries auth. One table, so tests assert the same one.
 func RegisterAgentRuntimeRoutes(g gin.IRoutes, ctl *AgentRuntimeController, require func(resource, action string) gin.HandlerFunc) {
+	gate := ctl.requireSchema
 	read := require("discovery", "read")
 	review := require("iga", "review")
-	g.GET("/agent-runtime/ai-workloads", read, ctl.ListAIWorkloads)
-	g.GET("/agent-runtime/suggestions", read, ctl.ListSuggestions)
-	g.POST("/agent-runtime/suggestions/:id/confirm", review, ctl.ConfirmSuggestion)
-	g.POST("/agent-runtime/suggestions/:id/dismiss", review, ctl.DismissSuggestion)
-	g.GET("/agent-runtime/findings", read, ctl.ListFindings)
+	g.GET("/agent-runtime/ai-workloads", read, gate, ctl.ListAIWorkloads)
+	g.GET("/agent-runtime/suggestions", read, gate, ctl.ListSuggestions)
+	g.POST("/agent-runtime/suggestions/:id/confirm", review, gate, ctl.ConfirmSuggestion)
+	g.POST("/agent-runtime/suggestions/:id/dismiss", review, gate, ctl.DismissSuggestion)
+	g.GET("/agent-runtime/findings", read, gate, ctl.ListFindings)
+}
+
+// requireSchema answers 503 with the reason until migrations 147-149 verify.
+func (ctl *AgentRuntimeController) requireSchema(c *gin.Context) {
+	// TENANT-EXEMPT: the 147-149 schema check reads the Postgres catalog only.
+	if err := services.RequireAgentRuntime(ctl.db()); err != nil {
+		var ge *services.GovError
+		if errors.As(err, &ge) {
+			c.AbortWithStatusJSON(ge.Status, ge.Body())
+			return
+		}
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+	}
 }
 
 // service is the agent runtime service over the controller's database.

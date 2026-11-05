@@ -486,6 +486,11 @@ func (e *Engine) applyPolicy(ctx context.Context, st *Step) error {
 // Restore puts the step's before-state back and reads it back. Steps that
 // changed nothing (skipped, failed) are restored trivially.
 func (e *Engine) Restore(ctx context.Context, st *Step) error {
+	if NeedsCleanup(*st) {
+		// A policy step that failed may have created (or attached) the
+		// AuthSec policy before it failed: remove what is ours, nothing else.
+		return e.restorePolicy(ctx, st)
+	}
 	switch st.State {
 	case StepSkipped, StepFailed, StepRestored:
 		return nil
@@ -585,6 +590,29 @@ func (e *Engine) Restore(ctx context.Context, st *Step) error {
 		return fmt.Errorf("unknown step kind %q", st.Kind)
 	}
 	return nil
+}
+
+// NeedsCleanup reports a failed IAM policy step: its AuthSecContain-* (or
+// revocation) policy may have been created before the step failed, and
+// release must remove it (restorePolicy touches only this containment's own
+// tagged policy).
+func NeedsCleanup(s Step) bool {
+	return s.State == StepFailed && (s.Kind == StepIAMPolicy || s.Kind == StepSessionRevoke)
+}
+
+// HoldsPolicy reports a policy step of a containment that never took effect
+// whose AuthSec policy may still exist: failed, or a cleanup of it that was
+// attempted and not finished (restoring, restore_failed). A containment with
+// such a step must not be left failed until the policy is gone.
+func HoldsPolicy(s Step) bool {
+	if s.Kind != StepIAMPolicy && s.Kind != StepSessionRevoke {
+		return false
+	}
+	switch s.State {
+	case StepFailed, StepRestoring, StepRestoreFailed:
+		return true
+	}
+	return false
 }
 
 func sameReserved(a, b *int32) bool {
@@ -707,10 +735,14 @@ func ReleaseDone(steps []Step, now time.Time) (done bool, next *time.Time) {
 	done = true
 	for _, s := range steps {
 		switch s.State {
-		case StepRestored, StepSkipped, StepFailed:
+		case StepRestored, StepSkipped:
 			continue
+		case StepFailed:
+			if !NeedsCleanup(s) {
+				continue
+			}
 		}
-		if s.RestoreAfter != nil && now.Before(*s.RestoreAfter) {
+		if s.State != StepFailed && s.RestoreAfter != nil && now.Before(*s.RestoreAfter) {
 			if next == nil || s.RestoreAfter.Before(*next) {
 				t := *s.RestoreAfter
 				next = &t

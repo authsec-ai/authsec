@@ -361,6 +361,13 @@ func envPositiveInt(name string, def int) int {
 	return def
 }
 
+// Available reports whether the event stream's schema (147-149) verified, and
+// why not. The admin routes answer 503 with the reason until it does.
+func (s *AgentRuntimeIngestService) Available() (bool, string) {
+	// TENANT-EXEMPT: the 147-149 schema check reads the Postgres catalog only.
+	return AgentRuntimeStatus(s.db)
+}
+
 // Allow takes one request from the connector's rate limit. false means 429:
 // EventBridge retries it.
 func (s *AgentRuntimeIngestService) Allow(connectorID uuid.UUID) bool {

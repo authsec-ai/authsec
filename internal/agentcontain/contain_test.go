@@ -252,8 +252,8 @@ type world struct {
 
 func newWorld() world {
 	return world{
-		lambdaA: Workload{ID: uuid.New(), Kind: WorkloadLambda, NativeID: fnA, Name: "agent-a", Region: "us-east-1", Via: "runs_as", EventSourceMappings: 1},
-		lambdaB: Workload{ID: uuid.New(), Kind: WorkloadLambda, NativeID: fnB, Name: "agent-b", Region: "us-east-1", Via: "runs_as"},
+		lambdaA: Workload{ID: uuid.New(), Kind: WorkloadLambda, NativeID: fnA, Name: "agent-a", Region: "us-east-1", Via: "runs_as", EventSourceMappings: 1, TagsRead: true},
+		lambdaB: Workload{ID: uuid.New(), Kind: WorkloadLambda, NativeID: fnB, Name: "agent-b", Region: "us-east-1", Via: "runs_as", TagsRead: true},
 		ecsW: Workload{ID: uuid.New(), Kind: WorkloadECSTaskDef, NativeID: tdA, Name: "agent-task", Region: "us-east-1", Via: "runs_as",
 			ECSServicesRead: true, ECSServices: []ECSService{{ClusterARN: clARN, ServiceARN: svcA, TaskDefinition: tdA, DesiredCount: 3}}},
 		ec2W: Workload{ID: uuid.New(), Kind: WorkloadEC2, NativeID: "i-0abc", Name: "i-0abc", Region: "us-east-1", Via: "runs_as"},

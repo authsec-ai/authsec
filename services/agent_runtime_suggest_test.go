@@ -154,10 +154,19 @@ func TestSessionNameEvidenceIsWeakAndUnverified(t *testing.T) {
 	}
 }
 
+// arTestUsageRow is a usage row whose evidence is all from today: inside the
+// evaluation window, as the day buckets the scan writes.
+func arTestUsageRow(identity uuid.UUID, u agentruntime.ModelCallUsage) *arUsage {
+	day := &modelCallDayBucket{Calls: u.Calls, Errors: u.Errors, Denied: u.Denied,
+		Models: u.Models, OtherServices: u.OtherServices}
+	return &arUsage{ID: uuid.New(), IdentityID: identity, usage: u,
+		doc: modelCallDoc{ModelCallUsage: u, Days: map[string]*modelCallDayBucket{modelCallDayKey(time.Now()): day}}}
+}
+
 func arTestState(ident *arIdentity, u agentruntime.ModelCallUsage, wls []*arWorkload, k8s []string) *agentRuntimeState {
 	st := &agentRuntimeState{
 		connectors: map[uuid.UUID]arConnector{}, identities: map[uuid.UUID]*arIdentity{ident.ID: ident},
-		usage:     map[uuid.UUID]*arUsage{ident.ID: {ID: uuid.New(), IdentityID: ident.ID, usage: u}},
+		usage:     map[uuid.UUID]*arUsage{ident.ID: arTestUsageRow(ident.ID, u)},
 		workloads: map[uuid.UUID][]*arWorkload{ident.ID: wls}, k8s: map[uuid.UUID][]string{},
 		saml: map[uuid.UUID]bool{}, suggestions: map[uuid.UUID]*arSuggestion{}, openFindings: map[uuid.UUID]int{},
 	}

@@ -150,9 +150,18 @@ func (s *AgentContain) readInventory(ctx context.Context, ws, identityID uuid.UU
 			inv.workloads = append(inv.workloads, agentcontain.Workload{ID: w.ID, Kind: w.RuntimeKind, NativeID: w.NativeID, Name: w.Name,
 				Region: w.Region, Via: "runs_as", EventSourceMappings: -1})
 		}
+		// Every principal that may assume the identity is part of its blast
+		// radius: k8s service accounts and EKS pod identities, but also other
+		// identities, CI pipelines, external accounts, SAML/human federation
+		// and AWS services. A service principal of the same compute a
+		// runs_as workload already names (lambda.amazonaws.com for a Lambda
+		// function) is that workload, not another one.
+		have := map[string]bool{}
+		for _, w := range inv.workloads {
+			have[w.Kind] = true
+		}
 		var edges []models.CloudAssumeEdge
-		if err := tx.Where("workspace_id = ? AND identity_id = ? AND (subject_kind = ? OR mechanism = ?)", ws, identityID,
-			models.AssumeSubjectK8sSA, models.AssumeMechanismEKSPodIdentity).Order("subject, id").Find(&edges).Error; err != nil {
+		if err := tx.Where("workspace_id = ? AND identity_id = ?", ws, identityID).Order("subject, id").Find(&edges).Error; err != nil {
 			return err
 		}
 		for _, e := range edges {
@@ -160,12 +169,24 @@ func (s *AgentContain) readInventory(ctx context.Context, ws, identityID uuid.UU
 			if e.K8sRef != nil && *e.K8sRef != "" {
 				name = *e.K8sRef
 			}
-			via := "irsa"
-			if e.Mechanism == models.AssumeMechanismEKSPodIdentity {
-				via = "eks_pod_identity"
+			switch {
+			case e.Mechanism == models.AssumeMechanismEKSPodIdentity:
+				inv.workloads = append(inv.workloads, agentcontain.Workload{ID: e.ID, Kind: agentcontain.WorkloadEKSPod, NativeID: name,
+					Name: name, Via: "eks_pod_identity", EventSourceMappings: -1})
+			case e.SubjectKind == models.AssumeSubjectK8sSA:
+				inv.workloads = append(inv.workloads, agentcontain.Workload{ID: e.ID, Kind: agentcontain.WorkloadEKSPod, NativeID: name,
+					Name: name, Via: "irsa", EventSourceMappings: -1})
+			default:
+				if e.SubjectKind == models.AssumeSubjectCloudService && have[serviceWorkloadKind(e.Subject)] {
+					continue
+				}
+				via := e.SubjectKind
+				if via == "" {
+					via = "assume_role"
+				}
+				inv.workloads = append(inv.workloads, agentcontain.Workload{ID: e.ID, Kind: agentcontain.WorkloadAssumer, NativeID: e.Subject,
+					Name: name, Via: via, EventSourceMappings: -1})
 			}
-			inv.workloads = append(inv.workloads, agentcontain.Workload{ID: e.ID, Kind: agentcontain.WorkloadEKSPod, NativeID: name,
-				Name: name, Via: via, EventSourceMappings: -1})
 		}
 		if len(selected) > 0 {
 			var n int64
@@ -192,6 +213,20 @@ func (s *AgentContain) readInventory(ctx context.Context, ws, identityID uuid.UU
 		return nil, err
 	}
 	return inv, nil
+}
+
+// serviceWorkloadKind is the workload kind an AWS service principal in a
+// trust policy stands for ("" when it names no kind of workload).
+func serviceWorkloadKind(principal string) string {
+	switch strings.ToLower(strings.TrimSpace(principal)) {
+	case "lambda.amazonaws.com":
+		return agentcontain.WorkloadLambda
+	case "ecs-tasks.amazonaws.com":
+		return agentcontain.WorkloadECSTaskDef
+	case "ec2.amazonaws.com":
+		return agentcontain.WorkloadEC2
+	}
+	return ""
 }
 
 // usageOf turns cloud_usage rows into recent services: Access Advisor rows,
@@ -297,7 +332,8 @@ func subjectOf(ctx context.Context, ws uuid.UUID, id models.CloudIdentity) agent
 }
 
 // live fills the selected workloads' live reads (discovery role): the ECS
-// services of a task definition, a function's event source mappings. A read
+// services of a task definition revision, a function's tags and event source
+// mappings. A read
 // that fails leaves the workload unread (the preview then refuses it or
 // states less), never a guess.
 func (s *AgentContain) live(ctx context.Context, ws, connectorID uuid.UUID, wls []agentcontain.Workload, selected []uuid.UUID) {
@@ -317,11 +353,14 @@ func (s *AgentContain) live(ctx context.Context, ws, connectorID uuid.UUID, wls 
 			if region == "" {
 				_, _, region, _, _, _ = agentcontain.ARNParts(w.NativeID)
 			}
-			svcs, err := acc.ECSServicesOf(ctx, ws, connectorID, region, agentcontain.TaskDefinitionFamily(w.NativeID))
+			svcs, err := acc.ECSServicesOf(ctx, ws, connectorID, region, w.NativeID)
 			if err == nil {
 				w.ECSServices, w.ECSServicesRead = svcs, true
 			}
 		case agentcontain.WorkloadLambda:
+			if tags, err := acc.FunctionTags(ctx, ws, connectorID, w.NativeID); err == nil {
+				w.Tags, w.TagsRead = tags, true
+			}
 			if n, err := acc.EventSourceMappings(ctx, ws, connectorID, w.NativeID); err == nil {
 				w.EventSourceMappings = n
 			}

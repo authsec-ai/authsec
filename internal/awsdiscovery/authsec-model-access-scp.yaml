@@ -11,29 +11,56 @@ Description: >-
 
 # What it does (SPEC-agent-runtime-visibility.md section 5.4 as amended in
 # section 10):
-#   - DenyUntaggedModelCalls: Bedrock Runtime (InvokeModel*, Converse*), the
-#     agents runtime (InvokeAgent, InvokeInlineAgent, RetrieveAndGenerate*,
-#     InvokeFlow) and the bedrock-mantle endpoint are refused unless the
-#     calling principal carries the authsec:agent tag (role tag, user tag or
-#     session tag). The refusals are CloudTrail management events, so AuthSec
-#     shows every untagged AI workload as a refused model call.
+#   - DenyUntaggedModelCalls / DenyEmptyAgentTagModelCalls: Bedrock Runtime
+#     (InvokeModel*, Converse*), batch inference (CreateModelInvocationJob),
+#     the agents runtime (InvokeAgent, InvokeInlineAgent,
+#     RetrieveAndGenerate*, InvokeFlow), AgentCore runtimes
+#     (InvokeAgentRuntime*) and the bedrock-mantle endpoint (CreateInference)
+#     are refused unless the calling principal carries a NON-EMPTY
+#     authsec:agent tag (role tag, user tag or session tag). The refusals are
+#     CloudTrail events, so AuthSec shows every untagged AI workload as a
+#     refused model call (agents runtime, AgentCore and mantle calls are data
+#     events: only with the event stream's data events on).
 #   - The gate cannot be passed by tagging: setting authsec:agent as a session
 #     tag (sts:TagSession, sts:AssumeRole* with tags), on a role or user
 #     (iam:TagRole, iam:TagUser, iam:CreateRole, iam:CreateUser with tags),
 #     or removing it (iam:UntagRole, iam:UntagUser) is refused, except for the
 #     AdminPrincipalArns (aws:PrincipalArn).
 #
+# Actions, checked against the IAM service reference
+# (servicereference.us-east-1.amazonaws.com/v1/<svc>/<svc>.json, 2026-11-05):
+#   - Converse, ConverseStream and StartAsyncInvoke are authorized as
+#     bedrock:InvokeModel / InvokeModelWithResponseStream (no separate action
+#     is listed); bedrock:Converse* matches nothing today and is kept in case
+#     AWS adds one.
+#   - CreateModelInvocationJob, InvokeAgent, InvokeInlineAgent,
+#     RetrieveAndGenerate, InvokeFlow and bedrock-agentcore:InvokeAgentRuntime
+#     (with its ForUser, WebSocket and Command variants) are confirmed.
+#   - bedrock-mantle: the prefix and CreateInference are confirmed; that every
+#     mantle inference API is authorized as CreateInference is UNVERIFIED (it
+#     is the only inference-creating action listed) -- confirm with a lab call.
+#
 # Limits, stated plainly:
 #   - SCPs never apply to the management account or to service-linked roles.
-#   - bedrock-mantle's IAM action prefix is UNVERIFIED (bedrock-mantle:*);
-#     confirm against a lab call before relying on that statement.
-#   - Converse and ConverseStream are authorized as bedrock:InvokeModel and
-#     bedrock:InvokeModelWithResponseStream; bedrock:Converse* is listed in
-#     case AWS adds separate actions and matches nothing otherwise.
-#   - Session tags passed by an identity provider (AssumeRoleWithSAML,
-#     AssumeRoleWithWebIdentity) are authorized by the role's trust policy;
-#     whether an SCP stops them is UNVERIFIED. Do not let a federated role's
-#     trust policy allow sts:TagSession for authsec:agent.
+#   - An SCP governs only principals IN the organization. Session tags set
+#     by a caller outside it (another account assuming one of your roles
+#     with Tags) or issued by a SAML or OIDC identity provider are authorized
+#     by the role's trust policy and are NOT stopped here. Deploy the RCP
+#     form (form=rcp) as well: a resource control policy on your roles
+#     refuses sts:TagSession for authsec:agent whoever the caller is. Without
+#     it, check that no trust policy allows sts:TagSession without an
+#     aws:TagKeys condition that excludes authsec:agent (AuthSec does not
+#     check this for you).
+#   - Bedrock's own service roles: a Bedrock agent, knowledge base, flow,
+#     batch inference job or AgentCore runtime calls the model AS a role of
+#     yours that Bedrock assumes (its service role or execution role).
+#     aws:PrincipalIsAWSService is false for it, so it is refused like any
+#     untagged role: tag those roles authsec:agent too, or the agent's own
+#     model call fails after its InvokeAgent succeeds. There is no exception
+#     by aws:CalledVia / aws:ViaAWSService: they describe a service acting
+#     with the CALLER's credentials (forward access), not a role the service
+#     assumed, so whether Bedrock sets them on these calls is UNVERIFIED, and
+#     an exception on them would let other service-forwarded calls through.
 
 Metadata:
   AuthSec:
@@ -83,15 +110,37 @@ Resources:
             Action:
               - bedrock:InvokeModel*
               - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
               - bedrock:InvokeAgent
               - bedrock:InvokeInlineAgent
               - bedrock:RetrieveAndGenerate*
               - bedrock:InvokeFlow
-              - bedrock-mantle:*
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
             Resource: '*'
             Condition:
               'Null':
                 aws:PrincipalTag/authsec:agent: 'true'
+              BoolIfExists:
+                aws:PrincipalIsAWSService: 'false'
+          # Present but empty: 'Null' alone would let it pass. StringEquals is
+          # false when the key is absent (the statement above covers that).
+          - Sid: DenyEmptyAgentTagModelCalls
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel*
+              - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
+              - bedrock:InvokeAgent
+              - bedrock:InvokeInlineAgent
+              - bedrock:RetrieveAndGenerate*
+              - bedrock:InvokeFlow
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalTag/authsec:agent: ''
               BoolIfExists:
                 aws:PrincipalIsAWSService: 'false'
           - Sid: DenyAgentTagByKey

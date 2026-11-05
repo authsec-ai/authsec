@@ -58,7 +58,19 @@ func TestAgentEventStreamTemplate(t *testing.T) {
 	if strings.Join(dt, "|") != "AWS API Call via CloudTrail|AWS Service Event via CloudTrail" {
 		t.Errorf("detail-type %v", dt)
 	}
-	got := strs(enforcetest.Dig(rule, "EventPattern", "detail", "eventSource"))
+	// The sources are spread over the pattern's $or branches (the busy ones
+	// filtered by event name, readOnly, errorCode and invokedBy).
+	branches, _ := enforcetest.Dig(rule, "EventPattern", "detail", "$or").([]any)
+	seen := map[string]bool{}
+	var got []string
+	for _, b := range branches {
+		for _, src := range strs(enforcetest.Dig(b, "eventSource")) {
+			if !seen[src] {
+				seen[src] = true
+				got = append(got, src)
+			}
+		}
+	}
 	want := []string{
 		"bedrock.amazonaws.com", "ref:MantleEventSource", "bedrock-agentcore.amazonaws.com",
 		"iam.amazonaws.com", "sts.amazonaws.com", "secretsmanager.amazonaws.com", "ssm.amazonaws.com",
@@ -132,7 +144,8 @@ func checkGate(t *testing.T, name string, content any) {
 		t.Fatalf("%s: no DenyUntaggedModelCalls", name)
 	}
 	actions := strs(enforcetest.Dig(model, "Action"))
-	for _, a := range []string{"bedrock:InvokeModel*", "bedrock:Converse*", "bedrock:InvokeAgent", "bedrock-mantle:*"} {
+	for _, a := range []string{"bedrock:InvokeModel*", "bedrock:Converse*", "bedrock:InvokeAgent",
+		"bedrock:CreateModelInvocationJob", "bedrock-agentcore:InvokeAgentRuntime*", "bedrock-mantle:CreateInference"} {
 		if !contains(actions, a) {
 			t.Errorf("%s: model deny lacks %s", name, a)
 		}
@@ -188,8 +201,10 @@ func TestModelAccessSCPTemplate(t *testing.T) {
 func TestModelAccessPolicyTemplate(t *testing.T) {
 	tpl := parseAgentTemplate(t, "policy", awsdiscovery.ModelAccessPolicyTemplate)
 	p := enforcetest.Dig(tpl, "Resources", "AuthSecModelAccessGate")
-	if enforcetest.Dig(p, "Type") != "AWS::IAM::ManagedPolicy" || enforcetest.Dig(p, "Properties", "Path") != "/authsec/" {
-		t.Fatalf("policy form must be a managed policy under /authsec/: %v", p)
+	// Outside /authsec/: the enforcement role may rewrite and detach every
+	// policy there.
+	if enforcetest.Dig(p, "Type") != "AWS::IAM::ManagedPolicy" || enforcetest.Dig(p, "Properties", "Path") != "/authsec-gate/" {
+		t.Fatalf("policy form must be a managed policy under /authsec-gate/: %v", p)
 	}
 	if r, _ := enforcetest.Dig(p, "Properties", "Roles").(map[string]any); r["Ref"] != "RoleNames" {
 		t.Errorf("policy form is attached to the chosen roles, got %v", enforcetest.Dig(p, "Properties", "Roles"))
@@ -212,7 +227,7 @@ func TestModelAccessAuditDocument(t *testing.T) {
 		t.Error("audit mode must carry a tagging guide")
 	}
 	aff, _ := doc["affected"].(map[string]any)
-	if aff["scp"] == nil || aff["policy"] == nil {
+	if aff["scp"] == nil || aff["rcp"] == nil || aff["policy"] == nil {
 		t.Error("audit mode must say what each form would affect")
 	}
 }

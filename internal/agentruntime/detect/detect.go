@@ -96,11 +96,10 @@ func Name(id ID) string {
 	return string(id)
 }
 
-// FactWithDecryption is the RequestFacts key a producer may set to "true" or
-// "false" from ssm's requestParameters.withDecryption. The shared parser
-// does not fill it today (it keeps string facts only), so an ssm
-// GetParameter* read counts unless a record states with_decryption=false.
-const FactWithDecryption = "with_decryption"
+// FactWithDecryption is the RequestFacts key the shared parser sets from
+// ssm's requestParameters.withDecryption. An ssm GetParameter* read counts
+// only when it is "true".
+const FactWithDecryption = agentruntime.FactWithDecryption
 
 // Config is one workspace's detection configuration.
 type Config struct {
@@ -450,10 +449,10 @@ func IsAWSServiceSource(ip string) bool {
 
 // SecretRead is D1 (spec §5.7 with §10's change): Secrets Manager
 // GetSecretValue / BatchGetSecretValue (high); SSM GetParameter,
-// GetParameters, GetParametersByPath unless the record states
-// with_decryption=false (medium); KMS Decrypt (medium) ONLY when not made
-// on the principal's behalf by Secrets Manager or SSM -- those decrypts
-// accompany a GetSecretValue / GetParameter already alerted on.
+// GetParameters, GetParametersByPath only with
+// with_decryption=true (medium); KMS Decrypt (medium) ONLY when the principal
+// called it directly (no invokedBy: service-made decrypts accompany a read
+// already alerted on) and its encryption context names a secret or parameter.
 func SecretRead(e agentruntime.Event) (severity string, ok bool) {
 	switch e.EventSource {
 	case "secretsmanager.amazonaws.com":
@@ -463,15 +462,14 @@ func SecretRead(e agentruntime.Event) (severity string, ok bool) {
 	case "ssm.amazonaws.com":
 		switch e.EventName {
 		case "GetParameter", "GetParameters", "GetParametersByPath":
-			if strings.EqualFold(strings.TrimSpace(e.RequestFacts[FactWithDecryption]), "false") {
+			if !strings.EqualFold(strings.TrimSpace(e.RequestFacts[FactWithDecryption]), "true") {
 				return "", false
 			}
 			return SeverityMedium, true
 		}
 	case "kms.amazonaws.com":
 		if e.EventName == "Decrypt" {
-			switch strings.ToLower(strings.TrimSpace(e.InvokedBy)) {
-			case "secretsmanager.amazonaws.com", "ssm.amazonaws.com":
+			if strings.TrimSpace(e.InvokedBy) != "" || e.RequestFacts[agentruntime.FactSecretContext] != "true" {
 				return "", false
 			}
 			return SeverityMedium, true

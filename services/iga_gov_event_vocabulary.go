@@ -299,7 +299,9 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
 	// Agent runtime alerts (agent_runtime_alerts.go).
 	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
-	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member (with the reason given)."},
+	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
+	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
+	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
 }
 
 // Object kinds the events API filters on.

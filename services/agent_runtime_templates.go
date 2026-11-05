@@ -50,12 +50,14 @@ func EventStreamStackParameters(endpointURL, secret string, connectorID uuid.UUI
 func EventStreamNotes() []string {
 	return []string{
 		"Deploy the stack in every region to watch (a StackSet works) and in us-east-1, where IAM, STS and other global-service events arrive.",
-		"A CloudTrail trail must log management events (read and write) in each region: set CreateTrail=true in ONE region's stack (the trail is multi-region), or keep your own trail.",
+		"A CloudTrail trail must log management events (read and write) in each region: set CreateTrail=true in ONE region's stack (the trail is multi-region), or keep your own trail. In a StackSet, CreateTrail=true in every region creates a duplicate, separately charged trail per region: deploy with false and override it in one region.",
 		"Read-only calls such as Converse, InvokeModel and GetSecretValue reach EventBridge only because the rule's state is ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS.",
 		"Data events (Bedrock agents runtime, bedrock-mantle, AgentCore, S3) are off by default and charged by CloudTrail per event; S3 object events can be the largest cost. On your own trail, add the selectors yourself.",
 		"The bedrock-mantle event source and data resource type are UNVERIFIED: the stack takes both as parameters.",
 		"EventBridge sends one event per request with the secret in the " + AgentEventSecretHeader + " header, waits 5 seconds for a reply and retries for up to 24 hours on 429 and 5xx.",
-		"EventBridge also charges per API destination invocation; KMS and S3 management events can be numerous.",
+		"Events AuthSec refuses (401 after a rotation, 413) and events still undelivered after 24 hours go to the stack's encrypted SQS dead-letter queue (kept 14 days), whose CloudWatch alarm fires on any message; DeadLetterAlarmTopicArn sends it to an SNS topic.",
+		"From KMS, STS, S3, SSM and CloudWatch Logs the rule forwards only writes, the calls the detections read (kms:Decrypt, sts:AssumeRole, sts:GetFederationToken, ssm:GetParameter*, s3:GetObject, logs:DeleteLogGroup) and authorization denials, and never calls an AWS service made on the caller's behalf; the rest of those sources reaches AuthSec only through polling during scans.",
+		"Cost: EventBridge charges per API destination invocation (USD 0.20 per million in us-east-1 at the time of writing, one per forwarded event); CloudTrail charges data events per event, and any copy of management events beyond the first trail.",
 		"Rotating the secret in AuthSec stops the stream until the stack's EventSecret parameter is updated; revoking it stops the stream.",
 		"Polling during scans stays on as the backstop for management events.",
 	}
@@ -90,13 +92,18 @@ const (
 	ModelAccessModeDeny  = "deny"
 	// ModelAccessFormSCP: a service control policy (AWS Organizations).
 	ModelAccessFormSCP = "scp"
-	// ModelAccessFormPolicy: an AuthSec-owned deny policy under /authsec/
-	// attached to chosen roles. There is no permissions-boundary form (§10).
+	// ModelAccessFormRCP: a resource control policy (AWS Organizations)
+	// refusing the authsec:agent session tag on role assumption by any
+	// caller; deployed with the SCP, it gates no model call itself.
+	ModelAccessFormRCP = "rcp"
+	// ModelAccessFormPolicy: an AuthSec-owned deny policy under
+	// /authsec-gate/ attached to chosen roles. There is no
+	// permissions-boundary form (§10).
 	ModelAccessFormPolicy = "policy"
 )
 
 // ErrModelAccessParam is an unknown mode or form.
-var ErrModelAccessParam = errors.New("mode must be audit or deny, and form scp or policy")
+var ErrModelAccessParam = errors.New("mode must be audit or deny, and form scp, rcp or policy")
 
 // ModelAccessTemplateDoc is GET /authsec/discovery/aws/templates/model-access.
 // Deny mode carries a CloudFormation template; audit mode carries no template
@@ -126,7 +133,7 @@ func ModelAccessTemplate(mode, form string) (ModelAccessTemplateDoc, error) {
 		form = ModelAccessFormSCP
 	}
 	if (mode != ModelAccessModeAudit && mode != ModelAccessModeDeny) ||
-		(form != ModelAccessFormSCP && form != ModelAccessFormPolicy) {
+		(form != ModelAccessFormSCP && form != ModelAccessFormRCP && form != ModelAccessFormPolicy) {
 		return ModelAccessTemplateDoc{}, ErrModelAccessParam
 	}
 	doc := ModelAccessTemplateDoc{TemplateVersion: awsdiscovery.AgentRuntimeTemplateVersion, Mode: mode, Form: form}
@@ -151,17 +158,30 @@ func ModelAccessTemplate(mode, form string) (ModelAccessTemplateDoc, error) {
 		doc.Notes = []string{
 			"Deploy in the Organizations management account (or a delegated policy administrator). SCPs do not apply to the management account or to service-linked roles.",
 			"Untagged principals in the targeted accounts are refused Bedrock model calls; the refusals appear in AuthSec as refused model calls.",
-			"Only AdminPrincipalArns may set or remove the authsec:agent tag, including as a session tag; list your pipeline and CloudFormation roles that tag agent roles.",
-			"The bedrock-mantle action prefix is UNVERIFIED.",
+			"Only AdminPrincipalArns in the organization may set or remove the authsec:agent tag, including as a session tag; list your pipeline and CloudFormation roles that tag agent roles.",
+			"An SCP does not govern callers outside the organization or identity-provider session tags: deploy form=rcp with it, or check that no trust policy allows sts:TagSession without an aws:TagKeys condition excluding authsec:agent.",
+			"Roles Bedrock assumes for your agents, knowledge bases, flows, batch jobs and AgentCore runtimes call models themselves: tag them authsec:agent too.",
+			"bedrock-mantle:CreateInference is confirmed as an action; that every mantle inference API is authorized as it is UNVERIFIED.",
+		}
+	case ModelAccessFormRCP:
+		doc.FileName = awsdiscovery.ModelAccessRCPTemplateFile
+		doc.Template = awsdiscovery.ModelAccessRCPTemplate
+		doc.Parameters = []string{"TargetIds", "AdminPrincipalArns", "PolicyName"}
+		doc.Notes = []string{
+			"Deploy with the SCP form, in the Organizations management account (or a delegated policy administrator), after enabling the RESOURCE_CONTROL_POLICY policy type on the root. It gates no model call by itself.",
+			"Refuses setting authsec:agent as a session tag when any caller -- another account, a SAML or OIDC identity provider, or a principal in the organization -- assumes a role in the targeted accounts, except AdminPrincipalArns. Identity providers can never be excepted: set the tag on the role.",
+			"RCPs do not apply to the management account or to service-linked roles.",
 		}
 	case ModelAccessFormPolicy:
 		doc.FileName = awsdiscovery.ModelAccessPolicyTemplateFile
 		doc.Template = awsdiscovery.ModelAccessPolicyTemplate
 		doc.Parameters = []string{"RoleNames", "AdminPrincipalArns", "PolicySuffix"}
 		doc.Notes = []string{
-			"A deny policy under /authsec/ attached to the roles you name, never a permissions boundary. AuthSec's enforcement role (template v2) may attach and detach it.",
+			"A deny policy under /authsec-gate/ attached to the roles you name, never a permissions boundary. It is outside /authsec/, so AuthSec's enforcement role can neither change nor detach it.",
 			"It covers only the roles it is attached to, and it cannot stop another principal from tagging a gated role: the SCP form is stronger.",
-			"The bedrock-mantle action prefix is UNVERIFIED.",
+			"It cannot stop whoever assumes a gated role from setting authsec:agent as a session tag (the trust policy authorizes that): check that no gated role's trust policy allows sts:TagSession without an aws:TagKeys condition excluding authsec:agent. AuthSec does not check this for you.",
+			"Gating a role Bedrock assumes (agent, knowledge base, flow, batch job or AgentCore runtime role) refuses its model calls unless it is tagged authsec:agent.",
+			"bedrock-mantle:CreateInference is confirmed as an action; that every mantle inference API is authorized as it is UNVERIFIED.",
 		}
 	}
 	return doc, nil

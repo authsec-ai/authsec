@@ -134,8 +134,9 @@ func TestReadWindowFirstReadCoversNinetyDays(t *testing.T) {
 }
 
 // From a mark, the focused pass starts at it; the general pass still reaches
-// back the legacy 48 hours (R1b), but counts only after the mark; a mark
-// older than 48 hours (a weekly connector) is read from.
+// back the legacy 48 hours (R1b), and counts from TrailLateLookback before
+// the mark (the caller dedupes by event id); a mark older than 48 hours (a
+// weekly connector) is read from, less the lookback.
 func TestReadWindowFromAMark(t *testing.T) {
 	since := windowNow.Add(-6 * time.Hour)
 	api := &windowTrail{events: []cttypes.Event{
@@ -155,7 +156,7 @@ func TestReadWindowFromAMark(t *testing.T) {
 	if len(general.Records) != 4 {
 		t.Fatalf("read %d records, want all 4 (evidence is recorded for every event read)", len(general.Records))
 	}
-	for id, want := range map[string]bool{"before": false, "at": false, "inside": true, "unsettled": false} {
+	for id, want := range map[string]bool{"before": false, "at": true, "inside": true, "unsettled": false} {
 		var at time.Time
 		for _, rec := range general.Records {
 			if rec.Event.EventID == id {
@@ -174,13 +175,13 @@ func TestReadWindowFromAMark(t *testing.T) {
 	if _, err := r.ReadWindow(context.Background(), TrailWindowRequest{Stream: TrailStreamGeneral, Since: weekly}); err != nil {
 		t.Fatal(err)
 	}
-	if !aws.ToTime(api.inputs[1].StartTime).Equal(weekly) {
+	if !aws.ToTime(api.inputs[1].StartTime).Equal(weekly.Add(-TrailLateLookback)) {
 		t.Fatalf("weekly StartTime %s, want the mark %s", aws.ToTime(api.inputs[1].StartTime), weekly)
 	}
 	if _, err := r.ReadWindow(context.Background(), TrailWindowRequest{Stream: TrailStreamBedrock, Since: since}); err != nil {
 		t.Fatal(err)
 	}
-	if !aws.ToTime(api.inputs[2].StartTime).Equal(since) {
+	if !aws.ToTime(api.inputs[2].StartTime).Equal(since.Add(-TrailLateLookback)) {
 		t.Fatalf("bedrock StartTime %s, want the mark", aws.ToTime(api.inputs[2].StartTime))
 	}
 }
@@ -242,8 +243,8 @@ func TestReadWindowFailureClaimsNothing(t *testing.T) {
 func TestReadWindowNeverMovesTheMarkBack(t *testing.T) {
 	since := windowNow.Add(-5 * time.Minute)
 	read, err := readerAt(&windowTrail{}).ReadWindow(context.Background(), TrailWindowRequest{Stream: TrailStreamBedrock, Since: since})
-	if err != nil || !read.ReadTo.Equal(since) || !read.CoveredFrom.Equal(since) {
-		t.Fatalf("read_to %s covered_from %s err %v, want both at the mark", read.ReadTo, read.CoveredFrom, err)
+	if err != nil || !read.ReadTo.Equal(since) || !read.CoveredFrom.Equal(since.Add(-TrailLateLookback)) {
+		t.Fatalf("read_to %s covered_from %s err %v, want read_to at the mark and the window a lookback before it", read.ReadTo, read.CoveredFrom, err)
 	}
 }
 
