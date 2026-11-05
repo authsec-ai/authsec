@@ -55,6 +55,13 @@ import (
 //     raise no alert: a first scan reading 90 days of history must not open
 //     an alert for every secret read of the last quarter. 7 days keeps a
 //     weekly connector's window alertable.
+//   - Backfill (lab 2026-11-05): a finding on an event older than
+//     agentAlertBackfillAge (24 h) is history arriving in one batch (a scan's
+//     window, a replay), not a live incident. All such findings of one batch
+//     for the same (identity, detection) go into ONE alert: the first is
+//     deduplicated as usual (it extends an alert within the window or opens
+//     one), every later one extends that same alert whatever the gap. Recent
+//     events keep the per-window dedupe.
 //   - One finding per detection per event: when D6 matches twice on one
 //     event (a new model during a spike) the details are joined.
 //   - An acknowledged alert is still extended (the same incident); a
@@ -84,6 +91,8 @@ const (
 	DefaultAgentAlertRetentionDays = 90
 
 	agentAlertMaxEventAge = 7 * 24 * time.Hour
+	// agentAlertBackfillAge: older findings are grouped per batch (DECISIONS).
+	agentAlertBackfillAge = 24 * time.Hour
 	// Evidence keeps the first agentAlertEvidenceHead references and the
 	// latest agentAlertEvidenceTail.
 	agentAlertEvidenceHead = 5
@@ -93,6 +102,7 @@ const (
 // AgentAlertLabels are the labels detections run for.
 var AgentAlertLabels = map[string]bool{
 	agentruntime.LabelAIWorkload: true, agentruntime.LabelSuggestedAgent: true, agentruntime.LabelAgent: true,
+	agentruntime.LabelPossibleAIWorkload: true,
 }
 
 /* ------------------------------------------------------------------------- */
@@ -406,6 +416,7 @@ func (s *AgentAlertSink) Process(ctx context.Context, workspaceID, connectorID u
 		events []agentruntime.Event
 	}
 	var targets []target
+	byIdentity := map[uuid.UUID]int{} // index in targets
 	var first error
 	for _, a := range keys {
 		subj, err := r.Resolve(ctx, workspaceID, connectorID, a)
@@ -421,6 +432,13 @@ func (s *AgentAlertSink) Process(ctx context.Context, workspaceID, connectorID u
 		if subj.ConnectorID == uuid.Nil {
 			subj.ConnectorID = connectorID
 		}
+		// Attributions that resolve to one identity (the same role named with
+		// and without its RoleId) are one identity's batch.
+		if i, ok := byIdentity[subj.IdentityID]; ok {
+			targets[i].events = append(targets[i].events, groups[a]...)
+			continue
+		}
+		byIdentity[subj.IdentityID] = len(targets)
 		targets = append(targets, target{subj: subj, events: groups[a]})
 	}
 	if len(targets) == 0 {
@@ -481,9 +499,20 @@ func (s *AgentAlertSink) processIdentity(ctx context.Context, ws uuid.UUID, subj
 		if err := saveAgentAlertBaseline(tx, ws, subj.IdentityID, b, now); err != nil {
 			return err
 		}
+		// Backfill: one alert per detection for this batch's old findings.
+		backfill := map[detect.ID]uuid.UUID{}
 		for _, h := range hits {
-			if err := upsertAgentAlert(tx, ws, subj, st, h, window, now); err != nil {
+			old := now.Sub(h.e.EventTime) > agentAlertBackfillAge
+			var into *uuid.UUID
+			if id, ok := backfill[h.f.Detection]; old && ok {
+				into = &id
+			}
+			id, err := upsertAgentAlert(tx, ws, subj, st, h, window, now, into)
+			if err != nil {
 				return err
+			}
+			if old {
+				backfill[h.f.Detection] = id
 			}
 		}
 		return nil
@@ -631,7 +660,7 @@ func agentAlertTitle(subj agentruntime.Subject, d detect.ID) string {
 		name = "identity " + subj.IdentityID.String()
 	}
 	label := map[string]string{agentruntime.LabelAIWorkload: "AI workload", agentruntime.LabelSuggestedAgent: "suggested agent",
-		agentruntime.LabelAgent: "agent"}[subj.Label]
+		agentruntime.LabelAgent: "agent", agentruntime.LabelPossibleAIWorkload: "possible AI workload"}[subj.Label]
 	return truncate(fmt.Sprintf("%s: %s (%s)", detect.Name(d), name, label), 300)
 }
 
@@ -642,8 +671,11 @@ type agentAlertOpenRow struct {
 }
 
 // upsertAgentAlert extends the open alert of (identity, detection) whose
-// activity is within window of the event, or opens one.
-func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st AgentAlertSettings, h agentAlertHit, window time.Duration, now time.Time) error {
+// activity is within window of the event, or opens one, and returns the
+// alert's id. into, when set, is the alert this batch's backfill already
+// wrote for the detection: it is extended whatever the gap (unless it was
+// resolved meanwhile, when the usual rule applies).
+func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st AgentAlertSettings, h agentAlertHit, window time.Duration, now time.Time, into *uuid.UUID) (uuid.UUID, error) {
 	key := AgentAlertDedupeKey(subj.IdentityID, h.f.Detection)
 	at := h.e.EventTime.UTC()
 	workloads := subj.WorkloadIDs
@@ -652,27 +684,36 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 	}
 	wl, err := json.Marshal(workloads)
 	if err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	var open []agentAlertOpenRow
-	if err := tx.Raw(`SELECT id, severity, evidence FROM agent_alert
-	                   WHERE workspace_id = ? AND dedupe_key = ? AND state <> 'resolved'
-	                     AND last_seen >= ? AND first_seen <= ?
-	                   ORDER BY last_seen DESC LIMIT 1 FOR UPDATE`,
-		ws, key, at.Add(-window), at.Add(window)).Scan(&open).Error; err != nil {
-		return err
+	if into != nil {
+		if err := tx.Raw(`SELECT id, severity, evidence FROM agent_alert
+		                   WHERE workspace_id = ? AND id = ? AND dedupe_key = ? AND state <> 'resolved'
+		                   FOR UPDATE`, ws, *into, key).Scan(&open).Error; err != nil {
+			return uuid.Nil, err
+		}
+	}
+	if len(open) == 0 {
+		if err := tx.Raw(`SELECT id, severity, evidence FROM agent_alert
+		                   WHERE workspace_id = ? AND dedupe_key = ? AND state <> 'resolved'
+		                     AND last_seen >= ? AND first_seen <= ?
+		                   ORDER BY last_seen DESC LIMIT 1 FOR UPDATE`,
+			ws, key, at.Add(-window), at.Add(window)).Scan(&open).Error; err != nil {
+			return uuid.Nil, err
+		}
 	}
 	if len(open) == 1 {
 		cur := open[0]
 		ev, err := appendAgentAlertEvidence(cur.Evidence, agentAlertRef(h))
 		if err != nil {
-			return err
+			return uuid.Nil, err
 		}
 		sev := cur.Severity
 		if detect.SeverityRank(h.f.Severity) > detect.SeverityRank(sev) {
 			sev = h.f.Severity
 		}
-		return tx.Exec(`UPDATE agent_alert SET last_seen = GREATEST(last_seen, ?), first_seen = LEAST(first_seen, ?),
+		return cur.ID, tx.Exec(`UPDATE agent_alert SET last_seen = GREATEST(last_seen, ?), first_seen = LEAST(first_seen, ?),
 		                       event_count = event_count + 1, severity = ?, evidence = ?::jsonb, workload_ids = ?::jsonb,
 		                       subject_label = ?, subject_name = ?
 		                 WHERE workspace_id = ? AND id = ?`,
@@ -680,7 +721,7 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 	}
 	ev, err := appendAgentAlertEvidence(nil, agentAlertRef(h))
 	if err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	var ids []uuid.UUID
 	if err := tx.Raw(`INSERT INTO agent_alert (workspace_id, connector_id, identity_id, workload_ids, subject_label, subject_name,
@@ -689,19 +730,19 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 	                  RETURNING id`,
 		ws, subj.ConnectorID, subj.IdentityID, string(wl), subj.Label, truncate(subj.Name, 300),
 		string(h.f.Detection), h.f.Severity, agentAlertTitle(subj, h.f.Detection), key, at, at, string(ev), now).Scan(&ids).Error; err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	if len(ids) != 1 {
-		return errors.New("agent alert insert returned no id")
+		return uuid.Nil, errors.New("agent alert insert returned no id")
 	}
 	id := ids[0]
 	if err := appendGovEvent(tx, ws, GovEventAgentAlertOpened, models.GovActorSystem, AgentAlertSinkName, govEventRefs{},
 		map[string]any{"alert_id": id, "detection": string(h.f.Detection), "severity": h.f.Severity,
 			"identity_id": subj.IdentityID, "connector_id": subj.ConnectorID, "subject_label": subj.Label,
 			"first_event_id": h.e.EventID}); err != nil {
-		return err
+		return uuid.Nil, err
 	}
-	return enqueueAgentAlertDeliveries(tx, ws, id, st)
+	return id, enqueueAgentAlertDeliveries(tx, ws, id, st)
 }
 
 /* ------------------------------------------------------------------------- */

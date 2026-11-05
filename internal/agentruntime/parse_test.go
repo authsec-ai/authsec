@@ -102,6 +102,29 @@ func TestTrailNameFactOnlyForCloudTrail(t *testing.T) {
 	}
 }
 
+// withDecryption is a JSON bool: kept as "true" / "false", absent when the
+// record does not state it.
+func TestParseWithDecryption(t *testing.T) {
+	for _, c := range []struct{ param, want string }{
+		{`,"withDecryption":true`, "true"},
+		{`,"withDecryption":false`, "false"},
+		{``, ""},
+	} {
+		raw := `{"eventID":"wd","eventName":"GetParameter","eventSource":"ssm.amazonaws.com","requestParameters":{"name":"/db/pass"` + c.param + `}}`
+		e, err := ParseCloudTrailRecord([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := e.RequestFacts[FactWithDecryption]
+		if got != c.want || ok != (c.want != "") {
+			t.Fatalf("%s: with_decryption=%q (present %v), want %q", c.param, got, ok, c.want)
+		}
+		if e.RequestFacts[FactParameter] != "/db/pass" {
+			t.Fatalf("parameter fact: %v", e.RequestFacts)
+		}
+	}
+}
+
 type sinkFunc struct {
 	name string
 	fn   func([]Event) error

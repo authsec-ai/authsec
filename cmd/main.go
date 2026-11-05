@@ -192,6 +192,7 @@ func main() {
 	graphGate := services.DefaultGraphProjectionGate()
 	services.SetGraphProjection(graphGate)
 	services.InstallAgentRuntimeResolver(config.DB) // agentruntime.SubjectResolver for detections and containment
+	services.InstallAgentRuntimeGraph()             // agent_runtime on the graph's AWS identity and workload nodes
 	go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
 		go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
 	})
@@ -305,6 +306,7 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentLiveSink(config.DB)          // agent runtime: live AI-workload evidence; before the alert and verify sinks
 	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
@@ -329,7 +331,14 @@ func main() {
 	// "agent_alerts" event sink (detections D1-D8 on events the poller and the
 	// stream dispatch), and the SIEM delivery / retention worker.
 	services.InstallAgentRuntimeAlerts(config.DB)
+	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+
+	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
+	// workspace; the Vault client for admin keys, and the hourly sync worker
+	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
+	services.InstallModelProviders()
+	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL

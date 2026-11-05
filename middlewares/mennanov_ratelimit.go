@@ -141,7 +141,21 @@ var (
 )
 
 // ingestRateLimitPaths are the event-ingest endpoints, relative to /authsec.
-var ingestRateLimitPaths = []string{"/ingest/aws/events"}
+var ingestRateLimitPaths = []string{"/ingest/aws/events", "/ingest/otlp/v1/traces"}
+
+// pdpRateLimitPrefix is the agent gateway PDP (SPEC-agent-runtime-gateway.md
+// §10): gateways behind one NAT would share the general per-IP budget, and
+// a busy gateway asks once per uncached tool or model call, so it has its
+// own per-IP ceiling (PDPRateLimit); each gateway also has its own limit
+// after its credential is checked (AGENT_GATEWAY_PDP_RPS).
+const pdpRateLimitPrefix = "/pdp/"
+
+// PDPRateLimit bounds unauthenticated traffic to the PDP per client IP.
+var PDPRateLimit = RateLimitConfig{
+	Limit:    60000,
+	Window:   time.Minute,
+	Endpoint: "pdp",
+}
 
 // MennovRateLimitMiddleware creates rate limiting middleware using in-memory sliding window
 func MennovRateLimitMiddleware() gin.HandlerFunc {
@@ -237,6 +251,9 @@ func selectRateLimitConfig(path string) RateLimitConfig {
 		if rel == p {
 			return IngestRateLimit
 		}
+	}
+	if strings.HasPrefix(rel, pdpRateLimitPrefix) {
+		return PDPRateLimit
 	}
 	for _, authPath := range authRateLimitPrefixes {
 		if strings.HasPrefix(rel, authPath) {
