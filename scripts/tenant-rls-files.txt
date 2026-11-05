@@ -126,3 +126,8 @@ controllers/platform/agent_runtime_activity_controller.go
 services/agent_runtime_activity.go
 services/agent_runtime_activity_otlp.go
 services/agent_runtime_activity_spans.go
+controllers/platform/agent_gateway_controller.go
+controllers/platform/agent_gateway_pdp_controller.go
+services/agent_gateway.go
+services/agent_gateway_policy.go
+services/agent_gateway_decisions.go

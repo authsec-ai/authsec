@@ -1,0 +1,56 @@
+# Minimal Helm values for the AuthSec agent gateway, for a generic
+# Deployment + Service chart (e.g. bjw-s app-template or your own).
+image:
+  repository: authsec/agent-gateway
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Pins are per replica (a local file): with more than one replica, pre-pin
+# tool hashes in config.yaml (mcp_servers[].pins) so every replica agrees.
+replicaCount: 1
+
+args: ["-config", "/etc/agent-gateway/config.yaml"]
+
+env:
+  - name: AUTHSEC_GATEWAY_CREDENTIAL
+    valueFrom: { secretKeyRef: { name: agent-gateway, key: authsec-credential } }
+  - name: OPENAI_API_KEY
+    valueFrom: { secretKeyRef: { name: agent-gateway, key: openai-api-key } }
+  - name: ANTHROPIC_API_KEY
+    valueFrom: { secretKeyRef: { name: agent-gateway, key: anthropic-api-key } }
+  - name: GITHUB_MCP_AUTHORIZATION
+    valueFrom: { secretKeyRef: { name: agent-gateway, key: github-mcp-authorization } }
+  - name: AGENT_GATEWAY_ADMIN_TOKEN
+    valueFrom: { secretKeyRef: { name: agent-gateway, key: admin-token } }
+
+configMap:
+  name: agent-gateway-config        # holds config.yaml (see config.example.yaml)
+  mountPath: /etc/agent-gateway
+
+persistence:
+  pins:
+    enabled: true                   # tool-definition pins survive restarts
+    mountPath: /var/lib/agent-gateway
+    size: 10Mi
+
+service:
+  type: ClusterIP                   # agents reach it in-cluster; do not expose publicly
+  port: 8080
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+
+probes:
+  liveness:  { httpGet: { path: /healthz, port: 8080 } }
+  readiness: { httpGet: { path: /healthz, port: 8080 } }
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits:   { memory: 256Mi }
+
+# Egress the gateway needs: AuthSec (PDP), the MCP servers and the model
+# providers in config.yaml. Agents need egress to the gateway only.

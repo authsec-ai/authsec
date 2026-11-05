@@ -113,5 +113,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// Agent runtime activity timeline (SPEC-agent-runtime-activity.md §7):
 		// /api/iga/v1/agent-runtime/{activity,otlp-tokens} (agent_runtime_activity_controller.go).
 		platformCtrl.MountAgentRuntimeActivityRoutes(iga, platformCtrl.NewAgentRuntimeActivityControllerFor(igaGraphRead))
+
+		// Agent runtime gateway (SPEC-agent-runtime-gateway.md §8): gateways,
+		// tool policies, settings and the decision log under
+		// /api/iga/v1/agent-runtime (agent_gateway_controller.go). The PDP
+		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
+		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
 	}
 }

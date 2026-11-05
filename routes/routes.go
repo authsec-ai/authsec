@@ -1523,6 +1523,12 @@ func SetupRoutes(
 		// the per-workspace OTLP token alone decides the workspace.
 		authsec.POST("/ingest/otlp/v1/traces", platformCtrl.NewAgentOTLPIngestController(config.DB).IngestTraces)
 
+		// Agent runtime gateway PDP (SPEC-agent-runtime-gateway.md §5): AuthZEN
+		// evaluations and decision-log uploads from gateways in customers'
+		// environments. No AuthMiddleware: "Authorization: Bearer agw_..." (the
+		// gateway credential) alone decides workspace and gateway.
+		platformCtrl.MountAgentGatewayPDPRoutes(authsec, platformCtrl.NewAgentGatewayPDPController())
+
 		// Everything else stays authenticated and permission-gated: reading the
 		// inventory exposes hostnames and workload metadata across the workspace, and
 		// claim/quarantine are governance decisions that must be attributable.
