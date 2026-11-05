@@ -1,5 +1,6 @@
 -- ============================================================================
--- 152: live model-call evidence (agent_live_event_seen).
+-- 152: live model-call evidence (agent_live_event_seen) and the AI-workload
+-- evidence finding kinds.
 --
 -- The "agent_runtime_live" event sink (services/agent_runtime_live.go)
 -- records model calls seen on the event stream (or a poll's dispatch) as live
@@ -12,6 +13,14 @@
 -- identity_id and connector_id carry no foreign key on purpose, as in 150:
 -- the row is an idempotency key that outlives the inventory row; the purge
 -- removes it.
+--
+-- agent_finding_kind_chk admits 'ai_config_hint' (a workload whose
+-- configuration names a model provider: a possible AI workload) and
+-- 'ai_network_traffic' (DNS lookups of model endpoints, written by the
+-- network evidence path, migration 153 on its branch). Both are added here
+-- and there, keeping every earlier kind, so either merge order works.
+-- agent_alert.subject_label admits 'possible_ai_workload' (detections run on
+-- possible AI workloads too).
 --
 -- Expand only. Idempotent: safe to run again.
 -- 001_bootstrap.sql carries the same block at its end.
@@ -37,5 +46,20 @@ BEGIN
     -- Required for every workspace table; guarded as in 139 and 146.
     IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
         PERFORM public.tenancy_enable_rls('public.agent_live_event_seen');
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF to_regclass('public.agent_finding') IS NOT NULL THEN
+        ALTER TABLE public.agent_finding DROP CONSTRAINT IF EXISTS agent_finding_kind_chk;
+        ALTER TABLE public.agent_finding ADD CONSTRAINT agent_finding_kind_chk
+            CHECK (kind IN ('shared_role', 'human_credentials', 'long_lived_key', 'model_key_secret',
+                            'ai_config_hint', 'ai_network_traffic'));
+    END IF;
+    IF to_regclass('public.agent_alert') IS NOT NULL THEN
+        ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_check;
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_subject_label_check
+            CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent', 'possible_ai_workload'));
     END IF;
 END $$;

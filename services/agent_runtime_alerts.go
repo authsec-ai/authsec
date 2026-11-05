@@ -102,6 +102,7 @@ const (
 // AgentAlertLabels are the labels detections run for.
 var AgentAlertLabels = map[string]bool{
 	agentruntime.LabelAIWorkload: true, agentruntime.LabelSuggestedAgent: true, agentruntime.LabelAgent: true,
+	agentruntime.LabelPossibleAIWorkload: true,
 }
 
 /* ------------------------------------------------------------------------- */
@@ -659,7 +660,7 @@ func agentAlertTitle(subj agentruntime.Subject, d detect.ID) string {
 		name = "identity " + subj.IdentityID.String()
 	}
 	label := map[string]string{agentruntime.LabelAIWorkload: "AI workload", agentruntime.LabelSuggestedAgent: "suggested agent",
-		agentruntime.LabelAgent: "agent"}[subj.Label]
+		agentruntime.LabelAgent: "agent", agentruntime.LabelPossibleAIWorkload: "possible AI workload"}[subj.Label]
 	return truncate(fmt.Sprintf("%s: %s (%s)", detect.Name(d), name, label), 300)
 }
 

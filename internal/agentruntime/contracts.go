@@ -25,6 +25,11 @@ const (
 	LabelSuggestedAgent = "suggested_agent"
 	// LabelAgent: provider-native (projector) or classified by a person.
 	LabelAgent = "agent"
+	// LabelPossibleAIWorkload: no model-call evidence, but its configuration
+	// names a model provider (env var names, layers, readable model-key
+	// secrets). The weakest label: agent > suggested_agent > ai_workload >
+	// possible_ai_workload > "". Never suggested as an agent from names.
+	LabelPossibleAIWorkload = "possible_ai_workload"
 )
 
 // Event is one CloudTrail record, normalised. Produced by the LookupEvents
@@ -220,7 +225,8 @@ type Subject struct {
 	ConnectorID uuid.UUID   // the account's connector
 	WorkloadIDs []uuid.UUID // cloud_workload rows that run as the identity
 	// Label is the strongest of LabelAgent, LabelSuggestedAgent,
-	// LabelAIWorkload, or "" when the identity is none of them.
+	// LabelAIWorkload, LabelPossibleAIWorkload, or "" when the identity is
+	// none of them.
 	Label string
 	// SharedRole: more than one workload runs as the identity.
 	SharedRole bool

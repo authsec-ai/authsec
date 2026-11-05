@@ -13585,3 +13585,25 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agent_live_event_seen');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 152 (continued): agent_finding admits 'ai_config_hint' and
+-- 'ai_network_traffic'; agent_alert.subject_label admits
+-- 'possible_ai_workload'. Same objects as
+-- migrations/master/152_agent_live_event_seen.sql.
+-- ============================================================================
+
+DO $$
+BEGIN
+    IF to_regclass('public.agent_finding') IS NOT NULL THEN
+        ALTER TABLE public.agent_finding DROP CONSTRAINT IF EXISTS agent_finding_kind_chk;
+        ALTER TABLE public.agent_finding ADD CONSTRAINT agent_finding_kind_chk
+            CHECK (kind IN ('shared_role', 'human_credentials', 'long_lived_key', 'model_key_secret',
+                            'ai_config_hint', 'ai_network_traffic'));
+    END IF;
+    IF to_regclass('public.agent_alert') IS NOT NULL THEN
+        ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_check;
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_subject_label_check
+            CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent', 'possible_ai_workload'));
+    END IF;
+END $$;
