@@ -207,9 +207,15 @@ func enqueueAgentAlertDeliveries(tx *gorm.DB, ws, alertID uuid.UUID, st AgentAle
 /*                                   Slack                                    */
 /* ------------------------------------------------------------------------- */
 
-// AgentAlertConsoleLink is the console URL of an alert ("" without a base URL).
-func AgentAlertConsoleLink(id uuid.UUID) string {
-	return govConsoleLink("/iga/agent-runtime/alerts/" + id.String())
+// AgentAlertConsoleLink is the console URL an alert links to ("" without a
+// base URL): the AWS account's connection page. The console has no alerts
+// page yet, and a link must name a page it serves (AS-124); point it at
+// /iga/agent-runtime/alerts/<id> when the console adds one.
+func AgentAlertConsoleLink(connectorID uuid.UUID) string {
+	if connectorID == uuid.Nil {
+		return ""
+	}
+	return govConsoleLink("/iga/connections/" + connectorID.String())
 }
 
 func renderAgentAlertNotice(db *gorm.DB, n *models.IGAGovNotification, _ *uuid.UUID) (*GovNotice, error) {
@@ -223,7 +229,7 @@ func renderAgentAlertNotice(db *gorm.DB, n *models.IGAGovNotification, _ *uuid.U
 		return nil, GovNotifyPermanent(errors.New("the alert no longer exists"))
 	}
 	a := rows[0]
-	link := AgentAlertConsoleLink(a.ID)
+	link := AgentAlertConsoleLink(a.ConnectorID)
 	title := fmt.Sprintf("AuthSec alert (%s): %s", a.Severity, a.Title)
 	lines := []string{
 		fmt.Sprintf("Detection %s: %s", a.Detection, detect.Name(detect.ID(a.Detection))),
@@ -320,7 +326,7 @@ func BuildAgentAlertSIEMPayload(a AgentAlert, deliveryID string, now time.Time) 
 		Alert: AgentAlertSIEMAlert{ID: a.ID, WorkspaceID: a.WorkspaceID, ConnectorID: a.ConnectorID, IdentityID: a.IdentityID,
 			WorkloadIDs: wl, SubjectLabel: a.SubjectLabel, SubjectName: a.SubjectName, Detection: a.Detection,
 			DetectionName: detect.Name(detect.ID(a.Detection)), Severity: a.Severity, Title: a.Title, State: a.State,
-			FirstSeen: a.FirstSeen.UTC(), LastSeen: a.LastSeen.UTC(), EventCount: a.EventCount, Link: AgentAlertConsoleLink(a.ID)},
+			FirstSeen: a.FirstSeen.UTC(), LastSeen: a.LastSeen.UTC(), EventCount: a.EventCount, Link: AgentAlertConsoleLink(a.ConnectorID)},
 		Evidence: refs})
 }
 
