@@ -4,6 +4,21 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-05 — Agent runtime gateway: live control of MCP tool calls and model calls (branch `feat/agent-runtime-gateway`)
+
+Spec `SPEC-agent-runtime-gateway.md` (revision 1, not reviewed): visibility spec rev 1 §5.7, with the gateway in the customer's environment (provider keys and MCP credentials never reach AuthSec). AuthSec is the PDP (OpenID AuthZEN Authorization API 1.0) and the decision-log sink.
+
+### Done
+- Migration 156 (`agent_gateway`, `agent_gateway_setting`, `agent_tool_policy`, `agent_gateway_decision` append-only with a 30-day default retention), RLS, bootstrap mirror; schema of the four tables identical on upgrade and fresh bootstrap.
+- PDP `/authsec/pdp/access/v1/evaluation(s)`, `/authsec/pdp/v1/decisions`, `/authsec/pdp/v1/policy-hints` (gateway credential `agw_…` only; per-gateway limit; own per-IP ceiling). Admin `/api/iga/v1/agent-runtime/{gateways,gateway-settings,tool-policies,tool-policies/evaluate,gateway-decisions}`.
+- Gateway binary `cmd/agent-gateway` (MCP Streamable HTTP proxy with header/body validation and tool pinning; OpenAI-compatible and Anthropic proxy with usage; cache; fail mode auto/closed/open; batched upload), `deploy/agent-gateway/` (Dockerfile, Helm values, README, example config).
+- Tests: unit (`internal/agentgateway/...`), integration `TestAgentGateway*` (isolation, append-only, retention, rates), ratchet 72/72, IGA isolation check.
+
+### Open
+- Review of the spec; UI; pin approval from the console (Q1); mirroring decisions into `agent_activity_event` (155) once it lands; AuthZEN `/.well-known/authzen-configuration` at the host root.
+
+---
+
 ## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
 
 Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.
