@@ -4,6 +4,19 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-05 — Model provider usage, OpenAI and Anthropic (branch `feat/agent-runtime-provider-usage`)
+
+Spec `SPEC-agent-runtime-provider-usage.md`. Built opt-in despite review 2's concern (Ritam, pending Aditya). Committed locally; nothing pushed.
+
+### Done
+- Migration 154: `model_provider_connection` (admin key in Vault per workspace, fingerprint only in the row), `model_provider_key`, `model_provider_usage` (hourly); `agent_finding` admits `ai_config_hint`, `ai_network_traffic`, `unaccounted_model_usage`, `connector_id` nullable, `provider_connection_id` added.
+- `internal/modelprovider`: GET-only clients for the OpenAI and Anthropic Admin APIs (fixed hosts, no redirects, 429 backoff, 401/403 as a refused key).
+- Hourly sync worker, weak attribution by name (Secrets Manager secret names with readers, Lambda env-var names), finding `unaccounted_model_usage`.
+- Routes `/api/iga/v1/agent-runtime/model-providers` (connect, list, get, rotate, revoke, sync, keys, usage), audited.
+
+### Open
+- Aditya's sign-off; UI (connect dialog, keys and usage views); Anthropic's Usage and Cost Analytics API (the messages report is legacy); verify both providers against a real organisation.
+
 ## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
 
 Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.
