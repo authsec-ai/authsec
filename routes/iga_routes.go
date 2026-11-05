@@ -109,5 +109,9 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime/model-providers
 		// (agent_runtime_provider_controller.go).
 		platformCtrl.MountAgentRuntimeProviderRoutes(iga, platformCtrl.NewAgentRuntimeProviderControllerFor(igaGraphRead))
+
+		// Agent runtime activity timeline (SPEC-agent-runtime-activity.md §7):
+		// /api/iga/v1/agent-runtime/{activity,otlp-tokens} (agent_runtime_activity_controller.go).
+		platformCtrl.MountAgentRuntimeActivityRoutes(iga, platformCtrl.NewAgentRuntimeActivityControllerFor(igaGraphRead))
 	}
 }

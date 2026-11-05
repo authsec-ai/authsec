@@ -122,3 +122,7 @@ services/agent_runtime_dns.go
 controllers/platform/agent_runtime_provider_controller.go
 services/model_provider.go
 services/model_provider_sync.go
+controllers/platform/agent_runtime_activity_controller.go
+services/agent_runtime_activity.go
+services/agent_runtime_activity_otlp.go
+services/agent_runtime_activity_spans.go
