@@ -837,7 +837,24 @@ func (s *AWSWorkloadScanner) trailAttribution(
 			names[att.UserName] = true
 		}
 	}
-	identities, err := s.identities.FindForAttribution(workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+	return trailIdentityMatcher(s.identities, workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+}
+
+// trailAttributionFinder is the one read trailIdentityMatcher needs
+// (repositories.CloudIdentityRepository.FindForAttribution).
+type trailAttributionFinder interface {
+	FindForAttribution(workspaceID, connectorID uuid.UUID, nativeIDs, iamUserNames []string) ([]models.CloudIdentity, error)
+}
+
+// trailIdentityMatcher reads the connector's identities named by arns (and
+// IAM users named by names) in ONE read and returns the matcher with the
+// incarnation check described on trailAttribution. Shared by the scan and the
+// live model-call sink (agent_runtime_live.go), so both attribute an event
+// to exactly the same identity.
+func trailIdentityMatcher(
+	find trailAttributionFinder, workspaceID, connectorID uuid.UUID, arns, names []string,
+) (func(awsdiscovery.Attribution) (*models.CloudIdentity, bool), error) {
+	identities, err := find.FindForAttribution(workspaceID, connectorID, arns, names)
 	if err != nil {
 		return nil, err
 	}

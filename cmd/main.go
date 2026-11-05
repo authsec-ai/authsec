@@ -305,6 +305,7 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentLiveSink(config.DB)          // agent runtime: live AI-workload evidence; before the alert and verify sinks
 	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")

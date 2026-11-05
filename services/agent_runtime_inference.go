@@ -497,10 +497,24 @@ type AIWorkload struct {
 	Suggestion         *AISuggestionRef `json:"suggestion"`
 	OpenFindings       int              `json:"open_findings"`
 	UsageID            uuid.UUID        `json:"usage_id"`
+	// Live is what the event stream showed since the scan's coverage
+	// (agent_runtime_live.go); SeenLive: a model call of it was ever seen
+	// live.
+	Live     AILiveEvidence `json:"live"`
+	SeenLive bool           `json:"seen_live"`
 
 	ident  *arIdentity
 	wls    []*arWorkload
 	usageR *arUsage
+}
+
+// AILiveEvidence is the live model-call evidence not yet in the scan's exact
+// counts (ModelCallUsage.Live*).
+type AILiveEvidence struct {
+	Calls      int            `json:"calls"`
+	Denied     int            `json:"denied"`
+	LastCallAt *time.Time     `json:"last_call_at"`
+	Models     map[string]int `json:"models"`
 }
 
 // AIIdentityRef is the identity the calls are attributed to.
@@ -552,8 +566,11 @@ type AISuggestionRef struct {
 }
 
 // isAIWorkload: seen calling a model, or refused one (the tag-gated template's
-// deny mode makes the untagged AI workloads show as refusals, §5.4).
-func isAIWorkload(u agentruntime.ModelCallUsage) bool { return u.Calls > 0 || u.Denied > 0 }
+// deny mode makes the untagged AI workloads show as refusals, §5.4), by the
+// scan or live (the event stream, before the next scan).
+func isAIWorkload(u agentruntime.ModelCallUsage) bool {
+	return u.Calls > 0 || u.Denied > 0 || u.LiveCalls > 0 || u.LiveDenied > 0
+}
 
 // aiWorkloads builds every AI workload of the state, sorted by identity id.
 func (st *agentRuntimeState) aiWorkloads() []*AIWorkload {
@@ -587,7 +604,10 @@ func (st *agentRuntimeState) buildAIWorkload(ident *arIdentity, u *arUsage) *AIW
 		Coverage:     AICoverage{From: u.usage.CoveredFrom, To: u.usage.CoveredTo, Partial: u.usage.Partial},
 		OpenFindings: st.openFindings[ident.ID],
 		UsageID:      u.ID,
-		ident:        ident, wls: wls, usageR: u,
+		Live: AILiveEvidence{Calls: u.usage.LiveCalls, Denied: u.usage.LiveDenied,
+			LastCallAt: u.usage.LiveLastCallAt, Models: arNonNil(u.usage.LiveModels)},
+		SeenLive: u.usage.LiveLastCallAt != nil,
+		ident:    ident, wls: wls, usageR: u,
 	}
 	for _, w := range wls {
 		ai.Workloads = append(ai.Workloads, AIWorkloadRef{CloudWorkloadID: w.ID, WorkloadID: w.GraphID,

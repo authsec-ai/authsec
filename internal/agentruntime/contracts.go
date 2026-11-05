@@ -189,6 +189,23 @@ type ModelCallUsage struct {
 	// same windows (event source -> successful calls): the "acted on other
 	// resources" evidence of a suggested agent (§5.3).
 	OtherServices map[string]int `json:"other_services"`
+
+	// Live evidence (the "agent_runtime_live" sink): model calls seen on the
+	// event stream (or a poll's dispatch) AFTER the scan's exact coverage of
+	// their region, so a new AI workload shows before the next scan. Never
+	// added to the exact counts above, which only the scan writes. An event
+	// inside the scan's coverage of its region is not counted live (the scan
+	// counts it). LiveCalls, LiveDenied, LiveModels and LiveRegions are
+	// cleared once the scan's coverage of every region in LiveRegions reaches
+	// that region's latest live call (the scan now counts those calls
+	// exactly); LiveLastCallAt is kept, so "seen live" stays answerable.
+	LiveCalls      int            `json:"live_calls"`
+	LiveDenied     int            `json:"live_denied"`
+	LiveLastCallAt *time.Time     `json:"live_last_call_at,omitempty"`
+	LiveModels     map[string]int `json:"live_models,omitempty"`
+	// LiveRegions is each region's latest live call: the counters are
+	// cleared only once the scan covers every one of them.
+	LiveRegions map[string]time.Time `json:"live_regions,omitempty"`
 }
 
 // Usage keys in cloud_usage.
