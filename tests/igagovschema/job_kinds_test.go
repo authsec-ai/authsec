@@ -23,7 +23,7 @@ func TestGovJobKindsMatch052Check(t *testing.T) {
 		t.Fatalf("read iga_gov_job_kind_check: %v", err)
 	}
 	var fromDB []string
-	for _, m := range regexp.MustCompile(`'([a-z_]+)'::text`).FindAllStringSubmatch(def, -1) {
+	for _, m := range regexp.MustCompile(`'([a-z0-9_]+)'::text`).FindAllStringSubmatch(def, -1) {
 		fromDB = append(fromDB, m[1])
 	}
 	if len(fromDB) == 0 {
