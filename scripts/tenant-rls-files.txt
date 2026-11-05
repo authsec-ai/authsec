@@ -115,3 +115,6 @@ services/agent_runtime_alert_delivery.go
 services/agent_runtime_alert_siem.go
 controllers/platform/agent_runtime_ingest_controller.go
 services/agent_runtime_ingest.go
+controllers/platform/agent_runtime_provider_controller.go
+services/model_provider.go
+services/model_provider_sync.go

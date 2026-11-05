@@ -104,5 +104,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime/{alerts,alert-settings,siem-endpoints}
 		// (agent_runtime_alerts_controller.go).
 		platformCtrl.MountAgentRuntimeAlertRoutes(iga, platformCtrl.NewAgentRuntimeAlertsControllerFor(igaGraphRead))
+
+		// Model provider usage (SPEC-agent-runtime-provider-usage.md, opt-in):
+		// /api/iga/v1/agent-runtime/model-providers
+		// (agent_runtime_provider_controller.go).
+		platformCtrl.MountAgentRuntimeProviderRoutes(iga, platformCtrl.NewAgentRuntimeProviderControllerFor(igaGraphRead))
 	}
 }

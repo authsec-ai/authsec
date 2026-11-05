@@ -331,6 +331,12 @@ func main() {
 	services.InstallAgentRuntimeAlerts(config.DB)
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
 
+	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
+	// workspace; the Vault client for admin keys, and the hourly sync worker
+	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
+	services.InstallModelProviders()
+	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
+
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL
 	// (default 12h; "0" turns it off). Safe on every replica: each pass is a

@@ -380,7 +380,7 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 // AgentFinding is one finding as the API returns it.
 type AgentFinding struct {
 	ID          uuid.UUID       `json:"id"`
-	ConnectorID uuid.UUID       `json:"connector_id"`
+	ConnectorID *uuid.UUID      `json:"connector_id"` // NULL on a model provider finding (154)
 	Kind        string          `json:"kind"`
 	SubjectKey  string          `json:"subject_key"`
 	IdentityID  *uuid.UUID      `json:"identity_id"`
