@@ -89,6 +89,9 @@ const (
 	FactKeyID     = "key_id"     // kms keyId
 	FactFunction  = "function"   // lambda functionName
 	FactBucket    = "bucket"     // s3 bucketName
+	// FactWithDecryption is ssm's requestParameters.withDecryption, stored
+	// as "true" or "false"; absent when the record does not state it.
+	FactWithDecryption = "with_decryption"
 )
 
 // Attribution is how an event is tied to an identity, mirroring
