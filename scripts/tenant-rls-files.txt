@@ -115,3 +115,8 @@ services/agent_runtime_alert_delivery.go
 services/agent_runtime_alert_siem.go
 controllers/platform/agent_runtime_ingest_controller.go
 services/agent_runtime_ingest.go
+controllers/platform/agent_gateway_controller.go
+controllers/platform/agent_gateway_pdp_controller.go
+services/agent_gateway.go
+services/agent_gateway_policy.go
+services/agent_gateway_decisions.go
