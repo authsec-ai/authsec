@@ -329,6 +329,7 @@ func main() {
 	// "agent_alerts" event sink (detections D1-D8 on events the poller and the
 	// stream dispatch), and the SIEM delivery / retention worker.
 	services.InstallAgentRuntimeAlerts(config.DB)
+	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected

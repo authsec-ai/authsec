@@ -500,6 +500,7 @@ func (s *AWSWorkloadScanner) scanRegion(
 	s.scanCredentialProviders(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
 	s.scanTrailStatus(ctx, workspaceID, snapshot, region, trail, out)
+	s.scanAgentActivitySpans(ctx, workspaceID, snapshot, region, out) // agent_runtime_activity_spans.go
 }
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are

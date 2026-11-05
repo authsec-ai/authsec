@@ -141,7 +141,7 @@ var (
 )
 
 // ingestRateLimitPaths are the event-ingest endpoints, relative to /authsec.
-var ingestRateLimitPaths = []string{"/ingest/aws/events"}
+var ingestRateLimitPaths = []string{"/ingest/aws/events", "/ingest/otlp/v1/traces"}
 
 // MennovRateLimitMiddleware creates rate limiting middleware using in-memory sliding window
 func MennovRateLimitMiddleware() gin.HandlerFunc {

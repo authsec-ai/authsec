@@ -104,5 +104,8 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime/{alerts,alert-settings,siem-endpoints}
 		// (agent_runtime_alerts_controller.go).
 		platformCtrl.MountAgentRuntimeAlertRoutes(iga, platformCtrl.NewAgentRuntimeAlertsControllerFor(igaGraphRead))
+		// Agent runtime activity timeline (SPEC-agent-runtime-activity.md §7):
+		// /api/iga/v1/agent-runtime/{activity,otlp-tokens} (agent_runtime_activity_controller.go).
+		platformCtrl.MountAgentRuntimeActivityRoutes(iga, platformCtrl.NewAgentRuntimeActivityControllerFor(igaGraphRead))
 	}
 }
