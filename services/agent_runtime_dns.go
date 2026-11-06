@@ -380,6 +380,10 @@ func withDNSTemplateNote(cov models.SurfaceCoverage, recorded string) models.Sur
 	if cov.State != models.CloudCoverageDenied || !strings.HasPrefix(cov.ErrorCode, "AccessDenied") {
 		return cov
 	}
+	if recorded != "" && recorded >= awsdiscovery.DNSScopedQueryTemplateVersion {
+		cov.Error += "; this connector's discovery template grants Logs Insights only on the log groups named in its DnsQueryLogGroupArns parameter: add the query-log group's ARN there to read it"
+		return cov
+	}
 	if recorded != "" && recorded >= awsdiscovery.DNSQueryLogTemplateVersion {
 		return cov
 	}
@@ -545,13 +549,31 @@ type dnsSubject struct {
 	Attribution dnsAttribution
 }
 
-// attributeDNSLookups decides a source's subject. In order: a Lambda
-// interface (the function it names), an ECS task interface (its task
-// definition), an instance (srcids.instance, recorded at lookup time, else
-// the interface's attachment), else the VPC.
+// attributeDNSLookups decides a source's subject. In order: the instance the
+// query log record names (srcids.instance, recorded at lookup time: the only
+// query_time attribution); then, by the network interface holding the
+// address at scan time, a Lambda interface (the function it names), an ECS
+// task interface (its task definition), the interface's instance; else the
+// VPC. An interface attached after the last lookup did not make it and is
+// not used: the address changed hands.
 func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, inv dnsInventory,
 	region, account, partition string) dnsSubject {
 	e := attr.ENI
+	if a.InstanceID != "" {
+		how := dnsAttribution{How: "srcids_instance", Confidence: "query_time"}
+		if e != nil && e.InstanceID == a.InstanceID && (e.Kind == awsdiscovery.ENIKindEKSPod || !e.PrimaryIP) {
+			how.PodLevel = "unresolved"
+			how.Note = "the address is a secondary address of the instance's network interfaces (on an EKS node, a pod's); the pod is not resolved"
+		}
+		if w := inv.find(models.WorkloadEC2Instance, a.InstanceID); w != nil {
+			return workloadDNSSubject(w, how)
+		}
+		return uninventoriedDNSSubject(models.WorkloadEC2Instance, a.InstanceID, "", region, how)
+	}
+	attachedLater := false
+	if e != nil && e.AttachTime != nil && !a.LastSeen.IsZero() && e.AttachTime.After(a.LastSeen) {
+		e, attachedLater = nil, true
+	}
 	if e != nil && e.Kind == awsdiscovery.ENIKindLambda {
 		if w := inv.lambdaFor(e.LambdaFunctionHint); w != nil {
 			return workloadDNSSubject(w, dnsAttribution{How: "eni_lambda", Confidence: "scan_time",
@@ -578,11 +600,11 @@ func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, 
 		return uninventoriedDNSSubject(models.WorkloadECSTaskDefinition, attr.ECSTask.TaskDefinitionARN,
 			"", region, how)
 	}
-	instance, how := a.InstanceID, dnsAttribution{How: "srcids_instance", Confidence: "query_time"}
-	if instance == "" && e != nil && e.InstanceID != "" {
+	instance, how := "", dnsAttribution{}
+	if e != nil && e.InstanceID != "" {
 		instance, how = e.InstanceID, dnsAttribution{How: "eni_instance", Confidence: "scan_time"}
 	}
-	if instance != "" && (e == nil || e.Kind != awsdiscovery.ENIKindECSTask) {
+	if instance != "" && e.Kind != awsdiscovery.ENIKindECSTask {
 		if e != nil && (e.Kind == awsdiscovery.ENIKindEKSPod || (e.InstanceID == instance && !e.PrimaryIP)) {
 			how.PodLevel = "unresolved"
 			how.Note = "the address is a secondary address of the instance's network interfaces (on an EKS node, a pod's); the pod is not resolved"
@@ -602,6 +624,8 @@ func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, 
 		how.Note += " (lookup failed: " + attr.Err + ")"
 	} else if e != nil && e.Kind == awsdiscovery.ENIKindECSTask {
 		how.Note += " (an ECS task network interface whose running task was not found)"
+	} else if attachedLater {
+		how.Note += " (the network interface holding the address now was attached after the last lookup)"
 	} else if e == nil {
 		how.Note += " (no network interface holds the address now)"
 	}

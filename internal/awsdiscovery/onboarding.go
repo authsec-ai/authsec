@@ -69,7 +69,11 @@ var CloudFormationTemplate string
 // CloudWatch Logs destinations, and ec2:DescribeNetworkInterfaces. Stacks on
 // an older version keep working: the dns-query-logs surface is reported
 // denied with the call and AWS's code, and the scan goes on.
-const TemplateVersion = "2026-11-05"
+//
+// Bumped again (2026-11-06): logs:StartQuery is granted only on the log
+// groups named in the DnsQueryLogGroupArns parameter, never on every log
+// group of the account. Role permissions otherwise unchanged.
+const TemplateVersion = "2026-11-06"
 
 // PermissionsVersion is the oldest template version that grants every
 // permission this build reads with: the last bump that changed the role's
@@ -84,6 +88,12 @@ const PermissionsVersion = DNSQueryLogTemplateVersion
 // DNS query-log reads (DNSQueryLogActions). A denied DNS read on a connector
 // whose stack reports an older version says so, as a fact beside AWS's code.
 const DNSQueryLogTemplateVersion = "2026-11-05"
+
+// DNSScopedQueryTemplateVersion is the first template version that grants
+// logs:StartQuery only on the log groups its DnsQueryLogGroupArns parameter
+// names. A query refused on a stack of this version or later most likely
+// names a log group the customer did not list.
+const DNSScopedQueryTemplateVersion = "2026-11-06"
 
 // ResourcePolicyTemplateVersion is the oldest template version that grants
 // resource-policy collection (§3.9) and the migration-evidence reads (§11). A

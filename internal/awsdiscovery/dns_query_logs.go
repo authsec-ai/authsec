@@ -686,6 +686,8 @@ type ENIInfo struct {
 	RequesterManaged bool
 	// InstanceID is the instance the interface is attached to, if any.
 	InstanceID string
+	// AttachTime is when the interface was attached, when AWS reports it.
+	AttachTime *time.Time
 	// PrimaryIP: the address is the interface's primary private address.
 	PrimaryIP bool
 	// LambdaFunctionHint is what follows "AWS Lambda VPC ENI-": the function
@@ -783,6 +785,7 @@ func eniInfo(ni ec2types.NetworkInterface) ENIInfo {
 	}
 	if ni.Attachment != nil {
 		e.InstanceID = aws.ToString(ni.Attachment.InstanceId)
+		e.AttachTime = ni.Attachment.AttachTime
 	}
 	switch {
 	case strings.HasPrefix(desc, lambdaENIPrefix) || ni.InterfaceType == ec2types.NetworkInterfaceTypeLambda:

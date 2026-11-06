@@ -24,15 +24,14 @@ the admin key.
 
 ## Decision record
 
-- **Ritam 2026-11-05: build opt-in despite the review-2 concern; pending
-  Aditya.** Review 2 of SPEC-agent-runtime-visibility.md said "holding
+- **Ritam 2026-11-05, signed off by Aditya 2026-11-06: built and shipped
+  opt-in.** Review 2 of SPEC-agent-runtime-visibility.md said "holding
   customers' OpenAI and Anthropic admin keys makes AuthSec a high-value
-  target; leave out of the AWS pilot". The product owner decided to build it
-  as an **opt-in** feature with the mitigations of §2. Nothing runs for a
-  workspace until one of its administrators connects an organisation.
-  Aditya's sign-off is pending; until then the feature stays out of the pilot
-  scope of SPEC-agent-runtime-visibility.md and its findings are labelled
-  with their weak basis (§5).
+  target; leave out of the AWS pilot". The product owner accepted that risk
+  for an **opt-in** feature with the mitigations of §2: nothing runs for a
+  workspace until one of its administrators connects an organisation. It is
+  in the pilot scope, and its findings are labelled with their weak basis
+  (§5).
 
 ## 1. Requirements
 

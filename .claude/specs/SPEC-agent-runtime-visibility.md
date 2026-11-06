@@ -362,7 +362,7 @@ P1.
 | Kill switch breaks shared roles, SLRs; verification only by read-back | §5.8: blast-radius preview, workload level, SLR refusal, behavioural verification |
 | Human approval is a product call | Q6 |
 | Tag-gated model access as the certain confirmation path | §5.4, P1, with audit mode |
-| Provider admin keys, LLM gateway with provider keys | Out of the AWS pilot (§2) |
+| Provider admin keys, LLM gateway with provider keys | Admin keys: opt-in, signed off 2026-11-06 (SPEC-agent-runtime-provider-usage.md). Gateway: runs in the customer's environment, AuthSec never holds the provider keys (SPEC-agent-runtime-gateway.md) |
 | Unverified MCP header and AuthZEN dates, EO naming | Removed (not needed for AWS) |
 | "Only GitHub writes `iga_agents`" unverified | Removed |
 | Kubernetes ingress described too harshly | Removed (Kubernetes deferred) |
@@ -516,14 +516,18 @@ nothing and records `last_error`.
 
 ### 11.3 Attribution
 
-For each (VPC, source address) the network interface holding the address
-**now** (`ec2:DescribeNetworkInterfaces`, filtered by private address and VPC):
+`srcids.instance` in the query log record is recorded at lookup time and
+always decides first. Otherwise, for each (VPC, source address), the network
+interface holding the address **now** (`ec2:DescribeNetworkInterfaces`,
+filtered by private address and VPC). An interface whose attachment time is
+after the last lookup did not make it (the address changed hands) and is not
+used.
 
-| Evidence | Subject | Confidence |
+| Evidence (in this order) | Subject | Confidence |
 |---|---|---|
+| `srcids.instance` in the record | the EC2 instance (and its instance-profile role) | `query_time` |
 | interface `AWS Lambda VPC ENI-<name>` / type `lambda` | the Lambda function of that name (longest inventory name it starts with) | `scan_time`; Lambda shares one interface across functions with the same subnets and security groups, and the interface names the function that created it |
 | interface described by an ECS attachment ARN | the running task holding the interface (`ecs:ListClusters/ListTasks/DescribeTasks`), then its task definition | `scan_time` |
-| `srcids.instance` in the record | the EC2 instance (and its instance-profile role) | `query_time` |
 | interface attached to an instance | the instance | `scan_time` |
 | a secondary address on an instance, or a VPC CNI interface (`aws-K8S-...`) | the instance (EKS node), **pod level unresolved** (`subject.pod_level = "unresolved"`) | as above |
 | none of these | **the VPC**: "model traffic from an unknown source in VPC X" | `none` |
@@ -550,8 +554,10 @@ A workload the interface names but the inventory lacks is still the subject
   group it was seen in has been read without a gap and without a failure since
   then (`covered_from <= last lookup`, `read_to >= last lookup + 30 d`). A log
   group no longer read keeps the finding open: unknown is not "no traffic".
-- The inference pass (`applyFindings`) neither opens nor resolves this kind;
-  inference may read an open finding as `ai_workload` evidence.
+- The inference pass (`applyFindings`) neither opens nor resolves this kind.
+  Only a `query_time` attribution is `ai_workload` evidence; a `scan_time` or
+  `none` one makes a possible AI workload, which raises no detections and
+  gets no suggestion or credential findings (§5.7).
 
 ### 11.5 Coverage and limits
 
@@ -571,12 +577,14 @@ address may since have been released or reused). A lookup is not a call.
 Nothing here fails the scan: every failure is coverage and a scan warning, and
 none of these surfaces gates reconciliation.
 
-### 11.6 Permissions: discovery template 2026-11-05
+### 11.6 Permissions: discovery template 2026-11-05, scoped in 2026-11-06
 
 Statements `DnsQueryLogConfigs` (`route53resolver:ListResolverQueryLogConfigs`,
 `route53resolver:ListResolverQueryLogConfigAssociations`,
-`ec2:DescribeNetworkInterfaces`), `DnsQueryLogInsights` (`logs:StartQuery` on
-`arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*`) and
+`ec2:DescribeNetworkInterfaces`), `DnsQueryLogInsights` (`logs:StartQuery`
+only on the log-group ARNs the customer lists in the `DnsQueryLogGroupArns`
+parameter; omitted when the list is empty, since template 2026-11-06 — IAM,
+not AuthSec's query filter, keeps every other log group out of reach) and
 `DnsQueryLogInsightsResults` (`logs:GetQueryResults`, `logs:StopQuery`; no
 resource scoping exists for them). The ECS task reads are already granted
 (MigrationEvidence). `TemplateVersion` and `PermissionsVersion` move to
@@ -587,6 +595,12 @@ stack on an older version keeps working: `dns-query-logs:<region>` is
 first to grant the DNS query-log reads; this connector's stack reports ...".
 Deliberately **not** granted: `route53resolver:Get*` and
 `logs:DescribeLogGroups` (never called).
+Template 2026-11-06 changes only that scope; `PermissionsVersion` stays
+2026-11-05. A query refused on a 2026-11-06 stack says to add the log group's
+ARN to `DnsQueryLogGroupArns`. A 2026-11-05 stack still grants `StartQuery`
+on every log group until the customer updates it. The 2026-11-06 template
+must be published to `<base>/aws/2026-11-06/authsec-aws-discovery-role.yaml`
+before release.
 
 ### 11.7 Customer setup
 

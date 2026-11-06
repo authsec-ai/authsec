@@ -96,10 +96,21 @@ func TestPossibleAIWorkloadLabels(t *testing.T) {
 			t.Fatalf("label %q", l)
 		}
 	})
-	t.Run("network traffic is an AI workload, not a suggestion", func(t *testing.T) {
+	t.Run("network traffic attributed at scan time is only possible", func(t *testing.T) {
 		r := arTestRole("r")
 		st := arTestState(r, arTestUsage(0, 0, acting), one(), nil)
 		st.network = map[uuid.UUID][]*arFinding{r.ID: {hintFinding(FindingAINetworkTraffic, r.ID)}}
+		ai := st.aiWorkloads()[0]
+		if ai.Label != agentruntime.LabelPossibleAIWorkload || ai.evidenced() || len(ai.NetworkTraffic) != 1 {
+			t.Fatalf("got %+v", ai)
+		}
+	})
+	t.Run("network traffic attributed at lookup time is an AI workload, not a suggestion", func(t *testing.T) {
+		r := arTestRole("r")
+		st := arTestState(r, arTestUsage(0, 0, acting), one(), nil)
+		f := hintFinding(FindingAINetworkTraffic, r.ID)
+		f.Evidence = json.RawMessage(`{"attribution":{"how":"srcids_instance","confidence":"query_time"}}`)
+		st.network = map[uuid.UUID][]*arFinding{r.ID: {f}}
 		ai := st.aiWorkloads()[0]
 		if ai.Label != agentruntime.LabelAIWorkload || !ai.evidenced() || len(ai.NetworkTraffic) != 1 {
 			t.Fatalf("got %+v", ai)
@@ -124,9 +135,9 @@ func TestPossibleAIWorkloadLabels(t *testing.T) {
 			t.Fatalf("label %q", l)
 		}
 	})
-	t.Run("detections run for it, titled as possible", func(t *testing.T) {
-		if !AgentAlertLabels[agentruntime.LabelPossibleAIWorkload] {
-			t.Fatal("detections must apply to possible AI workloads")
+	t.Run("detections do not run for it; a title still names it possible", func(t *testing.T) {
+		if AgentAlertLabels[agentruntime.LabelPossibleAIWorkload] {
+			t.Fatal("detections must not apply to possible AI workloads (§5.7)")
 		}
 		title := agentAlertTitle(agentruntime.Subject{IdentityID: uuid.New(), Name: "bot", Label: agentruntime.LabelPossibleAIWorkload}, "D1")
 		if !strings.HasSuffix(title, "(possible AI workload)") {

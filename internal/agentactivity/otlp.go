@@ -38,6 +38,9 @@ var (
 
 // DecodeOTLPProtobuf decodes an application/x-protobuf export request.
 func DecodeOTLPProtobuf(body []byte) ([]Span, error) {
+	if err := checkOTLPProtobufLimits(body); err != nil {
+		return nil, err
+	}
 	var td tracepb.TracesData
 	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &td); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadOTLP, err)
@@ -191,6 +194,9 @@ func DecodeOTLPJSON(body []byte) ([]Span, error) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, ErrBadOTLP
+	}
+	if err := checkOTLPJSONLimits(trimmed); err != nil {
+		return nil, err
 	}
 	var t jsonTraces
 	if err := json.Unmarshal(trimmed, &t); err != nil {

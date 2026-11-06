@@ -443,7 +443,7 @@ func (ctl *AgentOTLPIngestController) IngestTraces(c *gin.Context) {
 		spans, err = agentactivity.DecodeOTLPProtobuf(body)
 	}
 	switch {
-	case errors.Is(err, agentactivity.ErrTooManySpans):
+	case errors.Is(err, agentactivity.ErrTooManySpans), errors.Is(err, agentactivity.ErrOTLPTooLarge):
 		otlpStatus(c, http.StatusRequestEntityTooLarge, err.Error())
 		return
 	case err != nil:
