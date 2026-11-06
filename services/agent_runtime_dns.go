@@ -559,16 +559,20 @@ type dnsSubject struct {
 func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, inv dnsInventory,
 	region, account, partition string) dnsSubject {
 	e := attr.ENI
+	// srcids.instance decides first only when it is one of this account's
+	// instances. Lambda (and other managed compute) in a VPC resolves through
+	// AWS-owned hosts whose instance ids appear in srcids.instance too
+	// (observed 2026-11-06 in the lab); such an id names no customer
+	// workload, so the network interface decides instead.
 	if a.InstanceID != "" {
-		how := dnsAttribution{How: "srcids_instance", Confidence: "query_time"}
-		if e != nil && e.InstanceID == a.InstanceID && (e.Kind == awsdiscovery.ENIKindEKSPod || !e.PrimaryIP) {
-			how.PodLevel = "unresolved"
-			how.Note = "the address is a secondary address of the instance's network interfaces (on an EKS node, a pod's); the pod is not resolved"
-		}
 		if w := inv.find(models.WorkloadEC2Instance, a.InstanceID); w != nil {
+			how := dnsAttribution{How: "srcids_instance", Confidence: "query_time"}
+			if e != nil && e.InstanceID == a.InstanceID && (e.Kind == awsdiscovery.ENIKindEKSPod || !e.PrimaryIP) {
+				how.PodLevel = "unresolved"
+				how.Note = "the address is a secondary address of the instance's network interfaces (on an EKS node, a pod's); the pod is not resolved"
+			}
 			return workloadDNSSubject(w, how)
 		}
-		return uninventoriedDNSSubject(models.WorkloadEC2Instance, a.InstanceID, "", region, how)
 	}
 	attachedLater := false
 	if e != nil && e.AttachTime != nil && !a.LastSeen.IsZero() && e.AttachTime.After(a.LastSeen) {
@@ -603,8 +607,13 @@ func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, 
 	instance, how := "", dnsAttribution{}
 	if e != nil && e.InstanceID != "" {
 		instance, how = e.InstanceID, dnsAttribution{How: "eni_instance", Confidence: "scan_time"}
+	} else if e == nil && a.InstanceID != "" {
+		// No interface holds the address now; the record names an instance
+		// not in the inventory (a terminated one, or a managed host).
+		instance, how = a.InstanceID, dnsAttribution{How: "srcids_instance", Confidence: "query_time",
+			Note: "the instance named in the query log record is not in this connector's inventory"}
 	}
-	if instance != "" && e.Kind != awsdiscovery.ENIKindECSTask {
+	if instance != "" && (e == nil || e.Kind != awsdiscovery.ENIKindECSTask) {
 		if e != nil && (e.Kind == awsdiscovery.ENIKindEKSPod || (e.InstanceID == instance && !e.PrimaryIP)) {
 			how.PodLevel = "unresolved"
 			how.Note = "the address is a secondary address of the instance's network interfaces (on an EKS node, a pod's); the pod is not resolved"

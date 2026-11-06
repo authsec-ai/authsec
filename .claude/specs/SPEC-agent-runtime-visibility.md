@@ -533,7 +533,11 @@ nothing and records `last_error`.
 ### 11.3 Attribution
 
 `srcids.instance` in the query log record is recorded at lookup time and
-always decides first. Otherwise, for each (VPC, source address), the network
+decides first when it is one of the account's inventoried instances. Lambda in
+a VPC resolves through AWS-owned hosts whose instance ids also appear there
+(observed in the lab, 2026-11-06), so an id not in the inventory does not
+decide: the network interface does, and the id is used only when no
+interface holds the address. Otherwise, for each (VPC, source address), the network
 interface holding the address **now** (`ec2:DescribeNetworkInterfaces`,
 filtered by private address and VPC). An interface whose attachment time is
 after the last lookup did not make it (the address changed hands) and is not
