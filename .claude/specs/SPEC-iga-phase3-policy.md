@@ -1,7 +1,8 @@
 # SPEC: Phase 3 R1a — an independent policy product, from discovery to verified AWS change
 
-**Status:** draft for review, rewritten 7 October 2026 against the current
-code. This is the **R1a implementation spec**. R1b, R1k (Kubernetes), R2 and
+**Status:** implementation target; retirement decision updated 13 October 2026.
+The pre-Phase-3 policy stack is removed, with no compatibility or customer
+migration gates. Execution evidence below is dated and is not proof of the current build. This is the **R1a implementation spec**. R1b, R1k (Kubernetes), R2 and
 R3 are recorded as direction in §12; each needs its own implementation spec
 before any of its build tasks start.
 
@@ -39,11 +40,11 @@ Shared infrastructure is reused only through these contracts:
 | Permission rows | Global rows bound to the workspace `admin` role, as `004` / `005` do | Present and source-traced |
 | Credentials | Vault KV paths per workspace and account, as discovery uses | Present and source-traced (discovery onboarding) |
 | Audit | `auditAdminMutation` → `audit_events` on every mutating route, in addition to `iga_gov_event` | Present and source-traced |
-| Email and webhook transport | A shared sender extracted from `policy_warning_senders.go` (§4.2); the legacy warning lifecycle is not reused | Proposed (reimplemented behind a contract) |
+| Email and webhook transport | `internal/notify` transport (§4.2); no dependency on the removed warning lifecycle | Proposed (reimplemented behind a contract) |
 | Graph reads | `igaread.Reader` for AWS at the current publication; `/api/iga/v1/lookup` for identity resolution | Present and source-traced (AWS only) |
 | Console primitives | `ConsolePage`, `AdaptiveTable`, `ObjectShell` / `ObjectTabs`, `StatusBadge`, `DecisionBanner`, `RightDrawer`, `CursorPager`, `LoadFailurePanel` | Present; `ImpactPreviewDialog` and `MetricStrip` exist but have no IGA caller |
 
-## Baseline, traced
+## Original design baseline (historical, not current implementation status)
 
 Inspected: `authsec` local `authsec-staging` at `05e8291`; **the cached
 `origin/authsec-staging` is 19 commits ahead** (`caf27f1`…`c18df5e`, 5–6
@@ -76,7 +77,7 @@ present, not exercised end to end; **missing**; **proposed**; **conflict**.
 | Unified inventory | `/api/iga/v1/inventory/*` (`iga_inventory_controller.go:28-42`): cursors, max 200, total cap 10,000, not revision-pinned; per-row `graph_state` (`inventory.go:360-372,799-860`) | traced; console uses it for Kubernetes only |
 | Connections | `GET /authsec/discovery/connections` (`routes.go:1631-1637`, `igaread/connections.go:224-256`), independent conditions per connection | traced |
 | Console | Four destinations (`IgaSidebar.tsx:43-53`); `/iga/policy` is a no-network reference preview; `/iga/logs` runs on fixtures; retired routes render `RetiredPage` (`App.tsx:839-930`) | traced |
-| Legacy policy stack | UI deleted (`8e92359`); reconciler and warning workers run live every 5 min with no gate (`cmd/main.go:494-506`) | traced — disposition plan |
+| Superseded policy stack | Removed by explicit product decision; see disposition plan and migration `139` | Verify on the release being shipped |
 
 ## 0. The completion promise
 
@@ -164,7 +165,7 @@ Connections remedy where one exists. No Kubernetes finding is produced.
 | Time-bound access, session revocation | R2 |
 | Agent runtime controls | R3 |
 | Automatic application without approval | Every write is bound to an approved plan (§2.8) |
-| Any change to the legacy agent-policy stack | Disposition plan |
+| Superseded policy removal boundary | Disposition plan; no coexistence gates |
 
 ## 2. The model
 
@@ -666,7 +667,7 @@ legacy agent-lifecycle feature; Phase 3 neither reads nor migrates it.
 
 `055` seeds the four new permissions as global rows and binds them to every
 workspace `admin` role, using the same statements as `004`/`005`.
-`governance:read` is an existing row that the legacy routes also use; sharing a
+`governance:read` is an existing shared permission row; sharing a
 read permission couples nothing else. Self-approval is refused in code for
 every role, including admins.
 
@@ -1173,7 +1174,6 @@ flowchart TB
     PAPI["/api/iga/v1/policy/* — findings, targets, policies, versions,<br/>plans, reviews, approvals, rollouts, deployments, setup, events"]
     GAPI["/api/iga/v1 — graph, inventory, lookup (Phase 2)"]
     SLK["/authsec/integrations/slack — install, interactions"]
-    LEG["/authsec/governance/agent-policies — legacy, unchanged"]
   end
 
   subgraph SVC["Services and workers (in-process)"]
@@ -1190,15 +1190,10 @@ flowchart TB
     NOTIF["Notifier: email · webhook · Slack"]
   end
 
-  subgraph LEGSVC["Legacy (disposition plan)"]
-    REC["PolicyReconcileWorker · PolicyWarningWorker"]
-  end
-
   subgraph DATA["PostgreSQL"]
     G[("Graph iga_* (Phase 2)")]
     RAW[("cloud_* (Phase 1)")]
     P3[("iga_gov_* + cloud_resource_policy_* (047–056)")]
-    AP[("agent_policies … (legacy)")]
   end
 
   subgraph EXT["External"]
@@ -1225,15 +1220,12 @@ flowchart TB
   ADP -->|IAM writes| EROLE
   IAC --> GH
   NOTIF --> SLACK
-  LEG --> AP
-  REC --> AP
 ```
 
-There is no edge between the Phase 3 services and the legacy stack: Phase 3
-neither reads `agent_policies` nor enqueues `provisioning_instructions`, and
-the legacy workers never read `iga_gov_*`; the schema has no reference between the two (probe DB2; E-12). The only
-cross-reference is the read-only compatibility view of the disposition plan
-(§7.11), served by the legacy service.
+The policy worker is the sole policy lifecycle writer. The superseded agent-policy
+stack, compatibility routes, old warning scheduler and notification-copy bridge
+are removed. Phase 3 does not enqueue manual actuation instructions or mutate
+AuthSec runtime authorization. Shared discovery and graph services remain.
 
 ### 4.2 Packages and files
 
@@ -1251,9 +1243,9 @@ cross-reference is the read-only compatibility view of the disposition plan
 | `internal/awsenforce/` | Discovery-role reads; enforcement-role writes; per-op recovery; error classes; binding self-test | No |
 | `internal/iacpr/` | Render Terraform/CloudFormation changes; open/update PRs through the GitHub App; record reviewed and merged SHAs | No |
 | `internal/slackapp/` | Signature verification, message builders, interaction parsing | Mostly |
-| `internal/notify/` | Email and webhook transport extracted from `services/policy_warning_senders.go` (`SMTPWarningSender`, `HTTPWarningSender`) behind a `Send(ctx, Message)` contract; the legacy senders become thin adapters over it, with unchanged behaviour | No |
+| `internal/notify/` | Shared email/webhook transport behind `Send(ctx, Message)`; Phase 3 owns its notification lifecycle | No |
 | `services/iga_gov_evaluator.go` | The evaluation step called by the projection service (§8.2) | No |
-| `services/iga_gov_target_resolver.go` | `targets/resolve` (§2.12) | No |
+| `services/iga_gov_targets.go` | `targets/resolve` (§2.12) | No |
 | `services/iga_gov_ownership_service.go` | Owners, owner rules | No |
 | `services/iga_gov_authoring_service.go` | Policies, versions, controls, targets, proposals, bundles | No |
 | `services/iga_gov_owner_review_service.go` | Reviews, notifications, responses, deadlines | No |
@@ -1266,10 +1258,10 @@ cross-reference is the read-only compatibility view of the disposition plan
 | `repository/iga_gov_*_repository.go` | One repository per table group; the job repository copies `iga_projection_job_repository.go`'s fenced claim/renew | No |
 | `controllers/platform/iga_gov_*_controller.go` | Handlers (§7), registered in a `policy` subgroup of the graph route group | No |
 
-Not touched: `internal/policy` (the runtime PDP behind
-`oauth_as_controller.go` and `authorization_controller.go`, AuthSec runtime
-authorization), `services/policy_reconcile*`, `services/policy_warning_service.go`
-(except the sender extraction above) and every `agent_policies` repository.
+Preserved: `internal/policy`, the runtime PDP used by OAuth and authorization,
+workspace membership and permission evaluation, provider discovery and graph
+publication. The superseded agent-policy reconciler, warning service and old
+policy persistence are removed, not shared dependencies of Phase 3.
 `scripts/ci-iga-isolation-check.sh` must pass for every new file: IGA code
 names only `iga_*` tables and the allowlisted shared tables.
 
@@ -1277,7 +1269,7 @@ names only `iga_*` tables and the allowlisted shared tables.
 
 | Gate | Values | Effect |
 |---|---|---|
-| `IGA_POLICY` env | `off` (default), `on` | `on` requires `IGA_GRAPH_PROJECTION=on` and a verified Phase 3 schema: every relation and added column of `047`–`056` checked by existence, as `VerifyGraphSchema` does for the graph (`services/iga_graph_projection.go:74-101`). Fail closed: on with verification failing, every Phase 3 route returns `503 policy_unavailable` and the evaluation step is skipped. Off: the same, and the Policy destination keeps its preview. Legacy routes and workers are unaffected either way |
+| `IGA_POLICY` env | `off` (default), `on` | `on` requires `IGA_GRAPH_PROJECTION=on` and a verified Phase 3 schema: every required relation and added column through the required cleanup migration (`139`) checked by existence, as `VerifyGraphSchema` does for the graph (`services/iga_graph_projection.go:74-101`). Fail closed: on with verification failing, every Phase 3 route returns `503 policy_unavailable` and the evaluation step is skipped. Off: the same, and the Policy destination keeps its preview. No legacy policy routes or workers exist |
 | `iga_gov_settings.enforcement_mode` | `findings_only` (default), `enforce` | `findings_only`: findings, proposals, reviews, approvals and J1 export; `direct` and `iac_pr` deployments refused with `enforcement_not_enabled` |
 | `cloud_enforcement_binding.state = verified` | per account | Required for `direct` (J3) |
 | `iga_gov_iac_source` covering the role | per account/repository | Required for `iac_pr` (J2) |
@@ -1285,8 +1277,7 @@ names only `iga_*` tables and the allowlisted shared tables.
 | Evidence trust | per bundle (§2.11) | `untrusted` blocks compilation; `partial` requires per-gap acceptance at approval |
 | `GET /api/iga/v1/capabilities` | adds `policy: { findings, proposals, export, iac, enforcement, slack, providers: { aws: "supported", k8s: "not_supported" } }` with a reason per unavailable flag | The UI explains disabled actions from these flags |
 
-`IGA_LEGACY_AGENT_POLICY` (default `on`) belongs to the disposition plan; it
-gates the legacy workers, not Phase 3.
+There is no legacy policy feature flag or alternate writer.
 
 ### 4.4 Credentials
 
@@ -1363,24 +1354,22 @@ sequenceDiagram
 
 ### 6.1 Rules and the bootstrap decision
 
-- **Numbering.** The chain ends at `046_ingest_token_triggers.sql`
-  (`043`–`046` landed after this spec was first drafted against `042`);
-  `037` is reserved by `migrations/contract/037_iga_access_edges_contract.sql`.
-  Phase 3 therefore uses `047`–`056` in `migrations/master/`, applied by the
-  existing runner. The numbers were re-checked against the actual files when
-  T3.01 started (workspace rule) and the block moved up as a unit; if another
-  migration lands first, it moves up again and this section is edited, never
-  patched with a second list.
-- **Independent tables.** Every Phase 3 table is new: `iga_gov_*`, plus
-  `cloud_enforcement_binding`, `cloud_resource_policy_*`,
-  `cloud_policy_document`, the Slack tables and `iga_gov_settings`. **No
-  existing table is altered.** `agent_policies`, `agent_policy_*`,
-  `provisioning_instructions`, `iga_policy` and `iga_policy_assignment` keep
-  their columns, constraints and rows (probe DB1; the constraint fingerprint of
-  `agent_policies` is identical before and after `047`–`056`). Existing tables
-  are referenced only by FK: `workspaces`, `users`,
-  `iga_identity_accounts`, `iga_workload`, `iga_publication`,
-  `cloud_connector`, `cloud_scan_run`, `discovery_sources`.
+- **Numbering.** The core policy chain is `047`–`059`. Upstream additions
+  are `060_r1b_action_evidence.sql`, `061_r2_time_bound_access.sql` and
+  `062_r3_runtime_controls.sql`, followed by tenancy and authentication
+  migrations through `136`, and `137_access_policies.sql`. Recovery approvals and drift acceptance are added
+  by `138_iga_gov_recovery_approval.sql`; `139_retire_legacy_agent_policy.sql`
+  removes superseded policy storage. All use the existing numbered runner and
+  are mirrored in bootstrap. Do not renumber shipped upstream migrations.
+  Migration `138` adds approval scope (`version` or `recovery`) and
+  `recovery_plan_id`, one live approval per recovery plan, drift acceptance
+  fields, and the `review_response` notification kind while preserving R2 kinds.
+- **Independent policy storage.** Phase 3 owns `iga_gov_*`,
+  `cloud_enforcement_binding`, resource-policy evidence and Slack integration
+  tables. Migration `139` removes the six superseded policy tables and the
+  notification-copy column; it does not remove `provisioning_instructions`,
+  provider discovery, graph tables, runtime RBAC or workspace memberships.
+  New policy references to those shared objects remain workspace-scoped.
 - Every table: `workspace_id … REFERENCES workspaces(id) ON DELETE CASCADE`,
   `UNIQUE (workspace_id, id)`, composite FKs for every cross-object reference
   (probes DB17, DB22). **Every CHECK is NULL-safe**, because PostgreSQL
@@ -1633,7 +1622,7 @@ CREATE TABLE IF NOT EXISTS iga_gov_finding_rule (
 
 ```sql
 -- The AuthSec governance policy: customer intent and its lifecycle. It is
--- independent of the legacy agent_policies table, which Phase 3 does not read
+-- independent policy root; superseded policy storage is removed by migration 061
 -- or alter (PLAN-existing-policy-code-disposition.md).
 CREATE TABLE IF NOT EXISTS iga_gov_policy (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2703,12 +2692,11 @@ CREATE TABLE IF NOT EXISTS iga_gov_settings (
   -- Notification channels (sections 7.8, 9.3 S9): owner email on/off, the
   -- workspace webhook (https only) and the Vault path of its signing secret
   -- (never the secret), and where the values came from (default, set through
-  -- PUT /settings, or copied once from the legacy governance settings).
+  -- PUT /settings only).
   notify_email_enabled      boolean NOT NULL DEFAULT true,
   notify_webhook_url        text NOT NULL DEFAULT '' CHECK (notify_webhook_url = '' OR notify_webhook_url LIKE 'https://%'),
   notify_webhook_secret_ref text NOT NULL DEFAULT '',
-  notify_channels_source    text NOT NULL DEFAULT 'default' CHECK (notify_channels_source IN ('default','phase3','legacy_copy')),
-  notify_channels_copied_at timestamptz,
+  notify_channels_source    text NOT NULL DEFAULT 'default' CHECK (notify_channels_source IN ('default','phase3')),
   updated_by               uuid REFERENCES users(id),
   updated_at               timestamptz NOT NULL DEFAULT now()
 );
@@ -2803,7 +2791,11 @@ CREATE TRIGGER cloud_rpc_immutable BEFORE UPDATE ON cloud_resource_policy_covera
   FOR EACH ROW EXECUTE FUNCTION authsec_row_immutable();
 ```
 
-### 6.3 Rehearsal, the end-to-end path, and probes
+### 6.3 Historical schema rehearsals and probe catalogue
+
+**Historical evidence, 7 October 2026.** The `047`–`056` results below do not
+prove the current tree or retain the superseded policy schema. Migration `061`
+replaces that storage disposition. Re-run the current schema checks for release.
 
 **Proof level.** Everything in this section is an executed SQL rehearsal on a
 local scratch PostgreSQL 16 instance, never a deployed database. It proves the
@@ -2875,8 +2867,8 @@ probe, so their result is observed.
 
 | # | Probe | Expected | Result |
 |---|---|---|---|
-| DB1 | Legacy agent_policies row still insertable unchanged by 047-056 | accepted | pass |
-| DB2 | A governance policy cannot reference a legacy agent policy | FK violation | pass |
+| DB1 | Six superseded policy tables absent after the full migration chain | absent | re-run with current schema suite |
+| DB2 | A version cannot reference a nonexistent governance policy | FK violation | re-run with current schema suite |
 | DB3 | Governance policy with an unsupported provider (R1k adds k8s) | CHECK violation | pass |
 | DB4 | Governance policy with an unknown family | CHECK violation | pass |
 | DB5 | Second live control for role A, owned by p2 | unique violation | pass |
@@ -3135,7 +3127,7 @@ publication's; plans never depend on re-reading it (§2.11).
 
 | Method + path | Permission | Purpose |
 |---|---|---|
-| `GET /findings?status&kind&severity&confidence&identity_id&workload_id&account&q&rev&cursor` | `governance:read` | Findings, grouped by role on request (`group=role`) |
+| `GET /findings?status&kind&severity&confidence&identity_id&workload_id&account&category&q&rev&cursor` | `governance:read` | Findings. `category` is a readiness category: only the findings of the roles `GET /readiness` puts in it (the same computation, so the two never disagree). `group=role` returns **one entry per role** and pages by role (`limit` roles, ordered by identity id, findings without a role last; a role's findings are never split across pages): `{ identity_account_id, role_id, role_name, role_arn, findings[], workloads[≤5: { workload_id, name, runtime_kind }], workload_count }` |
 | `GET /findings/summary?rev` | `governance:read` | Counts by kind/status; `evaluated_rev`, `latest_rev`, last evaluation status |
 | `GET /readiness?account&cursor` | `governance:read` | Remediation readiness per role with open findings, in **one** category each, by precedence: `blocked_by_collection` > `ineligible` > `needs_owner` > `iac_only` > `direct_eligible`; plus `no_change_needed`. Returns counts per category (they sum to the roles reviewed) and per role the category, every reason (not only the deciding one) and the remedy link. Computed server-side from the latest complete evaluation, coverage, ownership, binding and IaC-source state; no proposal is compiled |
 | `GET /findings/:id` | `governance:read` | Finding, rationale, interval, grant age, owners, linked policy, the collection gap it depends on (link to the connection, L-16) |
@@ -3175,8 +3167,8 @@ Resolve response for one key:
 
 | Method + path | Permission | Purpose |
 |---|---|---|
-| `GET /policies?family&provider&status&lifecycle&q&cursor` | `governance:read` | Phase 3 policies only: `{ id, name, family, provider, lifecycle, scope_summary, status, last_verified_at, owner, next_action }`. Legacy agent policies are not mixed in (§7.10) |
-| `POST /proposals` | `governance:author` | From `{ "from": { "finding_ids": [...] } }`, `{ "template": "right_size_services", "keys": [...] }` or `{ "context": { "object_id": "…" } }` (a Discovery object or graph relationship). The server resolves targets (§2.12), builds evidence bundles, and creates the policy, controls (`planned`), version 1 and targets; returns the draft and recommendation. `409 role_controlled_by_policy` with `detail.policy_id`; `422 target_not_supported` / `evidence_untrusted` per key |
+| `GET /policies?family&provider&status&stage&lifecycle&q&cursor` | `governance:read` | Phase 3 policies only: `{ id, name, family, provider, lifecycle, scope_summary, status, stage, delivery, last_verified_at, owner, next_action }`. `status` is the current version's; **`stage`** is where the policy stands, one definition for the list, its tiles and the detail: `archived`; `drifted` (a live control's current deployment is drifted and not accepted); `failed` (failed, blocked or unresolved); `canary`; `observing`; `verified` (every live control's current deployment verified); `partial` (some); `applying` (deployments, none verified); then the version: `in_review`, `approved`, `draft`, else `idle`. A deployment that is superseded, undone or recovered says nothing about the role now and is not counted, and neither is a drift an operator accepted (settled). `delivery` is the newest current deployment's; `last_verified_at` the newest verification of a live control's deployment. `meta.stage_tiles` counts the workspace's non-archived policies per stage whatever page or filter is shown (the S7 tiles; the UI never derives counts from rows). There is no legacy policy list (§7.10) |
+| `POST /proposals` | `governance:author` | From `{ "from": { "finding_ids": [...] } }`, `{ "template": "right_size_services", "keys": [...] }` or `{ "context": { "object_id": "…" } }` (a Discovery object or graph relationship). Dedicated identity: `{ "template": "dedicated_identity", "keys": [one role], "isolation": { "workload": { "workload_id", "binding_kind", "binding_ref" }, "role_name", "role_path" }, "delivery": "iac_pr" or "export" }`. This entry does not require a right-sizing policy or unused-service finding. The server reads and copies source-role documents and checks the selected workload binding; it never trusts caller-supplied policy hashes. The server resolves targets (§2.12), builds evidence bundles, and creates the policy, controls (`planned`), version 1 and targets; returns the draft and recommendation. `409 role_controlled_by_policy` with `detail.policy_id`; `422 target_not_supported` / `evidence_untrusted` per key |
 | `GET /policies/:id` | `governance:read` | Policy, current version, controls, rollout, per-target state, next action |
 | `PATCH /policies/:id` | `governance:author` | `{ name?, purpose?, owner_user_id? }` |
 | `POST /policies/:id/pause` · `/resume` | `governance:enforce` | `{ reason }`; lifecycle `paused`/`active` |
@@ -3221,9 +3213,9 @@ edge's removal as revocation (requirements scenario 2).
 
 | Method + path | Permission | Purpose |
 |---|---|---|
-| `GET /reviews?mine=true&status` | member | Reviews where the caller is an owner |
-| `GET /reviews/:id` | owner of a subject or `governance:read` | Version, diff, consumers, age and route confirmations requested, the caller's response, deadline |
-| `POST /reviews/:id/respond` | owner of a subject | `{ response: "acknowledge" \| "retain" \| "object", retain_items: [{ service, reason, review_by }], age_confirmations: [{ service, confirmed: true }], route_confirmations: [{ service, route, confirmed: true }], comment }`. `retain`/`object` creates a draft version and reopens the review when `impact_hash` changes |
+| `GET /reviews?mine=true&status&order` | member | Reviews where the caller is an owner. Newest first; `order=due` lists open reviews first by deadline, then closed ones, with a keyset cursor, so the order holds across pages (S4b) |
+| `GET /reviews/:id` | owner of a subject or `governance:read` | Version (with `created_by_name`, so an owner who cannot list members still reads who asked), `deployments` (the version's forward deployments, so an owner who cannot list deployments can still report on the change), diff, consumers, age and route confirmations requested, the caller's response, deadline |
+| `POST /reviews/:id/respond` | owner of a subject | `{ response: "acknowledge" \| "retain" \| "object", retain_items: [{ service, reason, review_by }], age_confirmations: [{ service, confirmed: true }], route_confirmations: [{ service, route, confirmed: true }], comment }`. `retain`/`object` creates a draft version and reopens the review when `impact_hash` changes, **and notifies the version's author** (a `review_response` notice: who kept which service and why, or who objected; one row per review and recipient, resent on each new response) |
 | `POST /reviews/:id/exception` | `governance:approve` | `{ reason }` — proceed without a missing owner or response |
 | `POST /reviews/:id/remind` | `governance:author` | Re-send to non-responders |
 
@@ -3242,11 +3234,14 @@ edge's removal as revocation (requirements scenario 2).
 
 | Method + path | Permission | Purpose |
 |---|---|---|
-| `GET /deployments?policy_id&state&account&kind&cursor` | `governance:read` | Policy › Deployments and policy detail |
-| `GET /deployments/:id` | `governance:read` | Attempts with their write-ahead status (`prepared`, `dispatched`, `completed`, `unknown`, `abandoned`), request hash, signing time and AWS request id; for isolation plans, each migration subject with its evidence and remaining references; verifications, per-service outcomes, validations, health reports, ledger rows, PR, the approved evidence bundle, revalidations with their `changes`, acceptances |
+| `GET /deployments?policy_id&state&account&kind&delivery&attention&cursor` | `governance:read` | Policy › Deployments and policy detail. An `outcome_unresolved` deployment first, then **newest first**; the cursor is a keyset over (group, created_at, id), so the order holds across pages. `delivery` is `direct`, `iac_pr` or `export`. `attention=1` keeps deployments that need a person: blocked, failed, `outcome_unknown`, `outcome_unresolved`, drifted and not accepted, `applied_unverified` past `verify_deadline_at`, `awaiting_apply` past `apply_deadline_at` |
+| `GET /deployments/:id` | `governance:read` | `context` (policy, version number, account, role), `iac_change` (branch, PR number and URL, proposed, reviewed and merged SHA, state) for an `iac_pr` deployment, `recovery_plans` (§8.9, each with its approval), attempts with their write-ahead status (`prepared`, `dispatched`, `completed`, `unknown`, `abandoned`), request hash, signing time and AWS request id; for isolation plans, each migration subject with its evidence and remaining references; verifications, per-service outcomes, validations, health reports, ledger rows, PR, the approved evidence bundle, revalidations with their `changes`, acceptances |
 | `POST /deployments/:id/resolve` | `governance:enforce` (`governance:emergency` for `emergency_undo`) | For `outcome_unresolved` (§8.1): `{ action: "reread" \| "accept_observed" \| "emergency_undo", reason }`. `accept_observed` compiles a plan and opens its review; the role stays held until that plan is approved and its deployment takes over in the atomic handoff. `409 outcome_unknown_pending` while still `outcome_unknown` before `settle_after` |
 | `POST /deployments/:id/undo` | `governance:enforce` | Undo to the recorded before-state (§8.9), authorized by the original approval's undo plan hash; `409 not_latest_deployment`, `409 plan_changed`, `409 artifact_consumers_changed` |
-| `POST /deployments/:id/emergency-undo` | `governance:emergency` | `{ reason }` — undo without an approval reference; notifies approvers and owners |
+| `POST /deployments/:id/recovery-plans/:plan_id/approve` | `governance:approve` | `{ plan_hash, reason? }` — approves one role-only recovery plan of an apply deployment (§8.9). `plan_hash` must equal the stored plan's. `403 self_approval` (the version's author), `409 plan_changed`, `409 not_latest_deployment`, `409 version_conflict` (already approved). The approval is usable for 24 h; `POST /deployments/:id/undo { plan_id }` then names it |
+| `POST /deployments/:id/accept-drift` | `governance:enforce` | `{ reason }` — closes a drifted deployment as accepted (§8.8). `409 not_drifted`, `409 drift_already_accepted`; `409 deployment_in_flight` when the role changed while it was being read |
+| `POST /deployments/:id/reapply` | `governance:author` | `{ reason }` — opens a new proposal with the drifted deployment's intent, compiled from AWS now, in review (§8.8); returns the proposal like `POST /policies/:id/versions/:no/propose`. `409 not_drifted`, `409 control_removed` |
+| `POST /deployments/:id/emergency-undo` | `governance:emergency` | `{ reason }` — undo without an approval reference; notifies approvers and owners (§8.1 notices) |
 | `POST /deployments/:id/validations` | `governance:author` | `{ items: [{ action: "sqs:ListQueues", expected: "denied" }, { action: "s3:ListAllMyBuckets", expected: "allowed" }], correlation: "assumed_session" \| "dedicated_workload", dedicated_workload_id?, window_start, window_end, note }`; `role_id` is taken from the deployment; returns the `authsec-validate-…` session name |
 | `GET /deployments/:id/validations` | `governance:read` | Results: `matched`, `not_seen`, `contradicted` |
 | `POST /deployments/:id/health-reports` | owner of a consumer, or `governance:author` | `{ kind: "problem" \| "working", service?, detail }` |
@@ -3283,18 +3278,12 @@ The version then follows the normal approve → deploy path (§8.10).
 | `DELETE /connectors/:id/enforcement` | `governance:enforce` | Revoke (blocks new J3 deployments; lists artifacts still in AWS) |
 | `GET /connectors/:id/iac-sources` · `POST` · `DELETE /:sid` | `governance:enforce` | Map a GitHub repository/directory (from an existing GitHub discovery source of the same workspace, enforced by FK) to this account; `role_match` rules |
 
-### 7.10 Legacy compatibility (disposition plan §3)
+### 7.10 Removed policy APIs
 
-| Method + path | Permission | Purpose |
-|---|---|---|
-| `GET /api/iga/v1/legacy/agent-policies?cursor` | `governance:read` | Read-only list of the workspace's legacy agent policies, served by the legacy service: target, enabled, last reconcile outcome, pending destructive deadline |
-| `POST /api/iga/v1/legacy/agent-policies/:id/pause` | `governance:enforce` | Proxied to the legacy manager: sets the policy disabled; audited |
-| `DELETE /api/iga/v1/legacy/agent-policies/:id` | `governance:enforce` | Proxied removal; audited; `{ reason }` |
-
-These routes exist only while `agent_policies` has rows or
-`IGA_LEGACY_AGENT_POLICY=on`. They never create or edit a legacy policy, and
-no Phase 3 route reads or writes `agent_policies`. The legacy
-`/authsec/governance/agent-policies` routes keep their current behaviour.
+`/api/iga/v1/legacy/agent-policies`, `/authsec/governance/agent-policies`,
+legacy effective-policy, upcoming-actions, policy-warning, notification-settings
+and enforcement-plan routes are not registered. The new policy APIs in this
+section own the product. No legacy table is read or copied into settings.
 
 ### 7.11 Slack (under `/authsec/integrations/slack`)
 
@@ -3320,7 +3309,8 @@ no Phase 3 route reads or writes `agent_policies`. The legacy
 | `role_controlled_by_policy`, `policy_controls_roles` | 409 | One control per role; archive needs every control removed |
 | `version_conflict`, `plan_changed`, `impact_changed` | 409 | Re-read and review the new state |
 | `review_incomplete`, `age_unconfirmed`, `route_unconfirmed`, `residuals_not_accepted` | 409 | Owner gate and residual acceptance |
-| `self_approval` | 403 | Author cannot approve |
+| `self_approval` | 403 | Author cannot approve (a version, or a recovery plan of it) |
+| `not_drifted`, `drift_already_accepted`, `control_removed` | 409 | Re-apply and Accept drift apply to a drifted, not yet accepted deployment of a live control |
 | `approval_expired` | 409 | Re-approve |
 | `resource_policy_blocks_boundary`, `resource_policy_evidence_incomplete` | 422 | First-attachment proof (§3.4) |
 | `evaluation_incomplete` / `revision_not_retained` | 409 / 410 | Finding reads at a revision |
@@ -3398,8 +3388,14 @@ holds (probes DB131, DB132). Drift checks keep running.
    resumes or recognises the op as done (probes DB136, DB137). Otherwise the deployment becomes
    **`outcome_unresolved`**, which still holds the role.
 3. **Operator.** An `outcome_unresolved` deployment is assigned to the
-   policy's owner and every holder of `governance:enforce` (notified at once,
-   reminded hourly, shown first in Policy › Overview and Deployments). Its
+   policy's owner and every holder of `governance:enforce` (notified within one
+   sweep, about two minutes; reminded hourly; shown first in Policy › Overview
+   and Deployments). The notice is a `deployment` notice whose text follows the
+   deployment's state when it is rendered; a worker sweeper, not each state
+   change, queues it, and the unique notice row keeps replicas from sending it
+   twice. The same sweeper sends, once, the drift notice (§8.8: owner and
+   enforcers) and the emergency notice of an emergency undo or removal (owner
+   and approvers). Its
    page states what AuthSec tried, what AWS shows now, and the three choices:
    **Re-read** (repeat step 2); **Accept observed state** (compile a plan from
    what is in AWS; it needs owner review and approval); **Emergency undo**
@@ -3931,6 +3927,21 @@ which needs approval because the world changed) or **Accept drift** (closes the
 deployment as `drifted`; if AuthSec's boundary is no longer attached, the
 control moves to `removed` with reason `drift_accepted`).
 
+- `POST /deployments/:id/reapply { reason }` opens a new version with the
+  drifted deployment's intent and proposes it: plans are compiled from AWS now
+  and the version goes to owner review and approval like any other. Nothing is
+  written to AWS and the control is unchanged until that version is approved
+  and deployed.
+- `POST /deployments/:id/accept-drift { reason }` reads the role again as an
+  enforcement observer (sequence read first, posture written by the winning
+  compare-and-swap; a lost swap is `409`), marks the deployment accepted
+  (`drift_accepted_at / _by / _reason`; its state stays `drifted`, because it
+  still describes what AuthSec applied and AWS no longer matches), and
+  recomputes posture from what is attached now. When the boundary in force is
+  no longer AuthSec's, the same transaction retires the control (`removed`,
+  event `control.removed` with reason `drift_accepted`). An accepted drift is
+  no longer "needs attention" and sends no further notice.
+
 ### 8.9 Undo
 
 Undo restores **exactly the state recorded before the deployment**, using the
@@ -3968,7 +3979,14 @@ Rules:
     document, `artifact_disposition = retain_shared` for the shared one.
 
   Its plan hash is not in the original approval, so it needs its own approval
-  (or `governance:emergency` with a reason). It reaches `verified` on the
+  (or `governance:emergency` with a reason). The own approval is
+  `POST /deployments/:id/recovery-plans/:plan_id/approve` by a holder of
+  `governance:approve` other than the version's author, who approves the plan
+  hash they were shown; it is a `scope = 'recovery'` row of `iga_gov_approval`
+  naming that one plan, valid for 24 hours to request the undo, and it never
+  marks the version approved. `POST /deployments/:id/undo { plan_id }` then
+  creates the undo deployment naming that approval; the executor's rule (the
+  approval names the plan's hash) is unchanged. It reaches `verified` on the
   disposition-aware rules of §8.7: this role's attachment as desired, and the
   shared policy still present, unchanged, used by exactly the others. The
   ledger records the shared policy as `released` (AuthSec no longer manages
@@ -4173,7 +4191,6 @@ Logs' real events are the whole of the new surface.
 | `/iga/policy/reviews` · `/iga/policy/reviews/:id` | S4b My reviews · S4 Owner review (the link in email and Slack) |
 | `/iga/policy/deployments` · `/iga/policy/deployments/:id` | S8 Deployments: everything in flight or needing attention, across policies |
 | `/iga/policy/setup/:section?` | S9 Setup: `enforcement`, `iac`, `notifications`, `settings` |
-| `/iga/policy/legacy` | Read-only **Legacy agent policies** (§7.10), shown only when the compatibility read returns rows |
 | `/iga/logs` | Logs (§9.6) |
 
 **Retired-route replacements.** Once `IGA_POLICY` is on, the bookmarks that
@@ -4181,7 +4198,7 @@ today render `RetiredPage` (`App.tsx:839-930`) redirect:
 
 | Bookmark | Replacement |
 |---|---|
-| `/iga/policies` | `/iga/policy/policies` (with a link to `/iga/policy/legacy` when legacy rows exist) |
+| `/iga/policies` | `/iga/policy/policies` |
 | `/iga/policy-warnings` | `/iga/policy/deployments?attention=1` |
 | `/iga/enforcement` | `/iga/policy/deployments` |
 | `/iga/upcoming` | `/iga/policy` (Overview › Coming up) |
@@ -4281,12 +4298,20 @@ Remove (11)                           Keep (4)
 ☑ sns      no attempt · 112 d  ⚠ age  logs      ECS execution dependency
 …                                     glue      granted, not in the activity report
                                       + Keep a service…
-Window: [112 days ▾]  (longest supportable for this role: 112)
+Window: 90 days  (workspace default · longest supportable for this role: 112)  [Change in Setup]
 ⚠ age: the grant existed before AuthSec's first scan; owners will be asked to confirm.
 This restricts whole services for this role. Actions and resources within the
 services it keeps are not narrowed.
                                                            [Back]  [Next: impact]
 ```
+
+The window is the evidence window the findings were evaluated with: the
+workspace default (`default_window_days`) or an `unused_window` finding rule
+that covers the role (Policy › Setup). The review deadline is the workspace's
+`owner_review_days`. Neither is a per-policy choice: the proposal's intent has
+no field for either, so the wizard shows them read-only with a link to Setup
+rather than a dropdown that would change nothing. A per-policy override is a later change that needs an intent
+field and a migration; it is not in this release.
 
 Opened from a graph relationship, step 1 adds: "You started from
 `RefundTaskRole → sqs:*` on `refunds`. sqs is also granted by
@@ -4309,7 +4334,7 @@ reported by AWS's activity report, so AuthSec cannot tell whether it is used.
 Owners who will be asked (2)
 Akash M.   owner of refund-agent        email · Slack
 Priya K.   owner of refund-reconciler   email
-Review deadline: [3 business days ▾]
+Review deadline: 3 days  (workspace setting, calendar days)  [Change in Setup]
                                                         [Back]  [Next: rollout]
 ```
 
@@ -4493,29 +4518,48 @@ to Setup. Connections never shows policy findings.
 
 ### 9.4 Discovery and graph entrypoints
 
-- **Identity page** (`/iga/identities/:id`): status chip (`Boundary · verified`
-  / `applying` / `drifted`) when controlled; **Findings** and **Owners**
-  panels; **Create policy** (or **Edit <policy>**) opens
-  `/iga/policy/new?object=<id>`.
-- **Workload page** (`/iga/estate/:id`): **Owners** panel; findings for its
-  execution identity.
-- **Graph `SelectionCard`**: for an identity, **Right-size this role** when it
-  has open `unused_service`/`broad_grant` findings; for a statement→resource
-  relationship, **Create policy** with the relationship as context. The
-  overlay never paints a path "blocked"; declared grants stay drawn.
-- **Kubernetes object pages** (`/iga/k8s/:kind/:id`) and Kubernetes inventory
-  rows: a quiet line "Policy is not yet supported for Kubernetes. It needs
-  authenticated, ordered collection from this cluster (K-1)", linking to the
-  cluster's connection. No Create policy action.
+One rule governs every entrypoint: **a policy changes an IAM role, by removing
+whole AWS services it does not use.** So whatever the user clicks, the action
+leads to a role. Roles are found by walking the drawn lines back from the
+clicked node (role → statement → resource is two hops). The object's id goes to `POST /policy/targets/resolve` (§2.12)
+when the action is used; the server decides what is eligible, and no screen
+builds a target from a loaded row, a capped list or a truncated graph. Where
+the resolve answer says a policy already controls the role, the action reads
+**Edit <policy name>** and opens that policy; it never offers a create button
+that can only refuse. Nothing below renders while `IGA_POLICY` is off.
 
-### 9.5 Legacy agent policies
+**Boundary chip.** `Boundary · <state>`, text and colour, with the meaning on
+hover. The state is the role control's newest current **apply or split**
+deployment (`verified`, `applying`, `drifted`, …); a superseded, undone or
+recovered deployment is not current, and a finished undo or control removal
+never makes the chip say `verified`. A control being removed says so first. Before any deployment it says `planned` or `being
+removed` from the control itself. It is never `verified` unless a deployment
+said so.
 
-`/iga/policy/legacy` lists the compatibility read (§7.10): name, target
-agent or selector, enabled, last reconcile outcome, pending destructive
-deadline. Actions: **Pause** and **Remove** (confirmation names what the
-legacy reconciler will do next). No create or edit. A banner explains that
-these are the previous Kubernetes agent-lifecycle policies, still run by the
-legacy reconciler until its retirement gate.
+| Surface | What it shows | Action |
+|---|---|---|
+| **Identity page** (`/iga/identities/:id`, IAM role) | Boundary chip when controlled; **Findings** and **Owners** panels | **Right-size this role**, or **Edit <policy>** when controlled; opens `/iga/policy/new?object=<id>` |
+| **Workload page** (`/iga/estate/:id`) | **Owners** panel; findings for the roles it runs as | None: a workload has no policy of its own |
+| **Graph: IAM role node** | A *Policy* section on the selection card: chip, "N open findings" with a link to Findings filtered to the role, "No open findings" otherwise | **Right-size this role** (primary when the role has open findings, outline when it has none) or **Edit <policy>** |
+| **Graph: workload node** | One line: a workload has no policy of its own; a policy changes the role it runs as and everything that runs as that role | **Right-size the role it runs as**; the server resolves the role; more than one answers *ambiguous* and says to open the role |
+| **Graph: resource or statement node** | "AuthSec changes roles, not resources. A policy removes whole AWS services a role does not use; it cannot restrict one resource." Then the roles **drawn on the canvas** that reach it (up to 5, "+N more"), labelled "Others may exist that the canvas has not loaded" | **Right-size** next to each role; it asks the server only when clicked (so a role that is already controlled answers with a link to its policy). With no role drawn: "Expand the graph to see who can, then select a role." The list is a convenience for choosing a role, never a claim of who can reach the resource |
+| **Graph: grant line** (identity → resource) | "A policy changes the role, not one grant. It removes whole services the role does not use, so every grant to a removed service goes with it; this line stands for N grants." | **Create policy for this role**. For a Deny line: "A policy only removes access, so there is nothing to create from it." |
+| **Graph: IAM user or group** | "A policy changes IAM roles. It is not offered for IAM users / IAM groups." | None |
+| **Graph, Kubernetes object pages and Kubernetes inventory** | "Policy is not yet supported for Kubernetes", with the prerequisite the server names (K-1) and a link to Connections (clusters have no connection page of their own) | None |
+| **Graph: GitHub, external principals and other nodes** | Nothing about policy | None: no provider support in R1a |
+
+The selection card's policy section is the only place the graph shows policy
+state. **The canvas itself does not draw control chips on every node**: a
+card's height depends on its indicators, so adding a chip when an asynchronous
+read arrives would move a laid-out graph. Declared grants stay drawn and
+nothing is ever painted "blocked".
+
+### 9.5 Single policy workspace
+
+No Legacy policies page, notice, sidebar item or network request. Previous
+policy bookmarks redirect to the current policy workspace; there is no second
+authoring model. Kubernetes discovery remains visible without implying that
+AWS policy controls enforce Kubernetes permissions.
 
 ### 9.6 Logs
 
@@ -4524,7 +4568,7 @@ legacy reconciler until its retirement gate.
 from `GET /policy/events` (§7.8) — proposal, review response, approval and
 each acceptance, revalidation, rollout stage, deployment attempt (with AWS
 request id, including `unknown` attempts), verification, drift, undo, control
-removal, settings change, legacy pause/remove. Each event links to its object
+removal, settings change. Each event links to its object
 in Policy. Event categories that have no source yet (connection added or
 revoked, scan, publication) appear in the kind filter as **Not recorded yet**,
 disabled, with one line explaining it; no sample event is mixed into the
@@ -4578,10 +4622,10 @@ the trigger. Tables are fitted with card mode below 640 px.
 | `src/app/api/cloudDiscoveryApi.ts` | Binding and IaC source endpoints (§7.9) |
 | `src/app/api/slackIntegrationApi.ts` (new) | §7.11 |
 | `src/app/api/igaGraphApi.ts` | `GraphCapabilities.policy` |
-| `src/features/iga/policy/` | `PolicyPage` becomes Overview (preview kept for gate off); new `findings/`, `policies/` (`PolicyDetailPage` + `tabs/*`), `new/` (`NewPolicyFlow` + `steps/*`), `reviews/`, `approvals/`, `deployments/`, `setup/`, `legacy/`, shared `UndoDialog`, `RemoveControlFlow`, `ValidationDialog` |
+| `src/features/iga/policy/` | `PolicyPage` becomes Overview (preview kept for gate off); new `findings/`, `policies/` (`PolicyDetailPage` + `tabs/*`), `new/` (`NewPolicyFlow` + `steps/*`), `reviews/`, `approvals/`, `deployments/`, `setup/`, shared `UndoDialog`, `RemoveControlFlow`, `ValidationDialog` |
 | `src/features/iga/logs/` | With the gate on, recorded policy events from `igaPolicyApi` only, and unrecorded kinds shown as *Not recorded yet*; `fixtures.ts` only in the gate-off preview |
 | `src/features/iga/connections/OverviewTab.tsx` | Enforcement line (read-only) |
-| `src/features/iga/identities/`, `estate/`, `graph/SelectionCard.tsx`, `k8s/K8sObjectPage.tsx` | §9.4 |
+| `src/features/iga/identities/`, `estate/`, `graph/SelectionCard.tsx` + `graph/PolicyCardSection.tsx`, `discovery/InventoryScreen.tsx`, `k8s/K8sObjectPage.tsx`; shared `policy/findings/ControlChip.tsx`, `useObjectPolicy.ts`, `CreatePolicyAction.tsx` | §9.4 |
 | `src/App.tsx` | Routes in §9.2; retired-route redirects gated on `capabilities.policy` |
 | `src/components/layout/IgaSidebar.tsx` | No new entry. Policy and Logs drop their `Preview` tags when `capabilities.policy` is on |
 
@@ -4607,14 +4651,14 @@ the trigger. Tables are fitted with card mode below 640 px.
 | Forged or replayed discovery evidence | A plan is compiled only from a `trusted` or explicitly accepted `partial` bundle (§2.11); Kubernetes evidence arrives through an ingress that is unauthenticated today (`routes.go:1449-1479`) and has no ordering guard, so it is `untrusted` and produces no finding or plan until K-1 (§12.2) |
 | Evidence changed after compilation | The bundle is insert-once and hash-verified; its hash is inside the plan hash the approval binds; the deploy job re-reads live AWS state before every write and stops on a changed precondition (§2.8, §2.11, §8.5) |
 | Wrong target from a partial list | Targets are resolved server-side by immutable key (`RoleId`), never from capped lists or a truncated graph (§2.12) |
-| Two systems owning one artifact | Phase 3 never reads or writes `agent_policies`, `provisioning_instructions`, `role_bindings` or the runtime PDP's `policies`; the legacy stack never touches AuthSec boundaries; R1k refuses a cluster whose workspace has an enabled legacy policy (disposition plan §3; E-12) |
+| Policy ownership | The superseded stack is removed. Phase 3 does not write `provisioning_instructions`, `role_bindings` or runtime PDP `policies`. Provider adapters only change artifacts allowed by their reviewed plan |
 | Cross-workspace access | Authenticated workspace only; composite FKs (probe DB17); the AWS policy tag rejects another workspace's artifact; Slack team bound to one workspace |
 | Confused deputy on the enforcement stack | Separate ExternalId per workspace+account, HMAC-bound like discovery's; single-use Quick Create session |
 | Secrets in evidence | `igagov.RedactEventPayload`; CloudTrail facts store ids, codes and a denial classification, never request parameters or message text; documents archived are policy documents only |
 | Crash or duplicate worker | Fenced leases, lease margin before AWS calls, live-state classification, idempotent ops (§8.1, §8.5) |
 | Delayed AWS mutation landing after a newer change | No exactly-once claim: a write-ahead attempt is committed before dispatch; a dispatched call without an answer is `unknown`; `outcome_unknown` and `outcome_unresolved` hold the role until resolved, and only an atomic handoff releases it; SDK retries are off for mutating calls; late arrivals are reported as `late_mutation_suspected` drift (§8.1). Not yet proven by fault injection (A58) |
 | Approval silently carried across changed evidence, or re-requested for nothing | Approved evidence is never rewritten; each recheck is an insert-once revalidation; only a named material change needs re-approval (§2.8) |
-| Audit tampering | `iga_gov_event` append-only trigger (deletable only during workspace purge); `audit_events` on every Phase 3 mutating route (T3.20). The legacy handlers `ForceEvictAgent` and `UpdateNotificationSettings` (`governance_controller.go:831,922`) write no audit row today; that repair belongs to the disposition plan |
+| Audit tampering | `iga_gov_event` append-only trigger and `audit_events` on every Phase 3 mutation; verified human membership is the actor |
 | Slack token leak | Bot token in Vault; scopes `chat:write`, `users:read`, `users:read.email` |
 
 ---
@@ -4879,7 +4923,7 @@ ineligible for direct apply, because the controller would revert the change;
 they are offered the manifest-PR or export journey.
 
 **Coexistence.** The R1k deployment job refuses a cluster whose workspace has
-an enabled legacy agent policy (disposition plan §3.3). NetworkPolicy
+an active separately managed containment. NetworkPolicy
 containment and admission policies are not R1k mechanisms (requirements §5.1).
 
 **Schema.** R1k adds `k8s` to `iga_gov_policy.provider` and a Kubernetes
@@ -4927,14 +4971,12 @@ in that engine before choosing to build an AuthSec evaluator.
 
 ### 13.1 Order
 
-Following the workspace build sequence (schema and design locked → UI/UX →
-backend), with the lab integration last. The disposition plan's first two
-steps run in parallel with Stage A, because R1a owns no artifact the legacy
-stack touches.
+Remove the superseded stack first, then align schema, backend and UI with the
+independent policy contracts. Finish with the lab integration.
 
 | Stage | Exit |
 |---|---|
-| **0. Legacy containment** (disposition plan §5 steps 1–2) — stale-report repair, legacy audit gaps, `IGA_LEGACY_AGENT_POLICY` (default `on`), compatibility read | Gate and compatibility read merged; G1 counts requested from the operator |
+| **0. Remove superseded policy stack** | No old workers, API routes, models, notification bridge or UI; six old tables removed by `061`; retained integrations and multitenancy build and run |
 | **A. Lock** — this spec approved; migration numbers re-checked against the files; bootstrap parity to `046` (T3.00); `047`–`056` rehearsed on a production-schema copy (the fresh-database rehearsal is §6.3); enforcement template written; its §3.6 self-test run by hand in the lab account, including the `DeleteRolePermissionsBoundary` condition-key check | Rehearsal log; template review; self-test transcript |
 | **B. UI/UX** — every §9 view against the §7 contracts with typed fixtures, reviewed in the running console | `ui-reviewer` pass; walkthrough recorded |
 | **C. Backend** — services, workers, adapters, routes | `authsec-reviewer` pass; existing checks and `ci-iga-isolation-check.sh` green; §6.3 probes re-run |
@@ -4961,16 +5003,16 @@ work items owned by the discovery and agent repositories (§12.2).
 | T3.09 | Enforcement template (incl. self-test role), `Custom::AuthSecEnforcementRegistration`, binding service, self-test | T3.01 |
 | T3.10 | `awsenforce`: discovery-role reads, enforcement-role writes with SDK retries off for mutating calls, the write-ahead attempt lifecycle (§8.1), response classification (§8.5), readback, ledger and document archive discipline | T3.09 |
 | T3.11 | Authoring, controls, proposals (from findings, templates and Discovery context), apply/undo plans from the artifact delta with explicit replaced policy, `material_hash`, acceptance rows | T3.03b, T3.06b, T3.10 |
-| T3.12 | `internal/notify` extracted from `policy_warning_senders.go` (legacy senders become adapters, behaviour unchanged); owner review (age and route confirmations, reopen on impact change), email/webhook notices | T3.07, T3.08 |
+| T3.12 | `internal/notify` transport; Phase 3 owner review, age/route confirmations, re-review on impact change and email/webhook notices | T3.07, T3.08 |
 | T3.13 | Approval (UI), SoD, invalidation | T3.11 |
 | T3.14 | Slack app | T3.13 |
 | T3.15 | Rollout: observation with fresh-report rule, `refresh_activity`, canary choice, gates, expand, pause | T3.04, T3.12, T3.13 |
 | T3.16 | The single classifier with fact-level intermediate states (§2.8); revalidation before stale deployments (§2.8); replacement-worker handling of open attempts, `outcome_unknown` / `outcome_unresolved`, settle, resolution, operator choices, atomic handoff, late-mutation drift (§8.1); deploy, verify (four dimensions, session-correlated validations, health reports, per-deployment history, current posture with the control as epoch, generated outcome, shared lock order and bounded retries, posture-based finding resolution), drift, undo with the attachment-set check and role-only recovery plans, remove control, `split_revert` | T3.10, T3.15 |
 | T3.17 | IaC sources and the supported-form matrix with fallback reasons (§8.11), PR adapter, `iac_sync` (merge, `awaiting_apply`, intermediate states, deadline, run correlation), export delivery; dedicated-identity isolation: migration subjects, compatibility list, per-subject migration evidence and completeness (§11) | T3.03b, T3.11 |
 | T3.18 | Metrics rollup: posture counts from `iga_gov_service_posture`, change counts from `iga_gov_service_outcome`; API | T3.16 |
-| T3.19 | `/api/iga/v1/legacy/agent-policies` read and proxied Pause/Remove (§7.10), on the disposition plan's compatibility read | Stage 0 |
+| T3.19 | Remove superseded policy code and compatibility surfaces (§7.10, §9.5, disposition plan), including obsolete tests and schema | Stage 0 |
 | T3.20 | `iga_gov_event` on every Phase 3 mutation; `auditAdminMutation` on every Phase 3 route; events API and export | T3.01 |
-| T3.21–T3.30 | UI: §9.2 routes and redirects, S1–S9, Discovery entrypoints (§9.4), legacy view (§9.5), Logs policy kinds (§9.6), §9.8 map | Stage B, §7 |
+| T3.21–T3.30 | UI: §9.2 routes and redirects, S1–S9, Discovery entrypoints (§9.4), single-workspace cleanup (§9.5), Logs policy kinds (§9.6), §9.8 map | Stage B, §7 |
 
 ### 13.3 Requirement → task → proof (R1a MUSTs)
 
@@ -4999,7 +5041,7 @@ Proof IDs: `DB` = executed SQL probe (§6.3, schema only); `A` = §14 scenario
 | E-01–E-08 execution and recovery | T3.08, T3.10, T3.16 | DB5–DB10, DB23–DB30, DB44–DB46, DB58–DB61, DB96–DB108, DB122–DB137; A58, A60, A64, A6, A13, A15, A16, A18, A25–A27, A35, A40, A41, A49–A51, A55 |
 | E-10 audit | T3.20 | DB15, DB16; A19 |
 | E-11 targets | T3.18 + pilot | §14.4 |
-| E-12 legacy coexistence | T3.19, Stage 0 | DB1, DB2; A8, A56 |
+| E-12 single policy system | T3.19, Stage 0 | Removal and retained-path smoke checks |
 
 ---
 
@@ -5026,7 +5068,7 @@ have been executed; no scenario below has been run.**
 | 8 Crash before and after a provider write, and a delayed mutation | A13, A25–A27, A41, A58 | Real run (fault injection) | Schema part only (DB122–DB137) |
 | 9 Customer edits the artifact before rollback | A15, A35, A40, A60 | Real run | Schema part only (DB106–DB108) |
 | 10 Provider update succeeds, verification unknown | A18, A55 | Real run | No |
-| 11 Legacy and new workers coexist | A8, A56 | Real run | Schema part only (DB1, DB2) |
+| 11 Superseded stack removed | A8, A56 | Runtime and migration checks | Must be verified on current build |
 | 12 Kubernetes alternate binding (R1k) | Not provable in R1a; the R1k spec (§12.2) | — | — |
 | 13 Retired screen bookmark | A57 | Fixture + real console | No |
 | 14 One target fails in a multi-target rollout | A16, A49 | Real run | Schema part only (DB11) |
@@ -5121,7 +5163,7 @@ The gate passes only when every expectation is observed and recorded (§14.4).
 | A5 | Owner gate | No response; missing owner; retain `dynamodb`; age not confirmed | Blocked until exception; new version; `age_unconfirmed` |
 | A6 | Observation and canary | Attempt a removed service during observation; deny a retained service during canary | Version to draft; rollout paused with Undo offered |
 | A7 | Versions immutable | Edit an approved version | New version; old approval does not apply |
-| A8 | Legacy stack untouched | With `IGA_LEGACY_AGENT_POLICY=on`, existing legacy policies reconcile while A1 runs; compare `agent_policies` and `agent_policy_actions` before and after | Legacy rows and reconcile outcomes as without Phase 3; no Phase 3 route reads or writes `agent_policies`; `/authsec/governance/agent-policies` responses unchanged |
+| A8 | Single policy writer | Start backend with policy on and off; inspect routes and worker registration | No superseded agent-policy worker starts and no legacy policy API is registered; graph/discovery and multitenancy remain functional |
 | A9 | Duplicate grants | Two policies grant `sqs:*` | Boundary still removes it; both grants remain declared |
 | A10 | Shared role | Two workloads, one role | Both owners asked; canary requires both acknowledgements |
 | A11 | Ineligible roles | Service-linked; `authsec:protected`; a role tagged `ManagedBy=AuthSec` with a customer name; oversized document | Ineligible with reasons; nothing written; AWS denies a forced attempt |
@@ -5169,7 +5211,7 @@ The gate passes only when every expectation is observed and recorded (§14.4).
 | A53 | Evidence not trustworthy | (a) Activity report older than the freshness rule; (b) resource-policy coverage `partial`; (c) a Kubernetes ServiceAccount key | (a) `422 evidence_untrusted` naming the source, Connections link; (b) bundle `partial`, approval `409 evidence_gaps_not_accepted` until each gap is accepted; (c) `not_supported` with `K-1`, no finding, no plan |
 | A54 | Target beyond list caps | A workspace with more than 10,000 inventory rows; target a role absent from the first inventory page and from the graph's loaded view, by ARN and by Discovery object id | Resolved by `RoleId`; consumers and owners complete (`consumers_unresolved = 0`); the proposal matches one made for a role on the first page |
 | A55 | Verification stays unknown | Apply succeeds; block scans of the account (stop the scanner) for longer than the verification deadline | `applied_unverified`, then `overdue` with the reason; never `verified` by elapsed time; restoring scans verifies it |
-| A56 | Legacy coexistence | A workspace with one enabled legacy policy: list it in Policy › Legacy; Pause it; Remove another; turn `IGA_LEGACY_AGENT_POLICY` off and on | Both actions audited in `audit_events` and shown in Logs; workers stop with the gate off and resume with it on; no Phase 3 artifact or row changes |
+| A56 | Schema and UI removal | Upgrade through `139`; bootstrap independently; browse policy pages | Six obsolete tables absent; no legacy list or notification-copy requests; one policy workspace |
 | A57 | Bookmarks and placement | Open `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement`, `/iga/upcoming`, `/iga/sod` with `IGA_POLICY` on and off | On: redirects of §9.2; `/iga/sod` stays retired. Off: `RetiredPage` for all. No sidebar entry beyond the four destinations |
 | A58 | Unknown and late mutations | Fault injection at the adapter: (a) kill the worker after AWS accepted `CreatePolicyVersion` and before the response is recorded; (b) delay a `CreatePolicyVersion` past the client timeout; (c) try an undo and a version-3 deployment while (a) or (b) is unknown; (d) make readback disagree with CloudTrail; (e) release (b)'s request after version 3 verified; (f) in (d), choose Accept observed state | (a) the replacement finds the attempt `dispatched`, marks it `unknown`, never re-sends; a `prepared` attempt is `abandoned` and re-prepared; (b) `unknown`, no SDK retry; (c) refused (`409 outcome_unknown_pending`); (d) `outcome_unresolved`, owner notified, role still locked; (e) `late_mutation_suspected` drift within 5 minutes, nothing reverted; (f) the role stays locked until the new plan is approved, then the handoff releases it in one transaction |
 | A59 | Rescan after approval | Approve; publish two unchanged scans before the canary and one between canary and expansion; then add a consumer of the role and rescan | Three `unchanged` revalidations, the approved `plan_hash` untouched, no new approval or owner notice; after the new consumer: `material_change` naming `consumers`, deployment `blocked`, review reopened for the new owner, re-approval required |
@@ -5245,9 +5287,8 @@ by a recorded run, never by code review.
 19. The console keeps four destinations; Policy holds the workflow in
     secondary views; Logs carries policy events; Connections keeps collection
     gaps (§9).
-20. Legacy agent policies stay visible and manageable through a read-only
-    compatibility view with proxied Pause/Remove until the disposition plan's
-    retirement gate; no artifact is owned by both systems (§7.10, E-12).
+20. The superseded agent-policy system is removed: no compatibility view,
+    workers or table dependency (§7.10, E-12).
 21. AWS mutations are not exactly-once. Each is a write-ahead attempt
     committed before dispatch, SDK retries are off, and a dispatched call
     without an answer is `unknown`; `outcome_unknown` and `outcome_unresolved`
@@ -5278,7 +5319,6 @@ by a recorded run, never by code review.
 |---|---|---|
 | Origin divergence: cached `origin/authsec-staging` is 19 commits ahead (including `043`); the local branch was not updated for this review | T3.01 re-checks numbering and §6.3 is re-run on the merged chain | Backend |
 | Production-schema rehearsal of `047`–`056` | Stage A exit; not done | Backend + operator |
-| Legacy usage in production (disposition G1) | Gate stays `on`; compatibility view ships | Operator |
 | Slack app distribution | One AuthSec app; signing secret in env `AUTHSEC_SLACK_SIGNING_SECRET`, client id/secret in Vault | Product + platform |
 | GitHub App permission upgrade (contents + pull requests write) | Requested only when a customer maps an IaC source | Product |
 | Default enforcement mode for existing workspaces | `findings_only` | Product |

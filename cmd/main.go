@@ -322,21 +322,9 @@ func main() {
 			policyWorkerDone <- services.StartDefaultPolicyJobWorker(policyWorkerCtx, config.DB)
 		})
 	} else {
-		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable; legacy agent policies unaffected", services.PolicyEnv)
+		log.Printf("[policy] %s is off: /api/iga/v1/policy answers 503 policy_unavailable", services.PolicyEnv)
 		log.Printf("[policy] policy job worker not started: %s is off", services.PolicyEnv)
 	}
-
-	// IGA_LEGACY_AGENT_POLICY (disposition plan §3.2): read ONCE, default on.
-	// Off stops this process starting the two legacy agent-policy workers
-	// (started below, with the other governance workers) and nothing else.
-	// Installed before the routes are mounted: the legacy compatibility routes
-	// consult it.
-	legacyAgentPolicyGate := services.LegacyAgentPolicyGateFromEnv()
-	services.SetLegacyAgentPolicyGate(legacyAgentPolicyGate)
-	if w := legacyAgentPolicyGate.Warning(); w != "" {
-		log.Printf("WARNING: [legacy-agent-policy] %s", w)
-	}
-	log.Print(legacyAgentPolicyGate.Decision())
 
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
@@ -660,32 +648,6 @@ func main() {
 		jmlWorker.Start()
 		log.Printf("governance JML reconcile worker started (interval=5m)")
 
-		// Agent policy, on a timer. Until this existed, everything the policy
-		// reconciler does — narrowing a role, lapsing a grant at its expiry,
-		// planning a containment — happened only when somebody POSTed to the
-		// reconcile endpoint. A policy is a standing instruction, and a standing
-		// instruction that needs a button pressed is a reminder.
-		//
-		// Five minutes: the same cadence as JML, and the actions are the same
-		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
-		// less access.
-		//
-		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
-		// Runs at five minutes rather than hourly because the DELIVERY half also
-		// retries: an SMTP blip should cost minutes, not a whole warning.
-		//
-		// A failed warning NEVER blocks the action it warns about — blocking would
-		// let an SMTP outage quietly turn every destructive policy into a no-op,
-		// which is the failure this exists to prevent. It is recorded instead, and
-		// the action executes as a governance exception.
-		//
-		// Both are the legacy agent-policy stack, so both start only while
-		// IGA_LEGACY_AGENT_POLICY is on (read above). ExpiryWorker and the lease
-		// reaper are shared runtime infrastructure and start regardless.
-		for _, name := range services.StartLegacyAgentPolicyWorkers(legacyAgentPolicyGate,
-			services.NewLegacyAgentPolicyWorkers(config.DB)) {
-			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
-		}
 	}
 
 	// ─────────────────────────────────────────────────────────

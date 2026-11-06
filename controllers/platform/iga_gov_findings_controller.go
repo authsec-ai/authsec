@@ -128,7 +128,7 @@ func (ctl *IGAGovPolicyController) ListFindings(c *gin.Context) {
 		}
 		f := services.FindingFilter{Statuses: listParam(c, "status"), Kinds: listParam(c, "kind"),
 			Severities: listParam(c, "severity"), Confidences: listParam(c, "confidence"),
-			Account: c.Query("account"), Q: c.Query("q"), Cursor: c.Query("cursor"), GroupByRole: c.Query("group") == "role"}
+			Account: c.Query("account"), Category: c.Query("category"), Q: c.Query("q"), Cursor: c.Query("cursor"), GroupByRole: c.Query("group") == "role"}
 		if g := c.Query("group"); g != "" && g != "role" {
 			return nil, nil, services.GovBadParam("group", "group must be role.")
 		}
@@ -149,14 +149,19 @@ func (ctl *IGAGovPolicyController) ListFindings(c *gin.Context) {
 		if err != nil {
 			return nil, nil, err
 		}
+		if f.GroupByRole {
+			groups, next, err := r.ListFindingGroups(ws, rev, f)
+			if err != nil {
+				return nil, nil, err
+			}
+			meta.NextCursor = next
+			return groups, meta, nil
+		}
 		list, next, err := r.ListFindings(ws, rev, f)
 		if err != nil {
 			return nil, nil, err
 		}
 		meta.NextCursor = next
-		if f.GroupByRole {
-			return services.GroupByRole(list), meta, nil
-		}
 		return list, meta, nil
 	})
 }

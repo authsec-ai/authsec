@@ -282,7 +282,7 @@ func (r *GovRollout) backToDraftTx(tx *gorm.DB, ws uuid.UUID, rc *govRolloutCtx,
 		return err
 	}
 	if err := tx.Exec(`UPDATE iga_gov_approval SET revoked_at = ?, revoked_reason = ?
-		WHERE workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL`,
+		WHERE workspace_id = ? AND version_id = ? AND decision = 'approve' AND scope = 'version' AND revoked_at IS NULL`,
 		now, "version back to draft: "+reason, ws, rc.Version.ID).Error; err != nil {
 		return err
 	}

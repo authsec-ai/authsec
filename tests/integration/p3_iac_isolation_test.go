@@ -252,7 +252,18 @@ func (l *p3iLab) newRole(name, roleID, managed string) uuid.UUID {
 // policy and returns the policy id.
 func (l *p3iLab) isolate(name, roleID, newName, workloadID, binding, ref string) string {
 	l.t.Helper()
-	pol, _ := l.proposeTemplateDelivery(roleID)
+	var pol string
+	if binding == igagov.BindingLambdaRole {
+		// The independent entry must work even when there is no unused-service finding.
+		l.setTemplate(awsdiscovery.ResourcePolicyTemplateVersion)
+		code, body := l.call(l.author, http.MethodPost, "/proposals", map[string]any{
+			"template": "dedicated_identity", "keys": []any{map[string]any{"provider": "aws", "role_id": roleID}}, "delivery": "iac_pr",
+			"isolation": map[string]any{"workload": map[string]any{"workload_id": workloadID, "binding_kind": binding, "binding_ref": ref}, "role_name": newName}})
+		d := l.must(code, body, http.StatusCreated, "standalone dedicated identity")
+		pol = d["policy"].(map[string]any)["id"].(string)
+	} else {
+		pol, _ = l.proposeTemplateDelivery(roleID)
+	}
 	managed := l.a.policyARN(name + "Work")
 	_, th := p3iTrust(l.t)
 	intent := map[string]any{"kind": "dedicated_identity",
@@ -381,7 +392,11 @@ func p3iIsoSetup(t *testing.T, kind string) *p3iIso {
 	x := &p3iIso{p3iLab: newP3iLab(t, "p3-t317-a33-"+kind), kind: kind}
 	l := x.p3iLab
 	x.name, x.roleID = "Shared"+strings.ToUpper(kind[:1])+kind[1:]+"Role", "AROASHAREDISO"+strings.ToUpper(kind[:3])
-	x.src = l.role(x.name, x.roleID, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	usage := map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil}
+	if kind == "lambda" {
+		usage["sqs"] = p3eTime(time.Hour)
+	} // no unused-service candidate
+	x.src = l.role(x.name, x.roleID, usage)
 	tc, th := p3iTrust(t)
 	l.live.mu.Lock()
 	l.live.roles[x.src].TrustPolicyHash = th

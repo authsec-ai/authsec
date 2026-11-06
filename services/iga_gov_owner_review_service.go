@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1190,6 +1191,12 @@ func (s *IGAGovOwnerReviewService) Respond(ctx context.Context, ws, actor, revie
 		if newVersion != nil {
 			payload["new_version_id"] = *newVersion
 		}
+		if resp == GovResponseRetain || resp == GovResponseObject {
+			// "creates a version and tells the author" (§9.3 S4).
+			if err := notifyAuthorTx(tx, ws, st); err != nil {
+				return err
+			}
+		}
 		ak, aid := actorOf(actor)
 		if via == "slack" {
 			ak = models.GovActorSlackUser
@@ -1481,6 +1488,19 @@ type GovReviewView struct {
 	Gate            map[string]any          `json:"gate"`
 	Unconfirmed     map[string]any          `json:"unconfirmed"`
 	ViewerIsOwner   bool                    `json:"viewer_is_owner"`
+	// Deployments are the forward deployments (apply, split) of the reviewed
+	// version, so an owner who cannot list deployments can still report on
+	// the change (POST /deployments/:id/health-reports).
+	Deployments []GovReviewDeployment `json:"deployments"`
+}
+
+// GovReviewDeployment is one forward deployment of a reviewed version.
+type GovReviewDeployment struct {
+	ID       uuid.UUID `json:"id"`
+	Kind     string    `json:"kind"`
+	State    string    `json:"state"`
+	Delivery string    `json:"delivery"`
+	RoleARN  string    `json:"role_arn"`
 }
 
 // IsOwnerOf reports whether user is a live owner asked in the review
@@ -1512,17 +1532,40 @@ func (s *IGAGovOwnerReviewService) IsReviewOwner(ctx context.Context, ws, review
 // View is GET /reviews/:id for viewer (uuid.Nil: no personal response).
 func (s *IGAGovOwnerReviewService) View(ctx context.Context, ws, reviewID, viewer uuid.UUID) (*GovReviewView, error) {
 	var st *govReviewState
+	var v *GovReviewView
 	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(db *gorm.DB) error {
 		vid, err := s.reviewVersion(db, ws, reviewID)
 		if err != nil {
 			return err
 		}
-		st, err = s.load(db, ws, vid, false)
-		return err
+		if st, err = s.load(db, ws, vid, false); err != nil {
+			return err
+		}
+		v = st.view(viewer, s.now())
+		// The author's name travels with the review: an owner who cannot list
+		// members still reads who asked.
+		v.Version["created_by_name"] = govMemberName(db, ws, st.Version.CreatedBy)
+		v.Deployments = []GovReviewDeployment{}
+		return db.Raw(`SELECT d.id, d.kind, d.state, d.delivery, c.role_arn FROM iga_gov_deployment d
+			JOIN iga_gov_control c ON c.workspace_id = d.workspace_id AND c.id = d.control_id
+			WHERE d.workspace_id = ? AND d.version_id = ? AND d.kind IN ('apply','split')
+			ORDER BY d.created_at, d.id`, ws, st.Version.ID).Scan(&v.Deployments).Error
 	}); err != nil {
 		return nil, err
 	}
-	return st.view(viewer, s.now()), nil
+	return v, nil
+}
+
+// govMemberName is a member's display name (the name, else the part of the
+// email before the @), "" when the user is not a member of the workspace.
+func govMemberName(db *gorm.DB, ws, user uuid.UUID) string {
+	var n []string
+	if err := db.Raw(`SELECT COALESCE(NULLIF(u.name, ''), split_part(u.email, '@', 1))
+		FROM users u JOIN workspace_memberships m ON m.user_id = u.id AND m.workspace_id = ?
+		WHERE u.id = ? LIMIT 1`, ws, user).Scan(&n).Error; err != nil || len(n) == 0 {
+		return ""
+	}
+	return n[0]
 }
 
 func (st *govReviewState) view(viewer uuid.UUID, now time.Time) *GovReviewView {
@@ -1604,6 +1647,9 @@ type GovReviewFilter struct {
 	Mine     bool
 	Viewer   uuid.UUID
 	Statuses []string
+	// Order is "" (newest first) or "due": reviews still open first, by
+	// deadline, then the closed ones by deadline; global across pages.
+	Order string
 }
 
 // List is GET /reviews: newest first, cursor-paged (≤ 200), mine = the
@@ -1621,7 +1667,10 @@ func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f Gov
 	}
 	sort.Strings(f.Statuses)
 	rd := NewGovReader(nil, key) // cursors only: signing needs no database
-	want := govCursor{Route: "reviews", WS: ws.String(), Q: fmt.Sprintf("mine=%t;viewer=%s;status=%s", f.Mine, f.Viewer, strings.Join(f.Statuses, ","))}
+	if f.Order != "" && f.Order != "due" {
+		return nil, nil, GovBadParam("order", "order must be due.")
+	}
+	want := govCursor{Route: "reviews", WS: ws.String(), Q: fmt.Sprintf("mine=%t;viewer=%s;status=%s;order=%s", f.Mine, f.Viewer, strings.Join(f.Statuses, ","), f.Order)}
 	q := `SELECT r.id, r.version_id, v.policy_id, p.name AS policy_name, v.version_no, r.status, r.deadline_at, r.created_at, r.closed_at,
 	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id) AS owners_asked,
 	             (SELECT count(*) FROM iga_gov_owner_response x WHERE x.workspace_id = r.workspace_id AND x.review_id = r.id
@@ -1648,16 +1697,35 @@ func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f Gov
 		if err != nil {
 			return nil, nil, err
 		}
-		parts := strings.SplitN(after, "|", 2)
+		parts := strings.SplitN(after, "|", 3)
 		ts, err1 := time.Parse(time.RFC3339Nano, parts[0])
 		id, err2 := uuid.Parse(parts[len(parts)-1])
-		if len(parts) != 2 || err1 != nil || err2 != nil {
-			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid for this list; restart it.", nil)
+		if f.Order == "due" {
+			// closed|deadline|id
+			closed, err0 := strconv.Atoi(parts[0])
+			var dl time.Time
+			var err3 error
+			if len(parts) == 3 {
+				dl, err3 = time.Parse(time.RFC3339Nano, parts[1])
+			}
+			if len(parts) != 3 || err0 != nil || err3 != nil || err2 != nil {
+				return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid for this list; restart it.", nil)
+			}
+			q += ` AND ((CASE WHEN r.closed_at IS NULL THEN 0 ELSE 1 END), r.deadline_at, r.id) > (?, ?, ?)`
+			args = append(args, closed, dl, id)
+		} else {
+			if len(parts) != 2 || err1 != nil || err2 != nil {
+				return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid for this list; restart it.", nil)
+			}
+			q += ` AND (r.created_at, r.id) < (?, ?)`
+			args = append(args, ts, id)
 		}
-		q += ` AND (r.created_at, r.id) < (?, ?)`
-		args = append(args, ts, id)
 	}
-	q += ` ORDER BY r.created_at DESC, r.id DESC LIMIT ?`
+	if f.Order == "due" {
+		q += ` ORDER BY (CASE WHEN r.closed_at IS NULL THEN 0 ELSE 1 END), r.deadline_at, r.id LIMIT ?`
+	} else {
+		q += ` ORDER BY r.created_at DESC, r.id DESC LIMIT ?`
+	}
 	args = append(args, limit+1)
 	var rows []GovReviewSummary
 	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
@@ -1669,7 +1737,15 @@ func (s *IGAGovOwnerReviewService) List(ctx context.Context, ws uuid.UUID, f Gov
 	if len(rows) > limit {
 		rows = rows[:limit]
 		last := rows[len(rows)-1]
-		c := rd.sign(govCursor{Route: want.Route, WS: want.WS, Q: want.Q, After: last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID.String()})
+		after := last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID.String()
+		if f.Order == "due" {
+			closed := "0"
+			if last.ClosedAt != nil {
+				closed = "1"
+			}
+			after = closed + "|" + last.DeadlineAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID.String()
+		}
+		c := rd.sign(govCursor{Route: want.Route, WS: want.WS, Q: want.Q, After: after})
 		next = &c
 	}
 	now := s.now()
@@ -1871,4 +1947,102 @@ func renderOwnerReviewNotice(db *gorm.DB, n *models.IGAGovNotification, user *uu
 	}
 	return &GovNotice{Subject: subject, Text: b.String(), Title: "Review a change to " + strings.Join(roles, ", "),
 		Lines: lines, Link: link}, nil
+}
+
+// notifyAuthorTx queues the review_response notice to the version's author on
+// every channel that reaches them, and to the workspace webhook; each new
+// response is a new delivery (resend).
+func notifyAuthorTx(tx *gorm.DB, ws uuid.UUID, st *govReviewState) error {
+	if t, err := GovWorkspaceWebhookTarget(tx, ws); err != nil {
+		return err
+	} else if t != nil {
+		if _, err := EnqueueGovNotificationTx(tx, ws, GovNoticeReviewResponse, st.Review.ID, GovChannelWebhook, GovRecipientWorkspaceWebhook, true); err != nil {
+			return err
+		}
+	}
+	author := st.Version.CreatedBy
+	if govChannels(tx, ws).EmailEnabled {
+		if _, err := EnqueueGovNotificationTx(tx, ws, GovNoticeReviewResponse, st.Review.ID, GovChannelEmail, GovUserRecipient(author), true); err != nil {
+			return err
+		}
+	}
+	for _, ch := range govExtraChannels() {
+		ok, err := ch.Reaches(tx, ws, author)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if _, err := EnqueueGovNotificationTx(tx, ws, GovNoticeReviewResponse, st.Review.ID, ch.Channel(), GovUserRecipient(author), true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func init() {
+	RegisterGovNoticeSubject(GovNoticeReviewResponse, GovNoticeSubject{Render: renderReviewResponseNotice})
+}
+
+func renderReviewResponseNotice(db *gorm.DB, n *models.IGAGovNotification, user *uuid.UUID) (*GovNotice, error) {
+	svc := NewIGAGovOwnerReviewService(db)
+	vid, err := svc.reviewVersion(db, n.WorkspaceID, n.SubjectID)
+	if err != nil {
+		var ge *GovError
+		if errors.As(err, &ge) && ge.Status == http.StatusNotFound {
+			return nil, GovNotifyPermanent(errors.New("the review no longer exists"))
+		}
+		return nil, err
+	}
+	st, err := svc.load(db, n.WorkspaceID, vid, false)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	var retained, objections []string
+	for _, r := range st.Responses {
+		if r.Response == nil {
+			continue
+		}
+		who := govMemberName(db, n.WorkspaceID, r.UserID)
+		if who == "" {
+			who = "An owner"
+		}
+		switch *r.Response {
+		case GovResponseRetain:
+			for _, it := range decodeJSON[GovRetainItem](r.RetainItems) {
+				retained = append(retained, fmt.Sprintf("%s keeps %s: %s", who, it.Service, it.Reason))
+			}
+		case GovResponseObject:
+			objections = append(objections, fmt.Sprintf("%s objects: %s", who, r.Comment))
+		}
+	}
+	lines = append(lines, retained...)
+	lines = append(lines, objections...)
+	title := fmt.Sprintf("Owner response on %s version %d", st.Policy.Name, st.Version.VersionNo)
+	link := govConsoleLink("/iga/policy/policies/" + st.Policy.ID.String())
+	if len(retained) > 0 {
+		lines = append(lines, "AuthSec created a new draft version that keeps those services. Propose it to ask the owners again.")
+	}
+	if len(objections) > 0 {
+		lines = append(lines, "An objection blocks the version until the owner changes their answer, an approver records an exception, or you edit the version.")
+	}
+	if user == nil {
+		doc := map[string]any{"type": "iga.policy.review_response", "version": 1, "workspace_id": n.WorkspaceID.String(),
+			"review_id": st.Review.ID.String(), "policy_id": st.Policy.ID.String(), "policy_name": st.Policy.Name,
+			"version_no": st.Version.VersionNo, "retained": retained, "objections": objections}
+		if link != "" {
+			doc["link"] = link
+		}
+		return &GovNotice{Webhook: doc, Title: title, Lines: lines, Link: link}, nil
+	}
+	var b strings.Builder
+	for _, l := range lines {
+		fmt.Fprintf(&b, "%s\n", l)
+	}
+	if link != "" {
+		fmt.Fprintf(&b, "\nOpen the policy:\n  %s\n", link)
+	}
+	fmt.Fprintf(&b, "\nRegards,\nAuthSec Team\n")
+	return &GovNotice{Subject: title, Text: b.String(), Title: title, Lines: lines, Link: link}, nil
 }

@@ -26,6 +26,12 @@ import (
 // with the real AuthMiddleware and permission middleware): §7.4 reviews and
 // §7.8 settings, incl. the legacy channel copy and a signed webhook notice.
 
+type p3RecordedHTTP struct {
+	Method, Path string
+	Header       http.Header
+	Body         []byte
+}
+
 func p3Audit(t *testing.T, db *gorm.DB, wss ...uuid.UUID) {
 	t.Helper()
 	p3MetricsOnce.Do(func() {
@@ -230,16 +236,6 @@ func TestP3T312ReviewRoutes(t *testing.T) {
 
 /* ------------------------------- settings --------------------------------- */
 
-func p3LegacyRow(t *testing.T, db *gorm.DB, ws uuid.UUID) string {
-	t.Helper()
-	var s []string
-	db.Raw(`SELECT row_to_json(x)::text FROM governance_notification_settings x WHERE workspace_id = ?`, ws).Scan(&s)
-	if len(s) != 1 {
-		return ""
-	}
-	return s[0]
-}
-
 // Without a channel store installed (IGA_POLICY not yet verified, or a build
 // that never installs one): GET /settings says notifications are not
 // available and why, and PUT /settings with notifications is 409
@@ -348,50 +344,14 @@ func TestP3T320Settings(t *testing.T) {
 	}
 	p3WaitAudit(t, db, g.ws, http.MethodPut, "/api/iga/v1/policy/settings")
 
-	// The legacy channel addresses are copied, never moved (the settings row
-	// saved above holds default channels, so the first read still copies).
-	p3exec(t, db, `INSERT INTO governance_notification_settings (workspace_id, webhook_url, webhook_secret, email_enabled)
-		VALUES (?, 'https://hooks.customer.test/legacy', 'legacy-secret', false)`, g.ws)
-	legacyBefore := p3LegacyRow(t, db, g.ws)
-	for i := 0; i < 2; i++ {
-		code, body = api.call(http.MethodGet, "/settings", reader, nil)
-		if code != http.StatusOK || dig(body, "data", "notifications", "available") != true || digs(body, "data", "notifications", "source") != "legacy_copy" ||
-			digs(body, "data", "notifications", "webhook_url") != "https://hooks.customer.test/legacy" ||
-			dig(body, "data", "notifications", "webhook_secret_set") != true || dig(body, "data", "notifications", "email_enabled") != false ||
-			dig(body, "data", "notifications", "copied_from_legacy_at") == nil {
-			t.Fatalf("GET %d after the copy: %d %v", i, code, body)
-		}
-		if strings.Contains(string(mustJSON(t, body)), "legacy-secret") {
-			t.Fatal("GET /settings returned the webhook secret")
-		}
+	// Configure channels through the supported Phase 3 API.
+	code, body = api.call(http.MethodPut, "/settings", enforcer, map[string]any{"notifications": map[string]any{
+		"email_enabled": false, "webhook_url": "https://hooks.customer.test/initial", "webhook_secret": "initial-secret"}})
+	if code != http.StatusOK {
+		t.Fatalf("initial channels: %d %v", code, body)
 	}
-	if n := len(g.eventsNamed(services.GovEventSettingsChannelsCopied)); n != 1 {
-		t.Fatalf("copy events: %d", n)
-	}
-	// The row holds the Vault path, never the secret; Vault holds it under
-	// the workspace's iga-gov namespace.
 	var legacyRef string
 	db.Raw(`SELECT notify_webhook_secret_ref FROM iga_gov_settings WHERE workspace_id = ?`, g.ws).Scan(&legacyRef)
-	if !strings.HasPrefix(legacyRef, "kv/data/secret/workspaces/"+g.ws.String()+"/iga-gov/notifications/") {
-		t.Fatalf("secret ref %q", legacyRef)
-	}
-	if sec, err := vault.ReadSecret(legacyRef); err != nil || sec["secret"] != "legacy-secret" {
-		t.Fatalf("vault at %s: %v %v", legacyRef, sec, err)
-	}
-	var rowText string
-	db.Raw(`SELECT row_to_json(s)::text FROM iga_gov_settings s WHERE workspace_id = ?`, g.ws).Scan(&rowText)
-	if strings.Contains(rowText, "legacy-secret") {
-		t.Fatalf("the settings row holds the secret: %s", rowText)
-	}
-	if after := p3LegacyRow(t, db, g.ws); after == "" || after != legacyBefore {
-		t.Fatalf("the legacy row changed or moved:\nbefore %s\nafter  %s", legacyBefore, after)
-	}
-	if code, body := api.call(http.MethodGet, "/settings", otherTok, nil); code != http.StatusOK || digs(body, "data", "notifications", "source") != "default" {
-		t.Fatalf("a workspace without a legacy row: %d %v", code, body)
-	}
-	if n := len(other.eventsNamed(services.GovEventSettingsChannelsCopied)); n != 0 {
-		t.Fatalf("copy events in a workspace without a legacy row: %d", n)
-	}
 	// PUT channels: https only; the secret is stored, never echoed or logged.
 	if code, body := api.call(http.MethodPut, "/settings", enforcer, map[string]any{"notifications": map[string]any{"webhook_url": "http://hooks.example.test"}}); code != http.StatusBadRequest {
 		t.Fatalf("http webhook: %d %v", code, body)
@@ -440,7 +400,7 @@ func TestP3T320Settings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Email is off (copied from legacy) and no other channel reaches u1:
+	// Email is off (configured through settings) and no other channel reaches u1:
 	// the owner's delivery fails at once and blocks.
 	var r models.IGAGovOwnerResponse
 	db.Where("review_id = ? AND user_id = ?", sync.ReviewID, u1).Take(&r)

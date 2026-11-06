@@ -63,8 +63,9 @@ before every build.
 - Never wipe a deployed namespace, PVC, Postgres database, or Vault data.
 - A backend release containing migrations requires a pre-deploy `pg_dump`, then
   post-deploy verification of `migration_logs`.
-- A Helm upgrade can overwrite a manual image patch. Inspect the running image
-  after any Helm operation.
+- A Helm upgrade can overwrite a manual image patch, and drops every setting in
+  "Settings applied by hand to the live deployment" below. Inspect the running
+  image and re-check that table after any Helm operation.
 - **Every deployable build carries its commit, and every deploy is verified
   against it.** Both services serve the same JSON shape — a shape that differed
   between them is one somebody reads wrong at 2am:
@@ -113,6 +114,27 @@ before every build.
   reviewer can be attached in repository settings without editing the workflow.
   **There is one cluster and it serves customers**; whether a push reaches it
   unattended is a decision for a person, and that setting is where it lives.
+
+## Settings applied by hand to the live deployment
+
+Some settings exist only on the running `prod-authsec` deployment, set with
+`kubectl set env`. The deploy workflow changes only the image, so it keeps them,
+but **anything that re-renders the deployment from a chart or manifest (a Helm
+upgrade, a re-apply, a rebuilt cluster) silently drops them.** Whoever edits the
+chart or recreates the deployment must re-apply every row below, or move it into
+the source of truth and delete the row. **This table lists names and where the
+value lives, never values.** Secret values are kept in a Kubernetes Secret or
+Vault, not here and not in Git.
+
+| Setting | Applied | Where the value lives | Read by | To restore |
+|---|---|---|---|---|
+| `IGA_POLICY=true` | 2026-10-12, by hand | plain env on `deploy/prod-authsec` (not secret) | `services/iga_gov_gate.go`; `/api/iga/v1/capabilities` shows `policy.state` | `kubectl -n authsec-prod set env deploy/prod-authsec IGA_POLICY=true`, then confirm `policy.state: on` |
+| `AZURE_AUTHSEC_CLIENT_ID`, `AZURE_AUTHSEC_TENANT_ID`, `AZURE_REDIRECT_URI`, `AZURE_AUTHSEC_CLIENT_SECRET` | 2026-10-12, by hand, **for testing before the consuming backend code exists** | Kubernetes Secret `azure-authsec` in `authsec-prod` (all four keys, including the secret); the deployment imports them with `kubectl set env --from=secret/azure-authsec`. Secret value is in no file or Git | Nothing yet: as of `4fda6b5` no code reads them and no route serves `/api/v1/auth/azure/callback` | recreate the Secret from the Entra app (client id, tenant id, a **new** client secret), then `kubectl -n authsec-prod set env deploy/prod-authsec --from=secret/azure-authsec` |
+
+The Azure client secret was pasted into a chat on 2026-10-12: rotate it in Entra
+and update the Secret `azure-authsec` before anything depends on it. When the
+consuming code lands, replace "Nothing yet" with its file and add the redirect
+URI to the Entra app registration exactly as set here.
 
 ## Pre-release migration rehearsal and target gate
 

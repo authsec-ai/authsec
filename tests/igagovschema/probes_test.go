@@ -96,7 +96,6 @@ func probeWorld(t *testing.T, x execer) *world {
 		   ({iaA}, {ws1}, 'role', 'aws', 'aws:iam:role:111111111111:RefundTaskRole', 'immutable', 'AROAAAAAAAAAAAAAAAAAA', 'RefundTaskRole'),
 		   ({iaB}, {ws1}, 'role', 'aws', 'aws:iam:role:111111111111:PaymentsTaskRole', 'immutable', 'AROABBBBBBBBBBBBBBBBB', 'PaymentsTaskRole')`,
 		`INSERT INTO iga_workload (id, workspace_id, runtime_kind, source_key) VALUES ({wl1}, {ws1}, 'ecs_task', 'aws:ecs:task-definition/refunds:7')`,
-		`INSERT INTO agent_policies (id, workspace_id, name, selector) VALUES ({ap1}, {ws1}, 'legacy selector policy', '{"labels":{"team":"refunds"}}')`,
 		`INSERT INTO iga_gov_policy (id, workspace_id, name, family, provider, created_by) VALUES
 		   ({p1}, {ws1}, 'refund right-size', 'cloud_access', 'aws', {u1}),
 		   ({p2}, {ws1}, 'refund replacement', 'cloud_access', 'aws', {u1}),
@@ -157,9 +156,11 @@ func probes() []probe {
 	}
 	return []probe{
 		/* ---------------------------- legacy, policy --------------------------- */
-		{id: "DB1", name: "Legacy agent_policies row still insertable unchanged by 047-056", want: accepted(),
-			do: x(`INSERT INTO agent_policies (workspace_id, name, selector) VALUES ({ws1}, 'legacy probe', '{"labels":{"app":"refunds"}}')`)},
-		{id: "DB2", name: "A governance policy cannot reference a legacy agent policy",
+		{id: "DB1", name: "Superseded agent-policy tables are absent", want: accepted(),
+			do: func(s *step) {
+				s.eq("0", `SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('agent_policies','agent_policy_actions','agent_policy_confirmations','agent_policy_warnings','enforcement_plans','governance_notification_settings')`)
+			}},
+		{id: "DB2", name: "A policy version cannot reference a nonexistent policy",
 			want: fkViolation("iga_gov_policy_version_workspace_id_policy_id_fkey"),
 			do: x(row("iga_gov_policy_version", []string{"workspace_id", "{ws1}", "policy_id", "{ap1}", "version_no", "1",
 				"intent", "'{}'", "intent_hash", "'ih'", "catalog_version", "1", "evidence_rev", "1", "created_by", "{u1}"}))},

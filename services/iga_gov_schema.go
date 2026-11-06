@@ -21,9 +21,8 @@ import (
 // check; the gate that runs it is iga_gov_gate.go (PolicyGate), its routes
 // and the capabilities block controllers/platform/iga_gov_policy_controller.go.
 
-// PolicySchemaHead is the last Phase 3 migration (047-059; the spec's
-// original 044-053, moved up as a unit when 044-046 landed first).
-const PolicySchemaHead = "059"
+// PolicySchemaHead is the migration required by the independent policy lifecycle.
+const PolicySchemaHead = "139"
 
 // policyRelations is every relation 047-056 create: each table, the sequence
 // behind iga_gov_event.id, and every explicitly named index. The indexes are
@@ -69,6 +68,8 @@ var policyRelations = []string{
 	"uq_iga_gov_acceptance_gate",
 	// 059_tidy_eval_pruned (fix/p3-tidy): finding reads answer 410 from it
 	"iga_gov_evaluation_pruned",
+	// 138_iga_gov_recovery_approval: a role-only recovery plan is approved on its own.
+	"uq_iga_gov_approval_recovery",
 }
 
 // policyColumns are columns a relation check cannot prove. 047-056 add no
@@ -83,7 +84,6 @@ var policyColumns = []string{
 	"iga_gov_settings.notify_webhook_url",
 	"iga_gov_settings.notify_webhook_secret_ref",
 	"iga_gov_settings.notify_channels_source",
-	"iga_gov_settings.notify_channels_copied_at",
 }
 
 // policyTriggers is every trigger 047-056 create, as "table.trigger"
@@ -153,7 +153,8 @@ var policyConstraints = []string{
 	"iga_gov_owner_review.iga_gov_owner_review_workspace_id_id_key",
 	"iga_gov_owner_response.iga_gov_orr_response_chk", "iga_gov_owner_response.iga_gov_owner_response_review_id_user_id_key",
 	"iga_gov_owner_response.iga_gov_owner_response_workspace_id_id_key",
-	"iga_gov_approval.iga_gov_approval_reject_reason_chk", "iga_gov_approval.iga_gov_approval_workspace_id_id_key",
+	"iga_gov_approval.iga_gov_approval_reject_reason_chk", "iga_gov_approval.iga_gov_approval_scope_chk",
+	"iga_gov_approval.iga_gov_approval_recovery_plan_fkey", "iga_gov_approval.iga_gov_approval_workspace_id_id_key",
 	"iga_gov_approval.iga_gov_approval_workspace_id_id_version_id_key",
 	"iga_gov_revalidation.iga_gov_rv_result_chk", "iga_gov_revalidation.iga_gov_revalidation_workspace_id_id_key",
 	"iga_gov_revalidation.iga_gov_revalidation_workspace_id_id_plan_id_result_key",

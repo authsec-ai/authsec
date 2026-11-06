@@ -38,6 +38,8 @@ import (
 // of a workspace is always a users row OF that workspace (memberships span
 // workspaces) is the open question that decides it.
 var phase3UserRefs = map[string]string{
+	"iga_gov_access_policy_version.created_by":  "137: the member who authored the access policy",
+	"iga_gov_deployment.drift_accepted_by":      "138: the member who accepted drift",
 	"cloud_enforcement_binding.consented_by":    "053: who consented to the enforcement role",
 	"iga_gov_acceptance.accepted_by":            "051: who accepted the uncertainty",
 	"iga_gov_approval.decided_by":               "050: the approver",
@@ -258,9 +260,9 @@ func TestPhase3ForeignKeyCatalogGuard(t *testing.T) {
 	c := phase3Catalog(t, db)
 	// 047-056's 43 tables, plus 059_tidy_eval_pruned (fix/p3-tidy), plus
 	// the 13 of 060-062 (R1b action evidence, R2 time-bound access, R3
-	// runtime controls).
-	if len(c.tables) != 57 {
-		t.Fatalf("%d Phase 3 tables in scope, want 57", len(c.tables))
+	// runtime controls), plus 137's access-policy version table.
+	if len(c.tables) != 58 {
+		t.Fatalf("%d Phase 3 tables in scope, want 58", len(c.tables))
 	}
 	for _, p := range phase3CatalogProblems(c) {
 		t.Error(p)
