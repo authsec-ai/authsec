@@ -95,6 +95,10 @@ func (g *Gateway) llmHandler(l *LLMUpstream) http.Handler {
 			llmError(w, l.Provider, http.StatusRequestEntityTooLarge, "request_too_large", "The request body is too large.", nil)
 			return
 		}
+		if err := checkUnambiguousJSON(body); err != nil {
+			llmError(w, l.Provider, http.StatusBadRequest, "invalid_request", "The body must be unambiguous JSON: "+err.Error(), nil)
+			return
+		}
 		var head struct {
 			Model  string `json:"model"`
 			Stream bool   `json:"stream"`

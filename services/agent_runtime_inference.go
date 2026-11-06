@@ -628,10 +628,34 @@ func isAIWorkload(u agentruntime.ModelCallUsage) bool {
 	return u.Calls > 0 || u.Denied > 0 || u.LiveCalls > 0 || u.LiveDenied > 0
 }
 
-// evidenced: model calls (scan or live) or network traffic show the identity
-// uses a model; otherwise it rests on configuration hints alone.
+// evidenced: model calls (scan or live), or network traffic attributed at
+// lookup time, show the identity uses a model; otherwise it rests on
+// configuration hints or on traffic attributed only by who holds the address
+// at scan time, and is a possible AI workload.
 func (ai *AIWorkload) evidenced() bool {
-	return (ai.usageR != nil && isAIWorkload(ai.usageR.usage)) || len(ai.NetworkTraffic) > 0
+	if ai.usageR != nil && isAIWorkload(ai.usageR.usage) {
+		return true
+	}
+	for _, n := range ai.NetworkTraffic {
+		if networkAttributedAtLookup(n.Evidence) {
+			return true
+		}
+	}
+	return false
+}
+
+// networkAttributedAtLookup: an ai_network_traffic finding whose source was
+// named in the query log record itself (srcids.instance). An attribution by
+// the network interface holding the address when AuthSec scanned is a lead,
+// not evidence: the address may have changed hands, and Lambda shares one
+// interface across functions, so it never labels an AI workload on its own.
+func networkAttributedAtLookup(evidence json.RawMessage) bool {
+	var doc struct {
+		Attribution struct {
+			Confidence string `json:"confidence"`
+		} `json:"attribution"`
+	}
+	return json.Unmarshal(evidence, &doc) == nil && doc.Attribution.Confidence == "query_time"
 }
 
 // usageOf is the identity's model-call row, or an empty one.

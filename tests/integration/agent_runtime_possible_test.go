@@ -52,7 +52,7 @@ func possibleSeed(t *testing.T, db *gorm.DB, name string) *possibleWorld {
 	w.plain, w.plainARN, _ = role("plain", map[string]any{"env_var_names": []string{"PATH"}})
 	// The network evidence path's finding (migration 153 on its branch).
 	arExec(t, db, `INSERT INTO agent_finding (workspace_id, connector_id, kind, subject_key, identity_id, subject, evidence)
-		VALUES (?, ?, 'ai_network_traffic', ?, ?, '{}'::jsonb, '{"lookups":["api.openai.com"]}'::jsonb)`,
+		VALUES (?, ?, 'ai_network_traffic', ?, ?, '{}'::jsonb, '{"providers":["openai"],"attribution":{"how":"srcids_instance","confidence":"query_time"}}'::jsonb)`,
 		g.ws, g.conn, "dns:"+w.netARN, w.net)
 	return w
 }
@@ -148,7 +148,8 @@ func TestAgentRuntimePossibleAIWorkloadFromConfigHints(t *testing.T) {
 		t.Fatalf("%d suggestions from names", n)
 	}
 
-	// Detections apply, titled as a possible AI workload.
+	// Detections do not apply to a possible AI workload (§5.7): names are not
+	// evidence of model use.
 	agentruntime.ResetSinks()
 	t.Cleanup(agentruntime.ResetSinks)
 	agentruntime.SetResolver(services.NewAgentRuntimeResolver(db))
@@ -162,8 +163,8 @@ func TestAgentRuntimePossibleAIWorkloadFromConfigHints(t *testing.T) {
 	}
 	var titles []string
 	db.Raw(`SELECT title FROM agent_alert WHERE workspace_id = ?`, a.g.ws).Scan(&titles)
-	if len(titles) != 1 || !strings.HasSuffix(titles[0], "(possible AI workload)") {
-		t.Fatalf("alert titles %v", titles)
+	if len(titles) != 0 {
+		t.Fatalf("a possible AI workload raised alerts: %v", titles)
 	}
 
 	// Workspace B: nothing of A's before its own inference, its own after.

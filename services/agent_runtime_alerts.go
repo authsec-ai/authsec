@@ -99,10 +99,12 @@ const (
 	agentAlertEvidenceTail = 20
 )
 
-// AgentAlertLabels are the labels detections run for.
+// AgentAlertLabels are the labels detections run for: AI workloads and
+// agents (§5.7). A possible AI workload rests on configuration hints or on
+// network traffic attributed only at scan time, which is not evidence of
+// model use, so it raises no alerts.
 var AgentAlertLabels = map[string]bool{
 	agentruntime.LabelAIWorkload: true, agentruntime.LabelSuggestedAgent: true, agentruntime.LabelAgent: true,
-	agentruntime.LabelPossibleAIWorkload: true,
 }
 
 /* ------------------------------------------------------------------------- */

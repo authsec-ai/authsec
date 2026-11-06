@@ -210,6 +210,10 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 			return
 		}
 		trimmed := bytes.TrimSpace(body)
+		if err := checkUnambiguousJSON(trimmed); err != nil {
+			writeRPCError(w, http.StatusBadRequest, nil, rpcParseError, "the body must be unambiguous JSON: "+err.Error(), nil)
+			return
+		}
 		var msgs []rpcMessage
 		batch := len(trimmed) > 0 && trimmed[0] == '['
 		if batch {
@@ -348,6 +352,12 @@ func (g *Gateway) observeToolsList(s *MCPServer, raw []byte) {
 		Result *struct {
 			Tools []json.RawMessage `json:"tools"`
 		} `json:"result"`
+	}
+	if err := checkUnambiguousJSON(raw); err != nil {
+		// A listing two parsers read differently is never pinned: the copy
+		// the client trusts may not be the one that would be hashed.
+		log.Printf("[agent-gateway] tools/list from server=%s not pinned: %v", s.Name, err)
+		return
 	}
 	if json.Unmarshal(raw, &resp) != nil || resp.Result == nil {
 		return
