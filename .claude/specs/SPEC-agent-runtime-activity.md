@@ -156,8 +156,9 @@ Coverage: `AccessDeniedException` → `permission_missing`;
 written into the scan's surface coverage (it would mark every scan partial
 until the role is updated).
 
-**Discovery role permissions needed** (the integrator adds them to
-`authsec-aws-discovery-role.yaml`; not edited here):
+**Discovery role permissions** (granted by discovery template 2026-11-07,
+`authsec-aws-discovery-role.yaml`; until 2026-11-06 the template's broad
+`logs:StartQuery` covered them by accident):
 
 ```yaml
 - Sid: AgentActivitySpans
