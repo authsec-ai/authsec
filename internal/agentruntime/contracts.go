@@ -25,6 +25,11 @@ const (
 	LabelSuggestedAgent = "suggested_agent"
 	// LabelAgent: provider-native (projector) or classified by a person.
 	LabelAgent = "agent"
+	// LabelPossibleAIWorkload: no model-call evidence, but its configuration
+	// names a model provider (env var names, layers, readable model-key
+	// secrets). The weakest label: agent > suggested_agent > ai_workload >
+	// possible_ai_workload > "". Never suggested as an agent from names.
+	LabelPossibleAIWorkload = "possible_ai_workload"
 )
 
 // Event is one CloudTrail record, normalised. Produced by the LookupEvents
@@ -89,6 +94,9 @@ const (
 	FactKeyID     = "key_id"     // kms keyId
 	FactFunction  = "function"   // lambda functionName
 	FactBucket    = "bucket"     // s3 bucketName
+	// FactWithDecryption is ssm's requestParameters.withDecryption, stored
+	// as "true" or "false"; absent when the record does not state it.
+	FactWithDecryption = "with_decryption"
 )
 
 // Attribution is how an event is tied to an identity, mirroring
@@ -186,6 +194,23 @@ type ModelCallUsage struct {
 	// same windows (event source -> successful calls): the "acted on other
 	// resources" evidence of a suggested agent (§5.3).
 	OtherServices map[string]int `json:"other_services"`
+
+	// Live evidence (the "agent_runtime_live" sink): model calls seen on the
+	// event stream (or a poll's dispatch) AFTER the scan's exact coverage of
+	// their region, so a new AI workload shows before the next scan. Never
+	// added to the exact counts above, which only the scan writes. An event
+	// inside the scan's coverage of its region is not counted live (the scan
+	// counts it). LiveCalls, LiveDenied, LiveModels and LiveRegions are
+	// cleared once the scan's coverage of every region in LiveRegions reaches
+	// that region's latest live call (the scan now counts those calls
+	// exactly); LiveLastCallAt is kept, so "seen live" stays answerable.
+	LiveCalls      int            `json:"live_calls"`
+	LiveDenied     int            `json:"live_denied"`
+	LiveLastCallAt *time.Time     `json:"live_last_call_at,omitempty"`
+	LiveModels     map[string]int `json:"live_models,omitempty"`
+	// LiveRegions is each region's latest live call: the counters are
+	// cleared only once the scan covers every one of them.
+	LiveRegions map[string]time.Time `json:"live_regions,omitempty"`
 }
 
 // Usage keys in cloud_usage.
@@ -200,7 +225,8 @@ type Subject struct {
 	ConnectorID uuid.UUID   // the account's connector
 	WorkloadIDs []uuid.UUID // cloud_workload rows that run as the identity
 	// Label is the strongest of LabelAgent, LabelSuggestedAgent,
-	// LabelAIWorkload, or "" when the identity is none of them.
+	// LabelAIWorkload, LabelPossibleAIWorkload, or "" when the identity is
+	// none of them.
 	Label string
 	// SharedRole: more than one workload runs as the identity.
 	SharedRole bool

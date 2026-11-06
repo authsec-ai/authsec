@@ -1,4 +1,4 @@
--- 154_iga_gov_recovery_approval.sql — recovery-plan approval, accepted drift, author notices.
+-- 157_iga_gov_recovery_approval.sql — recovery-plan approval, accepted drift, author notices.
 --
 -- expand only. Idempotent: safe to run again.
 --

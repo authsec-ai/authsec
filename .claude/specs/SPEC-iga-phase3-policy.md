@@ -77,7 +77,7 @@ present, not exercised end to end; **missing**; **proposed**; **conflict**.
 | Unified inventory | `/api/iga/v1/inventory/*` (`iga_inventory_controller.go:28-42`): cursors, max 200, total cap 10,000, not revision-pinned; per-row `graph_state` (`inventory.go:360-372,799-860`) | traced; console uses it for Kubernetes only |
 | Connections | `GET /authsec/discovery/connections` (`routes.go:1631-1637`, `igaread/connections.go:224-256`), independent conditions per connection | traced |
 | Console | Four destinations (`IgaSidebar.tsx:43-53`); `/iga/policy` is a no-network reference preview; `/iga/logs` runs on fixtures; retired routes render `RetiredPage` (`App.tsx:839-930`) | traced |
-| Superseded policy stack | Removed by explicit product decision; see disposition plan and migration `155` | Verify on the release being shipped |
+| Superseded policy stack | Removed by explicit product decision; see disposition plan and migration `158` | Verify on the release being shipped |
 
 ## 0. The completion promise
 
@@ -1269,7 +1269,7 @@ names only `iga_*` tables and the allowlisted shared tables.
 
 | Gate | Values | Effect |
 |---|---|---|
-| Policy schema verification | verified / not verified | Policy is always on; it serves once the graph schema is verified and the Phase 3 schema is: every relation and added column of `047`–`059` and the recovery/retirement migrations `154`–`155` checked by existence, as `VerifyGraphSchema` does for the graph. Fail closed: until both verify, every Phase 3 route returns `503 policy_unavailable` with the reason. R1b (`060`), R2 (`061`, which also carries access policies, `137`–`138`) and R3 (`062`) each verify their own migration the same way; a database missing a later one never takes an earlier part down. There are no switches. |
+| Policy schema verification | verified / not verified | Policy is always on; it serves once the graph schema is verified and the Phase 3 schema is: every relation and added column of `047`–`059` and the recovery/retirement migrations `157`–`158` checked by existence, as `VerifyGraphSchema` does for the graph. Fail closed: until both verify, every Phase 3 route returns `503 policy_unavailable` with the reason. R1b (`060`), R2 (`061`, which also carries access policies, `137`–`138`) and R3 (`062`) each verify their own migration the same way; a database missing a later one never takes an earlier part down. There are no switches. |
 | `iga_gov_settings.enforcement_mode` | `findings_only` (default), `enforce` | `findings_only`: findings, proposals, reviews, approvals and J1 export; `direct` and `iac_pr` deployments refused with `enforcement_not_enabled` |
 | `cloud_enforcement_binding.state = verified` | per account | Required for `direct` (J3) |
 | `iga_gov_iac_source` covering the role | per account/repository | Required for `iac_pr` (J2) |
@@ -1358,15 +1358,15 @@ sequenceDiagram
   are `060_r1b_action_evidence.sql`, `061_r2_time_bound_access.sql` and
   `062_r3_runtime_controls.sql`, followed by tenancy and authentication
   migrations through `136`, and `137_access_policies.sql`. Recovery approvals and drift acceptance are added
-  by `154_iga_gov_recovery_approval.sql`; `155_retire_legacy_agent_policy.sql`
+  by `157_iga_gov_recovery_approval.sql`; `158_retire_legacy_agent_policy.sql`
   removes superseded policy storage. All use the existing numbered runner and
   are mirrored in bootstrap. Do not renumber shipped upstream migrations.
-  Migration `154` adds approval scope (`version` or `recovery`) and
+  Migration `157` adds approval scope (`version` or `recovery`) and
   `recovery_plan_id`, one live approval per recovery plan, drift acceptance
   fields, and the `review_response` notification kind while preserving the R2 kinds and `agent_alert` (150).
 - **Independent policy storage.** Phase 3 owns `iga_gov_*`,
   `cloud_enforcement_binding`, resource-policy evidence and Slack integration
-  tables. Migration `155` removes the five superseded policy tables and the
+  tables. Migration `158` removes the five superseded policy tables and the
   notification-copy column; it does not remove `enforcement_plans` (the cluster agent's plan poll, which Kubernetes access policies read), `provisioning_instructions`,
   provider discovery, graph tables, runtime RBAC or workspace memberships.
   New policy references to those shared objects remain workspace-scoped.
@@ -4978,7 +4978,7 @@ independent policy contracts. Finish with the lab integration.
 
 | Stage | Exit |
 |---|---|
-| **0. Remove superseded policy stack** | No old workers, API routes, models, notification bridge or UI; five old tables removed by `155` (`enforcement_plans` stays for the cluster plan poll); retained integrations and multitenancy build and run |
+| **0. Remove superseded policy stack** | No old workers, API routes, models, notification bridge or UI; five old tables removed by `158` (`enforcement_plans` stays for the cluster plan poll); retained integrations and multitenancy build and run |
 | **A. Lock** — this spec approved; migration numbers re-checked against the files; bootstrap parity to `046` (T3.00); `047`–`056` rehearsed on a production-schema copy (the fresh-database rehearsal is §6.3); enforcement template written; its §3.6 self-test run by hand in the lab account, including the `DeleteRolePermissionsBoundary` condition-key check | Rehearsal log; template review; self-test transcript |
 | **B. UI/UX** — every §9 view against the §7 contracts with typed fixtures, reviewed in the running console | `ui-reviewer` pass; walkthrough recorded |
 | **C. Backend** — services, workers, adapters, routes | `authsec-reviewer` pass; existing checks and `ci-iga-isolation-check.sh` green; §6.3 probes re-run |
@@ -5213,7 +5213,7 @@ The gate passes only when every expectation is observed and recorded (§14.4).
 | A53 | Evidence not trustworthy | (a) Activity report older than the freshness rule; (b) resource-policy coverage `partial`; (c) a Kubernetes ServiceAccount key | (a) `422 evidence_untrusted` naming the source, Connections link; (b) bundle `partial`, approval `409 evidence_gaps_not_accepted` until each gap is accepted; (c) `not_supported` with `K-1`, no finding, no plan |
 | A54 | Target beyond list caps | A workspace with more than 10,000 inventory rows; target a role absent from the first inventory page and from the graph's loaded view, by ARN and by Discovery object id | Resolved by `RoleId`; consumers and owners complete (`consumers_unresolved = 0`); the proposal matches one made for a role on the first page |
 | A55 | Verification stays unknown | Apply succeeds; block scans of the account (stop the scanner) for longer than the verification deadline | `applied_unverified`, then `overdue` with the reason; never `verified` by elapsed time; restoring scans verifies it |
-| A56 | Schema and UI removal | Upgrade through `155`; bootstrap independently; browse policy pages | Five obsolete tables absent, `enforcement_plans` present; no legacy list or notification-copy requests; one policy workspace |
+| A56 | Schema and UI removal | Upgrade through `158`; bootstrap independently; browse policy pages | Five obsolete tables absent, `enforcement_plans` present; no legacy list or notification-copy requests; one policy workspace |
 | A57 | Bookmarks and placement | Open `/iga/policies`, `/iga/policy-warnings`, `/iga/enforcement`, `/iga/upcoming`, `/iga/sod` | Redirects of §9.2; `/iga/sod` stays retired. No sidebar entry beyond the four destinations |
 | A58 | Unknown and late mutations | Fault injection at the adapter: (a) kill the worker after AWS accepted `CreatePolicyVersion` and before the response is recorded; (b) delay a `CreatePolicyVersion` past the client timeout; (c) try an undo and a version-3 deployment while (a) or (b) is unknown; (d) make readback disagree with CloudTrail; (e) release (b)'s request after version 3 verified; (f) in (d), choose Accept observed state | (a) the replacement finds the attempt `dispatched`, marks it `unknown`, never re-sends; a `prepared` attempt is `abandoned` and re-prepared; (b) `unknown`, no SDK retry; (c) refused (`409 outcome_unknown_pending`); (d) `outcome_unresolved`, owner notified, role still locked; (e) `late_mutation_suspected` drift within 5 minutes, nothing reverted; (f) the role stays locked until the new plan is approved, then the handoff releases it in one transaction |
 | A59 | Rescan after approval | Approve; publish two unchanged scans before the canary and one between canary and expansion; then add a consumer of the role and rescan | Three `unchanged` revalidations, the approved `plan_hash` untouched, no new approval or owner notice; after the new consumer: `material_change` naming `consumers`, deployment `blocked`, review reopened for the new owner, re-approval required |

@@ -18,7 +18,7 @@ Design reference: [`SPEC-iga-phase3-policy.md`](SPEC-iga-phase3-policy.md). Each
 
 | Item | Setting |
 |---|---|
-| Database | New PostgreSQL 15+. Load `migrations/master/001_bootstrap.sql` (verify parity with the complete numbered migration chain, currently through `155`). Never point at the deployed database. |
+| Database | New PostgreSQL 15+. Load `migrations/master/001_bootstrap.sql` (verify parity with the complete numbered migration chain, currently through `158`). Never point at the deployed database. |
 | Backend | `cp .env.example .env`, then set the database, `IGA_CURSOR_SECRET`, Vault (needed for the enforcement ExternalId, the GitHub App key and Slack tokens). Do **not** set `AUTHSEC_DISABLE_POLICY_WORKER`, `AUTHSEC_DISABLE_AWS_SCAN_WORKER` or `AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER`. `go run ./cmd/` listens on `7468`. |
 | Reachability | AWS CloudFormation calls back to the backend, so the backend needs a public HTTPS URL for the enforcement and discovery stacks (a tunnel is fine). The same URL is the OAuth redirect for GitHub and Slack. |
 | Console | `Authsec-ui` pointed at that backend (`VITE_API_URL`, `VITE_OAUTH_BASE_URL`). |

@@ -167,7 +167,7 @@ func (m *enforcementPlanManager) History(workspaceID, sourceID uuid.UUID,
 //
 // The source of truth is discovered_agents.status: there is exactly one answer
 // to "is this agent contained". Entries carry no policy_id since the legacy
-// agent-policy feature was retired (155); the field stays in the document for
+// agent-policy feature was retired (158); the field stays in the document for
 // agents that read it.
 func (m *enforcementPlanManager) build(workspaceID uuid.UUID,
 	src *models.DiscoverySource) (*models.EnforcementPlanDoc, error) {

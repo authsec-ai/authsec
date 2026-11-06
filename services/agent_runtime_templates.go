@@ -30,16 +30,22 @@ type CFNParameter struct {
 // returned anywhere but the create/rotate response.
 const EventStreamSecretPlaceholder = "<the aev_ secret shown once when the stream was turned on or rotated>"
 
+// EventStreamSecretInResponse stands for the event secret in the
+// create/rotate response's parameters: the secret itself is in data.secret
+// and in no other field (lab 2026-11-05: printing the parameters leaked it a
+// second time).
+const EventStreamSecretInResponse = "<the secret in data.secret; shown once>"
+
 // EventStreamStackParameters are the AuthSec-filled parameters of the event
-// stream stack for one connector. secret "" puts the placeholder in its
-// place: only the create/rotate response carries the secret.
-func EventStreamStackParameters(endpointURL, secret string, connectorID uuid.UUID) []CFNParameter {
-	if secret == "" {
-		secret = EventStreamSecretPlaceholder
+// stream stack for one connector. EventSecret is never the secret: it is
+// placeholder, or EventStreamSecretPlaceholder when placeholder is "".
+func EventStreamStackParameters(endpointURL, placeholder string, connectorID uuid.UUID) []CFNParameter {
+	if placeholder == "" {
+		placeholder = EventStreamSecretPlaceholder
 	}
 	return []CFNParameter{
 		{ParameterKey: "EndpointUrl", ParameterValue: endpointURL},
-		{ParameterKey: "EventSecret", ParameterValue: secret},
+		{ParameterKey: "EventSecret", ParameterValue: placeholder},
 		{ParameterKey: "ConnectorId", ParameterValue: connectorID.String()},
 		{ParameterKey: "CreateTrail", ParameterValue: "false"},
 	}

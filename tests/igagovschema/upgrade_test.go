@@ -117,7 +117,7 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	}
 	before := fingerprints(t, db)
 
-	// Apply the original policy chain plus recovery/retirement (154-155).
+	// Apply the original policy chain plus recovery/retirement (157-158).
 	// Do not include the new access-policy feature (137) in this isolation check.
 	// The tenancy program's
 	// migrations (101+) change existing tables on purpose (workspace columns,
@@ -129,7 +129,7 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	}
 	for _, f := range all {
 		v, err := strconv.Atoi(strings.SplitN(filepath.Base(f), "_", 2)[0])
-		if err != nil || v < phase3First || (v >= 100 && v != 154 && v != 155) {
+		if err != nil || v < phase3First || (v >= 100 && v != 157 && v != 158) {
 			continue
 		}
 		body, err := os.ReadFile(f)

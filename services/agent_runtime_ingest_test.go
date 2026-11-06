@@ -147,7 +147,7 @@ func TestAgentEventRateLimit_PerConnector(t *testing.T) {
 	}
 }
 
-func TestEventStreamStackParameters_SecretOnlyWhenGiven(t *testing.T) {
+func TestEventStreamStackParameters_NeverTheSecret(t *testing.T) {
 	id := uuid.New()
 	get := func(ps []CFNParameter, k string) string {
 		for _, p := range ps {
@@ -161,9 +161,9 @@ func TestEventStreamStackParameters_SecretOnlyWhenGiven(t *testing.T) {
 	if get(ps, "EventSecret") != EventStreamSecretPlaceholder || get(ps, "ConnectorId") != id.String() {
 		t.Fatalf("parameters without a secret: %+v", ps)
 	}
-	ps = EventStreamStackParameters("https://x.example/authsec/ingest/aws/events", "aev_secret", id)
-	if get(ps, "EventSecret") != "aev_secret" {
-		t.Fatalf("parameters with a secret: %+v", ps)
+	ps = EventStreamStackParameters("https://x.example/authsec/ingest/aws/events", EventStreamSecretInResponse, id)
+	if get(ps, "EventSecret") != EventStreamSecretInResponse {
+		t.Fatalf("create-response parameters: %+v", ps)
 	}
 	if doc := EventStreamTemplate(id); strings.Contains(fmt.Sprint(doc.Parameters), "aev_secret") || doc.Template == "" {
 		t.Fatal("the template document must carry the stack and never a secret")

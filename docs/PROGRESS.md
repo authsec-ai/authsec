@@ -6,16 +6,60 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ## 2026-11-06 — Legacy agent-policy retirement and Phase 3 recovery, merged onto staging (branch `merge/legacy-policy-retire`)
 
-Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` at `d1763fe3`.
+Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` (after PR #106 and the round-3 security fixes).
 
 ### Done
 - Phase 3: a role-only recovery plan gets its own approval (scope `recovery`), "Accept drift" and "Re-apply" on a drifted deployment, author notices (`review_response`), isolation proposals, `GET /findings?category`.
 - Retired the pre-Phase-3 agent-policy feature (decision 2026-10-13, disposition plan): workers, `/authsec/governance/agent-policies`, warnings, notification settings, `/api/iga/v1/legacy/*`, the notification-channel copy.
-- Migrations renumbered from 138/139 (taken upstream) to `154_iga_gov_recovery_approval` (keeps 150's `agent_alert` notice kind) and `155_retire_legacy_agent_policy`; both mirrored at the end of bootstrap; policy schema head `155`.
+- Migrations renumbered from 138/139 (taken upstream), then again past PR #106's 152-156, to `157_iga_gov_recovery_approval` (keeps 150's `agent_alert` notice kind) and `158_retire_legacy_agent_policy`; both mirrored at the end of bootstrap; policy schema head `158`.
 - Kept, unlike the original work: `enforcement_plans` and the cluster agent's `GET /authsec/provisioning/enforcement-plan` poll (plus the console history route). Kubernetes access policies (146) read the agent's `bindings=` report from it. Plan entries no longer carry `policy_id`.
 
 ### Open
-- `155` drops `agent_policies`, `agent_policy_actions`, `agent_policy_confirmations`, `agent_policy_warnings` and `governance_notification_settings` with their rows. Their production row counts have not been checked; check before release.
+- `158` drops `agent_policies`, `agent_policy_actions`, `agent_policy_confirmations`, `agent_policy_warnings` and `governance_notification_settings` with their rows. Their production row counts have not been checked; check before release.
+
+---
+
+## 2026-11-05 — Agent runtime on the access graph (branch `feat/agent-runtime-graph`)
+
+- `/graph`, `/graph/expand`, `/graph/path` and the identity and workload details: an AWS role, user or workload carries an additive `agent_runtime` object (label, model calls, open alerts, open findings, suggestion, containment) only when there is something to say; a contained role's grant edges carry `contained: {id, level}` while the containment is in force (identity level: every grant; model level: grants whose statement allows a model action). Nodes and edges without agent-runtime data are unchanged byte for byte.
+- Labels come from the inference service's own rules through an `igaread.AgentRuntimeSource` installed at startup (`services/agent_runtime_graph.go`); one statement per table per graph level, inside the level's RLS transaction.
+- `/capabilities` `features` is not extended: the frozen contract fixes it at eight keys.
+## 2026-11-05 (cont.) — DNS-based detection of direct model-provider calls (branch `feat/agent-runtime-dns`)
+
+Spec `SPEC-agent-runtime-visibility.md` §11. Committed locally; nothing pushed.
+
+### Done
+- Route 53 Resolver query logs (CloudWatch Logs destinations) read per region with one Logs Insights query per log group that returns only lookups of the model-endpoint list; findings `ai_network_traffic` attributed to the EC2 instance, Lambda or ECS task (or the VPC), resolved after 30 gap-free quiet days. Migration 153 (kind CHECK incl. `ai_config_hint`, `cloud_dns_cursor`). Discovery template 2026-11-05 (route53resolver List, logs StartQuery/GetQueryResults/StopQuery, ec2:DescribeNetworkInterfaces).
+- Tests: unit (domain list and in-query filter, configs, windows, truncation, attribution, coverage, permission missing, S3 unsupported), integration (attribution, no other domain stored, cumulative windows, resolve and gap, two-workspace isolation under RLS); tenancy ratchet 72/72.
+
+### Open
+- Publish template 2026-11-05 to the template bucket before release; verify the Logs Insights query (field names, `coalesce`, `(?i)`) and the Lambda/ECS interface descriptions against the lab account; UI for the new finding kind and surfaces.
+
+---
+## 2026-11-05 — Model provider usage, OpenAI and Anthropic (branch `feat/agent-runtime-provider-usage`)
+
+Spec `SPEC-agent-runtime-provider-usage.md`. Built opt-in despite review 2's concern (Ritam, pending Aditya). Committed locally; nothing pushed.
+
+### Done
+- Migration 154: `model_provider_connection` (admin key in Vault per workspace, fingerprint only in the row), `model_provider_key`, `model_provider_usage` (hourly); `agent_finding` admits `ai_config_hint`, `ai_network_traffic`, `unaccounted_model_usage`, `connector_id` nullable, `provider_connection_id` added.
+- `internal/modelprovider`: GET-only clients for the OpenAI and Anthropic Admin APIs (fixed hosts, no redirects, 429 backoff, 401/403 as a refused key).
+- Hourly sync worker, weak attribution by name (Secrets Manager secret names with readers, Lambda env-var names), finding `unaccounted_model_usage`.
+- Routes `/api/iga/v1/agent-runtime/model-providers` (connect, list, get, rotate, revoke, sync, keys, usage), audited.
+
+### Open
+- Aditya's sign-off; UI (connect dialog, keys and usage views); Anthropic's Usage and Cost Analytics API (the messages report is legacy); verify both providers against a real organisation.
+## 2026-11-05 — Agent runtime gateway: live control of MCP tool calls and model calls (branch `feat/agent-runtime-gateway`)
+
+Spec `SPEC-agent-runtime-gateway.md` (revision 1, not reviewed): visibility spec rev 1 §5.7, with the gateway in the customer's environment (provider keys and MCP credentials never reach AuthSec). AuthSec is the PDP (OpenID AuthZEN Authorization API 1.0) and the decision-log sink.
+
+### Done
+- Migration 156 (`agent_gateway`, `agent_gateway_setting`, `agent_tool_policy`, `agent_gateway_decision` append-only with a 30-day default retention), RLS, bootstrap mirror; schema of the four tables identical on upgrade and fresh bootstrap.
+- PDP `/authsec/pdp/access/v1/evaluation(s)`, `/authsec/pdp/v1/decisions`, `/authsec/pdp/v1/policy-hints` (gateway credential `agw_…` only; per-gateway limit; own per-IP ceiling). Admin `/api/iga/v1/agent-runtime/{gateways,gateway-settings,tool-policies,tool-policies/evaluate,gateway-decisions}`.
+- Gateway binary `cmd/agent-gateway` (MCP Streamable HTTP proxy with header/body validation and tool pinning; OpenAI-compatible and Anthropic proxy with usage; cache; fail mode auto/closed/open; batched upload), `deploy/agent-gateway/` (Dockerfile, Helm values, README, example config).
+- Tests: unit (`internal/agentgateway/...`), integration `TestAgentGateway*` (isolation, append-only, retention, rates), ratchet 72/72, IGA isolation check.
+
+### Open
+- Review of the spec; UI; pin approval from the console (Q1); mirroring decisions into `agent_activity_event` (155) once it lands; AuthZEN `/.well-known/authzen-configuration` at the host root.
 
 ---
 

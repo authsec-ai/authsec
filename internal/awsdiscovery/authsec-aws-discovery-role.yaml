@@ -8,7 +8,7 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-10-07'
+    TemplateVersion: '2026-11-06'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -22,6 +22,7 @@ Metadata:
         Parameters:
           - RoleName
           - MaxSessionDurationSeconds
+          - DnsQueryLogGroupArns
 
 Parameters:
 
@@ -83,9 +84,21 @@ Parameters:
       account can run for a while; the default of one hour is enough for the
       current scan surfaces. Minimum 3600, maximum 43200.
 
+  DnsQueryLogGroupArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional. The ARNs of the CloudWatch Logs log groups your Route 53
+      Resolver query logging writes to, as the CloudWatch console shows them
+      (arn:aws:logs:<region>:<account>:log-group:<name>:*). AuthSec may run Logs
+      Insights queries on these log groups only, and only to find lookups of
+      AI model providers' API hosts. Empty: no log group can be queried, and
+      DNS-based detection reports the read as denied.
+
 Conditions:
 
   HasCallback: !Not [!Equals [!Ref CallbackTopicArn, '']]
+  HasDnsQueryLogGroups: !Not [!Equals [!Join ['', !Ref DnsQueryLogGroupArns], '']]
 
 Resources:
 
@@ -345,6 +358,48 @@ Resources:
                   - ec2:DescribeIamInstanceProfileAssociations
                 Resource: '*'
 
+              # DNS query logs (template 2026-11-05). Detects workloads that
+              # call a model provider (OpenAI, Anthropic, Google...) directly,
+              # from Route 53 Resolver query logs: which VPCs log their DNS
+              # queries and where, and -- for a CloudWatch Logs destination --
+              # one Logs Insights query per log group that returns ONLY the
+              # lookups of model providers' API hosts, filtered inside the
+              # query, so no other DNS data leaves the account. Logs Insights
+              # is charged per GB scanned: AuthSec reads 24 hours on the first
+              # read and at most 7 days per log group per scan, and stops a
+              # query it no longer waits for. ec2:DescribeNetworkInterfaces
+              # maps a source address to the network interface (Lambda, ECS
+              # task, instance) holding it; the ECS task reads are granted
+              # under MigrationEvidence above. S3 and Firehose destinations are
+              # listed, never read.
+              - Sid: DnsQueryLogConfigs
+                Effect: Allow
+                Action:
+                  - route53resolver:ListResolverQueryLogConfigs
+                  - route53resolver:ListResolverQueryLogConfigAssociations
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+
+              # StartQuery is granted ONLY on the log groups the customer names
+              # in DnsQueryLogGroupArns (template 2026-11-06): IAM, not
+              # AuthSec's code, keeps every other log group out of reach.
+              # GetQueryResults and StopQuery act on a query id and support no
+              # resource scoping.
+              - !If
+                - HasDnsQueryLogGroups
+                - Sid: DnsQueryLogInsights
+                  Effect: Allow
+                  Action:
+                    - logs:StartQuery
+                  Resource: !Ref DnsQueryLogGroupArns
+                - !Ref 'AWS::NoValue'
+              - Sid: DnsQueryLogInsightsResults
+                Effect: Allow
+                Action:
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+
         # ------------------------------------------------------------------
         # Explicit denies. SecurityAudit does not grant any of these, so this
         # policy changes nothing about what the role can do today. It is here so
@@ -423,7 +478,7 @@ Resources:
       RoleArn: !GetAtt AuthSecDiscoveryRole.Arn
       ExternalId: !Ref ExternalId
       AccountId: !Ref 'AWS::AccountId'
-      TemplateVersion: '2026-10-07'
+      TemplateVersion: '2026-11-06'
 
 Outputs:
 
@@ -442,4 +497,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-10-07'
+    Value: '2026-11-06'

@@ -38,7 +38,7 @@ import (
 // of a workspace is always a users row OF that workspace (memberships span
 // workspaces) is the open question that decides it.
 var phase3UserRefs = map[string]string{
-	"iga_gov_deployment.drift_accepted_by":      "154: the member who accepted drift",
+	"iga_gov_deployment.drift_accepted_by":      "157: the member who accepted drift",
 	"cloud_enforcement_binding.consented_by":    "053: who consented to the enforcement role",
 	"iga_gov_acceptance.accepted_by":            "051: who accepted the uncertainty",
 	"iga_gov_approval.decided_by":               "050: the approver",

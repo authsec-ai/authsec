@@ -232,7 +232,8 @@ func TestAgentRuntimeInferenceAndIsolation(t *testing.T) {
 	sugB, _ := arSuggestionID(t, db, b.ws, b.workload)
 	var kinds []string
 	db.Raw(`SELECT kind FROM agent_finding WHERE workspace_id = ? AND state = 'open' ORDER BY kind`, a.ws).Pluck("kind", &kinds)
-	if strings.Join(kinds, ",") != "long_lived_key,model_key_secret,shared_role" {
+	// ai_config_hint: the support bot's LANGCHAIN_API_KEY env var name.
+	if strings.Join(kinds, ",") != "ai_config_hint,long_lived_key,model_key_secret,shared_role" {
 		t.Fatalf("A's open findings: %v", kinds)
 	}
 	var sharedSuggestions int64

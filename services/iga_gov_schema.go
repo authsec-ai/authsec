@@ -22,7 +22,7 @@ import (
 // and the capabilities block controllers/platform/iga_gov_policy_controller.go.
 
 // PolicySchemaHead is the migration required by the independent policy lifecycle.
-const PolicySchemaHead = "155"
+const PolicySchemaHead = "158"
 
 // policyRelations is every relation 047-056 create: each table, the sequence
 // behind iga_gov_event.id, and every explicitly named index. The indexes are
@@ -68,7 +68,7 @@ var policyRelations = []string{
 	"uq_iga_gov_acceptance_gate",
 	// 059_tidy_eval_pruned (fix/p3-tidy): finding reads answer 410 from it
 	"iga_gov_evaluation_pruned",
-	// 154_iga_gov_recovery_approval: a role-only recovery plan is approved on its own.
+	// 157_iga_gov_recovery_approval: a role-only recovery plan is approved on its own.
 	"uq_iga_gov_approval_recovery",
 }
 

@@ -69,6 +69,12 @@ const (
 	FindingHumanCredentials = "human_credentials"
 	FindingLongLivedKey     = "long_lived_key"
 	FindingModelKeySecret   = "model_key_secret"
+	// FindingAIConfigHint: a workload's configuration names a model provider
+	// (agent_runtime_config_hints.go).
+	FindingAIConfigHint = "ai_config_hint"
+	// FindingAINetworkTraffic: DNS lookups of model endpoints mapped to an
+	// identity, written by the network evidence path; read here only.
+	FindingAINetworkTraffic = "ai_network_traffic"
 
 	FindingOpen     = "open"
 	FindingResolved = "resolved"
@@ -106,13 +112,18 @@ func (s *AgentRuntimeService) WithClock(f func() time.Time) *AgentRuntimeService
 
 // AgentInferenceResult reports one inference run.
 type AgentInferenceResult struct {
-	AIWorkloads      int
-	SuggestionsNew   int
-	SuggestionsOpen  int
-	Superseded       int
-	FindingsOpen     int
-	FindingsResolved int
-	AgentsMirrored   int
+	// AIWorkloads have model-call or network evidence; PossibleAIWorkloads
+	// only configuration hints.
+	AIWorkloads         int
+	PossibleAIWorkloads int
+	ConfigHintsOpen     int
+	ConfigHintsResolved int
+	SuggestionsNew      int
+	SuggestionsOpen     int
+	Superseded          int
+	FindingsOpen        int
+	FindingsResolved    int
+	AgentsMirrored      int
 }
 
 // RunAgentInferenceAfterScan is the scan worker's hook: it runs inference for
@@ -129,9 +140,9 @@ func RunAgentInferenceAfterScan(ctx context.Context, db *gorm.DB, ws, connectorI
 		log.Printf("agent runtime inference: ws=%s connector=%s: %v", ws, connectorID, err)
 		return
 	}
-	log.Printf("agent runtime inference: ws=%s connector=%s: %d AI workloads, %d new suggestions (%d pending), %d superseded, %d findings open, %d resolved, %d agents mirrored",
-		ws, connectorID, res.AIWorkloads, res.SuggestionsNew, res.SuggestionsOpen, res.Superseded,
-		res.FindingsOpen, res.FindingsResolved, res.AgentsMirrored)
+	log.Printf("agent runtime inference: ws=%s connector=%s: %d AI workloads (%d possible), %d new suggestions (%d pending), %d superseded, %d findings open, %d resolved, %d config hints open, %d resolved, %d agents mirrored",
+		ws, connectorID, res.AIWorkloads, res.PossibleAIWorkloads, res.SuggestionsNew, res.SuggestionsOpen, res.Superseded,
+		res.FindingsOpen, res.FindingsResolved, res.ConfigHintsOpen, res.ConfigHintsResolved, res.AgentsMirrored)
 }
 
 // RunAgentInference recomputes one connector's AI workloads, suggestions,
@@ -155,13 +166,29 @@ func (s *AgentRuntimeService) RunAgentInference(ctx context.Context, ws, connect
 		if _, ok := st.connectors[connectorID]; !ok {
 			return nil // not an AWS connector of this workspace: nothing to infer
 		}
-		ais := st.aiWorkloads()
-		res.AIWorkloads = len(ais)
-
 		secrets, err := loadModelKeySecrets(tx, ws, st.connectors[connectorID])
 		if err != nil {
 			return fmt.Errorf("model-key secrets: %w", err)
 		}
+		// Configuration hints first, then the state again: the labels below
+		// read the hint findings.
+		if err := s.applyConfigHints(tx, ws, st.connectors[connectorID], secrets, now, &res); err != nil {
+			return fmt.Errorf("config hints: %w", err)
+		}
+		if st, err = loadAgentRuntimeState(tx, ws, &connectorID, nil); err != nil {
+			return err
+		}
+		// Suggestions and credential findings rest on evidence of model use
+		// (calls or network); a possible AI workload (names only) gets none.
+		var ais []*AIWorkload
+		for _, ai := range st.aiWorkloads() {
+			if ai.evidenced() {
+				ais = append(ais, ai)
+			} else {
+				res.PossibleAIWorkloads++
+			}
+		}
+		res.AIWorkloads = len(ais)
 		if err := s.applySuggestions(tx, ws, connectorID, st, ais, secrets, now, &res); err != nil {
 			return fmt.Errorf("suggestions: %w", err)
 		}
@@ -277,6 +304,8 @@ type agentRuntimeState struct {
 	saml         map[uuid.UUID]bool          // identities a SAML provider may assume
 	suggestions  map[uuid.UUID]*arSuggestion // by graph workload id
 	openFindings map[uuid.UUID]int           // open findings, by identity
+	hints        map[uuid.UUID][]*arFinding  // open ai_config_hint findings, by identity
+	network      map[uuid.UUID][]*arFinding  // open ai_network_traffic findings, by identity
 }
 
 // loadAgentRuntimeState reads the state for the workspace, optionally only one
@@ -288,6 +317,7 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 		usage: map[uuid.UUID]*arUsage{}, workloads: map[uuid.UUID][]*arWorkload{},
 		k8s: map[uuid.UUID][]string{}, saml: map[uuid.UUID]bool{},
 		suggestions: map[uuid.UUID]*arSuggestion{}, openFindings: map[uuid.UUID]int{},
+		hints: map[uuid.UUID][]*arFinding{}, network: map[uuid.UUID][]*arFinding{},
 	}
 
 	var conns []arConnector
@@ -328,6 +358,27 @@ func loadAgentRuntimeState(tx *gorm.DB, ws uuid.UUID, connector, identity *uuid.
 		}
 		st.usage[u.IdentityID] = u
 		idSet[u.IdentityID] = true
+	}
+	// Label evidence other than model calls: configuration hints and network
+	// traffic, open findings naming an identity of these connectors.
+	var hintRows []*arFinding
+	fq := tx.Table("agent_finding").Select("id, kind, identity_id, subject, evidence").
+		Where(`workspace_id = ? AND state = ? AND kind IN ? AND identity_id IN
+		        (SELECT id FROM cloud_identity WHERE workspace_id = ? AND connector_id IN ?)`,
+			ws, FindingOpen, []string{FindingAIConfigHint, FindingAINetworkTraffic}, ws, connIDs)
+	if identity != nil {
+		fq = fq.Where("identity_id = ?", *identity)
+	}
+	if err := fq.Order("kind, subject_key, id").Scan(&hintRows).Error; err != nil {
+		return nil, fmt.Errorf("read hint findings: %w", err)
+	}
+	for _, f := range hintRows {
+		if f.Kind == FindingAINetworkTraffic {
+			st.network[f.IdentityID] = append(st.network[f.IdentityID], f)
+		} else {
+			st.hints[f.IdentityID] = append(st.hints[f.IdentityID], f)
+		}
+		idSet[f.IdentityID] = true
 	}
 	if identity != nil {
 		idSet[*identity] = true
@@ -497,10 +548,29 @@ type AIWorkload struct {
 	Suggestion         *AISuggestionRef `json:"suggestion"`
 	OpenFindings       int              `json:"open_findings"`
 	UsageID            uuid.UUID        `json:"usage_id"`
+	// Live is what the event stream showed since the scan's coverage
+	// (agent_runtime_live.go); SeenLive: a model call of it was ever seen
+	// live.
+	Live     AILiveEvidence `json:"live"`
+	SeenLive bool           `json:"seen_live"`
+	// ConfigHints are the open ai_config_hint findings of the identity's
+	// workloads (a possible AI workload rests on them); NetworkTraffic the
+	// open ai_network_traffic findings (evidence of an AI workload).
+	ConfigHints    []AIFindingRef `json:"config_hints"`
+	NetworkTraffic []AIFindingRef `json:"network_traffic"`
 
 	ident  *arIdentity
 	wls    []*arWorkload
 	usageR *arUsage
+}
+
+// AILiveEvidence is the live model-call evidence not yet in the scan's exact
+// counts (ModelCallUsage.Live*).
+type AILiveEvidence struct {
+	Calls      int            `json:"calls"`
+	Denied     int            `json:"denied"`
+	LastCallAt *time.Time     `json:"last_call_at"`
+	Models     map[string]int `json:"models"`
 }
 
 // AIIdentityRef is the identity the calls are attributed to.
@@ -552,21 +622,82 @@ type AISuggestionRef struct {
 }
 
 // isAIWorkload: seen calling a model, or refused one (the tag-gated template's
-// deny mode makes the untagged AI workloads show as refusals, §5.4).
-func isAIWorkload(u agentruntime.ModelCallUsage) bool { return u.Calls > 0 || u.Denied > 0 }
+// deny mode makes the untagged AI workloads show as refusals, §5.4), by the
+// scan or live (the event stream, before the next scan).
+func isAIWorkload(u agentruntime.ModelCallUsage) bool {
+	return u.Calls > 0 || u.Denied > 0 || u.LiveCalls > 0 || u.LiveDenied > 0
+}
 
-// aiWorkloads builds every AI workload of the state, sorted by identity id.
+// evidenced: model calls (scan or live), or network traffic attributed at
+// lookup time, show the identity uses a model; otherwise it rests on
+// configuration hints or on traffic attributed only by who holds the address
+// at scan time, and is a possible AI workload.
+func (ai *AIWorkload) evidenced() bool {
+	if ai.usageR != nil && isAIWorkload(ai.usageR.usage) {
+		return true
+	}
+	for _, n := range ai.NetworkTraffic {
+		if networkAttributedAtLookup(n.Evidence) {
+			return true
+		}
+	}
+	return false
+}
+
+// networkAttributedAtLookup: an ai_network_traffic finding whose source was
+// named in the query log record itself (srcids.instance). An attribution by
+// the network interface holding the address when AuthSec scanned is a lead,
+// not evidence: the address may have changed hands, and Lambda shares one
+// interface across functions, so it never labels an AI workload on its own.
+func networkAttributedAtLookup(evidence json.RawMessage) bool {
+	var doc struct {
+		Attribution struct {
+			Confidence string `json:"confidence"`
+		} `json:"attribution"`
+	}
+	return json.Unmarshal(evidence, &doc) == nil && doc.Attribution.Confidence == "query_time"
+}
+
+// usageOf is the identity's model-call row, or an empty one.
+func (st *agentRuntimeState) usageOf(id uuid.UUID) *arUsage {
+	if u := st.usage[id]; u != nil {
+		return u
+	}
+	return &arUsage{IdentityID: id}
+}
+
+// aiCandidate: the identity has model-call evidence, network traffic or
+// configuration hints.
+func (st *agentRuntimeState) aiCandidate(id uuid.UUID) bool {
+	if u := st.usage[id]; u != nil && isAIWorkload(u.usage) {
+		return true
+	}
+	return len(st.network[id]) > 0 || len(st.hints[id]) > 0
+}
+
+// aiWorkloads builds every AI workload (and possible AI workload) of the
+// state, sorted by identity id.
 func (st *agentRuntimeState) aiWorkloads() []*AIWorkload {
 	var out []*AIWorkload
-	for idID, u := range st.usage {
-		if !isAIWorkload(u.usage) {
+	ids := map[uuid.UUID]bool{}
+	for id := range st.usage {
+		ids[id] = true
+	}
+	for id := range st.hints {
+		ids[id] = true
+	}
+	for id := range st.network {
+		ids[id] = true
+	}
+	for idID := range ids {
+		if !st.aiCandidate(idID) {
 			continue
 		}
 		ident := st.identities[idID]
 		if ident == nil {
 			continue
 		}
-		out = append(out, st.buildAIWorkload(ident, u))
+		out = append(out, st.buildAIWorkload(ident, st.usageOf(idID)))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Identity.ID.String() < out[j].Identity.ID.String() })
 	return out
@@ -587,7 +718,12 @@ func (st *agentRuntimeState) buildAIWorkload(ident *arIdentity, u *arUsage) *AIW
 		Coverage:     AICoverage{From: u.usage.CoveredFrom, To: u.usage.CoveredTo, Partial: u.usage.Partial},
 		OpenFindings: st.openFindings[ident.ID],
 		UsageID:      u.ID,
-		ident:        ident, wls: wls, usageR: u,
+		Live: AILiveEvidence{Calls: u.usage.LiveCalls, Denied: u.usage.LiveDenied,
+			LastCallAt: u.usage.LiveLastCallAt, Models: arNonNil(u.usage.LiveModels)},
+		SeenLive:       u.usage.LiveLastCallAt != nil,
+		ConfigHints:    aiFindingRefs(st.hints[ident.ID]),
+		NetworkTraffic: aiFindingRefs(st.network[ident.ID]),
+		ident:          ident, wls: wls, usageR: u,
 	}
 	for _, w := range wls {
 		ai.Workloads = append(ai.Workloads, AIWorkloadRef{CloudWorkloadID: w.ID, WorkloadID: w.GraphID,
@@ -618,13 +754,22 @@ func (ai *AIWorkload) single() *arWorkload {
 // suggestion or the rule matches and the incarnation was never dismissed or
 // confirmed, otherwise AI workload. A shared role is never more than an AI
 // workload (§10 Q1): the calls cannot be tied to one of its workloads.
+// Without model-call or network evidence it is a possible AI workload
+// (configuration hints): never a suggested agent, since names never decide a
+// suggestion.
 func (st *agentRuntimeState) label(ai *AIWorkload) string {
 	one := ai.single()
 	if one == nil {
+		if !ai.evidenced() {
+			return agentruntime.LabelPossibleAIWorkload
+		}
 		return agentruntime.LabelAIWorkload
 	}
 	if one.isAgent() {
 		return agentruntime.LabelAgent
+	}
+	if !ai.evidenced() {
+		return agentruntime.LabelPossibleAIWorkload
 	}
 	if one.GraphID != nil {
 		if s := st.suggestions[*one.GraphID]; s != nil {
@@ -681,6 +826,7 @@ type AIWorkloadFilter struct {
 // AIWorkloadLabels are the label filter's legal values.
 var AIWorkloadLabels = map[string]bool{
 	agentruntime.LabelAIWorkload: true, agentruntime.LabelSuggestedAgent: true, agentruntime.LabelAgent: true,
+	agentruntime.LabelPossibleAIWorkload: true,
 }
 
 // DefaultAgentRuntimePage is a list page when no limit is given.
@@ -691,7 +837,7 @@ const DefaultAgentRuntimePage = 50
 // runs under row-level security for it.
 func (s *AgentRuntimeService) ListAIWorkloads(ctx context.Context, ws uuid.UUID, f AIWorkloadFilter) ([]*AIWorkload, *string, error) {
 	if f.Label != "" && !AIWorkloadLabels[f.Label] {
-		return nil, nil, GovBadParam("label", "label must be ai_workload, suggested_agent or agent.")
+		return nil, nil, GovBadParam("label", "label must be ai_workload, suggested_agent, agent or possible_ai_workload.")
 	}
 	if f.Cursor != "" {
 		if _, err := uuid.Parse(f.Cursor); err != nil {
@@ -808,8 +954,8 @@ func subjectFromState(st *agentRuntimeState, ident *arIdentity) agentruntime.Sub
 	if sub.Label != "" {
 		return sub
 	}
-	if u := st.usage[ident.ID]; u != nil && isAIWorkload(u.usage) {
-		sub.Label = st.buildAIWorkload(ident, u).Label
+	if st.aiCandidate(ident.ID) {
+		sub.Label = st.buildAIWorkload(ident, st.usageOf(ident.ID)).Label
 	}
 	return sub
 }

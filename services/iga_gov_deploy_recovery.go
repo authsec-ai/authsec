@@ -19,7 +19,7 @@ import (
 // (artifact_consumers_changed) compiles a recovery plan whose hash is not in
 // the deployment's approval, so it needs its own: a second approver, or
 // governance:emergency. The approval is a scope = 'recovery' row of
-// iga_gov_approval (migration 154): one plan, its hash, never the version's
+// iga_gov_approval (migration 157): one plan, its hash, never the version's
 // approval. Undo then names it as the deployment's approval; the executor's
 // undo rule (the approval names the plan's hash) is unchanged.
 

@@ -51,8 +51,12 @@ func TestD1SecretReads(t *testing.T) {
 		{"GetSecretValue", ev("secretsmanager.amazonaws.com", "GetSecretValue"), SeverityHigh},
 		{"BatchGetSecretValue", ev("secretsmanager.amazonaws.com", "BatchGetSecretValue"), SeverityHigh},
 		{"ListSecrets is not a read of a value", ev("secretsmanager.amazonaws.com", "ListSecrets"), ""},
-		{"GetParameter", ev("ssm.amazonaws.com", "GetParameter"), SeverityMedium},
-		{"GetParametersByPath", ev("ssm.amazonaws.com", "GetParametersByPath"), SeverityMedium},
+		{"GetParameter with decryption", ssm("GetParameter", "true"), SeverityMedium},
+		{"GetParameters with decryption", ssm("GetParameters", "true"), SeverityMedium},
+		{"GetParametersByPath with decryption", ssm("GetParametersByPath", "true"), SeverityMedium},
+		{"GetParameter without decryption", ssm("GetParameter", "false"), ""},
+		{"GetParameter, decryption not stated", ev("ssm.amazonaws.com", "GetParameter"), ""},
+		{"GetParametersByPath, decryption not stated", ev("ssm.amazonaws.com", "GetParametersByPath"), ""},
 		{"kms Decrypt by the caller", ev("kms.amazonaws.com", "Decrypt"), SeverityMedium},
 	}
 	for _, c := range cases {
@@ -81,12 +85,39 @@ func TestD1KMSDecryptViaSecretsManagerOrSSMDropped(t *testing.T) {
 	only(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
 }
 
-func TestD1SSMWithDecryptionFalseDropped(t *testing.T) {
-	e := ev("ssm.amazonaws.com", "GetParameter")
-	e.RequestFacts = map[string]string{FactWithDecryption: "false"}
-	none(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
-	e.RequestFacts[FactWithDecryption] = "true"
-	only(t, Evaluate(DefaultConfig(), established(), e, t0), D1)
+func ssm(name, withDecryption string) agentruntime.Event {
+	e := ev("ssm.amazonaws.com", name)
+	e.RequestFacts = map[string]string{FactWithDecryption: withDecryption}
+	return e
+}
+
+// Only a decrypting ssm read is a secret read; unstated is not (lab
+// 2026-11-05: 217 plain GetParameter calls made one alert).
+func TestD1SSMOnlyWithDecryption(t *testing.T) {
+	none(t, Evaluate(DefaultConfig(), established(), ssm("GetParameter", "false"), t0), D1)
+	none(t, Evaluate(DefaultConfig(), established(), ev("ssm.amazonaws.com", "GetParameter"), t0), D1)
+	none(t, Evaluate(DefaultConfig(), established(), ssm("GetParameter", ""), t0), D1)
+	if f := only(t, Evaluate(DefaultConfig(), established(), ssm("GetParameter", "true"), t0), D1); f.Severity != SeverityMedium {
+		t.Fatalf("severity %s", f.Severity)
+	}
+	only(t, Evaluate(DefaultConfig(), established(), ssm("GetParameters", "TRUE"), t0), D1)
+	// Other ssm calls never count, decrypting or not.
+	none(t, Evaluate(DefaultConfig(), established(), ssm("DescribeParameters", "true"), t0), D1)
+}
+
+// A parsed record carries the fact through to D1.
+func TestD1SSMParsedRecord(t *testing.T) {
+	rec := func(with string) agentruntime.Event {
+		raw := `{"eventID":"p-` + with + `","eventTime":"2026-11-05T12:00:00Z","eventSource":"ssm.amazonaws.com",
+		 "eventName":"GetParameter","eventType":"AwsApiCall","requestParameters":{"name":"/app/db","withDecryption":` + with + `}}`
+		e, err := agentruntime.ParseCloudTrailRecord([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	only(t, Evaluate(DefaultConfig(), established(), rec("true"), t0), D1)
+	none(t, Evaluate(DefaultConfig(), established(), rec("false"), t0), D1)
 }
 
 func TestD2D3D4(t *testing.T) {

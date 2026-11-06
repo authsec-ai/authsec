@@ -23,7 +23,7 @@ Provider-discovered policies in the graph remain evidence, not authored policies
 - `IGA_LEGACY_AGENT_POLICY`, the compatibility controller/service, Legacy policies
   UI, legacy notification copying, and tests specific to those removed features.
 - Superseded hand-run SQL for those tables. Historical numbered migrations remain
-  migration history; `155_retire_legacy_agent_policy.sql` removes their objects.
+  migration history; `158_retire_legacy_agent_policy.sql` removes their objects.
   Bootstrap describes the same final schema.
 
 ## Preserve separately
