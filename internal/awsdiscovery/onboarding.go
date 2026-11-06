@@ -73,7 +73,12 @@ var CloudFormationTemplate string
 // Bumped again (2026-11-06): logs:StartQuery is granted only on the log
 // groups named in the DnsQueryLogGroupArns parameter, never on every log
 // group of the account. Role permissions otherwise unchanged.
-const TemplateVersion = "2026-11-06"
+//
+// Bumped again (2026-11-07): AgentActivitySpans grants logs:StartQuery and
+// StopQuery on the aws/spans log group only, for the activity timeline's
+// AgentCore span reader (2026-11-06 had left it without, once StartQuery
+// stopped covering every log group).
+const TemplateVersion = "2026-11-07"
 
 // PermissionsVersion is the oldest template version that grants every
 // permission this build reads with: the last bump that changed the role's
@@ -81,8 +86,13 @@ const TemplateVersion = "2026-11-06"
 // the Quick Create callback) leaves it where it is, so existing stacks are not
 // reported outdated for permissions they already hold. 2026-10-07 changed the
 // role's permissions (ResourcePolicyTemplateVersion), and so did 2026-11-05
-// (DNSQueryLogTemplateVersion), so it moves with them.
-const PermissionsVersion = DNSQueryLogTemplateVersion
+// (DNSQueryLogTemplateVersion) and 2026-11-07 (ActivitySpansTemplateVersion),
+// so it moves with them.
+const PermissionsVersion = ActivitySpansTemplateVersion
+
+// ActivitySpansTemplateVersion is the oldest template version that grants the
+// activity timeline's AgentCore span reads (logs:StartQuery on aws/spans).
+const ActivitySpansTemplateVersion = "2026-11-07"
 
 // DNSQueryLogTemplateVersion is the oldest template version that grants the
 // DNS query-log reads (DNSQueryLogActions). A denied DNS read on a connector

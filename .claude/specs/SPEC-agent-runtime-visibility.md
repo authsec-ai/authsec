@@ -611,8 +611,8 @@ stack on an older version keeps working: `dns-query-logs:<region>` is
 first to grant the DNS query-log reads; this connector's stack reports ...".
 Deliberately **not** granted: `route53resolver:Get*` and
 `logs:DescribeLogGroups` (never called).
-Template 2026-11-06 changes only that scope; `PermissionsVersion` stays
-2026-11-05. A query refused on a 2026-11-06 stack says to add the log group's
+Template 2026-11-06 changes only that scope; 2026-11-07 adds `AgentActivitySpans`
+(the activity timeline's `aws/spans` reads), and `PermissionsVersion` is 2026-11-07. A query refused on a 2026-11-06 stack says to add the log group's
 ARN to `DnsQueryLogGroupArns`. A 2026-11-05 stack still grants `StartQuery`
 on every log group until the customer updates it. The 2026-11-06 template
 must be published to `<base>/aws/2026-11-06/authsec-aws-discovery-role.yaml`

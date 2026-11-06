@@ -788,13 +788,26 @@ func (st *agentRuntimeState) buildAIWorkload(ident *arIdentity, u *arUsage) *AIW
 			Classification: arClassification(w)})
 	}
 	ai.SessionNames = sessionNameEvidence(u.usage.SessionNames, wls)
-	if one := ai.single(); one != nil && one.GraphID != nil {
+	if one := ai.sole(); one != nil && one.GraphID != nil {
 		if s := st.suggestions[*one.GraphID]; s != nil {
 			ai.Suggestion = &AISuggestionRef{ID: s.ID, State: s.State}
 		}
 	}
 	ai.Label = st.label(ai)
 	return ai
+}
+
+// sole is the identity's one workload and nothing else running as it,
+// ignoring other assumers: what a person's classification and the suggestion
+// on that workload are read from. A classification is a person's (or the
+// platform's) statement about the workload, so another principal that may
+// also assume the role does not undo it; it only stops new suggestions
+// (single).
+func (ai *AIWorkload) sole() *arWorkload {
+	if len(ai.wls) == 1 && len(ai.K8sServiceAccounts) == 0 {
+		return ai.wls[0]
+	}
+	return nil
 }
 
 // single is the AI workload's one workload: exactly one candidate on the
@@ -817,6 +830,9 @@ func (ai *AIWorkload) single() *arWorkload {
 // (configuration hints): never a suggested agent, since names never decide a
 // suggestion.
 func (st *agentRuntimeState) label(ai *AIWorkload) string {
+	if w := ai.sole(); w != nil && w.isAgent() {
+		return agentruntime.LabelAgent
+	}
 	one := ai.single()
 	if one == nil {
 		if !ai.evidenced() {
