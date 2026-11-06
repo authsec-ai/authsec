@@ -64,6 +64,8 @@ type AWSWorkloadScanner struct {
 	fence *repositories.ScanFence
 	// trailClock replaces the CloudTrail reader's clock (tests).
 	trailClock func() time.Time
+	// dns holds the DNS query-log read's test seams (agent_runtime_dns.go).
+	dns dnsScanConfig
 }
 
 // NewAWSWorkloadScanner constructs the scanner.
@@ -177,6 +179,9 @@ type WorkloadSnapshot struct {
 	// read once per scan (trackedKnown) before any region writes.
 	trackedFrom  *time.Time
 	trackedKnown bool
+	// DNSTrafficFindings counts the ai_network_traffic findings opened or
+	// refreshed from Route 53 Resolver query logs (§11), across regions.
+	DNSTrafficFindings int
 	// Warnings are failures that cost evidence but not the scan: the focused
 	// Bedrock CloudTrail pass, the model-call evidence write, the dispatch to
 	// agent-runtime sinks. Never a reason to fail or to mark coverage.
@@ -507,6 +512,8 @@ func (s *AWSWorkloadScanner) scanRegion(
 	s.scanCredentialProviders(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
 	s.scanTrailStatus(ctx, workspaceID, snapshot, region, trail, out)
+	s.scanDNSQueryLogs(ctx, workspaceID, snapshot, scope, region, out)
+	s.scanAgentActivitySpans(ctx, workspaceID, snapshot, region, out) // agent_runtime_activity_spans.go
 }
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are
@@ -879,7 +886,24 @@ func (s *AWSWorkloadScanner) trailAttribution(
 			names[att.UserName] = true
 		}
 	}
-	identities, err := s.identities.FindForAttribution(workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+	return trailIdentityMatcher(s.identities, workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+}
+
+// trailAttributionFinder is the one read trailIdentityMatcher needs
+// (repositories.CloudIdentityRepository.FindForAttribution).
+type trailAttributionFinder interface {
+	FindForAttribution(workspaceID, connectorID uuid.UUID, nativeIDs, iamUserNames []string) ([]models.CloudIdentity, error)
+}
+
+// trailIdentityMatcher reads the connector's identities named by arns (and
+// IAM users named by names) in ONE read and returns the matcher with the
+// incarnation check described on trailAttribution. Shared by the scan and the
+// live model-call sink (agent_runtime_live.go), so both attribute an event
+// to exactly the same identity.
+func trailIdentityMatcher(
+	find trailAttributionFinder, workspaceID, connectorID uuid.UUID, arns, names []string,
+) (func(awsdiscovery.Attribution) (*models.CloudIdentity, bool), error) {
+	identities, err := find.FindForAttribution(workspaceID, connectorID, arns, names)
 	if err != nil {
 		return nil, err
 	}

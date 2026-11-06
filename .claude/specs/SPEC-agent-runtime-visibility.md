@@ -66,7 +66,7 @@ LLM-only and retrieval-only applications out of "agent"):
 Lambda, ECS, EC2, EKS identities as collected today; P1–P3 (§7).
 
 **Deferred:** Azure and Kubernetes (their discovery and inference stay as
-built); DNS/egress and node-sensor signals; OpenAI/Anthropic admin APIs;
+built); egress and node-sensor signals (AWS DNS query logs: built, §11); OpenAI/Anthropic admin APIs;
 LLM and MCP gateways; OpenTelemetry ingest; per-tool-call control; the activity
 timeline from AgentCore spans (P4, later); human approval (§8, Q6).
 
@@ -362,7 +362,7 @@ P1.
 | Kill switch breaks shared roles, SLRs; verification only by read-back | §5.8: blast-radius preview, workload level, SLR refusal, behavioural verification |
 | Human approval is a product call | Q6 |
 | Tag-gated model access as the certain confirmation path | §5.4, P1, with audit mode |
-| Provider admin keys, LLM gateway with provider keys | Out of the AWS pilot (§2) |
+| Provider admin keys, LLM gateway with provider keys | Admin keys: opt-in, signed off 2026-11-06 (SPEC-agent-runtime-provider-usage.md). Gateway: runs in the customer's environment, AuthSec never holds the provider keys (SPEC-agent-runtime-gateway.md) |
 | Unverified MCP header and AuthZEN dates, EO naming | Removed (not needed for AWS) |
 | "Only GitHub writes `iga_agents`" unverified | Removed |
 | Kubernetes ingress described too harshly | Removed (Kubernetes deferred) |
@@ -437,7 +437,7 @@ names are shown as unverified weak evidence only.
 not stop event source mappings (queue messages are retried and may dead-letter);
 ECS `desiredCount = 0` does not stop tasks started with `RunTask`. Workload
 containment selects ECS services running the workload's exact task-definition
-revision, and one target is held by one live containment at a time (152).
+revision, and one target is held by one live containment at a time (159).
 **Verified** needs evidence: CloudTrail events from after contained-at plus the
 grace were received (stream or scan cursor) and none was a successful call by
 the identity (calls a deny cannot block, such as `sts:GetCallerIdentity`, and
@@ -452,3 +452,181 @@ check in the lab.
 
 Q5 and Q7 remain open; the build uses: Q5 graph classification authoritative +
 mirror into `discovered_agents`; Q7 defaults D5 N=10/M=5 min, D6 k=5.
+
+## 11. DNS-based detection of direct model-provider calls
+
+> Built 2026-11-05 on `feat/agent-runtime-dns` (Ritam). This section takes the
+> **AWS DNS part** of revision 1's deferred network signals (§2) into scope;
+> egress flow logs, node sensors and non-AWS resolvers stay deferred.
+
+**Why.** A workload that calls OpenAI, Anthropic, Google… directly leaves
+nothing in CloudTrail (§5.1 sees Bedrock only). It does look up the provider's
+API host, and Route 53 Resolver query logging records every lookup a VPC makes
+through the Amazon-provided resolver, with the source address and — for an EC2
+instance — the instance id.
+
+### 11.1 Discovery (per region)
+
+- `route53resolver:ListResolverQueryLogConfigs` and
+  `ListResolverQueryLogConfigAssociations`: which VPCs of this account are
+  logged (associations in state `ACTIVE`) and to which destination.
+- **CloudWatch Logs** destination in this account and region: read (§11.2).
+- **S3 or Firehose** destination, a log group in **another account** (a shared
+  configuration) or another region: listed, **not read**, reported on
+  `dns-query-logs-unread:<region>` (state `unsupported`) naming the
+  configuration, its VPCs, the destination and why.
+- Kill switch: `AUTHSEC_AWS_DNS_QUERY_LOGS=off` skips the read
+  (`dns-query-logs:<region>` = `not_selected`).
+
+### 11.2 Query: only model hosts are ever read
+
+The domain list (`awsdiscovery.ModelEndpoints`; exact and suffix match, case
+insensitive, trailing dot optional):
+
+| Provider | Hosts |
+|---|---|
+| openai | `api.openai.com` |
+| azure_openai | `*.openai.azure.com` |
+| anthropic | `api.anthropic.com` |
+| google_gemini | `generativelanguage.googleapis.com` |
+| google_vertex | `aiplatform.googleapis.com`, `*.aiplatform.googleapis.com`, `<region>-aiplatform.googleapis.com` (Vertex's regional hosts are not subdomains) |
+| mistral | `api.mistral.ai` |
+| cohere | `api.cohere.com`, `api.cohere.ai` |
+| groq | `api.groq.com` |
+| openrouter | `openrouter.ai` |
+| huggingface | `api-inference.huggingface.co`, `router.huggingface.co` |
+| together | `api.together.xyz` |
+| fireworks | `api.fireworks.ai` |
+| deepseek | `api.deepseek.com` |
+| xai | `api.x.ai` |
+| aws_bedrock (**control**) | `bedrock-runtime.<region>.amazonaws.com`, `bedrock-runtime-fips.<region>.amazonaws.com` |
+
+One Logs Insights query per log group (`logs:StartQuery` over the log group
+ARN, polled with `GetQueryResults`, stopped with `StopQuery` past a 2-minute
+deadline):
+
+```
+fields @timestamp, query_name, coalesce(srcaddr, "-") as srcaddr,
+       coalesce(srcids.instance, "-") as src_instance, coalesce(vpc_id, "-") as vpc
+| filter query_name like /(?i)^(<the list as one regex>)\.?$/
+| stats count(*) as queries, min(@timestamp) as first_seen, max(@timestamp) as last_seen
+        by srcaddr, src_instance, vpc, query_name
+| limit 10000
+```
+
+The filter runs inside the customer's account, so no other DNS data is
+returned; every returned row is checked against the same list again and a
+non-matching row is dropped, never stored or named (`coalesce` keeps the
+lookups of Lambdas and Fargate tasks, which carry no `srcids.instance`).
+
+**Window and cost.** Logs Insights is charged per GB scanned. Per (connector,
+region, log group) a cursor (`cloud_dns_cursor`, migration 153, stream `dns`)
+records the window read: the first read covers 24 h; later reads start at the
+previous `read_to` (exclusive end, 10 minutes behind the scan for delivery
+delay) and are capped at **7 days**. An older mark is read for its last 7
+days and the cursor marks the read `partial` (`lapsed`); a read that reaches
+the 10,000-row limit is `partial` (`truncated`). At most 10 log groups per
+region per scan (more: `partial`, the rest named). `records_scanned` and
+`bytes_scanned` are kept per read so the cost is visible. A failed read moves
+nothing and records `last_error`.
+
+### 11.3 Attribution
+
+`srcids.instance` in the query log record is recorded at lookup time and
+always decides first. Otherwise, for each (VPC, source address), the network
+interface holding the address **now** (`ec2:DescribeNetworkInterfaces`,
+filtered by private address and VPC). An interface whose attachment time is
+after the last lookup did not make it (the address changed hands) and is not
+used.
+
+| Evidence (in this order) | Subject | Confidence |
+|---|---|---|
+| `srcids.instance` in the record | the EC2 instance (and its instance-profile role) | `query_time` |
+| interface `AWS Lambda VPC ENI-<name>` / type `lambda` | the Lambda function of that name (longest inventory name it starts with) | `scan_time`; Lambda shares one interface across functions with the same subnets and security groups, and the interface names the function that created it |
+| interface described by an ECS attachment ARN | the running task holding the interface (`ecs:ListClusters/ListTasks/DescribeTasks`), then its task definition | `scan_time` |
+| interface attached to an instance | the instance | `scan_time` |
+| a secondary address on an instance, or a VPC CNI interface (`aws-K8S-...`) | the instance (EKS node), **pod level unresolved** (`subject.pod_level = "unresolved"`) | as above |
+| none of these | **the VPC**: "model traffic from an unknown source in VPC X" | `none` |
+
+Subjects resolve to `cloud_workload` (and `identity_id`, the role it runs as).
+A workload the interface names but the inventory lacks is still the subject
+(`in_inventory: false`).
+
+### 11.4 Output: `agent_finding` kind `ai_network_traffic`
+
+- One row per subject: `subject_key` `workload:<runtime_kind>:<region>:<native_id>`
+  or `vpc:<region>:<vpc_id>`; `identity_id` the workload's role when known;
+  `subject` {kind workload|vpc, cloud_workload_id, runtime_kind, native_id,
+  name, region, identity_id, identity_arn, in_inventory, pod_level}.
+- `evidence`: providers, `control_only` (only `bedrock-runtime` lookups),
+  queries, first/last seen, per domain {domain, provider, control, queries,
+  first/last seen}, source refs {srcaddr, instance_id, vpc_id, eni_id,
+  eni_kind, queries, last_seen} (at most 50), log groups and their VPCs,
+  attribution {how, confidence, note, pod_level}, `partial`, limitations.
+  Model hosts only, never another domain.
+- `first_seen` / `last_seen` are the first and last **lookup**. Counts add
+  across scans (windows never overlap).
+- **Resolved** when the last lookup is at least 30 days old **and** every log
+  group it was seen in has been read without a gap and without a failure since
+  then (`covered_from <= last lookup`, `read_to >= last lookup + 30 d`). A log
+  group no longer read keeps the finding open: unknown is not "no traffic".
+- The inference pass (`applyFindings`) neither opens nor resolves this kind.
+  Only a `query_time` attribution is `ai_workload` evidence; a `scan_time` or
+  `none` one makes a possible AI workload, which raises no detections and
+  gets no suggestion or credential findings (§5.7).
+
+### 11.5 Coverage and limits
+
+| Surface | Meaning |
+|---|---|
+| `dns-query-logs:<region>` | `reached` (every log group read whole), `partial` (failed, truncated, lapsed or above the cap, each named), `denied` / `throttled` with the call and AWS's code; `unsupported` when no VPC logs to CloudWatch Logs here |
+| `dns-query-logs-unread:<region>` | `unsupported`: configurations not read (S3, Firehose, other account or region) |
+| `dns_blind_spots` | `unsupported`, fixed: what DNS detection never sees |
+
+**Not visible**, whatever is read: **Lambda functions not attached to a VPC**;
+anything using a resolver **other than the Route 53 Resolver** (a custom DNS
+server, DNS over HTTPS/TLS in the application); VPCs without query logging to
+CloudWatch Logs; lookups answered from a cache. Attribution by address names
+the interface holding the address **at scan time** (a short-lived task's
+address may since have been released or reused). A lookup is not a call.
+
+Nothing here fails the scan: every failure is coverage and a scan warning, and
+none of these surfaces gates reconciliation.
+
+### 11.6 Permissions: discovery template 2026-11-05, scoped in 2026-11-06
+
+Statements `DnsQueryLogConfigs` (`route53resolver:ListResolverQueryLogConfigs`,
+`route53resolver:ListResolverQueryLogConfigAssociations`,
+`ec2:DescribeNetworkInterfaces`), `DnsQueryLogInsights` (`logs:StartQuery`
+only on the log-group ARNs the customer lists in the `DnsQueryLogGroupArns`
+parameter; omitted when the list is empty, since template 2026-11-06 — IAM,
+not AuthSec's query filter, keeps every other log group out of reach) and
+`DnsQueryLogInsightsResults` (`logs:GetQueryResults`, `logs:StopQuery`; no
+resource scoping exists for them). The ECS task reads are already granted
+(MigrationEvidence). `TemplateVersion` and `PermissionsVersion` move to
+2026-11-05; the template must be published to
+`<base>/aws/2026-11-05/authsec-aws-discovery-role.yaml` before release. A
+stack on an older version keeps working: `dns-query-logs:<region>` is
+`denied` with the call, AWS's code and the fact "template 2026-11-05 is the
+first to grant the DNS query-log reads; this connector's stack reports ...".
+Deliberately **not** granted: `route53resolver:Get*` and
+`logs:DescribeLogGroups` (never called).
+Template 2026-11-06 changes only that scope; `PermissionsVersion` stays
+2026-11-05. A query refused on a 2026-11-06 stack says to add the log group's
+ARN to `DnsQueryLogGroupArns`. A 2026-11-05 stack still grants `StartQuery`
+on every log group until the customer updates it. The 2026-11-06 template
+must be published to `<base>/aws/2026-11-06/authsec-aws-discovery-role.yaml`
+before release.
+
+### 11.7 Customer setup
+
+1. Update the AuthSec discovery stack to template 2026-11-05.
+2. In each region, create a Route 53 Resolver **query logging configuration**
+   whose destination is a **CloudWatch Logs log group** in the same account
+   (Route 53 > Resolver > Query logging), and associate every VPC whose
+   workloads should be covered. S3 and Firehose destinations are not read.
+3. Keep workloads on the Amazon-provided resolver (the VPC `.2` address or
+   Route 53 Resolver endpoints); attach Lambdas that must be covered to a VPC.
+4. Cost: Logs Insights bills per GB scanned (24 h on the first read, then only
+   the new interval, at most 7 days, per log group per scan); the bytes
+   scanned per read are kept in `cloud_dns_cursor`.

@@ -204,7 +204,7 @@ func newACLab(t *testing.T) *acLab {
 	prevR2 := services.PolicyR2GateState()
 	services.SetPolicyR2Gate(r2)
 	if err := services.VerifyAgentContainSchema(db); err != nil {
-		t.Fatalf("the integration database must be at 152: %v", err)
+		t.Fatalf("the integration database must be at 159: %v", err)
 	}
 	l := &acLab{t: t, db: db, fake: newACAWS(), clock: time.Now().UTC()}
 	l.access = &acAccess{aws: l.fake}

@@ -275,6 +275,7 @@ var contractWorkloadDetail = contractExtend(contractWorkloadRow,
 		contractReq("decided_by", contractDecidedBy),
 		contractReq("decided_at", contractTime),
 	))),
+	contractOpt("agent_runtime", contractAgentRuntime), // additive (agent runtime visibility)
 )
 
 // The identity brief every tab row names an identity with.
@@ -559,6 +560,7 @@ func contractIdentityDetailData(kind string) contractShape {
 		contractReq("immutable_key", contractStr),
 		contractReq("provider_attrs", contractObj(attrs...)),
 		contractReq("sources", contractArrMin(1, contractSource)),
+		contractOpt("agent_runtime", contractAgentRuntime), // additive (agent runtime visibility)
 	}
 	if kind == "iam_user" {
 		more = append(more, contractReq("credentials", contractArr(contractObj(
@@ -828,6 +830,33 @@ var contractResourceAccess = contractObj(
 	contractReq("meta", contractListMeta()),
 )
 
+/* ------------------------------ agent runtime ------------------------------ */
+
+// An AWS identity's or workload's agent-runtime picture (agent_runtime.go),
+// additive and optional on graph nodes and on the identity and workload
+// details: present only when there is something to say.
+var contractAgentRuntime = contractObj(
+	contractReq("label", contractNullable(contractEnum("possible_ai_workload", "ai_workload", "suggested_agent", "agent"))),
+	contractReq("model_calls", contractNullable(contractObj(
+		contractReq("calls", contractInt),
+		contractReq("denied", contractInt),
+		contractReq("last_call_at", contractNullable(contractTime)),
+		contractReq("models", contractArr(contractObj(contractReq("model", contractNonEmpty), contractReq("calls", contractInt)))),
+	))),
+	contractReq("open_alerts", contractObj(contractReq("count", contractInt),
+		contractReq("highest_severity", contractNullable(contractEnum("high", "medium"))))),
+	contractReq("open_findings", contractInt),
+	contractReq("suggestion", contractNullable(contractObj(contractReq("id", contractNonEmpty),
+		contractReq("state", contractEnum("pending", "confirmed", "dismissed", "superseded"))))),
+	contractReq("containment", contractNullable(contractObj(contractReq("id", contractNonEmpty),
+		contractReq("level", contractEnum("identity", "model", "workload")),
+		contractReq("state", contractEnum("previewed", "containing", "contained", "partially_contained", "releasing")),
+		contractReq("effective", contractNullable(contractBool))))),
+)
+
+// A grant edge of an identity under a containment in force.
+var contractContained = contractObj(contractReq("id", contractNonEmpty), contractReq("level", contractEnum("identity", "model")))
+
 /* ---------------------------------- graph ---------------------------------- */
 
 var contractRestrictions = contractObj(
@@ -853,11 +882,12 @@ var contractGraphNode = contractFunc(func(path string, v any, errs *[]string) {
 	switch typ {
 	case "workload":
 		more = []contractField{contractReq("kind", contractConst("workload")), contractReq("account", contractAccount),
-			contractReq("arn", contractNonEmpty), contractReq("runtime_kind", contractRuntimeKind)}
+			contractReq("arn", contractNonEmpty), contractReq("runtime_kind", contractRuntimeKind),
+			contractOpt("agent_runtime", contractAgentRuntime)}
 	case "identity":
 		more = []contractField{contractReq("kind", contractIdentityKind), contractReq("account", contractAccount),
 			contractReq("arn", contractNonEmpty), contractReq("restrictions", contractRestrictions),
-			contractReq("used_by_count", contractExact)}
+			contractReq("used_by_count", contractExact), contractOpt("agent_runtime", contractAgentRuntime)}
 	case "statement":
 		// No account: statements have none (D-36).
 		more = []contractField{contractReq("kind", contractConst("statement")), contractReq("policy", contractNonEmpty),
@@ -891,7 +921,7 @@ var contractGraphEdge = contractFunc(func(path string, v any, errs *[]string) {
 		more = append(more, contractReq("mechanism", contractMechanism))
 	case "grant":
 		claimType = "grant"
-		more = append(more, contractReq("policy", contractNonEmpty))
+		more = append(more, contractReq("policy", contractNonEmpty), contractOpt("contained", contractContained))
 	case "target":
 		claimType = "target"
 		more = append(more, contractReq("mode", contractConst("resource")))

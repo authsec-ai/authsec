@@ -96,9 +96,9 @@ func Name(id ID) string {
 	return string(id)
 }
 
-// FactWithDecryption is the RequestFacts key the shared parser sets from
-// ssm's requestParameters.withDecryption. An ssm GetParameter* read counts
-// only when it is "true".
+// FactWithDecryption is the RequestFacts key the shared parser fills with
+// "true" or "false" from ssm's requestParameters.withDecryption
+// (agentruntime.FactWithDecryption).
 const FactWithDecryption = agentruntime.FactWithDecryption
 
 // Config is one workspace's detection configuration.
@@ -453,6 +453,12 @@ func IsAWSServiceSource(ip string) bool {
 // with_decryption=true (medium); KMS Decrypt (medium) ONLY when the principal
 // called it directly (no invokedBy: service-made decrypts accompany a read
 // already alerted on) and its encryption context names a secret or parameter.
+//
+// DECISION (lab 2026-11-05): a plain GetParameter reads configuration (217
+// of them made one alert), not a secret: only a decrypting read returns a
+// SecureString's value. A record that does not state withDecryption is
+// treated as not decrypting and raises nothing (AWS's own default is
+// false); a SecureString read always passes withDecryption=true.
 func SecretRead(e agentruntime.Event) (severity string, ok bool) {
 	switch e.EventSource {
 	case "secretsmanager.amazonaws.com":

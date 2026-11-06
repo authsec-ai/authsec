@@ -291,6 +291,10 @@ func (s *GovDeployments) Register(w *PolicyJobWorker) {
 	// re-enqueued (iga_gov_deploy_sweep.go).
 	w.AddSweeper(PolicyJobSweeper{Name: "stuck_deployments", Every: DeploySweepEvery,
 		Run: func(ctx context.Context, _ time.Time) error { _, err := s.SweepStuckDeployments(ctx); return err }})
+	// §8.1 step 3, §8.8, §8.9: unresolved outcomes (hourly), drift and
+	// emergency changes are announced (iga_gov_deploy_notify.go).
+	w.AddSweeper(PolicyJobSweeper{Name: "deployment_notices", Every: GovDeploymentNoticeEvery,
+		Run: func(ctx context.Context, _ time.Time) error { _, err := s.SweepDeploymentNotices(ctx); return err }})
 }
 
 /* ------------------------------- small reads ------------------------------- */

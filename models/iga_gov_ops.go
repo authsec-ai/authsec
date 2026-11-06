@@ -181,7 +181,6 @@ type IGAGovSettings struct {
 	NotifyWebhookURL       string     `json:"-" gorm:"column:notify_webhook_url;->"`
 	NotifyWebhookSecretRef string     `json:"-" gorm:"column:notify_webhook_secret_ref;->"`
 	NotifyChannelsSource   string     `json:"-" gorm:"column:notify_channels_source;->"`
-	NotifyChannelsCopiedAt *time.Time `json:"-" gorm:"column:notify_channels_copied_at;->"`
 	UpdatedBy              *uuid.UUID `json:"updated_by,omitempty" gorm:"type:uuid"`
 	UpdatedAt              time.Time  `json:"updated_at" gorm:"not null;default:now()"`
 }

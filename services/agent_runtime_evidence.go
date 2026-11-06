@@ -469,13 +469,15 @@ func modelCallCoverage(general, bedrock awsdiscovery.TrailWindowRead) (trailCove
 // to a row's stored doc. A delta from another incarnation of the identity
 // (its unique id differs from the one the doc records) starts the doc afresh:
 // a role recreated under the same ARN is another principal. Pure.
+//
+// The live_* keys (written by the live sink, agent_runtime_live.go) are kept
+// as they are, except that once every region a live call was seen in is
+// covered up to that region's latest live call, the live counters are
+// cleared: the scan now counts those calls exactly (live_last_call_at stays).
 func mergeModelCallDoc(prev modelCallDoc, d *modelCallDelta, region string, cov *trailCoverage) modelCallDoc {
 	doc := prev
-	if d != nil && d.Identity.UniqueID != "" {
-		if doc.IdentityUniqueID != "" && doc.IdentityUniqueID != d.Identity.UniqueID {
-			doc = modelCallDoc{}
-		}
-		doc.IdentityUniqueID = d.Identity.UniqueID
+	if d != nil {
+		doc = modelCallDocFor(prev, d.Identity.UniqueID)
 	}
 	u := &doc.ModelCallUsage
 	if d != nil {
@@ -591,6 +593,72 @@ func (doc *modelCallDoc) recomputeCoverage() {
 		// them at once.
 		u.Partial = true
 	}
+	if liveCoveredByScan(*doc) {
+		u.LiveCalls, u.LiveDenied, u.LiveModels, u.LiveRegions = 0, 0, nil, nil
+	}
+}
+
+// modelCallDocFor is prev as the doc of the incarnation uniqueID: a doc that
+// records another incarnation starts afresh (a role recreated under the same
+// ARN is another principal). An unknown uniqueID keeps prev. Pure.
+func modelCallDocFor(prev modelCallDoc, uniqueID string) modelCallDoc {
+	doc := prev
+	if uniqueID != "" {
+		if doc.IdentityUniqueID != "" && doc.IdentityUniqueID != uniqueID {
+			doc = modelCallDoc{}
+		}
+		doc.IdentityUniqueID = uniqueID
+	}
+	return doc
+}
+
+// liveCoveredByScan reports whether the doc has live counts and every region
+// they were seen in is read by the scan up to that region's latest live call.
+func liveCoveredByScan(doc modelCallDoc) bool {
+	u := doc.ModelCallUsage
+	if u.LiveCalls == 0 && u.LiveDenied == 0 && len(u.LiveModels) == 0 {
+		return false
+	}
+	if len(u.LiveRegions) == 0 {
+		return false
+	}
+	for region, last := range u.LiveRegions {
+		c, ok := doc.Regions[region]
+		if !ok || c.CoveredTo.Before(last) {
+			return false
+		}
+	}
+	return true
+}
+
+// modelCallUsageLockKey serialises the writers of one connector's model-call
+// rows: the scan's Record and the live sink. Each takes it first in its
+// transaction, so neither inserts a row the other is about to insert.
+func modelCallUsageLockKey(ws, connectorID uuid.UUID) string {
+	return "agent_model_call_usage:" + ws.String() + ":" + connectorID.String()
+}
+
+func lockModelCallUsage(tx *gorm.DB, ws, connectorID uuid.UUID) error {
+	return tx.Exec(`SELECT pg_advisory_xact_lock(hashtext(?))`, modelCallUsageLockKey(ws, connectorID)).Error
+}
+
+// modelCallLastUsed is the row's last_used_at: the latest model call, exact
+// or seen live.
+// modelCallLastUsedAt is cloud_usage.last_used_at: the newest successful
+// model call the scan read, or a later call the event stream reported.
+func modelCallLastUsedAt(doc modelCallDoc) *time.Time {
+	u := doc.ModelCallUsage
+	if u.LiveLastCallAt == nil {
+		return doc.LastSuccessAt
+	}
+	return laterCall(doc.LastSuccessAt, *u.LiveLastCallAt)
+}
+
+func modelCallLastUsed(u agentruntime.ModelCallUsage) *time.Time {
+	if u.LiveLastCallAt == nil {
+		return u.LastCallAt
+	}
+	return laterCall(u.LastCallAt, *u.LiveLastCallAt)
 }
 
 func addModelCallCount(m map[string]int, k string, n int) map[string]int {
@@ -802,6 +870,11 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 	err := tenancy.InWorkspace(ctx, st.db, w.WorkspaceID, func(tx *gorm.DB) error {
 		return repositories.RunFenced(tx, st.fence, func(tx *gorm.DB) error {
 			written = 0
+			// 0. One writer of the connector's model-call rows at a time (the
+			// live sink is the other).
+			if err := lockModelCallUsage(tx, w.WorkspaceID, w.ConnectorID); err != nil {
+				return err
+			}
 			// 1. The marks this write moves must be the ones the reads began
 			// at. Locked, so a concurrent writer waits and then fails here.
 			var stored []trailCursor
@@ -881,7 +954,7 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 				                      SET attrs = ?::jsonb, last_used_at = `+lastUsed+`, last_seen_generation = ?,
 				                          last_seen_at = ?, row_updated_at = ?
 				                    WHERE workspace_id = ? AND id = ?`,
-					string(attrs), doc.LastSuccessAt, w.Generation, now, now, w.WorkspaceID, row.ID).Error; err != nil {
+					string(attrs), modelCallLastUsedAt(doc), w.Generation, now, now, w.WorkspaceID, row.ID).Error; err != nil {
 					return err
 				}
 				written++
@@ -912,7 +985,7 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 				                   VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)`,
 					uuid.New(), w.WorkspaceID, w.ConnectorID, id,
 					agentruntime.UsageService, agentruntime.UsageSource,
-					doc.LastSuccessAt, string(attrs), w.Generation, now, now, now).Error; err != nil {
+					modelCallLastUsedAt(doc), string(attrs), w.Generation, now, now, now).Error; err != nil {
 					return err
 				}
 				written++

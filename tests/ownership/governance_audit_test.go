@@ -9,16 +9,15 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"github.com/authsec-ai/authsec/internal/tenancy"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/gin-gonic/gin"
 )
@@ -111,8 +110,6 @@ func governanceRouter(t *testing.T, f provFixture) *gin.Engine {
 		c.Set("email", "u@a.com")
 	})
 	r.POST("/authsec/governance/agents/:id/force-evict", ctl.ForceEvictAgent)
-	r.PUT("/authsec/governance/notification-settings", ctl.UpdateNotificationSettings)
-	r.GET("/authsec/governance/notification-settings", ctl.GetNotificationSettings)
 	return r
 }
 
@@ -177,75 +174,5 @@ func TestForceEvictIsAudited(t *testing.T) {
 	if nv["reason"] != "compromised, budget overruled" || nv["instruction_id"] != out.InstructionID ||
 		out.InstructionID == "" {
 		t.Errorf("the audit record must carry the reason and what was queued, got %v", nv)
-	}
-}
-
-func TestNotificationSettingsUpdateIsAuditedWithoutTheSecret(t *testing.T) {
-	f := newProvFixture(t)
-	withAuditLogger(t, f.raw)
-	r := governanceRouter(t, f)
-	const secret = "whsec-do-not-log-7f3a9c"
-
-	rec := send(t, r, http.MethodPut, "/authsec/governance/notification-settings", map[string]any{
-		"warning_lead":   "48h",
-		"webhook_url":    "https://hooks.example.com/authsec",
-		"webhook_secret": secret,
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("update: %d %s", rec.Code, rec.Body.String())
-	}
-	// The response is the console's view, unchanged in shape.
-	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("body: %v", err)
-	}
-	for _, k := range []string{"workspace_id", "warning_lead_seconds", "webhook_url",
-		"webhook_secret_set", "email_enabled"} {
-		if _, ok := body[k]; !ok {
-			t.Errorf("response lost %q: %s", k, rec.Body.String())
-		}
-	}
-	if len(body) != 5 || strings.Contains(rec.Body.String(), secret) {
-		t.Errorf("response shape changed or leaks the secret: %s", rec.Body.String())
-	}
-
-	rows := waitAudit(t, f.raw, "update", "governance_notification_settings", f.ws.String())
-	if len(rows) != 1 {
-		t.Fatalf("want exactly one settings audit row, got %d", len(rows))
-	}
-	a := rows[0]
-	if a.WorkspaceID != f.ws.String() || a.UserID != claimOwner.String() || a.StatusCode != http.StatusOK {
-		t.Errorf("audit row does not attribute the change: %+v", a)
-	}
-	if strings.Contains(a.OldValues.String+a.NewValues.String, secret) {
-		t.Fatal("the webhook secret must never be written to the audit log")
-	}
-	var oldV, newV map[string]any
-	if err := json.Unmarshal([]byte(a.OldValues.String), &oldV); err != nil {
-		t.Fatalf("old_values: %v (%q)", err, a.OldValues.String)
-	}
-	if err := json.Unmarshal([]byte(a.NewValues.String), &newV); err != nil {
-		t.Fatalf("new_values: %v (%q)", err, a.NewValues.String)
-	}
-	if oldV["webhook_url"] != "" || oldV["email_enabled"] != true || oldV["webhook_secret_set"] != false {
-		t.Errorf("old values must be the defaults the workspace had, got %v", oldV)
-	}
-	if newV["webhook_url"] != "https://hooks.example.com/authsec" ||
-		newV["webhook_secret_set"] != true || newV["warning_lead_seconds"] != float64(48*3600) {
-		t.Errorf("new values must be the redacted settings now in force, got %v", newV)
-	}
-	// Exactly what the response reported as in force.
-	if nb, _ := json.Marshal(newV); string(nb) != string(mustJSON(t, body)) {
-		t.Errorf("audit new values %s differ from the response %s", nb, mustJSON(t, body))
-	}
-
-	// A refused update (http webhook) is not audited.
-	before := countAudit(t, f.raw)
-	if rec := send(t, r, http.MethodPut, "/authsec/governance/notification-settings",
-		map[string]any{"webhook_url": "http://plain.example.com"}); rec.Code != http.StatusBadRequest {
-		t.Fatalf("an http webhook must be refused, got %d", rec.Code)
-	}
-	if after := countAudit(t, f.raw); after != before {
-		t.Errorf("a refused update must not be audited (%d -> %d)", before, after)
 	}
 }

@@ -150,7 +150,7 @@ func init() {
 }
 
 // AgentContainSchemaHead is the migration containment needs.
-const AgentContainSchemaHead = "152"
+const AgentContainSchemaHead = "159"
 
 var agentContainSchema struct {
 	sync.Mutex
@@ -159,7 +159,7 @@ var agentContainSchema struct {
 	at     time.Time
 }
 
-// VerifyAgentContainSchema checks 151's objects and 152's index.
+// VerifyAgentContainSchema checks 151's objects and 159's index.
 func VerifyAgentContainSchema(db *gorm.DB) error {
 	var missing []string
 	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target"} {

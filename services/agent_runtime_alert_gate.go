@@ -23,7 +23,7 @@ const (
 	AgentAlertsSchemaHead = "150"
 	// AgentRuntimeSchemaHead names the migrations the runtime (inference,
 	// suggestions, findings, event stream, CloudTrail cursor) needs.
-	AgentRuntimeSchemaHead = "147, 148, 149, 153"
+	AgentRuntimeSchemaHead = "147, 148, 149, 160"
 
 	// GovCodeAgentAlertsUnavailable and GovCodeAgentRuntimeUnavailable are the
 	// 503 codes of the alert routes and the runtime routes.

@@ -62,15 +62,38 @@ var CloudFormationTemplate string
 // never assumed covered by SecurityAudit. Stacks on an older version keep
 // working: their resource-policy coverage is recorded not_collected
 // ("discovery template update needed") and nothing else changes.
-const TemplateVersion = "2026-10-07"
+//
+// Bumped for DNS-based detection of direct model-provider calls
+// (2026-11-05, SPEC-agent-runtime-visibility.md §11): Route 53 Resolver query
+// logging configurations and associations, Logs Insights over their
+// CloudWatch Logs destinations, and ec2:DescribeNetworkInterfaces. Stacks on
+// an older version keep working: the dns-query-logs surface is reported
+// denied with the call and AWS's code, and the scan goes on.
+//
+// Bumped again (2026-11-06): logs:StartQuery is granted only on the log
+// groups named in the DnsQueryLogGroupArns parameter, never on every log
+// group of the account. Role permissions otherwise unchanged.
+const TemplateVersion = "2026-11-06"
 
 // PermissionsVersion is the oldest template version that grants every
 // permission this build reads with: the last bump that changed the role's
 // permissions. A bump that changes only the template's plumbing (2026-09-24,
 // the Quick Create callback) leaves it where it is, so existing stacks are not
 // reported outdated for permissions they already hold. 2026-10-07 changed the
-// role's permissions (ResourcePolicyTemplateVersion), so it moves with it.
-const PermissionsVersion = ResourcePolicyTemplateVersion
+// role's permissions (ResourcePolicyTemplateVersion), and so did 2026-11-05
+// (DNSQueryLogTemplateVersion), so it moves with them.
+const PermissionsVersion = DNSQueryLogTemplateVersion
+
+// DNSQueryLogTemplateVersion is the oldest template version that grants the
+// DNS query-log reads (DNSQueryLogActions). A denied DNS read on a connector
+// whose stack reports an older version says so, as a fact beside AWS's code.
+const DNSQueryLogTemplateVersion = "2026-11-05"
+
+// DNSScopedQueryTemplateVersion is the first template version that grants
+// logs:StartQuery only on the log groups its DnsQueryLogGroupArns parameter
+// names. A query refused on a stack of this version or later most likely
+// names a log group the customer did not list.
+const DNSScopedQueryTemplateVersion = "2026-11-06"
 
 // ResourcePolicyTemplateVersion is the oldest template version that grants
 // resource-policy collection (§3.9) and the migration-evidence reads (§11). A

@@ -19,3 +19,6 @@ NUL
 
 # Local environment (secrets). Copy .env.example to .env (AS-098).
 .env
+
+# Agent instructions are private to each developer: never committed.
+AGENTS.md

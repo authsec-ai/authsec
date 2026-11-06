@@ -225,7 +225,14 @@ func (ctl *AgentRuntimeIngestController) CreateEventStream(c *gin.Context) {
 	auditAdminMutation(c, ws.String(), action, "cloud_connector", id.String(), http.StatusOK, nil, view)
 
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, eventStreamCreatedBody(view, secret, rotated, id, time.Now().UTC()))
+}
+
+// eventStreamCreatedBody is the create/rotate response. The secret is in
+// data.secret and in NO other field: the stack parameters carry a
+// placeholder for EventSecret.
+func eventStreamCreatedBody(view services.AgentEventStreamView, secret string, rotated bool, id uuid.UUID, now time.Time) gin.H {
+	return gin.H{
 		"success": true,
 		"data": gin.H{
 			"stream":  view,
@@ -233,15 +240,15 @@ func (ctl *AgentRuntimeIngestController) CreateEventStream(c *gin.Context) {
 			"rotated": rotated,
 			"cloudformation": gin.H{
 				"template_url": "/authsec/discovery/aws/connectors/" + id.String() + "/event-stream/template",
-				"parameters":   services.EventStreamStackParameters(view.EndpointURL, secret, id),
+				"parameters":   services.EventStreamStackParameters(view.EndpointURL, services.EventStreamSecretInResponse, id),
 				"notes":        services.EventStreamNotes(),
 			},
 		},
 		"meta": gin.H{
-			"as_of": time.Now().UTC(),
-			"note":  "the secret is shown only in this response; store it in the stack's EventSecret parameter",
+			"as_of": now,
+			"note":  "the secret is shown only in this response, in data.secret; store it in the stack's EventSecret parameter",
 		},
-	})
+	}
 }
 
 // GetEventStream handles GET .../aws/connectors/:id/event-stream: the

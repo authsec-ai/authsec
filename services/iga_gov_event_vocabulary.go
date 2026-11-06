@@ -50,7 +50,6 @@ const (
 	GovCatDrift          = "drift"
 	GovCatUndo           = "undo"
 	GovCatControlRemoval = "control_removal"
-	GovCatLegacy         = "legacy_agent_policy"
 	// R2 (R2): temporary grants, session revocations and
 	// time-bound retention notices.
 	GovCatTimeBoundAccess = "time_bound_access"
@@ -77,8 +76,7 @@ const (
 	GovEventNotificationFailed = "notification.failed"
 	GovEventNotificationDead   = "notification.dead"
 
-	GovEventSettingsUpdated        = "settings.updated"
-	GovEventSettingsChannelsCopied = "settings.notification_channels_copied"
+	GovEventSettingsUpdated = "settings.updated"
 )
 
 // GovEventKind is one vocabulary entry.
@@ -159,7 +157,6 @@ var GovEventVocabulary = []GovEventKind{
 	{"approval_revoked", GovCatRevalidation, GovObjVersion, "A version's approval was revoked by a material change."},
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
-	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
 	// T3.16 deployments, verification, drift, undo and control removal
 	// (iga_gov_deploy_*.go).
 	{GovEventDeploymentStarted, GovCatDeploymentAttempt, GovObjDeployment, "A deployment started (authority checked, binding fresh)."},
@@ -181,12 +178,15 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventValidationDeclared, GovCatVerification, GovObjDeployment, "A validation session and its expected outcomes were declared."},
 	{GovEventHealthReported, GovCatVerification, GovObjDeployment, "An owner reported a problem or that the workload works."},
 	{GovEventDeploymentDrifted, GovCatDrift, GovObjDeployment, "The deployed artifact changed outside AuthSec (never auto-reconciled)."},
+	{GovEventDriftAccepted, GovCatDrift, GovObjDeployment, "An operator accepted a drifted deployment; it is closed as drifted."},
+	{GovEventReapplyRequested, GovCatDrift, GovObjDeployment, "An operator opened a new proposal to re-apply a drifted deployment's policy."},
 	{GovEventDriftLateMutation, GovCatDrift, GovObjDeployment, "A change matching an earlier unknown request appeared after it."},
 	{GovEventControlRoleGone, GovCatDrift, GovObjDeployment, "The controlled role was deleted or recreated; the control was retired."},
 	{GovEventUndoRequested, GovCatUndo, GovObjDeployment, "An undo to the recorded before-state was requested."},
 	{GovEventEmergencyUndo, GovCatUndo, GovObjDeployment, "An emergency undo was requested without an approval reference."},
 	{GovEventDeploymentUndone, GovCatUndo, GovObjDeployment, "A deployment was undone (verified undo)."},
 	{GovEventRoleOnlyRecoveryPlan, GovCatUndo, GovObjDeployment, "A role-only recovery plan was compiled for a blocked undo."},
+	{GovEventRecoveryApproved, GovCatUndo, GovObjDeployment, "A role-only recovery plan was approved on its own."},
 	{GovEventControlRemovalReq, GovCatControlRemoval, GovObjPolicy, "Removing AuthSec control was requested (review, or emergency)."},
 	{GovEventControlRemoved, GovCatControlRemoval, GovObjPolicy, "AuthSec control of a role ended; the control is retired."},
 	// T3.14 Slack app (slack_integration_service.go, slack_integration_interactions.go).
@@ -331,20 +331,20 @@ const (
 // govEventObjectFilters maps an object_kind to how an event names it: a
 // column of iga_gov_event, or a payload key.
 var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
-	GovObjPolicy:          {column: "policy_id"},
-	GovObjVersion:         {column: "version_id"},
-	GovObjDeployment:      {column: "deployment_id"},
-	GovObjFinding:         {column: "finding_id"},
-	GovObjReview:          {payloadKey: "review_id"},
-	GovObjOwner:           {payloadKey: "owner_id"},
-	GovObjOwnerRule:       {payloadKey: "rule_id"},
-	GovObjFindingRule:     {payloadKey: "finding_rule_id"},
-	GovObjBinding:         {payloadKey: "binding_id"},
-	GovObjConnector:       {payloadKey: "connector_id"},
-	GovObjEvidenceBundle:  {payloadKey: "bundle_id"},
-	GovObjNotification:    {payloadKey: "notification_id"},
-	GovObjWorkload:        {payloadKey: "object_id"},
-	GovObjIdentityAccount: {payloadKey: "object_id"},
+	GovObjPolicy:            {column: "policy_id"},
+	GovObjVersion:           {column: "version_id"},
+	GovObjDeployment:        {column: "deployment_id"},
+	GovObjFinding:           {column: "finding_id"},
+	GovObjReview:            {payloadKey: "review_id"},
+	GovObjOwner:             {payloadKey: "owner_id"},
+	GovObjOwnerRule:         {payloadKey: "rule_id"},
+	GovObjFindingRule:       {payloadKey: "finding_rule_id"},
+	GovObjBinding:           {payloadKey: "binding_id"},
+	GovObjConnector:         {payloadKey: "connector_id"},
+	GovObjEvidenceBundle:    {payloadKey: "bundle_id"},
+	GovObjNotification:      {payloadKey: "notification_id"},
+	GovObjWorkload:          {payloadKey: "object_id"},
+	GovObjIdentityAccount:   {payloadKey: "object_id"},
 	GovObjTempGrant:         {payloadKey: "grant_id"},
 	GovObjSessionRevocation: {payloadKey: "revocation_id"},
 	GovObjAgentAlert:        {payloadKey: "alert_id"},
@@ -387,7 +387,7 @@ type GovEventCategoryView struct {
 }
 
 var govUnrecordedCategories = []string{GovCatProposal, GovCatApproval, GovCatAcceptance, GovCatRevalidation,
-	GovCatRollout, GovCatVerification, GovCatDrift, GovCatUndo, GovCatControlRemoval, GovCatLegacy}
+	GovCatRollout, GovCatVerification, GovCatDrift, GovCatUndo, GovCatControlRemoval}
 
 // GovEventCategories is the Logs kind filter: every recorded category with
 // its event names, then the categories with no writer in this build.

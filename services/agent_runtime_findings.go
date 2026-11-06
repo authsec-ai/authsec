@@ -28,16 +28,26 @@ import (
      model_key_secret   -- a Secrets Manager secret whose NAME suggests a model
                            provider key, with the identities whose declared
                            grants let them read it; no value is ever read
+     ai_config_hint     -- a workload whose configuration names a model
+                           provider (agent_runtime_config_hints.go)
+     ai_network_traffic -- written by the DNS evidence path, never here: read
+                           only, it makes its identity an AI workload
 
    A finding is open while the newest inference of its connector sees it and
-   resolved when it no longer does. The three identity findings rest on model
-   calls inside the last AgentRuntimeWindowDays days, so they resolve when the
-   identity has made none in it. */
+   resolved when it no longer does. Inference resolves only the kinds it
+   writes (inferenceFindingKinds here, ai_config_hint in applyConfigHints). The
+   three identity findings rest on model calls inside the last
+   AgentRuntimeWindowDays days, so they resolve when the identity has made
+   none in it. */
 
 // FindingKinds are the kind filter's legal values.
 var FindingKinds = map[string]bool{
 	FindingSharedRole: true, FindingHumanCredentials: true, FindingLongLivedKey: true, FindingModelKeySecret: true,
+	FindingAIConfigHint: true, FindingAINetworkTraffic: true,
 }
+
+// inferenceFindingKinds are the kinds applyFindings writes and resolves.
+var inferenceFindingKinds = []string{FindingSharedRole, FindingHumanCredentials, FindingLongLivedKey, FindingModelKeySecret}
 
 // FindingStates are the state filter's legal values.
 var FindingStates = map[string]bool{FindingOpen: true, FindingResolved: true}
@@ -237,7 +247,18 @@ func findingDrafts(tx *gorm.DB, ws uuid.UUID, st *agentRuntimeState, ais []*AIWo
 			"models": arNonNil(ai.win.Models), "last_call_at": ai.LastCallAt,
 			"window": ai.Coverage, "window_days": AgentRuntimeWindowDays}
 		subject := map[string]any{"identity_id": id, "arn": ai.Identity.ARN, "name": ai.Identity.Name, "kind": ai.Identity.Kind}
-		refs := map[string]any{"cloud_usage": []uuid.UUID{ai.UsageID}}
+		usageRefs := []uuid.UUID{}
+		if ai.UsageID != uuid.Nil {
+			usageRefs = append(usageRefs, ai.UsageID)
+		}
+		refs := map[string]any{"cloud_usage": usageRefs}
+		if len(ai.NetworkTraffic) > 0 {
+			ids := []uuid.UUID{}
+			for _, n := range ai.NetworkTraffic {
+				ids = append(ids, n.ID)
+			}
+			refs["agent_finding"] = ids
+		}
 		obs, err := cloudTrailObservations(tx, ws, id)
 		if err != nil {
 			return nil, fmt.Errorf("observations: %w", err)
@@ -339,18 +360,8 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 	}
 	seen := map[string]bool{}
 	for _, d := range drafts {
-		subj, _ := json.Marshal(d.Subject)
-		ev, _ := json.Marshal(d.Evidence)
-		if err := tx.Exec(`INSERT INTO agent_finding
-			  (workspace_id, connector_id, kind, subject_key, identity_id, subject, evidence, state,
-			   first_seen, last_seen, resolved_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, 'open', ?, ?, NULL, ?, ?)
-			ON CONFLICT (workspace_id, kind, subject_key) DO UPDATE SET
-			  connector_id = excluded.connector_id, identity_id = excluded.identity_id,
-			  subject = excluded.subject, evidence = excluded.evidence, state = 'open',
-			  last_seen = excluded.last_seen, resolved_at = NULL, updated_at = excluded.updated_at`,
-			ws, connectorID, d.Kind, d.SubjectKey, d.IdentityID, string(subj), string(ev), now, now, now, now).Error; err != nil {
-			return fmt.Errorf("upsert finding %s: %w", d.Kind, err)
+		if err := upsertAgentFinding(tx, ws, connectorID, d, now); err != nil {
+			return err
 		}
 		seen[d.Kind+"\x1f"+d.SubjectKey] = true
 	}
@@ -362,13 +373,15 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 		SubjectKey string
 		LastSeen   time.Time
 	}
+	// Only the kinds this pass writes: ai_config_hint has its own pass and
+	// ai_network_traffic is another writer's.
 	if err := tx.Table("agent_finding").Select("id, kind, subject_key, last_seen").
-		Where("workspace_id = ? AND connector_id = ? AND state = ?", ws, connectorID, FindingOpen).
+		Where("workspace_id = ? AND connector_id = ? AND state = ? AND kind IN ?", ws, connectorID, FindingOpen, inferenceFindingKinds).
 		Scan(&open).Error; err != nil {
 		return fmt.Errorf("read open findings: %w", err)
 	}
 	for _, f := range open {
-		if seen[f.Kind+"\x1f"+f.SubjectKey] {
+		if seen[f.Kind+"\x1f"+f.SubjectKey] || findingKindsOutsideInference[f.Kind] {
 			continue
 		}
 		if f.Kind == FindingModelKeySecret && (secrets == nil || !secrets.known) {
@@ -390,12 +403,31 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 	return nil
 }
 
+// upsertAgentFinding opens or refreshes one finding (one row per workspace,
+// kind and subject key).
+func upsertAgentFinding(tx *gorm.DB, ws, connectorID uuid.UUID, d findingDraft, now time.Time) error {
+	subj, _ := json.Marshal(d.Subject)
+	ev, _ := json.Marshal(d.Evidence)
+	if err := tx.Exec(`INSERT INTO agent_finding
+		  (workspace_id, connector_id, kind, subject_key, identity_id, subject, evidence, state,
+		   first_seen, last_seen, resolved_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, 'open', ?, ?, NULL, ?, ?)
+		ON CONFLICT (workspace_id, kind, subject_key) DO UPDATE SET
+		  connector_id = excluded.connector_id, identity_id = excluded.identity_id,
+		  subject = excluded.subject, evidence = excluded.evidence, state = 'open',
+		  last_seen = excluded.last_seen, resolved_at = NULL, updated_at = excluded.updated_at`,
+		ws, connectorID, d.Kind, d.SubjectKey, d.IdentityID, string(subj), string(ev), now, now, now, now).Error; err != nil {
+		return fmt.Errorf("upsert finding %s: %w", d.Kind, err)
+	}
+	return nil
+}
+
 /* ---------------------------------- the reads ------------------------------- */
 
 // AgentFinding is one finding as the API returns it.
 type AgentFinding struct {
 	ID          uuid.UUID       `json:"id"`
-	ConnectorID uuid.UUID       `json:"connector_id"`
+	ConnectorID *uuid.UUID      `json:"connector_id"` // NULL on a model provider finding (154)
 	Kind        string          `json:"kind"`
 	SubjectKey  string          `json:"subject_key"`
 	IdentityID  *uuid.UUID      `json:"identity_id"`
@@ -419,7 +451,7 @@ type FindingListFilter struct {
 // ListFindings returns the workspace's findings, most recently seen first.
 func (s *AgentRuntimeService) ListFindings(ctx context.Context, ws uuid.UUID, f FindingListFilter) ([]AgentFinding, *string, error) {
 	if f.Kind != "" && !FindingKinds[f.Kind] {
-		return nil, nil, GovBadParam("kind", "kind must be shared_role, human_credentials, long_lived_key or model_key_secret.")
+		return nil, nil, GovBadParam("kind", "kind must be one of "+strings.Join(sortedKeys(FindingKinds), ", ")+".")
 	}
 	if f.State != "" && !FindingStates[f.State] {
 		return nil, nil, GovBadParam("state", "state must be open or resolved.")

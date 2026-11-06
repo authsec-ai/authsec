@@ -96,13 +96,20 @@ func suggestEligible(u agentruntime.ModelCallUsage, one *arWorkload, candidates 
 /* ---------------------------- supporting evidence --------------------------- */
 
 var (
-	agentEnvPrefixes = []string{"LANGCHAIN_", "LANGSMITH_", "MCP_"}
-	agentEnvNames    = map[string]bool{"OPENAI_API_KEY": true, "ANTHROPIC_API_KEY": true}
+	agentEnvPrefixes = []string{"LANGCHAIN_", "LANGSMITH_", "MCP_", "AZURE_OPENAI_", "HUGGINGFACE", "LLAMA_"}
+	agentEnvNames    = map[string]bool{
+		"OPENAI_API_KEY": true, "ANTHROPIC_API_KEY": true, "GEMINI_API_KEY": true, "GOOGLE_API_KEY": true,
+		"MISTRAL_API_KEY": true, "COHERE_API_KEY": true, "GROQ_API_KEY": true, "OPENROUTER_API_KEY": true,
+		"HF_TOKEN": true,
+	}
 )
 
 // AgentEnvVarNames are the environment variable NAMES (never values) of agent
-// frameworks or model keys: LANGCHAIN_*, LANGSMITH_*, MCP_*, OPENAI_API_KEY,
-// ANTHROPIC_API_KEY. Supporting evidence only (§3).
+// frameworks or model keys, case-insensitive: OPENAI_API_KEY,
+// ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, MISTRAL_API_KEY,
+// COHERE_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, HF_TOKEN, and AZURE_OPENAI_*,
+// HUGGINGFACE*, LANGCHAIN_*, LANGSMITH_*, LLAMA_*, MCP_*. Supporting evidence
+// of a suggestion (§3) and the env hint of an ai_config_hint finding.
 func AgentEnvVarNames(names []string) []string {
 	out := []string{}
 	for _, n := range names {

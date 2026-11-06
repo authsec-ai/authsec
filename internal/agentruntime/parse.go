@@ -56,7 +56,8 @@ type rawRecord struct {
 }
 
 // requestFactKeys maps a requestParameters key to the RequestFacts key it
-// fills. Only scalar strings (or string arrays, comma-joined) are kept.
+// fills. Only scalar strings (or string arrays, comma-joined) and booleans
+// ("true" / "false") are kept.
 var requestFactKeys = map[string]string{
 	"modelId":      FactModelID,
 	"model":        FactModelID,
@@ -71,6 +72,8 @@ var requestFactKeys = map[string]string{
 	"keyId":        FactKeyID,
 	"functionName": FactFunction,
 	"bucketName":   FactBucket,
+	// ssm GetParameter*: a bool, kept as "true" / "false" (detect D1).
+	"withDecryption": FactWithDecryption,
 }
 
 // ParseCloudTrailRecord normalises one CloudTrail record (the JSON of
@@ -121,15 +124,6 @@ func ParseCloudTrailRecord(raw []byte) (Event, error) {
 			e.RequestFacts[fk] = s
 		}
 	}
-	if raw, ok := r.RequestParameters["withDecryption"]; ok {
-		var b bool
-		if json.Unmarshal(raw, &b) == nil {
-			if e.RequestFacts == nil {
-				e.RequestFacts = map[string]string{}
-			}
-			e.RequestFacts[FactWithDecryption] = fmt.Sprintf("%t", b)
-		}
-	}
 	if raw, ok := r.RequestParameters["encryptionContext"]; ok {
 		var ctx map[string]json.RawMessage
 		if json.Unmarshal(raw, &ctx) == nil {
@@ -164,6 +158,13 @@ func scalarString(v json.RawMessage) string {
 			arr = arr[:20]
 		}
 		return truncate(strings.Join(arr, ","), 512)
+	}
+	var b bool
+	if json.Unmarshal(v, &b) == nil {
+		if b {
+			return "true"
+		}
+		return "false"
 	}
 	return ""
 }

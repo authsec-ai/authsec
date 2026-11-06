@@ -175,6 +175,36 @@ func AdditionalPermissions() []Permission {
 				"evidence that the move happened. Never stored as inventory; " +
 				"nothing is changed (template 2026-10-07).",
 		},
+		{
+			Surface: "dns-query-logs",
+			Actions: DNSQueryLogActions(),
+			Why: "Detects workloads that call a model provider (OpenAI, Anthropic, " +
+				"Google, Mistral...) directly, from Route 53 Resolver query logs " +
+				"(template 2026-11-05): which VPCs log their DNS queries and where, " +
+				"and for a CloudWatch Logs destination one Logs Insights query per " +
+				"log group that returns only lookups of model providers' API hosts, " +
+				"filtered inside the query -- no other DNS data is read. Logs " +
+				"Insights is charged per GB scanned: 24 hours on the first read, at " +
+				"most 7 days per log group per scan; a query no longer waited for " +
+				"is stopped. ec2:DescribeNetworkInterfaces maps a source address to " +
+				"the Lambda, ECS task or instance network interface holding it. " +
+				"StartQuery is scoped to this account's log groups.",
+		},
+	}
+}
+
+// DNSQueryLogActions are the DNS query-log reads (SPEC-agent-runtime-
+// visibility.md §11). The ECS task reads that resolve a task's network
+// interface (ecs:ListClusters, ListTasks, DescribeTasks) are granted under
+// MigrationEvidenceActions.
+func DNSQueryLogActions() []string {
+	return []string{
+		"route53resolver:ListResolverQueryLogConfigs",
+		"route53resolver:ListResolverQueryLogConfigAssociations",
+		"ec2:DescribeNetworkInterfaces",
+		"logs:StartQuery",
+		"logs:GetQueryResults",
+		"logs:StopQuery",
 	}
 }
 
