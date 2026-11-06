@@ -152,6 +152,10 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		"policy": withAccessPolicies(policyCapabilities(ctl.policyGateFn()()), ctl.db()),
 		// Agent runtime visibility P3: containment levels per AWS account.
 		"agent_containment": agentContainCapabilities(c, ctl.db()),
+		// Schema gates ({"available", "reason"}): alerts need 150, the rest
+		// of the agent runtime 147-149.
+		"agent_alerts":  services.AgentAlertsCapabilities(ctl.db()),
+		"agent_runtime": services.AgentRuntimeCapabilities(ctl.db()),
 	}})
 }
 

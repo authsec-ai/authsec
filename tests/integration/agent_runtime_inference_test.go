@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -89,6 +90,10 @@ func arSeedWorld(t *testing.T, db *gorm.DB, name string) *arWorld {
 		return gid
 	}
 	usage := func(identity uuid.UUID, u agentruntime.ModelCallUsage) {
+		// A real document dates its calls (the scan always sets both): the
+		// evaluation window reads those dates for a document with no day buckets.
+		now := time.Now().UTC()
+		u.FirstCallAt, u.LastCallAt = &now, &now
 		attrs, _ := json.Marshal(u)
 		arExec(t, db, `INSERT INTO cloud_usage (workspace_id, connector_id, identity_id, service, source, attrs, last_used_at)
 			VALUES (?, ?, ?, ?, ?, ?::jsonb, now())`, w.ws, w.conn, identity, agentruntime.UsageService, agentruntime.UsageSource, string(attrs))

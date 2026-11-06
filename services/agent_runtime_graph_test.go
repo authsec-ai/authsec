@@ -21,7 +21,7 @@ func arGraphState(ident *arIdentity, u *agentruntime.ModelCallUsage, wls ...*arW
 		suggestions: map[uuid.UUID]*arSuggestion{}, openFindings: map[uuid.UUID]int{},
 	}
 	if u != nil {
-		st.usage[ident.ID] = &arUsage{ID: uuid.New(), IdentityID: ident.ID, usage: *u}
+		st.usage[ident.ID] = arTestUsageRow(ident.ID, *u)
 	}
 	return st
 }

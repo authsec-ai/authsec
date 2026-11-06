@@ -160,6 +160,9 @@ func (a *acAccess) Open(_ context.Context, ws, _, _ uuid.UUID) (agentcontain.AWS
 func (a *acAccess) ECSServicesOf(context.Context, uuid.UUID, uuid.UUID, string, string) ([]agentcontain.ECSService, error) {
 	return nil, nil
 }
+func (a *acAccess) FunctionTags(context.Context, uuid.UUID, uuid.UUID, string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
 func (a *acAccess) EventSourceMappings(context.Context, uuid.UUID, uuid.UUID, string) (int, error) {
 	return 0, nil
 }
@@ -201,7 +204,7 @@ func newACLab(t *testing.T) *acLab {
 	prevR2 := services.PolicyR2GateState()
 	services.SetPolicyR2Gate(r2)
 	if err := services.VerifyAgentContainSchema(db); err != nil {
-		t.Fatalf("the integration database must be at 151: %v", err)
+		t.Fatalf("the integration database must be at 159: %v", err)
 	}
 	l := &acLab{t: t, db: db, fake: newACAWS(), clock: time.Now().UTC()}
 	l.access = &acAccess{aws: l.fake}
@@ -334,6 +337,10 @@ func TestAgentContainWorkloadLevelPerWorkspace(t *testing.T) {
 
 	// Behavioural verification: past the grace with no late event -> verified.
 	l.clock = l.clock.Add(agentcontain.VerifyGrace + time.Minute)
+	// "None seen" needs CloudTrail evidence past the cutoff: the connector's
+	// event stream delivered an event after contained_at + grace.
+	p3exec(t, l.db, `INSERT INTO agent_event_stream (connector_id, workspace_id, secret_hash, secret_prefix, last_event_time)
+		VALUES (?, ?, ?, 'p3test', ?)`, a.g.conn, a.g.ws, strings.Repeat("a", 64), l.clock)
 	got = l.run(a.g.ws, c.ID)
 	if got.VerifiedAt == nil || got.Effective == nil || !*got.Effective {
 		t.Fatalf("verified_at %v effective %v", got.VerifiedAt, got.Effective)

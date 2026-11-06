@@ -97,6 +97,10 @@ const (
 	// FactWithDecryption is ssm's requestParameters.withDecryption, stored
 	// as "true" or "false"; absent when the record does not state it.
 	FactWithDecryption = "with_decryption"
+	// FactSecretContext is "true" when a kms request's encryptionContext has a
+	// key naming a Secrets Manager secret or SSM parameter (SecretARN,
+	// PARAMETER_ARN, aws:secretsmanager:*, aws:ssm:*). Keys only, never values.
+	FactSecretContext = "secret_context"
 )
 
 // Attribution is how an event is tied to an identity, mirroring

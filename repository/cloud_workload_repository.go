@@ -414,7 +414,10 @@ func listWorkloads(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([
 }
 
 func listUsage(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
-	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
+	// Access Advisor rows only: the model-call evidence rows (source
+	// cloudtrail) are read by the agent-runtime endpoints, and listed here they
+	// would show every AI identity a second, "bedrock", service.
+	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ? AND source = ?", workspaceID, models.UsageSourceServiceLastAccessed)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -454,7 +457,7 @@ type CloudUsageSummaryRow struct {
 func usageSummary(db *gorm.DB, workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
 	q := db.Model(&models.CloudUsage{}).
 		Select("identity_id, count(*) AS services, count(*) FILTER (WHERE last_used_at IS NULL) AS never_used").
-		Where("workspace_id = ?", workspaceID)
+		Where("workspace_id = ? AND source = ?", workspaceID, models.UsageSourceServiceLastAccessed)
 	if connectorID != nil {
 		q = q.Where("connector_id = ?", *connectorID)
 	}
@@ -476,7 +479,7 @@ func countsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) (int64,
 		return 0, 0, err
 	}
 	if err := db.Model(&models.CloudUsage{}).
-		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
+		Where("workspace_id = ? AND connector_id = ? AND source = ?", workspaceID, connectorID, models.UsageSourceServiceLastAccessed).
 		Count(&usage).Error; err != nil {
 		return 0, 0, err
 	}

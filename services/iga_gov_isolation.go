@@ -606,6 +606,9 @@ func (a *GovAuthoring) isolationInput(ctx context.Context, ws uuid.UUID, c model
 		return out, govUnprocessable("workload_not_found", "The intent's workload is not in the graph.", map[string]any{"workload_id": wid})
 	}
 	kind := subjectKindFor(di.Workload.BindingKind, di.Workload.BindingRef)
+	if (kind == igagov.SubjectLambdaFunction || kind == igagov.SubjectEC2Instance) && keyARN(keys[0]) != di.Workload.BindingRef {
+		return out, GovBadParam("workload.binding_ref", "The binding must identify the selected graph workload.")
+	}
 	if kind == igagov.SubjectECSService {
 		out.TaskFamily = ecsFamily(keyARN(keys[0]))
 		pred := subjectPredicate(kind, di.Workload.BindingRef, keys, nil)
@@ -657,7 +660,7 @@ func (a *GovAuthoring) isolationInput(ctx context.Context, ws uuid.UUID, c model
 			from[keyARN(k)] = true
 		}
 		refs, ev := r.ListECSServices(ctx)
-		subjects := map[string]bool{di.Workload.BindingRef: true}
+		subjects := map[string]bool{}
 		for _, ref := range refs {
 			st, sev := r.ECSService(ctx, ref)
 			ev.Merge(sev)
@@ -674,6 +677,9 @@ func (a *GovAuthoring) isolationInput(ctx context.Context, ws uuid.UUID, c model
 		}
 		if !ev.Complete() {
 			return out, migrationReadUnavailable("ECS services of family "+out.TaskFamily, ev, nil)
+		}
+		if !subjects[di.Workload.BindingRef] {
+			return out, GovBadParam("workload.binding_ref", "The selected ECS service does not run a source-role revision of this task family.")
 		}
 		for s := range subjects {
 			out.SubjectARNs = append(out.SubjectARNs, s)

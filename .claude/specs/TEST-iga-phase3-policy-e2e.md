@@ -1,6 +1,6 @@
 # Phase 3 Policy — end-to-end test plan
 
-Target: backend `authsec-staging` at `4fda6b5` (Ritam's P3 R1a + review fixes + the follow-up fixes), console `Authsec-ui` at `66585a9` with the Policy screens (`/iga/policy/...`). Both are deployed to production; the Policy gate was switched on there on 2026-10-12. A junior-friendly run sheet that follows this plan step by step is [`RUNBOOK-iga-phase3-policy-junior-test.md`](RUNBOOK-iga-phase3-policy-junior-test.md); this document is the case catalogue behind it.
+Target: the current `authsec-staging` backend and console working trees, with the Phase 3 Policy screens (`/iga/policy/...`). Record the actual tested commit and deployed image before a live run; this checklist does not establish deployment. The junior-friendly run sheet is [`RUNBOOK-iga-phase3-policy-junior-test.md`](RUNBOOK-iga-phase3-policy-junior-test.md).
 Design reference: [`SPEC-iga-phase3-policy.md`](SPEC-iga-phase3-policy.md). Each case names the spec scenario it exercises where one exists.
 
 **This plan is a checklist for a person to run. Nothing in it has been run yet.** The UI was rendered only against recorded backend responses; the backend's own tests ran only against fake AWS, GitHub and Slack. The purpose of this plan is the first run against real ones.
@@ -18,7 +18,7 @@ Design reference: [`SPEC-iga-phase3-policy.md`](SPEC-iga-phase3-policy.md). Each
 
 | Item | Setting |
 |---|---|
-| Database | New PostgreSQL 15+. Load `migrations/master/001_bootstrap.sql` (it carries everything through `059`). Never point at the deployed database. |
+| Database | New PostgreSQL 15+. Load `migrations/master/001_bootstrap.sql` (verify parity with the complete numbered migration chain, currently through `158`). Never point at the deployed database. |
 | Backend | `cp .env.example .env`, then set the database, `IGA_CURSOR_SECRET`, Vault (needed for the enforcement ExternalId, the GitHub App key and Slack tokens). Do **not** set `AUTHSEC_DISABLE_POLICY_WORKER`, `AUTHSEC_DISABLE_AWS_SCAN_WORKER` or `AUTHSEC_DISABLE_AWS_CFN_CALLBACK_WORKER`. `go run ./cmd/` listens on `7468`. |
 | Reachability | AWS CloudFormation calls back to the backend, so the backend needs a public HTTPS URL for the enforcement and discovery stacks (a tunnel is fine). The same URL is the OAuth redirect for GitHub and Slack. |
 | Console | `Authsec-ui` pointed at that backend (`VITE_API_URL`, `VITE_OAUTH_BASE_URL`). |
@@ -199,8 +199,8 @@ Run with **enforcement mode `enforce`** and a **verified binding** and delivery 
 
 | ID | Steps | Expected | Evidence |
 |---|---|---|---|
-| S12.1 | With a legacy agent policy present, open `/iga/policy/legacy`. | Listed read-only. **Pause** and **Remove** need `governance:enforce`; a workspace admin has it; a user with only `governance:admin` does not. | Screenshot. |
-| S12.1b | A legacy agent that was reclaimed after a missed lease reports success late, once with the same `?pod=` it leased with and once without. | Only the matching holder's report is recorded; the other gets 409 and the instruction stays queued. (Agents that do not send `?pod=` do not get late successes recorded.) | HTTP status; instruction row. |
+| S12.1 | Upgrade a scratch database containing superseded policy rows; inspect policy navigation and registered routes. | The five superseded tables are absent and `enforcement_plans` remains; no old policy worker, API or Legacy page remains. Current policy routes still enforce workspace membership and governance permissions. | Schema and route inventory; positive and cross-workspace request results. |
+| S12.1b | A discovery actuation agent that was reclaimed after a missed lease reports success late, once with the same `?pod=` it leased with and once without. | Only the matching holder's report is recorded; the other gets 409 and the instruction stays queued. (Agents that do not send `?pod=` do not get late successes recorded.) | HTTP status; instruction row. |
 | S12.2 | GitHub connection, Kubernetes pages, OAuth/OIDC login, MCP, governance (old) pages. | Behave as before. | Short note per area. |
 | S12.3 | Delete a **scratch** workspace that has events, acceptances and attempts. | Delete succeeds. (Scratch only. Never a real workspace.) | Workspace gone; no orphan `iga_gov_*` rows. |
 

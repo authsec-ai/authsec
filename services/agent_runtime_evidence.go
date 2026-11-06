@@ -40,9 +40,15 @@ import (
 //     template in deny mode these are the untagged AI workloads, §5.4) and
 //     errors (anything else) are kept apart; refused calls are evidence too.
 //   - a Bedrock event counts only inside the Bedrock pass's settled window,
-//     every other event only inside the general pass's. Each window starts at
-//     its stream's previous mark, so no event is added twice across scans; an
-//     event both passes returned is one event (awsdiscovery.MergeTrailRecords).
+//     every other event only inside the general pass's. Each window starts
+//     awsdiscovery.TrailLateLookback BEFORE its stream's previous mark (late
+//     CloudTrail deliveries), so an event already counted is skipped by its
+//     eventID (cloud_trail_seen_event, kept seenEventRetention) and no event is
+//     added twice across scans; an event both passes returned is one event
+//     (awsdiscovery.MergeTrailRecords).
+//   - every count is also kept per UTC day (modelCallDoc.Days, at most
+//     maxModelCallDays): the suggestion rule and the findings read the last
+//     AgentRuntimeWindowDays days, not the all-time totals (spec §5.1, §5.3).
 //   - other_services: the other event sources the same identity called
 //     successfully in the general window -- the "acted on other resources"
 //     evidence inference reads (§5.3). Recorded only for an identity that has
@@ -61,6 +67,107 @@ import (
 
 // maxModelCallSessionNames caps ModelCallUsage.SessionNames.
 const maxModelCallSessionNames = 20
+
+const (
+	// maxModelCallDays is how many UTC days of per-day buckets a row keeps.
+	maxModelCallDays = 90
+	// AgentRuntimeWindowDays is the window the suggestion rule and the
+	// findings evaluate (spec §5.3 "in the same window"): the last 30 UTC
+	// days including today.
+	AgentRuntimeWindowDays = 30
+	// seenEventRetention is how long a counted event's id is kept. It only has
+	// to outlive awsdiscovery.TrailLateLookback.
+	seenEventRetention = 7 * 24 * time.Hour
+)
+
+// modelCallDayBucket is one UTC day of one identity's evidence.
+type modelCallDayBucket struct {
+	Calls         int            `json:"calls"`
+	Errors        int            `json:"errors"`
+	Denied        int            `json:"denied"`
+	Models        map[string]int `json:"models,omitempty"`
+	OtherServices map[string]int `json:"other_services,omitempty"`
+}
+
+func modelCallDayKey(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// windowedUsage is the document's evidence over the last
+// AgentRuntimeWindowDays days up to now: the day buckets summed, the
+// cumulative fields (tokens, first/last call, coverage, session names) kept.
+// A document with no day buckets (written before they existed) has no
+// windowed evidence. Pure.
+func (d modelCallDoc) windowedUsage(now time.Time) agentruntime.ModelCallUsage {
+	u := d.ModelCallUsage
+	u.Calls, u.Errors, u.Denied = 0, 0, 0
+	u.Models, u.OtherServices = nil, nil
+	cutoff := modelCallDayKey(now.UTC().AddDate(0, 0, -(AgentRuntimeWindowDays - 1)))
+	days := d.Days
+	if len(days) == 0 {
+		days = d.legacyDays(now)
+	}
+	for day, b := range days {
+		if day < cutoff || b == nil {
+			continue
+		}
+		u.Calls += b.Calls
+		u.Errors += b.Errors
+		u.Denied += b.Denied
+		for k, n := range b.Models {
+			u.Models = addModelCallCount(u.Models, k, n)
+		}
+		for k, n := range b.OtherServices {
+			u.OtherServices = addModelCallCount(u.OtherServices, k, n)
+		}
+	}
+	return u
+}
+
+// legacyDays are the buckets of a document written before day buckets existed
+// (its counts are cumulative with no dates). It never overstates the window:
+//   - first call inside the window: every cumulative count is inside it, kept
+//     whole in the bucket of that day;
+//   - otherwise, a last call inside it: only "a call was made in the window"
+//     is known, so one call (or, with no successful call, one refusal) is
+//     kept in the bucket of the last call's day; no other-service evidence is
+//     claimed.
+//
+// A document with neither date has none. Pure.
+func (d modelCallDoc) legacyDays(now time.Time) map[string]*modelCallDayBucket {
+	if d.Calls+d.Errors+d.Denied == 0 && len(d.OtherServices) == 0 {
+		return nil
+	}
+	cutoff := modelCallDayKey(now.UTC().AddDate(0, 0, -(AgentRuntimeWindowDays - 1)))
+	if d.FirstCallAt != nil && modelCallDayKey(*d.FirstCallAt) >= cutoff {
+		return map[string]*modelCallDayBucket{modelCallDayKey(*d.FirstCallAt): {
+			Calls: d.Calls, Errors: d.Errors, Denied: d.Denied,
+			Models: mergeModelCallCounts(nil, d.Models), OtherServices: mergeModelCallCounts(nil, d.OtherServices)}}
+	}
+	if d.LastCallAt != nil && modelCallDayKey(*d.LastCallAt) >= cutoff {
+		b := &modelCallDayBucket{}
+		if d.Calls > 0 {
+			b.Calls = 1
+		} else if d.Denied > 0 {
+			b.Denied = 1
+		} else {
+			return nil
+		}
+		return map[string]*modelCallDayBucket{modelCallDayKey(*d.LastCallAt): b}
+	}
+	return nil
+}
+
+// pruneDays drops buckets older than maxModelCallDays.
+func (d *modelCallDoc) pruneDays(now time.Time) {
+	cutoff := modelCallDayKey(now.UTC().AddDate(0, 0, -(maxModelCallDays - 1)))
+	for day := range d.Days {
+		if day < cutoff {
+			delete(d.Days, day)
+		}
+	}
+	if len(d.Days) == 0 {
+		d.Days = nil
+	}
+}
 
 // streamingModelCalls are the operations whose completion record
 // (AwsServiceEvent) carries the call's token counts. For these the AwsApiCall
@@ -88,6 +195,37 @@ type modelCallDelta struct {
 	// ModelActivity: a model-call record (call, error or denial) was counted.
 	// Only such a delta creates a row.
 	ModelActivity bool
+	// Days is the same evidence per UTC day (modelCallDayKey).
+	Days map[string]*modelCallDayBucket
+	// LastSuccessAt is the newest SUCCESSFUL model call (a refused or failed
+	// one never sets it): cloud_usage.last_used_at.
+	LastSuccessAt *time.Time
+	// EventIDs are the CloudTrail ids of the events this delta counted, kept
+	// in cloud_trail_seen_event so a re-read never counts them again.
+	EventIDs map[string]time.Time
+}
+
+func (d *modelCallDelta) day(t time.Time) *modelCallDayBucket {
+	if d.Days == nil {
+		d.Days = map[string]*modelCallDayBucket{}
+	}
+	k := modelCallDayKey(t)
+	b := d.Days[k]
+	if b == nil {
+		b = &modelCallDayBucket{}
+		d.Days[k] = b
+	}
+	return b
+}
+
+func (d *modelCallDelta) counted(id string, t time.Time) {
+	if id == "" {
+		return
+	}
+	if d.EventIDs == nil {
+		d.EventIDs = map[string]time.Time{}
+	}
+	d.EventIDs[id] = t.UTC()
 }
 
 // trailCoverage is one region's coverage on a row.
@@ -104,10 +242,104 @@ type modelCallDoc struct {
 	agentruntime.ModelCallUsage
 	IdentityUniqueID string                   `json:"identity_unique_id,omitempty"`
 	Regions          map[string]trailCoverage `json:"regions,omitempty"`
+	// LastSuccessAt: the newest successful model call (LastCallAt is the
+	// newest attempt of any outcome).
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	// Days are the per-UTC-day buckets (at most maxModelCallDays).
+	Days map[string]*modelCallDayBucket `json:"days,omitempty"`
 }
 
 func isModelCallSource(src string) bool {
 	return src == agentruntime.SourceBedrock || (agentruntime.Event{EventSource: src, EventType: "AwsApiCall"}).IsModelCall()
+}
+
+// rootModelCallDelta is the model calls one region's records attribute to the
+// account's root user (userIdentity.type Root). Root has no inventory
+// identity, so these never reach a usage row; they raise the §5.2 step-4
+// finding (an AI workload on human credentials) on their own.
+type rootModelCallDelta struct {
+	AccountID             string
+	Calls, Denied, Errors int
+	LastCallAt            *time.Time
+	EventIDs              map[string]time.Time
+}
+
+// rootFindingKey is the agent_finding subject_key of a connector's root
+// model-call finding.
+func rootFindingKey(connectorID uuid.UUID) string { return "root:" + connectorID.String() }
+
+// aggregateRootModelCalls counts the root user's model calls under the same
+// windows and event-id rules as aggregateModelCalls. Pure; nil when none.
+func aggregateRootModelCalls(general, bedrock awsdiscovery.TrailWindowRead, records []awsdiscovery.TrailRecord) *rootModelCallDelta {
+	var out *rootModelCallDelta
+	for _, rec := range records {
+		ev := rec.Event
+		if ev.PrincipalType != "Root" || !ev.IsModelCall() {
+			continue
+		}
+		window := general
+		if ev.EventSource == agentruntime.SourceBedrock {
+			window = bedrock
+		}
+		if !window.Counts(ev.EventTime) {
+			continue
+		}
+		if ev.EventID == "" && !window.Since.IsZero() && !ev.EventTime.After(window.Since) {
+			continue
+		}
+		if out == nil {
+			out = &rootModelCallDelta{AccountID: ev.AccountID}
+		}
+		switch {
+		case ev.ErrorCode == "":
+			out.Calls++
+		case ev.AuthorizationDenied:
+			out.Denied++
+		default:
+			out.Errors++
+		}
+		out.LastCallAt = laterCall(out.LastCallAt, ev.EventTime)
+		if ev.EventID != "" {
+			if out.EventIDs == nil {
+				out.EventIDs = map[string]time.Time{}
+			}
+			out.EventIDs[ev.EventID] = ev.EventTime.UTC()
+		}
+	}
+	return out
+}
+
+// upsertRootFinding opens (or extends) the connector's root model-call
+// finding. The counts accumulate over the reads; inference resolves it once
+// its last call is older than the evaluation window.
+func upsertRootFinding(tx *gorm.DB, w modelCallWrite, now time.Time) error {
+	r := w.Root
+	last := now
+	if r.LastCallAt != nil {
+		last = *r.LastCallAt
+	}
+	subj, _ := json.Marshal(map[string]any{"kind": "root", "name": "Root user",
+		"arn": "arn:aws:iam::" + r.AccountID + ":root"})
+	ev, _ := json.Marshal(map[string]any{"calls": r.Calls, "denied": r.Denied, "errors": r.Errors,
+		"last_call_at": last, "window_days": AgentRuntimeWindowDays,
+		"note": "Model calls made with the account's root user: an AI workload on human credentials."})
+	return tx.Exec(`INSERT INTO agent_finding
+		  (workspace_id, connector_id, kind, subject_key, identity_id, subject, evidence, state,
+		   first_seen, last_seen, resolved_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, NULL, ?::jsonb, ?::jsonb, 'open', ?, ?, NULL, ?, ?)
+		ON CONFLICT (workspace_id, kind, subject_key) DO UPDATE SET
+		  subject = excluded.subject,
+		  evidence = excluded.evidence || jsonb_build_object(
+		      'calls',  CASE WHEN agent_finding.state = 'resolved' THEN 0 ELSE COALESCE((agent_finding.evidence->>'calls')::bigint, 0) END  + ?,
+		      'denied', CASE WHEN agent_finding.state = 'resolved' THEN 0 ELSE COALESCE((agent_finding.evidence->>'denied')::bigint, 0) END + ?,
+		      'errors', CASE WHEN agent_finding.state = 'resolved' THEN 0 ELSE COALESCE((agent_finding.evidence->>'errors')::bigint, 0) END + ?,
+		      'last_call_at', CASE WHEN agent_finding.state = 'resolved' THEN excluded.evidence->'last_call_at'
+		          ELSE to_jsonb(GREATEST((agent_finding.evidence->>'last_call_at')::timestamptz,
+		                                 (excluded.evidence->>'last_call_at')::timestamptz)) END),
+		  state = 'open', resolved_at = NULL,
+		  last_seen = GREATEST(agent_finding.last_seen, excluded.last_seen), updated_at = excluded.updated_at`,
+		w.WorkspaceID, w.ConnectorID, FindingHumanCredentials, rootFindingKey(w.ConnectorID),
+		string(subj), string(ev), last, last, now, now, r.Calls, r.Denied, r.Errors).Error
 }
 
 // aggregateModelCalls folds one region's records (both passes, deduplicated)
@@ -145,6 +377,11 @@ func aggregateModelCalls(
 		if !window.Counts(ev.EventTime) {
 			continue
 		}
+		// An event with no id cannot be deduplicated across the overlapping
+		// reads: it counts only after the previous mark, as before them.
+		if ev.EventID == "" && !window.Since.IsZero() && !ev.EventTime.After(window.Since) {
+			continue
+		}
 		switch {
 		case ev.IsModelCall():
 			d := delta(ev)
@@ -152,18 +389,25 @@ func aggregateModelCalls(
 				continue
 			}
 			d.ModelActivity = true
+			d.counted(ev.EventID, ev.EventTime)
 			u := &d.Usage
+			day := d.day(ev.EventTime)
 			switch {
 			case ev.ErrorCode == "":
 				u.Calls++
+				day.Calls++
 				if model := ev.RequestFacts[agentruntime.FactModelID]; model != "" {
 					u.Models = addModelCallCount(u.Models, model, 1)
+					day.Models = addModelCallCount(day.Models, model, 1)
 				}
 				u.Endpoints = addModelCallCount(u.Endpoints, ev.EventSource, 1)
+				d.LastSuccessAt = laterCall(d.LastSuccessAt, ev.EventTime)
 			case ev.AuthorizationDenied:
 				u.Denied++
+				day.Denied++
 			default:
 				u.Errors++
+				day.Errors++
 			}
 			if !streamingModelCalls[ev.EventName] {
 				u.Tokens += rec.Tokens
@@ -176,6 +420,7 @@ func aggregateModelCalls(
 			if rec.Tokens > 0 {
 				if d := delta(ev); d != nil {
 					d.Usage.Tokens += rec.Tokens
+					d.counted(ev.EventID, ev.EventTime)
 				}
 			}
 		case isModelCallSource(ev.EventSource):
@@ -184,12 +429,22 @@ func aggregateModelCalls(
 		case ev.IsAPICall() && ev.ErrorCode == "" && ev.EventSource != "":
 			if d := delta(ev); d != nil {
 				d.Usage.OtherServices = addModelCallCount(d.Usage.OtherServices, ev.EventSource, 1)
+				d.day(ev.EventTime).OtherServices = addModelCallCount(d.day(ev.EventTime).OtherServices, ev.EventSource, 1)
+				d.counted(ev.EventID, ev.EventTime)
 			}
 		}
 	}
 	for id, d := range out {
 		if !d.ModelActivity && len(d.Usage.OtherServices) == 0 && d.Usage.Tokens == 0 {
 			delete(out, id)
+			continue
+		}
+		// A day bucket created for a token-only completion record holds no
+		// counts; keep none of those.
+		for k, b := range d.Days {
+			if b.Calls == 0 && b.Errors == 0 && b.Denied == 0 && len(b.OtherServices) == 0 {
+				delete(d.Days, k)
+			}
 		}
 	}
 	return out
@@ -243,6 +498,36 @@ func mergeModelCallDoc(prev modelCallDoc, d *modelCallDelta, region string, cov 
 		if du.LastCallAt != nil {
 			u.LastCallAt = laterCall(u.LastCallAt, *du.LastCallAt)
 		}
+		if d.LastSuccessAt != nil {
+			doc.LastSuccessAt = laterCall(doc.LastSuccessAt, *d.LastSuccessAt)
+		}
+		if len(d.Days) > 0 {
+			if len(doc.Days) == 0 {
+				// Evidence written before day buckets existed keeps what the
+				// window can still claim of it (legacyDays).
+				doc.Days = doc.legacyDays(time.Now())
+			}
+			days := make(map[string]*modelCallDayBucket, len(doc.Days)+len(d.Days))
+			for k, b := range doc.Days {
+				c := *b
+				c.Models = mergeModelCallCounts(nil, b.Models)
+				c.OtherServices = mergeModelCallCounts(nil, b.OtherServices)
+				days[k] = &c
+			}
+			for k, b := range d.Days {
+				c := days[k]
+				if c == nil {
+					c = &modelCallDayBucket{}
+					days[k] = c
+				}
+				c.Calls += b.Calls
+				c.Errors += b.Errors
+				c.Denied += b.Denied
+				c.Models = mergeModelCallCounts(c.Models, b.Models)
+				c.OtherServices = mergeModelCallCounts(c.OtherServices, b.OtherServices)
+			}
+			doc.Days = days
+		}
 	}
 	if cov != nil && region != "" {
 		regions := make(map[string]trailCoverage, len(doc.Regions)+1)
@@ -263,7 +548,35 @@ func mergeModelCallDoc(prev modelCallDoc, d *modelCallDelta, region string, cov 
 		regions[region] = c
 		doc.Regions = regions
 	}
-	// The top-level coverage is what holds in EVERY region the row names.
+	doc.recomputeCoverage()
+	return doc
+}
+
+// pruneRegions drops the coverage of regions the connector no longer reads: a
+// deselected region's old window would otherwise freeze the top-level
+// coverage (the intersection over every region named) for good.
+func (doc *modelCallDoc) pruneRegions(current []string) {
+	if len(current) == 0 || len(doc.Regions) == 0 {
+		return
+	}
+	keep := make(map[string]bool, len(current))
+	for _, r := range current {
+		keep[r] = true
+	}
+	regions := make(map[string]trailCoverage, len(doc.Regions))
+	for r, c := range doc.Regions {
+		if keep[r] {
+			regions[r] = c
+		}
+	}
+	doc.Regions = regions
+	doc.recomputeCoverage()
+}
+
+// recomputeCoverage sets the top-level coverage: what holds in EVERY region
+// the document names.
+func (doc *modelCallDoc) recomputeCoverage() {
+	u := &doc.ModelCallUsage
 	u.CoveredFrom, u.CoveredTo, u.Partial = nil, nil, false
 	for _, c := range doc.Regions {
 		from, to := c.CoveredFrom, c.CoveredTo
@@ -280,10 +593,9 @@ func mergeModelCallDoc(prev modelCallDoc, d *modelCallDelta, region string, cov 
 		// them at once.
 		u.Partial = true
 	}
-	if liveCoveredByScan(doc) {
+	if liveCoveredByScan(*doc) {
 		u.LiveCalls, u.LiveDenied, u.LiveModels, u.LiveRegions = 0, 0, nil, nil
 	}
-	return doc
 }
 
 // modelCallDocFor is prev as the doc of the incarnation uniqueID: a doc that
@@ -332,6 +644,16 @@ func lockModelCallUsage(tx *gorm.DB, ws, connectorID uuid.UUID) error {
 
 // modelCallLastUsed is the row's last_used_at: the latest model call, exact
 // or seen live.
+// modelCallLastUsedAt is cloud_usage.last_used_at: the newest successful
+// model call the scan read, or a later call the event stream reported.
+func modelCallLastUsedAt(doc modelCallDoc) *time.Time {
+	u := doc.ModelCallUsage
+	if u.LiveLastCallAt == nil {
+		return doc.LastSuccessAt
+	}
+	return laterCall(doc.LastSuccessAt, *u.LiveLastCallAt)
+}
+
 func modelCallLastUsed(u agentruntime.ModelCallUsage) *time.Time {
 	if u.LiveLastCallAt == nil {
 		return u.LastCallAt
@@ -430,12 +752,109 @@ type modelCallWrite struct {
 	Reads  map[string]awsdiscovery.TrailWindowRead
 	Errors map[string]error
 	Deltas map[uuid.UUID]*modelCallDelta
+	// Root: the root user's model calls in this write (nil: none).
+	Root *rootModelCallDelta
+	// CurrentRegions are the connector's regions now; coverage recorded for
+	// any other region is dropped from the rows. Empty: nothing is dropped.
+	CurrentRegions []string
 }
 
 type modelCallUsageRow struct {
 	ID         uuid.UUID
 	IdentityID uuid.UUID
 	Attrs      []byte
+	// IdentityAttrs are the cloud_identity's attrs now: the incarnation the
+	// row's document must describe.
+	IdentityAttrs []byte
+}
+
+// SeenEvents returns the ids of the connector's events already counted whose
+// time is not before from: what an overlapping read must skip. Zero from
+// returns none (a first read overlaps nothing).
+func (st trailEvidenceStore) SeenEvents(ctx context.Context, ws, connectorID uuid.UUID, from time.Time) (map[string]bool, error) {
+	out := map[string]bool{}
+	if from.IsZero() {
+		return out, nil
+	}
+	var ids []string
+	err := tenancy.InWorkspaceRead(ctx, st.db, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT event_id FROM cloud_trail_seen_event
+		                WHERE workspace_id = ? AND connector_id = ? AND event_time >= ?`,
+			ws, connectorID, from).Scan(&ids).Error
+	})
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, err
+}
+
+// TrackedFrom is the time of the oldest counted event whose id is kept for
+// the connector (nil: none is). Events counted before id tracking existed
+// have no row.
+func (st trailEvidenceStore) TrackedFrom(ctx context.Context, ws, connectorID uuid.UUID) (*time.Time, error) {
+	var rows []struct{ T *time.Time }
+	err := tenancy.InWorkspaceRead(ctx, st.db, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT min(event_time) AS t FROM cloud_trail_seen_event
+		                WHERE workspace_id = ? AND connector_id = ?`, ws, connectorID).Scan(&rows).Error
+	})
+	if err != nil || len(rows) == 0 || rows[0].T == nil {
+		return nil, err
+	}
+	t := rows[0].T.UTC()
+	return &t, nil
+}
+
+// countFloored returns the read with its counting window raised to the floor
+// below which an event may already have been counted WITHOUT its id being
+// kept: events counted before id tracking existed (the code that wrote them
+// counted every event after the previous mark and kept no ids). Reads overlap
+// the previous mark by awsdiscovery.TrailLateLookback, but only over the
+// range ids are kept for:
+//
+//	no id kept for the connector yet      floor = the mark: count t > mark
+//	oldest kept id at time m              floor = clamp(m, mark-lookback, mark)
+//
+// Every event at or after m was counted, if at all, by code that kept its id,
+// so the id decides; an event before m may have been counted without one, so
+// it counts only after the mark. A first read (no mark) has nothing counted
+// before it. Only the counting copy is floored; the stored coverage is not.
+func countFloored(r awsdiscovery.TrailWindowRead, tracked *time.Time) awsdiscovery.TrailWindowRead {
+	if r.Since.IsZero() {
+		return r
+	}
+	floor := r.Since
+	if tracked != nil {
+		floor = *tracked
+		if floor.After(r.Since) {
+			floor = r.Since
+		}
+		if lo := r.Since.Add(-awsdiscovery.TrailLateLookback); floor.Before(lo) {
+			floor = lo
+		}
+	}
+	if from := floor.Add(time.Nanosecond); r.CoveredFrom.Before(from) {
+		r.CoveredFrom = from
+	}
+	return r
+}
+
+// unseenRecords drops the records whose event id was already counted.
+func unseenRecords(records []awsdiscovery.TrailRecord, seen map[string]bool) []awsdiscovery.TrailRecord {
+	if len(seen) == 0 {
+		return records
+	}
+	out := make([]awsdiscovery.TrailRecord, 0, len(records))
+	for _, rec := range records {
+		id := rec.Event.EventID
+		if id == "" {
+			id = rec.Trail.EventID
+		}
+		if id != "" && seen[id] {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out
 }
 
 // Record lands one region's evidence: every cloud_usage model-call row of the
@@ -446,6 +865,8 @@ type modelCallUsageRow struct {
 func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int, error) {
 	written := 0
 	cov, covOK := modelCallCoverage(w.Reads[awsdiscovery.TrailStreamGeneral], w.Reads[awsdiscovery.TrailStreamBedrock])
+	// TENANT-EXEMPT: the 147-149 schema check reads the Postgres catalog only.
+	rootFindings, _ := AgentRuntimeStatus(st.db)
 	err := tenancy.InWorkspace(ctx, st.db, w.WorkspaceID, func(tx *gorm.DB) error {
 		return repositories.RunFenced(tx, st.fence, func(tx *gorm.DB) error {
 			written = 0
@@ -475,9 +896,11 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 
 			// 2. Merge into the connector's existing rows.
 			var rows []modelCallUsageRow
-			if err := tx.Raw(`SELECT id, identity_id, attrs FROM cloud_usage
-			                   WHERE workspace_id = ? AND connector_id = ? AND source = ? AND service = ?
-			                   FOR UPDATE`, w.WorkspaceID, w.ConnectorID,
+			if err := tx.Raw(`SELECT u.id, u.identity_id, u.attrs, i.attrs AS identity_attrs
+			                    FROM cloud_usage u
+			                    LEFT JOIN cloud_identity i ON i.workspace_id = u.workspace_id AND i.id = u.identity_id
+			                   WHERE u.workspace_id = ? AND u.connector_id = ? AND u.source = ? AND u.service = ?
+			                   FOR UPDATE OF u`, w.WorkspaceID, w.ConnectorID,
 				agentruntime.UsageSource, agentruntime.UsageService).Scan(&rows).Error; err != nil {
 				return err
 			}
@@ -490,25 +913,48 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 			for _, row := range rows {
 				seen[row.IdentityID] = true
 				d := w.Deltas[row.IdentityID]
-				if d == nil && covp == nil {
-					continue
-				}
 				var prev modelCallDoc
 				if len(row.Attrs) > 0 {
 					if err := json.Unmarshal(row.Attrs, &prev); err != nil {
 						prev = modelCallDoc{} // unreadable: rebuilt from here
 					}
 				}
+				// The identity was recreated under the same ARN since the
+				// document was written: it describes another principal, so it
+				// starts afresh now, not at the next model call.
+				reset := false
+				current := ""
+				if len(row.IdentityAttrs) > 0 {
+					ci := models.CloudIdentity{Attrs: row.IdentityAttrs}
+					current = ci.AWSAttrs().UniqueID
+				}
+				if current != "" && prev.IdentityUniqueID != "" && prev.IdentityUniqueID != current {
+					prev, reset = modelCallDoc{}, true
+				}
+				if d == nil && covp == nil && !reset {
+					continue
+				}
 				doc := mergeModelCallDoc(prev, d, w.Region, covp)
+				if current != "" {
+					doc.IdentityUniqueID = current
+				}
+				doc.pruneRegions(w.CurrentRegions)
+				doc.pruneDays(now)
 				attrs, err := json.Marshal(doc)
 				if err != nil {
 					return err
 				}
+				// last_used_at is the newest SUCCESSFUL call: a refused or
+				// failed one never sets it. A reset clears the predecessor's.
+				lastUsed := "COALESCE(?, last_used_at)"
+				if reset {
+					lastUsed = "?"
+				}
 				if err := tx.Exec(`UPDATE cloud_usage
-				                      SET attrs = ?::jsonb, last_used_at = COALESCE(?, last_used_at), last_seen_generation = ?,
+				                      SET attrs = ?::jsonb, last_used_at = `+lastUsed+`, last_seen_generation = ?,
 				                          last_seen_at = ?, row_updated_at = ?
 				                    WHERE workspace_id = ? AND id = ?`,
-					string(attrs), modelCallLastUsed(doc.ModelCallUsage), w.Generation, now, now, w.WorkspaceID, row.ID).Error; err != nil {
+					string(attrs), modelCallLastUsedAt(doc), w.Generation, now, now, w.WorkspaceID, row.ID).Error; err != nil {
 					return err
 				}
 				written++
@@ -524,6 +970,7 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 			sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 			for _, id := range ids {
 				doc := mergeModelCallDoc(modelCallDoc{}, w.Deltas[id], w.Region, covp)
+				doc.pruneDays(now)
 				attrs, err := json.Marshal(doc)
 				if err != nil {
 					return err
@@ -538,10 +985,22 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 				                   VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)`,
 					uuid.New(), w.WorkspaceID, w.ConnectorID, id,
 					agentruntime.UsageService, agentruntime.UsageSource,
-					modelCallLastUsed(doc.ModelCallUsage), string(attrs), w.Generation, now, now, now).Error; err != nil {
+					modelCallLastUsedAt(doc), string(attrs), w.Generation, now, now, now).Error; err != nil {
 					return err
 				}
 				written++
+			}
+
+			// 3b. The events counted, so an overlapping read skips them; and
+			// the ids past their retention dropped.
+			if err := recordSeenEvents(tx, w, now); err != nil {
+				return err
+			}
+			// 3c. The root user's model calls (§5.2 step 4), once 148 is there.
+			if w.Root != nil && rootFindings {
+				if err := upsertRootFinding(tx, w, now); err != nil {
+					return err
+				}
 			}
 
 			// 4. Move the settled streams' marks; record a failed attempt.
@@ -587,6 +1046,55 @@ func (st trailEvidenceStore) Record(ctx context.Context, w modelCallWrite) (int,
 		return 0, err
 	}
 	return written, nil
+}
+
+// recordSeenEvents stores the ids of every event the write counted that is
+// still inside the retention, and deletes the connector's older ones.
+func recordSeenEvents(tx *gorm.DB, w modelCallWrite, now time.Time) error {
+	keep := now.Add(-seenEventRetention)
+	ids := make([]string, 0)
+	times := map[string]time.Time{}
+	sets := make([]map[string]time.Time, 0, len(w.Deltas)+1)
+	for _, d := range w.Deltas {
+		sets = append(sets, d.EventIDs)
+	}
+	if w.Root != nil {
+		sets = append(sets, w.Root.EventIDs)
+	}
+	for _, set := range sets {
+		for id, at := range set {
+			if at.Before(keep) {
+				continue
+			}
+			if _, dup := times[id]; !dup {
+				ids = append(ids, id)
+			}
+			times[id] = at
+		}
+	}
+	sort.Strings(ids)
+	for start := 0; start < len(ids); start += 500 {
+		end := start + 500
+		if end > len(ids) {
+			end = len(ids)
+		}
+		args := make([]any, 0, (end-start)*5)
+		values := ""
+		for i, id := range ids[start:end] {
+			if i > 0 {
+				values += ","
+			}
+			values += "(?, ?, ?, ?, ?)"
+			args = append(args, w.WorkspaceID, w.ConnectorID, id, times[id], now)
+		}
+		if err := tx.Exec(`INSERT INTO cloud_trail_seen_event (workspace_id, connector_id, event_id, event_time, seen_at)
+		                   VALUES `+values+` ON CONFLICT DO NOTHING`, args...).Error; err != nil {
+			return err
+		}
+	}
+	return tx.Exec(`DELETE FROM cloud_trail_seen_event
+	                 WHERE workspace_id = ? AND connector_id = ? AND event_time < ?`,
+		w.WorkspaceID, w.ConnectorID, keep).Error
 }
 
 func truncateTrailError(s string) string {

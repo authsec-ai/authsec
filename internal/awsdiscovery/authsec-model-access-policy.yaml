@@ -2,18 +2,26 @@ AWSTemplateFormatVersion: '2010-09-09'
 
 Description: >-
   AuthSec tag-gated model access (deny mode, without AWS Organizations) - an
-  AuthSec-owned IAM policy under /authsec/ that, attached to the roles you
-  choose, refuses their Bedrock model calls unless the role (or its session)
-  carries the authsec:agent tag, and refuses those roles setting or removing
-  that tag. Run the audit mode first: this one breaks every chosen role that
-  calls a model without the tag.
+  AuthSec-owned IAM policy under /authsec-gate/ that, attached to the roles
+  you choose, refuses their Bedrock model calls unless the role (or its
+  session) carries a non-empty authsec:agent tag, and refuses those roles
+  setting or removing that tag. Run the audit mode first: this one breaks
+  every chosen role that calls a model without the tag.
 
 # What it does (SPEC-agent-runtime-visibility.md section 5.4 as amended in
 # section 10): the same statements as the SCP form, as an identity policy.
 # It is a DENY POLICY attached to roles, never a permissions boundary: a role
 # has one boundary and AuthSec access policies already write AuthSec
-# boundaries. The AuthSec enforcement role (template v2) may attach and
-# detach it, because it lives under /authsec/.
+# boundaries.
+#
+# PATH /authsec-gate/, deliberately NOT /authsec/: the AuthSec enforcement
+# role (templates v1 and v2) may create, version, delete, attach and detach
+# every policy under /authsec/ (ManageAuthSecPolicies,
+# AttachOnlyAuthSecPolicies). Under /authsec-gate/ it can neither rewrite this
+# gate nor detach it from a role. AuthSec never attaches it; this stack does
+# (Roles). A stack first deployed with Path /authsec/ replaces the policy on
+# update (CloudFormation creates the new one, attaches it, then deletes the
+# old one).
 #
 # Weaker than the SCP form, stated plainly:
 #   - it covers only the roles it is attached to; a role it is not attached
@@ -23,7 +31,40 @@ Description: >-
 #     iam:TagRole for authsec:agent in your administrators' policies, or use
 #     the SCP form. AdminPrincipalArns matters only if an administrator role
 #     is itself gated.
-#   - bedrock-mantle's IAM action prefix is UNVERIFIED (bedrock-mantle:*).
+#   - it CANNOT stop session tags set by whoever ASSUMES a gated role: the
+#     assumer's sts:AssumeRole / sts:TagSession is authorized by the
+#     assumer's own policies and the gated role's TRUST policy, never by a
+#     policy attached to the gated role. A caller allowed to assume a gated
+#     role and to tag the session authsec:agent passes the gate. Check every
+#     gated role's trust policy: it must not allow sts:TagSession, or must
+#     allow it only with an aws:TagKeys condition that excludes authsec:agent
+#     (AuthSec does not check this for you). The SCP form (in-organization
+#     callers) plus the RCP form (any caller, including SAML and OIDC
+#     identity providers) close this.
+#
+# Actions, checked against the IAM service reference
+# (servicereference.us-east-1.amazonaws.com/v1/<svc>/<svc>.json, 2026-11-05):
+#   - bedrock:InvokeModel* covers InvokeModel and
+#     InvokeModelWithResponseStream; Converse, ConverseStream and
+#     StartAsyncInvoke are authorized as these (the reference lists no
+#     separate Converse or StartAsyncInvoke action; InvokeModel's resources
+#     include async-invoke). bedrock:Converse* matches nothing today and is
+#     kept in case AWS adds separate actions.
+#   - bedrock:CreateModelInvocationJob (batch inference), InvokeAgent,
+#     InvokeInlineAgent, RetrieveAndGenerate, InvokeFlow: confirmed.
+#   - bedrock-agentcore:InvokeAgentRuntime* covers InvokeAgentRuntime and its
+#     ForUser, WithWebSocketStream(ForUser), Command and CommandShell
+#     variants: confirmed.
+#   - bedrock-mantle:CreateInference: the prefix and action are confirmed;
+#     that every mantle inference API (chat completions, responses,
+#     messages) is authorized as CreateInference is UNVERIFIED (it is the
+#     only inference-creating action listed) -- confirm with a lab call.
+#
+# Bedrock's own service roles: a Bedrock agent, knowledge base, flow, batch
+# inference job or AgentCore runtime calls the model AS a role of yours that
+# Bedrock assumes. It is not an AWS service principal, so if you attach this
+# policy to such a role it is refused like any other: tag it authsec:agent
+# too, or do not attach the gate to it.
 
 Metadata:
   AuthSec:
@@ -42,7 +83,7 @@ Parameters:
     Type: CommaDelimitedList
     Description: >-
       ARNs (wildcards allowed) of the principals that may set or remove the
-      authsec:agent tag even when gated.
+      authsec:agent tag, and detach or change this policy, even when gated.
 
   PolicySuffix:
     Type: String
@@ -56,26 +97,49 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: !Sub 'AuthSecModelAccessGate-${PolicySuffix}'
-      Path: /authsec/
+      Path: /authsec-gate/
       Description: AuthSec tag-gated model access - refuses model calls by attached roles without the authsec:agent tag
       Roles: !Ref RoleNames
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
+          # No authsec:agent tag on the principal (role, user or session).
           - Sid: DenyUntaggedModelCalls
             Effect: Deny
             Action:
               - bedrock:InvokeModel*
               - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
               - bedrock:InvokeAgent
               - bedrock:InvokeInlineAgent
               - bedrock:RetrieveAndGenerate*
               - bedrock:InvokeFlow
-              - bedrock-mantle:*
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
             Resource: '*'
             Condition:
               'Null':
                 aws:PrincipalTag/authsec:agent: 'true'
+          # The tag is present but empty: 'Null' alone would let it pass.
+          # (Same actions as above; CloudFormation allows no YAML aliases.)
+          # StringEquals is false when the key is absent, so this statement
+          # matches only an empty value (the one above matches absence).
+          - Sid: DenyEmptyAgentTagModelCalls
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel*
+              - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
+              - bedrock:InvokeAgent
+              - bedrock:InvokeInlineAgent
+              - bedrock:RetrieveAndGenerate*
+              - bedrock:InvokeFlow
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalTag/authsec:agent: ''
           - Sid: DenyAgentTagByKey
             Effect: Deny
             Action:
@@ -107,6 +171,28 @@ Resources:
             Condition:
               'Null':
                 aws:RequestTag/authsec:agent: 'false'
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+          # A gated role with IAM rights must not lift its own gate.
+          - Sid: DenyGateDetach
+            Effect: Deny
+            Action:
+              - iam:DetachRolePolicy
+            Resource: '*'
+            Condition:
+              ArnLike:
+                iam:PolicyARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec-gate/*'
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+          - Sid: DenyGateRewrite
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:DeletePolicy
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec-gate/*'
+            Condition:
               ArnNotLike:
                 aws:PrincipalArn: !Ref AdminPrincipalArns
 

@@ -20,8 +20,12 @@ import (
 // RecentEvents reads a fixed 48 hours. A connector scanned weekly therefore
 // never saw five of its seven days. ReadWindow reads instead from the previous
 // read's high-water mark (the caller keeps it, per connector, region and
-// stream: cloud_trail_cursor), bounded by the 90 days LookupEvents can look
-// back; a first read covers the full 90 days up to its page cap.
+// stream: cloud_trail_cursor) less TrailLateLookback, bounded by the 90 days
+// LookupEvents can look back; a first read covers the full 90 days up to its
+// page cap. The overlap re-reads events already counted: the caller dedupes
+// them by event id (cloud_trail_seen_event), so an event delivered late -- up
+// to the lookback after the mark passed it -- is counted once, and never
+// twice.
 //
 // What a read may CLAIM is narrower than what it read:
 //
@@ -29,7 +33,9 @@ import (
 //     to LookupEvents minutes after they happen, so an interval that ended a
 //     moment ago is not yet whole. Events after read_to are returned (and the
 //     caller records them as evidence, idempotently by event id) but are not
-//     counted until a later read settles them.
+//     counted until a later read settles them. An event delivered later than
+//     the delay is still counted if it lands within TrailLateLookback of the
+//     mark; one later than that is lost (CloudTrail documents no upper bound).
 //   - LookupEvents returns the newest events first. A read that stops at its
 //     page cap has covered [covered_from, read_to] and NOT [window_from,
 //     covered_from): Partial, with covered_from saying how far back it got.
@@ -62,9 +68,12 @@ const (
 	trailLookbackMargin = 5 * time.Minute
 	// TrailIngestDelay is how long after an event's time a read waits before
 	// claiming the interval holding it. CloudTrail documents delivery "within
-	// 15 minutes of an API call" on average; events later than that are read
-	// on the next scan, never lost (the next read starts at read_to).
+	// 15 minutes of an API call" on AVERAGE: it is not a bound.
 	TrailIngestDelay = 15 * time.Minute
+	// TrailLateLookback is how far before the previous mark a read starts
+	// again, to catch events delivered after the mark passed them. Events
+	// delivered later than mark + this are not counted.
+	TrailLateLookback = time.Hour
 	// maxBedrockTrailPages is the focused pass's own page cap: 10,000 Bedrock
 	// management events per region per scan.
 	maxBedrockTrailPages = 200
@@ -97,8 +106,9 @@ type TrailWindowRead struct {
 	LookupFrom, LookupTo time.Time
 	// Since is the request's high-water mark (zero on a first read).
 	Since time.Time
-	// WindowFrom is where this read's claim starts: Since, or the 90-day
-	// limit when Since is zero or older than it.
+	// WindowFrom is where this read's claim starts: Since less
+	// TrailLateLookback, or the 90-day limit when that is earlier or Since is
+	// zero.
 	WindowFrom time.Time
 	// CoveredFrom is how far back the read actually reached inside the
 	// window: WindowFrom unless the page cap stopped it first.
@@ -117,14 +127,13 @@ type TrailWindowRead struct {
 	Settled bool
 }
 
-// Counts reports whether an event at t lies in what this read settled: after
-// the previous mark, inside the covered part of the window, not after
-// ReadTo. Exactly the events a cumulative aggregate may add once.
+// Counts reports whether an event at t lies in what this read settled: inside
+// the covered part of the window (which starts TrailLateLookback before the
+// previous mark), not after ReadTo. Events between WindowFrom and Since were
+// probably counted by an earlier read: the caller skips the ones it has seen
+// (by event id) and counts the rest once.
 func (r TrailWindowRead) Counts(t time.Time) bool {
 	if !r.Settled || t.IsZero() {
-		return false
-	}
-	if !r.Since.IsZero() && !t.After(r.Since) {
 		return false
 	}
 	return !t.Before(r.CoveredFrom) && !t.After(r.ReadTo)
@@ -184,11 +193,18 @@ func (r *CloudTrailReader) ReadWindow(ctx context.Context, req TrailWindowReques
 	case read.Since.Before(limit):
 		read.WindowFrom, read.Lapsed = limit, true
 	default:
-		read.WindowFrom = read.Since
+		read.WindowFrom = read.Since.Add(-TrailLateLookback)
+		if read.WindowFrom.Before(limit) {
+			read.WindowFrom = limit
+		}
 	}
 	read.ReadTo = now.Add(-TrailIngestDelay).Truncate(time.Second)
 	if read.ReadTo.Before(read.WindowFrom) {
 		read.ReadTo = read.WindowFrom
+	}
+	// The mark never moves back, though the window now starts before it.
+	if !read.Since.IsZero() && read.ReadTo.Before(read.Since) && !read.Lapsed {
+		read.ReadTo = read.Since
 	}
 
 	in := &cloudtrail.LookupEventsInput{}

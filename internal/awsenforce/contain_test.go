@@ -71,10 +71,20 @@ func TestWorkloadContainmentProbe(t *testing.T) {
 	if r := workloadContainmentProbe(context.Background(), withParam, in, "run1", at); r.Status != StatusOK {
 		t.Fatalf("with the parameter: %+v", r)
 	}
-	for _, c := range withParam.calls {
-		if c == "RegisterScalableTarget" || c == "DeleteFunctionConcurrency" {
-			t.Errorf("the probe must not call %s", c)
+	// Release's writes are probed too: a stack that can contain but not
+	// release must not report the capability.
+	for _, want := range []string{"DeleteFunctionConcurrency", "RegisterScalableTarget", "DetachUserPolicy", "DescribeServices"} {
+		found := false
+		for _, c := range withParam.calls {
+			found = found || c == want
 		}
+		if !found {
+			t.Errorf("the probe must call %s", want)
+		}
+	}
+	noRelease := &probeFake{answer: map[string]error{"DeleteFunctionConcurrency": apiErr("AccessDeniedException")}}
+	if r := workloadContainmentProbe(context.Background(), noRelease, in, "run1", at); r.Status != StatusDenied {
+		t.Fatalf("release permission missing: %+v", r)
 	}
 
 	without := &probeFake{answer: map[string]error{

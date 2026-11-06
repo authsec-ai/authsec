@@ -138,8 +138,14 @@ func (ctl *AgentRuntimeIngestController) IngestAWSEvents(c *gin.Context) {
 
 /* --------------------------------- admin ---------------------------------- */
 
-// eventStreamTarget resolves the token's workspace and the route's connector.
-func eventStreamTarget(c *gin.Context) (uuid.UUID, uuid.UUID, string, bool) {
+// eventStreamTarget resolves the token's workspace and the route's connector,
+// after the stream's schema verified (503 with the reason until then).
+func (ctl *AgentRuntimeIngestController) eventStreamTarget(c *gin.Context) (uuid.UUID, uuid.UUID, string, bool) {
+	if ok, reason := ctl.svc.Available(); !ok {
+		awsP2Error(c, http.StatusServiceUnavailable, services.GovCodeAgentRuntimeUnavailable,
+			"Agent runtime visibility is not available on this server.", gin.H{"reason": reason})
+		return uuid.Nil, uuid.Nil, "", false
+	}
 	ws, actor, err := workspaceAndActorFrom(c)
 	if err != nil {
 		awsP2Error(c, http.StatusUnauthorized, "unauthenticated", err.Error(), nil)
@@ -181,7 +187,7 @@ type postEventStreamBody struct {
 // the stream on, or rotates its secret. The secret is in this response and
 // nowhere else, ever.
 func (ctl *AgentRuntimeIngestController) CreateEventStream(c *gin.Context) {
-	ws, id, actor, ok := eventStreamTarget(c)
+	ws, id, actor, ok := ctl.eventStreamTarget(c)
 	if !ok {
 		return
 	}
@@ -248,7 +254,7 @@ func eventStreamCreatedBody(view services.AgentEventStreamView, secret string, r
 // GetEventStream handles GET .../aws/connectors/:id/event-stream: the
 // stream's state, counters and whether it is silent (and since when).
 func (ctl *AgentRuntimeIngestController) GetEventStream(c *gin.Context) {
-	ws, id, _, ok := eventStreamTarget(c)
+	ws, id, _, ok := ctl.eventStreamTarget(c)
 	if !ok {
 		return
 	}
@@ -263,7 +269,7 @@ func (ctl *AgentRuntimeIngestController) GetEventStream(c *gin.Context) {
 // RevokeEventStream handles DELETE .../aws/connectors/:id/event-stream: the
 // secret is refused from now on. The row and its counters stay.
 func (ctl *AgentRuntimeIngestController) RevokeEventStream(c *gin.Context) {
-	ws, id, _, ok := eventStreamTarget(c)
+	ws, id, _, ok := ctl.eventStreamTarget(c)
 	if !ok {
 		return
 	}
@@ -281,7 +287,7 @@ func (ctl *AgentRuntimeIngestController) RevokeEventStream(c *gin.Context) {
 // the connector's parameters, with the secret as a placeholder.
 // ?format=yaml returns the template file itself.
 func (ctl *AgentRuntimeIngestController) GetEventStreamTemplate(c *gin.Context) {
-	ws, id, _, ok := eventStreamTarget(c)
+	ws, id, _, ok := ctl.eventStreamTarget(c)
 	if !ok {
 		return
 	}
@@ -300,7 +306,7 @@ func (ctl *AgentRuntimeIngestController) GetEventStreamTemplate(c *gin.Context) 
 }
 
 // GetModelAccessTemplate handles GET /authsec/discovery/aws/templates/model-access
-// ?mode=audit|deny&form=scp|policy (default audit, scp). Deny mode returns a
+// ?mode=audit|deny&form=scp|policy|rcp (default audit, scp). Deny mode returns a
 // CloudFormation template (?format=yaml: the file); audit mode returns the
 // audit document and denies nothing.
 func (ctl *AgentRuntimeIngestController) GetModelAccessTemplate(c *gin.Context) {

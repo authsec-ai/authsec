@@ -1112,7 +1112,16 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractReq("policy", contractPolicyCapabilities),
 	// Agent runtime visibility P3 (SPEC-agent-runtime-visibility.md §10 Q4).
 	contractOpt("agent_containment", contractAgentContainCapabilities),
+	// Agent runtime visibility: alerts (150) and the runtime routes (147-149, 153).
+	contractOpt("agent_alerts", contractAgentSchemaCapabilities),
+	contractOpt("agent_runtime", contractAgentSchemaCapabilities),
 )))
+
+// The /capabilities agent_alerts and agent_runtime blocks: available, and the
+// reason when not.
+var contractAgentSchemaCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+)
 
 // The /capabilities agent_containment block: the server's state and, per AWS
 // account, the identity/model levels and the workload level

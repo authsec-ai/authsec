@@ -374,7 +374,7 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	var done *igagraph.AlreadyPublished
 	if errors.As(err, &done) {
 		s.evaluate(ctx, job, version, done.Rev)
-		return true, s.completeAndRelease(ctx, job, version)
+		return true, s.completeAndInfer(ctx, job, version)
 	}
 	if errors.Is(err, igagraph.ErrSuperseded) {
 		return true, s.abandonAndRelease(ctx, job, version, "superseded by a newer publication")
@@ -386,7 +386,19 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	// finding evaluation (§8.2). Collection cannot run, so every connector's
 	// cloud_usage rows are still its manifest run's.
 	s.evaluate(ctx, job, version, rev)
-	return true, s.completeAndRelease(ctx, job, version)
+	return true, s.completeAndInfer(ctx, job, version)
+}
+
+// completeAndInfer completes the job and, once it has, runs agent-runtime
+// inference for the connector it projected: the graph (iga_workload) it reads
+// is this run's only now. It never fails or panics the projection
+// (RunAgentInferenceAfterScan logs); a job that did not complete runs nothing.
+func (s *ProjectionService) completeAndInfer(ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64) error {
+	if err := s.completeAndRelease(ctx, job, barrierVersion); err != nil {
+		return err
+	}
+	RunAgentInferenceAfterScan(ctx, s.db, job.WorkspaceID, job.ConnectorID)
+	return nil
 }
 
 // holdBarrier returns the barrier version when the barrier is projecting this

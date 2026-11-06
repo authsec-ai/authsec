@@ -21,10 +21,13 @@ import (
 //	iam:ListAccessKeys, iam:UpdateAccessKey
 //	iam:AttachUserPolicy, iam:DetachUserPolicy (only an /authsec/ policy ARN)
 //
-// each denied on resources tagged authsec:protected=true. UNVERIFIED (lab):
-// whether Lambda and ECS evaluate aws:ResourceTag on these actions, and
-// whether Application Auto Scaling's tag condition reads the ECS service's
-// tags (it reads the scalable target's own).
+// each denied on resources tagged authsec:protected=true (RegisterScalableTarget
+// is limited to ECS desired-count targets in the account). The service
+// reference lists aws:ResourceTag on the Lambda function, ECS service,
+// scalable target and IAM user resources; that each service enforces it on
+// these calls is UNVERIFIED (lab). Application Auto Scaling reads the scalable
+// target's own tags, not the ECS service's, so AuthSec also refuses a
+// protected service or function itself in the preview (agentcontain.Protected).
 //
 // The capability workload_containment is proven by the self-test like
 // split_role_lifecycle proves EnableLambdaSplit: calls against objects that
@@ -123,25 +126,50 @@ func workloadContainmentProbe(ctx context.Context, c IAM, in SelfTestInput, runI
 	cluster := "arn:" + partition + ":ecs:" + region + ":" + in.AccountID + ":cluster/" + name
 	service := "arn:" + partition + ":ecs:" + region + ":" + in.AccountID + ":service/" + name + "/" + name
 	policy := "arn:" + partition + ":iam::" + in.AccountID + ":policy" + SelfTestPolicyPath + name
+	// Every write containment makes AND every write its release makes is
+	// probed: a stack that can contain but not release must not report
+	// workload containment available (the contained workload could not be
+	// restored).
 	probes := []struct {
 		op   string
 		call func() error
+		// ok are error codes that prove the call was authorised (the
+		// request was then validated and rejected, nothing changed).
+		ok []string
 	}{
-		{"lambda:GetFunctionConcurrency", func() error { _, err := wc.GetFunctionConcurrency(ctx, fn); return err }},
-		{"lambda:PutFunctionConcurrency", func() error { return wc.PutFunctionConcurrency(ctx, fn, 0) }},
-		{"ecs:UpdateService", func() error { return wc.UpdateECSServiceDesiredCount(ctx, cluster, service, 0) }},
+		{"lambda:GetFunctionConcurrency", func() error { _, err := wc.GetFunctionConcurrency(ctx, fn); return err }, nil},
+		{"lambda:PutFunctionConcurrency", func() error { return wc.PutFunctionConcurrency(ctx, fn, 0) }, nil},
+		{"lambda:DeleteFunctionConcurrency", func() error { return wc.DeleteFunctionConcurrency(ctx, fn) }, nil},
+		{"ecs:DescribeServices", func() error { _, err := wc.DescribeECSService(ctx, cluster, service); return err }, nil},
+		{"ecs:UpdateService", func() error { return wc.UpdateECSServiceDesiredCount(ctx, cluster, service, 0) }, nil},
 		{"application-autoscaling:DescribeScalableTargets", func() error {
 			_, err := wc.DescribeECSScalableTarget(ctx, region, "service/"+name+"/"+name)
 			return err
-		}},
-		{"iam:ListAccessKeys", func() error { _, err := wc.ListAccessKeys(ctx, name); return err }},
-		{"iam:UpdateAccessKey", func() error { return wc.UpdateAccessKey(ctx, name, "AKIAAUTHSECSELFTEST0", false) }},
-		{"iam:AttachUserPolicy", func() error { return wc.AttachUserPolicy(ctx, name, policy) }},
+		}, nil},
+		// Release re-registers the scalable target with its recorded
+		// suspended state. On a target that does not exist the request
+		// carries no min/max capacity, so AWS can only validate and refuse
+		// it (it never creates one): ValidationException after the
+		// authorisation proves the permission.
+		{"application-autoscaling:RegisterScalableTarget", func() error {
+			return wc.SetECSScalingSuspended(ctx, region, "service/"+name+"/"+name, false, false, false)
+		}, []string{"ValidationException"}},
+		{"iam:ListAccessKeys", func() error { _, err := wc.ListAccessKeys(ctx, name); return err }, nil},
+		{"iam:UpdateAccessKey", func() error { return wc.UpdateAccessKey(ctx, name, "AKIAAUTHSECSELFTEST0", false) }, nil},
+		{"iam:AttachUserPolicy", func() error { return wc.AttachUserPolicy(ctx, name, policy) }, nil},
+		{"iam:DetachUserPolicy", func() error { return wc.DetachUserPolicy(ctx, name, policy) }, nil},
 	}
 	for _, p := range probes {
 		err := p.call()
+		permitted := false
+		if err != nil {
+			code := ErrorCode(err)
+			for _, c := range p.ok {
+				permitted = permitted || code == c
+			}
+		}
 		switch {
-		case err == nil || IsNotFound(err):
+		case err == nil || IsNotFound(err) || permitted:
 			continue
 		case IsAccessDenied(err):
 			r := classify(err, at())

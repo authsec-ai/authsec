@@ -33,9 +33,13 @@ import (
 type AgentContainAccess interface {
 	// Open is the engine's AWS for one run in the connector's account.
 	Open(ctx context.Context, ws, connectorID, runID uuid.UUID) (agentcontain.AWS, error)
-	// ECSServicesOf lists the ECS services in region whose task definition
-	// is of family (discovery role).
-	ECSServicesOf(ctx context.Context, ws, connectorID uuid.UUID, region, family string) ([]agentcontain.ECSService, error)
+	// ECSServicesOf lists the ECS services in region running exactly the
+	// task definition revision taskDefARN (discovery role): discovery stores
+	// each revision as its own workload with its own task role, so a service
+	// on another revision is not this workload.
+	ECSServicesOf(ctx context.Context, ws, connectorID uuid.UUID, region, taskDefARN string) ([]agentcontain.ECSService, error)
+	// FunctionTags reads a Lambda function's tags live (discovery role).
+	FunctionTags(ctx context.Context, ws, connectorID uuid.UUID, functionARN string) (map[string]string, error)
 	// EventSourceMappings counts a function's event source mappings
 	// (discovery role).
 	EventSourceMappings(ctx context.Context, ws, connectorID uuid.UUID, functionARN string) (int, error)
@@ -112,7 +116,7 @@ func (l liveContainAccess) discoveryConfig(ctx context.Context, ws, connectorID 
 	return cfg, err
 }
 
-func (l liveContainAccess) ECSServicesOf(ctx context.Context, ws, connectorID uuid.UUID, region, family string) ([]agentcontain.ECSService, error) {
+func (l liveContainAccess) ECSServicesOf(ctx context.Context, ws, connectorID uuid.UUID, region, taskDefARN string) ([]agentcontain.ECSService, error) {
 	cfg, err := l.discoveryConfig(ctx, ws, connectorID, region)
 	if err != nil {
 		return nil, err
@@ -150,7 +154,7 @@ func (l liveContainAccess) ECSServicesOf(ctx context.Context, ws, connectorID uu
 			}
 			for _, s := range d.Services {
 				td := aws.ToString(s.TaskDefinition)
-				if agentcontain.TaskDefinitionFamily(td) != family || aws.ToString(s.Status) == "INACTIVE" {
+				if td != taskDefARN || aws.ToString(s.Status) == "INACTIVE" {
 					continue
 				}
 				tags := map[string]string{}
@@ -163,6 +167,33 @@ func (l liveContainAccess) ECSServicesOf(ctx context.Context, ws, connectorID uu
 		}
 	}
 	return out, nil
+}
+
+func (l liveContainAccess) FunctionTags(ctx context.Context, ws, connectorID uuid.UUID, functionARN string) (map[string]string, error) {
+	region := agentcontain.LambdaRegion(functionARN)
+	if region == "" {
+		return nil, fmt.Errorf("%q is not a Lambda function ARN", functionARN)
+	}
+	cfg, err := l.discoveryConfig(ctx, ws, connectorID, region)
+	if err != nil {
+		return nil, err
+	}
+	// lambda:ListTags, not GetFunction: the discovery role's SecurityAudit
+	// baseline grants lambda:List* but not GetFunction. ListTags takes the
+	// unqualified function ARN (a version or alias suffix is dropped).
+	unqualified := functionARN
+	if parts := strings.Split(functionARN, ":"); len(parts) > 7 {
+		unqualified = strings.Join(parts[:7], ":")
+	}
+	out, err := lambda.NewFromConfig(cfg).ListTags(ctx, &lambda.ListTagsInput{Resource: aws.String(unqualified)})
+	if err != nil {
+		return nil, fmt.Errorf("lambda:ListTags: %w", err)
+	}
+	tags := map[string]string{}
+	for k, v := range out.Tags {
+		tags[k] = v
+	}
+	return tags, nil
 }
 
 func (l liveContainAccess) EventSourceMappings(ctx context.Context, ws, connectorID uuid.UUID, functionARN string) (int, error) {

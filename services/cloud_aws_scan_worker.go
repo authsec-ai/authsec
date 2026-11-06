@@ -421,7 +421,13 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	written, skipped := evidence.Counts()
 	log.Printf("aws scan run %s published: evidence %d new, %d unchanged",
 		run.ID, written, skipped)
-	RunAgentInferenceAfterScan(ctx, w.db, run.WorkspaceID, run.ConnectorID) // agent runtime (logs, never fails the scan)
+	// Agent-runtime inference is NOT run here. It reads the graph
+	// (iga_workload) to label workloads and key suggestions, and the graph of
+	// this run does not exist until its projection job completes: running it
+	// now read the PREVIOUS scan's graph, so a new workload stayed
+	// "not_projected" for a whole scan interval. The projection service runs it
+	// when the job completes (ProjectionService.completeAndInfer). Without the
+	// graph schema (no pipeline) there is nothing for it to read.
 	return nil
 }
 

@@ -45,8 +45,10 @@ var arTelemetrySources = map[string]bool{
 }
 
 // actedElsewhere is the other-services evidence that counts for the rule:
-// successful calls by the identity, in the same windows, to services that are
-// neither a model endpoint nor its own telemetry.
+// successful calls by the identity to services that are neither a model
+// endpoint nor its own telemetry. The caller passes the windowed usage
+// (arUsage.windowed), so these are the calls of the same
+// AgentRuntimeWindowDays days as the model calls (§5.3 "in the same window").
 func actedElsewhere(u agentruntime.ModelCallUsage) map[string]int {
 	out := map[string]int{}
 	for src, n := range u.OtherServices {
@@ -68,10 +70,13 @@ const (
 )
 
 // suggestEligible applies rule aws_agent_suggest_v1 to one AI workload: model
-// calls (or refusals) by its identity, exactly one workload on that identity
-// (§10 Q1: never on a shared role), that workload in the graph and still
-// unclassified, and the identity also acting on other services in the same
-// windows. Names, env vars and secrets are supporting evidence only.
+// calls (or refusals) by its identity inside the evaluation window, exactly
+// one principal on that identity (candidates counts its workloads, its EKS
+// service accounts and any other assumer: §10 Q1, never on a shared role),
+// that workload in the graph and still unclassified, and the identity also
+// acting on other services inside the same window. u is the WINDOWED usage
+// (arUsage.windowed), never the all-time totals. Names, env vars and secrets
+// are supporting evidence only.
 func suggestEligible(u agentruntime.ModelCallUsage, one *arWorkload, candidates int) (bool, string) {
 	switch {
 	case !isAIWorkload(u):
@@ -175,7 +180,7 @@ func SecretNameFromARN(arn string) string {
 // rows it rests on (cloud_usage, cloud_observation) and the summary numbers,
 // never a secret value or a request body.
 func suggestionEvidence(ai *AIWorkload, one *arWorkload, secrets []modelKeySecret, observations []uuid.UUID) json.RawMessage {
-	u := ai.usageR.usage
+	u := ai.win
 	attrs := models.CloudWorkload{Attrs: one.Attrs}
 	readable := []map[string]string{}
 	for _, s := range secrets {
@@ -183,7 +188,8 @@ func suggestionEvidence(ai *AIWorkload, one *arWorkload, secrets []modelKeySecre
 	}
 	ev := map[string]any{
 		"rule": AgentSuggestRule, "rule_version": AgentSuggestRuleVersion,
-		"window": map[string]any{"from": u.CoveredFrom, "to": u.CoveredTo, "partial": u.Partial},
+		"window": map[string]any{"from": u.CoveredFrom, "to": u.CoveredTo, "partial": u.Partial,
+			"days": AgentRuntimeWindowDays},
 		"model_calls": map[string]any{
 			"calls": u.Calls, "denied": u.Denied, "errors": u.Errors, "tokens": u.Tokens,
 			"models": arNonNil(u.Models), "endpoints": arNonNil(u.Endpoints),
@@ -236,8 +242,12 @@ func cloudTrailObservations(tx *gorm.DB, ws, identityID uuid.UUID) ([]uuid.UUID,
 func (s *AgentRuntimeService) applySuggestions(tx *gorm.DB, ws, connectorID uuid.UUID, st *agentRuntimeState,
 	ais []*AIWorkload, secrets *modelKeySecrets, now time.Time, res *AgentInferenceResult) error {
 	shared := map[uuid.UUID]bool{}
+	byWorkload := map[uuid.UUID]*AIWorkload{}
 	for _, ai := range ais {
-		if ai.SharedRole {
+		if one := ai.single(); one != nil && one.GraphID != nil {
+			byWorkload[*one.GraphID] = ai
+		}
+		if ai.SharedRole || ai.others {
 			for _, w := range ai.wls {
 				if w.GraphID != nil {
 					shared[*w.GraphID] = true
@@ -246,7 +256,7 @@ func (s *AgentRuntimeService) applySuggestions(tx *gorm.DB, ws, connectorID uuid
 			continue
 		}
 		one := ai.single()
-		if ok, _ := suggestEligible(ai.usageR.usage, one, len(ai.wls)+len(ai.K8sServiceAccounts)); !ok {
+		if ok, _ := suggestEligible(ai.win, one, ai.candidates()); !ok {
 			continue
 		}
 		obs, err := cloudTrailObservations(tx, ws, ai.Identity.ID)
@@ -273,14 +283,15 @@ func (s *AgentRuntimeService) applySuggestions(tx *gorm.DB, ws, connectorID uuid
 				string(ev), connectorID, ai.Identity.ID, AgentSuggestRuleVersion, now, ws, existing.ID).Error; err != nil {
 				return fmt.Errorf("refresh suggestion: %w", err)
 			}
-		case existing.State == SuggestionSuperseded && existing.Reason == SupersededSharedRole:
-			// The role was split: the incarnation is proposed again.
+		case existing.State == SuggestionSuperseded && suggestionReproposable(existing.Reason):
+			// What closed it (a shared role, another identity, lapsed model
+			// calls) no longer holds: the incarnation is proposed again.
 			r := tx.Exec(`UPDATE agent_suggestion
 				SET state = 'pending', decided_by = NULL, decided_at = NULL, reason = '',
 				    evidence = ?::jsonb, connector_id = ?, identity_id = ?, rule_version = ?,
 				    version = version + 1, updated_at = ?
 				WHERE workspace_id = ? AND id = ? AND state = 'superseded' AND reason = ?`,
-				string(ev), connectorID, ai.Identity.ID, AgentSuggestRuleVersion, now, ws, existing.ID, SupersededSharedRole)
+				string(ev), connectorID, ai.Identity.ID, AgentSuggestRuleVersion, now, ws, existing.ID, existing.Reason)
 			if r.Error != nil {
 				return fmt.Errorf("re-propose suggestion: %w", r.Error)
 			}
@@ -290,15 +301,17 @@ func (s *AgentRuntimeService) applySuggestions(tx *gorm.DB, ws, connectorID uuid
 	}
 
 	// Close what no longer holds: a workload classified elsewhere or retired
-	// (final), or now on a shared role (§10 Q1).
+	// (final), now on a shared role (§10 Q1), now running as another identity,
+	// or whose identity made no model call inside the window.
 	var pending []struct {
 		ID             uuid.UUID
 		WorkloadID     uuid.UUID
+		IdentityID     *uuid.UUID
 		Classification string
 		Lifecycle      string
 	}
 	if err := tx.Table("agent_suggestion s").
-		Select("s.id, s.workload_id, w.classification, w.lifecycle").
+		Select("s.id, s.workload_id, s.identity_id, w.classification, w.lifecycle").
 		Joins("JOIN iga_workload w ON w.workspace_id = s.workspace_id AND w.id = s.workload_id").
 		Where("s.workspace_id = ? AND s.connector_id = ? AND s.state = ?", ws, connectorID, SuggestionPending).
 		Scan(&pending).Error; err != nil {
@@ -313,6 +326,11 @@ func (s *AgentRuntimeService) applySuggestions(tx *gorm.DB, ws, connectorID uuid
 			reason = "retired"
 		case shared[p.WorkloadID]:
 			reason = SupersededSharedRole
+		case byWorkload[p.WorkloadID] != nil && p.IdentityID != nil &&
+			byWorkload[p.WorkloadID].Identity.ID != *p.IdentityID:
+			reason = SupersededIdentityChanged
+		case byWorkload[p.WorkloadID] == nil || !isAIWorkload(byWorkload[p.WorkloadID].win):
+			reason = SupersededNoModelCalls
 		default:
 			continue
 		}
@@ -444,6 +462,8 @@ func (s *AgentRuntimeService) ListSuggestions(ctx context.Context, ws uuid.UUID,
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		q := tx.Table("agent_suggestion s").Select(suggestionSelect).
 			Joins("JOIN iga_workload w ON w.workspace_id = s.workspace_id AND w.id = s.workload_id").
+			// A revoked connector's suggestions stay for audit but are not listed.
+			Joins("JOIN cloud_connector cc ON cc.workspace_id = s.workspace_id AND cc.id = s.connector_id AND cc.status <> ?", models.CloudConnectorRevoked).
 			Where("s.workspace_id = ?", ws)
 		if f.State != "" {
 			q = q.Where("s.state = ?", f.State)
@@ -575,6 +595,13 @@ func (s *AgentRuntimeService) ConfirmSuggestion(ctx context.Context, ws uuid.UUI
 	after, err := s.GetSuggestion(ctx, ws, in.SuggestionID)
 	if err != nil {
 		return nil, err
+	}
+	// The Agents-list mirror follows the graph's classification: refresh it
+	// now rather than at the connector's next projection. Best effort; the
+	// next inference pass converges it anyway.
+	// TENANT-EXEMPT: not a statement: inference opens its own workspace transaction for ws.
+	if s.db != nil {
+		go RunAgentInferenceAfterScan(context.Background(), s.db, ws, after.ConnectorID) // TENANT-EXEMPT: inference runs under RLS for ws
 	}
 	return &ConfirmSuggestionResult{Classification: res, Suggestion: after}, nil
 }

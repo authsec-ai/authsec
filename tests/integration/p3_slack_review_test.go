@@ -205,14 +205,14 @@ func TestP3T314SlackOwnerReview(t *testing.T) {
 		w := p3NotifyWorker(db, &p3Outbox{}, &p3Outbox{})
 		app.fake.SetPostErr(&slackapp.APIError{Method: "chat.postMessage", Code: "ratelimited"})
 		id := resend()
-		w.RunOnce(ctx)
+		p3Drain(t, w)
 		if state(id) != "failed" {
 			t.Fatalf("transient failure: state %s, want failed (retried)", state(id))
 		}
 		app.fake.SetPostErr(&slackapp.APIError{Method: "chat.postMessage", Code: "channel_not_found"})
 		p3exec(t, db, `UPDATE iga_gov_job SET run_after = now() WHERE workspace_id = ? AND dedupe_key = ?`, g.ws, "notification:"+id.String())
 		p3exec(t, db, `UPDATE iga_gov_notification SET available_at = now() WHERE id = ?`, id)
-		w.RunOnce(ctx)
+		p3Drain(t, w)
 		if state(id) != "dead" {
 			t.Fatalf("permanent failure: state %s, want dead", state(id))
 		}

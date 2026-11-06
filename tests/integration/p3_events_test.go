@@ -482,7 +482,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 	// iga_gov_event and audit_events rows, as this walker does.
 	for _, r := range []string{"/deployments/:id/resolve", "/deployments/:id/undo", "/deployments/:id/emergency-undo",
 		"/deployments/:id/validations", "/deployments/:id/health-reports", "/policies/:id/remove-control",
-		"/policies/:id/emergency-remove-control"} {
+		"/policies/:id/emergency-remove-control", "/deployments/:id/accept-drift", "/deployments/:id/recovery-plans/:plan_id/approve"} {
 		exempt["POST "+prefix+r] = "audited in TestP3T316DeploymentRoutes (T3.16)"
 	}
 	// T3.15's rollout routes need an observed, approved version over a fake
@@ -729,6 +729,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 // p3AuthoringRoutes are the §7.3 / §7.5 mutating routes of T3.11 / T3.13.
 func p3AuthoringRoutes(prefix string) []string {
 	return []string{
+		"POST " + prefix + "/deployments/:id/reapply",
 		"POST " + prefix + "/proposals",
 		"PATCH " + prefix + "/policies/:id",
 		"POST " + prefix + "/policies/:id/versions/:no/propose",
@@ -791,6 +792,23 @@ func TestP3T320AuthoringMutationsAudited(t *testing.T) {
 	walk("POST "+prefix+"/policies/:id/pause", l.author, http.MethodPost, pp+"/pause", map[string]any{"reason": "walker"})
 	walk("POST "+prefix+"/policies/:id/resume", l.author, http.MethodPost, pp+"/resume", map[string]any{"reason": "walker"})
 	walk("POST "+prefix+"/policies/:id/archive", l.author, http.MethodPost, pp+"/archive", map[string]any{"reason": "walker"})
+	// Exercise the re-apply API using a real authored and approved version.
+	// The drifted deployment row is the observer's input; no AWS mutation is simulated here.
+	code, resp = l.call(l.author, http.MethodPost, "/proposals", map[string]any{"template": "right_size_services",
+		"keys": []any{map[string]any{"provider": "aws", "role_id": roleID}}})
+	next := l.must(code, resp, http.StatusCreated, "reapply source")
+	nextID := next["policy"].(map[string]any)["id"].(string)
+	code, resp = l.call(l.author, http.MethodPost, "/policies/"+nextID+"/versions/1/propose", nil)
+	l.must(code, resp, http.StatusOK, "reapply source propose")
+	code, resp = l.call(l.approver, http.MethodPost, "/policies/"+nextID+"/versions/1/approve", p3aApproveBody(l.plans(nextID, 1), nil))
+	l.must(code, resp, http.StatusOK, "reapply source approve")
+	depID := uuid.New()
+	p3exec(t, l.db, `INSERT INTO iga_gov_deployment (id, workspace_id, version_id, plan_id, control_id, approval_id, kind, delivery, state, applied_at)
+	 SELECT ?, p.workspace_id, p.version_id, p.id, p.control_id, a.id, 'apply', p.delivery, 'drifted', now()
+	 FROM iga_gov_plan p JOIN iga_gov_policy_version v ON v.id = p.version_id
+	 JOIN iga_gov_approval a ON a.version_id = v.id AND a.scope = 'version' AND a.decision = 'approve' AND a.revoked_at IS NULL
+	 WHERE v.policy_id = ? AND v.version_no = 1 AND p.kind = 'apply'`, depID, nextID)
+	walk("POST "+prefix+"/deployments/:id/reapply", l.author, http.MethodPost, "/deployments/"+depID.String()+"/reapply", map[string]any{"reason": "restore reviewed intent"})
 	for _, r := range p3AuthoringRoutes(prefix) {
 		if !walked[r] {
 			t.Errorf("authoring route %s was not walked", r)

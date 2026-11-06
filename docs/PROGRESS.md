@@ -4,6 +4,37 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-06 — Legacy agent-policy retirement and Phase 3 recovery, merged onto staging (branch `merge/legacy-policy-retire`)
+
+Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` (after PR #106 and the round-3 security fixes).
+
+### Done
+- Phase 3: a role-only recovery plan gets its own approval (scope `recovery`), "Accept drift" and "Re-apply" on a drifted deployment, author notices (`review_response`), isolation proposals, `GET /findings?category`.
+- Retired the pre-Phase-3 agent-policy feature (decision 2026-10-13, disposition plan): workers, `/authsec/governance/agent-policies`, warnings, notification settings, `/api/iga/v1/legacy/*`, the notification-channel copy.
+- Migrations renumbered from 138/139 (taken upstream), then again past PR #106's 152-156, to `157_iga_gov_recovery_approval` (keeps 150's `agent_alert` notice kind) and `158_retire_legacy_agent_policy`; both mirrored at the end of bootstrap; policy schema head `158`.
+- Kept, unlike the original work: `enforcement_plans` and the cluster agent's `GET /authsec/provisioning/enforcement-plan` poll (plus the console history route). Kubernetes access policies (146) read the agent's `bindings=` report from it. Plan entries no longer carry `policy_id`.
+
+### Open
+- `158` drops `agent_policies`, `agent_policy_actions`, `agent_policy_confirmations`, `agent_policy_warnings` and `governance_notification_settings` with their rows. Their production row counts have not been checked; check before release.
+
+---
+
+## 2026-11-05 — Agent runtime review fixes (branch `fix/agent-runtime-review`)
+
+Fixes the code review of PR #105 (`reviews/agent-runtime-aws-code-review-2026-11-05.md` in the workspace). Migrations 159 (one live containment per target) and 160 (`cloud_trail_seen_event`). Committed locally; nothing pushed.
+
+### Done
+- Containment: ECS services matched by exact task-definition revision; one live holder per target (159); "verified" needs CloudTrail evidence past the cutoff in every read region or the stream, otherwise "unverifiable" (re-checked, not final); deny-immune and AWS-service calls ignored; every assumer in the blast radius; Lambda `authsec:protected` read live (`lambda:ListTags`, covered by SecurityAudit); failed policy steps cleaned up before a containment may end failed; release pulled forward; probe covers release actions.
+- Alerts: D1 counts only direct `kms:Decrypt` with a secret encryption context and SSM reads with decryption; `agent_alerts` / `agent_runtime` capabilities and 503s until their schema verifies (sink and worker skip, ingest no longer fails); SIEM URLs redacted in views, audit and errors; SIEM delivery outcomes and retention closes in Logs; DB-clock lease; endpoint-limit lock; alert link to `/iga/agent-runtime/alerts/:id`.
+- Evidence: inference runs when the projection completes; reads overlap the previous mark by 1 h and dedupe by eventID (160), with the pre-upgrade window counted once; per-day buckets and a 30-day window for the rule and findings (legacy documents read safely); root-user model calls raise a `human_credentials` finding; AWS mirror rows retired; usage endpoints show Access Advisor rows only and `last_used_at` is the last successful call; revoked connectors not listed; mirror refreshed after a confirm.
+- Templates: resource control policy form (`form=rcp`); AgentCore runtime, batch inference and `bedrock-mantle:CreateInference` denied; empty tag denied; gate policy under `/authsec-gate/`; event stream gets a dead-letter queue, alarm, narrower pattern and `aws:SourceArn`; `RegisterScalableTarget` limited to ECS desired count.
+- Checks: unit, `tests/integration` (all), flows/onboarding/flagsoff (only the two SPIRE 429 failures, which fail identically on `authsec-staging`), ratchet 72/0, schema parity (fresh == upgraded from the 151 schema).
+
+### Open
+- The lab items above; Q5 (AWS agents in the Agents list) now also changes phase-2 acceptance E16, updated to allow only mirrored AWS agents; production ingress body limit.
+
+---
+
 ## 2026-11-05 — Agent runtime on the access graph (branch `feat/agent-runtime-graph`)
 
 - `/graph`, `/graph/expand`, `/graph/path` and the identity and workload details: an AWS role, user or workload carries an additive `agent_runtime` object (label, model calls, open alerts, open findings, suggestion, containment) only when there is something to say; a contained role's grant edges carry `contained: {id, level}` while the containment is in force (identity level: every grant; model level: grants whose statement allows a model action). Nodes and edges without agent-runtime data are unchanged byte for byte.
@@ -61,7 +92,7 @@ Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. 
 - `bedrock-mantle` event source and IAM namespace; Bedrock token field names; Lambda/ECS session-name format; Lambda/ECS `aws:ResourceTag` on the containment actions; `kms:Decrypt` invokedBy for Secrets Manager; suggestion precision (Q1 condition).
 
 ### Open
-- UI: AI workloads and suggestions, alerts page (then switch the alert link), alert settings and SIEM endpoints, containment preview/confirm/release, event-stream setup.
+- UI: built on `Authsec-ui` branch `feat/agent-runtime-ui` (alert link switched).
 - Production ingress: 1 MB body limit on `/authsec/ingest/aws/events`.
 
 ---

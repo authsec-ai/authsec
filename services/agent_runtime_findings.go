@@ -35,7 +35,10 @@ import (
 
    A finding is open while the newest inference of its connector sees it and
    resolved when it no longer does. Inference resolves only the kinds it
-   writes (inferenceFindingKinds here, ai_config_hint in applyConfigHints). */
+   writes (inferenceFindingKinds here, ai_config_hint in applyConfigHints). The
+   three identity findings rest on model calls inside the last
+   AgentRuntimeWindowDays days, so they resolve when the identity has made
+   none in it. */
 
 // FindingKinds are the kind filter's legal values.
 var FindingKinds = map[string]bool{
@@ -232,11 +235,17 @@ func findingDrafts(tx *gorm.DB, ws uuid.UUID, st *agentRuntimeState, ais []*AIWo
 	var out []findingDraft
 	aiByIdentity := map[uuid.UUID]bool{}
 	for _, ai := range ais {
+		// A finding stands on model calls inside the evaluation window
+		// (§5.3, §5.5): an identity with none in it raises none, and the
+		// findings it had resolve.
+		if !isAIWorkload(ai.win) {
+			continue
+		}
 		aiByIdentity[ai.Identity.ID] = true
 		id := ai.Identity.ID
-		calls := map[string]any{"calls": ai.Calls, "denied": ai.Denied, "errors": ai.Errors,
-			"models": ai.Models, "last_call_at": ai.LastCallAt,
-			"window": ai.Coverage}
+		calls := map[string]any{"calls": ai.win.Calls, "denied": ai.win.Denied, "errors": ai.win.Errors,
+			"models": arNonNil(ai.win.Models), "last_call_at": ai.LastCallAt,
+			"window": ai.Coverage, "window_days": AgentRuntimeWindowDays}
 		subject := map[string]any{"identity_id": id, "arn": ai.Identity.ARN, "name": ai.Identity.Name, "kind": ai.Identity.Kind}
 		usageRefs := []uuid.UUID{}
 		if ai.UsageID != uuid.Nil {
@@ -362,10 +371,11 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 		ID         uuid.UUID
 		Kind       string
 		SubjectKey string
+		LastSeen   time.Time
 	}
 	// Only the kinds this pass writes: ai_config_hint has its own pass and
 	// ai_network_traffic is another writer's.
-	if err := tx.Table("agent_finding").Select("id, kind, subject_key").
+	if err := tx.Table("agent_finding").Select("id, kind, subject_key, last_seen").
 		Where("workspace_id = ? AND connector_id = ? AND state = ? AND kind IN ?", ws, connectorID, FindingOpen, inferenceFindingKinds).
 		Scan(&open).Error; err != nil {
 		return fmt.Errorf("read open findings: %w", err)
@@ -375,6 +385,12 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 			continue
 		}
 		if f.Kind == FindingModelKeySecret && (secrets == nil || !secrets.known) {
+			continue
+		}
+		// The root finding is written by the evidence write, not drafted
+		// here: it resolves once no root call is left in the window.
+		if f.SubjectKey == rootFindingKey(connectorID) &&
+			!f.LastSeen.Before(now.AddDate(0, 0, -AgentRuntimeWindowDays)) {
 			continue
 		}
 		r := tx.Exec(`UPDATE agent_finding SET state = 'resolved', resolved_at = ?, updated_at = ?
@@ -456,7 +472,9 @@ func (s *AgentRuntimeService) ListFindings(ctx context.Context, ws uuid.UUID, f 
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		q := tx.Table("agent_finding").
 			Select("id, connector_id, kind, subject_key, identity_id, subject, evidence, state, first_seen, last_seen, resolved_at").
-			Where("workspace_id = ?", ws)
+			Where("workspace_id = ?", ws).
+			// A revoked connector's findings stay for audit but are not listed.
+			Where("connector_id NOT IN (SELECT id FROM cloud_connector WHERE workspace_id = ? AND status = ?)", ws, models.CloudConnectorRevoked)
 		if f.Kind != "" {
 			q = q.Where("kind = ?", f.Kind)
 		}

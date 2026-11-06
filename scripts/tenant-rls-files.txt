@@ -14,7 +14,6 @@ repository/discovery_ingest_token_repository.go
 repository/iga_gov_evaluation_repository.go
 repository/iga_gov_finding_rule_repository.go
 repository/iga_gov_job_repository.go
-services/agent_policy_legacy_compat.go
 services/agent_runtime_evidence.go
 services/agent_runtime_contain.go
 services/agent_runtime_contain_job.go
@@ -27,7 +26,6 @@ services/cloud_enforcement_binding_service.go
 services/cloud_enforcement_deploy_gate.go
 services/cloud_enforcement_r2.go
 services/cloud_runtime_broker.go
-services/governance_notification_bridge.go
 services/iga_gov_access_policy.go
 services/iga_gov_access_azure.go
 services/iga_gov_access_k8s.go
@@ -37,7 +35,10 @@ services/iga_gov_authoring_service.go
 services/iga_gov_aws_executor.go
 services/iga_gov_compile_service.go
 services/iga_gov_deploy_drift.go
+services/iga_gov_deploy_driftactions.go
+services/iga_gov_deploy_notify.go
 services/iga_gov_deploy_observer.go
+services/iga_gov_deploy_recovery.go
 services/iga_gov_deploy_remove.go
 services/iga_gov_deploy_routes.go
 services/iga_gov_deploy_service.go
@@ -53,6 +54,7 @@ services/iga_gov_iac_delivery_handler.go
 services/iga_gov_iac_source_service.go
 services/iga_gov_iac_transitions.go
 services/iga_gov_isolation.go
+services/iga_gov_isolation_proposal.go
 services/iga_gov_job_scheduler.go
 services/iga_gov_job_worker.go
 services/iga_gov_metrics.go

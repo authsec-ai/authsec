@@ -47,10 +47,37 @@ type containJob struct {
 	run *PolicyJobRun
 	ws  uuid.UUID
 	row *AgentContainment
+	// forceCleanup: restoreDue removes the AuthSec policy of every policy
+	// step that never took effect (the failed-outcome path), whatever its
+	// step state, and ignores a deferred restore time.
+	forceCleanup bool
 }
 
-// Handler is the agent_contain job.
+// Handler is the agent_contain job. A release requested while the job runs
+// cannot move the running job's run_after (Release only pulls forward a
+// queued job), so a long wait the run ends with is cut to a second when the
+// containment has meanwhile moved to releasing.
 func (s *AgentContain) Handler(ctx context.Context, run *PolicyJobRun) error {
+	var started string
+	err := s.handle(ctx, run, &started)
+	var rl *policyJobRetryLater
+	if errors.As(err, &rl) && rl.after > 5*time.Second && started != "" && started != agentcontain.StateReleasing && run.Job.SubjectID != nil {
+		var state string
+		ws := run.Job.WorkspaceID
+		if rerr := run.ReadTx(ctx, func(tx *gorm.DB) error {
+			row, err := loadContainment(tx, ws, *run.Job.SubjectID, false)
+			if err == nil {
+				state = row.State
+			}
+			return err
+		}); rerr == nil && state == agentcontain.StateReleasing {
+			return PolicyJobRetryLater(time.Second, "release requested; running it now")
+		}
+	}
+	return err
+}
+
+func (s *AgentContain) handle(ctx context.Context, run *PolicyJobRun, started *string) error {
 	if run.Job.SubjectID == nil {
 		return PolicyJobAbandon("agent_contain needs a containment subject")
 	}
@@ -72,6 +99,7 @@ func (s *AgentContain) Handler(ctx context.Context, run *PolicyJobRun) error {
 		}
 		return err
 	}
+	*started = row.State
 	j := &containJob{s: s, run: run, ws: ws, row: row}
 	switch row.State {
 	case agentcontain.StatePreviewed:
@@ -349,16 +377,30 @@ func (j *containJob) apply(ctx context.Context) error {
 			Region: st.Region, Before: jsonOrEmpty(st.Before), After: json.RawMessage(`{}`), State: state, Error: st.Error,
 			RestoreAfter: st.RestoreAfter, CreatedAt: j.now(), UpdatedAt: j.now()}
 		seq++
-		if err := j.run.InTx(ctx, func(tx *gorm.DB) error {
-			if err := tx.Create(&row).Error; err != nil {
+		insert := func(r AgentContainmentStep) error {
+			return j.run.InTx(ctx, func(tx *gorm.DB) error {
+				if err := tx.Create(&r).Error; err != nil {
+					return err
+				}
+				if r.State == agentcontain.StepFailed {
+					return j.event(tx, j.ws, GovEventContainmentStepFailed, map[string]any{"kind": r.Kind, "target": r.Target, "error": r.Error})
+				}
+				return nil
+			})
+		}
+		if err := insert(row); err != nil {
+			if !isUniqueViolation(err, "uq_agent_containment_step_live_target") {
 				return err
 			}
-			if state == agentcontain.StepFailed {
-				return j.event(tx, j.ws, GovEventContainmentStepFailed, map[string]any{"kind": row.Kind, "target": row.Target, "error": row.Error})
+			// Another live containment holds this target: its before-state is
+			// that containment's change, not the workload's own. Refuse the
+			// step (nothing was written to AWS) and name the holder.
+			holder := j.liveHolder(ctx, st.Kind, st.Target)
+			row.ID, row.State = uuid.New(), agentcontain.StepFailed
+			row.Before, row.Error = json.RawMessage(`{}`), "target already held by containment "+holder
+			if err := insert(row); err != nil {
+				return err
 			}
-			return nil
-		}); err != nil {
-			return err
 		}
 	}
 	steps, err := j.steps(ctx)
@@ -421,6 +463,38 @@ func (j *containJob) apply(ctx context.Context) error {
 	if outcome == agentcontain.StateContaining {
 		return PolicyJobRetryLater(containRetry, "steps still pending")
 	}
+	if outcome == agentcontain.StateFailed {
+		// Nothing was applied, but a failed policy step may have created the
+		// AuthSec policy. A failed containment cannot be released, so it is
+		// not left failed until every such policy is gone: a refused or
+		// transient cleanup retries (the steps keep restore_failed, which
+		// still counts as holding the policy).
+		holds := false
+		for _, s := range steps {
+			holds = holds || agentcontain.HoldsPolicy(s.engineStep())
+		}
+		if holds {
+			eng, err := j.open(ctx)
+			if err != nil {
+				return err
+			}
+			j.forceCleanup = true
+			_, err = j.restoreDue(ctx, eng, steps, j.now())
+			j.forceCleanup = false
+			if err != nil {
+				return err
+			}
+			if steps, err = j.steps(ctx); err != nil {
+				return err
+			}
+			for _, s := range steps {
+				if agentcontain.HoldsPolicy(s.engineStep()) {
+					j.note(ctx, "removing the AuthSec policy of a failed containment: "+s.Error)
+					return PolicyJobRetryLater(5*time.Minute, "the AuthSec policy "+s.Target+" could not be removed yet")
+				}
+			}
+		}
+	}
 	now := j.now()
 	err = j.run.InTx(ctx, func(tx *gorm.DB) error {
 		set := map[string]any{"state_reason": ""}
@@ -445,6 +519,22 @@ func (j *containJob) apply(ctx context.Context) error {
 		return nil
 	}
 	return PolicyJobRetryLater(agentcontain.VerifyGrace+30*time.Second, "verifying after the grace period")
+}
+
+// liveHolder names the other live containment holding (kind, target), for the
+// refusal text; "another containment" when it cannot be read.
+func (j *containJob) liveHolder(ctx context.Context, kind, target string) string {
+	holder := "another containment"
+	_ = j.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var rows []AgentContainmentStep
+		if err := tx.Where("workspace_id = ? AND kind = ? AND target = ? AND containment_id <> ? AND state IN ?", j.ws, kind, target, j.row.ID,
+			[]string{agentcontain.StepPending, agentcontain.StepApplied, agentcontain.StepRestoring, agentcontain.StepRestoreFailed}).
+			Limit(1).Find(&rows).Error; err == nil && len(rows) > 0 {
+			holder = rows[0].ContainmentID.String()
+		}
+		return nil
+	})
+	return holder
 }
 
 func stepSummary(steps []AgentContainmentStep) []map[string]any {
@@ -480,21 +570,8 @@ func (j *containJob) stepUpdate(ctx context.Context, stepID uuid.UUID, set map[s
 // once the grace has passed, and the read-back of every applied step.
 func (j *containJob) check(ctx context.Context) error {
 	now := j.now()
-	if j.row.VerifiedAt == nil && j.row.Effective == nil && j.row.ContainedAt != nil &&
-		!now.Before(j.row.ContainedAt.Add(agentcontain.VerifyGrace)) {
-		err := j.run.InTx(ctx, func(tx *gorm.DB) error {
-			res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state IN ? AND effective IS NULL", j.ws, j.row.ID,
-				[]string{agentcontain.StateContained, agentcontain.StatePartial}).
-				Updates(map[string]any{"verified_at": now, "effective": true, "updated_at": now})
-			if res.Error != nil || res.RowsAffected == 0 {
-				return res.Error
-			}
-			return j.event(tx, j.ws, GovEventContainmentVerified, map[string]any{"grace_seconds": int(agentcontain.VerifyGrace.Seconds()),
-				"note": "No successful call by the identity was seen after the grace period; a later-delivered event can still mark it not effective."})
-		})
-		if err != nil {
-			return err
-		}
+	if err := j.verdict(ctx, now); err != nil {
+		return err
 	}
 	steps, err := j.steps(ctx)
 	if err != nil {
@@ -563,6 +640,133 @@ func (j *containJob) check(ctx context.Context) error {
 	return PolicyJobRetryLater(containCheckEvery, "contained; read back every 15 minutes")
 }
 
+// verdict decides the behavioural verification once the grace has passed:
+// verified only on CloudTrail evidence that events after contained_at +
+// VerifyGrace were received for the connector (never on the timer alone);
+// unverifiable when no event can be attributed to the contained workloads
+// (final), or when no evidence arrived within VerifyGiveUp. The second kind
+// is re-checked on every run: a weekly scan's cursor or a stream event that
+// later passes the cutoff turns it into verified (the note is removed). The
+// event sink can still flip a verified containment to not effective.
+func (j *containJob) verdict(ctx context.Context, now time.Time) error {
+	if j.row.VerifiedAt != nil || j.row.Effective != nil || j.row.ContainedAt == nil {
+		return nil
+	}
+	c := containedOf(*j.row)
+	if !now.After(c.CutOff()) {
+		return nil
+	}
+	var prev struct {
+		Unverifiable *struct {
+			Final bool `json:"final"`
+		} `json:"unverifiable"`
+	}
+	_ = json.Unmarshal(j.row.Verification, &prev)
+	noted := prev.Unverifiable != nil
+	if noted && prev.Unverifiable.Final {
+		return nil
+	}
+	if bad, why := c.Unverifiable(); bad {
+		return j.markUnverifiable(ctx, now, why, true)
+	}
+	var covered bool
+	var how string
+	if err := j.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		covered, how, err = containEvidenceCovers(tx, j.ws, j.row.ConnectorID, c.CutOff())
+		return err
+	}); err != nil {
+		return err
+	}
+	if !covered {
+		if noted || now.Before(c.ContainedAt.Add(agentcontain.VerifyGiveUp)) {
+			return nil // keep waiting for CloudTrail evidence
+		}
+		return j.markUnverifiable(ctx, now, "No CloudTrail events were received for this account after the containment (neither the event stream nor every region's CloudTrail read reached it), so no call by the identity could have been seen. It is checked again whenever new events arrive.", false)
+	}
+	return j.run.InTx(ctx, func(tx *gorm.DB) error {
+		raw, _ := json.Marshal(map[string]any{"evidence": how})
+		res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state IN ? AND effective IS NULL", j.ws, j.row.ID,
+			[]string{agentcontain.StateContained, agentcontain.StatePartial}).
+			Updates(map[string]any{"verified_at": now, "effective": true, "updated_at": now,
+				"verification": gorm.Expr("(verification - 'unverifiable') || ?::jsonb", string(raw))})
+		if res.Error != nil || res.RowsAffected == 0 {
+			return res.Error
+		}
+		return j.event(tx, j.ws, GovEventContainmentVerified, map[string]any{"grace_seconds": int(agentcontain.VerifyGrace.Seconds()),
+			"evidence": how,
+			"note":     "CloudTrail events newer than the grace period were received and none was a successful call by the identity; a later-delivered event can still mark it not effective."})
+	})
+}
+
+func (j *containJob) markUnverifiable(ctx context.Context, now time.Time, why string, final bool) error {
+	return j.run.InTx(ctx, func(tx *gorm.DB) error {
+		raw, _ := json.Marshal(map[string]any{"unverifiable": map[string]any{"reason": why, "at": now, "final": final}})
+		res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state IN ? AND effective IS NULL", j.ws, j.row.ID,
+			[]string{agentcontain.StateContained, agentcontain.StatePartial}).
+			Updates(map[string]any{"updated_at": now, "verification": gorm.Expr("verification || ?::jsonb", string(raw))})
+		if res.Error != nil || res.RowsAffected == 0 {
+			return res.Error
+		}
+		return j.event(tx, j.ws, GovEventContainmentUnverifiable, map[string]any{"reason": why, "final": final})
+	})
+}
+
+// containEvidenceCovers reports whether CloudTrail events from after cut were
+// received for the connector: the event stream's newest event time
+// (agent_event_stream.last_event_time, migration 149) is past cut, or EVERY
+// region the connector reads has a general read cursor
+// (cloud_trail_cursor.read_to, migration 147) past cut that did not skip it
+// (a capped read must reach back to cut). One region is not enough: a call
+// can be made, and logged, in any region the connector reads.
+func containEvidenceCovers(tx *gorm.DB, ws, connectorID uuid.UUID, cut time.Time) (bool, string, error) {
+	var n int64
+	if err := tx.Table("agent_event_stream").Where("workspace_id = ? AND connector_id = ? AND revoked_at IS NULL AND last_event_time >= ?", ws, connectorID, cut).
+		Count(&n).Error; err != nil {
+		return false, "", err
+	}
+	if n > 0 {
+		return true, "event_stream", nil
+	}
+	var conns []models.CloudConnector
+	if err := tx.Where("workspace_id = ? AND id = ?", ws, connectorID).Limit(1).Find(&conns).Error; err != nil {
+		return false, "", err
+	}
+	if len(conns) == 0 {
+		return false, "", nil
+	}
+	var cursors []struct {
+		Region      string
+		ReadTo      time.Time
+		Partial     bool
+		CoveredFrom time.Time
+	}
+	if err := tx.Table("cloud_trail_cursor").Select("region, read_to, partial, covered_from").
+		Where("workspace_id = ? AND connector_id = ? AND stream = ?", ws, connectorID, "general").Find(&cursors).Error; err != nil {
+		return false, "", err
+	}
+	past := map[string]bool{}
+	for _, c := range cursors {
+		past[c.Region] = !c.ReadTo.Before(cut) && (!c.Partial || !c.CoveredFrom.After(cut))
+	}
+	regions := conns[0].AWSAttrs().Regions
+	if len(regions) == 0 {
+		// No recorded selection: every region the scan has a cursor for.
+		for r := range past {
+			regions = append(regions, r)
+		}
+	}
+	if len(regions) == 0 {
+		return false, "", nil
+	}
+	for _, r := range regions {
+		if !past[r] {
+			return false, "", nil
+		}
+	}
+	return true, "cloudtrail_read", nil
+}
+
 func containJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -576,21 +780,26 @@ func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, s
 	failed := false
 	for i := len(steps) - 1; i >= 0; i-- {
 		s := steps[i]
+		cleanup := agentcontain.NeedsCleanup(s.engineStep()) || (j.forceCleanup && agentcontain.HoldsPolicy(s.engineStep()))
 		switch s.State {
 		case agentcontain.StepPending, agentcontain.StepApplied, agentcontain.StepRestoring, agentcontain.StepRestoreFailed:
 		default:
+			if !cleanup {
+				continue
+			}
+		}
+		if !cleanup && s.RestoreAfter != nil && now.Before(*s.RestoreAfter) {
 			continue
 		}
-		if s.RestoreAfter != nil && now.Before(*s.RestoreAfter) {
-			continue
-		}
-		if s.State != agentcontain.StepRestoring {
+		if s.State != agentcontain.StepRestoring && !cleanup {
 			if err := j.stepUpdate(ctx, s.ID, map[string]any{"state": agentcontain.StepRestoring}, nil); err != nil {
 				return failed, err
 			}
 		}
 		st := s.engineStep()
-		st.State = agentcontain.StepRestoring
+		if !cleanup {
+			st.State = agentcontain.StepRestoring
+		}
 		err := j.run.External(ctx, 0, func(ctx context.Context) error { return eng.Restore(ctx, &st) })
 		var se *agentcontain.StepError
 		switch {
@@ -609,10 +818,15 @@ func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, s
 			if s.Kind == agentcontain.StepSessionRevoke && j.row.State == agentcontain.StateReleased {
 				name = GovEventContainmentRevocationEnded
 			}
-			if err := j.stepUpdate(ctx, s.ID, map[string]any{"state": agentcontain.StepRestored, "restored_at": now, "error": st.Error},
+			note := st.Error
+			if cleanup {
+				// Keep why the step failed; the policy it may have left is gone.
+				note = truncateReason(s.Error + " (AuthSec policy cleaned up on release)")
+			}
+			if err := j.stepUpdate(ctx, s.ID, map[string]any{"state": agentcontain.StepRestored, "restored_at": now, "error": note},
 				func(tx *gorm.DB) error {
 					return j.event(tx, j.ws, name, map[string]any{"kind": s.Kind, "target": s.Target,
-						"before": json.RawMessage(jsonOrEmpty(s.Before)), "note": st.Error})
+						"before": json.RawMessage(jsonOrEmpty(s.Before)), "note": note})
 				}); err != nil {
 				return failed, err
 			}
@@ -623,6 +837,9 @@ func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, s
 
 func (j *containJob) needsAWS(steps []AgentContainmentStep, now time.Time) bool {
 	for _, s := range steps {
+		if agentcontain.NeedsCleanup(s.engineStep()) {
+			return true
+		}
 		switch s.State {
 		case agentcontain.StepPending, agentcontain.StepApplied, agentcontain.StepRestoring, agentcontain.StepRestoreFailed:
 			if s.RestoreAfter == nil || !now.Before(*s.RestoreAfter) {

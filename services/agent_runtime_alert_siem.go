@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -86,6 +87,27 @@ func validateAgentAlertSIEMURL(raw string) (string, error) {
 	return u.String(), nil
 }
 
+// RedactAgentAlertSIEMURL is the only form of an endpoint URL any view, audit
+// entry or stored error shows: scheme and host, the path and query replaced
+// by "…" (a SIEM URL can carry its credential, e.g. ?dd-api-key=).
+func RedactAgentAlertSIEMURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "https://…"
+	}
+	return u.Scheme + "://" + u.Host + "/…"
+}
+
+// sanitizeAgentAlertSIEMError removes the request URL a net/http error
+// carries (url.Error keeps path and query), keeping the operation and cause.
+func sanitizeAgentAlertSIEMError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
+}
+
 // ListSIEMEndpoints is GET /siem-endpoints (deleted ones are not listed).
 func (s *AgentAlertService) ListSIEMEndpoints(ctx context.Context, ws uuid.UUID) ([]AgentAlertSIEMEndpoint, error) {
 	var out []AgentAlertSIEMEndpoint
@@ -96,6 +118,9 @@ func (s *AgentAlertService) ListSIEMEndpoints(ctx context.Context, ws uuid.UUID)
 	})
 	if out == nil {
 		out = []AgentAlertSIEMEndpoint{}
+	}
+	for i := range out {
+		out[i].URL = RedactAgentAlertSIEMURL(out[i].URL)
 	}
 	return out, err
 }
@@ -123,7 +148,8 @@ func (s *AgentAlertService) CreateSIEMEndpoint(ctx context.Context, ws, actor uu
 	}
 	id := uuid.New()
 	ref := AgentAlertSIEMSecretPath(ws, id)
-	// Count first, so a workspace at its limit writes nothing to Vault.
+	// Quick pre-check, so a workspace at its limit writes nothing to Vault;
+	// the binding check is under the lock in the insert transaction below.
 	var n int64
 	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		return tx.Raw(`SELECT count(*) FROM agent_alert_siem_endpoint WHERE workspace_id = ? AND deleted_at IS NULL`, ws).Scan(&n).Error
@@ -131,7 +157,7 @@ func (s *AgentAlertService) CreateSIEMEndpoint(ctx context.Context, ws, actor uu
 		return nil, "", err
 	}
 	if n >= agentAlertMaxSIEMEndpoints {
-		return nil, "", govErr(http.StatusConflict, "siem_endpoint_limit", "A workspace has at most 10 SIEM endpoints.", nil)
+		return nil, "", errAgentAlertSIEMLimit()
 	}
 	if err := vc.WriteSecret(ref, map[string]interface{}{"secret": secret}); err != nil {
 		log.Printf("[agent-alerts] workspace %s: storing a SIEM secret failed: %v", ws, err)
@@ -140,6 +166,18 @@ func (s *AgentAlertService) CreateSIEMEndpoint(ctx context.Context, ws, actor uu
 	}
 	var out AgentAlertSIEMEndpoint
 	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+		// Serialise creators of one workspace so count-then-insert cannot
+		// overshoot the limit (released at commit).
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended(?, 0))`, "agent_alert_siem_endpoint:"+ws.String()).Error; err != nil {
+			return err
+		}
+		var live int64
+		if err := tx.Raw(`SELECT count(*) FROM agent_alert_siem_endpoint WHERE workspace_id = ? AND deleted_at IS NULL`, ws).Scan(&live).Error; err != nil {
+			return err
+		}
+		if live >= agentAlertMaxSIEMEndpoints {
+			return errAgentAlertSIEMLimit()
+		}
 		var rows []AgentAlertSIEMEndpoint
 		if err := tx.Raw(`INSERT INTO agent_alert_siem_endpoint (id, workspace_id, url, secret_ref, enabled, created_by)
 		                  VALUES (?, ?, ?, ?, true, ?)
@@ -151,6 +189,7 @@ func (s *AgentAlertService) CreateSIEMEndpoint(ctx context.Context, ws, actor uu
 			return errors.New("SIEM endpoint insert returned no row")
 		}
 		out = rows[0]
+		out.URL = RedactAgentAlertSIEMURL(out.URL)
 		return nil
 	})
 	if err != nil {
@@ -160,6 +199,10 @@ func (s *AgentAlertService) CreateSIEMEndpoint(ctx context.Context, ws, actor uu
 		return nil, "", err
 	}
 	return &out, secret, nil
+}
+
+func errAgentAlertSIEMLimit() error {
+	return govErr(http.StatusConflict, "siem_endpoint_limit", "A workspace has at most 10 SIEM endpoints.", nil)
 }
 
 // DeleteSIEMEndpoint is DELETE /siem-endpoints/:id: the endpoint stops

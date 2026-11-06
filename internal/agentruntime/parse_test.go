@@ -97,7 +97,7 @@ func TestTrailNameFactOnlyForCloudTrail(t *testing.T) {
 		t.Fatalf("cloudtrail name: %v", e.RequestFacts)
 	}
 	e, _ = ParseCloudTrailRecord([]byte(`{"eventID":"2","eventName":"GetParameter","eventSource":"ssm.amazonaws.com","requestParameters":{"name":"/db/pass","withDecryption":true}}`))
-	if e.RequestFacts[FactParameter] != "/db/pass" {
+	if e.RequestFacts[FactParameter] != "/db/pass" || e.RequestFacts[FactWithDecryption] != "true" {
 		t.Fatalf("ssm name: %v", e.RequestFacts)
 	}
 }

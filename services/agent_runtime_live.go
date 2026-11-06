@@ -278,7 +278,7 @@ func recordLiveModelCalls(tx *gorm.DB, ws, connectorID uuid.UUID, d *agentLiveDe
 	                          COALESCE((SELECT last_seen_generation FROM cloud_identity WHERE workspace_id = ? AND id = ?), 0),
 	                          ?, ?, ?`,
 		uuid.New(), ws, connectorID, d.identity.ID, agentruntime.UsageService, agentruntime.UsageSource,
-		modelCallLastUsed(doc.ModelCallUsage), string(attrs), ws, d.identity.ID, now, now, now).Error
+		modelCallLastUsedAt(doc), string(attrs), ws, d.identity.ID, now, now, now).Error
 }
 
 // mergeLiveModelCalls adds live events to a row's doc and returns it with the

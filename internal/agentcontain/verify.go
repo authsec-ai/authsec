@@ -15,9 +15,14 @@ import (
 // CloudTrail events (the poller and the event stream both hand them to the
 // agent_contain_verify sink). A SUCCESSFUL call by the contained identity
 // after contained_at + VerifyGrace marks the containment not effective, with
-// the events; when the grace has passed with none, the containment is
-// verified (verified_at) -- provisionally: an event delivered later (a daily
-// poll) still flips it to not effective.
+// the events. "None seen" means something only when CloudTrail evidence
+// covers the time after contained_at + VerifyGrace (the event stream's newest
+// event time, or the poller's read cursor, has passed it): then the
+// containment is verified (verified_at) -- provisionally: an event delivered
+// later still flips it to not effective. With no such evidence it stays
+// undecided and, after VerifyGiveUp, is recorded as unverifiable. A
+// containment no event can be attributed to (Unverifiable) is never verified.
+// Calls a deny cannot block (DenyImmune) are not evidence.
 //
 // DECISION P3-6 (what counts, per level):
 //   - identity: any successful API call attributed to the identity;
@@ -31,6 +36,40 @@ import (
 
 // VerifyGrace is CloudTrail's delivery delay plus IAM propagation.
 const VerifyGrace = 5 * time.Minute
+
+// VerifyGiveUp is how long after containment AuthSec waits for CloudTrail
+// events covering the grace period before it records the containment as
+// unverifiable (no events were received since it) instead of verified.
+const VerifyGiveUp = 24 * time.Hour
+
+// CutOff is the time after which a successful call counts against the
+// containment, and the time CloudTrail evidence must cover before "no late
+// call" means anything.
+func (c Contained) CutOff() time.Time { return c.ContainedAt.Add(VerifyGrace) }
+
+// Unverifiable reports a containment whose effect no event can show: a
+// workload containment of ECS services on a role shared with other
+// workloads. An ECS task's role session name is not the service's (DECISION
+// P3-6), so no CloudTrail event can be attributed to the contained services;
+// absence of late calls would prove nothing.
+func (c Contained) Unverifiable() (bool, string) {
+	if c.Level == LevelWorkload && !c.Dedicated && len(c.SessionNames) == 0 {
+		return true, "The contained workloads (ECS services) share the role with other workloads and their CloudTrail sessions cannot be told apart, so no event can confirm or refute the containment. Read-back of each change is the only evidence."
+	}
+	return false, ""
+}
+
+// DenyImmune reports a call an explicit deny cannot block: it succeeds under
+// the deny-all policy and is no evidence the containment failed.
+// sts:GetCallerIdentity needs no permission; a call made by an AWS service
+// on the identity's behalf (userIdentity.invokedBy) is made with the
+// service's own authority, not by the contained identity's permissions.
+func DenyImmune(e agentruntime.Event) bool {
+	if e.InvokedBy != "" {
+		return true
+	}
+	return strings.EqualFold(e.EventSource, "sts.amazonaws.com") && e.EventName == "GetCallerIdentity"
+}
 
 // Contained is one live containment as the verifier sees it.
 type Contained struct {
@@ -77,7 +116,7 @@ func (c Contained) MatchesIdentity(e agentruntime.Event) bool {
 // Late returns the events that show the containment is not effective,
 // sorted by time.
 func Late(c Contained, events []agentruntime.Event) []LateEvent {
-	cut := c.ContainedAt.Add(VerifyGrace)
+	cut := c.CutOff()
 	names := map[string]bool{}
 	for _, n := range c.SessionNames {
 		names[n] = true
@@ -87,7 +126,7 @@ func Late(c Contained, events []agentruntime.Event) []LateEvent {
 		if !e.IsAPICall() || e.ErrorCode != "" || e.AuthorizationDenied {
 			continue
 		}
-		if !e.EventTime.After(cut) || !c.MatchesIdentity(e) {
+		if !e.EventTime.After(cut) || DenyImmune(e) || !c.MatchesIdentity(e) {
 			continue
 		}
 		weak := false

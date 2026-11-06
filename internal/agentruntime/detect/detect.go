@@ -449,10 +449,10 @@ func IsAWSServiceSource(ip string) bool {
 
 // SecretRead is D1 (spec §5.7 with §10's change): Secrets Manager
 // GetSecretValue / BatchGetSecretValue (high); SSM GetParameter,
-// GetParameters, GetParametersByPath ONLY when the record states
-// with_decryption=true (medium); KMS Decrypt (medium) ONLY when not made on
-// the principal's behalf by Secrets Manager or SSM -- those decrypts
-// accompany a GetSecretValue / GetParameter already alerted on.
+// GetParameters, GetParametersByPath only with
+// with_decryption=true (medium); KMS Decrypt (medium) ONLY when the principal
+// called it directly (no invokedBy: service-made decrypts accompany a read
+// already alerted on) and its encryption context names a secret or parameter.
 //
 // DECISION (lab 2026-11-05): a plain GetParameter reads configuration (217
 // of them made one alert), not a secret: only a decrypting read returns a
@@ -475,8 +475,7 @@ func SecretRead(e agentruntime.Event) (severity string, ok bool) {
 		}
 	case "kms.amazonaws.com":
 		if e.EventName == "Decrypt" {
-			switch strings.ToLower(strings.TrimSpace(e.InvokedBy)) {
-			case "secretsmanager.amazonaws.com", "ssm.amazonaws.com":
+			if strings.TrimSpace(e.InvokedBy) != "" || e.RequestFacts[agentruntime.FactSecretContext] != "true" {
 				return "", false
 			}
 			return SeverityMedium, true
