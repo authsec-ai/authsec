@@ -5665,229 +5665,6 @@ CREATE INDEX IF NOT EXISTS idx_discovery_scan_runs_claim
 CREATE INDEX IF NOT EXISTS idx_discovery_scan_runs_source
     ON public.discovery_scan_runs (workspace_id, source_id, queued_at DESC);
 
--- ============================================================================
--- Agent policies: the declarative layer above enforcement.
---
--- An operator attaches a policy to a claimed agent -- or to a selector matching many
--- -- stating the end state they want, and a reconciler works toward it on a timer.
--- Enforcement becomes the difference between what a policy says and what is true,
--- rather than a button that fires an action.
---
--- Same shape as birthright_policies, which established the pattern for humans.
--- ============================================================================
-
--- agent_policies ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.agent_policies (
-    id           uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL,
-    name         text NOT NULL,
-    description  text NOT NULL DEFAULT '',
-
-    -- TARGET. Either one named agent, or a selector the reconciler expands.
-    -- The selector is evaluated in the CONTROL PLANE and never reaches the cluster
-    -- agent, which only ever receives an explicit fingerprint list -- so a broad
-    -- selector can produce a longer list but never a broader predicate.
-    discovered_agent_id uuid,
-    -- {cluster, namespace, labels, archetype, deployment_origin, framework}
-    selector jsonb,
-
-    -- ARM 1: entitlement. Never reaches the cluster.
-    -- A CEILING, not a grant. Effective access is the intersection of this and what
-    -- was provisioned, so a policy can only ever narrow (PG-5). A policy naming a
-    -- scope the agent never held is a no-op on that scope, not a grant of it.
-    scope_ceiling   text[],
-    role_ceiling_id uuid,
-
-    -- ARM 2: cluster. Every caveat in ENFORCEMENT-ARCHITECTURE.md §3 applies.
-    desired_state text NOT NULL DEFAULT 'active',
-
-    -- CLOCK. One or the other, never both -- two clocks make "when does this expire"
-    -- ambiguous, and the answer would depend on evaluation order.
-    duration   interval,
-    expires_at timestamptz,
-
-    -- What happens when the clock runs out. 'revoke' is the default deliberately:
-    -- it is today's behaviour (entitlements lapse, workload untouched), so the blast
-    -- radius of a mis-set expiry is lost access rather than a deleted workload.
-    on_expiry text NOT NULL DEFAULT 'revoke',
-
-    -- PRE-AUTHORIZATION. A destructive on_expiry executes unattended, with no human
-    -- present at the deadline. The reason and confirmation are therefore captured
-    -- HERE, at authoring time -- the policy is the authorization.
-    --
-    -- The rejected alternative was raising an approval at expiry, which means the
-    -- policy sometimes does nothing: an ignored queue turns "delete in 30 days" into
-    -- "runs forever" while the author believes it is handled. Silent non-execution is
-    -- the worse failure, because only the blunt one is visible.
-    reason       text NOT NULL DEFAULT '',
-    confirmed_by uuid,
-    confirmed_at timestamptz,
-
-    enabled    boolean NOT NULL DEFAULT true,
-    created_by text NOT NULL DEFAULT '',
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-
-    CONSTRAINT agent_policies_pkey PRIMARY KEY (id),
-    CONSTRAINT agent_policies_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policies_agent_fkey FOREIGN KEY (discovered_agent_id)
-        REFERENCES public.discovered_agents(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policies_role_fkey FOREIGN KEY (role_ceiling_id)
-        REFERENCES public.roles(id) ON DELETE SET NULL,
-
-    -- A target, and exactly one kind of it. Both set would make the policy's scope
-    -- ambiguous; neither set would make it apply to nothing while looking active.
-    CONSTRAINT agent_policies_target_chk CHECK (
-        (discovered_agent_id IS NOT NULL AND selector IS NULL)
-     OR (discovered_agent_id IS NULL     AND selector IS NOT NULL)),
-
-    CONSTRAINT agent_policies_desired_chk CHECK (
-        desired_state IN ('active', 'quarantined')),
-    CONSTRAINT agent_policies_expiry_chk CHECK (
-        on_expiry IN ('revoke', 'quarantine', 'evict')),
-    CONSTRAINT agent_policies_clock_chk CHECK (
-        duration IS NULL OR expires_at IS NULL),
-
-    -- A destructive expiry must be justified AND confirmed. Same pattern as the
-    -- standing-grant rule: make the dangerous option the one that costs something.
-    CONSTRAINT agent_policies_destructive_chk CHECK (
-        on_expiry <> 'evict'
-        OR (reason <> '' AND confirmed_by IS NOT NULL AND confirmed_at IS NOT NULL)),
-
-    -- A clock that has already been decided must say when. An expiry action with no
-    -- expiry is a policy that can never fire, which is worse than being rejected.
-    CONSTRAINT agent_policies_actionable_chk CHECK (
-        on_expiry = 'revoke' OR duration IS NOT NULL OR expires_at IS NOT NULL),
-
-    CONSTRAINT agent_policies_name_key UNIQUE (workspace_id, name)
-);
-
--- One active DIRECT policy per agent. Selector policies may overlap -- forbidding
--- that is impractical once selectors exist -- and conflicts are resolved by the
--- most-restrictive lattice in the reconciler instead.
-CREATE UNIQUE INDEX IF NOT EXISTS agent_policies_one_direct_key
-    ON public.agent_policies(workspace_id, discovered_agent_id)
-    WHERE enabled AND discovered_agent_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_agent_policies_enabled
-    ON public.agent_policies(workspace_id) WHERE enabled;
--- The reconciler's due-work scan, and the lookahead's "what happens this week".
-CREATE INDEX IF NOT EXISTS idx_agent_policies_expiring
-    ON public.agent_policies(expires_at)
-    WHERE enabled AND expires_at IS NOT NULL;
-
--- agent_policy_confirmations ------------------------------------------------
---
--- What a confirmation was actually bound to.
---
--- A selector policy carrying a destructive on_expiry confirms against the EXPANSION
--- -- these named agents -- never against the selector. One typed confirmation must
--- not authorize the deletion of workloads nobody enumerated, and an agent that starts
--- matching the selector later is not covered by an earlier confirmation.
-CREATE TABLE IF NOT EXISTS public.agent_policy_confirmations (
-    id           uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL,
-    policy_id    uuid NOT NULL,
-
-    -- The agents this confirmation authorizes. Snapshotted rather than recomputed:
-    -- "what did you actually confirm" must stay answerable months later, after the
-    -- selector's membership has moved on.
-    expanded_agent_ids uuid[] NOT NULL,
-
-    on_expiry    text NOT NULL,
-    reason       text NOT NULL,
-    confirmed_by uuid NOT NULL,
-    confirmed_at timestamptz NOT NULL DEFAULT now(),
-
-    CONSTRAINT agent_policy_confirmations_pkey PRIMARY KEY (id),
-    CONSTRAINT agent_policy_confirmations_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policy_confirmations_policy_fkey FOREIGN KEY (policy_id)
-        REFERENCES public.agent_policies(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policy_confirmations_expiry_chk CHECK (
-        on_expiry IN ('revoke', 'quarantine', 'evict')),
-    -- A confirmation that authorizes nothing is a UI bug, not a valid record.
-    --
-    -- cardinality(), NOT array_length(): array_length('{}', 1) returns NULL, and a
-    -- CHECK only fails on FALSE -- so the obvious `array_length(...) > 0` evaluates
-    -- to NULL for an empty array and lets it straight through. cardinality() returns
-    -- 0, which fails as intended.
-    CONSTRAINT agent_policy_confirmations_nonempty_chk CHECK (
-        cardinality(expanded_agent_ids) > 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_agent_policy_confirmations_policy
-    ON public.agent_policy_confirmations(workspace_id, policy_id);
-
--- agent_policy_actions ------------------------------------------------------
---
--- What the reconciler did, so a scheduled destruction is explicable after the fact.
--- Append-only in practice; nothing updates a row here.
-CREATE TABLE IF NOT EXISTS public.agent_policy_actions (
-    id           uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL,
-    policy_id    uuid,
-    discovered_agent_id uuid,
-
-    action text NOT NULL,
-    arm    text NOT NULL,
-    reason text NOT NULL DEFAULT '',
-
-    -- True for a reconcile that only computed what it would do. Phase 1 ships with
-    -- this always true.
-    dry_run boolean NOT NULL DEFAULT false,
-
-    outcome text NOT NULL DEFAULT 'applied',
-    -- Why, when the outcome is not 'applied' -- e.g. the PodDisruptionBudget that
-    -- blocked an eviction, or the scope a policy named that the agent never held.
-    detail text NOT NULL DEFAULT '',
-
-    -- Was the operator warned before this happened? NULL for a non-destructive
-    -- action. FALSE is a governance exception the console must surface: the action
-    -- executed and nobody was told.
-    --
-    -- A failed warning deliberately does NOT block execution -- blocking would let an
-    -- SMTP outage silently no-op every destructive policy, which is the same
-    -- silent-non-execution failure the pre-authorization model exists to avoid.
-    warning_delivered boolean,
-
-    acted_at timestamptz NOT NULL DEFAULT now(),
-
-    CONSTRAINT agent_policy_actions_pkey PRIMARY KEY (id),
-    CONSTRAINT agent_policy_actions_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    -- The action outlives the policy. Deleting a policy must not erase the record of
-    -- what it did -- that is the audit trail an operator asks for afterwards.
-    CONSTRAINT agent_policy_actions_policy_fkey FOREIGN KEY (policy_id)
-        REFERENCES public.agent_policies(id) ON DELETE SET NULL,
-    CONSTRAINT agent_policy_actions_agent_fkey FOREIGN KEY (discovered_agent_id)
-        REFERENCES public.discovered_agents(id) ON DELETE SET NULL,
-
-    CONSTRAINT agent_policy_actions_action_chk CHECK (
-        action IN ('narrowed', 'revoked', 'quarantined', 'released', 'evicted', 'noop')),
-    CONSTRAINT agent_policy_actions_arm_chk CHECK (arm IN ('entitlement', 'cluster')),
-    CONSTRAINT agent_policy_actions_outcome_chk CHECK (
-        outcome IN ('applied', 'failed', 'refused', 'planned')),
-    -- A non-applied outcome must say why, or the console can only report that
-    -- something went wrong.
-    CONSTRAINT agent_policy_actions_detail_chk CHECK (
-        outcome = 'applied' OR detail <> ''),
-    -- A dry run never claims to have applied anything.
-    CONSTRAINT agent_policy_actions_dryrun_chk CHECK (
-        NOT dry_run OR outcome = 'planned')
-);
-
-CREATE INDEX IF NOT EXISTS idx_agent_policy_actions_agent
-    ON public.agent_policy_actions(workspace_id, discovered_agent_id, acted_at DESC);
-CREATE INDEX IF NOT EXISTS idx_agent_policy_actions_policy
-    ON public.agent_policy_actions(workspace_id, policy_id, acted_at DESC);
--- A reviewer's queue: destructive actions that executed with no delivered warning.
-CREATE INDEX IF NOT EXISTS idx_agent_policy_actions_unwarned
-    ON public.agent_policy_actions(workspace_id, acted_at DESC)
-    WHERE warning_delivered IS FALSE;
-
-
 -- ===========================================================================
 -- enforcement_plans -- the document the in-cluster agent polls.
 --
@@ -5947,133 +5724,6 @@ CREATE INDEX IF NOT EXISTS idx_enforcement_plans_latest
     ON public.enforcement_plans(discovery_source_id, version DESC);
 CREATE INDEX IF NOT EXISTS idx_enforcement_plans_workspace
     ON public.enforcement_plans(workspace_id, generated_at DESC);
-
-
--- ===========================================================================
--- governance_notification_settings + agent_policy_warnings
---
--- §3A.4 requires that a destructive deadline is warned about BEFORE it fires.
--- This is the durable side of that: a row per (policy, agent, deadline, channel,
--- recipient), scheduled at deadline-minus-lead, retried on failure, and sent once
--- across replicas.
---
--- A FAILED WARNING NEVER BLOCKS THE ACTION. Blocking would mean an SMTP outage
--- silently turns every destructive policy into a no-op -- exactly the
--- silent-non-execution failure §3A.4 exists to prevent. The failure is recorded
--- instead: a destructive action that ran without a delivered warning is a
--- governance exception (agent_policy_actions.warning_delivered = false), which is
--- an auditable finding rather than a swallowed error.
---
--- The LOOKAHEAD (GET /governance/policies/upcoming) remains the system of record.
--- It is a pull, so it has no delivery to fail. Everything here is escalation on
--- top of it.
---
--- WHY NOT iga_durable_jobs, WHICH ALREADY LOOKS LIKE THIS QUEUE
--- Two structural reasons. Its integration_id is NOT NULL with an FK to
--- iga_integrations, and a policy warning belongs to a policy rather than to a
--- connected IGA system -- so every row would need a synthetic integration, and
--- removing an unrelated integration would cascade warnings away. And nothing
--- drains it: IGAManager.RunWorkerOnce is called from no running process. This
--- reuses the pattern (available_at, a dedupe key, attempt_count, FOR UPDATE SKIP
--- LOCKED) without borrowing a table that cannot hold the row.
--- ===========================================================================
-
-CREATE TABLE IF NOT EXISTS public.governance_notification_settings (
-    workspace_id uuid PRIMARY KEY,
-
-    -- How far ahead of a destructive deadline to warn. Seven days: long enough to
-    -- act on during a normal working week, including a weekend.
-    warning_lead interval NOT NULL DEFAULT '7 days',
-
-    -- OPTIONAL second channel, so customers reach Slack or PagerDuty without us
-    -- integrating each one. OUTBOUND, so it costs nothing against EN-0: the control
-    -- plane calling a customer's Slack is not the control plane calling into a
-    -- customer's cluster.
-    webhook_url    text NOT NULL DEFAULT '',
-    webhook_secret text NOT NULL DEFAULT '',
-    email_enabled  boolean NOT NULL DEFAULT true,
-
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-
-    CONSTRAINT gov_notif_settings_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    -- A lead of zero would "warn" at the instant of destruction, which is not a
-    -- warning. The upper bound stops a typo scheduling one years out, where it
-    -- would sit pending and look like the system had gone quiet.
-    CONSTRAINT gov_notif_settings_lead_chk CHECK (
-        warning_lead >= interval '1 hour' AND warning_lead <= interval '90 days'),
-    -- https only. A warning naming which workload is about to be deleted is a map
-    -- of what to attack during the window in which nobody is watching it.
-    CONSTRAINT gov_notif_settings_webhook_chk CHECK (
-        webhook_url = '' OR webhook_url LIKE 'https://%')
-);
-
-CREATE TABLE IF NOT EXISTS public.agent_policy_warnings (
-    id           uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL,
-    policy_id    uuid NOT NULL,
-
-    -- A warning names ONE agent, not a policy: "three of your agents will be
-    -- deleted" is a summary, and the person who has to act needs to know which one
-    -- is theirs.
-    discovered_agent_id uuid NOT NULL,
-
-    -- The deadline being warned about, and part of the dedupe key -- so moving a
-    -- policy's expiry schedules a FRESH warning instead of reusing a sent one.
-    -- Keyed on policy alone, an operator who pushed a deletion out by a month would
-    -- never be warned again, because a warning had already gone out for a deadline
-    -- that no longer exists.
-    deadline timestamptz NOT NULL,
-    -- Snapshotted, not read from the policy at send time: the warning has to
-    -- describe what was scheduled when it was scheduled.
-    on_expiry text NOT NULL,
-
-    channel   text NOT NULL,
-    -- The address actually used, so "who was told" is answerable later. In the
-    -- dedupe key, so adding a recipient warns THEM without re-warning everyone who
-    -- already knew.
-    recipient      text NOT NULL,
-    recipient_role text NOT NULL DEFAULT '',
-
-    available_at  timestamptz NOT NULL,
-    state         text NOT NULL DEFAULT 'pending',
-    attempt_count integer NOT NULL DEFAULT 0,
-    last_error    text NOT NULL DEFAULT '',
-    sent_at       timestamptz,
-
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-
-    CONSTRAINT agent_policy_warnings_pkey PRIMARY KEY (id),
-    CONSTRAINT agent_policy_warnings_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policy_warnings_policy_fkey FOREIGN KEY (policy_id)
-        REFERENCES public.agent_policies(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policy_warnings_agent_fkey FOREIGN KEY (discovered_agent_id)
-        REFERENCES public.discovered_agents(id) ON DELETE CASCADE,
-    CONSTRAINT agent_policy_warnings_channel_chk CHECK (channel IN ('email', 'webhook')),
-    CONSTRAINT agent_policy_warnings_state_chk CHECK (
-        state IN ('pending', 'sent', 'failed', 'dead')),
-    -- 'sent' must carry its timestamp, or "was this warned about" degrades to a
-    -- boolean with no time attached and cannot be compared against the deadline.
-    CONSTRAINT agent_policy_warnings_sent_chk CHECK (
-        (state = 'sent') = (sent_at IS NOT NULL)),
-    -- Fires ONCE. Two replicas scheduling in the same tick collide here rather than
-    -- double-mailing an operator about the deletion of their workload.
-    CONSTRAINT agent_policy_warnings_dedupe_key UNIQUE (
-        policy_id, discovered_agent_id, deadline, channel, recipient)
-);
-
--- The delivery worker's claim path: due, not yet sent, oldest first.
-CREATE INDEX IF NOT EXISTS idx_agent_policy_warnings_due
-    ON public.agent_policy_warnings(available_at)
-    WHERE state IN ('pending', 'failed');
-
--- "Was this action warned about?" -- read by the reconciler when it records a
--- destructive action, and by the console when it lists governance exceptions.
-CREATE INDEX IF NOT EXISTS idx_agent_policy_warnings_lookup
-    ON public.agent_policy_warnings(workspace_id, discovered_agent_id, deadline);
 
 
 -- ===========================================================================
@@ -8800,9 +8450,12 @@ CREATE TABLE public.iga_gov_approval (
     revoked_at timestamp with time zone,
     revoked_reason text DEFAULT ''::text NOT NULL,
     decided_at timestamp with time zone DEFAULT now() NOT NULL,
+    scope text DEFAULT 'version'::text NOT NULL,
+    recovery_plan_id uuid,
     CONSTRAINT iga_gov_approval_channel_check CHECK ((channel = ANY (ARRAY['ui'::text, 'slack'::text]))),
     CONSTRAINT iga_gov_approval_decision_check CHECK ((decision = ANY (ARRAY['approve'::text, 'reject'::text]))),
-    CONSTRAINT iga_gov_approval_reject_reason_chk CHECK (((decision = 'approve'::text) OR (reason <> ''::text)))
+    CONSTRAINT iga_gov_approval_reject_reason_chk CHECK (((decision = 'approve'::text) OR (reason <> ''::text))),
+    CONSTRAINT iga_gov_approval_scope_chk CHECK (((scope = ANY (ARRAY['version'::text, 'recovery'::text])) AND ((scope = 'recovery'::text) = (recovery_plan_id IS NOT NULL)) AND ((scope = 'version'::text) OR (decision = 'approve'::text))))
 );
 
 CREATE TABLE public.iga_gov_evidence_bundle (
@@ -8992,7 +8645,9 @@ ALTER TABLE ONLY public.iga_gov_revalidation
 ALTER TABLE ONLY public.iga_gov_revalidation
     ADD CONSTRAINT iga_gov_revalidation_workspace_id_id_plan_id_result_key UNIQUE (workspace_id, id, plan_id, result);
 
-CREATE UNIQUE INDEX uq_iga_gov_approval_live ON public.iga_gov_approval USING btree (version_id) WHERE ((decision = 'approve'::text) AND (revoked_at IS NULL));
+CREATE UNIQUE INDEX uq_iga_gov_approval_live ON public.iga_gov_approval USING btree (version_id) WHERE ((decision = 'approve'::text) AND (revoked_at IS NULL) AND (scope = 'version'::text));
+
+CREATE UNIQUE INDEX uq_iga_gov_approval_recovery ON public.iga_gov_approval USING btree (recovery_plan_id) WHERE ((scope = 'recovery'::text) AND (decision = 'approve'::text) AND (revoked_at IS NULL));
 
 CREATE UNIQUE INDEX uq_iga_gov_plan_current ON public.iga_gov_plan USING btree (target_id, kind) WHERE (superseded_at IS NULL);
 
@@ -9004,6 +8659,9 @@ CREATE TRIGGER iga_gov_revalidation_immutable BEFORE UPDATE ON public.iga_gov_re
 
 ALTER TABLE ONLY public.iga_gov_approval
     ADD CONSTRAINT iga_gov_approval_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id);
+
+ALTER TABLE ONLY public.iga_gov_approval
+    ADD CONSTRAINT iga_gov_approval_recovery_plan_fkey FOREIGN KEY (workspace_id, recovery_plan_id, version_id) REFERENCES public.iga_gov_plan(workspace_id, id, version_id);
 
 ALTER TABLE ONLY public.iga_gov_approval
     ADD CONSTRAINT iga_gov_approval_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
@@ -9254,6 +8912,9 @@ CREATE TABLE public.iga_gov_deployment (
     revalidation_result text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    drift_accepted_at timestamp with time zone,
+    drift_accepted_by uuid,
+    drift_accepted_reason text DEFAULT ''::text NOT NULL,
     CONSTRAINT iga_gov_deployment_delivery_check CHECK ((delivery = ANY (ARRAY['direct'::text, 'iac_pr'::text, 'export'::text]))),
     CONSTRAINT iga_gov_deployment_kind_check CHECK ((kind = ANY (ARRAY['apply'::text, 'undo'::text, 'remove_control'::text, 'split'::text, 'split_revert'::text]))),
     CONSTRAINT iga_gov_deployment_revalidation_result_check CHECK ((revalidation_result = 'unchanged'::text)),
@@ -9579,6 +9240,9 @@ ALTER TABLE ONLY public.iga_gov_attempt
 
 ALTER TABLE ONLY public.iga_gov_attempt
     ADD CONSTRAINT iga_gov_attempt_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.iga_gov_deployment
+    ADD CONSTRAINT iga_gov_deployment_drift_accepted_by_fkey FOREIGN KEY (drift_accepted_by) REFERENCES public.users(id);
 
 ALTER TABLE ONLY public.iga_gov_deployment
     ADD CONSTRAINT iga_gov_deployment_emergency_by_fkey FOREIGN KEY (emergency_by) REFERENCES public.users(id);
@@ -9919,7 +9583,7 @@ CREATE TABLE public.iga_gov_notification (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT iga_gov_notification_channel_check CHECK ((channel = ANY (ARRAY['email'::text, 'webhook'::text, 'slack'::text]))),
     CONSTRAINT iga_gov_notification_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'dead'::text]))),
-    CONSTRAINT iga_gov_notification_subject_kind_check CHECK ((subject_kind = ANY (ARRAY['owner_review'::text, 'approval_request'::text, 'deployment'::text, 'drift'::text, 'canary_gate'::text, 'finding_digest'::text, 'temporary_grant'::text, 'session_revocation'::text, 'time_bound'::text]))),
+    CONSTRAINT iga_gov_notification_subject_kind_check CHECK ((subject_kind = ANY (ARRAY['owner_review'::text, 'approval_request'::text, 'deployment'::text, 'drift'::text, 'canary_gate'::text, 'finding_digest'::text, 'temporary_grant'::text, 'session_revocation'::text, 'time_bound'::text, 'review_response'::text]))),
     CONSTRAINT iga_gov_pn_sent_chk CHECK (((state = 'sent'::text) = (sent_at IS NOT NULL)))
 );
 
@@ -9997,7 +9661,6 @@ CREATE TABLE public.iga_gov_settings (
     notify_webhook_url text DEFAULT ''::text NOT NULL,
     notify_webhook_secret_ref text DEFAULT ''::text NOT NULL,
     notify_channels_source text DEFAULT 'default'::text NOT NULL,
-    notify_channels_copied_at timestamp with time zone,
     updated_by uuid,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT iga_gov_settings_approval_valid_days_check CHECK (((approval_valid_days >= 1) AND (approval_valid_days <= 30))),
@@ -10007,7 +9670,7 @@ CREATE TABLE public.iga_gov_settings (
     CONSTRAINT iga_gov_settings_enforcement_mode_check CHECK ((enforcement_mode = ANY (ARRAY['findings_only'::text, 'enforce'::text]))),
     CONSTRAINT iga_gov_settings_evidence_retention_revs_check CHECK (((evidence_retention_revs >= 5) AND (evidence_retention_revs <= 365))),
     CONSTRAINT iga_gov_settings_iac_apply_hours_check CHECK (((iac_apply_hours >= 1) AND (iac_apply_hours <= 336))),
-    CONSTRAINT iga_gov_settings_notify_channels_source_check CHECK ((notify_channels_source = ANY (ARRAY['default'::text, 'phase3'::text, 'legacy_copy'::text]))),
+    CONSTRAINT iga_gov_settings_notify_channels_source_check CHECK ((notify_channels_source = ANY (ARRAY['default'::text, 'phase3'::text]))),
     CONSTRAINT iga_gov_settings_notify_webhook_url_check CHECK (((notify_webhook_url = ''::text) OR (notify_webhook_url ~~ 'https://%'::text))),
     CONSTRAINT iga_gov_settings_owner_review_days_check CHECK (((owner_review_days >= 1) AND (owner_review_days <= 30)))
 );
@@ -13557,3 +13220,90 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agent_containment_step');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 154: recovery-plan approval, accepted drift and the review_response notice
+-- (154_iga_gov_recovery_approval.sql, mirrored verbatim).
+-- ============================================================================
+-- 154_iga_gov_recovery_approval.sql — recovery-plan approval, accepted drift, author notices.
+--
+-- expand only. Idempotent: safe to run again.
+--
+-- WHY
+-- §8.9: a blocked undo (artifact_consumers_changed) offers a role-only recovery
+-- plan whose hash is not in the original approval, "so it needs its own
+-- approval (or governance:emergency)". Until now the only way to give it one
+-- was the emergency path: uq_iga_gov_approval_live allows ONE live approve row
+-- per version, and the deployment's foreign key (workspace_id, approval_id,
+-- version_id) requires an iga_gov_approval row of that version, so a second
+-- approval of the same version could not be stored.
+--
+-- A recovery approval is a row of the same table, scoped to one plan:
+--
+--   scope = 'version'   the approval of a proposal (every row so far)
+--   scope = 'recovery'  the approval of ONE side plan (recovery_plan_id), with
+--                       plan_hashes = {that plan's hash}; it never marks the
+--                       version approved and never counts as its live approval
+--
+-- uq_iga_gov_approval_live now applies to scope = 'version' only; a recovery
+-- plan has at most one live approval of its own (uq_iga_gov_approval_recovery).
+-- Readers of "the version's approval" filter scope = 'version'.
+
+ALTER TABLE iga_gov_approval ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'version';
+ALTER TABLE iga_gov_approval ADD COLUMN IF NOT EXISTS recovery_plan_id uuid;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_gov_approval_scope_chk' AND conrelid = 'iga_gov_approval'::regclass) THEN
+    ALTER TABLE iga_gov_approval ADD CONSTRAINT iga_gov_approval_scope_chk CHECK (
+      scope IN ('version','recovery')
+      AND ((scope = 'recovery') = (recovery_plan_id IS NOT NULL))
+      AND (scope = 'version' OR decision = 'approve'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'iga_gov_approval_recovery_plan_fkey' AND conrelid = 'iga_gov_approval'::regclass) THEN
+    ALTER TABLE iga_gov_approval ADD CONSTRAINT iga_gov_approval_recovery_plan_fkey
+      FOREIGN KEY (workspace_id, recovery_plan_id, version_id) REFERENCES iga_gov_plan (workspace_id, id, version_id);
+  END IF;
+END $$;
+
+DROP INDEX IF EXISTS uq_iga_gov_approval_live;
+CREATE UNIQUE INDEX uq_iga_gov_approval_live
+  ON iga_gov_approval (version_id) WHERE decision = 'approve' AND revoked_at IS NULL AND scope = 'version';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_gov_approval_recovery
+  ON iga_gov_approval (recovery_plan_id) WHERE scope = 'recovery' AND decision = 'approve' AND revoked_at IS NULL;
+
+-- ACCEPTED DRIFT (§8.8)
+-- "Accept drift" closes a drifted deployment: the deployment stays `drifted`
+-- (it still describes what AuthSec applied, which AWS no longer matches) and
+-- records who accepted it, when and why, so the console stops offering the
+-- choice and the event log keeps the decision. The actor is an audit
+-- reference like emergency_by: NO ACTION, so the user survives their record.
+ALTER TABLE iga_gov_deployment ADD COLUMN IF NOT EXISTS drift_accepted_at timestamptz;
+ALTER TABLE iga_gov_deployment ADD COLUMN IF NOT EXISTS drift_accepted_by uuid REFERENCES users(id);
+ALTER TABLE iga_gov_deployment ADD COLUMN IF NOT EXISTS drift_accepted_reason text NOT NULL DEFAULT '';
+
+-- AUTHOR NOTICE (§9.3 S4)
+-- "Keep a service" and "This will break something" create a version or block
+-- one, "and tell the author". The notice is its own subject kind, review_response,
+-- one row per (review, channel, recipient), resent on each new response.
+ALTER TABLE iga_gov_notification DROP CONSTRAINT IF EXISTS iga_gov_notification_subject_kind_check;
+ALTER TABLE iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check
+  CHECK (subject_kind IN ('owner_review','approval_request','deployment','drift','canary_gate','finding_digest','temporary_grant','session_revocation','time_bound','agent_alert','review_response'));
+
+-- ============================================================================
+-- 155: the legacy agent-policy feature retired; its tables are dropped
+-- (155_retire_legacy_agent_policy.sql, mirrored verbatim).
+-- ============================================================================
+-- Superseded pre-Phase-3 policy implementation, removed by product decision.
+-- No customer migration/compatibility period is required. Shared discovery,
+-- graph, workspace and runtime authorization tables are deliberately untouched.
+DROP TABLE IF EXISTS public.agent_policy_warnings;
+DROP TABLE IF EXISTS public.agent_policy_confirmations;
+DROP TABLE IF EXISTS public.agent_policy_actions;
+DROP TABLE IF EXISTS public.agent_policies;
+DROP TABLE IF EXISTS public.governance_notification_settings;
+
+UPDATE public.iga_gov_settings SET notify_channels_source = 'phase3' WHERE notify_channels_source = 'legacy_copy';
+ALTER TABLE public.iga_gov_settings DROP CONSTRAINT IF EXISTS iga_gov_settings_notify_channels_source_check;
+ALTER TABLE public.iga_gov_settings ADD CONSTRAINT iga_gov_settings_notify_channels_source_check CHECK (notify_channels_source IN ('default','phase3'));
+ALTER TABLE public.iga_gov_settings DROP COLUMN IF EXISTS notify_channels_copied_at;

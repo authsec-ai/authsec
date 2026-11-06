@@ -153,6 +153,11 @@ type IGAGovDeployment struct {
 	RevalidationResult      *string         `json:"revalidation_result,omitempty"`
 	CreatedAt               time.Time       `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt               time.Time       `json:"updated_at" gorm:"not null;default:now()"`
+	// DriftAcceptedAt is set when an operator accepted a drifted deployment
+	// (§8.8); the state stays drifted (migration 060).
+	DriftAcceptedAt     *time.Time `json:"drift_accepted_at,omitempty"`
+	DriftAcceptedBy     *uuid.UUID `json:"drift_accepted_by,omitempty" gorm:"type:uuid"`
+	DriftAcceptedReason string     `json:"drift_accepted_reason" gorm:"not null;default:''"`
 }
 
 func (IGAGovDeployment) TableName() string { return "iga_gov_deployment" }

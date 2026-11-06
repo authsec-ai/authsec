@@ -134,12 +134,16 @@ func (ctl *IGAGovPolicyController) ListPolicies(c *gin.Context) {
 			return nil, nil, err
 		}
 		list, next, err := ctl.authoring().ListPolicies(c.Request.Context(), ws, services.GovPolicyFilter{
-			Family: c.Query("family"), Provider: c.Query("provider"), Status: c.Query("status"), Lifecycle: c.Query("lifecycle"),
+			Family: c.Query("family"), Provider: c.Query("provider"), Status: c.Query("status"), Stage: c.Query("stage"), Lifecycle: c.Query("lifecycle"),
 			Q: c.Query("q"), Cursor: c.Query("cursor"), Limit: limit})
 		if err != nil {
 			return nil, nil, err
 		}
-		return list, gin.H{"next_cursor": next}, nil
+		tiles, err := ctl.authoring().PolicyStageTiles(c.Request.Context(), ws)
+		if err != nil {
+			return nil, nil, err
+		}
+		return list, gin.H{"next_cursor": next, "stage_tiles": tiles}, nil
 	})
 }
 

@@ -19,7 +19,7 @@ import (
 // -- iga_gov_policy / _version / _validation / _finding_rule / _owner_rule /
 // _owner.created_by, iga_gov_approval.decided_by, iga_gov_acceptance.accepted_by,
 // iga_gov_owner_review.exception_by, iga_gov_owner_response.user_id,
-// iga_gov_deployment.emergency_by, iga_gov_health_report.reported_by,
+// iga_gov_deployment.emergency_by / drift_accepted_by, iga_gov_health_report.reported_by,
 // iga_gov_settings.updated_by, iga_gov_iac_source.created_by,
 // cloud_enforcement_binding.consented_by, workspace_slack_integration.installed_by
 // (and the older role_assignment_requests.reviewed_by) -- are ON DELETE NO

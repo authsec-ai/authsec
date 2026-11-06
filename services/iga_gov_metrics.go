@@ -163,7 +163,7 @@ iga_m_approvals AS (
       SELECT max(e.occurred_at) AS submitted_at FROM iga_gov_event e
        WHERE e.workspace_id = a.workspace_id AND e.version_id = a.version_id
          AND e.event = 'version_proposed' AND e.occurred_at <= a.decided_at) s
-   WHERE a.workspace_id = @ws AND a.decided_at >= @from AND a.decided_at < @to AND s.submitted_at IS NOT NULL
+   WHERE a.workspace_id = @ws AND a.scope = 'version' AND a.decided_at >= @from AND a.decided_at < @to AND s.submitted_at IS NOT NULL
 ),
 iga_m_failures AS (
   SELECT DISTINCT c.role_id, x->>'event_time' AS at, x->>'action' AS action, x->>'session_name' AS session, x->>'error_code' AS code

@@ -4,6 +4,21 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-06 — Legacy agent-policy retirement and Phase 3 recovery, merged onto staging (branch `merge/legacy-policy-retire`)
+
+Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` at `d1763fe3`.
+
+### Done
+- Phase 3: a role-only recovery plan gets its own approval (scope `recovery`), "Accept drift" and "Re-apply" on a drifted deployment, author notices (`review_response`), isolation proposals, `GET /findings?category`.
+- Retired the pre-Phase-3 agent-policy feature (decision 2026-10-13, disposition plan): workers, `/authsec/governance/agent-policies`, warnings, notification settings, `/api/iga/v1/legacy/*`, the notification-channel copy.
+- Migrations renumbered from 138/139 (taken upstream) to `154_iga_gov_recovery_approval` (keeps 150's `agent_alert` notice kind) and `155_retire_legacy_agent_policy`; both mirrored at the end of bootstrap; policy schema head `155`.
+- Kept, unlike the original work: `enforcement_plans` and the cluster agent's `GET /authsec/provisioning/enforcement-plan` poll (plus the console history route). Kubernetes access policies (146) read the agent's `bindings=` report from it. Plan entries no longer carry `policy_id`.
+
+### Open
+- `155` drops `agent_policies`, `agent_policy_actions`, `agent_policy_confirmations`, `agent_policy_warnings` and `governance_notification_settings` with their rows. Their production row counts have not been checked; check before release.
+
+---
+
 ## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
 
 Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.

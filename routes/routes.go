@@ -276,18 +276,6 @@ func SetupRoutes(
 	// D-100).
 	SetupIGARoutes(r, platformCtrl.NewIGAController(config.DB), platformCtrl.NewIGAGraphReadController())
 
-	// LEGACY compatibility under the IGA prefix (disposition plan §3.1, Phase 3
-	// spec §7.10): a read-only list of the workspace's legacy agent policies
-	// with Pause and Remove, served by the legacy agent-policy service -- not
-	// Phase 3 code, and outside SetupIGARoutes on purpose. Same auth, same
-	// error envelope; the legacy governance permissions (governance:read to
-	// list, governance:admin to pause or remove, as the legacy
-	// /authsec/governance/agent-policies routes). The legacy routes below keep
-	// their behaviour.
-	platformCtrl.MountLegacyAgentPolicyCompatRoutes(r,
-		platformCtrl.NewLegacyAgentPolicyCompatController(config.DB),
-		middlewares.AuthMiddleware(), middlewares.Require)
-
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
@@ -1584,11 +1572,6 @@ func SetupRoutes(
 
 			// Which canonical agent in the correlated estate is this workload?
 			// Read is a discovery read; the decision is a correlation decision.
-			// What every matching policy adds up to for this agent, and which
-			// policies caused it — a state without an explanation is unreviewable.
-			discovery.GET("/agents/:id/effective-policy",
-				middlewares.Require("discovery", "read"), governanceController.GetAgentPolicyEffective)
-
 			discovery.GET("/agents/:id/iga-link",
 				middlewares.Require("discovery", "read"), governanceController.GetAgentIGALink)
 			discovery.POST("/agents/:id/iga-link/decisions",
@@ -1954,15 +1937,10 @@ func SetupRoutes(
 		{
 			actuation.GET("/instructions", governanceController.LeaseInstructions)
 			actuation.POST("/instructions/:id/result", governanceController.ReportInstruction)
-			// The enforcement plan: the WHOLE list of fingerprints this cluster
-			// should be containing, re-fetched on every actuation tick. Whole and
-			// not a delta, because a missed delta silently un-enforces while a
-			// whole plan is self-correcting on the next poll.
-			//
-			// The agent's self-report (mode, the version it is enforcing, its
-			// would-deny count) rides on this fetch as query parameters rather than
-			// on an endpoint of its own — one authenticated round trip that both
-			// reports and refreshes.
+			// The cluster's whole enforcement plan, polled on the agent's actuation
+			// interval. The agent's self-report (mode, enforcing version, denials,
+			// evict/delete/bindings capability) rides on this fetch as query
+			// parameters; Kubernetes access policies read bindings= from it.
 			actuation.GET("/enforcement-plan", governanceController.GetEnforcementPlan)
 		}
 
@@ -2029,57 +2007,6 @@ func SetupRoutes(
 				middlewares.Require("governance", "read"), governanceController.ListBirthrights)
 			governance.DELETE("/birthrights/:id",
 				middlewares.Require("governance", "admin"), governanceController.DeleteBirthright)
-			// The bridge to the correlated IGA estate. Reading a proposal is a
-			// discovery read; DECIDING one is a correlation decision, so it takes
-			// iga:review — the same permission as the classification and ownership
-			// decisions it sits alongside, rather than a governance permission that
-			// would let an entitlement reviewer redefine what an agent IS.
-			// Agent policies — the declarative layer above enforcement.
-			// Authoring is governance:admin; a destructive on_expiry additionally
-			// needs an attributable confirmation, checked in the service.
-			governance.POST("/agent-policies",
-				middlewares.Require("governance", "admin"), governanceController.CreateAgentPolicy)
-			governance.GET("/agent-policies",
-				middlewares.Require("governance", "read"), governanceController.ListAgentPolicies)
-			governance.GET("/agent-policies/:id",
-				middlewares.Require("governance", "read"), governanceController.GetAgentPolicy)
-			governance.DELETE("/agent-policies/:id",
-				middlewares.Require("governance", "admin"), governanceController.DeleteAgentPolicy)
-			// Dry-run by default; a live run is refused until the phase order allows it.
-			governance.POST("/agent-policies/reconcile",
-				middlewares.Require("governance", "admin"), governanceController.ReconcileAgentPolicies)
-			// The lookahead: what this system will do to the cluster this week. Read
-			// permission on purpose — anyone who can see governance state should be
-			// able to see what is about to happen because of it.
-			governance.GET("/policies/upcoming",
-				middlewares.Require("governance", "read"), governanceController.ListUpcomingPolicyActions)
-
-			// What a cluster has actually been told to contain, and whether it says
-			// it is enforcing it. The gap between the published version and the
-			// reported one is the difference between a decision and its effect.
-			governance.GET("/connectors/:id/enforcement-plans",
-				middlewares.Require("governance", "read"), governanceController.ListEnforcementPlans)
-
-			// Pre-deadline warnings. The LOOKAHEAD above is the system of record —
-			// a pull, with no delivery to fail. These configure and inspect the
-			// escalation layered on top of it.
-			//
-			// Reading which warnings failed is governance:read on purpose: an
-			// undelivered warning is the thing standing between an operator and an
-			// unannounced deletion, so anyone who can see governance state should
-			// see it. CHANGING where warnings go is admin — redirecting them is
-			// indistinguishable from silencing them.
-			governance.GET("/notification-settings",
-				middlewares.Require("governance", "read"), governanceController.GetNotificationSettings)
-			governance.PUT("/notification-settings",
-				middlewares.Require("governance", "admin"), governanceController.UpdateNotificationSettings)
-			governance.GET("/policy-warnings",
-				middlewares.Require("governance", "read"), governanceController.ListPolicyWarnings)
-			// Schedule and send now rather than on the worker's tick, so "did my
-			// policy actually warn anyone" is answerable while setting one up.
-			governance.POST("/policy-warnings/run",
-				middlewares.Require("governance", "admin"), governanceController.RunPolicyWarnings)
-
 			// The force-delete escalation: override a PodDisruptionBudget that
 			// refused an eviction. THE ONLY WAY TO REACH ONE — no reconciler,
 			// policy expiry or retry path can, deliberately.
@@ -2089,6 +2016,11 @@ func SetupRoutes(
 			// set. The reason is required here, and again by a database CHECK.
 			governance.POST("/agents/:id/force-evict",
 				middlewares.Require("governance", "admin"), governanceController.ForceEvictAgent)
+
+			// What a cluster has been told to contain, and whether it says it is
+			// enforcing it.
+			governance.GET("/connectors/:id/enforcement-plans",
+				middlewares.Require("governance", "read"), governanceController.ListEnforcementPlans)
 
 			governance.GET("/iga-links",
 				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)

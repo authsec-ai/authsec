@@ -56,13 +56,12 @@ type EnforcementPlanManager interface {
 }
 
 type enforcementPlanManager struct {
-	db       *gorm.DB
-	policies AgentPolicyManager
+	db *gorm.DB
 }
 
 // NewEnforcementPlanManager builds the manager.
 func NewEnforcementPlanManager(db *gorm.DB) EnforcementPlanManager {
-	return &enforcementPlanManager{db: db, policies: NewAgentPolicyManager(db)}
+	return &enforcementPlanManager{db: db}
 }
 
 /* -------------------------------- publish -------------------------------- */
@@ -166,10 +165,10 @@ func (m *enforcementPlanManager) History(workspaceID, sourceID uuid.UUID,
 
 // build assembles the document from the DECISIONS of record.
 //
-// The source of truth is discovered_agents.status, not the policy table. A policy
-// asking for quarantine only reaches the cluster once the reconciler has moved the
-// agent's status — so there is exactly one answer to "is this agent contained",
-// and a dry-run reconcile can never contain anything.
+// The source of truth is discovered_agents.status: there is exactly one answer
+// to "is this agent contained". Entries carry no policy_id since the legacy
+// agent-policy feature was retired (155); the field stays in the document for
+// agents that read it.
 func (m *enforcementPlanManager) build(workspaceID uuid.UUID,
 	src *models.DiscoverySource) (*models.EnforcementPlanDoc, error) {
 
@@ -180,18 +179,6 @@ func (m *enforcementPlanManager) build(workspaceID uuid.UUID,
 		Order("fingerprint ASC").Find(&agents).Error
 	if err != nil {
 		return nil, err
-	}
-
-	// Policy attribution costs a query per quarantining policy, so it is only
-	// computed when there is something to attribute. With nothing contained -- the
-	// overwhelmingly common case, polled every 30 seconds by every cluster -- the
-	// build is one indexed SELECT that returns no rows.
-	var byAgent map[uuid.UUID]uuid.UUID
-	if len(agents) > 0 {
-		byAgent, err = m.quarantiningPolicies(workspaceID)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	doc := &models.EnforcementPlanDoc{
@@ -228,48 +215,9 @@ func (m *enforcementPlanManager) build(workspaceID uuid.UUID,
 			Reason:       reason,
 			Since:        since.UTC(),
 		}
-		if pid, ok := byAgent[a.ID]; ok {
-			e.PolicyID = pid.String()
-		}
 		doc.Deny = append(doc.Deny, e)
 	}
 	return doc, nil
-}
-
-// quarantiningPolicies maps each agent to a policy that asks for its containment.
-//
-// Only policies whose desired_state is 'quarantined' are expanded, so an agent
-// quarantined by hand is not retroactively attributed to a policy that merely
-// happens to cap its scope. An agent covered by more than one keeps the first by
-// creation order, which is stable across calls — the field is an explanation, not
-// the authority, and the authority is the agent's status.
-func (m *enforcementPlanManager) quarantiningPolicies(
-	workspaceID uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
-
-	policies, err := m.policies.List(workspaceID, true)
-	if err != nil {
-		return nil, err
-	}
-	out := map[uuid.UUID]uuid.UUID{}
-	for i := range policies {
-		p := &policies[i]
-		if p.DesiredState != models.AgentPolicyStateQuarantined {
-			continue
-		}
-		agents, err := m.policies.Expand(workspaceID, p)
-		if err != nil {
-			// A broken selector must not blank the plan. Skipping it costs an
-			// explanation on some entries; failing the build would stop serving
-			// every containment in the cluster, which is the far worse outcome.
-			continue
-		}
-		for j := range agents {
-			if _, seen := out[agents[j].ID]; !seen {
-				out[agents[j].ID] = p.ID
-			}
-		}
-	}
-	return out, nil
 }
 
 // k8sCoordinates pulls the workload coordinates out of a sighting's metadata.
