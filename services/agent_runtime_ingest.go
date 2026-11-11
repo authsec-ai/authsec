@@ -704,10 +704,20 @@ func (s *AgentRuntimeIngestService) Ingest(ctx context.Context, p AgentEventPrin
 	fresh := map[string]bool{}
 	err = tenancy.InWorkspace(ctx, s.db, p.WorkspaceID, func(tx *gorm.DB) error {
 		if len(ids) > 0 {
-			rows, err := tx.Raw(`INSERT INTO agent_event_seen (workspace_id, connector_id, event_id)
-				SELECT ?, ?, unnest(?::text[])
-				ON CONFLICT (workspace_id, event_id) DO NOTHING
-				RETURNING event_id`, p.WorkspaceID, p.ConnectorID, pq.StringArray(ids)).Rows()
+			// New ids are inserted undispatched; ids already here but never
+			// dispatched (a process died after the insert, or the dispatch
+			// failed) are returned too, so this delivery dispatches them.
+			rows, err := tx.Raw(`WITH ins AS (
+				    INSERT INTO agent_event_seen (workspace_id, connector_id, event_id)
+				    SELECT ?, ?, unnest(?::text[])
+				    ON CONFLICT (workspace_id, event_id) DO NOTHING
+				    RETURNING event_id)
+				SELECT event_id FROM ins
+				UNION
+				SELECT event_id FROM agent_event_seen
+				 WHERE workspace_id = ? AND connector_id = ? AND event_id = ANY(?::text[]) AND dispatched_at IS NULL`,
+				p.WorkspaceID, p.ConnectorID, pq.StringArray(ids),
+				p.WorkspaceID, p.ConnectorID, pq.StringArray(ids)).Rows()
 			if err != nil {
 				return err
 			}
@@ -764,29 +774,31 @@ func (s *AgentRuntimeIngestService) Ingest(ctx context.Context, p AgentEventPrin
 		derr := s.dispatch(dctx, p.WorkspaceID, p.ConnectorID, newEvents)
 		cancel()
 		if derr != nil {
+			// The rows stay undispatched: EventBridge retries the delivery
+			// and the retry dispatches them again.
 			log.Printf("[agent-event-ingest] stage=dispatch workspace=%s connector=%s events=%d outcome=failed err=%v",
 				p.WorkspaceID, p.ConnectorID, len(newEvents), derr)
-			s.releaseSeen(p, newIDs)
 			return res, ErrAgentEventDispatch
 		}
+		s.markDispatched(p, newIDs)
 	}
 	s.maybePurge(ctx, p.WorkspaceID)
 	return res, nil
 }
 
-// releaseSeen forgets events whose dispatch failed, so a retry is not
-// deduplicated away. Its own failure is logged: the poller remains the
-// backstop for management events.
-func (s *AgentRuntimeIngestService) releaseSeen(p AgentEventPrincipal, ids []string) {
+// markDispatched records that every consumer has returned for ids. If it
+// fails the rows stay undispatched and a redelivery dispatches them again,
+// which the idempotent consumers absorb; the failure is logged.
+func (s *AgentRuntimeIngestService) markDispatched(p AgentEventPrincipal, ids []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := tenancy.InWorkspace(ctx, s.db, p.WorkspaceID, func(tx *gorm.DB) error {
-		return tx.Exec(`DELETE FROM agent_event_seen
-			WHERE workspace_id = ? AND connector_id = ? AND event_id = ANY(?::text[])`,
+		return tx.Exec(`UPDATE agent_event_seen SET dispatched_at = now()
+			WHERE workspace_id = ? AND connector_id = ? AND event_id = ANY(?::text[]) AND dispatched_at IS NULL`,
 			p.WorkspaceID, p.ConnectorID, pq.StringArray(ids)).Error
 	})
 	if err != nil {
-		log.Printf("[agent-event-ingest] stage=release workspace=%s connector=%s events=%d outcome=failed err=%v",
+		log.Printf("[agent-event-ingest] stage=mark_dispatched workspace=%s connector=%s events=%d outcome=failed err=%v",
 			p.WorkspaceID, p.ConnectorID, len(ids), err)
 	}
 }

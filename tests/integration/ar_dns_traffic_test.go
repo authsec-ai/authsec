@@ -42,13 +42,15 @@ const dnsLogGroup = "arn:aws:logs:us-east-1:429418377036:log-group:/aws/route53/
 // dnsLookup is one query-log record.
 type dnsLookup struct {
 	src, instance, vpc, name string
-	at                       time.Time
+	at                       time.Time // also its arrival (@ingestionTime)
 }
 
 // dnsLogs is a Logs Insights stand-in that does what the real query does: it
-// keeps the records in [StartTime, EndTime] whose query_name matches the
-// query's own `like /.../` filter, and aggregates them per (srcaddr,
-// src_instance, vpc, query_name). It records every window asked of it.
+// keeps the records in [StartTime, EndTime] that ARRIVED in the query's
+// @ingestionTime window and whose query_name matches the query's own
+// `like /.../` filter, and aggregates them per (srcaddr, src_instance, vpc,
+// query_name). It records every arrival window asked of it, as
+// [from, to-1] in seconds.
 type dnsLogs struct {
 	mu      sync.Mutex
 	records []dnsLookup
@@ -57,7 +59,10 @@ type dnsLogs struct {
 	n       int
 }
 
-var dnsLikeFilter = regexp.MustCompile(`filter query_name like /(.*)/\n`)
+var (
+	dnsLikeFilter   = regexp.MustCompile(`filter query_name like /(.*)/\n`)
+	dnsIngestFilter = regexp.MustCompile(`filter @ingestionTime >= (\d+) and @ingestionTime < (\d+)`)
+)
 
 func (f *dnsLogs) StartQuery(_ context.Context, in *cloudwatchlogs.StartQueryInput, _ ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.StartQueryOutput, error) {
 	f.mu.Lock()
@@ -68,7 +73,13 @@ func (f *dnsLogs) StartQuery(_ context.Context, in *cloudwatchlogs.StartQueryInp
 	}
 	re := regexp.MustCompile(m[1])
 	from, to := aws.ToInt64(in.StartTime), aws.ToInt64(in.EndTime)
-	f.windows = append(f.windows, [2]int64{from, to})
+	im := dnsIngestFilter.FindStringSubmatch(aws.ToString(in.QueryString))
+	if im == nil {
+		panic("the query has no @ingestionTime window")
+	}
+	ingFrom, _ := strconv.ParseInt(im[1], 10, 64)
+	ingTo, _ := strconv.ParseInt(im[2], 10, 64)
+	f.windows = append(f.windows, [2]int64{ingFrom / 1000, ingTo/1000 - 1})
 	type key struct{ src, inst, vpc, name string }
 	type agg struct {
 		n           int
@@ -76,7 +87,9 @@ func (f *dnsLogs) StartQuery(_ context.Context, in *cloudwatchlogs.StartQueryInp
 	}
 	groups := map[key]*agg{}
 	for _, r := range f.records {
-		if r.at.Unix() < from || r.at.Unix() > to || !re.MatchString(r.name) {
+		arrived := r.at
+		if r.at.Unix() < from || r.at.Unix() > to || arrived.UnixMilli() < ingFrom || arrived.UnixMilli() >= ingTo ||
+			!re.MatchString(r.name) {
 			continue
 		}
 		inst := r.instance

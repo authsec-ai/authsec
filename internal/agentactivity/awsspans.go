@@ -27,9 +27,24 @@ const AWSSpansLogGroup = "aws/spans"
 
 // AWSSpansQuery selects GenAI / agent / MCP span records, oldest first; the
 // limit is appended.
-const AWSSpansQuery = `fields @timestamp, @message
+const AWSSpansQuery = `fields @timestamp, @ingestionTime, @message
 | filter @message like /gen_ai|openinference|traceloop|mcp\./
-| sort @timestamp asc`
+| sort @ingestionTime asc`
+
+// SpanLateArrival is how much later than its event time a span may reach
+// aws/spans and still be read. A read selects spans by ARRIVAL
+// (@ingestionTime) in [Since, Until) and searches event time from
+// SpanLateArrival before Since, so a span up to this late is read once by the
+// read whose window holds its arrival; a later one is missed.
+const SpanLateArrival = 2 * time.Hour
+
+// spansQueryFor is AWSSpansQuery restricted to spans that arrived in
+// [since, until), oldest arrival first.
+func spansQueryFor(since, until time.Time, limit int) string {
+	return strings.Replace(AWSSpansQuery, "\n| sort",
+		fmt.Sprintf("\n| filter @ingestionTime >= %d and @ingestionTime < %d\n| sort", since.UnixMilli(), until.UnixMilli()), 1) +
+		fmt.Sprintf("\n| limit %d", limit)
+}
 
 // Span reader defaults (spec §8).
 const (
@@ -73,7 +88,7 @@ type SpanRead struct {
 	Spans   []Span
 	Records int // result rows
 	Invalid int // rows whose @message was not a span record
-	// Last is the newest @timestamp read (zero when none).
+	// Last is the newest arrival (@ingestionTime, else @timestamp) read; zero when none.
 	Last time.Time
 	// CapHit: the query returned Limit rows, so the window may hold more.
 	CapHit bool
@@ -112,10 +127,12 @@ func ReadAWSSpans(ctx context.Context, api LogsInsightsAPI, q SpanQuery) (SpanRe
 	}
 	started, err := api.StartQuery(ctx, &cloudwatchlogs.StartQueryInput{
 		LogGroupNames: []string{AWSSpansLogGroup},
-		StartTime:     aws.Int64(q.Since.Unix()),
-		EndTime:       aws.Int64(q.Until.Unix()),
-		QueryString:   aws.String(AWSSpansQuery + fmt.Sprintf("\n| limit %d", q.Limit)),
-		Limit:         aws.Int32(int32(q.Limit)),
+		// Event time reaches SpanLateArrival back; the query keeps only spans
+		// that ARRIVED in [Since, Until).
+		StartTime:   aws.Int64(q.Since.Add(-SpanLateArrival).Unix()),
+		EndTime:     aws.Int64(q.Until.Unix()),
+		QueryString: aws.String(spansQueryFor(q.Since, q.Until, q.Limit)),
+		Limit:       aws.Int32(int32(q.Limit)),
 	})
 	if err != nil {
 		return out, fmt.Errorf("logs:StartQuery: %w", err)
@@ -154,7 +171,7 @@ func readRows(rows [][]cwltypes.ResultField, limit int) SpanRead {
 	out.Records = len(rows)
 	out.CapHit = len(rows) >= limit
 	for _, row := range rows {
-		var ts time.Time
+		var ts, arrived time.Time
 		var msg string
 		for _, f := range row {
 			switch aws.ToString(f.Field) {
@@ -162,12 +179,21 @@ func readRows(rows [][]cwltypes.ResultField, limit int) SpanRead {
 				if t, err := time.Parse(insightsTime, aws.ToString(f.Value)); err == nil {
 					ts = t.UTC()
 				}
+			case "@ingestionTime":
+				if t, err := time.Parse(insightsTime, aws.ToString(f.Value)); err == nil {
+					arrived = t.UTC()
+				}
 			case "@message":
 				msg = aws.ToString(f.Value)
 			}
 		}
-		if ts.After(out.Last) {
-			out.Last = ts
+		// Last is the newest ARRIVAL read: the cursor is an arrival time.
+		mark := arrived
+		if mark.IsZero() {
+			mark = ts
+		}
+		if mark.After(out.Last) {
+			out.Last = mark
 		}
 		sp, err := ParseAWSSpanRecord([]byte(msg))
 		if err != nil {

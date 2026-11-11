@@ -132,15 +132,21 @@ from `scanRegion`, code in its own file): CloudWatch Logs Insights over log
 group **`aws/spans`** (where AgentCore and Transaction Search write spans),
 
 ```
-fields @timestamp, @message
+fields @timestamp, @ingestionTime, @message
 | filter @message like /gen_ai|openinference|traceloop|mcp\./
-| sort @timestamp asc
+| filter @ingestionTime >= <cursor ms> and @ingestionTime < <until ms>
+| sort @ingestionTime asc
 | limit 1000
 ```
 
 from the `aws_spans` cursor (first scan: the last 24 h) to now − 5 min
-(ingestion lag); at most one query of 1,000 spans per region per scan. Capped →
-the cursor moves to the last span read and the state is `partial`. Results are
+(ingestion lag); at most one query of 1,000 spans per region per scan. The
+cursor is an **arrival time**: the query keeps spans that arrived
+(`@ingestionTime`) in `[cursor, now − 5 min)`, sorted by arrival, and searches
+event time from `SpanLateArrival` (2 h) before the cursor, so a span that
+reaches `aws/spans` up to 2 h after its event time is read once; later ones
+are missed. Capped → the cursor moves to the last arrival read and the state
+is `partial`. Results are
 polled for at most 60 s (then `StopQuery`, state `error`). Each `@message` is
 one span record (OTLP shape with `attributes` as a map; parsed tolerantly,
 §5). **UNVERIFIED** against a lab account: the record shape, and that

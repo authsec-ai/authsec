@@ -23,7 +23,7 @@ const (
 	AgentAlertsSchemaHead = "150"
 	// AgentRuntimeSchemaHead names the migrations the runtime (inference,
 	// suggestions, findings, event stream, CloudTrail cursor) needs.
-	AgentRuntimeSchemaHead = "147, 148, 149, 160"
+	AgentRuntimeSchemaHead = "147, 148, 149, 160, 161"
 
 	// GovCodeAgentAlertsUnavailable and GovCodeAgentRuntimeUnavailable are the
 	// 503 codes of the alert routes and the runtime routes.
@@ -41,6 +41,7 @@ type agentSchemaGate struct {
 	mu        sync.Mutex
 	head      string
 	relations []string
+	columns   [][2]string // {table, column} a relation check cannot prove
 	ok        bool
 	reason    string
 	at        time.Time
@@ -49,7 +50,8 @@ type agentSchemaGate struct {
 
 var (
 	agentAlertsGate  = &agentSchemaGate{head: AgentAlertsSchemaHead, relations: agentAlertsSchemaRelations}
-	agentRuntimeGate = &agentSchemaGate{head: AgentRuntimeSchemaHead, relations: agentRuntimeSchemaRelations}
+	agentRuntimeGate = &agentSchemaGate{head: AgentRuntimeSchemaHead, relations: agentRuntimeSchemaRelations,
+		columns: [][2]string{{"agent_event_seen", "dispatched_at"}}}
 )
 
 func (g *agentSchemaGate) verify(db *gorm.DB) error {
@@ -61,6 +63,15 @@ func (g *agentSchemaGate) verify(db *gorm.DB) error {
 		}
 		if !ok {
 			missing = append(missing, rel)
+		}
+	}
+	for _, c := range g.columns {
+		ok, err := repositories.HasColumn(db, c[0], c[1])
+		if err != nil {
+			return fmt.Errorf("schema verification could not run: %w", err)
+		}
+		if !ok {
+			missing = append(missing, c[0]+"."+c[1])
 		}
 	}
 	if len(missing) > 0 {

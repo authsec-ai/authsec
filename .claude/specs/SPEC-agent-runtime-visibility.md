@@ -222,6 +222,19 @@ Response 202; 401 unknown secret; 413; 429 per-connector limit
   destination to the endpoint above.
 - Idempotent by CloudTrail `eventID`; polling (§5.1) stays as the backstop; the
   connector shows "stream silent since …" after a configurable gap.
+- **Delivery is best effort and its latency is measured, not promised.** AWS
+  delivers service events to CloudTrail, and CloudTrail events to EventBridge,
+  on a best-effort basis ([doc](https://docs.aws.amazon.com/eventbridge/latest/ref/events-ref-bedrock.html)).
+  The connector reports `last_event_time` and silence; the lab measured 10–30 s.
+- **Durable acceptance (migration 161).** Each accepted eventID is recorded in
+  `agent_event_seen` with `dispatched_at` NULL, and `dispatched_at` is set only
+  after every consumer has returned. A delivery whose eventIDs are present but
+  undispatched (a dispatch error, or a process that died after the insert) is
+  dispatched again; EventBridge retries the delivery for up to 24 h (185
+  attempts in the event-stream template). Every consumer is idempotent by
+  eventID, so a second dispatch changes nothing. Before 161 the row was
+  committed before dispatch and only a normal error removed it, so a crash in
+  between lost the event for the live consumers.
 
 ### 5.7 Detections and alerts (P2)
 
@@ -521,14 +534,27 @@ lookups of Lambdas and Fargate tasks, which carry no `srcids.instance`).
 
 **Window and cost.** Logs Insights is charged per GB scanned. Per (connector,
 region, log group) a cursor (`cloud_dns_cursor`, migration 153, stream `dns`)
-records the window read: the first read covers 24 h; later reads start at the
-previous `read_to` (exclusive end, 10 minutes behind the scan for delivery
-delay) and are capped at **7 days**. An older mark is read for its last 7
+records the window read. Windows are cut by **arrival time** (`@ingestionTime`,
+when CloudWatch Logs received the line), not by event time: the query keeps
+only lines that arrived in `[read_to, now − 10 min)` and searches event time
+from `DNSLateArrival` (2 h) before the window. Consecutive windows never
+overlap, so a line is counted once, and a line that arrives after a read has
+passed its event time is still read by the read whose window holds its
+arrival. A line arriving more than 2 h after its event time is missed (the
+late-data policy; AWS states no maximum delivery delay). The first read covers
+24 h; later reads are capped at **7 days**. An older mark is read for its last 7
 days and the cursor marks the read `partial` (`lapsed`); a read that reaches
 the 10,000-row limit is `partial` (`truncated`). At most 10 log groups per
 region per scan (more: `partial`, the rest named). `records_scanned` and
 `bytes_scanned` are kept per read so the cost is visible. A failed read moves
 nothing and records `last_error`.
+
+**What a count means.** The Resolver logs only *unique* queries: a lookup it
+answers from its cache within the record's TTL is not logged
+([doc](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-query-logs.html)),
+and the workload's own resolver cache answers repeats before they reach it.
+`queries` is therefore evidence of **resolution activity** (the workload looked
+the host up), never a count of model requests.
 
 ### 11.3 Attribution
 
@@ -546,7 +572,7 @@ used.
 | Evidence (in this order) | Subject | Confidence |
 |---|---|---|
 | `srcids.instance` in the record | the EC2 instance (and its instance-profile role) | `query_time` |
-| interface `AWS Lambda VPC ENI-<name>` / type `lambda` | the Lambda function of that name (longest inventory name it starts with) | `scan_time`; Lambda shares one interface across functions with the same subnets and security groups, and the interface names the function that created it |
+| interface `AWS Lambda VPC ENI-<name>` / type `lambda` | Lambda shares one interface across every function with the same subnet and security groups ([doc](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-enis)). The candidates are the inventoried functions whose VPC subnets include the interface's subnet and whose security groups equal its groups (`vpc_subnet_ids`, `vpc_security_group_ids` in `cloud_workload.attrs`). One candidate: that function. Several: subject `workload_set` keyed `lambda_eni:<region>:<eni>` listing every candidate, **unresolved**, with `identity_id` only when they all run as one role. Until a scan has recorded VPC settings, the function the description names, with a note that sharing was not checked | `scan_time` (`eni_lambda`, or `eni_lambda_shared` for a set) |
 | interface described by an ECS attachment ARN | the running task holding the interface (`ecs:ListClusters/ListTasks/DescribeTasks`), then its task definition | `scan_time` |
 | interface attached to an instance | the instance | `scan_time` |
 | a secondary address on an instance, or a VPC CNI interface (`aws-K8S-...`) | the instance (EKS node), **pod level unresolved** (`subject.pod_level = "unresolved"`) | as above |
@@ -634,3 +660,75 @@ before release.
 4. Cost: Logs Insights bills per GB scanned (24 h on the first read, then only
    the new interval, at most 7 days, per log group per scan); the bytes
    scanned per read are kept in `cloud_dns_cursor`.
+
+## 12. Review 3 (2026-11-11): verified defects, fixes, and a PROPOSED product direction
+
+An external design review of the system-design document and code. Its factual
+claims were checked against the code and AWS's documentation on 2026-11-11.
+
+### 12.1 Verified and fixed (branch `fix/agent-runtime-review-3`)
+
+| Claim | Verified | Fix |
+|---|---|---|
+| A crash between committing `agent_event_seen` and dispatching loses the event for the live consumers | yes (`agent_runtime_ingest.go`: insert, then dispatch; only a normal error deleted the row) | migration 161 `dispatched_at`; undispatched rows are redispatched on EventBridge's retry (§5.6) |
+| A Lambda interface does not identify one function | yes; AWS shares an interface across functions with the same subnet and security groups | candidate set from recorded Lambda VPC settings; unresolved `workload_set` when several (§11.3) |
+| Non-overlapping event-time windows miss late log lines | yes (`StartQuery` on event time from the previous `read_to`) | windows cut by `@ingestionTime` with a 2 h late-arrival search (§11.2; activity spec, span reader). The ingestion filter was run against the lab log group: it selected the window's arrivals and excluded older ones |
+| Resolver logs are not one line per question | yes; cached answers are not logged | counts described as resolution activity, not requests (§11.2) |
+| EventBridge delivery "within seconds" is not a guarantee | yes; best effort per AWS | latency stated as measured, health shown (§5.6) |
+| "CloudTrail records every call; scans count every model call exactly" | the system-design PDF overstated it; this spec (§5.1) already scopes coverage to management events, with data events seen only through the stream | PDF corrected |
+
+### 12.2 Verified, not changed (needs a product decision)
+
+- **Detections run only for labelled identities** (`AgentAlertLabels`,
+  `agent_runtime_alerts.go`): an unlabelled or newly seen identity raises
+  nothing until a scan labels it.
+- **Containment success is configuration, not effect.** `contained` means the
+  steps were applied; behavioural verification is separate (`effective`, late
+  events). Lambda concurrency 0 stops **new invocations** only; restricting an
+  IAM role does not revoke an external provider key the workload holds.
+
+### 12.3 PROPOSED direction (not decided; for Aditya)
+
+1. **A governed run as the central object.** Application and version, run id
+   and parent run id, requester, owner and environment, task type, approved
+   tools and resource scope, time/call/spend limits, progress checkpoints and
+   state, and the interventions available. Supplied by trusted application or
+   orchestration context (existing OpenTelemetry instrumentation plus a small
+   run-context integration), never inferred from an IAM role or a DNS lookup.
+2. **Four separate dimensions instead of one label ladder:** classification
+   (agent, AI application, unknown), visibility (which sources report on it),
+   attribution (run, workload, or shared identity only), control (what AuthSec
+   can actually block or stop).
+3. **Intervention contracts that state their real scope:** reject a tool call
+   (gateway), stop further model calls (model gateway or provider control),
+   cancel one run (orchestrator integration), restrict an AWS identity (IAM),
+   disable new Lambda invocations (concurrency). Success reads requested →
+   applied → independently checked → effect observed, with what remains
+   unobservable; the UI names what happened ("New Lambda invocations disabled").
+4. **Detection scope set by the customer** (monitored applications and
+   infrastructure scopes), with detections running regardless of
+   classification inside it; classification only adds context and priority.
+5. **An approved behaviour envelope per application** (tools, resource
+   scopes, destinations, budgets, deadlines, approval points), with findings
+   phrased as departures from it ("accessed a production credential outside its
+   approved scope; previous runs touched only the document store").
+6. **Onboarding in three independent steps:** Connect (read-only AWS),
+   Observe (traces and run context), Control (gateway or runtime integration).
+   DNS logging, provider admin keys and classification review are optional,
+   never prerequisites.
+7. **Hard budget limits need admission control** (reservations at the request
+   boundary, defined handling of in-flight requests); hourly provider
+   reconciliation is accounting, not enforcement.
+8. **Five demonstrations before expanding:** (a) two runs share a role, one
+   misbehaves, the intervention leaves the other running; (b) a new workload
+   acts suspiciously before classification and stays visible; (c) an agent
+   holding an external provider key, with the UI stating which intervention can
+   stop those calls; (d) events arriving late, twice, and across a processing
+   crash, preserved without invented completeness; (e) a control applied but
+   not behaviourally verifiable, shown as such.
+
+What exists toward this: OTLP spans with trace and parent ids (activity
+timeline), the request-time gateway (AuthZEN policy decision point), the
+containment preview and separate enforcement role. What does not: run identity
+and context, budgets with admission control, run-level cancellation, scoped
+detection, behaviour envelopes.
