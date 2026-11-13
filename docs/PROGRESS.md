@@ -4,6 +4,18 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-13 — AuthSec Agent Kit control plane (branch `feat/agent-kit-control-plane`)
+
+- authsec-cli machines connect as discovery sources of kind `vm_sensor`: they register and heartbeat on `/agent-registration`, report agents as sightings (`source: vm_sensor`, metadata `machine.agent_id`), and hand over an actuation credential as Kubernetes agents do.
+- Migration 147: `agentkit_events` (decisions, detections, agent start/stop, sensor, access summaries; source pinned to the workspace by a composite FK) and `agentkit_policies` (authsec.ai/v1 AgentPolicy YAML, one row per version). Both under RLS; bootstrap carries them; parity rehearsed (fresh == upgraded, the upgrade applies 147 only).
+- Machine routes `/authsec/discovery/agentkit/machine/{events,policies}` always need a credential, whatever `IGA_DISCOVERY_INGEST_AUTH` says: the machine's actuation token, or a live ingest token of the workspace naming a vm_sensor source of it. A machine holding an actuation token speaks only with it. Policies come with an ETag.
+- Console routes `/authsec/discovery/agentkit/{events,access,policies,policies/:agent/versions}` (discovery:read), `PUT policies/:agent` and `POST policies/:agent/block` (discovery:admin). A save names the version it started from (409 when stale). Block adds one deny rule (host, cidr, path, command, mcp) as a new version, keeping the YAML's comments; an agent without its own policy starts from a copy of `*`.
+- Quarantine of a machine agent queues a `quarantine` instruction with payload `target: machine` to its vm_sensor source (no eviction); without actuation the decision stands and nothing is queued, as for clusters.
+- Tests: `tests/integration/agentkit_test.go` (auth matrix, cross-workspace reads/writes/cursors/pulls, versions, block, quarantine), `services/agentkit_block_test.go`. Ratchet unchanged (72).
+- Note: `scripts/schema-parity.sh` with pg_dump 18 reports `pg_attver` lines as differences; filtered, the schemas match.
+
+---
+
 ## 2026-11-04 — Azure blocks in tenants without PIM (AS-171)
 
 - A colleague found every Azure access block stuck on "Applying" in a tenant without Entra ID P2: the PIM schedule read (added after 22 Oct, so AI Search had worked then) answers 400 `AadPremiumLicenseRequired`, and the block retried it every minute forever. That answer now means the tenant has no PIM, so nothing is time-bound and the block proceeds; any other PIM error still waits. Stuck blocks proceed on their next retry once deployed.

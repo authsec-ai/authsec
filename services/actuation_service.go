@@ -763,6 +763,12 @@ func EnforceQuarantine(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discove
 	// The workload coordinate the NetworkPolicy needs, taken from the sighting metadata
 	// rather than re-derived, so enforcement targets exactly what discovery saw.
 	var meta struct {
+		// Machine is set on an AuthSec Agent Kit sighting: an agent process
+		// on a machine whose daemon (a vm_sensor source) enforces.
+		Machine struct {
+			AgentID string `json:"agent_id"`
+			Host    string `json:"host"`
+		} `json:"machine"`
 		Kubernetes struct {
 			Namespace    string            `json:"namespace"`
 			WorkloadKind string            `json:"workload_kind"`
@@ -772,6 +778,9 @@ func EnforceQuarantine(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discove
 	}
 	if len(agent.Metadata) > 0 {
 		_ = json.Unmarshal(agent.Metadata, &meta)
+	}
+	if meta.Machine.AgentID != "" {
+		return enqueueMachineQuarantine(db, workspaceID, agent, kind, release, meta.Machine.AgentID, actor)
 	}
 	if meta.Kubernetes.Namespace == "" || meta.Kubernetes.WorkloadName == "" {
 		return false, "the sighting carries no workload coordinate, so a NetworkPolicy " +
@@ -832,6 +841,48 @@ func EnforceQuarantine(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discove
 			meta.Kubernetes.Labels, actor)
 	}
 
+	if !created {
+		return true, "already queued"
+	}
+	return true, ""
+}
+
+// enqueueMachineQuarantine queues a quarantine (or release) of an agent on an
+// AuthSec Agent Kit machine. The daemon freezes the agent's processes and
+// cuts their network itself, so there is no separate eviction. Only a
+// vm_sensor source acts on it.
+func enqueueMachineQuarantine(db *gorm.DB, workspaceID uuid.UUID, agent *models.DiscoveredAgent,
+	kind string, release bool, machineAgentID, actor string) (bool, string) {
+
+	var src models.DiscoverySource
+	if err := db.First(&src, "workspace_id = ? AND id = ?", workspaceID, *agent.DiscoverySourceID).Error; err != nil {
+		return false, "the machine that reported this agent is not found"
+	}
+	if src.Kind != models.DiscoverySourceVMSensor {
+		return false, "the sighting says machine, but its source is not a machine (vm_sensor)"
+	}
+	opposite := models.InstructionUnquarantine
+	if release {
+		opposite = models.InstructionQuarantine
+	}
+	supersedeOpenInstruction(db, workspaceID, src.ID, opposite+":"+agent.Fingerprint)
+	agentID := agent.ID
+	_, created, err := NewActuationManager(db).Enqueue(workspaceID, EnqueueInstructionInput{
+		DiscoverySourceID: src.ID,
+		Kind:              kind,
+		DiscoveredAgentID: &agentID,
+		Fingerprint:       agent.Fingerprint,
+		Payload: map[string]interface{}{
+			"target":   "machine",
+			"agent_id": machineAgentID,
+			"reason":   agent.QuarantineReason,
+		},
+		IdempotencyKey: kind + ":" + agent.Fingerprint,
+		CreatedBy:      actor,
+	})
+	if err != nil {
+		return false, err.Error()
+	}
 	if !created {
 		return true, "already queued"
 	}
