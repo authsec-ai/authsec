@@ -4,6 +4,14 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-13 (cont.) — Agent Kit console and release
+
+- UI (branch `feat/agent-kit-console` in Authsec-ui): IGA › Machines — add a machine (mint token, three commands, wait for registration), agents with quarantine/release, per-agent access with right-click block, policy editor with history and stale-save refusal, logs with OWASP tag filters, enforcement on/off and SIEM commands. Checked in a browser against a scratch backend.
+- authsec-cli: `make release` (binaries, install.sh, SHA256SUMS) and docs/DEMO.md.
+- CLAUDE.md listed `CORS_ALLOWED_ORIGINS`; the backend reads `CORS_ALLOW_ORIGIN` (config/config.go). Corrected.
+
+---
+
 ## 2026-11-13 — AuthSec Agent Kit control plane (branch `feat/agent-kit-control-plane`)
 
 - authsec-cli machines connect as discovery sources of kind `vm_sensor`: they register and heartbeat on `/agent-registration`, report agents as sightings (`source: vm_sensor`, metadata `machine.agent_id`), and hand over an actuation credential as Kubernetes agents do.
