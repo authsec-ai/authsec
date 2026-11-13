@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -45,7 +44,7 @@ import (
 //     stores a rule the evaluator would skip. scope is
 //     {runtime_kinds, stages, classifications} (each list optional; empty
 //     matches anything); stages and classifications are the iga_workload
-//     CHECK vocabularies; runtime_kinds are lower-case identifiers.
+//     CHECK vocabularies; runtime_kinds are the canonical AWS collector kinds.
 //     require_review_date takes no params; unused_window takes
 //     {window_days} in igagov.MinWindowDays..MaxWindowDays.
 //   - kind is immutable (PATCH may not change it): a different kind is a
@@ -98,7 +97,6 @@ const (
 var (
 	govRuleStages          = map[string]bool{"production": true, "non_production": true, "unknown": true}
 	govRuleClassifications = map[string]bool{"unclassified": true, "provider_native_agent": true, "classified_agent": true}
-	govRuleRuntimeKind     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 )
 
 const govRuleMaxScopeItems = 20
@@ -191,6 +189,18 @@ func normList(field string, in []string, ok func(string) bool) ([]string, error)
 
 // normalizeRule validates kind, scope and params and returns their canonical
 // stored forms. The final check is the evaluator's own parser.
+// Only vocabulary emitted by the AWS collector is accepted. A syntactically
+// valid but unknown value silently matches no workloads and defeats the rule.
+func validGovRuntimeKind(kind string) bool {
+	switch kind {
+	case models.WorkloadLambdaFunction, models.WorkloadECSTaskDefinition, models.WorkloadEC2Instance,
+		models.WorkloadBedrockAgent, models.WorkloadBedrockAgentCoreRT, models.WorkloadBedrockAgentCoreGW:
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeRule(kind string, scope, params json.RawMessage) (json.RawMessage, json.RawMessage, error) {
 	if kind != igagov.RuleRequireReviewDate && kind != igagov.RuleUnusedWindow {
 		return nil, nil, GovBadParam("kind", "kind must be require_review_date or unused_window.")
@@ -202,7 +212,7 @@ func normalizeRule(kind string, scope, params json.RawMessage) (json.RawMessage,
 		}
 	}
 	var err error
-	if sc.RuntimeKinds, err = normList("scope.runtime_kinds", sc.RuntimeKinds, govRuleRuntimeKind.MatchString); err != nil {
+	if sc.RuntimeKinds, err = normList("scope.runtime_kinds", sc.RuntimeKinds, validGovRuntimeKind); err != nil {
 		return nil, nil, err
 	}
 	if sc.Stages, err = normList("scope.stages", sc.Stages, func(v string) bool { return govRuleStages[v] }); err != nil {

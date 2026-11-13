@@ -25,7 +25,7 @@ func ValidAgentKitEventTypes() []string {
 	}
 }
 
-// AgentKitEvent is one record a machine's daemon reported (migration 147).
+// AgentKitEvent is one record a machine's daemon reported (migration 162).
 // The indexed columns are copied out of Record, which is kept whole.
 type AgentKitEvent struct {
 	ID                uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
@@ -48,7 +48,7 @@ type AgentKitEvent struct {
 func (AgentKitEvent) TableName() string { return "agentkit_events" }
 
 // AgentKitPolicy is one version of an agent policy (authsec.ai/v1
-// AgentPolicy YAML) kept for the workspace's machines (migration 147).
+// AgentPolicy YAML) kept for the workspace's machines (migration 162).
 type AgentKitPolicy struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null"`

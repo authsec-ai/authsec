@@ -177,6 +177,7 @@ func (t *graphTraversal) fetchIdentities(lv *graphLevel, ids []uuid.UUID, set ma
 		n.State, n.Lifecycle, n.LastConfirmedAt = r.State, r.Lifecycle, TS(r.LastConfirmedAt)
 		n.stale = r.StaleSubject()
 		n.notPrincipal = r.TrustNotPrincipal
+		n.immutable = r.ImmutableKey
 		n.Restrictions = &GraphRestrictions{}
 		n.fetched = true
 	}
@@ -567,6 +568,9 @@ func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error
 		return err
 	}
 	if err := t.decorateStatements(lv, byType[RefStatement]); err != nil {
+		return err
+	}
+	if err := t.decorateAgentRuntime(lv, byType[RefIdentity], byType[RefWorkload]); err != nil {
 		return err
 	}
 	for typ, column := range map[string]string{

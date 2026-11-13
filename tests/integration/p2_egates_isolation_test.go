@@ -687,7 +687,10 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 		return []string{"/api/iga/v1/integrations", "/api/iga/v1/integrations/" + in, "/api/iga/v1/integrations/" + in + "/coverage",
 			"/api/iga/v1/integrations/" + in + "/source-health", "/api/iga/v1/scan-runs/" + scans[ws].String(),
 			"/api/iga/v1/agents", "/api/iga/v1/identity-accounts", "/api/iga/v1/classification-candidates",
-			"/authsec/discovery/agents", "/authsec/discovery/coverage",
+			// /authsec/discovery/agents and /coverage are not compared: AWS
+			// agents are mirrored into the Agents list by design
+			// (SPEC-agent-runtime-visibility.md §5.3, §10 Q5 default); the
+			// listing is checked row by row below.
 			"/api/iga/v1/agents/" + ag, "/api/iga/v1/agents/" + ag + "/evidence", "/api/iga/v1/agents/" + ag + "/access-paths"}
 	}
 	mp, cp := paths(mixed.ws), paths(control)
@@ -732,14 +735,28 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	// Discovered Agents lists exactly the two sightings -- and no AWS
 	// workload -- and after the GitHub rescan the AWS-named one is still
 	// proposed nothing.
+	// AWS rows are only the agent-runtime mirror: an AWS agent (provider-
+	// native or classified) of this workspace's graph, source aws. No other
+	// AWS workload is listed, and the non-AWS rows are exactly the sightings.
 	_, listing := egatesCall(t, eng, mixed.ws, "/authsec/discovery/agents")
 	listed := map[string]bool{}
+	others := 0
 	for _, row := range digl(listing, "agents") {
+		if digs(row, "source") == "aws" {
+			cls := digs(row, "metadata", "classification")
+			if !awsIDs[digs(row, "metadata", "iga_workload_id")] || (cls != "provider_native_agent" && cls != "classified_agent") {
+				t.Errorf("/discovery/agents lists AWS row %s that is not a mirrored AWS agent of this workspace", egatesJSON(row))
+			}
+			continue
+		}
+		others++
 		listed[digs(row, "id")] = true
+		if strings.Contains(egatesJSON(row), accountA) || strings.Contains(egatesJSON(row), "arn:aws:") {
+			t.Errorf("/discovery/agents non-AWS row %s mentions AWS", egatesJSON(row))
+		}
 	}
-	if strings.Contains(egatesJSON(listing), accountA) || strings.Contains(egatesJSON(listing), "arn:aws:") ||
-		num(listing, "total") != 2 || !listed[matched[mixed.ws].String()] || !listed[sightings[mixed.ws].String()] {
-		t.Errorf("/discovery/agents = %s, want the two sightings and no AWS workload", egatesJSON(listing))
+	if others != 2 || !listed[matched[mixed.ws].String()] || !listed[sightings[mixed.ws].String()] {
+		t.Errorf("/discovery/agents = %s, want the two sightings besides the mirrored AWS agents", egatesJSON(listing))
 	}
 	if link, err := bridge.ProposeForAgent(mixed.ws, sightings[mixed.ws]); err != nil || link != nil {
 		t.Errorf("after the GitHub rescan the bridge proposed %+v (%v) for the AWS-named sighting, want nothing", link, err)

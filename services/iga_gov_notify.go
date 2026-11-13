@@ -64,6 +64,9 @@ const (
 	GovNoticeDrift           = "drift"
 	GovNoticeCanaryGate      = "canary_gate"
 	GovNoticeFindingDigest   = "finding_digest"
+	// GovNoticeReviewResponse tells a version's author that an owner kept a
+	// service or objected (§9.3 S4).
+	GovNoticeReviewResponse = "review_response"
 
 	// GovRecipientWorkspaceWebhook is the recipient of a workspace webhook notice.
 	GovRecipientWorkspaceWebhook = "workspace_webhook"
@@ -278,8 +281,8 @@ type GovNotifier struct {
 // from the notification settings store.
 func NewGovNotifier(db *gorm.DB) *GovNotifier {
 	return &GovNotifier{
-		db:            db,
-		Email:         &notify.SMTP{Config: utils.AppSMTPConfig},
+		db:    db,
+		Email: &notify.SMTP{Config: utils.AppSMTPConfig},
 		// No client of its own: notify.Webhook's default is the SSRF-safe
 		// client (internal/safehttp). The URL is the workspace's choice.
 		Webhook:       &notify.Webhook{},

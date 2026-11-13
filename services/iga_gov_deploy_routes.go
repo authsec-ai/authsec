@@ -55,8 +55,11 @@ type GovDeploymentFilter struct {
 	State    string
 	Account  string
 	Kind     string
-	Cursor   string
-	Limit    int
+	Delivery string
+	// Attention keeps only deployments that need a person (deploymentAttentionSQL).
+	Attention bool
+	Cursor    string
+	Limit     int
 }
 
 // GovDeploymentView is one deployment row in a list.
@@ -69,12 +72,26 @@ type GovDeploymentView struct {
 	RoleARN   string    `json:"role_arn"`
 }
 
-// ListDeployments is GET /deployments (cursor by id, limit <= 200). An
-// outcome_unresolved deployment is listed first (§8.1 step 3).
+// deploymentAttentionSQL is §9.5's "needs attention": blocked, failed, an
+// outcome AuthSec could not establish, drift nobody accepted, verification
+// past its deadline, a customer apply past its deadline.
+const deploymentAttentionSQL = `(d.state IN ('blocked','failed','outcome_unknown','outcome_unresolved')
+	OR (d.state = 'drifted' AND d.drift_accepted_at IS NULL)
+	OR (d.state = 'applied_unverified' AND d.verify_deadline_at < now())
+	OR (d.state = 'awaiting_apply' AND d.apply_deadline_at < now()))`
+
+// ListDeployments is GET /deployments: an outcome_unresolved deployment
+// first (§8.1 step 3), then newest first; the cursor is a keyset over
+// (group, created_at, id), so the order holds across pages. Filters: policy,
+// state, account, kind, delivery and attention.
 func (s *GovDeployments) ListDeployments(ctx context.Context, ws uuid.UUID, f GovDeploymentFilter) ([]GovDeploymentView, *string, error) {
 	if f.Limit <= 0 || f.Limit > MaxGovPage {
 		f.Limit = MaxGovPage
 	}
+	if f.Delivery != "" && f.Delivery != "direct" && f.Delivery != "iac_pr" && f.Delivery != "export" {
+		return nil, nil, GovBadParam("delivery", "delivery must be direct, iac_pr or export.")
+	}
+	const group = `(CASE WHEN d.state = 'outcome_unresolved' THEN 0 ELSE 1 END)`
 	q := `SELECT d.*, v.policy_id, v.version_no, c.account_id, c.role_id, c.role_arn
 	        FROM iga_gov_deployment d
 	        JOIN iga_gov_policy_version v ON v.workspace_id = d.workspace_id AND v.id = d.version_id
@@ -97,19 +114,33 @@ func (s *GovDeployments) ListDeployments(ctx context.Context, ws uuid.UUID, f Go
 		q += ` AND d.kind = ?`
 		args = append(args, f.Kind)
 	}
-	if f.Cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(f.Cursor)
-		parts := strings.SplitN(string(raw), "|", 2)
-		if err != nil || len(parts) != 2 {
-			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid.", map[string]any{"parameter": "cursor"})
-		}
-		if _, err := uuid.Parse(parts[1]); err != nil {
-			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid.", map[string]any{"parameter": "cursor"})
-		}
-		q += ` AND ((CASE WHEN d.state = 'outcome_unresolved' THEN 0 ELSE 1 END)::text || '|' || d.id::text) > ?`
-		args = append(args, string(raw))
+	if f.Delivery != "" {
+		q += ` AND d.delivery = ?`
+		args = append(args, f.Delivery)
 	}
-	q += ` ORDER BY (CASE WHEN d.state = 'outcome_unresolved' THEN 0 ELSE 1 END), d.id LIMIT ?`
+	if f.Attention {
+		q += ` AND ` + deploymentAttentionSQL
+	}
+	if f.Cursor != "" {
+		bad := govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid.", map[string]any{"parameter": "cursor"})
+		raw, err := base64.RawURLEncoding.DecodeString(f.Cursor)
+		parts := strings.SplitN(string(raw), "|", 3)
+		if err != nil || len(parts) != 3 || (parts[0] != "0" && parts[0] != "1") {
+			return nil, nil, bad
+		}
+		at, err := time.Parse(time.RFC3339Nano, parts[1])
+		if err != nil {
+			return nil, nil, bad
+		}
+		id, err := uuid.Parse(parts[2])
+		if err != nil {
+			return nil, nil, bad
+		}
+		q += ` AND (` + group + ` > ? OR (` + group + ` = ? AND (d.created_at < ? OR (d.created_at = ? AND d.id < ?))))`
+		g := int(parts[0][0] - '0')
+		args = append(args, g, g, at, at, id)
+	}
+	q += ` ORDER BY ` + group + `, d.created_at DESC, d.id DESC LIMIT ?`
 	args = append(args, f.Limit+1)
 	var rows []GovDeploymentView
 	if err := s.read(ctx, ws, func(tx *gorm.DB) error { return tx.Raw(q, args...).Scan(&rows).Error }); err != nil {
@@ -123,7 +154,7 @@ func (s *GovDeployments) ListDeployments(ctx context.Context, ws uuid.UUID, f Go
 		if last.State == models.GovDeployOutcomeUnresolved {
 			k = "0"
 		}
-		c := base64.RawURLEncoding.EncodeToString([]byte(k + "|" + last.ID.String()))
+		c := base64.RawURLEncoding.EncodeToString([]byte(k + "|" + last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID.String()))
 		next = &c
 	}
 	if rows == nil {
@@ -134,7 +165,11 @@ func (s *GovDeployments) ListDeployments(ctx context.Context, ws uuid.UUID, f Go
 
 // GovDeploymentDetail is GET /deployments/:id (§7.6).
 type GovDeploymentDetail struct {
-	Deployment     models.IGAGovDeployment          `json:"deployment"`
+	Deployment models.IGAGovDeployment `json:"deployment"`
+	// Context names what the deployment is of, so the page needs no list scan.
+	Context GovDeploymentContext `json:"context"`
+	// IaCChange is the pull request of an iac_pr deployment (§8.11), else nil.
+	IaCChange      *models.IGAGovIaCChange          `json:"iac_change"`
 	Plan           models.IGAGovPlan                `json:"plan"`
 	Attempts       []models.IGAGovAttempt           `json:"attempts"`
 	Verifications  []models.IGAGovVerification      `json:"verifications"`
@@ -147,6 +182,19 @@ type GovDeploymentDetail struct {
 	Migrations     []models.IGAGovWorkloadMigration `json:"migrations"`
 	BundleID       uuid.UUID                        `json:"evidence_bundle_id"`
 	GateFacts      *DeploymentGateFacts             `json:"gate_facts"`
+	// RecoveryPlans are the role-only recovery plans of this deployment's
+	// control (§8.9), each with its approval; empty unless an undo was blocked.
+	RecoveryPlans []GovRecoveryPlanView `json:"recovery_plans"`
+}
+
+// GovDeploymentContext is the policy, version and role a deployment belongs to.
+type GovDeploymentContext struct {
+	PolicyID   uuid.UUID `json:"policy_id"`
+	PolicyName string    `json:"policy_name"`
+	VersionNo  int       `json:"version_no"`
+	AccountID  string    `json:"account_id"`
+	RoleID     string    `json:"role_id"`
+	RoleARN    string    `json:"role_arn"`
 }
 
 // GovValidationView is a validation with its items.
@@ -172,6 +220,20 @@ func (s *GovDeployments) getDeploymentTx(db *gorm.DB, ws, id uuid.UUID) (*GovDep
 		return nil, err
 	}
 	out := &GovDeploymentDetail{Deployment: *d}
+	if err := db.Raw(`SELECT p.id AS policy_id, p.name AS policy_name, v.version_no, c.account_id, c.role_id, c.role_arn
+		FROM iga_gov_policy_version v
+		JOIN iga_gov_policy p ON p.workspace_id = v.workspace_id AND p.id = v.policy_id
+		JOIN iga_gov_control c ON c.workspace_id = v.workspace_id AND c.id = ?
+		WHERE v.workspace_id = ? AND v.id = ?`, d.ControlID, ws, d.VersionID).Scan(&out.Context).Error; err != nil {
+		return nil, err
+	}
+	var ics []models.IGAGovIaCChange
+	if err := db.Where("workspace_id = ? AND deployment_id = ?", ws, d.ID).Limit(1).Find(&ics).Error; err != nil {
+		return nil, err
+	}
+	if len(ics) == 1 {
+		out.IaCChange = &ics[0]
+	}
 	p, err := s.loadPlanRow(db, ws, d.PlanID)
 	if err != nil {
 		return nil, err
@@ -209,6 +271,13 @@ func (s *GovDeployments) getDeploymentTx(db *gorm.DB, ws, id uuid.UUID) (*GovDep
 	}
 	if out.GateFacts, err = s.deploymentGateFactsTx(db, ws, d.ID); err != nil {
 		return nil, err
+	}
+	if d.Kind == igagov.PlanApply {
+		if out.RecoveryPlans, err = recoveryPlansOf(db, ws, *d); err != nil {
+			return nil, err
+		}
+	} else {
+		out.RecoveryPlans = []GovRecoveryPlanView{}
 	}
 	return out, nil
 }
@@ -283,6 +352,7 @@ func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, r
 	var ctl *models.IGAGovControl
 	var ap models.IGAGovApproval
 	var undo models.IGAGovPlan
+	var recovery *models.IGAGovApproval
 	err := s.read(ctx, ws, func(db *gorm.DB) error {
 		var err error
 		if d, err = s.loadDeployment(db, ws, depID); err != nil {
@@ -338,15 +408,31 @@ func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, r
 		if undo.ID == uuid.Nil {
 			return govConflict(GovCodePlanChanged, "No undo plan of this deployment is named by its approval.", nil)
 		}
+		// The recovery approval (a role-only plan's own approval) is read in
+		// the same workspace transaction; the expiry/conflict decision is made
+		// below, outside the read.
+		if !emergency && (d.ApprovalID == nil || !containsStr(ap.PlanHashes, undo.PlanHash)) {
+			if recovery, err = recoveryApproval(db, ws, undo); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	// The approval the undo deployment names: the deployment's own when it
+	// names the plan's hash, else the plan's own (a role-only recovery plan,
+	// ApproveRecoveryPlan).
+	approvalID := d.ApprovalID
 	if !emergency && (d.ApprovalID == nil || !containsStr(ap.PlanHashes, undo.PlanHash)) {
-		return nil, govConflict(GovCodeApprovalRequired,
-			"This plan is not named by the deployment's approval; it needs its own approval or an emergency undo.",
-			map[string]any{"plan_id": undo.ID})
+		ra := recovery
+		if ra == nil || !s.now().Before(ra.ExpiresAt) {
+			return nil, govConflict(GovCodeApprovalRequired,
+				"This plan is not named by the deployment's approval; it needs its own approval or an emergency undo.",
+				map[string]any{"plan_id": undo.ID, "plan_hash": undo.PlanHash, "recovery_approval_expired": ra != nil})
+		}
+		approvalID = &ra.ID
 	}
 	plan, err := fullPlanFromRow(undo)
 	if err != nil {
@@ -387,7 +473,7 @@ func (s *GovDeployments) Undo(ctx context.Context, ws, actor, depID uuid.UUID, r
 	if emergency {
 		nd.EmergencyBy, nd.EmergencyReason, name = &actor, strings.TrimSpace(req.Reason), GovEventEmergencyUndo
 	} else {
-		nd.ApprovalID = d.ApprovalID
+		nd.ApprovalID = approvalID
 	}
 	err = s.write(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(&nd).Error; err != nil {

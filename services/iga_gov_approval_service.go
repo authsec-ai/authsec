@@ -98,7 +98,7 @@ func sameMultiset(a, b []string) bool {
 // liveApproval is the version's unrevoked approve decision, or nil.
 func liveApproval(db *gorm.DB, ws, versionID uuid.UUID) (*models.IGAGovApproval, error) {
 	var as []models.IGAGovApproval
-	if err := db.Where("workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL", ws, versionID).
+	if err := db.Where("workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL AND scope = 'version'", ws, versionID).
 		Find(&as).Error; err != nil {
 		return nil, err
 	}
@@ -494,7 +494,7 @@ func (a *GovAuthoring) ListApprovals(ctx context.Context, ws, caller uuid.UUID, 
 		        FROM iga_gov_approval a
 		        JOIN iga_gov_policy_version v ON v.workspace_id = a.workspace_id AND v.id = a.version_id
 		        JOIN iga_gov_policy p ON p.workspace_id = v.workspace_id AND p.id = v.policy_id
-		       WHERE a.workspace_id = ? AND a.decided_by = ?`
+		       WHERE a.workspace_id = ? AND a.decided_by = ? AND a.scope = 'version'`
 		args = []any{ws, caller}
 		if after != "" {
 			q += ` AND a.id > ?`

@@ -16,7 +16,7 @@ var consoleRoutes = struct{ exact, prefix []string }{
 	exact: []string{"/iga/policy", "/iga/policy/setup/notifications", "/iga/connections"},
 	// /iga/policy/<id> is an access policy; /iga/policy/setup/<section>
 	// forwards to a connection's tab.
-	prefix: []string{"/iga/policy/", "/iga/policy/setup/notifications?", "/iga/connections/", "/iga/identities/"},
+	prefix: []string{"/iga/policy/", "/iga/policy/setup/notifications?", "/iga/connections/", "/iga/identities/", "/iga/agent-runtime/alerts/"},
 }
 
 var reConsolePath = regexp.MustCompile(`"(/iga/[^"]*)"`)

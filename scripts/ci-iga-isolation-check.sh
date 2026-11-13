@@ -98,6 +98,13 @@ ALLOWED_SHARED=(
   "slack_user_link:r"
   "workspace_slack_integration:r"
 
+  # Agent runtime visibility's own tables (148), named without the iga_
+  # prefix by its spec (SPEC-agent-runtime-visibility.md §10 Q2): suggestions
+  # keyed to iga_workload, and findings. Written only by agent runtime
+  # inference and its decision routes (services/agent_runtime_*.go).
+  "agent_suggestion:rw"
+  "agent_finding:rw"
+
   # The GitHub / Kubernetes collected model: discovery sources and their scan
   # runs (the IaC source FK, the connections view) and the repository / k8s
   # sightings the GitHub and Kubernetes projections read, as the AWS

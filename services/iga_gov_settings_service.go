@@ -51,9 +51,8 @@ type GovNotificationChannels struct {
 	// unavailable). The webhook is then never sent unsigned: its target
 	// resolution fails and the notify job retries.
 	SecretUnreadable bool `json:"-"`
-	// Source is "phase3" (set through PUT /settings) or "legacy_copy".
-	Source             string     `json:"source"`
-	CopiedFromLegacyAt *time.Time `json:"copied_from_legacy_at"`
+	// Source is "phase3" (set through PUT /settings).
+	Source string `json:"source"`
 }
 
 // GovNotificationChannelStore persists GovNotificationChannels.
@@ -200,13 +199,11 @@ type govChannelRow struct {
 	NotifyWebhookURL       string
 	NotifyWebhookSecretRef string
 	NotifyChannelsSource   string
-	NotifyChannelsCopiedAt *time.Time
 }
 
 func (s *GovDBChannelStore) row(tx *gorm.DB, ws uuid.UUID) (*govChannelRow, error) {
 	var rows []govChannelRow
-	if err := tx.Raw(`SELECT notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref, notify_channels_source,
-	                         notify_channels_copied_at
+	if err := tx.Raw(`SELECT notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref, notify_channels_source
 	                    FROM iga_gov_settings WHERE workspace_id = ?`, ws).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -238,7 +235,7 @@ func (s *GovDBChannelStore) GetTx(tx *gorm.DB, ws uuid.UUID) (*GovNotificationCh
 		return nil, false, err
 	}
 	ch := &GovNotificationChannels{EmailEnabled: r.NotifyEmailEnabled, WebhookURL: r.NotifyWebhookURL,
-		WebhookSecretRef: r.NotifyWebhookSecretRef, Source: r.NotifyChannelsSource, CopiedFromLegacyAt: r.NotifyChannelsCopiedAt}
+		WebhookSecretRef: r.NotifyWebhookSecretRef, Source: r.NotifyChannelsSource}
 	if ch.WebhookSecretRef != "" {
 		sec, err := s.readSecret(ch.WebhookSecretRef)
 		if err != nil {
@@ -290,18 +287,11 @@ func (s *GovDBChannelStore) SaveTx(tx *gorm.DB, ws uuid.UUID, ch GovNotification
 			ref = p
 		}
 	}
-	src := ch.Source
-	if src != "legacy_copy" {
-		src = "phase3"
-	}
-	return tx.Exec(`INSERT INTO iga_gov_settings (workspace_id, notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref,
-	                      notify_channels_source, notify_channels_copied_at)
-	                VALUES (?, ?, ?, ?, ?, ?)
-	                ON CONFLICT (workspace_id) DO UPDATE SET notify_email_enabled = EXCLUDED.notify_email_enabled,
-	                      notify_webhook_url = EXCLUDED.notify_webhook_url, notify_webhook_secret_ref = EXCLUDED.notify_webhook_secret_ref,
-	                      notify_channels_source = EXCLUDED.notify_channels_source,
-	                      notify_channels_copied_at = EXCLUDED.notify_channels_copied_at`,
-		ws, ch.EmailEnabled, ch.WebhookURL, ref, src, ch.CopiedFromLegacyAt).Error
+	return tx.Exec(`INSERT INTO iga_gov_settings (workspace_id, notify_email_enabled, notify_webhook_url, notify_webhook_secret_ref, notify_channels_source)
+ VALUES (?, ?, ?, ?, 'phase3')
+ ON CONFLICT (workspace_id) DO UPDATE SET notify_email_enabled = EXCLUDED.notify_email_enabled,
+ notify_webhook_url = EXCLUDED.notify_webhook_url, notify_webhook_secret_ref = EXCLUDED.notify_webhook_secret_ref,
+ notify_channels_source = EXCLUDED.notify_channels_source`, ws, ch.EmailEnabled, ch.WebhookURL, ref).Error
 }
 
 // SecretRefTx is the workspace's stored secret path ("" = none).
@@ -353,13 +343,12 @@ func (s *GovSettingsService) releaseSuperseded(ctx context.Context, st GovNotifi
 
 // GovNotificationSettingsView is the notifications block of GET /settings.
 type GovNotificationSettingsView struct {
-	Available          bool       `json:"available"`
-	Reason             string     `json:"reason,omitempty"`
-	EmailEnabled       bool       `json:"email_enabled"`
-	WebhookURL         string     `json:"webhook_url"`
-	WebhookSecretSet   bool       `json:"webhook_secret_set"`
-	Source             string     `json:"source"`
-	CopiedFromLegacyAt *time.Time `json:"copied_from_legacy_at"`
+	Available        bool   `json:"available"`
+	Reason           string `json:"reason,omitempty"`
+	EmailEnabled     bool   `json:"email_enabled"`
+	WebhookURL       string `json:"webhook_url"`
+	WebhookSecretSet bool   `json:"webhook_secret_set"`
+	Source           string `json:"source"`
 	// Slack is T3.14's (workspace_slack_integration); reported here so the
 	// Setup page has one place to read.
 	Slack GovChannelAvailability `json:"slack"`
@@ -390,15 +379,8 @@ type GovSettingsService struct {
 // channel store.
 func NewGovSettingsService(db *gorm.DB) *GovSettingsService { return &GovSettingsService{db: db} }
 
-// Get is GET /settings. On the first read of a workspace whose channel store
-// has no row and whose LEGACY governance_notification_settings row exists,
-// the legacy channel addresses are copied into the store in one transaction
-// with a settings.notification_channels_copied event (disposition plan §2:
-// copy, never move -- the legacy row is only read).
+// Get reads Phase 3 settings without consulting the retired policy store.
 func (s *GovSettingsService) Get(ctx context.Context, ws uuid.UUID) (*GovSettingsView, error) {
-	if err := s.copyLegacyChannels(ctx, ws); err != nil {
-		return nil, err
-	}
 	var out *GovSettingsView
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var err error
@@ -428,7 +410,7 @@ func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, 
 	if ch.SecretUnreadable {
 		n.Reason = "The webhook signing secret cannot be read right now; webhook notices wait until it can."
 	}
-	n.Source, n.CopiedFromLegacyAt = ch.Source, ch.CopiedFromLegacyAt
+	n.Source = ch.Source
 	if _, has := govNoticeChannel(GovChannelSlack); has {
 		n.Slack = GovChannelAvailability{Available: true, Status: SlackStatusForSettings(db, ws)}
 	} else {
@@ -437,54 +419,6 @@ func (s *GovSettingsService) view(db *gorm.DB, ws uuid.UUID) (*GovSettingsView, 
 	}
 	out.Notifications = n
 	return out, nil
-}
-
-func (s *GovSettingsService) copyLegacyChannels(ctx context.Context, ws uuid.UUID) error {
-	st := currentGovChannelStore()
-	if ok, _ := st.Available(); !ok {
-		return nil
-	}
-	return tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
-		// Serialise first reads of one workspace on its settings row lock
-		// (the row may not exist: lock the workspace's settings key instead).
-		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext('iga_gov_settings_channels:' || ?::text))`, ws.String()).Error; err != nil {
-			return err
-		}
-		_, exists, err := st.GetTx(tx, ws)
-		if err != nil || exists {
-			return err
-		}
-		legacy, err := ReadLegacyNotificationChannels(tx, ws)
-		if err != nil || legacy == nil {
-			return err
-		}
-		now := time.Now().UTC()
-		ch := GovNotificationChannels{EmailEnabled: legacy.EmailEnabled, WebhookURL: strings.TrimSpace(legacy.WebhookURL),
-			WebhookSecret: legacy.WebhookSecret, Source: "legacy_copy", CopiedFromLegacyAt: &now}
-		// DECISION (p3-wire): Phase 3 webhooks are https only (055 CHECK);
-		// a legacy http:// address is not copied, and the event says so.
-		skipped := ""
-		if ch.WebhookURL != "" && !strings.HasPrefix(ch.WebhookURL, "https://") {
-			ch.WebhookURL, ch.WebhookSecret, skipped = "", "", "not https"
-		}
-		if err := st.SaveTx(tx, ws, ch); err != nil {
-			var ge *GovError
-			if errors.As(err, &ge) {
-				// The secret cannot be stored right now (Vault): nothing was
-				// written; the copy is retried on the next read, and the
-				// settings read itself still answers.
-				log.Printf("[policy] workspace %s: legacy notification channels not copied yet: %s", ws, ge.Message)
-				return nil
-			}
-			return err
-		}
-		payload := map[string]any{"from": "governance_notification_settings", "email_enabled": legacy.EmailEnabled,
-			"webhook_configured": ch.WebhookURL != "", "webhook_signed": ch.WebhookSecret != ""}
-		if skipped != "" {
-			payload["webhook_not_copied"] = skipped
-		}
-		return appendGovEvent(tx, ws, GovEventSettingsChannelsCopied, models.GovActorSystem, "settings", govEventRefs{}, payload)
-	})
 }
 
 // GovSettingsPatch is PUT /settings: every field optional (omitted keeps
@@ -533,9 +467,6 @@ var govSettingsRanges = []struct {
 // Update is PUT /settings: validated, written with a settings.updated event
 // in one transaction. It returns the views before and after.
 func (s *GovSettingsService) Update(ctx context.Context, ws, actor uuid.UUID, p GovSettingsPatch) (before, after *GovSettingsView, err error) {
-	if err := s.copyLegacyChannels(ctx, ws); err != nil {
-		return nil, nil, err
-	}
 	st := currentGovChannelStore()
 	prevSecretRef := ""
 	if p.Notifications != nil {

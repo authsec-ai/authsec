@@ -191,6 +191,8 @@ func main() {
 	// scan could run there again.
 	graphGate := services.DefaultGraphProjectionGate()
 	services.SetGraphProjection(graphGate)
+	services.InstallAgentRuntimeResolver(config.DB) // agentruntime.SubjectResolver for detections and containment
+	services.InstallAgentRuntimeGraph()             // agent_runtime on the graph's AWS identity and workload nodes
 	go graphGate.VerifyUntilReady(context.Background(), config.DB, 30*time.Second, func() {
 		go services.NewDefaultProjectionService(config.DB).Run(context.Background(), 10*time.Second)
 	})
@@ -304,6 +306,8 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentLiveSink(config.DB)          // agent runtime: live AI-workload evidence; before the alert and verify sinks
+	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
 		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 		if vaultAddr == "" || vaultToken == "" {
@@ -322,6 +326,19 @@ func main() {
 			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
 		}
 	}
+
+	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §5.7): the
+	// "agent_alerts" event sink (detections D1-D8 on events the poller and the
+	// stream dispatch), and the SIEM delivery / retention worker.
+	services.InstallAgentRuntimeAlerts(config.DB)
+	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
+	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+
+	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
+	// workspace; the Vault client for admin keys, and the hourly sync worker
+	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
+	services.InstallModelProviders()
+	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL
@@ -646,30 +663,6 @@ func main() {
 		jmlWorker.Start()
 		log.Printf("governance JML reconcile worker started (interval=5m)")
 
-		// Agent policy, on a timer. Until this existed, everything the policy
-		// reconciler does — narrowing a role, lapsing a grant at its expiry,
-		// planning a containment — happened only when somebody POSTed to the
-		// reconcile endpoint. A policy is a standing instruction, and a standing
-		// instruction that needs a button pressed is a reminder.
-		//
-		// Five minutes: the same cadence as JML, and the actions are the same
-		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
-		// less access.
-		//
-		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
-		// Runs at five minutes rather than hourly because the DELIVERY half also
-		// retries: an SMTP blip should cost minutes, not a whole warning.
-		//
-		// A failed warning NEVER blocks the action it warns about — blocking would
-		// let an SMTP outage quietly turn every destructive policy into a no-op,
-		// which is the failure this exists to prevent. It is recorded instead, and
-		// the action executes as a governance exception.
-		//
-		// Both are the legacy agent-policy stack. ExpiryWorker and the lease
-		// reaper are shared runtime infrastructure and are started separately.
-		for _, name := range services.StartLegacyAgentPolicyWorkers(services.NewLegacyAgentPolicyWorkers(config.DB)) {
-			log.Printf("legacy agent policy worker started: %s (interval=5m)", name)
-		}
 	}
 
 	// ─────────────────────────────────────────────────────────

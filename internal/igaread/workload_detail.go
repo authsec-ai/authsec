@@ -88,6 +88,9 @@ type WorkloadDetail struct {
 	// and a retired workload's sources say who last held it.
 	Sources  []SupportSource `json:"sources"`
 	Decision *LatestDecision `json:"decision"`
+	// AgentRuntime is the workload's agent-runtime picture, as its graph node
+	// carries it (agent_runtime.go): absent unless there is something to say.
+	AgentRuntime *GraphAgentRuntime `json:"agent_runtime,omitempty"`
 }
 
 // WorkloadDetailMeta is the detail envelope's meta (§5.2) with the detail's
@@ -176,6 +179,11 @@ func (r *Reader) WorkloadDetail(ctx context.Context, rawID string, vals url.Valu
 			ProviderAttrs: workloadProviderAttrsOf(w.ProviderAttrs),
 			Sources:       sources,
 			Decision:      decision,
+		}
+		if w.Lifecycle == models.IGALifecycleActive {
+			if d.AgentRuntime, err = workloadAgentRuntime(q, w.ID); err != nil {
+				return err
+			}
 		}
 		out = &WorkloadDetailResponse{Data: d, Meta: WorkloadDetailMeta{
 			DetailMeta: NewDetailMeta(q),

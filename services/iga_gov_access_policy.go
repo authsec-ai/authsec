@@ -1809,6 +1809,11 @@ func (s *GovAccess) viewsTx(ctx context.Context, db *gorm.DB, ws uuid.UUID, bs [
 			v.VersionNo = cur.VersionNo
 		}
 		v.Status, v.StatusReason, v.EndReason, v.EndedAt = accessStatus(b, now)
+		// Nothing archives a policy that expires on its own, so its stored
+		// lifecycle stays "active". Report what the status says: it is ended.
+		if v.Status == AccessStatusEnded && v.Lifecycle == "active" {
+			v.Lifecycle = "archived"
+		}
 		t, terr := igagov.ParseAWSAccessTarget(resARN[in.Resource.ResourceID], in.Resource.Prefix)
 		v.Resource = AccessResourceView{ResourceID: in.Resource.ResourceID, Prefix: in.Resource.Prefix, Provider: models.ProviderAWS}
 		rr := resRow[in.Resource.ResourceID]

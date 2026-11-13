@@ -129,6 +129,12 @@ func (r *GovReader) ListFindings(ws uuid.UUID, rev int64, f FindingFilter) (out 
 	return out, next, err
 }
 
+// ListFindingGroups is GET /findings?group=role at the resolved revision.
+func (r *GovReader) ListFindingGroups(ws uuid.UUID, rev int64, f FindingFilter) (out []RoleGroup, next *string, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { out, next, e = r.listFindingGroups(tx, ws, rev, f); return e })
+	return out, next, err
+}
+
 // Summary counts the findings whose condition holds at rev.
 func (r *GovReader) Summary(ws uuid.UUID, rev int64) (s FindingSummary, err error) {
 	err = r.readIn(ws, func(tx *gorm.DB) (e error) { s, e = r.summary(tx, ws, rev); return e })
@@ -265,6 +271,10 @@ type FindingFilter struct {
 	IdentityID  *uuid.UUID
 	WorkloadID  *uuid.UUID
 	Account     string
+	// Category keeps the findings of the roles GET /readiness puts in that
+	// category (blocked_by_collection, ineligible, needs_owner, iac_only,
+	// direct_eligible, no_change_needed).
+	Category    string
 	Q           string
 	Cursor      string
 	Limit       int
@@ -273,7 +283,7 @@ type FindingFilter struct {
 
 func (f FindingFilter) key() string {
 	return strings.Join([]string{strings.Join(f.Statuses, ","), strings.Join(f.Kinds, ","), strings.Join(f.Severities, ","),
-		strings.Join(f.Confidences, ","), uuidStr(f.IdentityID), uuidStr(f.WorkloadID), f.Account, f.Q,
+		strings.Join(f.Confidences, ","), uuidStr(f.IdentityID), uuidStr(f.WorkloadID), f.Account, f.Category, f.Q,
 		fmt.Sprint(f.GroupByRole)}, "|")
 }
 
@@ -367,6 +377,9 @@ func ValidateFindingFilter(f FindingFilter) error {
 			}
 		}
 	}
+	if f.Category != "" && !containsStr(ReadinessOrder, f.Category) {
+		return GovBadParam("category", fmt.Sprintf("Unknown category %q.", f.Category))
+	}
 	if f.Limit < 0 || f.Limit > MaxGovPage {
 		return GovBadParam("limit", fmt.Sprintf("limit must be 1..%d.", MaxGovPage))
 	}
@@ -439,24 +452,13 @@ func connectionCoverageLink(conn *uuid.UUID) string {
 	return "/iga/connections/" + conn.String() + "/coverage"
 }
 
-// ListFindings is GET /findings at the resolved revision.
-func (r *GovReader) listFindings(db *gorm.DB, ws uuid.UUID, rev int64, f FindingFilter) ([]FindingView, *string, error) {
-	if f.Limit == 0 {
-		f.Limit = 50
-	}
-	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
-	after := ""
-	if f.Cursor != "" {
-		var err error
-		if after, err = r.open(f.Cursor, want); err != nil {
-			return nil, nil, err
-		}
-	}
-	if rev == 0 {
-		return []FindingView{}, nil, nil
-	}
-	where := []string{"f.workspace_id = ?"}
-	args := []any{rev, ws}
+// findingConds is the WHERE of a findings read: the conditions and their
+// arguments (the first is the workspace). none is true when the filter can
+// match nothing (a readiness category with no roles). db is the caller's
+// workspace-scoped transaction (AS-108), threaded through to readiness.
+func (r *GovReader) findingConds(db *gorm.DB, ws uuid.UUID, f FindingFilter) (where []string, args []any, none bool, err error) {
+	where = []string{"f.workspace_id = ?"}
+	args = []any{ws}
 	add := func(cond string, a ...any) { where = append(where, cond); args = append(args, a...) }
 	if len(f.Statuses) > 0 {
 		add("f.status IN ?", f.Statuses)
@@ -482,12 +484,52 @@ func (r *GovReader) listFindings(db *gorm.DB, ws uuid.UUID, rev int64, f Finding
 		// The role ARN's account field (source key "aws␟arn:aws:iam::<acct>:role/…").
 		add("split_part(i.source_key, ':', 5) = ?", f.Account)
 	}
+	if f.Category != "" {
+		rd, err := r.readiness(db, ws, f.Account, "", 1, f.Category)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if len(rd.CategoryIDs) == 0 {
+			return nil, nil, true, nil
+		}
+		add("f.identity_account_id IN ?", rd.CategoryIDs)
+	}
 	if f.Q != "" {
 		like := "%" + strings.ReplaceAll(strings.ReplaceAll(f.Q, "%", `\%`), "_", `\_`) + "%"
 		add("(i.display_name ILIKE ? OR f.role_id ILIKE ? OR f.detail_key ILIKE ?)", like, like, like)
 	}
+	return where, args, false, nil
+}
+
+// listFindings is GET /findings at a revision: findings ordered by
+// fingerprint, cursor-paged. group=role is listFindingGroups. db is the
+// caller's workspace-scoped transaction (AS-108).
+func (r *GovReader) listFindings(db *gorm.DB, ws uuid.UUID, rev int64, f FindingFilter) ([]FindingView, *string, error) {
+	if f.Limit == 0 {
+		f.Limit = 50
+	}
+	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
+	after := ""
+	if f.Cursor != "" {
+		var err error
+		if after, err = r.open(f.Cursor, want); err != nil {
+			return nil, nil, err
+		}
+	}
+	if rev == 0 {
+		return []FindingView{}, nil, nil
+	}
+	where, cargs, none, err := r.findingConds(db, ws, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if none {
+		return []FindingView{}, nil, nil
+	}
+	args := append([]any{rev}, cargs...)
 	if after != "" {
-		add("f.fingerprint > ?", after)
+		where = append(where, "f.fingerprint > ?")
+		args = append(args, after)
 	}
 	q := fmt.Sprintf(findingSelect, "") + " WHERE " + strings.Join(where, " AND ") + " ORDER BY f.fingerprint LIMIT ?"
 	args = append(args, f.Limit+1)
@@ -510,38 +552,137 @@ func (r *GovReader) listFindings(db *gorm.DB, ws uuid.UUID, rev int64, f Finding
 	return out, next, nil
 }
 
-// RoleGroup is one role's findings (group=role).
+// RoleGroup is one role's findings (group=role), with the workloads that run
+// as the role.
 type RoleGroup struct {
-	RoleID            *string       `json:"role_id"`
-	IdentityAccountID *uuid.UUID    `json:"identity_account_id"`
-	RoleName          string        `json:"role_name"`
-	RoleARN           string        `json:"role_arn"`
-	Findings          []FindingView `json:"findings"`
+	RoleID            *string         `json:"role_id"`
+	IdentityAccountID *uuid.UUID      `json:"identity_account_id"`
+	RoleName          string          `json:"role_name"`
+	RoleARN           string          `json:"role_arn"`
+	Findings          []FindingView   `json:"findings"`
+	Workloads         []GroupWorkload `json:"workloads"`
+	WorkloadCount     int             `json:"workload_count"`
 }
 
-// GroupByRole groups one page of findings by role, in first-seen order
-// (DECISION E10: the page is of findings; a role whose findings straddle two
-// pages appears on both).
-func GroupByRole(fs []FindingView) []RoleGroup {
+// GroupWorkload is a workload that runs as a role.
+type GroupWorkload struct {
+	WorkloadID  uuid.UUID `json:"workload_id"`
+	Name        string    `json:"name"`
+	RuntimeKind string    `json:"runtime_kind"`
+}
+
+// groupWorkloadsShown caps the workloads named per role; the count is whole.
+const groupWorkloadsShown = 5
+
+// groupNoRole is the sort key of the findings that have no role.
+const groupNoRole = "zzzz"
+
+// listFindingGroups is GET /findings?group=role: one entry per role, the page
+// being of roles (limit roles, ordered by identity id, the findings with no
+// role last). A role's findings are all of them that match the filter, never
+// a part split across pages. db is the caller's workspace-scoped transaction
+// (AS-108).
+func (r *GovReader) listFindingGroups(db *gorm.DB, ws uuid.UUID, rev int64, f FindingFilter) ([]RoleGroup, *string, error) {
+	if f.Limit == 0 {
+		f.Limit = 50
+	}
+	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
+	after := ""
+	if f.Cursor != "" {
+		var err error
+		if after, err = r.open(f.Cursor, want); err != nil {
+			return nil, nil, err
+		}
+	}
+	if rev == 0 {
+		return []RoleGroup{}, nil, nil
+	}
+	where, cargs, none, err := r.findingConds(db, ws, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if none {
+		return []RoleGroup{}, nil, nil
+	}
+	const key = `coalesce(f.identity_account_id::text, '` + groupNoRole + `')`
+	join := ` FROM iga_gov_finding f
+	  JOIN iga_gov_finding_result r ON r.workspace_id = f.workspace_id AND r.finding_id = f.id AND r.rev = ?
+	  LEFT JOIN iga_identity_accounts i ON i.workspace_id = f.workspace_id AND i.id = f.identity_account_id`
+	pageWhere := append([]string{}, where...)
+	args := append([]any{rev}, cargs...)
+	if after != "" {
+		pageWhere = append(pageWhere, key+" > ?")
+		args = append(args, after)
+	}
+	var keys []string
+	if err := db.Raw("SELECT "+key+" AS k"+join+" WHERE "+strings.Join(pageWhere, " AND ")+" GROUP BY k ORDER BY k LIMIT ?",
+		append(args, f.Limit+1)...).Scan(&keys).Error; err != nil {
+		return nil, nil, err
+	}
+	var next *string
+	if len(keys) > f.Limit {
+		keys = keys[:f.Limit]
+		c := want
+		c.After = keys[len(keys)-1]
+		s := r.sign(c)
+		next = &s
+	}
+	if len(keys) == 0 {
+		return []RoleGroup{}, next, nil
+	}
+	var rows []findingRow
+	if err := db.Raw(fmt.Sprintf(findingSelect, "")+" WHERE "+strings.Join(where, " AND ")+" AND "+key+" IN ? ORDER BY "+key+", f.fingerprint",
+		append(append([]any{rev}, cargs...), keys)...).Scan(&rows).Error; err != nil {
+		return nil, nil, err
+	}
 	idx := map[string]int{}
-	var out []RoleGroup
-	for _, f := range fs {
-		k := ""
-		if f.IdentityAccountID != nil {
-			k = f.IdentityAccountID.String()
+	out := make([]RoleGroup, 0, len(keys))
+	var ids []uuid.UUID
+	for _, fr := range rows {
+		v := fr.view()
+		k := groupNoRole
+		if v.IdentityAccountID != nil {
+			k = v.IdentityAccountID.String()
 		}
 		i, ok := idx[k]
 		if !ok {
 			i = len(out)
 			idx[k] = i
-			out = append(out, RoleGroup{RoleID: f.RoleID, IdentityAccountID: f.IdentityAccountID, RoleName: f.RoleName, RoleARN: f.RoleARN})
+			out = append(out, RoleGroup{RoleID: v.RoleID, IdentityAccountID: v.IdentityAccountID, RoleName: v.RoleName, RoleARN: v.RoleARN,
+				Workloads: []GroupWorkload{}})
+			if v.IdentityAccountID != nil {
+				ids = append(ids, *v.IdentityAccountID)
+			}
 		}
-		out[i].Findings = append(out[i].Findings, f)
+		out[i].Findings = append(out[i].Findings, v)
 	}
-	if out == nil {
-		out = []RoleGroup{}
+	if len(ids) > 0 {
+		var ws2 []struct {
+			IdentityID  uuid.UUID
+			WorkloadID  uuid.UUID
+			Name        string
+			RuntimeKind string
+		}
+		if err := db.Raw(`SELECT DISTINCT r.target_identity_account_id AS identity_id, w.id AS workload_id, w.display_name AS name, w.runtime_kind
+		                      FROM iga_relationship r
+		                      JOIN iga_workload w ON w.workspace_id = r.workspace_id AND w.id = r.source_workload_id
+		                     WHERE r.workspace_id = ? AND r.target_identity_account_id IN ? AND r.state <> 'ended'
+		                       AND r.relationship_type IN ('executes_as','task_execution_role')
+		                     ORDER BY identity_id, name, workload_id`, ws, ids).Scan(&ws2).Error; err != nil {
+			return nil, nil, err
+		}
+		for _, w := range ws2 {
+			i, ok := idx[w.IdentityID.String()]
+			if !ok {
+				continue
+			}
+			out[i].WorkloadCount++
+			if len(out[i].Workloads) < groupWorkloadsShown {
+				out[i].Workloads = append(out[i].Workloads, GroupWorkload{WorkloadID: w.WorkloadID, Name: w.Name, RuntimeKind: w.RuntimeKind})
+			}
+		}
 	}
-	return out
+	return out, next, nil
 }
 
 // FindingSummary is GET /findings/summary.

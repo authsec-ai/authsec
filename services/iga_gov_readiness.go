@@ -84,6 +84,8 @@ type Readiness struct {
 	Counts        map[string]int  `json:"counts"`
 	Roles         []ReadinessRole `json:"roles"`
 	Next          *string         `json:"-"`
+	// CategoryIDs are the roles of the collected category (not served).
+	CategoryIDs []uuid.UUID `json:"-"`
 }
 
 // Readiness computes readiness at the latest complete evaluation; account
@@ -92,13 +94,16 @@ type Readiness struct {
 // under row-level security for ws.
 func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor string, limit int) (out *Readiness, err error) {
 	err = tenancy.InWorkspaceRead(ctx, r.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
-		out, e = r.readiness(tx, ws, account, cursor, limit)
+		out, e = r.readiness(tx, ws, account, cursor, limit, "")
 		return e
 	}))
 	return out, err
 }
 
-func (r *GovReader) readiness(db *gorm.DB, ws uuid.UUID, account, cursor string, limit int) (*Readiness, error) {
+// readiness is Readiness; a non-empty collect also gathers, over every role
+// reviewed, the identity ids of that category (CategoryIDs), which GET
+// /findings?category reads.
+func (r *GovReader) readiness(db *gorm.DB, ws uuid.UUID, account, cursor string, limit int, collect string) (*Readiness, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -305,6 +310,9 @@ func (r *GovReader) readiness(db *gorm.DB, ws uuid.UUID, account, cursor string,
 		rr.Remedy = readinessRemedy(rr)
 		out.Counts[rr.Category]++
 		out.RolesReviewed++
+		if collect != "" && rr.Category == collect {
+			out.CategoryIDs = append(out.CategoryIDs, ro.ID)
+		}
 		if after != "" && ro.ID.String() <= after {
 			continue
 		}

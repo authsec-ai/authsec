@@ -38,6 +38,22 @@ AuthSec scans an AWS account, finds IAM roles that have permission for AWS servi
 - [ ] You have a folder for evidence, with sub-folders `step-01`, `step-02` and so on.
 - [ ] The lead has confirmed the **discovery stack in AWS is updated** to template `2026-10-07` and a **new scan has finished**. If not, do step 2 with the lead before going on.
 - [ ] You have a copy of the results log (section 6).
+- [ ] Every person has done the member-session step in section 3b.
+
+## 3b. Known blocker until fixed: get a member session first (everyone, once per day)
+
+Every action that records *who did it* (opening your own reviews, creating a policy, assigning owners, excepting a finding, adding rules, approving) needs a **workspace member session**. The normal console login does not carry one yet, so these actions answer "Your role cannot do this" even for an administrator. This is not a permission to grant. Until the console does it for you, do this in each person's own browser after logging in:
+
+1. Log in to https://app.authsec.ai and open the workspace.
+2. Open DevTools (F12) → **Console**, paste the following and press Enter. It swaps your session token for one that carries your membership; it prints nothing secret and reloads the page.
+
+```js
+(async()=>{const s=JSON.parse(localStorage.getItem('authsec_session_v2'));const r=await fetch(`https://prod.api.authsec.ai/authsec/workspaces/${s.workspace_id}/switch`,{method:'POST',headers:{Authorization:`Bearer ${s.token}`}});const j=await r.json();if(!j.access_token){console.log('switch failed',r.status,j);return}s.token=j.access_token;localStorage.setItem('authsec_session_v2',JSON.stringify(s));location.reload()})()
+```
+
+3. Check: **Policy → Overview**, "Needs a decision now" no longer says "Your role cannot do this".
+
+The new token lasts 24 hours. Repeat after it expires or after a fresh login. If step 2 prints `switch failed`, tell the lead: that person is not an **active** member of this workspace.
 
 ## 4. The run
 
@@ -138,7 +154,7 @@ Open the deployment and press **Undo…** (needs the enforce permission). Read w
 ### Step 13: Permissions and safety checks (S0.4, S5, S12)
 1. Log in as a person with **read only**. Open every Policy page. **Expected:** pages load; buttons that change things are missing or explain why.
 2. As the **Author**, edit and save the policy while it is *approved*. **Expected:** a new version is created and the old approval does not apply to it (S5.6).
-3. Open the legacy page (**Policy → Legacy**, if shown in the menu or at `/iga/policy/legacy`). **Expected:** it lists old policies; Pause and Remove need the enforce permission.
+3. Check that **Policy** is the only policy destination. `/iga/policy/legacy` and the retired policy APIs must not expose an old list or writer. Provider discovery, graph browsing and workspace switching must still work.
 4. Check **Logs** for an email address or a URL in any event. **Expected:** none.
 
 ### Step 14: Wrap up

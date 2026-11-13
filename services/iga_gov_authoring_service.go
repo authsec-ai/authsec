@@ -376,15 +376,24 @@ type GovVersionView struct {
 
 // GovPolicyView is a policy in a list or its detail.
 type GovPolicyView struct {
-	ID             uuid.UUID       `json:"id"`
-	Name           string          `json:"name"`
-	Purpose        string          `json:"purpose"`
-	Family         string          `json:"family"`
-	Provider       string          `json:"provider"`
-	Lifecycle      string          `json:"lifecycle"`
-	OwnerUserID    *uuid.UUID      `json:"owner"`
-	Status         *string         `json:"status"`
-	ScopeSummary   string          `json:"scope_summary"`
+	ID           uuid.UUID  `json:"id"`
+	Name         string     `json:"name"`
+	Purpose      string     `json:"purpose"`
+	Family       string     `json:"family"`
+	Provider     string     `json:"provider"`
+	Lifecycle    string     `json:"lifecycle"`
+	OwnerUserID  *uuid.UUID `json:"owner"`
+	Status       *string    `json:"status"`
+	ScopeSummary string     `json:"scope_summary"`
+	// Stage is where the policy stands, from its newest version, rollout and
+	// deployments (policyStageSQL): archived, drifted, failed, canary,
+	// observing, partial, verified, applying, in_review, approved, draft or
+	// idle. Status stays the current version's own status.
+	Stage string `json:"stage"`
+	// Delivery is the newest current deployment's delivery, null before one.
+	Delivery *string `json:"delivery"`
+	// LastVerifiedAt is the newest verification of a live control's
+	// deployment, null before one.
 	LastVerifiedAt *time.Time      `json:"last_verified_at"`
 	NextAction     string          `json:"next_action"`
 	CreatedBy      uuid.UUID       `json:"created_by"`
@@ -437,9 +446,12 @@ func scopeSummary(n int) string {
 
 // GovPolicyFilter filters GET /policies.
 type GovPolicyFilter struct {
-	Family, Provider, Status, Lifecycle, Q, Cursor string
-	Limit                                          int
+	Family, Provider, Status, Stage, Lifecycle, Q, Cursor string
+	Limit                                                 int
 }
+
+// GovPolicyStages are the values of GovPolicyView.Stage.
+var GovPolicyStages = []string{"archived", "drifted", "failed", "canary", "observing", "partial", "verified", "applying", "in_review", "approved", "draft", "idle"}
 
 var (
 	govFamilies   = map[string]bool{"governance": true, "cloud_access": true, "time_bound": true, "runtime": true}
@@ -449,9 +461,66 @@ var (
 
 type policyListRow struct {
 	models.IGAGovPolicy
-	VStatus *string
-	Roles   int
+	VStatus        *string
+	Roles          int
+	Stage          string
+	Delivery       *string
+	LastVerifiedAt *time.Time
 }
+
+// policyStageSQL computes every policy's stage from the rows that decide it:
+// the live controls' newest current apply or split deployment (a superseded,
+// undone or recovered one says nothing about the role now), the newest
+// rollout of any of the policy's versions, and the current version's status.
+// Precedence: an archived policy; drift nobody accepted; a failed, blocked or
+// unresolved deployment; a rollout in canary or observation; deployments that
+// are all verified, some verified, or still applying; then the version.
+// A drift an operator accepted is settled and not counted. It is
+// the one definition: the list, its tiles and the detail read it.
+// TENANT-EXEMPT: shared CTE binds p.workspace_id to named @ws from the authenticated service argument at every caller; all correlated joins bind that workspace.
+const policyStageSQL = `
+WITH staged AS (
+  SELECT p.*, v.status AS v_status,
+         (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = p.workspace_id AND t.version_id = p.current_version_id) AS roles,
+         dep.last_verified_at, dep.delivery,
+         CASE
+           WHEN p.lifecycle = 'archived' THEN 'archived'
+           WHEN dep.drifted > 0 THEN 'drifted'
+           WHEN dep.failed > 0 THEN 'failed'
+           WHEN ro.stage IN ('canary','expand') THEN 'canary'
+           WHEN ro.stage IN ('observe','awaiting_approval') THEN 'observing'
+           WHEN dep.n > 0 AND dep.verified = dep.n THEN 'verified'
+           WHEN dep.verified > 0 THEN 'partial'
+           WHEN dep.n > 0 THEN 'applying'
+           WHEN v.status = 'in_review' THEN 'in_review'
+           WHEN v.status = 'approved' THEN 'approved'
+           WHEN v.status = 'draft' THEN 'draft'
+           ELSE 'idle'
+         END AS stage
+    FROM iga_gov_policy p
+    LEFT JOIN iga_gov_policy_version v ON v.workspace_id = p.workspace_id AND v.id = p.current_version_id
+    LEFT JOIN LATERAL (
+      SELECT count(*) AS n,
+             count(*) FILTER (WHERE ld.state = 'verified') AS verified,
+             count(*) FILTER (WHERE ld.state = 'drifted' AND ld.drift_accepted_at IS NULL) AS drifted,
+             count(*) FILTER (WHERE ld.state IN ('failed','blocked','outcome_unresolved')) AS failed,
+             max(ld.verified_at) FILTER (WHERE ld.state = 'verified') AS last_verified_at,
+             (array_agg(ld.delivery ORDER BY ld.created_at DESC))[1] AS delivery
+        FROM iga_gov_control c
+        JOIN LATERAL (
+          SELECT d.* FROM iga_gov_deployment d
+           WHERE d.workspace_id = c.workspace_id AND d.control_id = c.id AND d.kind IN ('apply','split')
+             AND d.state NOT IN ('superseded','undone','recovered')
+             AND NOT (d.state = 'drifted' AND d.drift_accepted_at IS NOT NULL)
+           ORDER BY d.created_at DESC, d.id DESC LIMIT 1) ld ON true
+       WHERE c.workspace_id = p.workspace_id AND c.policy_id = p.id AND c.state <> 'removed') dep ON true
+    LEFT JOIN LATERAL (
+      SELECT r.stage FROM iga_gov_rollout r
+        JOIN iga_gov_policy_version rv ON rv.workspace_id = r.workspace_id AND rv.id = r.version_id
+       WHERE rv.workspace_id = p.workspace_id AND rv.policy_id = p.id
+       ORDER BY r.updated_at DESC LIMIT 1) ro ON true
+   WHERE p.workspace_id = @ws)
+`
 
 // ListPolicies is GET /policies: Phase 3 policies only (never legacy agent
 // policies, §7.10), ordered by name, cursor-paged.
@@ -472,9 +541,35 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
-	var after *struct {
-		name string
-		id   uuid.UUID
+	where := []string{"1 = 1"}
+	args := map[string]any{"ws": ws}
+	add := func(cond, name string, v any) {
+		where = append(where, cond)
+		args[name] = v
+	}
+	// Access policies (family time_bound) have their own routes and lifecycle
+	// (iga_gov_access_policy.go); R1a never lists or acts on them.
+	add("family <> @excl_family", "excl_family", "time_bound")
+	if f.Stage != "" {
+		if !containsStr(GovPolicyStages, f.Stage) {
+			return nil, nil, GovBadParam("stage", "Unknown stage.")
+		}
+		add("stage = @stage", "stage", f.Stage)
+	}
+	if f.Family != "" {
+		add("family = @family", "family", f.Family)
+	}
+	if f.Provider != "" {
+		add("provider = @provider", "provider", f.Provider)
+	}
+	if f.Lifecycle != "" {
+		add("lifecycle = @lifecycle", "lifecycle", f.Lifecycle)
+	}
+	if f.Status != "" {
+		add("v_status = @status", "status", f.Status)
+	}
+	if f.Q != "" {
+		add("name ILIKE @q", "q", "%"+strings.NewReplacer("%", `\%`, "_", `\_`).Replace(f.Q)+"%")
 	}
 	if f.Cursor != "" {
 		raw, err := base64.RawURLEncoding.DecodeString(f.Cursor)
@@ -486,40 +581,14 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 		if err != nil {
 			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid.", map[string]any{"parameter": "cursor"})
 		}
-		after = &struct {
-			name string
-			id   uuid.UUID
-		}{parts[0], id}
+		add("(name, id) > (@cname, @cid)", "cname", parts[0])
+		args["cid"] = id
 	}
+	args["lim"] = limit + 1
 	var rows []policyListRow
 	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
-		q := tx.Table("iga_gov_policy p").
-			Select(`p.*, v.status AS v_status,
-			        (SELECT count(*) FROM iga_gov_target t WHERE t.workspace_id = p.workspace_id AND t.version_id = p.current_version_id) AS roles`).
-			Joins("LEFT JOIN iga_gov_policy_version v ON v.workspace_id = p.workspace_id AND v.id = p.current_version_id").
-			Where("p.workspace_id = ?", ws).
-			// Access policies (family time_bound) have their own routes and
-			// lifecycle (iga_gov_access_policy.go); R1a never lists or acts on them.
-			Where("p.family <> ?", "time_bound")
-		if f.Family != "" {
-			q = q.Where("p.family = ?", f.Family)
-		}
-		if f.Provider != "" {
-			q = q.Where("p.provider = ?", f.Provider)
-		}
-		if f.Lifecycle != "" {
-			q = q.Where("p.lifecycle = ?", f.Lifecycle)
-		}
-		if f.Status != "" {
-			q = q.Where("v.status = ?", f.Status)
-		}
-		if f.Q != "" {
-			q = q.Where("p.name ILIKE ?", "%"+strings.NewReplacer("%", `\%`, "_", `\_`).Replace(f.Q)+"%")
-		}
-		if after != nil {
-			q = q.Where("(p.name, p.id) > (?, ?)", after.name, after.id)
-		}
-		return q.Order("p.name, p.id").Limit(limit + 1).Scan(&rows).Error
+		return tx.Raw(policyStageSQL+"SELECT * FROM staged WHERE "+strings.Join(where, " AND ")+" ORDER BY name, id LIMIT @lim", args).
+			Scan(&rows).Error
 	}); err != nil {
 		return nil, nil, err
 	}
@@ -532,9 +601,35 @@ func (a *GovAuthoring) ListPolicies(ctx context.Context, ws uuid.UUID, f GovPoli
 	}
 	out := make([]GovPolicyView, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, policyView(r.IGAGovPolicy, r.VStatus, r.Roles))
+		v := policyView(r.IGAGovPolicy, r.VStatus, r.Roles)
+		v.Stage, v.Delivery, v.LastVerifiedAt = r.Stage, r.Delivery, r.LastVerifiedAt
+		out = append(out, v)
 	}
 	return out, next, nil
+}
+
+// PolicyStageTiles counts the workspace's policies per stage (archived ones
+// excluded), whatever page or filter the list shows: the S7 tiles.
+func (a *GovAuthoring) PolicyStageTiles(ctx context.Context, ws uuid.UUID) (map[string]int, error) {
+	var rows []struct {
+		Stage string
+		N     int
+	}
+	if err := a.readWorkspace(ctx, ws, func(tx *gorm.DB) error {
+		return tx.Raw(policyStageSQL+"SELECT stage, count(*) AS n FROM staged WHERE lifecycle <> 'archived' AND family <> 'time_bound' GROUP BY stage", map[string]any{"ws": ws}).Scan(&rows).Error
+	}); err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	for _, s := range GovPolicyStages {
+		if s != "archived" {
+			out[s] = 0
+		}
+	}
+	for _, r := range rows {
+		out[r.Stage] = r.N
+	}
+	return out, nil
 }
 
 func policyView(p models.IGAGovPolicy, status *string, roles int) GovPolicyView {
@@ -620,6 +715,13 @@ func (a *GovAuthoring) getPolicyTx(db *gorm.DB, ws, id uuid.UUID) (*GovPolicyVie
 		status, cur, roles = &v.Status, &vv, len(vv.Targets)
 	}
 	out := policyView(*p, status, roles)
+	var st []policyListRow
+	if err := db.Raw(policyStageSQL+"SELECT * FROM staged WHERE id = @id", map[string]any{"ws": ws, "id": id}).Scan(&st).Error; err != nil {
+		return nil, err
+	}
+	if len(st) == 1 {
+		out.Stage, out.Delivery, out.LastVerifiedAt = st[0].Stage, st[0].Delivery, st[0].LastVerifiedAt
+	}
 	out.CurrentVersion = cur
 	var approved []int
 	if err := db.Raw(`SELECT version_no FROM iga_gov_policy_version WHERE workspace_id = ? AND policy_id = ? AND status = 'approved'`,
@@ -845,7 +947,7 @@ func (a *GovAuthoring) closeVersionTx(tx *gorm.DB, actor uuid.UUID, v models.IGA
 		return err
 	}
 	if err := tx.Exec(`UPDATE iga_gov_approval SET revoked_at = ?, revoked_reason = ?
-	                    WHERE workspace_id = ? AND version_id = ? AND decision = 'approve' AND revoked_at IS NULL`,
+	                    WHERE workspace_id = ? AND version_id = ? AND decision = 'approve' AND scope = 'version' AND revoked_at IS NULL`,
 		now, "version "+status+": "+reason, v.WorkspaceID, v.ID).Error; err != nil {
 		return err
 	}
@@ -1523,7 +1625,8 @@ func activeMember(db *gorm.DB, ws, user uuid.UUID) (bool, error) {
 // ProposalRequest is POST /proposals (§7.3): exactly one of From (findings),
 // Template + Keys, or Context (a Discovery object or graph relationship).
 type ProposalRequest struct {
-	From *struct {
+	Isolation *IsolationProposalInput `json:"isolation,omitempty"`
+	From      *struct {
 		FindingIDs []string `json:"finding_ids"`
 	} `json:"from"`
 	Template string      `json:"template"`
@@ -1636,6 +1739,15 @@ type proposalRole struct {
 // warnings. From findings, the removal is further limited to the findings'
 // services (unused_service findings only).
 func (a *GovAuthoring) CreateProposal(ctx context.Context, ws, actor uuid.UUID, req ProposalRequest) (*ProposalResult, error) {
+	if req.Template == igagov.IntentDedicatedIdentity {
+		if req.From != nil || req.Context != nil || len(req.Keys) != 1 || req.Isolation == nil {
+			return nil, GovBadParam("body", "dedicated_identity requires exactly one source key and isolation settings, without from or context.")
+		}
+		return a.createIsolationProposal(ctx, ws, actor, req)
+	}
+	if req.Isolation != nil {
+		return nil, GovBadParam("isolation", "isolation requires the dedicated_identity template.")
+	}
 	forms := 0
 	if req.From != nil {
 		forms++

@@ -94,7 +94,7 @@ func containsName(msg, name string) bool {
 func TestVerifyPolicySchemaFailsWithoutAChannelColumn(t *testing.T) {
 	_, g := testDB(t)
 	cols := services.PolicySchemaColumns()
-	if len(cols) != 5 {
+	if len(cols) != 4 {
 		t.Fatalf("channel columns checked: %v", cols)
 	}
 	for _, qc := range cols {

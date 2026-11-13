@@ -238,6 +238,10 @@ type GraphNode struct {
 	// absent on every other node. provider, scope, sub_scope and native_id
 	// above carry Azure nodes' too ("azure", the azure_tenant scope).
 	AzureRole *GraphAzureRole `json:"azure_role,omitempty"`
+	// AgentRuntime is an AWS identity's or workload's agent-runtime picture
+	// (agent_runtime.go): absent unless there is something to say, so a node
+	// without agent-runtime data is what it always was.
+	AgentRuntime *GraphAgentRuntime `json:"agent_runtime,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
@@ -263,7 +267,11 @@ type GraphNode struct {
 	// -- the reader /evidence's grant limitations use (D-35).
 	denyIDs          []uuid.UUID
 	boundaryPolicies []uuid.UUID
-	fetched          bool
+	// AWS identities: the immutable key (RoleId / UserId), and the
+	// containment in force its grant edges carry (agent_runtime.go).
+	immutable string
+	arContain *AgentRuntimeContainment
+	fetched   bool
 }
 
 // GraphRestrictions is an identity's restrictions (§5.4, D-78): how many Deny
@@ -327,6 +335,10 @@ type GraphEdge struct {
 	CrossesProvider bool           `json:"crosses_provider,omitempty"`
 	ViaPrincipal    string         `json:"via_principal,omitempty"`
 	Resolution      map[string]any `json:"resolution,omitempty"`
+	// Contained marks an AWS grant edge of an identity under a containment in
+	// force (agent_runtime.go): every grant at identity level, the grants
+	// whose statement allows a model action at model level. Absent otherwise.
+	Contained *GraphContained `json:"contained,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
@@ -546,6 +558,9 @@ type graphTraversal struct {
 	cross *graphCross
 	// az is what an Azure walk reads once per request (traverse_azure.go).
 	az *graphAzureState
+	// modelActions are what model-level containment denies, from the agent
+	// runtime source (agent_runtime.go); nil until a level read it.
+	modelActions []string
 
 	nodes   map[string]*GraphNode
 	order   []*GraphNode
@@ -910,6 +925,7 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 	if err := t.decorateEdges(lv, res.newEdges, lookup); err != nil {
 		return nil, err
 	}
+	t.decorateContained(res.newEdges, lookup)
 	if err := t.decorateLimitations(lv, res.newNodes, res.newEdges); err != nil {
 		return nil, err
 	}

@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec tag-gated model access (deny mode, AWS Organizations) - a service
+  control policy that refuses Bedrock model calls by any principal not tagged
+  authsec:agent, and refuses setting or removing that tag except by the
+  administrator principals you name. Deploy it in the Organizations
+  management account (or a delegated administrator for policies). Run the
+  audit mode first: this one breaks every untagged caller of a model in the
+  accounts it targets.
+
+# What it does (SPEC-agent-runtime-visibility.md section 5.4 as amended in
+# section 10):
+#   - DenyUntaggedModelCalls / DenyEmptyAgentTagModelCalls: Bedrock Runtime
+#     (InvokeModel*, Converse*), batch inference (CreateModelInvocationJob),
+#     the agents runtime (InvokeAgent, InvokeInlineAgent,
+#     RetrieveAndGenerate*, InvokeFlow), AgentCore runtimes
+#     (InvokeAgentRuntime*) and the bedrock-mantle endpoint (CreateInference)
+#     are refused unless the calling principal carries a NON-EMPTY
+#     authsec:agent tag (role tag, user tag or session tag). The refusals are
+#     CloudTrail events, so AuthSec shows every untagged AI workload as a
+#     refused model call (agents runtime, AgentCore and mantle calls are data
+#     events: only with the event stream's data events on).
+#   - The gate cannot be passed by tagging: setting authsec:agent as a session
+#     tag (sts:TagSession, sts:AssumeRole* with tags), on a role or user
+#     (iam:TagRole, iam:TagUser, iam:CreateRole, iam:CreateUser with tags),
+#     or removing it (iam:UntagRole, iam:UntagUser) is refused, except for the
+#     AdminPrincipalArns (aws:PrincipalArn).
+#
+# Actions, checked against the IAM service reference
+# (servicereference.us-east-1.amazonaws.com/v1/<svc>/<svc>.json, 2026-11-05):
+#   - Converse, ConverseStream and StartAsyncInvoke are authorized as
+#     bedrock:InvokeModel / InvokeModelWithResponseStream (no separate action
+#     is listed); bedrock:Converse* matches nothing today and is kept in case
+#     AWS adds one.
+#   - CreateModelInvocationJob, InvokeAgent, InvokeInlineAgent,
+#     RetrieveAndGenerate, InvokeFlow and bedrock-agentcore:InvokeAgentRuntime
+#     (with its ForUser, WebSocket and Command variants) are confirmed.
+#   - bedrock-mantle: the prefix and CreateInference are confirmed; that every
+#     mantle inference API is authorized as CreateInference is UNVERIFIED (it
+#     is the only inference-creating action listed) -- confirm with a lab call.
+#
+# Limits, stated plainly:
+#   - SCPs never apply to the management account or to service-linked roles.
+#   - An SCP governs only principals IN the organization. Session tags set
+#     by a caller outside it (another account assuming one of your roles
+#     with Tags) or issued by a SAML or OIDC identity provider are authorized
+#     by the role's trust policy and are NOT stopped here. Deploy the RCP
+#     form (form=rcp) as well: a resource control policy on your roles
+#     refuses sts:TagSession for authsec:agent whoever the caller is. Without
+#     it, check that no trust policy allows sts:TagSession without an
+#     aws:TagKeys condition that excludes authsec:agent (AuthSec does not
+#     check this for you).
+#   - Bedrock's own service roles: a Bedrock agent, knowledge base, flow,
+#     batch inference job or AgentCore runtime calls the model AS a role of
+#     yours that Bedrock assumes (its service role or execution role).
+#     aws:PrincipalIsAWSService is false for it, so it is refused like any
+#     untagged role: tag those roles authsec:agent too, or the agent's own
+#     model call fails after its InvokeAgent succeeds. There is no exception
+#     by aws:CalledVia / aws:ViaAWSService: they describe a service acting
+#     with the CALLER's credentials (forward access), not a role the service
+#     assumed, so whether Bedrock sets them on these calls is UNVERIFIED, and
+#     an exception on them would let other service-forwarded calls through.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-11-05'
+    Kind: model-access-scp
+
+Parameters:
+
+  TargetIds:
+    Type: CommaDelimitedList
+    Description: >-
+      The organization root (r-...), organizational units (ou-...) or accounts
+      (12 digits) to attach the policy to. Start with one test account.
+
+  # At least one: with none, nobody (outside the management account) can ever
+  # tag an agent role again.
+  AdminPrincipalArns:
+    Type: CommaDelimitedList
+    Description: >-
+      ARNs (wildcards allowed, e.g. arn:aws:iam::*:role/PlatformAdmin) of the
+      principals that may set or remove the authsec:agent tag, including any
+      pipeline or CloudFormation role that tags agent roles.
+
+  PolicyName:
+    Type: String
+    Default: AuthSecModelAccessGate
+    AllowedPattern: '^[A-Za-z0-9_-]{1,128}$'
+    Description: The name of the service control policy.
+
+Resources:
+
+  AuthSecModelAccessGate:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: !Ref PolicyName
+      Description: AuthSec tag-gated model access - refuses model calls by principals without the authsec:agent tag
+      Type: SERVICE_CONTROL_POLICY
+      TargetIds: !Ref TargetIds
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+      Content:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUntaggedModelCalls
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel*
+              - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
+              - bedrock:InvokeAgent
+              - bedrock:InvokeInlineAgent
+              - bedrock:RetrieveAndGenerate*
+              - bedrock:InvokeFlow
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:PrincipalTag/authsec:agent: 'true'
+              BoolIfExists:
+                aws:PrincipalIsAWSService: 'false'
+          # Present but empty: 'Null' alone would let it pass. StringEquals is
+          # false when the key is absent (the statement above covers that).
+          - Sid: DenyEmptyAgentTagModelCalls
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel*
+              - bedrock:Converse*
+              - bedrock:CreateModelInvocationJob
+              - bedrock:InvokeAgent
+              - bedrock:InvokeInlineAgent
+              - bedrock:RetrieveAndGenerate*
+              - bedrock:InvokeFlow
+              - bedrock-agentcore:InvokeAgentRuntime*
+              - bedrock-mantle:CreateInference
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalTag/authsec:agent: ''
+              BoolIfExists:
+                aws:PrincipalIsAWSService: 'false'
+          - Sid: DenyAgentTagByKey
+            Effect: Deny
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - sts:AssumeRoleWithSAML
+              - sts:AssumeRoleWithWebIdentity
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:TagUser
+              - iam:UntagUser
+              - iam:CreateRole
+              - iam:CreateUser
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEqualsIgnoreCase:
+                aws:TagKeys:
+                  - authsec:agent
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+          - Sid: DenyAgentTagByRequest
+            Effect: Deny
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - sts:AssumeRoleWithSAML
+              - sts:AssumeRoleWithWebIdentity
+              - iam:TagRole
+              - iam:TagUser
+              - iam:CreateRole
+              - iam:CreateUser
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:RequestTag/authsec:agent: 'false'
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+
+Outputs:
+  TemplateVersion:
+    Description: The AuthSec template version of this stack.
+    Value: '2026-11-05'
+  PolicyId:
+    Description: The service control policy AuthSec's gate is.
+    Value: !Ref AuthSecModelAccessGate

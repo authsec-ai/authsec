@@ -1,0 +1,42 @@
+# AuthSec agent runtime gateway configuration (SPEC-agent-runtime-gateway.md).
+# Secrets are never in this file: the gateway credential, provider keys and MCP
+# server tokens come from environment variables (Kubernetes Secrets).
+listen: ":8080"
+
+authsec:
+  url: https://api.authsec.ai/authsec      # or AUTHSEC_URL
+  credential_env: AUTHSEC_GATEWAY_CREDENTIAL   # agw_... from POST /api/iga/v1/agent-runtime/gateways
+  timeout_ms: 300                          # then the fail mode applies
+  hints_interval_s: 60
+
+# auto: deny when the target has a deny policy, or the workspace is in enforce
+# mode, or no hints were ever fetched; allow otherwise. closed | open.
+fail_mode: auto
+
+agents:
+  keys:
+    # agent-gateway gen-key  -> give the key to the agent, put its sha256 here.
+    - id: billing-agent
+      key_sha256: "<64 hex>"
+      labels: [prod, billing]
+      # identity_id / workload_id: AuthSec ids, when policies select by them
+  # trust_spiffe_header: true      # only behind an mTLS-terminating proxy
+  # spiffe_header: X-Client-SPIFFE-ID
+
+mcp_servers:
+  - name: github
+    url: https://api.githubcopilot.com/mcp/
+    path_prefix: /mcp/github         # agents use http://agent-gateway:8080/mcp/github
+    headers:
+      Authorization: "env:GITHUB_MCP_AUTHORIZATION"   # "Bearer ghp_..." stays here
+    pin_tools: true
+    require_pinned: false
+
+llm:
+  - provider: openai                 # agents: base_url http://agent-gateway:8080/llm/openai/v1
+    api_key_env: OPENAI_API_KEY
+  - provider: anthropic              # agents: base_url http://agent-gateway:8080/llm/anthropic
+    api_key_env: ANTHROPIC_API_KEY
+
+pin_store: /var/lib/agent-gateway/pins.json
+admin_token_env: AGENT_GATEWAY_ADMIN_TOKEN     # local pin approval on 127.0.0.1:9091

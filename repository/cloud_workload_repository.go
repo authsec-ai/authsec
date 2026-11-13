@@ -414,7 +414,10 @@ func listWorkloads(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([
 }
 
 func listUsage(db *gorm.DB, workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
-	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
+	// Access Advisor rows only: the model-call evidence rows (source
+	// cloudtrail) are read by the agent-runtime endpoints, and listed here they
+	// would show every AI identity a second, "bedrock", service.
+	q := db.Model(&models.CloudUsage{}).Where("workspace_id = ? AND source = ?", workspaceID, models.UsageSourceServiceLastAccessed)
 	if f.IdentityID != nil {
 		q = q.Where("identity_id = ?", *f.IdentityID)
 	}
@@ -454,7 +457,7 @@ type CloudUsageSummaryRow struct {
 func usageSummary(db *gorm.DB, workspaceID uuid.UUID, connectorID *uuid.UUID) ([]CloudUsageSummaryRow, error) {
 	q := db.Model(&models.CloudUsage{}).
 		Select("identity_id, count(*) AS services, count(*) FILTER (WHERE last_used_at IS NULL) AS never_used").
-		Where("workspace_id = ?", workspaceID)
+		Where("workspace_id = ? AND source = ?", workspaceID, models.UsageSourceServiceLastAccessed)
 	if connectorID != nil {
 		q = q.Where("connector_id = ?", *connectorID)
 	}
@@ -476,7 +479,7 @@ func countsForConnector(db *gorm.DB, workspaceID, connectorID uuid.UUID) (int64,
 		return 0, 0, err
 	}
 	if err := db.Model(&models.CloudUsage{}).
-		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
+		Where("workspace_id = ? AND connector_id = ? AND source = ?", workspaceID, connectorID, models.UsageSourceServiceLastAccessed).
 		Count(&usage).Error; err != nil {
 		return 0, 0, err
 	}
@@ -557,15 +560,18 @@ func (r *cloudWorkloadRepository) ReconcileWorkloads(
 	return removed, err
 }
 
-// ReconcileUsage removes the usage rows this connector did not see in the
-// given generation. The caller invokes it only when activity was reached.
+// ReconcileUsage removes the Access Advisor usage rows this connector did not
+// see in the given generation. The caller invokes it only when activity was
+// reached, which licenses deleting those rows and no others: the CloudTrail
+// model-call rows (source cloudtrail) are cumulative evidence over the windows
+// read, not a report the activity surface re-reads whole every scan.
 func (r *cloudWorkloadRepository) ReconcileUsage(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, error) {
 	var removed int64
 	err := r.fencedTx(workspaceID, func(tx *gorm.DB) error {
-		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
+		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ? AND source = ?`,
+			workspaceID, connectorID, generation, models.UsageSourceServiceLastAccessed).Delete(&models.CloudUsage{})
 		removed = res.RowsAffected
 		return res.Error
 	})

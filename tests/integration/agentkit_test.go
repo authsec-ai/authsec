@@ -1,6 +1,6 @@
 package integration
 
-// AuthSec Agent Kit control plane (migration 147): machine events and policy
+// AuthSec Agent Kit control plane (migration 162): machine events and policy
 // pull on the discovery ingress, console logs and the policy editor, and the
 // machine branch of quarantine. Every route is checked across two
 // workspaces: neither reads, lists or writes the other's rows.

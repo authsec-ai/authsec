@@ -253,7 +253,9 @@ func AccessActions(access []string, prefix string) (object, bucket []string) {
 // accessActionsFor is AccessActions plus, for a Block, the read-side actions
 // that expose the same keys or their metadata: listing versions and in-flight
 // multipart uploads (both honour s3:prefix) and the metadata reads
-// (attributes, tags, ACL); for a delete of the whole bucket, setting a
+// (attributes, tags, ACL, retention, legal hold); for a write, the actions that
+// change an object without replacing it (ACL, tags, retention, legal hold,
+// restore from archive); for a delete of the whole bucket, setting a
 // lifecycle rule (it expires objects). An Allow never gains them: it must not
 // widen beyond what the person chose.
 func accessActionsFor(effect string, access []string, prefix string) (object, bucket []string) {
@@ -264,10 +266,21 @@ func accessActionsFor(effect string, access []string, prefix string) (object, bu
 	for _, a := range access {
 		switch a {
 		case AccessRead:
-			// What reads an object's metadata: attributes, tags and ACL.
+			// What reads an object's metadata: attributes, tags, ACL, retention and
+			// legal hold (retention was found open live: not denied by a read block).
 			object = append(object, "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes",
-				"s3:GetObjectTagging", "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl")
+				"s3:GetObjectTagging", "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
+				"s3:GetObjectRetention", "s3:GetObjectLegalHold")
 			bucket = append(bucket, "s3:ListBucketVersions", "s3:ListBucketMultipartUploads")
+		case AccessWrite:
+			// What changes a protected object without replacing it: who can reach
+			// it (ACL), its tags, how long it is held (retention, legal hold), and
+			// restoring it from archive. Found live: a write block left every one of
+			// these allowed. The Version forms are the same calls with a versionId.
+			object = append(object, "s3:PutObjectAcl", "s3:PutObjectVersionAcl",
+				"s3:PutObjectTagging", "s3:PutObjectVersionTagging",
+				"s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging",
+				"s3:PutObjectRetention", "s3:PutObjectLegalHold", "s3:RestoreObject")
 		case AccessDelete:
 			// A lifecycle rule expires (deletes) objects. It is bucket-wide,
 			// so only a block of the whole bucket denies setting one.

@@ -511,6 +511,32 @@ func TestP3T316DeploymentRoutes(t *testing.T) {
 	_, _, held := dUnknownApply(t, d, "RouteHeld")
 	p3exec(t, d.db, `UPDATE iga_gov_deployment SET settle_after = now() - interval '1 minute' WHERE id = ?`, held)
 	mut("/deployments/"+held.String()+"/resolve", map[string]any{"action": "reread", "reason": "check"}, 200)
+	// Shared-artifact recovery has a separately approved plan, including renewal after expiry.
+	d.fake.AddRole("RouteExternalConsumer", "/", nil)
+	x5 := d.role("RouteRecovery", "/", nil)
+	tp5 := d.compile(d.fake.Discovery(), x5, "sqs")
+	dep5 := d.applyAndVerify(x5, d.storeApproved(x5, tp5.Apply, *tp5.Undo))
+	d.fake.SetBoundary("RouteExternalConsumer", *tp5.Apply.DesiredBoundaryARN)
+	d.mustRun("drift_check", dep5)
+	b5 := "/deployments/" + dep5.String()
+	blocked := mut(b5+"/undo", nil, 409)
+	pid := digs(blocked, "error", "detail", "recovery_plan_id")
+	var plan models.IGAGovPlan
+	if err := d.db.Where("workspace_id = ? AND id = ?", d.ws, pid).Take(&plan).Error; err != nil {
+		t.Fatal(err)
+	}
+	apu, apm := d.memberM("governance:read", "governance:approve", "governance:enforce")
+	tok = api.token(d.ws, apu, apm, "governance:read governance:approve governance:enforce")
+	approved := mut(b5+"/recovery-plans/"+pid+"/approve", map[string]any{"plan_hash": plan.PlanHash, "reason": "limit recovery to this role"}, 201)
+	oldApproval := digs(approved, "data", "id")
+	p3exec(t, d.db, `UPDATE iga_gov_approval SET expires_at = now() - interval '1 minute' WHERE id = ?`, oldApproval)
+	mut(b5+"/recovery-plans/"+pid+"/approve", map[string]any{"plan_hash": plan.PlanHash, "reason": "renew after review"}, 201)
+	var revoked bool
+	d.db.Raw(`SELECT revoked_at IS NOT NULL FROM iga_gov_approval WHERE id = ?`, oldApproval).Scan(&revoked)
+	if !revoked {
+		t.Fatal("expired recovery approval was not retired")
+	}
+	mut(b5+"/accept-drift", map[string]any{"reason": "reviewed shared attachment"}, 200)
 	_ = errors.New
 }
 

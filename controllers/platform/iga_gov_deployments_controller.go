@@ -26,7 +26,7 @@ func (ctl *IGAGovPolicyController) ListDeployments(c *gin.Context) {
 			return nil, nil, err
 		}
 		f := services.GovDeploymentFilter{State: c.Query("state"), Account: c.Query("account"), Kind: c.Query("kind"),
-			Cursor: c.Query("cursor"), Limit: limit}
+			Delivery: c.Query("delivery"), Attention: c.Query("attention") == "1" || c.Query("attention") == "true", Cursor: c.Query("cursor"), Limit: limit}
 		if p := c.Query("policy_id"); p != "" {
 			id, err := uuid.Parse(p)
 			if err != nil {
@@ -210,3 +210,65 @@ func (ctl *IGAGovPolicyController) RemoveControl(c *gin.Context) { ctl.removeCon
 
 // EmergencyRemoveControl handles POST /policies/:id/emergency-remove-control.
 func (ctl *IGAGovPolicyController) EmergencyRemoveControl(c *gin.Context) { ctl.removeControl(c, true) }
+
+// ApproveRecoveryPlan handles POST /deployments/:id/recovery-plans/:plan_id/approve (governance:approve).
+func (ctl *IGAGovPolicyController) ApproveRecoveryPlan(c *gin.Context) {
+	ctl.govMutation(c, http.StatusCreated, func(ws, actor uuid.UUID) (any, *audited, error) {
+		id, err := uuidParam(c, "id")
+		if err != nil {
+			return nil, nil, err
+		}
+		planID, err := uuidParam(c, "plan_id")
+		if err != nil {
+			return nil, nil, err
+		}
+		var req services.GovRecoveryApproveRequest
+		if err := bindBody(c, &req, "{plan_hash, reason?}"); err != nil {
+			return nil, nil, err
+		}
+		ap, err := ctl.deployments().ApproveRecoveryPlan(c.Request.Context(), ws, actor, id, planID, req)
+		if err != nil {
+			return nil, nil, err
+		}
+		return ap, &audited{"approve_recovery_plan", "iga_gov_deployment", id.String(), nil, gin.H{"plan_id": planID, "approval_id": ap.ID,
+			"reason": req.Reason}}, nil
+	})
+}
+
+// AcceptDrift handles POST /deployments/:id/accept-drift (governance:enforce).
+func (ctl *IGAGovPolicyController) AcceptDrift(c *gin.Context) {
+	ctl.govMutation(c, http.StatusOK, func(ws, actor uuid.UUID) (any, *audited, error) {
+		id, err := uuidParam(c, "id")
+		if err != nil {
+			return nil, nil, err
+		}
+		var req services.GovDriftActionRequest
+		if err := bindBody(c, &req, "{reason}"); err != nil {
+			return nil, nil, err
+		}
+		out, err := ctl.deployments().AcceptDrift(c.Request.Context(), ws, actor, id, req)
+		if err != nil {
+			return nil, nil, err
+		}
+		return out, &audited{"accept_drift", "iga_gov_deployment", id.String(), nil, gin.H{"reason": req.Reason, "control_removed": out.ControlRemoved}}, nil
+	})
+}
+
+// ReapplyDeployment handles POST /deployments/:id/reapply (governance:author).
+func (ctl *IGAGovPolicyController) ReapplyDeployment(c *gin.Context) {
+	ctl.govMutation(c, http.StatusCreated, func(ws, actor uuid.UUID) (any, *audited, error) {
+		id, err := uuidParam(c, "id")
+		if err != nil {
+			return nil, nil, err
+		}
+		var req services.GovDriftActionRequest
+		if err := bindBody(c, &req, "{reason}"); err != nil {
+			return nil, nil, err
+		}
+		out, err := ctl.deployments().Reapply(c.Request.Context(), ws, actor, id, req)
+		if err != nil {
+			return nil, nil, err
+		}
+		return out, &audited{"reapply", "iga_gov_deployment", id.String(), nil, gin.H{"reason": req.Reason}}, nil
+	})
+}
