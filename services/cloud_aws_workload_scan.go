@@ -1055,15 +1055,17 @@ func (s *AWSWorkloadScanner) recordWorkload(
 	}
 
 	attrs := models.AWSWorkloadAttrs{
-		ExecutionRoleARN:   w.ExecutionRoleARN,
-		InstanceProfileARN: w.InstanceProfileARN,
-		EnvVarNames:        w.EnvVarNames,
-		EnvVarsUnread:      w.EnvVarsUnread,
-		FoundationModel:    w.FoundationModel,
-		Status:             w.Status,
-		DetailIncomplete:   w.DetailIncomplete,
-		DetailError:        w.DetailError,
-		TargetsIncomplete:  w.TargetsIncomplete,
+		ExecutionRoleARN:    w.ExecutionRoleARN,
+		InstanceProfileARN:  w.InstanceProfileARN,
+		EnvVarNames:         w.EnvVarNames,
+		EnvVarsUnread:       w.EnvVarsUnread,
+		VPCSubnetIDs:        w.VPCSubnetIDs,
+		VPCSecurityGroupIDs: w.VPCSecurityGroupIDs,
+		FoundationModel:     w.FoundationModel,
+		Status:              w.Status,
+		DetailIncomplete:    w.DetailIncomplete,
+		DetailError:         w.DetailError,
+		TargetsIncomplete:   w.TargetsIncomplete,
 	}
 	for _, t := range w.Targets {
 		attrs.GatewayTargets = append(attrs.GatewayTargets, models.AWSGatewayTarget{

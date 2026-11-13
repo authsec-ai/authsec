@@ -4,6 +4,22 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-11 — Agent runtime review 3: ingest durability, shared Lambda interfaces, late log lines (branch `fix/agent-runtime-review-3`)
+
+An external design review; every factual claim was checked against the code and AWS's documentation (spec §12).
+
+### Done
+- Event stream: migration 161 adds `agent_event_seen.dispatched_at`. An event is recorded undispatched, marked once every consumer returns, and dispatched again on EventBridge's retry if it never was. Before, a crash between the insert and the dispatch lost it for the live consumers.
+- DNS attribution: the inventory records Lambda VPC subnets and security groups; a Lambda interface shared by several functions gives an unresolved `workload_set` (a role only when all share it), not the function its description names.
+- Late log lines: DNS and AgentCore span reads cut windows by `@ingestionTime` and search event time 2 h back (`DNSLateArrival`, `SpanLateArrival`). The ingestion filter was run against the lab's Resolver log group.
+- Specs corrected: Resolver logs only unique queries (counts are resolution activity); EventBridge delivery is best effort. Spec §12 records the review's PROPOSED product direction (governed runs, separate classification / visibility / attribution / control, intervention contracts, scoped detection, behaviour envelopes) for decision.
+- Checks: build, vet, unit tests, tenancy ratchet 69 (baseline 72); schema parity (upgrade from 160 applies 161 only, equal to a fresh install); integration suite.
+
+### Open
+- Product decisions in spec §12.3. Detections still run only for labelled identities; "contained" still means applied, not observed.
+
+---
+
 ## 2026-11-06 — Legacy agent-policy retirement and Phase 3 recovery, merged onto staging (branch `merge/legacy-policy-retire`)
 
 Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` (after PR #106 and the round-3 security fixes).

@@ -206,11 +206,24 @@ const (
 // ModelEndpointQuery is the Logs Insights query a DNS read runs: only lookups
 // of the model-endpoint list, aggregated per source and name. Nothing else in
 // the log group is returned.
-func ModelEndpointQuery() string {
+func ModelEndpointQuery() string { return modelEndpointQuery("") }
+
+// ModelEndpointQueryFor is ModelEndpointQuery restricted to the lines
+// CloudWatch Logs RECEIVED in w ([From, To) by @ingestionTime). Windows are
+// cut by ingestion time, not event time, so a line that arrives after a read
+// has passed its event time is still read, once, by the read whose window
+// holds its arrival (as long as it is no later than DNSLateArrival).
+func ModelEndpointQueryFor(w DNSWindow) string {
+	return modelEndpointQuery("\n| filter @ingestionTime >= " + strconv.FormatInt(w.From.UnixMilli(), 10) +
+		" and @ingestionTime < " + strconv.FormatInt(w.To.UnixMilli(), 10))
+}
+
+func modelEndpointQuery(ingestFilter string) string {
 	return "fields @timestamp, query_name" +
 		", coalesce(srcaddr, \"" + dnsNone + "\") as " + dnsFieldSrcAddr +
 		", coalesce(srcids.instance, \"" + dnsNone + "\") as " + dnsFieldInstance +
 		", coalesce(vpc_id, \"" + dnsNone + "\") as " + dnsFieldVPC +
+		ingestFilter +
 		"\n| filter query_name like /" + ModelEndpointInsightsRegex() + "/" +
 		"\n| stats count(*) as " + dnsFieldQueries +
 		", min(@timestamp) as " + dnsFieldFirstSeen +
@@ -390,6 +403,13 @@ const (
 	// DNSIngestDelay is how long a read waits before claiming an interval:
 	// Resolver delivers query logs to CloudWatch Logs within minutes.
 	DNSIngestDelay = 10 * time.Minute
+	// DNSLateArrival is how much later than its event time a query-log line
+	// may reach CloudWatch Logs and still be read. Each read selects lines by
+	// ARRIVAL (@ingestionTime) in its window, and searches event time from
+	// DNSLateArrival before the window, so a line up to this late is read
+	// exactly once; a later one is missed (late-data policy, spec §11.2). It
+	// costs DNSLateArrival more data scanned per read.
+	DNSLateArrival = 2 * time.Hour
 	// DNSResultLimit is the query's row limit (the Logs Insights maximum
 	// per page): reaching it means groups may be missing (Truncated).
 	DNSResultLimit = 10000
@@ -485,10 +505,11 @@ func (r *DNSQueryLogReader) ReadModelEndpointLookups(ctx context.Context, logGro
 	}
 	start, err := r.logs.StartQuery(ctx, &cloudwatchlogs.StartQueryInput{
 		LogGroupIdentifiers: []string{logGroup},
-		StartTime:           aws.Int64(w.From.Unix()),
-		// EndTime is inclusive: the window is [From, To).
+		// Event time: from DNSLateArrival before the window (late lines) to
+		// its end; the query keeps only lines that ARRIVED in [From, To).
+		StartTime:   aws.Int64(w.From.Add(-DNSLateArrival).Unix()),
 		EndTime:     aws.Int64(w.To.Unix() - 1),
-		QueryString: aws.String(ModelEndpointQuery()),
+		QueryString: aws.String(ModelEndpointQueryFor(w)),
 		Limit:       aws.Int32(DNSResultLimit),
 	})
 	if err != nil {
@@ -688,6 +709,10 @@ type ENIInfo struct {
 	InstanceID string
 	// AttachTime is when the interface was attached, when AWS reports it.
 	AttachTime *time.Time
+	// SubnetID and SecurityGroupIDs (sorted) identify which Lambda functions a
+	// Lambda interface can stand for.
+	SubnetID         string
+	SecurityGroupIDs []string
 	// PrimaryIP: the address is the interface's primary private address.
 	PrimaryIP bool
 	// LambdaFunctionHint is what follows "AWS Lambda VPC ENI-": the function
@@ -787,6 +812,13 @@ func eniInfo(ni ec2types.NetworkInterface) ENIInfo {
 		e.InstanceID = aws.ToString(ni.Attachment.InstanceId)
 		e.AttachTime = ni.Attachment.AttachTime
 	}
+	e.SubnetID = aws.ToString(ni.SubnetId)
+	for _, g := range ni.Groups {
+		if id := aws.ToString(g.GroupId); id != "" {
+			e.SecurityGroupIDs = append(e.SecurityGroupIDs, id)
+		}
+	}
+	sort.Strings(e.SecurityGroupIDs)
 	switch {
 	case strings.HasPrefix(desc, lambdaENIPrefix) || ni.InterfaceType == ec2types.NetworkInterfaceTypeLambda:
 		e.Kind = ENIKindLambda

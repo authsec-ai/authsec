@@ -263,8 +263,8 @@ func TestDNSReadKeepsOnlyListedDomains(t *testing.T) {
 	if err != nil || !read.Settled {
 		t.Fatalf("read %+v err %v", read, err)
 	}
-	if aws.ToInt64(ins.start.StartTime) != w.From.Unix() || aws.ToInt64(ins.start.EndTime) != w.To.Unix()-1 ||
-		aws.ToString(ins.start.QueryString) != ModelEndpointQuery() || ins.start.LogGroupIdentifiers[0] != "arn:aws:logs:us-east-1:1:log-group:dns" {
+	if aws.ToInt64(ins.start.StartTime) != w.From.Add(-DNSLateArrival).Unix() || aws.ToInt64(ins.start.EndTime) != w.To.Unix()-1 ||
+		aws.ToString(ins.start.QueryString) != ModelEndpointQueryFor(w) || ins.start.LogGroupIdentifiers[0] != "arn:aws:logs:us-east-1:1:log-group:dns" {
 		t.Errorf("start query %+v", ins.start)
 	}
 	if read.Dropped != 1 || len(read.Aggregates) != 2 {

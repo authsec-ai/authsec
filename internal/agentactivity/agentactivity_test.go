@@ -429,7 +429,7 @@ func TestReadAWSSpans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if aws.ToInt64(f.start.StartTime) != since.Unix() || aws.ToInt64(f.start.EndTime) != until.Unix() ||
+	if aws.ToInt64(f.start.StartTime) != since.Add(-SpanLateArrival).Unix() || aws.ToInt64(f.start.EndTime) != until.Unix() ||
 		f.start.LogGroupNames[0] != AWSSpansLogGroup || !strings.Contains(aws.ToString(f.start.QueryString), "limit 2") {
 		t.Fatalf("query: %+v", f.start)
 	}

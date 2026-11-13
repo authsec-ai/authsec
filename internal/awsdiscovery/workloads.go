@@ -92,6 +92,12 @@ type Workload struct {
 	// rather than as variables (lambdaEnvVarsUnread): no names were read, so
 	// an empty EnvVarNames is unknown, not "none".
 	EnvVarsUnread bool
+	// VPCSubnetIDs and VPCSecurityGroupIDs are a Lambda's VPC settings
+	// (sorted). Lambda shares one network interface across the functions with
+	// the same subnet and security-group combination, so DNS attribution needs
+	// them to know which functions an interface can stand for.
+	VPCSubnetIDs        []string
+	VPCSecurityGroupIDs []string
 	// FoundationModel is Bedrock only: the model the agent invokes. Part of the
 	// workload's identity in a way a Lambda's runtime version is not -- it is
 	// what the agent thinks with.
@@ -200,14 +206,16 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 		}
 		for _, fn := range resp.Functions {
 			out = append(out, Workload{
-				RuntimeKind:   "lambda_function",
-				NativeID:      aws.ToString(fn.FunctionArn),
-				Name:          aws.ToString(fn.FunctionName),
-				RoleARN:       aws.ToString(fn.Role),
-				EnvVarNames:   lambdaEnvVarNames(fn.Environment),
-				EnvVarsUnread: lambdaEnvVarsUnread(fn.Environment),
-				Status:        string(fn.State),
-				SourceAPI:     "lambda:ListFunctions",
+				RuntimeKind:         "lambda_function",
+				NativeID:            aws.ToString(fn.FunctionArn),
+				Name:                aws.ToString(fn.FunctionName),
+				RoleARN:             aws.ToString(fn.Role),
+				EnvVarNames:         lambdaEnvVarNames(fn.Environment),
+				EnvVarsUnread:       lambdaEnvVarsUnread(fn.Environment),
+				Status:              string(fn.State),
+				VPCSubnetIDs:        lambdaVPCSubnets(fn.VpcConfig),
+				VPCSecurityGroupIDs: lambdaVPCSecurityGroups(fn.VpcConfig),
+				SourceAPI:           "lambda:ListFunctions",
 			})
 		}
 		if resp.NextMarker == nil || *resp.NextMarker == "" {
@@ -455,4 +463,25 @@ func afterLastSlash(s string) string {
 		}
 	}
 	return s
+}
+
+// lambdaVPCSubnets is a function's VPC subnets, sorted; nil when it is not
+// attached to a VPC.
+func lambdaVPCSubnets(v *lambdatypes.VpcConfigResponse) []string {
+	if v == nil || len(v.SubnetIds) == 0 {
+		return nil
+	}
+	out := append([]string(nil), v.SubnetIds...)
+	sort.Strings(out)
+	return out
+}
+
+// lambdaVPCSecurityGroups is a function's VPC security groups, sorted.
+func lambdaVPCSecurityGroups(v *lambdatypes.VpcConfigResponse) []string {
+	if v == nil || len(v.SecurityGroupIds) == 0 {
+		return nil
+	}
+	out := append([]string(nil), v.SecurityGroupIds...)
+	sort.Strings(out)
+	return out
 }

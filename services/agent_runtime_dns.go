@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -492,11 +493,36 @@ type dnsWorkload struct {
 	Region      string
 	IdentityID  *uuid.UUID
 	IdentityARN string
+	Attrs       json.RawMessage
+	// subnets and groups are a Lambda's VPC settings (from Attrs).
+	subnets, groups []string
 }
 
 type dnsInventory struct {
 	byNative map[string]*dnsWorkload // runtime_kind \x1f native_id
 	lambdas  []*dnsWorkload          // longest name first
+	// vpcKnown: at least one Lambda carries its VPC settings, i.e. a scan
+	// after the inventory began recording them. Until then shared interfaces
+	// cannot be checked.
+	vpcKnown bool
+}
+
+// lambdasOn is every inventoried Lambda an interface can stand for: Lambda
+// shares one interface across the functions whose subnets include the
+// interface's subnet and whose security groups are exactly its groups.
+func (inv dnsInventory) lambdasOn(e *awsdiscovery.ENIInfo) []*dnsWorkload {
+	if e == nil || e.SubnetID == "" {
+		return nil
+	}
+	var out []*dnsWorkload
+	for _, w := range inv.lambdas {
+		if len(w.groups) == 0 || !slices.Contains(w.subnets, e.SubnetID) || !slices.Equal(w.groups, e.SecurityGroupIDs) {
+			continue
+		}
+		out = append(out, w)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].NativeID < out[j].NativeID })
+	return out
 }
 
 func (inv dnsInventory) find(kind, native string) *dnsWorkload {
@@ -520,7 +546,7 @@ func (inv dnsInventory) lambdaFor(hint string) *dnsWorkload {
 func loadDNSInventory(tx *gorm.DB, ws, connectorID uuid.UUID, region string) (dnsInventory, error) {
 	var rows []dnsWorkload
 	if err := tx.Raw(`SELECT w.id, w.runtime_kind, w.native_id, w.name, w.region, w.identity_id,
-	                         COALESCE(i.native_id, '') AS identity_arn
+	                         COALESCE(i.native_id, '') AS identity_arn, w.attrs
 	                    FROM cloud_workload w
 	                    LEFT JOIN cloud_identity i ON i.id = w.identity_id AND i.workspace_id = w.workspace_id
 	                   WHERE w.workspace_id = ? AND w.connector_id = ? AND w.region = ?
@@ -534,6 +560,11 @@ func loadDNSInventory(tx *gorm.DB, ws, connectorID uuid.UUID, region string) (dn
 		w := &rows[i]
 		inv.byNative[w.RuntimeKind+"\x1f"+w.NativeID] = w
 		if w.RuntimeKind == models.WorkloadLambdaFunction && w.Name != "" {
+			var a models.AWSWorkloadAttrs
+			if len(w.Attrs) > 0 && json.Unmarshal(w.Attrs, &a) == nil && len(a.VPCSecurityGroupIDs) > 0 {
+				w.subnets, w.groups = a.VPCSubnetIDs, a.VPCSecurityGroupIDs
+				inv.vpcKnown = true
+			}
 			inv.lambdas = append(inv.lambdas, w)
 		}
 	}
@@ -579,9 +610,25 @@ func attributeDNSLookups(a awsdiscovery.DNSLookupAggregate, attr dnsSourceAttr, 
 		e, attachedLater = nil, true
 	}
 	if e != nil && e.Kind == awsdiscovery.ENIKindLambda {
+		// The interface names the function that created it, but Lambda shares
+		// it with every function on the same subnet and security groups: any
+		// of them may have made the lookup.
+		if inv.vpcKnown {
+			cands := inv.lambdasOn(e)
+			if len(cands) == 1 {
+				return workloadDNSSubject(cands[0], dnsAttribution{How: "eni_lambda", Confidence: "scan_time",
+					Note: "the only inventoried function on this Lambda network interface's subnet and security groups"})
+			}
+			if len(cands) > 1 {
+				return sharedLambdaDNSSubject(e, cands, region)
+			}
+		}
 		if w := inv.lambdaFor(e.LambdaFunctionHint); w != nil {
-			return workloadDNSSubject(w, dnsAttribution{How: "eni_lambda", Confidence: "scan_time",
-				Note: "Lambda shares one network interface across the functions with the same subnets and security groups; the interface names the function that created it"})
+			note := "the interface names the function that created it; other functions with the same subnets and security groups share it"
+			if !inv.vpcKnown {
+				note += " (not checked: the inventory records Lambda VPC settings from the next scan)"
+			}
+			return workloadDNSSubject(w, dnsAttribution{How: "eni_lambda", Confidence: "scan_time", Note: note})
 		}
 		if e.LambdaFunctionHint != "" {
 			if partition == "" {
@@ -654,6 +701,39 @@ func workloadDNSSubject(w *dnsWorkload, how dnsAttribution) dnsSubject {
 	}
 	return dnsSubject{Key: dnsWorkloadKey(w.RuntimeKind, w.Region, w.NativeID), IdentityID: w.IdentityID,
 		Subject: subj, Attribution: how}
+}
+
+// sharedLambdaDNSSubject is a Lambda network interface several inventoried
+// functions share: the lookups belong to one of them, unresolved. When they
+// all run as one role, that role is still the identity (the calls were made
+// as it); otherwise no identity is named.
+func sharedLambdaDNSSubject(e *awsdiscovery.ENIInfo, cands []*dnsWorkload, region string) dnsSubject {
+	var list []map[string]any
+	var identity *uuid.UUID
+	sameRole := true
+	for i, w := range cands {
+		list = append(list, map[string]any{"cloud_workload_id": w.ID, "native_id": w.NativeID, "name": w.Name,
+			"identity_id": w.IdentityID})
+		switch {
+		case w.IdentityID == nil:
+			sameRole = false
+		case i == 0:
+			id := *w.IdentityID
+			identity = &id
+		case identity == nil || *identity != *w.IdentityID:
+			sameRole = false
+		}
+	}
+	how := dnsAttribution{How: "eni_lambda_shared", Confidence: "scan_time",
+		Note: fmt.Sprintf("%d functions share this Lambda network interface (same subnet and security groups); the lookups belong to one of them", len(cands))}
+	subj := map[string]any{"kind": "workload_set", "runtime_kind": models.WorkloadLambdaFunction, "region": region,
+		"eni_id": e.ID, "candidates": list, "resolved": false}
+	if !sameRole {
+		identity = nil
+	} else {
+		subj["identity_id"] = *identity
+	}
+	return dnsSubject{Key: "lambda_eni:" + region + ":" + e.ID, IdentityID: identity, Subject: subj, Attribution: how}
 }
 
 func uninventoriedDNSSubject(kind, native, name, region string, how dnsAttribution) dnsSubject {

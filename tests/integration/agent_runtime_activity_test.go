@@ -495,7 +495,7 @@ func TestAgentActivityAgentCoreSpansCursor(t *testing.T) {
 	if err != nil || res.State != "reached" || res.Inserted != 2 {
 		t.Fatalf("collect: %+v %v", res, err)
 	}
-	if aws.ToInt64(logs.q.StartTime) != now.Add(-services.AgentSpanFirstWindow).Unix() {
+	if aws.ToInt64(logs.q.StartTime) != now.Add(-services.AgentSpanFirstWindow-agentactivity.SpanLateArrival).Unix() {
 		t.Errorf("first window: %d", aws.ToInt64(logs.q.StartTime))
 	}
 	rows := actRows(t, db, a.ws)
@@ -525,7 +525,7 @@ func TestAgentActivityAgentCoreSpansCursor(t *testing.T) {
 	// The cursor moved to now - lag; the next read starts there.
 	res, err = services.NewAgentSpanCollector(db).WithClock(func() time.Time { return now.Add(10 * time.Minute) }).
 		Collect(ctx, a.ws, a.conn, "us-east-1", apiFor)
-	if err != nil || res.State != "reached" || res.Inserted != 0 || aws.ToInt64(logs.q.StartTime) != now.Add(-services.AgentSpanIngestLag).Unix() {
+	if err != nil || res.State != "reached" || res.Inserted != 0 || aws.ToInt64(logs.q.StartTime) != now.Add(-services.AgentSpanIngestLag-agentactivity.SpanLateArrival).Unix() {
 		t.Fatalf("second collect: %+v %v start=%d", res, err, aws.ToInt64(logs.q.StartTime))
 	}
 	// A refused read: permission_missing on the cursor, never an error.

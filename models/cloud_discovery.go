@@ -1611,6 +1611,11 @@ type AWSWorkloadAttrs struct {
 	// with the function's KMS key) instead of its variables, so no names were
 	// read -- EnvVarNames empty then means unknown, never "has none".
 	EnvVarsUnread bool `json:"env_vars_unread,omitempty"`
+	// VPCSubnetIDs and VPCSecurityGroupIDs are a Lambda's VPC settings: the
+	// functions sharing a subnet and security-group combination share one
+	// network interface (DNS attribution reads them).
+	VPCSubnetIDs        []string `json:"vpc_subnet_ids,omitempty"`
+	VPCSecurityGroupIDs []string `json:"vpc_security_group_ids,omitempty"`
 	// FoundationModel is the Bedrock agent's model id.
 	FoundationModel string `json:"foundation_model,omitempty"`
 	// Status is the provider's own lifecycle string, verbatim.
