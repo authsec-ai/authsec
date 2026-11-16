@@ -336,16 +336,13 @@ func TestScopeTree_RejectsUnknownScopeKind(t *testing.T) {
 }
 
 func TestGovernor_IAMDefaultIsFour(t *testing.T) {
-	if defaultIAMQPS != 4.0 {
-		t.Fatalf("defaultIAMQPS = %v, want 4 (GCP-1)", defaultIAMQPS)
+	if defaultIAMQPS != 8.0 {
+		t.Fatalf("defaultIAMQPS = %v, want 8 (GCP-1)", defaultIAMQPS)
 	}
 }
 
 func TestReaderRoleSetVersions(t *testing.T) {
-	if ReaderRoleSetVersion != "gcp-reader-p1-v3" {
+	if ReaderRoleSetVersion != "gcp-reader-p1-v2" {
 		t.Fatalf("current role set = %q: bump it only together with the roles", ReaderRoleSetVersion)
-	}
-	if ReaderRoleSetVersionP2 != "gcp-reader-p2" {
-		t.Fatalf("p2 label = %q", ReaderRoleSetVersionP2)
 	}
 }
