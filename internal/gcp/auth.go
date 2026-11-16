@@ -480,6 +480,24 @@ func DeriveWIFParams(workspaceID uuid.UUID, scopeID string) (poolID, providerID,
 	return poolID, ProviderID, subject
 }
 
+// IsAuthSecPool reports whether poolID matches AuthSec's derived pool ID shape (authsec- + 16 lowercase hex chars).
+func IsAuthSecPool(poolID string) bool {
+	if !strings.HasPrefix(poolID, poolIDPrefix) {
+		return false
+	}
+	hexPart := strings.TrimPrefix(poolID, poolIDPrefix)
+	if len(hexPart) != 16 {
+		return false
+	}
+	for i := 0; i < len(hexPart); i++ {
+		c := hexPart[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // hmacKey resolves the key used to derive WIF pool/provider/subject values.
 //
 // Deliberately a SEPARATE function from services.cloudDiscoveryHMACKey rather

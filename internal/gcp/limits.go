@@ -86,6 +86,10 @@ type Governor struct {
 	// budget's shape -- it is the same class of cheap metadata read -- but its
 	// own bucket, so enumeration cannot starve identity reads.
 	ResourceManager *rate.Limiter
+	// Storage paces storage.googleapis.com reads (HMAC keys).
+	Storage *rate.Limiter
+	// APIKeys paces apikeys.googleapis.com reads.
+	APIKeys *rate.Limiter
 
 	// projectSlots bounds fan-out concurrency. A buffered channel rather than
 	// x/sync/semaphore to avoid adding a dependency for a counter.
@@ -102,6 +106,8 @@ func NewGovernor() *Governor {
 		IAM:             rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
 		CAI:             rate.NewLimiter(rate.Limit(caiQPS), burst(caiQPS)),
 		ResourceManager: rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
+		Storage:         rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
+		APIKeys:         rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
 		projectSlots:    make(chan struct{}, concurrency),
 	}
 }

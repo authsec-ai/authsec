@@ -13,10 +13,12 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	apikeys "google.golang.org/api/apikeys/v2"
 	"google.golang.org/api/cloudasset/v1"
 	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/iam/v1"
 	"google.golang.org/api/option"
+	storage "google.golang.org/api/storage/v1"
 	"gorm.io/gorm"
 )
 
@@ -113,6 +115,8 @@ type GCPScanSnapshot struct {
 	Tree *gcp.ScopeTree
 	// Coverage is the report, as committed.
 	Coverage models.ScanCoverage
+	// Providers is the workload identity federation providers read from Google.
+	Providers []gcpProvider
 }
 
 // gcpProject is the minimum a collector needs to address a project.
@@ -127,22 +131,13 @@ type gcpProject struct {
 
 // GCPScanner reads a GCP estate into the shared cloud_* tables.
 type GCPScanner struct {
-	connectors repositories.CloudConnectorRepository
-	scans      repositories.CloudGCPScanRepository
-	identities repositories.CloudIdentityRepository
-	authSvc    *GCPAuthService
+	connectors  repositories.CloudConnectorRepository
+	scans       repositories.CloudGCPScanRepository
+	identities  repositories.CloudIdentityRepository
+	permissions repositories.CloudPermissionRepository
+	authSvc     *GCPAuthService
 
-	// gcpRead provides access to stored IAM actions for roles that could not be
-	// read in this scan (GCP-5 feature, optional).
-	gcpRead interface {
-		StoredActions(ctx context.Context, workspaceID, identityID, resourceID uuid.UUID, nativeID string) ([]string, bool, error)
-	}
-
-	// permissions provides permission upsert capability (GCP-5 feature, optional).
-	permissions interface {
-		UpsertPermission(*models.CloudPermission) (uuid.UUID, bool, error)
-		UpsertResource(*models.CloudResource) (uuid.UUID, bool, error)
-	}
+	gcpRead     *repositories.CloudGCPReadRepository
 
 	// Client factories, overridable in tests. Package-level vars are already
 	// how cloud_gcp_onboarding.go does this; these are fields so two scanners
@@ -155,6 +150,8 @@ type GCPScanner struct {
 	// test that fakes the API but not the credential cannot reach the code
 	// under test at all.
 	newCredential func(context.Context, uuid.UUID, *models.CloudConnector, models.GCPConnectorAttrs) (option.ClientOption, error)
+
+	endpoint string
 }
 
 // NewGCPScanner constructs the scanner. authSvc is the same service onboarding
@@ -164,6 +161,8 @@ func NewGCPScanner(db *gorm.DB, authSvc *GCPAuthService) *GCPScanner {
 		connectors:   repositories.NewCloudConnectorRepository(db),
 		scans:        repositories.NewCloudGCPScanRepository(db),
 		identities:   repositories.NewCloudIdentityRepository(db),
+		permissions:  repositories.NewCloudPermissionRepository(db),
+		gcpRead:      repositories.NewCloudGCPReadRepository(db),
 		authSvc:      authSvc,
 		newIAMClient: gcp.NewIAMClient,
 		newRMClient:  gcp.NewResourceManagerClient,
@@ -203,12 +202,26 @@ func (s *GCPScanner) WithCredentialFactory(
 	return s
 }
 
+// WithEndpoint configures a custom endpoint (e.g. httptest.Server URL for tests).
+func (s *GCPScanner) WithEndpoint(endpoint string) *GCPScanner {
+	s.endpoint = endpoint
+	return s
+}
+
 // Scan reads service accounts and their keys for one connector.
 //
 // Returns the snapshot on every path where a generation was allocated, so a
 // caller can report what happened even when the scan failed -- the outcome is
 // never computed and then dropped.
 func (s *GCPScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.UUID) (*GCPScanSnapshot, error) {
+	return s.ScanWithTrigger(ctx, workspaceID, connectorID, models.CloudScanTriggerManual)
+}
+
+// ScanWithTrigger reads service accounts and their keys for one connector, recording
+// the specified trigger on the coverage report.
+func (s *GCPScanner) ScanWithTrigger(
+	ctx context.Context, workspaceID, connectorID uuid.UUID, trigger string,
+) (*GCPScanSnapshot, error) {
 	connector, err := s.connectors.Get(workspaceID, connectorID)
 	if err != nil {
 		return nil, err
@@ -249,7 +262,7 @@ func (s *GCPScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.UUI
 		// Could not even authenticate. Recorded as a failed scan rather than
 		// left showing the previous report, which would let a broken connection
 		// keep displaying a stale all-clear. Nothing is reconciled.
-		snapshot.Coverage = s.commitFailed(workspaceID, connectorID, generation, err)
+		snapshot.Coverage = s.commitFailed(workspaceID, connectorID, generation, err, trigger)
 		return snapshot, err
 	}
 
@@ -260,6 +273,7 @@ func (s *GCPScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.UUI
 	running := models.ScanCoverage{
 		Generation: generation,
 		Status:     models.ScanStatusRunning,
+		Trigger:    trigger,
 		StartedAt:  &started,
 		Surfaces:   map[string]models.SurfaceCoverage{},
 		Counters:   map[string]int{},
@@ -299,7 +313,7 @@ func (s *GCPScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.UUI
 		}
 	}
 
-	coverage := s.buildCoverage(generation, started, models.CloudScanTriggerManual, []gcpNamedAcc{
+	coverage := s.buildCoverage(generation, started, trigger, []gcpNamedAcc{
 		{surface: gcp.SurfaceIdentities, counter: "identities_upserted", acc: identityAcc},
 		{surface: gcp.SurfaceKeys, counter: "secrets_upserted", acc: keyAcc},
 	}, governor, len(projects))
@@ -450,6 +464,7 @@ type gcpSurfaceAcc struct {
 	state       string
 	count       int
 	reason      string
+	skipped     bool
 	total       int
 	reached     int
 	denied      int
@@ -483,6 +498,10 @@ func surfaceStateRank(state string) int {
 func (a *gcpSurfaceAcc) observe(err error, found int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.skipped {
+		return
+	}
 
 	a.total++
 	a.count += found
@@ -534,6 +553,10 @@ func (a *gcpSurfaceAcc) observeVacuous() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if a.skipped {
+		return
+	}
+
 	if a.state == models.CloudCoverageUnknown {
 		a.state = models.CloudCoverageReached
 	}
@@ -544,6 +567,10 @@ func (a *gcpSurfaceAcc) observeVacuous() {
 func (a *gcpSurfaceAcc) fail(err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if a.skipped {
+		return
+	}
 
 	state := classifyGCPSurfaceError(err)
 	if surfaceStateRank(state) > surfaceStateRank(a.state) || a.state == models.CloudCoverageUnknown {
@@ -576,6 +603,11 @@ func classifyGCPSurfaceError(err error) string {
 	switch {
 	case err == nil:
 		return models.CloudCoverageReached
+	case errors.Is(err, gcp.ErrScopeTreeTruncated),
+		errors.Is(err, errGCPMembersUnparsed),
+		errors.Is(err, errGCPBindingsTruncated),
+		errors.Is(err, gcp.ErrRolePagesExceeded):
+		return models.CloudCoverageUnknown
 	case gcp.ClassifyConstraint(err) != nil:
 		return models.CloudCoverageConstrained
 	case gcp.IsThrottle(err):
@@ -635,6 +667,7 @@ func (s *GCPScanner) buildCoverage(
 	cov := models.ScanCoverage{
 		Generation: generation,
 		Status:     models.ScanStatusRunning,
+		Trigger:    trigger,
 		StartedAt:  &started,
 		Surfaces:   make(map[string]models.SurfaceCoverage, len(surfaces)),
 		Counters:   map[string]int{},
@@ -663,6 +696,17 @@ func (s *GCPScanner) buildCoverage(
 	return cov
 }
 
+// gcpAllReached reports whether every surface in the list is present and reached.
+func gcpAllReached(cov models.ScanCoverage, surfaces []string) bool {
+	for _, s := range surfaces {
+		c, ok := cov.Surfaces[s]
+		if !ok || c.State != models.CloudCoverageReached {
+			return false
+		}
+	}
+	return true
+}
+
 /* ------------------------------ coverage writes ----------------------------- */
 
 func (s *GCPScanner) writeCoverage(
@@ -681,12 +725,13 @@ func (s *GCPScanner) writeCoverage(
 // Best-effort on the write itself: a scan that already failed should surface
 // the original error, not a secondary one from trying to report it.
 func (s *GCPScanner) commitFailed(
-	workspaceID, connectorID uuid.UUID, generation int, cause error,
+	workspaceID, connectorID uuid.UUID, generation int, cause error, trigger string,
 ) models.ScanCoverage {
 	now := time.Now()
 	cov := models.ScanCoverage{
 		Generation: generation,
 		Status:     models.ScanStatusFailed,
+		Trigger:    trigger,
 		StartedAt:  &now,
 		FinishedAt: &now,
 		Error:      sanitizedSurfaceReason(cause),
@@ -720,7 +765,29 @@ func (s *GCPScanner) resolveProjects(ctx context.Context, connector *models.Clou
 }
 
 // newCAIClient creates a Cloud Asset Inventory client.
-// TODO(GCP-3): Implement if Cloud Asset calls are needed; currently using Resource Manager fallback.
 func (s *GCPScanner) newCAIClient(ctx context.Context, authOpt option.ClientOption, quotaProject string) (*cloudasset.Service, error) {
+	if s.endpoint != "" {
+		opts := []option.ClientOption{option.WithEndpoint(s.endpoint), option.WithoutAuthentication()}
+		if quotaProject != "" {
+			opts = append(opts, option.WithQuotaProject(quotaProject))
+		}
+		return cloudasset.NewService(ctx, opts...)
+	}
 	return gcp.NewCloudAssetClient(ctx, authOpt, quotaProject)
+}
+
+// newStorageClient creates a Cloud Storage client for HMAC key discovery.
+func (s *GCPScanner) newStorageClient(ctx context.Context, authOpt option.ClientOption) (*storage.Service, error) {
+	if s.endpoint != "" {
+		return storage.NewService(ctx, option.WithEndpoint(s.endpoint), option.WithoutAuthentication())
+	}
+	return storage.NewService(ctx, authOpt, option.WithScopes(gcp.ReadOnlyScope))
+}
+
+// newAPIKeysClient creates an API Keys client for API key discovery.
+func (s *GCPScanner) newAPIKeysClient(ctx context.Context, authOpt option.ClientOption) (*apikeys.Service, error) {
+	if s.endpoint != "" {
+		return apikeys.NewService(ctx, option.WithEndpoint(s.endpoint), option.WithoutAuthentication())
+	}
+	return apikeys.NewService(ctx, authOpt, option.WithScopes(gcp.ReadOnlyScope))
 }

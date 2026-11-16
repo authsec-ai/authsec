@@ -120,6 +120,16 @@ type CloudGCPScanRepository interface {
 	// still owns the current generation. Complete() proves the scan was allowed
 	// to look everywhere; this proves nothing has started since.
 	CurrentGeneration(workspaceID, connectorID uuid.UUID) (int, error)
+
+	// WriteScopeTree records the discovered GCP resource hierarchy (folders, projects)
+	// into the connector's attrs.scope_tree. Guarded by generation so a superseded scan
+	// does not overwrite a newer scope tree.
+	WriteScopeTree(workspaceID, connectorID uuid.UUID, generation int, tree json.RawMessage) error
+
+	// DueConnectors lists active GCP connectors across all workspaces whose last
+	// scan finished before finishedBefore, or whose in-progress scan started before
+	// runningStartedBefore (indicating a dead scan).
+	DueConnectors(finishedBefore, runningStartedBefore time.Time) ([]models.CloudConnector, error)
 }
 
 type cloudGCPScanRepository struct{ db *gorm.DB }
@@ -221,4 +231,63 @@ func (r *cloudGCPScanRepository) CurrentGeneration(workspaceID, connectorID uuid
 		return 0, ErrCloudConnectorNotFound
 	}
 	return generation, nil
+}
+
+func (r *cloudGCPScanRepository) WriteScopeTree(
+	workspaceID, connectorID uuid.UUID, generation int, tree json.RawMessage,
+) error {
+	if len(tree) == 0 {
+		return errors.New("cloud gcp scan: refusing to write an empty scope tree")
+	}
+
+	var c models.CloudConnector
+	if err := r.db.Where("workspace_id = ? AND id = ? AND provider = ?",
+		workspaceID, connectorID, models.CloudProviderGCP).First(&c).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrCloudConnectorNotFound
+		}
+		return err
+	}
+	if c.ScanGeneration != generation {
+		return ErrScanSuperseded
+	}
+
+	attrs := c.GCPAttrs()
+	attrs.ScopeTree = tree
+	if err := c.SetGCPAttrs(attrs); err != nil {
+		return err
+	}
+
+	res := r.db.Model(&models.CloudConnector{}).
+		Where("workspace_id = ? AND id = ? AND provider = ? AND scan_generation = ?",
+			workspaceID, connectorID, models.CloudProviderGCP, generation).
+		Updates(map[string]interface{}{
+			"attrs":      c.Attrs,
+			"updated_at": time.Now(),
+		})
+
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrScanSuperseded
+	}
+	return nil
+}
+
+func (r *cloudGCPScanRepository) DueConnectors(finishedBefore, runningStartedBefore time.Time) ([]models.CloudConnector, error) {
+	var out []models.CloudConnector
+	// TENANT-EXEMPT: the scheduler's scan of due GCP connectors across workspaces; every pass it starts is then run for the connector's own workspace.
+	err := r.db.Where(`provider = ? AND status = ?
+		AND (
+		      (COALESCE(coverage->>'status', '') <> ?
+		       AND (coverage->>'finished_at' IS NULL OR (coverage->>'finished_at')::timestamptz < ?))
+		   OR (coverage->>'status' = ?
+		       AND (coverage->>'started_at' IS NULL OR (coverage->>'started_at')::timestamptz < ?))
+		)`,
+		models.CloudProviderGCP, models.CloudConnectorActive,
+		models.ScanStatusRunning, finishedBefore,
+		models.ScanStatusRunning, runningStartedBefore).
+		Order("updated_at").Find(&out).Error
+	return out, err
 }

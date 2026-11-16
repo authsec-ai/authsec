@@ -714,3 +714,53 @@ func lastSegment(name string) string {
 	}
 	return name
 }
+
+type gcpCredentialSkip struct {
+	SecretKinds            []string
+	IdentityKinds          []string
+	IdentityNativePrefixes []string
+}
+
+var gcpMemberIdentityKinds = []string{
+	models.CloudIdentityGCPUser,
+	models.CloudIdentityGCPGroup,
+	models.CloudIdentityGCPDomain,
+	models.CloudIdentityGCPPublic,
+	models.CloudIdentityGCPDeleted,
+	models.CloudIdentityGCPServiceAgent,
+	models.CloudIdentityGCPFederated,
+}
+
+func gcpCredentialReconcileSkip(cov models.ScanCoverage) gcpCredentialSkip {
+	var s gcpCredentialSkip
+
+	hmacReached := cov.Surfaces != nil && cov.Surfaces[gcp.SurfaceHMACKeys].State == models.CloudCoverageReached
+	apiReached := cov.Surfaces != nil && cov.Surfaces[gcp.SurfaceAPIKeys].State == models.CloudCoverageReached
+	bindingsReached := cov.Surfaces != nil &&
+		cov.Surfaces[gcp.SurfaceAllowBindings].State == models.CloudCoverageReached &&
+		cov.Surfaces[gcp.SurfaceResourceIAM].State == models.CloudCoverageReached
+
+	if !hmacReached {
+		s.SecretKinds = append(s.SecretKinds, models.CloudSecretGCPHMACKey)
+		s.IdentityNativePrefixes = append(s.IdentityNativePrefixes, "//gcp/principal/")
+	}
+	if !apiReached {
+		s.SecretKinds = append(s.SecretKinds, models.CloudSecretGCPAPIKey)
+		s.IdentityKinds = append(s.IdentityKinds, models.CloudIdentityGCPProject)
+	}
+	if !bindingsReached {
+		s.IdentityKinds = append(s.IdentityKinds, gcpMemberIdentityKinds...)
+		hasPrefix := false
+		for _, p := range s.IdentityNativePrefixes {
+			if p == "//gcp/principal/" {
+				hasPrefix = true
+				break
+			}
+		}
+		if !hasPrefix {
+			s.IdentityNativePrefixes = append(s.IdentityNativePrefixes, "//gcp/principal/")
+		}
+	}
+
+	return s
+}
