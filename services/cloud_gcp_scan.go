@@ -109,6 +109,8 @@ type GCPScanSnapshot struct {
 	ScopeID     string
 	// Projects is the set this scan enumerated and read.
 	Projects []gcpProject
+	// Tree is the scope hierarchy (org/folder/project) walked for org/folder scopes.
+	Tree *gcp.ScopeTree
 	// Coverage is the report, as committed.
 	Coverage models.ScanCoverage
 }
@@ -129,6 +131,13 @@ type GCPScanner struct {
 	scans      repositories.CloudGCPScanRepository
 	identities repositories.CloudIdentityRepository
 	authSvc    *GCPAuthService
+
+	// gcpRead provides access to stored IAM actions for roles that could not be
+	// read in this scan (GCP-5 feature, optional).
+	gcpRead interface{ StoredActions(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) ([]string, bool, error) }
+
+	// permissions provides permission upsert capability (GCP-5 feature, optional).
+	permissions interface{ UpsertPermission(*models.CloudPermission) (uuid.UUID, bool, error) }
 
 	// Client factories, overridable in tests. Package-level vars are already
 	// how cloud_gcp_onboarding.go does this; these are fields so two scanners
@@ -285,7 +294,10 @@ func (s *GCPScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.UUI
 		}
 	}
 
-	coverage := s.buildCoverage(generation, started, identityAcc, keyAcc, governor, len(projects))
+	coverage := s.buildCoverage(generation, started, models.CloudScanTriggerManual, []gcpNamedAcc{
+		{surface: gcp.SurfaceIdentities, counter: "identities_upserted", acc: identityAcc},
+		{surface: gcp.SurfaceKeys, counter: "secrets_upserted", acc: keyAcc},
+	}, governor, len(projects))
 
 	// ---- reconcile, and only behind two proofs -----------------------------
 	//
@@ -587,6 +599,13 @@ func sanitizedSurfaceReason(err error) string {
 	return err.Error()
 }
 
+// gcpNamedAcc pairs a discovery surface with its accumulator and counter name.
+type gcpNamedAcc struct {
+	surface string
+	counter string
+	acc     *gcpSurfaceAcc
+}
+
 // buildCoverage assembles the report from the surfaces this scan ATTEMPTED.
 //
 // It deliberately does not start from the connector's onboarding coverage
@@ -605,28 +624,36 @@ func sanitizedSurfaceReason(err error) string {
 // connector attrs.CapabilityProfile, which this scan never touches. Onboarding
 // and verify own attrs; scans own coverage.
 func (s *GCPScanner) buildCoverage(
-	generation int, started time.Time,
-	identityAcc, keyAcc *gcpSurfaceAcc, governor *gcp.Governor, projectCount int,
+	generation int, started time.Time, trigger string,
+	surfaces []gcpNamedAcc, governor *gcp.Governor, projectCount int,
 ) models.ScanCoverage {
-	reached, denied, throttled, constrained := identityAcc.snapshotCounters()
 	cov := models.ScanCoverage{
 		Generation: generation,
 		Status:     models.ScanStatusRunning,
 		StartedAt:  &started,
-		Surfaces: map[string]models.SurfaceCoverage{
-			gcp.SurfaceIdentities: identityAcc.coverage(),
-			gcp.SurfaceKeys:       keyAcc.coverage(),
-		},
-		Counters: map[string]int{
-			"projects_total":       projectCount,
-			"projects_reached":     reached,
-			"projects_denied":      denied,
-			"projects_throttled":   throttled,
-			"projects_constrained": constrained,
-			"project_concurrency":  governor.ProjectConcurrency(),
-			"identities_upserted":  identityAcc.count,
-			"secrets_upserted":     keyAcc.count,
-		},
+		Surfaces:   make(map[string]models.SurfaceCoverage, len(surfaces)),
+		Counters:   map[string]int{},
+	}
+	for _, named := range surfaces {
+		if named.acc == nil {
+			continue
+		}
+		cov.Surfaces[named.surface] = named.acc.coverage()
+		if named.counter != "" {
+			cov.Counters[named.counter] = named.acc.count
+		}
+	}
+	var reached, denied, throttled, constrained int
+	if len(surfaces) > 0 && surfaces[0].acc != nil {
+		reached, denied, throttled, constrained = surfaces[0].acc.snapshotCounters()
+	}
+	cov.Counters["projects_total"] = projectCount
+	cov.Counters["projects_reached"] = reached
+	cov.Counters["projects_denied"] = denied
+	cov.Counters["projects_throttled"] = throttled
+	cov.Counters["projects_constrained"] = constrained
+	if governor != nil {
+		cov.Counters["project_concurrency"] = governor.ProjectConcurrency()
 	}
 	return cov
 }
@@ -674,17 +701,21 @@ func (s *GCPScanner) commitFailed(
 // resolveProjects resolves the list of projects to scan for org/folder connectors.
 // TODO(GCP-5): Implement full org/folder enumeration; for now returns connector's project.
 func (s *GCPScanner) resolveProjects(ctx context.Context, connector *models.CloudConnector, attrs models.GCPConnectorAttrs, authOpt option.ClientOption, governor *gcp.Governor) ([]gcpProject, error) {
-	if attrs.ProjectID == "" {
+	projectID := attrs.ProjectID
+	if projectID == "" && connector != nil && connector.ScopeKind == models.CloudScopeProject {
+		projectID = connector.ScopeID
+	}
+	if projectID == "" {
 		return nil, errors.New("gcp: project_id not set on connector")
 	}
 	// For now, return just this project. Organization/folder traversal is GCP-5+.
 	return []gcpProject{
-		{ProjectID: attrs.ProjectID, Number: attrs.ProjectNumber},
+		{ProjectID: projectID, Number: attrs.ProjectNumber},
 	}, nil
 }
 
 // newCAIClient creates a Cloud Asset Inventory client.
 // TODO(GCP-3): Implement if Cloud Asset calls are needed; currently using Resource Manager fallback.
-func (s *GCPScanner) newCAIClient(ctx context.Context, authOpt option.ClientOption, quota *gcp.QPS) (*cloudasset.Service, error) {
-	return gcp.NewCloudAssetClient(ctx, authOpt, "")
+func (s *GCPScanner) newCAIClient(ctx context.Context, authOpt option.ClientOption, quotaProject string) (*cloudasset.Service, error) {
+	return gcp.NewCloudAssetClient(ctx, authOpt, quotaProject)
 }

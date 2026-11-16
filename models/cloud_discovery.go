@@ -1426,6 +1426,16 @@ type GCPAPIKeyRestrictions struct {
 	HttpReferrers []string `json:"http_referrers,omitempty"`
 }
 
+// GCPPermissionAttrs holds provider-specific attributes for a GCP permission.
+type GCPPermissionAttrs struct {
+	// RoleNames are the GCP IAM roles that grant this permission.
+	RoleNames []string `json:"role_names,omitempty"`
+	// ExpiresAt is when the binding expires, if conditional.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// StartsAt is when the binding starts, if conditional.
+	StartsAt *time.Time `json:"starts_at,omitempty"`
+}
+
 // Resource and permission sensitivity. A starting heuristic per the AWS plan's
 // section 5: Secrets Manager, KMS and IAM are high; everything else is low.
 // 'med' exists for a later ticket that refines this from tags or activity.
@@ -1588,6 +1598,10 @@ type CloudPermission struct {
 	// with the statement's position so two statements in one document do not
 	// collide.
 	NativeID string `json:"native_id" gorm:"not null"`
+
+	// Attrs is provider-specific attributes for permissions (GCP, Azure, etc.),
+	// stored as JSON. Empty or nil when not applicable.
+	Attrs json.RawMessage `json:"attrs,omitempty" gorm:"type:jsonb"`
 
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`

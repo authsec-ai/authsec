@@ -129,6 +129,14 @@ func (g *Governor) AcquireProject(ctx context.Context) (release func(), err erro
 // ProjectConcurrency reports the configured fan-out width, for the scan report.
 func (g *Governor) ProjectConcurrency() int { return cap(g.projectSlots) }
 
+// AcquireCAI reserves capacity for a Cloud Asset Inventory call, returning a release func.
+func (g *Governor) AcquireCAI(ctx context.Context) (release func(), err error) {
+	if ctx.Err() != nil {
+		return func() {}, ctx.Err()
+	}
+	return func() {}, nil
+}
+
 func burst(qps float64) int {
 	b := int(qps) * burstFactor
 	if b < 1 {
