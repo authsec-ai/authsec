@@ -1428,12 +1428,28 @@ type GCPAPIKeyRestrictions struct {
 
 // GCPPermissionAttrs holds provider-specific attributes for a GCP permission.
 type GCPPermissionAttrs struct {
-	// RoleNames are the GCP IAM roles that grant this permission.
-	RoleNames []string `json:"role_names,omitempty"`
-	// ExpiresAt is when the binding expires, if conditional.
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	// StartsAt is when the binding starts, if conditional.
-	StartsAt *time.Time `json:"starts_at,omitempty"`
+	// AttachedTo is the full resource name the binding is attached to.
+	AttachedTo string `json:"attached_to,omitempty"`
+	// GCPScopeKind is the kind of scope (resource, organization, folder, project).
+	GCPScopeKind string `json:"gcp_scope_kind,omitempty"`
+	// Ancestors are the resource hierarchy ancestors.
+	Ancestors json.RawMessage `json:"ancestors,omitempty"`
+	// Project is the project the binding was found in.
+	Project string `json:"project,omitempty"`
+	// Member is the raw IAM member string.
+	Member string `json:"member,omitempty"`
+	// ReadTime is when the binding was read.
+	ReadTime time.Time `json:"read_time,omitempty"`
+	// BindingRaw is the full binding as returned by Cloud Asset.
+	BindingRaw json.RawMessage `json:"binding_raw,omitempty"`
+	// RoleUnresolved is true if the role could not be resolved.
+	RoleUnresolved bool `json:"role_unresolved,omitempty"`
+	// BasicRole indicates if the role is a basic role (owner/editor/viewer).
+	BasicRole bool `json:"basic_role,omitempty"`
+	// RoleStage is the launch stage of the role (GA, BETA, ALPHA).
+	RoleStage string `json:"role_stage,omitempty"`
+	// RoleState is the state of the role (available, deleted, etc.).
+	RoleState string `json:"role_state,omitempty"`
 }
 
 // Resource and permission sensitivity. A starting heuristic per the AWS plan's

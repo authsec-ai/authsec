@@ -134,10 +134,15 @@ type GCPScanner struct {
 
 	// gcpRead provides access to stored IAM actions for roles that could not be
 	// read in this scan (GCP-5 feature, optional).
-	gcpRead interface{ StoredActions(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) ([]string, bool, error) }
+	gcpRead interface {
+		StoredActions(ctx context.Context, workspaceID, identityID, resourceID uuid.UUID, nativeID string) ([]string, bool, error)
+	}
 
 	// permissions provides permission upsert capability (GCP-5 feature, optional).
-	permissions interface{ UpsertPermission(*models.CloudPermission) (uuid.UUID, bool, error) }
+	permissions interface {
+		UpsertPermission(*models.CloudPermission) (uuid.UUID, bool, error)
+		UpsertResource(*models.CloudResource) (uuid.UUID, bool, error)
+	}
 
 	// Client factories, overridable in tests. Package-level vars are already
 	// how cloud_gcp_onboarding.go does this; these are fields so two scanners
