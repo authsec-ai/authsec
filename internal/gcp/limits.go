@@ -68,6 +68,9 @@ const (
 	burstFactor = 2
 )
 
+// QPS is a rate limiter for quota per second.
+type QPS = *rate.Limiter
+
 // Governor is the outbound budget for one scan.
 //
 // One Governor per scan rather than a package-level singleton: two connectors

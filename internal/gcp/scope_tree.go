@@ -33,7 +33,10 @@ import (
 // is not a probe surface (it is not in AllSurfaces): the probe asks whether the
 // walk is possible, this records whether a scan completed one.
 const (
-	SurfaceScopeTree = "scope_tree"
+	SurfaceScopeTree        = "scope_tree"
+	SurfaceHMACKeys         = "hmac_keys"
+	SurfaceAPIKeys          = "api_keys"
+	SurfaceFederationConfig = "federation_config"
 )
 
 // Node kinds in a ScopeTree.

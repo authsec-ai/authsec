@@ -31,6 +31,14 @@ const (
 	CloudScopeTenant       = "tenant"
 )
 
+// GCP-specific scope kinds used in discovery bindings.
+const (
+	GCPScopeResource     = "resource"
+	GCPScopeOrganization = "organization"
+	GCPScopeFolder       = "folder"
+	GCPScopeProject      = "project"
+)
+
 // Connector lifecycle.
 //
 //   - active  — assumable, and proven so at VerifiedAt
@@ -987,6 +995,14 @@ type GCPConnectorAttrs struct {
 	// from ScopeID, since a service account always has a home project even
 	// when its IAM grants are at org/folder scope (GCP-D9, point 2).
 	ReaderProjectID string `json:"reader_project_id,omitempty"`
+
+	// ProjectID is the human-readable project ID when the scope is a project
+	// (for org/folder scopes, this is empty). Derived from ScopeID.
+	ProjectID string `json:"project_id,omitempty"`
+
+	// ProjectNumber is the immutable project number when the scope is a project
+	// (for org/folder scopes, this is empty).
+	ProjectNumber string `json:"project_number,omitempty"`
 
 	// ReaderSAEmail is the reader service account's email, as the customer
 	// pasted it back (json_key: parsed from the uploaded key's client_email;
