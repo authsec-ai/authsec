@@ -180,3 +180,25 @@ func isConflict(err error) bool {
 	var gerr *googleapi.Error
 	return errors.As(err, &gerr) && (gerr.Code == 409 || gerr.Code == 400)
 }
+
+// IsScopeInsufficient checks if the error indicates insufficient authentication scopes.
+// TODO(GCP-7): Full implementation with proper scope detection.
+func IsScopeInsufficient(e error) bool {
+	if e == nil {
+		return false
+	}
+	msg := flattenMessage(e)
+	if flattenCode(e) != 403 {
+		return false
+	}
+	return strings.Contains(msg, "scope") || isReason(e, "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+}
+
+// IsServiceDisabled checks if the error indicates a disabled API service.
+// TODO(GCP-7): Full implementation with proper service disabled detection.
+func IsServiceDisabled(e error) bool {
+	if e == nil {
+		return false
+	}
+	return isReason(e, "SERVICE_DISABLED") || (flattenCode(e) == 403 && strings.Contains(flattenMessage(e), "has not been used"))
+}

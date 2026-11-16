@@ -13,6 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"google.golang.org/api/cloudasset/v1"
 	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/iam/v1"
 	"google.golang.org/api/option"
@@ -668,4 +669,22 @@ func (s *GCPScanner) commitFailed(
 			connectorID, generation, err)
 	}
 	return cov
+}
+
+// resolveProjects resolves the list of projects to scan for org/folder connectors.
+// TODO(GCP-5): Implement full org/folder enumeration; for now returns connector's project.
+func (s *GCPScanner) resolveProjects(ctx context.Context, connector *models.CloudConnector, attrs models.GCPConnectorAttrs, authOpt option.ClientOption, governor *gcp.Governor) ([]gcpProject, error) {
+	if attrs.ProjectID == "" {
+		return nil, errors.New("gcp: project_id not set on connector")
+	}
+	// For now, return just this project. Organization/folder traversal is GCP-5+.
+	return []gcpProject{
+		{ProjectID: attrs.ProjectID, Number: attrs.ProjectNumber},
+	}, nil
+}
+
+// newCAIClient creates a Cloud Asset Inventory client.
+// TODO(GCP-3): Implement if Cloud Asset calls are needed; currently using Resource Manager fallback.
+func (s *GCPScanner) newCAIClient(ctx context.Context, authOpt option.ClientOption, quota *gcp.QPS) (*cloudasset.Service, error) {
+	return gcp.NewCloudAssetClient(ctx, authOpt, "")
 }

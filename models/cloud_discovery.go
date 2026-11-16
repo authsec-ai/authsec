@@ -1371,6 +1371,45 @@ type CloudAssumeEdge struct {
 
 func (CloudAssumeEdge) TableName() string { return "cloud_assume_edge" }
 
+// GCPAssumeEdgeAttrs holds provider-specific attributes for a GCP assume edge.
+type GCPAssumeEdgeAttrs struct {
+	// RoleNames are the GCP IAM roles that enable the assumption.
+	RoleNames []string `json:"role_names,omitempty"`
+	// ExpiresAt is when the binding expires, if conditional.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// StartsAt is when the binding starts, if conditional.
+	StartsAt *time.Time `json:"starts_at,omitempty"`
+}
+
+// GCPAPIKeyRestrictions holds restrictions on a GCP API key.
+type GCPAPIKeyRestrictions struct {
+	// BrowserKeyRestrictions restricts usage to specified referrer URLs.
+	BrowserKeyRestrictions *struct {
+		AllowedReferrers []string `json:"allowed_referrers,omitempty"`
+	} `json:"browser_key_restrictions,omitempty"`
+	// ServerKeyRestrictions restricts usage to specified IP addresses.
+	ServerKeyRestrictions *struct {
+		AllowedIPs []string `json:"allowed_ips,omitempty"`
+	} `json:"server_key_restrictions,omitempty"`
+	// AndroidKeyRestrictions restricts usage to specified Android app packages.
+	AndroidKeyRestrictions *struct {
+		AllowedApplications []struct {
+			PackageName    string `json:"package_name,omitempty"`
+			Sha1Fingerprint string `json:"sha1_fingerprint,omitempty"`
+		} `json:"allowed_applications,omitempty"`
+	} `json:"android_key_restrictions,omitempty"`
+	// IosKeyRestrictions restricts usage to specified iOS bundle IDs.
+	IosKeyRestrictions *struct {
+		AllowedBundleIds []string `json:"allowed_bundle_ids,omitempty"`
+	} `json:"ios_key_restrictions,omitempty"`
+	// ApiTarget specifies which APIs the key is allowed to call.
+	ApiTarget *struct {
+		Service []string `json:"service,omitempty"`
+	} `json:"api_target,omitempty"`
+	// HttpReferrers specifies allowed HTTP referrers (deprecated, use BrowserKeyRestrictions).
+	HttpReferrers []string `json:"http_referrers,omitempty"`
+}
+
 // Resource and permission sensitivity. A starting heuristic per the AWS plan's
 // section 5: Secrets Manager, KMS and IAM are high; everything else is low.
 // 'med' exists for a later ticket that refines this from tags or activity.
