@@ -1,0 +1,22 @@
+# Copy into .github/workflows/ in the repo named in GITHUB_REPO.
+# Replace <DEV_NUM> and <DEV> with the values seed.sh printed.
+# Running it makes GitHub authenticate to GCP through Workload Identity
+# Federation as deployer-sa, which gives AuthSec a real federated sign-in to see.
+name: iga-gcp-federation-check
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 8 * * 1"
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/<DEV_NUM>/locations/global/workloadIdentityPools/iga-github/providers/github
+          service_account: deployer-sa@<DEV>.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth print-access-token >/dev/null && echo "federated sign-in ok"
