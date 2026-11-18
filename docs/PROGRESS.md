@@ -4,6 +4,31 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-18 — Machines are connections (branch `feat/agent-kit-control-plane`)
+
+- `GET /authsec/discovery/connections` lists each machine (discovery source `vm_sensor`, an authsec-cli daemon) as provider `machine`: connected while it reports (the cluster agent's heartbeat rule), its last report as the scan, its agent count as the scope, no graph, remove only. Unit test of the mapping; the cross-workspace connections test now seeds a machine per workspace (A sees its own, never B's).
+- UI (`feat/agent-kit-console`): no separate Machines page. Machines are added from Connections (picker and Connect more sources), listed there, and open at `/iga/connections/:id` with their own tabs; `/iga/machines[/:id]` redirect.
+- Found by testing on a real machine (authsec-cli `4ab95cd`): `daemon install` wrote a unit whose ReadWritePaths named a missing /var/lib/authsec, so systemd never started the service (226/NAMESPACE), and /etc/authsec was read-only under ProtectSystem=full (the actuation credential). Fixed: install creates the folders, the unit tolerates a missing one and makes /etc/authsec writable.
+
+---
+
+## 2026-11-13 (cont.) — Agent Kit console and release
+
+- UI (branch `feat/agent-kit-console` in Authsec-ui): IGA › Machines — add a machine (mint token, three commands, wait for registration), agents with quarantine/release, per-agent access with right-click block, policy editor with history and stale-save refusal, logs with OWASP tag filters, enforcement on/off and SIEM commands. Checked in a browser against a scratch backend.
+- authsec-cli: `make release` (binaries, install.sh, SHA256SUMS) and docs/DEMO.md.
+- CLAUDE.md listed `CORS_ALLOWED_ORIGINS`; the backend reads `CORS_ALLOW_ORIGIN` (config/config.go). Corrected.
+
+---
+
+## 2026-11-13 — AuthSec Agent Kit control plane (branch `feat/agent-kit-control-plane`)
+
+- authsec-cli machines connect as discovery sources of kind `vm_sensor`: they register and heartbeat on `/agent-registration`, report agents as sightings (`source: vm_sensor`, metadata `machine.agent_id`), and hand over an actuation credential as Kubernetes agents do.
+- Migration 162: `agentkit_events` (decisions, detections, agent start/stop, sensor, access summaries; source pinned to the workspace by a composite FK) and `agentkit_policies` (authsec.ai/v1 AgentPolicy YAML, one row per version). Both under RLS; bootstrap carries them; parity rehearsed (fresh == upgraded, the upgrade applies 162 only).
+- Machine routes `/authsec/discovery/agentkit/machine/{events,policies}` always need a credential, whatever `IGA_DISCOVERY_INGEST_AUTH` says: the machine's actuation token, or a live ingest token of the workspace naming a vm_sensor source of it. A machine holding an actuation token speaks only with it. Policies come with an ETag.
+- Console routes `/authsec/discovery/agentkit/{events,access,policies,policies/:agent/versions}` (discovery:read), `PUT policies/:agent` and `POST policies/:agent/block` (discovery:admin). A save names the version it started from (409 when stale). Block adds one deny rule (host, cidr, path, command, mcp) as a new version, keeping the YAML's comments; an agent without its own policy starts from a copy of `*`.
+- Quarantine of a machine agent queues a `quarantine` instruction with payload `target: machine` to its vm_sensor source (no eviction); without actuation the decision stands and nothing is queued, as for clusters.
+- Tests: `tests/integration/agentkit_test.go` (auth matrix, cross-workspace reads/writes/cursors/pulls, versions, block, quarantine), `services/agentkit_block_test.go`. Ratchet unchanged (72).
+- Note: `scripts/schema-parity.sh` with pg_dump 18 reports `pg_attver` lines as differences; filtered, the schemas match.
 ## 2026-11-11 — Agent runtime review 3: ingest durability, shared Lambda interfaces, late log lines (branch `fix/agent-runtime-review-3`)
 
 An external design review; every factual claim was checked against the code and AWS's documentation (spec §12).

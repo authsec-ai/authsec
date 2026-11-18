@@ -1496,6 +1496,11 @@ func SetupRoutes(
 			// install, or during an outage — since admission sees deletions live or
 			// never. A partial sweep retires nothing.
 			discoveryIngress.POST("/resync-manifest", discoveryController.ReportResyncManifest)
+
+			// AuthSec Agent Kit machines (authsec-cli daemons, vm_sensor sources):
+			// their decision/detection records and the policies they enforce.
+			// Always credentialed, whatever IGA_DISCOVERY_INGEST_AUTH says.
+			platformCtrl.MountAgentKitMachineRoutes(discoveryIngress, discoveryController)
 		}
 
 		// Agent runtime event stream (SPEC-agent-runtime-visibility.md §5.6):
@@ -1549,6 +1554,10 @@ func SetupRoutes(
 			//   GET    /ingest-tokens      list (prefixes, never hashes)
 			//   DELETE /ingest-tokens/:id  revoke
 			platformCtrl.MountDiscoveryIngestTokenRoutes(discovery, discoveryController, middlewares.Require)
+
+			// AuthSec Agent Kit console: machine logs, access summaries, and the
+			// agent policies machines pull (edit, version history, block).
+			platformCtrl.MountAgentKitConsoleRoutes(discovery, discoveryController, middlewares.Require)
 
 			// NOTE: POST /sightings, /agent-registration, /lifecycle and
 			// /resync-manifest are deliberately NOT here — they are registered

@@ -45,6 +45,12 @@ func Test_Isolation_DiscoveryReads(t *testing.T) {
 			saID, tn.WS.WorkspaceID, "system:serviceaccount:iga-demo:sa-"+tag, "k8s-sa-"+saID.String()).Error; err != nil {
 			t.Fatalf("seed k8s identity: %v", err)
 		}
+		// A machine (authsec-cli daemon) is a connection too, named for its host.
+		if err := config.DB.Exec(`
+			INSERT INTO discovery_sources (id, workspace_id, kind, display_name, cluster_name, last_heartbeat_at)
+			VALUES (?, ?, 'vm_sensor', ?, ?, now())`, uuid.New(), tn.WS.WorkspaceID, "host-"+connScope, "host-"+connScope).Error; err != nil {
+			t.Fatalf("seed machine: %v", err)
+		}
 		return connScope, saID
 	}
 	aScope, aSA := seed(a, "a")
@@ -66,5 +72,8 @@ func Test_Isolation_DiscoveryReads(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	if body := w.Body.String(); !strings.Contains(body, aScope) || strings.Contains(body, bScope) {
 		t.Errorf("connections for A: want A's connector and not B's, got %s", body)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"provider":"machine"`) || !strings.Contains(body, "host-"+aScope) || strings.Contains(body, "host-"+bScope) {
+		t.Errorf("connections for A: want A's machine and not B's, got %s", body)
 	}
 }

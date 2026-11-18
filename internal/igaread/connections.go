@@ -20,6 +20,8 @@ package igaread
 //	           + k8sread.LatestSweeps and the newest projected sweep per source
 //	GitHub     discovery_sources kind repo_scan + its iga_integrations row
 //	           + LATERAL latest and latest-succeeded discovery_scan_runs
+//	Machine    discovery_sources kind vm_sensor (an authsec-cli daemon:
+//	           heartbeat, runtime) + its discovered-agent count
 //
 // Every mapping below is a pure function of what those rows say, so the same
 // rows always render the same connection.
@@ -46,12 +48,16 @@ const (
 	ConnProviderK8s    = "k8s"
 	ConnProviderGitHub = "github"
 	ConnProviderAzure  = "azure"
+	// ConnProviderMachine is a computer running the AuthSec Agent Kit
+	// (authsec-cli daemon), a discovery source of kind vm_sensor.
+	ConnProviderMachine = "machine"
 
 	connScopeAccount      = "account"
 	connScopeTenant       = "tenant"
 	connScopeProject      = "project"
 	connScopeCluster      = "cluster"
 	connScopeOrganisation = "organisation"
+	connScopeMachine      = "machine"
 
 	connConnected       = "connected"
 	connAuthFailed      = "authentication_failed"
@@ -218,6 +224,9 @@ var connCapabilities = map[string]ConnectionCapabilities{
 	// re-checks access and starts a discovery run; its scope is chosen at
 	// onboarding.
 	ConnProviderAzure: {Scan: true, Verify: true, Revoke: true},
+	// A machine reports on its own every minute; it can only be removed (the
+	// source's DELETE), as a cluster.
+	ConnProviderMachine: {Revoke: true},
 }
 
 // ConnectionList is the response body.
@@ -243,13 +252,17 @@ func (r *Reader) ListConnections(ctx context.Context) (any, error) {
 		if err != nil {
 			return err
 		}
-		out.Connections = append(append(append(out.Connections, cloud...), k8s...), gh...)
+		machines, err := connMachines(q, now)
+		if err != nil {
+			return err
+		}
+		out.Connections = append(append(append(append(out.Connections, cloud...), k8s...), machines...), gh...)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	rank := map[string]int{ConnProviderAWS: 0, ConnProviderGCP: 1, ConnProviderAzure: 2, ConnProviderK8s: 3, ConnProviderGitHub: 4}
+	rank := map[string]int{ConnProviderAWS: 0, ConnProviderGCP: 1, ConnProviderAzure: 2, ConnProviderK8s: 3, ConnProviderMachine: 4, ConnProviderGitHub: 5}
 	sort.SliceStable(out.Connections, func(i, j int) bool {
 		a, b := out.Connections[i], out.Connections[j]
 		if rank[a.Provider] != rank[b.Provider] {
@@ -709,6 +722,73 @@ func connKubernetes(q *Query, now time.Time) ([]Connection, error) {
 		out = append(out, conn)
 	}
 	return out, nil
+}
+
+// machineReportSeconds is how often an authsec-cli daemon reports (link
+// Options.Every): its heartbeat and its agents, every minute.
+const machineReportSeconds int64 = 60
+
+// connMachines lists the workspace's machines: authsec-cli daemons, each a
+// discovery source of kind vm_sensor named after its host.
+func connMachines(q *Query, now time.Time) ([]Connection, error) {
+	var sources []models.DiscoverySource
+	if err := q.DB().Select("id, display_name, enabled, cluster_name, last_heartbeat_at, created_at").
+		Where("workspace_id = ? AND kind = ?", q.WS, models.DiscoverySourceVMSensor).
+		Order("created_at, id").Find(&sources).Error; err != nil {
+		return nil, err
+	}
+	if len(sources) == 0 {
+		return nil, nil
+	}
+	// The agents each machine has reported, counted as the source list counts
+	// them (repository ListSources), in one statement.
+	var counts []struct {
+		SourceID uuid.UUID
+		N        int64
+	}
+	if err := q.DB().Raw(`SELECT discovery_source_id AS source_id, count(*) AS n
+		FROM discovered_agents
+		WHERE workspace_id = ? AND discovery_source_id IS NOT NULL
+		GROUP BY discovery_source_id`, q.WS).Scan(&counts).Error; err != nil {
+		return nil, err
+	}
+	agents := make(map[uuid.UUID]int64, len(counts))
+	for _, c := range counts {
+		agents[c.SourceID] = c.N
+	}
+	out := make([]Connection, 0, len(sources))
+	for i := range sources {
+		out = append(out, connMachine(&sources[i], agents[sources[i].ID], now))
+	}
+	return out, nil
+}
+
+// connMachine is one machine as a connection. It has no scan and no graph
+// publication: the daemon reports every minute, so its last report is its
+// "scan", and its agents are in Discovery from the first report on. The
+// connection condition is the cluster agent's (heartbeat within the grace
+// period).
+func connMachine(s *models.DiscoverySource, agents int64, now time.Time) Connection {
+	s.DeriveConnected(now)
+	host := nameOr(s.ClusterName, s.DisplayName)
+	every := machineReportSeconds
+	scan := ConnectionScan{State: connScanNever, HeartbeatAt: TS(s.LastHeartbeatAt), ReportsEverySeconds: &every}
+	conn := Connection{
+		ID: s.ID.String(), Provider: ConnProviderMachine, ScopeKind: connScopeMachine,
+		Name: nameOr(s.DisplayName, host), NativeID: host,
+		CreatedAt:    T(s.CreatedAt),
+		Connection:   connK8sCondition(s),
+		Coverage:     ConnectionCoverage{State: connCovUnknown, Gaps: []ConnectionGap{}},
+		Graph:        ConnectionGraph{State: connGraphNA},
+		ScopeSummary: countWord(int(agents), "agent", "agents", "no agents yet"),
+		Capabilities: connCapabilities[ConnProviderMachine],
+	}
+	if s.LastHeartbeatAt != nil {
+		scan.State, scan.At = connScanFinished, T(*s.LastHeartbeatAt)
+		conn.Discovery = ConnectionDiscovery{Ready: true, AsOf: T(*s.LastHeartbeatAt)}
+	}
+	conn.Scan = scan
+	return conn
 }
 
 func connK8sCondition(s *models.DiscoverySource) ConnectionCondition {

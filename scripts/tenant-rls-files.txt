@@ -14,6 +14,8 @@ repository/discovery_ingest_token_repository.go
 repository/iga_gov_evaluation_repository.go
 repository/iga_gov_finding_rule_repository.go
 repository/iga_gov_job_repository.go
+services/agentkit_block.go
+services/agentkit_service.go
 services/agent_runtime_evidence.go
 services/agent_runtime_contain.go
 services/agent_runtime_contain_job.go
