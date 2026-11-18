@@ -4,6 +4,14 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-18 — Machines are connections (branch `feat/agent-kit-control-plane`)
+
+- `GET /authsec/discovery/connections` lists each machine (discovery source `vm_sensor`, an authsec-cli daemon) as provider `machine`: connected while it reports (the cluster agent's heartbeat rule), its last report as the scan, its agent count as the scope, no graph, remove only. Unit test of the mapping; the cross-workspace connections test now seeds a machine per workspace (A sees its own, never B's).
+- UI (`feat/agent-kit-console`): no separate Machines page. Machines are added from Connections (picker and Connect more sources), listed there, and open at `/iga/connections/:id` with their own tabs; `/iga/machines[/:id]` redirect.
+- Found by testing on a real machine (authsec-cli `4ab95cd`): `daemon install` wrote a unit whose ReadWritePaths named a missing /var/lib/authsec, so systemd never started the service (226/NAMESPACE), and /etc/authsec was read-only under ProtectSystem=full (the actuation credential). Fixed: install creates the folders, the unit tolerates a missing one and makes /etc/authsec writable.
+
+---
+
 ## 2026-11-13 (cont.) — Agent Kit console and release
 
 - UI (branch `feat/agent-kit-console` in Authsec-ui): IGA › Machines — add a machine (mint token, three commands, wait for registration), agents with quarantine/release, per-agent access with right-click block, policy editor with history and stale-save refusal, logs with OWASP tag filters, enforcement on/off and SIEM commands. Checked in a browser against a scratch backend.
