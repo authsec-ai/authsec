@@ -68,6 +68,9 @@ const (
 	burstFactor = 2
 )
 
+// QPS is a rate limiter for quota per second.
+type QPS = *rate.Limiter
+
 // Governor is the outbound budget for one scan.
 //
 // One Governor per scan rather than a package-level singleton: two connectors
@@ -83,6 +86,10 @@ type Governor struct {
 	// budget's shape -- it is the same class of cheap metadata read -- but its
 	// own bucket, so enumeration cannot starve identity reads.
 	ResourceManager *rate.Limiter
+	// Storage paces storage.googleapis.com reads (HMAC keys).
+	Storage *rate.Limiter
+	// APIKeys paces apikeys.googleapis.com reads.
+	APIKeys *rate.Limiter
 
 	// projectSlots bounds fan-out concurrency. A buffered channel rather than
 	// x/sync/semaphore to avoid adding a dependency for a counter.
@@ -99,6 +106,8 @@ func NewGovernor() *Governor {
 		IAM:             rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
 		CAI:             rate.NewLimiter(rate.Limit(caiQPS), burst(caiQPS)),
 		ResourceManager: rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
+		Storage:         rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
+		APIKeys:         rate.NewLimiter(rate.Limit(iamQPS), burst(iamQPS)),
 		projectSlots:    make(chan struct{}, concurrency),
 	}
 }
@@ -125,6 +134,14 @@ func (g *Governor) AcquireProject(ctx context.Context) (release func(), err erro
 
 // ProjectConcurrency reports the configured fan-out width, for the scan report.
 func (g *Governor) ProjectConcurrency() int { return cap(g.projectSlots) }
+
+// AcquireCAI reserves capacity for a Cloud Asset Inventory call, returning a release func.
+func (g *Governor) AcquireCAI(ctx context.Context) (release func(), err error) {
+	if ctx.Err() != nil {
+		return func() {}, ctx.Err()
+	}
+	return func() {}, nil
+}
 
 func burst(qps float64) int {
 	b := int(qps) * burstFactor

@@ -14,9 +14,12 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/google/uuid"
+	apikeys "google.golang.org/api/apikeys/v2"
+	"google.golang.org/api/cloudasset/v1"
 	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/iam/v1"
 	"google.golang.org/api/option"
+	storage "google.golang.org/api/storage/v1"
 	"gorm.io/gorm"
 )
 
@@ -55,6 +58,57 @@ type fakeGCPKey struct {
 	origin string
 }
 
+type fakeGCPBinding struct {
+	role      string
+	members   []string
+	condTitle string
+	condDesc  string
+	condExpr  string
+}
+
+type fakeGCPPolicy struct {
+	resource  string
+	assetType string
+	project   string
+	org       string
+	folders   []string
+	bindings  []fakeGCPBinding
+}
+
+type fakeGCPRole struct {
+	name    string
+	deleted bool
+	stage   string
+	perms   []string
+}
+
+type fakeGCPHMACKey struct {
+	accessID string
+	saEmail  string
+	state    string
+}
+
+type fakeGCPAPIKey struct {
+	number     string
+	uid        string
+	display    string
+	keyString  string
+	apiTargets []string
+	ips        []string
+}
+
+type fakeGCPProvider struct {
+	id        string
+	issuer    string
+	condition string
+	jwks      string
+}
+
+type fakeGCPPool struct {
+	id        string
+	providers []fakeGCPProvider
+}
+
 type fakeGCPDiscovery struct {
 	srv *httptest.Server
 
@@ -73,14 +127,46 @@ type fakeGCPDiscovery struct {
 	// pageProjects returns one project per page, exercising pagination.
 	pageProjects bool
 
+	// GCP-2, 3, 4 fake server state
+	customRoles      map[string][]fakeGCPRole
+	predefinedRoles  map[string][]string
+	policies         []fakeGCPPolicy
+	saPolicies       map[string][]fakeGCPBinding
+	wifPools         map[string][]fakeGCPPool
+	hmacKeys         map[string][]fakeGCPHMACKey
+	apiKeys          map[string][]fakeGCPAPIKey
+	folders          map[string][]*cloudresourcemanager.Folder
+	projectsByParent map[string][]struct{ id, number string }
+	foldersStatus    int
+	failBindings     int
+	failBindingsBody string
+	failRMPolicy     int
+	failSAPolicy     int
+	failRoleGet      map[string]int
+	failHMAC         map[string]int
+	failAPIKeys      map[string]int
+	failBody         string
+	endlessBindings  bool
+
 	mu    sync.Mutex
 	calls []string
 }
 
 func newFakeGCPDiscovery() *fakeGCPDiscovery {
 	f := &fakeGCPDiscovery{
-		accounts:    map[string][]fakeGCPAccount{},
-		failProject: map[string]int{},
+		accounts:         map[string][]fakeGCPAccount{},
+		failProject:      map[string]int{},
+		customRoles:      map[string][]fakeGCPRole{},
+		predefinedRoles:  map[string][]string{},
+		saPolicies:       map[string][]fakeGCPBinding{},
+		wifPools:         map[string][]fakeGCPPool{},
+		hmacKeys:         map[string][]fakeGCPHMACKey{},
+		apiKeys:          map[string][]fakeGCPAPIKey{},
+		folders:          map[string][]*cloudresourcemanager.Folder{},
+		projectsByParent: map[string][]struct{ id, number string }{},
+		failRoleGet:      map[string]int{},
+		failHMAC:         map[string]int{},
+		failAPIKeys:      map[string]int{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
@@ -107,31 +193,289 @@ func (f *fakeGCPDiscovery) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch {
+	// Folders list
+	case strings.Contains(r.URL.Path, "/folders"):
+		if f.foldersStatus != 0 {
+			writeGCPError(w, f.foldersStatus, "folders refused")
+			return
+		}
+		parent := r.URL.Query().Get("parent")
+		resp := cloudresourcemanager.ListFoldersResponse{
+			Folders: f.folders[parent],
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
 	// Resource Manager project search.
 	case strings.Contains(r.URL.Path, "/projects:search"):
 		if f.enumStatus != 0 {
 			writeGCPError(w, f.enumStatus, "enumeration refused")
 			return
 		}
-		// One project per page when pageProjects is set, so the manual
-		// pagination -- and its per-page limiter token and per-page retry --
-		// is actually exercised rather than assumed.
+		query := r.URL.Query().Get("query")
+		projList := f.projects
+		if strings.HasPrefix(query, "parent:") {
+			parent := strings.TrimPrefix(query, "parent:")
+			if pbp, ok := f.projectsByParent[parent]; ok {
+				projList = pbp
+			}
+		}
 		resp := cloudresourcemanager.SearchProjectsResponse{}
 		start := 0
 		if tok := r.URL.Query().Get("pageToken"); tok != "" {
 			fmt.Sscanf(tok, "p%d", &start)
 		}
-		end := len(f.projects)
+		end := len(projList)
 		if f.pageProjects && start < end {
 			end = start + 1
 		}
-		for _, p := range f.projects[start:end] {
+		for _, p := range projList[start:end] {
 			resp.Projects = append(resp.Projects, &cloudresourcemanager.Project{
 				Name: "projects/" + p.number, ProjectId: p.id, State: "ACTIVE",
 			})
 		}
-		if end < len(f.projects) {
+		if end < len(projList) {
 			resp.NextPageToken = fmt.Sprintf("p%d", end)
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// Cloud Asset searchAllIamPolicies
+	case strings.Contains(r.URL.Path, ":searchAllIamPolicies"):
+		if f.failBindings != 0 {
+			msg := "denied"
+			if f.failBindingsBody != "" {
+				msg = f.failBindingsBody
+			}
+			writeGCPError(w, f.failBindings, msg)
+			return
+		}
+		if f.endlessBindings {
+			resp := cloudasset.SearchAllIamPoliciesResponse{
+				Results: []*cloudasset.IamPolicySearchResult{
+					{
+						Resource: "//cloudresourcemanager.googleapis.com/projects/endless",
+						Policy: &cloudasset.Policy{
+							Bindings: []*cloudasset.Binding{
+								{Role: "roles/viewer", Members: []string{"user:endless@example.com"}},
+							},
+						},
+					},
+				},
+				NextPageToken: "always-next-page",
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		resp := cloudasset.SearchAllIamPoliciesResponse{}
+		for _, pol := range f.policies {
+			var bindings []*cloudasset.Binding
+			for _, b := range pol.bindings {
+				cb := &cloudasset.Binding{
+					Role:    b.role,
+					Members: b.members,
+				}
+				if b.condExpr != "" {
+					cb.Condition = &cloudasset.Expr{
+						Title:       b.condTitle,
+						Description: b.condDesc,
+						Expression:  b.condExpr,
+					}
+				}
+				bindings = append(bindings, cb)
+			}
+			resp.Results = append(resp.Results, &cloudasset.IamPolicySearchResult{
+				Resource:     pol.resource,
+				AssetType:    pol.assetType,
+				Project:      pol.project,
+				Organization: pol.org,
+				Folders:      pol.folders,
+				Policy: &cloudasset.Policy{
+					Bindings: bindings,
+				},
+			})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// Resource Manager or Service Account getIamPolicy
+	case strings.Contains(r.URL.Path, ":getIamPolicy"):
+		if strings.Contains(r.URL.Path, "/serviceAccounts/") {
+			if f.failSAPolicy != 0 {
+				writeGCPError(w, f.failSAPolicy, "sa policy denied")
+				return
+			}
+			sa := gcpSAFromPath(r.URL.Path)
+			bindings, ok := f.saPolicies[sa]
+			if !ok {
+				for k, v := range f.saPolicies {
+					if strings.Contains(sa, k) || strings.Contains(k, sa) {
+						bindings = v
+						ok = true
+						break
+					}
+				}
+			}
+			resp := iam.Policy{}
+			for _, b := range bindings {
+				resp.Bindings = append(resp.Bindings, &iam.Binding{
+					Role:    b.role,
+					Members: b.members,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if f.failRMPolicy != 0 {
+			writeGCPError(w, f.failRMPolicy, "rm policy denied")
+			return
+		}
+		resp := cloudresourcemanager.Policy{}
+		if len(f.policies) > 0 {
+			for _, b := range f.policies[0].bindings {
+				resp.Bindings = append(resp.Bindings, &cloudresourcemanager.Binding{
+					Role:    b.role,
+					Members: b.members,
+				})
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// HMAC keys
+	case strings.Contains(r.URL.Path, "/hmacKeys"):
+		project := gcpProjectFromHmacPath(r.URL.Path)
+		if code, ok := f.failHMAC[project]; ok && code != 0 {
+			msg := "denied"
+			if f.failBody != "" {
+				msg = f.failBody
+			}
+			writeGCPError(w, code, msg)
+			return
+		}
+		resp := storage.HmacKeysMetadata{}
+		for _, k := range f.hmacKeys[project] {
+			resp.Items = append(resp.Items, &storage.HmacKeyMetadata{
+				AccessId:            k.accessID,
+				ServiceAccountEmail: k.saEmail,
+				State:               k.state,
+				ProjectId:           project,
+				TimeCreated:         "2026-01-01T00:00:00Z",
+				Updated:             "2026-01-01T00:00:00Z",
+			})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// API keys (v2 /locations/.../keys)
+	case strings.Contains(r.URL.Path, "/locations/") && strings.Contains(r.URL.Path, "/keys"):
+		project := gcpProjectFromAPIKeysPath(r.URL.Path)
+		if code, ok := f.failAPIKeys[project]; ok && code != 0 {
+			msg := "denied"
+			if f.failBody != "" {
+				msg = f.failBody
+			}
+			writeGCPError(w, code, msg)
+			return
+		}
+		resp := apikeys.V2ListKeysResponse{}
+		for _, k := range f.apiKeys[project] {
+			var targets []*apikeys.V2ApiTarget
+			for _, t := range k.apiTargets {
+				targets = append(targets, &apikeys.V2ApiTarget{Service: t})
+			}
+			var restrictions *apikeys.V2Restrictions
+			if len(targets) > 0 || len(k.ips) > 0 {
+				restrictions = &apikeys.V2Restrictions{
+					ApiTargets: targets,
+				}
+				if len(k.ips) > 0 {
+					restrictions.ServerKeyRestrictions = &apikeys.V2ServerKeyRestrictions{AllowedIps: k.ips}
+				}
+			}
+			resp.Keys = append(resp.Keys, &apikeys.V2Key{
+				Name:         fmt.Sprintf("projects/%s/locations/global/keys/%s", k.number, k.uid),
+				Uid:          k.uid,
+				DisplayName:  k.display,
+				KeyString:    k.keyString,
+				Restrictions: restrictions,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// Workload Identity Pools & Providers
+	case strings.Contains(r.URL.Path, "/workloadIdentityPools"):
+		project := gcpProjectFromWIFPath(r.URL.Path)
+		pools := f.wifPools[project]
+		if strings.Contains(r.URL.Path, "/providers") {
+			poolID := gcpPoolIDFromPath(r.URL.Path)
+			resp := iam.ListWorkloadIdentityPoolProvidersResponse{}
+			for _, pool := range pools {
+				if pool.id == poolID {
+					for _, prov := range pool.providers {
+						p := &iam.WorkloadIdentityPoolProvider{
+							Name:               fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s/providers/%s", project, pool.id, prov.id),
+							State:              "ACTIVE",
+							AttributeCondition: prov.condition,
+						}
+						if prov.issuer != "" {
+							p.Oidc = &iam.Oidc{IssuerUri: prov.issuer}
+						}
+						resp.WorkloadIdentityPoolProviders = append(resp.WorkloadIdentityPoolProviders, p)
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		resp := iam.ListWorkloadIdentityPoolsResponse{}
+		for _, pool := range pools {
+			resp.WorkloadIdentityPools = append(resp.WorkloadIdentityPools, &iam.WorkloadIdentityPool{
+				Name:  fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s", project, pool.id),
+				State: "ACTIVE",
+			})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+
+	// Roles (get and list)
+	case strings.Contains(r.URL.Path, "/roles"):
+		roleName := gcpRoleNameFromPath(r.URL.Path)
+		if roleName != "" && !strings.HasSuffix(r.URL.Path, "/roles") {
+			if code, ok := f.failRoleGet[roleName]; ok && code != 0 {
+				writeGCPError(w, code, "role get failed")
+				return
+			}
+			for _, roles := range f.customRoles {
+				for _, r := range roles {
+					if r.name == roleName {
+						resp := iam.Role{
+							Name:                r.name,
+							Stage:               r.stage,
+							Deleted:             r.deleted,
+							IncludedPermissions: r.perms,
+						}
+						_ = json.NewEncoder(w).Encode(resp)
+						return
+					}
+				}
+			}
+			if perms, ok := f.predefinedRoles[roleName]; ok {
+				resp := iam.Role{
+					Name:                roleName,
+					IncludedPermissions: perms,
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+			writeGCPError(w, http.StatusNotFound, "role not found")
+			return
+		}
+		parent := gcpRoleParentFromPath(r.URL.Path)
+		resp := iam.ListRolesResponse{}
+		if roles, ok := f.customRoles[parent]; ok {
+			for _, r := range roles {
+				resp.Roles = append(resp.Roles, &iam.Role{
+					Name:                r.name,
+					Stage:               r.stage,
+					Deleted:             r.deleted,
+					IncludedPermissions: r.perms,
+				})
+			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 
@@ -224,6 +568,82 @@ func gcpEmailFromKeysPath(path string) string {
 	return ""
 }
 
+func gcpSAFromPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "serviceAccounts" && i+1 < len(parts) {
+			target := parts[i+1]
+			return strings.TrimSuffix(target, ":getIamPolicy")
+		}
+	}
+	return ""
+}
+
+func gcpProjectFromHmacPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "projects" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+func gcpProjectFromAPIKeysPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "projects" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+func gcpProjectFromWIFPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "projects" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+func gcpPoolIDFromPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "workloadIdentityPools" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
+func gcpRoleNameFromPath(path string) string {
+	if i := strings.Index(path, "/roles/"); i >= 0 {
+		prefix := path[:i]
+		roleSuffix := path[i+1:]
+		if j := strings.Index(prefix, "projects/"); j >= 0 {
+			return prefix[j:] + "/" + roleSuffix
+		}
+		if j := strings.Index(prefix, "organizations/"); j >= 0 {
+			return prefix[j:] + "/" + roleSuffix
+		}
+		return roleSuffix
+	}
+	return ""
+}
+
+func gcpRoleParentFromPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if (p == "projects" || p == "organizations") && i+2 < len(parts) && parts[i+2] == "roles" {
+			return p + "/" + parts[i+1]
+		}
+	}
+	return ""
+}
+
 /* -------------------------------- fixtures ---------------------------------- */
 
 func gcpScanner(t *testing.T, db *gorm.DB, f *fakeGCPDiscovery) *services.GCPScanner {
@@ -242,6 +662,7 @@ func gcpScanner(t *testing.T, db *gorm.DB, f *fakeGCPDiscovery) *services.GCPSca
 			return option.WithoutAuthentication(), nil
 		},
 	)
+	scanner.WithEndpoint(f.srv.URL)
 	return scanner.WithClientFactories(
 		func(ctx context.Context, _ option.ClientOption) (*iam.Service, error) {
 			return iam.NewService(ctx, option.WithEndpoint(f.srv.URL), option.WithoutAuthentication())

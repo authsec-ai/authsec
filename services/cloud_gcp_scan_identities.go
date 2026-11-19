@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,7 +11,6 @@ import (
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
-	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/iam/v1"
 	"google.golang.org/api/option"
 )
@@ -54,22 +54,60 @@ var errTooManyGCPPages = fmt.Errorf("gcp: pagination exceeded %d pages", gcpMaxP
 
 /* ------------------------------ project set --------------------------------- */
 
-// resolveProjects determines which projects this scan will read.
+// resolveScope determines which projects this scan will read, and returns the
+// hierarchy it found them in.
 //
-// A project connector is its own project set and needs no enumeration -- the
-// common case, and the one that costs exactly one call either way.
+// A project connector is its own project set and tree, and costs no calls.
 //
-// An org or folder connector must enumerate, because iam.serviceAccounts.list
-// is project-scoped and has no organization-wide form. If the reader cannot
-// enumerate, this returns an error and BOTH Phase 1 surfaces are recorded
-// not-reached: a connector that cannot see the projects has not discovered an
-// empty estate, it has failed to look.
-func (s *GCPScanner) resolveProjects(
+// An org or folder connector must walk, because iam.serviceAccounts.list is
+// project-scoped and has no organization-wide form. If the reader cannot walk,
+// this returns an error and every surface is recorded not-reached: a connector
+// that cannot see the projects has not discovered an empty estate, it has failed
+// to look.
+//
+// A walk that stopped at a hierarchy limit returns the projects it found AND the
+// truncated tree with no error: those projects are real and worth reading, but
+// the tree is not whole, so recordScopeTree marks the scope_tree surface
+// not-reached and the scan cannot reconcile.
+// projectNumber reads a project's number with Resource Manager projects.get,
+// returning "" when it cannot.
+func (s *GCPScanner) projectNumber(ctx context.Context, authOpt option.ClientOption, governor *gcp.Governor, projectID string) string {
+	rm, err := s.newRMClient(ctx, authOpt)
+	if err != nil {
+		return ""
+	}
+	var number string
+	_ = gcp.Retry(ctx, func() error {
+		if err := governor.ResourceManager.Wait(ctx); err != nil {
+			return err
+		}
+		p, err := rm.Projects.Get("projects/" + projectID).Context(ctx).Do()
+		if err != nil {
+			return err
+		}
+		if n := strings.TrimPrefix(p.Name, "projects/"); n != p.Name && n != "" && n != projectID {
+			number = n
+		}
+		return nil
+	})
+	return number
+}
+
+func (s *GCPScanner) resolveScope(
 	ctx context.Context, connector *models.CloudConnector,
 	attrs models.GCPConnectorAttrs, authOpt option.ClientOption, governor *gcp.Governor,
-) ([]gcpProject, error) {
+) ([]gcpProject, *gcp.ScopeTree, error) {
 	if connector.ScopeKind == models.CloudScopeProject {
-		return []gcpProject{{ProjectID: connector.ScopeID}}, nil
+		// The number is what Google names a project by in Cloud Asset, API keys
+		// and federation pools; without it the same project gets two rows. Best
+		// effort: onboarding already proved projects.get works, and a failure
+		// here only leaves the number unknown, as it always was.
+		number := s.projectNumber(ctx, authOpt, governor, connector.ScopeID)
+		return []gcpProject{{ProjectID: connector.ScopeID, Number: number}},
+			&gcp.ScopeTree{
+				WalkedAt: time.Now().UTC(),
+				Nodes:    []gcp.ScopeNode{{ID: connector.ScopeID, Kind: gcp.ScopeNodeProject, Number: number}},
+			}, nil
 	}
 
 	// Onboarding already probed whether the tree can be walked and stored the
@@ -77,7 +115,7 @@ func (s *GCPScanner) resolveProjects(
 	// known -- and a probe that came back unknown is not proof of refusal, so
 	// only a definite "no" short-circuits here.
 	if enum := decodeScopeEnumeration(attrs.ScopeEnumeration); enum != nil && !enum.Usable() && !enum.Unknown {
-		return nil, fmt.Errorf("%w: the reader cannot enumerate projects below %s/%s",
+		return nil, nil, fmt.Errorf("%w: the reader cannot enumerate projects below %s/%s",
 			gcp.ErrPermissionDenied, connector.ScopeKind, connector.ScopeID)
 	}
 
@@ -86,80 +124,45 @@ func (s *GCPScanner) resolveProjects(
 
 	rm, err := s.newRMClient(enumCtx, authOpt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	query, err := gcpProjectSearchQuery(connector.ScopeKind, connector.ScopeID)
+	walker := &gcp.ScopeTreeWalker{RM: rm, Governor: governor}
+	tree, err := walker.Walk(enumCtx, connector.ScopeKind, connector.ScopeID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Paginated by hand rather than with .Pages(), so that EACH page is
-	// separately rate-limited and separately retried.
-	//
-	// The generated .Pages() helper walks every page inside one call, which
-	// would put the whole walk inside one Retry and one limiter token: a
-	// hundred-page enumeration would take one token and, on a 429 at page
-	// ninety, discard eighty-nine good pages and re-fetch them all. Under
-	// throttling that issues MORE calls, not fewer, which is the opposite of
-	// backing off.
-	var (
-		projects  []gcpProject
-		pageToken string
-	)
-	for page := 0; page < gcpMaxPages; page++ {
-		var resp *cloudresourcemanager.SearchProjectsResponse
-		token := pageToken
-		if err := gcp.Retry(enumCtx, func() error {
-			if err := governor.ResourceManager.Wait(enumCtx); err != nil {
-				return err
-			}
-			out, callErr := rm.Projects.Search().
-				Query(query).PageToken(token).Context(enumCtx).Do()
-			if callErr != nil {
-				return callErr
-			}
-			resp = out
-			return nil
-		}); err != nil {
-			return nil, err
-		}
-
-		for _, p := range resp.Projects {
-			// A project being deleted is not part of the estate and its service
-			// accounts are on their way out with it. Reading it would add rows
-			// that the next scan correctly removes.
-			if p.State != "" && p.State != "ACTIVE" {
-				continue
-			}
-			projects = append(projects, gcpProject{
-				ProjectID: p.ProjectId,
-				Number:    projectNumberFromName(p.Name),
-			})
-		}
-
-		if resp.NextPageToken == "" {
-			return projects, nil
-		}
-		pageToken = resp.NextPageToken
+	var projects []gcpProject
+	for _, n := range tree.Projects() {
+		projects = append(projects, gcpProject{ProjectID: n.ID, Number: n.Number})
 	}
-	// Ran out of page budget with more to come. Returned as an error so the
-	// surfaces record not-reached: a truncated project list would otherwise
-	// look exactly like an org that owns fewer projects than it does.
-	return nil, errTooManyGCPPages
+	return projects, tree, nil
 }
 
-// gcpProjectSearchQuery builds the Resource Manager search filter for a scope.
-func gcpProjectSearchQuery(scopeKind, scopeID string) (string, error) {
-	switch scopeKind {
-	case models.CloudScopeOrg:
-		return "parent:organizations/" + scopeID, nil
-	case models.CloudScopeFolder:
-		return "parent:folders/" + scopeID, nil
-	default:
-		return "", fmt.Errorf("%w: cannot enumerate projects for scope kind %q",
-			gcp.ErrInvalidGrant, scopeKind)
+// recordScopeTree stores the walked tree and records the scope_tree surface.
+//
+// A failed store is a not-reached surface, not a log line: a tree nobody can read
+// back is a tree the scan did not deliver. A superseded scan stores nothing and
+// says so the same way.
+func (s *GCPScanner) recordScopeTree(
+	workspaceID, connectorID uuid.UUID, generation int,
+	tree *gcp.ScopeTree, acc *gcpSurfaceAcc,
+) {
+	raw, err := json.Marshal(tree)
+	if err != nil {
+		acc.fail(err)
+		return
 	}
+	if err := s.scans.WriteScopeTree(workspaceID, connectorID, generation, raw); err != nil {
+		acc.fail(err)
+		return
+	}
+	if tree.Truncated {
+		acc.observe(fmt.Errorf("%w: %s", gcp.ErrScopeTreeTruncated, tree.TruncatedReason), len(tree.Nodes))
+		return
+	}
+	acc.observe(nil, len(tree.Nodes))
 }
 
 // projectNumberFromName pulls the immutable number out of "projects/123456".
@@ -248,6 +251,11 @@ type gcpWrittenIdentity struct {
 	// Email is the address the keys API addresses the account by. The identity
 	// itself is IdentityID; this is a locator, exactly as it is in attrs.
 	Email string
+	// Set only for a service account read by serviceAccounts.list (never for a
+	// principal named in a binding): where its own IAM policy lives.
+	UniqueID      string
+	ProjectID     string
+	ProjectNumber string
 }
 
 func (s *GCPScanner) listServiceAccounts(
@@ -328,6 +336,7 @@ func (s *GCPScanner) upsertServiceAccount(
 		OAuth2ClientID: sa.Oauth2ClientId,
 		Disabled:       sa.Disabled,
 		IdentityKind:   "service_account",
+		SAClass:        gcp.ClassifySA(sa.Email),
 	}); err != nil {
 		return gcpWrittenIdentity{}, err
 	}
@@ -336,7 +345,10 @@ func (s *GCPScanner) upsertServiceAccount(
 	if err != nil {
 		return gcpWrittenIdentity{}, err
 	}
-	return gcpWrittenIdentity{IdentityID: stored.ID, Email: sa.Email}, nil
+	return gcpWrittenIdentity{
+		IdentityID: stored.ID, Email: sa.Email,
+		UniqueID: sa.UniqueId, ProjectID: projectIDOf(project, sa), ProjectNumber: project.Number,
+	}, nil
 }
 
 // gcpServiceAccountNativeID is the join key, and it is the service account's

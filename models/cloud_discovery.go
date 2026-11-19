@@ -31,6 +31,14 @@ const (
 	CloudScopeTenant       = "tenant"
 )
 
+// GCP-specific scope kinds used in discovery bindings.
+const (
+	GCPScopeResource     = "resource"
+	GCPScopeOrganization = "organization"
+	GCPScopeFolder       = "folder"
+	GCPScopeProject      = "project"
+)
+
 // Connector lifecycle.
 //
 //   - active  — assumable, and proven so at VerifiedAt
@@ -465,6 +473,7 @@ const CoverageItemLimit = 100
 type ScanCoverage struct {
 	Generation int                        `json:"generation"`
 	Status     string                     `json:"status"`
+	Trigger    string                     `json:"trigger,omitempty"`
 	StartedAt  *time.Time                 `json:"started_at,omitempty"`
 	FinishedAt *time.Time                 `json:"finished_at,omitempty"`
 	Surfaces   map[string]SurfaceCoverage `json:"surfaces,omitempty"`
@@ -573,10 +582,18 @@ const (
 	// only requires kind <> '', so no constraint change was needed.
 	CloudIdentityIAMGroup = "iam_group"
 
-	// GCP. A service account is the only identity kind GCP discovery writes
-	// today; workload-identity and federated principals arrive with the
-	// impersonation and WIF edges, which are a later surface.
+	// GCP. Service accounts, scope identities, and member principals.
 	CloudIdentityGCPServiceAccount = "gcp_service_account"
+	CloudIdentityGCPProject        = "gcp_project"
+	CloudIdentityGCPFolder         = "gcp_folder"
+	CloudIdentityGCPOrganization   = "gcp_organization"
+	CloudIdentityGCPUser           = "gcp_user"
+	CloudIdentityGCPGroup          = "gcp_group"
+	CloudIdentityGCPDomain         = "gcp_domain"
+	CloudIdentityGCPPublic         = "gcp_public"
+	CloudIdentityGCPDeleted        = "gcp_deleted"
+	CloudIdentityGCPServiceAgent   = "gcp_service_agent"
+	CloudIdentityGCPFederated      = "gcp_federated"
 )
 
 // Secret kinds.
@@ -587,6 +604,8 @@ const (
 	// are recorded: a google-managed key is rotated by Google, never handled by
 	// the customer, and is not a credential anyone can leak.
 	CloudSecretGCPServiceAccountKey = "gcp_service_account_key"
+	CloudSecretGCPHMACKey           = "gcp_hmac_key"
+	CloudSecretGCPAPIKey            = "gcp_api_key"
 )
 
 // Secret status, in the provider's own words.
@@ -988,6 +1007,14 @@ type GCPConnectorAttrs struct {
 	// when its IAM grants are at org/folder scope (GCP-D9, point 2).
 	ReaderProjectID string `json:"reader_project_id,omitempty"`
 
+	// ProjectID is the human-readable project ID when the scope is a project
+	// (for org/folder scopes, this is empty). Derived from ScopeID.
+	ProjectID string `json:"project_id,omitempty"`
+
+	// ProjectNumber is the immutable project number when the scope is a project
+	// (for org/folder scopes, this is empty).
+	ProjectNumber string `json:"project_number,omitempty"`
+
 	// ReaderSAEmail is the reader service account's email, as the customer
 	// pasted it back (json_key: parsed from the uploaded key's client_email;
 	// wif: the second of the two values GCP-D9's flow has the customer paste).
@@ -1085,6 +1112,11 @@ type GCPConnectorAttrs struct {
 	// scan on it would report a nearly empty estate with nothing actually
 	// wrong. Shaped as internal/gcp.ScopeEnumeration.
 	ScopeEnumeration json.RawMessage `json:"scope_enumeration,omitempty"`
+
+	// ScopeTree is the cached hierarchy graph of orgs, folders, and projects
+	// discovered during the last successful scope walk. Stored as raw JSON
+	// encoding of internal/gcp.ScopeTree.
+	ScopeTree json.RawMessage `json:"scope_tree,omitempty"`
 
 	// OnboardingPath is one of the GCPOnboardingPath* constants. Reporting has
 	// to tell the three apart: they differ in what they were able to
@@ -1195,8 +1227,18 @@ type GCPIdentityAttrs struct {
 	// carries the same fact in the shared column; this keeps the provider's
 	// word for it beside the rest of its evidence.
 	Disabled bool `json:"disabled,omitempty"`
-	// IdentityKind discriminates within GCP. Always "service_account" today.
+	// IdentityKind discriminates within GCP.
 	IdentityKind string `json:"identity_kind,omitempty"`
+	// SAClass is the service account classification (e.g. user_managed, default_compute, service_agent).
+	SAClass string `json:"sa_class,omitempty"`
+	// MemberType is the IAM member type (user, group, domain, serviceAccount, etc.).
+	MemberType string `json:"member_type,omitempty"`
+	// IsExternal indicates if the identity is outside the connector's scanned scope.
+	IsExternal bool `json:"is_external,omitempty"`
+	// Deleted indicates if the identity was deleted in GCP.
+	Deleted bool `json:"deleted,omitempty"`
+	// DeletedUID is the UID of the deleted principal, if available.
+	DeletedUID string `json:"deleted_uid,omitempty"`
 }
 
 // GCPAttrs decodes Attrs as the GCP shape. Malformed or empty decodes to a zero
@@ -1261,6 +1303,16 @@ type GCPSecretAttrs struct {
 	// identity_id is the authoritative link; this is here so a key is
 	// intelligible on its own in an export.
 	ServiceAccountEmail string `json:"service_account_email,omitempty"`
+	// ProjectID is the GCP project ID.
+	ProjectID string `json:"project_id,omitempty"`
+	// ProjectNumber is the GCP project number.
+	ProjectNumber string `json:"project_number,omitempty"`
+	// DisplayName is the cosmetic name of the key (API keys).
+	DisplayName string `json:"display_name,omitempty"`
+	// HMACState is the state of an HMAC key (ACTIVE, INACTIVE, DELETED).
+	HMACState string `json:"hmac_state,omitempty"`
+	// Restrictions holds API key usage restrictions.
+	Restrictions *GCPAPIKeyRestrictions `json:"restrictions,omitempty"`
 }
 
 // GCPAttrs decodes Attrs as the GCP shape.
@@ -1320,9 +1372,11 @@ const (
 // Also not a closed set -- see AssumeSubject* above. GCP service-account
 // impersonation, for one, is none of these three.
 const (
-	AssumeMechanismSTSAssumeRole  = "sts_assume_role"
-	AssumeMechanismOIDCFederation = "oidc_federation"
-	AssumeMechanismEKSPodIdentity = "eks_pod_identity"
+	AssumeMechanismSTSAssumeRole          = "sts_assume_role"
+	AssumeMechanismOIDCFederation         = "oidc_federation"
+	AssumeMechanismEKSPodIdentity         = "eks_pod_identity"
+	AssumeMechanismGCPImpersonation       = "gcp_impersonation"
+	AssumeMechanismGKEWorkloadIdentity    = "gke_workload_identity"
 )
 
 // KnownAWSAssumeSubjectKinds returns the subject kinds AWS's own scanner
@@ -1370,6 +1424,92 @@ type CloudAssumeEdge struct {
 }
 
 func (CloudAssumeEdge) TableName() string { return "cloud_assume_edge" }
+
+// GCPAssumeEdgeAttrs holds provider-specific attributes for a GCP assume edge.
+type GCPAssumeEdgeAttrs struct {
+	// ViaScope is the scope resource if the role was granted at scope level.
+	ViaScope string `json:"via_scope,omitempty"`
+	// Member is the IAM member string.
+	Member string `json:"member,omitempty"`
+	// SubjectIdentityID is the UUID string of the subject identity row.
+	SubjectIdentityID string `json:"subject_identity_id,omitempty"`
+	// External indicates if the subject identity is external to this project/scope.
+	External bool `json:"external,omitempty"`
+	// BasicRole indicates if the assume capability came from a basic role.
+	BasicRole bool `json:"basic_role,omitempty"`
+	// Roles are the GCP IAM roles enabling this edge.
+	Roles []string `json:"roles,omitempty"`
+	// Capabilities are the actions enabled (e.g. mint_token, act_as).
+	Capabilities []string `json:"capabilities,omitempty"`
+	// SourcePermissionIDs are the IDs of the permission rows generating this edge.
+	SourcePermissionIDs []string `json:"source_permission_ids,omitempty"`
+	// Conditional indicates if the edge is conditional.
+	Conditional bool `json:"conditional,omitempty"`
+	// ExpiresAt is when the edge expires (RFC3339).
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// Pool is the workload identity pool identifier.
+	Pool string `json:"pool,omitempty"`
+	// Workforce indicates a workforce identity federation pool.
+	Workforce bool `json:"workforce,omitempty"`
+	// ProviderUnknown indicates if all providers in the pool are unknown/disabled.
+	ProviderUnknown bool `json:"provider_unknown,omitempty"`
+	// Providers lists the provider IDs in the pool.
+	Providers []string `json:"providers,omitempty"`
+	// Issuers lists the OIDC issuer hostnames.
+	Issuers []string `json:"issuers,omitempty"`
+	// Unconditioned indicates if the provider has no attribute condition.
+	Unconditioned bool `json:"unconditioned,omitempty"`
+	// AttributeCondition is the provider's attribute condition.
+	AttributeCondition string `json:"attribute_condition,omitempty"`
+	// AttributeMapping is the provider's attribute mapping.
+	AttributeMapping map[string]string `json:"attribute_mapping,omitempty"`
+}
+
+// GCPAPIKeyRestrictions holds restrictions on a GCP API key.
+type GCPAPIKeyRestrictions struct {
+	// APITargets specifies the GCP API services this key is allowed to call.
+	APITargets []string `json:"api_targets,omitempty"`
+	// Referrers specifies allowed HTTP referrers.
+	Referrers []string `json:"referrers,omitempty"`
+	// IPs specifies allowed IP addresses.
+	IPs []string `json:"ips,omitempty"`
+	// Android specifies allowed Android application package names.
+	Android []string `json:"android,omitempty"`
+	// IOS specifies allowed iOS bundle IDs.
+	IOS []string `json:"ios,omitempty"`
+	// Unrestricted is true if the key has no restrictions.
+	Unrestricted bool `json:"unrestricted,omitempty"`
+}
+
+// GCPPermissionAttrs holds provider-specific attributes for a GCP permission.
+type GCPPermissionAttrs struct {
+	// AttachedTo is the full resource name the binding is attached to.
+	AttachedTo string `json:"attached_to,omitempty"`
+	// GCPScopeKind is the kind of scope (resource, organization, folder, project).
+	GCPScopeKind string `json:"gcp_scope_kind,omitempty"`
+	// Ancestors are the resource hierarchy ancestors.
+	Ancestors []string `json:"ancestors,omitempty"`
+	// Project is the project the binding was found in.
+	Project string `json:"project,omitempty"`
+	// Member is the raw IAM member string.
+	Member string `json:"member,omitempty"`
+	// ReadTime is when the binding was read.
+	ReadTime string `json:"read_time,omitempty"`
+	// BindingRaw is the full binding as returned by Cloud Asset.
+	BindingRaw json.RawMessage `json:"binding_raw,omitempty"`
+	// RoleUnresolved is true if the role could not be resolved.
+	RoleUnresolved bool `json:"role_unresolved,omitempty"`
+	// BasicRole indicates if the role is a basic role (owner/editor/viewer).
+	BasicRole bool `json:"basic_role,omitempty"`
+	// RoleStage is the launch stage of the role (GA, BETA, ALPHA).
+	RoleStage string `json:"role_stage,omitempty"`
+	// RoleState is the state of the role (available, deleted, etc.).
+	RoleState string `json:"role_state,omitempty"`
+	// ExpiresAt is when the conditional binding expires (RFC3339).
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// StartsAt is when the conditional binding starts (RFC3339).
+	StartsAt string `json:"starts_at,omitempty"`
+}
 
 // Resource and permission sensitivity. A starting heuristic per the AWS plan's
 // section 5: Secrets Manager, KMS and IAM are high; everything else is low.
@@ -1533,6 +1673,10 @@ type CloudPermission struct {
 	// with the statement's position so two statements in one document do not
 	// collide.
 	NativeID string `json:"native_id" gorm:"not null"`
+
+	// Attrs is provider-specific attributes for permissions (GCP, Azure, etc.),
+	// stored as JSON. Empty or nil when not applicable.
+	Attrs json.RawMessage `json:"attrs,omitempty" gorm:"type:jsonb"`
 
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
