@@ -13994,3 +13994,25 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agentkit_policies');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 163: the AWS agent review handoff (idx_cloud_workload_agent_review_status,
+-- role authsec_agent_review). Same objects as migrations/master/163_agent_review.sql.
+CREATE INDEX IF NOT EXISTS idx_cloud_workload_agent_review_status
+    ON public.cloud_workload ((attrs->'agent_review'->>'status'))
+    WHERE attrs ? 'agent_review';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authsec_agent_review') THEN
+        BEGIN
+            CREATE ROLE authsec_agent_review NOLOGIN NOBYPASSRLS;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'authsec_agent_review not created (no CREATEROLE); create it by hand with the grants below';
+            RETURN;
+        END;
+    END IF;
+    GRANT USAGE ON SCHEMA public TO authsec_agent_review;
+    GRANT SELECT ON public.cloud_workload, public.cloud_identity, public.cloud_connector TO authsec_agent_review;
+    GRANT UPDATE (attrs) ON public.cloud_workload TO authsec_agent_review;
+END $$;

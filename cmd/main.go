@@ -24,6 +24,7 @@ import (
 
 	"github.com/authsec-ai/authsec/clients"
 	"github.com/authsec-ai/authsec/config"
+	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/azure"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
@@ -513,6 +514,11 @@ func main() {
 	// token. With neither, the metrics are not exposed.
 	metricsSrv := mountMetrics(r)
 
+	// AWS agent review service (authsec-aws-agent-discovery): temporary AWS
+	// keys for the workloads it reviews, behind its own service token. Unset,
+	// the route is not mounted and inference queues no reviews.
+	mountAgentReview(r)
+
 	// favicon.ico — browsers automatically request this for every HTML page,
 	// including backend-served pages like /authsec/hmgr/consent. Return 204
 	// No Content so it stops appearing as a console 404. Keep it tiny — no
@@ -720,6 +726,27 @@ func main() {
 		log.Fatalf("Server forced shutdown: %v", err)
 	}
 	log.Println("Server exited cleanly")
+}
+
+// mountAgentReview mounts the review service's keys route when
+// AGENT_REVIEW_SERVICE_TOKEN is set. Without Vault it answers 503: the
+// ExternalId lives there.
+func mountAgentReview(r *gin.Engine) {
+	token := os.Getenv(services.AgentReviewServiceTokenEnv)
+	if token == "" {
+		return
+	}
+	var keys platform.AgentReviewKeyIssuer
+	if addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && tok != "" {
+		if vc, err := vault.NewClient(addr, tok); err == nil {
+			keys = services.NewAgentReviewKeys(services.NewAWSOnboardingService(config.DB, vc))
+		} else {
+			log.Printf("agent review keys: secrets store unavailable: %v", err)
+		}
+	} else {
+		log.Printf("agent review keys: VAULT_ADDR/VAULT_TOKEN not configured; the route answers 503")
+	}
+	platform.MountAgentReviewRoutes(r, token, keys)
 }
 
 // mountMetrics exposes the Prometheus handler without making it public: on

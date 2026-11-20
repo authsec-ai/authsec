@@ -335,7 +335,21 @@ const workloadIdentityMerge = `CASE WHEN (EXCLUDED.attrs->>'detail_incomplete'):
 //
 // Both "previous list" arms are jsonb_strip_nulls: with no earlier list
 // there is nothing to keep, and this run's (partial, flagged) list stands.
-const workloadAttrsMerge = `CASE
+//
+// In every case the previous agent_review is carried over (workloadKeepReview):
+// it is not a scan fact but the AWS agent review handoff, which AuthSec sets
+// to pending and the agent review service claims and decides
+// (authsec-aws-agent-discovery). A complete read must not erase pending work
+// or a verdict.
+const workloadAttrsMerge = `(` + workloadScanAttrs + `) || ` + workloadKeepReview
+
+// workloadKeepReview is the previous attrs.agent_review, or nothing.
+const workloadKeepReview = `CASE WHEN cloud_workload.attrs->'agent_review' IS NOT NULL
+	THEN jsonb_build_object('agent_review', cloud_workload.attrs->'agent_review')
+	ELSE '{}'::jsonb END`
+
+// workloadScanAttrs is what the scan itself decides about attrs (above).
+const workloadScanAttrs = `CASE
 	WHEN (EXCLUDED.attrs->>'detail_incomplete')::boolean IS TRUE
 		THEN ((cloud_workload.attrs - 'gateway_targets' - 'targets_incomplete') || EXCLUDED.attrs)
 			|| CASE WHEN (EXCLUDED.attrs->>'targets_incomplete')::boolean IS TRUE

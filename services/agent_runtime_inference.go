@@ -141,6 +141,12 @@ type AgentInferenceResult struct {
 	FindingsOpen        int
 	FindingsResolved    int
 	AgentsMirrored      int
+	// ReviewsQueued are workloads handed to the agent review service
+	// (agent_review_queue.go); RulesDecided and RulesQueued the rules
+	// engine's verdicts and its unclear workloads (agent_rules_engine.go).
+	ReviewsQueued int
+	RulesDecided  int
+	RulesQueued   int
 }
 
 // RunAgentInferenceAfterScan is the scan worker's hook: it runs inference for
@@ -157,9 +163,10 @@ func RunAgentInferenceAfterScan(ctx context.Context, db *gorm.DB, ws, connectorI
 		log.Printf("agent runtime inference: ws=%s connector=%s: %v", ws, connectorID, err)
 		return
 	}
-	log.Printf("agent runtime inference: ws=%s connector=%s: %d AI workloads (%d possible), %d new suggestions (%d pending), %d superseded, %d findings open, %d resolved, %d config hints open, %d resolved, %d agents mirrored",
+	log.Printf("agent runtime inference: ws=%s connector=%s: %d AI workloads (%d possible), %d new suggestions (%d pending), %d superseded, %d findings open, %d resolved, %d config hints open, %d resolved, %d agents mirrored, %d queued for agent review, %d decided by rules, %d unclear to rules",
 		ws, connectorID, res.AIWorkloads, res.PossibleAIWorkloads, res.SuggestionsNew, res.SuggestionsOpen, res.Superseded,
-		res.FindingsOpen, res.FindingsResolved, res.ConfigHintsOpen, res.ConfigHintsResolved, res.AgentsMirrored)
+		res.FindingsOpen, res.FindingsResolved, res.ConfigHintsOpen, res.ConfigHintsResolved, res.AgentsMirrored,
+		res.ReviewsQueued, res.RulesDecided, res.RulesQueued)
 }
 
 // RunAgentInference recomputes one connector's AI workloads, suggestions,
@@ -213,7 +220,13 @@ func (s *AgentRuntimeService) RunAgentInference(ctx context.Context, ws, connect
 		if err := s.applyFindings(tx, ws, connectorID, st, ais, secrets, now, &res); err != nil {
 			return fmt.Errorf("findings: %w", err)
 		}
-		n, err := mirrorAWSAgents(tx, ws, st.connectors[connectorID], now)
+		// The AI agent rules engine (agent_rules_engine.go): its own verdicts
+		// and sightings, never classification or suggestions.
+		ruleAgents, err := s.applyAgentRules(tx, ws, st.connectors[connectorID], ais, now, &res)
+		if err != nil {
+			return fmt.Errorf("agent rules: %w", err)
+		}
+		n, err := mirrorAWSAgents(tx, ws, st.connectors[connectorID], now, ruleAgents)
 		if err != nil {
 			return fmt.Errorf("agents mirror: %w", err)
 		}
@@ -1064,7 +1077,10 @@ func AWSAgentFingerprint(account, runtimeKind, nativeID string) string {
 // UpsertSighting, so the Agents page lists them (§5.3, Q5 build default). The
 // graph stays authoritative for classification; a sighting never moves a
 // row's status, owner or claim (UpsertSighting does not update them).
-func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time) (int, error) {
+//
+// keep are the rules engine's agents of this pass (applyAgentRules): rows it
+// reported are not retired while it still reports them.
+func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time, keep map[string]bool) (int, error) {
 	var wls []*arWorkload
 	if err := tx.Table("cloud_workload").
 		Select("id, connector_id, identity_id, runtime_kind, native_id, name, region, attrs").
@@ -1110,6 +1126,9 @@ func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time)
 		agents[fp] = true
 		n++
 	}
+	for fp := range keep {
+		agents[fp] = true
+	}
 	if err := retireAWSAgents(tx, repo, ws, conn, agents, present, now); err != nil {
 		return n, err
 	}
@@ -1127,10 +1146,18 @@ func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time)
 // was reclassified; one it no longer holds was deleted or aged out (cloud_workload
 // rows are removed only by a surface the scan read completely, so a partial
 // scan never retires anything here). Rows of other connectors are untouched.
+//
+// A row the agent review service reported (metadata.origin
+// AgentReviewSightingOrigin, through POST /authsec/discovery/sightings) is
+// its finding, not a classification: it is retired only when its workload
+// left the inventory, never for being unclassified.
 func retireAWSAgents(tx *gorm.DB, repo repositories.DiscoveryRepository, ws uuid.UUID, conn arConnector,
 	agents, present map[string]bool, now time.Time) error {
-	var rows []struct{ Fingerprint string }
-	if err := tx.Table("discovered_agents").Select("fingerprint").
+	var rows []struct {
+		Fingerprint string
+		Origin      string
+	}
+	if err := tx.Table("discovered_agents").Select("fingerprint, COALESCE(metadata->>'origin', '') AS origin").
 		Where("workspace_id = ? AND source = ? AND metadata->>'connector_id' = ? AND runtime_status <> ?",
 			ws, models.DiscoverySourceAWS, conn.ID.String(), models.RuntimeStatusGone).
 		Scan(&rows).Error; err != nil {
@@ -1138,6 +1165,9 @@ func retireAWSAgents(tx *gorm.DB, repo repositories.DiscoveryRepository, ws uuid
 	}
 	for _, r := range rows {
 		if agents[r.Fingerprint] {
+			continue
+		}
+		if r.Origin == AgentReviewSightingOrigin && present[r.Fingerprint] {
 			continue
 		}
 		reason := "its workload is no longer in the AWS inventory"

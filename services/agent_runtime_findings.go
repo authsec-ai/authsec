@@ -366,6 +366,12 @@ func (s *AgentRuntimeService) applyFindings(tx *gorm.DB, ws, connectorID uuid.UU
 		seen[d.Kind+"\x1f"+d.SubjectKey] = true
 	}
 	res.FindingsOpen = len(drafts)
+	// What inference cannot attribute goes to the agent review service.
+	queued, err := queueAgentReviews(tx, ws, connectorID, drafts, now)
+	if err != nil {
+		return err
+	}
+	res.ReviewsQueued = queued
 
 	var open []struct {
 		ID         uuid.UUID
