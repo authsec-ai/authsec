@@ -335,15 +335,25 @@ func TestAgentContainWorkloadLevelPerWorkspace(t *testing.T) {
 		t.Fatalf("steps %+v: the before-state (7) is recorded", v.Steps)
 	}
 
-	// Behavioural verification: past the grace with no late event -> verified.
+	// Behavioural verification: past the grace with no late event and
+	// CloudTrail evidence past the cutoff is still NOT verified -- silence is
+	// not proof, and the workload level attaches no policy a refusal could
+	// name, so it is recorded unverifiable for good.
 	l.clock = l.clock.Add(agentcontain.VerifyGrace + time.Minute)
-	// "None seen" needs CloudTrail evidence past the cutoff: the connector's
-	// event stream delivered an event after contained_at + grace.
 	p3exec(t, l.db, `INSERT INTO agent_event_stream (connector_id, workspace_id, secret_hash, secret_prefix, last_event_time)
 		VALUES (?, ?, ?, 'p3test', ?)`, a.g.conn, a.g.ws, strings.Repeat("a", 64), l.clock)
 	got = l.run(a.g.ws, c.ID)
-	if got.VerifiedAt == nil || got.Effective == nil || !*got.Effective {
-		t.Fatalf("verified_at %v effective %v", got.VerifiedAt, got.Effective)
+	if got.VerifiedAt != nil || got.Effective != nil {
+		t.Fatalf("silence verified a workload containment: verified_at %v effective %v", got.VerifiedAt, got.Effective)
+	}
+	var wv struct {
+		Unverifiable *struct {
+			Final bool `json:"final"`
+		} `json:"unverifiable"`
+	}
+	_ = json.Unmarshal(got.Verification, &wv)
+	if wv.Unverifiable == nil || !wv.Unverifiable.Final {
+		t.Fatalf("workload level is recorded unverifiable (final): %s", got.Verification)
 	}
 
 	if _, err := l.svc.Release(ctx, a.g.ws, a.g.author, c.ID, services.AgentContainReleaseRequest{Reason: "fixed"}); err != nil {
@@ -387,14 +397,56 @@ func TestAgentContainIdentityLevelDeferredRevocationAndVerification(t *testing.T
 		t.Fatalf("deny-all and the session revocation attached: %d, want 2", attached)
 	}
 
-	// A successful call by the identity after the grace: not effective.
-	ev := agentruntime.Event{EventID: "late-1", EventTime: got.ContainedAt.Add(10 * time.Minute), EventSource: "s3.amazonaws.com",
-		EventName: "GetObject", EventType: "AwsApiCall", SessionIssuerARN: a.roleARN, SessionIssuerPrincipalID: a.roleID}
+	// Silence is not proof: past the grace with CloudTrail evidence past the
+	// cutoff and no call by the identity, it stays undecided.
+	l.clock = l.clock.Add(agentcontain.VerifyGrace + time.Minute)
+	p3exec(t, l.db, `INSERT INTO agent_event_stream (connector_id, workspace_id, secret_hash, secret_prefix, last_event_time)
+		VALUES (?, ?, ?, 'p3test', ?)`, a.g.conn, a.g.ws, strings.Repeat("b", 64), l.clock)
+	got = l.run(a.g.ws, c.ID)
+	if got.VerifiedAt != nil || got.Effective != nil {
+		t.Fatalf("silence verified the containment: verified_at %v effective %v", got.VerifiedAt, got.Effective)
+	}
 	sink := services.NewAgentContainVerifySink(l.db)
-	if err := sink.Process(ctx, a.g.ws, a.g.conn, []agentruntime.Event{ev, ev}); err != nil {
+	policy := agentcontain.ContainPolicyName(a.roleID, c.ID)
+	refused := func(id, msg string) agentruntime.Event {
+		return agentruntime.Event{EventID: id, EventTime: got.ContainedAt.Add(8 * time.Minute), EventSource: "s3.amazonaws.com",
+			EventName: "GetObject", EventType: "AwsApiCall", SessionIssuerARN: a.roleARN, SessionIssuerPrincipalID: a.roleID,
+			ErrorCode: "AccessDenied", AuthorizationDenied: true, ErrorMessage: msg}
+	}
+	// A refusal that does not name the containment's policy proves nothing.
+	if err := sink.Process(ctx, a.g.ws, a.g.conn, []agentruntime.Event{refused("deny-other",
+		"... with an explicit deny in a service control policy")}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := l.svc.Get(ctx, a.g.ws, c.ID); v.VerifiedAt != nil || v.Effective != nil {
+		t.Fatalf("a refusal not naming the policy verified it: %v %v", v.VerifiedAt, v.Effective)
+	}
+	// A refusal naming the containment's policy verifies it, with the event.
+	if err := sink.Process(ctx, a.g.ws, a.g.conn, []agentruntime.Event{refused("deny-1",
+		"User: x is not authorized to perform: s3:GetObject with an explicit deny in an identity-based policy: arn:aws:iam::111111111111:policy/authsec/"+policy)}); err != nil {
 		t.Fatal(err)
 	}
 	v, _ := l.svc.Get(ctx, a.g.ws, c.ID)
+	var pv struct {
+		Evidence string `json:"evidence"`
+		Proof    *struct {
+			EventID string `json:"event_id"`
+			Policy  string `json:"policy"`
+		} `json:"proof"`
+	}
+	_ = json.Unmarshal(v.Verification, &pv)
+	if v.VerifiedAt == nil || v.Effective == nil || !*v.Effective || pv.Evidence != "refusal" || pv.Proof == nil ||
+		pv.Proof.EventID != "deny-1" || pv.Proof.Policy != policy {
+		t.Fatalf("proof by refusal: verified_at %v effective %v verification %s", v.VerifiedAt, v.Effective, v.Verification)
+	}
+
+	// A successful call by the identity after the grace: not effective.
+	ev := agentruntime.Event{EventID: "late-1", EventTime: got.ContainedAt.Add(10 * time.Minute), EventSource: "s3.amazonaws.com",
+		EventName: "GetObject", EventType: "AwsApiCall", SessionIssuerARN: a.roleARN, SessionIssuerPrincipalID: a.roleID}
+	if err := sink.Process(ctx, a.g.ws, a.g.conn, []agentruntime.Event{ev, ev}); err != nil {
+		t.Fatal(err)
+	}
+	v, _ = l.svc.Get(ctx, a.g.ws, c.ID)
 	if v.Effective == nil || *v.Effective || !strings.Contains(string(v.Verification), "late-1") {
 		t.Fatalf("effective %v verification %s", v.Effective, v.Verification)
 	}

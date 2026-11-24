@@ -640,20 +640,16 @@ func (j *containJob) check(ctx context.Context) error {
 	return PolicyJobRetryLater(containCheckEvery, "contained; read back every 15 minutes")
 }
 
-// verdict decides the behavioural verification once the grace has passed:
-// verified only on CloudTrail evidence that events after contained_at +
-// VerifyGrace were received for the connector (never on the timer alone);
-// unverifiable when no event can be attributed to the contained workloads
-// (final), or when no evidence arrived within VerifyGiveUp. The second kind
-// is re-checked on every run: a weekly scan's cursor or a stream event that
-// later passes the cutoff turns it into verified (the note is removed). The
-// event sink can still flip a verified containment to not effective.
+// verdict is the clock's part of the behavioural verification
+// (agentcontain.Pending). It never verifies: only the event sink does, on a
+// refused call naming the containment's policy (agentcontain.Proof). After
+// the grace a containment no refusal can prove (the workload level) is
+// recorded as unverifiable for good (final); any other containment without
+// proof waits, and after VerifyGiveUp is recorded as unverifiable, which a
+// proving refusal delivered later still turns into verified (the note is
+// removed). The event sink can flip any of them to not effective.
 func (j *containJob) verdict(ctx context.Context, now time.Time) error {
 	if j.row.VerifiedAt != nil || j.row.Effective != nil || j.row.ContainedAt == nil {
-		return nil
-	}
-	c := containedOf(*j.row)
-	if !now.After(c.CutOff()) {
 		return nil
 	}
 	var prev struct {
@@ -662,41 +658,31 @@ func (j *containJob) verdict(ctx context.Context, now time.Time) error {
 		} `json:"unverifiable"`
 	}
 	_ = json.Unmarshal(j.row.Verification, &prev)
-	noted := prev.Unverifiable != nil
-	if noted && prev.Unverifiable.Final {
+	if prev.Unverifiable != nil {
+		return nil // already recorded; a proof removes a non-final note
+	}
+	c := containedOf(*j.row)
+	decision, final, why := agentcontain.Pending(c, now)
+	if decision != agentcontain.PendingUnverifiable {
 		return nil
 	}
-	if bad, why := c.Unverifiable(); bad {
+	if final {
 		return j.markUnverifiable(ctx, now, why, true)
 	}
+	// Silence proves nothing; say which kind of silence it was.
 	var covered bool
-	var how string
 	if err := j.run.ReadTx(ctx, func(tx *gorm.DB) error {
 		var err error
-		covered, how, err = containEvidenceCovers(tx, j.ws, j.row.ConnectorID, c.CutOff())
+		covered, _, err = containEvidenceCovers(tx, j.ws, j.row.ConnectorID, c.CutOff())
 		return err
 	}); err != nil {
 		return err
 	}
-	if !covered {
-		if noted || now.Before(c.ContainedAt.Add(agentcontain.VerifyGiveUp)) {
-			return nil // keep waiting for CloudTrail evidence
-		}
-		return j.markUnverifiable(ctx, now, "No CloudTrail events were received for this account after the containment (neither the event stream nor every region's CloudTrail read reached it), so no call by the identity could have been seen. It is checked again whenever new events arrive.", false)
+	why = "No CloudTrail events were received for this account after the containment (neither the event stream nor every region's CloudTrail read reached it), so no call by the identity could have been seen. It is checked again whenever new events arrive."
+	if covered {
+		why = "CloudTrail events after the containment were received, but none was a call by the identity that AWS refused naming the containment's policy: the identity may simply be idle, so nothing proves the containment works. A refused call seen later still verifies it; a successful one marks it not effective."
 	}
-	return j.run.InTx(ctx, func(tx *gorm.DB) error {
-		raw, _ := json.Marshal(map[string]any{"evidence": how})
-		res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state IN ? AND effective IS NULL", j.ws, j.row.ID,
-			[]string{agentcontain.StateContained, agentcontain.StatePartial}).
-			Updates(map[string]any{"verified_at": now, "effective": true, "updated_at": now,
-				"verification": gorm.Expr("(verification - 'unverifiable') || ?::jsonb", string(raw))})
-		if res.Error != nil || res.RowsAffected == 0 {
-			return res.Error
-		}
-		return j.event(tx, j.ws, GovEventContainmentVerified, map[string]any{"grace_seconds": int(agentcontain.VerifyGrace.Seconds()),
-			"evidence": how,
-			"note":     "CloudTrail events newer than the grace period were received and none was a successful call by the identity; a later-delivered event can still mark it not effective."})
-	})
+	return j.markUnverifiable(ctx, now, why, false)
 }
 
 func (j *containJob) markUnverifiable(ctx context.Context, now time.Time, why string, final bool) error {
