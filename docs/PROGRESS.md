@@ -4,6 +4,15 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-24 — W0: fixes the SecOps-flows review says contradict the flows (branch `fix/w0-combined`)
+
+- The review "Backend upgrade for the SecOps flows" (written against `161b0745`, which is not in this repo; `9840e246` is the migration-161 commit) was re-verified at `48ee78f5`. Its §3 citations hold apart from moved lines and a few wrong paths (gateway is `internal/agentgateway/gateway/`; provider-usage retention is `services/model_provider.go:54`, not migration 154; IaC closed-PR handling is `services/iga_gov_iac_delivery.go:1019-1027`). Corrections: F6 is audited (new value only); F8's acknowledge does record the actor; "no rotation writer" holds only for cloud keys. PR #109 (Agent Kit) closes none of the gaps (AS-181).
+- Fixed, one branch each, merged here: AS-172 release never reactivates a key (`0d0e073c`); AS-175 verification only by a refusal naming the containment's policy (`99e0d734`); AS-173 Agent Action Guard decisions by the principal or a `governance:approve` holder, user sessions only (`b38cc695`); AS-176 containment drift re-applied with a 3-per-hour loop breaker (`16242aa0`).
+- Tests: unit tests per fix; `TestAgentContain*` (8) and `TestP3T320EventVocabularyMatchesWriters` pass on the merged branch against a scratch pg16 loaded from `001_bootstrap.sql`; `Test_AgentAction_*` integration (TwoTenants). Ratchet 69 (baseline 72). `go test ./services/` has the 7 pre-existing cgo/sqlite failures (`TestCreateResourceServer_*`, `TestValidateResourceServer*`) on this Windows build.
+- Open from the review: AS-174 (gateway fail-open, P0), AS-177 (audit purge/chain), AS-178, AS-179, AS-180, AS-181. Lab check needed for AS-175: whether CloudTrail errorMessage names the policy ARN for every service.
+
+---
+
 ## 2026-11-18 — Machines are connections (branch `feat/agent-kit-control-plane`)
 
 - `GET /authsec/discovery/connections` lists each machine (discovery source `vm_sensor`, an authsec-cli daemon) as provider `machine`: connected while it reports (the cluster agent's heartbeat rule), its last report as the scan, its agent count as the scope, no graph, remove only. Unit test of the mapping; the cross-workspace connections test now seeds a machine per workspace (A sees its own, never B's).
