@@ -25,8 +25,11 @@ import (
 //	               partially_contained | failed
 //	contained / partially_contained
 //	            -> behavioural verdict after the grace (verified_at), and a
-//	               read-back of every applied step every 15 minutes (drift is
-//	               reported, never re-applied: R2-18)
+//	               read-back of every applied step every 15 minutes; a
+//	               change undone outside AuthSec is re-applied through the
+//	               same engine step (as access policies re-apply a detached
+//	               policy), paused after containReapplyLimit re-applications
+//	               within containReapplyWindow
 //	releasing   -> restores every step, newest first, to its recorded
 //	               before-state (the session revocation at its time, P3-3)
 //	               -> released
@@ -595,6 +598,7 @@ func (j *containJob) check(ctx context.Context) error {
 		return err
 	}
 	var drift []map[string]any
+	var drifted []AgentContainmentStep
 	for _, s := range steps {
 		if s.State != agentcontain.StepApplied {
 			continue
@@ -615,29 +619,216 @@ func (j *containJob) check(ctx context.Context) error {
 		}
 		if !in {
 			drift = append(drift, map[string]any{"kind": s.Kind, "target": s.Target, "read": detail})
+			drifted = append(drifted, s)
 		}
 	}
-	prev := map[string]json.RawMessage{}
-	_ = json.Unmarshal(j.row.Verification, &prev)
-	raw, _ := json.Marshal(map[string]any{"drift": drift, "read_back_at": now})
-	if drift == nil {
-		raw, _ = json.Marshal(map[string]any{"drift": []any{}, "read_back_at": now})
+	if len(drift) > 0 {
+		return j.reapply(ctx, eng, drifted, drift, now)
 	}
+	raw, _ := json.Marshal(map[string]any{"drift": []any{}, "read_back_at": now})
 	err = j.run.InTx(ctx, func(tx *gorm.DB) error {
-		if err := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ?", j.ws, j.row.ID).
-			Updates(map[string]any{"verification": gorm.Expr("verification || ?::jsonb", string(raw)), "updated_at": now}).Error; err != nil {
-			return err
-		}
-		if len(drift) > 0 && string(prev["drift"]) != containJSON(drift) {
-			return j.event(tx, j.ws, GovEventContainmentDrifted, map[string]any{"drift": drift,
-				"note": "AuthSec does not re-apply a change undone outside AuthSec; release and contain again."})
-		}
-		return nil
+		return tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ?", j.ws, j.row.ID).
+			Updates(map[string]any{"verification": gorm.Expr("verification || ?::jsonb", string(raw)), "updated_at": now}).Error
 	})
 	if err != nil {
 		return err
 	}
 	return PolicyJobRetryLater(containCheckEvery, "contained; read back every 15 minutes")
+}
+
+// The re-apply loop breaker: something that keeps undoing a containment (an
+// automation reverting IAM, a pipeline resetting concurrency) would be fought
+// every 15 minutes for ever. Once a containment was re-applied
+// containReapplyLimit times within containReapplyWindow, AuthSec stops
+// re-applying, says so once (containment.reapply_paused) and leaves it to a
+// human; it re-applies again when the window no longer holds that many.
+const (
+	containReapplyLimit  = 3
+	containReapplyWindow = time.Hour
+)
+
+// containReapplyHistory is what the containment's own events say about its
+// recent re-applications.
+type containReapplyHistory struct {
+	// Recent counts the re-applications within the window before now.
+	Recent int
+	// Paused: a reapply_paused event is newer than the last re-application
+	// (the pause was already reported).
+	Paused bool
+}
+
+// loadContainReapplyHistory reads the containment's latest reapplied and
+// reapply_paused events (append-only iga_gov_event rows; the time is the
+// job clock's reapplied_at in the payload, so the window follows the same
+// clock that wrote it).
+func loadContainReapplyHistory(tx *gorm.DB, ws, id uuid.UUID, now time.Time) (containReapplyHistory, error) {
+	var h containReapplyHistory
+	var rows []models.IGAGovEvent
+	if err := tx.Where("workspace_id = ? AND event IN ? AND payload->>'containment_id' = ?", ws,
+		[]string{GovEventContainmentReapplied, GovEventContainmentReapplyPaused}, id.String()).
+		Order("id DESC").Limit(2*containReapplyLimit + 2).Find(&rows).Error; err != nil {
+		return h, err
+	}
+	since := now.Add(-containReapplyWindow)
+	for i, r := range rows {
+		if r.Event == GovEventContainmentReapplyPaused {
+			if i == 0 {
+				h.Paused = true
+			}
+			continue
+		}
+		var p struct {
+			At time.Time `json:"reapplied_at"`
+		}
+		if json.Unmarshal(r.Payload, &p) == nil && p.At.After(since) && !p.At.After(now) {
+			h.Recent++
+		}
+	}
+	return h, nil
+}
+
+// reapply puts back the applied steps whose change was undone outside
+// AuthSec while the containment is live (contained or partially
+// contained), through the engine's Apply -- the same idempotent call that
+// applied them (a reactivated access key is deactivated again, a detached or
+// deleted deny policy is attached or recreated). The recorded before-state is
+// never re-read: release still restores what was there before AuthSec.
+// A drifted event first, then the re-apply; done -> a reapplied event.
+// A step AWS refuses (the target is gone, the policy's document was edited
+// outside AuthSec) stays drifted and is reported once as a step failure.
+func (j *containJob) reapply(ctx context.Context, eng *agentcontain.Engine, drifted []AgentContainmentStep, drift []map[string]any, now time.Time) error {
+	prev := map[string]json.RawMessage{}
+	_ = json.Unmarshal(j.row.Verification, &prev)
+	var hist containReapplyHistory
+	if err := j.run.ReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		hist, err = loadContainReapplyHistory(tx, j.ws, j.row.ID, now)
+		return err
+	}); err != nil {
+		return err
+	}
+	paused := hist.Recent >= containReapplyLimit
+	pauseWhy := fmt.Sprintf("re-application paused: AuthSec re-applied this containment %d times in the last %s and something outside AuthSec keeps undoing it; a person needs to find what reverts it (it is re-applied again once the window allows)",
+		hist.Recent, containReapplyWindow)
+	note := "AuthSec re-applies the change."
+	if paused {
+		note = "AuthSec does not re-apply it now: " + pauseWhy + "."
+	}
+	raw, _ := json.Marshal(map[string]any{"drift": drift, "read_back_at": now})
+	err := j.run.InTx(ctx, func(tx *gorm.DB) error {
+		set := map[string]any{"verification": gorm.Expr("verification || ?::jsonb", string(raw)), "updated_at": now}
+		if paused {
+			set["state_reason"] = truncateReason(pauseWhy)
+		}
+		if err := j.liveUpdateTx(tx, set); err != nil {
+			return err
+		}
+		if !sameContainJSON(prev["drift"], drift) {
+			if err := j.event(tx, j.ws, GovEventContainmentDrifted, map[string]any{"drift": drift, "note": note}); err != nil {
+				return err
+			}
+		}
+		if paused && !hist.Paused {
+			return j.event(tx, j.ws, GovEventContainmentReapplyPaused, map[string]any{"drift": drift, "reapplied": hist.Recent,
+				"window_seconds": int(containReapplyWindow.Seconds()), "note": pauseWhy})
+		}
+		return nil
+	})
+	if err != nil {
+		return j.settled(err)
+	}
+	if paused {
+		return PolicyJobRetryLater(containCheckEvery, pauseWhy)
+	}
+
+	var done, refused, still []map[string]any
+	for i, s := range drifted {
+		// A release may have landed meanwhile: stop re-applying (the release
+		// restores every step, whatever this run put back).
+		var cur *AgentContainment
+		if err := j.run.ReadTx(ctx, func(tx *gorm.DB) error {
+			var err error
+			cur, err = loadContainment(tx, j.ws, j.row.ID, false)
+			return err
+		}); err != nil {
+			return err
+		}
+		if cur.State != agentcontain.StateContained && cur.State != agentcontain.StatePartial {
+			return PolicyJobRetryLater(time.Second, "the containment's state moved; reloading")
+		}
+		st := s.engineStep()
+		err := j.run.External(ctx, 0, func(ctx context.Context) error { return eng.Apply(ctx, &st) })
+		var se *agentcontain.StepError
+		switch {
+		case err != nil && isLeaseErr(err):
+			return err
+		case errors.As(err, &se):
+			refused = append(refused, map[string]any{"kind": s.Kind, "target": s.Target, "error": se.Error()})
+			still = append(still, drift[i])
+		case err != nil:
+			j.note(ctx, "re-applying "+s.Kind+" "+s.Target+": "+err.Error())
+			return PolicyJobRetryLater(containRetry, "re-applying "+s.Target+": "+err.Error())
+		default:
+			if err := j.stepUpdate(ctx, s.ID, map[string]any{"after": string(jsonOrEmpty(st.After))}, nil); err != nil {
+				return err
+			}
+			done = append(done, map[string]any{"kind": s.Kind, "target": s.Target, "was": drift[i]["read"],
+				"after": json.RawMessage(jsonOrEmpty(st.After))})
+		}
+	}
+	if still == nil {
+		still = []map[string]any{}
+	}
+	raw, _ = json.Marshal(map[string]any{"drift": still, "reapply_refused": refused, "read_back_at": now})
+	err = j.run.InTx(ctx, func(tx *gorm.DB) error {
+		if err := j.liveUpdateTx(tx, map[string]any{"verification": gorm.Expr("verification || ?::jsonb", string(raw)),
+			"state_reason": "", "updated_at": now}); err != nil {
+			return err
+		}
+		if len(refused) > 0 && !sameContainJSON(prev["reapply_refused"], refused) {
+			if err := j.event(tx, j.ws, GovEventContainmentStepFailed, map[string]any{"during": "reapply", "refused": refused,
+				"note": "AWS refused re-applying these changes; they stay undone. Release and contain again."}); err != nil {
+				return err
+			}
+		}
+		if len(done) == 0 {
+			return nil
+		}
+		return j.event(tx, j.ws, GovEventContainmentReapplied, map[string]any{"steps": done, "reapplied_at": now,
+			"reapplied_in_window": hist.Recent + 1, "window_seconds": int(containReapplyWindow.Seconds())})
+	})
+	if err != nil {
+		return j.settled(err)
+	}
+	return PolicyJobRetryLater(containCheckEvery, "contained; drift re-applied; read back every 15 minutes")
+}
+
+// liveUpdateTx updates the containment while it is still live (contained or
+// partially contained); errStateMoved when a release moved it.
+func (j *containJob) liveUpdateTx(tx *gorm.DB, set map[string]any) error {
+	res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state IN ?", j.ws, j.row.ID,
+		[]string{agentcontain.StateContained, agentcontain.StatePartial}).Updates(set)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected != 1 {
+		return errStateMoved
+	}
+	return nil
+}
+
+// sameContainJSON compares a stored jsonb value with v after decoding both
+// (Postgres rewrites jsonb spacing and key order, so the stored text never
+// equals Go's encoding byte for byte).
+func sameContainJSON(stored json.RawMessage, v any) bool {
+	var a, b any
+	if json.Unmarshal(stored, &a) != nil {
+		return false
+	}
+	if json.Unmarshal([]byte(containJSON(v)), &b) != nil {
+		return false
+	}
+	return containJSON(a) == containJSON(b)
 }
 
 // verdict decides the behavioural verification once the grace has passed:

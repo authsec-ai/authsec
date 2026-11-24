@@ -117,6 +117,8 @@ const (
 	GovEventContainmentStepRestored    = "containment.step_restored"
 	GovEventContainmentReleased        = "containment.released"
 	GovEventContainmentRevocationEnded = "containment.revocation_removed"
+	GovEventContainmentReapplied       = "containment.reapplied"
+	GovEventContainmentReapplyPaused   = "containment.reapply_paused"
 )
 
 // GovCatAgentContainment is the Logs category of containment events.
@@ -141,6 +143,8 @@ func init() {
 		GovEventKind{GovEventContainmentUnverifiable, GovCatAgentContainment, GovObjContainment, "The containment's effect cannot be confirmed from CloudTrail (no events received since it, or its workloads cannot be told apart); it is neither verified nor not effective."},
 		GovEventKind{GovEventContainmentNotEffective, GovCatAgentContainment, GovObjContainment, "A successful call by the contained identity after the grace period: the containment is not effective (events attached)."},
 		GovEventKind{GovEventContainmentDrifted, GovCatAgentContainment, GovObjContainment, "A containment change was undone outside AuthSec (read back while contained)."},
+		GovEventKind{GovEventContainmentReapplied, GovCatAgentContainment, GovObjContainment, "A containment change undone outside AuthSec was re-applied (read back while contained)."},
+		GovEventKind{GovEventContainmentReapplyPaused, GovCatAgentContainment, GovObjContainment, "Re-applying a containment was paused: it was undone outside AuthSec again after repeated re-applications within an hour; a person needs to look."},
 		GovEventKind{GovEventContainmentReleaseReq, GovCatAgentContainment, GovObjContainment, "Release of a containment was requested (with a reason)."},
 		GovEventKind{GovEventContainmentStepRestored, GovCatAgentContainment, GovObjContainment, "One containment change was restored to its recorded before-state."},
 		GovEventKind{GovEventContainmentReleased, GovCatAgentContainment, GovObjContainment, "Every containment change was restored (a session revocation may stay until its time)."},
