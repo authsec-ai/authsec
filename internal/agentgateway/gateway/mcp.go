@@ -166,6 +166,11 @@ func (g *Gateway) decideToolCall(r *http.Request, s *MCPServer, subj agentgatewa
 	req := subj
 	req.Kind, req.Server, req.ServerURL, req.Tool = agentgateway.KindMCPTool, s.Name, s.URL, name
 	req.ArgsDigest, req.RequestID, req.GatewayVersion = digest, rid, Version
+	if g.pdp.StoppedBy(req) != nil {
+		// A stopped agent is refused before pinning, the cache and the PDP
+		// (Decide refuses it first and records the refusal).
+		return req, g.pdp.Decide(r.Context(), req), nil
+	}
 	if *s.PinTools {
 		state, pin := g.pins.Check(s.Name, name)
 		switch {
@@ -192,9 +197,18 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 			writeRPCError(w, http.StatusUnauthorized, nil, rpcInvalidRequest, "an AuthSec agent credential is required", nil)
 			return
 		}
+		probe := subj
+		probe.Kind = agentgateway.KindMCPTool
+		stopped := g.pdp.StoppedBy(probe) != nil
 		switch r.Method {
 		case http.MethodPost:
 		case http.MethodGet, http.MethodDelete:
+			if stopped {
+				// A stopped agent gets nothing from the server, not even a stream.
+				log.Printf("[agent-gateway] mcp stopped agent refused agent=%s server=%s method=%s", subj.SubjectID, s.Name, r.Method)
+				writeRPCError(w, http.StatusForbidden, nil, RPCPolicyDenied, "AuthSec stopped this agent", denyData(StoppedDecision()))
+				return
+			}
 			// Pre-2026-07-28 standalone streams and session termination:
 			// nothing to decide, passed through.
 			g.forwardMCP(w, r, s, nil, false)
@@ -243,6 +257,13 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 				}
 			}
 			if m.Method != "tools/call" {
+				if stopped {
+					// Every message of a stopped agent is refused (tools/list,
+					// resources/read, initialize ...): nothing is forwarded.
+					sd := StoppedDecision()
+					calls = append(calls, mcpCall{msg: m, deny: &sd})
+					denied = true
+				}
 				continue
 			}
 			if p.Name == "" {

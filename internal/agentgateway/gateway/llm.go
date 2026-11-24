@@ -80,6 +80,16 @@ func (g *Gateway) llmHandler(l *LLMUpstream) http.Handler {
 				"An AuthSec agent key is required (use it as the API key, or send X-AuthSec-Agent-Key).", nil)
 			return
 		}
+		probe := subj
+		probe.Kind = agentgateway.KindModel
+		if g.pdp.StoppedBy(probe) != nil && !(r.Method == http.MethodPost && ops[suffix] != "") {
+			// A stopped agent reaches nothing; a model call is refused (and
+			// recorded) by Decide below.
+			d := StoppedDecision()
+			llmError(w, l.Provider, http.StatusForbidden, "authsec_policy_denied",
+				"AuthSec stopped this agent ("+d.Reason+").", map[string]any{"authsec": denyData(d)})
+			return
+		}
 		if r.Method == http.MethodGet && suffix == "/v1/models" && family(l.Provider) == ProviderOpenAI {
 			// Listing models makes no model call.
 			g.forwardLLM(w, r, l, suffix, nil, nil, Decision{})
