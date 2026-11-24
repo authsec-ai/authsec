@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/sessiontoken"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // Token surfaces (AS-033). AuthMiddleware admits a session token only when its
@@ -61,3 +63,25 @@ func surfaceClasses(path string) []sessiontoken.Class {
 // userSessionClasses are the classes that name an interactive user: used
 // where a handler validates a user session outside AuthMiddleware.
 var userSessionClasses = []sessiontoken.Class{sessiontoken.Admin, sessiontoken.EndUser, sessiontoken.Legacy}
+
+// IsInteractiveUserSession reports whether the session token AuthMiddleware
+// verified for this request is an admin or end-user session (a person signed
+// in), not an SDK token, which is what an agent holds. A legacy (typ-less)
+// token is refused: it may have been signed with the SDK secret, so its class
+// cannot be known. Use it where only the human may act, such as deciding an
+// agent's action.
+func IsInteractiveUserSession(c *gin.Context) bool {
+	raw, ok := c.Get("claims")
+	if !ok {
+		return false
+	}
+	claims, ok := raw.(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+	switch sessiontoken.ClassOf(claims) {
+	case sessiontoken.Admin, sessiontoken.EndUser:
+		return true
+	}
+	return false
+}

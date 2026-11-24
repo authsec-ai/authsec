@@ -12,7 +12,7 @@ import (
 
 // RiskPolicy defines a rule for scoring agent actions
 type RiskPolicy struct {
-	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
 	// Rule matching
@@ -55,7 +55,7 @@ func (RiskPolicy) TableName() string {
 
 // AgentGuardSettings holds tenant-level defaults for risk thresholds
 type AgentGuardSettings struct {
-	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
 
 	AutoApproveBelow          int `json:"auto_approve_below" gorm:"default:30"`
@@ -90,9 +90,9 @@ type AgentActionRequest struct {
 	ActionReqID string    `json:"action_req_id" gorm:"uniqueIndex;size:255;not null"`
 
 	// Tenant + user context
-	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	UserEmail string    `json:"user_email" gorm:"size:255;not null"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
+	UserEmail   string    `json:"user_email" gorm:"size:255;not null"`
 
 	// Agent context (framework-agnostic)
 	AgentID        string `json:"agent_id" gorm:"size:255;not null;index"`
@@ -179,7 +179,7 @@ func (AgentActionDecision) TableName() string {
 // AgentActionAuditLog is an immutable record of agent actions and outcomes
 type AgentActionAuditLog struct {
 	ID              uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	WorkspaceID        uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID     uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ActionRequestID *uuid.UUID `json:"action_request_id,omitempty" gorm:"type:uuid"`
 
 	// Snapshot
@@ -301,10 +301,12 @@ type AgentActionStatusResponse struct {
 
 // AgentActionRespondRequest - Human approves/denies via mobile app or web
 type AgentActionRespondRequest struct {
-	ActionReqID       string `json:"action_req_id" binding:"required"`
-	Approved          bool   `json:"approved"`
-	Reason            string `json:"reason,omitempty"`
-	BiometricVerified bool   `json:"biometric_verified,omitempty"`
+	ActionReqID string `json:"action_req_id" binding:"required"`
+	Approved    bool   `json:"approved"`
+	Reason      string `json:"reason,omitempty"`
+	// BiometricVerified is accepted for compatibility and ignored: it is the
+	// client's own claim, so the decision is never recorded as verified.
+	BiometricVerified bool `json:"biometric_verified,omitempty"`
 }
 
 // AgentActionRespondResponse
