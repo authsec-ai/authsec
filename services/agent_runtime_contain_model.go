@@ -117,6 +117,9 @@ const (
 	GovEventContainmentStepRestored    = "containment.step_restored"
 	GovEventContainmentReleased        = "containment.released"
 	GovEventContainmentRevocationEnded = "containment.revocation_removed"
+	// A released access-key step: the key was left as it was (never
+	// reactivated, DECISION P3-4a) and a new key must be issued.
+	GovEventContainmentKeyRotation = "containment.access_key_rotation_required"
 )
 
 // GovCatAgentContainment is the Logs category of containment events.
@@ -145,6 +148,7 @@ func init() {
 		GovEventKind{GovEventContainmentStepRestored, GovCatAgentContainment, GovObjContainment, "One containment change was restored to its recorded before-state."},
 		GovEventKind{GovEventContainmentReleased, GovCatAgentContainment, GovObjContainment, "Every containment change was restored (a session revocation may stay until its time)."},
 		GovEventKind{GovEventContainmentRevocationEnded, GovCatAgentContainment, GovObjContainment, "The session revocation kept after release was removed at its time."},
+		GovEventKind{GovEventContainmentKeyRotation, GovCatAgentContainment, GovObjContainment, "Release left an access key the containment deactivated as it was (never reactivated: it may have leaked); issue a new key for the user and delete the old one."},
 	)
 	govEventObjectFilters[GovObjContainment] = struct{ column, payloadKey string }{payloadKey: "containment_id"}
 }

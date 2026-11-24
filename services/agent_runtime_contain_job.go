@@ -823,10 +823,20 @@ func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, s
 				// Keep why the step failed; the policy it may have left is gone.
 				note = truncateReason(s.Error + " (AuthSec policy cleaned up on release)")
 			}
-			if err := j.stepUpdate(ctx, s.ID, map[string]any{"state": agentcontain.StepRestored, "restored_at": now, "error": note},
+			set := map[string]any{"state": agentcontain.StepRestored, "restored_at": now, "error": note}
+			pl := map[string]any{"kind": s.Kind, "target": s.Target, "before": json.RawMessage(jsonOrEmpty(s.Before)), "note": note}
+			if s.Kind == agentcontain.StepAccessKey && !cleanup {
+				// Never reactivated (DECISION P3-4a): the step records the
+				// key as left and that a new key must be issued.
+				set["after"] = string(jsonOrEmpty(st.After))
+				pl["after"], pl["rotate_required"] = json.RawMessage(jsonOrEmpty(st.After)), agentcontain.KeyRotationRequired(st)
+				if agentcontain.KeyRotationRequired(st) {
+					name = GovEventContainmentKeyRotation
+				}
+			}
+			if err := j.stepUpdate(ctx, s.ID, set,
 				func(tx *gorm.DB) error {
-					return j.event(tx, j.ws, name, map[string]any{"kind": s.Kind, "target": s.Target,
-						"before": json.RawMessage(jsonOrEmpty(s.Before)), "note": note})
+					return j.event(tx, j.ws, name, pl)
 				}); err != nil {
 				return failed, err
 			}

@@ -396,9 +396,9 @@ func identityLevel(in PreviewInput, idRef []Refusal) LevelOption {
 			Message: "Sessions issued before the containment stay refused after release until 13 hours after the containment (R2 session revocation); new sessions work again at release."})
 	case IdentityUser:
 		o.Steps = append(o.Steps, PlannedStep{Kind: StepAccessKey, Target: in.Subject.Name,
-			Detail: "Set every Active access key of " + in.Subject.Name + " Inactive (recorded; release reactivates only those keys)."})
+			Detail: "Set every Active access key of " + in.Subject.Name + " Inactive (recorded; release does not reactivate them: issue new keys after release)."})
 		o.SideEffects = append(o.SideEffects, SideEffect{Code: EffectAccessKeysInactive,
-			Message: "Every Active access key of the user is deactivated: anything else using those keys stops too."})
+			Message: "Every Active access key of the user is deactivated and stays Inactive after release (a stopped key may have leaked): anything else using those keys stops too until it is given a new key."})
 	}
 	if len(in.Workloads) > 1 {
 		o.SideEffects = append(o.SideEffects, SideEffect{Code: EffectSharedRole, Message: fmt.Sprintf(

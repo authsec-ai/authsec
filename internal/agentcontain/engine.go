@@ -484,7 +484,8 @@ func (e *Engine) applyPolicy(ctx context.Context, st *Step) error {
 }
 
 // Restore puts the step's before-state back and reads it back. Steps that
-// changed nothing (skipped, failed) are restored trivially.
+// changed nothing (skipped, failed) are restored trivially. An access key is
+// the exception: it is never reactivated (leaveKey, DECISION P3-4a).
 func (e *Engine) Restore(ctx context.Context, st *Step) error {
 	if NeedsCleanup(*st) {
 		// A policy step that failed may have created (or attached) the
@@ -571,25 +572,76 @@ func (e *Engine) Restore(ctx context.Context, st *Step) error {
 	case StepIAMPolicy, StepSessionRevoke:
 		return e.restorePolicy(ctx, st)
 	case StepAccessKey:
+		// DECISION P3-4a: stopping an access key cannot be undone. The key
+		// may be what leaked, so release never activates it: it is left as
+		// it is, and the step records that a new key must be issued.
 		var b KeyBefore
 		if err := json.Unmarshal(st.Before, &b); err != nil {
 			return err
 		}
-		if b.Status != "Active" {
-			return nil
-		}
-		err := e.AWS.SetAccessKeyStatus(ctx, b.UserName, st.Target, true)
-		if notFound(err) {
-			st.Error = "the access key no longer exists; nothing to restore"
-			return nil
-		}
-		if err != nil {
-			return e.writeErr("reactivate access key", st, err)
-		}
+		e.leaveKey(ctx, st, b.UserName)
 	default:
 		return fmt.Errorf("unknown step kind %q", st.Kind)
 	}
 	return nil
+}
+
+// KeyLeft is the after-state release records on an access-key step: the
+// key's status as read at release (Inactive, Active when changed outside
+// AuthSec, deleted, or unknown when it could not be read). RotateRequired
+// says a new key must be issued; it is false only when the key is gone.
+type KeyLeft struct {
+	UserName       string `json:"user_name"`
+	Status         string `json:"status"`
+	RotateRequired bool   `json:"rotate_required"`
+}
+
+// Key statuses KeyLeft records besides AWS's Active and Inactive.
+const (
+	KeyStatusDeleted = "deleted"
+	KeyStatusUnknown = "unknown"
+)
+
+// leaveKey records an access-key step's release without any AWS write: it
+// reads the key only to say what is there, and a failed read never holds
+// up the release (the key is not touched either way).
+func (e *Engine) leaveKey(ctx context.Context, st *Step, userName string) {
+	status := KeyStatusUnknown
+	keys, err := e.AWS.ListAccessKeys(ctx, userName)
+	switch {
+	case notFound(err):
+		status = KeyStatusDeleted
+	case err == nil:
+		status = KeyStatusDeleted
+		for _, k := range keys {
+			if k.ID == st.Target {
+				status = "Inactive"
+				if k.Active {
+					status = "Active"
+				}
+			}
+		}
+	}
+	left := KeyLeft{UserName: userName, Status: status, RotateRequired: status != KeyStatusDeleted}
+	st.After, _ = json.Marshal(left)
+	switch status {
+	case KeyStatusDeleted:
+		st.Error = "access key " + st.Target + " of " + userName + " no longer exists; release does not reactivate access keys, so issue a new key if " + userName + " still needs one"
+	case "Active":
+		st.Error = "access key " + st.Target + " of " + userName + " was reactivated outside AuthSec; it may have leaked: issue a new access key for " + userName + " and delete this one"
+	default:
+		st.Error = "access key " + st.Target + " of " + userName + " was left Inactive (release never reactivates a key containment stopped; it may have leaked): issue a new access key for " + userName + " and delete this one"
+	}
+}
+
+// KeyRotationRequired reports whether a released access-key step asks for
+// a new key (its After is a KeyLeft with RotateRequired).
+func KeyRotationRequired(st Step) bool {
+	if st.Kind != StepAccessKey || len(st.After) == 0 {
+		return false
+	}
+	var l KeyLeft
+	return json.Unmarshal(st.After, &l) == nil && l.RotateRequired
 }
 
 // NeedsCleanup reports a failed IAM policy step: its AuthSecContain-* (or
