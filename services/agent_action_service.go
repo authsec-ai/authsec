@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,6 +19,9 @@ type AgentActionService struct {
 	actionRepo  *database.AgentActionRepository
 	riskEngine  *RiskEngineService
 	pushService *PushNotificationService
+	// holdsPermission reports whether a user holds resource:action in a
+	// workspace now (WorkspaceUserHoldsPermission on config.DB).
+	holdsPermission func(ws, user uuid.UUID, resource, action string) (bool, error)
 }
 
 // NewAgentActionService creates a new agent action service
@@ -30,6 +34,12 @@ func NewAgentActionService(
 		actionRepo:  actionRepo,
 		riskEngine:  NewRiskEngineService(actionRepo),
 		pushService: pushService,
+		holdsPermission: func(ws, user uuid.UUID, resource, action string) (bool, error) {
+			if config.DB == nil {
+				return false, fmt.Errorf("database not initialized")
+			}
+			return WorkspaceUserHoldsPermission(config.DB, ws, user, resource, action)
+		},
 	}
 }
 
@@ -311,35 +321,73 @@ func (s *AgentActionService) PollActionStatus(workspaceID uuid.UUID, actionReqID
 	}
 }
 
+// Errors RespondToAction returns for a caller who may not decide.
+var (
+	// ErrAgentActionNotFound: no request of that id in the caller's
+	// workspace (another workspace's request is answered the same way).
+	ErrAgentActionNotFound = errors.New("agent action request not found")
+	// ErrAgentActionForbidden: the caller is neither the principal the
+	// action is on behalf of nor a holder of governance:approve.
+	ErrAgentActionForbidden = errors.New("not allowed to decide this agent action")
+)
+
+// agentActionApprovePermission is the permission that lets a workspace member
+// other than the principal decide an agent action. It is the platform's
+// approval permission (governance:approve), the one R3 runtime holds, Slack
+// and policy approvals already require; admin roles hold it (migration 055).
+const (
+	agentActionApproveResource = "governance"
+	agentActionApproveAction   = "approve"
+)
+
+// mayDecideAgentAction reports whether approver may approve or deny req.
+//
+// The Action Guard is push approval: the request is made with the human
+// principal's identity (the agent calls evaluate with that user's token), the
+// push goes to that user's registered device, and GetPendingActions shows it
+// to that user only. So the principal (req.UserID) is the legitimate approver
+// of their own agent's action, as with push MFA. Any other member must hold
+// governance:approve now (read from the database, not the token), which also
+// lets an admin supply the second vote of a multi-approval request.
+func mayDecideAgentAction(req *models.AgentActionRequest, approver uuid.UUID, holdsApprove func() (bool, error)) (bool, error) {
+	if approver == uuid.Nil {
+		return false, nil
+	}
+	if approver == req.UserID {
+		return true, nil
+	}
+	return holdsApprove()
+}
+
 // RespondToAction processes a human's approval or denial.
-// responderWorkspaceID is extracted from the caller's JWT and must match the
-// request's workspace — prevents a user in workspace A from approving a
-// request that belongs to workspace B.
+// responderWorkspaceID is the caller's token workspace: only a request of that
+// workspace is found (ErrAgentActionNotFound otherwise). The caller must be
+// the principal the action is on behalf of or hold governance:approve
+// (ErrAgentActionForbidden). The decision is never recorded as biometric
+// verified: the client's biometric_verified flag is its own assertion and the
+// server has no proof of it.
 func (s *AgentActionService) RespondToAction(
 	actionReqID string,
 	approverUserID uuid.UUID,
 	approverEmail string,
 	approved bool,
 	reason string,
-	biometricVerified bool,
 	responderWorkspaceID uuid.UUID,
 ) (*models.AgentActionRespondResponse, error) {
 
 	req, err := s.actionRepo.GetActionRequestByID(responderWorkspaceID, actionReqID)
-	if err != nil {
-		return &models.AgentActionRespondResponse{
-			Success: false,
-			Message: "Action request not found",
-		}, nil
+	if err != nil || req.WorkspaceID != responderWorkspaceID {
+		return nil, ErrAgentActionNotFound
 	}
 
-	// Caller-identity binding: the responder must belong to the same workspace
-	// as the challenged user.
-	if req.WorkspaceID != responderWorkspaceID {
-		return &models.AgentActionRespondResponse{
-			Success: false,
-			Message: "Unauthorized: workspace mismatch",
-		}, nil
+	allowed, err := mayDecideAgentAction(req, approverUserID, func() (bool, error) {
+		return s.holdsPermission(responderWorkspaceID, approverUserID, agentActionApproveResource, agentActionApproveAction)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check approver permission: %w", err)
+	}
+	if !allowed {
+		return nil, ErrAgentActionForbidden
 	}
 
 	if !req.IsPending() {
@@ -350,11 +398,13 @@ func (s *AgentActionService) RespondToAction(
 	}
 
 	decision := &models.AgentActionDecision{
-		ID:                uuid.New(),
-		ActionRequestID:   req.ID,
-		ApproverUserID:    approverUserID,
-		ApproverEmail:     approverEmail,
-		BiometricVerified: biometricVerified,
+		ID:              uuid.New(),
+		ActionRequestID: req.ID,
+		ApproverUserID:  approverUserID,
+		ApproverEmail:   approverEmail,
+		// Not verifiable server-side (local device biometrics): never
+		// recorded as verified on the client's word.
+		BiometricVerified: false,
 	}
 
 	if approved {
