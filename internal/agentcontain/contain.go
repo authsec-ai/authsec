@@ -38,7 +38,10 @@
 // DECISION P3-4: an IAM user has no sessions to revoke by issue time that the
 // deny-all does not already cover, so identity level on a user is the deny-all
 // policy attached to the user plus every Active access key set Inactive
-// (recorded; release reactivates only those keys). Attaching a policy to a
+// (recorded). DECISION P3-4a: release never reactivates a key: a stopped key
+// may be what leaked, so release leaves it as it is and records on the step
+// that a new key must be issued (KeyLeft.RotateRequired, event
+// containment.access_key_rotation_required). Attaching a policy to a
 // USER (iam:AttachUserPolicy) and changing keys are not in template v2: they
 // come with EnableWorkloadContainment, so containing an IAM user at any level
 // needs the parameter.
