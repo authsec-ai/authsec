@@ -78,6 +78,9 @@ type AgentContainRequest struct {
 	WorkloadIDs []string `json:"workload_ids"`
 	Level       string   `json:"level"`
 	Reason      string   `json:"reason"`
+	// CaseID is the case the stop is for: required from an automation
+	// identity (W5, CheckStopCase), checked when given. W2 stores it.
+	CaseID *uuid.UUID `json:"case_id,omitempty"`
 }
 
 // AgentContainReleaseRequest is POST /containments/:id/release.

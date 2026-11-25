@@ -79,7 +79,7 @@ func MountAgentRuntimeAlertRoutes(g *gin.RouterGroup, ctl *AgentRuntimeAlertsCon
 	write := middlewares.Require("governance", "enforce")
 	approve := middlewares.Require("governance", "approve")
 	decide := middlewares.RequireAny(authz.Need{Resource: "governance", Action: "approve"}, authz.Need{Resource: "governance", Action: "enforce"})
-	RegisterAgentRuntimeAlertRoutes(g.Group("/agent-runtime"), ctl, read, write, approve, decide)
+	RegisterAgentRuntimeAlertRoutes(g.Group("/agent-runtime", TierGuard()), ctl, read, write, approve, decide)
 }
 
 // RegisterAgentRuntimeAlertRoutes is the route table (one table, so tests

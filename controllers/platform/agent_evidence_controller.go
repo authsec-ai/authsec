@@ -80,7 +80,7 @@ func (ctl *AgentEvidenceController) WithCollectors(s *services.CollectorService)
 // /api/iga/v1 group) with their permissions.
 func MountAgentEvidenceRoutes(g *gin.RouterGroup, ctl *AgentEvidenceController) {
 	read := middlewares.RequireAny(authz.Need{Resource: "governance", Action: "read"}, authz.Need{Resource: "discovery", Action: "read"})
-	RegisterAgentEvidenceRoutes(g, ctl, read, middlewares.Require("governance", "enforce"),
+	RegisterAgentEvidenceRoutes(g.Group("", TierGuard()), ctl, read, middlewares.Require("governance", "enforce"),
 		middlewares.Require("governance", "approve"), middlewares.Require("discovery", "admin"))
 }
 

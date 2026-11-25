@@ -38,7 +38,7 @@ import (
 // Production calls it from routes.SetupIGARoutes.
 func MountAgentRuntimeContainRoutes(r gin.IRouter, ctl *IGAGovPolicyController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1/agent-runtime")
-	g.Use(GraphEnvelope(auth))
+	g.Use(GraphEnvelope(auth), TierGuard())
 	g.Use(ctl.Gate())
 	RegisterAgentRuntimeContainRoutes(g, ctl, GraphRequire(require))
 }
@@ -93,7 +93,16 @@ func (ctl *IGAGovPolicyController) CreateContainment(c *gin.Context) {
 		if err := bindBody(c, &req, "{identity_id, workload_ids?, level, reason}"); err != nil {
 			return nil, nil, err
 		}
+		// W5: an automation identity names the case of its stop; a case
+		// named must be an open case of this workspace.
+		if err := services.CheckStopCase(c.Request.Context(), ctl.db(), ws, req.CaseID); err != nil {
+			return nil, nil, err
+		}
 		if req.Level == agentcontain.LevelIdentity {
+			// A wider stop (every workload on the role, its sessions): tier 2.
+			if err := TierError(c, services.GovActionContainIdentity); err != nil {
+				return nil, nil, err
+			}
 			ok, err := ctl.contain().HoldsPermission(c.Request.Context(), ws, actor, "governance", "emergency")
 			if err != nil {
 				return nil, nil, err

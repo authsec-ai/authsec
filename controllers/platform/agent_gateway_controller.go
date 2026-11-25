@@ -65,7 +65,7 @@ func NewAgentGatewayController() *AgentGatewayController {
 // MountAgentGatewayRoutes mounts the routes on g (the authenticated
 // /api/iga/v1 group) with their permissions.
 func MountAgentGatewayRoutes(g *gin.RouterGroup, ctl *AgentGatewayController) {
-	RegisterAgentGatewayRoutes(g.Group("/agent-runtime"), ctl,
+	RegisterAgentGatewayRoutes(g.Group("/agent-runtime", TierGuard()), ctl,
 		middlewares.Require("governance", "read"), middlewares.Require("governance", "enforce"))
 }
 

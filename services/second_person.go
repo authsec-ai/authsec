@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
+
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // The second-person rule (SPEC-secops-backend-upgrade.md P3, decision 4),
@@ -51,6 +53,8 @@ const (
 	GovCodeAutomationTier       = "automation_tier_refused"
 	GovCodeCaseSubject          = "case_subject"
 	GovCodeBreakGlassNotAllowed = "break_glass_not_allowed"
+	GovCodeStopCaseRequired     = "case_required"
+	GovCodeStopCaseClosed       = "case_closed"
 )
 
 // GovCodeApproverNotAuthorized ("approver_not_authorized") is declared in
@@ -330,4 +334,41 @@ func uuidStrings(ids []uuid.UUID) []string {
 		out = append(out, id.String())
 	}
 	return out
+}
+
+/* ------------------------------------------------------------------------- */
+/*                         Stops by automation identities                     */
+/* ------------------------------------------------------------------------- */
+
+// CheckStopCase applies W5's rule to a stop (containment) request: an
+// automation identity must name the case the stop is for (400
+// case_required). A case named, by anyone, must be an open case of ws (404
+// otherwise, also for another workspace's case; 409 case_closed).
+func CheckStopCase(ctx context.Context, db *gorm.DB, ws uuid.UUID, caseID *uuid.UUID) error {
+	if caseID == nil || *caseID == uuid.Nil {
+		if IsGovAutomationActor(ctx) {
+			return govErr(http.StatusBadRequest, GovCodeStopCaseRequired,
+				"An automation identity must name the case a stop is for (case_id).", map[string]any{"field": "case_id"})
+		}
+		return nil
+	}
+	var states []string
+	if err := tenancy.InWorkspaceRead(ctx, db, ws, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT state FROM agent_case WHERE workspace_id = ? AND id = ?`, ws, *caseID).Scan(&states).Error
+	}); err != nil {
+		return err
+	}
+	if len(states) == 0 {
+		return GovNotFound()
+	}
+	if states[0] != "open" {
+		return govConflict(GovCodeStopCaseClosed, "The case is closed; reopen it or name an open case.", nil)
+	}
+	return nil
+}
+
+// NewGovError is a *GovError for handlers outside this package (the tier
+// guard).
+func NewGovError(status int, code, msg string, detail map[string]any) error {
+	return govErr(status, code, msg, detail)
 }

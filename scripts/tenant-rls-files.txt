@@ -162,3 +162,5 @@ services/agent_hygiene.go
 services/directory.go
 services/resource_classification.go
 services/responder_groups.go
+services/governance_approvals.go
+services/second_person.go

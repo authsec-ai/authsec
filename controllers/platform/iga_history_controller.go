@@ -60,8 +60,8 @@ func NewIGAHistoryControllerWith(db *gorm.DB) *IGAHistoryController {
 
 // MountIGAHistoryRoutes mounts the routes on g (the authenticated /api/iga/v1
 // group) with their permissions.
-func MountIGAHistoryRoutes(g gin.IRoutes, ctl *IGAHistoryController) {
-	RegisterIGAHistoryRoutes(g, ctl, middlewares.Require("governance", "read"),
+func MountIGAHistoryRoutes(g *gin.RouterGroup, ctl *IGAHistoryController) {
+	RegisterIGAHistoryRoutes(g.Group("", TierGuard()), ctl, middlewares.Require("governance", "read"),
 		middlewares.Require("governance", "author"), middlewares.Require("governance", "approve"))
 }
 
