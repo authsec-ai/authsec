@@ -180,12 +180,64 @@ func MatchModelEndpoint(name string) (ModelEndpoint, string, bool) {
 // ModelEndpointInsightsRegex is the whole list as one Logs Insights regular
 // expression over query_name: case-insensitive, anchored, the trailing dot
 // optional.
-func ModelEndpointInsightsRegex() string {
-	alts := make([]string, len(ModelEndpoints))
-	for i, e := range ModelEndpoints {
-		alts[i] = e.Pattern
+func ModelEndpointInsightsRegex() string { return hostsInsightsRegex(nil) }
+
+func hostsInsightsRegex(egress []string) string {
+	alts := make([]string, 0, len(ModelEndpoints)+len(egress))
+	for _, e := range ModelEndpoints {
+		alts = append(alts, e.Pattern)
+	}
+	for _, h := range egress {
+		if p := EgressHostPattern(h); p != "" {
+			alts = append(alts, p)
+		}
 	}
 	return `(?i)^(` + strings.Join(alts, "|") + `)\.?$`
+}
+
+// EgressHostPattern is a workspace egress host ("api.example.com", or
+// "*.example.com" for one or more labels before it) as a pattern in the
+// subset Go and Logs Insights share; "" when it is not a host.
+func EgressHostPattern(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	wild := strings.HasPrefix(h, "*.")
+	h = strings.TrimPrefix(h, "*.")
+	if NormalizeDNSName(h) != h || !strings.Contains(h, ".") {
+		return ""
+	}
+	q := strings.ReplaceAll(h, ".", `\.`)
+	if wild {
+		return dnsSubdomain + q
+	}
+	return q
+}
+
+// Host kinds of a kept lookup.
+const (
+	HostKindProvider = "provider"
+	HostKindEgress   = "egress"
+)
+
+// MatchHost reports whether a name is a model endpoint (kind provider, with
+// its entry) or one of the egress hosts (kind egress); the name normalised.
+func MatchHost(name string, egress []string) (kind string, ep ModelEndpoint, norm string, ok bool) {
+	if e, n, ok := MatchModelEndpoint(name); ok {
+		return HostKindProvider, e, n, true
+	}
+	n := NormalizeDNSName(name)
+	if n == "" {
+		return "", ModelEndpoint{}, "", false
+	}
+	for _, h := range egress {
+		p := EgressHostPattern(h)
+		if p == "" {
+			continue
+		}
+		if re, err := regexp.Compile(`^(` + p + `)$`); err == nil && re.MatchString(n) {
+			return HostKindEgress, ModelEndpoint{}, n, true
+		}
+	}
+	return "", ModelEndpoint{}, "", false
 }
 
 // Logs Insights result field names of ModelEndpointQuery.
@@ -197,6 +249,8 @@ const (
 	dnsFieldQueries   = "queries"
 	dnsFieldFirstSeen = "first_seen"
 	dnsFieldLastSeen  = "last_seen"
+	dnsFieldMinute    = "minute"
+	dnsFieldAnswer    = "answer"
 	// dnsNone stands in for an absent field: Logs Insights drops an event from
 	// a stats group when a by-field is missing, and a Lambda's or a Fargate
 	// task's lookups carry no srcids.instance -- exactly the ones that matter.
@@ -206,29 +260,37 @@ const (
 // ModelEndpointQuery is the Logs Insights query a DNS read runs: only lookups
 // of the model-endpoint list, aggregated per source and name. Nothing else in
 // the log group is returned.
-func ModelEndpointQuery() string { return modelEndpointQuery("") }
+func ModelEndpointQuery() string { return modelEndpointQuery("", nil) }
 
 // ModelEndpointQueryFor is ModelEndpointQuery restricted to the lines
 // CloudWatch Logs RECEIVED in w ([From, To) by @ingestionTime). Windows are
 // cut by ingestion time, not event time, so a line that arrives after a read
 // has passed its event time is still read, once, by the read whose window
 // holds its arrival (as long as it is no later than DNSLateArrival).
-func ModelEndpointQueryFor(w DNSWindow) string {
-	return modelEndpointQuery("\n| filter @ingestionTime >= " + strconv.FormatInt(w.From.UnixMilli(), 10) +
-		" and @ingestionTime < " + strconv.FormatInt(w.To.UnixMilli(), 10))
+func ModelEndpointQueryFor(w DNSWindow) string { return LookupQueryFor(w, nil) }
+
+// LookupQueryFor is the window's query over the model-endpoint list and the
+// workspace's egress hosts (W6): per minute (datefloor) and first answer,
+// so each kept lookup can be stored (agent_dns_lookup) and joined to flows.
+func LookupQueryFor(w DNSWindow, egress []string) string {
+	return modelEndpointQuery("\n| filter @ingestionTime >= "+strconv.FormatInt(w.From.UnixMilli(), 10)+
+		" and @ingestionTime < "+strconv.FormatInt(w.To.UnixMilli(), 10), egress)
 }
 
-func modelEndpointQuery(ingestFilter string) string {
+func modelEndpointQuery(ingestFilter string, egress []string) string {
 	return "fields @timestamp, query_name" +
 		", coalesce(srcaddr, \"" + dnsNone + "\") as " + dnsFieldSrcAddr +
 		", coalesce(srcids.instance, \"" + dnsNone + "\") as " + dnsFieldInstance +
 		", coalesce(vpc_id, \"" + dnsNone + "\") as " + dnsFieldVPC +
+		", coalesce(answers.0.Rdata, \"" + dnsNone + "\") as " + dnsFieldAnswer +
+		", datefloor(@timestamp, 1m) as " + dnsFieldMinute +
 		ingestFilter +
-		"\n| filter query_name like /" + ModelEndpointInsightsRegex() + "/" +
+		"\n| filter query_name like /" + hostsInsightsRegex(egress) + "/" +
 		"\n| stats count(*) as " + dnsFieldQueries +
 		", min(@timestamp) as " + dnsFieldFirstSeen +
 		", max(@timestamp) as " + dnsFieldLastSeen +
-		" by " + dnsFieldSrcAddr + ", " + dnsFieldInstance + ", " + dnsFieldVPC + ", " + dnsFieldQueryName +
+		" by " + dnsFieldMinute + ", " + dnsFieldSrcAddr + ", " + dnsFieldInstance + ", " + dnsFieldVPC + ", " +
+		dnsFieldQueryName + ", " + dnsFieldAnswer +
 		"\n| limit " + strconv.Itoa(DNSResultLimit)
 }
 
@@ -304,6 +366,15 @@ type DNSQueryLogReader struct {
 	logs     LogsInsightsAPI
 	sleep    func(context.Context, time.Duration) error
 	wait     time.Duration
+	// egress are the workspace's egress hosts whose lookups are also kept.
+	egress []string
+}
+
+// WithEgressHosts adds the workspace's egress hosts to what is read (W6):
+// their lookups become rows, never findings.
+func (r *DNSQueryLogReader) WithEgressHosts(hosts []string) *DNSQueryLogReader {
+	r.egress = append([]string(nil), hosts...)
+	return r
 }
 
 // NewDNSQueryLogReader builds a reader; either client may be nil.
@@ -466,11 +537,29 @@ type DNSLookupAggregate struct {
 	LastSeen  time.Time
 }
 
+// DNSMinuteLookup is one minute of one source's lookups of one kept host
+// (a model endpoint or an egress host) with its first answer.
+type DNSMinuteLookup struct {
+	Minute     time.Time
+	SrcAddr    string
+	InstanceID string
+	VPCID      string
+	Domain     string
+	// HostKind is provider or egress; Provider the endpoint's key ("" for egress).
+	HostKind string
+	Provider string
+	// Answer is the first answer when it is an address ("" otherwise).
+	Answer  string
+	Queries int64
+}
+
 // DNSQueryRead is one log group's read of one window.
 type DNSQueryRead struct {
 	LogGroup   string
 	Window     DNSWindow
 	Aggregates []DNSLookupAggregate
+	// Lookups are the per-minute rows (model endpoints and egress hosts).
+	Lookups []DNSMinuteLookup
 	// Dropped counts returned rows whose name was not on the list after all;
 	// they are discarded without being stored or named.
 	Dropped int
@@ -509,7 +598,7 @@ func (r *DNSQueryLogReader) ReadModelEndpointLookups(ctx context.Context, logGro
 		// its end; the query keeps only lines that ARRIVED in [From, To).
 		StartTime:   aws.Int64(w.From.Add(-DNSLateArrival).Unix()),
 		EndTime:     aws.Int64(w.To.Unix() - 1),
-		QueryString: aws.String(ModelEndpointQueryFor(w)),
+		QueryString: aws.String(LookupQueryFor(w, r.egress)),
 		Limit:       aws.Int32(DNSResultLimit),
 	})
 	if err != nil {
@@ -559,7 +648,7 @@ func (r *DNSQueryLogReader) ReadModelEndpointLookups(ctx context.Context, logGro
 	if len(rows) >= DNSResultLimit {
 		read.Truncated = true
 	}
-	read.Aggregates, read.Dropped = parseDNSRows(rows)
+	read.Aggregates, read.Lookups, read.Dropped = parseLookupRows(rows, r.egress)
 	read.Settled = true
 	return read, nil
 }
@@ -588,9 +677,55 @@ var (
 	vpcIDPattern      = regexp.MustCompile(`^vpc-[0-9a-f]{8,17}$`)
 )
 
-// parseDNSRows turns Logs Insights rows into aggregates, keeping only names
-// on the list (normalised, so case variants merge) and well-formed ids.
+// parseDNSRows turns Logs Insights rows into aggregates (model endpoints
+// only), keeping only names on the list and well-formed ids.
 func parseDNSRows(rows [][]cwltypes.ResultField) ([]DNSLookupAggregate, int) {
+	a, _, d := parseLookupRows(rows, nil)
+	return a, d
+}
+
+// parseLookupRows turns rows into the model-endpoint aggregates (findings,
+// as before) and the per-minute lookups of every kept host. A row whose
+// name is on neither list is dropped, never stored or named.
+func parseLookupRows(rows [][]cwltypes.ResultField, egress []string) ([]DNSLookupAggregate, []DNSMinuteLookup, int) {
+	var lookups []DNSMinuteLookup
+	var modelRows [][]cwltypes.ResultField
+	dropped := 0
+	for _, row := range rows {
+		f := map[string]string{}
+		for _, c := range row {
+			f[aws.ToString(c.Field)] = aws.ToString(c.Value)
+		}
+		kind, ep, domain, ok := MatchHost(f[dnsFieldQueryName], egress)
+		if !ok {
+			dropped++
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(f[dnsFieldQueries]), 10, 64)
+		if err != nil || n <= 0 {
+			dropped++
+			continue
+		}
+		if kind == HostKindProvider {
+			modelRows = append(modelRows, row)
+		}
+		minute, err := ParseInsightsTime(f[dnsFieldMinute])
+		if err != nil {
+			minute, err = ParseInsightsTime(f[dnsFieldFirstSeen])
+		}
+		if err != nil {
+			continue
+		}
+		lookups = append(lookups, DNSMinuteLookup{Minute: minute.UTC().Truncate(time.Minute),
+			SrcAddr: cleanIP(f[dnsFieldSrcAddr]), InstanceID: cleanID(f[dnsFieldInstance], instanceIDPattern),
+			VPCID: cleanID(f[dnsFieldVPC], vpcIDPattern), Domain: domain, HostKind: kind, Provider: ep.Provider,
+			Answer: cleanIP(f[dnsFieldAnswer]), Queries: n})
+	}
+	aggs, d := parseModelRows(modelRows)
+	return aggs, lookups, dropped + d
+}
+
+func parseModelRows(rows [][]cwltypes.ResultField) ([]DNSLookupAggregate, int) {
 	type key struct{ src, inst, vpc, domain string }
 	byKey := map[key]*DNSLookupAggregate{}
 	var order []key

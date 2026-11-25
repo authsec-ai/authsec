@@ -59,6 +59,7 @@ func MountAgentGatewayPDPRoutes(g gin.IRoutes, ctl *AgentGatewayPDPController) {
 	g.POST("/pdp/access/v1/evaluations", ctl.Evaluations)
 	g.POST("/pdp/v1/decisions", ctl.UploadDecisions)
 	g.GET("/pdp/v1/policy-hints", ctl.PolicyHints)
+	MountAgentGatewayW6PDPRoutes(g, ctl)
 }
 
 // TENANT-EXEMPT: not a statement here: the service resolves the workspace from the gateway credential and runs every statement under row-level security for it.
