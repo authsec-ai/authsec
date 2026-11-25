@@ -72,7 +72,6 @@ const (
 	GovCodeRuleChangePending      = "rule_change_pending"
 	GovCodeApproverNotAuthorized  = "approver_not_authorized"
 	GovCodeRuleVersionStale       = "rule_version_stale"
-	agentTier3BreakGlassReviewDue = 24 * time.Hour
 )
 
 // AgentDetectionRuleVersion is one agent_detection_rule_version row.
@@ -216,49 +215,9 @@ func agentRuleSnapshot(s AgentAlertSettings) map[string]any {
 /*                         Tier 3: second person, break-glass                 */
 /* ------------------------------------------------------------------------- */
 
-// agentTier3BreakGlass reports whether actor may apply a tier-3 change alone
-// (SecOps decision 4): actor is the workspace's only member holding
-// governance:approve, so no second person exists.
-func agentTier3BreakGlass(tx *gorm.DB, ws, actor uuid.UUID) (bool, error) {
-	holders, err := WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
-	if err != nil {
-		return false, err
-	}
-	return len(holders) == 1 && holders[0] == actor, nil
-}
-
-// agentTier3CheckApprover refuses an approval by the requester (403
-// self_approval) or by a member who does not hold governance:approve now
-// (403 approver_not_authorized; read from the database, not the token).
-func agentTier3CheckApprover(tx *gorm.DB, ws uuid.UUID, requester *uuid.UUID, approver uuid.UUID) error {
-	if requester != nil && *requester == approver {
-		return govErr(http.StatusForbidden, GovCodeSelfApproval, "A change cannot be approved by the person who requested it.", nil)
-	}
-	ok, err := WorkspaceUserHoldsPermission(tx, ws, approver, "governance", "approve")
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return govErr(http.StatusForbidden, GovCodeApproverNotAuthorized, "Approving needs governance:approve.", nil)
-	}
-	return nil
-}
-
-// agentTier3CheckRejecter allows the requester (withdrawing) or a holder of
-// governance:approve to reject.
-func agentTier3CheckRejecter(tx *gorm.DB, ws uuid.UUID, requester *uuid.UUID, actor uuid.UUID) error {
-	if requester != nil && *requester == actor {
-		return nil
-	}
-	ok, err := WorkspaceUserHoldsPermission(tx, ws, actor, "governance", "approve")
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return govErr(http.StatusForbidden, GovCodeApproverNotAuthorized, "Rejecting someone else's request needs governance:approve.", nil)
-	}
-	return nil
-}
+// The second-person rule itself (approver != requester, governance:approve
+// re-read from the database, break-glass only for the workspace's only
+// approver, review due in 24 h, no automation identity) is second_person.go's.
 
 /* ------------------------------------------------------------------------- */
 /*                                   Writes                                   */
@@ -329,7 +288,10 @@ func (s *AgentAlertService) ProposeSettings(ctx context.Context, ws, actor uuid.
 			out = &AgentAlertSettingsChange{Settings: settings, Changed: true, Applied: true, Loosening: []string{}, Version: v}
 			return err
 		}
-		breakGlass, err := agentTier3BreakGlass(tx, ws, actor)
+		if err := CheckTier3Requester(ctx); err != nil {
+			return err
+		}
+		breakGlass, err := BreakGlassAllowed(ctx, tx, ws, actor)
 		if err != nil {
 			return err
 		}
@@ -390,7 +352,7 @@ func insertAgentRuleVersion(tx *gorm.DB, ws uuid.UUID, base *int, next AgentAler
 		activated = &now
 	}
 	if breakGlass {
-		due := now.Add(agentTier3BreakGlassReviewDue)
+		due := ReviewDue(now)
 		reviewDue = &due
 	}
 	v, err := scanAgentRuleVersion(tx, `INSERT INTO agent_detection_rule_version (workspace_id, version_no, base_version_no, detections,
@@ -489,7 +451,7 @@ func (s *AgentAlertService) ApproveRuleVersion(ctx context.Context, ws, id, acto
 		if v.State != AgentRuleProposed {
 			return govErr(http.StatusConflict, "invalid_state", "Only a proposed version can be approved.", map[string]any{"state": v.State})
 		}
-		if err := agentTier3CheckApprover(tx, ws, v.ProposedBy, actor); err != nil {
+		if err := CheckApprover(ctx, tx, ws, uuidOrNil(v.ProposedBy), actor); err != nil {
 			return err
 		}
 		active, err := activeAgentRuleVersion(tx, ws, true)
@@ -559,7 +521,7 @@ func (s *AgentAlertService) RejectRuleVersion(ctx context.Context, ws, id, actor
 		if v.State != AgentRuleProposed {
 			return govErr(http.StatusConflict, "invalid_state", "Only a proposed version can be rejected.", map[string]any{"state": v.State})
 		}
-		if err := agentTier3CheckRejecter(tx, ws, v.ProposedBy, actor); err != nil {
+		if err := CheckRejecter(ctx, tx, ws, uuidOrNil(v.ProposedBy), actor); err != nil {
 			return err
 		}
 		now := s.now().UTC()
@@ -610,4 +572,12 @@ func (s *AgentAlertService) ListRuleVersions(ctx context.Context, ws uuid.UUID, 
 		rows = []AgentDetectionRuleVersion{}
 	}
 	return rows, nil
+}
+
+// uuidOrNil is *p, or uuid.Nil.
+func uuidOrNil(p *uuid.UUID) uuid.UUID {
+	if p == nil {
+		return uuid.Nil
+	}
+	return *p
 }

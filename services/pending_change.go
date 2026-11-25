@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +42,7 @@ const (
 // Pending change limits.
 const (
 	PendingChangeTTL         = 7 * 24 * time.Hour
-	PendingChangeReviewDue   = 24 * time.Hour
+	PendingChangeReviewDue   = SecondPersonReviewWindow
 	MaxPendingChangeReason   = 2000
 	GovCodeChangePending     = "change_pending"
 	GovCodeChangeNotPending  = "change_not_pending"
@@ -160,7 +159,7 @@ func insertChangeTx(tx *gorm.DB, ws uuid.UUID, kind, target string, payload any,
 		err = tx.Exec(`INSERT INTO pending_change (id, workspace_id, kind, target_ref, payload, reason, state, requested_by,
 			    requested_at, expires_at, applied_at, break_glass, review_due_at)
 			VALUES (?, ?, ?, ?, ?::jsonb, ?, 'applied', ?, ?, ?, ?, true, ?)`,
-			id, ws, kind, target, string(raw), reason, actor, now, now, now, now.Add(PendingChangeReviewDue)).Error
+			id, ws, kind, target, string(raw), reason, actor, now, now, now, ReviewDue(now)).Error
 	} else {
 		err = tx.Exec(`INSERT INTO pending_change (id, workspace_id, kind, target_ref, payload, reason, requested_by,
 			    requested_at, expires_at)
@@ -285,15 +284,8 @@ func (s *PendingChangeService) Approve(ctx context.Context, ws, id, approver uui
 		if before, err = readPendingChange(tx, ws, id, true); err != nil {
 			return err
 		}
-		holds, err := WorkspaceUserHoldsPermission(tx, ws, approver, "governance", "approve")
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, before.RequestedBy, approver); err != nil {
 			return err
-		}
-		if !holds {
-			return govErr(http.StatusForbidden, GovCodeApproverRequired, "Approving needs governance:approve.", nil)
-		}
-		if before.RequestedBy == approver {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "You requested this change; another approver must decide.", nil)
 		}
 		if expired, err = expireIfDue(tx, ws, before, now); err != nil || expired {
 			return err
@@ -341,12 +333,8 @@ func (s *PendingChangeService) Reject(ctx context.Context, ws, id, actor uuid.UU
 		if before, err = readPendingChange(tx, ws, id, true); err != nil {
 			return err
 		}
-		holds, err := WorkspaceUserHoldsPermission(tx, ws, actor, "governance", "approve")
-		if err != nil {
+		if err := CheckRejecter(ctx, tx, ws, before.RequestedBy, actor); err != nil {
 			return err
-		}
-		if !holds && before.RequestedBy != actor {
-			return govErr(http.StatusForbidden, GovCodeApproverRequired, "Rejecting needs governance:approve (or to be the requester).", nil)
 		}
 		if before.State != PendingChangePending {
 			return govConflict(GovCodeChangeNotPending, "Only a pending change can be rejected.", map[string]any{"state": before.State})

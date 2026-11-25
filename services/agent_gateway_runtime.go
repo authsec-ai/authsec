@@ -222,17 +222,6 @@ func (s *AgentGatewayService) UpdateGatewayRuntime(ctx context.Context, ws, id, 
 		if before, err = readAgentGateway(tx, ws, id); err != nil {
 			return err
 		}
-		approvers, err := WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
-		if err != nil {
-			return err
-		}
-		second := false
-		for _, a := range approvers {
-			if a != actor {
-				second = true
-				break
-			}
-		}
 		if before.RevokedAt != nil {
 			return govConflict("gateway_revoked", "A revoked gateway cannot be changed.", nil)
 		}
@@ -252,7 +241,18 @@ func (s *AgentGatewayService) UpdateGatewayRuntime(ctx context.Context, ws, id, 
 			return nil
 		}
 		payload := gatewayRuntimePayload{GatewayID: id, From: from, To: to}
-		if from.loosens(to) && second {
+		breakGlass := false
+		if from.loosens(to) {
+			// Tier 3 (second_person.go): a person requests it; it applies
+			// alone only when the actor is the workspace's only approver.
+			if err := CheckTier3Requester(ctx); err != nil {
+				return err
+			}
+			if breakGlass, err = BreakGlassAllowed(ctx, tx, ws, actor); err != nil {
+				return err
+			}
+		}
+		if from.loosens(to) && !breakGlass {
 			pc, err := insertPendingChangeTx(tx, ws, PendingChangeKindGatewayRuntime, "agent_gateway:"+id.String(),
 				payload, strings.TrimSpace(u.Reason), actor, now)
 			if err != nil {

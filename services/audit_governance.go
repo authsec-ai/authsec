@@ -78,7 +78,7 @@ const (
 	AuditChangeUnsuspend        = "operator_unsuspend"
 
 	auditChangeTTL      = 7 * 24 * time.Hour
-	auditBreakGlassDue  = 24 * time.Hour
+	auditBreakGlassDue  = SecondPersonReviewWindow
 	auditSystemActor    = "system"
 	auditRealmSystem    = "system"
 	auditRealmAdmin     = "admin"
@@ -278,7 +278,7 @@ func (s *AuditGovService) SetRetention(ctx context.Context, ws uuid.UUID, a Audi
 			return appendGovEvent(tx, ws, GovEventAuditRetentionChanged, models.GovActorUser, a.UserID.String(), govEventRefs{},
 				map[string]any{"record_class": class, "from_days": cur[class], "to_days": days})
 		}
-		ch, err := s.requestChange(tx, ws, a, AuditChangeRetentionShorten, class,
+		ch, err := s.requestChange(ctx, tx, ws, a, AuditChangeRetentionShorten, class,
 			map[string]any{"record_class": class, "from_days": cur[class], "to_days": days}, reason, breakGlass, uuid.Nil)
 		if err != nil {
 			return err
@@ -367,7 +367,7 @@ func (s *AuditGovService) RequestLegalHoldRelease(ctx context.Context, ws uuid.U
 		if n == 0 {
 			return GovNotFound()
 		}
-		ch, err := s.requestChange(tx, ws, a, AuditChangeHoldRelease, id.String(), map[string]any{"hold_id": id}, reason, breakGlass, uuid.Nil)
+		ch, err := s.requestChange(ctx, tx, ws, a, AuditChangeHoldRelease, id.String(), map[string]any{"hold_id": id}, reason, breakGlass, uuid.Nil)
 		if err != nil {
 			return err
 		}
@@ -412,38 +412,19 @@ const (
 	GovCodeNotBreakGlass         = "not_break_glass"
 )
 
-// otherApprovers lists the members of ws other than the excluded users who
-// hold governance:approve now (from the database, never a token).
-func otherApprovers(tx *gorm.DB, ws uuid.UUID, exclude ...uuid.UUID) ([]uuid.UUID, error) {
-	all, err := WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
-	if err != nil {
-		return nil, err
-	}
-	var out []uuid.UUID
-	for _, u := range all {
-		skip := false
-		for _, x := range exclude {
-			if u == x {
-				skip = true
-			}
-		}
-		if !skip {
-			out = append(out, u)
-		}
-	}
-	return out, nil
-}
-
 // requestChange records a tier-3 change: pending (a second person applies
 // it) or, with breakGlass and nobody else holding governance:approve,
 // applied now with a review due within 24 hours (DECISION 4). subject is a
 // user the change is about who cannot count as the second person (the
 // suspended operator), or uuid.Nil.
-func (s *AuditGovService) requestChange(tx *gorm.DB, ws uuid.UUID, a AuditActor, kind, target string, payload map[string]any,
+func (s *AuditGovService) requestChange(ctx context.Context, tx *gorm.DB, ws uuid.UUID, a AuditActor, kind, target string, payload map[string]any,
 	reason string, breakGlass bool, subject uuid.UUID) (*AuditChangeView, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" || len(reason) > 1000 {
 		return nil, GovBadParam("reason", "A tier-3 change needs a reason (at most 1000 characters).")
+	}
+	if err := CheckTier3Requester(ctx); err != nil {
+		return nil, err
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -460,16 +441,10 @@ func (s *AuditGovService) requestChange(tx *gorm.DB, ws uuid.UUID, a AuditActor,
 	}
 	var ch AuditChangeView
 	if breakGlass {
-		others, err := otherApprovers(tx, ws, a.UserID, subject)
-		if err != nil {
+		if err := BreakGlassRefusal(ctx, tx, ws, a.UserID, ExcludingUsers(subject)); err != nil {
 			return nil, err
 		}
-		if len(others) > 0 {
-			return nil, govConflict(GovCodeSecondPersonAvailable,
-				"Another member holds governance:approve: ask them to approve instead of applying alone.",
-				map[string]any{"approvers": len(others)})
-		}
-		due := now.Add(auditBreakGlassDue)
+		due := ReviewDue(now)
 		if err := tx.Raw(`INSERT INTO audit_governance_change (workspace_id, kind, target, payload, reason, status, requested_by,
 		                     requested_at, expires_at, decided_by, decided_at, break_glass, review_due_at)
 		                  VALUES (?, ?, ?, ?::jsonb, ?, 'applied', ?, ?, ?, ?, ?, true, ?) RETURNING `+auditChangeCols,
@@ -581,18 +556,8 @@ func (s *AuditGovService) decideChange(ctx context.Context, ws uuid.UUID, a Audi
 		if ch.Status != "pending" {
 			return govConflict(GovCodeChangeNotPending, "The change is "+ch.Status+".", map[string]any{"status": ch.Status})
 		}
-		if ch.RequestedBy == a.UserID {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "A tier-3 change needs a second person: the requester cannot decide it.", nil)
-		}
-		if ch.Kind == AuditChangeUnsuspend && ch.Target == a.UserID.String() {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "An operator cannot decide their own unsuspension.", nil)
-		}
-		ok, err := WorkspaceUserHoldsPermission(tx, ws, a.UserID, "governance", "approve")
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, ch.RequestedBy, a.UserID, auditChangeSubjects(ch)...); err != nil {
 			return err
-		}
-		if !ok {
-			return GovForbidden("governance:approve is required to decide a tier-3 change.")
 		}
 		now := s.now().UTC()
 		if apply && now.After(ch.ExpiresAt) {
@@ -654,15 +619,8 @@ func (s *AuditGovService) ReviewBreakGlass(ctx context.Context, ws uuid.UUID, a 
 		if !ch.BreakGlass || ch.ReviewedAt != nil {
 			return govConflict(GovCodeNotBreakGlass, "Only an unreviewed break-glass change can be reviewed.", nil)
 		}
-		if ch.RequestedBy == a.UserID {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "A break-glass change is reviewed by someone else.", nil)
-		}
-		ok, err := WorkspaceUserHoldsPermission(tx, ws, a.UserID, "governance", "approve")
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, ch.RequestedBy, a.UserID, auditChangeSubjects(ch)...); err != nil {
 			return err
-		}
-		if !ok {
-			return GovForbidden("governance:approve is required to review a break-glass change.")
 		}
 		now := s.now().UTC()
 		if err := tx.Exec(`UPDATE audit_governance_change SET reviewed_by = ?, reviewed_at = ? WHERE workspace_id = ? AND id = ?`,
@@ -697,4 +655,16 @@ func (j JSONText) MarshalJSON() ([]byte, error) {
 		return []byte("null"), nil
 	}
 	return []byte(j), nil
+}
+
+// auditChangeSubjects names the user a change is about (the operator an
+// unsuspension lifts): they never decide or review it.
+func auditChangeSubjects(ch *AuditChangeView) []SecondPersonOption {
+	if ch.Kind != AuditChangeUnsuspend {
+		return nil
+	}
+	if u, err := uuid.Parse(ch.Target); err == nil {
+		return []SecondPersonOption{ExcludingUsers(u)}
+	}
+	return nil
 }

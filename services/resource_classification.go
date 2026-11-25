@@ -181,7 +181,7 @@ func (s *ResourceClassificationService) Set(ctx context.Context, ws, id, actor u
 			}
 		}
 		if IsClassificationLowering(c, next) {
-			pc, err := createPendingChange(tx, ws, PendingClassificationLower, id, actor, reason, map[string]any{
+			pc, err := createPendingChange(ctx, tx, ws, PendingClassificationLower, id, actor, reason, map[string]any{
 				"sensitivity": next.Sensitivity, "crown_jewel": next.CrownJewel,
 				"data_category": next.DataCategory, "residency": next.Residency,
 				"previous": c,
@@ -190,7 +190,10 @@ func (s *ResourceClassificationService) Set(ctx context.Context, ws, id, actor u
 				return err
 			}
 			out.PendingChange = pc
-			return nil
+			if pc.BreakGlass {
+				out.Applied, err = loadResourceClassification(tx, ws, id, false)
+			}
+			return err
 		}
 		if err := writeResourceClassification(tx, ws, id, next, actor, uuid.Nil, reason); err != nil {
 			return err

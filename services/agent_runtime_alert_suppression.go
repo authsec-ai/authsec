@@ -346,7 +346,7 @@ func (s *AgentAlertService) RequestSuppression(ctx context.Context, ws, actor uu
 				"A suppression of this scope is in force: renew it instead.", map[string]any{"suppression_id": active[0]})
 		}
 		var err error
-		out, err = s.requestSuppressionTx(tx, ws, actor, req, nil, now)
+		out, err = s.requestSuppressionTx(ctx, tx, ws, actor, req, nil, now)
 		return err
 	})
 	return out, err
@@ -355,7 +355,10 @@ func (s *AgentAlertService) RequestSuppression(ctx context.Context, ws, actor uu
 // requestSuppressionTx writes a request (renewalOf: the suppression it
 // renews) and, when actor may apply it alone (break-glass), brings it into
 // force.
-func (s *AgentAlertService) requestSuppressionTx(tx *gorm.DB, ws, actor uuid.UUID, req AgentAlertSuppressionRequest, renewalOf *uuid.UUID, now time.Time) (*AgentAlertSuppressionResult, error) {
+func (s *AgentAlertService) requestSuppressionTx(ctx context.Context, tx *gorm.DB, ws, actor uuid.UUID, req AgentAlertSuppressionRequest, renewalOf *uuid.UUID, now time.Time) (*AgentAlertSuppressionResult, error) {
+	if err := CheckTier3Requester(ctx); err != nil {
+		return nil, err
+	}
 	var pending []uuid.UUID
 	if err := tx.Raw(`SELECT id FROM agent_alert_suppression WHERE workspace_id = ? AND identity_id = ? AND detection = ?
 	                     AND instance_digest = ? AND state = 'proposed'`, ws, req.IdentityID, req.Detection, req.InstanceDigest).
@@ -385,7 +388,7 @@ func (s *AgentAlertService) requestSuppressionTx(tx *gorm.DB, ws, actor uuid.UUI
 	if renewalOf != nil {
 		payload["renewal_of"] = *renewalOf
 	}
-	breakGlass, err := agentTier3BreakGlass(tx, ws, actor)
+	breakGlass, err := BreakGlassAllowed(ctx, tx, ws, actor)
 	if err != nil {
 		return nil, err
 	}
@@ -426,7 +429,7 @@ func activateAgentSuppression(tx *gorm.DB, ws uuid.UUID, sup *AgentAlertSuppress
 	ends := now.AddDate(0, 0, sup.DurationDays)
 	var reviewDue *time.Time
 	if breakGlass {
-		d := now.Add(agentTier3BreakGlassReviewDue)
+		d := ReviewDue(now)
 		reviewDue = &d
 	}
 	var approvedAt *time.Time
@@ -463,7 +466,9 @@ func (s *AgentAlertService) ApproveSuppression(ctx context.Context, ws, id, acto
 			return govErr(http.StatusConflict, "invalid_state", "Only a requested suppression can be approved.", map[string]any{"state": sup.State})
 		}
 		requester := sup.RequestedBy
-		if err := agentTier3CheckApprover(tx, ws, &requester, actor); err != nil {
+		// The suppression concerns every open case whose alerts name its
+		// identity: a subject of one of them never approves it.
+		if err := CheckApprover(ctx, tx, ws, requester, actor, ConcerningIdentities(sup.IdentityID)); err != nil {
 			return err
 		}
 		now := s.now().UTC()
@@ -505,7 +510,7 @@ func (s *AgentAlertService) RejectSuppression(ctx context.Context, ws, id, actor
 			return govErr(http.StatusConflict, "invalid_state", "Only a requested suppression can be rejected.", map[string]any{"state": sup.State})
 		}
 		requester := sup.RequestedBy
-		if err := agentTier3CheckRejecter(tx, ws, &requester, actor); err != nil {
+		if err := CheckRejecter(ctx, tx, ws, requester, actor); err != nil {
 			return err
 		}
 		now := s.now().UTC()
@@ -556,7 +561,7 @@ func (s *AgentAlertService) RenewSuppression(ctx context.Context, ws, id, actor 
 		req := AgentAlertSuppressionRequest{IdentityID: prev.IdentityID, Detection: prev.Detection, InstanceDigest: prev.InstanceDigest,
 			Reason: reason, Days: days}
 		prevID := prev.ID
-		out, err = s.requestSuppressionTx(tx, ws, actor, req, &prevID, now)
+		out, err = s.requestSuppressionTx(ctx, tx, ws, actor, req, &prevID, now)
 		return err
 	})
 	return out, err
