@@ -893,6 +893,7 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 		// Stored, never delivered to Slack or SIEM.
 		return id, nil
 	}
+	clusterNewAgentAlert(tx, ws, id, now) // agent_runtime_cases.go: the alert joins or opens a case
 	return id, enqueueAgentAlertDeliveries(tx, ws, id, st)
 }
 
