@@ -13994,3 +13994,528 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agentkit_policies');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 177: one agent id (agent, agent_alias, purpose, risk class, pending changes).
+-- Same objects as migrations/master/177_agent_identity.sql (the backfill has
+-- nothing to read on a fresh database and is left out).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    display_name    text        NOT NULL DEFAULT '',
+    -- Where the agent was first seen (cloud_workload, k8s_webhook, agentkit,
+    -- iga, ...). Descriptive only.
+    kind            text        NOT NULL DEFAULT 'unknown',
+    state           text        NOT NULL DEFAULT 'active',
+    ended_reason    text        NOT NULL DEFAULT '',
+    -- The person who ended it; NULL for deleted_at_source (a pass, no actor).
+    ended_by        uuid,
+    ended_at        timestamptz,
+    merged_into     uuid,
+    -- Transferred: to whom (a team, a business unit), as the decider wrote it.
+    transferred_to  text        NOT NULL DEFAULT '',
+    -- Decision 1 keeps a responder group per estate scope; these let a named
+    -- owner or sponsor replace the group later without a schema change.
+    owner_user_id   uuid,
+    sponsor_user_id uuid,
+    version         bigint      NOT NULL DEFAULT 1,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_merged_fkey FOREIGN KEY (workspace_id, merged_into)
+        REFERENCES public.agent (workspace_id, id),
+    CONSTRAINT agent_state_chk CHECK (state IN
+        ('active', 'retired', 'merged', 'transferred', 'deleted_at_source', 'not_an_agent')),
+    CONSTRAINT agent_merged_chk CHECK ((state = 'merged') = (merged_into IS NOT NULL)),
+    CONSTRAINT agent_merged_self_chk CHECK (merged_into IS NULL OR merged_into <> id),
+    CONSTRAINT agent_ended_chk CHECK ((state = 'active') = (ended_at IS NULL)),
+    CONSTRAINT agent_ended_reason_chk CHECK (state = 'active' OR ended_reason <> ''),
+    CONSTRAINT agent_transferred_chk CHECK (state <> 'transferred' OR transferred_to <> ''),
+    CONSTRAINT agent_kind_chk CHECK (kind <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ws_state ON public.agent (workspace_id, state, created_at DESC, id);
+
+CREATE TABLE IF NOT EXISTS public.agent_alias (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    agent_id     uuid        NOT NULL,
+    source_table text        NOT NULL,
+    -- text: Agent Kit recogniser ids and client ids are not uuids.
+    source_id    text        NOT NULL,
+    -- 'system' (projection, sweep), 'backfill' (this migration) or a user id.
+    linked_by    text        NOT NULL DEFAULT 'system',
+    linked_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_alias_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_alias_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_alias_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_alias_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_alias_source_key UNIQUE (workspace_id, source_table, source_id),
+    CONSTRAINT agent_alias_source_chk CHECK (source_table IN
+        ('iga_workload', 'discovered_agents', 'iga_agents', 'agentkit', 'resource_servers', 'mcp_oauth_clients')),
+    CONSTRAINT agent_alias_source_id_chk CHECK (source_id <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alias_agent ON public.agent_alias (workspace_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS public.agent_purpose_version (
+    id               uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL,
+    agent_id         uuid        NOT NULL,
+    version          integer     NOT NULL,
+    purpose          text        NOT NULL,
+    assessor_user_id uuid        NOT NULL,
+    assessed_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_purpose_version_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_purpose_version_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_purpose_version_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_purpose_version_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_purpose_version_key UNIQUE (workspace_id, agent_id, version),
+    CONSTRAINT agent_purpose_version_chk CHECK (version > 0),
+    CONSTRAINT agent_purpose_text_chk CHECK (length(purpose) BETWEEN 1 AND 2000)
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_risk_class (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    agent_id            uuid        NOT NULL,
+    version             integer     NOT NULL,
+    risk_class          text        NOT NULL,
+    -- What the class obliges ("human oversight", "logging"): a JSON array of
+    -- strings, as the assessor wrote them.
+    obligations         jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    reason              text        NOT NULL,
+    assessor_user_id    uuid        NOT NULL,
+    -- Set when the version lowered the class: the second person.
+    approved_by_user_id uuid,
+    pending_change_id   uuid,
+    assessed_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_risk_class_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_risk_class_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_risk_class_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_risk_class_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_risk_class_key UNIQUE (workspace_id, agent_id, version),
+    CONSTRAINT agent_risk_class_version_chk CHECK (version > 0),
+    CONSTRAINT agent_risk_class_chk CHECK (risk_class IN ('minimal', 'limited', 'high', 'prohibited')),
+    CONSTRAINT agent_risk_class_obligations_chk CHECK (jsonb_typeof(obligations) = 'array'),
+    CONSTRAINT agent_risk_class_reason_chk CHECK (reason <> ''),
+    CONSTRAINT agent_risk_class_second_person_chk CHECK
+        (approved_by_user_id IS NULL OR approved_by_user_id <> assessor_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_pending_change (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    kind            text        NOT NULL,
+    subject_id      uuid        NOT NULL,
+    -- The change as requested (the new class and obligations, or the new
+    -- classification); applied verbatim by the approver.
+    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    reason          text        NOT NULL,
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    state           text        NOT NULL DEFAULT 'pending',
+    decided_by      uuid,
+    decided_at      timestamptz,
+    decision_reason text        NOT NULL DEFAULT '',
+    CONSTRAINT agent_pending_change_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_pending_change_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_pending_change_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_pending_change_kind_chk CHECK (kind IN
+        ('agent_risk_class_lower', 'resource_classification_lower')),
+    CONSTRAINT agent_pending_change_state_chk CHECK (state IN ('pending', 'applied', 'rejected', 'withdrawn')),
+    CONSTRAINT agent_pending_change_reason_chk CHECK (reason <> ''),
+    CONSTRAINT agent_pending_change_decided_chk CHECK ((state = 'pending') = (decided_at IS NULL)),
+    -- Separation (decision 4): the requester never applies or rejects their own
+    -- change; withdrawing it is theirs.
+    CONSTRAINT agent_pending_change_second_person_chk CHECK
+        (state NOT IN ('applied', 'rejected') OR decided_by <> requested_by),
+    CONSTRAINT agent_pending_change_withdraw_chk CHECK
+        (state <> 'withdrawn' OR decided_by = requested_by)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_pending_change_list
+    ON public.agent_pending_change (workspace_id, state, requested_at DESC, id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_pending_change_open
+    ON public.agent_pending_change (workspace_id, kind, subject_id) WHERE state = 'pending';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent');
+        PERFORM public.tenancy_enable_rls('public.agent_alias');
+        PERFORM public.tenancy_enable_rls('public.agent_purpose_version');
+        PERFORM public.tenancy_enable_rls('public.agent_risk_class');
+        PERFORM public.tenancy_enable_rls('public.agent_pending_change');
+    END IF;
+END $$;
+
+-- agent_identity_link links the workspace's unlinked source rows (all of them,
+-- or one: p_table/p_id) and returns how many aliases it wrote. SECURITY
+-- INVOKER: under the request's row-level security it sees only p_ws's rows.
+CREATE OR REPLACE FUNCTION public.agent_identity_link(p_ws uuid, p_table text DEFAULT NULL, p_id text DEFAULT NULL)
+RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE
+    n   integer := 0;
+    r   record;
+    aid uuid;
+BEGIN
+    IF p_ws IS NULL THEN
+        RAISE EXCEPTION 'agent_identity_link: workspace is required';
+    END IF;
+
+    -- 1. Workloads the graph calls an agent.
+    IF p_table IS NULL OR p_table = 'iga_workload' THEN
+        FOR r IN
+            SELECT w.id::text AS sid, w.display_name, w.provider
+              FROM public.iga_workload w
+             WHERE w.workspace_id = p_ws
+               AND w.classification IN ('provider_native_agent', 'classified_agent')
+               AND (p_id IS NULL OR w.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'iga_workload' AND a.source_id = w.id::text)
+             ORDER BY w.created_at, w.id
+        LOOP
+            INSERT INTO public.agent (workspace_id, display_name, kind)
+                 VALUES (p_ws, r.display_name, r.provider || '_workload') RETURNING id INTO aid;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'iga_workload', r.sid);
+            n := n + 1;
+        END LOOP;
+    END IF;
+
+    -- 2. Sightings.
+    IF p_table IS NULL OR p_table = 'discovered_agents' THEN
+        FOR r IN
+            SELECT d.id::text AS sid, d.display_name, d.source, d.matched_client_id,
+                   (SELECT a.agent_id FROM public.agent_alias a
+                     WHERE a.workspace_id = p_ws AND a.source_table = 'iga_workload'
+                       AND a.source_id = d.metadata->>'iga_workload_id') AS via_workload,
+                   (SELECT a.agent_id FROM public.discovered_agent_iga_links l
+                      JOIN public.agent_alias a ON a.workspace_id = l.workspace_id
+                       AND a.source_table = 'iga_agents' AND a.source_id = l.iga_agent_id::text
+                     WHERE l.workspace_id = p_ws AND l.discovered_agent_id = d.id AND l.state = 'accepted'
+                     LIMIT 1) AS via_link
+              FROM public.discovered_agents d
+             WHERE d.workspace_id = p_ws
+               AND (p_id IS NULL OR d.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'discovered_agents' AND a.source_id = d.id::text)
+             ORDER BY d.first_seen_at, d.id
+        LOOP
+            aid := COALESCE(r.via_workload, r.via_link);
+            IF aid IS NULL THEN
+                INSERT INTO public.agent (workspace_id, display_name, kind)
+                     VALUES (p_ws, r.display_name,
+                             CASE WHEN r.source = 'vm_sensor' THEN 'agentkit' ELSE COALESCE(NULLIF(r.source, ''), 'discovered') END)
+                  RETURNING id INTO aid;
+            END IF;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'discovered_agents', r.sid);
+            n := n + 1;
+            IF r.matched_client_id IS NOT NULL THEN
+                INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                     VALUES (p_ws, aid, 'mcp_oauth_clients', r.matched_client_id::text)
+                ON CONFLICT (workspace_id, source_table, source_id) DO NOTHING;
+            END IF;
+        END LOOP;
+    END IF;
+
+    -- 3. Logical agents of the IGA estate.
+    IF p_table IS NULL OR p_table = 'iga_agents' THEN
+        FOR r IN
+            SELECT g.id::text AS sid, g.display_name,
+                   (SELECT a.agent_id FROM public.discovered_agent_iga_links l
+                      JOIN public.agent_alias a ON a.workspace_id = l.workspace_id
+                       AND a.source_table = 'discovered_agents' AND a.source_id = l.discovered_agent_id::text
+                     WHERE l.workspace_id = p_ws AND l.iga_agent_id = g.id AND l.state = 'accepted'
+                     LIMIT 1) AS via_link
+              FROM public.iga_agents g
+             WHERE g.workspace_id = p_ws
+               AND (p_id IS NULL OR g.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'iga_agents' AND a.source_id = g.id::text)
+             ORDER BY g.created_at, g.id
+        LOOP
+            aid := r.via_link;
+            IF aid IS NULL THEN
+                INSERT INTO public.agent (workspace_id, display_name, kind)
+                     VALUES (p_ws, r.display_name, 'iga') RETURNING id INTO aid;
+            END IF;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'iga_agents', r.sid);
+            n := n + 1;
+        END LOOP;
+    END IF;
+    RETURN n;
+END;
+$$;
+
+
+-- ============================================================================
+-- 178: same objects as migrations/master/178_agent_instances.sql.
+-- ============================================================================
+
+ALTER TABLE public.iga_agent_instances ALTER COLUMN agent_id DROP NOT NULL;
+ALTER TABLE public.iga_agent_instances
+    ADD COLUMN IF NOT EXISTS agent_ref         uuid,
+    ADD COLUMN IF NOT EXISTS source_table      text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS source_id         text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS artifact_digest   text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS artifact_version  text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS model             text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS model_version     text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS environment       text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS deployer          text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS spawned_by        text        NOT NULL DEFAULT '',
+    -- The cloud identity the instance acts as (AWS), so hygiene can read its
+    -- calls (cloud_usage) without re-deriving the workload.
+    ADD COLUMN IF NOT EXISTS cloud_identity_id uuid;
+
+DO $$
+BEGIN
+    ALTER TABLE public.iga_agent_instances DROP CONSTRAINT IF EXISTS iga_agent_instances_agent_ref_fkey;
+    ALTER TABLE public.iga_agent_instances ADD CONSTRAINT iga_agent_instances_agent_ref_fkey
+        FOREIGN KEY (workspace_id, agent_ref) REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE;
+    ALTER TABLE public.iga_agent_instances DROP CONSTRAINT IF EXISTS iga_agent_instances_owner_chk;
+    ALTER TABLE public.iga_agent_instances ADD CONSTRAINT iga_agent_instances_owner_chk
+        CHECK (agent_id IS NOT NULL OR agent_ref IS NOT NULL);
+END $$;
+
+-- One row per agent, workload and artifact: a new digest is a new instance.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_agent_instances_ref
+    ON public.iga_agent_instances (workspace_id, agent_ref, native_workload_id, artifact_digest)
+    WHERE agent_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_agent_instances_ref
+    ON public.iga_agent_instances (workspace_id, agent_ref, last_seen_at DESC)
+    WHERE agent_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_deployer (
+    id            uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL,
+    agent_id      uuid        NOT NULL,
+    deployer      text        NOT NULL,
+    -- 'first_instance' (recorded from the agent's first instance) or a user id.
+    recorded_by   text        NOT NULL DEFAULT 'first_instance',
+    recorded_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_deployer_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_deployer_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_deployer_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_deployer_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_deployer_key UNIQUE (workspace_id, agent_id, deployer),
+    CONSTRAINT agent_deployer_chk CHECK (deployer <> '')
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_hygiene_finding (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    kind         text        NOT NULL,
+    -- Stable across runs: the agent id, the access key id (an identifier,
+    -- never material), or agent id + deployer.
+    subject_key  text        NOT NULL,
+    agent_id     uuid,
+    subject      jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    evidence     jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    state        text        NOT NULL DEFAULT 'open',
+    first_seen   timestamptz NOT NULL DEFAULT now(),
+    last_seen    timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    CONSTRAINT agent_hygiene_finding_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_hygiene_finding_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_hygiene_finding_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_hygiene_finding_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_hygiene_finding_subject_key UNIQUE (workspace_id, kind, subject_key),
+    CONSTRAINT agent_hygiene_finding_kind_chk CHECK (kind IN ('stale_agent', 'overdue_key', 'unknown_deployer')),
+    CONSTRAINT agent_hygiene_finding_state_chk CHECK (state IN ('open', 'resolved')),
+    CONSTRAINT agent_hygiene_finding_resolved_chk CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
+    CONSTRAINT agent_hygiene_finding_subject_chk CHECK (subject_key <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_hygiene_finding_list
+    ON public.agent_hygiene_finding (workspace_id, state, kind, last_seen DESC, id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_deployer');
+        PERFORM public.tenancy_enable_rls('public.agent_hygiene_finding');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 179: same objects as migrations/master/179_resource_classification.sql.
+-- ============================================================================
+
+ALTER TABLE public.cloud_resource
+    ADD COLUMN IF NOT EXISTS crown_jewel   boolean     NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS data_category text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS residency     text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classified_by uuid,
+    ADD COLUMN IF NOT EXISTS classified_at timestamptz;
+
+DO $$
+BEGIN
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_data_category_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_data_category_chk
+        CHECK (length(data_category) <= 64);
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_residency_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_residency_chk
+        CHECK (length(residency) <= 64);
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_classified_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_classified_chk
+        CHECK ((classified_by IS NULL) = (classified_at IS NULL));
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_cloud_resource_crown_jewel
+    ON public.cloud_resource (workspace_id, id) WHERE crown_jewel;
+
+-- ============================================================================
+-- 180: same objects as migrations/master/180_directory_person.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.directory_person (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    user_id             uuid,
+    source              text        NOT NULL,
+    external_id         text        NOT NULL,
+    email               text        NOT NULL DEFAULT '',
+    display_name        text        NOT NULL DEFAULT '',
+    -- The manager as the directory names them (its id there), and the
+    -- manager's own row once it is known.
+    manager_external_id text        NOT NULL DEFAULT '',
+    manager_person_id   uuid,
+    status              text        NOT NULL DEFAULT 'active',
+    contractor          boolean     NOT NULL DEFAULT false,
+    employee_type       text        NOT NULL DEFAULT '',
+    leave_from          timestamptz,
+    leave_to            timestamptz,
+    left_at             timestamptz,
+    synced_at           timestamptz NOT NULL DEFAULT now(),
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT directory_person_pkey PRIMARY KEY (id),
+    CONSTRAINT directory_person_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT directory_person_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT directory_person_user_fkey FOREIGN KEY (user_id)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT directory_person_manager_fkey FOREIGN KEY (workspace_id, manager_person_id)
+        REFERENCES public.directory_person (workspace_id, id) ON DELETE SET NULL (manager_person_id),
+    CONSTRAINT directory_person_external_key UNIQUE (workspace_id, source, external_id),
+    CONSTRAINT directory_person_source_chk CHECK (source IN ('scim', 'entra', 'okta')),
+    CONSTRAINT directory_person_external_chk CHECK (external_id <> ''),
+    CONSTRAINT directory_person_status_chk CHECK (status IN ('active', 'leave', 'left')),
+    CONSTRAINT directory_person_left_chk CHECK ((status = 'left') = (left_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_directory_person_user
+    ON public.directory_person (workspace_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_directory_person_status
+    ON public.directory_person (workspace_id, status, id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.directory_person');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 181: same objects as migrations/master/181_responder_groups.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.responder_group (
+    id            uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL,
+    name          text        NOT NULL,
+    description   text        NOT NULL DEFAULT '',
+    is_default    boolean     NOT NULL DEFAULT false,
+    owner_user_id uuid,
+    created_by    uuid,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT responder_group_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_name_key UNIQUE (workspace_id, name),
+    CONSTRAINT responder_group_name_chk CHECK (length(name) BETWEEN 1 AND 200)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_responder_group_default
+    ON public.responder_group (workspace_id) WHERE is_default;
+
+CREATE TABLE IF NOT EXISTS public.responder_group_member (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    group_id        uuid        NOT NULL,
+    user_id         uuid        NOT NULL,
+    role            text        NOT NULL DEFAULT 'member',
+    state           text        NOT NULL DEFAULT 'candidate',
+    assigned_by     uuid,
+    assigned_at     timestamptz NOT NULL DEFAULT now(),
+    accepted_at     timestamptz,
+    delegated_to    uuid,
+    delegated_until timestamptz,
+    CONSTRAINT responder_group_member_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_member_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_member_group_fkey FOREIGN KEY (workspace_id, group_id)
+        REFERENCES public.responder_group (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_user_fkey FOREIGN KEY (user_id)
+        REFERENCES public.users(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_key UNIQUE (workspace_id, group_id, user_id),
+    CONSTRAINT responder_group_member_role_chk CHECK (role IN ('member', 'lead')),
+    CONSTRAINT responder_group_member_state_chk CHECK (state IN ('candidate', 'accepted')),
+    CONSTRAINT responder_group_member_accepted_chk CHECK ((state = 'accepted') = (accepted_at IS NOT NULL)),
+    CONSTRAINT responder_group_member_delegation_chk CHECK ((delegated_to IS NULL) = (delegated_until IS NULL)),
+    CONSTRAINT responder_group_member_delegate_self_chk CHECK (delegated_to IS NULL OR delegated_to <> user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_responder_group_member_user
+    ON public.responder_group_member (workspace_id, user_id);
+
+CREATE TABLE IF NOT EXISTS public.responder_group_scope (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    group_id     uuid        NOT NULL,
+    scope_kind   text        NOT NULL,
+    -- The account id, subscription id, cluster's discovery source id, agent
+    -- id or iga_estate_scopes id, as text.
+    scope_ref    text        NOT NULL,
+    created_by   uuid,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT responder_group_scope_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_scope_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_scope_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_scope_group_fkey FOREIGN KEY (workspace_id, group_id)
+        REFERENCES public.responder_group (workspace_id, id) ON DELETE CASCADE,
+    -- One group decides for a scope.
+    CONSTRAINT responder_group_scope_key UNIQUE (workspace_id, scope_kind, scope_ref),
+    CONSTRAINT responder_group_scope_kind_chk CHECK (scope_kind IN
+        ('account', 'subscription', 'cluster', 'agent', 'estate_scope')),
+    CONSTRAINT responder_group_scope_ref_chk CHECK (scope_ref <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_responder_group_scope_group
+    ON public.responder_group_scope (workspace_id, group_id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.responder_group');
+        PERFORM public.tenancy_enable_rls('public.responder_group_member');
+        PERFORM public.tenancy_enable_rls('public.responder_group_scope');
+    END IF;
+END $$;

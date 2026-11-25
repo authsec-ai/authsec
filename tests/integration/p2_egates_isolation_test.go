@@ -424,7 +424,9 @@ func egatesGitHubRows(t *testing.T, l *p2Lab, ws uuid.UUID) string {
 		`SELECT to_jsonb(x)::text FROM iga_resources x WHERE workspace_id = ? AND provider <> 'aws'`,
 		`SELECT to_jsonb(x)::text FROM iga_credentials x WHERE workspace_id = ?`,
 		`SELECT to_jsonb(x)::text FROM iga_agents x WHERE workspace_id = ?`,
-		`SELECT to_jsonb(x)::text FROM iga_agent_instances x WHERE workspace_id = ?`,
+		// Instances of an AWS agent's one agent id (W7, 178: agent_ref) are not
+		// GitHub rows; the Phase 1 estate's instances name an iga_agents row.
+		`SELECT to_jsonb(x)::text FROM iga_agent_instances x WHERE workspace_id = ? AND agent_ref IS NULL`,
 		`SELECT to_jsonb(x)::text FROM iga_classification_candidates x WHERE workspace_id = ?`,
 	} {
 		var got []string
@@ -631,7 +633,13 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 	// it was sighted as (iga_agent_instances has no name of its own).
 	for table, col := range map[string]string{"iga_agents": "display_name", "iga_agent_instances": "native_workload_id"} {
 		var names []string
-		if err := mixed.db.Raw(`SELECT `+col+` FROM `+table+` WHERE workspace_id = ?`, mixed.ws).Scan(&names).Error; err != nil {
+		// iga_agent_instances rows of an AWS agent's one agent id (W7, 178:
+		// agent_ref set, agent_id NULL) are not iga_agents rows (§2.2 holds).
+		own := ""
+		if table == "iga_agent_instances" {
+			own = " AND agent_id IS NOT NULL"
+		}
+		if err := mixed.db.Raw(`SELECT `+col+` FROM `+table+` WHERE workspace_id = ?`+own, mixed.ws).Scan(&names).Error; err != nil {
 			t.Fatalf("read %s: %v", table, err)
 		}
 		for _, n := range names {
@@ -644,8 +652,8 @@ func TestP2EgatesE16ExistingProductsUnchanged(t *testing.T) {
 				}
 			}
 		}
-		if got, want := mixed.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`, mixed.ws),
-			mixed.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`, control); got != want {
+		if got, want := mixed.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`+own, mixed.ws),
+			mixed.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`+own, control); got != want {
 			t.Errorf("%s: %d rows in the mixed workspace, %d in the GitHub-only control", table, got, want)
 		}
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -449,6 +450,8 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		}
 	}()
 
+	scimRecordDirectory(c, workspaceUUID, services.DirectoryFromSCIM(input, newUser.ID))
+
 	middlewares.Audit(c, "scim", workspaceID, "create_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":     newUser.ID.String(),
@@ -527,6 +530,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 
 	// Re-fetch updated user
 	tenantDB.Where("id = ?", userUUID).First(&user)
+	scimRecordDirectory(c, user.WorkspaceID, services.DirectoryFromSCIM(input, userUUID))
 
 	middlewares.Audit(c, "scim", workspaceID, "replace_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
@@ -616,6 +620,14 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 		}
 	}
 
+	ext := ""
+	if user.ExternalID != nil {
+		ext = *user.ExternalID
+	}
+	if dp, ok := services.DirectoryPatchFromSCIM(patchReq.Operations, ext, userUUID); ok {
+		scimRecordDirectory(c, user.WorkspaceID, dp)
+	}
+
 	middlewares.Audit(c, "scim", workspaceID, "patch_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":    userID,
@@ -663,6 +675,11 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 	if _, err := tenancy.ExecContext(c.Request.Context(), scimSQL(),
 		`UPDATE workspace_memberships SET status = 'left', updated_at = NOW() WHERE workspace_id = $1 AND user_id = $2`, userUUID); err != nil {
 		log.Printf("SCIM: membership of %s not marked left: %v", userUUID, err)
+	}
+
+	if wsUUID, perr := uuid.Parse(workspaceID); perr == nil {
+		scimRecordDirectory(c, wsUUID, services.DirectoryPersonInput{Source: services.DirectorySourceSCIM,
+			ExternalID: scimDirectoryExternalID(c, wsUUID, userUUID), UserID: &userUUID, Deleted: true})
 	}
 
 	middlewares.Audit(c, "scim", workspaceID, "delete_user", &middlewares.AuditChanges{
@@ -1325,4 +1342,29 @@ func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 		BaseURL:  baseURL,
 		ExpireAt: expireAt,
 	})
+}
+
+// scimRecordDirectory records the person in the directory (W7, C10):
+// manager, status, contractor, leave. Best-effort: SCIM's own answer never
+// depends on it; a failure is logged.
+func scimRecordDirectory(c *gin.Context, ws uuid.UUID, in services.DirectoryPersonInput) {
+	if ws == uuid.Nil {
+		return
+	}
+	// TENANT-EXEMPT: not a statement: the directory service runs in a workspace transaction (tenancy.InWorkspace).
+	if _, _, err := services.NewDirectoryService(config.DB).Upsert(c.Request.Context(), ws, in); err != nil {
+		log.Printf("SCIM: directory record for %s not written: %v", in.ExternalID, err)
+	}
+}
+
+// scimDirectoryExternalID is the directory key a SCIM user was recorded
+// under: its externalId, else its user id. A deleted user's row is read
+// before the soft delete hides it.
+func scimDirectoryExternalID(c *gin.Context, ws, user uuid.UUID) string {
+	var ext sql.NullString
+	if err := tenancy.QueryRowContext(c.Request.Context(), scimSQL(),
+		`SELECT external_id FROM users WHERE workspace_id = $1 AND id = $2`, []interface{}{user}, &ext); err == nil && ext.Valid && ext.String != "" {
+		return ext.String
+	}
+	return user.String()
 }

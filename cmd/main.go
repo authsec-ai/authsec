@@ -339,6 +339,10 @@ func main() {
 	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
 	services.InstallModelProviders()
 	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
+	// One agent id (W7): link sweep, deleted-at-source, stale agents and
+	// overdue keys, every 15 minutes per workspace
+	// (AUTHSEC_DISABLE_AGENT_IDENTITY_SWEEP=true turns it off).
+	go services.RunAgentIdentityWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL

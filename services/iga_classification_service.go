@@ -367,6 +367,17 @@ func (s *ClassificationService) ClassifyThen(ctx context.Context, in ClassifyReq
 			return err
 		}
 
+		// One agent id (W7): a workload classified an agent gets its agent;
+		// an undo is "not an agent" with the decision's reason, on the agent
+		// too when this workload is its only source.
+		if req.Decision == models.ClassificationClassified {
+			if _, err := LinkAgentSources(tx, ws, "iga_workload", w.ID.String()); err != nil {
+				return err
+			}
+		} else if err := markNotAnAgentFromSource(tx, ws, "iga_workload", w.ID.String(), req.ActorUserID, req.Reason); err != nil {
+			return err
+		}
+
 		res, err := igaread.RenderClassifyResult(tx, row, false)
 		if err != nil {
 			return err

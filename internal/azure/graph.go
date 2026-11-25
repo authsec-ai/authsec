@@ -221,3 +221,46 @@ func (c *Client) ListDirectoryRoleDefinitions(ctx context.Context, graphToken st
 		}})
 	return graphPaged[DirectoryRoleDefinition](ctx, c, graphToken, ri, err, maxPages)
 }
+
+// DirectoryPerson is a directory person as the directory (W7, C10) reads them:
+// the user, whether the account is enabled, their leave date and type, and
+// their manager's id.
+type DirectoryPerson struct {
+	ID                    string     `json:"id"`
+	DisplayName           string     `json:"displayName"`
+	UserPrincipalName     string     `json:"userPrincipalName"`
+	Mail                  string     `json:"mail"`
+	UserType              string     `json:"userType"`
+	EmployeeType          string     `json:"employeeType"`
+	AccountEnabled        *bool      `json:"accountEnabled"`
+	EmployeeLeaveDateTime *time.Time `json:"employeeLeaveDateTime"`
+	Manager               *struct {
+		ID string `json:"id"`
+	} `json:"manager"`
+}
+
+// ListDirectoryPeople returns every user with manager, accountEnabled,
+// employeeType and employeeLeaveDateTime. employeeLeaveDateTime needs
+// User-LifeCycleInfo.Read.All, which a tenant may not have granted: on a
+// refusal the read is retried without it (no leave dates), never failed.
+func (c *Client) ListDirectoryPeople(ctx context.Context, graphToken string) ([]DirectoryPerson, error) {
+	g, err := c.graph()
+	if err != nil {
+		return nil, err
+	}
+	list := func(sel []string) ([]DirectoryPerson, error) {
+		ri, err := g.Users().ToGetRequestInformation(ctx, &users.UsersRequestBuilderGetRequestConfiguration{
+			QueryParameters: &users.UsersRequestBuilderGetQueryParameters{
+				Select: sel,
+				Expand: []string{"manager($select=id)"},
+				Top:    to.Ptr(int32(graphPageSize)),
+			}})
+		return graphPaged[DirectoryPerson](ctx, c, graphToken, ri, err, maxPages)
+	}
+	base := []string{"id", "displayName", "userPrincipalName", "mail", "userType", "employeeType", "accountEnabled"}
+	out, err := list(append(append([]string{}, base...), "employeeLeaveDateTime"))
+	if err != nil {
+		return list(base)
+	}
+	return out, nil
+}

@@ -301,8 +301,9 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
 	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
 	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
-	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
-}
+	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},}
+
+func init() { GovEventVocabulary = append(GovEventVocabulary, agentLifecycleVocabulary...) }
 
 // Object kinds the events API filters on.
 const (
@@ -348,6 +349,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjTempGrant:         {payloadKey: "grant_id"},
 	GovObjSessionRevocation: {payloadKey: "revocation_id"},
 	GovObjAgentAlert:        {payloadKey: "alert_id"},
+	GovObjAgent:             {payloadKey: "agent_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.

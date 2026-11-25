@@ -1113,6 +1113,11 @@ func mirrorAWSAgents(tx *gorm.DB, ws uuid.UUID, conn arConnector, now time.Time)
 	if err := retireAWSAgents(tx, repo, ws, conn, agents, present, now); err != nil {
 		return n, err
 	}
+	// One agent id and instances (W7, agent_instances.go): the agents just
+	// mirrored get their agent and alias, and each running version an instance.
+	if err := recordAWSAgentInstances(tx, ws, wls, now); err != nil {
+		return n, fmt.Errorf("agent instances: %w", err)
+	}
 	return n, nil
 }
 

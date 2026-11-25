@@ -135,3 +135,9 @@ controllers/platform/agent_gateway_pdp_controller.go
 services/agent_gateway.go
 services/agent_gateway_policy.go
 services/agent_gateway_decisions.go
+services/agent_identity.go
+services/agent_instances.go
+services/agent_hygiene.go
+services/directory.go
+services/resource_classification.go
+services/responder_groups.go
