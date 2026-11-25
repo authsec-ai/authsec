@@ -13994,3 +13994,362 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agentkit_policies');
     END IF;
 END $$;
+
+-- 167_audit_chain. Kept identical to migrations/master/167_audit_chain.sql.
+
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS record_class text;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS seq bigint;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS prev_hash text;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS hash text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'audit_events_record_class_chk'
+                      AND conrelid = 'public.audit_events'::regclass) THEN
+        ALTER TABLE public.audit_events ADD CONSTRAINT audit_events_record_class_chk
+            CHECK (record_class IS NULL OR record_class IN ('admin_change', 'auth', 'access_decision', 'export', 'default'));
+    END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_events_chain
+    ON public.audit_events (workspace_id, seq) WHERE seq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_ws_actor_time
+    ON public.audit_events (workspace_id, user_id, "timestamp");
+CREATE INDEX IF NOT EXISTS idx_audit_events_ws_class_time
+    ON public.audit_events (workspace_id, record_class, "timestamp");
+
+-- One field of the canonical form: NULL is "~", anything else is its byte
+-- length in UTF-8 (whatever the database encoding), a colon and the value
+-- (so no value can imitate a separator).
+CREATE OR REPLACE FUNCTION public.audit_chain_field(v text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN v IS NULL THEN '~' ELSE octet_length(convert_to(v, 'UTF8'))::text || ':' || v END
+$$;
+
+-- The canonical form a link's hash is taken over. internal/auditchain
+-- (Canonical) builds the same string in Go, which is how verification
+-- recomputes hashes without trusting this function.
+CREATE OR REPLACE FUNCTION public.audit_event_canonical(e public.audit_events) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT 'authsec.audit.v1'
+        || '|' || public.audit_chain_field(e.id::text)
+        || '|' || public.audit_chain_field(e.workspace_id)
+        || '|' || public.audit_chain_field(e.seq::text)
+        || '|' || public.audit_chain_field(e.prev_hash)
+        || '|' || public.audit_chain_field(e.record_class)
+        || '|' || public.audit_chain_field(e.request_id)
+        || '|' || public.audit_chain_field(e.actor_realm)
+        || '|' || public.audit_chain_field(e.user_id)
+        || '|' || public.audit_chain_field(e.action)
+        || '|' || public.audit_chain_field(e.resource)
+        || '|' || public.audit_chain_field(e.resource_id)
+        || '|' || public.audit_chain_field(e.method)
+        || '|' || public.audit_chain_field(e.path)
+        || '|' || public.audit_chain_field(e.user_agent)
+        || '|' || public.audit_chain_field(e.client_ip)
+        || '|' || public.audit_chain_field(e.status_code::text)
+        || '|' || public.audit_chain_field(e.duration::text)
+        || '|' || public.audit_chain_field(e.old_values::text)
+        || '|' || public.audit_chain_field(e.new_values::text)
+        || '|' || public.audit_chain_field(e.error)
+        || '|' || public.audit_chain_field(to_char(e."timestamp" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
+$$;
+
+CREATE TABLE IF NOT EXISTS public.audit_chain_anchor (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    chain        text        NOT NULL,
+    day          date        NOT NULL,
+    last_seq     bigint      NOT NULL,
+    head_hash    text        NOT NULL,
+    reason       text        NOT NULL DEFAULT 'daily',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_chain_anchor_seq_chk CHECK (last_seq > 0),
+    CONSTRAINT audit_chain_anchor_hash_chk CHECK (head_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT audit_chain_anchor_reason_chk CHECK (reason IN ('daily', 'purge')),
+    CONSTRAINT audit_chain_anchor_chain_chk CHECK (workspace_id IS NULL OR chain = workspace_id::text),
+    CONSTRAINT uq_audit_chain_anchor UNIQUE (chain, last_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_anchor_ws_day
+    ON public.audit_chain_anchor (workspace_id, day);
+
+CREATE TABLE IF NOT EXISTS public.audit_chain_gap (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    chain        text        NOT NULL,
+    from_seq     bigint      NOT NULL,
+    to_seq       bigint      NOT NULL,
+    prev_hash    text        NOT NULL,
+    last_hash    text        NOT NULL,
+    purge_run    uuid        NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_chain_gap_range_chk CHECK (from_seq >= 1 AND to_seq >= from_seq),
+    CONSTRAINT audit_chain_gap_hash_chk CHECK (prev_hash ~ '^[0-9a-f]{64}$' AND last_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT audit_chain_gap_chain_chk CHECK (workspace_id IS NULL OR chain = workspace_id::text),
+    CONSTRAINT uq_audit_chain_gap UNIQUE (chain, from_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_gap_ws_chain
+    ON public.audit_chain_gap (workspace_id, chain, to_seq);
+
+CREATE TABLE IF NOT EXISTS public.audit_write_failure (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    event        jsonb       NOT NULL,
+    error        text        NOT NULL,
+    attempts     integer     NOT NULL DEFAULT 0,
+    state        text        NOT NULL DEFAULT 'pending',
+    notified_at  timestamptz,
+    replayed_at  timestamptz,
+    replayed_seq bigint,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_write_failure_state_chk CHECK (state IN ('pending', 'replayed', 'dead'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_write_failure_ws_state
+    ON public.audit_write_failure (workspace_id, state, created_at);
+
+COMMENT ON TABLE public.audit_chain_anchor IS
+    'Heads of the audit_events hash chains (daily and before every retention purge); append-only.';
+COMMENT ON TABLE public.audit_chain_gap IS
+    'Runs of audit_events links removed by retention, with the hashes around them; append-only.';
+COMMENT ON TABLE public.audit_write_failure IS
+    'Audit events that could not be written after retries; replayed into the chain by the audit governance job.';
+
+-- The chain: seq, prev_hash and hash are assigned here, never by the writer.
+CREATE OR REPLACE FUNCTION public.audit_events_chain() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    head_seq  bigint;
+    head_hash text;
+    gap_seq   bigint;
+    gap_hash  text;
+BEGIN
+    NEW.workspace_id := COALESCE(NEW.workspace_id, '');
+    IF NEW."timestamp" IS NULL THEN
+        NEW."timestamp" := now();
+    END IF;
+    IF NEW.record_class IS NULL OR NEW.record_class = '' THEN
+        NEW.record_class := 'default';
+    END IF;
+    -- One writer per chain at a time, until its transaction ends.
+    PERFORM pg_advisory_xact_lock(1096107092, hashtext(NEW.workspace_id));
+    SELECT a.seq, a.hash INTO head_seq, head_hash
+      FROM public.audit_events a
+     WHERE a.workspace_id = NEW.workspace_id AND a.seq IS NOT NULL
+     ORDER BY a.seq DESC LIMIT 1;
+    SELECT g.to_seq, g.last_hash INTO gap_seq, gap_hash
+      FROM public.audit_chain_gap g
+     WHERE g.chain = NEW.workspace_id
+     ORDER BY g.to_seq DESC LIMIT 1;
+    IF gap_seq IS NOT NULL AND (head_seq IS NULL OR gap_seq > head_seq) THEN
+        head_seq := gap_seq;
+        head_hash := gap_hash;
+    END IF;
+    NEW.seq := COALESCE(head_seq, 0) + 1;
+    NEW.prev_hash := COALESCE(head_hash, repeat('0', 64));
+    NEW.hash := encode(sha256(convert_to(public.audit_event_canonical(NEW), 'UTF8')), 'hex');
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_chain ON public.audit_events;
+CREATE TRIGGER trg_audit_events_chain
+    BEFORE INSERT ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_chain();
+
+CREATE OR REPLACE FUNCTION public.audit_events_delete_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('authsec.audit_retention', true) = 'on'
+       OR current_setting('authsec.workspace_purge', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'audit_events rows are deleted only by the audit retention job';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_delete_guard ON public.audit_events;
+CREATE TRIGGER trg_audit_events_delete_guard
+    BEFORE DELETE ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_delete_guard();
+
+CREATE OR REPLACE FUNCTION public.audit_chain_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' AND current_setting('authsec.workspace_purge', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION '% rows are append-only', TG_TABLE_NAME;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_chain_anchor_immutable ON public.audit_chain_anchor;
+CREATE TRIGGER trg_audit_chain_anchor_immutable
+    BEFORE UPDATE OR DELETE ON public.audit_chain_anchor
+    FOR EACH ROW EXECUTE FUNCTION public.audit_chain_immutable();
+
+DROP TRIGGER IF EXISTS trg_audit_chain_gap_immutable ON public.audit_chain_gap;
+CREATE TRIGGER trg_audit_chain_gap_immutable
+    BEFORE UPDATE OR DELETE ON public.audit_chain_gap
+    FOR EACH ROW EXECUTE FUNCTION public.audit_chain_immutable();
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.audit_chain_anchor');
+        PERFORM public.tenancy_enable_rls('public.audit_chain_gap');
+        PERFORM public.tenancy_enable_rls('public.audit_write_failure');
+    END IF;
+END $$;
+
+-- 168_audit_retention. Kept identical to migrations/master/168_audit_retention.sql.
+
+CREATE TABLE IF NOT EXISTS public.audit_retention_policy (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    record_class text        NOT NULL,
+    retain_days  integer     NOT NULL,
+    updated_by   uuid,
+    change_id    uuid,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_retention_policy_class_chk
+        CHECK (record_class IN ('admin_change', 'auth', 'access_decision', 'export', 'default')),
+    CONSTRAINT audit_retention_policy_days_chk CHECK (retain_days BETWEEN 7 AND 2557),
+    CONSTRAINT audit_retention_policy_pkey PRIMARY KEY (workspace_id, record_class)
+);
+
+CREATE TABLE IF NOT EXISTS public.audit_legal_hold (
+    id                uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    from_ts           timestamptz NOT NULL,
+    to_ts             timestamptz NOT NULL,
+    reason            text        NOT NULL,
+    created_by        uuid        NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    released_at       timestamptz,
+    released_by       uuid,
+    release_change_id uuid,
+    CONSTRAINT audit_legal_hold_window_chk CHECK (to_ts > from_ts),
+    CONSTRAINT audit_legal_hold_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    CONSTRAINT uq_audit_legal_hold_ws_id UNIQUE (workspace_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_legal_hold_live
+    ON public.audit_legal_hold (workspace_id, from_ts, to_ts) WHERE released_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS public.audit_governance_change (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind            text        NOT NULL,
+    target          text        NOT NULL,
+    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    reason          text        NOT NULL,
+    status          text        NOT NULL DEFAULT 'pending',
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at      timestamptz NOT NULL,
+    decided_by      uuid,
+    decided_at      timestamptz,
+    decision_reason text,
+    break_glass     boolean     NOT NULL DEFAULT false,
+    review_due_at   timestamptz,
+    reviewed_by     uuid,
+    reviewed_at     timestamptz,
+    CONSTRAINT audit_governance_change_kind_chk
+        CHECK (kind IN ('retention_shorten', 'legal_hold_release', 'operator_unsuspend')),
+    CONSTRAINT audit_governance_change_status_chk
+        CHECK (status IN ('pending', 'applied', 'rejected', 'withdrawn', 'expired')),
+    CONSTRAINT audit_governance_change_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    -- Separation of duties: nobody approves or rejects their own request;
+    -- only break-glass applies alone, and then someone else reviews it.
+    CONSTRAINT audit_governance_change_second_person_chk
+        CHECK (decided_by IS NULL OR break_glass OR status = 'withdrawn' OR decided_by <> requested_by),
+    CONSTRAINT audit_governance_change_break_glass_chk CHECK (NOT break_glass OR review_due_at IS NOT NULL),
+    CONSTRAINT audit_governance_change_reviewer_chk CHECK (reviewed_by IS NULL OR reviewed_by <> requested_by),
+    CONSTRAINT uq_audit_governance_change_ws_id UNIQUE (workspace_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_governance_change_pending
+    ON public.audit_governance_change (workspace_id, kind, target) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_audit_governance_change_ws_status
+    ON public.audit_governance_change (workspace_id, status, requested_at);
+
+COMMENT ON TABLE public.audit_retention_policy IS
+    'Audit retention per workspace and record class (days); missing rows use the built-in defaults.';
+COMMENT ON TABLE public.audit_legal_hold IS
+    'Windows of audit_events the retention job must keep while the hold is live.';
+COMMENT ON TABLE public.audit_governance_change IS
+    'Tier-3 audit governance changes (shorter retention, hold release, unsuspend) awaiting or applied by a second person.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.audit_retention_policy');
+        PERFORM public.tenancy_enable_rls('public.audit_legal_hold');
+        PERFORM public.tenancy_enable_rls('public.audit_governance_change');
+    END IF;
+END $$;
+
+-- 169_operator_governance. Kept identical to migrations/master/169_operator_governance.sql.
+
+CREATE TABLE IF NOT EXISTS public.operator_activity_hour (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id      text        NOT NULL,
+    hour         timestamptz NOT NULL,
+    writes       integer     NOT NULL DEFAULT 0,
+    elevated     integer     NOT NULL DEFAULT 0,
+    exports      integer     NOT NULL DEFAULT 0,
+    computed_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operator_activity_hour_counts_chk CHECK (writes >= 0 AND elevated >= 0 AND exports >= 0),
+    CONSTRAINT operator_activity_hour_pkey PRIMARY KEY (workspace_id, user_id, hour)
+);
+
+CREATE TABLE IF NOT EXISTS public.operator_alert (
+    id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id      text        NOT NULL,
+    hour         timestamptz NOT NULL,
+    metric       text        NOT NULL,
+    observed     integer     NOT NULL,
+    baseline_p95 numeric     NOT NULL,
+    threshold    integer     NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operator_alert_metric_chk CHECK (metric IN ('writes', 'elevated', 'exports')),
+    CONSTRAINT uq_operator_alert UNIQUE (workspace_id, user_id, hour, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_operator_alert_ws_time
+    ON public.operator_alert (workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.operator_suspension (
+    id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id        uuid        NOT NULL,
+    mechanism      text        NOT NULL,
+    membership_id  uuid,
+    reason         text        NOT NULL,
+    suspended_by   uuid        NOT NULL,
+    suspended_at   timestamptz NOT NULL DEFAULT now(),
+    lifted_at      timestamptz,
+    lifted_by      uuid,
+    lift_change_id uuid,
+    CONSTRAINT operator_suspension_mechanism_chk CHECK (mechanism IN ('membership', 'user')),
+    CONSTRAINT operator_suspension_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    CONSTRAINT operator_suspension_self_chk CHECK (suspended_by <> user_id),
+    CONSTRAINT uq_operator_suspension_ws_id UNIQUE (workspace_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_suspension_live
+    ON public.operator_suspension (workspace_id, user_id) WHERE lifted_at IS NULL;
+
+COMMENT ON TABLE public.operator_activity_hour IS
+    'Hourly console writes, elevated (tier 2/3) writes and exports per operator, from audit_events.';
+COMMENT ON TABLE public.operator_alert IS
+    'Hours in which an operator exceeded their baseline (max(10, 3 x trailing 14-day p95)).';
+COMMENT ON TABLE public.operator_suspension IS
+    'Operators suspended in a workspace (governance:emergency); lifted by a second person.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.operator_activity_hour');
+        PERFORM public.tenancy_enable_rls('public.operator_alert');
+        PERFORM public.tenancy_enable_rls('public.operator_suspension');
+    END IF;
+END $$;

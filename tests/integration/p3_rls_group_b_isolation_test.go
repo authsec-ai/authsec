@@ -38,7 +38,7 @@ func TestP3RLSApprovalFromAnotherWorkspaceChangesNothing(t *testing.T) {
 	p3exec(t, l.db, `INSERT INTO roles (id, name, workspace_id) VALUES (?, 'p3-rls-b-other', ?)`, om.role, ows)
 	p3exec(t, l.db, `INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status) VALUES (?, ?, ?, ?, 'active')`, om.membership, ows, om.user, om.role)
 	t.Cleanup(func() {
-		l.db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, ows.String())
+		auditEventsCleanup(l.db, ows)
 		l.db.Exec(`DELETE FROM workspace_memberships WHERE id = ?`, om.membership)
 		l.db.Exec(`DELETE FROM users WHERE id = ?`, om.user)
 		l.db.Exec(`DELETE FROM roles WHERE id = ?`, om.role)

@@ -44,7 +44,7 @@ func p3Audit(t *testing.T, db *gorm.DB, wss ...uuid.UUID) {
 	t.Cleanup(func() {
 		config.AuditLogger = prev
 		for _, ws := range wss {
-			db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, ws.String())
+			auditEventsCleanup(db, ws)
 		}
 	})
 }

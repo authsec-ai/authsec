@@ -666,7 +666,7 @@ func TestP3T320EveryMutationAudited(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := newEnfRouteLab(t, gate)
-		t.Cleanup(func() { db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, r.a.ws.String()) })
+		t.Cleanup(func() { auditEventsCleanup(db, r.a.ws) })
 		tok := r.token(t, r.a, "discovery:read governance:enforce")
 		base := "/aws/connectors/" + r.a.connector.ID.String() + "/enforcement"
 		const dprefix = "/authsec/discovery"

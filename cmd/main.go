@@ -565,16 +565,11 @@ func main() {
 	// Phase 4: background workers
 	// ─────────────────────────────────────────────────────────
 
-	// Audit log cleanup (runs daily, removes events older than 90 days)
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := auditLogger.CleanupOldEvents(90 * 24 * time.Hour); err != nil {
-				monitoring.GetLogger().WithError(err).Error("Failed to cleanup old audit events")
-			}
-		}
-	}()
+	// Audit governance (F7 / P18, AS-177): daily chain anchors and the
+	// retention purge per workspace and record class (sparing legal holds),
+	// the hourly operator baseline, and the replay of audit write failures.
+	// Replaces the daily DELETE of every workspace's events older than 90 days.
+	services.InstallAuditGovernance(config.DB)
 
 	// Auth request context + PKCE verifier cleanup (expired entries, runs every 10 minutes)
 	go func() {

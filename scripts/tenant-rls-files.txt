@@ -135,3 +135,7 @@ controllers/platform/agent_gateway_pdp_controller.go
 services/agent_gateway.go
 services/agent_gateway_policy.go
 services/agent_gateway_decisions.go
+services/audit_governance.go
+services/audit_governance_chain.go
+services/audit_governance_jobs.go
+services/audit_governance_operators.go

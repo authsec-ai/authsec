@@ -120,4 +120,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
 		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
 	}
+
+	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18):
+	// /api/iga/v1/audit/* and the operator suspension routes under
+	// /authsec/admin/operators, behind the same AuthMiddleware
+	// (audit_governance_controller.go). Mounted here so the tests that mount
+	// SetupIGARoutes reach them through the production chain.
+	platformCtrl.MountAuditGovernanceRoutes(r, platformCtrl.NewAuditGovernanceControllerFor(igaGraphRead), middlewares.AuthMiddleware())
 }
