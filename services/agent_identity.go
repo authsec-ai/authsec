@@ -30,7 +30,7 @@ import (
 // (the merged agent's aliases are re-pointed at the survivor), transfer and
 // "not an agent" (a reason is required whatever the source). Deleted at
 // source is not a person's decision: the sweep marks it when every source
-// reports the agent gone, and raises agent.ask_needed (TODO(W4): an ask).
+// reports the agent gone, and raises agent.ask_needed (and an ask, W4).
 //
 // Every statement runs in a transaction under row-level security for the
 // caller's workspace (tenancy.InWorkspace): another workspace's agent is 404.

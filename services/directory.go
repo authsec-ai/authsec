@@ -29,7 +29,7 @@ import (
 //
 // A person becoming left raises agent.ask_needed (reason decider_left) for
 // every agent whose responder group they are the only accepted member of
-// (TODO(W4): an ask), and writes directory.person_left.
+// (and an ask, W4), and writes directory.person_left.
 
 // Directory sources.
 const (
@@ -293,6 +293,9 @@ func raiseLeaverAsks(tx *gorm.DB, ws uuid.UUID, p *DirectoryPerson, now time.Tim
 				"subject": map[string]any{"person_id": p.ID, "user_id": user, "group_id": *res.GroupID}}); err != nil {
 			return n, err
 		}
+		// The leaver never decides the ask about their own departure.
+		raiseAgentAskNeeded(tx, ws, a, AskReasonDeciderLeft,
+			map[string]any{"person_id": p.ID, "user_id": user, "group_id": *res.GroupID}, user)
 		n++
 	}
 	return n, nil

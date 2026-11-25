@@ -6,7 +6,7 @@ package services
 //
 // agent.ask_needed stands in for an ask until W4 builds them: it names the
 // agent, the reason and the subject a person must decide about.
-// TODO(W4): convert agent.ask_needed events into agent_ask rows.
+// W4: every agent.ask_needed writer also raises an ask (agent_asks_needed.go).
 const (
 	GovCatAgentLifecycle = "agent_lifecycle"
 	GovObjAgent          = "agent"

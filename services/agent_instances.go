@@ -26,7 +26,7 @@ import (
 // Deployers: the agent's first instance records its deployer. A later NEW
 // instance from a deployer outside the recorded set opens an
 // unknown_deployer hygiene finding and writes agent.instance_unknown_deployer
-// and agent.ask_needed (TODO(W4): an ask; TODO(F8): an agent_alert once the
+// and agent.ask_needed (and an ask, W4; TODO(F8): an agent_alert once the
 // alert pipeline takes non-CloudTrail detections) until a person records the
 // deployer (RecordDeployer).
 
@@ -140,8 +140,12 @@ func RecordAgentInstance(tx *gorm.DB, ws uuid.UUID, obs AgentInstanceObservation
 	if err := appendGovEvent(tx, ws, GovEventAgentUnknownDeployer, models.GovActorSystem, "", govEventRefs{}, payload); err != nil {
 		return out, err
 	}
-	return out, appendGovEvent(tx, ws, GovEventAgentAskNeeded, models.GovActorSystem, "", govEventRefs{},
-		map[string]any{"agent_id": *aid, "reason": AskReasonUnknownDeployer, "subject": map[string]any{"deployer": dep}})
+	if err := appendGovEvent(tx, ws, GovEventAgentAskNeeded, models.GovActorSystem, "", govEventRefs{},
+		map[string]any{"agent_id": *aid, "reason": AskReasonUnknownDeployer, "subject": map[string]any{"deployer": dep}}); err != nil {
+		return out, err
+	}
+	raiseAgentAskNeeded(tx, ws, *aid, AskReasonUnknownDeployer, map[string]any{"deployer": dep, "known_deployers": known})
+	return out, nil
 }
 
 // awsAgentInstance is the instance an AWS agent workload's scan attributes
