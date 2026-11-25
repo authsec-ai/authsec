@@ -258,6 +258,7 @@ func (s *AWSWorkloadScanner) scanDNSQueryLogs(
 	out.DNSTrafficFindings += res.Written
 	// W6: VPC flow logs configured for this connector and region, filtered
 	// to the addresses the stored lookups resolved to.
+	// TENANT-EXEMPT: not a statement here: CollectFlows runs every statement under row-level security for workspaceID.
 	if fr, ferr := NewAgentRuntimeJoinService(s.db).CollectFlows(ctx, workspaceID, snapshot.ConnectorID, region,
 		clients.Logs, s.dns.sleep); ferr != nil {
 		warn("recording flow summaries: %v", ferr)

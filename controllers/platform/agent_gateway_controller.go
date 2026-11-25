@@ -67,6 +67,7 @@ func NewAgentGatewayController() *AgentGatewayController {
 func MountAgentGatewayRoutes(g *gin.RouterGroup, ctl *AgentGatewayController) {
 	RegisterAgentGatewayRoutes(g.Group("/agent-runtime"), ctl,
 		middlewares.Require("governance", "read"), middlewares.Require("governance", "enforce"))
+	MountAgentGatewayW6Routes(g, ctl)
 }
 
 // RegisterAgentGatewayRoutes is the route table.

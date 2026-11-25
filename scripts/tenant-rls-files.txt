@@ -162,3 +162,9 @@ services/agent_hygiene.go
 services/directory.go
 services/resource_classification.go
 services/responder_groups.go
+services/agent_gateway_keys.go
+services/agent_gateway_holds.go
+services/agent_runtime_joins.go
+services/model_usage_reconcile.go
+controllers/platform/agent_gateway_w6_controller.go
+controllers/platform/agent_gateway_w6_pdp_controller.go
