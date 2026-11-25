@@ -299,7 +299,24 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
 	// Agent runtime alerts (agent_runtime_alerts.go).
 	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
-	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
+	{GovEventAgentAlertAcknowledged, GovCatAgentAlert, GovObjAgentAlert, "A workspace member acknowledged an alert (actor and reason kept per transition)."},
+	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member with an outcome code, or by retention (with the reason given)."},
+	{GovEventAgentAlertReopened, GovCatAgentAlert, GovObjAgentAlert, "A resolved alert was reopened by a workspace member, with a reason."},
+	{GovEventAgentAlertUnsuppressed, GovCatAgentAlert, GovObjAgentAlert, "A suppressed alert recorded a harmful outcome that succeeded and was delivered after all."},
+	// Versioned detection rules (agent_runtime_alert_rules.go): before and after.
+	{GovEventAgentAlertRulesApplied, GovCatAgentAlert, GovObjAgentAlertRule, "A detection rule change that only tightens was applied at once."},
+	{GovEventAgentAlertRulesProposed, GovCatAgentAlert, GovObjAgentAlertRule, "A loosening detection rule change was proposed; it waits for a second person (tier 3)."},
+	{GovEventAgentAlertRulesApproved, GovCatAgentAlert, GovObjAgentAlertRule, "A second person holding governance:approve approved a detection rule change."},
+	{GovEventAgentAlertRulesRejected, GovCatAgentAlert, GovObjAgentAlertRule, "A proposed detection rule change was rejected or withdrawn."},
+	{GovEventAgentAlertRulesBreakGlass, GovCatAgentAlert, GovObjAgentAlertRule, "The workspace's only approver applied a loosening rule change alone (break-glass); a review is due within 24 hours."},
+	{GovEventAgentAlertRulesSuperseded, GovCatAgentAlert, GovObjAgentAlertRule, "A proposed rule change was superseded by a newer active version."},
+	// Alert suppressions (agent_runtime_alert_suppression.go).
+	{GovEventAgentAlertSuppressionRequested, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression (or its renewal) was requested; it waits for a second person (tier 3)."},
+	{GovEventAgentAlertSuppressionApproved, GovCatAgentAlert, GovObjAgentAlertSuppression, "A second person holding governance:approve brought a suppression into force."},
+	{GovEventAgentAlertSuppressionRejected, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression request was rejected or withdrawn."},
+	{GovEventAgentAlertSuppressionBreakGlass, GovCatAgentAlert, GovObjAgentAlertSuppression, "The workspace's only approver brought a suppression into force alone (break-glass); a review is due within 24 hours."},
+	{GovEventAgentAlertSuppressionEnded, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression in force was ended early or replaced by its renewal."},
+	{GovEventAgentAlertSuppressionExpired, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression reached its end."},
 	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
 	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
 }
@@ -326,28 +343,34 @@ const (
 	GovObjSessionRevocation = "session_revocation"
 	// Agent runtime alerts (payload key alert_id).
 	GovObjAgentAlert = "agent_alert"
+	// Detection rule versions (payload key rule_version_id) and alert
+	// suppressions (payload key suppression_id).
+	GovObjAgentAlertRule        = "agent_alert_rule_version"
+	GovObjAgentAlertSuppression = "agent_alert_suppression"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
 // column of iga_gov_event, or a payload key.
 var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
-	GovObjPolicy:            {column: "policy_id"},
-	GovObjVersion:           {column: "version_id"},
-	GovObjDeployment:        {column: "deployment_id"},
-	GovObjFinding:           {column: "finding_id"},
-	GovObjReview:            {payloadKey: "review_id"},
-	GovObjOwner:             {payloadKey: "owner_id"},
-	GovObjOwnerRule:         {payloadKey: "rule_id"},
-	GovObjFindingRule:       {payloadKey: "finding_rule_id"},
-	GovObjBinding:           {payloadKey: "binding_id"},
-	GovObjConnector:         {payloadKey: "connector_id"},
-	GovObjEvidenceBundle:    {payloadKey: "bundle_id"},
-	GovObjNotification:      {payloadKey: "notification_id"},
-	GovObjWorkload:          {payloadKey: "object_id"},
-	GovObjIdentityAccount:   {payloadKey: "object_id"},
-	GovObjTempGrant:         {payloadKey: "grant_id"},
-	GovObjSessionRevocation: {payloadKey: "revocation_id"},
-	GovObjAgentAlert:        {payloadKey: "alert_id"},
+	GovObjPolicy:                {column: "policy_id"},
+	GovObjVersion:               {column: "version_id"},
+	GovObjDeployment:            {column: "deployment_id"},
+	GovObjFinding:               {column: "finding_id"},
+	GovObjReview:                {payloadKey: "review_id"},
+	GovObjOwner:                 {payloadKey: "owner_id"},
+	GovObjOwnerRule:             {payloadKey: "rule_id"},
+	GovObjFindingRule:           {payloadKey: "finding_rule_id"},
+	GovObjBinding:               {payloadKey: "binding_id"},
+	GovObjConnector:             {payloadKey: "connector_id"},
+	GovObjEvidenceBundle:        {payloadKey: "bundle_id"},
+	GovObjNotification:          {payloadKey: "notification_id"},
+	GovObjWorkload:              {payloadKey: "object_id"},
+	GovObjIdentityAccount:       {payloadKey: "object_id"},
+	GovObjTempGrant:             {payloadKey: "grant_id"},
+	GovObjSessionRevocation:     {payloadKey: "revocation_id"},
+	GovObjAgentAlert:            {payloadKey: "alert_id"},
+	GovObjAgentAlertRule:        {payloadKey: "rule_version_id"},
+	GovObjAgentAlertSuppression: {payloadKey: "suppression_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.

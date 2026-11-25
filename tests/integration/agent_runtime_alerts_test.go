@@ -176,7 +176,7 @@ func TestAgentRuntimeAlertsPerWorkspaceAndIsolation(t *testing.T) {
 		{http.MethodPost, "/alerts/" + aID + "/resolve"},
 		{http.MethodGet, "/alerts/" + uuid.NewString()},
 	} {
-		if code, body := arCall(t, api, c.method, c.path, tokB, map[string]any{"reason": "not mine"}); code != http.StatusNotFound {
+		if code, body := arCall(t, api, c.method, c.path, tokB, map[string]any{"reason": "not mine", "outcome": "benign"}); code != http.StatusNotFound {
 			t.Errorf("B %s %s: %d %v, want 404", c.method, c.path, code, body)
 		}
 	}
@@ -192,10 +192,10 @@ func TestAgentRuntimeAlertsPerWorkspaceAndIsolation(t *testing.T) {
 	if code, body := arCall(t, api, http.MethodPost, "/alerts/"+aID+"/acknowledge", tokA, map[string]any{"reason": "looking"}); code != http.StatusOK || digs(body, "data", "state") != "acknowledged" {
 		t.Fatalf("A acknowledges: %d %v", code, body)
 	}
-	if code, body := arCall(t, api, http.MethodPost, "/alerts/"+aID+"/resolve", tokA, map[string]any{"reason": "expected rotation"}); code != http.StatusOK || digs(body, "data", "state") != "resolved" {
+	if code, body := arCall(t, api, http.MethodPost, "/alerts/"+aID+"/resolve", tokA, map[string]any{"reason": "expected rotation", "outcome": "benign"}); code != http.StatusOK || digs(body, "data", "state") != "resolved" {
 		t.Fatalf("A resolves: %d %v", code, body)
 	}
-	if code, body := arCall(t, api, http.MethodPost, "/alerts/"+aID+"/resolve", tokA, nil); code != http.StatusConflict {
+	if code, body := arCall(t, api, http.MethodPost, "/alerts/"+aID+"/resolve", tokA, map[string]any{"outcome": "benign"}); code != http.StatusConflict {
 		t.Errorf("resolving twice: %d %v, want 409", code, body)
 	}
 	var resolved int64
@@ -220,9 +220,18 @@ func TestAgentRuntimeAlertsPerWorkspaceAndIsolation(t *testing.T) {
 	}
 
 	// Settings are per workspace: A turns D1 off; B still alerts on D1.
-	if code, body := arCall(t, api, http.MethodPut, "/alert-settings", tokA, map[string]any{
-		"detections": map[string]any{"D1": map[string]any{"enabled": false}}}); code != http.StatusOK {
+	// Turning a detection off is tier 3 (F6): proposed by A's author,
+	// approved by A's approver.
+	arGrantApprove(t, db, a.ws, a.approver)
+	code, body := arCall(t, api, http.MethodPut, "/alert-settings", tokA, map[string]any{
+		"detections": map[string]any{"D1": map[string]any{"enabled": false}}})
+	if code != http.StatusAccepted || dig(body, "change", "pending") != true {
 		t.Fatalf("A puts settings: %d %v", code, body)
+	}
+	tokApprover := api.token(a.ws, a.approver, a.membershipOf(a.approver), "governance:read governance:approve")
+	if code, body := arCall(t, api, http.MethodPost, "/alert-settings/versions/"+digs(body, "change", "version", "id")+"/approve",
+		tokApprover, nil); code != http.StatusOK {
+		t.Fatalf("A approves: %d %v", code, body)
 	}
 	if code, body := arCall(t, api, http.MethodGet, "/alert-settings", tokB, nil); code != http.StatusOK || dig(body, "data", "saved") != false {
 		t.Fatalf("B's settings changed by A: %d %v", code, body)
