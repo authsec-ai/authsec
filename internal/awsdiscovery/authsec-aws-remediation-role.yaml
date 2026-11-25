@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec remediation - a SEPARATE, customer-consented stack that lets AuthSec
+  carry out a remediation a person in AuthSec requested and a second person
+  approved: remove a grant (detach a policy, rewrite or delete an inline or
+  customer-managed policy), rotate an IAM user's access key (the new key is
+  handed over ONLY through a Secrets Manager secret you tagged
+  authsec:key-handover=true), start a Secrets Manager rotation you configured,
+  and block a retired agent's identity with an AuthSec deny policy. It can
+  never read a secret value, never change an AuthSec-owned policy outside
+  /authsec/remediation/, and never touch service-linked roles, AWS reserved
+  roles, AuthSec's own roles or anything tagged authsec:protected=true.
+  Without this stack AuthSec only prepares changes (exact API calls, documents
+  and CLI commands) or opens pull requests. Deleting it removes AuthSec's
+  ability to remediate.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-11-25'
+    Kind: remediation
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Filled in by AuthSec - do not change
+        Parameters:
+          - AuthSecPrincipalArn
+          - ExternalId
+          - NameSuffix
+
+Parameters:
+
+  AuthSecPrincipalArn:
+    Type: String
+    Description: >-
+      The AuthSec AWS principal permitted to assume the remediation role. Copy
+      it from the AuthSec console.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(root|user\/.+|role\/.+)$'
+    ConstraintDescription: must be an IAM principal ARN.
+
+  # Minted for remediation alone: never equal to the discovery or the
+  # enforcement ExternalId. Not NoEcho, for the same reason as the other
+  # AuthSec templates (Quick Create ignores NoEcho parameters, and the value
+  # is readable in the trust policy anyway).
+  ExternalId:
+    Type: String
+    Description: >-
+      The AuthSec-generated ExternalId for remediation in this account. Filled
+      in by AuthSec; do not change it.
+    MinLength: 32
+    MaxLength: 1224
+    AllowedPattern: '^[\w+=,.@:\/-]+$'
+    ConstraintDescription: must be the ExternalId shown in the AuthSec console.
+
+  NameSuffix:
+    Type: String
+    Description: >-
+      The suffix AuthSec gave this binding. Names the remediation role
+      (AuthSecRemediation-<suffix>).
+    AllowedPattern: '^[a-z0-9]{1,16}$'
+    ConstraintDescription: must be the suffix shown in the AuthSec console.
+
+Resources:
+
+  AuthSecRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AuthSecRemediation-${NameSuffix}'
+      Description: >-
+        Write-only role assumed by AuthSec to carry out approved remediations.
+        It cannot read anything (AuthSec reads through its discovery role) and
+        can never read a secret value.
+      MaxSessionDuration: 3600
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthSecAssumeWithExternalId
+            Effect: Allow
+            Principal:
+              AWS: !Ref AuthSecPrincipalArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+
+      # The complete permission set. Nothing else is granted: no reads, no
+      # managed policies. Protection is by PATH and TAG, never by name.
+      Policies:
+        - PolicyName: AuthSecRemediationWrites
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # ------------------------------------------- retire: block
+
+              # AuthSec's own deny policies for a retired agent's identity,
+              # and only those: every policy AuthSec writes here lives under
+              # /authsec/remediation/. Never versioned (see the deny below).
+              - Sid: ManageRemediationPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:TagPolicy
+                  - iam:DeletePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/remediation/*'
+
+              # Attach (and, to undo, detach) an AuthSec remediation policy
+              # to a role or a user, and no other policy by this statement.
+              - Sid: AttachRemediationPolicies
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:AttachUserPolicy
+                  - iam:DetachUserPolicy
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+                Condition:
+                  ArnLike:
+                    iam:PolicyARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/remediation/*'
+
+              # ------------------------------------- remove a grant: detach
+
+              # Detach a managed policy (yours or an AWS managed one) from a
+              # role or a user. Never an AuthSec policy: the condition keeps
+              # AuthSec's containment, boundary and grant policies out of
+              # reach of a remediation.
+              - Sid: DetachCustomerPolicies
+                Effect: Allow
+                Action:
+                  - iam:DetachRolePolicy
+                  - iam:DetachUserPolicy
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+                Condition:
+                  ArnNotLike:
+                    iam:PolicyARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # ------------------------- remove a grant: rewrite or revert
+
+              # Rewrite one statement of a customer-managed policy (a new
+              # default version), restore a version from a snapshot, and
+              # delete the oldest non-default version when the policy already
+              # has five. AuthSec policies are excluded by DenyAuthSecPolicyVersions.
+              - Sid: VersionCustomerManagedPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicyVersion
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/*'
+
+              # Rewrite, restore or delete an inline policy of a role or a
+              # user.
+              #
+              # BREADTH, stated plainly (as enforcement DECISION R2-14): IAM
+              # has no condition key that limits PutRolePolicy /
+              # DeleteRolePolicy (or the user forms) to a policy NAME or a
+              # document, so this grant lets the role write any inline
+              # policy to any unprotected role or user. AuthSec's code only
+              # ever writes back the policy it read with one statement
+              # removed, or the document of a snapshot a person chose. The
+              # Protect* denies below still keep service-linked, AWS reserved,
+              # AuthSec-owned and authsec:protected principals out of reach.
+              - Sid: RewriteInlinePolicies
+                Effect: Allow
+                Action:
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:PutUserPolicy
+                  - iam:DeleteUserPolicy
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+
+              # ----------------------------------- rotate an IAM user's key
+
+              # Create the new key, deactivate the old one after its grace,
+              # and delete the new key again if it could not be handed over
+              # (its secret is never stored by AuthSec). ListAccessKeys is a
+              # read the rotation needs on the same session to count keys
+              # (IAM allows two per user).
+              - Sid: RotateUserAccessKeys
+                Effect: Allow
+                Action:
+                  - iam:ListAccessKeys
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+
+              # Hand the new key over: write it as a new version of a secret
+              # YOU created and tagged authsec:key-handover=true, and no other
+              # secret. AuthSec never reads it back.
+              - Sid: HandOverKeysThroughTaggedSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/authsec:key-handover: 'true'
+
+              # ------------------------------------------ rotate a secret
+
+              # Start the rotation YOU configured on a secret (its own
+              # rotation function or managed rotation), and read its metadata
+              # (rotation enabled, last rotated, version stages) -- never its
+              # value.
+              - Sid: StartSecretRotation
+                Effect: Allow
+                Action:
+                  - secretsmanager:RotateSecret
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:*'
+
+              # ----------------------------------------------- tagging
+
+              # Mark a remediated role or user with authsec:remediation=<id>
+              # (only tags whose key starts with authsec:remediation).
+              - Sid: TagRemediatedPrincipals
+                Effect: Allow
+                Action:
+                  - iam:TagRole
+                  - iam:TagUser
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+                Condition:
+                  ForAllValues:StringLike:
+                    aws:TagKeys: 'authsec:remediation*'
+
+              # ------------------------------------------------- protections
+
+              # Never read a secret value, whatever else is granted to this
+              # role now or later.
+              - Sid: NeverReadSecretValues
+                Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:BatchGetSecretValue
+                Resource: '*'
+
+              # AuthSec's own policies are versioned by the enforcement stack
+              # only; a remediation never rewrites them.
+              - Sid: DenyAuthSecPolicyVersions
+                Effect: Deny
+                Action:
+                  - iam:CreatePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicyVersion
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/authsec/*'
+
+              # Never service-linked roles or AWS reserved (SSO) roles, by
+              # path.
+              - Sid: ProtectServiceRoles
+                Effect: Deny
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:TagRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-reserved/*'
+
+              # Never AuthSec's own roles and users (discovery, enforcement,
+              # this one), by tag.
+              - Sid: ProtectAuthSecPrincipals
+                Effect: Deny
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:TagRole
+                  - iam:AttachUserPolicy
+                  - iam:DetachUserPolicy
+                  - iam:PutUserPolicy
+                  - iam:DeleteUserPolicy
+                  - iam:TagUser
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ManagedBy: AuthSec
+
+              # Never anything you have tagged authsec:protected=true: roles,
+              # users, customer-managed policies and secrets.
+              - Sid: ProtectTaggedResources
+                Effect: Deny
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:TagRole
+                  - iam:AttachUserPolicy
+                  - iam:DetachUserPolicy
+                  - iam:PutUserPolicy
+                  - iam:DeleteUserPolicy
+                  - iam:TagUser
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
+                  - iam:CreatePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicyVersion
+                  - secretsmanager:RotateSecret
+                  - secretsmanager:PutSecretValue
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/authsec:protected: 'true'
+
+      Tags:
+        - Key: ManagedBy
+          Value: AuthSec
+        - Key: Purpose
+          Value: remediation
+
+Outputs:
+
+  RoleArn:
+    Description: >-
+      Paste this back into the AuthSec console (Remediation > Setup). Not
+      secret.
+    Value: !GetAtt AuthSecRemediationRole.Arn
+
+  AccountId:
+    Description: The AWS account this remediation binding covers.
+    Value: !Ref 'AWS::AccountId'
+
+  TemplateVersion:
+    Description: Identifies which remediation permission set this stack granted.
+    Value: '2026-11-25'

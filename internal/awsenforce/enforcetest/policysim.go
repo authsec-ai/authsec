@@ -164,6 +164,12 @@ func (st Statement) matches(r Request) bool {
 		for key, vals := range kv {
 			got, present := r.Context[key]
 			if !present {
+				// IAM: a negated operator, and a ForAllValues set
+				// operator, hold on a key absent from the request. Every
+				// other operator fails.
+				if absentHolds(op) {
+					continue
+				}
 				return false
 			}
 			if !conditionHolds(op, got, vals) {
@@ -174,7 +180,34 @@ func (st Statement) matches(r Request) bool {
 	return true
 }
 
+// absentHolds reports the operators that hold when their key is absent from
+// the request (ArnNotLike, ForAllValues:StringLike). Only the operators the
+// remediation template uses are modelled; the enforcement templates use
+// neither, so their simulated decisions are unchanged.
+func absentHolds(op string) bool {
+	return op == "ArnNotLike" || op == "ForAllValues:StringLike"
+}
+
 func conditionHolds(op, got string, vals []string) bool {
+	switch op {
+	case "ArnNotLike":
+		// Holds when the value matches none of the patterns.
+		for _, v := range vals {
+			if glob(v, got, false) {
+				return false
+			}
+		}
+		return true
+	case "ForAllValues:StringLike":
+		// A multi-valued key is given as a comma-separated list: every
+		// value must match one of the patterns.
+		for _, g := range strings.Split(got, ",") {
+			if !anyGlob(vals, g, false) {
+				return false
+			}
+		}
+		return true
+	}
 	for _, v := range vals {
 		switch op {
 		case "StringEquals", "ArnEquals":
