@@ -108,6 +108,19 @@ func TestAgentCaseBundleHashStable(t *testing.T) {
 	}
 }
 
+func TestAgentCaseCanonicalJSON(t *testing.T) {
+	got, err := AgentCaseCanonicalJSON([]byte(`{"b": [1, 2.50, {"z": "<&>", "a": null}], "a": "x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"a":"x","b":[1,2.50,{"a":null,"z":"<&>"}]}`; string(got) != want {
+		t.Fatalf("canonical: %s, want %s", got, want)
+	}
+	if _, err := AgentCaseCanonicalJSON([]byte(`{`)); err == nil {
+		t.Fatal("bad JSON accepted")
+	}
+}
+
 func TestAgentCaseTiers(t *testing.T) {
 	for a, want := range map[string]int{"close": 0, "export": 0, "open": 1, "assign": 1, "lower_severity": 3} {
 		if got, ok := AgentCaseActionTier[a]; !ok || got != want {

@@ -28,14 +28,14 @@ func acAlert(t *testing.T, db *gorm.DB, ws, conn, identity uuid.UUID, workloads 
 	wl, _ := json.Marshal(workloads)
 	evID := "ev-" + uuid.NewString()[:12]
 	ev, _ := json.Marshal([]map[string]any{{"event_id": evID, "time": first, "source": "secretsmanager.amazonaws.com", "name": "GetSecretValue"}})
-	var id uuid.UUID
+	var ids []uuid.UUID
 	if err := db.Raw(`INSERT INTO agent_alert (workspace_id, connector_id, identity_id, workload_ids, subject_label, subject_name, detection,
 	                     severity, title, dedupe_key, first_seen, last_seen, event_count, evidence, state)
 	                  VALUES (?, ?, ?, ?::jsonb, 'agent', 'order-agent', ?, ?, ?, ?, ?, ?, 1, ?::jsonb, 'open') RETURNING id`,
-		ws, conn, identity, string(wl), det, sev, det+": order-agent", identity.String()+"/"+det+"/"+evID, first, last, string(ev)).Scan(&id).Error; err != nil {
-		t.Fatal(err)
+		ws, conn, identity, string(wl), det, sev, det+": order-agent", identity.String()+"/"+det+"/"+evID, first, last, string(ev)).Scan(&ids).Error; err != nil || len(ids) != 1 {
+		t.Fatal(err, ids)
 	}
-	return id
+	return ids[0]
 }
 
 // acCaseOf is the case an alert is in (uuid.Nil: none).
@@ -451,7 +451,7 @@ func TestAgentCasesRoutesAndIsolation(t *testing.T) {
 		t.Fatalf("export hash not stable: %s %s", h1, h2)
 	}
 	raw, _ := json.Marshal(dig(body1, "data", "bundle"))
-	if services.AgentCaseBundleHash(raw) != h1 {
+	if canon, err := services.AgentCaseCanonicalJSON(raw); err != nil || services.AgentCaseBundleHash(canon) != h1 {
 		t.Errorf("the hash is not over the bundle served")
 	}
 	if digs(body1, "data", "bundle", "format") != services.AgentCaseExportFormat || len(digl(body1, "data", "bundle", "notes")) != 1 {

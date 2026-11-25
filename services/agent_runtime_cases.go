@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1477,8 +1478,10 @@ type AgentCaseBundle struct {
 	Log      []AgentCaseLogEntry `json:"log"`
 }
 
-// AgentCaseExport is POST /cases/:id/export: Bundle is the exact JSON the
-// SHA256 (hex) is computed over.
+// AgentCaseExport is POST /cases/:id/export. SHA256 (hex) is over the
+// bundle's canonical JSON (AgentCaseCanonicalJSON: object keys sorted,
+// compact, no HTML escaping), so a receiver re-encodes the bundle it got
+// that way and compares.
 type AgentCaseExport struct {
 	Bundle     json.RawMessage `json:"bundle"`
 	SHA256     string          `json:"sha256"`
@@ -1486,10 +1489,28 @@ type AgentCaseExport struct {
 	ExportedBy uuid.UUID       `json:"exported_by"`
 }
 
-// AgentCaseBundleHash is the hex sha256 of a bundle's JSON.
+// AgentCaseBundleHash is the hex sha256 of a bundle's canonical JSON.
 func AgentCaseBundleHash(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// AgentCaseCanonicalJSON re-encodes JSON canonically: object keys sorted,
+// numbers as written, compact, without HTML escaping.
+func AgentCaseCanonicalJSON(raw []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
 // Export is POST /cases/:id/export (tier 0, one case): the case's evidence
@@ -1513,6 +1534,9 @@ func (s *AgentCaseService) Export(ctx context.Context, ws, id, actor uuid.UUID) 
 		raw, err := json.Marshal(AgentCaseBundle{Format: AgentCaseExportFormat, Case: v.AgentCase, Alerts: v.Alerts,
 			Evidence: v.Evidence, Asks: v.Asks, Stops: v.Stops, Notes: v.Notes, Links: v.Links, Log: v.Log})
 		if err != nil {
+			return err
+		}
+		if raw, err = AgentCaseCanonicalJSON(raw); err != nil {
 			return err
 		}
 		sum := AgentCaseBundleHash(raw)
