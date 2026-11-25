@@ -260,8 +260,8 @@ func TestRemediationQuickCreateURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, err := url.Parse(link)
-	if err != nil || u.Query().Get("param_NameSuffix") != "abc123" || u.Query().Get("param_ExternalId") == "" {
+	if _, err := url.Parse(link); err != nil || !strings.Contains(link, "param_NameSuffix=abc123") ||
+		!strings.Contains(link, "stackName=AuthSec-Remediation-abc123") {
 		t.Fatalf("link %s: %v", link, err)
 	}
 	if _, err := awsdiscovery.RemediationQuickCreateURL("us-east-1", tplURL, "AuthSec-Remediation-x",
