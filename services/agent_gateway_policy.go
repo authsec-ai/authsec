@@ -414,6 +414,10 @@ func decisionContext(id uuid.UUID, res agentgateway.Result, mode string, ttl int
 	if id != uuid.Nil {
 		ctx["decision_id"] = id.String()
 	}
+	if res.Allowed && !res.ArgBounds.Empty() {
+		// The gateway checks the call's arguments against these (P17).
+		ctx["arg_bounds"] = res.ArgBounds
+	}
 	return ctx
 }
 
@@ -525,7 +529,10 @@ type AgentGatewayPolicyHints struct {
 	CacheTTLSeconds int                           `json:"cache_ttl_seconds"`
 	Stopped         []agentgateway.StoppedSubject `json:"stopped"`
 	PolicyVersion   string                        `json:"policy_version"`
-	Version         string                        `json:"version"`
+	// AgentKeys are the live AuthSec-issued agent keys the gateway may
+	// accept (hash and bound workload identity), W6.
+	AgentKeys []AgentGatewayKeyHint `json:"agent_keys"`
+	Version   string                `json:"version"`
 	AsOf            time.Time                     `json:"as_of"`
 }
 
@@ -554,13 +561,17 @@ func (s *AgentGatewayService) PolicyHints(ctx context.Context, p AgentGatewayPri
 		t = []agentgateway.Target{}
 	}
 	var stops []agentgateway.StoppedSubject
+	var keys []AgentGatewayKeyHint
 	var gw *agentGatewayRow
 	err = tenancy.InWorkspaceRead(ctx, s.db, p.WorkspaceID, func(tx *gorm.DB) error {
 		var err error
 		if gw, err = readAgentGateway(tx, p.WorkspaceID, p.GatewayID); err != nil {
 			return err
 		}
-		stops, err = readContainmentStops(tx, p.WorkspaceID)
+		if stops, err = readContainmentStops(tx, p.WorkspaceID); err != nil {
+			return err
+		}
+		keys, err = agentKeyHints(tx, p.WorkspaceID, p.GatewayID)
 		return err
 	})
 	if err != nil {
@@ -573,7 +584,7 @@ func (s *AgentGatewayService) PolicyHints(ctx context.Context, p AgentGatewayPri
 	}
 	h := AgentGatewayPolicyHints{Mode: set.settings.Mode, DenyTargets: t, TTLSeconds: AgentGatewayHintsTTL,
 		FailMode: gw.FailMode, CacheTTLSeconds: gatewayCacheTTL(set.settings.CacheTTLSeconds, gw.CacheTTLSeconds),
-		Stopped: stops, PolicyVersion: set.version}
+		Stopped: stops, PolicyVersion: set.version, AgentKeys: keys}
 	h.Version = hintsVersion(h)
 	h.AsOf = s.now().UTC()
 	return h, nil
