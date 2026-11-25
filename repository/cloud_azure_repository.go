@@ -556,10 +556,22 @@ func (r *cloudAzureRepository) UpsertResources(workspaceID, connectorID uuid.UUI
 			// Sensitivity follows AuthSec's rule only while AuthSec's rule set
 			// it: a customer's own classification is never stamped over.
 			DoUpdates: clause.Assignments(map[string]interface{}{
-				"sensitivity": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source = ? THEN EXCLUDED.sensitivity ELSE cloud_resource.sensitivity END",
-					models.SensitivityFromHeuristic),
-				"sensitivity_reason": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source = ? THEN EXCLUDED.sensitivity_reason ELSE cloud_resource.sensitivity_reason END",
-					models.SensitivityFromHeuristic),
+				//
+				// The resource's own tags (provider_metadata, 179) refresh the
+				// same way: a tag changed or removed is followed, a person's
+				// classification never is.
+				"sensitivity": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source IN (?, ?) THEN EXCLUDED.sensitivity ELSE cloud_resource.sensitivity END",
+					models.SensitivityFromHeuristic, models.SensitivityFromProvider),
+				"sensitivity_reason": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source IN (?, ?) THEN EXCLUDED.sensitivity_reason ELSE cloud_resource.sensitivity_reason END",
+					models.SensitivityFromHeuristic, models.SensitivityFromProvider),
+				"sensitivity_source": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source IN (?, ?) THEN EXCLUDED.sensitivity_source ELSE cloud_resource.sensitivity_source END",
+					models.SensitivityFromHeuristic, models.SensitivityFromProvider),
+				"crown_jewel": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source = ? THEN cloud_resource.crown_jewel ELSE EXCLUDED.crown_jewel END",
+					models.SensitivityFromCustomer),
+				"data_category": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source = ? THEN cloud_resource.data_category ELSE EXCLUDED.data_category END",
+					models.SensitivityFromCustomer),
+				"residency": gorm.Expr("CASE WHEN cloud_resource.sensitivity_source = ? THEN cloud_resource.residency ELSE EXCLUDED.residency END",
+					models.SensitivityFromCustomer),
 				"connector_id":         gorm.Expr("EXCLUDED.connector_id"),
 				"kind":                 gorm.Expr("EXCLUDED.kind"),
 				"name":                 gorm.Expr("EXCLUDED.name"),

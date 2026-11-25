@@ -93,6 +93,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// Agent runtime visibility P3: agent containment, the same auth,
 		// envelope and policy gate (agent_runtime_contain_controller.go).
 		platformCtrl.MountAgentRuntimeContainRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
+		// One agent id, lifecycle, classification, directory, responder
+		// groups and hygiene (SPEC-secops-backend-upgrade.md W7):
+		// /api/iga/v1/{agent-identities,agent-changes,resources/:id/classification,
+		// directory,agent-hygiene,responder-groups} (agent_identity_controller.go).
+		platformCtrl.MountAgentIdentityRoutes(r, platformCtrl.NewAgentIdentityControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a

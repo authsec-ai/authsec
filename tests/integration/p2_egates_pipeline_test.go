@@ -225,9 +225,15 @@ func TestP2EgatesE1ConnectAndPublishFirstGraph(t *testing.T) {
 	if st := l.barrier(); st != models.PipelineIdle {
 		t.Errorf("barrier = %s, want idle", st)
 	}
-	for _, table := range []string{"iga_agents", "iga_agent_instances"} {
-		if n := l.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`, l.ws); n != 0 {
-			t.Errorf("%s has %d rows after an AWS scan, want 0 (AWS workloads are never GitHub agents)", table, n)
+	// No AWS row is an iga_agents agent. Since W7 (178) an AWS agent's
+	// instances are written to iga_agent_instances under its one agent id
+	// (agent_ref), never under an iga_agents row (agent_id stays NULL).
+	for table, q := range map[string]string{
+		"iga_agents":          `SELECT count(*) FROM iga_agents WHERE workspace_id = ?`,
+		"iga_agent_instances": `SELECT count(*) FROM iga_agent_instances WHERE workspace_id = ? AND (agent_id IS NOT NULL OR agent_ref IS NULL)`,
+	} {
+		if n := l.count(q, l.ws); n != 0 {
+			t.Errorf("%s has %d iga_agents-owned rows after an AWS scan, want 0 (AWS workloads are never GitHub agents)", table, n)
 		}
 	}
 	// The run itself says what became of its projection (§5.3, T2.2).

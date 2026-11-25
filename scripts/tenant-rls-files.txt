@@ -156,3 +156,9 @@ services/audit_governance.go
 services/audit_governance_chain.go
 services/audit_governance_jobs.go
 services/audit_governance_operators.go
+services/agent_identity.go
+services/agent_instances.go
+services/agent_hygiene.go
+services/directory.go
+services/resource_classification.go
+services/responder_groups.go

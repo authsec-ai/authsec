@@ -339,6 +339,9 @@ func (s *AzureOnboardingService) runTenantScan(ctx context.Context, workspaceID,
 
 	users, err := s.api.ListUsers(ctx, graphToken)
 	surfaces[models.SurfaceEntraUsers] = listSurface("GET /v1.0/users", len(users), err)
+	// The directory (W7, C10): manager, accountEnabled and leave date of
+	// every person. Best-effort: a refusal never changes this pass.
+	syncEntraDirectoryBestEffort(ctx, s.db, s.api, workspaceID, graphToken)
 	groups, err := s.api.ListGroups(ctx, graphToken)
 	surfaces[models.SurfaceEntraGroups] = listSurface("GET /v1.0/groups", len(groups), err)
 	members, membersSurface := s.readGroupMembers(ctx, graphToken, groups)

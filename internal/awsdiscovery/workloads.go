@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
@@ -103,6 +104,17 @@ type Workload struct {
 	// what the agent thinks with.
 	FoundationModel string
 	Status          string
+
+	// The running version, for agent instances (SPEC-secops W7, P12):
+	// ArtifactDigest is what was deployed (a Lambda's CodeSha256, a container
+	// image digest or reference), ArtifactVersion the provider's version label
+	// (a Lambda version, a task definition revision, an AgentCore runtime
+	// version, a Bedrock agent version) and Deployer the principal the
+	// provider says registered it (ECS registeredBy). Empty when the provider
+	// does not say.
+	ArtifactDigest  string
+	ArtifactVersion string
+	Deployer        string
 
 	// SourceAPI is the call that actually produced this row's data, so its
 	// evidence never names a call that did not return it: bedrock:GetAgent
@@ -215,6 +227,8 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 				Status:              string(fn.State),
 				VPCSubnetIDs:        lambdaVPCSubnets(fn.VpcConfig),
 				VPCSecurityGroupIDs: lambdaVPCSecurityGroups(fn.VpcConfig),
+				ArtifactDigest:      lambdaCodeDigest(fn.CodeSha256),
+				ArtifactVersion:     aws.ToString(fn.Version),
 				SourceAPI:           "lambda:ListFunctions",
 			})
 		}
@@ -332,8 +346,39 @@ func (r *WorkloadReader) taskDefinitionDetail(ctx context.Context, arn string, d
 		RoleARN:          aws.ToString(td.TaskRoleArn),
 		ExecutionRoleARN: aws.ToString(td.ExecutionRoleArn),
 		Status:           string(td.Status),
+		ArtifactDigest:   ecsImageDigest(td.ContainerDefinitions),
+		ArtifactVersion:  fmt.Sprintf("%d", td.Revision),
+		Deployer:         aws.ToString(td.RegisteredBy),
 		SourceAPI:        "ecs:DescribeTaskDefinition",
 	}
+}
+
+// lambdaCodeDigest is a function's deployment package hash as Lambda reports
+// it (base64 SHA-256), prefixed so it never reads as a container digest.
+func lambdaCodeDigest(sha *string) string {
+	if v := aws.ToString(sha); v != "" {
+		return "lambda-sha256:" + v
+	}
+	return ""
+}
+
+// ecsImageDigest is the task definition's container images: each image's
+// digest when it was pinned by one (repo@sha256:...), else its reference,
+// sorted and joined, so the same images always give the same value.
+func ecsImageDigest(defs []ecstypes.ContainerDefinition) string {
+	var out []string
+	for _, d := range defs {
+		img := aws.ToString(d.Image)
+		if img == "" {
+			continue
+		}
+		if i := strings.Index(img, "@sha256:"); i >= 0 {
+			img = img[i+1:]
+		}
+		out = append(out, img)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }
 
 // taskDefinitionFamily reads the family out of a task definition ARN

@@ -353,6 +353,8 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventOperatorUnsuspended, GovCatAuditGovernance, GovObjOperator, "An operator's suspension was lifted by a second person (or by break-glass)."},
 }
 
+func init() { GovEventVocabulary = append(GovEventVocabulary, agentLifecycleVocabulary...) }
+
 // Object kinds the events API filters on.
 const (
 	GovObjPolicy             = "policy"
@@ -411,6 +413,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjAgentCase:             {payloadKey: "case_id"},
 	GovObjAuditChange:           {payloadKey: "change_id"},
 	GovObjOperator:              {payloadKey: "operator_id"},
+	GovObjAgent:                 {payloadKey: "agent_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.
