@@ -127,7 +127,30 @@ type Client interface {
 	// KeyEvents is key created / deleted events since since; nil without an
 	// audit log (Anthropic) or when the organisation has not enabled it.
 	KeyEvents(ctx context.Context, since time.Time) ([]KeyEvent, error)
+	// UsageMinutes is usage in [from, to) in 1-minute buckets (both
+	// providers report 1m buckets, at most 1440 per page), limited to keyIDs
+	// when given (W6).
+	UsageMinutes(ctx context.Context, from, to time.Time, keyIDs []string) ([]UsageRow, error)
+	// Costs is cost in [from, to) in daily buckets (the finest both report):
+	// OpenAI per API key, Anthropic per workspace (ProjectID).
+	Costs(ctx context.Context, from, to time.Time) ([]CostRow, error)
 }
+
+// CostRow is one day of cost (USD) of one key (OpenAI) or one workspace
+// (Anthropic; KeyID "").
+type CostRow struct {
+	KeyID       string
+	ProjectID   string
+	BucketStart time.Time
+	USD         float64
+}
+
+// Bucket widths.
+const (
+	WidthMinute = "1m"
+	WidthHour   = "1h"
+	WidthDay    = "1d"
+)
 
 // Error is a provider call that failed. Message never contains the admin key.
 type Error struct {
@@ -311,12 +334,15 @@ type usageKey struct {
 type usageAgg struct {
 	m     map[usageKey]*UsageRow
 	order []usageKey
+	width time.Duration
 }
 
-func newUsageAgg() *usageAgg { return &usageAgg{m: map[usageKey]*UsageRow{}} }
+func newUsageAgg() *usageAgg { return &usageAgg{m: map[usageKey]*UsageRow{}, width: time.Hour} }
+
+func newUsageAggWidth(w time.Duration) *usageAgg { return &usageAgg{m: map[usageKey]*UsageRow{}, width: w} }
 
 func (a *usageAgg) add(r UsageRow) {
-	r.BucketStart = r.BucketStart.UTC().Truncate(time.Hour)
+	r.BucketStart = r.BucketStart.UTC().Truncate(a.width)
 	k := usageKey{r.KeyID, r.ProjectID, r.Model, r.BucketStart.Unix()}
 	cur := a.m[k]
 	if cur == nil {
