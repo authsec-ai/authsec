@@ -427,6 +427,7 @@ func TestRemediationRotateIAMKeyNoSecretAnywhere(t *testing.T) {
 	arExec(t, db, `DELETE FROM role_permissions WHERE role_id = (SELECT role_id FROM workspace_memberships WHERE id = ?)`, w.approverM)
 	now := time.Now().UTC()
 	remInstall(t, db, w.fake, &now)
+	w.fake.Now = func() time.Time { return now } // the account's clock is the test's (event times)
 	user := strings.TrimPrefix(w.userARN, "arn:aws:iam::"+w.account+":user/")
 	u := w.fake.AddUser(user, nil, awsremediate.AccessKey{ID: "AKIAOLDKEY0000000001", Active: true})
 	sec := w.fake.AddSecret("bot-key", map[string]string{"authsec:key-handover": "true"}, false)
