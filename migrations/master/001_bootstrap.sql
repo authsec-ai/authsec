@@ -13994,3 +13994,149 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agentkit_policies');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 193: agent containment proof states, stop levels, target, narrowed_from.
+-- Same objects as migrations/master/193_agent_containment_proof_levels.sql.
+-- ============================================================================
+
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS proof_state text NOT NULL DEFAULT 'requested';
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS proven_by_event_id text;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS skew_ms bigint;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS token_expiry_at timestamptz;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS target text NOT NULL DEFAULT '';
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS narrowed_from uuid;
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_proof_state_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_proof_state_check
+  CHECK (proof_state IN ('requested','applied','proven','unproven','cannot_verify','kept'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_level_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_level_check
+  CHECK (level IN ('workload','identity','model','key','sessions_before','chain','source_identity',
+                   'entra','kubernetes','gateway','platform'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_identity_kind_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_identity_kind_check
+  CHECK (identity_kind IN ('iam_role','iam_user','entra_service_principal','entra_agent_identity',
+                           'k8s_service_account','gateway_agent','platform_principal'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_state_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_state_check
+  CHECK (state IN ('previewed','requested','containing','contained','partially_contained','failed','releasing','released'));
+
+ALTER TABLE public.agent_containment_step DROP CONSTRAINT IF EXISTS agent_containment_step_kind_check;
+ALTER TABLE public.agent_containment_step ADD CONSTRAINT agent_containment_step_kind_check
+  CHECK (kind IN ('lambda_concurrency','ecs_desired','ecs_autoscaling','iam_policy','session_revoke','access_key',
+                  'assumer_policy','entra_account','azure_role_assignment','k8s_binding_subject'));
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_containment_narrowed_from_fkey'
+                     AND conrelid = 'public.agent_containment'::regclass) THEN
+        ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_narrowed_from_fkey
+          FOREIGN KEY (workspace_id, narrowed_from) REFERENCES public.agent_containment (workspace_id, id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agent_containment_narrowed_from ON public.agent_containment (workspace_id, narrowed_from)
+  WHERE narrowed_from IS NOT NULL;
+
+-- One live containment per (workspace, identity, level, target).
+DROP INDEX IF EXISTS public.uq_agent_containment_live;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_live ON public.agent_containment (workspace_id, identity_id, level, target)
+  WHERE state IN ('previewed','requested','containing','contained','partially_contained','releasing');
+
+-- Backfill the proof columns of the rows written before 193.
+UPDATE public.agent_containment c SET
+  proof_state = CASE
+    WHEN c.state IN ('previewed','requested','containing','failed') THEN 'requested'
+    WHEN c.state = 'released' AND (c.pending_restore_at IS NOT NULL OR EXISTS (
+           SELECT 1 FROM public.agent_containment_step s
+            WHERE s.workspace_id = c.workspace_id AND s.containment_id = c.id
+              AND s.kind = 'access_key' AND s.after->>'rotate_required' = 'true')) THEN 'kept'
+    WHEN c.verified_at IS NOT NULL AND c.effective IS TRUE THEN 'proven'
+    WHEN c.effective IS FALSE THEN 'unproven'
+    WHEN c.verification->'unverifiable'->>'final' = 'true' THEN 'cannot_verify'
+    WHEN c.verification ? 'unverifiable' THEN 'unproven'
+    WHEN c.state = 'released' THEN 'unproven'
+    ELSE 'applied' END,
+  proven_by_event_id = NULLIF(c.verification->'proof'->>'event_id', ''),
+  token_expiry_at = CASE
+    WHEN c.level IN ('identity','model') AND c.identity_kind = 'iam_role'
+      THEN date_trunc('second', c.created_at) + interval '13 hours'
+    WHEN c.level IN ('identity','model') AND c.identity_kind = 'iam_user'
+      THEN date_trunc('second', c.created_at) + interval '36 hours'
+    ELSE NULL END
+WHERE c.proof_state = 'requested' AND c.proven_by_event_id IS NULL AND c.token_expiry_at IS NULL;
+
+-- ============================================================================
+-- 194: containment holds and release requests (second person).
+-- Same objects as migrations/master/194_agent_containment_holds.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_containment_release_request (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id  uuid NOT NULL,
+  -- NULL: release of a containment no case holds.
+  case_id         uuid,
+  reason          text NOT NULL CHECK (btrim(reason) <> ''),
+  state           text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','approved','rejected','withdrawn')),
+  requested_by    uuid NOT NULL REFERENCES users(id),
+  requested_at    timestamptz NOT NULL DEFAULT now(),
+  decided_by      uuid REFERENCES users(id),
+  decided_at      timestamptz,
+  decision_reason text NOT NULL DEFAULT '',
+  break_glass     boolean NOT NULL DEFAULT false,
+  review_due_at   timestamptz,
+  reviewed_by     uuid REFERENCES users(id),
+  reviewed_at     timestamptz,
+  review_note     text NOT NULL DEFAULT '',
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE,
+  CONSTRAINT agent_containment_release_request_second_person_chk
+    CHECK (decided_by IS NULL OR break_glass OR decided_by <> requested_by),
+  CONSTRAINT agent_containment_release_request_review_chk
+    CHECK (reviewed_by IS NULL OR reviewed_by <> requested_by),
+  CONSTRAINT agent_containment_release_request_break_glass_chk
+    CHECK (NOT break_glass OR review_due_at IS NOT NULL),
+  CONSTRAINT agent_containment_release_request_decided_chk
+    CHECK ((state = 'pending') = (decided_at IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_release_request_pending
+  ON agent_containment_release_request (workspace_id, containment_id, (coalesce(case_id, '00000000-0000-0000-0000-000000000000'::uuid)))
+  WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_agent_containment_release_request_state
+  ON agent_containment_release_request (workspace_id, state, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_release_request_review
+  ON agent_containment_release_request (workspace_id, review_due_at)
+  WHERE break_glass AND reviewed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS agent_containment_hold (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id       uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id     uuid NOT NULL,
+  case_id            uuid NOT NULL, -- FK to agent_case added when W3 merges
+  state              text NOT NULL DEFAULT 'active' CHECK (state IN ('active','released')),
+  held_by            uuid NOT NULL REFERENCES users(id),
+  held_at            timestamptz NOT NULL DEFAULT now(),
+  released_by        uuid REFERENCES users(id),
+  released_at        timestamptz,
+  release_reason     text NOT NULL DEFAULT '',
+  release_request_id uuid,
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, release_request_id) REFERENCES agent_containment_release_request (workspace_id, id),
+  CONSTRAINT agent_containment_hold_released_chk CHECK ((state = 'released') = (released_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_hold_active
+  ON agent_containment_hold (workspace_id, containment_id, case_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_containment_hold_case ON agent_containment_hold (workspace_id, case_id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_containment_release_request');
+        PERFORM public.tenancy_enable_rls('public.agent_containment_hold');
+    END IF;
+END $$;

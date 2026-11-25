@@ -112,7 +112,26 @@ type Step struct {
 	RestoreAfter *time.Time
 	AppliedAt    *time.Time
 	RestoredAt   *time.Time
+	// Principal is the entity a policy step attaches to when it is not the
+	// run's subject (an assumer of a chain stop). Set by the plan; Before
+	// records it in PolicyBefore, which is where later runs read it.
+	Principal *Principal
 }
+
+// StepRunner is what the containment job drives for one level family: the
+// AWS Engine, and the Entra and Kubernetes runners. A *StepError is a
+// definitive refusal; ErrWaiting means the change was handed on and its
+// answer is not in yet (the step stays pending); any other error is
+// transient.
+type StepRunner interface {
+	Before(ctx context.Context, st *Step) (skip bool, err error)
+	Apply(ctx context.Context, st *Step) error
+	Restore(ctx context.Context, st *Step) error
+	Readback(ctx context.Context, st *Step) (inPlace bool, detail string, err error)
+}
+
+// ErrWaiting is a step handed to an agent whose answer is not in yet.
+var ErrWaiting = errors.New("waiting for the change to be applied")
 
 // The before/after documents.
 type (
@@ -135,6 +154,10 @@ type (
 		// false for a policy AuthSec creates for this containment.
 		Existed  bool `json:"existed"`
 		Attached bool `json:"attached"`
+		// The principal of an assumer_policy step (chain level).
+		PrincipalKind     string `json:"principal_kind,omitempty"`
+		PrincipalName     string `json:"principal_name,omitempty"`
+		PrincipalUniqueID string `json:"principal_unique_id,omitempty"`
 	}
 	KeyBefore struct {
 		UserName string `json:"user_name"`
@@ -152,6 +175,12 @@ type Run struct {
 	// containment's request time (R2-12: never earlier than the request).
 	Cutoff time.Time
 	Now    func() time.Time
+	// Target is what the stop names within the identity: the access key id
+	// (key) or the agent reference (source_identity).
+	Target string
+	// Assumers are the chain level's assumers (only enforceable ones get a
+	// step).
+	Assumers []Assumer
 }
 
 func (r Run) now() time.Time {
@@ -176,15 +205,36 @@ func (r Run) partition() string {
 // access-key steps of a user, which are read live (AccessKeySteps).
 func (r Run) IAMSteps() []Step {
 	var out []Step
+	revoke := func(deferred bool) Step {
+		rname := RevokePolicyName(r.Subject.UniqueID, r.ContainmentID)
+		st := Step{Kind: StepSessionRevoke, Target: PolicyARN(r.partition(), r.Subject.AccountID, rname)}
+		if deferred {
+			ra := RevokeRemoveAfter(r.Cutoff)
+			st.RestoreAfter = &ra
+		}
+		return st
+	}
 	switch r.Level {
-	case LevelIdentity, LevelModel:
+	case LevelIdentity, LevelModel, LevelSourceIdentity:
 		name := ContainPolicyName(r.Subject.UniqueID, r.ContainmentID)
 		out = append(out, Step{Kind: StepIAMPolicy, Target: PolicyARN(r.partition(), r.Subject.AccountID, name)})
 		if r.Level == LevelIdentity && r.Subject.Kind == IdentityRole {
-			rname := RevokePolicyName(r.Subject.UniqueID, r.ContainmentID)
-			ra := RevokeRemoveAfter(r.Cutoff)
-			out = append(out, Step{Kind: StepSessionRevoke, Target: PolicyARN(r.partition(), r.Subject.AccountID, rname), RestoreAfter: &ra})
+			out = append(out, revoke(true))
 		}
+	case LevelSessionsBefore:
+		// Alone, the revocation is the stop: release removes it at once.
+		out = append(out, revoke(false))
+	case LevelChain:
+		for _, a := range r.Assumers {
+			if !a.Enforceable {
+				continue
+			}
+			p := a.principal()
+			out = append(out, Step{Kind: StepAssumerPolicy, Principal: &p,
+				Target: PolicyARN(r.partition(), r.Subject.AccountID, ChainPolicyName(a.UniqueID, r.ContainmentID))})
+		}
+		// Sessions the chain already opened: refused until 13 hours after.
+		out = append(out, revoke(true))
 	}
 	return out
 }
@@ -219,6 +269,29 @@ func AccessKeySteps(ctx context.Context, aws AWS, userName string) ([]Step, erro
 		}
 	}
 	return out, nil
+}
+
+// KeyStep is the key level's one step: the named key of the user, if it is
+// Active (a key already Inactive is a skipped step: release must never
+// activate it). A key the user does not have is a definitive refusal.
+func KeyStep(ctx context.Context, aws AWS, userName, keyID string) (Step, bool, error) {
+	keys, err := aws.ListAccessKeys(ctx, userName)
+	if err != nil {
+		return Step{}, false, err
+	}
+	for _, k := range keys {
+		if k.ID != keyID {
+			continue
+		}
+		b, _ := json.Marshal(KeyBefore{UserName: userName, Status: "Active"})
+		st := Step{Kind: StepAccessKey, Target: k.ID, Before: b}
+		if !k.Active {
+			st.Error = "access key " + k.ID + " is already Inactive; nothing to stop"
+			return st, true, nil
+		}
+		return st, false, nil
+	}
+	return Step{}, false, refused("access_key_not_found", "%s has no access key %s", userName, keyID)
 }
 
 // Engine applies, reads back and restores steps of one run.
@@ -302,16 +375,21 @@ func (e *Engine) Before(ctx context.Context, st *Step) (skip bool, err error) {
 			return true, nil
 		}
 		st.Before, _ = json.Marshal(ScalingBefore{Registered: true, Suspended: t.Suspended})
-	case StepIAMPolicy, StepSessionRevoke:
-		r, err := e.AWS.ReadPolicy(ctx, st.Target, e.Run.principal())
+	case StepIAMPolicy, StepSessionRevoke, StepAssumerPolicy:
+		p := e.principalOf(st)
+		r, err := e.AWS.ReadPolicy(ctx, st.Target, p)
 		if err != nil {
 			return false, err
 		}
 		if r != nil && r.Exists && !e.ours(r) {
 			return false, refused("artifact_owned_elsewhere", "%s exists and is not this containment's policy", st.Target)
 		}
-		st.Before, _ = json.Marshal(PolicyBefore{PolicyARN: st.Target, PolicyName: IdentityNameOf(st.Target),
-			Existed: r != nil && r.Exists, Attached: r != nil && r.AttachedToPrincipal})
+		b := PolicyBefore{PolicyARN: st.Target, PolicyName: IdentityNameOf(st.Target),
+			Existed: r != nil && r.Exists, Attached: r != nil && r.AttachedToPrincipal}
+		if st.Kind == StepAssumerPolicy {
+			b.PrincipalKind, b.PrincipalName, b.PrincipalUniqueID = p.Kind, p.Name, p.UniqueID
+		}
+		st.Before, _ = json.Marshal(b)
 	case StepAccessKey:
 		if len(st.Before) == 0 {
 			return false, fmt.Errorf("access key step %s has no before-state", st.Target)
@@ -320,6 +398,25 @@ func (e *Engine) Before(ctx context.Context, st *Step) (skip bool, err error) {
 		return false, fmt.Errorf("unknown step kind %q", st.Kind)
 	}
 	return false, nil
+}
+
+// principalOf is the entity a policy step attaches to: the step's own
+// principal (an assumer, recorded in its before-state), else the subject.
+func (e *Engine) principalOf(st *Step) Principal {
+	if st.Kind == StepAssumerPolicy {
+		if st.Principal != nil {
+			return *st.Principal
+		}
+		var b PolicyBefore
+		if json.Unmarshal(st.Before, &b) == nil && b.PrincipalName != "" {
+			return Principal{Kind: b.PrincipalKind, Name: b.PrincipalName, UniqueID: b.PrincipalUniqueID}
+		}
+	}
+	return e.Run.principal()
+}
+
+func isPolicyStep(kind string) bool {
+	return kind == StepIAMPolicy || kind == StepSessionRevoke || kind == StepAssumerPolicy
 }
 
 func (e *Engine) tags(level string) map[string]string {
@@ -339,8 +436,12 @@ func (e *Engine) document(st *Step) (string, string, error) {
 	switch {
 	case st.Kind == StepSessionRevoke:
 		return RevokeDocument(e.Run.Cutoff)
+	case st.Kind == StepAssumerPolicy:
+		return ChainDocument(e.Run.Subject.ARN)
 	case e.Run.Level == LevelModel:
 		return DenyModelDocument()
+	case e.Run.Level == LevelSourceIdentity:
+		return SourceIdentityDocument(e.Run.Target)
 	default:
 		return DenyAllDocument()
 	}
@@ -399,7 +500,7 @@ func (e *Engine) Apply(ctx context.Context, st *Step) error {
 			return fmt.Errorf("readback: %s desired count is not 0", st.Target)
 		}
 		st.After, _ = json.Marshal(ECSBefore{ClusterARN: cl, DesiredCount: s.DesiredCount})
-	case StepIAMPolicy, StepSessionRevoke:
+	case StepIAMPolicy, StepSessionRevoke, StepAssumerPolicy:
 		return e.applyPolicy(ctx, st)
 	case StepAccessKey:
 		var b KeyBefore
@@ -441,7 +542,7 @@ func (e *Engine) writeErr(op string, st *Step, err error) error {
 }
 
 func (e *Engine) applyPolicy(ctx context.Context, st *Step) error {
-	p := e.Run.principal()
+	p := e.principalOf(st)
 	doc, hash, err := e.document(st)
 	if err != nil {
 		return err
@@ -449,6 +550,9 @@ func (e *Engine) applyPolicy(ctx context.Context, st *Step) error {
 	level := e.Run.Level
 	if st.Kind == StepSessionRevoke {
 		level = "session_revoke"
+	}
+	if st.Kind == StepAssumerPolicy {
+		level = LevelChain
 	}
 	for i := 0; i < 3; i++ {
 		r, err := e.AWS.ReadPolicy(ctx, st.Target, p)
@@ -569,7 +673,7 @@ func (e *Engine) Restore(ctx context.Context, st *Step) error {
 		if s != nil && s.DesiredCount != b.DesiredCount {
 			return fmt.Errorf("readback: %s desired count is %d, want %d", st.Target, s.DesiredCount, b.DesiredCount)
 		}
-	case StepIAMPolicy, StepSessionRevoke:
+	case StepIAMPolicy, StepSessionRevoke, StepAssumerPolicy:
 		return e.restorePolicy(ctx, st)
 	case StepAccessKey:
 		// DECISION P3-4a: stopping an access key cannot be undone. The key
@@ -649,7 +753,7 @@ func KeyRotationRequired(st Step) bool {
 // release must remove it (restorePolicy touches only this containment's own
 // tagged policy).
 func NeedsCleanup(s Step) bool {
-	return s.State == StepFailed && (s.Kind == StepIAMPolicy || s.Kind == StepSessionRevoke)
+	return s.State == StepFailed && isPolicyStep(s.Kind)
 }
 
 // HoldsPolicy reports a policy step of a containment that never took effect
@@ -657,7 +761,7 @@ func NeedsCleanup(s Step) bool {
 // attempted and not finished (restoring, restore_failed). A containment with
 // such a step must not be left failed until the policy is gone.
 func HoldsPolicy(s Step) bool {
-	if s.Kind != StepIAMPolicy && s.Kind != StepSessionRevoke {
+	if !isPolicyStep(s.Kind) {
 		return false
 	}
 	switch s.State {
@@ -675,7 +779,7 @@ func sameReserved(a, b *int32) bool {
 }
 
 func (e *Engine) restorePolicy(ctx context.Context, st *Step) error {
-	p := e.Run.principal()
+	p := e.principalOf(st)
 	for i := 0; i < 3; i++ {
 		r, err := e.AWS.ReadPolicy(ctx, st.Target, p)
 		if err != nil {
@@ -734,8 +838,8 @@ func (e *Engine) Readback(ctx context.Context, st *Step) (inPlace bool, detail s
 			return false, "", err
 		}
 		return t != nil && t.Suspended.All(), "scaling suspended", nil
-	case StepIAMPolicy, StepSessionRevoke:
-		r, err := e.AWS.ReadPolicy(ctx, st.Target, e.Run.principal())
+	case StepIAMPolicy, StepSessionRevoke, StepAssumerPolicy:
+		r, err := e.AWS.ReadPolicy(ctx, st.Target, e.principalOf(st))
 		if err != nil {
 			return false, "", err
 		}

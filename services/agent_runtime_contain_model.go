@@ -50,6 +50,21 @@ type AgentContainment struct {
 	Preview            json.RawMessage `json:"preview" gorm:"type:jsonb;not null;default:'{}'"`
 	CreatedAt          time.Time       `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt          time.Time       `json:"updated_at" gorm:"not null;default:now()"`
+	// Proof (migration 193, SecOps P4): requested -> applied -> proven |
+	// unproven | cannot_verify -> kept (agentcontain.ProofStateOf).
+	ProofState      string  `json:"proof_state" gorm:"not null;default:'requested'"`
+	ProvenByEventID *string `json:"proven_by_event_id"`
+	// SkewMs is how late the proving event reached AuthSec (received minus
+	// event time), in milliseconds.
+	SkewMs *int64 `json:"skew_ms"`
+	// TokenExpiryAt is the latest time a credential issued before the stop
+	// can still be live (agentcontain.TokenExpiryAt).
+	TokenExpiryAt *time.Time `json:"token_expiry_at"`
+	// Target is what the stop names within the identity (key id, agent,
+	// gateway subject); "" for the identity-wide levels.
+	Target string `json:"target" gorm:"not null;default:''"`
+	// NarrowedFrom is the wider containment this one replaces.
+	NarrowedFrom *uuid.UUID `json:"narrowed_from" gorm:"type:uuid"`
 }
 
 // TableName pins agent_containment.
@@ -158,7 +173,7 @@ func init() {
 }
 
 // AgentContainSchemaHead is the migration containment needs.
-const AgentContainSchemaHead = "159"
+const AgentContainSchemaHead = "194"
 
 var agentContainSchema struct {
 	sync.Mutex
@@ -170,7 +185,8 @@ var agentContainSchema struct {
 // VerifyAgentContainSchema checks 151's objects and 159's index.
 func VerifyAgentContainSchema(db *gorm.DB) error {
 	var missing []string
-	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target"} {
+	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target",
+		"agent_containment_hold", "agent_containment_release_request", "uq_agent_containment_hold_active"} {
 		ok, err := repositories.HasRelation(db, rel)
 		if err != nil {
 			return fmt.Errorf("agent containment schema verification could not run: %w", err)
@@ -185,6 +201,21 @@ func VerifyAgentContainSchema(db *gorm.DB) error {
 	}
 	if !ok {
 		missing = append(missing, "constraint iga_gov_job.iga_gov_job_kind_check admitting "+GovJobAgentContain)
+	}
+	// 193: the W2 levels and the proof columns.
+	for _, c := range []struct{ con, v string }{{"agent_containment_level_check", agentcontain.LevelPlatform},
+		{"agent_containment_proof_state_check", agentcontain.ProofKept}, {"agent_containment_step_kind_check", agentcontain.StepK8sBindingSubject}} {
+		tbl := "agent_containment"
+		if c.con == "agent_containment_step_kind_check" {
+			tbl = "agent_containment_step"
+		}
+		ok, err := repositories.ConstraintAdmits(db, tbl, c.con, c.v)
+		if err != nil {
+			return fmt.Errorf("agent containment schema verification could not run: %w", err)
+		}
+		if !ok {
+			missing = append(missing, "constraint "+tbl+"."+c.con+" admitting "+c.v)
+		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("agent containment needs migration %s; missing: %s", AgentContainSchemaHead, strings.Join(missing, ", "))

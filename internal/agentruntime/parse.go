@@ -25,7 +25,12 @@ type rawIdentity struct {
 	PrincipalID    string `json:"principalId"`
 	UserName       string `json:"userName"`
 	InvokedBy      string `json:"invokedBy"`
+	AccessKeyID    string `json:"accessKeyId"`
 	SessionContext *struct {
+		SourceIdentity string `json:"sourceIdentity"`
+		Attributes     *struct {
+			CreationDate string `json:"creationDate"`
+		} `json:"attributes"`
 		SessionIssuer *struct {
 			Type        string `json:"type"`
 			ARN         string `json:"arn"`
@@ -98,7 +103,16 @@ func ParseCloudTrailRecord(raw []byte) (Event, error) {
 	}
 	if id := r.UserIdentity; id != nil {
 		e.PrincipalType, e.PrincipalARN, e.PrincipalID = id.Type, id.ARN, id.PrincipalID
-		e.UserName, e.InvokedBy = id.UserName, id.InvokedBy
+		e.UserName, e.InvokedBy, e.AccessKeyID = id.UserName, id.InvokedBy, id.AccessKeyID
+		if id.SessionContext != nil {
+			e.SourceIdentity = id.SessionContext.SourceIdentity
+			if a := id.SessionContext.Attributes; a != nil && a.CreationDate != "" {
+				if t, err := time.Parse(time.RFC3339, a.CreationDate); err == nil {
+					t = t.UTC()
+					e.SessionCreatedAt = &t
+				}
+			}
+		}
 		if id.SessionContext != nil && id.SessionContext.SessionIssuer != nil {
 			si := id.SessionContext.SessionIssuer
 			e.SessionIssuerType, e.SessionIssuerARN, e.SessionIssuerPrincipalID = si.Type, si.ARN, si.PrincipalID

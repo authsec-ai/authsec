@@ -21,6 +21,9 @@ services/agent_runtime_contain.go
 services/agent_runtime_contain_job.go
 services/agent_runtime_contain_model.go
 services/agent_runtime_contain_verify.go
+services/agent_runtime_contain_holds.go
+services/agent_runtime_contain_levels.go
+services/agent_runtime_contain_probe.go
 services/cloud_aws_iac_access.go
 services/cloud_enforcement_access_readiness.go
 services/cloud_enforcement_binding_jobs.go

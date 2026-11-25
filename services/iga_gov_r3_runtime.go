@@ -1188,17 +1188,17 @@ func (s *GovR3) BrokerSession(ctx context.Context, ws uuid.UUID, ag RuntimeAgent
 			return govUnprocessable(GovCodeToolNotBrokered, err.Error(), nil)
 		}
 		short := strings.ReplaceAll(d.ID.String(), "-", "")[:16]
-		human := strings.ReplaceAll(d.HumanUserID.String(), "-", "")
-		agentTag := ag.ClientID
-		if agentTag == "" {
-			agentTag = ag.SpiffeID
+		agentRef := ag.ClientID
+		if agentRef == "" {
+			agentRef = ag.SpiffeID
 		}
-		if len(agentTag) > 256 {
-			agentTag = agentTag[:256]
-		}
+		agentTag := awsbroker.AgentTag(agentRef)
 		tags := map[string]string{"authsec-agent": agentTag, "authsec-human": d.HumanUserID.String(),
 			"authsec-decision": d.ID.String(), "authsec-workspace": GovWorkspaceRef(ws)}
-		areq = awsbroker.Request{RoleARN: role.RoleARN, SessionName: "authsec-rt-" + short, SourceIdentity: "authsec-" + human[:24],
+		// SourceIdentity names the human and the agent (SecOps C7), so a
+		// source_identity containment can stop this one agent on the role.
+		areq = awsbroker.Request{RoleARN: role.RoleARN, SessionName: "authsec-rt-" + short,
+			SourceIdentity: awsbroker.BrokerSourceIdentity(d.HumanUserID.String(), agentRef),
 			SessionPolicy: policyDoc, DurationSeconds: int32(dur), Tags: tags}
 		if err := awsbroker.Validate(awsbroker.Request{RoleARN: areq.RoleARN, ExternalID: "x", SessionName: areq.SessionName,
 			SourceIdentity: areq.SourceIdentity, SessionPolicy: areq.SessionPolicy, DurationSeconds: areq.DurationSeconds, Tags: tags}); err != nil {

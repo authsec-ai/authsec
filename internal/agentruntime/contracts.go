@@ -67,6 +67,15 @@ type Event struct {
 	// InvokedBy is userIdentity.invokedBy, set when an AWS service made the
 	// call on the principal's behalf.
 	InvokedBy string
+	// AccessKeyID is userIdentity.accessKeyId: the long-term key (AKIA...)
+	// or the temporary credential (ASIA...) the call was signed with.
+	AccessKeyID string
+	// SourceIdentity is userIdentity.sessionContext.sourceIdentity (set by
+	// whoever opened the role session, e.g. AuthSec's broker), "" when none.
+	SourceIdentity string
+	// SessionCreatedAt is sessionContext.attributes.creationDate: when the
+	// temporary credentials were issued (aws:TokenIssueTime), nil when none.
+	SessionCreatedAt *time.Time
 
 	ErrorCode    string
 	ErrorMessage string
