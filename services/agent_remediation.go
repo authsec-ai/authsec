@@ -439,7 +439,7 @@ func readRemediationSteps(tx *gorm.DB, ws, id uuid.UUID) ([]remediationStepRow, 
 	return rows, err
 }
 
-func mustJSON(v any) string {
+func remJSON(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "{}"
@@ -795,8 +795,8 @@ func (s *RemediationService) Create(ctx context.Context, ws, actor uuid.UUID, re
 		        connector_id, agent_id, case_id, state, mode, mode_reason, reason, requested_by, collateral, prepared, iac, session_name,
 		        plan_hash, iac_source_id)
 		    VALUES (?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?, ?, ?)`,
-			p.id, ws, p.kind, p.targetProvider, p.targetKind, p.targetRef, mustJSON(p.detail), p.connectorID, p.agentID, req.CaseID,
-			state, p.mode, p.modeReason, reason, actor, mustJSON(p.collateral), mustJSON(prepared), mustJSON(p.iac), session,
+			p.id, ws, p.kind, p.targetProvider, p.targetKind, p.targetRef, remJSON(p.detail), p.connectorID, p.agentID, req.CaseID,
+			state, p.mode, p.modeReason, reason, actor, remJSON(p.collateral), remJSON(prepared), remJSON(p.iac), session,
 			planHash, p.iacSourceID).Error
 		if isUniqueViolation(err, "uq_agent_remediation_open") {
 			var ids []uuid.UUID
@@ -828,7 +828,7 @@ func (s *RemediationService) Create(ctx context.Context, ws, actor uuid.UUID, re
 			}
 		}
 		if len(asks) > 0 {
-			if err := tx.Exec(`UPDATE agent_remediation SET asks = ?::jsonb WHERE workspace_id = ? AND id = ?`, mustJSON(asks), ws, p.id).Error; err != nil {
+			if err := tx.Exec(`UPDATE agent_remediation SET asks = ?::jsonb WHERE workspace_id = ? AND id = ?`, remJSON(asks), ws, p.id).Error; err != nil {
 				return err
 			}
 		}
@@ -859,7 +859,7 @@ func insertRemediationStep(tx *gorm.DB, ws, id uuid.UUID, st awsremediate.Step, 
 	return tx.Exec(`INSERT INTO agent_remediation_step (workspace_id, remediation_id, seq, op, target, event_source, event_name,
 	        before, after, state, due_at)
 	    VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?)`,
-		ws, id, st.Seq, st.Op, st.Target, st.EventSource, st.EventName, mustJSON(st.Before), mustJSON(st.After), state, st.DueAt).Error
+		ws, id, st.Seq, st.Op, st.Target, st.EventSource, st.EventName, remJSON(st.Before), remJSON(st.After), state, st.DueAt).Error
 }
 
 func remPlanHash(steps []awsremediate.Step) string {
