@@ -62,7 +62,7 @@ type containmentStopRow struct {
 	ID          uuid.UUID
 	IdentityID  uuid.UUID
 	Level       string
-	WorkloadIDs pq.StringArray `gorm:"column:workload_ids"`
+	WorkloadIDs pq.StringArray `gorm:"column:workload_ids;type:uuid[]"`
 }
 
 // readContainmentStops lists the stops of the workspace's live containments

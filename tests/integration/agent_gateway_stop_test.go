@@ -1,8 +1,11 @@
 package integration
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -30,6 +33,24 @@ func agwHints(t *testing.T, api *p3OwnersAPI, cred string, hdr map[string]string
 		}
 	}
 	return code, out, h
+}
+
+// pcCall calls /api/iga/v1<path> as bearer.
+func pcCall(t *testing.T, api *p3OwnersAPI, method, path, bearer string, body any) (int, map[string]any) {
+	t.Helper()
+	var rd io.Reader = http.NoBody
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		rd = bytes.NewReader(raw)
+	}
+	req := httptest.NewRequest(method, "/api/iga/v1"+path, rd)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	w := httptest.NewRecorder()
+	api.eng.ServeHTTP(w, req)
+	var out map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	return w.Code, out
 }
 
 func agentEval(agent, identity string) map[string]any {
@@ -63,11 +84,11 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 	all := "governance:read governance:enforce governance:approve"
 	tokA := api.token(a.ws, a.author, a.authorMember, all)
 	tokB := api.token(b.ws, b.author, b.authorMember, all)
-	var approverMember uuid.UUID
-	if err := db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.approver).Scan(&approverMember).Error; err != nil {
-		t.Fatal(err)
+	var m struct{ ID uuid.UUID }
+	if err := db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.approver).Scan(&m).Error; err != nil || m.ID == uuid.Nil {
+		t.Fatalf("approver membership: %v", err)
 	}
-	approverA := api.token(a.ws, a.approver, approverMember, all)
+	approverA := api.token(a.ws, a.approver, m.ID, all)
 
 	newGW := func(tok, name string) (string, string) {
 		code, out := agwAdmin(t, api, "POST", "/gateways", tok, map[string]any{"name": name})
@@ -196,27 +217,27 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 		t.Fatalf("second open request: %d %v", code, out)
 	}
 	// The requester cannot approve; another workspace cannot see it.
-	if code, out := api.call("POST", "/api/iga/v1/pending-changes/"+changeID+"/approve", tokA, nil); code != http.StatusForbidden ||
+	if code, out := pcCall(t, api, "POST", "/pending-changes/"+changeID+"/approve", tokA, nil); code != http.StatusForbidden ||
 		!strings.Contains(mustJSONString(out), "self_approval") {
 		t.Fatalf("self approval: %d %v", code, out)
 	}
-	if code, _ := api.call("POST", "/api/iga/v1/pending-changes/"+changeID+"/approve", tokB, nil); code != 404 {
+	if code, _ := pcCall(t, api, "POST", "/pending-changes/"+changeID+"/approve", tokB, nil); code != 404 {
 		t.Fatalf("B approved A's change: %d", code)
 	}
-	if code, _ := api.call("GET", "/api/iga/v1/pending-changes/"+changeID, tokB, nil); code != 404 {
+	if code, _ := pcCall(t, api, "GET", "/pending-changes/"+changeID, tokB, nil); code != 404 {
 		t.Fatalf("B read A's change: %d", code)
 	}
-	if code, _ := api.call("POST", "/api/iga/v1/pending-changes/"+changeID+"/reject", tokB, map[string]any{"reason": "x"}); code != 404 {
+	if code, _ := pcCall(t, api, "POST", "/pending-changes/"+changeID+"/reject", tokB, map[string]any{"reason": "x"}); code != 404 {
 		t.Fatalf("B rejected A's change: %d", code)
 	}
-	if code, out := api.call("GET", "/api/iga/v1/pending-changes?state=pending", tokB, nil); code != 200 || strings.Contains(mustJSONString(out), changeID) {
+	if code, out := pcCall(t, api, "GET", "/pending-changes?state=pending", tokB, nil); code != 200 || strings.Contains(mustJSONString(out), changeID) {
 		t.Fatalf("B lists A's change: %d %v", code, out)
 	}
-	if code, out := api.call("GET", "/api/iga/v1/pending-changes?state=pending", tokA, nil); code != 200 || !strings.Contains(mustJSONString(out), changeID) {
+	if code, out := pcCall(t, api, "GET", "/pending-changes?state=pending", tokA, nil); code != 200 || !strings.Contains(mustJSONString(out), changeID) {
 		t.Fatalf("A's list: %d %v", code, out)
 	}
 	// The second person applies it.
-	code, out = api.call("POST", "/api/iga/v1/pending-changes/"+changeID+"/approve", approverA, nil)
+	code, out = pcCall(t, api, "POST", "/pending-changes/"+changeID+"/approve", approverA, nil)
 	if code != 200 {
 		t.Fatalf("approve: %d %v", code, out)
 	}
@@ -230,7 +251,7 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 	if _, h, _ := agwHints(t, api, credA, nil); h.FailMode != "open" || h.CacheTTLSeconds != 30 {
 		t.Fatalf("hints after approval: %+v", h)
 	}
-	if code, _ := api.call("POST", "/api/iga/v1/pending-changes/"+changeID+"/approve", approverA, nil); code != http.StatusConflict {
+	if code, _ := pcCall(t, api, "POST", "/pending-changes/"+changeID+"/approve", approverA, nil); code != http.StatusConflict {
 		t.Fatalf("approved twice: %d", code)
 	}
 
@@ -243,7 +264,7 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 		t.Fatalf("loosen: %d %v", code, out)
 	}
 	second := agwData(t, out)["pending_change"].(map[string]any)["id"].(string)
-	code, out = api.call("POST", "/api/iga/v1/pending-changes/"+second+"/reject", tokA, map[string]any{"reason": "not needed"})
+	code, out = pcCall(t, api, "POST", "/pending-changes/"+second+"/reject", tokA, map[string]any{"reason": "not needed"})
 	if code != 200 || out["data"].(map[string]any)["state"] != "rejected" {
 		t.Fatalf("withdraw: %d %v", code, out)
 	}
