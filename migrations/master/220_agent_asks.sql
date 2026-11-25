@@ -260,3 +260,28 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agent_ask_external');
     END IF;
 END $$;
+
+-- The notification outbox delivers asks (subject_kind 'agent_ask'). The
+-- allowed kinds are read from the live constraint and 'agent_ask' added, so
+-- a kind another migration admitted is kept; a later migration that rewrites
+-- the list must keep 'agent_ask'.
+DO $$
+DECLARE
+    def  text;
+    vals text[];
+BEGIN
+    IF to_regclass('public.iga_gov_notification') IS NULL THEN
+        RETURN;
+    END IF;
+    SELECT pg_get_constraintdef(c.oid) INTO def FROM pg_constraint c
+     WHERE c.conrelid = 'public.iga_gov_notification'::regclass AND c.conname = 'iga_gov_notification_subject_kind_check';
+    IF def IS NULL OR def ~ '''agent_ask''' THEN
+        RETURN;
+    END IF;
+    SELECT array_agg(m.v[1] ORDER BY m.n) INTO vals
+      FROM regexp_matches(def, '''([a-z_]+)''', 'g') WITH ORDINALITY AS m(v, n);
+    vals := COALESCE(vals, ARRAY[]::text[]) || ARRAY['agent_ask'];
+    ALTER TABLE public.iga_gov_notification DROP CONSTRAINT iga_gov_notification_subject_kind_check;
+    EXECUTE format('ALTER TABLE public.iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check CHECK (subject_kind IN (%s))',
+        (SELECT string_agg(quote_literal(v), ', ' ORDER BY n) FROM unnest(vals) WITH ORDINALITY AS u(v, n)));
+END $$;

@@ -42,6 +42,15 @@ type Message struct {
 	Secret string
 	// UserAgent is the webhook's User-Agent; empty means DefaultUserAgent.
 	UserAgent string
+	// Timestamp, when set (unix seconds), signs the webhook the way the agent
+	// runtime SIEM webhook is signed: X-AuthSec-Timestamp carries it and
+	// X-AuthSec-Signature is "sha256=" + hex(HMAC-SHA256(secret, timestamp +
+	// "." + body)), so a receiver can refuse a replayed delivery. Empty keeps
+	// the body-only signature every existing receiver verifies.
+	Timestamp string
+	// DeliveryID, when set, is sent as X-AuthSec-Delivery (stable across
+	// retries of one delivery).
+	DeliveryID string
 }
 
 // Sender delivers one message. An error means it was not (known to be)

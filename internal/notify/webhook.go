@@ -22,6 +22,23 @@ const DefaultUserAgent = "authsec-governance"
 // integrated one has integrated both.
 const SignatureHeader = "X-AuthSec-Signature"
 
+// TimestampHeader and DeliveryHeader are sent with a timestamped signature
+// (Message.Timestamp), as on the agent runtime SIEM webhook.
+const (
+	TimestampHeader = "X-AuthSec-Timestamp"
+	DeliveryHeader  = "X-AuthSec-Delivery"
+)
+
+// SignTimestamped is the SignatureHeader value of a timestamped delivery:
+// "sha256=" + hex(HMAC-SHA256(secret, timestamp + "." + body)).
+func SignTimestamped(secret, timestamp string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("."))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
 // DefaultWebhookTimeout bounds one POST: a customer endpoint that hangs must
 // not hold the delivery worker.
 const DefaultWebhookTimeout = 10 * time.Second
@@ -69,7 +86,14 @@ func (w *Webhook) Send(ctx context.Context, m Message) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", ua)
-	if m.Secret != "" {
+	if m.DeliveryID != "" {
+		req.Header.Set(DeliveryHeader, m.DeliveryID)
+	}
+	switch {
+	case m.Secret != "" && m.Timestamp != "":
+		req.Header.Set(TimestampHeader, m.Timestamp)
+		req.Header.Set(SignatureHeader, SignTimestamped(m.Secret, m.Timestamp, m.Body))
+	case m.Secret != "":
 		req.Header.Set(SignatureHeader, Sign(m.Secret, m.Body))
 	}
 	resp, err := client.Do(req)

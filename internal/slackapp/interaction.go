@@ -160,6 +160,9 @@ func ValidActionTS(ts string) bool { return actionTSRe.MatchString(ts) }
 type ButtonValue struct {
 	Notification string `json:"n"`
 	Digest       string `json:"d,omitempty"`
+	// Choice is the answer an ask button gives (W4); Digest then binds the
+	// notification, the ask, its step and the choice (a server-side HMAC).
+	Choice string `json:"c,omitempty"`
 }
 
 // Encode renders the value (Slack allows 2000 characters; this is < 150).

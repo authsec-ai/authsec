@@ -35,6 +35,10 @@ const (
 	// ActionOpen is a link button: Slack still posts an interaction for it,
 	// which is acknowledged and ignored.
 	ActionOpen = "open"
+	// ActionAskChoicePrefix + an index is an ask's answer button (the choice
+	// is in the button value); ActionAskNotMine passes the ask on (W4).
+	ActionAskChoicePrefix = "ask_choice_"
+	ActionAskNotMine      = "ask_not_mine"
 )
 
 // Block ids of the message inputs an action reads from state.values.
@@ -302,6 +306,53 @@ func BuildNotice(n Notice) Message {
 		blocks = append(blocks, actions("notice", elems...))
 	}
 	return Message{Text: n.Title, Blocks: blocks}
+}
+
+/* ----------------------------------- asks ---------------------------------- */
+
+// Ask is an ask's message (W4): the question, one button per choice and
+// "Not mine"; each button's value is the encoded ButtonValue the server
+// signed.
+type Ask struct {
+	Title        string
+	Lines        []string
+	Choices      []LabeledValue // Label, and the button value
+	NotMineValue string
+	Link         string
+}
+
+// BuildAsk renders a.
+func BuildAsk(a Ask) Message {
+	blocks := []Block{header(a.Title)}
+	if len(a.Lines) > 0 {
+		var esc []string
+		for _, l := range a.Lines {
+			esc = append(esc, Escape(l))
+		}
+		blocks = append(blocks, section(strings.Join(esc, "\n")))
+	}
+	var elems []map[string]any
+	for i, c := range a.Choices {
+		l := c.Label
+		if len(l) > 75 {
+			l = l[:72] + "..."
+		}
+		style := ""
+		if i == 0 {
+			style = "primary"
+		}
+		elems = append(elems, button(fmt.Sprintf("%s%d", ActionAskChoicePrefix, i), l, c.Value, style))
+	}
+	if a.NotMineValue != "" {
+		elems = append(elems, button(ActionAskNotMine, "Not mine", a.NotMineValue, ""))
+	}
+	if a.Link != "" {
+		elems = append(elems, linkButton("Open in AuthSec", a.Link))
+	}
+	if len(elems) > 0 {
+		blocks = append(blocks, actions("ask", elems...))
+	}
+	return Message{Text: a.Title, Blocks: blocks}
 }
 
 /* --------------------------------- outcomes -------------------------------- */
