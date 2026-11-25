@@ -141,7 +141,19 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 			head = fmt.Sprintf("%03d", h)
 		}
 	}
+	// Coverage (SPEC-secops W1, P8), additive: the workspace's delivering
+	// sources (heartbeats) and, per estate scope, capabilities C1..C13.
+	// Empty until migration 170 verified.
+	var sources any = []any{}
+	var scopes any = []any{}
+	if ws, ok := tokenWorkspace(c); ok {
+		hb, caps := services.CoverageCapabilitiesBlock(c.Request.Context(), ctl.db(), ws)
+		sources, scopes = hb, caps
+	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"sources":          sources,
+		"capabilities":     scopes,
+		"agent_evidence":   services.AgentEvidenceCapabilities(ctl.db()),
 		"graph_projection": mode,
 		"reason":           nullIfEmpty(reason),
 		"features":         graphFeatures(mode == services.GraphProjectionOn),

@@ -1512,6 +1512,12 @@ func SetupRoutes(
 		// per-connector rate limits).
 		agentRuntimeIngest := platformCtrl.NewAgentRuntimeIngestController(config.DB)
 		authsec.POST("/ingest/aws/events", agentRuntimeIngest.IngestAWSEvents)
+		// Evidence collectors (SPEC-secops W1, C1): Azure diagnostic settings
+		// (X-AuthSec-Event-Secret: the Azure connector's azev_ secret) and
+		// Kubernetes audit from the iga-agent (Bearer: the cluster's actuation
+		// credential or a discovery ingest token). No AuthMiddleware: the
+		// credential alone decides workspace and connector.
+		platformCtrl.MountAgentCollectorIngestRoutes(authsec, platformCtrl.NewAgentCollectorIngestController())
 		// OTLP/HTTP traces (SPEC-agent-runtime-activity.md §4.3): no AuthMiddleware;
 		// the per-workspace OTLP token alone decides the workspace.
 		authsec.POST("/ingest/otlp/v1/traces", platformCtrl.NewAgentOTLPIngestController(config.DB).IngestTraces)

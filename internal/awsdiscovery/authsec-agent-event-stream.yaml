@@ -28,7 +28,11 @@ Description: >-
 # CreateTrail=false and set it to true in one region's stack only (a
 # parameter override), or keep your own trail.
 #
-# WHAT IS FORWARDED (the rule's pattern). Every event of the model
+# WHAT IS FORWARDED (the rule's pattern). With ForwardAllManagementEvents
+# 'true' (the default): EVERY management event of the account, from every
+# service and every principal, so AuthSec keeps evidence of all of them (not
+# only of AI workloads). Set it 'false' to forward only the selection below,
+# which costs fewer API destination invocations. Either way: every event of the
 # endpoints (bedrock, bedrock-mantle, bedrock-agentcore), IAM, Secrets
 # Manager, CloudTrail and Lambda. From the busy read-heavy sources (KMS, STS,
 # S3, SSM, CloudWatch Logs) only what detections D1-D8 and the model-call
@@ -84,6 +88,7 @@ Metadata:
         Parameters:
           - InvocationRateLimit
           - DeadLetterAlarmTopicArn
+          - ForwardAllManagementEvents
 
 Parameters:
 
@@ -203,6 +208,17 @@ Parameters:
       Optional SNS topic the dead-letter alarm notifies. Empty: the alarm is
       only shown in CloudWatch.
 
+  ForwardAllManagementEvents:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      'true' forwards every CloudTrail management event of this account and
+      region (all services, all principals) so AuthSec keeps complete
+      evidence. 'false' forwards only the model endpoints and the calls
+      AuthSec's detections read (fewer EventBridge invocations, less
+      evidence).
+
 Conditions:
 
   CreateTrailCond: !Equals [!Ref CreateTrail, 'true']
@@ -214,6 +230,7 @@ Conditions:
   AgentCoreCond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsAgentCore, 'true']]
   S3Cond: !And [!Condition CreateTrailCond, !Equals [!Ref DataEventsS3, 'true']]
   HasAlarmTopic: !Not [!Equals [!Ref DeadLetterAlarmTopicArn, '']]
+  ForwardAllCond: !Equals [!Ref ForwardAllManagementEvents, 'true']
 
 Resources:
 
@@ -494,7 +511,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub 'AuthSecAgentRuntime-${ConnectorId}'
-      Description: AuthSec agent runtime - CloudTrail events of model calls and what follows them
+      Description: AuthSec agent runtime - CloudTrail management events of the account, and model-call data events
       State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
       EventPattern:
         detail-type:
@@ -502,6 +519,13 @@ Resources:
           - AWS Service Event via CloudTrail
         detail:
           $or:
+            # Every management event of the account (evidence for every
+            # principal), unless ForwardAllManagementEvents is 'false'.
+            - !If
+              - ForwardAllCond
+              - eventCategory:
+                  - Management
+              - !Ref AWS::NoValue
             # Everything from the model endpoints and the low-volume sources.
             - eventSource:
                 - bedrock.amazonaws.com

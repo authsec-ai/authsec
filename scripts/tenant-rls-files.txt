@@ -140,3 +140,7 @@ services/agent_gateway_decisions.go
 services/agent_gateway_runtime.go
 services/pending_change.go
 controllers/platform/pending_change_controller.go
+services/agent_evidence.go
+services/agent_coverage.go
+services/agent_ingest_collectors.go
+services/agent_trail_backfill.go

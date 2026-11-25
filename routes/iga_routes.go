@@ -123,5 +123,9 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// Pending changes (tier 3, a second person approves; migration 163):
 		// /api/iga/v1/pending-changes (pending_change_controller.go).
 		platformCtrl.MountPendingChangeRoutes(iga, platformCtrl.NewPendingChangeControllerFor(igaGraphRead))
+		// Evidence store and coverage (SPEC-secops W1): evidence, retention,
+		// trail backfill, Azure diagnostic ingest secrets, capability states
+		// and gap declarations (agent_evidence_controller.go).
+		platformCtrl.MountAgentEvidenceRoutes(iga, platformCtrl.NewAgentEvidenceControllerFor(igaGraphRead))
 	}
 }

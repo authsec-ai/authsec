@@ -771,6 +771,8 @@ func (s *AgentRuntimeIngestService) Ingest(ctx context.Context, p AgentEventPrin
 
 	if len(newEvents) > 0 {
 		dctx, cancel := context.WithTimeout(ctx, s.dispatchTimeout)
+		// The evidence sink records the path (and the stream's heartbeat).
+		dctx = agentruntime.WithDelivery(dctx, agentruntime.Delivery{Kind: agentruntime.DeliveryAWSStream})
 		derr := s.dispatch(dctx, p.WorkspaceID, p.ConnectorID, newEvents)
 		cancel()
 		if derr != nil {

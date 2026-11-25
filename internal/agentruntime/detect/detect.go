@@ -41,6 +41,11 @@ const (
 	D6 ID = "D6" // new model or volume spike
 	D7 ID = "D7" // new role assumption
 	D8 ID = "D8" // model call from an unexpected place
+
+	// COV01 is the coverage alert "a source fell silent" (SPEC-secops W1).
+	// It is raised by the coverage worker, never by Evaluate, so it is not in
+	// All (which the per-event detections and their settings range over).
+	COV01 ID = "COV-01"
 )
 
 // All lists every detection, in order.
@@ -134,6 +139,8 @@ func Name(id ID) string {
 		return "New role assumption"
 	case D8:
 		return "Model call from an unexpected place"
+	case COV01:
+		return "Source silent"
 	}
 	return string(id)
 }
