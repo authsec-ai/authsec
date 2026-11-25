@@ -358,6 +358,12 @@ func main() {
 	// overdue keys, every 15 minutes per workspace
 	// (AUTHSEC_DISABLE_AGENT_IDENTITY_SWEEP=true turns it off).
 	go services.RunAgentIdentityWorker(context.Background(), config.DB)
+	// Remediation (W8): the Vault client for remediation ExternalIds, the
+	// live AWS access, and the worker (deferred key deactivations, pull
+	// request sync, proof refresh; AUTHSEC_DISABLE_REMEDIATION_WORKER=true
+	// turns it off).
+	services.InstallRemediation(config.DB)
+	go services.RunRemediationWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL

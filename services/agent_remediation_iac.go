@@ -122,6 +122,7 @@ func (s *RemediationService) openRemediationPR(ctx context.Context, ws, actor uu
 	}
 	var iac RemediationIaC
 	_ = json.Unmarshal([]byte(r.IaC), &iac)
+	// TENANT-EXEMPT: not a statement here: the resolver opens its own workspace transaction (tenancy.InWorkspaceRead).
 	tgt, err := resolveRemediationIaC(ctx, s.db, ws, *r.ConnectorID, iac.Tool)
 	if err != nil {
 		return nil, err
@@ -208,6 +209,7 @@ func (s *RemediationService) SyncPR(ctx context.Context, ws, id uuid.UUID) error
 	}
 	var iac RemediationIaC
 	_ = json.Unmarshal([]byte(r.IaC), &iac)
+	// TENANT-EXEMPT: not a statement here: the resolver opens its own workspace transaction (tenancy.InWorkspaceRead).
 	tgt, err := resolveRemediationIaC(ctx, s.db, ws, *r.ConnectorID, iac.Tool)
 	if err != nil || tgt == nil {
 		return err

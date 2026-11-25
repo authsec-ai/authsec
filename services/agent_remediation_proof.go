@@ -59,6 +59,7 @@ const remProofSkew = 5 * time.Minute
 // Proof evaluates (and records) a remediation's proof. A remediation that
 // is proven by it becomes proven.
 func (s *RemediationService) Proof(ctx context.Context, ws, id uuid.UUID) (*RemediationProof, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -97,6 +98,7 @@ func (s *RemediationService) Proof(ctx context.Context, ws, id uuid.UUID) (*Reme
 			reader, _ = acc.Reader(ctx, ws, *r.ConnectorID)
 		}
 	}
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	evidenceOK, _ := AgentEvidenceStatus(s.db)
 	account := ""
 	if r.ConnectorID != nil {

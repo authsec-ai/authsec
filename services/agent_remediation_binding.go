@@ -182,6 +182,7 @@ func remediationAccess() RemediationAccess {
 // cmd/main.go calls it once.
 func InstallRemediation(db *gorm.DB) {
 	remediationDeps.Lock()
+	// TENANT-EXEMPT: not a statement: the process handle the post-approval run and the worker open workspace transactions on.
 	remediationDeps.db = db
 	remediationDeps.princ = os.Getenv("AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN")
 	if cb, err := LoadAWSCallbackConfig(); err == nil {
@@ -207,6 +208,7 @@ func InstallRemediation(db *gorm.DB) {
 func remediationDB() *gorm.DB {
 	remediationDeps.RLock()
 	defer remediationDeps.RUnlock()
+	// TENANT-EXEMPT: not a statement: the process handle the post-approval run and the worker open workspace transactions on.
 	return remediationDeps.db
 }
 
@@ -232,6 +234,7 @@ func (l *liveRemediationAccess) Open(ctx context.Context, ws, connectorID, remed
 	if err != nil {
 		return nil, err
 	}
+	// TENANT-EXEMPT: not a statement here: the binding read opens its own workspace transaction (tenancy.InWorkspaceRead).
 	w, err := AssumeRemediation(ctx, l.db, ws, connectorID, remediationID)
 	if err != nil {
 		return nil, err

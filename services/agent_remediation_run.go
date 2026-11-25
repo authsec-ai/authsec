@@ -81,6 +81,7 @@ func holdsRemediate(tx *gorm.DB, ws, user uuid.UUID) (bool, error) {
 // is opened at once (its review is the second person). A prepared
 // remediation cannot be applied by AuthSec.
 func (s *RemediationService) Apply(ctx context.Context, ws, id, actor uuid.UUID, note string) (*RemediationApplyResult, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -238,6 +239,7 @@ const remediationLease = 10 * time.Minute
 // before it stay applied, their before-state kept). It ends applied (with
 // its proof evaluated) or failed. One run at a time (a lease).
 func (s *RemediationService) Execute(ctx context.Context, ws, id uuid.UUID) error {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return err
 	}
@@ -424,6 +426,7 @@ func (s *RemediationService) runAuthSecStep(ctx context.Context, ws uuid.UUID, r
 			map[string]any{"ok": true}, "", nil, &at)
 	case RemOpAgentRetire:
 		aid, _ := uuid.Parse(row.Target)
+		// TENANT-EXEMPT: not a statement here: EndAgent runs in its own workspace transaction (tenancy.InWorkspace).
 		_, err := NewAgentIdentityService(s.db).EndAgent(ctx, ws, aid, actor, AgentEndRequest{Action: AgentEndRetire,
 			Reason: "Retired by remediation " + r.ID.String() + ": " + r.Reason})
 		if ge, ok := err.(*GovError); ok && ge.Code == "agent_ended" {
@@ -499,6 +502,7 @@ func (s *RemediationService) fail(ctx context.Context, ws, id uuid.UUID, seq int
 // governance:remediate, ends a remediation that changed nothing (a pending
 // approval is rejected with it; an open pull request is closed).
 func (s *RemediationService) Cancel(ctx context.Context, ws, id, actor uuid.UUID, reason string) (*RemediationView, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -556,6 +560,7 @@ func (s *RemediationService) Cancel(ctx context.Context, ws, id, actor uuid.UUID
 	if closePR != nil && closePR.ConnectorID != nil && closePR.PRNumber != nil {
 		var iac RemediationIaC
 		_ = json.Unmarshal([]byte(closePR.IaC), &iac)
+		// TENANT-EXEMPT: not a statement here: the resolver opens its own workspace transaction (tenancy.InWorkspaceRead).
 		if tgt, err := resolveRemediationIaC(ctx, s.db, ws, *closePR.ConnectorID, iac.Tool); err == nil && tgt != nil {
 			if gh := DefaultGovIaCGitHub(); gh != nil {
 				if err := gh.ClosePullRequest(ctx, tgt.Repo, *closePR.PRNumber, "AuthSec: the remediation was cancelled."); err != nil {

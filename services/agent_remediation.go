@@ -475,6 +475,7 @@ type RemediationFilter struct {
 
 // List lists the workspace's remediations, newest first.
 func (s *RemediationService) List(ctx context.Context, ws uuid.UUID, f RemediationFilter) ([]RemediationView, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -516,6 +517,7 @@ func (s *RemediationService) List(ctx context.Context, ws uuid.UUID, f Remediati
 
 // Get reads one remediation with its steps; another workspace's is 404.
 func (s *RemediationService) Get(ctx context.Context, ws, id uuid.UUID) (*RemediationView, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -725,6 +727,7 @@ func isAWSARN(s string) bool { return strings.HasPrefix(s, "arn:aws") }
 // Create plans a remediation (POST /remediations): steps, collateral, mode
 // and the prepared change. Nothing is written to the customer.
 func (s *RemediationService) Create(ctx context.Context, ws, actor uuid.UUID, req RemediationRequest) (*RemediationView, error) {
+	// TENANT-EXEMPT: not a statement here: the schema gate reads the Postgres catalog only.
 	if err := RequireRemediation(s.db); err != nil {
 		return nil, err
 	}
@@ -1774,6 +1777,7 @@ func (s *RemediationService) decideMode(ctx context.Context, ws uuid.UUID, p *re
 		return nil
 	}
 	if p.iac.Managed && (p.kind == RemediationRemoveGrant || p.kind == RemediationRevertSnapshot) && p.connectorID != nil {
+		// TENANT-EXEMPT: not a statement here: the resolver opens its own workspace transaction (tenancy.InWorkspaceRead).
 		tgt, err := resolveRemediationIaC(ctx, s.db, ws, *p.connectorID, p.iac.Tool)
 		if err != nil {
 			return err
@@ -1796,6 +1800,7 @@ func (s *RemediationService) decideMode(ctx context.Context, ws uuid.UUID, p *re
 		p.mode, p.modeReason = RemediationModePrepared, RemReasonNoRole
 		return nil
 	}
+	// TENANT-EXEMPT: not a statement here: the binding read opens its own workspace transaction (tenancy.InWorkspaceRead).
 	b, err := liveRemediationBinding(ctx, s.db, ws, *p.connectorID)
 	if err != nil {
 		return err
