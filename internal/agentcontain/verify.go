@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/agentruntime"
+	"github.com/authsec-ai/authsec/internal/awsbroker"
 )
 
 // Behavioural verification (spec §5.8 "Verification (2)"): after a
@@ -60,6 +61,18 @@ func (c Contained) CutOff() time.Time { return c.ContainedAt.Add(VerifyGrace) }
 // services it cannot even be refuted (an ECS task's role session name is not
 // the service's, DECISION P3-6).
 func (c Contained) Unverifiable() (bool, string) {
+	switch c.Level {
+	case LevelKey:
+		return true, "A deactivated access key fails authentication (InvalidClientTokenId) before any policy is evaluated, and CloudTrail does not reliably record such a call against the user, so no refusal can prove the stop. Read-back of the key's status is the evidence; a successful call signed with the key still marks it not effective."
+	case LevelEntra:
+		return true, "Entra sign-in refusals are not ingested, so no event can prove the service principal is disabled. Read-back of accountEnabled and of the removed role assignments is the evidence, and every token issued before the stop has expired (token_expiry_at)."
+	case LevelKubernetes:
+		return true, "Kubernetes audit events are not ingested, so no refused request can prove the ServiceAccount lost its bindings. The cluster agent's report and the RBAC sweeps are the evidence."
+	case LevelGateway:
+		return true, "A gateway stop is enforced by the customer's gateway from AuthSec's deny list; its decision log is not yet read as proof."
+	case LevelPlatform:
+		return true, "A platform stop is asked of whoever can act on the platform; AuthSec cannot observe it."
+	}
 	if c.Level == LevelWorkload && !c.Dedicated && len(c.SessionNames) == 0 {
 		return true, "The contained workloads (ECS services) share the role with other workloads and their CloudTrail sessions cannot be told apart, so no event can confirm or refute the containment. Read-back of each change is the only evidence."
 	}
@@ -92,6 +105,47 @@ type Contained struct {
 	Dedicated bool
 	// SessionNames are the contained Lambda functions' names (workload level).
 	SessionNames []string
+	// Target is the access key id (key) or agent reference (source_identity).
+	Target string
+	// Assumers are the chain level's denied assumers (ARN and unique id).
+	Assumers []Assumer
+	// TokenExpiry is token_expiry_at: an Entra stop is not judged before it.
+	TokenExpiry *time.Time
+}
+
+// matchesAssumer reports whether the event is a call by one of the chain
+// stop's denied assumers.
+func (c Contained) matchesAssumer(e agentruntime.Event) bool {
+	a := e.Attribution()
+	if a.ARN == "" {
+		return false
+	}
+	for _, x := range c.Assumers {
+		if strings.EqualFold(x.ARN, a.ARN) && (x.UniqueID == "" || a.UniqueID == "" || x.UniqueID == a.UniqueID) {
+			return true
+		}
+	}
+	return false
+}
+
+// agentSession reports whether the event is a session the broker opened for
+// the source_identity stop's agent.
+func (c Contained) agentSession(e agentruntime.Event) bool {
+	if c.Target == "" || e.SourceIdentity == "" {
+		return false
+	}
+	ok, _ := pathMatch(awsbroker.AgentSourcePattern(c.Target), e.SourceIdentity)
+	return ok
+}
+
+// pathMatch is IAM StringLike for one '*' wildcard pattern.
+func pathMatch(pattern, s string) (bool, error) {
+	i := strings.Index(pattern, "*")
+	if i < 0 {
+		return pattern == s, nil
+	}
+	pre, suf := pattern[:i], pattern[i+1:]
+	return len(s) >= len(pre)+len(suf) && strings.HasPrefix(s, pre) && strings.HasSuffix(s, suf), nil
 }
 
 // LateEvent is a successful call after the grace: evidence the containment
@@ -136,11 +190,36 @@ func Late(c Contained, events []agentruntime.Event) []LateEvent {
 		if !e.IsAPICall() || e.ErrorCode != "" || e.AuthorizationDenied {
 			continue
 		}
-		if !e.EventTime.After(cut) || DenyImmune(e) || !c.MatchesIdentity(e) {
+		if !e.EventTime.After(cut) || DenyImmune(e) {
+			continue
+		}
+		if c.Level == LevelChain {
+			// An assumer still assuming the role.
+			if c.matchesAssumer(e) && strings.EqualFold(e.EventSource, "sts.amazonaws.com") && e.EventName == "AssumeRole" &&
+				strings.EqualFold(e.RequestFacts[agentruntime.FactRoleARN], c.IdentityARN) {
+				out = append(out, LateEvent{EventID: e.EventID, EventTime: e.EventTime, EventSource: e.EventSource,
+					EventName: e.EventName, SessionName: e.SessionName, Region: e.Region})
+				continue
+			}
+		}
+		if !c.MatchesIdentity(e) {
 			continue
 		}
 		weak := false
 		switch c.Level {
+		case LevelKey:
+			if c.Target == "" || e.AccessKeyID != c.Target {
+				continue
+			}
+		case LevelSessionsBefore, LevelChain:
+			// A session issued before the stop still working.
+			if e.SessionCreatedAt == nil || !e.SessionCreatedAt.Before(c.ContainedAt) {
+				continue
+			}
+		case LevelSourceIdentity:
+			if !c.agentSession(e) {
+				continue
+			}
 		case LevelIdentity:
 		case LevelModel:
 			if !e.IsModelCall() && e.EventSource != agentruntime.SourceAgentCore {
@@ -201,8 +280,18 @@ func (c Contained) ProofPolicyNames() []string {
 	switch c.Level {
 	case LevelIdentity:
 		return []string{ContainPolicyName(c.UniqueID, c.ID), RevokePolicyName(c.UniqueID, c.ID)}
-	case LevelModel:
+	case LevelModel, LevelSourceIdentity:
 		return []string{ContainPolicyName(c.UniqueID, c.ID)}
+	case LevelSessionsBefore:
+		return []string{RevokePolicyName(c.UniqueID, c.ID)}
+	case LevelChain:
+		out := []string{RevokePolicyName(c.UniqueID, c.ID)}
+		for _, a := range c.Assumers {
+			if a.UniqueID != "" {
+				out = append(out, ChainPolicyName(a.UniqueID, c.ID))
+			}
+		}
+		return out
 	}
 	return nil
 }
@@ -265,10 +354,16 @@ func Proof(c Contained, events []agentruntime.Event) *ProofEvent {
 		if !e.IsAPICall() || !e.AuthorizationDenied || e.ErrorMessage == "" {
 			continue
 		}
-		if !e.EventTime.After(cut) || !c.MatchesIdentity(e) {
+		if !e.EventTime.After(cut) {
+			continue
+		}
+		if !c.MatchesIdentity(e) && !(c.Level == LevelChain && c.matchesAssumer(e)) {
 			continue
 		}
 		if c.Level == LevelModel && !e.IsModelCall() && e.EventSource != agentruntime.SourceAgentCore {
+			continue
+		}
+		if c.Level == LevelSourceIdentity && !c.agentSession(e) {
 			continue
 		}
 		policy := ""
@@ -306,6 +401,10 @@ func Pending(c Contained, now time.Time) (decision string, final bool, why strin
 	if !now.After(c.CutOff()) {
 		return PendingWait, false, ""
 	}
+	if c.Level == LevelEntra && c.TokenExpiry != nil && now.Before(*c.TokenExpiry) {
+		// Tokens issued before the stop may still be used: not judged yet.
+		return PendingWait, false, ""
+	}
 	if bad, reason := c.Unverifiable(); bad {
 		return PendingUnverifiable, true, reason
 	}
@@ -313,4 +412,15 @@ func Pending(c Contained, now time.Time) (decision string, final bool, why strin
 		return PendingWait, false, ""
 	}
 	return PendingUnverifiable, false, ""
+}
+
+// ProbeProves is the policy of the containment an active probe's refusal
+// message names ("" when none): the same naming rule as Proof.
+func ProbeProves(c Contained, msg string) string {
+	for _, n := range c.ProofPolicyNames() {
+		if namesPolicy(msg, n) {
+			return n
+		}
+	}
+	return ""
 }

@@ -63,6 +63,17 @@ type containJob struct {
 func (s *AgentContain) Handler(ctx context.Context, run *PolicyJobRun) error {
 	var started string
 	err := s.handle(ctx, run, &started)
+	if run.Job.SubjectID != nil && !isLeaseErr(err) {
+		// The proof state follows every transition the run made (P4).
+		if perr := run.InTx(ctx, func(tx *gorm.DB) error {
+			return refreshContainProofTx(tx, run.Job.WorkspaceID, *run.Job.SubjectID, s.now().UTC())
+		}); perr != nil && err == nil && !isLeaseErr(perr) {
+			var ge *GovError
+			if !errors.As(perr, &ge) {
+				return perr
+			}
+		}
+	}
 	var rl *policyJobRetryLater
 	if errors.As(err, &rl) && rl.after > 5*time.Second && started != "" && started != agentcontain.StateReleasing && run.Job.SubjectID != nil {
 		var state string
@@ -105,6 +116,9 @@ func (s *AgentContain) handle(ctx context.Context, run *PolicyJobRun, started *s
 	*started = row.State
 	j := &containJob{s: s, run: run, ws: ws, row: row}
 	switch row.State {
+	case agentcontain.StateRequested:
+		// A platform stop AuthSec cannot write: nothing to run (W4 asks).
+		return nil
 	case agentcontain.StatePreviewed:
 		return j.start(ctx)
 	case agentcontain.StateContaining:
@@ -189,16 +203,25 @@ func (j *containJob) engineRun() agentcontain.Run {
 		sub.AccountID, sub.Partition = acct, part
 	}
 	return agentcontain.Run{ContainmentID: j.row.ID, WorkspaceRef: GovWorkspaceRef(j.ws), Level: j.row.Level, Subject: sub,
-		Cutoff: j.row.CreatedAt.UTC().Truncate(time.Second), Now: j.s.now}
+		Cutoff: j.row.CreatedAt.UTC().Truncate(time.Second), Now: j.s.now, Target: j.row.Target, Assumers: p.Assumers}
 }
 
 // features are the enforcement v2 features the containment needs.
 func (j *containJob) features() []string {
+	if agentcontain.FamilyOf(j.row.Level) != agentcontain.FamilyAWS {
+		return nil
+	}
 	switch {
-	case j.row.Level == agentcontain.LevelWorkload:
+	case j.row.Level == agentcontain.LevelWorkload, j.row.Level == agentcontain.LevelKey:
 		return []string{awsenforce.FeatureWorkloadContainment}
 	case j.row.IdentityKind == agentcontain.IdentityUser:
 		return []string{EnforcementFeatureGrants, awsenforce.FeatureWorkloadContainment}
+	case j.row.Level == agentcontain.LevelChain:
+		for _, a := range j.preview().Assumers {
+			if a.Enforceable && a.Kind == agentcontain.AssumerUser {
+				return []string{EnforcementFeatureGrants, awsenforce.FeatureWorkloadContainment}
+			}
+		}
 	}
 	return []string{EnforcementFeatureGrants}
 }
@@ -214,6 +237,19 @@ func (j *containJob) start(ctx context.Context) error {
 			code, msg := errCode(err)
 			return j.fail(ctx, agentcontain.StatePreviewed, code, msg)
 		}
+	}
+	if agentcontain.FamilyOf(j.row.Level) == agentcontain.FamilyRecord {
+		// Nothing to write to the customer: the row is the stop.
+		if err := j.settled(j.run.InTx(ctx, func(tx *gorm.DB) error {
+			now := j.now()
+			if err := j.moveTx(tx, agentcontain.StatePreviewed, agentcontain.StateContained, map[string]any{"state_reason": "", "contained_at": now}); err != nil {
+				return err
+			}
+			return j.event(tx, j.ws, GovEventContainmentContained, map[string]any{"level": j.row.Level, "steps": []any{}})
+		})); err != nil {
+			return err
+		}
+		return PolicyJobRetryLater(agentcontain.VerifyGrace+30*time.Second, "verifying after the grace period")
 	}
 	err := j.run.InTx(ctx, func(tx *gorm.DB) error {
 		if err := j.moveTx(tx, agentcontain.StatePreviewed, agentcontain.StateContaining, map[string]any{"state_reason": ""}); err != nil {
@@ -240,9 +276,22 @@ func (j *containJob) fail(ctx context.Context, from, code, detail string) error 
 
 /* ---------------------------------- apply ---------------------------------- */
 
-// open is the engine for this run: the enforcement session (one per run,
+// open is the step runner of the containment's level family.
+func (j *containJob) open(ctx context.Context) (agentcontain.StepRunner, error) {
+	switch agentcontain.FamilyOf(j.row.Level) {
+	case agentcontain.FamilyEntra:
+		return j.openEntra(ctx)
+	case agentcontain.FamilyKubernetes:
+		return &k8sContainRunner{j: j}, nil
+	case agentcontain.FamilyRecord:
+		return recordRunner{}, nil
+	}
+	return j.openAWS(ctx)
+}
+
+// openAWS is the engine for this run: the enforcement session (one per run,
 // never cached) and the discovery reads.
-func (j *containJob) open(ctx context.Context) (*agentcontain.Engine, error) {
+func (j *containJob) openAWS(ctx context.Context) (*agentcontain.Engine, error) {
 	acc := agentContainAccess()
 	if acc == nil {
 		return nil, PolicyJobRetryLater(5*time.Minute, errContainNotConfigured.Message)
@@ -276,10 +325,41 @@ func (j *containJob) steps(ctx context.Context) ([]AgentContainmentStep, error) 
 
 // planned lists the containment's steps in order (the access keys of a user
 // are read live).
-func (j *containJob) planned(ctx context.Context, eng *agentcontain.Engine) ([]agentcontain.Step, error) {
+func (j *containJob) planned(ctx context.Context, runner agentcontain.StepRunner) ([]agentcontain.Step, error) {
+	switch r := runner.(type) {
+	case *agentcontain.EntraEngine:
+		var out []agentcontain.Step
+		err := j.run.External(ctx, 0, func(ctx context.Context) error {
+			var err error
+			out, err = r.Plan(ctx)
+			return err
+		})
+		return out, err
+	case *k8sContainRunner:
+		return r.plan(), nil
+	case recordRunner:
+		return nil, nil
+	}
+	eng := runner.(*agentcontain.Engine)
 	if j.row.Level == agentcontain.LevelWorkload {
 		p := j.preview()
 		return agentcontain.WorkloadSteps(p.Level(agentcontain.LevelWorkload)), nil
+	}
+	if j.row.Level == agentcontain.LevelKey {
+		var st agentcontain.Step
+		var skip bool
+		err := j.run.External(ctx, 0, func(ctx context.Context) error {
+			var err error
+			st, skip, err = agentcontain.KeyStep(ctx, eng.AWS, eng.Run.Subject.Name, j.row.Target)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		if skip {
+			st.State = agentcontain.StepSkipped
+		}
+		return []agentcontain.Step{st}, nil
 	}
 	out := eng.Run.IAMSteps()
 	if j.row.Level == agentcontain.LevelIdentity && j.row.IdentityKind == agentcontain.IdentityUser {
@@ -315,7 +395,11 @@ func (j *containJob) apply(ctx context.Context) error {
 	}
 	// The role must still be the incarnation the containment was requested
 	// for (a role recreated under the same name is another identity).
-	if rr, ok := eng.AWS.(containRoleReader); ok && len(have) == 0 && j.row.IdentityKind == agentcontain.IdentityRole && j.row.UniqueID != "" {
+	var rr containRoleReader
+	if ae, ok := eng.(*agentcontain.Engine); ok {
+		rr, _ = ae.AWS.(containRoleReader)
+	}
+	if rr != nil && len(have) == 0 && j.row.IdentityKind == agentcontain.IdentityRole && j.row.UniqueID != "" {
 		var live string
 		err := j.run.External(ctx, 0, func(ctx context.Context) error {
 			var err error
@@ -337,7 +421,11 @@ func (j *containJob) apply(ctx context.Context) error {
 		if isLeaseErr(err) {
 			return err
 		}
-		j.note(ctx, "reading the user's access keys: "+err.Error())
+		var se *agentcontain.StepError
+		if errors.As(err, &se) && len(have) == 0 {
+			return j.fail(ctx, agentcontain.StateContaining, se.Code, se.Message)
+		}
+		j.note(ctx, "planning the stop: "+err.Error())
 		return PolicyJobRetryLater(containRetry, err.Error())
 	}
 	// Write-ahead: every planned step is recorded with its exact before-state
@@ -356,7 +444,9 @@ func (j *containJob) apply(ctx context.Context) error {
 			continue
 		}
 		state := agentcontain.StepPending
-		if len(st.Before) == 0 {
+		if st.State == agentcontain.StepSkipped {
+			state = agentcontain.StepSkipped
+		} else if len(st.Before) == 0 || st.Kind == agentcontain.StepAssumerPolicy {
 			var skip bool
 			err := j.run.External(ctx, 0, func(ctx context.Context) error {
 				var err error
@@ -432,6 +522,12 @@ func (j *containJob) apply(ctx context.Context) error {
 		switch {
 		case err != nil && isLeaseErr(err):
 			return err
+		case errors.Is(err, agentcontain.ErrWaiting):
+			if len(st.After) > 0 {
+				_ = j.stepUpdate(ctx, steps[i].ID, map[string]any{"after": string(st.After)}, nil)
+			}
+			j.note(ctx, "waiting for "+st.Kind+" "+st.Target+" to be applied")
+			return PolicyJobRetryLater(k8sPoll, "waiting for "+st.Target)
 		case errors.As(err, &se):
 			if err := j.stepUpdate(ctx, steps[i].ID, map[string]any{"state": agentcontain.StepFailed, "error": truncateReason(se.Error())},
 				func(tx *gorm.DB) error {
@@ -696,7 +792,7 @@ func loadContainReapplyHistory(tx *gorm.DB, ws, id uuid.UUID, now time.Time) (co
 // A drifted event first, then the re-apply; done -> a reapplied event.
 // A step AWS refuses (the target is gone, the policy's document was edited
 // outside AuthSec) stays drifted and is reported once as a step failure.
-func (j *containJob) reapply(ctx context.Context, eng *agentcontain.Engine, drifted []AgentContainmentStep, drift []map[string]any, now time.Time) error {
+func (j *containJob) reapply(ctx context.Context, eng agentcontain.StepRunner, drifted []AgentContainmentStep, drift []map[string]any, now time.Time) error {
 	prev := map[string]json.RawMessage{}
 	_ = json.Unmarshal(j.row.Verification, &prev)
 	var hist containReapplyHistory
@@ -762,6 +858,8 @@ func (j *containJob) reapply(ctx context.Context, eng *agentcontain.Engine, drif
 		switch {
 		case err != nil && isLeaseErr(err):
 			return err
+		case errors.Is(err, agentcontain.ErrWaiting):
+			return PolicyJobRetryLater(k8sPoll, "re-applying "+s.Target+": waiting for the change to be applied")
 		case errors.As(err, &se):
 			refused = append(refused, map[string]any{"kind": s.Kind, "target": s.Target, "error": se.Error()})
 			still = append(still, drift[i])
@@ -953,7 +1051,7 @@ func containJSON(v any) string {
 
 // restoreDue restores every step that is due (newest first) and reports
 // whether any restore failed for good.
-func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, steps []AgentContainmentStep, now time.Time) (bool, error) {
+func (j *containJob) restoreDue(ctx context.Context, eng agentcontain.StepRunner, steps []AgentContainmentStep, now time.Time) (bool, error) {
 	failed := false
 	for i := len(steps) - 1; i >= 0; i-- {
 		s := steps[i]
@@ -982,6 +1080,11 @@ func (j *containJob) restoreDue(ctx context.Context, eng *agentcontain.Engine, s
 		switch {
 		case err != nil && isLeaseErr(err):
 			return failed, err
+		case errors.Is(err, agentcontain.ErrWaiting):
+			if len(st.After) > 0 {
+				_ = j.stepUpdate(ctx, s.ID, map[string]any{"after": string(st.After)}, nil)
+			}
+			return failed, PolicyJobRetryLater(k8sPoll, "waiting for "+s.Target+" to be restored")
 		case errors.As(err, &se):
 			failed = true
 			if err := j.stepUpdate(ctx, s.ID, map[string]any{"state": agentcontain.StepRestoreFailed, "error": truncateReason(se.Error())}, nil); err != nil {

@@ -55,9 +55,19 @@ type containVerification struct {
 
 // containedOf is the verifier's view of one containment.
 func containedOf(r AgentContainment) agentcontain.Contained {
-	c := agentcontain.Contained{ID: r.ID, Level: r.Level, IdentityARN: r.IdentityARN, UniqueID: r.UniqueID}
+	c := agentcontain.Contained{ID: r.ID, Level: r.Level, IdentityARN: r.IdentityARN, UniqueID: r.UniqueID, Target: r.Target,
+		TokenExpiry: r.TokenExpiryAt}
 	if r.ContainedAt != nil {
 		c.ContainedAt = *r.ContainedAt
+	}
+	if r.Level == agentcontain.LevelChain {
+		var p agentcontain.Preview
+		_ = json.Unmarshal(r.Preview, &p)
+		for _, a := range p.Assumers {
+			if a.Enforceable {
+				c.Assumers = append(c.Assumers, a)
+			}
+		}
 	}
 	if r.Level == agentcontain.LevelWorkload {
 		var p agentcontain.Preview
@@ -141,6 +151,9 @@ func (s *agentContainVerifySink) Process(ctx context.Context, ws, connectorID uu
 					"first": first, "weak_evidence_only": weak}); err != nil {
 				return err
 			}
+			if err := refreshContainProofTx(tx, ws, r.ID, s.now().UTC()); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -160,11 +173,19 @@ func (s *agentContainVerifySink) prove(tx *gorm.DB, ws uuid.UUID, r AgentContain
 	if err != nil {
 		return err
 	}
+	// skew: how late the proving event reached AuthSec (P4).
+	skew := now.Sub(p.EventTime).Milliseconds()
+	if skew < 0 {
+		skew = 0
+	}
 	res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND effective IS NULL AND verified_at IS NULL", ws, r.ID).
-		Updates(map[string]any{"verified_at": now, "effective": true, "updated_at": now,
+		Updates(map[string]any{"verified_at": now, "effective": true, "updated_at": now, "proven_by_event_id": p.EventID, "skew_ms": skew,
 			"verification": gorm.Expr("(verification - 'unverifiable') || ?::jsonb", string(raw))})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return res.Error
+	}
+	if err := refreshContainProofTx(tx, ws, r.ID, now); err != nil {
+		return err
 	}
 	return appendGovEvent(tx, ws, GovEventContainmentVerified, models.GovActorSystem, AgentContainVerifySinkName, govEventRefs{},
 		map[string]any{"containment_id": r.ID, "level": r.Level, "identity_arn": r.IdentityARN, "evidence": "refusal", "proof": p,

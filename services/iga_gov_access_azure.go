@@ -111,6 +111,17 @@ func azureTimeBound(ctx context.Context, rbac AzureRBACClient, token, subscripti
 type AzureAccessDeps struct {
 	RBAC  AzureRBACClient
 	Token func(ctx context.Context, ws uuid.UUID, tenantID string) (string, error)
+	// Graph and GraphToken are the entra containment level's account
+	// read/write (SecOps W2): nil when not installed (the level then waits).
+	Graph      AzureGraphAccountClient
+	GraphToken func(ctx context.Context, ws uuid.UUID, tenantID string) (string, error)
+}
+
+// AzureGraphAccountClient reads and writes a service principal's
+// accountEnabled (*azure.Client in production).
+type AzureGraphAccountClient interface {
+	ServicePrincipalAccountEnabled(ctx context.Context, graphToken, objectID string) (bool, error)
+	SetServicePrincipalAccountEnabled(ctx context.Context, graphToken, objectID string, enabled bool) error
 }
 
 var azureAccess struct {
@@ -144,6 +155,12 @@ func (s *AzureOnboardingService) AccessDeps() *AzureAccessDeps {
 			return "", err
 		}
 		return s.api.AppToken(ctx, cfg, tenantID, azure.ScopeARMApp)
+	}, Graph: s.api, GraphToken: func(ctx context.Context, ws uuid.UUID, tenantID string) (string, error) {
+		cfg, err := s.resolveDiscoveryConfig(ws, tenantID)
+		if err != nil {
+			return "", err
+		}
+		return s.api.AppToken(ctx, cfg, tenantID, azure.ScopeGraphApp)
 	}}
 }
 

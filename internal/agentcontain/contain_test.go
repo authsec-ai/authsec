@@ -349,7 +349,7 @@ func TestPreviewRefusesProtected(t *testing.T) {
 	w := newWorld()
 	w.lambdaA.Tags = map[string]string{"authsec:protected": "TRUE"}
 	p := BuildPreview(PreviewInput{Subject: s, Workloads: []Workload{w.lambdaA}, Selected: []uuid.UUID{w.lambdaA.ID}, Cap: fullCap()})
-	for _, l := range Levels {
+	for _, l := range AWSLevels {
 		o := p.Level(l)
 		if o.Offered || !hasCode(o.Refusals, RefuseProtected) {
 			t.Errorf("%s level on protected resources: offered=%v refusals=%+v", l, o.Offered, o.Refusals)

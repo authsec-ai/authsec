@@ -129,6 +129,14 @@ type PreviewInput struct {
 	// names then show <id>).
 	ContainmentID uuid.UUID
 	Now           time.Time
+	// Target is what a W2 level names within the identity: the access key id
+	// (key) or the agent's client id / SPIFFE id (source_identity).
+	Target string
+	// Assumers are the principals of the role's trust policy (chain level).
+	Assumers []Assumer
+	// Brokered: AuthSec's broker opens sessions on the role (an active
+	// iga_gov_runtime_broker_role), so a SourceIdentity can name an agent.
+	Brokered bool
 }
 
 // Preview is the blast radius (spec §5.8 "preview -- blast radius first").
@@ -142,6 +150,11 @@ type Preview struct {
 	// Refusals apply to every level (the identity itself cannot be changed).
 	Refusals []Refusal `json:"refusals"`
 	Warnings []string  `json:"warnings"`
+	// Assumers are the role's trust principals and whether a chain stop can
+	// reach each one.
+	Assumers []Assumer `json:"assumers"`
+	// Target is what the stop names (key id, agent), when one was given.
+	Target string `json:"target,omitempty"`
 	Capability
 }
 
@@ -190,7 +203,7 @@ func refOf(w Workload) WorkloadRef { return WorkloadRef{ID: w.ID, Kind: w.Kind, 
 // nothing: the caller supplies the inventory, the live ECS reads and the
 // binding's capability.
 func BuildPreview(in PreviewInput) Preview {
-	p := Preview{Subject: in.Subject, Workloads: in.Workloads, Selected: in.Selected, Capability: in.Cap,
+	p := Preview{Subject: in.Subject, Workloads: in.Workloads, Selected: in.Selected, Capability: in.Cap, Target: in.Target,
 		RecentServices: sortedUsage(in.Usage), Refusals: []Refusal{}, Warnings: []string{}}
 	if p.Workloads == nil {
 		p.Workloads = []Workload{}
@@ -210,10 +223,14 @@ func BuildPreview(in PreviewInput) Preview {
 	}
 	idRef := identityRefusals(in.Subject)
 
-	p.Levels = []LevelOption{
+	p.Levels = append([]LevelOption{
 		workloadLevel(in, idRef),
 		modelLevel(in, idRef),
 		identityLevel(in, idRef),
+	}, w2Levels(in, idRef)...)
+	p.Assumers = in.Assumers
+	if p.Assumers == nil {
+		p.Assumers = []Assumer{}
 	}
 	if len(p.Refusals) > 0 {
 		for i := range p.Levels {

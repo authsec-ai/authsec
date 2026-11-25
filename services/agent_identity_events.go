@@ -53,7 +53,7 @@ const (
 )
 
 var agentLifecycleVocabulary = []GovEventKind{
-	{GovEventAgentAskNeeded, GovCatAgentLifecycle, GovObjAgent, "A person must decide about an agent (deleted at source, its only decider left, an unknown deployer); an ask once W4 lands."},
+	{GovEventAgentAskNeeded, GovCatAgentLifecycle, GovObjAgent, "A person must decide about an agent (deleted at source, its only decider left, an unknown deployer, a platform stop AuthSec cannot write); an ask once W4 lands."},
 	{GovEventAgentRetired, GovCatAgentLifecycle, GovObjAgent, "An agent was retired by a workspace member (reason given); every alias moved with it."},
 	{GovEventAgentMerged, GovCatAgentLifecycle, GovObjAgent, "An agent was merged into another; its aliases now point at the survivor."},
 	{GovEventAgentTransferred, GovCatAgentLifecycle, GovObjAgent, "An agent was transferred out of the workspace's responsibility (to whom, and why)."},
