@@ -62,6 +62,7 @@ type containmentStopRow struct {
 	ID          uuid.UUID
 	IdentityID  uuid.UUID
 	Level       string
+	Target      string
 	WorkloadIDs pq.StringArray `gorm:"column:workload_ids;type:uuid[]"`
 }
 
@@ -69,7 +70,7 @@ type containmentStopRow struct {
 // (tx is under RLS for ws).
 func readContainmentStops(tx *gorm.DB, ws uuid.UUID) ([]agentgateway.StoppedSubject, error) {
 	var rows []containmentStopRow
-	if err := tx.Raw(`SELECT id, identity_id, level, workload_ids FROM agent_containment
+	if err := tx.Raw(`SELECT id, identity_id, level, target, workload_ids FROM agent_containment
 		WHERE workspace_id = ? AND state IN ? ORDER BY id`, ws, agentcontain.LiveStates).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -78,7 +79,7 @@ func readContainmentStops(tx *gorm.DB, ws uuid.UUID) ([]agentgateway.StoppedSubj
 	}
 	var identities []uuid.UUID
 	for _, r := range rows {
-		if r.Level != agentcontain.LevelWorkload {
+		if gatewayStopsIdentity(r.Level) || (r.Level == agentcontain.LevelGateway && strings.TrimSpace(r.Target) == "") {
 			identities = append(identities, r.IdentityID)
 		}
 	}
@@ -96,6 +97,24 @@ func readContainmentStops(tx *gorm.DB, ws uuid.UUID) ([]agentgateway.StoppedSubj
 			workloadsOf[w.IdentityID] = append(workloadsOf[w.IdentityID], w.ID.String())
 		}
 	}
+	return containmentGatewayStops(rows, workloadsOf), nil
+}
+
+// gatewayStopsIdentity: the levels whose stop the gateway applies to the
+// whole identity (and every workload running as it). The narrower cloud-side
+// levels (key, sessions_before, chain, source_identity) and a platform stop
+// (an ask) are not identity-wide, so the gateway does not refuse the identity
+// for them.
+func gatewayStopsIdentity(level string) bool {
+	switch level {
+	case agentcontain.LevelIdentity, agentcontain.LevelModel, agentcontain.LevelEntra, agentcontain.LevelKubernetes:
+		return true
+	}
+	return false
+}
+
+// containmentGatewayStops maps live containments to what the gateway refuses.
+func containmentGatewayStops(rows []containmentStopRow, workloadsOf map[uuid.UUID][]string) []agentgateway.StoppedSubject {
 	var out []agentgateway.StoppedSubject
 	for _, r := range rows {
 		ref := "containment:" + r.ID.String()
@@ -103,19 +122,23 @@ func readContainmentStops(tx *gorm.DB, ws uuid.UUID) ([]agentgateway.StoppedSubj
 		if r.Level == agentcontain.LevelModel {
 			kind = agentgateway.KindModel
 		}
-		switch r.Level {
-		case agentcontain.LevelWorkload:
+		switch {
+		case r.Level == agentcontain.LevelWorkload:
 			for _, w := range r.WorkloadIDs {
 				out = append(out, agentgateway.StoppedSubject{Selector: agentgateway.Selector{WorkloadID: strings.ToLower(w)}, Ref: ref})
 			}
-		default:
+		case r.Level == agentcontain.LevelGateway && strings.TrimSpace(r.Target) != "":
+			// A gateway-level stop names the caller as the gateway sees it
+			// (gateway client id or SPIFFE ID).
+			out = append(out, agentgateway.StoppedSubject{Selector: agentgateway.Selector{ClientID: strings.TrimSpace(r.Target)}, Ref: ref})
+		case r.Level == agentcontain.LevelGateway || gatewayStopsIdentity(r.Level):
 			out = append(out, agentgateway.StoppedSubject{Selector: agentgateway.Selector{IdentityID: r.IdentityID.String()}, Kind: kind, Ref: ref})
 			for _, w := range workloadsOf[r.IdentityID] {
 				out = append(out, agentgateway.StoppedSubject{Selector: agentgateway.Selector{WorkloadID: w}, Kind: kind, Ref: ref})
 			}
 		}
 	}
-	return out, nil
+	return out
 }
 
 func digestJSON(v any) string {
