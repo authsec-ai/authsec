@@ -117,6 +117,9 @@ controllers/platform/agent_runtime_alerts_controller.go
 services/agent_runtime_alerts.go
 services/agent_runtime_alert_delivery.go
 services/agent_runtime_alert_siem.go
+controllers/platform/agent_runtime_cases_controller.go
+services/agent_runtime_cases.go
+services/agent_runtime_case_log.go
 controllers/platform/agent_runtime_ingest_controller.go
 services/agent_runtime_ingest.go
 services/agent_runtime_live.go

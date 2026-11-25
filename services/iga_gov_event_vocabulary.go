@@ -60,6 +60,8 @@ const (
 	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §10 Q3,
 	// agent_runtime_alerts.go): an alert opened and resolved.
 	GovCatAgentAlert = "agent_alert"
+	// Agent runtime cases (agent_runtime_cases.go): every case change.
+	GovCatAgentCase = "agent_case"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -302,6 +304,18 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
 	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
 	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
+	// Agent runtime cases (agent_runtime_cases.go).
+	{GovEventAgentCaseOpened, GovCatAgentCase, GovObjAgentCase, "A case was opened: by clustering (system) or by a member from alerts, or by a split."},
+	{GovEventAgentCaseAlertAdded, GovCatAgentCase, GovObjAgentCase, "An alert joined a case (clustered, moved in, or with a new case)."},
+	{GovEventAgentCaseAlertRemoved, GovCatAgentCase, GovObjAgentCase, "An alert left a case for another (move or split)."},
+	{GovEventAgentCaseLinked, GovCatAgentCase, GovObjAgentCase, "Two cases were linked (duplicate_of, related, split_from); logged on both."},
+	{GovEventAgentCaseAssigned, GovCatAgentCase, GovObjAgentCase, "A case's assignee was set or cleared."},
+	{GovEventAgentCaseNoteAdded, GovCatAgentCase, GovObjAgentCase, "A note was added to a case (the body is in the note, not the log)."},
+	{GovEventAgentCaseSplit, GovCatAgentCase, GovObjAgentCase, "Alerts of a case were split into a new case."},
+	{GovEventAgentCaseSeverityRaised, GovCatAgentCase, GovObjAgentCase, "A member raised a case's severity."},
+	{GovEventAgentCaseClosed, GovCatAgentCase, GovObjAgentCase, "A case was closed with an outcome (true_positive, benign, false_positive, duplicate)."},
+	{GovEventAgentCaseReopened, GovCatAgentCase, GovObjAgentCase, "A closed case was reopened (the previous outcome is in the entry)."},
+	{GovEventAgentCaseExported, GovCatAgentCase, GovObjAgentCase, "A case was exported as a bundle (its sha256 is in the entry)."},
 }
 
 // Object kinds the events API filters on.
@@ -326,6 +340,8 @@ const (
 	GovObjSessionRevocation = "session_revocation"
 	// Agent runtime alerts (payload key alert_id).
 	GovObjAgentAlert = "agent_alert"
+	// Agent runtime cases (payload key case_id).
+	GovObjAgentCase = "agent_case"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
@@ -348,6 +364,7 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjTempGrant:         {payloadKey: "grant_id"},
 	GovObjSessionRevocation: {payloadKey: "revocation_id"},
 	GovObjAgentAlert:        {payloadKey: "alert_id"},
+	GovObjAgentCase:         {payloadKey: "case_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.

@@ -756,6 +756,7 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 			"first_event_id": h.e.EventID}); err != nil {
 		return uuid.Nil, err
 	}
+	clusterNewAgentAlert(tx, ws, id, now) // agent_runtime_cases.go: the alert joins or opens a case
 	return id, enqueueAgentAlertDeliveries(tx, ws, id, st)
 }
 
