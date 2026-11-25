@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS public.agent_remediation (
     proven_at        timestamptz,
     cancelled_at     timestamptz,
     cancelled_by     uuid,
+    -- The executor's claim (one run at a time; a crashed run's claim lapses).
+    lease_until      timestamptz,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT agent_remediation_workspace_id_key UNIQUE (workspace_id, id),
