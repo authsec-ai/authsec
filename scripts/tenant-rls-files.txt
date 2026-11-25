@@ -152,3 +152,7 @@ services/iga_history_metrics.go
 services/iga_history_reports.go
 services/iga_history_schema.go
 services/iga_history_snapshot.go
+services/audit_governance.go
+services/audit_governance_chain.go
+services/audit_governance_jobs.go
+services/audit_governance_operators.go

@@ -62,6 +62,10 @@ const (
 	GovCatAgentAlert = "agent_alert"
 	// Agent runtime cases (agent_runtime_cases.go): every case change.
 	GovCatAgentCase = "agent_case"
+	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18,
+	// audit_governance*.go): retention, legal holds, the hash chain, write
+	// failures, second-person changes and operator governance.
+	GovCatAuditGovernance = "audit_governance"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -333,6 +337,20 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventAgentCaseClosed, GovCatAgentCase, GovObjAgentCase, "A case was closed with an outcome (true_positive, benign, false_positive, duplicate)."},
 	{GovEventAgentCaseReopened, GovCatAgentCase, GovObjAgentCase, "A closed case was reopened (the previous outcome is in the entry)."},
 	{GovEventAgentCaseExported, GovCatAgentCase, GovObjAgentCase, "A case was exported as a bundle (its sha256 is in the entry)."},
+	// Audit governance (audit_governance*.go).
+	{GovEventAuditRetentionChanged, GovCatAuditGovernance, "", "An audit retention was set to the same or a longer period (applied at once)."},
+	{GovEventAuditChangeRequested, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change (shorter retention, hold release, unsuspend) awaits a second person."},
+	{GovEventAuditChangeApplied, GovCatAuditGovernance, GovObjAuditChange, "A second person with governance:approve approved and applied a tier-3 audit change."},
+	{GovEventAuditChangeRejected, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change was rejected, withdrawn or expired."},
+	{GovEventAuditBreakGlass, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change was applied alone (no other approver in the workspace); a review is due within 24 hours."},
+	{GovEventAuditBreakGlassReviewed, GovCatAuditGovernance, GovObjAuditChange, "Another person reviewed a break-glass audit change."},
+	{GovEventAuditLegalHoldPlaced, GovCatAuditGovernance, "", "A legal hold was placed on a window of audit events."},
+	{GovEventAuditAnchored, GovCatAuditGovernance, "", "The workspace's audit hash chain head was anchored (daily)."},
+	{GovEventAuditRetentionPurged, GovCatAuditGovernance, "", "The retention job removed expired audit events (per record class, sparing legal holds); the chain records the gap."},
+	{GovEventAuditWriteFailed, GovCatAuditGovernance, "", "An audit event could not be written on the request path; it is kept in audit_write_failure for replay."},
+	{GovEventOperatorOutOfPattern, GovCatAuditGovernance, GovObjOperator, "An operator's hourly writes, elevated writes or exports exceeded max(10, 3 x their 14-day p95)."},
+	{GovEventOperatorSuspended, GovCatAuditGovernance, GovObjOperator, "An operator was suspended in the workspace (governance:emergency)."},
+	{GovEventOperatorUnsuspended, GovCatAuditGovernance, GovObjOperator, "An operator's suspension was lifted by a second person (or by break-glass)."},
 }
 
 // Object kinds the events API filters on.
@@ -363,6 +381,9 @@ const (
 	GovObjAgentAlertSuppression = "agent_alert_suppression"
 	// Agent runtime cases (payload key case_id).
 	GovObjAgentCase = "agent_case"
+	// Audit governance (payload keys change_id, operator_id).
+	GovObjAuditChange = "audit_change"
+	GovObjOperator    = "operator"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
@@ -388,6 +409,8 @@ var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
 	GovObjAgentAlertRule:        {payloadKey: "rule_version_id"},
 	GovObjAgentAlertSuppression: {payloadKey: "suppression_id"},
 	GovObjAgentCase:             {payloadKey: "case_id"},
+	GovObjAuditChange:           {payloadKey: "change_id"},
+	GovObjOperator:              {payloadKey: "operator_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.

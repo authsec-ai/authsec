@@ -137,4 +137,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// second-person requests of tier-3 changes (iga_history_controller.go).
 		platformCtrl.MountIGAHistoryRoutes(iga, platformCtrl.NewIGAHistoryControllerFor(igaGraphRead))
 	}
+
+	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18):
+	// /api/iga/v1/audit/* and the operator suspension routes under
+	// /authsec/admin/operators, behind the same AuthMiddleware
+	// (audit_governance_controller.go). Mounted here so the tests that mount
+	// SetupIGARoutes reach them through the production chain.
+	platformCtrl.MountAuditGovernanceRoutes(r, platformCtrl.NewAuditGovernanceControllerFor(igaGraphRead), middlewares.AuthMiddleware())
 }
