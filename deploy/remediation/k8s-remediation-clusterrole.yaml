@@ -1,0 +1,47 @@
+# AuthSec remediation on Kubernetes (SPEC-secops-backend-upgrade.md W8,
+# decision 2): a SEPARATE ClusterRole from the iga-agent's discovery and
+# actuation roles. It lets AuthSec remove a subject from a RoleBinding or a
+# ClusterRoleBinding that grants an agent's ServiceAccount too much, and
+# nothing else: no secrets, no pods, no escalate.
+#
+# In this release AuthSec only PREPARES Kubernetes remediations (the exact
+# kubectl commands); this ClusterRole is what a later write mode (through the
+# iga-agent, as access policies' remove_binding_subject does) will need.
+# Bind it only to the remediation identity, never to the discovery one.
+#
+# "update"/"patch" on bindings cannot be limited to removing a subject; the
+# bind verb is limited to the roles named below by resourceNames, so the
+# identity can never bind itself to cluster-admin (Kubernetes refuses a
+# binding update that grants a role the updater does not hold or may not
+# bind). List the roles whose bindings AuthSec may edit.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: authsec-remediation
+  labels:
+    app.kubernetes.io/name: authsec-remediation
+    app.kubernetes.io/managed-by: authsec
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings", "clusterrolebindings"]
+    verbs: ["get", "list", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "clusterroles"]
+    verbs: ["bind"]
+    # The roles whose bindings may be edited (fill in your own).
+    resourceNames: ["<role-a>", "<role-b>"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: authsec-remediation
+  labels:
+    app.kubernetes.io/managed-by: authsec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: authsec-remediation
+subjects:
+  - kind: ServiceAccount
+    name: authsec-remediation
+    namespace: authsec
