@@ -131,5 +131,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// trail backfill, Azure diagnostic ingest secrets, capability states
 		// and gap declarations (agent_evidence_controller.go).
 		platformCtrl.MountAgentEvidenceRoutes(iga, platformCtrl.NewAgentEvidenceControllerFor(igaGraphRead))
+		// History and metrics (SPEC-secops-backend-upgrade.md W9): daily
+		// snapshots and as-of reads, legal holds, redaction, SOC and posture
+		// metrics, CISO and population reports, bulk exports, and the
+		// second-person requests of tier-3 changes (iga_history_controller.go).
+		platformCtrl.MountIGAHistoryRoutes(iga, platformCtrl.NewIGAHistoryControllerFor(igaGraphRead))
 	}
 }

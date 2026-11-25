@@ -344,6 +344,10 @@ func main() {
 	// Agent runtime cases (W3): places alerts the sink left out of a case and
 	// backfills alerts raised before migration 186.
 	go services.RunAgentCaseClusterWorker(context.Background(), config.DB)
+	// History snapshots (SPEC-secops-backend-upgrade.md W9): daily snapshots
+	// and snapshot retention, leader-locked (AUTHSEC_DISABLE_SNAPSHOTS=true
+	// turns it off on a replica).
+	go services.RunHistorySnapshotWorker(context.Background(), config.DB)
 
 	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
 	// workspace; the Vault client for admin keys, and the hourly sync worker
