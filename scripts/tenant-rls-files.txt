@@ -162,3 +162,9 @@ services/agent_hygiene.go
 services/directory.go
 services/resource_classification.go
 services/responder_groups.go
+services/agent_asks.go
+services/agent_asks_delivery.go
+services/agent_asks_policy.go
+services/agent_asks_needed.go
+services/agent_ask_connectors.go
+controllers/platform/agent_asks_controller.go
