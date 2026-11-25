@@ -413,7 +413,9 @@ func TestHistoryMetricsSeededAndUnavailable(t *testing.T) {
 	tfa := histMetric(t, soc.Metrics, services.SOCTimeToFirstAction)
 	// Alert 1: acknowledged at +30 s (before its stop at +60 s); alert 2:
 	// its (non-covering) stop was started a minute after it.
-	if *tfa.N != 2 || *tfa.Median != 45 || tfa.Definition.Version != 1 {
+	// With F8's acknowledged_at/resolved_at present the metric runs under
+	// definition version 2; both versions see the same two alerts acted on.
+	if *tfa.N != 2 || tfa.Breakdown["acted_on"] != 2 || tfa.Definition.Version != 2 {
 		t.Fatalf("time to first action: %+v", tfa)
 	}
 	up := histMetric(t, soc.Metrics, services.SOCUnprovenStops)
@@ -421,8 +423,9 @@ func TestHistoryMetricsSeededAndUnavailable(t *testing.T) {
 		t.Fatalf("unproven stops: %+v", up)
 	}
 	mix := histMetric(t, soc.Metrics, services.SOCOutcomeMix)
-	if mix.Status != services.MetricUnavailable || !strings.HasPrefix(mix.Reason, "source_missing") {
-		t.Fatalf("outcome mix is unavailable before W3/F8: %+v", mix)
+	// W3's cases and F8's outcome codes are merged: the outcome mix is live.
+	if mix.Status != services.MetricAvailable {
+		t.Fatalf("outcome mix is available once W3/F8 are merged: %+v", mix)
 	}
 	if tfa.Previous == nil || tfa.Previous.Definition.Version != tfa.Definition.Version {
 		t.Fatalf("previous period under the same definition: %+v", tfa.Previous)
@@ -458,18 +461,14 @@ func TestHistoryMetricsSeededAndUnavailable(t *testing.T) {
 	if err != nil || len(ciso.Headlines) != 7 {
 		t.Fatalf("ciso: %+v %v", ciso, err)
 	}
-	if m := histMetric(t, ciso.Headlines, services.CISOIncidents); m.Status != services.MetricUnavailable {
-		t.Fatalf("incidents need cases: %+v", m)
-	}
-
-	// W3 lands: a case table with outcome codes lights the outcome mix up.
-	p3exec(t, db, `CREATE TABLE agent_case (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL,
-		state text NOT NULL DEFAULT 'open', outcome text, opened_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz,
-		classified_at timestamptz, severity text)`)
-	t.Cleanup(func() { db.Exec(`DROP TABLE IF EXISTS agent_case`); services.ResetHistorySchemaCache() })
-	services.ResetHistorySchemaCache()
-	p3exec(t, db, `INSERT INTO agent_case (workspace_id, state, outcome, closed_at) VALUES (?, 'closed', 'true_positive', now() - interval '1 minute'), (?, 'closed', 'benign', now() - interval '1 minute'), (?, 'closed', 'true_positive', now() - interval '1 minute')`,
+	// W3 is merged: incidents and the outcome mix read agent_case. Two closed
+	// cases in A (one true positive) and one in B, which A must never count.
+	p3exec(t, db, `INSERT INTO agent_case (workspace_id, number, title, severity, state, outcome, opened_by, closed_at, closed_by)
+		VALUES (?, 901, 'hist case 1', 'high', 'closed', 'true_positive', 'system', now() - interval '1 minute', gen_random_uuid()),
+		       (?, 902, 'hist case 2', 'medium', 'closed', 'benign', 'system', now() - interval '1 minute', gen_random_uuid()),
+		       (?, 901, 'hist case B', 'high', 'closed', 'true_positive', 'system', now() - interval '1 minute', gen_random_uuid())`,
 		a.ws, a.ws, b.ws)
+	services.ResetHistorySchemaCache()
 	soc, err = svc.SOC(ctx, a.ws, "7d")
 	if err != nil {
 		t.Fatal(err)
