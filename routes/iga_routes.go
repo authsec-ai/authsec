@@ -119,5 +119,9 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime (agent_gateway_controller.go). The PDP
 		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
 		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
+
+		// Pending changes (tier 3, a second person approves; migration 163):
+		// /api/iga/v1/pending-changes (pending_change_controller.go).
+		platformCtrl.MountPendingChangeRoutes(iga, platformCtrl.NewPendingChangeControllerFor(igaGraphRead))
 	}
 }
