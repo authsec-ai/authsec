@@ -231,3 +231,27 @@ func TestModelAccessAuditDocument(t *testing.T) {
 		t.Error("audit mode must say what each form would affect")
 	}
 }
+
+// SecOps W1: the stream forwards every management event of the account by
+// default (evidence for every principal), behind a parameter that can turn
+// it back to the selection.
+func TestAgentEventStreamForwardsAllManagementEvents(t *testing.T) {
+	tpl := parseAgentTemplate(t, "event stream", awsdiscovery.AgentEventStreamTemplate)
+	if d := enforcetest.Dig(tpl, "Parameters", "ForwardAllManagementEvents", "Default"); d != "true" {
+		t.Fatalf("ForwardAllManagementEvents default %v, want 'true'", d)
+	}
+	branches, _ := enforcetest.Dig(tpl, "Resources", "AuthSecEventRule", "Properties", "EventPattern", "detail", "$or").([]any)
+	found := false
+	for _, b := range branches {
+		ifs, ok := enforcetest.Dig(b, "Fn::If").([]any)
+		if !ok || len(ifs) != 3 || ifs[0] != "ForwardAllCond" {
+			continue
+		}
+		if cats := strs(enforcetest.Dig(ifs[1], "eventCategory")); len(cats) == 1 && cats[0] == "Management" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no ForwardAllCond branch forwarding eventCategory Management")
+	}
+}

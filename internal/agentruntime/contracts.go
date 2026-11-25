@@ -79,6 +79,13 @@ type Event struct {
 	RequestFacts map[string]string
 	// Resources are the ARNs the record lists in resources[].
 	Resources []string
+
+	// Provider is the event id's namespace: "" or ProviderAWS for a
+	// CloudTrail record, ProviderAzure, ProviderK8s (evidence.go).
+	Provider string
+	// RawHash is sha256 (lower-case hex) of the record as received, set by
+	// the parsers; "" when the event was built in memory.
+	RawHash string
 }
 
 // Request fact keys (Event.RequestFacts).

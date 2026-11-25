@@ -119,5 +119,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime (agent_gateway_controller.go). The PDP
 		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
 		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
+
+		// Evidence store and coverage (SPEC-secops W1): evidence, retention,
+		// trail backfill, Azure diagnostic ingest secrets, capability states
+		// and gap declarations (agent_evidence_controller.go).
+		platformCtrl.MountAgentEvidenceRoutes(iga, platformCtrl.NewAgentEvidenceControllerFor(igaGraphRead))
 	}
 }

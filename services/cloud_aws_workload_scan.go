@@ -847,7 +847,9 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 				warn("agent-runtime dispatch panicked: %v", r)
 			}
 		}()
-		if derr := agentruntime.Dispatch(ctx, workspaceID, snapshot.ConnectorID, normalised); derr != nil {
+		dctx := agentruntime.WithDelivery(ctx, agentruntime.Delivery{Kind: agentruntime.DeliveryCloudTrailPoll,
+			Ref: HeartbeatRef(snapshot.ConnectorID) + "/region/" + region})
+		if derr := agentruntime.Dispatch(dctx, workspaceID, snapshot.ConnectorID, normalised); derr != nil {
 			warn("agent-runtime dispatch: %v", derr)
 		}
 	}()

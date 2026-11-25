@@ -87,6 +87,7 @@ func ParseCloudTrailRecord(raw []byte) (Event, error) {
 		return Event{}, fmt.Errorf("cloudtrail record: missing eventID or eventName")
 	}
 	e := Event{
+		Provider: ProviderAWS, RawHash: RawHash(raw),
 		EventID: r.EventID, EventSource: r.EventSource, EventName: r.EventName,
 		EventType: r.EventType, EventCategory: r.EventCategory, ReadOnly: r.ReadOnly,
 		AccountID: r.RecipientAccountID, Region: r.AWSRegion, SourceIP: r.SourceIPAddress,

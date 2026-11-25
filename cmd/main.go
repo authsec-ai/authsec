@@ -306,6 +306,7 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentEvidenceSink(config.DB)      // SecOps W1: every event of a connected account, first
 	services.RegisterAgentLiveSink(config.DB)          // agent runtime: live AI-workload evidence; before the alert and verify sinks
 	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
@@ -324,6 +325,10 @@ func main() {
 			// connection starts off). It only queues work, the worker above runs
 			// it, and it needs no environment switch.
 			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
+
+			// SecOps W1: trail-bucket backfills (asked for, and the windows a
+			// silent event stream missed), read with the connector's role.
+			go services.RunAgentTrailBackfillWorker(context.Background(), config.DB, services.AWSTrailLocator(awsSvc))
 		}
 	}
 
@@ -333,6 +338,9 @@ func main() {
 	services.InstallAgentRuntimeAlerts(config.DB)
 	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+	// SecOps W1: source heartbeats and COV-01, capability states, evidence
+	// retention (AUTHSEC_DISABLE_AGENT_COVERAGE_WORKER=true turns it off).
+	go services.RunAgentCoverageWorker(context.Background(), config.DB)
 
 	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
 	// workspace; the Vault client for admin keys, and the hourly sync worker
