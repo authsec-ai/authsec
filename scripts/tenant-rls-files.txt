@@ -135,3 +135,8 @@ controllers/platform/agent_gateway_pdp_controller.go
 services/agent_gateway.go
 services/agent_gateway_policy.go
 services/agent_gateway_decisions.go
+services/iga_history_changes.go
+services/iga_history_metrics.go
+services/iga_history_reports.go
+services/iga_history_schema.go
+services/iga_history_snapshot.go

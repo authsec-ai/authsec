@@ -119,5 +119,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime (agent_gateway_controller.go). The PDP
 		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
 		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
+
+		// History and metrics (SPEC-secops-backend-upgrade.md W9): daily
+		// snapshots and as-of reads, legal holds, redaction, SOC and posture
+		// metrics, CISO and population reports, bulk exports, and the
+		// second-person requests of tier-3 changes (iga_history_controller.go).
+		platformCtrl.MountIGAHistoryRoutes(iga, platformCtrl.NewIGAHistoryControllerFor(igaGraphRead))
 	}
 }

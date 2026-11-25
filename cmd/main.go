@@ -333,6 +333,10 @@ func main() {
 	services.InstallAgentRuntimeAlerts(config.DB)
 	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+	// History snapshots (SPEC-secops-backend-upgrade.md W9): daily snapshots
+	// and snapshot retention, leader-locked (AUTHSEC_DISABLE_SNAPSHOTS=true
+	// turns it off on a replica).
+	go services.RunHistorySnapshotWorker(context.Background(), config.DB)
 
 	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
 	// workspace; the Vault client for admin keys, and the hourly sync worker
