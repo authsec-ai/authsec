@@ -124,7 +124,8 @@ func TestAgentRuntimeGraphContainmentFacts(t *testing.T) {
 			t.Errorf("%s: in force = %v, want %v", state, got, inForce)
 		}
 	}
-	if (&arAlertCount{Rank: 2}).severity() != "high" || (&arAlertCount{Rank: 1}).severity() != "medium" || (&arAlertCount{}).severity() != "" {
+	if (&arAlertCount{Rank: 3}).severity() != "high" || (&arAlertCount{Rank: 2}).severity() != "medium" ||
+		(&arAlertCount{Rank: 1}).severity() != "low" || (&arAlertCount{}).severity() != "" {
 		t.Error("alert severity ranks")
 	}
 }

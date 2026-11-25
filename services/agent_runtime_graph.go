@@ -79,14 +79,14 @@ func (AgentRuntimeGraphSource) AgentRuntimeFacts(tx *gorm.DB, ws uuid.UUID, subj
 	                       OR EXISTS (SELECT 1 FROM agent_finding f WHERE f.workspace_id = ci.workspace_id AND f.identity_id = ci.id
 	                                     AND f.state = ?)
 	                       OR EXISTS (SELECT 1 FROM agent_alert a WHERE a.workspace_id = ci.workspace_id AND a.identity_id = ci.id
-	                                     AND a.state = ?)
+	                                     AND a.state IN ?)
 	                       OR EXISTS (SELECT 1 FROM agent_containment c WHERE c.workspace_id = ci.workspace_id AND c.identity_id = ci.id
 	                                     AND c.state IN ?)
 	                       OR EXISTS (SELECT 1 FROM agent_suggestion s WHERE s.workspace_id = ci.workspace_id AND s.identity_id = ci.id
 	                                     AND s.state = ?))
 	                   ORDER BY ci.id`,
 		ws, arns, []string{models.CloudIdentityIAMRole, models.CloudIdentityIAMUser},
-		agentruntime.UsageSource, agentruntime.UsageService, FindingOpen, AgentAlertOpen,
+		agentruntime.UsageSource, agentruntime.UsageService, FindingOpen, AgentAlertActiveStates,
 		agentcontain.LiveStates, SuggestionPending).Scan(&cands).Error; err != nil {
 		return nil, fmt.Errorf("agent runtime graph: identities: %w", err)
 	}
@@ -327,11 +327,10 @@ type arAlertCount struct {
 }
 
 func (a *arAlertCount) severity() string {
-	switch a.Rank {
-	case 2:
-		return detect.SeverityHigh
-	case 1:
-		return detect.SeverityMedium
+	for _, s := range []string{detect.SeverityHigh, detect.SeverityMedium, detect.SeverityLow} {
+		if a.Rank == detect.SeverityRank(s) {
+			return s
+		}
 	}
 	return ""
 }
@@ -339,9 +338,11 @@ func (a *arAlertCount) severity() string {
 func arOpenAlerts(tx *gorm.DB, ws uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]*arAlertCount, error) {
 	var rows []*arAlertCount
 	if err := tx.Table("agent_alert").
-		Select("identity_id, count(*) AS n, max(CASE severity WHEN ? THEN 2 WHEN ? THEN 1 ELSE 0 END) AS rank",
-			detect.SeverityHigh, detect.SeverityMedium).
-		Where("workspace_id = ? AND state = ? AND identity_id IN ?", ws, AgentAlertOpen, ids).
+		Select("identity_id, count(*) AS n, max(CASE severity WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? ELSE 0 END) AS rank",
+			detect.SeverityHigh, detect.SeverityRank(detect.SeverityHigh), detect.SeverityMedium, detect.SeverityRank(detect.SeverityMedium),
+			detect.SeverityLow, detect.SeverityRank(detect.SeverityLow)).
+		// Open and reopened alerts; a suppressed one is not shown as open.
+		Where("workspace_id = ? AND state IN ? AND suppressed_by IS NULL AND identity_id IN ?", ws, AgentAlertActiveStates, ids).
 		Group("identity_id").Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("agent runtime graph: alerts: %w", err)
 	}

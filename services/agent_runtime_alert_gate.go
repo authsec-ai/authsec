@@ -19,8 +19,9 @@ import (
 // is cached and, until it passes, retried at most once a minute.
 
 const (
-	// AgentAlertsSchemaHead is the migration alerts need.
-	AgentAlertsSchemaHead = "150"
+	// AgentAlertsSchemaHead names the migrations alerts need: 150, rule
+	// versions (164), the lifecycle (165) and suppressions (166).
+	AgentAlertsSchemaHead = "150, 164, 165, 166"
 	// AgentRuntimeSchemaHead names the migrations the runtime (inference,
 	// suggestions, findings, event stream, CloudTrail cursor) needs.
 	AgentRuntimeSchemaHead = "147, 148, 149, 160, 161"
@@ -32,7 +33,8 @@ const (
 )
 
 var agentAlertsSchemaRelations = []string{"agent_alert", "agent_alert_siem_endpoint", "agent_alert_delivery",
-	"agent_alert_baseline", "agent_alert_setting", "agent_alert_event_seen"}
+	"agent_alert_baseline", "agent_alert_setting", "agent_alert_event_seen", "agent_detection_rule_version",
+	"agent_alert_transition", "agent_alert_suppression"}
 
 var agentRuntimeSchemaRelations = []string{"cloud_trail_cursor", "cloud_trail_seen_event", "agent_suggestion", "agent_finding",
 	"agent_event_stream", "agent_event_seen"}
@@ -49,7 +51,8 @@ type agentSchemaGate struct {
 }
 
 var (
-	agentAlertsGate  = &agentSchemaGate{head: AgentAlertsSchemaHead, relations: agentAlertsSchemaRelations}
+	agentAlertsGate = &agentSchemaGate{head: AgentAlertsSchemaHead, relations: agentAlertsSchemaRelations,
+		columns: [][2]string{{"agent_alert", "reopen_count"}, {"agent_alert", "suppressed_by"}}}
 	agentRuntimeGate = &agentSchemaGate{head: AgentRuntimeSchemaHead, relations: agentRuntimeSchemaRelations,
 		columns: [][2]string{{"agent_event_seen", "dispatched_at"}}}
 )
@@ -110,7 +113,7 @@ func (g *agentSchemaGate) logWait(what, reason string) {
 	}
 }
 
-// AgentAlertsStatus is whether alerts can run (migration 150's tables).
+// AgentAlertsStatus is whether alerts can run (migrations 150, 164-166).
 func AgentAlertsStatus(db *gorm.DB) (bool, string) { return agentAlertsGate.status(db) }
 
 // AgentRuntimeStatus is whether the runtime routes can run (147, 148, 149).

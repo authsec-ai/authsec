@@ -14036,3 +14036,271 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.pending_change');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 164: mirrored verbatim from migrations/master/164_agent_detection_rule_version.sql.
+-- ============================================================================
+-- ============================================================================
+-- 164: versioned detection rules (SecOps F6, AS-179).
+--
+-- agent_alert_setting was one row per workspace, overwritten in place, and
+-- its audit row carried only the new value. Every change is now a row of
+-- agent_detection_rule_version:
+--
+--   proposed    a loosening change (a detection disabled, a threshold raised,
+--               a severity lowered, Slack off, a longer dedupe window, a
+--               shorter retention) waiting for a second person holding
+--               governance:approve (tier 3; approved_by <> proposed_by)
+--   active      the version the detections read (at most one per workspace)
+--   rejected    a proposal turned down
+--   superseded  a version that was active, or a proposal overtaken by a newer
+--               active version
+--
+-- A tightening change is active at once. break_glass marks a loosening that
+-- the workspace's only governance:approve holder applied alone; it is due a
+-- review within 24 hours (review_due_at).
+--
+-- Every existing agent_alert_setting row becomes the workspace's version 1,
+-- active. agent_alert_setting stays (it mirrors the active version) until a
+-- contract migration retires it.
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_detection_rule_version (
+    id                    uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id          uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    version_no            integer     NOT NULL CHECK (version_no >= 1),
+    -- The version this one was proposed against (NULL for the first).
+    base_version_no       integer,
+    -- Same shape as agent_alert_setting.detections:
+    -- {"D5": {"enabled": true, "n": 10, "minutes": 5, "severity": ""}, ...}
+    detections            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    slack_enabled         boolean     NOT NULL DEFAULT true,
+    dedupe_window_minutes integer     NOT NULL DEFAULT 60 CHECK (dedupe_window_minutes BETWEEN 5 AND 1440),
+    retention_days        integer     NOT NULL DEFAULT 90 CHECK (retention_days BETWEEN 7 AND 3650),
+    -- The loosening changes this version makes over its base ([] = none).
+    loosening             jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    state                 text        NOT NULL CHECK (state IN ('proposed', 'active', 'rejected', 'superseded')),
+    proposed_by           uuid,
+    proposed_at           timestamptz NOT NULL DEFAULT now(),
+    approved_by           uuid,
+    approved_at           timestamptz,
+    rejected_by           uuid,
+    rejected_at           timestamptz,
+    activated_at          timestamptz,
+    superseded_at         timestamptz,
+    reason                text        NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+    break_glass           boolean     NOT NULL DEFAULT false,
+    review_due_at         timestamptz,
+    UNIQUE (workspace_id, id),
+    UNIQUE (workspace_id, version_no),
+    -- Separation of duties: nobody approves their own proposal.
+    CONSTRAINT agent_detection_rule_version_sod_chk
+        CHECK (approved_by IS NULL OR proposed_by IS NULL OR approved_by <> proposed_by),
+    CONSTRAINT agent_detection_rule_version_approved_chk
+        CHECK ((approved_by IS NULL) = (approved_at IS NULL)),
+    CONSTRAINT agent_detection_rule_version_break_glass_chk
+        CHECK (NOT break_glass OR review_due_at IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_detection_rule_version_ws
+    ON public.agent_detection_rule_version (workspace_id, version_no DESC);
+-- One active version, and at most one open proposal, per workspace.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_detection_rule_version_active
+    ON public.agent_detection_rule_version (workspace_id) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_detection_rule_version_proposed
+    ON public.agent_detection_rule_version (workspace_id) WHERE state = 'proposed';
+
+-- Existing settings become version 1, active.
+INSERT INTO public.agent_detection_rule_version (workspace_id, version_no, detections, slack_enabled, dedupe_window_minutes,
+                                                 retention_days, state, proposed_by, proposed_at, activated_at, reason)
+SELECT s.workspace_id, 1, s.detections, s.slack_enabled, s.dedupe_window_minutes, s.retention_days, 'active',
+       s.updated_by, s.updated_at, s.updated_at, 'migrated from agent_alert_setting'
+  FROM public.agent_alert_setting s
+ WHERE NOT EXISTS (SELECT 1 FROM public.agent_detection_rule_version v WHERE v.workspace_id = s.workspace_id);
+
+COMMENT ON TABLE public.agent_detection_rule_version IS
+    'Versioned agent runtime detection rules: loosening changes need a second person (tier 3); every change is an iga_gov_event.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_detection_rule_version');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 165: mirrored verbatim from migrations/master/165_agent_alert_lifecycle.sql.
+-- ============================================================================
+-- ============================================================================
+-- 165: agent alert lifecycle (SecOps F8, AS-180).
+--
+-- 1. agent_alert.state admits 'reopened' (a resolved alert reopened with a
+--    reason); severity admits 'low'.
+-- 2. Per-transition actors on the alert: acknowledged_by/at, resolved_by/at
+--    and the resolution's outcome code (true_positive | benign |
+--    false_positive | duplicate), reopened_by/at and reopen_count.
+--    Resolving no longer overwrites who acknowledged. state_changed_by/at
+--    stay: the latest transition.
+-- 3. agent_alert_transition: every acknowledge / resolve / reopen, with its
+--    actor, outcome and reason, in order. Rows are only inserted; they go
+--    with their alert (retention). The summary columns of (2) show the
+--    latest cycle; this table keeps every cycle.
+--
+-- Existing acknowledged and resolved alerts get their summary columns from
+-- state_changed_by/at; their outcome stays NULL (it was never recorded).
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_state_check;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_state_check
+    CHECK (state IN ('open', 'acknowledged', 'resolved', 'reopened'));
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_severity_check;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_severity_check
+    CHECK (severity IN ('high', 'medium', 'low'));
+
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS acknowledged_by uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS acknowledged_at timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS resolved_by     uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS resolved_at     timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS outcome         text;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopened_by     uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopened_at     timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopen_count    integer NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_alert_outcome_check'
+                      AND conrelid = 'public.agent_alert'::regclass) THEN
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_outcome_check
+            CHECK (outcome IS NULL OR outcome IN ('true_positive', 'benign', 'false_positive', 'duplicate'));
+    END IF;
+END $$;
+
+UPDATE public.agent_alert SET acknowledged_by = state_changed_by, acknowledged_at = state_changed_at
+ WHERE state = 'acknowledged' AND acknowledged_at IS NULL AND state_changed_at IS NOT NULL;
+UPDATE public.agent_alert SET resolved_by = state_changed_by, resolved_at = state_changed_at
+ WHERE state = 'resolved' AND resolved_at IS NULL AND state_changed_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_transition (
+    id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    alert_id     uuid        NOT NULL,
+    from_state   text        NOT NULL,
+    to_state     text        NOT NULL CHECK (to_state IN ('acknowledged', 'resolved', 'reopened')),
+    actor_id     uuid        NOT NULL,
+    outcome      text        CHECK (outcome IS NULL OR outcome IN ('true_positive', 'benign', 'false_positive', 'duplicate')),
+    reason       text        NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+    at           timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, alert_id) REFERENCES public.agent_alert (workspace_id, id) ON DELETE CASCADE,
+    -- A resolution always carries its outcome; nothing else does.
+    CONSTRAINT agent_alert_transition_outcome_chk CHECK ((to_state = 'resolved') = (outcome IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_transition_alert
+    ON public.agent_alert_transition (workspace_id, alert_id, at);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_alert_transition');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 166: mirrored verbatim from migrations/master/166_agent_alert_suppression.sql.
+-- ============================================================================
+-- ============================================================================
+-- 166: agent alert suppressions (SecOps P6, AS-179/AS-180 follow-on).
+--
+-- A suppression keeps the alerts of one agent identity and one detection
+-- (optionally one instance digest) from being delivered to Slack and SIEM
+-- for at most 90 days. The alerts are still stored, with suppressed_by set.
+--
+--   proposed  requested; a second person holding governance:approve
+--             approves (tier 3; approved_by <> requested_by)
+--   active    in force between starts_at and ends_at
+--   rejected  turned down
+--   ended     ended early by a member, or replaced by its approved renewal
+--   expired   reached ends_at
+--
+-- A suppression never silences an alert recording a succeeded harmful
+-- outcome (services/agent_runtime_alert_suppression.go): it cannot name
+-- D1-D4 or D7, which fire only on a call that succeeded.
+-- renewals counts the earlier suppressions of the same identity and
+-- detection that came into force (per agent x rule, however requested).
+-- break_glass marks one the workspace's only governance:approve holder
+-- applied alone; it is due a review within 24 hours.
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_suppression (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    identity_id     uuid        NOT NULL,
+    detection       text        NOT NULL CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8')),
+    instance_digest text        NOT NULL DEFAULT '' CHECK (length(instance_digest) <= 200),
+    reason          text        NOT NULL CHECK (length(reason) BETWEEN 1 AND 1000),
+    duration_days   integer     NOT NULL CHECK (duration_days BETWEEN 1 AND 90),
+    state           text        NOT NULL CHECK (state IN ('proposed', 'active', 'rejected', 'ended', 'expired')),
+    renewal_of      uuid,
+    renewals        integer     NOT NULL DEFAULT 0 CHECK (renewals >= 0),
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    approved_by     uuid,
+    approved_at     timestamptz,
+    rejected_by     uuid,
+    rejected_at     timestamptz,
+    starts_at       timestamptz,
+    ends_at         timestamptz,
+    ended_by        uuid,
+    ended_at        timestamptz,
+    end_reason      text        NOT NULL DEFAULT '' CHECK (length(end_reason) <= 1000),
+    break_glass     boolean     NOT NULL DEFAULT false,
+    review_due_at   timestamptz,
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, renewal_of) REFERENCES public.agent_alert_suppression (workspace_id, id),
+    CONSTRAINT agent_alert_suppression_sod_chk CHECK (approved_by IS NULL OR approved_by <> requested_by),
+    -- In force means a window, never longer than 90 days.
+    CONSTRAINT agent_alert_suppression_window_chk CHECK (
+        (starts_at IS NULL) = (ends_at IS NULL)
+        AND (ends_at IS NULL OR (ends_at > starts_at AND ends_at <= starts_at + interval '90 days'))),
+    CONSTRAINT agent_alert_suppression_active_chk CHECK (state NOT IN ('active', 'expired') OR starts_at IS NOT NULL),
+    CONSTRAINT agent_alert_suppression_break_glass_chk CHECK (NOT break_glass OR review_due_at IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppression_ws
+    ON public.agent_alert_suppression (workspace_id, requested_at DESC, id DESC);
+-- The sink's lookup: active suppressions of an identity and detection.
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppression_match
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection) WHERE state = 'active';
+-- One request waiting and one suppression in force per scope.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_suppression_proposed
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection, instance_digest) WHERE state = 'proposed';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_suppression_active
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection, instance_digest) WHERE state = 'active';
+
+-- The suppression that kept an alert from being delivered.
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS suppressed_by uuid;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_alert_suppressed_by_fkey'
+                      AND conrelid = 'public.agent_alert'::regclass) THEN
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_suppressed_by_fkey
+            FOREIGN KEY (workspace_id, suppressed_by) REFERENCES public.agent_alert_suppression (workspace_id, id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppressed_by
+    ON public.agent_alert (workspace_id, suppressed_by) WHERE suppressed_by IS NOT NULL;
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_alert_suppression');
+    END IF;
+END $$;
+
