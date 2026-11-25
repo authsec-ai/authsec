@@ -18,13 +18,16 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/authsec-ai/authsec/internal/agentgateway"
 )
 
-// Fail modes (spec §7).
+// Fail modes (spec §7). AuthSec sets each gateway's fail mode (policy
+// hints, fail_mode); the local value can only make it stricter (AS-174).
 const (
-	FailAuto   = "auto"
-	FailClosed = "closed"
-	FailOpen   = "open"
+	FailAuto   = agentgateway.FailAuto
+	FailClosed = agentgateway.FailClosed
+	FailOpen   = agentgateway.FailOpen
 )
 
 // Provider kinds of an LLM upstream.
@@ -45,7 +48,9 @@ type Config struct {
 	TLS           *TLS   `yaml:"tls"`
 
 	AuthSec AuthSec `yaml:"authsec"`
-	// FailMode is auto (default), closed or open.
+	// FailMode is auto (default), closed or open. It can only tighten the
+	// fail mode AuthSec sets for this gateway (closed > auto > open): with
+	// AuthSec saying auto, a local "open" acts as auto.
 	FailMode string `yaml:"fail_mode"`
 
 	Cache  CacheConfig  `yaml:"cache"`
@@ -76,7 +81,9 @@ type AuthSec struct {
 	CredentialEnv string `yaml:"credential_env"`
 	// TimeoutMS bounds one PDP call (default 300); then the fail mode applies.
 	TimeoutMS int `yaml:"timeout_ms"`
-	// HintsIntervalS is how often policy hints are refreshed (default 60).
+	// HintsIntervalS is how often policy hints (fail mode, cache lifetime,
+	// stopped agents) are refreshed (default 5, at most 60). It bounds how
+	// long a stopped agent can still be served from the decision cache.
 	HintsIntervalS int `yaml:"hints_interval_s"`
 
 	credential string
@@ -85,6 +92,9 @@ type AuthSec struct {
 // CacheConfig bounds the decision cache.
 type CacheConfig struct {
 	MaxEntries int `yaml:"max_entries"`
+	// MaxTTLSeconds, when > 0, caps how long a decision is cached below
+	// what AuthSec allows (it can only shorten it).
+	MaxTTLSeconds int `yaml:"max_ttl_seconds"`
 }
 
 // UploadConfig tunes the decision upload.
@@ -258,7 +268,13 @@ func (c *Config) finish(getenv func(string) string) error {
 		c.AuthSec.TimeoutMS = 300
 	}
 	if c.AuthSec.HintsIntervalS <= 0 {
+		c.AuthSec.HintsIntervalS = 5
+	}
+	if c.AuthSec.HintsIntervalS > 60 {
 		c.AuthSec.HintsIntervalS = 60
+	}
+	if c.Cache.MaxTTLSeconds < 0 {
+		c.Cache.MaxTTLSeconds = 0
 	}
 	if c.Cache.MaxEntries <= 0 {
 		c.Cache.MaxEntries = 10000

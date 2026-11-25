@@ -40,16 +40,35 @@ type Decision struct {
 	LatencyMS  float64
 }
 
-// Hints are the PDP's fail-mode hints.
+// Hints are what AuthSec tells a gateway between decisions
+// (GET /pdp/v1/policy-hints): the workspace mode and deny targets (auto fail
+// mode), and (AS-174) this gateway's fail mode and decision cache lifetime as
+// AuthSec sets them, the agents it must refuse locally, and versions.
 type Hints struct {
 	Mode        string                `json:"mode"`
 	DenyTargets []agentgateway.Target `json:"deny_targets"`
-	TTLSeconds  int                   `json:"ttl_seconds"`
+	// TTLSeconds is how long the hints themselves are good for.
+	TTLSeconds int `json:"ttl_seconds"`
+	// FailMode is AuthSec's fail mode for this gateway; local config can
+	// only make it stricter. Empty (an older AuthSec) counts as auto.
+	FailMode string `json:"fail_mode,omitempty"`
+	// CacheTTLSeconds caps how long any decision is cached (0 = never).
+	CacheTTLSeconds *int `json:"cache_ttl_seconds,omitempty"`
+	// Stopped are the agents refused before the cache and the PDP.
+	Stopped []agentgateway.StoppedSubject `json:"stopped,omitempty"`
+	// PolicyVersion changes with any policy or setting: the cache is
+	// emptied when it does (a new deny is not served from an old allow).
+	PolicyVersion string `json:"policy_version,omitempty"`
+	// Version is the whole body's version (the ETag).
+	Version string `json:"version,omitempty"`
 }
 
 type cacheEntry struct {
 	d       Decision
 	expires time.Time
+	// req is the request decided (its subject and kind), so the entries of
+	// a stopped agent can be purged.
+	req agentgateway.Request
 }
 
 // decisionCache is a bounded TTL cache of PDP decisions.
@@ -78,7 +97,7 @@ func (c *decisionCache) get(k string) (Decision, bool) {
 	return e.d, true
 }
 
-func (c *decisionCache) put(k string, d Decision, ttl time.Duration) {
+func (c *decisionCache) put(k string, r agentgateway.Request, d Decision, ttl time.Duration) {
 	if ttl <= 0 {
 		return
 	}
@@ -98,7 +117,38 @@ func (c *decisionCache) put(k string, d Decision, ttl time.Duration) {
 			delete(c.m, kk)
 		}
 	}
-	c.m[k] = cacheEntry{d: d, expires: now.Add(ttl)}
+	c.m[k] = cacheEntry{d: d, expires: now.Add(ttl), req: r}
+}
+
+// purge removes the entries whose request matches and returns how many.
+func (c *decisionCache) purge(match func(agentgateway.Request) bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for k, e := range c.m {
+		if match(e.req) {
+			delete(c.m, k)
+			n++
+		}
+	}
+	return n
+}
+
+// capTTL shortens every entry to at most ttl from now (0 empties the cache).
+func (c *decisionCache) capTTL(ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	limit := c.now().Add(ttl)
+	for k, e := range c.m {
+		if ttl <= 0 {
+			delete(c.m, k)
+			continue
+		}
+		if e.expires.After(limit) {
+			e.expires = limit
+			c.m[k] = e
+		}
+	}
 }
 
 func (c *decisionCache) len() int {
@@ -116,16 +166,32 @@ func CacheKey(r agentgateway.Request) string {
 		r.Server, r.ServerURL, r.Tool, r.Provider, r.Model, r.Operation}, "\x1f")
 }
 
-// PDPClient asks AuthSec and applies the cache and the fail mode.
+// MaxCacheTTL is the longest a decision is ever cached, whatever AuthSec or
+// the PDP says.
+const MaxCacheTTL = 300 * time.Second
+
+// minHintsStale is the shortest time after which hints count as stale.
+const minHintsStale = 30 * time.Second
+
+// PDPClient asks AuthSec and applies the stop list, the cache and the fail
+// mode.
 type PDPClient struct {
 	base       string
 	credential string
 	version    string
 	hc         *http.Client
 	timeout    time.Duration
-	failMode   string
-	cache      *decisionCache
-	hints      atomic.Pointer[Hints]
+	// failMode and maxTTL are the LOCAL configuration: they can only make
+	// AuthSec's values stricter.
+	failMode string
+	maxTTL   time.Duration
+	cache    *decisionCache
+	hints    atomic.Pointer[Hints]
+	// hintsAt is when hints were last confirmed (a 200 or a 304), unix ns.
+	hintsAt    atomic.Int64
+	hintsEvery time.Duration
+	hintsMu    sync.Mutex
+	etag       string
 	now        func() time.Time
 	up         *Uploader
 }
@@ -135,8 +201,13 @@ func NewPDPClient(cfg *Config, version string, hc *http.Client, up *Uploader) *P
 	if hc == nil {
 		hc = &http.Client{}
 	}
+	every := time.Duration(cfg.AuthSec.HintsIntervalS) * time.Second
+	if every <= 0 {
+		every = 5 * time.Second
+	}
 	c := &PDPClient{base: cfg.AuthSec.URL, credential: cfg.AuthSec.credential, version: version, hc: hc,
-		timeout: cfg.timeout(), failMode: cfg.FailMode, now: time.Now, up: up}
+		timeout: cfg.timeout(), failMode: cfg.FailMode, maxTTL: time.Duration(cfg.Cache.MaxTTLSeconds) * time.Second,
+		hintsEvery: every, now: time.Now, up: up}
 	c.cache = newDecisionCache(cfg.Cache.MaxEntries, func() time.Time { return c.now() })
 	return c
 }
@@ -203,10 +274,63 @@ func ctxString(m map[string]any, path ...string) string {
 	return s
 }
 
+// FailMode is the fail mode in force: the stricter of AuthSec's (auto until
+// hints arrive, or when an older AuthSec sends none) and the local one.
+func (c *PDPClient) FailMode() string {
+	server := FailAuto
+	if h := c.hints.Load(); h != nil && h.FailMode != "" {
+		server = h.FailMode
+	}
+	return agentgateway.StricterFailMode(c.failMode, server)
+}
+
+// CacheTTLCap is the longest a decision may be cached now: MaxCacheTTL,
+// AuthSec's cache_ttl_seconds and the local max_ttl_seconds, whichever is
+// shortest.
+func (c *PDPClient) CacheTTLCap() time.Duration {
+	limit := MaxCacheTTL
+	if h := c.hints.Load(); h != nil && h.CacheTTLSeconds != nil {
+		if d := time.Duration(*h.CacheTTLSeconds) * time.Second; d < limit {
+			limit = d
+		}
+	}
+	if c.maxTTL > 0 && c.maxTTL < limit {
+		limit = c.maxTTL
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return limit
+}
+
+// hintsFresh reports whether hints were confirmed recently enough for the
+// cache to be used: a cached allow is served only while the stop list that
+// would refuse it is current.
+func (c *PDPClient) hintsFresh() bool {
+	at := c.hintsAt.Load()
+	if at == 0 {
+		return false
+	}
+	stale := 3 * c.hintsEvery
+	if stale < minHintsStale {
+		stale = minHintsStale
+	}
+	return c.now().Sub(time.Unix(0, at)) <= stale
+}
+
+// StoppedBy returns the stop refusing r, or nil.
+func (c *PDPClient) StoppedBy(r agentgateway.Request) *agentgateway.StoppedSubject {
+	h := c.hints.Load()
+	if h == nil {
+		return nil
+	}
+	return agentgateway.StoppedBy(h.Stopped, r)
+}
+
 // failDecision applies the fail mode (spec §7).
 func (c *PDPClient) failDecision(r agentgateway.Request) Decision {
 	allowed := false
-	switch c.failMode {
+	switch c.FailMode() {
 	case FailOpen:
 		allowed = true
 	case FailAuto:
@@ -228,22 +352,38 @@ func (c *PDPClient) failDecision(r agentgateway.Request) Decision {
 	return d
 }
 
-// Decide decides one request: the cache, else the PDP, else the fail mode.
-// Decisions the gateway makes itself (cache, fail mode) are queued for
-// upload; the PDP records its own.
+// StoppedDecision is the local refusal of a stopped agent.
+func StoppedDecision() Decision {
+	return Decision{Allowed: false, Reason: agentgateway.ReasonAgentStopped, Source: SourceGateway}
+}
+
+// Decide decides one request: a stopped agent is refused first (whatever
+// the fail mode, the workspace mode or the cache), then the cache (only
+// while hints are fresh), else the PDP, else the fail mode. Decisions the
+// gateway makes itself (stop, cache, fail mode) are queued for upload; the
+// PDP records its own.
 func (c *PDPClient) Decide(ctx context.Context, r agentgateway.Request) Decision {
 	start := time.Now()
-	key := CacheKey(r)
-	if d, ok := c.cache.get(key); ok {
-		ref := d.DecisionID
-		d.Source = SourceCache
+	if s := c.StoppedBy(r); s != nil {
+		d := StoppedDecision()
 		d.LatencyMS = msSince(start)
-		c.up.Decision(r, d, ref)
+		log.Printf("[agent-gateway] stopped agent refused agent=%s ref=%s", r.SubjectID, s.Ref)
+		c.up.Decision(r, d, "")
 		return d
+	}
+	key := CacheKey(r)
+	if c.hintsFresh() {
+		if d, ok := c.cache.get(key); ok {
+			ref := d.DecisionID
+			d.Source = SourceCache
+			d.LatencyMS = msSince(start)
+			c.up.Decision(r, d, ref)
+			return d
+		}
 	}
 	resp, err := c.evaluate(ctx, r)
 	if err != nil {
-		log.Printf("[agent-gateway] pdp outcome=unavailable fail_mode=%s err=%v", c.failMode, err)
+		log.Printf("[agent-gateway] pdp outcome=unavailable fail_mode=%s err=%v", c.FailMode(), err)
 		d := c.failDecision(r)
 		d.LatencyMS = msSince(start)
 		c.up.Decision(r, d, "")
@@ -254,21 +394,50 @@ func (c *PDPClient) Decide(ctx context.Context, r agentgateway.Request) Decision
 		PolicyID:   ctxString(resp.Context, "reason_admin", "policy_id"),
 		DecisionID: ctxString(resp.Context, "decision_id")}
 	if ttl, ok := resp.Context["ttl_seconds"].(float64); ok && ttl > 0 {
-		if ttl > 300 {
-			ttl = 300
+		dur := time.Duration(ttl) * time.Second
+		if limit := c.CacheTTLCap(); dur > limit {
+			dur = limit
 		}
-		c.cache.put(key, d, time.Duration(ttl)*time.Second)
+		c.cache.put(key, r, d, dur)
 	}
 	return d
 }
 
-// RefreshHints fetches GET /pdp/v1/policy-hints.
+// applyHints installs new hints, then purges what they invalidate: every
+// cached decision when the policy version changed, the entries of stopped
+// agents, and whatever outlives the cache lifetime cap. Hints are installed
+// first, so a request racing the purge already meets the new stop list.
+func (c *PDPClient) applyHints(h *Hints) {
+	old := c.hints.Swap(h)
+	c.hintsAt.Store(c.now().UnixNano())
+	if old == nil || old.PolicyVersion != h.PolicyVersion {
+		c.cache.purge(func(agentgateway.Request) bool { return true })
+	}
+	if len(h.Stopped) > 0 {
+		if n := c.cache.purge(func(r agentgateway.Request) bool { return agentgateway.StoppedBy(h.Stopped, r) != nil }); n > 0 {
+			log.Printf("[agent-gateway] purged %d cached decisions of stopped agents", n)
+		}
+	}
+	c.cache.capTTL(c.CacheTTLCap())
+	if old == nil || len(old.Stopped) != len(h.Stopped) || old.FailMode != h.FailMode {
+		log.Printf("[agent-gateway] hints stopped_agents=%d fail_mode=%s (authsec=%q local=%s) cache_ttl_cap=%s",
+			len(h.Stopped), c.FailMode(), h.FailMode, c.failMode, c.CacheTTLCap())
+	}
+}
+
+// RefreshHints fetches GET /pdp/v1/policy-hints, conditional on the last
+// version (an unchanged body is a 304).
 func (c *PDPClient) RefreshHints(ctx context.Context) error {
+	c.hintsMu.Lock()
+	defer c.hintsMu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := c.newRequest(ctx, http.MethodGet, "/pdp/v1/policy-hints", nil)
 	if err != nil {
 		return err
+	}
+	if c.etag != "" && c.hints.Load() != nil {
+		req.Header.Set("If-None-Match", c.etag)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -276,6 +445,10 @@ func (c *PDPClient) RefreshHints(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode == http.StatusNotModified && c.hints.Load() != nil {
+		c.hintsAt.Store(c.now().UnixNano())
+		return nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("policy hints: status %d", resp.StatusCode)
 	}
@@ -283,7 +456,8 @@ func (c *PDPClient) RefreshHints(ctx context.Context) error {
 	if err := json.Unmarshal(raw, &h); err != nil {
 		return err
 	}
-	c.hints.Store(&h)
+	c.etag = resp.Header.Get("ETag")
+	c.applyHints(&h)
 	return nil
 }
 

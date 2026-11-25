@@ -484,6 +484,10 @@ func (s *AgentContain) Contain(ctx context.Context, ws, actor uuid.UUID, req Age
 	if err != nil {
 		return nil, err
 	}
+	// The PDP refuses the agent from now on in this process (other
+	// processes within their policy cache lifetime); gateways get it in
+	// their next policy hints (AS-174).
+	InvalidateAgentGatewayWorkspace(ws, uuid.Nil)
 	return &AgentContainmentView{AgentContainment: row}, nil
 }
 
