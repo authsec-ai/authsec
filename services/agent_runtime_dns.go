@@ -181,6 +181,15 @@ func (s *AWSWorkloadScanner) scanDNSQueryLogs(
 	if s.dns.sleep != nil {
 		reader = reader.WithSleep(s.dns.sleep)
 	}
+	// W6: the workspace's egress hosts are read too (rows, never findings).
+	// TENANT-EXEMPT: a nil check on the handle, no statement runs on it.
+	if s.db != nil {
+		if hosts, herr := joinEgressHosts(ctx, s.db, workspaceID); herr != nil {
+			warn("reading the egress hosts: %v; only model provider hosts are read", herr)
+		} else {
+			reader = reader.WithEgressHosts(hosts)
+		}
+	}
 	configs, err := reader.Configs(ctx)
 	if err != nil {
 		out.Surfaces[key] = withDNSTemplateNote(surfaceResult(0, err), templateVersion)
@@ -247,6 +256,16 @@ func (s *AWSWorkloadScanner) scanDNSQueryLogs(
 		warn("recording DNS evidence: %v", werr)
 	}
 	out.DNSTrafficFindings += res.Written
+	// W6: VPC flow logs configured for this connector and region, filtered
+	// to the addresses the stored lookups resolved to.
+	if fr, ferr := NewAgentRuntimeJoinService(s.db).CollectFlows(ctx, workspaceID, snapshot.ConnectorID, region,
+		clients.Logs, s.dns.sleep); ferr != nil {
+		warn("recording flow summaries: %v", ferr)
+	} else {
+		for _, e := range fr.Errors {
+			warn("reading flow logs %s", e)
+		}
+	}
 	out.Surfaces[key] = withDNSTemplateNote(dnsCoverage(reads, skipped, werr), templateVersion)
 }
 
@@ -425,6 +444,16 @@ func resolveDNSSources(ctx context.Context, clients DNSClients, reads []dnsLogGr
 				byVPC[a.VPCID] = map[string]bool{}
 			}
 			byVPC[a.VPCID][a.SrcAddr] = true
+		}
+		// W6: egress-host lookups are attributed too.
+		for _, l := range r.Read.Lookups {
+			if l.SrcAddr == "" {
+				continue
+			}
+			if byVPC[l.VPCID] == nil {
+				byVPC[l.VPCID] = map[string]bool{}
+			}
+			byVPC[l.VPCID][l.SrcAddr] = true
 		}
 	}
 	out := map[dnsSourceKey]dnsSourceAttr{}
@@ -1093,6 +1122,11 @@ func (st dnsEvidenceStore) Record(ctx context.Context, w dnsWrite) (dnsWriteResu
 					d.doc.Partial = d.doc.Partial || r.Read.Partial()
 					d.doc.Attribution = subj.Attribution
 				}
+			}
+
+			// 2b. W6: the per-minute lookup rows (provider and egress hosts).
+			if _, err := insertDNSLookupRows(tx, w, inv); err != nil {
+				return err
 			}
 
 			// 3. Open or refresh each subject's finding.
