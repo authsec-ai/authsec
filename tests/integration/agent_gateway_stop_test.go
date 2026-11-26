@@ -187,7 +187,21 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 	if _, h, _ := agwHints(t, api, credA, nil); h.FailMode != "closed" || h.CacheTTLSeconds != 10 {
 		t.Fatalf("hints after tightening: %+v", h)
 	}
-	// Loosening with nobody else holding governance:approve: break-glass.
+	// W5 (rule drift fixed): with nobody holding governance:approve, a
+	// requester who does not hold it either never applies alone; the
+	// loosening waits for a second person. The requester withdraws it.
+	code, out = runtime(tokA, gwA, map[string]any{"fail_mode": "auto", "reason": "pdp outage drill", "version": version()})
+	if code != http.StatusAccepted || agwData(t, out)["applied"] != false || agwData(t, out)["break_glass"] == true {
+		t.Fatalf("loosening by a non-approver with no approver: %d %v", code, out)
+	}
+	firstID := agwData(t, out)["pending_change"].(map[string]any)["id"].(string)
+	if code, out := pcCall(t, api, "POST", "/pending-changes/"+firstID+"/reject", tokA, map[string]any{"reason": "withdrawn"}); code != 200 {
+		t.Fatalf("withdraw: %d %v", code, out)
+	}
+	// The author becomes the workspace's only approver: break-glass.
+	p3exec(t, db, `INSERT INTO role_permissions (role_id, permission_id)
+		SELECT ?, id FROM permissions WHERE workspace_id IS NULL AND resource = 'governance' AND action = 'approve'
+		ON CONFLICT DO NOTHING`, a.roles[0])
 	code, out = runtime(tokA, gwA, map[string]any{"fail_mode": "auto", "reason": "pdp outage drill", "version": version()})
 	d := agwData(t, out)
 	if code != 200 || d["applied"] != true || d["break_glass"] != true {
@@ -201,7 +215,8 @@ func TestAgentGatewayStopListAndRuntimeApproval(t *testing.T) {
 	// Two approvers now (author and approver hold governance:approve).
 	for _, role := range a.roles[:2] {
 		p3exec(t, db, `INSERT INTO role_permissions (role_id, permission_id)
-			SELECT ?, id FROM permissions WHERE workspace_id IS NULL AND resource = 'governance' AND action = 'approve'`, role)
+			SELECT ?, id FROM permissions WHERE workspace_id IS NULL AND resource = 'governance' AND action = 'approve'
+			ON CONFLICT DO NOTHING`, role)
 	}
 	code, out = runtime(tokA, gwA, map[string]any{"fail_mode": "open", "cache_ttl_seconds": 120, "reason": "maintenance", "version": version()})
 	if code != http.StatusAccepted || agwData(t, out)["applied"] != false {

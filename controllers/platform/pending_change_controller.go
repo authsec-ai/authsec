@@ -44,6 +44,7 @@ func NewPendingChangeController() *PendingChangeController {
 // MountPendingChangeRoutes mounts the routes on g (the /api/iga/v1 group).
 func MountPendingChangeRoutes(g *gin.RouterGroup, ctl *PendingChangeController) {
 	read := middlewares.Require("governance", "read")
+	g = g.Group("", TierGuard())
 	g.GET("/pending-changes", read, ctl.List)
 	g.GET("/pending-changes/:id", read, ctl.Get)
 	g.POST("/pending-changes/:id/approve", middlewares.Require("governance", "approve"), ctl.Approve)

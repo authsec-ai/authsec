@@ -41,7 +41,7 @@ const (
 const historyApprovalTTL = 7 * 24 * time.Hour
 
 // historyBreakGlassReview is when a break-glass change must be reviewed.
-const historyBreakGlassReview = 24 * time.Hour
+const historyBreakGlassReview = SecondPersonReviewWindow
 
 // historyExportTTL is how long an export's bytes are kept.
 const historyExportTTL = 7 * 24 * time.Hour
@@ -187,16 +187,6 @@ func (s *HistoryService) ListHolds(ctx context.Context, ws uuid.UUID) ([]History
 
 /* --------------------------------- requests --------------------------------- */
 
-// historyApprovers lists who holds governance:approve in ws now
-// (read from the database, never the token).
-var historyApprovers = func(tx *gorm.DB, ws uuid.UUID) ([]uuid.UUID, error) {
-	return WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
-}
-
-var historyHoldsApprove = func(tx *gorm.DB, ws, user uuid.UUID) (bool, error) {
-	return WorkspaceUserHoldsPermission(tx, ws, user, "governance", "approve")
-}
-
 // RequestChange records a tier-3 request; with BreakGlass, in a workspace
 // whose only approver is the requester, it applies it at once.
 func (s *HistoryService) RequestChange(ctx context.Context, ws, actor uuid.UUID, req HistoryChangeRequest) (*HistoryApproval, error) {
@@ -206,6 +196,9 @@ func (s *HistoryService) RequestChange(ctx context.Context, ws, actor uuid.UUID,
 	}
 	if req.Params == nil {
 		req.Params = map[string]any{}
+	}
+	if err := CheckTier3Requester(ctx); err != nil {
+		return nil, err
 	}
 	now := s.now().UTC()
 	var out *HistoryApproval
@@ -219,14 +212,13 @@ func (s *HistoryService) RequestChange(ctx context.Context, ws, actor uuid.UUID,
 		}
 		sum := sha256.Sum256(canon)
 		if req.BreakGlass {
-			approvers, err := historyApprovers(tx, ws)
+			ok, err := BreakGlassAllowed(ctx, tx, ws, actor)
 			if err != nil {
 				return err
 			}
-			if len(approvers) != 1 || approvers[0] != actor {
-				return govConflict("break_glass_not_allowed",
-					"Break-glass is only for a workspace whose one holder of governance:approve is you; ask another approver instead.",
-					map[string]any{"approvers": len(approvers)})
+			if !ok {
+				return govConflict(GovCodeBreakGlassNotAllowed,
+					"Break-glass is only for a workspace whose one holder of governance:approve is you; ask another approver instead.", nil)
 			}
 		}
 		id := uuid.New()
@@ -251,7 +243,7 @@ func (s *HistoryService) RequestChange(ctx context.Context, ws, actor uuid.UUID,
 			if err := tx.Exec(`UPDATE iga_history_approval SET state = 'applied', break_glass = true, decided_by = ?, decided_at = ?,
 			                     decision_reason = 'break-glass: the only approver in the workspace', review_due_at = ?, result = ?::jsonb
 			                   WHERE workspace_id = ? AND id = ?`,
-				actor, now, now.Add(historyBreakGlassReview), string(raw), ws, id).Error; err != nil {
+				actor, now, ReviewDue(now), string(raw), ws, id).Error; err != nil {
 				return err
 			}
 			log.Printf("[history] ALERT break-glass %s applied alone in workspace %s by %s (approval %s); review due within 24h",
@@ -344,7 +336,7 @@ func (s *HistoryService) Approve(ctx context.Context, ws, approver, id uuid.UUID
 		if err != nil {
 			return err
 		}
-		if err := s.decidable(tx, ws, a, approver, now); err != nil {
+		if err := s.decidable(ctx, tx, ws, a, approver, now); err != nil {
 			return err
 		}
 		result, err := s.applyChange(tx, ws, a, approver)
@@ -371,7 +363,7 @@ func (s *HistoryService) Reject(ctx context.Context, ws, approver, id uuid.UUID,
 		if err != nil {
 			return err
 		}
-		if err := s.decidable(tx, ws, a, approver, now); err != nil {
+		if err := s.decidable(ctx, tx, ws, a, approver, now); err != nil {
 			return err
 		}
 		if err := tx.Exec(`UPDATE iga_history_approval SET state = 'rejected', decided_by = ?, decided_at = ?, decision_reason = ?
@@ -424,15 +416,8 @@ func (s *HistoryService) Review(ctx context.Context, ws, reviewer, id uuid.UUID,
 		if a.ReviewedAt != nil {
 			return govConflict("already_reviewed", "The change was already reviewed.", nil)
 		}
-		if a.RequestedBy == reviewer {
-			return govErr(http.StatusForbidden, "self_review", "You made this change; another member must review it.", nil)
-		}
-		ok, err := historyHoldsApprove(tx, ws, reviewer)
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, a.RequestedBy, reviewer); err != nil {
 			return err
-		}
-		if !ok {
-			return GovForbidden("governance:approve is required.")
 		}
 		if err := tx.Exec(`UPDATE iga_history_approval SET reviewed_by = ?, reviewed_at = ?, review_note = ? WHERE workspace_id = ? AND id = ?`,
 			reviewer, now, strings.TrimSpace(note), ws, id).Error; err != nil {
@@ -444,24 +429,14 @@ func (s *HistoryService) Review(ctx context.Context, ws, reviewer, id uuid.UUID,
 	return out, err
 }
 
-func (s *HistoryService) decidable(tx *gorm.DB, ws uuid.UUID, a *HistoryApproval, approver uuid.UUID, now time.Time) error {
+func (s *HistoryService) decidable(ctx context.Context, tx *gorm.DB, ws uuid.UUID, a *HistoryApproval, approver uuid.UUID, now time.Time) error {
 	if a.State != "pending" {
 		return govConflict("invalid_state", "Only a pending request can be decided.", map[string]any{"state": a.State})
 	}
 	if now.After(a.ExpiresAt) {
 		return govConflict("request_expired", "The request expired; ask again.", nil)
 	}
-	if a.RequestedBy == approver {
-		return govErr(http.StatusForbidden, "self_approval", "You asked for this change; another approver must decide.", nil)
-	}
-	ok, err := historyHoldsApprove(tx, ws, approver)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return GovForbidden("governance:approve is required.")
-	}
-	return nil
+	return CheckApprover(ctx, tx, ws, a.RequestedBy, approver)
 }
 
 // ListApprovals lists requests; state filters, reviewDue keeps break-glass

@@ -3,6 +3,7 @@ package platform
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -45,7 +46,7 @@ import (
 // Production calls it from routes.SetupIGARoutes.
 func MountAgentRuntimeContainRoutes(r gin.IRouter, ctl *IGAGovPolicyController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1/agent-runtime")
-	g.Use(GraphEnvelope(auth))
+	g.Use(GraphEnvelope(auth), TierGuard())
 	g.Use(ctl.Gate())
 	RegisterAgentRuntimeContainRoutes(g, ctl, GraphRequire(require))
 }
@@ -127,6 +128,23 @@ func (ctl *IGAGovPolicyController) CreateContainment(c *gin.Context) {
 		var req services.AgentContainRequest
 		if err := bindBody(c, &req, "{identity_id, workload_ids?, level, reason, target?, case_id?}"); err != nil {
 			return nil, nil, err
+		}
+		// W5: an automation identity names the case of its stop; a case
+		// named must be an open case of this workspace (W2 parses and stores
+		// it as the first hold).
+		var stopCase *uuid.UUID
+		if id, perr := uuid.Parse(strings.TrimSpace(req.CaseID)); perr == nil {
+			stopCase = &id
+		}
+		// TENANT-EXEMPT: not a statement here: CheckStopCase reads the case in a workspace transaction under RLS (tenancy.InWorkspaceRead).
+		if err := services.CheckStopCase(c.Request.Context(), ctl.db(), ws, stopCase); err != nil {
+			return nil, nil, err
+		}
+		if wideLevels[req.Level] {
+			// A wider stop (identity, chain, entra, kubernetes): tier 2.
+			if err := TierError(c, services.GovActionContainIdentity); err != nil {
+				return nil, nil, err
+			}
 		}
 		if err := ctl.requireWide(c, ws, actor, req.Level); err != nil {
 			return nil, nil, err

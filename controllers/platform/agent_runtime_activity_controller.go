@@ -63,7 +63,7 @@ func NewAgentRuntimeActivityControllerWith(db *gorm.DB) *AgentRuntimeActivityCon
 // MountAgentRuntimeActivityRoutes mounts the routes on g (the authenticated
 // /api/iga/v1 group) with their permissions.
 func MountAgentRuntimeActivityRoutes(g *gin.RouterGroup, ctl *AgentRuntimeActivityController) {
-	RegisterAgentRuntimeActivityRoutes(g.Group("/agent-runtime"), ctl,
+	RegisterAgentRuntimeActivityRoutes(g.Group("/agent-runtime", TierGuard()), ctl,
 		middlewares.Require("discovery", "read"), middlewares.Require("discovery", "admin"))
 }
 

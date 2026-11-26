@@ -33,7 +33,7 @@ import (
 
 // MountAgentGatewayW6Routes mounts the routes on the /api/iga/v1 group.
 func MountAgentGatewayW6Routes(g *gin.RouterGroup, ctl *AgentGatewayController) {
-	RegisterAgentGatewayW6Routes(g.Group("/agent-runtime"), ctl, middlewares.Require("governance", "read"),
+	RegisterAgentGatewayW6Routes(g.Group("/agent-runtime", TierGuard()), ctl, middlewares.Require("governance", "read"),
 		middlewares.Require("governance", "enforce"), middlewares.Require("governance", "approve"))
 }
 

@@ -67,7 +67,7 @@ func MountAuditGovernanceRoutes(r gin.IRouter, ctl *AuditGovernanceController, a
 	emergency := middlewares.Require("governance", "emergency")
 
 	g := r.Group("/api/iga/v1/audit")
-	g.Use(auth, ctl.requireSchema)
+	g.Use(auth, TierGuard(), ctl.requireSchema)
 	g.GET("/events", read, ctl.ListEvents)
 	g.GET("/verify", read, ctl.Verify)
 	g.GET("/anchors", read, ctl.ListAnchors)
@@ -86,7 +86,7 @@ func MountAuditGovernanceRoutes(r gin.IRouter, ctl *AuditGovernanceController, a
 	g.GET("/suspensions", read, ctl.ListSuspensions)
 
 	op := r.Group("/authsec/admin/operators")
-	op.Use(auth, ctl.requireSchema)
+	op.Use(auth, TierGuard(), ctl.requireSchema)
 	op.POST("/:id/suspend", emergency, ctl.Suspend)
 	op.POST("/:id/unsuspend", emergency, ctl.Unsuspend)
 }

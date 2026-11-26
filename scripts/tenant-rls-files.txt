@@ -184,3 +184,5 @@ services/agent_runtime_joins.go
 services/model_usage_reconcile.go
 controllers/platform/agent_gateway_w6_controller.go
 controllers/platform/agent_gateway_w6_pdp_controller.go
+services/governance_approvals.go
+services/second_person.go

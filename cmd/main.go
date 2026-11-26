@@ -377,6 +377,10 @@ func main() {
 	// turns it off).
 	services.InstallRemediation(config.DB)
 	go services.RunRemediationWorker(context.Background(), config.DB)
+	// Second-person rule (W5): every 15 minutes, one governance.review_overdue
+	// event and operator alert per break-glass change whose review is overdue
+	// (AUTHSEC_DISABLE_BREAKGLASS_REVIEW_WORKER=true turns it off).
+	go services.RunBreakGlassReviewWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL

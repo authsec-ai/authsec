@@ -705,11 +705,20 @@ func (s *AgentIdentityService) SetRiskClass(ctx context.Context, ws, id, actor u
 		}
 		if len(cur) > 0 && rank < agentRiskRank[cur[0]] {
 			payload := map[string]any{"risk_class": req.RiskClass, "obligations": obligations, "previous": cur[0]}
-			pc, err := createPendingChange(tx, ws, PendingRiskClassLower, id, actor, reason, payload)
+			pc, err := createPendingChange(ctx, tx, ws, PendingRiskClassLower, id, actor, reason, payload)
 			if err != nil {
 				return err
 			}
 			out.PendingChange = pc
+			if pc.BreakGlass {
+				var v AgentRiskClassVersion
+				if err := tx.Raw(`SELECT id, version, risk_class, obligations, reason, assessor_user_id, approved_by_user_id,
+				        pending_change_id, assessed_at FROM agent_risk_class WHERE workspace_id = ? AND agent_id = ?
+				        ORDER BY version DESC LIMIT 1`, ws, id).Scan(&v).Error; err != nil {
+					return err
+				}
+				out.Applied = &v
+			}
 			return nil
 		}
 		v, err := insertRiskClass(tx, ws, id, req.RiskClass, obl, reason, actor, nil, nil)
@@ -770,9 +779,23 @@ type AgentPendingChange struct {
 	DecidedBy      *uuid.UUID      `json:"decided_by" gorm:"column:decided_by"`
 	DecidedAt      *time.Time      `json:"decided_at" gorm:"column:decided_at"`
 	DecisionReason string          `json:"decision_reason" gorm:"column:decision_reason"`
+	// Break-glass (decision 4, migration 211): applied alone by the
+	// workspace's only approver, due a second person's review.
+	BreakGlass  bool       `json:"break_glass" gorm:"column:break_glass"`
+	ReviewDueAt *time.Time `json:"review_due_at" gorm:"column:review_due_at"`
+	ReviewedBy  *uuid.UUID `json:"reviewed_by" gorm:"column:reviewed_by"`
+	ReviewedAt  *time.Time `json:"reviewed_at" gorm:"column:reviewed_at"`
 }
 
-func createPendingChange(tx *gorm.DB, ws uuid.UUID, kind string, subject, actor uuid.UUID, reason string, payload map[string]any) (*AgentPendingChange, error) {
+// createPendingChange records a tier-3 lowering for a second person. When
+// the requester is the workspace's only holder of governance:approve
+// (BreakGlassAllowed) it is applied at once instead, as break-glass: the row
+// is written applied, decided by the requester, with a review due within
+// 24 hours (second_person.go).
+func createPendingChange(ctx context.Context, tx *gorm.DB, ws uuid.UUID, kind string, subject, actor uuid.UUID, reason string, payload map[string]any) (*AgentPendingChange, error) {
+	if err := CheckTier3Requester(ctx); err != nil {
+		return nil, err
+	}
 	var open []AgentPendingChange
 	if err := tx.Raw(`SELECT * FROM agent_pending_change WHERE workspace_id = ? AND kind = ? AND subject_id = ? AND state = 'pending'`,
 		ws, kind, subject).Scan(&open).Error; err != nil {
@@ -783,7 +806,25 @@ func createPendingChange(tx *gorm.DB, ws uuid.UUID, kind string, subject, actor 
 			map[string]any{"pending_change_id": open[0].ID})
 	}
 	raw, _ := json.Marshal(payload)
+	breakGlass, err := BreakGlassAllowed(ctx, tx, ws, actor)
+	if err != nil {
+		return nil, err
+	}
 	var out AgentPendingChange
+	if breakGlass {
+		now := time.Now().UTC()
+		if err := tx.Raw(`INSERT INTO agent_pending_change (workspace_id, kind, subject_id, payload, reason, requested_by, requested_at,
+		            state, decided_by, decided_at, decision_reason, break_glass, review_due_at)
+		        VALUES (?, ?, ?, ?::jsonb, ?, ?, ?, 'applied', ?, ?, 'break-glass: the only approver in the workspace', true, ?) RETURNING *`,
+			ws, kind, subject, string(raw), reason, actor, now, actor, now, ReviewDue(now)).Scan(&out).Error; err != nil {
+			return nil, err
+		}
+		if err := applyPendingChange(tx, ws, out, nil); err != nil {
+			return nil, err
+		}
+		return &out, appendGovEvent(tx, ws, GovEventAgentChangeBreakGlass, models.GovActorUser, actor.String(), govEventRefs{},
+			map[string]any{"pending_change_id": out.ID, "kind": kind, "subject_id": subject, "review_due_at": out.ReviewDueAt})
+	}
 	if err := tx.Raw(`INSERT INTO agent_pending_change (workspace_id, kind, subject_id, payload, reason, requested_by)
 	        VALUES (?, ?, ?, ?::jsonb, ?, ?) RETURNING *`, ws, kind, subject, string(raw), reason, actor).Scan(&out).Error; err != nil {
 		return nil, err
@@ -828,8 +869,7 @@ const (
 // who holds governance:approve now (read from the database); withdraw is the
 // requester's alone.
 //
-// TODO(W5): break-glass for a workspace with exactly one admin (decision 4)
-// belongs to W5's pending_change; until then such a workspace cannot lower.
+// Break-glass (decision 4) happens at request time (createPendingChange).
 func (s *AgentIdentityService) DecidePendingChange(ctx context.Context, ws, id, actor uuid.UUID, decision, reason string) (*AgentPendingChange, error) {
 	reason = strings.TrimSpace(reason)
 	if utf8.RuneCountInString(reason) > maxAgentReason {
@@ -861,20 +901,13 @@ func (s *AgentIdentityService) DecidePendingChange(ctx context.Context, ws, id, 
 			}
 			newState, event = "withdrawn", GovEventAgentChangeWithdrawn
 		default:
-			if actor == pc.RequestedBy {
-				return govErr(403, "self_approval", "A tier-3 change needs a second person: the requester cannot decide it.", nil)
-			}
-			ok, err := holdsPermission(tx, ws, actor, "governance", "approve")
-			if err != nil {
+			if err := CheckApprover(ctx, tx, ws, pc.RequestedBy, actor); err != nil {
 				return err
-			}
-			if !ok {
-				return GovForbidden("Deciding a tier-3 change requires governance:approve.")
 			}
 			newState, event = "rejected", GovEventAgentChangeRejected
 			if decision == PendingDecisionApprove {
 				newState, event = "applied", GovEventAgentChangeApplied
-				if err := applyPendingChange(tx, ws, pc, actor); err != nil {
+				if err := applyPendingChange(tx, ws, pc, &actor); err != nil {
 					return err
 				}
 			}
@@ -894,7 +927,9 @@ func (s *AgentIdentityService) DecidePendingChange(ctx context.Context, ws, id, 
 	return out, err
 }
 
-func applyPendingChange(tx *gorm.DB, ws uuid.UUID, pc AgentPendingChange, approver uuid.UUID) error {
+// applyPendingChange applies pc; approver is nil for break-glass (the
+// requester applied it alone).
+func applyPendingChange(tx *gorm.DB, ws uuid.UUID, pc AgentPendingChange, approver *uuid.UUID) error {
 	switch pc.Kind {
 	case PendingRiskClassLower:
 		var p struct {
@@ -911,14 +946,14 @@ func applyPendingChange(tx *gorm.DB, ws uuid.UUID, pc AgentPendingChange, approv
 		if p.Obligations == nil {
 			obl = []byte("[]")
 		}
-		_, err := insertRiskClass(tx, ws, pc.SubjectID, p.RiskClass, obl, pc.Reason, pc.RequestedBy, &approver, &pc.ID)
+		_, err := insertRiskClass(tx, ws, pc.SubjectID, p.RiskClass, obl, pc.Reason, pc.RequestedBy, approver, &pc.ID)
 		return err
 	case PendingClassificationLower:
 		var c ResourceClassification
 		if err := json.Unmarshal(pc.Payload, &c); err != nil {
 			return err
 		}
-		return writeResourceClassification(tx, ws, pc.SubjectID, c, pc.RequestedBy, approver, pc.Reason)
+		return writeResourceClassification(tx, ws, pc.SubjectID, c, pc.RequestedBy, uuidOrNil(approver), pc.Reason)
 	}
 	return fmt.Errorf("unknown pending change kind %q", pc.Kind)
 }

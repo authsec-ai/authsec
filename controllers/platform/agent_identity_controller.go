@@ -76,7 +76,7 @@ func NewAgentIdentityControllerWith(db *gorm.DB) *AgentIdentityController {
 // MountAgentIdentityRoutes mounts the routes on /api/iga/v1 behind auth.
 func MountAgentIdentityRoutes(r gin.IRouter, ctl *AgentIdentityController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1")
-	g.Use(GraphEnvelope(auth))
+	g.Use(GraphEnvelope(auth), TierGuard())
 	RegisterAgentIdentityRoutes(g, ctl, GraphRequire(require))
 }
 

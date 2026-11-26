@@ -73,7 +73,7 @@ const (
 	GovEventCoverageDeclareRejected   = "coverage.gap_declaration_rejected"
 	GovEventCoverageBreakGlassApplied = "coverage.gap_declared_break_glass"
 	GovEventCoverageBreakGlassReview  = "coverage.break_glass_reviewed"
-	coverageBreakGlassReviewWithin    = 24 * time.Hour
+	coverageBreakGlassReviewWithin    = SecondPersonReviewWindow
 	coverageMaxGapBackfill            = 7 * 24 * time.Hour
 	coverageDataEventLookback         = 7 * 24 * time.Hour
 )
@@ -1037,25 +1037,26 @@ func (s *AgentCoverageService) Declare(ctx context.Context, ws, stateID, actor u
 		if open > 0 {
 			return govConflict(GovCodeCoverageDeclarePending, "A declaration of this gap is already waiting for a second person.", nil)
 		}
-		holders, err := WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
+		if err := CheckTier3Requester(ctx); err != nil {
+			return err
+		}
+		breakGlass, err := BreakGlassAllowed(ctx, tx, ws, actor)
 		if err != nil {
 			return err
 		}
-		others, self := 0, false
-		for _, h := range holders {
-			if h == actor {
-				self = true
-			} else {
-				others++
+		if !breakGlass {
+			// W1's own refusal, kept: a request nobody could ever decide.
+			holders, err := WorkspaceUsersHoldingPermission(tx, ws, "governance", "approve")
+			if err != nil {
+				return err
 			}
-		}
-		breakGlass := others == 0 && self
-		if others == 0 && !self {
-			return govConflict(GovCodeCoverageNoApprover, "Nobody in the workspace holds governance:approve, so the declaration could not be decided.", nil)
+			if len(holders) == 0 {
+				return govConflict(GovCodeCoverageNoApprover, "Nobody in the workspace holds governance:approve, so the declaration could not be decided.", nil)
+			}
 		}
 		var d AgentCapabilityDeclaration
 		if breakGlass {
-			due := now.Add(coverageBreakGlassReviewWithin)
+			due := ReviewDue(now)
 			if err := tx.Raw(`INSERT INTO agent_capability_declaration (workspace_id, capability_state_id, reason, requested_by, requested_at,
 			                         state, decided_by, decided_at, decision_reason, break_glass, review_due_at)
 			                  VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, 'break-glass: the workspace has one approver', true, ?)
@@ -1109,15 +1110,8 @@ func (s *AgentCoverageService) Decide(ctx context.Context, ws, declID, approver 
 		if err != nil {
 			return err
 		}
-		if d.RequestedBy == approver {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "You asked for this declaration; a second person must decide.", nil)
-		}
-		holds, err := WorkspaceUserHoldsPermission(tx, ws, approver, "governance", "approve")
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, d.RequestedBy, approver); err != nil {
 			return err
-		}
-		if !holds {
-			return govErr(http.StatusForbidden, "forbidden", "Deciding a declaration needs governance:approve.", nil)
 		}
 		if d.State != "pending" {
 			return govConflict(GovCodeCoverageNotPending, "Only a pending declaration can be decided.", map[string]any{"state": d.State})
@@ -1167,19 +1161,12 @@ func (s *AgentCoverageService) Review(ctx context.Context, ws, declID, reviewer 
 		if !d.BreakGlass {
 			return govConflict(GovCodeCoverageNotBreakGlass, "Only a break-glass declaration is reviewed.", nil)
 		}
-		if d.RequestedBy == reviewer {
-			return govErr(http.StatusForbidden, GovCodeSelfApproval, "You declared this gap; a second person must review it.", nil)
-		}
-		holds, err := WorkspaceUserHoldsPermission(tx, ws, reviewer, "governance", "approve")
-		if err != nil {
+		if err := CheckApprover(ctx, tx, ws, d.RequestedBy, reviewer); err != nil {
 			return err
 		}
-		if !holds {
-			return govErr(http.StatusForbidden, "forbidden", "Reviewing a declaration needs governance:approve.", nil)
-		}
 		if d.ReviewedAt != nil {
-			out = d
-			return nil
+			// As every other kind (second_person.go): a review is recorded once.
+			return govConflict("already_reviewed", "The declaration was already reviewed.", nil)
 		}
 		if err := tx.Exec(`UPDATE agent_capability_declaration SET reviewed_by = ?, reviewed_at = ? WHERE workspace_id = ? AND id = ?`,
 			reviewer, now, ws, declID).Error; err != nil {

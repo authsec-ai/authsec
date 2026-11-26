@@ -65,7 +65,7 @@ type AgentAskRouteGuards struct {
 // MountAgentAskRoutes mounts the routes on g (the authenticated /api/iga/v1
 // group).
 func MountAgentAskRoutes(g *gin.RouterGroup, ctl *AgentAsksController) {
-	RegisterAgentAskRoutes(g, ctl, AgentAskRouteGuards{
+	RegisterAgentAskRoutes(g.Group("", TierGuard()), ctl, AgentAskRouteGuards{
 		Read:     middlewares.RequireAny(authz.Need{Resource: "governance", Action: "read"}, authz.Need{Resource: "discovery", Action: "read"}),
 		GovRead:  middlewares.Require("governance", "read"),
 		Author:   middlewares.Require("governance", "author"),

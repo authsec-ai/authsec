@@ -543,7 +543,7 @@ func (s *AuditGovService) RequestUnsuspend(ctx context.Context, ws uuid.UUID, a 
 			}
 			return govConflict(GovCodeNotSuspended, "The operator is not suspended.", nil)
 		}
-		ch, err := s.requestChange(tx, ws, a, AuditChangeUnsuspend, user.String(), map[string]any{"operator_id": user}, reason, breakGlass, user)
+		ch, err := s.requestChange(ctx, tx, ws, a, AuditChangeUnsuspend, user.String(), map[string]any{"operator_id": user}, reason, breakGlass, user)
 		if err != nil {
 			return err
 		}

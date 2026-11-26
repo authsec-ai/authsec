@@ -150,6 +150,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// metrics, CISO and population reports, bulk exports, and the
 		// second-person requests of tier-3 changes (iga_history_controller.go).
 		platformCtrl.MountIGAHistoryRoutes(iga, platformCtrl.NewIGAHistoryControllerFor(igaGraphRead))
+		// One approvals inbox over every second-person mechanism, and the
+		// review of break-glass changes (SPEC-secops-backend-upgrade.md W5):
+		// /api/iga/v1/approvals (governance_tier_guard.go).
+		platformCtrl.MountApprovalsRoutes(iga, platformCtrl.NewApprovalsControllerFor(igaGraphRead))
 	}
 
 	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18):

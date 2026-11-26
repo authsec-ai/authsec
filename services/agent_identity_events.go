@@ -11,23 +11,24 @@ const (
 	GovCatAgentLifecycle = "agent_lifecycle"
 	GovObjAgent          = "agent"
 
-	GovEventAgentAskNeeded       = "agent.ask_needed"
-	GovEventAgentRetired         = "agent.retired"
-	GovEventAgentMerged          = "agent.merged"
-	GovEventAgentTransferred     = "agent.transferred"
-	GovEventAgentNotAnAgent      = "agent.not_an_agent"
-	GovEventAgentDeletedAtSource = "agent.deleted_at_source"
-	GovEventAgentReappeared      = "agent.reappeared"
-	GovEventAgentPurposeSet      = "agent.purpose_set"
-	GovEventAgentRiskClassSet    = "agent.risk_class_set"
-	GovEventAgentChangeRequested = "agent.change_requested"
-	GovEventAgentChangeApplied   = "agent.change_applied"
-	GovEventAgentChangeRejected  = "agent.change_rejected"
-	GovEventAgentChangeWithdrawn = "agent.change_withdrawn"
-	GovEventAgentInstanceNew     = "agent.instance_new"
-	GovEventAgentUnknownDeployer = "agent.instance_unknown_deployer"
-	GovEventAgentDeployerAdded   = "agent.deployer_recorded"
-	GovEventAgentStale           = "agent.stale"
+	GovEventAgentAskNeeded        = "agent.ask_needed"
+	GovEventAgentRetired          = "agent.retired"
+	GovEventAgentMerged           = "agent.merged"
+	GovEventAgentTransferred      = "agent.transferred"
+	GovEventAgentNotAnAgent       = "agent.not_an_agent"
+	GovEventAgentDeletedAtSource  = "agent.deleted_at_source"
+	GovEventAgentReappeared       = "agent.reappeared"
+	GovEventAgentPurposeSet       = "agent.purpose_set"
+	GovEventAgentRiskClassSet     = "agent.risk_class_set"
+	GovEventAgentChangeRequested  = "agent.change_requested"
+	GovEventAgentChangeApplied    = "agent.change_applied"
+	GovEventAgentChangeRejected   = "agent.change_rejected"
+	GovEventAgentChangeWithdrawn  = "agent.change_withdrawn"
+	GovEventAgentChangeBreakGlass = "agent.change_break_glass"
+	GovEventAgentInstanceNew      = "agent.instance_new"
+	GovEventAgentUnknownDeployer  = "agent.instance_unknown_deployer"
+	GovEventAgentDeployerAdded    = "agent.deployer_recorded"
+	GovEventAgentStale            = "agent.stale"
 
 	GovEventResourceClassified = "resource.classification_set"
 	GovEventDirectoryLeft      = "directory.person_left"
@@ -66,6 +67,7 @@ var agentLifecycleVocabulary = []GovEventKind{
 	{GovEventAgentChangeApplied, GovCatAgentLifecycle, "", "A second person with governance:approve applied a pending tier-3 change."},
 	{GovEventAgentChangeRejected, GovCatAgentLifecycle, "", "A second person rejected a pending tier-3 change."},
 	{GovEventAgentChangeWithdrawn, GovCatAgentLifecycle, "", "The requester withdrew a pending tier-3 change."},
+	{GovEventAgentChangeBreakGlass, GovCatAgentLifecycle, "", "The workspace's only approver applied a tier-3 lowering alone (break-glass); a review is due within 24 hours."},
 	{GovEventAgentInstanceNew, GovCatAgentLifecycle, GovObjAgent, "A new instance (artifact digest or version) of an agent was observed."},
 	{GovEventAgentUnknownDeployer, GovCatAgentLifecycle, GovObjAgent, "A new instance came from a deployer outside the agent's recorded deployer set."},
 	{GovEventAgentDeployerAdded, GovCatAgentLifecycle, GovObjAgent, "A workspace member recorded a deployer for an agent."},

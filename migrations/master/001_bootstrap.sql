@@ -16771,3 +16771,75 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.model_usage_reconciliation');
     END IF;
 END $$;
+
+-- ============================================================================
+-- 210-212 (W5): governance:remediate, second-person reviews and the overdue
+-- break-glass reviews. The same statements as those migrations.
+-- ============================================================================
+
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+  (gen_random_uuid(), NULL, 'governance', 'remediate', 'Apply remediation writes to the customer cloud (tier 4)', 'governance:remediate', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+INSERT INTO public.role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM public.roles r CROSS JOIN public.permissions p
+WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
+  AND p.resource = 'governance' AND p.action = 'remediate'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+ALTER TABLE public.pending_change ADD COLUMN IF NOT EXISTS reviewed_by uuid REFERENCES public.users(id);
+ALTER TABLE public.pending_change ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.pending_change DROP CONSTRAINT IF EXISTS pending_change_review_chk;
+ALTER TABLE public.pending_change ADD CONSTRAINT pending_change_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+ALTER TABLE public.agent_detection_rule_version ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_detection_rule_version ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_detection_rule_version DROP CONSTRAINT IF EXISTS agent_detection_rule_version_review_chk;
+ALTER TABLE public.agent_detection_rule_version ADD CONSTRAINT agent_detection_rule_version_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL)
+           AND (reviewed_by IS NULL OR proposed_by IS NULL OR reviewed_by <> proposed_by));
+
+ALTER TABLE public.agent_alert_suppression ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_alert_suppression ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_alert_suppression DROP CONSTRAINT IF EXISTS agent_alert_suppression_review_chk;
+ALTER TABLE public.agent_alert_suppression ADD CONSTRAINT agent_alert_suppression_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS break_glass boolean NOT NULL DEFAULT false;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS review_due_at timestamptz;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_second_person_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_second_person_chk
+    CHECK (state NOT IN ('applied', 'rejected') OR decided_by <> requested_by OR (break_glass AND state = 'applied'));
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_break_glass_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_break_glass_chk
+    CHECK (NOT break_glass OR (state = 'applied' AND review_due_at IS NOT NULL));
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_review_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+CREATE TABLE IF NOT EXISTS public.governance_review_overdue (
+    workspace_id  uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind          text        NOT NULL CHECK (kind ~ '^[a-z_]{1,64}$'),
+    item_id       uuid        NOT NULL,
+    requested_by  uuid,
+    review_due_at timestamptz NOT NULL,
+    raised_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT governance_review_overdue_pkey PRIMARY KEY (workspace_id, kind, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_governance_review_overdue_ws_raised
+    ON public.governance_review_overdue (workspace_id, raised_at DESC);
+
+ALTER TABLE public.operator_alert DROP CONSTRAINT IF EXISTS operator_alert_metric_chk;
+ALTER TABLE public.operator_alert ADD CONSTRAINT operator_alert_metric_chk
+    CHECK (metric IN ('writes', 'elevated', 'exports', 'review_overdue'));
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.governance_review_overdue');
+    END IF;
+END $$;

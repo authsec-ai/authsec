@@ -84,7 +84,8 @@ type AgentContainRequest struct {
 	// (key), the agent's client id or SPIFFE id (source_identity), the
 	// gateway subject id (gateway), the platform principal (platform).
 	Target string `json:"target"`
-	// CaseID, when set, makes the case the containment's first hold.
+	// CaseID, when set, makes the case the containment's first hold; an
+	// automation identity must name an open case (W5, CheckStopCase).
 	CaseID string `json:"case_id"`
 }
 

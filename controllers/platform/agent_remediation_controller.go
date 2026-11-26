@@ -52,7 +52,7 @@ func NewRemediationControllerWith(db *gorm.DB) *RemediationController {
 // MountRemediationRoutes mounts the routes on /api/iga/v1 behind auth.
 func MountRemediationRoutes(r gin.IRouter, ctl *RemediationController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1")
-	g.Use(GraphEnvelope(auth))
+	g.Use(GraphEnvelope(auth), TierGuard())
 	RegisterRemediationRoutes(g, ctl, GraphRequire(require))
 }
 

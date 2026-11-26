@@ -65,7 +65,7 @@ func NewAgentRuntimeControllerWith(db *gorm.DB, classifier *services.Classificat
 // groups).
 func MountAgentRuntimeRoutes(r gin.IRouter, ctl *AgentRuntimeController, auth gin.HandlerFunc, require func(resource, action string) gin.HandlerFunc) {
 	g := r.Group("/api/iga/v1")
-	g.Use(GraphEnvelope(auth))
+	g.Use(GraphEnvelope(auth), TierGuard())
 	RegisterAgentRuntimeRoutes(g, ctl, GraphRequire(require))
 }
 

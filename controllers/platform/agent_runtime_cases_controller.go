@@ -58,7 +58,7 @@ func NewAgentRuntimeCasesController() *AgentRuntimeCasesController {
 func MountAgentRuntimeCaseRoutes(g *gin.RouterGroup, ctl *AgentRuntimeCasesController) {
 	read := middlewares.RequireAny(authz.Need{Resource: "governance", Action: "read"}, authz.Need{Resource: "discovery", Action: "read"})
 	write := middlewares.Require("governance", "enforce")
-	RegisterAgentRuntimeCaseRoutes(g.Group("/agent-runtime"), ctl, read, write)
+	RegisterAgentRuntimeCaseRoutes(g.Group("/agent-runtime", TierGuard()), ctl, read, write)
 }
 
 // RegisterAgentRuntimeCaseRoutes is the route table.
