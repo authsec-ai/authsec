@@ -115,7 +115,12 @@ type AgentGatewayView struct {
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	LastSeenAt       *time.Time `json:"last_seen_at,omitempty"`
 	SoftwareVersion  string     `json:"software_version,omitempty"`
-	Version          int        `json:"version"`
+	// FailMode and CacheTTLSeconds are what AuthSec tells the gateway
+	// (policy hints): its fail mode and the longest it may cache a
+	// decision. Loosening either needs a second person (AS-174).
+	FailMode        string `json:"fail_mode"`
+	CacheTTLSeconds int    `json:"cache_ttl_seconds"`
+	Version         int    `json:"version"`
 }
 
 type agentGatewayRow struct {
@@ -129,6 +134,8 @@ type agentGatewayRow struct {
 	RevokedAt        *time.Time
 	LastSeenAt       *time.Time
 	SoftwareVersion  string
+	FailMode         string
+	CacheTTLSeconds  int
 	Version          int
 }
 
@@ -136,7 +143,7 @@ func (r agentGatewayRow) view() AgentGatewayView {
 	v := AgentGatewayView{ID: r.ID, Name: r.Name, State: AgentGatewayActive, CredentialPrefix: r.CredentialPrefix,
 		CreatedBy: r.CreatedBy, CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC(),
 		RotatedAt: utcPtr(r.RotatedAt), RevokedAt: utcPtr(r.RevokedAt), LastSeenAt: utcPtr(r.LastSeenAt),
-		SoftwareVersion: r.SoftwareVersion, Version: r.Version}
+		SoftwareVersion: r.SoftwareVersion, FailMode: r.FailMode, CacheTTLSeconds: r.CacheTTLSeconds, Version: r.Version}
 	if r.RevokedAt != nil {
 		v.State = AgentGatewayRevoked
 	}
@@ -144,7 +151,7 @@ func (r agentGatewayRow) view() AgentGatewayView {
 }
 
 const agentGatewayCols = `id, name, credential_prefix, created_by, created_at, updated_at, rotated_at,
-	revoked_at, last_seen_at, software_version, version`
+	revoked_at, last_seen_at, software_version, fail_mode, cache_ttl_seconds, version`
 
 // AgentGatewaySettings are a workspace's gateway settings.
 type AgentGatewaySettings struct {
@@ -175,6 +182,9 @@ type AgentGatewayPrincipal struct {
 	WorkspaceID uuid.UUID
 	GatewayID   uuid.UUID
 	Name        string
+	// CacheTTLSeconds is the gateway's cache cap (agent_gateway), as of the
+	// credential lookup (at most agentGatewayCredCacheTTL old).
+	CacheTTLSeconds int
 }
 
 /* --------------------------------- service -------------------------------- */
@@ -187,7 +197,12 @@ type agentGatewayCredEntry struct {
 type agentGatewayPolicySet struct {
 	policies []agentgateway.Policy
 	settings AgentGatewaySettings
-	loaded   time.Time
+	// stops are the agents stopped by live containments (AS-174).
+	stops []agentgateway.StoppedSubject
+	// version is a digest of the policies and settings (hints
+	// policy_version: a gateway empties its cache when it changes).
+	version string
+	loaded  time.Time
 }
 
 // AgentGatewayService is the PDP and the admin model. Use
@@ -284,6 +299,26 @@ func (s *AgentGatewayService) invalidatePolicies(ws uuid.UUID) {
 	s.polMu.Lock()
 	delete(s.pols, ws)
 	s.polMu.Unlock()
+}
+
+// InvalidateAgentGatewayWorkspace drops the workspace's cached policies,
+// settings and stopped agents in every gateway service of this process,
+// and, when gatewayID is set, that gateway's cached credential (its cache
+// cap). A containment calls it so the PDP refuses the agent at once here
+// (within agentGatewayPolicyCacheTTL in other processes).
+func InvalidateAgentGatewayWorkspace(ws, gatewayID uuid.UUID) {
+	agentGatewaySvcMu.Lock()
+	svcs := make([]*AgentGatewayService, 0, len(agentGatewaySvcs))
+	for _, s := range agentGatewaySvcs {
+		svcs = append(svcs, s)
+	}
+	agentGatewaySvcMu.Unlock()
+	for _, s := range svcs {
+		s.invalidatePolicies(ws)
+		if gatewayID != uuid.Nil {
+			s.invalidateCreds(gatewayID)
+		}
+	}
 }
 
 func agentGatewayNameErr(name string) error {
@@ -570,14 +605,15 @@ func (s *AgentGatewayService) Authenticate(ctx context.Context, presented string
 	s.credMu.Unlock()
 
 	var cred struct {
-		WorkspaceID    uuid.UUID
-		ID             uuid.UUID
-		Name           string
-		CredentialHash string
+		WorkspaceID     uuid.UUID
+		ID              uuid.UUID
+		Name            string
+		CredentialHash  string
+		CacheTTLSeconds int
 	}
 	// TENANT-EXEMPT: the presented gateway credential decides the workspace, so it is looked up by its hash across workspaces (as event secrets); everything after runs under its workspace.
 	res := s.db.WithContext(ctx).Table("agent_gateway").
-		Select("workspace_id", "id", "name", "credential_hash").
+		Select("workspace_id", "id", "name", "credential_hash", "cache_ttl_seconds").
 		Where("credential_hash = ? AND revoked_at IS NULL", h).
 		Limit(1).Scan(&cred)
 	if res.Error != nil {
@@ -585,7 +621,8 @@ func (s *AgentGatewayService) Authenticate(ctx context.Context, presented string
 	}
 	var p *AgentGatewayPrincipal
 	if res.RowsAffected > 0 && subtle.ConstantTimeCompare([]byte(cred.CredentialHash), []byte(h)) == 1 {
-		p = &AgentGatewayPrincipal{WorkspaceID: cred.WorkspaceID, GatewayID: cred.ID, Name: cred.Name}
+		p = &AgentGatewayPrincipal{WorkspaceID: cred.WorkspaceID, GatewayID: cred.ID, Name: cred.Name,
+			CacheTTLSeconds: cred.CacheTTLSeconds}
 	}
 	if p != nil {
 		// Unknown credentials are not cached: a garbage flood must not grow the map.

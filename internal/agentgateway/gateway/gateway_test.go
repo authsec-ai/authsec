@@ -25,6 +25,8 @@ type fakePDP struct {
 	evals   []json.RawMessage
 	records []Record
 	auth    []string
+	// notModified counts conditional hints requests answered 304.
+	notModified int
 }
 
 func newFakePDP(t *testing.T) *fakePDP {
@@ -67,6 +69,15 @@ func newFakePDP(t *testing.T) *fakePDP {
 			if f.hints == nil {
 				http.Error(w, "down", 500)
 				return
+			}
+			if f.hints.Version != "" {
+				etag := `"` + f.hints.Version + `"`
+				if r.Header.Get("If-None-Match") == etag {
+					f.notModified++
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				w.Header().Set("ETag", etag)
 			}
 			writeJSON(w, 200, f.hints)
 		default:
@@ -126,6 +137,10 @@ func testConfig(t *testing.T, pdp *fakePDP, mcpURL, openaiURL, anthropicURL, fai
 		AuthSec:  AuthSec{URL: pdp.srv.URL + "/authsec"},
 		FailMode: failMode,
 		Agents:   AgentsConfig{Keys: []AgentKey{{ID: "billing-agent", KeySHA256: HashAgentKey(testAgentKey), Labels: []string{"prod"}}}},
+		// The pre-W6 behaviour these tests exercise: locally generated agent
+		// keys presented alone, provider keys from the environment.
+		LegacyAgentKeys: true,
+		ProviderKeys:    ProviderKeysLocal,
 	}
 	if mcpURL != "" {
 		cfg.MCPServers = []MCPServer{{Name: "github", URL: mcpURL, Headers: map[string]string{"Authorization": "env:GH_TOKEN"}}}
@@ -597,7 +612,15 @@ func TestFailModes(t *testing.T) {
 		deleteAllow bool
 	}{
 		{FailClosed, &Hints{Mode: agentgateway.ModeObserve}, false, false},
-		{FailOpen, &Hints{Mode: agentgateway.ModeEnforce}, true, true},
+		// AuthSec says open: open applies.
+		{FailOpen, &Hints{Mode: agentgateway.ModeEnforce, FailMode: FailOpen}, true, true},
+		// AuthSec says auto (or nothing): a local "open" acts as auto (AS-174).
+		{FailOpen, &Hints{Mode: agentgateway.ModeEnforce}, false, false},
+		{FailOpen, &Hints{Mode: agentgateway.ModeObserve, FailMode: FailAuto, DenyTargets: []agentgateway.Target{{Kind: agentgateway.KindMCPTool, Tool: "delete_*"}}}, true, false},
+		{FailOpen, nil, false, false}, // no hints ever fetched: auto, which is closed without hints
+		// AuthSec says closed: a looser local value never loosens it.
+		{FailAuto, &Hints{Mode: agentgateway.ModeObserve, FailMode: FailClosed}, false, false},
+		{FailOpen, &Hints{Mode: agentgateway.ModeObserve, FailMode: FailClosed}, false, false},
 		{FailAuto, nil, false, false}, // no hints ever fetched: closed
 		{FailAuto, &Hints{Mode: agentgateway.ModeEnforce}, false, false},
 		{FailAuto, &Hints{Mode: agentgateway.ModeObserve, DenyTargets: []agentgateway.Target{{Kind: agentgateway.KindMCPTool, Tool: "delete_*"}}}, true, false},
@@ -652,7 +675,12 @@ func TestDecisionCache(t *testing.T) {
 	up := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
 		writeJSON(w, 200, map[string]any{"jsonrpc": "2.0", "id": 7, "result": map[string]any{}})
 	})
+	pdp.hints = &Hints{Mode: agentgateway.ModeObserve}
 	g, h := newTestGateway(t, testConfig(t, pdp, up.srv.URL, "", "", FailClosed))
+	// The cache is used only while hints (the stop list) are current.
+	if err := g.PDP().RefreshHints(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
 		// Different arguments, same tool: one decision.
 		body := strings.Replace(toolCallBody, "SECRET-TITLE", "t"+string(rune('a'+i)), 1)
@@ -707,7 +735,7 @@ func TestSSEParser(t *testing.T) {
 
 func TestConfigRefusesSecretsInYAMLAndBadValues(t *testing.T) {
 	base := func() *Config {
-		return &Config{AuthSec: AuthSec{URL: "https://authsec.example/authsec"},
+		return &Config{AuthSec: AuthSec{URL: "https://authsec.example/authsec"}, ProviderKeys: ProviderKeysLocal,
 			LLM: []LLMUpstream{{Provider: ProviderOpenAI, APIKeyEnv: "K"}}}
 	}
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }

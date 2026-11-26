@@ -19,8 +19,11 @@ import (
 // is cached and, until it passes, retried at most once a minute.
 
 const (
-	// AgentAlertsSchemaHead is the migration alerts need.
-	AgentAlertsSchemaHead = "150"
+	// AgentAlertsSchemaHead names the migrations alerts need: 150, rule
+	// versions (164), the lifecycle (165) and suppressions (166).
+	AgentAlertsSchemaHead = "150, 164, 165, 166"
+	// AgentCasesSchemaHead is the migration cases need (over 150).
+	AgentCasesSchemaHead = "186"
 	// AgentRuntimeSchemaHead names the migrations the runtime (inference,
 	// suggestions, findings, event stream, CloudTrail cursor) needs.
 	AgentRuntimeSchemaHead = "147, 148, 149, 160, 161"
@@ -29,10 +32,16 @@ const (
 	// 503 codes of the alert routes and the runtime routes.
 	GovCodeAgentAlertsUnavailable  = "agent_alerts_unavailable"
 	GovCodeAgentRuntimeUnavailable = "agent_runtime_unavailable"
+	// GovCodeAgentCasesUnavailable is the 503 code of the case routes.
+	GovCodeAgentCasesUnavailable = "agent_cases_unavailable"
 )
 
 var agentAlertsSchemaRelations = []string{"agent_alert", "agent_alert_siem_endpoint", "agent_alert_delivery",
-	"agent_alert_baseline", "agent_alert_setting", "agent_alert_event_seen"}
+	"agent_alert_baseline", "agent_alert_setting", "agent_alert_event_seen", "agent_detection_rule_version",
+	"agent_alert_transition", "agent_alert_suppression"}
+
+var agentCasesSchemaRelations = []string{"agent_alert", "agent_case", "agent_case_alert", "agent_case_link",
+	"agent_case_note", "agent_case_evidence"}
 
 var agentRuntimeSchemaRelations = []string{"cloud_trail_cursor", "cloud_trail_seen_event", "agent_suggestion", "agent_finding",
 	"agent_event_stream", "agent_event_seen"}
@@ -49,7 +58,9 @@ type agentSchemaGate struct {
 }
 
 var (
-	agentAlertsGate  = &agentSchemaGate{head: AgentAlertsSchemaHead, relations: agentAlertsSchemaRelations}
+	agentAlertsGate = &agentSchemaGate{head: AgentAlertsSchemaHead, relations: agentAlertsSchemaRelations,
+		columns: [][2]string{{"agent_alert", "reopen_count"}, {"agent_alert", "suppressed_by"}}}
+	agentCasesGate   = &agentSchemaGate{head: AgentCasesSchemaHead, relations: agentCasesSchemaRelations}
 	agentRuntimeGate = &agentSchemaGate{head: AgentRuntimeSchemaHead, relations: agentRuntimeSchemaRelations,
 		columns: [][2]string{{"agent_event_seen", "dispatched_at"}}}
 )
@@ -110,7 +121,7 @@ func (g *agentSchemaGate) logWait(what, reason string) {
 	}
 }
 
-// AgentAlertsStatus is whether alerts can run (migration 150's tables).
+// AgentAlertsStatus is whether alerts can run (migrations 150, 164-166).
 func AgentAlertsStatus(db *gorm.DB) (bool, string) { return agentAlertsGate.status(db) }
 
 // AgentRuntimeStatus is whether the runtime routes can run (147, 148, 149).
@@ -142,6 +153,24 @@ func RequireAgentAlerts(db *gorm.DB) error {
 func RequireAgentRuntime(db *gorm.DB) error {
 	if ok, reason := AgentRuntimeStatus(db); !ok {
 		return govErr(http.StatusServiceUnavailable, GovCodeAgentRuntimeUnavailable, "Agent runtime visibility is not available on this server.",
+			map[string]any{"reason": reason})
+	}
+	return nil
+}
+
+// AgentCasesStatus is whether cases can run (migrations 150 and 186).
+func AgentCasesStatus(db *gorm.DB) (bool, string) { return agentCasesGate.status(db) }
+
+// AgentCasesCapabilities is /capabilities' agent_cases block, same shape.
+func AgentCasesCapabilities(db *gorm.DB) map[string]any {
+	ok, reason := AgentCasesStatus(db)
+	return map[string]any{"available": ok, "reason": nullable(reason)}
+}
+
+// RequireAgentCases is nil while cases can run, else the 503.
+func RequireAgentCases(db *gorm.DB) error {
+	if ok, reason := AgentCasesStatus(db); !ok {
+		return govErr(http.StatusServiceUnavailable, GovCodeAgentCasesUnavailable, "Agent runtime cases are not available on this server.",
 			map[string]any{"reason": reason})
 	}
 	return nil

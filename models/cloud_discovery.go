@@ -1419,6 +1419,15 @@ type CloudResource struct {
 	// high-sensitivity service list". Empty for low.
 	SensitivityReason string `json:"sensitivity_reason" gorm:"not null;default:''"`
 
+	// Classification beyond sensitivity (179): crown jewel, data category and
+	// residency, from the resource's tags (provider_metadata) or a person
+	// (customer_classification; ClassifiedBy/At are set only then).
+	CrownJewel   bool       `json:"crown_jewel" gorm:"not null;default:false"`
+	DataCategory string     `json:"data_category" gorm:"not null;default:''"`
+	Residency    string     `json:"residency" gorm:"not null;default:''"`
+	ClassifiedBy *uuid.UUID `json:"classified_by,omitempty" gorm:"type:uuid"`
+	ClassifiedAt *time.Time `json:"classified_at,omitempty"`
+
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt         time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
@@ -1618,6 +1627,11 @@ type AWSWorkloadAttrs struct {
 	VPCSecurityGroupIDs []string `json:"vpc_security_group_ids,omitempty"`
 	// FoundationModel is the Bedrock agent's model id.
 	FoundationModel string `json:"foundation_model,omitempty"`
+	// ArtifactDigest, ArtifactVersion and Deployer describe the running
+	// version (awsdiscovery.Workload): agent instances are written from them.
+	ArtifactDigest  string `json:"artifact_digest,omitempty"`
+	ArtifactVersion string `json:"artifact_version,omitempty"`
+	Deployer        string `json:"deployer,omitempty"`
 	// Status is the provider's own lifecycle string, verbatim.
 	Status string `json:"status,omitempty"`
 	// UnresolvedRoleARN records a role the workload names that this scan could

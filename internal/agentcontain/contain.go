@@ -38,7 +38,10 @@
 // DECISION P3-4: an IAM user has no sessions to revoke by issue time that the
 // deny-all does not already cover, so identity level on a user is the deny-all
 // policy attached to the user plus every Active access key set Inactive
-// (recorded; release reactivates only those keys). Attaching a policy to a
+// (recorded). DECISION P3-4a: release never reactivates a key: a stopped key
+// may be what leaked, so release leaves it as it is and records on the step
+// that a new key must be issued (KeyLeft.RotateRequired, event
+// containment.access_key_rotation_required). Attaching a policy to a
 // USER (iam:AttachUserPolicy) and changing keys are not in template v2: they
 // come with EnableWorkloadContainment, so containing an IAM user at any level
 // needs the parameter.
@@ -61,15 +64,17 @@ import (
 	"github.com/authsec-ai/authsec/internal/igagov"
 )
 
-// Levels (spec §5.8).
+// Levels (spec §5.8; SecOps W2 P13 adds the rest, levels.go).
 const (
 	LevelWorkload = "workload"
 	LevelIdentity = "identity"
 	LevelModel    = "model"
 )
 
-// Levels lists the levels from narrowest to broadest.
-var Levels = []string{LevelWorkload, LevelModel, LevelIdentity}
+// Levels lists every level: the three AWS levels of P3 from narrowest to
+// broadest, then the W2 levels (levels.go).
+var Levels = []string{LevelWorkload, LevelModel, LevelIdentity,
+	LevelKey, LevelSessionsBefore, LevelChain, LevelSourceIdentity, LevelEntra, LevelKubernetes, LevelGateway, LevelPlatform}
 
 // ValidLevel reports whether l is a level.
 func ValidLevel(l string) bool {
@@ -91,13 +96,17 @@ const (
 	StateFailed     = "failed"
 	StateReleasing  = "releasing"
 	StateReleased   = "released"
+	// StateRequested is a stop AuthSec cannot write itself (the platform
+	// level): recorded, and asked of whoever can (W4).
+	StateRequested = "requested"
 )
 
-// LiveStates are the states that hold the (workspace, identity, level) slot.
-var LiveStates = []string{StatePreviewed, StateContaining, StateContained, StatePartial, StateReleasing}
+// LiveStates are the states that hold the (workspace, identity, level,
+// target) slot.
+var LiveStates = []string{StatePreviewed, StateRequested, StateContaining, StateContained, StatePartial, StateReleasing}
 
 // ReleasableStates are the states a release may start from.
-var ReleasableStates = []string{StatePreviewed, StateContaining, StateContained, StatePartial}
+var ReleasableStates = []string{StatePreviewed, StateRequested, StateContaining, StateContained, StatePartial}
 
 // Step kinds (agent_containment_step.kind).
 const (

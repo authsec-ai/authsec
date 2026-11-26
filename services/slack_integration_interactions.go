@@ -170,6 +170,8 @@ type SlackInteractionResult struct {
 	ResourceID  string    `json:"resource_id,omitempty"`
 	Before      any       `json:"-"`
 	After       any       `json:"result,omitempty"`
+	// OutcomeTitle, when set, is what replaces the clicked message (asks).
+	OutcomeTitle string `json:"-"`
 }
 
 // SlackInteractionDone receives an accepted interaction's outcome once its
@@ -385,6 +387,8 @@ func (s *SlackIntegrationService) authenticated(ctx context.Context, ic *interac
 		run, err = s.authorizeResponse(ctx, ic)
 	case GovNoticeDeployment, GovNoticeCanaryGate:
 		run, err = s.authorizeHealth(ctx, ic)
+	case GovNoticeAgentAsk:
+		run, err = s.authorizeAsk(ctx, ic)
 	default:
 		err = GovBadParam("actions[0].action_id", "This message takes no action.")
 	}
@@ -672,6 +676,10 @@ func (s *SlackIntegrationService) answerOutcome(ctx context.Context, ic *interac
 	if res == nil || res.Ignored {
 		return
 	}
+	if res.OutcomeTitle != "" {
+		s.respondURL(ctx, ic, slackapp.Outcome(res.OutcomeTitle, askOutcomeLine(ic.n)))
+		return
+	}
 	who := ic.member.Name
 	if who == "" {
 		who = ic.member.Email
@@ -704,6 +712,9 @@ func (s *SlackIntegrationService) answerOutcome(ctx context.Context, ic *interac
 // slackNoticeLink is the console page a notice is about: the Policy area
 // (the approvals, owner reviews and deployments pages were removed from the
 // console with the R1a pages; their paths would open as a policy id).
-func slackNoticeLink(models.IGAGovNotification) string {
+func slackNoticeLink(n models.IGAGovNotification) string {
+	if n.SubjectKind == GovNoticeAgentAsk {
+		return AgentAskConsoleLink(n.SubjectID)
+	}
 	return govConsoleLink("/iga/policy")
 }

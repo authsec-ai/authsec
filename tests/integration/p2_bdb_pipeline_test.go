@@ -136,10 +136,19 @@ func TestP2BdbFirstPublication(t *testing.T) {
 	if agent.Classification != models.ClassificationProviderAgent || agent.Region != "eu-central-1" {
 		t.Fatalf("support-bot = %+v, want a workload in eu-central-1 classified provider_native_agent", agent)
 	}
-	for _, table := range []string{"iga_agents", "iga_agent_instances"} {
-		if n := l.count(`SELECT count(*) FROM `+table+` WHERE workspace_id = ?`, l.ws); n != 0 {
-			t.Errorf("%s has %d rows after an AWS scan: no AWS row is ever an agent row (§2.2)", table, n)
+	// §2.2: no AWS row is an iga_agents agent. Since W7 (178) an AWS agent's
+	// instances live in iga_agent_instances under its one agent id
+	// (agent_ref), never under an iga_agents row (agent_id stays NULL).
+	for table, q := range map[string]string{
+		"iga_agents":          `SELECT count(*) FROM iga_agents WHERE workspace_id = ?`,
+		"iga_agent_instances": `SELECT count(*) FROM iga_agent_instances WHERE workspace_id = ? AND (agent_id IS NOT NULL OR agent_ref IS NULL)`,
+	} {
+		if n := l.count(q, l.ws); n != 0 {
+			t.Errorf("%s has %d iga_agents-owned rows after an AWS scan: no AWS row is ever an agent row (§2.2)", table, n)
 		}
+	}
+	if n := l.count(`SELECT count(*) FROM iga_agent_instances WHERE workspace_id = ? AND agent_ref IS NOT NULL`, l.ws); n == 0 {
+		t.Errorf("the Bedrock agent has no instance under its agent id (W7, P12)")
 	}
 
 	// /workloads lists A's workloads at rev 1.

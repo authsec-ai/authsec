@@ -306,6 +306,7 @@ func main() {
 		})
 	}
 
+	services.RegisterAgentEvidenceSink(config.DB)      // SecOps W1: every event of a connected account, first
 	services.RegisterAgentLiveSink(config.DB)          // agent runtime: live AI-workload evidence; before the alert and verify sinks
 	services.RegisterAgentContainVerifySink(config.DB) // agent runtime P3: behavioural verification of containments
 	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
@@ -324,6 +325,10 @@ func main() {
 			// connection starts off). It only queues work, the worker above runs
 			// it, and it needs no environment switch.
 			go services.NewAWSScanScheduler(config.DB).Run(context.Background())
+
+			// SecOps W1: trail-bucket backfills (asked for, and the windows a
+			// silent event stream missed), read with the connector's role.
+			go services.RunAgentTrailBackfillWorker(context.Background(), config.DB, services.AWSTrailLocator(awsSvc))
 		}
 	}
 
@@ -333,12 +338,52 @@ func main() {
 	services.InstallAgentRuntimeAlerts(config.DB)
 	services.InstallAgentRuntimeActivity(config.DB) // agent runtime P4: the "agent_activity" sink and activity retention
 	go services.RunAgentRuntimeAlertWorker(context.Background(), config.DB)
+	// SecOps W1: source heartbeats and COV-01, capability states, evidence
+	// retention (AUTHSEC_DISABLE_AGENT_COVERAGE_WORKER=true turns it off).
+	go services.RunAgentCoverageWorker(context.Background(), config.DB)
+	// Agent runtime cases (W3): places alerts the sink left out of a case and
+	// backfills alerts raised before migration 186.
+	go services.RunAgentCaseClusterWorker(context.Background(), config.DB)
+	// Asks (W4): escalation of due asks every minute
+	// (AUTHSEC_DISABLE_ASK_ESCALATION=true turns it off) and the ticketing /
+	// paging sync (AUTHSEC_DISABLE_ASK_EXTERNAL_SYNC=true), leader-locked;
+	// integration secrets in Vault.
+	services.InstallAgentAsks()
+	go services.RunAgentAskEscalationWorker(context.Background(), config.DB)
+	go services.RunAgentAskExternalWorker(context.Background(), config.DB)
+	// History snapshots (SPEC-secops-backend-upgrade.md W9): daily snapshots
+	// and snapshot retention, leader-locked (AUTHSEC_DISABLE_SNAPSHOTS=true
+	// turns it off on a replica).
+	go services.RunHistorySnapshotWorker(context.Background(), config.DB)
 
 	// Model provider usage (SPEC-agent-runtime-provider-usage.md): opt-in per
 	// workspace; the Vault client for admin keys, and the hourly sync worker
 	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
 	services.InstallModelProviders()
 	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
+	// W6: per-minute provider usage and the usage reconciliation every 5
+	// minutes (USAGE-02 outside use, USAGE-03 bypass;
+	// AUTHSEC_DISABLE_USAGE_RECONCILE=true turns it off), and the expiry of
+	// held gateway calls (AUTHSEC_DISABLE_GATEWAY_HOLD_SWEEP=true).
+	go services.RunUsageReconcileWorker(context.Background(), config.DB)
+	go services.RunGatewayHoldSweeper(context.Background(), config.DB)
+	// One agent id (W7): link sweep, deleted-at-source, stale agents and
+	// overdue keys, every 15 minutes per workspace
+	// (AUTHSEC_DISABLE_AGENT_IDENTITY_SWEEP=true turns it off).
+	go services.RunAgentIdentityWorker(context.Background(), config.DB)
+	// Remediation (W8): the Vault client for remediation ExternalIds, the
+	// live AWS access, and the worker (deferred key deactivations, pull
+	// request sync, proof refresh; AUTHSEC_DISABLE_REMEDIATION_WORKER=true
+	// turns it off).
+	services.InstallRemediation(config.DB)
+	go services.RunRemediationWorker(context.Background(), config.DB)
+	// SecOps cross-workstream hooks (secops_wiring.go): remediation and gateway
+	// hold asks (W4), gateway rule removal on retire (W6), case evidence pins (W1).
+	services.InstallSecOpsWiring(config.DB)
+	// Second-person rule (W5): every 15 minutes, one governance.review_overdue
+	// event and operator alert per break-glass change whose review is overdue
+	// (AUTHSEC_DISABLE_BREAKGLASS_REVIEW_WORKER=true turns it off).
+	go services.RunBreakGlassReviewWorker(context.Background(), config.DB)
 
 	// Azure scheduled discovery: re-verifies and rediscovers every connected
 	// Entra tenant whose last pass is older than AZURE_DISCOVERY_INTERVAL
@@ -565,16 +610,11 @@ func main() {
 	// Phase 4: background workers
 	// ─────────────────────────────────────────────────────────
 
-	// Audit log cleanup (runs daily, removes events older than 90 days)
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := auditLogger.CleanupOldEvents(90 * 24 * time.Hour); err != nil {
-				monitoring.GetLogger().WithError(err).Error("Failed to cleanup old audit events")
-			}
-		}
-	}()
+	// Audit governance (F7 / P18, AS-177): daily chain anchors and the
+	// retention purge per workspace and record class (sparing legal holds),
+	// the hourly operator baseline, and the replay of audit write failures.
+	// Replaces the daily DELETE of every workspace's events older than 90 days.
+	services.InstallAuditGovernance(config.DB)
 
 	// Auth request context + PKCE verifier cleanup (expired entries, runs every 10 minutes)
 	go func() {

@@ -26,6 +26,9 @@ import (
 //	PATCH  /gateways/:id                  governance:enforce  {name, version}
 //	POST   /gateways/:id/rotate           governance:enforce  -> new credential, shown once
 //	DELETE /gateways/:id                  governance:enforce  revoke
+//	PUT    /gateways/:id/runtime          governance:enforce  {fail_mode, cache_ttl_seconds, reason, version}
+//	                                      tightening applies at once; loosening is 202 + a pending change
+//	                                      (a second member with governance:approve applies it, AS-174)
 //	GET    /gateway-settings              governance:read
 //	PUT    /gateway-settings              governance:enforce  {mode, cache_ttl_seconds, decision_retention_days, version}
 //	GET    /tool-policies                 governance:read
@@ -62,8 +65,9 @@ func NewAgentGatewayController() *AgentGatewayController {
 // MountAgentGatewayRoutes mounts the routes on g (the authenticated
 // /api/iga/v1 group) with their permissions.
 func MountAgentGatewayRoutes(g *gin.RouterGroup, ctl *AgentGatewayController) {
-	RegisterAgentGatewayRoutes(g.Group("/agent-runtime"), ctl,
+	RegisterAgentGatewayRoutes(g.Group("/agent-runtime", TierGuard()), ctl,
 		middlewares.Require("governance", "read"), middlewares.Require("governance", "enforce"))
+	MountAgentGatewayW6Routes(g, ctl)
 }
 
 // RegisterAgentGatewayRoutes is the route table.
@@ -74,6 +78,7 @@ func RegisterAgentGatewayRoutes(g gin.IRoutes, ctl *AgentGatewayController, read
 	g.PATCH("/gateways/:id", write, ctl.RenameGateway)
 	g.POST("/gateways/:id/rotate", write, ctl.RotateGateway)
 	g.DELETE("/gateways/:id", write, ctl.RevokeGateway)
+	g.PUT("/gateways/:id/runtime", write, ctl.PutGatewayRuntime)
 	g.GET("/gateway-settings", read, ctl.GetSettings)
 	g.PUT("/gateway-settings", write, ctl.PutSettings)
 	g.GET("/tool-policies", read, ctl.ListPolicies)
@@ -261,6 +266,41 @@ func (ctl *AgentGatewayController) RevokeGateway(c *gin.Context) {
 	}
 	auditAdminMutation(c, ws.String(), "agent_gateway.revoke", "agent_gateway", id.String(), http.StatusOK, before, after)
 	c.JSON(http.StatusOK, gin.H{"data": after})
+}
+
+// PutGatewayRuntime handles PUT /gateways/:id/runtime: the gateway's fail
+// mode and cache cap as AuthSec hands them out. 200 when applied
+// (tightening, no change, or break-glass when nobody else can approve);
+// 202 with the pending change when it loosens and needs a second person.
+func (ctl *AgentGatewayController) PutGatewayRuntime(c *gin.Context) {
+	ws, actor, id, ok := ctl.writeTarget(c, true)
+	if !ok {
+		return
+	}
+	var u services.AgentGatewayRuntimeUpdate
+	if err := strictJSON(c, &u); err != nil {
+		govErrorOut(c, services.GovBadParam("body", "The body must be JSON: {\"fail_mode\", \"cache_ttl_seconds\", \"reason\", \"version\"}."))
+		return
+	}
+	before, res, err := ctl.svc().UpdateGatewayRuntime(c.Request.Context(), ws, id, actor, u)
+	if err != nil {
+		govErrorOut(c, err)
+		return
+	}
+	switch {
+	case !res.Applied:
+		auditAdminMutation(c, ws.String(), "pending_change.request", "pending_change", res.PendingChange.ID.String(),
+			http.StatusAccepted, before, res.PendingChange)
+		c.JSON(http.StatusAccepted, gin.H{"data": res})
+	case res.BreakGlass:
+		auditAdminMutation(c, ws.String(), "agent_gateway.runtime_break_glass", "agent_gateway", id.String(), http.StatusOK,
+			before, res)
+		c.JSON(http.StatusOK, gin.H{"data": res})
+	default:
+		auditAdminMutation(c, ws.String(), "agent_gateway.runtime_update", "agent_gateway", id.String(), http.StatusOK,
+			before, res.Gateway)
+		c.JSON(http.StatusOK, gin.H{"data": res})
+	}
 }
 
 /* --------------------------------- settings ------------------------------- */

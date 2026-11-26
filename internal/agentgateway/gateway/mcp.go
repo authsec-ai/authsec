@@ -10,6 +10,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/agentgateway"
 )
@@ -33,7 +36,13 @@ const (
 	// RPCPolicyDenied is AuthSec's refusal of a tool call (an application
 	// code outside the JSON-RPC reserved range).
 	RPCPolicyDenied = -31001
+	// RPCHeld answers a tool call AuthSec holds for a person (HTTP 202):
+	// retry the same call with X-AuthSec-Hold-Id once it is approved.
+	RPCHeld = -31002
 )
+
+// HoldIDHeader names the hold a retried call refers to.
+const HoldIDHeader = "X-AuthSec-Hold-Id"
 
 // Forwarded agent headers. Authorization, X-Api-Key, cookies and the agent
 // key are never forwarded: no token passthrough (the upstream's
@@ -144,6 +153,15 @@ type mcpCall struct {
 	msg  rpcMessage
 	req  agentgateway.Request
 	deny *Decision
+	hold *pendingHold
+}
+
+// pendingHold is an allowed call outside its policy's argument bounds that
+// the policy holds for a person.
+type pendingHold struct {
+	decision   Decision
+	violations []agentgateway.BoundViolation
+	held       map[string]json.RawMessage
 }
 
 func denyData(d Decision) map[string]any {
@@ -157,8 +175,29 @@ func denyData(d Decision) map[string]any {
 	return m
 }
 
-// decideToolCall applies pinning and then the PDP to one tools/call.
-func (g *Gateway) decideToolCall(r *http.Request, s *MCPServer, subj agentgateway.Request, name string, args json.RawMessage, rid string) (agentgateway.Request, Decision, error) {
+// decideToolCall applies pinning, then the PDP, then the deciding policy's
+// argument bounds to one tools/call. A call outside bounds is denied
+// (argument_out_of_bounds, recorded with the violated paths, never the
+// values) or, when the policy holds, returned as a pendingHold.
+func (g *Gateway) decideToolCall(r *http.Request, s *MCPServer, subj agentgateway.Request, name string, args json.RawMessage, rid string) (agentgateway.Request, Decision, *pendingHold, error) {
+	req, d, err := g.decideToolCallPDP(r, s, subj, name, args, rid)
+	if err != nil || !d.Allowed || d.ArgBounds.Empty() {
+		return req, d, nil, err
+	}
+	v, held := d.ArgBounds.Check(args)
+	if len(v) == 0 {
+		return req, d, nil, nil
+	}
+	if d.ArgBounds.Hold() {
+		return req, d, &pendingHold{decision: d, violations: v, held: held}, nil
+	}
+	dd := Decision{Allowed: false, Reason: agentgateway.ReasonArgumentOutOfBounds, PolicyID: d.PolicyID, Source: SourceGateway,
+		DecisionID: d.DecisionID}
+	g.up.DecisionViolations(req, dd, d.DecisionID, v)
+	return req, dd, nil, nil
+}
+
+func (g *Gateway) decideToolCallPDP(r *http.Request, s *MCPServer, subj agentgateway.Request, name string, args json.RawMessage, rid string) (agentgateway.Request, Decision, error) {
 	digest, err := agentgateway.DigestArguments(args)
 	if err != nil {
 		return agentgateway.Request{}, Decision{}, fmt.Errorf("arguments are not valid JSON: %w", err)
@@ -166,6 +205,11 @@ func (g *Gateway) decideToolCall(r *http.Request, s *MCPServer, subj agentgatewa
 	req := subj
 	req.Kind, req.Server, req.ServerURL, req.Tool = agentgateway.KindMCPTool, s.Name, s.URL, name
 	req.ArgsDigest, req.RequestID, req.GatewayVersion = digest, rid, Version
+	if g.pdp.StoppedBy(req) != nil {
+		// A stopped agent is refused before pinning, the cache and the PDP
+		// (Decide refuses it first and records the refusal).
+		return req, g.pdp.Decide(r.Context(), req), nil
+	}
 	if *s.PinTools {
 		state, pin := g.pins.Check(s.Name, name)
 		switch {
@@ -189,15 +233,25 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		subj, err := g.identify(r)
 		if err != nil {
-			writeRPCError(w, http.StatusUnauthorized, nil, rpcInvalidRequest, "an AuthSec agent credential is required", nil)
+			writeRPCError(w, http.StatusUnauthorized, nil, rpcInvalidRequest, identifyMessage(err), nil)
 			return
 		}
+		subj.RunID = runID(w, r)
+		probe := subj
+		probe.Kind = agentgateway.KindMCPTool
+		stopped := g.pdp.StoppedBy(probe) != nil
 		switch r.Method {
 		case http.MethodPost:
 		case http.MethodGet, http.MethodDelete:
+			if stopped {
+				// A stopped agent gets nothing from the server, not even a stream.
+				log.Printf("[agent-gateway] mcp stopped agent refused agent=%s server=%s method=%s", subj.SubjectID, s.Name, r.Method)
+				writeRPCError(w, http.StatusForbidden, nil, RPCPolicyDenied, "AuthSec stopped this agent", denyData(StoppedDecision()))
+				return
+			}
 			// Pre-2026-07-28 standalone streams and session termination:
 			// nothing to decide, passed through.
-			g.forwardMCP(w, r, s, nil, false)
+			g.forwardMCP(w, r, s, nil, false, subj.RunID)
 			return
 		default:
 			w.Header().Set("Allow", "POST, GET, DELETE")
@@ -243,18 +297,32 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 				}
 			}
 			if m.Method != "tools/call" {
+				if stopped {
+					// Every message of a stopped agent is refused (tools/list,
+					// resources/read, initialize ...): nothing is forwarded.
+					sd := StoppedDecision()
+					calls = append(calls, mcpCall{msg: m, deny: &sd})
+					denied = true
+				}
 				continue
 			}
 			if p.Name == "" {
 				writeRPCError(w, http.StatusBadRequest, m.ID, rpcInvalidRequest, "tools/call needs params.name", nil)
 				return
 			}
-			req, d, derr := g.decideToolCall(r, s, subj, p.Name, p.Arguments, rid)
+			req, d, ph, derr := g.decideToolCall(r, s, subj, p.Name, p.Arguments, rid)
 			if derr != nil {
 				writeRPCError(w, http.StatusBadRequest, m.ID, rpcInvalidRequest, derr.Error(), nil)
 				return
 			}
-			c := mcpCall{msg: m, req: req}
+			if ph != nil && batch {
+				// A batch is refused whole; a call in it is never held.
+				d = Decision{Allowed: false, Reason: agentgateway.ReasonArgumentOutOfBounds, PolicyID: ph.decision.PolicyID,
+					Source: SourceGateway, DecisionID: ph.decision.DecisionID}
+				g.up.DecisionViolations(req, d, ph.decision.DecisionID, ph.violations)
+				ph = nil
+			}
+			c := mcpCall{msg: m, req: req, hold: ph}
 			if !d.Allowed {
 				dd := d
 				c.deny = &dd
@@ -290,15 +358,94 @@ func (g *Gateway) mcpHandler(s *MCPServer) http.Handler {
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
+		if !batch && len(calls) == 1 && calls[0].hold != nil {
+			if !g.holdCall(w, r, calls[0].msg.ID, calls[0].req, calls[0].hold) {
+				return
+			}
+		}
 		listing := !batch && msgs[0].Method == "tools/list" && *s.PinTools
-		g.forwardMCP(w, r, s, body, listing)
+		g.forwardMCP(w, r, s, body, listing, subj.RunID)
 	})
+}
+
+func heldData(t HoldTicket) map[string]any {
+	m := map[string]any{"hold_id": t.HoldID, "state": t.State, "expires_at": t.ExpiresAt, "retry_header": HoldIDHeader}
+	if t.ApproverUserID != "" {
+		m["approver_user_id"] = t.ApproverUserID
+	}
+	return m
+}
+
+// holdCall settles a held call: it reports true when the call may be
+// forwarded (an approved hold, consumed once), and otherwise writes the
+// answer (held: HTTP 202 with RPCHeld; denied or expired: RPCPolicyDenied).
+// With X-AuthSec-Hold-Id the agent retries a call held before.
+func (g *Gateway) holdCall(w http.ResponseWriter, r *http.Request, id json.RawMessage, req agentgateway.Request, ph *pendingHold) bool {
+	deny := func(reason string) {
+		d := Decision{Allowed: false, Reason: reason, PolicyID: ph.decision.PolicyID, Source: SourceGateway}
+		writeRPCError(w, http.StatusOK, id, RPCPolicyDenied, "AuthSec policy denied this tool call ("+reason+")", denyData(d))
+	}
+	settle := func(t HoldTicket) bool {
+		switch t.State {
+		case "approved":
+			if _, _, err := g.pdp.ConsumeHold(r.Context(), t.HoldID, req); err == nil {
+				return true
+			}
+			deny(agentgateway.ReasonHoldExpired)
+		case "denied":
+			deny(agentgateway.ReasonHoldDenied)
+		case "expired", "consumed":
+			d := Decision{Allowed: false, Reason: agentgateway.ReasonHoldExpired, PolicyID: ph.decision.PolicyID, Source: SourceGateway}
+			g.up.DecisionViolations(req, d, ph.decision.DecisionID, ph.violations)
+			deny(agentgateway.ReasonHoldExpired)
+		default:
+			writeRPCError(w, http.StatusAccepted, id, RPCHeld, "AuthSec is holding this tool call for approval", heldData(t))
+		}
+		return false
+	}
+	if hid := strings.TrimSpace(r.Header.Get(HoldIDHeader)); hid != "" {
+		if _, err := uuid.Parse(hid); err != nil {
+			writeRPCError(w, http.StatusBadRequest, id, rpcInvalidRequest, HoldIDHeader+" must be a hold id", nil)
+			return false
+		}
+		t, err := g.pdp.HoldStatus(r.Context(), hid)
+		if err != nil {
+			deny("hold_unavailable")
+			return false
+		}
+		return settle(t)
+	}
+	t, err := g.pdp.CreateHold(r.Context(), req, ph.decision.PolicyID, ph.violations, ph.held)
+	if err != nil {
+		log.Printf("[agent-gateway] hold could not be opened agent=%s tool=%s: %v", req.SubjectID, req.Tool, err)
+		d := Decision{Allowed: false, Reason: "hold_unavailable", PolicyID: ph.decision.PolicyID, Source: SourceGateway}
+		g.up.DecisionViolations(req, d, ph.decision.DecisionID, ph.violations)
+		deny("hold_unavailable")
+		return false
+	}
+	log.Printf("[agent-gateway] mcp held agent=%s tool=%s hold=%s", req.SubjectID, req.Tool, t.HoldID)
+	if g.cfg.Holds.Mode == HoldWait {
+		deadline := time.Now().Add(time.Duration(g.cfg.Holds.WaitTimeoutS) * time.Second)
+		every := time.Duration(g.cfg.Holds.PollIntervalMS) * time.Millisecond
+		for t.State == "pending" && time.Now().Before(deadline) {
+			select {
+			case <-r.Context().Done():
+				return false
+			case <-time.After(every):
+			}
+			nt, err := g.pdp.HoldStatus(r.Context(), t.HoldID)
+			if err == nil {
+				t = nt
+			}
+		}
+	}
+	return settle(t)
 }
 
 // forwardMCP sends the request upstream with the server's configured
 // headers and streams the response back; listing tees a tools/list response
 // into the pin store.
-func (g *Gateway) forwardMCP(w http.ResponseWriter, r *http.Request, s *MCPServer, body []byte, listing bool) {
+func (g *Gateway) forwardMCP(w http.ResponseWriter, r *http.Request, s *MCPServer, body []byte, listing bool, run string) {
 	target := s.URL
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -315,6 +462,11 @@ func (g *Gateway) forwardMCP(w http.ResponseWriter, r *http.Request, s *MCPServe
 	copyHeaders(up.Header, r.Header, mcpForwardHeaders)
 	for k, v := range s.Headers {
 		up.Header.Set(k, v)
+	}
+	if run != "" {
+		// The run id travels on to the server, so an agent behind it can
+		// pass it on with its own calls.
+		up.Header.Set(agentgateway.RunIDHeader, run)
 	}
 	resp, err := g.upstream.Do(up)
 	if err != nil {

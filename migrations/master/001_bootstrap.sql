@@ -13994,3 +13994,2874 @@ BEGIN
         PERFORM public.tenancy_enable_rls('public.agentkit_policies');
     END IF;
 END $$;
+
+-- 163: per-gateway fail mode and cache cap; pending_change (two-person changes, AS-174).
+ALTER TABLE agent_gateway ADD COLUMN IF NOT EXISTS fail_mode text NOT NULL DEFAULT 'auto'
+  CHECK (fail_mode IN ('closed','auto','open'));
+ALTER TABLE agent_gateway ADD COLUMN IF NOT EXISTS cache_ttl_seconds integer NOT NULL DEFAULT 30
+  CHECK (cache_ttl_seconds BETWEEN 0 AND 300);
+
+CREATE TABLE IF NOT EXISTS pending_change (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  kind            text NOT NULL CHECK (kind ~ '^[a-z0-9_.]{1,64}$'),
+  target_ref      text NOT NULL CHECK (btrim(target_ref) <> '' AND length(target_ref) <= 512),
+  payload         jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
+  reason          text NOT NULL DEFAULT '' CHECK (length(reason) <= 2000),
+  state           text NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending','approved','rejected','applied','expired')),
+  requested_by    uuid NOT NULL REFERENCES users(id),
+  requested_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at      timestamptz NOT NULL,
+  approved_by     uuid REFERENCES users(id),
+  approved_at     timestamptz,
+  rejected_by     uuid REFERENCES users(id),
+  rejected_at     timestamptz,
+  decision_reason text NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 2000),
+  applied_at      timestamptz,
+  break_glass     boolean NOT NULL DEFAULT false,
+  review_due_at   timestamptz,
+  updated_at      timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, id),
+  CONSTRAINT pending_change_second_person_chk CHECK (approved_by IS NULL OR approved_by <> requested_by),
+  CONSTRAINT pending_change_break_glass_chk CHECK (NOT break_glass OR (approved_by IS NULL AND review_due_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_pending_change_ws_state ON pending_change (workspace_id, state, requested_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_change_open ON pending_change (workspace_id, kind, target_ref)
+  WHERE state IN ('pending','approved');
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.pending_change');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 164: mirrored verbatim from migrations/master/164_agent_detection_rule_version.sql.
+-- ============================================================================
+-- ============================================================================
+-- 164: versioned detection rules (SecOps F6, AS-179).
+--
+-- agent_alert_setting was one row per workspace, overwritten in place, and
+-- its audit row carried only the new value. Every change is now a row of
+-- agent_detection_rule_version:
+--
+--   proposed    a loosening change (a detection disabled, a threshold raised,
+--               a severity lowered, Slack off, a longer dedupe window, a
+--               shorter retention) waiting for a second person holding
+--               governance:approve (tier 3; approved_by <> proposed_by)
+--   active      the version the detections read (at most one per workspace)
+--   rejected    a proposal turned down
+--   superseded  a version that was active, or a proposal overtaken by a newer
+--               active version
+--
+-- A tightening change is active at once. break_glass marks a loosening that
+-- the workspace's only governance:approve holder applied alone; it is due a
+-- review within 24 hours (review_due_at).
+--
+-- Every existing agent_alert_setting row becomes the workspace's version 1,
+-- active. agent_alert_setting stays (it mirrors the active version) until a
+-- contract migration retires it.
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_detection_rule_version (
+    id                    uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id          uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    version_no            integer     NOT NULL CHECK (version_no >= 1),
+    -- The version this one was proposed against (NULL for the first).
+    base_version_no       integer,
+    -- Same shape as agent_alert_setting.detections:
+    -- {"D5": {"enabled": true, "n": 10, "minutes": 5, "severity": ""}, ...}
+    detections            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    slack_enabled         boolean     NOT NULL DEFAULT true,
+    dedupe_window_minutes integer     NOT NULL DEFAULT 60 CHECK (dedupe_window_minutes BETWEEN 5 AND 1440),
+    retention_days        integer     NOT NULL DEFAULT 90 CHECK (retention_days BETWEEN 7 AND 3650),
+    -- The loosening changes this version makes over its base ([] = none).
+    loosening             jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    state                 text        NOT NULL CHECK (state IN ('proposed', 'active', 'rejected', 'superseded')),
+    proposed_by           uuid,
+    proposed_at           timestamptz NOT NULL DEFAULT now(),
+    approved_by           uuid,
+    approved_at           timestamptz,
+    rejected_by           uuid,
+    rejected_at           timestamptz,
+    activated_at          timestamptz,
+    superseded_at         timestamptz,
+    reason                text        NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+    break_glass           boolean     NOT NULL DEFAULT false,
+    review_due_at         timestamptz,
+    UNIQUE (workspace_id, id),
+    UNIQUE (workspace_id, version_no),
+    -- Separation of duties: nobody approves their own proposal.
+    CONSTRAINT agent_detection_rule_version_sod_chk
+        CHECK (approved_by IS NULL OR proposed_by IS NULL OR approved_by <> proposed_by),
+    CONSTRAINT agent_detection_rule_version_approved_chk
+        CHECK ((approved_by IS NULL) = (approved_at IS NULL)),
+    CONSTRAINT agent_detection_rule_version_break_glass_chk
+        CHECK (NOT break_glass OR review_due_at IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_detection_rule_version_ws
+    ON public.agent_detection_rule_version (workspace_id, version_no DESC);
+-- One active version, and at most one open proposal, per workspace.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_detection_rule_version_active
+    ON public.agent_detection_rule_version (workspace_id) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_detection_rule_version_proposed
+    ON public.agent_detection_rule_version (workspace_id) WHERE state = 'proposed';
+
+-- Existing settings become version 1, active.
+INSERT INTO public.agent_detection_rule_version (workspace_id, version_no, detections, slack_enabled, dedupe_window_minutes,
+                                                 retention_days, state, proposed_by, proposed_at, activated_at, reason)
+SELECT s.workspace_id, 1, s.detections, s.slack_enabled, s.dedupe_window_minutes, s.retention_days, 'active',
+       s.updated_by, s.updated_at, s.updated_at, 'migrated from agent_alert_setting'
+  FROM public.agent_alert_setting s
+ WHERE NOT EXISTS (SELECT 1 FROM public.agent_detection_rule_version v WHERE v.workspace_id = s.workspace_id);
+
+COMMENT ON TABLE public.agent_detection_rule_version IS
+    'Versioned agent runtime detection rules: loosening changes need a second person (tier 3); every change is an iga_gov_event.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_detection_rule_version');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 165: mirrored verbatim from migrations/master/165_agent_alert_lifecycle.sql.
+-- ============================================================================
+-- ============================================================================
+-- 165: agent alert lifecycle (SecOps F8, AS-180).
+--
+-- 1. agent_alert.state admits 'reopened' (a resolved alert reopened with a
+--    reason); severity admits 'low'.
+-- 2. Per-transition actors on the alert: acknowledged_by/at, resolved_by/at
+--    and the resolution's outcome code (true_positive | benign |
+--    false_positive | duplicate), reopened_by/at and reopen_count.
+--    Resolving no longer overwrites who acknowledged. state_changed_by/at
+--    stay: the latest transition.
+-- 3. agent_alert_transition: every acknowledge / resolve / reopen, with its
+--    actor, outcome and reason, in order. Rows are only inserted; they go
+--    with their alert (retention). The summary columns of (2) show the
+--    latest cycle; this table keeps every cycle.
+--
+-- Existing acknowledged and resolved alerts get their summary columns from
+-- state_changed_by/at; their outcome stays NULL (it was never recorded).
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_state_check;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_state_check
+    CHECK (state IN ('open', 'acknowledged', 'resolved', 'reopened'));
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_severity_check;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_severity_check
+    CHECK (severity IN ('high', 'medium', 'low'));
+
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS acknowledged_by uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS acknowledged_at timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS resolved_by     uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS resolved_at     timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS outcome         text;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopened_by     uuid;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopened_at     timestamptz;
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS reopen_count    integer NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_alert_outcome_check'
+                      AND conrelid = 'public.agent_alert'::regclass) THEN
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_outcome_check
+            CHECK (outcome IS NULL OR outcome IN ('true_positive', 'benign', 'false_positive', 'duplicate'));
+    END IF;
+END $$;
+
+UPDATE public.agent_alert SET acknowledged_by = state_changed_by, acknowledged_at = state_changed_at
+ WHERE state = 'acknowledged' AND acknowledged_at IS NULL AND state_changed_at IS NOT NULL;
+UPDATE public.agent_alert SET resolved_by = state_changed_by, resolved_at = state_changed_at
+ WHERE state = 'resolved' AND resolved_at IS NULL AND state_changed_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_transition (
+    id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    alert_id     uuid        NOT NULL,
+    from_state   text        NOT NULL,
+    to_state     text        NOT NULL CHECK (to_state IN ('acknowledged', 'resolved', 'reopened')),
+    actor_id     uuid        NOT NULL,
+    outcome      text        CHECK (outcome IS NULL OR outcome IN ('true_positive', 'benign', 'false_positive', 'duplicate')),
+    reason       text        NOT NULL DEFAULT '' CHECK (length(reason) <= 1000),
+    at           timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, alert_id) REFERENCES public.agent_alert (workspace_id, id) ON DELETE CASCADE,
+    -- A resolution always carries its outcome; nothing else does.
+    CONSTRAINT agent_alert_transition_outcome_chk CHECK ((to_state = 'resolved') = (outcome IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_transition_alert
+    ON public.agent_alert_transition (workspace_id, alert_id, at);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_alert_transition');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 166: mirrored verbatim from migrations/master/166_agent_alert_suppression.sql.
+-- ============================================================================
+-- ============================================================================
+-- 166: agent alert suppressions (SecOps P6, AS-179/AS-180 follow-on).
+--
+-- A suppression keeps the alerts of one agent identity and one detection
+-- (optionally one instance digest) from being delivered to Slack and SIEM
+-- for at most 90 days. The alerts are still stored, with suppressed_by set.
+--
+--   proposed  requested; a second person holding governance:approve
+--             approves (tier 3; approved_by <> requested_by)
+--   active    in force between starts_at and ends_at
+--   rejected  turned down
+--   ended     ended early by a member, or replaced by its approved renewal
+--   expired   reached ends_at
+--
+-- A suppression never silences an alert recording a succeeded harmful
+-- outcome (services/agent_runtime_alert_suppression.go): it cannot name
+-- D1-D4 or D7, which fire only on a call that succeeded.
+-- renewals counts the earlier suppressions of the same identity and
+-- detection that came into force (per agent x rule, however requested).
+-- break_glass marks one the workspace's only governance:approve holder
+-- applied alone; it is due a review within 24 hours.
+--
+-- Expand only. Idempotent: safe to run again.
+-- 001_bootstrap.sql carries the same block at its end.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_alert_suppression (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    identity_id     uuid        NOT NULL,
+    detection       text        NOT NULL CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8')),
+    instance_digest text        NOT NULL DEFAULT '' CHECK (length(instance_digest) <= 200),
+    reason          text        NOT NULL CHECK (length(reason) BETWEEN 1 AND 1000),
+    duration_days   integer     NOT NULL CHECK (duration_days BETWEEN 1 AND 90),
+    state           text        NOT NULL CHECK (state IN ('proposed', 'active', 'rejected', 'ended', 'expired')),
+    renewal_of      uuid,
+    renewals        integer     NOT NULL DEFAULT 0 CHECK (renewals >= 0),
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    approved_by     uuid,
+    approved_at     timestamptz,
+    rejected_by     uuid,
+    rejected_at     timestamptz,
+    starts_at       timestamptz,
+    ends_at         timestamptz,
+    ended_by        uuid,
+    ended_at        timestamptz,
+    end_reason      text        NOT NULL DEFAULT '' CHECK (length(end_reason) <= 1000),
+    break_glass     boolean     NOT NULL DEFAULT false,
+    review_due_at   timestamptz,
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, renewal_of) REFERENCES public.agent_alert_suppression (workspace_id, id),
+    CONSTRAINT agent_alert_suppression_sod_chk CHECK (approved_by IS NULL OR approved_by <> requested_by),
+    -- In force means a window, never longer than 90 days.
+    CONSTRAINT agent_alert_suppression_window_chk CHECK (
+        (starts_at IS NULL) = (ends_at IS NULL)
+        AND (ends_at IS NULL OR (ends_at > starts_at AND ends_at <= starts_at + interval '90 days'))),
+    CONSTRAINT agent_alert_suppression_active_chk CHECK (state NOT IN ('active', 'expired') OR starts_at IS NOT NULL),
+    CONSTRAINT agent_alert_suppression_break_glass_chk CHECK (NOT break_glass OR review_due_at IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppression_ws
+    ON public.agent_alert_suppression (workspace_id, requested_at DESC, id DESC);
+-- The sink's lookup: active suppressions of an identity and detection.
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppression_match
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection) WHERE state = 'active';
+-- One request waiting and one suppression in force per scope.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_suppression_proposed
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection, instance_digest) WHERE state = 'proposed';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_suppression_active
+    ON public.agent_alert_suppression (workspace_id, identity_id, detection, instance_digest) WHERE state = 'active';
+
+-- The suppression that kept an alert from being delivered.
+ALTER TABLE public.agent_alert ADD COLUMN IF NOT EXISTS suppressed_by uuid;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_alert_suppressed_by_fkey'
+                      AND conrelid = 'public.agent_alert'::regclass) THEN
+        ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_suppressed_by_fkey
+            FOREIGN KEY (workspace_id, suppressed_by) REFERENCES public.agent_alert_suppression (workspace_id, id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agent_alert_suppressed_by
+    ON public.agent_alert (workspace_id, suppressed_by) WHERE suppressed_by IS NOT NULL;
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_alert_suppression');
+    END IF;
+END $$;
+
+
+-- 167_audit_chain. Kept identical to migrations/master/167_audit_chain.sql.
+
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS record_class text;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS seq bigint;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS prev_hash text;
+ALTER TABLE public.audit_events ADD COLUMN IF NOT EXISTS hash text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'audit_events_record_class_chk'
+                      AND conrelid = 'public.audit_events'::regclass) THEN
+        ALTER TABLE public.audit_events ADD CONSTRAINT audit_events_record_class_chk
+            CHECK (record_class IS NULL OR record_class IN ('admin_change', 'auth', 'access_decision', 'export', 'default'));
+    END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_events_chain
+    ON public.audit_events (workspace_id, seq) WHERE seq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_ws_actor_time
+    ON public.audit_events (workspace_id, user_id, "timestamp");
+CREATE INDEX IF NOT EXISTS idx_audit_events_ws_class_time
+    ON public.audit_events (workspace_id, record_class, "timestamp");
+
+-- One field of the canonical form: NULL is "~", anything else is its byte
+-- length in UTF-8 (whatever the database encoding), a colon and the value
+-- (so no value can imitate a separator).
+CREATE OR REPLACE FUNCTION public.audit_chain_field(v text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN v IS NULL THEN '~' ELSE octet_length(convert_to(v, 'UTF8'))::text || ':' || v END
+$$;
+
+-- The canonical form a link's hash is taken over. internal/auditchain
+-- (Canonical) builds the same string in Go, which is how verification
+-- recomputes hashes without trusting this function.
+CREATE OR REPLACE FUNCTION public.audit_event_canonical(e public.audit_events) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT 'authsec.audit.v1'
+        || '|' || public.audit_chain_field(e.id::text)
+        || '|' || public.audit_chain_field(e.workspace_id)
+        || '|' || public.audit_chain_field(e.seq::text)
+        || '|' || public.audit_chain_field(e.prev_hash)
+        || '|' || public.audit_chain_field(e.record_class)
+        || '|' || public.audit_chain_field(e.request_id)
+        || '|' || public.audit_chain_field(e.actor_realm)
+        || '|' || public.audit_chain_field(e.user_id)
+        || '|' || public.audit_chain_field(e.action)
+        || '|' || public.audit_chain_field(e.resource)
+        || '|' || public.audit_chain_field(e.resource_id)
+        || '|' || public.audit_chain_field(e.method)
+        || '|' || public.audit_chain_field(e.path)
+        || '|' || public.audit_chain_field(e.user_agent)
+        || '|' || public.audit_chain_field(e.client_ip)
+        || '|' || public.audit_chain_field(e.status_code::text)
+        || '|' || public.audit_chain_field(e.duration::text)
+        || '|' || public.audit_chain_field(e.old_values::text)
+        || '|' || public.audit_chain_field(e.new_values::text)
+        || '|' || public.audit_chain_field(e.error)
+        || '|' || public.audit_chain_field(to_char(e."timestamp" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
+$$;
+
+CREATE TABLE IF NOT EXISTS public.audit_chain_anchor (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    chain        text        NOT NULL,
+    day          date        NOT NULL,
+    last_seq     bigint      NOT NULL,
+    head_hash    text        NOT NULL,
+    reason       text        NOT NULL DEFAULT 'daily',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_chain_anchor_seq_chk CHECK (last_seq > 0),
+    CONSTRAINT audit_chain_anchor_hash_chk CHECK (head_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT audit_chain_anchor_reason_chk CHECK (reason IN ('daily', 'purge')),
+    CONSTRAINT audit_chain_anchor_chain_chk CHECK (workspace_id IS NULL OR chain = workspace_id::text),
+    CONSTRAINT uq_audit_chain_anchor UNIQUE (chain, last_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_anchor_ws_day
+    ON public.audit_chain_anchor (workspace_id, day);
+
+CREATE TABLE IF NOT EXISTS public.audit_chain_gap (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    chain        text        NOT NULL,
+    from_seq     bigint      NOT NULL,
+    to_seq       bigint      NOT NULL,
+    prev_hash    text        NOT NULL,
+    last_hash    text        NOT NULL,
+    purge_run    uuid        NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_chain_gap_range_chk CHECK (from_seq >= 1 AND to_seq >= from_seq),
+    CONSTRAINT audit_chain_gap_hash_chk CHECK (prev_hash ~ '^[0-9a-f]{64}$' AND last_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT audit_chain_gap_chain_chk CHECK (workspace_id IS NULL OR chain = workspace_id::text),
+    CONSTRAINT uq_audit_chain_gap UNIQUE (chain, from_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_gap_ws_chain
+    ON public.audit_chain_gap (workspace_id, chain, to_seq);
+
+CREATE TABLE IF NOT EXISTS public.audit_write_failure (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    event        jsonb       NOT NULL,
+    error        text        NOT NULL,
+    attempts     integer     NOT NULL DEFAULT 0,
+    state        text        NOT NULL DEFAULT 'pending',
+    notified_at  timestamptz,
+    replayed_at  timestamptz,
+    replayed_seq bigint,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_write_failure_state_chk CHECK (state IN ('pending', 'replayed', 'dead'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_write_failure_ws_state
+    ON public.audit_write_failure (workspace_id, state, created_at);
+
+COMMENT ON TABLE public.audit_chain_anchor IS
+    'Heads of the audit_events hash chains (daily and before every retention purge); append-only.';
+COMMENT ON TABLE public.audit_chain_gap IS
+    'Runs of audit_events links removed by retention, with the hashes around them; append-only.';
+COMMENT ON TABLE public.audit_write_failure IS
+    'Audit events that could not be written after retries; replayed into the chain by the audit governance job.';
+
+-- The chain: seq, prev_hash and hash are assigned here, never by the writer.
+CREATE OR REPLACE FUNCTION public.audit_events_chain() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    head_seq  bigint;
+    head_hash text;
+    gap_seq   bigint;
+    gap_hash  text;
+BEGIN
+    NEW.workspace_id := COALESCE(NEW.workspace_id, '');
+    IF NEW."timestamp" IS NULL THEN
+        NEW."timestamp" := now();
+    END IF;
+    IF NEW.record_class IS NULL OR NEW.record_class = '' THEN
+        NEW.record_class := 'default';
+    END IF;
+    -- One writer per chain at a time, until its transaction ends.
+    PERFORM pg_advisory_xact_lock(1096107092, hashtext(NEW.workspace_id));
+    SELECT a.seq, a.hash INTO head_seq, head_hash
+      FROM public.audit_events a
+     WHERE a.workspace_id = NEW.workspace_id AND a.seq IS NOT NULL
+     ORDER BY a.seq DESC LIMIT 1;
+    SELECT g.to_seq, g.last_hash INTO gap_seq, gap_hash
+      FROM public.audit_chain_gap g
+     WHERE g.chain = NEW.workspace_id
+     ORDER BY g.to_seq DESC LIMIT 1;
+    IF gap_seq IS NOT NULL AND (head_seq IS NULL OR gap_seq > head_seq) THEN
+        head_seq := gap_seq;
+        head_hash := gap_hash;
+    END IF;
+    NEW.seq := COALESCE(head_seq, 0) + 1;
+    NEW.prev_hash := COALESCE(head_hash, repeat('0', 64));
+    NEW.hash := encode(sha256(convert_to(public.audit_event_canonical(NEW), 'UTF8')), 'hex');
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_chain ON public.audit_events;
+CREATE TRIGGER trg_audit_events_chain
+    BEFORE INSERT ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_chain();
+
+CREATE OR REPLACE FUNCTION public.audit_events_delete_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('authsec.audit_retention', true) = 'on'
+       OR current_setting('authsec.workspace_purge', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'audit_events rows are deleted only by the audit retention job';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_events_delete_guard ON public.audit_events;
+CREATE TRIGGER trg_audit_events_delete_guard
+    BEFORE DELETE ON public.audit_events
+    FOR EACH ROW EXECUTE FUNCTION public.audit_events_delete_guard();
+
+CREATE OR REPLACE FUNCTION public.audit_chain_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' AND current_setting('authsec.workspace_purge', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION '% rows are append-only', TG_TABLE_NAME;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_chain_anchor_immutable ON public.audit_chain_anchor;
+CREATE TRIGGER trg_audit_chain_anchor_immutable
+    BEFORE UPDATE OR DELETE ON public.audit_chain_anchor
+    FOR EACH ROW EXECUTE FUNCTION public.audit_chain_immutable();
+
+DROP TRIGGER IF EXISTS trg_audit_chain_gap_immutable ON public.audit_chain_gap;
+CREATE TRIGGER trg_audit_chain_gap_immutable
+    BEFORE UPDATE OR DELETE ON public.audit_chain_gap
+    FOR EACH ROW EXECUTE FUNCTION public.audit_chain_immutable();
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.audit_chain_anchor');
+        PERFORM public.tenancy_enable_rls('public.audit_chain_gap');
+        PERFORM public.tenancy_enable_rls('public.audit_write_failure');
+    END IF;
+END $$;
+
+-- 168_audit_retention. Kept identical to migrations/master/168_audit_retention.sql.
+
+CREATE TABLE IF NOT EXISTS public.audit_retention_policy (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    record_class text        NOT NULL,
+    retain_days  integer     NOT NULL,
+    updated_by   uuid,
+    change_id    uuid,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT audit_retention_policy_class_chk
+        CHECK (record_class IN ('admin_change', 'auth', 'access_decision', 'export', 'default')),
+    CONSTRAINT audit_retention_policy_days_chk CHECK (retain_days BETWEEN 7 AND 2557),
+    CONSTRAINT audit_retention_policy_pkey PRIMARY KEY (workspace_id, record_class)
+);
+
+CREATE TABLE IF NOT EXISTS public.audit_legal_hold (
+    id                uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    from_ts           timestamptz NOT NULL,
+    to_ts             timestamptz NOT NULL,
+    reason            text        NOT NULL,
+    created_by        uuid        NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    released_at       timestamptz,
+    released_by       uuid,
+    release_change_id uuid,
+    CONSTRAINT audit_legal_hold_window_chk CHECK (to_ts > from_ts),
+    CONSTRAINT audit_legal_hold_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    CONSTRAINT uq_audit_legal_hold_ws_id UNIQUE (workspace_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_legal_hold_live
+    ON public.audit_legal_hold (workspace_id, from_ts, to_ts) WHERE released_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS public.audit_governance_change (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind            text        NOT NULL,
+    target          text        NOT NULL,
+    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    reason          text        NOT NULL,
+    status          text        NOT NULL DEFAULT 'pending',
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at      timestamptz NOT NULL,
+    decided_by      uuid,
+    decided_at      timestamptz,
+    decision_reason text,
+    break_glass     boolean     NOT NULL DEFAULT false,
+    review_due_at   timestamptz,
+    reviewed_by     uuid,
+    reviewed_at     timestamptz,
+    CONSTRAINT audit_governance_change_kind_chk
+        CHECK (kind IN ('retention_shorten', 'legal_hold_release', 'operator_unsuspend')),
+    CONSTRAINT audit_governance_change_status_chk
+        CHECK (status IN ('pending', 'applied', 'rejected', 'withdrawn', 'expired')),
+    CONSTRAINT audit_governance_change_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    -- Separation of duties: nobody approves or rejects their own request;
+    -- only break-glass applies alone, and then someone else reviews it.
+    CONSTRAINT audit_governance_change_second_person_chk
+        CHECK (decided_by IS NULL OR break_glass OR status = 'withdrawn' OR decided_by <> requested_by),
+    CONSTRAINT audit_governance_change_break_glass_chk CHECK (NOT break_glass OR review_due_at IS NOT NULL),
+    CONSTRAINT audit_governance_change_reviewer_chk CHECK (reviewed_by IS NULL OR reviewed_by <> requested_by),
+    CONSTRAINT uq_audit_governance_change_ws_id UNIQUE (workspace_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_governance_change_pending
+    ON public.audit_governance_change (workspace_id, kind, target) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_audit_governance_change_ws_status
+    ON public.audit_governance_change (workspace_id, status, requested_at);
+
+COMMENT ON TABLE public.audit_retention_policy IS
+    'Audit retention per workspace and record class (days); missing rows use the built-in defaults.';
+COMMENT ON TABLE public.audit_legal_hold IS
+    'Windows of audit_events the retention job must keep while the hold is live.';
+COMMENT ON TABLE public.audit_governance_change IS
+    'Tier-3 audit governance changes (shorter retention, hold release, unsuspend) awaiting or applied by a second person.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.audit_retention_policy');
+        PERFORM public.tenancy_enable_rls('public.audit_legal_hold');
+        PERFORM public.tenancy_enable_rls('public.audit_governance_change');
+    END IF;
+END $$;
+
+-- 169_operator_governance. Kept identical to migrations/master/169_operator_governance.sql.
+
+CREATE TABLE IF NOT EXISTS public.operator_activity_hour (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id      text        NOT NULL,
+    hour         timestamptz NOT NULL,
+    writes       integer     NOT NULL DEFAULT 0,
+    elevated     integer     NOT NULL DEFAULT 0,
+    exports      integer     NOT NULL DEFAULT 0,
+    computed_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operator_activity_hour_counts_chk CHECK (writes >= 0 AND elevated >= 0 AND exports >= 0),
+    CONSTRAINT operator_activity_hour_pkey PRIMARY KEY (workspace_id, user_id, hour)
+);
+
+CREATE TABLE IF NOT EXISTS public.operator_alert (
+    id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id      text        NOT NULL,
+    hour         timestamptz NOT NULL,
+    metric       text        NOT NULL,
+    observed     integer     NOT NULL,
+    baseline_p95 numeric     NOT NULL,
+    threshold    integer     NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operator_alert_metric_chk CHECK (metric IN ('writes', 'elevated', 'exports')),
+    CONSTRAINT uq_operator_alert UNIQUE (workspace_id, user_id, hour, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_operator_alert_ws_time
+    ON public.operator_alert (workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.operator_suspension (
+    id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id        uuid        NOT NULL,
+    mechanism      text        NOT NULL,
+    membership_id  uuid,
+    reason         text        NOT NULL,
+    suspended_by   uuid        NOT NULL,
+    suspended_at   timestamptz NOT NULL DEFAULT now(),
+    lifted_at      timestamptz,
+    lifted_by      uuid,
+    lift_change_id uuid,
+    CONSTRAINT operator_suspension_mechanism_chk CHECK (mechanism IN ('membership', 'user')),
+    CONSTRAINT operator_suspension_reason_chk CHECK (length(btrim(reason)) BETWEEN 1 AND 1000),
+    CONSTRAINT operator_suspension_self_chk CHECK (suspended_by <> user_id),
+    CONSTRAINT uq_operator_suspension_ws_id UNIQUE (workspace_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_suspension_live
+    ON public.operator_suspension (workspace_id, user_id) WHERE lifted_at IS NULL;
+
+COMMENT ON TABLE public.operator_activity_hour IS
+    'Hourly console writes, elevated (tier 2/3) writes and exports per operator, from audit_events.';
+COMMENT ON TABLE public.operator_alert IS
+    'Hours in which an operator exceeded their baseline (max(10, 3 x trailing 14-day p95)).';
+COMMENT ON TABLE public.operator_suspension IS
+    'Operators suspended in a workspace (governance:emergency); lifted by a second person.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.operator_activity_hour');
+        PERFORM public.tenancy_enable_rls('public.operator_alert');
+        PERFORM public.tenancy_enable_rls('public.operator_suspension');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 170: agent runtime evidence store and coverage.
+-- Same objects as migrations/master/170_agent_evidence_coverage.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_evidence_event (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- The event id's namespace: CloudTrail ids are unique per AWS, Azure
+    -- record ids per Azure, audit ids per cluster.
+    provider         text        NOT NULL CHECK (provider IN ('aws', 'azure', 'k8s', 'gateway')),
+    -- The path that delivered the event first.
+    source           text        NOT NULL CHECK (source IN ('aws_stream', 'cloudtrail_poll', 'trail_backfill',
+                                                            'azure_diag', 'k8s_audit', 'gateway', 'other')),
+    event_id         text        NOT NULL CHECK (length(event_id) BETWEEN 1 AND 256),
+    connector_id     uuid,
+    event_time       timestamptz NOT NULL,
+    received_at      timestamptz NOT NULL DEFAULT now(),
+    -- received_at - event_time, in milliseconds (a negative value is a clock
+    -- ahead of ours).
+    skew_ms          bigint      NOT NULL DEFAULT 0,
+    -- The attributed principal (an assumed role's role ARN, an IAM user's
+    -- ARN, an Entra object id, a Kubernetes user name) and its kind.
+    principal        text        NOT NULL DEFAULT '' CHECK (length(principal) <= 2048),
+    principal_kind   text        NOT NULL DEFAULT '' CHECK (length(principal_kind) <= 64),
+    -- The caller as the record states it (an assumed-role session ARN).
+    principal_detail text        NOT NULL DEFAULT '' CHECK (length(principal_detail) <= 2048),
+    account_id       text        NOT NULL DEFAULT '' CHECK (length(account_id) <= 256),
+    region           text        NOT NULL DEFAULT '' CHECK (length(region) <= 64),
+    event_source     text        NOT NULL DEFAULT '' CHECK (length(event_source) <= 256),
+    event_name       text        NOT NULL DEFAULT '' CHECK (length(event_name) <= 256),
+    outcome          text        NOT NULL DEFAULT 'success' CHECK (outcome IN ('success', 'denied', 'error')),
+    raw_hash         text        NOT NULL CHECK (raw_hash ~ '^[0-9a-f]{64}$'),
+    body             jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (pg_column_size(body) <= 16384),
+    record_class     text        NOT NULL DEFAULT 'default' CHECK (record_class IN ('default', 'elevated', 'regulated')),
+    pin_count        integer     NOT NULL DEFAULT 0 CHECK (pin_count >= 0),
+    UNIQUE (workspace_id, id),
+    CONSTRAINT agent_evidence_event_dedupe_key UNIQUE (workspace_id, provider, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_event_ws_time
+    ON public.agent_evidence_event (workspace_id, event_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_event_ws_principal
+    ON public.agent_evidence_event (workspace_id, principal, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_event_ws_source
+    ON public.agent_evidence_event (workspace_id, source, event_time DESC);
+-- The retention purge reads unpinned rows by class and receipt.
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_event_retention
+    ON public.agent_evidence_event (workspace_id, record_class, received_at) WHERE pin_count = 0;
+
+CREATE TABLE IF NOT EXISTS public.agent_evidence_retention (
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    record_class   text        NOT NULL CHECK (record_class IN ('default', 'elevated', 'regulated')),
+    retention_days integer     NOT NULL CHECK (retention_days BETWEEN 30 AND 3650),
+    updated_by     uuid,
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, record_class)
+);
+
+CREATE TABLE IF NOT EXISTS public.source_heartbeat (
+    id                     uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id           uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    source_kind            text        NOT NULL CHECK (source_kind IN ('aws_stream', 'cloudtrail_poll', 'trail_backfill',
+                                                                       'azure_diag', 'k8s_audit', 'gateway', 'other')),
+    -- e.g. "connector/<id>" (a stream), "connector/<id>/region/<r>" (a poll).
+    source_ref             text        NOT NULL CHECK (length(source_ref) BETWEEN 1 AND 300),
+    connector_id           uuid,
+    last_event_at          timestamptz,
+    last_received_at       timestamptz,
+    -- The longest gap between events expected in normal operation
+    -- (informational; NULL = unknown).
+    expected_floor_seconds integer     CHECK (expected_floor_seconds IS NULL OR expected_floor_seconds > 0),
+    -- Silent once nothing arrived for this long; NULL = never judged silent
+    -- (a source delivered only when someone runs a scan).
+    silent_after_seconds   integer     CHECK (silent_after_seconds IS NULL OR silent_after_seconds > 0),
+    state                  text        NOT NULL DEFAULT 'ok' CHECK (state IN ('ok', 'silent')),
+    silent_since           timestamptz,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    CONSTRAINT source_heartbeat_source_key UNIQUE (workspace_id, source_kind, source_ref),
+    CONSTRAINT source_heartbeat_silent_chk CHECK ((state = 'silent') = (silent_since IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_source_heartbeat_ws_connector
+    ON public.source_heartbeat (workspace_id, connector_id);
+
+CREATE TABLE IF NOT EXISTS public.agent_capability_state (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- An AWS account id, an Azure tenant id, a cluster (discovery source id),
+    -- or 'workspace'.
+    estate_scope    text        NOT NULL CHECK (length(estate_scope) BETWEEN 1 AND 256),
+    scope_kind      text        NOT NULL CHECK (scope_kind IN ('account', 'tenant', 'subscription', 'cluster', 'workspace')),
+    connector_id    uuid,
+    capability      text        NOT NULL CHECK (capability IN ('C1','C2','C3','C4','C5','C6','C7','C8','C9','C10','C11','C12','C13')),
+    state           text        NOT NULL CHECK (state IN ('on', 'partial', 'off')),
+    gap_kind        text        NOT NULL DEFAULT 'none' CHECK (gap_kind IN ('none', 'declared', 'broken')),
+    since           timestamptz NOT NULL DEFAULT now(),
+    detail          text        NOT NULL DEFAULT '' CHECK (length(detail) <= 2000),
+    fallback        text        NOT NULL DEFAULT '' CHECK (length(fallback) <= 2000),
+    declared_by     uuid,
+    declared_at     timestamptz,
+    declared_reason text        NOT NULL DEFAULT '' CHECK (length(declared_reason) <= 2000),
+    computed_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    CONSTRAINT agent_capability_state_scope_key UNIQUE (workspace_id, estate_scope, capability),
+    CONSTRAINT agent_capability_state_gap_chk CHECK ((state = 'on') = (gap_kind = 'none'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_capability_state_ws_cap
+    ON public.agent_capability_state (workspace_id, capability);
+
+CREATE TABLE IF NOT EXISTS public.agent_capability_declaration (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    capability_state_id uuid     NOT NULL,
+    reason           text        NOT NULL CHECK (length(btrim(reason)) BETWEEN 1 AND 2000),
+    requested_by     uuid        NOT NULL,
+    requested_at     timestamptz NOT NULL DEFAULT now(),
+    state            text        NOT NULL DEFAULT 'pending'
+                                 CHECK (state IN ('pending', 'applied', 'rejected', 'withdrawn')),
+    decided_by       uuid,
+    decided_at       timestamptz,
+    decision_reason  text        NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 2000),
+    -- Applied alone: the workspace had one approver (decision 4).
+    break_glass      boolean     NOT NULL DEFAULT false,
+    review_due_at    timestamptz,
+    reviewed_by      uuid,
+    reviewed_at      timestamptz,
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, capability_state_id)
+        REFERENCES public.agent_capability_state (workspace_id, id) ON DELETE CASCADE,
+    -- Separation: a second person decides, except break-glass.
+    CONSTRAINT agent_capability_declaration_separation_chk
+        CHECK (decided_by IS NULL OR break_glass OR decided_by <> requested_by),
+    CONSTRAINT agent_capability_declaration_break_glass_chk
+        CHECK (NOT break_glass OR (state = 'applied' AND review_due_at IS NOT NULL)),
+    CONSTRAINT agent_capability_declaration_decided_chk
+        CHECK ((state = 'pending') = (decided_at IS NULL))
+);
+-- One open request per capability state.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_capability_declaration_pending
+    ON public.agent_capability_declaration (workspace_id, capability_state_id) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_agent_capability_declaration_ws
+    ON public.agent_capability_declaration (workspace_id, requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.agent_ingest_secret (
+    connector_id     uuid        NOT NULL,
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind             text        NOT NULL CHECK (kind IN ('azure_diag')),
+    secret_hash      text        NOT NULL CHECK (secret_hash ~ '^[0-9a-f]{64}$'),
+    secret_prefix    text        NOT NULL,
+    created_by       text        NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    rotated_at       timestamptz,
+    revoked_at       timestamptz,
+    last_received_at timestamptz,
+    received_count   bigint      NOT NULL DEFAULT 0,
+    rejected_count   bigint      NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, connector_id, kind),
+    CONSTRAINT agent_ingest_secret_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE
+);
+-- The ingest's credential lookup.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_ingest_secret_hash
+    ON public.agent_ingest_secret (secret_hash);
+
+CREATE TABLE IF NOT EXISTS public.agent_trail_backfill (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id  uuid        NOT NULL,
+    window_from   timestamptz NOT NULL,
+    window_to     timestamptz NOT NULL,
+    cause         text        NOT NULL CHECK (cause IN ('manual', 'gap')),
+    -- For cause 'gap': the heartbeat whose silence it fills.
+    heartbeat_id  uuid,
+    state         text        NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed')),
+    requested_by  uuid,
+    objects_read  integer     NOT NULL DEFAULT 0,
+    events_read   integer     NOT NULL DEFAULT 0,
+    partial       boolean     NOT NULL DEFAULT false,
+    last_error    text        NOT NULL DEFAULT '' CHECK (length(last_error) <= 2000),
+    leased_until  timestamptz,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    UNIQUE (workspace_id, id),
+    CONSTRAINT agent_trail_backfill_window_chk CHECK (window_to > window_from)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_trail_backfill_ws
+    ON public.agent_trail_backfill (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_trail_backfill_due
+    ON public.agent_trail_backfill (created_at) WHERE state IN ('queued', 'running');
+-- One automatic backfill per heartbeat silence.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_trail_backfill_gap
+    ON public.agent_trail_backfill (workspace_id, heartbeat_id, window_from) WHERE cause = 'gap';
+
+-- Coverage alerts (COV-01) are agent_alert rows: the detection id and the
+-- subject label 'source' are admitted, and a source has at most one alert
+-- that is not resolved. For COV-01, identity_id holds the source_heartbeat id.
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_detection_chk
+    CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8','COV-01'));
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_subject_label_chk
+    CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent', 'source'));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_coverage_open
+    ON public.agent_alert (workspace_id, dedupe_key) WHERE detection = 'COV-01' AND state <> 'resolved';
+
+COMMENT ON TABLE public.agent_evidence_event IS
+    'Agent runtime evidence: every normalised event of a connected account (all principals), redacted, deduplicated per provider event id; retention by record class, pinned rows kept.';
+COMMENT ON TABLE public.source_heartbeat IS
+    'Per delivering source: last event and receipt, silence threshold and state (COV-01 coverage alerts).';
+COMMENT ON TABLE public.agent_capability_state IS
+    'Coverage: capability C1..C13 per estate scope (on|partial|off), broken or declared gap, detail and fallback.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_evidence_event');
+        PERFORM public.tenancy_enable_rls('public.agent_evidence_retention');
+        PERFORM public.tenancy_enable_rls('public.source_heartbeat');
+        PERFORM public.tenancy_enable_rls('public.agent_capability_state');
+        PERFORM public.tenancy_enable_rls('public.agent_capability_declaration');
+        PERFORM public.tenancy_enable_rls('public.agent_ingest_secret');
+        PERFORM public.tenancy_enable_rls('public.agent_trail_backfill');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 177: one agent id (agent, agent_alias, purpose, risk class, pending changes).
+-- Same objects as migrations/master/177_agent_identity.sql (the backfill has
+-- nothing to read on a fresh database and is left out).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    display_name    text        NOT NULL DEFAULT '',
+    -- Where the agent was first seen (cloud_workload, k8s_webhook, agentkit,
+    -- iga, ...). Descriptive only.
+    kind            text        NOT NULL DEFAULT 'unknown',
+    state           text        NOT NULL DEFAULT 'active',
+    ended_reason    text        NOT NULL DEFAULT '',
+    -- The person who ended it; NULL for deleted_at_source (a pass, no actor).
+    ended_by        uuid,
+    ended_at        timestamptz,
+    merged_into     uuid,
+    -- Transferred: to whom (a team, a business unit), as the decider wrote it.
+    transferred_to  text        NOT NULL DEFAULT '',
+    -- Decision 1 keeps a responder group per estate scope; these let a named
+    -- owner or sponsor replace the group later without a schema change.
+    owner_user_id   uuid,
+    sponsor_user_id uuid,
+    version         bigint      NOT NULL DEFAULT 1,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_merged_fkey FOREIGN KEY (workspace_id, merged_into)
+        REFERENCES public.agent (workspace_id, id),
+    CONSTRAINT agent_state_chk CHECK (state IN
+        ('active', 'retired', 'merged', 'transferred', 'deleted_at_source', 'not_an_agent')),
+    CONSTRAINT agent_merged_chk CHECK ((state = 'merged') = (merged_into IS NOT NULL)),
+    CONSTRAINT agent_merged_self_chk CHECK (merged_into IS NULL OR merged_into <> id),
+    CONSTRAINT agent_ended_chk CHECK ((state = 'active') = (ended_at IS NULL)),
+    CONSTRAINT agent_ended_reason_chk CHECK (state = 'active' OR ended_reason <> ''),
+    CONSTRAINT agent_transferred_chk CHECK (state <> 'transferred' OR transferred_to <> ''),
+    CONSTRAINT agent_kind_chk CHECK (kind <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ws_state ON public.agent (workspace_id, state, created_at DESC, id);
+
+CREATE TABLE IF NOT EXISTS public.agent_alias (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    agent_id     uuid        NOT NULL,
+    source_table text        NOT NULL,
+    -- text: Agent Kit recogniser ids and client ids are not uuids.
+    source_id    text        NOT NULL,
+    -- 'system' (projection, sweep), 'backfill' (this migration) or a user id.
+    linked_by    text        NOT NULL DEFAULT 'system',
+    linked_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_alias_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_alias_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_alias_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_alias_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_alias_source_key UNIQUE (workspace_id, source_table, source_id),
+    CONSTRAINT agent_alias_source_chk CHECK (source_table IN
+        ('iga_workload', 'discovered_agents', 'iga_agents', 'agentkit', 'resource_servers', 'mcp_oauth_clients')),
+    CONSTRAINT agent_alias_source_id_chk CHECK (source_id <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_alias_agent ON public.agent_alias (workspace_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS public.agent_purpose_version (
+    id               uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL,
+    agent_id         uuid        NOT NULL,
+    version          integer     NOT NULL,
+    purpose          text        NOT NULL,
+    assessor_user_id uuid        NOT NULL,
+    assessed_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_purpose_version_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_purpose_version_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_purpose_version_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_purpose_version_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_purpose_version_key UNIQUE (workspace_id, agent_id, version),
+    CONSTRAINT agent_purpose_version_chk CHECK (version > 0),
+    CONSTRAINT agent_purpose_text_chk CHECK (length(purpose) BETWEEN 1 AND 2000)
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_risk_class (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    agent_id            uuid        NOT NULL,
+    version             integer     NOT NULL,
+    risk_class          text        NOT NULL,
+    -- What the class obliges ("human oversight", "logging"): a JSON array of
+    -- strings, as the assessor wrote them.
+    obligations         jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    reason              text        NOT NULL,
+    assessor_user_id    uuid        NOT NULL,
+    -- Set when the version lowered the class: the second person.
+    approved_by_user_id uuid,
+    pending_change_id   uuid,
+    assessed_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_risk_class_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_risk_class_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_risk_class_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_risk_class_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_risk_class_key UNIQUE (workspace_id, agent_id, version),
+    CONSTRAINT agent_risk_class_version_chk CHECK (version > 0),
+    CONSTRAINT agent_risk_class_chk CHECK (risk_class IN ('minimal', 'limited', 'high', 'prohibited')),
+    CONSTRAINT agent_risk_class_obligations_chk CHECK (jsonb_typeof(obligations) = 'array'),
+    CONSTRAINT agent_risk_class_reason_chk CHECK (reason <> ''),
+    CONSTRAINT agent_risk_class_second_person_chk CHECK
+        (approved_by_user_id IS NULL OR approved_by_user_id <> assessor_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_pending_change (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    kind            text        NOT NULL,
+    subject_id      uuid        NOT NULL,
+    -- The change as requested (the new class and obligations, or the new
+    -- classification); applied verbatim by the approver.
+    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    reason          text        NOT NULL,
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    state           text        NOT NULL DEFAULT 'pending',
+    decided_by      uuid,
+    decided_at      timestamptz,
+    decision_reason text        NOT NULL DEFAULT '',
+    CONSTRAINT agent_pending_change_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_pending_change_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_pending_change_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_pending_change_kind_chk CHECK (kind IN
+        ('agent_risk_class_lower', 'resource_classification_lower')),
+    CONSTRAINT agent_pending_change_state_chk CHECK (state IN ('pending', 'applied', 'rejected', 'withdrawn')),
+    CONSTRAINT agent_pending_change_reason_chk CHECK (reason <> ''),
+    CONSTRAINT agent_pending_change_decided_chk CHECK ((state = 'pending') = (decided_at IS NULL)),
+    -- Separation (decision 4): the requester never applies or rejects their own
+    -- change; withdrawing it is theirs.
+    CONSTRAINT agent_pending_change_second_person_chk CHECK
+        (state NOT IN ('applied', 'rejected') OR decided_by <> requested_by),
+    CONSTRAINT agent_pending_change_withdraw_chk CHECK
+        (state <> 'withdrawn' OR decided_by = requested_by)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_pending_change_list
+    ON public.agent_pending_change (workspace_id, state, requested_at DESC, id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_pending_change_open
+    ON public.agent_pending_change (workspace_id, kind, subject_id) WHERE state = 'pending';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent');
+        PERFORM public.tenancy_enable_rls('public.agent_alias');
+        PERFORM public.tenancy_enable_rls('public.agent_purpose_version');
+        PERFORM public.tenancy_enable_rls('public.agent_risk_class');
+        PERFORM public.tenancy_enable_rls('public.agent_pending_change');
+    END IF;
+END $$;
+
+-- agent_identity_link links the workspace's unlinked source rows (all of them,
+-- or one: p_table/p_id) and returns how many aliases it wrote. SECURITY
+-- INVOKER: under the request's row-level security it sees only p_ws's rows.
+CREATE OR REPLACE FUNCTION public.agent_identity_link(p_ws uuid, p_table text DEFAULT NULL, p_id text DEFAULT NULL)
+RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE
+    n   integer := 0;
+    r   record;
+    aid uuid;
+BEGIN
+    IF p_ws IS NULL THEN
+        RAISE EXCEPTION 'agent_identity_link: workspace is required';
+    END IF;
+
+    -- 1. Workloads the graph calls an agent.
+    IF p_table IS NULL OR p_table = 'iga_workload' THEN
+        FOR r IN
+            SELECT w.id::text AS sid, w.display_name, w.provider
+              FROM public.iga_workload w
+             WHERE w.workspace_id = p_ws
+               AND w.classification IN ('provider_native_agent', 'classified_agent')
+               AND (p_id IS NULL OR w.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'iga_workload' AND a.source_id = w.id::text)
+             ORDER BY w.created_at, w.id
+        LOOP
+            INSERT INTO public.agent (workspace_id, display_name, kind)
+                 VALUES (p_ws, r.display_name, r.provider || '_workload') RETURNING id INTO aid;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'iga_workload', r.sid);
+            n := n + 1;
+        END LOOP;
+    END IF;
+
+    -- 2. Sightings.
+    IF p_table IS NULL OR p_table = 'discovered_agents' THEN
+        FOR r IN
+            SELECT d.id::text AS sid, d.display_name, d.source, d.matched_client_id,
+                   (SELECT a.agent_id FROM public.agent_alias a
+                     WHERE a.workspace_id = p_ws AND a.source_table = 'iga_workload'
+                       AND a.source_id = d.metadata->>'iga_workload_id') AS via_workload,
+                   (SELECT a.agent_id FROM public.discovered_agent_iga_links l
+                      JOIN public.agent_alias a ON a.workspace_id = l.workspace_id
+                       AND a.source_table = 'iga_agents' AND a.source_id = l.iga_agent_id::text
+                     WHERE l.workspace_id = p_ws AND l.discovered_agent_id = d.id AND l.state = 'accepted'
+                     LIMIT 1) AS via_link
+              FROM public.discovered_agents d
+             WHERE d.workspace_id = p_ws
+               AND (p_id IS NULL OR d.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'discovered_agents' AND a.source_id = d.id::text)
+             ORDER BY d.first_seen_at, d.id
+        LOOP
+            aid := COALESCE(r.via_workload, r.via_link);
+            IF aid IS NULL THEN
+                INSERT INTO public.agent (workspace_id, display_name, kind)
+                     VALUES (p_ws, r.display_name,
+                             CASE WHEN r.source = 'vm_sensor' THEN 'agentkit' ELSE COALESCE(NULLIF(r.source, ''), 'discovered') END)
+                  RETURNING id INTO aid;
+            END IF;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'discovered_agents', r.sid);
+            n := n + 1;
+            IF r.matched_client_id IS NOT NULL THEN
+                INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                     VALUES (p_ws, aid, 'mcp_oauth_clients', r.matched_client_id::text)
+                ON CONFLICT (workspace_id, source_table, source_id) DO NOTHING;
+            END IF;
+        END LOOP;
+    END IF;
+
+    -- 3. Logical agents of the IGA estate.
+    IF p_table IS NULL OR p_table = 'iga_agents' THEN
+        FOR r IN
+            SELECT g.id::text AS sid, g.display_name,
+                   (SELECT a.agent_id FROM public.discovered_agent_iga_links l
+                      JOIN public.agent_alias a ON a.workspace_id = l.workspace_id
+                       AND a.source_table = 'discovered_agents' AND a.source_id = l.discovered_agent_id::text
+                     WHERE l.workspace_id = p_ws AND l.iga_agent_id = g.id AND l.state = 'accepted'
+                     LIMIT 1) AS via_link
+              FROM public.iga_agents g
+             WHERE g.workspace_id = p_ws
+               AND (p_id IS NULL OR g.id::text = p_id)
+               AND NOT EXISTS (SELECT 1 FROM public.agent_alias a
+                                WHERE a.workspace_id = p_ws AND a.source_table = 'iga_agents' AND a.source_id = g.id::text)
+             ORDER BY g.created_at, g.id
+        LOOP
+            aid := r.via_link;
+            IF aid IS NULL THEN
+                INSERT INTO public.agent (workspace_id, display_name, kind)
+                     VALUES (p_ws, r.display_name, 'iga') RETURNING id INTO aid;
+            END IF;
+            INSERT INTO public.agent_alias (workspace_id, agent_id, source_table, source_id)
+                 VALUES (p_ws, aid, 'iga_agents', r.sid);
+            n := n + 1;
+        END LOOP;
+    END IF;
+    RETURN n;
+END;
+$$;
+
+
+-- ============================================================================
+-- 178: same objects as migrations/master/178_agent_instances.sql.
+-- ============================================================================
+
+ALTER TABLE public.iga_agent_instances ALTER COLUMN agent_id DROP NOT NULL;
+ALTER TABLE public.iga_agent_instances
+    ADD COLUMN IF NOT EXISTS agent_ref         uuid,
+    ADD COLUMN IF NOT EXISTS source_table      text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS source_id         text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS artifact_digest   text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS artifact_version  text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS model             text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS model_version     text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS environment       text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS deployer          text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS spawned_by        text        NOT NULL DEFAULT '',
+    -- The cloud identity the instance acts as (AWS), so hygiene can read its
+    -- calls (cloud_usage) without re-deriving the workload.
+    ADD COLUMN IF NOT EXISTS cloud_identity_id uuid;
+
+DO $$
+BEGIN
+    ALTER TABLE public.iga_agent_instances DROP CONSTRAINT IF EXISTS iga_agent_instances_agent_ref_fkey;
+    ALTER TABLE public.iga_agent_instances ADD CONSTRAINT iga_agent_instances_agent_ref_fkey
+        FOREIGN KEY (workspace_id, agent_ref) REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE;
+    ALTER TABLE public.iga_agent_instances DROP CONSTRAINT IF EXISTS iga_agent_instances_owner_chk;
+    ALTER TABLE public.iga_agent_instances ADD CONSTRAINT iga_agent_instances_owner_chk
+        CHECK (agent_id IS NOT NULL OR agent_ref IS NOT NULL);
+END $$;
+
+-- One row per agent, workload and artifact: a new digest is a new instance.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_agent_instances_ref
+    ON public.iga_agent_instances (workspace_id, agent_ref, native_workload_id, artifact_digest)
+    WHERE agent_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_agent_instances_ref
+    ON public.iga_agent_instances (workspace_id, agent_ref, last_seen_at DESC)
+    WHERE agent_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_deployer (
+    id            uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL,
+    agent_id      uuid        NOT NULL,
+    deployer      text        NOT NULL,
+    -- 'first_instance' (recorded from the agent's first instance) or a user id.
+    recorded_by   text        NOT NULL DEFAULT 'first_instance',
+    recorded_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_deployer_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_deployer_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_deployer_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_deployer_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_deployer_key UNIQUE (workspace_id, agent_id, deployer),
+    CONSTRAINT agent_deployer_chk CHECK (deployer <> '')
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_hygiene_finding (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    kind         text        NOT NULL,
+    -- Stable across runs: the agent id, the access key id (an identifier,
+    -- never material), or agent id + deployer.
+    subject_key  text        NOT NULL,
+    agent_id     uuid,
+    subject      jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    evidence     jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    state        text        NOT NULL DEFAULT 'open',
+    first_seen   timestamptz NOT NULL DEFAULT now(),
+    last_seen    timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    CONSTRAINT agent_hygiene_finding_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_hygiene_finding_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_hygiene_finding_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_hygiene_finding_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.agent (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_hygiene_finding_subject_key UNIQUE (workspace_id, kind, subject_key),
+    CONSTRAINT agent_hygiene_finding_kind_chk CHECK (kind IN ('stale_agent', 'overdue_key', 'unknown_deployer')),
+    CONSTRAINT agent_hygiene_finding_state_chk CHECK (state IN ('open', 'resolved')),
+    CONSTRAINT agent_hygiene_finding_resolved_chk CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
+    CONSTRAINT agent_hygiene_finding_subject_chk CHECK (subject_key <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_hygiene_finding_list
+    ON public.agent_hygiene_finding (workspace_id, state, kind, last_seen DESC, id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_deployer');
+        PERFORM public.tenancy_enable_rls('public.agent_hygiene_finding');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 179: same objects as migrations/master/179_resource_classification.sql.
+-- ============================================================================
+
+ALTER TABLE public.cloud_resource
+    ADD COLUMN IF NOT EXISTS crown_jewel   boolean     NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS data_category text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS residency     text        NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classified_by uuid,
+    ADD COLUMN IF NOT EXISTS classified_at timestamptz;
+
+DO $$
+BEGIN
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_data_category_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_data_category_chk
+        CHECK (length(data_category) <= 64);
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_residency_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_residency_chk
+        CHECK (length(residency) <= 64);
+    ALTER TABLE public.cloud_resource DROP CONSTRAINT IF EXISTS cloud_resource_classified_chk;
+    ALTER TABLE public.cloud_resource ADD CONSTRAINT cloud_resource_classified_chk
+        CHECK ((classified_by IS NULL) = (classified_at IS NULL));
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_cloud_resource_crown_jewel
+    ON public.cloud_resource (workspace_id, id) WHERE crown_jewel;
+
+-- ============================================================================
+-- 180: same objects as migrations/master/180_directory_person.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.directory_person (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    user_id             uuid,
+    source              text        NOT NULL,
+    external_id         text        NOT NULL,
+    email               text        NOT NULL DEFAULT '',
+    display_name        text        NOT NULL DEFAULT '',
+    -- The manager as the directory names them (its id there), and the
+    -- manager's own row once it is known.
+    manager_external_id text        NOT NULL DEFAULT '',
+    manager_person_id   uuid,
+    status              text        NOT NULL DEFAULT 'active',
+    contractor          boolean     NOT NULL DEFAULT false,
+    employee_type       text        NOT NULL DEFAULT '',
+    leave_from          timestamptz,
+    leave_to            timestamptz,
+    left_at             timestamptz,
+    synced_at           timestamptz NOT NULL DEFAULT now(),
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT directory_person_pkey PRIMARY KEY (id),
+    CONSTRAINT directory_person_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT directory_person_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT directory_person_user_fkey FOREIGN KEY (user_id)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT directory_person_manager_fkey FOREIGN KEY (workspace_id, manager_person_id)
+        REFERENCES public.directory_person (workspace_id, id) ON DELETE SET NULL (manager_person_id),
+    CONSTRAINT directory_person_external_key UNIQUE (workspace_id, source, external_id),
+    CONSTRAINT directory_person_source_chk CHECK (source IN ('scim', 'entra', 'okta')),
+    CONSTRAINT directory_person_external_chk CHECK (external_id <> ''),
+    CONSTRAINT directory_person_status_chk CHECK (status IN ('active', 'leave', 'left')),
+    CONSTRAINT directory_person_left_chk CHECK ((status = 'left') = (left_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_directory_person_user
+    ON public.directory_person (workspace_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_directory_person_status
+    ON public.directory_person (workspace_id, status, id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.directory_person');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 181: same objects as migrations/master/181_responder_groups.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.responder_group (
+    id            uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL,
+    name          text        NOT NULL,
+    description   text        NOT NULL DEFAULT '',
+    is_default    boolean     NOT NULL DEFAULT false,
+    owner_user_id uuid,
+    created_by    uuid,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT responder_group_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_name_key UNIQUE (workspace_id, name),
+    CONSTRAINT responder_group_name_chk CHECK (length(name) BETWEEN 1 AND 200)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_responder_group_default
+    ON public.responder_group (workspace_id) WHERE is_default;
+
+CREATE TABLE IF NOT EXISTS public.responder_group_member (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    group_id        uuid        NOT NULL,
+    user_id         uuid        NOT NULL,
+    role            text        NOT NULL DEFAULT 'member',
+    state           text        NOT NULL DEFAULT 'candidate',
+    assigned_by     uuid,
+    assigned_at     timestamptz NOT NULL DEFAULT now(),
+    accepted_at     timestamptz,
+    delegated_to    uuid,
+    delegated_until timestamptz,
+    CONSTRAINT responder_group_member_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_member_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_member_group_fkey FOREIGN KEY (workspace_id, group_id)
+        REFERENCES public.responder_group (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_user_fkey FOREIGN KEY (user_id)
+        REFERENCES public.users(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_member_key UNIQUE (workspace_id, group_id, user_id),
+    CONSTRAINT responder_group_member_role_chk CHECK (role IN ('member', 'lead')),
+    CONSTRAINT responder_group_member_state_chk CHECK (state IN ('candidate', 'accepted')),
+    CONSTRAINT responder_group_member_accepted_chk CHECK ((state = 'accepted') = (accepted_at IS NOT NULL)),
+    CONSTRAINT responder_group_member_delegation_chk CHECK ((delegated_to IS NULL) = (delegated_until IS NULL)),
+    CONSTRAINT responder_group_member_delegate_self_chk CHECK (delegated_to IS NULL OR delegated_to <> user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_responder_group_member_user
+    ON public.responder_group_member (workspace_id, user_id);
+
+CREATE TABLE IF NOT EXISTS public.responder_group_scope (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    group_id     uuid        NOT NULL,
+    scope_kind   text        NOT NULL,
+    -- The account id, subscription id, cluster's discovery source id, agent
+    -- id or iga_estate_scopes id, as text.
+    scope_ref    text        NOT NULL,
+    created_by   uuid,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT responder_group_scope_pkey PRIMARY KEY (id),
+    CONSTRAINT responder_group_scope_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT responder_group_scope_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT responder_group_scope_group_fkey FOREIGN KEY (workspace_id, group_id)
+        REFERENCES public.responder_group (workspace_id, id) ON DELETE CASCADE,
+    -- One group decides for a scope.
+    CONSTRAINT responder_group_scope_key UNIQUE (workspace_id, scope_kind, scope_ref),
+    CONSTRAINT responder_group_scope_kind_chk CHECK (scope_kind IN
+        ('account', 'subscription', 'cluster', 'agent', 'estate_scope')),
+    CONSTRAINT responder_group_scope_ref_chk CHECK (scope_ref <> '')
+);
+CREATE INDEX IF NOT EXISTS idx_responder_group_scope_group
+    ON public.responder_group_scope (workspace_id, group_id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.responder_group');
+        PERFORM public.tenancy_enable_rls('public.responder_group_member');
+        PERFORM public.tenancy_enable_rls('public.responder_group_scope');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 186: agent runtime cases (agent_case, agent_case_alert, agent_case_link,
+-- agent_case_note, agent_case_evidence, idx_iga_gov_event_case).
+-- Same objects as migrations/master/186_agent_cases.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.agent_case (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    number           integer     NOT NULL CHECK (number > 0),
+    title            text        NOT NULL CHECK (btrim(title) <> '' AND char_length(title) <= 300),
+    severity         text        NOT NULL CHECK (severity IN ('high', 'medium', 'low')),
+    state            text        NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'closed')),
+    outcome          text        CHECK (outcome IN ('true_positive', 'benign', 'false_positive', 'duplicate')),
+    assignee_user_id uuid,
+    -- The first time a person set the severity or the outcome.
+    classified_at    timestamptz,
+    classified_by    uuid,
+    exercise_id      uuid,
+    opened_by        text        NOT NULL CHECK (opened_by = 'system'
+                                 OR opened_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+    opened_at        timestamptz NOT NULL DEFAULT now(),
+    closed_by        uuid,
+    closed_at        timestamptz,
+    close_reason     text        NOT NULL DEFAULT '' CHECK (char_length(close_reason) <= 1000),
+    reopened_count   integer     NOT NULL DEFAULT 0 CHECK (reopened_count >= 0),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    UNIQUE (workspace_id, number),
+    CONSTRAINT agent_case_closed_chk CHECK ((state = 'closed') = (outcome IS NOT NULL AND closed_at IS NOT NULL AND closed_by IS NOT NULL)),
+    CONSTRAINT agent_case_classified_chk CHECK ((classified_at IS NULL) = (classified_by IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_case_ws_opened
+    ON public.agent_case (workspace_id, opened_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_case_ws_state
+    ON public.agent_case (workspace_id, state, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_case_ws_assignee
+    ON public.agent_case (workspace_id, assignee_user_id) WHERE assignee_user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_case_alert (
+    workspace_id uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    case_id      uuid        NOT NULL,
+    alert_id     uuid        NOT NULL,
+    indicators   text[]      NOT NULL DEFAULT '{}',
+    added_by     text        NOT NULL CHECK (added_by = 'system'
+                             OR added_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+    added_at     timestamptz NOT NULL DEFAULT now(),
+    -- One case per alert.
+    PRIMARY KEY (workspace_id, alert_id),
+    FOREIGN KEY (workspace_id, case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, alert_id) REFERENCES public.agent_alert (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_case_alert_case
+    ON public.agent_case_alert (workspace_id, case_id);
+CREATE INDEX IF NOT EXISTS idx_agent_case_alert_indicators
+    ON public.agent_case_alert USING gin (indicators);
+
+CREATE TABLE IF NOT EXISTS public.agent_case_link (
+    id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id  uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    case_id       uuid        NOT NULL,
+    other_case_id uuid        NOT NULL,
+    relation      text        NOT NULL CHECK (relation IN ('duplicate_of', 'related', 'split_from')),
+    created_by    text        NOT NULL CHECK (created_by = 'system'
+                              OR created_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    UNIQUE (workspace_id, case_id, other_case_id, relation),
+    CONSTRAINT agent_case_link_self_chk CHECK (case_id <> other_case_id),
+    FOREIGN KEY (workspace_id, case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, other_case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_case_link_other
+    ON public.agent_case_link (workspace_id, other_case_id);
+
+CREATE TABLE IF NOT EXISTS public.agent_case_note (
+    id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    case_id        uuid        NOT NULL,
+    author_user_id uuid        NOT NULL,
+    body           text        NOT NULL CHECK (btrim(body) <> '' AND char_length(body) <= 10000),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_case_note_case
+    ON public.agent_case_note (workspace_id, case_id, created_at);
+
+CREATE OR REPLACE FUNCTION public.agent_case_note_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' AND current_setting('authsec.workspace_purge', true) = 'on' THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'agent_case_note is append-only';
+END $$;
+DROP TRIGGER IF EXISTS agent_case_note_no_update ON public.agent_case_note;
+CREATE TRIGGER agent_case_note_no_update BEFORE UPDATE OR DELETE ON public.agent_case_note
+  FOR EACH ROW EXECUTE FUNCTION public.agent_case_note_immutable();
+
+-- pins agent_evidence_event (W1) by (source,event_id); pin_count maintained after merge
+CREATE TABLE IF NOT EXISTS public.agent_case_evidence (
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    case_id         uuid        NOT NULL,
+    source          text        NOT NULL CHECK (source <> '' AND char_length(source) <= 64),
+    event_id        text        NOT NULL CHECK (event_id <> '' AND char_length(event_id) <= 256),
+    -- The alert whose evidence reference this pin copies (no foreign key:
+    -- the pin outlives the alert's retention).
+    alert_id        uuid,
+    alert_event_ref jsonb,
+    pinned_by       text        NOT NULL CHECK (pinned_by = 'system'
+                                OR pinned_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+    pinned_at       timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_case_evidence_pin
+    ON public.agent_case_evidence (workspace_id, case_id, source, event_id, COALESCE(alert_id, '00000000-0000-0000-0000-000000000000'::uuid));
+CREATE INDEX IF NOT EXISTS idx_agent_case_evidence_alert
+    ON public.agent_case_evidence (workspace_id, alert_id) WHERE alert_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_case_evidence_event
+    ON public.agent_case_evidence (workspace_id, source, event_id);
+
+-- The case timeline (iga_gov_event rows naming a case).
+CREATE INDEX IF NOT EXISTS idx_iga_gov_event_case
+    ON public.iga_gov_event (workspace_id, (payload->>'case_id'), id) WHERE (payload->>'case_id') IS NOT NULL;
+
+COMMENT ON TABLE public.agent_case IS
+    'Agent runtime cases: alerts grouped into one incident; every change is logged in iga_gov_event (payload case_id).';
+
+-- Required for every workspace table; guarded as in 150.
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_case');
+        PERFORM public.tenancy_enable_rls('public.agent_case_alert');
+        PERFORM public.tenancy_enable_rls('public.agent_case_link');
+        PERFORM public.tenancy_enable_rls('public.agent_case_note');
+        PERFORM public.tenancy_enable_rls('public.agent_case_evidence');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 193: agent containment proof states, stop levels, target, narrowed_from.
+-- Same objects as migrations/master/193_agent_containment_proof_levels.sql.
+-- ============================================================================
+
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS proof_state text NOT NULL DEFAULT 'requested';
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS proven_by_event_id text;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS skew_ms bigint;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS token_expiry_at timestamptz;
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS target text NOT NULL DEFAULT '';
+ALTER TABLE public.agent_containment ADD COLUMN IF NOT EXISTS narrowed_from uuid;
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_proof_state_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_proof_state_check
+  CHECK (proof_state IN ('requested','applied','proven','unproven','cannot_verify','kept'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_level_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_level_check
+  CHECK (level IN ('workload','identity','model','key','sessions_before','chain','source_identity',
+                   'entra','kubernetes','gateway','platform'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_identity_kind_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_identity_kind_check
+  CHECK (identity_kind IN ('iam_role','iam_user','entra_service_principal','entra_agent_identity',
+                           'k8s_service_account','gateway_agent','platform_principal'));
+
+ALTER TABLE public.agent_containment DROP CONSTRAINT IF EXISTS agent_containment_state_check;
+ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_state_check
+  CHECK (state IN ('previewed','requested','containing','contained','partially_contained','failed','releasing','released'));
+
+ALTER TABLE public.agent_containment_step DROP CONSTRAINT IF EXISTS agent_containment_step_kind_check;
+ALTER TABLE public.agent_containment_step ADD CONSTRAINT agent_containment_step_kind_check
+  CHECK (kind IN ('lambda_concurrency','ecs_desired','ecs_autoscaling','iam_policy','session_revoke','access_key',
+                  'assumer_policy','entra_account','azure_role_assignment','k8s_binding_subject'));
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_containment_narrowed_from_fkey'
+                     AND conrelid = 'public.agent_containment'::regclass) THEN
+        ALTER TABLE public.agent_containment ADD CONSTRAINT agent_containment_narrowed_from_fkey
+          FOREIGN KEY (workspace_id, narrowed_from) REFERENCES public.agent_containment (workspace_id, id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agent_containment_narrowed_from ON public.agent_containment (workspace_id, narrowed_from)
+  WHERE narrowed_from IS NOT NULL;
+
+-- One live containment per (workspace, identity, level, target).
+DROP INDEX IF EXISTS public.uq_agent_containment_live;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_live ON public.agent_containment (workspace_id, identity_id, level, target)
+  WHERE state IN ('previewed','requested','containing','contained','partially_contained','releasing');
+
+-- Backfill the proof columns of the rows written before 193.
+UPDATE public.agent_containment c SET
+  proof_state = CASE
+    WHEN c.state IN ('previewed','requested','containing','failed') THEN 'requested'
+    WHEN c.state = 'released' AND (c.pending_restore_at IS NOT NULL OR EXISTS (
+           SELECT 1 FROM public.agent_containment_step s
+            WHERE s.workspace_id = c.workspace_id AND s.containment_id = c.id
+              AND s.kind = 'access_key' AND s.after->>'rotate_required' = 'true')) THEN 'kept'
+    WHEN c.verified_at IS NOT NULL AND c.effective IS TRUE THEN 'proven'
+    WHEN c.effective IS FALSE THEN 'unproven'
+    WHEN c.verification->'unverifiable'->>'final' = 'true' THEN 'cannot_verify'
+    WHEN c.verification ? 'unverifiable' THEN 'unproven'
+    WHEN c.state = 'released' THEN 'unproven'
+    ELSE 'applied' END,
+  proven_by_event_id = NULLIF(c.verification->'proof'->>'event_id', ''),
+  token_expiry_at = CASE
+    WHEN c.level IN ('identity','model') AND c.identity_kind = 'iam_role'
+      THEN date_trunc('second', c.created_at) + interval '13 hours'
+    WHEN c.level IN ('identity','model') AND c.identity_kind = 'iam_user'
+      THEN date_trunc('second', c.created_at) + interval '36 hours'
+    ELSE NULL END
+WHERE c.proof_state = 'requested' AND c.proven_by_event_id IS NULL AND c.token_expiry_at IS NULL;
+
+-- ============================================================================
+-- 194: containment holds and release requests (second person).
+-- Same objects as migrations/master/194_agent_containment_holds.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_containment_release_request (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id  uuid NOT NULL,
+  -- NULL: release of a containment no case holds.
+  case_id         uuid,
+  reason          text NOT NULL CHECK (btrim(reason) <> ''),
+  state           text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','approved','rejected','withdrawn')),
+  requested_by    uuid NOT NULL REFERENCES users(id),
+  requested_at    timestamptz NOT NULL DEFAULT now(),
+  decided_by      uuid REFERENCES users(id),
+  decided_at      timestamptz,
+  decision_reason text NOT NULL DEFAULT '',
+  break_glass     boolean NOT NULL DEFAULT false,
+  review_due_at   timestamptz,
+  reviewed_by     uuid REFERENCES users(id),
+  reviewed_at     timestamptz,
+  review_note     text NOT NULL DEFAULT '',
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE,
+  CONSTRAINT agent_containment_release_request_second_person_chk
+    CHECK (decided_by IS NULL OR break_glass OR decided_by <> requested_by),
+  CONSTRAINT agent_containment_release_request_review_chk
+    CHECK (reviewed_by IS NULL OR reviewed_by <> requested_by),
+  CONSTRAINT agent_containment_release_request_break_glass_chk
+    CHECK (NOT break_glass OR review_due_at IS NOT NULL),
+  CONSTRAINT agent_containment_release_request_decided_chk
+    CHECK ((state = 'pending') = (decided_at IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_release_request_pending
+  ON agent_containment_release_request (workspace_id, containment_id, (coalesce(case_id, '00000000-0000-0000-0000-000000000000'::uuid)))
+  WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_agent_containment_release_request_state
+  ON agent_containment_release_request (workspace_id, state, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_containment_release_request_review
+  ON agent_containment_release_request (workspace_id, review_due_at)
+  WHERE break_glass AND reviewed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS agent_containment_hold (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id       uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  containment_id     uuid NOT NULL,
+  case_id            uuid NOT NULL, -- FK to agent_case added when W3 merges
+  state              text NOT NULL DEFAULT 'active' CHECK (state IN ('active','released')),
+  held_by            uuid NOT NULL REFERENCES users(id),
+  held_at            timestamptz NOT NULL DEFAULT now(),
+  released_by        uuid REFERENCES users(id),
+  released_at        timestamptz,
+  release_reason     text NOT NULL DEFAULT '',
+  release_request_id uuid,
+  UNIQUE (workspace_id, id),
+  FOREIGN KEY (workspace_id, containment_id) REFERENCES agent_containment (workspace_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, release_request_id) REFERENCES agent_containment_release_request (workspace_id, id),
+  CONSTRAINT agent_containment_hold_released_chk CHECK ((state = 'released') = (released_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_containment_hold_active
+  ON agent_containment_hold (workspace_id, containment_id, case_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_containment_hold_case ON agent_containment_hold (workspace_id, case_id);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_containment_release_request');
+        PERFORM public.tenancy_enable_rls('public.agent_containment_hold');
+    END IF;
+END $$;
+
+-- 200: same objects as migrations/master/200_iga_snapshot.sql.
+
+CREATE TABLE IF NOT EXISTS public.iga_snapshot (
+    id               uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    snapshot_date    date        NOT NULL,
+    kind             text        NOT NULL CHECK (kind IN ('inventory', 'policy_text', 'reach', 'metric_value', 'metric_definition', 'rule_version')),
+    stable_id        text        NOT NULL CHECK (stable_id <> '' AND length(stable_id) <= 300),
+    hash             text        NOT NULL CHECK (hash ~ '^[0-9a-f]{64}$'),
+    body             jsonb       NOT NULL,
+    absent           boolean     NOT NULL DEFAULT false,
+    legal_hold       boolean     NOT NULL DEFAULT false,
+    redacted         boolean     NOT NULL DEFAULT false,
+    redacted_at      timestamptz,
+    redacted_by      uuid,
+    redaction_reason text        NOT NULL DEFAULT '' CHECK (length(redaction_reason) <= 1000),
+    prev_chain_hash  text        NOT NULL DEFAULT '' CHECK (prev_chain_hash = '' OR prev_chain_hash ~ '^[0-9a-f]{64}$'),
+    chain_hash       text        NOT NULL CHECK (chain_hash ~ '^[0-9a-f]{64}$'),
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_snapshot_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_snapshot_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT iga_snapshot_day_stable_key UNIQUE (workspace_id, snapshot_date, kind, stable_id),
+    CONSTRAINT iga_snapshot_redacted_chk CHECK (redacted = (redacted_at IS NOT NULL)),
+    CONSTRAINT iga_snapshot_redaction_reason_chk CHECK (NOT redacted OR btrim(redaction_reason) <> '')
+);
+-- As-of reads: the latest row of a stable id at or before a date.
+CREATE INDEX IF NOT EXISTS idx_iga_snapshot_asof
+    ON public.iga_snapshot (workspace_id, kind, stable_id, snapshot_date DESC);
+CREATE INDEX IF NOT EXISTS idx_iga_snapshot_ws_date
+    ON public.iga_snapshot (workspace_id, snapshot_date);
+
+CREATE TABLE IF NOT EXISTS public.iga_snapshot_day (
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    snapshot_date   date        NOT NULL,
+    kinds           jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    rows_written    integer     NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
+    content_hash    text        NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+    prev_chain_hash text        NOT NULL DEFAULT '' CHECK (prev_chain_hash = '' OR prev_chain_hash ~ '^[0-9a-f]{64}$'),
+    chain_hash      text        NOT NULL CHECK (chain_hash ~ '^[0-9a-f]{64}$'),
+    purged          boolean     NOT NULL DEFAULT false,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_snapshot_day_pkey PRIMARY KEY (workspace_id, snapshot_date)
+);
+
+CREATE TABLE IF NOT EXISTS public.iga_snapshot_hold (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    from_date           date        NOT NULL,
+    to_date             date        NOT NULL,
+    kinds               text[]      NOT NULL,
+    reason              text        NOT NULL CHECK (btrim(reason) <> '' AND length(reason) <= 1000),
+    placed_by           uuid        NOT NULL,
+    placed_at           timestamptz NOT NULL DEFAULT now(),
+    released_at         timestamptz,
+    released_by         uuid,
+    release_approval_id uuid,
+    CONSTRAINT iga_snapshot_hold_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_snapshot_hold_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT iga_snapshot_hold_range_chk CHECK (from_date <= to_date),
+    CONSTRAINT iga_snapshot_hold_kinds_chk CHECK (cardinality(kinds) >= 1 AND kinds <@ ARRAY['inventory', 'policy_text', 'reach', 'metric_value', 'metric_definition', 'rule_version']::text[]),
+    CONSTRAINT iga_snapshot_hold_released_chk CHECK ((released_at IS NULL) = (released_by IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_iga_snapshot_hold_ws_live
+    ON public.iga_snapshot_hold (workspace_id, from_date) WHERE released_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS public.iga_snapshot_setting (
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    retention_days integer     NOT NULL DEFAULT 400 CHECK (retention_days BETWEEN 30 AND 3650),
+    updated_by     uuid,
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_snapshot_setting_pkey PRIMARY KEY (workspace_id)
+);
+
+COMMENT ON TABLE public.iga_snapshot IS
+    'Daily history snapshots by stable id (inventory, policy text, reach, metric values and definitions, rule versions); deduplicated by hash, chained, append-only except legal hold and redaction.';
+
+CREATE OR REPLACE FUNCTION public.iga_snapshot_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF current_setting('authsec.snapshot_purge', true) = 'on'
+           OR current_setting('authsec.workspace_purge', true) = 'on' THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'iga_snapshot rows are removed only by retention';
+    END IF;
+    IF NEW.workspace_id IS DISTINCT FROM OLD.workspace_id OR NEW.snapshot_date IS DISTINCT FROM OLD.snapshot_date
+       OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.stable_id IS DISTINCT FROM OLD.stable_id
+       OR NEW.hash IS DISTINCT FROM OLD.hash OR NEW.absent IS DISTINCT FROM OLD.absent
+       OR NEW.prev_chain_hash IS DISTINCT FROM OLD.prev_chain_hash OR NEW.chain_hash IS DISTINCT FROM OLD.chain_hash
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'iga_snapshot % is immutable: only legal_hold and redaction change', OLD.id;
+    END IF;
+    IF OLD.redacted AND (NOT NEW.redacted OR NEW.body IS DISTINCT FROM OLD.body
+                         OR NEW.redacted_at IS DISTINCT FROM OLD.redacted_at
+                         OR NEW.redacted_by IS DISTINCT FROM OLD.redacted_by
+                         OR NEW.redaction_reason IS DISTINCT FROM OLD.redaction_reason) THEN
+        RAISE EXCEPTION 'iga_snapshot % is redacted; a redaction is final', OLD.id;
+    END IF;
+    IF NOT NEW.redacted AND NEW.body IS DISTINCT FROM OLD.body THEN
+        RAISE EXCEPTION 'iga_snapshot % body changes only by redaction', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_iga_snapshot_guard ON public.iga_snapshot;
+CREATE TRIGGER trg_iga_snapshot_guard
+    BEFORE UPDATE OR DELETE ON public.iga_snapshot
+    FOR EACH ROW EXECUTE FUNCTION public.iga_snapshot_guard();
+
+CREATE OR REPLACE FUNCTION public.iga_snapshot_day_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF current_setting('authsec.workspace_purge', true) = 'on' THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'iga_snapshot_day rows are append-only';
+    END IF;
+    IF NEW.workspace_id IS DISTINCT FROM OLD.workspace_id OR NEW.snapshot_date IS DISTINCT FROM OLD.snapshot_date
+       OR NEW.kinds IS DISTINCT FROM OLD.kinds OR NEW.rows_written IS DISTINCT FROM OLD.rows_written
+       OR NEW.content_hash IS DISTINCT FROM OLD.content_hash OR NEW.prev_chain_hash IS DISTINCT FROM OLD.prev_chain_hash
+       OR NEW.chain_hash IS DISTINCT FROM OLD.chain_hash OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR (OLD.purged AND NOT NEW.purged) THEN
+        RAISE EXCEPTION 'iga_snapshot_day is append-only: only purged may be set';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_iga_snapshot_day_guard ON public.iga_snapshot_day;
+CREATE TRIGGER trg_iga_snapshot_day_guard
+    BEFORE UPDATE OR DELETE ON public.iga_snapshot_day
+    FOR EACH ROW EXECUTE FUNCTION public.iga_snapshot_day_guard();
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.iga_snapshot');
+        PERFORM public.tenancy_enable_rls('public.iga_snapshot_day');
+        PERFORM public.tenancy_enable_rls('public.iga_snapshot_hold');
+        PERFORM public.tenancy_enable_rls('public.iga_snapshot_setting');
+    END IF;
+END $$;
+
+-- 201: same objects as migrations/master/201_iga_history_approval.sql.
+
+CREATE TABLE IF NOT EXISTS public.iga_history_approval (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    action          text        NOT NULL CHECK (action IN ('hold_release', 'snapshot_redact', 'bulk_export')),
+    subject_id      uuid,
+    params          jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    params_hash     text        NOT NULL CHECK (params_hash ~ '^[0-9a-f]{64}$'),
+    reason          text        NOT NULL CHECK (btrim(reason) <> '' AND length(reason) <= 1000),
+    requested_by    uuid        NOT NULL,
+    requested_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at      timestamptz NOT NULL,
+    state           text        NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'applied', 'rejected', 'withdrawn', 'expired', 'failed')),
+    break_glass     boolean     NOT NULL DEFAULT false,
+    decided_by      uuid,
+    decided_at      timestamptz,
+    decision_reason text        NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 1000),
+    review_due_at   timestamptz,
+    reviewed_by     uuid,
+    reviewed_at     timestamptz,
+    review_note     text        NOT NULL DEFAULT '' CHECK (length(review_note) <= 1000),
+    result          jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT iga_history_approval_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_history_approval_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT iga_history_approval_decided_chk CHECK ((state = 'pending') = (decided_at IS NULL)),
+    -- A second person decides, unless the change was a break-glass one.
+    CONSTRAINT iga_history_approval_second_person_chk CHECK (break_glass OR decided_by IS NULL OR decided_by <> requested_by),
+    CONSTRAINT iga_history_approval_break_glass_chk CHECK (NOT break_glass OR (review_due_at IS NOT NULL AND decided_by = requested_by)),
+    CONSTRAINT iga_history_approval_review_chk CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by)),
+    CONSTRAINT iga_history_approval_subject_chk CHECK ((action = 'bulk_export') = (subject_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_iga_history_approval_ws_state
+    ON public.iga_history_approval (workspace_id, state, requested_at DESC);
+-- One open request per subject and action.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_history_approval_pending
+    ON public.iga_history_approval (workspace_id, action, subject_id) WHERE state = 'pending' AND subject_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.iga_export (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    approval_id        uuid        NOT NULL,
+    requested_by       uuid        NOT NULL,
+    params             jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    sha256             text        NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    size_bytes         bigint      NOT NULL CHECK (size_bytes >= 0),
+    item_count         integer     NOT NULL CHECK (item_count >= 0),
+    content            bytea,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    expires_at         timestamptz NOT NULL,
+    download_count     integer     NOT NULL DEFAULT 0 CHECK (download_count >= 0),
+    last_downloaded_at timestamptz,
+    CONSTRAINT iga_export_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_export_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT iga_export_approval_key UNIQUE (workspace_id, approval_id),
+    CONSTRAINT iga_export_approval_fkey FOREIGN KEY (workspace_id, approval_id)
+        REFERENCES public.iga_history_approval (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_iga_export_ws_created
+    ON public.iga_export (workspace_id, created_at DESC);
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.iga_history_approval');
+        PERFORM public.tenancy_enable_rls('public.iga_export');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 230: remediation (cloud_remediation_binding, agent_remediation,
+-- agent_remediation_step). Same objects as migrations/master/230_agent_remediation.sql.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_remediation_binding (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id     uuid        NOT NULL,
+    provider         text        NOT NULL DEFAULT 'aws' CHECK (provider IN ('aws', 'azure', 'k8s')),
+    -- The AWS account id, the Azure subscription id or the cluster id.
+    account_ref      text        NOT NULL CHECK (btrim(account_ref) <> '' AND length(account_ref) <= 256),
+    role_arn         text        NOT NULL DEFAULT '' CHECK (length(role_arn) <= 2048),
+    -- Vault path of the remediation ExternalId; never the value.
+    auth_ref         text        NOT NULL DEFAULT '' CHECK (length(auth_ref) <= 512),
+    template_version text        NOT NULL DEFAULT '' CHECK (length(template_version) <= 64),
+    state            text        NOT NULL DEFAULT 'pending'
+                     CHECK (state IN ('pending', 'verified', 'error', 'revoked')),
+    last_error       text        NOT NULL DEFAULT '' CHECK (length(last_error) <= 2000),
+    consented_by     uuid        NOT NULL,
+    verified_at      timestamptz,
+    revoked_at       timestamptz,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT cloud_remediation_binding_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT cloud_remediation_binding_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT cloud_remediation_binding_verified_chk CHECK (state <> 'verified' OR (verified_at IS NOT NULL AND role_arn <> '')),
+    CONSTRAINT cloud_remediation_binding_revoked_chk CHECK ((state = 'revoked') = (revoked_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_remediation_binding_live
+    ON public.cloud_remediation_binding (workspace_id, connector_id) WHERE state <> 'revoked';
+CREATE INDEX IF NOT EXISTS idx_cloud_remediation_binding_ws
+    ON public.cloud_remediation_binding (workspace_id, state);
+
+CREATE TABLE IF NOT EXISTS public.agent_remediation (
+    id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind             text        NOT NULL CHECK (kind IN ('remove_grant', 'rotate_secret', 'rotate_iam_key',
+                                                          'rotate_provider_key', 'retire_agent', 'revert_snapshot')),
+    -- The target: its provider, what it is and its ARN or id, as requested.
+    target_provider  text        NOT NULL CHECK (target_provider IN ('aws', 'azure', 'k8s', 'model_provider', 'authsec')),
+    target_kind      text        NOT NULL CHECK (target_kind ~ '^[a-z_]{1,64}$'),
+    target_ref       text        NOT NULL CHECK (btrim(target_ref) <> '' AND length(target_ref) <= 2048),
+    -- The request's own details (policy ARN, inline name, statement sid,
+    -- key id, handover secret, snapshot stable id and date, ...). Never a
+    -- secret value.
+    target_detail    jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(target_detail) = 'object'),
+    connector_id     uuid,
+    agent_id         uuid,
+    case_id          uuid,
+    state            text        NOT NULL DEFAULT 'draft'
+                     CHECK (state IN ('draft', 'prepared', 'awaiting_approval', 'applying', 'applied', 'proven',
+                                      'failed', 'pr_open', 'pr_merged', 'pr_closed', 'cancelled')),
+    state_reason     text        NOT NULL DEFAULT '' CHECK (length(state_reason) <= 2000),
+    mode             text        NOT NULL CHECK (mode IN ('write', 'prepared', 'iac_pr')),
+    -- Why this mode (no remediation role, managed by CloudFormation stack X,
+    -- the provider cannot create keys, ...).
+    mode_reason      text        NOT NULL DEFAULT '' CHECK (length(mode_reason) <= 2000),
+    reason           text        NOT NULL CHECK (btrim(reason) <> '' AND length(reason) <= 2000),
+    requested_by     uuid        NOT NULL,
+    approved_by      uuid,
+    pending_change_id uuid,
+    break_glass      boolean     NOT NULL DEFAULT false,
+    collateral       jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(collateral) = 'object'),
+    -- The exact change (API calls, JSON documents, CLI commands) for a
+    -- person or a pipeline to run; kept in every mode.
+    prepared         jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(prepared) = 'object'),
+    -- IaC detection (CloudFormation stack, Terraform hints) of the target.
+    iac              jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(iac) = 'object'),
+    proof            jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(proof) = 'object'),
+    error            text        NOT NULL DEFAULT '' CHECK (length(error) <= 2000),
+    -- RoleSessionName of the remediation session (write mode): what the
+    -- change event's caller must name.
+    session_name     text        NOT NULL DEFAULT '' CHECK (length(session_name) <= 64),
+    plan_hash        text        NOT NULL DEFAULT '' CHECK (plan_hash = '' OR plan_hash ~ '^[0-9a-f]{64}$'),
+    -- Pull request (mode iac_pr).
+    iac_source_id    uuid,
+    pr_number        integer,
+    pr_url           text        NOT NULL DEFAULT '' CHECK (length(pr_url) <= 2048),
+    pr_branch        text        NOT NULL DEFAULT '' CHECK (length(pr_branch) <= 256),
+    pr_state         text        NOT NULL DEFAULT '' CHECK (pr_state IN ('', 'open', 'merged', 'closed')),
+    pr_count         integer     NOT NULL DEFAULT 0 CHECK (pr_count >= 0),
+    -- Every ask raised for this remediation (code owners, a provider
+    -- console step), as the ask creator returned its references.
+    asks             jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(asks) = 'array'),
+    apply_requested_at timestamptz,
+    applied_at       timestamptz,
+    proven_at        timestamptz,
+    cancelled_at     timestamptz,
+    cancelled_by     uuid,
+    -- The executor's claim (one run at a time; a crashed run's claim lapses).
+    lease_until      timestamptz,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_remediation_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_remediation_proven_chk CHECK ((state = 'proven') = (proven_at IS NOT NULL)),
+    CONSTRAINT agent_remediation_cancelled_chk CHECK ((state = 'cancelled') = (cancelled_at IS NOT NULL)),
+    CONSTRAINT agent_remediation_second_person_chk CHECK (approved_by IS NULL OR approved_by <> requested_by),
+    CONSTRAINT agent_remediation_pr_chk CHECK ((pr_state = '') = (pr_number IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_remediation_ws_state
+    ON public.agent_remediation (workspace_id, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_remediation_ws_case
+    ON public.agent_remediation (workspace_id, case_id) WHERE case_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_remediation_ws_target
+    ON public.agent_remediation (workspace_id, target_ref);
+-- One open remediation of a kind per target.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_remediation_open
+    ON public.agent_remediation (workspace_id, kind, target_ref)
+    WHERE state IN ('draft', 'prepared', 'awaiting_approval', 'applying', 'pr_open', 'pr_closed');
+-- The worker's sweep: deferred steps due, pull requests to sync.
+CREATE INDEX IF NOT EXISTS idx_agent_remediation_open
+    ON public.agent_remediation (state) WHERE state IN ('applying', 'applied', 'pr_open', 'pr_merged');
+
+CREATE TABLE IF NOT EXISTS public.agent_remediation_step (
+    id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    remediation_id uuid        NOT NULL,
+    seq            integer     NOT NULL CHECK (seq > 0),
+    op             text        NOT NULL CHECK (op ~ '^[a-z_]{1,64}$'),
+    target         text        NOT NULL CHECK (btrim(target) <> '' AND length(target) <= 2048),
+    -- The provider call (CloudTrail eventSource / eventName) whose record
+    -- proves the write; '' for a step AuthSec records itself.
+    event_source   text        NOT NULL DEFAULT '' CHECK (length(event_source) <= 256),
+    event_name     text        NOT NULL DEFAULT '' CHECK (length(event_name) <= 256),
+    before         jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(before) = 'object'),
+    after          jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(after) = 'object'),
+    readback       jsonb       NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(readback) = 'object'),
+    state          text        NOT NULL DEFAULT 'pending'
+                   CHECK (state IN ('pending', 'waiting', 'applied', 'skipped', 'failed', 'asked')),
+    error          text        NOT NULL DEFAULT '' CHECK (length(error) <= 2000),
+    -- A deferred step (deactivate the old key after its grace) is due then.
+    due_at         timestamptz,
+    applied_at     timestamptz,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_remediation_step_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_remediation_step_seq_key UNIQUE (workspace_id, remediation_id, seq),
+    CONSTRAINT agent_remediation_step_remediation_fkey FOREIGN KEY (workspace_id, remediation_id)
+        REFERENCES public.agent_remediation (workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_remediation_step_due
+    ON public.agent_remediation_step (due_at) WHERE state = 'waiting';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.cloud_remediation_binding');
+        PERFORM public.tenancy_enable_rls('public.agent_remediation');
+        PERFORM public.tenancy_enable_rls('public.agent_remediation_step');
+    END IF;
+END $$;
+
+-- 220_agent_asks.sql: asks and their delivery (SecOps W4).
+CREATE TABLE IF NOT EXISTS public.agent_ask (
+    id                       uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id             uuid        NOT NULL,
+    about_kind               text        NOT NULL,
+    about_id                 text        NOT NULL,
+    -- The agent the decider was resolved through (W7's agent table), when any.
+    agent_id                 uuid,
+    case_id                  uuid,
+    question                 text        NOT NULL,
+    -- [{"id": "...", "label": "..."}], 2..10 entries.
+    choices                  jsonb       NOT NULL,
+    severity                 text        NOT NULL,
+    -- The tier (SPEC P3) of what an answer decides; tier 2+ answered from
+    -- Slack waits for the same person's console confirmation.
+    tier                     smallint    NOT NULL DEFAULT 1,
+    role                     text        NOT NULL DEFAULT 'responder',
+    decider_group_id         uuid,
+    decider_user_id          uuid,
+    -- The people who could decide at the current step when it began.
+    deciders                 uuid[]      NOT NULL DEFAULT '{}',
+    resolved_via             text        NOT NULL DEFAULT '',
+    path                     jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    step                     integer     NOT NULL DEFAULT 0,
+    excluded_user_ids        uuid[]      NOT NULL DEFAULT '{}',
+    requester_user_id        uuid,
+    due_at                   timestamptz NOT NULL,
+    due_source               text        NOT NULL,
+    external_deadline_at     timestamptz,
+    external_deadline_source text        NOT NULL DEFAULT '',
+    hours_per_step           integer     NOT NULL,
+    state                    text        NOT NULL DEFAULT 'open',
+    overdue                  boolean     NOT NULL DEFAULT false,
+    overdue_at               timestamptz,
+    pending_choice           text,
+    pending_by               uuid,
+    pending_at               timestamptz,
+    answer_choice            text,
+    answered_by              uuid,
+    answered_at              timestamptz,
+    answer_channel           text,
+    answer_note              text        NOT NULL DEFAULT '',
+    withdrawn_by             uuid,
+    withdrawn_at             timestamptz,
+    withdraw_reason          text        NOT NULL DEFAULT '',
+    created_by_kind          text        NOT NULL DEFAULT 'user',
+    created_by               uuid,
+    -- A system ask's identity (one open ask per key).
+    dedupe_key               text,
+    context                  jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    created_at               timestamptz NOT NULL DEFAULT now(),
+    updated_at               timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_ask_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_ask_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_ask_case_fkey FOREIGN KEY (workspace_id, case_id)
+        REFERENCES public.agent_case (workspace_id, id) ON DELETE SET NULL (case_id),
+    CONSTRAINT agent_ask_group_fkey FOREIGN KEY (workspace_id, decider_group_id)
+        REFERENCES public.responder_group (workspace_id, id) ON DELETE SET NULL (decider_group_id),
+    CONSTRAINT agent_ask_about_kind_chk CHECK (about_kind IN
+        ('agent', 'alert', 'key', 'case', 'containment', 'remediation', 'gateway_call')),
+    CONSTRAINT agent_ask_about_id_chk CHECK (about_id <> '' AND char_length(about_id) <= 512),
+    CONSTRAINT agent_ask_question_chk CHECK (btrim(question) <> '' AND char_length(question) <= 2000),
+    CONSTRAINT agent_ask_choices_chk CHECK (jsonb_typeof(choices) = 'array' AND jsonb_array_length(choices) BETWEEN 2 AND 10),
+    CONSTRAINT agent_ask_severity_chk CHECK (severity IN ('high', 'medium', 'low')),
+    CONSTRAINT agent_ask_tier_chk CHECK (tier BETWEEN 0 AND 4),
+    CONSTRAINT agent_ask_role_chk CHECK (role IN ('owner', 'responder', 'code_owner', 'approver')),
+    CONSTRAINT agent_ask_path_chk CHECK (jsonb_typeof(path) = 'array'),
+    CONSTRAINT agent_ask_step_chk CHECK (step >= 0),
+    CONSTRAINT agent_ask_hours_chk CHECK (hours_per_step BETWEEN 1 AND 168),
+    CONSTRAINT agent_ask_state_chk CHECK (state IN ('open', 'pending_step_up', 'answered', 'withdrawn', 'expired')),
+    CONSTRAINT agent_ask_due_source_chk CHECK (due_source IN ('policy', 'external_deadline')),
+    CONSTRAINT agent_ask_external_chk CHECK ((external_deadline_at IS NULL) = (external_deadline_source = '')),
+    CONSTRAINT agent_ask_overdue_chk CHECK (overdue = (overdue_at IS NOT NULL)),
+    CONSTRAINT agent_ask_pending_chk CHECK ((state = 'pending_step_up')
+        = (pending_choice IS NOT NULL AND pending_by IS NOT NULL AND pending_at IS NOT NULL)),
+    CONSTRAINT agent_ask_answered_chk CHECK ((state = 'answered')
+        = (answer_choice IS NOT NULL AND answered_by IS NOT NULL AND answered_at IS NOT NULL AND answer_channel IS NOT NULL)),
+    CONSTRAINT agent_ask_channel_chk CHECK (answer_channel IS NULL OR answer_channel IN ('console', 'slack', 'email')),
+    CONSTRAINT agent_ask_withdrawn_chk CHECK ((state = 'withdrawn') = (withdrawn_at IS NOT NULL)),
+    CONSTRAINT agent_ask_created_by_chk CHECK (created_by_kind IN ('user', 'system')
+        AND (created_by_kind = 'system' OR created_by IS NOT NULL)),
+    -- Separation: the requester of the underlying action never answers.
+    CONSTRAINT agent_ask_requester_chk CHECK (answered_by IS NULL OR requester_user_id IS NULL OR answered_by <> requester_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ask_ws_created
+    ON public.agent_ask (workspace_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_ask_ws_state
+    ON public.agent_ask (workspace_id, state, due_at);
+CREATE INDEX IF NOT EXISTS idx_agent_ask_ws_about
+    ON public.agent_ask (workspace_id, about_kind, about_id);
+CREATE INDEX IF NOT EXISTS idx_agent_ask_ws_case
+    ON public.agent_ask (workspace_id, case_id) WHERE case_id IS NOT NULL;
+-- The escalation worker's scan: live asks not yet at the end of their path.
+CREATE INDEX IF NOT EXISTS idx_agent_ask_escalation
+    ON public.agent_ask (due_at) WHERE state IN ('open', 'pending_step_up') AND NOT overdue;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_ask_open_dedupe
+    ON public.agent_ask (workspace_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND state IN ('open', 'pending_step_up');
+
+CREATE TABLE IF NOT EXISTS public.agent_ask_event (
+    id           uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid        NOT NULL,
+    ask_id       uuid        NOT NULL,
+    kind         text        NOT NULL,
+    step         integer     NOT NULL DEFAULT 0,
+    actor_kind   text        NOT NULL DEFAULT 'system',
+    actor_id     text        NOT NULL DEFAULT '',
+    channel      text        NOT NULL DEFAULT '',
+    detail       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_ask_event_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_ask_event_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_event_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_ask_event_ask_fkey FOREIGN KEY (workspace_id, ask_id)
+        REFERENCES public.agent_ask (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_event_kind_chk CHECK (kind IN ('asked', 'delivered', 'delivery_failed', 'escalated', 'overdue',
+        'disputed', 'step_up_pending', 'step_up_confirmed', 'step_up_lapsed', 'answered', 'withdrawn', 'expired',
+        'ticket_opened', 'ticket_resolved', 'paged', 'page_resolved', 'external_failed')),
+    CONSTRAINT agent_ask_event_actor_chk CHECK (actor_kind IN ('user', 'system', 'slack_user'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ask_event_ask
+    ON public.agent_ask_event (workspace_id, ask_id, created_at);
+
+CREATE OR REPLACE FUNCTION public.agent_ask_event_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' AND current_setting('authsec.workspace_purge', true) = 'on' THEN
+    RETURN OLD;
+  END IF;
+  RAISE EXCEPTION 'agent_ask_event is append-only';
+END $$;
+DROP TRIGGER IF EXISTS agent_ask_event_no_update ON public.agent_ask_event;
+CREATE TRIGGER agent_ask_event_no_update BEFORE UPDATE OR DELETE ON public.agent_ask_event
+  FOR EACH ROW EXECUTE FUNCTION public.agent_ask_event_immutable();
+
+CREATE TABLE IF NOT EXISTS public.agent_ask_policy (
+    workspace_id     uuid        NOT NULL,
+    due_high_hours   integer     NOT NULL DEFAULT 4,
+    due_medium_hours integer     NOT NULL DEFAULT 24,
+    due_low_hours    integer     NOT NULL DEFAULT 72,
+    hours_per_step   integer     NOT NULL DEFAULT 4,
+    channel_slack    boolean     NOT NULL DEFAULT true,
+    channel_email    boolean     NOT NULL DEFAULT true,
+    channel_webhook  boolean     NOT NULL DEFAULT false,
+    version          bigint      NOT NULL DEFAULT 1,
+    updated_by       uuid,
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_ask_policy_pkey PRIMARY KEY (workspace_id),
+    CONSTRAINT agent_ask_policy_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_policy_due_chk CHECK (due_high_hours BETWEEN 1 AND 720 AND due_medium_hours BETWEEN 1 AND 720
+        AND due_low_hours BETWEEN 1 AND 720),
+    CONSTRAINT agent_ask_policy_step_chk CHECK (hours_per_step BETWEEN 1 AND 168)
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_ask_integration (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL,
+    provider           text        NOT NULL,
+    category           text        NOT NULL,
+    enabled            boolean     NOT NULL DEFAULT true,
+    -- Non-secret settings (site URL, project key, routing region ...).
+    config             jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    -- The Vault path of the API token / routing key; never the secret.
+    secret_ref         text        NOT NULL DEFAULT '',
+    secret_fingerprint text        NOT NULL DEFAULT '',
+    last_error         text        NOT NULL DEFAULT '',
+    last_ok_at         timestamptz,
+    created_by         uuid,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_ask_integration_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_ask_integration_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_integration_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_ask_integration_provider_key UNIQUE (workspace_id, provider),
+    CONSTRAINT agent_ask_integration_provider_chk CHECK (
+        (category = 'ticketing' AND provider IN ('jira', 'servicenow'))
+        OR (category = 'paging' AND provider IN ('pagerduty', 'opsgenie'))),
+    CONSTRAINT agent_ask_integration_config_chk CHECK (jsonb_typeof(config) = 'object')
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_ask_external (
+    id              uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid        NOT NULL,
+    provider        text        NOT NULL,
+    kind            text        NOT NULL,
+    ask_id          uuid,
+    case_id         uuid,
+    external_key    text        NOT NULL DEFAULT '',
+    external_url    text        NOT NULL DEFAULT '',
+    state           text        NOT NULL DEFAULT 'pending',
+    last_status     text        NOT NULL DEFAULT '',
+    attempts        integer     NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    last_error      text        NOT NULL DEFAULT '',
+    created_by      uuid,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    resolved_at     timestamptz,
+    CONSTRAINT agent_ask_external_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_ask_external_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_external_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_ask_external_ask_fkey FOREIGN KEY (workspace_id, ask_id)
+        REFERENCES public.agent_ask (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_external_case_fkey FOREIGN KEY (workspace_id, case_id)
+        REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT agent_ask_external_provider_chk CHECK (provider IN ('jira', 'servicenow', 'pagerduty', 'opsgenie')),
+    CONSTRAINT agent_ask_external_kind_chk CHECK ((kind = 'ticket' AND provider IN ('jira', 'servicenow'))
+        OR (kind = 'page' AND provider IN ('pagerduty', 'opsgenie'))),
+    CONSTRAINT agent_ask_external_subject_chk CHECK ((ask_id IS NULL) <> (case_id IS NULL)),
+    -- pending: not created yet; open: created; resolving: a page to resolve;
+    -- resolved: closed (externally, or the page was resolved); failed: gave up.
+    CONSTRAINT agent_ask_external_state_chk CHECK (state IN ('pending', 'open', 'resolving', 'resolved', 'failed')),
+    CONSTRAINT agent_ask_external_resolved_chk CHECK ((state = 'resolved') = (resolved_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_ask_external_ask
+    ON public.agent_ask_external (workspace_id, provider, ask_id) WHERE ask_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_ask_external_case
+    ON public.agent_ask_external (workspace_id, provider, case_id) WHERE case_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_ask_external_due
+    ON public.agent_ask_external (next_attempt_at) WHERE state IN ('pending', 'open', 'resolving');
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_ask');
+        PERFORM public.tenancy_enable_rls('public.agent_ask_event');
+        PERFORM public.tenancy_enable_rls('public.agent_ask_policy');
+        PERFORM public.tenancy_enable_rls('public.agent_ask_integration');
+        PERFORM public.tenancy_enable_rls('public.agent_ask_external');
+    END IF;
+END $$;
+
+-- The notification outbox delivers asks (subject_kind 'agent_ask'). The
+-- allowed kinds are read from the live constraint and 'agent_ask' added, so
+-- a kind another migration admitted is kept; a later migration that rewrites
+-- the list must keep 'agent_ask'.
+DO $$
+DECLARE
+    def  text;
+    vals text[];
+BEGIN
+    IF to_regclass('public.iga_gov_notification') IS NULL THEN
+        RETURN;
+    END IF;
+    SELECT pg_get_constraintdef(c.oid) INTO def FROM pg_constraint c
+     WHERE c.conrelid = 'public.iga_gov_notification'::regclass AND c.conname = 'iga_gov_notification_subject_kind_check';
+    IF def IS NULL OR def ~ '''agent_ask''' THEN
+        RETURN;
+    END IF;
+    SELECT array_agg(m.v[1] ORDER BY m.n) INTO vals
+      FROM regexp_matches(def, '''([a-z_]+)''', 'g') WITH ORDINALITY AS m(v, n);
+    vals := COALESCE(vals, ARRAY[]::text[]) || ARRAY['agent_ask'];
+    ALTER TABLE public.iga_gov_notification DROP CONSTRAINT iga_gov_notification_subject_kind_check;
+    EXECUTE format('ALTER TABLE public.iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check CHECK (subject_kind IN (%s))',
+        (SELECT string_agg(quote_literal(v), ', ' ORDER BY n) FROM unnest(vals) WITH ORDINALITY AS u(v, n)));
+END $$;
+
+-- 240_agent_gateway_keys.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C6): gateway keys held by AuthSec.
+--
+-- 1. agent_gateway_provider_key: a model provider API key a workspace's
+--    gateways use upstream. The key itself is in Vault under the workspace's
+--    path (kv/data/secret/workspaces/<ws>/agent-gateway/provider-keys/<id>-<nonce>);
+--    this row holds only that path (secret_ref, '' once revoked) and a
+--    fingerprint. A gateway fetches the keys assigned to it (gateway_id, or
+--    NULL for every gateway of the workspace) with its agw_ credential and
+--    keeps them in memory only. provider_key_id names the provider's own id
+--    of the key (OpenAI key_..., Anthropic apikey_...) when known, so provider
+--    usage can be joined to what the gateway sent (reconciliation).
+-- 2. agent_gateway_agent_key: a per-agent gateway key ("agk_", shown once,
+--    stored as its sha256) bound to a workload identity (a SPIFFE id, an
+--    AuthSec workload id, or both). A gateway accepts the key only from the
+--    workload identity it is bound to. agent_id is the W7 agent and
+--    principal_user_id the human the agent acts for, when known (a held
+--    call is never approved by that human).
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_provider_key (
+    id               uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    name             text        NOT NULL CHECK (btrim(name) <> '' AND length(name) <= 200),
+    -- The provider as policies name it (openai, anthropic, groq ...).
+    provider         text        NOT NULL CHECK (provider ~ '^[a-z][a-z0-9_]{0,63}$'),
+    -- NULL: every gateway of the workspace may fetch it.
+    gateway_id       uuid,
+    -- Vault path of the key; '' once revoked. Never the key.
+    secret_ref       text        NOT NULL DEFAULT '',
+    key_fingerprint  text        NOT NULL CHECK (key_fingerprint <> ''),
+    provider_key_id  text        NOT NULL DEFAULT '' CHECK (length(provider_key_id) <= 200),
+    connection_id    uuid,
+    state            text        NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'revoked')),
+    created_by       uuid        NOT NULL,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    rotated_at       timestamptz,
+    revoked_at       timestamptz,
+    revoked_by       uuid,
+    last_fetched_at  timestamptz,
+    version          integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_gateway_provider_key_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_provider_key_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_provider_key_gateway_fkey FOREIGN KEY (workspace_id, gateway_id)
+        REFERENCES public.agent_gateway (workspace_id, id),
+    CONSTRAINT agent_gateway_provider_key_revoked_chk CHECK ((state = 'revoked') = (revoked_at IS NOT NULL)),
+    CONSTRAINT agent_gateway_provider_key_secret_chk CHECK (state = 'revoked' OR secret_ref <> '')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_provider_key_live_name
+    ON public.agent_gateway_provider_key (workspace_id, lower(name)) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_provider_key_ws
+    ON public.agent_gateway_provider_key (workspace_id, provider, state);
+
+COMMENT ON TABLE public.agent_gateway_provider_key IS
+    'Model provider keys gateways use upstream; the key is in Vault (secret_ref), never stored here or returned to the console.';
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_agent_key (
+    id                uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    name              text        NOT NULL CHECK (btrim(name) <> '' AND length(name) <= 200),
+    -- The AuthZEN subject.id the gateway decides with.
+    client_id         text        NOT NULL CHECK (btrim(client_id) <> '' AND length(client_id) <= 512),
+    key_hash          text        NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),
+    key_prefix        text        NOT NULL,
+    -- The workload identity the key is bound to: a SPIFFE id, an AuthSec
+    -- workload id, or both (both must then match).
+    spiffe_id         text        NOT NULL DEFAULT '' CHECK (spiffe_id = '' OR (spiffe_id LIKE 'spiffe://%' AND length(spiffe_id) <= 512)),
+    workload_id       uuid,
+    identity_id       uuid,
+    labels            jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(labels) = 'array'),
+    agent_id          uuid,
+    principal_user_id uuid,
+    gateway_id        uuid,
+    created_by        uuid        NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    rotated_at        timestamptz,
+    revoked_at        timestamptz,
+    revoked_by        uuid,
+    revoked_reason    text        NOT NULL DEFAULT '' CHECK (length(revoked_reason) <= 500),
+    version           integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_gateway_agent_key_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_agent_key_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_agent_key_gateway_fkey FOREIGN KEY (workspace_id, gateway_id)
+        REFERENCES public.agent_gateway (workspace_id, id),
+    CONSTRAINT agent_gateway_agent_key_bound_chk CHECK (spiffe_id <> '' OR workload_id IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_agent_key_hash
+    ON public.agent_gateway_agent_key (key_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_agent_key_live_client
+    ON public.agent_gateway_agent_key (workspace_id, client_id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_agent_key_ws
+    ON public.agent_gateway_agent_key (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_agent_key_agent
+    ON public.agent_gateway_agent_key (workspace_id, agent_id) WHERE agent_id IS NOT NULL;
+
+COMMENT ON TABLE public.agent_gateway_agent_key IS
+    'Per-agent gateway keys (agk_, sha256 only) bound to a workload identity; a gateway accepts a key only with that identity.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_provider_key');
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_agent_key');
+    END IF;
+END $$;
+
+-- 241_agent_gateway_calls.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C6, P17): what the decision log keeps
+-- about a call, and held calls.
+--
+-- 1. agent_gateway_decision gains, as metadata only:
+--    run_id            the X-AuthSec-Run-Id that ties one agent run's calls
+--                      across hops;
+--    model_version     the model the provider says answered (the "model" of
+--                      the OpenAI / Anthropic response), on outcomes;
+--    provider_key_ref  the AuthSec-held provider key the gateway used;
+--    hold_id           the held call a decision "ask" opened;
+--    violations        the bounded argument paths a call broke and which
+--                      rule -- never the values.
+--    decision admits 'ask' (a call held for a person).
+-- 2. agent_gateway_hold: a call held because its arguments are outside the
+--    bounds of the policy that allowed it. It names its approver (responder
+--    resolution) and expires. held_values are the bounded fields' values,
+--    kept for the approver only and cleared when the hold ends; the decision
+--    log never has them. The approver is never the agent's own human.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS run_id text NOT NULL DEFAULT ''
+    CHECK (length(run_id) <= 128);
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS model_version text NOT NULL DEFAULT ''
+    CHECK (length(model_version) <= 200);
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS provider_key_ref uuid;
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS hold_id uuid;
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS violations jsonb;
+ALTER TABLE public.agent_gateway_decision DROP CONSTRAINT IF EXISTS agent_gateway_decision_decision_check;
+ALTER TABLE public.agent_gateway_decision DROP CONSTRAINT IF EXISTS agent_gateway_decision_decision_chk;
+ALTER TABLE public.agent_gateway_decision ADD CONSTRAINT agent_gateway_decision_decision_chk
+    CHECK (decision IN ('allow', 'deny', 'ask'));
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_decision_run
+    ON public.agent_gateway_decision (workspace_id, run_id, decided_at) WHERE run_id <> '';
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_decision_provider_key
+    ON public.agent_gateway_decision (workspace_id, provider_key_ref, decided_at) WHERE provider_key_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_hold (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    gateway_id         uuid        NOT NULL,
+    subject_id         text        NOT NULL CHECK (length(subject_id) <= 512),
+    subject            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    kind               text        NOT NULL CHECK (kind IN ('mcp_tool', 'model')),
+    resource_id        text        NOT NULL CHECK (length(resource_id) <= 1024),
+    resource           jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    policy_id          uuid,
+    args_digest        text        NOT NULL CHECK (args_digest ~ '^sha256:[0-9a-f]{64}$'),
+    run_id             text        NOT NULL DEFAULT '' CHECK (length(run_id) <= 128),
+    request_id         text        NOT NULL DEFAULT '' CHECK (length(request_id) <= 128),
+    violations         jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(violations) = 'array'),
+    -- The bounded fields' values, for the approver; NULL once the hold ended.
+    held_values        jsonb,
+    agent_key_id       uuid,
+    agent_id           uuid,
+    principal_user_id  uuid,
+    responder_group_id uuid,
+    responder_via      text        NOT NULL DEFAULT '',
+    approver_user_id   uuid,
+    deciders           jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(deciders) = 'array'),
+    state              text        NOT NULL DEFAULT 'pending'
+                       CHECK (state IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+    expires_at         timestamptz NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    decided_by         uuid,
+    decided_at         timestamptz,
+    decision_reason    text        NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 2000),
+    consumed_at        timestamptz,
+    CONSTRAINT agent_gateway_hold_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_hold_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_hold_not_principal_chk
+        CHECK (decided_by IS NULL OR principal_user_id IS NULL OR decided_by <> principal_user_id),
+    CONSTRAINT agent_gateway_hold_decided_chk CHECK ((decided_by IS NULL) = (decided_at IS NULL)),
+    CONSTRAINT agent_gateway_hold_values_chk CHECK (held_values IS NULL OR state IN ('pending', 'approved'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_hold_ws_state
+    ON public.agent_gateway_hold (workspace_id, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_hold_due
+    ON public.agent_gateway_hold (expires_at) WHERE state IN ('pending', 'approved');
+
+COMMENT ON TABLE public.agent_gateway_hold IS
+    'Gateway calls held for a person (argument bounds): approver, expiry; bounded values kept for the approver only until the hold ends.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_hold');
+    END IF;
+END $$;
+
+-- 242_agent_runtime_joins.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C3-C5, P15): the rows the usage
+-- reconciliation joins.
+--
+-- 1. agent_dns_lookup: per minute, a source's lookups of a model provider
+--    host or a workspace egress host (never any other name): where from
+--    (address, interface, instance, VPC), the workload holding the address
+--    (resolved holder), the name, the first answer address, the source
+--    (route53 Resolver query logs; coredns and azure are admitted for the
+--    Kubernetes and Azure readers).
+-- 2. agent_flow_summary: per minute, a source's traffic to an address a
+--    provider or egress host resolved to (VPC / VNet flow logs): bytes out,
+--    packets, the host the address was resolved from.
+-- 3. model_provider_usage_minute: a connected organisation's usage per key,
+--    project and model at the finest resolution the provider reports
+--    (1m for OpenAI and Anthropic usage; cost is daily, 1d), with cost where
+--    the provider reports it.
+-- 4. model_provider_connection.usage_minute_cursor / cost_cursor: how far
+--    the per-minute usage and the daily cost were read.
+-- 5. agent_join_setting: per workspace, the egress hosts (beyond the model
+--    provider list) whose lookups and flows are kept, and the flow-log log
+--    groups to read per AWS connector and region.
+--
+-- Counts only: no DNS answer other than the first address of a listed
+-- host, no payload, no prompt.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.agent_dns_lookup (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id       uuid        NOT NULL,
+    source             text        NOT NULL CHECK (source IN ('route53', 'coredns', 'azure')),
+    region             text        NOT NULL DEFAULT '',
+    -- Start of the minute the lookups were made in.
+    observed_at        timestamptz NOT NULL,
+    src_ip             text        NOT NULL DEFAULT '',
+    src_eni            text        NOT NULL DEFAULT '',
+    src_instance       text        NOT NULL DEFAULT '',
+    vpc_id             text        NOT NULL DEFAULT '',
+    -- The workload holding the source (cloud_workload id), when resolved.
+    holder_workload_id uuid,
+    holder_ref         text        NOT NULL DEFAULT '' CHECK (length(holder_ref) <= 512),
+    query_name         text        NOT NULL CHECK (query_name <> '' AND length(query_name) <= 253),
+    host_kind          text        NOT NULL CHECK (host_kind IN ('provider', 'egress')),
+    -- The model provider key of the host's list entry; '' for egress hosts.
+    provider           text        NOT NULL DEFAULT '',
+    answer_ip          text        NOT NULL DEFAULT '',
+    queries            bigint      NOT NULL DEFAULT 1 CHECK (queries >= 1),
+    log_group_arn      text        NOT NULL DEFAULT '',
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_dns_lookup_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_dns_lookup_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_dns_lookup_key UNIQUE (workspace_id, connector_id, source, observed_at, src_ip, src_instance,
+                                            vpc_id, query_name, answer_ip)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_ws_time
+    ON public.agent_dns_lookup (workspace_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_provider
+    ON public.agent_dns_lookup (workspace_id, provider, observed_at) WHERE provider <> '';
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_answer
+    ON public.agent_dns_lookup (workspace_id, answer_ip) WHERE answer_ip <> '';
+
+CREATE TABLE IF NOT EXISTS public.agent_flow_summary (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id       uuid        NOT NULL,
+    source             text        NOT NULL CHECK (source IN ('vpc', 'vnet')),
+    region             text        NOT NULL DEFAULT '',
+    minute             timestamptz NOT NULL,
+    src_ip             text        NOT NULL DEFAULT '',
+    src_eni            text        NOT NULL DEFAULT '',
+    holder_workload_id uuid,
+    holder_ref         text        NOT NULL DEFAULT '' CHECK (length(holder_ref) <= 512),
+    dst_ip             text        NOT NULL CHECK (dst_ip <> ''),
+    dst_host           text        NOT NULL DEFAULT '',
+    provider           text        NOT NULL DEFAULT '',
+    bytes_out          bigint      NOT NULL DEFAULT 0 CHECK (bytes_out >= 0),
+    packets            bigint      NOT NULL DEFAULT 0 CHECK (packets >= 0),
+    log_group_arn      text        NOT NULL DEFAULT '',
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_flow_summary_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_flow_summary_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_flow_summary_key UNIQUE (workspace_id, connector_id, source, minute, src_ip, src_eni, dst_ip)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_flow_summary_ws_time
+    ON public.agent_flow_summary (workspace_id, minute);
+CREATE INDEX IF NOT EXISTS idx_agent_flow_summary_provider
+    ON public.agent_flow_summary (workspace_id, provider, minute) WHERE provider <> '';
+
+CREATE TABLE IF NOT EXISTS public.model_provider_usage_minute (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    connection_id       uuid        NOT NULL,
+    provider            text        NOT NULL CHECK (provider IN ('openai', 'anthropic')),
+    -- '' for usage or cost the provider ties to no key.
+    provider_key_id     text        NOT NULL DEFAULT '',
+    key_hint            text        NOT NULL DEFAULT '',
+    project_id          text        NOT NULL DEFAULT '',
+    model               text        NOT NULL DEFAULT '',
+    bucket_start        timestamptz NOT NULL,
+    -- 1m for usage; 1h when a provider reports only hourly; 1d for cost.
+    resolution          text        NOT NULL CHECK (resolution IN ('1m', '1h', '1d')),
+    requests            bigint,
+    input_tokens        bigint      NOT NULL DEFAULT 0,
+    cached_input_tokens bigint      NOT NULL DEFAULT 0,
+    output_tokens       bigint      NOT NULL DEFAULT 0,
+    -- USD, when the provider reports cost at this resolution (cost rows).
+    cost_usd            numeric(20, 6),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT model_provider_usage_minute_pkey PRIMARY KEY (id),
+    CONSTRAINT model_provider_usage_minute_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT model_provider_usage_minute_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT model_provider_usage_minute_connection_fkey FOREIGN KEY (workspace_id, connection_id)
+        REFERENCES public.model_provider_connection (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT model_provider_usage_minute_bucket_key
+        UNIQUE (workspace_id, connection_id, resolution, provider_key_id, project_id, model, bucket_start),
+    CONSTRAINT model_provider_usage_minute_counts_chk
+        CHECK ((requests IS NULL OR requests >= 0) AND input_tokens >= 0 AND cached_input_tokens >= 0
+               AND output_tokens >= 0 AND (cost_usd IS NULL OR cost_usd >= 0))
+);
+CREATE INDEX IF NOT EXISTS idx_model_provider_usage_minute_bucket
+    ON public.model_provider_usage_minute (workspace_id, resolution, bucket_start);
+
+ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS usage_minute_cursor timestamptz;
+ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS cost_cursor timestamptz;
+
+-- The flow-log read keeps its cursors beside the DNS ones (stream 'flow').
+ALTER TABLE public.cloud_dns_cursor DROP CONSTRAINT IF EXISTS cloud_dns_cursor_stream_chk;
+ALTER TABLE public.cloud_dns_cursor ADD CONSTRAINT cloud_dns_cursor_stream_chk CHECK (stream IN ('dns', 'flow'));
+
+CREATE TABLE IF NOT EXISTS public.agent_join_setting (
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- ["api.example.com", "*.example.net"]
+    egress_hosts    jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(egress_hosts) = 'array'),
+    -- [{"connector_id": "...", "region": "us-east-1", "log_group": "arn:aws:logs:..."}]
+    flow_log_groups jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(flow_log_groups) = 'array'),
+    updated_by      uuid,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    version         integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_join_setting_pkey PRIMARY KEY (workspace_id)
+);
+
+COMMENT ON TABLE public.agent_dns_lookup IS
+    'Per-minute lookups of model provider and egress hosts (route53 / coredns / azure), with the resolved holder; counts only.';
+COMMENT ON TABLE public.agent_flow_summary IS
+    'Per-minute flow-log traffic to addresses provider / egress hosts resolved to: bytes out, packets; counts only.';
+COMMENT ON TABLE public.model_provider_usage_minute IS
+    'Provider usage per key at the finest resolution reported (1m; cost 1d); token and request counts only.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_dns_lookup');
+        PERFORM public.tenancy_enable_rls('public.agent_flow_summary');
+        PERFORM public.tenancy_enable_rls('public.model_provider_usage_minute');
+        PERFORM public.tenancy_enable_rls('public.agent_join_setting');
+    END IF;
+END $$;
+
+-- 243_usage_reconciliation.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md P15): the usage reconciliation.
+--
+-- 1. model_usage_reconciliation: one label per provider key and minute
+--    (key_ref '' when the key is unknown: estate traffic with no provider
+--    usage to tie it to):
+--      observed     the gateway's decision log has calls with the key in the minute;
+--      bypass       an estate workload looked the provider up or sent it
+--                   traffic in the minute, and the gateway saw no call;
+--      outside_use  the provider reports usage of the key in the minute and
+--                   neither the gateway nor any estate lookup or flow explains it.
+--    evidence holds references (table and id) to the rows behind the label.
+-- 2. agent_alert admits detections USAGE-02 (outside use) and USAGE-03
+--    (bypass), subject label 'provider_key', and keeps one open alert per
+--    dedupe key for them.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.model_usage_reconciliation (
+    id                uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    provider          text        NOT NULL CHECK (provider ~ '^[a-z][a-z0-9_]{0,63}$'),
+    -- The provider's key id; 'agw:<uuid>' for an AuthSec-held key not tied
+    -- to one; '' unknown.
+    key_ref           text        NOT NULL DEFAULT '' CHECK (length(key_ref) <= 200),
+    connection_id     uuid,
+    minute            timestamptz NOT NULL,
+    label             text        NOT NULL CHECK (label IN ('observed', 'bypass', 'outside_use')),
+    gateway_calls     integer     NOT NULL DEFAULT 0 CHECK (gateway_calls >= 0),
+    provider_requests bigint,
+    input_tokens      bigint      NOT NULL DEFAULT 0,
+    output_tokens     bigint      NOT NULL DEFAULT 0,
+    dns_lookups       bigint      NOT NULL DEFAULT 0,
+    flow_bytes        bigint      NOT NULL DEFAULT 0,
+    workload_ids      jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(workload_ids) = 'array'),
+    evidence          jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(evidence) = 'array'),
+    alert_id          uuid,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT model_usage_reconciliation_pkey PRIMARY KEY (id),
+    CONSTRAINT model_usage_reconciliation_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT model_usage_reconciliation_key UNIQUE (workspace_id, provider, key_ref, minute)
+);
+CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation_ws
+    ON public.model_usage_reconciliation (workspace_id, minute DESC);
+CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation_label
+    ON public.model_usage_reconciliation (workspace_id, label, minute DESC) WHERE label <> 'observed';
+
+COMMENT ON TABLE public.model_usage_reconciliation IS
+    'Per provider key and minute: observed (gateway), bypass (estate traffic, no gateway call) or outside use (provider usage nobody explains), with evidence refs.';
+
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_detection_chk
+    CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8','COV-01','USAGE-02','USAGE-03'));
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_subject_label_chk
+    CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent', 'source', 'provider_key'));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_usage_open
+    ON public.agent_alert (workspace_id, dedupe_key) WHERE detection IN ('USAGE-02', 'USAGE-03') AND state <> 'resolved';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.model_usage_reconciliation');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 210-212 (W5): governance:remediate, second-person reviews and the overdue
+-- break-glass reviews. The same statements as those migrations.
+-- ============================================================================
+
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+  (gen_random_uuid(), NULL, 'governance', 'remediate', 'Apply remediation writes to the customer cloud (tier 4)', 'governance:remediate', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+INSERT INTO public.role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM public.roles r CROSS JOIN public.permissions p
+WHERE r.name = 'admin' AND r.workspace_id IS NOT NULL AND p.workspace_id IS NULL
+  AND p.resource = 'governance' AND p.action = 'remediate'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+ALTER TABLE public.pending_change ADD COLUMN IF NOT EXISTS reviewed_by uuid REFERENCES public.users(id);
+ALTER TABLE public.pending_change ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.pending_change DROP CONSTRAINT IF EXISTS pending_change_review_chk;
+ALTER TABLE public.pending_change ADD CONSTRAINT pending_change_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+ALTER TABLE public.agent_detection_rule_version ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_detection_rule_version ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_detection_rule_version DROP CONSTRAINT IF EXISTS agent_detection_rule_version_review_chk;
+ALTER TABLE public.agent_detection_rule_version ADD CONSTRAINT agent_detection_rule_version_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL)
+           AND (reviewed_by IS NULL OR proposed_by IS NULL OR reviewed_by <> proposed_by));
+
+ALTER TABLE public.agent_alert_suppression ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_alert_suppression ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_alert_suppression DROP CONSTRAINT IF EXISTS agent_alert_suppression_review_chk;
+ALTER TABLE public.agent_alert_suppression ADD CONSTRAINT agent_alert_suppression_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS break_glass boolean NOT NULL DEFAULT false;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS review_due_at timestamptz;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS reviewed_by uuid;
+ALTER TABLE public.agent_pending_change ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_second_person_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_second_person_chk
+    CHECK (state NOT IN ('applied', 'rejected') OR decided_by <> requested_by OR (break_glass AND state = 'applied'));
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_break_glass_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_break_glass_chk
+    CHECK (NOT break_glass OR (state = 'applied' AND review_due_at IS NOT NULL));
+ALTER TABLE public.agent_pending_change DROP CONSTRAINT IF EXISTS agent_pending_change_review_chk;
+ALTER TABLE public.agent_pending_change ADD CONSTRAINT agent_pending_change_review_chk
+    CHECK ((reviewed_at IS NULL) = (reviewed_by IS NULL) AND (reviewed_by IS NULL OR reviewed_by <> requested_by));
+
+CREATE TABLE IF NOT EXISTS public.governance_review_overdue (
+    workspace_id  uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    kind          text        NOT NULL CHECK (kind ~ '^[a-z_]{1,64}$'),
+    item_id       uuid        NOT NULL,
+    requested_by  uuid,
+    review_due_at timestamptz NOT NULL,
+    raised_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT governance_review_overdue_pkey PRIMARY KEY (workspace_id, kind, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_governance_review_overdue_ws_raised
+    ON public.governance_review_overdue (workspace_id, raised_at DESC);
+
+ALTER TABLE public.operator_alert DROP CONSTRAINT IF EXISTS operator_alert_metric_chk;
+ALTER TABLE public.operator_alert ADD CONSTRAINT operator_alert_metric_chk
+    CHECK (metric IN ('writes', 'elevated', 'exports', 'review_overdue'));
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.governance_review_overdue');
+    END IF;
+END $$;
+
+-- ============================================================================
+-- 195: mirrored verbatim from migrations/master/195_agent_containment_hold_case_fk.sql.
+-- ============================================================================
+-- 195_agent_containment_hold_case_fk.sql
+--
+-- A containment hold names the case that holds the stop (194). agent_case
+-- (186) is now on the same branch, so the case reference becomes a foreign
+-- key within the workspace: a hold can only name a case of its own
+-- workspace. W2 shipped holds before cases existed on its branch; no
+-- deployed database has rows in agent_containment_hold yet.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_containment_hold_case_fk') THEN
+        ALTER TABLE public.agent_containment_hold
+            ADD CONSTRAINT agent_containment_hold_case_fk
+            FOREIGN KEY (workspace_id, case_id) REFERENCES public.agent_case (workspace_id, id) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_agent_containment_hold_case ON public.agent_containment_hold (workspace_id, case_id);

@@ -4,6 +4,44 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-26 — SecOps backend upgrade, batch 2 and wiring (branch `secops/batch1`)
+
+- Built from `secops/batch1` in parallel worktrees, then merged into it (local only, nothing pushed):
+  - W5 (`secops/w5-tiers`, 210-212): one action -> tier map (`services/governance_tiers.go`) with `TierGuard` on every tiered route group (an unmapped write route answers 403 `tier_unmapped`); one second-person helper (`services/second_person.go`) used by all seven approval mechanisms (rule drift fixed: break-glass only for the sole approver, reviews everywhere, one set of error codes); approvals inbox `GET /api/iga/v1/approvals` and overdue break-glass reviews; `governance:remediate`; automation identities limited to tier 0/1 and never deciders; case subjects cannot approve requests about their case.
+  - W4 (`secops/w4-asks`, 220): asks with responder-group deciders, due times from policy only, escalation, Slack buttons with step-up, e-mail, webhook, Jira, ServiceNow, PagerDuty, Opsgenie (Vault secrets, safehttp); `agent.ask_needed` writers raise real asks; case detail shows asks.
+  - W8 (`secops/w8-remediation`, 230): remediation role template, prepared / IaC PR / write modes, writers remove_grant, rotate_secret, rotate_iam_key, rotate_provider_key (ask), retire_agent, revert_snapshot; proven only with the change event and an end-state read; apply is tier 4 plus a second person.
+  - W6 (`secops/w6-gateway-joins`, 240-243): provider keys in Vault, AuthSec-issued `agk_` agent keys bound to a workload identity (key and identity both), run id, model version, argument bounds and holds, DNS lookup rows, VPC flow summaries, per-minute provider usage, reconciliation (observed / bypass / outside_use) with USAGE-02/03 alerts.
+- Wiring after the merge: the tier map gained the 22 write routes merged after W5 branched and the W4/W6/W8 groups run `TierGuard`; `services/secops_wiring.go` installs remediation and gateway-hold asks (W4), gateway rule removal on retire (W6) and case evidence pins (W1); a platform stop raises an ask; migration 195 makes `agent_containment_hold.case_id` a same-workspace FK to `agent_case`.
+- Checks on the final branch (local Postgres 16, Docker hung): fresh bootstrap == old bootstrap + 163..243 (0 differences); every workspace table has forced RLS; ratchet 69 (baseline 72); tier-map route test passes; wiring tests pass. Full `tests/integration` package (758 s): everything passes except `TestP2EgatesE11HardBudgetsThroughTheRoutes` (the graph read hits its time budget before the 500-node budget on this machine; fails the same on the base commit) and `TestP2IdetailPermissionsStatementCap` (passes alone; load). W2 tests now open real cases (195 FK); W9 seeds `proof_state`. Not run: `tests/integration/flows` (AS-182).
+
+---
+
+## 2026-11-25 — SecOps backend upgrade, batch 1 (branch `secops/batch1`)
+
+- Built in parallel worktrees from `fix/w0-combined`, each with its own migration block, then combined on `secops/batch1` (local only, nothing pushed):
+  - F5 / AS-174 (`secops/f5-gateway-stop`, 163): stopped agents refused by the gateway before cache and PDP; per-gateway fail mode and cache cap; generic `pending_change`.
+  - F6+F8 / AS-179, AS-180 (`secops/f68-alert-rules-lifecycle`, 164-166): versioned detection rules, alert reopen and outcome codes, suppressions.
+  - F7 / AS-177 (`secops/f7-audit-retention`, 167-169): audit retention per class, hash chain by trigger, durable writes, operator baseline and suspension.
+  - W1 (`secops/w1-evidence-coverage`, 170): evidence store, source heartbeats and COV-01, capabilities C1..C13 per scope, Azure and Kubernetes ingest, trail backfill.
+  - W7 (`secops/w7-agent-identity`, 177-181): one agent id with aliases, endings, instances and deployers, risk class, classification setter, directory, responder groups, hygiene. Routes are `/api/iga/v1/agent-identities` (`/agents` already exists).
+  - W3 (`secops/w3-cases`, 186): cases, clustering by shared identity/workload within 24 h, notes, split, move, close/reopen, export hash.
+  - W2 (`secops/w2-stops-proof`, 193-194): proof states, stop levels key/sessions_before/chain/source_identity/entra/kubernetes/gateway/platform, holds with second-person release, probe, narrow.
+  - W9 (`secops/w9-history-metrics`, 200-201): daily snapshots with chain, as-of reads, SOC/posture metrics, CISO and population reports, bulk exports.
+- Merge fixes: `001_bootstrap.sql` rebuilt as the base plus each branch's appended block (every branch only appends); duplicate constants and helpers removed; suppressed alerts are not clustered into cases; F5's gateway stop list now maps each W2 level (narrow cloud-side levels never refuse a whole identity at the gateway); W9's metrics test follows the merged schema; the API contract declares the new `/capabilities` blocks.
+- Checks on the combined branch (local Postgres 16, Docker hung): fresh bootstrap == old bootstrap + 163..201 (pg_dump, 0 differences); every workspace table has forced RLS; ratchet 69 (baseline 72); full `tests/integration` package passes except `TestP2EgatesE11HardBudgetsThroughTheRoutes` and `TestP2IdetailPermissionsStatementCap` (graph time budgets on this machine; E11 fails on the base too). Not run: `tests/integration/flows` (AS-182).
+- Batch 2 (W5 tiers, W4 asks, W8 remediation, W6 gateway keys and joins, migrations 210-249) runs on `secops/batch1`.
+
+---
+
+## 2026-11-24 — W0: fixes the SecOps-flows review says contradict the flows (branch `fix/w0-combined`)
+
+- The review "Backend upgrade for the SecOps flows" (written against `161b0745`, which is not in this repo; `9840e246` is the migration-161 commit) was re-verified at `48ee78f5`. Its §3 citations hold apart from moved lines and a few wrong paths (gateway is `internal/agentgateway/gateway/`; provider-usage retention is `services/model_provider.go:54`, not migration 154; IaC closed-PR handling is `services/iga_gov_iac_delivery.go:1019-1027`). Corrections: F6 is audited (new value only); F8's acknowledge does record the actor; "no rotation writer" holds only for cloud keys. PR #109 (Agent Kit) closes none of the gaps (AS-181).
+- Fixed, one branch each, merged here: AS-172 release never reactivates a key (`0d0e073c`); AS-175 verification only by a refusal naming the containment's policy (`99e0d734`); AS-173 Agent Action Guard decisions by the principal or a `governance:approve` holder, user sessions only (`b38cc695`); AS-176 containment drift re-applied with a 3-per-hour loop breaker (`16242aa0`).
+- Tests: unit tests per fix; `TestAgentContain*` (8) and `TestP3T320EventVocabularyMatchesWriters` pass on the merged branch against a scratch pg16 loaded from `001_bootstrap.sql`; `Test_AgentAction_*` integration (TwoTenants). Ratchet 69 (baseline 72). `go test ./services/` has the 7 pre-existing cgo/sqlite failures (`TestCreateResourceServer_*`, `TestValidateResourceServer*`) on this Windows build.
+- Open from the review: AS-174 (gateway fail-open, P0), AS-177 (audit purge/chain), AS-178, AS-179, AS-180, AS-181. Lab check needed for AS-175: whether CloudTrail errorMessage names the policy ARN for every service.
+
+---
+
 ## 2026-11-18 — Machines are connections (branch `feat/agent-kit-control-plane`)
 
 - `GET /authsec/discovery/connections` lists each machine (discovery source `vm_sensor`, an authsec-cli daemon) as provider `machine`: connected while it reports (the cluster agent's heartbeat rule), its last report as the scan, its agent count as the scope, no graph, remove only. Unit test of the mapping; the cross-workspace connections test now seeds a machine per workspace (A sees its own, never B's).

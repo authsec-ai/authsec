@@ -383,7 +383,7 @@ func TestP3T307OwnerRoutes(t *testing.T) {
 	g := p3NewGov(t, db, "p3own-owner-routes")
 	other := p3NewGov(t, db, "p3own-owner-routes-other")
 	t.Cleanup(func() {
-		db.Exec(`DELETE FROM audit_events WHERE workspace_id IN (?, ?)`, g.ws.String(), other.ws.String())
+		auditEventsCleanup(db, g.ws, other.ws)
 	})
 
 	role, _ := g.identity("SharedRole", nil)

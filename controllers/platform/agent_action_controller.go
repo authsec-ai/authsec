@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -146,12 +147,29 @@ func (ctrl *AgentActionController) PollActionStatus(c *gin.Context) {
 // @Success 200 {object} models.AgentActionRespondResponse "Response result"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
+// @Failure 403 {object} map[string]string "Agent (SDK) token, or caller is neither the principal nor a governance:approve holder"
+// @Failure 404 {object} map[string]string "No such request in the caller's workspace"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/agent/actions/respond [post]
 func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
+	// Only a person decides an agent's action: the agent's own (SDK) token,
+	// or a legacy token whose class cannot be known, is refused.
+	if !middlewares.IsInteractiveUserSession(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden",
+			"error_description": "An agent action is decided by a signed-in user, not with an agent (SDK) token."})
+		return
+	}
+
 	var req models.AgentActionRespondRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body", "details": err.Error()})
+		return
+	}
+
+	// The workspace comes from the verified token only.
+	workspaceID, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "workspace not resolved"})
 		return
 	}
 
@@ -160,26 +178,37 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
 		return
 	}
-	userID, _ := uuid.Parse(userIDStr)
-
-	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
-	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil || userID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
 
 	approverEmail := ""
 	if email, exists := c.Get("email"); exists {
-		approverEmail = email.(string)
+		approverEmail, _ = email.(string)
 	}
 
+	// req.BiometricVerified is accepted for compatibility and ignored: it is
+	// the client's assertion, never proof (the decision records false).
 	resp, err := ctrl.actionService.RespondToAction(
 		req.ActionReqID,
 		userID,
 		approverEmail,
 		req.Approved,
 		req.Reason,
-		req.BiometricVerified,
 		workspaceID,
 	)
-	if err != nil {
+	switch {
+	case errors.Is(err, services.ErrAgentActionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "error_description": "Action request not found"})
+		return
+	case errors.Is(err, services.ErrAgentActionForbidden):
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden",
+			"error_description":    "Only the user the action is on behalf of, or a member holding governance:approve, may decide it.",
+			"required_permissions": []string{"governance:approve"}})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to respond to action", "details": err.Error()})
 		return
 	}
@@ -193,7 +222,7 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 		After: map[string]interface{}{
 			"decision":  decision,
 			"reason":    req.Reason,
-			"biometric": req.BiometricVerified,
+			"biometric": false, // client assertion not trusted
 		},
 	})
 

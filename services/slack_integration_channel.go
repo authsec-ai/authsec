@@ -182,6 +182,8 @@ func (c *SlackNotificationChannel) message(ctx context.Context, db *gorm.DB, n m
 			Link: notice.Link, Value: value.Encode()}), nil
 	case GovNoticeDeployment, GovNoticeCanaryGate:
 		return slackapp.BuildNotice(slackapp.Notice{Title: notice.Title, Lines: notice.Lines, Link: notice.Link, Value: value.Encode()}), nil
+	case GovNoticeAgentAsk:
+		return c.askMessage(db, n, notice)
 	}
 	return slackapp.BuildNotice(slackapp.Notice{Title: notice.Title, Lines: notice.Lines, Link: notice.Link}), nil
 }

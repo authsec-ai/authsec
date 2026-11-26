@@ -60,6 +60,12 @@ const (
 	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §10 Q3,
 	// agent_runtime_alerts.go): an alert opened and resolved.
 	GovCatAgentAlert = "agent_alert"
+	// Agent runtime cases (agent_runtime_cases.go): every case change.
+	GovCatAgentCase = "agent_case"
+	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18,
+	// audit_governance*.go): retention, legal holds, the hash chain, write
+	// failures, second-person changes and operator governance.
+	GovCatAuditGovernance = "audit_governance"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -299,10 +305,55 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
 	// Agent runtime alerts (agent_runtime_alerts.go).
 	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
-	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
+	{GovEventAgentAlertAcknowledged, GovCatAgentAlert, GovObjAgentAlert, "A workspace member acknowledged an alert (actor and reason kept per transition)."},
+	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member with an outcome code, or by retention (with the reason given)."},
+	{GovEventAgentAlertReopened, GovCatAgentAlert, GovObjAgentAlert, "A resolved alert was reopened by a workspace member, with a reason."},
+	{GovEventAgentAlertUnsuppressed, GovCatAgentAlert, GovObjAgentAlert, "A suppressed alert recorded a harmful outcome that succeeded and was delivered after all."},
+	// Versioned detection rules (agent_runtime_alert_rules.go): before and after.
+	{GovEventAgentAlertRulesApplied, GovCatAgentAlert, GovObjAgentAlertRule, "A detection rule change that only tightens was applied at once."},
+	{GovEventAgentAlertRulesProposed, GovCatAgentAlert, GovObjAgentAlertRule, "A loosening detection rule change was proposed; it waits for a second person (tier 3)."},
+	{GovEventAgentAlertRulesApproved, GovCatAgentAlert, GovObjAgentAlertRule, "A second person holding governance:approve approved a detection rule change."},
+	{GovEventAgentAlertRulesRejected, GovCatAgentAlert, GovObjAgentAlertRule, "A proposed detection rule change was rejected or withdrawn."},
+	{GovEventAgentAlertRulesBreakGlass, GovCatAgentAlert, GovObjAgentAlertRule, "The workspace's only approver applied a loosening rule change alone (break-glass); a review is due within 24 hours."},
+	{GovEventAgentAlertRulesSuperseded, GovCatAgentAlert, GovObjAgentAlertRule, "A proposed rule change was superseded by a newer active version."},
+	// Alert suppressions (agent_runtime_alert_suppression.go).
+	{GovEventAgentAlertSuppressionRequested, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression (or its renewal) was requested; it waits for a second person (tier 3)."},
+	{GovEventAgentAlertSuppressionApproved, GovCatAgentAlert, GovObjAgentAlertSuppression, "A second person holding governance:approve brought a suppression into force."},
+	{GovEventAgentAlertSuppressionRejected, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression request was rejected or withdrawn."},
+	{GovEventAgentAlertSuppressionBreakGlass, GovCatAgentAlert, GovObjAgentAlertSuppression, "The workspace's only approver brought a suppression into force alone (break-glass); a review is due within 24 hours."},
+	{GovEventAgentAlertSuppressionEnded, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression in force was ended early or replaced by its renewal."},
+	{GovEventAgentAlertSuppressionExpired, GovCatAgentAlert, GovObjAgentAlertSuppression, "A suppression reached its end."},
 	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
 	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
+	// Agent runtime cases (agent_runtime_cases.go).
+	{GovEventAgentCaseOpened, GovCatAgentCase, GovObjAgentCase, "A case was opened: by clustering (system) or by a member from alerts, or by a split."},
+	{GovEventAgentCaseAlertAdded, GovCatAgentCase, GovObjAgentCase, "An alert joined a case (clustered, moved in, or with a new case)."},
+	{GovEventAgentCaseAlertRemoved, GovCatAgentCase, GovObjAgentCase, "An alert left a case for another (move or split)."},
+	{GovEventAgentCaseLinked, GovCatAgentCase, GovObjAgentCase, "Two cases were linked (duplicate_of, related, split_from); logged on both."},
+	{GovEventAgentCaseAssigned, GovCatAgentCase, GovObjAgentCase, "A case's assignee was set or cleared."},
+	{GovEventAgentCaseNoteAdded, GovCatAgentCase, GovObjAgentCase, "A note was added to a case (the body is in the note, not the log)."},
+	{GovEventAgentCaseSplit, GovCatAgentCase, GovObjAgentCase, "Alerts of a case were split into a new case."},
+	{GovEventAgentCaseSeverityRaised, GovCatAgentCase, GovObjAgentCase, "A member raised a case's severity."},
+	{GovEventAgentCaseClosed, GovCatAgentCase, GovObjAgentCase, "A case was closed with an outcome (true_positive, benign, false_positive, duplicate)."},
+	{GovEventAgentCaseReopened, GovCatAgentCase, GovObjAgentCase, "A closed case was reopened (the previous outcome is in the entry)."},
+	{GovEventAgentCaseExported, GovCatAgentCase, GovObjAgentCase, "A case was exported as a bundle (its sha256 is in the entry)."},
+	// Audit governance (audit_governance*.go).
+	{GovEventAuditRetentionChanged, GovCatAuditGovernance, "", "An audit retention was set to the same or a longer period (applied at once)."},
+	{GovEventAuditChangeRequested, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change (shorter retention, hold release, unsuspend) awaits a second person."},
+	{GovEventAuditChangeApplied, GovCatAuditGovernance, GovObjAuditChange, "A second person with governance:approve approved and applied a tier-3 audit change."},
+	{GovEventAuditChangeRejected, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change was rejected, withdrawn or expired."},
+	{GovEventAuditBreakGlass, GovCatAuditGovernance, GovObjAuditChange, "A tier-3 audit change was applied alone (no other approver in the workspace); a review is due within 24 hours."},
+	{GovEventAuditBreakGlassReviewed, GovCatAuditGovernance, GovObjAuditChange, "Another person reviewed a break-glass audit change."},
+	{GovEventAuditLegalHoldPlaced, GovCatAuditGovernance, "", "A legal hold was placed on a window of audit events."},
+	{GovEventAuditAnchored, GovCatAuditGovernance, "", "The workspace's audit hash chain head was anchored (daily)."},
+	{GovEventAuditRetentionPurged, GovCatAuditGovernance, "", "The retention job removed expired audit events (per record class, sparing legal holds); the chain records the gap."},
+	{GovEventAuditWriteFailed, GovCatAuditGovernance, "", "An audit event could not be written on the request path; it is kept in audit_write_failure for replay."},
+	{GovEventOperatorOutOfPattern, GovCatAuditGovernance, GovObjOperator, "An operator's hourly writes, elevated writes or exports exceeded max(10, 3 x their 14-day p95)."},
+	{GovEventOperatorSuspended, GovCatAuditGovernance, GovObjOperator, "An operator was suspended in the workspace (governance:emergency)."},
+	{GovEventOperatorUnsuspended, GovCatAuditGovernance, GovObjOperator, "An operator's suspension was lifted by a second person (or by break-glass)."},
 }
+
+func init() { GovEventVocabulary = append(GovEventVocabulary, agentLifecycleVocabulary...) }
 
 // Object kinds the events API filters on.
 const (
@@ -326,28 +377,43 @@ const (
 	GovObjSessionRevocation = "session_revocation"
 	// Agent runtime alerts (payload key alert_id).
 	GovObjAgentAlert = "agent_alert"
+	// Detection rule versions (payload key rule_version_id) and alert
+	// suppressions (payload key suppression_id).
+	GovObjAgentAlertRule        = "agent_alert_rule_version"
+	GovObjAgentAlertSuppression = "agent_alert_suppression"
+	// Agent runtime cases (payload key case_id).
+	GovObjAgentCase = "agent_case"
+	// Audit governance (payload keys change_id, operator_id).
+	GovObjAuditChange = "audit_change"
+	GovObjOperator    = "operator"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
 // column of iga_gov_event, or a payload key.
 var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
-	GovObjPolicy:            {column: "policy_id"},
-	GovObjVersion:           {column: "version_id"},
-	GovObjDeployment:        {column: "deployment_id"},
-	GovObjFinding:           {column: "finding_id"},
-	GovObjReview:            {payloadKey: "review_id"},
-	GovObjOwner:             {payloadKey: "owner_id"},
-	GovObjOwnerRule:         {payloadKey: "rule_id"},
-	GovObjFindingRule:       {payloadKey: "finding_rule_id"},
-	GovObjBinding:           {payloadKey: "binding_id"},
-	GovObjConnector:         {payloadKey: "connector_id"},
-	GovObjEvidenceBundle:    {payloadKey: "bundle_id"},
-	GovObjNotification:      {payloadKey: "notification_id"},
-	GovObjWorkload:          {payloadKey: "object_id"},
-	GovObjIdentityAccount:   {payloadKey: "object_id"},
-	GovObjTempGrant:         {payloadKey: "grant_id"},
-	GovObjSessionRevocation: {payloadKey: "revocation_id"},
-	GovObjAgentAlert:        {payloadKey: "alert_id"},
+	GovObjPolicy:                {column: "policy_id"},
+	GovObjVersion:               {column: "version_id"},
+	GovObjDeployment:            {column: "deployment_id"},
+	GovObjFinding:               {column: "finding_id"},
+	GovObjReview:                {payloadKey: "review_id"},
+	GovObjOwner:                 {payloadKey: "owner_id"},
+	GovObjOwnerRule:             {payloadKey: "rule_id"},
+	GovObjFindingRule:           {payloadKey: "finding_rule_id"},
+	GovObjBinding:               {payloadKey: "binding_id"},
+	GovObjConnector:             {payloadKey: "connector_id"},
+	GovObjEvidenceBundle:        {payloadKey: "bundle_id"},
+	GovObjNotification:          {payloadKey: "notification_id"},
+	GovObjWorkload:              {payloadKey: "object_id"},
+	GovObjIdentityAccount:       {payloadKey: "object_id"},
+	GovObjTempGrant:             {payloadKey: "grant_id"},
+	GovObjSessionRevocation:     {payloadKey: "revocation_id"},
+	GovObjAgentAlert:            {payloadKey: "alert_id"},
+	GovObjAgentAlertRule:        {payloadKey: "rule_version_id"},
+	GovObjAgentAlertSuppression: {payloadKey: "suppression_id"},
+	GovObjAgentCase:             {payloadKey: "case_id"},
+	GovObjAuditChange:           {payloadKey: "change_id"},
+	GovObjOperator:              {payloadKey: "operator_id"},
+	GovObjAgent:                 {payloadKey: "agent_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.

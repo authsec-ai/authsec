@@ -68,7 +68,7 @@ func (ctl *AgentRuntimeProviderController) svc() *services.ModelProviderService 
 // MountAgentRuntimeProviderRoutes mounts the routes on g (the authenticated
 // /api/iga/v1 group) with their permissions.
 func MountAgentRuntimeProviderRoutes(g *gin.RouterGroup, ctl *AgentRuntimeProviderController) {
-	RegisterAgentRuntimeProviderRoutes(g.Group("/agent-runtime"), ctl,
+	RegisterAgentRuntimeProviderRoutes(g.Group("/agent-runtime", TierGuard()), ctl,
 		middlewares.Require("discovery", "read"), middlewares.Require("governance", "enforce"))
 }
 

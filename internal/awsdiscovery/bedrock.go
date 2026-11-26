@@ -193,6 +193,7 @@ func (r *BedrockReader) agentDetail(
 	}
 	built.RoleARN = aws.ToString(a.AgentResourceRoleArn)
 	built.FoundationModel = aws.ToString(a.FoundationModel)
+	built.ArtifactVersion = aws.ToString(a.AgentVersion)
 	if s := string(a.AgentStatus); s != "" {
 		built.Status = s
 	}
@@ -241,6 +242,10 @@ func (r *BedrockReader) AgentRuntimes(ctx context.Context) ([]Workload, error) {
 				Name:        aws.ToString(rt.AgentRuntimeName),
 				Status:      string(rt.Status),
 				SourceAPI:   "bedrock-agentcore:ListAgentRuntimes",
+				// The runtime's version is its artifact: a new version is a
+				// new instance (P12).
+				ArtifactDigest:  agentCoreRuntimeVersion(rt.AgentRuntimeVersion),
+				ArtifactVersion: aws.ToString(rt.AgentRuntimeVersion),
 			}
 			r.runtimeDetail(ctx, id, &w, details)
 			out = append(out, w)
@@ -520,4 +525,12 @@ func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialPr
 	}
 
 	return out, firstErr
+}
+
+// agentCoreRuntimeVersion names an AgentCore runtime version as an artifact.
+func agentCoreRuntimeVersion(v *string) string {
+	if s := aws.ToString(v); s != "" {
+		return "agentcore-runtime-version:" + s
+	}
+	return ""
 }

@@ -70,6 +70,8 @@ const (
 type AgentContainPreviewRequest struct {
 	IdentityID  string   `json:"identity_id"`
 	WorkloadIDs []string `json:"workload_ids"`
+	// Target: as AgentContainRequest.Target (key, source_identity).
+	Target string `json:"target"`
 }
 
 // AgentContainRequest is POST /containments.
@@ -78,6 +80,13 @@ type AgentContainRequest struct {
 	WorkloadIDs []string `json:"workload_ids"`
 	Level       string   `json:"level"`
 	Reason      string   `json:"reason"`
+	// Target is what a level names within the identity: the access key id
+	// (key), the agent's client id or SPIFFE id (source_identity), the
+	// gateway subject id (gateway), the platform principal (platform).
+	Target string `json:"target"`
+	// CaseID, when set, makes the case the containment's first hold; an
+	// automation identity must name an open case (W5, CheckStopCase).
+	CaseID string `json:"case_id"`
 }
 
 // AgentContainReleaseRequest is POST /containments/:id/release.
@@ -89,6 +98,10 @@ type AgentContainReleaseRequest struct {
 type AgentContainmentView struct {
 	AgentContainment
 	Steps []AgentContainmentStep `json:"steps,omitempty"`
+	// Holds are the cases holding the stop (detail only).
+	Holds []AgentContainmentHold `json:"holds,omitempty"`
+	// ReleaseRequests are its release requests (detail only).
+	ReleaseRequests []AgentContainmentReleaseRequest `json:"release_requests,omitempty"`
 }
 
 // MaxContainReason bounds a reason's length.
@@ -118,6 +131,8 @@ type containInventory struct {
 	workloads []agentcontain.Workload
 	usage     []agentcontain.ServiceUse
 	cap       agentcontain.Capability
+	assumers  []agentcontain.Assumer
+	brokered  bool
 }
 
 // readInventory reads the identity, the workloads running as it, its recent
@@ -207,7 +222,12 @@ func (s *AgentContain) readInventory(ctx context.Context, ws, identityID uuid.UU
 		}
 		inv.usage = usageOf(usage)
 		inv.cap = s.capabilityOf(ctx, tx, ws, inv.identity.ConnectorID)
-		return nil
+		var err error
+		if inv.assumers, err = containAssumersTx(tx, ws, inv.identity, edges); err != nil {
+			return err
+		}
+		inv.brokered, err = containBrokeredTx(tx, ws, inv.identity.NativeID)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -369,7 +389,7 @@ func (s *AgentContain) live(ctx context.Context, ws, connectorID uuid.UUID, wls 
 }
 
 // preview computes the blast radius for (identity, selected) in ws.
-func (s *AgentContain) preview(ctx context.Context, ws uuid.UUID, identity string, workloadIDs []string, containmentID uuid.UUID) (*agentcontain.Preview, *containInventory, error) {
+func (s *AgentContain) preview(ctx context.Context, ws uuid.UUID, identity string, workloadIDs []string, target string, containmentID uuid.UUID) (*agentcontain.Preview, *containInventory, error) {
 	identityID, err := uuid.Parse(strings.TrimSpace(identity))
 	if err != nil {
 		if strings.TrimSpace(identity) == "" {
@@ -387,7 +407,8 @@ func (s *AgentContain) preview(ctx context.Context, ws uuid.UUID, identity strin
 	}
 	s.live(ctx, ws, inv.identity.ConnectorID, inv.workloads, selected)
 	p := agentcontain.BuildPreview(agentcontain.PreviewInput{Subject: subjectOf(ctx, ws, inv.identity), Workloads: inv.workloads,
-		Selected: selected, Usage: inv.usage, Cap: inv.cap, ContainmentID: containmentID, Now: s.now().UTC()})
+		Selected: selected, Usage: inv.usage, Cap: inv.cap, ContainmentID: containmentID, Now: s.now().UTC(),
+		Target: strings.TrimSpace(target), Assumers: inv.assumers, Brokered: inv.brokered})
 	return &p, inv, nil
 }
 
@@ -397,7 +418,7 @@ func (s *AgentContain) Preview(ctx context.Context, ws uuid.UUID, req AgentConta
 	if err := RequireAgentContain(s.db); err != nil {
 		return nil, err
 	}
-	p, _, err := s.preview(ctx, ws, req.IdentityID, req.WorkloadIDs, uuid.Nil)
+	p, _, err := s.preview(ctx, ws, req.IdentityID, req.WorkloadIDs, req.Target, uuid.Nil)
 	return p, err
 }
 
@@ -407,13 +428,31 @@ func (s *AgentContain) Preview(ctx context.Context, ws uuid.UUID, req AgentConta
 // is not offered (422 with the refusals), record the containment (state
 // previewed, with its preview) and queue its job. No approval (§10 Q6).
 func (s *AgentContain) Contain(ctx context.Context, ws, actor uuid.UUID, req AgentContainRequest) (*AgentContainmentView, error) {
+	return s.contain(ctx, ws, actor, req, nil)
+}
+
+// contain records a containment; narrowedFrom, when set, is the wider
+// containment it replaces (Narrow), whose active holds it takes over.
+func (s *AgentContain) contain(ctx context.Context, ws, actor uuid.UUID, req AgentContainRequest, narrowedFrom *uuid.UUID) (*AgentContainmentView, error) {
 	// TENANT-EXEMPT: the 151 schema check reads the Postgres catalog only.
 	if err := RequireAgentContain(s.db); err != nil {
 		return nil, err
 	}
 	level := strings.TrimSpace(req.Level)
 	if !agentcontain.ValidLevel(level) {
-		return nil, GovBadParam("level", "level must be workload, model or identity.")
+		return nil, GovBadParam("level", "level must be one of "+strings.Join(agentcontain.Levels, ", ")+".")
+	}
+	var caseID *uuid.UUID
+	if c := strings.TrimSpace(req.CaseID); c != "" {
+		id, err := uuid.Parse(c)
+		if err != nil {
+			return nil, GovBadParam("case_id", "case_id must be a uuid.")
+		}
+		caseID = &id
+	}
+	req.Target = strings.TrimSpace(req.Target)
+	if len(req.Target) > 512 {
+		return nil, GovBadParam("target", "target is too long.")
 	}
 	reason := strings.TrimSpace(req.Reason)
 	if reason == "" {
@@ -427,8 +466,16 @@ func (s *AgentContain) Contain(ctx context.Context, ws, actor uuid.UUID, req Age
 		// narrowed there, they are only shown as the blast radius.
 		req.WorkloadIDs = nil
 	}
+	if agentcontain.FamilyOf(level) != agentcontain.FamilyAWS {
+		return s.containOther(ctx, ws, actor, level, reason, req, caseID, narrowedFrom)
+	}
+	switch level {
+	case agentcontain.LevelKey, agentcontain.LevelSourceIdentity:
+	default:
+		req.Target = ""
+	}
 	id := uuid.New()
-	p, inv, err := s.preview(ctx, ws, req.IdentityID, req.WorkloadIDs, id)
+	p, inv, err := s.preview(ctx, ws, req.IdentityID, req.WorkloadIDs, req.Target, id)
 	if err != nil {
 		return nil, err
 	}
@@ -449,42 +496,99 @@ func (s *AgentContain) Contain(ctx context.Context, ws, actor uuid.UUID, req Age
 	row := AgentContainment{ID: id, WorkspaceID: ws, ConnectorID: inv.identity.ConnectorID, IdentityID: inv.identity.ID,
 		IdentityKind: inv.identity.Kind, IdentityARN: inv.identity.NativeID, UniqueID: p.Subject.UniqueID,
 		WorkloadIDs: pq.StringArray{}, Level: level, State: agentcontain.StatePreviewed, Reason: reason, CreatedBy: actor,
-		Verification: json.RawMessage(`{}`), Preview: raw, CreatedAt: now, UpdatedAt: now}
+		Verification: json.RawMessage(`{}`), Preview: raw, CreatedAt: now, UpdatedAt: now,
+		ProofState: agentcontain.ProofRequested, Target: req.Target, NarrowedFrom: narrowedFrom,
+		TokenExpiryAt: agentcontain.TokenExpiryAt(level, inv.identity.Kind, now)}
 	if level == agentcontain.LevelWorkload {
 		for _, w := range p.Selected {
 			row.WorkloadIDs = append(row.WorkloadIDs, w.String())
 		}
 	}
-	err = tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+	err = s.recordContainment(ctx, ws, actor, &row, caseID, map[string]any{
+		"workload_ids": row.WorkloadIDs, "stops": opt.Stops, "also_stops": opt.AlsoStops,
+		"side_effects": opt.SideEffects, "steps": opt.Steps, "label": p.Subject.Label,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &AgentContainmentView{AgentContainment: row}, nil
+}
+
+// recordContainment inserts the row (one live per identity, level and
+// target), its first hold, the requested event, the narrowed-from holds and
+// its job, in one transaction under RLS for ws.
+func (s *AgentContain) recordContainment(ctx context.Context, ws, actor uuid.UUID, row *AgentContainment, caseID *uuid.UUID, extra map[string]any) error {
+	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
+		if caseID != nil {
+			if err := requireCaseTx(tx, ws, *caseID); err != nil {
+				return err
+			}
+		}
 		var live []AgentContainment
-		if err := tx.Where("workspace_id = ? AND identity_id = ? AND level = ? AND state IN ?", ws, row.IdentityID, level,
-			agentcontain.LiveStates).Limit(1).Find(&live).Error; err != nil {
+		if err := tx.Where("workspace_id = ? AND identity_id = ? AND level = ? AND target = ? AND state IN ?", ws, row.IdentityID, row.Level,
+			row.Target, agentcontain.LiveStates).Limit(1).Find(&live).Error; err != nil {
 			return err
 		}
 		if len(live) > 0 {
 			return govConflict(GovCodeContainmentExists, "This identity already has a live containment at this level; release it first.",
 				map[string]any{"containment_id": live[0].ID, "state": live[0].State})
 		}
-		if err := tx.Create(&row).Error; err != nil {
+		if err := tx.Create(row).Error; err != nil {
 			if isUniqueViolation(err, "uq_agent_containment_live") {
 				return govConflict(GovCodeContainmentExists, "This identity already has a live containment at this level; release it first.", nil)
 			}
 			return err
 		}
 		kind, aid := userActor(actor)
-		if err := appendGovEvent(tx, ws, GovEventContainmentRequested, kind, aid, govEventRefs{}, map[string]any{
-			"containment_id": row.ID, "identity_id": row.IdentityID, "identity_arn": row.IdentityARN, "level": level,
-			"workload_ids": row.WorkloadIDs, "reason": reason, "stops": opt.Stops, "also_stops": opt.AlsoStops,
-			"side_effects": opt.SideEffects, "steps": opt.Steps, "label": p.Subject.Label,
-		}); err != nil {
+		payload := map[string]any{"containment_id": row.ID, "identity_id": row.IdentityID, "identity_arn": row.IdentityARN,
+			"level": row.Level, "target": row.Target, "reason": row.Reason}
+		if row.NarrowedFrom != nil {
+			payload["narrowed_from"] = *row.NarrowedFrom
+		}
+		if caseID != nil {
+			payload["case_id"] = *caseID
+		}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		if err := appendGovEvent(tx, ws, GovEventContainmentRequested, kind, aid, govEventRefs{}, payload); err != nil {
 			return err
 		}
-		return enqueueContainTx(tx, ws, row.ID, now)
+		if caseID != nil {
+			if err := addHoldTx(tx, ws, row.ID, *caseID, actor, s.now().UTC()); err != nil {
+				return err
+			}
+		}
+		if row.NarrowedFrom != nil {
+			if err := copyHoldsTx(tx, ws, *row.NarrowedFrom, row.ID, actor, s.now().UTC()); err != nil {
+				return err
+			}
+		}
+		if row.State == agentcontain.StateRequested {
+			if err := appendGovEvent(tx, ws, GovEventAgentAskNeeded, kind, aid, govEventRefs{}, map[string]any{
+				"containment_id": row.ID, "level": row.Level, "target": row.Target, "reason": row.Reason,
+				"note": "AuthSec cannot stop this on the platform itself; whoever administers it is asked to."}); err != nil {
+				return err
+			}
+			// The platform stop is an ask (W4): whoever administers the
+			// platform stops the agent there and says so.
+			req := actor
+			_, _, err := createAskTx(tx, ws, AskInput{AboutKind: AskAboutContainment, AboutID: row.ID.String(), CaseID: caseID,
+				Question:        "Stop this agent on its platform (" + row.Target + "): AuthSec cannot write there. Reason: " + row.Reason,
+				Choices:         []AskChoice{{ID: "stopped", Label: "Stopped on the platform"}, {ID: "cannot", Label: "Cannot stop it there"}},
+				RequesterUserID: &req, DedupeKey: "platform_stop:" + row.ID.String()}, row.CreatedAt)
+			return err
+		}
+		return enqueueContainTx(tx, ws, row.ID, row.CreatedAt)
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &AgentContainmentView{AgentContainment: row}, nil
+	// The PDP refuses the agent from now on in this process (other
+	// processes within their policy cache lifetime); gateways get it in
+	// their next policy hints (AS-174).
+	InvalidateAgentGatewayWorkspace(ws, uuid.Nil)
+	return nil
 }
 
 // enqueueContainTx asks for the containment's job at `at`, pulling an open
@@ -542,7 +646,7 @@ func (s *AgentContain) List(ctx context.Context, ws uuid.UUID, state string, lim
 
 func validContainState(s string) bool {
 	switch s {
-	case agentcontain.StatePreviewed, agentcontain.StateContaining, agentcontain.StateContained, agentcontain.StatePartial,
+	case agentcontain.StatePreviewed, agentcontain.StateRequested, agentcontain.StateContaining, agentcontain.StateContained, agentcontain.StatePartial,
 		agentcontain.StateFailed, agentcontain.StateReleasing, agentcontain.StateReleased:
 		return true
 	}
@@ -566,7 +670,10 @@ func (s *AgentContain) Get(ctx context.Context, ws, id uuid.UUID) (*AgentContain
 			return err
 		}
 		out = &AgentContainmentView{AgentContainment: *row, Steps: steps}
-		return nil
+		if err := tx.Where("workspace_id = ? AND containment_id = ?", ws, id).Order("held_at, id").Find(&out.Holds).Error; err != nil {
+			return err
+		}
+		return tx.Where("workspace_id = ? AND containment_id = ?", ws, id).Order("requested_at DESC, id").Find(&out.ReleaseRequests).Error
 	})
 	return out, err
 }
@@ -596,62 +703,6 @@ func loadSteps(tx *gorm.DB, ws, id uuid.UUID) ([]AgentContainmentStep, error) {
 }
 
 /* --------------------------------- release --------------------------------- */
-
-// Release is POST /containments/:id/release: the containment moves to
-// releasing and its job restores every recorded before-state.
-func (s *AgentContain) Release(ctx context.Context, ws, actor, id uuid.UUID, req AgentContainReleaseRequest) (*AgentContainmentView, error) {
-	// TENANT-EXEMPT: the 151 schema check reads the Postgres catalog only.
-	if err := RequireAgentContain(s.db); err != nil {
-		return nil, err
-	}
-	reason := strings.TrimSpace(req.Reason)
-	if reason == "" {
-		return nil, GovBadParam("reason", "A release needs a reason.")
-	}
-	if len(reason) > MaxContainReason {
-		return nil, GovBadParam("reason", "reason is too long.")
-	}
-	var out *AgentContainmentView
-	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
-		row, err := loadContainment(tx, ws, id, true)
-		if err != nil {
-			return err
-		}
-		releasable := false
-		for _, st := range agentcontain.ReleasableStates {
-			if row.State == st {
-				releasable = true
-			}
-		}
-		if !releasable {
-			return govConflict(GovCodeNotReleasable, "This containment cannot be released in state "+row.State+".",
-				map[string]any{"state": row.State})
-		}
-		now := s.now().UTC()
-		a := actor
-		res := tx.Model(&AgentContainment{}).Where("workspace_id = ? AND id = ? AND state = ?", ws, id, row.State).
-			Updates(map[string]any{"state": agentcontain.StateReleasing, "release_reason": reason, "release_requested_at": now,
-				"released_by": a, "updated_at": now})
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected != 1 {
-			return govConflict(GovCodeNotReleasable, "The containment changed meanwhile; read it again.", nil)
-		}
-		kind, aid := userActor(actor)
-		if err := appendGovEvent(tx, ws, GovEventContainmentReleaseReq, kind, aid, govEventRefs{}, map[string]any{
-			"containment_id": id, "from": row.State, "reason": reason}); err != nil {
-			return err
-		}
-		if err := enqueueContainTx(tx, ws, id, now); err != nil {
-			return err
-		}
-		row.State, row.ReleaseReason, row.ReleaseRequestedAt, row.ReleasedBy, row.UpdatedAt = agentcontain.StateReleasing, reason, &now, &a, now
-		out = &AgentContainmentView{AgentContainment: *row}
-		return nil
-	})
-	return out, err
-}
 
 // HoldsPermission is WorkspaceUserHoldsPermission under RLS for ws (the
 // identity level's governance:emergency check).

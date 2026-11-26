@@ -13,15 +13,45 @@ authsec:
 # mode, or no hints were ever fetched; allow otherwise. closed | open.
 fail_mode: auto
 
+# Agent keys (W6): AuthSec issues each agent its key (agk_..., POST
+# /api/iga/v1/agent-runtime/gateway-agent-keys), bound to the agent's workload
+# identity (a SPIFFE ID and/or an AuthSec workload id). The gateway receives
+# the hashes in its policy hints and accepts a key ONLY together with that
+# verified workload identity (mTLS client certificate, or the trusted header).
+# Locally generated keys (agents.keys) are legacy: refused unless
+# legacy_agent_keys: true (default false; set it only while moving agents to
+# AuthSec-issued keys, then remove it and agents.keys).
+legacy_agent_keys: false
+
 agents:
-  keys:
-    # agent-gateway gen-key  -> give the key to the agent, put its sha256 here.
-    - id: billing-agent
-      key_sha256: "<64 hex>"
-      labels: [prod, billing]
-      # identity_id / workload_id: AuthSec ids, when policies select by them
+  # allow_spiffe_only: false       # a SPIFFE ID with no agent key (default refused)
+  spiffe:
+    # Maps a verified SPIFFE ID to an AuthSec workload id (a key bound to a
+    # workload id is accepted only from a SPIFFE ID mapped to it).
+    - id: spiffe://acme.example/ns/prod/sa/billing
+      workload_id: "<AuthSec workload id>"
   # trust_spiffe_header: true      # only behind an mTLS-terminating proxy
   # spiffe_header: X-Client-SPIFFE-ID
+  # keys:                          # legacy only (legacy_agent_keys: true)
+  #   - id: billing-agent
+  #     key_sha256: "<64 hex>"
+
+# Provider keys (W6): authsec (default) fetches the provider keys AuthSec holds
+# for this gateway (added at /api/iga/v1/agent-runtime/gateway-provider-keys,
+# stored in AuthSec's Vault) with the gateway credential and keeps them in
+# memory only, never on disk. local reads each llm entry's api_key_env.
+provider_keys: authsec
+
+# Calls held for a person (a policy's argument bounds with on_violation: hold):
+# wait up to wait_timeout_s for the decision, else answer HTTP 202 "held"; or
+# return "held" at once. The agent retries the same call with X-AuthSec-Hold-Id.
+holds:
+  mode: wait                       # wait | return
+  wait_timeout_s: 30
+  poll_interval_ms: 1000
+
+# X-AuthSec-Run-Id: taken from the agent (or made), logged with every decision,
+# echoed to the agent and passed on to MCP servers.
 
 mcp_servers:
   - name: github
@@ -34,9 +64,10 @@ mcp_servers:
 
 llm:
   - provider: openai                 # agents: base_url http://agent-gateway:8080/llm/openai/v1
-    api_key_env: OPENAI_API_KEY
+    provider_key: openai-prod        # AuthSec key name or id (omit: the only openai key)
+    # api_key_env: OPENAI_API_KEY    # provider_keys: local only
   - provider: anthropic              # agents: base_url http://agent-gateway:8080/llm/anthropic
-    api_key_env: ANTHROPIC_API_KEY
+    # api_key_env: ANTHROPIC_API_KEY # provider_keys: local only
 
 pin_store: /var/lib/agent-gateway/pins.json
 admin_token_env: AGENT_GATEWAY_ADMIN_TOKEN     # local pin approval on 127.0.0.1:9091

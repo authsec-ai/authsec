@@ -158,16 +158,31 @@ var openAIUsageEndpoints = []string{"/organization/usage/completions", "/organiz
 
 // Usage reads both endpoints in 1 h buckets grouped by key, project, model.
 func (c *openAIClient) Usage(ctx context.Context, from, to time.Time) ([]UsageRow, error) {
-	agg := newUsageAgg()
+	return c.usage(ctx, from, to, WidthHour, nil)
+}
+
+// UsageMinutes reads both endpoints in 1 m buckets (limit 1440 per page).
+func (c *openAIClient) UsageMinutes(ctx context.Context, from, to time.Time, keyIDs []string) ([]UsageRow, error) {
+	return c.usage(ctx, from, to, WidthMinute, keyIDs)
+}
+
+func (c *openAIClient) usage(ctx context.Context, from, to time.Time, width string, keyIDs []string) ([]UsageRow, error) {
+	agg, limit := newUsageAgg(), "168"
+	if width == WidthMinute {
+		agg, limit = newUsageAggWidth(time.Minute), "1440"
+	}
 	for _, ep := range openAIUsageEndpoints {
 		page := ""
 		for i := 0; i < maxPages; i++ {
 			q := url.Values{
 				"start_time":   {strconv.FormatInt(from.Unix(), 10)},
 				"end_time":     {strconv.FormatInt(to.Unix(), 10)},
-				"bucket_width": {"1h"},
+				"bucket_width": {width},
 				"group_by":     {"api_key_id", "project_id", "model"},
-				"limit":        {"168"},
+				"limit":        {limit},
+			}
+			if len(keyIDs) > 0 {
+				q["api_key_ids"] = keyIDs
 			}
 			if page != "" {
 				q.Set("page", page)
@@ -192,6 +207,60 @@ func (c *openAIClient) Usage(ctx context.Context, from, to time.Time) ([]UsageRo
 		}
 	}
 	return agg.rows(), nil
+}
+
+type openAICostPage struct {
+	Data []struct {
+		StartTime int64 `json:"start_time"`
+		Results   []struct {
+			Amount struct {
+				Value    float64 `json:"value"`
+				Currency string  `json:"currency"`
+			} `json:"amount"`
+			ProjectID *string `json:"project_id"`
+			APIKeyID  *string `json:"api_key_id"`
+		} `json:"results"`
+	} `json:"data"`
+	HasMore  bool    `json:"has_more"`
+	NextPage *string `json:"next_page"`
+}
+
+// Costs reads GET /organization/costs in 1 d buckets grouped by key and
+// project (the endpoint reports daily buckets only).
+func (c *openAIClient) Costs(ctx context.Context, from, to time.Time) ([]CostRow, error) {
+	var out []CostRow
+	page := ""
+	for i := 0; i < maxPages; i++ {
+		q := url.Values{
+			"start_time":   {strconv.FormatInt(from.Unix(), 10)},
+			"end_time":     {strconv.FormatInt(to.Unix(), 10)},
+			"bucket_width": {WidthDay},
+			"group_by":     {"api_key_id", "project_id"},
+			"limit":        {"180"},
+		}
+		if page != "" {
+			q.Set("page", page)
+		}
+		var p openAICostPage
+		if _, err := c.h.get(ctx, "/organization/costs", q, &p); err != nil {
+			return nil, err
+		}
+		for _, b := range p.Data {
+			for _, r := range b.Results {
+				if r.Amount.Currency != "" && r.Amount.Currency != "usd" {
+					continue
+				}
+				out = append(out, CostRow{KeyID: str(r.APIKeyID), ProjectID: str(r.ProjectID),
+					BucketStart: time.Unix(b.StartTime, 0).UTC().Truncate(24 * time.Hour), USD: r.Amount.Value})
+			}
+		}
+		next := str(p.NextPage)
+		if !p.HasMore || next == "" || next == page {
+			break
+		}
+		page = next
+	}
+	return out, nil
 }
 
 type openAIAuditLog struct {

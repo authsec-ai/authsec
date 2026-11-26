@@ -93,6 +93,15 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// Agent runtime visibility P3: agent containment, the same auth,
 		// envelope and policy gate (agent_runtime_contain_controller.go).
 		platformCtrl.MountAgentRuntimeContainRoutes(r, igaGraphRead.Policy(), middlewares.AuthMiddleware(), middlewares.Require)
+		// One agent id, lifecycle, classification, directory, responder
+		// groups and hygiene (SPEC-secops-backend-upgrade.md W7):
+		// /api/iga/v1/{agent-identities,agent-changes,resources/:id/classification,
+		// directory,agent-hygiene,responder-groups} (agent_identity_controller.go).
+		platformCtrl.MountAgentIdentityRoutes(r, platformCtrl.NewAgentIdentityControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require)
+		// Remediation (SPEC-secops-backend-upgrade.md W8): /api/iga/v1/remediations
+		// (plan, apply at tier 4 with a second person, proof, cancel) and the
+		// remediation role bindings (agent_remediation_controller.go).
+		platformCtrl.MountRemediationRoutes(r, platformCtrl.NewRemediationControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a
@@ -104,6 +113,15 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime/{alerts,alert-settings,siem-endpoints}
 		// (agent_runtime_alerts_controller.go).
 		platformCtrl.MountAgentRuntimeAlertRoutes(iga, platformCtrl.NewAgentRuntimeAlertsControllerFor(igaGraphRead))
+
+		// Agent runtime cases (SPEC-secops-backend-upgrade.md W3):
+		// /api/iga/v1/agent-runtime/cases (agent_runtime_cases_controller.go).
+		platformCtrl.MountAgentRuntimeCaseRoutes(iga, platformCtrl.NewAgentRuntimeCasesControllerFor(igaGraphRead))
+
+		// Asks and their delivery (SPEC-secops-backend-upgrade.md W4):
+		// /api/iga/v1/agent-runtime/asks[/policy|/:id/...], case tickets and
+		// /api/iga/v1/integrations/{ticketing,paging} (agent_asks_controller.go).
+		platformCtrl.MountAgentAskRoutes(iga, platformCtrl.NewAgentAsksControllerFor(igaGraphRead))
 
 		// Model provider usage (SPEC-agent-runtime-provider-usage.md, opt-in):
 		// /api/iga/v1/agent-runtime/model-providers
@@ -119,5 +137,29 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime (agent_gateway_controller.go). The PDP
 		// itself is /authsec/pdp/* (routes.go), authenticated by the gateway.
 		platformCtrl.MountAgentGatewayRoutes(iga, platformCtrl.NewAgentGatewayControllerFor(igaGraphRead))
+
+		// Pending changes (tier 3, a second person approves; migration 163):
+		// /api/iga/v1/pending-changes (pending_change_controller.go).
+		platformCtrl.MountPendingChangeRoutes(iga, platformCtrl.NewPendingChangeControllerFor(igaGraphRead))
+		// Evidence store and coverage (SPEC-secops W1): evidence, retention,
+		// trail backfill, Azure diagnostic ingest secrets, capability states
+		// and gap declarations (agent_evidence_controller.go).
+		platformCtrl.MountAgentEvidenceRoutes(iga, platformCtrl.NewAgentEvidenceControllerFor(igaGraphRead))
+		// History and metrics (SPEC-secops-backend-upgrade.md W9): daily
+		// snapshots and as-of reads, legal holds, redaction, SOC and posture
+		// metrics, CISO and population reports, bulk exports, and the
+		// second-person requests of tier-3 changes (iga_history_controller.go).
+		platformCtrl.MountIGAHistoryRoutes(iga, platformCtrl.NewIGAHistoryControllerFor(igaGraphRead))
+		// One approvals inbox over every second-person mechanism, and the
+		// review of break-glass changes (SPEC-secops-backend-upgrade.md W5):
+		// /api/iga/v1/approvals (governance_tier_guard.go).
+		platformCtrl.MountApprovalsRoutes(iga, platformCtrl.NewApprovalsControllerFor(igaGraphRead))
 	}
+
+	// Audit governance (SPEC-secops-backend-upgrade.md F7 / P18):
+	// /api/iga/v1/audit/* and the operator suspension routes under
+	// /authsec/admin/operators, behind the same AuthMiddleware
+	// (audit_governance_controller.go). Mounted here so the tests that mount
+	// SetupIGARoutes reach them through the production chain.
+	platformCtrl.MountAuditGovernanceRoutes(r, platformCtrl.NewAuditGovernanceControllerFor(igaGraphRead), middlewares.AuthMiddleware())
 }

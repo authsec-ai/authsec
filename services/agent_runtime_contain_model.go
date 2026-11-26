@@ -50,6 +50,21 @@ type AgentContainment struct {
 	Preview            json.RawMessage `json:"preview" gorm:"type:jsonb;not null;default:'{}'"`
 	CreatedAt          time.Time       `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt          time.Time       `json:"updated_at" gorm:"not null;default:now()"`
+	// Proof (migration 193, SecOps P4): requested -> applied -> proven |
+	// unproven | cannot_verify -> kept (agentcontain.ProofStateOf).
+	ProofState      string  `json:"proof_state" gorm:"not null;default:'requested'"`
+	ProvenByEventID *string `json:"proven_by_event_id"`
+	// SkewMs is how late the proving event reached AuthSec (received minus
+	// event time), in milliseconds.
+	SkewMs *int64 `json:"skew_ms"`
+	// TokenExpiryAt is the latest time a credential issued before the stop
+	// can still be live (agentcontain.TokenExpiryAt).
+	TokenExpiryAt *time.Time `json:"token_expiry_at"`
+	// Target is what the stop names within the identity (key id, agent,
+	// gateway subject); "" for the identity-wide levels.
+	Target string `json:"target" gorm:"not null;default:''"`
+	// NarrowedFrom is the wider containment this one replaces.
+	NarrowedFrom *uuid.UUID `json:"narrowed_from" gorm:"type:uuid"`
 }
 
 // TableName pins agent_containment.
@@ -117,6 +132,11 @@ const (
 	GovEventContainmentStepRestored    = "containment.step_restored"
 	GovEventContainmentReleased        = "containment.released"
 	GovEventContainmentRevocationEnded = "containment.revocation_removed"
+	// A released access-key step: the key was left as it was (never
+	// reactivated, DECISION P3-4a) and a new key must be issued.
+	GovEventContainmentKeyRotation   = "containment.access_key_rotation_required"
+	GovEventContainmentReapplied     = "containment.reapplied"
+	GovEventContainmentReapplyPaused = "containment.reapply_paused"
 )
 
 // GovCatAgentContainment is the Logs category of containment events.
@@ -137,20 +157,23 @@ func init() {
 		GovEventKind{GovEventContainmentContained, GovCatAgentContainment, GovObjContainment, "Every containment change is in place and read back."},
 		GovEventKind{GovEventContainmentPartial, GovCatAgentContainment, GovObjContainment, "Some containment changes are in place; others were refused."},
 		GovEventKind{GovEventContainmentFailed, GovCatAgentContainment, GovObjContainment, "No containment change could be applied."},
-		GovEventKind{GovEventContainmentVerified, GovCatAgentContainment, GovObjContainment, "No successful call by the contained identity was seen after the grace period."},
-		GovEventKind{GovEventContainmentUnverifiable, GovCatAgentContainment, GovObjContainment, "The containment's effect cannot be confirmed from CloudTrail (no events received since it, or its workloads cannot be told apart); it is neither verified nor not effective."},
+		GovEventKind{GovEventContainmentVerified, GovCatAgentContainment, GovObjContainment, "AWS refused a call by the contained identity after the grace period with a message naming the containment's policy (the proving event is attached). Absence of calls never verifies."},
+		GovEventKind{GovEventContainmentUnverifiable, GovCatAgentContainment, GovObjContainment, "The containment's effect cannot be confirmed from CloudTrail (no refused call naming its policy within a day, no events received since it, or a level no refusal can prove); it is neither verified nor not effective."},
 		GovEventKind{GovEventContainmentNotEffective, GovCatAgentContainment, GovObjContainment, "A successful call by the contained identity after the grace period: the containment is not effective (events attached)."},
 		GovEventKind{GovEventContainmentDrifted, GovCatAgentContainment, GovObjContainment, "A containment change was undone outside AuthSec (read back while contained)."},
+		GovEventKind{GovEventContainmentReapplied, GovCatAgentContainment, GovObjContainment, "A containment change undone outside AuthSec was re-applied (read back while contained)."},
+		GovEventKind{GovEventContainmentReapplyPaused, GovCatAgentContainment, GovObjContainment, "Re-applying a containment was paused: it was undone outside AuthSec again after repeated re-applications within an hour; a person needs to look."},
 		GovEventKind{GovEventContainmentReleaseReq, GovCatAgentContainment, GovObjContainment, "Release of a containment was requested (with a reason)."},
 		GovEventKind{GovEventContainmentStepRestored, GovCatAgentContainment, GovObjContainment, "One containment change was restored to its recorded before-state."},
 		GovEventKind{GovEventContainmentReleased, GovCatAgentContainment, GovObjContainment, "Every containment change was restored (a session revocation may stay until its time)."},
 		GovEventKind{GovEventContainmentRevocationEnded, GovCatAgentContainment, GovObjContainment, "The session revocation kept after release was removed at its time."},
+		GovEventKind{GovEventContainmentKeyRotation, GovCatAgentContainment, GovObjContainment, "Release left an access key the containment deactivated as it was (never reactivated: it may have leaked); issue a new key for the user and delete the old one."},
 	)
 	govEventObjectFilters[GovObjContainment] = struct{ column, payloadKey string }{payloadKey: "containment_id"}
 }
 
 // AgentContainSchemaHead is the migration containment needs.
-const AgentContainSchemaHead = "159"
+const AgentContainSchemaHead = "194"
 
 var agentContainSchema struct {
 	sync.Mutex
@@ -162,7 +185,8 @@ var agentContainSchema struct {
 // VerifyAgentContainSchema checks 151's objects and 159's index.
 func VerifyAgentContainSchema(db *gorm.DB) error {
 	var missing []string
-	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target"} {
+	for _, rel := range []string{"agent_containment", "agent_containment_step", "uq_agent_containment_live", "uq_agent_containment_step_live_target",
+		"agent_containment_hold", "agent_containment_release_request", "uq_agent_containment_hold_active"} {
 		ok, err := repositories.HasRelation(db, rel)
 		if err != nil {
 			return fmt.Errorf("agent containment schema verification could not run: %w", err)
@@ -177,6 +201,21 @@ func VerifyAgentContainSchema(db *gorm.DB) error {
 	}
 	if !ok {
 		missing = append(missing, "constraint iga_gov_job.iga_gov_job_kind_check admitting "+GovJobAgentContain)
+	}
+	// 193: the W2 levels and the proof columns.
+	for _, c := range []struct{ con, v string }{{"agent_containment_level_check", agentcontain.LevelPlatform},
+		{"agent_containment_proof_state_check", agentcontain.ProofKept}, {"agent_containment_step_kind_check", agentcontain.StepK8sBindingSubject}} {
+		tbl := "agent_containment"
+		if c.con == "agent_containment_step_kind_check" {
+			tbl = "agent_containment_step"
+		}
+		ok, err := repositories.ConstraintAdmits(db, tbl, c.con, c.v)
+		if err != nil {
+			return fmt.Errorf("agent containment schema verification could not run: %w", err)
+		}
+		if !ok {
+			missing = append(missing, "constraint "+tbl+"."+c.con+" admitting "+c.v)
+		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("agent containment needs migration %s; missing: %s", AgentContainSchemaHead, strings.Join(missing, ", "))

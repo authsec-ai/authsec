@@ -349,7 +349,7 @@ func TestPreviewRefusesProtected(t *testing.T) {
 	w := newWorld()
 	w.lambdaA.Tags = map[string]string{"authsec:protected": "TRUE"}
 	p := BuildPreview(PreviewInput{Subject: s, Workloads: []Workload{w.lambdaA}, Selected: []uuid.UUID{w.lambdaA.ID}, Cap: fullCap()})
-	for _, l := range Levels {
+	for _, l := range AWSLevels {
 		o := p.Level(l)
 		if o.Offered || !hasCode(o.Refusals, RefuseProtected) {
 			t.Errorf("%s level on protected resources: offered=%v refusals=%+v", l, o.Offered, o.Refusals)
@@ -578,7 +578,7 @@ func TestIdentityLevelRoleContainAndRelease(t *testing.T) {
 	}
 }
 
-func TestIdentityLevelUserKeysRestoredExactly(t *testing.T) {
+func TestIdentityLevelUserKeysNeverReactivated(t *testing.T) {
 	f := newFake()
 	s := userSubject()
 	f.keys[s.Name] = map[string]bool{"AKIAACTIVE1": true, "AKIAINACTIVE": false}
@@ -602,9 +602,80 @@ func TestIdentityLevelUserKeysRestoredExactly(t *testing.T) {
 	if !f.policies[steps[0].Target].attached[s.Name] {
 		t.Fatal("deny-all not attached to the user")
 	}
-	release(t, e, steps, time.Now())
-	if !f.keys[s.Name]["AKIAACTIVE1"] || f.keys[s.Name]["AKIAINACTIVE"] {
-		t.Fatalf("release must reactivate only the keys it deactivated: %v", f.keys[s.Name])
+	f.calls = nil
+	steps = release(t, e, steps, time.Now())
+	// DECISION P3-4a: a stopped key may be what leaked; release never
+	// activates it, whatever it was before.
+	if f.keys[s.Name]["AKIAACTIVE1"] || f.keys[s.Name]["AKIAINACTIVE"] {
+		t.Fatalf("release must never reactivate an access key: %v", f.keys[s.Name])
+	}
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "UpdateAccessKey") {
+			t.Fatalf("release wrote an access key status (%s); calls %v", c, f.calls)
+		}
+	}
+	if _, ok := f.policies[steps[0].Target]; ok {
+		t.Error("the deny-all policy must still be removed at release")
+	}
+	key := steps[1]
+	if !KeyRotationRequired(key) {
+		t.Fatalf("the released key step must record that a new key is required: after=%s", key.After)
+	}
+	var left KeyLeft
+	if err := json.Unmarshal(key.After, &left); err != nil || left.Status != "Inactive" || left.UserName != s.Name {
+		t.Fatalf("key after-state %s (%v): want Inactive for %s", key.After, err, s.Name)
+	}
+	if !strings.Contains(key.Error, "left Inactive") || !strings.Contains(key.Error, "issue a new access key") {
+		t.Errorf("the step note must tell a human to rotate the key: %q", key.Error)
+	}
+	if done, _ := ReleaseDone(steps, time.Now()); !done {
+		t.Error("leaving the key Inactive must not hold up the release")
+	}
+}
+
+// A key changed outside AuthSec while contained, deleted, or unreadable at
+// release: never written, always recorded.
+func TestReleaseKeyNeverWritten(t *testing.T) {
+	cases := []struct {
+		name       string
+		keys       map[string]bool
+		listErr    error
+		wantStatus string
+		wantRotate bool
+		wantNote   string
+	}{
+		{"reactivated outside AuthSec", map[string]bool{"AKIAACTIVE1": true}, nil, "Active", true, "reactivated outside AuthSec"},
+		{"deleted", map[string]bool{}, nil, KeyStatusDeleted, false, "no longer exists"},
+		{"user gone", nil, ErrNotFound, KeyStatusDeleted, false, "no longer exists"},
+		{"read refused", map[string]bool{"AKIAACTIVE1": false}, ErrDenied, KeyStatusUnknown, true, "left Inactive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake()
+			s := userSubject()
+			f.keys[s.Name] = tc.keys
+			b, _ := json.Marshal(KeyBefore{UserName: s.Name, Status: "Active"})
+			st := Step{Kind: StepAccessKey, Target: "AKIAACTIVE1", Before: b, State: StepRestoring}
+			if tc.listErr != nil {
+				f.failNext["ListAccessKeys"] = tc.listErr
+			}
+			e := &Engine{AWS: f, Run: runOf(s, LevelIdentity)}
+			if err := e.Restore(context.Background(), &st); err != nil {
+				t.Fatalf("restore must not fail on the key: %v", err)
+			}
+			for _, c := range f.calls {
+				if strings.HasPrefix(c, "UpdateAccessKey") {
+					t.Fatalf("release wrote an access key status: %v", f.calls)
+				}
+			}
+			var left KeyLeft
+			if err := json.Unmarshal(st.After, &left); err != nil || left.Status != tc.wantStatus || left.RotateRequired != tc.wantRotate {
+				t.Fatalf("after %s (%v): want status %s rotate %v", st.After, err, tc.wantStatus, tc.wantRotate)
+			}
+			if KeyRotationRequired(st) != tc.wantRotate || !strings.Contains(st.Error, tc.wantNote) {
+				t.Errorf("note %q rotate %v", st.Error, KeyRotationRequired(st))
+			}
+		})
 	}
 }
 

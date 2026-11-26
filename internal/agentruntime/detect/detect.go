@@ -41,6 +41,19 @@ const (
 	D6 ID = "D6" // new model or volume spike
 	D7 ID = "D7" // new role assumption
 	D8 ID = "D8" // model call from an unexpected place
+
+	// COV01 is the coverage alert "a source fell silent" (SPEC-secops W1).
+	// It is raised by the coverage worker, never by Evaluate, so it is not in
+	// All (which the per-event detections and their settings range over).
+	COV01 ID = "COV-01"
+
+	// USAGE02 (outside use: a provider key used in a minute neither the
+	// gateway nor any estate lookup or flow explains) and USAGE03 (bypass:
+	// estate traffic to a provider in a minute the gateway saw no call) are
+	// raised by the usage reconciliation (SPEC-secops W6), never by
+	// Evaluate, so they are not in All. Both are signals (W3 clustering).
+	USAGE02 ID = "USAGE-02"
+	USAGE03 ID = "USAGE-03"
 )
 
 // All lists every detection, in order.
@@ -56,21 +69,63 @@ func Valid(id ID) bool {
 	return false
 }
 
-// Severities.
+// Severities. No detection raises SeverityLow itself; a workspace's rules
+// may set it as a detection's severity (services' alert settings).
 const (
 	SeverityHigh   = "high"
 	SeverityMedium = "medium"
+	SeverityLow    = "low"
 )
 
 // SeverityRank orders severities (higher is worse); unknown is 0.
 func SeverityRank(s string) int {
 	switch s {
 	case SeverityHigh:
-		return 2
+		return 3
 	case SeverityMedium:
+		return 2
+	case SeverityLow:
 		return 1
 	}
 	return 0
+}
+
+// ValidSeverity reports whether s is a known severity.
+func ValidSeverity(s string) bool { return SeverityRank(s) > 0 }
+
+// DefaultSeverity is the highest severity id raises on its own (D1 and D4
+// raise medium for some calls, high for others).
+func DefaultSeverity(id ID) string {
+	switch id {
+	case D1, D2, D3, D4:
+		return SeverityHigh
+	}
+	return SeverityMedium
+}
+
+// HarmfulOnSuccess reports whether id records a harmful outcome that
+// SUCCEEDED: D1 (a secret was read), D2 (credentials were created), D3 (IAM
+// was changed), D4 (logging was weakened) and D7 (a new role was assumed)
+// fire only on a call that succeeded (Evaluate's success gate), so every
+// event they cite is a success. D5 counts refused calls (attempts); D6 and
+// D8 flag unusual but permitted model use, not a harmful outcome.
+//
+// DECISION (SecOps P6): an alert suppression never silences a harmful
+// outcome that succeeded, so suppressions may not name these detections,
+// and SucceededHarm guards the alert path as well.
+func HarmfulOnSuccess(id ID) bool {
+	switch id {
+	case D1, D2, D3, D4, D7:
+		return true
+	}
+	return false
+}
+
+// SucceededHarm reports whether finding f on event e records a harmful
+// outcome that succeeded: a HarmfulOnSuccess detection on a call that
+// returned no error.
+func SucceededHarm(f Finding, e agentruntime.Event) bool {
+	return HarmfulOnSuccess(f.Detection) && e.ErrorCode == "" && !e.AuthorizationDenied
 }
 
 // Name is a detection's short title, as the console and Slack show it.
@@ -92,6 +147,12 @@ func Name(id ID) string {
 		return "New role assumption"
 	case D8:
 		return "Model call from an unexpected place"
+	case COV01:
+		return "Source silent"
+	case USAGE02:
+		return "Provider key used outside AuthSec's view"
+	case USAGE03:
+		return "Model provider reached around the gateway"
 	}
 	return string(id)
 }

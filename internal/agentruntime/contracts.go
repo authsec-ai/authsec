@@ -67,6 +67,15 @@ type Event struct {
 	// InvokedBy is userIdentity.invokedBy, set when an AWS service made the
 	// call on the principal's behalf.
 	InvokedBy string
+	// AccessKeyID is userIdentity.accessKeyId: the long-term key (AKIA...)
+	// or the temporary credential (ASIA...) the call was signed with.
+	AccessKeyID string
+	// SourceIdentity is userIdentity.sessionContext.sourceIdentity (set by
+	// whoever opened the role session, e.g. AuthSec's broker), "" when none.
+	SourceIdentity string
+	// SessionCreatedAt is sessionContext.attributes.creationDate: when the
+	// temporary credentials were issued (aws:TokenIssueTime), nil when none.
+	SessionCreatedAt *time.Time
 
 	ErrorCode    string
 	ErrorMessage string
@@ -79,6 +88,13 @@ type Event struct {
 	RequestFacts map[string]string
 	// Resources are the ARNs the record lists in resources[].
 	Resources []string
+
+	// Provider is the event id's namespace: "" or ProviderAWS for a
+	// CloudTrail record, ProviderAzure, ProviderK8s (evidence.go).
+	Provider string
+	// RawHash is sha256 (lower-case hex) of the record as received, set by
+	// the parsers; "" when the event was built in memory.
+	RawHash string
 }
 
 // Request fact keys (Event.RequestFacts).

@@ -89,7 +89,9 @@ func TestDNSInsightsFilterAgreesWithTheList(t *testing.T) {
 	for _, must := range []string{
 		"| filter query_name like /" + pattern + "/",
 		"coalesce(srcids.instance, \"-\") as src_instance",
-		"stats count(*) as queries, min(@timestamp) as first_seen, max(@timestamp) as last_seen by srcaddr, src_instance, vpc, query_name",
+		"stats count(*) as queries, min(@timestamp) as first_seen, max(@timestamp) as last_seen by minute, srcaddr, src_instance, vpc, query_name, answer",
+		"datefloor(@timestamp, 1m) as minute",
+		"coalesce(answers.0.Rdata, \"-\") as answer",
 		"| limit 10000",
 	} {
 		if !strings.Contains(q, must) {

@@ -3,6 +3,8 @@ package modelprovider
 import (
 	"context"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -181,15 +183,30 @@ type anthropicUsagePage struct {
 // workspace and model. Input tokens are uncached + cache read + cache
 // creation; requests are not reported (nil).
 func (c *anthropicClient) Usage(ctx context.Context, from, to time.Time) ([]UsageRow, error) {
-	agg := newUsageAgg()
+	return c.usage(ctx, from, to, WidthHour, nil)
+}
+
+// UsageMinutes reads the report in 1 m buckets (limit 1440 per page).
+func (c *anthropicClient) UsageMinutes(ctx context.Context, from, to time.Time, keyIDs []string) ([]UsageRow, error) {
+	return c.usage(ctx, from, to, WidthMinute, keyIDs)
+}
+
+func (c *anthropicClient) usage(ctx context.Context, from, to time.Time, width string, keyIDs []string) ([]UsageRow, error) {
+	agg, limit := newUsageAgg(), "168"
+	if width == WidthMinute {
+		agg, limit = newUsageAggWidth(time.Minute), "1440"
+	}
 	page := ""
 	for i := 0; i < maxPages; i++ {
 		q := url.Values{
 			"starting_at":  {from.UTC().Format(time.RFC3339)},
 			"ending_at":    {to.UTC().Format(time.RFC3339)},
-			"bucket_width": {"1h"},
+			"bucket_width": {width},
 			"group_by[]":   {"api_key_id", "workspace_id", "model"},
-			"limit":        {"168"},
+			"limit":        {limit},
+		}
+		if len(keyIDs) > 0 {
+			q["api_key_ids[]"] = keyIDs
 		}
 		if page != "" {
 			q.Set("page", page)
@@ -216,6 +233,62 @@ func (c *anthropicClient) Usage(ctx context.Context, from, to time.Time) ([]Usag
 		page = next
 	}
 	return agg.rows(), nil
+}
+
+type anthropicCostPage struct {
+	Data []struct {
+		StartingAt string `json:"starting_at"`
+		Results    []struct {
+			Currency    string  `json:"currency"`
+			Amount      string  `json:"amount"`
+			WorkspaceID *string `json:"workspace_id"`
+		} `json:"results"`
+	} `json:"data"`
+	HasMore  bool    `json:"has_more"`
+	NextPage *string `json:"next_page"`
+}
+
+// Costs reads GET /organizations/cost_report (daily buckets only), grouped
+// by workspace. Amounts are decimal strings in cents (USD).
+func (c *anthropicClient) Costs(ctx context.Context, from, to time.Time) ([]CostRow, error) {
+	var out []CostRow
+	page := ""
+	for i := 0; i < maxPages; i++ {
+		q := url.Values{
+			"starting_at": {from.UTC().Format(time.RFC3339)},
+			"ending_at":   {to.UTC().Format(time.RFC3339)},
+			"group_by[]":  {"workspace_id"},
+		}
+		if page != "" {
+			q.Set("page", page)
+		}
+		var p anthropicCostPage
+		if _, err := c.h.get(ctx, "/organizations/cost_report", q, &p); err != nil {
+			return nil, err
+		}
+		for _, b := range p.Data {
+			start, err := time.Parse(time.RFC3339Nano, b.StartingAt)
+			if err != nil {
+				continue
+			}
+			for _, r := range b.Results {
+				if r.Currency != "" && !strings.EqualFold(r.Currency, "USD") {
+					continue
+				}
+				cents, err := strconv.ParseFloat(strings.TrimSpace(r.Amount), 64)
+				if err != nil {
+					continue
+				}
+				out = append(out, CostRow{ProjectID: str(r.WorkspaceID), BucketStart: start.UTC().Truncate(24 * time.Hour), USD: cents / 100})
+			}
+		}
+		next := str(p.NextPage)
+		if !p.HasMore || next == "" || next == page {
+			break
+		}
+		page = next
+	}
+	return out, nil
 }
 
 // KeyEvents: the Anthropic Admin API has no audit log of key events.

@@ -16,6 +16,12 @@ const (
 	SCIMSchemaServiceProvider = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"
 	SCIMSchemaSchema          = "urn:ietf:params:scim:schemas:core:2.0:Schema"
 	SCIMSchemaResourceType    = "urn:ietf:params:scim:schemas:core:2.0:ResourceType"
+	// SCIMEnterpriseUserSchema is RFC 7643 §4.3's enterprise user extension
+	// (manager, department, ...; employeeType as Entra and Okta send it).
+	SCIMEnterpriseUserSchema = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+	// SCIMAuthSecUserSchema is AuthSec's extension: leave dates and an
+	// explicit contractor flag, for directories that send them.
+	SCIMAuthSecUserSchema = "urn:authsec:params:scim:schemas:extension:directory:1.0:User"
 )
 
 // SCIMMeta represents SCIM resource metadata
@@ -297,6 +303,35 @@ type SCIMCreateUserInput struct {
 	Title       string      `json:"title,omitempty"`
 	Department  string      `json:"department,omitempty"`
 	Password    string      `json:"password,omitempty"`
+	// UserType is core's userType ("Employee", "Contractor").
+	UserType string `json:"userType,omitempty"`
+	// Enterprise is the enterprise user extension.
+	Enterprise *SCIMEnterpriseUser `json:"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User,omitempty"`
+	// AuthSec is AuthSec's directory extension.
+	AuthSec *SCIMAuthSecUser `json:"urn:authsec:params:scim:schemas:extension:directory:1.0:User,omitempty"`
+}
+
+// SCIMEnterpriseUser is the part of the enterprise extension the directory
+// reads (W7, C10).
+type SCIMEnterpriseUser struct {
+	EmployeeNumber string `json:"employeeNumber,omitempty"`
+	Department     string `json:"department,omitempty"`
+	// EmployeeType is not in RFC 7643 but Entra and Okta send it here.
+	EmployeeType string       `json:"employeeType,omitempty"`
+	Manager      *SCIMManager `json:"manager,omitempty"`
+}
+
+// SCIMManager is the enterprise extension's manager reference.
+type SCIMManager struct {
+	Value       string `json:"value,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+}
+
+// SCIMAuthSecUser is AuthSec's directory extension.
+type SCIMAuthSecUser struct {
+	LeaveFrom  *time.Time `json:"leaveFrom,omitempty"`
+	LeaveTo    *time.Time `json:"leaveTo,omitempty"`
+	Contractor *bool      `json:"contractor,omitempty"`
 }
 
 // GetPrimaryEmail returns the primary email from the SCIM user input

@@ -337,13 +337,17 @@ func (s *AgentGatewayService) policySet(ctx context.Context, ws uuid.UUID) (*age
 		for _, r := range rows {
 			set.policies = append(set.policies, r.view().Policy)
 		}
-		set.settings, err = readAgentGatewaySettings(tx, ws)
+		if set.settings, err = readAgentGatewaySettings(tx, ws); err != nil {
+			return err
+		}
+		set.stops, err = readContainmentStops(tx, ws)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	agentgateway.SortPolicies(set.policies)
+	set.version = policySetVersion(set.policies, set.settings)
 	s.polMu.Lock()
 	s.pols[ws] = set
 	s.polMu.Unlock()
@@ -410,6 +414,10 @@ func decisionContext(id uuid.UUID, res agentgateway.Result, mode string, ttl int
 	if id != uuid.Nil {
 		ctx["decision_id"] = id.String()
 	}
+	if res.Allowed && !res.ArgBounds.Empty() {
+		// The gateway checks the call's arguments against these (P17).
+		ctx["arg_bounds"] = res.ArgBounds
+	}
 	return ctx
 }
 
@@ -442,9 +450,16 @@ func (s *AgentGatewayService) Decide(ctx context.Context, p AgentGatewayPrincipa
 		return AgentGatewayDecision{}, err
 	}
 	now := s.now()
-	res := agentgateway.Evaluate(set.policies, req, set.settings.Mode, now, s.buckets)
+	var res agentgateway.Result
+	if stop := agentgateway.StoppedBy(set.stops, req); stop != nil {
+		// A stopped agent is refused before any policy (and takes no rate
+		// token); never cacheable.
+		res = agentgateway.Result{Allowed: false, Reason: agentgateway.ReasonAgentStopped}
+	} else {
+		res = agentgateway.Evaluate(set.policies, req, set.settings.Mode, now, s.buckets)
+	}
 	id := uuid.New()
-	ttl := cacheTTL(res, set.settings.CacheTTLSeconds)
+	ttl := cacheTTL(res, gatewayCacheTTL(set.settings.CacheTTLSeconds, p.CacheTTLSeconds))
 	latency := float64(time.Since(start).Microseconds()) / 1000.0
 	s.writer.enqueue(pdpDecisionRow(p, id, now, req, res, latency))
 	resp := agentgateway.EvaluationResponse{Decision: res.Allowed, Context: decisionContext(id, res, set.settings.Mode, ttl)}
@@ -487,7 +502,12 @@ func (s *AgentGatewayService) DryRun(ctx context.Context, ws uuid.UUID, gatewayI
 		return AgentGatewayDryRun{}, err
 	}
 	now := s.now()
-	res := agentgateway.Evaluate(set.policies, req, set.settings.Mode, now, nil)
+	var res agentgateway.Result
+	if stop := agentgateway.StoppedBy(set.stops, req); stop != nil {
+		res = agentgateway.Result{Allowed: false, Reason: agentgateway.ReasonAgentStopped}
+	} else {
+		res = agentgateway.Evaluate(set.policies, req, set.settings.Mode, now, nil)
+	}
 	return AgentGatewayDryRun{Decision: res.Allowed, Reason: res.Reason, PolicyID: res.PolicyID, Policy: res.PolicyName,
 		Mode: set.settings.Mode, TTL: cacheTTL(res, set.settings.CacheTTLSeconds),
 		Request: map[string]any{"subject_id": req.SubjectID, "subject": req.SubjectProps(), "kind": req.Kind,
@@ -495,16 +515,36 @@ func (s *AgentGatewayService) DryRun(ctx context.Context, ws uuid.UUID, gatewayI
 		Trace: res.Trace, Evaluated: now.UTC()}, nil
 }
 
-// AgentGatewayPolicyHints is what a gateway needs for its auto fail mode:
-// the workspace mode and the deny policies' targets (no subjects, no names).
+// AgentGatewayPolicyHints is what a gateway needs between decisions: the
+// workspace mode and the deny policies' targets (auto fail mode; no
+// subjects, no names), and (AS-174) its own fail mode and cache cap as
+// AuthSec sets them, the agents it must refuse locally, and versions.
 type AgentGatewayPolicyHints struct {
 	Mode        string                `json:"mode"`
 	DenyTargets []agentgateway.Target `json:"deny_targets"`
-	TTLSeconds  int                   `json:"ttl_seconds"`
-	AsOf        time.Time             `json:"as_of"`
+	// TTLSeconds is how long the hints are good for (refresh at least this
+	// often).
+	TTLSeconds      int                           `json:"ttl_seconds"`
+	FailMode        string                        `json:"fail_mode"`
+	CacheTTLSeconds int                           `json:"cache_ttl_seconds"`
+	Stopped         []agentgateway.StoppedSubject `json:"stopped"`
+	PolicyVersion   string                        `json:"policy_version"`
+	// AgentKeys are the live AuthSec-issued agent keys the gateway may
+	// accept (hash and bound workload identity), W6.
+	AgentKeys []AgentGatewayKeyHint `json:"agent_keys"`
+	Version   string                `json:"version"`
+	AsOf      time.Time             `json:"as_of"`
 }
 
-// PolicyHints returns the hints for an authenticated gateway.
+// AgentGatewayHintsTTL is the hints' ttl_seconds (and the gateway's default
+// refresh interval): the longest a stop waits for a gateway that has the
+// agent's allow cached.
+const AgentGatewayHintsTTL = 5
+
+// PolicyHints returns the hints for an authenticated gateway. The stopped
+// agents and the gateway's fail mode and cache cap are read fresh on every
+// call (not from the policy cache), so a stop reaches the gateway on its
+// next refresh.
 func (s *AgentGatewayService) PolicyHints(ctx context.Context, p AgentGatewayPrincipal) (AgentGatewayPolicyHints, error) {
 	set, err := s.policySet(ctx, p.WorkspaceID)
 	if err != nil {
@@ -520,7 +560,34 @@ func (s *AgentGatewayService) PolicyHints(ctx context.Context, p AgentGatewayPri
 	if t == nil {
 		t = []agentgateway.Target{}
 	}
-	return AgentGatewayPolicyHints{Mode: set.settings.Mode, DenyTargets: t, TTLSeconds: 60, AsOf: s.now().UTC()}, nil
+	var stops []agentgateway.StoppedSubject
+	var keys []AgentGatewayKeyHint
+	var gw *agentGatewayRow
+	err = tenancy.InWorkspaceRead(ctx, s.db, p.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		if gw, err = readAgentGateway(tx, p.WorkspaceID, p.GatewayID); err != nil {
+			return err
+		}
+		if stops, err = readContainmentStops(tx, p.WorkspaceID); err != nil {
+			return err
+		}
+		keys, err = agentKeyHints(tx, p.WorkspaceID, p.GatewayID)
+		return err
+	})
+	if err != nil {
+		return AgentGatewayPolicyHints{}, err
+	}
+	stops = append(stops, agentgateway.PolicyStops(applicable, p.GatewayID.String())...)
+	agentgateway.SortStops(stops)
+	if stops == nil {
+		stops = []agentgateway.StoppedSubject{}
+	}
+	h := AgentGatewayPolicyHints{Mode: set.settings.Mode, DenyTargets: t, TTLSeconds: AgentGatewayHintsTTL,
+		FailMode: gw.FailMode, CacheTTLSeconds: gatewayCacheTTL(set.settings.CacheTTLSeconds, gw.CacheTTLSeconds),
+		Stopped: stops, PolicyVersion: set.version, AgentKeys: keys}
+	h.Version = hintsVersion(h)
+	h.AsOf = s.now().UTC()
+	return h, nil
 }
 
 // IsInvalidEvaluation reports an AuthZEN mapping error.

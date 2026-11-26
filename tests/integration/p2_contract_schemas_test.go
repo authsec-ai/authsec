@@ -1115,7 +1115,56 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	// Agent runtime visibility: alerts (150) and the runtime routes (147-149, 153).
 	contractOpt("agent_alerts", contractAgentSchemaCapabilities),
 	contractOpt("agent_runtime", contractAgentSchemaCapabilities),
+	// SecOps W3: cases (186). W1: the evidence store (170), the delivering
+	// sources (heartbeats) and, per estate scope, capabilities C1..C13.
+	contractOpt("agent_cases", contractAgentSchemaCapabilities),
+	contractOpt("agent_evidence", contractAgentSchemaCapabilities),
+	contractOpt("sources", contractArr(contractSourceHeartbeat)),
+	contractOpt("capabilities", contractArr(contractCapabilityScope)),
+	// Remediation (SPEC-secops-backend-upgrade.md W8, migration 230).
+	contractOpt("remediation", contractRemediationCapabilities),
+	// Asks (SPEC-secops-backend-upgrade.md W4, migration 220).
+	contractOpt("agent_asks", contractAgentSchemaCapabilities),
 )))
+
+// A /capabilities source: one delivering source and its silence state (W1).
+var contractSourceHeartbeat = contractObj(
+	contractReq("id", contractNonEmpty), contractReq("source_kind", contractNonEmpty), contractReq("source_ref", contractNonEmpty),
+	contractReq("connector_id", contractNullable(contractNonEmpty)),
+	contractReq("last_event_at", contractNullable(contractTime)), contractReq("last_received_at", contractNullable(contractTime)),
+	contractReq("expected_floor_seconds", contractNullable(contractInt)), contractReq("silent_after_seconds", contractNullable(contractInt)),
+	contractReq("state", contractEnum("ok", "silent")), contractReq("silent_since", contractNullable(contractTime)),
+	contractReq("created_at", contractTime), contractReq("updated_at", contractTime),
+)
+
+// A /capabilities estate scope and its capabilities C1..C13 (W1, P8).
+var contractCapabilityScope = contractObj(
+	contractReq("estate_scope", contractNonEmpty), contractReq("scope_kind", contractNonEmpty),
+	contractReq("connector_id", contractNullable(contractNonEmpty)),
+	contractReq("capabilities", contractArr(contractObj(
+		contractReq("id", contractNonEmpty), contractReq("capability", contractNonEmpty), contractReq("name", contractNonEmpty),
+		contractReq("state", contractEnum("on", "partial", "off")), contractReq("gap_kind", contractEnum("none", "declared", "broken")),
+		contractReq("since", contractTime), contractReq("detail", contractStr), contractReq("fallback", contractStr)))),
+)
+
+// The /capabilities remediation block: the schema gate, the kinds, and what
+// each provider's writer really does (a sentence per provider).
+var contractRemediationCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+	contractReq("kinds", contractArrMin(1, contractNonEmpty)),
+	contractReq("writers", contractFunc(func(path string, v any, errs *[]string) {
+		m, ok := v.(map[string]any)
+		if !ok || len(m) == 0 {
+			*errs = append(*errs, path+": want a non-empty object of provider -> sentence")
+			return
+		}
+		for k, x := range m {
+			if s, ok := x.(string); !ok || s == "" {
+				*errs = append(*errs, path+"."+k+": want a non-empty string")
+			}
+		}
+	})),
+)
 
 // The /capabilities agent_alerts and agent_runtime blocks: available, and the
 // reason when not.

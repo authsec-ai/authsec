@@ -129,6 +129,14 @@ type PreviewInput struct {
 	// names then show <id>).
 	ContainmentID uuid.UUID
 	Now           time.Time
+	// Target is what a W2 level names within the identity: the access key id
+	// (key) or the agent's client id / SPIFFE id (source_identity).
+	Target string
+	// Assumers are the principals of the role's trust policy (chain level).
+	Assumers []Assumer
+	// Brokered: AuthSec's broker opens sessions on the role (an active
+	// iga_gov_runtime_broker_role), so a SourceIdentity can name an agent.
+	Brokered bool
 }
 
 // Preview is the blast radius (spec §5.8 "preview -- blast radius first").
@@ -142,6 +150,11 @@ type Preview struct {
 	// Refusals apply to every level (the identity itself cannot be changed).
 	Refusals []Refusal `json:"refusals"`
 	Warnings []string  `json:"warnings"`
+	// Assumers are the role's trust principals and whether a chain stop can
+	// reach each one.
+	Assumers []Assumer `json:"assumers"`
+	// Target is what the stop names (key id, agent), when one was given.
+	Target string `json:"target,omitempty"`
 	Capability
 }
 
@@ -190,7 +203,7 @@ func refOf(w Workload) WorkloadRef { return WorkloadRef{ID: w.ID, Kind: w.Kind, 
 // nothing: the caller supplies the inventory, the live ECS reads and the
 // binding's capability.
 func BuildPreview(in PreviewInput) Preview {
-	p := Preview{Subject: in.Subject, Workloads: in.Workloads, Selected: in.Selected, Capability: in.Cap,
+	p := Preview{Subject: in.Subject, Workloads: in.Workloads, Selected: in.Selected, Capability: in.Cap, Target: in.Target,
 		RecentServices: sortedUsage(in.Usage), Refusals: []Refusal{}, Warnings: []string{}}
 	if p.Workloads == nil {
 		p.Workloads = []Workload{}
@@ -210,10 +223,14 @@ func BuildPreview(in PreviewInput) Preview {
 	}
 	idRef := identityRefusals(in.Subject)
 
-	p.Levels = []LevelOption{
+	p.Levels = append([]LevelOption{
 		workloadLevel(in, idRef),
 		modelLevel(in, idRef),
 		identityLevel(in, idRef),
+	}, w2Levels(in, idRef)...)
+	p.Assumers = in.Assumers
+	if p.Assumers == nil {
+		p.Assumers = []Assumer{}
 	}
 	if len(p.Refusals) > 0 {
 		for i := range p.Levels {
@@ -396,9 +413,9 @@ func identityLevel(in PreviewInput, idRef []Refusal) LevelOption {
 			Message: "Sessions issued before the containment stay refused after release until 13 hours after the containment (R2 session revocation); new sessions work again at release."})
 	case IdentityUser:
 		o.Steps = append(o.Steps, PlannedStep{Kind: StepAccessKey, Target: in.Subject.Name,
-			Detail: "Set every Active access key of " + in.Subject.Name + " Inactive (recorded; release reactivates only those keys)."})
+			Detail: "Set every Active access key of " + in.Subject.Name + " Inactive (recorded; release does not reactivate them: issue new keys after release)."})
 		o.SideEffects = append(o.SideEffects, SideEffect{Code: EffectAccessKeysInactive,
-			Message: "Every Active access key of the user is deactivated: anything else using those keys stops too."})
+			Message: "Every Active access key of the user is deactivated and stays Inactive after release (a stopped key may have leaked): anything else using those keys stops too until it is given a new key."})
 	}
 	if len(in.Workloads) > 1 {
 		o.SideEffects = append(o.SideEffects, SideEffect{Code: EffectSharedRole, Message: fmt.Sprintf(

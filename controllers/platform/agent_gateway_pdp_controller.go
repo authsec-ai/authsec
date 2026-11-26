@@ -24,7 +24,7 @@ import (
 //	POST /authsec/pdp/access/v1/evaluation    AuthZEN Authorization API 1.0 §6
 //	POST /authsec/pdp/access/v1/evaluations   AuthZEN §7 (≤ 100 evaluations)
 //	POST /authsec/pdp/v1/decisions            the gateway's own decisions and outcomes
-//	GET  /authsec/pdp/v1/policy-hints         mode and deny targets (auto fail mode)
+//	GET  /authsec/pdp/v1/policy-hints         mode, deny targets, fail mode, cache cap, stopped agents (ETag)
 //
 // A decision is a 200 whose body says true or false (as R3, DECISION R3-18);
 // refusals of the request are 400 (bad request), 401 (credential), 413
@@ -59,6 +59,7 @@ func MountAgentGatewayPDPRoutes(g gin.IRoutes, ctl *AgentGatewayPDPController) {
 	g.POST("/pdp/access/v1/evaluations", ctl.Evaluations)
 	g.POST("/pdp/v1/decisions", ctl.UploadDecisions)
 	g.GET("/pdp/v1/policy-hints", ctl.PolicyHints)
+	MountAgentGatewayW6PDPRoutes(g, ctl)
 }
 
 // TENANT-EXEMPT: not a statement here: the service resolves the workspace from the gateway credential and runs every statement under row-level security for it.
@@ -248,6 +249,14 @@ func (ctl *AgentGatewayPDPController) PolicyHints(c *gin.Context) {
 	if err != nil {
 		log.Printf("[agent-gateway-pdp] stage=hints workspace=%s gateway=%s outcome=error err=%v", p.WorkspaceID, p.GatewayID, err)
 		pdpError(c, http.StatusInternalServerError, "the hints could not be read")
+		return
+	}
+	// The version is the ETag: an unchanged body is a 304, so gateways can
+	// poll every few seconds (AS-174).
+	etag := `"` + h.Version + `"`
+	c.Header("ETag", etag)
+	if c.GetHeader("If-None-Match") == etag {
+		c.Status(http.StatusNotModified)
 		return
 	}
 	c.JSON(http.StatusOK, h)

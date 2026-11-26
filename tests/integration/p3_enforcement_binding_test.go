@@ -1004,7 +1004,7 @@ func TestP3EnfRoutes(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, r.a.ws.String())
+	auditEventsCleanup(db, r.a.ws)
 }
 
 // Review fix R1a P2 "unscheduled verify_binding" (§3.6: the self-test runs

@@ -44,8 +44,21 @@ import (
 // A new alert writes "agent_alert.opened" into iga_gov_event (Logs) and queues
 // its deliveries: Slack through the governance notification outbox
 // (iga_gov_notify.go, GovChannelSlack, the workspace's approvals channel)
-// and every enabled SIEM endpoint (agent_runtime_alert_delivery.go).
-// Resolving an alert writes "agent_alert.resolved".
+// and every enabled SIEM endpoint (agent_runtime_alert_delivery.go). A new
+// alert matched by an active suppression (agent_runtime_alert_suppression.go)
+// is stored with suppressed_by set and queues no delivery; a suppression
+// never matches a harmful outcome that succeeded (detect.SucceededHarm).
+//
+// Lifecycle (SecOps F8, migration 165): open -> acknowledged -> resolved,
+// resolved -> reopened -> acknowledged | resolved. Each transition records
+// its actor on the alert (acknowledged_by, resolved_by, reopened_by) and a
+// row of agent_alert_transition, and writes "agent_alert.acknowledged",
+// "agent_alert.resolved" or "agent_alert.reopened". A resolution carries an
+// outcome code (true_positive | benign | false_positive | duplicate); a
+// reopen carries a reason.
+//
+// The detections read the workspace's ACTIVE detection rule version
+// (agent_runtime_alert_rules.go, migration 164).
 //
 // Everything a workspace's alerts touch runs in one transaction under
 // row-level security for that workspace (tenancy.InWorkspace).
@@ -75,12 +88,41 @@ const (
 	AgentAlertOpen         = "open"
 	AgentAlertAcknowledged = "acknowledged"
 	AgentAlertResolved     = "resolved"
+	AgentAlertReopened     = "reopened"
 )
+
+// AgentAlertActiveStates are the states of an alert that needs attention
+// (not acknowledged, not resolved).
+var AgentAlertActiveStates = []string{AgentAlertOpen, AgentAlertReopened}
+
+// Resolution outcome codes (agent_alert.outcome, required on resolve).
+const (
+	AgentAlertOutcomeTruePositive  = "true_positive"
+	AgentAlertOutcomeBenign        = "benign"
+	AgentAlertOutcomeFalsePositive = "false_positive"
+	AgentAlertOutcomeDuplicate     = "duplicate"
+)
+
+// AgentAlertOutcomes lists the outcome codes.
+var AgentAlertOutcomes = []string{AgentAlertOutcomeTruePositive, AgentAlertOutcomeBenign, AgentAlertOutcomeFalsePositive,
+	AgentAlertOutcomeDuplicate}
+
+// ValidAgentAlertOutcome reports whether o is an outcome code.
+func ValidAgentAlertOutcome(o string) bool {
+	for _, x := range AgentAlertOutcomes {
+		if x == o {
+			return true
+		}
+	}
+	return false
+}
 
 // iga_gov_event names (iga_gov_event_vocabulary.go) and the notice subject.
 const (
-	GovEventAgentAlertOpened   = "agent_alert.opened"
-	GovEventAgentAlertResolved = "agent_alert.resolved"
+	GovEventAgentAlertOpened       = "agent_alert.opened"
+	GovEventAgentAlertAcknowledged = "agent_alert.acknowledged"
+	GovEventAgentAlertResolved     = "agent_alert.resolved"
+	GovEventAgentAlertReopened     = "agent_alert.reopened"
 	// SIEM delivery outcomes that end a delivery (not each retry).
 	GovEventAgentAlertSIEMDelivered = "agent_alert.siem_delivered"
 	GovEventAgentAlertSIEMFailed    = "agent_alert.siem_failed"
@@ -136,6 +178,29 @@ type AgentAlert struct {
 	StateChangedAt *time.Time      `json:"state_changed_at" gorm:"column:state_changed_at"`
 	Reason         string          `json:"reason" gorm:"column:reason"`
 	CreatedAt      time.Time       `json:"created_at" gorm:"column:created_at"`
+	// Per-transition actors (migration 165): the latest of each.
+	AcknowledgedBy *uuid.UUID `json:"acknowledged_by" gorm:"column:acknowledged_by"`
+	AcknowledgedAt *time.Time `json:"acknowledged_at" gorm:"column:acknowledged_at"`
+	ResolvedBy     *uuid.UUID `json:"resolved_by" gorm:"column:resolved_by"`
+	ResolvedAt     *time.Time `json:"resolved_at" gorm:"column:resolved_at"`
+	Outcome        *string    `json:"outcome" gorm:"column:outcome"`
+	ReopenedBy     *uuid.UUID `json:"reopened_by" gorm:"column:reopened_by"`
+	ReopenedAt     *time.Time `json:"reopened_at" gorm:"column:reopened_at"`
+	ReopenCount    int        `json:"reopen_count" gorm:"column:reopen_count"`
+	// SuppressedBy is the suppression that kept the alert from Slack and
+	// SIEM (migration 166).
+	SuppressedBy *uuid.UUID `json:"suppressed_by" gorm:"column:suppressed_by"`
+}
+
+// AgentAlertTransition is one agent_alert_transition row.
+type AgentAlertTransition struct {
+	ID        uuid.UUID `json:"id" gorm:"column:id"`
+	FromState string    `json:"from_state" gorm:"column:from_state"`
+	ToState   string    `json:"to_state" gorm:"column:to_state"`
+	ActorID   uuid.UUID `json:"actor_id" gorm:"column:actor_id"`
+	Outcome   *string   `json:"outcome" gorm:"column:outcome"`
+	Reason    string    `json:"reason" gorm:"column:reason"`
+	At        time.Time `json:"at" gorm:"column:at"`
 }
 
 // AgentAlertEventRef is one sanitised event reference in an alert's
@@ -169,8 +234,9 @@ type AgentAlertDelivery struct {
 // AgentAlertView is GET /alerts/:id: the alert and its deliveries.
 type AgentAlertView struct {
 	AgentAlert
-	DetectionName string               `json:"detection_name"`
-	Deliveries    []AgentAlertDelivery `json:"deliveries,omitempty"`
+	DetectionName string                 `json:"detection_name"`
+	Deliveries    []AgentAlertDelivery   `json:"deliveries,omitempty"`
+	Transitions   []AgentAlertTransition `json:"transitions"`
 }
 
 /* ------------------------------------------------------------------------- */
@@ -178,12 +244,22 @@ type AgentAlertView struct {
 /* ------------------------------------------------------------------------- */
 
 // AgentAlertDetectionSetting is one detection's switch and thresholds (N and
-// Minutes for D5, K for D6).
+// Minutes for D5, K for D6), and its severity when the workspace sets one
+// ("" = the severity the detection raises).
 type AgentAlertDetectionSetting struct {
-	Enabled bool    `json:"enabled"`
-	N       int     `json:"n,omitempty"`
-	Minutes int     `json:"minutes,omitempty"`
-	K       float64 `json:"k,omitempty"`
+	Enabled  bool    `json:"enabled"`
+	N        int     `json:"n,omitempty"`
+	Minutes  int     `json:"minutes,omitempty"`
+	K        float64 `json:"k,omitempty"`
+	Severity string  `json:"severity,omitempty"`
+}
+
+// effectiveSeverity is the highest severity the detection raises under d.
+func (d AgentAlertDetectionSetting) effectiveSeverity(id detect.ID) string {
+	if d.Severity != "" {
+		return d.Severity
+	}
+	return detect.DefaultSeverity(id)
 }
 
 // AgentAlertSettings is a workspace's alert configuration (absent row = the
@@ -195,6 +271,22 @@ type AgentAlertSettings struct {
 	RetentionDays       int                                   `json:"retention_days"`
 	Saved               bool                                  `json:"saved"`
 	UpdatedAt           *time.Time                            `json:"updated_at,omitempty"`
+	// Version is the active detection rule version (0: none saved, the
+	// defaults); PendingVersionID is the proposal waiting for approval.
+	Version          int        `json:"version"`
+	VersionID        *uuid.UUID `json:"version_id,omitempty"`
+	PendingVersionID *uuid.UUID `json:"pending_version_id,omitempty"`
+}
+
+// applySeverity sets each finding's severity to the workspace's severity for
+// its detection, when one is set.
+func (s AgentAlertSettings) applySeverity(fs []detect.Finding) []detect.Finding {
+	for i := range fs {
+		if d, ok := s.Detections[string(fs[i].Detection)]; ok && d.Severity != "" {
+			fs[i].Severity = d.Severity
+		}
+	}
+	return fs
 }
 
 // DefaultAgentAlertSettings is every detection on with spec §10's
@@ -243,12 +335,14 @@ func (s AgentAlertSettings) DetectConfig() detect.Config {
 	return cfg
 }
 
-// AgentAlertDetectionUpdate changes one detection (nil = unchanged).
+// AgentAlertDetectionUpdate changes one detection (nil = unchanged;
+// Severity "" = the detection's own severity).
 type AgentAlertDetectionUpdate struct {
-	Enabled *bool    `json:"enabled"`
-	N       *int     `json:"n"`
-	Minutes *int     `json:"minutes"`
-	K       *float64 `json:"k"`
+	Enabled  *bool    `json:"enabled"`
+	N        *int     `json:"n"`
+	Minutes  *int     `json:"minutes"`
+	K        *float64 `json:"k"`
+	Severity *string  `json:"severity"`
 }
 
 // AgentAlertSettingsUpdate is PUT /alert-settings: omitted fields keep
@@ -258,31 +352,17 @@ type AgentAlertSettingsUpdate struct {
 	SlackEnabled        *bool                                 `json:"slack_enabled"`
 	DedupeWindowMinutes *int                                  `json:"dedupe_window_minutes"`
 	RetentionDays       *int                                  `json:"retention_days"`
+	// Reason is recorded on the rule version (optional, at most 1000
+	// characters).
+	Reason string `json:"reason"`
 }
 
-type agentAlertSettingRow struct {
-	Detections          json.RawMessage
-	SlackEnabled        bool
-	DedupeWindowMinutes int
-	RetentionDays       int
-	UpdatedAt           time.Time
-}
-
-// readAgentAlertSettings reads ws's settings on tx (under RLS for ws).
-func readAgentAlertSettings(tx *gorm.DB, ws uuid.UUID) (AgentAlertSettings, error) {
+// settingsFromStored is the defaults overlaid with a stored version's values.
+func settingsFromStored(ws uuid.UUID, detections json.RawMessage, slack bool, dedupe, retention int) AgentAlertSettings {
 	out := DefaultAgentAlertSettings()
-	var rows []agentAlertSettingRow
-	if err := tx.Raw(`SELECT detections, slack_enabled, dedupe_window_minutes, retention_days, updated_at
-	                    FROM agent_alert_setting WHERE workspace_id = ?`, ws).Scan(&rows).Error; err != nil {
-		return out, err
-	}
-	if len(rows) == 0 {
-		return out, nil
-	}
-	r := rows[0]
 	stored := map[string]AgentAlertDetectionSetting{}
-	if len(r.Detections) > 0 {
-		if err := json.Unmarshal(r.Detections, &stored); err != nil {
+	if len(detections) > 0 {
+		if err := json.Unmarshal(detections, &stored); err != nil {
 			log.Printf("[agent-alerts] workspace %s: unreadable detection settings, using defaults: %v", ws, err)
 		}
 	}
@@ -298,24 +378,42 @@ func readAgentAlertSettings(tx *gorm.DB, ws uuid.UUID) (AgentAlertSettings, erro
 			if v.K == 0 {
 				v.K = def.K
 			}
+			if v.Severity != "" && !detect.ValidSeverity(v.Severity) {
+				v.Severity = ""
+			}
 			out.Detections[k] = v
 		}
 	}
-	out.SlackEnabled = r.SlackEnabled
-	if r.DedupeWindowMinutes > 0 {
-		out.DedupeWindowMinutes = r.DedupeWindowMinutes
+	out.SlackEnabled = slack
+	if dedupe > 0 {
+		out.DedupeWindowMinutes = dedupe
 	}
-	if r.RetentionDays > 0 {
-		out.RetentionDays = r.RetentionDays
+	if retention > 0 {
+		out.RetentionDays = retention
 	}
-	out.Saved = true
-	t := r.UpdatedAt
-	out.UpdatedAt = &t
-	return out, nil
+	return out
 }
 
-// apply merges u onto s, validating every value.
+// readAgentAlertSettings reads ws's ACTIVE detection rule version on tx
+// (under RLS for ws); without one, the defaults.
+func readAgentAlertSettings(tx *gorm.DB, ws uuid.UUID) (AgentAlertSettings, error) {
+	v, err := activeAgentRuleVersion(tx, ws, false)
+	if err != nil || v == nil {
+		return DefaultAgentAlertSettings(), err
+	}
+	return v.settings(ws), nil
+}
+
+// apply merges u onto s, validating every value; s itself is not changed.
 func (u AgentAlertSettingsUpdate) apply(s AgentAlertSettings) (AgentAlertSettings, error) {
+	det := make(map[string]AgentAlertDetectionSetting, len(s.Detections))
+	for k, v := range s.Detections {
+		det[k] = v
+	}
+	s.Detections = det
+	if len(u.Reason) > 1000 {
+		return s, GovBadParam("reason", "reason must be at most 1000 characters.")
+	}
 	for k, d := range u.Detections {
 		if !detect.Valid(detect.ID(k)) {
 			return s, GovBadParam("detections", fmt.Sprintf("Unknown detection %q (D1..D8).", k))
@@ -350,6 +448,12 @@ func (u AgentAlertSettingsUpdate) apply(s AgentAlertSettings) (AgentAlertSetting
 				return s, GovBadParam("detections.D6.k", "k must be between 1 and 100.")
 			}
 			cur.K = *d.K
+		}
+		if d.Severity != nil {
+			if *d.Severity != "" && !detect.ValidSeverity(*d.Severity) {
+				return s, GovBadParam("detections."+k+".severity", `severity must be high, medium, low or "" (the detection's own).`)
+			}
+			cur.Severity = *d.Severity
 		}
 		s.Detections[k] = cur
 	}
@@ -502,7 +606,7 @@ func (s *AgentAlertSink) processIdentity(ctx context.Context, ws uuid.UUID, subj
 		}
 		var hits []agentAlertHit
 		for _, e := range fresh {
-			fs := mergeAgentAlertFindings(detect.Evaluate(cfg, b, e, now))
+			fs := st.applySeverity(mergeAgentAlertFindings(detect.Evaluate(cfg, b, e, now)))
 			if len(fs) == 0 || now.Sub(e.EventTime) > agentAlertMaxEventAge {
 				continue
 			}
@@ -679,9 +783,10 @@ func agentAlertTitle(subj agentruntime.Subject, d detect.ID) string {
 }
 
 type agentAlertOpenRow struct {
-	ID       uuid.UUID
-	Severity string
-	Evidence json.RawMessage
+	ID           uuid.UUID
+	Severity     string
+	Evidence     json.RawMessage
+	SuppressedBy *uuid.UUID
 }
 
 // upsertAgentAlert extends the open alert of (identity, detection) whose
@@ -702,14 +807,14 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 	}
 	var open []agentAlertOpenRow
 	if into != nil {
-		if err := tx.Raw(`SELECT id, severity, evidence FROM agent_alert
+		if err := tx.Raw(`SELECT id, severity, evidence, suppressed_by FROM agent_alert
 		                   WHERE workspace_id = ? AND id = ? AND dedupe_key = ? AND state <> 'resolved'
 		                   FOR UPDATE`, ws, *into, key).Scan(&open).Error; err != nil {
 			return uuid.Nil, err
 		}
 	}
 	if len(open) == 0 {
-		if err := tx.Raw(`SELECT id, severity, evidence FROM agent_alert
+		if err := tx.Raw(`SELECT id, severity, evidence, suppressed_by FROM agent_alert
 		                   WHERE workspace_id = ? AND dedupe_key = ? AND state <> 'resolved'
 		                     AND last_seen >= ? AND first_seen <= ?
 		                   ORDER BY last_seen DESC LIMIT 1 FOR UPDATE`,
@@ -717,6 +822,7 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 			return uuid.Nil, err
 		}
 	}
+	harm := detect.SucceededHarm(h.f, h.e)
 	if len(open) == 1 {
 		cur := open[0]
 		ev, err := appendAgentAlertEvidence(cur.Evidence, agentAlertRef(h))
@@ -727,35 +833,67 @@ func upsertAgentAlert(tx *gorm.DB, ws uuid.UUID, subj agentruntime.Subject, st A
 		if detect.SeverityRank(h.f.Severity) > detect.SeverityRank(sev) {
 			sev = h.f.Severity
 		}
-		return cur.ID, tx.Exec(`UPDATE agent_alert SET last_seen = GREATEST(last_seen, ?), first_seen = LEAST(first_seen, ?),
+		if err := tx.Exec(`UPDATE agent_alert SET last_seen = GREATEST(last_seen, ?), first_seen = LEAST(first_seen, ?),
 		                       event_count = event_count + 1, severity = ?, evidence = ?::jsonb, workload_ids = ?::jsonb,
 		                       subject_label = ?, subject_name = ?
 		                 WHERE workspace_id = ? AND id = ?`,
-			at, at, sev, string(ev), string(wl), subj.Label, truncate(subj.Name, 300), ws, cur.ID).Error
+			at, at, sev, string(ev), string(wl), subj.Label, truncate(subj.Name, 300), ws, cur.ID).Error; err != nil {
+			return uuid.Nil, err
+		}
+		// A suppressed alert that now records a harmful outcome that
+		// succeeded is no longer suppressed: it is delivered.
+		if cur.SuppressedBy != nil && harm {
+			if err := tx.Exec(`UPDATE agent_alert SET suppressed_by = NULL WHERE workspace_id = ? AND id = ?`, ws, cur.ID).Error; err != nil {
+				return uuid.Nil, err
+			}
+			if err := appendGovEvent(tx, ws, GovEventAgentAlertUnsuppressed, models.GovActorSystem, AgentAlertSinkName, govEventRefs{},
+				map[string]any{"alert_id": cur.ID, "suppression_id": *cur.SuppressedBy, "detection": string(h.f.Detection),
+					"event_id": h.e.EventID, "reason": "succeeded_harmful_outcome"}); err != nil {
+				return uuid.Nil, err
+			}
+			return cur.ID, enqueueAgentAlertDeliveries(tx, ws, cur.ID, st)
+		}
+		return cur.ID, nil
 	}
 	ev, err := appendAgentAlertEvidence(nil, agentAlertRef(h))
 	if err != nil {
 		return uuid.Nil, err
 	}
+	var suppressedBy *uuid.UUID
+	if !harm {
+		if suppressedBy, err = matchAgentAlertSuppression(tx, ws, subj.IdentityID, h.f.Detection, "", now); err != nil {
+			return uuid.Nil, err
+		}
+	}
 	var ids []uuid.UUID
 	if err := tx.Raw(`INSERT INTO agent_alert (workspace_id, connector_id, identity_id, workload_ids, subject_label, subject_name,
-	                         detection, severity, title, dedupe_key, first_seen, last_seen, event_count, evidence, state, created_at)
-	                  VALUES (?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?::jsonb, 'open', ?)
+	                         detection, severity, title, dedupe_key, first_seen, last_seen, event_count, evidence, state, created_at,
+	                         suppressed_by)
+	                  VALUES (?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?::jsonb, 'open', ?, ?)
 	                  RETURNING id`,
 		ws, subj.ConnectorID, subj.IdentityID, string(wl), subj.Label, truncate(subj.Name, 300),
-		string(h.f.Detection), h.f.Severity, agentAlertTitle(subj, h.f.Detection), key, at, at, string(ev), now).Scan(&ids).Error; err != nil {
+		string(h.f.Detection), h.f.Severity, agentAlertTitle(subj, h.f.Detection), key, at, at, string(ev), now,
+		suppressedBy).Scan(&ids).Error; err != nil {
 		return uuid.Nil, err
 	}
 	if len(ids) != 1 {
 		return uuid.Nil, errors.New("agent alert insert returned no id")
 	}
 	id := ids[0]
-	if err := appendGovEvent(tx, ws, GovEventAgentAlertOpened, models.GovActorSystem, AgentAlertSinkName, govEventRefs{},
-		map[string]any{"alert_id": id, "detection": string(h.f.Detection), "severity": h.f.Severity,
-			"identity_id": subj.IdentityID, "connector_id": subj.ConnectorID, "subject_label": subj.Label,
-			"first_event_id": h.e.EventID}); err != nil {
+	payload := map[string]any{"alert_id": id, "detection": string(h.f.Detection), "severity": h.f.Severity,
+		"identity_id": subj.IdentityID, "connector_id": subj.ConnectorID, "subject_label": subj.Label,
+		"first_event_id": h.e.EventID}
+	if suppressedBy != nil {
+		payload["suppressed_by"] = *suppressedBy
+	}
+	if err := appendGovEvent(tx, ws, GovEventAgentAlertOpened, models.GovActorSystem, AgentAlertSinkName, govEventRefs{}, payload); err != nil {
 		return uuid.Nil, err
 	}
+	if suppressedBy != nil {
+		// Stored, never delivered to Slack or SIEM.
+		return id, nil
+	}
+	clusterNewAgentAlert(tx, ws, id, now) // agent_runtime_cases.go: the alert joins or opens a case
 	return id, enqueueAgentAlertDeliveries(tx, ws, id, st)
 }
 
@@ -774,10 +912,18 @@ func NewAgentAlertService(db *gorm.DB) *AgentAlertService {
 	return &AgentAlertService{db: db, now: time.Now}
 }
 
-// AgentAlertFilter filters GET /alerts.
+// WithClock replaces the wall clock (tests).
+func (s *AgentAlertService) WithClock(now func() time.Time) *AgentAlertService {
+	s.now = now
+	return s
+}
+
+// AgentAlertFilter filters GET /alerts. Suppressed: nil = every alert, true =
+// only alerts a suppression kept from delivery, false = only the others.
 type AgentAlertFilter struct {
 	State, Severity, Detection string
 	IdentityID                 *uuid.UUID
+	Suppressed                 *bool
 }
 
 func errAgentAlertNotFound() error {
@@ -787,14 +933,12 @@ func errAgentAlertNotFound() error {
 // Validate checks the filter's values.
 func (f AgentAlertFilter) Validate() error {
 	switch f.State {
-	case "", AgentAlertOpen, AgentAlertAcknowledged, AgentAlertResolved:
+	case "", AgentAlertOpen, AgentAlertAcknowledged, AgentAlertResolved, AgentAlertReopened:
 	default:
-		return GovBadParam("state", "state must be open, acknowledged or resolved.")
+		return GovBadParam("state", "state must be open, acknowledged, resolved or reopened.")
 	}
-	switch f.Severity {
-	case "", detect.SeverityHigh, detect.SeverityMedium:
-	default:
-		return GovBadParam("severity", "severity must be high or medium.")
+	if f.Severity != "" && !detect.ValidSeverity(f.Severity) {
+		return GovBadParam("severity", "severity must be high, medium or low.")
 	}
 	if f.Detection != "" && !detect.Valid(detect.ID(f.Detection)) {
 		return GovBadParam("detection", "detection must be one of D1..D8.")
@@ -825,7 +969,8 @@ func decodeAgentAlertCursor(c string) (time.Time, uuid.UUID, error) {
 
 const agentAlertColumns = `id, workspace_id, connector_id, identity_id, workload_ids, subject_label, subject_name, detection,
 	severity, title, dedupe_key, first_seen, last_seen, event_count, evidence, state, state_changed_by, state_changed_at,
-	reason, created_at`
+	reason, created_at, acknowledged_by, acknowledged_at, resolved_by, resolved_at, outcome, reopened_by, reopened_at,
+	reopen_count, suppressed_by`
 
 // List is GET /alerts: newest first (created_at, id), limit 1..200.
 func (s *AgentAlertService) List(ctx context.Context, ws uuid.UUID, f AgentAlertFilter, cursor string, limit int) ([]AgentAlert, string, error) {
@@ -856,6 +1001,13 @@ func (s *AgentAlertService) List(ctx context.Context, ws uuid.UUID, f AgentAlert
 		q += ` AND identity_id = ?`
 		args = append(args, *f.IdentityID)
 	}
+	if f.Suppressed != nil {
+		if *f.Suppressed {
+			q += ` AND suppressed_by IS NOT NULL`
+		} else {
+			q += ` AND suppressed_by IS NULL`
+		}
+	}
 	if cursor != "" {
 		t, id, err := decodeAgentAlertCursor(cursor)
 		if err != nil {
@@ -884,8 +1036,8 @@ func (s *AgentAlertService) List(ctx context.Context, ws uuid.UUID, f AgentAlert
 	return rows, next, nil
 }
 
-// Get is GET /alerts/:id with its deliveries. Another workspace's alert is
-// not found.
+// Get is GET /alerts/:id with its deliveries and transitions. Another
+// workspace's alert is not found.
 func (s *AgentAlertService) Get(ctx context.Context, ws, id uuid.UUID) (*AgentAlertView, error) {
 	var out *AgentAlertView
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
@@ -902,25 +1054,69 @@ func (s *AgentAlertService) Get(ctx context.Context, ws, id uuid.UUID) (*AgentAl
 			Scan(&v.Deliveries).Error; err != nil {
 			return err
 		}
+		if err := tx.Raw(`SELECT id, from_state, to_state, actor_id, outcome, reason, at
+		                    FROM agent_alert_transition WHERE workspace_id = ? AND alert_id = ? ORDER BY at, id`, ws, id).
+			Scan(&v.Transitions).Error; err != nil {
+			return err
+		}
+		if v.Transitions == nil {
+			v.Transitions = []AgentAlertTransition{}
+		}
 		out = v
 		return nil
 	})
 	return out, err
 }
 
-// Acknowledge is POST /alerts/:id/acknowledge: open -> acknowledged
-// (acknowledging an acknowledged alert changes nothing).
+// Acknowledge is POST /alerts/:id/acknowledge: open or reopened ->
+// acknowledged (acknowledging an acknowledged alert changes nothing), with
+// an "agent_alert.acknowledged" log entry.
 func (s *AgentAlertService) Acknowledge(ctx context.Context, ws, id, actor uuid.UUID, reason string) (*AgentAlert, error) {
-	return s.transition(ctx, ws, id, actor, AgentAlertAcknowledged, reason)
+	return s.transition(ctx, ws, id, actor, AgentAlertAcknowledged, "", reason)
 }
 
-// Resolve is POST /alerts/:id/resolve: open or acknowledged -> resolved,
-// with an "agent_alert.resolved" log entry.
-func (s *AgentAlertService) Resolve(ctx context.Context, ws, id, actor uuid.UUID, reason string) (*AgentAlert, error) {
-	return s.transition(ctx, ws, id, actor, AgentAlertResolved, reason)
+// Resolve is POST /alerts/:id/resolve: open, acknowledged or reopened ->
+// resolved with an outcome code (required) and an optional reason, with an
+// "agent_alert.resolved" log entry. Who acknowledged stays recorded.
+func (s *AgentAlertService) Resolve(ctx context.Context, ws, id, actor uuid.UUID, outcome, reason string) (*AgentAlert, error) {
+	outcome = strings.TrimSpace(outcome)
+	if outcome == "" {
+		return nil, GovBadParam("outcome", "outcome is required: true_positive, benign, false_positive or duplicate.")
+	}
+	if !ValidAgentAlertOutcome(outcome) {
+		return nil, GovBadParam("outcome", "outcome must be true_positive, benign, false_positive or duplicate.")
+	}
+	return s.transition(ctx, ws, id, actor, AgentAlertResolved, outcome, reason)
 }
 
-func (s *AgentAlertService) transition(ctx context.Context, ws, id, actor uuid.UUID, to, reason string) (*AgentAlert, error) {
+// Reopen is POST /alerts/:id/reopen: resolved -> reopened, with a reason
+// (required) and an "agent_alert.reopened" log entry. A reopened alert is
+// extended by new findings like an open one.
+func (s *AgentAlertService) Reopen(ctx context.Context, ws, id, actor uuid.UUID, reason string) (*AgentAlert, error) {
+	if strings.TrimSpace(reason) == "" {
+		return nil, GovBadParam("reason", "reason is required to reopen an alert.")
+	}
+	return s.transition(ctx, ws, id, actor, AgentAlertReopened, "", reason)
+}
+
+// agentAlertTransitionAllowed reports whether from -> to is a transition
+// (same == true: to equals from and nothing changes).
+func agentAlertTransitionAllowed(from, to string) (ok, same bool) {
+	switch to {
+	case AgentAlertAcknowledged:
+		if from == AgentAlertAcknowledged {
+			return true, true
+		}
+		return from == AgentAlertOpen || from == AgentAlertReopened, false
+	case AgentAlertResolved:
+		return from == AgentAlertOpen || from == AgentAlertAcknowledged || from == AgentAlertReopened, false
+	case AgentAlertReopened:
+		return from == AgentAlertResolved, false
+	}
+	return false, false
+}
+
+func (s *AgentAlertService) transition(ctx context.Context, ws, id, actor uuid.UUID, to, outcome, reason string) (*AgentAlert, error) {
 	reason = strings.TrimSpace(reason)
 	if len(reason) > 1000 {
 		return nil, GovBadParam("reason", "reason must be at most 1000 characters.")
@@ -935,24 +1131,57 @@ func (s *AgentAlertService) transition(ctx context.Context, ws, id, actor uuid.U
 			return errAgentAlertNotFound()
 		}
 		a := rows[0]
-		switch {
-		case a.State == AgentAlertResolved:
-			return govErr(http.StatusConflict, "invalid_state", "The alert is already resolved.", map[string]any{"state": a.State})
-		case a.State == to:
+		ok, same := agentAlertTransitionAllowed(a.State, to)
+		if same {
 			out = &a
 			return nil
 		}
+		if !ok {
+			msg := fmt.Sprintf("An alert in state %s cannot be %s.", a.State, to)
+			if a.State == AgentAlertResolved {
+				msg = "The alert is already resolved."
+			}
+			return govErr(http.StatusConflict, "invalid_state", msg, map[string]any{"state": a.State})
+		}
 		now := s.now().UTC()
-		if err := tx.Exec(`UPDATE agent_alert SET state = ?, state_changed_by = ?, state_changed_at = ?, reason = ?
-		                    WHERE workspace_id = ? AND id = ?`, to, actor, now, reason, ws, id).Error; err != nil {
+		var (
+			set   string
+			event string
+			oc    *string
+		)
+		args := []any{to, actor, now, reason, actor, now}
+		switch to {
+		case AgentAlertAcknowledged:
+			set, event = `acknowledged_by = ?, acknowledged_at = ?`, GovEventAgentAlertAcknowledged
+			a.AcknowledgedBy, a.AcknowledgedAt = &actor, &now
+		case AgentAlertResolved:
+			oc = &outcome
+			set, event = `resolved_by = ?, resolved_at = ?, outcome = ?`, GovEventAgentAlertResolved
+			args = append(args, outcome)
+			a.ResolvedBy, a.ResolvedAt, a.Outcome = &actor, &now, oc
+		case AgentAlertReopened:
+			// The previous resolution stays in agent_alert_transition.
+			set, event = `reopened_by = ?, reopened_at = ?, reopen_count = reopen_count + 1,
+			              resolved_by = NULL, resolved_at = NULL, outcome = NULL`, GovEventAgentAlertReopened
+			a.ReopenedBy, a.ReopenedAt, a.ReopenCount = &actor, &now, a.ReopenCount+1
+			a.ResolvedBy, a.ResolvedAt, a.Outcome = nil, nil, nil
+		}
+		args = append(args, ws, id)
+		if err := tx.Exec(`UPDATE agent_alert SET state = ?, state_changed_by = ?, state_changed_at = ?, reason = ?, `+set+`
+		                    WHERE workspace_id = ? AND id = ?`, args...).Error; err != nil {
 			return err
 		}
-		if to == AgentAlertResolved {
-			if err := appendGovEvent(tx, ws, GovEventAgentAlertResolved, models.GovActorUser, actor.String(), govEventRefs{},
-				map[string]any{"alert_id": id, "detection": a.Detection, "identity_id": a.IdentityID, "reason": reason,
-					"event_count": a.EventCount}); err != nil {
-				return err
-			}
+		if err := tx.Exec(`INSERT INTO agent_alert_transition (workspace_id, alert_id, from_state, to_state, actor_id, outcome, reason, at)
+		                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ws, id, a.State, to, actor, oc, reason, now).Error; err != nil {
+			return err
+		}
+		payload := map[string]any{"alert_id": id, "detection": a.Detection, "identity_id": a.IdentityID, "from": a.State,
+			"reason": reason, "event_count": a.EventCount}
+		if oc != nil {
+			payload["outcome"] = *oc
+		}
+		if err := appendGovEvent(tx, ws, event, models.GovActorUser, actor.String(), govEventRefs{}, payload); err != nil {
+			return err
 		}
 		a.State, a.StateChangedBy, a.StateChangedAt, a.Reason = to, &actor, &now, reason
 		out = &a
@@ -961,42 +1190,13 @@ func (s *AgentAlertService) transition(ctx context.Context, ws, id, actor uuid.U
 	return out, err
 }
 
-// Settings is GET /alert-settings.
+// Settings is GET /alert-settings: the active detection rule version (or
+// the defaults) and the pending proposal's id.
 func (s *AgentAlertService) Settings(ctx context.Context, ws uuid.UUID) (AgentAlertSettings, error) {
 	var out AgentAlertSettings
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		var err error
-		out, err = readAgentAlertSettings(tx, ws)
-		return err
-	})
-	return out, err
-}
-
-// UpdateSettings is PUT /alert-settings.
-func (s *AgentAlertService) UpdateSettings(ctx context.Context, ws, actor uuid.UUID, u AgentAlertSettingsUpdate) (AgentAlertSettings, error) {
-	var out AgentAlertSettings
-	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
-		cur, err := readAgentAlertSettings(tx, ws)
-		if err != nil {
-			return err
-		}
-		next, err := u.apply(cur)
-		if err != nil {
-			return err
-		}
-		det, err := json.Marshal(next.Detections)
-		if err != nil {
-			return err
-		}
-		if err := tx.Exec(`INSERT INTO agent_alert_setting (workspace_id, detections, slack_enabled, dedupe_window_minutes, retention_days, updated_by, updated_at)
-		                   VALUES (?, ?::jsonb, ?, ?, ?, ?, now())
-		                   ON CONFLICT (workspace_id) DO UPDATE SET detections = EXCLUDED.detections,
-		                     slack_enabled = EXCLUDED.slack_enabled, dedupe_window_minutes = EXCLUDED.dedupe_window_minutes,
-		                     retention_days = EXCLUDED.retention_days, updated_by = EXCLUDED.updated_by, updated_at = now()`,
-			ws, string(det), next.SlackEnabled, next.DedupeWindowMinutes, next.RetentionDays, actor).Error; err != nil {
-			return err
-		}
-		out, err = readAgentAlertSettings(tx, ws)
+		out, err = readAgentAlertSettingsWithPending(tx, ws)
 		return err
 	})
 	return out, err

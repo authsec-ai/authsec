@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -945,6 +946,13 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 		}
 	}
 	m.projectK8sSighting(workspaceID, stored.Source, stored.Fingerprint)
+	// One agent id (W7): the sighting's agent, and its instance when the
+	// metadata names an artifact. Best-effort, like the correlation above.
+	if db := m.repo.DB(); db != nil {
+		if ierr := RecordSightingInstance(context.Background(), db, stored); ierr != nil {
+			log.Printf("[discovery] could not link agent %s to its agent id: %v", stored.ID, ierr)
+		}
+	}
 	return stored, created, nil
 }
 

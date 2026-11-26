@@ -374,7 +374,7 @@ func azureResourceRows(data []azure.GraphResource, subscriptionID string, contai
 			account = subscriptionID
 		}
 		sensitivity, reason := azureResourceSensitivity(kind, d.Tags, containers.stageOfRG(d.ResourceGroup))
-		rows = append(rows, models.CloudResource{
+		row := models.CloudResource{
 			Kind:              kind,
 			NativeID:          id,
 			Name:              d.Name,
@@ -382,7 +382,10 @@ func azureResourceRows(data []azure.GraphResource, subscriptionID string, contai
 			Sensitivity:       sensitivity,
 			SensitivitySource: models.SensitivityFromHeuristic,
 			SensitivityReason: reason,
-		})
+		}
+		// The resource's authsec:* classification tags (W7, C12).
+		ApplyTagClassification(&row, d.Tags)
+		rows = append(rows, row)
 	}
 	return rows
 }

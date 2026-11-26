@@ -113,7 +113,7 @@ func newP3aLab(t *testing.T, name string) *p3aLab {
 	// Runs first (LIFO): the Phase 3 rows reference the members.
 	t.Cleanup(func() {
 		p3ePurge(t, l.db, l.ws)
-		l.db.Exec(`DELETE FROM audit_events WHERE workspace_id = ?`, l.ws.String())
+		auditEventsCleanup(l.db, l.ws)
 		for _, u := range l.users {
 			l.db.Exec(`DELETE FROM workspace_memberships WHERE user_id = ?`, u)
 			l.db.Exec(`DELETE FROM users WHERE id = ?`, u)

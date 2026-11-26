@@ -126,3 +126,28 @@ func TestWebhookSignedPost(t *testing.T) {
 		t.Fatal("mux accepted an unknown channel")
 	}
 }
+
+// A timestamped delivery is signed as the agent runtime SIEM webhook is:
+// HMAC over timestamp + "." + body, with the timestamp and delivery id sent.
+func TestWebhookTimestampedSignature(t *testing.T) {
+	type got struct{ sig, ts, delivery string }
+	ch := make(chan got, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		ch <- got{r.Header.Get(notify.SignatureHeader), r.Header.Get(notify.TimestampHeader), r.Header.Get(notify.DeliveryHeader)}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	body := []byte(`{"type":"authsec.agent_runtime.ask"}`)
+	if err := (&notify.Webhook{Client: srv.Client()}).Send(context.Background(), notify.Message{Channel: notify.ChannelWebhook,
+		To: srv.URL, Body: body, Secret: "k", Timestamp: "1700000000", DeliveryID: "d-1"}); err != nil {
+		t.Fatal(err)
+	}
+	g := <-ch
+	mac := hmac.New(sha256.New, []byte("k"))
+	mac.Write([]byte("1700000000." + string(body)))
+	if g.ts != "1700000000" || g.delivery != "d-1" || g.sig != "sha256="+hex.EncodeToString(mac.Sum(nil)) ||
+		g.sig != notify.SignTimestamped("k", "1700000000", body) || g.sig == notify.Sign("k", body) {
+		t.Fatalf("headers %+v", g)
+	}
+}
