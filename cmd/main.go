@@ -377,6 +377,9 @@ func main() {
 	// turns it off).
 	services.InstallRemediation(config.DB)
 	go services.RunRemediationWorker(context.Background(), config.DB)
+	// SecOps cross-workstream hooks (secops_wiring.go): remediation and gateway
+	// hold asks (W4), gateway rule removal on retire (W6), case evidence pins (W1).
+	services.InstallSecOpsWiring(config.DB)
 	// Second-person rule (W5): every 15 minutes, one governance.review_overdue
 	// event and operator alert per break-glass change whose review is overdue
 	// (AUTHSEC_DISABLE_BREAKGLASS_REVIEW_WORKER=true turns it off).

@@ -565,9 +565,19 @@ func (s *AgentContain) recordContainment(ctx context.Context, ws, actor uuid.UUI
 			}
 		}
 		if row.State == agentcontain.StateRequested {
-			return appendGovEvent(tx, ws, GovEventAgentAskNeeded, kind, aid, govEventRefs{}, map[string]any{
+			if err := appendGovEvent(tx, ws, GovEventAgentAskNeeded, kind, aid, govEventRefs{}, map[string]any{
 				"containment_id": row.ID, "level": row.Level, "target": row.Target, "reason": row.Reason,
-				"note": "AuthSec cannot stop this on the platform itself; whoever administers it must be asked to (W4 delivers the ask)."})
+				"note": "AuthSec cannot stop this on the platform itself; whoever administers it is asked to."}); err != nil {
+				return err
+			}
+			// The platform stop is an ask (W4): whoever administers the
+			// platform stops the agent there and says so.
+			req := actor
+			_, _, err := createAskTx(tx, ws, AskInput{AboutKind: AskAboutContainment, AboutID: row.ID.String(), CaseID: caseID,
+				Question:        "Stop this agent on its platform (" + row.Target + "): AuthSec cannot write there. Reason: " + row.Reason,
+				Choices:         []AskChoice{{ID: "stopped", Label: "Stopped on the platform"}, {ID: "cannot", Label: "Cannot stop it there"}},
+				RequesterUserID: &req, DedupeKey: "platform_stop:" + row.ID.String()}, row.CreatedAt)
+			return err
 		}
 		return enqueueContainTx(tx, ws, row.ID, row.CreatedAt)
 	})
