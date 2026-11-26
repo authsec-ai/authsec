@@ -1089,11 +1089,21 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 		}
 	}
 
+	// The access token the client receives is AuthSec's, with the resource as
+	// its audience (tokenAuthCodeGrant). Hydra's own access token never leaves
+	// AuthSec, so it is granted no audience: one Hydra would re-validate against
+	// the client's (empty) audience list on every refresh and refuse as "not
+	// whitelisted". Without the native sealer the Hydra token is what the client
+	// gets, so it keeps the resource as its audience.
+	grantedAudience := []string{rs.ResourceURI}
+	if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+		grantedAudience = []string{}
+	}
 	acceptResponse, err := ctrl.service.AcceptHydraConsentRequestMCP(
 		consentChallenge,
 		consentRequest,
 		grantedScopes,
-		[]string{rs.ResourceURI},
+		grantedAudience,
 		sessionClaims,
 	)
 	if err != nil {

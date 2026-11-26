@@ -1325,6 +1325,39 @@ func (s *OAuthASService) RevokeTokensForConsentGrant(ctx context.Context, grant 
 	return errors.Join(errs...)
 }
 
+// RevokeAuthCodeTokensForRefresh revokes the live browser-login (auth_code)
+// access tokens minted alongside refreshToken. RFC 7009 §2.1: revoking a
+// refresh token also invalidates the access tokens of the same grant; the
+// refresh grant calls it with the rotated-out token for the same reason.
+//
+// workspaceID narrows the lookup when the caller knows it. /oauth/revoke does
+// not: there the only key is the hash of the credential the caller presented,
+// which names at most the tokens of that one grant.
+func (s *OAuthASService) RevokeAuthCodeTokensForRefresh(ctx context.Context, workspaceID *uuid.UUID, refreshToken, reason string) error {
+	if refreshToken == "" {
+		return nil
+	}
+	q := s.db.WithContext(ctx).
+		Where(`token_family = ? AND source_grant_iss = ? AND source_grant_jti = ?
+		       AND revoked_at IS NULL AND expires_at > ?`,
+			models.TokenFamilyAuthCode, tokens.GrantRefIssuerHydraRefresh,
+			tokens.RefreshTokenGrantRef(refreshToken), time.Now())
+	if workspaceID != nil {
+		q = q.Where("workspace_id = ?", *workspaceID)
+	}
+	var live []models.NativeToken
+	if err := q.Find(&live).Error; err != nil {
+		return fmt.Errorf("list native tokens for refresh token: %w", err)
+	}
+	var errs []error
+	for _, nt := range live {
+		if err := tokens.RevokeAccessToken(ctx, s.db, nt.Iss, nt.JTI.String(), reason, nt.ExpiresAt); err != nil {
+			errs = append(errs, fmt.Errorf("revoke native token %s: %w", nt.JTI, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // RevokeUserTokensForWorkspace invalidates a user's active OAuth tokens + consent
 // in a specific workspace, immediately after an RBAC mutation removes or narrows
 // their permissions. Phase H-5 is the security keystone: without it, removing
