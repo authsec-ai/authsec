@@ -130,7 +130,7 @@ func TestContainW2HoldsNeedASecondPerson(t *testing.T) {
 	a := l.tenant("w2-holds")
 	ctx := context.Background()
 	approver := w2Member(t, a.g, "Avery Approver", "governance:approve")
-	case1, case2 := uuid.New(), uuid.New()
+	case1, case2 := w2Case(t, l, a.g.ws), w2Case(t, l, a.g.ws)
 	c, err := l.svc.Contain(ctx, a.g.ws, a.g.author, services.AgentContainRequest{IdentityID: a.identity.String(),
 		Level: agentcontain.LevelModel, Reason: "suspicious model use", CaseID: case1.String()})
 	if err != nil {
@@ -209,7 +209,7 @@ func TestContainW2CaseMustExistInTheWorkspace(t *testing.T) {
 	l := newACLab(t)
 	a := l.tenant("w2-case-a")
 	b := l.tenant("w2-case-b")
-	caseA := uuid.New()
+	caseA := w2Case(t, l, a.g.ws)
 	t.Cleanup(services.SetContainCaseChecker(w2Cases{known: map[uuid.UUID]uuid.UUID{caseA: a.g.ws}}))
 	ctx := context.Background()
 	if _, err := l.svc.Contain(ctx, b.g.ws, b.g.author, services.AgentContainRequest{IdentityID: b.identity.String(),
@@ -231,7 +231,7 @@ func TestContainW2Isolation(t *testing.T) {
 	ctx := context.Background()
 	w2Member(t, a.g, "Avery Approver", "governance:approve")
 	bApprover := w2Member(t, b.g, "Bo Approver", "governance:approve")
-	caseA := uuid.New()
+	caseA := w2Case(t, l, a.g.ws)
 	c, err := l.svc.Contain(ctx, a.g.ws, a.g.author, services.AgentContainRequest{IdentityID: a.identity.String(),
 		Level: agentcontain.LevelIdentity, Reason: "A", CaseID: caseA.String()})
 	if err != nil {
@@ -352,7 +352,7 @@ func TestContainW2NarrowReleasesTheWiderOnceProven(t *testing.T) {
 	l := newACLab(t)
 	a := l.tenant("w2-narrow")
 	ctx := context.Background()
-	caseA := uuid.New()
+	caseA := w2Case(t, l, a.g.ws)
 	wide, err := l.svc.Contain(ctx, a.g.ws, a.g.author, services.AgentContainRequest{IdentityID: a.identity.String(),
 		Level: agentcontain.LevelIdentity, Reason: "everything", CaseID: caseA.String()})
 	if err != nil {
@@ -705,4 +705,14 @@ func TestContainW2KubernetesUnbindsThroughTheAgent(t *testing.T) {
 	if got := l.run(a.g.ws, c.ID); got.State != agentcontain.StateReleased {
 		t.Fatalf("released: %s %s", got.State, got.StateReason)
 	}
+}
+
+// w2Case opens a real case in ws (agent_case, 186): a hold's case is a
+// same-workspace foreign key (195).
+func w2Case(t *testing.T, l *acLab, ws uuid.UUID) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	p3exec(t, l.db, `INSERT INTO agent_case (id, workspace_id, number, title, severity, opened_by)
+		VALUES (?, ?, (SELECT COALESCE(MAX(number), 0) + 1 FROM agent_case WHERE workspace_id = ?), 'w2 test case', 'high', 'system')`, id, ws, ws)
+	return id
 }

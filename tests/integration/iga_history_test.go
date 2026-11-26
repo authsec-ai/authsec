@@ -369,8 +369,8 @@ func histSeedRuntime(t *testing.T, g *p3Gov, t0 time.Time) (identity uuid.UUID) 
 	alert(other, t0.Add(time.Minute), "open", nil)
 	contain := func(id uuid.UUID, level string, created, contained time.Time) {
 		p3exec(t, g.db, `INSERT INTO agent_containment (workspace_id, connector_id, identity_id, identity_kind, identity_arn, level, state, reason,
-			created_by, contained_at, created_at)
-			VALUES (?, ?, ?, 'iam_role', 'arn:aws:iam::111111111111:role/x', ?, 'contained', 'stop', ?, ?, ?)`,
+			created_by, contained_at, created_at, proof_state)
+			VALUES (?, ?, ?, 'iam_role', 'arn:aws:iam::111111111111:role/x', ?, 'contained', 'stop', ?, ?, ?, 'applied')`,
 			g.ws, g.conn, id, level, g.author, contained, created)
 	}
 	contain(identity, "identity", t0.Add(60*time.Second), t0.Add(120*time.Second))
