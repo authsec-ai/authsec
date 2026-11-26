@@ -98,6 +98,10 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/{agent-identities,agent-changes,resources/:id/classification,
 		// directory,agent-hygiene,responder-groups} (agent_identity_controller.go).
 		platformCtrl.MountAgentIdentityRoutes(r, platformCtrl.NewAgentIdentityControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require)
+		// Remediation (SPEC-secops-backend-upgrade.md W8): /api/iga/v1/remediations
+		// (plan, apply at tier 4 with a second person, proof, cancel) and the
+		// remediation role bindings (agent_remediation_controller.go).
+		platformCtrl.MountRemediationRoutes(r, platformCtrl.NewRemediationControllerFor(igaGraphRead), middlewares.AuthMiddleware(), middlewares.Require)
 		iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 		// Governance decisions. Both require an expected version, so a

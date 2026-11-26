@@ -1121,6 +1121,8 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractOpt("agent_evidence", contractAgentSchemaCapabilities),
 	contractOpt("sources", contractArr(contractSourceHeartbeat)),
 	contractOpt("capabilities", contractArr(contractCapabilityScope)),
+	// Remediation (SPEC-secops-backend-upgrade.md W8, migration 230).
+	contractOpt("remediation", contractRemediationCapabilities),
 )))
 
 // A /capabilities source: one delivering source and its silence state (W1).
@@ -1141,6 +1143,25 @@ var contractCapabilityScope = contractObj(
 		contractReq("id", contractNonEmpty), contractReq("capability", contractNonEmpty), contractReq("name", contractNonEmpty),
 		contractReq("state", contractEnum("on", "partial", "off")), contractReq("gap_kind", contractEnum("none", "declared", "broken")),
 		contractReq("since", contractTime), contractReq("detail", contractStr), contractReq("fallback", contractStr)))),
+)
+
+// The /capabilities remediation block: the schema gate, the kinds, and what
+// each provider's writer really does (a sentence per provider).
+var contractRemediationCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+	contractReq("kinds", contractArrMin(1, contractNonEmpty)),
+	contractReq("writers", contractFunc(func(path string, v any, errs *[]string) {
+		m, ok := v.(map[string]any)
+		if !ok || len(m) == 0 {
+			*errs = append(*errs, path+": want a non-empty object of provider -> sentence")
+			return
+		}
+		for k, x := range m {
+			if s, ok := x.(string); !ok || s == "" {
+				*errs = append(*errs, path+"."+k+": want a non-empty string")
+			}
+		}
+	})),
 )
 
 // The /capabilities agent_alerts and agent_runtime blocks: available, and the

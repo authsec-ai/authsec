@@ -1,0 +1,22 @@
+{
+  "Name": "AuthSec Remediation",
+  "IsCustom": true,
+  "Description": "Lets AuthSec carry out remediations a person approved in AuthSec on this subscription: delete a role assignment that grants an agent identity too much, and remove AuthSec's own role assignments. It cannot create role assignments of other roles, read secrets or change resources. In this release AuthSec only PREPARES Azure remediations (exact az commands); this role is what a later write mode will need. Assign it to AuthSec's Azure app at the subscription scope, separately from the discovery reader and the access-policy role.",
+  "Actions": [
+    "Microsoft.Authorization/roleAssignments/read",
+    "Microsoft.Authorization/roleAssignments/delete",
+    "Microsoft.Authorization/roleDefinitions/read",
+    "Microsoft.KeyVault/vaults/read",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/read"
+  ],
+  "NotActions": [
+    "Microsoft.Authorization/roleAssignments/write",
+    "Microsoft.Authorization/roleDefinitions/write",
+    "Microsoft.Authorization/elevateAccess/action"
+  ],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/<subscription-id>"
+  ]
+}

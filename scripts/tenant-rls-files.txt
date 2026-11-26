@@ -165,3 +165,10 @@ services/agent_hygiene.go
 services/directory.go
 services/resource_classification.go
 services/responder_groups.go
+services/agent_remediation.go
+services/agent_remediation_binding.go
+services/agent_remediation_hooks.go
+services/agent_remediation_iac.go
+services/agent_remediation_proof.go
+services/agent_remediation_run.go
+controllers/platform/agent_remediation_controller.go

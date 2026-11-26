@@ -305,7 +305,11 @@ func (s *PendingChangeService) Approve(ctx context.Context, ws, id, approver uui
 		if apply == nil {
 			return govConflict("change_kind_unknown", "This kind of change cannot be applied by this server.", map[string]any{"kind": before.Kind})
 		}
-		if after2, err = apply(tx, ws, before); err != nil {
+		// The applier sees the decision being made (who approves, when);
+		// before stays the row as it was read.
+		decided := *before
+		decided.ApprovedBy, decided.ApprovedAt = &approver, &now
+		if after2, err = apply(tx, ws, &decided); err != nil {
 			return err
 		}
 		if err := tx.Exec(`UPDATE pending_change SET state = 'applied', approved_by = ?, approved_at = ?, applied_at = ?,

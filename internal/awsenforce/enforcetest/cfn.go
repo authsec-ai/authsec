@@ -185,9 +185,15 @@ func Dig(v any, path ...any) any {
 // role has exactly one inline policy and no managed policies, so a template
 // that grants anything outside its inline document cannot pass as simulated.
 func EnforcementPolicy(template map[string]any, account string) (Policy, error) {
-	role := Dig(template, "Resources", "AuthSecEnforcementRole", "Properties")
+	return RolePolicy(template, "AuthSecEnforcementRole", account)
+}
+
+// RolePolicy is EnforcementPolicy for any role of a template, by logical id
+// (the remediation stack's AuthSecRemediationRole), with the same checks.
+func RolePolicy(template map[string]any, logicalID, account string) (Policy, error) {
+	role := Dig(template, "Resources", logicalID, "Properties")
 	if role == nil {
-		return Policy{}, fmt.Errorf("no AuthSecEnforcementRole")
+		return Policy{}, fmt.Errorf("no %s", logicalID)
 	}
 	if Dig(role, "ManagedPolicyArns") != nil || Dig(role, "PermissionsBoundary") != nil {
 		return Policy{}, fmt.Errorf("the enforcement role must have no managed policies and no boundary")

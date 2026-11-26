@@ -154,6 +154,7 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		"sources":          sources,
 		"capabilities":     scopes,
 		"agent_evidence":   services.AgentEvidenceCapabilities(ctl.db()),
+		"remediation":      services.RemediationCapabilities(ctl.db()),
 		"graph_projection": mode,
 		"reason":           nullIfEmpty(reason),
 		"features":         graphFeatures(mode == services.GraphProjectionOn),

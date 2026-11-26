@@ -226,6 +226,14 @@ func snapshotSources() []snapSource {
 		      'access_versions', COALESCE((SELECT jsonb_agg(to_jsonb(av) - 'workspace_id' ORDER BY av.version_no)
 		          FROM iga_gov_access_policy_version av WHERE av.workspace_id = p.workspace_id AND av.policy_id = p.id), '[]'::jsonb))::text
 		  FROM iga_gov_policy p WHERE p.workspace_id = ? ORDER BY p.id LIMIT ?`},
+		// The AWS policy text discovery read (customer-managed and inline):
+		// what a revert_snapshot remediation (W8) restores.
+		{SnapshotKindPolicyText, "cloud_policy", "cloud_policy", []string{"document", "holder_identity_id"}, `SELECT 'cloud_policy:' || p.id::text,
+		    jsonb_build_object('type', 'cloud_policy', 'id', p.id, 'connector_id', p.connector_id, 'policy_kind', p.policy_kind,
+		      'native_id', p.native_id, 'name', p.name, 'holder_arn', h.native_id, 'document_hash', p.document_hash,
+		      'document', p.document)::text
+		  FROM cloud_policy p LEFT JOIN cloud_identity h ON h.workspace_id = p.workspace_id AND h.id = p.holder_identity_id
+		 WHERE p.workspace_id = ? AND NOT p.aws_managed AND p.document IS NOT NULL ORDER BY p.id LIMIT ?`},
 		{SnapshotKindReach, "identity_reach", "iga_access_edges", []string{"subject_identity_account_id", "state"}, `SELECT 'identity:' || x.id::text,
 		    jsonb_build_object('identity_id', x.id, 'grants', x.grants, 'resources', x.resources,
 		      'resource_ids', to_jsonb(x.ids[1:500]), 'truncated', x.resources > 500)::text
