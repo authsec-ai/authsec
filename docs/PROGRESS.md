@@ -4,6 +4,23 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-25 — SecOps backend upgrade, batch 1 (branch `secops/batch1`)
+
+- Built in parallel worktrees from `fix/w0-combined`, each with its own migration block, then combined on `secops/batch1` (local only, nothing pushed):
+  - F5 / AS-174 (`secops/f5-gateway-stop`, 163): stopped agents refused by the gateway before cache and PDP; per-gateway fail mode and cache cap; generic `pending_change`.
+  - F6+F8 / AS-179, AS-180 (`secops/f68-alert-rules-lifecycle`, 164-166): versioned detection rules, alert reopen and outcome codes, suppressions.
+  - F7 / AS-177 (`secops/f7-audit-retention`, 167-169): audit retention per class, hash chain by trigger, durable writes, operator baseline and suspension.
+  - W1 (`secops/w1-evidence-coverage`, 170): evidence store, source heartbeats and COV-01, capabilities C1..C13 per scope, Azure and Kubernetes ingest, trail backfill.
+  - W7 (`secops/w7-agent-identity`, 177-181): one agent id with aliases, endings, instances and deployers, risk class, classification setter, directory, responder groups, hygiene. Routes are `/api/iga/v1/agent-identities` (`/agents` already exists).
+  - W3 (`secops/w3-cases`, 186): cases, clustering by shared identity/workload within 24 h, notes, split, move, close/reopen, export hash.
+  - W2 (`secops/w2-stops-proof`, 193-194): proof states, stop levels key/sessions_before/chain/source_identity/entra/kubernetes/gateway/platform, holds with second-person release, probe, narrow.
+  - W9 (`secops/w9-history-metrics`, 200-201): daily snapshots with chain, as-of reads, SOC/posture metrics, CISO and population reports, bulk exports.
+- Merge fixes: `001_bootstrap.sql` rebuilt as the base plus each branch's appended block (every branch only appends); duplicate constants and helpers removed; suppressed alerts are not clustered into cases; F5's gateway stop list now maps each W2 level (narrow cloud-side levels never refuse a whole identity at the gateway); W9's metrics test follows the merged schema; the API contract declares the new `/capabilities` blocks.
+- Checks on the combined branch (local Postgres 16, Docker hung): fresh bootstrap == old bootstrap + 163..201 (pg_dump, 0 differences); every workspace table has forced RLS; ratchet 69 (baseline 72); full `tests/integration` package passes except `TestP2EgatesE11HardBudgetsThroughTheRoutes` and `TestP2IdetailPermissionsStatementCap` (graph time budgets on this machine; E11 fails on the base too). Not run: `tests/integration/flows` (AS-182).
+- Batch 2 (W5 tiers, W4 asks, W8 remediation, W6 gateway keys and joins, migrations 210-249) runs on `secops/batch1`.
+
+---
+
 ## 2026-11-24 — W0: fixes the SecOps-flows review says contradict the flows (branch `fix/w0-combined`)
 
 - The review "Backend upgrade for the SecOps flows" (written against `161b0745`, which is not in this repo; `9840e246` is the migration-161 commit) was re-verified at `48ee78f5`. Its §3 citations hold apart from moved lines and a few wrong paths (gateway is `internal/agentgateway/gateway/`; provider-usage retention is `services/model_provider.go:54`, not migration 154; IaC closed-PR handling is `services/iga_gov_iac_delivery.go:1019-1027`). Corrections: F6 is audited (new value only); F8's acknowledge does record the actor; "no rotation writer" holds only for cloud keys. PR #109 (Agent Kit) closes none of the gaps (AS-181).
