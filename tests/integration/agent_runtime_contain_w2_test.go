@@ -331,6 +331,19 @@ func TestContainW2GatewayAndPlatform(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("agent.ask_needed: %d", n)
 	}
+	// The platform stop is a real ask (W4): about the containment, never
+	// decided by the person who asked for the stop.
+	var asks []struct {
+		AboutKind       string
+		RequesterUserID *uuid.UUID
+		State           string
+	}
+	l.db.Table("agent_ask").Select("about_kind, requester_user_id, state").
+		Where("workspace_id = ? AND about_id = ?", a.g.ws, pl.ID.String()).Scan(&asks)
+	if len(asks) != 1 || asks[0].AboutKind != services.AskAboutContainment || asks[0].State != "open" ||
+		asks[0].RequesterUserID == nil || *asks[0].RequesterUserID != a.g.author {
+		t.Fatalf("platform stop ask: %+v", asks)
+	}
 }
 
 /* ---------------------------------- narrow --------------------------------- */

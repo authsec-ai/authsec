@@ -128,3 +128,7 @@ func secopsPinCaseEvidence(tx *gorm.DB, ws uuid.UUID, refs []AgentCaseEvidenceRe
 	return tx.Exec(`UPDATE agent_evidence_event SET pin_count = GREATEST(pin_count + ?, 0)
 	                 WHERE workspace_id = ? AND event_id IN ?`, delta, ws, ids).Error
 }
+
+// SecOpsCaseEvidencePinner is the pinner InstallSecOpsWiring installs
+// (tests drive it directly).
+func SecOpsCaseEvidencePinner() EvidencePinner { return secopsCaseEvidencePins{} }
