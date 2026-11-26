@@ -501,8 +501,9 @@ func TestAgentAskSlackAnswerStepUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := newP3sApp(t, db, pg)
-	const team = "TASKS1"
+	team := "TASK" + strings.ToUpper(uuid.NewString()[:8]) // unique: a team is installed in one workspace
 	app.connectDirect(a.ws, team, "CASKS", a.admin)
+	t.Cleanup(func() { db.Exec(`DELETE FROM slack_user_link WHERE workspace_id = ?`, a.ws); db.Exec(`DELETE FROM workspace_slack_integration WHERE workspace_id = ?`, a.ws) })
 	app.link(a.ws, "UAPPR", a.approver)
 	app.link(a.ws, "UHUMAN", a.human)
 	email := &p3Outbox{}
