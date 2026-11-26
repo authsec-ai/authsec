@@ -657,21 +657,21 @@ func raiseUsageAlert(tx *gorm.DB, ws uuid.UUID, km *usageKeyMinute, label string
 
 // UsageReconciliationRow is one label as the console shows it.
 type UsageReconciliationRow struct {
-	ID               uuid.UUID       `json:"id" gorm:"column:id"`
-	Provider         string          `json:"provider" gorm:"column:provider"`
-	KeyRef           string          `json:"key_ref" gorm:"column:key_ref"`
-	ConnectionID     *uuid.UUID      `json:"connection_id" gorm:"column:connection_id"`
-	Minute           time.Time       `json:"minute" gorm:"column:minute"`
-	Label            string          `json:"label" gorm:"column:label"`
-	GatewayCalls     int             `json:"gateway_calls" gorm:"column:gateway_calls"`
-	ProviderRequests *int64          `json:"provider_requests" gorm:"column:provider_requests"`
-	InputTokens      int64           `json:"input_tokens" gorm:"column:input_tokens"`
-	OutputTokens     int64           `json:"output_tokens" gorm:"column:output_tokens"`
-	DNSLookups       int64           `json:"dns_lookups" gorm:"column:dns_lookups"`
-	FlowBytes        int64           `json:"flow_bytes" gorm:"column:flow_bytes"`
-	WorkloadIDs      json.RawMessage `json:"workload_ids" gorm:"column:workload_ids"`
-	Evidence         json.RawMessage `json:"evidence" gorm:"column:evidence"`
-	AlertID          *uuid.UUID      `json:"alert_id" gorm:"column:alert_id"`
+	ID               uuid.UUID  `json:"id" gorm:"column:id"`
+	Provider         string     `json:"provider" gorm:"column:provider"`
+	KeyRef           string     `json:"key_ref" gorm:"column:key_ref"`
+	ConnectionID     *uuid.UUID `json:"connection_id" gorm:"column:connection_id"`
+	Minute           time.Time  `json:"minute" gorm:"column:minute"`
+	Label            string     `json:"label" gorm:"column:label"`
+	GatewayCalls     int        `json:"gateway_calls" gorm:"column:gateway_calls"`
+	ProviderRequests *int64     `json:"provider_requests" gorm:"column:provider_requests"`
+	InputTokens      int64      `json:"input_tokens" gorm:"column:input_tokens"`
+	OutputTokens     int64      `json:"output_tokens" gorm:"column:output_tokens"`
+	DNSLookups       int64      `json:"dns_lookups" gorm:"column:dns_lookups"`
+	FlowBytes        int64      `json:"flow_bytes" gorm:"column:flow_bytes"`
+	WorkloadIDs      JSONText   `json:"workload_ids" gorm:"column:workload_ids"`
+	Evidence         JSONText   `json:"evidence" gorm:"column:evidence"`
+	AlertID          *uuid.UUID `json:"alert_id" gorm:"column:alert_id"`
 }
 
 // List reads ws's labels, newest first (label filter optional).

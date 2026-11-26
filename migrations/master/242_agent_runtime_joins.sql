@@ -127,6 +127,10 @@ CREATE INDEX IF NOT EXISTS idx_model_provider_usage_minute_bucket
 ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS usage_minute_cursor timestamptz;
 ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS cost_cursor timestamptz;
 
+-- The flow-log read keeps its cursors beside the DNS ones (stream 'flow').
+ALTER TABLE public.cloud_dns_cursor DROP CONSTRAINT IF EXISTS cloud_dns_cursor_stream_chk;
+ALTER TABLE public.cloud_dns_cursor ADD CONSTRAINT cloud_dns_cursor_stream_chk CHECK (stream IN ('dns', 'flow'));
+
 CREATE TABLE IF NOT EXISTS public.agent_join_setting (
     workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
     -- ["api.example.com", "*.example.net"]

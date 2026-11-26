@@ -476,24 +476,24 @@ func (s *AgentGatewayService) ProviderSecretsFor(ctx context.Context, p AgentGat
 
 // AgentGatewayAgentKeyView is an agent key as the console sees it.
 type AgentGatewayAgentKeyView struct {
-	ID              uuid.UUID       `json:"id" gorm:"column:id"`
-	Name            string          `json:"name" gorm:"column:name"`
-	ClientID        string          `json:"client_id" gorm:"column:client_id"`
-	KeyPrefix       string          `json:"key_prefix" gorm:"column:key_prefix"`
-	SPIFFEID        string          `json:"spiffe_id" gorm:"column:spiffe_id"`
-	WorkloadID      *uuid.UUID      `json:"workload_id" gorm:"column:workload_id"`
-	IdentityID      *uuid.UUID      `json:"identity_id" gorm:"column:identity_id"`
-	Labels          json.RawMessage `json:"labels" gorm:"column:labels"`
-	AgentID         *uuid.UUID      `json:"agent_id" gorm:"column:agent_id"`
-	PrincipalUserID *uuid.UUID      `json:"principal_user_id" gorm:"column:principal_user_id"`
-	GatewayID       *uuid.UUID      `json:"gateway_id" gorm:"column:gateway_id"`
-	State           string          `json:"state" gorm:"-"`
-	CreatedBy       uuid.UUID       `json:"created_by" gorm:"column:created_by"`
-	CreatedAt       time.Time       `json:"created_at" gorm:"column:created_at"`
-	RotatedAt       *time.Time      `json:"rotated_at" gorm:"column:rotated_at"`
-	RevokedAt       *time.Time      `json:"revoked_at" gorm:"column:revoked_at"`
-	RevokedReason   string          `json:"revoked_reason" gorm:"column:revoked_reason"`
-	Version         int             `json:"version" gorm:"column:version"`
+	ID              uuid.UUID  `json:"id" gorm:"column:id"`
+	Name            string     `json:"name" gorm:"column:name"`
+	ClientID        string     `json:"client_id" gorm:"column:client_id"`
+	KeyPrefix       string     `json:"key_prefix" gorm:"column:key_prefix"`
+	SPIFFEID        string     `json:"spiffe_id" gorm:"column:spiffe_id"`
+	WorkloadID      *uuid.UUID `json:"workload_id" gorm:"column:workload_id"`
+	IdentityID      *uuid.UUID `json:"identity_id" gorm:"column:identity_id"`
+	Labels          JSONText   `json:"labels" gorm:"column:labels"`
+	AgentID         *uuid.UUID `json:"agent_id" gorm:"column:agent_id"`
+	PrincipalUserID *uuid.UUID `json:"principal_user_id" gorm:"column:principal_user_id"`
+	GatewayID       *uuid.UUID `json:"gateway_id" gorm:"column:gateway_id"`
+	State           string     `json:"state" gorm:"-"`
+	CreatedBy       uuid.UUID  `json:"created_by" gorm:"column:created_by"`
+	CreatedAt       time.Time  `json:"created_at" gorm:"column:created_at"`
+	RotatedAt       *time.Time `json:"rotated_at" gorm:"column:rotated_at"`
+	RevokedAt       *time.Time `json:"revoked_at" gorm:"column:revoked_at"`
+	RevokedReason   string     `json:"revoked_reason" gorm:"column:revoked_reason"`
+	Version         int        `json:"version" gorm:"column:version"`
 }
 
 const agentGatewayAgentKeyCols = `id, name, client_id, key_prefix, spiffe_id, workload_id, identity_id, labels::text AS labels,
@@ -505,7 +505,7 @@ func (v *AgentGatewayAgentKeyView) finish() {
 		v.State = AgentGatewayRevoked
 	}
 	if len(v.Labels) == 0 {
-		v.Labels = json.RawMessage("[]")
+		v.Labels = "[]"
 	}
 }
 
