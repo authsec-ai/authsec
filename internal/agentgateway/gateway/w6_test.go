@@ -393,3 +393,15 @@ func TestW6MergeModel(t *testing.T) {
 		t.Fatal("bad name kept", m)
 	}
 }
+
+func TestW6ExampleConfigLoads(t *testing.T) {
+	t.Setenv("AUTHSEC_GATEWAY_CREDENTIAL", "agw_example")
+	t.Setenv("GITHUB_MCP_AUTHORIZATION", "Bearer x")
+	cfg, err := LoadConfig(filepath.Join("..", "..", "..", "deploy", "agent-gateway", "config.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProviderKeys != ProviderKeysAuthSec || cfg.LegacyAgentKeys || cfg.Holds.Mode != HoldWait || len(cfg.Agents.Keys) != 0 {
+		t.Fatalf("%+v", cfg)
+	}
+}

@@ -14,10 +14,10 @@ args: ["-config", "/etc/agent-gateway/config.yaml"]
 env:
   - name: AUTHSEC_GATEWAY_CREDENTIAL
     valueFrom: { secretKeyRef: { name: agent-gateway, key: authsec-credential } }
-  - name: OPENAI_API_KEY
-    valueFrom: { secretKeyRef: { name: agent-gateway, key: openai-api-key } }
-  - name: ANTHROPIC_API_KEY
-    valueFrom: { secretKeyRef: { name: agent-gateway, key: anthropic-api-key } }
+  # Provider keys come from AuthSec (provider_keys: authsec, the default).
+  # Only with provider_keys: local:
+  # - name: OPENAI_API_KEY
+  #   valueFrom: { secretKeyRef: { name: agent-gateway, key: openai-api-key } }
   - name: GITHUB_MCP_AUTHORIZATION
     valueFrom: { secretKeyRef: { name: agent-gateway, key: github-mcp-authorization } }
   - name: AGENT_GATEWAY_ADMIN_TOKEN
