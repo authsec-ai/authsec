@@ -379,7 +379,7 @@ type Result struct {
 	// ArgBounds are the deciding allow policy's argument bounds (the
 	// gateway checks them).
 	ArgBounds *ArgBounds
-	Trace  []Trace
+	Trace     []Trace
 }
 
 // SortPolicies orders policies as evaluation reads them: priority

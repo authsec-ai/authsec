@@ -533,7 +533,7 @@ type AgentGatewayPolicyHints struct {
 	// accept (hash and bound workload identity), W6.
 	AgentKeys []AgentGatewayKeyHint `json:"agent_keys"`
 	Version   string                `json:"version"`
-	AsOf            time.Time                     `json:"as_of"`
+	AsOf      time.Time             `json:"as_of"`
 }
 
 // AgentGatewayHintsTTL is the hints' ttl_seconds (and the gateway's default

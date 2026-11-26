@@ -383,7 +383,6 @@ func flowRow(minute time.Time, src, dst, eni string, bytes, pkts int) []cwltypes
 		f("interfaceId", eni), f("bytes_out", itoa(int64(bytes))), f("pkts", itoa(int64(pkts)))}
 }
 
-
 func TestW6DNSLookupRowsEgressAndFlows(t *testing.T) {
 	db := igaDB(t)
 	a := newP1aEnv(t, db, "w6-dns-a")

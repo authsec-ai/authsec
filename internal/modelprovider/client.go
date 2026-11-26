@@ -339,7 +339,9 @@ type usageAgg struct {
 
 func newUsageAgg() *usageAgg { return &usageAgg{m: map[usageKey]*UsageRow{}, width: time.Hour} }
 
-func newUsageAggWidth(w time.Duration) *usageAgg { return &usageAgg{m: map[usageKey]*UsageRow{}, width: w} }
+func newUsageAggWidth(w time.Duration) *usageAgg {
+	return &usageAgg{m: map[usageKey]*UsageRow{}, width: w}
+}
 
 func (a *usageAgg) add(r UsageRow) {
 	r.BucketStart = r.BucketStart.UTC().Truncate(a.width)
