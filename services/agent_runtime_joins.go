@@ -335,6 +335,11 @@ func (s *AgentRuntimeJoinService) CollectFlows(ctx context.Context, ws, connecto
 		ips = append(ips, d.AnswerIP)
 	}
 	res.Destinations = len(ips)
+	if len(ips) == 0 {
+		// Nothing resolved yet: nothing to filter on, and the cursors stay
+		// where they are so the window is read once destinations are known.
+		return res, nil
+	}
 	reader := awsdiscovery.NewFlowLogReader(logs)
 	if sleep != nil {
 		reader = reader.WithSleep(sleep)

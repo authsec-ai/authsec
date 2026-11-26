@@ -665,11 +665,13 @@ func TestW6UsageReconciliationLabelsAndAlerts(t *testing.T) {
 		t.Fatalf("rerun alerts %+v", al2)
 	}
 	// A gateway call later explains the outside use: the label moves to observed.
-	p3exec(t, db, `UPDATE agent_gateway_provider_key SET provider_key_id = 'key_out' WHERE workspace_id = ? AND id = ?`, a.ws, pk)
+	pk2 := uuid.New()
+	p3exec(t, db, `INSERT INTO agent_gateway_provider_key (id, workspace_id, name, provider, secret_ref, key_fingerprint, provider_key_id,
+		connection_id, created_by) VALUES (?, ?, 'out', 'openai', 'kv/y', '...y', 'key_out', ?, ?)`, pk2, a.ws, connA, a.author)
 	p3exec(t, db, `INSERT INTO agent_gateway_decision (workspace_id, gateway_id, record_type, source, decided_at, subject_id, action, kind,
 		resource_id, resource, decision, reason, provider_key_ref)
 		VALUES (?, ?, 'outcome', 'pdp', ?, 'agk:x', 'model/invoke', 'model', 'openai/gpt-5.1', '{"provider":"openai"}', 'allow',
-		        'upstream_completed', ?)`, a.ws, gw, m(50).Add(5*time.Second), pk)
+		        'upstream_completed', ?)`, a.ws, gw, m(50).Add(5*time.Second), pk2)
 	if _, err = rec.ReconcileWorkspace(ctx, a.ws); err != nil {
 		t.Fatal(err)
 	}
