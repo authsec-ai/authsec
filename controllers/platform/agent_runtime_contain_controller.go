@@ -95,6 +95,7 @@ func (ctl *IGAGovPolicyController) CreateContainment(c *gin.Context) {
 		}
 		// W5: an automation identity names the case of its stop; a case
 		// named must be an open case of this workspace.
+		// TENANT-EXEMPT: not a statement here: CheckStopCase reads the case in a workspace transaction under RLS (tenancy.InWorkspaceRead).
 		if err := services.CheckStopCase(c.Request.Context(), ctl.db(), ws, req.CaseID); err != nil {
 			return nil, nil, err
 		}
